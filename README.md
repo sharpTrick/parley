@@ -12,10 +12,17 @@ human in a normal chat client — over whichever backend you choose.
 The bet: the hard, platform-independent half (push delivery, catch-up, routing, dedup) is written
 **once**, above a small seam. Each backend is a thin plugin implementing **five methods**.
 
-> **Status: v0.1 (seam-proving gate).** `@parley/core` + `@parley/sqlite`, local stdio,
-> catch-up + polling push + reply, a shared conformance suite, and a headless channel loopback —
-> all green. Remote/OAuth mode and the Redis/Matrix/XMPP/NATS backends are the next milestones
-> (see `TASKS.md`).
+> **Status: v0.1 + v0.2 done and verified.**
+> - **v0.1** — `@parley/core` + `@parley/sqlite`, local stdio, catch-up + polling push + reply, a
+>   shared conformance suite (incl. a forked multi-process write test), and a headless channel
+>   loopback. All green.
+> - **v0.2** — remote / chat mode: a Streamable-HTTP transport + single-tenant **OAuth 2.1 + PKCE**
+>   front door over the same SQLite seam, verified end-to-end as a Claude connector would drive it
+>   (discovery → DCR → PKCE → owner consent → token → MCP). See
+>   [`examples/self-host-remote`](examples/self-host-remote/README.md).
+>
+> The Redis / Matrix / XMPP / NATS backends are the next milestones (see `TASKS.md`); each is
+> new-plugin-only — adding them touches zero `@parley/core` code.
 
 ## How it works
 
@@ -89,6 +96,26 @@ claude --dangerously-load-development-channels --channels server:parley
 
 The full end-to-end walkthrough — including driving a real fakechat loop — is in
 [`examples/fakechat-loopback/MANUAL-CHECKLIST.md`](examples/fakechat-loopback/MANUAL-CHECKLIST.md).
+
+## Remote / chat mode (v0.2)
+
+Run the same bridge as a public HTTP server with an OAuth front door so a **Claude chat / web /
+mobile connector** can `post` and `fetch_recent` against it. Single-tenant: the instance
+authenticates exactly one owner; backend credentials stay server-side and Claude only ever holds a
+consented, audience-bound token. Discovery (RFC 9728 PRM), dynamic client registration, PKCE, and
+token rotation are all handled. Full setup — HTTPS, the public-exposure constraint, and Anthropic
+IP-range allowlisting — is in [`examples/self-host-remote`](examples/self-host-remote/README.md).
+
+```ts
+import { createOAuthRemoteApp, ownerVerifierFromPassphrase } from '@parley/core';
+import { SqlitePlugin } from '@parley/sqlite';
+// plugin.connect(...) once, then:
+const app = createOAuthRemoteApp(plugin, cfg, {
+  issuerUrl: new URL('https://parley.example.com'),
+  verifyOwner: ownerVerifierFromPassphrase(process.env.PARLEY_OWNER_PASSPHRASE!),
+});
+await app.listen(3000);
+```
 
 ## Conventions
 

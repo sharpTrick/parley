@@ -1,0 +1,62 @@
+# Maintainer-facing throwaway infra for developing/testing the network backends (DESIGN §15).
+# This is "how we test", NOT a production recipe — each network plugin's own README points at the
+# canonical upstream Docker setup. Bring up only the service you're working on, e.g.:
+#   docker compose -f examples/dev-compose/docker-compose.yml up redis
+#   docker compose -f examples/dev-compose/docker-compose.yml up nats
+name: parley-dev
+
+services:
+  # --- v0.3 Redis (Streams: XADD id = cursor, XRANGE = fetchRecent, XREAD BLOCK = subscribe) ---
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # --- v0.5 NATS (subject = topic, JetStream seq = cursor, subscribe = wildcard) ---
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"] # -js enables JetStream; -m exposes monitoring on 8222
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # --- v0.4 Matrix / Synapse (room = topic, sync token = cursor, sync loop = subscribe) ---
+  # FIRST RUN (one-time): generate config before `up`:
+  #   docker compose -f examples/dev-compose/docker-compose.yml run --rm \
+  #     -e SYNAPSE_SERVER_NAME=parley.local -e SYNAPSE_REPORT_STATS=no synapse generate
+  # then enable a registration_shared_secret in synapse-data/homeserver.yaml, and `up synapse`.
+  synapse:
+    image: matrixdotorg/synapse:latest
+    environment:
+      SYNAPSE_SERVER_NAME: parley.local
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - synapse-data:/data
+    ports:
+      - "8008:8008"
+
+  # --- v0.5 XMPP / Prosody (MUC = topic, MAM = fetchRecent/cursor, PubSub = subscribe) ---
+  # MAM MUST be enabled or catch-up has no archive to read — see prosody/prosody.cfg.lua.
+  prosody:
+    image: prosody/prosody:latest
+    volumes:
+      - ./prosody/prosody.cfg.lua:/etc/prosody/prosody.cfg.lua:ro
+      - prosody-data:/var/lib/prosody
+    ports:
+      - "5222:5222" # c2s
+      - "5269:5269" # s2s
+
+volumes:
+  synapse-data:
+  prosody-data:

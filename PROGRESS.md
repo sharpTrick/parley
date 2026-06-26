@@ -6,8 +6,8 @@
 
 ## Status
 
-- **Phase:** v0.1 **COMPLETE — gate PASSED.** Seam is now FROZEN. Next: parallel fan-out
-  (v0.2 OAuth + v0.3–v0.5 backends).
+- **Phase:** v0.1 + v0.2 **COMPLETE & SHIPPED.** Seam FROZEN. **Paused for the user to install
+  Docker + grant docker permissions + reboot; then RESUME the network backends** (see RESUME HERE).
 - **Done (all committed, clean build + 57 tests green):** Task #1 toolchain · S-1..S-4
   scaffold/seam/Message · C-1..C-5 core engine · Q-1..Q-4 sqlite plugin · P-1..P-5 push half +
   reply + headless loopback · V-1 conformance suite · V-2 skill+conventions · V-3 README.
@@ -66,6 +66,85 @@ Source: live `code.claude.com/docs/en/channels` + `/channels-reference`.
   compares cursor values. Reconciles DESIGN §6's "orders on cursor" + "cursor opaque to core."
 - Per-instance read-state lives in **core** as an atomic JSON file (not the message DB).
 - Shared conformance suite is its **own package** `@parley/conformance`.
+
+## v0.2 COMPLETE (R-1..R-6) — verified
+
+Remote/chat mode done: stateless Streamable-HTTP transport (reactive-only) + single-tenant
+OAuth 2.1 + PKCE front door (SDK `mcpAuthRouter` + `requireBearerAuth` + a `ParleyOAuthProvider`
+with owner-consent gate, DCR, rotating refresh, RFC 8707 audience binding). Verified headlessly
+acting as Claude's connector: 401→PRM discovery, DCR, PKCE authorize, owner consent, token, then
+post/fetch over MCP. `examples/self-host-remote` reference deploy + README (Anthropic IP allowlist
+160.79.104.0/21). 72 tests green; **zero `bridge-core` seam changes** forced by v0.2.
+
+## Infra reality for the parallel phase (probed 2026-06-25) — HARD BLOCKER
+
+- **No Docker/Podman daemon; no redis-server/nats-server/prosody/ejabberd/synapse binaries.**
+  Network egress works (npm + general fetch OK), BUT **downloading + running external server
+  binaries is denied by the sandbox** (nats-server download blocked). So network-backend
+  conformance **cannot be verified here** without the user enabling Docker / authorizing binary
+  downloads / running servers. Surfaced to the user for a decision.
+- Consequence: **network-backend conformance can't run against real servers via Docker here.**
+  - **v0.2 Remote/OAuth** — needs NO external server (HTTP+OAuth over the same SQLite). Fully
+    verifiable here → doing it first.
+  - **v0.3 Redis / v0.5 NATS** — investigate no-Docker paths: `redis-memory-server` (downloads a
+    redis binary) and the `nats-server` release binary (single Go binary, downloadable). If they
+    run, conformance can be green here.
+  - **v0.4 Matrix / v0.5 XMPP** — realistically need a full homeserver/Prosody (Docker). Plan:
+    implement the plugin code against the seam + ship dev-compose + README; mark conformance
+    "verify on a Docker host" (honest, not silently skipped).
+
+## ▶▶ RESUME HERE — network backends (once Docker is available)
+
+**Context:** v0.1 (`@parley/core` + `@parley/sqlite`, local stdio, catch-up + polling push + reply)
+and v0.2 (remote Streamable-HTTP + single-tenant OAuth front door) are done, committed, and green
+(72 tests). The seam (`packages/bridge-core/src/seam.ts`, `message.ts`) and `@parley/conformance`
+are FROZEN. Both v0.1 and v0.2 required **zero** seam changes.
+
+**Decision taken:** user is installing Docker + docker permissions and rebooting; on resume, build
+the 4 network backends and run the shared conformance suite GREEN against real servers.
+
+**Everything is staged for immediate resumption:**
+- Backend skeletons exist + compile + are registered: `packages/bridge-{redis,matrix,xmpp,nats}/`
+  (stub classes `RedisPlugin`/`MatrixPlugin`/`XmppPlugin`/`NatsPlugin` that throw "not implemented";
+  already in root `tsconfig.json` references and `vitest.config.ts` aliases `@parley/redis` etc.).
+- Test infra ready: `examples/dev-compose/docker-compose.yml` (redis:7, nats:2.10 -js, synapse,
+  prosody w/ MAM) + its README with first-run steps. Redis/NATS are ready-to-`up`; Synapse/Prosody
+  have documented one-time setup and need validating on first real run.
+
+**Order (TASKS.md):** v0.3 Redis → v0.4 Matrix → v0.5 XMPP + NATS. **Success criterion for each:
+new-plugin-only, ZERO `bridge-core` changes (`git diff` must show none), conformance GREEN.**
+
+**Per-backend recipe (repeat for each):**
+1. `docker compose -f examples/dev-compose/docker-compose.yml up <svc>`.
+2. `npm install <client> -w @parley/<name>` — clients: Redis→`redis` (node-redis v4, has XADD/
+   XRANGE/XREAD BLOCK); Matrix→`matrix-js-sdk`; XMPP→`@xmpp/client`; NATS→`nats` (nats.js, JetStream).
+3. Implement the seam in `packages/bridge-<name>/src/index.ts` (replace the stub), mapping:
+   - **Redis** (v0.3, FIRST EVENT-DRIVEN): one Stream per topic (key e.g. `parley:{topic}`).
+     `post`=XADD (id=cursor, also the backendMsgId); `fetchRecent`=XRANGE `(since`..`+` exclusive;
+     `subscribe`=**XREAD BLOCK** loop (genuine events, not a poll timer — this milestone proves the
+     event-driven push path, D-2). Store sender/mentions in the stream fields. `resolveIdentity`=convention.
+   - **Matrix** (v0.4): room→topic, `sync` token→cursor, sync loop→subscribe, `/messages` history→
+     fetchRecent, `m.room.message` send→post, event_id→backendMsgId. Read `elkimek/matrix-bridge`
+     first (E2EE/TOFU/mentions). Cross-machine test = M-5.
+   - **XMPP** (v0.5): MUC→topic, **MAM**→fetchRecent/cursor (archive id), PubSub/MUC-presence→
+     subscribe, message stanza id→backendMsgId. README MUST note MAM required.
+   - **NATS** (v0.5): subject→topic (`parley.{topic}`), JetStream **seq**→cursor, durable/ordered
+     consumer→subscribe, `getMessage`/consumer fetch→fetchRecent, seq→backendMsgId.
+4. Add `packages/bridge-<name>/test/conformance.test.ts` calling `runConformanceSuite('<name>',
+   factory)` where the factory connects to the dev-compose server and provides a `freshTopic()`
+   (unique key/room/subject per test) + `cleanup()`. `concurrentPost` is optional (N client conns).
+5. Run `npm test` → conformance GREEN. Then `git diff --stat packages/bridge-core` MUST be empty.
+6. Per-backend README points at the canonical upstream Docker image (not authored here). Commit.
+
+**Conformance contract a backend must satisfy:** stable-unique `backendMsgId` AND monotonic,
+in-order, **exclusive-`since`** cursor delivery (fetchRecent returns pre-sorted ascending). Order is
+the plugin's guarantee; core never compares cursor values. Dedup is on `backendMsgId`, never timestamp.
+
+**If a backend seems to need a core change → STOP and surface it (the seam is wrong; fix the seam,
+not core).** That has not happened in v0.1 or v0.2 and is the design's whole bet.
+
+**Then v1 wrap:** all backends green on the shared suite; READMEs point to upstream Docker (XMPP
+notes MAM); re-scan prior art by function (DESIGN §17); update the main README backend table.
 
 ## Blocked / needs human
 
