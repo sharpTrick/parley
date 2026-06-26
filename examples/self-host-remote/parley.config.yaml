@@ -1,0 +1,23 @@
+# Remote/chat-mode config (DESIGN §10). The chat instance is reactive-only: it uses
+# parley_post + parley_fetch_recent and cannot receive live pushes.
+
+backend: local-sqlite
+
+identity:
+  handle: "owner"
+
+topics:
+  - "ctx-handoff"
+
+catchup:
+  on_start: false      # remote/chat reads context on demand via the fetch_recent tool
+  limit: 100
+
+live_push:
+  enabled: false       # chat cannot receive <channel> pushes (§8)
+
+permissions:
+  skip_permissions: false
+
+backend_config:
+  db_path: "./parley-remote.db"
