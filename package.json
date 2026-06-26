@@ -1,0 +1,27 @@
+{
+  "name": "parley",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Parley — a transport-agnostic MCP seam for messages, context sharing, and task hand-off between humans, chat bots, and coding agents. One pluggable interface; runs on local SQLite, Redis, Matrix, or NATS. Bridges Claude chat ↔ Claude Code via native channels.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "clean": "tsc -b --clean",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:conformance": "vitest run packages/bridge-sqlite",
+    "test:loopback": "npm run build && vitest run examples/fakechat-loopback",
+    "bridge": "node packages/bridge-sqlite/dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
