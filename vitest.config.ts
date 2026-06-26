@@ -10,6 +10,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@parley/core': fromHere('./packages/bridge-core/src/index.ts'),
+      '@parley/sqlite': fromHere('./packages/bridge-sqlite/src/index.ts'),
       '@parley/conformance': fromHere('./packages/conformance/src/index.ts'),
     },
   },

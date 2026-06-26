@@ -1,0 +1,27 @@
+# Demo config for the Parley fakechat loopback (manual checklist Step B).
+# Local stdio mode, SQLite backend, live push ON so the running Claude Code session
+# receives <channel> events.
+
+backend: local-sqlite
+
+identity:
+  handle: "agent"            # this session's logical handle
+
+topics:                      # subscribe to / catch up on (the allowlist)
+  - "ctx-demo"
+
+catchup:
+  on_start: true
+  limit: 100
+
+live_push:
+  enabled: true              # Code only — push <channel> events into the session
+  mention_filter: false      # true = only surface messages mentioning `agent`
+
+permissions:
+  skip_permissions: false    # DANGEROUS; sandbox-only; leave OFF
+
+# Opaque to core; passed verbatim to the SQLite plugin's connect().
+backend_config:
+  db_path: "./parley-demo.db"
+  poll_interval_ms: 500      # latency knob only; no correctness impact

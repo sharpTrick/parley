@@ -1,0 +1,14 @@
+{
+  "name": "@parley/example-fakechat-loopback",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless channel/loopback harness + manual checklist for the live fakechat loop.",
+  "dependencies": {
+    "@parley/core": "*",
+    "@parley/sqlite": "*"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1"
+  }
+}
