@@ -1,9 +1,13 @@
 {
-  "//": "Solution file: tsc -b walks these references in dependency order. Add each package as it is created.",
+  "//": "Solution file: tsc -b walks these references in dependency order. Backend skeletons are pre-registered so parallel implementers touch only their own package.",
   "files": [],
   "references": [
     { "path": "packages/bridge-core" },
     { "path": "packages/conformance" },
-    { "path": "packages/bridge-sqlite" }
+    { "path": "packages/bridge-sqlite" },
+    { "path": "packages/bridge-redis" },
+    { "path": "packages/bridge-matrix" },
+    { "path": "packages/bridge-xmpp" },
+    { "path": "packages/bridge-nats" }
   ]
 }

@@ -1,0 +1,25 @@
+{
+  "name": "@parley/redis",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "@parley/redis — first event-driven push backend (Redis Streams: XADD id = cursor, XRANGE = fetchRecent, XREAD BLOCK = subscribe). Skeleton against the frozen Parley seam — planned v0.3.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@parley/core": "*"
+  },
+  "devDependencies": {
+    "@parley/conformance": "*"
+  },
+  "keywords": ["mcp", "parley", "redis", "message-bus", "agent-messaging"]
+}

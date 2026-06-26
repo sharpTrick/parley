@@ -1,0 +1,25 @@
+{
+  "name": "@parley/matrix",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "@parley/matrix — first external-network backend (matrix-js-sdk: room->topic, sync token->cursor, sync loop->subscribe, history->fetchRecent). Skeleton against the frozen Parley seam — planned v0.4.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@parley/core": "*"
+  },
+  "devDependencies": {
+    "@parley/conformance": "*"
+  },
+  "keywords": ["mcp", "parley", "matrix", "message-bus", "agent-messaging"]
+}

@@ -11,6 +11,10 @@ export default defineConfig({
     alias: {
       '@parley/core': fromHere('./packages/bridge-core/src/index.ts'),
       '@parley/sqlite': fromHere('./packages/bridge-sqlite/src/index.ts'),
+      '@parley/redis': fromHere('./packages/bridge-redis/src/index.ts'),
+      '@parley/matrix': fromHere('./packages/bridge-matrix/src/index.ts'),
+      '@parley/xmpp': fromHere('./packages/bridge-xmpp/src/index.ts'),
+      '@parley/nats': fromHere('./packages/bridge-nats/src/index.ts'),
       '@parley/conformance': fromHere('./packages/conformance/src/index.ts'),
     },
   },

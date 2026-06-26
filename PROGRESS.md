@@ -6,11 +6,23 @@
 
 ## Status
 
-- **Phase:** v0.1 (seam-proving gate), main-thread serial build.
-- **Done:** Task #1 toolchain · S-1..S-4 scaffold/seam/Message · C-1..C-5 core engine ·
-  Q-1..Q-4 sqlite plugin. All committed, full suite green.
-- **P-1 channel gate: PASSED** (findings + auth discrepancy recorded below). Push code may proceed.
-- **In progress:** P-2..P-5 push half + reply + headless loopback (Task #5).
+- **Phase:** v0.1 **COMPLETE — gate PASSED.** Seam is now FROZEN. Next: parallel fan-out
+  (v0.2 OAuth + v0.3–v0.5 backends).
+- **Done (all committed, clean build + 57 tests green):** Task #1 toolchain · S-1..S-4
+  scaffold/seam/Message · C-1..C-5 core engine · Q-1..Q-4 sqlite plugin · P-1..P-5 push half +
+  reply + headless loopback · V-1 conformance suite · V-2 skill+conventions · V-3 README.
+- **v0.1 gate evidence:** (a) `@parley/conformance` green vs `bridge-sqlite` incl. forked
+  4-process × 25-post write test; (b) headless loopback green (channel capability advertised,
+  push delivered with identifier-keyed meta, reply durable, dedup holds).
+- **P-1 channel gate: PASSED** (findings + auth discrepancy recorded below).
+
+## SEAM FREEZE (post-v0.1)
+
+The seam (`packages/bridge-core/src/seam.ts`, `message.ts`) and the conformance suite
+(`@parley/conformance`) are FROZEN. Any later need to change them is a ⚠ design smell to surface,
+not absorb. Backend skeletons (`bridge-redis/matrix/xmpp/nats`) are pre-scaffolded + registered in
+the root tsconfig/vitest so parallel agents touch ONLY their own package dir. Success criterion
+for every backend after sqlite: zero `bridge-core` changes; conformance green.
 
 ## Toolchain — verified empirically (2026-06-25, Node v26.2.0)
 
