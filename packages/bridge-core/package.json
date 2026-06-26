@@ -1,0 +1,53 @@
+{
+  "name": "@parley/core",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Parley core: the transport-agnostic seam, normalized Message, cursor/dedup engine, and dual-role MCP channel server. Zero backend dependencies.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1",
+    "yaml": "^2",
+    "zod": "^3"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "claude",
+    "claude-code",
+    "claude-channels",
+    "agent-messaging",
+    "agent-to-agent",
+    "a2a",
+    "multi-agent",
+    "agent-coordination",
+    "context-sharing",
+    "context-handoff",
+    "task-handoff",
+    "agent-handoff",
+    "message-bus",
+    "message-queue",
+    "pub-sub",
+    "transport-agnostic",
+    "pluggable-backend",
+    "backend-agnostic",
+    "self-hosted",
+    "chat-to-code",
+    "human-in-the-loop",
+    "inter-agent-communication",
+    "agent-bus"
+  ]
+}
