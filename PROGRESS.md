@@ -7,8 +7,10 @@
 ## Status
 
 - **Phase:** v0.1 (seam-proving gate), main-thread serial build.
-- **Done:** toolchain verification (Task #1).
-- **In progress:** S-1..S-4 scaffolding (Task #2).
+- **Done:** Task #1 toolchain · S-1..S-4 scaffold/seam/Message · C-1..C-5 core engine ·
+  Q-1..Q-4 sqlite plugin. All committed, full suite green.
+- **P-1 channel gate: PASSED** (findings + auth discrepancy recorded below). Push code may proceed.
+- **In progress:** P-2..P-5 push half + reply + headless loopback (Task #5).
 
 ## Toolchain — verified empirically (2026-06-25, Node v26.2.0)
 

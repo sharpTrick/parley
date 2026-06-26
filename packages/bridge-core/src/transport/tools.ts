@@ -118,12 +118,37 @@ const postTool = (deps: ToolDeps): ToolDef => ({
   },
 });
 
+const replyTool = (deps: ToolDeps): ToolDef => ({
+  name: 'parley_reply',
+  description:
+    'Reply into the topic a <channel> message arrived from. Pass the same `topic`. The reply is ' +
+    'written durably to the backend so it survives restart and appears in the next catch-up — the ' +
+    'live channel is only the fast inbound hop, replies always write to the backend. Returns ' +
+    '{ backendMsgId }.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      topic: { type: 'string', description: 'The topic to reply in (the inbound message’s topic).' },
+      content: { type: 'string', description: 'The reply body.' },
+      in_reply_to: { type: 'string', description: 'Optional msg_id of the message being replied to.' },
+    },
+    required: ['topic', 'content'],
+    additionalProperties: false,
+  },
+  async handle(raw) {
+    const { topic, content, in_reply_to } = postArgs.parse(raw);
+    const id = await doPost(deps, topic, content, in_reply_to);
+    return textResult({ backendMsgId: id });
+  },
+});
+
 /**
- * Build the tool set. C-3 exposes the reactive subset (`parley_fetch_recent`, `parley_post`) —
- * the chat instance uses exactly this. P-4 adds `parley_reply` (the channel reply tool) here.
+ * Build the tool set. The reactive subset (`parley_fetch_recent`, `parley_post`) is what the
+ * chat instance uses; `parley_reply` (P-4) is the channel reply tool — same durable doPost,
+ * distinct name/description so Claude surfaces it as a reply (DESIGN §7).
  */
 export function buildToolDefs(deps: ToolDeps): ToolDef[] {
-  return [fetchRecentTool(deps), postTool(deps)];
+  return [fetchRecentTool(deps), postTool(deps), replyTool(deps)];
 }
 
 /**

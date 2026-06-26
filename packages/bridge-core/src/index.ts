@@ -36,6 +36,16 @@ export { SeenSet } from './engine/seen-set.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
 
-// Transport: reactive MCP tools (DESIGN §8/§9). Channel emit + push loop + the dual-role
-// stdio bridge are added in the push half (P-2..P-4).
+// Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
 export { registerTools, buildToolDefs, type ToolDeps } from './transport/tools.js';
+export {
+  emitChannel,
+  channelMeta,
+  CHANNEL_NOTIFICATION_METHOD,
+} from './transport/channel-emit.js';
+export { startPushLoop, type PushLoopOptions } from './transport/push-loop.js';
+export {
+  buildBridge,
+  createStdioBridge,
+  type ParleyBridge,
+} from './transport/stdio-bridge.js';

@@ -40,9 +40,22 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
     ({ client, plugin } = await harness());
   });
 
-  it('advertises parley_post and parley_fetch_recent', async () => {
+  it('advertises parley_fetch_recent, parley_post, and parley_reply', async () => {
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(['parley_fetch_recent', 'parley_post']);
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'parley_fetch_recent',
+      'parley_post',
+      'parley_reply',
+    ]);
+  });
+
+  it('parley_reply writes durably (same path as post)', async () => {
+    await client.callTool({
+      name: 'parley_reply',
+      arguments: { topic: 'ctx', content: 'ack', in_reply_to: '1' },
+    });
+    const got = await plugin.fetchRecent({ topic: 'ctx' as never });
+    expect(got.messages.at(-1)!.content).toBe('ack');
   });
 
   it('parley_post writes durably and returns a backendMsgId', async () => {
