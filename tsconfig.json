@@ -2,6 +2,7 @@
   "//": "Solution file: tsc -b walks these references in dependency order. Add each package as it is created.",
   "files": [],
   "references": [
-    { "path": "packages/bridge-core" }
+    { "path": "packages/bridge-core" },
+    { "path": "packages/bridge-sqlite" }
   ]
 }

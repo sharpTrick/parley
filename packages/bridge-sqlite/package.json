@@ -1,0 +1,39 @@
+{
+  "name": "@parley/sqlite",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Parley SQLite backend: zero-infra, polling-only seam implementation. The seam-proving reference backend.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "parley-sqlite": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@parley/core": "*",
+    "better-sqlite3": "^12"
+  },
+  "devDependencies": {
+    "@parley/conformance": "*",
+    "@types/better-sqlite3": "^7"
+  },
+  "keywords": [
+    "mcp",
+    "parley",
+    "sqlite",
+    "message-bus",
+    "claude-code",
+    "agent-messaging"
+  ]
+}
