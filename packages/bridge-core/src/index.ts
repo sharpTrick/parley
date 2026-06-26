@@ -49,3 +49,10 @@ export {
   createStdioBridge,
   type ParleyBridge,
 } from './transport/stdio-bridge.js';
+// Remote mode (v0.2): Streamable-HTTP transport over the same seam (DESIGN §10).
+export {
+  buildReactiveServer,
+  createRemoteHttpApp,
+  type RemoteHttpServer,
+  type RemoteHttpOptions,
+} from './transport/http.js';
