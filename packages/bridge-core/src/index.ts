@@ -56,3 +56,15 @@ export {
   type RemoteHttpServer,
   type RemoteHttpOptions,
 } from './transport/http.js';
+// Remote mode auth: single-tenant OAuth 2.1 + PKCE front door (DESIGN §10/§14).
+export {
+  createOAuthRemoteApp,
+  type OAuthRemoteOptions,
+  type OAuthRemoteServer,
+} from './auth/remote.js';
+export {
+  ParleyOAuthProvider,
+  ConsentError,
+  type ParleyOAuthProviderOptions,
+} from './auth/oauth-provider.js';
+export { hashOwnerSecret, makeOwnerVerifier, ownerVerifierFromPassphrase } from './auth/owner.js';

@@ -1,8 +1,6 @@
-import { randomUUID } from 'node:crypto';
 import type { Server as NodeHttpServer } from 'node:http';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Express, type RequestHandler } from 'express';
 import { Allowlist } from '../allowlist.js';
 import { SeenSet } from '../engine/seen-set.js';
@@ -55,41 +53,34 @@ export function createRemoteHttpApp(
   opts: RemoteHttpOptions = {},
 ): RemoteHttpServer {
   const app = express();
+  app.disable('x-powered-by');
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
 
-  const transports = new Map<string, StreamableHTTPServerTransport>();
   const protect: RequestHandler = opts.protect ?? ((_req, _res, next) => next());
+  const methodNotAllowed: RequestHandler = (_req, res) => {
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method Not Allowed: stateless reactive server' },
+      id: null,
+    });
+  };
 
-  const handle: RequestHandler = async (req, res) => {
+  // STATELESS (DESIGN §10; recommended for reactive-only): a fresh server + transport per POST,
+  // torn down on response close. The plugin is shared and long-lived; building a server just
+  // re-registers handlers. No session map, no SSE, no server push — chat is request/response only.
+  const handlePost: RequestHandler = async (req, res) => {
     try {
-      const sid = req.header('mcp-session-id');
-      let transport = sid !== undefined ? transports.get(sid) : undefined;
-
-      if (transport === undefined) {
-        if (sid !== undefined || !isInitializeRequest(req.body)) {
-          res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Bad Request: no valid session for this request' },
-            id: null,
-          });
-          return;
-        }
-        const created = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          enableJsonResponse: true,
-          onsessioninitialized: (id) => {
-            transports.set(id, created);
-          },
-          onsessionclosed: (id) => {
-            transports.delete(id);
-          },
-        });
-        const server = buildReactiveServer(plugin, cfg);
-        await server.connect(created);
-        transport = created;
-      }
-
+      const server = buildReactiveServer(plugin, cfg);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      });
+      res.on('close', () => {
+        void transport.close();
+        void server.close();
+      });
+      await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
       if (!res.headersSent) {
@@ -102,9 +93,9 @@ export function createRemoteHttpApp(
     }
   };
 
-  app.post(mcpPath, protect, express.json(), handle);
-  app.get(mcpPath, protect, handle);
-  app.delete(mcpPath, protect, handle);
+  app.post(mcpPath, protect, express.json(), handlePost);
+  app.get(mcpPath, protect, methodNotAllowed);
+  app.delete(mcpPath, protect, methodNotAllowed);
 
   let httpServer: NodeHttpServer | undefined;
   return {
@@ -115,8 +106,6 @@ export function createRemoteHttpApp(
       }),
     close: () =>
       new Promise((resolve, reject) => {
-        for (const t of transports.values()) void t.close();
-        transports.clear();
         if (httpServer === undefined) {
           resolve();
           return;
