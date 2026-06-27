@@ -10,16 +10,25 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
   },
   "dependencies": {
-    "@parley/core": "*"
+    "@parley/core": "*",
+    "nats": "^2.29.3"
   },
   "devDependencies": {
     "@parley/conformance": "*"
   },
-  "keywords": ["mcp", "parley", "nats", "message-bus", "agent-messaging"]
+  "keywords": [
+    "mcp",
+    "parley",
+    "nats",
+    "message-bus",
+    "agent-messaging"
+  ]
 }
