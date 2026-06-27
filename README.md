@@ -12,17 +12,16 @@ human in a normal chat client — over whichever backend you choose.
 The bet: the hard, platform-independent half (push delivery, catch-up, routing, dedup) is written
 **once**, above a small seam. Each backend is a thin plugin implementing **five methods**.
 
-> **Status: v0.1 + v0.2 done and verified.**
-> - **v0.1** — `@parley/core` + `@parley/sqlite`, local stdio, catch-up + polling push + reply, a
->   shared conformance suite (incl. a forked multi-process write test), and a headless channel
->   loopback. All green.
-> - **v0.2** — remote / chat mode: a Streamable-HTTP transport + single-tenant **OAuth 2.1 + PKCE**
->   front door over the same SQLite seam, verified end-to-end as a Claude connector would drive it
->   (discovery → DCR → PKCE → owner consent → token → MCP). See
->   [`examples/self-host-remote`](examples/self-host-remote/README.md).
->
-> The Redis / Matrix / XMPP / NATS backends are the next milestones (see `TASKS.md`); each is
-> new-plugin-only — adding them touches zero `@parley/core` code.
+> **Status: v1 — all five backends done and verified. 96 tests green.**
+> - **v0.1** local SQLite (stdio, catch-up + polling push + reply), the shared conformance suite,
+>   and a headless channel loopback. **v0.2** remote / chat mode: a Streamable-HTTP transport +
+>   single-tenant **OAuth 2.1 + PKCE** front door, verified end-to-end as a Claude connector drives
+>   it (discovery → DCR → PKCE → owner consent → token → MCP).
+> - **v0.3 Redis** (event-driven, `XREAD BLOCK`), **v0.4 Matrix** (Synapse, C-S API), **v0.5 NATS**
+>   (JetStream) **and XMPP** (Prosody, MAM) — each verified against a live server by the **same**
+>   shared conformance suite.
+> - **The seam held:** adding every backend after the first touched **zero** `@parley/core` code
+>   (`git diff` confirms it). One interface, five transports, one suite.
 
 ## How it works
 
@@ -127,13 +126,15 @@ await app.listen(3000);
 
 ## Backends
 
-| Backend | Package | Cursor source | Push | Status |
+| Backend | Package | Cursor source | Subscribe (live) | Status |
 |---|---|---|---|---|
 | SQLite | `@parley/sqlite` | rowid (AUTOINCREMENT) | poll loop | ✅ v0.1 |
-| Redis | `@parley/redis` | stream id (`XADD`) | `XREAD BLOCK` | planned v0.3 |
-| Matrix | `@parley/matrix` | sync token | sync loop | planned v0.4 |
-| XMPP | `@parley/xmpp` | MAM archive id | PubSub | planned v0.5 (needs **MAM**) |
-| NATS | `@parley/nats` | JetStream seq | subscribe | planned v0.5 |
+| Redis | `@parley/redis` | stream entry id (`XADD`) | `XREAD BLOCK` (event-driven) | ✅ v0.3 |
+| Matrix | `@parley/matrix` | event_id | filtered `/sync` long-poll | ✅ v0.4 |
+| NATS | `@parley/nats` | JetStream seq | `consume()` ordered consumer | ✅ v0.5 |
+| XMPP | `@parley/xmpp` | MAM/stanza-id | MUC live + MAM (needs **MAM**) | ✅ v0.5 |
+
+Every backend passes the **same** `@parley/conformance` suite; adding each touched zero core.
 
 Each network backend's README will point to the canonical upstream Docker setup (we don't author
 production compose files); a maintainer throwaway compose for tests lives under `examples/`.

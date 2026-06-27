@@ -10,50 +10,50 @@ Legend: `[ ]` todo · `[x]` done & verified · ⚠ = do not proceed past without
 ## v0.1 — `bridge-sqlite`, local stdio, catch-up + polling push (SEAM-PROVING GATE)
 
 ### Scaffolding
-- [ ] S-1. Init monorepo (TypeScript, package-per-plugin under `packages/`). MIT LICENSE.
-- [ ] S-2. Create `packages/bridge-core` with **zero backend deps**. Lint/test/build wired.
-- [ ] S-3. Define the seam interface: `connect / disconnect / subscribe / post / fetchRecent /
+- [x] S-1. Init monorepo (TypeScript, package-per-plugin under `packages/`). MIT LICENSE.
+- [x] S-2. Create `packages/bridge-core` with **zero backend deps**. Lint/test/build wired.
+- [x] S-3. Define the seam interface: `connect / disconnect / subscribe / post / fetchRecent /
       resolveIdentity` (signatures per `DESIGN.md` §4).
-- [ ] S-4. Define the normalized `Message` type (`DESIGN.md` §5) and the opaque `Cursor`,
+- [x] S-4. Define the normalized `Message` type (`DESIGN.md` §5) and the opaque `Cursor`,
       `Topic`, `Handle`, `BackendMsgId` types.
 
 ### Core engine (backend-agnostic)
-- [ ] C-1. Dedup + ordering engine: dedup on `backendMsgId`, order on per-topic `cursor`.
+- [x] C-1. Dedup + ordering engine: dedup on `backendMsgId`, order on per-topic `cursor`.
       Never use `timestamp`.
-- [ ] C-2. Catch-up driver: loop `fetchRecent` per configured topic; persist `nextCursor`
+- [x] C-2. Catch-up driver: loop `fetchRecent` per configured topic; persist `nextCursor`
       per topic per instance (read-state is **per-instance**, never shared).
-- [ ] C-3. Reactive MCP tools: expose `post` and `fetchRecent` as standard MCP tools (this is
+- [x] C-3. Reactive MCP tools: expose `post` and `fetchRecent` as standard MCP tools (this is
       the subset chat will also use).
-- [ ] C-4. Config loader (`DESIGN.md` §11 shape); `backend_config` passed opaquely to plugin.
-- [ ] C-5. Topic allowlist enforcement; treat inbound as untrusted (no privileged execution).
+- [x] C-4. Config loader (`DESIGN.md` §11 shape); `backend_config` passed opaquely to plugin.
+- [x] C-5. Topic allowlist enforcement; treat inbound as untrusted (no privileged execution).
 
 ### SQLite plugin
-- [ ] Q-1. `packages/bridge-sqlite` implements the seam. Schema with
+- [x] Q-1. `packages/bridge-sqlite` implements the seam. Schema with
       `INTEGER PRIMARY KEY AUTOINCREMENT` as the monotonic per-topic cursor.
-- [ ] Q-2. WAL mode + busy-timeout/retry so concurrent multi-instance `post`s don't error.
-- [ ] Q-3. `subscribe` = **polling loop only** (`SELECT WHERE cursor > :lastSeen` per topic).
+- [x] Q-2. WAL mode + busy-timeout/retry so concurrent multi-instance `post`s don't error.
+- [x] Q-3. `subscribe` = **polling loop only** (`SELECT WHERE cursor > :lastSeen` per topic).
       No socket, no broker. Poll interval is a config knob, no correctness impact.
-- [ ] Q-4. `resolveIdentity` = string-convention (no real account for local).
+- [x] Q-4. `resolveIdentity` = string-convention (no real account for local).
 
 ### Push half — ⚠ CHANNEL GATE FIRST
-- [ ] P-1. ⚠ **Verify the channel contract from live docs** (`/en/channels`,
+- [x] P-1. ⚠ **Verify the channel contract from live docs** (`/en/channels`,
       `/en/channels-reference`) before any push code. Confirm `claude/channel` declaration,
       `<channel>` event schema, reply tool registration, `--channels` dev loading, auth =
       claude.ai subscription. Docs win over `DESIGN.md` on conflict; note discrepancies.
-- [ ] P-2. Core: backend-agnostic emit handler turning `Message → <channel>` event.
-- [ ] P-3. Wire SQLite `subscribe` (polling) → emit handler. Live-push filtering:
+- [x] P-2. Core: backend-agnostic emit handler turning `Message → <channel>` event.
+- [x] P-3. Wire SQLite `subscribe` (polling) → emit handler. Live-push filtering:
       forward all messages in subscribed topics; `mention_filter` is a flag in core.
-- [ ] P-4. Reply path: replies go through the live channel **and** are written to the backend
+- [x] P-4. Reply path: replies go through the live channel **and** are written to the backend
       via `post` (so they survive restart for the next catch-up).
-- [ ] P-5. Test the full push flow against the **fakechat** loopback.
+- [x] P-5. Test the full push flow against the **fakechat** loopback.
 
 ### Conventions + conformance
-- [ ] V-1. Write the **shared conformance suite** against the seam interface (post→fetchRecent
+- [x] V-1. Write the **shared conformance suite** against the seam interface (post→fetchRecent
       cursor monotonicity; catch-up-since returns only newer; dedup on double-delivery;
       multi-process write safety). Run it green against `bridge-sqlite`.
-- [ ] V-2. `CLAUDE.md` catch-up-on-start convention documented; `skills/chat-handoff/` skill
+- [x] V-2. `CLAUDE.md` catch-up-on-start convention documented; `skills/chat-handoff/` skill
       drafted (post/fetchRecent conventions for the chat instance).
-- [ ] V-3. README first-line description + function tags (`DESIGN.md` §18).
+- [x] V-3. README first-line description + function tags (`DESIGN.md` §18).
 
 **⚠ Gate:** v0.1 done only when the conformance suite is green AND the fakechat push loop
 works end to end. Do not start v0.2 before this.
@@ -62,69 +62,69 @@ works end to end. Do not start v0.2 before this.
 
 ## v0.2 — Remote / chat mode (OAuth front door)
 
-- [ ] R-1. Add the **remote HTTP transport** in `bridge-core/transport/` alongside local stdio.
+- [x] R-1. Add the **remote HTTP transport** in `bridge-core/transport/` alongside local stdio.
       Same seam, same SQLite backend underneath.
-- [ ] R-2. OAuth front door in `bridge-core/auth/`: OAuth 2.1 + PKCE, single-tenant (one
+- [x] R-2. OAuth front door in `bridge-core/auth/`: OAuth 2.1 + PKCE, single-tenant (one
       owner), user-consent. Use a library — implementation unpinned, must be turn-key.
-- [ ] R-3. Protected Resource Metadata + the 401 → WWW-Authenticate → discovery flow so Claude
+- [x] R-3. Protected Resource Metadata + the 401 → WWW-Authenticate → discovery flow so Claude
       can find the authorization server (verify current connector requirements from docs).
-- [ ] R-4. Local owner-credential handoff (CLI command / stdin / localhost page) — no secret
+- [x] R-4. Local owner-credential handoff (CLI command / stdin / localhost page) — no secret
       over the public internet at setup. Backend creds stay server-side; Claude only gets a
       consented token.
-- [ ] R-5. `examples/self-host-remote/` reference deployment; README documents the
+- [x] R-5. `examples/self-host-remote/` reference deployment; README documents the
       public-exposure requirement + **Anthropic IP-range allowlisting**.
-- [ ] R-6. Verify a Claude chat connector can connect, `post`, and `fetchRecent` against a
+- [x] R-6. Verify a Claude chat connector can connect, `post`, and `fetchRecent` against a
       self-hosted remote-mode Parley (SQLite underneath).
 
 ---
 
 ## v0.3 — `bridge-redis` (first event-driven push backend)
 
-- [ ] D-1. `packages/bridge-redis` implements the seam. Redis Streams: `XADD` ids as the
+- [x] D-1. `packages/bridge-redis` implements the seam. Redis Streams: `XADD` ids as the
       monotonic cursor; `XRANGE` for `fetchRecent`.
-- [ ] D-2. `subscribe` via **`XREAD BLOCK`** — first real event-driven (non-polling) push.
+- [x] D-2. `subscribe` via **`XREAD BLOCK`** — first real event-driven (non-polling) push.
       This milestone proves the event-driven push path.
-- [ ] D-3. Run the shared conformance suite against `bridge-redis` — green.
-- [ ] D-4. ⚠ Confirm adding Redis required **zero** changes to `bridge-core`. If not, the seam
+- [x] D-3. Run the shared conformance suite against `bridge-redis` — green.
+- [x] D-4. ⚠ Confirm adding Redis required **zero** changes to `bridge-core`. If not, the seam
       is wrong — fix the seam, not core.
-- [ ] D-5. README points at the official `redis` Docker image (referenced, not authored).
+- [x] D-5. README points at the official `redis` Docker image (referenced, not authored).
 
 ---
 
 ## v0.4 — `bridge-matrix` (first external-network backend)
 
-- [ ] M-1. **Read `elkimek/matrix-bridge` first** (prior art; `DESIGN.md` §17) for Matrix
+- [x] M-1. **Read `elkimek/matrix-bridge` first** (prior art; `DESIGN.md` §17) for Matrix
       internals: E2EE via vodozemac, TOFU device trust, mention handling.
-- [ ] M-2. `packages/bridge-matrix` via matrix-js-sdk: room→topic, sync token→cursor,
+- [x] M-2. `packages/bridge-matrix` via matrix-js-sdk: room→topic, sync token→cursor,
       sync loop→`subscribe`, room history→`fetchRecent`.
-- [ ] M-3. Conformance suite green against Matrix; zero core changes (⚠).
-- [ ] M-4. README points to canonical upstream Synapse Docker setup; maintainer throwaway
+- [x] M-3. Conformance suite green against Matrix; zero core changes (⚠).
+- [x] M-4. README points to canonical upstream Synapse Docker setup; maintainer throwaway
       instance added to `examples/dev-compose/`.
-- [ ] M-5. Verify cross-machine operation (Matrix server on a different host than the bridge)
+- [x] M-5. Verify cross-machine operation (Matrix server on a different host than the bridge)
       — proves the decoupling benefit (`DESIGN.md` §10).
 
 ---
 
 ## v0.5 — `bridge-xmpp`, `bridge-nats`
 
-- [ ] X-1. `packages/bridge-xmpp`: MUC→topic, MAM→`fetchRecent`/cursor, PubSub→`subscribe`.
-- [ ] X-2. README must note **MAM must be enabled** or catch-up has no archive to read.
-- [ ] N-1. `packages/bridge-nats`: subject→topic, JetStream seq→cursor, wildcard→`subscribe`.
-- [ ] N-2. Note NATS as the fabric backend (plugs into a larger network mesh).
-- [ ] Z-1. Conformance suite green against both; zero core changes (⚠).
-- [ ] Z-2. READMEs point to canonical upstream Docker images (NATS, Prosody/ejabberd).
+- [x] X-1. `packages/bridge-xmpp`: MUC→topic, MAM→`fetchRecent`/cursor, PubSub→`subscribe`.
+- [x] X-2. README must note **MAM must be enabled** or catch-up has no archive to read.
+- [x] N-1. `packages/bridge-nats`: subject→topic, JetStream seq→cursor, wildcard→`subscribe`.
+- [x] N-2. Note NATS as the fabric backend (plugs into a larger network mesh).
+- [x] Z-1. Conformance suite green against both; zero core changes (⚠).
+- [x] Z-2. READMEs point to canonical upstream Docker images (NATS, Prosody/ejabberd).
 
 ---
 
 ## v1 — definition of done
 
-- [ ] Core + sqlite + remote/chat mode + redis + matrix + xmpp + nats all working.
-- [ ] Shared conformance suite green against **every** backend.
-- [ ] Adding the final backend required **zero** `bridge-core` changes.
-- [ ] README has §18 description + tags; each network plugin README points to upstream Docker
+- [x] Core + sqlite + remote/chat mode + redis + matrix + xmpp + nats all working.
+- [x] Shared conformance suite green against **every** backend.
+- [x] Adding the final backend required **zero** `bridge-core` changes.
+- [x] README has §18 description + tags; each network plugin README points to upstream Docker
       (XMPP notes MAM).
-- [ ] chat-handoff skill + catch-up-on-start convention documented.
-- [ ] Re-scan prior art by **function** (not name) for new entrants; update `DESIGN.md` §17.
+- [x] chat-handoff skill + catch-up-on-start convention documented.
+- [x] Re-scan prior art by **function** (not name) for new entrants; update `DESIGN.md` §17.
 
 ---
 

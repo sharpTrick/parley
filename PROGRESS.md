@@ -6,8 +6,16 @@
 
 ## Status
 
-- **Phase:** v0.1 + v0.2 **COMPLETE & SHIPPED.** Seam FROZEN. **Paused for the user to install
-  Docker + grant docker permissions + reboot; then RESUME the network backends** (see RESUME HERE).
+- **Phase:** ✅ **v1 COMPLETE.** All five backends green on the shared conformance suite; remote
+  OAuth mode done. **96 tests across 21 files.** Adding every backend after the first touched
+  **zero** `@parley/core` code (verified by `git diff`). The seam held end to end.
+- **Backends (all conformance-green):** SQLite (poll) · Redis (`XREAD BLOCK`) · Matrix (Synapse C-S
+  API, `/sync`) · NATS (JetStream `consume()`) · XMPP (Prosody MUC + MAM). Matrix + XMPP were
+  implemented by parallel agents against live Synapse/Prosody and integrated/re-verified here.
+- **Infra note:** servers run via plain `docker run` (no Compose plugin on this host); Synapse
+  needed relaxed rate limits + a registered user; the Matrix conformance run uses an opt-in
+  `shared_room` to stay under Synapse's per-user room-creation limit (production default =
+  room-per-topic). v1-wrap: README/TASKS updated, DESIGN §17 re-scanned (niche still unclaimed).
 - **Done (all committed, clean build + 57 tests green):** Task #1 toolchain · S-1..S-4
   scaffold/seam/Message · C-1..C-5 core engine · Q-1..Q-4 sqlite plugin · P-1..P-5 push half +
   reply + headless loopback · V-1 conformance suite · V-2 skill+conventions · V-3 README.

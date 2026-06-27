@@ -618,6 +618,18 @@ piece — they solve real sub-problems we will hit).
 > Maintenance note: this list is a snapshot from design-time research. New entrants appear
 > constantly in this space; re-scan by *function* (not by name) before major milestones.
 
+**Re-scan at v1 (2026-06-26).** Searched by function (transport-agnostic / backend-agnostic
+agent messaging, pluggable-backend seam, A2A message bus). Findings: the **pluggable-backend
+pattern has gone mainstream for agent *memory/state*** — Microsoft Agent Framework v1.0 ships a
+pluggable memory architecture (Foundry / Mem0 / Redis / Neo4j / custom), and
+`redis/agent-memory-server` offers a pluggable vector-DB factory — but these swap *memory stores*,
+not *messaging transports*, and are framework-internal, not a standalone seam. Per-transport
+**point** MCP servers remain single-backend (e.g. `bmorphism/nats-mcp-server` for NATS only). No
+new entrant combines (1) a real backend-agnostic messaging **seam**, (2) human ↔ chat-bot ↔
+coding-agent in one bus, and (3) a small standalone give-away. **Parley's niche (§16) is still
+unclaimed.** Worth tracking: the memory-pluggability convergence validates the "implement an
+interface, swap the backend" thesis in an adjacent domain.
+
 ---
 
 ## 18. Discoverability — function-based tags
