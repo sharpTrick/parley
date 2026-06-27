@@ -10,16 +10,26 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
   },
   "dependencies": {
-    "@parley/core": "*"
+    "@parley/core": "*",
+    "@xmpp/client": "^0.14.0",
+    "@xmpp/debug": "^0.14.0"
   },
   "devDependencies": {
     "@parley/conformance": "*"
   },
-  "keywords": ["mcp", "parley", "xmpp", "message-bus", "agent-messaging"]
+  "keywords": [
+    "mcp",
+    "parley",
+    "xmpp",
+    "message-bus",
+    "agent-messaging"
+  ]
 }
