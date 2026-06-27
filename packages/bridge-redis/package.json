@@ -10,16 +10,25 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
   },
   "dependencies": {
-    "@parley/core": "*"
+    "@parley/core": "*",
+    "redis": "^4.7.1"
   },
   "devDependencies": {
     "@parley/conformance": "*"
   },
-  "keywords": ["mcp", "parley", "redis", "message-bus", "agent-messaging"]
+  "keywords": [
+    "mcp",
+    "parley",
+    "redis",
+    "message-bus",
+    "agent-messaging"
+  ]
 }
