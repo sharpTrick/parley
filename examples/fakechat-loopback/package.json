@@ -1,5 +1,5 @@
 {
-  "name": "@parley/example-fakechat-loopback",
+  "name": "@sharptrick/parley-example-fakechat-loopback",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,8 +8,8 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@parley/core": "*",
-    "@parley/sqlite": "*"
+    "@sharptrick/parley-core": "*",
+    "@sharptrick/parley-sqlite": "*"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1"

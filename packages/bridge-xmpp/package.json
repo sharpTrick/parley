@@ -1,11 +1,27 @@
 {
-  "name": "@parley/xmpp",
+  "name": "@sharptrick/parley-xmpp",
   "version": "0.1.0",
   "type": "module",
-  "description": "@parley/xmpp — MUC->topic, MAM->fetchRecent/cursor (MAM must be enabled), PubSub->subscribe. Skeleton against the frozen Parley seam — planned v0.5.",
+  "description": "@sharptrick/parley-xmpp — MUC->topic, MAM->fetchRecent/cursor (MAM must be enabled), PubSub->subscribe. Skeleton against the frozen Parley seam — planned v0.5.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-xmpp"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-xmpp#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": {
@@ -18,15 +34,16 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@parley/core": "*",
+    "@sharptrick/parley-core": "^0.1.0",
     "@xmpp/client": "^0.14.0",
     "@xmpp/debug": "^0.14.0"
   },
   "devDependencies": {
-    "@parley/conformance": "*"
+    "@sharptrick/parley-conformance": "^0.1.0"
   },
   "keywords": [
     "mcp",

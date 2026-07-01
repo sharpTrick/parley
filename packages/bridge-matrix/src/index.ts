@@ -13,7 +13,7 @@ import {
   type MessageHandler,
   parseMentions,
   type Topic,
-} from '@parley/core';
+} from '@sharptrick/parley-core';
 
 /** Plugin-specific backend_config. */
 export interface MatrixBackendConfig {

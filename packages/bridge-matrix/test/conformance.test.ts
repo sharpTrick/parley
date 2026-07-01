@@ -1,5 +1,5 @@
-import { runConformanceSuite } from '@parley/conformance';
-import { asHandle, asTopic, type Topic } from '@parley/core';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, it } from 'vitest';
 import { MatrixPlugin } from '../src/index.js';
 

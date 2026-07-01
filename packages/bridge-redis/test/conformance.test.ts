@@ -1,5 +1,5 @@
-import { runConformanceSuite } from '@parley/conformance';
-import { asHandle, asTopic, type Topic } from '@parley/core';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { createClient } from 'redis';
 import { describe, it } from 'vitest';
 import { RedisPlugin } from '../src/index.js';

@@ -1,4 +1,4 @@
-import type { BackendPlugin, Topic } from '@parley/core';
+import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
 
 /**
  * What a backend provides so the shared suite can run against it. Written ONCE against the

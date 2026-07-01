@@ -1,7 +1,7 @@
-# @parley/xmpp
+# @sharptrick/parley-xmpp
 
 XMPP MUC backend for [Parley](../../README.md). Implements the seam in
-`packages/bridge-xmpp/src/index.ts`; adding it required **zero** `@parley/core` changes.
+`packages/bridge-xmpp/src/index.ts`; adding it required **zero** `@sharptrick/parley-core` changes.
 
 A topic maps to a [MUC](https://xmpp.org/extensions/xep-0045.html) room. The per-message
 [XEP-0359](https://xmpp.org/extensions/xep-0359.html) **stanza-id** — which equals the
@@ -114,7 +114,7 @@ Component "muc.parley.local" "muc"
 
 ```bash
 # bring up a Prosody/ejabberd with MAM + MUC (examples/dev-compose), then:
-cd <repo-root> && npx vitest run packages/bridge-xmpp   # the shared @parley/conformance suite
+cd <repo-root> && npx vitest run packages/bridge-xmpp   # the shared @sharptrick/parley-conformance suite
 ```
 
 `PARLEY_XMPP_SERVICE` / `PARLEY_XMPP_DOMAIN` / `PARLEY_XMPP_MUC` / `PARLEY_XMPP_USER` /

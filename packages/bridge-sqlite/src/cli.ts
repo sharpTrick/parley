@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createStdioBridge, loadConfig, type ParleyConfig } from '@parley/core';
+import { createStdioBridge, loadConfig, type ParleyConfig } from '@sharptrick/parley-core';
 import { SqlitePlugin } from './index.js';
 
 // IMPORTANT: this is an MCP stdio server — stdout is the JSON-RPC channel. All diagnostics go

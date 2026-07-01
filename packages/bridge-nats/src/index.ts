@@ -13,7 +13,7 @@ import {
   type MessageHandler,
   parseMentions,
   type Topic,
-} from '@parley/core';
+} from '@sharptrick/parley-core';
 import {
   AckPolicy,
   connect,

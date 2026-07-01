@@ -4,8 +4,8 @@ import {
   loadConfig,
   makeOwnerVerifier,
   ownerVerifierFromPassphrase,
-} from '@parley/core';
-import { SqlitePlugin } from '@parley/sqlite';
+} from '@sharptrick/parley-core';
+import { SqlitePlugin } from '@sharptrick/parley-sqlite';
 
 export interface RemoteServerHandle {
   /** The bound origin, e.g. http://127.0.0.1:3000 */

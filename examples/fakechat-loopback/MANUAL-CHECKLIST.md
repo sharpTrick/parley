@@ -69,8 +69,8 @@ DB the running bridge polls). Quick way with a throwaway Node one-liner:
 
 ```bash
 node --input-type=module -e '
-import { SqlitePlugin } from "@parley/sqlite";
-import { asHandle, asTopic } from "@parley/core";
+import { SqlitePlugin } from "@sharptrick/parley-sqlite";
+import { asHandle, asTopic } from "@sharptrick/parley-core";
 const p = new SqlitePlugin();
 await p.connect({ db_path: "./parley-demo.db" });
 await p.post(asTopic("ctx-demo"), asHandle("human"), "ping from a human @agent — please ack");
@@ -87,8 +87,8 @@ Confirm, in the running Claude Code session:
 
 ```bash
 node --input-type=module -e '
-import { SqlitePlugin } from "@parley/sqlite";
-import { asTopic } from "@parley/core";
+import { SqlitePlugin } from "@sharptrick/parley-sqlite";
+import { asTopic } from "@sharptrick/parley-core";
 const p = new SqlitePlugin();
 await p.connect({ db_path: "./parley-demo.db" });
 const { messages } = await p.fetchRecent({ topic: asTopic("ctx-demo") });

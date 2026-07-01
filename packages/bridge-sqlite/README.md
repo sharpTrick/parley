@@ -1,9 +1,9 @@
-# @parley/sqlite
+# @sharptrick/parley-sqlite
 
 The **seam-proving reference backend** for [Parley](../../README.md) — zero-infra,
 **polling-only** (no socket, no broker). Implements the seam in
 `packages/bridge-sqlite/src/index.ts` and ships the `parley-sqlite` CLI that wraps
-`@parley/core`'s stdio bridge. This is the backend v0.1 was built and verified against first.
+`@sharptrick/parley-core`'s stdio bridge. This is the backend v0.1 was built and verified against first.
 
 ## Mapping
 
@@ -93,6 +93,6 @@ npx vitest run packages/bridge-sqlite
 ```
 
 No external service required — this is the only backend with no `docker`/`dev-compose`
-dependency. The shared `@parley/conformance` suite runs against a scratch database, including the
+dependency. The shared `@sharptrick/parley-conformance` suite runs against a scratch database, including the
 `concurrentPost` check, which forks real OS processes (`src/concurrent-writer.mjs`) writing the
 same file concurrently to prove WAL + `busy_timeout` hold under genuine multi-process contention.

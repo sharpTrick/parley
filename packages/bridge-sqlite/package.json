@@ -1,11 +1,27 @@
 {
-  "name": "@parley/sqlite",
+  "name": "@sharptrick/parley-sqlite",
   "version": "0.1.0",
   "type": "module",
   "description": "Parley SQLite backend: zero-infra, polling-only seam implementation. The seam-proving reference backend.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-sqlite"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-sqlite#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": {
@@ -21,14 +37,15 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@parley/core": "*",
+    "@sharptrick/parley-core": "^0.1.0",
     "better-sqlite3": "^12"
   },
   "devDependencies": {
-    "@parley/conformance": "*",
+    "@sharptrick/parley-conformance": "^0.1.0",
     "@types/better-sqlite3": "^7"
   },
   "keywords": [

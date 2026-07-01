@@ -1,8 +1,8 @@
-# @parley/conformance
+# @sharptrick/parley-conformance
 
 The shared seam conformance suite for [Parley](../../README.md): write the contract **once**
 against `BackendPlugin`, run it against every backend plugin. Every backend in this repo
-(`@parley/sqlite`, `@parley/redis`, `@parley/matrix`, `@parley/xmpp`, `@parley/nats`) is verified
+(`@sharptrick/parley-sqlite`, `@sharptrick/parley-redis`, `@sharptrick/parley-matrix`, `@sharptrick/parley-xmpp`, `@sharptrick/parley-nats`) is verified
 by the exact same suite — this is what "adding a backend touches zero core" is checked against.
 
 ## What it proves
@@ -28,7 +28,7 @@ Concretely, `runConformanceSuite` (`src/index.ts`) checks:
 Implement a `BackendFactory` (`src/factory.ts`):
 
 ```ts
-import type { BackendPlugin, Topic } from '@parley/core';
+import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
 
 export interface ConformanceContext {
   plugin: BackendPlugin;          // a freshly connected plugin instance
@@ -42,8 +42,8 @@ export type BackendFactory = () => Promise<ConformanceContext>;
 Then, in the plugin package's own test file:
 
 ```ts
-import { runConformanceSuite } from '@parley/conformance';
-import { asHandle, asTopic, type Topic } from '@parley/core';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, it } from 'vitest';
 import { MyBackendPlugin } from '../src/index.js';
 

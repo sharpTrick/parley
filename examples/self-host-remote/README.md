@@ -26,7 +26,7 @@ export PARLEY_OWNER_PASSPHRASE='a long passphrase only you know'
 Or pre-hash it (so the plaintext isn't in the environment at runtime):
 
 ```bash
-node -e "import('@parley/core').then(m => console.log(m.hashOwnerSecret(process.argv[1])))" 'your passphrase'
+node -e "import('@sharptrick/parley-core').then(m => console.log(m.hashOwnerSecret(process.argv[1])))" 'your passphrase'
 # -> scrypt$....   then:  export PARLEY_OWNER_SECRET_HASH='scrypt$....'
 ```
 

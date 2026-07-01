@@ -1,4 +1,4 @@
-import { asHandle, type BackendPlugin, type Message, type Topic } from '@parley/core';
+import { asHandle, type BackendPlugin, type Message, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BackendFactory, ConformanceContext } from './factory.js';
 

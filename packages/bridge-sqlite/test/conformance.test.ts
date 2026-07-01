@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runConformanceSuite } from '@parley/conformance';
-import { asTopic, type Topic } from '@parley/core';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
+import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { SqlitePlugin } from '../src/index.js';
 
 // Forked OS-process writer (plain .mjs; no build needed) — the strongest proof of WAL +

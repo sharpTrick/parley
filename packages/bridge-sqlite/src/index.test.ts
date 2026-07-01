@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asHandle, asTopic, type Message } from '@parley/core';
+import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SqlitePlugin } from './index.js';
 

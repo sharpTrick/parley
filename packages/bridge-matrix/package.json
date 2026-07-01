@@ -1,11 +1,27 @@
 {
-  "name": "@parley/matrix",
+  "name": "@sharptrick/parley-matrix",
   "version": "0.1.0",
   "type": "module",
-  "description": "@parley/matrix — first external-network backend (matrix-js-sdk: room->topic, sync token->cursor, sync loop->subscribe, history->fetchRecent). Skeleton against the frozen Parley seam — planned v0.4.",
+  "description": "@sharptrick/parley-matrix — first external-network backend (matrix-js-sdk: room->topic, sync token->cursor, sync loop->subscribe, history->fetchRecent). Skeleton against the frozen Parley seam — planned v0.4.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-matrix"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-matrix#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": {
@@ -16,13 +32,14 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@parley/core": "*"
+    "@sharptrick/parley-core": "^0.1.0"
   },
   "devDependencies": {
-    "@parley/conformance": "*"
+    "@sharptrick/parley-conformance": "^0.1.0"
   },
   "keywords": ["mcp", "parley", "matrix", "message-bus", "agent-messaging"]
 }

@@ -14,7 +14,7 @@ import {
   type MessageHandler,
   parseMentions,
   type Topic,
-} from '@parley/core';
+} from '@sharptrick/parley-core';
 import { openDriver, type SqlDriver, type SqlStatement } from './driver.js';
 import { type MessageRow, SCHEMA } from './schema.js';
 

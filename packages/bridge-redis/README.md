@@ -1,7 +1,7 @@
-# @parley/redis
+# @sharptrick/parley-redis
 
 Redis Streams backend for [Parley](../../README.md) — the **first event-driven** backend. Implements
-the seam in `packages/bridge-redis/src/index.ts`; adding it required **zero** `@parley/core` changes.
+the seam in `packages/bridge-redis/src/index.ts`; adding it required **zero** `@sharptrick/parley-core` changes.
 
 ## Mapping
 
@@ -75,7 +75,7 @@ docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
 
 ```bash
 docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
-npm test   # the shared @parley/conformance suite runs green against Redis
+npm test   # the shared @sharptrick/parley-conformance suite runs green against Redis
 ```
 
 `PARLEY_REDIS_URL` overrides the URL; the suite skips itself if no server is reachable.

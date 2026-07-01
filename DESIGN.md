@@ -7,7 +7,7 @@
 > NATS). The name (a *parley* = a conference between parties to reach understanding) names the
 > experience: parties conferring on common ground, not the plumbing underneath.
 >
-> Package/repo/scope: `parley` (`@parley/core`, `@parley/matrix`, …).
+> Package/repo/scope: `parley` (`@sharptrick/parley-core`, `@sharptrick/parley-matrix`, …).
 
 ---
 
@@ -668,7 +668,7 @@ the name (`parley`), so the evocative name and the searchable terms both do thei
       `CLAUDE.md` and `TASKS.md`.
 
 **Resolved since earlier revisions:**
-- Name is **Parley** (`@parley/*`).
+- Name is **Parley** (`@sharptrick/parley-*`).
 - `bridge-redis` is a committed v0.3 backend (not optional) and is networked, not local-only;
   remote/chat mode is v0.2.
 - Infra: no per-backend production compose files are authored here. Each network-backend

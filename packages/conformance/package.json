@@ -1,11 +1,27 @@
 {
-  "name": "@parley/conformance",
+  "name": "@sharptrick/parley-conformance",
   "version": "0.1.0",
   "type": "module",
   "description": "Parley shared conformance suite: write once against the seam, run against every backend plugin.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/conformance"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/conformance#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": {
@@ -18,10 +34,11 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@parley/core": "*"
+    "@sharptrick/parley-core": "^0.1.0"
   },
   "peerDependencies": {
     "vitest": "^2"

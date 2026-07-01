@@ -1,8 +1,8 @@
-# @parley/nats
+# @sharptrick/parley-nats
 
 NATS JetStream backend for [Parley](../../README.md) — the network-fabric backend (plugs into a
 larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding it required
-**zero** `@parley/core` changes.
+**zero** `@sharptrick/parley-core` changes.
 
 ## Mapping
 
@@ -75,7 +75,7 @@ docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
 
 ```bash
 docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
-npm test   # the shared @parley/conformance suite runs green against NATS
+npm test   # the shared @sharptrick/parley-conformance suite runs green against NATS
 ```
 
 `PARLEY_NATS_SERVERS` overrides the servers; the suite skips itself if no server is reachable.

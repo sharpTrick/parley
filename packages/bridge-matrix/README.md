@@ -1,11 +1,11 @@
-# @parley/matrix
+# @sharptrick/parley-matrix
 
 A [Parley](../../README.md) backend plugin that carries topics over a **Matrix** homeserver,
 spoken to via the raw [Client–Server HTTP API](https://spec.matrix.org/latest/client-server-api/)
 with the global `fetch` — **no SDK dependency**. Unencrypted rooms only.
 
 It implements the frozen seam (`connect / disconnect / subscribe / post / fetchRecent /
-resolveIdentity`); adding it required **zero** changes to `@parley/core`.
+resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-core`.
 
 ## Seam mapping
 
@@ -106,7 +106,7 @@ not ship production infra.
 npx vitest run packages/bridge-matrix
 ```
 
-The shared seam conformance suite (`@parley/conformance`) runs against this backend and skips
+The shared seam conformance suite (`@sharptrick/parley-conformance`) runs against this backend and skips
 cleanly when no homeserver answers `GET /_matrix/client/versions`.
 
 ## E2EE later

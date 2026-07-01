@@ -63,8 +63,8 @@ it is plain MCP and can proceed immediately.
   TS isn't the "home" language; `nats.js` is fine.)
 - **Repo:** monorepo, package-per-plugin under `packages/` (see `DESIGN.md` §13). Keep
   `bridge-core` dependency-free of backends.
-- **Naming/scope:** `@parley/core`, `@parley/sqlite`, `@parley/redis`, `@parley/matrix`,
-  `@parley/xmpp`, `@parley/nats`. Plugin package dirs may be `bridge-*` per `DESIGN.md`.
+- **Naming/scope:** `@sharptrick/parley-core`, `@sharptrick/parley-sqlite`, `@sharptrick/parley-redis`, `@sharptrick/parley-matrix`,
+  `@sharptrick/parley-xmpp`, `@sharptrick/parley-nats`. Plugin package dirs may be `bridge-*` per `DESIGN.md`.
 - **Ordering/dedup:** never order or dedupe on `timestamp`. Use `backendMsgId` (dedup key) and
   the monotonic per-topic `cursor`. The cursor is opaque to core and keyed by `topic`.
 - **Cross-process safety (SQLite):** WAL mode + a busy-timeout/retry so concurrent `post`s from

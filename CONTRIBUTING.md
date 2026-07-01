@@ -9,18 +9,18 @@ non-trivial change** — it's the source of truth this project is built against.
 
 > **The seam is the product.** Everything backend-specific lives behind one small interface
 > (`connect / disconnect / subscribe / post / fetchRecent / resolveIdentity`, defined in
-> [`packages/bridge-core/src/seam.ts`](packages/bridge-core/src/seam.ts)). `@parley/core` must
+> [`packages/bridge-core/src/seam.ts`](packages/bridge-core/src/seam.ts)). `@sharptrick/parley-core` must
 > **never** import from a backend plugin. Dependencies point one way: plugins depend on core,
 > never the reverse.
 
 The practical test: **adding or changing a backend should touch only that backend's own package,
-never `@parley/core`.** If you find yourself wanting to special-case a backend inside core, or to
+never `@sharptrick/parley-core`.** If you find yourself wanting to special-case a backend inside core, or to
 change the seam's method signatures to accommodate one backend's quirk, stop — that's a sign the
 seam (or your approach) needs rethinking, not a quick patch. Open an issue describing the gap
 before sending a PR; a seam change is the one kind of change that needs discussion first.
 
 Concretely, the seam (`seam.ts`, `message.ts`) and the shared conformance suite
-(`@parley/conformance`) are **frozen** as of v0.1 — every backend since then (Redis, Matrix, NATS,
+(`@sharptrick/parley-conformance`) are **frozen** as of v0.1 — every backend since then (Redis, Matrix, NATS,
 XMPP) was added without touching either.
 
 ## Other invariants worth knowing before you start
@@ -46,12 +46,12 @@ XMPP) was added without touching either.
 1. Read `DESIGN.md` in full, then skim an existing plugin (`packages/bridge-redis/src/index.ts` is
    a clean, relatively small reference) to see the shape.
 2. Scaffold `packages/bridge-<name>/` following the existing packages' `package.json`/`tsconfig`
-   conventions, depending on `@parley/core` and (as a dev dependency) `@parley/conformance`.
+   conventions, depending on `@sharptrick/parley-core` and (as a dev dependency) `@sharptrick/parley-conformance`.
 3. Implement `BackendPlugin` (`connect`, `disconnect`, `subscribe`, `post`, `fetchRecent`,
    `resolveIdentity`). Map the backend's native ordering primitive to `cursor` and its native unique
    message id to `backendMsgId` — see any existing plugin's README "Mapping" table for the pattern.
 4. Add `packages/bridge-<name>/test/conformance.test.ts` calling
-   `runConformanceSuite('<name>', factory)` from `@parley/conformance` — see
+   `runConformanceSuite('<name>', factory)` from `@sharptrick/parley-conformance` — see
    [`packages/conformance/README.md`](packages/conformance/README.md) for the `BackendFactory`
    shape. Have the factory skip cleanly (not fail) when no server is reachable, matching the
    existing network backends' pattern.

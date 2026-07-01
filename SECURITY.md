@@ -12,7 +12,7 @@ keeps the report out of public issues/PRs until a fix is ready.
 Please do **not** open a public GitHub issue for a suspected vulnerability.
 
 When reporting, include:
-- What component is affected (`@parley/core`, a specific backend plugin, the remote/OAuth server,
+- What component is affected (`@sharptrick/parley-core`, a specific backend plugin, the remote/OAuth server,
   a skill, etc.).
 - Steps to reproduce, or a minimal repro config.
 - What you'd expect to happen vs. what actually happens.
@@ -25,9 +25,9 @@ unless you ask not to be.
 
 **In scope** — vulnerabilities in this repository's own code:
 
-- The core seam, dedup/ordering engine, and topic allowlist (`@parley/core`).
-- Any backend plugin's handling of its own credentials or connection (`@parley/sqlite`,
-  `@parley/redis`, `@parley/matrix`, `@parley/xmpp`, `@parley/nats`).
+- The core seam, dedup/ordering engine, and topic allowlist (`@sharptrick/parley-core`).
+- Any backend plugin's handling of its own credentials or connection (`@sharptrick/parley-sqlite`,
+  `@sharptrick/parley-redis`, `@sharptrick/parley-matrix`, `@sharptrick/parley-xmpp`, `@sharptrick/parley-nats`).
 - The remote/chat OAuth 2.1 + PKCE front door (token issuance, consent, audience binding, dynamic
   client registration) — see `DESIGN.md` §10/§14 and `examples/self-host-remote`.
 - Anything that lets inbound backend content (which is meant to be treated as **untrusted data**,

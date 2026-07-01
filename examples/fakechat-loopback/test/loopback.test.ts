@@ -10,8 +10,8 @@ import {
   CHANNEL_NOTIFICATION_METHOD,
   parseConfig,
   type ParleyBridge,
-} from '@parley/core';
-import { SqlitePlugin } from '@parley/sqlite';
+} from '@sharptrick/parley-core';
+import { SqlitePlugin } from '@sharptrick/parley-sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**

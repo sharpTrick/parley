@@ -1,4 +1,4 @@
-# @parley/core
+# @sharptrick/parley-core
 
 The transport-agnostic seam: normalized `Message`, cursor/dedup engine, config schema, topic
 allowlist, and the dual-role MCP server (reactive tools + live `claude/channel` push). **Zero
@@ -6,7 +6,7 @@ backend dependencies** — plugins depend on this package, never the reverse (`C
 directive #1).
 
 This package is a library, not something you run directly. Install a backend plugin
-(`@parley/sqlite`, `@parley/redis`, `@parley/matrix`, `@parley/xmpp`, `@parley/nats`) and build a
+(`@sharptrick/parley-sqlite`, `@sharptrick/parley-redis`, `@sharptrick/parley-matrix`, `@sharptrick/parley-xmpp`, `@sharptrick/parley-nats`) and build a
 bridge with the exports below — see the [root README](../../README.md) for the end-to-end
 quickstart.
 
@@ -23,7 +23,7 @@ interface BackendPlugin {
 }
 ```
 
-A conforming backend guarantees two things (checked by `@parley/conformance`):
+A conforming backend guarantees two things (checked by `@sharptrick/parley-conformance`):
 
 1. a **stable, unique `backendMsgId`** per message — the dedup key;
 2. **monotonic, in-order, exclusive-`since` cursor delivery** — `fetchRecent` returns messages
@@ -78,15 +78,15 @@ All three go through the topic `Allowlist` — any topic outside `config.topics`
 ## Local (stdio) bridge
 
 ```ts
-import { createStdioBridge, loadConfig } from '@parley/core';
-import { SqlitePlugin } from '@parley/sqlite';
+import { createStdioBridge, loadConfig } from '@sharptrick/parley-core';
+import { SqlitePlugin } from '@sharptrick/parley-sqlite';
 
 const cfg = loadConfig('parley.config.yaml');
 const bridge = await createStdioBridge(new SqlitePlugin(), cfg);
 // ... on shutdown: await bridge.shutdown();
 ```
 
-This is what each plugin's `cli.ts` wraps (see `@parley/sqlite`'s `parley-sqlite` bin). Point a
+This is what each plugin's `cli.ts` wraps (see `@sharptrick/parley-sqlite`'s `parley-sqlite` bin). Point a
 `.mcp.json` server entry at the built CLI and launch with
 `claude --dangerously-load-development-channels --channels server:parley` — see the
 [root README](../../README.md) and
@@ -96,7 +96,7 @@ channel walkthrough.
 ## Remote / chat (OAuth) mode
 
 ```ts
-import { createOAuthRemoteApp, ownerVerifierFromPassphrase } from '@parley/core';
+import { createOAuthRemoteApp, ownerVerifierFromPassphrase } from '@sharptrick/parley-core';
 // plugin.connect(...) once, then:
 const app = createOAuthRemoteApp(plugin, cfg, {
   issuerUrl: new URL('https://parley.example.com'),
@@ -118,4 +118,4 @@ npx vitest run packages/bridge-core
 
 Covers config parsing, the allowlist, mentions, seen-set/read-state, catch-up, the reactive tools,
 the channel-emit/push-loop mechanics, and the OAuth provider/remote auth flow. Backend-specific
-behavior is exercised by each plugin against the shared `@parley/conformance` suite, not here.
+behavior is exercised by each plugin against the shared `@sharptrick/parley-conformance` suite, not here.

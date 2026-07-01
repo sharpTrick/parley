@@ -13,7 +13,7 @@ import {
   type MessageHandler,
   parseMentions,
   type Topic,
-} from '@parley/core';
+} from '@sharptrick/parley-core';
 // `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
 // declared dependency keeps the package self-contained (no extra direct dep on @xmpp/xml).
 import { client, xml } from '@xmpp/client';

@@ -1,5 +1,5 @@
 {
-  "name": "@parley/example-self-host-remote",
+  "name": "@sharptrick/parley-example-self-host-remote",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,7 +8,7 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@parley/core": "*",
-    "@parley/sqlite": "*"
+    "@sharptrick/parley-core": "*",
+    "@sharptrick/parley-sqlite": "*"
   }
 }

@@ -1,5 +1,5 @@
-import { runConformanceSuite } from '@parley/conformance';
-import { asHandle, asTopic, type Topic } from '@parley/core';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { client } from '@xmpp/client';
 import { describe, it } from 'vitest';
 import { XmppPlugin, type XmppBackendConfig } from '../src/index.js';

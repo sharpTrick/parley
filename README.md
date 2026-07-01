@@ -22,7 +22,7 @@ The bet: the hard, platform-independent half (push delivery, catch-up, routing, 
 > - **v0.3 Redis** (event-driven, `XREAD BLOCK`), **v0.4 Matrix** (Synapse, C-S API), **v0.5 NATS**
 >   (JetStream) **and XMPP** (Prosody, MAM) — each verified against a live server by the **same**
 >   shared conformance suite.
-> - **The seam held:** adding every backend after the first touched **zero** `@parley/core` code
+> - **The seam held:** adding every backend after the first touched **zero** `@sharptrick/parley-core` code
 >   (`git diff` confirms it). One interface, five transports, one suite.
 
 ## How it works
@@ -32,7 +32,7 @@ The bet: the hard, platform-independent half (push delivery, catch-up, routing, 
         │  backend-native protocol
  Backend plugin  ── implements the SEAM: connect · disconnect · subscribe · post · fetchRecent · resolveIdentity
         │  normalized Message (topic, sender, content, backendMsgId, cursor, mentions)
- @parley/core    ── reactive tools (post + fetchRecent)  ·  proactive push (<channel> events)
+ @sharptrick/parley-core    ── reactive tools (post + fetchRecent)  ·  proactive push (<channel> events)
         │             dedup + ordering via cursor · reply fan-out · topic allowlist
    ┌────┴─────────────────────────┐
  Claude Code                    Claude chat / human in a chat client
@@ -47,7 +47,7 @@ The bet: the hard, platform-independent half (push delivery, catch-up, routing, 
   and a stable `backendMsgId`; core dedups on the id and trusts the plugin's cursor order. A
   dropped push is harmless — the cursor reconciles it via `fetchRecent`.
 - **The seam is the product.** Adding a backend touches *only* the new plugin — never
-  `@parley/core`. A shared conformance suite runs against every backend.
+  `@sharptrick/parley-core`. A shared conformance suite runs against every backend.
 
 ## The seam
 
@@ -108,8 +108,8 @@ token rotation are all handled. Full setup — HTTPS, the public-exposure constr
 IP-range allowlisting — is in [`examples/self-host-remote`](examples/self-host-remote/README.md).
 
 ```ts
-import { createOAuthRemoteApp, ownerVerifierFromPassphrase } from '@parley/core';
-import { SqlitePlugin } from '@parley/sqlite';
+import { createOAuthRemoteApp, ownerVerifierFromPassphrase } from '@sharptrick/parley-core';
+import { SqlitePlugin } from '@sharptrick/parley-sqlite';
 // plugin.connect(...) once, then:
 const app = createOAuthRemoteApp(plugin, cfg, {
   issuerUrl: new URL('https://parley.example.com'),
@@ -130,13 +130,13 @@ await app.listen(3000);
 
 | Backend | Package | Cursor source | Subscribe (live) | Status |
 |---|---|---|---|---|
-| SQLite | `@parley/sqlite` | rowid (AUTOINCREMENT) | poll loop | ✅ v0.1 |
-| Redis | `@parley/redis` | stream entry id (`XADD`) | `XREAD BLOCK` (event-driven) | ✅ v0.3 |
-| Matrix | `@parley/matrix` | event_id | filtered `/sync` long-poll | ✅ v0.4 |
-| NATS | `@parley/nats` | JetStream seq | `consume()` ordered consumer | ✅ v0.5 |
-| XMPP | `@parley/xmpp` | MAM/stanza-id | MUC live + MAM (needs **MAM**) | ✅ v0.5 |
+| SQLite | `@sharptrick/parley-sqlite` | rowid (AUTOINCREMENT) | poll loop | ✅ v0.1 |
+| Redis | `@sharptrick/parley-redis` | stream entry id (`XADD`) | `XREAD BLOCK` (event-driven) | ✅ v0.3 |
+| Matrix | `@sharptrick/parley-matrix` | event_id | filtered `/sync` long-poll | ✅ v0.4 |
+| NATS | `@sharptrick/parley-nats` | JetStream seq | `consume()` ordered consumer | ✅ v0.5 |
+| XMPP | `@sharptrick/parley-xmpp` | MAM/stanza-id | MUC live + MAM (needs **MAM**) | ✅ v0.5 |
 
-Every backend passes the **same** `@parley/conformance` suite; adding each touched zero core.
+Every backend passes the **same** `@sharptrick/parley-conformance` suite; adding each touched zero core.
 
 Each network backend's README will point to the canonical upstream Docker setup (we don't author
 production compose files); a maintainer throwaway compose for tests lives under `examples/`.
