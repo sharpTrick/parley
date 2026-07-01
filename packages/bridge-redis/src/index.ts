@@ -26,6 +26,13 @@ export interface RedisBackendConfig {
   key_prefix?: string;
   /** XREAD BLOCK timeout (ms) — the loop re-checks for shutdown each interval. Default 2000. */
   block_ms?: number;
+  /**
+   * Optional retention window in days: entries older than this are (approximately) trimmed on
+   * every `post` via `XADD`'s own `MINID` trim option — no separate job or connection. Omit for
+   * the default — keep every entry forever. A topic with no new posts isn't trimmed until its
+   * next post (trimming is opportunistic, tied to write activity, not a background timer).
+   */
+  retention_days?: number;
 }
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -41,6 +48,7 @@ export class RedisPlugin implements BackendPlugin {
   private client?: RedisClient;
   private prefix = 'parley:';
   private blockMs = 2000;
+  private retentionDays?: number;
   private stopped = false;
   private readonly readers: RedisClient[] = [];
 
@@ -48,6 +56,7 @@ export class RedisPlugin implements BackendPlugin {
     const cfg = config as RedisBackendConfig;
     this.prefix = cfg.key_prefix ?? 'parley:';
     this.blockMs = cfg.block_ms ?? 2000;
+    this.retentionDays = cfg.retention_days;
     this.stopped = false;
     const client = createClient({ url: cfg.url ?? 'redis://127.0.0.1:6379' });
     client.on('error', () => {
@@ -74,12 +83,25 @@ export class RedisPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
-    const id = await this.require().xAdd(this.key(topic), '*', {
-      sender: identity,
-      content,
-      ts: new Date().toISOString(),
-      in_reply_to: opts?.inReplyTo ?? '',
-    });
+    const id = await this.require().xAdd(
+      this.key(topic),
+      '*',
+      {
+        sender: identity,
+        content,
+        ts: new Date().toISOString(),
+        in_reply_to: opts?.inReplyTo ?? '',
+      },
+      this.retentionDays !== undefined
+        ? {
+            TRIM: {
+              strategy: 'MINID',
+              strategyModifier: '~',
+              threshold: Date.now() - this.retentionDays * 86_400_000,
+            },
+          }
+        : undefined,
+    );
     return asBackendMsgId(id);
   }
 

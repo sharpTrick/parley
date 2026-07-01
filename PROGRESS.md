@@ -7,7 +7,7 @@
 ## Status
 
 - **Phase:** ✅ **v1 COMPLETE.** All five backends green on the shared conformance suite; remote
-  OAuth mode done. **96 tests across 21 files.** Adding every backend after the first touched
+  OAuth mode done. **97 tests across 21 files.** Adding every backend after the first touched
   **zero** `@parley/core` code (verified by `git diff`). The seam held end to end.
 - **Backends (all conformance-green):** SQLite (poll) · Redis (`XREAD BLOCK`) · Matrix (Synapse C-S
   API, `/sync`) · NATS (JetStream `consume()`) · XMPP (Prosody MUC + MAM). Matrix + XMPP were
@@ -84,6 +84,10 @@ acting as Claude's connector: 401→PRM discovery, DCR, PKCE authorize, owner co
 post/fetch over MCP. `examples/self-host-remote` reference deploy + README (Anthropic IP allowlist
 160.79.104.0/21). 72 tests green; **zero `bridge-core` seam changes** forced by v0.2.
 
+> *(Historical — resolved. The blocker below was hit and cleared once Docker access was granted;
+> the "resume" plan it describes has since been fully executed — see "v1 COMPLETE" at the top of
+> this file. Kept for the record.)*
+
 ## Infra reality for the parallel phase (probed 2026-06-25) — HARD BLOCKER
 
 - **No Docker/Podman daemon; no redis-server/nats-server/prosody/ejabberd/synapse binaries.**
@@ -159,3 +163,17 @@ notes MAM); re-scan prior art by function (DESIGN §17); update the main README 
 - Real `claude --channels` fakechat loopback (P-5 live half) needs an interactive Claude Code session
   (v2.1.80+, claude.ai/Console auth). Automated substitute = headless InMemoryTransport harness +
   `examples/fakechat-loopback/MANUAL-CHECKLIST.md`.
+
+## Post-v1: optional retention/pruning (`retention_days`)
+
+Added an opt-in `retention_days` `backend_config` knob to **sqlite** (background prune timer,
+hourly + once at connect), **redis** (rides `XADD`'s own `MINID` trim option — opportunistic, tied
+to `post` activity), and **nats** (sets JetStream's native `max_age` at stream-creation time —
+first-creator-wins, doesn't retroactively update an existing stream). All three: unset = keep
+forever (unchanged default behavior); safe by construction since none of `sqlite`'s `AUTOINCREMENT`
+rowid, Redis's stream id, or NATS's stream seq are ever reused, so a cursor minted before a prune
+stays valid — a stale reader just gets less history back, never a wrong/duplicate message.
+**Matrix/XMPP got docs-only notes** instead of plugin code: their retention is a homeserver feature
+(Synapse retention policy + admin-API purge; Prosody/ejabberd MAM `archive_expires_after`), not
+something an unprivileged bridge account can enact itself. Zero `bridge-core` changes (fully
+inside each plugin's opaque `backend_config`); one new sqlite unit test (96 → 97 tests).

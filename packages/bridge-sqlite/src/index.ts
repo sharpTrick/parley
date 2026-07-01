@@ -24,10 +24,19 @@ export interface SqliteBackendConfig {
   db_path?: string;
   /** Poll interval for the live `subscribe` loop. Latency knob only — no correctness impact (§9). */
   poll_interval_ms?: number;
+  /**
+   * Optional retention window in days: rows older than this are pruned on a background timer.
+   * Omit for the default — keep every message forever. Safe to enable at any time: `id` is
+   * `AUTOINCREMENT` and never reused, so a cursor/backendMsgId minted before a prune stays valid
+   * (a stale reader just gets fewer rows back, never a wrong or duplicate one).
+   */
+  retention_days?: number;
 }
 
 /** How many new rows a single poll tick drains at most before yielding. */
 const POLL_BATCH = 512;
+/** Pruning cadence when `retention_days` is set — a cost knob only, like the poll interval. */
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * The SQLite backend (DESIGN §9). Zero-infra, **polling-only** — no socket, no notify bus,
@@ -38,19 +47,23 @@ const POLL_BATCH = 512;
 export class SqlitePlugin implements BackendPlugin {
   private driver?: SqlDriver;
   private pollIntervalMs = 1000;
+  private retentionDays?: number;
   private stopped = false;
   private readonly cancellers: Array<() => void> = [];
+  private pruneTimer?: ReturnType<typeof setInterval>;
 
   // Prepared statements (built once at connect).
   private insertStmt?: SqlStatement;
   private selectAfterStmt?: SqlStatement;
   private selectRecentStmt?: SqlStatement;
   private maxIdStmt?: SqlStatement;
+  private pruneStmt?: SqlStatement;
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SqliteBackendConfig;
     const dbPath = cfg.db_path ?? 'parley.db';
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
+    this.retentionDays = cfg.retention_days;
     this.stopped = false;
 
     const driver = openDriver(dbPath, {});
@@ -67,10 +80,18 @@ export class SqlitePlugin implements BackendPlugin {
       'SELECT id, topic, sender, content, ts, in_reply_to FROM messages WHERE topic = ? ORDER BY id DESC LIMIT ?',
     );
     this.maxIdStmt = driver.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM messages WHERE topic = ?');
+    this.pruneStmt = driver.prepare('DELETE FROM messages WHERE ts < ?');
+
+    if (this.retentionDays !== undefined) {
+      this.prune();
+      this.pruneTimer = setInterval(() => this.prune(), PRUNE_INTERVAL_MS);
+    }
   }
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    if (this.pruneTimer !== undefined) clearInterval(this.pruneTimer);
+    this.pruneTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
     this.driver?.close();
@@ -157,6 +178,17 @@ export class SqlitePlugin implements BackendPlugin {
   private maxId(topic: Topic): number {
     const row = this.require(this.maxIdStmt).get(topic) as { maxId: number } | undefined;
     return row?.maxId ?? 0;
+  }
+
+  /** Delete rows older than `retention_days`. Best-effort — a transient lock retries next tick. */
+  private prune(): void {
+    if (this.retentionDays === undefined || this.driver === undefined) return;
+    const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
+    try {
+      this.require(this.pruneStmt).run(cutoff);
+    } catch {
+      // Transient lock/contention — retry on the next interval.
+    }
   }
 
   private require<T>(value: T | undefined): T {

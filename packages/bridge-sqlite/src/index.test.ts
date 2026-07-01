@@ -78,6 +78,33 @@ describe('SqlitePlugin (seam smoke)', () => {
       backendRef: 'ctx-payments',
     });
   });
+
+  it('retention_days prunes older rows on connect, without breaking cursor monotonicity', async () => {
+    const path = dbFile();
+    const writer = new SqlitePlugin();
+    await writer.connect({ db_path: path, poll_interval_ms: 10 });
+    await writer.post(T, me, 'old-1');
+    const lastOldId = await writer.post(T, me, 'old-2');
+    await writer.disconnect();
+
+    // retention_days: 0 → cutoff is "now", strictly after the posts above → prunable immediately.
+    await new Promise((r) => setTimeout(r, 5));
+    const p = new SqlitePlugin();
+    open.push(p);
+    await p.connect({ db_path: path, poll_interval_ms: 10, retention_days: 0 });
+
+    await vi.waitFor(
+      async () => {
+        const { messages } = await p.fetchRecent({ topic: T });
+        expect(messages).toEqual([]);
+      },
+      { timeout: 2000, interval: 10 },
+    );
+
+    // AUTOINCREMENT never reuses ids, so the next post's cursor still strictly increases.
+    const id3 = await p.post(T, me, 'new-after-prune');
+    expect(Number(id3)).toBeGreaterThan(Number(lastOldId));
+  });
 });
 
 async function firstCursor(p: SqlitePlugin) {

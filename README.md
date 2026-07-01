@@ -12,7 +12,7 @@ human in a normal chat client — over whichever backend you choose.
 The bet: the hard, platform-independent half (push delivery, catch-up, routing, dedup) is written
 **once**, above a small seam. Each backend is a thin plugin implementing **five methods**.
 
-> **Status: v1 — all five backends done and verified. 96 tests green.**
+> **Status: v1 — all five backends done and verified. 97 tests green.**
 > - **v0.1** local SQLite (stdio, catch-up + polling push + reply), the shared conformance suite,
 >   and a headless channel loopback. **v0.2** remote / chat mode: a Streamable-HTTP transport +
 >   single-tenant **OAuth 2.1 + PKCE** front door, verified end-to-end as a Claude connector drives

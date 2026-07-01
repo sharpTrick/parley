@@ -22,6 +22,7 @@ import {
   type JetStreamClient,
   type JetStreamManager,
   type NatsConnection,
+  type StreamConfig,
 } from 'nats';
 
 /** Plugin-specific backend_config. */
@@ -32,6 +33,13 @@ export interface NatsBackendConfig {
   subject_prefix?: string;
   /** JetStream stream-name prefix. Default `PARLEY_`. One stream per topic (contiguous seqs). */
   stream_prefix?: string;
+  /**
+   * Optional retention window in days, set as the stream's `max_age` at creation time. Omit for
+   * the default — keep every message forever. Applies only when THIS plugin creates the stream
+   * (`ensureStream`'s first caller); changing it later does not retroactively update an
+   * already-existing stream — edit or recreate the stream out-of-band for that.
+   */
+  retention_days?: number;
 }
 
 const enc = new TextEncoder();
@@ -51,6 +59,7 @@ export class NatsPlugin implements BackendPlugin {
   private jsm?: JetStreamManager;
   private subjectPrefix = 'parley.';
   private streamPrefix = 'PARLEY_';
+  private retentionDays?: number;
   private stopped = false;
   private readonly ensured = new Map<string, Promise<void>>();
   private readonly subscriptions: ConsumerMessages[] = [];
@@ -59,6 +68,7 @@ export class NatsPlugin implements BackendPlugin {
     const cfg = config as NatsBackendConfig;
     this.subjectPrefix = cfg.subject_prefix ?? 'parley.';
     this.streamPrefix = cfg.stream_prefix ?? 'PARLEY_';
+    this.retentionDays = cfg.retention_days;
     this.stopped = false;
     this.nc = await connect({ servers: cfg.servers ?? '127.0.0.1:4222' });
     this.js = this.nc.jetstream();
@@ -179,7 +189,11 @@ export class NatsPlugin implements BackendPlugin {
     if (pending === undefined) {
       pending = (async () => {
         try {
-          await this.requireJsm().streams.add({ name, subjects: [this.subject(topic)] });
+          const config: Partial<StreamConfig> = { name, subjects: [this.subject(topic)] };
+          if (this.retentionDays !== undefined) {
+            config.max_age = this.retentionDays * 86_400_000_000_000; // days → ns
+          }
+          await this.requireJsm().streams.add(config);
         } catch (err) {
           // Another writer created it first (same config) — fine. Re-throw anything else.
           const msg = err instanceof Error ? err.message : String(err);
