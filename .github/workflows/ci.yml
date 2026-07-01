@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # >=22.0.0 is the declared floor (package.json "engines"); also cover the newer LTS line.
+        node-version: ["22.x", "24.x"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # Redis and NATS (JetStream) are cheap, single-container, no-config-needed servers, so their
+      # conformance suites run for real here — same `docker run` commands as each plugin's README.
+      # Matrix (Synapse) and XMPP (Prosody) need one-time server config generation + user
+      # registration (see examples/dev-compose/README.md) and are NOT wired into CI yet; their
+      # conformance suites skip themselves cleanly here, exactly as they would on any dev machine
+      # with no server running.
+      - name: Start Redis
+        run: docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
+
+      - name: Start NATS (JetStream)
+        run: docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
+
+      - name: Wait for Redis + NATS to accept connections
+        shell: bash
+        run: |
+          for port in 6379 4222; do
+            for i in $(seq 1 30); do
+              (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && { echo "port $port up"; break; }
+              sleep 1
+            done
+          done
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test

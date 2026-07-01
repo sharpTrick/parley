@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Parley core: the transport-agnostic seam, normalized Message, cursor/dedup engine, and dual-role MCP channel server. Zero backend dependencies.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

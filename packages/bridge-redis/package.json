@@ -4,6 +4,9 @@
   "type": "module",
   "description": "@parley/redis — first event-driven push backend (Redis Streams: XADD id = cursor, XRANGE = fetchRecent, XREAD BLOCK = subscribe). Skeleton against the frozen Parley seam — planned v0.3.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

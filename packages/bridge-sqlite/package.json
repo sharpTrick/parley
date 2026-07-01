@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Parley SQLite backend: zero-infra, polling-only seam implementation. The seam-proving reference backend.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

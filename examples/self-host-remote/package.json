@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Reference remote/chat-mode deployment: OAuth front door over Streamable HTTP, SQLite backend.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "dependencies": {
     "@parley/core": "*",
     "@parley/sqlite": "*"

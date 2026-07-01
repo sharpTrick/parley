@@ -5,6 +5,9 @@
   "type": "module",
   "description": "Parley — a transport-agnostic MCP seam for messages, context sharing, and task hand-off between humans, chat bots, and coding agents. One pluggable interface; runs on local SQLite, Redis, Matrix, or NATS. Bridges Claude chat ↔ Claude Code via native channels.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "workspaces": [
     "packages/*",
     "examples/*"

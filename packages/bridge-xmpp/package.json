@@ -4,6 +4,9 @@
   "type": "module",
   "description": "@parley/xmpp — MUC->topic, MAM->fetchRecent/cursor (MAM must be enabled), PubSub->subscribe. Skeleton against the frozen Parley seam — planned v0.5.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

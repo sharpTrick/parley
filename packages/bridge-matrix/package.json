@@ -4,6 +4,9 @@
   "type": "module",
   "description": "@parley/matrix — first external-network backend (matrix-js-sdk: room->topic, sync token->cursor, sync loop->subscribe, history->fetchRecent). Skeleton against the frozen Parley seam — planned v0.4.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

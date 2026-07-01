@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Parley shared conformance suite: write once against the seam, run against every backend plugin.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

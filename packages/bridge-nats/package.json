@@ -4,6 +4,9 @@
   "type": "module",
   "description": "@parley/nats — subject->topic, JetStream seq->cursor, wildcard->subscribe. Skeleton against the frozen Parley seam — planned v0.5.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
