@@ -1,5 +1,7 @@
 # Parley
 
+[![CI](https://github.com/sharpTrick/parley/actions/workflows/ci.yml/badge.svg)](https://github.com/sharpTrick/parley/actions/workflows/ci.yml)
+
 > Parley — a transport-agnostic MCP seam for messages, context sharing, and task hand-off
 > between humans, chat bots, and coding agents. One pluggable interface; runs on local SQLite,
 > Redis, Matrix, or NATS. Bridges Claude chat ↔ Claude Code via native channels.
