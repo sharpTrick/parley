@@ -1,0 +1,29 @@
+instance_id: "code-agent-a"
+identity:
+  handle: "agent-a"                       # Redis stores this as the `sender` field — per-session, safe.
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 100
+live_push:
+  enabled: true
+  mention_filter: true
+permissions:
+  skip_permissions: false
+
+backend: local-redis
+backend_config:
+  # ── Must be IDENTICAL across every config sharing this Redis. ──
+  url: "redis://redis.internal:6379"
+  # ── Must ALSO be identical — this one is the hidden risk. It reads like cosmetic
+  #    namespacing, but topic "ctx-payments" under a DIFFERENT prefix is a totally different
+  #    Redis key. Get this wrong and every field still LOOKS consistent while history silently
+  #    splits in two, with no error from either session. ──
+  key_prefix: "parley:"
+  # ── Safe to differ: per-instance XREAD BLOCK / shutdown-recheck timeout. ──
+  block_ms: 2000
+  # ── Should be identical: trimming rides on XADD to a SHARED stream, so whichever writer's
+  #    config sets this enforces it for every session touching the topic, not just itself. ──
+  retention_days: 30

@@ -1,0 +1,23 @@
+instance_id: "code-agent-b"
+identity:
+  handle: "agent-b"                       # again ignored by Matrix's post() — see below.
+topics:
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 50
+live_push:
+  enabled: true
+  mention_filter: false
+permissions:
+  skip_permissions: false
+
+backend: local-matrix
+backend_config:
+  homeserver_url: "https://matrix.internal:8008"   # identical to code-agent-a.yaml
+  server_name: "parley.local"                        # identical
+  # A DIFFERENT provisioned Matrix account from code-agent-a.yaml — this is what actually
+  # gives this session its own distinct sender attribution (see A's comment).
+  user: "parley-agent-b"
+  password: "change-me-agent-b"
+  sync_timeout_ms: 25000

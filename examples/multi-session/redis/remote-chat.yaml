@@ -1,0 +1,19 @@
+identity:
+  handle: "owner"
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: false
+  limit: 100
+live_push:
+  enabled: false
+permissions:
+  skip_permissions: false
+
+backend: local-redis
+backend_config:
+  url: "redis://redis.internal:6379"   # identical to both code-agent-*.yaml
+  key_prefix: "parley:"                 # identical
+  block_ms: 2000                        # unused here (live_push is off) but harmless
+  retention_days: 30                    # identical

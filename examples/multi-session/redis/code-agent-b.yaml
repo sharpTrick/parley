@@ -1,0 +1,20 @@
+instance_id: "code-agent-b"
+identity:
+  handle: "agent-b"
+topics:
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 50
+live_push:
+  enabled: true
+  mention_filter: false
+permissions:
+  skip_permissions: false
+
+backend: local-redis
+backend_config:
+  url: "redis://redis.internal:6379"   # identical to code-agent-a.yaml — same server
+  key_prefix: "parley:"                 # identical — same key namespace (see A's comment)
+  block_ms: 5000                        # differs from A — fine, per-instance only
+  retention_days: 30                    # identical — see A's comment

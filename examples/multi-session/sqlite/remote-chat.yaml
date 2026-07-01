@@ -1,0 +1,19 @@
+# The config examples/self-host-remote/server.ts loads. Chat is reactive-only: no live_push.
+identity:
+  handle: "owner"
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: false        # chat reads on demand via parley_fetch_recent, not on connect
+  limit: 100
+live_push:
+  enabled: false          # chat cannot receive <channel> pushes
+permissions:
+  skip_permissions: false
+
+backend: local-sqlite
+backend_config:
+  db_path: "/var/lib/parley/parley-shared.db"   # identical to both code-agent-*.yaml
+  poll_interval_ms: 1000                         # unused here (live_push is off) but harmless
+  retention_days: 30                             # identical — see code-agent-a.yaml's comment

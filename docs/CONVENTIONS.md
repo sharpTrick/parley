@@ -37,3 +37,15 @@ The chat instance uses only `parley_post` + `parley_fetch_recent` (no live subsc
 receive pushes). The conventions for *which topic to post to, how to format a handoff, and when to
 read context* live in the **`skills/chat-handoff/`** skill. That skill is documentation of usage,
 not a second integration: chat and Code share one seam and one write path (`post`).
+
+## 3. Sharing one backend across multiple configs
+
+A real deployment is never one config — it's one `parley.config.yaml` per Claude Code session plus
+one for the remote/chat OAuth server, all pointed at the same backend. Two fields
+(`instance_id`, `identity.handle`) are meant to vary per config; almost everything under
+`backend_config` is meant to be **identical** across every config that shares that backend, since
+it describes the deployment, not the session. A few `backend_config` fields carry a hidden risk if
+they diverge (a silent history split, not an error) or, for Matrix/XMPP, an inverted rule (some
+fields must NOT match). The full breakdown, with runnable examples for every backend, is
+[`examples/multi-session`](../examples/multi-session/README.md) — worth reading before running more
+than one bridge instance against the same backend.

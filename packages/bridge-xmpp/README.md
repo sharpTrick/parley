@@ -26,6 +26,10 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 Archive ids are not lexically comparable, but core never compares cursors — the server's RSM
 `<after>` defines "strictly after" and the MAM archive defines order.
 
+> **`post`'s `identity` argument (your config's `identity.handle`) is not used.** The sender is the
+> MUC occupant nick — see "Multiple concurrent sessions" for why this is usually fine, but not
+> always.
+
 ### Notes / caveats
 
 - **MAM is mandatory.** Without `mod_mam` + `mod_muc_mam` (Prosody) / `mod_mam` (ejabberd) the
@@ -53,6 +57,39 @@ backend_config:
   password: "parleypass"             # default — keep secrets in .env, never commit
   # nick: optional; defaults to a unique per-connection value
 ```
+
+## Multiple concurrent sessions (one `backend_config` per config file, same server)
+
+A real deployment is several configs — one per Claude Code session plus one for the remote/chat
+server — all pointed at the same XMPP server. `service`/`domain`/`muc_service` must be **identical**
+across every one of them; `username`/`password` should usually match too, **but `nick` is the one
+field that must NOT, if you set it at all**:
+
+- **`service` / `domain` / `muc_service`** — the obvious ones.
+- **`username` / `password`** — as noted above, `post()` ignores the seam's `identity`, so the
+  actual sender is the MUC nick, not `identity.handle`. Unlike Matrix, though, sharing one XMPP
+  account across sessions is usually **fine**: leaving `nick` unset (the default) auto-generates a
+  random nick per connection, so every session still gets its own distinct sender for free even
+  with the same login.
+- **`nick` — must be unique per concurrent session if you set it.** Pin it to a fixed, readable
+  value and copy that same config to a second concurrent session, and the second session's MUC
+  join **fails outright** — unlike every other divergence risk on this page, this one is a loud
+  error, not a silent split, because MUC requires unique nicknames per room. Leave it unset unless
+  you need stable names, and if you do set it, give each session its own.
+
+Runnable multi-config examples (two Code sessions + a remote/chat config, sharing one XMPP account
+with auto-generated nicks): [`examples/multi-session/xmpp`](../../examples/multi-session/README.md).
+
+## Retention (server-side, not configured by this plugin)
+
+As with Matrix, retention here is a **server** feature, not something this plugin's account can
+turn on itself — catch-up is a MAM query, so MAM's own archive-expiry setting is the retention
+knob. Prosody's `mod_mam` has `archive_expires_after` (e.g. `"1w"`, `"1m"`, or `"never"` —
+Prosody's own default is `"1w"`, so a Parley deployment that wants longer history must raise this
+explicitly); ejabberd's `mod_mam` has an analogous `default_shaping`/archive-cleanup config. Set it
+on the server if you want a retention window — this plugin has no opinion on it and needs no
+changes either way. As with the other backends, once an archived message expires, `fetchRecent`
+just returns less history, with no error signaling that anything was pruned.
 
 ## Run an XMPP server (with MAM)
 

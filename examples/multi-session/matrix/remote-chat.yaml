@@ -1,0 +1,22 @@
+identity:
+  handle: "owner"                          # ignored by Matrix's post() — the account below is what matters.
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: false
+  limit: 100
+live_push:
+  enabled: false
+permissions:
+  skip_permissions: false
+
+backend: local-matrix
+backend_config:
+  homeserver_url: "https://matrix.internal:8008"   # identical to both code-agent-*.yaml
+  server_name: "parley.local"                        # identical
+  # Its own account too — so a transcript can distinguish "the chat/remote side posted this"
+  # from either Code session, exactly like agent-a/agent-b use distinct accounts from each other.
+  user: "parley-owner"
+  password: "change-me-owner"
+  sync_timeout_ms: 25000

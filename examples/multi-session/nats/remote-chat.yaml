@@ -1,0 +1,19 @@
+identity:
+  handle: "owner"
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: false
+  limit: 100
+live_push:
+  enabled: false
+permissions:
+  skip_permissions: false
+
+backend: local-nats
+backend_config:
+  servers: "nats.internal:4222"   # identical to both code-agent-*.yaml
+  subject_prefix: "parley."       # identical
+  stream_prefix: "PARLEY_"        # identical
+  retention_days: 30               # identical

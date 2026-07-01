@@ -24,6 +24,10 @@ resolveIdentity`); adding it required **zero** changes to `@parley/core`.
 `timestamp` ← `new Date(event.origin_server_ts).toISOString()` (informational only — never used for
 ordering or dedup).
 
+> **`post`'s `identity` argument (your config's `identity.handle`) is not used.** The homeserver
+> stamps `sender` from whichever account is logged in (`user`/`password` below) — see "Multiple
+> concurrent sessions" for why this matters.
+
 ## A note on room-creation rate limits (`shared_room`)
 
 Synapse rate-limits **room creation** hard — empirically ~2-room burst per user, then ~1 room every
@@ -51,6 +55,42 @@ fixture uses this mode against a stable `#parley_conformance:parley.local`.
 | `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. |
 
 Secrets live in `backend_config` / `.env`, never in code.
+
+## Multiple concurrent sessions (one `backend_config` per config file, same homeserver)
+
+A real deployment is several configs — one per Claude Code session plus one for the remote/chat
+server — all pointed at the same homeserver. `homeserver_url`/`server_name`/`shared_room` must be
+**identical** across every one of them, but **`user`/`password` are the one exception to that
+rule** — they should each be **different**:
+
+- **`homeserver_url` / `server_name`** — the obvious ones; a mismatch means different servers or
+  broken room aliases.
+- **`shared_room`** — must agree too: if one config sets it and another doesn't, sessions look in
+  different rooms for "the same" topic.
+- **`user` / `password` — should NOT match, unlike every other backend's credentials.** As noted
+  above, `post()` ignores the seam's `identity` argument entirely — the homeserver stamps `sender`
+  from whichever account is logged in here. Give every session the same Matrix account (as you
+  would for SQLite's `db_path` or Redis's `url`) and **every message from every session shows up as
+  sent by that one account** — `identity.handle` silently has no effect. If you want per-session
+  attribution (so a transcript can tell `agent-a` and `agent-b` apart), provision a **distinct
+  Matrix account per session** and put its `user`/`password` here — the same role `identity.handle`
+  plays for SQLite/Redis/NATS, just carried in `backend_config` instead of the per-instance block.
+- **`sync_timeout_ms`** is safe to vary per session.
+
+Runnable multi-config examples (two Code sessions with distinct accounts + a remote/chat config,
+all sharing one homeserver): [`examples/multi-session/matrix`](../../examples/multi-session/README.md).
+
+## Retention (server-side, not configured by this plugin)
+
+Unlike SQLite/Redis/NATS, message retention here isn't something an unprivileged bridge account
+can turn on itself — it's a **homeserver** feature. Synapse supports a
+[retention policy](https://element-hq.github.io/synapse/latest/message_retention_policies.html)
+(a `retention` block in `homeserver.yaml` plus an optional per-room `m.room.retention` state event)
+that a scheduled purge job enforces; running the actual purge additionally needs the **admin
+API** (`purge_history`), which a normal `m.login.password` user does not have. If you want
+Parley's Matrix history to expire, configure retention on the homeserver — this plugin has no
+opinion on it and needs no changes either way. As with the other backends, an expired room's
+history is just gone from `fetchRecent`/`messages` — no error signals it.
 
 ## Running a homeserver
 

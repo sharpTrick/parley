@@ -1,0 +1,20 @@
+# Claude Code session #2 — a different task, same shared database.
+instance_id: "code-agent-b"
+identity:
+  handle: "agent-b"
+topics:
+  - "ctx-infra"                            # a different subset of topics — fine, per-session
+catchup:
+  on_start: true
+  limit: 50
+live_push:
+  enabled: true
+  mention_filter: false
+permissions:
+  skip_permissions: false
+
+backend: local-sqlite
+backend_config:
+  db_path: "/var/lib/parley/parley-shared.db"   # identical to code-agent-a.yaml — same file
+  poll_interval_ms: 1000                         # differs from A — fine, latency-only
+  retention_days: 30                             # identical to code-agent-a.yaml — see its comment

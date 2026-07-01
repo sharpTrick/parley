@@ -1,0 +1,28 @@
+# Claude Code session #1. Per-instance fields below are free to vary between sessions.
+instance_id: "code-agent-a"
+identity:
+  handle: "agent-a"                       # SQLite uses this as the stored `sender` — per-session, safe.
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 100
+live_push:
+  enabled: true
+  mention_filter: true
+permissions:
+  skip_permissions: false
+
+backend: local-sqlite
+backend_config:
+  # ── Must be IDENTICAL across every config sharing this database. ──
+  # Silent-split risk: a relative path resolved from a different launch `cwd` is a DIFFERENT
+  # file with no error — always prefer an absolute path in a multi-session deployment.
+  db_path: "/var/lib/parley/parley-shared.db"
+  # ── Safe to differ: pure per-instance latency knob, no correctness impact. ──
+  poll_interval_ms: 500
+  # ── Should be IDENTICAL (or unset) across every config: retention prunes the WHOLE shared
+  #    file, not just this session's topics. Whichever session's schedule is most aggressive
+  #    wins over time, since deletes are irreversible. ──
+  retention_days: 30

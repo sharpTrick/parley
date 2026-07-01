@@ -1,0 +1,33 @@
+instance_id: "code-agent-a"
+identity:
+  handle: "agent-a"                       # NOTE: XMPP's post() ignores this too — see backend_config below.
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 100
+live_push:
+  enabled: true
+  mention_filter: true
+permissions:
+  skip_permissions: false
+
+backend: local-xmpp
+backend_config:
+  # ── Must be IDENTICAL across every config on this server. ──
+  service: "xmpp://xmpp.internal:5222"
+  domain: "parley.local"
+  muc_service: "muc.parley.local"
+  # ── Same account as code-agent-b.yaml/remote-chat.yaml is FINE here (unlike Matrix) — see
+  #    the `nick` note below for why. ──
+  username: "parley"
+  password: "change-me"
+  # ── `nick` is intentionally left UNSET. Like Matrix, XMPP's post() ignores the seam's
+  #    `identity` — the real sender is the MUC nick, not `identity.handle` above. But unlike
+  #    Matrix, leaving `nick` unset is safe to share across sessions: the plugin auto-generates
+  #    a random one per connection (`${username}-${rand()}`), so each session still gets its
+  #    own distinct (if randomly-labeled) sender for free. Only pin `nick` to a fixed value if
+  #    you want a stable, readable name — and if you do, it MUST be unique per concurrent
+  #    session (MUC requires unique nicknames per room; reusing one across sessions makes the
+  #    second session's join fail outright, not silently misattribute).

@@ -1,0 +1,21 @@
+identity:
+  handle: "owner"
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: false
+  limit: 100
+live_push:
+  enabled: false
+permissions:
+  skip_permissions: false
+
+backend: local-xmpp
+backend_config:
+  service: "xmpp://xmpp.internal:5222"   # identical to both code-agent-*.yaml
+  domain: "parley.local"                  # identical
+  muc_service: "muc.parley.local"         # identical
+  username: "parley"                       # identical
+  password: "change-me"                    # identical
+  # `nick` left unset — auto-randomized, distinct from both Code sessions' nicks for free.

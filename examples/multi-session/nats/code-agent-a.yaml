@@ -1,0 +1,29 @@
+instance_id: "code-agent-a"
+identity:
+  handle: "agent-a"                       # NATS stores this as the `sender` field — per-session, safe.
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 100
+live_push:
+  enabled: true
+  mention_filter: true
+permissions:
+  skip_permissions: false
+
+backend: local-nats
+backend_config:
+  # ── Must be IDENTICAL across every config sharing this NATS cluster. ──
+  servers: "nats.internal:4222"
+  # ── Must ALSO be identical — same hidden risk as Redis's key_prefix: a mismatch here
+  #    silently maps "the same" topic to a different subject/stream, splitting history with
+  #    no error while every other field still looks consistent. ──
+  subject_prefix: "parley."
+  stream_prefix: "PARLEY_"
+  # ── Should be identical, and for a different reason than sqlite/redis: this is LOCKED IN
+  #    at stream creation. Whichever session's instance first touches a brand-new topic wins
+  #    this value for that topic's stream PERMANENTLY — other configs' values are silently
+  #    never applied. Keeping every config identical makes that race harmless. ──
+  retention_days: 30

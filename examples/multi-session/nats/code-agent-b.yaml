@@ -1,0 +1,20 @@
+instance_id: "code-agent-b"
+identity:
+  handle: "agent-b"
+topics:
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 50
+live_push:
+  enabled: true
+  mention_filter: false
+permissions:
+  skip_permissions: false
+
+backend: local-nats
+backend_config:
+  servers: "nats.internal:4222"   # identical to code-agent-a.yaml
+  subject_prefix: "parley."       # identical (see A's comment on the stream-creation race)
+  stream_prefix: "PARLEY_"        # identical
+  retention_days: 30               # identical

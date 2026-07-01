@@ -1,0 +1,36 @@
+instance_id: "code-agent-a"
+identity:
+  handle: "agent-a"                       # NOTE: Matrix's post() ignores this — see backend_config below.
+topics:
+  - "ctx-payments"
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 100
+live_push:
+  enabled: true
+  mention_filter: true
+permissions:
+  skip_permissions: false
+
+backend: local-matrix
+backend_config:
+  # ── Must be IDENTICAL across every config on this homeserver. ──
+  homeserver_url: "https://matrix.internal:8008"
+  server_name: "parley.local"
+  # ── Must ALSO be identical if used: mismatched shared/per-topic-room mode means sessions
+  #    look in different rooms for "the same" topic. Leave unset in production (real
+  #    per-topic rooms); this repo's own conformance fixture is the one place it's needed. ──
+  # shared_room: "parley_conformance"
+  #
+  # ── THE EXCEPTION — must NOT match code-agent-b.yaml. Matrix's post() ignores the seam's
+  #    `identity` (the `identity.handle` above) entirely; the homeserver stamps `sender` from
+  #    whichever account is logged in here. Reuse the same user/password across sessions and
+  #    EVERY message from every session shows up as sent by this one Matrix account —
+  #    `identity.handle` has silently no effect. Give each session its own provisioned account
+  #    if you want per-session attribution, same idea as `instance_id`, just carried here
+  #    instead of in the per-instance block above. ──
+  user: "parley-agent-a"
+  password: "change-me-agent-a"
+  # ── Safe to differ: per-instance /sync long-poll timeout. ──
+  sync_timeout_ms: 25000

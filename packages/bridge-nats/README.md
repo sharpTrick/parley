@@ -25,10 +25,41 @@ backend_config:
   servers: "127.0.0.1:4222"   # string or list; default
   subject_prefix: "parley."    # default; topic → subject parley.<topic>
   stream_prefix: "PARLEY_"     # default; topic → stream PARLEY_<topic>
+  retention_days: 30           # optional; omit to keep every message forever (the default)
 ```
 
 Topic tokens must not contain `.`, `*`, `>`, or whitespace (NATS subject rules); they're sanitized
 to `_` for safety.
+
+## Retention (optional)
+
+`retention_days` sets the per-topic stream's native `max_age` at creation time — JetStream's own
+built-in retention (this plugin just supplies the value), so no separate pruning code runs here.
+It's off by default — `max_age` is unset and JetStream keeps every message forever unless you opt
+in. **It only applies when this plugin is the one that creates the stream** (the first `post`,
+`fetchRecent`, or `subscribe` on a fresh topic) — changing `retention_days` later does not
+retroactively update an already-existing stream; use `nats stream edit` (or recreate it) for that.
+As with the other backends, catch-up after the retention window just returns less history, with no
+error signaling that anything expired.
+
+## Multiple concurrent sessions (one `backend_config` per config file, same cluster)
+
+A real deployment is several configs — one per Claude Code session plus one for the remote/chat
+server — all pointed at the same NATS. `servers`, `subject_prefix`/`stream_prefix`, and
+`retention_days` must be **identical** across every one of them:
+
+- **`servers`** — the obvious one.
+- **`subject_prefix`/`stream_prefix`** — the hidden one, same story as Redis's `key_prefix`: a
+  mismatch silently maps "the same" topic to a different subject/stream while every other field
+  still looks consistent.
+- **`retention_days`** — the trickiest, because it isn't really "per config" at all: it's **locked
+  in at stream creation**. Whichever session's instance is first to touch a brand-new topic wins
+  that topic's `max_age` *permanently*; every other config's value for that topic is silently never
+  applied. Divergence here is a race, not a choice — keep it identical everywhere so the race is
+  harmless.
+
+Runnable multi-config examples (two Code sessions + a remote/chat config, all sharing one cluster):
+[`examples/multi-session/nats`](../../examples/multi-session/README.md).
 
 ## Run NATS (JetStream)
 

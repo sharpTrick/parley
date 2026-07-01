@@ -1,0 +1,23 @@
+instance_id: "code-agent-b"
+identity:
+  handle: "agent-b"
+topics:
+  - "ctx-infra"
+catchup:
+  on_start: true
+  limit: 50
+live_push:
+  enabled: true
+  mention_filter: false
+permissions:
+  skip_permissions: false
+
+backend: local-xmpp
+backend_config:
+  service: "xmpp://xmpp.internal:5222"   # identical to code-agent-a.yaml
+  domain: "parley.local"                  # identical
+  muc_service: "muc.parley.local"         # identical
+  username: "parley"                       # identical — fine, see code-agent-a.yaml's nick note
+  password: "change-me"                    # identical
+  # `nick` left unset here too — this session gets its own random nick automatically. Do NOT
+  # copy a pinned `nick` value from another config; see code-agent-a.yaml for why.
