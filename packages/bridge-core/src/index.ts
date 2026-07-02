@@ -22,7 +22,11 @@ export { parseMentions } from './mentions.js';
 // Config (DESIGN §11).
 export {
   ConfigSchema,
+  AuthSchema,
+  OidcAuthSchema,
   type ParleyConfig,
+  type AuthConfig,
+  type OidcAuthConfig,
   parseConfig,
   loadConfig,
   instanceIdOf,

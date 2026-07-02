@@ -3,6 +3,55 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
 /**
+ * Remote-mode auth via an external OIDC IdP (e.g. Keycloak) — the delegated resource-server
+ * variant of DESIGN §10. Parley hosts no /authorize,/token,/register in this mode; it publishes
+ * Protected Resource Metadata pointing at the issuer and validates inbound Bearer JWTs locally.
+ * Nothing in this block is a secret (issuer/audience/claim policy are public-side config).
+ */
+export const OidcAuthSchema = z.object({
+  /** OIDC issuer, e.g. https://kc.example.com/realms/myrealm. Discovery is fetched from
+   *  `<issuer>/.well-known/openid-configuration` at startup. */
+  issuer: z.string().url(),
+  /** Expected `aud` value. Default: the canonical resource id (public URL + mcpPath). Keycloak
+   *  ignores RFC 8707 `resource`, so an audience mapper must emit this exact string — see
+   *  docs/keycloak-integration.md. */
+  audience: z.string().min(1).optional(),
+  /** Override the JWKS URI (default: `jwks_uri` from discovery). */
+  jwks_uri: z.string().url().optional(),
+  /** If set, the token's `scope` (space-separated) must include this value. */
+  required_scope: z.string().min(1).optional(),
+  /** Identity gates preserving the single-tenant posture: any that are set must ALL pass.
+   *  Issuer + audience validation is always mandatory regardless. */
+  allowed_subjects: z.array(z.string().min(1)).nonempty().optional(),
+  /** Matched against the `preferred_username` claim. */
+  allowed_usernames: z.array(z.string().min(1)).nonempty().optional(),
+  /** Required realm role (Keycloak `realm_access.roles`). */
+  required_role: z.string().min(1).optional(),
+  /** exp/nbf tolerance in seconds. */
+  clock_skew_s: z.number().int().min(0).max(300).default(30),
+});
+
+export type OidcAuthConfig = z.infer<typeof OidcAuthSchema>;
+
+/** Remote-mode auth selection: the built-in single-tenant OAuth AS (default) or external OIDC. */
+export const AuthSchema = z
+  .object({
+    mode: z.enum(['builtin', 'oidc']).default('builtin'),
+    oidc: OidcAuthSchema.optional(),
+  })
+  .superRefine((a, ctx) => {
+    if (a.mode === 'oidc' && a.oidc === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['oidc'],
+        message: 'auth.mode "oidc" requires an auth.oidc block',
+      });
+    }
+  });
+
+export type AuthConfig = z.infer<typeof AuthSchema>;
+
+/**
  * The single config object that drives a bridge (DESIGN §11). Sane defaults everywhere.
  * `backend_config` is opaque to core and passed verbatim to the plugin's `connect()`.
  */
@@ -37,6 +86,8 @@ export const ConfigSchema = z.object({
       skip_permissions: z.boolean().default(false),
     })
     .default({}),
+  /** Remote-mode auth selection; ignored in local stdio mode. Absent = built-in OAuth AS. */
+  auth: AuthSchema.default({}),
   /** Opaque to core; handed to the plugin verbatim (DESIGN §11). */
   backend_config: z.record(z.unknown()).default({}),
 });
