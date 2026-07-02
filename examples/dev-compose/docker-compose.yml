@@ -46,6 +46,27 @@ services:
     ports:
       - "8008:8008"
 
+  # --- post-v1 Keycloak (external-OIDC auth mode for remote/chat; docs/keycloak-integration.md) ---
+  # Imports the throwaway `parley` realm: users parley/parleypass (has the parley-owner role) and
+  # stranger/parleypass (doesn't), plus the parley-aud audience-mapper scope on client parley-test.
+  # Gated test: packages/bridge-core/src/auth/keycloak.e2e.test.ts (PARLEY_KEYCLOAK_URL overrides).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    volumes:
+      - ./keycloak/parley-realm.json:/opt/keycloak/data/import/parley-realm.json:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # The image ships no curl/wget; bash's /dev/tcp probe is the standard trick.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
   # --- v0.5 XMPP / Prosody (MUC = topic, MAM = fetchRecent/cursor, PubSub = subscribe) ---
   # MAM MUST be enabled or catch-up has no archive to read — see prosody/prosody.cfg.lua.
   prosody:
