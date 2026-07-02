@@ -75,7 +75,8 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
     }
 
     if (!this.passesIdentityGates(payload)) {
-      throw new InvalidTokenError('token does not satisfy this server’s access policy');
+      // ASCII only: the message ends up in the WWW-Authenticate header, which rejects non-Latin1.
+      throw new InvalidTokenError('token does not satisfy this server access policy');
     }
 
     const clientId =

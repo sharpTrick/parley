@@ -1,6 +1,6 @@
 import {
-  OAuthMetadataSchema,
-  type OAuthMetadata,
+  OpenIdProviderDiscoveryMetadataSchema,
+  type OpenIdProviderDiscoveryMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 /**
@@ -15,7 +15,7 @@ import {
 export async function fetchOidcDiscovery(
   issuer: string,
   fetchFn: typeof fetch = fetch,
-): Promise<OAuthMetadata> {
+): Promise<OpenIdProviderDiscoveryMetadata> {
   const base = issuer.endsWith('/') ? issuer : `${issuer}/`;
   const url = new URL('.well-known/openid-configuration', base).href;
 
@@ -31,9 +31,9 @@ export async function fetchOidcDiscovery(
     throw new Error(`OIDC discovery failed: ${url} returned HTTP ${res.status}`);
   }
 
-  let metadata: OAuthMetadata;
+  let metadata: OpenIdProviderDiscoveryMetadata;
   try {
-    metadata = OAuthMetadataSchema.parse(await res.json());
+    metadata = OpenIdProviderDiscoveryMetadataSchema.parse(await res.json());
   } catch (err) {
     throw new Error(
       `OIDC discovery failed: ${url} returned an invalid document (${err instanceof Error ? err.message : String(err)})`,

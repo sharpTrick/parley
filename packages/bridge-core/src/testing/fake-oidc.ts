@@ -52,6 +52,8 @@ export async function startFakeOidc(): Promise<FakeOidc> {
       token_endpoint: `${issuer}/token`,
       jwks_uri: `${issuer}/jwks`,
       response_types_supported: ['code'],
+      subject_types_supported: ['public'],
+      id_token_signing_alg_values_supported: ['RS256'],
       code_challenge_methods_supported: ['S256'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
     });
