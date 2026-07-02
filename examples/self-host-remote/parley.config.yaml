@@ -19,5 +19,16 @@ live_push:
 permissions:
   skip_permissions: false
 
+# auth:                      # omit entirely for the built-in single-tenant OAuth AS (default)
+#   mode: oidc               # delegate authorization to an external OIDC IdP (e.g. Keycloak)
+#   oidc:
+#     issuer: "https://kc.example.com/realms/myrealm"
+#     audience: "parley-mcp"           # must match your Keycloak audience mapper (see docs)
+#     required_role: "parley-owner"    # realm-role gate (recommended)
+#     # allowed_usernames: ["alice"]   # and/or allowed_subjects: [...]
+#     # required_scope: "mcp"          # only if your IdP maps a default scope
+#     # jwks_uri / clock_skew_s: rarely needed overrides
+# Full reference + Keycloak realm setup: docs/keycloak-integration.md
+
 backend_config:
   db_path: "./parley-remote.db"
