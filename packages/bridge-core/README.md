@@ -45,6 +45,7 @@ is informational only; ordering and dedup never use it.
 | Local bridge | `buildBridge`, `createStdioBridge` | Composes plugin + tools + push loop into one stdio MCP server. |
 | Remote bridge (v0.2) | `buildReactiveServer`, `createRemoteHttpApp`, `createOAuthRemoteApp` | Streamable-HTTP transport + single-tenant OAuth 2.1 + PKCE front door. |
 | Owner auth | `ParleyOAuthProvider`, `hashOwnerSecret`, `makeOwnerVerifier`, `ownerVerifierFromPassphrase` | Owner-secret verification for remote/chat mode. |
+| External-OIDC auth | `createRemoteAuthApp`, `createOidcRemoteApp`, `OidcTokenVerifier`, `fetchOidcDiscovery` | Delegated resource-server mode (RFC 9728): an external IdP (e.g. Keycloak) hosts the AS; selected via `cfg.auth.mode`. |
 
 ## Config (`parley.config.yaml`)
 
@@ -109,6 +110,12 @@ Single-tenant: the instance authenticates exactly one owner; backend credentials
 server, and Claude only ever holds a consented, audience-bound token. Full deployment guide
 (HTTPS, the public-exposure constraint, and Anthropic IP-range allowlisting) is in
 [`examples/self-host-remote`](../../examples/self-host-remote/README.md).
+
+Alternatively, delegate authorization to an external OIDC IdP (e.g. Keycloak) and let Parley act
+as a pure resource server — set `auth: { mode: oidc, oidc: { issuer, audience, ... } }` in the
+config and compose with `createRemoteAuthApp(plugin, cfg, { publicUrl })` (which dispatches
+between the two modes; no owner secret is needed in oidc mode). Realm setup, config reference,
+and security notes: [`docs/keycloak-integration.md`](../../docs/keycloak-integration.md).
 
 ## Testing
 

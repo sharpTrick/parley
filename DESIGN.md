@@ -346,6 +346,12 @@ authenticates exactly one owner.
 - **`mcp-remote` escape hatch (Desktop only).** A local stdio proxy can broker OAuth from the
   user's machine so the bridge need not be public — but it does **not** serve claude.ai
   web/mobile, so it's a documented option, not the baseline.
+- **Bring-your-own-IdP variant (post-v1).** `auth.mode: oidc` in the config swaps the built-in
+  AS for delegation to an external OIDC provider (e.g. Keycloak): Parley becomes a pure
+  resource server (RFC 9728) that publishes resource metadata pointing at the IdP and validates
+  its JWTs locally (issuer + audience always; configurable claim gates such as a required realm
+  role restore the single-tenant posture). This changes **who hosts the AS**, not the
+  OAuth-is-mandatory rule — see `docs/keycloak-integration.md`.
 
 ---
 

@@ -128,6 +128,21 @@ works end to end. Do not start v0.2 before this.
 
 ---
 
+## Post-v1: external OIDC (Keycloak) auth mode for remote/chat
+
+- [x] K-1. Config: optional `auth` block (`mode: builtin | oidc` + `auth.oidc` schema); absent =
+      builtin, fully backward compatible.
+- [x] K-2. `bridge-core/auth`: `OidcTokenVerifier` (JWKS sig, iss, exp/nbf ± skew, aud always;
+      scope + identity gates on top), `fetchOidcDiscovery`, and the delegated-RS composition
+      `createOidcRemoteApp` (PRM → external issuer; no local /authorize, /token, /register).
+- [x] K-3. `createRemoteAuthApp` selector; `examples/self-host-remote` boots either mode from
+      config (no owner secret needed in oidc mode).
+- [x] K-4. Tests: fake in-process IdP (always-run unit + e2e through the real MCP SDK client)
+      plus a dev-compose Keycloak realm import with a gated live suite (self-skips when down).
+- [x] K-5. Docs: `docs/keycloak-integration.md` (realm setup: audience mapper, DCR trusted
+      hosts, owner role; config reference; security notes) + README/DESIGN updates.
+- [x] K-6. Zero changes to `createOAuthRemoteApp` / `ParleyOAuthProvider` / `transport/http.ts` (⚠).
+
 ## Deferred (post-v1, do NOT build in v1)
 
 - [ ] Spawn-on-unknown-handle (launch a Code instance for a not-yet-running handle).
