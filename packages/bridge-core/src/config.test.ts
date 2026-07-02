@@ -45,4 +45,58 @@ describe('config loader', () => {
   it('rejects a config with no handle', () => {
     expect(() => parseConfig({ topics: ['a'] })).toThrow();
   });
+
+  it('defaults auth to the built-in OAuth AS when absent', () => {
+    const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'] });
+    expect(cfg.auth).toEqual({ mode: 'builtin' });
+  });
+
+  it('rejects auth.mode oidc without an oidc block', () => {
+    expect(() =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['a'], auth: { mode: 'oidc' } }),
+    ).toThrow(/auth\.oidc/);
+  });
+
+  it('parses a full oidc auth block with per-field defaults', () => {
+    const cfg = parseConfig({
+      identity: { handle: 'h' },
+      topics: ['a'],
+      auth: {
+        mode: 'oidc',
+        oidc: {
+          issuer: 'https://kc.example.com/realms/parley',
+          audience: 'parley-mcp',
+          required_role: 'parley-owner',
+          allowed_usernames: ['alice'],
+        },
+      },
+    });
+    expect(cfg.auth.mode).toBe('oidc');
+    expect(cfg.auth.oidc).toEqual({
+      issuer: 'https://kc.example.com/realms/parley',
+      audience: 'parley-mcp',
+      required_role: 'parley-owner',
+      allowed_usernames: ['alice'],
+      clock_skew_s: 30,
+    });
+  });
+
+  it('rejects a bad issuer URL, empty gate lists, and out-of-range clock skew', () => {
+    const base = { identity: { handle: 'h' }, topics: ['a'] };
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer: 'not-a-url' } } }),
+    ).toThrow();
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: { mode: 'oidc', oidc: { issuer: 'https://kc.example.com/realms/x', allowed_subjects: [] } },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: { mode: 'oidc', oidc: { issuer: 'https://kc.example.com/realms/x', clock_skew_s: 301 } },
+      }),
+    ).toThrow();
+  });
 });

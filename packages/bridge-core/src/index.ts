@@ -22,7 +22,11 @@ export { parseMentions } from './mentions.js';
 // Config (DESIGN §11).
 export {
   ConfigSchema,
+  AuthSchema,
+  OidcAuthSchema,
   type ParleyConfig,
+  type AuthConfig,
+  type OidcAuthConfig,
   parseConfig,
   loadConfig,
   instanceIdOf,
@@ -68,3 +72,18 @@ export {
   type ParleyOAuthProviderOptions,
 } from './auth/oauth-provider.js';
 export { hashOwnerSecret, makeOwnerVerifier, ownerVerifierFromPassphrase } from './auth/owner.js';
+// Remote mode auth, external-OIDC variant (e.g. Keycloak): delegated resource server (RFC 9728) —
+// the IdP hosts the AS; Parley only publishes resource metadata and validates JWTs locally.
+export {
+  createOidcRemoteApp,
+  type OidcRemoteOptions,
+  type OidcRemoteServer,
+} from './auth/oidc-remote.js';
+export { OidcTokenVerifier, type OidcVerifierOptions } from './auth/oidc-verifier.js';
+export { fetchOidcDiscovery } from './auth/oidc-discovery.js';
+// The mode selector driven by cfg.auth (builtin | oidc).
+export {
+  createRemoteAuthApp,
+  type RemoteAuthOptions,
+  type RemoteAuthServer,
+} from './auth/remote-auth.js';

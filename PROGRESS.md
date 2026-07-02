@@ -177,3 +177,29 @@ stays valid — a stale reader just gets less history back, never a wrong/duplic
 (Synapse retention policy + admin-API purge; Prosody/ejabberd MAM `archive_expires_after`), not
 something an unprivileged bridge account can enact itself. Zero `bridge-core` changes (fully
 inside each plugin's opaque `backend_config`); one new sqlite unit test (96 → 97 tests).
+
+## Post-v1: external OIDC (Keycloak) auth mode for remote/chat
+
+`auth.mode: oidc` in the config now swaps the built-in single-tenant OAuth AS for **delegation to
+an external OIDC IdP** (Keycloak is the documented/tested target): Parley becomes a pure resource
+server (RFC 9728) — PRM points at the realm issuer, the realm's AS metadata is mirrored at the
+resource origin, no /authorize,/token,/register are hosted, and inbound JWTs are validated locally
+(`OidcTokenVerifier` via jose: JWKS sig, iss, exp/nbf±skew, aud always; optional scope +
+identity gates `allowed_subjects`/`allowed_usernames`/`required_role` restore the single-tenant
+posture). `createRemoteAuthApp` dispatches on `cfg.auth.mode`; the built-in path and
+`transport/http.ts` are untouched, and jose dedupes to the MCP SDK's own copy (zero new packages).
+
+**Verified:** always-run tests against an in-process fake IdP (12 verifier units + 11 e2e through
+the real MCP SDK client + 2 example smokes, 81 core tests total green) and a gated live suite
+(6/6) against dev-compose Keycloak 26.3, plus a manual smoke of the example server in oidc mode.
+Two live-debugging finds worth remembering: (1) declaring `clientScopes` in a Keycloak realm
+import REPLACES the built-in scopes — the throwaway realm defines minimal copies of
+basic/profile/roles or tokens carry no `realm_access`/`preferred_username`; (2) messages thrown
+from a bearer verifier end up in the WWW-Authenticate header, which rejects non-Latin-1 — keep
+them ASCII or every 401 becomes a 500.
+
+**Keycloak caveat (documented prominently in docs/keycloak-integration.md):** Keycloak ignores
+RFC 8707 `resource` params, so an **audience mapper** (realm-default client scope, e.g.
+`aud: parley-mcp`) is mandatory — without it every token carries `aud: ["account"]` and is
+correctly rejected. DCR for Claude's connector additionally needs the realm's anonymous
+client-registration trusted-hosts policy configured.

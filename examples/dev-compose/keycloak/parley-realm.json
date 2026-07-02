@@ -1,0 +1,135 @@
+{
+  "realm": "parley",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "parley-owner",
+        "description": "Grants access to the Parley MCP resource server (the single-tenant gate)"
+      }
+    ]
+  },
+  "clientScopes": [
+    {
+      "name": "basic",
+      "description": "Minimal copy of the built-in basic scope (declaring clientScopes in an import REPLACES the built-ins, so the ones this realm relies on are defined explicitly)",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "false", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": { "access.token.claim": "true" }
+        }
+      ]
+    },
+    {
+      "name": "profile",
+      "description": "Minimal copy of the built-in profile scope: preferred_username for the allowed_usernames gate",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "roles",
+      "description": "Minimal copy of the built-in roles scope: realm_access.roles for the required_role gate",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "false", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "name": "parley-aud",
+      "description": "Injects the Parley resource audience. Keycloak ignores RFC 8707 resource params, so the aud claim must be mapped explicitly (docs/keycloak-integration.md).",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "parley-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "parley-mcp",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "defaultDefaultClientScopes": ["basic", "profile", "roles", "parley-aud"],
+  "clients": [
+    {
+      "clientId": "parley-test",
+      "name": "Parley test client (direct-access grants for the gated e2e suite)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": ["http://127.0.0.1/*", "http://localhost/*"],
+      "webOrigins": ["+"]
+    }
+  ],
+  "users": [
+    {
+      "username": "parley",
+      "enabled": true,
+      "email": "parley@example.test",
+      "emailVerified": true,
+      "firstName": "Parley",
+      "lastName": "Owner",
+      "credentials": [{ "type": "password", "value": "parleypass", "temporary": false }],
+      "realmRoles": ["parley-owner", "default-roles-parley"]
+    },
+    {
+      "username": "stranger",
+      "enabled": true,
+      "email": "stranger@example.test",
+      "emailVerified": true,
+      "firstName": "Some",
+      "lastName": "Stranger",
+      "credentials": [{ "type": "password", "value": "parleypass", "temporary": false }],
+      "realmRoles": ["default-roles-parley"]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ docker compose up redis      # v0.3
 docker compose up nats       # v0.5
 docker compose up synapse    # v0.4  (see first-run note below)
 docker compose up prosody    # v0.5  (MAM enabled in prosody/prosody.cfg.lua)
+docker compose up keycloak   # post-v1 external-OIDC auth mode
 ```
 
 ## Redis (v0.3) — ready to run
@@ -45,5 +46,26 @@ docker compose exec synapse register_new_matrix_user -u parley -p parley -a -c /
 docker compose exec prosody prosodyctl register parley parley.local parley
 ```
 
-> These four compose services were authored from upstream conventions; Synapse and Prosody in
+## Keycloak (post-v1 external-OIDC auth mode) — ready to run
+
+`quay.io/keycloak/keycloak:26.3` in `start-dev` mode on `localhost:8080`, auto-importing the
+throwaway **`parley` realm** from `keycloak/parley-realm.json`:
+
+- users `parley` / `parleypass` (has the `parley-owner` realm role) and `stranger` / `parleypass`
+  (doesn't);
+- client scope `parley-aud` with an **audience mapper** injecting `aud: parley-mcp` — Keycloak
+  ignores RFC 8707 `resource` parameters, so the audience must be mapped (this is the same setup
+  a production realm needs; see `docs/keycloak-integration.md`);
+- public client `parley-test` with direct-access grants, used by the gated test to mint tokens.
+
+The gated suite `packages/bridge-core/src/auth/keycloak.e2e.test.ts` probes
+`http://127.0.0.1:8080/realms/parley` (override with `PARLEY_KEYCLOAK_URL`) and self-skips when
+the realm isn't up. Admin console: `admin` / `admin`.
+
+JSON can't carry comments, so one note that belongs in the realm file lives here instead: the
+import intentionally does **not** configure client-registration (DCR) trusted-hosts policies —
+that's admin-console work a real deployment needs for Claude's connector to register itself, and
+it is documented step by step in `docs/keycloak-integration.md`.
+
+> These compose services were authored from upstream conventions; Synapse and Prosody in
 > particular are validated against the conformance suite when their plugins are implemented.
