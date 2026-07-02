@@ -98,9 +98,23 @@ Keycloak restricts anonymous DCR with **client-registration policies**
   at their defaults unless they block registration; review what a policy relaxation exposes
   before changing it.
 
-Alternatively, skip anonymous DCR entirely by pre-registering a client for Claude and locking
-anonymous registration down — Claude supports supplying pre-registered client credentials for
-custom connectors. In that case give the pre-registered client the `parley-aud` scope directly.
+#### Alternative: pre-register a client (no anonymous DCR)
+
+If your realm forbids anonymous registration (common on shared/corporate Keycloak), skip DCR
+entirely — Claude's custom-connector settings accept a pre-registered OAuth client ID and
+secret. This keeps the realm fully locked down and makes the client explicit and auditable:
+
+1. **Clients → Create client.** Client ID e.g. `claude-connector`, protocol OpenID Connect.
+   Enable **Client authentication** (confidential) — or leave it public; Claude supports both.
+2. **Valid redirect URIs:** `https://claude.ai/api/mcp/auth_callback` (exactly; no wildcard
+   needed — the chat connector's callback is fixed).
+3. **Client scopes tab:** add `parley-aud` as a **Default** scope for this client (required if
+   you didn't make it a realm default in step 1 above).
+4. If confidential: **Credentials tab** → copy the client secret.
+5. In Claude's connector dialog, expand the advanced/OAuth settings and paste the client ID
+   (and secret). Claude then skips registration and goes straight to the PKCE login flow.
+
+No Parley configuration changes — token validation is identical in both variants.
 
 ### 3. The owner identity (single-tenant gate)
 
