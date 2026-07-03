@@ -1,0 +1,53 @@
+{
+  "name": "@sharptrick/parley-telegram",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "@sharptrick/parley-telegram — hosted-SaaS chat backend (per-chat message_id = cursor, getUpdates long-poll = subscribe, chat = topic; local observed-message store because the Bot API exposes no history) against the frozen Parley seam.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-telegram"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-telegram#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@sharptrick/parley-core": "^0.1.0"
+  },
+  "devDependencies": {
+    "@sharptrick/parley-conformance": "^0.1.0"
+  },
+  "keywords": [
+    "mcp",
+    "parley",
+    "telegram",
+    "message-bus",
+    "agent-messaging"
+  ]
+}
