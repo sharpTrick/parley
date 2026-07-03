@@ -1,0 +1,40 @@
+name: Publish (manual)
+
+# Manual escape hatch, for two cases:
+#   1. First publish of a brand-new package (before it has a trusted publisher / has never been
+#      on the registry) — run this once the new package exists in the tree.
+#   2. Recovery: an automated release published only some packages (registry hiccup). Re-run
+#      this with that release's version; publish-workspaces.mjs skips the ones already out.
+#
+# Pick the ref (branch/tag) to publish from in the "Run workflow" dialog; give the version to
+# stamp. Idempotent — safe to re-run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp & publish (e.g. 0.2.0)"
+        required: true
+
+permissions:
+  id-token: write # OIDC trusted publishing + npm provenance
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
+
+      - run: npm ci
+      - run: npm run build
+      - run: node scripts/stamp-version.mjs "${{ inputs.version }}"
+      - run: node scripts/publish-workspaces.mjs

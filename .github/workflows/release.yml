@@ -1,0 +1,66 @@
+name: Release
+
+# A merge to main IS a release (gated by your PR review). On every push to main this runs the
+# full test gate; if it passes, semantic-release reads the conventional commits since the last
+# vX.Y.Z tag, decides the bump, creates the tag + GitHub Release, stamps that one version across
+# all workspaces (lockstep), and publishes every public package to npm with provenance via
+# trusted publishing (OIDC — no NPM_TOKEN).
+#
+# No bump is committed back to main: the git tag + npm are the source of truth for the current
+# version. Keep non-release work on feature/dev branches. If tests fail, semantic-release never
+# runs, so a red main never publishes.
+
+on:
+  push:
+    branches: [main]
+
+# Never let two releases publish at once; don't cancel an in-flight publish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # semantic-release pushes the tag + creates the GitHub Release
+  id-token: write # OIDC trusted publishing + npm provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # semantic-release needs full history + tags to compute the bump
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; newer than what Node 22 bundles.
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
+
+      # --- Test gate (mirrors ci.yml: Redis + NATS run for real, Matrix/XMPP self-skip) ---
+      - name: Start Redis
+        run: docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
+      - name: Start NATS (JetStream)
+        run: docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
+      - name: Wait for Redis + NATS to accept connections
+        shell: bash
+        run: |
+          for port in 6379 4222; do
+            for i in $(seq 1 30); do
+              (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && { echo "port $port up"; break; }
+              sleep 1
+            done
+          done
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+      # --- Release: bump decided from commits, tag + GitHub Release, lockstep npm publish ---
+      - name: semantic-release
+        run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

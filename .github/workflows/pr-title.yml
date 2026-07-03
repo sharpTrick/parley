@@ -1,0 +1,23 @@
+name: PR title
+
+# A merge to main is a release, and the (squash-)merge commit subject is the PR title — which
+# semantic-release parses to choose the version bump. So the PR title must be a valid
+# conventional commit (feat:, fix:, feat!:, chore:, ci:, docs: ...). This check enforces that,
+# so a merge can't silently produce the wrong bump (or an accidental release).
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+    branches: [main]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  lint-title:
+    runs-on: ubuntu-latest
+    steps:
+      # Pin to a full commit SHA if you want stricter supply-chain guarantees.
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
