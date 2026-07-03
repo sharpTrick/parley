@@ -76,6 +76,25 @@ it is plain MCP and can proceed immediately.
 
 ---
 
+## Releases (automated)
+
+Publishing is automated — full details in `CONTRIBUTING.md` ("Releases & versioning"); read it
+before merging to `main`. In short:
+
+- **A merge to `main` *is* a release.** CI runs the test gate, then `semantic-release` picks the
+  version bump, tags it, and publishes **all** packages to npm in lockstep with provenance
+  (trusted publishing / OIDC — no tokens). Never `npm publish` by hand or hand-edit `package.json`
+  versions; the git tag + npm are the source of truth. The one exception is the *first* publish of
+  a brand-new package (see `CONTRIBUTING.md`).
+- **The bump comes from the PR title** (merges are squash-only; the title is the squash subject,
+  linted by `lint-title`). Conventional-commit prefix decides it: `feat:`→minor, `fix:`/`perf:`→
+  patch, `feat!:` or a `BREAKING CHANGE:` footer→major, `docs:`/`chore:`/`ci:`/`build:`/`refactor:`/
+  `test:`→no release.
+- **Pre-1.0: avoid `!` / `BREAKING CHANGE`.** There is no special 0.x handling — a breaking change
+  jumps straight to `1.0.0`. Land early breaking changes as `feat:` until you deliberately cut 1.0.
+
+---
+
 ## Testing discipline
 
 - Each backend ships with tests that exercise the **same** seam contract (a shared conformance

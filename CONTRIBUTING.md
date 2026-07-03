@@ -67,6 +67,10 @@ XMPP) was added without touching either.
    `examples/dev-compose/` instead), and a "Multiple concurrent sessions" section if the backend
    has any shared-state gotchas (see [`examples/multi-session`](examples/multi-session/README.md)
    for the pattern other backends follow).
+7. **First publish (one-time).** A brand-new package has to be published by hand *once* before
+   automation can take over — npm trusted publishing can only be configured on a package that
+   already exists. See [Releases & versioning](#releases--versioning) for the exact steps. Every
+   release after that is automatic.
 
 ## Dev setup
 
@@ -83,8 +87,76 @@ conformance suites to actually run instead of skip.
 ## Before opening a PR
 
 - `npm run build && npm test` green locally.
+- **Title your PR as a [Conventional Commit].** A merge to `main` publishes, and the PR title is
+  the message that decides the version bump — see [Releases & versioning](#releases--versioning).
+  A CI check (`lint-title`) enforces this. Use `docs:`/`chore:`/`ci:` for changes that shouldn't
+  cut a release.
 - Small, focused commits over one large one — each logical change is easier to review on its own.
+  (Branch commits are squashed on merge, so they're for reviewers, not the changelog.)
 - If you touched a backend's `backend_config` shape, update that backend's README (the config
   table + any shared/per-session notes) in the same PR.
 - If you're not sure whether a change is a "seam change," ask first (open an issue) rather than
   find out via review — see "The one rule that matters most" above.
+
+## Releases & versioning
+
+Releases are **fully automated**. A merge to `main` *is* a release — there's no separate publish
+step, and you should never `npm publish` by hand or hand-edit a `package.json` version (the one
+exception is the first publish of a brand-new package — see below).
+
+How it works:
+
+- On every push to `main`, CI runs the full test gate. If it's green,
+  [semantic-release](https://semantic-release.gitbook.io) reads the conventional-commit messages
+  since the last `vX.Y.Z` tag, decides the bump, creates the tag + a GitHub Release, stamps that
+  one version across **all** workspace packages (lockstep), and publishes every public package to
+  npm with provenance — via trusted publishing (OIDC), so there are no npm tokens anywhere.
+  Config lives in [`.releaserc.json`](.releaserc.json) and
+  [`.github/workflows/release.yml`](.github/workflows/release.yml).
+- **No bump is committed back** to the tree. The git tag + npm are the source of truth for the
+  current version; `package.json` versions on `main` stay at the last-released number between
+  releases. Don't hand-edit them — the release stamps them in CI.
+
+### The PR title is what releases
+
+Merges are **squash-only**, and the PR title becomes the squash commit's subject (a `lint-title`
+check enforces that it's a valid [Conventional Commit]). So the **PR title is authoritative** — your
+branch's individual WIP commits are squashed away and don't affect the release. Prefix it:
+
+| PR title prefix | Release | Example |
+| --- | --- | --- |
+| `feat:` | **minor** | `0.1.0 → 0.2.0` |
+| `fix:` / `perf:` / `revert:` | **patch** | `0.1.0 → 0.1.1` |
+| `feat!:` (any `type!:`, or a `BREAKING CHANGE:` footer in the PR body) | **major** | `0.1.0 → 1.0.0` |
+| `docs:` `chore:` `ci:` `build:` `refactor:` `style:` `test:` | **none** | no release |
+
+> **While Parley is pre-1.0, avoid `!` / `BREAKING CHANGE`.** semantic-release has no special 0.x
+> handling — a breaking change jumps straight to `1.0.0`, not `0.2.0`. Land breaking-but-early
+> changes as `feat:` until you deliberately mean to cut 1.0.
+
+`main` is protected: PRs only, both CI checks green and up to date, linear history, squash-only.
+Keep non-release work on feature/dev branches — a merge to `main` ships.
+
+### First publish of a brand-new package (the one manual case)
+
+npm trusted publishing can only be configured on a package that already exists, so a new backend
+package must be published once by hand before automation can take over:
+
+```bash
+npm login                                                   # a @sharptrick publisher
+npm run build
+npm publish -w @sharptrick/parley-<name> --access public    # no provenance on this bootstrap publish
+```
+
+Then add the trusted publisher on npmjs.com (the package → **Settings → Publishing access → Add
+trusted publisher**: repo `sharpTrick/parley`, workflow `release.yml`). From the next release on,
+it's automated like every other package.
+
+### Recovering a partial release
+
+If a release publishes only some packages (e.g. a registry hiccup mid-run), re-run the **Publish
+(manual)** workflow (Actions tab → *Run workflow* → enter that release's version). It re-stamps and
+publishes idempotently, skipping anything already on the registry
+([`.github/workflows/publish-manual.yml`](.github/workflows/publish-manual.yml)).
+
+[Conventional Commit]: https://www.conventionalcommits.org
