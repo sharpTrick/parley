@@ -6,9 +6,14 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { Allowlist } from '../allowlist.js';
+import { computeLive, presenceTopicFor } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
+import { filterHandles } from '../identity-filter.js';
 import { asBackendMsgId, asCursor, type BackendMsgId, type Handle } from '../message.js';
 import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
+
+/** How many recent presence messages to scan per topic when building the live roster. */
+const PRESENCE_FETCH_LIMIT = 500;
 
 /** Dependencies the reactive/reply tools close over. */
 export interface ToolDeps {
@@ -17,6 +22,10 @@ export interface ToolDeps {
   identity: Handle;
   allow: Allowlist;
   seen: SeenSet;
+  /** Liveness window (ms) for `parley_list_users` — a handle is live if its last beat is within it. */
+  presenceTtlMs: number;
+  /** Clock source; injectable for tests. Default `Date.now`. */
+  now?: () => number;
 }
 
 /** Alias the SDK's result type so handlers align with the ServerResult union exactly. */
@@ -47,6 +56,10 @@ const postArgs = z.object({
   topic: z.string(),
   content: z.string(),
   in_reply_to: z.string().optional(),
+});
+const listUsersArgs = z.object({
+  filter: z.string().optional(),
+  topic: z.string().optional(),
 });
 
 /** Shared durable write path for both `parley_post` and (P-4) `parley_reply`. */
@@ -142,13 +155,66 @@ const replyTool = (deps: ToolDeps): ToolDef => ({
   },
 });
 
+const listUsersTool = (deps: ToolDeps): ToolDef => ({
+  name: 'parley_list_users',
+  description:
+    'List participants currently LIVE on the bus, optionally filtered by a glob over handles ' +
+    '(e.g. "claude-*"). Liveness comes from presence heartbeats, so an idle instance that has ' +
+    'not posted is still listed — use this to find who is available for hand-off. Pass `topic` ' +
+    'to scope to one topic; omit for all configured topics. A human using a plain chat client ' +
+    'appears only once they send a message. Returns { live: [{ handle, topics, lastSeenMs }] }.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      filter: { type: 'string', description: 'Optional glob over handles, e.g. "claude-*". Omit for all.' },
+      topic: { type: 'string', description: 'Optional topic to scope to (must be on the allowlist).' },
+    },
+    additionalProperties: false,
+  },
+  async handle(raw) {
+    const { filter, topic } = listUsersArgs.parse(raw);
+    const now = deps.now ?? Date.now;
+    const topics = topic !== undefined ? [deps.allow.assert(topic)] : deps.allow.topics();
+
+    // Aggregate the live roster across each topic's isolated presence stream.
+    const byHandle = new Map<Handle, { handle: Handle; topics: string[]; lastSeenMs: number }>();
+    for (const t of topics) {
+      let messages;
+      try {
+        const page = await deps.plugin.fetchRecent({
+          topic: presenceTopicFor(t),
+          limit: PRESENCE_FETCH_LIMIT,
+        });
+        messages = page.messages;
+      } catch {
+        continue; // a topic with no presence stream yet ⇒ nobody live there
+      }
+      for (const entry of computeLive(messages, now(), deps.presenceTtlMs)) {
+        const agg = byHandle.get(entry.handle);
+        if (agg === undefined) {
+          byHandle.set(entry.handle, { handle: entry.handle, topics: [t], lastSeenMs: entry.lastSeenMs });
+        } else {
+          agg.topics.push(t);
+          agg.lastSeenMs = Math.max(agg.lastSeenMs, entry.lastSeenMs);
+        }
+      }
+    }
+
+    const live = filterHandles([...byHandle.values()], filter).sort((a, b) =>
+      a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0,
+    );
+    return textResult({ live });
+  },
+});
+
 /**
- * Build the tool set. The reactive subset (`parley_fetch_recent`, `parley_post`) is what the
- * chat instance uses; `parley_reply` (P-4) is the channel reply tool — same durable doPost,
- * distinct name/description so Claude surfaces it as a reply (DESIGN §7).
+ * Build the tool set. The reactive subset (`parley_fetch_recent`, `parley_post`,
+ * `parley_list_users`) is what the chat instance uses; `parley_reply` (P-4) is the channel reply
+ * tool — same durable doPost, distinct name/description so Claude surfaces it as a reply
+ * (DESIGN §7).
  */
 export function buildToolDefs(deps: ToolDeps): ToolDef[] {
-  return [fetchRecentTool(deps), postTool(deps), replyTool(deps)];
+  return [fetchRecentTool(deps), postTool(deps), replyTool(deps), listUsersTool(deps)];
 }
 
 /**

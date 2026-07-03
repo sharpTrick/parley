@@ -129,8 +129,9 @@ interface BackendPlugin {
     limit?: number;
   }): Promise<{ messages: Message[]; nextCursor: Cursor }>;
 
-  // 5. Map a logical handle to a backend identity.
-  //    Real account lookup for Matrix/XMPP; string-format convention for NATS/local.
+  // 5. Map a logical handle to a backend identity. Best-effort: a real account lookup where
+  //    the backend supports one, or a string-format convention otherwise. (The shipped plugins
+  //    currently use the convention echo; Zulip is the one that hits a real directory endpoint.)
   resolveIdentity(handle: Handle): Promise<BackendIdentity>;
 }
 ```
@@ -212,6 +213,16 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   place in `bridge-core`.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
+- **Presence / liveness.** A bridge announces itself by posting `hello` / `heartbeat` /
+  `goodbye` to a **derived presence stream** (a real topic + a reserved suffix), isolated from
+  the real topic: presence streams are **never subscribed and never enter catch-up / dedup**, so
+  heartbeats never surface as `<channel>` events or pollute durable history. The
+  `parley_list_users` tool reconstructs "who is live" from `fetchRecent` over those streams plus
+  a TTL window — so it works **identically on every backend with no new seam method**, and lists
+  an idle instance that has never posted. TTL reclaims crashed instances; `goodbye` is a
+  best-effort fast-path. This is **Parley-participant liveness, not a human directory** — a human
+  in a native chat client appears only once they send a real message. Powered above the seam by
+  `post`/`fetchRecent`; knobs in §11 (`presence`).
 
 ---
 
@@ -378,6 +389,10 @@ catchup:
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
+presence:                  # announce hello/heartbeat/goodbye; powers parley_list_users (§7)
+  enabled: true
+  heartbeat_ms: 30000
+  ttl_ms: 90000            # a handle is "live" if its last beat is within this window
 permissions:
   skip_permissions: false  # DANGEROUS; sandbox-only; default off
 backend_config:            # opaque to core; passed to the plugin

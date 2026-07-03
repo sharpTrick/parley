@@ -7,6 +7,7 @@ import { SeenSet } from '../engine/seen-set.js';
 import type { ParleyConfig } from '../config.js';
 import { asHandle } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
+import { startPresenceLoop } from './presence-loop.js';
 import { registerTools } from './tools.js';
 
 /**
@@ -22,6 +23,7 @@ export function buildReactiveServer(plugin: BackendPlugin, cfg: ParleyConfig): S
     identity: asHandle(cfg.identity.handle),
     allow: new Allowlist(cfg.topics),
     seen: new SeenSet(),
+    presenceTtlMs: cfg.presence.ttl_ms,
   });
   return server;
 }
@@ -56,6 +58,14 @@ export function createRemoteHttpApp(
   app.disable('x-powered-by');
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
+
+  // The chat bridge is a long-lived participant too: announce presence off the shared plugin
+  // (the reactive servers are per-request and stateless, so presence lives at app scope).
+  const presence = cfg.presence.enabled
+    ? startPresenceLoop(plugin, asHandle(cfg.identity.handle), new Allowlist(cfg.topics), {
+        heartbeatMs: cfg.presence.heartbeat_ms,
+      })
+    : undefined;
 
   const protect: RequestHandler = opts.protect ?? ((_req, _res, next) => next());
   const methodNotAllowed: RequestHandler = (_req, res) => {
@@ -104,13 +114,15 @@ export function createRemoteHttpApp(
       new Promise((resolve) => {
         httpServer = app.listen(port, host, () => resolve(httpServer as NodeHttpServer));
       }),
-    close: () =>
-      new Promise((resolve, reject) => {
+    close: async () => {
+      await presence?.stop(); // best-effort goodbye
+      await new Promise<void>((resolve, reject) => {
         if (httpServer === undefined) {
           resolve();
           return;
         }
         httpServer.close((e) => (e ? reject(e) : resolve()));
-      }),
+      });
+    },
   };
 }

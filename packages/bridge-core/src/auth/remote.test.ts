@@ -163,6 +163,7 @@ describe('remote OAuth front door (single-tenant)', () => {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
         'parley_fetch_recent',
+        'parley_list_users',
         'parley_post',
         'parley_reply',
       ]);
