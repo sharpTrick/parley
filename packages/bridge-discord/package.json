@@ -1,0 +1,55 @@
+{
+  "name": "@sharptrick/parley-discord",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "@sharptrick/parley-discord — hosted-SaaS chat backend (message snowflake = cursor, gateway websocket MESSAGE_CREATE = subscribe, channel = topic) against the frozen Parley seam.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-discord"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-discord#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@sharptrick/parley-core": "^0.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@sharptrick/parley-conformance": "^0.1.0",
+    "@types/ws": "^8.5.13"
+  },
+  "keywords": [
+    "mcp",
+    "parley",
+    "discord",
+    "message-bus",
+    "agent-messaging"
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "name": "@sharptrick/parley-postgres",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "@sharptrick/parley-postgres — self-hosted networked SQL backend (BIGSERIAL seq = cursor, LISTEN/NOTIFY = subscribe). Slots between SQLite (local floor) and Redis (broker) against the frozen Parley seam.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-postgres"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-postgres#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@sharptrick/parley-core": "^0.1.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@sharptrick/parley-conformance": "^0.1.0",
+    "@types/pg": "^8.11.10"
+  },
+  "keywords": [
+    "mcp",
+    "parley",
+    "postgres",
+    "postgresql",
+    "message-bus",
+    "agent-messaging"
+  ]
+}

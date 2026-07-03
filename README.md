@@ -3,8 +3,9 @@
 [![CI](https://github.com/sharpTrick/parley/actions/workflows/ci.yml/badge.svg)](https://github.com/sharpTrick/parley/actions/workflows/ci.yml)
 
 > Parley — a transport-agnostic MCP seam for messages, context sharing, and task hand-off
-> between humans, chat bots, and coding agents. One pluggable interface; runs on local SQLite,
-> Redis, Matrix, or NATS. Bridges Claude chat ↔ Claude Code via native channels.
+> between humans, chat bots, and coding agents. One pluggable interface; runs on self-hosted
+> SQLite, Postgres, Redis, Matrix, XMPP, NATS, or Zulip — or hosted Discord, Telegram, and
+> Slack. Bridges Claude chat ↔ Claude Code via native channels.
 
 A *parley* is a conference between parties to reach understanding. Parley (the tool) lets humans,
 Claude chat, and Claude Code confer on common ground: context explored in one place (say, a Claude
@@ -24,11 +25,15 @@ The bet: the hard, platform-independent half (push delivery, catch-up, routing, 
 >   shared conformance suite.
 > - **The seam held:** adding every backend after the first touched **zero** `@sharptrick/parley-core` code
 >   (`git diff` confirms it). One interface, five transports, one suite.
+> - **v0.6** five more backends: **Postgres** (`LISTEN`/`NOTIFY` push) and **Zulip** (event
+>   queue) self-hosted, plus the first hosted-SaaS trio — **Discord** (gateway), **Telegram**
+>   (`getUpdates` + local observed store), **Slack** (Socket Mode) — all green on the same
+>   conformance suite, still zero core changes.
 
 ## How it works
 
 ```
- Messaging backend (SQLite | Redis | Matrix | XMPP | NATS)   topics · handles · history
+ Messaging backend (SQLite | Postgres | Redis | Matrix | XMPP | NATS | Zulip | Discord | Telegram | Slack)
         │  backend-native protocol
  Backend plugin  ── implements the SEAM: connect · disconnect · subscribe · post · fetchRecent · resolveIdentity
         │  normalized Message (topic, sender, content, backendMsgId, cursor, mentions)
@@ -135,6 +140,16 @@ await app.listen(3000);
 | Matrix | `@sharptrick/parley-matrix` | event_id | filtered `/sync` long-poll | ✅ v0.4 |
 | NATS | `@sharptrick/parley-nats` | JetStream seq | `consume()` ordered consumer | ✅ v0.5 |
 | XMPP | `@sharptrick/parley-xmpp` | MAM/stanza-id | MUC live + MAM (needs **MAM**) | ✅ v0.5 |
+| Postgres | `@sharptrick/parley-postgres` | `BIGSERIAL` seq (advisory-lock ordered) | `LISTEN`/`NOTIFY` (event-driven) | ✅ v0.6 |
+| Zulip | `@sharptrick/parley-zulip` | message id (globally monotonic) | event queue + `/events` long-poll | ✅ v0.6 |
+| Discord ☁️ | `@sharptrick/parley-discord` | message snowflake | gateway websocket | ✅ v0.6 |
+| Telegram ☁️ | `@sharptrick/parley-telegram` | per-chat `message_id` (local observed store — **no pre-join history**) | `getUpdates` long-poll | ✅ v0.6 |
+| Slack ☁️ | `@sharptrick/parley-slack` | per-channel `ts` | Socket Mode websocket | ✅ v0.6 |
+
+☁️ = hosted SaaS, unlike the self-hosted core backends — history durability and identity live
+under the vendor's policy. Telegram additionally cannot backfill history from before the bot
+joined: the Bot API has no history endpoint, so `fetchRecent` replays a local store of messages
+the bridge has observed (see the [`bridge-telegram` README](packages/bridge-telegram/README.md)).
 
 Every backend passes the **same** `@sharptrick/parley-conformance` suite; adding each touched zero core.
 
@@ -163,7 +178,8 @@ for your transport.* (See `DESIGN.md` §16–17 for prior art and attribution.)
 `agent-messaging` · `agent-to-agent` · `a2a` · `multi-agent` · `agent-coordination` ·
 `context-sharing` · `context-handoff` · `task-handoff` · `agent-handoff` · `message-bus` ·
 `message-queue` · `pub-sub` · `transport-agnostic` · `pluggable-backend` · `backend-agnostic` ·
-`matrix` · `nats` · `redis` · `xmpp` · `sqlite` · `self-hosted` · `chat-to-code` ·
+`matrix` · `nats` · `redis` · `xmpp` · `sqlite` · `postgres` · `zulip` · `discord` ·
+`telegram` · `slack` · `self-hosted` · `chat-to-code` ·
 `human-in-the-loop` · `inter-agent-communication` · `agent-bus`
 
 ## License
