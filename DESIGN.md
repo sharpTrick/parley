@@ -181,6 +181,12 @@ The same logical message can arrive twice — once via live push, once via `fetc
   - Matrix → per-room stream/sync token.
   - XMPP → MAM archive id.
   - NATS → JetStream sequence number.
+  - Postgres → `BIGSERIAL` seq (per-topic advisory lock keeps seq order == commit order).
+  - Zulip → message id (globally monotonic integer).
+  - Discord → message snowflake (per-channel strictly increasing).
+  - Telegram → per-chat `message_id`, replayed from a **local observed-message store** (the
+    Bot API exposes no history endpoint — no pre-join backfill; see §12 v0.6 caveat).
+  - Slack → per-channel message `ts` (compared integer-wise, never as float/lexical).
 - The cursor is **opaque to core** and **keyed by `topic`**. The plugin decides the real
   granularity.
 - `bridge-core` dedups on `backendMsgId` and orders on `cursor` within a topic.
@@ -433,6 +439,31 @@ room/subject/channel from handle/topic), overridable in `backend_config`.
 - Infra: READMEs point to canonical upstream Docker images (§15); not authored here.
 - Same success criterion: new plugin only, core untouched.
 
+**v0.6 — `bridge-postgres`, `bridge-zulip`, `bridge-discord`, `bridge-telegram`,
+`bridge-slack`.**
+- **Postgres** (self-hosted): `BIGSERIAL` seq→cursor, `LISTEN`/`NOTIFY`→subscribe (true push;
+  notify payload is a hint — subscribers re-query from their last seq, so drops coalesce
+  harmlessly per §6), senders table→resolveIdentity. `post` takes a per-topic advisory
+  transaction lock so seq visibility order matches commit order. Slots between SQLite
+  (local floor) and Redis (broker).
+- **Zulip** (self-hosted): the closest native fit — stream+topic→topic (near 1:1; Zulip
+  topics are mutable, so membership can drift if admins move messages), globally monotonic
+  message id→cursor, narrowed event queue + `/events` long-poll→subscribe (queue GC recovered
+  by re-register + cursor gap-fill), `GET /messages` anchor→fetchRecent.
+- **Discord, Telegram, Slack** — the first **hosted SaaS** backends, unlike the self-hosted
+  core set; history durability and identity live under the vendor's policy (positioning
+  noted in each plugin's class JSDoc). Discord: channel→topic, snowflake→cursor, gateway
+  websocket→subscribe, `?after=`→fetchRecent. Slack: channel→topic, per-channel `ts`→cursor,
+  Socket Mode websocket→subscribe (every envelope acked before processing),
+  `conversations.history` paging→fetchRecent. Telegram: chat→topic, per-chat
+  `message_id`→cursor, `getUpdates` long-poll→subscribe (one poller per token — no
+  multi-instance writers), **fetchRecent replays a local observed-message store** because the
+  Bot API has no history endpoint — the one backend that structurally strains the
+  durable-replayable-history line of the fit contract (no pre-join backfill, ever).
+- Infra: Postgres/Zulip READMEs point to canonical upstream images (`postgres`,
+  `zulip/docker-zulip`) per §15; SaaS backends need vendor app/bot provisioning, no infra.
+- Same success criterion: new plugins only, core untouched.
+
 **Deferred (post-v1):** spawn-on-unknown-handle, richer payloads (files/images),
 multi-instance routing.
 
@@ -451,7 +482,12 @@ parley/
 │   ├── bridge-redis/         # v0.3 — first event-driven push; first networked local-ish backend
 │   ├── bridge-matrix/        # v0.4 — first network backend (flagship external)
 │   ├── bridge-xmpp/          # v0.5
-│   └── bridge-nats/          # v0.5
+│   ├── bridge-nats/          # v0.5
+│   ├── bridge-postgres/      # v0.6 — self-hosted SQL; LISTEN/NOTIFY push
+│   ├── bridge-zulip/         # v0.6 — self-hosted; closest native fit (streams+topics)
+│   ├── bridge-discord/       # v0.6 — hosted SaaS; gateway push
+│   ├── bridge-telegram/      # v0.6 — hosted SaaS; local observed store (no history API)
+│   └── bridge-slack/         # v0.6 — hosted SaaS; Socket Mode push
 ├── examples/
 │   ├── fakechat-loopback/    # local test harness for the channel path
 │   ├── self-host-remote/     # reference deployment for remote/chat mode (public + OAuth)
@@ -652,7 +688,8 @@ the name (`parley`), so the evocative name and the searchable terms both do thei
 `agent-messaging`, `agent-to-agent`, `a2a`, `multi-agent`, `agent-coordination`,
 `context-sharing`, `context-handoff`, `task-handoff`, `agent-handoff`, `message-bus`,
 `message-queue`, `pub-sub`, `transport-agnostic`, `pluggable-backend`, `backend-agnostic`,
-`matrix`, `nats`, `redis`, `xmpp`, `sqlite`, `self-hosted`, `chat-to-code`,
+`matrix`, `nats`, `redis`, `xmpp`, `sqlite`, `postgres`, `zulip`, `discord`, `telegram`,
+`slack`, `self-hosted`, `chat-to-code`,
 `human-in-the-loop`, `inter-agent-communication`, `agent-bus`.
 
 **README first-line / description (keyword-dense, human-readable):**

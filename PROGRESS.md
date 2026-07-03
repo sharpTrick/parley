@@ -6,7 +6,23 @@
 
 ## Status
 
-- **Phase:** ✅ **v1 COMPLETE.** All five backends green on the shared conformance suite; remote
+- **Phase (v0.6):** ✅ **Five more backends landed** — Postgres, Zulip, Discord, Telegram, Slack —
+  built by five parallel agents (one per plugin package), integrated serially by the lead. All
+  green on the shared conformance suite; **zero `bridge-core` changes** (verified by
+  `git diff --stat`). Postgres verified against a live local Postgres 16 (`LISTEN`/`NOTIFY` push,
+  advisory-lock-ordered `BIGSERIAL` cursor). Zulip/Discord/Telegram/Slack verified against
+  **in-process fakes** of their APIs (no credentials/Docker in this environment; deliberate
+  choice, user-approved) — Zulip also has an env-gated `zulip (real)` suite
+  (`PARLEY_ZULIP_URL/_EMAIL/_API_KEY`).
+- **v0.6 fit-contract caveats (honest):** Telegram is the structural outlier — the Bot API has no
+  history endpoint, so `fetchRecent` replays a local JSONL store of *observed* messages (own
+  sends + `getUpdates`); **no pre-join backfill, ever**, and one `getUpdates` poller per token
+  means the multi-writer conformance case is skipped by design. Zulip topics are mutable
+  (membership can drift if messages are moved; ids/cursors survive). Discord/Telegram/Slack are
+  hosted SaaS — durability/identity under vendor policy, noted in each class JSDoc. Identity: the
+  SaaS backends post as the bot account (`identity` arg informational, same shape as Matrix's
+  login caveat).
+- **Phase (v1):** ✅ **v1 COMPLETE.** All five backends green on the shared conformance suite; remote
   OAuth mode done. **97 tests across 21 files.** Adding every backend after the first touched
   **zero** `@parley/core` code (verified by `git diff`). The seam held end to end.
 - **Backends (all conformance-green):** SQLite (poll) · Redis (`XREAD BLOCK`) · Matrix (Synapse C-S

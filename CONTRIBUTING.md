@@ -54,7 +54,10 @@ XMPP) was added without touching either.
    `runConformanceSuite('<name>', factory)` from `@sharptrick/parley-conformance` — see
    [`packages/conformance/README.md`](packages/conformance/README.md) for the `BackendFactory`
    shape. Have the factory skip cleanly (not fail) when no server is reachable, matching the
-   existing network backends' pattern.
+   existing network backends' pattern. For hosted-SaaS backends with no self-hostable server
+   (Discord/Telegram/Slack pattern), run the suite against a minimal **in-process fake** of the
+   API subset the plugin uses (see `packages/bridge-slack/test/fake-slack.ts`), optionally with
+   an env-gated real-credential suite on top.
 5. Run `npm test`. Then confirm the success criterion: `git diff --stat packages/bridge-core`
    must be **empty**. If it isn't, the seam is missing something — raise it as an issue rather than
    patching around it.

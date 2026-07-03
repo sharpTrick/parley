@@ -31,6 +31,29 @@ services:
       timeout: 3s
       retries: 10
 
+  # --- v0.6 Postgres (BIGSERIAL seq = cursor, LISTEN/NOTIFY = subscribe) ---
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: parley
+      POSTGRES_PASSWORD: parley
+      POSTGRES_DB: parley
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parley"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # --- v0.6 Zulip (stream+topic = topic, message id = cursor, event queue = subscribe) ---
+  # Zulip's self-host stack is multi-container and config-heavy; per DESIGN §15 we do NOT
+  # author it here. Use the canonical upstream setup: https://github.com/zulip/docker-zulip
+  # then run the gated real-server suite with PARLEY_ZULIP_URL / _EMAIL / _API_KEY set.
+  # (The bridge-zulip conformance tests run against an in-process fake by default, no server
+  # needed. Discord/Telegram/Slack are hosted SaaS — nothing to compose; their suites also
+  # run against in-process fakes.)
+
   # --- v0.4 Matrix / Synapse (room = topic, sync token = cursor, sync loop = subscribe) ---
   # FIRST RUN (one-time): generate config before `up`:
   #   docker compose -f examples/dev-compose/docker-compose.yml run --rm \

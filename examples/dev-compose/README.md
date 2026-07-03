@@ -12,6 +12,7 @@ docker compose up redis      # v0.3
 docker compose up nats       # v0.5
 docker compose up synapse    # v0.4  (see first-run note below)
 docker compose up prosody    # v0.5  (MAM enabled in prosody/prosody.cfg.lua)
+docker compose up postgres   # v0.6
 docker compose up keycloak   # post-v1 external-OIDC auth mode
 ```
 
@@ -45,6 +46,24 @@ docker compose exec synapse register_new_matrix_user -u parley -p parley -a -c /
 ```bash
 docker compose exec prosody prosodyctl register parley parley.local parley
 ```
+
+## Postgres (v0.6) — ready to run
+
+`postgres:16-alpine` on `localhost:5432`, user/db `parley`/`parley` (password `parley`).
+`BIGSERIAL` seq is the cursor; `LISTEN`/`NOTIFY` drives subscribe. The conformance suite probes
+`postgres://parley:parley@127.0.0.1:5432/parley` (override with `PARLEY_PG_URL`) and self-skips
+when no server is up. No Docker handy? A plain `apt install postgresql` cluster with the same
+user/db works identically.
+
+## Zulip (v0.6) — upstream compose, not authored here
+
+Zulip's self-host stack is multi-container and config-heavy; per DESIGN §15 use the canonical
+[`zulip/docker-zulip`](https://github.com/zulip/docker-zulip) setup. The `bridge-zulip`
+conformance tests run against an **in-process fake** by default (no server needed); with a real
+server up, set `PARLEY_ZULIP_URL` / `PARLEY_ZULIP_EMAIL` / `PARLEY_ZULIP_API_KEY` to also run the
+gated `zulip (real)` suite. Discord, Telegram, and Slack are hosted SaaS — nothing to compose;
+their suites likewise run against in-process fakes, with manual real-service runs documented in
+each plugin README.
 
 ## Keycloak (post-v1 external-OIDC auth mode) — ready to run
 
