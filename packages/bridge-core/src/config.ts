@@ -80,6 +80,19 @@ export const ConfigSchema = z.object({
       mention_filter: z.boolean().default(false),
     })
     .default({}),
+  /**
+   * Presence (DESIGN §7): the bridge announces itself (hello/heartbeat/goodbye) to each
+   * allowlisted topic's presence stream so `parley_list_users` can report who is LIVE — even
+   * an idle instance that hasn't posted. `ttl_ms` is the liveness window (a handle counts as
+   * live if its last beat is within it); keep it a few multiples of `heartbeat_ms`.
+   */
+  presence: z
+    .object({
+      enabled: z.boolean().default(true),
+      heartbeat_ms: z.number().int().positive().default(30_000),
+      ttl_ms: z.number().int().positive().default(90_000),
+    })
+    .default({}),
   permissions: z
     .object({
       // DANGEROUS; sandbox-only; default OFF (DESIGN §2.5/§14). Read but unused in v0.1.

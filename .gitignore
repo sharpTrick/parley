@@ -29,3 +29,6 @@ read-state.json
 *.log
 .idea/
 .vscode/
+
+# Local project tooling metadata (not part of the repo)
+.project.yml

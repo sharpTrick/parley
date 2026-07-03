@@ -83,6 +83,7 @@ identity: { handle: "agent" }
 topics: ["ctx-demo"]
 catchup: { on_start: true, limit: 100 }
 live_push: { enabled: true, mention_filter: false }
+presence: { enabled: true, heartbeat_ms: 30000, ttl_ms: 90000 }  # powers parley_list_users
 backend_config:
   db_path: "./parley-demo.db"
   poll_interval_ms: 500
@@ -130,6 +131,11 @@ await app.listen(3000);
 - **Chat handoff.** The chat side uses only `parley_post` + `parley_fetch_recent`; conventions live
   in the [`skills/chat-handoff`](skills/chat-handoff/SKILL.md) skill. One seam, one write path —
   do **not** install a separate backend-specific MCP in chat.
+- **Discover who's live.** Each bridge announces itself with presence heartbeats, so
+  `parley_list_users` (optional glob, e.g. `claude-*`) reports who is on the bus right now —
+  including an idle agent that hasn't posted — to pick a hand-off target. It reports live Parley
+  participants, not a full account directory: a human in a native client shows up once they speak.
+  Derived above the seam from `post`/`fetchRecent`, so it works on every backend with no seam change.
 
 ## Backends
 

@@ -39,6 +39,20 @@ export { Allowlist, TopicNotAllowedError } from './allowlist.js';
 export { SeenSet } from './engine/seen-set.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
+// Presence: "who is live" derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
+export {
+  presenceTopicFor,
+  encodePresence,
+  decodePresence,
+  computeLive,
+  PRESENCE_TOPIC_SUFFIX,
+  type PresenceKind,
+  type PresenceRecord,
+  type LiveEntry,
+} from './engine/presence.js';
+
+// Handle glob filtering (parley_list_users).
+export { matchGlob, filterHandles } from './identity-filter.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
 export { registerTools, buildToolDefs, type ToolDeps } from './transport/tools.js';
@@ -48,6 +62,11 @@ export {
   CHANNEL_NOTIFICATION_METHOD,
 } from './transport/channel-emit.js';
 export { startPushLoop, type PushLoopOptions } from './transport/push-loop.js';
+export {
+  startPresenceLoop,
+  type PresenceLoop,
+  type PresenceLoopOptions,
+} from './transport/presence-loop.js';
 export {
   buildBridge,
   createStdioBridge,
