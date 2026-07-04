@@ -7,6 +7,7 @@ import { SeenSet } from '../engine/seen-set.js';
 import type { ParleyConfig } from '../config.js';
 import { asHandle, asTopic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
+import { CORE_VERSION } from '../version.js';
 import { startPresenceLoop } from './presence-loop.js';
 import { registerTools } from './tools.js';
 
@@ -17,7 +18,7 @@ import { registerTools } from './tools.js';
  * HTTP session (cheap; just registers handlers).
  */
 export function buildReactiveServer(plugin: BackendPlugin, cfg: ParleyConfig): McpServer {
-  const server = new McpServer({ name: 'parley', version: '0.1.0' }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: 'parley', version: CORE_VERSION }, { capabilities: { tools: {} } });
   registerTools(server, {
     plugin,
     identity: asHandle(cfg.identity.handle),
