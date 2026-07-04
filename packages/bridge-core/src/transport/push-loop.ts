@@ -1,4 +1,4 @@
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Allowlist } from '../allowlist.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import type { Handle, Message } from '../message.js';
@@ -23,7 +23,7 @@ export interface PushLoopOptions {
  * same path event-driven backends will drive.
  */
 export async function startPushLoop(
-  server: Server,
+  server: McpServer,
   plugin: BackendPlugin,
   allow: Allowlist,
   seen: SeenSet,

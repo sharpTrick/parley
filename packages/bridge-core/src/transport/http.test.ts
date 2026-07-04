@@ -62,6 +62,9 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
       arguments: { topic: 'secret', content: 'x' },
     })) as { isError?: boolean; content: Array<{ text: string }> };
     expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain('topic not allowed');
+    // Closed allowlist → `topic` is a z.enum, so the SDK rejects a disallowed topic at the schema
+    // layer (Invalid enum value); with a post pattern it would be allow.assert's "topic not
+    // allowed". Either way it is an isError result, not a crash.
+    expect(res.content[0]!.text).toMatch(/invalid enum value|topic not allowed/i);
   });
 });

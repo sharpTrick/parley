@@ -1,5 +1,5 @@
 import type { Server as NodeHttpServer } from 'node:http';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type RequestHandler } from 'express';
 import { allowlistFor } from '../allowlist.js';
@@ -16,8 +16,8 @@ import { registerTools } from './tools.js';
  * client cannot receive pushes. The plugin is shared and long-lived; one server is built per
  * HTTP session (cheap; just registers handlers).
  */
-export function buildReactiveServer(plugin: BackendPlugin, cfg: ParleyConfig): Server {
-  const server = new Server({ name: 'parley', version: '0.1.0' }, { capabilities: { tools: {} } });
+export function buildReactiveServer(plugin: BackendPlugin, cfg: ParleyConfig): McpServer {
+  const server = new McpServer({ name: 'parley', version: '0.1.0' }, { capabilities: { tools: {} } });
   registerTools(server, {
     plugin,
     identity: asHandle(cfg.identity.handle),
