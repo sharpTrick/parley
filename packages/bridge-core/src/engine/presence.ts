@@ -2,46 +2,49 @@
  * Presence — "who is live" derived ABOVE the seam (no seam change).
  *
  * Each Parley bridge announces itself by POSTING presence messages (hello / heartbeat /
- * goodbye) to a derived presence topic — the mechanical shadow of a real allowlisted topic.
- * `parley_list_users` then reconstructs the live roster from `fetchRecent` over those presence
- * topics plus a liveness window (TTL). Because this uses only `post`/`fetchRecent`, it works
- * IDENTICALLY on every backend and needs no new seam method (DESIGN §4/§7).
+ * goodbye) to ONE shared presence topic (`presence.topic`, default `parley-presence`). Each beat
+ * carries the emitter's subscribed topics, so `parley_list_users` can still report who is live
+ * per topic while a human only has to mute a SINGLE topic on a real chat backend. The roster is
+ * reconstructed from `fetchRecent` over that one topic plus a liveness window (TTL). Because this
+ * uses only `post`/`fetchRecent`, it works IDENTICALLY on every backend and needs no new seam
+ * method (DESIGN §4/§7).
  *
- * Presence topics are isolated: they are NEVER subscribed (live push) and NEVER enter
- * catch-up / `seen` / read-state, so heartbeats never pollute a real topic's durable history
- * or surface as `<channel>` events.
+ * The presence topic is isolated: it is NEVER subscribed (live push) and NEVER enters catch-up /
+ * `seen` / read-state, so heartbeats never pollute a real topic's durable history or surface as
+ * `<channel>` events. It is also reserved — no `post`/`fetch_recent` (or `post_topics` pattern)
+ * may target it, so a peer cannot spoof the roster.
  */
-import { asTopic, type Handle, type Message, type Topic } from '../message.js';
+import type { Handle, Message } from '../message.js';
 
 /**
- * Reserved suffix appended to a real topic to derive its presence topic. Topics ending in this
- * suffix are reserved for presence and must not be used as real topics.
- *
- * The derived string must be a legal topic on every backend (Matrix room alias / NATS subject
- * charset, etc.). This is the ONE place the scheme is defined — adjust here if a backend rejects
- * it (e.g. switch separators) rather than special-casing anywhere else.
+ * The single presence topic every bridge announces itself on, unless overridden by
+ * `presence.topic`. Must be a legal topic on every backend (Matrix room alias / NATS subject
+ * charset, etc.). Keep it consistent across a deployment — bridges with different presence
+ * topics cannot see each other in `parley_list_users`.
  */
-export const PRESENCE_TOPIC_SUFFIX = '-parley-presence';
+export const DEFAULT_PRESENCE_TOPIC = 'parley-presence';
 
-/** Derive the presence topic that shadows a real topic. */
-export function presenceTopicFor(topic: Topic): Topic {
-  return asTopic(`${topic}${PRESENCE_TOPIC_SUFFIX}`);
-}
+/** Cap the topics a single record may advertise — a hostile peer can't bloat the roster (DESIGN §14). */
+export const MAX_RECORD_TOPICS = 64;
 
 /** The kind of a presence beat. `goodbye` is a best-effort fast-path removal (TTL is the real gate). */
 export type PresenceKind = 'hello' | 'heartbeat' | 'goodbye';
 
 /** The payload carried in a presence message's `content` (JSON). Versioned for forward-compat. */
 export interface PresenceRecord {
-  v: 1;
+  v: 2;
   kind: PresenceKind;
   /** Emitter wall-clock (ms) when the beat was sent — used for TTL freshness (advisory; DESIGN §14). */
   at: number;
+  /** The emitter's explicit subscribed topics at beat time (its `topics` allowlist). */
+  topics: string[];
 }
 
 /** A live participant surfaced by {@link computeLive}. */
 export interface LiveEntry {
   handle: Handle;
+  /** The subscribed topics advertised by this handle's latest beat. */
+  topics: string[];
   /** The `at` of this handle's latest beat (ms). */
   lastSeenMs: number;
 }
@@ -54,7 +57,8 @@ export function encodePresence(rec: PresenceRecord): string {
 /**
  * Decode a presence message's `content`. Returns null for anything that isn't a well-formed
  * presence record — defensive against a stray or spoofed message on the presence topic
- * (inbound is untrusted; DESIGN §14).
+ * (inbound is untrusted; DESIGN §14). A pre-v2 record (the old per-topic scheme) decodes to
+ * null: those live on old derived topics the current reader never fetches.
  */
 export function decodePresence(content: string): PresenceRecord | null {
   let parsed: unknown;
@@ -65,19 +69,25 @@ export function decodePresence(content: string): PresenceRecord | null {
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
   const r = parsed as Record<string, unknown>;
-  if (r.v !== 1) return null;
+  if (r.v !== 2) return null;
   if (r.kind !== 'hello' && r.kind !== 'heartbeat' && r.kind !== 'goodbye') return null;
   if (typeof r.at !== 'number' || !Number.isFinite(r.at)) return null;
-  return { v: 1, kind: r.kind, at: r.at };
+  if (!Array.isArray(r.topics) || !r.topics.every((t) => typeof t === 'string' && t.length > 0)) {
+    return null;
+  }
+  // Truncate rather than reject: a fresh beat with an over-long list is still useful liveness.
+  const topics = (r.topics as string[]).slice(0, MAX_RECORD_TOPICS);
+  return { v: 2, kind: r.kind, at: r.at, topics };
 }
 
 /**
- * Reconstruct the live roster from one presence topic's messages.
+ * Reconstruct the live roster from the presence topic's messages.
  *
  * `messages` are pre-sorted ascending by cursor (the plugin's ordering guarantee, DESIGN §6), so
  * the LAST record per handle is its latest. A handle is live iff its latest beat is
  * `hello`/`heartbeat` (not `goodbye`) AND is fresh (`nowMs - at < ttlMs`). TTL is the real
- * liveness gate — it reclaims crashed instances that never sent a `goodbye`.
+ * liveness gate — it reclaims crashed instances that never sent a `goodbye`. The handle's
+ * advertised `topics` come from that same latest beat.
  */
 export function computeLive(messages: Message[], nowMs: number, ttlMs: number): LiveEntry[] {
   const latest = new Map<Handle, PresenceRecord>();
@@ -90,7 +100,7 @@ export function computeLive(messages: Message[], nowMs: number, ttlMs: number): 
   for (const [handle, rec] of latest) {
     if (rec.kind === 'goodbye') continue;
     if (nowMs - rec.at >= ttlMs) continue;
-    live.push({ handle, lastSeenMs: rec.at });
+    live.push({ handle, topics: rec.topics, lastSeenMs: rec.at });
   }
   live.sort((a, b) => (a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0));
   return live;

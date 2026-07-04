@@ -9,12 +9,18 @@ identity:
 topics:
   - "ctx-handoff"
 
+# post_topics:           # OPTIONAL: extra topics allowed for post/fetch only, as full-match regexes
+#   - "ctx-.*"           #   (never subscribed/caught-up; the presence topic can never be matched)
+
 catchup:
   on_start: false      # remote/chat reads context on demand via the fetch_recent tool
   limit: 100
 
 live_push:
   enabled: false       # chat cannot receive <channel> pushes (§8)
+
+presence:
+  enabled: false       # reactive-only chat can't receive pushes → skip heartbeats (DESIGN §7)
 
 permissions:
   skip_permissions: false

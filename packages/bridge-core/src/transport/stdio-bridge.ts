@@ -1,11 +1,11 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { Allowlist } from '../allowlist.js';
+import { allowlistFor } from '../allowlist.js';
 import { instanceIdOf, type ParleyConfig } from '../config.js';
 import { catchUpAll } from '../engine/catchup.js';
 import { defaultReadStatePath, ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asHandle } from '../message.js';
+import { asHandle, asTopic } from '../message.js';
 import type { BackendConfig, BackendPlugin } from '../seam.js';
 import { startPresenceLoop, type PresenceLoop } from './presence-loop.js';
 import { startPushLoop } from './push-loop.js';
@@ -53,14 +53,15 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   );
 
   const identity = asHandle(cfg.identity.handle);
-  const allow = new Allowlist(cfg.topics);
+  const allow = allowlistFor(cfg);
+  const presenceTopic = asTopic(cfg.presence.topic);
   const seen = new SeenSet();
   const statePath = cfg.state_path ?? defaultReadStatePath(instanceIdOf(cfg));
   const readState = new ReadStateStore(statePath);
 
   // Reactive role: tools share this one `seen` set with the push loop so a message pulled via
   // the fetch_recent tool is not later re-pushed.
-  registerTools(server, { plugin, identity, allow, seen, presenceTtlMs: cfg.presence.ttl_ms });
+  registerTools(server, { plugin, identity, allow, seen, presenceTopic, presenceTtlMs: cfg.presence.ttl_ms });
 
   await plugin.connect(cfg.backend_config as BackendConfig);
 
@@ -88,6 +89,7 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
       // participant others can discover via parley_list_users (DESIGN §7).
       if (cfg.presence.enabled) {
         presence = startPresenceLoop(plugin, identity, allow, {
+          presenceTopic,
           heartbeatMs: cfg.presence.heartbeat_ms,
         });
       }

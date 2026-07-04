@@ -83,7 +83,8 @@ identity: { handle: "agent" }
 topics: ["ctx-demo"]
 catchup: { on_start: true, limit: 100 }
 live_push: { enabled: true, mention_filter: false }
-presence: { enabled: true, heartbeat_ms: 30000, ttl_ms: 90000 }  # powers parley_list_users
+# One shared presence topic powers parley_list_users; ttl_ms defaults to 3× heartbeat_ms.
+presence: { enabled: true, topic: "parley-presence", heartbeat_ms: 600000 }
 backend_config:
   db_path: "./parley-demo.db"
   poll_interval_ms: 500
@@ -131,11 +132,19 @@ await app.listen(3000);
 - **Chat handoff.** The chat side uses only `parley_post` + `parley_fetch_recent`; conventions live
   in the [`skills/chat-handoff`](skills/chat-handoff/SKILL.md) skill. One seam, one write path —
   do **not** install a separate backend-specific MCP in chat.
-- **Discover who's live.** Each bridge announces itself with presence heartbeats, so
-  `parley_list_users` (optional glob, e.g. `claude-*`) reports who is on the bus right now —
-  including an idle agent that hasn't posted — to pick a hand-off target. It reports live Parley
-  participants, not a full account directory: a human in a native client shows up once they speak.
-  Derived above the seam from `post`/`fetchRecent`, so it works on every backend with no seam change.
+- **Discover who's live.** Each bridge announces itself with presence heartbeats on one shared
+  topic (`presence.topic`, default `parley-presence`), so `parley_list_users` (optional glob, e.g.
+  `claude-*`) reports who is on the bus right now — including an idle agent that hasn't posted, with
+  the topics each subscribes to — to pick a hand-off target. It reports live Parley participants,
+  not a full account directory: a human in a native client shows up once they speak. Because it's a
+  single stream, you mute **one** topic to hide presence on a real chat backend; a reactive-only
+  chat instance that can't receive pushes can set `presence.enabled: false` to skip heartbeats
+  entirely. Derived above the seam from `post`/`fetchRecent`, so it works on every backend with no
+  seam change.
+- **Post beyond the allowlist.** `topics` is the subscribe/catch-up allowlist; add `post_topics`
+  (full-match regexes) to let an instance `parley_post`/`parley_fetch_recent` on ad-hoc topics it
+  doesn't subscribe to. The configured topics (and any post patterns) are surfaced in the MCP tool
+  descriptions, so an agent discovers what it may post to without a separate call.
 
 ## Backends
 

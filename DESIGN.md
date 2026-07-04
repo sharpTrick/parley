@@ -214,15 +214,22 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
 - **Presence / liveness.** A bridge announces itself by posting `hello` / `heartbeat` /
-  `goodbye` to a **derived presence stream** (a real topic + a reserved suffix), isolated from
-  the real topic: presence streams are **never subscribed and never enter catch-up / dedup**, so
-  heartbeats never surface as `<channel>` events or pollute durable history. The
-  `parley_list_users` tool reconstructs "who is live" from `fetchRecent` over those streams plus
-  a TTL window — so it works **identically on every backend with no new seam method**, and lists
-  an idle instance that has never posted. TTL reclaims crashed instances; `goodbye` is a
-  best-effort fast-path. This is **Parley-participant liveness, not a human directory** — a human
-  in a native chat client appears only once they send a real message. Powered above the seam by
-  `post`/`fetchRecent`; knobs in §11 (`presence`).
+  `goodbye` to **one shared presence topic** (`presence.topic`, default `parley-presence`), and
+  each beat carries the instance's subscribed topics. This is isolated from real topics: the
+  presence topic is **never subscribed and never enters catch-up / dedup**, so heartbeats never
+  surface as `<channel>` events or pollute durable history — and because it is a single stream, a
+  human on a real chat backend mutes **one** topic instead of one per context. It is also
+  **reserved**: no `post` / `fetch_recent` (nor any `post_topics` pattern, §14) may target it, so
+  a peer cannot spoof the roster. The `parley_list_users` tool reconstructs "who is live" from
+  `fetchRecent` over that one topic plus a TTL window — so it works **identically on every backend
+  with no new seam method**, reports each instance's subscribed topics, and lists an idle instance
+  that has never posted. TTL reclaims crashed instances; `goodbye` is a best-effort fast-path.
+  This is **Parley-participant liveness, not a human directory** — a human in a native chat client
+  appears only once they send a real message. A reactive-only front door (the chat instance)
+  cannot receive `<channel>` pushes and can set `presence.enabled: false` to stay silent. Powered
+  above the seam by `post`/`fetchRecent`; knobs in §11 (`presence`). Keep `presence.topic`
+  consistent across a deployment — bridges announcing on different presence topics cannot see each
+  other.
 
 ---
 
@@ -380,9 +387,11 @@ A single config object drives the bridge; sane defaults everywhere. Illustrative
 backend: local-sqlite      # local-sqlite | local-redis | matrix | xmpp | nats
 identity:
   handle: "ctx-payments"   # this instance's logical handle
-topics:                    # subscribe to / catch up on (one fetchRecent call each)
+topics:                    # subscribe to / catch up on (one fetchRecent call each) — THE ALLOWLIST
   - "ctx-payments"
   - "ctx-payments-reviews"
+post_topics:               # OPTIONAL extra topics allowed for post/fetch only, as full-match regexes
+  - "ctx-payments-.*"      # (never subscribed/caught-up; the presence topic can never be matched)
 catchup:
   on_start: true
   limit: 100
@@ -390,9 +399,10 @@ live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
 presence:                  # announce hello/heartbeat/goodbye; powers parley_list_users (§7)
-  enabled: true
-  heartbeat_ms: 30000
-  ttl_ms: 90000            # a handle is "live" if its last beat is within this window
+  enabled: true            # reactive-only front doors (chat) can set this false
+  topic: "parley-presence" # ONE shared topic all bridges announce on; mute this one to hide presence
+  heartbeat_ms: 600000     # 10 min — agents stay subscribed a long time
+  ttl_ms: 1800000          # a handle is "live" if its last beat is within this window; default 3× heartbeat_ms
 permissions:
   skip_permissions: false  # DANGEROUS; sandbox-only; default off
 backend_config:            # opaque to core; passed to the plugin
@@ -528,7 +538,11 @@ promise: *implement five methods, get a Claude bridge for your platform.*
 ## 14. Security (designed in, not bolted on)
 
 - **Topic allowlist.** The bridge only subscribes to / catches up on an explicit list of
-  topics. No wildcard-everything by default.
+  topics (`topics`). No wildcard-everything by default. `post_topics` optionally extends
+  **post/fetch only** with full-match regex patterns (for a chat instance posting to ad-hoc
+  topics) — it never widens subscribe/catch-up/presence, which stay the explicit list. The
+  presence topic is **reserved**: no pattern, however broad, makes it postable/fetchable, so a
+  peer cannot spoof the presence roster.
 - **Inbound is untrusted.** A backend message becomes agent context; treat it as untrusted
   input, never as privileged instruction. With spawn deferred, worst case is "writes into a
   live session," but the prompt-injection surface concentrates here — keep backends private

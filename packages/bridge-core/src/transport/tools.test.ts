@@ -3,7 +3,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
-import { encodePresence, presenceTopicFor, type PresenceKind } from '../engine/presence.js';
+import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -15,7 +15,14 @@ interface ToolText {
 }
 const parse = (r: unknown): unknown => JSON.parse((r as ToolText).content[0]!.text);
 
-async function harness(opts?: { now?: () => number; presenceTtlMs?: number }) {
+const PRESENCE_TOPIC = asTopic(DEFAULT_PRESENCE_TOPIC);
+
+async function harness(opts?: {
+  now?: () => number;
+  presenceTtlMs?: number;
+  topics?: string[];
+  postPatterns?: string[];
+}) {
   const plugin = new FakePlugin();
   await plugin.connect({});
   const server = new Server(
@@ -25,8 +32,12 @@ async function harness(opts?: { now?: () => number; presenceTtlMs?: number }) {
   registerTools(server, {
     plugin,
     identity: asHandle('alice'),
-    allow: new Allowlist(['ctx', 'ctx-reviews']),
+    allow: new Allowlist(opts?.topics ?? ['ctx', 'ctx-reviews'], {
+      postPatterns: opts?.postPatterns,
+      reserved: [DEFAULT_PRESENCE_TOPIC],
+    }),
     seen: new SeenSet(),
+    presenceTopic: PRESENCE_TOPIC,
     presenceTtlMs: opts?.presenceTtlMs ?? 90_000,
     now: opts?.now,
   });
@@ -36,18 +47,18 @@ async function harness(opts?: { now?: () => number; presenceTtlMs?: number }) {
   return { plugin, client };
 }
 
-/** Post a presence beat straight to a topic's isolated presence stream (as the emitter would). */
+/** Post a presence beat straight to the shared presence topic (as the emitter would). */
 function postBeat(
   plugin: FakePlugin,
   handle: string,
-  realTopic: string,
+  topics: string[],
   kind: PresenceKind,
   at: number,
 ): Promise<unknown> {
   return plugin.post(
-    presenceTopicFor(asTopic(realTopic)),
+    PRESENCE_TOPIC,
     asHandle(handle),
-    encodePresence({ v: 1, kind, at }),
+    encodePresence({ v: 2, kind, at, topics }),
   );
 }
 
@@ -136,7 +147,7 @@ describe('parley_list_users (presence-derived liveness)', () => {
 
   it('lists a live participant from presence beats, with no real post needed', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'claude-a', 'ctx', 'hello', NOW - 1_000);
+    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
     ) as LiveResult;
@@ -145,8 +156,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
 
   it('applies the glob filter over handles', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'claude-a', 'ctx', 'heartbeat', NOW - 1_000);
-    await postBeat(plugin, 'human-x', 'ctx', 'heartbeat', NOW - 1_000);
+    await postBeat(plugin, 'claude-a', ['ctx'], 'heartbeat', NOW - 1_000);
+    await postBeat(plugin, 'human-x', ['ctx'], 'heartbeat', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: { filter: 'claude-*' } }),
     ) as LiveResult;
@@ -155,8 +166,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
 
   it('excludes a handle whose latest beat is older than the TTL', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'stale', 'ctx', 'heartbeat', NOW - TTL - 1);
-    await postBeat(plugin, 'fresh', 'ctx', 'heartbeat', NOW - 1_000);
+    await postBeat(plugin, 'stale', ['ctx'], 'heartbeat', NOW - TTL - 1);
+    await postBeat(plugin, 'fresh', ['ctx'], 'heartbeat', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
     ) as LiveResult;
@@ -172,12 +183,34 @@ describe('parley_list_users (presence-derived liveness)', () => {
     expect(out.live).toEqual([]);
   });
 
+  it('excludes a handle advertising only topics we do not subscribe to', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
+    await postBeat(plugin, 'stranger', ['some-other-ctx'], 'hello', NOW - 1_000);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as LiveResult;
+    expect(out.live).toEqual([]);
+  });
+
   it('scopes to a single topic when `topic` is given', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'claude-a', 'ctx', 'hello', NOW - 1_000);
-    await postBeat(plugin, 'claude-b', 'ctx-reviews', 'hello', NOW - 1_000);
+    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
+    await postBeat(plugin, 'claude-b', ['ctx-reviews'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx' } }),
+    ) as LiveResult;
+    expect(out.live.map((l) => l.handle)).toEqual(['claude-a']);
+  });
+
+  it('scopes by a pattern-allowed topic (a peer may advertise a topic we only match)', async () => {
+    const { client, plugin } = await harness({
+      now: () => NOW,
+      presenceTtlMs: TTL,
+      postPatterns: ['ctx-.*'],
+    });
+    await postBeat(plugin, 'claude-a', ['ctx-adhoc'], 'hello', NOW - 1_000);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
     ) as LiveResult;
     expect(out.live.map((l) => l.handle)).toEqual(['claude-a']);
   });
@@ -190,5 +223,65 @@ describe('parley_list_users (presence-derived liveness)', () => {
     })) as ToolText;
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toContain('topic not allowed');
+  });
+});
+
+describe('post_topics regex patterns + presence reservation', () => {
+  it('posts to and fetches a pattern-matched topic outside the explicit list', async () => {
+    const { client, plugin } = await harness({ postPatterns: ['ctx-.*'] });
+    const res = (await client.callTool({
+      name: 'parley_post',
+      arguments: { topic: 'ctx-adhoc', content: 'hi' },
+    })) as ToolText;
+    expect(res.isError).toBeFalsy();
+    const got = await plugin.fetchRecent({ topic: asTopic('ctx-adhoc') });
+    expect(got.messages.at(-1)!.content).toBe('hi');
+    // and it is fetchable back through the tool
+    const fetched = parse(
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx-adhoc' } }),
+    ) as { messages: Array<{ content: string }> };
+    expect(fetched.messages.map((m) => m.content)).toEqual(['hi']);
+  });
+
+  it('still rejects a topic matching no explicit entry and no pattern', async () => {
+    const { client } = await harness({ postPatterns: ['ctx-.*'] });
+    const res = (await client.callTool({
+      name: 'parley_post',
+      arguments: { topic: 'other', content: 'x' },
+    })) as ToolText;
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain('topic not allowed');
+  });
+
+  it('never lets a broad pattern reach the reserved presence topic', async () => {
+    const { client } = await harness({ postPatterns: ['.*'] });
+    for (const name of ['parley_post', 'parley_fetch_recent'] as const) {
+      const res = (await client.callTool({
+        name,
+        arguments: name === 'parley_post' ? { topic: DEFAULT_PRESENCE_TOPIC, content: 'x' } : { topic: DEFAULT_PRESENCE_TOPIC },
+      })) as ToolText;
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain('topic not allowed');
+    }
+  });
+});
+
+describe('dynamic tool descriptions', () => {
+  it('interpolates configured topics and emits a topic enum when no patterns are set', async () => {
+    const { client } = await harness({ topics: ['ctx', 'ctx-reviews'] });
+    const { tools } = await client.listTools();
+    const post = tools.find((t) => t.name === 'parley_post')!;
+    expect(post.description).toContain('Configured topics: "ctx", "ctx-reviews".');
+    const postProps = post.inputSchema.properties as Record<string, { enum?: string[] }>;
+    expect(postProps.topic!.enum).toEqual(['ctx', 'ctx-reviews']);
+  });
+
+  it('drops the enum and mentions the patterns when post_topics is set', async () => {
+    const { client } = await harness({ topics: ['ctx'], postPatterns: ['ctx-.*'] });
+    const { tools } = await client.listTools();
+    const fetch = tools.find((t) => t.name === 'parley_fetch_recent')!;
+    expect(fetch.description).toContain('fully matching regex "ctx-.*"');
+    const fetchProps = fetch.inputSchema.properties as Record<string, { enum?: string[] }>;
+    expect(fetchProps.topic!.enum).toBeUndefined();
   });
 });

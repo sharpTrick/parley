@@ -4,11 +4,15 @@ identity:
 topics:
   - "ctx-payments"
   - "ctx-infra"
+# post_topics:             # OPTIONAL: let chat post to ad-hoc topics it doesn't subscribe to
+#   - "ctx-.*"             #   full-match regexes; post/fetch only, never subscribed
 catchup:
   on_start: false        # chat reads on demand via parley_fetch_recent, not on connect
   limit: 100
 live_push:
   enabled: false          # chat cannot receive <channel> pushes
+presence:
+  enabled: false          # reactive-only chat can't receive pushes → skip heartbeats (DESIGN §7)
 permissions:
   skip_permissions: false
 
