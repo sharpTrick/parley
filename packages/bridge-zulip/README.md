@@ -63,6 +63,16 @@ Secrets live in `backend_config` / `.env`, never in code.
    queue only sees streams its owner can access.
 3. Put `site_url`, the bot `email`, and `api_key` in `backend_config` / `.env`.
 
+### Headless provisioning
+
+The GUI steps above have a scriptable equivalent — useful for minting a **distinct bot per
+session** (below) without click-through. Zulip's
+[management commands](https://zulip.readthedocs.io/en/stable/production/management-commands.html)
+(run as the `zulip` user, e.g. `/home/zulip/deployments/current/manage.py <cmd> --help`) can
+create/find the bot user and subscribe it to the stream. A bot's **`api_key` is stable and
+reusable** — mint it once and reuse it across restarts (it only changes if you regenerate it),
+which is what makes automated per-agent bot provisioning practical.
+
 ## Multiple concurrent sessions (one `backend_config` per config file, same server)
 
 A real deployment is several configs — one per Claude Code session plus one for the remote/chat
@@ -88,6 +98,20 @@ Use the canonical upstream setup — **[zulip/docker-zulip](https://github.com/z
 (or the [production installer](https://zulip.readthedocs.io/en/stable/production/install.html)).
 For hacking, the [Zulip development environment](https://zulip.readthedocs.io/en/latest/development/overview.html)
 listens on `:9991` — this plugin's default `site_url`. This package does not ship production infra.
+
+### Behind a reverse proxy
+
+Co-hosting a self-hosted Zulip behind the same reverse proxy as a remote Parley MCP has two
+upstream-Zulip gotchas — see
+[Zulip's reverse-proxy docs](https://zulip.readthedocs.io/en/stable/production/reverse-proxies.html):
+
+- **Trust the proxy.** Zulip ignores `X-Forwarded-*` from untrusted sources, so it must be told
+  the proxy's IP: `LOADBALANCER_IPS` (docker-zulip env) / `[loadbalancer] ips` in
+  `/etc/zulip/zulip.conf` (installer). Across multiple Docker networks, `TRUST_GATEWAY_IP` alone
+  may not cover the proxy's address as Zulip sees it — set `LOADBALANCER_IPS` to that IP/CIDR.
+- **Reach it at its `EXTERNAL_HOST`.** Zulip validates the host, so requests must arrive as its
+  configured `EXTERNAL_HOST`; in Docker, a network alias for that hostname is the simplest fix.
+  Configure `EXTERNAL_HOST` rather than hand-widening host validation in custom settings.
 
 ## Tests
 

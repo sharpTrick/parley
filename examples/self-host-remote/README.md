@@ -76,6 +76,33 @@ token); it never sees your backend credentials.
 > [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) as a local stdio→HTTP proxy that runs
 > the full OAuth flow. It does **not** serve claude.ai web/mobile, so it's an option, not the baseline.
 
+### Two connector gotchas
+
+**Scope the connector out of Claude Code.** Once this connector is on your claude.ai account, any
+Claude Code signed into the *same* account auto-inherits it (it appears as `mcp__claude_ai_<name>__*`).
+If that machine also runs a local stdio Parley for the same project, you now have two Parley MCPs and
+the agent can't tell which to use. Deny the remote one in your **user** settings
+(`~/.claude/settings.json`) — `deniedMcpServers` is honored per-user and merges across scopes:
+
+```json
+{
+  "deniedMcpServers": [
+    { "serverUrl": "https://parley.example.com/*" },
+    { "serverName": "claude.ai parley-mcp" }
+  ]
+}
+```
+
+`serverUrl` (glob) is the most robust — it survives a renamed connector. Mind the near-misses: it's
+`deniedMcpServers`, **not** `disabledMcpServers` (not a real key — the `.mcp.json` toggle is the
+unrelated `disabledMcpjsonServers`), and **not** `disableClaudeAiConnectors: true` (which kills
+*every* claude.ai connector — Gmail, Drive, …). See
+[managed MCP](https://code.claude.com/docs/en/managed-mcp) and [MCP settings](https://code.claude.com/docs/en/mcp).
+
+**Refresh the tool list after redeploying.** The claude.ai connector caches the server's tool
+descriptions, so a redeploy with changed tools won't show up until you open Connectors → the server →
+settings → **Refresh tools list**. A current server on its own isn't enough.
+
 ## 5. Public-exposure constraint (read this)
 
 In remote mode the bridge **must be internet-reachable** — Claude connects from Anthropic's cloud.

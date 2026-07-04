@@ -120,16 +120,23 @@ No Parley configuration changes — token validation is identical in both varian
 
 With the built-in auth, the owner passphrase makes the bridge single-tenant. With Keycloak,
 **any realm user who can log in gets a perfectly valid token** — so re-establish the
-single-tenant posture with claim gates:
+single-tenant posture with a claim gate. **Recommended: `allowed_subjects`.**
 
-1. **Realm roles → Create role:** `parley-owner`.
-2. Assign it to your own user (**Users → you → Role mapping**).
-3. Set `required_role: "parley-owner"` in Parley's config.
+1. Find your user's subject (`sub`) — the stable per-realm UUID (**Users → you → Details**, or
+   decode any issued token). It survives username changes.
+2. Set `allowed_subjects: ["<your-sub>"]` in Parley's config.
 
-`allowed_usernames` / `allowed_subjects` work too (see the reference below); `required_role` is
-recommended because it survives username changes and is explicit in the Keycloak UI. Prefer
-`required_role` over `required_scope`: Claude's connector may request no scopes at all, so a
-scope requirement only works if your realm maps a default scope into every token.
+`allowed_usernames: ["<preferred_username>"]` is a more readable alternative (but breaks if you
+rename the account). Both gate on claims Keycloak always includes in the token.
+
+> ⚠️ **`required_role` can silently 401 — avoid it unless you control the realm's client
+> registration policy.** Claude's connector self-registers via DCR (§2); if the realm applies
+> `fullScopeAllowed=false` to registered clients (common on hardened/shared realms), Keycloak
+> **strips `realm_access.roles` from the issued token**, so a `required_role` gate rejects every
+> request (401, one opaque error — see Security notes) with no hint why. If you do want a role
+> gate, first confirm the DCR'd client has `fullScopeAllowed=true` (or a mapper that re-emits the
+> role). Prefer subject/username gates over `required_scope` too: Claude's connector may request
+> no scopes at all, so a scope gate only works if your realm maps a default scope into every token.
 
 ## Parley config reference
 
@@ -147,11 +154,12 @@ auth:
     audience: "parley-mcp"
 
     # Identity gates — any that are set must ALL pass (issuer + audience are
-    # always enforced regardless).
-    required_role: "parley-owner"        # realm_access.roles must contain this
-    # allowed_usernames: ["alice"]       # preferred_username allowlist
-    # allowed_subjects: ["<uuid>"]       # sub allowlist (survives renames)
-    # required_scope: "mcp"              # only if your IdP maps a default scope
+    # always enforced regardless). Recommended: allowed_subjects (stable, always present).
+    allowed_subjects: ["<your-sub-uuid>"]  # sub allowlist (survives renames)
+    # allowed_usernames: ["alice"]         # preferred_username allowlist (readable; breaks on rename)
+    # required_role: "parley-owner"        # realm_access.roles — SILENTLY 401s if the DCR'd client
+    #                                      #   has fullScopeAllowed=false (roles stripped); see §3
+    # required_scope: "mcp"                # only if your IdP maps a default scope
 
     # Rarely needed:
     # jwks_uri: "https://kc.example.com/realms/myrealm/protocol/openid-connect/certs"
@@ -175,7 +183,8 @@ dispatches on `cfg.auth.mode`; the OIDC composition is also available directly a
   message — an unauthorized caller learns nothing about which check failed or what the gate
   policy is.
 - **Configure at least one identity gate.** Without one, every user in the realm who can log
-  in can drive your bridge; `required_role` is the recommended minimum.
+  in can drive your bridge; `allowed_subjects` is the recommended default (`required_role` can
+  silently 401 under `fullScopeAllowed=false` — see §3).
 - Token lifetime, refresh, and revocation are Keycloak's: Parley honors `exp` on every request
   and picks up signing-key rotation via JWKS automatically. Keycloak's default 5-minute access
   tokens with refresh work fine — Claude refreshes proactively.
