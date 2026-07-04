@@ -229,7 +229,14 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   advertised `post_topics` can reach a topic *you* subscribe to — so a freshly-onboarded agent on a
   unique topic still discovers the peers it can hand off to (advertised pattern sources are inbound,
   so they are compiled defensively, never enumerated). TTL reclaims crashed instances; `goodbye` is
-  a best-effort fast-path.
+  a best-effort fast-path. **Presence records are versioned** (`v`; current line `v:2`): evolve the
+  format *additively within a version* — a new optional field (e.g. `postTopics`, added in v0.6.0)
+  decodes to a default on older readers and is ignored by them, so mixed-version fleets interoperate
+  and a rolling upgrade only forgoes the *new* signal until every peer is current. A **version bump
+  is a flag day**, not a graceful step: `decodePresence` returns null for any record whose `v` it
+  does not recognize (a `v:2` reader *drops* a `v:1` record — pre-v2 beats simply never land on the
+  shared presence topic), so a bump needs every peer on the same line, or a reader taught to accept
+  both versions. Prefer additive fields.
   This is **Parley-participant liveness, not a human directory** — a human in a native chat client
   appears only once they send a real message. A reactive-only front door (the chat instance)
   cannot receive `<channel>` pushes and can set `presence.enabled: false` to stay silent. Powered
