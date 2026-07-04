@@ -38,7 +38,25 @@ describe('presence loop', () => {
     const recs = await records(plugin);
     // One beat = ONE message total, even across a multi-topic allowlist.
     expect(recs).toHaveLength(1);
-    expect(recs[0]).toEqual({ v: 2, kind: 'hello', at: NOW, topics: ['ctx', 'reviews'] });
+    // No post_topics ⇒ postTopics advertised as [].
+    expect(recs[0]).toEqual({ v: 2, kind: 'hello', at: NOW, topics: ['ctx', 'reviews'], postTopics: [] });
+    await loop.stop();
+  });
+
+  it('advertises the post_topics reach (pattern sources) on every beat', async () => {
+    const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*', 'general'] });
+    const loop = startPresenceLoop(plugin, asHandle('claude-a'), allow, {
+      presenceTopic: PRESENCE_TOPIC,
+      heartbeatMs: 30_000,
+      now: () => NOW,
+    });
+    await vi.advanceTimersByTimeAsync(30_000); // hello + one heartbeat
+    const recs = await records(plugin);
+    expect(recs).toHaveLength(2);
+    for (const r of recs) {
+      expect(r.topics).toEqual(['ctx']);
+      expect(r.postTopics).toEqual(['ctx-.*', 'general']);
+    }
     await loop.stop();
   });
 

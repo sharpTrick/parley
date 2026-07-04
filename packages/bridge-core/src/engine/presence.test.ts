@@ -16,11 +16,12 @@ function beat(
   at: number,
   seq: number,
   topics: string[] = ['ctx'],
+  postTopics: string[] = [],
 ): Message {
   return {
     topic: asTopic('parley-presence'),
     senderHandle: asHandle(handle),
-    content: encodePresence({ v: 2, kind, at, topics }),
+    content: encodePresence({ v: 2, kind, at, topics, postTopics }),
     timestamp: new Date(seq * 1000).toISOString(),
     backendMsgId: asBackendMsgId(String(seq)),
     cursor: asCursor(String(seq)),
@@ -29,9 +30,36 @@ function beat(
 }
 
 describe('encode/decode presence', () => {
-  it('round-trips a record', () => {
-    const rec: PresenceRecord = { v: 2, kind: 'heartbeat', at: 1234, topics: ['ctx-a', 'ctx-b'] };
+  it('round-trips a record, including postTopics', () => {
+    const rec: PresenceRecord = {
+      v: 2,
+      kind: 'heartbeat',
+      at: 1234,
+      topics: ['ctx-a', 'ctx-b'],
+      postTopics: ['ctx-.*', 'general'],
+    };
     expect(decodePresence(encodePresence(rec))).toEqual(rec);
+  });
+
+  it('defaults postTopics to [] for an old beat that omits it (additive field, no version bump)', () => {
+    const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'] }));
+    expect(rec).toEqual({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [] });
+  });
+
+  it('drops a malformed postTopics to [] rather than rejecting the whole beat (untrusted input)', () => {
+    const bad = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [42, ''] });
+    expect(decodePresence(bad)?.postTopics).toEqual([]);
+    const notArray = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: 'ctx-.*' });
+    expect(decodePresence(notArray)?.postTopics).toEqual([]);
+  });
+
+  it('truncates an over-long postTopics list', () => {
+    const postTopics = Array.from({ length: MAX_RECORD_TOPICS + 10 }, (_, i) => `p-${i}`);
+    const rec = decodePresence(
+      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics }),
+    );
+    expect(rec?.postTopics).toHaveLength(MAX_RECORD_TOPICS);
+    expect(rec?.postTopics[0]).toBe('p-0');
   });
 
   it('rejects malformed / non-presence content (untrusted input)', () => {
@@ -64,18 +92,24 @@ describe('computeLive', () => {
   const now = 100_000;
   const ttl = 90_000;
 
-  it('lists a handle whose latest beat is a fresh hello/heartbeat, with its topics', () => {
-    const live = computeLive([beat('claude-a', 'hello', now - 1000, 1, ['ctx-x', 'ctx-y'])], now, ttl);
-    expect(live).toEqual([{ handle: 'claude-a', topics: ['ctx-x', 'ctx-y'], lastSeenMs: now - 1000 }]);
+  it('lists a handle whose latest beat is a fresh hello/heartbeat, with its topics + postTopics', () => {
+    const live = computeLive(
+      [beat('claude-a', 'hello', now - 1000, 1, ['ctx-x', 'ctx-y'], ['ctx-.*'])],
+      now,
+      ttl,
+    );
+    expect(live).toEqual([
+      { handle: 'claude-a', topics: ['ctx-x', 'ctx-y'], postTopics: ['ctx-.*'], lastSeenMs: now - 1000 },
+    ]);
   });
 
   it('takes the latest beat per handle (later cursor wins) and refreshes freshness + topics', () => {
     const msgs = [
       beat('claude-a', 'hello', now - 80_000, 1, ['ctx-a']),
-      beat('claude-a', 'heartbeat', now - 1_000, 2, ['ctx-a', 'ctx-b']),
+      beat('claude-a', 'heartbeat', now - 1_000, 2, ['ctx-a', 'ctx-b'], ['ctx-.*']),
     ];
     expect(computeLive(msgs, now, ttl)).toEqual([
-      { handle: 'claude-a', topics: ['ctx-a', 'ctx-b'], lastSeenMs: now - 1_000 },
+      { handle: 'claude-a', topics: ['ctx-a', 'ctx-b'], postTopics: ['ctx-.*'], lastSeenMs: now - 1_000 },
     ]);
   });
 

@@ -2,7 +2,9 @@
  * Presence emitter (DESIGN §7/§9, presence). A proactive loop — a sibling of the push loop —
  * that announces THIS bridge on ONE shared presence topic: a `hello` on start, a `heartbeat` on
  * an interval, and a best-effort `goodbye` on clean shutdown. Each beat carries the bridge's
- * subscribed topics so `parley_list_users` can report liveness per topic.
+ * subscribed topics AND its `post_topics` reach (the regex sources it may post to) so
+ * `parley_list_users` can report liveness per topic and match hand-off partners in either
+ * direction.
  *
  * Writes go through the seam's single `post` path, to the configured presence topic — so this
  * adds no new allowlist surface and no seam method. The roster is reconstructed on demand by
@@ -39,11 +41,19 @@ export function startPresenceLoop(
   opts: PresenceLoopOptions,
 ): PresenceLoop {
   const now = opts.now ?? Date.now;
-  // The subscribed topics are static config — capture once and advertise them on every beat.
+  // Subscribed topics and post_topics reach are both static config — capture once and advertise
+  // them on every beat. `postTopics` are the raw pattern SOURCES (peers compile them defensively).
   const subscribedTopics = allow.topics();
+  const postTopics = allow.patterns();
 
   const beat = async (kind: PresenceKind): Promise<void> => {
-    const content = encodePresence({ v: 2, kind, at: now(), topics: subscribedTopics });
+    const content = encodePresence({
+      v: 2,
+      kind,
+      at: now(),
+      topics: subscribedTopics,
+      postTopics,
+    });
     await plugin.post(opts.presenceTopic, identity, content).catch(() => {
       // Best-effort: a dropped beat is harmless; TTL reconciles (engine/presence.ts).
     });

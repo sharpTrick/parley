@@ -3,8 +3,11 @@
  *
  * Each Parley bridge announces itself by POSTING presence messages (hello / heartbeat /
  * goodbye) to ONE shared presence topic (`presence.topic`, default `parley-presence`). Each beat
- * carries the emitter's subscribed topics, so `parley_list_users` can still report who is live
- * per topic while a human only has to mute a SINGLE topic on a real chat backend. The roster is
+ * carries the emitter's subscribed topics AND its `post_topics` reach (the regex sources it may
+ * post to but does not subscribe), so `parley_list_users` can report who is live per topic AND
+ * decide who is a viable hand-off partner in EITHER direction (I can post to a topic they
+ * subscribe to, or they can post — per their advertised patterns — to a topic I subscribe to),
+ * while a human only has to mute a SINGLE topic on a real chat backend. The roster is
  * reconstructed from `fetchRecent` over that one topic plus a liveness window (TTL). Because this
  * uses only `post`/`fetchRecent`, it works IDENTICALLY on every backend and needs no new seam
  * method (DESIGN §4/§7).
@@ -24,13 +27,22 @@ import type { Handle, Message } from '../message.js';
  */
 export const DEFAULT_PRESENCE_TOPIC = 'parley-presence';
 
-/** Cap the topics a single record may advertise — a hostile peer can't bloat the roster (DESIGN §14). */
+/**
+ * Cap the topics (and, independently, the post-pattern sources) a single record may advertise —
+ * a hostile peer can't bloat the roster or hand us an unbounded pattern list (DESIGN §14).
+ */
 export const MAX_RECORD_TOPICS = 64;
 
 /** The kind of a presence beat. `goodbye` is a best-effort fast-path removal (TTL is the real gate). */
 export type PresenceKind = 'hello' | 'heartbeat' | 'goodbye';
 
-/** The payload carried in a presence message's `content` (JSON). Versioned for forward-compat. */
+/**
+ * The payload carried in a presence message's `content` (JSON). Versioned for forward-compat.
+ *
+ * `postTopics` was added as an ADDITIVE field on `v: 2` (not a version bump): older beats omit it
+ * and decode with `postTopics: []`; older readers ignore it. Bumping `v` would make old readers
+ * reject new beats mid-rollout — additive keeps mixed-version fleets interoperable.
+ */
 export interface PresenceRecord {
   v: 2;
   kind: PresenceKind;
@@ -38,6 +50,12 @@ export interface PresenceRecord {
   at: number;
   /** The emitter's explicit subscribed topics at beat time (its `topics` allowlist). */
   topics: string[];
+  /**
+   * The emitter's `post_topics` reach: the raw regex SOURCES it may post to but does NOT subscribe
+   * to (§14). A reader treats these as UNTRUSTED and compiles them defensively — never enumerated
+   * (a pattern can match infinitely many topics), matched against the reader's own topics instead.
+   */
+  postTopics: string[];
 }
 
 /** A live participant surfaced by {@link computeLive}. */
@@ -45,6 +63,8 @@ export interface LiveEntry {
   handle: Handle;
   /** The subscribed topics advertised by this handle's latest beat. */
   topics: string[];
+  /** The `post_topics` regex sources advertised by this handle's latest beat (post-only reach). */
+  postTopics: string[];
   /** The `at` of this handle's latest beat (ms). */
   lastSeenMs: number;
 }
@@ -77,7 +97,13 @@ export function decodePresence(content: string): PresenceRecord | null {
   }
   // Truncate rather than reject: a fresh beat with an over-long list is still useful liveness.
   const topics = (r.topics as string[]).slice(0, MAX_RECORD_TOPICS);
-  return { v: 2, kind: r.kind, at: r.at, topics };
+  // `postTopics` is optional/additive: absent (old emitter) or malformed ⇒ [] rather than a
+  // whole-record reject — the liveness signal is still worth keeping. Same cap as `topics`.
+  const postTopics =
+    Array.isArray(r.postTopics) && r.postTopics.every((t) => typeof t === 'string' && t.length > 0)
+      ? (r.postTopics as string[]).slice(0, MAX_RECORD_TOPICS)
+      : [];
+  return { v: 2, kind: r.kind, at: r.at, topics, postTopics };
 }
 
 /**
@@ -100,7 +126,7 @@ export function computeLive(messages: Message[], nowMs: number, ttlMs: number): 
   for (const [handle, rec] of latest) {
     if (rec.kind === 'goodbye') continue;
     if (nowMs - rec.at >= ttlMs) continue;
-    live.push({ handle, topics: rec.topics, lastSeenMs: rec.at });
+    live.push({ handle, topics: rec.topics, postTopics: rec.postTopics, lastSeenMs: rec.at });
   }
   live.sort((a, b) => (a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0));
   return live;

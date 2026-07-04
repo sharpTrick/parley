@@ -14,6 +14,32 @@ import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
  */
 const PRESENCE_FETCH_LIMIT = 500;
 
+/**
+ * Max length of an untrusted peer post-pattern source we will compile. A beat's `postTopics` are
+ * attacker-controlled regex sources (inbound is untrusted, DESIGN §14); a catastrophic-backtracking
+ * pattern is a ReDoS risk. We bound source length (and count, via `MAX_RECORD_TOPICS` at decode) and
+ * only ever match these against our OWN short, bounded topic names — never against message text.
+ */
+const MAX_PEER_PATTERN_LEN = 512;
+
+/**
+ * Compile a peer's advertised `postTopics` sources into full-match regexes (`^(?:src)$`, mirroring
+ * the {@link Allowlist}), skipping any that are over-long or un-compilable so a hostile beat can
+ * never crash or hang `parley_list_users`.
+ */
+function compilePeerPatterns(sources: readonly string[]): RegExp[] {
+  const out: RegExp[] = [];
+  for (const src of sources) {
+    if (src.length > MAX_PEER_PATTERN_LEN) continue;
+    try {
+      out.push(new RegExp(`^(?:${src})$`));
+    } catch {
+      // Un-compilable source from an untrusted peer — ignore it.
+    }
+  }
+  return out;
+}
+
 /** Dependencies the reactive/reply tools close over. */
 export interface ToolDeps {
   plugin: BackendPlugin;
@@ -194,9 +220,11 @@ export function buildToolDefs(deps: ToolDeps): ToolDef[] {
       'List participants currently LIVE on the bus, optionally filtered by a glob over handles ' +
         '(e.g. "claude-*"). Liveness comes from presence heartbeats, so an idle instance that has ' +
         'not posted is still listed — use this to find who is available for hand-off. Each entry ' +
-        'reports the topics that instance subscribes to. Pass `topic` to scope to one topic; omit ' +
-        'for all configured topics. A human using a plain chat client appears only once they send a ' +
-        `message. Returns { live: [{ handle, topics, lastSeenMs }] }. Configured topics: ${allow
+        'reports the topics that instance subscribes to and the post-only topics it can reach. Pass ' +
+        '`topic` to scope to peers on that topic (subscribed to it, or able to post to it); omit for ' +
+        'everyone you share a channel with — anyone you can post to, or who can post to a topic you ' +
+        'subscribe to. A human using a plain chat client appears only once they send a message. ' +
+        `Returns { live: [{ handle, topics, postTopics, lastSeenMs }] }. Configured topics: ${allow
           .topics()
           .map((t) => JSON.stringify(t))
           .join(', ')}.`,
@@ -229,12 +257,24 @@ export function buildToolDefs(deps: ToolDeps): ToolDef[] {
           return textResult({ live: [] }); // presence topic not created yet ⇒ nobody live
         }
 
-        // Default (unscoped) roster = anyone advertising at least one of OUR configured topics.
-        const ownTopics = new Set<string>(deps.allow.topics());
+        // Our own subscribed topics — short and trusted; matched against peers' advertised patterns.
+        const mySubscribed = deps.allow.topics();
         const live = filterHandles(
-          computeLive(messages, now(), deps.presenceTtlMs).filter((e) =>
-            scope !== undefined ? e.topics.includes(scope) : e.topics.some((t) => ownTopics.has(t)),
-          ),
+          computeLive(messages, now(), deps.presenceTtlMs).filter((e) => {
+            if (scope !== undefined) {
+              // Scoped: peers ON that topic — subscribed to it, or able to post to it via a pattern.
+              return (
+                e.topics.includes(scope) ||
+                compilePeerPatterns(e.postTopics).some((re) => re.test(scope))
+              );
+            }
+            // Unscoped: everyone we share a viable channel with, in EITHER direction:
+            //  - I can post to a topic they subscribe to (allow.has = my subscribed ∪ my patterns), OR
+            //  - they can post — per their advertised patterns — to a topic I subscribe to.
+            if (e.topics.some((t) => deps.allow.has(t))) return true;
+            const theirReach = compilePeerPatterns(e.postTopics);
+            return mySubscribed.some((mt) => theirReach.some((re) => re.test(mt)));
+          }),
           filter,
         ).sort((a, b) => (a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0));
         return textResult({ live });
