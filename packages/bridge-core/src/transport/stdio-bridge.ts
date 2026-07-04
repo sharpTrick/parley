@@ -7,6 +7,7 @@ import { defaultReadStatePath, ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import type { BackendConfig, BackendPlugin } from '../seam.js';
+import { CORE_VERSION } from '../version.js';
 import { startPresenceLoop, type PresenceLoop } from './presence-loop.js';
 import { startPushLoop } from './push-loop.js';
 import { registerTools } from './tools.js';
@@ -42,7 +43,7 @@ export interface ParleyBridge {
  */
 export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Promise<ParleyBridge> {
   const server = new McpServer(
-    { name: 'parley', version: '0.1.0' },
+    { name: 'parley', version: CORE_VERSION },
     {
       capabilities: {
         tools: {},
