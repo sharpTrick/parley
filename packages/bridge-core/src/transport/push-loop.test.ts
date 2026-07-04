@@ -1,4 +1,4 @@
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { SeenSet } from '../engine/seen-set.js';
@@ -14,12 +14,15 @@ interface Captured {
 
 function fakeServer() {
   const calls: Captured[] = [];
+  // emitChannel reaches the low-level Server via McpServer's `.server`, so nest the spy there.
   const server = {
-    notification: vi.fn((n: Captured) => {
-      calls.push(n);
-      return Promise.resolve();
-    }),
-  } as unknown as Server;
+    server: {
+      notification: vi.fn((n: Captured) => {
+        calls.push(n);
+        return Promise.resolve();
+      }),
+    },
+  } as unknown as McpServer;
   return { server, calls };
 }
 

@@ -1,5 +1,5 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
@@ -25,7 +25,7 @@ async function harness(opts?: {
 }) {
   const plugin = new FakePlugin();
   await plugin.connect({});
-  const server = new Server(
+  const server = new McpServer(
     { name: 'parley', version: '0.1.0' },
     { capabilities: { tools: {} } },
   );
@@ -127,13 +127,19 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
       arguments: { topic: 'secret', content: 'x' },
     })) as ToolText;
     expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain('topic not allowed');
+    // Closed allowlist → `topic` is a z.enum, so the SDK rejects a disallowed topic at the schema
+    // layer (Invalid enum value) before the handler's allow.assert would run. When a post pattern
+    // widens the set the schema is a plain string and allow.assert produces "topic not allowed"
+    // (see the pattern cases below). Either path is an isError result, never a crash.
+    expect(res.content[0]!.text).toMatch(/invalid enum value|topic not allowed/i);
   });
 
   it('reports an unknown tool as an error result', async () => {
     const res = (await client.callTool({ name: 'nope', arguments: {} })) as ToolText;
     expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain('unknown tool');
+    // McpServer surfaces an unknown tool as an isError result (text "Tool <name> not found"),
+    // matching the previous manual dispatcher's behavior of not throwing a protocol error.
+    expect(res.content[0]!.text).toContain('not found');
   });
 });
 

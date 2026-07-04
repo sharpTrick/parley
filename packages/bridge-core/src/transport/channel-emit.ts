@@ -1,4 +1,4 @@
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Message } from '../message.js';
 
 /** Claude Code's channel notification method (verified against the live channels-reference). */
@@ -43,13 +43,15 @@ export function channelMeta(m: Message): Record<string, string> {
  * the cursor reconciles any loss via fetchRecent (§6). Single backend-agnostic emit path used
  * across every backend (polling or event-driven).
  */
-export async function emitChannel(server: Server, m: Message): Promise<void> {
+export async function emitChannel(server: McpServer, m: Message): Promise<void> {
   const notification: ChannelNotification = {
     method: CHANNEL_NOTIFICATION_METHOD,
     params: { content: m.content, meta: channelMeta(m) },
   };
-  // The channel method is a Claude Code extension outside the SDK's ServerNotification union,
-  // so we cast at this single boundary. Verified at runtime: Server.notification forwards any
-  // {method, params} over the transport unchanged.
-  await server.notification(notification as unknown as Parameters<typeof server.notification>[0]);
+  // The channel method is a Claude Code extension outside the SDK's ServerNotification union, so
+  // we reach the underlying low-level Server (McpServer's sanctioned escape hatch for custom
+  // notifications) and cast at this single boundary. Verified at runtime: Server.notification
+  // forwards any {method, params} over the transport unchanged.
+  const low = server.server;
+  await low.notification(notification as unknown as Parameters<typeof low.notification>[0]);
 }
