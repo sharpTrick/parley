@@ -2,10 +2,10 @@ import type { Server as NodeHttpServer } from 'node:http';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type RequestHandler } from 'express';
-import { Allowlist } from '../allowlist.js';
+import { allowlistFor } from '../allowlist.js';
 import { SeenSet } from '../engine/seen-set.js';
 import type { ParleyConfig } from '../config.js';
-import { asHandle } from '../message.js';
+import { asHandle, asTopic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
 import { startPresenceLoop } from './presence-loop.js';
 import { registerTools } from './tools.js';
@@ -21,8 +21,9 @@ export function buildReactiveServer(plugin: BackendPlugin, cfg: ParleyConfig): S
   registerTools(server, {
     plugin,
     identity: asHandle(cfg.identity.handle),
-    allow: new Allowlist(cfg.topics),
+    allow: allowlistFor(cfg),
     seen: new SeenSet(),
+    presenceTopic: asTopic(cfg.presence.topic),
     presenceTtlMs: cfg.presence.ttl_ms,
   });
   return server;
@@ -62,7 +63,8 @@ export function createRemoteHttpApp(
   // The chat bridge is a long-lived participant too: announce presence off the shared plugin
   // (the reactive servers are per-request and stateless, so presence lives at app scope).
   const presence = cfg.presence.enabled
-    ? startPresenceLoop(plugin, asHandle(cfg.identity.handle), new Allowlist(cfg.topics), {
+    ? startPresenceLoop(plugin, asHandle(cfg.identity.handle), allowlistFor(cfg), {
+        presenceTopic: asTopic(cfg.presence.topic),
         heartbeatMs: cfg.presence.heartbeat_ms,
       })
     : undefined;

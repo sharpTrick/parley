@@ -1,18 +1,21 @@
 /**
  * Presence emitter (DESIGN §7/§9, presence). A proactive loop — a sibling of the push loop —
- * that announces THIS bridge to every allowlisted topic's presence stream: a `hello` on start,
- * a `heartbeat` on an interval, and a best-effort `goodbye` on clean shutdown.
+ * that announces THIS bridge on ONE shared presence topic: a `hello` on start, a `heartbeat` on
+ * an interval, and a best-effort `goodbye` on clean shutdown. Each beat carries the bridge's
+ * subscribed topics so `parley_list_users` can report liveness per topic.
  *
- * Writes go through the seam's single `post` path, to presence topics DERIVED from allowlisted
- * topics (`presenceTopicFor`) — so this adds no new allowlist surface and no seam method. The
- * roster is reconstructed on demand by `parley_list_users` (see engine/presence.ts).
+ * Writes go through the seam's single `post` path, to the configured presence topic — so this
+ * adds no new allowlist surface and no seam method. The roster is reconstructed on demand by
+ * `parley_list_users` (see engine/presence.ts).
  */
 import type { Allowlist } from '../allowlist.js';
-import type { Handle } from '../message.js';
+import type { Handle, Topic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
-import { encodePresence, presenceTopicFor, type PresenceKind } from '../engine/presence.js';
+import { encodePresence, type PresenceKind } from '../engine/presence.js';
 
 export interface PresenceLoopOptions {
+  /** The shared presence topic to announce on (`presence.topic`). */
+  presenceTopic: Topic;
   /** Heartbeat cadence (ms). */
   heartbeatMs: number;
   /** Clock source; injectable for deterministic tests. Default `Date.now`. */
@@ -36,17 +39,14 @@ export function startPresenceLoop(
   opts: PresenceLoopOptions,
 ): PresenceLoop {
   const now = opts.now ?? Date.now;
-  const presenceTopics = allow.topics().map(presenceTopicFor);
+  // The subscribed topics are static config — capture once and advertise them on every beat.
+  const subscribedTopics = allow.topics();
 
   const beat = async (kind: PresenceKind): Promise<void> => {
-    const content = encodePresence({ v: 1, kind, at: now() });
-    await Promise.all(
-      presenceTopics.map((topic) =>
-        plugin.post(topic, identity, content).catch(() => {
-          // Best-effort: a dropped beat is harmless; TTL reconciles (engine/presence.ts).
-        }),
-      ),
-    );
+    const content = encodePresence({ v: 2, kind, at: now(), topics: subscribedTopics });
+    await plugin.post(opts.presenceTopic, identity, content).catch(() => {
+      // Best-effort: a dropped beat is harmless; TTL reconciles (engine/presence.ts).
+    });
   };
 
   void beat('hello');

@@ -33,7 +33,7 @@ export {
 } from './config.js';
 
 // Security: topic allowlist (DESIGN §14).
-export { Allowlist, TopicNotAllowedError } from './allowlist.js';
+export { Allowlist, allowlistFor, TopicNotAllowedError, type AllowlistOptions } from './allowlist.js';
 
 // Engine: dedup / ordering / catch-up / read-state (DESIGN §6/§7).
 export { SeenSet } from './engine/seen-set.js';
@@ -41,11 +41,11 @@ export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
 // Presence: "who is live" derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
 export {
-  presenceTopicFor,
   encodePresence,
   decodePresence,
   computeLive,
-  PRESENCE_TOPIC_SUFFIX,
+  DEFAULT_PRESENCE_TOPIC,
+  MAX_RECORD_TOPICS,
   type PresenceKind,
   type PresenceRecord,
   type LiveEntry,

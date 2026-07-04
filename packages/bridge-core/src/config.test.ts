@@ -9,6 +9,51 @@ describe('config loader', () => {
     expect(cfg.live_push).toEqual({ enabled: false, mention_filter: false });
     expect(cfg.permissions.skip_permissions).toBe(false);
     expect(cfg.backend_config).toEqual({});
+    expect(cfg.post_topics).toEqual([]);
+    // Presence defaults: single shared topic, 10-min heartbeat, TTL = 3× heartbeat.
+    expect(cfg.presence).toEqual({
+      enabled: true,
+      topic: 'parley-presence',
+      heartbeat_ms: 600_000,
+      ttl_ms: 1_800_000,
+    });
+  });
+
+  it('derives presence.ttl_ms from an explicit heartbeat, but honors an explicit ttl', () => {
+    const derived = parseConfig({
+      identity: { handle: 'h' },
+      topics: ['a'],
+      presence: { heartbeat_ms: 60_000 },
+    });
+    expect(derived.presence.ttl_ms).toBe(180_000);
+    const pinned = parseConfig({
+      identity: { handle: 'h' },
+      topics: ['a'],
+      presence: { heartbeat_ms: 60_000, ttl_ms: 500_000 },
+    });
+    expect(pinned.presence.ttl_ms).toBe(500_000);
+  });
+
+  it('accepts post_topics and rejects an uncompilable regex', () => {
+    const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-.*'] });
+    expect(cfg.post_topics).toEqual(['ctx-.*']);
+    expect(() =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-('] }),
+    ).toThrow(/invalid regex/);
+  });
+
+  it('rejects an explicit topic that collides with the presence topic', () => {
+    expect(() =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['parley-presence'] }),
+    ).toThrow(/reserved for presence/);
+    // Also when the presence topic is customized.
+    expect(() =>
+      parseConfig({
+        identity: { handle: 'h' },
+        topics: ['a', 'live'],
+        presence: { topic: 'live' },
+      }),
+    ).toThrow(/reserved for presence/);
   });
 
   it('merges partial nested objects with per-field defaults', () => {

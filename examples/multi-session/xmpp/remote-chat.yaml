@@ -3,11 +3,15 @@ identity:
 topics:
   - "ctx-payments"
   - "ctx-infra"
+# post_topics:             # OPTIONAL: let chat post to ad-hoc topics it doesn't subscribe to
+#   - "ctx-.*"             #   full-match regexes; post/fetch only, never subscribed
 catchup:
   on_start: false
   limit: 100
 live_push:
   enabled: false
+presence:
+  enabled: false          # reactive-only chat can't receive pushes → skip heartbeats (DESIGN §7)
 permissions:
   skip_permissions: false
 
