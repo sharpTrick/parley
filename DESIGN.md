@@ -215,15 +215,21 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
 - **Presence / liveness.** A bridge announces itself by posting `hello` / `heartbeat` /
   `goodbye` to **one shared presence topic** (`presence.topic`, default `parley-presence`), and
-  each beat carries the instance's subscribed topics. This is isolated from real topics: the
+  each beat carries the instance's subscribed topics **plus its `post_topics` reach** (the regex
+  sources it may post to but does not subscribe, §14). This is isolated from real topics: the
   presence topic is **never subscribed and never enters catch-up / dedup**, so heartbeats never
   surface as `<channel>` events or pollute durable history — and because it is a single stream, a
   human on a real chat backend mutes **one** topic instead of one per context. It is also
   **reserved**: no `post` / `fetch_recent` (nor any `post_topics` pattern, §14) may target it, so
   a peer cannot spoof the roster. The `parley_list_users` tool reconstructs "who is live" from
   `fetchRecent` over that one topic plus a TTL window — so it works **identically on every backend
-  with no new seam method**, reports each instance's subscribed topics, and lists an idle instance
-  that has never posted. TTL reclaims crashed instances; `goodbye` is a best-effort fast-path.
+  with no new seam method**, reports each instance's subscribed topics **and post reach**, and lists
+  an idle instance that has never posted. Its default (unscoped) roster is **everyone you share a
+  channel with in either direction** — peers subscribed to a topic *you* can post to, or whose
+  advertised `post_topics` can reach a topic *you* subscribe to — so a freshly-onboarded agent on a
+  unique topic still discovers the peers it can hand off to (advertised pattern sources are inbound,
+  so they are compiled defensively, never enumerated). TTL reclaims crashed instances; `goodbye` is
+  a best-effort fast-path.
   This is **Parley-participant liveness, not a human directory** — a human in a native chat client
   appears only once they send a real message. A reactive-only front door (the chat instance)
   cannot receive `<channel>` pushes and can set `presence.enabled: false` to stay silent. Powered

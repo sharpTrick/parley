@@ -54,11 +54,12 @@ function postBeat(
   topics: string[],
   kind: PresenceKind,
   at: number,
+  postTopics: string[] = [],
 ): Promise<unknown> {
   return plugin.post(
     PRESENCE_TOPIC,
     asHandle(handle),
-    encodePresence({ v: 2, kind, at, topics }),
+    encodePresence({ v: 2, kind, at, topics, postTopics }),
   );
 }
 
@@ -144,7 +145,7 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
 });
 
 interface LiveResult {
-  live: Array<{ handle: string; topics: string[]; lastSeenMs: number }>;
+  live: Array<{ handle: string; topics: string[]; postTopics: string[]; lastSeenMs: number }>;
 }
 
 describe('parley_list_users (presence-derived liveness)', () => {
@@ -157,7 +158,9 @@ describe('parley_list_users (presence-derived liveness)', () => {
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
     ) as LiveResult;
-    expect(out.live).toEqual([{ handle: 'claude-a', topics: ['ctx'], lastSeenMs: NOW - 1_000 }]);
+    expect(out.live).toEqual([
+      { handle: 'claude-a', topics: ['ctx'], postTopics: [], lastSeenMs: NOW - 1_000 },
+    ]);
   });
 
   it('applies the glob filter over handles', async () => {
@@ -198,6 +201,69 @@ describe('parley_list_users (presence-derived liveness)', () => {
     expect(out.live).toEqual([]);
   });
 
+  it('includes a peer subscribed to a topic I can POST to via my post pattern (the fresh-onboard case)', async () => {
+    // I subscribe only to my own unique topic — no subscribed-topic overlap with anyone — but my
+    // post pattern reaches the peer's topic, so it IS a viable hand-off target. (msg-2539 fix.)
+    const { client, plugin } = await harness({
+      now: () => NOW,
+      presenceTtlMs: TTL,
+      topics: ['ctx-mine'],
+      postPatterns: ['ctx-.*'],
+    });
+    await postBeat(plugin, 'peer', ['ctx-theirs'], 'hello', NOW - 1_000);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as LiveResult;
+    expect(out.live.map((l) => l.handle)).toEqual(['peer']);
+  });
+
+  it('includes a peer whose advertised post-pattern can reach a topic I subscribe to (inbound reach)', async () => {
+    // I have no post patterns, so I cannot reach the peer's topic; but the peer advertises it can
+    // post to ctx-.*, which covers my subscribed topic — a one-way channel INTO me still counts.
+    const { client, plugin } = await harness({
+      now: () => NOW,
+      presenceTtlMs: TTL,
+      topics: ['ctx-mine'],
+    });
+    await postBeat(plugin, 'peer', ['ctx-theirs'], 'hello', NOW - 1_000, ['ctx-.*']);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as LiveResult;
+    expect(out.live.map((l) => l.handle)).toEqual(['peer']);
+  });
+
+  it('excludes a peer with no shared channel in either direction', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // Peer subscribes elsewhere and can only post to unrelated topics — neither can reach the other.
+    await postBeat(plugin, 'stranger', ['other'], 'hello', NOW - 1_000, ['unrelated-.*']);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as LiveResult;
+    expect(out.live).toEqual([]);
+  });
+
+  it("surfaces a peer's advertised postTopics in its roster entry", async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000, ['ctx-.*']);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as LiveResult;
+    expect(out.live).toEqual([
+      { handle: 'claude-a', topics: ['ctx'], postTopics: ['ctx-.*'], lastSeenMs: NOW - 1_000 },
+    ]);
+  });
+
+  it('ignores an un-compilable / over-long peer post-pattern without crashing (untrusted input)', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // A hostile beat: a broken regex source plus a huge one. Neither should reach me, and the call
+    // must not throw — the peer has no subscribed overlap and no valid pattern that covers 'ctx'.
+    await postBeat(plugin, 'hostile', ['other'], 'hello', NOW - 1_000, ['(', 'x'.repeat(10_000)]);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as LiveResult;
+    expect(out.live).toEqual([]);
+  });
+
   it('scopes to a single topic when `topic` is given', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
     await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
@@ -219,6 +285,21 @@ describe('parley_list_users (presence-derived liveness)', () => {
       await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
     ) as LiveResult;
     expect(out.live.map((l) => l.handle)).toEqual(['claude-a']);
+  });
+
+  it('scopes to peers who can POST to the topic, not only its subscribers', async () => {
+    const { client, plugin } = await harness({
+      now: () => NOW,
+      presenceTtlMs: TTL,
+      postPatterns: ['ctx-.*'], // makes 'ctx-adhoc' a valid scope for me to query
+    });
+    // 'poster' does not subscribe to ctx-adhoc but advertises it can post there; 'subber' subscribes.
+    await postBeat(plugin, 'poster', ['elsewhere'], 'hello', NOW - 1_000, ['ctx-.*']);
+    await postBeat(plugin, 'subber', ['ctx-adhoc'], 'hello', NOW - 1_000);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
+    ) as LiveResult;
+    expect(out.live.map((l) => l.handle)).toEqual(['poster', 'subber']);
   });
 
   it('rejects a topic outside the allowlist', async () => {
