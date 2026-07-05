@@ -2,17 +2,25 @@ import type { McpServer, ToolCallback } from '@modelcontextprotocol/sdk/server/m
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { Allowlist } from '../allowlist.js';
-import { computeLive } from '../engine/presence.js';
+import { computeRoster } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { filterHandles } from '../identity-filter.js';
 import { asBackendMsgId, asCursor, type BackendMsgId, type Handle, type Topic } from '../message.js';
 import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
 
 /**
- * How many recent presence messages to scan when building the live roster. At the default 10-min
- * heartbeat / 30-min TTL this covers well over a hundred concurrent instances' TTL windows.
+ * How many recent presence messages to scan when building the roster. At the default 10-min
+ * heartbeat / 30-min TTL this covers well over a hundred concurrent instances' TTL windows. It also
+ * bounds the OFFLINE lookback: a `since_ms` reaching further back than this many beats can silently
+ * under-report older peers — the handler flags that with `truncated: true` when the page is full.
  */
 const PRESENCE_FETCH_LIMIT = 500;
+
+/**
+ * Default offline lookback for `parley_list_users` (24h): how far back a peer can have last been
+ * seen and still surface as `online: false`. Bounded in practice by {@link PRESENCE_FETCH_LIMIT}.
+ */
+const DEFAULT_ROSTER_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Max length of an untrusted peer post-pattern source we will compile. A beat's `postTopics` are
@@ -217,14 +225,19 @@ export function buildToolDefs(deps: ToolDeps): ToolDef[] {
     ),
     defineTool(
       'parley_list_users',
-      'List participants currently LIVE on the bus, optionally filtered by a glob over handles ' +
-        '(e.g. "claude-*"). Liveness comes from presence heartbeats, so an idle instance that has ' +
-        'not posted is still listed — use this to find who is available for hand-off. Each entry ' +
-        'reports the topics that instance subscribes to and the post-only topics it can reach. Pass ' +
-        '`topic` to scope to peers on that topic (subscribed to it, or able to post to it); omit for ' +
-        'everyone you share a channel with — anyone you can post to, or who can post to a topic you ' +
-        'subscribe to. A human using a plain chat client appears only once they send a message. ' +
-        `Returns { live: [{ handle, topics, postTopics, lastSeenMs }] }. Configured topics: ${allow
+      'List participants reachable on the bus for hand-off — a REACHABILITY roster, not just who is ' +
+        'awake this instant. Includes peers seen recently but currently offline (agents are ephemeral ' +
+        'sessions; a post to an offline peer’s topic lands durably and it catches up on next ' +
+        'start), each tagged `online: true|false`, most-recently-seen first. Each entry reports the ' +
+        'topics that peer subscribes to and the post-only topics it can reach. Pass `topic` to scope ' +
+        'to peers on that topic (subscribed to it, or able to post to it); omit for everyone you share ' +
+        'a channel with — anyone you can post to, or who can post to a topic you subscribe to. ' +
+        '`online_only: true` returns only live peers; `since_ms` bounds how far back offline peers are ' +
+        'included (default 24h); `limit` caps the result; `filter` is a glob over handles (e.g. ' +
+        '"claude-*"). A human using a plain chat client appears only once they send a message. Returns ' +
+        '{ users: [{ handle, online, topics, postTopics, lastSeenMs }], truncated } (truncated=true ' +
+        'when the scanned presence history was full, so older offline peers may be missing). Configured ' +
+        `topics: ${allow
           .topics()
           .map((t) => JSON.stringify(t))
           .join(', ')}.`,
@@ -240,44 +253,65 @@ export function buildToolDefs(deps: ToolDeps): ToolDef[] {
             'Optional topic to scope to. Omit for all configured topics; the default scope is the ' +
               'configured topics.',
           ),
+        online_only: z
+          .boolean()
+          .optional()
+          .describe('Only peers online right now (skip offline-but-recently-seen). Default false.'),
+        since_ms: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('How far back (ms) to include offline peers. Default 24h.'),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Max peers to return (after the most-recently-seen-first sort).'),
       },
-      async ({ filter, topic }) => {
+      async ({ filter, topic, online_only, since_ms, limit }) => {
         const now = deps.now ?? Date.now;
         // A pattern-allowed topic is a valid scope: a peer may advertise a topic we only match, not list.
         const scope = topic !== undefined ? deps.allow.assert(topic) : undefined;
+        const sinceMs = since_ms ?? DEFAULT_ROSTER_WINDOW_MS;
 
-        let messages;
+        let page;
         try {
-          const page = await deps.plugin.fetchRecent({
+          page = await deps.plugin.fetchRecent({
             topic: deps.presenceTopic,
             limit: PRESENCE_FETCH_LIMIT,
           });
-          messages = page.messages;
         } catch {
-          return textResult({ live: [] }); // presence topic not created yet ⇒ nobody live
+          return textResult({ users: [], truncated: false }); // presence topic not created yet ⇒ nobody seen
         }
+        // A full page means older presence history was clipped — offline coverage is best-effort.
+        const truncated = page.messages.length >= PRESENCE_FETCH_LIMIT;
 
         // Our own subscribed topics — short and trusted; matched against peers' advertised patterns.
         const mySubscribed = deps.allow.topics();
-        const live = filterHandles(
-          computeLive(messages, now(), deps.presenceTtlMs).filter((e) => {
-            if (scope !== undefined) {
-              // Scoped: peers ON that topic — subscribed to it, or able to post to it via a pattern.
-              return (
-                e.topics.includes(scope) ||
-                compilePeerPatterns(e.postTopics).some((re) => re.test(scope))
-              );
-            }
-            // Unscoped: everyone we share a viable channel with, in EITHER direction:
-            //  - I can post to a topic they subscribe to (allow.has = my subscribed ∪ my patterns), OR
-            //  - they can post — per their advertised patterns — to a topic I subscribe to.
-            if (e.topics.some((t) => deps.allow.has(t))) return true;
-            const theirReach = compilePeerPatterns(e.postTopics);
-            return mySubscribed.some((mt) => theirReach.some((re) => re.test(mt)));
-          }),
-          filter,
-        ).sort((a, b) => (a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0));
-        return textResult({ live });
+        let users = computeRoster(page.messages, now(), {
+          ttlMs: deps.presenceTtlMs,
+          sinceMs,
+        }).filter((e) => {
+          if (scope !== undefined) {
+            // Scoped: peers ON that topic — subscribed to it, or able to post to it via a pattern.
+            return (
+              e.topics.includes(scope) || compilePeerPatterns(e.postTopics).some((re) => re.test(scope))
+            );
+          }
+          // Unscoped: everyone we share a viable channel with, in EITHER direction:
+          //  - I can post to a topic they subscribe to (allow.has = my subscribed ∪ my patterns), OR
+          //  - they can post — per their advertised patterns — to a topic I subscribe to.
+          if (e.topics.some((t) => deps.allow.has(t))) return true;
+          const theirReach = compilePeerPatterns(e.postTopics);
+          return mySubscribed.some((mt) => theirReach.some((re) => re.test(mt)));
+        });
+        if (online_only === true) users = users.filter((e) => e.online);
+        // computeRoster already sorts most-recently-seen first; filter/slice preserve that order.
+        users = filterHandles(users, filter);
+        if (limit !== undefined) users = users.slice(0, limit);
+        return textResult({ users, truncated });
       },
     ),
   ];

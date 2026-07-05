@@ -39,16 +39,18 @@ export { Allowlist, allowlistFor, TopicNotAllowedError, type AllowlistOptions } 
 export { SeenSet } from './engine/seen-set.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
-// Presence: "who is live" derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
+// Presence: the reachability roster derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
 export {
   encodePresence,
   decodePresence,
-  computeLive,
+  computeRoster,
   DEFAULT_PRESENCE_TOPIC,
   MAX_RECORD_TOPICS,
+  MAX_INSTANCE_ID_LEN,
   type PresenceKind,
   type PresenceRecord,
-  type LiveEntry,
+  type RosterEntry,
+  type RosterOptions,
 } from './engine/presence.js';
 
 // Handle glob filtering (parley_list_users).

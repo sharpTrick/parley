@@ -145,23 +145,33 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
   });
 });
 
-interface LiveResult {
-  live: Array<{ handle: string; topics: string[]; postTopics: string[]; lastSeenMs: number }>;
+interface RosterResult {
+  users: Array<{
+    handle: string;
+    online: boolean;
+    topics: string[];
+    postTopics: string[];
+    lastSeenMs: number;
+  }>;
+  truncated: boolean;
 }
 
-describe('parley_list_users (presence-derived liveness)', () => {
+describe('parley_list_users (presence-derived reachability roster)', () => {
   const NOW = 1_000_000;
   const TTL = 90_000;
 
-  it('lists a live participant from presence beats, with no real post needed', async () => {
+  it('lists an online participant from presence beats, with no real post needed', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
     await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live).toEqual([
-      { handle: 'claude-a', topics: ['ctx'], postTopics: [], lastSeenMs: NOW - 1_000 },
-    ]);
+    ) as RosterResult;
+    expect(out).toEqual({
+      users: [
+        { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: [], lastSeenMs: NOW - 1_000 },
+      ],
+      truncated: false,
+    });
   });
 
   it('applies the glob filter over handles', async () => {
@@ -170,18 +180,71 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'human-x', ['ctx'], 'heartbeat', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: { filter: 'claude-*' } }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['claude-a']);
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['claude-a']);
   });
 
-  it('excludes a handle whose latest beat is older than the TTL', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'stale', ['ctx'], 'heartbeat', NOW - TTL - 1);
-    await postBeat(plugin, 'fresh', ['ctx'], 'heartbeat', NOW - 1_000);
+  it('lists a beyond-TTL handle as offline (reachability), and online_only hides it', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    await postBeat(plugin, 'stale', ['ctx'], 'heartbeat', NOW - TTL - 1); // past TTL ⇒ offline
+    await postBeat(plugin, 'fresh', ['ctx'], 'heartbeat', NOW - 1_000); //   within TTL ⇒ online
+    const all = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    expect(all.users.map((u) => [u.handle, u.online])).toEqual([
+      ['fresh', true],
+      ['stale', false],
+    ]);
+    const onlyLive = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: { online_only: true } }),
+    ) as RosterResult;
+    expect(onlyLive.users.map((u) => u.handle)).toEqual(['fresh']);
+  });
+
+  it('includes an offline-but-recently-seen peer, tagged online:false and sorted after online peers', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    await postBeat(plugin, 'awake', ['ctx'], 'heartbeat', NOW - 1_000);
+    await postBeat(plugin, 'napping', ['ctx'], 'goodbye', NOW - 5_000); // departed ⇒ offline, still recent
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['fresh']);
+    ) as RosterResult;
+    expect(out.users.map((u) => [u.handle, u.online])).toEqual([
+      ['awake', true],
+      ['napping', false],
+    ]);
+  });
+
+  it('since_ms bounds how far back offline peers are included', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    await postBeat(plugin, 'recent', ['ctx'], 'goodbye', NOW - 10_000);
+    await postBeat(plugin, 'ancient', ['ctx'], 'goodbye', NOW - 5_000_000);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: { since_ms: 60_000 } }),
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['recent']); // 'ancient' is beyond the 60s window
+  });
+
+  it('limit caps the roster after the most-recently-seen-first sort', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    await postBeat(plugin, 'a', ['ctx'], 'heartbeat', NOW - 3_000);
+    await postBeat(plugin, 'b', ['ctx'], 'heartbeat', NOW - 1_000); // freshest
+    await postBeat(plugin, 'c', ['ctx'], 'heartbeat', NOW - 2_000);
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: { limit: 2 } }),
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['b', 'c']); // top-2 most recent
+  });
+
+  it('flags truncated when the scanned presence history fills the page', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // Fill the fetch page (PRESENCE_FETCH_LIMIT = 500) so older offline peers could be clipped.
+    for (let i = 0; i < 500; i++) {
+      await postBeat(plugin, 'flood', ['ctx'], 'heartbeat', NOW - 1_000 - i);
+    }
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    expect(out.truncated).toBe(true);
   });
 
   it('ignores real-topic senders (presence stream is isolated)', async () => {
@@ -189,8 +252,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await plugin.post(asTopic('ctx'), asHandle('chatty'), 'a real message'); // NOT a presence beat
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live).toEqual([]);
+    ) as RosterResult;
+    expect(out.users).toEqual([]);
   });
 
   it('excludes a handle advertising only topics we do not subscribe to', async () => {
@@ -198,8 +261,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'stranger', ['some-other-ctx'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live).toEqual([]);
+    ) as RosterResult;
+    expect(out.users).toEqual([]);
   });
 
   it('includes a peer subscribed to a topic I can POST to via my post pattern (the fresh-onboard case)', async () => {
@@ -214,8 +277,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'peer', ['ctx-theirs'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['peer']);
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['peer']);
   });
 
   it('includes a peer whose advertised post-pattern can reach a topic I subscribe to (inbound reach)', async () => {
@@ -229,8 +292,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'peer', ['ctx-theirs'], 'hello', NOW - 1_000, ['ctx-.*']);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['peer']);
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['peer']);
   });
 
   it('excludes a peer with no shared channel in either direction', async () => {
@@ -239,8 +302,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'stranger', ['other'], 'hello', NOW - 1_000, ['unrelated-.*']);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live).toEqual([]);
+    ) as RosterResult;
+    expect(out.users).toEqual([]);
   });
 
   it("surfaces a peer's advertised postTopics in its roster entry", async () => {
@@ -248,9 +311,9 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000, ['ctx-.*']);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live).toEqual([
-      { handle: 'claude-a', topics: ['ctx'], postTopics: ['ctx-.*'], lastSeenMs: NOW - 1_000 },
+    ) as RosterResult;
+    expect(out.users).toEqual([
+      { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: ['ctx-.*'], lastSeenMs: NOW - 1_000 },
     ]);
   });
 
@@ -261,8 +324,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'hostile', ['other'], 'hello', NOW - 1_000, ['(', 'x'.repeat(10_000)]);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as LiveResult;
-    expect(out.live).toEqual([]);
+    ) as RosterResult;
+    expect(out.users).toEqual([]);
   });
 
   it('scopes to a single topic when `topic` is given', async () => {
@@ -271,8 +334,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'claude-b', ['ctx-reviews'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx' } }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['claude-a']);
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['claude-a']);
   });
 
   it('scopes by a pattern-allowed topic (a peer may advertise a topic we only match)', async () => {
@@ -284,8 +347,8 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'claude-a', ['ctx-adhoc'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['claude-a']);
+    ) as RosterResult;
+    expect(out.users.map((u) => u.handle)).toEqual(['claude-a']);
   });
 
   it('scopes to peers who can POST to the topic, not only its subscribers', async () => {
@@ -299,8 +362,9 @@ describe('parley_list_users (presence-derived liveness)', () => {
     await postBeat(plugin, 'subber', ['ctx-adhoc'], 'hello', NOW - 1_000);
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
-    ) as LiveResult;
-    expect(out.live.map((l) => l.handle)).toEqual(['poster', 'subber']);
+    ) as RosterResult;
+    // Same lastSeenMs ⇒ handle-ascending tiebreak.
+    expect(out.users.map((u) => u.handle)).toEqual(['poster', 'subber']);
   });
 
   it('rejects a topic outside the allowlist', async () => {

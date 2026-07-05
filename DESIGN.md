@@ -221,17 +221,27 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   surface as `<channel>` events or pollute durable history — and because it is a single stream, a
   human on a real chat backend mutes **one** topic instead of one per context. It is also
   **reserved**: no `post` / `fetch_recent` (nor any `post_topics` pattern, §14) may target it, so
-  a peer cannot spoof the roster. The `parley_list_users` tool reconstructs "who is live" from
-  `fetchRecent` over that one topic plus a TTL window — so it works **identically on every backend
-  with no new seam method**, reports each instance's subscribed topics **and post reach**, and lists
-  an idle instance that has never posted. Its default (unscoped) roster is **everyone you share a
-  channel with in either direction** — peers subscribed to a topic *you* can post to, or whose
-  advertised `post_topics` can reach a topic *you* subscribe to — so a freshly-onboarded agent on a
-  unique topic still discovers the peers it can hand off to (advertised pattern sources are inbound,
-  so they are compiled defensively, never enumerated). TTL reclaims crashed instances; `goodbye` is
-  a best-effort fast-path. **Presence records are versioned** (`v`; current line `v:2`): evolve the
-  format *additively within a version* — a new optional field (e.g. `postTopics`, added in v0.6.0)
-  decodes to a default on older readers and is ignored by them, so mixed-version fleets interoperate
+  a peer cannot spoof the roster. The `parley_list_users` tool reconstructs a **reachability roster**
+  from `fetchRecent` over that one topic plus a TTL window — so it works **identically on every backend
+  with no new seam method** and reports each peer's subscribed topics **and post reach**. It is
+  reachability-first, **not just who is awake this instant**: because a post to a sleeping peer's topic
+  lands durably and it catches up on next start, the default roster also includes peers **seen recently
+  but currently offline**, each tagged `online: true | false`, most-recently-seen first (the top
+  hand-off candidates lead). `online_only: true` narrows to live peers; `since_ms` bounds how far back
+  offline peers reach (default 24h); `limit` caps the result. Its default (unscoped) roster is
+  **everyone you share a channel with in either direction** — peers subscribed to a topic *you* can
+  post to, or whose advertised `post_topics` can reach a topic *you* subscribe to — so a
+  freshly-onboarded agent on a unique topic still discovers the peers it can hand off to (advertised
+  pattern sources are inbound, so they are compiled defensively, never enumerated). Liveness is scoped
+  **per instance**: each beat carries a fresh per-process `instanceId`, and a handle is `online` iff
+  **any** of its instances has a fresh, non-`goodbye` beat — so a `goodbye` from an exiting process
+  reaps only its own instance and a relaunch's `hello` is never clobbered by the old process's trailing
+  `goodbye`. TTL reclaims crashed instances; `goodbye` is a best-effort fast-path. The roster envelope
+  is `{ users, truncated }` — `truncated: true` warns the scanned presence page was full, so offline
+  peers older than it are not guaranteed to appear. **Presence records are versioned** (`v`; current
+  line `v:2`): evolve the format *additively within a version* — new optional fields (e.g. `postTopics`
+  and the per-process `instanceId`, both added on the `v:2` line)
+  decode to a default on older readers and are ignored by them, so mixed-version fleets interoperate
   and a rolling upgrade only forgoes the *new* signal until every peer is current. A **version bump
   is a flag day**, not a graceful step: `decodePresence` returns null for any record whose `v` it
   does not recognize (a `v:2` reader *drops* a `v:1` record — pre-v2 beats simply never land on the
