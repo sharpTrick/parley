@@ -33,15 +33,22 @@ export const DEFAULT_PRESENCE_TOPIC = 'parley-presence';
  */
 export const MAX_RECORD_TOPICS = 64;
 
+/**
+ * Cap the length of an untrusted `instanceId` we retain — a hostile beat can't hand us an
+ * unbounded string to bloat the roster's per-instance map (DESIGN §14). A real id is a UUID.
+ */
+export const MAX_INSTANCE_ID_LEN = 128;
+
 /** The kind of a presence beat. `goodbye` is a best-effort fast-path removal (TTL is the real gate). */
 export type PresenceKind = 'hello' | 'heartbeat' | 'goodbye';
 
 /**
  * The payload carried in a presence message's `content` (JSON). Versioned for forward-compat.
  *
- * `postTopics` was added as an ADDITIVE field on `v: 2` (not a version bump): older beats omit it
- * and decode with `postTopics: []`; older readers ignore it. Bumping `v` would make old readers
- * reject new beats mid-rollout — additive keeps mixed-version fleets interoperable.
+ * `v: 2` carries TWO additive fields — `postTopics` and `instanceId` — each added WITHOUT a
+ * version bump: older beats omit them and decode with `postTopics: []` / `instanceId: ''`; older
+ * readers ignore them. Bumping `v` would make old readers reject new beats mid-rollout — additive
+ * keeps mixed-version fleets interoperable (DESIGN §7).
  */
 export interface PresenceRecord {
   v: 2;
@@ -56,6 +63,15 @@ export interface PresenceRecord {
    * (a pattern can match infinitely many topics), matched against the reader's own topics instead.
    */
   postTopics: string[];
+  /**
+   * A fresh PER-PROCESS token (a random id minted at loop start), NOT the config-stable
+   * `instance_id`. Liveness is derived per `(handle, instanceId)` so a `goodbye` from an exiting
+   * process reaps only its OWN instance — a relaunch mints a new id, so its `hello` is never
+   * clobbered by the old process's trailing `goodbye` (the bug this scopes out). `''` is the
+   * "anonymous instance" sentinel an old beat (which omits the field) decodes to — collapsing to
+   * the previous per-handle behaviour, so mixed-version fleets degrade gracefully.
+   */
+  instanceId: string;
 }
 
 /** A live participant surfaced by {@link computeLive}. */
@@ -103,30 +119,52 @@ export function decodePresence(content: string): PresenceRecord | null {
     Array.isArray(r.postTopics) && r.postTopics.every((t) => typeof t === 'string' && t.length > 0)
       ? (r.postTopics as string[]).slice(0, MAX_RECORD_TOPICS)
       : [];
-  return { v: 2, kind: r.kind, at: r.at, topics, postTopics };
+  // `instanceId` is optional/additive: absent (old emitter) or malformed ⇒ '' (the anonymous
+  // instance, i.e. today's per-handle collapse) rather than a whole-record reject. Length-capped
+  // because it is untrusted (DESIGN §14).
+  const instanceId =
+    typeof r.instanceId === 'string' && r.instanceId.length > 0
+      ? r.instanceId.slice(0, MAX_INSTANCE_ID_LEN)
+      : '';
+  return { v: 2, kind: r.kind, at: r.at, topics, postTopics, instanceId };
 }
 
 /**
  * Reconstruct the live roster from the presence topic's messages.
  *
  * `messages` are pre-sorted ascending by cursor (the plugin's ordering guarantee, DESIGN §6), so
- * the LAST record per handle is its latest. A handle is live iff its latest beat is
- * `hello`/`heartbeat` (not `goodbye`) AND is fresh (`nowMs - at < ttlMs`). TTL is the real
- * liveness gate — it reclaims crashed instances that never sent a `goodbye`. The handle's
- * advertised `topics` come from that same latest beat.
+ * the LAST record per `(handle, instanceId)` is that instance's latest beat. Liveness is scoped
+ * PER INSTANCE: a handle is live iff ANY of its instances has a latest beat that is
+ * `hello`/`heartbeat` (not `goodbye`) AND fresh (`nowMs - at < ttlMs`). Keying per instance means
+ * a `goodbye` from an exiting process reaps only THAT process's slot — a relaunch's fresh instance
+ * (new random `instanceId`) is never clobbered by the old process's trailing `goodbye`. TTL is the
+ * real liveness gate — it reclaims crashed instances that never sent a `goodbye`. A live handle's
+ * advertised `topics`/`postTopics` are the union across its live instances.
  */
 export function computeLive(messages: Message[], nowMs: number, ttlMs: number): LiveEntry[] {
-  const latest = new Map<Handle, PresenceRecord>();
+  const byHandle = new Map<Handle, Map<string, PresenceRecord>>();
   for (const m of messages) {
     const rec = decodePresence(m.content);
     if (rec === null) continue;
-    latest.set(m.senderHandle, rec); // ascending cursor order ⇒ last write wins
+    let insts = byHandle.get(m.senderHandle);
+    if (insts === undefined) {
+      insts = new Map();
+      byHandle.set(m.senderHandle, insts);
+    }
+    insts.set(rec.instanceId, rec); // ascending cursor order ⇒ last write wins per instance
   }
   const live: LiveEntry[] = [];
-  for (const [handle, rec] of latest) {
-    if (rec.kind === 'goodbye') continue;
-    if (nowMs - rec.at >= ttlMs) continue;
-    live.push({ handle, topics: rec.topics, postTopics: rec.postTopics, lastSeenMs: rec.at });
+  for (const [handle, insts] of byHandle) {
+    const liveInsts = [...insts.values()].filter(
+      (r) => r.kind !== 'goodbye' && nowMs - r.at < ttlMs,
+    );
+    if (liveInsts.length === 0) continue;
+    live.push({
+      handle,
+      topics: [...new Set(liveInsts.flatMap((r) => r.topics))],
+      postTopics: [...new Set(liveInsts.flatMap((r) => r.postTopics))],
+      lastSeenMs: Math.max(...liveInsts.map((r) => r.at)),
+    });
   }
   live.sort((a, b) => (a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0));
   return live;

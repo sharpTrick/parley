@@ -33,13 +33,36 @@ describe('presence loop', () => {
       presenceTopic: PRESENCE_TOPIC,
       heartbeatMs: 30_000,
       now: () => NOW,
+      instanceId: 'inst-a',
     });
     await vi.advanceTimersByTimeAsync(0); // flush the fire-and-forget hello
     const recs = await records(plugin);
     // One beat = ONE message total, even across a multi-topic allowlist.
     expect(recs).toHaveLength(1);
     // No post_topics ⇒ postTopics advertised as [].
-    expect(recs[0]).toEqual({ v: 2, kind: 'hello', at: NOW, topics: ['ctx', 'reviews'], postTopics: [] });
+    expect(recs[0]).toEqual({
+      v: 2,
+      kind: 'hello',
+      at: NOW,
+      topics: ['ctx', 'reviews'],
+      postTopics: [],
+      instanceId: 'inst-a',
+    });
+    await loop.stop();
+  });
+
+  it('stamps a stable per-process instanceId on every beat, defaulting to a fresh random id', async () => {
+    const loop = startPresenceLoop(plugin, asHandle('claude-a'), new Allowlist(['ctx']), {
+      presenceTopic: PRESENCE_TOPIC,
+      heartbeatMs: 30_000,
+      now: () => NOW,
+    });
+    await vi.advanceTimersByTimeAsync(30_000); // hello + one heartbeat
+    const recs = await records(plugin);
+    expect(recs).toHaveLength(2);
+    const ids = new Set(recs.map((r) => r.instanceId));
+    expect(ids.size).toBe(1); // one process ⇒ one id across all its beats
+    expect([...ids][0]).not.toBe(''); // a real random id, not the anonymous sentinel
     await loop.stop();
   });
 

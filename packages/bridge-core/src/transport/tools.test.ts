@@ -55,11 +55,12 @@ function postBeat(
   kind: PresenceKind,
   at: number,
   postTopics: string[] = [],
+  instanceId = '',
 ): Promise<unknown> {
   return plugin.post(
     PRESENCE_TOPIC,
     asHandle(handle),
-    encodePresence({ v: 2, kind, at, topics, postTopics }),
+    encodePresence({ v: 2, kind, at, topics, postTopics, instanceId }),
   );
 }
 
