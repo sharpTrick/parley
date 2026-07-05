@@ -10,6 +10,7 @@
  * adds no new allowlist surface and no seam method. The roster is reconstructed on demand by
  * `parley_list_users` (see engine/presence.ts).
  */
+import { randomUUID } from 'node:crypto';
 import type { Allowlist } from '../allowlist.js';
 import type { Handle, Topic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
@@ -22,6 +23,12 @@ export interface PresenceLoopOptions {
   heartbeatMs: number;
   /** Clock source; injectable for deterministic tests. Default `Date.now`. */
   now?: () => number;
+  /**
+   * Per-PROCESS liveness token stamped on every beat — a fresh random id per loop by default
+   * (NOT the config-stable `instance_id`). A relaunch mints a new one so its `hello` is not reaped
+   * by the old process's trailing `goodbye` (see engine/presence.ts). Injectable for deterministic tests.
+   */
+  instanceId?: string;
 }
 
 /** A running presence loop. Call {@link stop} once to cancel the timer and say goodbye. */
@@ -45,6 +52,8 @@ export function startPresenceLoop(
   // them on every beat. `postTopics` are the raw pattern SOURCES (peers compile them defensively).
   const subscribedTopics = allow.topics();
   const postTopics = allow.patterns();
+  // One fresh per-process token for this loop's lifetime — scopes goodbye to this instance only.
+  const instanceId = opts.instanceId ?? randomUUID();
 
   const beat = async (kind: PresenceKind): Promise<void> => {
     const content = encodePresence({
@@ -53,6 +62,7 @@ export function startPresenceLoop(
       at: now(),
       topics: subscribedTopics,
       postTopics,
+      instanceId,
     });
     await plugin.post(opts.presenceTopic, identity, content).catch(() => {
       // Best-effort: a dropped beat is harmless; TTL reconciles (engine/presence.ts).

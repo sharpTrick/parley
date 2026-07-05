@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
 import {
-  computeLive,
+  computeRoster,
   decodePresence,
   encodePresence,
+  MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
   type PresenceKind,
   type PresenceRecord,
@@ -17,11 +18,12 @@ function beat(
   seq: number,
   topics: string[] = ['ctx'],
   postTopics: string[] = [],
+  instanceId = '',
 ): Message {
   return {
     topic: asTopic('parley-presence'),
     senderHandle: asHandle(handle),
-    content: encodePresence({ v: 2, kind, at, topics, postTopics }),
+    content: encodePresence({ v: 2, kind, at, topics, postTopics, instanceId }),
     timestamp: new Date(seq * 1000).toISOString(),
     backendMsgId: asBackendMsgId(String(seq)),
     cursor: asCursor(String(seq)),
@@ -30,20 +32,34 @@ function beat(
 }
 
 describe('encode/decode presence', () => {
-  it('round-trips a record, including postTopics', () => {
+  it('round-trips a record, including postTopics and instanceId', () => {
     const rec: PresenceRecord = {
       v: 2,
       kind: 'heartbeat',
       at: 1234,
       topics: ['ctx-a', 'ctx-b'],
       postTopics: ['ctx-.*', 'general'],
+      instanceId: 'proc-abc123',
     };
     expect(decodePresence(encodePresence(rec))).toEqual(rec);
   });
 
-  it('defaults postTopics to [] for an old beat that omits it (additive field, no version bump)', () => {
+  it('defaults postTopics/instanceId for an old beat that omits them (additive fields, no version bump)', () => {
     const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'] }));
-    expect(rec).toEqual({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [] });
+    expect(rec).toEqual({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [], instanceId: '' });
+  });
+
+  it('drops a malformed / empty instanceId to the anonymous sentinel (untrusted input)', () => {
+    const notString = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], instanceId: 42 });
+    expect(decodePresence(notString)?.instanceId).toBe('');
+    const empty = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], instanceId: '' });
+    expect(decodePresence(empty)?.instanceId).toBe('');
+  });
+
+  it('truncates an over-long instanceId', () => {
+    const instanceId = 'x'.repeat(MAX_INSTANCE_ID_LEN + 50);
+    const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], instanceId }));
+    expect(rec?.instanceId).toHaveLength(MAX_INSTANCE_ID_LEN);
   });
 
   it('drops a malformed postTopics to [] rather than rejecting the whole beat (untrusted input)', () => {
@@ -88,61 +104,136 @@ describe('encode/decode presence', () => {
   });
 });
 
-describe('computeLive', () => {
+describe('computeRoster', () => {
   const now = 100_000;
   const ttl = 90_000;
+  const since = 600_000; // offline window, well beyond ttl for these fixtures
+  const opts = { ttlMs: ttl, sinceMs: since };
 
-  it('lists a handle whose latest beat is a fresh hello/heartbeat, with its topics + postTopics', () => {
-    const live = computeLive(
+  it('lists an online handle whose latest beat is a fresh hello/heartbeat, with its topics + postTopics', () => {
+    const roster = computeRoster(
       [beat('claude-a', 'hello', now - 1000, 1, ['ctx-x', 'ctx-y'], ['ctx-.*'])],
       now,
-      ttl,
+      opts,
     );
-    expect(live).toEqual([
-      { handle: 'claude-a', topics: ['ctx-x', 'ctx-y'], postTopics: ['ctx-.*'], lastSeenMs: now - 1000 },
+    expect(roster).toEqual([
+      {
+        handle: 'claude-a',
+        online: true,
+        topics: ['ctx-x', 'ctx-y'],
+        postTopics: ['ctx-.*'],
+        lastSeenMs: now - 1000,
+      },
     ]);
   });
 
-  it('takes the latest beat per handle (later cursor wins) and refreshes freshness + topics', () => {
+  it('takes the latest beat per instance (later cursor wins) and refreshes freshness + topics', () => {
     const msgs = [
       beat('claude-a', 'hello', now - 80_000, 1, ['ctx-a']),
       beat('claude-a', 'heartbeat', now - 1_000, 2, ['ctx-a', 'ctx-b'], ['ctx-.*']),
     ];
-    expect(computeLive(msgs, now, ttl)).toEqual([
-      { handle: 'claude-a', topics: ['ctx-a', 'ctx-b'], postTopics: ['ctx-.*'], lastSeenMs: now - 1_000 },
+    expect(computeRoster(msgs, now, opts)).toEqual([
+      {
+        handle: 'claude-a',
+        online: true,
+        topics: ['ctx-a', 'ctx-b'],
+        postTopics: ['ctx-.*'],
+        lastSeenMs: now - 1_000,
+      },
     ]);
   });
 
-  it('drops a handle whose latest beat is goodbye', () => {
+  it('marks a handle offline when its latest beat is goodbye, but still surfaces it within the since window', () => {
     const msgs = [
       beat('claude-a', 'heartbeat', now - 1_000, 1),
       beat('claude-a', 'goodbye', now - 500, 2),
     ];
-    expect(computeLive(msgs, now, ttl)).toEqual([]);
+    expect(computeRoster(msgs, now, opts)).toEqual([
+      { handle: 'claude-a', online: false, topics: ['ctx'], postTopics: [], lastSeenMs: now - 500 },
+    ]);
   });
 
-  it('drops a handle whose latest beat is older than the TTL (crash reclaim)', () => {
-    const msgs = [beat('claude-a', 'heartbeat', now - ttl, 1)]; // exactly TTL ⇒ not live
-    expect(computeLive(msgs, now, ttl)).toEqual([]);
-    const stale = [beat('claude-a', 'heartbeat', now - ttl - 1, 1)];
-    expect(computeLive(stale, now, ttl)).toEqual([]);
+  it('drops an offline handle whose last beat is older than the since window', () => {
+    const msgs = [beat('claude-a', 'goodbye', now - since, 1)]; // exactly since ⇒ dropped
+    expect(computeRoster(msgs, now, opts)).toEqual([]);
+    const stale = [beat('claude-a', 'goodbye', now - since - 1, 1)];
+    expect(computeRoster(stale, now, opts)).toEqual([]);
+  });
+
+  it('keeps a handle ONLINE when a different instance said goodbye after its hello (stale-goodbye scope, #14)', () => {
+    // Relaunch overlap: the new process posts hello (cursor 1); the old process then posts its
+    // trailing goodbye (cursor 2, later). Per-instance scoping must NOT let the old instance's
+    // goodbye reap the new instance — the handle stays online. `lastSeenMs` is the freshest beat of
+    // any kind (the trailing goodbye), which the new instance's next heartbeat supersedes.
+    const msgs = [
+      beat('claude-a', 'hello', now - 1_000, 1, ['ctx'], [], 'inst-new'),
+      beat('claude-a', 'goodbye', now - 500, 2, ['ctx'], [], 'inst-old'),
+    ];
+    expect(computeRoster(msgs, now, opts)).toEqual([
+      { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: [], lastSeenMs: now - 500 },
+    ]);
+  });
+
+  it('unions topics/postTopics across an online handle live instances', () => {
+    const msgs = [
+      beat('claude-a', 'hello', now - 2_000, 1, ['ctx-a'], ['a-.*'], 'inst-1'),
+      beat('claude-a', 'heartbeat', now - 800, 2, ['ctx-b'], ['b-.*'], 'inst-2'),
+    ];
+    const roster = computeRoster(msgs, now, opts);
+    expect(roster).toHaveLength(1);
+    const entry = roster[0]!;
+    expect(entry.online).toBe(true);
+    expect([...entry.topics].sort()).toEqual(['ctx-a', 'ctx-b']);
+    expect([...entry.postTopics].sort()).toEqual(['a-.*', 'b-.*']);
+    expect(entry.lastSeenMs).toBe(now - 800);
+  });
+
+  it('an offline handle uses its single last-known beat for topics/reach', () => {
+    const msgs = [
+      beat('claude-a', 'heartbeat', now - 2_000, 1, ['ctx-old'], ['old-.*']),
+      beat('claude-a', 'goodbye', now - 500, 2, ['ctx-new'], ['new-.*']),
+    ];
+    expect(computeRoster(msgs, now, opts)).toEqual([
+      {
+        handle: 'claude-a',
+        online: false,
+        topics: ['ctx-new'],
+        postTopics: ['new-.*'],
+        lastSeenMs: now - 500,
+      },
+    ]);
+  });
+
+  it('reclaims a handle by TTL (no goodbye) — offline once its last beat ages past ttl, still listed within since', () => {
+    const msgs = [beat('claude-a', 'heartbeat', now - ttl, 1)]; // exactly ttl ⇒ not online
+    expect(computeRoster(msgs, now, opts)).toEqual([
+      { handle: 'claude-a', online: false, topics: ['ctx'], postTopics: [], lastSeenMs: now - ttl },
+    ]);
   });
 
   it('ignores stray non-presence messages on the topic', () => {
     const stray: Message = { ...beat('x', 'hello', now, 1), content: 'plain chatter' };
-    expect(computeLive([stray], now, ttl)).toEqual([]);
+    expect(computeRoster([stray], now, opts)).toEqual([]);
   });
 
-  it('returns multiple live handles sorted by handle', () => {
+  it('sorts most-recently-seen first (online floats above older offline)', () => {
     const msgs = [
-      beat('human-x', 'heartbeat', now - 1_000, 1),
-      beat('claude-b', 'hello', now - 2_000, 2),
-      beat('claude-a', 'heartbeat', now - 3_000, 3),
+      beat('human-x', 'heartbeat', now - 1_000, 1), // online, freshest
+      beat('claude-b', 'goodbye', now - 5_000, 2), // offline, oldest
+      beat('claude-a', 'heartbeat', now - 3_000, 3), // online, middle
     ];
-    expect(computeLive(msgs, now, ttl).map((e) => e.handle)).toEqual([
-      'claude-a',
-      'claude-b',
-      'human-x',
+    expect(computeRoster(msgs, now, opts).map((e) => [e.handle, e.online])).toEqual([
+      ['human-x', true],
+      ['claude-a', true],
+      ['claude-b', false],
     ]);
+  });
+
+  it('breaks lastSeenMs ties by handle ascending', () => {
+    const msgs = [
+      beat('claude-b', 'heartbeat', now - 1_000, 1),
+      beat('claude-a', 'heartbeat', now - 1_000, 2),
+    ];
+    expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['claude-a', 'claude-b']);
   });
 });
