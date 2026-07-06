@@ -59,7 +59,7 @@ export {
 export { matchGlob, filterHandles } from './identity-filter.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
-export { registerTools, buildToolDefs, type ToolDeps } from './transport/tools.js';
+export { registerTools, type ToolDeps } from './transport/tools.js';
 export {
   emitChannel,
   channelMeta,

@@ -7,8 +7,9 @@ import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../en
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import { NoSuchTopicError } from '../seam.js';
+import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { registerTools } from './tools.js';
+import { registerTools, toolDepsFor } from './tools.js';
 
 interface ToolText {
   content: Array<{ type: string; text: string }>;
@@ -445,6 +446,27 @@ describe('post_topics regex patterns + presence reservation', () => {
       expect(res.isError).toBe(true);
       expect(res.content[0]!.text).toContain('topic not allowed');
     }
+  });
+});
+
+describe('toolDepsFor (single ToolDeps factory — CX-09/CX-06)', () => {
+  it('derives the exact ToolDeps both roots previously assembled by hand; threads seen only via extras', () => {
+    const plugin = new FakePlugin();
+    const cfg = parseConfig({ identity: { handle: 'alice' }, topics: ['ctx', 'ctx-reviews'] });
+    const seen = new SeenSet();
+
+    // stdio root: passes its shared push-loop `seen`.
+    const deps = toolDepsFor(plugin, cfg, { seen });
+    expect(deps.plugin).toBe(plugin);
+    // Matches the fields the stdio bridge used to spell out inline (identity/allow/presenceTopic/ttl).
+    expect(deps.identity).toBe(asHandle(cfg.identity.handle));
+    expect(deps.allow.topics()).toEqual(['ctx', 'ctx-reviews']);
+    expect(deps.presenceTopic).toBe(asTopic(cfg.presence.topic));
+    expect(deps.presenceTtlMs).toBe(cfg.presence.ttl_ms);
+    expect(deps.seen).toBe(seen);
+
+    // reactive HTTP root: omits extras ⇒ no SeenSet is threaded (CX-06 — no push loop, no dedup state).
+    expect(toolDepsFor(plugin, cfg).seen).toBeUndefined();
   });
 });
 

@@ -7,6 +7,7 @@ import express from 'express';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
+import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
 
 export interface OAuthRemoteOptions {
@@ -94,10 +95,4 @@ export function createOAuthRemoteApp(
   });
 
   return Object.assign(remote, { provider, resource });
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) =>
-    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;',
-  );
 }

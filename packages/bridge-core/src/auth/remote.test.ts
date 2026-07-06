@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
+import { ConsentError } from './oauth-provider.js';
 import { ownerVerifierFromPassphrase } from './owner.js';
 import { createOAuthRemoteApp, type OAuthRemoteServer } from './remote.js';
 
@@ -217,6 +218,61 @@ describe('remote OAuth front door (single-tenant)', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
+  });
+
+  // CX-04: the shared escapeHtml is wired at BOTH consent-flow render sites (the /authorize consent
+  // page and the /parley/consent 403 error page). Drive each with a hostile string and assert the
+  // served HTML carries escaped entities and no raw markup.
+  const HOSTILE = '<script>a&"\'';
+  const ESCAPED = '&lt;script&gt;a&amp;&quot;&#39;';
+
+  it('escapes a hostile client_name in the rendered consent page', async () => {
+    const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+    const reg = await jget(
+      await fetch(as.registration_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [CLIENT_REDIRECT],
+          token_endpoint_auth_method: 'none',
+          client_name: HOSTILE,
+        }),
+      }),
+    );
+    const { challenge } = pkce();
+    const authorizeUrl = new URL(as.authorization_endpoint);
+    authorizeUrl.search = form({
+      response_type: 'code',
+      client_id: reg.client_id,
+      redirect_uri: CLIENT_REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      resource: `${origin}/mcp`,
+      scope: 'mcp',
+    });
+    const html = await (await fetch(authorizeUrl.href)).text();
+    expect(html).toContain(ESCAPED);
+    expect(html).not.toContain('<script>');
+  });
+
+  it('escapes a hostile ConsentError message in the 403 owner-consent error page', async () => {
+    // Force the consent handler down its ConsentError branch with an attacker-shaped message
+    // (the real messages are fixed strings; this proves the 403 render escapes through the shared
+    // escapeHtml, not that the message is user-controlled today). Same stub pattern the tools tests
+    // use for backend failures.
+    remote.provider.completeConsent = () => {
+      throw new ConsentError(HOSTILE);
+    };
+    const res = await fetch(`${origin}/parley/consent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form({ consent_id: 'x', passphrase: 'y' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+    const html = await res.text();
+    expect(html).toContain(ESCAPED);
+    expect(html).not.toContain('<script>');
   });
 
   it('refresh_token rotation issues a new access token and one-time-uses the old refresh', async () => {

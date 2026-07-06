@@ -10,7 +10,7 @@ import type { BackendConfig, BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
 import { startPresenceLoop, type PresenceLoop } from './presence-loop.js';
 import { startPushLoop } from './push-loop.js';
-import { registerTools } from './tools.js';
+import { registerTools, toolDepsFor } from './tools.js';
 
 /** The system-prompt string Claude Code adds when it loads this channel (channels gate). */
 const CHANNEL_INSTRUCTIONS = [
@@ -61,8 +61,9 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   const readState = new ReadStateStore(statePath);
 
   // Reactive role: tools share this one `seen` set with the push loop so a message pulled via
-  // the fetch_recent tool is not later re-pushed.
-  registerTools(server, { plugin, identity, allow, seen, presenceTopic, presenceTtlMs: cfg.presence.ttl_ms });
+  // the fetch_recent tool is not later re-pushed. `toolDepsFor` is the single factory both
+  // composition roots use to derive ToolDeps from config (CX-09).
+  registerTools(server, toolDepsFor(plugin, cfg, { seen }));
 
   await plugin.connect(cfg.backend_config as BackendConfig);
 

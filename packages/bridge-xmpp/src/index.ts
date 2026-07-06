@@ -14,6 +14,7 @@ import {
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 // `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
 // declared dependency keeps the package self-contained (no extra direct dep on @xmpp/xml).
 import { client, xml } from '@xmpp/client';
@@ -58,7 +59,6 @@ const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
 const RETRYABLE_CONDITIONS = ['item-not-found', 'recipient-unavailable', 'remote-server-not-found'];
 
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const rand = (): string => Math.random().toString(36).slice(2, 12);
 const resourceOf = (full: string): string => {
   const i = full.indexOf('/');

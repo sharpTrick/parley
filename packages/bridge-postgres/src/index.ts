@@ -15,6 +15,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import { Client, Pool } from 'pg';
 import { assertTableName, buildSchema, type MessageRow } from './schema.js';
 
@@ -36,8 +37,6 @@ const DEFAULT_URL = 'postgres://parley:parley@127.0.0.1:5432/parley';
 const DRAIN_BATCH = 512;
 /** Backoff between listener reconnect attempts after the connection drops. */
 const RECONNECT_DELAY_MS = 500;
-
-const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Live-path bookkeeping for one subscribed topic (keyed by NOTIFY channel). */
 interface TopicSubscription {

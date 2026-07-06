@@ -194,3 +194,68 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
   );
   return roster;
 }
+
+/**
+ * Max length of an untrusted peer post-pattern source we will compile. A beat's `postTopics` are
+ * attacker-controlled regex sources (inbound is untrusted, DESIGN §14); a catastrophic-backtracking
+ * pattern is a ReDoS risk. We bound source length (and count, via {@link MAX_RECORD_TOPICS} at
+ * decode) and only ever match these against our OWN short, bounded topic names — never message text.
+ */
+const MAX_PEER_PATTERN_LEN = 512;
+
+/**
+ * Compile a peer's advertised `postTopics` sources into full-match regexes (`^(?:src)$`, mirroring
+ * the Allowlist), skipping any that are over-long or un-compilable so a hostile beat can never crash
+ * or hang `parley_list_users`.
+ */
+function compilePeerPatterns(sources: readonly string[]): RegExp[] {
+  const out: RegExp[] = [];
+  for (const src of sources) {
+    if (src.length > MAX_PEER_PATTERN_LEN) continue;
+    try {
+      out.push(new RegExp(`^(?:${src})$`));
+    } catch {
+      // Un-compilable source from an untrusted peer — ignore it.
+    }
+  }
+  return out;
+}
+
+/**
+ * The pure hand-off REACHABILITY predicate behind `parley_list_users` (DESIGN §7): given a roster
+ * and the caller's own reach, keep only the peers that share a viable channel.
+ *
+ *  - **Scoped** (`opts.scope` set): a peer is included iff it subscribes to that topic OR one of its
+ *    advertised `postTopics` patterns matches it.
+ *  - **Unscoped**: a peer is included iff we share a channel in EITHER direction — I can post to a
+ *    topic it subscribes to (`opts.canPostTo`), OR it can post — per its advertised patterns — to a
+ *    topic I subscribe to (`opts.mySubscribedTopics`).
+ *
+ * Peer `postTopics` are untrusted regex sources; they are compiled defensively via
+ * {@link compilePeerPatterns} (length-capped, full-match-anchored) and only ever matched against the
+ * caller's own bounded topic names. Passing `canPostTo`/`mySubscribedTopics` as plain
+ * values/predicates keeps `engine/` free of any dependency on `Allowlist`.
+ */
+export function filterReachable(
+  roster: RosterEntry[],
+  opts: {
+    /** A specific topic to scope to, or undefined for the bidirectional unscoped roster. */
+    scope?: string;
+    /** Whether the caller may post to a topic — pass `allow.has`. */
+    canPostTo: (topic: string) => boolean;
+    /** The caller's own subscribed topics — pass `allow.topics()`. */
+    mySubscribedTopics: readonly string[];
+  },
+): RosterEntry[] {
+  return roster.filter((e) => {
+    if (opts.scope !== undefined) {
+      return (
+        e.topics.includes(opts.scope) ||
+        compilePeerPatterns(e.postTopics).some((re) => re.test(opts.scope!))
+      );
+    }
+    if (e.topics.some((t) => opts.canPostTo(t))) return true;
+    const theirReach = compilePeerPatterns(e.postTopics);
+    return opts.mySubscribedTopics.some((mt) => theirReach.some((re) => re.test(mt)));
+  });
+}
