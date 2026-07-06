@@ -191,6 +191,46 @@ describe('remote OAuth front door (single-tenant)', () => {
     expect(www).toContain('/.well-known/oauth-protected-resource/mcp');
   });
 
+  // SEC-04: the browser-facing OAuth front door must carry anti-clickjacking / hardening headers on
+  // EVERY response (app-wide middleware covers /authorize + /parley/consent), and the consent page
+  // must lead with the trustworthy redirect ORIGIN, demoting the attacker-controlled client_name to
+  // a muted line so a spoofed name ("Claude Desktop") is less convincing.
+  it('sets security headers and de-emphasizes client_name on the /authorize consent page', async () => {
+    const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+    const reg = await jget(
+      await fetch(as.registration_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [CLIENT_REDIRECT],
+          token_endpoint_auth_method: 'none',
+          client_name: 'Claude Desktop',
+        }),
+      }),
+    );
+    const { challenge } = pkce();
+    const authorizeUrl = new URL(as.authorization_endpoint);
+    authorizeUrl.search = form({
+      response_type: 'code',
+      client_id: reg.client_id,
+      redirect_uri: CLIENT_REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      resource: `${origin}/mcp`,
+      scope: 'mcp',
+    });
+    const res = await fetch(authorizeUrl.href);
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('strict-transport-security')).toBeTruthy();
+    const html = await res.text();
+    // Leads with the redirect ORIGIN prominently; the client-supplied name is demoted to the muted line.
+    const redirectOrigin = new URL(CLIENT_REDIRECT).origin;
+    expect(html).toContain(`<strong>${redirectOrigin}</strong>`);
+    expect(html).toContain('class="muted">Client-supplied name: Claude Desktop');
+  });
+
   it('completes discovery → DCR → PKCE → owner consent → token, then post/fetch over MCP', async () => {
     const { tokens } = await runOAuthFlow();
     const client = await mcpClientWithToken(tokens.access_token);

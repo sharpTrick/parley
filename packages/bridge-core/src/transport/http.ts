@@ -22,8 +22,13 @@ export function buildReactiveServer(deps: ToolDeps): McpServer {
 }
 
 export interface RemoteHttpOptions {
-  /** Middleware protecting the /mcp route (e.g. requireBearerAuth). Default: open (no auth). */
+  /** Middleware protecting the /mcp route (e.g. requireBearerAuth). Default: FAIL CLOSED (401). */
   protect?: RequestHandler;
+  /**
+   * Explicitly run /mcp with NO auth — dev/loopback only. Named so the insecurity is visible at
+   * the call site. Ignored when `protect` is set. Default: false (fail closed).
+   */
+  insecureNoAuth?: boolean;
   /** Mount extra routers (e.g. the OAuth front door) on the app before /mcp is wired. */
   configureApp?: (app: Express) => void;
   /** MCP endpoint path. Default `/mcp`. */
@@ -49,6 +54,17 @@ export function createRemoteHttpApp(
 ): RemoteHttpServer {
   const app = express();
   app.disable('x-powered-by');
+  // SEC-04: anti-clickjacking + hardening headers on every response, including the browser-facing
+  // OAuth /authorize consent page (owner-passphrase form) and /parley/consent. Applied app-wide
+  // because the whole app is single-purpose. HSTS is ignored by browsers over plain HTTP, so it is
+  // safe to send unconditionally and takes effect only on the HTTPS deployment.
+  app.use((_req, res, next) => {
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+  });
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
 
@@ -66,7 +82,17 @@ export function createRemoteHttpApp(
       })
     : undefined;
 
-  const protect: RequestHandler = opts.protect ?? ((_req, _res, next) => next());
+  // SEC-17: fail CLOSED by default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
+  // an open endpoint. A no-arg call must never mean "no auth".
+  const failClosed: RequestHandler = (_req, res) => {
+    res.status(401).json({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: 'Unauthorized: no auth middleware configured' },
+      id: null,
+    });
+  };
+  const protect: RequestHandler =
+    opts.protect ?? (opts.insecureNoAuth ? (_req, _res, next) => next() : failClosed);
   const methodNotAllowed: RequestHandler = (_req, res) => {
     res.status(405).json({
       jsonrpc: '2.0',
@@ -92,10 +118,12 @@ export function createRemoteHttpApp(
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
+      // SEC-14: never echo internal error detail to the client; log it for the operator instead.
+      console.error('[parley] /mcp request failed:', err);
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: '2.0',
-          error: { code: -32603, message: err instanceof Error ? err.message : 'internal error' },
+          error: { code: -32603, message: 'internal error' },
           id: null,
         });
       }

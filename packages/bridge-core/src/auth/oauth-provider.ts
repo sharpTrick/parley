@@ -296,8 +296,8 @@ input[type=password]{width:100%;padding:.6rem;border:1px solid #ccc;border-radiu
 button{margin-top:1.25rem;padding:.6rem 1.25rem;border:0;border-radius:8px;background:#111;color:#fff;font-size:1rem;cursor:pointer}
 .muted{color:#666;font-size:.9rem}</style></head>
 <body><div class="box"><h1>Authorize access to Parley</h1>
-<p><strong>${name}</strong> wants to connect to your Parley bridge.</p>
-<p class="muted">Redirect: ${redirect}<br>Scopes: ${scopeList}</p>
+<p>A client at <strong>${redirect}</strong> wants to connect to your Parley bridge.</p>
+<p class="muted">Client-supplied name: ${name}<br>Scopes: ${scopeList}</p>
 <p>Enter your owner passphrase to approve. This is the only party that can authorize this bridge.</p>
 <form method="POST" action="${escapeHtml(this.opts.consentPath)}">
 <input type="hidden" name="consent_id" value="${escapeHtml(consentId)}">

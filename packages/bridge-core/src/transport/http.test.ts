@@ -1,6 +1,7 @@
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as allowlistMod from '../allowlist.js';
 import { parseConfig } from '../config.js';
@@ -15,7 +16,7 @@ beforeEach(async () => {
   plugin = new FakePlugin();
   await plugin.connect({});
   const cfg = parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] });
-  remote = createRemoteHttpApp(plugin, cfg);
+  remote = createRemoteHttpApp(plugin, cfg, { insecureNoAuth: true });
   const srv = await remote.listen(0);
   const port = (srv.address() as AddressInfo).port;
   client = new Client({ name: 'chat-stand-in', version: '0.0.0' }, { capabilities: {} });
@@ -85,7 +86,7 @@ describe('reactive HTTP: allowlist compiled once per app, not per POST (CX-06)',
       topics: ['ctx'],
       presence: { enabled: false },
     });
-    const app = createRemoteHttpApp(plugin2, cfg);
+    const app = createRemoteHttpApp(plugin2, cfg, { insecureNoAuth: true });
     const srv = await app.listen(0);
     const port = (srv.address() as AddressInfo).port;
     const c = new Client({ name: 'x', version: '0.0.0' }, { capabilities: {} });
@@ -102,6 +103,103 @@ describe('reactive HTTP: allowlist compiled once per app, not per POST (CX-06)',
       await app.close();
       await plugin2.disconnect();
       spy.mockRestore();
+    }
+  });
+});
+
+// SEC-17: createRemoteHttpApp must FAIL CLOSED. Omitting BOTH `protect` and `insecureNoAuth` is not
+// "no auth" — it 401s (JSON-RPC -32001). Only the explicit, named `insecureNoAuth: true` opt-in
+// restores the open dev/loopback endpoint. Proves the behavior flips both ways.
+describe('reactive HTTP: fail closed by default (SEC-17)', () => {
+  const INIT = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'x', version: '0.0.0' },
+    },
+  });
+  const HEADERS = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+
+  async function appOn(opts?: Parameters<typeof createRemoteHttpApp>[2]) {
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+    });
+    const app = createRemoteHttpApp(p, cfg, opts);
+    const srv = await app.listen(0);
+    const port = (srv.address() as AddressInfo).port;
+    return { p, app, port, teardown: async () => (await app.close(), await p.disconnect()) };
+  }
+
+  it('401s /mcp when neither protect nor insecureNoAuth is set (no-arg ≠ no-auth)', async () => {
+    const { port, teardown } = await appOn(); // no auth option → fail CLOSED
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers: HEADERS, body: INIT });
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error: { code: number } };
+      expect(body.error.code).toBe(-32001);
+    } finally {
+      await teardown();
+    }
+  });
+
+  it('serves /mcp (200) once insecureNoAuth: true is set explicitly', async () => {
+    const { port, teardown } = await appOn({ insecureNoAuth: true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers: HEADERS, body: INIT });
+      expect(res.status).toBe(200);
+    } finally {
+      await teardown();
+    }
+  });
+});
+
+// SEC-14: the stateless /mcp 500 path must return the generic `message: 'internal error'` (never
+// err.message) to the client, and write the real error to stderr for the operator. Force a
+// transport-level throw so the catch fires deterministically.
+describe('reactive HTTP: 500 path hides internal detail, logs it (SEC-14)', () => {
+  it('returns generic "internal error" and console.errors the real error', async () => {
+    const SECRET = 'SECRET /var/lib/parley.db backend driver detail';
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+    });
+    const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+    const srv = await app.listen(0);
+    const port = (srv.address() as AddressInfo).port;
+    const handleSpy = vi
+      .spyOn(StreamableHTTPServerTransport.prototype, 'handleRequest')
+      .mockRejectedValue(new Error(SECRET));
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+      });
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toBe('internal error'); // generic, not err.message
+      expect(JSON.stringify(body)).not.toContain('SECRET'); // no internal detail leaked to client
+      // … while the real error reached the operator via stderr.
+      const logged = errSpy.mock.calls.some((call) =>
+        call.some((arg) => arg instanceof Error && arg.message === SECRET),
+      );
+      expect(logged).toBe(true);
+    } finally {
+      handleSpy.mockRestore();
+      errSpy.mockRestore();
+      await app.close();
+      await p.disconnect();
     }
   });
 });
