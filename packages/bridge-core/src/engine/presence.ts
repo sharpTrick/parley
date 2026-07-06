@@ -41,6 +41,27 @@ export const MAX_RECORD_TOPICS = 64;
  */
 export const MAX_INSTANCE_ID_LEN = 128;
 
+/**
+ * Cap the length of each untrusted topic/post-pattern string a record may advertise (DESIGN §14).
+ * The count cap ({@link MAX_RECORD_TOPICS}) bounds how MANY entries a beat carries; this bounds how
+ * LONG each one is, so a hostile beat can't smuggle multi-megabyte strings into roster memory and
+ * `parley_list_users` output. A real topic name / regex source is short.
+ */
+export const MAX_TOPIC_LEN = 512;
+
+/**
+ * Tolerance (ms) for an emitter's self-reported wall-clock running AHEAD of ours. A beat whose `at`
+ * is further in the future than this is REJECTED at {@link decodePresence} (when the roster's real
+ * `nowMs` is threaded in) rather than trusted — it never enters the roster. The untrusted `at` drives
+ * both TTL freshness (`nowMs - at < ttlMs`) and the recency sort, so a far-future value would
+ * otherwise read as permanently "live" and pin a phantom peer at the top of the roster forever, immune
+ * to the `sinceMs`/`online_only` gates (SEC-03). Clamping `at` to `nowMs` instead does NOT fix this —
+ * it re-clamps to the live now on every evaluation, so the age stays 0 and the phantom is always live;
+ * the beat must be dropped, not clamped. ~5 min mirrors typical OIDC `clock_skew` handling; genuine
+ * clock skew is far smaller, so legitimate beats are unaffected.
+ */
+export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
+
 /** The kind of a presence beat. `goodbye` is a best-effort fast-path removal (TTL is the real gate). */
 export type PresenceKind = 'hello' | 'heartbeat' | 'goodbye';
 
@@ -107,8 +128,14 @@ export function encodePresence(rec: PresenceRecord): string {
  * presence record — defensive against a stray or spoofed message on the presence topic
  * (inbound is untrusted; DESIGN §14). A pre-v2 record (the old per-topic scheme) decodes to
  * null: those live on old derived topics the current reader never fetches.
+ *
+ * When `nowMs` is supplied ({@link computeRoster} threads in the roster's real clock), a beat whose
+ * self-reported `at` is more than {@link MAX_CLOCK_SKEW_MS} in the future is REJECTED — an untrusted
+ * far-future clock must never enter the roster, where it would read as permanently "live" and pin a
+ * phantom peer online forever (SEC-03). A pure decode (no `nowMs`, e.g. round-trip tests) leaves `at`
+ * unbounded.
  */
-export function decodePresence(content: string): PresenceRecord | null {
+export function decodePresence(content: string, nowMs?: number): PresenceRecord | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
@@ -120,16 +147,22 @@ export function decodePresence(content: string): PresenceRecord | null {
   if (r.v !== 2) return null;
   if (r.kind !== 'hello' && r.kind !== 'heartbeat' && r.kind !== 'goodbye') return null;
   if (typeof r.at !== 'number' || !Number.isFinite(r.at)) return null;
+  // SEC-03: the self-reported clock is untrusted. Drop a beat whose `at` is implausibly far in the
+  // future (beyond a small skew tolerance) so it can never enter the roster and be counted "live" —
+  // clamping `at` to now would instead re-read it as freshly-live on every evaluation (age 0).
+  if (nowMs !== undefined && r.at > nowMs + MAX_CLOCK_SKEW_MS) return null;
   if (!Array.isArray(r.topics) || !r.topics.every((t) => typeof t === 'string' && t.length > 0)) {
     return null;
   }
-  // Truncate rather than reject: a fresh beat with an over-long list is still useful liveness.
-  const topics = (r.topics as string[]).slice(0, MAX_RECORD_TOPICS);
+  // Truncate rather than reject: a fresh beat with an over-long list is still useful liveness. Drop
+  // (don't truncate — that would fabricate a different topic name) any per-string over MAX_TOPIC_LEN
+  // before the count cap, so a hostile beat can't bloat roster memory / tool output (SEC-09).
+  const topics = (r.topics as string[]).filter((t) => t.length <= MAX_TOPIC_LEN).slice(0, MAX_RECORD_TOPICS);
   // `postTopics` is optional/additive: absent (old emitter) or malformed ⇒ [] rather than a
-  // whole-record reject — the liveness signal is still worth keeping. Same cap as `topics`.
+  // whole-record reject — the liveness signal is still worth keeping. Same count + per-string caps.
   const postTopics =
     Array.isArray(r.postTopics) && r.postTopics.every((t) => typeof t === 'string' && t.length > 0)
-      ? (r.postTopics as string[]).slice(0, MAX_RECORD_TOPICS)
+      ? (r.postTopics as string[]).filter((t) => t.length <= MAX_TOPIC_LEN).slice(0, MAX_RECORD_TOPICS)
       : [];
   // `instanceId` is optional/additive: absent (old emitter) or malformed ⇒ '' (the anonymous
   // instance, i.e. today's per-handle collapse) rather than a whole-record reject. Length-capped
@@ -162,7 +195,9 @@ export function decodePresence(content: string): PresenceRecord | null {
 export function computeRoster(messages: Message[], nowMs: number, opts: RosterOptions): RosterEntry[] {
   const byHandle = new Map<Handle, Map<string, PresenceRecord>>();
   for (const m of messages) {
-    const rec = decodePresence(m.content);
+    // Thread `nowMs` so decode drops an untrusted far-future `at` (beyond MAX_CLOCK_SKEW_MS) before it
+    // ever reaches the liveness/recency logic below (SEC-03) — legitimate small skew still decodes.
+    const rec = decodePresence(m.content, nowMs);
     if (rec === null) continue;
     let insts = byHandle.get(m.senderHandle);
     if (insts === undefined) {
@@ -174,6 +209,9 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
   const roster: RosterEntry[] = [];
   for (const [handle, insts] of byHandle) {
     const recs = [...insts.values()];
+    // Every record here already has a trusted-enough `at`: decode rejected any beat more than
+    // MAX_CLOCK_SKEW_MS in the future (SEC-03), so a spoofed far-future beat never reaches this point
+    // and cannot read as "live" or dominate the recency sort. Legitimate within-skew beats are kept.
     const live = recs.filter((r) => r.kind !== 'goodbye' && nowMs - r.at < opts.ttlMs);
     const online = live.length > 0;
     const lastSeenMs = Math.max(...recs.map((r) => r.at)); // freshest beat of ANY kind

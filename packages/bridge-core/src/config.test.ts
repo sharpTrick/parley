@@ -34,6 +34,23 @@ describe('config loader', () => {
     expect(pinned.presence.ttl_ms).toBe(500_000);
   });
 
+  it('BUG-34 — rejects presence.ttl_ms below heartbeat_ms; accepts ttl_ms >= heartbeat_ms and the 3× default', () => {
+    // A pinned ttl below the (default 600s) heartbeat would read every live peer offline between beats.
+    expect(() =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], presence: { ttl_ms: 5 } }),
+    ).toThrow(/ttl_ms must be >= .*heartbeat_ms/);
+    // An explicit ttl >= heartbeat still parses...
+    expect(() =>
+      parseConfig({
+        identity: { handle: 'h' },
+        topics: ['ctx'],
+        presence: { heartbeat_ms: 60_000, ttl_ms: 500_000 },
+      }),
+    ).not.toThrow();
+    // ...as does the dependent-default (ttl = 3× heartbeat).
+    expect(() => parseConfig({ identity: { handle: 'h' }, topics: ['ctx'] })).not.toThrow();
+  });
+
   it('accepts post_topics and rejects an uncompilable regex', () => {
     const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-.*'] });
     expect(cfg.post_topics).toEqual(['ctx-.*']);
