@@ -13,6 +13,16 @@
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
 
+/** Thrown by a plugin whose `fetchRecent`/`subscribe` target topic has no backend
+ *  representation yet (e.g. a chat channel that does not exist). Core maps ONLY this to
+ *  "topic absent" — all other rejections are real failures and propagate. */
+export class NoSuchTopicError extends Error {
+  constructor(public readonly topic: string) {
+    super(`no such topic: ${JSON.stringify(topic)}`);
+    this.name = 'NoSuchTopicError';
+  }
+}
+
 /**
  * Opaque per-backend configuration, passed verbatim from `config.backend_config`.
  * Core never inspects it; the plugin owns its shape (DESIGN §11).
@@ -91,6 +101,13 @@ export interface BackendPlugin {
    * Durable catch-up for ONE topic since a monotonic cursor (the standard-MCP path).
    * Returns messages strictly after `since`, pre-sorted ascending, plus `nextCursor` to
    * persist. Called once per topic; core loops over N topics (DESIGN §4/§6/§7).
+   *
+   * A topic that has NEVER been posted to returns an EMPTY PAGE (`messages: []`) with a
+   * REPLAYABLE `nextCursor` — passing that `nextCursor` back as `since` again yields `[]`
+   * and the same cursor (the SQLite reference backend returns `{ messages: [], nextCursor:
+   * '0' }`). A plugin that genuinely cannot represent an absent topic (e.g. a chat channel
+   * that does not exist) MAY throw {@link NoSuchTopicError} instead; core treats that as
+   * "topic not present yet", distinct from a real backend failure (which propagates).
    */
   fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult>;
 

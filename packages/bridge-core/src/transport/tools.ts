@@ -6,7 +6,7 @@ import { computeRoster } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { filterHandles } from '../identity-filter.js';
 import { asBackendMsgId, asCursor, type BackendMsgId, type Handle, type Topic } from '../message.js';
-import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
+import { NoSuchTopicError, type BackendPlugin, type FetchRecentArgs } from '../seam.js';
 
 /**
  * How many recent presence messages to scan when building the roster. At the default 10-min
@@ -282,8 +282,11 @@ export function buildToolDefs(deps: ToolDeps): ToolDef[] {
             topic: deps.presenceTopic,
             limit: PRESENCE_FETCH_LIMIT,
           });
-        } catch {
-          return textResult({ users: [], truncated: false }); // presence topic not created yet ⇒ nobody seen
+        } catch (e) {
+          if (e instanceof NoSuchTopicError) {
+            return textResult({ users: [], truncated: false }); // presence topic genuinely absent ⇒ nobody seen
+          }
+          throw e; // real backend failure — surface it, don't fake an empty roster
         }
         // A full page means older presence history was clipped — offline coverage is best-effort.
         const truncated = page.messages.length >= PRESENCE_FETCH_LIMIT;

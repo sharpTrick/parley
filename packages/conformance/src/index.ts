@@ -63,6 +63,15 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(drained.nextCursor).toBe(tail);
     });
 
+    it('fetchRecent on a never-posted topic returns an empty page with a replayable cursor', async () => {
+      const t = ctx.freshTopic(); // no posts
+      const first = await ctx.plugin.fetchRecent({ topic: t });
+      expect(first.messages).toEqual([]);
+      const again = await ctx.plugin.fetchRecent({ topic: t, since: first.nextCursor });
+      expect(again.messages).toEqual([]);
+      expect(again.nextCursor).toBe(first.nextCursor);
+    });
+
     it('the same message has identical backendMsgId + cursor via live push and via catch-up', async () => {
       const t = ctx.freshTopic();
       const live: Message[] = [];
