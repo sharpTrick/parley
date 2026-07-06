@@ -48,8 +48,8 @@ interface PendingConsent {
 export interface ParleyOAuthProviderOptions {
   /** Canonical resource (RS) identifier = the public /mcp URL (no trailing slash). Audience for tokens. */
   resource: URL;
-  /** Verify the owner's consent secret (timing-safe). Single-tenant gate (DESIGN §10/§14). */
-  verifyOwner: (passphrase: string) => boolean;
+  /** Verify the owner's consent secret (timing-safe, off the event loop). Single-tenant gate (DESIGN §10/§14). */
+  verifyOwner: (passphrase: string) => Promise<boolean>;
   /** Path the consent form POSTs to (mounted by the remote app). */
   consentPath: string;
   /** Clock injectable for tests; defaults to Date.now. */
@@ -106,16 +106,19 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
    * the client/redirect/PKCE-challenge, and return the redirect URL (code + state).
    * @throws on bad secret, unknown/expired consent.
    */
-  completeConsent(consentId: string, passphrase: string): { redirectUrl: string } {
+  async completeConsent(consentId: string, passphrase: string): Promise<{ redirectUrl: string }> {
     const pend = this.pending.get(consentId);
     if (pend === undefined || pend.expiresAtMs < this.now()) {
       this.pending.delete(consentId);
       throw new ConsentError('consent request expired or unknown');
     }
-    if (!this.opts.verifyOwner(passphrase)) {
+    // One-shot: consume the pending consent BEFORE verifying, so a wrong guess invalidates the
+    // consent_id regardless of outcome. Each guess then costs a fresh (SDK-rate-limited) /authorize
+    // round-trip, dropping brute force to the /authorize cap. Owner typo ⇒ restart the flow.
+    this.pending.delete(consentId);
+    if (!(await this.opts.verifyOwner(passphrase))) {
       throw new ConsentError('incorrect owner passphrase');
     }
-    this.pending.delete(consentId);
 
     const code = randomUUID();
     this.codes.set(code, {
