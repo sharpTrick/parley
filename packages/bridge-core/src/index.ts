@@ -43,20 +43,12 @@ export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
 // Presence: the reachability roster derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
 export {
-  encodePresence,
-  decodePresence,
-  computeRoster,
   DEFAULT_PRESENCE_TOPIC,
-  MAX_RECORD_TOPICS,
-  MAX_INSTANCE_ID_LEN,
   type PresenceKind,
   type PresenceRecord,
   type RosterEntry,
   type RosterOptions,
 } from './engine/presence.js';
-
-// Handle glob filtering (parley_list_users).
-export { matchGlob, filterHandles } from './identity-filter.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
 export { registerTools, type ToolDeps } from './transport/tools.js';
