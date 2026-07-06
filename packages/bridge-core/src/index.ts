@@ -5,8 +5,8 @@
 export { CORE_VERSION } from './version.js';
 
 // The seam + normalized Message (DESIGN §4/§5/§6).
-export type { Topic, Handle, BackendMsgId, Cursor, Message } from './message.js';
-export { asTopic, asHandle, asBackendMsgId, asCursor } from './message.js';
+export type { Topic, Handle, BackendMsgId, Cursor, Message, BuildMessageInput } from './message.js';
+export { asTopic, asHandle, asBackendMsgId, asCursor, buildMessage } from './message.js';
 export { safeName } from './topic-name.js';
 export type {
   BackendPlugin,

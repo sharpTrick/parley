@@ -1,18 +1,17 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
@@ -364,16 +363,13 @@ export class ZulipPlugin implements BackendPlugin {
 }
 
 function zulipToMessage(topic: Topic, m: ZulipMessage): Message {
-  const content = m.content ?? '';
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(m.sender_email ?? ''),
-    content,
+    sender: m.sender_email ?? '',
+    content: m.content ?? '',
     timestamp: new Date((m.timestamp ?? 0) * 1000).toISOString(),
-    backendMsgId: asBackendMsgId(String(m.id)),
-    cursor: asCursor(String(m.id)),
-    mentions: parseMentions(content),
-  };
+    id: String(m.id),
+  });
 }
 
 /** Zulip 429s carry `Retry-After` (header) and `retry-after` (JSON body), both in SECONDS. */

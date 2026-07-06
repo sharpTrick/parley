@@ -6,6 +6,8 @@
  * make timestamps unsafe; DESIGN §5/§6).
  */
 
+import { parseMentions } from './mentions.js';
+
 declare const BRAND: unique symbol;
 type Brand<T, B extends string> = T & { readonly [BRAND]: B };
 
@@ -49,4 +51,41 @@ export interface Message {
   cursor: Cursor;
   /** Handles referenced in this message. */
   mentions: Handle[];
+}
+
+/**
+ * The already-extracted, normalized-but-unbranded fields a backend supplies; {@link buildMessage}
+ * brands them and derives `mentions`. The two independent axes a backend varies (DESIGN §5/§6):
+ * `timestamp` is pre-computed per-backend (this helper does NO date math), and `id`/`cursor` are
+ * separate inputs because `backendMsgId` and `cursor` are not always the same value (e.g. Telegram).
+ */
+export interface BuildMessageInput {
+  /** Already branded by the caller — plugins already hold a Topic (sqlite/postgres brand at the call). */
+  topic: Topic;
+  /** Raw sender string; branded to a {@link Handle} here. */
+  sender: string;
+  content: string;
+  /** Already-computed ISO string (informational only, DESIGN §5) — NOT recomputed here. */
+  timestamp: string;
+  /** backendMsgId (dedup key). */
+  id: string;
+  /** Order key; defaults to `id` when the backend uses one value for both. */
+  cursor?: string;
+}
+
+/**
+ * The single sanctioned way to assemble a normalized {@link Message} from a backend record.
+ * Centralizes branding (asHandle/asBackendMsgId/asCursor) and the {@link parseMentions} call so
+ * mention + assembly semantics live in ONE place (CX-02). `topic` is passed pre-branded.
+ */
+export function buildMessage(input: BuildMessageInput): Message {
+  return {
+    topic: input.topic,
+    senderHandle: asHandle(input.sender),
+    content: input.content,
+    timestamp: input.timestamp,
+    backendMsgId: asBackendMsgId(input.id),
+    cursor: asCursor(input.cursor ?? input.id),
+    mentions: parseMentions(input.content),
+  };
 }

@@ -1,17 +1,16 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
@@ -419,17 +418,14 @@ export function compareTs(a: string, b: string): number {
 }
 
 function slackToMessage(topic: Topic, m: SlackMessage): Message {
-  const content = m.text ?? '';
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(m.user ?? m.bot_id ?? ''),
-    content,
+    sender: m.user ?? m.bot_id ?? '',
+    content: m.text ?? '',
     // Informational only (DESIGN §5) — derived from the ts seconds, never used for ordering.
     timestamp: new Date(Number(m.ts.split('.')[0]) * 1000).toISOString(),
-    backendMsgId: asBackendMsgId(m.ts),
-    cursor: asCursor(m.ts),
-    mentions: parseMentions(content),
-  };
+    id: m.ts,
+  });
 }
 
 /**

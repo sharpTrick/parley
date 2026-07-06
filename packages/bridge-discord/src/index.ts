@@ -1,17 +1,16 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { fetchWithRetry } from '@sharptrick/parley-net-util';
@@ -382,16 +381,13 @@ export class DiscordPlugin implements BackendPlugin {
 }
 
 function toMessage(topic: Topic, m: DiscordMessage): Message {
-  const content = m.content ?? '';
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(m.author?.username ?? ''),
-    content,
+    sender: m.author?.username ?? '',
+    content: m.content ?? '',
     timestamp: m.timestamp ?? '',
-    backendMsgId: asBackendMsgId(m.id),
-    cursor: asCursor(m.id),
-    mentions: parseMentions(content),
-  };
+    id: m.id,
+  });
 }
 
 /**

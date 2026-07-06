@@ -1,17 +1,16 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
@@ -230,17 +229,13 @@ function rowToMessage(topic: Topic, seq: number, raw: string): Message {
   } catch {
     /* leave empty */
   }
-  const content = fields.content ?? '';
-  const id = String(seq);
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(fields.sender ?? ''),
-    content,
+    sender: fields.sender ?? '',
+    content: fields.content ?? '',
     timestamp: fields.ts ?? '',
-    backendMsgId: asBackendMsgId(id),
-    cursor: asCursor(id),
-    mentions: parseMentions(content),
-  };
+    id: String(seq),
+  });
 }
 
 // Subject tokens may not contain `.`, `*`, `>`, or whitespace; stream names also bar `/ \`.
