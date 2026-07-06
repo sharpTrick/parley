@@ -2,18 +2,17 @@ import { createHash } from 'node:crypto';
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { Client, Pool } from 'pg';
@@ -365,14 +364,11 @@ function channelFor(topic: Topic): string {
 }
 
 function rowToMessage(row: MessageRow): Message {
-  const id = String(row.seq);
-  return {
+  return buildMessage({
     topic: asTopic(row.topic),
-    senderHandle: asHandle(row.sender),
+    sender: row.sender,
     content: row.content,
     timestamp: row.ts,
-    backendMsgId: asBackendMsgId(id),
-    cursor: asCursor(id),
-    mentions: parseMentions(row.content),
-  };
+    id: String(row.seq),
+  });
 }

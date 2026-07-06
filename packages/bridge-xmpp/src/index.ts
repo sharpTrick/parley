@@ -1,17 +1,16 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
@@ -415,15 +414,13 @@ export class XmppPlugin implements BackendPlugin {
 
   private toMessage(topic: Topic, it: MamItem): Message {
     const nick = resourceOf(it.from);
-    return {
+    return buildMessage({
       topic,
-      senderHandle: asHandle(nick !== '' ? nick : this.handle),
+      sender: nick !== '' ? nick : this.handle,
       content: it.body,
       timestamp: it.stamp ?? new Date().toISOString(),
-      backendMsgId: asBackendMsgId(it.archId),
-      cursor: asCursor(it.archId),
-      mentions: parseMentions(it.body),
-    };
+      id: it.archId,
+    });
   }
 
   /** Join a room with NO history (maxstanzas=0); cached so repeated calls are idempotent. */

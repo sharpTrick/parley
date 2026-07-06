@@ -1,18 +1,17 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { openDriver, type SqlDriver, type SqlStatement } from './driver.js';
@@ -198,14 +197,11 @@ export class SqlitePlugin implements BackendPlugin {
 }
 
 function rowToMessage(row: MessageRow): Message {
-  const id = String(row.id);
-  return {
+  return buildMessage({
     topic: asTopic(row.topic),
-    senderHandle: asHandle(row.sender),
+    sender: row.sender,
     content: row.content,
     timestamp: row.ts,
-    backendMsgId: asBackendMsgId(id),
-    cursor: asCursor(id),
-    mentions: parseMentions(row.content),
-  };
+    id: String(row.id),
+  });
 }

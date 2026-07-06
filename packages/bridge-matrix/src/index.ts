@@ -1,17 +1,16 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
@@ -359,16 +358,13 @@ interface SyncResponse {
 }
 
 function eventToMessage(topic: Topic, e: MatrixEvent): Message {
-  const content = e.content?.body ?? '';
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(e.sender),
-    content,
+    sender: e.sender,
+    content: e.content?.body ?? '',
     timestamp: new Date(e.origin_server_ts).toISOString(),
-    backendMsgId: asBackendMsgId(e.event_id),
-    cursor: asCursor(e.event_id),
-    mentions: parseMentions(content),
-  };
+    id: e.event_id,
+  });
 }
 
 /**

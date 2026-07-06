@@ -1,17 +1,16 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { createClient } from 'redis';
@@ -193,14 +192,11 @@ export class RedisPlugin implements BackendPlugin {
 }
 
 function rowToMessage(topic: Topic, id: string, fields: Record<string, string>): Message {
-  const content = fields.content ?? '';
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(fields.sender ?? ''),
-    content,
+    sender: fields.sender ?? '',
+    content: fields.content ?? '',
     timestamp: fields.ts ?? '',
-    backendMsgId: asBackendMsgId(id),
-    cursor: asCursor(id),
-    mentions: parseMentions(content),
-  };
+    id,
+  });
 }

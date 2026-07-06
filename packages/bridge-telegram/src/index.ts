@@ -1,18 +1,17 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
@@ -361,15 +360,14 @@ function parseCompositeMid(id: BackendMsgId | undefined): number | undefined {
 }
 
 function recordToMessage(rec: StoredRecord): Message {
-  return {
+  return buildMessage({
     topic: asTopic(rec.topic),
-    senderHandle: asHandle(rec.sender),
+    sender: rec.sender,
     content: rec.content,
     timestamp: rec.ts,
-    backendMsgId: asBackendMsgId(keyOf(rec)),
-    cursor: asCursor(String(rec.message_id)),
-    mentions: parseMentions(rec.content),
-  };
+    id: keyOf(rec),
+    cursor: String(rec.message_id),
+  });
 }
 
 /**
