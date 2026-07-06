@@ -37,6 +37,23 @@ function compareTs(a: string, b: string): number {
 
 const rand = (): string => Math.random().toString(36).slice(2, 10);
 
+/**
+ * Decode one form field the way real Slack does: scalar args arrive as plain strings; array/object
+ * args were `JSON.stringify`d by the plugin, so parse those back — but ONLY when the value actually
+ * looks like a JSON object/array. A numeric-looking scalar (e.g. a `ts` cursor `oldest`) MUST stay
+ * a string, so it is never round-tripped through `JSON.parse`.
+ */
+const decodeFormValue = (raw: string): unknown => {
+  if (raw.startsWith('{') || raw.startsWith('[')) {
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      /* not valid JSON after all — treat as a plain string */
+    }
+  }
+  return raw;
+};
+
 export class FakeSlack {
   /** Web API base, e.g. `http://127.0.0.1:PORT/api` — pass as the plugin's `api_url`. */
   readonly apiUrl: string;
@@ -96,11 +113,13 @@ export class FakeSlack {
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body: Record<string, unknown> = {};
-    try {
-      body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>;
-    } catch {
-      /* fall through with empty body → method handlers reject as needed */
+    // The plugin form-encodes EVERY Web API call (application/x-www-form-urlencoded), exactly like
+    // real Slack expects. A regression back to a JSON request body would drop these args here
+    // (URLSearchParams finds no `key=value` pairs), so the conformance suite fails the way
+    // slack.com does — which is precisely what makes the BUG-25 fix CI-observable.
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of new URLSearchParams(Buffer.concat(chunks).toString('utf8'))) {
+      body[k] = decodeFormValue(v);
     }
 
     const reply = (payload: Record<string, unknown>): void => {

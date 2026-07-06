@@ -14,6 +14,7 @@ import {
   parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { fetchWithRetry } from '@sharptrick/parley-net-util';
 import WebSocket from 'ws';
 
 /** Plugin-specific backend_config. */
@@ -363,23 +364,20 @@ export class DiscordPlugin implements BackendPlugin {
     if (this.token !== undefined) headers.Authorization = `Bot ${this.token}`;
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
 
-    for (;;) {
-      const res = await fetch(url, {
+    return fetchWithRetry(
+      url,
+      {
         method,
         headers,
         body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      });
-      if (res.status === 429) {
+      },
+      {
+        label: `Discord ${method} ${path}`,
         // Stop retrying once disconnected — don't compete for the rate-limit budget post-teardown.
-        if (this.stopped) throw new Error(`Discord ${method} ${path} → 429 (disconnected)`);
-        const retryMs = await readRetryAfter(res);
-        await delay(retryMs);
-        continue;
-      }
-      if (res.ok) return res;
-      const text = await res.text();
-      throw new Error(`Discord ${method} ${path} → ${res.status}: ${text}`);
-    }
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+      },
+    );
   }
 }
 
@@ -396,17 +394,20 @@ function toMessage(topic: Topic, m: DiscordMessage): Message {
   };
 }
 
-/** Discord's 429 body carries `retry_after` in SECONDS (float); convert to ms, cap, default. */
+/**
+ * Discord's 429 body carries `retry_after` in SECONDS (float); Discord ALSO sends the standard
+ * `Retry-After` header (SECONDS). Prefer the header, then the body — both `> 0`-guarded — convert
+ * to ms (ceil the float), cap at 5s, default 500.
+ */
 async function readRetryAfter(res: Response): Promise<number> {
+  const header = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(header) && header > 0) return Math.min(Math.ceil(header * 1000), 5000);
   try {
     const json = (await res.clone().json()) as { retry_after?: number };
-    if (typeof json.retry_after === 'number') {
-      return Math.min(Math.ceil(json.retry_after * 1000), 5000);
-    }
+    const s = json.retry_after;
+    if (typeof s === 'number' && s > 0) return Math.min(Math.ceil(s * 1000), 5000);
   } catch {
     /* fall through to default backoff */
   }
   return 500;
 }
-
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

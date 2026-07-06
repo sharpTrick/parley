@@ -14,6 +14,7 @@ import {
   parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 
 /** Plugin-specific backend_config. */
 export interface MatrixBackendConfig {
@@ -332,24 +333,22 @@ export class MatrixPlugin implements BackendPlugin {
     if (this.token !== undefined) headers.Authorization = `Bearer ${this.token}`;
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
 
-    for (;;) {
-      const res = await fetch(url, {
+    return fetchWithRetry(
+      url,
+      {
         method,
         headers,
         body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: opts?.signal,
-      });
-      if (res.status === 429) {
+      },
+      {
+        label: `Matrix ${method} ${path}`,
         // Stop retrying once disconnected — don't compete for the rate-limit budget post-teardown.
-        if (this.stopped) throw new Error(`Matrix ${method} ${path} → 429 (disconnected)`);
-        const retryMs = await readRetryAfter(res);
-        await delay(retryMs);
-        continue;
-      }
-      if (res.ok || (opts?.allowStatuses?.includes(res.status) ?? false)) return res;
-      const text = await res.text();
-      throw new Error(`Matrix ${method} ${path} → ${res.status}: ${text}`);
-    }
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+        allowStatuses: opts?.allowStatuses,
+      },
+    );
   }
 }
 
@@ -371,17 +370,24 @@ function eventToMessage(topic: Topic, e: MatrixEvent): Message {
   };
 }
 
+/**
+ * Matrix 429s carry `retry_after_ms` (MS) in the JSON body; Synapse ALSO sends the standard
+ * `Retry-After` header (SECONDS). Prefer the header, then the body — both `> 0`-guarded so a
+ * `0`/negative value falls to the default rather than `delay(0)` — capped at 5s.
+ */
 async function readRetryAfter(res: Response): Promise<number> {
+  const header = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
   try {
     const json = (await res.clone().json()) as { retry_after_ms?: number };
-    if (typeof json.retry_after_ms === 'number') return Math.min(json.retry_after_ms, 5000);
+    const ms = json.retry_after_ms;
+    if (typeof ms === 'number' && ms > 0) return Math.min(ms, 5000);
   } catch {
     /* fall through to default backoff */
   }
   return 500;
 }
 
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const rand = (): string => Math.random().toString(36).slice(2, 10);
 
 // Matrix alias localparts allow a restricted character set; map anything else to `_`.

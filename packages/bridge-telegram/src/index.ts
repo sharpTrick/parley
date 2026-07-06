@@ -15,6 +15,7 @@ import {
   parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 import { keyOf, ObservedStore, type StoredRecord } from './store.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
@@ -57,8 +58,6 @@ interface Subscription {
   handler: MessageHandler;
   watermark: number;
 }
-
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Telegram Bot API backend (DESIGN §6/§9) — spoken to via the raw HTTP API with the global
@@ -317,24 +316,21 @@ export class TelegramPlugin implements BackendPlugin {
     const headers: Record<string, string> = {};
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
 
-    for (;;) {
-      const res = await fetch(url, {
+    return fetchWithRetry(
+      url,
+      {
         method,
         headers,
         body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: opts?.signal,
-      });
-      if (res.status === 429) {
+      },
+      {
+        label: `Telegram ${method} ${path}`,
         // Stop retrying once disconnected — don't keep hammering the API post-teardown.
-        if (this.stopped) throw new Error(`Telegram ${method} ${path} → 429 (disconnected)`);
-        const retryMs = await readRetryAfter(res);
-        await delay(retryMs);
-        continue;
-      }
-      if (res.ok) return res;
-      const text = await res.text();
-      throw new Error(`Telegram ${method} ${path} → ${res.status}: ${text}`);
-    }
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+      },
+    );
   }
 
   private require<T>(value: T | undefined): T {
@@ -376,12 +372,18 @@ function recordToMessage(rec: StoredRecord): Message {
   };
 }
 
-/** Telegram 429s carry `parameters.retry_after` in SECONDS; cap the wait at 5s. */
+/**
+ * Telegram 429s carry `parameters.retry_after` (SECONDS) in the JSON body, and also send the
+ * standard `Retry-After` header (SECONDS). Prefer the header, then the body — both `> 0`-guarded
+ * so a `0`/negative value falls to the default rather than `delay(0)` — capped at 5s.
+ */
 async function readRetryAfter(res: Response): Promise<number> {
+  const header = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
   try {
     const json = (await res.clone().json()) as { parameters?: { retry_after?: number } };
     const s = json.parameters?.retry_after;
-    if (typeof s === 'number') return Math.min(s * 1000, 5000);
+    if (typeof s === 'number' && s > 0) return Math.min(s * 1000, 5000);
   } catch {
     /* fall through to default backoff */
   }
