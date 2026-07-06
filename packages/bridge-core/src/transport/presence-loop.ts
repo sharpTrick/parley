@@ -69,8 +69,16 @@ export function startPresenceLoop(
     });
   };
 
-  void beat('hello');
-  const timer = setInterval(() => void beat('heartbeat'), heartbeatClamp(opts.heartbeatMs));
+  // Serialize every beat through a single promise chain so `goodbye` is posted only AFTER every
+  // earlier beat (hello/heartbeats) has settled. On an async backend a stalled heartbeat could
+  // otherwise land after `goodbye`, and last-write-wins per (handle, instanceId) would then report a
+  // cleanly-stopped instance `online` for a full TTL (BUG-26). `beat` swallows post failures, so a
+  // failed earlier beat still resolves the chain and never wedges `stop()`.
+  let tail: Promise<void> = Promise.resolve();
+  const enqueue = (kind: PresenceKind): Promise<void> => (tail = tail.then(() => beat(kind)));
+
+  void enqueue('hello');
+  const timer = setInterval(() => void enqueue('heartbeat'), heartbeatClamp(opts.heartbeatMs));
   // Don't keep the process alive solely for heartbeats.
   timer.unref?.();
 
@@ -80,7 +88,7 @@ export function startPresenceLoop(
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
-      await beat('goodbye');
+      await enqueue('goodbye');
     },
   };
 }

@@ -36,6 +36,14 @@ export interface MatrixBackendConfig {
    * while message send/read/sync are unthrottled — so a one-room-per-topic suite is infeasible for
    * an unprivileged login. A production deployment runs the bridge as a rate-limit-exempt
    * appservice and leaves this UNSET to get a real Matrix room per topic. See README.
+   *
+   * SECURITY (SEC-18): the `app.parley.topic` tag is UNTRUSTED, member-writable event content with
+   * no server-enforced integrity — any member of the shared room can send a message whose tag names
+   * an arbitrary topic (including the reserved presence topic, entering `computeRoster` under its own
+   * homeserver-stamped sender). So in `shared_room` mode inbound data chooses which topic/allowlist
+   * bucket a message lands in. This mode is for TEST FIXTURES / rate-limited deployments ONLY and
+   * MUST NOT carry mutually-distrusting topics. Production leaves this UNSET: one physically separate
+   * Matrix room per topic, where the tag is ignored (rooms are the isolation boundary).
    */
   shared_room?: string;
 }
@@ -244,7 +252,15 @@ export class MatrixPlugin implements BackendPlugin {
     return { handle, backendRef: handle };
   }
 
-  /** True iff event `e` is an `m.room.message` belonging to `topic` (tag-gated in shared mode). */
+  /**
+   * True iff event `e` is an `m.room.message` belonging to `topic` (tag-gated in shared mode).
+   *
+   * SECURITY (SEC-18): in `shared_room` mode this gate reads the `app.parley.topic` tag straight off
+   * an untrusted, member-writable event — Matrix enforces no integrity on custom content keys, so any
+   * room member can forge the tag (including naming the reserved presence topic). This is why
+   * `shared_room` is documented as test-only / non-production ({@link MatrixBackendConfig.shared_room}):
+   * per-topic rooms (the default) are the real isolation boundary and ignore the tag entirely.
+   */
   private belongs(e: MatrixEvent, topic: Topic): boolean {
     if (!isMessageEvent(e)) return false;
     if (this.sharedLocalpart === undefined) return true; // per-topic room: every message is ours

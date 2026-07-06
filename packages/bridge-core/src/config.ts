@@ -181,6 +181,17 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
       message: `${JSON.stringify(cfg.presence.topic)} is reserved for presence (presence.topic); rename the topic or change presence.topic`,
     });
   }
+  // `ttl_ms` is populated by the dependent-default transform before superRefine runs (default 3×, or
+  // the pinned value), so it is always a number here. A ttl below the heartbeat cadence would make
+  // every genuinely running instance read as offline in computeRoster between beats (BUG-34).
+  if (cfg.presence.ttl_ms < cfg.presence.heartbeat_ms) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['presence', 'ttl_ms'],
+      message:
+        'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
+    });
+  }
 });
 
 export type ParleyConfig = z.infer<typeof ConfigSchema>;

@@ -5,8 +5,10 @@ import {
   decodePresence,
   encodePresence,
   filterReachable,
+  MAX_CLOCK_SKEW_MS,
   MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
+  MAX_TOPIC_LEN,
   type PresenceKind,
   type PresenceRecord,
   type RosterEntry,
@@ -103,6 +105,26 @@ describe('encode/decode presence', () => {
     const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics }));
     expect(rec?.topics).toHaveLength(MAX_RECORD_TOPICS);
     expect(rec?.topics[0]).toBe('ctx-0');
+  });
+
+  it('SEC-09 — drops an over-long topics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
+    const tooLong = 'x'.repeat(MAX_TOPIC_LEN + 1);
+    const exact = 'y'.repeat(MAX_TOPIC_LEN);
+    const rec = decodePresence(
+      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: [tooLong, 'ctx', exact] }),
+    );
+    expect(rec?.topics).toEqual(['ctx', exact]);
+    expect(rec?.topics).not.toContain(tooLong);
+  });
+
+  it('SEC-09 — drops an over-long postTopics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
+    const tooLong = 'z'.repeat(MAX_TOPIC_LEN + 1);
+    const exact = 'w'.repeat(MAX_TOPIC_LEN);
+    const rec = decodePresence(
+      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [tooLong, 'ctx-.*', exact] }),
+    );
+    expect(rec?.postTopics).toEqual(['ctx-.*', exact]);
+    expect(rec?.postTopics).not.toContain(tooLong);
   });
 });
 
@@ -237,6 +259,51 @@ describe('computeRoster', () => {
       beat('claude-a', 'heartbeat', now - 1_000, 2),
     ];
     expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['claude-a', 'claude-b']);
+  });
+
+  // SEC-03 — the self-reported `at` is untrusted; a far-future value must never enter the roster,
+  // where it would read as permanently `online` and pin a phantom hand-off target at the top forever.
+  const FUTURE_AT = 8_640_000_000_000_000; // the spoof value from the finding (max Date ms)
+
+  it('SEC-03 — a far-future spoofed `at` never enters the roster: no phantom online peer, no top slot', () => {
+    // An attacker plants an astronomical `at`; a legitimate peer beats at `now`. The spoof must be
+    // dropped at decode — not clamped-to-now (which would re-read it as freshly live every call).
+    const roster = computeRoster(
+      [beat('zzz-attacker', 'heartbeat', FUTURE_AT, 1, ['dev']), beat('real', 'heartbeat', now, 2, ['ctx'])],
+      now,
+      opts,
+    );
+    expect(roster.map((e) => e.handle)).toEqual(['real']); // only the legit peer survives
+    expect(roster.find((e) => e.handle === 'zzz-attacker')).toBeUndefined(); // no online AND no offline phantom
+    expect(roster[0]?.online).toBe(true);
+  });
+
+  it('SEC-03 — a far-future spoof cannot outlive a legit peer that ages out (immune-forever regression)', () => {
+    // Evaluate well past ttl AND sinceMs with no fresh beats: the legit peer correctly ages out and is
+    // dropped, and the phantom must NOT be left behind as the sole surviving (online) hand-off target.
+    const msgs = [
+      beat('zzz-attacker', 'heartbeat', FUTURE_AT, 1, ['dev']),
+      beat('real', 'heartbeat', now, 2, ['ctx']),
+    ];
+    expect(computeRoster(msgs, now + 100 * ttl, opts)).toEqual([]);
+  });
+
+  it('SEC-03 — decode rejects a beat beyond the skew tolerance but keeps one exactly at it', () => {
+    const at = (delta: number) => JSON.stringify({ v: 2, kind: 'hello', at: now + delta, topics: ['ctx'] });
+    expect(decodePresence(at(MAX_CLOCK_SKEW_MS + 1), now)).toBeNull(); // just beyond tolerance ⇒ dropped
+    expect(decodePresence(at(MAX_CLOCK_SKEW_MS), now)?.at).toBe(now + MAX_CLOCK_SKEW_MS); // boundary kept
+    expect(decodePresence(at(1e12), now)).toBeNull(); // far future ⇒ dropped
+    expect(decodePresence(at(1e12))).not.toBeNull(); // pure decode (no now) leaves `at` unbounded
+  });
+
+  it('SEC-03 — a legitimate small clock skew (at = now + 1s) still reads online', () => {
+    const roster = computeRoster([beat('peer', 'heartbeat', now + 1_000, 1)], now, opts);
+    expect(roster[0]?.online).toBe(true);
+  });
+
+  it('SEC-03 — the guard leaves the normal past-TTL offline path intact (only far-future ats are dropped)', () => {
+    const roster = computeRoster([beat('old', 'heartbeat', now - ttl - 1, 1)], now, opts);
+    expect(roster[0]?.online).toBe(false);
   });
 });
 

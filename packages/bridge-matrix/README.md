@@ -43,6 +43,15 @@ isolated by the `app.parley.topic` content tag carried on each event (filtered o
 the live path). Because the room persists, runs do **zero** `createRoom` calls. The conformance
 fixture uses this mode against a stable `#parley_conformance:parley.local`.
 
+> **Security — `shared_room` is test-only.** The `app.parley.topic` tag is **untrusted,
+> member-writable** event content: Matrix enforces no integrity on custom content keys, so any member
+> of the shared room can forge the tag and post a message that lands in whatever topic it names —
+> including the reserved presence topic (a forged well-formed record then enters the roster under the
+> sender's own homeserver-stamped handle). Inbound data thus chooses the topic/allowlist bucket. So
+> `shared_room` **MUST NOT** carry mutually-distrusting topics; use it only for test fixtures and
+> rate-limited single-tenant deployments. **Production leaves `shared_room` unset**, giving one
+> physically separate room per topic, where the tag is ignored and the room is the isolation boundary.
+
 ## Config (`backend_config`)
 
 | key                | default                  | meaning |
