@@ -17,6 +17,7 @@ import {
 import {
   AckPolicy,
   connect,
+  ConsumerEvents,
   DeliverPolicy,
   type ConsumerMessages,
   type JetStreamClient,
@@ -45,13 +46,17 @@ export interface NatsBackendConfig {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const INACTIVE_NS = 30_000_000_000; // 30s ephemeral-consumer cleanup
+const RESUBSCRIBE_BACKOFF_MS = 1000; // wait before retrying a consumer while the backend is unreachable
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * NATS JetStream backend (DESIGN §6/§9) — the fabric backend. One JetStream STREAM per topic, so
  * the stream sequence number is a contiguous, monotonic per-topic `cursor` (= `backendMsgId`).
  * `post` = `js.publish` (→ seq); `fetchRecent` = an ephemeral consumer from `opt_start_seq`
- * (exclusive `since`); `subscribe` = a `consume()` ordered consumer with `DeliverPolicy.New`
- * (genuine events). Core never compares cursor values — NATS delivers in seq order.
+ * (exclusive `since`); `subscribe` = a `consume()` ephemeral consumer starting at `DeliverPolicy.New`
+ * that rebuilds itself on server-side loss (genuine events). Core never compares cursor values —
+ * NATS delivers in seq order.
  */
 export class NatsPlugin implements BackendPlugin {
   private nc?: NatsConnection;
@@ -70,6 +75,7 @@ export class NatsPlugin implements BackendPlugin {
     this.streamPrefix = cfg.stream_prefix ?? 'PARLEY_';
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
+    this.ensured.clear(); // a fresh connection starts from a clean stream-cache (BUG-01)
     this.nc = await connect({ servers: cfg.servers ?? '127.0.0.1:4222' });
     this.js = this.nc.jetstream();
     this.jsm = await this.nc.jetstreamManager();
@@ -147,33 +153,80 @@ export class NatsPlugin implements BackendPlugin {
   }
 
   /**
-   * Live path = an ordered `consume()` consumer with `DeliverPolicy.New` (DESIGN §9 — genuine
-   * events; history is owned by catch-up). `disconnect()` closes the iterator.
+   * Live path = an ephemeral `consume()` consumer starting at `DeliverPolicy.New` (DESIGN §9 —
+   * genuine events; history is owned by catch-up). A plain named ephemeral consumer is GC'd by the
+   * server after `INACTIVE_NS` of client absence (restart / partition), and `consume()` does not
+   * self-heal — so we watch `iter.status()` and, on `ConsumerDeleted`/`ConsumerNotFound`/
+   * `StreamNotFound`, rebuild the consumer at `DeliverPolicy.StartSequence` `lastSeq + 1`, which
+   * both restores delivery and backfills the outage gap (BUG-02). The outer loop honors
+   * `disconnect()`: `this.stopped` + the registered closer stop it without a rebuild.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     await this.ensureStream(topic);
     const stream = this.streamName(topic);
-    const ci = await this.requireJsm().consumers.add(stream, {
-      filter_subject: this.subject(topic),
-      deliver_policy: DeliverPolicy.New,
-      ack_policy: AckPolicy.None,
-      inactive_threshold: INACTIVE_NS,
-    });
-    const consumer = await this.requireJs().consumers.get(stream, ci.name);
-    const iter = await consumer.consume();
-    this.subscriptions.push(iter);
+    const filterSubject = this.subject(topic);
+    let lastSeq: number | undefined; // undefined → start at DeliverPolicy.New (no gap to backfill yet)
+    let current: ConsumerMessages | undefined;
+    // A single closer so disconnect() tears down whichever iterator is live at the time.
+    this.subscriptions.push({
+      close: () => current?.close() ?? Promise.resolve(),
+    } as unknown as ConsumerMessages);
+
     void (async () => {
-      try {
-        for await (const m of iter) {
+      while (!this.stopped) {
+        let iter: ConsumerMessages;
+        try {
+          const ci = await this.requireJsm().consumers.add(stream, {
+            filter_subject: filterSubject,
+            deliver_policy: lastSeq === undefined ? DeliverPolicy.New : DeliverPolicy.StartSequence,
+            ...(lastSeq === undefined ? {} : { opt_start_seq: lastSeq + 1 }),
+            ack_policy: AckPolicy.None,
+            inactive_threshold: INACTIVE_NS,
+          });
+          const consumer = await this.requireJs().consumers.get(stream, ci.name);
+          iter = await consumer.consume();
+        } catch {
           if (this.stopped) break;
-          try {
-            handler(rowToMessage(topic, m.seq, dec.decode(m.data)));
-          } catch {
-            /* handler is best-effort (DESIGN §6) */
-          }
+          await delay(RESUBSCRIBE_BACKOFF_MS); // backend momentarily unreachable — retry the consumer
+          continue;
         }
-      } catch {
-        /* iterator closed on disconnect */
+        current = iter;
+
+        // The plain named consumer only notify()s on deletion/GC; surface it and force a rebuild.
+        let recreate = false;
+        const statusTask = (async () => {
+          try {
+            for await (const s of await iter.status()) {
+              if (
+                s.type === ConsumerEvents.ConsumerDeleted ||
+                s.type === ConsumerEvents.ConsumerNotFound ||
+                s.type === ConsumerEvents.StreamNotFound
+              ) {
+                recreate = true;
+                await iter.close(); // ends the message for-await below
+                break;
+              }
+            }
+          } catch {
+            /* status iterator closed */
+          }
+        })();
+
+        try {
+          for await (const m of iter) {
+            if (this.stopped) break;
+            lastSeq = m.seq;
+            try {
+              handler(rowToMessage(topic, m.seq, dec.decode(m.data)));
+            } catch {
+              /* handler is best-effort (DESIGN §6) */
+            }
+          }
+        } catch {
+          /* iterator closed on disconnect or consumer loss */
+        }
+        await statusTask;
+        if (this.stopped || !recreate) break; // clean disconnect vs. consumer-loss rebuild
       }
     })();
   }
@@ -199,7 +252,11 @@ export class NatsPlugin implements BackendPlugin {
           const msg = err instanceof Error ? err.message : String(err);
           if (!/already in use|already exists|name already/i.test(msg)) throw err;
         }
-      })();
+      })().catch((err: unknown) => {
+        // Don't poison the cache on transient failure — evict so the next call retries (BUG-01).
+        this.ensured.delete(name);
+        throw err;
+      });
       this.ensured.set(name, pending);
     }
     return pending;
