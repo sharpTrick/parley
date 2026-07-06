@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -22,15 +23,22 @@ export class ReadStateStore {
   }
 
   private static load(filePath: string): Record<string, string> {
+    // Null-prototype backing map: `constructor`/`__proto__` topic names can neither leak a
+    // prototype value out of get() nor turn set() into a silent no-op.
+    const out: Record<string, string> = Object.create(null);
     try {
       const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
-      if (parsed !== null && typeof parsed === 'object') {
-        return parsed as Record<string, string>;
+      // Reject arrays (an `[]` file would otherwise swallow string-keyed writes on flush) and
+      // keep only own, string-valued entries (a non-string cursor would wedge catch-up).
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (typeof v === 'string') out[k] = v;
+        }
       }
     } catch {
       // Missing or corrupt file → start from an empty read position.
     }
-    return {};
+    return out;
   }
 
   /** The persisted cursor for a topic, or undefined if this instance has never read it. */
@@ -66,5 +74,12 @@ export function defaultReadStatePath(instanceId: string): string {
 function sanitize(instanceId: string): string {
   // Keep the path component filesystem-safe without colliding distinct ids.
   const cleaned = instanceId.replace(/[^A-Za-z0-9._-]/g, '_');
-  return cleaned.length > 0 ? cleaned : 'default';
+  const traversal = cleaned === '.' || cleaned === '..';
+  // Already filesystem-safe and non-traversal → return verbatim (backward compatible).
+  if (cleaned.length > 0 && cleaned === instanceId && !traversal) return cleaned;
+  // Sanitization altered the id (or it reduced to '.'/'..'/'') → the mapping is no longer
+  // injective, so disambiguate with a short hash of the RAW id, and never emit a traversal token.
+  const base = cleaned.length === 0 || traversal ? 'default' : cleaned;
+  const hash = createHash('sha256').update(instanceId).digest('hex').slice(0, 8);
+  return `${base}-${hash}`;
 }
