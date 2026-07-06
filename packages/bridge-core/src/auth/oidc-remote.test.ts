@@ -231,7 +231,7 @@ describe('createRemoteAuthApp selector', () => {
     );
     remote = (await createRemoteAuthApp(plugin, cfg, {
       publicUrl: new URL(origin),
-      verifyOwner: () => true,
+      verifyOwner: async () => true,
     })) as OidcRemoteServer;
     await remote.listen(port);
     // The built-in AS hosts its own registration endpoint — the delegated mode never does.

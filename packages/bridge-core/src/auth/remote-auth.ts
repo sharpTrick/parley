@@ -7,8 +7,8 @@ export interface RemoteAuthOptions {
   /** Public base URL of this server. builtin mode: issuer = AS = RS. oidc mode: RS only
    *  (the issuer is the external IdP from cfg.auth.oidc). */
   publicUrl: URL;
-  /** Owner-consent verifier — required iff cfg.auth.mode === 'builtin'. */
-  verifyOwner?: (passphrase: string) => boolean;
+  /** Owner-consent verifier (async: scrypt runs off the event loop) — required iff cfg.auth.mode === 'builtin'. */
+  verifyOwner?: (passphrase: string) => Promise<boolean>;
   /** MCP endpoint path. Default `/mcp`. */
   mcpPath?: string;
   /** builtin mode only. */

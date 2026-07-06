@@ -4,6 +4,7 @@ import {
 } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
@@ -13,8 +14,8 @@ import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
 export interface OAuthRemoteOptions {
   /** Public origin = issuer = base URL (AS = RS, single tenant). HTTPS in production; localhost ok in dev. */
   issuerUrl: URL;
-  /** Verify the owner's consent secret (timing-safe). See ./owner.ts. */
-  verifyOwner: (passphrase: string) => boolean;
+  /** Verify the owner's consent secret (timing-safe, off the event loop). See ./owner.ts. */
+  verifyOwner: (passphrase: string) => Promise<boolean>;
   /** MCP endpoint path. Default `/mcp`. The canonical resource id is `issuerUrl + mcpPath` (no trailing slash). */
   mcpPath?: string;
   scopesSupported?: string[];
@@ -54,6 +55,23 @@ export function createOAuthRemoteApp(
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resource);
   const bearer = requireBearerAuth({ verifier: provider, resourceMetadataUrl });
 
+  // Strict rate limit on the hand-mounted consent route, mirroring how the SDK guards its own auth
+  // endpoints (/register|/authorize|/token). A legit owner needs one attempt; brute force needs
+  // thousands, so keep the ceiling low and return 429 on exceed. Per-app instance (its own store)
+  // so the counter is scoped to this server, not shared process-wide.
+  //
+  // Trust-proxy note: the limiter keys on req.ip. Behind the documented reverse proxy (Caddy) all
+  // requests would otherwise share the proxy's IP, so per-IP throttling is defense-in-depth here —
+  // the load-bearing brute-force defense is the one-shot consent invalidation in completeConsent
+  // (each guess costs a fresh /authorize). We deliberately do NOT reconfigure the global `trust
+  // proxy` setting from this route (an app-wide change with its own security implications).
+  const consentLimiter = rateLimit({
+    windowMs: 15 * 60_000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
   const remote = createRemoteHttpApp(plugin, cfg, {
     mcpPath,
     protect: bearer,
@@ -73,12 +91,12 @@ export function createOAuthRemoteApp(
 
       // Owner-consent submit (browser-driven). The /authorize handler renders a consent page that
       // POSTs here; on the correct owner passphrase we mint the code and redirect back to Claude.
-      app.post(CONSENT_PATH, express.urlencoded({ extended: false }), (req, res) => {
+      app.post(CONSENT_PATH, consentLimiter, express.urlencoded({ extended: false }), async (req, res) => {
         const body = (req.body ?? {}) as Record<string, unknown>;
         const consentId = String(body.consent_id ?? '');
         const passphrase = String(body.passphrase ?? '');
         try {
-          const { redirectUrl } = provider.completeConsent(consentId, passphrase);
+          const { redirectUrl } = await provider.completeConsent(consentId, passphrase);
           res.redirect(302, redirectUrl);
         } catch (err) {
           if (err instanceof ConsentError) {
