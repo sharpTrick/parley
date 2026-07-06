@@ -287,4 +287,76 @@ describe('filterReachable (pure reachability predicate — CX-05)', () => {
     expect(scoped()).toEqual([]); // broken/huge patterns compile to nothing ⇒ no false match
     expect(unscoped()).toEqual([]);
   });
+
+  it('(d) SEC-08 — a beat of 64 nested-quantifier postTopics returns in bounded time (no ReDoS hang)', () => {
+    // A hostile peer plants the maximum 64 catastrophic-backtracking sources; the reader's real,
+    // short topic name is the match input. On the unfixed code a single `.test` against a 15-char
+    // topic hangs the whole process for >8s — here the ReDoS screen rejects the sources up front, so
+    // the pathological peer is simply excluded (no shared channel) and the call returns immediately.
+    const evil = '((([a-z-]+)+)+)+[0-9]'; // 20 source chars, catastrophic on Node's engine
+    const roster = [entry('attacker', ['some-other-ctx'], Array<string>(64).fill(evil))];
+    const scopedT0 = performance.now();
+    const scoped = filterReachable(roster, {
+      scope: 'team-eng-alerts', // a short, ordinary 15-char topic the unfixed matcher hangs on
+      canPostTo: NEVER,
+      mySubscribedTopics: [],
+    });
+    expect(performance.now() - scopedT0).toBeLessThan(200);
+    expect(scoped).toEqual([]);
+
+    const unscopedT0 = performance.now();
+    const unscoped = filterReachable(roster, {
+      scope: undefined,
+      canPostTo: NEVER,
+      mySubscribedTopics: ['team-eng-alerts'],
+    });
+    expect(performance.now() - unscopedT0).toBeLessThan(200);
+    expect(unscoped).toEqual([]);
+  });
+
+  it('(d2) SEC-08 — a BOUNDED exact-count nested quantifier is also screened (no ReDoS hang)', () => {
+    // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` has only `*` and a bounded exact
+    // `{40}` (no unbounded outer quantifier), so the earlier screen — which rejected only UNBOUNDED
+    // outer quantifiers — let it through, yet V8 unrolls `{40}` into 40 sequential `*`-bodies and the
+    // match hangs Node for tens of seconds on a short 15-char topic. The screen must reject a risky
+    // body repeated `>= 2` times regardless of boundedness, so the peer is excluded and the call
+    // returns immediately.
+    const evil = '([a-z-]*){40}[0-9]';
+    const roster = [entry('attacker', ['some-other-ctx'], Array<string>(64).fill(evil))];
+    const scopedT0 = performance.now();
+    const scoped = filterReachable(roster, {
+      scope: 'team-eng-alerts', // a short, ordinary 15-char topic the unfixed matcher hangs on
+      canPostTo: NEVER,
+      mySubscribedTopics: [],
+    });
+    expect(performance.now() - scopedT0).toBeLessThan(200);
+    expect(scoped).toEqual([]);
+
+    const unscopedT0 = performance.now();
+    const unscoped = filterReachable(roster, {
+      scope: undefined,
+      canPostTo: NEVER,
+      mySubscribedTopics: ['team-eng-alerts'],
+    });
+    expect(performance.now() - unscopedT0).toBeLessThan(200);
+    expect(unscoped).toEqual([]);
+  });
+
+  it('(e) SEC-08 — a benign postTopics pattern still legitimately matches (screen preserves semantics)', () => {
+    const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
+    // scoped: the peer's `team-.*` covers the scope.
+    expect(
+      filterReachable(roster, { scope: 'team-eng-alerts', canPostTo: NEVER, mySubscribedTopics: [] }).map(
+        (e) => e.handle,
+      ),
+    ).toEqual(['peer']);
+    // unscoped: the peer can post to a topic I subscribe to.
+    expect(
+      filterReachable(roster, {
+        scope: undefined,
+        canPostTo: NEVER,
+        mySubscribedTopics: ['team-eng-alerts'],
+      }).map((e) => e.handle),
+    ).toEqual(['peer']);
+  });
 });
