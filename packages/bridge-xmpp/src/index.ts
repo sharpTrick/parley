@@ -175,6 +175,26 @@ export class XmppPlugin implements BackendPlugin {
     // Stream/connection errors surface via command rejections; don't crash the process.
     xmpp.on('error', () => undefined);
     xmpp.on('stanza', (stanza) => this.onStanza(stanza));
+    // BUG-06: @xmpp/client bundles @xmpp/reconnect, which transparently re-establishes and
+    // re-auths the stream after a drop/server-restart — but MUC occupancy is presence-based and
+    // is NOT restored by the library. On every `online` AFTER the first, re-send the join
+    // presence for each subscribed room so push resumes and post() doesn't wait out its timeout.
+    let firstOnline = true;
+    xmpp.on('online', () => {
+      if (firstOnline) {
+        firstOnline = false;
+        return; // initial connect: subscribe()/post() drive the first joins
+      }
+      // The reconnect re-authed the stream but we are no longer a MUC occupant. Fail in-flight
+      // posts so callers retry immediately instead of hanging out the full POST_TIMEOUT_MS
+      // (the reflection can never arrive — the un-rejoined room answers <message type='error'>).
+      for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
+      this.pendingPosts.clear();
+      this.joined.clear();
+      for (const sub of this.subscriptions.values()) {
+        void this.ensureJoined(sub.topic).catch(() => undefined); // re-send join presence per room
+      }
+    });
     await xmpp.start();
     this.xmpp = xmpp;
   }
@@ -235,14 +255,16 @@ export class XmppPlugin implements BackendPlugin {
     await this.ensureJoined(args.topic);
     const limit = args.limit ?? 100;
 
+    const since = args.since === undefined ? undefined : String(args.since);
     let items: MamItem[];
-    if (args.since === undefined) {
-      // Default window: the most recent `limit` messages (RSM "last page" via empty <before/>).
+    if (since === undefined) {
+      // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
       items = (await this.mamQuery(args.topic, { before: true, max: limit })).items;
     } else {
-      // Exclusive catch-up: page forward with <after> until complete or `limit` reached.
+      // Exclusive catch-up. `since === ''` (empty archive's zero cursor) means "from the very
+      // beginning": the first page omits <after/> (guarded in mamQuery); later pages use real archIds.
       items = [];
-      let cursor = String(args.since);
+      let cursor = since; // may be '' on the first iteration → no <after/> emitted
       while (items.length < limit) {
         const page = await this.mamQuery(args.topic, {
           after: cursor,
@@ -404,7 +426,10 @@ export class XmppPlugin implements BackendPlugin {
     this.mamCollectors.set(queryid, { room, items: collector });
 
     const rsm: unknown[] = [];
-    if (opts.after !== undefined) rsm.push(xml('after', {}, opts.after));
+    // Never emit an empty <after/>: the empty-archive zero cursor '' means "from the beginning"
+    // (forward-from-start), not a real archive UID. XEP-0313 §4.2 makes servers reply
+    // item-not-found for an <after> that is not in the archive, so '' must omit the element.
+    if (opts.after !== undefined && opts.after !== '') rsm.push(xml('after', {}, opts.after));
     rsm.push(xml('max', {}, String(opts.max)));
     if (opts.before === true) rsm.push(xml('before', {})); // empty <before/> => last page
 
