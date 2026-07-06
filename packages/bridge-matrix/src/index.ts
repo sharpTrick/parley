@@ -62,6 +62,13 @@ interface MatrixEvent {
 
 const isMessageEvent = (e: MatrixEvent): boolean => e.type === 'm.room.message';
 
+/** Real per-sync timeline cap for the incremental `/sync` filter and the backfill page size (BUG-09). */
+const INCREMENTAL_TIMELINE_LIMIT = 100;
+/** Bound on forward catch-up pagination so an all-foreign timeline terminates instead of spinning (BUG-03). */
+const MAX_FORWARD_PAGES = 50;
+/** Bound on backward `limited`-burst recovery pagination so it always terminates (BUG-09). */
+const MAX_BACKFILL_PAGES = 50;
+
 /**
  * Matrix (Synapse) backend (DESIGN §6/§9) — first external-network backend, over the raw
  * Client-Server HTTP API (no SDK; unencrypted rooms). By default a topic maps to its own room via
@@ -158,16 +165,7 @@ export class MatrixPlugin implements BackendPlugin {
     const limit = args.limit ?? 100;
 
     if (args.since === undefined) {
-      // Default window: most-recent `limit`, returned ASCENDING (reverse the dir=b chunk).
-      const res = await this.http(
-        'GET',
-        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=${limit}`,
-      );
-      const { chunk } = (await res.json()) as { chunk: MatrixEvent[] };
-      const events = chunk.filter((e) => this.belongs(e, args.topic)).reverse();
-      const messages = events.map((e) => eventToMessage(args.topic, e));
-      const nextCursor = messages.at(-1)?.cursor ?? asCursor('');
-      return { messages, nextCursor };
+      return this.recentWindow(roomId, args.topic, limit);
     }
 
     // Exclusive `since`: locate the cursor event, then page forward from just after it.
@@ -175,26 +173,79 @@ export class MatrixPlugin implements BackendPlugin {
     const ctxRes = await this.http(
       'GET',
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/context/${encodeURIComponent(since)}?limit=0`,
+      { allowStatuses: [404] },
     );
+    // BUG-10: a purged / retention-expired cursor (or a topic remapped to a different room by a
+    // `shared_room`/`server_name` config change) no longer resolves and 404s on `/context`. Treat
+    // it as an expired cursor and resume from the recent window instead of throwing — `buildBridge`
+    // awaits `catchUpAll`, so a throw here bricks startup on EVERY restart until the read-state file
+    // is hand-edited. Other backends already degrade gracefully from a trimmed/expired cursor.
+    if (ctxRes.status === 404) {
+      return this.recentWindow(roomId, args.topic, limit);
+    }
     const ctx = (await ctxRes.json()) as { end?: string };
     if (ctx.end === undefined) {
       return { messages: [], nextCursor: args.since };
     }
-    const fwdRes = await this.http(
+
+    // BUG-03: the forward `/messages` page is `limit`-bounded BEFORE topic/type filtering, so a
+    // full page of foreign-topic (shared-room) or non-`m.room.message` events would pin
+    // `nextCursor` at `since` — indistinguishable from "caught up" — and permanently mask later
+    // on-topic messages (a catch-up livelock). Advance the cursor by RAW page position and drain
+    // the foreign block: page forward until `limit` belonging messages are collected or the
+    // timeline ends, tracking the last raw event id so the cursor always crosses a foreign block.
+    const messages: Message[] = [];
+    let from = ctx.end;
+    let lastRawEventId: string | undefined;
+    for (let page = 0; page < MAX_FORWARD_PAGES && messages.length < limit; page++) {
+      const fwdRes = await this.http(
+        'GET',
+        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(from)}&dir=f&limit=${limit}`,
+      );
+      const { chunk, end } = (await fwdRes.json()) as { chunk: MatrixEvent[]; end?: string };
+      if (chunk.length === 0) break; // genuine end of timeline.
+      lastRawEventId = chunk.at(-1)?.event_id ?? lastRawEventId;
+      // The context `end` token is inconsistent at the boundary (it re-includes the `since` event
+      // for a mid-stream event, but not for the tail). Make `since` strictly exclusive by dropping
+      // everything up to AND INCLUDING the cursor event if it reappears in this page, THEN restrict
+      // to this topic (shared-room mode interleaves other topics in the same room).
+      let events = chunk.filter(isMessageEvent);
+      const idx = events.findIndex((e) => e.event_id === since);
+      if (idx >= 0) events = events.slice(idx + 1);
+      events = events.filter((e) => this.belongs(e, args.topic));
+      for (const e of events) messages.push(eventToMessage(args.topic, e));
+      if (end === undefined) break; // no further forward pagination token.
+      from = end;
+    }
+    const trimmed = messages.slice(0, limit);
+    // nextCursor: the last belonging message's cursor if any were collected; else the raw page
+    // position so the cursor crosses the foreign block; else `since` when the first page was empty
+    // (nothing to advance past). Guarantees monotonic forward progress so `catchUpTopic` either
+    // gets a full page and continues, or advances the persisted cursor past the foreign block.
+    const nextCursor =
+      trimmed.at(-1)?.cursor ??
+      (lastRawEventId !== undefined ? asCursor(lastRawEventId) : args.since);
+    return { messages: trimmed, nextCursor };
+  }
+
+  /**
+   * Most-recent `limit` messages for `topic`, returned ASCENDING (reverse the `dir=b` chunk). Used
+   * for the default (`since`-less) window AND as the BUG-10 fallback when a persisted cursor has
+   * expired — its most-recent-`limit`-ascending contract is identical in both cases.
+   */
+  private async recentWindow(
+    roomId: string,
+    topic: Topic,
+    limit: number,
+  ): Promise<FetchRecentResult> {
+    const res = await this.http(
       'GET',
-      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(ctx.end)}&dir=f&limit=${limit}`,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=${limit}`,
     );
-    const { chunk } = (await fwdRes.json()) as { chunk: MatrixEvent[] };
-    // The context `end` token is inconsistent at the boundary (it re-includes the `since` event
-    // for a mid-stream event, but not for the tail). Make `since` strictly exclusive by dropping
-    // everything up to AND INCLUDING the cursor event if it reappears in the forward page, THEN
-    // restrict to this topic (shared-room mode interleaves other topics in the same room).
-    let events = chunk.filter(isMessageEvent);
-    const idx = events.findIndex((e) => e.event_id === since);
-    if (idx >= 0) events = events.slice(idx + 1);
-    events = events.filter((e) => this.belongs(e, args.topic));
-    const messages = events.map((e) => eventToMessage(args.topic, e));
-    const nextCursor = messages.at(-1)?.cursor ?? args.since;
+    const { chunk } = (await res.json()) as { chunk: MatrixEvent[] };
+    const events = chunk.filter((e) => this.belongs(e, topic)).reverse();
+    const messages = events.map((e) => eventToMessage(topic, e));
+    const nextCursor = messages.at(-1)?.cursor ?? asCursor('');
     return { messages, nextCursor };
   }
 
@@ -206,23 +257,29 @@ export class MatrixPlugin implements BackendPlugin {
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const roomId = await this.ensureRoom(topic);
-    const filter = JSON.stringify({
-      room: {
-        rooms: [roomId],
-        timeline: { limit: 0 },
-        ephemeral: { limit: 0 },
-        account_data: { limit: 0 },
-        state: { limit: 0, lazy_load_members: true },
-      },
-      presence: { limit: 0 },
-      account_data: { limit: 0 },
-    });
-    const fparam = encodeURIComponent(filter);
+    // Two filters: the initial position uses `timeline.limit: 0` to skip history; the loop uses a
+    // REAL timeline limit (BUG-09) so a burst that overflows the per-sync cap is reported via
+    // `limited`/`prev_batch` (and recoverable) instead of being silently truncated.
+    const initParam = encodeURIComponent(JSON.stringify(this.syncFilter(roomId, 0)));
+    const incParam = encodeURIComponent(
+      JSON.stringify(this.syncFilter(roomId, INCREMENTAL_TIMELINE_LIMIT)),
+    );
 
     // Establish the resume position BEFORE returning, so a post immediately after subscribe()
     // resolves is guaranteed to land in a subsequent sync (positioning is awaited).
-    const initial = await this.http('GET', `/_matrix/client/v3/sync?filter=${fparam}&timeout=0`);
+    const initial = await this.http('GET', `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`);
     let nextBatch = ((await initial.json()) as { next_batch: string }).next_batch;
+    // Backward-recovery stop boundary (BUG-09): the event_id of the last event handed to the
+    // handler. SEED it — right after positioning — with the current timeline tip so a `limited`
+    // burst recovery can never page backward PAST the subscription position into PRE-subscription
+    // history (which `subscribe` must skip) when no on-topic message has been delivered yet. Without
+    // this seed, in `shared_room` mode `lastDelivered` stays `undefined` while other-topic traffic
+    // flows, and the first `limited` sync would call `backfill(stopAfter=undefined)` with no lower
+    // bound — walking up to MAX_BACKFILL_PAGES into old belonging messages that predate the cursor
+    // and leaking them as spurious live `<channel>` events. The tip is read AFTER the timeout=0 sync
+    // so the boundary never precedes B0; an empty room yields `undefined` (no history → safe). Once a
+    // real message is delivered the boundary advances past the seed.
+    let lastDelivered: string | undefined = await this.timelineTip(roomId);
 
     const loop = async (): Promise<void> => {
       while (!this.stopped) {
@@ -232,7 +289,7 @@ export class MatrixPlugin implements BackendPlugin {
         try {
           const res = await this.http(
             'GET',
-            `/_matrix/client/v3/sync?filter=${fparam}&since=${encodeURIComponent(nextBatch)}&timeout=${this.syncTimeoutMs}`,
+            `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${this.syncTimeoutMs}`,
             { signal: controller.signal },
           );
           json = (await res.json()) as SyncResponse;
@@ -245,18 +302,116 @@ export class MatrixPlugin implements BackendPlugin {
         }
         if (this.stopped) break;
         nextBatch = json.next_batch ?? nextBatch;
-        const events = json.rooms?.join?.[roomId]?.timeline?.events ?? [];
+        const timeline = json.rooms?.join?.[roomId]?.timeline;
+        const events = timeline?.events ?? [];
+        // BUG-09: the server truncated this sync's timeline to the filter cap; the omitted (older)
+        // events are reachable only by paging `prev_batch` backwards. Recover and deliver them
+        // ASCENDING before the new batch so no burst larger than the per-sync cap is silently
+        // dropped (the "handler fires once per inbound message" seam contract).
+        if (timeline?.limited === true && timeline.prev_batch !== undefined) {
+          let recovered: MatrixEvent[] = [];
+          try {
+            recovered = await this.backfill(
+              roomId,
+              topic,
+              timeline.prev_batch,
+              lastDelivered,
+              new Set(events.map((e) => e.event_id)),
+            );
+          } catch {
+            /* backfill is best-effort; anything missed stays reachable via fetchRecent catch-up */
+          }
+          for (const e of recovered) {
+            lastDelivered = e.event_id;
+            this.deliver(topic, e, handler);
+          }
+        }
         for (const e of events) {
           if (!this.belongs(e, topic)) continue;
-          try {
-            handler(eventToMessage(topic, e));
-          } catch {
-            /* handler is best-effort; never break the loop (DESIGN §6) */
-          }
+          lastDelivered = e.event_id;
+          this.deliver(topic, e, handler);
         }
       }
     };
     void loop();
+  }
+
+  /** Build the `/sync` room filter with a given timeline limit (0 = skip history for positioning). */
+  private syncFilter(roomId: string, timelineLimit: number) {
+    return {
+      room: {
+        rooms: [roomId],
+        timeline: { limit: timelineLimit },
+        ephemeral: { limit: 0 },
+        account_data: { limit: 0 },
+        state: { limit: 0, lazy_load_members: true },
+      },
+      presence: { limit: 0 },
+      account_data: { limit: 0 },
+    };
+  }
+
+  /**
+   * The `event_id` of the most-recent event in `roomId` (ANY type — a state event is a valid
+   * boundary since `backfill` matches by id, not by topic/type), or `undefined` for a room with no
+   * timeline history. Read once at subscribe time to seed the `limited`-burst backward-recovery
+   * boundary at the subscription position so `backfill` (BUG-09) never walks into pre-subscription
+   * history. An empty room has no such history, so `undefined` there is safe.
+   */
+  private async timelineTip(roomId: string): Promise<string | undefined> {
+    const res = await this.http(
+      'GET',
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=1`,
+    );
+    const { chunk } = (await res.json()) as { chunk: MatrixEvent[] };
+    return chunk.at(0)?.event_id;
+  }
+
+  /**
+   * BUG-09 recovery: page the timeline BACKWARDS from a `limited` sync's `prev_batch` (`dir=b`,
+   * newest→oldest), collecting belonging messages until we reach the last event already delivered
+   * (`stopAfter`), the chunk empties, or the page bound trips; return them reversed to ASCENDING
+   * order for in-order delivery. `skip` holds the ids already present in the current sync batch so
+   * a token-boundary overlap can't double-deliver.
+   */
+  private async backfill(
+    roomId: string,
+    topic: Topic,
+    prevBatch: string,
+    stopAfter: string | undefined,
+    skip: Set<string>,
+  ): Promise<MatrixEvent[]> {
+    const recovered: MatrixEvent[] = [];
+    let from = prevBatch;
+    for (let page = 0; page < MAX_BACKFILL_PAGES && !this.stopped; page++) {
+      const res = await this.http(
+        'GET',
+        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(from)}&dir=b&limit=${INCREMENTAL_TIMELINE_LIMIT}`,
+      );
+      const { chunk, end } = (await res.json()) as { chunk: MatrixEvent[]; end?: string };
+      if (chunk.length === 0) break;
+      let reachedBoundary = false;
+      for (const e of chunk) {
+        if (stopAfter !== undefined && e.event_id === stopAfter) {
+          reachedBoundary = true;
+          break;
+        }
+        if (skip.has(e.event_id)) continue; // already in this sync's batch — don't double-deliver.
+        if (this.belongs(e, topic)) recovered.push(e);
+      }
+      if (reachedBoundary || end === undefined) break;
+      from = end;
+    }
+    return recovered.reverse();
+  }
+
+  /** Deliver one event to a subscribe handler, swallowing handler throws (best-effort, DESIGN §6). */
+  private deliver(topic: Topic, e: MatrixEvent, handler: MessageHandler): void {
+    try {
+      handler(eventToMessage(topic, e));
+    } catch {
+      /* handler is best-effort; never break the loop (DESIGN §6) */
+    }
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
@@ -381,7 +536,12 @@ export class MatrixPlugin implements BackendPlugin {
 
 interface SyncResponse {
   next_batch?: string;
-  rooms?: { join?: Record<string, { timeline?: { events?: MatrixEvent[] } }> };
+  rooms?: {
+    join?: Record<
+      string,
+      { timeline?: { events?: MatrixEvent[]; limited?: boolean; prev_batch?: string } }
+    >;
+  };
 }
 
 function eventToMessage(topic: Topic, e: MatrixEvent): Message {
