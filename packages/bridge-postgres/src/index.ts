@@ -77,6 +77,16 @@ export class PostgresPlugin implements BackendPlugin {
     this.table = assertTableName(cfg.table_name ?? 'parley_messages');
     this.stopped = false;
 
+    // SEC-06: warn loudly before the schema bootstrap when the operator is connecting with the
+    // repo-public default DSN (unset → fell back, or set literally to the well-known value).
+    if (cfg.url === undefined || this.url === DEFAULT_URL) {
+      console.warn(
+        '[parley-postgres] SECURITY: connecting with the built-in default DSN ' +
+          "('postgres://parley:parley@…'). Set backend_config.url to a real connection string; a " +
+          'network-reachable database provisioned with these credentials is world-readable/injectable.',
+      );
+    }
+
     const pool = new Pool({ connectionString: this.url, max: cfg.pool_size ?? 5 });
     pool.on('error', () => {
       /* idle-client errors (server restart etc.) surface via command rejections; don't crash */

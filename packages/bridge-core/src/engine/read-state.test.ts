@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, normalize, sep } from 'node:path';
+import { dirname, join, normalize, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { asCursor, asTopic } from '../message.js';
 import { defaultReadStatePath, ReadStateStore } from './read-state.js';
@@ -82,5 +82,33 @@ describe('ReadStateStore', () => {
   it('maps distinct ids that clean alike to distinct files', () => {
     expect(defaultReadStatePath('a/b')).not.toBe(defaultReadStatePath('a_b'));
     expect(defaultReadStatePath('sess/1')).not.toBe(defaultReadStatePath('sess_1'));
+  });
+
+  // SEC-16 — flush() must create read-state.json 0600 and its containing dir 0700 so a co-tenant
+  // on a shared host cannot read this instance's cursor positions. Pre-fix these landed at the
+  // umask default (0644/0755).
+  it('creates read-state.json 0600 and its dir 0700 (SEC-16)', () => {
+    const base = mkdtempSync(join(tmpdir(), 'parley-rs-mode-'));
+
+    // Control: a plain mkdir under this env's umask reproduces the pre-fix dir mode. If it is not
+    // world/group-traversable (e.g. umask 0077) the 0700 assertion below would be trivially met,
+    // so skip the strict check in that case rather than claim a false proof.
+    const control = join(base, 'control');
+    mkdirSync(control);
+    const umaskExposes = (statSync(control).mode & 0o077) !== 0;
+
+    // Point at a path whose parent dir does NOT exist yet, so flush()'s mkdirSync is what creates
+    // it — otherwise we'd be asserting on mkdtemp's own 0700 rather than the fix.
+    const dir = join(base, 'nested');
+    const file = join(dir, 'read-state.json');
+    new ReadStateStore(file).set(asTopic('t'), asCursor('1'));
+
+    expect(dirname(file)).toBe(dir);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    if (umaskExposes) {
+      // The fix stripped the group/other bits a plain mkdir/writeFile would have left.
+      expect(statSync(control).mode & 0o077).not.toBe(0);
+    }
   });
 });

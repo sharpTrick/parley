@@ -54,9 +54,12 @@ export class ReadStateStore {
   }
 
   private flush(): void {
-    mkdirSync(dirname(this.filePath), { recursive: true });
+    // SEC-16: create the state dir 0700 and the file 0600 so a co-tenant on a shared host can't
+    // read this instance's cursor positions. `mode` is masked by the umask (only ever *removing*
+    // bits, so the result is ≤ these), and renameSync preserves the tmp file's mode into place.
+    mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
     const tmp = `${this.filePath}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(this.state, null, 2)}\n`, 'utf8');
+    writeFileSync(tmp, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
     renameSync(tmp, this.filePath);
   }
 }
