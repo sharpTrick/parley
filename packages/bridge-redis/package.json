@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "@sharptrick/parley-core": "^0.1.0",
+    "@sharptrick/parley-net-util": "^0.1.0",
     "redis": "^4.7.1"
   },
   "devDependencies": {

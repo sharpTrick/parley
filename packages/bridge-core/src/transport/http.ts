@@ -2,31 +2,22 @@ import type { Server as NodeHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type RequestHandler } from 'express';
-import { allowlistFor } from '../allowlist.js';
-import { SeenSet } from '../engine/seen-set.js';
 import type { ParleyConfig } from '../config.js';
-import { asHandle, asTopic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
 import { startPresenceLoop } from './presence-loop.js';
-import { registerTools } from './tools.js';
+import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
 
 /**
  * Build a REACTIVE-ONLY MCP server (DESIGN §8/§10 remote mode): the post / fetchRecent / reply
  * tools over the same seam, with NO `claude/channel` capability and NO push loop — the chat
- * client cannot receive pushes. The plugin is shared and long-lived; one server is built per
- * HTTP session (cheap; just registers handlers).
+ * client cannot receive pushes. `deps` is derived ONCE at app scope (see {@link createRemoteHttpApp})
+ * and shared across every per-request server, so the allowlist/regexes are compiled a single time,
+ * not per POST. No `seen` is passed: without a push loop there is no dedup state to maintain (CX-06).
  */
-export function buildReactiveServer(plugin: BackendPlugin, cfg: ParleyConfig): McpServer {
+export function buildReactiveServer(deps: ToolDeps): McpServer {
   const server = new McpServer({ name: 'parley', version: CORE_VERSION }, { capabilities: { tools: {} } });
-  registerTools(server, {
-    plugin,
-    identity: asHandle(cfg.identity.handle),
-    allow: allowlistFor(cfg),
-    seen: new SeenSet(),
-    presenceTopic: asTopic(cfg.presence.topic),
-    presenceTtlMs: cfg.presence.ttl_ms,
-  });
+  registerTools(server, deps);
   return server;
 }
 
@@ -61,11 +52,16 @@ export function createRemoteHttpApp(
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
 
+  // Derive the tool deps ONCE at app scope (config is constant): the allowlist/regexes and tool
+  // descriptions are compiled a single time and reused by every per-request reactive server and by
+  // the presence loop below — no per-POST recompilation, no duplicate app-scope derivation (CX-09).
+  const deps = toolDepsFor(plugin, cfg);
+
   // The chat bridge is a long-lived participant too: announce presence off the shared plugin
   // (the reactive servers are per-request and stateless, so presence lives at app scope).
   const presence = cfg.presence.enabled
-    ? startPresenceLoop(plugin, asHandle(cfg.identity.handle), allowlistFor(cfg), {
-        presenceTopic: asTopic(cfg.presence.topic),
+    ? startPresenceLoop(plugin, deps.identity, deps.allow, {
+        presenceTopic: deps.presenceTopic,
         heartbeatMs: cfg.presence.heartbeat_ms,
       })
     : undefined;
@@ -84,7 +80,7 @@ export function createRemoteHttpApp(
   // re-registers handlers. No session map, no SSE, no server push — chat is request/response only.
   const handlePost: RequestHandler = async (req, res) => {
     try {
-      const server = buildReactiveServer(plugin, cfg);
+      const server = buildReactiveServer(deps);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

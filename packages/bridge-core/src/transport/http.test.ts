@@ -1,7 +1,8 @@
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as allowlistMod from '../allowlist.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from './http.js';
@@ -66,5 +67,41 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
     // layer (Invalid enum value); with a post pattern it would be allow.assert's "topic not
     // allowed". Either way it is an isError result, not a crash.
     expect(res.content[0]!.text).toMatch(/invalid enum value|topic not allowed/i);
+  });
+});
+
+// CX-06: the reactive HTTP path builds a fresh MCP server PER POST but must NOT recompile the
+// allowlist (nor allocate a dead per-request SeenSet). The allowlist is derived once at app scope
+// via toolDepsFor and reused by every per-request reactive server. A grep already confirms `new
+// SeenSet` is gone from http.ts; this proves the allowlist compiles exactly once across N POSTs.
+describe('reactive HTTP: allowlist compiled once per app, not per POST (CX-06)', () => {
+  it('derives the allowlist a single time at app scope regardless of request count', async () => {
+    const spy = vi.spyOn(allowlistMod, 'allowlistFor');
+    const plugin2 = new FakePlugin();
+    await plugin2.connect({});
+    // Presence off: keep this focused on the request path (a presence loop reuses deps.allow anyway).
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+    });
+    const app = createRemoteHttpApp(plugin2, cfg);
+    const srv = await app.listen(0);
+    const port = (srv.address() as AddressInfo).port;
+    const c = new Client({ name: 'x', version: '0.0.0' }, { capabilities: {} });
+    await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
+    try {
+      // Several POSTs, each building a brand-new reactive server + transport …
+      await c.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'a' } });
+      await c.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } });
+      await c.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } });
+      // … yet the allowlist (and its regex compilation) was built exactly once, at app scope.
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      await c.close();
+      await app.close();
+      await plugin2.disconnect();
+      spy.mockRestore();
+    }
   });
 });

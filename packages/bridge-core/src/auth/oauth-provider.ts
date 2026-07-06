@@ -15,6 +15,7 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { escapeHtml } from './html.js';
 
 const ACCESS_TTL_SEC = 60 * 60; // 1 hour
 const REFRESH_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
@@ -255,13 +256,4 @@ export class ConsentError extends Error {
     super(message);
     this.name = 'ConsentError';
   }
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }

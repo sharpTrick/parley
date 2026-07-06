@@ -4,10 +4,12 @@ import {
   computeRoster,
   decodePresence,
   encodePresence,
+  filterReachable,
   MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
   type PresenceKind,
   type PresenceRecord,
+  type RosterEntry,
 } from './presence.js';
 
 /** Build a presence Message on the shared presence topic in ascending-cursor order (seq drives the cursor). */
@@ -235,5 +237,54 @@ describe('computeRoster', () => {
       beat('claude-a', 'heartbeat', now - 1_000, 2),
     ];
     expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['claude-a', 'claude-b']);
+  });
+});
+
+// CX-05 payoff: the hand-off reachability predicate is now a PURE, directly-callable function that
+// lives beside computeRoster — no MCP client/server harness required (the whole point of the extract).
+describe('filterReachable (pure reachability predicate — CX-05)', () => {
+  /** A roster entry; only `topics`/`postTopics` drive the predicate (online/lastSeenMs are inert here). */
+  const entry = (handle: string, topics: string[], postTopics: string[] = []): RosterEntry => ({
+    handle: asHandle(handle),
+    online: true,
+    topics,
+    postTopics,
+    lastSeenMs: 0,
+  });
+  const NEVER = () => false;
+
+  it('(a) scoped — includes a peer that only PATTERN-matches the scope via postTopics; excludes one that neither subscribes nor matches', () => {
+    const roster = [
+      entry('subber', ['ctx-adhoc']), // subscribes to the scope directly
+      entry('poster', ['elsewhere'], ['ctx-.*']), // only its post-pattern covers the scope
+      entry('stranger', ['other'], ['unrelated-.*']), // neither subscribes nor matches
+    ];
+    const got = filterReachable(roster, { scope: 'ctx-adhoc', canPostTo: NEVER, mySubscribedTopics: [] });
+    expect(got.map((e) => e.handle)).toEqual(['subber', 'poster']);
+  });
+
+  it('(b) unscoped bidirectional — includes a peer I can post to AND a peer that can post to a topic I subscribe to; excludes an unrelated peer', () => {
+    const roster = [
+      entry('i-can-post-to', ['their-topic']), // I can post to a topic it subscribes to
+      entry('can-post-to-me', ['elsewhere'], ['mine-.*']), // its post-pattern covers a topic I subscribe to
+      entry('unrelated', ['nowhere'], ['no-.*']), // no channel in either direction
+    ];
+    const got = filterReachable(roster, {
+      scope: undefined,
+      canPostTo: (t) => t === 'their-topic', // stands in for `allow.has`
+      mySubscribedTopics: ['mine-1'], // stands in for `allow.topics()`
+    });
+    expect(got.map((e) => e.handle).sort()).toEqual(['can-post-to-me', 'i-can-post-to']);
+  });
+
+  it('(c) silently ignores a hostile un-compilable / over-long postTopics source (never throws), scoped or unscoped', () => {
+    const roster = [entry('hostile', ['other'], ['(', 'x'.repeat(10_000)])];
+    const scoped = () => filterReachable(roster, { scope: 'ctx', canPostTo: NEVER, mySubscribedTopics: [] });
+    const unscoped = () =>
+      filterReachable(roster, { scope: undefined, canPostTo: NEVER, mySubscribedTopics: ['ctx'] });
+    expect(scoped).not.toThrow();
+    expect(unscoped).not.toThrow();
+    expect(scoped()).toEqual([]); // broken/huge patterns compile to nothing ⇒ no false match
+    expect(unscoped()).toEqual([]);
   });
 });

@@ -13,6 +13,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import { createClient } from 'redis';
 
 type RedisClient = ReturnType<typeof createClient>;
@@ -33,8 +34,6 @@ export interface RedisBackendConfig {
    */
   retention_days?: number;
 }
-
-const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Redis Streams backend (DESIGN §6/§9) — the FIRST event-driven push backend. A Stream entry id
