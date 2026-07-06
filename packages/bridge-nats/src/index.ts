@@ -12,6 +12,7 @@ import {
   type Message,
   type MessageHandler,
   parseMentions,
+  safeName,
   type Topic,
 } from '@sharptrick/parley-core';
 import {
@@ -206,10 +207,10 @@ export class NatsPlugin implements BackendPlugin {
   }
 
   private subject(topic: Topic): string {
-    return this.subjectPrefix + sanitizeToken(topic);
+    return this.subjectPrefix + safeName(topic, sanitizeToken);
   }
   private streamName(topic: Topic): string {
-    return this.streamPrefix + sanitizeName(topic);
+    return this.streamPrefix + safeName(topic, sanitizeName);
   }
 
   private requireJs(): JetStreamClient {
