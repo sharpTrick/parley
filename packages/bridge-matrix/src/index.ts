@@ -103,6 +103,17 @@ export class MatrixPlugin implements BackendPlugin {
     this.stopped = false;
     this.rooms.clear();
 
+    // SEC-06: refuse to connect *silently* with the repo-public default credential — an operator
+    // who left `password` unset (or set it to the well-known value) gets one loud warning naming
+    // the backend and the key to set, emitted before the login POST goes out.
+    if (cfg.password === undefined || this.password === 'parleypass') {
+      console.warn(
+        '[parley-matrix] SECURITY: connecting with the built-in default password ' +
+          "('parleypass'). Set backend_config.password to a real secret; a network-reachable " +
+          'homeserver provisioned with this password is world-readable/injectable.',
+      );
+    }
+
     const res = await this.http('POST', '/_matrix/client/v3/login', {
       body: {
         type: 'm.login.password',

@@ -104,6 +104,17 @@ export class ZulipPlugin implements BackendPlugin {
     this.eventsTimeoutMs = cfg.events_timeout_ms ?? 25_000;
     this.stopped = false;
     this.connected = true;
+
+    // SEC-06: connect() never contacts the server (auth is per-request), so a bad key surfaces
+    // only on first use — warn here when the effective API key is the repo-public default so the
+    // operator is told at startup rather than silently running with a well-known credential.
+    if (cfg.api_key === undefined || this.apiKey === 'parley-api-key') {
+      console.warn(
+        '[parley-zulip] SECURITY: connecting with the built-in default API key ' +
+          "('parley-api-key'). Set backend_config.api_key to a real secret; a network-reachable " +
+          'Zulip bot provisioned with this key is world-readable/injectable.',
+      );
+    }
   }
 
   async disconnect(): Promise<void> {

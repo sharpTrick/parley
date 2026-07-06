@@ -154,11 +154,22 @@ export class XmppPlugin implements BackendPlugin {
     this.nick = cfg.nick ?? `${username}-${rand()}`;
     this.stopped = false;
 
+    // SEC-06: warn loudly before the SASL handshake when the operator is connecting with the
+    // repo-public default password (unset → fell back, or set literally to the well-known value).
+    const password = cfg.password ?? 'parleypass';
+    if (cfg.password === undefined || password === 'parleypass') {
+      console.warn(
+        '[parley-xmpp] SECURITY: connecting with the built-in default password ' +
+          "('parleypass'). Set backend_config.password to a real secret; a network-reachable " +
+          'XMPP account provisioned with this password is world-readable/injectable.',
+      );
+    }
+
     const xmpp = client({
       service: cfg.service ?? 'xmpp://127.0.0.1:5222',
       domain: this.domain,
       username,
-      password: cfg.password ?? 'parleypass',
+      password,
     }) as unknown as XmppClient;
     // Stream/connection errors surface via command rejections; don't crash the process.
     xmpp.on('error', () => undefined);

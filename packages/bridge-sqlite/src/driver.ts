@@ -1,3 +1,4 @@
+import { chmodSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 // Lazy CJS require so the native module (better-sqlite3) or the built-in (node:sqlite)
@@ -96,5 +97,23 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   // busy_timeout: a concurrent post from another instance retries instead of erroring (DESIGN §9/§10).
   driver.exec(`PRAGMA busy_timeout = ${busy}`);
   driver.exec('PRAGMA synchronous = NORMAL');
+  // SEC-16: SQLite creates the DB (and, since journal_mode = WAL above, its -wal/-shm sidecars)
+  // at the umask default — typically 0644, world-readable — and neither driver exposes a mode
+  // option, so chmod them to 0600 after open. Skip in-memory paths; the sidecars may not exist
+  // yet (e.g. before the first write), so guard each chmod individually.
+  if (path !== ':memory:' && !path.startsWith('file::memory:')) {
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      /* best-effort: file may be on a mode-less FS */
+    }
+    for (const sidecar of [`${path}-wal`, `${path}-shm`]) {
+      try {
+        chmodSync(sidecar, 0o600);
+      } catch {
+        /* not created yet / absent — ignore */
+      }
+    }
+  }
   return driver;
 }
