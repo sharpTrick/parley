@@ -53,12 +53,28 @@ export async function createOidcRemoteApp(
 
   const metadata = await fetchOidcDiscovery(oidc.issuer, opts.fetchFn ?? fetch);
   const jwksUri = oidc.jwks_uri ?? metadata.jwks_uri;
+  if (oidc.jwks_uri === undefined) {
+    // Defense-in-depth: a discovery-supplied JWKS must share the issuer's origin. An explicit
+    // `auth.oidc.jwks_uri` config override is the trusted pin (e.g. a CDN-hosted JWKS).
+    const jwksOrigin = new URL(jwksUri).origin;
+    const issuerOrigin = new URL(metadata.issuer).origin;
+    if (jwksOrigin !== issuerOrigin) {
+      throw new Error(
+        `OIDC discovery: jwks_uri origin ${jwksOrigin} does not match issuer origin ` +
+          `${issuerOrigin}. Pin it explicitly via auth.oidc.jwks_uri if this is intentional ` +
+          `(e.g. a CDN-hosted JWKS).`,
+      );
+    }
+  }
   // Keycloak ignores RFC 8707 `resource`, so deployments typically pin a fixed-string audience
   // via a mapper; default to the canonical resource id for IdPs that do bind audiences to it.
   const audience = oidc.audience ?? resource.href;
 
   const verifier = new OidcTokenVerifier({
-    issuer: oidc.issuer,
+    // Use the discovery document's canonical issuer (already validated to equal oidc.issuer
+    // modulo a trailing slash) — it is exactly what the IdP stamps in `iss`, so jose's exact
+    // match lines up in both slash directions (BUG-24).
+    issuer: metadata.issuer,
     audience,
     jwksUri,
     clockSkewS: oidc.clock_skew_s,

@@ -144,4 +144,56 @@ describe('config loader', () => {
       }),
     ).toThrow();
   });
+
+  it('rejects an oidc block with no identity gate (SEC-05 fail-closed)', () => {
+    const base = { identity: { handle: 'h' }, topics: ['a'] };
+    const issuer = 'https://kc.example.com/realms/x';
+    // Gate-less: none of allowed_subjects / allowed_usernames / required_role → rejected.
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: { mode: 'oidc', oidc: { issuer, audience: 'parley-mcp' } },
+      }),
+    ).toThrow(/identity gate/);
+    // required_scope alone is NOT a sufficient gate.
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: { mode: 'oidc', oidc: { issuer, required_scope: 'mcp' } },
+      }),
+    ).toThrow(/identity gate/);
+    // Any one of the three gates makes it parse.
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer, allowed_subjects: ['owner-sub'] } } }),
+    ).not.toThrow();
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer, allowed_usernames: ['alice'] } } }),
+    ).not.toThrow();
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer, required_role: 'parley-owner' } } }),
+    ).not.toThrow();
+  });
+
+  it('rejects an http issuer but exempts loopback (SEC-19 https requirement)', () => {
+    const base = { identity: { handle: 'h' }, topics: ['a'] };
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: {
+          mode: 'oidc',
+          oidc: { issuer: 'http://kc.example.com/realms/x', required_role: 'parley-owner' },
+        },
+      }),
+    ).toThrow(/https/);
+    // Loopback stays usable so the in-process fake IdP (http://127.0.0.1) works in tests/dev.
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: {
+          mode: 'oidc',
+          oidc: { issuer: 'http://127.0.0.1:8080/realms/x', required_role: 'parley-owner' },
+        },
+      }),
+    ).not.toThrow();
+  });
 });
