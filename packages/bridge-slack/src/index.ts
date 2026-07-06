@@ -14,6 +14,7 @@ import {
   parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 import { WebSocket, type RawData } from 'ws';
 
 /** Plugin-specific backend_config. */
@@ -351,9 +352,14 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * Single Web API entry point: `POST <api_url>/<method>`, `Authorization: Bearer <token>`, JSON
-   * body. Every Slack response carries `ok`; `ok:false` throws with Slack's `error` code.
-   * Transparently retries HTTP 429 honoring the `Retry-After` header (SECONDS). Retries stop the
+   * Single Web API entry point: `POST <api_url>/<method>`, `Authorization: Bearer <token>`, body
+   * `application/x-www-form-urlencoded` — Slack accepts form encoding UNIVERSALLY (incl.
+   * `chat.postMessage`), while read methods like `conversations.history`/`users.lookupByEmail`
+   * silently IGNORE JSON args, so every method is form-encoded to match the official SDK (scalar
+   * args → strings; array/object args → `JSON.stringify`). Every Slack response carries `ok`;
+   * `ok:false` throws with Slack's `error` code — that envelope shape is interpreted HERE, not in
+   * the shared helper. Transparently retries HTTP 429 honoring the `Retry-After` header (SECONDS,
+   * `> 0`-guarded so a header-less 429 backs off the default, never `delay(0)`). Retries stop the
    * moment we disconnect, so an aborted test never leaves a loop hammering the API.
    */
   private async api<T extends { ok: boolean }>(
@@ -362,25 +368,32 @@ export class SlackPlugin implements BackendPlugin {
     auth: 'bot' | 'app' = 'bot',
   ): Promise<T> {
     const token = auth === 'app' ? this.appToken : this.botToken;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    };
     if (token !== undefined) headers.Authorization = `Bearer ${token}`;
     const url = `${this.apiUrl}/${method}`;
 
-    for (;;) {
-      const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-      if (res.status === 429) {
-        if (this.stopped) throw new Error(`Slack ${method} → 429 (disconnected)`);
-        const retryAfterSec = Number(res.headers.get('retry-after'));
-        await delay(Number.isFinite(retryAfterSec) ? Math.min(retryAfterSec * 1000, 5000) : 500);
-        continue;
-      }
-      if (!res.ok) {
-        throw new Error(`Slack ${method} → HTTP ${res.status}: ${await res.text()}`);
-      }
-      const json = (await res.json()) as T & { error?: string };
-      if (!json.ok) throw new Error(`Slack ${method} → ${json.error ?? 'unknown_error'}`);
-      return json;
+    // Slack form convention: scalar → string; array/object arg → JSON.stringify(value).
+    const form = new URLSearchParams();
+    for (const [k, v] of Object.entries(body)) {
+      if (v === undefined) continue;
+      form.set(k, typeof v === 'string' ? v : JSON.stringify(v));
     }
+
+    const res = await fetchWithRetry(
+      url,
+      { method: 'POST', headers, body: form.toString() },
+      {
+        label: `Slack ${method}`,
+        // Stop retrying once disconnected, so an aborted test never leaves a loop hammering the API.
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+      },
+    );
+    const json = (await res.json()) as T & { error?: string };
+    if (!json.ok) throw new Error(`Slack ${method} → ${json.error ?? 'unknown_error'}`);
+    return json;
   }
 
   private require(): void {
@@ -419,4 +432,14 @@ function slackToMessage(topic: Topic, m: SlackMessage): Message {
   };
 }
 
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/**
+ * Slack 429s carry `Retry-After` (SECONDS) in the header; there is no body retry field. Honor the
+ * header only when it is a positive finite number — an absent/empty header parses as
+ * `Number(null|'') === 0`, which must NOT be treated as "retry immediately" (BUG-41's 0 ms tight
+ * loop). Cap the wait at 5s; otherwise fall to the 500 ms default.
+ */
+function readRetryAfter(res: Response): number {
+  const header = Number(res.headers.get('retry-after')); // seconds
+  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
+  return 500;
+}

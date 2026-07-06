@@ -15,6 +15,7 @@ import {
   parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -343,24 +344,22 @@ export class ZulipPlugin implements BackendPlugin {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
 
-    for (;;) {
-      const res = await fetch(url, {
+    return fetchWithRetry(
+      url,
+      {
         method,
         headers,
         body: opts?.form !== undefined ? new URLSearchParams(opts.form).toString() : undefined,
         signal: opts?.signal,
-      });
-      if (res.status === 429) {
+      },
+      {
+        label: `Zulip ${method} ${path}`,
         // Stop retrying once disconnected — don't compete for the rate-limit budget post-teardown.
-        if (this.stopped) throw new Error(`Zulip ${method} ${path} → 429 (disconnected)`);
-        const retryMs = await readRetryAfter(res);
-        await delay(retryMs);
-        continue;
-      }
-      if (res.ok || (opts?.allowStatuses?.includes(res.status) ?? false)) return res;
-      const text = await res.text();
-      throw new Error(`Zulip ${method} ${path} → ${res.status}: ${text}`);
-    }
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+        allowStatuses: opts?.allowStatuses,
+      },
+    );
   }
 }
 
@@ -390,5 +389,3 @@ async function readRetryAfter(res: Response): Promise<number> {
   }
   return 500;
 }
-
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
