@@ -6,6 +6,7 @@ import { Allowlist } from '../allowlist.js';
 import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
+import { NoSuchTopicError } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { registerTools } from './tools.js';
 
@@ -375,6 +376,35 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     })) as ToolText;
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toContain('topic not allowed');
+  });
+
+  it('surfaces an arbitrary backend failure as an isError result, not a fake-empty roster', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
+    // A real outage (connection loss, auth expiry, DB error) rejects fetchRecent — it must NOT
+    // collapse into a healthy `{ users: [], truncated: false }` the agent would trust (BUG-13).
+    plugin.fetchRecent = async () => {
+      throw new Error('backend down');
+    };
+    const res = (await client.callTool({
+      name: 'parley_list_users',
+      arguments: {},
+    })) as ToolText;
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain('backend down');
+  });
+
+  it('maps an explicit NoSuchTopicError to an empty roster (presence topic genuinely absent)', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
+    // Only NoSuchTopicError means "topic not present yet" ⇒ nobody seen; this is a normal result.
+    plugin.fetchRecent = async () => {
+      throw new NoSuchTopicError(DEFAULT_PRESENCE_TOPIC);
+    };
+    const res = (await client.callTool({
+      name: 'parley_list_users',
+      arguments: {},
+    })) as ToolText;
+    expect(res.isError).toBeFalsy();
+    expect(parse(res)).toEqual({ users: [], truncated: false });
   });
 });
 
