@@ -181,6 +181,70 @@ describe('remote OIDC front door (delegated resource server)', () => {
     expect(urlAud.status).toBe(401);
   });
 
+  it('authorizes valid tokens when the configured issuer has a trailing slash (BUG-24)', async () => {
+    // Issuer configured WITH a trailing slash; the fake IdP mints `iss` WITHOUT one. The verifier
+    // must be built from the discovery document's canonical issuer, or jose's exact `iss` match
+    // rejects every token (healthy boot, 100% token rejection).
+    await boot({ issuer: `${idp.issuer}/` });
+    const res = await postMcp({ Authorization: `Bearer ${await idp.mint({ aud: `${origin}/mcp` })}` });
+    expect(res.status).toBe(200);
+  });
+
+  it('enforces the identity gate end to end: a mismatched subject is 401 (SEC-05)', async () => {
+    await boot({ allowed_subjects: ['owner-sub'] });
+    const aud = `${origin}/mcp`;
+    // Default mint uses sub 'owner-sub' → allowed.
+    const ok = await postMcp({ Authorization: `Bearer ${await idp.mint({ aud })}` });
+    expect(ok.status).toBe(200);
+    // A different realm subject with an otherwise-valid token is rejected.
+    const denied = await postMcp({
+      Authorization: `Bearer ${await idp.mint({ aud, sub: 'intruder-sub' })}`,
+    });
+    expect(denied.status).toBe(401);
+  });
+
+  it('rejects a discovery jwks_uri off the issuer origin, unless explicitly pinned (SEC-19)', async () => {
+    const port = await freePort();
+    origin = `http://127.0.0.1:${port}`;
+    plugin = new FakePlugin();
+    await plugin.connect({});
+    const offOrigin = 'https://cdn.example.com/jwks';
+    const discovery = {
+      issuer: idp.issuer,
+      authorization_endpoint: `${idp.issuer}/authorize`,
+      token_endpoint: `${idp.issuer}/token`,
+      jwks_uri: offOrigin, // different origin than the issuer
+      response_types_supported: ['code'],
+      subject_types_supported: ['public'],
+      id_token_signing_alg_values_supported: ['RS256'],
+      code_challenge_methods_supported: ['S256'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+    };
+    const fetchFn = (async () =>
+      new Response(JSON.stringify(discovery), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch;
+
+    // Discovery-supplied off-origin JWKS → fail closed at boot.
+    await expect(
+      createOidcRemoteApp(plugin, baseCfg(), {
+        publicUrl: new URL(origin),
+        oidc: { issuer: idp.issuer, clock_skew_s: 30 },
+        fetchFn,
+      }),
+    ).rejects.toThrow(/jwks_uri origin/);
+
+    // Explicit config override is the trusted pin (e.g. a CDN-hosted JWKS) → accepted.
+    remote = await createOidcRemoteApp(plugin, baseCfg(), {
+      publicUrl: new URL(origin),
+      oidc: { issuer: idp.issuer, clock_skew_s: 30, jwks_uri: offOrigin },
+      fetchFn,
+    });
+    await remote.listen(port);
+    expect(remote.authorizationServer.href).toBe(new URL(idp.issuer).href);
+  });
+
   it('fails fast at boot when the issuer is unreachable', async () => {
     const port = await freePort();
     plugin = new FakePlugin();
@@ -209,7 +273,9 @@ describe('createRemoteAuthApp selector', () => {
     const cfg = parseConfig({
       identity: { handle: 'agent' },
       topics: ['ctx'],
-      auth: { mode: 'oidc', oidc: { issuer: idp.issuer } },
+      // SEC-05: an identity gate is now mandatory for oidc mode. owner-sub matches the fake
+      // IdP's default subject; this test only checks PRM, so the gate value is otherwise inert.
+      auth: { mode: 'oidc', oidc: { issuer: idp.issuer, allowed_subjects: ['owner-sub'] } },
     });
     remote = (await createRemoteAuthApp(plugin, cfg, {
       publicUrl: new URL(origin),
