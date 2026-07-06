@@ -18,6 +18,7 @@ import { delay } from '@sharptrick/parley-net-util';
 // `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
 // declared dependency keeps the package self-contained (no extra direct dep on @xmpp/xml).
 import { client, xml } from '@xmpp/client';
+import { randomUUID } from 'node:crypto';
 
 /** Plugin-specific backend_config. */
 export interface XmppBackendConfig {
@@ -140,8 +141,8 @@ export class XmppPlugin implements BackendPlugin {
   private readonly pendingJoins = new Map<string, PendingJoin>();
   /** origin-id -> resolver awaiting the MUC reflection that carries the archive id. */
   private readonly pendingPosts = new Map<string, PendingPost>();
-  /** MAM queryid -> collector for the streamed `<result>` items. */
-  private readonly mamCollectors = new Map<string, MamItem[]>();
+  /** MAM queryid -> collector for the streamed `<result>` items, bound to the room queried. */
+  private readonly mamCollectors = new Map<string, { room: string; items: MamItem[] }>();
   /** roomJid -> live subscription(s). */
   private readonly subscriptions = new Map<string, Subscription>();
 
@@ -287,7 +288,7 @@ export class XmppPlugin implements BackendPlugin {
     // MAM streamed result? (outer stanza is a normal message addressed to us)
     const result = stanza.getChild('result', NS_MAM);
     if (result !== undefined) {
-      this.onMamResult(result);
+      this.onMamResult(result, bareOf(stanza.attrs.from ?? ''));
       return;
     }
 
@@ -336,14 +337,16 @@ export class XmppPlugin implements BackendPlugin {
       .catch(() => undefined);
   }
 
-  private onMamResult(result: El): void {
+  private onMamResult(result: El, fromBare: string): void {
     const collector = this.mamCollectors.get(result.attrs.queryid ?? '');
     if (collector === undefined) return;
+    // XEP-0313 security: only accept archive results from the room we queried.
+    if (fromBare !== collector.room) return;
     const forwarded = result.getChild('forwarded', NS_FORWARD);
     const inner = forwarded?.getChild('message');
     if (inner === undefined) return;
     const delay = forwarded?.getChild('delay', NS_DELAY);
-    collector.push({
+    collector.items.push({
       archId: result.attrs.id ?? '',
       from: inner.attrs.from ?? '',
       body: inner.getChildText('body') ?? '',
@@ -396,9 +399,9 @@ export class XmppPlugin implements BackendPlugin {
     opts: { after?: string; before?: boolean; max: number },
   ): Promise<{ items: MamItem[]; complete: boolean }> {
     const room = this.roomJid(topic);
-    const queryid = `q-${rand()}`;
+    const queryid = randomUUID();
     const collector: MamItem[] = [];
-    this.mamCollectors.set(queryid, collector);
+    this.mamCollectors.set(queryid, { room, items: collector });
 
     const rsm: unknown[] = [];
     if (opts.after !== undefined) rsm.push(xml('after', {}, opts.after));
