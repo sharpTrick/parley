@@ -12,6 +12,7 @@ import {
   type Message,
   type MessageHandler,
   parseMentions,
+  safeName,
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
@@ -255,7 +256,7 @@ export class MatrixPlugin implements BackendPlugin {
   private ensureRoom(topic: Topic): Promise<string> {
     // In shared mode all topics collapse onto one room → one cache key, one resolve.
     const localpart =
-      this.sharedLocalpart ?? `parley_${sanitizeAlias(topic)}`;
+      this.sharedLocalpart ?? `parley_${safeName(topic, sanitizeAlias)}`;
     const key = this.sharedLocalpart !== undefined ? ' shared' : (topic as string);
     const existing = this.rooms.get(key);
     if (existing !== undefined) return existing;

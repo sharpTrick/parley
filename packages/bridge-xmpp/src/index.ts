@@ -12,6 +12,7 @@ import {
   type Message,
   type MessageHandler,
   parseMentions,
+  safeName,
   type Topic,
 } from '@sharptrick/parley-core';
 // `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
@@ -494,7 +495,7 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   private roomJid(topic: Topic): string {
-    return `${sanitizeLocal(topic)}@${this.mucService}`;
+    return `${safeName(topic, sanitizeLocal)}@${this.mucService}`;
   }
 
   private require(): XmppClient {
