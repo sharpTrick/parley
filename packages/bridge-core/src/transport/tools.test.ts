@@ -330,6 +330,39 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     expect(out.users).toEqual([]);
   });
 
+  it('SEC-08 — a beat of 64 nested-quantifier postTopics does not hang list_users (bounded time)', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // A hostile peer plants the maximum 64 catastrophic-backtracking regex sources on the presence
+    // topic (raw backend write — outside the tool allowlist), then the reader calls list_users. On
+    // the unfixed code this `.test` loop never returns; the ReDoS screen must make the call resolve
+    // in bounded wall-clock time (the wall-clock assertion, not a green suite, is the proof).
+    const evil = '((([a-z-]+)+)+)+[0-9]';
+    await postBeat(plugin, 'attacker', ['some-other-ctx'], 'hello', NOW - 1_000, Array<string>(64).fill(evil));
+    const t0 = performance.now();
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
+    expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
+  });
+
+  it('SEC-08 — a beat of 64 BOUNDED exact-count nested postTopics also does not hang list_users', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` uses no unbounded OUTER quantifier
+    // (only `*` inside a bounded exact `{40}`), so it slipped the earlier screen, yet V8 unrolls the
+    // `{40}` into 40 sequential `*`-bodies and the `.test` hangs the whole loop for tens of seconds on
+    // the reader's own short topic. The hardened screen rejects a risky body repeated `>= 2` times, so
+    // the call must resolve in bounded wall-clock time (the assertion, not a green suite, is the proof).
+    const evil = '([a-z-]*){40}[0-9]';
+    await postBeat(plugin, 'attacker', ['some-other-ctx'], 'hello', NOW - 1_000, Array<string>(64).fill(evil));
+    const t0 = performance.now();
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
+    expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
+  });
+
   it('scopes to a single topic when `topic` is given', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
     await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);

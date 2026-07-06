@@ -197,21 +197,171 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
 
 /**
  * Max length of an untrusted peer post-pattern source we will compile. A beat's `postTopics` are
- * attacker-controlled regex sources (inbound is untrusted, DESIGN §14); a catastrophic-backtracking
- * pattern is a ReDoS risk. We bound source length (and count, via {@link MAX_RECORD_TOPICS} at
- * decode) and only ever match these against our OWN short, bounded topic names — never message text.
+ * attacker-controlled regex sources (inbound is untrusted, DESIGN §14). This length cap and the
+ * per-record count cap ({@link MAX_RECORD_TOPICS} at decode) bound how MUCH a hostile beat can carry
+ * — they do NOT bound backtracking: a 20-char nested-quantifier source such as `((([a-z-]+)+)+)+[0-9]`
+ * hangs Node's single-threaded engine for seconds against even a short 15-char topic. The
+ * backtracking bound is {@link isRedosSafeSource}, applied before we ever compile a source.
  */
 const MAX_PEER_PATTERN_LEN = 512;
 
 /**
+ * Most unbounded (`*` / `+` / `{n,}`) quantifiers we allow in one untrusted source. A handful is
+ * ample for a real topic pattern; capping the count bounds the polynomial-backtracking degree of even
+ * a nesting-free source (sequential `.*.*…`).
+ */
+const MAX_PEER_PATTERN_QUANTIFIERS = 4;
+
+/**
+ * Longest input string we ever feed to an untrusted peer pattern. Our own topic names are short, so
+ * clamping the compared string caps the worst-case work of a (screened, low-degree) match no matter
+ * how long a self-configured topic is.
+ */
+const MAX_PEER_MATCH_INPUT = 64;
+
+/**
+ * Conservative structural ReDoS screen for an untrusted regex source, run BEFORE compiling it. Node's
+ * `RegExp` backtracks, so a hostile source can wedge the whole single-threaded process; catastrophic
+ * blowup needs one of two structural shapes and we reject both:
+ *   - a quantifier that lets a group whose body itself contains a quantifier or alternation repeat
+ *     TWO OR MORE times — the exponential/polynomial signature. This covers an UNBOUNDED outer
+ *     quantifier (`(x+)+`, `(a|a)*`, `(x*){2,}`) AND a BOUNDED exact/range count `>= 2` (`(x*){15}`,
+ *     `(x?){250}`, `(x+){2,5}`): V8 unrolls `{n}`/`{n,m}` into up to n sequential copies of the risky
+ *     body, so a bounded exact count over a `*`/`?`-body is just as catastrophic as an unbounded one
+ *     (empirically `([a-z-]*){15}[0-9]` hangs Node for ~8s on a 15-char input). Only a bound of `<= 1`
+ *     (`?`, `{0,1}`, `{1}`) is safe, since a body matched at most once cannot compound; or
+ *   - more than {@link MAX_PEER_PATTERN_QUANTIFIERS} unbounded quantifiers (`.*.*…`) — a high-degree
+ *     polynomial blowup. (Because a risky body repeated `>= 2` times is rejected above, any
+ *     multiplicity from unrolling a `{n}` over an unbounded-quantifier body is already excluded — so
+ *     the unbounded count here need not itself be scaled by the unroll factor.)
+ * Character-class interiors and escaped metacharacters are treated as literal. It is deliberately
+ * conservative (it may reject some safe-but-exotic sources); a legitimate topic pattern never needs a
+ * nested quantifier. Anything that still slips through as un-compilable is caught by the `try/catch`
+ * in {@link compilePeerPatterns}.
+ */
+function isRedosSafeSource(src: string): boolean {
+  let unbounded = 0;
+  // Per-open-group flag: did this group's body contain a quantifier or alternation (directly, or
+  // inherited from a nested non-quantified subgroup)? A quantified group with a risky body is the
+  // catastrophic case. Index 0 is the implicit top level (never itself quantified).
+  const risky: boolean[] = [false];
+  // Parse a `{...}` quantifier at `i`; null when `{` is a literal brace, not a valid quantifier.
+  // `unbounded` = open-ended reps (a comma is present, `{n,}`/`{n,m}`) — preserved for the polynomial
+  // count. `max` = the largest repetition the quantifier permits (Infinity when open-ended) — used to
+  // decide whether a risky body may repeat `>= 2` times.
+  const readBrace = (i: number): { len: number; unbounded: boolean; max: number } | null => {
+    const m = /^\{(\d*)(,(\d*))?\}/.exec(src.slice(i));
+    if (!m || (m[1] === '' && m[3] === undefined)) return null; // `{}` / bare `{` ⇒ literal
+    const min = m[1] === '' ? 0 : Number.parseInt(m[1]!, 10);
+    const hasComma = m[2] !== undefined;
+    // `{n}` ⇒ exactly n; `{n,}` ⇒ open-ended (Infinity); `{n,m}` ⇒ m; `{,m}` ⇒ m (min defaulted to 0).
+    const max = !hasComma ? min : m[3] === '' ? Number.POSITIVE_INFINITY : Number.parseInt(m[3]!, 10);
+    return { len: m[0].length, unbounded: hasComma, max };
+  };
+  for (let i = 0; i < src.length; ) {
+    const ch = src[i]!;
+    if (ch === '\\') {
+      i += 2; // escaped atom ⇒ literal
+      continue;
+    }
+    if (ch === '[') {
+      // Character class: everything up to the closing `]` is literal (quantifier chars included).
+      i++;
+      if (src[i] === '^') i++;
+      if (src[i] === ']') i++; // a leading `]` is a literal class member
+      while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
+      i++; // consume `]`
+      continue;
+    }
+    if (ch === '(') {
+      risky.push(false);
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      const body = risky.pop() ?? false;
+      i++;
+      let quantified = false;
+      let quantUnbounded = false;
+      let quantMax = 1; // reps the group's quantifier permits (1 = none, `?`, `{0,1}`, `{1}` — all safe)
+      const q = src[i];
+      if (q === '*' || q === '+') {
+        quantified = true;
+        quantUnbounded = true;
+        quantMax = Number.POSITIVE_INFINITY;
+        i++;
+      } else if (q === '?') {
+        quantified = true;
+        i++;
+      } else if (q === '{') {
+        const b = readBrace(i);
+        if (b) {
+          quantified = true;
+          quantUnbounded = b.unbounded;
+          quantMax = b.max;
+          i += b.len;
+        }
+      }
+      if (quantified && (src[i] === '?' || src[i] === '+')) i++; // lazy / possessive suffix
+      // A group with a risky body (its own quantifier or alternation) becomes catastrophic the moment
+      // it can repeat TWO OR MORE times — whether the outer quantifier is unbounded (`(x+)+`) OR a
+      // bounded exact/range count `>= 2` (`(x*){15}`, `(x?){250}`), which V8 unrolls into sequential
+      // copies of the risky body. Reject both; only a bound of `<= 1` (`?`/`{0,1}`/`{1}`) is safe.
+      if (body && quantMax >= 2) return false;
+      if (quantified && quantUnbounded) unbounded++;
+      const parent = risky.length - 1;
+      risky[parent] = risky[parent] || body || quantified;
+      continue;
+    }
+    if (ch === '|') {
+      risky[risky.length - 1] = true;
+      i++;
+      continue;
+    }
+    if (ch === '*' || ch === '+') {
+      // Unbounded quantifier on a single preceding atom.
+      unbounded++;
+      risky[risky.length - 1] = true;
+      i++;
+      if (src[i] === '?' || src[i] === '+') i++;
+      continue;
+    }
+    if (ch === '?') {
+      risky[risky.length - 1] = true;
+      i++;
+      continue;
+    }
+    if (ch === '{') {
+      const b = readBrace(i);
+      if (b) {
+        if (b.unbounded) {
+          unbounded++;
+          risky[risky.length - 1] = true;
+        }
+        i += b.len;
+        if (src[i] === '?') i++; // lazy suffix
+        continue;
+      }
+      i++; // literal brace
+      continue;
+    }
+    i++; // literal char
+  }
+  return unbounded <= MAX_PEER_PATTERN_QUANTIFIERS;
+}
+
+/**
  * Compile a peer's advertised `postTopics` sources into full-match regexes (`^(?:src)$`, mirroring
- * the Allowlist), skipping any that are over-long or un-compilable so a hostile beat can never crash
- * or hang `parley_list_users`.
+ * the Allowlist). Each source is length-capped ({@link MAX_PEER_PATTERN_LEN}), screened for
+ * catastrophic backtracking ({@link isRedosSafeSource}), and wrapped in a `try/catch`; any source
+ * that is over-long, screens as unsafe, or fails to compile is skipped — so a hostile beat can never
+ * crash or hang `parley_list_users`.
  */
 function compilePeerPatterns(sources: readonly string[]): RegExp[] {
   const out: RegExp[] = [];
   for (const src of sources) {
     if (src.length > MAX_PEER_PATTERN_LEN) continue;
+    if (!isRedosSafeSource(src)) continue; // reject catastrophic-backtracking sources up front
     try {
       out.push(new RegExp(`^(?:${src})$`));
     } catch {
@@ -219,6 +369,15 @@ function compilePeerPatterns(sources: readonly string[]): RegExp[] {
     }
   }
   return out;
+}
+
+/**
+ * Test compiled untrusted patterns against a bounded prefix of `input` (our topic names are short;
+ * clamping the compared string keeps even a screened, low-degree match cheap regardless of input).
+ */
+function reachesBounded(patterns: readonly RegExp[], input: string): boolean {
+  const bounded = input.length > MAX_PEER_MATCH_INPUT ? input.slice(0, MAX_PEER_MATCH_INPUT) : input;
+  return patterns.some((re) => re.test(bounded));
 }
 
 /**
@@ -231,10 +390,12 @@ function compilePeerPatterns(sources: readonly string[]): RegExp[] {
  *    topic it subscribes to (`opts.canPostTo`), OR it can post — per its advertised patterns — to a
  *    topic I subscribe to (`opts.mySubscribedTopics`).
  *
- * Peer `postTopics` are untrusted regex sources; they are compiled defensively via
- * {@link compilePeerPatterns} (length-capped, full-match-anchored) and only ever matched against the
- * caller's own bounded topic names. Passing `canPostTo`/`mySubscribedTopics` as plain
- * values/predicates keeps `engine/` free of any dependency on `Allowlist`.
+ * Peer `postTopics` are untrusted regex sources; {@link compilePeerPatterns} length-caps them,
+ * screens out catastrophic-backtracking sources ({@link isRedosSafeSource}), and full-match-anchors
+ * whatever survives, and {@link reachesBounded} then tests them against only a bounded prefix of the
+ * caller's own topic names — so a hostile beat cannot wedge the loop. Passing
+ * `canPostTo`/`mySubscribedTopics` as plain values/predicates keeps `engine/` free of any dependency
+ * on `Allowlist`.
  */
 export function filterReachable(
   roster: RosterEntry[],
@@ -251,11 +412,11 @@ export function filterReachable(
     if (opts.scope !== undefined) {
       return (
         e.topics.includes(opts.scope) ||
-        compilePeerPatterns(e.postTopics).some((re) => re.test(opts.scope!))
+        reachesBounded(compilePeerPatterns(e.postTopics), opts.scope)
       );
     }
     if (e.topics.some((t) => opts.canPostTo(t))) return true;
     const theirReach = compilePeerPatterns(e.postTopics);
-    return opts.mySubscribedTopics.some((mt) => theirReach.some((re) => re.test(mt)));
+    return opts.mySubscribedTopics.some((mt) => reachesBounded(theirReach, mt));
   });
 }

@@ -5,7 +5,7 @@ import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
 import { computeRoster, filterReachable } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
-import { filterHandles } from '../identity-filter.js';
+import { filterHandles, MAX_GLOB_LEN } from '../identity-filter.js';
 import {
   asBackendMsgId,
   asCursor,
@@ -254,6 +254,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       inputSchema: {
         filter: z
           .string()
+          .max(MAX_GLOB_LEN) // bound the glob before it reaches the matcher (SEC-15 ReDoS input cap)
           .optional()
           .describe('Optional glob over handles, e.g. "claude-*". Omit for all.'),
         topic: z
