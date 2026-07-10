@@ -70,9 +70,6 @@ interface AuthTestResponse {
 const isPlainMessage = (m: SlackMessage): boolean =>
   m.type === 'message' && (m.subtype === undefined || m.subtype === 'bot_message');
 
-/** Sanity bound on `conversations.history` pagination — never spin forever on a hostile server. */
-const MAX_HISTORY_PAGES = 100;
-
 /**
  * Slack backend (DESIGN §6/§9) over the raw Web API (`fetch`) + Socket Mode (`ws`) — no Slack SDK.
  *
@@ -157,13 +154,17 @@ export class SlackPlugin implements BackendPlugin {
    *
    * COST CAVEAT: Slack returns pages NEWEST-first and `response_metadata.next_cursor` pages
    * FURTHER BACK in time, while the seam wants the OLDEST unseen page (ascending, resuming after
-   * `since`). So with `since` set we must assemble the whole `(since, now]` range — page until the
-   * cursor runs out — then sort ascending and take the FIRST `limit` entries. Taking the newest
-   * `limit` instead would permanently skip the middle of a long backlog: the skipped span sits
-   * below the returned `nextCursor` and no later catch-up would ever revisit it. A reader that's
-   * been offline across a huge backlog therefore pays O(backlog / page) requests for one call;
-   * bounded by {@link MAX_HISTORY_PAGES} as a sanity stop. Without `since` only the most recent
-   * `limit` are needed, so paging stops as soon as enough have been collected.
+   * `since`). So with `since` set we must page ALL the way to the OLDEST end of `(since, now]` —
+   * until the cursor runs out — then sort ascending and take the FIRST `limit` entries. There is NO
+   * page cap on this walk: capping it would return the newest `limit` of a truncated set and set
+   * `nextCursor` ABOVE the never-fetched older messages, permanently skipping the middle of a long
+   * backlog (the skipped span sits below `nextCursor` and no later catch-up would ever revisit it —
+   * BUG-18). A reader that's been offline across a huge backlog therefore pays O(backlog / page)
+   * requests for one call, but memory stays O(limit): since pages arrive newest-first, the oldest
+   * live at the tail, so we retain only a rolling tail of ~`limit + page_size` collected messages
+   * and discard the newer ones as older pages arrive. Without `since` only the most recent `limit`
+   * are needed, so paging stops as soon as enough PLAIN (surfaced) messages have been collected —
+   * counting plain, not raw, so a system-subtype-heavy page can't cut the window short (BUG-31).
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
@@ -173,16 +174,28 @@ export class SlackPlugin implements BackendPlugin {
 
     const collected: SlackMessage[] = [];
     let pageCursor: string | undefined;
-    for (let page = 0; page < MAX_HISTORY_PAGES; page++) {
+    for (;;) {
       const body: Record<string, unknown> = { channel, limit: 200 };
       if (args.since !== undefined) body.oldest = args.since; // EXCLUSIVE (no `inclusive`)
       if (pageCursor !== undefined) body.cursor = pageCursor;
       const resp = await this.api<HistoryResponse>('conversations.history', body);
       collected.push(...(resp.messages ?? []));
       pageCursor = resp.response_metadata?.next_cursor || undefined;
-      if (pageCursor === undefined) break;
-      // Newest-first: without `since` the first `limit` collected ARE the most recent window.
-      if (!resumeAfterSince && collected.length >= limit) break;
+
+      if (!resumeAfterSince) {
+        // Newest-first default window: stop once `limit` PLAIN (surfaced) messages are in hand.
+        // Counting RAW here would let a system-subtype-heavy first page (channel_join, …) end the
+        // walk short of a full window, dropping the older plain messages below `nextCursor` (BUG-31).
+        if (collected.filter(isPlainMessage).length >= limit) break;
+        if (pageCursor === undefined) break;
+      } else {
+        // Resume-after-`since`: walk to the OLDEST end so `nextCursor` never sits above unfetched
+        // history (BUG-18). Pages are newest-first, so the oldest live at the tail; keep only the
+        // oldest ~`limit + page_size` so memory stays O(limit) while the request count is the
+        // documented O(backlog / page) cost caveat.
+        if (collected.length > limit + 200) collected.splice(0, collected.length - (limit + 200));
+        if (pageCursor === undefined) break; // NO page cap: walk to cursor exhaustion.
+      }
     }
 
     // Defensive ascending re-sort after multi-page assembly (pages arrive newest-first; never
@@ -279,13 +292,19 @@ export class SlackPlugin implements BackendPlugin {
       });
       ws.on('close', () => {
         if (this.stopped || this.ws !== ws) return;
-        // Socket Mode URLs are SINGLE-USE: never redial the old URL; mint a fresh one.
+        // Socket Mode URLs are SINGLE-USE: never redial the old URL.
         this.wsReady = undefined;
-        void this.reconnect();
         if (!settled) {
+          // Pre-`hello` close: ONLY reject — the owning caller (the first `subscribe` OR the
+          // existing `reconnect` loop) retries. Spawning `reconnect()` here too would stack a
+          // second loop per failed attempt during an outage, each independently clearing
+          // `wsReady` and defeating the exponential backoff (BUG-30).
           settled = true;
           reject(new Error('Slack Socket Mode connection closed before hello'));
+          return;
         }
+        // Post-`hello` close: this connection was live; mint a fresh single-use URL.
+        void this.reconnect();
       });
     });
   }
