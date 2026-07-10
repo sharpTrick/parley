@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SqlitePlugin } from './index.js';
 
@@ -104,6 +104,85 @@ describe('SqlitePlugin (seam smoke)', () => {
     // AUTOINCREMENT never reuses ids, so the next post's cursor still strictly increases.
     const id3 = await p.post(T, me, 'new-after-prune');
     expect(Number(id3)).toBeGreaterThan(Number(lastOldId));
+  });
+});
+
+// A fresh in-memory plugin — `:memory:` is a brand-new DB per connection, which is exactly the
+// "DB reset" scenario BUG-23 is about (rowids restart at 1).
+async function memPlugin(): Promise<SqlitePlugin> {
+  const p = new SqlitePlugin();
+  await p.connect({ db_path: ':memory:', poll_interval_ms: 10 });
+  open.push(p);
+  return p;
+}
+
+describe('SqlitePlugin cursor integrity (BUG-22/23/40)', () => {
+  it('BUG-22: a malformed/foreign cursor throws instead of silently wedging catch-up', async () => {
+    const p = await plugin();
+    await p.post(T, me, 'a');
+    await p.post(T, me, 'b');
+    // Current (pre-fix) code returns { messages: [], nextCursor: 's123_456' } here — rows present,
+    // no throw — which core then re-persists, wedging the topic forever. The fix rejects it loudly.
+    await expect(p.fetchRecent({ topic: T, since: asCursor('s123_456') })).rejects.toThrow(
+      /parley-sqlite: malformed cursor/,
+    );
+    await expect(p.fetchRecent({ topic: T, since: asCursor('m123abc') })).rejects.toThrow(
+      /malformed cursor 'm123abc'/,
+    );
+  });
+
+  it('BUG-22: an empty-string cursor throws instead of replaying all history', async () => {
+    const p = await plugin();
+    await p.post(T, me, 'a');
+    await p.post(T, me, 'b');
+    // Pre-fix: Number('') === 0 → `id > 0` → the whole topic replays. `^\d+$` rejects '' outright.
+    await expect(p.fetchRecent({ topic: T, since: asCursor('') })).rejects.toThrow(
+      /parley-sqlite: malformed cursor/,
+    );
+  });
+
+  it('BUG-23: a stale cursor across a DB reset falls back instead of skipping new messages', async () => {
+    // Instance A holds a high cursor from before the reset.
+    const before = await memPlugin();
+    for (const c of ['1', '2', '3', '4', '5']) await before.post(T, me, c);
+    const staleCursor = (await before.fetchRecent({ topic: T })).nextCursor; // rowid 5
+    expect(staleCursor).toBe('5');
+    await before.disconnect();
+
+    // The DB is recreated (fresh `:memory:`): teammates post while A was offline; ids restart at 1.
+    const after = await memPlugin();
+    for (const c of ['post-reset-1', 'post-reset-2', 'post-reset-3']) await after.post(T, me, c);
+
+    // Pre-fix: `id > 5` against ids 1..3 → [] and A never sees the new messages. The fix detects
+    // the stale cursor (5 > high-water 3) and falls back to the recent window, surfacing them.
+    const caught = await after.fetchRecent({ topic: T, since: staleCursor });
+    expect(caught.messages.map((m) => m.content)).toEqual([
+      'post-reset-1',
+      'post-reset-2',
+      'post-reset-3',
+    ]);
+    expect(caught.messages).not.toEqual([]);
+    // nextCursor is a fresh, well-formed cursor for this DB — the wedge self-heals.
+    expect(caught.nextCursor).toBe('3');
+  });
+
+  it('BUG-40: minted cursor is a bare rowid that round-trips back through fetchRecent', async () => {
+    const p = await plugin();
+    const id1 = await p.post(T, me, 'a');
+    const id2 = await p.post(T, me, 'b');
+    // No Number() artifacts (NaN / precision): backendMsgId is a pure decimal rowid the seam
+    // validator accepts.
+    expect(id1).toMatch(/^\d+$/);
+    expect(id2).toMatch(/^\d+$/);
+
+    const { messages } = await p.fetchRecent({ topic: T });
+    expect(messages[0]!.cursor).toMatch(/^\d+$/);
+    expect(messages[0]!.backendMsgId).toBe(id1);
+
+    // Feed a freshly-minted cursor straight back in as `since` — well-formed, non-throwing, exclusive.
+    const round = await p.fetchRecent({ topic: T, since: messages[0]!.cursor });
+    expect(round.messages.map((m) => m.content)).toEqual(['b']);
+    expect(round.nextCursor).toBe(id2);
   });
 });
 

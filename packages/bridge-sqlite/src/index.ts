@@ -19,7 +19,16 @@ import { type MessageRow, SCHEMA } from './schema.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
 export interface SqliteBackendConfig {
-  /** Path to the SQLite file. Default `parley.db` in the cwd. `:memory:` is single-process only. */
+  /**
+   * Path to the SQLite file. Default `parley.db` in the cwd. `:memory:` is single-process only
+   * AND a brand-new database every process: its `AUTOINCREMENT` rowids restart at 1, so a cursor
+   * persisted by core from a previous run no longer lines up with this DB's ids. The same is true
+   * of a recreated/wiped file. Because core's read-state outlives the DB, **clear any persisted
+   * read-state whenever the DB is reset** — otherwise a stale high cursor would reference ids this
+   * DB never minted. `fetchRecent` guards this case (a `since` past the DB's high-water mark falls
+   * back to the recent window instead of silently skipping every post after the reset), but
+   * clearing stale read-state on reset is still the correct operational step.
+   */
   db_path?: string;
   /** Poll interval for the live `subscribe` loop. Latency knob only — no correctness impact (§9). */
   poll_interval_ms?: number;
@@ -57,6 +66,7 @@ export class SqlitePlugin implements BackendPlugin {
   private selectRecentStmt?: SqlStatement;
   private maxIdStmt?: SqlStatement;
   private pruneStmt?: SqlStatement;
+  private seqStmt?: SqlStatement;
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SqliteBackendConfig;
@@ -80,6 +90,11 @@ export class SqlitePlugin implements BackendPlugin {
     );
     this.maxIdStmt = driver.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM messages WHERE topic = ?');
     this.pruneStmt = driver.prepare('DELETE FROM messages WHERE ts < ?');
+    // High-water mark of the AUTOINCREMENT sequence — the largest rowid this DB lifetime has
+    // ever minted (absent until the first insert). Lets `fetchRecent` detect a stale/foreign
+    // `since` cursor minted against a previous DB (a recreated file, or `:memory:` — a fresh DB
+    // every process) instead of silently skipping every post after the reset (BUG-23).
+    this.seqStmt = driver.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'messages'");
 
     if (this.retentionDays !== undefined) {
       this.prune();
@@ -106,28 +121,66 @@ export class SqlitePlugin implements BackendPlugin {
     const stmt = this.require(this.insertStmt);
     const ts = new Date().toISOString();
     const info = stmt.run(topic, identity, content, ts, opts?.inReplyTo ?? null);
-    return asBackendMsgId(String(Number(info.lastInsertRowid)));
+    // No Number() round-trip: String() handles number and bigint alike, so a 64-bit rowid can
+    // never lose precision on the way to the dedup key (BUG-40).
+    return asBackendMsgId(String(info.lastInsertRowid));
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const limit = args.limit ?? 100;
+    // Validate the opaque cursor at the seam (BUG-22). A cursor this backend mints is the decimal
+    // rowid (`^\d+$`); anything else — a foreign/Matrix-style cursor (e.g. `'s123_456'`), or a
+    // value that slipped in via mis-namespaced read-state — would otherwise become Number(x) ===
+    // NaN, bind as SQL NULL, match zero rows with NO error, and re-echo itself as `nextCursor`,
+    // silently wedging this topic's catch-up forever. `\d+` also rejects '' (Number('') === 0
+    // would replay the whole topic). Throw loudly so core/the agent can drop the bad cursor and
+    // refetch the default window.
+    if (args.since !== undefined && !/^\d+$/.test(args.since)) {
+      throw new Error(
+        `parley-sqlite: malformed cursor '${args.since}' for topic ${args.topic} — ` +
+          `expected a numeric rowid cursor minted by this backend`,
+      );
+    }
+    // A well-formed but STALE cursor — one minted against a previous DB lifetime, so it points
+    // past this DB's AUTOINCREMENT high-water mark — is treated exactly like `since === undefined`
+    // for both the query AND the returned cursor (BUG-23): fall back to the default recent window
+    // so on-start catch-up self-heals after a reset, instead of binding `id > <stale>` → [] and
+    // silently dropping every post made after the reset.
+    const since =
+      args.since !== undefined && this.isStaleCursor(args.since) ? undefined : args.since;
     let rows: MessageRow[];
-    if (args.since === undefined) {
+    if (since === undefined) {
       // Default window: the most recent `limit` messages, returned ascending by cursor.
       rows = this.require(this.selectRecentStmt).all(args.topic, limit) as MessageRow[];
       rows.reverse();
     } else {
-      // Exclusive: strictly after `since`, ascending.
+      // Exclusive: strictly after `since`, ascending. `since` is validated `^\d+$`, so bind it as
+      // a BigInt — no Number() round-trip / >2^53 precision loss (BUG-40). The `id` column's
+      // INTEGER affinity drives the `id > ?` comparison.
       rows = this.require(this.selectAfterStmt).all(
         args.topic,
-        Number(args.since),
+        BigInt(since),
         limit,
       ) as MessageRow[];
     }
     const messages = rows.map(rowToMessage);
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor('0'));
+    const nextCursor = last !== undefined ? last.cursor : (since ?? asCursor('0'));
     return { messages, nextCursor };
+  }
+
+  /**
+   * True if a validated (`^\d+$`) `since` cursor points past this DB's AUTOINCREMENT high-water
+   * mark — i.e. it references a rowid this database lifetime has never minted, so it was minted
+   * against a previous DB (a recreated file, or `:memory:` which is a brand-new DB every process).
+   * Such a cursor must NOT drive an `id > since` query or it silently skips every post after the
+   * reset (BUG-23). `sqlite_sequence.seq` holds the largest rowid ever assigned (absent → 0). The
+   * BigInt compare avoids the >2^53 rounding a Number() coercion would introduce (BUG-40).
+   */
+  private isStaleCursor(since: string): boolean {
+    const row = this.require(this.seqStmt).get() as { seq: number | bigint } | undefined;
+    const highWater = row === undefined ? 0n : BigInt(row.seq);
+    return BigInt(since) > highWater;
   }
 
   /**
