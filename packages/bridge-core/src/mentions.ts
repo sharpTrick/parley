@@ -1,9 +1,10 @@
 import { asHandle, type Handle } from './message.js';
 
-// `@` preceded by start-of-string or a non-handle char, then an alnum-led token.
-// Handles may contain `-`, `_`, `.` (e.g. @ctx-payments). The leading guard stops
+// `@` preceded by start-of-string or a non-handle char, then an alnum-led, alnum-ended token.
+// Handles may contain interior `-`, `_`, `.` (e.g. @ctx-payments) but not a trailing one, so
+// sentence punctuation ("ping @bob.") isn't absorbed into the handle. The leading guard stops
 // us matching emails like alice@example.com mid-token.
-const MENTION_RE = /(?:^|[^A-Za-z0-9_.@-])@([A-Za-z0-9][A-Za-z0-9._-]*)/g;
+const MENTION_RE = /(?:^|[^A-Za-z0-9_.@-])@([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)/g;
 
 /**
  * Parse @mentions from message content. SHARED by every backend so mention semantics
