@@ -69,14 +69,22 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
 
   // On-start catch-up: advance the per-instance read cursor + warm the seen-set BEFORE the
   // push loop starts (so the live path doesn't double-emit across the boundary). Does not emit.
-  if (cfg.catchup.on_start) {
-    await catchUpAll({
-      plugin,
-      topics: allow.topics(),
-      limit: cfg.catchup.limit,
-      readState,
-      seen,
-    });
+  // BUG-27: if catch-up throws AFTER connect, the caller never receives a ParleyBridge to call
+  // shutdown() on, so disconnect the plugin here (releasing its poll/prune timers) before
+  // re-throwing — otherwise a leaked connection keeps the event loop alive and hangs the process.
+  try {
+    if (cfg.catchup.on_start) {
+      await catchUpAll({
+        plugin,
+        topics: allow.topics(),
+        limit: cfg.catchup.limit,
+        readState,
+        seen,
+      });
+    }
+  } catch (e) {
+    await plugin.disconnect().catch(() => {});
+    throw e;
   }
 
   let attached = false;
@@ -87,19 +95,28 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
       if (attached) throw new Error('bridge already attached');
       attached = true;
       await server.connect(transport);
-      // Announce presence regardless of live_push — a reactive-only bridge is still a live
-      // participant others can discover via parley_list_users (DESIGN §7).
-      if (cfg.presence.enabled) {
-        presence = startPresenceLoop(plugin, identity, allow, {
-          presenceTopic,
-          heartbeatMs: cfg.presence.heartbeat_ms,
-        });
-      }
-      if (cfg.live_push.enabled) {
-        await startPushLoop(server, plugin, allow, seen, {
-          mentionFilter: cfg.live_push.mention_filter,
-          identity,
-        });
+      // BUG-28: wire the live push path BEFORE announcing presence, so the bridge is only
+      // advertised as reachable once it can actually deliver. BUG-27: if any step throws, stop
+      // whatever was already started (the presence loop, if reached) before re-throwing, so a
+      // failed attach does not leave the bridge half-live with a running presence loop.
+      try {
+        if (cfg.live_push.enabled) {
+          await startPushLoop(server, plugin, allow, seen, {
+            mentionFilter: cfg.live_push.mention_filter,
+            identity,
+          });
+        }
+        // Announce presence regardless of live_push — a reactive-only bridge is still a live
+        // participant others can discover via parley_list_users (DESIGN §7).
+        if (cfg.presence.enabled) {
+          presence = startPresenceLoop(plugin, identity, allow, {
+            presenceTopic,
+            heartbeatMs: cfg.presence.heartbeat_ms,
+          });
+        }
+      } catch (e) {
+        await presence?.stop().catch(() => {});
+        throw e;
       }
     },
     async shutdown() {

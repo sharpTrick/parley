@@ -98,7 +98,10 @@ export class SqlitePlugin implements BackendPlugin {
 
     if (this.retentionDays !== undefined) {
       this.prune();
-      this.pruneTimer = setInterval(() => this.prune(), PRUNE_INTERVAL_MS);
+      // BUG-27: unref the prune timer so a leaked-but-never-disconnect()ed plugin cannot by
+      // itself pin the event loop — pruning is a best-effort cost knob, not a reason to keep the
+      // process alive.
+      this.pruneTimer = setInterval(() => this.prune(), PRUNE_INTERVAL_MS).unref();
     }
   }
 

@@ -105,6 +105,34 @@ describe('SqlitePlugin (seam smoke)', () => {
     const id3 = await p.post(T, me, 'new-after-prune');
     expect(Number(id3)).toBeGreaterThan(Number(lastOldId));
   });
+
+  // BUG-27 (prune-timer unref): connect() with retention_days starts a prune setInterval. It must
+  // be .unref()'d so a leaked-but-never-disconnect()ed plugin cannot by itself pin the event loop
+  // (belt-and-suspenders behind buildBridge's disconnect-on-catch-up-failure). Drive connect() with
+  // retention set, capture the timer setInterval actually returned, and assert it is NOT ref'd.
+  it('BUG-27: the prune timer is unref()d so a leaked plugin cannot pin the event loop', async () => {
+    const timers: Array<ReturnType<typeof setInterval>> = [];
+    const realSetInterval = globalThis.setInterval;
+    const spy = vi
+      .spyOn(globalThis, 'setInterval')
+      .mockImplementation(((fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        const t = realSetInterval(fn, ms, ...args);
+        timers.push(t);
+        return t;
+      }) as typeof setInterval);
+    try {
+      const p = new SqlitePlugin();
+      open.push(p);
+      await p.connect({ db_path: dbFile(), poll_interval_ms: 10, retention_days: 7 });
+      // The prune interval is the only setInterval the plugin creates (the poll loop uses
+      // setTimeout), and it must have been created and unref'd.
+      expect(timers.length).toBeGreaterThanOrEqual(1);
+      // hasRef() === false ⟺ .unref() was applied — the timer will not keep the process alive.
+      expect(timers.every((t) => t.hasRef() === false)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 // A fresh in-memory plugin — `:memory:` is a brand-new DB per connection, which is exactly the

@@ -137,9 +137,28 @@ export function createRemoteHttpApp(
   let httpServer: NodeHttpServer | undefined;
   return {
     app,
+    // BUG-12: REJECT on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
+    // never-bound server (address() === null) the composition root cannot detect, retry, or
+    // cleanly shut down. Express 5 (`app.listen`) wraps our callback in `once()` and ALSO
+    // registers it as `server.once('error', done)` BEFORE we can attach our own listener — so on
+    // a bind error our callback is invoked FIRST, with the error as its argument. We must inspect
+    // that argument and reject: ignoring it (and only relying on the `s.once('error', reject)`
+    // below) resolves the promise on the settle race and leaves reject a no-op. The `s.once` is a
+    // belt-and-suspenders for any error path that skips the callback; the success branch removes
+    // it so a later runtime error on the live server cannot reject an already-settled promise.
+    // `httpServer = s` is set synchronously so close() can still find it.
     listen: (port, host = '127.0.0.1') =>
-      new Promise((resolve) => {
-        httpServer = app.listen(port, host, () => resolve(httpServer as NodeHttpServer));
+      new Promise<NodeHttpServer>((resolve, reject) => {
+        const s = app.listen(port, host, (err?: Error) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          s.off('error', reject);
+          resolve(s);
+        });
+        s.once('error', reject);
+        httpServer = s;
       }),
     close: async () => {
       await presence?.stop(); // best-effort goodbye

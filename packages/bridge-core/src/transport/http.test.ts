@@ -1,3 +1,4 @@
+import { createServer as createHttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -68,6 +69,81 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
     // layer (Invalid enum value); with a post pattern it would be allow.assert's "topic not
     // allowed". Either way it is an isError result, not a crash.
     expect(res.content[0]!.text).toMatch(/invalid enum value|topic not allowed/i);
+  });
+});
+
+// BUG-12: RemoteHttpServer.listen() must REJECT on a bind failure (EADDRINUSE, EACCES, bad host),
+// not resolve a never-bound server whose address() is null — a silent start-up failure the
+// composition root cannot detect, retry, or shut down from. The success callback must remove the
+// error listener so a later runtime 'error' on the live server cannot reject an already-settled
+// promise. Drives the real failure and observes the fixed behavior (green suite alone insufficient).
+describe('remote HTTP: listen() rejects on a bind error (BUG-12)', () => {
+  async function appOn() {
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+    });
+    return { p, app: createRemoteHttpApp(p, cfg, { insecureNoAuth: true }) };
+  }
+
+  it('rejects with EADDRINUSE when the port is already bound (does not resolve a null-address server)', async () => {
+    // Bind a plain http server on an ephemeral port to occupy it.
+    const blocker = createHttpServer();
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+    const port = (blocker.address() as AddressInfo).port;
+    const { p, app } = await appOn();
+    try {
+      // The whole point: this must REJECT, not resolve a server whose address() is null.
+      await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    } finally {
+      await app.close().catch(() => {});
+      await p.disconnect();
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it('rejects when the same RemoteHttpServer is asked to listen twice on one port', async () => {
+    const { p, app } = await appOn();
+    const s1 = await app.listen(0);
+    const port = (s1.address() as AddressInfo).port;
+    try {
+      await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    } finally {
+      await app.close().catch(() => {});
+      await p.disconnect();
+    }
+  });
+
+  it('positive: listen(0) resolves with a bound server, and a later runtime error does not reject it', async () => {
+    const { p, app } = await appOn();
+    let settled: 'resolved' | 'rejected' | 'pending' = 'pending';
+    const promise = app.listen(0).then(
+      (s) => {
+        settled = 'resolved';
+        return s;
+      },
+      (e) => {
+        settled = 'rejected';
+        throw e;
+      },
+    );
+    const s = await promise;
+    expect(settled).toBe('resolved');
+    // A genuinely BOUND server: address() is non-null.
+    expect(s.address()).not.toBeNull();
+    // A later runtime 'error' on the live server must NOT flip the already-settled promise into a
+    // rejection (the success callback removed listen()'s reject listener).
+    s.on('error', () => {}); // catcher so emit() doesn't throw (EventEmitter throws on unhandled 'error')
+    s.emit('error', Object.assign(new Error('runtime boom'), { code: 'ERUNTIME' }));
+    // Give any stray rejection a tick to surface, then confirm the promise is still resolved.
+    await Promise.resolve();
+    await expect(promise).resolves.toBe(s);
+    expect(settled).toBe('resolved');
+    await app.close();
+    await p.disconnect();
   });
 });
 
