@@ -186,6 +186,71 @@ describe('SqlitePlugin cursor integrity (BUG-22/23/40)', () => {
   });
 });
 
+describe('SqlitePlugin poll-loop diagnostics (BUG-39)', () => {
+  it('diagnoses a permanently-failing poll tick and stops the loop after N failures', async () => {
+    const p = await plugin(5); // fast poll so escalation is quick
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let lines: string[] = [];
+    try {
+      await p.subscribe(T, () => {});
+      // Induce a PERMANENT (non-transient) failure under the running loop: drop the table so every
+      // subsequent tick's SELECT throws "no such table: messages" identically.
+      (p as unknown as { driver: { exec(sql: string): void } }).driver.exec('DROP TABLE messages');
+      await vi.waitFor(
+        () => {
+          lines = spy.mock.calls.map(([c]) => String(c));
+          // Escalation: the loop stops itself rather than spinning silently forever.
+          expect(lines.some((w) => /poll loop for topic "ctx" stopped/.test(w))).toBe(true);
+        },
+        { timeout: 3000, interval: 10 },
+      );
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Not silent — a diagnostic names the failing topic (pre-fix the catch was empty).
+    expect(lines.some((w) => /poll error on topic "ctx"/.test(w))).toBe(true);
+    // Rate-limited — NOT one line per tick: only the first hard failure logs (the rest are
+    // suppressed until the 60 s window), so at most a couple of "poll error" lines, not dozens.
+    const diag = lines.filter((w) => /poll error on topic "ctx"/.test(w));
+    expect(diag.length).toBeLessThanOrEqual(2);
+
+    // Stopped means stopped: no reschedule → no further ticks → no further stderr writes.
+    const spy2 = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    await new Promise((r) => setTimeout(r, 60));
+    const wroteAfterStop = spy2.mock.calls.length;
+    spy2.mockRestore();
+    expect(wroteAfterStop).toBe(0);
+  });
+
+  it('takes the quiet-retry path for a SQLITE_BUSY/LOCKED tick — no diagnostic, keeps ticking', async () => {
+    const p = await plugin(5);
+    const busyErr = Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+    let calls = 0;
+    // Swap in a statement whose .all always throws a lock-classed error, as WAL contention would.
+    (
+      p as unknown as { selectAfterStmt: { all: (...a: unknown[]) => unknown[] } }
+    ).selectAfterStmt = {
+      all: () => {
+        calls++;
+        throw busyErr;
+      },
+    };
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let wrote: string[] = [];
+    try {
+      await p.subscribe(T, () => {});
+      // A transient lock never escalates, so the loop keeps ticking — `calls` climbs past several.
+      await vi.waitFor(() => expect(calls).toBeGreaterThan(3), { timeout: 2000, interval: 10 });
+      wrote = spy.mock.calls.map(([c]) => String(c));
+    } finally {
+      spy.mockRestore();
+    }
+    // Quiet: a lock-classed error writes NO diagnostic and never stops the loop.
+    expect(wrote.some((w) => /poll error|poll loop/.test(w))).toBe(false);
+  });
+});
+
 async function firstCursor(p: SqlitePlugin) {
   const all = await p.fetchRecent({ topic: T });
   return all.messages[0]!.cursor;
