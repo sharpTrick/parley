@@ -3,11 +3,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 /**
  * In-process fake Telegram Bot API (node:http, port 0) — just enough surface for the plugin:
  * `sendMessage`, `getUpdates` (with real long-poll parking + `offset` acknowledgement
- * semantics), and `getMe`.
+ * semantics), `getMe`, and `getChat` (username → numeric-id resolution).
  *
- * Faithful in the two ways that matter to the seam:
+ * Faithful in the ways that matter to the seam:
  *  - `message_id` is a PER-CHAT counter (so the composite `<chat>:<mid>` dedup key and the
  *    per-topic numeric cursor are exercised for real), `update_id` a global one.
+ *  - `chat.id` is a NUMBER on both `sendMessage` responses and injected updates (mirroring real
+ *    Telegram), and `@channelusername` references resolve to a stable numeric id via `getChat` —
+ *    exactly the shape BUG-08 needs (a string echo would mask it).
  *  - `sendMessage` does NOT enqueue the bot's own message as an update — mirrors real
  *    Telegram (a bot never sees its own sends via getUpdates), which forces the plugin's
  *    record-own-post-from-the-response path.
@@ -18,17 +21,27 @@ export interface FakeTelegram {
   /** Shut down: answer parked polls, drop connections, close the listener. */
   close(): Promise<void>;
   /**
-   * Simulate a HUMAN (non-bot) message arriving in `chatId`: allocates the next message_id
-   * in the same per-chat sequence sendMessage uses, enqueues an update, and wakes parked
-   * long-polls. Returns the minted message_id so tests can assert composite ids.
+   * Simulate a HUMAN (non-bot) message arriving in `chatId` (a numeric id or `@name`, resolved
+   * to the same numeric id sendMessage/getChat use): allocates the next per-chat message_id,
+   * enqueues an update, and wakes parked long-polls. Returns the minted message_id.
    */
   injectUserMessage(chatId: string, from: string, text: string): number;
+  /**
+   * Like {@link injectUserMessage} but mints the message_id NOW (so it can be LOWER than a post
+   * that runs next) while WITHHOLDING the update from getUpdates until `release()` — reproduces
+   * the BUG-17 race (a foreign message accepted before our post, delivered to the bridge after).
+   */
+  injectUserMessageDeferred(
+    chatId: string,
+    from: string,
+    text: string,
+  ): { messageId: number; release(): void };
 }
 
 interface TgMessage {
   message_id: number;
   date: number;
-  chat: { id: string; type: string };
+  chat: { id: number; type: string; username?: string };
   from: { id: number; is_bot: boolean; username?: string; first_name: string };
   text: string;
   reply_to_message?: { message_id: number };
@@ -47,9 +60,37 @@ interface ParkedPoll {
 
 const BOT = { id: 999_000_001, is_bot: true, username: 'parley_test_bot', first_name: 'Parley' };
 
+/**
+ * A known channel: its `@channelusername` resolves (via getChat) to this NUMERIC id, so tests
+ * can drive the BUG-08 case (`@name` chat_map/topic → numeric inbound `chat.id` routing).
+ */
+export const KNOWN_CHANNEL = { username: '@mychannel', id: -1_001_234_567_890 };
+
 export async function startFakeTelegram(): Promise<FakeTelegram> {
-  /** Next message_id PER CHAT — Telegram's message_id is only unique within a chat. */
+  /** Next message_id PER CHAT (keyed by numeric-id string) — unique only within a chat. */
   const nextMid = new Map<string, number>();
+  /** `@name` → numeric id (getChat resolutions). */
+  const knownByUsername = new Map<string, number>([[KNOWN_CHANNEL.username, KNOWN_CHANNEL.id]]);
+  /** Stable synthetic numeric ids for non-numeric literals (the conformance suite's topics). */
+  const syntheticIds = new Map<string, number>();
+  let nextSynthetic = 5_000_000_001;
+
+  /** Resolve any chat_id reference (`@name`, numeric, or synthetic literal) to a stable number. */
+  const numericChatId = (raw: string): number => {
+    const known = knownByUsername.get(raw);
+    if (known !== undefined) return known;
+    if (/^-?\d+$/.test(raw)) return Number(raw);
+    let id = syntheticIds.get(raw);
+    if (id === undefined) {
+      id = nextSynthetic++;
+      syntheticIds.set(raw, id);
+    }
+    return id;
+  };
+
+  /** The `chat` object real Telegram would stamp for `raw` (channels carry a `username`). */
+  const buildChat = (raw: string, id: number): TgMessage['chat'] =>
+    raw.startsWith('@') ? { id, type: 'channel', username: raw.slice(1) } : { id, type: 'group' };
   /** Global update_id counter. */
   let updateSeq = 1;
   /** Every update ever produced; `offset` filtering serves the acknowledged tail. */
@@ -98,12 +139,18 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         reply(res, 200, { ok: true, result: BOT });
         return;
       }
+      case 'getChat': {
+        const raw = String(url.searchParams.get('chat_id') ?? body.chat_id ?? '');
+        reply(res, 200, { ok: true, result: buildChat(raw, numericChatId(raw)) });
+        return;
+      }
       case 'sendMessage': {
-        const chatId = String(body.chat_id ?? '');
+        const raw = String(body.chat_id ?? '');
+        const id = numericChatId(raw);
         const message: TgMessage = {
-          message_id: mintMid(chatId),
+          message_id: mintMid(String(id)),
           date: Math.floor(Date.now() / 1000),
-          chat: { id: chatId, type: 'group' },
+          chat: buildChat(raw, id),
           from: BOT,
           text: String(body.text ?? ''),
         };
@@ -162,16 +209,42 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     url: `http://127.0.0.1:${addr.port}`,
 
     injectUserMessage(chatId: string, from: string, text: string): number {
+      const id = numericChatId(chatId);
       const message: TgMessage = {
-        message_id: mintMid(chatId),
+        message_id: mintMid(String(id)),
         date: Math.floor(Date.now() / 1000),
-        chat: { id: chatId, type: 'group' },
+        chat: buildChat(chatId, id),
         from: { id: userSeq++, is_bot: false, username: from, first_name: from },
         text,
       };
       updates.push({ update_id: updateSeq++, message });
       wakeParked();
       return message.message_id;
+    },
+
+    injectUserMessageDeferred(
+      chatId: string,
+      from: string,
+      text: string,
+    ): { messageId: number; release(): void } {
+      const id = numericChatId(chatId);
+      const message: TgMessage = {
+        message_id: mintMid(String(id)),
+        date: Math.floor(Date.now() / 1000),
+        chat: buildChat(chatId, id),
+        from: { id: userSeq++, is_bot: false, username: from, first_name: from },
+        text,
+      };
+      let released = false;
+      return {
+        messageId: message.message_id,
+        release(): void {
+          if (released) return;
+          released = true;
+          updates.push({ update_id: updateSeq++, message });
+          wakeParked();
+        },
+      };
     },
 
     async close(): Promise<void> {
