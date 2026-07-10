@@ -47,7 +47,13 @@ export class RedisPlugin implements BackendPlugin {
   private prefix = 'parley:';
   private blockMs = 2000;
   private retentionDays?: number;
-  private stopped = false;
+  /**
+   * Per-connect generation token. Bumped on every `connect()`/`disconnect()`; each `subscribe()`
+   * captures the current value and gates its read loop on `gen === this.generation`. Because it
+   * only ever increases, a torn-down (or superseded) loop can never be revived by a later
+   * `connect()` — unlike a shared mutable boolean that a reconnect could reset (BUG-37).
+   */
+  private generation = 0;
   private readonly readers: RedisClient[] = [];
 
   async connect(config: BackendConfig): Promise<void> {
@@ -55,7 +61,7 @@ export class RedisPlugin implements BackendPlugin {
     this.prefix = cfg.key_prefix ?? 'parley:';
     this.blockMs = cfg.block_ms ?? 2000;
     this.retentionDays = cfg.retention_days;
-    this.stopped = false;
+    this.generation++; // re-baseline the generation so a fresh connect can't revive a prior loop
     const client = createClient({ url: cfg.url ?? 'redis://127.0.0.1:6379' });
     client.on('error', () => {
       /* transient connection errors surface via command rejections; don't crash the process */
@@ -65,7 +71,7 @@ export class RedisPlugin implements BackendPlugin {
   }
 
   async disconnect(): Promise<void> {
-    this.stopped = true;
+    this.generation++; // supersede every in-flight/straggler subscribe loop so they exit deterministically
     for (const reader of this.readers.splice(0)) {
       await reader.disconnect().catch(() => undefined);
     }
@@ -126,10 +132,28 @@ export class RedisPlugin implements BackendPlugin {
    * tears the reader down, which breaks the blocking read.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    // Capture the generation this subscribe belongs to; every continuation below is gated on it
+    // still being current, so a disconnect()/reconnect that ran meanwhile tears this loop down.
+    const gen = this.generation;
     const reader = this.require().duplicate();
     reader.on('error', () => undefined);
-    await reader.connect();
+    // Register BEFORE connecting so a disconnect() racing this window can always find and close
+    // the reader (BUG-37); registering after connect leaks a freshly-connected duplicate.
     this.readers.push(reader);
+    try {
+      await reader.connect();
+    } catch (err) {
+      this.dropReader(reader);
+      await reader.disconnect().catch(() => undefined);
+      throw err;
+    }
+    if (gen !== this.generation) {
+      // disconnect() won the race during connect() → tear the reader down instead of leaking it,
+      // and start no loop for this superseded connection.
+      this.dropReader(reader);
+      await reader.disconnect().catch(() => undefined);
+      return;
+    }
     const key = this.key(topic);
 
     // Capture the stream tail *before* subscribe() resolves, so a post() (XADD) racing in right
@@ -141,23 +165,39 @@ export class RedisPlugin implements BackendPlugin {
     let lastId = '0';
     try {
       lastId = (await reader.xInfoStream(key)).lastGeneratedId;
-    } catch {
-      // stream doesn't exist yet → no history to skip; '0' delivers everything from here on
+    } catch (err) {
+      if (gen !== this.generation) {
+        // disconnect() raced in during the probe; it already tore the registered reader down.
+        this.dropReader(reader);
+        await reader.disconnect().catch(() => undefined);
+        return;
+      }
+      // Only a genuinely missing stream means "no history to skip" (node-redis surfaces
+      // `ERR no such key` for XINFO STREAM on a non-existent key). Any OTHER failure (socket drop,
+      // LOADING during a restart, READONLY after failover, NOPERM on XINFO) must NOT be seeded as
+      // '0' — that would XREAD from the start and replay the whole retained history as live
+      // <channel> push (BUG-11). Surface it so core observes the failure instead of flooding.
+      if (!/no such key/i.test(String((err as Error)?.message ?? err))) {
+        this.dropReader(reader);
+        await reader.disconnect().catch(() => undefined);
+        throw err;
+      }
+      // stream doesn't exist yet → '0' delivers everything from here on
     }
 
     const loop = async (): Promise<void> => {
-      while (!this.stopped) {
+      while (gen === this.generation) {
         let res:
           | Array<{ name: string; messages: Array<{ id: string; message: Record<string, string> }> }>
           | null;
         try {
           res = await reader.xRead({ key, id: lastId }, { BLOCK: this.blockMs, COUNT: 256 });
         } catch {
-          if (this.stopped) break;
+          if (gen !== this.generation) break; // torn down/superseded → exit, never spin-retry (BUG-37)
           await delay(100);
           continue;
         }
-        if (this.stopped) break;
+        if (gen !== this.generation) break;
         if (res === null) continue; // BLOCK timed out with no new entries
         for (const stream of res) {
           for (const entry of stream.messages) {
@@ -180,6 +220,12 @@ export class RedisPlugin implements BackendPlugin {
 
   private key(topic: Topic): string {
     return `${this.prefix}${topic}`;
+  }
+
+  /** Remove a specific reader from the registry (used when a subscribe tears its own reader down). */
+  private dropReader(reader: RedisClient): void {
+    const i = this.readers.indexOf(reader);
+    if (i !== -1) this.readers.splice(i, 1);
   }
 
   private require(): RedisClient {
