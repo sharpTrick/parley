@@ -1,10 +1,28 @@
 import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { openDriver } from './driver.js';
 
 const mode = (f: string): number => statSync(f).mode & 0o777;
+
+// BUG-35/36 assertions exercise the native better-sqlite3 open/lock semantics specifically (the
+// node:sqlite fallback behaves differently), so load it directly and skip those blocks cleanly
+// when it is absent — matching openDriver, which only falls back on a module-*load* failure.
+const require = createRequire(import.meta.url);
+interface RawConn {
+  exec(sql: string): void;
+  prepare(sql: string): { run(...p: unknown[]): unknown };
+  close(): void;
+}
+const BetterCtor: (new (p: string) => RawConn) | null = (() => {
+  try {
+    return require('better-sqlite3') as new (p: string) => RawConn;
+  } catch {
+    return null;
+  }
+})();
 
 // SEC-16 — the SQLite DB (all message content, hand-offs, presence) plus its WAL sidecars must be
 // created 0600 so another local account on a shared host cannot read the conversation store.
@@ -47,5 +65,68 @@ describe('openDriver file permissions (SEC-16)', () => {
       d.prepare('INSERT INTO t (x) VALUES (?)').run(1);
     }).not.toThrow();
     d.close();
+  });
+});
+
+// BUG-35 — a fresh-file delete→WAL conversion racing another opener must NOT crash connect().
+// SQLite does not consult the busy handler for a journal-mode change, so openDriver sets
+// busy_timeout first, bounded-retries the WAL pragma, and degrades to the default journal mode
+// rather than throwing "database is locked".
+describe.skipIf(BetterCtor === null)('openDriver concurrent first-boot WAL race (BUG-35)', () => {
+  it('retries then degrades to a usable driver instead of throwing when WAL conversion is blocked', () => {
+    const Ctor = BetterCtor as new (p: string) => RawConn;
+    const dir = mkdtempSync(join(tmpdir(), 'parley-sqlite-wal-'));
+    const dbPath = join(dir, 'p.db');
+
+    // Connection A: a fresh delete-mode file holding an IMMEDIATE write lock, so the delete→WAL
+    // conversion openDriver runs cannot acquire its exclusive lock — the exact first-boot race.
+    const a = new Ctor(dbPath);
+    a.exec('PRAGMA busy_timeout = 0');
+    a.exec('CREATE TABLE t (x)');
+    a.exec('BEGIN IMMEDIATE');
+    a.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let d: ReturnType<typeof openDriver> | undefined;
+    try {
+      // Pre-fix openDriver ran `PRAGMA journal_mode = WAL` FIRST (0 ms window) and threw
+      // "database is locked". Post-fix: busy_timeout first, bounded WAL retry, then degrade →
+      // a usable driver with no throw out of connect().
+      expect(() => {
+        d = openDriver(dbPath, { busyTimeoutMs: 200 });
+      }).not.toThrow();
+      expect(d).toBeDefined();
+      // It degraded loudly (WAL never converted while A held the lock the whole time).
+      const warned = spy.mock.calls.some(([c]) => /WAL conversion still busy/.test(String(c)));
+      expect(warned).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+
+    a.exec('COMMIT');
+    expect(() => (d as ReturnType<typeof openDriver>).exec('SELECT 1')).not.toThrow();
+    (d as ReturnType<typeof openDriver>).close();
+    a.close();
+  });
+});
+
+// BUG-36 — an *open* failure (bad path/permissions/corrupt file) must surface better-sqlite3's own
+// precise message, not be swallowed and replaced by the node:sqlite fallback. The fallback fires
+// only on a module-*load* failure.
+describe.skipIf(BetterCtor === null)('openDriver surfaces the real open error (BUG-36)', () => {
+  it("propagates better-sqlite3's own message, not node:sqlite's, on an open failure", () => {
+    let caught: unknown;
+    try {
+      openDriver('/no/such/dir/parley.db');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const err = caught as Error & { code?: string };
+    // better-sqlite3's actionable "directory does not exist", NOT swallowed and replaced by the
+    // node:sqlite fallback's vaguer "unable to open database file" (ERR_SQLITE_ERROR).
+    expect(err.message).toMatch(/directory|open database/i);
+    expect(err.message).toMatch(/directory/i);
+    expect(err.code).not.toBe('ERR_SQLITE_ERROR');
   });
 });

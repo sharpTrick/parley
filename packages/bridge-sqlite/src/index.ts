@@ -192,6 +192,11 @@ export class SqlitePlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     let lastSeen = this.maxId(topic);
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // BUG-39: a permanent DB failure (file deleted/replaced/corrupted mid-run) makes the query
+    // throw identically every tick. Track consecutive non-transient failures so the loop can be
+    // diagnosed and escalated instead of spinning silently forever; rate-limit the diagnostic.
+    let consecutiveHardFailures = 0;
+    let lastDiag = 0;
 
     const tick = (): void => {
       if (this.stopped || this.driver === undefined) return;
@@ -209,8 +214,32 @@ export class SqlitePlugin implements BackendPlugin {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }
         }
-      } catch {
-        // Transient lock/contention — WAL + busy_timeout handle it; retry next tick.
+        consecutiveHardFailures = 0; // a clean tick clears the escalation counter
+      } catch (e) {
+        if (isTransientLock(e)) {
+          // Transient lock/contention — WAL + busy_timeout handle it; retry next tick, quietly.
+          consecutiveHardFailures = 0;
+        } else {
+          consecutiveHardFailures++;
+          const now = Date.now();
+          // Rate-limited so a persistent failure doesn't flood stderr every poll_interval_ms —
+          // but the very first hit is loud so the failure is never invisible.
+          if (now - lastDiag > 60_000 || consecutiveHardFailures === 1) {
+            lastDiag = now;
+            process.stderr.write(
+              `parley-sqlite: poll error on topic "${topic}" (#${consecutiveHardFailures}): ` +
+                `${e instanceof Error ? e.message : String(e)}\n`,
+            );
+          }
+          if (consecutiveHardFailures >= 10) {
+            // Permanent failure → stop the dead loop rather than spin forever with zero progress.
+            process.stderr.write(
+              `parley-sqlite: poll loop for topic "${topic}" stopped after ${consecutiveHardFailures} ` +
+                `consecutive failures; live push is down for this topic\n`,
+            );
+            return; // do NOT reschedule
+          }
+        }
       }
       if (!this.stopped) timer = setTimeout(tick, this.pollIntervalMs);
     };
@@ -247,6 +276,18 @@ export class SqlitePlugin implements BackendPlugin {
     if (value === undefined) throw new Error('SqlitePlugin not connected — call connect() first');
     return value;
   }
+}
+
+/**
+ * BUG-39: classify a poll-tick error. SQLITE_BUSY/SQLITE_LOCKED are the sanctioned silent-retry
+ * case (WAL + busy_timeout resolve them); everything else (`database disk image is malformed`,
+ * `no such table: messages`, I/O errors after the file is removed) is a hard failure that must be
+ * diagnosed and escalated rather than swallowed.
+ */
+function isTransientLock(e: unknown): boolean {
+  const code = (e as { code?: string } | null)?.code ?? '';
+  const msg = e instanceof Error ? e.message : String(e);
+  return /BUSY|LOCKED/.test(code) || /database is locked|database table is locked/i.test(msg);
 }
 
 function rowToMessage(row: MessageRow): Message {
