@@ -36,11 +36,11 @@ jobs:
           node-version: "22.x"
           registry-url: "https://registry.npmjs.org"
 
-      # Trusted publishing (OIDC) needs npm >= 11.5.1; newer than what Node 22 bundles.
-      - name: Ensure npm supports trusted publishing
-        run: npm install -g npm@latest
-
       # --- Test gate (mirrors ci.yml: Redis + NATS run for real, Matrix/XMPP self-skip) ---
+      # Runs on the npm bundled with Node 22 (via setup-node), exactly like ci.yml. Do NOT upgrade npm
+      # before this gate: npm 12 (2026-07-08) changed install handling so `npm ci` no longer builds
+      # better-sqlite3's native binary — which turned the whole SQLite suite red here on 2026-07-11 while
+      # ci.yml (bundled npm) stayed green. The npm upgrade needed for trusted publishing runs after the gate.
       - name: Start Redis
         run: docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
       - name: Start NATS (JetStream)
@@ -60,6 +60,12 @@ jobs:
       - run: npm test
 
       # --- Release: bump decided from commits, tag + GitHub Release, lockstep npm publish ---
+      # Trusted publishing (OIDC) needs npm >= 11.5.1, newer than Node 22 bundles — upgrade npm ONLY here,
+      # for the publish, never before the test gate. Pinned below the 12 major (npm 12 is what broke the
+      # gate above); ^11.5.1 keeps trusted publishing on the known-good line that last published cleanly.
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g "npm@^11.5.1"
+
       - name: semantic-release
         run: npx semantic-release
         env:
