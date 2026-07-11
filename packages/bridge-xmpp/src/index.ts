@@ -1,22 +1,24 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
+  safeName,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 // `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
 // declared dependency keeps the package self-contained (no extra direct dep on @xmpp/xml).
 import { client, xml } from '@xmpp/client';
+import { randomUUID } from 'node:crypto';
 
 /** Plugin-specific backend_config. */
 export interface XmppBackendConfig {
@@ -58,7 +60,6 @@ const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
 const RETRYABLE_CONDITIONS = ['item-not-found', 'recipient-unavailable', 'remote-server-not-found'];
 
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const rand = (): string => Math.random().toString(36).slice(2, 12);
 const resourceOf = (full: string): string => {
   const i = full.indexOf('/');
@@ -140,8 +141,8 @@ export class XmppPlugin implements BackendPlugin {
   private readonly pendingJoins = new Map<string, PendingJoin>();
   /** origin-id -> resolver awaiting the MUC reflection that carries the archive id. */
   private readonly pendingPosts = new Map<string, PendingPost>();
-  /** MAM queryid -> collector for the streamed `<result>` items. */
-  private readonly mamCollectors = new Map<string, MamItem[]>();
+  /** MAM queryid -> collector for the streamed `<result>` items, bound to the room queried. */
+  private readonly mamCollectors = new Map<string, { room: string; items: MamItem[] }>();
   /** roomJid -> live subscription(s). */
   private readonly subscriptions = new Map<string, Subscription>();
 
@@ -154,15 +155,46 @@ export class XmppPlugin implements BackendPlugin {
     this.nick = cfg.nick ?? `${username}-${rand()}`;
     this.stopped = false;
 
+    // SEC-06: warn loudly before the SASL handshake when the operator is connecting with the
+    // repo-public default password (unset → fell back, or set literally to the well-known value).
+    const password = cfg.password ?? 'parleypass';
+    if (cfg.password === undefined || password === 'parleypass') {
+      console.warn(
+        '[parley-xmpp] SECURITY: connecting with the built-in default password ' +
+          "('parleypass'). Set backend_config.password to a real secret; a network-reachable " +
+          'XMPP account provisioned with this password is world-readable/injectable.',
+      );
+    }
+
     const xmpp = client({
       service: cfg.service ?? 'xmpp://127.0.0.1:5222',
       domain: this.domain,
       username,
-      password: cfg.password ?? 'parleypass',
+      password,
     }) as unknown as XmppClient;
     // Stream/connection errors surface via command rejections; don't crash the process.
     xmpp.on('error', () => undefined);
     xmpp.on('stanza', (stanza) => this.onStanza(stanza));
+    // BUG-06: @xmpp/client bundles @xmpp/reconnect, which transparently re-establishes and
+    // re-auths the stream after a drop/server-restart — but MUC occupancy is presence-based and
+    // is NOT restored by the library. On every `online` AFTER the first, re-send the join
+    // presence for each subscribed room so push resumes and post() doesn't wait out its timeout.
+    let firstOnline = true;
+    xmpp.on('online', () => {
+      if (firstOnline) {
+        firstOnline = false;
+        return; // initial connect: subscribe()/post() drive the first joins
+      }
+      // The reconnect re-authed the stream but we are no longer a MUC occupant. Fail in-flight
+      // posts so callers retry immediately instead of hanging out the full POST_TIMEOUT_MS
+      // (the reflection can never arrive — the un-rejoined room answers <message type='error'>).
+      for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
+      this.pendingPosts.clear();
+      this.joined.clear();
+      for (const sub of this.subscriptions.values()) {
+        void this.ensureJoined(sub.topic).catch(() => undefined); // re-send join presence per room
+      }
+    });
     await xmpp.start();
     this.xmpp = xmpp;
   }
@@ -223,14 +255,16 @@ export class XmppPlugin implements BackendPlugin {
     await this.ensureJoined(args.topic);
     const limit = args.limit ?? 100;
 
+    const since = args.since === undefined ? undefined : String(args.since);
     let items: MamItem[];
-    if (args.since === undefined) {
-      // Default window: the most recent `limit` messages (RSM "last page" via empty <before/>).
+    if (since === undefined) {
+      // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
       items = (await this.mamQuery(args.topic, { before: true, max: limit })).items;
     } else {
-      // Exclusive catch-up: page forward with <after> until complete or `limit` reached.
+      // Exclusive catch-up. `since === ''` (empty archive's zero cursor) means "from the very
+      // beginning": the first page omits <after/> (guarded in mamQuery); later pages use real archIds.
       items = [];
-      let cursor = String(args.since);
+      let cursor = since; // may be '' on the first iteration → no <after/> emitted
       while (items.length < limit) {
         const page = await this.mamQuery(args.topic, {
           after: cursor,
@@ -276,7 +310,7 @@ export class XmppPlugin implements BackendPlugin {
     // MAM streamed result? (outer stanza is a normal message addressed to us)
     const result = stanza.getChild('result', NS_MAM);
     if (result !== undefined) {
-      this.onMamResult(result);
+      this.onMamResult(result, bareOf(stanza.attrs.from ?? ''));
       return;
     }
 
@@ -325,14 +359,16 @@ export class XmppPlugin implements BackendPlugin {
       .catch(() => undefined);
   }
 
-  private onMamResult(result: El): void {
+  private onMamResult(result: El, fromBare: string): void {
     const collector = this.mamCollectors.get(result.attrs.queryid ?? '');
     if (collector === undefined) return;
+    // XEP-0313 security: only accept archive results from the room we queried.
+    if (fromBare !== collector.room) return;
     const forwarded = result.getChild('forwarded', NS_FORWARD);
     const inner = forwarded?.getChild('message');
     if (inner === undefined) return;
     const delay = forwarded?.getChild('delay', NS_DELAY);
-    collector.push({
+    collector.items.push({
       archId: result.attrs.id ?? '',
       from: inner.attrs.from ?? '',
       body: inner.getChildText('body') ?? '',
@@ -385,12 +421,15 @@ export class XmppPlugin implements BackendPlugin {
     opts: { after?: string; before?: boolean; max: number },
   ): Promise<{ items: MamItem[]; complete: boolean }> {
     const room = this.roomJid(topic);
-    const queryid = `q-${rand()}`;
+    const queryid = randomUUID();
     const collector: MamItem[] = [];
-    this.mamCollectors.set(queryid, collector);
+    this.mamCollectors.set(queryid, { room, items: collector });
 
     const rsm: unknown[] = [];
-    if (opts.after !== undefined) rsm.push(xml('after', {}, opts.after));
+    // Never emit an empty <after/>: the empty-archive zero cursor '' means "from the beginning"
+    // (forward-from-start), not a real archive UID. XEP-0313 §4.2 makes servers reply
+    // item-not-found for an <after> that is not in the archive, so '' must omit the element.
+    if (opts.after !== undefined && opts.after !== '') rsm.push(xml('after', {}, opts.after));
     rsm.push(xml('max', {}, String(opts.max)));
     if (opts.before === true) rsm.push(xml('before', {})); // empty <before/> => last page
 
@@ -414,15 +453,13 @@ export class XmppPlugin implements BackendPlugin {
 
   private toMessage(topic: Topic, it: MamItem): Message {
     const nick = resourceOf(it.from);
-    return {
+    return buildMessage({
       topic,
-      senderHandle: asHandle(nick !== '' ? nick : this.handle),
+      sender: nick !== '' ? nick : this.handle,
       content: it.body,
       timestamp: it.stamp ?? new Date().toISOString(),
-      backendMsgId: asBackendMsgId(it.archId),
-      cursor: asCursor(it.archId),
-      mentions: parseMentions(it.body),
-    };
+      id: it.archId,
+    });
   }
 
   /** Join a room with NO history (maxstanzas=0); cached so repeated calls are idempotent. */
@@ -494,7 +531,7 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   private roomJid(topic: Topic): string {
-    return `${sanitizeLocal(topic)}@${this.mucService}`;
+    return `${safeName(topic, sanitizeLocal)}@${this.mucService}`;
   }
 
   private require(): XmppClient {

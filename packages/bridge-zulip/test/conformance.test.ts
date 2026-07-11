@@ -75,6 +75,70 @@ describe('zulip queue GC recovery', () => {
       await fake.close();
     }
   });
+
+  it('BUG-15: gap-fill read throws once → the dead-window message still arrives via retry, once', async () => {
+    const fake = await startFakeZulip({ heartbeatMs: 200 });
+    const plugin = new ZulipPlugin();
+    await plugin.connect({ site_url: fake.url, events_timeout_ms: 500 });
+    try {
+      const topic = asTopic(`gc-fail-${rand()}`);
+      const got: Message[] = [];
+      await plugin.subscribe(topic, (m) => got.push(m));
+
+      await plugin.post(topic, asHandle('w'), 'before');
+      await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 3000, interval: 10 });
+
+      // Kill the queue AND make the first post-GC gap-fill history read throw (proxy 502). Under
+      // the old one-shot recovery, 'during' would be lost forever (delivered on neither queue);
+      // with the tracked retry, the top-of-loop gap-fill re-attempts until it succeeds.
+      fake.gcQueues();
+      fake.failNextMessagesRead();
+      await plugin.post(topic, asHandle('w'), 'during');
+
+      await vi.waitFor(
+        () => expect(got.map((m) => m.content)).toEqual(['before', 'during']),
+        { timeout: 5000, interval: 10 },
+      );
+      // Settle: no duplicate from the fresh queue's overlap, no double-delivery from the retry.
+      await new Promise((r) => setTimeout(r, 400));
+      expect(got.map((m) => m.content)).toEqual(['before', 'during']);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
+  it('BUG-15: several gap-fill reads throw → the dead-window messages all arrive exactly once', async () => {
+    const fake = await startFakeZulip({ heartbeatMs: 200 });
+    const plugin = new ZulipPlugin();
+    await plugin.connect({ site_url: fake.url, events_timeout_ms: 500 });
+    try {
+      const topic = asTopic(`gc-fail-n-${rand()}`);
+      const got: Message[] = [];
+      await plugin.subscribe(topic, (m) => got.push(m));
+
+      await plugin.post(topic, asHandle('w'), 'before');
+      await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 3000, interval: 10 });
+
+      // Kill the queue, fail the first THREE gap-fill reads, and drop several messages into the
+      // dead window — the top-of-loop retry must eventually deliver them all, none twice.
+      fake.gcQueues();
+      fake.failMessagesReads(3);
+      await plugin.post(topic, asHandle('w'), 'd1');
+      await plugin.post(topic, asHandle('w'), 'd2');
+      await plugin.post(topic, asHandle('w'), 'd3');
+
+      await vi.waitFor(
+        () => expect(got.map((m) => m.content)).toEqual(['before', 'd1', 'd2', 'd3']),
+        { timeout: 6000, interval: 10 },
+      );
+      await new Promise((r) => setTimeout(r, 400));
+      expect(got.map((m) => m.content)).toEqual(['before', 'd1', 'd2', 'd3']);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
 });
 
 describe('zulip resolveIdentity', () => {

@@ -1,20 +1,20 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 import { keyOf, ObservedStore, type StoredRecord } from './store.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
@@ -33,6 +33,14 @@ export interface TelegramBackendConfig {
    * giving chats friendly topic names.
    */
   chat_map?: Record<string, string>;
+  /**
+   * Max observed records retained PER topic in the local JSONL store. On load the newest N are
+   * kept and the file is compacted below the bound, so a long-lived bridge on a busy chat can't
+   * grow the store/RAM without limit or degrade `connect` (BUG-32). Older records fall outside
+   * Telegram's ~24-48h `getUpdates` replay horizon anyway (see README "History limitations").
+   * Default 10000.
+   */
+  observed_retention_per_topic?: number;
 }
 
 /** The subset of a Telegram `Message` object this plugin reads. */
@@ -57,8 +65,6 @@ interface Subscription {
   handler: MessageHandler;
   watermark: number;
 }
-
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Telegram Bot API backend (DESIGN §6/§9) — spoken to via the raw HTTP API with the global
@@ -101,20 +107,31 @@ export class TelegramPlugin implements BackendPlugin {
   private readonly controllers = new Set<AbortController>();
   /** Memoized getMe (the bot's own identity), for resolveIdentity. */
   private me?: Promise<{ id: number; username?: string }>;
+  /** Memoized `@channelusername` → numeric-id-string resolutions (one getChat per distinct name). */
+  private canonicalById = new Map<string, Promise<string>>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as TelegramBackendConfig;
     this.apiUrl = (cfg.api_url ?? 'https://api.telegram.org').replace(/\/+$/, '');
     this.token = cfg.token ?? '';
     this.pollTimeoutS = cfg.poll_timeout_s ?? 25;
-    this.chatMap = cfg.chat_map ?? {};
-    this.topicByChat = new Map(
-      Object.entries(this.chatMap).map(([topic, chat]) => [chat, asTopic(topic)]),
-    );
     this.stopped = false;
     this.me = undefined;
-    // Load the full observed-message store up front — fetchRecent is a pure in-memory query.
-    this.store = new ObservedStore(cfg.store_path ?? 'parley-telegram.jsonl');
+    this.canonicalById = new Map();
+    this.chatMap = cfg.chat_map ?? {};
+    // BUG-08: chat ids in `@channelusername` form must be canonicalized to their NUMERIC id so
+    // the reverse `topicByChat` lookup matches inbound `Update.chat.id` (Telegram always stamps
+    // it as a number). Resolve every `@name` chat_map value via getChat (once, memoized) and key
+    // the reverse map by String(numericId); numeric ids pass through with no network call.
+    this.topicByChat = new Map();
+    for (const [topic, chat] of Object.entries(this.chatMap)) {
+      this.topicByChat.set(await this.canonicalChatId(chat), asTopic(topic));
+    }
+    // Load the observed-message store up front — fetchRecent is a pure in-memory query.
+    this.store = new ObservedStore(
+      cfg.store_path ?? 'parley-telegram.jsonl',
+      cfg.observed_retention_per_topic,
+    );
     // ONE shared ingestion loop per instance (one getUpdates consumer per token — see class doc).
     void this.pollLoop();
   }
@@ -127,6 +144,7 @@ export class TelegramPlugin implements BackendPlugin {
     this.store?.close();
     this.store = undefined;
     this.me = undefined;
+    this.canonicalById = new Map();
   }
 
   /**
@@ -144,6 +162,7 @@ export class TelegramPlugin implements BackendPlugin {
   ): Promise<BackendMsgId> {
     this.require(this.store);
     void identity; // sender is the bot account; see JSDoc above.
+    await this.ensureTopicRouting(topic); // BUG-08: register the reverse route for `@name` topics.
     const body: Record<string, unknown> = { chat_id: this.chatIdOf(topic), text: content };
     // Reply threading: if inReplyTo parses as our composite `<chat>:<mid>`, thread to that mid.
     const replyMid = parseCompositeMid(opts?.inReplyTo);
@@ -183,6 +202,7 @@ export class TelegramPlugin implements BackendPlugin {
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const store = this.require(this.store);
+    await this.ensureTopicRouting(topic); // BUG-08: `@name` topic literals route by numeric id.
     const sub: Subscription = { handler, watermark: store.maxMessageId(topic) };
     const list = this.subs.get(topic);
     if (list === undefined) this.subs.set(topic, [sub]);
@@ -214,9 +234,53 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
+   * A chat id in canonical NUMERIC-string form. `@channelusername` values are resolved to their
+   * numeric id via `getChat` (once per distinct name — memoized like {@link getMe}); numeric ids
+   * pass straight through with NO network call. Keeps `topicByChat` (and `StoredRecord.chat_id`)
+   * keyed by the numeric id Telegram always stamps on inbound `Update.chat.id` (BUG-08).
+   */
+  private canonicalChatId(chat: string): Promise<string> {
+    if (!chat.startsWith('@')) return Promise.resolve(chat);
+    const cached = this.canonicalById.get(chat);
+    if (cached !== undefined) return cached;
+    const pending = this.http('GET', `/getChat?chat_id=${encodeURIComponent(chat)}`)
+      .then(async (res) => {
+        const json = (await res.json()) as { result: { id: number } };
+        return String(json.result.id);
+      })
+      .catch((err: unknown) => {
+        // Don't poison the memo on transient failure — let the next call retry.
+        this.canonicalById.delete(chat);
+        throw err;
+      });
+    this.canonicalById.set(chat, pending);
+    return pending;
+  }
+
+  /**
+   * Register the reverse route for an `@channelusername` TOPIC LITERAL (an unmapped topic whose
+   * own name is `@name`) on first use — chat_map entries are canonicalized at connect instead.
+   * No-op for numeric/plain topics and for mapped topics. Lets inbound `Update.chat.id` (numeric)
+   * route to the `@name` topic a subscriber/poster is using (BUG-08).
+   */
+  private async ensureTopicRouting(topic: Topic): Promise<void> {
+    const t = topic as string;
+    if (!t.startsWith('@') || this.chatMap[t] !== undefined) return;
+    this.topicByChat.set(await this.canonicalChatId(t), asTopic(t));
+  }
+
+  /**
    * The single ingestion point for an observed message (own send or getUpdates delivery):
-   * dedup on the composite id, persist to the store, then deliver to any live subscriber
-   * whose watermark it exceeds (advancing the watermark).
+   * dedup on the composite id, persist to the store, then deliver to any live subscriber.
+   *
+   * BUG-17: the store's dedup set is the once-only guarantee — `store.append` returning `true`
+   * already proves this message was never observed, so it is delivered unconditionally. The
+   * per-subscriber watermark is the FIXED value captured AT subscribe (deliver only messages
+   * newer than the subscribe point — "history is owned by catch-up, not push"); it is NEVER
+   * advanced here. Advancing it let an own post (higher `message_id`) move the bar past a
+   * foreign message accepted just before it (lower `message_id`) that arrives moments later,
+   * permanently dropping it. Losing strict ascending order in this sub-second race is strictly
+   * better than permanent loss; core dedups the push on `backendMsgId`.
    */
   private ingest(topic: Topic, msg: TgMessage): void {
     const store = this.store;
@@ -232,8 +296,7 @@ export class TelegramPlugin implements BackendPlugin {
     if (!store.append(rec)) return; // already observed — dedup holds (DESIGN §6).
     const message = recordToMessage(rec);
     for (const sub of this.subs.get(topic as string) ?? []) {
-      if (msg.message_id <= sub.watermark) continue;
-      sub.watermark = msg.message_id;
+      if (msg.message_id <= sub.watermark) continue; // fixed subscribe-time value; never advanced.
       try {
         sub.handler(message);
       } catch {
@@ -317,24 +380,21 @@ export class TelegramPlugin implements BackendPlugin {
     const headers: Record<string, string> = {};
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
 
-    for (;;) {
-      const res = await fetch(url, {
+    return fetchWithRetry(
+      url,
+      {
         method,
         headers,
         body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: opts?.signal,
-      });
-      if (res.status === 429) {
+      },
+      {
+        label: `Telegram ${method} ${path}`,
         // Stop retrying once disconnected — don't keep hammering the API post-teardown.
-        if (this.stopped) throw new Error(`Telegram ${method} ${path} → 429 (disconnected)`);
-        const retryMs = await readRetryAfter(res);
-        await delay(retryMs);
-        continue;
-      }
-      if (res.ok) return res;
-      const text = await res.text();
-      throw new Error(`Telegram ${method} ${path} → ${res.status}: ${text}`);
-    }
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+      },
+    );
   }
 
   private require<T>(value: T | undefined): T {
@@ -365,23 +425,28 @@ function parseCompositeMid(id: BackendMsgId | undefined): number | undefined {
 }
 
 function recordToMessage(rec: StoredRecord): Message {
-  return {
+  return buildMessage({
     topic: asTopic(rec.topic),
-    senderHandle: asHandle(rec.sender),
+    sender: rec.sender,
     content: rec.content,
     timestamp: rec.ts,
-    backendMsgId: asBackendMsgId(keyOf(rec)),
-    cursor: asCursor(String(rec.message_id)),
-    mentions: parseMentions(rec.content),
-  };
+    id: keyOf(rec),
+    cursor: String(rec.message_id),
+  });
 }
 
-/** Telegram 429s carry `parameters.retry_after` in SECONDS; cap the wait at 5s. */
+/**
+ * Telegram 429s carry `parameters.retry_after` (SECONDS) in the JSON body, and also send the
+ * standard `Retry-After` header (SECONDS). Prefer the header, then the body — both `> 0`-guarded
+ * so a `0`/negative value falls to the default rather than `delay(0)` — capped at 5s.
+ */
 async function readRetryAfter(res: Response): Promise<number> {
+  const header = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
   try {
     const json = (await res.clone().json()) as { parameters?: { retry_after?: number } };
     const s = json.parameters?.retry_after;
-    if (typeof s === 'number') return Math.min(s * 1000, 5000);
+    if (typeof s === 'number' && s > 0) return Math.min(s * 1000, 5000);
   } catch {
     /* fall through to default backoff */
   }

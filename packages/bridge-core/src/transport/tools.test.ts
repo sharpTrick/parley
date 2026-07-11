@@ -6,8 +6,10 @@ import { Allowlist } from '../allowlist.js';
 import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
+import { NoSuchTopicError } from '../seam.js';
+import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { registerTools } from './tools.js';
+import { registerTools, toolDepsFor } from './tools.js';
 
 interface ToolText {
   content: Array<{ type: string; text: string }>;
@@ -328,6 +330,39 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     expect(out.users).toEqual([]);
   });
 
+  it('SEC-08 — a beat of 64 nested-quantifier postTopics does not hang list_users (bounded time)', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // A hostile peer plants the maximum 64 catastrophic-backtracking regex sources on the presence
+    // topic (raw backend write — outside the tool allowlist), then the reader calls list_users. On
+    // the unfixed code this `.test` loop never returns; the ReDoS screen must make the call resolve
+    // in bounded wall-clock time (the wall-clock assertion, not a green suite, is the proof).
+    const evil = '((([a-z-]+)+)+)+[0-9]';
+    await postBeat(plugin, 'attacker', ['some-other-ctx'], 'hello', NOW - 1_000, Array<string>(64).fill(evil));
+    const t0 = performance.now();
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
+    expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
+  });
+
+  it('SEC-08 — a beat of 64 BOUNDED exact-count nested postTopics also does not hang list_users', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` uses no unbounded OUTER quantifier
+    // (only `*` inside a bounded exact `{40}`), so it slipped the earlier screen, yet V8 unrolls the
+    // `{40}` into 40 sequential `*`-bodies and the `.test` hangs the whole loop for tens of seconds on
+    // the reader's own short topic. The hardened screen rejects a risky body repeated `>= 2` times, so
+    // the call must resolve in bounded wall-clock time (the assertion, not a green suite, is the proof).
+    const evil = '([a-z-]*){40}[0-9]';
+    await postBeat(plugin, 'attacker', ['some-other-ctx'], 'hello', NOW - 1_000, Array<string>(64).fill(evil));
+    const t0 = performance.now();
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
+    expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
+  });
+
   it('scopes to a single topic when `topic` is given', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
     await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
@@ -376,6 +411,35 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toContain('topic not allowed');
   });
+
+  it('surfaces an arbitrary backend failure as an isError result, not a fake-empty roster', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
+    // A real outage (connection loss, auth expiry, DB error) rejects fetchRecent — it must NOT
+    // collapse into a healthy `{ users: [], truncated: false }` the agent would trust (BUG-13).
+    plugin.fetchRecent = async () => {
+      throw new Error('backend down');
+    };
+    const res = (await client.callTool({
+      name: 'parley_list_users',
+      arguments: {},
+    })) as ToolText;
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain('backend down');
+  });
+
+  it('maps an explicit NoSuchTopicError to an empty roster (presence topic genuinely absent)', async () => {
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
+    // Only NoSuchTopicError means "topic not present yet" ⇒ nobody seen; this is a normal result.
+    plugin.fetchRecent = async () => {
+      throw new NoSuchTopicError(DEFAULT_PRESENCE_TOPIC);
+    };
+    const res = (await client.callTool({
+      name: 'parley_list_users',
+      arguments: {},
+    })) as ToolText;
+    expect(res.isError).toBeFalsy();
+    expect(parse(res)).toEqual({ users: [], truncated: false });
+  });
 });
 
 describe('post_topics regex patterns + presence reservation', () => {
@@ -415,6 +479,27 @@ describe('post_topics regex patterns + presence reservation', () => {
       expect(res.isError).toBe(true);
       expect(res.content[0]!.text).toContain('topic not allowed');
     }
+  });
+});
+
+describe('toolDepsFor (single ToolDeps factory — CX-09/CX-06)', () => {
+  it('derives the exact ToolDeps both roots previously assembled by hand; threads seen only via extras', () => {
+    const plugin = new FakePlugin();
+    const cfg = parseConfig({ identity: { handle: 'alice' }, topics: ['ctx', 'ctx-reviews'] });
+    const seen = new SeenSet();
+
+    // stdio root: passes its shared push-loop `seen`.
+    const deps = toolDepsFor(plugin, cfg, { seen });
+    expect(deps.plugin).toBe(plugin);
+    // Matches the fields the stdio bridge used to spell out inline (identity/allow/presenceTopic/ttl).
+    expect(deps.identity).toBe(asHandle(cfg.identity.handle));
+    expect(deps.allow.topics()).toEqual(['ctx', 'ctx-reviews']);
+    expect(deps.presenceTopic).toBe(asTopic(cfg.presence.topic));
+    expect(deps.presenceTtlMs).toBe(cfg.presence.ttl_ms);
+    expect(deps.seen).toBe(seen);
+
+    // reactive HTTP root: omits extras ⇒ no SeenSet is threaded (CX-06 — no push loop, no dedup state).
+    expect(toolDepsFor(plugin, cfg).seen).toBeUndefined();
   });
 });
 

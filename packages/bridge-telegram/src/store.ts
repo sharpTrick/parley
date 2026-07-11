@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 
 /**
  * One observed Telegram message, as persisted to the JSONL store. Everything needed to
@@ -24,42 +24,72 @@ export interface StoredRecord {
 export const keyOf = (rec: Pick<StoredRecord, 'chat_id' | 'message_id'>): string =>
   `${rec.chat_id}:${rec.message_id}`;
 
+/** Default max records retained PER topic when the caller doesn't override it. */
+const DEFAULT_MAX_PER_TOPIC = 10_000;
+
 /**
  * Append-only JSONL store of every message this bridge has OBSERVED (own sends via the
  * `sendMessage` response + foreign messages via `getUpdates`). The Telegram Bot API exposes
  * NO history endpoint, so this store IS the durable, replayable history the seam contract
  * asks for (DESIGN §6) — limited to what the bridge has seen (see the caveat in index.ts).
  *
- * Loaded fully at `connect` into a per-topic array sorted ascending by `message_id` plus a
- * `Set<backendMsgId>` for dedup; `append` is `fs.appendFileSync` (write-through, nothing to
- * flush) followed by an in-order insert.
+ * Loaded at `connect` into a per-topic array sorted ascending by `message_id` plus a
+ * `Set<backendMsgId>` for dedup, then BOUNDED to the newest {@link DEFAULT_MAX_PER_TOPIC}
+ * records per topic (compacting the on-disk file when anything is dropped) so a long-lived
+ * bridge on a busy chat can't grow the file/RAM without limit or turn `connect` into a
+ * tens-of-seconds parse (BUG-32). `append` writes one JSONL line through a persistent fd (not
+ * a reopen-per-message) followed by an in-order insert.
  *
- * ONE bridge process per store file AND per bot token, by design: `appendFileSync` from a
- * single process is atomic enough for JSONL, but two processes interleaving appends (or two
- * `getUpdates` pollers racing on one token — Telegram answers the second with HTTP 409)
- * are structurally unsupported. See the "Multiple concurrent sessions" section in README.md.
+ * ONE bridge process per store file AND per bot token, by design: a single process's appends
+ * are atomic enough for JSONL, but two processes interleaving appends (or two `getUpdates`
+ * pollers racing on one token — Telegram answers the second with HTTP 409) are structurally
+ * unsupported. See the "Multiple concurrent sessions" section in README.md.
  */
 export class ObservedStore {
-  /** topic → records sorted ascending by `message_id`. */
+  /** topic → records sorted ascending by `message_id` (bounded to the newest {@link maxPerTopic}). */
   private readonly byTopic = new Map<string, StoredRecord[]>();
-  /** Every observed composite id — the dedup set. */
+  /** The dedup set — the composite ids of the currently-retained records (BUG-32: bounded). */
   private readonly seen = new Set<string>();
+  /** Newest-N-per-topic retention bound (BUG-32). */
+  private readonly maxPerTopic: number;
+  /** Persistent append descriptor — one open fd for the process, not open/close per append. */
+  private fd: number | undefined;
 
-  constructor(private readonly path: string) {
+  constructor(
+    private readonly path: string,
+    maxPerTopic = DEFAULT_MAX_PER_TOPIC,
+  ) {
+    this.maxPerTopic = maxPerTopic > 0 ? maxPerTopic : DEFAULT_MAX_PER_TOPIC;
     let raw = '';
     try {
       raw = readFileSync(path, 'utf8');
     } catch {
       // No store yet — first run against this path starts empty.
     }
+    // BUG-19: drop a crash-torn tail fragment (a final line with no trailing '\n') BEFORE any
+    // append, so the next record can't glue onto it. The repaired file is rewritten below.
+    let torn = false;
+    if (raw !== '' && !raw.endsWith('\n')) {
+      const lastNl = raw.lastIndexOf('\n');
+      raw = lastNl >= 0 ? raw.slice(0, lastNl + 1) : '';
+      torn = true;
+    }
     for (const line of raw.split('\n')) {
       if (line.trim() === '') continue;
       try {
         this.insert(JSON.parse(line) as StoredRecord);
       } catch {
-        // A torn tail line (crash mid-append) is dropped; every complete line loads.
+        // A torn/garbled line is dropped; every complete line loads.
       }
     }
+    // BUG-32: bound each topic to its newest N records (rebuilding `seen` from the survivors).
+    const trimmed = this.applyRetention();
+    // Compact the on-disk file when we dropped a torn fragment (BUG-19) or over-retention
+    // records (BUG-32); the rewrite yields a clean, newline-terminated, bounded file. This runs
+    // AFTER the BUG-19 repair so the fragment is never carried into the compacted output.
+    if (torn || trimmed) this.rewrite();
+    // BUG-32: hold one append fd for the process instead of reopening the file per append.
+    this.fd = openSync(path, 'a');
   }
 
   /**
@@ -69,7 +99,8 @@ export class ObservedStore {
    */
   append(rec: StoredRecord): boolean {
     if (this.seen.has(keyOf(rec))) return false;
-    appendFileSync(this.path, `${JSON.stringify(rec)}\n`);
+    if (this.fd === undefined) return false; // store closed — no-op (BUG-32: fd released).
+    appendFileSync(this.fd, `${JSON.stringify(rec)}\n`);
     this.insert(rec);
     return true;
   }
@@ -91,10 +122,45 @@ export class ObservedStore {
     return last?.message_id ?? 0;
   }
 
-  /** Drop the in-memory index. Appends are write-through, so there is nothing to flush. */
+  /** Drop the in-memory index and release the append fd. Appends are write-through — nothing to flush. */
   close(): void {
     this.byTopic.clear();
     this.seen.clear();
+    if (this.fd !== undefined) {
+      closeSync(this.fd);
+      this.fd = undefined;
+    }
+  }
+
+  /**
+   * Bound each topic to its newest {@link maxPerTopic} records and, if anything was dropped,
+   * rebuild the dedup `seen` set from the survivors so neither map grows without bound (BUG-32).
+   * Returns true iff any record was evicted (the on-disk file then needs a compacting rewrite).
+   */
+  private applyRetention(): boolean {
+    let trimmed = false;
+    for (const list of this.byTopic.values()) {
+      if (list.length > this.maxPerTopic) {
+        list.splice(0, list.length - this.maxPerTopic);
+        trimmed = true;
+      }
+    }
+    if (trimmed) {
+      this.seen.clear();
+      for (const list of this.byTopic.values()) {
+        for (const rec of list) this.seen.add(keyOf(rec));
+      }
+    }
+    return trimmed;
+  }
+
+  /** Rewrite the file from the retained records — a clean, newline-terminated, bounded file. */
+  private rewrite(): void {
+    const lines: string[] = [];
+    for (const list of this.byTopic.values()) {
+      for (const rec of list) lines.push(JSON.stringify(rec));
+    }
+    writeFileSync(this.path, lines.length > 0 ? `${lines.join('\n')}\n` : '');
   }
 
   /** Index a record: dedup-set + in-order insert (append-at-tail is the common case). */

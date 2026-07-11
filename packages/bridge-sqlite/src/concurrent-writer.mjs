@@ -16,9 +16,26 @@ function openDb(path) {
     const { DatabaseSync } = require('node:sqlite');
     db = new DatabaseSync(path);
   }
-  // Same pragmas as driver.ts: WAL + busy_timeout make concurrent multi-process writes safe.
-  db.exec('PRAGMA journal_mode = WAL');
+  // Same pragmas as driver.ts (BUG-35): busy_timeout FIRST, then bounded-retry the WAL
+  // conversion so a first-boot race against another opener degrades instead of crashing.
   db.exec('PRAGMA busy_timeout = 5000');
+  for (let i = 0; ; i++) {
+    try {
+      db.exec('PRAGMA journal_mode = WAL');
+      break;
+    } catch (e) {
+      if (i >= 20) {
+        // Degrade to the default journal mode rather than crash the writer.
+        process.stderr.write(
+          `concurrent-writer: WAL conversion still busy after ${i} retries; ` +
+            `continuing in default journal mode: ${e instanceof Error ? e.message : String(e)}\n`,
+        );
+        break;
+      }
+      const sab = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(sab, 0, 0, 5 + i);
+    }
+  }
   db.exec('PRAGMA synchronous = NORMAL');
   return db;
 }

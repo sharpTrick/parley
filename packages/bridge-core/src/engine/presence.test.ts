@@ -4,10 +4,14 @@ import {
   computeRoster,
   decodePresence,
   encodePresence,
+  filterReachable,
+  MAX_CLOCK_SKEW_MS,
   MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
+  MAX_TOPIC_LEN,
   type PresenceKind,
   type PresenceRecord,
+  type RosterEntry,
 } from './presence.js';
 
 /** Build a presence Message on the shared presence topic in ascending-cursor order (seq drives the cursor). */
@@ -101,6 +105,26 @@ describe('encode/decode presence', () => {
     const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics }));
     expect(rec?.topics).toHaveLength(MAX_RECORD_TOPICS);
     expect(rec?.topics[0]).toBe('ctx-0');
+  });
+
+  it('SEC-09 — drops an over-long topics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
+    const tooLong = 'x'.repeat(MAX_TOPIC_LEN + 1);
+    const exact = 'y'.repeat(MAX_TOPIC_LEN);
+    const rec = decodePresence(
+      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: [tooLong, 'ctx', exact] }),
+    );
+    expect(rec?.topics).toEqual(['ctx', exact]);
+    expect(rec?.topics).not.toContain(tooLong);
+  });
+
+  it('SEC-09 — drops an over-long postTopics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
+    const tooLong = 'z'.repeat(MAX_TOPIC_LEN + 1);
+    const exact = 'w'.repeat(MAX_TOPIC_LEN);
+    const rec = decodePresence(
+      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [tooLong, 'ctx-.*', exact] }),
+    );
+    expect(rec?.postTopics).toEqual(['ctx-.*', exact]);
+    expect(rec?.postTopics).not.toContain(tooLong);
   });
 });
 
@@ -235,5 +259,171 @@ describe('computeRoster', () => {
       beat('claude-a', 'heartbeat', now - 1_000, 2),
     ];
     expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['claude-a', 'claude-b']);
+  });
+
+  // SEC-03 — the self-reported `at` is untrusted; a far-future value must never enter the roster,
+  // where it would read as permanently `online` and pin a phantom hand-off target at the top forever.
+  const FUTURE_AT = 8_640_000_000_000_000; // the spoof value from the finding (max Date ms)
+
+  it('SEC-03 — a far-future spoofed `at` never enters the roster: no phantom online peer, no top slot', () => {
+    // An attacker plants an astronomical `at`; a legitimate peer beats at `now`. The spoof must be
+    // dropped at decode — not clamped-to-now (which would re-read it as freshly live every call).
+    const roster = computeRoster(
+      [beat('zzz-attacker', 'heartbeat', FUTURE_AT, 1, ['dev']), beat('real', 'heartbeat', now, 2, ['ctx'])],
+      now,
+      opts,
+    );
+    expect(roster.map((e) => e.handle)).toEqual(['real']); // only the legit peer survives
+    expect(roster.find((e) => e.handle === 'zzz-attacker')).toBeUndefined(); // no online AND no offline phantom
+    expect(roster[0]?.online).toBe(true);
+  });
+
+  it('SEC-03 — a far-future spoof cannot outlive a legit peer that ages out (immune-forever regression)', () => {
+    // Evaluate well past ttl AND sinceMs with no fresh beats: the legit peer correctly ages out and is
+    // dropped, and the phantom must NOT be left behind as the sole surviving (online) hand-off target.
+    const msgs = [
+      beat('zzz-attacker', 'heartbeat', FUTURE_AT, 1, ['dev']),
+      beat('real', 'heartbeat', now, 2, ['ctx']),
+    ];
+    expect(computeRoster(msgs, now + 100 * ttl, opts)).toEqual([]);
+  });
+
+  it('SEC-03 — decode rejects a beat beyond the skew tolerance but keeps one exactly at it', () => {
+    const at = (delta: number) => JSON.stringify({ v: 2, kind: 'hello', at: now + delta, topics: ['ctx'] });
+    expect(decodePresence(at(MAX_CLOCK_SKEW_MS + 1), now)).toBeNull(); // just beyond tolerance ⇒ dropped
+    expect(decodePresence(at(MAX_CLOCK_SKEW_MS), now)?.at).toBe(now + MAX_CLOCK_SKEW_MS); // boundary kept
+    expect(decodePresence(at(1e12), now)).toBeNull(); // far future ⇒ dropped
+    expect(decodePresence(at(1e12))).not.toBeNull(); // pure decode (no now) leaves `at` unbounded
+  });
+
+  it('SEC-03 — a legitimate small clock skew (at = now + 1s) still reads online', () => {
+    const roster = computeRoster([beat('peer', 'heartbeat', now + 1_000, 1)], now, opts);
+    expect(roster[0]?.online).toBe(true);
+  });
+
+  it('SEC-03 — the guard leaves the normal past-TTL offline path intact (only far-future ats are dropped)', () => {
+    const roster = computeRoster([beat('old', 'heartbeat', now - ttl - 1, 1)], now, opts);
+    expect(roster[0]?.online).toBe(false);
+  });
+});
+
+// CX-05 payoff: the hand-off reachability predicate is now a PURE, directly-callable function that
+// lives beside computeRoster — no MCP client/server harness required (the whole point of the extract).
+describe('filterReachable (pure reachability predicate — CX-05)', () => {
+  /** A roster entry; only `topics`/`postTopics` drive the predicate (online/lastSeenMs are inert here). */
+  const entry = (handle: string, topics: string[], postTopics: string[] = []): RosterEntry => ({
+    handle: asHandle(handle),
+    online: true,
+    topics,
+    postTopics,
+    lastSeenMs: 0,
+  });
+  const NEVER = () => false;
+
+  it('(a) scoped — includes a peer that only PATTERN-matches the scope via postTopics; excludes one that neither subscribes nor matches', () => {
+    const roster = [
+      entry('subber', ['ctx-adhoc']), // subscribes to the scope directly
+      entry('poster', ['elsewhere'], ['ctx-.*']), // only its post-pattern covers the scope
+      entry('stranger', ['other'], ['unrelated-.*']), // neither subscribes nor matches
+    ];
+    const got = filterReachable(roster, { scope: 'ctx-adhoc', canPostTo: NEVER, mySubscribedTopics: [] });
+    expect(got.map((e) => e.handle)).toEqual(['subber', 'poster']);
+  });
+
+  it('(b) unscoped bidirectional — includes a peer I can post to AND a peer that can post to a topic I subscribe to; excludes an unrelated peer', () => {
+    const roster = [
+      entry('i-can-post-to', ['their-topic']), // I can post to a topic it subscribes to
+      entry('can-post-to-me', ['elsewhere'], ['mine-.*']), // its post-pattern covers a topic I subscribe to
+      entry('unrelated', ['nowhere'], ['no-.*']), // no channel in either direction
+    ];
+    const got = filterReachable(roster, {
+      scope: undefined,
+      canPostTo: (t) => t === 'their-topic', // stands in for `allow.has`
+      mySubscribedTopics: ['mine-1'], // stands in for `allow.topics()`
+    });
+    expect(got.map((e) => e.handle).sort()).toEqual(['can-post-to-me', 'i-can-post-to']);
+  });
+
+  it('(c) silently ignores a hostile un-compilable / over-long postTopics source (never throws), scoped or unscoped', () => {
+    const roster = [entry('hostile', ['other'], ['(', 'x'.repeat(10_000)])];
+    const scoped = () => filterReachable(roster, { scope: 'ctx', canPostTo: NEVER, mySubscribedTopics: [] });
+    const unscoped = () =>
+      filterReachable(roster, { scope: undefined, canPostTo: NEVER, mySubscribedTopics: ['ctx'] });
+    expect(scoped).not.toThrow();
+    expect(unscoped).not.toThrow();
+    expect(scoped()).toEqual([]); // broken/huge patterns compile to nothing ⇒ no false match
+    expect(unscoped()).toEqual([]);
+  });
+
+  it('(d) SEC-08 — a beat of 64 nested-quantifier postTopics returns in bounded time (no ReDoS hang)', () => {
+    // A hostile peer plants the maximum 64 catastrophic-backtracking sources; the reader's real,
+    // short topic name is the match input. On the unfixed code a single `.test` against a 15-char
+    // topic hangs the whole process for >8s — here the ReDoS screen rejects the sources up front, so
+    // the pathological peer is simply excluded (no shared channel) and the call returns immediately.
+    const evil = '((([a-z-]+)+)+)+[0-9]'; // 20 source chars, catastrophic on Node's engine
+    const roster = [entry('attacker', ['some-other-ctx'], Array<string>(64).fill(evil))];
+    const scopedT0 = performance.now();
+    const scoped = filterReachable(roster, {
+      scope: 'team-eng-alerts', // a short, ordinary 15-char topic the unfixed matcher hangs on
+      canPostTo: NEVER,
+      mySubscribedTopics: [],
+    });
+    expect(performance.now() - scopedT0).toBeLessThan(200);
+    expect(scoped).toEqual([]);
+
+    const unscopedT0 = performance.now();
+    const unscoped = filterReachable(roster, {
+      scope: undefined,
+      canPostTo: NEVER,
+      mySubscribedTopics: ['team-eng-alerts'],
+    });
+    expect(performance.now() - unscopedT0).toBeLessThan(200);
+    expect(unscoped).toEqual([]);
+  });
+
+  it('(d2) SEC-08 — a BOUNDED exact-count nested quantifier is also screened (no ReDoS hang)', () => {
+    // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` has only `*` and a bounded exact
+    // `{40}` (no unbounded outer quantifier), so the earlier screen — which rejected only UNBOUNDED
+    // outer quantifiers — let it through, yet V8 unrolls `{40}` into 40 sequential `*`-bodies and the
+    // match hangs Node for tens of seconds on a short 15-char topic. The screen must reject a risky
+    // body repeated `>= 2` times regardless of boundedness, so the peer is excluded and the call
+    // returns immediately.
+    const evil = '([a-z-]*){40}[0-9]';
+    const roster = [entry('attacker', ['some-other-ctx'], Array<string>(64).fill(evil))];
+    const scopedT0 = performance.now();
+    const scoped = filterReachable(roster, {
+      scope: 'team-eng-alerts', // a short, ordinary 15-char topic the unfixed matcher hangs on
+      canPostTo: NEVER,
+      mySubscribedTopics: [],
+    });
+    expect(performance.now() - scopedT0).toBeLessThan(200);
+    expect(scoped).toEqual([]);
+
+    const unscopedT0 = performance.now();
+    const unscoped = filterReachable(roster, {
+      scope: undefined,
+      canPostTo: NEVER,
+      mySubscribedTopics: ['team-eng-alerts'],
+    });
+    expect(performance.now() - unscopedT0).toBeLessThan(200);
+    expect(unscoped).toEqual([]);
+  });
+
+  it('(e) SEC-08 — a benign postTopics pattern still legitimately matches (screen preserves semantics)', () => {
+    const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
+    // scoped: the peer's `team-.*` covers the scope.
+    expect(
+      filterReachable(roster, { scope: 'team-eng-alerts', canPostTo: NEVER, mySubscribedTopics: [] }).map(
+        (e) => e.handle,
+      ),
+    ).toEqual(['peer']);
+    // unscoped: the peer can post to a topic I subscribe to.
+    expect(
+      filterReachable(roster, {
+        scope: undefined,
+        canPostTo: NEVER,
+        mySubscribedTopics: ['team-eng-alerts'],
+      }).map((e) => e.handle),
+    ).toEqual(['peer']);
   });
 });

@@ -43,6 +43,10 @@ export interface FakeZulip {
   url: string;
   /** Drop ALL event queues without notice (simulates Zulip's ~10-min-idle GC / a restart). */
   gcQueues(): void;
+  /** Make the next `GET /api/v1/messages` fail once with a 502 (a transient history-read blip). */
+  failNextMessagesRead(): void;
+  /** Make the next `n` `GET /api/v1/messages` reads fail with a 502, then behave normally. */
+  failMessagesReads(n: number): void;
   close(): Promise<void>;
 }
 
@@ -50,6 +54,7 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
   const heartbeatMs = opts?.heartbeatMs ?? 10_000;
   let msgSeq = 0;
   let queueSeq = 0;
+  let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
   const messages: WireMessage[] = []; // ascending by id by construction
   const queues = new Map<string, Queue>();
 
@@ -120,6 +125,12 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
       }
 
       case 'GET /api/v1/messages': {
+        // Injected transient failure: a proxy 502 on the history read (gap-fill / fetchRecent).
+        if (failMessagesReadsRemaining > 0) {
+          failMessagesReadsRemaining--;
+          json(res, 502, { result: 'error', msg: 'Bad gateway' });
+          return;
+        }
         const narrow = JSON.parse(url.searchParams.get('narrow') ?? '[]') as Array<{
           operator: string;
           operand: string;
@@ -219,6 +230,12 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
       // poll gets BAD_EVENT_QUEUE_ID and must re-register + gap-fill.
       for (const q of queues.values()) dropWaiter(q, true);
       queues.clear();
+    },
+    failNextMessagesRead: () => {
+      failMessagesReadsRemaining = 1;
+    },
+    failMessagesReads: (n: number) => {
+      failMessagesReadsRemaining = n;
     },
     close: async () => {
       for (const q of queues.values()) dropWaiter(q, true);

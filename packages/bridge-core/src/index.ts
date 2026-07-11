@@ -5,8 +5,9 @@
 export { CORE_VERSION } from './version.js';
 
 // The seam + normalized Message (DESIGN §4/§5/§6).
-export type { Topic, Handle, BackendMsgId, Cursor, Message } from './message.js';
-export { asTopic, asHandle, asBackendMsgId, asCursor } from './message.js';
+export type { Topic, Handle, BackendMsgId, Cursor, Message, BuildMessageInput } from './message.js';
+export { asTopic, asHandle, asBackendMsgId, asCursor, buildMessage } from './message.js';
+export { safeName } from './topic-name.js';
 export type {
   BackendPlugin,
   BackendConfig,
@@ -15,6 +16,7 @@ export type {
   FetchRecentResult,
   MessageHandler,
 } from './seam.js';
+export { NoSuchTopicError } from './seam.js';
 
 // Shared helpers (used by plugins and core alike).
 export { parseMentions } from './mentions.js';
@@ -41,23 +43,15 @@ export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
 // Presence: the reachability roster derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
 export {
-  encodePresence,
-  decodePresence,
-  computeRoster,
   DEFAULT_PRESENCE_TOPIC,
-  MAX_RECORD_TOPICS,
-  MAX_INSTANCE_ID_LEN,
   type PresenceKind,
   type PresenceRecord,
   type RosterEntry,
   type RosterOptions,
 } from './engine/presence.js';
 
-// Handle glob filtering (parley_list_users).
-export { matchGlob, filterHandles } from './identity-filter.js';
-
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
-export { registerTools, buildToolDefs, type ToolDeps } from './transport/tools.js';
+export { registerTools, type ToolDeps } from './transport/tools.js';
 export {
   emitChannel,
   channelMeta,

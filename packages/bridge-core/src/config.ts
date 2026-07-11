@@ -11,8 +11,20 @@ import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
  */
 export const OidcAuthSchema = z.object({
   /** OIDC issuer, e.g. https://kc.example.com/realms/myrealm. Discovery is fetched from
-   *  `<issuer>/.well-known/openid-configuration` at startup. */
-  issuer: z.string().url(),
+   *  `<issuer>/.well-known/openid-configuration` at startup. Must be https — the JWKS trust
+   *  root depends on TLS — except on loopback, where test/dev fakes serve over http. */
+  issuer: z
+    .string()
+    .url()
+    .refine(
+      (u) => {
+        const url = new URL(u);
+        return (
+          url.protocol === 'https:' || url.hostname === '127.0.0.1' || url.hostname === 'localhost'
+        );
+      },
+      { message: 'auth.oidc.issuer must use https (the JWKS trust root depends on TLS)' },
+    ),
   /** Expected `aud` value. Default: the canonical resource id (public URL + mcpPath). Keycloak
    *  ignores RFC 8707 `resource`, so an audience mapper must emit this exact string — see
    *  docs/keycloak-integration.md. */
@@ -47,6 +59,27 @@ export const AuthSchema = z
         path: ['oidc'],
         message: 'auth.mode "oidc" requires an auth.oidc block',
       });
+      return;
+    }
+    if (a.mode === 'oidc' && a.oidc !== undefined) {
+      // Delegated OIDC has no owner-consent step, so an identity gate is the ONLY thing that
+      // keeps a shared/corporate realm from authorizing every realm user. Require at least one.
+      // `required_scope` alone is insufficient (Claude's connector may request no scopes).
+      const { allowed_subjects, allowed_usernames, required_role } = a.oidc;
+      if (
+        allowed_subjects === undefined &&
+        allowed_usernames === undefined &&
+        required_role === undefined
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['oidc'],
+          message:
+            'auth.mode "oidc" requires an identity gate: set at least one of ' +
+            'allowed_subjects / allowed_usernames / required_role to preserve the single-tenant ' +
+            'posture (required_scope alone is not sufficient). See docs/keycloak-integration.md.',
+        });
+      }
     }
   });
 
@@ -146,6 +179,17 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
       code: z.ZodIssueCode.custom,
       path: ['topics'],
       message: `${JSON.stringify(cfg.presence.topic)} is reserved for presence (presence.topic); rename the topic or change presence.topic`,
+    });
+  }
+  // `ttl_ms` is populated by the dependent-default transform before superRefine runs (default 3×, or
+  // the pinned value), so it is always a number here. A ttl below the heartbeat cadence would make
+  // every genuinely running instance read as offline in computeRoster between beats (BUG-34).
+  if (cfg.presence.ttl_ms < cfg.presence.heartbeat_ms) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['presence', 'ttl_ms'],
+      message:
+        'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
     });
   }
 });

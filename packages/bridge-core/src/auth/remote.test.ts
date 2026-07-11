@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
+import { ConsentError } from './oauth-provider.js';
 import { ownerVerifierFromPassphrase } from './owner.js';
 import { createOAuthRemoteApp, type OAuthRemoteServer } from './remote.js';
 
@@ -143,6 +144,40 @@ async function mcpClientWithToken(accessToken: string): Promise<Client> {
   return client;
 }
 
+/** Drive DCR + /authorize and scrape the pending consent_id from the rendered consent page. */
+async function authorizeToConsentId(): Promise<string> {
+  const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+  const reg = await jget(
+    await fetch(as.registration_endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [CLIENT_REDIRECT], token_endpoint_auth_method: 'none' }),
+    }),
+  );
+  const { challenge } = pkce();
+  const authorizeUrl = new URL(as.authorization_endpoint);
+  authorizeUrl.search = form({
+    response_type: 'code',
+    client_id: reg.client_id,
+    redirect_uri: CLIENT_REDIRECT,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    resource: `${origin}/mcp`,
+  });
+  const html = await (await fetch(authorizeUrl.href)).text();
+  const consentId = /name="consent_id" value="([^"]+)"/.exec(html)?.[1];
+  expect(consentId).toBeTruthy();
+  return consentId!;
+}
+
+const postConsent = (consentId: string, passphrase: string) =>
+  fetch(`${origin}/parley/consent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: form({ consent_id: consentId, passphrase }),
+    redirect: 'manual',
+  });
+
 describe('remote OAuth front door (single-tenant)', () => {
   it('rejects unauthenticated /mcp with 401 + WWW-Authenticate → PRM (discovery)', async () => {
     const res = await fetch(`${origin}/mcp`, {
@@ -154,6 +189,46 @@ describe('remote OAuth front door (single-tenant)', () => {
     const www = res.headers.get('www-authenticate') ?? '';
     expect(www.toLowerCase()).toContain('bearer');
     expect(www).toContain('/.well-known/oauth-protected-resource/mcp');
+  });
+
+  // SEC-04: the browser-facing OAuth front door must carry anti-clickjacking / hardening headers on
+  // EVERY response (app-wide middleware covers /authorize + /parley/consent), and the consent page
+  // must lead with the trustworthy redirect ORIGIN, demoting the attacker-controlled client_name to
+  // a muted line so a spoofed name ("Claude Desktop") is less convincing.
+  it('sets security headers and de-emphasizes client_name on the /authorize consent page', async () => {
+    const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+    const reg = await jget(
+      await fetch(as.registration_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [CLIENT_REDIRECT],
+          token_endpoint_auth_method: 'none',
+          client_name: 'Claude Desktop',
+        }),
+      }),
+    );
+    const { challenge } = pkce();
+    const authorizeUrl = new URL(as.authorization_endpoint);
+    authorizeUrl.search = form({
+      response_type: 'code',
+      client_id: reg.client_id,
+      redirect_uri: CLIENT_REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      resource: `${origin}/mcp`,
+      scope: 'mcp',
+    });
+    const res = await fetch(authorizeUrl.href);
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('strict-transport-security')).toBeTruthy();
+    const html = await res.text();
+    // Leads with the redirect ORIGIN prominently; the client-supplied name is demoted to the muted line.
+    const redirectOrigin = new URL(CLIENT_REDIRECT).origin;
+    expect(html).toContain(`<strong>${redirectOrigin}</strong>`);
+    expect(html).toContain('class="muted">Client-supplied name: Claude Desktop');
   });
 
   it('completes discovery → DCR → PKCE → owner consent → token, then post/fetch over MCP', async () => {
@@ -217,6 +292,87 @@ describe('remote OAuth front door (single-tenant)', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
+  });
+
+  // SEC-01 / D2: a wrong guess must CONSUME the pending consent — one-shot consent_id. A second POST
+  // with the same consent_id and the CORRECT passphrase must be rejected (not a 302 with a code).
+  // Pre-fix, the correct second guess would 302 back with a code; this pins the one-shot delete.
+  it('consumes the pending consent on a wrong guess (consent_id is one-shot)', async () => {
+    const consentId = await authorizeToConsentId();
+    const first = await postConsent(consentId, 'wrong');
+    expect(first.status).toBe(403);
+    // Retry the SAME consent_id with the correct passphrase — must be rejected, not redirected.
+    const second = await postConsent(consentId, OWNER_PASS);
+    expect(second.status).toBe(403);
+    expect(second.status).not.toBe(302);
+    const back = second.headers.get('location');
+    expect(back === null || !new URL(back, origin).searchParams.has('code')).toBe(true);
+  });
+
+  // SEC-01 / D1: the hand-mounted consent route carries its own strict express-rate-limit. Firing
+  // limit + 1 POSTs from the same client returns 429 on the final one (per-test app ⇒ fresh counter).
+  it('rate-limits /parley/consent (429 past the limit)', async () => {
+    const LIMIT = 10;
+    let last: Response | undefined;
+    for (let i = 0; i < LIMIT + 1; i++) {
+      last = await postConsent('nonexistent', 'wrong');
+    }
+    expect(last!.status).toBe(429);
+  });
+
+  // CX-04: the shared escapeHtml is wired at BOTH consent-flow render sites (the /authorize consent
+  // page and the /parley/consent 403 error page). Drive each with a hostile string and assert the
+  // served HTML carries escaped entities and no raw markup.
+  const HOSTILE = '<script>a&"\'';
+  const ESCAPED = '&lt;script&gt;a&amp;&quot;&#39;';
+
+  it('escapes a hostile client_name in the rendered consent page', async () => {
+    const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+    const reg = await jget(
+      await fetch(as.registration_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [CLIENT_REDIRECT],
+          token_endpoint_auth_method: 'none',
+          client_name: HOSTILE,
+        }),
+      }),
+    );
+    const { challenge } = pkce();
+    const authorizeUrl = new URL(as.authorization_endpoint);
+    authorizeUrl.search = form({
+      response_type: 'code',
+      client_id: reg.client_id,
+      redirect_uri: CLIENT_REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      resource: `${origin}/mcp`,
+      scope: 'mcp',
+    });
+    const html = await (await fetch(authorizeUrl.href)).text();
+    expect(html).toContain(ESCAPED);
+    expect(html).not.toContain('<script>');
+  });
+
+  it('escapes a hostile ConsentError message in the 403 owner-consent error page', async () => {
+    // Force the consent handler down its ConsentError branch with an attacker-shaped message
+    // (the real messages are fixed strings; this proves the 403 render escapes through the shared
+    // escapeHtml, not that the message is user-controlled today). Same stub pattern the tools tests
+    // use for backend failures.
+    remote.provider.completeConsent = () => {
+      throw new ConsentError(HOSTILE);
+    };
+    const res = await fetch(`${origin}/parley/consent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form({ consent_id: 'x', passphrase: 'y' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+    const html = await res.text();
+    expect(html).toContain(ESCAPED);
+    expect(html).not.toContain('<script>');
   });
 
   it('refresh_token rotation issues a new access token and one-time-uses the old refresh', async () => {

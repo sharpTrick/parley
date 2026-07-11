@@ -10,7 +10,7 @@ import type { BackendConfig, BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
 import { startPresenceLoop, type PresenceLoop } from './presence-loop.js';
 import { startPushLoop } from './push-loop.js';
-import { registerTools } from './tools.js';
+import { registerTools, toolDepsFor } from './tools.js';
 
 /** The system-prompt string Claude Code adds when it loads this channel (channels gate). */
 const CHANNEL_INSTRUCTIONS = [
@@ -61,21 +61,30 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   const readState = new ReadStateStore(statePath);
 
   // Reactive role: tools share this one `seen` set with the push loop so a message pulled via
-  // the fetch_recent tool is not later re-pushed.
-  registerTools(server, { plugin, identity, allow, seen, presenceTopic, presenceTtlMs: cfg.presence.ttl_ms });
+  // the fetch_recent tool is not later re-pushed. `toolDepsFor` is the single factory both
+  // composition roots use to derive ToolDeps from config (CX-09).
+  registerTools(server, toolDepsFor(plugin, cfg, { seen }));
 
   await plugin.connect(cfg.backend_config as BackendConfig);
 
   // On-start catch-up: advance the per-instance read cursor + warm the seen-set BEFORE the
   // push loop starts (so the live path doesn't double-emit across the boundary). Does not emit.
-  if (cfg.catchup.on_start) {
-    await catchUpAll({
-      plugin,
-      topics: allow.topics(),
-      limit: cfg.catchup.limit,
-      readState,
-      seen,
-    });
+  // BUG-27: if catch-up throws AFTER connect, the caller never receives a ParleyBridge to call
+  // shutdown() on, so disconnect the plugin here (releasing its poll/prune timers) before
+  // re-throwing — otherwise a leaked connection keeps the event loop alive and hangs the process.
+  try {
+    if (cfg.catchup.on_start) {
+      await catchUpAll({
+        plugin,
+        topics: allow.topics(),
+        limit: cfg.catchup.limit,
+        readState,
+        seen,
+      });
+    }
+  } catch (e) {
+    await plugin.disconnect().catch(() => {});
+    throw e;
   }
 
   let attached = false;
@@ -86,19 +95,28 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
       if (attached) throw new Error('bridge already attached');
       attached = true;
       await server.connect(transport);
-      // Announce presence regardless of live_push — a reactive-only bridge is still a live
-      // participant others can discover via parley_list_users (DESIGN §7).
-      if (cfg.presence.enabled) {
-        presence = startPresenceLoop(plugin, identity, allow, {
-          presenceTopic,
-          heartbeatMs: cfg.presence.heartbeat_ms,
-        });
-      }
-      if (cfg.live_push.enabled) {
-        await startPushLoop(server, plugin, allow, seen, {
-          mentionFilter: cfg.live_push.mention_filter,
-          identity,
-        });
+      // BUG-28: wire the live push path BEFORE announcing presence, so the bridge is only
+      // advertised as reachable once it can actually deliver. BUG-27: if any step throws, stop
+      // whatever was already started (the presence loop, if reached) before re-throwing, so a
+      // failed attach does not leave the bridge half-live with a running presence loop.
+      try {
+        if (cfg.live_push.enabled) {
+          await startPushLoop(server, plugin, allow, seen, {
+            mentionFilter: cfg.live_push.mention_filter,
+            identity,
+          });
+        }
+        // Announce presence regardless of live_push — a reactive-only bridge is still a live
+        // participant others can discover via parley_list_users (DESIGN §7).
+        if (cfg.presence.enabled) {
+          presence = startPresenceLoop(plugin, identity, allow, {
+            presenceTopic,
+            heartbeatMs: cfg.presence.heartbeat_ms,
+          });
+        }
+      } catch (e) {
+        await presence?.stop().catch(() => {});
+        throw e;
       }
     },
     async shutdown() {

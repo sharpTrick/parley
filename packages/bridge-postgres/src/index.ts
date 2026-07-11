@@ -2,20 +2,20 @@ import { createHash } from 'node:crypto';
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import { Client, Pool } from 'pg';
 import { assertTableName, buildSchema, type MessageRow } from './schema.js';
 
@@ -38,12 +38,16 @@ const DRAIN_BATCH = 512;
 /** Backoff between listener reconnect attempts after the connection drops. */
 const RECONNECT_DELAY_MS = 500;
 
-const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
 /** Live-path bookkeeping for one subscribed topic (keyed by NOTIFY channel). */
 interface TopicSubscription {
   topic: Topic;
-  handler: MessageHandler;
+  /**
+   * Every handler subscribed to this NOTIFY channel; a repeat `subscribe(topic, …)` appends
+   * (matching bridge-xmpp) so a second subscribe doesn't silently replace the first. The channel
+   * is drained once per notification and fanned out to all handlers, so the `lastSeen`/coalescing
+   * bookkeeping stays shared per channel.
+   */
+  handlers: MessageHandler[];
   /** Highest seq already delivered (as text — BIGINT round-trips as a string). */
   lastSeen: string;
   /** In-flight guard: at most one drain loop per topic at a time. */
@@ -78,6 +82,16 @@ export class PostgresPlugin implements BackendPlugin {
     this.url = cfg.url ?? DEFAULT_URL;
     this.table = assertTableName(cfg.table_name ?? 'parley_messages');
     this.stopped = false;
+
+    // SEC-06: warn loudly before the schema bootstrap when the operator is connecting with the
+    // repo-public default DSN (unset → fell back, or set literally to the well-known value).
+    if (cfg.url === undefined || this.url === DEFAULT_URL) {
+      console.warn(
+        '[parley-postgres] SECURITY: connecting with the built-in default DSN ' +
+          "('postgres://parley:parley@…'). Set backend_config.url to a real connection string; a " +
+          'network-reachable database provisioned with these credentials is world-readable/injectable.',
+      );
+    }
 
     const pool = new Pool({ connectionString: this.url, max: cfg.pool_size ?? 5 });
     pool.on('error', () => {
@@ -198,6 +212,15 @@ export class PostgresPlugin implements BackendPlugin {
     const listener = await this.ensureListener();
     const channel = channelFor(topic);
 
+    // Repeat subscribe on the same topic: append to the channel's handler list (matching
+    // bridge-xmpp) — the channel is already LISTENed and drained, so the new handler just joins
+    // the fan-out from here on (push never replays history).
+    const existing = this.subs.get(channel);
+    if (existing !== undefined) {
+      existing.handlers.push(handler);
+      return;
+    }
+
     // Tail first: push never replays history (catch-up owns it).
     const res = await pool.query(
       `SELECT COALESCE(MAX(seq), 0)::text AS max FROM ${this.table} WHERE topic = $1`,
@@ -205,13 +228,17 @@ export class PostgresPlugin implements BackendPlugin {
     );
     const sub: TopicSubscription = {
       topic,
-      handler,
+      handlers: [handler],
       lastSeen: (res.rows[0] as { max: string }).max,
       draining: false,
       pending: false,
     };
-    this.subs.set(channel, sub);
+    // LISTEN before we register (BUG-29): a rejected LISTEN must leave no entry in `this.subs`,
+    // or the next reconnect would re-LISTEN and re-drain a channel the caller was told FAILED to
+    // subscribe. Registering only after the LISTEN resolves keeps the tail-read → LISTEN window
+    // covered too — a row committed in it has seq > lastSeen, so the drain below still catches it.
     await listener.query(`LISTEN "${channel}"`);
+    this.subs.set(channel, sub);
     // Cover the tail-read → LISTEN window: a row committed inside it never notified us.
     this.drain(sub);
   }
@@ -286,8 +313,21 @@ export class PostgresPlugin implements BackendPlugin {
         this.wireListener(client);
         try {
           await client.connect();
+          // A disconnect() can complete fully while connect() is in flight (BUG-16). If it did,
+          // this candidate must not become the live listener: end it and return, or its open pg
+          // socket keeps the Node event loop referenced (shutdown/tests hang) and `this.listener`
+          // is resurrected after a completed disconnect.
+          if (this.stopped) {
+            await client.end().catch(() => undefined);
+            return;
+          }
           for (const channel of this.subs.keys()) {
             await client.query(`LISTEN "${channel}"`);
+          }
+          // Re-check after the LISTEN loop's awaits, before publishing `this.listener`.
+          if (this.stopped) {
+            await client.end().catch(() => undefined);
+            return;
           }
           this.listener = client;
           this.listenerPromise = Promise.resolve(client);
@@ -330,10 +370,15 @@ export class PostgresPlugin implements BackendPlugin {
             if (rows.length === 0) break;
             for (const row of rows) {
               sub.lastSeen = String(row.seq);
-              try {
-                sub.handler(rowToMessage(row));
-              } catch {
-                /* handler is best-effort; never break the loop (DESIGN §6) */
+              const msg = rowToMessage(row);
+              // Fan out to every handler on this channel, each best-effort in its own try/catch
+              // so one throwing handler can't starve the others (DESIGN §6).
+              for (const handler of sub.handlers) {
+                try {
+                  handler(msg);
+                } catch {
+                  /* handler is best-effort; never break the loop (DESIGN §6) */
+                }
               }
             }
           }
@@ -365,14 +410,11 @@ function channelFor(topic: Topic): string {
 }
 
 function rowToMessage(row: MessageRow): Message {
-  const id = String(row.seq);
-  return {
+  return buildMessage({
     topic: asTopic(row.topic),
-    senderHandle: asHandle(row.sender),
+    sender: row.sender,
     content: row.content,
     timestamp: row.ts,
-    backendMsgId: asBackendMsgId(id),
-    cursor: asCursor(id),
-    mentions: parseMentions(row.content),
-  };
+    id: String(row.seq),
+  });
 }

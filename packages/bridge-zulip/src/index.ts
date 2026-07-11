@@ -1,20 +1,20 @@
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
+  buildMessage,
   type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
   type Message,
   type MessageHandler,
-  parseMentions,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -104,6 +104,17 @@ export class ZulipPlugin implements BackendPlugin {
     this.eventsTimeoutMs = cfg.events_timeout_ms ?? 25_000;
     this.stopped = false;
     this.connected = true;
+
+    // SEC-06: connect() never contacts the server (auth is per-request), so a bad key surfaces
+    // only on first use — warn here when the effective API key is the repo-public default so the
+    // operator is told at startup rather than silently running with a well-known credential.
+    if (cfg.api_key === undefined || this.apiKey === 'parley-api-key') {
+      console.warn(
+        '[parley-zulip] SECURITY: connecting with the built-in default API key ' +
+          "('parley-api-key'). Set backend_config.api_key to a real secret; a network-reachable " +
+          'Zulip bot provisioned with this key is world-readable/injectable.',
+      );
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -165,10 +176,15 @@ export class ZulipPlugin implements BackendPlugin {
    * expectation.
    *
    * Queue GC: Zulip garbage-collects queues after ~10 min idle; the server then answers
-   * `BAD_EVENT_QUEUE_ID`. Recovery: re-register (new tail), then GAP-FILL — replay every message
-   * with id > the last delivered id through the catch-up path — so the dead-queue window is not
-   * lost, then resume the loop on the new queue. `lastDeliveredId` also dedupes the overlap when
-   * a gap-filled message's event later arrives on the fresh queue.
+   * `BAD_EVENT_QUEUE_ID`. Recovery: re-register (new tail) and ARM a pending gap
+   * (`needsGapFillFrom`); the top of the loop then GAP-FILLS — replays every message with id > the
+   * last delivered id through the catch-up path — RETRYING until it succeeds before polling the
+   * fresh queue, so a transient gap-fill failure (a network blip / non-2xx history read) can no
+   * longer punch a permanent hole in the push stream. Register failures and gap-fill failures
+   * retry independently. Gap-fill advances the delivered watermark PER PAGE, so a mid-pagination
+   * throw keeps its partial progress and a retry does not re-deliver already-delivered pages.
+   * `lastDeliveredId` also dedupes the overlap when a gap-filled message's event later arrives on
+   * the fresh queue.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
@@ -180,9 +196,28 @@ export class ZulipPlugin implements BackendPlugin {
     // message landing in between is never lost — worst case it is delivered once via the queue.
     const tail = await this.fetchMessages(topic, undefined, 1);
     let lastDeliveredId = Number(tail.at(-1)?.backendMsgId ?? '0');
+    // A queue GC arms this with the last-delivered id; the top of the loop then drains it, retrying
+    // until the gap-fill read succeeds, so a transient failure can't leave a permanent push hole.
+    let needsGapFillFrom: number | undefined;
 
     const loop = async (): Promise<void> => {
       while (!this.stopped) {
+        // Drain a pending gap-fill BEFORE polling the fresh queue — retry the gap (not the events
+        // poll) until it clears, advancing `lastDeliveredId`/`needsGapFillFrom` per delivered page
+        // so a mid-pagination throw keeps its progress and a retry resumes past delivered pages.
+        if (needsGapFillFrom !== undefined) {
+          try {
+            lastDeliveredId = await this.gapFill(topic, needsGapFillFrom, handler, (id) => {
+              lastDeliveredId = id;
+              needsGapFillFrom = id;
+            });
+            needsGapFillFrom = undefined; // gap closed — resume normal polling
+          } catch {
+            if (this.stopped) break;
+            await delay(200);
+          }
+          continue; // re-check stopped / re-attempt before polling the fresh queue
+        }
         const controller = new AbortController();
         this.controllers.add(controller);
         // Client-side long-poll cap so the loop re-checks shutdown; un-acked events survive.
@@ -210,11 +245,16 @@ export class ZulipPlugin implements BackendPlugin {
         if (this.stopped) break;
         if (json.result === 'error') {
           if (json.code === 'BAD_EVENT_QUEUE_ID') {
+            // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
+            // Splitting register from gap-fill lets each retry independently: a register throw
+            // retries register, a gap-fill throw retries the gap-fill (not a wasted re-register).
             try {
               const fresh = await this.register(topic);
               state.queueId = fresh.queue_id;
               lastEventId = fresh.last_event_id;
-              lastDeliveredId = await this.gapFill(topic, lastDeliveredId, handler);
+              // Arm from the lowest outstanding watermark so a second GC racing before the first
+              // gap closes never skips messages (`lastDeliveredId` only moves forward in practice).
+              needsGapFillFrom = Math.min(needsGapFillFrom ?? lastDeliveredId, lastDeliveredId);
             } catch {
               if (this.stopped) break;
               await delay(200);
@@ -290,12 +330,22 @@ export class ZulipPlugin implements BackendPlugin {
     return (await res.json()) as { queue_id: string; last_event_id: number };
   }
 
-  /** Replay everything after `sinceId` through `handler`; returns the new last delivered id. */
-  private async gapFill(topic: Topic, sinceId: number, handler: MessageHandler): Promise<number> {
+  /**
+   * Replay everything after `sinceId` through `handler`; returns the new last delivered id.
+   * `onProgress` is invoked with the last delivered id after EACH page lands, so a caller retrying
+   * a throwing gap-fill can resume past already-delivered pages instead of re-delivering them (the
+   * history read at the top of the loop may throw on any non-2xx/network blip — the caller retries).
+   */
+  private async gapFill(
+    topic: Topic,
+    sinceId: number,
+    handler: MessageHandler,
+    onProgress: (id: number) => void,
+  ): Promise<number> {
     const page = 500;
     let cursor = asCursor(String(sinceId));
     for (;;) {
-      const messages = await this.fetchMessages(topic, cursor, page);
+      const messages = await this.fetchMessages(topic, cursor, page); // may throw → caller retries
       for (const m of messages) {
         try {
           handler(m);
@@ -305,7 +355,8 @@ export class ZulipPlugin implements BackendPlugin {
       }
       const last = messages.at(-1);
       if (last === undefined) return Number(cursor);
-      cursor = last.cursor;
+      cursor = last.cursor; // advance so a retry resumes past this delivered page
+      onProgress(Number(cursor)); // report per-page progress — durable across a later throw
       if (messages.length < page) return Number(cursor);
     }
   }
@@ -343,38 +394,33 @@ export class ZulipPlugin implements BackendPlugin {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
 
-    for (;;) {
-      const res = await fetch(url, {
+    return fetchWithRetry(
+      url,
+      {
         method,
         headers,
         body: opts?.form !== undefined ? new URLSearchParams(opts.form).toString() : undefined,
         signal: opts?.signal,
-      });
-      if (res.status === 429) {
+      },
+      {
+        label: `Zulip ${method} ${path}`,
         // Stop retrying once disconnected — don't compete for the rate-limit budget post-teardown.
-        if (this.stopped) throw new Error(`Zulip ${method} ${path} → 429 (disconnected)`);
-        const retryMs = await readRetryAfter(res);
-        await delay(retryMs);
-        continue;
-      }
-      if (res.ok || (opts?.allowStatuses?.includes(res.status) ?? false)) return res;
-      const text = await res.text();
-      throw new Error(`Zulip ${method} ${path} → ${res.status}: ${text}`);
-    }
+        isStopped: () => this.stopped,
+        retryAfterOf: readRetryAfter,
+        allowStatuses: opts?.allowStatuses,
+      },
+    );
   }
 }
 
 function zulipToMessage(topic: Topic, m: ZulipMessage): Message {
-  const content = m.content ?? '';
-  return {
+  return buildMessage({
     topic,
-    senderHandle: asHandle(m.sender_email ?? ''),
-    content,
+    sender: m.sender_email ?? '',
+    content: m.content ?? '',
     timestamp: new Date((m.timestamp ?? 0) * 1000).toISOString(),
-    backendMsgId: asBackendMsgId(String(m.id)),
-    cursor: asCursor(String(m.id)),
-    mentions: parseMentions(content),
-  };
+    id: String(m.id),
+  });
 }
 
 /** Zulip 429s carry `Retry-After` (header) and `retry-after` (JSON body), both in SECONDS. */
@@ -390,5 +436,3 @@ async function readRetryAfter(res: Response): Promise<number> {
   }
   return 500;
 }
-
-const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

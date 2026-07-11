@@ -34,6 +34,23 @@ describe('config loader', () => {
     expect(pinned.presence.ttl_ms).toBe(500_000);
   });
 
+  it('BUG-34 — rejects presence.ttl_ms below heartbeat_ms; accepts ttl_ms >= heartbeat_ms and the 3× default', () => {
+    // A pinned ttl below the (default 600s) heartbeat would read every live peer offline between beats.
+    expect(() =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], presence: { ttl_ms: 5 } }),
+    ).toThrow(/ttl_ms must be >= .*heartbeat_ms/);
+    // An explicit ttl >= heartbeat still parses...
+    expect(() =>
+      parseConfig({
+        identity: { handle: 'h' },
+        topics: ['ctx'],
+        presence: { heartbeat_ms: 60_000, ttl_ms: 500_000 },
+      }),
+    ).not.toThrow();
+    // ...as does the dependent-default (ttl = 3× heartbeat).
+    expect(() => parseConfig({ identity: { handle: 'h' }, topics: ['ctx'] })).not.toThrow();
+  });
+
   it('accepts post_topics and rejects an uncompilable regex', () => {
     const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-.*'] });
     expect(cfg.post_topics).toEqual(['ctx-.*']);
@@ -143,5 +160,57 @@ describe('config loader', () => {
         auth: { mode: 'oidc', oidc: { issuer: 'https://kc.example.com/realms/x', clock_skew_s: 301 } },
       }),
     ).toThrow();
+  });
+
+  it('rejects an oidc block with no identity gate (SEC-05 fail-closed)', () => {
+    const base = { identity: { handle: 'h' }, topics: ['a'] };
+    const issuer = 'https://kc.example.com/realms/x';
+    // Gate-less: none of allowed_subjects / allowed_usernames / required_role → rejected.
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: { mode: 'oidc', oidc: { issuer, audience: 'parley-mcp' } },
+      }),
+    ).toThrow(/identity gate/);
+    // required_scope alone is NOT a sufficient gate.
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: { mode: 'oidc', oidc: { issuer, required_scope: 'mcp' } },
+      }),
+    ).toThrow(/identity gate/);
+    // Any one of the three gates makes it parse.
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer, allowed_subjects: ['owner-sub'] } } }),
+    ).not.toThrow();
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer, allowed_usernames: ['alice'] } } }),
+    ).not.toThrow();
+    expect(() =>
+      parseConfig({ ...base, auth: { mode: 'oidc', oidc: { issuer, required_role: 'parley-owner' } } }),
+    ).not.toThrow();
+  });
+
+  it('rejects an http issuer but exempts loopback (SEC-19 https requirement)', () => {
+    const base = { identity: { handle: 'h' }, topics: ['a'] };
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: {
+          mode: 'oidc',
+          oidc: { issuer: 'http://kc.example.com/realms/x', required_role: 'parley-owner' },
+        },
+      }),
+    ).toThrow(/https/);
+    // Loopback stays usable so the in-process fake IdP (http://127.0.0.1) works in tests/dev.
+    expect(() =>
+      parseConfig({
+        ...base,
+        auth: {
+          mode: 'oidc',
+          oidc: { issuer: 'http://127.0.0.1:8080/realms/x', required_role: 'parley-owner' },
+        },
+      }),
+    ).not.toThrow();
   });
 });

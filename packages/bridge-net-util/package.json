@@ -1,0 +1,49 @@
+{
+  "name": "@sharptrick/parley-net-util",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "@sharptrick/parley-net-util — tiny internal HTTP helper (fetchWithRetry + delay) shared by the HTTP chat backends. NOT bridge-core: keeps the seam HTTP-free for SQLite/Redis/NATS/Postgres. Lockstep-published with the rest of Parley (semantic-release, no hand-versioning).",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sharpTrick/parley.git",
+    "directory": "packages/bridge-net-util"
+  },
+  "homepage": "https://github.com/sharpTrick/parley/tree/main/packages/bridge-net-util#readme",
+  "bugs": {
+    "url": "https://github.com/sharpTrick/parley/issues"
+  },
+  "author": {
+    "name": "Patrick Sharp",
+    "url": "https://github.com/sharpTrick"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "parley",
+    "http",
+    "retry",
+    "message-bus",
+    "agent-messaging"
+  ]
+}

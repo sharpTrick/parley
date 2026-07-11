@@ -24,6 +24,8 @@ interface StoredMessage {
   text: string;
   user: string;
   bot_id: string;
+  /** System/mutation records (`channel_join`, `message_changed`, …) carry a subtype; plain posts don't. */
+  subtype?: string;
 }
 
 /** Same integer-wise ts comparison the plugin uses — independent copy, not imported from src. */
@@ -37,6 +39,23 @@ function compareTs(a: string, b: string): number {
 
 const rand = (): string => Math.random().toString(36).slice(2, 10);
 
+/**
+ * Decode one form field the way real Slack does: scalar args arrive as plain strings; array/object
+ * args were `JSON.stringify`d by the plugin, so parse those back — but ONLY when the value actually
+ * looks like a JSON object/array. A numeric-looking scalar (e.g. a `ts` cursor `oldest`) MUST stay
+ * a string, so it is never round-tripped through `JSON.parse`.
+ */
+const decodeFormValue = (raw: string): unknown => {
+  if (raw.startsWith('{') || raw.startsWith('[')) {
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      /* not valid JSON after all — treat as a plain string */
+    }
+  }
+  return raw;
+};
+
 export class FakeSlack {
   /** Web API base, e.g. `http://127.0.0.1:PORT/api` — pass as the plugin's `api_url`. */
   readonly apiUrl: string;
@@ -46,10 +65,16 @@ export class FakeSlack {
   readonly pushed = new Set<string>();
   /** envelope_id of every ack received back over any socket. */
   readonly acked = new Set<string>();
+  /** Count of `apps.connections.open` calls served — a deterministic proxy for reconnect attempts. */
+  connectionsOpened = 0;
+  /** Count of `hello` envelopes sent (only when greeting) — marks a settled Socket Mode connection. */
+  helloSent = 0;
 
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly sockets = new Set<WebSocket>();
+  /** When false, new Socket Mode connections are closed WITHOUT `hello` (pre-`hello` close, BUG-30). */
+  private greet = true;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
   private counter = 0;
   private readonly channels = new Map<string, StoredMessage[]>();
@@ -81,10 +106,46 @@ export class FakeSlack {
           /* ignore non-JSON */
         }
       });
-      // Socket Mode greets with hello once the connection is ready (no envelope_id, no ack).
-      ws.send(JSON.stringify({ type: 'hello', num_connections: fake.sockets.size }));
+      if (fake.greet) {
+        // Socket Mode greets with hello once the connection is ready (no envelope_id, no ack).
+        fake.helloSent++;
+        ws.send(JSON.stringify({ type: 'hello', num_connections: fake.sockets.size }));
+      } else {
+        // Pre-`hello` close: accept the socket then immediately close it WITHOUT a hello, so the
+        // plugin's pre-`hello` close branch (BUG-30) is exercised on every reconnect attempt.
+        ws.close();
+      }
     });
     return fake;
+  }
+
+  /** Toggle whether new Socket Mode connections receive `hello` or are closed pre-`hello`. */
+  setGreet(on: boolean): void {
+    this.greet = on;
+  }
+
+  /** Close every currently-connected Socket Mode socket (simulate an established-socket drop). */
+  dropSockets(): void {
+    for (const ws of this.sockets) ws.close();
+  }
+
+  /**
+   * Bulk-seed a channel directly (bypassing `chat.postMessage`/the socket push) so pagination and
+   * subtype-filter tests can stage large / system-subtype-heavy histories the live path can't cheaply
+   * produce. `ts` is minted the same way `postMessage` does (unique, strictly increasing), so entries
+   * are returned in insertion (ascending-`ts`) order.
+   */
+  seed(channel: string, entries: Array<{ text: string; subtype?: string }>): StoredMessage[] {
+    const list = this.channels.get(channel) ?? [];
+    const created = entries.map((e) => {
+      const ts = `${Math.floor(Date.now() / 1000)}.${String(++this.counter).padStart(6, '0')}`;
+      const msg: StoredMessage = { type: 'message', ts, text: e.text, user: 'U0PARLEY', bot_id: 'B0PARLEY' };
+      if (e.subtype !== undefined) msg.subtype = e.subtype;
+      list.push(msg);
+      return msg;
+    });
+    this.channels.set(channel, list);
+    return created;
   }
 
   async close(): Promise<void> {
@@ -96,11 +157,13 @@ export class FakeSlack {
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body: Record<string, unknown> = {};
-    try {
-      body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>;
-    } catch {
-      /* fall through with empty body → method handlers reject as needed */
+    // The plugin form-encodes EVERY Web API call (application/x-www-form-urlencoded), exactly like
+    // real Slack expects. A regression back to a JSON request body would drop these args here
+    // (URLSearchParams finds no `key=value` pairs), so the conformance suite fails the way
+    // slack.com does — which is precisely what makes the BUG-25 fix CI-observable.
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of new URLSearchParams(Buffer.concat(chunks).toString('utf8'))) {
+      body[k] = decodeFormValue(v);
     }
 
     const reply = (payload: Record<string, unknown>): void => {
@@ -125,6 +188,7 @@ export class FakeSlack {
         reply(this.history(body));
         return;
       case 'apps.connections.open':
+        this.connectionsOpened++;
         reply({ ok: true, url: this.wsUrl });
         return;
       case 'auth.test':
