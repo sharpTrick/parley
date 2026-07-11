@@ -87,6 +87,11 @@ conformance suites to actually run instead of skip.
 ## Before opening a PR
 
 - `npm run build && npm test` green locally.
+- **Added a package, or changed packaging?** Run `npm run preflight:publish` (CI runs the same check
+  on every PR). It flags any public package that isn't on npm yet — the automated release can't
+  bootstrap one, so it must be [first-published by hand](#first-publish-of-a-brand-new-package-the-one-manual-case)
+  or marked `"private": true` before merge — plus any package whose tarball won't build. This catches
+  the failure *before* merge instead of after, when a half-finished release would split the registry.
 - **Title your PR as a [Conventional Commit].** A merge to `main` publishes, and the PR title is
   the message that decides the version bump — see [Releases & versioning](#releases--versioning).
   A CI check (`lint-title`) enforces this. Use `docs:`/`chore:`/`ci:` for changes that shouldn't

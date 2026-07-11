@@ -47,3 +47,21 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  # Catch release-publish failures on the PR, not post-merge when release.yml runs on main. The
+  # release publishes with OIDC / trusted publishing, which can't bootstrap a brand-new package —
+  # so a PR that adds one (or one whose tarball won't build) would go green here but split the
+  # registry on the next release. This gate fails the PR instead. Read-only against the registry.
+  publish-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build # pack validates the built dist/, so build first
+      - run: npm run preflight:publish

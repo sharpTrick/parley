@@ -7,47 +7,37 @@
 // erroring on the ones that made it out.
 //
 // Private workspaces (the examples/*) are skipped. Assumes versions were already stamped by
-// scripts/stamp-version.mjs.
-import { readFileSync, readdirSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+// scripts/stamp-version.mjs. The publishable set comes from scripts/lib/workspaces.mjs so it
+// stays in lockstep with the pre-merge preflight (scripts/publish-preflight.mjs).
 import { execFileSync } from 'node:child_process'
+import { publicWorkspaces } from './lib/workspaces.mjs'
 
-const ROOTS = ['packages', 'examples']
 let published = 0
 let skipped = 0
 
-for (const root of ROOTS) {
-  if (!existsSync(root)) continue
-  for (const dir of readdirSync(root)) {
-    const pkgPath = join(root, dir, 'package.json')
-    if (!existsSync(pkgPath)) continue
+for (const { name, version } of publicWorkspaces()) {
+  const spec = `${name}@${version}`
 
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
-    if (pkg.private) continue
-
-    const spec = `${pkg.name}@${pkg.version}`
-
-    // `npm view <spec> version` exits non-zero (E404) when the version isn't published yet.
-    let alreadyPublished = false
-    try {
-      execFileSync('npm', ['view', spec, 'version'], { stdio: 'ignore' })
-      alreadyPublished = true
-    } catch {
-      alreadyPublished = false
-    }
-
-    if (alreadyPublished) {
-      console.log(`skip    ${spec} (already on registry)`)
-      skipped++
-      continue
-    }
-
-    console.log(`publish ${spec}`)
-    execFileSync('npm', ['publish', '-w', pkg.name, '--provenance', '--access', 'public'], {
-      stdio: 'inherit',
-    })
-    published++
+  // `npm view <spec> version` exits non-zero (E404) when this exact version isn't published yet.
+  let alreadyPublished = false
+  try {
+    execFileSync('npm', ['view', spec, 'version'], { stdio: 'ignore' })
+    alreadyPublished = true
+  } catch {
+    alreadyPublished = false
   }
+
+  if (alreadyPublished) {
+    console.log(`skip    ${spec} (already on registry)`)
+    skipped++
+    continue
+  }
+
+  console.log(`publish ${spec}`)
+  execFileSync('npm', ['publish', '-w', name, '--provenance', '--access', 'public'], {
+    stdio: 'inherit',
+  })
+  published++
 }
 
 console.log(`done: ${published} published, ${skipped} skipped`)
