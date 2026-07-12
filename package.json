@@ -20,6 +20,7 @@
     "test:watch": "vitest",
     "test:conformance": "vitest run packages/bridge-sqlite",
     "test:loopback": "npm run build && vitest run examples/fakechat-loopback",
+    "preflight:publish": "node scripts/publish-preflight.mjs",
     "bridge": "node packages/bridge-sqlite/dist/cli.js"
   },
   "devDependencies": {
