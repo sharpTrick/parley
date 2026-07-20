@@ -21,6 +21,10 @@ async function makeContext() {
   });
   return {
     plugin,
+    // Discord honors blockMs NATIVELY: fetchRecent waits on the shared gateway MESSAGE_CREATE
+    // stream (the same live primitive subscribe uses), so the shared blocking case runs directly
+    // against the plugin rather than being covered only by core's generic polling wrapper.
+    supportsBlockingFetch: true,
     freshTopic: (): Topic => asTopic(freshChannelId()),
     cleanup: async () => {
       await plugin.disconnect();
