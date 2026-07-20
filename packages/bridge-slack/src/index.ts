@@ -62,6 +62,17 @@ interface AuthTestResponse {
 }
 
 /**
+ * A pending native long-poll (`fetchRecent` with `blockMs`) parked on the shared Socket Mode
+ * stream. `since` is the exclusive floor (`ts`) it is waiting past; `wake` fires exactly once —
+ * on a matching live event, at the `blockMs` timeout, or on `disconnect()` — and tears down its
+ * own timer + registration (no leaked listeners/timers).
+ */
+interface Waiter {
+  since: string;
+  wake: () => void;
+}
+
+/**
  * A channel-level message we surface. Everything else (`message_changed`, `message_deleted`,
  * `channel_join`, thread broadcasts, …) is a mutation/system record, not a new message —
  * surfacing those would break dedup (same `ts`, different payload). Plain messages carry no
@@ -97,6 +108,12 @@ export class SlackPlugin implements BackendPlugin {
   private wsReady?: Promise<void>;
   /** channel id → the topic + handler it feeds (Socket Mode events carry the channel id). */
   private readonly routes = new Map<string, { topic: Topic; handler: MessageHandler }>();
+  /**
+   * channel id → the set of native long-poll waiters parked on that channel (issue #20). Populated
+   * only while a `fetchRecent({ blockMs })` is blocked; hooks the SAME shared Socket Mode stream as
+   * `subscribe`, independent of whether any route is registered. Drained on wake/timeout/disconnect.
+   */
+  private readonly waiters = new Map<string, Set<Waiter>>();
   /** Memoized `auth.test` (our own bot identity) for {@link resolveIdentity}. */
   private authTestPromise?: Promise<AuthTestResponse>;
 
@@ -114,6 +131,11 @@ export class SlackPlugin implements BackendPlugin {
     this.stopped = true;
     this.connected = false;
     this.routes.clear();
+    // Abort every blocked long-poll cleanly (clears their timers + registrations via wake()). Snapshot
+    // first — wake() mutates `waiters` — then clear so no timer/listener outlives the disconnect.
+    const pending = [...this.waiters.values()].flatMap((set) => [...set]);
+    this.waiters.clear();
+    for (const waiter of pending) waiter.wake();
     this.wsReady = undefined;
     if (this.ws !== undefined) {
       try {
@@ -167,6 +189,47 @@ export class SlackPlugin implements BackendPlugin {
    * counting plain, not raw, so a system-subtype-heavy page can't cut the window short (BUG-31).
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    this.require();
+    const first = await this.runFetch(args);
+
+    const blockMs = args.blockMs ?? 0;
+    // Native long-poll engages ONLY when asked (blockMs > 0), resuming a `since`, and the exclusive
+    // query came back empty. Any other case is the unchanged durable catch-up. Returning early/empty
+    // is always safe — core's generic wrapper polls the remaining budget — so this stays conservative.
+    if (blockMs <= 0 || args.since === undefined || first.messages.length > 0) {
+      return first;
+    }
+
+    const channel = this.channelFor(args.topic);
+    const sinceTs = String(args.since);
+    try {
+      // Wait on the EXISTING shared Socket Mode stream (the one `subscribe` uses); never a 2nd socket.
+      await this.ensureSocket();
+    } catch {
+      // Live stream unavailable (e.g. no app token) — hand back the empty page; core polls onward.
+      return first;
+    }
+    // Arm the waiter FIRST, then run the gap-closing re-query, so the waiter is live across that
+    // snapshot window: a push that lands mid-query is caught, not lost (otherwise onEnvelope could
+    // process the push before this HTTP response resolves and the waiter is armed — a lost wakeup).
+    const { wait, wake } = this.armWaiter(channel, sinceTs, blockMs);
+
+    // Re-query once the socket is live: a message may have landed in the gap between `first` and the
+    // socket becoming ready. If so, cancel the (now-redundant) waiter and return immediately.
+    const afterConnect = await this.runFetch(args);
+    if (afterConnect.messages.length > 0) {
+      wake();
+      return afterConnect;
+    }
+
+    // Park on the live stream until a message strictly after `since` arrives, blockMs elapses, or we
+    // disconnect. Then re-run the canonical exclusive query for canonical ids/cursor.
+    await wait;
+    if (this.stopped) return { messages: [], nextCursor: args.since };
+    return this.runFetch(args);
+  }
+
+  private async runFetch(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const channel = this.channelFor(args.topic);
     const limit = args.limit ?? 100;
@@ -268,6 +331,47 @@ export class SlackPlugin implements BackendPlugin {
     return this.wsReady;
   }
 
+  /**
+   * ARM a native long-poll on `channel` immediately and return its `{ wait, wake }` handle. `wait`
+   * resolves when a live event strictly after `sinceTs` arrives (via {@link onEnvelope}), when
+   * `blockMs` elapses, or when `wake()`/`disconnect()` drains it — EXACTLY once, self-cleaning (timer
+   * cleared, registration removed), never rejecting. Arming is separated from awaiting so the caller
+   * can register the waiter BEFORE the gap-closing re-query, keeping it live across that snapshot
+   * window (a push landing mid-query is then caught, not lost); `wake()` cancels it if that query
+   * already returned data.
+   */
+  private armWaiter(
+    channel: string,
+    sinceTs: string,
+    blockMs: number,
+  ): { wait: Promise<void>; wake: () => void } {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let resolveWait!: () => void;
+    const waiter: Waiter = {
+      since: sinceTs,
+      wake: () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        const set = this.waiters.get(channel);
+        if (set !== undefined) {
+          set.delete(waiter);
+          if (set.size === 0) this.waiters.delete(channel);
+        }
+        resolveWait();
+      },
+    };
+    const wait = new Promise<void>((resolve) => {
+      resolveWait = resolve;
+    });
+    timer = setTimeout(waiter.wake, blockMs);
+    const set = this.waiters.get(channel) ?? new Set<Waiter>();
+    set.add(waiter);
+    this.waiters.set(channel, set);
+    return { wait, wake: waiter.wake };
+  }
+
   private async openSocket(): Promise<void> {
     // Socket Mode handshake uses the APP token; everything else uses the bot token.
     const open = await this.api<{ ok: boolean; url: string }>('apps.connections.open', {}, 'app');
@@ -360,6 +464,17 @@ export class SlackPlugin implements BackendPlugin {
     if (env.type !== 'events_api') return;
     const event = env.payload?.event;
     if (event === undefined || event.channel === undefined || !isPlainMessage(event)) return;
+
+    // Wake any native long-poll waiters on this channel — independent of subscribe routes, since a
+    // blocking `fetchRecent` may have no route registered. A message strictly after a waiter's floor
+    // means its exclusive re-query will now return; snapshot the set (wake() mutates it).
+    const waiting = this.waiters.get(event.channel);
+    if (waiting !== undefined) {
+      for (const waiter of [...waiting]) {
+        if (compareTs(event.ts, waiter.since) > 0) waiter.wake();
+      }
+    }
+
     const route = this.routes.get(event.channel);
     if (route === undefined) return;
     try {
