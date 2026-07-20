@@ -6,6 +6,7 @@ import {
   type BackendMsgId,
   type BackendPlugin,
   buildMessage,
+  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
@@ -50,6 +51,18 @@ export interface MatrixBackendConfig {
 
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 const TOPIC_KEY = 'app.parley.topic';
+
+/**
+ * A pending native long-poll (`fetchRecent` with `blockMs`, issue #20) parked on a room. `topic`
+ * is the logical topic it is caught up to (its exclusive `since` floor); `wake` fires EXACTLY once
+ * — when a belonging live event lands (delivered by the running `subscribe` loop, or observed by a
+ * dedicated bounded `/sync` when no loop runs), at the `blockMs` timeout, or on `disconnect()` —
+ * and tears down its own timer, registration, and any dedicated `/sync` (no leaked timers/sockets).
+ */
+interface Waiter {
+  topic: Topic;
+  wake: () => void;
+}
 
 /** A minimal Matrix timeline event (the subset we read). */
 interface MatrixEvent {
@@ -98,6 +111,19 @@ export class MatrixPlugin implements BackendPlugin {
   private readonly rooms = new Map<string, Promise<string>>();
   /** In-flight sync long-polls, aborted on disconnect so teardown is immediate. */
   private readonly controllers = new Set<AbortController>();
+  /**
+   * room_id → the native long-poll waiters parked on it (issue #20). Populated only while a
+   * `fetchRecent({ blockMs })` blocks. Woken by the running `subscribe` loop's delivery when one
+   * drives this room (see {@link liveRooms}); otherwise by a dedicated bounded `/sync`. Drained on
+   * wake/timeout/disconnect. Independent of `subscribe` — a blocking fetch needs no active route.
+   */
+  private readonly waiters = new Map<string, Set<Waiter>>();
+  /**
+   * room_ids with a live `subscribe` `/sync` loop running. A blocking `fetchRecent` hooks that
+   * loop's delivery (no second `/sync`) when the room is here; when it is NOT, the blocking path
+   * drives its OWN bounded `/sync` to observe the wake. Added in `subscribe`, cleared on disconnect.
+   */
+  private readonly liveRooms = new Set<string>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as MatrixBackendConfig;
@@ -137,6 +163,13 @@ export class MatrixPlugin implements BackendPlugin {
     this.stopped = true;
     for (const c of this.controllers) c.abort();
     this.controllers.clear();
+    this.liveRooms.clear();
+    // Wake every blocked long-poll so its `fetchRecent` returns at once (each wake() clears its timer
+    // and registration). Snapshot first — wake() mutates `waiters` — then clear so nothing outlives
+    // the disconnect; the in-flight `/sync` each drives (if any) was already aborted above.
+    const pending = [...this.waiters.values()].flatMap((set) => [...set]);
+    this.waiters.clear();
+    for (const w of pending) w.wake();
     this.token = undefined;
     this.userId = undefined;
   }
@@ -168,8 +201,35 @@ export class MatrixPlugin implements BackendPlugin {
       return this.recentWindow(roomId, args.topic, limit);
     }
 
+    const first = await this.fetchSince(roomId, args.topic, args.since, limit);
+
+    // Native long-poll (issue #20): engage ONLY when asked (blockMs > 0) and the exclusive query
+    // came back empty — otherwise this is the unchanged durable catch-up. Returning early/empty is
+    // ALWAYS safe (core's generic wrapper polls the remaining budget), so this stays conservative.
+    const blockMs = args.blockMs ?? 0;
+    if (blockMs <= 0 || first.messages.length > 0 || this.stopped) {
+      return first;
+    }
+    // Wait on the live `/sync` primitive (the same one `subscribe` uses) up to the budget for a new
+    // belonging event in the room, then re-run the canonical exclusive `/messages` query so the
+    // returned ids/cursor stay canonical. A timeout leaves the empty page + stable cursor `first`.
+    return this.blockingFetch(roomId, args.topic, args.since, limit, blockMs);
+  }
+
+  /**
+   * The exclusive-`since` catch-up: locate the cursor event and page forward from just after it,
+   * returning only belonging messages strictly after `since` plus a monotonic, replayable
+   * `nextCursor`. Factored out of {@link fetchRecent} so the native long-poll can re-run the EXACT
+   * canonical query on wake without duplicating the BUG-03/BUG-10 handling.
+   */
+  private async fetchSince(
+    roomId: string,
+    topic: Topic,
+    sinceCursor: Cursor,
+    limit: number,
+  ): Promise<FetchRecentResult> {
     // Exclusive `since`: locate the cursor event, then page forward from just after it.
-    const since = String(args.since);
+    const since = String(sinceCursor);
     const ctxRes = await this.http(
       'GET',
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/context/${encodeURIComponent(since)}?limit=0`,
@@ -181,11 +241,11 @@ export class MatrixPlugin implements BackendPlugin {
     // awaits `catchUpAll`, so a throw here bricks startup on EVERY restart until the read-state file
     // is hand-edited. Other backends already degrade gracefully from a trimmed/expired cursor.
     if (ctxRes.status === 404) {
-      return this.recentWindow(roomId, args.topic, limit);
+      return this.recentWindow(roomId, topic, limit);
     }
     const ctx = (await ctxRes.json()) as { end?: string };
     if (ctx.end === undefined) {
-      return { messages: [], nextCursor: args.since };
+      return { messages: [], nextCursor: sinceCursor };
     }
 
     // BUG-03: the forward `/messages` page is `limit`-bounded BEFORE topic/type filtering, so a
@@ -212,8 +272,8 @@ export class MatrixPlugin implements BackendPlugin {
       let events = chunk.filter(isMessageEvent);
       const idx = events.findIndex((e) => e.event_id === since);
       if (idx >= 0) events = events.slice(idx + 1);
-      events = events.filter((e) => this.belongs(e, args.topic));
-      for (const e of events) messages.push(eventToMessage(args.topic, e));
+      events = events.filter((e) => this.belongs(e, topic));
+      for (const e of events) messages.push(eventToMessage(topic, e));
       if (end === undefined) break; // no further forward pagination token.
       from = end;
     }
@@ -224,8 +284,139 @@ export class MatrixPlugin implements BackendPlugin {
     // gets a full page and continues, or advances the persisted cursor past the foreign block.
     const nextCursor =
       trimmed.at(-1)?.cursor ??
-      (lastRawEventId !== undefined ? asCursor(lastRawEventId) : args.since);
+      (lastRawEventId !== undefined ? asCursor(lastRawEventId) : sinceCursor);
     return { messages: trimmed, nextCursor };
+  }
+
+  /**
+   * Native long-poll (issue #20): park until a belonging live event lands in `roomId`, `blockMs`
+   * elapses, or `disconnect()` drains us — then re-run the canonical exclusive `/messages` query so
+   * ids/cursor stay canonical (timeout → empty page + stable `nextCursor === since`). The waiter's
+   * `wake` fires EXACTLY once and self-cleans (timer cleared, registration removed, any dedicated
+   * `/sync` aborted); it never blocks past `blockMs`. When a `subscribe` loop already drives this
+   * room we hook its delivery ({@link liveRooms}) rather than open a second `/sync`; otherwise we
+   * drive a dedicated bounded `/sync` with its OWN since token (never the subscribe loop's, so it
+   * cannot corrupt the live loop's position) to observe the wake.
+   */
+  private async blockingFetch(
+    roomId: string,
+    topic: Topic,
+    sinceCursor: Cursor,
+    limit: number,
+    blockMs: number,
+  ): Promise<FetchRecentResult> {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let syncController: AbortController | undefined;
+    let resolveParked!: () => void;
+    const parked = new Promise<void>((resolve) => {
+      resolveParked = resolve;
+    });
+    const waiter: Waiter = {
+      topic,
+      wake: () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        const set = this.waiters.get(roomId);
+        if (set !== undefined) {
+          set.delete(waiter);
+          if (set.size === 0) this.waiters.delete(roomId);
+        }
+        if (syncController !== undefined) {
+          this.controllers.delete(syncController);
+          syncController.abort();
+        }
+        resolveParked();
+      },
+    };
+    // Register the waiter FIRST so it is live across everything below (no lost wakeups).
+    timer = setTimeout(waiter.wake, blockMs);
+    const set = this.waiters.get(roomId) ?? new Set<Waiter>();
+    set.add(waiter);
+    this.waiters.set(roomId, set);
+    if (this.stopped) {
+      waiter.wake();
+      return { messages: [], nextCursor: sinceCursor };
+    }
+
+    // Arm the wake source. When a `subscribe` loop already drives this room we hook its delivery
+    // ({@link wakeRoomWaiters}), no second `/sync`; otherwise drive a bounded `/sync` (its controller
+    // is aborted by wake() on timeout/disconnect, so it never outlives the wait).
+    if (!this.liveRooms.has(roomId)) {
+      syncController = new AbortController();
+      this.controllers.add(syncController);
+      void this.driveBoundedSync(roomId, topic, blockMs, syncController, waiter.wake);
+    }
+
+    // Close the lost-wakeup window for BOTH paths: a belonging message may have landed between the
+    // caller's first `fetchSince` and the wake source being armed (before this registration for the
+    // live loop; before `driveBoundedSync`'s `timeout=0` positioning for the dedicated one). Re-check
+    // ONCE now that the waiter is live across the snapshot; if it's there, wake/cancel and return it
+    // promptly instead of idling out the budget.
+    const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit);
+    if (recheck.messages.length > 0) {
+      waiter.wake();
+      return recheck;
+    }
+
+    await parked;
+    if (this.stopped) return { messages: [], nextCursor: sinceCursor };
+    return this.fetchSince(roomId, topic, sinceCursor, limit);
+  }
+
+  /**
+   * Drive a dedicated, bounded `/sync` used ONLY while a blocking `fetchRecent` waits on a room that
+   * no `subscribe` loop covers. It positions with a `timeout=0` sync (its OWN token — never shared
+   * with the live loop), then long-polls forward until a belonging event appears (→ `wake()`), the
+   * `blockMs` budget runs out, or it is aborted (disconnect/wake). Every `/sync` timeout is clamped
+   * to the remaining budget so the total wait never exceeds `blockMs`. Best-effort: any error (an
+   * abort included) just returns — the `blockMs` timer still resolves the wait.
+   */
+  private async driveBoundedSync(
+    roomId: string,
+    topic: Topic,
+    blockMs: number,
+    controller: AbortController,
+    wake: () => void,
+  ): Promise<void> {
+    const deadline = Date.now() + blockMs;
+    const initParam = encodeURIComponent(JSON.stringify(this.syncFilter(roomId, 0)));
+    const incParam = encodeURIComponent(
+      JSON.stringify(this.syncFilter(roomId, INCREMENTAL_TIMELINE_LIMIT)),
+    );
+    try {
+      const initial = await this.http(
+        'GET',
+        `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`,
+        { signal: controller.signal },
+      );
+      let nextBatch = ((await initial.json()) as { next_batch: string }).next_batch;
+      while (!this.stopped && !controller.signal.aborted) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return;
+        const timeout = Math.min(remaining, this.syncTimeoutMs);
+        const started = Date.now();
+        const res = await this.http(
+          'GET',
+          `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${timeout}`,
+          { signal: controller.signal },
+        );
+        const json = (await res.json()) as SyncResponse;
+        nextBatch = json.next_batch ?? nextBatch;
+        const events = json.rooms?.join?.[roomId]?.timeline?.events ?? [];
+        if (events.some((e) => this.belongs(e, topic))) {
+          wake();
+          return;
+        }
+        // A conforming homeserver blocks server-side for ~`timeout` when idle. If the sync returned
+        // far sooner with nothing belonging (a non-blocking/degenerate server), pace the loop so we
+        // don't hot-spin the remaining budget — still bounded by `deadline`.
+        if (Date.now() - started < timeout / 2) await delay(Math.min(remaining, 25));
+      }
+    } catch {
+      /* aborted (disconnect/wake) or transient — the blockMs timer still resolves the wait */
+    }
   }
 
   /**
@@ -257,6 +448,9 @@ export class MatrixPlugin implements BackendPlugin {
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const roomId = await this.ensureRoom(topic);
+    // Mark this room as live-driven so a concurrent blocking `fetchRecent` ({@link blockingFetch})
+    // hooks THIS loop's delivery (via {@link wakeRoomWaiters}) instead of opening a second `/sync`.
+    this.liveRooms.add(roomId);
     // Two filters: the initial position uses `timeline.limit: 0` to skip history; the loop uses a
     // REAL timeline limit (BUG-09) so a burst that overflows the per-sync cap is reported via
     // `limited`/`prev_batch` (and recoverable) instead of being silently truncated.
@@ -326,14 +520,29 @@ export class MatrixPlugin implements BackendPlugin {
             this.deliver(topic, e, handler);
           }
         }
+        let deliveredBelonging = false;
         for (const e of events) {
           if (!this.belongs(e, topic)) continue;
           lastDelivered = e.event_id;
           this.deliver(topic, e, handler);
+          deliveredBelonging = true;
         }
+        // Wake any native long-poll (issue #20) parked on this room: this live loop just observed a
+        // belonging event strictly after the subscription position, so a blocked `fetchRecent` should
+        // re-run its canonical query now instead of idling out its budget.
+        if (deliveredBelonging) this.wakeRoomWaiters(roomId, topic);
       }
     };
     void loop();
+  }
+
+  /** Wake every native long-poll waiter parked on `roomId` for `topic` (idempotent per waiter). */
+  private wakeRoomWaiters(roomId: string, topic: Topic): void {
+    const set = this.waiters.get(roomId);
+    if (set === undefined) return;
+    for (const waiter of [...set]) {
+      if (waiter.topic === topic) waiter.wake();
+    }
   }
 
   /** Build the `/sync` room filter with a given timeline limit (0 = skip history for positioning). */
