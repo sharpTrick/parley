@@ -17,6 +17,14 @@ the seam in `packages/bridge-redis/src/index.ts`; adding it required **zero** `@
 Stream ids aren't lexically comparable, but core never compares cursors — Redis returns entries in
 order and `fetchRecent` is exclusive on `since`.
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` also accepts an optional request-level
+`block_ms`: when nothing is newer than `since`, the call holds up to `block_ms` for a new message
+before returning (possibly empty), so a polling agent's token cost scales with messages, not
+wall-clock time. Redis serves this natively via an `XREAD BLOCK` on a dedicated reader connection.
+Core caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return
+catch-up semantics. (Distinct from the `block_ms` config knob above, which is `subscribe`'s
+shutdown re-check interval.)
+
 ## Config (`backend_config`)
 
 ```yaml

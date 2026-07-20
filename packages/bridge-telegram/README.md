@@ -31,6 +31,13 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 numeric id is the stable fallback; channel posts carry no `from`, so the chat id stands in).
 `timestamp` ← `date` (informational only — never used for ordering or dedup).
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time.
+Telegram serves this natively off the shared `getUpdates` loop's per-chat delivery — no second
+consumer is opened (see the one-consumer-per-token rule below). Core caps the wait at
+`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+
 > **`post`'s `identity` argument is not used.** Telegram stamps the sender as the bot account
 > behind the token — the same caveat as the Matrix plugin's login account. Per-session
 > attribution requires a distinct bot token per session.

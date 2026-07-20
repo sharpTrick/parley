@@ -24,6 +24,13 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 `timestamp` ← `new Date(event.origin_server_ts).toISOString()` (informational only — never used for
 ordering or dedup).
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. Matrix
+serves this natively via a room-filtered `/sync` long-poll (bounded), reconciled through
+`/messages`. Core caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the
+immediate-return catch-up semantics.
+
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** The homeserver
 > stamps `sender` from whichever account is logged in (`user`/`password` below) — see "Multiple
 > concurrent sessions" for why this matters.
