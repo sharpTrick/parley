@@ -90,6 +90,19 @@ export class ZulipPlugin implements BackendPlugin {
   private readonly controllers = new Set<AbortController>();
   /** Live queues (one per subscribe), so disconnect can best-effort delete them server-side. */
   private readonly queues = new Set<QueueState>();
+  /**
+   * Topics with a live `subscribe` loop → the set of wake callbacks for blocking `fetchRecent`
+   * calls piggybacking on that loop's already-registered event queue (issue #20). Presence of a
+   * topic key means "subscribed"; the loop fires these when a message event lands so a blocked
+   * fetch re-queries WITHOUT opening a second event queue for the topic.
+   */
+  private readonly waiters = new Map<Topic, Set<() => void>>();
+  /**
+   * Aborts for every in-flight blocking-fetch wait (both the piggyback and the dedicated-queue
+   * kind), fired on `disconnect()` so a blocked `fetchRecent` releases immediately with no leaked
+   * timer or listener — reuses the same teardown discipline as the event-poll controllers.
+   */
+  private readonly pendingAborts = new Set<() => void>();
 
   /**
    * Zulip auth is per-request HTTP Basic (`email:api_key`) — there is no session or token to
@@ -119,6 +132,10 @@ export class ZulipPlugin implements BackendPlugin {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    // Release any blocked fetchRecent waits first — clears their timers/listeners deterministically.
+    for (const abort of this.pendingAborts) abort();
+    this.pendingAborts.clear();
+    this.waiters.clear();
     for (const c of this.controllers) c.abort();
     this.controllers.clear();
     // Best-effort server-side cleanup — Zulip GCs idle queues after ~10 min anyway.
@@ -162,9 +179,135 @@ export class ZulipPlugin implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const limit = args.limit ?? 100;
-    const messages = await this.fetchMessages(args.topic, args.since, limit);
+    let messages = await this.fetchMessages(args.topic, args.since, limit);
+    // Native long-poll (issue #20): only when the exclusive `since` query came back EMPTY and the
+    // caller asked to block. With no `since` there is no cursor to advance past, so we never block
+    // (matches the seam's "default recent window returns at once"). Returning early/empty stays
+    // safe — core's generic wrapper polls the remaining budget — so this only ever SHORTENS the wait.
+    if (messages.length === 0 && args.since !== undefined && (args.blockMs ?? 0) > 0) {
+      messages = await this.blockingFetch(args.topic, args.since, limit, args.blockMs as number);
+    }
     const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');
     return { messages, nextCursor };
+  }
+
+  /**
+   * Wait up to `blockMs` for a message strictly after `since`, then re-run the normal exclusive
+   * query and return it (possibly empty, with a cursor === `since`, which is correct at timeout).
+   * Reuses Zulip's live primitive — the `/api/v1/events` event-queue long-poll `subscribe` uses:
+   *   - If a `subscribe` loop already owns a queue for this topic, PIGGYBACK on it (never open a
+   *     second queue): register a wake callback the loop fires on the next message event.
+   *   - Otherwise register a short-lived dedicated queue and issue ONE bounded long-poll.
+   * Either wait aborts cleanly on `disconnect()` via {@link pendingAborts}/{@link controllers}.
+   */
+  private async blockingFetch(
+    topic: Topic,
+    since: Cursor,
+    limit: number,
+    blockMs: number,
+  ): Promise<Message[]> {
+    const deadline = Date.now() + blockMs;
+    if (this.waiters.has(topic)) {
+      // A subscribe loop owns the topic's queue — hook it rather than open our own. Arm the wake
+      // callback FIRST, then re-check history: a message delivered by the loop between the caller's
+      // initial empty read and this registration fired `waiters` before our callback existed, so
+      // the re-check (with the callback already live) closes that lost-wakeup window.
+      const { waited, cancel } = this.armSubscriptionWaiter(topic, blockMs);
+      const raced = this.stopped ? [] : await this.fetchMessages(topic, since, limit);
+      if (raced.length > 0) {
+        cancel();
+        return raced;
+      }
+      await waited;
+      return this.stopped ? [] : this.fetchMessages(topic, since, limit);
+    }
+    return this.waitViaDedicatedQueue(topic, since, limit, deadline);
+  }
+
+  /**
+   * Synchronously register a wake callback on the live `subscribe` loop for `topic` and return the
+   * promise that resolves when the loop signals a message (or `blockMs` elapses / disconnect), plus
+   * a `cancel` to release it early. Registering synchronously keeps the callback live across the
+   * caller's subsequent re-check snapshot, so no wake fired in that window is lost.
+   */
+  private armSubscriptionWaiter(topic: Topic, blockMs: number): {
+    waited: Promise<void>;
+    cancel: () => void;
+  } {
+    const set = this.waiters.get(topic);
+    let finish!: () => void;
+    const waited = new Promise<void>((resolve) => {
+      let done = false;
+      finish = (): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        set?.delete(finish);
+        this.pendingAborts.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, blockMs);
+      this.pendingAborts.add(finish);
+      set?.add(finish);
+      if (this.stopped) finish(); // disconnect may have raced the registration
+    });
+    return { waited, cancel: () => finish() };
+  }
+
+  /**
+   * No live subscription for this topic: register a short-lived narrowed event queue, re-check for
+   * a message that raced registration, then issue a single `/api/v1/events` long-poll bounded by
+   * the remaining budget. Any wake (a matching message) OR timeout/abort falls through to a final
+   * exclusive read. The queue is always torn down; the poll aborts on disconnect.
+   */
+  private async waitViaDedicatedQueue(
+    topic: Topic,
+    since: Cursor,
+    limit: number,
+    deadline: number,
+  ): Promise<Message[]> {
+    if (this.stopped) return [];
+    const reg = await this.register(topic);
+    const state: QueueState = { queueId: reg.queue_id };
+    this.queues.add(state);
+    try {
+      // A message landing between the caller's first read and register is now visible to this read.
+      const raced = await this.fetchMessages(topic, since, limit);
+      if (raced.length > 0) return raced;
+      const remaining = deadline - Date.now();
+      if (remaining > 0 && !this.stopped) {
+        const controller = new AbortController();
+        this.controllers.add(controller);
+        const abort = (): void => controller.abort();
+        const timer = setTimeout(abort, remaining);
+        this.pendingAborts.add(abort);
+        try {
+          // Blocks server-side until a matching message enters the queue, our timer fires, or
+          // disconnect aborts. We only need the wake edge — the events themselves are re-read below.
+          await this.http('GET', '/api/v1/events', {
+            query: {
+              queue_id: reg.queue_id,
+              last_event_id: String(reg.last_event_id),
+              dont_block: 'false',
+            },
+            signal: controller.signal,
+            allowStatuses: [400],
+          });
+        } catch {
+          /* aborted (timeout/disconnect) or a transient blip — fall through to the final read */
+        } finally {
+          clearTimeout(timer);
+          this.controllers.delete(controller);
+          this.pendingAborts.delete(abort);
+        }
+      }
+      return this.stopped ? [] : this.fetchMessages(topic, since, limit);
+    } finally {
+      this.queues.delete(state);
+      await this.http('DELETE', '/api/v1/events', { query: { queue_id: reg.queue_id } }).catch(
+        () => undefined,
+      );
+    }
   }
 
   /**
@@ -189,6 +332,11 @@ export class ZulipPlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
     const reg = await this.register(topic);
+    // Mark the topic subscribed so a blocking fetchRecent piggybacks on THIS queue (issue #20)
+    // instead of opening a second one; the loop below wakes any registered fetchers per message.
+    // Seeded AFTER a successful register so a register failure leaves no dead waiter set that a
+    // later piggyback fetch would park on for its full blockMs.
+    if (!this.waiters.has(topic)) this.waiters.set(topic, new Set());
     const state: QueueState = { queueId: reg.queue_id };
     this.queues.add(state);
     let lastEventId = reg.last_event_id;
@@ -264,9 +412,11 @@ export class ZulipPlugin implements BackendPlugin {
           }
           continue;
         }
+        let sawMessage = false;
         for (const ev of json.events ?? []) {
           if (ev.id > lastEventId) lastEventId = ev.id; // ack everything, incl. heartbeats
           if (ev.type !== 'message' || ev.message === undefined) continue;
+          sawMessage = true; // a message landed on this topic — release any blocked fetchers
           if (ev.message.id <= lastDeliveredId) continue; // already gap-filled — dedup
           lastDeliveredId = ev.message.id;
           try {
@@ -274,6 +424,12 @@ export class ZulipPlugin implements BackendPlugin {
           } catch {
             /* handler is best-effort; never break the loop (DESIGN §6) */
           }
+        }
+        // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
+        // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
+        if (sawMessage) {
+          const set = this.waiters.get(topic);
+          if (set !== undefined) for (const w of [...set]) w();
         }
       }
     };
