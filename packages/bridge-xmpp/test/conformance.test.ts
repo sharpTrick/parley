@@ -51,6 +51,9 @@ async function makeContext() {
   await plugin.connect(BASE);
   return {
     plugin,
+    // XMPP honors `blockMs` natively (MUC live-wait + MAM reconcile), so the shared blocking-fetch
+    // conformance case runs directly against the plugin instead of core's generic wrapper (#20).
+    supportsBlockingFetch: true,
     // Each topic -> a fresh, unique MUC room, so tests are fully isolated.
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     cleanup: async () => {
