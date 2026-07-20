@@ -305,64 +305,80 @@ export class MatrixPlugin implements BackendPlugin {
     limit: number,
     blockMs: number,
   ): Promise<FetchRecentResult> {
-    let done = false;
-    let timer: ReturnType<typeof setTimeout>;
-    let syncController: AbortController | undefined;
-    let resolveParked!: () => void;
-    const parked = new Promise<void>((resolve) => {
-      resolveParked = resolve;
-    });
-    const waiter: Waiter = {
-      topic,
-      wake: () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        const set = this.waiters.get(roomId);
-        if (set !== undefined) {
-          set.delete(waiter);
-          if (set.size === 0) this.waiters.delete(roomId);
-        }
-        if (syncController !== undefined) {
-          this.controllers.delete(syncController);
-          syncController.abort();
-        }
-        resolveParked();
-      },
-    };
-    // Register the waiter FIRST so it is live across everything below (no lost wakeups).
-    timer = setTimeout(waiter.wake, blockMs);
-    const set = this.waiters.get(roomId) ?? new Set<Waiter>();
-    set.add(waiter);
-    this.waiters.set(roomId, set);
-    if (this.stopped) {
-      waiter.wake();
-      return { messages: [], nextCursor: sinceCursor };
-    }
+    const deadline = Date.now() + blockMs;
+    // Wait in a loop so a SPURIOUS wake does not end the call early. The dedicated `/sync` can
+    // re-deliver an event at/before `sinceCursor` (its `timeout=0` positioning racing that event),
+    // waking the waiter even though the exclusive re-query is still empty. On such an empty re-query
+    // with budget left we re-arm and keep waiting, so the plugin holds the full `blockMs` like the
+    // other native backends — only a genuinely newer message, the deadline, or disconnect returns.
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (this.stopped || remaining <= 0) return { messages: [], nextCursor: sinceCursor };
 
-    // Arm the wake source. When a `subscribe` loop already drives this room we hook its delivery
-    // ({@link wakeRoomWaiters}), no second `/sync`; otherwise drive a bounded `/sync` (its controller
-    // is aborted by wake() on timeout/disconnect, so it never outlives the wait).
-    if (!this.liveRooms.has(roomId)) {
-      syncController = new AbortController();
-      this.controllers.add(syncController);
-      void this.driveBoundedSync(roomId, topic, blockMs, syncController, waiter.wake);
-    }
+      let done = false;
+      let timer: ReturnType<typeof setTimeout>;
+      let syncController: AbortController | undefined;
+      let resolveParked!: () => void;
+      const parked = new Promise<void>((resolve) => {
+        resolveParked = resolve;
+      });
+      const waiter: Waiter = {
+        topic,
+        wake: () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          const set = this.waiters.get(roomId);
+          if (set !== undefined) {
+            set.delete(waiter);
+            if (set.size === 0) this.waiters.delete(roomId);
+          }
+          if (syncController !== undefined) {
+            this.controllers.delete(syncController);
+            syncController.abort();
+          }
+          resolveParked();
+        },
+      };
+      // Register the waiter FIRST so it is live across everything below (no lost wakeups). The timer
+      // is bounded by the REMAINING budget so re-arming after a spurious wake never overruns blockMs.
+      timer = setTimeout(waiter.wake, remaining);
+      const set = this.waiters.get(roomId) ?? new Set<Waiter>();
+      set.add(waiter);
+      this.waiters.set(roomId, set);
+      if (this.stopped) {
+        waiter.wake();
+        return { messages: [], nextCursor: sinceCursor };
+      }
 
-    // Close the lost-wakeup window for BOTH paths: a belonging message may have landed between the
-    // caller's first `fetchSince` and the wake source being armed (before this registration for the
-    // live loop; before `driveBoundedSync`'s `timeout=0` positioning for the dedicated one). Re-check
-    // ONCE now that the waiter is live across the snapshot; if it's there, wake/cancel and return it
-    // promptly instead of idling out the budget.
-    const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit);
-    if (recheck.messages.length > 0) {
-      waiter.wake();
-      return recheck;
-    }
+      // Arm the wake source. When a `subscribe` loop already drives this room we hook its delivery
+      // ({@link wakeRoomWaiters}), no second `/sync`; otherwise drive a bounded `/sync` for the
+      // remaining budget (its controller is aborted by wake() on timeout/disconnect/re-arm, so it
+      // never outlives this iteration).
+      if (!this.liveRooms.has(roomId)) {
+        syncController = new AbortController();
+        this.controllers.add(syncController);
+        void this.driveBoundedSync(roomId, topic, remaining, syncController, waiter.wake);
+      }
 
-    await parked;
-    if (this.stopped) return { messages: [], nextCursor: sinceCursor };
-    return this.fetchSince(roomId, topic, sinceCursor, limit);
+      // Close the lost-wakeup window for BOTH paths: a belonging message may have landed between the
+      // caller's first `fetchSince` and the wake source being armed (before this registration for the
+      // live loop; before `driveBoundedSync`'s `timeout=0` positioning for the dedicated one). Re-check
+      // ONCE now that the waiter is live across the snapshot; if it's there, wake/cancel and return it
+      // promptly instead of idling out the budget.
+      const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit);
+      if (recheck.messages.length > 0) {
+        waiter.wake();
+        return recheck;
+      }
+
+      await parked;
+      if (this.stopped) return { messages: [], nextCursor: sinceCursor };
+      const after = await this.fetchSince(roomId, topic, sinceCursor, limit);
+      if (after.messages.length > 0) return after;
+      // Empty ⇒ the deadline timer fired or the wake was spurious. Loop: the top re-checks the
+      // deadline and returns the empty page once the budget is spent, else re-arms for the remainder.
+    }
   }
 
   /**
