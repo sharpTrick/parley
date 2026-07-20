@@ -8,6 +8,7 @@ import {
   type BackendMsgId,
   type BackendPlugin,
   buildMessage,
+  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
@@ -77,6 +78,21 @@ export class PostgresPlugin implements BackendPlugin {
   private reconnecting = false;
   private readonly subs = new Map<string, TopicSubscription>();
 
+  /**
+   * Blocking `fetchRecent` waiters keyed by NOTIFY channel (issue #20). A waiter parks on the
+   * SAME doorbell `subscribe` waits on — the AFTER INSERT trigger's `pg_notify` — so a blocked
+   * fetch wakes the instant a matching row lands. The channel is LISTENed for the wait's duration
+   * (piggybacking a live subscription's LISTEN when one exists) and UNLISTENed once the last
+   * waiter for it leaves; the notification handler fans a NOTIFY out to every registered wake.
+   */
+  private readonly waiters = new Map<string, Set<() => void>>();
+  /**
+   * Every in-flight blocking-fetch wait's release callback, fired on `disconnect()` so a blocked
+   * `fetchRecent` returns immediately with no leaked timer — the same teardown discipline the
+   * listener connection gets.
+   */
+  private readonly pendingAborts = new Set<() => void>();
+
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as PostgresBackendConfig;
     this.url = cfg.url ?? DEFAULT_URL;
@@ -118,6 +134,11 @@ export class PostgresPlugin implements BackendPlugin {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    // Release any blocked fetchRecent waits first — clears their timers deterministically. Each
+    // callback removes itself from `pendingAborts`/`waiters`; iterate a copy so that's safe.
+    for (const abort of [...this.pendingAborts]) abort();
+    this.pendingAborts.clear();
+    this.waiters.clear();
     this.subs.clear();
     const listener = this.listener;
     this.listener = undefined;
@@ -170,30 +191,133 @@ export class PostgresPlugin implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const limit = args.limit ?? 100;
-    let rows: MessageRow[];
     // NB: ORDER BY is table-qualified everywhere — a bare `ORDER BY seq` would bind to the
     // `seq::text AS seq` OUTPUT alias and sort lexicographically ('9' > '10'), not numerically.
     if (args.since === undefined) {
-      // Default window: the most recent `limit` messages, returned ascending by cursor.
+      // Default window: the most recent `limit` messages, returned ascending by cursor. With no
+      // cursor to advance past there is nothing to block on, so `blockMs` is ignored here.
       const res = await this.require().query(
         `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
          FROM ${this.table} WHERE topic = $1 ORDER BY ${this.table}.seq DESC LIMIT $2`,
         [args.topic, limit],
       );
-      rows = (res.rows as MessageRow[]).reverse();
-    } else {
-      // Exclusive: strictly after `since`, ascending.
-      const res = await this.require().query(
-        `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
-         FROM ${this.table} WHERE topic = $1 AND seq > $2::bigint ORDER BY ${this.table}.seq ASC LIMIT $3`,
-        [args.topic, args.since, limit],
-      );
-      rows = res.rows as MessageRow[];
+      return this.pageResult((res.rows as MessageRow[]).reverse(), args);
     }
+
+    // Exclusive: strictly after `since`, ascending.
+    let rows = await this.exclusiveSince(args.topic, args.since, limit);
+    // Native long-poll (issue #20): only when the exclusive `since` query came back EMPTY and the
+    // caller asked to block. Wait on the topic's NOTIFY channel up to the remaining budget, then
+    // re-run the SAME exclusive query. Returning early/empty stays safe — core's generic wrapper
+    // polls the remaining budget — so the native wait only ever SHORTENS latency, never extends it.
+    if (rows.length === 0 && (args.blockMs ?? 0) > 0 && !this.stopped) {
+      await this.waitForNotify(args.topic, args.since, limit, args.blockMs as number);
+      if (!this.stopped) rows = await this.exclusiveSince(args.topic, args.since, limit);
+    }
+    return this.pageResult(rows, args);
+  }
+
+  /** The canonical exclusive `since` read: strictly after `since`, ascending by cursor. */
+  private async exclusiveSince(topic: Topic, since: Cursor, limit: number): Promise<MessageRow[]> {
+    const res = await this.require().query(
+      `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
+       FROM ${this.table} WHERE topic = $1 AND seq > $2::bigint ORDER BY ${this.table}.seq ASC LIMIT $3`,
+      [topic, since, limit],
+    );
+    return res.rows as MessageRow[];
+  }
+
+  /** Shape rows into a page; an empty page holds `nextCursor` at `since` (stable at timeout). */
+  private pageResult(rows: MessageRow[], args: FetchRecentArgs): FetchRecentResult {
     const messages = rows.map(rowToMessage);
     const last = messages.at(-1);
     const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor('0'));
     return { messages, nextCursor };
+  }
+
+  /**
+   * Park up to `blockMs` waiting for a NOTIFY on `topic`'s channel (issue #20), then return so the
+   * caller can re-run the exclusive `since` query. Reuses the live primitive — the AFTER INSERT
+   * trigger's `pg_notify`, the same doorbell `subscribe` waits on:
+   *   - If a `subscribe` (or an earlier waiter) already LISTENs the channel, PIGGYBACK on it.
+   *   - Otherwise LISTEN for the wait's duration and UNLISTEN once the last waiter leaves, taking
+   *     care never to drop a LISTEN a live subscription still needs.
+   * Any wake (a matching NOTIFY), the `blockMs` timer, or `disconnect()` releases the wait; the
+   * timer is always cleared, so nothing leaks. Once the waiter is registered we re-check
+   * `exclusiveSince` ONCE (issue #20): a row that landed between the caller's initial empty query
+   * and this LISTEN never notified us, so without this the wait would stall to the timeout — the
+   * re-check makes the waiter live across the LISTEN snapshot window and wakes it promptly.
+   */
+  private async waitForNotify(
+    topic: Topic,
+    since: Cursor,
+    limit: number,
+    blockMs: number,
+  ): Promise<void> {
+    let listener: Client;
+    try {
+      listener = await this.ensureListener();
+    } catch {
+      return; // listener unavailable → skip the native wait; core polls the remaining budget
+    }
+    if (this.stopped) return;
+    const channel = channelFor(topic);
+
+    // Already LISTENed if a subscription or an earlier waiter holds the channel.
+    const alreadyListening = this.subs.has(channel) || this.waiters.has(channel);
+    let set = this.waiters.get(channel);
+    if (set === undefined) {
+      set = new Set();
+      this.waiters.set(channel, set);
+    }
+    if (!alreadyListening) {
+      try {
+        await listener.query(`LISTEN "${channel}"`);
+      } catch {
+        if (set.size === 0) this.waiters.delete(channel);
+        return; // LISTEN failed → skip the native wait; core polls the remaining budget
+      }
+      // disconnect() may have completed while LISTEN was in flight.
+      if (this.stopped) {
+        if (set.size === 0) this.waiters.delete(channel);
+        return;
+      }
+    }
+
+    const waiters = set;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.pendingAborts.delete(finish);
+        waiters.delete(finish);
+        if (waiters.size === 0) {
+          this.waiters.delete(channel);
+          // Drop the LISTEN only if no subscription still needs the channel (and we're live).
+          if (!this.stopped && !this.subs.has(channel) && this.listener !== undefined) {
+            void this.listener.query(`UNLISTEN "${channel}"`).catch(() => undefined);
+          }
+        }
+        resolve();
+      };
+      const timer = setTimeout(finish, blockMs);
+      this.pendingAborts.add(finish);
+      waiters.add(finish);
+      if (this.stopped) {
+        finish(); // disconnect may have raced registration
+        return;
+      }
+      // Snapshot-window re-check: catch a row that landed between the caller's empty read and the
+      // LISTEN above, which sent no NOTIFY we'd hear. If it's there, wake now (caller re-queries);
+      // otherwise stay parked. A failed re-check is harmless — the NOTIFY/timer still resolve us.
+      void this.exclusiveSince(topic, since, limit)
+        .then((recheck) => {
+          if (recheck.length > 0) finish();
+        })
+        .catch(() => undefined);
+    });
   }
 
   /**
@@ -291,6 +415,10 @@ export class PostgresPlugin implements BackendPlugin {
       const sub = this.subs.get(n.channel);
       // Payload is a hint only (size limits + best-effort delivery) — always re-query.
       if (sub !== undefined) this.drain(sub);
+      // Wake any blocking fetchRecent parked on this channel (issue #20); each re-runs its own
+      // exclusive `since` query. A spurious wake only ends a wait early — safe, core re-polls.
+      const set = this.waiters.get(n.channel);
+      if (set !== undefined) for (const wake of [...set]) wake();
     });
     client.on('end', () => {
       if (!this.stopped && this.listener === client) void this.reconnectListener();
@@ -321,7 +449,9 @@ export class PostgresPlugin implements BackendPlugin {
             await client.end().catch(() => undefined);
             return;
           }
-          for (const channel of this.subs.keys()) {
+          // Re-LISTEN every channel a subscription OR an in-flight blocking waiter needs, so a
+          // reconnect mid-wait still delivers the doorbell (issue #20).
+          for (const channel of new Set([...this.subs.keys(), ...this.waiters.keys()])) {
             await client.query(`LISTEN "${channel}"`);
           }
           // Re-check after the LISTEN loop's awaits, before publishing `this.listener`.

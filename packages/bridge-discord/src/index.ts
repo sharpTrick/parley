@@ -6,6 +6,7 @@ import {
   type BackendMsgId,
   type BackendPlugin,
   buildMessage,
+  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
@@ -118,6 +119,15 @@ export class DiscordPlugin implements BackendPlugin {
   private op9MinWaitMs = 0;
   /** channel id → subscription; MESSAGE_CREATE dispatch routes through this. */
   private readonly subs = new Map<string, { topic: Topic; handler: MessageHandler }>();
+  /**
+   * Native long-poll wakeups (issue #20): channel id → set of one-shot callbacks armed by a
+   * blocking `fetchRecent`. Any MESSAGE_CREATE on that channel — OR `disconnect()` — fires every
+   * waiter so the blocked fetch re-queries and returns. Independent of `subs`: a blocking fetch
+   * does NOT register a subscription, it only listens on the SHARED gateway socket the live path
+   * already runs (no second connection). Reusing the same `MESSAGE_CREATE` primitive keeps the
+   * wait cheap and its teardown identical to the live path's.
+   */
+  private readonly waiters = new Map<string, Set<() => void>>();
   /** Memoized `GET /users/@me` (the bot's own account), for resolveIdentity. */
   private me?: Promise<{ id: string; username: string }>;
 
@@ -142,6 +152,10 @@ export class DiscordPlugin implements BackendPlugin {
     this.ws = undefined;
     this.gatewayReady = undefined;
     this.subs.clear();
+    // Abort every in-flight long-poll cleanly (fire clears its own timer + map entry). A blocked
+    // fetch then sees `stopped` and returns an empty page — no leaked listeners or timers.
+    for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire();
+    this.waiters.clear();
     this.me = undefined;
   }
 
@@ -168,7 +182,7 @@ export class DiscordPlugin implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
-    const channelId = encodeURIComponent(this.channelId(args.topic));
+    const channelIdEnc = encodeURIComponent(this.channelId(args.topic));
     const limit = args.limit ?? 100;
 
     if (args.since === undefined) {
@@ -176,32 +190,105 @@ export class DiscordPlugin implements BackendPlugin {
       // newest-first; reverse). The API caps a page at 100 — that cap IS the default window.
       const res = await this.http(
         'GET',
-        `/channels/${channelId}/messages?limit=${Math.min(limit, 100)}`,
+        `/channels/${channelIdEnc}/messages?limit=${Math.min(limit, 100)}`,
       );
       const chunk = (await res.json()) as DiscordMessage[];
       const messages = chunk.reverse().map((m) => toMessage(args.topic, m));
       return { messages, nextCursor: messages.at(-1)?.cursor ?? asCursor('0') };
     }
 
-    // Exclusive `since`: `?after=` is exclusive server-side. Each page comes back newest-first
-    // → reverse to ascending; for limit > 100, page forward advancing `after` to the last
-    // (largest) returned id until filled or a short page says the tail is reached.
+    const blockMs = args.blockMs ?? 0;
+    // No long-poll requested → the durable exclusive-since page, exactly as before.
+    if (blockMs <= 0) {
+      return this.fetchSince(channelIdEnc, args.topic, args.since, limit);
+    }
+
+    // Native long-poll (issue #20): the exclusive `since` query is empty, so wait on the SAME
+    // gateway MESSAGE_CREATE stream the live path uses for a message on this channel — up to
+    // blockMs — then re-run the exclusive REST query so ids/cursor stay canonical. Returning
+    // early/empty is always safe (core polls the remaining budget), so any failure to establish
+    // the live socket degrades gracefully to the immediate query.
+    let socketLive = true;
+    try {
+      await this.ensureGateway();
+    } catch {
+      socketLive = false; // no live socket → skip the wait; the immediate page is still correct.
+    }
+    const rawChannelId = this.channelId(args.topic);
+    // Arm the waiter BEFORE the first query so a message landing during it can't be lost.
+    const waiter = socketLive ? this.armWaiter(rawChannelId, blockMs) : undefined;
+    try {
+      const first = await this.fetchSince(channelIdEnc, args.topic, args.since, limit);
+      if (first.messages.length > 0 || waiter === undefined) return first;
+      await waiter.fired; // resolves on MESSAGE_CREATE for this channel, timeout, or disconnect
+      if (this.stopped) return { messages: [], nextCursor: args.since };
+      return await this.fetchSince(channelIdEnc, args.topic, args.since, limit);
+    } finally {
+      waiter?.cancel();
+    }
+  }
+
+  /**
+   * One exclusive-`since` catch-up page. `?after=` is exclusive server-side; each page comes back
+   * newest-first → reverse to ascending; for limit > 100, page forward advancing `after` to the
+   * last (largest) returned id until filled or a short page says the tail is reached. Empty →
+   * `nextCursor` echoes `since` (stable, replayable).
+   */
+  private async fetchSince(
+    channelIdEnc: string,
+    topic: Topic,
+    since: Cursor,
+    limit: number,
+  ): Promise<FetchRecentResult> {
     const messages: Message[] = [];
-    let after = String(args.since);
+    let after = String(since);
     while (messages.length < limit) {
       const page = Math.min(limit - messages.length, 100);
       const res = await this.http(
         'GET',
-        `/channels/${channelId}/messages?after=${encodeURIComponent(after)}&limit=${page}`,
+        `/channels/${channelIdEnc}/messages?after=${encodeURIComponent(after)}&limit=${page}`,
       );
       const chunk = (await res.json()) as DiscordMessage[];
       if (chunk.length === 0) break;
       const ascending = chunk.reverse();
-      for (const m of ascending) messages.push(toMessage(args.topic, m));
+      for (const m of ascending) messages.push(toMessage(topic, m));
       after = ascending.at(-1)!.id;
       if (chunk.length < page) break;
     }
-    return { messages, nextCursor: messages.at(-1)?.cursor ?? args.since };
+    return { messages, nextCursor: messages.at(-1)?.cursor ?? since };
+  }
+
+  /**
+   * Arm a one-shot long-poll waiter on `channelId`, resolving `fired` when a MESSAGE_CREATE for
+   * that channel arrives, when `blockMs` elapses, or when `disconnect()` fires it. Idempotent
+   * `cancel()` (also invoked by the fire path) clears the timer and de-registers, so no listener
+   * or timer can leak past the wait.
+   */
+  private armWaiter(channelId: string, blockMs: number): { fired: Promise<void>; cancel: () => void } {
+    let resolveFired!: () => void;
+    const fired = new Promise<void>((r) => {
+      resolveFired = r;
+    });
+    let settled = false;
+    const fire = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const set = this.waiters.get(channelId);
+      if (set !== undefined) {
+        set.delete(fire);
+        if (set.size === 0) this.waiters.delete(channelId);
+      }
+      resolveFired();
+    };
+    const timer = setTimeout(fire, blockMs);
+    let set = this.waiters.get(channelId);
+    if (set === undefined) {
+      set = new Set();
+      this.waiters.set(channelId, set);
+    }
+    set.add(fire);
+    return { fired, cancel: fire };
   }
 
   /**
@@ -216,9 +303,18 @@ export class DiscordPlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
     this.subs.set(this.channelId(topic), { topic, handler });
+    await this.ensureGateway();
+  }
+
+  /**
+   * Open the ONE shared gateway socket if it isn't up yet, and await READY. Used by both the live
+   * path (`subscribe`) and native long-poll (`fetchRecent` blocking), so the blocking wait hooks
+   * the SAME connection rather than opening a second one.
+   */
+  private async ensureGateway(): Promise<void> {
     if (this.gatewayReady === undefined) {
       this.gatewayReady = this.openGateway().catch((err) => {
-        // Don't poison the shared socket on transient failure — let the next subscribe retry.
+        // Don't poison the shared socket on transient failure — let the next caller retry.
         this.gatewayReady = undefined;
         throw err;
       });
@@ -342,6 +438,10 @@ export class DiscordPlugin implements BackendPlugin {
                   /* handler is best-effort; never break the loop (DESIGN §6) */
                 }
               }
+              // Wake any long-poll fetch blocked on this channel (issue #20). It re-runs the
+              // exclusive REST query, so the wakeup only needs to signal "something arrived".
+              const waiting = this.waiters.get(d.channel_id);
+              if (waiting !== undefined) for (const fire of [...waiting]) fire();
             }
             break;
           }

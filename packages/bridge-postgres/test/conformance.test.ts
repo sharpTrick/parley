@@ -29,6 +29,8 @@ async function makeContext() {
   await plugin.connect({ url: PG_URL, table_name: table });
   return {
     plugin,
+    // Postgres honors blockMs natively via LISTEN/NOTIFY (issue #20) — run the long-poll case.
+    supportsBlockingFetch: true,
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     cleanup: async () => {
       await plugin.disconnect();

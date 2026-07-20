@@ -52,6 +52,17 @@ export interface FetchRecentArgs {
   since?: Cursor;
   /** Max messages to return in this page. */
   limit?: number;
+  /**
+   * Long-poll HINT (ms). When set and the exclusive `since` query is empty, a plugin MAY block
+   * internally up to `blockMs` waiting for the topic cursor to advance past `since`, then return
+   * whatever arrived (possibly an empty page). It is only a hint: a plugin that ignores it (or
+   * returns early/empty) is still correct — core's generic long-poll wrapper polls the remaining
+   * budget on the MCP `fetch_recent` path, so every backend blocks with or without native support.
+   * Omit / `0` = return immediately (the durable catch-up semantics). Blocking only engages
+   * relative to a `since`; with no `since` the default recent window returns at once. The value
+   * is capped server-side before it reaches a plugin (issue #20).
+   */
+  blockMs?: number;
 }
 
 /** Result of {@link BackendPlugin.fetchRecent}. */

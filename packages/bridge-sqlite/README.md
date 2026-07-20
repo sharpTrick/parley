@@ -20,6 +20,13 @@ There's no real event source to block on, so `subscribe` polls. The cursor makes
 correct regardless of cadence — `poll_interval_ms` is a pure latency/cost knob, never a
 correctness concern.
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. SQLite
+is polling-only, so there's no native block to serve this — it comes for free from core's generic
+long-poll wrapper (a short internal poll-and-recheck), zero plugin change. Core caps the wait at
+`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+
 ## Config (`backend_config`)
 
 ```yaml

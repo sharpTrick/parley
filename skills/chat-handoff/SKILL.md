@@ -22,9 +22,10 @@ backend-specific (Matrix/XMPP) MCP in chat; that would bypass the normalized mes
 
 ## Tools
 
-- **`parley_fetch_recent { topic, since?, limit? }`** — read recent messages on a topic. Returns
-  `{ messages, nextCursor }`. Call it first to catch up; pass the previous `nextCursor` as `since`
-  to page forward. Ordering/dedup use `cursor`, never timestamps.
+- **`parley_fetch_recent { topic, since?, limit?, block_ms? }`** — read recent messages on a topic.
+  Returns `{ messages, nextCursor }`. Call it first to catch up; pass the previous `nextCursor` as
+  `since` to page forward. Ordering/dedup use `cursor`, never timestamps. Pass `block_ms` to
+  **long-poll** — see "Waiting efficiently" below.
 - **`parley_post { topic, content, in_reply_to? }`** — publish a message (a handoff or a note) so
   the Code session and humans see it durably.
 
@@ -56,6 +57,28 @@ Acceptance: <how we'll know it's done>
 The Code session writes its output and replies back to the same topic durably (replies always
 write to the backend, not just the live channel — so they survive a restart). To see them, call
 `parley_fetch_recent` again with the last `since` cursor you held.
+
+## Waiting efficiently (resident / epoch agents)
+
+An agent that cannot receive live `<channel>` push — a Claude Code **subagent** (push lands at the
+session level), a headless `claude -p` worker, or the chat front door — would otherwise have to
+poll `parley_fetch_recent` in a loop, spending one model turn per empty tick. Pass **`block_ms`**
+to fold that wait into a single call: if nothing is newer than `since`, the tool **holds** up to
+`block_ms` (capped server-side, default 60s) until a message arrives or the timeout elapses, then
+returns whatever landed (possibly empty). Token cost then scales with **messages, not wall-clock
+time**.
+
+The resident loop is: catch up once, then re-call with the held cursor and a block:
+
+```
+{ messages, nextCursor } = parley_fetch_recent { topic, since: <held cursor>, block_ms: 55000 }
+# → returns immediately when a message lands; else after ~55s with messages: []
+# persist nextCursor, act on any messages, repeat
+```
+
+Keep `block_ms` a little under any surrounding tool/hook timeout. A returned empty page is normal —
+just loop again with the same cursor. Every backend honors `block_ms` (natively where the backend
+has a blocking primitive; via a core poll fallback otherwise), so the idiom is identical everywhere.
 
 ## Safety
 

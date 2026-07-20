@@ -259,6 +259,62 @@ describe('BUG-09 — subscribe recovers a burst larger than the per-sync cap via
   });
 });
 
+describe('issue #20 — fetchRecent honors blockMs natively via a bounded /sync long-poll', () => {
+  it('wakes promptly when a message lands mid-wait, returning it via the canonical catch-up', async () => {
+    install();
+    const p = await connect(false); // per-topic room; no subscribe loop → dedicated bounded /sync
+    const T = asTopic('block-wake');
+    const writer = asHandle('w');
+
+    await p.post(T, writer, 'old');
+    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
+
+    const pending = p.fetchRecent({ topic: T, since: tail, blockMs: 2000 });
+    // A message lands ~60ms into the wait (after the first bounded /sync has parked).
+    setTimeout(() => void p.post(T, writer, 'fresh'), 60);
+
+    const woke = await pending;
+    expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
+    expect(String(woke.nextCursor)).not.toBe(String(tail)); // cursor advanced past the floor
+    await p.disconnect();
+  });
+
+  it('returns an empty page with a stable, replayable cursor at the blockMs timeout', async () => {
+    install();
+    const p = await connect(false);
+    const T = asTopic('block-timeout');
+    const writer = asHandle('w');
+
+    await p.post(T, writer, 'only');
+    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
+
+    const started = Date.now();
+    const timedOut = await p.fetchRecent({ topic: T, since: tail, blockMs: 250 });
+    expect(timedOut.messages).toEqual([]);
+    expect(String(timedOut.nextCursor)).toBe(String(tail)); // stable — replaying it yields [] again
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150); // actually blocked, not instant
+    await p.disconnect();
+  });
+
+  it('disconnect() aborts an in-flight blocking fetch promptly (no leak, no hang)', async () => {
+    install();
+    const p = await connect(false);
+    const T = asTopic('block-disconnect');
+    const writer = asHandle('w');
+
+    await p.post(T, writer, 'seed');
+    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
+
+    const started = Date.now();
+    const pending = p.fetchRecent({ topic: T, since: tail, blockMs: 5000 });
+    setTimeout(() => void p.disconnect(), 50);
+
+    const res = await pending; // must resolve well before the 5s budget
+    expect(res.messages).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
 describe('BUG-10 — a purged/remapped cursor 404 falls back to the recent window instead of throwing', () => {
   it('fetchRecent with an unresolvable since resolves to the recent window (no throw)', async () => {
     const f = install();

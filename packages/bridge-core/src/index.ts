@@ -41,6 +41,7 @@ export { Allowlist, allowlistFor, TopicNotAllowedError, type AllowlistOptions } 
 export { SeenSet } from './engine/seen-set.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
+export { fetchRecentBlocking, type BlockingFetchOptions } from './engine/blocking-fetch.js';
 // Presence: the reachability roster derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
 export {
   DEFAULT_PRESENCE_TOPIC,

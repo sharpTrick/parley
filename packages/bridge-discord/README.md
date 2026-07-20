@@ -30,6 +30,12 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 `senderHandle` ← `author.username`, `content` ← `content`, `timestamp` ← the message `timestamp`
 (informational only — never used for ordering or dedup).
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time.
+Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps the wait at
+`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Discord stamps
 > `author` from whichever bot token is configured — see "Multiple concurrent sessions".
 

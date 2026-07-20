@@ -1,0 +1,33 @@
+# >>> parley dev-overrides >>>  (sentinel — dev-infra.sh appends this block once, keyed on this line)
+#
+# Dev/test-only Synapse tuning for the Parley conformance harness — NOT production.
+#
+# dev-infra.sh appends this to the generated homeserver.yaml. `synapse generate` already emits its
+# own `registration_shared_secret` (which `register_new_matrix_user -c homeserver.yaml` uses), so we
+# do NOT set one here — a second would be a duplicate top-level key and crash Synapse. These `rc_*`
+# keys are NOT emitted by generate, so appending them is safe.
+#
+# The IPv4 listener fix is applied separately, in place, by dev-infra.sh (a second `listeners:` block
+# here would also be a duplicate key): the generated 8008 listener binds '::' too, so a container
+# without IPv6 dies at startup ("Couldn't listen on :::8008"); the script adds
+# `bind_addresses: ["0.0.0.0"]` to it.
+
+# The conformance suite makes many per-test logins/joins/sends (a fresh login per test, plus
+# concurrent writers); the default limiters throttle it into beforeEach/afterEach hook timeouts.
+# Relax them generously for the disposable server.
+rc_message:
+  per_second: 10000
+  burst_count: 10000
+rc_login:
+  address: { per_second: 10000, burst_count: 10000 }
+  account: { per_second: 10000, burst_count: 10000 }
+  failed_attempts: { per_second: 10000, burst_count: 10000 }
+rc_registration:
+  per_second: 10000
+  burst_count: 10000
+rc_joins:
+  local: { per_second: 10000, burst_count: 10000 }
+  remote: { per_second: 10000, burst_count: 10000 }
+rc_invites:
+  per_room: { per_second: 10000, burst_count: 10000 }
+  per_user: { per_second: 10000, burst_count: 10000 }

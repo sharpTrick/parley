@@ -24,6 +24,12 @@ Threading is an approximation: `inReplyTo` becomes `thread_ts`, and Slack thread
 surface at channel level (history or channel events) unless broadcast — durable, but only visible
 inside the thread.
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. Slack
+serves this natively off the Socket Mode event stream. Core caps the wait at `catchup.block_max_ms`
+(default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+
 ## Config (`backend_config`)
 
 ```yaml

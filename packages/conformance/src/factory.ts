@@ -18,6 +18,14 @@ export interface ConformanceContext {
    * backend can't exercise true concurrency in tests.
    */
   concurrentPost?(topic: Topic, writers: number, perWriter: number): Promise<void>;
+  /**
+   * Set by backends that honor `blockMs` NATIVELY in `fetchRecent` (Redis XREAD BLOCK, NATS pull
+   * expiry, Matrix `/sync` timeout, XMPP MUC wait, Postgres LISTEN/NOTIFY, …). When true, the
+   * shared blocking-fetch case runs directly against the plugin; when unset it is skipped, because
+   * that backend gets its long-poll from core's generic wrapper (tested in bridge-core), not the
+   * plugin (issue #20). SQLite is polling-only and leaves this unset.
+   */
+  supportsBlockingFetch?: boolean;
 }
 
 export type BackendFactory = () => Promise<ConformanceContext>;

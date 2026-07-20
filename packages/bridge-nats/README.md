@@ -18,6 +18,12 @@ larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding
 One stream per topic keeps sequence numbers contiguous, so the cursor is a clean per-topic monotonic
 integer. Core never compares cursor values — NATS delivers in seq order.
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. NATS
+serves this natively via a JetStream `StartSequence` pull consumer with expiry. Core caps the wait
+at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+
 ## Config (`backend_config`)
 
 ```yaml

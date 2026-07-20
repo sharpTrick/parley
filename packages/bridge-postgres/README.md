@@ -23,6 +23,12 @@ coalesced or dropped notification costs latency, never a message. The channel na
 `'parley_' || md5(topic)`: fixed length, so any topic string stays under PostgreSQL's 63-byte
 identifier limit with no injection surface.
 
+**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
+nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
+(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time.
+Postgres serves this natively via `LISTEN`/`NOTIFY` on the topic channel. Core caps the wait at
+`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+
 ## Config (`backend_config`)
 
 ```yaml

@@ -14,6 +14,9 @@ async function makeContext(): Promise<ConformanceContext> {
   await plugin.connect({ site_url: fake.url, events_timeout_ms: 1000 });
   return {
     plugin,
+    // Zulip honors blockMs NATIVELY via the /api/v1/events long-poll (issue #20), so the shared
+    // blocking-fetch conformance case runs directly against the plugin here.
+    supportsBlockingFetch: true,
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     cleanup: async () => {
       await plugin.disconnect();
@@ -197,6 +200,7 @@ async function makeRealContext(): Promise<ConformanceContext> {
   await plugin.connect(config);
   return {
     plugin,
+    supportsBlockingFetch: true, // native /api/v1/events long-poll (issue #20)
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     cleanup: async () => {
       await plugin.disconnect();

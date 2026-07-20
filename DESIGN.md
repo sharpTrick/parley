@@ -127,6 +127,11 @@ interface BackendPlugin {
     topic: Topic;
     since?: Cursor;     // monotonic position (§6); omit = backend default window
     limit?: number;
+    blockMs?: number;   // long-poll HINT: if empty past `since`, a plugin MAY block up to blockMs
+                        // for a new message before returning (possibly empty). Only a hint — core
+                        // wraps this with a generic poll fallback on the fetch_recent tool, so every
+                        // backend long-polls with or without native support; value is capped
+                        // server-side (catchup.block_max_ms, default 60s). 0/omit = return at once.
   }): Promise<{ messages: Message[]; nextCursor: Cursor }>;
 
   // 5. Map a logical handle to a backend identity. Best-effort: a real account lookup where

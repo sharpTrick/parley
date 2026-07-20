@@ -44,6 +44,10 @@ async function makeContext() {
   await plugin.connect(baseConfig);
   return {
     plugin,
+    // Matrix honors `blockMs` NATIVELY: fetchRecent long-polls a room-filtered `/sync` (the same
+    // primitive `subscribe` uses) for a new event, then reconciles via the canonical `/messages`
+    // catch-up. So the shared suite runs the blockMs long-poll case against the live homeserver.
+    supportsBlockingFetch: true,
     // Each topic is globally unique → its `app.parley.topic` tag isolates it inside the shared room.
     freshTopic: (): Topic => asTopic(`t-${++seq}-${Date.now().toString(36)}-${rand()}`),
     cleanup: async () => {

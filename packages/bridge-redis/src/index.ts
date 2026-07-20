@@ -119,11 +119,71 @@ export class RedisPlugin implements BackendPlugin {
     } else {
       // Exclusive: strictly after `since`, ascending. `(` makes XRANGE start exclusive.
       entries = await this.require().xRange(key, `(${args.since}`, '+', { COUNT: limit });
+      // Native long-poll (issue #20): the canonical XRANGE was empty and the caller granted a
+      // budget → wait up to `blockMs` for entries strictly after `since`. XREAD BLOCK is itself
+      // the bounded wait, and a Stream entry id IS the cursor, so `XREAD ... STREAMS key <since>`
+      // returns exactly the entries a repeated exclusive XRANGE would — same {id, message} shape,
+      // same ascending order — mapped identically below. No waiter map, no re-run of XRANGE.
+      // Gate on the FLOORED budget: `blockMs` is typed `number`, so a sub-ms hint (e.g. 0.5)
+      // passes `> 0` yet floors to 0 — and `XREAD BLOCK 0` blocks FOREVER. Flooring first makes
+      // such budgets correctly degrade to "return immediately, empty" (core polls the remainder).
+      const block = Math.floor(args.blockMs ?? 0);
+      if (entries.length === 0 && block > 0) {
+        entries = await this.blockingRead(key, args.since, block, limit);
+      }
     }
     const messages = entries.map((e) => rowToMessage(args.topic, e.id, e.message));
     const last = messages.at(-1);
     const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor('0-0'));
     return { messages, nextCursor };
+  }
+
+  /**
+   * Bounded blocking wait for entries strictly after `since`, on a DEDICATED reader connection.
+   * A dedicated connection is mandatory, not an optimization: `XREAD BLOCK` holds its connection
+   * for the whole wait, so running it on the shared command client would stall every concurrent
+   * `post` (XADD) — including a post racing in on the SAME plugin instance that is meant to wake
+   * this very wait — turning the long-poll into a deadlock.
+   *
+   * The reader is registered in `this.readers` BEFORE the blocking call so a concurrent
+   * `disconnect()` finds and tears it down (breaking the blocking read), and the loop is gated on
+   * the connect generation so a disconnect/reconnect racing this window can never revive it. On
+   * any early exit — timeout, teardown, or error — we return `[]`, which is always safe: the empty
+   * page carries `nextCursor === since` and core polls the remaining budget on the MCP path.
+   */
+  private async blockingRead(
+    key: string,
+    since: string,
+    blockMs: number,
+    limit: number,
+  ): Promise<Array<{ id: string; message: Record<string, string> }>> {
+    // Defensive floor: `XREAD BLOCK 0` blocks FOREVER, so a non-positive budget must never reach
+    // Redis regardless of caller. The XRANGE path already returned the immediate answer ([]).
+    if (blockMs <= 0) return [];
+    const gen = this.generation;
+    const reader = this.require().duplicate();
+    reader.on('error', () => undefined);
+    // Register BEFORE connecting so a disconnect() racing this window can always find and close the
+    // reader (mirrors the subscribe() pattern); registering after connect leaks a fresh duplicate.
+    this.readers.push(reader);
+    try {
+      await reader.connect();
+      if (gen !== this.generation) return []; // disconnect() won the race during connect()
+      // `id: since` (a concrete cursor, not '$') means XREAD returns everything strictly after
+      // `since` — including an entry that landed in the XRANGE→XREAD gap — with no missed-message
+      // window. Waits at most `blockMs`; a wake returns immediately, a timeout returns null.
+      const res = await reader.xRead({ key, id: since }, { BLOCK: blockMs, COUNT: limit });
+      if (gen !== this.generation || res === null) return [];
+      return res[0]?.messages ?? [];
+    } catch {
+      // Timeout is null (handled above); a throw here is teardown or a transient socket drop.
+      // Returning [] is safe (core polls the remainder) and never masks a real fault — the
+      // canonical XRANGE above already succeeded against the live connection.
+      return [];
+    } finally {
+      this.dropReader(reader);
+      await reader.disconnect().catch(() => undefined);
+    }
   }
 
   /**

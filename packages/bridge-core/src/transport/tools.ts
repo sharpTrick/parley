@@ -3,6 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
+import { fetchRecentBlocking } from '../engine/blocking-fetch.js';
 import { computeRoster, filterReachable } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { filterHandles, MAX_GLOB_LEN } from '../identity-filter.js';
@@ -46,6 +47,10 @@ export interface ToolDeps {
   presenceTopic: Topic;
   /** Liveness window (ms) for `parley_list_users` — a handle is live if its last beat is within it. */
   presenceTtlMs: number;
+  /** Server-side cap (ms) on `parley_fetch_recent`'s `block_ms` long-poll (issue #20). */
+  blockMaxMs: number;
+  /** Poll cadence (ms) for core's generic long-poll fallback (issue #20). */
+  blockPollIntervalMs: number;
   /** Clock source; injectable for tests. Default `Date.now`. */
   now?: () => number;
 }
@@ -71,6 +76,8 @@ export function toolDepsFor(
     allow: allowlistFor(cfg),
     presenceTopic: asTopic(cfg.presence.topic),
     presenceTtlMs: cfg.presence.ttl_ms,
+    blockMaxMs: cfg.catchup.block_max_ms,
+    blockPollIntervalMs: cfg.catchup.block_poll_interval_ms,
     seen: extras?.seen,
   };
 }
@@ -163,7 +170,10 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       description:
         'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
         'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor }. ' +
-        'Call this on session start for each configured topic, then on demand.' +
+        'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
+        'long-poll: if nothing is newer than `since`, the call holds until a message arrives or the ' +
+        'timeout elapses (capped server-side), so a polling agent burns tokens per message, not per ' +
+        'tick.' +
         describeAllowed(allow),
       inputSchema: {
         topic: topicSchema(allow, 'Topic to read (must be on the allowlist).'),
@@ -174,14 +184,33 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
             'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
           ),
         limit: z.number().int().positive().optional().describe('Max messages to return.'),
+        block_ms: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            'Long-poll budget in ms. When set with a `since` at the tail, hold up to this long for a ' +
+              'new message before returning (possibly empty). Clamped server-side. 0 / omit = return ' +
+              'immediately.',
+          ),
       },
     },
-    async ({ topic, since, limit }) => {
+    async ({ topic, since, limit, block_ms }, extra) => {
       const t = deps.allow.assert(topic);
       const args: FetchRecentArgs = { topic: t };
       if (since !== undefined) args.since = asCursor(since);
       if (limit !== undefined) args.limit = limit;
-      const result = await deps.plugin.fetchRecent(args);
+      const blockMs = block_ms !== undefined ? Math.min(block_ms, deps.blockMaxMs) : 0;
+      const result =
+        blockMs > 0
+          ? await fetchRecentBlocking(deps.plugin, args, {
+              blockMs,
+              pollIntervalMs: deps.blockPollIntervalMs,
+              now: deps.now,
+              signal: extra?.signal,
+            })
+          : await deps.plugin.fetchRecent(args);
       for (const m of result.messages) deps.seen?.markSeen(t, m.backendMsgId);
       return textResult({ messages: result.messages, nextCursor: result.nextCursor });
     },

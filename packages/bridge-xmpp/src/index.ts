@@ -55,6 +55,13 @@ const POST_TIMEOUT_MS = 15_000;
 const MAM_TIMEOUT_MS = 15_000;
 /** Page size for forward MAM paging; the conformance scale fits one page, big archives won't. */
 const MAM_PAGE = 200;
+/**
+ * Re-poll interval used by the native long-poll to reconcile a live MUC message against MAM.
+ * XEP-0313 archival can LAG the reflected live stanza slightly, so after a live-message wake the
+ * archive may not yet show it; we re-query the archive on this cadence, always bounded by the
+ * caller's remaining `blockMs` budget (never blocking past the deadline).
+ */
+const MAM_LAG_POLL_MS = 50;
 /** Bounded retry for the transient MUC cold-creation race (see {@link XmppPlugin.doJoin}). */
 const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
@@ -145,6 +152,15 @@ export class XmppPlugin implements BackendPlugin {
   private readonly mamCollectors = new Map<string, { room: string; items: MamItem[] }>();
   /** roomJid -> live subscription(s). */
   private readonly subscriptions = new Map<string, Subscription>();
+  /**
+   * Native long-poll wakeups (issue #20): roomJid -> set of one-shot callbacks armed by a blocking
+   * `fetchRecent`. Any live groupchat message on that room — OR `disconnect()` — fires every waiter
+   * so the blocked fetch reconciles against MAM and returns. Independent of `subscriptions`: a
+   * blocking fetch does NOT subscribe, it only listens on the SAME live MUC delivery the push path
+   * already runs (no second MUC join / connection). Reusing that primitive keeps the wait cheap and
+   * its teardown identical to the live path's.
+   */
+  private readonly waiters = new Map<string, Set<() => void>>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as XmppBackendConfig;
@@ -207,6 +223,10 @@ export class XmppPlugin implements BackendPlugin {
     this.pendingPosts.clear();
     this.mamCollectors.clear();
     this.subscriptions.clear();
+    // Abort every in-flight long-poll cleanly (each fire clears its own timer + de-registers), so a
+    // blocked fetch wakes, sees `stopped`, and returns an empty page — no leaked listeners/timers.
+    for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire();
+    this.waiters.clear();
     this.joined.clear();
     if (this.xmpp !== undefined) {
       await this.xmpp.stop().catch(() => undefined);
@@ -259,20 +279,17 @@ export class XmppPlugin implements BackendPlugin {
     let items: MamItem[];
     if (since === undefined) {
       // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
+      // A `blockMs` here is a no-op by design (falsy/undefined `since` → behave exactly as today).
       items = (await this.mamQuery(args.topic, { before: true, max: limit })).items;
     } else {
-      // Exclusive catch-up. `since === ''` (empty archive's zero cursor) means "from the very
-      // beginning": the first page omits <after/> (guarded in mamQuery); later pages use real archIds.
-      items = [];
-      let cursor = since; // may be '' on the first iteration → no <after/> emitted
-      while (items.length < limit) {
-        const page = await this.mamQuery(args.topic, {
-          after: cursor,
-          max: Math.min(MAM_PAGE, limit - items.length),
-        });
-        items.push(...page.items);
-        if (page.complete || page.items.length === 0) break;
-        cursor = page.items[page.items.length - 1]!.archId;
+      // Exclusive catch-up (`since === ''` means "from the very beginning"; see exclusiveMam).
+      items = await this.exclusiveMam(args.topic, since, limit);
+      // Native long-poll (issue #20): the exclusive query was empty and the caller granted a budget
+      // → wait for a live MUC message on this room, then reconcile against MAM (the archived copy is
+      // authoritative for id/cursor). Returning early/empty is always safe (core polls the rest).
+      const blockMs = args.blockMs ?? 0;
+      if (items.length === 0 && blockMs > 0) {
+        items = await this.blockingMam(args.topic, since, limit, Math.floor(blockMs));
       }
     }
 
@@ -280,6 +297,112 @@ export class XmppPlugin implements BackendPlugin {
     const last = messages.at(-1);
     const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor(''));
     return { messages, nextCursor };
+  }
+
+  /**
+   * Forward, exclusive MAM catch-up strictly after `since`, paged up to `limit`. `since === ''`
+   * (the empty archive's zero cursor) means "from the very beginning": the first page omits
+   * `<after/>` (guarded in mamQuery), later pages advance on real archive ids.
+   */
+  private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<MamItem[]> {
+    const items: MamItem[] = [];
+    let cursor = since; // may be '' on the first iteration → no <after/> emitted
+    while (items.length < limit) {
+      const page = await this.mamQuery(topic, {
+        after: cursor,
+        max: Math.min(MAM_PAGE, limit - items.length),
+      });
+      items.push(...page.items);
+      if (page.complete || page.items.length === 0) break;
+      cursor = page.items[page.items.length - 1]!.archId;
+    }
+    return items;
+  }
+
+  /**
+   * Native long-poll (issue #20): MUC-live-wait + MAM-reconcile. Arm a one-shot waiter on the room
+   * that fires on the SAME live groupchat delivery the push path uses (or a bounded timeout, or
+   * `disconnect()`), wait up to the remaining budget, then re-run the canonical exclusive MAM query
+   * so ids/cursor stay archive-authoritative.
+   *
+   * MAM archival lag: XEP-0313 can commit the archive slightly AFTER the live stanza is reflected,
+   * so the immediate post-wake MAM query may not yet show the message. We reconcile by re-polling
+   * MAM on a short cadence, always bounded by the deadline — never blocking past `blockMs`. If the
+   * archive still hasn't caught up when the budget runs out we return an empty page, which is
+   * always safe: the empty page carries `nextCursor === since` and core's wrapper polls the rest.
+   * Aborts cleanly on `disconnect()` (the waiter is fired + de-registered; `stopped` short-circuits
+   * every subsequent query), so no listener or timer leaks.
+   */
+  private async blockingMam(
+    topic: Topic,
+    since: string,
+    limit: number,
+    blockMs: number,
+  ): Promise<MamItem[]> {
+    const deadline = Date.now() + blockMs;
+    const room = this.roomJid(topic);
+    const remaining = deadline - Date.now();
+    if (remaining > 0) {
+      const waiter = this.armWaiter(room, remaining);
+      try {
+        await waiter.fired; // live MUC message on this room, timeout, or disconnect
+      } finally {
+        waiter.cancel(); // idempotent — also clears the timer + de-registers on the fire path
+      }
+    }
+    if (this.stopped) return []; // disconnect() won → empty page is safe
+    try {
+      let items = await this.exclusiveMam(topic, since, limit);
+      // Reconcile against MAM lag: re-poll the archive within the remaining budget.
+      while (items.length === 0 && !this.stopped && Date.now() < deadline) {
+        await delay(Math.min(MAM_LAG_POLL_MS, deadline - Date.now()));
+        if (this.stopped) break;
+        items = await this.exclusiveMam(topic, since, limit);
+      }
+      return items;
+    } catch (err) {
+      if (this.stopped) return []; // torn down mid-reconcile → empty page is safe
+      throw err;
+    }
+  }
+
+  /**
+   * Arm a one-shot long-poll waiter on `room`, resolving `fired` when a live groupchat message for
+   * that room arrives (via {@link fireWaiters}), when `blockMs` elapses, or when `disconnect()`
+   * fires it. Idempotent `cancel()` (also the fire path) clears the timer and de-registers, so no
+   * listener or timer can leak past the wait. Mirrors the chat backends' waiter shape.
+   */
+  private armWaiter(room: string, blockMs: number): { fired: Promise<void>; cancel: () => void } {
+    let resolveFired!: () => void;
+    const fired = new Promise<void>((r) => {
+      resolveFired = r;
+    });
+    let settled = false;
+    const fire = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const set = this.waiters.get(room);
+      if (set !== undefined) {
+        set.delete(fire);
+        if (set.size === 0) this.waiters.delete(room);
+      }
+      resolveFired();
+    };
+    const timer = setTimeout(fire, blockMs);
+    let set = this.waiters.get(room);
+    if (set === undefined) {
+      set = new Set();
+      this.waiters.set(room, set);
+    }
+    set.add(fire);
+    return { fired, cancel: fire };
+  }
+
+  /** Wake every long-poll fetch blocked on `room`; each fire self-clears (idempotent). */
+  private fireWaiters(room: string): void {
+    const set = this.waiters.get(room);
+    if (set !== undefined) for (const fire of [...set]) fire();
   }
 
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
@@ -396,6 +519,10 @@ export class XmppPlugin implements BackendPlugin {
 
     // Live delivery: every reflected message carrying a room stanza-id (incl. our own).
     if (archId === undefined) return;
+    // Wake any long-poll fetch blocked on this room (issue #20), independent of subscriptions — the
+    // blocked fetch re-runs its exclusive MAM query, so the wake only needs to signal "something
+    // arrived". This is the SAME live delivery the push path uses (no second join/connection).
+    this.fireWaiters(room);
     const sub = this.subscriptions.get(room);
     if (sub === undefined) return;
     const body = stanza.getChildText('body');

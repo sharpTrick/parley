@@ -24,6 +24,8 @@ async function harness(opts?: {
   presenceTtlMs?: number;
   topics?: string[];
   postPatterns?: string[];
+  blockMaxMs?: number;
+  blockPollIntervalMs?: number;
 }) {
   const plugin = new FakePlugin();
   await plugin.connect({});
@@ -41,6 +43,8 @@ async function harness(opts?: {
     seen: new SeenSet(),
     presenceTopic: PRESENCE_TOPIC,
     presenceTtlMs: opts?.presenceTtlMs ?? 90_000,
+    blockMaxMs: opts?.blockMaxMs ?? 60_000,
+    blockPollIntervalMs: opts?.blockPollIntervalMs ?? 20,
     now: opts?.now,
   });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
@@ -123,6 +127,36 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
     ) as { messages: Array<{ content: string }>; nextCursor: string };
     expect(since.messages.map((m) => m.content)).toEqual(['c']);
     expect(since.nextCursor).toBe('3');
+  });
+
+  it('parley_fetch_recent block_ms long-polls and returns promptly after a concurrent post', async () => {
+    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'old' } });
+    // Block at the tail; nothing newer than cursor '1' yet, so the call must hold.
+    const pending = client.callTool({
+      name: 'parley_fetch_recent',
+      arguments: { topic: 'ctx', since: '1', block_ms: 3000 },
+    });
+    // A concurrent writer posts while the fetch is blocked (poll interval is 20ms in the harness).
+    await new Promise((r) => setTimeout(r, 40));
+    await plugin.post(asTopic('ctx'), asHandle('other'), 'fresh');
+    const out = parse(await pending) as { messages: Array<{ content: string }>; nextCursor: string };
+    expect(out.messages.map((m) => m.content)).toEqual(['fresh']);
+    expect(out.nextCursor).toBe('2');
+  });
+
+  it('parley_fetch_recent block_ms returns an empty page at the (clamped) timeout', async () => {
+    // block_max_ms clamps the huge request to 40ms — if the clamp were absent this would hang the
+    // default test timeout instead of returning empty promptly.
+    const { client: c } = await harness({ blockMaxMs: 40, blockPollIntervalMs: 20 });
+    await c.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'old' } });
+    const out = parse(
+      await c.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', since: '1', block_ms: 10_000_000 },
+      }),
+    ) as { messages: unknown[]; nextCursor: string };
+    expect(out.messages).toEqual([]);
+    expect(out.nextCursor).toBe('1'); // stable, replayable
   });
 
   it('rejects a topic outside the allowlist (isError, not a crash)', async () => {
@@ -496,6 +530,8 @@ describe('toolDepsFor (single ToolDeps factory — CX-09/CX-06)', () => {
     expect(deps.allow.topics()).toEqual(['ctx', 'ctx-reviews']);
     expect(deps.presenceTopic).toBe(asTopic(cfg.presence.topic));
     expect(deps.presenceTtlMs).toBe(cfg.presence.ttl_ms);
+    expect(deps.blockMaxMs).toBe(cfg.catchup.block_max_ms);
+    expect(deps.blockPollIntervalMs).toBe(cfg.catchup.block_poll_interval_ms);
     expect(deps.seen).toBe(seen);
 
     // reactive HTTP root: omits extras ⇒ no SeenSet is threaded (CX-06 — no push loop, no dedup state).
