@@ -67,6 +67,18 @@ interface Subscription {
 }
 
 /**
+ * A `fetchRecent` long-poll parked on a topic (issue #20). Resolved by the SHARED ingest path
+ * (the one getUpdates loop, or an own post) when a message strictly after `sinceMid` lands, or
+ * on `blockMs` timeout, or on disconnect. No second getUpdates consumer is ever opened.
+ */
+interface Waiter {
+  /** Wake only for a message whose `message_id` is strictly greater than this. */
+  sinceMid: number;
+  /** Idempotently unpark (message arrived, timeout, or disconnect) — self-cleans the waiter. */
+  wake: () => void;
+}
+
+/**
  * Telegram Bot API backend (DESIGN §6/§9) — spoken to via the raw HTTP API with the global
  * `fetch`, no SDK dependency. Telegram is a hosted SaaS, unlike the self-hosted core backends:
  * there is no server of ours to configure, only a bot token from @BotFather.
@@ -103,6 +115,8 @@ export class TelegramPlugin implements BackendPlugin {
   private stopped = false;
   /** Live subscriptions per topic, fed by the shared getUpdates loop and by post(). */
   private readonly subs = new Map<string, Subscription[]>();
+  /** Native long-poll waiters per topic (issue #20), resolved by ingest / timeout / disconnect. */
+  private readonly waiters = new Map<string, Set<Waiter>>();
   /** In-flight getUpdates long-polls, aborted on disconnect so teardown is immediate. */
   private readonly controllers = new Set<AbortController>();
   /** Memoized getMe (the bot's own identity), for resolveIdentity. */
@@ -141,6 +155,11 @@ export class TelegramPlugin implements BackendPlugin {
     for (const c of this.controllers) c.abort();
     this.controllers.clear();
     this.subs.clear();
+    // Unpark every native long-poll waiter (issue #20) so no blocked fetchRecent hangs past
+    // teardown. Snapshot first: wake() mutates `waiters`. Each resumes, re-queries the (now
+    // closed) store, and returns an empty page — returning early/empty is always safe.
+    for (const set of [...this.waiters.values()]) for (const w of [...set]) w.wake();
+    this.waiters.clear();
     this.store?.close();
     this.store = undefined;
     this.me = undefined;
@@ -181,17 +200,75 @@ export class TelegramPlugin implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const store = this.require(this.store);
     const limit = args.limit ?? 100;
-    const all = store.entries(args.topic);
-    const slice =
-      args.since === undefined
-        ? // Default window: the most recent `limit` messages, ascending.
-          all.slice(-limit)
-        : // Exclusive: strictly after `since`, ascending. Numeric — never lexical.
-          all.filter((r) => r.message_id > Number(args.since)).slice(0, limit);
-    const messages = slice.map(recordToMessage);
+    const query = (): Message[] => {
+      const all = store.entries(args.topic);
+      const slice =
+        args.since === undefined
+          ? // Default window: the most recent `limit` messages, ascending.
+            all.slice(-limit)
+          : // Exclusive: strictly after `since`, ascending. Numeric — never lexical.
+            all.filter((r) => r.message_id > Number(args.since)).slice(0, limit);
+      return slice.map(recordToMessage);
+    };
+    let messages = query();
+    // Native long-poll (issue #20): ONLY when the exclusive `since` query came back empty. Park
+    // up to `blockMs` for the SHARED ingest path (the one getUpdates loop, or an own post) to
+    // deliver a message strictly after `since`, then re-run the same pure query. There is no
+    // second getUpdates consumer — {@link ingest} wakes the waiter. The initial query and the
+    // waiter registration run with NO await between them, so a message ingested during the wait
+    // can never slip through the gap. Empty page + STABLE cursor (=== `since`) at timeout is
+    // correct; returning early/empty is always safe, and we never block longer than `blockMs`.
+    if (
+      messages.length === 0 &&
+      args.since !== undefined &&
+      args.blockMs !== undefined &&
+      args.blockMs > 0
+    ) {
+      await this.waitForMessage(args.topic, Number(args.since), args.blockMs);
+      messages = query();
+    }
     const last = messages.at(-1);
     const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor('0'));
     return { messages, nextCursor };
+  }
+
+  /**
+   * Park until the SHARED ingest path delivers a message strictly after `sinceMid` in `topic`
+   * (issue #20), or `blockMs` elapses, or {@link disconnect} fires. No second getUpdates
+   * consumer: the one shared loop and own posts both flow through {@link ingest}, which wakes
+   * the waiter. The waiter always self-cleans (timer cleared, removed from the set), so a
+   * timed-out or resolved long-poll never leaks.
+   */
+  private waitForMessage(topic: Topic, sinceMid: number, blockMs: number): Promise<void> {
+    const key = topic as string;
+    let set = this.waiters.get(key);
+    if (set === undefined) {
+      set = new Set<Waiter>();
+      this.waiters.set(key, set);
+    }
+    const waiters = set;
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const wake = (): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        waiters.delete(waiter);
+        if (waiters.size === 0) this.waiters.delete(key);
+        resolve();
+      };
+      const timer = setTimeout(wake, blockMs);
+      const waiter: Waiter = { sinceMid, wake };
+      waiters.add(waiter);
+    });
+  }
+
+  /** Wake any native long-poll waiter on `topic` whose `since` now trails `messageId` (issue #20). */
+  private wakeWaiters(topic: Topic, messageId: number): void {
+    const set = this.waiters.get(topic as string);
+    if (set === undefined) return;
+    // Snapshot: wake() removes the waiter from the set (and may drop the key).
+    for (const w of [...set]) if (messageId > w.sinceMid) w.wake();
   }
 
   /**
@@ -294,6 +371,9 @@ export class TelegramPlugin implements BackendPlugin {
       ts: new Date(msg.date * 1000).toISOString(),
     };
     if (!store.append(rec)) return; // already observed — dedup holds (DESIGN §6).
+    // Native long-poll (issue #20): a genuinely-new message wakes any parked fetchRecent on this
+    // topic. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
+    this.wakeWaiters(topic, msg.message_id);
     const message = recordToMessage(rec);
     for (const sub of this.subs.get(topic as string) ?? []) {
       if (msg.message_id <= sub.watermark) continue; // fixed subscribe-time value; never advanced.
