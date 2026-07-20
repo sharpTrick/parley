@@ -117,6 +117,17 @@ const ConfigObject = z.object({
     .object({
       on_start: z.boolean().default(true),
       limit: z.number().int().positive().default(100),
+      /**
+       * Server-side cap (ms) on the `parley_fetch_recent` `block_ms` long-poll (issue #20). A
+       * caller's `block_ms` is clamped to this before it reaches a plugin, kept safely below MCP /
+       * client tool timeouts so a blocked call never trips them. Default 60s.
+       */
+      block_max_ms: z.number().int().nonnegative().default(60_000),
+      /**
+       * Poll cadence (ms) for core's generic long-poll fallback — how often it re-queries when a
+       * backend does not block natively (issue #20). No correctness impact; latency/cost knob only.
+       */
+      block_poll_interval_ms: z.number().int().positive().default(250),
     })
     .default({}),
   live_push: z

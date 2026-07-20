@@ -5,7 +5,12 @@ describe('config loader', () => {
   it('applies defaults from a minimal config', () => {
     const cfg = parseConfig({ identity: { handle: 'ctx-payments' }, topics: ['ctx-payments'] });
     expect(cfg.backend).toBe('local-sqlite');
-    expect(cfg.catchup).toEqual({ on_start: true, limit: 100 });
+    expect(cfg.catchup).toEqual({
+      on_start: true,
+      limit: 100,
+      block_max_ms: 60_000,
+      block_poll_interval_ms: 250,
+    });
     expect(cfg.live_push).toEqual({ enabled: false, mention_filter: false });
     expect(cfg.permissions.skip_permissions).toBe(false);
     expect(cfg.backend_config).toEqual({});
@@ -80,7 +85,12 @@ describe('config loader', () => {
       catchup: { limit: 50 },
       live_push: { enabled: true },
     });
-    expect(cfg.catchup).toEqual({ on_start: true, limit: 50 });
+    expect(cfg.catchup).toEqual({
+      on_start: true,
+      limit: 50,
+      block_max_ms: 60_000,
+      block_poll_interval_ms: 250,
+    });
     expect(cfg.live_push).toEqual({ enabled: true, mention_filter: false });
   });
 

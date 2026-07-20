@@ -101,6 +101,36 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       ]);
     });
 
+    it('blockMs long-poll: returns promptly after a concurrent post, empty at timeout', async (testCtx) => {
+      if (ctx.supportsBlockingFetch !== true) {
+        testCtx.skip(); // backend gets long-poll from core's generic wrapper, not the plugin
+        return;
+      }
+      const t = ctx.freshTopic();
+      await ctx.plugin.post(t, SENDER, 'old');
+      const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
+
+      // (a) A blocked fetch at the tail wakes promptly when a message lands mid-wait.
+      const pending = ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 });
+      const posted = new Promise<void>((resolve) =>
+        setTimeout(() => {
+          void ctx.plugin.post(t, SENDER, 'fresh').then(() => resolve());
+        }, 50),
+      );
+      const [woke] = await Promise.all([pending, posted]);
+      expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
+      expect(woke.nextCursor).not.toBe(tail); // cursor advanced
+
+      // (b) With nothing new, a blocked fetch returns an empty page with a stable cursor at timeout.
+      const newTail = woke.nextCursor;
+      const started = Date.now();
+      const timedOut = await ctx.plugin.fetchRecent({ topic: t, since: newTail, blockMs: 300 });
+      expect(timedOut.messages).toEqual([]);
+      expect(timedOut.nextCursor).toBe(newTail);
+      // It actually waited (did not return instantly) — allow generous slack for slow CI.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+    });
+
     it('multi-process writes do not corrupt or error; cursor stays monotonic', async (testCtx) => {
       if (ctx.concurrentPost === undefined) {
         testCtx.skip();
