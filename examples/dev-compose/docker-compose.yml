@@ -55,10 +55,10 @@ services:
   # run against in-process fakes.)
 
   # --- v0.4 Matrix / Synapse (room = topic, sync token = cursor, sync loop = subscribe) ---
-  # FIRST RUN (one-time): generate config before `up`:
-  #   docker compose -f examples/dev-compose/docker-compose.yml run --rm \
-  #     -e SYNAPSE_SERVER_NAME=parley.local -e SYNAPSE_REPORT_STATS=no synapse generate
-  # then enable a registration_shared_secret in synapse-data/homeserver.yaml, and `up synapse`.
+  # Easiest path: `./dev-infra.sh up matrix` — it generates the config, pins the 8008 listener to
+  # IPv4 (the generated '::' bind kills the container where there is no IPv6), appends
+  # synapse/dev-overrides.yaml (registration secret + relaxed rate limits), and registers the test
+  # user parley/parleypass. The equivalent manual steps are in README.md.
   synapse:
     image: matrixdotorg/synapse:latest
     environment:
@@ -66,8 +66,16 @@ services:
       SYNAPSE_REPORT_STATS: "no"
     volumes:
       - synapse-data:/data
+      - ./synapse/dev-overrides.yaml:/dev-overrides.yaml:ro
     ports:
       - "8008:8008"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8008/health', timeout=3)\""
+      interval: 3s
+      timeout: 4s
+      retries: 40
 
   # --- post-v1 Keycloak (external-OIDC auth mode for remote/chat; docs/keycloak-integration.md) ---
   # Imports the throwaway `parley` realm: users parley/parleypass (has the parley-owner role) and
@@ -100,6 +108,8 @@ services:
     ports:
       - "5222:5222" # c2s
       - "5269:5269" # s2s
+    # No healthcheck: prosody has no pidfile here, so `prosodyctl status` is unreliable, and the
+    # image lacks nc/curl for a port probe. dev-infra.sh gates on the c2s port from the host instead.
 
 volumes:
   synapse-data:
