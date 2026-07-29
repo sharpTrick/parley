@@ -121,4 +121,89 @@ Prosody, Synapse and Keycloak running.
 
 ## Results
 
-*(To be appended as rounds complete. Nothing here yet — the run has not started.)*
+Appended as rounds complete. Raw per-round data is in `data/`.
+
+### Per round
+
+| round | targets run | findings | CONFIRMED | blocking | PLAUSIBLE | errored | converged |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :-- |
+| 1 | 14 / 14 | 139 | 124 | 61 | 15 | 0 | no |
+| 2 | 14 / 14 | 136 | 130 | 49 | 6 | 0 | no |
+
+Tests in the suite: **460 → 1428** (round 1 remediation) **→ 2545** (round 2 remediation), none
+skipped, against real Redis, NATS, Postgres, Prosody, Synapse and Keycloak.
+
+### Per-lens yield (total / confirmed / blocking)
+
+| lens | R1 | R2 |
+| --- | --- | --- |
+| concurrency-and-failure | 29 / 25 / 17 | 24 / 23 / 16 |
+| design-principles | 9 / 9 / 3 | 23 / 23 / 5 |
+| test-integrity | 16 / 16 / 7 | 21 / 21 / 10 |
+| security | 23 / 17 / 9 | 15 / 13 / 9 |
+| correctness | 19 / 18 / 13 | 11 / 10 / 3 |
+| truth-in-docs | 15 / 13 / 3 | 11 / 10 / 2 |
+| maintainability | 4 / 4 / 0 | 11 / 11 / 0 |
+| protocol-conformance | 12 / 12 / 9 | 8 / 8 / 4 |
+| test-hygiene | *(not yet added)* | 7 / 7 / 0 |
+| operability-and-release | 11 / 9 / 0 | 5 / 4 / 0 |
+| seam-integrity | 1 / 1 / 0 | 0 / 0 / 0 |
+
+### What the first two rounds say about the pre-registered expectations
+
+Two rounds is far too few to settle any of these. Recorded now so the reading is not
+retrofitted later.
+
+- **E1 (security stays productive).** Holding so far — 9 blocking findings in each of the first two
+  rounds, no sign of the extinction ouroboros saw. This is the expectation the deep surface was
+  chosen to test, and it is the one currently most clearly supported.
+- **E2 (maintainability files the most, blocks the least).** *Contradicted on the first half,
+  confirmed on the second.* Maintainability filed 4 and 11 findings, nowhere near ouroboros's 43%
+  of the total — but it produced **zero** blocking findings in both rounds, exactly as predicted.
+  The likely cause of the first half is the partition, not the codebase: a per-lens critic with only
+  maintainability to report will report maintainability, whereas an all-lens critic that has just
+  found a lost wakeup files that instead. If that reading is right, ouroboros's "convergence was
+  gated by maintainability running out of nits" is partly an artifact of partitioning by lens.
+- **E5 (blocking-gated rule fires earlier).** No signal yet; both rounds are far from either stop
+  rule.
+- **E3, E4.** Not yet measurable — no round has quiesced, and cost-per-finding needs more points.
+
+### Instrument observations
+
+- **`theme` is not being used as designed.** 136 findings carried **100 distinct themes**. The field
+  was added because ouroboros's 92 findings wore 87 distinct *class* labels but collapsed to ~12
+  themes, and the ratchet locked cases rather than themes. At near-1:1, `theme` is being filled in at
+  class granularity and cannot yet serve as the anti-recurrence barrier it was introduced to be. This
+  is a defect in the instrument's *instructions*, not in its data collection — recorded rather than
+  fixed mid-run, per the pre-registered rule on not changing the instrument.
+- **`seam-integrity` yielded 1 finding in R1 and 0 in R2.** The prime directive is holding, which is
+  the substantive result; but it also means the mechanically-checkable lens contributes almost
+  nothing to the stop signal. Whether that is saturation or a lens with nothing left to say on a
+  frozen seam is not yet distinguishable.
+- **A round's cost is dominated by remediation, not review.** Both rounds ran 14 critics in
+  parallel; both took substantially longer to *act on* than to *produce*. Ouroboros measured review
+  cost; the thing that actually gates throughput here is the fan-out of fixers behind it.
+
+### Process defects found by running the process
+
+Recorded because the meta-goal is what the *next* experiment should be.
+
+- **The runner received `args` as a JSON string**, so `round` silently defaulted to 1 and `wakeAll`
+  to false. Since `wakeAll` is a precondition for declaring convergence, round 2 was
+  convergence-INELIGIBLE and a clean round could not have stopped the loop. Fixed in `128ce60` and
+  recorded as a protocol-version bump; no round's findings were affected, only its eligibility.
+- **Agents sharing a filesystem corrupted each other's work.** Three round-1 remediators collided on
+  one scratch path and wrote foreign plugin source into packages. Round 2 gave every agent its own
+  git worktree (`scripts/careening-worktrees.mjs`), which fixed it.
+- **Worktrees isolate files, not services.** Shared Synapse contention produced 4 *false* conformance
+  failures in round 2 — foreign traffic in the shared `parley_conformance` room legitimately advances
+  the Matrix cursor, which the suite's stability assertion cannot distinguish from a defect. Both the
+  matrix critic and the orchestrator diagnosed this independently and it passed 18/18 once quiet. The
+  harness sharing one stable room across processes is a real defect, filed for a later round.
+- **`git checkout -- <file>` is a trap in a dirty worktree.** Three separate agents used it to undo a
+  mutation and destroyed their own uncommitted fixes. The remediation contract now says to snapshot
+  and restore from the snapshot.
+- **A guard nobody watched fail.** Round 1's remediation reintroduced a raw NUL byte into a source
+  file, which made `file(1)` classify it as binary and ripgrep skip it silently. It recurred four
+  times before being ratcheted as a class in `source-hygiene.test.ts` — the clearest example in this
+  run of why the protocol requires ratcheting the class, not the instance.
