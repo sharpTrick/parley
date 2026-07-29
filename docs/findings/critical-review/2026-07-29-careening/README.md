@@ -129,6 +129,12 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :-- |
 | 1 | 14 / 14 | 139 | 124 | 61 | 15 | 0 | no |
 | 2 | 14 / 14 | 136 | 130 | 49 | 6 | 0 | no |
+| 3 | 14 / 14 | 119 | 115 | 38 | 4 | 0 | no |
+
+Round 3 ran the **round-1 runner** — see "Process defects" below. It is kept in the series because
+all 14 critics still reviewed the correct targets full-surface and reached the worktrees and the
+mutation requirement through `docs/REVIEW_PROTOCOL.md`; but it is a protocol-version confound and
+any cross-round claim has to say so.
 
 Tests in the suite: **460 → 1428** (round 1 remediation) **→ 2545** (round 2 remediation), none
 skipped, against real Redis, NATS, Postgres, Prosody, Synapse and Keycloak.
@@ -148,6 +154,30 @@ skipped, against real Redis, NATS, Postgres, Prosody, Synapse and Keycloak.
 | test-hygiene | *(not yet added)* | 7 / 7 / 0 |
 | operability-and-release | 11 / 9 / 0 | 5 / 4 / 0 |
 | seam-integrity | 1 / 1 / 0 | 0 / 0 / 0 |
+
+Round 3, same order of columns (total / confirmed / blocking): test-integrity 28 / 28 / **12**,
+truth-in-docs 18 / 17 / 1, concurrency-and-failure 17 / 17 / **13**, correctness 11 / 11 / 3,
+security 8 / 8 / 4, test-hygiene 8 / 8 / 0, operability-and-release 8 / 7 / 0, design-principles
+7 / 7 / 1, protocol-conformance 6 / 6 / 2, seam-integrity 4 / 2 / **2**, maintainability 4 / 4 / 0.
+
+Three movements are worth naming now rather than at the end:
+
+- **test-integrity went from fourth to first (28 findings, 12 blocking).** Round 2's remediation
+  took the suite from 1428 to 2545 tests, and round 3 found most of its blocking material *in that
+  new test code*. The loop is now substantially reviewing its own output — the regime change
+  ouroboros reported at its midpoint, arriving here at round 3 rather than round 11. The `git blame`
+  oracle is what will settle how much; it has not been run yet.
+- **security is decaying: 23 → 15 → 8 findings.** E1 predicted a deep auth surface would keep this
+  lens productive. It is still producing blocking findings (9, 9, 4), so it has not gone extinct the
+  way ouroboros's did — but the trend is downward and E1 should not yet be called confirmed.
+- **seam-integrity produced its first blocking findings (2).** Both are the same shape: core
+  depending on something the seam does not guarantee. `computeRoster` keys the presence roster on
+  `Message.senderHandle`, which the conformance suite explicitly makes optional and which five of
+  ten backends do not carry; and `bridge-sqlite` silently clamps `limit` to 1000 while core's
+  catch-up driver uses a short page as its "topic exhausted" signal, so `catchup.limit: 1500`
+  silently strands every message past the first thousand. The prime directive (core must not import
+  a backend) holds and was checked mechanically every round; what these findings show is a subtler
+  leak in the other direction — core relying on behaviour the seam never promised.
 
 ### What the first two rounds say about the pre-registered expectations
 
@@ -203,6 +233,15 @@ Recorded because the meta-goal is what the *next* experiment should be.
 - **`git checkout -- <file>` is a trap in a dirty worktree.** Three separate agents used it to undo a
   mutation and destroyed their own uncommitted fixes. The remediation contract now says to snapshot
   and restore from the snapshot.
+- **A named workflow is a snapshot, and the snapshot went stale.** Round 3 was invoked as
+  `Workflow({name: "careening-review"})` and executed the round-1 script: no worktree instruction,
+  no mutation-testing requirement, no container-scoping rule, and none of the argument parsing fixed
+  in `128ce60` — so it recorded itself as "round 1, not convergence-eligible" despite running all
+  fourteen critics. The findings stand, because `CLAUDE.md` points critics at
+  `docs/REVIEW_PROTOCOL.md` and they picked up the worktrees and the mutation requirement from
+  there; the instrument's redundancy is what saved the round. The runner, protocol and skill now all
+  say to invoke by `scriptPath`. This is the second time the same class — *the harness silently ran
+  something other than what was committed* — has cost a round its convergence eligibility.
 - **A guard nobody watched fail.** Round 1's remediation reintroduced a raw NUL byte into a source
   file, which made `file(1)` classify it as binary and ripgrep skip it silently. It recurred four
   times before being ratcheted as a class in `source-hygiene.test.ts` — the clearest example in this

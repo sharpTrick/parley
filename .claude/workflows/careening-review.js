@@ -1,6 +1,11 @@
 // One round of the Careening adversarial review. Protocol: docs/REVIEW_PROTOCOL.md
 //
-//   Workflow({ name: "careening-review", args: { round, quiesced, changed, wakeAll } })
+//   Workflow({ scriptPath: "/home/user/parley/.claude/workflows/careening-review.js",
+//             args: { round, quiesced, changed, wakeAll } })
+//
+// Invoke by scriptPath, NOT by name. A named workflow resolves to a snapshot registered when
+// the session started, so edits to this file do not reach a `name:` invocation — round 3 ran
+// the round-1 script that way (no worktree instruction, no mutation requirement, no args parse).
 //
 //   round     — round number, for labels and the returned record
 //   quiesced  — previous round's `nextQuiesced`, verbatim

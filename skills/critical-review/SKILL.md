@@ -13,7 +13,8 @@ wrong somewhere.
 ## Run a round
 
 ```
-Workflow({ name: "careening-review", args: { round: N, quiesced: [...], changed: [...], wakeAll: false } })
+Workflow({ scriptPath: "<repo>/.claude/workflows/careening-review.js",
+          args: { round: N, quiesced: [...], changed: [...], wakeAll: false } })
 ```
 
 - `round` — the round number, for labels and the record.

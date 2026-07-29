@@ -126,8 +126,17 @@ Run the committed runner rather than orchestrating by hand — it enforces full-
 per-package coverage, collects structured output, applies the wake rules, and computes convergence:
 
 ```
-Workflow({ name: "careening-review" })
+Workflow({ scriptPath: "<repo>/.claude/workflows/careening-review.js",
+          args: { round, quiesced, changed, wakeAll } })
 ```
+
+**Invoke it by path, never by name.** A named workflow resolves to a copy registered when the
+session started, so edits to the runner do not reach a `name:` invocation. Round 3 ran the
+round-1 script this way — without the worktree instruction, the mutation-testing requirement,
+the container-scoping rule, or the argument parsing that records `wakeAll`. The critics still
+reached the first two through `docs/REVIEW_PROTOCOL.md`, which `CLAUDE.md` points them at, so
+the round's findings stand; but a round whose `wakeAll` is not recorded can never declare
+convergence, which is the failure this note exists to prevent.
 
 It returns `converged` (**true iff zero CONFIRMED findings in a wake-all round**), the
 confirmed/blocking/plausible counts, per-package and per-lens breakdowns, and the findings.
