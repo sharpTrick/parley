@@ -49,6 +49,13 @@ instructions to report back what it fixed, what it declined and why, and which m
 fail. It must not touch another package — parallel agents editing shared files is how a round
 corrupts its own baseline.
 
+**Give each agent a scratch directory of its own,** named for its package. Scoping the *files* an
+agent may edit is not enough: in round 1 three agents independently chose the same backup filename
+in the shared session scratchpad and restored each other's source, twice writing one backend's
+plugin into another's. They caught it themselves, but verify independently rather than trusting the
+report — diffing each package's identifier set against the round's base commit is cheap and
+conclusive.
+
 The orchestrator then adjudicates the declines, runs the full suite once, and writes the commit.
 
 ## The fix cycle

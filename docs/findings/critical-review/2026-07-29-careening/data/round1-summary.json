@@ -2,52 +2,52 @@
  "round": 1,
  "base": "0f35f61",
  "wakeAll": true,
- "note": "13 of 14 critics recovered from an aborted run at base 1e0a7ab; the shared critic ran separately at 0f35f61. The two bases differ only in comments and docs.",
+ "targets": 14,
  "counts": {
-  "total": 121,
-  "confirmed": 106,
-  "blocking": 53,
+  "total": 139,
+  "confirmed": 124,
+  "blocking": 61,
   "plausible": 15
  },
  "byLens": {
   "correctness": {
-   "total": 18,
-   "confirmed": 17,
+   "total": 19,
+   "confirmed": 18,
    "blocking": 13
   },
   "security": {
-   "total": 21,
-   "confirmed": 15,
-   "blocking": 7
+   "total": 23,
+   "confirmed": 17,
+   "blocking": 9
   },
   "design-principles": {
-   "total": 8,
-   "confirmed": 8,
+   "total": 9,
+   "confirmed": 9,
    "blocking": 3
   },
   "truth-in-docs": {
-   "total": 13,
-   "confirmed": 11,
-   "blocking": 1
+   "total": 15,
+   "confirmed": 13,
+   "blocking": 3
   },
   "concurrency-and-failure": {
-   "total": 27,
-   "confirmed": 23,
-   "blocking": 16
+   "total": 29,
+   "confirmed": 25,
+   "blocking": 17
   },
   "protocol-conformance": {
-   "total": 9,
-   "confirmed": 9,
-   "blocking": 7
+   "total": 12,
+   "confirmed": 12,
+   "blocking": 9
   },
   "test-integrity": {
-   "total": 13,
-   "confirmed": 13,
-   "blocking": 6
+   "total": 16,
+   "confirmed": 16,
+   "blocking": 7
   },
   "operability-and-release": {
-   "total": 9,
-   "confirmed": 7,
+   "total": 11,
+   "confirmed": 9,
    "blocking": 0
   },
   "seam-integrity": {
@@ -56,8 +56,8 @@
    "blocking": 0
   },
   "maintainability": {
-   "total": 2,
-   "confirmed": 2,
+   "total": 4,
+   "confirmed": 4,
    "blocking": 0
   }
  },
@@ -74,6 +74,21 @@
   "zulip": 10,
   "discord": 10,
   "slack": 11,
-  "telegram": 12
- }
+  "telegram": 12,
+  "shared": 18
+ },
+ "tests": {
+  "before": 460,
+  "after": 1428,
+  "filesBefore": 58,
+  "filesAfter": 101,
+  "skippedFiles": 0
+ },
+ "converged": false,
+ "blockingClean": false,
+ "notes": [
+  "Two critic CONFIRMED findings failed independent reproduction and were declined: the sequential-optional ReDoS bypass, and (in my own strengthened suite) two assertions that contradicted the frozen contract.",
+  "Iatrogenesis observed and mechanically caught: a remediation agent reintroduced the raw-NUL defect class fixed earlier on this branch, in a new location in the same file.",
+  "Process defect: parallel agents collided on a shared scratchpad filename three times, twice writing one backend plugin into another package. Detected and recovered; contract now assigns per-agent scratch dirs."
+ ]
 }
