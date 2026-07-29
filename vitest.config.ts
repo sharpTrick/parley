@@ -1,3 +1,4 @@
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
@@ -6,22 +7,27 @@ import { defineConfig } from 'vitest/config';
 // manual channel loop are the only things that need `npm run build` first.)
 const fromHere = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
+/**
+ * DERIVED, never hand-listed. This map used to be written out package by package, and it drifted:
+ * `@sharptrick/parley-net-util` was missing, so anything importing it resolved through the
+ * workspace symlink to `dist/` instead. Its tests would then have graded a stale build rather than
+ * the source — a suite that passes while the code under it is broken. Scanning `packages/` means a
+ * new package is aliased the moment it exists, and the failure mode cannot come back.
+ */
+function packageAliases(): Record<string, string> {
+  const root = new URL('./packages/', import.meta.url);
+  const out: Record<string, string> = {};
+  for (const dir of readdirSync(root)) {
+    const manifest = new URL(`${dir}/package.json`, root);
+    const { name } = JSON.parse(readFileSync(manifest, 'utf8')) as { name: string };
+    out[name] = fromHere(`./packages/${dir}/src/index.ts`);
+  }
+  return out;
+}
+
 export default defineConfig({
   resolve: {
-    alias: {
-      '@sharptrick/parley-core': fromHere('./packages/bridge-core/src/index.ts'),
-      '@sharptrick/parley-sqlite': fromHere('./packages/bridge-sqlite/src/index.ts'),
-      '@sharptrick/parley-redis': fromHere('./packages/bridge-redis/src/index.ts'),
-      '@sharptrick/parley-matrix': fromHere('./packages/bridge-matrix/src/index.ts'),
-      '@sharptrick/parley-xmpp': fromHere('./packages/bridge-xmpp/src/index.ts'),
-      '@sharptrick/parley-nats': fromHere('./packages/bridge-nats/src/index.ts'),
-      '@sharptrick/parley-postgres': fromHere('./packages/bridge-postgres/src/index.ts'),
-      '@sharptrick/parley-zulip': fromHere('./packages/bridge-zulip/src/index.ts'),
-      '@sharptrick/parley-discord': fromHere('./packages/bridge-discord/src/index.ts'),
-      '@sharptrick/parley-telegram': fromHere('./packages/bridge-telegram/src/index.ts'),
-      '@sharptrick/parley-slack': fromHere('./packages/bridge-slack/src/index.ts'),
-      '@sharptrick/parley-conformance': fromHere('./packages/conformance/src/index.ts'),
-    },
+    alias: packageAliases(),
   },
   test: {
     environment: 'node',
