@@ -29,6 +29,10 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['packages/**/*.test.ts', 'examples/**/*.test.ts'],
+    // `zz-` is the reserved prefix for a throwaway probe written inside a package while
+    // investigating it by hand. Keep it excluded, so that a scratch file cannot silently join the
+    // real suite just because it ends in `.test.ts`.
+    exclude: ['**/node_modules/**', '**/dist/**', '**/zz-*.test.ts'],
     // SQLite file locks + poll loops want a little headroom over the default.
     testTimeout: 20_000,
     hookTimeout: 20_000,
