@@ -1,7 +1,8 @@
-import { asTopic, type Topic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { xml } from '@xmpp/client';
 import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
+import { type ArchiveItem, priv } from './fake-xmpp.js';
 
 // SEC-13 — XMPP MAM result provenance. `onMamResult` must accept a streamed
 // `<result xmlns='urn:xmpp:mam:2'>` item ONLY when the outer message stanza's bare `from`
@@ -14,25 +15,7 @@ const NS_MAM = 'urn:xmpp:mam:2';
 const NS_FORWARD = 'urn:xmpp:forward:0';
 const NS_DELAY = 'urn:xmpp:delay';
 
-interface MamItem {
-  archId: string;
-  from: string;
-  body: string;
-  stamp?: string;
-}
-
-/** Reach into the plugin's private surface via a typed cast (mirrors the spec's "typed cast" seam). */
-interface XmppPrivate {
-  stopped: boolean;
-  mamCollectors: Map<string, { room: string; items: MamItem[] }>;
-  onStanza(stanza: unknown): void;
-  mamQuery(
-    topic: Topic,
-    opts: { after?: string; before?: boolean; max: number },
-  ): Promise<{ items: MamItem[]; complete: boolean }>;
-  xmpp?: unknown;
-}
-const priv = (p: XmppPlugin): XmppPrivate => p as unknown as XmppPrivate;
+type MamItem = ArchiveItem;
 
 /**
  * A forwarded MAM `<result>` wrapped in an outer `message` stanza, exactly as a server (or an

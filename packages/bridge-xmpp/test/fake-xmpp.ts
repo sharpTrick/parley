@@ -22,6 +22,7 @@ export interface ArchiveItem {
   archId: string;
   from: string;
   body: string;
+  stamp?: string;
 }
 
 /** The plugin's private surface, reached by typed cast (the pattern the other suites use). */
@@ -38,7 +39,11 @@ export interface XmppPrivate {
   roomJid(topic: Topic): string;
   joinOnce(room: string): Promise<void>;
   onStanza(stanza: unknown): void;
-  armWaiter(room: string, blockMs: number): { fired: Promise<string>; cancel(): void };
+  armWaiter(room: string): { park(ms: number): Promise<string>; cancel(): void };
+  mamQuery(
+    topic: Topic,
+    opts: { after?: string; before?: boolean; max: number },
+  ): Promise<{ items: ArchiveItem[]; complete: boolean }>;
 }
 export const priv = (p: XmppPlugin): XmppPrivate => p as unknown as XmppPrivate;
 
@@ -58,6 +63,19 @@ export const expectNoLeaks = (plugin: XmppPlugin): void => {
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * First codepoint outside XML 1.0's `Char` production, derived independently of the plugin's own
+ * check so that a bug in that check cannot make this fixture agree with it.
+ */
+export const illegalCodepoint = (s: string): number | undefined => {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) as number;
+    if (cp === 0x9 || cp === 0xa || cp === 0xd) continue;
+    if (cp < 0x20 || (cp >= 0xd800 && cp <= 0xdfff) || cp === 0xfffe || cp === 0xffff) return cp;
+  }
+  return undefined;
+};
 
 /**
  * Scriptable stand-in for the `@xmpp/client` surface the plugin uses, built for FAULT injection:
@@ -86,9 +104,12 @@ export class FakeXmpp {
 
   /** The occupant nick the plugin joined with; a reflection must come back from it. */
   nick = 'parley-test';
+  /** Enforce XML well-formedness on everything sent, as a real XMPP server does. */
+  strictXml = true;
 
   private readonly handlers: Record<string, Array<(a?: unknown) => void>> = {};
   private seq = 0;
+  private dead = false;
 
   readonly iqCaller = { request: (iq: unknown): Promise<unknown> => this.onIq(iq as El) };
 
@@ -107,13 +128,29 @@ export class FakeXmpp {
   }
 
   async send(el: unknown): Promise<void> {
+    if (this.dead) throw new Error('stream closed');
     const stanza = el as El;
     this.sent.push(stanza);
+    if (this.strictXml && illegalCodepoint(String(stanza)) !== undefined) {
+      this.killStream();
+      throw new Error('not-well-formed: stream closed');
+    }
     if (stanza.is('presence')) {
       this.onJoin(stanza);
       return;
     }
     if (stanza.is('message') && stanza.attrs.type === 'groupchat') this.onPost(stanza);
+  }
+
+  /**
+   * What a real server does with a stanza XML forbids: abort the whole stream. That ends this
+   * connection's occupancy in EVERY room at once, and each non-persistent room dies with its
+   * archive — so the blast radius is every topic, not the one that was posted to.
+   */
+  private killStream(): void {
+    this.dead = true;
+    this.archives.clear();
+    this.emit('error', new Error('not-well-formed'));
   }
 
   /** Archive `body` as if `sender` had said it, and reflect it live (the push + wake path). */

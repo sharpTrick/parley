@@ -1,7 +1,8 @@
-import { asCursor, asTopic, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { xml } from '@xmpp/client';
 import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
+import { priv } from './fake-xmpp.js';
 
 // BUG-05 — empty-archive zero cursor. `fetchRecent` on a fresh/empty MUC returns the zero cursor
 // `''`; core persists it and feeds it back as `since`. The plugin must treat an empty/undefined
@@ -17,13 +18,6 @@ interface El {
   getChild(name: string, ns?: string): El | undefined;
   getChildText(name: string, ns?: string): string | null;
 }
-interface XmppPrivate {
-  xmpp?: unknown;
-  joined: Map<string, Promise<void>>;
-  roomJid(topic: Topic): string;
-}
-const priv = (p: XmppPlugin): XmppPrivate => p as unknown as XmppPrivate;
-
 /**
  * A fake @xmpp client that captures every MAM `<iq>` and answers an immediately-complete `<fin>`,
  * so `mamQuery`/`fetchRecent` resolve against an "empty archive" without a broker.

@@ -1,48 +1,8 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
-import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { client } from '@xmpp/client';
+import { asHandle, type Topic } from '@sharptrick/parley-core';
 import { describe, it } from 'vitest';
-import { XmppPlugin, type XmppBackendConfig } from '../src/index.js';
-
-const SERVICE = process.env.PARLEY_XMPP_SERVICE ?? 'xmpp://127.0.0.1:5222';
-const DOMAIN = process.env.PARLEY_XMPP_DOMAIN ?? 'parley.local';
-const MUC = process.env.PARLEY_XMPP_MUC ?? 'muc.parley.local';
-const USERNAME = process.env.PARLEY_XMPP_USER ?? 'parley';
-const PASSWORD = process.env.PARLEY_XMPP_PASS ?? 'parleypass';
-
-const BASE: XmppBackendConfig = {
-  service: SERVICE,
-  domain: DOMAIN,
-  muc_service: MUC,
-  username: USERNAME,
-  password: PASSWORD,
-};
-
-const rand = () => Math.random().toString(36).slice(2, 8);
-
-/** Reachability guard: try a short connect/auth, mirroring the redis/nats isUp pattern. */
-async function isXmppUp(): Promise<boolean> {
-  const c = client({
-    service: SERVICE,
-    domain: DOMAIN,
-    username: USERNAME,
-    password: PASSWORD,
-  }) as unknown as { start(): Promise<unknown>; stop(): Promise<unknown>; on(e: string, cb: () => void): void };
-  c.on('error', () => undefined);
-  try {
-    await Promise.race([
-      c.start(),
-      new Promise((_r, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
-    ]);
-    await c.stop().catch(() => undefined);
-    return true;
-  } catch {
-    await c.stop().catch(() => undefined);
-    return false;
-  }
-}
-
-let seq = 0;
+import { XmppPlugin } from '../src/index.js';
+import { BASE, canAuth, freshTopic } from './live-xmpp.js';
 
 async function makeContext() {
   const plugin = new XmppPlugin();
@@ -52,20 +12,18 @@ async function makeContext() {
   return {
     plugin,
     // XMPP honors `blockMs` natively (MUC live-wait + MAM reconcile), so the shared blocking-fetch
-    // conformance case runs directly against the plugin instead of core's generic wrapper (#20).
+    // conformance case runs directly against the plugin instead of core's generic wrapper.
     supportsBlockingFetch: true,
     // Each topic -> a fresh, unique MUC room, so tests are fully isolated.
-    freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    freshTopic: (): Topic => freshTopic(),
     carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
     },
     concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
-      // A MUC room exists only while it has an occupant; its MAM archive is destroyed when the
-      // last one leaves. In production the Parley bridge stays joined to every topic it serves,
-      // so the room never empties. Model that here: the long-lived ctx.plugin joins (and stays)
-      // before the transient writers come and go, so the archive survives for the drainAll read.
-      // This also pre-creates+unlocks the room, so the writers never hit the cold-creation race.
+      // Keep the long-lived ctx.plugin joined before the transient writers arrive, so that the
+      // room is created (and unlocked) by it: the writers then never hit the cold-creation race,
+      // and the archive is not at the mercy of the last writer leaving.
       await plugin.fetchRecent({ topic, limit: 1 });
       const plugins = await Promise.all(
         Array.from({ length: writers }, async () => {
@@ -89,10 +47,10 @@ async function makeContext() {
   };
 }
 
-if (await isXmppUp()) {
+if (await canAuth(BASE)) {
   runConformanceSuite('xmpp', makeContext);
 } else {
-  describe.skip(`seam conformance: xmpp (no server at ${SERVICE})`, () => {
+  describe.skip(`seam conformance: xmpp (no server at ${String(BASE.service)})`, () => {
     it('skipped — start Prosody/ejabberd with MAM (examples/dev-compose) to run', () => undefined);
   });
 }

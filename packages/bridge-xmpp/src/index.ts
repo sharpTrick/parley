@@ -15,8 +15,6 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
-// `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
-// declared dependency keeps the package self-contained (no extra direct dep on @xmpp/xml).
 import { client, xml } from '@xmpp/client';
 import { randomBytes, randomUUID } from 'node:crypto';
 
@@ -48,21 +46,24 @@ const NS_FORWARD = 'urn:xmpp:forward:0';
 const NS_DELAY = 'urn:xmpp:delay';
 const NS_RSM = 'http://jabber.org/protocol/rsm';
 const NS_MUC_OWNER = 'http://jabber.org/protocol/muc#owner';
+const NS_ROOMCONFIG = 'http://jabber.org/protocol/muc#roomconfig';
 const NS_XDATA = 'jabber:x:data';
 const NS_STANZAS = 'urn:ietf:params:xml:ns:xmpp-stanzas';
 
 const JOIN_TIMEOUT_MS = 15_000;
 const POST_TIMEOUT_MS = 15_000;
 const MAM_TIMEOUT_MS = 15_000;
-/** Page size for forward MAM paging; the conformance scale fits one page, big archives won't. */
+/** Page size for forward MAM paging. */
 const MAM_PAGE = 200;
-/**
- * Re-poll interval used by the native long-poll to reconcile a live MUC message against MAM.
- * XEP-0313 archival can LAG the reflected live stanza slightly, so after a live-message wake the
- * archive may not yet show it; we re-query the archive on this cadence, always bounded by the
- * caller's remaining `blockMs` budget (never blocking past the deadline).
- */
+/** Cadence of the bounded archival-lag re-poll that follows a live-message wake. */
 const MAM_LAG_POLL_MS = 50;
+/**
+ * How many capped re-polls one live-message wake may buy. The product with
+ * {@link MAM_LAG_POLL_MS} is the archival lag the long-poll can absorb; past it the fetch parks
+ * again on the live stream, so the query count per blocked fetch is a function of how many
+ * messages arrived, never of `blockMs`.
+ */
+const MAM_LAG_REPOLLS = 4;
 /** Floor between two stream-error reports, so a reconnect storm can't flood stderr. */
 const STREAM_ERROR_LOG_MS = 5_000;
 /** Bounded retry for the transient MUC cold-creation race (see {@link XmppPlugin.doJoin}). */
@@ -80,6 +81,32 @@ const resourceOf = (full: string): string => {
 const bareOf = (full: string): string => {
   const i = full.indexOf('/');
   return i === -1 ? full : full.slice(0, i);
+};
+
+/** The first codepoint of `s` outside XML 1.0's `Char` production, or `undefined` if all are legal. */
+const xmlIllegalCodepoint = (s: string): number | undefined => {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) as number;
+    if (cp === 0x9 || cp === 0xa || cp === 0xd) continue;
+    if (cp < 0x20 || (cp >= 0xd800 && cp <= 0xdfff) || cp === 0xfffe || cp === 0xffff) return cp;
+  }
+  return undefined;
+};
+const asU = (cp: number): string => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+/**
+ * A stanza carrying a codepoint XML forbids is not rejected per-stanza: the server aborts the
+ * whole stream with `not-well-formed`, which ends MUC occupancy for EVERY room this connection
+ * serves. Keep every string that reaches the wire behind this check, so that one topic's payload
+ * cannot take down the others.
+ */
+const assertXmlSafe = (value: string, what: string): void => {
+  const cp = xmlIllegalCodepoint(value);
+  if (cp !== undefined) {
+    throw new Error(
+      `${what} contains ${asU(cp)}, which XML forbids — refusing to send it (the server would ` +
+        'abort the stream and every MUC room this connection occupies with it)',
+    );
+  }
 };
 
 /** A minimal view of the ltx element / @xmpp client surface we use (no upstream types ship). */
@@ -103,8 +130,6 @@ type XmppClient = {
 
 /**
  * The RFC 6120 §8.3 defined-condition child of a stanza's `<error>`, plus its optional `<text>`.
- * The condition is reported whether or not the join loop considers it retryable — an operator
- * debugging a rejected join needs `forbidden`/`conflict`/`registration-required`, not `error`.
  */
 const stanzaError = (stanza: El): { condition: string; text: string } => {
   const err = stanza.getChild('error');
@@ -185,12 +210,10 @@ export class XmppPlugin implements BackendPlugin {
   /** roomJid -> live subscription(s). */
   private readonly subscriptions = new Map<string, Subscription>();
   /**
-   * Native long-poll wakeups (issue #20): roomJid -> set of one-shot callbacks armed by a blocking
-   * `fetchRecent`. Any live groupchat message on that room — OR `disconnect()` — fires every waiter
-   * so the blocked fetch reconciles against MAM and returns. Independent of `subscriptions`: a
-   * blocking fetch does NOT subscribe, it only listens on the SAME live MUC delivery the push path
-   * already runs (no second MUC join / connection). Reusing that primitive keeps the wait cheap and
-   * its teardown identical to the live path's.
+   * Long-poll wakeups: roomJid -> one-shot callbacks armed by a blocking `fetchRecent`. Any live
+   * groupchat message on that room — or `disconnect()` — fires every waiter, so the blocked fetch
+   * reconciles against MAM and returns. Independent of `subscriptions`: a blocking fetch listens
+   * on the live MUC delivery the push path already runs, it does not subscribe or join twice.
    */
   private readonly waiters = new Map<string, Set<(reason: WakeReason) => void>>();
 
@@ -202,9 +225,9 @@ export class XmppPlugin implements BackendPlugin {
     this.handle = username;
     this.nick = cfg.nick ?? `${username}-${rand()}`;
     this.stopped = false;
+    assertXmlSafe(this.nick, 'backend_config.nick');
+    assertXmlSafe(this.mucService, 'backend_config.muc_service');
 
-    // SEC-06: warn loudly before the SASL handshake when the operator is connecting with the
-    // repo-public default password (unset → fell back, or set literally to the well-known value).
     const password = cfg.password ?? 'parleypass';
     if (cfg.password === undefined || password === 'parleypass') {
       console.warn(
@@ -220,38 +243,16 @@ export class XmppPlugin implements BackendPlugin {
       username,
       password,
     }) as unknown as XmppClient;
-    // Stream/connection errors surface via command rejections; don't crash the process — but a
-    // flapping or auth-rejected stream must not be invisible, so report it on stderr (NEVER
-    // stdout: cli.ts speaks JSON-RPC there), rate-limited so a reconnect storm can't flood it.
+    // Report on stderr, NEVER stdout, so that cli.ts's JSON-RPC channel stays parseable.
     xmpp.on('error', (err) => this.reportStreamError(err));
     xmpp.on('stanza', (stanza) => this.onStanza(stanza as El));
-    // BUG-06: @xmpp/client bundles @xmpp/reconnect, which transparently re-establishes and
-    // re-auths the stream after a drop/server-restart — but MUC occupancy is presence-based and
-    // is NOT restored by the library. On every `online` AFTER the first, re-send the join
-    // presence for each subscribed room so push resumes and post() doesn't wait out its timeout.
     let firstOnline = true;
     xmpp.on('online', () => {
       if (firstOnline) {
         firstOnline = false;
-        return; // initial connect: subscribe()/post() drive the first joins
+        return;
       }
-      // The reconnect re-authed the stream but we are no longer a MUC occupant. Fail in-flight
-      // posts so callers retry immediately instead of hanging out the full POST_TIMEOUT_MS
-      // (the reflection can never arrive — the un-rejoined room answers <message type='error'>).
-      for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
-      this.pendingPosts.clear();
-      this.joined.clear();
-      for (const sub of this.subscriptions.values()) {
-        // Re-send the join presence per room. A failure here leaves the room unjoined until the
-        // next post/fetchRecent re-drives ensureJoined (the cache is dropped on failure), so it
-        // must reach the operator rather than being swallowed.
-        void this.ensureJoined(sub.topic).catch((err: unknown) => {
-          console.error(
-            `[parley-xmpp] re-join after reconnect failed for ${this.roomJid(sub.topic)}: ` +
-              `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
+      this.rejoinAfterReconnect();
     });
     await xmpp.start();
     this.xmpp = xmpp;
@@ -276,12 +277,20 @@ export class XmppPlugin implements BackendPlugin {
     }
   }
 
+  /**
+   * `<message type='groupchat'>` into the topic's room, resolved by the MUC's own reflection
+   * (which carries the archive id). `identity` is informational only: the sender on the wire is
+   * this connection's MUC nick (see README "Multiple concurrent sessions"). `opts.inReplyTo` is
+   * IGNORED — XEP-0461 replies exist, but nothing this seam returns carries the relation back,
+   * so it is documented as dropped rather than half-implemented (README "Notes / caveats").
+   */
   async post(
     topic: Topic,
     _identity: Handle,
     content: string,
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
+    assertXmlSafe(content, 'post content');
     await this.ensureJoined(topic);
     const room = this.roomJid(topic);
     const originId = `o-${randomUUID()}`;
@@ -322,14 +331,9 @@ export class XmppPlugin implements BackendPlugin {
     let items: MamItem[];
     if (since === undefined) {
       // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
-      // A `blockMs` here is a no-op by design (falsy/undefined `since` → behave exactly as today).
       items = (await this.mamQuery(args.topic, { before: true, max: limit })).items;
     } else {
-      // Exclusive catch-up (`since === ''` means "from the very beginning"; see exclusiveMam).
       items = await this.exclusiveMam(args.topic, since, limit);
-      // Native long-poll (issue #20): the exclusive query was empty and the caller granted a budget
-      // → wait for a live MUC message on this room, then reconcile against MAM (the archived copy is
-      // authoritative for id/cursor). Returning early/empty is always safe (core polls the rest).
       const blockMs = args.blockMs ?? 0;
       if (items.length === 0 && blockMs > 0) {
         items = await this.blockingMam(args.topic, since, limit, Math.floor(blockMs));
@@ -363,20 +367,12 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   /**
-   * Native long-poll (issue #20): MUC-live-wait + MAM-reconcile. Each round ARMS the room waiter
-   * FIRST, then runs the canonical exclusive MAM query, then parks on the waiter. Arming before the
-   * query is what closes the lost-wakeup window: a message reflected while the query is in flight
-   * (a remote round trip is tens to hundreds of ms) fires an already-registered waiter instead of
-   * firing into the void, so the next round returns it immediately rather than at the deadline.
-   * The loop also makes a spurious wake re-arm and keep waiting instead of returning early.
-   *
-   * MAM archival lag: XEP-0313 can commit the archive slightly AFTER the live stanza is reflected,
-   * so the query that follows a live wake may not yet show the message. After such a wake the park
-   * is capped at {@link MAM_LAG_POLL_MS} so the archive is re-read on a short cadence, always
-   * bounded by the deadline — never blocking past `blockMs`. If the archive still hasn't caught up
-   * when the budget runs out we return an empty page, which is always safe: the empty page carries
-   * `nextCursor === since` and core's wrapper polls the rest. Aborts cleanly on `disconnect()` (the
-   * waiter is fired + de-registered; `stopped` short-circuits every query), so nothing leaks.
+   * Native long-poll: MUC-live-wait + MAM-reconcile. Each round REGISTERS the room waiter before
+   * running the exclusive MAM query, so that a message reflected during the query's round trip
+   * fires an already-registered waiter instead of firing into the void; its park timer only starts
+   * once the query is back, so the park is the interval asked for rather than what a slow server
+   * left of it. An empty return is always safe — the page carries `nextCursor === since` and
+   * core's wrapper polls the rest.
    */
   private async blockingMam(
     topic: Topic,
@@ -386,41 +382,45 @@ export class XmppPlugin implements BackendPlugin {
   ): Promise<MamItem[]> {
     const deadline = Date.now() + blockMs;
     const room = this.roomJid(topic);
-    let parkCap = Number.POSITIVE_INFINITY;
+    let lagRepolls = 0;
     for (;;) {
-      const remaining = deadline - Date.now();
-      if (this.stopped || remaining <= 0) return [];
-      const waiter = this.armWaiter(room, Math.min(remaining, parkCap));
+      if (this.stopped || Date.now() >= deadline) return [];
+      const waiter = this.armWaiter(room);
       try {
         const items = await this.exclusiveMam(topic, since, limit);
         if (items.length > 0) return items;
         if (this.stopped) return [];
-        const reason = await waiter.fired; // live MUC message, timeout, or disconnect
-        if (reason === 'message') parkCap = MAM_LAG_POLL_MS;
+        const budget = deadline - Date.now();
+        const park = lagRepolls > 0 ? Math.min(budget, MAM_LAG_POLL_MS) : budget;
+        if (park <= 0) return [];
+        const reason = await waiter.park(park);
+        if (reason === 'message') lagRepolls = MAM_LAG_REPOLLS;
+        else if (reason === 'timeout' && lagRepolls > 0) lagRepolls--;
       } catch (err) {
-        if (this.stopped) return []; // torn down mid-reconcile → empty page is safe
+        if (this.stopped) return [];
         throw err;
       } finally {
-        waiter.cancel(); // idempotent — also clears the timer + de-registers on the fire path
+        waiter.cancel();
       }
     }
   }
 
   /**
-   * Arm a one-shot long-poll waiter on `room`, resolving `fired` when a live groupchat message for
-   * that room arrives (via {@link fireWaiters}), when `blockMs` elapses, or when `disconnect()`
-   * fires it. Idempotent `cancel()` (also the fire path) clears the timer and de-registers, so no
-   * listener or timer can leak past the wait. Mirrors the chat backends' waiter shape.
+   * Register a one-shot long-poll waiter on `room`. It resolves when a live groupchat message for
+   * that room arrives (via {@link fireWaiters}), when the `park(ms)` timer elapses, or when
+   * `disconnect()` fires it — `park` may be called after the waiter has already fired, and then
+   * arms no timer. Idempotent `cancel()` (also the fire path) clears the timer and de-registers.
    */
-  private armWaiter(
-    room: string,
-    blockMs: number,
-  ): { fired: Promise<WakeReason>; cancel: () => void } {
+  private armWaiter(room: string): {
+    park: (ms: number) => Promise<WakeReason>;
+    cancel: () => void;
+  } {
     let resolveFired!: (reason: WakeReason) => void;
     const fired = new Promise<WakeReason>((r) => {
       resolveFired = r;
     });
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const fire = (reason: WakeReason): void => {
       if (settled) return;
       settled = true;
@@ -432,14 +432,19 @@ export class XmppPlugin implements BackendPlugin {
       }
       resolveFired(reason);
     };
-    const timer = setTimeout(() => fire('timeout'), blockMs);
     let set = this.waiters.get(room);
     if (set === undefined) {
       set = new Set();
       this.waiters.set(room, set);
     }
     set.add(fire);
-    return { fired, cancel: () => fire('cancel') };
+    return {
+      park: (ms) => {
+        if (!settled) timer = setTimeout(() => fire('timeout'), ms);
+        return fired;
+      },
+      cancel: () => fire('cancel'),
+    };
   }
 
   /** Wake every long-poll fetch blocked on `room`; each fire self-clears (idempotent). */
@@ -501,13 +506,18 @@ export class XmppPlugin implements BackendPlugin {
    * A MUC bounce of one of our stanzas (not an occupant, no voice, kicked/banned, room gone).
    * The reflection can never arrive, so fail the correlated post/join NOW with the server's
    * condition instead of burning the full timeout and reporting a causeless stall.
+   *
+   * A bounce that carries an id identifies exactly one post: it settles that post or nothing at
+   * all. Keep it from falling through to the room's join, so that a late bounce for an already
+   * cleared post cannot reject an unrelated operation with another operation's condition.
    */
   private onErrorMessage(stanza: El): void {
     const room = bareOf(stanza.attrs.from ?? '');
     const err = stanzaError(stanza);
     const originId = stanza.getChild('origin-id', NS_SID)?.attrs.id ?? stanza.attrs.id ?? '';
-    const post = this.pendingPosts.get(originId);
-    if (post !== undefined && post.room === room) {
+    if (originId !== '') {
+      const post = this.pendingPosts.get(originId);
+      if (post === undefined || post.room !== room) return;
       this.pendingPosts.delete(originId);
       post.reject(new Error(`post rejected by ${room} (${describeError(err)})`));
       return;
@@ -532,25 +542,44 @@ export class XmppPlugin implements BackendPlugin {
     const isSelf =
       resourceOf(from) === this.nick || statuses.some((s) => s.attrs.code === '110');
     if (!isSelf) return;
-    // Status 201 = we just CREATED the room; it is locked until the owner submits config.
-    // Unlock it (accept defaults = "instant room") so concurrent joiners aren't item-not-found.
+    // Status 201 = we just CREATED the room; it stays locked until its owner submits a config.
     if (statuses.some((s) => s.attrs.code === '201')) {
-      this.unlockRoom(room).finally(() => pending.resolve());
+      this.configureRoom(room).finally(() => pending.resolve());
     } else {
       pending.resolve();
     }
   }
 
-  /** Accept the default room configuration ("instant room", XEP-0045 §10.1.2) to unlock it. */
-  private async unlockRoom(room: string): Promise<void> {
-    const iq = xml(
-      'iq',
-      { type: 'set', to: room },
-      xml('query', { xmlns: NS_MUC_OWNER }, xml('x', { xmlns: NS_XDATA, type: 'submit' })),
-    );
-    await this.require()
-      .iqCaller.request(iq, MAM_TIMEOUT_MS)
-      .catch(() => undefined);
+  /**
+   * Unlock a room we just created (XEP-0045 §10.1.2 config submit), asking for a PERSISTENT room:
+   * a non-persistent MUC and its entire MAM archive are destroyed the instant the last occupant
+   * leaves, which every stream drop causes — so catch-up history would not survive a network blip.
+   * A service that refuses the field rejects the whole form, and an unsubmitted form leaves the
+   * room locked, so keep the bare-submit fallback.
+   */
+  private async configureRoom(room: string): Promise<void> {
+    const conn = this.require();
+    const submit = (fields: unknown[]): unknown =>
+      xml(
+        'iq',
+        { type: 'set', to: room },
+        xml(
+          'query',
+          { xmlns: NS_MUC_OWNER },
+          xml('x', { xmlns: NS_XDATA, type: 'submit' }, ...(fields as never[])),
+        ),
+      );
+    await conn.iqCaller
+      .request(
+        submit([
+          xml('field', { var: 'FORM_TYPE', type: 'hidden' }, xml('value', {}, NS_ROOMCONFIG)),
+          xml('field', { var: 'muc#roomconfig_persistentroom' }, xml('value', {}, '1')),
+        ]),
+        MAM_TIMEOUT_MS,
+      )
+      .catch(async () => {
+        await conn.iqCaller.request(submit([]), MAM_TIMEOUT_MS).catch(() => undefined);
+      });
   }
 
   private onMamResult(result: El, fromBare: string): void {
@@ -578,10 +607,9 @@ export class XmppPlugin implements BackendPlugin {
       .getChildren('stanza-id', NS_SID)
       .find((e) => e.attrs.by === room)?.attrs.id;
 
-    // Correlate our own post() by its origin-id; resolve with the server's archive id. The
-    // origin-id is public to every occupant, so a reflection is only OURS when it comes back from
-    // our own occupant JID — without that check a co-occupant echoing the id resolves our post
-    // with THEIR archive position, which core then stores as our backendMsgId and cursor.
+    // The origin-id is public to every occupant, so keep the occupant-JID check, so that a
+    // co-occupant echoing it cannot resolve our post with THEIR archive position — which core
+    // would then store as our backendMsgId and cursor.
     const originId = stanza.getChild('origin-id', NS_SID)?.attrs.id;
     if (originId !== undefined) {
       const pending = this.pendingPosts.get(originId);
@@ -594,9 +622,6 @@ export class XmppPlugin implements BackendPlugin {
 
     // Live delivery: every reflected message carrying a room stanza-id (incl. our own).
     if (archId === undefined) return;
-    // Wake any long-poll fetch blocked on this room (issue #20), independent of subscriptions — the
-    // blocked fetch re-runs its exclusive MAM query, so the wake only needs to signal "something
-    // arrived". This is the SAME live delivery the push path uses (no second join/connection).
     this.fireWaiters(room);
     const sub = this.subscriptions.get(room);
     if (sub === undefined) return;
@@ -628,11 +653,9 @@ export class XmppPlugin implements BackendPlugin {
     this.mamCollectors.set(queryid, { room, items: collector });
 
     const rsm: unknown[] = [];
-    // Never emit an empty <after/>: the empty-archive zero cursor '' means "from the beginning"
-    // (forward-from-start), not a real archive UID. A server's response to an <after> it does not
-    // recognise is NOT portable — RSM (XEP-0059) specifies item-not-found, but Prosody's mod_mam
-    // ignores the unknown UID and replays from the start of the archive — so '' must omit the
-    // element rather than rely on either behaviour.
+    // Keep the zero cursor '' omitting <after/> entirely, so that "from the beginning" never
+    // depends on how a server answers an <after> UID it does not hold — RSM (XEP-0059) says
+    // item-not-found, Prosody's mod_mam replays the whole archive.
     if (opts.after !== undefined && opts.after !== '') rsm.push(xml('after', {}, opts.after));
     rsm.push(xml('max', {}, String(opts.max)));
     if (opts.before === true) rsm.push(xml('before', {})); // empty <before/> => last page
@@ -666,9 +689,32 @@ export class XmppPlugin implements BackendPlugin {
     });
   }
 
+  /**
+   * A reconnect restores the stream but not MUC occupancy — that is presence, and the library
+   * does not re-send it. Re-drive every room in `joined`, not just the subscribed ones, so that a
+   * catch-up-only topic is not left silently outside its room until some later post re-enters it.
+   */
+  private rejoinAfterReconnect(): void {
+    for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
+    this.pendingPosts.clear();
+    const rooms = [...this.joined.keys()];
+    this.joined.clear();
+    for (const room of rooms) {
+      void this.ensureJoinedRoom(room).catch((err: unknown) => {
+        console.error(
+          `[parley-xmpp] re-join after reconnect failed for ${room}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
   /** Join a room with NO history (maxstanzas=0); cached so repeated calls are idempotent. */
   private ensureJoined(topic: Topic): Promise<void> {
-    const room = this.roomJid(topic);
+    return this.ensureJoinedRoom(this.roomJid(topic));
+  }
+
+  private ensureJoinedRoom(room: string): Promise<void> {
     const cached = this.joined.get(room);
     if (cached !== undefined) return cached;
     const p = this.doJoin(room);

@@ -128,16 +128,17 @@ describe('XMPP keyed correlation registries (a superseded entry never unregister
     const p = attach(plugin, fake);
     const room = p.roomJid(TOPIC);
 
-    const shortWait = p.armWaiter(room, 100);
-    const longWait = p.armWaiter(room, 10_000);
+    const shortWait = p.armWaiter(room);
+    const shortFired = shortWait.park(100);
+    const longWait = p.armWaiter(room);
     let longFired: string | undefined;
-    void longWait.fired.then((r) => {
+    void longWait.park(10_000).then((r) => {
       longFired = r;
     });
     expect(p.waiters.get(room)?.size).toBe(2);
 
     await vi.advanceTimersByTimeAsync(200);
-    expect(await shortWait.fired).toBe('timeout');
+    expect(await shortFired).toBe('timeout');
     expect(p.waiters.get(room)?.size).toBe(1); // the survivor is still registered
 
     p.onStanza(

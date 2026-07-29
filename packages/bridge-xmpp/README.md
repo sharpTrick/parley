@@ -41,15 +41,29 @@ catch-up semantics.
 
 - **MAM is mandatory.** Without `mod_mam` + `mod_muc_mam` (Prosody) / `mod_mam` (ejabberd) the
   room has no archive and `fetchRecent` returns nothing. This backend's catch-up is MAM.
-- **Room lifetime = durability.** A MUC room (and its MAM archive) lives only while it has an
-  occupant; the last occupant leaving destroys a non-persistent room. The Parley bridge stays
-  joined to every topic it serves, so rooms it serves never empty. For history that must survive
-  a full bridge restart, configure the MUC service to default rooms **persistent**, or pre-create
-  persistent rooms for your topics.
+- **Room lifetime = durability, and occupancy is not durable.** A *non-persistent* MUC room and
+  its whole MAM archive are destroyed the moment the last occupant leaves — and occupancy is
+  presence on one stream, so it ends at every disconnect, not only at shutdown: a network blip, a
+  server restart or an auto-reconnect all empty the room, and no amount of re-joining brings the
+  archive back. This plugin therefore asks for a **persistent** room in the config submit of the
+  rooms it creates itself, which is what makes history survive a reconnect. Two cases it cannot
+  cover: a room that already exists as non-persistent, and a MUC service that refuses the field
+  (the plugin falls back to a plain "instant room" submit so the room still unlocks). For those,
+  configure the MUC service to default rooms **persistent**, or pre-create persistent rooms for
+  your topics. After a reconnect the plugin re-sends the join presence for every room it had
+  entered — subscribed or catch-up-only — so push and post recover without waiting for a timeout.
+- **`post`'s `inReplyTo` is ignored.** The seam's optional reply parent is dropped: nothing this
+  backend returns carries the relation back, so an XEP-0461 `<reply/>` would be write-only. A
+  reply posts as an ordinary top-level message in the topic's room.
 - **Cold-creation race.** When several instances join a brand-new room simultaneously, exactly one
   creates it (status 201) and the rest briefly get `item-not-found` until that creation commits.
-  The creator unlocks the room (XEP-0045 "instant room" config submit) and joiners retry the
-  transient condition, so concurrent cold-start is safe.
+  The creator unlocks the room (XEP-0045 §10.1.2 config submit) and joiners retry the transient
+  condition, so concurrent cold-start is safe.
+- **Content must be XML-legal.** XMPP is one long-lived XML document: a codepoint XML 1.0 forbids
+  (a C0 control other than tab/newline/CR, a lone surrogate, U+FFFE/U+FFFF) is not a rejected
+  message but the end of the stream, taking occupancy of every room on the connection with it.
+  `post` therefore refuses such content up front, with an error naming the offending codepoint,
+  rather than putting it on the wire.
 - **Unique nick per connection.** MUC nicks must be unique per room, so each connection defaults to
   a random nick; concurrent writers can share a room without collision.
 

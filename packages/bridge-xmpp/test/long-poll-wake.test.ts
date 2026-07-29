@@ -58,8 +58,8 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
       }
       if (stage === 'after-waiter-armed') {
         const armWaiter = p.armWaiter.bind(plugin);
-        p.armWaiter = (r: string, ms: number) => {
-          const waiter = armWaiter(r, ms);
+        p.armWaiter = (r: string) => {
+          const waiter = armWaiter(r);
           deliverOnce();
           return waiter;
         };
