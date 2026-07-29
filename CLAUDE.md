@@ -95,6 +95,19 @@ before merging to `main`. In short:
 
 ---
 
+## Adversarial review
+
+Non-trivial changes get an adversarial review before they are considered done.
+`docs/REVIEW_PROTOCOL.md` is authoritative: one all-lens critic per package, **full-surface every
+round** (never a diff), findings verified against the code before they are acted on, and every
+confirmed finding ratcheted into the suite as a *class* rather than an instance. Convergence is
+computed by `.claude/workflows/careening-review.js`, not judged — and a round that did not wake
+every critic can never declare it. `skills/critical-review/SKILL.md` is the operator's guide.
+
+Two rules worth restating here because they are cheap to violate: a round that *changed code* is
+never the clean round, and a new test does not count until you have watched it fail against the
+defect it is supposed to catch.
+
 ## Testing discipline
 
 - Each backend ships with tests that exercise the **same** seam contract (a shared conformance
