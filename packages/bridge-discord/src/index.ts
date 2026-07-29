@@ -57,13 +57,24 @@ interface DiscordMessage {
   mentions?: Array<{ id: string; username: string }>;
 }
 
-/** A minimal gateway payload (opcodes we speak: 0/1/2/7/9/10/11). */
+/** A minimal gateway payload. */
 interface GatewayPayload {
   op: number;
   d?: unknown;
   s?: number | null;
   t?: string | null;
 }
+
+/** The gateway opcodes this plugin speaks. */
+const OP = {
+  DISPATCH: 0,
+  HEARTBEAT: 1,
+  IDENTIFY: 2,
+  RECONNECT: 7,
+  INVALID_SESSION: 9,
+  HELLO: 10,
+  HEARTBEAT_ACK: 11,
+} as const;
 
 /**
  * GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT — without MESSAGE_CONTENT, content arrives empty.
@@ -106,6 +117,14 @@ export const RECONNECT_CAP_MS = 120_000;
  */
 export const STABLE_CONNECTION_MS = 60_000;
 
+/** First rung of the reconnect ladder, doubled per attempt up to {@link RECONNECT_CAP_MS}. */
+export const BACKOFF_BASE_MS = 1000;
+/** Random spread added to every ladder delay, so a fleet of bridges does not re-dial in lockstep. */
+export const BACKOFF_JITTER_MS = 1000;
+/** Discord's mandated re-IDENTIFY wait after op 9 INVALID SESSION: a random 1–5 s. */
+export const INVALID_SESSION_MIN_WAIT_MS = 1000;
+export const INVALID_SESSION_SPREAD_MS = 4000;
+
 /**
  * Discord backend (DESIGN §6/§9) — spoken to via the raw REST v10 API (global `fetch`) plus a
  * minimal gateway-websocket subset (`ws`); no discord.js. A Parley topic maps to one Discord
@@ -126,7 +145,9 @@ export class DiscordPlugin implements BackendPlugin {
   private apiUrl = 'https://discord.com/api/v10';
   private token?: string;
   private gatewayUrlOverride?: string;
-  private channelMap: Record<string, string> = {};
+  private channelMap = new Map<string, string>();
+  /** Reverse of {@link channelMap}: channel id → the ONE topic that owns it. */
+  private channelOwner = new Map<string, string>();
   private handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS;
   private connected = false;
   private stopped = false;
@@ -166,16 +187,22 @@ export class DiscordPlugin implements BackendPlugin {
   /** Pending reconnect, cleared by disconnect() so it cannot fire against the NEXT session. */
   private reconnectTimer?: NodeJS.Timeout;
   /**
-   * Minimum delay (ms) the NEXT dial must honor. Set by op 9 INVALID SESSION to the
-   * gateway-mandated random 1–5 s re-identify wait; consumed by {@link chargeDialAttempt}.
+   * Bumped by every `connect()`. Each socket captures it at open time; keep every deferred
+   * callback behind that capture, so that a watchdog or close from a session the plugin has
+   * already torn down cannot dial, re-IDENTIFY, or clear state belonging to the NEXT one.
    */
-  private op9MinWaitMs = 0;
+  private sessionEpoch = 0;
+  /**
+   * Minimum delay (ms) the NEXT dial must honor. Set by op 9 INVALID SESSION to Discord's
+   * mandated random 1–5 s re-IDENTIFY wait; consumed by {@link chargeDialAttempt}.
+   */
+  private invalidSessionWaitMs = 0;
   /** channel id → subscription; MESSAGE_CREATE dispatch routes through this. */
   private readonly subs = new Map<string, { topic: Topic; handler: MessageHandler }>();
   /**
    * Native long-poll wakeups: channel id → set of one-shot callbacks armed by a
-   * blocking `fetchRecent`. Any MESSAGE_CREATE on that channel — OR `disconnect()` — fires every
-   * waiter so the blocked fetch re-queries and returns. Independent of `subs`: a blocking fetch
+   * blocking `fetchRecent`. Any MESSAGE_CREATE on that channel — or the socket going away — fires
+   * every waiter so the blocked fetch re-queries and returns. Independent of `subs`: a blocking fetch
    * does NOT register a subscription, it only listens on the SHARED gateway socket the live path
    * already runs (no second connection). Reusing the same `MESSAGE_CREATE` primitive keeps the
    * wait cheap and its teardown identical to the live path's.
@@ -189,13 +216,15 @@ export class DiscordPlugin implements BackendPlugin {
     this.apiUrl = (cfg.api_url ?? 'https://discord.com/api/v10').replace(/\/+$/, '');
     this.token = cfg.token;
     this.gatewayUrlOverride = cfg.gateway_url;
-    this.channelMap = requireDistinctChannels(cfg.channel_map ?? {});
+    this.channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
+    this.channelOwner = requireDistinctChannels(this.channelMap);
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     this.fatalGateway = undefined;
     this.stopped = false;
     this.connected = true;
+    this.sessionEpoch++;
     this.reconnectAttempts = 0;
-    this.op9MinWaitMs = 0;
+    this.invalidSessionWaitMs = 0;
     this.nextDialAt = 0;
     this.seq = null;
     this.live = false;
@@ -216,16 +245,19 @@ export class DiscordPlugin implements BackendPlugin {
     this.gatewayReady = undefined;
     this.fatalGateway = undefined;
     this.subs.clear();
-    // Abort every in-flight long-poll cleanly (fire clears its own timer + map entry). A blocked
-    // fetch then sees `stopped` and returns an empty page — no leaked listeners or timers.
-    for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire();
+    this.wakeWaiters();
     this.waiters.clear();
     this.me = undefined;
   }
 
+  /**
+   * `POST /channels/<id>/messages`. The seam's `identity` is deliberately unused: Discord stamps
+   * `author` from whichever bot token is configured, so per-session attribution needs a
+   * per-session token, not an argument.
+   */
   async post(
     topic: Topic,
-    identity: Handle,
+    _identity: Handle,
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
@@ -245,8 +277,6 @@ export class DiscordPlugin implements BackendPlugin {
       },
     });
     const json = (await res.json()) as DiscordMessage;
-    // identity is the logical sender; Discord stamps `author` as the bot account behind `token`.
-    void identity;
     return asBackendMsgId(json.id);
   }
 
@@ -255,10 +285,9 @@ export class DiscordPlugin implements BackendPlugin {
     const limit = args.limit ?? 100;
 
     if (args.since === undefined) {
-      // Default window: the newest `limit` messages, returned ASCENDING (Discord replies
-      // newest-first; reverse). The API caps a page at 100, so a larger limit pages BACKWARDS
-      // with `before` — truncating instead would strand everything older behind a cursor that
-      // already sits past it.
+      // Keep paging BACKWARDS with `before` past the API's 100-per-page cap, so that a larger
+      // limit is not answered with a truncated head whose cursor already sits past everything
+      // older than it.
       const newestFirst: DiscordMessage[] = [];
       let before: string | undefined;
       while (newestFirst.length < limit) {
@@ -358,10 +387,18 @@ export class DiscordPlugin implements BackendPlugin {
   }
 
   /**
+   * Release every armed long-poll waiter (each `fire` clears its own timer and map entry). A woken
+   * fetch re-runs its exclusive REST query, so this only has to signal "stop waiting".
+   */
+  private wakeWaiters(): void {
+    for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire();
+  }
+
+  /**
    * Arm a one-shot long-poll waiter on `channelId`, resolving `fired` when a MESSAGE_CREATE for
-   * that channel arrives, when `blockMs` elapses, or when `disconnect()` fires it. Idempotent
-   * `cancel()` (also invoked by the fire path) clears the timer and de-registers, so no listener
-   * or timer can leak past the wait.
+   * that channel arrives, when `blockMs` elapses, or when the socket goes away — a close and
+   * `disconnect()` both run {@link wakeWaiters}. Idempotent `cancel()` (also invoked by the fire
+   * path) clears the timer and de-registers, so no listener or timer can leak past the wait.
    */
   private armWaiter(channelId: string, blockMs: number): { fired: Promise<void>; cancel: () => void } {
     let resolveFired!: () => void;
@@ -402,15 +439,6 @@ export class DiscordPlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
     const channelId = this.channelId(topic);
-    const existing = this.subs.get(channelId);
-    if (existing !== undefined && existing.topic !== topic) {
-      // Silently overwriting would drop the earlier topic's handler AND relabel its traffic as
-      // this topic, mis-routing core's per-topic seen-set and mention filter.
-      throw new Error(
-        `Discord topics ${JSON.stringify(existing.topic)} and ${JSON.stringify(topic)} both ` +
-          `resolve to channel ${channelId}; give each topic its own channel_map target`,
-      );
-    }
     this.subs.set(channelId, { topic, handler });
     await this.ensureGateway();
   }
@@ -427,11 +455,14 @@ export class DiscordPlugin implements BackendPlugin {
       if (wait > 0) {
         throw new Error(`Discord gateway dial refused: backing off for another ${wait}ms`);
       }
+      const epoch = this.sessionEpoch;
       this.gatewayReady = this.openGateway().catch((err) => {
-        // Don't poison the shared socket on transient failure — let the next caller retry, once
-        // the budget this failed dial just charged has elapsed.
-        this.gatewayReady = undefined;
-        this.chargeDialAttempt();
+        // Keep clearing the memo here, so that one failed dial does not wedge every later caller
+        // on a rejected promise; the budget it just charged is what paces the retry.
+        if (epoch === this.sessionEpoch) {
+          this.gatewayReady = undefined;
+          this.chargeDialAttempt();
+        }
         throw err;
       });
     }
@@ -453,10 +484,10 @@ export class DiscordPlugin implements BackendPlugin {
    * the backoff ladder regardless of who initiated it.
    */
   private chargeDialAttempt(): number {
-    const backoff = Math.min(1000 * 2 ** this.reconnectAttempts++, RECONNECT_CAP_MS);
-    const jitter = Math.floor(Math.random() * 1000);
-    const wait = Math.max(this.op9MinWaitMs, backoff + jitter);
-    this.op9MinWaitMs = 0;
+    const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, RECONNECT_CAP_MS);
+    const jitter = Math.floor(Math.random() * BACKOFF_JITTER_MS);
+    const wait = Math.max(this.invalidSessionWaitMs, backoff + jitter);
+    this.invalidSessionWaitMs = 0;
     this.nextDialAt = Date.now() + wait;
     return wait;
   }
@@ -483,9 +514,23 @@ export class DiscordPlugin implements BackendPlugin {
     return { handle, backendRef: handle };
   }
 
-  /** Topic → Discord channel id: `channel_map` entry, else the topic string IS the channel id. */
+  /**
+   * Topic → Discord channel id: `channel_map` entry, else the topic string IS the channel id. A
+   * literal that another topic already maps to is refused here rather than at one entry point, so
+   * that the same Discord message can never cross the seam under two topic labels — which would
+   * defeat core's per-topic dedup namespace and interleave the two topics' cursors.
+   */
   private channelId(topic: Topic): string {
-    return this.channelMap[topic as string] ?? (topic as string);
+    const mapped = this.channelMap.get(topic as string);
+    if (mapped !== undefined) return mapped;
+    const owner = this.channelOwner.get(topic as string);
+    if (owner !== undefined) {
+      throw new Error(
+        `Discord topics ${JSON.stringify(owner)} and ${JSON.stringify(topic)} both ` +
+          `resolve to channel ${topic as string}; give each topic its own channel_map target`,
+      );
+    }
+    return topic as string;
   }
 
   private require(): void {
@@ -518,6 +563,7 @@ export class DiscordPlugin implements BackendPlugin {
    */
   private openSocket(url: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      const epoch = this.sessionEpoch;
       const ws = new WebSocket(url);
       this.ws = ws;
       let ready = false;
@@ -551,8 +597,7 @@ export class DiscordPlugin implements BackendPlugin {
           return; // not JSON — not ours to crash on
         }
         switch (payload.op) {
-          case 10: {
-            // HELLO → heartbeat cadence + IDENTIFY.
+          case OP.HELLO: {
             const hello = payload.d as { heartbeat_interval: number };
             if (heartbeat !== undefined) {
               clearInterval(heartbeat);
@@ -572,12 +617,12 @@ export class DiscordPlugin implements BackendPlugin {
               // Arm BEFORE sending, so that an ACK arriving in the same tick clears the flag it
               // was meant to clear instead of being overwritten into a false "missed ack".
               awaitedAck = true;
-              ws.send(JSON.stringify({ op: 1, d: this.seq }));
+              ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
             }, hello.heartbeat_interval);
             this.heartbeats.add(heartbeat);
             ws.send(
               JSON.stringify({
-                op: 2,
+                op: OP.IDENTIFY,
                 d: {
                   token: this.token ?? '',
                   intents: INTENTS,
@@ -587,7 +632,7 @@ export class DiscordPlugin implements BackendPlugin {
             );
             break;
           }
-          case 0: {
+          case OP.DISPATCH: {
             if (payload.s !== null && payload.s !== undefined) this.seq = payload.s;
             if (payload.t === 'READY' && !ready) {
               ready = true;
@@ -605,39 +650,31 @@ export class DiscordPlugin implements BackendPlugin {
                   /* handler is best-effort; never break the loop (DESIGN §6) */
                 }
               }
-              // Wake any long-poll fetch blocked on this channel. It re-runs the
-              // exclusive REST query, so the wakeup only needs to signal "something arrived".
               const waiting = this.waiters.get(d.channel_id);
               if (waiting !== undefined) for (const fire of [...waiting]) fire();
             }
             break;
           }
-          case 1: {
-            // Server-requested immediate heartbeat.
-            ws.send(JSON.stringify({ op: 1, d: this.seq }));
+          case OP.HEARTBEAT: {
+            ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
             break;
           }
-          case 7: {
-            // RECONNECT — drop the socket; the close handler owns the reconnect.
+          case OP.RECONNECT: {
             ws.close();
             break;
           }
-          case 9: {
-            // INVALID SESSION — Discord mandates a random 1–5 s wait before re-identifying.
-            // Stash the min-wait for scheduleReconnect (which the close handler triggers), then
-            // drop the socket.
-            this.op9MinWaitMs = 1000 + Math.floor(Math.random() * 4000);
+          case OP.INVALID_SESSION: {
+            this.invalidSessionWaitMs =
+              INVALID_SESSION_MIN_WAIT_MS + Math.floor(Math.random() * INVALID_SESSION_SPREAD_MS);
             ws.close();
             break;
           }
-          case 11: {
-            // HEARTBEAT_ACK — liveness. Clears the pending-ack flag; a MISSING ack (still
-            // set at the next beat) is what forces ws.terminate() in the heartbeat interval above.
+          case OP.HEARTBEAT_ACK: {
             awaitedAck = false;
             break;
           }
           default:
-            break; // anything else we don't speak
+            break;
         }
       });
 
@@ -652,33 +689,32 @@ export class DiscordPlugin implements BackendPlugin {
           this.heartbeats.delete(heartbeat);
           heartbeat = undefined;
         }
-        const current = this.ws === ws;
-        if (current) {
-          this.ws = undefined;
-          this.live = false;
+        const terminal = TERMINAL_CLOSE.has(code);
+        const err = terminal
+          ? new TerminalGatewayCloseError(
+              `Discord gateway closed with terminal code ${code} — check the bot token and the ` +
+                'MESSAGE CONTENT privileged intent; live push is down until this bridge restarts',
+            )
+          : new Error(`Discord gateway closed before READY (code ${code})`);
+        if (!ready) reject(err);
+        // Keep every mutation below behind this check, so that a close delivered after the plugin
+        // moved on — real `ws` emits it a tick late — cannot mark the NEXT session fatal.
+        if (this.ws !== ws) return;
+        this.ws = undefined;
+        this.live = false;
+        if (!this.stopped) {
+          if (terminal) {
+            this.gatewayReady = undefined;
+            this.fatalGateway = err;
+            process.stderr.write(`parley-discord: ${err.message}\n`);
+          } else if (ready) {
+            if (Date.now() - readyAt >= STABLE_CONNECTION_MS) this.reconnectAttempts = 0;
+            this.scheduleReconnect(url, epoch);
+          }
         }
-        if (TERMINAL_CLOSE.has(code)) {
-          // Fatal (auth/intent/version/shard): never auto-retry — re-IDENTIFYing on every attempt
-          // burns Discord's 1000-IDENTIFY/24h budget and resets the bot token. The close
-          // is recorded and REPORTED in both phases: after READY nothing else would ever mention
-          // it, and "live push silently stopped forever" is the worst failure this plugin has.
-          const err = new TerminalGatewayCloseError(
-            `Discord gateway closed with terminal code ${code} — check the bot token and the ` +
-              'MESSAGE CONTENT privileged intent; live push is down until this bridge restarts',
-          );
-          this.gatewayReady = undefined;
-          this.fatalGateway = err;
-          process.stderr.write(`parley-discord: ${err.message}\n`);
-          if (!ready) reject(err);
-          return;
-        }
-        if (!ready) {
-          reject(new Error(`Discord gateway closed before READY (code ${code})`));
-          return;
-        }
-        if (this.stopped || !current) return;
-        if (Date.now() - readyAt >= STABLE_CONNECTION_MS) this.reconnectAttempts = 0;
-        this.scheduleReconnect(url);
+        // The socket that would have woken them is gone: release every blocked long-poll so it
+        // re-queries REST now and hands the rest of its budget back to core's poll fallback.
+        this.wakeWaiters();
       });
     });
   }
@@ -688,15 +724,15 @@ export class DiscordPlugin implements BackendPlugin {
    * budget every other path spends ({@link chargeDialAttempt}). A terminal close short-circuits it
    * (openSocket rejects with TerminalGatewayCloseError).
    */
-  private scheduleReconnect(url: string): void {
-    if (this.stopped) return;
+  private scheduleReconnect(url: string, epoch: number): void {
+    if (this.stopped || epoch !== this.sessionEpoch) return;
     const wait = this.chargeDialAttempt();
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      if (this.stopped) return;
+      if (this.stopped || epoch !== this.sessionEpoch) return;
       void this.openSocket(url).catch((err) => {
         if (err instanceof TerminalGatewayCloseError) return; // fatal — don't restart the storm
-        this.scheduleReconnect(url);
+        this.scheduleReconnect(url, epoch);
       });
     }, wait);
   }
@@ -736,13 +772,14 @@ export class DiscordPlugin implements BackendPlugin {
 }
 
 /**
- * Reject a `channel_map` whose targets are not distinct. Two topics folding onto one channel makes
- * the topic → channel map non-injective, which silently drops one topic's subscription and
- * relabels its traffic as the other's (core's `safeName` guards the same class the other way).
+ * Reject a `channel_map` whose targets are not distinct, and return the channel id → owning topic
+ * reverse index. Two topics folding onto one channel makes the topic → channel map non-injective,
+ * which silently drops one topic's subscription and relabels its traffic as the other's (core's
+ * `safeName` guards the same class the other way).
  */
-function requireDistinctChannels(map: Record<string, string>): Record<string, string> {
+function requireDistinctChannels(map: Map<string, string>): Map<string, string> {
   const owner = new Map<string, string>();
-  for (const [topic, channel] of Object.entries(map)) {
+  for (const [topic, channel] of map) {
     const prior = owner.get(channel);
     if (prior !== undefined) {
       throw new Error(
@@ -752,7 +789,7 @@ function requireDistinctChannels(map: Record<string, string>): Record<string, st
     }
     owner.set(channel, topic);
   }
-  return map;
+  return owner;
 }
 
 /** Settle with `p`, or reject at `ms` — the caller's budget, not the callee's, wins. */
@@ -797,7 +834,9 @@ function renderMentions(m: DiscordMessage): string {
 
 /**
  * Discord's 429 hint: the standard `Retry-After` header, else Discord's own `retry_after` body
- * field (SECONDS, float). The clamp and the no-hint default live in net-util's `clampBackoff`.
+ * field (SECONDS, float). Return it UNCLAMPED, so that we never retry sooner than Discord asked —
+ * that is what escalates a rate limit into a ban. net-util honours a stated wait in full and
+ * refuses one that cannot fit the call's deadline.
  */
 async function readRetryAfter(res: Response): Promise<number | undefined> {
   const header = retryAfterFromHeader(res);

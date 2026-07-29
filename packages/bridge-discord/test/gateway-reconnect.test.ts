@@ -10,7 +10,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
 // Imported after the mock is declared; vitest hoists vi.mock above all imports regardless.
-import { DiscordPlugin, RECONNECT_CAP_MS, STABLE_CONNECTION_MS } from '../src/index.js';
+import {
+  BACKOFF_BASE_MS,
+  BACKOFF_JITTER_MS,
+  DiscordPlugin,
+  INVALID_SESSION_MIN_WAIT_MS,
+  INVALID_SESSION_SPREAD_MS,
+  RECONNECT_CAP_MS,
+  STABLE_CONNECTION_MS,
+} from '../src/index.js';
 import { FakeWs, instances, resetGateway, state, totalIdentifies } from './fake-gateway.js';
 
 const gw = { instances, state, FakeWs };
@@ -128,38 +136,64 @@ describe('Discord gateway reconnect & liveness', () => {
     await plugin.disconnect();
   });
 
-  it('op 9 INVALID SESSION waits a randomized 1–5 s before re-identifying', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0.5); // op9 min-wait = 3000 ms (dominates the backoff)
-    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
-    const plugin = new DiscordPlugin();
-    await plugin.connect({
-      token: 't',
-      gateway_url: 'ws://fake',
-      handshake_timeout_ms: NO_HANDSHAKE_TIMEOUT,
+  // Discord's op 9 wait and the ordinary ladder are two independent floors on the SAME dial, so a
+  // range assertion is satisfied by whichever happens to be larger — delete the op 9 term and a
+  // fresh ladder still lands inside 1–5 s. Each cell computes the delay it expects from the
+  // exported constants, so dropping either term changes an asserted number.
+  const invalidSessionWait = (r: number): number =>
+    INVALID_SESSION_MIN_WAIT_MS + Math.floor(r * INVALID_SESSION_SPREAD_MS);
+  const ladderWait = (attempts: number, r: number): number =>
+    Math.min(BACKOFF_BASE_MS * 2 ** attempts, RECONNECT_CAP_MS) + Math.floor(r * BACKOFF_JITTER_MS);
+
+  /** Drive `cycles` transient close→reconnect→READY rounds, leaving the ladder at `cycles`. */
+  const climbLadder = async (ws: FakeWs, cycles: number): Promise<FakeWs> => {
+    let current = ws;
+    for (let i = 0; i < cycles; i++) {
+      current.serverClose(1006);
+      await vi.advanceTimersByTimeAsync(2 * RECONNECT_CAP_MS);
+      current = gw.instances.at(-1)!;
+      current.hello(HUGE_HB);
+    }
+    return current;
+  };
+
+  const OP9_CELLS: Array<{ random: number; climbs: number }> = [
+    { random: 0, climbs: 0 },
+    { random: 0.999, climbs: 0 },
+    { random: 0, climbs: 8 },
+    { random: 0.999, climbs: 8 },
+  ];
+
+  for (const cell of OP9_CELLS) {
+    const expected = Math.max(invalidSessionWait(cell.random), ladderWait(cell.climbs, cell.random));
+    it(`op 9 re-identifies after exactly ${expected}ms (random ${cell.random}, ladder at ${cell.climbs})`, async () => {
+      vi.spyOn(Math, 'random').mockReturnValue(cell.random);
+      const plugin = new DiscordPlugin();
+      await plugin.connect({
+        token: 't',
+        gateway_url: 'ws://fake',
+        handshake_timeout_ms: NO_HANDSHAKE_TIMEOUT,
+      });
+
+      const ws0 = await reachReady(plugin, asTopic('c3'));
+      const live = await climbLadder(ws0, cell.climbs);
+      const socketsBefore = gw.instances.length;
+      const identifiesBefore = totalIdentifies();
+
+      live.serverSend({ op: 9, d: false }); // INVALID SESSION on the live socket
+
+      await vi.advanceTimersByTimeAsync(expected - 1);
+      expect(gw.instances.length, 're-dialed before the wait elapsed').toBe(socketsBefore);
+      expect(totalIdentifies()).toBe(identifiesBefore);
+
+      await vi.advanceTimersByTimeAsync(2);
+      expect(gw.instances.length, 'never re-dialed after the wait elapsed').toBe(socketsBefore + 1);
+      gw.instances.at(-1)!.hello(HUGE_HB);
+      expect(totalIdentifies()).toBe(identifiesBefore + 1);
+
+      await plugin.disconnect();
     });
-
-    const ws0 = await reachReady(plugin, asTopic('c3'));
-    const identifiesBefore = totalIdentifies();
-
-    ws0.serverSend({ op: 9, d: false }); // INVALID SESSION on the live socket
-
-    const delay = setTimeoutDelays(setTimeoutSpy).at(-1)!;
-    expect(delay).toBeGreaterThanOrEqual(1000);
-    expect(delay).toBeLessThanOrEqual(5000);
-
-    // It must NOT re-identify before ~1 s.
-    await vi.advanceTimersByTimeAsync(900);
-    expect(gw.instances.length).toBe(1);
-    expect(totalIdentifies()).toBe(identifiesBefore);
-
-    // …but does reconnect within the window.
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(gw.instances.length).toBe(2);
-    gw.instances.at(-1)!.hello(HUGE_HB);
-    expect(totalIdentifies()).toBe(identifiesBefore + 1);
-
-    await plugin.disconnect();
-  });
+  }
 
   it('a missed heartbeat-ACK terminates the half-dead socket → reconnect → push resumes', async () => {
     const HB = 10_000;

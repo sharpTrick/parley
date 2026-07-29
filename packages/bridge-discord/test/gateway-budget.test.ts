@@ -148,10 +148,12 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
 describe('Discord session state does not leak across a connect/disconnect cycle', () => {
   const OLD_URL = 'ws://old';
   const NEW_URL = 'ws://new';
+  const LATE_TOPIC = asTopic('880002');
 
   beforeEach(() => {
     resetGateway();
     stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     vi.useFakeTimers();
   });
   afterEach(() => {
@@ -170,7 +172,9 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
   };
 
   // Each scenario leaves the FIRST session in a different state before it is torn down; none of
-  // them may reach into the second one.
+  // them may reach into the second one. Crossed with WHEN that state's socket event is delivered:
+  // real `ws` emits `close` a tick after the call that caused it, so an event from the old session
+  // can land after connect() has already opened the new one.
   const SCENARIOS: Array<{ label: string; first: (p: DiscordPlugin, ws: FakeWs) => Promise<void> }> = [
     {
       label: 'a reconnect was pending',
@@ -199,29 +203,75 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
         await vi.advanceTimersByTimeAsync(120_000);
       },
     },
+    {
+      label: 'a terminal close was in flight',
+      first: async (_p, ws) => {
+        ws.serverClose(4004);
+      },
+    },
+    {
+      label: 'a late HELLO was in flight',
+      first: async (_p, ws) => {
+        ws.hello(1000);
+      },
+    },
+    {
+      label: 'a late MESSAGE_CREATE was in flight',
+      first: async (_p, ws) => {
+        ws.serverSend({
+          op: 0,
+          t: 'MESSAGE_CREATE',
+          s: 7,
+          d: {
+            id: '901',
+            channel_id: TOPIC as string,
+            content: 'stale',
+            timestamp: '',
+            author: { id: '1', username: 'u' },
+          },
+        });
+      },
+    },
   ];
 
   for (const scenario of SCENARIOS) {
-    it(`a second session is unaffected when ${scenario.label}`, async () => {
-      const plugin = new DiscordPlugin();
-      const ws0 = await session(plugin, OLD_URL);
-      await scenario.first(plugin, ws0);
-      await plugin.disconnect();
+    for (const asyncClose of [false, true]) {
+      it(`a second session is unaffected when ${scenario.label} (close delivered ${
+        asyncClose ? 'async' : 'inline'
+      })`, async () => {
+        state.asyncClose = asyncClose;
+        const plugin = new DiscordPlugin();
+        const ws0 = await session(plugin, OLD_URL);
+        await scenario.first(plugin, ws0);
+        await plugin.disconnect();
+        // Under async delivery the ONE pending timer is the fake's own deferred close event, so
+        // only the inline mode can read the count as "what the plugin left behind".
+        if (!asyncClose) {
+          expect(vi.getTimerCount(), 'a timer outlived the first teardown').toBe(0);
+        }
 
-      state.onIdentify = (ws: FakeWs) => ws.ready();
-      const opened = instances.length;
-      await session(plugin, NEW_URL);
-      await vi.advanceTimersByTimeAsync(300_000);
+        state.onIdentify = (ws: FakeWs) => ws.ready();
+        const opened = instances.length;
+        await session(plugin, NEW_URL);
+        await vi.advanceTimersByTimeAsync(300_000);
 
-      // Nothing from the first session may dial, IDENTIFY, or dispatch into the second one.
-      expect(instances.slice(opened).map((ws) => ws.url)).toEqual([NEW_URL]);
-      expect(openSockets()).toHaveLength(1);
-      expect(openSockets()[0]!.url).toBe(NEW_URL);
+        // Nothing from the first session may dial, IDENTIFY, or dispatch into the second one.
+        expect(instances.slice(opened).map((ws) => ws.url)).toEqual([NEW_URL]);
+        expect(openSockets()).toHaveLength(1);
+        expect(openSockets()[0]!.url).toBe(NEW_URL);
 
-      await plugin.disconnect();
-      expect(openSockets()).toHaveLength(0);
-      expect(vi.getTimerCount()).toBe(0); // no interval, watchdog or reconnect outlives teardown
-    });
+        // Usable, not merely un-dialed: sticky state set by a late event kills live push on the
+        // new session without ever opening a socket, which every count above still satisfies.
+        const settled = instances.length;
+        await expect(plugin.subscribe(LATE_TOPIC, () => undefined)).resolves.toBeUndefined();
+        expect(instances.length).toBe(settled);
+
+        await plugin.disconnect();
+        await vi.advanceTimersByTimeAsync(1); // deliver the fake's own deferred close event
+        expect(openSockets()).toHaveLength(0);
+        expect(vi.getTimerCount()).toBe(0); // no interval, watchdog or reconnect outlives teardown
+      });
+    }
   }
 
   it('a heartbeat belongs to its own socket, never to whichever socket is current', async () => {

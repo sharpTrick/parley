@@ -48,14 +48,24 @@ export class FakeWs {
     if (this.readyState === FakeWs.CLOSED) return;
     this.readyState = FakeWs.CLOSED;
     this.closedCode = code ?? 1000;
-    this.fire('close', this.closedCode);
+    this.emitClose(this.closedCode);
   }
   terminate(): void {
     this.terminated = true;
     if (this.readyState === FakeWs.CLOSED) return;
     this.readyState = FakeWs.CLOSED;
     this.closedCode = 1006;
-    this.fire('close', 1006);
+    this.emitClose(1006);
+  }
+
+  /**
+   * Real `ws` delivers `close` on a later tick, never inside the call that caused it. Tests that
+   * need that race set {@link state.asyncClose}; everything else keeps the inline delivery, which
+   * is what makes close-driven suites readable under fake timers.
+   */
+  private emitClose(code: number): void {
+    if (state.asyncClose) setTimeout(() => this.fire('close', code), 0);
+    else this.fire('close', code);
   }
 
   // --- test-side "server" helpers ---
@@ -73,7 +83,7 @@ export class FakeWs {
     if (this.readyState === FakeWs.CLOSED) return;
     this.readyState = FakeWs.CLOSED;
     this.closedCode = code;
-    this.fire('close', code);
+    this.emitClose(code);
   }
   heartbeatsSent(): number {
     return this.sent.filter((f) => f.op === 1).length;
@@ -86,12 +96,16 @@ export class FakeWs {
 /** Every socket the plugin has opened, oldest first. */
 export const instances: FakeWs[] = [];
 
-/** What the fake server does when a socket sends op 2 IDENTIFY (default: ack with READY). */
-export const state = { onIdentify: (ws: FakeWs) => ws.ready() };
+/**
+ * What the fake server does when a socket sends op 2 IDENTIFY (default: ack with READY), and
+ * whether `close` events are delivered inline or a macrotask later (see {@link FakeWs.emitClose}).
+ */
+export const state = { onIdentify: (ws: FakeWs) => ws.ready(), asyncClose: false };
 
 export function resetGateway(): void {
   instances.length = 0;
   state.onIdentify = (ws: FakeWs) => ws.ready();
+  state.asyncClose = false;
 }
 
 /** IDENTIFYs sent across ALL sockets — the quantity Discord's 1000/24h quota counts. */

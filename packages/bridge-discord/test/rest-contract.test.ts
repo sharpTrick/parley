@@ -6,7 +6,7 @@ import {
   type BackendPlugin,
   type Topic,
 } from '@sharptrick/parley-core';
-import { MAX_BACKOFF_MS, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
 import { CONTENT_LIMIT, PAGE_LIMIT, startFakeDiscord, type FakeDiscord } from './fake-discord.js';
@@ -133,26 +133,37 @@ describe('Discord REST contract', () => {
   });
 
   describe('429 rate limits', () => {
-    const RETRY_MS = 1000;
-    const WAITS: Array<[string, { headers?: Record<string, string>; body: unknown }, number]> = [
-      ['header only', { headers: { 'retry-after': '1' }, body: {} }, RETRY_MS],
-      ['body only', { body: { retry_after: 1 } }, RETRY_MS],
-      ['both', { headers: { 'retry-after': '1' }, body: { retry_after: 0.001 } }, RETRY_MS],
-      ['malformed', { headers: { 'retry-after': 'soon' }, body: { retry_after: 'soon' } }, 500],
-    ];
+    // One row per HINT SOURCE, each with a hint distinguishable from every other source's — a
+    // floor alone is met by any longer wait, so each row also carries the ceiling that excludes
+    // the sources it is not testing (notably net-util's hintless DEFAULT_BACKOFF_MS).
+    const HINT_MS = 200;
+    const WAITS: Array<[string, { headers?: Record<string, string>; body: unknown }, number, number]> =
+      [
+        ['header only', { headers: { 'retry-after': '0.2' }, body: {} }, HINT_MS, DEFAULT_BACKOFF_MS],
+        ['body only', { body: { retry_after: 0.2 } }, HINT_MS, DEFAULT_BACKOFF_MS],
+        [
+          'header wins over body',
+          { headers: { 'retry-after': '0.2' }, body: { retry_after: 3 } },
+          HINT_MS,
+          DEFAULT_BACKOFF_MS,
+        ],
+        [
+          'malformed falls back to the shared default',
+          { headers: { 'retry-after': 'soon' }, body: { retry_after: 'soon' } },
+          DEFAULT_BACKOFF_MS,
+          3 * DEFAULT_BACKOFF_MS,
+        ],
+      ];
 
-    for (const [label, fault, expectedWait] of WAITS) {
+    for (const [label, fault, expectedWait, ceilingMs] of WAITS) {
       it(`honors retry_after (${label}) and then succeeds`, async () => {
         const t = liveTopic();
         fake.injectFault({ status: 429, path: '/channels/', ...fault });
         const started = Date.now();
         await plugin.post(t, SENDER, 'after the wait');
         const elapsed = Date.now() - started;
-        // Directional only: a wait can never come in SHORTER than the hint, whatever the runner is
-        // doing, while an upper bound tight enough to be interesting is a race, not a property.
-        // The ceiling that IS a property is net-util's clamp, and it holds by orders of magnitude.
         expect(elapsed).toBeGreaterThanOrEqual(expectedWait * 0.9);
-        expect(elapsed).toBeLessThan(MAX_BACKOFF_MS + 2000);
+        expect(elapsed).toBeLessThan(ceilingMs);
         expect(fake.requestCount('/messages')).toBe(2); // the 429, then exactly one retry
       });
     }
@@ -267,15 +278,58 @@ describe('Discord REST contract', () => {
         }
       });
     }
+  });
 
-    it('a limit above the message count reaches the very first message (no unreachable head)', async () => {
-      const t = liveTopic();
-      const count = 2 * PAGE_LIMIT + 5;
-      for (let i = 0; i < count; i++) await plugin.post(t, SENDER, `m${i}`);
+  describe('a topic named after an Object.prototype member', () => {
+    // A keyed lookup off a plain object answers for names it was never given. On this seam that
+    // turns a topic into a channel id nobody configured — and a 404 from it reads as an ABSENT
+    // topic rather than a misconfiguration, so the failure is silent.
+    const PROTOTYPE_NAMES = [
+      'constructor',
+      'toString',
+      'valueOf',
+      'hasOwnProperty',
+      '__proto__',
+      'isPrototypeOf',
+    ];
 
-      const { messages } = await plugin.fetchRecent({ topic: t, limit: 10_000 });
-      expect(messages.at(0)!.content).toBe('m0');
-      expect(messages).toHaveLength(count);
+    for (const name of PROTOTYPE_NAMES) {
+      it(`${name} used as a channel id literal round-trips`, async () => {
+        fake.createChannel(name);
+        const t = asTopic(name);
+        await plugin.post(t, SENDER, 'hi');
+        const { messages } = await plugin.fetchRecent({ topic: t });
+        expect(messages.map((m) => m.content)).toEqual(['hi']);
+      });
+
+      it(`${name} mapped through channel_map round-trips`, async () => {
+        const id = freshChannelId();
+        fake.createChannel(id);
+        const p = await connect({ channel_map: { [name]: id } });
+        try {
+          await p.post(asTopic(name), SENDER, 'hi');
+          const { messages } = await p.fetchRecent({ topic: asTopic(name) });
+          expect(messages.map((m) => m.content)).toEqual(['hi']);
+        } finally {
+          await p.disconnect();
+        }
+      });
+    }
+
+    it('each one gets its own live dispatch', async () => {
+      const p = await connect();
+      const got: Array<[string, string]> = [];
+      try {
+        for (const name of PROTOTYPE_NAMES) {
+          fake.createChannel(name);
+          await p.subscribe(asTopic(name), (m) => got.push([m.topic as string, m.content]));
+        }
+        for (const name of PROTOTYPE_NAMES) await p.post(asTopic(name), SENDER, `to-${name}`);
+        await expect.poll(() => got.length, { timeout: 3000 }).toBe(PROTOTYPE_NAMES.length);
+        expect([...got].sort()).toEqual(PROTOTYPE_NAMES.map((n) => [n, `to-${n}`]).sort());
+      } finally {
+        await p.disconnect();
+      }
     });
   });
 
@@ -286,17 +340,33 @@ describe('Discord REST contract', () => {
       ).rejects.toThrow(/alpha|beta|777000111/);
     });
 
-    it('a mapped topic colliding with another topic used literally is rejected at subscribe', async () => {
-      const id = freshChannelId();
-      fake.createChannel(id);
-      const p = await connect({ channel_map: { alpha: id } });
-      try {
-        await p.subscribe(asTopic('alpha'), () => undefined);
-        await expect(p.subscribe(asTopic(id), () => undefined)).rejects.toThrow(/alpha/);
-      } finally {
-        await p.disconnect();
-      }
-    });
+    // A collision refused at ONE entry point still lets the others carry the same Discord message
+    // across the seam under two topic labels, which defeats core's per-topic dedup namespace and
+    // interleaves the two topics' cursors. Every entry point that resolves a topic gets a cell.
+    const ENTRY_POINTS: Array<[string, (p: DiscordPlugin, t: Topic) => Promise<unknown>]> = [
+      ['post', (p, t) => p.post(t, SENDER, 'hi')],
+      ['fetchRecent (default window)', (p, t) => p.fetchRecent({ topic: t })],
+      ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
+      [
+        'fetchRecent (blocking)',
+        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 50 }),
+      ],
+      ['subscribe', (p, t) => p.subscribe(t, () => undefined)],
+    ];
+
+    for (const [label, run] of ENTRY_POINTS) {
+      it(`${label} rejects a literal topic that another topic already maps to`, async () => {
+        const id = freshChannelId();
+        fake.createChannel(id);
+        const p = await connect({ channel_map: { alpha: id } });
+        try {
+          await expect(run(p, asTopic(id))).rejects.toThrow(/alpha/);
+          await run(p, asTopic('alpha')); // the mapped topic is unaffected
+        } finally {
+          await p.disconnect();
+        }
+      });
+    }
 
     it('distinct topics mapped to distinct channels each get their own messages', async () => {
       const a = freshChannelId();

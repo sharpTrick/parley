@@ -50,7 +50,7 @@ Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps 
 | `token`       | _(unset)_                     | Bot token (secret — `.env`, never committed). |
 | `api_url`     | `https://discord.com/api/v10` | REST base URL. Tests point this at an in-process fake. |
 | `gateway_url` | _(unset)_                     | Gateway websocket URL override (tests/fakes). Default: resolved live via `GET /gateway/bot`. |
-| `channel_map` | `{}`                          | Parley topic → channel id. Unmapped topics are used as channel ids directly. Targets must be **distinct** — two topics folding onto one channel is rejected at `connect()`, because one of them would otherwise lose its subscription silently. |
+| `channel_map` | `{}`                          | Parley topic → channel id. Unmapped topics are used as channel ids directly. Targets must be **distinct** — two topics folding onto one channel is rejected at `connect()`, because one of them would otherwise lose its subscription silently. A topic used as a literal channel id that another topic already maps to is refused the same way, on every call that resolves it. |
 | `handshake_timeout_ms` | `10000` | How long HELLO → IDENTIFY → READY may take before the socket is terminated and the attempt fails (the reconnect loop then retries with backoff). |
 
 > **Presence needs a real channel.** Core enables presence by default (`presence.enabled: true`,
@@ -59,6 +59,24 @@ Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps 
 > point `presence.topic` at a real channel id (directly or through `channel_map`). Left as-is,
 > heartbeats fail (the presence loop swallows it, by design) and `parley_list_users` reports an
 > empty roster, because the topic is genuinely absent.
+
+## Rate limits (429)
+
+The retry loop is `@sharptrick/parley-net-util`'s, shared by every HTTP backend, and one cap does
+not describe it. The plugin reads Discord's hint from the standard `Retry-After` header, falling
+back to Discord's own `retry_after` body field (seconds, float):
+
+| what the 429 carries | what the call does |
+| -------------------- | ------------------ |
+| no usable hint       | waits the shared default of **500 ms**. The **5000 ms** ceiling bounds only a backoff the client invented for itself. |
+| a stated hint        | waits it **in full**, past 5000 ms when that is what Discord asked for. Retrying sooner than the vendor asked is what turns a rate limit into a ban. |
+| a hint longer than the call's remaining budget (**30000 ms**) | the call **fails** with an error naming both numbers instead of sleeping past its budget. Nothing is retried. |
+
+Discord's *global* rate limits routinely ask for longer than 30000 ms. When one lands, the tool
+call comes back as an error in the model's context rather than parking the session — this plugin
+does not expose a per-call deadline override, so the operator fix is to reduce the load on the bot
+token (fewer concurrent bridge instances sharing it, or a token per session) rather than to wait
+the limit out.
 
 ## Provisioning the bot (pointers, not infra)
 
@@ -101,7 +119,5 @@ hermetic, no credentials, always on. The fake also speaks Discord's *failure* su
 channels, injectable statuses/headers/bodies, the 2000-character and 100-per-page caps), so the
 error half of the plugin is exercised rather than assumed. To exercise a real server manually: put
 a real `token` in `backend_config`, use a real channel id as the topic (or map one in
-`channel_map`), and drive `post`/`fetchRecent`/`subscribe` from a scratch script — mind Discord's
-rate limits (the plugin honors `429 retry_after` up to the 5s cap that
-`@sharptrick/parley-net-util` sets for every HTTP backend; a global rate limit asking for longer
-is retried at that cap).
+`channel_map`), and drive `post`/`fetchRecent`/`subscribe` from a scratch script — mind the rate
+limits described below.
