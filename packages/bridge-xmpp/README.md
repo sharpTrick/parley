@@ -78,11 +78,13 @@ field that must NOT, if you set it at all**:
   account across sessions is usually **fine**: leaving `nick` unset (the default) auto-generates a
   random nick per connection, so every session still gets its own distinct sender for free even
   with the same login.
-- **`nick` — must be unique per concurrent session if you set it.** Pin it to a fixed, readable
-  value and copy that same config to a second concurrent session, and the second session's MUC
-  join **fails outright** — unlike every other divergence risk on this page, this one is a loud
-  error, not a silent split, because MUC requires unique nicknames per room. Leave it unset unless
-  you need stable names, and if you do set it, give each session its own.
+- **`nick` — must be unique per concurrent session if you set it, and nothing enforces that for
+  you.** MUC's unique-nickname rule is scoped to the *bare JID*: two sessions on the **same**
+  account (what the configs above recommend) can occupy one room under one pinned nick from two
+  resources, with **no error at any point** — both join, both post, and every message from both
+  is attributed to that single nick. It is a silent split, exactly like the other divergences on
+  this page. A loud `conflict` error only appears when the two sessions use **different** accounts.
+  Leave `nick` unset unless you need stable names, and if you do set it, give each session its own.
 
 Runnable multi-config examples (two Code sessions + a remote/chat config, sharing one XMPP account
 with auto-generated nicks): [`examples/multi-session/xmpp`](../../examples/multi-session/README.md).
@@ -95,8 +97,13 @@ knob. Prosody's `mod_mam` has `archive_expires_after` (e.g. `"1w"`, `"1m"`, or `
 Prosody's own default is `"1w"`, so a Parley deployment that wants longer history must raise this
 explicitly); ejabberd's `mod_mam` has an analogous `default_shaping`/archive-cleanup config. Set it
 on the server if you want a retention window — this plugin has no opinion on it and needs no
-changes either way. As with the other backends, once an archived message expires, `fetchRecent`
-just returns less history, with no error signaling that anything was pruned.
+changes either way. Once an archived message expires, `fetchRecent` returns less history, with no
+error signaling that anything was pruned — and if the *cursor itself* has expired out of the
+window, the result is server-dependent: RSM (XEP-0059) says a server should answer
+`item-not-found` for an `<after>` UID it does not hold, but Prosody's `mod_mam` ignores it and replays
+the surviving archive from the beginning. Core's `backendMsgId` dedup absorbs the replay, but a
+resume from a cursor older than the retention window can cost a full re-read of the archive; size
+`archive_expires_after` above your longest expected bridge downtime.
 
 ## Run an XMPP server (with MAM)
 

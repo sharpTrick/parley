@@ -18,7 +18,7 @@ import { delay } from '@sharptrick/parley-net-util';
 // `@xmpp/client` re-exports `xml` (the ltx element factory). Importing from the one
 // declared dependency keeps the package self-contained (no extra direct dep on @xmpp/xml).
 import { client, xml } from '@xmpp/client';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 
 /** Plugin-specific backend_config. */
 export interface XmppBackendConfig {
@@ -49,6 +49,7 @@ const NS_DELAY = 'urn:xmpp:delay';
 const NS_RSM = 'http://jabber.org/protocol/rsm';
 const NS_MUC_OWNER = 'http://jabber.org/protocol/muc#owner';
 const NS_XDATA = 'jabber:x:data';
+const NS_STANZAS = 'urn:ietf:params:xml:ns:xmpp-stanzas';
 
 const JOIN_TIMEOUT_MS = 15_000;
 const POST_TIMEOUT_MS = 15_000;
@@ -62,12 +63,16 @@ const MAM_PAGE = 200;
  * caller's remaining `blockMs` budget (never blocking past the deadline).
  */
 const MAM_LAG_POLL_MS = 50;
+/** Floor between two stream-error reports, so a reconnect storm can't flood stderr. */
+const STREAM_ERROR_LOG_MS = 5_000;
 /** Bounded retry for the transient MUC cold-creation race (see {@link XmppPlugin.doJoin}). */
 const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
 const RETRYABLE_CONDITIONS = ['item-not-found', 'recipient-unavailable', 'remote-server-not-found'];
 
-const rand = (): string => Math.random().toString(36).slice(2, 12);
+// Correlators (origin-id, nick) are published in the room on every post, so a co-occupant sees
+// them: keep this crypto-random, or an observer can predict the next one and race the reflection.
+const rand = (): string => randomBytes(8).toString('hex');
 const resourceOf = (full: string): string => {
   const i = full.indexOf('/');
   return i === -1 ? '' : full.slice(i + 1);
@@ -79,8 +84,10 @@ const bareOf = (full: string): string => {
 
 /** A minimal view of the ltx element / @xmpp client surface we use (no upstream types ship). */
 type El = {
+  name: string;
   is(name: string, ns?: string): boolean;
   attrs: Record<string, string>;
+  children: Array<El | string>;
   getChild(name: string, ns?: string): El | undefined;
   getChildren(name: string, ns?: string): El[];
   getChildText(name: string, ns?: string): string | null;
@@ -90,17 +97,37 @@ type XmppClient = {
   start(): Promise<unknown>;
   stop(): Promise<unknown>;
   send(el: unknown): Promise<unknown>;
-  on(event: string, cb: (arg: El) => void): void;
+  on(event: string, cb: (arg?: unknown) => void): void;
   iqCaller: { request(el: unknown, timeout?: number): Promise<El> };
 };
+
+/**
+ * The RFC 6120 §8.3 defined-condition child of a stanza's `<error>`, plus its optional `<text>`.
+ * The condition is reported whether or not the join loop considers it retryable — an operator
+ * debugging a rejected join needs `forbidden`/`conflict`/`registration-required`, not `error`.
+ */
+const stanzaError = (stanza: El): { condition: string; text: string } => {
+  const err = stanza.getChild('error');
+  if (err === undefined) return { condition: 'error', text: '' };
+  const defined = err.children.find(
+    (c): c is El => typeof c !== 'string' && c.name !== 'text',
+  );
+  return {
+    condition: defined?.name ?? err.attrs.type ?? 'error',
+    text: err.getChildText('text', NS_STANZAS) ?? err.getChildText('text') ?? '',
+  };
+};
+const describeError = (e: { condition: string; text: string }): string =>
+  e.text !== '' ? `${e.condition}: ${e.text}` : e.condition;
 
 /** Carries the XMPP error condition so the join loop can decide whether to retry. */
 class JoinError extends Error {
   constructor(
     readonly condition: string,
     room: string,
+    text = '',
   ) {
-    super(`MUC join error (${condition}) for ${room}`);
+    super(`MUC join error (${describeError({ condition, text })}) for ${room}`);
   }
 }
 
@@ -109,6 +136,8 @@ interface PendingJoin {
   reject(err: Error): void;
 }
 interface PendingPost {
+  /** The room this post was sent to; only its own reflection may resolve the correlator. */
+  room: string;
   resolve(id: BackendMsgId): void;
   reject(err: Error): void;
 }
@@ -122,6 +151,8 @@ interface Subscription {
   topic: Topic;
   handlers: MessageHandler[];
 }
+/** Why a long-poll waiter woke: only `message` implies the archive may still be lagging. */
+type WakeReason = 'message' | 'timeout' | 'cancel';
 
 /**
  * XMPP MUC backend (DESIGN §6/§9). A topic maps to a MUC room; the per-message
@@ -142,6 +173,7 @@ export class XmppPlugin implements BackendPlugin {
   private handle = 'parley';
   private nick = `parley-${rand()}`;
   private stopped = false;
+  private lastStreamErrorAt = 0;
 
   /** roomJid -> in-flight/settled join (cached like an "ensure"; idempotent). */
   private readonly joined = new Map<string, Promise<void>>();
@@ -160,7 +192,7 @@ export class XmppPlugin implements BackendPlugin {
    * already runs (no second MUC join / connection). Reusing that primitive keeps the wait cheap and
    * its teardown identical to the live path's.
    */
-  private readonly waiters = new Map<string, Set<() => void>>();
+  private readonly waiters = new Map<string, Set<(reason: WakeReason) => void>>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as XmppBackendConfig;
@@ -188,9 +220,11 @@ export class XmppPlugin implements BackendPlugin {
       username,
       password,
     }) as unknown as XmppClient;
-    // Stream/connection errors surface via command rejections; don't crash the process.
-    xmpp.on('error', () => undefined);
-    xmpp.on('stanza', (stanza) => this.onStanza(stanza));
+    // Stream/connection errors surface via command rejections; don't crash the process — but a
+    // flapping or auth-rejected stream must not be invisible, so report it on stderr (NEVER
+    // stdout: cli.ts speaks JSON-RPC there), rate-limited so a reconnect storm can't flood it.
+    xmpp.on('error', (err) => this.reportStreamError(err));
+    xmpp.on('stanza', (stanza) => this.onStanza(stanza as El));
     // BUG-06: @xmpp/client bundles @xmpp/reconnect, which transparently re-establishes and
     // re-auths the stream after a drop/server-restart — but MUC occupancy is presence-based and
     // is NOT restored by the library. On every `online` AFTER the first, re-send the join
@@ -208,7 +242,15 @@ export class XmppPlugin implements BackendPlugin {
       this.pendingPosts.clear();
       this.joined.clear();
       for (const sub of this.subscriptions.values()) {
-        void this.ensureJoined(sub.topic).catch(() => undefined); // re-send join presence per room
+        // Re-send the join presence per room. A failure here leaves the room unjoined until the
+        // next post/fetchRecent re-drives ensureJoined (the cache is dropped on failure), so it
+        // must reach the operator rather than being swallowed.
+        void this.ensureJoined(sub.topic).catch((err: unknown) => {
+          console.error(
+            `[parley-xmpp] re-join after reconnect failed for ${this.roomJid(sub.topic)}: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
       }
     });
     await xmpp.start();
@@ -225,7 +267,7 @@ export class XmppPlugin implements BackendPlugin {
     this.subscriptions.clear();
     // Abort every in-flight long-poll cleanly (each fire clears its own timer + de-registers), so a
     // blocked fetch wakes, sees `stopped`, and returns an empty page — no leaked listeners/timers.
-    for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire();
+    for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire('cancel');
     this.waiters.clear();
     this.joined.clear();
     if (this.xmpp !== undefined) {
@@ -242,7 +284,7 @@ export class XmppPlugin implements BackendPlugin {
   ): Promise<BackendMsgId> {
     await this.ensureJoined(topic);
     const room = this.roomJid(topic);
-    const originId = `o-${rand()}${rand()}`;
+    const originId = `o-${randomUUID()}`;
 
     const promise = new Promise<BackendMsgId>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -250,6 +292,7 @@ export class XmppPlugin implements BackendPlugin {
         reject(new Error(`post reflection timeout in ${room}`));
       }, POST_TIMEOUT_MS);
       this.pendingPosts.set(originId, {
+        room,
         resolve: (id) => {
           clearTimeout(timer);
           resolve(id);
@@ -320,18 +363,20 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   /**
-   * Native long-poll (issue #20): MUC-live-wait + MAM-reconcile. Arm a one-shot waiter on the room
-   * that fires on the SAME live groupchat delivery the push path uses (or a bounded timeout, or
-   * `disconnect()`), wait up to the remaining budget, then re-run the canonical exclusive MAM query
-   * so ids/cursor stay archive-authoritative.
+   * Native long-poll (issue #20): MUC-live-wait + MAM-reconcile. Each round ARMS the room waiter
+   * FIRST, then runs the canonical exclusive MAM query, then parks on the waiter. Arming before the
+   * query is what closes the lost-wakeup window: a message reflected while the query is in flight
+   * (a remote round trip is tens to hundreds of ms) fires an already-registered waiter instead of
+   * firing into the void, so the next round returns it immediately rather than at the deadline.
+   * The loop also makes a spurious wake re-arm and keep waiting instead of returning early.
    *
    * MAM archival lag: XEP-0313 can commit the archive slightly AFTER the live stanza is reflected,
-   * so the immediate post-wake MAM query may not yet show the message. We reconcile by re-polling
-   * MAM on a short cadence, always bounded by the deadline — never blocking past `blockMs`. If the
-   * archive still hasn't caught up when the budget runs out we return an empty page, which is
-   * always safe: the empty page carries `nextCursor === since` and core's wrapper polls the rest.
-   * Aborts cleanly on `disconnect()` (the waiter is fired + de-registered; `stopped` short-circuits
-   * every subsequent query), so no listener or timer leaks.
+   * so the query that follows a live wake may not yet show the message. After such a wake the park
+   * is capped at {@link MAM_LAG_POLL_MS} so the archive is re-read on a short cadence, always
+   * bounded by the deadline — never blocking past `blockMs`. If the archive still hasn't caught up
+   * when the budget runs out we return an empty page, which is always safe: the empty page carries
+   * `nextCursor === since` and core's wrapper polls the rest. Aborts cleanly on `disconnect()` (the
+   * waiter is fired + de-registered; `stopped` short-circuits every query), so nothing leaks.
    */
   private async blockingMam(
     topic: Topic,
@@ -341,28 +386,23 @@ export class XmppPlugin implements BackendPlugin {
   ): Promise<MamItem[]> {
     const deadline = Date.now() + blockMs;
     const room = this.roomJid(topic);
-    const remaining = deadline - Date.now();
-    if (remaining > 0) {
-      const waiter = this.armWaiter(room, remaining);
+    let parkCap = Number.POSITIVE_INFINITY;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (this.stopped || remaining <= 0) return [];
+      const waiter = this.armWaiter(room, Math.min(remaining, parkCap));
       try {
-        await waiter.fired; // live MUC message on this room, timeout, or disconnect
+        const items = await this.exclusiveMam(topic, since, limit);
+        if (items.length > 0) return items;
+        if (this.stopped) return [];
+        const reason = await waiter.fired; // live MUC message, timeout, or disconnect
+        if (reason === 'message') parkCap = MAM_LAG_POLL_MS;
+      } catch (err) {
+        if (this.stopped) return []; // torn down mid-reconcile → empty page is safe
+        throw err;
       } finally {
         waiter.cancel(); // idempotent — also clears the timer + de-registers on the fire path
       }
-    }
-    if (this.stopped) return []; // disconnect() won → empty page is safe
-    try {
-      let items = await this.exclusiveMam(topic, since, limit);
-      // Reconcile against MAM lag: re-poll the archive within the remaining budget.
-      while (items.length === 0 && !this.stopped && Date.now() < deadline) {
-        await delay(Math.min(MAM_LAG_POLL_MS, deadline - Date.now()));
-        if (this.stopped) break;
-        items = await this.exclusiveMam(topic, since, limit);
-      }
-      return items;
-    } catch (err) {
-      if (this.stopped) return []; // torn down mid-reconcile → empty page is safe
-      throw err;
     }
   }
 
@@ -372,13 +412,16 @@ export class XmppPlugin implements BackendPlugin {
    * fires it. Idempotent `cancel()` (also the fire path) clears the timer and de-registers, so no
    * listener or timer can leak past the wait. Mirrors the chat backends' waiter shape.
    */
-  private armWaiter(room: string, blockMs: number): { fired: Promise<void>; cancel: () => void } {
-    let resolveFired!: () => void;
-    const fired = new Promise<void>((r) => {
+  private armWaiter(
+    room: string,
+    blockMs: number,
+  ): { fired: Promise<WakeReason>; cancel: () => void } {
+    let resolveFired!: (reason: WakeReason) => void;
+    const fired = new Promise<WakeReason>((r) => {
       resolveFired = r;
     });
     let settled = false;
-    const fire = (): void => {
+    const fire = (reason: WakeReason): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -387,22 +430,22 @@ export class XmppPlugin implements BackendPlugin {
         set.delete(fire);
         if (set.size === 0) this.waiters.delete(room);
       }
-      resolveFired();
+      resolveFired(reason);
     };
-    const timer = setTimeout(fire, blockMs);
+    const timer = setTimeout(() => fire('timeout'), blockMs);
     let set = this.waiters.get(room);
     if (set === undefined) {
       set = new Set();
       this.waiters.set(room, set);
     }
     set.add(fire);
-    return { fired, cancel: fire };
+    return { fired, cancel: () => fire('cancel') };
   }
 
   /** Wake every long-poll fetch blocked on `room`; each fire self-clears (idempotent). */
   private fireWaiters(room: string): void {
     const set = this.waiters.get(room);
-    if (set !== undefined) for (const fire of [...set]) fire();
+    if (set !== undefined) for (const fire of [...set]) fire('message');
   }
 
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
@@ -422,6 +465,15 @@ export class XmppPlugin implements BackendPlugin {
 
   // ---- internals -----------------------------------------------------------
 
+  private reportStreamError(err: unknown): void {
+    const now = Date.now();
+    if (now - this.lastStreamErrorAt < STREAM_ERROR_LOG_MS) return;
+    this.lastStreamErrorAt = now;
+    console.error(
+      `[parley-xmpp] stream error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   private onStanza(stanza: El): void {
     if (this.stopped) return;
     if (stanza.is('presence')) {
@@ -437,8 +489,30 @@ export class XmppPlugin implements BackendPlugin {
       return;
     }
 
+    if (stanza.attrs.type === 'error') {
+      this.onErrorMessage(stanza);
+      return;
+    }
     if (stanza.attrs.type !== 'groupchat') return;
     this.onGroupchat(stanza);
+  }
+
+  /**
+   * A MUC bounce of one of our stanzas (not an occupant, no voice, kicked/banned, room gone).
+   * The reflection can never arrive, so fail the correlated post/join NOW with the server's
+   * condition instead of burning the full timeout and reporting a causeless stall.
+   */
+  private onErrorMessage(stanza: El): void {
+    const room = bareOf(stanza.attrs.from ?? '');
+    const err = stanzaError(stanza);
+    const originId = stanza.getChild('origin-id', NS_SID)?.attrs.id ?? stanza.attrs.id ?? '';
+    const post = this.pendingPosts.get(originId);
+    if (post !== undefined && post.room === room) {
+      this.pendingPosts.delete(originId);
+      post.reject(new Error(`post rejected by ${room} (${describeError(err)})`));
+      return;
+    }
+    this.pendingJoins.get(room)?.reject(new JoinError(err.condition, room, err.text));
   }
 
   private onPresence(stanza: El): void {
@@ -448,10 +522,8 @@ export class XmppPlugin implements BackendPlugin {
     if (pending === undefined) return;
 
     if (stanza.attrs.type === 'error') {
-      this.pendingJoins.delete(room);
-      const errEl = stanza.getChild('error');
-      const cond = RETRYABLE_CONDITIONS.find((c) => errEl?.getChild(c) !== undefined) ?? 'error';
-      pending.reject(new JoinError(cond, room));
+      const err = stanzaError(stanza);
+      pending.reject(new JoinError(err.condition, room, err.text));
       return;
     }
     // Self-presence: our own nick echoed back, or status code 110.
@@ -460,7 +532,6 @@ export class XmppPlugin implements BackendPlugin {
     const isSelf =
       resourceOf(from) === this.nick || statuses.some((s) => s.attrs.code === '110');
     if (!isSelf) return;
-    this.pendingJoins.delete(room);
     // Status 201 = we just CREATED the room; it is locked until the owner submits config.
     // Unlock it (accept defaults = "instant room") so concurrent joiners aren't item-not-found.
     if (statuses.some((s) => s.attrs.code === '201')) {
@@ -507,11 +578,15 @@ export class XmppPlugin implements BackendPlugin {
       .getChildren('stanza-id', NS_SID)
       .find((e) => e.attrs.by === room)?.attrs.id;
 
-    // Correlate our own post() by its origin-id; resolve with the server's archive id.
+    // Correlate our own post() by its origin-id; resolve with the server's archive id. The
+    // origin-id is public to every occupant, so a reflection is only OURS when it comes back from
+    // our own occupant JID — without that check a co-occupant echoing the id resolves our post
+    // with THEIR archive position, which core then stores as our backendMsgId and cursor.
     const originId = stanza.getChild('origin-id', NS_SID)?.attrs.id;
     if (originId !== undefined) {
       const pending = this.pendingPosts.get(originId);
-      if (pending !== undefined && archId !== undefined) {
+      const ours = resourceOf(from) === this.nick && room === pending?.room;
+      if (pending !== undefined && ours && archId !== undefined) {
         this.pendingPosts.delete(originId);
         pending.resolve(asBackendMsgId(archId));
       }
@@ -554,8 +629,10 @@ export class XmppPlugin implements BackendPlugin {
 
     const rsm: unknown[] = [];
     // Never emit an empty <after/>: the empty-archive zero cursor '' means "from the beginning"
-    // (forward-from-start), not a real archive UID. XEP-0313 §4.2 makes servers reply
-    // item-not-found for an <after> that is not in the archive, so '' must omit the element.
+    // (forward-from-start), not a real archive UID. A server's response to an <after> it does not
+    // recognise is NOT portable — RSM (XEP-0059) specifies item-not-found, but Prosody's mod_mam
+    // ignores the unknown UID and replays from the start of the archive — so '' must omit the
+    // element rather than rely on either behaviour.
     if (opts.after !== undefined && opts.after !== '') rsm.push(xml('after', {}, opts.after));
     rsm.push(xml('max', {}, String(opts.max)));
     if (opts.before === true) rsm.push(xml('before', {})); // empty <before/> => last page
@@ -626,20 +703,27 @@ export class XmppPlugin implements BackendPlugin {
 
   private joinOnce(room: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingJoins.delete(room);
-        reject(new Error(`MUC join timeout for ${room}`));
-      }, JOIN_TIMEOUT_MS);
-      this.pendingJoins.set(room, {
-        resolve: () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      });
+      // Settle only ever clears the map slot when the slot is still THIS entry: a reconnect
+      // re-join for a room whose previous join is still in flight registers a successor under the
+      // same key, and an unguarded delete from the loser's timer would drop the successor's
+      // registration — its self-presence would then be ignored and the room silently unjoined.
+      const settle = (finish: () => void): void => {
+        clearTimeout(timer);
+        if (this.pendingJoins.get(room) === entry) this.pendingJoins.delete(room);
+        finish();
+      };
+      const entry: PendingJoin = {
+        resolve: () => settle(resolve),
+        reject: (err) => settle(() => reject(err)),
+      };
+      const timer = setTimeout(
+        () => entry.reject(new Error(`MUC join timeout for ${room}`)),
+        JOIN_TIMEOUT_MS,
+      );
+      const superseded = this.pendingJoins.get(room);
+      this.pendingJoins.set(room, entry);
+      superseded?.reject(new Error(`MUC join superseded for ${room}`));
+
       const presence = xml(
         'presence',
         { to: `${room}/${this.nick}` },
@@ -648,11 +732,7 @@ export class XmppPlugin implements BackendPlugin {
       this.require()
         .send(presence)
         .catch((err: unknown) => {
-          const pj = this.pendingJoins.get(room);
-          if (pj !== undefined) {
-            this.pendingJoins.delete(room);
-            pj.reject(err instanceof Error ? err : new Error(String(err)));
-          }
+          entry.reject(err instanceof Error ? err : new Error(String(err)));
         });
     });
   }

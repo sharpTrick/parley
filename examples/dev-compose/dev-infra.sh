@@ -52,6 +52,11 @@ up_xmpp() {
   "${COMPOSE[@]}" exec -T prosody prosodyctl register parley parley.local parleypass 2>/dev/null \
     && log "registered xmpp user parley@parley.local" \
     || log "xmpp user parley@parley.local already present"
+  # A SECOND account: MUC's unique-nick rule is per bare JID, so the multi-session suite needs two
+  # accounts to observe the cross-account `conflict` the XMPP README documents.
+  "${COMPOSE[@]}" exec -T prosody prosodyctl register parley2 parley.local parleypass2 2>/dev/null \
+    && log "registered xmpp user parley2@parley.local" \
+    || log "xmpp user parley2@parley.local already present"
 }
 
 up_matrix() {

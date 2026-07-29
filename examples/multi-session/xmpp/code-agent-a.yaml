@@ -29,5 +29,7 @@ backend_config:
   #    a random one per connection (`${username}-${rand()}`), so each session still gets its
   #    own distinct (if randomly-labeled) sender for free. Only pin `nick` to a fixed value if
   #    you want a stable, readable name — and if you do, it MUST be unique per concurrent
-  #    session (MUC requires unique nicknames per room; reusing one across sessions makes the
-  #    second session's join fail outright, not silently misattribute).
+  #    session. Do NOT expect a duplicate to be caught for you: MUC's unique-nickname rule is
+  #    per bare JID, so two sessions sharing THIS account join the same room under the same
+  #    pinned nick with no error at all, and every message from both is attributed to that one
+  #    nick. (A `conflict` error only happens between different accounts.)
