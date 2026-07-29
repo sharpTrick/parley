@@ -495,6 +495,52 @@ describe('filterReachable (pure reachability predicate)', () => {
     expect(unscoped).toEqual([]);
   });
 
+  /**
+   * The ReDoS screen is calibrated for an input of MAX_MATCH_INPUT characters, and regex-safety.ts
+   * says so: callers MUST clamp. The two cases above fix the PATTERN axis with a short topic and
+   * leave the INPUT axis constant, so the clamp itself is free to disappear. `.*.*.*.*x` passes the
+   * screen (its budget is exactly the calibrated ceiling) yet costs ~9ms against 64 characters, 1.7s
+   * against 256 and minutes against 1024 — so cross the axes and bound every cell in wall-clock
+   * time. Topic names reach here from the operator's allowlist, which does not cap their length.
+   */
+  describe('a screened pattern stays cheap however long the matched topic is', () => {
+    const PATTERNS = {
+      'a degree-4 polynomial source that PASSES the screen': '.*.*.*.*x',
+      'a source the screen rejects outright': '((([a-z-]+)+)+)+[0-9]',
+      'a benign source': 'team-.*',
+    };
+    const LENGTHS = [8, 64, 256, 1024];
+    const BOUND_MS = 500;
+
+    for (const [label, source] of Object.entries(PATTERNS)) {
+      it.each(LENGTHS)(`${label}, against a %i-character topic`, (length) => {
+        const roster = [entry('attacker', ['some-other-ctx'], Array<string>(4).fill(source))];
+        const topic = `team-${'a'.repeat(length - 5)}`;
+
+        const scopedT0 = performance.now();
+        filterReachable(roster, { scope: topic, canPostTo: NEVER, mySubscribedTopics: [] });
+        expect(performance.now() - scopedT0).toBeLessThan(BOUND_MS);
+
+        const unscopedT0 = performance.now();
+        filterReachable(roster, { scope: undefined, canPostTo: NEVER, mySubscribedTopics: [topic] });
+        expect(performance.now() - unscopedT0).toBeLessThan(BOUND_MS);
+      });
+    }
+
+    // The clamp compares a PREFIX, so a pattern that matches inside the first MAX_MATCH_INPUT
+    // characters still reports reachable. That is the semantic cost of the bound, pinned here so it
+    // is not "fixed" later by silently refusing long topics instead.
+    it('still matches on the bounded prefix of an over-long topic', () => {
+      const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
+      const topic = `team-${'a'.repeat(5_000)}`;
+      expect(
+        filterReachable(roster, { scope: topic, canPostTo: NEVER, mySubscribedTopics: [] }).map(
+          (e) => e.handle,
+        ),
+      ).toEqual(['peer']);
+    });
+  });
+
   it('(e) a benign postTopics pattern still legitimately matches (screen preserves semantics)', () => {
     const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
     // scoped: the peer's `team-.*` covers the scope.

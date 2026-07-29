@@ -5,7 +5,13 @@ import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
 import { NoSuchTopicError, type BackendPlugin, type FetchRecentArgs, type FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { catchUpAll, catchUpTopic } from './catchup.js';
+import {
+  memoryReadState,
+  NONCONFORMANT_SHAPE_NAMES,
+  NONCONFORMANT_SHAPES,
+  pagingProbe,
+} from '../testing/nonconformant.js';
+import { catchUpAll, catchUpTopic, MAX_CATCHUP_PAGES } from './catchup.js';
 import { ReadStateStore } from './read-state.js';
 import { SeenSet } from './seen-set.js';
 
@@ -283,6 +289,54 @@ describe('catch-up driver', () => {
         expect(readState.get(T)).toBe(finalCursor);
       },
     );
+  });
+
+  /**
+   * A page's LENGTH proves nothing: the seam promises only "max messages to return in this page",
+   * and the backends whose ceiling is not negotiable (Discord's 100, Telegram, Matrix `/messages`)
+   * return short pages with more behind them. So the driver's stop rule is an EMPTY page, and every
+   * other adversarial shape must still terminate in a bounded number of calls rather than wedging
+   * startup. Run the whole shape table, not the one shape whose guard this file happens to own.
+   */
+  describe('a non-conformant backend can neither wedge nor short-change catch-up', () => {
+    it.each(NONCONFORMANT_SHAPE_NAMES)('%s', async (name) => {
+      const { serve, drains } = NONCONFORMANT_SHAPES[name]!;
+      const { plugin, calls } = pagingProbe(serve);
+      const drained = await catchUpTopic({
+        plugin,
+        topic: T,
+        limit: 1_000,
+        readState: memoryReadState() as unknown as ReadStateStore,
+        seen: new SeenSet(),
+      });
+      expect(calls.length).toBeLessThanOrEqual(MAX_CATCHUP_PAGES);
+      if (drains !== undefined) expect(drained).toBe(drains);
+    });
+
+    it('a topic whose pages never stop arriving stops at the page ceiling', async () => {
+      const { plugin, calls } = pagingProbe(NONCONFORMANT_SHAPES['a cursor that walks backwards, then forwards again']!.serve);
+      await catchUpTopic({
+        plugin,
+        topic: T,
+        limit: 1_000,
+        readState: memoryReadState() as unknown as ReadStateStore,
+        seen: new SeenSet(),
+      });
+      expect(calls).toHaveLength(MAX_CATCHUP_PAGES);
+    });
+
+    // Every page rewrites the state file, so an unbounded loop is a disk hazard as well as a CPU
+    // one: the ceiling has to hold with the REAL store, not only the in-memory stand-in above.
+    it('a stuck cursor stops before it can rewrite the state file more than a handful of times', async () => {
+      const path = rsPath();
+      const readState = new ReadStateStore(path);
+      const { plugin, calls } = pagingProbe(
+        NONCONFORMANT_SHAPES['a full page whose cursor never advances']!.serve,
+      );
+      await catchUpTopic({ plugin, topic: T, limit: 1_000, readState, seen: new SeenSet() });
+      expect(calls.length).toBeLessThan(5);
+      expect(new ReadStateStore(path).get(T)).toBe('stuck');
+    });
   });
 
   it('catchUpAll loops over every configured topic', async () => {

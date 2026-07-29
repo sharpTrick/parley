@@ -21,6 +21,20 @@ export function buildReactiveServer(deps: ToolDeps): McpServer {
   return server;
 }
 
+/**
+ * Tear one per-request object down without letting its failure escape. Keep the WHOLE call inside
+ * the try, so that a `close` which throws synchronously — or rejects a tick later, as a transport
+ * over an already-destroyed socket does — cannot become an unhandledRejection: this runs from a
+ * response `close` event, where nothing is awaiting it and Node would take the process down.
+ */
+async function closeQuietly(what: string, target: { close: () => Promise<void> }): Promise<void> {
+  try {
+    await target.close();
+  } catch (err) {
+    console.error(`[parley] ${what} close failed:`, err);
+  }
+}
+
 export interface RemoteHttpOptions {
   /** Middleware protecting the /mcp route (e.g. requireBearerAuth). Default: FAIL CLOSED (401). */
   protect?: RequestHandler;
@@ -118,8 +132,8 @@ export function createRemoteHttpApp(
         enableJsonResponse: true,
       });
       res.on('close', () => {
-        void transport.close();
-        void server.close();
+        void closeQuietly('transport', transport);
+        void closeQuietly('reactive server', server);
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
@@ -175,14 +189,19 @@ export function createRemoteHttpApp(
         s.once('error', reject);
         httpServer = s;
       }),
+    // Keep close() a no-op on a server that is not up — never listened on, bind failed, or already
+    // closed — so that a `try { await listen() } finally { await close() }` root, or a signal
+    // handler racing an explicit shutdown, cannot turn teardown into a fatal
+    // ERR_SERVER_NOT_RUNNING. Dropping the reference is what makes it both idempotent and
+    // re-listenable.
     close: async () => {
       await presence?.stop().catch(() => {}); // best-effort goodbye, never blocks the close
+      presence = undefined;
+      const s = httpServer;
+      httpServer = undefined;
+      if (s === undefined || !s.listening) return;
       await new Promise<void>((resolve, reject) => {
-        if (httpServer === undefined) {
-          resolve();
-          return;
-        }
-        httpServer.close((e) => (e ? reject(e) : resolve()));
+        s.close((e) => (e ? reject(e) : resolve()));
       });
     },
   };

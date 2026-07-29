@@ -107,7 +107,7 @@ describe('remote HTTP: listen() rejects on a bind error', () => {
       // The whole point: this must REJECT, not resolve a server whose address() is null.
       await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
     } finally {
-      await app.close().catch(() => {});
+      await app.close();
       await p.disconnect();
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
@@ -123,7 +123,7 @@ describe('remote HTTP: listen() rejects on a bind error', () => {
       const s = await app.listen(0);
       expect(s.address()).not.toBeNull();
     } finally {
-      await app.close().catch(() => {});
+      await app.close();
       await p.disconnect();
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
@@ -156,6 +156,57 @@ describe('remote HTTP: listen() rejects on a bind error', () => {
     expect(settled).toBe('resolved');
     await app.close();
     await p.disconnect();
+  });
+});
+
+/**
+ * Teardown is called on paths nobody chose: a `try { await listen() } finally { await close() }`
+ * root, a signal handler racing an explicit shutdown, a retry after a failed bind. Table the ORDERS
+ * `listen`/`close` can arrive in and require every close() to RESOLVE — and no presence loop to
+ * survive it. Cleanup here deliberately does NOT swallow: a `close()` that rejects is the defect,
+ * and a `.catch(() => {})` in cleanup is what let it ship.
+ */
+describe('remote HTTP: close() resolves in whatever order the lifecycle runs', () => {
+  type Op = 'listen-ok' | 'listen-fail' | 'close';
+
+  const SEQUENCES: Array<[name: string, ops: Op[]]> = [
+    ['close before any listen', ['close']],
+    ['a failed bind, then close', ['listen-fail', 'close']],
+    ['listen, close, close again', ['listen-ok', 'close', 'close']],
+    ['listen, close, listen again, close', ['listen-ok', 'close', 'listen-ok', 'close']],
+    ['a failed bind, a good one, then close', ['listen-fail', 'listen-ok', 'close']],
+  ];
+
+  it.each(SEQUENCES)('%s', async (_name, ops) => {
+    const blocker = createHttpServer();
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+    const taken = (blocker.address() as AddressInfo).port;
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
+    });
+    const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+    const beatCount = async (): Promise<number> =>
+      (await p.fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) })).messages.length;
+    const bound: Array<Awaited<ReturnType<typeof app.listen>>> = [];
+    try {
+      for (const op of ops) {
+        if (op === 'listen-ok') bound.push(await app.listen(0));
+        else if (op === 'listen-fail') {
+          await expect(app.listen(taken)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+        } else await app.close();
+      }
+      for (const s of bound) expect(s.listening).toBe(false);
+      const atStop = await beatCount();
+      await new Promise((resolve) => setTimeout(resolve, 80)); // several heartbeat cadences
+      expect(await beatCount()).toBe(atStop);
+    } finally {
+      await p.disconnect();
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
   });
 });
 
@@ -330,7 +381,7 @@ describe('presence is announced only once the transport is actually live', () =>
     await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
     await settle();
     expect(await beats(p)).toEqual([]);
-    await app.close().catch(() => {});
+    await app.close();
     await p.disconnect();
     await new Promise<void>((resolve) => blocker.close(() => resolve()));
   });

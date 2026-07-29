@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { asHandle, asTopic } from '../message.js';
+import { asCursor, asHandle, asTopic, type Cursor } from '../message.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { fetchRecentBlocking } from './blocking-fetch.js';
+import {
+  NONCONFORMANT_SHAPE_NAMES,
+  NONCONFORMANT_SHAPES,
+  pagingProbe,
+} from '../testing/nonconformant.js';
+import { FetchAbortedError, fetchRecentBlocking } from './blocking-fetch.js';
 
 const SENDER = asHandle('writer');
 
@@ -175,23 +180,42 @@ describe('fetchRecentBlocking', () => {
       'after several poll iterations': (ac: AbortController) => setTimeout(() => ac.abort(), 120).unref?.(),
     };
 
+    // `since` is a DIMENSION, not a constant: the tool explicitly invites a `since`-less long poll
+    // ("Omit for the recent window"), and that is the column where no page has landed yet and no
+    // cursor exists to hand back — so cancellation there cannot be a `nextCursor` at all.
+    const starts = {
+      'a since at the tail': (tail: Cursor): { since?: Cursor } => ({ since: tail }),
+      'no since': (): { since?: Cursor } => ({}),
+    };
+
     for (const [flavour, make] of Object.entries(flavours)) {
       for (const [when, fire] of Object.entries(timings)) {
-        it(`${flavour} × aborted ${when}`, async () => {
-          const plugin = make();
-          const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
-          const ac = new AbortController();
-          fire(ac);
-          const t0 = Date.now();
-          const res = await fetchRecentBlocking(
-            plugin,
-            { topic: T, since: tail },
-            { blockMs: BUDGET_MS, pollIntervalMs: 40, signal: ac.signal },
-          );
-          expect(Date.now() - t0).toBeLessThan(BOUND_MS);
-          expect(res.messages).toEqual([]);
-          expect(res.nextCursor).toBe(tail); // stable and replayable — the caller's own position
-        });
+        for (const [start, argsFor] of Object.entries(starts)) {
+          it(`${flavour} × aborted ${when} × ${start}`, async () => {
+            const plugin = make();
+            const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+            const ac = new AbortController();
+            fire(ac);
+            const t0 = Date.now();
+            const outcome = await fetchRecentBlocking(
+              plugin,
+              { topic: T, ...argsFor(tail) },
+              { blockMs: BUDGET_MS, pollIntervalMs: 40, signal: ac.signal },
+            ).then(
+              (res) => ({ res }),
+              (err: unknown) => ({ err }),
+            );
+            expect(Date.now() - t0).toBeLessThan(BOUND_MS);
+            if ('err' in outcome) {
+              // Cancelled before any page landed: recognisable as a cancellation, never as a
+              // backend failure, so the tool layer can answer it like an empty window.
+              expect(outcome.err).toBeInstanceOf(FetchAbortedError);
+              return;
+            }
+            expect(outcome.res.messages).toEqual([]);
+            expect(outcome.res.nextCursor).toBe(tail); // stable and replayable — the caller's position
+          });
+        }
       }
 
       it(`${flavour} × never aborted still spends the whole budget`, async () => {
@@ -346,6 +370,71 @@ describe('fetchRecentBlocking', () => {
       for (let i = 0; i < 4; i++) await clock.advance(250);
       await pending;
       expect(calls).toHaveLength(expectedCalls);
+    });
+  });
+
+  /**
+   * Advancing `since` to each page's `nextCursor` is what keeps the next wait exclusive of the tail
+   * and what lets a natively-blocking plugin park instead of busy-polling — and a call-COUNT
+   * assertion is identical with or without it. Pin the `since` threaded into every successive call,
+   * across a plugin whose empty-page cursor advances and one whose does not.
+   */
+  describe('every poll resumes from the previous page cursor', () => {
+    const T = asTopic('room');
+    const CURSORS = {
+      'a cursor that advances on every empty page': (call: number) => asCursor(`fresh-${call}`),
+      'a cursor that stands still on an empty page': () => asCursor('tail'),
+    };
+
+    for (const [flavour, cursorFor] of Object.entries(CURSORS)) {
+      it.each([
+        ['no since', undefined],
+        ['a since at the tail', asCursor('tail')],
+      ] as Array<[string, Cursor | undefined]>)(`${flavour}, starting from %s`, async (_name, start) => {
+        const { plugin, calls } = pagingProbe((_a, call) => ({
+          messages: [],
+          nextCursor: cursorFor(call),
+        }));
+        const clock = fakeClock();
+
+        const pending = fetchRecentBlocking(
+          plugin,
+          start === undefined ? { topic: T } : { topic: T, since: start },
+          { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep },
+        );
+        await flush();
+        for (let i = 0; i < 4; i++) await clock.advance(250);
+        await pending;
+
+        expect(calls.length).toBeGreaterThan(1);
+        expect(calls.map((c) => c.since)).toEqual([
+          start,
+          ...calls.slice(0, -1).map((_c, i) => cursorFor(i)),
+        ]);
+      });
+    }
+  });
+
+  /**
+   * The same non-conformant backend shapes the catch-up driver is run against: the long poll is the
+   * other loop a plugin's own data drives, so it has to stay bounded against all of them too.
+   */
+  describe('a non-conformant backend cannot wedge the long poll', () => {
+    const T = asTopic('room');
+
+    it.each(NONCONFORMANT_SHAPE_NAMES)('%s', async (name) => {
+      const { plugin, calls } = pagingProbe(NONCONFORMANT_SHAPES[name]!.serve);
+      const clock = fakeClock();
+
+      const pending = fetchRecentBlocking(
+        plugin,
+        { topic: T },
+        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep },
+      );
+      await flush();
+      for (let i = 0; i < 6; i++) await clock.advance(250);
+      await pending; // the assertion is that this settles at all
+      expect(calls.length).toBeLessThanOrEqual(6);
     });
   });
 

@@ -4,9 +4,10 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../engine/presence.js';
+import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
-import { NoSuchTopicError } from '../seam.js';
+import { NoSuchTopicError, type FetchRecentArgs } from '../seam.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { registerTools, toolDepsFor } from './tools.js';
@@ -196,79 +197,177 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
   const NOW = 1_000_000;
   const TTL = 90_000;
 
-  it('lists an online participant from presence beats, with no real post needed', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
+  type Beat = [handle: string, topics: string[], kind: PresenceKind, ago: number, postTopics?: string[]];
+  interface Scope {
+    topics?: string[];
+    postPatterns?: string[];
+  }
+
+  /** A harness at a fixed clock, seeded with presence beats `ago` ms before NOW. */
+  async function roster(beats: Beat[], scope: Scope = {}) {
+    const h = await harness({
+      now: () => NOW,
+      presenceTtlMs: TTL,
+      topics: scope.topics,
+      postPatterns: scope.postPatterns,
+    });
+    for (const [handle, topics, kind, ago, postTopics] of beats) {
+      await postBeat(h.plugin, handle, topics, kind, NOW - ago, postTopics ?? []);
+    }
+    return h;
+  }
+
+  async function listed(
+    client: Client,
+    args: Record<string, unknown>,
+  ): Promise<Array<[handle: string, online: boolean]>> {
+    const out = parse(await client.callTool({ name: 'parley_list_users', arguments: args })) as RosterResult;
+    return out.users.map((u) => [u.handle, u.online]);
+  }
+
+  /**
+   * The roster is a function of (beats x options), and every option interacts with the sort: each row
+   * therefore pins ORDER as well as membership, so the most-recently-seen-first sort is falsifiable
+   * rather than riding along. The final three rows are option PAIRS that no case covered — where a
+   * regression would land in the gap between two green single-option tests.
+   */
+  const ROWS: Array<
+    [name: string, beats: Beat[], args: Record<string, unknown>, expected: Array<[string, boolean]>, scope?: Scope]
+  > = [
+    ['an online peer needs no real post', [['claude-a', ['ctx'], 'hello', 1_000]], {}, [['claude-a', true]]],
+    [
+      'the glob filter selects by handle',
+      [['claude-a', ['ctx'], 'heartbeat', 1_000], ['human-x', ['ctx'], 'heartbeat', 1_000]],
+      { filter: 'claude-*' },
+      [['claude-a', true]],
+    ],
+    [
+      'a beat past the TTL is listed as offline, after the online peers',
+      [['stale', ['ctx'], 'heartbeat', TTL + 1], ['fresh', ['ctx'], 'heartbeat', 1_000]],
+      {},
+      [['fresh', true], ['stale', false]],
+    ],
+    [
+      'online_only drops the offline peer',
+      [['stale', ['ctx'], 'heartbeat', TTL + 1], ['fresh', ['ctx'], 'heartbeat', 1_000]],
+      { online_only: true },
+      [['fresh', true]],
+    ],
+    [
+      'a peer that said goodbye is offline but still reachable',
+      [['awake', ['ctx'], 'heartbeat', 1_000], ['napping', ['ctx'], 'goodbye', 5_000]],
+      {},
+      [['awake', true], ['napping', false]],
+    ],
+    [
+      'since_ms bounds how far back offline peers are included',
+      [['recent', ['ctx'], 'goodbye', 10_000], ['ancient', ['ctx'], 'goodbye', 5_000_000]],
+      { since_ms: 60_000 },
+      [['recent', false]],
+    ],
+    [
+      'limit caps the roster AFTER the most-recently-seen-first sort',
+      [
+        ['a', ['ctx'], 'heartbeat', 3_000],
+        ['b', ['ctx'], 'heartbeat', 1_000],
+        ['c', ['ctx'], 'heartbeat', 2_000],
+      ],
+      { limit: 2 },
+      [['b', true], ['c', true]],
+    ],
+    [
+      'a peer advertising only topics I do not subscribe to is excluded',
+      [['stranger', ['some-other-ctx'], 'hello', 1_000]],
+      {},
+      [],
+    ],
+    [
+      'a peer I can reach only through my own post pattern is included',
+      [['peer', ['ctx-theirs'], 'hello', 1_000]],
+      {},
+      [['peer', true]],
+      { topics: ['ctx-mine'], postPatterns: ['ctx-.*'] },
+    ],
+    [
+      'a peer whose advertised pattern reaches a topic I subscribe to is included',
+      [['peer', ['ctx-theirs'], 'hello', 1_000, ['ctx-.*']]],
+      {},
+      [['peer', true]],
+      { topics: ['ctx-mine'] },
+    ],
+    [
+      'a peer with no shared channel in either direction is excluded',
+      [['stranger', ['other'], 'hello', 1_000, ['unrelated-.*']]],
+      {},
+      [],
+      { topics: ['ctx'] },
+    ],
+    [
+      'topic scopes the roster to that topic',
+      [['claude-a', ['ctx'], 'hello', 1_000], ['claude-b', ['ctx-reviews'], 'hello', 1_000]],
+      { topic: 'ctx' },
+      [['claude-a', true]],
+    ],
+    [
+      'a pattern-allowed topic is a valid scope',
+      [['claude-a', ['ctx-adhoc'], 'hello', 1_000]],
+      { topic: 'ctx-adhoc' },
+      [['claude-a', true]],
+      { postPatterns: ['ctx-.*'] },
+    ],
+    [
+      'a scope includes peers who can POST there, not only its subscribers',
+      [['poster', ['elsewhere'], 'hello', 1_000, ['ctx-.*']], ['subber', ['ctx-adhoc'], 'hello', 1_000]],
+      { topic: 'ctx-adhoc' },
+      [['poster', true], ['subber', true]], // equal lastSeenMs ⇒ handle-ascending tiebreak
+      { postPatterns: ['ctx-.*'] },
+    ],
+    [
+      'online_only x since_ms: the window cannot resurrect an offline peer',
+      [
+        ['fresh', ['ctx'], 'heartbeat', 1_000],
+        ['recently-gone', ['ctx'], 'heartbeat', TTL + 1],
+        ['ancient', ['ctx'], 'goodbye', 5_000_000],
+      ],
+      { online_only: true, since_ms: 5_000_000 },
+      [['fresh', true]],
+    ],
+    [
+      'filter x limit: the cap applies to the FILTERED roster',
+      [
+        ['claude-a', ['ctx'], 'heartbeat', 3_000],
+        ['claude-b', ['ctx'], 'heartbeat', 1_000],
+        ['human-x', ['ctx'], 'heartbeat', 2_000],
+      ],
+      { filter: 'claude-*', limit: 1 },
+      [['claude-b', true]],
+    ],
+    [
+      'scope x online_only: both narrow, neither overrides the other',
+      [
+        ['on-scope-live', ['ctx'], 'heartbeat', 1_000],
+        ['on-scope-stale', ['ctx'], 'heartbeat', TTL + 1],
+        ['off-scope-live', ['ctx-reviews'], 'heartbeat', 500],
+      ],
+      { topic: 'ctx', online_only: true },
+      [['on-scope-live', true]],
+    ],
+  ];
+
+  it.each(ROWS)('%s', async (_name, beats, args, expected, scope) => {
+    const { client } = await roster(beats, scope);
+    expect(await listed(client, args)).toEqual(expected);
+  });
+
+  it("surfaces a peer's full entry: handle, online, topics, postTopics, lastSeenMs", async () => {
+    const { client } = await roster([['claude-a', ['ctx'], 'hello', 1_000, ['ctx-.*']]], { topics: ['ctx'] });
+    const out = parse(await client.callTool({ name: 'parley_list_users', arguments: {} })) as RosterResult;
     expect(out).toEqual({
       users: [
-        { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: [], lastSeenMs: NOW - 1_000 },
+        { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: ['ctx-.*'], lastSeenMs: NOW - 1_000 },
       ],
       truncated: false,
     });
-  });
-
-  it('applies the glob filter over handles', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'claude-a', ['ctx'], 'heartbeat', NOW - 1_000);
-    await postBeat(plugin, 'human-x', ['ctx'], 'heartbeat', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { filter: 'claude-*' } }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['claude-a']);
-  });
-
-  it('lists a beyond-TTL handle as offline (reachability), and online_only hides it', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    await postBeat(plugin, 'stale', ['ctx'], 'heartbeat', NOW - TTL - 1); // past TTL ⇒ offline
-    await postBeat(plugin, 'fresh', ['ctx'], 'heartbeat', NOW - 1_000); //   within TTL ⇒ online
-    const all = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(all.users.map((u) => [u.handle, u.online])).toEqual([
-      ['fresh', true],
-      ['stale', false],
-    ]);
-    const onlyLive = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { online_only: true } }),
-    ) as RosterResult;
-    expect(onlyLive.users.map((u) => u.handle)).toEqual(['fresh']);
-  });
-
-  it('includes an offline-but-recently-seen peer, tagged online:false and sorted after online peers', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    await postBeat(plugin, 'awake', ['ctx'], 'heartbeat', NOW - 1_000);
-    await postBeat(plugin, 'napping', ['ctx'], 'goodbye', NOW - 5_000); // departed ⇒ offline, still recent
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users.map((u) => [u.handle, u.online])).toEqual([
-      ['awake', true],
-      ['napping', false],
-    ]);
-  });
-
-  it('since_ms bounds how far back offline peers are included', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    await postBeat(plugin, 'recent', ['ctx'], 'goodbye', NOW - 10_000);
-    await postBeat(plugin, 'ancient', ['ctx'], 'goodbye', NOW - 5_000_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { since_ms: 60_000 } }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['recent']); // 'ancient' is beyond the 60s window
-  });
-
-  it('limit caps the roster after the most-recently-seen-first sort', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    await postBeat(plugin, 'a', ['ctx'], 'heartbeat', NOW - 3_000);
-    await postBeat(plugin, 'b', ['ctx'], 'heartbeat', NOW - 1_000); // freshest
-    await postBeat(plugin, 'c', ['ctx'], 'heartbeat', NOW - 2_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { limit: 2 } }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['b', 'c']); // top-2 most recent
   });
 
   it('flags truncated when the scanned presence history fills the page', async () => {
@@ -283,157 +382,39 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     expect(out.truncated).toBe(true);
   });
 
-  it('ignores real-topic senders (presence stream is isolated)', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
+  it('ignores real-topic senders (the presence stream is isolated)', async () => {
+    const { client, plugin } = await roster([]);
     await plugin.post(asTopic('ctx'), asHandle('chatty'), 'a real message'); // NOT a presence beat
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users).toEqual([]);
-  });
-
-  it('excludes a handle advertising only topics we do not subscribe to', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'stranger', ['some-other-ctx'], 'hello', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users).toEqual([]);
-  });
-
-  it('includes a peer subscribed to a topic I can POST to via my post pattern (the fresh-onboard case)', async () => {
-    // I subscribe only to my own unique topic — no subscribed-topic overlap with anyone — but my
-    // post pattern reaches the peer's topic, so it IS a viable hand-off target. (msg-2539 fix.)
-    const { client, plugin } = await harness({
-      now: () => NOW,
-      presenceTtlMs: TTL,
-      topics: ['ctx-mine'],
-      postPatterns: ['ctx-.*'],
-    });
-    await postBeat(plugin, 'peer', ['ctx-theirs'], 'hello', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['peer']);
-  });
-
-  it('includes a peer whose advertised post-pattern can reach a topic I subscribe to (inbound reach)', async () => {
-    // I have no post patterns, so I cannot reach the peer's topic; but the peer advertises it can
-    // post to ctx-.*, which covers my subscribed topic — a one-way channel INTO me still counts.
-    const { client, plugin } = await harness({
-      now: () => NOW,
-      presenceTtlMs: TTL,
-      topics: ['ctx-mine'],
-    });
-    await postBeat(plugin, 'peer', ['ctx-theirs'], 'hello', NOW - 1_000, ['ctx-.*']);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['peer']);
-  });
-
-  it('excludes a peer with no shared channel in either direction', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    // Peer subscribes elsewhere and can only post to unrelated topics — neither can reach the other.
-    await postBeat(plugin, 'stranger', ['other'], 'hello', NOW - 1_000, ['unrelated-.*']);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users).toEqual([]);
-  });
-
-  it("surfaces a peer's advertised postTopics in its roster entry", async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000, ['ctx-.*']);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users).toEqual([
-      { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: ['ctx-.*'], lastSeenMs: NOW - 1_000 },
-    ]);
+    expect(await listed(client, {})).toEqual([]);
   });
 
   it('ignores an un-compilable / over-long peer post-pattern without crashing (untrusted input)', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
     // A hostile beat: a broken regex source plus a huge one. Neither should reach me, and the call
     // must not throw — the peer has no subscribed overlap and no valid pattern that covers 'ctx'.
-    await postBeat(plugin, 'hostile', ['other'], 'hello', NOW - 1_000, ['(', 'x'.repeat(10_000)]);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(out.users).toEqual([]);
-  });
-
-  it('a beat of 64 nested-quantifier postTopics does not hang list_users (bounded time)', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    // A hostile peer plants the maximum 64 catastrophic-backtracking regex sources on the presence
-    // topic (raw backend write — outside the tool allowlist), then the reader calls list_users. On
-    // the unfixed code this `.test` loop never returns; the ReDoS screen must make the call resolve
-    // in bounded wall-clock time (the wall-clock assertion, not a green suite, is the proof).
-    const evil = '((([a-z-]+)+)+)+[0-9]';
-    await postBeat(plugin, 'attacker', ['some-other-ctx'], 'hello', NOW - 1_000, Array<string>(64).fill(evil));
-    const t0 = performance.now();
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
-    expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
-  });
-
-  it('a beat of 64 BOUNDED exact-count nested postTopics also does not hang list_users', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` uses no unbounded OUTER quantifier
-    // (only `*` inside a bounded exact `{40}`), so it slipped the earlier screen, yet V8 unrolls the
-    // `{40}` into 40 sequential `*`-bodies and the `.test` hangs the whole loop for tens of seconds on
-    // the reader's own short topic. The hardened screen rejects a risky body repeated `>= 2` times, so
-    // the call must resolve in bounded wall-clock time (the assertion, not a green suite, is the proof).
-    const evil = '([a-z-]*){40}[0-9]';
-    await postBeat(plugin, 'attacker', ['some-other-ctx'], 'hello', NOW - 1_000, Array<string>(64).fill(evil));
-    const t0 = performance.now();
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: {} }),
-    ) as RosterResult;
-    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
-    expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
-  });
-
-  it('scopes to a single topic when `topic` is given', async () => {
-    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
-    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', NOW - 1_000);
-    await postBeat(plugin, 'claude-b', ['ctx-reviews'], 'hello', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx' } }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['claude-a']);
-  });
-
-  it('scopes by a pattern-allowed topic (a peer may advertise a topic we only match)', async () => {
-    const { client, plugin } = await harness({
-      now: () => NOW,
-      presenceTtlMs: TTL,
-      postPatterns: ['ctx-.*'],
+    const { client } = await roster([['hostile', ['other'], 'hello', 1_000, ['(', 'x'.repeat(10_000)]]], {
+      topics: ['ctx'],
     });
-    await postBeat(plugin, 'claude-a', ['ctx-adhoc'], 'hello', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
-    ) as RosterResult;
-    expect(out.users.map((u) => u.handle)).toEqual(['claude-a']);
+    expect(await listed(client, {})).toEqual([]);
   });
 
-  it('scopes to peers who can POST to the topic, not only its subscribers', async () => {
-    const { client, plugin } = await harness({
-      now: () => NOW,
-      presenceTtlMs: TTL,
-      postPatterns: ['ctx-.*'], // makes 'ctx-adhoc' a valid scope for me to query
-    });
-    // 'poster' does not subscribe to ctx-adhoc but advertises it can post there; 'subber' subscribes.
-    await postBeat(plugin, 'poster', ['elsewhere'], 'hello', NOW - 1_000, ['ctx-.*']);
-    await postBeat(plugin, 'subber', ['ctx-adhoc'], 'hello', NOW - 1_000);
-    const out = parse(
-      await client.callTool({ name: 'parley_list_users', arguments: { topic: 'ctx-adhoc' } }),
-    ) as RosterResult;
-    // Same lastSeenMs ⇒ handle-ascending tiebreak.
-    expect(out.users.map((u) => u.handle)).toEqual(['poster', 'subber']);
+  /**
+   * A hostile peer plants the maximum 64 catastrophic-backtracking regex sources on the presence
+   * topic (a raw backend write, outside the tool allowlist), then the reader calls list_users. On
+   * unscreened code the `.test` loop never returns; the WALL-CLOCK bound, not a green suite, is the
+   * proof. Both shapes are here because the second slipped the screen the first one motivated:
+   * `{40}` has no unbounded outer quantifier, yet V8 unrolls it into 40 sequential `*`-bodies.
+   */
+  it.each([
+    ['an unbounded nested quantifier', '((([a-z-]+)+)+)+[0-9]'],
+    ['a BOUNDED exact-count nested quantifier', '([a-z-]*){40}[0-9]'],
+  ])('a beat of 64 postTopics carrying %s does not hang list_users', async (_label, evil) => {
+    const { client } = await roster(
+      [['attacker', ['some-other-ctx'], 'hello', 1_000, Array<string>(64).fill(evil)]],
+      { topics: ['ctx'] },
+    );
+    const t0 = performance.now();
+    expect(await listed(client, {})).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
+    expect(performance.now() - t0).toBeLessThan(1_000); // unfixed: never returns
   });
 
   it('rejects a topic outside the allowlist', async () => {
@@ -513,6 +494,110 @@ describe('post_topics regex patterns + presence reservation', () => {
       expect(res.isError).toBe(true);
       expect(res.content[0]!.text).toContain('topic not allowed');
     }
+  });
+});
+
+/**
+ * `block_ms` is the one tool argument whose description used to describe a DIFFERENT behaviour than
+ * the handler's: core blocks out the whole budget on any empty window, with or without a `since`
+ * (pinned in blocking-fetch.test.ts), while the text told the agent blocking was `since`-relative and
+ * that a bare call "returns immediately". An agent that believes the text issues an unqualified
+ * `block_ms` for a quick peek and stalls for a minute. Assert the two together: the behaviour of each
+ * cell, and that the rendered description does not contradict it.
+ */
+describe('the fetch_recent description says what the handler does', () => {
+  async function fetchRecentTool(client: Client) {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === 'parley_fetch_recent')!;
+    const props = tool.inputSchema.properties as Record<string, { description?: string }>;
+    return { summary: tool.description ?? '', block: props.block_ms?.description ?? '', limit: props.limit?.description ?? '' };
+  }
+
+  it('describes blocking as window-driven, not `since`-driven', async () => {
+    const { client } = await harness();
+    const { summary, block } = await fetchRecentTool(client);
+    const text = `${summary} ${block}`;
+    expect(text).toContain('whether or not you passed `since`');
+    // The claims the handler contradicts. Their absence is the whole point of this case.
+    expect(text).not.toContain('nothing is newer than `since`');
+    expect(text).not.toContain('with a `since` at the tail');
+  });
+
+  it.each([
+    ['no since, topic has messages', false, true, 'at once'],
+    ['no since, topic is empty', false, false, 'blocks'],
+    ['a since at the tail', true, false, 'blocks'],
+  ] as Array<[string, boolean, boolean, 'at once' | 'blocks']>)(
+    '%s → %s',
+    async (_name, withSince, seeded, expectation) => {
+      const { client, plugin } = await harness({ blockMaxMs: 120, blockPollIntervalMs: 20 });
+      if (seeded) await plugin.post(asTopic('ctx'), asHandle('bob'), 'old');
+      const args: Record<string, unknown> = { topic: 'ctx', block_ms: 10_000 };
+      if (withSince) args.since = '1';
+      const t0 = performance.now();
+      await client.callTool({ name: 'parley_fetch_recent', arguments: args });
+      const elapsed = performance.now() - t0;
+      if (expectation === 'at once') expect(elapsed).toBeLessThan(100);
+      else expect(elapsed).toBeGreaterThanOrEqual(100); // held the (clamped) budget
+    },
+  );
+});
+
+/**
+ * Tool arguments arrive from a model whose context is untrusted inbound message content, so every
+ * numeric one needs a server-side ceiling — `block_ms` had one, `limit` did not, and core walks a
+ * result twice (serialisation, then the dedup warm-up that can flush the seen-set). Assert against
+ * the cap the DESCRIPTION advertises rather than against the constant, so the two cannot drift apart.
+ */
+describe('every numeric tool argument is bounded before it reaches the backend', () => {
+  const VALUES = [1, 100, 10_000, Number.MAX_SAFE_INTEGER];
+
+  it.each(VALUES)('parley_fetch_recent with limit=%d and block_ms=%d', async (value) => {
+    const { client, plugin } = await harness({ blockMaxMs: 40, blockPollIntervalMs: 20 });
+    const seen: FetchRecentArgs[] = [];
+    const orig = plugin.fetchRecent.bind(plugin);
+    plugin.fetchRecent = async (a: FetchRecentArgs) => {
+      seen.push(a);
+      return orig(a);
+    };
+    const { tools } = await client.listTools();
+    const props = (tools.find((t) => t.name === 'parley_fetch_recent')!.inputSchema.properties ??
+      {}) as Record<string, { description?: string }>;
+    const advertised = Number(/capped server-side at (\d+)/.exec(props.limit?.description ?? '')![1]);
+
+    await client.callTool({
+      name: 'parley_fetch_recent',
+      arguments: { topic: 'ctx', limit: value, block_ms: value },
+    });
+
+    expect(seen.length).toBeGreaterThan(0);
+    for (const call of seen) {
+      expect(call.limit).toBeLessThanOrEqual(advertised);
+      expect(call.limit).toBeLessThanOrEqual(value); // clamped, never inflated
+      expect(call.blockMs ?? 0).toBeLessThanOrEqual(40); // the configured block_max_ms
+    }
+  });
+
+  it.each(VALUES)('parley_list_users with limit=%d and since_ms=%d', async (value) => {
+    const { client, plugin } = await harness({ now: () => 1_000_000, presenceTtlMs: 90_000 });
+    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', 999_000);
+    const seen: FetchRecentArgs[] = [];
+    const orig = plugin.fetchRecent.bind(plugin);
+    plugin.fetchRecent = async (a: FetchRecentArgs) => {
+      seen.push(a);
+      return orig(a);
+    };
+
+    const out = parse(
+      await client.callTool({
+        name: 'parley_list_users',
+        arguments: { limit: value, since_ms: value },
+      }),
+    ) as RosterResult;
+
+    // The roster's cost is fixed by the presence page, whatever the caller asks for.
+    for (const call of seen) expect(call.limit).toBe(500);
+    expect(out.users.length).toBeLessThanOrEqual(Math.min(value, 500));
   });
 });
 
@@ -615,6 +700,24 @@ describe('every tool honours NoSuchTopicError identically', () => {
   ])('%s reports the sentinel as an error — a write that did not happen is not a success', async (name, args) => {
     const res = await callWith(name, args, 'post', sentinel);
     expect(res.isError).toBe(true);
+  });
+
+  /**
+   * A long-poll the client cancelled before any page landed cannot carry a cursor (core never mints
+   * one), so the wrapper raises {@link FetchAbortedError}. That is a cancellation, not a backend
+   * failure: the handler must answer it like any other empty window rather than an isError.
+   */
+  it('a cancelled long-poll is reported as an empty window, not an error', async () => {
+    const { client, plugin } = await harness();
+    plugin.fetchRecent = async () => {
+      throw new FetchAbortedError();
+    };
+    const res = (await client.callTool({
+      name: 'parley_fetch_recent',
+      arguments: { topic: 'ctx', block_ms: 500 },
+    })) as ToolText;
+    expect(res.isError).toBeFalsy();
+    expect(parse(res)).toEqual({ messages: [] });
   });
 
   it('an absent topic hands back a replayable position, not an invented cursor', async () => {

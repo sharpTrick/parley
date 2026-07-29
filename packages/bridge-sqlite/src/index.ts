@@ -58,8 +58,9 @@ export const PRUNE_BATCH = 5_000;
 /**
  * Largest page `fetchRecent` will serve. The driver is synchronous, and `limit` reaches it from a
  * model whose context is untrusted inbound content, so an unbounded page is a whole-bridge stall.
- * Keep a larger `limit` REJECTED rather than clamped, so that a page shorter than the one asked for
- * always means the topic is exhausted — the test core's catch-up driver stops on.
+ * Keep a larger `limit` REJECTED rather than clamped, so that no caller which reads a short page as
+ * "topic exhausted" can be handed one. Core's driver no longer makes that inference, but the seam
+ * promises only that `limit` is a maximum, so a clamp stays unsafe for any caller that does.
  */
 export const MAX_PAGE = 10_000;
 /** Page size when a caller supplies no `limit`. */
@@ -546,8 +547,8 @@ function normalizeLimit(limit: number | undefined, topic: Topic): number {
       `parley-sqlite: invalid limit ${describe(limit)} for topic ${topic} — expected an integer ` +
         `between 1 and ${MAX_PAGE}; lower config \`catchup.limit\` (or the parley_fetch_recent ` +
         `\`limit\` argument) to at most ${MAX_PAGE} (SQLite reads a negative LIMIT as "no limit"; ` +
-        `a page above ${MAX_PAGE} would come back short, which a caller cannot tell from an ` +
-        `exhausted topic)`,
+        `a page above ${MAX_PAGE} would come back short, which a caller that stops on a short ` +
+        `page cannot tell from an exhausted topic)`,
     );
   }
   return limit;

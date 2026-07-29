@@ -1,6 +1,11 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
+import { parseConfig } from '../config.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
-import { channelMeta } from './channel-emit.js';
+import { FakePlugin } from '../testing/fake-plugin.js';
+import { CHANNEL_NOTIFICATION_METHOD, channelMeta } from './channel-emit.js';
+import { buildBridge } from './stdio-bridge.js';
 
 const msg = (over: Partial<Message> = {}): Message => ({
   topic: asTopic('ctx-payments'),
@@ -11,6 +16,39 @@ const msg = (over: Partial<Message> = {}): Message => ({
   cursor: asCursor('7'),
   mentions: [asHandle('bob')],
   ...over,
+});
+
+/**
+ * These strings ARE the contract with Claude Code, fixed at the mandatory channel-docs gate.
+ * Asserting them against the constants that define them is a tautology: a typo in the notification
+ * method renders no `<channel>` event at all — live push silently does nothing while catch-up keeps
+ * working — and the suite stays green. Every externally visible protocol string core emits is pinned
+ * here against a hard-coded literal instead. (The meta KEYS are pinned the same way below, and the
+ * `experimental` capability's presence/absence by the loopback example and http.test.ts.)
+ */
+describe('the wire strings are literals, taken from the channels reference', () => {
+  it('the channel notification method', () => {
+    expect(CHANNEL_NOTIFICATION_METHOD).toBe('notifications/claude/channel');
+  });
+
+  it('the server identity and capability key the dual-role bridge declares', async () => {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    const bridge = await buildBridge(
+      plugin,
+      parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'], presence: { enabled: false } }),
+    );
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
+    await Promise.all([bridge.attach(serverT), client.connect(clientT)]);
+    try {
+      expect(client.getServerVersion()?.name).toBe('parley');
+      expect(client.getServerCapabilities()?.experimental).toEqual({ 'claude/channel': {} });
+    } finally {
+      await client.close();
+      await bridge.shutdown();
+    }
+  });
 });
 
 describe('channelMeta', () => {

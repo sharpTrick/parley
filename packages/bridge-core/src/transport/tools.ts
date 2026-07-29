@@ -3,7 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
-import { fetchRecentBlocking } from '../engine/blocking-fetch.js';
+import { FetchAbortedError, fetchRecentBlocking } from '../engine/blocking-fetch.js';
 import { computeRoster, filterReachable } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { filterHandles, MAX_GLOB_LEN } from '../identity-filter.js';
@@ -16,7 +16,8 @@ import {
   type Handle,
   type Topic,
 } from '../message.js';
-import { NoSuchTopicError, type BackendPlugin, type FetchRecentArgs } from '../seam.js';
+import { isNoSuchTopicError } from '../no-such-topic.js';
+import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
 
 /**
  * How many recent presence messages to scan when building the roster. At the default 10-min
@@ -31,6 +32,14 @@ const PRESENCE_FETCH_LIMIT = 500;
  * seen and still surface as `online: false`. Bounded in practice by {@link PRESENCE_FETCH_LIMIT}.
  */
 const DEFAULT_ROSTER_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Server-side ceiling on `parley_fetch_recent`'s `limit`. The value arrives from a model whose
+ * context is untrusted inbound message content, and core then walks the whole result twice
+ * (serialisation, then the dedup warm-up that can flush the seen-set), so an unbounded page is a
+ * denial-of-service knob. Clamped rather than refused, exactly as `block_ms` is.
+ */
+const MAX_FETCH_LIMIT = 1_000;
 
 /** Dependencies the reactive/reply tools close over. */
 export interface ToolDeps {
@@ -171,10 +180,10 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
         'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor }. ' +
         'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
-        'long-poll: if nothing is newer than `since`, the call holds until a message arrives or the ' +
-        'timeout elapses (capped server-side), so a polling agent burns tokens per message, not per ' +
-        'tick. A topic that does not exist on the backend yet returns an empty page with ' +
-        '`topicAbsent: true` rather than an error.' +
+        'long-poll: if the queried window is empty — whether or not you passed `since` — the call ' +
+        'holds until a message arrives or the timeout elapses (capped server-side), so a polling ' +
+        'agent burns tokens per message, not per tick. A topic that does not exist on the backend ' +
+        'yet returns an empty page with `topicAbsent: true` rather than an error.' +
         describeAllowed(allow),
       inputSchema: {
         topic: topicSchema(allow, 'Topic to read (must be on the allowlist).'),
@@ -184,16 +193,21 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
           .describe(
             'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
           ),
-        limit: z.number().int().positive().optional().describe('Max messages to return.'),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(`Max messages to return in this page (capped server-side at ${MAX_FETCH_LIMIT}).`),
         block_ms: z
           .number()
           .int()
           .nonnegative()
           .optional()
           .describe(
-            'Long-poll budget in ms. When set with a `since` at the tail, hold up to this long for a ' +
-              'new message before returning (possibly empty). Clamped server-side. 0 / omit = return ' +
-              'immediately.',
+            'Long-poll budget in ms. If the queried window is empty — whether or not you passed ' +
+              '`since` — hold up to this long for a new message before returning (possibly empty). ' +
+              'Clamped server-side. 0 / omit = return the window at once, empty or not.',
           ),
       },
     },
@@ -201,7 +215,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       const t = deps.allow.assert(topic);
       const args: FetchRecentArgs = { topic: t };
       if (since !== undefined) args.since = asCursor(since);
-      if (limit !== undefined) args.limit = limit;
+      if (limit !== undefined) args.limit = Math.min(limit, MAX_FETCH_LIMIT);
       const blockMs = block_ms !== undefined ? Math.min(block_ms, deps.blockMaxMs) : 0;
       let result;
       try {
@@ -215,7 +229,10 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
               })
             : await deps.plugin.fetchRecent(args);
       } catch (e) {
-        if (!(e instanceof NoSuchTopicError)) throw e;
+        // A long-poll the client cancelled is not a failure: answer it like any other empty window,
+        // so that a routine cancellation is never rendered to the agent as a tool error.
+        if (e instanceof FetchAbortedError) return textResult({ messages: [], nextCursor: args.since });
+        if (!isNoSuchTopicError(e)) throw e;
         // Echo the caller's position back: replaying it once the topic exists reads from where
         // they were, and omitting it (no `since` given) reads the recent window.
         return textResult({ messages: [], nextCursor: args.since, topicAbsent: true });
@@ -333,7 +350,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
           limit: PRESENCE_FETCH_LIMIT,
         });
       } catch (e) {
-        if (e instanceof NoSuchTopicError) {
+        if (isNoSuchTopicError(e)) {
           return textResult({ users: [], truncated: false }); // presence topic genuinely absent ⇒ nobody seen
         }
         throw e; // real backend failure — surface it, don't fake an empty roster

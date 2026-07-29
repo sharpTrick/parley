@@ -22,6 +22,19 @@ export interface BlockingFetchOptions {
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * A long-poll cancelled before any page came back. There is no cursor to return — core never mints
+ * cursor values (DESIGN §6) and the caller supplied none — so cancellation cannot be expressed as a
+ * {@link FetchRecentResult}. Keep it its own type, so that a routine cancellation is not reported to
+ * the agent as a backend failure.
+ */
+export class FetchAbortedError extends Error {
+  constructor() {
+    super('fetch_recent cancelled before any page was read');
+    this.name = 'FetchAbortedError';
+  }
+}
+
 const ABORTED = Symbol('aborted');
 
 /**
@@ -94,10 +107,10 @@ export async function fetchRecentBlocking(
 
 /**
  * What a cancelled long-poll returns: the caller's own position, empty. Before the first page has
- * landed there is no cursor to hand back and none may be invented — core never mints cursor values
- * (DESIGN §6) — so the cancellation surfaces as a rejection instead.
+ * landed there is no cursor to hand back and none may be invented, so it raises
+ * {@link FetchAbortedError} — which callers map back to an empty result rather than to a failure.
  */
 function abandoned(since: Cursor | undefined): FetchRecentResult {
-  if (since === undefined) throw new Error('fetch_recent cancelled before any page was read');
+  if (since === undefined) throw new FetchAbortedError();
   return { messages: [], nextCursor: since };
 }

@@ -41,9 +41,10 @@ catch-up forever instead of costing one page.
 above the ceiling, below 1, or a non-integer — is rejected outright with an error naming the
 ceiling (SQLite reads a negative `LIMIT` as *no* limit). The driver is synchronous and `limit`
 reaches it from model-supplied tool arguments, so an unbounded page would stall the whole bridge.
-The ceiling rejects rather than silently clamping: a caller that pages until a page comes back
-short — which is how core's catch-up driver decides a topic is exhausted — would read a clamped
-page as the end of the topic and strand every message after it. Page to exhaustion for more.
+The ceiling rejects rather than silently clamping, so that a caller which treats a short page as
+the end of a topic cannot be handed one. Core's own catch-up driver no longer makes that inference —
+it stops on an empty page or a non-advancing cursor — but the seam only promises `limit` is a
+maximum, so a clamp remains unsafe for any caller that does. Page to exhaustion for more.
 
 Core validates its own `catchup.limit` as any positive integer, so **keep `catchup.limit` at or
 below 10000**: a larger value loads cleanly and then stops the bridge during catch-up-on-start, with

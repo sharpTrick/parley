@@ -1,12 +1,19 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
+import { catchUpTopic } from '../engine/catchup.js';
+import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
+import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asBackendMsgId, asHandle, asTopic } from '../message.js';
-import { NoSuchTopicError } from '../seam.js';
+import { asBackendMsgId, asHandle, asTopic, type Message, type Topic } from '../message.js';
+import { NoSuchTopicError, type BackendPlugin, type MessageHandler } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
+import { memoryReadState } from '../testing/nonconformant.js';
 import { CHANNEL_NOTIFICATION_METHOD } from './channel-emit.js';
 import { startPushLoop } from './push-loop.js';
+import { registerTools } from './tools.js';
 
 interface Captured {
   method: string;
@@ -65,6 +72,109 @@ describe('startPushLoop (core emit handler)', () => {
     await plugin.post(asTopic('ctx'), asHandle('bob'), 'ping @agent');
     await vi.waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]!.params.content).toBe('ping @agent');
+  });
+
+  /**
+   * The pull and push paths share ONE SeenSet precisely so a message the agent already read cannot
+   * arrive again as a `<channel>` event. Only the catch-up leg of that warm-up was covered; the
+   * `fetch_recent` TOOL's leg was pinned by `expect(deps.seen).toBe(seen)` — wiring, not behaviour —
+   * so deleting its warm-up loop left every test green while re-pushing everything the agent pulled.
+   *
+   * Table the ORDERS the two delivery paths can run in for the same backendMsgId, driven through the
+   * real tool and a plugin whose live delivery is deferred (a real backend's live hop lands after the
+   * row is already fetchable). A pull AFTER a push legitimately re-reads history — what must never
+   * happen is a push after a pull.
+   */
+  describe('the pull and push paths never deliver the same message twice', () => {
+    const T = asTopic('ctx');
+
+    /** A plugin that buffers live delivery so a message is fetchable BEFORE it is pushed. */
+    async function deferredBus() {
+      const backend = new FakePlugin();
+      await backend.connect({});
+      const buffered: Message[] = [];
+      await backend.subscribe(T, (m) => buffered.push(m));
+      let coreHandler: MessageHandler | undefined;
+      const plugin = {
+        connect: (c) => backend.connect(c),
+        disconnect: () => backend.disconnect(),
+        post: (t, i, c, o) => backend.post(t, i, c, o),
+        fetchRecent: (a) => backend.fetchRecent(a),
+        resolveIdentity: (h) => backend.resolveIdentity(h),
+        subscribe: async (_topic: Topic, handler: MessageHandler) => {
+          coreHandler = handler;
+        },
+      } as BackendPlugin;
+
+      const seen = new SeenSet();
+      const server = new McpServer({ name: 'parley', version: '0.0.0' }, { capabilities: { tools: {} } });
+      registerTools(server, {
+        plugin,
+        identity: asHandle('agent'),
+        allow: new Allowlist(['ctx'], { reserved: [DEFAULT_PRESENCE_TOPIC] }),
+        seen,
+        presenceTopic: asTopic(DEFAULT_PRESENCE_TOPIC),
+        presenceTtlMs: 90_000,
+        blockMaxMs: 1_000,
+        blockPollIntervalMs: 20,
+      });
+      const emits = vi.spyOn(server.server, 'notification').mockResolvedValue(undefined);
+      await startPushLoop(server, plugin, new Allowlist(['ctx']), seen, {
+        mentionFilter: false,
+        identity: asHandle('agent'),
+      });
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
+      await Promise.all([server.connect(serverT), client.connect(clientT)]);
+
+      let pulled = 0;
+      const readState = memoryReadState() as unknown as ReadStateStore;
+      return {
+        post: () => backend.post(T, asHandle('bob'), 'the one message'),
+        deliver: () => {
+          for (const m of buffered.splice(0)) coreHandler?.(m);
+        },
+        pull: async () => {
+          const res = (await client.callTool({
+            name: 'parley_fetch_recent',
+            arguments: { topic: 'ctx' },
+          })) as { content: Array<{ text: string }> };
+          const out = JSON.parse(res.content[0]!.text) as { messages: unknown[] };
+          pulled += out.messages.length;
+        },
+        catchup: async () => {
+          await catchUpTopic({ plugin, topic: T, limit: 100, readState, seen });
+        },
+        emitCount: () => emits.mock.calls.filter((c) => (c[0] as { method: string }).method === CHANNEL_NOTIFICATION_METHOD).length,
+        pulledCount: () => pulled,
+        stop: async () => {
+          await client.close();
+          await backend.disconnect();
+        },
+      };
+    }
+
+    type Step = 'post' | 'pull' | 'deliver' | 'catchup';
+
+    const ORDERS: Array<[name: string, steps: Step[], emits: number, pulls: number]> = [
+      ['pulled by the tool, then delivered live', ['post', 'pull', 'deliver'], 0, 1],
+      ['pulled by the tool twice, then delivered live', ['post', 'pull', 'pull', 'deliver'], 0, 2],
+      ['drained by catch-up, then pulled, then delivered live', ['post', 'catchup', 'pull', 'deliver'], 0, 1],
+      ['delivered live, then pulled, then delivered again', ['post', 'deliver', 'pull', 'deliver'], 1, 1],
+      ['delivered live twice', ['post', 'deliver', 'deliver'], 1, 0],
+    ];
+
+    it.each(ORDERS)('%s', async (_name, steps, emits, pulls) => {
+      const bus = await deferredBus();
+      try {
+        for (const step of steps) await bus[step]();
+        await new Promise((r) => setTimeout(r, 20)); // let any emit settle
+        expect(bus.emitCount()).toBe(emits);
+        expect(bus.pulledCount()).toBe(pulls); // the row really did read the message it claims to
+      } finally {
+        await bus.stop();
+      }
+    });
   });
 
   /**

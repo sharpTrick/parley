@@ -1,5 +1,6 @@
 import type { Cursor, Topic } from '../message.js';
-import { NoSuchTopicError, type BackendPlugin } from '../seam.js';
+import { isNoSuchTopicError } from '../no-such-topic.js';
+import type { BackendPlugin } from '../seam.js';
 import type { ReadStateStore } from './read-state.js';
 import type { SeenSet } from './seen-set.js';
 
@@ -13,17 +14,26 @@ export interface CatchUpArgs {
 }
 
 /**
+ * Ceiling on how many pages one topic's catch-up will read. A backend that keeps handing back
+ * non-empty pages with an advancing cursor is indistinguishable from a very long topic, so the
+ * driver stops and says so rather than pinning a CPU and a state-file rewrite per page forever.
+ */
+export const MAX_CATCHUP_PAGES = 10_000;
+
+/**
  * Catch-up driver for ONE topic (DESIGN §7). Warms the seen-set and advances the persisted read
  * position. How much it reads depends on whether a cursor was persisted:
  *
- *   - RESUMED (a cursor on disk): pages forward from that cursor until the topic is exhausted.
+ *   - RESUMED (a cursor on disk): pages forward from that cursor until the topic is exhausted —
+ *     which means an EMPTY page, so exhausting a topic always costs one final empty round-trip.
  *   - COLD START (no cursor): reads the backend's most-recent `limit` window and adopts its tail.
  *     Anything older than that window is outside this instance's catch-up horizon — it is never
  *     drained and never will be, because read-state now points past it.
  *
- * A topic the backend cannot represent yet ({@link NoSuchTopicError}) counts as zero messages and
- * leaves read-state untouched — the seam declares that "absent", not a failure, so one missing chat
- * channel must not take the whole bridge down.
+ * A topic the backend cannot represent yet (`NoSuchTopicError`, recognised by contract via
+ * {@link isNoSuchTopicError}) counts as zero messages and leaves read-state untouched — the seam
+ * declares that "absent", not a failure, so one missing chat channel must not take the whole bridge
+ * down.
  *
  * It deliberately does NOT emit to the channel: on-start history is surfaced when the agent
  * calls the `fetch_recent` tool (the pull/push split, §7). The driver's jobs are (a) advance
@@ -36,32 +46,36 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
   const { plugin, topic, limit, readState, seen } = args;
   let since = readState.get(topic);
   const resumedFromDisk = since !== undefined;
-  let first = true;
   let total = 0;
 
-  for (;;) {
-    let page;
+  for (let page = 0; page < MAX_CATCHUP_PAGES; page++) {
+    let result;
     try {
-      page = await (first && resumedFromDisk
+      result = await (page === 0 && resumedFromDisk
         ? fetchWithResumeHint(plugin, { topic, since, limit }, readState.path)
         : plugin.fetchRecent({ topic, since, limit }));
     } catch (err) {
-      if (!(err instanceof NoSuchTopicError)) throw err;
+      if (!isNoSuchTopicError(err)) throw err;
       console.error(`[parley] topic ${JSON.stringify(topic)} does not exist on the backend yet; skipping catch-up`);
       return total;
     }
-    first = false;
-    const { messages, nextCursor } = page;
+    const { messages, nextCursor } = result;
     for (const m of messages) seen.markSeen(topic, m.backendMsgId);
     total += messages.length;
     readState.set(topic, nextCursor);
 
-    // Defensive against a non-conformant backend: stop if a full page made no cursor
-    // progress (a conformant backend guarantees nextCursor advances past returned rows).
-    if (messages.length < limit || nextCursor === since) break;
+    // Keep EMPTY — not "shorter than the requested limit" — as the exhaustion test, so that a
+    // backend whose history API caps a page below `limit` (Discord's 100, Telegram, Matrix
+    // /messages) cannot strand everything past its cap. `nextCursor === since` is the separate
+    // brake for a page that made no cursor progress at all.
+    if (messages.length === 0 || nextCursor === since) return total;
     since = nextCursor;
   }
 
+  console.error(
+    `[parley] catch-up on topic ${JSON.stringify(topic)} stopped after ${MAX_CATCHUP_PAGES} pages ` +
+      `with messages still arriving; the backend may not be honouring the exclusive \`since\` contract`,
+  );
   return total;
 }
 
@@ -82,7 +96,7 @@ async function fetchWithResumeHint(
   } catch (err) {
     // Rethrow the absence sentinel unwrapped, so that the caller can still recognise it — an absent
     // topic is not a stale-cursor problem and must not be described as one.
-    if (err instanceof NoSuchTopicError) throw err;
+    if (isNoSuchTopicError(err)) throw err;
     const detail = err instanceof Error ? err.message : String(err);
     // Never copy err.stack onto this wrapper, so that the hint survives: callers print
     // `err.stack ?? err.message`, and a stack opens with the message it was captured for.

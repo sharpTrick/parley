@@ -1,6 +1,11 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { readFileSync, readdirSync } from 'node:fs';
+import type { AddressInfo } from 'node:net';
+import { join } from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
+import { parseConfig } from '../config.js';
 import { decodePresence, DEFAULT_PRESENCE_TOPIC, type PresenceKind } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic, type Handle, type Topic } from '../message.js';
@@ -11,6 +16,7 @@ import {
   type FailureShape,
 } from '../testing/failure-shapes.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
+import { createRemoteHttpApp } from './http.js';
 import { startPresenceLoop } from './presence-loop.js';
 import { startPushLoop } from './push-loop.js';
 
@@ -96,6 +102,104 @@ describe('no fire-and-forget seam call escapes as an unhandled rejection', () =>
       expect(escaped).toEqual([]);
       await plugin.disconnect();
     });
+  });
+
+  /**
+   * Remote mode tears its per-request server and transport down from the response's `close` event,
+   * where nothing is awaiting them: a transport whose socket is already destroyed rejects there, and
+   * a single aborted or malformed POST would take the whole remote bridge down with it.
+   */
+  const PER_REQUEST_SITES = {
+    'the per-request transport': (): { close: unknown } => StreamableHTTPServerTransport.prototype,
+    'the per-request reactive server': (): { close: unknown } => McpServer.prototype,
+  };
+
+  for (const [site, proto] of Object.entries(PER_REQUEST_SITES)) {
+    describe.each(FAILURE_SHAPE_NAMES)(`${site} whose close %s`, (shape) => {
+      it('is absorbed by the response-close teardown', async () => {
+        const plugin = new FakePlugin();
+        await plugin.connect({});
+        const cfg = parseConfig({
+          identity: { handle: 'agent' },
+          topics: ['ctx'],
+          presence: { enabled: false },
+        });
+        const app = createRemoteHttpApp(plugin, cfg, { insecureNoAuth: true });
+        const srv = await app.listen(0);
+        const port = (srv.address() as AddressInfo).port;
+        const closeSpy = vi
+          .spyOn(proto() as { close: () => Promise<void> }, 'close')
+          .mockImplementation(() => FAILURE_SHAPES[shape](Promise.resolve()));
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const escaped = await unhandledDuring(async () => {
+          const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              accept: 'application/json, text/event-stream',
+            },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'initialize',
+              params: {
+                protocolVersion: '2024-11-05',
+                capabilities: {},
+                clientInfo: { name: 'x', version: '0' },
+              },
+            }),
+          });
+          expect(res.status).toBe(200);
+          await res.text();
+        });
+
+        expect(escaped).toEqual([]);
+        // The failing site was actually exercised — without this the row proves nothing.
+        expect(closeSpy).toHaveBeenCalled();
+        closeSpy.mockRestore();
+        errSpy.mockRestore();
+        await app.close();
+        await plugin.disconnect();
+      });
+    });
+  }
+});
+
+/**
+ * The table above can only cover the sites it knows about. Pin the INVENTORY of fire-and-forget
+ * statements in engine/ + transport/ so a newly added one fails here until someone decides which
+ * behavioural row covers it — a `void` whose promise has no handler anywhere is the class, and the
+ * next one will not arrive at a site this file already names.
+ */
+describe('every fire-and-forget statement in engine/ + transport/ is a known one', () => {
+  const HERE = new URL('.', import.meta.url).pathname;
+  const DIRS = { engine: join(HERE, '..', 'engine'), transport: HERE };
+
+  // A `void` STATEMENT, not the `: void` return-type annotation.
+  const VOIDED = /(?<!:\s*)\bvoid\s+(\S.*)$/;
+
+  const EXPECTED = [
+    'engine/blocking-fetch.ts: work.then(resolve, reject).finally(() => signal.removeEventListener(\'abort\', onAbort));',
+    'transport/http.ts: closeQuietly(\'transport\', transport);',
+    'transport/http.ts: closeQuietly(\'reactive server\', server);',
+    'transport/presence-loop.ts: enqueue(\'hello\');',
+    'transport/presence-loop.ts: enqueue(\'heartbeat\'), heartbeatClamp(opts.heartbeatMs));',
+    'transport/presence-loop.ts: work.catch(() => undefined).then(() => {',
+    'transport/push-loop.ts: emitChannel(server, m).catch(() => {',
+  ];
+
+  it('matches the inventory the failure-shape tables cover', () => {
+    const found: string[] = [];
+    for (const [label, dir] of Object.entries(DIRS)) {
+      for (const file of readdirSync(dir).filter((f) => f.endsWith('.ts') && !f.includes('.test.'))) {
+        for (const line of readFileSync(join(dir, file), 'utf8').split('\n')) {
+          const m = VOIDED.exec(line);
+          if (m !== null) found.push(`${label}/${file}: ${m[1]!.trim()}`);
+        }
+      }
+    }
+    expect(found.sort()).toEqual([...EXPECTED].sort());
   });
 });
 

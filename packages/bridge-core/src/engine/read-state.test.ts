@@ -223,15 +223,47 @@ describe('ReadStateStore', () => {
     expect(p.endsWith('read-state.json')).toBe(true);
   });
 
-  it('does not let instanceId ".." escape the parley/ dir', () => {
-    const p = defaultReadStatePath('..');
-    expect(p).not.toContain(`${sep}..${sep}`);
-    expect(normalize(p)).toContain(`${sep}parley${sep}`);
-  });
+  /**
+   * `instance_id` defaults to identity.handle, so any handle carrying a separator or a traversal
+   * token reshapes the on-disk layout: the state file lands OUTSIDE `parley/`, or silently nests
+   * itself in directories nobody configured. Table hostile ids against the invariants that make the
+   * mapping safe — one namespace component, under `parley/`, never `.`/`..`, and injective — so the
+   * character-class sanitizer cannot be narrowed or dropped while the suite stays green.
+   */
+  describe('a hostile instanceId can neither escape parley/ nor collide', () => {
+    const HOSTILE: Array<[label: string, id: string]> = [
+      ['a traversal token', '..'],
+      ['the current directory', '.'],
+      ['an empty id', ''],
+      ['a rooted traversal', '../../etc'],
+      ['an interior traversal', 'a/../../b'],
+      ['windows separators', 'a\\..\\b'],
+      ['a NUL byte', '.\u0000/x'],
+      ['a bare separator', '/'],
+      ['a trailing separator', 'sess/'],
+      ['a reserved device name', 'con'],
+      ['a 4KB id', 'x'.repeat(4_096)],
+      ['a unicode division slash', 'a\u2215b'],
+      ['a newline', 'a\nb'],
+      ['a plain id (the control)', 'ctx-payments'],
+    ];
 
-  it('maps distinct ids that clean alike to distinct files', () => {
-    expect(defaultReadStatePath('a/b')).not.toBe(defaultReadStatePath('a_b'));
-    expect(defaultReadStatePath('sess/1')).not.toBe(defaultReadStatePath('sess_1'));
+    it.each(HOSTILE)('%s becomes one namespace component under parley/', (_label, id) => {
+      const parts = normalize(defaultReadStatePath(id)).split(sep);
+      expect(parts.at(-1)).toBe('read-state.json');
+      expect(parts.at(-3)).toBe('parley'); // nothing between parley/ and the file but the namespace
+      const namespace = parts.at(-2)!;
+      expect(namespace).not.toBe('');
+      expect(namespace).not.toBe('.');
+      expect(namespace).not.toBe('..');
+      expect(namespace).not.toMatch(/[\\/]/);
+    });
+
+    it('distinct ids never share a file, however they clean up', () => {
+      const ids = [...HOSTILE.map(([, id]) => id), 'a/b', 'a_b', 'sess/1', 'sess_1'];
+      const paths = ids.map((id) => defaultReadStatePath(id));
+      expect(new Set(paths).size).toBe(new Set(ids).size);
+    });
   });
 
   // A co-tenant on a shared host must not be able to read this instance's cursor positions.

@@ -60,8 +60,9 @@ type DrainOutcome =
   | { kind: 'drained'; contents: string[] };
 
 /**
- * Page a topic with the stop rule every caller uses, core's `catchUpTopic` included: a page
- * shorter than the requested `limit` means the topic is exhausted.
+ * Page a topic with the stop rule a caller may legitimately adopt — a page shorter than the
+ * requested `limit` means the topic is exhausted. Core's own driver stops on an empty page instead,
+ * but the seam permits this rule, so the cap must be safe against it.
  */
 async function drainStoppingOnShortPage(
   p: SqlitePlugin,
@@ -237,9 +238,9 @@ describe('SqlitePlugin post persists inReplyTo', () => {
 /**
  * `limit` reaches `fetchRecent` from a model whose context is untrusted inbound message content,
  * on a synchronous driver. A value it cannot serve must be refused — never absorbed as "no limit"
- * (how SQLite reads a negative LIMIT), and never quietly served short: every caller that pages,
- * core's `catchUpTopic` included, reads a page shorter than the `limit` it asked for as "topic
- * exhausted", so a silent server-side cap strands the remainder for the rest of the session.
+ * (how SQLite reads a negative LIMIT), and never quietly served short: a caller that pages may
+ * legitimately read a page shorter than the `limit` it asked for as "topic exhausted", so a silent
+ * server-side cap strands the remainder for the rest of the session.
  */
 describe('SqlitePlugin fetchRecent limit', () => {
   const REJECTED = [-1, 0, 0.5, Number.NaN, Number.POSITIVE_INFINITY, '10', null];
