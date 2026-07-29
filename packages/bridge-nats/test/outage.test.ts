@@ -2,7 +2,15 @@ import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { connect } from 'nats';
 import { afterAll, describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
-import { dropStreams, isNatsUp, rand, SERVERS, waitFor, waitForAsync } from './helpers.js';
+import {
+  dropStreams,
+  isNatsUp,
+  rand,
+  SERVERS,
+  serverTarget,
+  waitFor,
+  waitForAsync,
+} from './helpers.js';
 import { startTcpProxy, type TcpProxy } from './tcp-proxy.js';
 
 // Class 1: an outage — of ANY length, including one longer than the driver's own reconnect budget —
@@ -49,7 +57,7 @@ suite('nats network faults', () => {
 
   for (const outage of outages) {
     it(`post, fetchRecent and subscribe all recover after ${outage.name}`, async () => {
-      const proxy: TcpProxy = await startTcpProxy('127.0.0.1', 4222);
+      const proxy: TcpProxy = await startTcpProxy(serverTarget().host, serverTarget().port);
       const sub = new NatsPlugin();
       const pub = new NatsPlugin();
       await sub.connect({ ...base, servers: proxy.address });
@@ -113,7 +121,7 @@ suite('nats network faults', () => {
   for (const cause of causes) {
     for (const prior of priors) {
       it(`backfills the outage gap when ${prior.name} and the ${cause.name}`, async () => {
-        const proxy: TcpProxy = await startTcpProxy('127.0.0.1', 4222);
+        const proxy: TcpProxy = await startTcpProxy(serverTarget().host, serverTarget().port);
         const sub = new NatsPlugin();
         const pub = new NatsPlugin();
         await sub.connect({ ...base, servers: proxy.address });

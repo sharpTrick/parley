@@ -71,6 +71,13 @@ const DRAIN_TIMEOUT_MS = 2000;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Anything the teardown registry can shut down: a live pull, a consume() iterator, a shim. */
+interface Closeable {
+  close: () => unknown;
+}
+
+const NS_PER_DAY = 86_400_000_000_000;
+
 /**
  * NATS JetStream backend (DESIGN §6/§9) — the fabric backend. One JetStream STREAM per topic, so
  * the stream sequence number is a contiguous, monotonic per-topic `cursor` (= `backendMsgId`).
@@ -88,15 +95,15 @@ export class NatsPlugin implements BackendPlugin {
   private retentionDays?: number;
   private stopped = false;
   private readonly ensured = new Map<string, Promise<void>>();
-  private readonly subscriptions: ConsumerMessages[] = [];
+  private readonly subscriptions: Closeable[] = [];
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as NatsBackendConfig;
     this.subjectPrefix = cfg.subject_prefix ?? 'parley.';
     this.streamPrefix = cfg.stream_prefix ?? 'PARLEY_';
-    this.retentionDays = cfg.retention_days;
+    this.retentionDays = validateRetentionDays(cfg.retention_days);
     this.stopped = false;
-    this.ensured.clear(); // a fresh connection starts from a clean stream-cache (BUG-01)
+    this.ensured.clear();
     this.nc = await connect(connectionOptions(cfg));
     this.js = this.nc.jetstream();
     this.jsm = await this.nc.jetstreamManager();
@@ -141,31 +148,45 @@ export class NatsPlugin implements BackendPlugin {
     });
   }
 
-  fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    return this.withStream(args.topic, () => this.readRecent(args));
+  // Keep this `async`, so that a rejected `since` REJECTS: a synchronous throw out of a
+  // Promise-returning seam method escapes every caller that only wrote `.catch()`.
+  async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    const since = parseCursor(args.since);
+    return this.withStream(args.topic, () => this.readRecent(args, since));
   }
 
-  private async readRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+  private async readRecent(args: FetchRecentArgs, since?: number): Promise<FetchRecentResult> {
     const stream = this.streamName(args.topic);
     const limit = args.limit ?? 100;
     const info = await this.requireJsm().streams.info(stream);
     const lastSeq = info.state.last_seq;
     const firstSeq = info.state.first_seq;
+    // A `since` past the tail names a sequence this stream never had — it was re-provisioned
+    // underneath the cursor and its sequences restarted at 1. Keep the fall back to the retained
+    // window, so that catch-up cannot go permanently deaf waiting on a sequence that will not come.
+    const restarted = since !== undefined && since > lastSeq;
+    const tailWindow = Math.max(firstSeq, lastSeq - limit + 1, 1);
+    // JetStream prunes from the front (`max_age`), so a `since` older than the retained window must
+    // start at `first_seq`: the gap is gone either way, and asking below it stalls the pull for its
+    // whole expiry waiting on sequences the server no longer has.
     const startSeq =
-      args.since !== undefined ? Number(args.since) + 1 : Math.max(firstSeq, lastSeq - limit + 1);
+      since === undefined || restarted ? tailWindow : Math.max(since + 1, firstSeq, 1);
+    const emptyCursor =
+      since === undefined || restarted ? asCursor(String(lastSeq)) : (args.since as Cursor);
 
-    // Nothing is strictly after `since` yet (empty stream, or `since` already at the tail).
-    // Native long-poll (issue #20): if a positive `blockMs` is set AND we have an exclusive
-    // `since`, wait on a bounded JetStream pull up to the remaining budget instead of returning
-    // instantly; the pull's `expires` IS the bounded wait. `blockMs` falsy OR `since` undefined →
-    // return an empty page immediately, exactly as the durable read does today. Returning
-    // early/empty is always safe — core polls the remainder.
     const blockMs = args.blockMs ?? 0;
     if (info.state.messages === 0 || startSeq > lastSeq) {
       if (blockMs > 0 && args.since !== undefined) {
-        return this.blockingFetch(stream, args.topic, startSeq, limit, Date.now() + blockMs, args.since);
+        return this.blockingFetch(
+          stream,
+          args.topic,
+          startSeq,
+          limit,
+          Date.now() + blockMs,
+          emptyCursor,
+        );
       }
-      return { messages: [], nextCursor: args.since ?? asCursor(String(lastSeq)) };
+      return { messages: [], nextCursor: emptyCursor };
     }
     const want = Math.min(limit, lastSeq - startSeq + 1);
 
@@ -176,8 +197,8 @@ export class NatsPlugin implements BackendPlugin {
       ack_policy: AckPolicy.None,
       inactive_threshold: INACTIVE_NS,
     });
-    // From here the ephemeral consumer exists server-side, so a throw in get()/fetch() must delete
-    // it in the finally — otherwise it lingers until `inactive_threshold` (30s).
+    // Keep every step after `consumers.add` inside the try, so that a throw still reaches the
+    // finally's delete — an ephemeral consumer nobody deletes lingers for `inactive_threshold`.
     const messages: Message[] = [];
     let batch: ConsumerMessages | undefined;
     try {
@@ -185,7 +206,9 @@ export class NatsPlugin implements BackendPlugin {
       batch = await consumer.fetch({ max_messages: want, expires: FETCH_EXPIRY_MS });
       for await (const m of batch) {
         messages.push(rowToMessage(args.topic, m.seq, dec.decode(m.data)));
-        if (messages.length >= want) break;
+        // Keep the tail break: `want` is an upper bound over a range that may be sparse, and a pull
+        // that asked for more than the stream holds waits out its whole `expires` otherwise.
+        if (messages.length >= want || m.seq >= lastSeq) break;
       }
     } finally {
       void batch?.close();
@@ -217,21 +240,9 @@ export class NatsPlugin implements BackendPlugin {
   }
 
   /**
-   * Native long-poll for `fetchRecent` (issue #20). The exclusive `since` query was empty, so wait
-   * on an ephemeral JetStream PULL consumer starting at `opt_start_seq = since + 1` up to the
-   * remaining budget — a pull `fetch` with `expires` IS the bounded wait, so this blocks instead of
-   * returning instantly, waking the moment a message lands at `startSeq` (or at expiry). The
-   * JetStream sequence number is the cursor. Semantics:
-   *   - The remaining budget (`deadline - now`) bounds the wait; we never block past `blockMs`.
-   *     nats.js rejects `expires < 1000ms`, so we floor the pull's `expires` at 1000 but enforce the
-   *     TRUE remaining budget with our own timer that closes the pull — so a sub-second `blockMs`
-   *     (e.g. 300ms) still returns on time.
-   *   - Return promptly on the first message (break); any burst remainder stays in the stream and
-   *     core polls it. On expiry/disconnect we return an empty page whose `nextCursor === since`.
-   *   - `disconnect()` aborts cleanly: the ephemeral consumer is registered in `this.subscriptions`,
-   *     so teardown `close()`s the pull immediately, `this.stopped` short-circuits the result, and
-   *     the `finally` destroys the consumer (it is also GC'd server-side after `INACTIVE_NS`). No
-   *     leaked consumers/subscriptions.
+   * Long-poll half of `fetchRecent`: the exclusive `since` query was empty, so wait on an ephemeral
+   * JetStream pull from `startSeq` — the pull's `expires` IS the bounded wait — and return on the
+   * first message, at the deadline, or on `disconnect()`. `fallback` is the cursor of an empty page.
    */
   private async blockingFetch(
     stream: string,
@@ -239,10 +250,10 @@ export class NatsPlugin implements BackendPlugin {
     startSeq: number,
     limit: number,
     deadline: number,
-    since: Cursor,
+    fallback: Cursor,
   ): Promise<FetchRecentResult> {
     const remaining = deadline - Date.now();
-    if (remaining <= 0 || this.stopped) return { messages: [], nextCursor: since };
+    if (remaining <= 0 || this.stopped) return { messages: [], nextCursor: fallback };
 
     const ci = await this.requireJsm().consumers.add(stream, {
       filter_subject: this.subject(topic),
@@ -251,45 +262,43 @@ export class NatsPlugin implements BackendPlugin {
       ack_policy: AckPolicy.None,
       inactive_threshold: INACTIVE_NS,
     });
-    // From here the ephemeral consumer exists server-side, so a throw in get()/fetch() must delete
-    // it in the finally — otherwise it lingers until `inactive_threshold` (30s). Everything after
-    // add() runs inside the try so the primary cleanup, not just the GC backstop, covers the throw.
+    // Keep every step after `consumers.add` inside the try, so that a throw still reaches the
+    // finally's delete — an ephemeral consumer nobody deletes lingers for `inactive_threshold`.
     const messages: Message[] = [];
     let batch: ConsumerMessages | undefined;
-    let closer: ConsumerMessages | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const consumer = await this.requireJs().consumers.get(stream, ci.name);
-      // Floor `expires` at nats.js's 1000ms minimum; the timer below enforces the real deadline.
+      // Keep the 1000ms floor: nats.js rejects a shorter `expires`, and the timer below — not
+      // `expires` — is what honours a sub-second `blockMs`.
       batch = await consumer.fetch({ max_messages: limit, expires: Math.max(remaining, 1000) });
 
-      // Register the live pull so disconnect() closes it promptly (reuses the subscription
-      // teardown); removed again in the finally so nothing leaks after a normal return.
       const live = batch;
-      closer = { close: () => live.close() } as unknown as ConsumerMessages;
-      this.subscriptions.push(closer);
-      // Base the timer on the LIVE deadline so setup RTT (add/get/fetch) can't push the return past
-      // blockMs — never block longer than the remaining budget at the moment we arm it.
+      this.subscriptions.push(live);
+      // Keep the timer armed off the LIVE clock, so that setup round-trips cannot push the return
+      // past the caller's `blockMs`.
       timer = setTimeout(() => void live.close(), Math.max(deadline - Date.now(), 0));
 
       for await (const m of batch) {
         if (this.stopped) break;
         messages.push(rowToMessage(topic, m.seq, dec.decode(m.data)));
-        break; // long-poll: return promptly on the first message; core polls any burst remainder.
+        // Keep the single-message return, so that a long-poll wakes its caller at once; the
+        // remainder of a burst stays in the stream and core polls it.
+        break;
       }
     } catch {
       /* pull closed by the deadline timer or by disconnect() — return whatever we have */
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      if (closer !== undefined) {
-        const i = this.subscriptions.indexOf(closer);
+      if (batch !== undefined) {
+        const i = this.subscriptions.indexOf(batch);
         if (i >= 0) this.subscriptions.splice(i, 1);
       }
       void batch?.close();
       await this.jsm?.consumers.delete(stream, ci.name).catch(() => undefined);
     }
     const last = messages.at(-1);
-    return { messages, nextCursor: last !== undefined ? last.cursor : since };
+    return { messages, nextCursor: last !== undefined ? last.cursor : fallback };
   }
 
   /**
@@ -299,9 +308,9 @@ export class NatsPlugin implements BackendPlugin {
    * whatever landed while it was absent. A plain named ephemeral consumer is GC'd by the server
    * after `INACTIVE_NS` of client absence (restart / partition) and `consume()` does not self-heal,
    * so we watch `iter.status()` for `ConsumerDeleted`/`ConsumerNotFound`/`StreamNotFound` and close
-   * the iterator; ANY iterator exit rebuilds (BUG-02) — a connection drop ends `consume()` with no
-   * status event at all. The outer loop honors `disconnect()`: `this.stopped` + the registered
-   * closer stop it without a rebuild, as does a permanently closed connection.
+   * the iterator; ANY iterator exit rebuilds — a connection drop ends `consume()` with no status
+   * event at all. The outer loop honors `disconnect()`: `this.stopped` + the registered closer stop
+   * it without a rebuild, as does a permanently closed connection.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const stream = this.streamName(topic);
@@ -310,10 +319,7 @@ export class NatsPlugin implements BackendPlugin {
     let lastSeq = seeded.state.last_seq;
     let created = seeded.created;
     let current: ConsumerMessages | undefined;
-    // A single closer so disconnect() tears down whichever iterator is live at the time.
-    this.subscriptions.push({
-      close: () => current?.close() ?? Promise.resolve(),
-    } as unknown as ConsumerMessages);
+    this.subscriptions.push({ close: () => current?.close() });
 
     void (async () => {
       let rebuild = false;
@@ -345,7 +351,6 @@ export class NatsPlugin implements BackendPlugin {
         }
         current = iter;
 
-        // The plain named consumer only notify()s on deletion/GC; surface it and force a rebuild.
         const statusTask = (async () => {
           try {
             for await (const s of await iter.status()) {
@@ -408,16 +413,18 @@ export class NatsPlugin implements BackendPlugin {
         try {
           const config: Partial<StreamConfig> = { name, subjects: [this.subject(topic)] };
           if (this.retentionDays !== undefined) {
-            config.max_age = this.retentionDays * 86_400_000_000_000; // days → ns
+            config.max_age = Math.round(this.retentionDays * NS_PER_DAY);
           }
           await this.requireJsm().streams.add(config);
         } catch (err) {
-          // Another writer created it first (same config) — fine. Re-throw anything else.
+          // Keep this swallow narrow to "already exists", so that a real add failure still surfaces
+          // instead of being cached as a stream that was never created.
           const msg = err instanceof Error ? err.message : String(err);
           if (!/already in use|already exists|name already/i.test(msg)) throw err;
         }
       })().catch((err: unknown) => {
-        // Don't poison the cache on transient failure — evict so the next call retries (BUG-01).
+        // Keep the eviction, so that a transient failure does not poison the cache with a rejected
+        // promise every later call re-awaits.
         this.ensured.delete(name);
         throw err;
       });
@@ -441,6 +448,37 @@ export class NatsPlugin implements BackendPlugin {
     if (this.jsm === undefined) throw new Error('NatsPlugin not connected — call connect() first');
     return this.jsm;
   }
+}
+
+/**
+ * A cursor this plugin minted is a decimal JetStream sequence number. Anything else is caller
+ * input (`parley_fetch_recent` takes `since` as a free string) and is rejected here rather than
+ * coerced by `Number()` into a silently-empty page or an opaque driver error.
+ */
+function parseCursor(since: Cursor | undefined): number | undefined {
+  if (since === undefined) return undefined;
+  const n = Number(since);
+  if (!/^\d+$/.test(since) || !Number.isSafeInteger(n)) {
+    throw new Error(
+      `invalid nats cursor ${JSON.stringify(String(since))} — expected a JetStream sequence number`,
+    );
+  }
+  return n;
+}
+
+/**
+ * JetStream reads `max_age: 0` as UNLIMITED, so `retention_days: 0` would mean the exact opposite
+ * of what an operator wrote, and a negative value fails later with an unrelated driver error.
+ * Reject both at connect, before a stream is created with a window that is then locked in.
+ */
+function validateRetentionDays(days: number | undefined): number | undefined {
+  if (days === undefined) return undefined;
+  if (typeof days !== 'number' || !Number.isFinite(days) || days <= 0) {
+    throw new Error(
+      `invalid retention_days ${JSON.stringify(days)} — expected a positive number of days, or omit it for unlimited retention`,
+    );
+  }
+  return days;
 }
 
 /**

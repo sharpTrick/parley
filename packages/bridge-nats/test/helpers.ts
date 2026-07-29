@@ -2,6 +2,16 @@ import { connect } from 'nats';
 
 export const SERVERS = process.env.PARLEY_NATS_SERVERS ?? '127.0.0.1:4222';
 
+/**
+ * Host/port of `SERVERS`, for anything that has to reach the server other than through the plugin
+ * (the outage proxy). Keep everything pointed at this, so that PARLEY_NATS_SERVERS can move the
+ * whole suite onto a private instance instead of contending on the shared one.
+ */
+export function serverTarget(): { host: string; port: number } {
+  const [host = '127.0.0.1', port = '4222'] = SERVERS.replace(/^nats:\/\//, '').split(':');
+  return { host, port: Number(port) };
+}
+
 export async function isNatsUp(servers: string = SERVERS): Promise<boolean> {
   try {
     const nc = await connect({ servers, timeout: 1000, maxReconnectAttempts: 0 });

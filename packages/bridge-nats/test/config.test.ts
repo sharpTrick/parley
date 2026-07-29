@@ -1,13 +1,18 @@
+import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect, nkeys, type ConnectionOptions } from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
+import { fakeJetStream, injectFake } from './fake-jetstream.js';
 
-// Class: every backend_config field the docs promise is actually honoured by the driver, and no
+// Class 1: every backend_config field the docs promise is actually honoured by the driver, and no
 // secret value is echoed back out. A credential the plugin silently drops means the operator
 // believes a cluster is authenticated when the connection is anonymous.
+// Class 2: a backend_config value is validated where it is READ, not where it eventually lands.
+// A value the backend reinterprets (JetStream reads `max_age: 0` as unlimited) or rejects much
+// later must fail at connect(), naming the field the operator actually wrote.
 vi.mock('nats', async (importOriginal) => {
   const actual = await importOriginal<typeof import('nats')>();
   return {
@@ -95,6 +100,50 @@ describe('nats backend_config — documented connection fields reach the driver'
     expect(opts.reconnectJitter).toBeGreaterThan(0);
     await plugin.disconnect();
   });
+
+  const NS_PER_DAY = 86_400_000_000_000;
+  const retentions: { value: unknown; maxAge?: number }[] = [
+    { value: undefined, maxAge: undefined },
+    { value: 30, maxAge: 30 * NS_PER_DAY },
+    { value: 1, maxAge: NS_PER_DAY },
+    { value: 0.5, maxAge: NS_PER_DAY / 2 },
+    { value: 0 },
+    { value: -0 },
+    { value: -1 },
+    { value: -0.5 },
+    { value: Number.NaN },
+    { value: Number.POSITIVE_INFINITY },
+    { value: Number.NEGATIVE_INFINITY },
+    { value: '30' },
+    { value: 'thirty' },
+    { value: null },
+    { value: true },
+    { value: [] },
+  ];
+
+  for (const r of retentions) {
+    const label = Object.is(r.value, -0)
+      ? '-0'
+      : typeof r.value === 'object'
+        ? JSON.stringify(r.value)
+        : String(r.value);
+    it(`retention_days ${label} ${r.maxAge === undefined && r.value !== undefined ? 'is rejected at connect()' : 'reaches the stream as max_age'}`, async () => {
+      const plugin = new NatsPlugin();
+      const config = r.value === undefined ? {} : { retention_days: r.value };
+
+      if (r.maxAge === undefined && r.value !== undefined) {
+        await expect(plugin.connect(config)).rejects.toThrow(/retention_days/);
+        return;
+      }
+
+      await plugin.connect(config);
+      const fake = fakeJetStream();
+      injectFake(plugin, fake);
+      await plugin.post(asTopic('retention'), asHandle('sys'), 'x');
+      expect(fake.state.added?.max_age).toBe(r.maxAge);
+      await plugin.disconnect();
+    });
+  }
 
   for (const c of cases.filter((x) => JSON.stringify(x.config).includes(SECRET))) {
     it(`never echoes the ${c.name} secret in a connection failure`, async () => {

@@ -79,7 +79,9 @@ how a topic is folded onto a subject and a stream.
 `retention_days` sets the per-topic stream's native `max_age` at creation time — JetStream's own
 built-in retention (this plugin just supplies the value), so no separate pruning code runs here.
 It's off by default — `max_age` is unset and JetStream keeps every message forever unless you opt
-in. **It only applies when this plugin is the one that creates the stream** (the first `post`,
+in. It must be a positive number of days: `0` is rejected at `connect()` rather than passed
+through, because JetStream reads `max_age: 0` as *unlimited* — the opposite of what it reads as.
+Omit the field for that, don't write `0`. **It only applies when this plugin is the one that creates the stream** (the first `post`,
 `fetchRecent`, or `subscribe` on a fresh topic) — changing `retention_days` later does not
 retroactively update an already-existing stream; use `nats stream edit` (or recreate it) for that.
 As with the other backends, catch-up after the retention window just returns less history, with no

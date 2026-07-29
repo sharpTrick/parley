@@ -13,6 +13,13 @@ export interface FakeState {
   yieldLimit: number;
   /** `streams.info` reports this as `last_seq` (models a message landing after the snapshot). */
   visibleTail?: number;
+  /**
+   * How long a pull holds the connection open when its window yields fewer than `max_messages` —
+   * the real `expires`. A read that asks for more than the stream can supply pays this in full.
+   */
+  expiryMs: number;
+  /** Config of the last `streams.add`, for retention/naming assertions. */
+  added?: { name?: string; max_age?: number; subjects?: string[] };
   /** Where the fault is injected on the read path. */
   failOn: 'get' | 'fetch' | 'iterate' | null;
   /** How many `consume()` iterators end silently — no consumer-loss status event, just EOF. */
@@ -34,6 +41,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   const state: FakeState = {
     records: [],
     yieldLimit: Number.POSITIVE_INFINITY,
+    expiryMs: 0,
     failOn: null,
     silentExits: 0,
     created: [],
@@ -46,7 +54,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
 
   const jsm = {
     streams: {
-      add: async () => ({ config: { name: 'fake' } }),
+      add: async (cfg: { name?: string; max_age?: number; subjects?: string[] }) => {
+        state.added = cfg;
+        return { config: { name: cfg.name ?? 'fake' } };
+      },
       info: async () => ({
         state: {
           messages: state.records.length,
@@ -103,11 +114,18 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
             const window = state.records
               .filter((r) => r.seq >= start)
               .slice(0, Math.min(max_messages, state.yieldLimit));
+            let done = () => undefined as void;
+            const closed = new Promise<void>((resolve) => {
+              done = () => resolve();
+            });
             return {
-              close: () => undefined,
+              close: () => done(),
               [Symbol.asyncIterator]: async function* () {
                 if (state.failOn === 'iterate') throw new Error('injected: iterator failed');
                 for (const r of window) yield { seq: r.seq, data: enc.encode(r.data) };
+                if (window.length < max_messages && state.expiryMs > 0) {
+                  await Promise.race([closed, new Promise((r) => setTimeout(r, state.expiryMs))]);
+                }
               },
             };
           },
@@ -120,12 +138,15 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   return { js, jsm, state };
 }
 
-/** Wire a fake into a plugin instance and pre-seed the stream cache so `connect()` isn't needed. */
-export function injectFake(plugin: unknown, fake: FakeJetStream, streamName: string): void {
+/**
+ * Wire a fake into a plugin instance. `streamName` pre-seeds the stream cache so `connect()` isn't
+ * needed; omit it to let the call under test drive `ensureStream` and record its `streams.add`.
+ */
+export function injectFake(plugin: unknown, fake: FakeJetStream, streamName?: string): void {
   const peek = plugin as { js: unknown; jsm: unknown; ensured: Map<string, Promise<void>> };
   peek.js = fake.js;
   peek.jsm = fake.jsm;
-  peek.ensured.set(streamName, Promise.resolve());
+  if (streamName !== undefined) peek.ensured.set(streamName, Promise.resolve());
 }
 
 export const payload = (content: string): string =>

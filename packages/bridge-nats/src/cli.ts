@@ -44,8 +44,8 @@ async function main(): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
-  // BUG-38: an orphaned bridge (parent crashed or SIGKILLed) gets stdin EOF and no signal, so keep
-  // these, so that it stops rather than heart-beating a ghost peer into every peer's roster.
+  // Keep these: an orphaned bridge (parent crashed or SIGKILLed) gets stdin EOF and no signal, so
+  // that it stops rather than heart-beating a ghost peer into every peer's roster.
   process.stdin.on('end', shutdown);
   process.stdin.on('close', shutdown);
 }
