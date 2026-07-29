@@ -1,0 +1,15 @@
+{
+  "method": "git blame at each round's BASE commit, at the finding's file:line, asking whether that line was last touched by a commit authored inside the experiment (round-1 base .. that round's base). Deterministic; no hand-coding.",
+  "caveats": [
+    "Line-granularity blame attributes the LAST touch. A round that reformats or moves a line without introducing the defect is credited with it, so this over-attributes.",
+    "A finding whose file:line points at a test rather than the defect it guards is attributed to the test's author, which is usually the previous round.",
+    "Round 1 is not gradeable: there was no prior experiment commit for a line to be attributed to."
+  ],
+  "rounds": [
+    { "round": 2, "base": "4bc04e3", "findings": 136, "graded": 136, "selfInduced": 36, "preExisting": 100, "unresolvable": 0, "selfInducedPct": 26 },
+    { "round": 3, "base": "ddbeca9", "findings": 119, "graded": 119, "selfInduced": 46, "preExisting": 73, "unresolvable": 0, "selfInducedPct": 39 }
+  ],
+  "comparison": {
+    "ouroboros": { "value": 66.7, "method": "post-hoc hand-label by the same agent that authored the fixes being judged", "note": "ouroboros's own corrections section flagged this as its weakest number" }
+  }
+}

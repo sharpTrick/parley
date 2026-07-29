@@ -198,6 +198,38 @@ retrofitted later.
   rule.
 - **E3, E4.** Not yet measurable — no round has quiesced, and cost-per-finding needs more points.
 
+### Iatrogenesis, measured rather than estimated
+
+`data/iatrogenesis.json`. For each round, `git blame` is run **at that round's base commit**, at each
+finding's `file:line`, asking whether that line was last touched by a commit authored inside the
+experiment. Deterministic, and computed by something that does not share the fixer's blind spot —
+which was the pre-registered upgrade over ouroboros's `66.7%`, a post-hoc hand-label applied by the
+same agent that wrote the fixes being judged.
+
+| round | findings | self-induced | pre-existing | % self-induced |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 136 | 36 | 100 | **26%** |
+| 3 | 119 | 46 | 73 | **39%** |
+
+Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
+
+The trend is the result: **the share of findings the loop created for itself is rising**, 26% → 39%,
+while the absolute count of pre-existing findings falls (100 → 73). That is the loop working as
+intended on the original surface and progressively turning on its own output — consistent with the
+test-integrity lens jumping to first place in round 3, and with ouroboros's two-regime split, but
+arriving much earlier here.
+
+Two caveats that cut against over-reading it. Line-granularity blame attributes the **last** touch,
+so a round that reformats or moves a line without introducing the defect is charged with it — this
+over-attributes. And a finding anchored on a *test* rather than on the code it guards is attributed
+to whoever wrote the test, which is usually the previous round. Both push the number up. It is a
+ceiling, not a point estimate.
+
+One methodological note recorded because getting it wrong is easy: the first run of this oracle
+blamed at `HEAD` instead of at each round's base, which credited later remediation commits with
+earlier findings and reported round 2 at 51% instead of 26%. The line numbers in a findings record
+are only meaningful against the tree the critic read.
+
 ### Instrument observations
 
 - **`theme` is not being used as designed.** 136 findings carried **100 distinct themes**. The field
