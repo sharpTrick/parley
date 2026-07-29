@@ -14,6 +14,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *  - a `chat_id` that is neither numeric nor `@channelusername` is REJECTED with 400 ("chat not
  *    found"), and an unknown token with 401, as the real API does. Keep both, so that the
  *    conformance suite cannot pass on topics real Telegram would refuse.
+ *  - a poll at `offset` CONFIRMS and DELETES every update below it, as the real API does — a
+ *    bridge that never advances its offset therefore re-reads a growing backlog forever here
+ *    too, instead of looking indistinguishable from a healthy one.
  *  - `sendMessage` does NOT enqueue the bot's own message as an update — mirrors real
  *    Telegram (a bot never sees its own sends via getUpdates), which forces the plugin's
  *    record-own-post-from-the-response path.
@@ -34,8 +37,10 @@ export interface FakeTelegram {
   /**
    * Like {@link injectUserMessage} but for an arbitrary `Message` shape — a captioned photo, a
    * sticker, a service message — so the plugin's normalization is exercised beyond plain text.
+   * `as` selects the update field the message rides in: `message` (groups/DMs, the default) or
+   * `channel_post` (channels, which carry no `from`).
    */
-  injectRaw(chatId: string, payload: Record<string, unknown>): number;
+  injectRaw(chatId: string, payload: Record<string, unknown>, as?: 'message' | 'channel_post'): number;
   /**
    * Like {@link injectUserMessage} but mints the message_id NOW (so it can be LOWER than a post
    * that runs next) while WITHHOLDING the update from getUpdates until `release()` — reproduces
@@ -48,11 +53,22 @@ export interface FakeTelegram {
   ): { messageId: number; release(): void };
   /** Fail every subsequent call to `method` with `status` (and Telegram's description), or clear it. */
   failMethod(method: string, failure: { status: number; description: string } | undefined): void;
+  /**
+   * Break `method` at the TRANSPORT layer rather than with a status: the request is accepted and
+   * then never answered / half-answered / cut mid-body. A client with no request timeout parks
+   * forever on all three, which no status-level failure can reproduce.
+   */
+  stallMethod(method: string, mode: StallMode | undefined): void;
   /** How many requests this fake has served for `method` — the poll loop's retry cadence. */
   callCount(method: string): number;
+  /** Updates still retained: real Telegram DROPS everything the client has acknowledged. */
+  retainedUpdates(): number;
   /** Every `sendMessage` body received, in order. */
   readonly sent: Record<string, unknown>[];
 }
+
+/** How {@link FakeTelegram.stallMethod} breaks a request. */
+export type StallMode = 'never-answer' | 'half-body' | 'close-mid-body';
 
 interface TgMessage {
   message_id: number;
@@ -66,7 +82,8 @@ interface TgMessage {
 
 interface TgUpdate {
   update_id: number;
-  message: TgMessage;
+  message?: TgMessage;
+  channel_post?: TgMessage;
 }
 
 interface ParkedPoll {
@@ -119,6 +136,9 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   /** Long-polls parked until an update they can see arrives (or their timeout lapses). */
   const parked = new Set<ParkedPoll>();
   const failures = new Map<string, { status: number; description: string }>();
+  const stalls = new Map<string, StallMode>();
+  /** Responses deliberately left hanging — closed on shutdown so the process can exit. */
+  const stalled = new Set<ServerResponse>();
   const calls = new Map<string, number>();
   const sent: Record<string, unknown>[] = [];
 
@@ -129,6 +149,27 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   };
 
   const pending = (offset: number): TgUpdate[] => updates.filter((u) => u.update_id >= offset);
+
+  /**
+   * Real Telegram treats a poll at `offset` as confirmation of everything below it and DELETES
+   * those updates. Keep that, so that a bridge which never advances its offset is visible as an
+   * ever-growing backlog re-served on every poll instead of looking identical to a healthy one.
+   */
+  const confirm = (offset: number): void => {
+    if (offset <= 0) return;
+    for (let i = updates.length - 1; i >= 0; i--) {
+      if ((updates[i]?.update_id ?? 0) < offset) updates.splice(i, 1);
+    }
+  };
+
+  /** Break a request at the transport layer (see {@link FakeTelegram.stallMethod}). */
+  const stall = (res: ServerResponse, mode: StallMode): void => {
+    stalled.add(res);
+    if (mode === 'never-answer') return;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '4096' });
+    res.write('{"ok":true,"resu');
+    if (mode === 'close-mid-body') res.socket?.destroy();
+  };
 
   const reply = (res: ServerResponse, status: number, payload: unknown): void => {
     if (res.writableEnded || res.destroyed) return;
@@ -171,6 +212,11 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     }
     const method = match[2] ?? '';
     calls.set(method, (calls.get(method) ?? 0) + 1);
+    const stallMode = stalls.get(method);
+    if (stallMode !== undefined) {
+      stall(res, stallMode);
+      return;
+    }
     const failure = failures.get(method);
     if (failure !== undefined) {
       reply(res, failure.status, {
@@ -214,6 +260,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       case 'getUpdates': {
         const offset = Number(url.searchParams.get('offset') ?? body.offset ?? 0);
         const timeoutS = Number(url.searchParams.get('timeout') ?? body.timeout ?? 0);
+        confirm(offset);
         const ready = pending(offset);
         if (ready.length > 0 || timeoutS <= 0) {
           reply(res, 200, { ok: true, result: ready });
@@ -267,9 +314,12 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     token: TOKEN,
     sent,
 
-    injectRaw(chatId: string, payload: Record<string, unknown>): number {
+    injectRaw(chatId: string, payload: Record<string, unknown>, as = 'message'): number {
       const message = enqueue(chatId, payload);
-      updates.push({ update_id: updateSeq++, message });
+      const update: TgUpdate = { update_id: updateSeq++ };
+      if (as === 'channel_post') update.channel_post = message;
+      else update.message = message;
+      updates.push(update);
       wakeParked();
       return message.message_id;
     },
@@ -301,12 +351,23 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       else failures.set(method, failure);
     },
 
+    stallMethod(method: string, mode: StallMode | undefined): void {
+      if (mode === undefined) stalls.delete(method);
+      else stalls.set(method, mode);
+    },
+
     callCount(method: string): number {
       return calls.get(method) ?? 0;
     },
 
+    retainedUpdates(): number {
+      return updates.length;
+    },
+
     async close(): Promise<void> {
       for (const poll of [...parked]) answerPoll(poll);
+      for (const res of stalled.values()) res.socket?.destroy();
+      stalled.clear();
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err === undefined || err === null ? resolve() : reject(err)));

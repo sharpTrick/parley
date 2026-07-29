@@ -198,7 +198,145 @@ describe('telegram own-post race (BUG-17)', () => {
       () => expect([...live].map((m) => m.content).sort()).toEqual(['earlier', 'ours']),
       { timeout: 3000, interval: 10 },
     );
-    expect(await contentsOf(rig.plugin, topic)).toEqual(['earlier', 'ours']);
+    // Catch-up is ordered by OBSERVATION, not by message_id: 'ours' was seen first (from the
+    // sendMessage response), so the later-delivered 'earlier' sorts after it — and therefore
+    // above every cursor already issued, instead of below them where nothing could reach it.
+    expect(await contentsOf(rig.plugin, topic)).toEqual(['ours', 'earlier']);
+  });
+
+  /**
+   * The same race at a NON-ZERO watermark, which is where an agent actually lives: it catches up
+   * to the tail, subscribes, and holds that cursor. A late arrival must reach it through ONE of
+   * the two paths — a message that is below the cursor and below the watermark is reachable
+   * through neither, and the Bot API has no history endpoint that could ever hand it back.
+   */
+  it.each([0, 1, 5, 20])(
+    'a late-delivered foreign message stays reachable with %i messages already in the topic',
+    async (depth) => {
+      const rig = await startRig();
+      const chat = '-1005556000';
+      const topic = asTopic(chat);
+      for (let i = 0; i < depth; i++) await rig.plugin.post(topic, SENDER, `prior-${i}`);
+
+      const foreign = rig.fake.injectUserMessageDeferred(chat, 'bob', 'earlier');
+      await rig.plugin.post(topic, SENDER, 'ours');
+      // The documented startup: catch up to the tail, then subscribe from it.
+      const tail = (await rig.plugin.fetchRecent({ topic, limit: 1000 })).nextCursor;
+      const live: Message[] = [];
+      await rig.plugin.subscribe(topic, (m) => live.push(m));
+      foreign.release();
+
+      await vi.waitFor(
+        async () => {
+          const caughtUp = (await rig.plugin.fetchRecent({ topic, since: tail, limit: 1000 }))
+            .messages;
+          expect([...live, ...caughtUp].map((m) => m.content)).toContain('earlier');
+        },
+        { timeout: 5000, interval: 20 },
+      );
+    },
+  );
+
+  /**
+   * Generalized: whatever order deferred foreign messages and our own posts interleave in,
+   * catch-up from a cursor must return EVERY message the store admitted after that cursor.
+   */
+  it('catch-up from a cursor returns every message observed after it, under random interleaving', async () => {
+    const rig = await startRig();
+    const chat = '-1005556001';
+    const topic = asTopic(chat);
+    await rig.plugin.post(topic, SENDER, 'seed');
+    const tail = (await rig.plugin.fetchRecent({ topic, limit: 1000 })).nextCursor;
+    const live: Message[] = [];
+    await rig.plugin.subscribe(topic, (m) => live.push(m));
+
+    const deferred: { release(): void }[] = [];
+    const K = 6;
+    for (let i = 0; i < K; i++) {
+      deferred.push(rig.fake.injectUserMessageDeferred(chat, 'bob', `foreign-${i}`));
+      await rig.plugin.post(topic, SENDER, `ours-${i}`);
+    }
+    // Deterministic shuffle: a failing order must be reproducible.
+    let seed = 12_345;
+    const order = [...deferred.keys()];
+    for (let i = order.length - 1; i > 0; i--) {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      const j = seed % (i + 1);
+      [order[i], order[j]] = [order[j] as number, order[i] as number];
+    }
+    for (const i of order) deferred[i]?.release();
+
+    const expected = [
+      ...Array.from({ length: K }, (_, i) => `foreign-${i}`),
+      ...Array.from({ length: K }, (_, i) => `ours-${i}`),
+    ];
+    await vi.waitFor(
+      async () => {
+        const caughtUp = (await rig.plugin.fetchRecent({ topic, since: tail, limit: 1000 })).messages;
+        expect([...caughtUp, ...live].map((m) => m.content).sort()).toEqual(
+          expect.arrayContaining(expected.sort()),
+        );
+      },
+      { timeout: 8000, interval: 25 },
+    );
+    const all = await contentsOf(rig.plugin, topic);
+    const caughtUp = (await rig.plugin.fetchRecent({ topic, since: tail, limit: 1000 })).messages;
+    expect(caughtUp.map((m) => m.content)).toEqual(all.slice(1));
+    expect(live.map((m) => m.content).sort()).toEqual(all.slice(1).sort());
+  }, 20_000);
+});
+
+const DATE = 1_600_000_000;
+const SENDER_CHAT = '-1005557000';
+
+/**
+ * `senderHandle` and `timestamp` are agent-visible fields no other test in this package reads:
+ * both mappings can be replaced by a constant without a single failure. Every sender shape
+ * Telegram actually emits gets pinned here, through BOTH the live-push and the catch-up path.
+ */
+const FROM_SHAPES = [
+  {
+    name: 'from with a username',
+    kind: 'message' as const,
+    payload: { from: { id: 77, is_bot: false, username: 'alice' }, text: 'a', date: DATE },
+    sender: 'alice',
+  },
+  {
+    name: 'from without a username',
+    kind: 'message' as const,
+    payload: { from: { id: 77, is_bot: false }, text: 'b', date: DATE },
+    sender: '77',
+  },
+  {
+    name: 'another bot',
+    kind: 'message' as const,
+    payload: { from: { id: 4242, is_bot: true, username: 'otherbot' }, text: 'c', date: DATE },
+    sender: 'otherbot',
+  },
+  {
+    name: 'channel post with no from',
+    kind: 'channel_post' as const,
+    payload: { text: 'd', date: DATE },
+    sender: SENDER_CHAT,
+  },
+];
+
+describe('telegram sender and timestamp mapping', () => {
+  it.each(FROM_SHAPES)('$name', async ({ kind, payload, sender }) => {
+    const rig = await startRig();
+    const topic = asTopic(SENDER_CHAT);
+    const live: Message[] = [];
+    await rig.plugin.subscribe(topic, (m) => live.push(m));
+
+    rig.fake.injectRaw(SENDER_CHAT, payload, kind);
+    await vi.waitFor(() => expect(live).toHaveLength(1), { timeout: 3000, interval: 10 });
+
+    const fetched = (await rig.plugin.fetchRecent({ topic })).messages;
+    expect(fetched).toHaveLength(1);
+    for (const msg of [live[0] as Message, fetched[0] as Message]) {
+      expect(msg.senderHandle).toBe(sender);
+      expect(Date.parse(msg.timestamp)).toBe(DATE * 1000);
+    }
   });
 });
 
@@ -270,4 +408,122 @@ describe('telegram unconfigured-chat ingest', () => {
     const lines = readFileSync(rig.storePath, 'utf8').trimEnd().split('\n');
     expect(lines.length).toBeLessThanOrEqual(2 * (2 * 4 + 2));
   });
+
+  const OPS_CHAT = '-1007007777';
+  const SENTINEL_CHAT = '-1007005555';
+  const FLOOD_CHATS = Array.from({ length: 10 }, (_, i) => `-90000${i}`);
+  /** A served chat outside the contest, so waiting for ingestion never itself serves a chat. */
+  const STARVATION_CONFIG = { observed_max_chats: 3, chat_map: { sentinel: SENTINEL_CHAT } };
+  let marker = 0;
+
+  /**
+   * Park until the poll loop has consumed everything injected so far. Updates are delivered in
+   * order, so a marker in an ALREADY-served chat pins the point — polling the topic under test
+   * would register it as served and make the starvation being tested unreproducible.
+   */
+  const drainUpdates = async (rig: Rig): Promise<void> => {
+    const content = `sentinel-${++marker}`;
+    rig.fake.injectUserMessage(SENTINEL_CHAT, 'ops', content);
+    await vi.waitFor(
+      async () => expect(await contentsOf(rig.plugin, asTopic('sentinel'))).toContain(content),
+      { timeout: 8000, interval: 20 },
+    );
+  };
+
+  const floodAndWait = async (rig: Rig): Promise<void> => {
+    for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `flood-${c}`);
+    await drainUpdates(rig);
+  };
+
+  /**
+   * The ingestion loop starts before any seam call could have named a topic, so a chat the
+   * operator configured is UNSERVED for that window. A flood arriving in it must not be able to
+   * make the operator's own messages undeliverable — the update is acknowledged to Telegram the
+   * moment it is read, so a refused record is gone for good.
+   */
+  const STARVATION_CELLS = (['never', 'fetchRecent', 'subscribe', 'post'] as const).flatMap(
+    (firstCall) =>
+      (['before', 'after'] as const)
+        .filter((flood) => !(firstCall === 'never' && flood === 'after'))
+        .map((flood) => ({ firstCall, flood })),
+  );
+
+  it.each(STARVATION_CELLS)(
+    'keeps the operator message when the topic is first named by $firstCall and the flood lands $flood it',
+    async ({ firstCall, flood }) => {
+      const rig = await startRig(STARVATION_CONFIG);
+      const topic = asTopic(OPS_CHAT);
+      const runFirstCall = async (): Promise<void> => {
+        if (firstCall === 'fetchRecent') await rig.plugin.fetchRecent({ topic });
+        if (firstCall === 'subscribe') await rig.plugin.subscribe(topic, () => undefined);
+        if (firstCall === 'post') await rig.plugin.post(topic, SENDER, 'own');
+      };
+
+      if (flood === 'before') {
+        await floodAndWait(rig);
+        await runFirstCall();
+        rig.fake.injectUserMessage(OPS_CHAT, 'alice', 'mine');
+        await drainUpdates(rig);
+      } else {
+        await runFirstCall();
+        rig.fake.injectUserMessage(OPS_CHAT, 'alice', 'mine');
+        await drainUpdates(rig);
+        await floodAndWait(rig);
+      }
+
+      expect(await contentsOf(rig.plugin, topic)).toContain('mine');
+    },
+    20_000,
+  );
+
+  /**
+   * The residual limit of that protection, pinned so the README cannot drift from it: a topic no
+   * seam call has ever named is not protected from a LATER flood — `chat_map` is what protects
+   * it, because `connect` resolves those chats before the store is even opened.
+   */
+  it('protects a topic from a later flood once chat_map names it, not before', async () => {
+    // Nothing may name the topic before the flood — a fetchRecent to check on it would itself
+    // register the chat as served, which is exactly the protection under test.
+    const unnamed = await startRig(STARVATION_CONFIG);
+    unnamed.fake.injectUserMessage(OPS_CHAT, 'alice', 'mine');
+    await drainUpdates(unnamed);
+    await floodAndWait(unnamed);
+    expect(await contentsOf(unnamed.plugin, asTopic(OPS_CHAT))).not.toContain('mine');
+
+    const mapped = await startRig({
+      ...STARVATION_CONFIG,
+      chat_map: { ...STARVATION_CONFIG.chat_map, ops: OPS_CHAT },
+    });
+    mapped.fake.injectUserMessage(OPS_CHAT, 'alice', 'mine');
+    await drainUpdates(mapped);
+    await floodAndWait(mapped);
+    expect(await contentsOf(mapped.plugin, asTopic('ops'))).toContain('mine');
+  }, 30_000);
+
+  /**
+   * A refused record is permanent message loss — the update was acknowledged to Telegram before
+   * the store saw it — so it must never be silent.
+   */
+  it('reports a record the store refuses, and does not report a plain duplicate', async () => {
+    const stderr: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    cleanups.push(() => void vi.restoreAllMocks());
+    // Both configured chats are served from connect, so the cap has no unserved chat to displace.
+    const rig = await startRig({
+      observed_max_chats: 2,
+      chat_map: { a: '-1007001001', b: '-1007001002' },
+    });
+    await rig.plugin.post(asTopic('a'), SENDER, 'a');
+    await rig.plugin.post(asTopic('b'), SENDER, 'b');
+
+    rig.fake.injectUserMessage('-1007009999', 'mallory', 'refused');
+    await vi.waitFor(() => expect(stderr.join('')).toMatch(/dropped a message for chat/), {
+      timeout: 8000,
+      interval: 20,
+    });
+    expect(stderr.join('')).toContain('-1007009999');
+  }, 20_000);
 });

@@ -4,9 +4,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { keyOf, ObservedStore, type StoredRecord } from '../src/store.js';
 
-const record = (chatId: string, messageId: number, content: string): StoredRecord => ({
+const record = (chatId: string, messageId: number, content: string, seq = messageId): StoredRecord => ({
   chat_id: chatId,
   message_id: messageId,
+  seq,
   sender: 's',
   content,
   ts: new Date().toISOString(),
@@ -39,7 +40,7 @@ describe('telegram ObservedStore durability (BUG-19 / BUG-32)', () => {
 
     const store = new ObservedStore(path);
     const recC = record('1', 3, 'third');
-    expect(store.append(recC)).toBe(true);
+    expect(store.append(recC)).toBeDefined();
     store.close();
 
     const reloaded = new ObservedStore(path);
@@ -62,7 +63,7 @@ describe('telegram ObservedStore durability (BUG-19 / BUG-32)', () => {
     store.close();
 
     // After close the fd is released: a further append is a no-op (does not touch the file).
-    expect(store.append(record('1', 99, 'x'))).toBe(false);
+    expect(store.append(record('1', 99, 'x'))).toBeUndefined();
     expect(lineCount(path)).toBe(N);
 
     const reloaded = new ObservedStore(path, N);
@@ -89,7 +90,7 @@ describe('telegram ObservedStore durability (BUG-19 / BUG-32)', () => {
       const chatIds = Array.from({ length: chats }, (_, c) => String(-1000 - c));
       for (let i = 1; i <= appends; i++) {
         for (const chatId of chatIds) {
-          expect(store.append(record(chatId, i, `m${i}`))).toBe(true);
+          expect(store.append(record(chatId, i, `m${i}`))).toBeDefined();
           expect(store.entries(chatId).length).toBeLessThanOrEqual(maxPerChat);
         }
         expect(store.size()).toBeLessThanOrEqual(maxPerChat * chats);
@@ -117,28 +118,114 @@ describe('telegram ObservedStore durability (BUG-19 / BUG-32)', () => {
     },
   );
 
-  it('bounds the number of chats, and never refuses a chat the bridge serves', () => {
+  it('bounds the number of chats, and admits a chat the bridge serves past the cap', () => {
     const store = new ObservedStore(path, 10, 2);
     store.serve('-500');
-    // Two unconfigured chats fill the cap; every further unconfigured chat is refused outright.
-    expect(store.append(record('-1', 1, 'a'))).toBe(true);
-    expect(store.append(record('-2', 1, 'b'))).toBe(true);
-    for (let i = 3; i < 30; i++) expect(store.append(record(`-${i}`, 1, 'flood'))).toBe(false);
+    // Two unconfigured chats fill the cap; further unconfigured chats displace each other.
+    expect(store.append(record('-1', 1, 'a'))).toBeDefined();
+    expect(store.append(record('-2', 1, 'b'))).toBeDefined();
+    for (let i = 3; i < 30; i++) expect(store.append(record(`-${i}`, 1, 'flood'))).toBeDefined();
+    expect(store.size()).toBe(2);
     // ...while a served chat is admitted past the cap, and stays retrievable.
-    expect(store.append(record('-500', 1, 'mine'))).toBe(true);
+    expect(store.append(record('-500', 1, 'mine'))).toBeDefined();
     expect(store.entries('-500').map((r) => r.content)).toEqual(['mine']);
     expect(store.size()).toBe(3);
-    expect(lineCount(path)).toBe(3);
     store.close();
   });
 
-  it('bounds the chat count of a file written under a looser cap', () => {
-    const lines = Array.from({ length: 30 }, (_, c) => JSON.stringify(record(`-${c}`, 1, `c${c}`)));
-    writeFileSync(path, `${lines.join('\n')}\n`);
+  it('displaces the least recently active unserved chat, never a served one', () => {
+    const store = new ObservedStore(path, 10, 3, ['-500']);
+    expect(store.append(record('-1', 1, 'a'))).toBeDefined();
+    expect(store.append(record('-2', 1, 'b'))).toBeDefined();
+    expect(store.append(record('-500', 1, 'mine'))).toBeDefined();
+    // -2 becomes the more recently active unserved chat, so -1 is the one that must go.
+    expect(store.append(record('-2', 2, 'b2'))).toBeDefined();
+    expect(store.append(record('-3', 1, 'c'))).toBeDefined();
 
-    const store = new ObservedStore(path, 10, 4);
-    expect(store.size()).toBe(4);
-    expect(lineCount(path)).toBe(4);
+    expect(store.entries('-1')).toEqual([]);
+    expect(store.entries('-2').map((r) => r.content)).toEqual(['b', 'b2']);
+    expect(store.entries('-3').map((r) => r.content)).toEqual(['c']);
+    expect(store.entries('-500').map((r) => r.content)).toEqual(['mine']);
     store.close();
+  });
+
+  it('refuses a new chat only when every retained chat is served', () => {
+    const store = new ObservedStore(path, 10, 2, ['-500', '-600']);
+    expect(store.append(record('-500', 1, 'a'))).toBeDefined();
+    expect(store.append(record('-600', 1, 'b'))).toBeDefined();
+    expect(store.append(record('-900', 1, 'flood'))).toBeUndefined();
+    expect(store.entries('-500').map((r) => r.content)).toEqual(['a']);
+    expect(store.entries('-600').map((r) => r.content)).toEqual(['b']);
+    store.close();
+  });
+
+  /**
+   * The load path is where the operator's own chat is most exposed: it runs before any seam call
+   * could name a topic, and the Bot API has no history endpoint, so a served chat dropped here
+   * is history nothing can ever rebuild. Every combination where the chats on disk exceed the
+   * cap must lose only UNSERVED chats, oldest-active first.
+   */
+  const CAP_CASES = [
+    { served: 1, flood: 3, maxChats: 2 },
+    { served: 2, flood: 1, maxChats: 2 },
+    { served: 2, flood: 8, maxChats: 3 },
+    { served: 3, flood: 5, maxChats: 4 },
+    { served: 0, flood: 6, maxChats: 2 },
+    { served: 4, flood: 4, maxChats: 1 },
+  ];
+
+  it.each(CAP_CASES)(
+    'reloading $served served + $flood unserved chats under a cap of $maxChats keeps every served chat',
+    ({ served, flood, maxChats }) => {
+      const servedIds = Array.from({ length: served }, (_, i) => `-10${i}`);
+      const floodIds = Array.from({ length: flood }, (_, i) => `-90${i}`);
+      // Interleaved, so a served chat is the oldest, the newest, and somewhere in between.
+      const order: string[] = [];
+      for (let i = 0; i < Math.max(served, flood); i++) {
+        if (i < served) order.push(servedIds[i] as string);
+        if (i < flood) order.push(floodIds[i] as string);
+      }
+      const writer = new ObservedStore(path, 10, order.length, servedIds);
+      for (const [i, id] of order.entries()) {
+        expect(writer.append(record(id, i + 1, `m-${id}`))).toBeDefined();
+      }
+      writer.close();
+
+      const reloaded = new ObservedStore(path, 10, maxChats, servedIds);
+      for (const id of servedIds) {
+        expect(reloaded.entries(id).map((r) => r.content)).toEqual([`m-${id}`]);
+      }
+      const keptFlood = Math.max(0, Math.min(flood, maxChats - served));
+      expect(reloaded.size()).toBe(served + keptFlood);
+      // The unserved survivors are the most recently active ones.
+      for (const id of floodIds.slice(0, flood - keptFlood)) expect(reloaded.entries(id)).toEqual([]);
+      for (const id of floodIds.slice(flood - keptFlood)) expect(reloaded.entries(id)).toHaveLength(1);
+      expect(lineCount(path)).toBe(served + keptFlood);
+      reloaded.close();
+    },
+  );
+
+  /**
+   * The cursor is the store's own observation sequence, not Telegram's `message_id`: it must be
+   * strictly increasing in the order records were APPENDED even when the ids they carry are not,
+   * and it must survive a reload — a cursor an agent holds outlives the process that issued it.
+   */
+  it('stamps a monotonic observation sequence regardless of message_id order, and persists it', () => {
+    const store = new ObservedStore(path, 10, 10);
+    const mids = [7, 3, 9, 1, 8];
+    const seqs = mids.map((mid) => store.append(record('-1', mid, `m${mid}`))?.seq);
+    expect(seqs).toEqual([...seqs].sort((a, b) => (a ?? 0) - (b ?? 0)));
+    expect(new Set(seqs).size).toBe(mids.length);
+    expect(store.entries('-1').map((r) => r.message_id)).toEqual(mids);
+    expect(store.maxSeq('-1')).toBe(seqs.at(-1));
+    store.close();
+
+    const reloaded = new ObservedStore(path, 10, 10);
+    expect(reloaded.entries('-1').map((r) => r.seq)).toEqual(seqs);
+    // A record observed after the reload still sorts above every cursor already handed out.
+    const next = reloaded.append(record('-1', 2, 'later'));
+    expect(next?.seq).toBeGreaterThan(seqs.at(-1) as number);
+    expect(reloaded.entries('-1').at(-1)?.content).toBe('later');
+    reloaded.close();
   });
 });

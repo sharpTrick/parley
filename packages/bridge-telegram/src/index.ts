@@ -15,7 +15,7 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
-import { keyOf, ObservedStore, type StoredRecord } from './store.js';
+import { keyOf, type ObservedRecord, ObservedStore, type StoredRecord } from './store.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
 export interface TelegramBackendConfig {
@@ -44,8 +44,8 @@ export interface TelegramBackendConfig {
   /**
    * Max distinct chats retained in the local JSONL store. Anyone who can add the bot to a
    * group can drive writes into `store_path`, so the chat count is bounded too; chats a
-   * configured topic resolves to are always retained, unconfigured ones are dropped once the
-   * cap is reached. Default 1000.
+   * configured topic resolves to are always retained, and an unconfigured chat past the cap
+   * displaces the least recently active unconfigured one. Default 1000.
    */
   observed_max_chats?: number;
 }
@@ -69,7 +69,7 @@ interface TgUpdate {
   channel_post?: TgMessage;
 }
 
-/** A live subscription: deliver anything whose `message_id` exceeds the watermark. */
+/** A live subscription: deliver anything whose observation sequence exceeds the watermark. */
 interface Subscription {
   handler: MessageHandler;
   watermark: number;
@@ -83,8 +83,8 @@ interface Subscription {
  * on `blockMs` timeout, or on disconnect. No second getUpdates consumer is ever opened.
  */
 interface Waiter {
-  /** Wake only for a message whose `message_id` is strictly greater than this. */
-  sinceMid: number;
+  /** Wake only for a message whose observation sequence is strictly greater than this. */
+  sinceSeq: number;
   /** Idempotently unpark (message arrived, timeout, or disconnect) — self-cleans the waiter. */
   wake: () => void;
 }
@@ -104,10 +104,11 @@ interface Waiter {
  * (DESIGN §6); within the observed window the contract holds fully.
  *
  * IDs: `backendMsgId = '<chat_id>:<message_id>'` (composite — Telegram's `message_id` is only
- * unique PER CHAT) and `cursor = String(message_id)` (cursors are per-topic, a topic maps to
- * exactly one chat, and per-chat `message_id`s are monotonically increasing, so the bare
- * `message_id` is a valid topic cursor). Exclusive-`since` is a NUMERIC compare — never
- * lexical (`'10' < '9'` lexically).
+ * unique PER CHAT) and `cursor = String(seq)`, the store's local OBSERVATION sequence. Telegram's
+ * own `message_id` is minted when the sender's message is accepted, not when this bridge sees it,
+ * so a foreign message minted before our post can be delivered after it and would sit forever
+ * below a cursor already handed out; observation order is monotonic by construction and cannot.
+ * Exclusive-`since` is a NUMERIC compare — never lexical (`'10' < '9'` lexically).
  *
  * Everything internal — the observed store, live subscriptions, long-poll waiters — is keyed by
  * the CANONICAL NUMERIC CHAT ID a topic resolves to, never by the topic string. `chat_map`, an
@@ -140,10 +141,13 @@ export class TelegramPlugin implements BackendPlugin {
   private canonicalById = new Map<string, Promise<string>>();
   /** Memoized topic → canonical numeric chat id (chat_map or literal, `@name` resolved). */
   private chatIdByTopic = new Map<string, Promise<string>>();
-  /** Wall-clock of the last poll-loop diagnostic, so a persistent failure can't flood stderr. */
-  private lastPollReportAt = 0;
+  /** Wall-clock of the last diagnostic PER KIND, so one failure can't silence an unrelated one. */
+  private readonly lastReportAt = new Map<string, number>();
 
   async connect(config: BackendConfig): Promise<void> {
+    if (this.store !== undefined) {
+      throw new Error('TelegramPlugin: already connected — call disconnect() first');
+    }
     const cfg = config as TelegramBackendConfig;
     this.apiUrl = (cfg.api_url ?? 'https://api.telegram.org').replace(/\/+$/, '');
     this.token = cfg.token ?? '';
@@ -159,19 +163,18 @@ export class TelegramPlugin implements BackendPlugin {
     // Preflight: an unusable token or api_url must fail `connect` rather than come up as a
     // silent black hole that polls a rejecting API forever. Also warms the resolveIdentity memo.
     await this.getMe();
+    // Resolve the configured chats BEFORE the store exists: the store needs the served set at
+    // load time, or its chat cap evicts the operator's own chat in favour of a chat anyone who
+    // added the bot to a group created — history the Bot API can never backfill.
+    const served: string[] = [];
+    for (const topic of Object.keys(this.chatMap)) served.push(await this.chatIdFor(asTopic(topic)));
     // Load the observed-message store up front — fetchRecent is a pure in-memory query.
     this.store = new ObservedStore(
       cfg.store_path ?? 'parley-telegram.jsonl',
       cfg.observed_retention_per_topic,
       cfg.observed_max_chats,
+      served,
     );
-    try {
-      for (const topic of Object.keys(this.chatMap)) await this.chatIdFor(asTopic(topic));
-    } catch (err) {
-      this.store.close();
-      this.store = undefined;
-      throw err;
-    }
     // ONE shared ingestion loop per instance (one getUpdates consumer per token — see class doc).
     void this.pollLoop().catch((err: unknown) => {
       this.report(`getUpdates loop stopped: ${describe(err)}`);
@@ -217,8 +220,7 @@ export class TelegramPlugin implements BackendPlugin {
     // or thread onto an unrelated message that happens to share the number.
     const replyMid = parseCompositeMid(opts?.inReplyTo, chatId);
     if (replyMid !== undefined) body.reply_to_message_id = replyMid;
-    const res = await this.http('POST', '/sendMessage', { body });
-    const json = (await res.json()) as { result: TgMessage };
+    const json = await this.call<{ result: TgMessage }>('POST', '/sendMessage', { body });
     this.ingest(String(json.result.chat.id), json.result);
     return asBackendMsgId(keyOf({ chat_id: String(json.result.chat.id), message_id: json.result.message_id }));
   }
@@ -226,10 +228,15 @@ export class TelegramPlugin implements BackendPlugin {
   /**
    * Durable catch-up = a pure query over the observed-message store (no network — the Bot API
    * has no history endpoint; see the class doc for what that means). Exclusive `since` via a
-   * NUMERIC `message_id` compare, ascending, sliced to `limit`.
+   * NUMERIC observation-sequence compare, ascending, sliced to `limit`.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const store = this.require(this.store);
+    if (args.since !== undefined && !/^\d+$/.test(args.since as string)) {
+      throw new Error(
+        `TelegramPlugin: malformed cursor '${args.since as string}' for topic '${args.topic as string}'`,
+      );
+    }
     const chatId = await this.chatIdFor(args.topic);
     // Normalize BEFORE slicing: a non-positive limit must mean "no messages" on both branches
     // (`slice(-0)` is `slice(0)` — the whole history — which would invert the argument).
@@ -241,7 +248,7 @@ export class TelegramPlugin implements BackendPlugin {
           ? // Default window: the most recent `limit` messages, ascending.
             all.slice(Math.max(0, all.length - limit))
           : // Exclusive: strictly after `since`, ascending. Numeric — never lexical.
-            all.filter((r) => r.message_id > Number(args.since)).slice(0, limit);
+            all.filter((r) => r.seq > Number(args.since)).slice(0, limit);
       return slice.map((rec) => recordToMessage(rec, args.topic));
     };
     let messages = query();
@@ -273,7 +280,7 @@ export class TelegramPlugin implements BackendPlugin {
    * the waiter. The waiter always self-cleans (timer cleared, removed from the set), so a
    * timed-out or resolved long-poll never leaks.
    */
-  private waitForMessage(chatId: string, sinceMid: number, blockMs: number): Promise<void> {
+  private waitForMessage(chatId: string, sinceSeq: number, blockMs: number): Promise<void> {
     const key = chatId;
     let set = this.waiters.get(key);
     if (set === undefined) {
@@ -292,29 +299,29 @@ export class TelegramPlugin implements BackendPlugin {
         resolve();
       };
       const timer = setTimeout(wake, blockMs);
-      const waiter: Waiter = { sinceMid, wake };
+      const waiter: Waiter = { sinceSeq, wake };
       waiters.add(waiter);
     });
   }
 
-  /** Wake any native long-poll waiter on the chat whose `since` now trails `messageId` (issue #20). */
-  private wakeWaiters(chatId: string, messageId: number): void {
+  /** Wake any native long-poll waiter on the chat whose `since` now trails `seq` (issue #20). */
+  private wakeWaiters(chatId: string, seq: number): void {
     const set = this.waiters.get(chatId);
     if (set === undefined) return;
     // Snapshot: wake() removes the waiter from the set (and may drop the key).
-    for (const w of [...set]) if (messageId > w.sinceMid) w.wake();
+    for (const w of [...set]) if (seq > w.sinceSeq) w.wake();
   }
 
   /**
-   * Live path: register on the shared `getUpdates` loop. The watermark (current max
-   * `message_id` for the topic) is established SYNCHRONOUSLY before this resolves, so a post
-   * racing a fresh subscribe can never be missed — the ingest path delivers anything newer,
+   * Live path: register on the shared `getUpdates` loop. The watermark (current max observation
+   * sequence for the topic) is established SYNCHRONOUSLY before this resolves, so a post racing
+   * a fresh subscribe can never be missed — the ingest path delivers anything observed after,
    * in ascending order. Starts at the tail: history is owned by catch-up, not push.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const store = this.require(this.store);
     const chatId = await this.chatIdFor(topic);
-    const sub: Subscription = { handler, watermark: store.maxMessageId(chatId), topic };
+    const sub: Subscription = { handler, watermark: store.maxSeq(chatId), topic };
     const list = this.subs.get(chatId);
     if (list === undefined) this.subs.set(chatId, [sub]);
     else list.push(sub);
@@ -380,11 +387,11 @@ export class TelegramPlugin implements BackendPlugin {
     }
     const cached = this.canonicalById.get(chat);
     if (cached !== undefined) return cached;
-    const pending = this.http('GET', `/getChat?chat_id=${encodeURIComponent(chat)}`)
-      .then(async (res) => {
-        const json = (await res.json()) as { result: { id: number } };
-        return String(json.result.id);
-      })
+    const pending = this.call<{ result: { id: number } }>(
+      'GET',
+      `/getChat?chat_id=${encodeURIComponent(chat)}`,
+    )
+      .then((json) => String(json.result.id))
       .catch((err: unknown) => {
         // Don't poison the memo on transient failure — let the next call retry.
         this.canonicalById.delete(chat);
@@ -396,35 +403,44 @@ export class TelegramPlugin implements BackendPlugin {
 
   /**
    * The single ingestion point for an observed message (own send or getUpdates delivery):
-   * dedup on the composite id, persist to the store, then deliver to any live subscriber.
+   * dedup on the composite id, persist to the store under a fresh observation sequence, then
+   * deliver to any live subscriber.
    *
-   * BUG-17: the store's dedup set is the once-only guarantee — `store.append` returning `true`
-   * already proves this message was never observed, so it is delivered unconditionally. The
-   * per-subscriber watermark is the FIXED value captured AT subscribe (deliver only messages
-   * newer than the subscribe point — "history is owned by catch-up, not push"); it is NEVER
-   * advanced here. Advancing it let an own post (higher `message_id`) move the bar past a
-   * foreign message accepted just before it (lower `message_id`) that arrives moments later,
-   * permanently dropping it. Losing strict ascending order in this sub-second race is strictly
-   * better than permanent loss; core dedups the push on `backendMsgId`.
+   * BUG-17: the store's dedup set is the once-only guarantee — a record back from `store.append`
+   * already proves this message was never observed. The per-subscriber watermark is the FIXED
+   * observation sequence captured AT subscribe (deliver only what was observed after the
+   * subscribe point — "history is owned by catch-up, not push"); it is NEVER advanced here.
+   * Because the sequence is stamped in OBSERVATION order, a foreign message accepted before our
+   * own post but delivered after it still lands above the watermark and above every cursor
+   * already handed out, so it reaches both the push path and catch-up.
    */
   private ingest(chatId: string, msg: TgMessage): void {
     const store = this.store;
     if (store === undefined) return; // raced disconnect; drop.
     const content = contentOf(msg);
     if (content === undefined) return; // an update carrying nothing an agent could read.
-    const rec: StoredRecord = {
+    const observed: ObservedRecord = {
       chat_id: chatId,
       message_id: msg.message_id,
       sender: senderOf(msg),
       content,
       ts: new Date(msg.date * 1000).toISOString(),
     };
-    if (!store.append(rec)) return; // already observed, or past the store's bounds (DESIGN §6).
+    const rec = store.append(observed);
+    if (rec === undefined) {
+      if (!store.has(keyOf(observed))) {
+        this.report(
+          `dropped a message for chat ${chatId}: the observed store holds its maximum number of chats`,
+          { throttleAs: 'store-refused' },
+        );
+      }
+      return; // already observed, or past the store's bounds (DESIGN §6).
+    }
     // Native long-poll (issue #20): a genuinely-new message wakes any parked fetchRecent on this
     // chat. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
-    this.wakeWaiters(chatId, msg.message_id);
+    this.wakeWaiters(chatId, rec.seq);
     for (const sub of this.subs.get(chatId) ?? []) {
-      if (msg.message_id <= sub.watermark) continue; // fixed subscribe-time value; never advanced.
+      if (rec.seq <= sub.watermark) continue; // fixed subscribe-time value; never advanced.
       try {
         sub.handler(recordToMessage(rec, sub.topic));
       } catch {
@@ -443,16 +459,13 @@ export class TelegramPlugin implements BackendPlugin {
   private async pollLoop(): Promise<void> {
     let offset = 0;
     while (!this.stopped) {
-      const controller = new AbortController();
-      this.controllers.add(controller);
       let updates: TgUpdate[];
       try {
-        const res = await this.http(
+        const json = await this.call<{ result?: TgUpdate[] }>(
           'GET',
           `/getUpdates?timeout=${this.pollTimeoutS}&offset=${offset}`,
-          { signal: controller.signal },
+          { budgetMs: this.pollBudgetMs(), abortOnDisconnect: true },
         );
-        const json = (await res.json()) as { result?: TgUpdate[] };
         updates = json.result ?? [];
       } catch (err) {
         if (this.stopped) break;
@@ -466,11 +479,9 @@ export class TelegramPlugin implements BackendPlugin {
         // it (Telegram allows exactly one) or a webhook is registered (call deleteWebhook).
         // Telegram's own description says which — it rides along in the error text.
         const conflict = statusOf(err) === 409;
-        this.report(`getUpdates failed, retrying: ${describe(err)}`, { rateLimited: true });
+        this.report(`getUpdates failed, retrying: ${describe(err)}`, { throttleAs: 'poll-failure' });
         await delay(conflict ? 3000 : 500);
         continue;
-      } finally {
-        this.controllers.delete(controller);
       }
       if (this.stopped) break;
       for (const u of updates) {
@@ -482,20 +493,33 @@ export class TelegramPlugin implements BackendPlugin {
         } catch (err) {
           // Keep the loop alive across a failing store write (ENOSPC/EIO): losing one message is
           // recoverable, losing the only getUpdates consumer takes live push down for good.
-          this.report(`dropped update ${u.update_id}: ${describe(err)}`, { rateLimited: true });
+          this.report(`dropped update ${u.update_id}: ${describe(err)}`, { throttleAs: 'ingest' });
         }
       }
     }
   }
 
   /**
-   * Diagnostics go to stderr — stdout is the MCP JSON-RPC channel (see cli.ts). `rateLimited`
-   * throttles a persistent failure to one line a minute rather than one per retry.
+   * Wall-clock ceiling on one `getUpdates`: the long poll plus 40% slack, at least 2s. Keep a
+   * ceiling on it, so that a connection accepted and never answered (idle NAT drop, hung proxy)
+   * cannot park the single ingestion loop for the lifetime of the process.
    */
-  private report(message: string, opts?: { rateLimited?: boolean }): void {
-    const now = Date.now();
-    if (opts?.rateLimited === true && now - this.lastPollReportAt < 60_000) return;
-    this.lastPollReportAt = now;
+  private pollBudgetMs(): number {
+    return this.pollTimeoutS * 1000 + Math.max(2_000, this.pollTimeoutS * 400);
+  }
+
+  /**
+   * Diagnostics go to stderr — stdout is the MCP JSON-RPC channel (see cli.ts). `throttleAs`
+   * names a failure CLASS and throttles it to one line a minute; classes throttle independently,
+   * so a chattering poll failure cannot silence a store write that is losing messages.
+   */
+  private report(message: string, opts?: { throttleAs?: string }): void {
+    const kind = opts?.throttleAs;
+    if (kind !== undefined) {
+      const now = Date.now();
+      if (now - (this.lastReportAt.get(kind) ?? 0) < 60_000) return;
+      this.lastReportAt.set(kind, now);
+    }
     process.stderr.write(`parley-telegram: ${message}\n`);
   }
 
@@ -503,11 +527,8 @@ export class TelegramPlugin implements BackendPlugin {
   private getMe(): Promise<{ id: number; username?: string }> {
     const existing = this.me;
     if (existing !== undefined) return existing;
-    const pending = this.http('GET', '/getMe')
-      .then(async (res) => {
-        const json = (await res.json()) as { result: { id: number; username?: string } };
-        return json.result;
-      })
+    const pending = this.call<{ result: { id: number; username?: string } }>('GET', '/getMe')
+      .then((json) => json.result)
       .catch((err: unknown) => {
         // Don't poison the memo on transient failure — let the next call retry.
         this.me = undefined;
@@ -518,35 +539,51 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Single HTTP entry point (`<api_url>/bot<token><path>`). JSON encodes, and transparently
-   * retries on 429 honoring Telegram's `parameters.retry_after` (SECONDS). Retries stop the
-   * moment we disconnect. Throws on any other non-2xx with the status in the message (the
-   * poll loop matches `→ 409` to detect a competing poller).
+   * Single HTTP entry point (`<api_url>/bot<token><path>`) → parsed JSON body. Transparently
+   * retries on 429 honoring Telegram's `parameters.retry_after` (SECONDS); retries stop the
+   * moment we disconnect. Throws on any other non-2xx with the status in the message (the poll
+   * loop matches `→ 409` to detect a competing poller).
+   *
+   * The request AND the body read run under one abort budget: a server that accepts the
+   * connection and then answers slowly, half-answers, or never answers must surface as a
+   * retryable error rather than parking the caller forever.
    */
-  private async http(
+  private async call<T>(
     method: string,
     path: string,
-    opts?: { body?: unknown; signal?: AbortSignal },
-  ): Promise<Response> {
+    opts?: { body?: unknown; budgetMs?: number; abortOnDisconnect?: boolean },
+  ): Promise<T> {
     const url = `${this.apiUrl}/bot${this.token}${path}`;
     const headers: Record<string, string> = {};
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
-
-    return fetchWithRetry(
-      url,
-      {
-        method,
-        headers,
-        body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
-        signal: opts?.signal,
-      },
-      {
-        label: `Telegram ${method} ${path}`,
-        // Stop retrying once disconnected — don't keep hammering the API post-teardown.
-        isStopped: () => this.stopped,
-        retryAfterOf: readRetryAfter,
-      },
-    );
+    const label = `Telegram ${method} ${path.split('?')[0] ?? path}`;
+    const budgetMs = opts?.budgetMs ?? REQUEST_BUDGET_MS;
+    const controller = new AbortController();
+    if (opts?.abortOnDisconnect === true) this.controllers.add(controller);
+    const timer = setTimeout(() => {
+      controller.abort(new Error(`${label} timed out after ${budgetMs}ms with no response`));
+    }, budgetMs);
+    try {
+      const res = await fetchWithRetry(
+        url,
+        {
+          method,
+          headers,
+          body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
+          signal: controller.signal,
+        },
+        {
+          label,
+          // Stop retrying once disconnected — don't keep hammering the API post-teardown.
+          isStopped: () => this.stopped,
+          retryAfterOf: readRetryAfter,
+        },
+      );
+      return (await res.json()) as T;
+    } finally {
+      clearTimeout(timer);
+      this.controllers.delete(controller);
+    }
   }
 
   private require<T>(value: T | undefined): T {
@@ -623,9 +660,12 @@ function recordToMessage(rec: StoredRecord, topic: Topic): Message {
     content: rec.content,
     timestamp: rec.ts,
     id: keyOf(rec),
-    cursor: String(rec.message_id),
+    cursor: String(rec.seq),
   });
 }
+
+/** Wall-clock ceiling on one non-poll call, matching net-util's own per-call deadline. */
+const REQUEST_BUDGET_MS = 30_000;
 
 /** HTTP status carried by a {@link fetchWithRetry} error (`<label> → <status>: <body>`). */
 function statusOf(err: unknown): number | undefined {

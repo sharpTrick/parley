@@ -18,13 +18,13 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 
 | Seam concept       | Telegram mapping |
 | ------------------ | ---------------- |
-| `connect(config)`  | Verifies the token with `getMe` (**fails fast** — a missing/revoked token or wrong `api_url` rejects `connect` rather than coming up as a silent black hole), loads the observed-message store from `store_path`, resolves every `chat_map` entry, then starts the single shared `getUpdates` long-poll loop. |
+| `connect(config)`  | Verifies the token with `getMe` (**fails fast** — a missing/revoked token or wrong `api_url` rejects `connect` rather than coming up as a silent black hole), resolves every `chat_map` entry, loads the observed-message store from `store_path` *knowing which chats it serves*, then starts the single shared `getUpdates` long-poll loop. Connecting an already-connected instance is an error — one loop and one store per instance. |
 | topic → chat       | `chat_map[topic]` if present, else the topic string is used as the chat id **literal**. Either way it must be a numeric id or `@channelusername` — anything else is rejected (Telegram answers 400 "chat not found"), never silently accepted as an empty topic. `@name` is resolved to its numeric id once via `getChat`, and **everything the plugin stores or routes is keyed by that numeric id**, so a chat named three different ways is one topic's worth of history no matter which seam call ran first. One topic ↔ one chat. |
 | `post`             | `POST /bot<token>/sendMessage` `{ chat_id, text, reply_to_message_id? }` → the returned message object is ingested into the local store immediately (own posts **never** arrive via `getUpdates`). `inReplyTo` threads via `reply_to_message_id: mid` only when it is a `<chat>:<mid>` composite naming **this** chat (`message_id` is unique per chat, so a composite from another chat is ignored). |
 | `backendMsgId`     | **Composite `<chat_id>:<message_id>`** — Telegram's `message_id` is only unique *per chat*, so the chat id is baked into the dedup key. |
-| `cursor`           | **`String(message_id)`** — cursors are per-topic, a topic maps to exactly one chat, and per-chat `message_id`s are monotonically increasing. Exclusive-`since` is a **numeric** compare, never lexical. Zero cursor is `'0'`. |
-| `fetchRecent`      | A pure query over the local observed-message store — no network call exists that could serve it (see **History limitations**). Ascending, exclusive `since`, default window = most recent `limit` (100). |
-| `subscribe`        | Registers on the **one shared** `getUpdates` long-poll loop (`timeout=<poll_timeout_s>`, `offset` = confirmed `update_id + 1`). Watermark = current max `message_id` for the topic, taken synchronously **before** `subscribe` resolves; starts at the tail — history is owned by catch-up. Accepts both `message` and `channel_post` updates. `disconnect()` aborts the in-flight long-poll. |
+| `cursor`           | **`String(seq)`**, the store's own **observation sequence** — the order this bridge *saw* the message, not Telegram's `message_id`. A `message_id` is minted when the sender's message is accepted, so a message minted *before* one of our posts can be delivered *after* it and would sit forever below a cursor already issued; observation order is monotonic by construction. Exclusive-`since` is a **numeric** compare, never lexical. Zero cursor is `'0'`; a `since` that is not a run of digits is rejected as a malformed cursor rather than answered with a permanently empty page. |
+| `fetchRecent`      | A pure query over the local observed-message store — no network call exists that could serve it (see **History limitations**). Ascending **by observation order**, exclusive `since`, default window = most recent `limit` (100). |
+| `subscribe`        | Registers on the **one shared** `getUpdates` long-poll loop (`timeout=<poll_timeout_s>`, `offset` = confirmed `update_id + 1`, and a watchdog that abandons and re-polls a request the server accepts but never answers). Watermark = current max **observation sequence** for the topic, taken synchronously **before** `subscribe` resolves; starts at the tail — history is owned by catch-up. Accepts both `message` and `channel_post` updates. `disconnect()` aborts the in-flight long-poll. |
 | `resolveIdentity`  | The bot's own username (via memoized `getMe`) resolves to its numeric id; any other handle passes through as a name convention — the Bot API cannot look up arbitrary users. |
 
 `senderHandle` ← `from.username ?? String(from.id)` (usernames are optional on Telegram; the
@@ -60,10 +60,17 @@ everything delivered by `getUpdates`. Consequences:
   observed history; a new path starts empty.
 - It is **bounded**, on load and on every append: the newest `observed_retention_per_topic`
   (default 10000) records **per chat**, across at most `observed_max_chats` (default 1000)
-  chats. Anything older or beyond the chat cap is dropped and the file is compacted, so raise
-  `observed_retention_per_topic` if you need `fetchRecent` to replay a deeper window. The
-  chat cap only ever refuses chats **no configured topic names** — a chat one of your topics
-  resolves to is always retained, so a bot added to a flood of groups cannot crowd it out.
+  chats. Anything older is dropped and the file is compacted, so raise
+  `observed_retention_per_topic` if you need `fetchRecent` to replay a deeper window.
+- The chat cap **never evicts a chat this bridge serves** — one a `chat_map` entry resolves to,
+  or one a seam call has named — on load or at runtime. A new unserved chat displaces the least
+  recently active *unserved* chat instead, so a bot added to a flood of groups cannot crowd out
+  your own topics or starve them of admission. The one gap: a topic used as a **chat-id literal**
+  is not known to the bridge until some seam call names it, so a flood arriving in that window
+  can still displace it. **List the topics you care about in `chat_map`** — `connect` resolves
+  those before the store is even opened, which closes the window entirely.
+- Compaction replaces the file by **rename**, never in place: a crash or a full disk mid-compaction
+  leaves the previous file intact rather than a truncated one.
 - Within the observed window the seam contract holds fully: stable ids, monotonic exclusive
   cursors, dedup across `getUpdates` backlog replays, cold-restart replay.
 
@@ -82,7 +89,7 @@ store's dedup makes the replay harmless.
 | `poll_timeout_s` | `25`                       | `getUpdates` long-poll timeout, in **seconds** (Telegram's unit). Latency/cost knob only. |
 | `chat_map`       | _(empty)_                  | Parley topic → chat id (numeric or `@channelusername`). Unmapped topics are used as the chat id literal. |
 | `observed_retention_per_topic` | `10000`      | Newest-N observed records kept **per chat**, enforced on load *and* on every append; the file is compacted when records are evicted. Bounds how deep `fetchRecent` can replay — see **History limitations**. |
-| `observed_max_chats` | `1000`                 | Max distinct chats kept in the store. Chats a configured topic resolves to are always kept; unconfigured ones (the bot can be added to a group by anyone) are dropped once the cap is reached. |
+| `observed_max_chats` | `1000`                 | Max distinct chats kept in the store. Chats this bridge serves (a `chat_map` entry, or a topic a seam call has named) are never evicted; unconfigured ones (the bot can be added to a group by anyone) displace each other least-recently-active first once the cap is reached. |
 
 ## Provisioning a bot
 
@@ -128,6 +135,8 @@ npx vitest run packages/bridge-telegram
 
 The shared seam conformance suite (`@sharptrick/parley-conformance`) runs against an
 **in-process fake Bot API** (`test/fake-telegram.ts` — real long-poll parking, per-chat
-`message_id` counters, `offset` acknowledgement, and faithfully *not* echoing the bot's own
-sends as updates), so it always runs — no external service, no real token. An extra unit test
-covers the foreign-message ingestion path and cold-restart store replay.
+`message_id` counters, `offset` acknowledgement that *confirms and drops* consumed updates,
+transport-level stalls, and faithfully *not* echoing the bot's own sends as updates), so it
+always runs — no external service, no real token. Extra unit tests cover the foreign-message
+ingestion path, cold-restart store replay, the store's retention guarantees, and recovery from
+a long poll the server never answers.
