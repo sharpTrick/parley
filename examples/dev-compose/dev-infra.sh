@@ -85,6 +85,13 @@ up_matrix() {
     -u parley -p parleypass -a -c /data/homeserver.yaml http://localhost:8008 2>/dev/null \
     && log "registered matrix user @parley:parley.local" \
     || log "matrix user @parley:parley.local already present"
+  # A SECOND account, as the xmpp path also does: the configuration the README calls production is
+  # one room per topic with a DISTINCT account per session, and every such room is invite-only — so
+  # only two accounts can observe whether a peer can read and write a topic the other one created.
+  "${COMPOSE[@]}" exec -T synapse register_new_matrix_user \
+    -u parley2 -p parleypass2 -a -c /data/homeserver.yaml http://localhost:8008 2>/dev/null \
+    && log "registered matrix user @parley2:parley.local" \
+    || log "matrix user @parley2:parley.local already present"
 }
 
 up_keycloak() {
