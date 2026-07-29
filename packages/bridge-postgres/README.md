@@ -17,11 +17,19 @@ required **zero** `@sharptrick/parley-core` changes.
 | `subscribe` | **`LISTEN`** on channel `parley_<md5(topic)>`, rung by an `AFTER INSERT` trigger; each notification drains `seq > lastSeen` |
 | `resolveIdentity` | `<table>_senders` registry; unknown handles register on first sight with `backendRef = handle` |
 
+Both registration paths (`post` and `resolveIdentity`) insert `ON CONFLICT (handle) DO NOTHING`, so
+a row already in `<table>_senders` wins: an operator may pre-register a handle with a `backend_ref`
+of their own and `resolveIdentity` returns that instead of echoing the handle.
+
 The NOTIFY payload (the new `seq`) is a **hint only** — payloads are size-limited and delivery is
 best-effort across reconnects, so subscribers always re-query from their last-seen cursor. A
 coalesced or dropped notification costs latency, never a message. The channel name is
-`'parley_' || md5(topic)`: fixed length, so any topic string stays under PostgreSQL's 63-byte
-identifier limit with no injection surface.
+`'parley_' || md5(convert_to(topic, 'UTF8'))`: fixed length, so any topic string stays under
+PostgreSQL's 63-byte identifier limit with no injection surface. The `convert_to` cast is
+load-bearing and not decorative — Node hashes UTF-8 bytes, so the trigger must too, or on a
+database whose `server_encoding` is not UTF8 the two digests diverge and the whole live path goes
+silently dead. Any off-Parley `NOTIFY` producer or hand-written `LISTEN` client must use the same
+spelling.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
 nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
@@ -48,7 +56,7 @@ name is lower-cased and double-quoted everywhere it reaches SQL, so a reserved w
 backend_config.table_name — …`.
 
 `retention_days` deletes rows older than the window on connect and hourly thereafter, in batches
-of 5000 rows per statement against an index on `ts`, so the first prune after enabling retention
+of 5000 rows per statement, so the first prune after enabling retention
 on a large table cannot become one long DELETE that every `post()` queues behind. `seq` is a
 `BIGSERIAL` and is never reused, so a cursor minted before a prune stays valid: a stale reader
 just gets fewer rows back, never a wrong or duplicate one. The sender registry is not pruned —
@@ -75,6 +83,10 @@ config:
   completely different table than in `app_messages`; every other field can look consistent while
   history silently splits in two.
 - **`pool_size`** is safe to vary per session — it's per-instance capacity, not shared state.
+
+`connect()`'s bootstrap is idempotent and, on a table that is already bootstrapped, takes no
+table-level lock: the `CREATE TRIGGER` runs only when the trigger is missing. A rolling restart
+therefore does not stall the other processes' `post()`s.
 
 Cross-process write safety is structural, not configured: `post` wraps every insert in a
 transaction that takes `pg_advisory_xact_lock(hashtext(topic))` first. `BIGSERIAL` assigns `seq`

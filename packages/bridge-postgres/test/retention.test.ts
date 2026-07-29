@@ -1,38 +1,11 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
-import { Client } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { dropTable, isUp, PG_URL, rand, withAdmin } from './pg-harness.js';
 
 // Postgres creates and wholly owns its message table, so DESIGN §11 puts the retention knob on it
 // alongside sqlite/redis/nats. A config key that a sibling backend honours must never be silently
 // dropped here — an operator who sets it and sees no error must actually get pruning.
-
-const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-
-async function isUp(url: string): Promise<boolean> {
-  const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.query('SELECT 1');
-    await c.end();
-    return true;
-  } catch {
-    await c.end().catch(() => undefined);
-    return false;
-  }
-}
-
-async function dropTable(table: string): Promise<void> {
-  const admin = new Client({ connectionString: PG_URL });
-  admin.on('error', () => undefined);
-  await admin.connect();
-  await admin.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
-  await admin.query(`DROP TABLE IF EXISTS ${table}_senders CASCADE`);
-  await admin.query(`DROP FUNCTION IF EXISTS ${table}_notify() CASCADE`);
-  await admin.end();
-}
 
 if (await isUp(PG_URL)) {
   describe('retention_days (DESIGN §11)', () => {
@@ -85,15 +58,13 @@ if (await isUp(PG_URL)) {
       await seeder.connect({ url: PG_URL, table_name: table });
       await seeder.disconnect();
 
-      const admin = new Client({ connectionString: PG_URL });
-      admin.on('error', () => undefined);
-      await admin.connect();
-      await admin.query(
-        `INSERT INTO "${table}" (topic, sender, content, ts, in_reply_to)
-         SELECT $1, 'u', 'm' || g, $2, NULL FROM generate_series(1, $3::int) g`,
-        [topic, new Date(Date.now() - 86_400_000).toISOString(), backlog],
-      );
-      await admin.end();
+      await withAdmin(async (admin) => {
+        await admin.query(
+          `INSERT INTO "${table}" (topic, sender, content, ts, in_reply_to)
+           SELECT $1, 'u', 'm' || g, $2, NULL FROM generate_series(1, $3::int) g`,
+          [topic, new Date(Date.now() - 86_400_000).toISOString(), backlog],
+        );
+      });
 
       const plugin = new PostgresPlugin();
       await plugin.connect({ url: PG_URL, table_name: table, retention_days: 1 / 86_400_000 });

@@ -27,6 +27,11 @@ const state = vi.hoisted(() => ({
   // When set, the next `new Client().connect()` parks on this deferred (used to hold a reconnect
   // candidate mid-connect while a disconnect() races it).
   connectGate: null as Deferred | null,
+  // When set, the next `query('LISTEN …')` parks on this deferred — the window in which a
+  // disconnect() can land between "the LISTEN was issued" and "the subscription was registered".
+  listenGate: null as Deferred | null,
+  /** Every channel a LISTEN was issued for, in order. */
+  listenAttempts: [] as string[],
   // When true, `query('LISTEN …')` rejects (drives the failed-subscribe path).
   listenRejects: false,
   // The table, per topic. Rows STAY here: what a query returns is decided by the SQL's cursor
@@ -64,8 +69,16 @@ vi.mock('pg', async () => {
       }
     }
     async query(sql: string): Promise<{ rows: unknown[] }> {
-      if (state.listenRejects && /LISTEN/.test(sql)) throw new Error('LISTEN failed (mock)');
       const listen = /^LISTEN "(.+)"$/.exec(sql);
+      if (listen !== null) {
+        state.listenAttempts.push(listen[1] as string);
+        const gate = state.listenGate;
+        if (gate !== null) {
+          state.listenGate = null;
+          await gate.promise;
+        }
+      }
+      if (state.listenRejects && /LISTEN/.test(sql)) throw new Error('LISTEN failed (mock)');
       if (listen !== null) this.listened.push(listen[1] as string);
       return { rows: [] };
     }
@@ -99,6 +112,8 @@ const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
 beforeEach(() => {
   state.clients.length = 0;
   state.connectGate = null;
+  state.listenGate = null;
+  state.listenAttempts.length = 0;
   state.listenRejects = false;
   state.rows.clear();
 });
@@ -107,50 +122,216 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('Postgres listener lifecycle', () => {
-  it('a disconnect() racing an in-flight reconnect ends the candidate and does not resurrect the listener', async () => {
-    const plugin = new PostgresPlugin();
-    await plugin.connect({ url: REAL_URL });
-    await plugin.subscribe(asTopic('t'), () => undefined);
+// Every chore this plugin runs in the background parks on an await, and `disconnect()` can land in
+// that await. `stopped` alone cannot detect it, because `connect()` sets `stopped` back to false: a
+// chore that slept across a whole teardown AND restart wakes up believing it is live and publishes
+// into the NEXT lifecycle's registries. The two shapes that costs are a listener connection the new
+// session created being overwritten and never end()ed (a leaked socket and server backend for the
+// life of the process), and a TopicSubscription surviving into the new session, where subscribe()'s
+// fast path hands it back and no LISTEN is ever issued — push silently dead for that topic.
+//
+// So this is parameterized over every chore that can be parked here x whether a connect() follows
+// the disconnect, and asserts the same two invariants in each cell: nothing the old lifecycle built
+// is reachable from the plugin afterwards, and every Client ever constructed is either the current
+// listener or ended.
 
-    const priv = plugin as unknown as {
-      listener?: unknown;
-      listenerPromise?: unknown;
-    };
-    const client0 = state.clients[0];
-    expect(client0).toBeDefined();
+interface Priv {
+  listener?: { ended: boolean } | undefined;
+  listenerPromise?: unknown;
+  subs: Map<string, { handlers: unknown[] }>;
+  subscribing: Map<string, unknown>;
+  listens: Map<string, unknown>;
+  waiters: Map<string, unknown>;
+  pendingAborts: Set<unknown>;
+}
 
-    // Hold the reconnect candidate's connect() open, then drop the live listener so the 'end'
-    // handler kicks off reconnectListener(). (connect() nulls state.connectGate when it consumes
-    // the gate, so keep a local reference to release it later.)
-    const gate = deferred();
-    state.connectGate = gate;
-    client0?.emit('end');
+function registrySizes(priv: Priv): Record<string, number> {
+  return {
+    subs: priv.subs.size,
+    subscribing: priv.subscribing.size,
+    listens: priv.listens.size,
+    waiters: priv.waiters.size,
+    pendingAborts: priv.pendingAborts.size,
+  };
+}
 
-    // Wait past the reconnect backoff (RECONNECT_DELAY_MS = 500ms) so the candidate reaches its
-    // parked connect(); a second Client now exists but is stuck.
-    await sleep(700);
-    expect(state.clients.length).toBe(2);
-    const candidate = state.clients[1];
-    expect(candidate?.ended).toBe(false);
+async function until(pred: () => boolean, budgetMs = 2000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  while (!pred() && Date.now() < deadline) await sleep(2);
+}
 
-    // disconnect() wins the race: it completes teardown while the candidate is mid-connect.
-    await plugin.disconnect();
-    expect(priv.listener).toBeUndefined();
-    expect(priv.listenerPromise).toBeUndefined();
+type Chore = 'subscribe-listen' | 'blocking-fetch' | 'reconnect-backoff' | 'reconnect-connect';
+type Next = 'disconnect' | 'disconnect+connect';
 
-    // Now let the candidate's connect() resolve. The post-await stopped check must end it and
-    // return WITHOUT publishing this.listener.
-    gate.resolve();
-    await sleep(50);
+const CHORES: Chore[] = [
+  'subscribe-listen',
+  'blocking-fetch',
+  'reconnect-backoff',
+  'reconnect-connect',
+];
 
-    expect(candidate?.ended).toBe(true);
-    expect(priv.listener).toBeUndefined();
-    expect(priv.listenerPromise).toBeUndefined();
-  }, 5000);
+const CROSS_CELLS = CHORES.flatMap((chore) =>
+  (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),
+);
+
+describe('a chore in flight when disconnect lands never touches the next lifecycle', () => {
+  it.each(CROSS_CELLS.map((c) => [`${c.chore}, ${c.next}`, c] as const))(
+    '%s',
+    async (_label, cell) => {
+      const plugin = new PostgresPlugin();
+      const priv = plugin as unknown as Priv;
+      const topic = asTopic('t');
+      const settle = (p: Promise<unknown>): Promise<unknown> => p.catch(() => undefined);
+      await plugin.connect({ url: REAL_URL });
+
+      const pending: Promise<unknown>[] = [];
+      let release: (() => void) | undefined;
+
+      if (cell.chore === 'subscribe-listen' || cell.chore === 'blocking-fetch') {
+        const gate = deferred();
+        state.listenGate = gate;
+        release = gate.resolve;
+        pending.push(
+          settle(
+            cell.chore === 'subscribe-listen'
+              ? plugin.subscribe(topic, () => undefined)
+              : plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 4000 }),
+          ),
+        );
+        await until(() => state.listenAttempts.length > 0);
+      } else {
+        await plugin.subscribe(topic, () => undefined);
+        if (cell.chore === 'reconnect-connect') {
+          const gate = deferred();
+          state.connectGate = gate;
+          release = gate.resolve;
+        }
+        state.clients[0]?.emit('end');
+        // reconnect-connect must reach the candidate's parked connect() (past the 500ms backoff);
+        // reconnect-backoff must land while the loop is still sleeping.
+        await sleep(cell.chore === 'reconnect-connect' ? 700 : 100);
+      }
+
+      const older = [...state.clients];
+      await plugin.disconnect();
+      const got: Message[] = [];
+      if (cell.next === 'disconnect+connect') {
+        // The successor builds its OWN listener and registration BEFORE the parked chore wakes, so
+        // a chore that publishes anyway overwrites something live rather than filling a vacuum.
+        await plugin.connect({ url: REAL_URL });
+        await plugin.subscribe(topic, (m) => got.push(m));
+      }
+      release?.();
+      // Past one whole reconnect backoff, so a loop that did not abort has woken and acted.
+      await sleep(900);
+      await Promise.all(pending);
+
+      if (cell.next === 'disconnect') {
+        expect(priv.listener, 'listener resurrected after disconnect').toBeUndefined();
+        expect(priv.listenerPromise).toBeUndefined();
+        expect(registrySizes(priv), 'registry survived teardown').toEqual({
+          subs: 0,
+          subscribing: 0,
+          listens: 0,
+          waiters: 0,
+          pendingAborts: 0,
+        });
+      } else {
+        expect(priv.listener, 'the new lifecycle has no listener connection').toBeDefined();
+        expect(older, 'a connection from the previous lifecycle is still the live listener').not.toContain(
+          priv.listener,
+        );
+        expect(registrySizes(priv), 'the new lifecycle inherited registry state').toEqual({
+          subs: 1,
+          subscribing: 0,
+          listens: 1,
+          waiters: 0,
+          pendingAborts: 0,
+        });
+
+        const channel = [...priv.listens.keys()][0] as string;
+        expect(
+          (priv.listener as unknown as MockClientShape & { listened: string[] }).listened,
+          'the new lifecycle never LISTENed the topic it subscribed to',
+        ).toContain(channel);
+
+        state.rows.set('t', [
+          {
+            seq: '1',
+            topic: 't',
+            sender: asHandle('u'),
+            content: 'after-reuse',
+            ts: new Date().toISOString(),
+            in_reply_to: null,
+          },
+        ]);
+        (priv.listener as unknown as MockClientShape).emit('notification', { channel });
+        await sleep(60);
+        expect(got.map((m) => m.content), 'push is dead on the reused topic').toEqual([
+          'after-reuse',
+        ]);
+        await plugin.disconnect();
+      }
+
+      // Whatever happened, no socket is left both unreachable and open.
+      for (const c of state.clients) {
+        expect(
+          c === priv.listener || c.ended,
+          'a Client is neither the current listener nor ended',
+        ).toBe(true);
+      }
+    },
+    15000,
+  );
 });
 
 describe('Postgres subscribe registration', () => {
+  // `subscribing` is keyed by channel, and the channel for a topic is the same in every lifecycle.
+  // So the cleanup in subscribe()'s `finally` is aimed at a key a SUCCESSOR may already own: evicting
+  // it makes a concurrent subscribe miss the in-flight registration, build a second one, and inflate
+  // the channel's LISTEN refcount while dropping the first registration's handlers.
+  it('a subscribe rejected by teardown does not evict the successor lifecycle in-flight entry', async () => {
+    const plugin = new PostgresPlugin();
+    const priv = plugin as unknown as {
+      subs: Map<string, { handlers: unknown[] }>;
+      subscribing: Map<string, unknown>;
+      listens: Map<string, { refs: number }>;
+    };
+    const topic = asTopic('t');
+    await plugin.connect({ url: REAL_URL });
+
+    const first = deferred();
+    state.listenGate = first;
+    const doomed = plugin.subscribe(topic, () => undefined).catch(() => 'rejected');
+    await until(() => state.listenAttempts.length === 1);
+
+    await plugin.disconnect();
+    await plugin.connect({ url: REAL_URL });
+
+    const successor = deferred();
+    state.listenGate = successor;
+    const boxA: Message[] = [];
+    const joinA = plugin.subscribe(topic, (m) => boxA.push(m));
+    await until(() => state.listenAttempts.length === 2);
+
+    first.resolve();
+    expect(await doomed).toBe('rejected');
+    expect(priv.subscribing.size, 'the successor in-flight registration was evicted').toBe(1);
+
+    const boxB: Message[] = [];
+    const joinB = plugin.subscribe(topic, (m) => boxB.push(m));
+    successor.resolve();
+    await Promise.all([joinA, joinB]);
+
+    expect(priv.subs.size).toBe(1);
+    expect([...priv.subs.values()][0]?.handlers.length, 'a handler was dropped').toBe(2);
+    expect([...priv.listens.values()].map((l) => l.refs), 'LISTEN refcount inflated').toEqual([1]);
+    expect(state.listenAttempts.length, 'a duplicate LISTEN was issued').toBe(2);
+
+    await plugin.disconnect();
+  }, 10000);
+
+
   it('a subscribe whose LISTEN rejects leaves no entry in this.subs', async () => {
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: REAL_URL });

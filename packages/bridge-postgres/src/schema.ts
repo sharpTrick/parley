@@ -128,9 +128,17 @@ export function channelFor(topic: string): string {
  * Idempotent DDL: the message table, the sender registry, and the NOTIFY trigger. Run inside a
  * transaction under an advisory lock (index.ts `connect`) so concurrent bridge processes
  * bootstrapping the same table don't race the CREATEs.
+ *
+ * The indexes and the trigger are created only when missing, so that an ordinary process start on an
+ * already-bootstrapped table takes no table-level lock and cannot stall every other bridge process's
+ * `post()`: `CREATE INDEX` holds SHARE and `CREATE TRIGGER` SHARE ROW EXCLUSIVE, and both conflict
+ * with the ROW EXCLUSIVE an INSERT holds — the `IF NOT EXISTS` spelling still takes the lock. Keep
+ * every behavioural change to the doorbell in the trigger FUNCTION (replaced unconditionally), so
+ * that skipping the re-create cannot ship a stale one.
  */
 export function buildSchema(table: string): string {
   const n = quotedNames(table);
+  const raw = schemaNames(table);
   return `
 CREATE TABLE IF NOT EXISTS ${n.messages} (
   seq         BIGSERIAL PRIMARY KEY,
@@ -140,8 +148,6 @@ CREATE TABLE IF NOT EXISTS ${n.messages} (
   ts          TEXT NOT NULL,           -- ISO 8601, informational only
   in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
 );
-CREATE INDEX IF NOT EXISTS ${n.topicSeqIndex} ON ${n.messages} (topic, seq);
-CREATE INDEX IF NOT EXISTS ${n.tsIndex} ON ${n.messages} (ts);
 CREATE TABLE IF NOT EXISTS ${n.senders} (
   handle      TEXT PRIMARY KEY,
   backend_ref TEXT NOT NULL
@@ -152,9 +158,23 @@ BEGIN
   RETURN NULL;
 END;
 $PARLEY$ LANGUAGE plpgsql;
-DROP TRIGGER IF EXISTS ${n.notifyTrigger} ON ${n.messages};
-CREATE TRIGGER ${n.notifyTrigger} AFTER INSERT ON ${n.messages}
-FOR EACH ROW EXECUTE FUNCTION ${n.notifyFn}();
+DO $PARLEY_BOOTSTRAP$
+BEGIN
+  IF to_regclass('${n.topicSeqIndex}') IS NULL THEN
+    CREATE INDEX ${n.topicSeqIndex} ON ${n.messages} (topic, seq);
+  END IF;
+  IF to_regclass('${n.tsIndex}') IS NULL THEN
+    CREATE INDEX ${n.tsIndex} ON ${n.messages} (ts);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgrelid = '${n.messages}'::regclass AND tgname = '${raw.notifyTrigger}' AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER ${n.notifyTrigger} AFTER INSERT ON ${n.messages}
+    FOR EACH ROW EXECUTE FUNCTION ${n.notifyFn}();
+  END IF;
+END
+$PARLEY_BOOTSTRAP$;
 `;
 }
 

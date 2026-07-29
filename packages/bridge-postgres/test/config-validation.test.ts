@@ -1,7 +1,7 @@
 import { asHandle, asTopic, type BackendConfig } from '@sharptrick/parley-core';
-import { Client } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin, validateBackendConfig } from '../src/index.js';
+import { dropTable, isUp, PG_URL, rand } from './pg-harness.js';
 
 /**
  * `backend_config` is untyped YAML from an operator. Every knob is validated before the pool is
@@ -9,9 +9,6 @@ import { PostgresPlugin, validateBackendConfig } from '../src/index.js';
  * an irreversible action (`retention_days: 0` used to mean "delete the entire history") and can
  * never hang (`pool_size: -3` used to mean "connect() never settles").
  */
-
-const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
-const rand = (): string => Math.random().toString(36).slice(2, 8);
 
 /** Every knob is asserted to settle within this, so a hang fails as a hang and not as a timeout. */
 const SETTLE_MS = 5000;
@@ -78,30 +75,6 @@ describe('backend_config validation rejects every unusable value', () => {
   );
 });
 
-async function isUp(url: string): Promise<boolean> {
-  const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.query('SELECT 1');
-    await c.end();
-    return true;
-  } catch {
-    await c.end().catch(() => undefined);
-    return false;
-  }
-}
-
-async function dropTable(table: string): Promise<void> {
-  const admin = new Client({ connectionString: PG_URL });
-  admin.on('error', () => undefined);
-  await admin.connect();
-  await admin.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
-  await admin.query(`DROP TABLE IF EXISTS ${table}_senders CASCADE`);
-  await admin.query(`DROP FUNCTION IF EXISTS ${table}_notify() CASCADE`);
-  await admin.end();
-}
-
 /** Resolve to 'hung' rather than letting a never-settling connect() blow the suite timeout. */
 async function settles(p: Promise<unknown>): Promise<string> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -162,33 +135,6 @@ if (await isUp(PG_URL)) {
         await dropTable(table);
       }
     }, 60000);
-
-    it('a valid retention window prunes, and the cursor still advances past what it removed', async () => {
-      const table = `parley_cfg_${rand()}`;
-      const topic = asTopic(`cfg-${rand()}`);
-      const seeder = new PostgresPlugin();
-      await seeder.connect({ url: PG_URL, table_name: table });
-      try {
-        for (let i = 0; i < 3; i++) await seeder.post(topic, asHandle('u'), `m${i}`);
-      } finally {
-        await seeder.disconnect();
-      }
-
-      const plugin = new PostgresPlugin();
-      await plugin.connect({ url: PG_URL, table_name: table, retention_days: 1 / 86_400_000 });
-      try {
-        await new Promise((r) => setTimeout(r, 500));
-        expect((await plugin.fetchRecent({ topic })).messages.length).toBe(0);
-
-        const fresh = await plugin.post(topic, asHandle('u'), 'after-prune');
-        const after = await plugin.fetchRecent({ topic });
-        expect(after.messages.at(-1)?.content).toBe('after-prune');
-        expect(Number(fresh)).toBeGreaterThan(3);
-      } finally {
-        await plugin.disconnect();
-        await dropTable(table);
-      }
-    }, 30000);
   });
 } else {
   describe.skip(`connect() config validation (no server at ${PG_URL})`, () => {

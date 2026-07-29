@@ -1,7 +1,15 @@
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
-import { Client } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import {
+  dropTable,
+  isUp,
+  PG_URL,
+  rand,
+  settledBackendCount,
+  sleep,
+  terminateBackends,
+} from './pg-harness.js';
 
 // Every socket this plugin opens is published to a field AFTER an await, and `disconnect()` can
 // complete inside that await. Whatever is published then is attached to a stopped plugin: it never
@@ -14,77 +22,34 @@ import { PostgresPlugin } from '../src/index.js';
 // Every connection is tagged with a per-test `application_name`, so the count is this test's own
 // and not the shared database's traffic.
 
-const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-async function isUp(url: string): Promise<boolean> {
-  const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.query('SELECT 1');
-    await c.end();
-    return true;
-  } catch {
-    await c.end().catch(() => undefined);
-    return false;
-  }
-}
-
-async function withAdmin<T>(fn: (admin: Client) => Promise<T>): Promise<T> {
-  const admin = new Client({ connectionString: PG_URL });
-  admin.on('error', () => undefined);
-  await admin.connect();
-  try {
-    return await fn(admin);
-  } finally {
-    await admin.end().catch(() => undefined);
-  }
-}
-
-async function backendCount(appName: string): Promise<number> {
-  return withAdmin(async (admin) => {
-    const res = await admin.query(
-      'SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name = $1',
-      [appName],
-    );
-    return (res.rows[0] as { n: number }).n;
-  });
-}
-
-async function terminateBackends(appName: string): Promise<void> {
-  await withAdmin(async (admin) => {
-    await admin.query(
-      'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1',
-      [appName],
-    );
-  });
-}
-
-async function dropTable(table: string): Promise<void> {
-  await withAdmin(async (admin) => {
-    await admin.query(`DROP TABLE IF EXISTS "${table}" CASCADE`);
-    await admin.query(`DROP TABLE IF EXISTS "${table}_senders" CASCADE`);
-    await admin.query(`DROP FUNCTION IF EXISTS "${table}_notify"() CASCADE`);
-  });
-}
-
-/** Poll until this plugin's backends are gone, so a slow FIN is not reported as a leak. */
-async function settledBackendCount(appName: string, budgetMs = 3000): Promise<number> {
-  const deadline = Date.now() + budgetMs;
-  let n = await backendCount(appName);
-  while (n > 0 && Date.now() < deadline) {
-    await sleep(100);
-    n = await backendCount(appName);
-  }
-  return n;
-}
-
+// A connection is not the only thing published after an await: so is every entry in the plugin's
+// bookkeeping, and an entry that survives teardown is worse than a leaked socket. The NEXT connect()
+// finds it and believes it — subscribe()'s fast path hands back a TopicSubscription from the dead
+// session and issues no LISTEN, so push is permanently dead for that topic with no error anywhere. So
+// the post-condition here is the WHOLE registry set, and every cell then re-connects and proves the
+// live path works on the same topic; a state container this plugin grows later is covered by
+// construction rather than by someone remembering to add it.
 interface Priv {
   listener?: unknown;
   listenerPromise?: unknown;
   pool?: unknown;
+  subs: Map<string, unknown>;
+  subscribing: Map<string, unknown>;
+  listens: Map<string, unknown>;
+  waiters: Map<string, unknown>;
+  pendingAborts: Set<unknown>;
+}
+
+const DRAINED = { subs: 0, subscribing: 0, listens: 0, waiters: 0, pendingAborts: 0 };
+
+function registrySizes(priv: Priv): Record<string, number> {
+  return {
+    subs: priv.subs.size,
+    subscribing: priv.subscribing.size,
+    listens: priv.listens.size,
+    waiters: priv.waiters.size,
+    pendingAborts: priv.pendingAborts.size,
+  };
 }
 
 type Opener = 'connect' | 'subscribe' | 'blocking-fetch' | 'reconnect';
@@ -162,12 +127,30 @@ if (await isUp(PG_URL)) {
         expect(priv.listener, 'listener resurrected after disconnect').toBeUndefined();
         expect(priv.listenerPromise, 'listener promise resurrected after disconnect').toBeUndefined();
         expect(priv.pool, 'pool resurrected after disconnect').toBeUndefined();
+        expect(registrySizes(priv), 'registry state survived teardown').toEqual(DRAINED);
         expect(await settledBackendCount(appName), 'orphaned server backends').toBe(0);
+
+        // Then reuse: the next lifecycle must get a WORKING live path on the same topic. A stale
+        // registration from the session just torn down makes subscribe() resolve successfully and
+        // never LISTEN, so only a delivered message can tell the two apart.
+        await plugin.connect({ url, table_name: table });
+        const got: string[] = [];
+        await plugin.subscribe(topic, (m) => got.push(m.content));
+        await plugin.post(topic, asHandle('u'), 'after-reuse');
+        const deadline = Date.now() + 10000;
+        while (got.length === 0 && Date.now() < deadline) await sleep(25);
+        expect(got, 'push is dead on a topic the previous lifecycle subscribed to').toEqual([
+          'after-reuse',
+        ]);
+
+        await plugin.disconnect();
+        expect(registrySizes(priv), 'registry state survived the second teardown').toEqual(DRAINED);
+        expect(await settledBackendCount(appName), 'orphaned server backends after reuse').toBe(0);
       } finally {
         await plugin.disconnect().catch(() => undefined);
         await dropTable(table);
       }
-    }, 60000);
+    }, 90000);
   });
 
   // The seam says nothing about calling its lifecycle methods out of order, so an operator's

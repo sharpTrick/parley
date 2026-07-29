@@ -3,14 +3,13 @@ import { Client } from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { buildSchema, channelFor } from '../src/schema.js';
+import { dropTable, isUp, PG_URL, rand, sleep, withAdmin } from './pg-harness.js';
 
 // The NOTIFY channel is derived TWICE — once in Node by channelFor(), once inside the trigger by
 // PostgreSQL — and the live path is silently dead whenever the two disagree. Nothing errors: the
 // trigger rings a channel nobody LISTENs, push delivers nothing, and blocking fetches stall their
 // whole budget while catch-up keeps working, so the deployment looks healthy. These cases pin the
 // two derivations together over topic shapes the `t-<n>-<rand>` ASCII generator never produces.
-
-const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
 
 interface TopicShape {
   label: string;
@@ -30,38 +29,18 @@ const TOPIC_SHAPES: TopicShape[] = [
   { label: '500 chars', topic: 'x'.repeat(500), latin1: true },
 ];
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-
-async function isUp(url: string): Promise<boolean> {
-  const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.query('SELECT 1');
-    await c.end();
-    return true;
-  } catch {
-    await c.end().catch(() => undefined);
-    return false;
-  }
-}
-
 /** Create a throwaway database with `encoding`, returning its DSN, or undefined if not permitted. */
 async function makeDatabase(encoding: string): Promise<{ url: string; drop: () => Promise<void> } | undefined> {
   const name = `parley_enc_${encoding.toLowerCase()}_${rand()}`;
   const adminUrl = new URL(PG_URL);
   adminUrl.pathname = '/postgres';
-  const admin = new Client({ connectionString: adminUrl.toString() });
-  admin.on('error', () => undefined);
   try {
-    await admin.connect();
-    await admin.query(
-      `CREATE DATABASE ${name} ENCODING '${encoding}' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0`,
-    );
-    await admin.end();
+    await withAdmin(async (admin) => {
+      await admin.query(
+        `CREATE DATABASE ${name} ENCODING '${encoding}' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0`,
+      );
+    }, adminUrl.toString());
   } catch {
-    await admin.end().catch(() => undefined);
     return undefined;
   }
   const url = new URL(PG_URL);
@@ -69,11 +48,9 @@ async function makeDatabase(encoding: string): Promise<{ url: string; drop: () =
   return {
     url: url.toString(),
     drop: async () => {
-      const a = new Client({ connectionString: adminUrl.toString() });
-      a.on('error', () => undefined);
-      await a.connect();
-      await a.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
-      await a.end();
+      await withAdmin(async (a) => {
+        await a.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+      }, adminUrl.toString());
     },
   };
 }
@@ -93,13 +70,7 @@ async function pushRoundTrip(url: string, topic: Topic): Promise<Message[]> {
     return seen;
   } finally {
     await plugin.disconnect();
-    const admin = new Client({ connectionString: url });
-    admin.on('error', () => undefined);
-    await admin.connect();
-    await admin.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
-    await admin.query(`DROP TABLE IF EXISTS ${table}_senders CASCADE`);
-    await admin.query(`DROP FUNCTION IF EXISTS ${table}_notify() CASCADE`);
-    await admin.end();
+    await dropTable(table, url);
   }
 }
 

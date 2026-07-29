@@ -1,7 +1,7 @@
 import { asCursor, asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
-import { Client } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { dropTable, isUp, PG_URL, rand, sleep } from './pg-harness.js';
 
 // BIGSERIAL assigns `seq` at INSERT time, not COMMIT time, so two writers can make seq 42 visible
 // while 41 is still uncommitted. A reader that advances its cursor to 42 in that window can never
@@ -14,34 +14,6 @@ import { PostgresPlugin } from '../src/index.js';
 // nextCursor, concurrently with the writers, and the union of what it saw must equal the final
 // history exactly. Any store backend that mints a cursor from a pre-commit sequence can
 // reintroduce this, so the shape is the assertion, not the SQL.
-
-const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-async function isUp(url: string): Promise<boolean> {
-  const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.query('SELECT 1');
-    await c.end();
-    return true;
-  } catch {
-    await c.end().catch(() => undefined);
-    return false;
-  }
-}
-
-async function dropTable(table: string): Promise<void> {
-  const admin = new Client({ connectionString: PG_URL });
-  admin.on('error', () => undefined);
-  await admin.connect();
-  await admin.query(`DROP TABLE IF EXISTS "${table}" CASCADE`);
-  await admin.query(`DROP TABLE IF EXISTS "${table}_senders" CASCADE`);
-  await admin.query(`DROP FUNCTION IF EXISTS "${table}_notify"() CASCADE`);
-  await admin.end();
-}
 
 interface Cell {
   writers: number;

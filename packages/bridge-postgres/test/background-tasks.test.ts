@@ -14,9 +14,13 @@ const state = vi.hoisted(() => ({
   /** When set, the LISTEN connection cannot be established — drives the reconnect failure path. */
   clientFails: false,
   clients: [] as { emit: (event: string, arg?: unknown) => void }[],
+  /** The table, per topic — what the recovery read must actually come back with. */
+  rows: new Map<string, Record<string, unknown>[]>(),
 }));
 
-vi.mock('pg', () => {
+vi.mock('pg', async () => {
+  const { servePool } = await import('./fake-pg.js');
+
   class MockClient {
     private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
     constructor() {
@@ -38,9 +42,13 @@ vi.mock('pg', () => {
     async end(): Promise<void> {}
   }
 
-  const poolQuery = async (sql: string): Promise<{ rows: unknown[] }> => {
+  // Served through the same cursor-honouring helper as every other suite: a pool that answers []
+  // for every windowed SELECT makes the post-failure recovery assertion below pass whether or not
+  // the plugin ever recovered.
+  const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
     if (state.poolFails) throw new Error('query failed (mock)');
-    return { rows: /MAX\(seq\)/.test(sql) ? [{ max: '0' }] : [] };
+    const all = state.rows.get(String(values?.[0])) ?? [];
+    return { rows: servePool(all, sql, values ?? []) ?? [] };
   };
 
   return {
@@ -70,6 +78,7 @@ beforeEach(() => {
   state.poolFails = false;
   state.clientFails = false;
   state.clients.length = 0;
+  state.rows.clear();
   process.on('unhandledRejection', record);
 });
 
@@ -145,8 +154,24 @@ describe('background chores never escape as an unhandled rejection', () => {
 
     expect(rejections, `${path} leaked a rejection`).toEqual([]);
 
+    // Recovery has to be READ, not merely resolved: a pool that answers [] for every windowed
+    // SELECT would satisfy `resolves.toBeDefined()` from a plugin that never recovered at all.
     state.poolFails = false;
-    await expect(plugin.fetchRecent({ topic })).resolves.toBeDefined();
+    state.rows.set('t', [
+      {
+        seq: '1',
+        topic: 't',
+        sender: 'u',
+        content: 'recovered',
+        ts: new Date().toISOString(),
+        in_reply_to: null,
+      },
+    ]);
+    const page = await plugin.fetchRecent({ topic, since: asCursor('0') });
+    expect(page.messages.map((m) => m.content), `${path} left the read path broken`).toEqual([
+      'recovered',
+    ]);
+    expect(String(page.nextCursor)).toBe('1');
     await plugin.disconnect();
   }, 10000);
 });

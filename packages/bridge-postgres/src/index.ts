@@ -166,13 +166,9 @@ interface TopicSubscription {
 }
 
 /**
- * The PostgreSQL backend (DESIGN §9) — self-hosted networked SQL. Slots between SQLite (the
- * zero-infra local floor) and Redis (the first broker): one database serves any number of
- * bridge processes over the network, and LISTEN/NOTIFY makes the live path TRUE event-driven
- * push — an AFTER INSERT trigger rings a per-topic channel, so `subscribe` waits on real
- * events, not a poll timer. The cursor (`seq`) still owns correctness: a notification is only
- * a doorbell, and subscribers always re-query strictly after their last-seen cursor, so a
- * coalesced or dropped NOTIFY costs latency, never a message (DESIGN §6).
+ * The PostgreSQL backend (DESIGN §9). A NOTIFY is only a doorbell: keep every subscriber and
+ * blocking waiter re-querying strictly after its last-seen `seq`, so that a coalesced, dropped or
+ * mis-addressed notification costs latency and never a message (DESIGN §6).
  */
 export class PostgresPlugin implements BackendPlugin {
   private pool?: Pool;
@@ -183,6 +179,12 @@ export class PostgresPlugin implements BackendPlugin {
   private retentionDays?: number;
   private pruneTimer?: ReturnType<typeof setInterval>;
   private stopped = false;
+  /**
+   * Bumped by every `disconnect()`. Compare it, not `stopped`, after any await in a chore that
+   * mutates shared state — `connect()` sets `stopped` back to false, so a chore that slept across
+   * a whole teardown/restart sees `stopped === false` and would publish into the NEW lifecycle.
+   */
+  private epoch = 0;
 
   /** Dedicated non-pool LISTEN connection, shared by all topics; lazy on first subscribe. */
   private listener?: Client;
@@ -225,6 +227,7 @@ export class PostgresPlugin implements BackendPlugin {
     this.names = quotedNames(this.table);
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
+    const epoch = this.epoch;
 
     if (usesDefaultCredentials(this.url)) {
       console.warn(
@@ -235,12 +238,12 @@ export class PostgresPlugin implements BackendPlugin {
     }
 
     const pool = new Pool({ connectionString: this.url, max: cfg.pool_size ?? 5 });
-    pool.on('error', () => {
-      /* idle-client errors (server restart etc.) surface via command rejections; don't crash */
-    });
+    // Keep this no-op handler, so that an idle-client error (server restart) stays a rejected
+    // command instead of an unhandled 'error' event that kills the process.
+    pool.on('error', () => undefined);
 
     // Idempotent bootstrap, serialized under an advisory lock: concurrent bridge processes
-    // connecting to the same table would otherwise race the CREATE/DROP statements.
+    // connecting to the same table would otherwise race the CREATEs.
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -257,7 +260,7 @@ export class PostgresPlugin implements BackendPlugin {
     // Same hazard the listener has, one resource up: a disconnect() can complete while the
     // bootstrap is in flight. Publishing the pool after that leaves a live pool — and, below, a
     // prune timer — attached to a plugin the caller has already shut down.
-    if (this.stopped) {
+    if (this.stopped || epoch !== this.epoch) {
       await pool.end().catch(() => undefined);
       throw new Error('parley-postgres: disconnected while connect() was in flight');
     }
@@ -285,10 +288,11 @@ export class PostgresPlugin implements BackendPlugin {
    */
   private async prune(): Promise<void> {
     if (this.retentionDays === undefined || this.pool === undefined) return;
+    const epoch = this.epoch;
     try {
       const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
       for (;;) {
-        if (this.stopped || this.pool === undefined) return;
+        if (this.stopped || this.pool === undefined || epoch !== this.epoch) return;
         const res = await this.pool.query(
           `DELETE FROM ${this.names.messages} WHERE seq IN (
              SELECT seq FROM ${this.names.messages} WHERE ts < $1 ORDER BY seq LIMIT ${PRUNE_BATCH}
@@ -297,13 +301,13 @@ export class PostgresPlugin implements BackendPlugin {
         );
         if ((res.rowCount ?? 0) < PRUNE_BATCH) return;
       }
-    } catch {
-      // Transient contention/connection failure — retry on the next interval.
-    }
+    } catch {}
   }
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    this.epoch++;
+    this.reconnecting = false;
     if (this.pruneTimer !== undefined) clearInterval(this.pruneTimer);
     this.pruneTimer = undefined;
     // Release any blocked fetchRecent waits first — clears their timers deterministically. Each
@@ -330,8 +334,8 @@ export class PostgresPlugin implements BackendPlugin {
    * late-committing row forever. Cursor delivery must be monotonic and lossless (DESIGN §6),
    * so same-topic posts are serialized with a transaction-scoped advisory lock: writes to a
    * topic commit in seq order, making visibility order == cursor order. Distinct topics take
-   * distinct lock keys and don't contend. The sender registry upsert rides the same
-   * transaction (first sight of a handle registers it — DESIGN §4).
+   * distinct lock keys and don't contend. First sight of a handle registers it in the sender
+   * registry (DESIGN §4), before the lock is taken.
    */
   async post(
     topic: Topic,
@@ -341,17 +345,21 @@ export class PostgresPlugin implements BackendPlugin {
   ): Promise<BackendMsgId> {
     const client = await this.require().connect();
     try {
+      // Keep the registry upsert OUTSIDE the transaction below, so that it cannot lengthen the
+      // advisory-locked critical section every same-topic post from every bridge process queues
+      // behind. `DO NOTHING` is what makes it safe to run unconditionally and out of band: it never
+      // overwrites a `backend_ref` an operator registered by hand.
+      await client.query(
+        `INSERT INTO ${this.names.senders} (handle, backend_ref)
+         VALUES ($1, $1) ON CONFLICT (handle) DO NOTHING`,
+        [identity],
+      );
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [topic]);
       const res = await client.query(
         `INSERT INTO ${this.names.messages} (topic, sender, content, ts, in_reply_to)
          VALUES ($1, $2, $3, $4, $5) RETURNING seq::text AS seq`,
         [topic, identity, content, new Date().toISOString(), opts?.inReplyTo ?? null],
-      );
-      await client.query(
-        `INSERT INTO ${this.names.senders} (handle, backend_ref)
-         VALUES ($1, $1) ON CONFLICT (handle) DO NOTHING`,
-        [identity],
       );
       await client.query('COMMIT');
       return asBackendMsgId(String((res.rows[0] as { seq: string }).seq));
@@ -428,13 +436,14 @@ export class PostgresPlugin implements BackendPlugin {
     limit: number,
     blockMs: number,
   ): Promise<void> {
+    const epoch = this.epoch;
     let listener: Client;
     try {
       listener = await this.ensureListener();
     } catch {
       return; // listener unavailable → skip the native wait; core polls the remaining budget
     }
-    if (this.stopped) return;
+    if (this.stopped || epoch !== this.epoch) return;
     const channel = channelFor(topic);
 
     let listen: ListenState;
@@ -444,7 +453,7 @@ export class PostgresPlugin implements BackendPlugin {
       return; // LISTEN failed → skip the native wait; core polls the remaining budget
     }
     // disconnect() may have completed while LISTEN was in flight.
-    if (this.stopped) {
+    if (this.stopped || epoch !== this.epoch) {
       this.releaseListen(channel, listen);
       return;
     }
@@ -470,7 +479,7 @@ export class PostgresPlugin implements BackendPlugin {
       const timer = setTimeout(finish, blockMs);
       this.pendingAborts.add(finish);
       set.add(finish);
-      if (this.stopped) {
+      if (this.stopped || epoch !== this.epoch) {
         finish(); // disconnect may have raced registration
         return;
       }
@@ -521,7 +530,9 @@ export class PostgresPlugin implements BackendPlugin {
     try {
       await started;
     } finally {
-      this.subscribing.delete(channel);
+      // Delete only OUR entry, so that a subscribe spanning a disconnect()/connect() cannot evict
+      // the registration a successor lifecycle put here under the same channel name.
+      if (this.subscribing.get(channel) === started) this.subscribing.delete(channel);
     }
   }
 
@@ -532,6 +543,7 @@ export class PostgresPlugin implements BackendPlugin {
     channel: string,
     handler: MessageHandler,
   ): Promise<TopicSubscription> {
+    const epoch = this.epoch;
     const listener = await this.ensureListener();
     // Tail first: push never replays history (catch-up owns it).
     const res = await pool.query(
@@ -549,7 +561,14 @@ export class PostgresPlugin implements BackendPlugin {
     // `this.subs` — otherwise the next reconnect re-LISTENs and re-drains a channel the caller was
     // told FAILED to subscribe. It also covers the tail-read → LISTEN window: a row committed in
     // it has seq > lastSeen, so the drain below still catches it.
-    await this.acquireListen(listener, channel);
+    const listen = await this.acquireListen(listener, channel);
+    // Registering here after a teardown is worse than failing: the entry survives into the next
+    // connect(), where subscribe()'s fast path hands it back and no LISTEN is ever issued, so push
+    // is silently dead for that topic.
+    if (this.stopped || epoch !== this.epoch) {
+      this.releaseListen(channel, listen);
+      throw new Error('parley-postgres: disconnected while subscribe() was in flight');
+    }
     this.subs.set(channel, sub);
     this.drain(sub);
     return sub;
@@ -631,10 +650,11 @@ export class PostgresPlugin implements BackendPlugin {
   }
 
   private async createListener(): Promise<Client> {
+    const epoch = this.epoch;
     const client = new Client({ connectionString: this.url });
     this.wireListener(client);
     await client.connect();
-    return this.adoptListener(client);
+    return this.adoptListener(client, epoch);
   }
 
   /**
@@ -644,8 +664,8 @@ export class PostgresPlugin implements BackendPlugin {
    * an orphan keeps the Node event loop referenced and holds a server backend slot for as long
    * as the process runs.
    */
-  private async adoptListener(client: Client): Promise<Client> {
-    if (this.stopped) {
+  private async adoptListener(client: Client, epoch: number): Promise<Client> {
+    if (this.stopped || epoch !== this.epoch) {
       await client.end().catch(() => undefined);
       throw new Error('parley-postgres: disconnected while the listener connection was in flight');
     }
@@ -656,7 +676,8 @@ export class PostgresPlugin implements BackendPlugin {
   /** Attach notification + failure handlers to a (candidate) listener connection. */
   private wireListener(client: Client): void {
     client.on('error', () => {
-      /* swallow — a fatal error is followed by 'end', which drives the reconnect */
+      /* Keep this swallow, so that a socket error cannot kill the process; 'end' follows it and
+         drives the reconnect. */
     });
     client.on('notification', (n) => {
       const sub = this.subs.get(n.channel);
@@ -682,15 +703,16 @@ export class PostgresPlugin implements BackendPlugin {
   private async reconnectListener(): Promise<void> {
     if (this.reconnecting) return;
     this.reconnecting = true;
+    const epoch = this.epoch;
     try {
-      while (!this.stopped) {
+      while (!this.stopped && epoch === this.epoch) {
         await delay(RECONNECT_DELAY_MS);
-        if (this.stopped) return;
+        if (this.stopped || epoch !== this.epoch) return;
         const client = new Client({ connectionString: this.url });
         this.wireListener(client);
         try {
           await client.connect();
-          if (this.stopped) {
+          if (this.stopped || epoch !== this.epoch) {
             await client.end().catch(() => undefined);
             return;
           }
@@ -699,8 +721,8 @@ export class PostgresPlugin implements BackendPlugin {
           for (const channel of this.listens.keys()) {
             await client.query(`LISTEN "${channel}"`);
           }
-          await this.adoptListener(client);
-          this.listenerPromise = Promise.resolve(client);
+          await this.adoptListener(client, epoch);
+          if (epoch === this.epoch) this.listenerPromise = Promise.resolve(client);
           for (const sub of this.subs.values()) this.drain(sub);
           return;
         } catch {
@@ -709,7 +731,9 @@ export class PostgresPlugin implements BackendPlugin {
         }
       }
     } finally {
-      this.reconnecting = false;
+      // Keep the flag owned by the lifecycle that set it, so that this loop exiting after a
+      // disconnect() cannot clear a successor lifecycle's reconnect and let two run at once.
+      if (epoch === this.epoch) this.reconnecting = false;
     }
   }
 
@@ -724,12 +748,13 @@ export class PostgresPlugin implements BackendPlugin {
       return;
     }
     sub.draining = true;
+    const epoch = this.epoch;
     void (async () => {
       try {
         do {
           sub.pending = false;
           for (;;) {
-            if (this.stopped) return;
+            if (this.stopped || epoch !== this.epoch) return;
             const res = await this.require().query(
               `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
                FROM ${this.names.messages} WHERE topic = $1 AND seq > $2::bigint
@@ -741,18 +766,16 @@ export class PostgresPlugin implements BackendPlugin {
             for (const row of rows) {
               sub.lastSeen = String(row.seq);
               const msg = rowToMessage(row);
-              // Fan out to every handler on this channel, each best-effort in its own try/catch
-              // so one throwing handler can't starve the others (DESIGN §6).
+              // Keep each handler in its own try/catch, so that one throwing handler cannot starve
+              // the others on this channel (DESIGN §6).
               for (const handler of sub.handlers) {
                 try {
                   handler(msg);
-                } catch {
-                  /* handler is best-effort; never break the loop (DESIGN §6) */
-                }
+                } catch {}
               }
             }
           }
-        } while (sub.pending && !this.stopped);
+        } while (sub.pending && !this.stopped && epoch === this.epoch);
       } catch {
         // Transient query failure — the next NOTIFY (or the reconnect re-drain) resumes from
         // `lastSeen`; the cursor guarantees nothing is skipped.
