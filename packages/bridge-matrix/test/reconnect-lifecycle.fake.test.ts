@@ -70,6 +70,69 @@ describe('a subscribe loop does not survive disconnect + connect', () => {
   }
 });
 
+/**
+ * CLASS: no registry entry may outlive the work it describes. `liveTopics` is a claim that a running
+ * `/sync` loop covers a (room, topic) pair; a blocking `fetchRecent` trusts it and declines to open
+ * its own dedicated `/sync`. A phantom entry therefore costs a landed message a full slice of
+ * `sync_timeout_ms` of silence — and in production `catchup.block_max_ms` is 60s.
+ */
+const REGISTRIES = ['liveTopics', 'waiters', 'controllers', 'rooms'] as const;
+
+const sizeOf = (p: MatrixPlugin, name: (typeof REGISTRIES)[number]): number =>
+  (p as unknown as Record<string, { size: number }>)[name]!.size;
+
+const LIFECYCLES: Record<string, (p: MatrixPlugin) => Promise<void>> = {
+  'subscribe → disconnect → connect': async (p) => {
+    await p.subscribe(TOPIC, () => undefined);
+    await p.disconnect();
+    await p.connect(fakeConfig());
+  },
+  'subscribe → connect (a reconnect with no disconnect)': async (p) => {
+    await p.subscribe(TOPIC, () => undefined);
+    await p.connect(fakeConfig());
+  },
+  'a disconnect racing an in-flight subscribe': async (p) => {
+    const subscribing = p.subscribe(TOPIC, () => undefined);
+    await p.disconnect();
+    await subscribing;
+  },
+};
+
+describe('every internal registry is empty after a lifecycle that stood the loop down', () => {
+  for (const [name, sequence] of Object.entries(LIFECYCLES)) {
+    it(`${name}: no registry outlives it`, async () => {
+      const p = await connectFake({});
+      await sequence(p);
+
+      // A `/sync` already on the wire when the sequence ended drains within one fake round-trip; a
+      // registry the plugin never cleared never empties, so the timeout is the real assertion.
+      await vi.waitFor(
+        () => expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0])),
+        { timeout: 4000, interval: 10 },
+      );
+      await p.disconnect();
+    }, 30_000);
+  }
+
+  it('a blocking fetchRecent afterwards still wakes far inside its budget', async () => {
+    const p = await connectFake({ syncTimeoutMs: 8000 });
+    await p.subscribe(TOPIC, () => undefined);
+    await p.connect(fakeConfig({ syncTimeoutMs: 8000 }));
+    await p.post(TOPIC, WRITER, 'seed');
+    const tail = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
+
+    const started = Date.now();
+    const pending = p.fetchRecent({ topic: TOPIC, since: tail, blockMs: 3000 });
+    const lands = setTimeout(() => void p.post(TOPIC, WRITER, 'fresh'), 150);
+    const woke = await pending;
+    clearTimeout(lands);
+
+    expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
+    expect(Date.now() - started).toBeLessThan(1500);
+    await p.disconnect();
+  }, 30_000);
+});
+
 describe('a dedicated bounded /sync does not survive disconnect + connect', () => {
   it('the blocking fetch returns at the disconnect and issues no more requests', async () => {
     const p = await connectFake({});

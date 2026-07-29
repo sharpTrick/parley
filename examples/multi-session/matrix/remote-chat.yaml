@@ -23,4 +23,9 @@ backend_config:
   # from either Code session, exactly like agent-a/agent-b use distinct accounts from each other.
   user: "parley-owner"
   password: "change-me-owner"
+  # Same requirement as the two Code sessions: this account may be the first to create a
+  # shared topic's invite-only room, so it invites the others up front.
+  invite:
+    - "@parley-agent-a:parley.local"
+    - "@parley-agent-b:parley.local"
   sync_timeout_ms: 25000

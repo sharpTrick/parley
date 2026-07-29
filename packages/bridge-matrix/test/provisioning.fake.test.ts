@@ -1,6 +1,6 @@
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MatrixPlugin } from '../src/index.js';
+import { MatrixPlugin, ROOM_PRESETS } from '../src/index.js';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
@@ -43,22 +43,60 @@ const ENTRY_POINTS: Record<
   'first subscribe': { provisions: true, drive: (p, t) => p.subscribe(t, () => undefined) },
 };
 
+/**
+ * The createRoom body asserted WHOLE, so a silently added, removed or flipped field fails. Spot
+ * checks on `preset` and `invite` left `visibility` — the field that keeps every topic name out of
+ * the homeserver's federated public room directory — asserted only in prose.
+ */
+const createRoomBodyFor = (preset: string, invite: string[], localpart: string) => ({
+  room_alias_name: localpart,
+  preset,
+  visibility: 'private',
+  ...(invite.length > 0 ? { invite } : {}),
+});
+
 describe('only a write provisions, and never into a world-joinable room', () => {
   for (const shared of [true, false]) {
     for (const [entryName, entry] of Object.entries(ENTRY_POINTS)) {
       for (const aliasExists of [true, false]) {
         it(`${shared ? 'shared_room' : 'per-topic'} / ${entryName} / alias exists: ${aliasExists}`, async () => {
           fake.aliasExists = aliasExists;
-          const p = await connectFake({ shared });
+          const invite = ['@ally:parley.local'];
+          const p = await connectFake({ shared, invite });
           await entry.drive(p, asTopic('ctx-payments'));
 
           const expected = !aliasExists && entry.provisions ? 1 : 0;
           expect(fake.createRoomBodies).toHaveLength(expected);
-          for (const body of fake.createRoomBodies) expect(body.preset).not.toBe('public_chat');
+          for (const body of fake.createRoomBodies) {
+            expect(body).toEqual(
+              createRoomBodyFor(
+                'private_chat',
+                invite,
+                shared ? 'parley_conformance' : 'parley_ctx-payments',
+              ),
+            );
+          }
           await p.disconnect();
         });
       }
     }
+  }
+
+  /**
+   * CLASS: every value the `room_preset` union accepts is graded, and the whole body it produces is
+   * pinned — so a preset added to the union without a case, or a field quietly changed, fails here.
+   */
+  for (const preset of ROOM_PRESETS) {
+    it(`room_preset ${preset} reaches createRoom in an otherwise unchanged body`, async () => {
+      fake.aliasExists = false;
+      const p = await connectFake({ roomPreset: preset });
+      await p.post(asTopic('ctx-payments'), WRITER, 'hello');
+
+      expect(fake.createRoomBodies).toEqual([
+        createRoomBodyFor(preset, [], 'parley_ctx-payments'),
+      ]);
+      await p.disconnect();
+    });
   }
 
   it('a read on an unprovisioned topic degrades to an empty page, spending no creation budget', async () => {
@@ -99,21 +137,33 @@ describe('only a write provisions, and never into a world-joinable room', () => 
     await p.disconnect();
   }, 20_000);
 
-  it('opting back in to a public room is explicit config, never a default', async () => {
-    const p = await connectFake({ roomPreset: 'public_chat' });
-    await p.post(asTopic('open-house'), WRITER, 'hello');
+  /**
+   * CLASS: `blockMs` engages only where the seam says it does — "relative to a `since`; with no
+   * `since` the default recent window returns at once". A since-less read that honoured the budget
+   * would pin an MCP tool call for the whole of `catchup.block_max_ms` (60s in production) on a
+   * topic the model pattern-matched out of untrusted context.
+   */
+  it.each([
+    { name: 'no since', since: undefined, blocks: false },
+    { name: 'a since', since: asCursor(''), blocks: true },
+  ])('a never-posted topic with blockMs and $name: blocks = $blocks', async ({ since, blocks }) => {
+    fake.aliasExists = false;
+    const p = await connectFake({});
 
-    expect(fake.createRoomBodies[0]!.preset).toBe('public_chat');
+    const started = Date.now();
+    const res = await p.fetchRecent({
+      topic: asTopic('ctx-not-yet'),
+      since,
+      blockMs: 1500,
+      limit: 5,
+    });
+    const elapsed = Date.now() - started;
+
+    expect(res.messages).toEqual([]);
+    expect(elapsed > 1000).toBe(blocks);
+    expect(fake.createRoomBodies).toHaveLength(0);
     await p.disconnect();
-  });
-
-  it('configured invitees are provisioned onto the room', async () => {
-    const p = await connectFake({ invite: ['@ally:parley.local'] });
-    await p.post(asTopic('ctx-payments'), WRITER, 'hello');
-
-    expect(fake.createRoomBodies[0]!.invite).toEqual(['@ally:parley.local']);
-    await p.disconnect();
-  });
+  }, 20_000);
 
   it('an already-existing room is joined, not re-provisioned', async () => {
     fake.aliasExists = true;
@@ -121,6 +171,42 @@ describe('only a write provisions, and never into a world-joinable room', () => 
     await p.post(asTopic('ctx-payments'), WRITER, 'hello');
 
     expect(fake.createRoomBodies).toHaveLength(0);
+    await p.disconnect();
+  });
+});
+
+/**
+ * CLASS: no seam call may proceed on a swallowed authorization failure. The default preset makes
+ * every provisioned room invite-only, so a SECOND Matrix account — which the README prescribes per
+ * session — reaches an existing topic room it was never invited to. A join whose refusal is ignored
+ * turns that into an opaque 403 out of `/send` and `/messages` much later, and a live path that
+ * registers a route for a room it cannot see.
+ */
+const REFUSED_JOIN = [403, 404];
+
+describe('a refused join fails the call that needed the room', () => {
+  for (const status of REFUSED_JOIN) {
+    for (const [entryName, entry] of Object.entries(ENTRY_POINTS)) {
+      it(`join → ${status} / ${entryName} rejects and registers no live route`, async () => {
+        fake.aliasExists = true; // the room exists; this account is simply not a member
+        fake.joinStatus = status;
+        const p = await connectFake({});
+
+        await expect(entry.drive(p, asTopic('ctx-payments'))).rejects.toThrow();
+        expect([...(p as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
+        await p.disconnect();
+      });
+    }
+  }
+
+  it('a 403 names the alias, the account and the fix', async () => {
+    fake.aliasExists = true;
+    fake.joinStatus = 403;
+    const p = await connectFake({});
+
+    await expect(p.post(asTopic('ctx-payments'), WRITER, 'hello')).rejects.toThrow(
+      /#parley_ctx-payments:fake[\s\S]*@parley:fake[\s\S]*invite/,
+    );
     await p.disconnect();
   });
 });

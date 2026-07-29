@@ -32,5 +32,13 @@ backend_config:
   #    instead of in the per-instance block above. ──
   user: "parley-agent-a"
   password: "change-me-agent-a"
+  # ── REQUIRED with the default `room_preset: private_chat` (join_rule invite): every OTHER
+  #    account that shares a topic with this one must be listed here, or whichever session
+  #    creates the room first locks the others out (their catch-up 403s and their live path
+  #    delivers nothing). Rooms that already exist are joined as they are, so list the peers
+  #    on every config that might be the first to create a shared topic's room. ──
+  invite:
+    - "@parley-agent-b:parley.local"
+    - "@parley-owner:parley.local"
   # ── Safe to differ: per-instance /sync long-poll timeout. ──
   sync_timeout_ms: 25000

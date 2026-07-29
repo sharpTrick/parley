@@ -1,4 +1,4 @@
-import { MatrixPlugin } from '../src/index.js';
+import { MatrixPlugin, type RoomPreset } from '../src/index.js';
 
 /**
  * In-memory fake Synapse: a `global.fetch` stub modelling ONE room's timeline plus Matrix
@@ -43,6 +43,11 @@ export class FakeSynapse {
   /** Remaining `POST /createRoom` calls to refuse with 429 — the per-user creation budget, spent. */
   createRoomLimited = 0;
   createRoomRetryAfterMs = 45_000;
+  /**
+   * Status `POST /rooms/<id>/join` answers with. 403 = the invite-only room this account was never
+   * invited to (a second Matrix account against a room the first created); 404 = the room is gone.
+   */
+  joinStatus = 200;
   /** Every `PUT .../send/m.room.message/<txn>` body, in order. */
   readonly sentBodies: Record<string, unknown>[] = [];
   /** Remaining incremental-`/sync` calls to fail (`Infinity` = a permanent failure). */
@@ -142,7 +147,11 @@ export class FakeSynapse {
       this.aliasExists = true;
       return jsonRes({ room_id: ROOM_ID });
     }
-    if (path.endsWith('/join')) return jsonRes({ room_id: ROOM_ID });
+    if (path.endsWith('/join')) {
+      if (this.joinStatus === 200) return jsonRes({ room_id: ROOM_ID });
+      const errcode = this.joinStatus === 403 ? 'M_FORBIDDEN' : 'M_NOT_FOUND';
+      return jsonRes({ errcode, error: 'You are not invited to this room.' }, this.joinStatus);
+    }
 
     if (method === 'PUT' && /\/rooms\/[^/]+\/send\/m\.room\.message\//.test(path)) {
       const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
@@ -247,7 +256,7 @@ const tokenPos = (t: string): number => Number(t.slice(1));
 
 export interface ConnectOptions {
   shared?: boolean;
-  roomPreset?: 'private_chat' | 'trusted_private_chat' | 'public_chat';
+  roomPreset?: RoomPreset;
   invite?: string[];
   syncTimeoutMs?: number;
 }

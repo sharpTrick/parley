@@ -1,4 +1,12 @@
-import { asCursor, asHandle, asTopic, catchUpTopic, ReadStateStore, SeenSet } from '@sharptrick/parley-core';
+import {
+  asCursor,
+  asHandle,
+  asTopic,
+  catchUpTopic,
+  fetchRecentBlocking,
+  ReadStateStore,
+  SeenSet,
+} from '@sharptrick/parley-core';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -93,11 +101,13 @@ describe('fetchRecent since-path drains a foreign block and always advances the 
 
 /**
  * CLASS: a cursor must cross a block of traffic it cannot return, and must not move for traffic it
- * simply has not reached. `/messages` bounds a page BEFORE filtering, so a page-sized block of
- * another topic's events would wedge a cursor pinned at `since` forever — but advancing on a SHORT
- * (end-of-timeline) page means any traffic on any other topic in a shared room silently moves this
- * topic's cursor, breaking the seam's "since at the tail returns empty and a STABLE cursor" contract
- * for every reader of that room.
+ * simply has not reached — and a BLOCKING call must report the same position a non-blocking one
+ * would. `/messages` bounds a page BEFORE filtering, so a page-sized block of another topic's events
+ * would wedge a cursor pinned at `since` forever; but advancing on a SHORT (end-of-timeline) page
+ * means any traffic on any other topic in a shared room silently moves this topic's cursor, breaking
+ * the seam's "since at the tail returns empty and a STABLE cursor" contract for every reader of that
+ * room. A `blockMs` that discarded the advance would make the answer depend on the wait, not the
+ * timeline.
  */
 const FOREIGN_BLOCKS = [
   { count: 1, movesTheCursor: false },
@@ -105,35 +115,98 @@ const FOREIGN_BLOCKS = [
   { count: 10, movesTheCursor: true },
   { count: 15, movesTheCursor: true },
 ];
+/** 0 = the plain catch-up; >0 drives the native long-poll, which must agree with it. */
+const BLOCK_MODES = [0, 150];
 
 describe('a foreign block moves this topic cursor only when it fills a page', () => {
   for (const { count, movesTheCursor } of FOREIGN_BLOCKS) {
-    it(`${count} foreign event(s) after the cursor: moves it = ${movesTheCursor}`, async () => {
-      install();
-      const p = await connect(true);
-      const A = asTopic('topic-A');
-      const B = asTopic('topic-B');
-      const writer = asHandle('w');
+    for (const blockMs of BLOCK_MODES) {
+      it(`${count} foreign event(s) after the cursor / blockMs ${blockMs}: moves it = ${movesTheCursor}`, async () => {
+        install();
+        const p = await connect(true);
+        const A = asTopic('topic-A');
+        const B = asTopic('topic-B');
+        const writer = asHandle('w');
 
-      const idA0 = await p.post(A, writer, 'a0');
-      for (let i = 0; i < count; i++) await p.post(B, writer, `b${i}`);
+        const idA0 = await p.post(A, writer, 'a0');
+        for (let i = 0; i < count; i++) await p.post(B, writer, `b${i}`);
 
-      const at = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5 });
-      expect(at.messages).toEqual([]);
-      expect(String(at.nextCursor) !== String(idA0)).toBe(movesTheCursor);
+        const at = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5, blockMs });
+        expect(at.messages).toEqual([]);
+        expect(String(at.nextCursor) !== String(idA0)).toBe(movesTheCursor);
 
-      // Whatever it reported, the cursor is replayable: the next on-topic message is returned from
-      // it exactly once, and the read is idempotent until then.
-      const again = await p.fetchRecent({ topic: A, since: at.nextCursor, limit: 5 });
-      expect(again.messages).toEqual([]);
-      const idA1 = await p.post(A, writer, 'a1');
-      const next = await p.fetchRecent({ topic: A, since: at.nextCursor, limit: 5 });
+        // Whatever it reported, the cursor is replayable: the next on-topic message is returned from
+        // it exactly once, and the read is idempotent until then.
+        const again = await p.fetchRecent({ topic: A, since: at.nextCursor, limit: 5 });
+        expect(again.messages).toEqual([]);
+        const idA1 = await p.post(A, writer, 'a1');
+        const next = await p.fetchRecent({ topic: A, since: at.nextCursor, limit: 5 });
 
-      expect(next.messages.map((m) => m.content)).toEqual(['a1']);
-      expect(String(next.nextCursor)).toBe(String(idA1));
-      await p.disconnect();
-    });
+        expect(next.messages.map((m) => m.content)).toEqual(['a1']);
+        expect(String(next.nextCursor)).toBe(String(idA1));
+        await p.disconnect();
+      });
+    }
   }
+
+  it('a blocking read reports the identical cursor a non-blocking one does', async () => {
+    install();
+    const p = await connect(true);
+    const A = asTopic('topic-A');
+    const B = asTopic('topic-B');
+    const writer = asHandle('w');
+
+    const idA0 = await p.post(A, writer, 'a0');
+    for (let i = 0; i < 20; i++) await p.post(B, writer, `b${i}`);
+
+    const plain = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5 });
+    const blocked = await p.fetchRecent({
+      topic: A,
+      since: asCursor(String(idA0)),
+      limit: 5,
+      blockMs: 150,
+    });
+
+    expect(blocked.messages).toEqual([]);
+    expect(String(blocked.nextCursor)).toBe(String(plain.nextCursor));
+    expect(String(blocked.nextCursor)).not.toBe(String(idA0));
+    await p.disconnect();
+  });
+
+  /**
+   * The bound on forward pagination (MAX_FORWARD_PAGES * limit) is only survivable because each
+   * drain advances the cursor. Driven through core's own `fetchRecentBlocking`, which feeds
+   * `nextCursor` back as the next `since` — the exact loop a wedged cursor makes infinite.
+   */
+  it('a foreign block deeper than one drain is crossed by the blocking driver, not wedged', async () => {
+    install();
+    const p = await connect(true);
+    const A = asTopic('deep-A');
+    const B = asTopic('deep-B');
+    const writer = asHandle('w');
+
+    const idA0 = await p.post(A, writer, 'a0');
+    for (let i = 0; i < 300; i++) await p.post(B, writer, `b${i}`);
+    const idA1 = await p.post(A, writer, 'a1');
+
+    let since = asCursor(String(idA0));
+    const drained: string[] = [];
+    // A budget comfortably longer than one drain, so the plugin's native long-poll really is the
+    // thing reporting the cursor — a budget the first drain already spends returns before it.
+    for (let call = 0; call < 4 && drained.length === 0; call++) {
+      const page = await fetchRecentBlocking(
+        p,
+        { topic: A, since, limit: 5 },
+        { blockMs: 2000, pollIntervalMs: 10 },
+      );
+      drained.push(...page.messages.map((m) => m.content));
+      since = page.nextCursor;
+    }
+
+    expect(drained).toEqual(['a1']);
+    expect(String(since)).toBe(String(idA1));
+    await p.disconnect();
+  }, 30_000);
 });
 
 describe('subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {

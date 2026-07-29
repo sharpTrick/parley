@@ -20,4 +20,9 @@ backend_config:
   # gives this session its own distinct sender attribution (see A's comment).
   user: "parley-agent-b"
   password: "change-me-agent-b"
+  # Required for the same reason as in code-agent-a.yaml: whichever session creates
+  # `ctx-infra`'s invite-only room must already invite the others.
+  invite:
+    - "@parley-agent-a:parley.local"
+    - "@parley-owner:parley.local"
   sync_timeout_ms: 25000

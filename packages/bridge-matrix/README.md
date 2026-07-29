@@ -17,7 +17,7 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | `backendMsgId` = `cursor` | The Matrix **`event_id`** — globally unique and distinct; serves as both the dedup key and the order key. |
 | `cursor` (second form)  | `@parley-stream:<pagination-token>` — minted **only** when a read found no message belonging to the topic (an empty or all-foreign window), so there is no `event_id` to name. It marks the timeline position the window was read AT; replaying it returns exactly what landed after. It is **opaque**: not an `event_id`, never passed to `/context`, and not comparable to one. These two are the only cursor forms the plugin emits. |
 | `fetchRecent` (no `since`) | `GET /rooms/<room_id>/messages?dir=b&limit=N&filter={"types":["m.room.message"]}`, paged backwards until N **belonging** messages are collected (a raw page cap must never hide a topic sitting behind foreign-topic or reaction/membership traffic), then reversed to ascending. A topic whose room does not exist yet reads as an empty page — a read never provisions (see below). |
-| `fetchRecent` (`since`) | Two branches by cursor form. An **`event_id`**: `GET /rooms/<room_id>/context/<since>?limit=0` → `end` token → forward paging. A **`@parley-stream:` token** (and the legacy `''` sentinel written by older read-state files): no `/context` at all — the token *is* the forward position. Both then `GET /rooms/<room_id>/messages?from=<pos>&dir=f&limit=N&filter={"types":["m.room.message"]}`, paged forward until N belonging messages are collected. `since` is made strictly **exclusive** (drop up to and including the cursor event). A `since` that no longer resolves (purged / retention-expired) degrades to the recent window rather than throwing. `nextCursor` advances past a **page-sized** block of foreign-topic traffic so it can never wedge; a shorter, all-foreign tail leaves the cursor where it was, so another topic's traffic does not move this one's. |
+| `fetchRecent` (`since`) | Two branches by cursor form. An **`event_id`**: `GET /rooms/<room_id>/context/<since>?limit=0` → `end` token → forward paging. A **`@parley-stream:` token** (and the legacy `''` sentinel written by older read-state files): no `/context` at all — the token *is* the forward position. Both then `GET /rooms/<room_id>/messages?from=<pos>&dir=f&limit=N&filter={"types":["m.room.message"]}`, paged forward until N belonging messages are collected. `since` is made strictly **exclusive** (drop up to and including the cursor event). A `since` that no longer resolves (purged / retention-expired) degrades to the recent window rather than throwing. `nextCursor` advances past a **page-sized** block of foreign-topic traffic so it can never wedge; a shorter, all-foreign tail leaves the cursor where it was, so another topic's traffic does not move this one's. `block_ms` changes only how long the call waits, never which cursor it reports. |
 | `subscribe`             | A filtered `/sync` long-poll loop. The initial `timeout=0` sync yields a `next_batch` that **skips history**; the loop then delivers each new `m.room.message` (including our own sends) in timeline order. `disconnect()` aborts the in-flight long-poll. A failing `/sync` (revoked token, kick, homeserver fault) is reported on stderr and retried with exponential backoff up to 30s — never a silent hot loop. |
 | `resolveIdentity`       | `{ handle, backendRef: handle }` — the string-convention echo, not a directory lookup (`GET /_matrix/client/v3/profile/...` is never called); a production bridge would map handles to provisioned Matrix users. |
 
@@ -30,7 +30,9 @@ nothing is newer than `since`, the call holds up to `block_ms` for a new message
 (possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. Matrix
 serves this natively via a room-filtered `/sync` long-poll (bounded), reconciled through
 `/messages`. Core caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the
-immediate-return catch-up semantics.
+immediate-return catch-up semantics. Blocking engages only relative to a `since`, per the seam: a
+`fetch_recent` with no `since` is the default recent window and returns at once, even on a topic
+whose room does not exist yet.
 
 **Reads never provision.** `post` and `subscribe` create a topic's room when the alias does not
 resolve; `fetch_recent` does not — it returns an empty page with a replayable cursor and starts
@@ -82,6 +84,14 @@ Bring the accounts you *do* want in via `invite`. Set `room_preset: public_chat`
 deliberately want a room anyone on the homeserver can join. Rooms that already exist are joined as
 they are — this setting applies to rooms this plugin **creates**.
 
+Matrix's third preset, `trusted_private_chat`, is deliberately **not accepted**: it gives every
+invitee power level 100, so any of them could set `m.room.join_rules` to `public` and undo the
+guarantee above.
+
+A join this account is not admitted to **fails loudly**, naming the alias, the MXID and the fix —
+it does not degrade into an opaque `M_FORBIDDEN` from a later `/send` or `/messages`, or into a
+`/sync` that silently never yields the room.
+
 ## Config (`backend_config`)
 
 | key                | default                  | meaning |
@@ -92,8 +102,8 @@ they are — this setting applies to rooms this plugin **creates**.
 | `server_name`      | `parley.local`           | Used to build room aliases. |
 | `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout. Unbounded: each `/sync` gets a transport deadline of this plus a full 30s call budget, so raising it does not make the homeserver's own answer look like a timeout. It is also the cadence at which a blocking `fetch_recent` re-checks by itself, so a very large value slows the safety net that covers a `/sync` loop stuck in retry backoff. |
 | `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. |
-| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below). |
-| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. |
+| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below). These are the only two accepted. |
+| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares a topic; see "Multiple concurrent sessions". |
 
 Secrets live in `backend_config` / `.env`, never in code.
 
@@ -117,6 +127,13 @@ rule** — they should each be **different**:
   Matrix account per session** and put its `user`/`password` here — the same role `identity.handle`
   plays for SQLite/Redis/NATS, just carried in `backend_config` instead of the per-instance block.
 - **`sync_timeout_ms`** is safe to vary per session.
+- **`invite` — required as soon as `user` differs.** With the default `room_preset` every room this
+  plugin creates has `join_rule: invite`, and whichever session posts to a shared topic first is the
+  one that creates its room. So every *other* account that shares that topic must already be in the
+  creating config's `invite` list, or that session's startup catch-up rejects with `M_FORBIDDEN` and
+  its live path delivers nothing. Since you cannot know which session gets there first, list the
+  peers on **every** config — that is what the shipped examples below do. (Rooms that already exist
+  are joined as they are, so `invite` cannot repair a room somebody else created without you.)
 
 Runnable multi-config examples (two Code sessions with distinct accounts + a remote/chat config,
 all sharing one homeserver): [`examples/multi-session/matrix`](../../examples/multi-session/README.md).
