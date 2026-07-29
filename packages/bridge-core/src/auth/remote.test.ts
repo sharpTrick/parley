@@ -191,7 +191,7 @@ describe('remote OAuth front door (single-tenant)', () => {
     expect(www).toContain('/.well-known/oauth-protected-resource/mcp');
   });
 
-  // SEC-04: the browser-facing OAuth front door must carry anti-clickjacking / hardening headers on
+  // The browser-facing OAuth front door must carry anti-clickjacking / hardening headers on
   // EVERY response (app-wide middleware covers /authorize + /parley/consent), and the consent page
   // must lead with the trustworthy redirect ORIGIN, demoting the attacker-controlled client_name to
   // a muted line so a spoofed name ("Claude Desktop") is less convincing.
@@ -294,7 +294,7 @@ describe('remote OAuth front door (single-tenant)', () => {
     expect(res.status).toBe(403);
   });
 
-  // SEC-01 / D2: a wrong guess must CONSUME the pending consent — one-shot consent_id. A second POST
+  // A wrong guess must CONSUME the pending consent — one-shot consent_id. A second POST
   // with the same consent_id and the CORRECT passphrase must be rejected (not a 302 with a code).
   // Pre-fix, the correct second guess would 302 back with a code; this pins the one-shot delete.
   it('consumes the pending consent on a wrong guess (consent_id is one-shot)', async () => {
@@ -309,7 +309,7 @@ describe('remote OAuth front door (single-tenant)', () => {
     expect(back === null || !new URL(back, origin).searchParams.has('code')).toBe(true);
   });
 
-  // SEC-01 / D1: the hand-mounted consent route carries its own strict express-rate-limit. Firing
+  // The hand-mounted consent route carries its own strict express-rate-limit. Firing
   // limit + 1 POSTs from the same client returns 429 on the final one (per-test app ⇒ fresh counter).
   it('rate-limits /parley/consent (429 past the limit)', async () => {
     const LIMIT = 10;
@@ -320,7 +320,7 @@ describe('remote OAuth front door (single-tenant)', () => {
     expect(last!.status).toBe(429);
   });
 
-  // CX-04: the shared escapeHtml is wired at BOTH consent-flow render sites (the /authorize consent
+  // The shared escapeHtml is wired at BOTH consent-flow render sites (the /authorize consent
   // page and the /parley/consent 403 error page). Drive each with a hostile string and assert the
   // served HTML carries escaped entities and no raw markup.
   const HOSTILE = '<script>a&"\'';
@@ -396,5 +396,118 @@ describe('remote OAuth front door (single-tenant)', () => {
     // Reusing the now-rotated refresh token must fail.
     const second = await refreshOnce();
     expect(second.status).toBeGreaterThanOrEqual(400);
+  });
+});
+
+describe('remote OAuth front door — credential lifecycle over HTTP', () => {
+  const revoke = (endpoint: string, token: string, clientId: string) =>
+    fetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form({ token, client_id: clientId }),
+    });
+
+  it.each([['access_token'], ['refresh_token']])(
+    'revoking the %s at /revoke kills the whole grant, not just the string presented',
+    async (kind: string) => {
+      const { client, tokens, asMeta } = await runOAuthFlow();
+      const mcpClient = await mcpClientWithToken(tokens.access_token);
+      await mcpClient.close(); // the token works before revocation
+
+      const res = await revoke(asMeta.revocation_endpoint, tokens[kind], client.client_id);
+      expect(res.status).toBe(200);
+
+      const afterAccess = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${tokens.access_token}`,
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+      expect(afterAccess.status).toBe(401);
+
+      const afterRefresh = await fetch(asMeta.token_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: form({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refresh_token,
+          client_id: client.client_id,
+          resource: `${origin}/mcp`,
+        }),
+      });
+      expect(afterRefresh.status).toBeGreaterThanOrEqual(400);
+    },
+  );
+
+  it('ignores a revocation from a client the grant was not issued to', async () => {
+    const { client, tokens, asMeta } = await runOAuthFlow();
+    const attacker = await jget(
+      await fetch(asMeta.registration_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [CLIENT_REDIRECT],
+          token_endpoint_auth_method: 'none',
+        }),
+      }),
+    );
+    expect(attacker.client_id).not.toBe(client.client_id);
+
+    // RFC 7009: answer 200 regardless, so the endpoint is not a token oracle...
+    const res = await revoke(asMeta.revocation_endpoint, tokens.access_token, attacker.client_id);
+    expect(res.status).toBe(200);
+
+    // ...but the victim's token is untouched.
+    const still = await mcpClientWithToken(tokens.access_token);
+    await still.close();
+  });
+
+  it('refuses an /authorize for a resource this AS does not serve, before rendering consent', async () => {
+    const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+    const reg = await jget(
+      await fetch(as.registration_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [CLIENT_REDIRECT],
+          token_endpoint_auth_method: 'none',
+        }),
+      }),
+    );
+    const { challenge } = pkce();
+    const authorizeUrl = new URL(as.authorization_endpoint);
+    authorizeUrl.search = form({
+      response_type: 'code',
+      client_id: reg.client_id,
+      redirect_uri: CLIENT_REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      resource: 'https://evil.example/mcp',
+    });
+    const res = await fetch(authorizeUrl.href, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    const back = new URL(res.headers.get('location')!);
+    expect(back.searchParams.get('error')).toBe('invalid_target');
+    expect(await res.text()).not.toContain('consent_id');
+  });
+
+  it('401s a bearer token bound to a different resource (RFC 8707 audience)', async () => {
+    const peek = remote.provider as unknown as {
+      issue(clientId: string, scopes: string[], resource: string): { access_token: string };
+    };
+    const foreign = peek.issue('some-client', ['mcp'], 'https://evil.example/mcp').access_token;
+    const res = await fetch(`${origin}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: `Bearer ${foreign}`,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    expect(res.status).toBe(401);
   });
 });

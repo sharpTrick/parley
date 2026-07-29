@@ -1,4 +1,9 @@
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import {
+  createRemoteJWKSet,
+  jwtVerify,
+  type JWTHeaderParameters,
+  type JWTPayload,
+} from 'jose';
 import {
   InsufficientScopeError,
   InvalidTokenError,
@@ -23,11 +28,34 @@ export interface OidcVerifierOptions {
   requiredRole?: string;
   /** exp/nbf tolerance in seconds. Default 30. */
   clockSkewS?: number;
-  /** Accepted signing algorithms. Asymmetric only — never allow HS* on a public IdP. */
-  algorithms?: string[];
   /** Injectable clock for tests (ms epoch). */
   now?: () => number;
 }
+
+/**
+ * Every asymmetric JWS algorithm, and only those. Keep HS* out, so that anyone who learns the
+ * client secret an IdP shares with its clients cannot forge a token this server accepts.
+ */
+export const ACCEPTED_SIGNING_ALGORITHMS = [
+  'RS256',
+  'RS384',
+  'RS512',
+  'PS256',
+  'PS384',
+  'PS512',
+  'ES256',
+  'ES384',
+  'ES512',
+  'EdDSA',
+];
+
+/**
+ * `typ` values an IdP stamps on credentials that are not bearer access tokens (Keycloak: `ID`,
+ * `Refresh`, `Logout`). An ID token is a client-side login receipt, so accepting one here would
+ * let any client replay its own receipt as authorization for this resource. Keycloak puts this in
+ * the CLAIMS, not the JOSE header (where it writes a generic `JWT`) — check both.
+ */
+const NON_ACCESS_TOKEN_TYPES = new Set(['id', 'refresh', 'logout', 'serialized-id']);
 
 /** Keycloak-style realm-roles claim. */
 interface RealmAccessClaim {
@@ -54,18 +82,23 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const { opts } = this;
     let payload: JWTPayload;
+    let header: JWTHeaderParameters;
     try {
       // One call covers signature (kid-selected key, auto-refetch on unknown kid), iss, exp,
       // nbf (± clockTolerance), and aud-contains-audience.
-      ({ payload } = await jwtVerify(token, this.jwks, {
+      ({ payload, protectedHeader: header } = await jwtVerify(token, this.jwks, {
         issuer: opts.issuer,
         audience: opts.audience,
-        algorithms: opts.algorithms ?? ['RS256', 'PS256', 'ES256'],
+        algorithms: ACCEPTED_SIGNING_ALGORITHMS,
         clockTolerance: opts.clockSkewS ?? 30,
         ...(opts.now !== undefined ? { currentDate: new Date(opts.now()) } : {}),
       }));
     } catch {
       // Never leak which check failed (sig vs iss vs exp vs aud).
+      throw new InvalidTokenError('invalid or expired access token');
+    }
+
+    if (!isAccessToken(header, payload)) {
       throw new InvalidTokenError('invalid or expired access token');
     }
 
@@ -118,6 +151,15 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
     }
     return true;
   }
+}
+
+function isAccessToken(header: JWTHeaderParameters, payload: JWTPayload): boolean {
+  for (const typ of [header.typ, payload.typ]) {
+    if (typeof typ === 'string' && NON_ACCESS_TOKEN_TYPES.has(typ.toLowerCase())) return false;
+  }
+  // `nonce` is an ID-token claim echoed from the authentication request; an IdP that does not
+  // stamp `typ` still gives an ID token away this way.
+  return payload.nonce === undefined;
 }
 
 function asUrl(s: string): URL | undefined {

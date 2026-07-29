@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { parseConfig, type ParleyConfig } from '../config.js';
+import { parseConfig, type OidcAuthConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { startFakeOidc, type FakeOidc, type FakeOidcClaims } from '../testing/fake-oidc.js';
 import { createOidcRemoteApp, type OidcRemoteServer } from './oidc-remote.js';
@@ -31,6 +31,22 @@ function baseCfg(): ParleyConfig {
   return parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] });
 }
 
+/**
+ * Delegated OIDC refuses to boot without an identity gate, so supply one matching the fake IdP's
+ * default subject unless the case under test brings its own.
+ */
+function withGate(oidcExtras: Record<string, unknown> = {}): OidcAuthConfig {
+  const gated =
+    'allowed_subjects' in oidcExtras ||
+    'allowed_usernames' in oidcExtras ||
+    'required_role' in oidcExtras;
+  return {
+    clock_skew_s: 30,
+    ...(gated ? {} : { allowed_subjects: ['owner-sub'] }),
+    ...oidcExtras,
+  } as unknown as OidcAuthConfig;
+}
+
 /** Boot a delegated-RS remote app on a free port with the given oidc config extras. */
 async function boot(oidcExtras: Record<string, unknown> = {}): Promise<void> {
   const port = await freePort();
@@ -39,7 +55,7 @@ async function boot(oidcExtras: Record<string, unknown> = {}): Promise<void> {
   await plugin.connect({});
   remote = await createOidcRemoteApp(plugin, baseCfg(), {
     publicUrl: new URL(origin),
-    oidc: { issuer: idp.issuer, clock_skew_s: 30, ...oidcExtras },
+    oidc: { ...withGate(oidcExtras), issuer: idp.issuer },
   });
   await remote.listen(port);
 }
@@ -181,7 +197,7 @@ describe('remote OIDC front door (delegated resource server)', () => {
     expect(urlAud.status).toBe(401);
   });
 
-  it('authorizes valid tokens when the configured issuer has a trailing slash (BUG-24)', async () => {
+  it('authorizes valid tokens when the configured issuer has a trailing slash', async () => {
     // Issuer configured WITH a trailing slash; the fake IdP mints `iss` WITHOUT one. The verifier
     // must be built from the discovery document's canonical issuer, or jose's exact `iss` match
     // rejects every token (healthy boot, 100% token rejection).
@@ -190,7 +206,7 @@ describe('remote OIDC front door (delegated resource server)', () => {
     expect(res.status).toBe(200);
   });
 
-  it('enforces the identity gate end to end: a mismatched subject is 401 (SEC-05)', async () => {
+  it('enforces the identity gate end to end: a mismatched subject is 401', async () => {
     await boot({ allowed_subjects: ['owner-sub'] });
     const aud = `${origin}/mcp`;
     // Default mint uses sub 'owner-sub' → allowed.
@@ -203,7 +219,7 @@ describe('remote OIDC front door (delegated resource server)', () => {
     expect(denied.status).toBe(401);
   });
 
-  it('rejects a discovery jwks_uri off the issuer origin, unless explicitly pinned (SEC-19)', async () => {
+  it('rejects a discovery jwks_uri off the issuer origin, unless explicitly pinned', async () => {
     const port = await freePort();
     origin = `http://127.0.0.1:${port}`;
     plugin = new FakePlugin();
@@ -230,7 +246,7 @@ describe('remote OIDC front door (delegated resource server)', () => {
     await expect(
       createOidcRemoteApp(plugin, baseCfg(), {
         publicUrl: new URL(origin),
-        oidc: { issuer: idp.issuer, clock_skew_s: 30 },
+        oidc: { ...withGate(), issuer: idp.issuer },
         fetchFn,
       }),
     ).rejects.toThrow(/jwks_uri origin/);
@@ -238,7 +254,7 @@ describe('remote OIDC front door (delegated resource server)', () => {
     // Explicit config override is the trusted pin (e.g. a CDN-hosted JWKS) → accepted.
     remote = await createOidcRemoteApp(plugin, baseCfg(), {
       publicUrl: new URL(origin),
-      oidc: { issuer: idp.issuer, clock_skew_s: 30, jwks_uri: offOrigin },
+      oidc: { ...withGate({ jwks_uri: offOrigin }), issuer: idp.issuer },
       fetchFn,
     });
     await remote.listen(port);
@@ -253,13 +269,13 @@ describe('remote OIDC front door (delegated resource server)', () => {
     await expect(
       createOidcRemoteApp(plugin, baseCfg(), {
         publicUrl: new URL(`http://127.0.0.1:${port}`),
-        oidc: { issuer: dead, clock_skew_s: 30 },
+        oidc: { ...withGate(), issuer: dead },
       }),
     ).rejects.toThrow(/OIDC discovery failed/);
     // Satisfy afterEach.
     remote = await createOidcRemoteApp(plugin, baseCfg(), {
       publicUrl: new URL(`http://127.0.0.1:${await freePort()}`),
-      oidc: { issuer: idp.issuer, clock_skew_s: 30 },
+      oidc: { ...withGate(), issuer: idp.issuer },
     });
   });
 });
@@ -273,8 +289,8 @@ describe('createRemoteAuthApp selector', () => {
     const cfg = parseConfig({
       identity: { handle: 'agent' },
       topics: ['ctx'],
-      // SEC-05: an identity gate is now mandatory for oidc mode. owner-sub matches the fake
-      // IdP's default subject; this test only checks PRM, so the gate value is otherwise inert.
+      // An identity gate is mandatory in oidc mode; owner-sub matches the fake IdP's default
+      // subject, and this case only checks PRM, so the gate value is otherwise inert.
       auth: { mode: 'oidc', oidc: { issuer: idp.issuer, allowed_subjects: ['owner-sub'] } },
     });
     remote = (await createRemoteAuthApp(plugin, cfg, {

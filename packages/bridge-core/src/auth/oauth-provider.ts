@@ -8,7 +8,9 @@ import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/serv
 import {
   InvalidGrantError,
   InvalidScopeError,
+  InvalidTargetError,
   InvalidTokenError,
+  TemporarilyUnavailableError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type {
@@ -22,8 +24,8 @@ const ACCESS_TTL_SEC = 60 * 60; // 1 hour
 const REFRESH_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 const CODE_TTL_MS = 60_000; // 1 minute, single-use
 const CONSENT_TTL_MS = 5 * 60_000; // 5 minutes to approve
-const SWEEP_INTERVAL_MS = 60_000; // periodic GC of expired OAuth state so maps can't grow unbounded (SEC-02)
-const MAX_CLIENTS = 100; // cap DCR clients — a single-tenant bridge only ever needs a handful (SEC-02)
+const SWEEP_INTERVAL_MS = 60_000;
+const MAX_CLIENTS = 100;
 
 interface CodeRecord {
   clientId: string;
@@ -35,13 +37,14 @@ interface CodeRecord {
 }
 interface AccessRecord extends AuthInfo {
   expiresAt: number; // seconds since epoch (required by requireBearerAuth)
+  grantId: string;
 }
 interface RefreshRecord {
   clientId: string;
   scopes: string[];
   resource: string;
   expiresAtMs: number;
-  accessToken: string; // back-link to the access token issued alongside; freed on rotation (SEC-02)
+  grantId: string;
 }
 interface PendingConsent {
   client: OAuthClientInformationFull;
@@ -78,10 +81,8 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
 
   constructor(private readonly opts: ParleyOAuthProviderOptions) {
     this.now = opts.now ?? Date.now;
-    // Periodic GC (SEC-02): abandoned/expired code/pending/access/refresh entries would otherwise
-    // accumulate for the whole process lifetime. .unref() so the timer never keeps the event loop
-    // alive; stop() clears it for graceful shutdown and tests.
     this.sweepTimer = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
+    // Keep the .unref(), so that an un-stopped provider can never hold the process open.
     this.sweepTimer.unref?.();
   }
 
@@ -95,9 +96,25 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     for (const [k, r] of this.access) if (r.expiresAt < nowSec) this.access.delete(k);
   }
 
-  /** Stop the background sweeper (graceful shutdown / tests) so no timer is left dangling. */
+  /** Stop the background sweeper and drop all issued state (graceful shutdown / tests). */
   stop(): void {
     clearInterval(this.sweepTimer);
+    this.codes.clear();
+    this.access.clear();
+    this.refresh.clear();
+    this.pending.clear();
+    this.clients.clear();
+  }
+
+  private hasLiveCredential(clientId: string): boolean {
+    const nowMs = this.now();
+    for (const r of this.access.values()) {
+      if (r.clientId === clientId && r.expiresAt >= nowMs / 1000) return true;
+    }
+    for (const r of this.refresh.values()) {
+      if (r.clientId === clientId && r.expiresAtMs >= nowMs) return true;
+    }
+    return false;
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
@@ -106,17 +123,27 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       // DCR: the SDK has already set client_id on the object before calling this.
       registerClient: (client) => {
         const full = client as OAuthClientInformationFull;
-        // Bound the DCR client map (SEC-02): DCR is reachable pre-owner-auth, and clients were
-        // never freed. A single-tenant bridge only ever has a handful of live clients, so once we
-        // hit MAX_CLIENTS evict the oldest registration (Map insertion order = FIFO).
         if (!this.clients.has(full.client_id) && this.clients.size >= MAX_CLIENTS) {
-          const oldest = this.clients.keys().next().value;
-          if (oldest !== undefined) this.clients.delete(oldest);
+          // Only ever evict a client with no live token, so that unauthenticated DCR spam
+          // cannot push the owner's consented client out of the map and lock them out.
+          const evictable = [...this.clients.keys()].find((id) => !this.hasLiveCredential(id));
+          if (evictable === undefined) {
+            throw new TemporarilyUnavailableError('client registration capacity reached');
+          }
+          this.clients.delete(evictable);
         }
         this.clients.set(full.client_id, full);
         return full;
       },
     };
+  }
+
+  private assertResource(resource: URL | undefined): void {
+    if (resource !== undefined && resource.href !== this.opts.resource.href) {
+      throw new InvalidTargetError(
+        `this server only issues tokens for ${this.opts.resource.href}`,
+      );
+    }
   }
 
   /**
@@ -128,6 +155,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
+    this.assertResource(params.resource);
     const consentId = randomUUID();
     this.pending.set(consentId, { client, params, expiresAtMs: this.now() + CONSENT_TTL_MS });
     res.status(200).type('html').send(this.consentPage(consentId, client, params));
@@ -144,9 +172,8 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       this.pending.delete(consentId);
       throw new ConsentError('consent request expired or unknown');
     }
-    // One-shot: consume the pending consent BEFORE verifying, so a wrong guess invalidates the
-    // consent_id regardless of outcome. Each guess then costs a fresh (SDK-rate-limited) /authorize
-    // round-trip, dropping brute force to the /authorize cap. Owner typo ⇒ restart the flow.
+    // Consume before verifying, so that a wrong guess costs a fresh (rate-limited) /authorize
+    // round-trip instead of an unlimited retry against the same consent_id.
     this.pending.delete(consentId);
     if (!(await this.opts.verifyOwner(passphrase))) {
       throw new ConsentError('incorrect owner passphrase');
@@ -173,9 +200,8 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): Promise<string> {
     const rec = this.codes.get(authorizationCode);
-    // Delete-on-lazy-expiry (SEC-02): evict a found-but-expired code instead of leaving it to rot.
-    // (A valid code is intentionally NOT deleted here — the SDK verifies PKCE between this read-only
-    // call and exchangeAuthorizationCode, which is where the single-use consume happens.)
+    // Do not delete a valid code here, so that the SDK's PKCE check (which runs between this
+    // read-only call and exchangeAuthorizationCode) still has one to redeem.
     if (rec !== undefined && rec.expiresAtMs < this.now()) this.codes.delete(authorizationCode);
     if (rec === undefined || rec.clientId !== client.client_id || rec.expiresAtMs < this.now()) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
@@ -191,20 +217,17 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     resource?: URL,
   ): Promise<OAuthTokens> {
     const rec = this.codes.get(authorizationCode);
+    // Evict only on expiry, so that a foreign client presenting someone else's code cannot burn it.
+    if (rec !== undefined && rec.expiresAtMs < this.now()) this.codes.delete(authorizationCode);
     if (rec === undefined || rec.clientId !== client.client_id || rec.expiresAtMs < this.now()) {
-      if (rec !== undefined) this.codes.delete(authorizationCode); // expired/mismatched: evict (SEC-02)
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
-    // Single-use: consume the code on ANY exchange attempt, BEFORE the redirect_uri compare, so a
-    // failed exchange leaves nothing replayable (SEC-10). Residual: the PKCE-failure path can't be
-    // consumed here — the SDK verifies PKCE via the read-only challengeForAuthorizationCode call
-    // just before this one, and deleting the code there would break the happy path.
+    // Consume before every remaining check, so that a failed exchange leaves nothing replayable.
     this.codes.delete(authorizationCode);
-    // Unconditional redirect_uri binding per OAuth 2.1 (SEC-12): a token request that omits it must
-    // be rejected, not silently skip the check. A real MCP client (Claude/SDK) always sends it.
     if (redirectUri !== rec.redirectUri) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
+    this.assertResource(resource);
     return this.issue(client.client_id, rec.scopes, resource?.href ?? rec.resource);
   }
 
@@ -215,26 +238,30 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     resource?: URL,
   ): Promise<OAuthTokens> {
     const rec = this.refresh.get(refreshToken);
+    // Evict only on expiry, so that a foreign client presenting someone else's token cannot burn it.
+    if (rec !== undefined && rec.expiresAtMs < this.now()) this.refresh.delete(refreshToken);
     if (rec === undefined || rec.clientId !== client.client_id || rec.expiresAtMs < this.now()) {
-      if (rec !== undefined) this.refresh.delete(refreshToken); // stale/mismatched: evict (SEC-02)
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
-    // Scope subset check (SEC-11): a refresh MUST NOT widen scope beyond the original grant. Checked
-    // BEFORE consuming the token so a bad-scope request is retryable (does not burn the refresh
-    // token). Latent defense-in-depth today — no Parley capability is scope-gated (the allowlist is
-    // topic-based) — but any future scope gate would otherwise be bypassable via refresh.
     if (scopes !== undefined && !scopes.every((s) => rec.scopes.includes(s))) {
       throw new InvalidScopeError('requested scope exceeds the original grant');
     }
-    this.refresh.delete(refreshToken); // rotate: invalidate the used refresh token
-    this.access.delete(rec.accessToken); // free the access token orphaned by this rotation (SEC-02)
-    return this.issue(client.client_id, scopes ?? rec.scopes, resource?.href ?? rec.resource);
+    this.assertResource(resource);
+    // Rotation is revocation plus re-issue under the same grant: the presented refresh token and
+    // the access token it minted both die here.
+    this.revokeGrant(rec.grantId);
+    return this.issue(
+      client.client_id,
+      scopes ?? rec.scopes,
+      resource?.href ?? rec.resource,
+      rec.grantId,
+    );
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const rec = this.access.get(token);
     if (rec === undefined || rec.expiresAt < this.now() / 1000) {
-      if (rec !== undefined) this.access.delete(token); // delete-on-lazy-expiry (SEC-02)
+      if (rec !== undefined) this.access.delete(token);
       throw new InvalidTokenError('access token is invalid or expired');
     }
     // RFC 8707 audience binding: the token must have been minted for THIS resource.
@@ -244,15 +271,31 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     return rec;
   }
 
+  /**
+   * RFC 7009 revocation. Revoking any credential kills the whole grant — every access and refresh
+   * token of every rotation generation — and only the client the grant was issued to may do it.
+   * An unknown or foreign token is a silent no-op so the endpoint is not a token oracle.
+   */
   async revokeToken(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest,
   ): Promise<void> {
-    this.access.delete(request.token);
-    this.refresh.delete(request.token);
+    const rec = this.access.get(request.token) ?? this.refresh.get(request.token);
+    if (rec === undefined || rec.clientId !== client.client_id) return;
+    this.revokeGrant(rec.grantId);
   }
 
-  private issue(clientId: string, scopes: string[], resource: string): OAuthTokens {
+  private revokeGrant(grantId: string): void {
+    for (const [k, r] of this.access) if (r.grantId === grantId) this.access.delete(k);
+    for (const [k, r] of this.refresh) if (r.grantId === grantId) this.refresh.delete(k);
+  }
+
+  private issue(
+    clientId: string,
+    scopes: string[],
+    resource: string,
+    grantId: string = randomUUID(),
+  ): OAuthTokens {
     const accessToken = randomBytes(32).toString('base64url');
     const refreshToken = randomBytes(32).toString('base64url');
     const resourceUrl = new URL(resource);
@@ -262,13 +305,14 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       scopes,
       expiresAt: Math.floor(this.now() / 1000) + ACCESS_TTL_SEC,
       resource: resourceUrl,
+      grantId,
     });
     this.refresh.set(refreshToken, {
       clientId,
       scopes,
       resource,
       expiresAtMs: this.now() + REFRESH_TTL_SEC * 1000,
-      accessToken, // back-link so refresh rotation can free the access token it replaces (SEC-02)
+      grantId,
     });
     return {
       access_token: accessToken,

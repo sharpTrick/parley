@@ -9,6 +9,7 @@ import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { fetchOidcDiscovery } from './oidc-discovery.js';
 import { OidcTokenVerifier } from './oidc-verifier.js';
+import { assertIdentityGate, assertRootPath } from './invariants.js';
 
 export interface OidcRemoteOptions {
   /** Public base URL of THIS resource server (what Claude reaches) — NOT the OAuth issuer;
@@ -48,8 +49,10 @@ export async function createOidcRemoteApp(
   opts: OidcRemoteOptions,
 ): Promise<OidcRemoteServer> {
   const mcpPath = opts.mcpPath ?? '/mcp';
+  assertRootPath(opts.publicUrl, 'publicUrl');
   const resource = new URL(mcpPath, opts.publicUrl); // canonical resource id (no trailing slash)
   const oidc = opts.oidc;
+  assertIdentityGate(oidc);
 
   const metadata = await fetchOidcDiscovery(oidc.issuer, opts.fetchFn ?? fetch);
   const jwksUri = oidc.jwks_uri ?? metadata.jwks_uri;
@@ -71,9 +74,8 @@ export async function createOidcRemoteApp(
   const audience = oidc.audience ?? resource.href;
 
   const verifier = new OidcTokenVerifier({
-    // Use the discovery document's canonical issuer (already validated to equal oidc.issuer
-    // modulo a trailing slash) — it is exactly what the IdP stamps in `iss`, so jose's exact
-    // match lines up in both slash directions (BUG-24).
+    // Keep the discovery document's issuer rather than the configured one, so that jose's exact
+    // `iss` match lines up whichever way the operator wrote the trailing slash.
     issuer: metadata.issuer,
     audience,
     jwksUri,

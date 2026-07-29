@@ -4,12 +4,13 @@ import {
 } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import express from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { MemoryStore } from 'express-rate-limit';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
+import { assertRootPath } from './invariants.js';
 
 export interface OAuthRemoteOptions {
   /** Public origin = issuer = base URL (AS = RS, single tenant). HTTPS in production; localhost ok in dev. */
@@ -44,6 +45,7 @@ export function createOAuthRemoteApp(
   oauth: OAuthRemoteOptions,
 ): OAuthRemoteServer {
   const mcpPath = oauth.mcpPath ?? '/mcp';
+  assertRootPath(oauth.issuerUrl, 'issuerUrl');
   const resource = new URL(mcpPath, oauth.issuerUrl); // canonical resource id (no trailing slash)
 
   const provider = new ParleyOAuthProvider({
@@ -55,21 +57,21 @@ export function createOAuthRemoteApp(
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resource);
   const bearer = requireBearerAuth({ verifier: provider, resourceMetadataUrl });
 
-  // Strict rate limit on the hand-mounted consent route, mirroring how the SDK guards its own auth
-  // endpoints (/register|/authorize|/token). A legit owner needs one attempt; brute force needs
-  // thousands, so keep the ceiling low and return 429 on exceed. Per-app instance (its own store)
-  // so the counter is scoped to this server, not shared process-wide.
-  //
-  // Trust-proxy note: the limiter keys on req.ip. Behind the documented reverse proxy (Caddy) all
-  // requests would otherwise share the proxy's IP, so per-IP throttling is defense-in-depth here —
-  // the load-bearing brute-force defense is the one-shot consent invalidation in completeConsent
-  // (each guess costs a fresh /authorize). We deliberately do NOT reconfigure the global `trust
-  // proxy` setting from this route (an app-wide change with its own security implications).
+  // Every limiter gets a store this app owns, so that its counters stay scoped to this server
+  // rather than shared process-wide, and so that close() can stop their sweep timers.
+  const stores: MemoryStore[] = [];
+  const ownedStore = (): MemoryStore => {
+    const store = new MemoryStore();
+    stores.push(store);
+    return store;
+  };
+
   const consentLimiter = rateLimit({
     windowMs: 15 * 60_000,
     limit: 10,
     standardHeaders: true,
     legacyHeaders: false,
+    store: ownedStore(),
   });
 
   const remote = createRemoteHttpApp(plugin, cfg, {
@@ -86,6 +88,10 @@ export function createOAuthRemoteApp(
           resourceServerUrl: resource,
           scopesSupported: oauth.scopesSupported ?? ['mcp'],
           resourceName: 'Parley',
+          authorizationOptions: { rateLimit: { store: ownedStore() } },
+          clientRegistrationOptions: { rateLimit: { store: ownedStore() } },
+          revocationOptions: { rateLimit: { store: ownedStore() } },
+          tokenOptions: { rateLimit: { store: ownedStore() } },
         }),
       );
 
@@ -112,5 +118,14 @@ export function createOAuthRemoteApp(
     },
   });
 
-  return Object.assign(remote, { provider, resource });
+  const closeHttp = remote.close.bind(remote);
+  return Object.assign(remote, {
+    provider,
+    resource,
+    close: async (): Promise<void> => {
+      provider.stop();
+      for (const store of stores) store.shutdown();
+      await closeHttp();
+    },
+  });
 }
