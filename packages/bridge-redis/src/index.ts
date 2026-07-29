@@ -18,10 +18,21 @@ import { createClient } from 'redis';
 type RedisClient = ReturnType<typeof createClient>;
 
 const DEFAULT_URL = 'redis://127.0.0.1:6379';
+const DEFAULT_KEY_PREFIX = 'parley:';
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_BLOCK_MS = 2000;
+/** Every key `backend_config` may carry; anything else is a typo and is rejected by `connect()`. */
+export const CONFIG_KEYS = [
+  'url',
+  'key_prefix',
+  'block_ms',
+  'connect_timeout_ms',
+  'retention_days',
+] as const;
 /** A Redis Stream entry id — `<ms>` or `<ms>-<seq>`. Cursors and backendMsgIds are exactly this. */
 const CURSOR_PATTERN = /^\d+(-\d+)?$/;
+/** Both components of a stream entry id are unsigned 64-bit; a larger one is not an id at all. */
+const MAX_ID_COMPONENT = 18446744073709551615n;
 /** The sender of an entry written by something other than this plugin, which carries no `sender`. */
 const UNKNOWN_SENDER = 'unknown';
 /**
@@ -188,6 +199,39 @@ function normalizeRetentionDays(value: number | null | undefined): number | unde
 }
 
 /**
+ * Reject a key `backend_config` does not declare, so that `retention_dayz` or `keyprefix` cannot be
+ * accepted in silence and take the DEFAULT behaviour: history kept forever, or a keyspace that
+ * differs from every peer session's while every field still reads as consistent.
+ */
+function assertKnownKeys(cfg: Record<string, unknown>): void {
+  for (const key of Object.keys(cfg)) {
+    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `parley-redis: unknown backend_config key '${key}' — expected one of ` +
+          `${CONFIG_KEYS.join(', ')}`,
+      );
+    }
+  }
+}
+
+/**
+ * Keep the empty-string and wrong-type rejections, so that an unexpanded `"${REDIS_URL}"` — or any
+ * other empty secret — cannot fall through to node-redis' own default and quietly point the whole
+ * bridge at an unauthenticated `127.0.0.1:6379`, nor a non-string `key_prefix` template-coerce into
+ * a keyspace (`[object Object]parley:`) no peer session shares. `null` means "omitted" (DESIGN §11).
+ */
+function normalizeString(key: string, value: unknown, fallback: string): string {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'string' || value === '') {
+    throw new Error(
+      `parley-redis: ${key} must be a non-empty string (got ${describeValue(value)}); ` +
+        `omit it for the default '${fallback}'`,
+    );
+  }
+  return value;
+}
+
+/**
  * Every millisecond knob reaches a place where a nonsensical value is SILENT rather than loud:
  * `block_ms` becomes an `XREAD BLOCK` argument, where `-1`/`0.5`/`NaN` make the server reject every
  * read — killing live push forever behind a `subscribe()` that resolved — and `0` blocks the reader
@@ -221,6 +265,40 @@ async function streamTail(client: RedisClient, key: string): Promise<string> {
   } catch (err) {
     if ((await client.exists(key)) === 0) return '0'; // deleted in the EXISTS → XINFO gap
     throw err;
+  }
+}
+
+/**
+ * Validate the opaque cursor at the seam. A cursor this backend mints is a stream entry id
+ * (`<ms>[-<seq>]`); anything else — another backend's cursor, `''`/`'$'`, a truncated id via
+ * mis-namespaced read-state, or an all-digit string too large for the uint64 each component is —
+ * would otherwise reach XRANGE as a raw `ERR Invalid stream ID` naming neither backend nor topic.
+ * Throw labelled so core can drop it and refetch the window.
+ */
+function assertMintedCursor(topic: Topic, since: string): void {
+  const wellFormed =
+    CURSOR_PATTERN.test(since) && since.split('-').every((part) => BigInt(part) <= MAX_ID_COMPONENT);
+  if (!wellFormed) {
+    throw new Error(
+      `parley-redis: malformed cursor '${since}' for topic ${topic} — ` +
+        `expected a Redis Stream entry id ('<ms>' or '<ms>-<seq>') minted by this backend`,
+    );
+  }
+}
+
+/**
+ * Keep every backend refusal labelled, so that a repurposed key or a revoked ACL reaches the
+ * operator naming the plugin, the topic and the Redis key rather than as a bare RESP line
+ * (`WRONGTYPE Operation against a key holding the wrong kind of value`) that names none of them and
+ * cannot be traced back to which topic, prefix or process produced it.
+ */
+async function labelled<T>(topic: Topic, key: string, work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith('parley-redis:')) throw err;
+    throw new Error(`parley-redis: ${message} (topic ${topic}, key '${key}')`);
   }
 }
 
@@ -291,6 +369,9 @@ export class RedisPlugin implements BackendPlugin {
   }
 
   private async open(cfg: RedisBackendConfig): Promise<void> {
+    assertKnownKeys(cfg as Record<string, unknown>);
+    const url = normalizeString('url', cfg.url, DEFAULT_URL);
+    const prefix = normalizeString('key_prefix', cfg.key_prefix, DEFAULT_KEY_PREFIX);
     const retentionDays = normalizeRetentionDays(cfg.retention_days);
     const blockMs = normalizeMillis('block_ms', cfg.block_ms, DEFAULT_BLOCK_MS);
     const connectTimeoutMs = normalizeMillis(
@@ -302,10 +383,10 @@ export class RedisPlugin implements BackendPlugin {
     // explicitly advertises as safe — cannot orphan a live socket per call until Redis hits
     // maxclients. This also re-baselines the generation, so no prior loop can be revived.
     await this.tearDown();
-    this.prefix = cfg.key_prefix ?? 'parley:';
+    this.prefix = prefix;
     this.blockMs = blockMs;
     this.retentionDays = retentionDays;
-    this.url = cfg.url ?? DEFAULT_URL;
+    this.url = url;
     this.connectTimeoutMs = connectTimeoutMs;
     const client = createRedisClient(this.url, this.connectTimeoutMs);
     try {
@@ -348,41 +429,39 @@ export class RedisPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
-    const id = await this.require().xAdd(
-      this.key(topic),
-      '*',
-      {
-        sender: identity,
-        content,
-        ts: new Date().toISOString(),
-        in_reply_to: opts?.inReplyTo ?? '',
-      },
-      this.retentionDays !== undefined
-        ? {
-            TRIM: {
-              strategy: 'MINID',
-              strategyModifier: '~',
-              threshold: Date.now() - this.retentionDays * 86_400_000,
-            },
-          }
-        : undefined,
+    const key = this.key(topic);
+    const id = await labelled(topic, key, () =>
+      this.require().xAdd(
+        key,
+        '*',
+        {
+          sender: identity,
+          content,
+          ts: new Date().toISOString(),
+          in_reply_to: opts?.inReplyTo ?? '',
+        },
+        this.retentionDays !== undefined
+          ? {
+              TRIM: {
+                strategy: 'MINID',
+                strategyModifier: '~',
+                threshold: Date.now() - this.retentionDays * 86_400_000,
+              },
+            }
+          : undefined,
+      ),
     );
     return asBackendMsgId(id);
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const key = this.key(args.topic);
+    return labelled(args.topic, key, () => this.readWindow(args, key));
+  }
+
+  private async readWindow(args: FetchRecentArgs, key: string): Promise<FetchRecentResult> {
     const limit = args.limit ?? 100;
-    // Validate the opaque cursor at the seam. A cursor this backend mints is a stream entry id
-    // (`<ms>[-<seq>]`); anything else — another backend's cursor, or '' / '$' / a truncated id via
-    // mis-namespaced read-state — would otherwise reach XRANGE as a raw `ERR Invalid stream ID`
-    // naming neither backend nor topic. Throw labelled so core can drop it and refetch the window.
-    if (args.since !== undefined && !CURSOR_PATTERN.test(args.since)) {
-      throw new Error(
-        `parley-redis: malformed cursor '${args.since}' for topic ${args.topic} — ` +
-          `expected a Redis Stream entry id ('<ms>' or '<ms>-<seq>') minted by this backend`,
-      );
-    }
+    if (args.since !== undefined) assertMintedCursor(args.topic, args.since);
     let since: string | undefined = args.since;
     let entries: Array<{ id: string; message: Record<string, string> }>;
     if (since === undefined) {
@@ -491,6 +570,10 @@ export class RedisPlugin implements BackendPlugin {
    * `disconnect()` tears the reader down, which breaks the blocking read.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    return labelled(topic, this.key(topic), () => this.startReadLoop(topic, handler));
+  }
+
+  private async startReadLoop(topic: Topic, handler: MessageHandler): Promise<void> {
     // Capture the generation this subscribe belongs to; every continuation below is gated on it
     // still being current, so a disconnect()/reconnect that ran meanwhile tears this loop down.
     const gen = this.generation;

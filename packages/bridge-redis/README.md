@@ -36,8 +36,13 @@ backend_config:
   retention_days: 30               # optional; omit (or null) to keep every entry forever (default)
 ```
 
-Every numeric knob is validated by `connect()`, which rejects with an error naming the key rather
-than coercing — an unusable value here is silent, not loud. `retention_days` must be a positive
+Every key is validated by `connect()`, which rejects with an error naming the key rather than
+coercing — an unusable value here is silent, not loud. A key this backend does not declare (a typo
+like `retention_dayz`, or a knob borrowed from another backend) is rejected too, so a
+misconfiguration cannot quietly take the default behaviour. `url` and `key_prefix` must each be a
+non-empty string: an empty `url` — what an unexpanded `"${REDIS_URL}"` or an empty secret yields —
+would otherwise reach the client library as "unset" and connect to the unauthenticated default
+endpoint. `retention_days` must be a positive
 number of days (`0`, negative, `NaN`, a quoted string and anything reaching past the epoch are
 rejected; none of them mean "keep everything" and several silently delete history). `block_ms` and
 `connect_timeout_ms` must be positive whole milliseconds: a fractional or negative `block_ms` makes
@@ -51,6 +56,10 @@ isn't there. `connect()` also issues one `PING`, so a server that is reachable b
 seam (password-protected with no/wrong password, an ACL that forbids the commands, a non-Redis
 listener) fails at startup with `parley-redis: connected to <host>:<port> but the server refused a
 command: <RESP error>` instead of coming up "connected" and failing on every later tool call.
+
+A refusal that reaches a seam call rather than `connect()` — most often a `key_prefix` colliding
+with a key another application already owns — is labelled the same way, naming the plugin, the
+topic and the Redis key: `parley-redis: WRONGTYPE … (topic 'ctx-infra', key 'parley:ctx-infra')`.
 
 While Redis is down, `post`/`fetchRecent` reject rather than queueing for the length of the outage;
 the client reconnects on its own once the server is back. The `subscribe` loop rides out the same
@@ -123,6 +132,9 @@ docker run -d --name parley-redis -p 127.0.0.1:6379:6379 redis:7-alpine \
 [Credentials & exposure](#credentials--exposure) before pointing anything but localhost at it.
 
 ## Conformance
+
+From this package's directory (`npm test` here runs only the `bridge-redis` suite; from the repo
+root the same command runs every package's):
 
 ```bash
 docker run -d --name parley-redis -p 127.0.0.1:6379:6379 redis:7-alpine \

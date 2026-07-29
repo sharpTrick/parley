@@ -1,4 +1,4 @@
-import { asTopic, type Message } from '@sharptrick/parley-core';
+import { asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RedisPlugin } from '../src/index.js';
 
@@ -44,6 +44,10 @@ vi.mock('redis', () => ({
       disconnect: async () => {
         main.isOpen = false;
       },
+      exists: async () => 1,
+      xInfoStream: async () => ({ lastGeneratedId: '999999999999-0' }),
+      xRange: async () => [],
+      xRevRange: async () => [],
     };
     return main;
   },
@@ -296,6 +300,40 @@ describe('redis subscribe hardening — a dead live path must not look like a qu
       stderr.mockRestore();
       await plugin.disconnect();
     }
+  });
+});
+
+// CLASS: a blocking read armed at the TAIL SIGIL instead of the caller's cursor. '$' only resolves
+// to "the last id" when the read registers server-side, so every entry written between the catch-up
+// query and that moment is lost — a defect no wall-clock behavioural test can pin down reliably,
+// because the gap is a connection handshake wide. Pin the START ID directly instead.
+describe('redis long-poll — the blocking read starts at the caller cursor, never the tail', () => {
+  const cursors = ['500-0', '1-0', '123', '999999998-4'];
+
+  it.each(cursors)('XREADs from %s', async (since) => {
+    const plugin = new RedisPlugin();
+    await plugin.connect({ url: 'redis://mock' });
+    const reader = makeReader({ xRead: vi.fn(async (): Promise<XReadResult> => null) });
+    queue(reader);
+
+    const page = await plugin.fetchRecent({
+      topic: asTopic('ops'),
+      since: since as unknown as Cursor,
+      blockMs: 50,
+    });
+
+    expect(reader.xRead).toHaveBeenCalledTimes(1);
+    const [streams, opts] = reader.xRead.mock.calls[0] as [
+      { key: string; id: string },
+      { BLOCK: number },
+    ];
+    expect(streams.id, "'$' loses every entry written during the reader's handshake").toBe(since);
+    expect(streams.key).toBe('parley:ops');
+    expect(opts.BLOCK).toBe(50);
+    expect(page.messages).toEqual([]);
+    expect(page.nextCursor).toBe(since);
+
+    await plugin.disconnect();
   });
 });
 

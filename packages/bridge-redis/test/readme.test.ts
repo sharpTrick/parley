@@ -57,6 +57,42 @@ describe('bridge-redis README — shipped infra recipes must not be insecure by 
   });
 });
 
+// CLASS: a shipped command cannot run where the README that ships it lives. This README goes to
+// npm, where the package directory is the only context a reader has, so an `npm run` line naming a
+// script this package does not declare fails on the first thing a new contributor tries.
+
+const manifest = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+) as { scripts?: Record<string, string> };
+
+/** Every `npm test` / `npm run <script>` line in the README, with leading env assignments stripped. */
+function npmScriptInvocations(md: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const line of md.split('\n')) {
+    const command = line.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)*/, '');
+    const invocation = /^npm\s+(?:run\s+(?:--\s+)?([\w:-]+)|(test|start))\b/.exec(command);
+    if (invocation === null) continue;
+    out.push([line.trim(), invocation[1] ?? invocation[2] ?? '']);
+  }
+  return out;
+}
+
+describe('bridge-redis README — every documented npm command runs from this package', () => {
+  const invocations = npmScriptInvocations(text);
+  const scripts = Object.keys(manifest.scripts ?? {});
+
+  it('documents at least one npm command', () => {
+    expect(invocations.length).toBeGreaterThan(0);
+  });
+
+  it.each(invocations)('%s names a script this package declares', (line, script) => {
+    if (/\s(?:-w|--workspace)[=\s]/.test(line)) return; // explicitly repo-root-scoped
+    expect(scripts, `README ships '${line}', but there is no '${script}' script here`).toContain(
+      script,
+    );
+  });
+});
+
 // CLASS: a shipped copy-pasteable artifact contradicts the package's own security guidance. The
 // docker recipes above are only one such artifact — the runnable example configs the README links
 // to are the ones an operator actually copies, and nothing was checking them.

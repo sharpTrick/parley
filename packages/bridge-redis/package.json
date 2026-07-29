@@ -38,6 +38,7 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean",
+    "test": "vitest run --root ../.. packages/bridge-redis",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
