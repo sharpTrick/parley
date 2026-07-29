@@ -28,6 +28,15 @@ export class UnsafePatternError extends Error {
   }
 }
 
+/**
+ * Compile the source on its own before it is wrapped in `^(?:…)$`. Keep this check, so that an
+ * unbalanced source — uncompilable alone, yet legal once wrapped, where the anchors re-associate
+ * into one branch of an unanchored alternation — throws instead of minting an allow-everything set.
+ */
+function assertCompilesAlone(src: string): void {
+  new RegExp(src);
+}
+
 /** Options extending the exact allowlist with a post/fetch pattern dimension and reserved topics. */
 export interface AllowlistOptions {
   /**
@@ -71,6 +80,7 @@ export class Allowlist {
     }
     this.patternSources = opts.postPatterns ?? [];
     this.patternRegexes = this.patternSources.map((src) => {
+      assertCompilesAlone(src);
       if (!isRedosSafeSource(src)) throw new UnsafePatternError(src);
       return new RegExp(`^(?:${src})$`);
     });

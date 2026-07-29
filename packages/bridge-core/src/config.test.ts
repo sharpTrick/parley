@@ -425,6 +425,70 @@ describe('config rejects an empty string in any field that names something', () 
   });
 });
 
+// Every numeric field is a count or a duration, and none of them means anything at zero, below zero
+// or between integers: `catchup.limit: 0` makes catch-up's `messages.length < limit` break condition
+// false forever and page without end, `block_poll_interval_ms: 0` turns the long-poll fallback into a
+// tight re-query loop, and `presence.heartbeat_ms: -1` fires the beat every tick. Walk the fixture so
+// a knob added later is graded the moment it appears there.
+describe('config rejects a degenerate number in any numeric field', () => {
+  interface NumericLeaf {
+    label: string;
+    path: string[];
+    value: number;
+  }
+
+  function numericLeaves(node: unknown, prefix: string[] = []): NumericLeaf[] {
+    if (typeof node !== 'object' || node === null) return [];
+    return Object.entries(node).flatMap(([key, value]) => {
+      const path = [...prefix, key];
+      if (typeof value === 'number') return [{ label: path.join('.'), path, value }];
+      return numericLeaves(value, path);
+    });
+  }
+
+  // `backend_config` is opaque to core (DESIGN §11); its numbers are the plugin's to police.
+  const leaves = numericLeaves(FULL).filter((l) => l.path[0] !== 'backend_config');
+
+  // Zero is legal only where it names "no cap" / "no tolerance" rather than a cadence or a count.
+  const ZERO_IS_LEGAL = new Set(['catchup.block_max_ms', 'auth.oidc.clock_skew_s']);
+
+  it('finds every numeric field in the fixture (guards against a broken walk)', () => {
+    expect(leaves.map((l) => l.label).sort()).toEqual([
+      'auth.oidc.clock_skew_s',
+      'catchup.block_max_ms',
+      'catchup.block_poll_interval_ms',
+      'catchup.limit',
+      'presence.heartbeat_ms',
+      'presence.ttl_ms',
+    ]);
+  });
+
+  function withValue(leaf: NumericLeaf, value: number): Record<string, unknown> {
+    const mutated = structuredClone(FULL) as Record<string, unknown>;
+    parentOf(mutated, leaf.path)[leaf.path.at(-1)!] = value;
+    return mutated;
+  }
+
+  it.each(leaves.map((l) => [l.label, l] as const))('rejects %s set below zero', (_label, leaf) => {
+    expect(() => parseConfig(withValue(leaf, -1))).toThrow();
+  });
+
+  // The fixture's own value plus a half, so that a cross-field rule (ttl_ms >= heartbeat_ms) still
+  // holds and `.int()` is the only thing left that can reject the row.
+  it.each(leaves.map((l) => [l.label, l] as const))(
+    'rejects %s set to a fraction',
+    (_label, leaf) => {
+      expect(() => parseConfig(withValue(leaf, leaf.value + 0.5))).toThrow();
+    },
+  );
+
+  it.each(leaves.map((l) => [l.label, l] as const))('grades %s set to zero', (label, leaf) => {
+    const parse = (): unknown => parseConfig(withValue(leaf, 0));
+    if (ZERO_IS_LEGAL.has(label)) expect(parse).not.toThrow();
+    else expect(parse).toThrow();
+  });
+});
+
 // `mention_filter` compares a parsed @mention against `identity.handle`, so a handle the mention
 // grammar cannot produce silently drops EVERY inbound message. Either grammar may widen later;
 // the invariant is that the two agree, so assert the round trip rather than one bad handle.

@@ -1,6 +1,13 @@
 import { NoSuchTopicError } from './seam.js';
 
 /**
+ * The literal the {@link NoSuchTopicError} constructor assigns to `this.name`. Keep it a literal
+ * rather than `NoSuchTopicError.name`, so that a bundler mangling the class binding cannot make the
+ * marker on an instance and the marker being compared against diverge.
+ */
+const MARKER = 'NoSuchTopicError';
+
+/**
  * True for a {@link NoSuchTopicError} raised by ANY copy of this package.
  *
  * `instanceof` answers "was this thrown by MY class object", not "is this the seam contract". A
@@ -14,6 +21,6 @@ export function isNoSuchTopicError(err: unknown): boolean {
   return (
     typeof err === 'object' &&
     err !== null &&
-    (err as { name?: unknown }).name === NoSuchTopicError.name
+    (err as { name?: unknown }).name === MARKER
   );
 }

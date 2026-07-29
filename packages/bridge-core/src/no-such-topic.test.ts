@@ -38,6 +38,21 @@ describe('isNoSuchTopicError', () => {
     expect(isNoSuchTopicError(err)).toBe(true);
   });
 
+  // The marker on an instance is a literal the constructor writes; `NoSuchTopicError.name` is the
+  // class binding, which a bundler is free to rename. Recognition must survive that divergence.
+  it('recognises a foreign twin even when the local class binding has been renamed', () => {
+    const original = Object.getOwnPropertyDescriptor(NoSuchTopicError, 'name')!;
+    Object.defineProperty(NoSuchTopicError, 'name', { ...original, value: 'e' });
+    try {
+      expect(NoSuchTopicError.name).toBe('e');
+      expect(isNoSuchTopicError(new DuplicateInstall('ctx'))).toBe(true);
+      expect(isNoSuchTopicError(CROSS_REALM)).toBe(true);
+      expect(isNoSuchTopicError({ name: 'e' })).toBe(false);
+    } finally {
+      Object.defineProperty(NoSuchTopicError, 'name', original);
+    }
+  });
+
   it.each([
     ['a plain Error', new Error('boom')],
     ['a TypeError', new TypeError('boom')],

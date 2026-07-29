@@ -64,6 +64,10 @@ function repetitionCost(min: number, max: number): number {
  * Character-class interiors and escaped metacharacters are treated as literal, and nesting is
  * over-approximated, so the screen is deliberately stricter than necessary; a legitimate topic
  * pattern is nowhere near either bound.
+ *
+ * A source the scan cannot follow to the end — an unterminated class, an unbalanced group, a
+ * trailing escape — is refused rather than accepted: losing track of the grammar means the
+ * remainder was never screened. So everything the screen accepts also compiles on its own.
  */
 export function isRedosSafeSource(src: string): boolean {
   let budget = 1;
@@ -80,13 +84,16 @@ export function isRedosSafeSource(src: string): boolean {
     const ch = src[i]!;
     if (ch === '\\') {
       i += 2;
+      if (i > src.length) return false;
       continue;
     }
     if (ch === '[') {
       i++;
       if (src[i] === '^') i++;
-      if (src[i] === ']') i++;
+      // Keep JS class semantics — a `]` here CLOSES the class (`[]`, `[^]`) rather than joining it,
+      // so that the scan cannot run off the end and blind the screen to every atom that follows.
       while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
+      if (i >= src.length) return false;
       i++;
       continue;
     }
@@ -99,10 +106,9 @@ export function isRedosSafeSource(src: string): boolean {
       continue;
     }
     if (ch === ')') {
+      if (ambiguous.length === 1) return false;
       const body = ambiguous.pop() ?? false;
       const branchCount = branches.pop() ?? 1;
-      if (ambiguous.length === 0) ambiguous.push(false);
-      if (branches.length === 0) branches.push(1);
       i++;
       let quantified = false;
       let quantMax = 1;
@@ -168,6 +174,7 @@ export function isRedosSafeSource(src: string): boolean {
     }
     i++;
   }
+  if (ambiguous.length !== 1) return false;
   charge(branches[0] ?? 1);
   return budget <= MAX_AMBIGUITY;
 }

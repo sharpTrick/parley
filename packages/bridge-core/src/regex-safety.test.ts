@@ -48,6 +48,56 @@ const CORPUS: string[] = [
   '[\\]]*x',
 ];
 
+const HOSTILE: [label: string, src: string][] = [
+  ['nested quantifier', '([a-z]+)+'],
+  ['alternation under a quantifier', '(a|a)*'],
+  ['bounded repeat over a risky body', '([a-z]*){15}'],
+  ['optional group repeated many times', '(a?){250}'],
+  ['too many unbounded quantifiers', '.*.*.*.*.*'],
+  ['ambiguous alternation chain', `${chain('(a|aa)', 30)}b`],
+  ['ambiguous alternation chain (dot)', `${chain('(.|..)', 30)}z`],
+  ['ambiguous alternation chain (non-capturing)', `${chain('(?:a|aa)', 24)}b`],
+  ['three-branch alternation chain', `${chain('(a|b|ab)', 24)}z`],
+  ['optional-atom chain', `${chain('a?', 24)}${chain('a', 24)}b`],
+  ['optional-class chain', `${chain('[ab]?', 20)}${chain('a', 20)}z`],
+  ['bounded-repeat chain', `${chain('[ab]{1,3}', 16)}z`],
+];
+
+// The screen hand-rolls the regex grammar, so anything it mis-parses hides the rest of the source
+// from it. Character classes are the trap: under PCRE a leading `]` joins the class, under V8 it
+// CLOSES it, and a scanner that guesses wrong hunts for a `]` that is not coming. Generate the
+// class-shaped openings rather than listing them, so the next such form is graded unnamed.
+const CLASS_PREFIXES: string[] = ['\\[', '\\]', '\\\\']
+  .concat(
+    ['', '^'].flatMap((negate) =>
+      ['', ']', ']]', 'a', 'a-z', '\\]', '\\\\'].map((body) => `[${negate}${body}]`),
+    ),
+  )
+  .filter((prefix) => {
+    try {
+      new RegExp(prefix);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+const CLASS_SUFFIXES = ['', ']', 'x]', ']]'];
+
+/** Truncations are how an unterminated class, group or escape reaches the screen. */
+const TRUNCATIONS: string[] = CORPUS.flatMap((src) => [src.slice(0, -1), src.slice(0, -2)]).filter(
+  (src) => src.length > 0,
+);
+
+function compiles(src: string): boolean {
+  try {
+    new RegExp(src);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Inputs drawn from the pattern's own literal alphabet, at every length up to the caller clamp. */
 function inputsFor(src: string): string[] {
   const literals = new Set(src.match(/[A-Za-z0-9]/g) ?? []);
@@ -94,20 +144,28 @@ describe('isRedosSafeSource', () => {
     expect(isRedosSafeSource(src)).toBe(true);
   });
 
-  it.each([
-    ['nested quantifier', '([a-z]+)+'],
-    ['alternation under a quantifier', '(a|a)*'],
-    ['bounded repeat over a risky body', '([a-z]*){15}'],
-    ['optional group repeated many times', '(a?){250}'],
-    ['too many unbounded quantifiers', '.*.*.*.*.*'],
-    ['ambiguous alternation chain', `${chain('(a|aa)', 30)}b`],
-    ['ambiguous alternation chain (dot)', `${chain('(.|..)', 30)}z`],
-    ['ambiguous alternation chain (non-capturing)', `${chain('(?:a|aa)', 24)}b`],
-    ['three-branch alternation chain', `${chain('(a|b|ab)', 24)}z`],
-    ['optional-atom chain', `${chain('a?', 24)}${chain('a', 24)}b`],
-    ['optional-class chain', `${chain('[ab]?', 20)}${chain('a', 20)}z`],
-    ['bounded-repeat chain', `${chain('[ab]{1,3}', 16)}z`],
-  ])('rejects a source that can blow up (%s)', (_label, src) => {
+  it.each(HOSTILE)('rejects a source that can blow up (%s)', (_label, src) => {
     expect(isRedosSafeSource(src)).toBe(false);
+  });
+
+  it('rejects every blowup shape hidden behind a character class', () => {
+    const leaked = CLASS_PREFIXES.flatMap((prefix) =>
+      HOSTILE.flatMap(([label, src]) =>
+        // A later `]` is what lets a mis-parsed class swallow the shape WHOLE and still terminate;
+        // without one the scan merely runs off the end, which a fail-closed screen catches anyway.
+        CLASS_SUFFIXES.map(
+          (suffix) => [`${prefix} + ${label} + ${suffix}`, prefix + src + suffix] as const,
+        ),
+      )
+        .filter(([, src]) => isRedosSafeSource(src))
+        .map(([label]) => label),
+    );
+    expect(leaked).toEqual([]);
+  });
+
+  it('never accepts a source that does not compile on its own', () => {
+    const candidates = [...CORPUS, ...TRUNCATIONS, ...CLASS_PREFIXES.map((p) => p + '.*')];
+    const accepted = candidates.filter((src) => isRedosSafeSource(src));
+    expect(accepted.filter((src) => !compiles(src))).toEqual([]);
   });
 });

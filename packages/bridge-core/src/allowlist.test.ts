@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { Allowlist, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
 
+function compiles(src: string): boolean {
+  try {
+    new RegExp(src);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe('Allowlist', () => {
   const allow = new Allowlist(['ctx-payments', 'ctx-payments-reviews']);
 
@@ -114,5 +123,45 @@ describe('Allowlist pattern safety', () => {
     const started = Date.now();
     expect(allow.has(topic)).toBe(false);
     expect(Date.now() - started).toBeLessThan(100);
+  });
+
+  // The constructor validates the bare source but matches with `^(?:src)$`. An unbalanced source is
+  // uncompilable alone yet LEGAL once wrapped, because the anchors re-associate into one branch of an
+  // unanchored alternation — `ops)|(.*` becomes `/^(?:ops)|(.*)$/`, which matches every topic. So a
+  // config line that reads as narrow mints an allow-everything post/fetch set.
+  const WRAP_ESCAPING = ['ops)|(.*', 'a)|(.*', 'a)(b', 'x)$|^(', '(a', 'a|b)', ')(', '[a', 'a\\'];
+
+  it.each(WRAP_ESCAPING)('refuses a source that only compiles once wrapped (%s)', (src) => {
+    expect(() => new Allowlist(['ctx'], { postPatterns: [src] })).toThrow(SyntaxError);
+  });
+
+  it('never widens the post set beyond the source, however the source is shaped', () => {
+    const widened = WRAP_ESCAPING.filter((src) => {
+      try {
+        return new Allowlist(['ctx'], { postPatterns: [src] }).has('secret-topic');
+      } catch {
+        return false;
+      }
+    });
+    expect(widened).toEqual([]);
+  });
+
+  it('accepts a source only if it compiles on its own', () => {
+    const safe = SAFE.map(([, pattern]) => pattern);
+    const candidates = [
+      ...safe,
+      ...safe.flatMap((src) => [src.slice(0, -1), src.slice(0, -2), src.slice(1)]),
+      ...WRAP_ESCAPING,
+    ].filter((src) => src.length > 0);
+    const accepted = candidates.filter((src) => {
+      try {
+        new Allowlist(['ctx'], { postPatterns: [src] });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    expect(accepted.filter((src) => !compiles(src))).toEqual([]);
+    expect(accepted).toEqual(expect.arrayContaining(safe));
   });
 });
