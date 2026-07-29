@@ -25,7 +25,15 @@ async function makeContext() {
     // stream (the same live primitive subscribe uses), so the shared blocking case runs directly
     // against the plugin rather than being covered only by core's generic polling wrapper.
     supportsBlockingFetch: true,
-    freshTopic: (): Topic => asTopic(freshChannelId()),
+    // A Parley topic IS a Discord channel id, and a channel must exist before anything can be
+    // posted to or read from it — so provision it in the fake, exactly as a human would create
+    // the channel in Discord. An id that was never created is a genuinely absent topic
+    // (NoSuchTopicError), covered in absent-topic.test.ts.
+    freshTopic: (): Topic => {
+      const id = freshChannelId();
+      fake.createChannel(id);
+      return asTopic(id);
+    },
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();
