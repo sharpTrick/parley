@@ -10,6 +10,18 @@ import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
 
+const BAD_QUEUE = {
+  status: 400,
+  body: { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'gone' },
+};
+
+/**
+ * Every request the loop can issue. The bound below is asserted on ALL of them, not on the one the
+ * failure is injected into: a recovery path that answers 200 (a re-register, a gap-fill read) is
+ * exactly where an unpaced retry hides from a single-counter assertion.
+ */
+const LOOP_ROUTES = ['POST /api/v1/register', 'GET /api/v1/events', 'GET /api/v1/messages'] as const;
+
 /** Ways the push loop can fail forever — none of them is recoverable by retrying harder. */
 const PERMANENT_FAILURES = [
   {
@@ -40,6 +52,29 @@ const PERMANENT_FAILURES = [
       fake.gcQueues();
     },
   },
+  {
+    // A poll reaching a shard that does not own the queue: every re-register SUCCEEDS and the
+    // fresh queue is rejected at once, so the failure is in the RECOVERY path, not in a request.
+    name: 'every freshly registered queue is rejected as stale',
+    counted: 'POST /api/v1/register',
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', BAD_QUEUE),
+  },
+  {
+    name: 'every fresh queue is rejected as stale and the gap-fill reads fail too',
+    counted: 'POST /api/v1/register',
+    apply: (fake: FakeZulip) => {
+      fake.failRoute('GET /api/v1/events', BAD_QUEUE);
+      fake.failMessagesReads(1_000_000);
+    },
+  },
+  {
+    name: 'the gap-fill after a queue GC keeps failing',
+    counted: 'GET /api/v1/messages',
+    apply: (fake: FakeZulip) => {
+      fake.failMessagesReads(1_000_000);
+      fake.expireQueues();
+    },
+  },
 ];
 
 describe('zulip push loop backs off and reports when it fails permanently', () => {
@@ -57,13 +92,17 @@ describe('zulip push loop backs off and reports when it fails permanently', () =
       await plugin.post(topic, SENDER, 'live');
       await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 3000, interval: 10 });
 
-      const before = fake.requestCount(mode.counted);
+      const before = new Map(LOOP_ROUTES.map((r) => [r, fake.requestCount(r)]));
       mode.apply(fake);
       await sleep(3000);
-      const attempts = fake.requestCount(mode.counted) - before;
+      const attempts = new Map(
+        LOOP_ROUTES.map((r) => [r, fake.requestCount(r) - (before.get(r) ?? 0)]),
+      );
 
-      expect(attempts).toBeGreaterThan(0); // it is still trying
-      expect(attempts).toBeLessThan(10); // …but not at a flat, hot interval
+      expect(attempts.get(mode.counted)).toBeGreaterThan(0); // it is still trying
+      // …but not at a flat, hot interval — on ANY route, including the ones that answer 200.
+      const hot = LOOP_ROUTES.filter((r) => (attempts.get(r) ?? 0) >= 10);
+      expect([hot, [...attempts]]).toEqual([[], [...attempts]]);
       expect(errors.filter((e) => e.includes('[parley-zulip]')).length).toBeGreaterThan(0);
     });
   }

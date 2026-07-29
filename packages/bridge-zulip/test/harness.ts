@@ -1,8 +1,10 @@
 /**
- * The one fixture every zulip test file boots from, and the one place the optional real-server
- * gate is decided. Both used to be copy-pasted per file, which let them drift apart.
+ * The one fixture every zulip test file boots from, the one conformance context both passes use,
+ * and the one place the optional real-server gate is decided. Each used to be copy-pasted per call
+ * site, which let them drift apart.
  */
-import { asHandle } from '@sharptrick/parley-core';
+import type { ConformanceContext } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
 import { type FakeZulip, startFakeZulip } from './fake-zulip.js';
@@ -44,6 +46,59 @@ export function useZulip(): Boot {
     const pair: ZulipPair = { plugin, fake };
     open.push(pair);
     return pair;
+  };
+}
+
+let contextSeq = 0;
+
+/**
+ * The ONE conformance context for this backend, whichever server it is pointed at. Both passes —
+ * the in-process fake and the optional real server — go through here so a change to the concurrent
+ * writers, the capability flags, or the teardown cannot be applied to one pass and forgotten in the
+ * other; anything that must genuinely differ arrives as a named argument and is visible at the call
+ * site.
+ */
+export function makeZulipContext(args: {
+  connect: Record<string, unknown>;
+  /** Torn down after the plugin, e.g. closing the in-process fake. Omitted for a real server. */
+  closeServer?: () => Promise<void>;
+}): () => Promise<ConformanceContext> {
+  return async (): Promise<ConformanceContext> => {
+    const plugin = new ZulipPlugin();
+    await plugin.connect(args.connect);
+    return {
+      plugin,
+      // Zulip honors blockMs NATIVELY via the /api/v1/events long-poll, so the shared
+      // blocking-fetch conformance case runs directly against the plugin.
+      supportsBlockingFetch: true,
+      // Zulip stamps the sender from the authenticated bot, not from `post`'s `identity`.
+      carriesSenderIdentity: false,
+      freshTopic: (): Topic => asTopic(`t-${++contextSeq}-${rand()}`),
+      cleanup: async () => {
+        await plugin.disconnect();
+        await args.closeServer?.();
+      },
+      concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
+        const plugins = await Promise.all(
+          Array.from({ length: writers }, async () => {
+            const p = new ZulipPlugin();
+            await p.connect(args.connect);
+            return p;
+          }),
+        );
+        try {
+          await Promise.all(
+            plugins.map(async (p, w) => {
+              for (let i = 0; i < perWriter; i++) {
+                await p.post(topic, asHandle(`w${w}`), `w${w}-${i}`);
+              }
+            }),
+          );
+        } finally {
+          await Promise.all(plugins.map((p) => p.disconnect()));
+        }
+      },
+    };
   };
 }
 

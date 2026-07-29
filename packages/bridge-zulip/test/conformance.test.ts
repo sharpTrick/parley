@@ -1,87 +1,122 @@
-import { runConformanceSuite, type ConformanceContext } from '@sharptrick/parley-conformance';
-import { asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { ZulipPlugin } from '../src/index.js';
+import { GAP_FILL_PAGE } from '../src/index.js';
 import { startFakeZulip } from './fake-zulip.js';
-import { decideIntegrationGate, type GateProbe, rand, SENDER, sleep, useZulip } from './harness.js';
+import {
+  decideIntegrationGate,
+  type GateProbe,
+  makeZulipContext,
+  rand,
+  SENDER,
+  sleep,
+  useZulip,
+} from './harness.js';
 
-let seq = 0;
 const boot = useZulip();
 
 /** The in-process fake — always available, so this suite always runs. */
-async function makeContext(): Promise<ConformanceContext> {
+const fakeServerPass = async (): ReturnType<ReturnType<typeof makeZulipContext>> => {
   const fake = await startFakeZulip();
-  const plugin = new ZulipPlugin();
-  await plugin.connect({ site_url: fake.url, events_timeout_ms: 1000 });
-  return {
-    plugin,
-    // Zulip honors blockMs NATIVELY via the /api/v1/events long-poll, so the shared blocking-fetch
-    // conformance case runs directly against the plugin here.
-    supportsBlockingFetch: true,
-    freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
-    carriesSenderIdentity: false,
-    cleanup: async () => {
-      await plugin.disconnect();
-      await fake.close();
-    },
-    concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
-      const plugins = await Promise.all(
-        Array.from({ length: writers }, async () => {
-          const p = new ZulipPlugin();
-          await p.connect({ site_url: fake.url });
-          return p;
-        }),
-      );
-      try {
-        await Promise.all(
-          plugins.map(async (p, w) => {
-            for (let i = 0; i < perWriter; i++) {
-              await p.post(topic, asHandle(`w${w}`), `w${w}-${i}`);
-            }
-          }),
-        );
-      } finally {
-        await Promise.all(plugins.map((p) => p.disconnect()));
-      }
-    },
-  };
-}
+  return makeZulipContext({
+    connect: { site_url: fake.url, events_timeout_ms: 1000 },
+    closeServer: () => fake.close(),
+  })();
+};
 
-runConformanceSuite('zulip', makeContext);
+runConformanceSuite('zulip', fakeServerPass);
 
 /**
  * Zulip GCs an idle event queue after ~10 minutes and then answers `BAD_EVENT_QUEUE_ID`. Whatever
  * lands while the queue is dead reaches no queue at all, so recovery is a re-register plus a
- * gap-fill — and the gap-fill's own history reads can fail too, which is the dimension here.
+ * PAGINATED gap-fill whose own history reads can fail — and a failure BETWEEN two delivered pages
+ * is the case that grades the per-page progress watermark. The table crosses dead windows that
+ * straddle the page boundary with where the failure lands, and asserts exactly-once by counting
+ * DISTINCT ids against deliveries, so a duplicate fails instead of being absorbed by an
+ * order-and-content comparison.
  */
 describe('zulip queue GC recovery', () => {
-  for (const failingReads of [0, 1, 3]) {
-    it(`replays the dead-window messages exactly once with ${failingReads} failing gap-fill read(s)`, async () => {
-      const { plugin, fake } = await boot();
-      const topic = asTopic(`gc-${rand()}`);
-      const got: Message[] = [];
-      await plugin.subscribe(topic, (m) => got.push(m));
+  const DEAD_WINDOWS = [3, GAP_FILL_PAGE, GAP_FILL_PAGE + 100, 2 * GAP_FILL_PAGE + 1];
 
-      await plugin.post(topic, SENDER, 'before');
-      await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 3000, interval: 10 });
+  const FAILURE_POINTS = [
+    { name: 'nothing', failsAfter: () => false },
+    { name: 'the read after the 1st page', failsAfter: (n: number) => n === 1 },
+    { name: 'the read after the 2nd page', failsAfter: (n: number) => n === 2 },
+    { name: 'the read after the 3rd page', failsAfter: (n: number) => n === 3 },
+    { name: 'every other read', failsAfter: (n: number) => n % 2 === 1 },
+  ];
 
-      // Kill every queue server-side (the ~10-min-idle GC / a restart), break the gap-fill's first
-      // reads, then post into the dead window: those messages can only arrive via a retried
-      // gap-fill, and the fresh queue's overlap must not hand any of them over twice.
-      fake.gcQueues();
-      fake.failMessagesReads(failingReads);
-      await plugin.post(topic, SENDER, 'd1');
-      await plugin.post(topic, SENDER, 'd2');
-      await plugin.post(topic, SENDER, 'd3');
+  for (const deadWindow of DEAD_WINDOWS) {
+    for (const point of FAILURE_POINTS) {
+      it(`replays ${deadWindow} dead-window message(s) exactly once with ${point.name} failing`, async () => {
+        const { plugin, fake } = await boot();
+        const topic = asTopic(`gc-${rand()}`);
+        const got: Message[] = [];
+        await plugin.subscribe(topic, (m) => got.push(m));
 
-      await vi.waitFor(
-        () => expect(got.map((m) => m.content)).toEqual(['before', 'd1', 'd2', 'd3']),
-        { timeout: 6000, interval: 10 },
-      );
-      await sleep(400);
-      expect(got.map((m) => m.content)).toEqual(['before', 'd1', 'd2', 'd3']);
-    });
+        await plugin.post(topic, SENDER, 'before');
+        await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 5000, interval: 10 });
+
+        // Kill every queue server-side, then fill the dead window: those messages reach no queue
+        // and can only arrive via the retried, paginated gap-fill.
+        fake.expireQueues();
+        const expected = ['before'];
+        for (let i = 0; i < deadWindow; i++) {
+          expected.push(`d${i}`);
+          fake.injectMessage({ topic, content: `d${i}` });
+        }
+        // Injecting the failure from the response hook lands it BETWEEN delivered pages, which
+        // `failMessagesReads` alone cannot do — it only ever fails reads before the first page.
+        let reads = 0;
+        fake.setResponseHook((route) => {
+          if (route !== 'GET /api/v1/messages') return;
+          reads++;
+          if (point.failsAfter(reads)) fake.failNextMessagesRead();
+        });
+
+        await vi.waitFor(() => expect(got).toHaveLength(expected.length), {
+          timeout: 30_000,
+          interval: 10,
+        });
+        fake.setResponseHook(undefined);
+        await sleep(400);
+
+        expect(got.map((m) => m.content)).toEqual(expected);
+        expect(new Set(got.map((m) => m.backendMsgId)).size).toBe(got.length);
+      }, 60_000);
+    }
   }
+
+  /**
+   * The gap-fill's per-page wake is the ONLY edge a blocked `fetchRecent` piggybacking on a
+   * recovering loop can get: a message that landed while the queue was dead is not on the fresh
+   * queue, so no events poll will ever announce it.
+   */
+  it('wakes a blocked fetchRecent on the gap-fill page that carries its message', async () => {
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`gapwake-${rand()}`);
+    await plugin.subscribe(topic, () => undefined);
+    await plugin.post(topic, SENDER, 'old');
+    const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
+
+    // Every history answer is computed on request and delivered 250ms later, so both of the blocked
+    // fetch's own reads are snapshotted before the queue dies. Expiring and injecting in ONE
+    // synchronous step puts the message strictly between the old queue's death and the fresh
+    // queue's birth: it is on no queue at all, so only a gap-fill page can carry it.
+    fake.holdResponse('GET /api/v1/messages', 250);
+
+    const started = Date.now();
+    const pending = plugin.fetchRecent({ topic, since: tail, blockMs: 5000 });
+    await sleep(600);
+    fake.expireQueues();
+    fake.injectMessage({ topic, content: 'in-the-gap' });
+    const res = await pending;
+
+    expect(res.messages.map((m) => m.content)).toEqual(['in-the-gap']);
+    expect(Date.now() - started).toBeLessThan(3000);
+  }, 30_000);
 });
 
 describe('zulip resolveIdentity', () => {
@@ -99,6 +134,22 @@ describe('zulip resolveIdentity', () => {
       handle: 'nobody',
       backendRef: 'nobody',
     });
+  });
+});
+
+/**
+ * The two passes below used to be copy-pasted context literals and had already drifted apart in the
+ * long-poll cap. Guard the class, not that instance: a third transport or a second stream must go
+ * through the shared factory rather than being pasted in here again.
+ */
+describe('zulip conformance passes share one context factory', () => {
+  it('declares no conformance capability inline', () => {
+    const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    const inlineCapabilities = source
+      .split('\n')
+      .map((line, i) => ({ line: i + 1, text: line.trim() }))
+      .filter((l) => /^(supportsBlockingFetch|carriesSenderIdentity|concurrentPost|freshTopic):/.test(l.text));
+    expect(inlineCapabilities).toEqual([]);
   });
 });
 
@@ -122,46 +173,6 @@ async function probeZulip(url: string, email: string, key: string): Promise<Gate
   }
 }
 
-async function makeRealContext(): Promise<ConformanceContext> {
-  const config = {
-    site_url: REAL_URL,
-    email: REAL_EMAIL,
-    api_key: REAL_KEY,
-    stream: REAL_STREAM,
-  };
-  const plugin = new ZulipPlugin();
-  await plugin.connect(config);
-  return {
-    plugin,
-    supportsBlockingFetch: true, // native /api/v1/events long-poll
-    freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
-    carriesSenderIdentity: false,
-    cleanup: async () => {
-      await plugin.disconnect();
-    },
-    concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
-      const plugins = await Promise.all(
-        Array.from({ length: writers }, async () => {
-          const p = new ZulipPlugin();
-          await p.connect(config);
-          return p;
-        }),
-      );
-      try {
-        await Promise.all(
-          plugins.map(async (p, w) => {
-            for (let i = 0; i < perWriter; i++) {
-              await p.post(topic, asHandle(`w${w}`), `w${w}-${i}`);
-            }
-          }),
-        );
-      } finally {
-        await Promise.all(plugins.map((p) => p.disconnect()));
-      }
-    },
-  };
-}
-
 const realVars = {
   PARLEY_ZULIP_URL: REAL_URL,
   PARLEY_ZULIP_EMAIL: REAL_EMAIL,
@@ -174,7 +185,18 @@ const gate = decideIntegrationGate(
 );
 
 if (gate.kind === 'run') {
-  runConformanceSuite('zulip (real)', makeRealContext);
+  runConformanceSuite(
+    'zulip (real)',
+    makeZulipContext({
+      connect: {
+        site_url: REAL_URL,
+        email: REAL_EMAIL,
+        api_key: REAL_KEY,
+        stream: REAL_STREAM,
+        events_timeout_ms: 1000,
+      },
+    }),
+  );
 } else if (gate.kind === 'fail') {
   describe('seam conformance: zulip (real)', () => {
     it('runs against the configured PARLEY_ZULIP_* server', () => {

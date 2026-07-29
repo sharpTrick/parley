@@ -23,7 +23,24 @@ export const SERVER_CONSTRAINTS = {
   foldsTopicCase: true,
   /** Every endpoint requires HTTP Basic credentials that match a real bot account. */
   requiresValidCredentials: true,
+  /**
+   * `zerver/lib/request.py` defaults: a client that does not opt out gets RENDERED HTML content
+   * (`apply_markdown`), the anchor message included in a narrowed read (`include_anchor`), and a
+   * blocking events poll (`dont_block`). Each default is the WRONG value for this bridge.
+   */
+  requestFlagDefaults: { apply_markdown: 'true', include_anchor: 'true', dont_block: 'false' },
 } as const;
+
+/**
+ * Zulip's Markdown rendering, modelled just far enough that a client which forgets
+ * `apply_markdown=false` gets HTML instead of source text and cannot mistake one for the other.
+ */
+export function renderMarkdown(source: string): string {
+  const escaped = source.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<p>${escaped
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/@([\w.-]+)/g, '<span class="user-mention">@$1</span>')}</p>`;
+}
 
 interface WireMessage {
   id: number;
@@ -45,6 +62,8 @@ interface QueueEvent {
 interface Queue {
   stream: string;
   topic: string;
+  /** What the queue's `register` asked for — decides whether its events carry HTML or source. */
+  applyMarkdown: boolean;
   eventSeq: number;
   events: QueueEvent[];
   waiter?: { res: ServerResponse; timer: NodeJS.Timeout };
@@ -64,7 +83,15 @@ const MEMBERS: FakeMember[] = [
   { user_id: 11, email: 'pat@example.com', full_name: 'Pat Sharp', is_bot: false },
 ];
 
-const DEFAULT_CREDENTIALS = { email: 'parley-bot@localhost', apiKey: 'parley-api-key' };
+/** One account per bot: a realm has many, and the sender is stamped from whichever authenticates. */
+export interface FakeCredentials {
+  email: string;
+  apiKey: string;
+}
+
+const DEFAULT_CREDENTIALS: FakeCredentials[] = [
+  { email: 'parley-bot@localhost', apiKey: 'parley-api-key' },
+];
 
 /** A forced non-2xx for every request on a route, e.g. a revoked key (401) or an outage (500). */
 export interface RouteFailure {
@@ -86,8 +113,14 @@ export interface RateLimit {
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
   url: string;
-  /** Drop ALL event queues without notice (simulates Zulip's ~10-min-idle GC / a restart). */
+  /** Drop ALL event queues AND sever every parked poll (simulates a server restart). */
   gcQueues(): void;
+  /**
+   * Drop ALL event queues and answer every parked poll `BAD_EVENT_QUEUE_ID` — Zulip's ~10-min-idle
+   * GC, which retires the queue but leaves the connection alive, so recovery starts from a clean
+   * protocol error rather than a network failure.
+   */
+  expireQueues(): void;
   /** Make the next `GET /api/v1/messages` fail once with a 502 (a transient history-read blip). */
   failNextMessagesRead(): void;
   /** Make the next `n` `GET /api/v1/messages` reads fail with a 502, then behave normally. */
@@ -117,11 +150,12 @@ export interface FakeZulip {
 export async function startFakeZulip(opts?: {
   heartbeatMs?: number;
   members?: FakeMember[];
-  credentials?: { email: string; apiKey: string };
+  /** Accounts the server accepts. A single object is the one-bot realm the other tests boot. */
+  credentials?: FakeCredentials | FakeCredentials[];
 }): Promise<FakeZulip> {
   const heartbeatMs = opts?.heartbeatMs ?? 10_000;
   const members = opts?.members ?? MEMBERS;
-  const credentials = opts?.credentials ?? DEFAULT_CREDENTIALS;
+  const accounts = toArray(opts?.credentials) ?? DEFAULT_CREDENTIALS;
   let msgSeq = 0;
   let queueSeq = 0;
   let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
@@ -144,6 +178,22 @@ export async function startFakeZulip(opts?: {
     if (destroy) w.res.destroy();
   };
 
+  const wire = (m: WireMessage, applyMarkdown: boolean): WireMessage =>
+    applyMarkdown ? { ...m, content: renderMarkdown(m.content) } : m;
+
+  const eventsFor = (q: Queue): QueueEvent[] =>
+    q.events.map((e) =>
+      e.message === undefined ? e : { ...e, message: wire(e.message, q.applyMarkdown) },
+    );
+
+  const badQueue = (res: ServerResponse, queueId: string): void =>
+    json(res, 400, {
+      result: 'error',
+      code: 'BAD_EVENT_QUEUE_ID',
+      queue_id: queueId,
+      msg: `Bad event queue id: ${queueId}`,
+    });
+
   const append = (m: Omit<WireMessage, 'id' | 'type' | 'timestamp'>): number => {
     const msg: WireMessage = {
       ...m,
@@ -160,7 +210,7 @@ export async function startFakeZulip(opts?: {
       if (w !== undefined) {
         q.waiter = undefined;
         clearTimeout(w.timer);
-        json(w.res, 200, { result: 'success', events: q.events });
+        json(w.res, 200, { result: 'success', events: eventsFor(q) });
       }
     }
     return msg.id;
@@ -184,7 +234,7 @@ export async function startFakeZulip(opts?: {
 
     // Every real Zulip endpoint requires Basic auth for a REAL account; the sender is stamped from it.
     const auth = parseBasicAuth(req);
-    if (auth?.email !== credentials.email || auth.apiKey !== credentials.apiKey) {
+    if (!accounts.some((a) => a.email === auth?.email && a.apiKey === auth.apiKey)) {
       json(res, 401, { result: 'error', msg: 'Invalid API key' });
       return;
     }
@@ -269,7 +319,11 @@ export async function startFakeZulip(opts?: {
         const before = numBefore > 0 ? pool.filter((m) => m.id < anchor).slice(-numBefore) : [];
         const at = includeAnchor ? pool.filter((m) => m.id === anchor) : [];
         const after = numAfter > 0 ? pool.filter((m) => m.id > anchor).slice(0, numAfter) : [];
-        json(res, 200, { result: 'success', messages: [...before, ...at, ...after] });
+        const applyMarkdown = flagIsTrue(url.searchParams.get('apply_markdown'), 'apply_markdown');
+        json(res, 200, {
+          result: 'success',
+          messages: [...before, ...at, ...after].map((m) => wire(m, applyMarkdown)),
+        });
         return;
       }
 
@@ -278,7 +332,13 @@ export async function startFakeZulip(opts?: {
         const stream = narrow.find((n) => n[0] === 'stream')?.[1] ?? '';
         const topic = narrow.find((n) => n[0] === 'topic')?.[1] ?? '';
         const queueId = `fq-${++queueSeq}`;
-        queues.set(queueId, { stream, topic, eventSeq: 0, events: [] });
+        queues.set(queueId, {
+          stream,
+          topic,
+          applyMarkdown: flagIsTrue(form.get('apply_markdown'), 'apply_markdown'),
+          eventSeq: 0,
+          events: [],
+        });
         json(res, 200, { result: 'success', queue_id: queueId, last_event_id: -1 });
         return;
       }
@@ -288,17 +348,18 @@ export async function startFakeZulip(opts?: {
         const lastEventId = Number(url.searchParams.get('last_event_id') ?? '-1');
         const q = queues.get(queueId);
         if (q === undefined) {
-          json(res, 400, {
-            result: 'error',
-            code: 'BAD_EVENT_QUEUE_ID',
-            queue_id: queueId,
-            msg: `Bad event queue id: ${queueId}`,
-          });
+          badQueue(res, queueId);
           return;
         }
         q.events = q.events.filter((e) => e.id > lastEventId); // ack/prune
         if (q.events.length > 0) {
-          json(res, 200, { result: 'success', events: q.events });
+          json(res, 200, { result: 'success', events: eventsFor(q) });
+          return;
+        }
+        // `dont_block=true` returns whatever is queued RIGHT NOW — a client that sends it gets an
+        // empty answer at once instead of push, which is a spin, not a long-poll.
+        if (flagIsTrue(url.searchParams.get('dont_block'), 'dont_block')) {
+          json(res, 200, { result: 'success', events: [] });
           return;
         }
         // Park until a message wakes us or the heartbeat interval elapses.
@@ -350,6 +411,14 @@ export async function startFakeZulip(opts?: {
       for (const q of queues.values()) dropWaiter(q, true);
       queues.clear();
     },
+    expireQueues: () => {
+      for (const q of queues.values()) {
+        const w = q.waiter;
+        dropWaiter(q, false);
+        if (w !== undefined) badQueue(w.res, '(expired)');
+      }
+      queues.clear();
+    },
     failNextMessagesRead: () => {
       failMessagesReadsRemaining = 1;
     },
@@ -388,6 +457,16 @@ export async function startFakeZulip(opts?: {
       await closed;
     },
   };
+}
+
+function toArray(v: FakeCredentials | FakeCredentials[] | undefined): FakeCredentials[] | undefined {
+  if (v === undefined) return undefined;
+  return Array.isArray(v) ? v : [v];
+}
+
+/** A request flag read the way Zulip reads it: absent means the documented server DEFAULT. */
+function flagIsTrue(raw: string | null, flag: keyof typeof SERVER_CONSTRAINTS.requestFlagDefaults): boolean {
+  return (raw ?? SERVER_CONSTRAINTS.requestFlagDefaults[flag]) === 'true';
 }
 
 /** Zulip stores at most 60 characters of subject, replacing the tail with an ellipsis. */

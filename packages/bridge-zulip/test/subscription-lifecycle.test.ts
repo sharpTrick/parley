@@ -6,12 +6,13 @@
  * `disconnect()` returned.
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { rand, SENDER, sleep, useZulip, type ZulipPair } from './harness.js';
 
 const boot = useZulip();
 
 const REGISTER = 'POST /api/v1/register';
+const DELETE_QUEUE = 'DELETE /api/v1/events';
 /** Long enough that a loop parked in a backoff would still be asleep when disconnect lands. */
 const SETTLE_MS = 900;
 
@@ -111,5 +112,37 @@ describe('zulip push loop dies with its subscription, whatever it is parked in',
         expect(fake.requestCount(REGISTER)).toBe(registersAtTeardown);
       });
     }
+  }
+});
+
+/**
+ * Every event queue the plugin opens is a server-side resource against the bot's queue budget, and
+ * only the plugin knows the id. The ledger below is the class: whatever path minted a queue —
+ * subscribe, a re-register after a GC, a blocking fetch's dedicated queue — the plugin must have
+ * asked the server to drop it by the time `disconnect()` returns.
+ */
+describe('zulip releases every event queue it opens', () => {
+  for (const recoveries of [1, 3, 10]) {
+    it(`asks the server to drop every queue after ${recoveries} queue GC(s)`, async () => {
+      const { plugin, fake } = await boot();
+      const topic = asTopic(`ledger-${rand()}`);
+      const got: Message[] = [];
+      await plugin.subscribe(topic, (m) => got.push(m));
+
+      for (let i = 0; i < recoveries; i++) {
+        const registersBefore = fake.requestCount(REGISTER);
+        fake.expireQueues();
+        await vi.waitFor(() => expect(fake.requestCount(REGISTER)).toBeGreaterThan(registersBefore), {
+          timeout: 5000,
+          interval: 10,
+        });
+        await plugin.post(topic, SENDER, `after-gc-${i}`);
+        await vi.waitFor(() => expect(got).toHaveLength(i + 1), { timeout: 5000, interval: 10 });
+      }
+
+      await plugin.disconnect();
+      expect(fake.requestCount(REGISTER)).toBe(recoveries + 1);
+      expect(fake.requestCount(DELETE_QUEUE)).toBeGreaterThanOrEqual(fake.requestCount(REGISTER));
+    });
   }
 });

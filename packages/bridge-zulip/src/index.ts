@@ -73,10 +73,13 @@ interface TopicWaiters {
   healthy: number;
 }
 
-/** A single bounded wait for "a message may have landed on this topic", however it is obtained. */
+/**
+ * A single bounded wait for "a message may have landed on this topic", however it is obtained.
+ * Keep `release` synchronous, so that no teardown a wake owns can run inside the caller's `blockMs`.
+ */
 interface Wake {
   readonly waited: Promise<void>;
-  readonly release: () => void | Promise<void>;
+  readonly release: () => void;
 }
 
 /** `zerver/views/message_fetch.py`: `num_before + num_after > 5000` is a 400. */
@@ -104,6 +107,12 @@ const DEFAULT_EVENTS_TIMEOUT_MS = 25_000;
 
 /** Pace of a blocked `fetchRecent`'s retries while no live wake primitive is available. */
 const BLOCKED_FETCH_RETRY_MS = 400;
+
+/**
+ * Messages a single gap-fill history read asks for. Exported so a test's dead-window sizes stay
+ * derived from it and cannot stop straddling a page boundary if it changes.
+ */
+export const GAP_FILL_PAGE = 500;
 
 /**
  * Zulip backend (DESIGN §6/§9) — self-hosted, and the closest native fit of any backend: Zulip's
@@ -169,6 +178,11 @@ export class ZulipPlugin implements BackendPlugin {
    * listener, the same teardown discipline as the event-poll controllers.
    */
   private readonly pendingAborts = new Set<() => void>();
+  /**
+   * Queue deletions detached from a caller's deadline, awaited by `disconnect()` so best-effort
+   * cleanup still finishes without ever running inside a `fetchRecent`'s `blockMs`.
+   */
+  private readonly pendingDeletes = new Set<Promise<void>>();
 
   /**
    * Zulip auth is per-request HTTP Basic (`email:api_key`) — there is no session or token to
@@ -226,6 +240,7 @@ export class ZulipPlugin implements BackendPlugin {
     const queues = [...this.queues];
     this.queues.clear();
     await Promise.allSettled(queues.map((q) => this.deleteQueue(q.queueId)));
+    await Promise.allSettled([...this.pendingDeletes]);
     this.connected = false;
   }
 
@@ -239,6 +254,37 @@ export class ZulipPlugin implements BackendPlugin {
       query: { queue_id: queueId },
       signal: AbortSignal.timeout(TEARDOWN_TIMEOUT_MS),
     }).catch(() => undefined);
+  }
+
+  /**
+   * Drop a queue the plugin has stopped using without making anyone wait for the round trip. Keep
+   * it off every caller's path, so that a slow or black-holed server cannot spend a `fetchRecent`'s
+   * `blockMs` — or a push loop's recovery latency — on cleanup.
+   */
+  private deleteQueueDetached(queueId: string): void {
+    const done = this.deleteQueue(queueId);
+    this.pendingDeletes.add(done);
+    void done.finally(() => this.pendingDeletes.delete(done));
+  }
+
+  /**
+   * An abort that fires at `deadline` or on `disconnect()`, whichever comes first, with the
+   * bookkeeping teardown needs. `done()` releases the timer and the registrations.
+   */
+  private deadlineAbort(deadline: number): { signal: AbortSignal; done: () => void } {
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+    this.pendingAborts.add(abort);
+    this.controllers.add(controller);
+    return {
+      signal: controller.signal,
+      done: (): void => {
+        clearTimeout(timer);
+        this.pendingAborts.delete(abort);
+        this.controllers.delete(controller);
+      },
+    };
   }
 
   /**
@@ -306,7 +352,7 @@ export class ZulipPlugin implements BackendPlugin {
         if (raced.length > 0) return raced;
         await wake.waited;
       } finally {
-        await wake.release();
+        wake.release();
       }
       if (this.stopped) return [];
       const got = await this.fetchMessages(topic, since, limit);
@@ -322,8 +368,11 @@ export class ZulipPlugin implements BackendPlugin {
    *
    * Keep the piggyback registration on the synchronous path — before this function's first `await`
    * — so that a wake fired between the caller's history read and the registration cannot be lost.
+   * Keep the disconnect check here rather than in each arm, so that neither can be reached after
+   * teardown and neither has to re-check for it.
    */
   private async armWake(topic: Topic, deadline: number): Promise<Wake> {
+    if (this.stopped) return { waited: Promise.resolve(), release: () => undefined };
     const live = this.waiters.get(topic);
     if (live !== undefined && live.healthy > 0) {
       return this.armSubscriptionWaiter(topic, deadline - Date.now());
@@ -352,7 +401,6 @@ export class ZulipPlugin implements BackendPlugin {
       const timer = setTimeout(finish, Math.max(0, blockMs));
       this.pendingAborts.add(finish);
       set?.add(finish);
-      if (this.stopped) finish(); // disconnect may have raced the registration
     });
     return { waited, release: () => finish() };
   }
@@ -365,20 +413,24 @@ export class ZulipPlugin implements BackendPlugin {
    */
   private async armDedicatedQueue(topic: Topic, deadline: number): Promise<Wake> {
     const noop = { release: () => undefined };
-    if (this.stopped) return { waited: Promise.resolve(), ...noop };
     let reg: { queue_id: string; last_event_id: number };
+    // Bound the registration by the caller's deadline too: a slow or black-holed register is
+    // otherwise a wait the caller never asked for, ahead of the wait it did.
+    const bound = this.deadlineAbort(deadline);
     try {
-      reg = await this.register(topic);
+      reg = await this.register(topic, bound.signal);
     } catch {
       return { waited: this.pause(deadline), ...noop };
+    } finally {
+      bound.done();
     }
     const state: QueueState = { queueId: reg.queue_id };
     this.queues.add(state);
     return {
       waited: this.pollForWake(reg, deadline),
-      release: async () => {
+      release: () => {
         this.queues.delete(state);
-        await this.deleteQueue(reg.queue_id);
+        this.deleteQueueDetached(reg.queue_id);
       },
     };
   }
@@ -392,13 +444,8 @@ export class ZulipPlugin implements BackendPlugin {
     reg: { queue_id: string; last_event_id: number },
     deadline: number,
   ): Promise<void> {
-    const remaining = deadline - Date.now();
-    if (this.stopped || remaining <= 0) return;
-    const controller = new AbortController();
-    this.controllers.add(controller);
-    const abort = (): void => controller.abort();
-    const timer = setTimeout(abort, remaining);
-    this.pendingAborts.add(abort);
+    if (this.stopped || deadline - Date.now() <= 0) return;
+    const bound = this.deadlineAbort(deadline);
     try {
       const res = await this.http('GET', '/api/v1/events', {
         query: {
@@ -406,18 +453,16 @@ export class ZulipPlugin implements BackendPlugin {
           last_event_id: String(reg.last_event_id),
           dont_block: 'false',
         },
-        signal: controller.signal,
+        signal: bound.signal,
         allowStatuses: [400],
       });
       // Keep the pace on a non-2xx, so that a queue the server rejects outright — answering at once
       // instead of blocking — cannot turn the caller's retries into a spin.
       if (!res.ok) await this.pause(deadline);
     } catch {
-      if (!controller.signal.aborted) await this.pause(deadline);
+      if (!bound.signal.aborted) await this.pause(deadline);
     } finally {
-      clearTimeout(timer);
-      this.controllers.delete(controller);
-      this.pendingAborts.delete(abort);
+      bound.done();
     }
   }
 
@@ -461,15 +506,20 @@ export class ZulipPlugin implements BackendPlugin {
    * probe is delivered EXACTLY once.
    *
    * Queue GC: Zulip garbage-collects queues after ~10 min idle; the server then answers
-   * `BAD_EVENT_QUEUE_ID`. Recovery: re-register (new tail) and ARM a pending gap
-   * (`needsGapFillFrom`); the top of the loop then GAP-FILLS — replays every message with id > the
-   * last delivered id through the catch-up path — RETRYING until it succeeds before polling the
-   * fresh queue, so a transient gap-fill failure (a network blip / non-2xx history read) can no
-   * longer punch a permanent hole in the push stream. Register failures and gap-fill failures
-   * retry independently. Gap-fill advances the delivered watermark PER PAGE, so a mid-pagination
-   * throw keeps its partial progress and a retry does not re-deliver already-delivered pages.
-   * `lastDeliveredId` also dedupes the overlap when a gap-filled message's event later arrives on
-   * the fresh queue.
+   * `BAD_EVENT_QUEUE_ID`. Recovery: drop the superseded queue, re-register (new tail) and ARM a
+   * pending gap (`needsGapFillFrom`); the top of the loop then GAP-FILLS — replays every message
+   * with id > the last delivered id through the catch-up path — RETRYING until it succeeds before
+   * polling the fresh queue, so a transient gap-fill failure (a network blip / non-2xx history
+   * read) can no longer punch a permanent hole in the push stream. Register failures and gap-fill
+   * failures retry independently. Gap-fill advances the delivered watermark PER PAGE, so a
+   * mid-pagination throw keeps its partial progress and a retry does not re-deliver already-
+   * delivered pages. `lastDeliveredId` also dedupes the overlap when a gap-filled message's event
+   * later arrives on the fresh queue.
+   *
+   * Recovery is only "recovered" once the FRESH queue answers a poll: a queue rejected before it
+   * ever did is counted as a failure and paced by the same escalating backoff, so a server that
+   * rejects every queue it mints (a poll reaching a shard that does not own the queue) sees a
+   * backing-off, reported retry rather than a register/poll/gap-fill flood.
    *
    * The loop is bound to the connection GENERATION it was born in: `disconnect()` bumps it, so a
    * loop parked anywhere — a long-poll, a backoff, a gap-fill — stops rather than resuming against
@@ -503,6 +553,8 @@ export class ZulipPlugin implements BackendPlugin {
     let needsGapFillFrom: number | undefined = lastDeliveredId;
     let consecutiveFailures = 0;
     let degraded = false;
+    /** Whether `state.queueId` has ever answered an events poll — the only proof push works. */
+    let queueProven = false;
     const deliver = (m: Message): void => {
       if (!alive()) return;
       try {
@@ -518,11 +570,20 @@ export class ZulipPlugin implements BackendPlugin {
       entry.healthy--;
       this.wake(topic);
     };
-    const recovered = (): void => {
-      consecutiveFailures = 0;
+    /** Advertise the topic as piggyback-able again — the loop can deliver, by whatever route. */
+    const promote = (): void => {
       if (!degraded) return;
       degraded = false;
       entry.healthy++;
+    };
+    /**
+     * Keep the failure-escalation reset here and NOT in `promote`, so that a recovery step that
+     * always succeeds — a gap-fill read, a re-register — cannot cancel the backoff protecting the
+     * server from a cycle that fails at the step after it.
+     */
+    const recovered = (): void => {
+      consecutiveFailures = 0;
+      promote();
     };
     /** Escalating retry wait, so that a permanently dead push path is neither hot nor silent. */
     const backoff = async (reason: string): Promise<void> => {
@@ -561,7 +622,7 @@ export class ZulipPlugin implements BackendPlugin {
               signal,
             );
             needsGapFillFrom = undefined; // gap closed — resume normal polling
-            recovered();
+            promote();
           } catch {
             if (!alive()) break;
             await backoff('gap-fill history read failed');
@@ -591,9 +652,12 @@ export class ZulipPlugin implements BackendPlugin {
         } catch {
           if (!alive()) break;
           // Keep the `capped` branch, so that the healthy idle poll cap is never mistaken for a
-          // failure and escalated into backoff on every long-poll cycle.
-          if (capped) recovered();
-          else await backoff('events long-poll failed');
+          // failure and escalated into backoff on every long-poll cycle. A server that PARKED the
+          // poll long enough to be capped accepted the queue — a stale one is rejected at once.
+          if (capped) {
+            queueProven = true;
+            recovered();
+          } else await backoff('events long-poll failed');
           continue;
         } finally {
           clearTimeout(timer);
@@ -604,13 +668,18 @@ export class ZulipPlugin implements BackendPlugin {
           if (json.code === 'BAD_EVENT_QUEUE_ID') {
             // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
             try {
+              const superseded = state.queueId;
               const fresh = await this.register(topic, signal);
+              this.deleteQueueDetached(superseded);
               state.queueId = fresh.queue_id;
               lastEventId = fresh.last_event_id;
-              // Arm from the lowest outstanding watermark so a second GC racing before the first
-              // gap closes never skips messages (`lastDeliveredId` only moves forward in practice).
-              needsGapFillFrom = Math.min(needsGapFillFrom ?? lastDeliveredId, lastDeliveredId);
-              recovered();
+              needsGapFillFrom = lastDeliveredId;
+              // A queue rejected before it ever answered a poll is a FAILING recovery, not a
+              // completed one: pace it, so that a server rejecting every queue it mints cannot be
+              // flooded with fresh registrations by its own error.
+              if (queueProven) promote();
+              else await backoff('a freshly registered event queue was rejected as stale');
+              queueProven = false;
             } catch {
               if (!alive()) break;
               await backoff('re-register after queue GC failed');
@@ -620,6 +689,7 @@ export class ZulipPlugin implements BackendPlugin {
           }
           continue;
         }
+        queueProven = true;
         recovered();
         let sawMessage = false;
         for (const ev of json.events ?? []) {
@@ -776,7 +846,7 @@ export class ZulipPlugin implements BackendPlugin {
     onProgress: (id: number) => void,
     signal?: AbortSignal,
   ): Promise<number> {
-    const page = 500;
+    const page = GAP_FILL_PAGE;
     let cursor = asCursor(String(sinceId));
     for (;;) {
       // May throw (non-2xx / network blip / teardown) → the caller retries from `onProgress`.

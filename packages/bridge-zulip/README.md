@@ -34,7 +34,9 @@ serves this natively via the `/api/v1/events` event-queue long-poll. Core caps t
 `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Zulip stamps the
-> sender from the authenticated bot account — see "Multiple concurrent sessions". **`inReplyTo` is
+> sender from the authenticated bot account, so a message's sender is always that bot's **email**,
+> never your `identity.handle`. That is not just a transcript detail — it is also what the presence
+> roster (`parley_list_users`) is keyed by; see "Multiple concurrent sessions". **`inReplyTo` is
 > ignored too:** Zulip has no per-message reply parent; it threads *by topic*, and the topic is
 > already Parley's addressing unit.
 
@@ -107,6 +109,23 @@ session the same bot and every message from every session shows up as that one b
 provision a **distinct bot per session** if you want per-session attribution in transcripts —
 the same role `identity.handle` plays for SQLite/Redis/NATS, just carried in `backend_config`.
 `events_timeout_ms` is safe to vary per session.
+
+### What this costs the presence roster
+
+The presence roster behind `parley_list_users` is keyed by the message sender, which on Zulip is
+the bot email. Concretely, on this backend:
+
+- **Sessions sharing one bot merge into a single roster entry** whose `topics` are the *union* of
+  every sharing session's reach — one peer that does not exist, advertising more than any real
+  session can serve.
+- **No session is discoverable by its configured `identity.handle`.** A hand-off addressed to a
+  handle you read out of a config file will not match anything the roster reports.
+- **A distinct bot per session fixes the merging but not the naming**: each session becomes its own
+  roster entry keyed by *its bot's email*, still not by `identity.handle`. If you want the roster to
+  read like your handles, name the bots after them.
+
+This is a property of Zulip's sender model, not of your configuration — there is no per-message
+sender override for a bot account.
 
 ## Retention (server-side, not configured by this plugin)
 

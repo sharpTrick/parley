@@ -194,6 +194,64 @@ describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe
   });
 });
 
+/**
+ * `blockMs` is a CEILING, not a hint: DESIGN §11 sizes `catchup.block_max_ms` under the client tool
+ * timeout, so anything the plugin does on the caller's thread after the wait — registering the
+ * queue it is about to wait on, dropping it afterwards — has to live inside the budget too. The
+ * table crosses budgets with the server states that make each of those steps slow.
+ */
+describe('zulip blocking fetchRecent never overruns its blockMs', () => {
+  /** Scheduling, the history re-read, and the fake's own round trips. */
+  const SLACK_MS = 700;
+
+  const SLOW_STATES = [
+    { name: 'a responsive server', apply: () => undefined },
+    {
+      name: 'DELETE /events answering 500',
+      apply: (fake: FakeZulip) => fake.failRoute('DELETE /api/v1/events', { status: 500 }),
+    },
+    {
+      name: 'DELETE /events a black hole',
+      apply: (fake: FakeZulip) => fake.hangRoute('DELETE /api/v1/events'),
+    },
+    {
+      name: 'DELETE /events slower than the whole budget',
+      apply: (fake: FakeZulip) => fake.holdResponse('DELETE /api/v1/events', 4000),
+    },
+    {
+      name: 'register a black hole',
+      apply: (fake: FakeZulip) => fake.hangRoute(REGISTER),
+    },
+    {
+      name: 'register slower than the whole budget',
+      apply: (fake: FakeZulip) => fake.holdResponse(REGISTER, 4000),
+    },
+    {
+      name: '/events slower than the whole budget',
+      apply: (fake: FakeZulip) => fake.holdResponse('GET /api/v1/events', 4000),
+    },
+  ];
+
+  for (const state of SLOW_STATES) {
+    for (const blockMs of [200, 600, 2000]) {
+      it(`returns within ${blockMs}ms (+slack) with ${state.name}`, async () => {
+        const { plugin, fake } = await boot();
+        const topic = asTopic(`ceil-${rand()}`);
+        await plugin.post(topic, SENDER, 'old');
+        const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
+        state.apply(fake);
+
+        const started = Date.now();
+        const res = await plugin.fetchRecent({ topic, since: tail, blockMs });
+        const elapsed = Date.now() - started;
+
+        expect(res.messages).toEqual([]);
+        expect(elapsed).toBeLessThanOrEqual(blockMs + SLACK_MS);
+      });
+    }
+  }
+});
+
 /** The wake must survive the loop losing, and regaining, its ability to deliver. */
 describe('zulip blocking fetchRecent tracks a loop degrading and recovering', () => {
   const DEGRADE_THEN = [
