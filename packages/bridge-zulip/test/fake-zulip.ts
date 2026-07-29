@@ -1,11 +1,29 @@
 /**
- * An in-process fake Zulip server on `node:http` — just enough of the REST API for the
- * conformance suite: form-encoded writes (JSON bodies are REJECTED, mirroring real Zulip, to
- * keep the plugin honest), a global monotonic message id, anchor-based narrowed reads, and
- * per-queue long-polled event delivery with heartbeats.
+ * An in-process fake Zulip server on `node:http` — a semantic MODEL of the REST API, not a
+ * permissive echo: it enforces the documented server constraints the plugin must respect
+ * ({@link SERVER_CONSTRAINTS}) so a plugin that ignores one fails here instead of only against a
+ * real server. Form-encoded writes (JSON bodies are REJECTED), a global monotonic message id,
+ * anchor-based narrowed reads, and per-queue long-polled event delivery with heartbeats.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+
+/**
+ * The real-server constraints this fake models, each traced to upstream Zulip. Tests read this
+ * table so a constraint added here becomes a failing plugin test until the plugin honours it.
+ */
+export const SERVER_CONSTRAINTS = {
+  /** `zerver/views/message_fetch.py` MAX_MESSAGES_PER_FETCH — larger is a 400. */
+  maxMessagesPerFetch: 5000,
+  /** `zerver/lib/message.py` MAX_TOPIC_NAME_LENGTH — longer subjects are truncated on send. */
+  maxTopicNameLength: 60,
+  /** `zerver/actions/message_send.py` TOPIC_TRUNCATION_MESSAGE. */
+  topicTruncationSuffix: '...',
+  /** `zerver/lib/topic.py` `Q(subject__iexact=…)` — topics (and streams) compare case-folded. */
+  foldsTopicCase: true,
+  /** Every endpoint requires HTTP Basic credentials that match a real bot account. */
+  requiresValidCredentials: true,
+} as const;
 
 interface WireMessage {
   id: number;
@@ -32,11 +50,27 @@ interface Queue {
   waiter?: { res: ServerResponse; timer: NodeJS.Timeout };
 }
 
-/** Fixed directory for `GET /api/v1/users` (resolveIdentity tests). */
-const MEMBERS = [
+export interface FakeMember {
+  user_id: number;
+  email: string;
+  full_name: string;
+  is_bot?: boolean;
+  is_active?: boolean;
+}
+
+/** Default directory for `GET /api/v1/users` (resolveIdentity tests). */
+const MEMBERS: FakeMember[] = [
   { user_id: 10, email: 'parley-bot@localhost', full_name: 'Parley Bot', is_bot: true },
   { user_id: 11, email: 'pat@example.com', full_name: 'Pat Sharp', is_bot: false },
 ];
+
+const DEFAULT_CREDENTIALS = { email: 'parley-bot@localhost', apiKey: 'parley-api-key' };
+
+/** A forced non-2xx for every request on a route, e.g. a revoked key (401) or an outage (500). */
+export interface RouteFailure {
+  status: number;
+  body?: Record<string, unknown>;
+}
 
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
@@ -47,16 +81,39 @@ export interface FakeZulip {
   failNextMessagesRead(): void;
   /** Make the next `n` `GET /api/v1/messages` reads fail with a 502, then behave normally. */
   failMessagesReads(n: number): void;
+  /** Fail every request on `route` (e.g. `GET /api/v1/events`) until cleared. */
+  failRoute(route: string, failure: RouteFailure): void;
+  /** Accept every request on `route` and never answer it — an unreachable-but-open server. */
+  hangRoute(route: string): void;
+  clearRouteFailures(): void;
+  /** How many requests the fake has served for `route`. */
+  requestCount(route: string): number;
+  /** Called right after each request is answered — the injection point for handshake races. */
+  setResponseHook(hook: ((route: string) => void) | undefined): void;
+  /** Deliver a message without going through the plugin (a third party posting concurrently). */
+  injectMessage(opts: { topic: string; content: string; stream?: string; sender?: string }): number;
   close(): Promise<void>;
 }
 
-export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<FakeZulip> {
+export async function startFakeZulip(opts?: {
+  heartbeatMs?: number;
+  members?: FakeMember[];
+  credentials?: { email: string; apiKey: string };
+}): Promise<FakeZulip> {
   const heartbeatMs = opts?.heartbeatMs ?? 10_000;
+  const members = opts?.members ?? MEMBERS;
+  const credentials = opts?.credentials ?? DEFAULT_CREDENTIALS;
   let msgSeq = 0;
   let queueSeq = 0;
   let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
+  const routeFailures = new Map<string, RouteFailure>();
+  const hangRoutes = new Set<string>();
+  const requestCounts = new Map<string, number>();
+  let responseHook: ((route: string) => void) | undefined;
   const messages: WireMessage[] = []; // ascending by id by construction
   const queues = new Map<string, Queue>();
+
+  const fold = (s: string): string => s.toLowerCase();
 
   const dropWaiter = (q: Queue, destroy: boolean): void => {
     const w = q.waiter;
@@ -66,20 +123,54 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
     if (destroy) w.res.destroy();
   };
 
+  const append = (m: Omit<WireMessage, 'id' | 'type' | 'timestamp'>): number => {
+    const msg: WireMessage = {
+      ...m,
+      id: ++msgSeq,
+      type: 'stream',
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+    messages.push(msg);
+    for (const q of queues.values()) {
+      if (fold(q.stream) !== fold(msg.display_recipient)) continue;
+      if (fold(q.topic) !== fold(msg.subject)) continue;
+      q.events.push({ id: q.eventSeq++, type: 'message', message: msg });
+      const w = q.waiter;
+      if (w !== undefined) {
+        q.waiter = undefined;
+        clearTimeout(w.timer);
+        json(w.res, 200, { result: 'success', events: q.events });
+      }
+    }
+    return msg.id;
+  };
+
   const server = createServer((req, res) => {
-    void handle(req, res).catch(() => {
-      if (!res.writableEnded) json(res, 500, { result: 'error', msg: 'internal' });
-    });
+    const route = `${req.method} ${new URL(req.url ?? '/', 'http://fake').pathname}`;
+    requestCounts.set(route, (requestCounts.get(route) ?? 0) + 1);
+    void handle(req, res)
+      .catch(() => {
+        if (!res.writableEnded) json(res, 500, { result: 'error', msg: 'internal' });
+      })
+      .finally(() => responseHook?.(route));
   });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://fake');
     const route = `${req.method} ${url.pathname}`;
 
-    // Every real Zulip endpoint requires Basic auth; the sender is stamped from it.
+    // Every real Zulip endpoint requires Basic auth for a REAL account; the sender is stamped from it.
     const auth = parseBasicAuth(req);
-    if (auth === undefined) {
-      json(res, 401, { result: 'error', msg: 'Unauthorized: HTTP Basic auth required' });
+    if (auth?.email !== credentials.email || auth.apiKey !== credentials.apiKey) {
+      json(res, 401, { result: 'error', msg: 'Invalid API key' });
+      return;
+    }
+
+    if (hangRoutes.has(route)) return; // never answered — the socket just stays open
+
+    const forced = routeFailures.get(route);
+    if (forced !== undefined) {
+      json(res, forced.status, forced.body ?? { result: 'error', msg: `forced ${forced.status}` });
       return;
     }
 
@@ -96,31 +187,14 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
 
     switch (route) {
       case 'POST /api/v1/messages': {
-        const to = form.get('to') ?? '';
-        const topic = form.get('topic') ?? '';
-        const msg: WireMessage = {
-          id: ++msgSeq,
-          type: 'stream',
-          display_recipient: to,
-          subject: topic,
+        const id = append({
+          display_recipient: form.get('to') ?? '',
+          subject: truncateTopic(form.get('topic') ?? ''), // the server rewrites over-long topics
           content: form.get('content') ?? '',
           sender_email: auth.email,
           sender_full_name: 'Parley Bot',
-          timestamp: Math.floor(Date.now() / 1000),
-        };
-        messages.push(msg);
-        // Fan out to matching queues; wake parked long-polls.
-        for (const q of queues.values()) {
-          if (q.stream !== to || q.topic !== topic) continue;
-          q.events.push({ id: q.eventSeq++, type: 'message', message: msg });
-          const w = q.waiter;
-          if (w !== undefined) {
-            q.waiter = undefined;
-            clearTimeout(w.timer);
-            json(w.res, 200, { result: 'success', events: q.events });
-          }
-        }
-        json(res, 200, { result: 'success', id: msg.id });
+        });
+        json(res, 200, { result: 'success', id });
         return;
       }
 
@@ -131,6 +205,16 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
           json(res, 502, { result: 'error', msg: 'Bad gateway' });
           return;
         }
+        const numBefore = Number(url.searchParams.get('num_before') ?? '0');
+        const numAfter = Number(url.searchParams.get('num_after') ?? '0');
+        if (numBefore + numAfter > SERVER_CONSTRAINTS.maxMessagesPerFetch) {
+          json(res, 400, {
+            result: 'error',
+            code: 'BAD_REQUEST',
+            msg: `Too many messages requested (maximum ${SERVER_CONSTRAINTS.maxMessagesPerFetch}).`,
+          });
+          return;
+        }
         const narrow = JSON.parse(url.searchParams.get('narrow') ?? '[]') as Array<{
           operator: string;
           operand: string;
@@ -139,14 +223,12 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
         const topic = narrow.find((n) => n.operator === 'topic')?.operand;
         const pool = messages.filter(
           (m) =>
-            (stream === undefined || m.display_recipient === stream) &&
-            (topic === undefined || m.subject === topic),
+            (stream === undefined || fold(m.display_recipient) === fold(stream)) &&
+            (topic === undefined || fold(m.subject) === fold(topic)),
         );
         const anchorRaw = url.searchParams.get('anchor') ?? 'newest';
         const anchor = anchorRaw === 'newest' ? Number.POSITIVE_INFINITY : Number(anchorRaw);
         const includeAnchor = (url.searchParams.get('include_anchor') ?? 'true') === 'true';
-        const numBefore = Number(url.searchParams.get('num_before') ?? '0');
-        const numAfter = Number(url.searchParams.get('num_after') ?? '0');
         const before = numBefore > 0 ? pool.filter((m) => m.id < anchor).slice(-numBefore) : [];
         const at = includeAnchor ? pool.filter((m) => m.id === anchor) : [];
         const after = numAfter > 0 ? pool.filter((m) => m.id > anchor).slice(0, numAfter) : [];
@@ -211,7 +293,7 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
       }
 
       case 'GET /api/v1/users': {
-        json(res, 200, { result: 'success', members: MEMBERS });
+        json(res, 200, { result: 'success', members });
         return;
       }
 
@@ -237,6 +319,27 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
     failMessagesReads: (n: number) => {
       failMessagesReadsRemaining = n;
     },
+    failRoute: (route, failure) => {
+      routeFailures.set(route, failure);
+      for (const q of queues.values()) dropWaiter(q, true);
+    },
+    hangRoute: (route) => hangRoutes.add(route),
+    clearRouteFailures: () => {
+      routeFailures.clear();
+      hangRoutes.clear();
+    },
+    requestCount: (route) => requestCounts.get(route) ?? 0,
+    setResponseHook: (hook) => {
+      responseHook = hook;
+    },
+    injectMessage: ({ topic, content, stream, sender }) =>
+      append({
+        display_recipient: stream ?? 'parley',
+        subject: truncateTopic(topic),
+        content,
+        sender_email: sender ?? 'someone@example.com',
+        sender_full_name: 'Someone Else',
+      }),
     close: async () => {
       for (const q of queues.values()) dropWaiter(q, true);
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
@@ -244,6 +347,14 @@ export async function startFakeZulip(opts?: { heartbeatMs?: number }): Promise<F
       await closed;
     },
   };
+}
+
+/** Zulip stores at most 60 characters of subject, replacing the tail with an ellipsis. */
+function truncateTopic(topic: string): string {
+  const chars = [...topic];
+  if (chars.length <= SERVER_CONSTRAINTS.maxTopicNameLength) return topic;
+  const suffix = SERVER_CONSTRAINTS.topicTruncationSuffix;
+  return chars.slice(0, SERVER_CONSTRAINTS.maxTopicNameLength - suffix.length).join('') + suffix;
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {

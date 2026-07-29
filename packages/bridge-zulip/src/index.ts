@@ -61,6 +61,30 @@ interface QueueState {
 }
 
 /**
+ * Wake callbacks for blocking `fetchRecent` calls piggybacking on a topic's live `subscribe`
+ * loop(s); `loops` counts the loops currently draining the topic.
+ */
+interface TopicWaiters {
+  readonly wakes: Set<() => void>;
+  loops: number;
+}
+
+/** `zerver/views/message_fetch.py`: `num_before + num_after > 5000` is a 400. */
+const MAX_MESSAGES_PER_FETCH = 5000;
+
+/** `zerver/lib/message.py` `MAX_TOPIC_NAME_LENGTH`: longer subjects are truncated on send. */
+const MAX_TOPIC_NAME_LENGTH = 60;
+
+/** Milliseconds a best-effort teardown request may take before it is abandoned. */
+const TEARDOWN_TIMEOUT_MS = 2000;
+
+/** Backoff bounds for a failing push loop, and how often a persistent failure is reported. */
+const LOOP_BACKOFF_MIN_MS = 200;
+const LOOP_BACKOFF_MAX_MS = 5000;
+const LOOP_FAILURES_BEFORE_REPORT = 3;
+const LOOP_FAILURE_REPORT_INTERVAL = 20;
+
+/**
  * Zulip backend (DESIGN §6/§9) — self-hosted, and the closest native fit of any backend: Zulip's
  * data model is literally streams-and-topics, so the mapping is one configured Zulip *stream*
  * carrying all Parley traffic, with each Parley topic → a Zulip *topic* inside that stream.
@@ -71,6 +95,13 @@ interface QueueState {
  * `fetchRecent` = `GET /api/v1/messages` with an `anchor` (exclusive via `include_anchor=false`);
  * `subscribe` = a registered per-topic event queue driven by a `GET /api/v1/events` long-poll —
  * genuine push, not a poll timer. Zulip DOES deliver our own sends back to our own queue.
+ *
+ * TOPIC NAMESPACE: Zulip matches topics case-INsensitively (`subject__iexact` on reads, a
+ * lower-cased compare on event-queue narrows) and truncates subjects to 60 characters on send, so
+ * a Parley topic is mapped onto the wire by {@link ZulipPlugin.wireTopic}: case-folded (making
+ * Parley's namespace 1:1 with Zulip's) and rejected outright when it cannot survive the round trip
+ * — two Parley topics differing only in case, or a name over 60 characters, would otherwise share
+ * or silently rewrite a history.
  *
  * ONE INEXACTNESS to know about: Zulip topics are MUTABLE namespaces — admins (and, by default
  * policy, members) can move or rename messages between topics after the fact. Message ids and
@@ -91,12 +122,15 @@ export class ZulipPlugin implements BackendPlugin {
   /** Live queues (one per subscribe), so disconnect can best-effort delete them server-side. */
   private readonly queues = new Set<QueueState>();
   /**
-   * Topics with a live `subscribe` loop → the set of wake callbacks for blocking `fetchRecent`
-   * calls piggybacking on that loop's already-registered event queue (issue #20). Presence of a
-   * topic key means "subscribed"; the loop fires these when a message event lands so a blocked
-   * fetch re-queries WITHOUT opening a second event queue for the topic.
+   * Topics with a live `subscribe` loop → its wake callbacks for blocking `fetchRecent` calls
+   * piggybacking on that loop's already-registered event queue (issue #20). A topic key exists
+   * ONLY while at least one loop is actually draining it, so a blocked fetch can never park on a
+   * dead subscription; the loop fires the callbacks when a message event lands so a blocked fetch
+   * re-queries WITHOUT opening a second event queue for the topic.
    */
-  private readonly waiters = new Map<Topic, Set<() => void>>();
+  private readonly waiters = new Map<Topic, TopicWaiters>();
+  /** Wire topic → the one Parley topic that claimed it, so a case-fold collision fails fast. */
+  private readonly claimedWireTopics = new Map<string, Topic>();
   /**
    * Aborts for every in-flight blocking-fetch wait (both the piggyback and the dedicated-queue
    * kind), fired on `disconnect()` so a blocked `fetchRecent` releases immediately with no leaked
@@ -115,6 +149,7 @@ export class ZulipPlugin implements BackendPlugin {
     this.apiKey = cfg.api_key ?? 'parley-api-key';
     this.stream = cfg.stream ?? 'parley';
     this.eventsTimeoutMs = cfg.events_timeout_ms ?? 25_000;
+    this.claimedWireTopics.clear();
     this.stopped = false;
     this.connected = true;
 
@@ -128,6 +163,13 @@ export class ZulipPlugin implements BackendPlugin {
           'Zulip bot provisioned with this key is world-readable/injectable.',
       );
     }
+    if (isPlaintextRemote(this.baseUrl)) {
+      console.warn(
+        `[parley-zulip] SECURITY: site_url ${this.baseUrl} is plaintext http:// to a non-loopback ` +
+          'host, so the bot email and api_key travel the network as an unencrypted HTTP Basic ' +
+          'header on every request. Use https://.',
+      );
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -138,14 +180,22 @@ export class ZulipPlugin implements BackendPlugin {
     this.waiters.clear();
     for (const c of this.controllers) c.abort();
     this.controllers.clear();
-    // Best-effort server-side cleanup — Zulip GCs idle queues after ~10 min anyway.
-    for (const q of this.queues) {
-      await this.http('DELETE', '/api/v1/events', { query: { queue_id: q.queueId } }).catch(
-        () => undefined,
-      );
-    }
+    const queues = [...this.queues];
     this.queues.clear();
+    await Promise.allSettled(queues.map((q) => this.deleteQueue(q.queueId)));
     this.connected = false;
+  }
+
+  /**
+   * Best-effort server-side queue cleanup — Zulip GCs idle queues after ~10 min anyway, so keep
+   * the timeout, so that an unreachable-but-not-refusing server cannot stall shutdown past the
+   * container's grace period.
+   */
+  private async deleteQueue(queueId: string): Promise<void> {
+    await this.http('DELETE', '/api/v1/events', {
+      query: { queue_id: queueId },
+      signal: AbortSignal.timeout(TEARDOWN_TIMEOUT_MS),
+    }).catch(() => undefined);
   }
 
   /**
@@ -162,7 +212,7 @@ export class ZulipPlugin implements BackendPlugin {
   ): Promise<BackendMsgId> {
     this.require();
     const res = await this.http('POST', '/api/v1/messages', {
-      form: { type: 'stream', to: this.stream, topic, content },
+      form: { type: 'stream', to: this.stream, topic: this.wireTopic(topic), content },
     });
     const json = (await res.json()) as { id: number };
     // identity is the logical sender; Zulip stamps `sender_email` from the authenticated bot.
@@ -234,7 +284,7 @@ export class ZulipPlugin implements BackendPlugin {
     waited: Promise<void>;
     cancel: () => void;
   } {
-    const set = this.waiters.get(topic);
+    const set = this.waiters.get(topic)?.wakes;
     let finish!: () => void;
     const waited = new Promise<void>((resolve) => {
       let done = false;
@@ -304,19 +354,23 @@ export class ZulipPlugin implements BackendPlugin {
       return this.stopped ? [] : this.fetchMessages(topic, since, limit);
     } finally {
       this.queues.delete(state);
-      await this.http('DELETE', '/api/v1/events', { query: { queue_id: reg.queue_id } }).catch(
-        () => undefined,
-      );
+      await this.deleteQueue(reg.queue_id);
     }
   }
 
   /**
    * Live path = a registered per-topic event queue + `GET /api/v1/events` long-poll loop
    * (DESIGN §9 — genuine events, not a poll timer). `POST /api/v1/register` narrowed to
-   * `<stream, topic>` IS the tail: only messages sent after registration enter the queue, and it
+   * `<stream, topic>` is the queue's birth: only messages sent after registration enter it, and it
    * is awaited before subscribe resolves, so a post immediately after subscribe() is guaranteed
    * to be queued. Zulip delivers our own sends to our own queue, matching the seam's echo
    * expectation.
+   *
+   * The delivery watermark is probed BEFORE register and the handshake window is then closed by an
+   * armed gap-fill: anything landing between the probe and the queue's birth reaches no queue, and
+   * anything landing after it is deduped against the watermark, so every message newer than the
+   * probe is delivered EXACTLY once. Probing after register instead would fold a racing message
+   * into the watermark and then drop its own queue event as "already delivered".
    *
    * Queue GC: Zulip garbage-collects queues after ~10 min idle; the server then answers
    * `BAD_EVENT_QUEUE_ID`. Recovery: re-register (new tail) and ARM a pending gap
@@ -331,22 +385,37 @@ export class ZulipPlugin implements BackendPlugin {
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
-    const reg = await this.register(topic);
-    // Mark the topic subscribed so a blocking fetchRecent piggybacks on THIS queue (issue #20)
-    // instead of opening a second one; the loop below wakes any registered fetchers per message.
-    // Seeded AFTER a successful register so a register failure leaves no dead waiter set that a
-    // later piggyback fetch would park on for its full blockMs.
-    if (!this.waiters.has(topic)) this.waiters.set(topic, new Set());
-    const state: QueueState = { queueId: reg.queue_id };
-    this.queues.add(state);
-    let lastEventId = reg.last_event_id;
-    // Gap-fill baseline: the current tail id (0 for an empty topic). Probed AFTER register so a
-    // message landing in between is never lost — worst case it is delivered once via the queue.
     const tail = await this.fetchMessages(topic, undefined, 1);
     let lastDeliveredId = Number(tail.at(-1)?.backendMsgId ?? '0');
-    // A queue GC arms this with the last-delivered id; the top of the loop then drains it, retrying
-    // until the gap-fill read succeeds, so a transient failure can't leave a permanent push hole.
-    let needsGapFillFrom: number | undefined;
+    const reg = await this.register(topic);
+    const state: QueueState = { queueId: reg.queue_id };
+    if (this.stopped) {
+      await this.deleteQueue(reg.queue_id);
+      return;
+    }
+    this.queues.add(state);
+    let lastEventId = reg.last_event_id;
+    // Armed from the pre-register watermark so the register handshake window is replayed, and
+    // re-armed by a queue GC; the top of the loop drains it, retrying until the read succeeds so a
+    // transient failure can't leave a permanent push hole.
+    let needsGapFillFrom: number | undefined = lastDeliveredId;
+    let consecutiveFailures = 0;
+    /** Escalating retry wait, so that a permanently dead push path is neither hot nor silent. */
+    const backoff = async (reason: string): Promise<void> => {
+      consecutiveFailures++;
+      if (
+        consecutiveFailures === LOOP_FAILURES_BEFORE_REPORT ||
+        consecutiveFailures % LOOP_FAILURE_REPORT_INTERVAL === 0
+      ) {
+        console.error(
+          `[parley-zulip] push loop for topic ${JSON.stringify(topic)} has failed ` +
+            `${consecutiveFailures}× in a row (${reason}); still retrying, backing off`,
+        );
+      }
+      await delay(
+        Math.min(LOOP_BACKOFF_MIN_MS * 2 ** (consecutiveFailures - 1), LOOP_BACKOFF_MAX_MS),
+      );
+    };
 
     const loop = async (): Promise<void> => {
       while (!this.stopped) {
@@ -360,16 +429,21 @@ export class ZulipPlugin implements BackendPlugin {
               needsGapFillFrom = id;
             });
             needsGapFillFrom = undefined; // gap closed — resume normal polling
+            consecutiveFailures = 0;
           } catch {
             if (this.stopped) break;
-            await delay(200);
+            await backoff('gap-fill history read failed');
           }
           continue; // re-check stopped / re-attempt before polling the fresh queue
         }
         const controller = new AbortController();
         this.controllers.add(controller);
         // Client-side long-poll cap so the loop re-checks shutdown; un-acked events survive.
-        const timer = setTimeout(() => controller.abort(), this.eventsTimeoutMs);
+        let capped = false;
+        const timer = setTimeout(() => {
+          capped = true;
+          controller.abort();
+        }, this.eventsTimeoutMs);
         let json: EventsResponse;
         try {
           const res = await this.http('GET', '/api/v1/events', {
@@ -384,7 +458,10 @@ export class ZulipPlugin implements BackendPlugin {
           json = (await res.json()) as EventsResponse;
         } catch {
           if (this.stopped) break;
-          await delay(200);
+          // Keep the `capped` branch, so that the healthy idle poll cap is never mistaken for a
+          // failure and escalated into backoff on every long-poll cycle.
+          if (capped) consecutiveFailures = 0;
+          else await backoff('events long-poll failed');
           continue;
         } finally {
           clearTimeout(timer);
@@ -403,15 +480,17 @@ export class ZulipPlugin implements BackendPlugin {
               // Arm from the lowest outstanding watermark so a second GC racing before the first
               // gap closes never skips messages (`lastDeliveredId` only moves forward in practice).
               needsGapFillFrom = Math.min(needsGapFillFrom ?? lastDeliveredId, lastDeliveredId);
+              consecutiveFailures = 0;
             } catch {
               if (this.stopped) break;
-              await delay(200);
+              await backoff('re-register after queue GC failed');
             }
           } else {
-            await delay(200);
+            await backoff(`events poll returned ${json.code ?? 'an error'}`);
           }
           continue;
         }
+        consecutiveFailures = 0;
         let sawMessage = false;
         for (const ev of json.events ?? []) {
           if (ev.id > lastEventId) lastEventId = ev.id; // ack everything, incl. heartbeats
@@ -428,47 +507,116 @@ export class ZulipPlugin implements BackendPlugin {
         // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
         // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
         if (sawMessage) {
-          const set = this.waiters.get(topic);
-          if (set !== undefined) for (const w of [...set]) w();
+          const live = this.waiters.get(topic);
+          if (live !== undefined) for (const wake of [...live.wakes]) wake();
         }
       }
     };
-    void loop();
+    // Advertise the topic as piggyback-able only now that every await is behind us and the loop is
+    // about to run, and withdraw it when the loop exits — a waiter set with no loop behind it parks
+    // a blocking fetchRecent for its full blockMs.
+    const entry = this.waiters.get(topic) ?? { wakes: new Set<() => void>(), loops: 0 };
+    entry.loops++;
+    this.waiters.set(topic, entry);
+    void loop().finally(() => {
+      entry.loops--;
+      if (entry.loops > 0) return;
+      if (this.waiters.get(topic) === entry) this.waiters.delete(topic);
+      for (const wake of [...entry.wakes]) wake(); // no loop left to wake them
+    });
   }
 
   /**
-   * Real account lookup (DESIGN §4): `GET /api/v1/users`, matched on `email` or `full_name` →
-   * `backendRef` = the Zulip `user_id`. Miss (or any error) degrades to the string convention.
+   * Real account lookup (DESIGN §4): `GET /api/v1/users` → `backendRef` = the Zulip `user_id`.
+   * `email` is unique per realm, so it resolves outright; `full_name` is a user-settable, NON-unique
+   * display name, so it resolves only when exactly one ACTIVE member carries it — an ambiguous or
+   * deactivated match degrades to the string convention rather than letting whoever the server
+   * happens to list first claim another participant's handle. Any error degrades the same way.
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     this.require();
     try {
       const res = await this.http('GET', '/api/v1/users');
       const { members } = (await res.json()) as {
-        members: Array<{ user_id: number; email: string; full_name: string }>;
+        members: Array<{ user_id: number; email: string; full_name: string; is_active?: boolean }>;
       };
-      const user = members.find((u) => u.email === handle || u.full_name === handle);
-      if (user !== undefined) return { handle, backendRef: String(user.user_id) };
+      const active = members.filter((u) => u.is_active !== false);
+      const byEmail = active.find((u) => u.email === handle);
+      if (byEmail !== undefined) return { handle, backendRef: String(byEmail.user_id) };
+      const byName = active.filter((u) => u.full_name === handle);
+      if (byName.length === 1) return { handle, backendRef: String(byName[0]!.user_id) };
     } catch {
       /* lookup is best-effort; fall through to the string convention */
     }
     return { handle, backendRef: handle };
   }
 
-  /** Shared narrowed read used by fetchRecent AND the gap-fill after a queue GC. */
+  /**
+   * The Zulip topic a Parley topic addresses, used by post, the read narrow and register alike.
+   * Case-folded because Zulip compares topics case-insensitively; over-long and case-colliding
+   * names are rejected rather than sent, because Zulip would silently truncate the first to 60
+   * characters (making the topic write-only: posts land under a name the narrow never matches)
+   * and silently merge the second into one shared history.
+   */
+  private wireTopic(topic: Topic): string {
+    const wire = topic.toLowerCase();
+    if ([...wire].length > MAX_TOPIC_NAME_LENGTH) {
+      throw new Error(
+        `Zulip topic too long: ${[...wire].length} characters, max ${MAX_TOPIC_NAME_LENGTH} ` +
+          `(Zulip truncates longer subjects on send, making topic ${JSON.stringify(topic)} ` +
+          'unreadable). Shorten the Parley topic name.',
+      );
+    }
+    const claimed = this.claimedWireTopics.get(wire);
+    if (claimed !== undefined && claimed !== topic) {
+      throw new Error(
+        `Zulip topic collision: Parley topics ${JSON.stringify(claimed)} and ` +
+          `${JSON.stringify(topic)} both map to Zulip topic ${JSON.stringify(wire)} — Zulip ` +
+          'matches topics case-insensitively, so they would share one history. Rename one.',
+      );
+    }
+    this.claimedWireTopics.set(wire, topic);
+    return wire;
+  }
+
+  /**
+   * Shared narrowed read used by fetchRecent AND the gap-fill after a queue GC. Paginates so the
+   * seam's `limit` stays honest: Zulip rejects `num_before + num_after > 5000` outright, so a
+   * larger caller limit is served as successive pages rather than propagated as a 400.
+   */
   private async fetchMessages(topic: Topic, since: Cursor | undefined, limit: number): Promise<Message[]> {
     const narrow = JSON.stringify([
       { operator: 'stream', operand: this.stream },
-      { operator: 'topic', operand: topic },
+      { operator: 'topic', operand: this.wireTopic(topic) },
     ]);
-    const query: Record<string, string> =
-      since === undefined
-        ? { narrow, anchor: 'newest', include_anchor: 'true', num_before: String(limit), num_after: '0' }
-        : { narrow, anchor: String(since), include_anchor: 'false', num_before: '0', num_after: String(limit) };
-    query.apply_markdown = 'false'; // raw content, not rendered HTML
-    const res = await this.http('GET', '/api/v1/messages', { query });
-    const { messages } = (await res.json()) as { messages: ZulipMessage[] };
-    return messages.map((m) => zulipToMessage(topic, m)); // Zulip returns ascending by id
+    const out: Message[] = [];
+    let remaining = Math.max(0, limit);
+    let anchor = since === undefined ? 'newest' : String(since);
+    let includeAnchor = since === undefined;
+    while (remaining > 0) {
+      const page = Math.min(remaining, MAX_MESSAGES_PER_FETCH);
+      const query: Record<string, string> = {
+        narrow,
+        anchor,
+        include_anchor: String(includeAnchor),
+        num_before: since === undefined ? String(page) : '0',
+        num_after: since === undefined ? '0' : String(page),
+        apply_markdown: 'false', // raw content, not rendered HTML
+      };
+      const res = await this.http('GET', '/api/v1/messages', { query });
+      const { messages } = (await res.json()) as { messages: ZulipMessage[] };
+      const got = messages.map((m) => zulipToMessage(topic, m)); // Zulip returns ascending by id
+      // Keep the unshift: pages from the newest anchor walk BACKWARDS, so appending would
+      // return the window in descending page order.
+      if (since === undefined) out.unshift(...got);
+      else out.push(...got);
+      remaining -= got.length;
+      const edge = since === undefined ? got[0] : got.at(-1);
+      if (got.length < page || edge === undefined) break;
+      anchor = String(edge.cursor);
+      includeAnchor = false;
+    }
+    return out;
   }
 
   /** Register a `<stream, topic>`-narrowed message event queue; its birth is the topic's tail. */
@@ -478,7 +626,7 @@ export class ZulipPlugin implements BackendPlugin {
         event_types: JSON.stringify(['message']),
         narrow: JSON.stringify([
           ['stream', this.stream],
-          ['topic', topic],
+          ['topic', this.wireTopic(topic)],
         ]),
         apply_markdown: 'false',
       },
@@ -566,6 +714,18 @@ export class ZulipPlugin implements BackendPlugin {
         allowStatuses: opts?.allowStatuses,
       },
     );
+  }
+}
+
+/** True when the URL would put the Basic-auth credential on the wire in the clear. */
+function isPlaintextRemote(baseUrl: string): boolean {
+  try {
+    const { protocol, hostname } = new URL(baseUrl);
+    if (protocol !== 'http:') return false;
+    const host = hostname.replace(/^\[|]$/g, '');
+    return !(host === 'localhost' || host === '::1' || /^127\./.test(host));
+  } catch {
+    return false;
   }
 }
 

@@ -17,9 +17,9 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | topic → stream + topic    | ONE configured Zulip **stream** (default `parley`) carries all Parley traffic; each Parley topic is a Zulip **topic** within it. |
 | `post`                    | `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) with `{ type: "stream", to: <stream>, topic, content }` → returns the new message `id`. |
 | `backendMsgId` = `cursor` | The Zulip **message `id`** — a globally monotonic integer (hence per-topic monotonic); serves as both the dedup key and the order key. Zero cursor is `'0'`. |
-| `fetchRecent` (no `since`)| `GET /api/v1/messages` narrowed to `<stream, topic>`, `anchor=newest&num_before=N` → the most recent window, ascending. |
+| `fetchRecent` (no `since`)| `GET /api/v1/messages` narrowed to `<stream, topic>`, `anchor=newest&num_before=N` → the most recent window, ascending. Zulip caps a request at 5000 messages, so a larger `limit` is paginated transparently rather than returned as a 400. |
 | `fetchRecent` (`since`)   | `anchor=<since>&include_anchor=false&num_before=0&num_after=N` — the anchor itself is excluded, so `since` is strictly **exclusive** server-side. Zulip returns ascending by id; no client-side reordering. |
-| `subscribe`               | `POST /api/v1/register` a `<stream, topic>`-narrowed message **event queue** (its birth IS the tail — only later sends enter it; awaited before subscribe resolves), then a `GET /api/v1/events` long-poll loop. Zulip delivers our own sends back to our own queue. Queues idle-GC after ~10 min → on `BAD_EVENT_QUEUE_ID` the loop re-registers and **gap-fills** the dead-queue window through the catch-up path, deduped by last delivered id. `disconnect()` aborts in-flight polls and best-effort deletes the queues. |
+| `subscribe`               | `POST /api/v1/register` a `<stream, topic>`-narrowed message **event queue** (only later sends enter it; awaited before subscribe resolves), then a `GET /api/v1/events` long-poll loop. The delivery watermark is read *before* register and the handshake window is gap-filled, so a message racing the handshake is delivered exactly once. Zulip delivers our own sends back to our own queue. Queues idle-GC after ~10 min → on `BAD_EVENT_QUEUE_ID` the loop re-registers and **gap-fills** the dead-queue window through the catch-up path, deduped by last delivered id. `disconnect()` aborts in-flight polls and best-effort deletes the queues. |
 | `resolveIdentity`         | `GET /api/v1/users`, matched on `email` or `full_name` → `backendRef` = the Zulip `user_id`; miss (or error) degrades to `{ handle, backendRef: handle }`. |
 
 `senderHandle` ← `message.sender_email`, `content` ← raw `message.content` (`apply_markdown=false`
@@ -38,6 +38,18 @@ serves this natively via the `/api/v1/events` event-queue long-poll. Core caps t
 > ignored too:** Zulip has no per-message reply parent; it threads *by topic*, and the topic is
 > already Parley's addressing unit.
 
+## Topic names: case-folded, 60 characters, validated
+
+Zulip's topic namespace is not quite Parley's, so the plugin maps between them explicitly:
+
+- **Case is folded.** Zulip matches topics case-insensitively (`ops` and `OPS` are one topic), so
+  the plugin lower-cases the topic on the wire — your Parley topic `Ops` is Zulip topic `ops`, and
+  a third party posting to `OPS` lands in the same Parley topic rather than a hidden second one.
+  Two configured topics that differ only in case are **rejected** (they would share one history).
+- **60 characters, hard.** Zulip truncates longer subjects on send, which would make the topic
+  write-only — posts land under a name the read narrow never matches. The plugin refuses such a
+  topic with a clear error at `post`/`fetchRecent`/`subscribe` instead.
+
 ## The one inexactness: topics are mutable
 
 Zulip topics are **mutable namespaces** — admins (and, under the default org policy, members) can
@@ -52,7 +64,7 @@ stream with only bots posting, this never happens on its own.
 
 | key                 | default                  | meaning |
 | ------------------- | ------------------------ | ------- |
-| `site_url`          | `http://127.0.0.1:9991`  | Zulip server base URL (docker-zulip dev default port). |
+| `site_url`          | `http://127.0.0.1:9991`  | Zulip server base URL (docker-zulip dev default port). **Use `https://` for anything but loopback** — the bot `email:api_key` goes out as an HTTP Basic header on every request; a plaintext non-loopback URL is warned about at `connect`. |
 | `email`             | `parley-bot@localhost`   | Bot email for HTTP Basic auth. |
 | `api_key`           | `parley-api-key`         | Bot API key for HTTP Basic auth. |
 | `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. |
