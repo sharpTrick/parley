@@ -5,31 +5,11 @@
  * ({@link SERVER_CONSTRAINTS}), so these tables fail here exactly as they would fail live.
  */
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it } from 'vitest';
-import { ZulipPlugin } from '../src/index.js';
-import { type FakeMember, type FakeZulip, SERVER_CONSTRAINTS, startFakeZulip } from './fake-zulip.js';
+import { describe, expect, it } from 'vitest';
+import { type FakeMember, SERVER_CONSTRAINTS } from './fake-zulip.js';
+import { rand, SENDER, useZulip } from './harness.js';
 
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-const SENDER = asHandle('writer');
-
-let open: Array<{ plugin: ZulipPlugin; fake: FakeZulip }> = [];
-
-afterEach(async () => {
-  for (const { plugin, fake } of open) {
-    await plugin.disconnect().catch(() => undefined);
-    await fake.close();
-  }
-  open = [];
-});
-
-async function boot(opts?: Parameters<typeof startFakeZulip>[0], config?: Record<string, unknown>) {
-  const fake = await startFakeZulip(opts);
-  const plugin = new ZulipPlugin();
-  await plugin.connect({ site_url: fake.url, events_timeout_ms: 500, ...config });
-  const pair = { plugin, fake };
-  open.push(pair);
-  return pair;
-}
+const boot = useZulip();
 
 describe('zulip page size vs the server maximum', () => {
   const cap = SERVER_CONSTRAINTS.maxMessagesPerFetch;

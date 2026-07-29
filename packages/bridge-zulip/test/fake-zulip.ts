@@ -72,6 +72,17 @@ export interface RouteFailure {
   body?: Record<string, unknown>;
 }
 
+/**
+ * A run of 429s on a route. Zulip advertises its retry hint in BOTH the `Retry-After` header and a
+ * `retry-after` JSON body field (seconds); either, both, or neither can be modelled here.
+ */
+export interface RateLimit {
+  /** How many requests are rate limited before the route behaves normally. */
+  times: number;
+  headerSeconds?: number;
+  bodySeconds?: number;
+}
+
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
   url: string;
@@ -85,6 +96,14 @@ export interface FakeZulip {
   failRoute(route: string, failure: RouteFailure): void;
   /** Accept every request on `route` and never answer it — an unreachable-but-open server. */
   hangRoute(route: string): void;
+  /** Answer the next `times` requests on `route` with a 429 carrying the given retry hint(s). */
+  rateLimit(route: string, limit: RateLimit): void;
+  /**
+   * Hold every answer on `route` for `ms` before writing it. The body is snapshotted when the
+   * request is handled, so a message injected during the hold is NOT in that response — which is
+   * what turns a handshake window into one a test can inject into deterministically.
+   */
+  holdResponse(route: string, ms: number): void;
   clearRouteFailures(): void;
   /** How many requests the fake has served for `route`. */
   requestCount(route: string): number;
@@ -107,6 +126,8 @@ export async function startFakeZulip(opts?: {
   let queueSeq = 0;
   let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
   const routeFailures = new Map<string, RouteFailure>();
+  const rateLimits = new Map<string, RateLimit>();
+  const routeDelays = new Map<string, number>();
   const hangRoutes = new Set<string>();
   const requestCounts = new Map<string, number>();
   let responseHook: ((route: string) => void) | undefined;
@@ -148,6 +169,8 @@ export async function startFakeZulip(opts?: {
   const server = createServer((req, res) => {
     const route = `${req.method} ${new URL(req.url ?? '/', 'http://fake').pathname}`;
     requestCounts.set(route, (requestCounts.get(route) ?? 0) + 1);
+    const held = routeDelays.get(route);
+    if (held !== undefined) holdWrites(res, held);
     void handle(req, res)
       .catch(() => {
         if (!res.writableEnded) json(res, 500, { result: 'error', msg: 'internal' });
@@ -167,6 +190,20 @@ export async function startFakeZulip(opts?: {
     }
 
     if (hangRoutes.has(route)) return; // never answered — the socket just stays open
+
+    const limit = rateLimits.get(route);
+    if (limit !== undefined && limit.times > 0) {
+      limit.times--;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (limit.headerSeconds !== undefined) headers['Retry-After'] = String(limit.headerSeconds);
+      const body: Record<string, unknown> = { result: 'error', code: 'RATE_LIMIT_HIT' };
+      if (limit.bodySeconds !== undefined) body['retry-after'] = limit.bodySeconds;
+      if (!res.writableEnded && !res.destroyed) {
+        res.writeHead(429, headers);
+        res.end(JSON.stringify(body));
+      }
+      return;
+    }
 
     const forced = routeFailures.get(route);
     if (forced !== undefined) {
@@ -324,8 +361,12 @@ export async function startFakeZulip(opts?: {
       for (const q of queues.values()) dropWaiter(q, true);
     },
     hangRoute: (route) => hangRoutes.add(route),
+    rateLimit: (route, limit) => rateLimits.set(route, { ...limit }),
+    holdResponse: (route, ms) => routeDelays.set(route, ms),
     clearRouteFailures: () => {
       routeFailures.clear();
+      rateLimits.clear();
+      routeDelays.clear();
       hangRoutes.clear();
     },
     requestCount: (route) => requestCounts.get(route) ?? 0,
@@ -355,6 +396,29 @@ function truncateTopic(topic: string): string {
   if (chars.length <= SERVER_CONSTRAINTS.maxTopicNameLength) return topic;
   const suffix = SERVER_CONSTRAINTS.topicTruncationSuffix;
   return chars.slice(0, SERVER_CONSTRAINTS.maxTopicNameLength - suffix.length).join('') + suffix;
+}
+
+/**
+ * Buffer this response's status and body and flush them `ms` later, so the answer is computed at
+ * request time but delivered late — the only way a test can inject into a window the client is
+ * already inside.
+ */
+function holdWrites(res: ServerResponse, ms: number): void {
+  const writeHead = res.writeHead.bind(res);
+  const end = res.end.bind(res);
+  let head: { status: number; headers: Record<string, string> } | undefined;
+  res.writeHead = ((status: number, headers?: Record<string, string>) => {
+    head = { status, headers: headers ?? {} };
+    return res;
+  }) as typeof res.writeHead;
+  res.end = ((body?: unknown) => {
+    setTimeout(() => {
+      if (res.destroyed) return;
+      if (head !== undefined) writeHead(head.status, head.headers);
+      end(body as string);
+    }, ms);
+    return res;
+  }) as typeof res.end;
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {

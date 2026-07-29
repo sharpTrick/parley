@@ -3,34 +3,12 @@
  * stops answering must not hold shutdown open. Both are operator-facing properties no conformance
  * case covers, so they get their own tables here.
  */
-import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ZulipPlugin } from '../src/index.js';
-import { type FakeZulip, startFakeZulip } from './fake-zulip.js';
+import { asTopic, type Message } from '@sharptrick/parley-core';
+import { describe, expect, it, vi } from 'vitest';
+import type { FakeZulip } from './fake-zulip.js';
+import { rand, SENDER, sleep, useZulip } from './harness.js';
 
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-const SENDER = asHandle('writer');
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-let open: Array<{ plugin: ZulipPlugin; fake: FakeZulip }> = [];
-
-afterEach(async () => {
-  vi.restoreAllMocks();
-  for (const { plugin, fake } of open) {
-    await plugin.disconnect().catch(() => undefined);
-    await fake.close();
-  }
-  open = [];
-});
-
-async function boot(): Promise<{ plugin: ZulipPlugin; fake: FakeZulip }> {
-  const fake = await startFakeZulip({ heartbeatMs: 200 });
-  const plugin = new ZulipPlugin();
-  await plugin.connect({ site_url: fake.url, events_timeout_ms: 500 });
-  const pair = { plugin, fake };
-  open.push(pair);
-  return pair;
-}
+const boot = useZulip();
 
 /** Ways the push loop can fail forever — none of them is recoverable by retrying harder. */
 const PERMANENT_FAILURES = [

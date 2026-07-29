@@ -68,7 +68,12 @@ stream with only bots posting, this never happens on its own.
 | `email`             | `parley-bot@localhost`   | Bot email for HTTP Basic auth. |
 | `api_key`           | `parley-api-key`         | Bot API key for HTTP Basic auth. |
 | `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. |
-| `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). |
+| `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). Clamped to `[250, 600000]` ms, so no value can make the loop poll hot. |
+
+Every key is validated at `connect()`, which throws naming the offending key: `site_url` must be an
+absolute `http(s)` URL, `email`/`api_key`/`stream` must be non-empty, and `events_timeout_ms` must
+be a positive, finite number (`0` is an error, not "no cap"). A key that is present but empty (a
+bare `site_url:` in YAML) is reported rather than silently replaced by its default.
 
 Secrets live in `backend_config` / `.env`, never in code.
 
@@ -142,4 +147,6 @@ The shared seam conformance suite (`@sharptrick/parley-conformance`) always runs
 long-polled event queues with heartbeats and a `gcQueues()` lever for the `BAD_EVENT_QUEUE_ID`
 recovery test). Set `PARLEY_ZULIP_URL`, `PARLEY_ZULIP_EMAIL`, and `PARLEY_ZULIP_API_KEY`
 (optionally `PARLEY_ZULIP_STREAM`, default `parley`) to additionally run the same suite against a
-real server — fresh topics in the configured stream are free, so no cleanup is needed.
+real server — fresh topics in the configured stream are free, so no cleanup is needed. Setting them
+is a request, not a hint: if one is missing, or the configured server does not answer the probe,
+the run FAILS naming what was wrong rather than skipping green.

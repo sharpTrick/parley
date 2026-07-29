@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
 
-// SEC-06 — Zulip must not silently run with the repo-public default API key, nor put a real one on
-// the wire in the clear. connect() does no network I/O (auth is per-request HTTP Basic), so both
-// warnings are emitted synchronously.
+// Zulip must not silently run with the repo-public default API key, nor put a real one on the wire
+// in the clear. connect() does no network I/O (auth is per-request HTTP Basic), so both warnings
+// are emitted synchronously.
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-describe('Zulip default-credential warning (SEC-06)', () => {
+describe('Zulip default-credential warning', () => {
   it('warns once, naming the backend and the key to set, when api_key is omitted', async () => {
     const warn = spyWarn();
     await new ZulipPlugin().connect({ site_url: 'http://127.0.0.1:9991' });
@@ -52,7 +52,7 @@ const KEYS = [
   { api_key: 's3cret-real-key', defaultKey: false },
 ];
 
-describe('Zulip credential-transport warning (SEC-06)', () => {
+describe('Zulip credential-transport warning', () => {
   for (const transport of TRANSPORTS) {
     for (const key of KEYS) {
       const expected = Number(transport.plaintextRemote) + Number(key.defaultKey);

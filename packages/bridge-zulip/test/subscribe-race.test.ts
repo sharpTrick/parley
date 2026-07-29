@@ -4,32 +4,12 @@
  * its delivery watermark from state observed after the queue exists, and a topic must be
  * advertised as piggyback-able only while a loop is actually draining it.
  */
-import { asHandle, asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ZulipPlugin } from '../src/index.js';
-import { startFakeZulip, type FakeZulip } from './fake-zulip.js';
+import { asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
+import { describe, expect, it, vi } from 'vitest';
+import type { FakeZulip } from './fake-zulip.js';
+import { rand, SENDER, useZulip } from './harness.js';
 
-const rand = (): string => Math.random().toString(36).slice(2, 8);
-const SENDER = asHandle('writer');
-
-let open: Array<{ plugin: ZulipPlugin; fake: FakeZulip }> = [];
-
-afterEach(async () => {
-  for (const { plugin, fake } of open) {
-    await plugin.disconnect().catch(() => undefined);
-    await fake.close();
-  }
-  open = [];
-});
-
-async function boot(): Promise<{ plugin: ZulipPlugin; fake: FakeZulip }> {
-  const fake = await startFakeZulip({ heartbeatMs: 200 });
-  const plugin = new ZulipPlugin();
-  await plugin.connect({ site_url: fake.url, events_timeout_ms: 500 });
-  const pair = { plugin, fake };
-  open.push(pair);
-  return pair;
-}
+const boot = useZulip();
 
 /** Each window inside the handshake, named by the response the fake has just written. */
 const INJECTION_POINTS = [
