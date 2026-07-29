@@ -43,23 +43,51 @@ describe('zulip page size vs the server maximum', () => {
   });
 });
 
-describe('zulip topic length vs the server truncation', () => {
+/**
+ * Zulip truncates a subject by PYTHON character — a code point — and the plugin case-folds before
+ * measuring, so both the count and the fold are load-bearing. An ASCII-only table cannot see either:
+ * every ASCII string has the same length in code points and UTF-16 units, and ASCII folding never
+ * changes a string's length. Each unit below is exactly one code point, so `unit.repeat(n)` is an
+ * n-code-point topic whatever the script.
+ */
+const CHARSETS = [
+  { name: 'ASCII', unit: 'a' },
+  { name: 'Latin-1 accented', unit: 'é' },
+  { name: 'CJK', unit: '中' },
+  { name: 'astral emoji', unit: '\u{1F600}' },
+  { name: 'U+0130, which folds to TWO code points', unit: 'İ' },
+  { name: 'U+00DF, which folds to itself', unit: 'ß' },
+  { name: 'U+0131 dotless i', unit: 'ı' },
+];
+
+/** What the plugin must measure: code points of the topic AFTER folding, which is what Zulip sees. */
+const wireLength = (topic: string): number => [...topic.toLowerCase()].length;
+
+describe('zulip topic length vs the server truncation, counted in code points', () => {
   const max = SERVER_CONSTRAINTS.maxTopicNameLength;
-  for (const length of [1, max - 1, max, max + 1, 200]) {
-    it(`a ${length}-character topic either round-trips exactly or is rejected`, async () => {
-      const { plugin } = await boot();
-      const topic = asTopic('a'.repeat(length));
-      if (length > max) {
-        await expect(plugin.post(topic, SENDER, 'x')).rejects.toThrow(String(max));
-        await expect(plugin.fetchRecent({ topic })).rejects.toThrow(String(max));
-        await expect(plugin.subscribe(topic, () => undefined)).rejects.toThrow(String(max));
-        return;
-      }
-      await plugin.post(topic, SENDER, 'x');
-      const { messages } = await plugin.fetchRecent({ topic });
-      expect(messages.map((m) => m.content)).toEqual(['x']);
-      expect(messages[0]?.topic).toBe(topic);
-    });
+  for (const charset of CHARSETS) {
+    for (const codePoints of [1, max - 1, max, max + 1]) {
+      const topic = asTopic(charset.unit.repeat(codePoints));
+      const onWire = wireLength(topic);
+      const verdict = onWire > max ? 'is rejected, naming the wire count' : 'round-trips exactly';
+      it(`${codePoints} × ${charset.name} (${onWire} on the wire) ${verdict}`, async () => {
+        const { plugin } = await boot();
+        if (onWire > max) {
+          for (const call of [
+            plugin.post(topic, SENDER, 'x'),
+            plugin.fetchRecent({ topic }),
+            plugin.subscribe(topic, () => undefined),
+          ]) {
+            await expect(call).rejects.toThrow(`${onWire} characters`);
+          }
+          return;
+        }
+        await plugin.post(topic, SENDER, 'x');
+        const { messages } = await plugin.fetchRecent({ topic });
+        expect(messages.map((m) => m.content)).toEqual(['x']);
+        expect(messages[0]?.topic).toBe(topic);
+      });
+    }
   }
 
   it('two over-long topics sharing a 57-character prefix never merge into one history', async () => {
@@ -72,19 +100,41 @@ describe('zulip topic length vs the server truncation', () => {
   });
 });
 
+/**
+ * Case pairs in scripts where JS folding and the server's folding could disagree. The pairs that do
+ * NOT collide matter as much as the ones that do: `İ`/`i` and `ß`/`SS` look like case variants and
+ * are not, so treating them as one topic would merge two histories that the server keeps apart.
+ */
+const CASE_PAIRS = [
+  { first: 'ops', variant: 'OPS', collides: true },
+  { first: 't', variant: 'T', collides: true },
+  { first: 'Alpha', variant: 'alpha', collides: true },
+  { first: 'Design Review', variant: 'design review', collides: true },
+  { first: 'École', variant: 'école', collides: true },
+  { first: 'ΑΡΕΤΗ', variant: 'αρετη', collides: true },
+  { first: 'АЛФА', variant: 'алфа', collides: true },
+  { first: 'İstanbul', variant: 'istanbul', collides: false },
+  { first: 'Straße', variant: 'STRASSE', collides: false },
+];
+
 describe('zulip topic case folding vs the topic allowlist', () => {
-  for (const [first, variant] of [
-    ['ops', 'OPS'],
-    ['t', 'T'],
-    ['Alpha', 'alpha'],
-    ['Design Review', 'design review'],
-  ]) {
-    it(`refuses ${JSON.stringify(variant)} once ${JSON.stringify(first)} is in use — one Zulip history`, async () => {
+  for (const { first, variant, collides } of CASE_PAIRS) {
+    const verdict = collides
+      ? 'is refused — they would share one Zulip history'
+      : 'is a SEPARATE topic — the server does not fold them together';
+    it(`${JSON.stringify(variant)} after ${JSON.stringify(first)} ${verdict}`, async () => {
       const { plugin } = await boot();
       const suffix = rand();
       const a = asTopic(`${first}-${suffix}`);
       const b = asTopic(`${variant}-${suffix}`);
       await plugin.post(a, SENDER, 'x');
+
+      if (!collides) {
+        await plugin.post(b, SENDER, 'y');
+        expect((await plugin.fetchRecent({ topic: a })).messages.map((m) => m.content)).toEqual(['x']);
+        expect((await plugin.fetchRecent({ topic: b })).messages.map((m) => m.content)).toEqual(['y']);
+        return;
+      }
       await expect(plugin.post(b, SENDER, 'y')).rejects.toThrow(/collision/i);
       await expect(plugin.fetchRecent({ topic: b })).rejects.toThrow(/collision/i);
       await expect(plugin.subscribe(b, () => undefined)).rejects.toThrow(/collision/i);
@@ -93,16 +143,18 @@ describe('zulip topic case folding vs the topic allowlist', () => {
     });
   }
 
-  it('a third party posting a case variant lands in the SAME Parley topic, not a hidden second one', async () => {
-    const { plugin, fake } = await boot();
-    const topic = asTopic(`ops-${rand()}`);
-    await plugin.post(topic, SENDER, 'ours');
-    fake.injectMessage({ topic: topic.toUpperCase(), content: 'theirs' });
+  for (const script of ['ops', 'αρετη', 'алфа']) {
+    it(`a third party's upper-case ${JSON.stringify(script)} lands in the SAME Parley topic`, async () => {
+      const { plugin, fake } = await boot();
+      const topic = asTopic(`${script}-${rand()}`);
+      await plugin.post(topic, SENDER, 'ours');
+      fake.injectMessage({ topic: topic.toUpperCase(), content: 'theirs' });
 
-    const { messages } = await plugin.fetchRecent({ topic });
-    expect(messages.map((m) => m.content)).toEqual(['ours', 'theirs']);
-    expect(messages.map((m) => m.topic)).toEqual([topic, topic]);
-  });
+      const { messages } = await plugin.fetchRecent({ topic });
+      expect(messages.map((m) => m.content)).toEqual(['ours', 'theirs']);
+      expect(messages.map((m) => m.topic)).toEqual([topic, topic]);
+    });
+  }
 });
 
 describe('zulip credentials', () => {
@@ -112,27 +164,74 @@ describe('zulip credentials', () => {
   });
 });
 
+/**
+ * A realm laid out so every cell of {@link RESOLUTIONS} has a carrier: the deactivated member is
+ * always listed FIRST in its pair, so a resolution that forgets the `is_active` filter picks the
+ * stale account rather than failing on ordering luck.
+ */
 const DIRECTORY: FakeMember[] = [
   { user_id: 10, email: 'parley-bot@localhost', full_name: 'Parley Bot', is_bot: true },
+  { user_id: 13, email: 'sole@example.com', full_name: 'Sole Match' },
   { user_id: 42, email: 'impostor@example.com', full_name: 'Pat Sharp' },
   { user_id: 11, email: 'pat@example.com', full_name: 'Pat Sharp' },
+  { user_id: 44, email: 'dupe@example.com', full_name: 'Dupe One' },
+  { user_id: 45, email: 'dupe@example.com', full_name: 'Dupe Two' },
   { user_id: 12, email: 'gone@example.com', full_name: 'Gone Away', is_active: false },
-  { user_id: 13, email: 'sole@example.com', full_name: 'Sole Match' },
+  { user_id: 47, email: 'shared@example.com', full_name: 'Shared Gone', is_active: false },
+  { user_id: 46, email: 'shared@example.com', full_name: 'Shared Live' },
+  { user_id: 48, email: 'ghost@example.com', full_name: 'Twin Name', is_active: false },
+  { user_id: 49, email: 'twin@example.com', full_name: 'Twin Name' },
 ];
 
-describe('zulip resolveIdentity never picks among ambiguous candidates', () => {
-  for (const [name, handle, expected] of [
-    ['an exact email match wins', 'pat@example.com', '11'],
-    ['a full_name shared by two members is ambiguous', 'Pat Sharp', 'Pat Sharp'],
-    ['a deactivated member is not a match', 'Gone Away', 'Gone Away'],
-    ['a unique active full_name resolves', 'Sole Match', '13'],
-    ['an unknown handle degrades to the string convention', 'nobody', 'nobody'],
-  ]) {
-    it(String(name), async () => {
+/**
+ * Every resolution branch × every directory hazard. A handle resolves to a `user_id` only when
+ * exactly ONE active member carries it; everything else degrades to the string convention, because
+ * handing back the wrong `user_id` lets one participant address another's account.
+ */
+const HAZARDS: Array<{
+  hazard: string;
+  email: { handle: string; expected: string };
+  fullName: { handle: string; expected: string };
+}> = [
+  {
+    hazard: 'the sole active carrier',
+    email: { handle: 'pat@example.com', expected: '11' },
+    fullName: { handle: 'Sole Match', expected: '13' },
+  },
+  {
+    hazard: 'carried by two active members',
+    email: { handle: 'dupe@example.com', expected: 'dupe@example.com' },
+    fullName: { handle: 'Pat Sharp', expected: 'Pat Sharp' },
+  },
+  {
+    hazard: 'carried only by a deactivated member',
+    email: { handle: 'gone@example.com', expected: 'gone@example.com' },
+    fullName: { handle: 'Gone Away', expected: 'Gone Away' },
+  },
+  {
+    hazard: 'carried by one active and one deactivated member',
+    email: { handle: 'shared@example.com', expected: '46' },
+    fullName: { handle: 'Twin Name', expected: '49' },
+  },
+  {
+    hazard: 'carried by nobody',
+    email: { handle: 'nobody@example.com', expected: 'nobody@example.com' },
+    fullName: { handle: 'Nobody At All', expected: 'Nobody At All' },
+  },
+];
+
+const RESOLUTIONS = HAZARDS.flatMap((row) => [
+  { branch: 'email', hazard: row.hazard, ...row.email },
+  { branch: 'full_name', hazard: row.hazard, ...row.fullName },
+]);
+
+describe('zulip resolveIdentity never picks among ambiguous or stale candidates', () => {
+  for (const row of RESOLUTIONS) {
+    it(`a handle that is ${row.branch} ${row.hazard} → ${row.expected}`, async () => {
       const { plugin } = await boot({ members: DIRECTORY });
-      expect(await plugin.resolveIdentity(asHandle(String(handle)))).toEqual({
-        handle,
-        backendRef: expected,
+      expect(await plugin.resolveIdentity(asHandle(row.handle))).toEqual({
+        handle: row.handle,
+        backendRef: row.expected,
       });
     });
   }

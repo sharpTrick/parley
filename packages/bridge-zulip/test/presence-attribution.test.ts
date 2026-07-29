@@ -1,10 +1,9 @@
 /**
  * The README's "Multiple concurrent sessions" section makes claims about who a peer looks like on
- * this backend, and the presence roster keys peers by a message's SENDER. Zulip stamps the sender
- * from the authenticated bot, so `post`'s `identity` never reaches it — and the README says so.
- * These rows pin that observable against the two deployments the README describes, so the prose and
- * the wire cannot drift: a change that made `identity` survive would fail here and force the
- * paragraph to be rewritten.
+ * this backend. The seam fact underneath them is that Zulip stamps the sender from the authenticated
+ * bot, so `post`'s `identity` never reaches `Message.senderHandle`. These rows pin that observable
+ * against the two deployments the README describes, so the prose and the wire cannot drift: a change
+ * that made `identity` survive would fail here and force the paragraph to be rewritten.
  */
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';

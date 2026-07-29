@@ -1,0 +1,140 @@
+/**
+ * CLASS: no shape a server-controlled field can arrive in may throw out of the seam. The plugin
+ * declares wire types for a Zulip message record, but nothing on the wire is obliged to honour them
+ * — a `timestamp` outside `Date`'s range reaches `toISOString`, a non-string `content` reaches core's
+ * mention parser, and either throw escapes `fetchRecent`, which means catch-up fails identically on
+ * every subsequent start rather than once. An `id` is the one field that cannot be coerced (it is
+ * BOTH the dedup key and the cursor), so an unusable one drops the record instead of minting a
+ * `'NaN'` cursor the next `anchor` cannot use.
+ *
+ * The table is the cross product of every field a server controls and every shape the declaration
+ * says it cannot hold, so a field added to the wire type meets the whole hazard list by adding one
+ * name; the push case then drives the same gauntlet through a LIVE event queue, because the read
+ * path and the loop normalize the record at two different call sites.
+ */
+import { asTopic, type Message } from '@sharptrick/parley-core';
+import { describe, expect, it, vi } from 'vitest';
+import { rand, SENDER, sleep, useZulip } from './harness.js';
+
+const boot = useZulip();
+
+/** Every server-controlled field of a Zulip message record the plugin reads. */
+const FIELDS = ['id', 'content', 'sender_email', 'timestamp'] as const;
+
+/** Shapes the declared wire types say cannot arrive. Names double as the test titles. */
+const HAZARDS: Array<{ name: string; value: unknown }> = [
+  { name: 'missing', value: undefined },
+  { name: 'null', value: null },
+  { name: 'zero', value: 0 },
+  { name: 'negative', value: -1 },
+  { name: 'fractional', value: 1.5 },
+  { name: 'past the Date range', value: 1e18 },
+  { name: 'before the Date range', value: -1e18 },
+  { name: 'NaN', value: Number.NaN },
+  { name: 'Infinity', value: Number.POSITIVE_INFINITY },
+  { name: 'a string', value: 'nope' },
+  { name: 'an empty string', value: '' },
+  { name: 'an object', value: { nested: true } },
+  { name: 'an array', value: [1, 2] },
+  { name: 'a boolean', value: true },
+  { name: 'a huge string', value: 'x'.repeat(70_000) },
+  { name: 'non-ASCII around a control character', value: '\u{1F600}\u0000caf\u00e9' },
+];
+
+/** Everything above the seam relies on; a Message that fails any of these is not usable. */
+function expectWellFormed(m: Message): void {
+  expect(typeof m.content).toBe('string');
+  expect(typeof m.senderHandle).toBe('string');
+  expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
+  expect(m.backendMsgId.length).toBeGreaterThan(0);
+  expect(m.cursor).toBe(String(Number(m.cursor)));
+  expect(Number(m.cursor)).toBeGreaterThan(0);
+  expect(Array.isArray(m.mentions)).toBe(true);
+}
+
+describe('a hostile record shape never throws out of fetchRecent', () => {
+  for (const field of FIELDS) {
+    // Only `id` decides whether the record is usable at all; every other field is coerced.
+    const dropped = field === 'id';
+    it(`every hazard shape of \`${field}\` is ${dropped ? 'dropped' : 'normalized'}`, async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const { plugin, fake } = await boot();
+      for (const hazard of HAZARDS) {
+        const where = `${field} = ${hazard.name}`;
+        const topic = asTopic(`hostile-${rand()}`);
+        fake.injectRaw({ topic, fields: { [field]: hazard.value } });
+
+        const { messages, nextCursor } = await plugin.fetchRecent({ topic });
+        expect(messages, where).toHaveLength(dropped ? 0 : 1);
+        for (const m of messages) expectWellFormed(m);
+        expect(typeof nextCursor, where).toBe('string');
+
+        // …and the same record read a second time, exclusively, cannot resurrect or duplicate it.
+        const after = await plugin.fetchRecent({ topic, since: nextCursor });
+        expect(after.messages, where).toEqual([]);
+      }
+    }, 20_000);
+  }
+
+  it('a messages response that is not an object with an array under `messages` reads as empty', async () => {
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`hostile-body-${rand()}`);
+    for (const body of [{}, { result: 'success' }, { result: 'success', messages: null }]) {
+      fake.failRoute('GET /api/v1/messages', { status: 200, body, times: 1 });
+      expect(await plugin.fetchRecent({ topic })).toEqual({ messages: [], nextCursor: '0' });
+    }
+  });
+
+  it('a post whose response carries no usable id fails loudly instead of minting one', async () => {
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`hostile-post-${rand()}`);
+    for (const body of [{ result: 'success' }, { result: 'success', id: 'seven' }]) {
+      fake.failRoute('POST /api/v1/messages', { status: 200, body, times: 1 });
+      await expect(plugin.post(topic, SENDER, 'x')).rejects.toThrow('usable message id');
+    }
+  });
+
+  it('a register whose response carries no usable queue_id fails loudly instead of polling one', async () => {
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`hostile-reg-${rand()}`);
+    fake.failRoute('POST /api/v1/register', {
+      status: 200,
+      body: { result: 'success', last_event_id: -1 },
+      times: 1,
+    });
+    await expect(plugin.subscribe(topic, () => undefined)).rejects.toThrow('usable queue_id');
+  });
+});
+
+describe('a live push loop survives the same gauntlet', () => {
+  it('every hostile shape in sequence leaves the loop delivering and the process clean', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const rejections: unknown[] = [];
+    const collect = (err: unknown): void => void rejections.push(err);
+    process.on('unhandledRejection', collect);
+    try {
+      const { plugin, fake } = await boot();
+      const topic = asTopic(`hostile-push-${rand()}`);
+      const got: Message[] = [];
+      await plugin.subscribe(topic, (m) => got.push(m));
+
+      for (const field of FIELDS) {
+        for (const hazard of HAZARDS) {
+          fake.injectRaw({ topic, fields: { [field]: hazard.value } });
+          await sleep(2);
+        }
+      }
+      await sleep(400);
+      await plugin.post(topic, SENDER, 'still alive');
+      await sleep(600);
+
+      for (const m of got) expectWellFormed(m);
+      expect(got.at(-1)?.content).toBe('still alive');
+      // One delivery per hazard for every coercible field, none for the unusable ids, plus the probe.
+      expect(got).toHaveLength((FIELDS.length - 1) * HAZARDS.length + 1);
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', collect);
+    }
+  }, 30_000);
+});

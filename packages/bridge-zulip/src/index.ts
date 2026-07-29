@@ -14,7 +14,12 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay, fetchWithRetry, retryAfterFromHeader } from '@sharptrick/parley-net-util';
+import {
+  DEFAULT_DEADLINE_MS,
+  delay,
+  fetchWithRetry,
+  retryAfterFromHeader,
+} from '@sharptrick/parley-net-util';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -57,7 +62,6 @@ interface EventsResponse {
   events?: ZulipEvent[];
 }
 
-/** Per-subscription live state; `queueId` is mutable because a GC'd queue is re-registered. */
 interface QueueState {
   queueId: string;
 }
@@ -109,6 +113,18 @@ const DEFAULT_EVENTS_TIMEOUT_MS = 25_000;
 const BLOCKED_FETCH_RETRY_MS = 400;
 
 /**
+ * Wall-clock budget for a request that asks the server to PARK for `blockMs`. Keep every parking
+ * request on this, so that the shared {@link DEFAULT_DEADLINE_MS} never severs a healthy idle
+ * long-poll: an aborted-but-uncapped poll reads to the loop as a backend failure, and the whole
+ * documented `events_timeout_ms` range above 30s would degrade into escalating backoff instead.
+ */
+export const longPollDeadlineMs = (blockMs: number): number =>
+  Math.max(0, blockMs) + DEFAULT_DEADLINE_MS;
+
+/** Largest offset `Date` can represent; past it `toISOString()` throws a RangeError. */
+const MAX_TIMESTAMP_MS = 8.64e15;
+
+/**
  * Messages a single gap-fill history read asks for. Exported so a test's dead-window sizes stay
  * derived from it and cannot stop straddling a page boundary if it changes.
  */
@@ -133,11 +149,8 @@ export const GAP_FILL_PAGE = 500;
  * — two Parley topics differing only in case, or a name over 60 characters, would otherwise share
  * or silently rewrite a history.
  *
- * ONE INEXACTNESS to know about: Zulip topics are MUTABLE namespaces — admins (and, by default
- * policy, members) can move or rename messages between topics after the fact. Message ids and
- * cursors survive a move, but topic *membership* can drift: a moved message silently leaves one
- * Parley topic's history and appears in another's. Ids/cursors stay valid; topic isolation is
- * only as strong as the server's move policy.
+ * Topic isolation is only as strong as the server's message-move policy — see README, "The one
+ * inexactness: topics are mutable".
  */
 export class ZulipPlugin implements BackendPlugin {
   private baseUrl = 'http://127.0.0.1:9991';
@@ -194,7 +207,7 @@ export class ZulipPlugin implements BackendPlugin {
     const cfg = config as ZulipBackendConfig;
     this.baseUrl = requireHttpUrl(orDefault(cfg.site_url, 'http://127.0.0.1:9991'));
     this.email = requireNonEmpty('email', orDefault(cfg.email, 'parley-bot@localhost'));
-    this.apiKey = requireNonEmpty('api_key', orDefault(cfg.api_key, 'parley-api-key'));
+    this.apiKey = requireNonEmpty('api_key', orDefault(cfg.api_key, 'parley-api-key'), true);
     this.stream = requireNonEmpty('stream', orDefault(cfg.stream, 'parley'));
     this.eventsTimeoutMs = requireEventsTimeout(cfg.events_timeout_ms);
     this.claimedWireTopics.clear();
@@ -290,8 +303,7 @@ export class ZulipPlugin implements BackendPlugin {
   /**
    * `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) → the new message `id`.
    * `identity` is informational only: Zulip stamps the sender from the authenticated bot account
-   * (see README "Multiple concurrent sessions"). `opts.inReplyTo` is ignored — Zulip has no
-   * per-message reply parent; it threads BY topic, and the topic is already the addressing unit.
+   * (see README "Multiple concurrent sessions"). `opts.inReplyTo` is ignored: Zulip threads by topic.
    */
   async post(
     topic: Topic,
@@ -303,8 +315,13 @@ export class ZulipPlugin implements BackendPlugin {
     const res = await this.http('POST', '/api/v1/messages', {
       form: { type: 'stream', to: this.stream, topic: this.wireTopic(topic), content },
     });
-    const json = (await res.json()) as { id: number };
-    return asBackendMsgId(String(json.id));
+    const id = ((await res.json()) as { id?: number } | null)?.id;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+      throw new Error(
+        `Zulip POST /api/v1/messages answered without a usable message id (got ${JSON.stringify(id)})`,
+      );
+    }
+    return asBackendMsgId(String(id));
   }
 
   /**
@@ -317,12 +334,9 @@ export class ZulipPlugin implements BackendPlugin {
     this.require();
     const limit = args.limit ?? 100;
     let messages = await this.fetchMessages(args.topic, args.since, limit);
-    // Native long-poll: only when the exclusive `since` query came back EMPTY and the caller asked
-    // to block. With no `since` there is no cursor to advance past, so we never block (matches the
-    // seam's "default recent window returns at once"). Returning early/empty stays safe — core's
-    // generic wrapper polls the remaining budget — so this only ever SHORTENS the wait.
-    if (messages.length === 0 && args.since !== undefined && (args.blockMs ?? 0) > 0) {
-      messages = await this.blockingFetch(args.topic, args.since, limit, args.blockMs as number);
+    const blockMs = args.blockMs ?? 0;
+    if (messages.length === 0 && args.since !== undefined && blockMs > 0) {
+      messages = await this.blockingFetch(args.topic, args.since, limit, blockMs);
     }
     const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');
     return { messages, nextCursor };
@@ -455,6 +469,7 @@ export class ZulipPlugin implements BackendPlugin {
         },
         signal: bound.signal,
         allowStatuses: [400],
+        deadlineMs: longPollDeadlineMs(deadline - Date.now()),
       });
       // Keep the pace on a non-2xx, so that a queue the server rejects outright — answering at once
       // instead of blocking — cannot turn the caller's retries into a spin.
@@ -603,124 +618,147 @@ export class ZulipPlugin implements BackendPlugin {
       );
     };
 
+    /** One pass of the push loop; `false` ends it. */
+    const advance = async (): Promise<boolean> => {
+      // Drain a pending gap-fill BEFORE polling the fresh queue — retry the gap (not the events
+      // poll) until it clears, advancing `lastDeliveredId`/`needsGapFillFrom` per delivered page
+      // so a mid-pagination throw keeps its progress and a retry resumes past delivered pages.
+      if (needsGapFillFrom !== undefined) {
+        try {
+          lastDeliveredId = await this.gapFill(
+            topic,
+            needsGapFillFrom,
+            deliver,
+            (id) => {
+              lastDeliveredId = id;
+              needsGapFillFrom = id;
+              this.wake(topic); // gap-fill is also a delivery — release blocked fetchers
+            },
+            signal,
+          );
+          needsGapFillFrom = undefined; // gap closed — resume normal polling
+          promote();
+        } catch {
+          if (!alive()) return false;
+          await backoff('gap-fill history read failed');
+        }
+        return true; // re-check liveness / re-attempt before polling the fresh queue
+      }
+      const controller = new AbortController();
+      this.controllers.add(controller);
+      // Client-side long-poll cap so the loop re-checks shutdown; un-acked events survive.
+      let capped = false;
+      const timer = setTimeout(() => {
+        capped = true;
+        controller.abort();
+      }, this.eventsTimeoutMs);
+      let json: EventsResponse;
+      try {
+        const res = await this.http('GET', '/api/v1/events', {
+          query: {
+            queue_id: state.queueId,
+            last_event_id: String(lastEventId),
+            dont_block: 'false',
+          },
+          signal: controller.signal,
+          allowStatuses: [400],
+          deadlineMs: longPollDeadlineMs(this.eventsTimeoutMs),
+        });
+        json = ((await res.json()) as EventsResponse | null) ?? {};
+      } catch {
+        if (!alive()) return false;
+        // Keep the `capped` branch, so that the healthy idle poll cap is never mistaken for a
+        // failure and escalated into backoff on every long-poll cycle. A server that PARKED the
+        // poll long enough to be capped accepted the queue — a stale one is rejected at once.
+        if (capped) {
+          queueProven = true;
+          recovered();
+        } else await backoff('events long-poll failed');
+        return true;
+      } finally {
+        clearTimeout(timer);
+        this.controllers.delete(controller);
+      }
+      if (!alive()) return false;
+      if (json.result === 'error') {
+        if (json.code === 'BAD_EVENT_QUEUE_ID') {
+          // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
+          try {
+            const superseded = state.queueId;
+            const fresh = await this.register(topic, signal);
+            this.deleteQueueDetached(superseded);
+            state.queueId = fresh.queue_id;
+            lastEventId = fresh.last_event_id;
+            needsGapFillFrom = lastDeliveredId;
+            // A queue rejected before it ever answered a poll is a FAILING recovery, not a
+            // completed one: pace it, so that a server rejecting every queue it mints cannot be
+            // flooded with fresh registrations by its own error.
+            if (queueProven) promote();
+            else await backoff('a freshly registered event queue was rejected as stale');
+            queueProven = false;
+          } catch {
+            if (!alive()) return false;
+            await backoff('re-register after queue GC failed');
+          }
+        } else {
+          await backoff(`events poll returned ${json.code ?? 'an error'}`);
+        }
+        return true;
+      }
+      queueProven = true;
+      recovered();
+      let sawMessage = false;
+      for (const ev of asArray(json.events)) {
+        if (typeof ev?.id === 'number' && ev.id > lastEventId) lastEventId = ev.id; // ack heartbeats too
+        if (ev?.type !== 'message') continue;
+        const m = zulipToMessage(topic, ev.message);
+        if (m === undefined) continue;
+        sawMessage = true; // a message landed on this topic — release any blocked fetchers
+        const id = Number(m.backendMsgId);
+        if (id <= lastDeliveredId) continue; // already gap-filled — dedup
+        lastDeliveredId = id;
+        deliver(m);
+      }
+      // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
+      // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
+      if (sawMessage) this.wake(topic);
+      return true;
+    };
+
     const loop = async (): Promise<void> => {
       while (alive()) {
-        // Drain a pending gap-fill BEFORE polling the fresh queue — retry the gap (not the events
-        // poll) until it clears, advancing `lastDeliveredId`/`needsGapFillFrom` per delivered page
-        // so a mid-pagination throw keeps its progress and a retry resumes past delivered pages.
-        if (needsGapFillFrom !== undefined) {
-          try {
-            lastDeliveredId = await this.gapFill(
-              topic,
-              needsGapFillFrom,
-              deliver,
-              (id) => {
-                lastDeliveredId = id;
-                needsGapFillFrom = id;
-                this.wake(topic); // gap-fill is also a delivery — release blocked fetchers
-              },
-              signal,
-            );
-            needsGapFillFrom = undefined; // gap closed — resume normal polling
-            promote();
-          } catch {
-            if (!alive()) break;
-            await backoff('gap-fill history read failed');
-          }
-          continue; // re-check liveness / re-attempt before polling the fresh queue
-        }
-        const controller = new AbortController();
-        this.controllers.add(controller);
-        // Client-side long-poll cap so the loop re-checks shutdown; un-acked events survive.
-        let capped = false;
-        const timer = setTimeout(() => {
-          capped = true;
-          controller.abort();
-        }, this.eventsTimeoutMs);
-        let json: EventsResponse;
+        // Keep the catch around the WHOLE pass, so that no throw a server's payload can provoke —
+        // outside the awaits that guard themselves — ends push for this topic or escapes as an
+        // unhandled rejection that takes the MCP process with it.
         try {
-          const res = await this.http('GET', '/api/v1/events', {
-            query: {
-              queue_id: state.queueId,
-              last_event_id: String(lastEventId),
-              dont_block: 'false',
-            },
-            signal: controller.signal,
-            allowStatuses: [400],
-          });
-          json = (await res.json()) as EventsResponse;
-        } catch {
+          if (!(await advance())) break;
+        } catch (err) {
           if (!alive()) break;
-          // Keep the `capped` branch, so that the healthy idle poll cap is never mistaken for a
-          // failure and escalated into backoff on every long-poll cycle. A server that PARKED the
-          // poll long enough to be capped accepted the queue — a stale one is rejected at once.
-          if (capped) {
-            queueProven = true;
-            recovered();
-          } else await backoff('events long-poll failed');
-          continue;
-        } finally {
-          clearTimeout(timer);
-          this.controllers.delete(controller);
+          await backoff(`an unexpected push-loop failure: ${String(err)}`);
         }
-        if (!alive()) break;
-        if (json.result === 'error') {
-          if (json.code === 'BAD_EVENT_QUEUE_ID') {
-            // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
-            try {
-              const superseded = state.queueId;
-              const fresh = await this.register(topic, signal);
-              this.deleteQueueDetached(superseded);
-              state.queueId = fresh.queue_id;
-              lastEventId = fresh.last_event_id;
-              needsGapFillFrom = lastDeliveredId;
-              // A queue rejected before it ever answered a poll is a FAILING recovery, not a
-              // completed one: pace it, so that a server rejecting every queue it mints cannot be
-              // flooded with fresh registrations by its own error.
-              if (queueProven) promote();
-              else await backoff('a freshly registered event queue was rejected as stale');
-              queueProven = false;
-            } catch {
-              if (!alive()) break;
-              await backoff('re-register after queue GC failed');
-            }
-          } else {
-            await backoff(`events poll returned ${json.code ?? 'an error'}`);
-          }
-          continue;
-        }
-        queueProven = true;
-        recovered();
-        let sawMessage = false;
-        for (const ev of json.events ?? []) {
-          if (ev.id > lastEventId) lastEventId = ev.id; // ack everything, incl. heartbeats
-          if (ev.type !== 'message' || ev.message === undefined) continue;
-          sawMessage = true; // a message landed on this topic — release any blocked fetchers
-          if (ev.message.id <= lastDeliveredId) continue; // already gap-filled — dedup
-          lastDeliveredId = ev.message.id;
-          deliver(zulipToMessage(topic, ev.message));
-        }
-        // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
-        // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
-        if (sawMessage) this.wake(topic);
       }
     };
-    const running = loop().finally(() => {
-      entry.loops--;
-      if (!degraded) entry.healthy--;
-      if (entry.loops > 0) return;
-      if (this.waiters.get(topic) === entry) this.waiters.delete(topic);
-      for (const wake of [...entry.wakes]) wake(); // no loop left to wake them
-    });
+    const running = loop()
+      .finally(() => {
+        entry.loops--;
+        if (!degraded) entry.healthy--;
+        if (entry.loops > 0) return;
+        if (this.waiters.get(topic) === entry) this.waiters.delete(topic);
+        for (const wake of [...entry.wakes]) wake(); // no loop left to wake them
+      })
+      // Keep this catch LAST even with nothing left to report, so that a throw from the loop's own
+      // failure reporting or from the bookkeeping above cannot reach Node as an uncaught exception
+      // and take the MCP stdio server down with it.
+      .catch(() => undefined);
     this.loopExits.add(running);
     void running.finally(() => this.loopExits.delete(running));
   }
 
   /**
    * Real account lookup (DESIGN §4): `GET /api/v1/users` → `backendRef` = the Zulip `user_id`.
-   * `email` is unique per realm, so it resolves outright; `full_name` is a user-settable, NON-unique
-   * display name, so it resolves only when exactly one ACTIVE member carries it — an ambiguous or
-   * deactivated match degrades to the string convention rather than letting whoever the server
+   * `email` is unique per realm and `full_name` is a user-settable, NON-unique display name, but
+   * BOTH branches resolve only when exactly one ACTIVE member carries the handle: an ambiguous or
+   * deactivated-only match degrades to the string convention rather than letting whoever the server
    * happens to list first claim another participant's handle. Any error degrades the same way.
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
@@ -731,10 +769,12 @@ export class ZulipPlugin implements BackendPlugin {
         members: Array<{ user_id: number; email: string; full_name: string; is_active?: boolean }>;
       };
       const active = members.filter((u) => u.is_active !== false);
-      const byEmail = active.find((u) => u.email === handle);
-      if (byEmail !== undefined) return { handle, backendRef: String(byEmail.user_id) };
-      const byName = active.filter((u) => u.full_name === handle);
-      if (byName.length === 1) return { handle, backendRef: String(byName[0]!.user_id) };
+      const byEmail = active.filter((u) => u.email === handle);
+      if (byEmail.length === 1) return { handle, backendRef: String(byEmail[0]!.user_id) };
+      if (byEmail.length === 0) {
+        const byName = active.filter((u) => u.full_name === handle);
+        if (byName.length === 1) return { handle, backendRef: String(byName[0]!.user_id) };
+      }
     } catch {
       /* lookup is best-effort; fall through to the string convention */
     }
@@ -799,15 +839,24 @@ export class ZulipPlugin implements BackendPlugin {
         apply_markdown: 'false', // raw content, not rendered HTML
       };
       const res = await this.http('GET', '/api/v1/messages', { query, signal });
-      const { messages } = (await res.json()) as { messages: ZulipMessage[] };
-      const got = messages.map((m) => zulipToMessage(topic, m)); // Zulip returns ascending by id
+      const raw = asArray(((await res.json()) as { messages?: ZulipMessage[] } | null)?.messages);
+      const got = raw.flatMap((m) => zulipToMessage(topic, m) ?? []); // Zulip returns ascending by id
+      if (got.length < raw.length) {
+        console.warn(
+          `[parley-zulip] dropped ${raw.length - got.length} of ${raw.length} records read from ` +
+            `topic ${JSON.stringify(topic)}: no usable message id, so neither the dedup key nor ` +
+            'the cursor can be derived',
+        );
+      }
       // Keep the unshift: pages from the newest anchor walk BACKWARDS, so appending would
       // return the window in descending page order.
       if (since === undefined) out.unshift(...got);
       else out.push(...got);
       remaining -= got.length;
       const edge = since === undefined ? got[0] : got.at(-1);
-      if (got.length < page || edge === undefined) break;
+      // Keep this on the RAW count, so that dropping one unusable record cannot be mistaken for the
+      // end of history and silently truncate the window a caller asked for.
+      if (raw.length < page || edge === undefined) break;
       anchor = String(edge.cursor);
       includeAnchor = false;
     }
@@ -830,7 +879,16 @@ export class ZulipPlugin implements BackendPlugin {
         apply_markdown: 'false',
       },
     });
-    return (await res.json()) as { queue_id: string; last_event_id: number };
+    const reg = (await res.json()) as { queue_id?: unknown; last_event_id?: unknown } | null;
+    const queueId = reg?.queue_id;
+    const lastEventId = reg?.last_event_id;
+    if (typeof queueId !== 'string' || queueId === '' || typeof lastEventId !== 'number') {
+      throw new Error(
+        'Zulip POST /api/v1/register answered without a usable queue_id/last_event_id ' +
+          `(got ${JSON.stringify({ queue_id: queueId, last_event_id: lastEventId })})`,
+      );
+    }
+    return { queue_id: queueId, last_event_id: lastEventId };
   }
 
   /**
@@ -882,6 +940,7 @@ export class ZulipPlugin implements BackendPlugin {
       query?: Record<string, string>;
       signal?: AbortSignal;
       allowStatuses?: number[];
+      deadlineMs?: number;
     },
   ): Promise<Response> {
     const qs = opts?.query !== undefined ? `?${new URLSearchParams(opts.query)}` : '';
@@ -907,6 +966,7 @@ export class ZulipPlugin implements BackendPlugin {
         isStopped: () => this.stopped,
         retryAfterOf: readRetryAfter,
         allowStatuses: opts?.allowStatuses,
+        deadlineMs: opts?.deadlineMs,
       },
     );
   }
@@ -924,14 +984,34 @@ function isPlaintextRemote(baseUrl: string): boolean {
   }
 }
 
-function zulipToMessage(topic: Topic, m: ZulipMessage): Message {
+/**
+ * Normalize one server-controlled record into a {@link Message}, or `undefined` when its `id` — the
+ * dedup key AND the cursor — is not a usable Zulip message id. Every other field is coerced rather
+ * than trusted: a non-string `content` reaches core's mention parser and a non-numeric `timestamp`
+ * reaches `Date#toISOString`, either of which throws, and a throw here escapes `fetchRecent` and
+ * bricks catch-up on every subsequent start.
+ */
+function zulipToMessage(topic: Topic, m: ZulipMessage | undefined | null): Message | undefined {
+  if (m === undefined || m === null) return undefined;
+  const { id } = m;
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return undefined;
   return buildMessage({
     topic,
-    sender: m.sender_email ?? '',
-    content: m.content ?? '',
-    timestamp: new Date((m.timestamp ?? 0) * 1000).toISOString(),
-    id: String(m.id),
+    sender: typeof m.sender_email === 'string' ? m.sender_email : '',
+    content: typeof m.content === 'string' ? m.content : '',
+    timestamp: isoTimestamp(m.timestamp),
+    id: String(id),
   });
+}
+
+/** Zulip timestamps are Unix SECONDS; an out-of-range or non-numeric one falls back to the epoch. */
+function isoTimestamp(seconds: unknown): string {
+  const ms = typeof seconds === 'number' ? seconds * 1000 : Number.NaN;
+  return new Date(Number.isFinite(ms) && Math.abs(ms) <= MAX_TIMESTAMP_MS ? ms : 0).toISOString();
+}
+
+function asArray<T>(value: T[] | undefined): T[] {
+  return Array.isArray(value) ? value : [];
 }
 
 /**
@@ -979,11 +1059,25 @@ function requireHttpUrl(raw: unknown): string {
   return trimmed;
 }
 
-function requireNonEmpty(key: string, value: unknown): string {
+/**
+ * `secret: true` reports the offending SHAPE instead of the value. Keep it on for every credential,
+ * so that a mistyped `api_key` (a bare number in YAML) is not echoed into stderr and the tool
+ * result core hands the model.
+ */
+function requireNonEmpty(key: string, value: unknown, secret = false): string {
   if (typeof value !== 'string' || value.trim() === '') {
-    throw new Error(`backend_config.${key} must be a non-empty string (got ${JSON.stringify(value)})`);
+    const got = secret ? describeShape(value) : JSON.stringify(value);
+    throw new Error(`backend_config.${key} must be a non-empty string (got ${got})`);
   }
   return value;
+}
+
+/** Enough of a value to debug the wrong shape, never enough to disclose it. */
+function describeShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `an array of ${value.length}`;
+  if (typeof value === 'string') return `a ${value.length}-character string`;
+  return `a ${typeof value}`;
 }
 
 /**

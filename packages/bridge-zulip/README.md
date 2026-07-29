@@ -34,11 +34,10 @@ serves this natively via the `/api/v1/events` event-queue long-poll. Core caps t
 `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Zulip stamps the
-> sender from the authenticated bot account, so a message's sender is always that bot's **email**,
-> never your `identity.handle`. That is not just a transcript detail — it is also what the presence
-> roster (`parley_list_users`) is keyed by; see "Multiple concurrent sessions". **`inReplyTo` is
-> ignored too:** Zulip has no per-message reply parent; it threads *by topic*, and the topic is
-> already Parley's addressing unit.
+> sender from the authenticated bot account, so a message's `senderHandle` is always that bot's
+> **email**, never your `identity.handle` — see "Multiple concurrent sessions" for what that costs
+> transcripts. **`inReplyTo` is ignored too:** Zulip has no per-message reply parent; it threads
+> *by topic*, and the topic is already Parley's addressing unit.
 
 ## Topic names: case-folded, 60 characters, validated
 
@@ -110,22 +109,18 @@ provision a **distinct bot per session** if you want per-session attribution in 
 the same role `identity.handle` plays for SQLite/Redis/NATS, just carried in `backend_config`.
 `events_timeout_ms` is safe to vary per session.
 
-### What this costs the presence roster
+### What this costs, and what it does not
 
-The presence roster behind `parley_list_users` is keyed by the message sender, which on Zulip is
-the bot email. Concretely, on this backend:
+What it costs is **transcript attribution**: every message a session posts reads as its bot's email,
+so with one shared bot you cannot tell two sessions apart in the history. A distinct bot per session
+buys that back; naming the bots after your handles makes the transcript read like your config.
 
-- **Sessions sharing one bot merge into a single roster entry** whose `topics` are the *union* of
-  every sharing session's reach — one peer that does not exist, advertising more than any real
-  session can serve.
-- **No session is discoverable by its configured `identity.handle`.** A hand-off addressed to a
-  handle you read out of a config file will not match anything the roster reports.
-- **A distinct bot per session fixes the merging but not the naming**: each session becomes its own
-  roster entry keyed by *its bot's email*, still not by `identity.handle`. If you want the roster to
-  read like your handles, name the bots after them.
-
-This is a property of Zulip's sender model, not of your configuration — there is no per-message
-sender override for a bot account.
+What it does **not** cost is the presence roster. `parley_list_users` keys a peer by the handle each
+presence beat *carries in its own payload*, falling back to the message sender only for a beat
+emitted before that field existed — so sessions sharing one bot still appear as separate peers, each
+under its configured `identity.handle`, and a hand-off addressed to a handle from a config file
+resolves. This is a property of Zulip's sender model reaching only as far as the sender field: there
+is no per-message sender override for a bot account, and none is needed for reachability.
 
 ## Retention (server-side, not configured by this plugin)
 

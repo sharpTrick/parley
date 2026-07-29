@@ -36,7 +36,7 @@ export const SERVER_CONSTRAINTS = {
  * `apply_markdown=false` gets HTML instead of source text and cannot mistake one for the other.
  */
 export function renderMarkdown(source: string): string {
-  const escaped = source.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const escaped = String(source).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<p>${escaped
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/@([\w.-]+)/g, '<span class="user-mention">@$1</span>')}</p>`;
@@ -93,10 +93,16 @@ const DEFAULT_CREDENTIALS: FakeCredentials[] = [
   { email: 'parley-bot@localhost', apiKey: 'parley-api-key' },
 ];
 
-/** A forced non-2xx for every request on a route, e.g. a revoked key (401) or an outage (500). */
+/**
+ * A forced response for every request on a route, e.g. a revoked key (401) or an outage (500). The
+ * status may be 200: a server answering a route with a well-formed HTTP 200 whose BODY is the wrong
+ * shape is the hazard a status code cannot model.
+ */
 export interface RouteFailure {
   status: number;
   body?: Record<string, unknown>;
+  /** Requests to answer this way before the route behaves normally again; omitted = until cleared. */
+  times?: number;
 }
 
 /**
@@ -144,6 +150,14 @@ export interface FakeZulip {
   setResponseHook(hook: ((route: string) => void) | undefined): void;
   /** Deliver a message without going through the plugin (a third party posting concurrently). */
   injectMessage(opts: { topic: string; content: string; stream?: string; sender?: string }): number;
+  /**
+   * Deliver a record whose FIELDS are not the wire types the plugin declares — a server version, a
+   * proxy or a hostile realm member handing back a shape the type annotation promised could not
+   * happen. It reaches the history read AND any queue narrowed to `topic`, so one injection grades
+   * both the catch-up and the push path. Routing still uses `topic`, so the record lands where the
+   * test expects however mangled its own fields are.
+   */
+  injectRaw(opts: { topic: string; fields: Record<string, unknown>; stream?: string }): void;
   close(): Promise<void>;
 }
 
@@ -168,7 +182,9 @@ export async function startFakeZulip(opts?: {
   const messages: WireMessage[] = []; // ascending by id by construction
   const queues = new Map<string, Queue>();
 
-  const fold = (s: string): string => s.toLowerCase();
+  // Keep the coercion, so that a deliberately mangled routing field cannot make the FAKE throw and
+  // report a plugin defect that is really a fixture defect.
+  const fold = (s: string): string => String(s).toLowerCase();
 
   const dropWaiter = (q: Queue, destroy: boolean): void => {
     const w = q.waiter;
@@ -194,17 +210,22 @@ export async function startFakeZulip(opts?: {
       msg: `Bad event queue id: ${queueId}`,
     });
 
-  const append = (m: Omit<WireMessage, 'id' | 'type' | 'timestamp'>): number => {
-    const msg: WireMessage = {
+  const append = (
+    m: Omit<WireMessage, 'id' | 'type' | 'timestamp'>,
+    fields?: Record<string, unknown>,
+  ): number => {
+    const routing = { stream: m.display_recipient, topic: m.subject };
+    const msg = {
       ...m,
       id: ++msgSeq,
       type: 'stream',
       timestamp: Math.floor(Date.now() / 1000),
-    };
+      ...fields,
+    } as WireMessage;
     messages.push(msg);
     for (const q of queues.values()) {
-      if (fold(q.stream) !== fold(msg.display_recipient)) continue;
-      if (fold(q.topic) !== fold(msg.subject)) continue;
+      if (fold(q.stream) !== fold(routing.stream)) continue;
+      if (fold(q.topic) !== fold(routing.topic)) continue;
       q.events.push({ id: q.eventSeq++, type: 'message', message: msg });
       const w = q.waiter;
       if (w !== undefined) {
@@ -256,7 +277,8 @@ export async function startFakeZulip(opts?: {
     }
 
     const forced = routeFailures.get(route);
-    if (forced !== undefined) {
+    if (forced !== undefined && (forced.times === undefined || forced.times > 0)) {
+      if (forced.times !== undefined) forced.times--;
       json(res, forced.status, forced.body ?? { result: 'error', msg: `forced ${forced.status}` });
       return;
     }
@@ -426,7 +448,7 @@ export async function startFakeZulip(opts?: {
       failMessagesReadsRemaining = n;
     },
     failRoute: (route, failure) => {
-      routeFailures.set(route, failure);
+      routeFailures.set(route, { ...failure });
       for (const q of queues.values()) dropWaiter(q, true);
     },
     hangRoute: (route) => hangRoutes.add(route),
@@ -450,6 +472,18 @@ export async function startFakeZulip(opts?: {
         sender_email: sender ?? 'someone@example.com',
         sender_full_name: 'Someone Else',
       }),
+    injectRaw: ({ topic, fields, stream }) => {
+      append(
+        {
+          display_recipient: stream ?? 'parley',
+          subject: truncateTopic(topic),
+          content: 'well-formed',
+          sender_email: 'someone@example.com',
+          sender_full_name: 'Someone Else',
+        },
+        fields,
+      );
+    },
     close: async () => {
       for (const q of queues.values()) dropWaiter(q, true);
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
