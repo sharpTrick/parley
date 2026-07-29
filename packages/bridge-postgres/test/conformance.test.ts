@@ -34,7 +34,7 @@ async function makeContext(table: string) {
   await plugin.connect({ url: PG_URL, table_name: table });
   return {
     plugin,
-    // Postgres honors blockMs natively via LISTEN/NOTIFY (issue #20) — run the long-poll case.
+    // Postgres honors blockMs natively via LISTEN/NOTIFY — run the long-poll case.
     supportsBlockingFetch: true,
     freshTopic: (): Topic =>
       asTopic(`${TOPIC_SHAPES[++seq % TOPIC_SHAPES.length] as string}-${seq}-${rand()}`),

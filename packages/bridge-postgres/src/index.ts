@@ -49,15 +49,83 @@ export interface PostgresBackendConfig {
 }
 
 const DEFAULT_URL = 'postgres://parley:parley@127.0.0.1:5432/parley';
-/** The repo-public credential pair the README's docker snippet provisions (SEC-06). */
+/** The repo-public credential pair the README's docker snippet provisions. */
 const DEFAULT_USER = 'parley';
 const DEFAULT_PASSWORD = 'parley';
+const MIN_POOL_SIZE = 1;
+const MAX_POOL_SIZE = 1000;
 /** How many rows one drain query pulls at most before re-querying. */
 const DRAIN_BATCH = 512;
 /** Backoff between listener reconnect attempts after the connection drops. */
 const RECONNECT_DELAY_MS = 500;
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the pool size. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+const CONFIG_KEYS = ['url', 'table_name', 'pool_size', 'retention_days'] as const;
+
+function bad(key: string, reason: string): Error {
+  return new Error(`parley-postgres: invalid backend_config.${key} — ${reason}`);
+}
+
+function describeValue(v: unknown): string {
+  return typeof v === 'string' ? `'${v}'` : String(v);
+}
+
+/**
+ * Validate `backend_config` before the pool is opened or anything is deleted (§11). Every rejection
+ * names the key and the plugin, and happens before `connect()` has touched the database, so a typo
+ * or a mis-typed retention window can never take an irreversible action.
+ */
+export function validateBackendConfig(config: BackendConfig): PostgresBackendConfig {
+  const cfg = config as Record<string, unknown>;
+  for (const key of Object.keys(cfg)) {
+    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `parley-postgres: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
+      );
+    }
+  }
+
+  const url = cfg['url'];
+  if (url !== undefined && (typeof url !== 'string' || url === '')) {
+    throw bad('url', `expected a non-empty string, got ${describeValue(url)}`);
+  }
+
+  const tableName = cfg['table_name'];
+  if (tableName !== undefined && (typeof tableName !== 'string' || tableName === '')) {
+    throw bad('table_name', `expected a non-empty string, got ${describeValue(tableName)}`);
+  }
+
+  const poolSize = cfg['pool_size'];
+  if (
+    poolSize !== undefined &&
+    (typeof poolSize !== 'number' ||
+      !Number.isInteger(poolSize) ||
+      poolSize < MIN_POOL_SIZE ||
+      poolSize > MAX_POOL_SIZE)
+  ) {
+    throw bad(
+      'pool_size',
+      `expected an integer between ${MIN_POOL_SIZE} and ${MAX_POOL_SIZE}, got ` +
+        `${describeValue(poolSize)} — a pool that cannot hand out a connection makes connect() ` +
+        `wait forever`,
+    );
+  }
+
+  const retention = cfg['retention_days'];
+  if (retention !== undefined && (typeof retention !== 'number' || !(retention > 0))) {
+    throw bad(
+      'retention_days',
+      `expected a number > 0, got ${describeValue(retention)} — 0 or negative would delete the ` +
+        `whole history; omit the key to keep every message forever`,
+    );
+  }
+  if (typeof retention === 'number' && !Number.isFinite(retention)) {
+    throw bad('retention_days', `expected a finite number, got ${describeValue(retention)}`);
+  }
+
+  return cfg as PostgresBackendConfig;
+}
 
 /** True when the DSN carries the repo-public `parley:parley` pair, whatever host/port/database. */
 export function usesDefaultCredentials(url: string): boolean {
@@ -74,7 +142,7 @@ export function usesDefaultCredentials(url: string): boolean {
 
 /** Per-channel LISTEN state shared by subscriptions and blocking waiters. */
 interface ListenState {
-  /** Resolves only once the LISTEN is ESTABLISHED — never merely intended (issue: lost wakeup). */
+  /** Resolves only once the LISTEN is ESTABLISHED — never merely intended. */
   ready: Promise<void>;
   /** Participants (subscriptions + in-flight waiters) that still need this channel LISTENed. */
   refs: number;
@@ -121,9 +189,14 @@ export class PostgresPlugin implements BackendPlugin {
   private listenerPromise?: Promise<Client>;
   private reconnecting = false;
   private readonly subs = new Map<string, TopicSubscription>();
+  /**
+   * Channels whose first `subscribe` is still mid-flight, so a concurrent `subscribe` to the same
+   * topic joins that one instead of building a second {@link TopicSubscription} that overwrites it.
+   */
+  private readonly subscribing = new Map<string, Promise<TopicSubscription>>();
 
   /**
-   * Blocking `fetchRecent` waiters keyed by NOTIFY channel (issue #20). A waiter parks on the
+   * Blocking `fetchRecent` waiters keyed by NOTIFY channel. A waiter parks on the
    * SAME doorbell `subscribe` waits on — the AFTER INSERT trigger's `pg_notify` — so a blocked
    * fetch wakes the instant a matching row lands. The channel is LISTENed for the wait's duration
    * (piggybacking a live subscription's LISTEN when one exists) and UNLISTENed once the last
@@ -140,15 +213,13 @@ export class PostgresPlugin implements BackendPlugin {
   private readonly pendingAborts = new Set<() => void>();
 
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as PostgresBackendConfig;
+    const cfg = validateBackendConfig(config);
     this.url = cfg.url ?? DEFAULT_URL;
     this.table = assertTableName(cfg.table_name ?? 'parley_messages');
     this.names = schemaNames(this.table);
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
 
-    // SEC-06: warn loudly before the schema bootstrap when the operator is connecting with the
-    // repo-public `parley:parley` credential pair, whatever host/port/database it points at.
     if (usesDefaultCredentials(this.url)) {
       console.warn(
         '[parley-postgres] SECURITY: connecting with the repo-public default credentials ' +
@@ -180,18 +251,25 @@ export class PostgresPlugin implements BackendPlugin {
     this.pool = pool;
 
     if (this.retentionDays !== undefined) {
-      void this.prune();
+      const tick = (): void => {
+        void this.prune().catch(() => undefined);
+      };
+      tick();
       // Keep the unref, so a leaked-but-never-disconnect()ed plugin cannot by itself pin the
       // event loop — pruning is a best-effort cost knob, not a reason to keep the process alive.
-      this.pruneTimer = setInterval(() => void this.prune(), PRUNE_INTERVAL_MS).unref();
+      this.pruneTimer = setInterval(tick, PRUNE_INTERVAL_MS).unref();
     }
   }
 
-  /** Delete rows older than `retention_days`. Best-effort — a transient failure retries next tick. */
+  /**
+   * Delete rows older than `retention_days`. Best-effort — a transient failure retries next tick.
+   * Keep the whole body inside the try, so that no arithmetic on an operator-supplied window can
+   * escape this un-awaited call as an unhandled rejection and take the process down.
+   */
   private async prune(): Promise<void> {
     if (this.retentionDays === undefined || this.pool === undefined) return;
-    const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
     try {
+      const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
       await this.pool.query(`DELETE FROM ${this.names.messages} WHERE ts < $1`, [cutoff]);
     } catch {
       // Transient contention/connection failure — retry on the next interval.
@@ -209,6 +287,7 @@ export class PostgresPlugin implements BackendPlugin {
     this.waiters.clear();
     this.listens.clear();
     this.subs.clear();
+    this.subscribing.clear();
     const listener = this.listener;
     this.listener = undefined;
     this.listenerPromise = undefined;
@@ -275,7 +354,7 @@ export class PostgresPlugin implements BackendPlugin {
 
     // Exclusive: strictly after `since`, ascending.
     let rows = await this.exclusiveSince(args.topic, args.since, limit);
-    // Native long-poll (issue #20): only when the exclusive `since` query came back EMPTY and the
+    // Native long-poll: only when the exclusive `since` query came back EMPTY and the
     // caller asked to block. Wait on the topic's NOTIFY channel up to the remaining budget, then
     // re-run the SAME exclusive query. Returning early/empty stays safe — core's generic wrapper
     // polls the remaining budget — so the native wait only ever SHORTENS latency, never extends it.
@@ -305,7 +384,7 @@ export class PostgresPlugin implements BackendPlugin {
   }
 
   /**
-   * Park up to `blockMs` waiting for a NOTIFY on `topic`'s channel (issue #20), then return so the
+   * Park up to `blockMs` waiting for a NOTIFY on `topic`'s channel, then return so the
    * caller can re-run the exclusive `since` query. Reuses the live primitive — the AFTER INSERT
    * trigger's `pg_notify`, the same doorbell `subscribe` waits on:
    *   - If a `subscribe` (or an earlier waiter) already holds the channel, PIGGYBACK on its LISTEN
@@ -313,7 +392,7 @@ export class PostgresPlugin implements BackendPlugin {
    *   - Otherwise LISTEN for the wait's duration and UNLISTEN once the last participant leaves.
    * Any wake (a matching NOTIFY), the `blockMs` timer, or `disconnect()` releases the wait; the
    * timer is always cleared, so nothing leaks. Once the waiter is registered we re-check
-   * `exclusiveSince` ONCE (issue #20): a row that landed between the caller's initial empty query
+   * `exclusiveSince` ONCE: a row that landed between the caller's initial empty query
    * and this LISTEN never notified us, so without this the wait would stall to the timeout — the
    * re-check makes the waiter live across the LISTEN snapshot window and wakes it promptly.
    */
@@ -393,18 +472,41 @@ export class PostgresPlugin implements BackendPlugin {
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const pool = this.require();
-    const listener = await this.ensureListener();
     const channel = channelFor(topic);
 
     // Repeat subscribe on the same topic: append to the channel's handler list (matching
     // bridge-xmpp) — the channel is already LISTENed and drained, so the new handler just joins
-    // the fan-out from here on (push never replays history).
-    const existing = this.subs.get(channel);
-    if (existing !== undefined) {
-      existing.handlers.push(handler);
+    // the fan-out from here on (push never replays history). Keep both the live and the in-flight
+    // lookup ahead of the first await, so that two concurrent subscribes to one topic cannot both
+    // miss it and have the second overwrite the first's registration.
+    const live = this.subs.get(channel);
+    if (live !== undefined) {
+      live.handlers.push(handler);
+      return;
+    }
+    const inFlight = this.subscribing.get(channel);
+    if (inFlight !== undefined) {
+      (await inFlight).handlers.push(handler);
       return;
     }
 
+    const started = this.startSubscription(pool, topic, channel, handler);
+    this.subscribing.set(channel, started);
+    try {
+      await started;
+    } finally {
+      this.subscribing.delete(channel);
+    }
+  }
+
+  /** Tail read → LISTEN → register, for a channel nothing is subscribed to yet. */
+  private async startSubscription(
+    pool: Pool,
+    topic: Topic,
+    channel: string,
+    handler: MessageHandler,
+  ): Promise<TopicSubscription> {
+    const listener = await this.ensureListener();
     // Tail first: push never replays history (catch-up owns it).
     const res = await pool.query(
       `SELECT COALESCE(MAX(seq), 0)::text AS max FROM ${this.table} WHERE topic = $1`,
@@ -417,14 +519,14 @@ export class PostgresPlugin implements BackendPlugin {
       draining: false,
       pending: false,
     };
-    // LISTEN before we register (BUG-29): a rejected LISTEN must leave no entry in `this.subs`,
-    // or the next reconnect would re-LISTEN and re-drain a channel the caller was told FAILED to
-    // subscribe. Registering only after the LISTEN resolves keeps the tail-read → LISTEN window
-    // covered too — a row committed in it has seq > lastSeen, so the drain below still catches it.
+    // Keep the LISTEN ahead of the registration, so that a rejected LISTEN leaves no entry in
+    // `this.subs` — otherwise the next reconnect re-LISTENs and re-drains a channel the caller was
+    // told FAILED to subscribe. It also covers the tail-read → LISTEN window: a row committed in
+    // it has seq > lastSeen, so the drain below still catches it.
     await this.acquireListen(listener, channel);
     this.subs.set(channel, sub);
-    // Cover the tail-read → LISTEN window: a row committed inside it never notified us.
     this.drain(sub);
+    return sub;
   }
 
   /**
@@ -519,13 +621,15 @@ export class PostgresPlugin implements BackendPlugin {
       const sub = this.subs.get(n.channel);
       // Payload is a hint only (size limits + best-effort delivery) — always re-query.
       if (sub !== undefined) this.drain(sub);
-      // Wake any blocking fetchRecent parked on this channel (issue #20); each re-runs its own
+      // Wake any blocking fetchRecent parked on this channel; each re-runs its own
       // exclusive `since` query. A spurious wake only ends a wait early — safe, core re-polls.
       const set = this.waiters.get(n.channel);
       if (set !== undefined) for (const wake of [...set]) wake();
     });
     client.on('end', () => {
-      if (!this.stopped && this.listener === client) void this.reconnectListener();
+      if (!this.stopped && this.listener === client) {
+        void this.reconnectListener().catch(() => undefined);
+      }
     });
   }
 
@@ -545,7 +649,7 @@ export class PostgresPlugin implements BackendPlugin {
         this.wireListener(client);
         try {
           await client.connect();
-          // A disconnect() can complete fully while connect() is in flight (BUG-16). If it did,
+          // A disconnect() can complete fully while connect() is in flight. If it did,
           // this candidate must not become the live listener: end it and return, or its open pg
           // socket keeps the Node event loop referenced (shutdown/tests hang) and `this.listener`
           // is resurrected after a completed disconnect.
@@ -554,7 +658,7 @@ export class PostgresPlugin implements BackendPlugin {
             return;
           }
           // Re-LISTEN every channel a subscription OR an in-flight blocking waiter needs, so a
-          // reconnect mid-wait still delivers the doorbell (issue #20).
+          // reconnect mid-wait still delivers the doorbell.
           for (const channel of this.listens.keys()) {
             await client.query(`LISTEN "${channel}"`);
           }

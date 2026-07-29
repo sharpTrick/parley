@@ -47,6 +47,11 @@ identifiers at 63 bytes — a longer stem would silently make two of those the s
 `BIGSERIAL` and is never reused, so a cursor minted before a prune stays valid: a stale reader
 just gets fewer rows back, never a wrong or duplicate one.
 
+Every key is validated before the pool is opened, and `connect()` rejects — naming the key — on an
+unrecognised key (a typo would otherwise silently disable the feature), a `pool_size` that is not
+an integer in `1..1000`, or a `retention_days` that is not a finite number greater than zero
+(`0`, a negative value or `null` would delete the entire history on connect).
+
 Secrets belong in the config/`.env`, never committed (CLAUDE.md conventions).
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same database)

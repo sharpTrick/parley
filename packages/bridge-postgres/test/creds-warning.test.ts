@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 
-// SEC-06 — Postgres must not silently connect with the repo-public default DSN
+// Postgres must not silently connect with the repo-public default DSN
 // (postgres://parley:parley@…). connect() opens a pool and runs the idempotent schema bootstrap,
 // so mock `pg` to a no-op pool/client; the warning fires before `new Pool(...)`. The mock lets the
 // whole connect() resolve so the gate sits on the happy path, not an incidental connection failure.
@@ -46,7 +46,7 @@ const DSN_CASES: [label: string, url: string | undefined, warns: boolean][] = [
   ['a real DSN', 'postgres://app:s3cret@db.example.com:5432/prod', false],
 ];
 
-describe('Postgres default-credential warning (SEC-06)', () => {
+describe('Postgres default-credential warning (default DSN)', () => {
   it.each(DSN_CASES)('%s', async (_label, url, warns) => {
     const warn = spyWarn();
     await new PostgresPlugin().connect(url === undefined ? {} : { url });

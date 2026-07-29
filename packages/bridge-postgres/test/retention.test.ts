@@ -37,7 +37,7 @@ async function dropTable(table: string): Promise<void> {
 if (await isUp(PG_URL)) {
   describe('retention_days (DESIGN §11)', () => {
     it.each([
-      ['prunes older rows when set', 0, 0],
+      ['prunes older rows when set to a real window', 1 / 86_400_000, 0],
       ['keeps every row when omitted', undefined, 3],
     ])('%s', async (_label, retentionDays, expectedSurvivors) => {
       const table = `parley_ret_${rand()}`;
@@ -57,6 +57,7 @@ if (await isUp(PG_URL)) {
           : { url: PG_URL, table_name: table, retention_days: retentionDays },
       );
       try {
+        if (retentionDays !== undefined) await new Promise((r) => setTimeout(r, 400));
         const before = await plugin.fetchRecent({ topic });
         expect(before.messages.length).toBe(expectedSurvivors);
 

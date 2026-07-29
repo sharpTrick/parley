@@ -2,8 +2,8 @@ import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-co
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 
-// Deterministic listener-lifecycle tests for BUG-16 (disconnect() racing a reconnect must leak no
-// live Client) and BUG-29 (a failed LISTEN leaves no registration; repeat subscribe fans out).
+// Deterministic listener-lifecycle tests: a disconnect() racing a reconnect must leak no live
+// Client, a failed LISTEN must leave no registration, and a repeat subscribe must fan out.
 // These never touch a real server: `pg` is mocked so `new Client()` (the LISTEN connection) is a
 // controllable stub. The network-gated conformance suite covers the live paths.
 
@@ -27,7 +27,7 @@ const state = vi.hoisted(() => ({
   // When set, the next `new Client().connect()` parks on this deferred (used to hold a reconnect
   // candidate mid-connect while a disconnect() races it).
   connectGate: null as Deferred | null,
-  // When true, `query('LISTEN …')` rejects (drives the BUG-29(1) failed-subscribe path).
+  // When true, `query('LISTEN …')` rejects (drives the failed-subscribe path).
   listenRejects: false,
   // Rows the pool hands back, per topic, on the NEXT drain SELECT (then emptied — one delivery).
   drainRows: new Map<string, Record<string, unknown>[]>(),
@@ -73,12 +73,15 @@ vi.mock('pg', () => {
 
   const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
     if (/MAX\(seq\)/.test(sql)) return { rows: [{ max: '0' }] };
-    // Drain SELECT (the push path's batch read): hand back the topic's queued rows once, then
-    // nothing. The blocking-fetch read is the same shape but parameterizes its LIMIT, so it
-    // stays empty and the two paths cannot consume each other's rows.
-    if (/seq > \$2/.test(sql) && /LIMIT \d+/.test(sql)) {
+    // Drain SELECT (the push path's batch read): hand back at most the row cap the SQL asked for,
+    // so that the batching loop is exercised rather than handed everything in one reply — a fake
+    // that ignores the server's LIMIT leaves the re-query loop untested. The blocking-fetch read
+    // is the same shape but parameterizes its LIMIT, so it stays empty and the two paths cannot
+    // consume each other's rows.
+    const batch = /seq > \$2/.test(sql) ? /LIMIT (\d+)/.exec(sql) : null;
+    if (batch !== null) {
       const topic = String(values?.[0]);
-      return { rows: state.drainRows.get(topic)?.splice(0) ?? [] };
+      return { rows: state.drainRows.get(topic)?.splice(0, Number(batch[1])) ?? [] };
     }
     return { rows: [] };
   };
@@ -97,7 +100,7 @@ vi.mock('pg', () => {
   };
 });
 
-// A real DSN so the SEC-06 default-credential warning stays quiet.
+// A real DSN so the default-credential warning stays quiet.
 const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
 
 beforeEach(() => {
@@ -111,7 +114,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('Postgres listener lifecycle (BUG-16)', () => {
+describe('Postgres listener lifecycle', () => {
   it('a disconnect() racing an in-flight reconnect ends the candidate and does not resurrect the listener', async () => {
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: REAL_URL });
@@ -154,7 +157,7 @@ describe('Postgres listener lifecycle (BUG-16)', () => {
   }, 5000);
 });
 
-describe('Postgres subscribe registration (BUG-29)', () => {
+describe('Postgres subscribe registration', () => {
   it('a subscribe whose LISTEN rejects leaves no entry in this.subs', async () => {
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: REAL_URL });
