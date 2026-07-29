@@ -34,9 +34,16 @@ Two bounds are worth knowing before you call it:
 - A wait the server states — via `Retry-After` or the caller's `retryAfterOf` — is honoured in
   **full**, however long; it is refused, **ending the call**, only when it would not fit inside
   this call's `deadlineMs`. `MAX_BACKOFF_MS` clamps only a backoff the helper invented itself.
+- The `Retry-After` header is a **floor**, and `retryAfterOf` is a source of an *additional* hint,
+  never a ceiling: whichever is longer wins. Do not clamp what your parser returns — retrying
+  sooner than the vendor asked is what escalates a rate limit into a global ban, and this loop will
+  not let a parser do it.
 
 Errors never carry the request URL: several backends (Telegram) put a credential in the path, and
 a thrown message becomes an MCP `isError` result, i.e. model context. `label` identifies the call.
+Redaction covers the URL byte-for-byte, any `scheme://…` spelling of it, and the credential-bearing
+parts of its path — so a proxy or a hostile body that echoes the path alone is covered too. A bare
+`host/path` with no scheme is not treated as a URL, so keep credentials out of the host and query.
 
 ## Helpers
 
@@ -45,8 +52,10 @@ a thrown message becomes an MCP `isError` result, i.e. model context. `label` id
 - **`retryAfterFromHeader(res)`** — milliseconds from `Retry-After`, in **both** RFC 9110 forms
   (`delay-seconds` and HTTP-date), or `undefined` when the header carries no usable hint.
 - **`sanitizeBody(text)`** — bound and flatten an untrusted response body before it goes in an
-  Error: truncates at `MAX_ERROR_BODY` and strips C0/DEL, U+2028/U+2029 and bidi overrides. It
-  bounds and flattens only — the body's words still reach the reader.
+  Error: truncates at `MAX_ERROR_BODY` (never between the halves of an astral character) and strips
+  every Unicode control (`Cc`, i.e. C0, C1 and DEL) and format (`Cf`, i.e. bidi overrides,
+  isolates, joiners, BOM) character, plus U+2028/U+2029, replacing unpaired surrogates. It bounds
+  and flattens only — the body's words still reach the reader.
 
 ## Constants
 

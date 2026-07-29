@@ -37,6 +37,16 @@ export interface ConformanceContext {
    * `identity` argument is informational, and asserting it would be asserting a lie.
    */
   carriesSenderIdentity: boolean;
+  /**
+   * Which arm of `fetchRecent`'s absent-topic contract the backend takes: an empty page with a
+   * replayable cursor, or a `NoSuchTopicError` rejection. seam.ts permits BOTH, and core has a
+   * whole module mapping the second to "topic not present yet".
+   *
+   * The one optional field here, and only because its default — `'empty-page'` — is the STRICTER
+   * arm: omitting it cannot buy a weaker grade. That is exactly what an omitted capability flag
+   * does everywhere else, which is why every other field is required.
+   */
+  absentTopicBehaviour?: 'empty-page' | 'throws';
 }
 
 export type BackendFactory = () => Promise<ConformanceContext>;
@@ -54,6 +64,7 @@ export const CONTEXT_FIELDS: Record<keyof ConformanceContext, (v: unknown) => bo
   concurrentPost: (v) => typeof v === 'function' || v === 'unsupported',
   supportsBlockingFetch: (v) => typeof v === 'boolean',
   carriesSenderIdentity: (v) => typeof v === 'boolean',
+  absentTopicBehaviour: (v) => v === undefined || v === 'empty-page' || v === 'throws',
 };
 
 /** Throws naming the backend and the offending field; returns the context so it can be inlined. */

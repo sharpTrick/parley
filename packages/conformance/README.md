@@ -13,28 +13,40 @@ A backend is conformant iff:
 2. `fetchRecent` / `subscribe` deliver **monotonic, in-order, exclusive-`since`** cursor ordering
    (the order key) — core never parses or compares cursor values, it only trusts the plugin.
 
-Concretely, `runConformanceSuite` (`src/index.ts`) checks:
+Concretely, `runConformanceSuite` (`src/index.ts`) checks the clauses below. The list is not prose:
+each phrase is an entry in the exported `CLAUSES` table, and this package's own tests fail if any of
+them stops owning a case — a conformance clause used to be deletable with nothing going red.
 
 - `post` → `fetchRecent` returns messages in order, with unique ids and distinct cursors;
-- catch-up since a cursor returns only strictly-newer messages (exclusive `since`);
-- paging from a cursor is lossless at every `limit`, and a `since`-less fetch returns the NEWEST
-  messages (the backend's default window);
-- `since` at the tail, and a never-posted topic, return empty with a **replayable** cursor;
+- the same content posted twice still gets distinct ids and cursors;
+- catch-up since a cursor returns only newer messages (exclusive), and since at the tail returns
+  empty with a replayable cursor;
+- paging from a cursor with limit is lossless at every page size;
+- a since-less fetch returns the NEWEST messages — the backend's default window;
+- a never-posted topic returns an empty page with a replayable cursor — or, taking the other arm
+  the seam permits, rejects with `NoSuchTopicError` naming the topic (`absentTopicBehaviour`);
 - every delivered `Message` is well-formed: real `topic`, non-empty `senderHandle`, and `mentions`
   matching `parseMentions(content)` (core's push loop filters on it);
-- the same message has an identical `backendMsgId`/`cursor` whether seen via live `subscribe` or
-  via `fetchRecent` catch-up, and `subscribe` delivers exactly the post-subscribe tail, once;
-- topics are isolated on **both** paths — catch-up and live push;
-- `post` accepts `opts.inReplyTo` and the reply is durable, in order;
-- `resolveIdentity` answers for the handle it was asked about, and distinct senders are not
-  collapsed onto one another;
-- `blockMs` long-poll wakes on a concurrent post and returns empty at timeout on a
-  `supportsBlockingFetch` backend — and, on one that declares it `false`, returns **promptly** and
-  empty instead of parking: the hint is optional, hanging on it is not;
+- the same message has an identical `backendMsgId`/`cursor` via live push and via catch-up, and
+  `subscribe` delivers exactly the post-subscribe tail, once, in cursor order;
+- topics are isolated on catch-up, and on the live path too;
+- disconnect is idempotent and stops the plugin serving;
+- post either round-trips a payload exactly — newline, surrounding spaces, an astral emoji, a
+  combining sequence, a tab — or refuses it, never altering it silently. Carriage return is not
+  graded: XMPP bodies are XML character data, where CR is normalized to LF before a plugin sees it;
+- post accepts inReplyTo and the reply is durable, in order;
+- resolveIdentity answers for the handle it was asked about;
+- distinct senders are not collapsed onto one another;
+- blockMs is honoured natively or ignored promptly — never a hang: it wakes on a concurrent post
+  and returns empty at timeout on a `supportsBlockingFetch` backend, and returns promptly and empty
+  on one that declares it `false`. The hint is optional; hanging on it is not;
+- a post landing in the window between a blocking fetch issuing its read and registering its
+  waiter is not missed — a blocking fetch is not missed by 0-3ms of race;
 - a backend that declares `carriesSenderIdentity: false` still reports ONE stable, non-empty
   `senderHandle` and keeps the two posts distinguishable by id;
-- concurrent multi-writer posts don't corrupt state and cursor ordering still holds
-  (`concurrentPost` backends).
+- multi-process writes don't corrupt state and cursor ordering still holds, and a reader
+  interleaved with concurrent writers loses no message — the shape that catches a cursor minted
+  from a pre-commit sequence (`concurrentPost` backends).
 
 ## Using it for a new backend
 
@@ -72,6 +84,13 @@ export interface ConformanceContext {
    * user; Matrix reports the homeserver-stamped `sender`) — there, asserting it would assert a lie.
    */
   carriesSenderIdentity: boolean;
+  /**
+   * Which arm of `fetchRecent`'s absent-topic contract this backend takes: an empty page with a
+   * replayable cursor, or a `NoSuchTopicError` rejection — seam.ts permits both. The ONLY optional
+   * field, and only because its default (`'empty-page'`) is the stricter arm, so omitting it
+   * cannot buy a weaker grade.
+   */
+  absentTopicBehaviour?: 'empty-page' | 'throws';
 }
 export type BackendFactory = () => Promise<ConformanceContext>;
 ```
@@ -131,6 +150,20 @@ npx vitest run packages/conformance packages/bridge-sqlite packages/bridge-redis
   packages/bridge-zulip packages/bridge-slack packages/bridge-discord packages/bridge-telegram
 ```
 
-`packages/conformance/test` holds only the suite's own self-tests — that the context validator
-rejects a malformed fixture. This package has a `peerDependency` on `vitest`: the suite's
-`describe`/`it`/`expect` come from whatever vitest the consuming package's workspace resolves.
+`packages/conformance/test` also holds the suite's CONTROLS, which need no server and so run
+everywhere:
+
+- `reference.test.ts` runs the whole suite against an in-memory `ReferencePlugin` that is
+  conformant by construction (both arms of the absent-topic contract). It must pass.
+- `negative-control.test.ts` runs the suite against a table of deliberately broken plugins —
+  inclusive `since`, a constant `topic`, a constant `backendMsgId`, an oldest-first default window,
+  a history-replaying `subscribe`, a post that still serves after `disconnect`, dropped `mentions`,
+  a blank `senderHandle`, a stalled cursor, an unreplayable absent-topic cursor, a plain `Error`
+  instead of `NoSuchTopicError`, a fetch that parks on `blockMs` — and requires each one to FAIL the
+  case built to catch it. Vitest cannot invert a suite's result in-process, so that run happens in a
+  child process behind `PARLEY_CONFORMANCE_BROKEN=1` and this test grades its JSON report.
+
+Plus the self-tests: that the context validator rejects a malformed fixture, that every clause in
+`CLAUSES` still owns a case, and that no case buys itself out of asserting on a capability flag.
+This package has a `peerDependency` on `vitest`: the suite's `describe`/`it`/`expect` come from
+whatever vitest the consuming package's workspace resolves.

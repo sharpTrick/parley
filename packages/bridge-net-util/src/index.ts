@@ -26,12 +26,12 @@ export const MAX_ERROR_BODY = 2_048;
 export const STOP_POLL_MS = 25;
 
 /**
- * Normalize a backoff we chose ourselves to `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`.
+ * Normalize a backoff a PLUGIN chose itself (a reconnect ladder, a poll interval) to
+ * `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`. `Number(null)` and `Number('')` are both `0`, so an
+ * unchecked parse reads as "retry now"; this floor turns that into a wait.
  *
- * `Number(null)` and `Number('')` are both `0`, so an absent `Retry-After` reads as "retry now" —
- * keep this clamp on the shared path, so that one plugin's parser bug cannot become a request
- * flood against the operator's own account. It does NOT bound a wait the server asked for: see
- * {@link fetchWithRetry}.
+ * It does NOT bound a wait the server asked for, and {@link fetchWithRetry} deliberately does not
+ * put it on a stated hint: see there.
  */
 export function clampBackoff(ms: number | undefined): number {
   if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return DEFAULT_BACKOFF_MS;
@@ -54,15 +54,39 @@ export function retryAfterFromHeader(res: Response): number | undefined {
   return ms > 0 ? ms : undefined;
 }
 
+/** A hint only counts as server-stated when it is a real, positive duration. */
+const usableHint = (ms: number | undefined): number | undefined =>
+  ms !== undefined && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+
 const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
+
+/**
+ * The parts of the request URL that are themselves a secret. Telegram's path is
+ * `/bot<id>:<token>/<method>`, and a transport or a hostile body can echo the path alone — which no
+ * scheme-anchored sweep and no byte-identical comparison against the full URL would catch.
+ */
+function credentialParts(url: string): string[] {
+  let pathname: string;
+  try {
+    ({ pathname } = new URL(url));
+  } catch {
+    return [];
+  }
+  return [pathname, ...pathname.split('/')].filter((part) => part.includes(':') && part.length > 1);
+}
 
 /**
  * Keep this on every path that embeds a transport error or a response body, so that a
  * credential-bearing URL (Telegram carries the bot token in the path) never reaches model context
  * or the operator's logs. The caller's `label` already identifies the call site without it.
+ *
+ * A bare `host/path` with no scheme is NOT recognized as a URL; only the credential-bearing parts
+ * of it are removed. Keep any new credential shape out of the host and query, so that this holds.
  */
 function redactUrls(text: string, url: string): string {
-  return text.split(url).join('<url>').replace(URL_LIKE, '<url>');
+  let out = text.split(url).join('<url>');
+  for (const secret of credentialParts(url)) out = out.split(secret).join('<redacted>');
+  return out.replace(URL_LIKE, '<url>');
 }
 
 /** Node's `fetch` puts the real reason in `cause`, not in `message`. */
@@ -77,8 +101,16 @@ function errorText(err: unknown): string {
   return parts.length > 0 ? parts.join(': ') : 'unknown transport failure';
 }
 
-/** C0/DEL, plus the separators and bidi overrides a body can use to forge lines or reverse text. */
-const NEUTRALIZED = /[\u0000-\u001F\u007F\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+/**
+ * Every control (`Cc`: C0, C1, DEL) and every format character (`Cf`: bidi overrides, isolates,
+ * BOM), plus the two line/paragraph separators, which are `Zl`/`Zp` and so outside both classes.
+ * Keep this as the CLASSES rather than a hand-listed set, so that a family nobody thought of —
+ * U+0085 NEL and U+009B CSI were both missing from the listed version — cannot forge line structure.
+ */
+const NEUTRALIZED = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
+
+/** A surrogate with no partner: `JSON.stringify` escapes it, but nothing downstream can decode it. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
 /**
  * Bound and flatten an untrusted response body before it goes in an Error.
@@ -89,8 +121,12 @@ const NEUTRALIZED = /[\u0000-\u001F\u007F\u2028\u2029\u200E\u200F\u202A-\u202E\u
  * body's words still reach the model, so do not read this as neutralizing what they say.
  */
 export function sanitizeBody(text: string): string {
-  const flat = text.replace(NEUTRALIZED, ' ');
-  return flat.length > MAX_ERROR_BODY ? `${flat.slice(0, MAX_ERROR_BODY)}… [truncated]` : flat;
+  const flat = text.replace(NEUTRALIZED, ' ').replace(LONE_SURROGATE, '\uFFFD');
+  if (flat.length <= MAX_ERROR_BODY) return flat;
+  const cut = flat.slice(0, MAX_ERROR_BODY);
+  // Cutting between a surrogate pair emits half an astral character into an MCP JSON result.
+  const whole = /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+  return `${whole}… [truncated]`;
 }
 
 export interface FetchWithRetryOptions {
@@ -102,6 +138,10 @@ export interface FetchWithRetryOptions {
    * Per-backend `Retry-After` extraction → milliseconds, or undefined when the response carries no
    * usable hint. Only the body field differs between APIs; the header, the clamp and the default
    * are handled here. Receives the 429 `Response` (clone it before reading the body).
+   *
+   * A source of an ADDITIONAL hint, never a ceiling: the standard `Retry-After` header is a FLOOR
+   * this cannot lower. Do not clamp what you return here, so that a parser bug cannot retry sooner
+   * than the vendor asked — that is what escalates a rate limit into a ban.
    */
   retryAfterOf?: (res: Response) => Promise<number | undefined> | number | undefined;
   /** Non-2xx statuses the caller treats as expected (returned, not thrown). Default: none. */
@@ -209,29 +249,25 @@ async function errorBody(res: Response, url: string): Promise<string> {
  */
 async function sleepUnlessStopped(ms: number, isStopped: () => boolean): Promise<boolean> {
   if (isStopped()) return false;
-  let settled: boolean | undefined;
-  let resolveWait: ((v: boolean) => void) | undefined;
+  let resolveWait!: (v: boolean) => void;
+  const wait = new Promise<boolean>((resolve) => {
+    resolveWait = resolve;
+  });
   const cancels: (() => void)[] = [];
   const finish = (v: boolean): void => {
-    if (settled !== undefined) return;
-    settled = v;
     for (const cancel of cancels) cancel();
-    resolveWait?.(v);
+    resolveWait(v);
   };
 
-  const waited = setTimeout(() => finish(true), ms);
-  cancels.push(() => clearTimeout(waited));
-  if (settled !== undefined) {
-    clearTimeout(waited);
-    return settled;
-  }
+  // Take the resolve and arm the poll before the wait timer, so that a timer firing the instant it
+  // is armed still finds a resolve to call and a poll to cancel. Reordering leaks the interval.
   const poll = setInterval(() => {
     if (isStopped()) finish(false);
   }, STOP_POLL_MS);
   cancels.push(() => clearInterval(poll));
-  return new Promise<boolean>((resolve) => {
-    resolveWait = resolve;
-  });
+  const waited = setTimeout(() => finish(true), ms);
+  cancels.push(() => clearTimeout(waited));
+  return wait;
 }
 
 /**
@@ -271,20 +307,24 @@ export async function fetchWithRetry(
 
     if (opts.isStopped()) throw new Error(`${opts.label} → 429 (disconnected)`);
 
-    const hinted = (await opts.retryAfterOf?.(res)) ?? retryAfterFromHeader(res);
     // Honour a server-stated wait IN FULL, so that we never retry sooner than the vendor asked —
-    // that is what escalates a rate limit into a ban. Only a wait we invented is clamped; an
-    // unreasonable hint is refused by the deadline below, which is the real governor.
-    const stated = hinted !== undefined && Number.isFinite(hinted) && hinted > 0;
-    const wait = stated ? (hinted as number) : clampBackoff(hinted);
+    // that is what escalates a rate limit into a ban. The header is a FLOOR the caller's parser
+    // cannot lower, and an unreasonable hint is refused by the deadline below, not shortened.
+    const header = usableHint(retryAfterFromHeader(res));
+    const parsed = usableHint(await opts.retryAfterOf?.(res));
+    const hinted = header === undefined ? parsed : Math.max(header, parsed ?? 0);
+    const stated = hinted !== undefined;
+    const wait = hinted ?? DEFAULT_BACKOFF_MS;
     const elapsed = now() - started;
     const overDeadline = elapsed + wait > deadlineMs;
     if (attempt >= maxAttempts || overDeadline) {
-      throw new Error(
+      throw new HttpStatusError(
+        opts.label,
+        429,
         stated && overDeadline
-          ? `${opts.label} → 429: upstream asked for ${Math.round(wait)}ms, past this call's ` +
-            `${deadlineMs}ms deadline (${elapsed}ms elapsed). Raise deadlineMs to wait it out.`
-          : `${opts.label} → 429: still rate limited after ${attempt} attempts (${elapsed}ms)`,
+          ? `upstream asked for ${Math.round(wait)}ms, past this call's ${deadlineMs}ms deadline ` +
+            `(${elapsed}ms elapsed). Raise deadlineMs to wait it out.`
+          : `still rate limited after ${attempt} attempts (${elapsed}ms)`,
       );
     }
 

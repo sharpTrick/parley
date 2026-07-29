@@ -73,6 +73,37 @@ function expectWellFormedMessage(
 }
 
 /**
+ * Every clause this suite grades, as a phrase that must appear in the title of a case it registers.
+ *
+ * A conformance clause could previously be deleted with nothing anywhere going red — the suite's own
+ * self-tests pinned a case count and one title — and eleven backends would keep being certified
+ * against the weakened suite while the README kept advertising the clause. This table is what makes
+ * a deletion or a rename a failure in THIS package. Adding a case means adding its clause here.
+ */
+export const CLAUSES: readonly string[] = [
+  'in order, with unique ids and distinct cursors',
+  'the same content posted twice',
+  'only newer messages (exclusive)',
+  'paging from a cursor with limit',
+  'returns the NEWEST messages',
+  'since at the tail',
+  'never-posted topic',
+  'via live push and via catch-up',
+  'either round-trips',
+  'post accepts inReplyTo',
+  'exactly the post-subscribe tail',
+  'topics are isolated',
+  'on the live path too',
+  'disconnect is idempotent',
+  'resolveIdentity answers',
+  'not collapsed onto one another',
+  'blockMs is honoured natively or ignored promptly',
+  'blocking fetch is not missed',
+  'interleaved with concurrent writers',
+  'multi-process writes',
+];
+
+/**
  * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend
  * conforms iff: stable-unique backendMsgId AND monotonic, in-order, exclusive-`since` cursor
  * delivery. Write once here; run against every backend via {@link BackendFactory}.
@@ -181,8 +212,26 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(drained.nextCursor).toBe(tail);
     });
 
+    // seam.ts permits TWO answers for a topic with no backend representation, and pinning one of
+    // them made the suite narrower than the seam it is written against — a plugin taking the
+    // documented alternative failed conformance, while core's NoSuchTopicError mapping had no
+    // producer anywhere to grade it. A backend states which arm it takes; the default is the
+    // stricter one, so this cannot become a way to weaken the grade.
     it('fetchRecent on a never-posted topic returns an empty page with a replayable cursor', async () => {
       const t = ctx.freshTopic(); // no posts
+      if ((ctx.absentTopicBehaviour ?? 'empty-page') === 'throws') {
+        // The TYPE is the contract: core maps ONLY NoSuchTopicError to "topic not present yet", so
+        // a plain rejection here is an outage, and the topic must be named for the operator.
+        const err: unknown = await ctx.plugin.fetchRecent({ topic: t }).then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).name).toBe('NoSuchTopicError');
+        expect((err as { topic?: unknown }).topic).toBe(String(t));
+        expect((err as Error).message).toContain(String(t));
+        return;
+      }
       const first = await ctx.plugin.fetchRecent({ topic: t });
       expect(first.messages).toEqual([]);
       const again = await ctx.plugin.fetchRecent({ topic: t, since: first.nextCursor });
@@ -217,6 +266,35 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     // (transport/tools.ts), but no case ever supplied it — a plugin that 400s on a threaded reply,
     // or takes a different endpoint for one, was certified conformant. The seam surfaces no reply
     // field on Message, so the contract is exactly "accepted, and durable in order".
+    // Every other case posts short ASCII ('a', 'same', 'm0'), so nothing certified that `post`
+    // round-trips content AT ALL. Carriage return is deliberately NOT a row: XMPP carries bodies in
+    // XML character data, where CR is normalized to LF by the parser before any plugin sees it, so
+    // a CR row would pin one backend's transport rather than the seam.
+    // The same `parley_post` could behave four different ways across
+    // certified backends, and a backend that silently rewrote or truncated a payload would pass in
+    // full. Refusing a payload is a visible, legitimate answer; altering it silently is not.
+    it.each([
+      ['a newline', 'fidelity\nsecond line'],
+      ['leading and trailing spaces', '  fidelity  '],
+      ['an astral emoji', 'fidelity \u{1F600} done'],
+      ['a combining sequence', 'fidelity e\u0301 vs \u00E9'],
+      ['a tab', 'fidelity\tcolumn'],
+    ])('post either round-trips %s exactly or refuses it', async (_label, content) => {
+      const t = ctx.freshTopic();
+      const posted: string | Error = await ctx.plugin.post(t, SENDER, content).then(
+        (id) => String(id),
+        (err: unknown) => err as Error,
+      );
+      if (posted instanceof Error) {
+        expect(posted.message.length).toBeGreaterThan(0);
+        return;
+      }
+      const { messages } = await ctx.plugin.fetchRecent({ topic: t });
+      expect(messages).toHaveLength(1);
+      expect(messages[0]!.content).toBe(content);
+      expect(messages[0]!.mentions).toEqual(parseMentions(content));
+    });
+
     it('post accepts inReplyTo and the reply is durable, in order', async () => {
       const t = ctx.freshTopic();
       const parent = await ctx.plugin.post(t, SENDER, 'question');
@@ -421,6 +499,57 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       const [woke] = await Promise.all([pending, postLater()]);
       expect(woke.messages.map((m) => m.content)).toEqual(['racer']);
       expect(woke.nextCursor).not.toBe(tail);
+    });
+
+    // A store that mints a cursor from a PRE-COMMIT sequence (Postgres BIGSERIAL assigns `seq` at
+    // INSERT, not COMMIT) can make cursor 42 visible while 41 is still uncommitted. A reader that
+    // advances past 42 in that window can never fetch 41 again: durably stored, permanently
+    // unreachable. The case above cannot see it — it reads only after every writer has settled,
+    // when the gap has filled in — so this one puts the reader INSIDE the write window.
+    it('a reader interleaved with concurrent writers loses no message', async (testCtx) => {
+      if (ctx.concurrentPost === 'unsupported') {
+        testCtx.skip();
+        return;
+      }
+      const t = ctx.freshTopic();
+      const writers = 4;
+      const perWriter = 25;
+      // Seed first: a cursor to read from has to exist before the writers start, and a backend
+      // taking the throwing arm of the absent-topic contract has none until the topic does.
+      await ctx.plugin.post(t, SENDER, 'seed');
+      const start = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
+
+      const seen: string[] = [];
+      let cursor = start;
+      let writing = true;
+      const readLoop = (async () => {
+        const giveUpAt = Date.now() + 60_000;
+        while (Date.now() < giveUpAt) {
+          // Sample `writing` BEFORE the fetch, so that an empty page taken while a writer was
+          // still in flight cannot be read as "drained" once that writer lands — otherwise the
+          // last row commits between the fetch and the check and the loop exits without it.
+          const wasWriting = writing;
+          const page = await ctx.plugin.fetchRecent({ topic: t, since: cursor, limit: DRAIN_PAGE });
+          for (const m of page.messages) seen.push(String(m.backendMsgId));
+          cursor = page.nextCursor;
+          if (!wasWriting && page.messages.length === 0) return;
+          // Keep the macrotask yield, so that a backend whose fetchRecent resolves synchronously
+          // cannot starve the writers: on SQLite they are forked processes whose exit events never
+          // fire inside a microtask-only loop, and the reader spins until the deadline.
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        throw new Error(`the interleaved reader did not drain ${t}`);
+      })();
+
+      await ctx.concurrentPost(t, writers, perWriter);
+      writing = false;
+      await readLoop;
+
+      const stored = (await drainAll(ctx.plugin, t)).slice(1).map((m) => String(m.backendMsgId));
+      expect(stored).toHaveLength(writers * perWriter);
+      const missed = stored.filter((id) => !seen.includes(id));
+      expect(missed, 'the reader advanced past a row it can never fetch again').toEqual([]);
+      expect(seen, 'the reader saw a message twice or out of order').toEqual(stored);
     });
 
     it('multi-process writes do not corrupt or error; cursor stays monotonic', async (testCtx) => {

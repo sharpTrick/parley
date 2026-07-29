@@ -76,6 +76,83 @@ function captureWaits(): number[] {
   return waits;
 }
 
+interface TimerEntry {
+  kind: 'timeout' | 'interval';
+  fired: boolean;
+  cleared: boolean;
+}
+
+/**
+ * Ledger of the timers armed while it is installed, and how each one ended. A leak is an interval
+ * never cleared, or a timeout neither cleared nor fired. Counting `process.getActiveResourcesInfo()`
+ * instead cannot see either: that number is global, includes the harness's own timers, and its
+ * baseline churns between the two samples — so the comparison passes whatever the module does.
+ */
+function timerLedger(): { outstanding: () => TimerEntry[]; restore: () => void } {
+  const entries: TimerEntry[] = [];
+  const byHandle = new Map<unknown, TimerEntry[]>();
+  const real = {
+    setTimeout: globalThis.setTimeout,
+    setInterval: globalThis.setInterval,
+    clearTimeout: globalThis.clearTimeout,
+    clearInterval: globalThis.clearInterval,
+  };
+
+  const arm =
+    (kind: TimerEntry['kind'], underlying: unknown) =>
+    (fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]): unknown => {
+      const entry: TimerEntry = { kind, fired: false, cleared: false };
+      entries.push(entry);
+      const handle = (underlying as (...a: unknown[]) => unknown)(
+        (...a: unknown[]) => {
+          entry.fired = true;
+          fn(...a);
+        },
+        ms,
+        ...rest,
+      );
+      byHandle.set(handle, [...(byHandle.get(handle) ?? []), entry]);
+      return handle;
+    };
+
+  const disarm =
+    (underlying: unknown) =>
+    (handle?: unknown): void => {
+      for (const entry of byHandle.get(handle) ?? []) entry.cleared = true;
+      (underlying as (h?: unknown) => void)(handle);
+    };
+
+  globalThis.setTimeout = arm('timeout', real.setTimeout) as unknown as typeof setTimeout;
+  globalThis.setInterval = arm('interval', real.setInterval) as unknown as typeof setInterval;
+  globalThis.clearTimeout = disarm(real.clearTimeout) as unknown as typeof clearTimeout;
+  globalThis.clearInterval = disarm(real.clearInterval) as unknown as typeof clearInterval;
+
+  return {
+    outstanding: () =>
+      entries.filter((e) => !e.cleared && (e.kind === 'interval' || !e.fired)),
+    restore: () => {
+      globalThis.setTimeout = real.setTimeout;
+      globalThis.setInterval = real.setInterval;
+      globalThis.clearTimeout = real.clearTimeout;
+      globalThis.clearInterval = real.clearInterval;
+    },
+  };
+}
+
+/** Run `body` with a ledger installed, and report what it left armed. */
+async function timersLeftBy(body: () => Promise<unknown>): Promise<TimerEntry[]> {
+  const ledger = timerLedger();
+  try {
+    await body().then(
+      () => undefined,
+      () => undefined,
+    );
+  } finally {
+    ledger.restore();
+  }
+  return ledger.outstanding();
+}
+
 const res = (status: number, body = '', headers: Record<string, string> = {}): Response =>
   new Response(body, { status, headers });
 
@@ -207,7 +284,7 @@ describe('fetchWithRetry', () => {
         {},
         { ...OPTS, retryAfterOf: () => 1, maxAttempts: 4, now: () => (clock += 10) },
       ),
-    ).rejects.toThrow(/still rate limited after \d+ attempts/);
+    ).rejects.toThrow(/still rate limited after \d+ attempts|past this call's \d+ms deadline/);
     expect(state.calls).toBeLessThanOrEqual(4);
   });
 
@@ -284,8 +361,10 @@ describe('fetchWithRetry', () => {
   });
 
   // A client-side ceiling that retries SOONER than the server asked is worse than not retrying:
-  // Discord and Slack escalate repeated 429s to longer global bans.
-  it.each([
+  // Discord and Slack escalate repeated 429s to longer global bans. The `Retry-After` header is a
+  // FLOOR: crossed with every shape of caller parser, including ones that shrink it (which is what
+  // two shipped backends' parsers did), no performed wait may fall below the header's own figure.
+  const HEADER_ROWS: [string, () => Record<string, string>, number, string][] = [
     ['delay-seconds past the deadline', () => ({ 'retry-after': '60' }), 60_000, 'stop'],
     ['HTTP-date past the deadline', () => ({ 'retry-after': httpDate(120_000) }), 120_000, 'stop'],
     ['delay-seconds well within the deadline', () => ({ 'retry-after': '2' }), 2_000, 'retry'],
@@ -303,9 +382,29 @@ describe('fetchWithRetry', () => {
     ['negative', () => ({ 'retry-after': '-5' }), 0, 'retry'],
     ['a date already past', () => ({ 'retry-after': httpDate(-60_000) }), 0, 'retry'],
     ['absent', () => ({}), 0, 'retry'],
-  ])(
+  ];
+
+  // Every shape a consumer's own `retryAfterOf` can take. `bridge-telegram` and `bridge-matrix`
+  // ship the clamping one; a hint that is absent, zero, NaN or negative is no hint at all.
+  const PARSERS: [string, (res: Response) => number | undefined][] = [
+    ['no parser', () => undefined],
+    ['a clamping parser', (r) => Math.min(retryAfterFromHeader(r) ?? 0, 5_000) || undefined],
+    ['a doubling parser', (r) => (retryAfterFromHeader(r) ?? 0) * 2 || undefined],
+    ['a zero parser', () => 0],
+    ['a NaN parser', () => Number.NaN],
+    ['a negative parser', () => -1],
+  ];
+
+  it.each(
+    HEADER_ROWS.flatMap(([label, headers, requestedMs, outcome]) =>
+      PARSERS.map(
+        ([parserLabel, retryAfterOf]) =>
+          [`${label}, with ${parserLabel}`, headers, requestedMs, outcome, retryAfterOf] as const,
+      ),
+    ),
+  )(
     'never retries sooner than the server asked (%s)',
-    async (_label, headers, requestedMs, outcome) => {
+    async (_label, headers, requestedMs, outcome, retryAfterOf) => {
       const state = stubForever(() => res(429, '', headers()));
       const waits = captureWaits();
       let clock = 0;
@@ -313,7 +412,13 @@ describe('fetchWithRetry', () => {
         fetchWithRetry(
           'https://x/y',
           {},
-          { label: 'L', isStopped: () => false, maxAttempts: 8, now: () => (clock += 1) },
+          {
+            label: 'L',
+            isStopped: () => false,
+            maxAttempts: 8,
+            retryAfterOf,
+            now: () => (clock += 1),
+          },
         ),
       );
       if (outcome === 'stop') {
@@ -321,13 +426,35 @@ describe('fetchWithRetry', () => {
         expect(waits).toEqual([]);
         expect(err.message).toMatch(/past this call's 30000ms deadline/);
         const reported = Number(/asked for (\d+)ms/.exec(err.message)?.[1]);
-        expect(Math.abs(reported - requestedMs)).toBeLessThan(2_000);
+        expect(reported).toBeGreaterThanOrEqual(requestedMs - 2_000);
       } else {
         expect(state.calls).toBeGreaterThan(1);
         for (const w of waits) expect(w).toBeGreaterThanOrEqual(requestedMs);
       }
     },
   );
+
+  // The one status this module is built around was the one `statusOf` could not report: the
+  // exhaustion rejection was a plain Error, so a caller branching on the field saw undefined and
+  // fell back to re-parsing the prose the field exists to replace.
+  it.each([
+    ['the attempt cap', { maxAttempts: 2, deadlineMs: 30_000 }, /still rate limited after 2 attempts/],
+    ['a wait past the deadline', { maxAttempts: 8, deadlineMs: 1_000 }, /past this call's 1000ms deadline/],
+  ])('reports 429 through statusOf when the loop gives up on %s', async (_label, bounds, shape) => {
+    stubForever(() => res(429, '', { 'retry-after': '10' }));
+    captureWaits();
+    let clock = 0;
+    const err = await rejects(
+      fetchWithRetry(
+        'https://x/y',
+        {},
+        { label: 'L', isStopped: () => false, ...bounds, now: () => (clock += 1) },
+      ),
+    );
+    expect(api.statusOf(err)).toBe(429);
+    expect(err.message).toMatch(shape);
+    expect(err.message.startsWith('L → 429: ')).toBe(true);
+  });
 
   it('falls back to the Retry-After header when the caller supplies no parser', async () => {
     stubFetch([res(429, '', { 'retry-after': '2' }), res(200)]);
@@ -338,7 +465,7 @@ describe('fetchWithRetry', () => {
   });
 
   it('hands the 429 response itself to retryAfterOf so headers are readable', async () => {
-    stubFetch([res(429, '', { 'retry-after': '2' }), res(200)]);
+    stubFetch([res(429, '', { 'retry-after': '0.01' }), res(200)]);
     const seen: (string | null)[] = [];
     await fetchWithRetry(
       'https://x/y',
@@ -351,7 +478,7 @@ describe('fetchWithRetry', () => {
         },
       },
     );
-    expect(seen).toEqual(['2']);
+    expect(seen).toEqual(['0.01']);
   });
 
   it('stops on a 429 once isStopped() is true, without another request', async () => {
@@ -391,9 +518,6 @@ describe('fetchWithRetry', () => {
   // deletes the wait this class is about. A stop that is only checked around the sleep, never
   // during it, holds `disconnect()` for the server's full stated wait — unbounded, so a routine
   // `Retry-After: 25` keeps a torn-down plugin (and the MCP process) alive for 25 seconds.
-  const activeTimers = (): number =>
-    process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
-
   it.each([
     [200, 0],
     [200, 10],
@@ -409,27 +533,113 @@ describe('fetchWithRetry', () => {
       setTimeout(() => {
         stopped = true;
       }, stopAtMs);
-      const timersBefore = activeTimers();
 
       const started = Date.now();
-      const err = await rejects(
-        fetchWithRetry(
+      let err: Error | undefined;
+      // Nothing may still be armed once it rejects: a backoff timer left running past the
+      // rejection pins the event loop, the other half of "disconnect() cannot make the process
+      // exit". Measured as the module's OWN created-vs-cleared ledger, not a global count.
+      const leaked = await timersLeftBy(async () => {
+        err = await rejects(
+          fetchWithRetry(
+            'https://x/y',
+            {},
+            { label: 'L', isStopped: () => stopped, deadlineMs: 60_000, maxAttempts: 100 },
+          ),
+        );
+      });
+      const elapsed = Date.now() - started;
+
+      expect(err?.message).toBe('L → 429 (disconnected)');
+      expect(elapsed).toBeLessThan(stopAtMs + STOP_POLL_MS + 150);
+      expect(state.calls).toBe(1); // it never spent a request after the teardown
+      expect(leaked).toEqual([]);
+    },
+  );
+
+  // The class, not the one row: EVERY path that abandons a call must leave nothing armed. Each row
+  // is an abandonment shape the loop has — a leak on any of them pins the event loop just as hard.
+  it.each([
+    [
+      'the attempt cap on a permanent 429',
+      (): Promise<unknown> => {
+        stubForever(() => res(429, '', { 'retry-after': '0.001' }));
+        return fetchWithRetry(
+          'https://x/y',
+          {},
+          { label: 'L', isStopped: () => false, maxAttempts: 3 },
+        );
+      },
+    ],
+    [
+      'the wall-clock deadline mid-backoff',
+      (): Promise<unknown> => {
+        stubForever(() => res(429, '', { 'retry-after': '0.05' }));
+        return fetchWithRetry(
+          'https://x/y',
+          {},
+          { label: 'L', isStopped: () => false, maxAttempts: 100, deadlineMs: 120 },
+        );
+      },
+    ],
+    [
+      'a stop landing during the backoff',
+      (): Promise<unknown> => {
+        stubForever(() => res(429, '', { 'retry-after': '30' }));
+        let stopped = false;
+        setTimeout(() => {
+          stopped = true;
+        }, 10);
+        return fetchWithRetry(
           'https://x/y',
           {},
           { label: 'L', isStopped: () => stopped, deadlineMs: 60_000, maxAttempts: 100 },
-        ),
-      );
-      const elapsed = Date.now() - started;
+        );
+      },
+    ],
+    [
+      "the caller's own abort",
+      (): Promise<unknown> => {
+        stubStalling();
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new Error('torn down')), 10);
+        return fetchWithRetry(
+          'https://x/y',
+          { signal: controller.signal },
+          { label: 'L', isStopped: () => false, deadlineMs: 10_000 },
+        );
+      },
+    ],
+    [
+      'a transport failure after a backoff',
+      (): Promise<unknown> => {
+        let first = true;
+        vi.stubGlobal('fetch', () => {
+          if (first) {
+            first = false;
+            return Promise.resolve(res(429, '', { 'retry-after': '0.01' }));
+          }
+          return Promise.reject(new TypeError('fetch failed'));
+        });
+        return fetchWithRetry('https://x/y', {}, { label: 'L', isStopped: () => false });
+      },
+    ],
+  ])('leaves no timer armed when the call is abandoned by %s', async (_label, run) => {
+    expect(await timersLeftBy(run)).toEqual([]);
+  });
 
-      expect(err.message).toBe('L → 429 (disconnected)');
-      expect(elapsed).toBeLessThan(stopAtMs + STOP_POLL_MS + 150);
-      expect(state.calls).toBe(1); // it never spent a request after the teardown
-      // Nothing is still armed: a backoff timer left running past the rejection pins the event
-      // loop, which is the other half of "disconnect() cannot make the process exit".
-      await delay(STOP_POLL_MS * 2);
-      expect(activeTimers()).toBeLessThanOrEqual(timersBefore);
-    },
-  );
+  // `captureWaits()` installs a `setTimeout` that fires its callback INLINE — a shape no runtime
+  // has, and the module used to carry a branch existing only for it. Arming the poll and the
+  // resolve before the wait is what removes the need for that branch; reverse the two and every
+  // backoff under this stub leaks its 25ms interval.
+  it('leaves no timer armed when the wait fires the instant it is armed', async () => {
+    stubFetch([res(429, '', { 'retry-after': '2' }), res(200)]);
+    captureWaits();
+    const leaked = await timersLeftBy(() =>
+      fetchWithRetry('https://x/y', {}, { label: 'L', isStopped: () => false }),
+    );
+    expect(leaked).toEqual([]);
+  });
 
   it('still waits the full stated backoff when nothing stops it', async () => {
     const state = stubFetch([res(429, '', { 'retry-after': '0.2' }), res(200, 'ok')]);
@@ -457,36 +667,56 @@ describe('fetchWithRetry', () => {
   // message becomes an MCP isError result — i.e. model context — and the operator's stderr.
   const CANARY = 'SECRET-CANARY-9f3a';
   const SECRET_URL = `https://api.example.test/bot123:${CANARY}/getMe`;
-  it.each([
+  // A transport, a proxy or a hostile body echoes the URL in ITS OWN spelling, not the caller's
+  // byte-for-byte — normalized port, trailing slash, uppercased host, percent-encoding, or just the
+  // credential-bearing path. Splitting on the request URL catches only the first of those, so every
+  // row below is a spelling that must still be redacted by something other than the exact match.
+  const SPELLINGS: [string, (url: string) => string][] = [
+    ['byte-identical', (u) => u],
+    ['port made explicit', (u) => u.replace('://api.example.test/', '://api.example.test:443/')],
+    ['a trailing slash', (u) => `${u}/`],
+    ['an uppercased host', (u) => u.replace('api.example.test', 'API.EXAMPLE.TEST')],
+    // Percent-encoding the credential's own colon defeats BOTH the exact split and the path-part
+    // removal, leaving the scheme-anchored sweep as the only thing between the token and the model.
+    ['a percent-encoded credential separator', (u) => u.replace('bot123:', 'bot123%3A')],
+    ['a doubled path separator', (u) => u.replace('/getMe', '//getMe')],
+    ['the credential path alone, no scheme or host', (u) => new URL(u).pathname],
+    ['the credential path segment alone', (u) => new URL(u).pathname.split('/')[1] as string],
+  ];
+
+  const VECTORS: [string, (echoed: string) => (() => Promise<Response>) | undefined][] = [
+    ['a DNS failure echoing it', (e) => () => Promise.reject(new TypeError(`request to ${e} failed: ENOTFOUND`))],
     [
-      'unparseable URL (real fetch, operator typo in api_url)',
-      `https://api.example.test:99999/bot123:${CANARY}/getMe`,
-      undefined,
-    ],
-    [
-      'DNS failure echoing the URL',
-      SECRET_URL,
-      () => Promise.reject(new TypeError(`request to ${SECRET_URL} failed: ENOTFOUND`)),
-    ],
-    [
-      'TLS failure carrying the URL in the cause chain',
-      SECRET_URL,
-      () =>
+      'a TLS failure carrying it in the cause chain',
+      (e) => () =>
         Promise.reject(
-          new TypeError('fetch failed', {
-            cause: new Error(`unable to verify certificate for ${SECRET_URL}`),
-          }),
+          new TypeError('fetch failed', { cause: new Error(`unable to verify certificate for ${e}`) }),
         ),
     ],
-    [
-      'a 4xx body echoing the request URL back',
-      SECRET_URL,
-      () => Promise.resolve(res(404, `no route for ${SECRET_URL}`)),
-    ],
-  ])('never leaks a credential-bearing URL in an error (%s)', async (_label, url, stub) => {
-    if (stub !== undefined) vi.stubGlobal('fetch', stub);
+    ['a 4xx body echoing it back', (e) => () => Promise.resolve(res(404, `no route for ${e}`))],
+  ];
+
+  it.each(
+    SPELLINGS.flatMap(([spelling, spell]) =>
+      VECTORS.map(([vector, make]) => [`${vector}, ${spelling}`, spell, make] as const),
+    ),
+  )('never leaks a credential-bearing URL in an error (%s)', async (_label, spell, make) => {
+    vi.stubGlobal('fetch', make(spell(SECRET_URL)));
     const err = await rejects(
-      fetchWithRetry(url, {}, { label: 'Telegram GET /getMe', isStopped: () => false }),
+      fetchWithRetry(SECRET_URL, {}, { label: 'Telegram GET /getMe', isStopped: () => false }),
+    );
+    expect(err.message).toContain('Telegram GET /getMe');
+    expect(err.message).not.toContain(CANARY);
+  });
+
+  // The one vector with no stub at all: a real `fetch` rejecting on a URL it cannot even parse.
+  it('never leaks a credential-bearing URL that fetch itself refuses to parse', async () => {
+    const err = await rejects(
+      fetchWithRetry(
+        `https://api.example.test:99999/bot123:${CANARY}/getMe`,
+        {},
+        { label: 'Telegram GET /getMe', isStopped: () => false },
+      ),
     );
     expect(err.message).toContain('Telegram GET /getMe');
     expect(err.message).not.toContain(CANARY);
@@ -558,23 +788,55 @@ describe('retryAfterFromHeader', () => {
 });
 
 describe('sanitizeBody', () => {
-  it.each([
-    ['C0 control', 'a\u0000b\u0007c\u001bd', /[\u0000-\u001F]/],
-    ['DEL', 'a\u007Fb', /\u007F/],
-    ['line separator U+2028', 'a\u2028b', /\u2028/],
-    ['paragraph separator U+2029', 'a\u2029b', /\u2029/],
-    ['RTL override', 'a\u202Eb', /\u202E/],
-    ['bidi isolate', 'a\u2066b\u2069c', /[\u2066-\u2069]/],
-  ])('strips %s so the body cannot forge structure', (_label, payload, pattern) => {
+  // Anything that can forge line structure, reorder text, or hide itself. Generated per FAMILY, not
+  // per remembered character: the listed version covered C0 and the bidi controls but not C1, so
+  // U+0085 NEL (a line terminator in most terminals) and U+009B CSI (the 8-bit ANSI introducer)
+  // passed straight through a guard documented as flattening the body.
+  const span = (from: number, to: number): string =>
+    Array.from({ length: to - from + 1 }, (_, i) => String.fromCodePoint(from + i)).join('');
+
+  const FORBIDDEN = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+  const HALF_A_PAIR = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  const FAMILIES: [string, string][] = [
+    ['the whole C0 range', span(0x00, 0x1f)],
+    ['DEL', '\u007F'],
+    ['the whole C1 range', span(0x80, 0x9f)],
+    ['line and paragraph separators', '\u2028\u2029'],
+    ['bidi marks, embeddings and overrides', span(0x200e, 0x200f) + span(0x202a, 0x202e)],
+    ['bidi isolates', span(0x2066, 0x2069)],
+    ['zero-width joiners, soft hyphen and BOM', '\u200C\u200D\u00AD\uFEFF'],
+    ['interlinear annotation controls', span(0xfff9, 0xfffb)],
+    ['a lone high surrogate', '\uD800'],
+    ['a lone low surrogate', '\uDFFF'],
+  ];
+
+  it.each(FAMILIES)('strips %s so the body cannot forge structure or hide', (_label, chars) => {
+    const payload = `head${chars}tail`;
     const out = sanitizeBody(payload);
-    expect(pattern.test(out)).toBe(false);
-    expect(out.length).toBe(payload.length);
+    expect(FORBIDDEN.test(out)).toBe(false);
+    expect(HALF_A_PAIR.test(out)).toBe(false);
+    expect(out.length).toBeLessThanOrEqual(payload.length);
+    expect(out).toContain('head');
+    expect(out).toContain('tail');
+  });
+
+  it('keeps the printable text a family was hiding among', () => {
+    expect(sanitizeBody('a\u0085b\u009Bc')).toBe('a b c');
   });
 
   it('truncates past the cap and marks it', () => {
     const out = sanitizeBody('x'.repeat(MAX_ERROR_BODY + 50));
     expect(out.length).toBeLessThanOrEqual(MAX_ERROR_BODY + 20);
     expect(out).toMatch(/truncated/);
+  });
+
+  // Slicing at a UTF-16 boundary can land between the halves of an astral character, and half a
+  // pair reaches the MCP result as something nothing downstream can decode.
+  it.each([0, 1, 2])('never emits half an astral character at the cap (offset %i)', (offset) => {
+    const out = sanitizeBody(`${'x'.repeat(MAX_ERROR_BODY - 1 + offset)}\u{1F600}${'y'.repeat(80)}`);
+    expect(HALF_A_PAIR.test(out)).toBe(false);
+    expect(out.length).toBeLessThanOrEqual(MAX_ERROR_BODY + 20);
   });
 
   it('leaves an ordinary short body intact', () => {
@@ -599,8 +861,16 @@ describe('delay', () => {
 describe('README', () => {
   const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 
+  // `toContain(name)` over the whole file counts incidental prose as documentation: short names
+  // like `delay` match a sentence that never mentions the export. Require the name in a code span.
+  const asCodeSpan = (name: string): RegExp => new RegExp(`\`${name}(\`|\\()`);
+
   it.each(Object.keys(api).sort())('documents the exported `%s`', (name) => {
-    expect(readme).toContain(name);
+    expect(readme).toMatch(asCodeSpan(name));
+  });
+
+  it('finds code spans at all, so the check above cannot pass by finding none', () => {
+    expect(readme.split('`').length).toBeGreaterThan(20);
   });
 
   it('does not describe a publicly-published package as internal', () => {
