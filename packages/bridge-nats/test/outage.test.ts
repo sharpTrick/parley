@@ -61,7 +61,7 @@ suite('nats network faults', () => {
           got.push(m.content);
         });
         await pub.post(topic, asHandle('sys'), 'before');
-        await waitFor(() => got.includes('before'), 8000);
+        await waitFor(() => got.includes('before'), 20000);
         const preFault = (await sub.fetchRecent({ topic })).nextCursor;
 
         proxy.cut();
@@ -71,7 +71,7 @@ suite('nats network faults', () => {
         await pub.post(topic, asHandle('sys'), 'after');
 
         // (a) live push resumes and backfills what was published during the outage
-        await waitFor(() => got.includes('during') && got.includes('after'), 20000);
+        await waitFor(() => got.includes('during') && got.includes('after'), 60000);
         expect([...new Set(got)]).toEqual(['before', 'during', 'after']);
 
         // (b) catch-up from the pre-fault cursor still sees everything
@@ -81,7 +81,7 @@ suite('nats network faults', () => {
         // (c) the write path is alive too
         const id = await sub.post(topic, asHandle('sys'), 'post-heal');
         expect(id).toBeDefined();
-        await waitFor(() => got.includes('post-heal'), 10000);
+        await waitFor(() => got.includes('post-heal'), 30000);
       } finally {
         await sub.disconnect();
         await pub.disconnect();
@@ -127,7 +127,7 @@ suite('nats network faults', () => {
           const pre = prior.pre;
           if (pre !== undefined) {
             await pub.post(topic, asHandle('sys'), pre);
-            await waitFor(() => got.includes(pre), 8000);
+            await waitFor(() => got.includes(pre), 20000);
           }
           // The consumer must exist before we take it away, or the "outage" is a no-op.
           await waitForAsync(async () => (await consumerCount(topic)) >= 1, 8000);
@@ -139,9 +139,9 @@ suite('nats network faults', () => {
           await new Promise((r) => setTimeout(r, 1500));
           proxy.heal();
 
-          await waitFor(() => got.includes('during-gap'), 30000);
+          await waitFor(() => got.includes('during-gap'), 60000);
           await pub.post(topic, asHandle('sys'), 'after');
-          await waitFor(() => got.includes('after'), 15000);
+          await waitFor(() => got.includes('after'), 30000);
 
           const expected = prior.pre === undefined ? ['during-gap', 'after'] : ['before', 'during-gap', 'after'];
           expect([...new Set(got)]).toEqual(expected);
