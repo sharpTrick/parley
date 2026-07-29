@@ -27,7 +27,14 @@ const MAX_IDENTIFIER_BYTES = 63;
  * Every suffix the schema appends to `table_name`. The accepted-name budget is derived from the
  * longest entry, so adding a suffix here narrows the budget instead of silently truncating.
  */
-const DERIVED_SUFFIXES = ['', '_topic_seq', '_senders', '_notify', '_notify_trg'] as const;
+const DERIVED_SUFFIXES = [
+  '',
+  '_topic_seq',
+  '_ts',
+  '_senders',
+  '_notify',
+  '_notify_trg',
+] as const;
 
 const LONGEST_SUFFIX_BYTES = Math.max(
   ...DERIVED_SUFFIXES.map((s) => Buffer.byteLength(s, 'utf8')),
@@ -37,31 +44,48 @@ const LONGEST_SUFFIX_BYTES = Math.max(
 export const MAX_TABLE_NAME_BYTES = MAX_IDENTIFIER_BYTES - LONGEST_SUFFIX_BYTES;
 
 /**
- * Table names are interpolated into DDL/SQL text (they can't be bind parameters), so refuse
- * anything outside plain identifier characters — no quoting games, no injection surface — and
- * anything long enough that a derived name would truncate into another one.
+ * The one rejection formatter for `backend_config` values. Every rejection this package raises —
+ * from {@link assertTableName} as much as from `validateBackendConfig` — goes through here, so the
+ * documented `parley-postgres: … backend_config.<key>` contract holds on every path an operator's
+ * value can take.
+ */
+export function badConfig(key: string, reason: string): Error {
+  return new Error(`parley-postgres: invalid backend_config.${key} — ${reason}`);
+}
+
+/**
+ * Validate and canonicalise `table_name`. Table names are interpolated into DDL/SQL text (they
+ * can't be bind parameters), so refuse anything outside plain identifier characters and anything
+ * long enough that a derived name would truncate into another one. The result is lower-cased and
+ * every interpolation quotes it ({@link quotedNames}), which is what lets an accepted name that
+ * happens to be a reserved word (`user`, `order`, …) work instead of failing as a raw parse error;
+ * lower-casing first keeps the quoted relation byte-identical to the one an unquoted spelling of
+ * the same name would have created.
  */
 export function assertTableName(name: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    throw new Error(
+    throw badConfig(
+      'table_name',
       `invalid table_name ${JSON.stringify(name)} — use only [A-Za-z0-9_], not starting with a digit`,
     );
   }
   if (Buffer.byteLength(name, 'utf8') > MAX_TABLE_NAME_BYTES) {
-    throw new Error(
+    throw badConfig(
+      'table_name',
       `invalid table_name ${JSON.stringify(name)} — at most ${MAX_TABLE_NAME_BYTES} bytes, so the ` +
         `derived relations (${DERIVED_SUFFIXES.filter((s) => s !== '')
           .map((s) => `<table_name>${s}`)
           .join(', ')}) stay under PostgreSQL's ${MAX_IDENTIFIER_BYTES}-byte identifier limit`,
     );
   }
-  return name;
+  return name.toLowerCase();
 }
 
 /** Every relation name the schema derives from one validated `table_name`. */
 export interface SchemaNames {
   messages: string;
   topicSeqIndex: string;
+  tsIndex: string;
   senders: string;
   notifyFn: string;
   notifyTrigger: string;
@@ -72,10 +96,23 @@ export function schemaNames(table: string): SchemaNames {
   return {
     messages: t,
     topicSeqIndex: `${t}_topic_seq`,
+    tsIndex: `${t}_ts`,
     senders: `${t}_senders`,
     notifyFn: `${t}_notify`,
     notifyTrigger: `${t}_notify_trg`,
   };
+}
+
+/**
+ * The same relation names, double-quoted for interpolation into SQL. Everything this package
+ * interpolates goes through here — a bare `${table}` would reintroduce the reserved-word parse
+ * error quoting exists to remove.
+ */
+export function quotedNames(table: string): SchemaNames {
+  const n = schemaNames(table);
+  return Object.fromEntries(
+    Object.entries(n).map(([k, v]) => [k, `"${v}"`]),
+  ) as unknown as SchemaNames;
 }
 
 /**
@@ -93,7 +130,7 @@ export function channelFor(topic: string): string {
  * bootstrapping the same table don't race the CREATEs.
  */
 export function buildSchema(table: string): string {
-  const n = schemaNames(table);
+  const n = quotedNames(table);
   return `
 CREATE TABLE IF NOT EXISTS ${n.messages} (
   seq         BIGSERIAL PRIMARY KEY,
@@ -104,6 +141,7 @@ CREATE TABLE IF NOT EXISTS ${n.messages} (
   in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
 );
 CREATE INDEX IF NOT EXISTS ${n.topicSeqIndex} ON ${n.messages} (topic, seq);
+CREATE INDEX IF NOT EXISTS ${n.tsIndex} ON ${n.messages} (ts);
 CREATE TABLE IF NOT EXISTS ${n.senders} (
   handle      TEXT PRIMARY KEY,
   backend_ref TEXT NOT NULL

@@ -13,11 +13,19 @@ const state = vi.hoisted(() => ({
   /** Delay applied to the tail read and the LISTEN, so the registration window is wide. */
   slowMs: 0,
   clients: [] as MockClientShape[],
-  /** Rows the pool hands back on the NEXT drain SELECT for a topic, capped by the SQL's LIMIT. */
-  drainRows: new Map<string, Record<string, unknown>[]>(),
+  /**
+   * The table, per topic. Rows STAY here: the cursor predicate and the ORDER BY in the SQL decide
+   * what comes back, exactly as the server decides it.
+   */
+  rows: new Map<string, Record<string, unknown>[]>(),
   listenCalls: [] as string[],
   /** When true, `query('LISTEN …')` rejects on the listener connection. */
   listenRejects: false,
+  /**
+   * Fired the moment a drain read is about to come back empty — the instant a row committed
+   * elsewhere would land while the drain believes it has caught up.
+   */
+  onDrainEmpty: null as (() => void) | null,
 }));
 
 interface MockClientShape {
@@ -26,7 +34,9 @@ interface MockClientShape {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-vi.mock('pg', () => {
+vi.mock('pg', async () => {
+  const { servePool } = await import('./fake-pg.js');
+
   class MockClient implements MockClientShape {
     private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
     constructor() {
@@ -54,16 +64,14 @@ vi.mock('pg', () => {
   }
 
   const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
-    if (/MAX\(seq\)/.test(sql)) {
-      if (state.slowMs > 0) await sleep(state.slowMs);
-      return { rows: [{ max: '0' }] };
+    if (/MAX\(seq\)/.test(sql) && state.slowMs > 0) await sleep(state.slowMs);
+    const served = servePool(state.rows.get(String(values?.[0])) ?? [], sql, values ?? []);
+    if (served !== undefined && served.length === 0 && state.onDrainEmpty !== null) {
+      const fire = state.onDrainEmpty;
+      state.onDrainEmpty = null;
+      fire();
     }
-    const batch = /seq > \$2/.test(sql) ? /LIMIT (\d+)/.exec(sql) : null;
-    if (batch !== null) {
-      const topic = String(values?.[0]);
-      return { rows: state.drainRows.get(topic)?.splice(0, Number(batch[1])) ?? [] };
-    }
-    return { rows: [] };
+    return { rows: served ?? [] };
   };
 
   return {
@@ -99,7 +107,8 @@ beforeEach(() => {
   state.clients.length = 0;
   state.listenCalls.length = 0;
   state.listenRejects = false;
-  state.drainRows.clear();
+  state.rows.clear();
+  state.onDrainEmpty = null;
 });
 
 afterEach(() => {
@@ -152,7 +161,7 @@ describe('concurrent subscribe registration', () => {
     state.slowMs = 0;
     for (const [channel, sub] of priv.subs.entries()) {
       const topic = (sub as unknown as { topic: string }).topic;
-      state.drainRows.set(topic, rows(topic, 1));
+      state.rows.set(topic, rows(topic, 1));
       state.clients[0]?.emit('notification', { channel });
     }
     await sleep(80);
@@ -200,13 +209,51 @@ describe('drain honours the server-side batch cap', () => {
         ...(plugin as unknown as { subs: Map<string, unknown> }).subs.keys(),
       ][0] as string;
 
-      state.drainRows.set(topic, rows(topic, count));
+      state.rows.set(topic, rows(topic, count));
       state.clients[0]?.emit('notification', { channel });
       await sleep(120);
 
       expect(got.map((m) => m.content)).toEqual(
         Array.from({ length: count }, (_, i) => `m${i}`),
       );
+      expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
+
+      await plugin.disconnect();
+    },
+    15000,
+  );
+
+  // The drain re-queries until empty, so almost every mid-drain arrival is swept up by the loop
+  // itself. The one that isn't is a row that commits in the instant the drain's last read comes
+  // back empty: its NOTIFY lands while `draining` is still set, so the notification is dropped and
+  // only the coalescing flag makes the loop run once more. Nothing else in the suite reaches that
+  // instant, so it is driven directly here at each batch boundary.
+  it.each([1, DRAIN_BATCH, DRAIN_BATCH + 1])(
+    'a row committing in the instant a %i-row drain reads empty is still delivered, with no second NOTIFY',
+    async (count) => {
+      const plugin = new PostgresPlugin();
+      await plugin.connect({ url: REAL_URL });
+
+      const got: Message[] = [];
+      const topic = 'coalesce';
+      await plugin.subscribe(asTopic(topic), (m) => got.push(m));
+      const channel = [
+        ...(plugin as unknown as { subs: Map<string, unknown> }).subs.keys(),
+      ][0] as string;
+
+      state.rows.set(topic, rows(topic, count));
+      state.onDrainEmpty = () => {
+        state.rows.get(topic)?.push(...rows(topic, 1, count + 1));
+        state.clients[0]?.emit('notification', { channel });
+      };
+      state.clients[0]?.emit('notification', { channel });
+      await sleep(200);
+
+      expect(state.onDrainEmpty, 'the mid-drain arrival never happened').toBeNull();
+      expect(got.map((m) => m.content)).toEqual([
+        ...Array.from({ length: count }, (_, i) => `m${i}`),
+        'm0',
+      ]);
       expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
 
       await plugin.disconnect();

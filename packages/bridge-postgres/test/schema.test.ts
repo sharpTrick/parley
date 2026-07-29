@@ -38,6 +38,14 @@ const ACCEPTED = [
   ['digits after the first char', 'm1_2'],
   ['single char', 'm'],
   ['exactly the byte budget', 'a'.repeat(MAX_TABLE_NAME_BYTES)],
+  // Reserved words are accepted because every interpolation quotes the identifier. Before that,
+  // they slipped past the guard and surfaced as a bare PostgreSQL parse error naming neither
+  // Parley nor the config key.
+  ['reserved word user', 'user'],
+  ['reserved word order', 'order'],
+  ['reserved word table', 'table'],
+  ['reserved word select', 'select'],
+  ['reserved word group', 'group'],
 ] as const;
 
 const REJECTED = [
@@ -66,9 +74,26 @@ describe('assertTableName', () => {
     expect(() => buildSchema(name)).not.toThrow();
   });
 
-  it.each(REJECTED)('rejects %s', (_label, name) => {
-    expect(() => assertTableName(name)).toThrow(/table_name/);
-    expect(() => buildSchema(name)).toThrow(/table_name/);
+  // The rejection contract is stated once, in validateBackendConfig's JSDoc, and an operator
+  // reading a message that names neither the plugin nor the key has no idea which knob to fix.
+  // It only holds if EVERY path a table_name can be rejected on formats it the same way.
+  const CONTRACT = /^parley-postgres: invalid backend_config\.table_name — /;
+
+  it.each(REJECTED)('rejects %s, naming the plugin and the key', (_label, name) => {
+    expect(() => assertTableName(name)).toThrow(CONTRACT);
+    expect(() => buildSchema(name)).toThrow(CONTRACT);
+  });
+
+  it('lower-cases the accepted name, so the quoted relation is the one an unquoted spelling would have made', () => {
+    expect(assertTableName('MixedCase')).toBe('mixedcase');
+    expect(schemaNames('MixedCase').senders).toBe('mixedcase_senders');
+    expect(buildSchema('MixedCase')).toContain('"mixedcase"');
+  });
+
+  it('quotes every relation it interpolates, so a reserved word is a table name and not a parse error', () => {
+    const ddl = buildSchema('user');
+    expect(ddl).toContain('"user"');
+    expect(ddl).not.toMatch(/(FROM|TABLE|ON|EXISTS) user\b/);
   });
 
   // The stem is only half the story: every relation the schema derives from it must ALSO survive
@@ -100,7 +125,7 @@ describe('connect() rejects a bad table_name before it touches the database', ()
     poolCtor.mockClear();
     await expect(
       new PostgresPlugin().connect({ url: 'postgres://app:s3cret@db.example.com:5432/prod', table_name: name }),
-    ).rejects.toThrow(/table_name/);
+    ).rejects.toThrow(/^parley-postgres: invalid backend_config\.table_name — /);
     expect(poolCtor).not.toHaveBeenCalled();
   });
 });

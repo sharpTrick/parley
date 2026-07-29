@@ -40,12 +40,22 @@ backend_config:
 ```
 
 `table_name` is capped at 52 bytes because every other relation is derived from it by suffixing
-(`<table_name>_senders`, `_topic_seq`, `_notify`, `_notify_trg`) and PostgreSQL truncates
-identifiers at 63 bytes — a longer stem would silently make two of those the same relation.
+(`<table_name>_senders`, `_topic_seq`, `_ts`, `_notify`, `_notify_trg`) and PostgreSQL truncates
+identifiers at 63 bytes — a longer stem would silently make two of those the same relation. The
+name is lower-cased and double-quoted everywhere it reaches SQL, so a reserved word (`user`,
+`order`, `table`) is a working table name rather than a bare PostgreSQL parse error. Every
+`table_name` rejection is formatted like the other knobs': `parley-postgres: invalid
+backend_config.table_name — …`.
 
-`retention_days` deletes rows older than the window on connect and hourly thereafter. `seq` is a
+`retention_days` deletes rows older than the window on connect and hourly thereafter, in batches
+of 5000 rows per statement against an index on `ts`, so the first prune after enabling retention
+on a large table cannot become one long DELETE that every `post()` queues behind. `seq` is a
 `BIGSERIAL` and is never reused, so a cursor minted before a prune stays valid: a stale reader
-just gets fewer rows back, never a wrong or duplicate one.
+just gets fewer rows back, never a wrong or duplicate one. The sender registry is not pruned —
+it is bounded by the number of distinct handles, not by message volume.
+
+`connect()` rejects if the plugin is already connected: call `disconnect()` first. A second
+`connect()` would otherwise strand the previous pool and prune timer with no way to reclaim them.
 
 Every key is validated before the pool is opened, and `connect()` rejects — naming the key — on an
 unrecognised key (a typo would otherwise silently disable the feature), a `pool_size` that is not
@@ -71,9 +81,19 @@ transaction that takes `pg_advisory_xact_lock(hashtext(topic))` first. `BIGSERIA
 at INSERT time, not COMMIT time, so without the lock a larger `seq` could become visible before
 a smaller one commits and a catch-up reader would skip the late row forever. The per-topic lock
 serializes same-topic commits into `seq` order (distinct topics don't contend), which is what
-keeps the cursor monotonic and lossless under genuinely concurrent writers — the conformance
-suite's `concurrentPost` check drives N independent plugin instances against one table to prove
-it.
+keeps the cursor monotonic and lossless under genuinely concurrent writers.
+
+Two different tests hold that, and they prove different things:
+
+- the conformance suite's `concurrentPost` check drives N independent plugin instances against one
+  table and reads the topic **after every writer has committed** — so it proves uniqueness and
+  post-hoc ordering, and it stays green even with the advisory lock deleted;
+- `test/cursor-loss.test.ts` runs a reader **interleaved with** the writers, advancing its own
+  cursor while writes are still in flight. That is the case the lock exists for, and it is the one
+  that fails without it.
+
+If you are tempted to remove or refactor the lock, run that second file — a green conformance run
+is not evidence.
 
 ## Run Postgres
 

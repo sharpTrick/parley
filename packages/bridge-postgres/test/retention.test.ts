@@ -73,6 +73,44 @@ if (await isUp(PG_URL)) {
       }
     }, 20000);
 
+    // The prune is issued in bounded statements (prune-bounded.test.ts pins the statement shape).
+    // A backlog larger than one batch is what proves the loop around them runs to completion
+    // against a real server instead of removing one batch and calling it done.
+    it('removes a backlog larger than a single prune batch, completely', async () => {
+      const table = `parley_ret_${rand()}`;
+      const topic = asTopic(`ret-${rand()}`);
+      const backlog = 5001;
+
+      const seeder = new PostgresPlugin();
+      await seeder.connect({ url: PG_URL, table_name: table });
+      await seeder.disconnect();
+
+      const admin = new Client({ connectionString: PG_URL });
+      admin.on('error', () => undefined);
+      await admin.connect();
+      await admin.query(
+        `INSERT INTO "${table}" (topic, sender, content, ts, in_reply_to)
+         SELECT $1, 'u', 'm' || g, $2, NULL FROM generate_series(1, $3::int) g`,
+        [topic, new Date(Date.now() - 86_400_000).toISOString(), backlog],
+      );
+      await admin.end();
+
+      const plugin = new PostgresPlugin();
+      await plugin.connect({ url: PG_URL, table_name: table, retention_days: 1 / 86_400_000 });
+      try {
+        const deadline = Date.now() + 20000;
+        let left = 1;
+        while (left > 0 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 100));
+          left = (await plugin.fetchRecent({ topic, limit: 1 })).messages.length;
+        }
+        expect(left, 'prune stopped before the backlog was gone').toBe(0);
+      } finally {
+        await plugin.disconnect();
+        await dropTable(table);
+      }
+    }, 60000);
+
     it('clears the prune timer on disconnect so it cannot keep the process alive', async () => {
       const table = `parley_ret_${rand()}`;
       const plugin = new PostgresPlugin();

@@ -19,12 +19,13 @@ import { delay } from '@sharptrick/parley-net-util';
 import { Client, Pool } from 'pg';
 import {
   assertTableName,
+  badConfig,
   buildSchema,
   channelFor,
   MAX_TABLE_NAME_BYTES,
   type MessageRow,
+  quotedNames,
   type SchemaNames,
-  schemaNames,
 } from './schema.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
@@ -62,10 +63,8 @@ const RECONNECT_DELAY_MS = 500;
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 const CONFIG_KEYS = ['url', 'table_name', 'pool_size', 'retention_days'] as const;
-
-function bad(key: string, reason: string): Error {
-  return new Error(`parley-postgres: invalid backend_config.${key} — ${reason}`);
-}
+/** Rows one prune statement may delete, so retention never issues one unbounded table-wide DELETE. */
+const PRUNE_BATCH = 5000;
 
 function describeValue(v: unknown): string {
   return typeof v === 'string' ? `'${v}'` : String(v);
@@ -88,12 +87,12 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
 
   const url = cfg['url'];
   if (url !== undefined && (typeof url !== 'string' || url === '')) {
-    throw bad('url', `expected a non-empty string, got ${describeValue(url)}`);
+    throw badConfig('url', `expected a non-empty string, got ${describeValue(url)}`);
   }
 
   const tableName = cfg['table_name'];
   if (tableName !== undefined && (typeof tableName !== 'string' || tableName === '')) {
-    throw bad('table_name', `expected a non-empty string, got ${describeValue(tableName)}`);
+    throw badConfig('table_name', `expected a non-empty string, got ${describeValue(tableName)}`);
   }
 
   const poolSize = cfg['pool_size'];
@@ -104,7 +103,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
       poolSize < MIN_POOL_SIZE ||
       poolSize > MAX_POOL_SIZE)
   ) {
-    throw bad(
+    throw badConfig(
       'pool_size',
       `expected an integer between ${MIN_POOL_SIZE} and ${MAX_POOL_SIZE}, got ` +
         `${describeValue(poolSize)} — a pool that cannot hand out a connection makes connect() ` +
@@ -114,14 +113,14 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
 
   const retention = cfg['retention_days'];
   if (retention !== undefined && (typeof retention !== 'number' || !(retention > 0))) {
-    throw bad(
+    throw badConfig(
       'retention_days',
       `expected a number > 0, got ${describeValue(retention)} — 0 or negative would delete the ` +
         `whole history; omit the key to keep every message forever`,
     );
   }
   if (typeof retention === 'number' && !Number.isFinite(retention)) {
-    throw bad('retention_days', `expected a finite number, got ${describeValue(retention)}`);
+    throw badConfig('retention_days', `expected a finite number, got ${describeValue(retention)}`);
   }
 
   return cfg as PostgresBackendConfig;
@@ -179,7 +178,8 @@ export class PostgresPlugin implements BackendPlugin {
   private pool?: Pool;
   private url = DEFAULT_URL;
   private table = 'parley_messages';
-  private names: SchemaNames = schemaNames('parley_messages');
+  /** Relation names already double-quoted — the only spelling that may reach SQL text. */
+  private names: SchemaNames = quotedNames('parley_messages');
   private retentionDays?: number;
   private pruneTimer?: ReturnType<typeof setInterval>;
   private stopped = false;
@@ -214,9 +214,15 @@ export class PostgresPlugin implements BackendPlugin {
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = validateBackendConfig(config);
+    if (this.pool !== undefined) {
+      throw new Error(
+        'parley-postgres: already connected — call disconnect() first. A second connect() would ' +
+          'strand the previous pool and prune timer with no way for the caller to reclaim them',
+      );
+    }
     this.url = cfg.url ?? DEFAULT_URL;
     this.table = assertTableName(cfg.table_name ?? 'parley_messages');
-    this.names = schemaNames(this.table);
+    this.names = quotedNames(this.table);
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
 
@@ -248,6 +254,13 @@ export class PostgresPlugin implements BackendPlugin {
       throw err;
     }
     client.release();
+    // Same hazard the listener has, one resource up: a disconnect() can complete while the
+    // bootstrap is in flight. Publishing the pool after that leaves a live pool — and, below, a
+    // prune timer — attached to a plugin the caller has already shut down.
+    if (this.stopped) {
+      await pool.end().catch(() => undefined);
+      throw new Error('parley-postgres: disconnected while connect() was in flight');
+    }
     this.pool = pool;
 
     if (this.retentionDays !== undefined) {
@@ -262,15 +275,28 @@ export class PostgresPlugin implements BackendPlugin {
   }
 
   /**
-   * Delete rows older than `retention_days`. Best-effort — a transient failure retries next tick.
-   * Keep the whole body inside the try, so that no arithmetic on an operator-supplied window can
-   * escape this un-awaited call as an unhandled rejection and take the process down.
+   * Delete rows older than `retention_days`, {@link PRUNE_BATCH} rows per statement. The first
+   * prune after an operator enables retention on a long-lived table can have millions of rows to
+   * remove; keep it batched, so that it cannot become one long DELETE holding row locks while
+   * every advisory-lock-serialized `post()` queues behind it. Best-effort — a transient failure
+   * retries next tick. Keep the whole body inside the try, so that no arithmetic on an
+   * operator-supplied window can escape this un-awaited call as an unhandled rejection and take
+   * the process down.
    */
   private async prune(): Promise<void> {
     if (this.retentionDays === undefined || this.pool === undefined) return;
     try {
       const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
-      await this.pool.query(`DELETE FROM ${this.names.messages} WHERE ts < $1`, [cutoff]);
+      for (;;) {
+        if (this.stopped || this.pool === undefined) return;
+        const res = await this.pool.query(
+          `DELETE FROM ${this.names.messages} WHERE seq IN (
+             SELECT seq FROM ${this.names.messages} WHERE ts < $1 ORDER BY seq LIMIT ${PRUNE_BATCH}
+           )`,
+          [cutoff],
+        );
+        if ((res.rowCount ?? 0) < PRUNE_BATCH) return;
+      }
     } catch {
       // Transient contention/connection failure — retry on the next interval.
     }
@@ -318,7 +344,7 @@ export class PostgresPlugin implements BackendPlugin {
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [topic]);
       const res = await client.query(
-        `INSERT INTO ${this.table} (topic, sender, content, ts, in_reply_to)
+        `INSERT INTO ${this.names.messages} (topic, sender, content, ts, in_reply_to)
          VALUES ($1, $2, $3, $4, $5) RETURNING seq::text AS seq`,
         [topic, identity, content, new Date().toISOString(), opts?.inReplyTo ?? null],
       );
@@ -346,7 +372,7 @@ export class PostgresPlugin implements BackendPlugin {
       // cursor to advance past there is nothing to block on, so `blockMs` is ignored here.
       const res = await this.require().query(
         `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
-         FROM ${this.table} WHERE topic = $1 ORDER BY ${this.table}.seq DESC LIMIT $2`,
+         FROM ${this.names.messages} WHERE topic = $1 ORDER BY ${this.names.messages}.seq DESC LIMIT $2`,
         [args.topic, limit],
       );
       return this.pageResult((res.rows as MessageRow[]).reverse(), args);
@@ -369,7 +395,7 @@ export class PostgresPlugin implements BackendPlugin {
   private async exclusiveSince(topic: Topic, since: Cursor, limit: number): Promise<MessageRow[]> {
     const res = await this.require().query(
       `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
-       FROM ${this.table} WHERE topic = $1 AND seq > $2::bigint ORDER BY ${this.table}.seq ASC LIMIT $3`,
+       FROM ${this.names.messages} WHERE topic = $1 AND seq > $2::bigint ORDER BY ${this.names.messages}.seq ASC LIMIT $3`,
       [topic, since, limit],
     );
     return res.rows as MessageRow[];
@@ -509,7 +535,7 @@ export class PostgresPlugin implements BackendPlugin {
     const listener = await this.ensureListener();
     // Tail first: push never replays history (catch-up owns it).
     const res = await pool.query(
-      `SELECT COALESCE(MAX(seq), 0)::text AS max FROM ${this.table} WHERE topic = $1`,
+      `SELECT COALESCE(MAX(seq), 0)::text AS max FROM ${this.names.messages} WHERE topic = $1`,
       [topic],
     );
     const sub: TopicSubscription = {
@@ -608,6 +634,21 @@ export class PostgresPlugin implements BackendPlugin {
     const client = new Client({ connectionString: this.url });
     this.wireListener(client);
     await client.connect();
+    return this.adoptListener(client);
+  }
+
+  /**
+   * The one place a freshly connected candidate becomes `this.listener`. Keep EVERY path that
+   * opens a listener socket going through here, so that a `disconnect()` which completed while
+   * the connect was in flight cannot leave a live pg connection attached to a stopped plugin —
+   * an orphan keeps the Node event loop referenced and holds a server backend slot for as long
+   * as the process runs.
+   */
+  private async adoptListener(client: Client): Promise<Client> {
+    if (this.stopped) {
+      await client.end().catch(() => undefined);
+      throw new Error('parley-postgres: disconnected while the listener connection was in flight');
+    }
     this.listener = client;
     return client;
   }
@@ -649,10 +690,6 @@ export class PostgresPlugin implements BackendPlugin {
         this.wireListener(client);
         try {
           await client.connect();
-          // A disconnect() can complete fully while connect() is in flight. If it did,
-          // this candidate must not become the live listener: end it and return, or its open pg
-          // socket keeps the Node event loop referenced (shutdown/tests hang) and `this.listener`
-          // is resurrected after a completed disconnect.
           if (this.stopped) {
             await client.end().catch(() => undefined);
             return;
@@ -662,12 +699,7 @@ export class PostgresPlugin implements BackendPlugin {
           for (const channel of this.listens.keys()) {
             await client.query(`LISTEN "${channel}"`);
           }
-          // Re-check after the LISTEN loop's awaits, before publishing `this.listener`.
-          if (this.stopped) {
-            await client.end().catch(() => undefined);
-            return;
-          }
-          this.listener = client;
+          await this.adoptListener(client);
           this.listenerPromise = Promise.resolve(client);
           for (const sub of this.subs.values()) this.drain(sub);
           return;
@@ -700,8 +732,8 @@ export class PostgresPlugin implements BackendPlugin {
             if (this.stopped) return;
             const res = await this.require().query(
               `SELECT seq::text AS seq, topic, sender, content, ts, in_reply_to
-               FROM ${this.table} WHERE topic = $1 AND seq > $2::bigint
-               ORDER BY ${this.table}.seq ASC LIMIT ${DRAIN_BATCH}`,
+               FROM ${this.names.messages} WHERE topic = $1 AND seq > $2::bigint
+               ORDER BY ${this.names.messages}.seq ASC LIMIT ${DRAIN_BATCH}`,
               [sub.topic, sub.lastSeen],
             );
             const rows = res.rows as MessageRow[];

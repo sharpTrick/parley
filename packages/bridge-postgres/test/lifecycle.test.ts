@@ -29,8 +29,9 @@ const state = vi.hoisted(() => ({
   connectGate: null as Deferred | null,
   // When true, `query('LISTEN …')` rejects (drives the failed-subscribe path).
   listenRejects: false,
-  // Rows the pool hands back, per topic, on the NEXT drain SELECT (then emptied — one delivery).
-  drainRows: new Map<string, Record<string, unknown>[]>(),
+  // The table, per topic. Rows STAY here: what a query returns is decided by the SQL's cursor
+  // predicate and ORDER BY, exactly as the server decides it.
+  rows: new Map<string, Record<string, unknown>[]>(),
 }));
 
 interface MockClientShape {
@@ -39,7 +40,9 @@ interface MockClientShape {
   emit: (event: string, arg?: unknown) => void;
 }
 
-vi.mock('pg', () => {
+vi.mock('pg', async () => {
+  const { servePool } = await import('./fake-pg.js');
+
   class MockClient implements MockClientShape {
     private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
     ended = false;
@@ -72,18 +75,8 @@ vi.mock('pg', () => {
   }
 
   const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
-    if (/MAX\(seq\)/.test(sql)) return { rows: [{ max: '0' }] };
-    // Drain SELECT (the push path's batch read): hand back at most the row cap the SQL asked for,
-    // so that the batching loop is exercised rather than handed everything in one reply — a fake
-    // that ignores the server's LIMIT leaves the re-query loop untested. The blocking-fetch read
-    // is the same shape but parameterizes its LIMIT, so it stays empty and the two paths cannot
-    // consume each other's rows.
-    const batch = /seq > \$2/.test(sql) ? /LIMIT (\d+)/.exec(sql) : null;
-    if (batch !== null) {
-      const topic = String(values?.[0]);
-      return { rows: state.drainRows.get(topic)?.splice(0, Number(batch[1])) ?? [] };
-    }
-    return { rows: [] };
+    const served = servePool(state.rows.get(String(values?.[0])) ?? [], sql, values ?? []);
+    return { rows: served ?? [] };
   };
 
   return {
@@ -107,7 +100,7 @@ beforeEach(() => {
   state.clients.length = 0;
   state.connectGate = null;
   state.listenRejects = false;
-  state.drainRows.clear();
+  state.rows.clear();
 });
 
 afterEach(() => {
@@ -192,7 +185,7 @@ describe('Postgres subscribe registration', () => {
     expect(sub.handlers.length).toBe(2);
 
     // Deliver one row via a NOTIFY on the shared listener connection.
-    state.drainRows.set('t', [
+    state.rows.set('t', [
       {
         seq: '1',
         topic: 't',
@@ -275,7 +268,7 @@ describe('Postgres listener reconnect delivers what the blackout missed', () => 
     const channelsNeeded = [...(plugin as unknown as { listens: Map<string, unknown> }).listens.keys()];
 
     // Queue the blackout rows, then drop the listener connection.
-    for (const t of subTopics) state.drainRows.set(t, blackoutRows(t, cell.rows));
+    for (const t of subTopics) state.rows.set(t, blackoutRows(t, cell.rows));
     const listener = state.clients[0];
     if (listener === undefined) {
       // Nothing subscribed and nothing waiting: the listener connection is lazy, so there is no
