@@ -2,7 +2,7 @@
   "name": "@sharptrick/parley-nats",
   "version": "0.1.0",
   "type": "module",
-  "description": "@sharptrick/parley-nats — subject->topic, JetStream seq->cursor, wildcard->subscribe. Skeleton against the frozen Parley seam — planned v0.5.",
+  "description": "@sharptrick/parley-nats — Parley backend on NATS JetStream: one stream per topic, the contiguous stream sequence as both cursor and backendMsgId, and an ordered consumer for live push.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"

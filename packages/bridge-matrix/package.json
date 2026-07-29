@@ -2,7 +2,7 @@
   "name": "@sharptrick/parley-matrix",
   "version": "0.1.0",
   "type": "module",
-  "description": "@sharptrick/parley-matrix — first external-network backend (matrix-js-sdk: room->topic, sync token->cursor, sync loop->subscribe, history->fetchRecent). Skeleton against the frozen Parley seam — planned v0.4.",
+  "description": "@sharptrick/parley-matrix — Parley backend over a Matrix homeserver, spoken to via the raw Client-Server HTTP API (no SDK; unencrypted rooms). Room per topic, event_id as both cursor and backendMsgId, and a filtered /sync long-poll for live push.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
