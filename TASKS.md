@@ -95,8 +95,10 @@ works end to end. Do not start v0.2 before this.
 
 - [x] M-1. **Read `elkimek/matrix-bridge` first** (prior art; `DESIGN.md` §17) for Matrix
       internals: E2EE via vodozemac, TOFU device trust, mention handling.
-- [x] M-2. `packages/bridge-matrix` via matrix-js-sdk: room→topic, sync token→cursor,
-      sync loop→`subscribe`, room history→`fetchRecent`.
+- [x] M-2. `packages/bridge-matrix`: room→topic, `event_id`→cursor, sync loop→`subscribe`, room
+      history→`fetchRecent`. Shipped as a hand-rolled raw Client-Server HTTP client rather than
+      via matrix-js-sdk (the SDK's weight is earned by E2EE device management, which unencrypted
+      rooms do not need); the `/sync` token drives the live loop only, it is not the cursor.
 - [x] M-3. Conformance suite green against Matrix; zero core changes (⚠).
 - [x] M-4. README points to canonical upstream Synapse Docker setup; maintainer throwaway
       instance added to `examples/dev-compose/`.
@@ -143,10 +145,52 @@ works end to end. Do not start v0.2 before this.
       hosts, owner role; config reference; security notes) + README/DESIGN updates.
 - [x] K-6. Zero changes to `createOAuthRemoteApp` / `ParleyOAuthProvider` / `transport/http.ts` (⚠).
 
-## Deferred (post-v1, do NOT build in v1)
+## Post-v1: five more backends (v0.6)
+
+- [x] `packages/bridge-postgres` — table + `LISTEN`/`NOTIFY`; `BIGSERIAL` cursor ordered by a
+      per-topic advisory lock so seq order == commit order. Verified against live Postgres 16.
+- [x] `packages/bridge-zulip` — stream+topic→topic, message id→cursor, event-queue long-poll.
+      In-process fake by default, plus an env-gated real-server suite.
+- [x] `packages/bridge-discord` / `bridge-slack` / `bridge-telegram` — hosted SaaS; gateway,
+      Socket Mode, and `getUpdates` respectively. Verified against in-process API fakes.
+- [x] Telegram's fit-contract gaps documented rather than faked: the Bot API has no history
+      endpoint, so `fetchRecent` replays a local store of *observed* messages — no pre-join
+      backfill, ever — and one poller per token makes multi-writer structurally impossible, so
+      that conformance case is skipped by design.
+- [x] Zero `bridge-core` changes across all five (⚠).
+
+## Post-v1: presence + reachability roster
+
+- [x] Presence beats (hello/heartbeat/goodbye) on ONE shared, reserved topic; `parley_list_users`
+      derived above the seam so it works on every backend with no new seam method.
+- [x] Offline-aware roster (recently-seen peers, not just live ones); instance-scoped liveness;
+      beats advertise `post_topics` reach; presence records versioned (additive fields).
+
+## Post-v1: `block_ms` long-poll (issue #20)
+
+- [x] Optional `blockMs` hint on the seam's `fetchRecent`, exposed as `block_ms` on
+      `parley_fetch_recent`; server-side cap `catchup.block_max_ms`.
+- [x] Native implementations on all nine event-driven backends; generic re-query fallback in core
+      for polling-only SQLite.
+- [x] Zero `bridge-core` seam changes — a capability added *after* the freeze (⚠).
+
+## Post-v1: release automation + consolidation
+
+- [x] `semantic-release` on merge to `main`; lockstep publish of every package with provenance via
+      OIDC trusted publishing; PR-title lint drives the bump; pre-merge publish preflight.
+- [x] A bin for every backend (`parley-<name>`), so all ten are runnable; the inert `backend:`
+      config key removed and rejected at load, and `skip_permissions` made a load error.
+- [x] CI runs every backend for real (redis, nats, postgres, xmpp, matrix, keycloak via
+      `dev-infra.sh up all`) and fails if any test file skips itself.
+- [x] `docs/1.0-readiness.md` — the evidence for cutting 1.0, and the mechanics.
+
+## Deferred (post-v1, deferred on purpose — not oversights)
 
 - [ ] Spawn-on-unknown-handle (launch a Code instance for a not-yet-running handle).
 - [ ] Richer payloads (files / images).
 - [ ] Multi-instance routing beyond per-session bridges.
-- [ ] Splitting plugins into separate repos (only once the seam has stopped changing — i.e.
-      two consecutive backends land with zero core changes; see prior discussion).
+- [ ] Splitting plugins into separate repos. **Its gate is now met** — the stated condition was
+      "two consecutive backends land with zero core changes", and every backend after sqlite has,
+      nine in a row. Still deferred: lockstep versioning across one repo is working, and splitting
+      would trade that for cross-repo release choreography with no current benefit. Revisit if the
+      packages ever need independent release cadences.

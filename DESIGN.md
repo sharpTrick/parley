@@ -43,9 +43,11 @@ them.
      persistence. This is the durable path.
    - The backend — not the channel — is the source of truth and memory.
 
-2. **Auth: claude.ai subscription only.** Channels requires a claude.ai login
-   (Pro/Max/Team/Enterprise). API-key / Console auth is **not** supported for the channel
-   path. Free tier is out of scope.
+2. **Auth: claude.ai *or* a Console API key.** Channels requires Anthropic authentication —
+   a claude.ai login (Pro/Max/Team/Enterprise) **or** a Console API key; not Bedrock/Vertex/
+   Foundry. Free tier is out of scope.
+   *(Corrected at the P-1 gate: this section previously said Console auth was unsupported. The
+   live docs say otherwise and, per CLAUDE.md, the docs win — see PROGRESS.md.)*
 
 3. **Custom-channel preview gating.** Loading a self-built channel currently requires the
    `--dangerously-load-development-channels` flag (official channels are allowlisted during
@@ -184,7 +186,9 @@ The same logical message can arrive twice — once via live push, once via `fetc
   Message and as `nextCursor` from `fetchRecent`.
   - SQLite → `INTEGER PRIMARY KEY AUTOINCREMENT` / rowid (free monotonic sequence).
   - Redis → stream entry ID (`XADD` IDs are monotonic).
-  - Matrix → per-room stream/sync token.
+  - Matrix → `event_id` (globally unique; "strictly after" resolved server-side via
+    `/context/<event_id>` → a forward pagination token). The `/sync` token drives the LIVE loop
+    only — it is not the cursor.
   - XMPP → MAM archive id.
   - NATS → JetStream sequence number.
   - Postgres → `BIGSERIAL` seq (per-topic advisory lock keeps seq order == commit order).
@@ -411,8 +415,20 @@ authenticates exactly one owner.
 
 A single config object drives the bridge; sane defaults everywhere. Illustrative:
 
+There is deliberately **no `backend:` key**. Core cannot load a plugin by name without learning
+backend names, which the seam forbids (§3) — so the backend is chosen by *which binary you run*.
+Every backend package ships one (`parley-sqlite`, `parley-redis`, `parley-matrix`, …), each a small
+composition root that constructs its own plugin and calls `createStdioBridge`. A config carrying a
+`backend:` key is rejected at load, naming the binary to run instead, rather than silently ignored.
+
 ```yaml
-backend: local-sqlite      # local-sqlite | local-redis | matrix | xmpp | nats
+# Run with: parley-sqlite --config parley.config.yaml
+instance_id: "ctx-payments-a"   # read-state namespace; defaults to identity.handle.
+                                # MUST be distinct per concurrent session sharing a handle, and
+                                # should be fresh when repointing at a different backend (cursors
+                                # are backend-specific — see §6).
+state_path: null                # override the read-state file location
+                                # (default $XDG_STATE_HOME/parley/<instance_id>/read-state.json)
 identity:
   handle: "ctx-payments"   # this instance's logical handle
 topics:                    # subscribe to / catch up on (one fetchRecent call each) — THE ALLOWLIST
@@ -422,26 +438,46 @@ post_topics:               # OPTIONAL extra topics allowed for post/fetch only, 
   - "ctx-payments-.*"      # (never subscribed/caught-up; the presence topic can never be matched)
 catchup:
   on_start: true
-  limit: 100
+  limit: 100                    # page size per fetchRecent
+  block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll;
+                                # a caller's value is clamped to this before it reaches a plugin,
+                                # kept below client tool timeouts so a blocked call never trips them
+  block_poll_interval_ms: 250    # re-query cadence for core's generic long-poll fallback, used only
+                                 # by backends that cannot block natively (SQLite). Latency/cost only.
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
 presence:                  # announce hello/heartbeat/goodbye; powers parley_list_users (§7)
-  enabled: true            # reactive-only front doors (chat) can set this false
+  enabled: true            # DEFAULT ON, and it WRITES to the backend: on a real Matrix/Zulip
+                           # account the presence topic is a room/stream created on first beat.
+                           # Reactive-only front doors (chat) should set this false.
   topic: "parley-presence" # ONE shared topic all bridges announce on; mute this one to hide presence
   heartbeat_ms: 600000     # 10 min — agents stay subscribed a long time
   ttl_ms: 1800000          # a handle is "live" if its last beat is within this window; default 3× heartbeat_ms
 permissions:
-  skip_permissions: false  # DANGEROUS; sandbox-only; default off
-backend_config:            # opaque to core; passed to the plugin
-  # local-sqlite:
-  #   db_path: ...
-  #   poll_interval_ms: 1000   # latency knob only; no correctness impact
-  # local-redis:  { url }
-  # matrix: { homeserver, user, access_token, ... }
-  # xmpp:   { jid, password, muc_service, ... }
-  # nats:   { servers, subject_prefix, jetstream: true, ... }
+  skip_permissions: false  # NOT IMPLEMENTED — nothing reads it (§2.5/§14 describe the intent).
+                           # `true` is a load error rather than an accepted no-op, so it can never
+                           # imply a sandbox mode that does not exist.
+auth:                      # remote/chat mode only; ignored under local stdio (§10)
+  mode: builtin            # builtin = the bundled single-tenant OAuth 2.1 AS
+                           # oidc    = delegate to an external IdP; Parley becomes a pure
+                           #           resource server (RFC 9728). See docs/keycloak-integration.md
+  oidc:
+    issuer: "https://auth.example.com/realms/parley"
+    audience: "parley-mcp"       # Keycloak ignores RFC 8707 `resource` — an audience mapper is required
+    required_role: "parley-owner"  # optional identity gates: also allowed_subjects / allowed_usernames
+backend_config:            # opaque to core; passed verbatim to the plugin's connect()
+  # sqlite:   { db_path, poll_interval_ms, retention_days? }
+  #             poll_interval_ms is a latency knob only; no correctness impact
+  # redis:    { url, retention_days? }          postgres: { url }
+  # matrix:   { homeserver_url, user, password | access_token, shared_room? }
+  # xmpp:     { service, jid, password, muc_service }   nats: { servers, stream_prefix, retention_days? }
+  # zulip / discord / slack / telegram: see each plugin's README
 ```
+
+`retention_days` is an opt-in prune knob on the backends whose store Parley itself owns (sqlite,
+redis, nats). Matrix and XMPP retention is a homeserver feature, not something an unprivileged
+bridge account can enact — see each plugin's README.
 
 Identity/topic→backend mapping is **convention-based by default** (derive
 room/subject/channel from handle/topic), overridable in `backend_config`.
@@ -478,7 +514,10 @@ room/subject/channel from handle/topic), overridable in `backend_config`.
 - Success criterion: adding it touches **only** the new plugin, never `bridge-core`.
 
 **v0.4 — `bridge-matrix` (first external-network backend).**
-- matrix-js-sdk; room→topic, sync token→cursor, sync loop→subscribe, history→fetchRecent.
+- room→topic, `event_id`→cursor, sync loop→subscribe, history→fetchRecent. NOTE: the shipped
+  plugin is a hand-rolled raw Client-Server HTTP client, NOT matrix-js-sdk — the SDK's weight is
+  only earned by E2EE device management, which unencrypted rooms do not need. Reading this
+  reference remains the path for an encrypted-room variant.
 - First true proof the seam isn't local-shaped. Also the first backend that can run on a
   **different machine** from the bridge (§10 decoupling).
 - Infra: README points to the canonical upstream Synapse Docker setup (§15); not authored
@@ -531,7 +570,7 @@ parley/
 │   │   ├── transport/        #   local-stdio + remote-HTTP transports
 │   │   └── auth/             #   OAuth front door for remote mode (v0.2); absent in local mode
 │   │                         # ZERO backend dependencies
-│   ├── bridge-local-sqlite/  # v0.1 — zero-infra on-ramp; polling-only
+│   ├── bridge-sqlite/        # v0.1 — zero-infra on-ramp; polling-only
 │   ├── bridge-redis/         # v0.3 — first event-driven push; first networked local-ish backend
 │   ├── bridge-matrix/        # v0.4 — first network backend (flagship external)
 │   ├── bridge-xmpp/          # v0.5
@@ -559,7 +598,7 @@ parley/
 **transport/auth layer inside core**, not a plugin — the seam and backends are identical in
 local and remote mode. The local `bridge-local-sqlite` and networked `bridge-redis` implementations both satisfy the seam,
 demonstrating core is genuinely backend-agnostic before any network backend exists. The
-promise: *implement five methods, get a Claude bridge for your platform.*
+promise: *implement six methods, get a Claude bridge for your platform.*
 
 ---
 
@@ -630,7 +669,7 @@ Three properties define the niche, and *the combination* is what's unclaimed:
    (Claude chat via remote/OAuth mode), and coding agents (Claude Code via channels). Most
    prior art does *one or two*, usually agent-to-agent only.
 3. **Deliberately small and standalone** — a focused give-away, not a feature buried inside a
-   platform. "Implement five methods, get a Parley backend for your transport."
+   platform. "Implement six methods, get a Parley backend for your transport."
 
 ### Why we did not just use or contribute to an existing project
 
@@ -729,6 +768,30 @@ coding-agent in one bus, and (3) a small standalone give-away. **Parley's niche 
 unclaimed.** Worth tracking: the memory-pluggability convergence validates the "implement an
 interface, swap the backend" thesis in an adjacent domain.
 
+**Re-scan at 1.0 (2026-07-29).** Searched by function again (transport-agnostic MCP messaging,
+agent-to-agent over MCP, conversation/session hand-off between Claude surfaces). The niche is
+**no longer empty** — two entrants now overlap parts of it, and the honest read is narrower than
+June's:
+
+- **`trust-delta/conversation-handoff-mcp`** — hand-off of conversation context between AI chats
+  and systems (Claude Desktop, Claude Code, ChatGPT), sharing across MCP clients via a background
+  HTTP server. This is the closest thing yet to Parley's *use case*. The difference is
+  architectural rather than promotional: it ships one transport it owns, where Parley's whole
+  thesis is a seam with ten interchangeable backends behind a shared conformance suite — so a
+  Parley thread can live in a Matrix room a human already reads, which a bespoke HTTP store
+  cannot offer.
+- **`agenttrust/mcp-server`** — A2A messaging with verified agent identity, HITL escalation and
+  prompt-injection detection, exposed as MCP tools. Overlaps the agent-to-agent leg but is a
+  hosted trust/identity service, not a backend-agnostic seam, and does not target the
+  human-in-an-ordinary-chat-app case.
+- Community **Claude Code ↔ Codex CLI bridges** (Mar 2026) confirm the underlying demand while
+  being exactly the point-to-point glue Parley argues against in §16.
+
+Conclusion, stated more carefully than last time: the *problem* is now visibly contested, and the
+combination Parley still holds alone is (1) a real backend-agnostic messaging seam proven by one
+suite across ten backends, plus (2) humans, chat bots and coding agents on the same bus. Claims of
+an empty field should be retired; §16 should be read as a claim about the *seam*, not the problem.
+
 ---
 
 ## 18. Discoverability — function-based tags
@@ -764,8 +827,16 @@ the name (`parley`), so the evocative name and the searchable terms both do thei
 ## 19. Open items for review (non-blocking)
 
 - [x] **Project name: `parley`** — locked. Propagates to package/repo/scope/channel id.
-- [ ] (none blocking) — design is ready to hand to a Code instance; next artifacts are
-      `CLAUDE.md` and `TASKS.md`.
+- [x] Design handed to a Code instance; `CLAUDE.md` and `TASKS.md` written and worked to
+      completion. v0.1–v1 plus the post-v1 OIDC mode all shipped.
+- [ ] **Cut 1.0.** The seam has been frozen since v0.1 and survived ten backends and one
+      post-freeze capability (`block_ms`) with no changes — see `docs/1.0-readiness.md` for the
+      evidence, what 1.0 would and would not freeze, and the mechanics. Deliberately not
+      automatic: per `CLAUDE.md`, breaking changes land as `feat:` until 1.0 is cut on purpose.
+- [ ] Deferred by choice, not oversight (see `TASKS.md`): spawn-on-unknown-handle, richer
+      payloads (files/images), multi-instance routing, and splitting plugins into separate
+      repos — the last now satisfies its own gate (two consecutive backends with zero core
+      changes) many times over, but lockstep releasing is working, so it stays deferred.
 
 **Resolved since earlier revisions:**
 - Name is **Parley** (`@sharptrick/parley-*`).

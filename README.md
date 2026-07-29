@@ -332,6 +332,7 @@ For a hardened setup, the maintainer runs Parley as their own single-tenant inst
 - [`DESIGN.md`](DESIGN.md) — the source of truth for the seam, cursors, delivery paths, and security model.
 - [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) — catch-up-on-start and the hand-off conventions.
 - [`docs/keycloak-integration.md`](docs/keycloak-integration.md) — OIDC / Keycloak remote-mode setup.
+- [`docs/1.0-readiness.md`](docs/1.0-readiness.md) — the evidence for cutting 1.0, what it would and wouldn't promise, and the per-backend verification matrix.
 - [`skills/chat-handoff/SKILL.md`](skills/chat-handoff/SKILL.md) — the chat-handoff skill (the full, runnable chat→code walkthrough).
 - [`examples/fakechat-loopback/MANUAL-CHECKLIST.md`](examples/fakechat-loopback/MANUAL-CHECKLIST.md) — the headless live-push loopback and its manual checklist.
 - [`examples/self-host-remote/README.md`](examples/self-host-remote/README.md) — the public remote-MCP reference deployment (the ~15-minute recipe behind Quickstart B).

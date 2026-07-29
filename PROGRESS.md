@@ -6,6 +6,27 @@
 
 ## Status
 
+- **Phase (consolidation → 1.0-ready):** ✅ Published at **v0.9.0**, `main` green, no open issues
+  or PRs. Everything in `TASKS.md` is checked. The current branch closes the gap between what the
+  repo *claims* and what it *does*, ahead of a deliberate 1.0 (`docs/1.0-readiness.md`):
+  - **All ten backends are runnable.** Every package ships a `parley-<name>` bin. The `backend:`
+    config key was parsed and read by *nothing*, so `backend: matrix` ran whatever binary you
+    launched — removed and rejected at load. `skip_permissions` got the same treatment: a security
+    knob nothing reads is now a load error, not a silent no-op.
+  - **CI runs every backend for real** via `dev-infra.sh up all` (redis, nats, postgres, xmpp,
+    matrix, keycloak) and **fails if any test file skips itself**. Seven of 57 files used to skip
+    on every green build, including the conformance suites for the two largest plugins. Now
+    **460 tests, 58 files, none skipped**.
+  - Fixed: a raw NUL byte in `bridge-matrix/src/index.ts` made the file `data` to `file(1)` and
+    made ripgrep refuse to print matches — the largest plugin was invisible to every grep-based
+    search. Now an escape.
+  - Fixed: `bridge-net-util` (the shared 429 loop behind five HTTP backends) had zero tests, and
+    was the one package missing from `vitest.config.ts`'s hand-written alias map — so its first
+    tests silently graded stale `dist/` output and passed against a deliberately broken build. The
+    map is now derived from `packages/`.
+  - Fixed: read-state is keyed by instance+topic but not by backend, so repointing an instance at
+    a different backend replayed a foreign cursor and died deep in a driver. Now an actionable
+    error naming the state file.
 - **Phase (v0.6):** ✅ **Five more backends landed** — Postgres, Zulip, Discord, Telegram, Slack —
   built by five parallel agents (one per plugin package), integrated serially by the lead. All
   green on the shared conformance suite; **zero `bridge-core` changes** (verified by
@@ -178,7 +199,29 @@ notes MAM); re-scan prior art by function (DESIGN §17); update the main README 
 
 - Real `claude --channels` fakechat loopback (P-5 live half) needs an interactive Claude Code session
   (v2.1.80+, claude.ai/Console auth). Automated substitute = headless InMemoryTransport harness +
-  `examples/fakechat-loopback/MANUAL-CHECKLIST.md`.
+  `examples/fakechat-loopback/MANUAL-CHECKLIST.md`. **Still the one open item** — Tier-2 live push
+  has never been demonstrated in a real interactive session, and `README.md` says so.
+- CI cannot be exercised from a branch without a PR, so `ci.yml` gained a `workflow_dispatch`
+  trigger; run it against a ref from the Actions tab.
+
+## Post-v1: presence, block_ms, releases (landed since the v0.6 note below)
+
+- **Releases are automated** (#3, #4, #17, #18): merge to `main` → test gate → `semantic-release`
+  picks the bump from the PR title, tags, and publishes all 13 packages in lockstep with provenance
+  via OIDC trusted publishing. Two hard-won constraints, both encoded in the workflows: npm 12
+  (2026-07-08) stopped building better-sqlite3 under `npm ci`, so the gate runs on Node 22's bundled
+  npm and the publish upgrades only to `^11.5.1`; and a pre-merge preflight exists because OIDC
+  cannot bootstrap a brand-new package, so a PR adding one would go green then split the registry.
+- **Transport on `McpServer`** (#8): migrated off the low-level `Server`.
+- **Presence** (#6, #7, #11, #15): one shared reserved topic carries hello/heartbeat/goodbye;
+  `parley_list_users` is derived above the seam, so it works on every backend with **no new seam
+  method**. Offline-aware roster, instance-scoped liveness, beats advertise `post_topics` reach,
+  records versioned. Note it is **on by default and writes to the configured backend** — on a real
+  Matrix/Zulip account that is a room created on first beat.
+- **71-finding audit remediation** (#16) across core and every backend.
+- **`block_ms`** (#21): long-poll on `fetchRecent`, native on nine backends with a generic fallback
+  in core for SQLite. The seam gained one optional field and core learned no backend names — a
+  capability added *after* the freeze without bending it.
 
 ## Post-v1: optional retention/pruning (`retention_days`)
 
