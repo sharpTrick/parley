@@ -76,7 +76,7 @@ const SCHEMA = {
             enum: [
               'correctness', 'concurrency-and-failure', 'security', 'seam-integrity',
               'design-principles', 'protocol-conformance', 'test-integrity', 'truth-in-docs',
-              'operability-and-release', 'maintainability',
+              'operability-and-release', 'maintainability', 'test-hygiene',
             ],
             description: 'which lens produced this — a measurement, so be accurate not generous',
           },
@@ -96,13 +96,18 @@ const SCHEMA = {
   required: ['nothingFound', 'findings'],
 }
 
+const WORKTREES = '/tmp/careening/worktrees'
+
 function prompt(target) {
   return [
+    `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
     `Full-surface adversarial review of the Parley package at: ${target.path}.`,
     `Review the WHOLE target AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round." A diff-scoped review hides everything the current anchors sit on top of.`,
-    `Carry ALL TEN lenses yourself (docs/REVIEW_PROTOCOL.md): correctness, concurrency-and-failure, security, seam-integrity, design-principles, protocol-conformance, test-integrity, truth-in-docs, operability-and-release, maintainability. Tag every finding with the lens that produced it — that tag is a measurement.`,
+    `Carry ALL ELEVEN lenses yourself (docs/REVIEW_PROTOCOL.md): correctness, concurrency-and-failure, security, seam-integrity, design-principles, protocol-conformance, test-integrity, truth-in-docs, operability-and-release, maintainability, test-hygiene. Tag every finding with the lens that produced it — that tag is a measurement.`,
     `Read CLAUDE.md and DESIGN.md first for the invariants, especially the prime directive: bridge-core must never import from a backend plugin.`,
-    `Try hard to BREAK it. VERIFY each issue against the code — trace it or reproduce it by running tests/scripts — before reporting. Mark CONFIRMED only when traced or reproduced; otherwise PLAUSIBLE.`,
+    `Try hard to BREAK it. VERIFY each issue against the code — trace it or reproduce it — before reporting. Mark CONFIRMED only when traced or reproduced; otherwise PLAUSIBLE.`,
+    `The suite's GREEN STATE IS GIVEN: it was verified before this round. Do NOT re-run it to confirm it passes. Run tests only as an instrument — to reproduce a defect, or to MUTATE code and prove a test is vacuous. Mutation-testing is EXPECTED for the test-integrity and test-hygiene lenses: for any test you rely on, ask what mutation would keep it green, make it, and watch. A test that cannot fail is worse than none, because it counts as coverage.`,
+    `You may start throwaway containers ONLY for the backend you own, with a distinct name and port, and you must tear them down. Never touch a container you did not create — the shared parley-dev-* set belongs to the orchestrator and other agents are using it. Copy the image and flags from examples/dev-compose/docker-compose.yml.`,
     `Several lenses are mechanically checkable; CHECK them rather than reasoning about them: seam integrity via the import graph and \`git diff --stat packages/bridge-core\`, protocol conformance against packages/conformance, truth-in-docs by reading each claim and then the code behind it.`,
     `Return the structured schema. For each finding give the concrete failing input -> wrong output or hang, a remediation, and a testUpgrade that guards the CLASS (a parameterized or widened generator case), not just the one input.`,
     `If a genuine attempt to break it found nothing, set nothingFound=true and describe specifically what you examined and what you tried — a clean result retires you from later rounds until your package or a dependency changes, so it must be auditable.`,

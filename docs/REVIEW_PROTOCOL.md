@@ -60,6 +60,50 @@ nine consecutive rounds while every round still cost ~300K tokens.
   changed. Any finding a wake-all round surfaces in a package that was quiesced *and unchanged* is
   a recall miss attributable to retirement, and is reported as such.
 
+## Isolation: what an agent owns, and what it must not touch
+
+Every agent — critic or remediator — gets a **git worktree of its own**, pinned to the round's base
+commit (`scripts/careening-worktrees.mjs`). That makes "full-surface at commit X" structural rather
+than a matter of the orchestrator's discipline, and it makes mutating source safe, which is what
+lets mutation-testing be required below.
+
+Worktrees isolate the filesystem and **not** the backing services. A shared Redis, Postgres,
+Synapse, Prosody, Keycloak and NATS are one destructive test away from taking down every concurrent
+agent, and even without that, contention produces false reds — the NATS outage tests passed alone
+and failed under full-suite load purely because reconnect took longer while the rest of the suite
+hammered the same server.
+
+So an agent **may stand up its own throwaway containers**, under three rules:
+
+- **Only for the backend it owns.** A sqlite agent has no business starting Redis; a Slack agent has
+  no business starting Synapse. If a finding seems to need another backend's service, it is a
+  finding about the seam or about the other package — escalate it, do not provision your way around
+  it.
+- **Never touch a container it did not create.** The shared `parley-dev-*` set belongs to the
+  orchestrator. Use a distinct name and a distinct published port, so nothing collides with the
+  shared instance or with a sibling agent.
+- **Tear down what you start,** and say in your report what you started and that it is gone.
+
+Reuse the image and flags from `examples/dev-compose/docker-compose.yml` rather than inventing a
+recipe — that file is the canonical setup, and a divergent one tests something the project does not
+ship.
+
+## The test suite's green state is GIVEN
+
+The suite is green before a round is launched; that is a precondition, not a question. **Do not
+re-run it to confirm it passes** — a green suite tells you nothing you were not already told.
+
+Run tests only as an *instrument*:
+
+- to **reproduce** a hypothesised defect (this is the CONFIRMED bar), or
+- to **mutate** the code and prove an existing test is vacuous.
+
+The second is the highest-value technique available and it is **expected**, not optional, for the
+`test-integrity` lens. Round 1's single best finding came from mutating one backend six ways and
+watching the frozen conformance suite stay green through all six — including a class that had
+already bitten a shipped backend. Ask of any test you rely on: *what mutation would keep this
+green?*
+
 ## Anti-patterns — proven failure modes, do NOT do these
 
 - ❌ **Diff-scoping a follow-up round** to "only what changed since last round." A narrow round
@@ -152,3 +196,15 @@ being tested, not a reason to skip anything.
     the *code*, not the comment. Kept deliberately as the **control arm**: ouroboros concluded
     convergence "was gated by maintainability running out of nits, not by the app becoming correct
     and secure." Whether that replicates on a deep surface is a finding, not an assumption.
+11. **test-hygiene** *(added at round 2; instrument v2)* — the suite's own reviewability. Round 1
+    took it from 460 tests to 1428 in a single pass, and a suite no human can review is a suite no
+    human is checking. Distinct from `test-integrity`, which asks whether a test tests the thing:
+    this asks whether the suite stays legible. Cases differing only in a literal are one
+    parameterized case. A table earns its rows only if each dimension can independently fail — ask
+    which row would survive deleting the others. Fakes and builders restated per file are drift
+    waiting to happen; share the fixture or say why not. A failing test name should locate the
+    defect without opening the file. A case that costs seconds and discriminates nothing is a
+    finding, because slow suites get skipped and a skipped suite is a lie. More assertions are not
+    more coverage: flag a case that pins what its neighbour already pins. File against the *suite*,
+    not the feature — if your fix is "add another test", it belongs under a different lens.
+
