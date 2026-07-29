@@ -36,16 +36,28 @@ backend_config:
   retention_days: 30               # optional; omit (or null) to keep every entry forever (default)
 ```
 
-`retention_days` must be a positive number of days. `0`, a negative value, `NaN`, a quoted string
-and a value large enough to reach past the epoch are all rejected by `connect()` with an error
-naming the key — none of them mean "keep everything", and several of them silently delete history.
-Omit the key (or set it to `null`) for the default: keep every entry forever. There is no
-"trim everything" mode.
+Every numeric knob is validated by `connect()`, which rejects with an error naming the key rather
+than coercing — an unusable value here is silent, not loud. `retention_days` must be a positive
+number of days (`0`, negative, `NaN`, a quoted string and anything reaching past the epoch are
+rejected; none of them mean "keep everything" and several silently delete history). `block_ms` and
+`connect_timeout_ms` must be positive whole milliseconds: a fractional or negative `block_ms` makes
+the server reject every `XREAD`, which kills live push *permanently* behind a `subscribe()` that
+resolved, and `block_ms: 0` blocks the reader forever. Omit a key (or set it to `null`) for its
+default.
 
 An unreachable or wrong `url` makes `connect()` fail within `connect_timeout_ms` with
 `parley-redis: cannot reach <host>:<port>` on stderr — it never hangs waiting for a server that
-isn't there. While Redis is down, `post`/`fetchRecent` reject rather than queueing for the length
-of the outage; the client reconnects on its own once the server is back.
+isn't there. `connect()` also issues one `PING`, so a server that is reachable but cannot serve the
+seam (password-protected with no/wrong password, an ACL that forbids the commands, a non-Redis
+listener) fails at startup with `parley-redis: connected to <host>:<port> but the server refused a
+command: <RESP error>` instead of coming up "connected" and failing on every later tool call.
+
+While Redis is down, `post`/`fetchRecent` reject rather than queueing for the length of the outage;
+the client reconnects on its own once the server is back. The `subscribe` loop rides out the same
+transient faults, but a fault the server will never stop returning (`NOAUTH`, `NOPERM` after an ACL
+change, `WRONGTYPE` if the key is repurposed) stops the loop and writes one line to stderr —
+`parley-redis: live delivery STOPPED for topic '<topic>' …` — so a live path that can no longer
+deliver never looks like a quiet topic.
 
 ## Credentials & exposure
 

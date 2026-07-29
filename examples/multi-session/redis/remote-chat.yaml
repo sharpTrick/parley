@@ -17,7 +17,7 @@ permissions:
 
 # Run with: parley-redis --config <this file>   (the binary selects the backend)
 backend_config:
-  url: "redis://redis.internal:6379"   # identical to both code-agent-*.yaml
+  url: "rediss://:change-me@redis.internal:6379"   # identical to both code-agent-*.yaml
   key_prefix: "parley:"                 # identical
   block_ms: 2000                        # unused here (live_push is off) but harmless
   retention_days: 30                    # identical

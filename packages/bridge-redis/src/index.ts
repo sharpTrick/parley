@@ -19,8 +19,17 @@ type RedisClient = ReturnType<typeof createClient>;
 
 const DEFAULT_URL = 'redis://127.0.0.1:6379';
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
+const DEFAULT_BLOCK_MS = 2000;
 /** A Redis Stream entry id — `<ms>` or `<ms>-<seq>`. Cursors and backendMsgIds are exactly this. */
 const CURSOR_PATTERN = /^\d+(-\d+)?$/;
+/** The sender of an entry written by something other than this plugin, which carries no `sender`. */
+const UNKNOWN_SENDER = 'unknown';
+/**
+ * RESP error codes the server returns when it UNDERSTOOD a command and refused it — a bad
+ * argument, a revoked ACL, a repurposed key. Retrying cannot clear any of them without an operator.
+ * Everything else (socket faults, `LOADING`, failover redirects) heals on its own and is retried.
+ */
+const PERMANENT_SERVER_ERROR = /^(ERR|NOAUTH|WRONGPASS|NOPERM|WRONGTYPE|NOPROTO|EXECABORT)\b/;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -30,9 +39,15 @@ export interface RedisBackendConfig {
   url?: string;
   /** Stream key prefix. Default `parley:`. One Redis Stream per topic: `<prefix><topic>`. */
   key_prefix?: string;
-  /** XREAD BLOCK timeout (ms) — the loop re-checks for shutdown each interval. Default 2000. */
+  /**
+   * `XREAD BLOCK` timeout (ms) — the `subscribe` loop re-checks for shutdown each interval. Default
+   * 2000. Must be a positive whole number; anything else is rejected by `connect()`.
+   */
   block_ms?: number;
-  /** How long the FIRST handshake may take before `connect()` rejects (ms). Default 5000. */
+  /**
+   * How long the FIRST handshake (and its verifying `PING`) may take before `connect()` rejects
+   * (ms). Default 5000. Must be a positive whole number; anything else is rejected by `connect()`.
+   */
   connect_timeout_ms?: number;
   /**
    * Optional retention window in days: entries older than this are (approximately) trimmed on
@@ -73,10 +88,40 @@ export function createRedisClient(url: string, connectTimeoutMs: number): RedisC
   client.on('ready', () => {
     handshakeComplete = true;
   });
-  client.on('error', () => {
-    /* the offline queue is disabled, so faults surface as command rejections; don't crash */
+  client.on('error', (err: unknown) => {
+    // The offline queue is disabled, so faults surface as command rejections; don't crash.
+    if (err instanceof Error) lastEmittedError.set(client, err);
   });
   return client;
+}
+
+/**
+ * The most recent `error` event per client. A handshake rejected by the SERVER (`WRONGPASS`, a
+ * TLS-only listener) reaches the caller as the reconnect strategy's generic unreachable message,
+ * so the emitted `ErrorReply` is the only place the real cause survives.
+ */
+const lastEmittedError = new WeakMap<object, Error>();
+
+/** The RESP error the server answered with, if the failure was a refusal rather than a socket fault. */
+function serverRefusal(err: unknown): string | undefined {
+  const message = err instanceof Error ? err.message : '';
+  return PERMANENT_SERVER_ERROR.test(message) ? message : undefined;
+}
+
+/**
+ * A server that is reachable but cannot serve the seam. Distinct from {@link unreachable}, so that
+ * an operator debugging a `WRONGPASS` is not sent to look at the network instead of the credential.
+ */
+function refused(url: string, respError: string): string {
+  return `parley-redis: connected to ${endpointOf(url)} but the server refused a command: ${respError}`;
+}
+
+/** A server that completed the handshake and then did not answer the first command in time. */
+function unresponsive(url: string, connectTimeoutMs: number): string {
+  return (
+    `parley-redis: connected to ${endpointOf(url)} but it did not answer PING within ` +
+    `connect_timeout_ms=${connectTimeoutMs}`
+  );
 }
 
 /**
@@ -118,6 +163,11 @@ function endpointOf(url: string): string {
   }
 }
 
+/** Render a rejected config value for an operator; `JSON.stringify` alone turns NaN into `null`. */
+function describeValue(value: unknown): string {
+  return typeof value === 'number' ? String(value) : JSON.stringify(value) ?? String(value);
+}
+
 /**
  * `retention_days` is multiplied into a destructive `XADD MINID` threshold, so every unusable
  * value must be rejected at `connect()` rather than coerced: `0`/negative silently delete history
@@ -131,7 +181,25 @@ function normalizeRetentionDays(value: number | null | undefined): number | unde
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > maxDays) {
     throw new Error(
       `parley-redis: retention_days must be a positive number of days no greater than ${maxDays} ` +
-        `(got ${JSON.stringify(value)}); omit it (or set null) to keep every entry forever`,
+        `(got ${describeValue(value)}); omit it (or set null) to keep every entry forever`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Every millisecond knob reaches a place where a nonsensical value is SILENT rather than loud:
+ * `block_ms` becomes an `XREAD BLOCK` argument, where `-1`/`0.5`/`NaN` make the server reject every
+ * read — killing live push forever behind a `subscribe()` that resolved — and `0` blocks the reader
+ * forever; `connect_timeout_ms` becomes a deadline, where `0` fails every connect against a healthy
+ * server. Reject at `connect()`, as `retention_days` already does.
+ */
+function normalizeMillis(key: string, value: unknown, fallback: number): number {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `parley-redis: ${key} must be a positive whole number of milliseconds ` +
+        `(got ${describeValue(value)}); omit it for the default ${fallback}`,
     );
   }
   return value;
@@ -175,7 +243,7 @@ function compareIds(a: string, b: string): number {
 export class RedisPlugin implements BackendPlugin {
   private client?: RedisClient;
   private prefix = 'parley:';
-  private blockMs = 2000;
+  private blockMs = DEFAULT_BLOCK_MS;
   private retentionDays?: number;
   private url = DEFAULT_URL;
   private connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
@@ -187,19 +255,58 @@ export class RedisPlugin implements BackendPlugin {
    */
   private generation = 0;
   private readonly readers: RedisClient[] = [];
+  /**
+   * Readers whose `connect()` has not settled yet. Keep the exclusion in `tearDown`, so that a
+   * reader is never disconnected mid-handshake: node-redis assigns its socket only once the TCP
+   * connect resolves, so a `disconnect()` before that flips the client to closed WITHOUT a socket
+   * to destroy, the handshake then completes onto a live socket, and every later `disconnect()`
+   * throws `ClientClosedError` — an orphan nothing can ever close. Whoever is awaiting the connect
+   * closes it on the next generation check instead.
+   */
+  private readonly connecting = new Set<RedisClient>();
+  /**
+   * Serializes `connect`/`disconnect`. Keep it, so that two overlapping lifecycle calls cannot both
+   * open a command client: each reads `this.client` before the other assigns it, and the loser's
+   * socket is then referenced by nothing and can never be closed — a permanent leak that also holds
+   * the event loop open at shutdown.
+   */
+  private lifecycle: Promise<unknown> = Promise.resolve();
 
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as RedisBackendConfig;
+    return this.serialize(() => this.open(config as RedisBackendConfig));
+  }
+
+  async disconnect(): Promise<void> {
+    return this.serialize(() => this.tearDown());
+  }
+
+  private serialize<T>(work: () => Promise<T>): Promise<T> {
+    const settled = this.lifecycle.then(
+      () => undefined,
+      () => undefined,
+    );
+    const run = settled.then(work);
+    this.lifecycle = run.catch(() => undefined);
+    return run;
+  }
+
+  private async open(cfg: RedisBackendConfig): Promise<void> {
     const retentionDays = normalizeRetentionDays(cfg.retention_days);
+    const blockMs = normalizeMillis('block_ms', cfg.block_ms, DEFAULT_BLOCK_MS);
+    const connectTimeoutMs = normalizeMillis(
+      'connect_timeout_ms',
+      cfg.connect_timeout_ms,
+      DEFAULT_CONNECT_TIMEOUT_MS,
+    );
     // Tear the previous connection down first, so that a re-connect — which the generation token
     // explicitly advertises as safe — cannot orphan a live socket per call until Redis hits
     // maxclients. This also re-baselines the generation, so no prior loop can be revived.
-    await this.disconnect();
+    await this.tearDown();
     this.prefix = cfg.key_prefix ?? 'parley:';
-    this.blockMs = cfg.block_ms ?? 2000;
+    this.blockMs = blockMs;
     this.retentionDays = retentionDays;
     this.url = cfg.url ?? DEFAULT_URL;
-    this.connectTimeoutMs = cfg.connect_timeout_ms ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    this.connectTimeoutMs = connectTimeoutMs;
     const client = createRedisClient(this.url, this.connectTimeoutMs);
     try {
       await withDeadline(
@@ -207,16 +314,26 @@ export class RedisPlugin implements BackendPlugin {
         this.connectTimeoutMs,
         unreachable(this.url, this.connectTimeoutMs),
       );
+      // Verify one COMMAND, not just the handshake: node-redis reports a password-protected server
+      // reached without credentials as a successful connect, so without this the bridge comes up
+      // "connected" and every seam call fails afterwards — invisibly when catchup.on_start is off.
+      await withDeadline(
+        client.ping(),
+        this.connectTimeoutMs,
+        unresponsive(this.url, this.connectTimeoutMs),
+      );
     } catch (err) {
+      const respError = serverRefusal(err) ?? serverRefusal(lastEmittedError.get(client));
       await client.disconnect().catch(() => undefined);
-      throw err;
+      throw respError !== undefined ? new Error(refused(this.url, respError)) : err;
     }
     this.client = client;
   }
 
-  async disconnect(): Promise<void> {
+  private async tearDown(): Promise<void> {
     this.generation++; // supersede every in-flight/straggler subscribe loop so they exit deterministically
     for (const reader of this.readers.splice(0)) {
+      if (this.connecting.has(reader)) continue;
       await reader.disconnect().catch(() => undefined);
     }
     if (this.client !== undefined) {
@@ -422,8 +539,15 @@ export class RedisPlugin implements BackendPlugin {
           | null;
         try {
           res = await reader.xRead({ key, id: lastId }, { BLOCK: this.blockMs, COUNT: 256 });
-        } catch {
+        } catch (err) {
           if (gen !== this.generation) break; // torn down/superseded → exit, never spin-retry (BUG-37)
+          const respError = serverRefusal(err);
+          if (respError !== undefined) {
+            this.dropReader(reader);
+            await reader.disconnect().catch(() => undefined);
+            reportLiveDeliveryStopped(topic, respError);
+            break;
+          }
           await delay(100);
           continue;
         }
@@ -463,11 +587,16 @@ export class RedisPlugin implements BackendPlugin {
   }
 
   private async connectReader(reader: RedisClient): Promise<void> {
-    await withDeadline(
-      reader.connect(),
-      this.connectTimeoutMs,
-      unreachable(this.url, this.connectTimeoutMs),
-    );
+    this.connecting.add(reader);
+    try {
+      await withDeadline(
+        reader.connect(),
+        this.connectTimeoutMs,
+        unreachable(this.url, this.connectTimeoutMs),
+      );
+    } finally {
+      this.connecting.delete(reader);
+    }
   }
 
   /** Remove a specific reader from the registry (used when a subscribe tears its own reader down). */
@@ -484,12 +613,39 @@ export class RedisPlugin implements BackendPlugin {
   }
 }
 
+/**
+ * Keep this stderr line, so that a live path which can no longer deliver does not look identical to
+ * a quiet topic: `subscribe()` has already resolved, core keeps advertising this instance as
+ * subscribed to the topic, and nothing else in the process would ever mention the fault. stdout is
+ * the MCP JSON-RPC channel — diagnostics only ever go to stderr.
+ */
+function reportLiveDeliveryStopped(topic: Topic, respError: string): void {
+  process.stderr.write(
+    `parley-redis: live delivery STOPPED for topic '${topic}' — the server refused the stream ` +
+      `read: ${respError}. Catch-up still works; fix the cause and restart the bridge.\n`,
+  );
+}
+
+/**
+ * Anyone with access to the Redis can `XADD` to a parley stream, and a stream outlives the plugin
+ * version that created it, so an entry written without this plugin's fields still has to normalize
+ * into a Message that satisfies the DESIGN §5 contract rather than one with an unparseable
+ * timestamp and an empty sender that collides with every other empty sender.
+ */
 function rowToMessage(topic: Topic, id: string, fields: Record<string, string>): Message {
+  const sender = fields.sender ?? '';
   return buildMessage({
     topic,
-    sender: fields.sender ?? '',
+    sender: sender === '' ? UNKNOWN_SENDER : sender,
     content: fields.content ?? '',
-    timestamp: fields.ts ?? '',
+    timestamp: entryTimestamp(id, fields.ts),
     id,
   });
+}
+
+/** The entry's own `ts` when it is a real date, else the stream id's own millisecond component. */
+function entryTimestamp(id: string, ts: string | undefined): string {
+  if (ts !== undefined && !Number.isNaN(Date.parse(ts))) return ts;
+  const ms = Number(id.split('-')[0]);
+  return new Date(Number.isSafeInteger(ms) && ms >= 0 ? ms : 0).toISOString();
 }

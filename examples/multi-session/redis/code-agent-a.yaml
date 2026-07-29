@@ -16,7 +16,9 @@ permissions:
 # Run with: parley-redis --config <this file>   (the binary selects the backend)
 backend_config:
   # ── Must be IDENTICAL across every config sharing this Redis. ──
-  url: "redis://redis.internal:6379"
+  #    The server is not on localhost, so TLS is mandatory and so is a password (see the
+  #    plugin README's "Credentials & exposure"). Keep the real value in your secret store. ──
+  url: "rediss://:change-me@redis.internal:6379"
   # ── Must ALSO be identical — this one is the hidden risk. It reads like cosmetic
   #    namespacing, but topic "ctx-payments" under a DIFFERENT prefix is a totally different
   #    Redis key. Get this wrong and every field still LOOKS consistent while history silently

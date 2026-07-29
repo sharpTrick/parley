@@ -40,6 +40,7 @@ vi.mock('redis', () => ({
       connect: async () => {
         main.isOpen = true;
       },
+      ping: async () => 'PONG',
       disconnect: async () => {
         main.isOpen = false;
       },
@@ -217,6 +218,84 @@ describe('redis subscribe hardening — BUG-11: xInfoStream catch must not repla
     expect(handler).not.toHaveBeenCalled();
 
     await plugin.disconnect();
+  });
+});
+
+// CLASS: the subscribe read loop hides a non-recoverable backend fault. subscribe() has already
+// resolved and core keeps advertising this instance as subscribed, so a loop that can never deliver
+// again must not be indistinguishable from a quiet topic — while a fault that DOES heal must still
+// be ridden out. The axis that matters is the reason, not the retry count.
+describe('redis subscribe hardening — a dead live path must not look like a quiet topic', () => {
+  const reasons: Array<[string, string, 'permanent' | 'transient']> = [
+    ['a bad BLOCK argument', 'ERR timeout is not an integer or out of range', 'permanent'],
+    ['an unauthenticated connection', 'NOAUTH Authentication required.', 'permanent'],
+    ['an ACL revoked mid-session', 'NOPERM this user has no permissions to run the xread command', 'permanent'],
+    ['a wrong password after failover', 'WRONGPASS invalid username-password pair', 'permanent'],
+    ['the key repurposed', 'WRONGTYPE Operation against a key holding the wrong kind of value', 'permanent'],
+    ['a closed client', 'ClientClosedError', 'transient'],
+    ['a reset socket', 'read ECONNRESET', 'transient'],
+    ['an unexpectedly closed socket', 'Socket closed unexpectedly', 'transient'],
+    ['a server still loading its dataset', 'LOADING Redis is loading the dataset in memory', 'transient'],
+    ['a failover redirect', 'MOVED 3999 127.0.0.1:6381', 'transient'],
+  ];
+
+  it.each(reasons)('%s (%s) is %s', async (_label, message, kind) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const plugin = new RedisPlugin();
+    await plugin.connect({ url: 'redis://mock' });
+
+    const received: Message[] = [];
+    let failures = 0;
+    let healed = false;
+    const reader = makeReader({
+      xRead: vi.fn((): Promise<XReadResult> => {
+        // A transient reason heals after 3 rejections; a permanent one never does.
+        if (kind === 'permanent' || failures < 3) {
+          failures++;
+          return Promise.reject(new Error(message));
+        }
+        if (healed) return new Promise((resolve) => setTimeout(() => resolve(null), 20));
+        healed = true;
+        return Promise.resolve([
+          {
+            name: 'parley:ops',
+            messages: [{ id: '7-0', message: { sender: 'bob', content: 'healed', ts: '' } }],
+          },
+        ]);
+      }),
+    });
+    queue(reader);
+
+    try {
+      await plugin.subscribe(asTopic('ops'), (m) => received.push(m));
+
+      if (kind === 'transient') {
+        await vi.waitFor(() => expect(received.map((m) => m.content)).toEqual(['healed']), {
+          timeout: 3000,
+        });
+        expect(stderr).not.toHaveBeenCalled();
+        return;
+      }
+
+      // Surfaced: one labelled stderr line naming the topic and the server's reason.
+      await vi.waitFor(() => expect(stderr).toHaveBeenCalled(), { timeout: 3000 });
+      const line = String(stderr.mock.calls[0]?.[0]);
+      expect(line).toMatch(/^parley-redis:/);
+      expect(line).toContain('ops');
+      expect(line).toContain(message);
+
+      // …and the loop STOPPED rather than retrying a fault no retry can clear.
+      const frozen = reader.xRead.mock.calls.length;
+      await sleep(400);
+      expect(reader.xRead.mock.calls.length).toBe(frozen);
+      expect(received).toHaveLength(0);
+      // The dead reader was returned, not left registered and connected.
+      expect(peek(plugin).readers).toHaveLength(0);
+      expect(reader.disconnect).toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+      await plugin.disconnect();
+    }
   });
 });
 

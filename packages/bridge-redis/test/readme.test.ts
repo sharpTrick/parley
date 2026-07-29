@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 // CLASS: a shipped infra recipe must not be insecure by default. A copy-pasteable `docker run`
@@ -55,4 +55,60 @@ describe('bridge-redis README — shipped infra recipes must not be insecure by 
       expect(literal?.[1], `README ships the literal password ${literal?.[1]}`).toBeUndefined();
     }
   });
+});
+
+// CLASS: a shipped copy-pasteable artifact contradicts the package's own security guidance. The
+// docker recipes above are only one such artifact — the runnable example configs the README links
+// to are the ones an operator actually copies, and nothing was checking them.
+
+const EXAMPLES = new URL('../../../examples/multi-session/redis/', import.meta.url);
+
+interface ShippedUrl {
+  where: string;
+  raw: string;
+  scheme: string;
+  credentials: string;
+  host: string;
+}
+
+/** Every `redis://` / `rediss://` URL a reader could copy out of a shipped artifact. */
+function shippedUrls(where: string, source: string): ShippedUrl[] {
+  const url = /\b(rediss?):\/\/(?:([^@\s/"'`]*)@)?([A-Za-z0-9._[\]-]+)/g;
+  return [...source.matchAll(url)].map((m) => ({
+    where,
+    raw: m[0] ?? '',
+    scheme: m[1] ?? '',
+    credentials: m[2] ?? '',
+    host: m[3] ?? '',
+  }));
+}
+
+const artifacts: Array<[string, string]> = [
+  ['README.md', text],
+  ...readdirSync(EXAMPLES)
+    .filter((f) => f.endsWith('.yaml'))
+    .map((f): [string, string] => [f, readFileSync(new URL(f, EXAMPLES), 'utf8')]),
+];
+
+const shipped = artifacts.flatMap(([where, source]) => shippedUrls(where, source));
+
+const isLoopback = (host: string): boolean =>
+  host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+
+describe('bridge-redis shipped artifacts — every copy-pasteable URL follows the README', () => {
+  it('ships at least one example config and one README URL', () => {
+    expect(artifacts.length).toBeGreaterThan(1);
+    expect(shipped.length).toBeGreaterThan(0);
+  });
+
+  it.each(shipped.map((u): [string, ShippedUrl] => [`${u.where}: ${u.raw}`, u]))(
+    'is loopback, or TLS with credentials — %s',
+    (_label, u) => {
+      if (isLoopback(u.host)) return;
+      expect(u.scheme, `${u.raw} sends a shared history and forged-sender writes over plaintext`).toBe(
+        'rediss',
+      );
+      expect(u.credentials, `${u.raw} points at an unauthenticated Redis`).not.toBe('');
+    },
+  );
 });
