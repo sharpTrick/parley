@@ -138,8 +138,22 @@ const NEVER_A_STRING: Array<[string, unknown]> = [
   ['array', ['a']],
 ];
 
+/**
+ * Non-empty strings that clear the emptiness check and then fail INSIDE node-redis' constructor as a
+ * bare `TypeError: Invalid URL`/`Invalid protocol` naming neither the plugin, the key, nor anything
+ * an operator with a typo'd scheme could grep for — and only AFTER a live connection was torn down.
+ */
+const NEVER_A_REDIS_URL: Array<[string, unknown]> = [
+  ['prose', 'not a url'],
+  ['a missing colon', 'redis//127.0.0.1'],
+  ['a bare host:port', '127.0.0.1:6379'],
+  ['the wrong scheme', 'http://127.0.0.1:6379'],
+  ['a scheme node-redis does not speak', 'redis+unix:///tmp/redis.sock'],
+  ['a scheme with no host', 'redis://'],
+];
+
 const rejectedByKnob: Record<string, Array<[string, unknown]>> = {
-  url: NEVER_A_STRING,
+  url: [...NEVER_A_STRING, ...NEVER_A_REDIS_URL],
   key_prefix: NEVER_A_STRING,
   retention_days: [
     ...NEVER_A_KNOB,
@@ -406,27 +420,111 @@ describe.skipIf(!redisUp)('redis failure modes — retention_days keeps history 
 
 // -------------------------------------------------------------------------------------------
 // The inverse half of the knob class, and the half that actually catches a silent no-op: a value
-// connect() ACCEPTS must leave every seam path working. Rejecting bad values is not enough — a
-// knob that merely fails to be rejected can still disable live push with nothing to see.
+// connect() ACCEPTS must leave every seam path working. Rejecting bad values is not enough — a knob
+// that merely fails to be rejected can still make EVERY write fail behind a connect() that resolved,
+// or disable live push, with nothing to see at load time.
+//
+// GENERATED per knob, not hand-picked: `retention_days` reaches XADD as `days * 86_400_000`, so
+// whether a value works depends on its BINARY REPRESENTATION rather than its magnitude, and a fixed
+// row can only ever sample the values that happen to land on a whole millisecond. One wide row per
+// knob, so a failure names the offending value instead of hiding among green siblings.
 // -------------------------------------------------------------------------------------------
 
-describe.skipIf(!redisUp)('redis failure modes — an accepted config still delivers', () => {
-  const accepted: Array<[string, Record<string, unknown>]> = [
-    ['every knob omitted', {}],
-    ['block_ms at its documented default', { block_ms: 2000 }],
-    ['a block_ms shorter than delivery', { block_ms: 20 }],
-    ['a block_ms far longer than the test window', { block_ms: 120_000 }],
-    ['connect_timeout_ms set', { connect_timeout_ms: 10_000 }],
-    ['retention_days set', { retention_days: 7 }],
-    ['retention_days null', { retention_days: null }],
-    ['a fractional retention window', { retention_days: 0.5 }],
-    ['every knob at once', { block_ms: 250, connect_timeout_ms: 3000, retention_days: 30 }],
-  ];
+/** Deterministic LCG, so a value that breaks the seam is reproducible on a re-run, not once in 50. */
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 0x1_0000_0000;
+  };
+}
 
-  it.each(accepted)('live push and catch-up both work with %s', async (_label, knobs) => {
+/** Retention windows the validator accepts: small rationals (rarely whole ms) plus random floats. */
+function retentionWindows(): number[] {
+  const out: number[] = [0.5, 7, 30];
+  for (let denom = 2; denom <= 13; denom++) {
+    for (const numer of [1, denom + 1, 30]) out.push(numer / denom);
+  }
+  const rnd = seeded(0x5eed);
+  for (let i = 0; i < 40; i++) out.push(0.001 + rnd() * 60);
+  return out;
+}
+
+/** Whole-millisecond budgets in [lo, hi) — the only shape either millisecond knob accepts. */
+function millisBudgets(seed: number, lo: number, hi: number): number[] {
+  const rnd = seeded(seed);
+  return Array.from({ length: 20 }, () => lo + Math.floor(rnd() * (hi - lo)));
+}
+
+/**
+ * Values `connect()` accepts, per declared knob. Driven from CONFIG_KEYS below, so a knob added later
+ * with no accepted-value set fails here instead of shipping a value nobody ever round-tripped.
+ * `connect_timeout_ms` starts at 500, so that a budget shorter than a real handshake — a LOUD
+ * rejection the operator asked for, not the silent breakage this class is about — stays out.
+ */
+const acceptedByKnob: Record<string, unknown[]> = {
+  url: [REDIS_URL],
+  key_prefix: ['plain:', 'no-trailing-colon', 'with spaces:', 'unicode-\u00fc:', 'glob*chars?:'].map(
+    (flavour) => `${freshPrefix()}${flavour}`,
+  ),
+  retention_days: [null, ...retentionWindows()],
+  block_ms: [1, 2000, 120_000, ...millisBudgets(0xb10c, 1, 600_000)],
+  connect_timeout_ms: [5000, ...millisBudgets(0xc0de, 500, 30_000)],
+};
+
+/** Render a config value for a failure line; `JSON.stringify` alone turns NaN into `null`. */
+function label(value: unknown): string {
+  return typeof value === 'number' ? String(value) : JSON.stringify(value) ?? String(value);
+}
+
+describe.skipIf(!redisUp)('redis failure modes — an accepted config still delivers', () => {
+  it.each(CONFIG_KEYS)('every accepted %s round-trips post → fetchRecent', async (knob) => {
+    const values = acceptedByKnob[knob] ?? [];
+    expect(values.length, `no accepted values are declared for '${knob}'`).toBeGreaterThan(0);
+    const plugin = new RedisPlugin();
+    const prefixes = new Set<string>();
+    const broken: string[] = [];
+    try {
+      for (const value of values) {
+        const config: Record<string, unknown> = {
+          url: REDIS_URL,
+          key_prefix: freshPrefix(),
+          [knob]: value,
+        };
+        prefixes.add(String(config.key_prefix));
+        const t = freshTopic();
+        const failure = await (async () => {
+          await plugin.connect(config);
+          const id = await plugin.post(t, asHandle('w'), 'round-trip');
+          const page = await plugin.fetchRecent({ topic: t, limit: 10 });
+          if (page.messages.map((m) => m.backendMsgId).join() !== id) {
+            throw new Error(`fetchRecent returned ${JSON.stringify(page.messages)}`);
+          }
+        })().then(
+          () => undefined,
+          (err: Error) => err,
+        );
+        if (failure !== undefined) broken.push(`${label(value)} → ${failure.message}`);
+      }
+      expect(broken, `connect() accepted these ${knob} values and then broke the seam`).toEqual([]);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      for (const prefix of prefixes) await wipe(prefix);
+    }
+  });
+
+  // The one path the round-trip above cannot see: a knob accepted at connect() that then silently
+  // kills LIVE push. `30 / 7` is deliberate — a window that is not a whole number of milliseconds.
+  it('live push still works with every knob set at once', async () => {
     const prefix = freshPrefix();
     const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix, ...knobs });
+    await plugin.connect({
+      url: REDIS_URL,
+      key_prefix: prefix,
+      block_ms: 250,
+      connect_timeout_ms: 3000,
+      retention_days: 30 / 7,
+    });
     const t = freshTopic();
     const live: string[] = [];
     try {
@@ -442,6 +540,55 @@ describe.skipIf(!redisUp)('redis failure modes — an accepted config still deli
   });
 });
 
+// The teardown-ordering half of the same class: connect() validates its WHOLE config before it tears
+// the previous connection down, so a value an operator got wrong can never leave a live bridge with
+// no client and every later seam call answering "not connected". Driven over every rejection row of
+// every knob, because the ordering is a property of connect() rather than of any one knob.
+
+describe.skipIf(!redisUp)(
+  'redis failure modes — a rejected connect() must not destroy a live one',
+  () => {
+    it.each(CONFIG_KEYS)('every rejected %s leaves the live connection usable', async (knob) => {
+      const rows = rejectedByKnob[knob] ?? [];
+      expect(rows.length, `no rejection rows are declared for '${knob}'`).toBeGreaterThan(0);
+      const prefix = freshPrefix();
+      const plugin = new RedisPlugin();
+      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
+      const t = freshTopic();
+      const destroyed: string[] = [];
+      try {
+        await plugin.post(t, asHandle('w'), 'before');
+        for (const [rowLabel, value] of rows) {
+          const rejection = await plugin
+            .connect({ url: REDIS_URL, key_prefix: prefix, [knob]: value })
+            .then(
+              () => undefined,
+              (err: Error) => err,
+            );
+          if (rejection === undefined) {
+            destroyed.push(`${rowLabel}: accepted, so this row proves nothing`);
+            continue;
+          }
+          const survived = await plugin.post(t, asHandle('w'), rowLabel).then(
+            () => true,
+            () => false,
+          );
+          if (!survived) destroyed.push(`${rowLabel}: ${rejection.message}`);
+        }
+        expect(
+          destroyed,
+          `a rejected ${knob} tore the live connection down before finishing validation`,
+        ).toEqual([]);
+        const page = await plugin.fetchRecent({ topic: t, limit: 1000 });
+        expect(page.messages.map((m) => m.content)).toContain('before');
+      } finally {
+        await plugin.disconnect().catch(() => undefined);
+        await wipe(prefix);
+      }
+    });
+  },
+);
+
 // -------------------------------------------------------------------------------------------
 // CLASS: a record this plugin did not write still has to normalize into a valid Message. Streams
 // are shared across sessions, plugin versions and anyone holding a redis-cli, so `sender`/`ts`
@@ -449,19 +596,25 @@ describe.skipIf(!redisUp)('redis failure modes — an accepted config still deli
 // -------------------------------------------------------------------------------------------
 
 describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign writer', () => {
-  const foreignEntries: Array<[string, Record<string, string>]> = [
-    ['no recognised field at all', { unrelated: '1' }],
-    ['content only (a human via redis-cli)', { content: 'hi from redis-cli' }],
-    ['sender only', { sender: 'alice' }],
-    ['an empty sender', { sender: '', content: 'anon' }],
-    ['an empty ts', { sender: 'alice', content: 'hi', ts: '' }],
-    ['a ts that is not a date', { sender: 'alice', content: 'hi', ts: 'not-a-date' }],
-    ['a numeric epoch ts', { sender: 'alice', content: 'hi', ts: '1700000000000' }],
-    ['extra unknown fields', { sender: 'alice', content: 'hi', shape: 'm.text', edited: '1' }],
-    ['binary-ish content', { sender: 'alice', content: '\u00ff\u00fe\u0001bin' }],
+  // Every row declares the timestamp it must DERIVE, not merely that one parses: an assertion of the
+  // form `!Number.isNaN(Date.parse(ts))` is satisfied by any constant, so replacing the derivation
+  // with `new Date(0)` would report 1970 for every message and the suite would certify it.
+  // `from-id` = the stream id's own millisecond component; `passthrough` = the entry's `ts` verbatim.
+  type Derivation = 'from-id' | 'passthrough';
+  const foreignEntries: Array<[string, Record<string, string>, Derivation]> = [
+    ['no recognised field at all', { unrelated: '1' }, 'from-id'],
+    ['content only (a human via redis-cli)', { content: 'hi from redis-cli' }, 'from-id'],
+    ['sender only', { sender: 'alice' }, 'from-id'],
+    ['an empty sender', { sender: '', content: 'anon' }, 'from-id'],
+    // One row per DERIVATION, not one per unusable spelling: an empty `ts`, `not-a-date` and a bare
+    // epoch number all take the same fallback, so extra spellings cannot fail for their own reason.
+    ['a ts that is not a date', { sender: 'alice', content: 'hi', ts: 'not-a-date' }, 'from-id'],
+    ['a ts of its own', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09.000Z' }, 'passthrough'],
+    ['extra unknown fields', { sender: 'alice', content: 'hi', shape: 'm.text', edited: '1' }, 'from-id'],
+    ['binary-ish content', { sender: 'alice', content: '\u00ff\u00fe\u0001bin' }, 'from-id'],
   ];
 
-  it.each(foreignEntries)('normalizes an entry with %s', async (_label, fields) => {
+  it.each(foreignEntries)('normalizes an entry with %s', async (_label, fields, derivation) => {
     const prefix = freshPrefix();
     const plugin = new RedisPlugin();
     const writer = createRedisClient(REDIS_URL, FAST);
@@ -478,12 +631,40 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
       expect(m?.cursor).toBe(id);
       expect(m?.content).toBe(fields.content ?? '');
       expect(m?.senderHandle, 'an empty handle collides with every other empty handle').not.toBe('');
+      const expected =
+        derivation === 'passthrough' ? fields.ts : new Date(Number(id.split('-')[0])).toISOString();
+      expect(m?.timestamp, `timestamp is not derived ${derivation}`).toBe(expected);
       expect(
         Number.isNaN(Date.parse(m?.timestamp ?? '')),
         `timestamp ${JSON.stringify(m?.timestamp)} is not ISO 8601 (DESIGN §5)`,
       ).toBe(false);
     } finally {
       await writer.disconnect().catch(() => undefined);
+      await plugin.disconnect();
+      await wipe(prefix);
+    }
+  });
+
+  // The inverse half: an entry this plugin wrote must report the wall-clock time of the post. Only a
+  // bracketed window can say so — every other assertion on Message.timestamp here and in the shared
+  // conformance suite tests parseability, which any constant satisfies.
+  it('reports the wall-clock time of a post it made itself', async () => {
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
+    const t = freshTopic();
+    try {
+      const before = Date.now();
+      await plugin.post(t, asHandle('w'), 'now');
+      const after = Date.now();
+      const [m] = (await plugin.fetchRecent({ topic: t, limit: 10 })).messages;
+      const at = Date.parse(m?.timestamp ?? '');
+      expect(
+        at,
+        `timestamp ${JSON.stringify(m?.timestamp)} is outside the window the post ran in`,
+      ).toBeGreaterThanOrEqual(before - 1000);
+      expect(at).toBeLessThanOrEqual(after + 1000);
+    } finally {
       await plugin.disconnect();
       await wipe(prefix);
     }

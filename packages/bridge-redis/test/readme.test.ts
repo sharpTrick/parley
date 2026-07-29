@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 // CLASS: a shipped infra recipe must not be insecure by default. A copy-pasteable `docker run`
@@ -119,11 +120,55 @@ function shippedUrls(where: string, source: string): ShippedUrl[] {
   }));
 }
 
+/**
+ * Every relative path this README links or names in backticks, resolved to the compose/config files
+ * it points at — directly, or inside a directory it offers. Derived FROM THE README rather than
+ * hand-listed, so a recipe a future README links is pulled into the rules below instead of escaping
+ * them by being new.
+ */
+interface LinkedArtifact {
+  /** The path exactly as the README writes it — the string the exposure rule looks for in prose. */
+  mention: string;
+  rel: string;
+  text: string;
+}
+
+function linkedArtifacts(md: string): LinkedArtifact[] {
+  const hrefs = [
+    ...[...md.matchAll(/\]\(([^)\s]+)\)/g)].map((m) => m[1] ?? ''),
+    ...[...md.matchAll(/`([^`\s]*\/[^`\s]*)`/g)].map((m) => m[1] ?? ''),
+  ].filter((href) => href !== '' && !/^[a-z][a-z0-9+.-]*:|^#|^\/\//i.test(href));
+
+  const out = new Map<string, LinkedArtifact>();
+  for (const mention of new Set(hrefs)) {
+    const target = fileURLToPath(new URL(mention.split('#')[0] ?? '', README));
+    if (!existsSync(target)) continue;
+    const composeFiles = statSync(target).isDirectory()
+      ? readdirSync(target)
+          .filter((f) => /^docker-compose.*\.ya?ml$/.test(f))
+          .map((f) => `${target}/${f}`)
+      : /\.ya?ml$/.test(target)
+        ? [target]
+        : [];
+    for (const file of composeFiles) {
+      out.set(file, {
+        mention,
+        rel: file.replace(/^.*?(?=examples\/)/, ''),
+        text: readFileSync(file, 'utf8'),
+      });
+    }
+  }
+  return [...out.values()];
+}
+
+const linked = linkedArtifacts(text);
+
 const artifacts: Array<[string, string]> = [
   ['README.md', text],
   ...readdirSync(EXAMPLES)
     .filter((f) => f.endsWith('.yaml'))
     .map((f): [string, string] => [f, readFileSync(new URL(f, EXAMPLES), 'utf8')]),
+  ...linked.map((a): [string, string] => [a.rel, a.text]),
 ];
 
 const shipped = artifacts.flatMap(([where, source]) => shippedUrls(where, source));
@@ -145,6 +190,57 @@ describe('bridge-redis shipped artifacts — every copy-pasteable URL follows th
         'rediss',
       );
       expect(u.credentials, `${u.raw} points at an unauthenticated Redis`).not.toBe('');
+    },
+  );
+});
+
+// CLASS: a security guard that lints only the artifacts it was written against, while the README
+// links others. The `docker run` recipes and the example configs above were the guarded set; the
+// maintainer dev harness this README offers next to them publishes an unauthenticated Redis on every
+// interface — full history, forged `sender`s — and no rule here ever looked at it.
+
+/** Every host-published port in a compose file, as written (`6379:6379`, `127.0.0.1:6379:6379`). */
+function publishedPorts(yaml: string): string[] {
+  return [...yaml.matchAll(/^\s*-\s*["']?((?:\[[^\]]+\]:|[\d.]+:)?\d+:\d+)["']?/gm)].map(
+    (m) => m[1] ?? '',
+  );
+}
+
+const publishesOnLoopback = (spec: string): boolean => /^(127\.0\.0\.1|\[::1\]|::1):/.test(spec);
+
+/** The blank-line-delimited README blocks naming a path — where an exposure caveat has to live. */
+function paragraphsNaming(md: string, needle: string): string[] {
+  return md.split(/\n\s*\n/).filter((block) => block.includes(needle));
+}
+
+describe('bridge-redis shipped artifacts — a compose file the README links is guarded too', () => {
+  it('links at least one compose file, so the rows below are not vacuous', () => {
+    expect(linked.map((a) => a.rel)).not.toEqual([]);
+  });
+
+  it.each(linked.map((a): [string, LinkedArtifact] => [a.rel, a]))(
+    'publishes only on loopback, or the README names the exposure — %s',
+    (_label, artifact) => {
+      const ports = publishedPorts(artifact.text);
+      expect(ports, `${artifact.rel} publishes no port at all, so this row cannot fail`).not.toEqual(
+        [],
+      );
+      const exposed = ports.filter((spec) => !publishesOnLoopback(spec));
+      if (exposed.length === 0) return;
+      const blocks = paragraphsNaming(text, artifact.mention);
+      expect(
+        blocks,
+        `the README links ${artifact.mention} but never names it in prose, so a reader meets ` +
+          `${exposed.join(', ')} with no warning`,
+      ).not.toEqual([]);
+      for (const block of blocks) {
+        expect(
+          block,
+          `${artifact.rel} publishes ${exposed.join(', ')} on every interface and the README ` +
+            `offers it without saying so`,
+        ).toMatch(/every interface/i);
+        expect(block).toMatch(/unauthenticated/i);
+      }
     },
   );
 });

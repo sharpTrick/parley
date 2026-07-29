@@ -232,6 +232,37 @@ function normalizeString(key: string, value: unknown, fallback: string): string 
 }
 
 /**
+ * Keep the parse and scheme check here rather than leaving them to node-redis' constructor, so that
+ * a mistyped URL is rejected by `connect()` — naming the plugin and the key, like every other knob,
+ * and BEFORE `tearDown()` — instead of escaping as a bare `TypeError: Invalid URL` after a live
+ * plugin has already been torn down and left with no client.
+ *
+ * Keep the value itself out of every message, so that a password in a mistyped URL never reaches a
+ * log line; the scheme is the one part safe to echo back.
+ *
+ * Keep the hostname requirement, so that `redis://` — which parses, and carries the right scheme —
+ * cannot fall through to node-redis' own default and point the whole bridge at an unauthenticated
+ * `127.0.0.1:6379`, the same hazard the empty-string rejection exists for.
+ */
+function normalizeUrl(value: unknown, fallback: string): string {
+  const url = normalizeString('url', value, fallback);
+  const reject = (why: string): never => {
+    throw new Error(`parley-redis: url must ${why}; omit it for the default '${fallback}'`);
+  };
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return reject('be a URL of the form redis://host:port (it did not parse)');
+  }
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    return reject(`use the redis: or rediss: scheme (got '${parsed.protocol}')`);
+  }
+  if (parsed.hostname === '') return reject(`name a host (got '${parsed.protocol}' and none)`);
+  return url;
+}
+
+/**
  * Every millisecond knob reaches a place where a nonsensical value is SILENT rather than loud:
  * `block_ms` becomes an `XREAD BLOCK` argument, where `-1`/`0.5`/`NaN` make the server reject every
  * read — killing live push forever behind a `subscribe()` that resolved — and `0` blocks the reader
@@ -273,7 +304,6 @@ async function streamTail(client: RedisClient, key: string): Promise<string> {
  * (`<ms>[-<seq>]`); anything else — another backend's cursor, `''`/`'$'`, a truncated id via
  * mis-namespaced read-state, or an all-digit string too large for the uint64 each component is —
  * would otherwise reach XRANGE as a raw `ERR Invalid stream ID` naming neither backend nor topic.
- * Throw labelled so core can drop it and refetch the window.
  */
 function assertMintedCursor(topic: Topic, since: string): void {
   const wellFormed =
@@ -370,7 +400,7 @@ export class RedisPlugin implements BackendPlugin {
 
   private async open(cfg: RedisBackendConfig): Promise<void> {
     assertKnownKeys(cfg as Record<string, unknown>);
-    const url = normalizeString('url', cfg.url, DEFAULT_URL);
+    const url = normalizeUrl(cfg.url, DEFAULT_URL);
     const prefix = normalizeString('key_prefix', cfg.key_prefix, DEFAULT_KEY_PREFIX);
     const retentionDays = normalizeRetentionDays(cfg.retention_days);
     const blockMs = normalizeMillis('block_ms', cfg.block_ms, DEFAULT_BLOCK_MS);
@@ -445,7 +475,10 @@ export class RedisPlugin implements BackendPlugin {
               TRIM: {
                 strategy: 'MINID',
                 strategyModifier: '~',
-                threshold: Date.now() - this.retentionDays * 86_400_000,
+                // Keep the floor, so that a retention window whose millisecond product is not whole
+                // (30/7, 1e-6 — all accepted by the validator) cannot reach Redis as a fractional
+                // stream id and make EVERY post fail against a `connect()` that already resolved.
+                threshold: Math.floor(Date.now() - this.retentionDays * 86_400_000),
               },
             }
           : undefined,
