@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Allowlist } from '../allowlist.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import type { Handle, Message } from '../message.js';
-import type { BackendPlugin } from '../seam.js';
+import { NoSuchTopicError, type BackendPlugin } from '../seam.js';
 import { emitChannel } from './channel-emit.js';
 
 export interface PushLoopOptions {
@@ -21,6 +21,10 @@ export interface PushLoopOptions {
  * The plugin owns the delivery mechanism (poll loop for SQLite; blocking events later); core's
  * emit path is identical across mechanisms, so push developed against polling exercises the
  * same path event-driven backends will drive.
+ *
+ * A topic the backend cannot represent yet ({@link NoSuchTopicError}) gets no live subscription and
+ * is skipped — the seam declares that "absent", not a failure, so the remaining topics still go
+ * live. Every other rejection propagates and fails the attach.
  */
 export async function startPushLoop(
   server: McpServer,
@@ -37,6 +41,13 @@ export async function startPushLoop(
     });
   };
   for (const topic of allow.topics()) {
-    await plugin.subscribe(topic, handler);
+    try {
+      await plugin.subscribe(topic, handler);
+    } catch (err) {
+      if (!(err instanceof NoSuchTopicError)) throw err;
+      console.error(
+        `[parley] topic ${JSON.stringify(topic)} does not exist on the backend yet; no live subscription`,
+      );
+    }
   }
 }

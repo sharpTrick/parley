@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asHandle, asTopic } from '../message.js';
+import { NoSuchTopicError } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { CHANNEL_NOTIFICATION_METHOD } from './channel-emit.js';
 import { startPushLoop } from './push-loop.js';
@@ -64,5 +65,51 @@ describe('startPushLoop (core emit handler)', () => {
     await plugin.post(asTopic('ctx'), asHandle('bob'), 'ping @agent');
     await vi.waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]!.params.content).toBe('ping @agent');
+  });
+
+  /**
+   * `subscribe` is the other seam call seam.ts declares NoSuchTopicError for. A chat channel that
+   * does not exist yet must cost that ONE topic its live path, not the whole attach; anything else
+   * is a real failure and has to propagate.
+   */
+  describe('an absent topic loses only its own subscription', () => {
+    async function wireOver(topics: string[], failOn: string, err: () => Error) {
+      const plugin = new FakePlugin();
+      await plugin.connect({});
+      const subscribed: string[] = [];
+      const orig = plugin.subscribe.bind(plugin);
+      plugin.subscribe = async (topic, handler) => {
+        if (topic === failOn) throw err();
+        subscribed.push(topic);
+        return orig(topic, handler);
+      };
+      const { server, calls } = fakeServer();
+      const start = startPushLoop(server, plugin, new Allowlist(topics), new SeenSet(), {
+        mentionFilter: false,
+        identity: asHandle('me'),
+      });
+      return { plugin, subscribed, calls, start };
+    }
+
+    it.each([
+      ['the FIRST topic', 'ctx'],
+      ['a LATER topic', 'ops'],
+    ])('NoSuchTopicError on %s still wires the others', async (_where, failOn) => {
+      const others = ['ctx', 'ops'].filter((t) => t !== failOn);
+      const { subscribed, calls, start, plugin } = await wireOver(
+        ['ctx', 'ops'],
+        failOn,
+        () => new NoSuchTopicError(failOn),
+      );
+      await expect(start).resolves.toBeUndefined();
+      expect(subscribed).toEqual(others);
+      await plugin.post(asTopic(others[0]!), asHandle('bob'), 'still live');
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+    });
+
+    it('a generic subscribe failure still fails the whole wiring', async () => {
+      const { start } = await wireOver(['ctx', 'ops'], 'ops', () => new Error('subscribe boom'));
+      await expect(start).rejects.toThrow(/subscribe boom/);
+    });
   });
 });

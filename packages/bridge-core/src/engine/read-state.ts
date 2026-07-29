@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -11,9 +11,13 @@ import { asCursor, type Cursor, type Topic } from '../message.js';
  * Read-state is PER-INSTANCE, never shared (DESIGN §10) — different sessions legitimately
  * hold different read positions per topic, so the file path is namespaced by instanceId.
  * CORE owns this (identical across every backend); the plugin owns only the message store.
- * It is a JSON file, NOT the message DB: a single instance writes its own file (no
- * contention), core must not depend on a backend driver, and atomic rename prevents
- * corruption.
+ * It is a JSON file, NOT the message DB: core must not depend on a backend driver, and atomic
+ * rename prevents corruption.
+ *
+ * Exclusivity is a CONVENTION, not an enforced lock: `instance_id` defaults to the handle, so two
+ * sessions sharing a handle land on one file. Each flush therefore merges over a re-read of disk
+ * and writes through a process-unique temp name, so the worst case is a single topic's cursor
+ * losing a race — not a whole session's read position, and never a half-written file.
  */
 export class ReadStateStore {
   private readonly state: Record<string, string>;
@@ -63,8 +67,11 @@ export class ReadStateStore {
     // read this instance's cursor positions. `mode` is masked by the umask (only ever *removing*
     // bits, so the result is ≤ these), and renameSync preserves the tmp file's mode into place.
     mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
-    const tmp = `${this.filePath}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+    const merged = { ...ReadStateStore.load(this.filePath), ...this.state };
+    // Keep the temp name process-unique, so that a concurrent flush cannot interleave into it and
+    // leave a half-written file that load() would silently discard as corrupt.
+    const tmp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
     renameSync(tmp, this.filePath);
   }
 }

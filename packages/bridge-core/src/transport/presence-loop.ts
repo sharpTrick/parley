@@ -29,9 +29,24 @@ export interface PresenceLoopOptions {
    * by the old process's trailing `goodbye` (see engine/presence.ts). Injectable for deterministic tests.
    */
   instanceId?: string;
+  /**
+   * How long {@link PresenceLoop.stop} waits for the goodbye to reach the backend before giving up.
+   * Default {@link GOODBYE_TIMEOUT_MS}.
+   */
+  goodbyeTimeoutMs?: number;
 }
 
-/** A running presence loop. Call {@link stop} once to cancel the timer and say goodbye. */
+/**
+ * Ceiling on the best-effort goodbye. `stop()` runs on every teardown path, and a `post` that never
+ * settles (an HTTP backend with no request timeout) would otherwise hold `disconnect()` and
+ * `server.close()` forever. The TTL window reclaims the instance either way.
+ */
+export const GOODBYE_TIMEOUT_MS = 2_000;
+
+/**
+ * A running presence loop. Call {@link stop} once to cancel the timer and say goodbye; it always
+ * settles within {@link PresenceLoopOptions.goodbyeTimeoutMs}, so a teardown path can await it.
+ */
 export interface PresenceLoop {
   stop(): Promise<void>;
 }
@@ -88,7 +103,7 @@ export function startPresenceLoop(
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
-      await enqueue('goodbye');
+      await bounded(enqueue('goodbye'), opts.goodbyeTimeoutMs ?? GOODBYE_TIMEOUT_MS);
     },
   };
 }
@@ -96,4 +111,16 @@ export function startPresenceLoop(
 /** setInterval treats <=0 as 0 and floors to ~1ms; guard against a misconfigured cadence. */
 function heartbeatClamp(ms: number): number {
   return ms > 0 ? ms : 1;
+}
+
+/** Resolve when `work` settles or `ms` elapses, whichever is first — never reject, never linger. */
+function bounded(work: Promise<void>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+    void work.catch(() => undefined).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }

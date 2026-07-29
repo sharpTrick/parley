@@ -1,13 +1,32 @@
 import { createServer as createHttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as allowlistMod from '../allowlist.js';
 import { parseConfig } from '../config.js';
+import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
+import type { BackendMsgId } from '../message.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from './http.js';
+import { GOODBYE_TIMEOUT_MS } from './presence-loop.js';
+import { buildBridge } from './stdio-bridge.js';
+
+/** Mirrors the stdio root's teardown table (stdio-bridge.test.ts) — one rule, two composition roots. */
+const POST_BEHAVIOURS = {
+  resolves: (id: BackendMsgId): Promise<BackendMsgId> => Promise.resolve(id),
+  rejects: (): Promise<BackendMsgId> => Promise.reject(new Error('post boom')),
+  'rejects synchronously': (): Promise<BackendMsgId> => {
+    throw new Error('post boom (sync)');
+  },
+  'never settles': (): Promise<BackendMsgId> => new Promise<BackendMsgId>(() => {}),
+  'settles long after the teardown budget': (id: BackendMsgId): Promise<BackendMsgId> =>
+    new Promise<BackendMsgId>((r) => setTimeout(() => r(id), 30_000).unref?.()),
+} as const;
+type PostBehaviour = keyof typeof POST_BEHAVIOURS;
+const TEARDOWN_BUDGET_MS = GOODBYE_TIMEOUT_MS + 1_500;
 
 let remote: RemoteHttpServer;
 let plugin: FakePlugin;
@@ -278,4 +297,110 @@ describe('reactive HTTP: 500 path hides internal detail, logs it (SEC-14)', () =
       await p.disconnect();
     }
   });
+});
+
+/**
+ * Presence is a liveness advertisement: peers use `parley_list_users` to pick a hand-off target, so
+ * an announcement must never precede a delivery path that can answer. Both composition roots have
+ * to obey one rule, so table them together — the HTTP root announced at CONSTRUCTION time (before
+ * any bind, and even when the bind failed) while the stdio root deliberately waited.
+ */
+describe('presence is announced only once the transport is actually live', () => {
+  const presenceCfg = (topics = ['ctx']) =>
+    parseConfig({
+      identity: { handle: 'agent' },
+      topics,
+      live_push: { enabled: true },
+      presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
+    });
+
+  /** Every presence post seen so far, in order. A FakePlugin records posts durably. */
+  async function beats(p: FakePlugin): Promise<string[]> {
+    const { messages } = await p.fetchRecent({ topic: DEFAULT_PRESENCE_TOPIC as never });
+    return messages.map((m) => m.content);
+  }
+
+  async function settle(): Promise<void> {
+    await new Promise((r) => setTimeout(r, 120)); // several heartbeat cadences
+  }
+
+  it('http root: nothing is announced before listen() resolves', async () => {
+    const p = new FakePlugin();
+    await p.connect({});
+    const app = createRemoteHttpApp(p, presenceCfg(), { insecureNoAuth: true });
+    await settle();
+    expect(await beats(p)).toEqual([]); // constructed, never listened ⇒ never advertised
+    const s = await app.listen(0);
+    expect(s.address()).not.toBeNull();
+    await vi.waitFor(async () => expect((await beats(p)).length).toBeGreaterThan(0));
+    await app.close();
+    await p.disconnect();
+  });
+
+  it('http root: a failed bind never announces', async () => {
+    const blocker = createHttpServer();
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+    const port = (blocker.address() as AddressInfo).port;
+    const p = new FakePlugin();
+    await p.connect({});
+    const app = createRemoteHttpApp(p, presenceCfg(), { insecureNoAuth: true });
+    await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    await settle();
+    expect(await beats(p)).toEqual([]);
+    await app.close().catch(() => {});
+    await p.disconnect();
+    await new Promise<void>((resolve) => blocker.close(() => resolve()));
+  });
+
+  it('stdio root: nothing is announced before attach(), and a failed attach never announces', async () => {
+    const p = new FakePlugin();
+    await p.connect({});
+    const bridge = await buildBridge(p, presenceCfg());
+    await settle();
+    expect(await beats(p)).toEqual([]); // built, never attached ⇒ never advertised
+    const [, serverT] = InMemoryTransport.createLinkedPair();
+    await bridge.attach(serverT);
+    await vi.waitFor(async () => expect((await beats(p)).length).toBeGreaterThan(0));
+    await bridge.shutdown();
+
+    const failing = new FakePlugin();
+    await failing.connect({});
+    failing.subscribe = (): Promise<void> => Promise.reject(new Error('subscribe boom'));
+    const doomed = await buildBridge(failing, presenceCfg());
+    const [, t2] = InMemoryTransport.createLinkedPair();
+    await expect(doomed.attach(t2)).rejects.toThrow(/subscribe boom/);
+    await settle();
+    expect(await beats(failing)).toEqual([]);
+  });
+});
+
+/**
+ * The HTTP root's close() awaits the same best-effort goodbye the stdio root does, so it inherits
+ * the same hazard: a presence post that never settles must not hold the socket open forever.
+ */
+describe('remote HTTP close() is bounded whatever the presence post does', () => {
+  it.each(Object.keys(POST_BEHAVIOURS) as PostBehaviour[])(
+    'close() completes with a post that %s',
+    async (behaviour) => {
+      const p = new FakePlugin();
+      await p.connect({});
+      const orig = p.post.bind(p);
+      p.post = async (...a: Parameters<FakePlugin['post']>) =>
+        POST_BEHAVIOURS[behaviour](await orig(...a));
+      const cfg = parseConfig({
+        identity: { handle: 'agent' },
+        topics: ['ctx'],
+        presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
+      });
+      const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+      const s = await app.listen(0);
+      const closed = await Promise.race([
+        app.close().then(() => 'CLOSED'),
+        new Promise((r) => setTimeout(() => r('TIMED OUT'), TEARDOWN_BUDGET_MS).unref?.()),
+      ]);
+      expect(closed).toBe('CLOSED');
+      expect(s.listening).toBe(false);
+      await p.disconnect();
+    },
+  );
 });

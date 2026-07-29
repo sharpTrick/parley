@@ -173,7 +173,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
         'long-poll: if nothing is newer than `since`, the call holds until a message arrives or the ' +
         'timeout elapses (capped server-side), so a polling agent burns tokens per message, not per ' +
-        'tick.' +
+        'tick. A topic that does not exist on the backend yet returns an empty page with ' +
+        '`topicAbsent: true` rather than an error.' +
         describeAllowed(allow),
       inputSchema: {
         topic: topicSchema(allow, 'Topic to read (must be on the allowlist).'),
@@ -202,15 +203,23 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       if (since !== undefined) args.since = asCursor(since);
       if (limit !== undefined) args.limit = limit;
       const blockMs = block_ms !== undefined ? Math.min(block_ms, deps.blockMaxMs) : 0;
-      const result =
-        blockMs > 0
-          ? await fetchRecentBlocking(deps.plugin, args, {
-              blockMs,
-              pollIntervalMs: deps.blockPollIntervalMs,
-              now: deps.now,
-              signal: extra?.signal,
-            })
-          : await deps.plugin.fetchRecent(args);
+      let result;
+      try {
+        result =
+          blockMs > 0
+            ? await fetchRecentBlocking(deps.plugin, args, {
+                blockMs,
+                pollIntervalMs: deps.blockPollIntervalMs,
+                now: deps.now,
+                signal: extra?.signal,
+              })
+            : await deps.plugin.fetchRecent(args);
+      } catch (e) {
+        if (!(e instanceof NoSuchTopicError)) throw e;
+        // Echo the caller's position back: replaying it once the topic exists reads from where
+        // they were, and omitting it (no `since` given) reads the recent window.
+        return textResult({ messages: [], nextCursor: args.since, topicAbsent: true });
+      }
       for (const m of result.messages) deps.seen?.markSeen(t, m.backendMsgId);
       return textResult({ messages: result.messages, nextCursor: result.nextCursor });
     },

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { asHandle, asTopic } from '../message.js';
-import type { FetchRecentArgs, FetchRecentResult } from '../seam.js';
+import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { fetchRecentBlocking } from './blocking-fetch.js';
 
@@ -138,6 +138,71 @@ describe('fetchRecentBlocking', () => {
     expect(seen[0]).toBe(1000);
     expect(seen.every((b) => b !== undefined && b <= 1000)).toBe(true);
     expect(seen.length).toBeGreaterThan(1);
+  });
+
+  /**
+   * Cancellation has to reach the thing actually doing the waiting, not just the wrapper around it.
+   * Table both plugin flavours the seam allows — one that ignores `blockMs` (core naps between
+   * calls) and one that honours it NATIVELY (the wait happens inside a single plugin call) — across
+   * every moment an abort can land, and assert a bounded wall-clock return in every cell. Real
+   * timers: the defect is that core stays parked inside `plugin.fetchRecent`, which a fake clock
+   * cannot express.
+   */
+  describe('an aborted long-poll returns in bounded time on every plugin flavour', () => {
+    const BUDGET_MS = 3000;
+    const BOUND_MS = 600;
+    const T = asTopic('room');
+
+    const flavours = {
+      'ignores blockMs (returns instantly)': (): BackendPlugin => {
+        const p = new FakePlugin();
+        return p;
+      },
+      'honours blockMs natively (parks for the whole budget)': (): BackendPlugin => {
+        const p = new FakePlugin();
+        const orig = p.fetchRecent.bind(p);
+        p.fetchRecent = async (a: FetchRecentArgs): Promise<FetchRecentResult> => {
+          if ((a.blockMs ?? 0) > 0) await new Promise((r) => setTimeout(r, a.blockMs).unref?.());
+          return orig(a);
+        };
+        return p;
+      },
+    };
+
+    const timings = {
+      'before the first fetch': (ac: AbortController) => ac.abort(),
+      'while the fetch is in flight': (ac: AbortController) => setTimeout(() => ac.abort(), 25).unref?.(),
+      'after several poll iterations': (ac: AbortController) => setTimeout(() => ac.abort(), 120).unref?.(),
+    };
+
+    for (const [flavour, make] of Object.entries(flavours)) {
+      for (const [when, fire] of Object.entries(timings)) {
+        it(`${flavour} × aborted ${when}`, async () => {
+          const plugin = make();
+          const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+          const ac = new AbortController();
+          fire(ac);
+          const t0 = Date.now();
+          const res = await fetchRecentBlocking(
+            plugin,
+            { topic: T, since: tail },
+            { blockMs: BUDGET_MS, pollIntervalMs: 40, signal: ac.signal },
+          );
+          expect(Date.now() - t0).toBeLessThan(BOUND_MS);
+          expect(res.messages).toEqual([]);
+          expect(res.nextCursor).toBe(tail); // stable and replayable — the caller's own position
+        });
+      }
+
+      it(`${flavour} × never aborted still spends the whole budget`, async () => {
+        const plugin = make();
+        const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+        const t0 = Date.now();
+        await fetchRecentBlocking(plugin, { topic: T, since: tail }, { blockMs: 400, pollIntervalMs: 40 });
+        // Without this row every assertion above would pass on a wrapper that never waits at all.
+        expect(Date.now() - t0).toBeGreaterThanOrEqual(350);
+      });
+    }
   });
 
   it('stops early when the abort signal fires', async () => {

@@ -9,12 +9,20 @@ import type { BackendMsgId, Topic } from '../message.js';
  * Bounded FIFO per topic so memory stays flat. The window only needs to cover the overlap
  * between a catch-up pull and the live poll — cursor monotonicity prevents re-fetching
  * ancient ids — so a few thousand ids per topic is ample.
+ *
+ * The NUMBER of topics is bounded too, LRU. A `post_topics` pattern leaves the topic space open and
+ * `fetch_recent` warms a bucket for whatever topic it is handed, so an agent reading ad-hoc topics
+ * would otherwise grow this map for the process lifetime. Eviction costs at most a duplicate
+ * `<channel>` emit on a topic that has gone cold — the push loop's own topics stay hot.
  */
 export class SeenSet {
   private readonly sets = new Map<Topic, Set<BackendMsgId>>();
   private readonly queues = new Map<Topic, BackendMsgId[]>();
 
-  constructor(private readonly maxPerTopic = 4096) {}
+  constructor(
+    private readonly maxPerTopic = 4096,
+    private readonly maxTopics = 256,
+  ) {}
 
   private bucket(topic: Topic): { set: Set<BackendMsgId>; queue: BackendMsgId[] } {
     let set = this.sets.get(topic);
@@ -22,8 +30,16 @@ export class SeenSet {
     if (set === undefined || queue === undefined) {
       set = new Set<BackendMsgId>();
       queue = [];
-      this.sets.set(topic, set);
-      this.queues.set(topic, queue);
+    } else {
+      this.sets.delete(topic);
+      this.queues.delete(topic);
+    }
+    this.sets.set(topic, set);
+    this.queues.set(topic, queue);
+    for (const stale of this.sets.keys()) {
+      if (this.sets.size <= this.maxTopics) break;
+      this.sets.delete(stale);
+      this.queues.delete(stale);
     }
     return { set, queue };
   }

@@ -2,7 +2,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { asBackendMsgId, asHandle, asTopic } from '../message.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
+import { NoSuchTopicError, type BackendPlugin, type FetchRecentArgs, type FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { catchUpAll, catchUpTopic } from './catchup.js';
 import { ReadStateStore } from './read-state.js';
@@ -141,6 +142,147 @@ describe('catch-up driver', () => {
       );
       expect(err.message).toBe('backend went away');
     });
+  });
+
+  /**
+   * seam.ts declares NoSuchTopicError the ONE rejection meaning "topic not present yet" rather than
+   * a backend failure. Table every catch-up entry point against BOTH kinds so a call site that
+   * honours the sentinel on one path and not its siblings cannot pass: the sentinel must degrade
+   * (zero messages, read-state untouched, bridge alive), the generic error must propagate.
+   */
+  describe('the absent-topic sentinel degrades; every other rejection propagates', () => {
+    const rejectingWith = (make: () => Error, only?: string): BackendPlugin =>
+      ({
+        fetchRecent: (a: FetchRecentArgs) =>
+          only === undefined || a.topic === only
+            ? Promise.reject(make())
+            : Promise.resolve({ messages: [] as Message[], nextCursor: asCursor('9') }),
+      }) as unknown as BackendPlugin;
+
+    const sentinel = (): Error => new NoSuchTopicError('ops');
+    const generic = (): Error => new Error('backend on fire');
+
+    const entryPoints: Array<
+      [name: string, run: (plugin: BackendPlugin, readState: ReadStateStore) => Promise<number>]
+    > = [
+      [
+        'catchUpTopic',
+        (plugin, readState) =>
+          catchUpTopic({ plugin, topic: asTopic('ops'), limit: 100, readState, seen: new SeenSet() }),
+      ],
+      [
+        'catchUpAll',
+        (plugin, readState) =>
+          catchUpAll({
+            plugin,
+            topics: [asTopic('ctx'), asTopic('ops')],
+            limit: 100,
+            readState,
+            seen: new SeenSet(),
+          }),
+      ],
+    ];
+
+    for (const [name, run] of entryPoints) {
+      for (const cold of [true, false]) {
+        const start = cold ? 'cold start' : 'resuming from a stored cursor';
+
+        it(`${name} treats NoSuchTopicError as an empty topic (${start})`, async () => {
+          const readState = new ReadStateStore(rsPath());
+          if (!cold) readState.set(asTopic('ops'), asCursor('stored'));
+          const drained = await run(rejectingWith(sentinel, 'ops'), readState);
+          expect(drained).toBe(0);
+          // Read-state must not move for a topic we never actually read.
+          expect(readState.get(asTopic('ops'))).toBe(cold ? undefined : 'stored');
+        });
+
+        it(`${name} propagates a generic backend failure (${start})`, async () => {
+          const readState = new ReadStateStore(rsPath());
+          if (!cold) readState.set(asTopic('ops'), asCursor('stored'));
+          await expect(run(rejectingWith(generic, 'ops'), readState)).rejects.toThrow(
+            /backend on fire/,
+          );
+        });
+      }
+    }
+
+    it('catchUpAll keeps draining the healthy topics around an absent one', async () => {
+      const p = await seeded(4);
+      const absent = {
+        fetchRecent: (a: FetchRecentArgs) =>
+          a.topic === 'ops' ? Promise.reject(new NoSuchTopicError('ops')) : p.fetchRecent(a),
+      } as unknown as BackendPlugin;
+      const readState = new ReadStateStore(rsPath());
+      const total = await catchUpAll({
+        plugin: absent,
+        topics: [asTopic('ops'), T, asTopic('ops')],
+        limit: 100,
+        readState,
+        seen: new SeenSet(),
+      });
+      expect(total).toBe(4);
+      expect(readState.get(T)).toBe('4');
+    });
+
+  });
+
+  /**
+   * How much a cold start actually drains is a function of BOTH inputs — stored cursor and page
+   * size — and the loop silently reads only the newest window when there is no cursor. Pin the
+   * exact drained count and final read-state per cell against a fake with conformant since-less
+   * semantics (newest window), which FakePlugin does not have.
+   */
+  describe('drained window depends on stored-cursor × page-size', () => {
+    class RecentWindowPlugin implements Partial<BackendPlugin> {
+      constructor(private readonly total: number) {}
+      async fetchRecent(a: FetchRecentArgs): Promise<FetchRecentResult> {
+        const limit = a.limit ?? 100;
+        const all = Array.from({ length: this.total }, (_, i) => i + 1);
+        // No `since` ⇒ the backend's DEFAULT RECENT WINDOW: the newest `limit` rows (seam.ts §6).
+        const rows =
+          a.since === undefined ? all.slice(-limit) : all.filter((n) => n > Number(a.since)).slice(0, limit);
+        const messages = rows.map(
+          (n) =>
+            ({
+              topic: a.topic,
+              senderHandle: asHandle('w'),
+              content: `m${n}`,
+              timestamp: '1970-01-01T00:00:00.000Z',
+              backendMsgId: asBackendMsgId(String(n)),
+              cursor: asCursor(String(n)),
+              mentions: [],
+            }) as Message,
+        );
+        return { messages, nextCursor: messages.at(-1)?.cursor ?? a.since ?? asCursor('0') };
+      }
+    }
+
+    it.each([
+      // stored cursor | total | limit | drained | final read-state
+      [undefined, 2, 3, 2, '2'],
+      [undefined, 3, 3, 3, '3'],
+      [undefined, 10, 3, 3, '10'], // cold start adopts the newest window's tail: 7 rows never drained
+      [undefined, 1000, 100, 100, '1000'],
+      ['0', 2, 3, 2, '2'],
+      ['0', 3, 3, 3, '3'],
+      ['0', 10, 3, 10, '10'], // resumed catch-up pages to exhaustion
+      ['5', 10, 3, 5, '10'],
+    ])(
+      'stored=%s total=%i limit=%i drains %i and leaves read-state at %s',
+      async (stored, total, limit, drained, finalCursor) => {
+        const readState = new ReadStateStore(rsPath());
+        if (stored !== undefined) readState.set(T, asCursor(stored));
+        const n = await catchUpTopic({
+          plugin: new RecentWindowPlugin(total) as unknown as BackendPlugin,
+          topic: T,
+          limit,
+          readState,
+          seen: new SeenSet(),
+        });
+        expect(n).toBe(drained);
+        expect(readState.get(T)).toBe(finalCursor);
+      },
+    );
   });
 
   it('catchUpAll loops over every configured topic', async () => {

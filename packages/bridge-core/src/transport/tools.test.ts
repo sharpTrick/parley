@@ -558,3 +558,79 @@ describe('dynamic tool descriptions', () => {
     expect(fetchProps.topic!.enum).toBeUndefined();
   });
 });
+
+/**
+ * The seam's absence sentinel has to mean the same thing at every tool entry point, not only at the
+ * one where it was first noticed. Table each agent-facing call site against BOTH rejection kinds:
+ * the sentinel degrades to a normal, empty result; a generic failure is surfaced as an error rather
+ * than faked into an empty one.
+ */
+describe('every tool honours NoSuchTopicError identically', () => {
+  const sentinel = (): never => {
+    throw new NoSuchTopicError('ctx');
+  };
+  const generic = (): never => {
+    throw new Error('backend on fire');
+  };
+
+  async function callWith(
+    tool: string,
+    args: Record<string, unknown>,
+    seam: 'fetchRecent' | 'post',
+    fail: () => never,
+  ): Promise<ToolText> {
+    const { client, plugin } = await harness();
+    plugin[seam] = async () => fail();
+    return (await client.callTool({ name: tool, arguments: args })) as ToolText;
+  }
+
+  it.each([
+    ['parley_fetch_recent', { topic: 'ctx' }, 'fetchRecent'],
+    ['parley_fetch_recent (long-poll)', { topic: 'ctx', since: '0', block_ms: 500 }, 'fetchRecent'],
+    ['parley_list_users', {}, 'fetchRecent'],
+  ] as const)('%s degrades to an empty result on the sentinel', async (name, args, seam) => {
+    const res = await callWith(name.split(' ')[0]!, args, seam, sentinel);
+    expect(res.isError).toBeFalsy();
+    const out = parse(res) as { messages?: unknown[]; users?: unknown[] };
+    expect(out.messages ?? out.users).toEqual([]);
+  });
+
+  it.each([
+    ['parley_fetch_recent', { topic: 'ctx' }, 'fetchRecent'],
+    ['parley_fetch_recent (long-poll)', { topic: 'ctx', since: '0', block_ms: 500 }, 'fetchRecent'],
+    ['parley_list_users', {}, 'fetchRecent'],
+    ['parley_post', { topic: 'ctx', content: 'x' }, 'post'],
+    ['parley_reply', { topic: 'ctx', content: 'x' }, 'post'],
+  ] as const)('%s surfaces a generic backend failure as an error', async (name, args, seam) => {
+    const res = await callWith(name.split(' ')[0]!, args, seam, generic);
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain('backend on fire');
+  });
+
+  // A write to a topic the backend cannot represent genuinely FAILED — reporting it as an empty
+  // success would tell the agent its hand-off landed when nothing was written.
+  it.each([
+    ['parley_post', { topic: 'ctx', content: 'x' }],
+    ['parley_reply', { topic: 'ctx', content: 'x' }],
+  ])('%s reports the sentinel as an error — a write that did not happen is not a success', async (name, args) => {
+    const res = await callWith(name, args, 'post', sentinel);
+    expect(res.isError).toBe(true);
+  });
+
+  it('an absent topic hands back a replayable position, not an invented cursor', async () => {
+    const { client, plugin } = await harness();
+    plugin.fetchRecent = async () => sentinel();
+    const withSince = parse(
+      await client.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', since: 'c-7' },
+      }),
+    ) as { messages: unknown[]; nextCursor?: string; topicAbsent?: boolean };
+    expect(withSince).toEqual({ messages: [], nextCursor: 'c-7', topicAbsent: true });
+
+    const coldStart = parse(
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } }),
+    ) as { messages: unknown[]; nextCursor?: string; topicAbsent?: boolean };
+    expect(coldStart).toEqual({ messages: [], topicAbsent: true });
+  });
+});

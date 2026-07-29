@@ -11,11 +11,32 @@ export interface BlockingFetchOptions {
   now?: () => number;
   /** Sleep `ms`. Default a real `setTimeout`. */
   sleep?: (ms: number) => Promise<void>;
-  /** Optional cancellation; when aborted the loop returns the latest empty page at once. */
+  /**
+   * Optional cancellation. Observed while napping AND while a natively-blocking `fetchRecent` is
+   * parked inside the plugin, so an aborted long-poll returns in bounded time rather than after the
+   * plugin's full budget. The abandoned plugin call is left to settle on its own — the seam has no
+   * way to cancel it — and its page is discarded.
+   */
   signal?: AbortSignal;
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+const ABORTED = Symbol('aborted');
+
+/**
+ * Resolve with `work`'s value, or with {@link ABORTED} as soon as `signal` fires — whichever comes
+ * first. A rejection from `work` still propagates while `work` is the winner.
+ */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T | typeof ABORTED> {
+  if (signal === undefined) return work;
+  if (signal.aborted) return Promise.resolve(ABORTED);
+  return new Promise<T | typeof ABORTED>((resolve, reject) => {
+    const onAbort = (): void => resolve(ABORTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+    void work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
 
 /**
  * Generic long-poll wrapper over the seam's `fetchRecent`, used ONLY by the MCP `fetch_recent`
@@ -48,11 +69,11 @@ export async function fetchRecentBlocking(
   let since: Cursor | undefined = args.since;
   for (;;) {
     const remaining = deadline - now();
-    const result = await plugin.fetchRecent({
-      ...args,
-      since,
-      blockMs: Math.max(0, remaining),
-    });
+    const result = await untilAborted(
+      plugin.fetchRecent({ ...args, since, blockMs: Math.max(0, remaining) }),
+      opts.signal,
+    );
+    if (result === ABORTED) return abandoned(since);
     if (result.messages.length > 0) return result;
 
     // Advance so the next wait is exclusive of everything we've already seen (incl. the tail).
@@ -65,7 +86,18 @@ export async function fetchRecentBlocking(
     await sleep(nap);
     if (opts.signal?.aborted) {
       // Re-query once so the returned cursor reflects anything that landed during the nap.
-      return plugin.fetchRecent({ ...args, since, blockMs: 0 });
+      const last = await untilAborted(plugin.fetchRecent({ ...args, since, blockMs: 0 }), opts.signal);
+      return last === ABORTED ? abandoned(since) : last;
     }
   }
+}
+
+/**
+ * What a cancelled long-poll returns: the caller's own position, empty. Before the first page has
+ * landed there is no cursor to hand back and none may be invented — core never mints cursor values
+ * (DESIGN §6) — so the cancellation surfaces as a rejection instead.
+ */
+function abandoned(since: Cursor | undefined): FetchRecentResult {
+  if (since === undefined) throw new Error('fetch_recent cancelled before any page was read');
+  return { messages: [], nextCursor: since };
 }

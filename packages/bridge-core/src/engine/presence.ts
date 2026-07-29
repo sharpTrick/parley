@@ -17,7 +17,11 @@
  * The presence topic is isolated: it is NEVER subscribed (live push) and NEVER enters catch-up /
  * `seen` / read-state, so heartbeats never pollute a real topic's durable history or surface as
  * `<channel>` events. It is also reserved — no `post`/`fetch_recent` (or `post_topics` pattern)
- * may target it, so a peer cannot spoof the roster.
+ * may target it. That reservation binds the AGENT-FACING TOOL SURFACE only: it stops a
+ * prompt-injected agent from writing beats through Parley. It is NOT an authenticity control —
+ * anyone holding write credentials for the bus reaches the presence topic directly, below this
+ * seam, so a roster entry is exactly as trustworthy as the backend's own sender attribution.
+ * Cryptographic or ACL-backed roster authenticity is out of scope for v1.
  */
 import type { Handle, Message } from '../message.js';
 import { isRedosSafeSource, MAX_MATCH_INPUT } from '../regex-safety.js';

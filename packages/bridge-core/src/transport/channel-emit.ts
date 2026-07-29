@@ -5,7 +5,6 @@ import type { Message } from '../message.js';
 export const CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel';
 
 // Meta KEYS must be identifiers — Claude Code SILENTLY DROPS hyphenated keys (channels gate).
-// Values may contain hyphens (e.g. a handle "ctx-payments"); only keys are constrained.
 const META_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 interface ChannelNotification {
@@ -17,6 +16,12 @@ interface ChannelNotification {
  * Map a Message to the channel event's `meta` (rendered as `<channel>` attributes). All keys
  * are identifiers (`topic`, `sender`, `cursor`, `msg_id`, `mentions`) — NEVER `msg-id`, which
  * would be silently dropped. Throws if a key is somehow not an identifier (defensive guard).
+ *
+ * VALUES are forwarded verbatim, and several of them (`sender` above all) are writer-controlled on
+ * backends that let a peer pick its own display name. Structured escaping is the renderer's job:
+ * `content` is arbitrary prose that core can never sanitize without destroying the product, so a
+ * meta-only guard would buy no containment. Core's defence is the trust framing — inbound text is
+ * DATA, never instructions (DESIGN §14, CHANNEL_INSTRUCTIONS).
  */
 export function channelMeta(m: Message): Record<string, string> {
   const meta: Record<string, string> = {

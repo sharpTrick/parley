@@ -5,7 +5,7 @@ import express, { type Express, type RequestHandler } from 'express';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
-import { startPresenceLoop } from './presence-loop.js';
+import { startPresenceLoop, type PresenceLoop } from './presence-loop.js';
 import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
 
 /**
@@ -74,13 +74,18 @@ export function createRemoteHttpApp(
   const deps = toolDepsFor(plugin, cfg);
 
   // The chat bridge is a long-lived participant too: announce presence off the shared plugin
-  // (the reactive servers are per-request and stateless, so presence lives at app scope).
-  const presence = cfg.presence.enabled
-    ? startPresenceLoop(plugin, deps.identity, deps.allow, {
+  // (the reactive servers are per-request and stateless, so presence lives at app scope). BUG-28:
+  // this is armed but NOT fired here — an app whose bind fails, or which is never listened on, must
+  // never advertise itself as reachable, so `listen` calls it only once the socket is up.
+  let presence: PresenceLoop | undefined;
+  const announce = (): void => {
+    if (cfg.presence.enabled) {
+      presence = startPresenceLoop(plugin, deps.identity, deps.allow, {
         presenceTopic: deps.presenceTopic,
         heartbeatMs: cfg.presence.heartbeat_ms,
-      })
-    : undefined;
+      });
+    }
+  };
 
   // SEC-17: fail CLOSED by default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
   // an open endpoint. A no-arg call must never mean "no auth".
@@ -155,13 +160,14 @@ export function createRemoteHttpApp(
             return;
           }
           s.off('error', reject);
+          announce();
           resolve(s);
         });
         s.once('error', reject);
         httpServer = s;
       }),
     close: async () => {
-      await presence?.stop(); // best-effort goodbye
+      await presence?.stop().catch(() => {}); // best-effort goodbye, never blocks the close
       await new Promise<void>((resolve, reject) => {
         if (httpServer === undefined) {
           resolve();
