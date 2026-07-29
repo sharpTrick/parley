@@ -20,9 +20,10 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 /**
- * SEC-16 across the states a store is actually found in — brand new, already locked down, or left
- * group/world-readable by an older version. The mode must end at 0600 in every case, and any time
- * the store is (or stays) readable by another account the operator must be told, never silently.
+ * At-rest permissions across the states a store is actually found in — brand new, already locked
+ * down, or left group/world-readable by an older version. The mode must end at 0600 in every case,
+ * and any time the store is (or stays) readable by another account the operator must be told,
+ * never silently.
  */
 
 const mode = (f: string): number => statSync(f).mode & 0o777;

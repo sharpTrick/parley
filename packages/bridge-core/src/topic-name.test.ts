@@ -4,32 +4,32 @@ import { safeName } from './topic-name.js';
 
 // Representative copies of each backend's legal-charset fold (byte-for-byte the plugins' own
 // module-private regexes). safeName must make each of them injective; asserting against these
-// here proves BUG-14/SEC-07 without exporting the plugins' internals.
+// here proves injectivity without exporting the plugins' internals.
 const sanitizeToken = (s: string): string => s.replace(/[.*>\s]/g, '_'); // NATS subject
 const sanitizeName = (s: string): string => s.replace(/[.*>/\\\s]/g, '_'); // NATS stream
 const sanitizeAlias = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, '_'); // Matrix alias
 const sanitizeLocal = (s: string): string => s.toLowerCase().replace(/[^a-z0-9.\-_]/g, '_'); // XMPP JID
 
 describe('safeName', () => {
-  it('BUG-14 (NATS): distinct topics with a colliding sanitized stream name map to distinct names', () => {
+  it('NATS: distinct topics with a colliding sanitized stream name map to distinct names', () => {
     const a = safeName(asTopic('team.frontend'), sanitizeName);
     const b = safeName(asTopic('team_frontend'), sanitizeName);
     expect(a).not.toBe(b);
-    // The `/`-divergence variant the finder surfaced: subject vs stream folds differ but must
-    // each stay injective for the `a/b` vs `a_b` pair.
+    // The `/`-divergence variant: the subject and stream folds differ, but each must stay
+    // injective for the `a/b` vs `a_b` pair.
     expect(safeName(asTopic('a/b'), sanitizeName)).not.toBe(safeName(asTopic('a_b'), sanitizeName));
     expect(safeName(asTopic('a.b'), sanitizeToken)).not.toBe(
       safeName(asTopic('a_b'), sanitizeToken),
     );
   });
 
-  it('BUG-14 (Matrix): distinct topics with a colliding alias localpart map to distinct names', () => {
+  it('Matrix: distinct topics with a colliding alias localpart map to distinct names', () => {
     expect(safeName(asTopic('a b'), sanitizeAlias)).not.toBe(
       safeName(asTopic('a_b'), sanitizeAlias),
     );
   });
 
-  it('BUG-14 (XMPP): case- and separator-variant topics map to distinct JID localparts', () => {
+  it('XMPP: case- and separator-variant topics map to distinct JID localparts', () => {
     expect(safeName(asTopic('Ops'), sanitizeLocal)).not.toBe(
       safeName(asTopic('ops'), sanitizeLocal),
     );

@@ -87,7 +87,7 @@ export function startPresenceLoop(
   // Serialize every beat through a single promise chain so `goodbye` is posted only AFTER every
   // earlier beat (hello/heartbeats) has settled. On an async backend a stalled heartbeat could
   // otherwise land after `goodbye`, and last-write-wins per (handle, instanceId) would then report a
-  // cleanly-stopped instance `online` for a full TTL (BUG-26). `beat` swallows post failures, so a
+  // cleanly-stopped instance `online` for a full TTL. `beat` swallows post failures, so a
   // failed earlier beat still resolves the chain and never wedges `stop()`.
   let tail: Promise<void> = Promise.resolve();
   const enqueue = (kind: PresenceKind): Promise<void> => (tail = tail.then(() => beat(kind)));

@@ -30,7 +30,7 @@ async function makeContext() {
   await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 500 });
   return {
     plugin,
-    supportsBlockingFetch: true, // Redis honors blockMs natively via XREAD BLOCK (issue #20)
+    supportsBlockingFetch: true, // Redis honors blockMs natively via XREAD BLOCK
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     carriesSenderIdentity: true,
     cleanup: async () => {

@@ -33,7 +33,6 @@ describe('ReadStateStore', () => {
     expect(new ReadStateStore(path).get(asTopic('t'))).toBeUndefined();
   });
 
-  // BUG-33 — an array file must not swallow subsequent writes.
   it('does not lose writes when the file is a JSON array', () => {
     const path = tmpFile();
     writeFileSync(path, '[]', 'utf8');
@@ -41,7 +40,6 @@ describe('ReadStateStore', () => {
     expect(new ReadStateStore(path).get(asTopic('t'))).toBe('c');
   });
 
-  // BUG-33 — a non-string cursor value is filtered out at load (catch-up starts fresh).
   it('drops non-string cursor values at load', () => {
     const path = tmpFile();
     writeFileSync(path, '{"t":{"a":1}}', 'utf8');
@@ -52,7 +50,6 @@ describe('ReadStateStore', () => {
     expect(new ReadStateStore(path).get(asTopic('t2'))).toBe('ok');
   });
 
-  // BUG-33 — prototype-pollution topic names leak nothing and round-trip like any other.
   it('handles __proto__/constructor topic names without prototype leakage', () => {
     const path = tmpFile();
     const s = new ReadStateStore(path);
@@ -157,23 +154,19 @@ describe('ReadStateStore', () => {
     expect(p.endsWith('read-state.json')).toBe(true);
   });
 
-  // BUG-42 — the sanitized path never escapes the parley/ dir via a traversal token.
   it('does not let instanceId ".." escape the parley/ dir', () => {
     const p = defaultReadStatePath('..');
     expect(p).not.toContain(`${sep}..${sep}`);
     expect(normalize(p)).toContain(`${sep}parley${sep}`);
   });
 
-  // BUG-42 — distinct ids that clean to the same string map to distinct files.
   it('maps distinct ids that clean alike to distinct files', () => {
     expect(defaultReadStatePath('a/b')).not.toBe(defaultReadStatePath('a_b'));
     expect(defaultReadStatePath('sess/1')).not.toBe(defaultReadStatePath('sess_1'));
   });
 
-  // SEC-16 — flush() must create read-state.json 0600 and its containing dir 0700 so a co-tenant
-  // on a shared host cannot read this instance's cursor positions. Pre-fix these landed at the
-  // umask default (0644/0755).
-  it('creates read-state.json 0600 and its dir 0700 (SEC-16)', () => {
+  // A co-tenant on a shared host must not be able to read this instance's cursor positions.
+  it('creates read-state.json 0600 and its dir 0700', () => {
     const base = mkdtempSync(join(tmpdir(), 'parley-rs-mode-'));
 
     // Control: a plain mkdir under this env's umask reproduces the pre-fix dir mode. If it is not

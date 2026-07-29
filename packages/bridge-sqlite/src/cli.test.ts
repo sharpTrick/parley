@@ -56,10 +56,10 @@ afterAll(() => {
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
 });
 
-// BUG-38 (unit): the CLI's stdin EOF/close wiring must run shutdown() and must be idempotent under
-// the shuttingDown guard — 'end' + 'close' (or a signal racing EOF) must call shutdown ONCE. This
+// The CLI's stdin EOF/close wiring must run shutdown() and must be idempotent under the
+// shuttingDown guard — 'end' + 'close' (or a signal racing EOF) must call shutdown ONCE. This
 // mirrors the exact wiring in cli.ts against a stdin stub.
-describe('stdin EOF shutdown wiring is idempotent (BUG-38, unit)', () => {
+describe('stdin EOF shutdown wiring is idempotent (unit)', () => {
   it('runs shutdown exactly once across end + close', async () => {
     const stdin = new EventEmitter();
     let shutdownCalls = 0;
@@ -155,10 +155,10 @@ function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
   return cfgPath;
 }
 
-// BUG-38 (end-to-end): spawn the built CLI with a piped stdin, wait for "bridge up", then close the
+// End-to-end: spawn the built CLI with a piped stdin, wait for "bridge up", then close the
 // parent's write end (EOF WITHOUT a signal — the orphaned-parent scenario). The child must run
 // shutdown() and EXIT promptly, rather than lingering with the live poll loop + presence heartbeat.
-describe('orphaned stdio bridge exits on stdin EOF (BUG-38, e2e)', () => {
+describe('orphaned stdio bridge exits on stdin EOF (e2e)', () => {
   it('exits within a short timeout after the parent closes stdin (no signal)', async () => {
     const dir = tmp();
     const cfgPath = writeConfig(dir);

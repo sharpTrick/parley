@@ -1,4 +1,4 @@
-// Barrel-surface regression guard (CX-10 / work item 06 "barrel-trim").
+// Barrel-surface regression guard.
 //
 // The public entry `@sharptrick/parley-core` is automated-semver surface: every symbol it
 // re-exports is frozen by the release automation. This test pins the trimmed set (consumer-free
@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import * as api from './index.js';
 
 describe('public barrel surface', () => {
-  // The eight consumer-free internals trimmed by item 06. These stay defined in their own
+  // The consumer-free internals kept out of the barrel. These stay defined in their own
   // modules (engine/presence.ts, identity-filter.ts, transport/tools.ts) for in-package callers,
   // reached via relative imports — but must never be reachable through the public entry.
   const trimmed = [

@@ -42,7 +42,7 @@ describe('nats test hygiene — a gated file must not carry ungated coverage', (
 const trackerIds = /\b(BUG|SEC|CX|FIX)-\d+\b|\bissues?\s*#\d+/i;
 const stringLiterals = /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g;
 
-/** Every comment in `source`, trailing ones included — a `// (BUG-01)` tail is the common shape. */
+/** Every comment in `source`, trailing ones included — a tail on a code line is the usual shape. */
 function comments(source: string): { line: number; text: string }[] {
   const found: { line: number; text: string }[] = [];
   let inBlock = false;

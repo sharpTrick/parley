@@ -125,14 +125,14 @@ const ConfigObject = z.object({
       on_start: z.boolean().default(true),
       limit: z.number().int().positive().default(100),
       /**
-       * Server-side cap (ms) on the `parley_fetch_recent` `block_ms` long-poll (issue #20). A
+       * Server-side cap (ms) on the `parley_fetch_recent` `block_ms` long-poll. A
        * caller's `block_ms` is clamped to this before it reaches a plugin, kept safely below MCP /
        * client tool timeouts so a blocked call never trips them. Default 60s.
        */
       block_max_ms: z.number().int().nonnegative().default(60_000),
       /**
        * Poll cadence (ms) for core's generic long-poll fallback — how often it re-queries when a
-       * backend does not block natively (issue #20). No correctness impact; latency/cost knob only.
+       * backend does not block natively. No correctness impact; latency/cost knob only.
        */
       block_poll_interval_ms: z.number().int().positive().default(250),
     })
@@ -229,7 +229,7 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
   }
   // `ttl_ms` is populated by the dependent-default transform before superRefine runs (default 3×, or
   // the pinned value), so it is always a number here. A ttl below the heartbeat cadence would make
-  // every genuinely running instance read as offline in computeRoster between beats (BUG-34).
+  // every genuinely running instance read as offline in computeRoster between beats.
   if (cfg.presence.ttl_ms < cfg.presence.heartbeat_ms) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,

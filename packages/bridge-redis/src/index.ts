@@ -212,7 +212,7 @@ function normalizeMillis(key: string, value: unknown, fallback: number): number 
  * matching `XINFO STREAM`'s `ERR no such key` wording: a Redis-compatible server, proxy or future
  * release that words it differently would turn an empty stream into a hard failure, and any
  * unrelated error whose text happens to contain that phrase would turn a real fault into a
- * from-the-beginning replay of the whole retained history as live push (BUG-11).
+ * from-the-beginning replay of the whole retained history as live push.
  */
 async function streamTail(client: RedisClient, key: string): Promise<string> {
   if ((await client.exists(key)) === 0) return '0';
@@ -251,7 +251,7 @@ export class RedisPlugin implements BackendPlugin {
    * Per-connect generation token. Bumped on every `connect()`/`disconnect()`; each `subscribe()`
    * captures the current value and gates its read loop on `gen === this.generation`. Because it
    * only ever increases, a torn-down (or superseded) loop can never be revived by a later
-   * `connect()` — unlike a shared mutable boolean that a reconnect could reset (BUG-37).
+   * `connect()` — unlike a shared mutable boolean that a reconnect could reset.
    */
   private generation = 0;
   private readonly readers: RedisClient[] = [];
@@ -404,7 +404,7 @@ export class RedisPlugin implements BackendPlugin {
       }
     }
     if (since !== undefined && entries.length === 0) {
-      // Native long-poll (issue #20): the canonical XRANGE was empty and the caller granted a
+      // Native long-poll: the canonical XRANGE was empty and the caller granted a
       // budget → wait up to `blockMs` for entries strictly after `since`. XREAD BLOCK is itself
       // the bounded wait, and a Stream entry id IS the cursor, so `XREAD ... STREAMS key <since>`
       // returns exactly the entries a repeated exclusive XRANGE would — same {id, message} shape,
@@ -496,7 +496,7 @@ export class RedisPlugin implements BackendPlugin {
     const gen = this.generation;
     const reader = this.newReader();
     // Register BEFORE connecting so a disconnect() racing this window can always find and close
-    // the reader (BUG-37); registering after connect leaks a freshly-connected duplicate.
+    // the reader; registering after connect leaks a freshly-connected duplicate.
     this.readers.push(reader);
     try {
       await this.connectReader(reader);
@@ -540,7 +540,7 @@ export class RedisPlugin implements BackendPlugin {
         try {
           res = await reader.xRead({ key, id: lastId }, { BLOCK: this.blockMs, COUNT: 256 });
         } catch (err) {
-          if (gen !== this.generation) break; // torn down/superseded → exit, never spin-retry (BUG-37)
+          if (gen !== this.generation) break; // torn down/superseded → exit, never spin-retry
           const respError = serverRefusal(err);
           if (respError !== undefined) {
             this.dropReader(reader);

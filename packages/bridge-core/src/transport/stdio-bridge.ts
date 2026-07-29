@@ -60,18 +60,17 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   const statePath = cfg.state_path ?? defaultReadStatePath(instanceIdOf(cfg));
   const readState = new ReadStateStore(statePath);
 
-  // Reactive role: tools share this one `seen` set with the push loop so a message pulled via
-  // the fetch_recent tool is not later re-pushed. `toolDepsFor` is the single factory both
-  // composition roots use to derive ToolDeps from config (CX-09).
+  // Keep tools and the push loop on this ONE `seen` set, so a message pulled via the fetch_recent
+  // tool is not later re-pushed.
   registerTools(server, toolDepsFor(plugin, cfg, { seen }));
 
   await plugin.connect(cfg.backend_config as BackendConfig);
 
   // On-start catch-up: advance the per-instance read cursor + warm the seen-set BEFORE the
   // push loop starts (so the live path doesn't double-emit across the boundary). Does not emit.
-  // BUG-27: if catch-up throws AFTER connect, the caller never receives a ParleyBridge to call
-  // shutdown() on, so disconnect the plugin here (releasing its poll/prune timers) before
-  // re-throwing — otherwise a leaked connection keeps the event loop alive and hangs the process.
+  // A catch-up failure lands AFTER connect, and the caller never receives a ParleyBridge to call
+  // shutdown() on — keep the disconnect here (releasing the plugin's poll/prune timers) before
+  // re-throwing, so a leaked connection can't keep the event loop alive and hang the process.
   try {
     if (cfg.catchup.on_start) {
       await catchUpAll({
@@ -90,7 +89,7 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   let attached = false;
   let presence: PresenceLoop | undefined;
   let toreDown = false;
-  // BUG-27: the ONE teardown, so a failed attach releases exactly what shutdown() would — the
+  // Keep this as the ONE teardown, so a failed attach releases exactly what shutdown() would — the
   // caller of a rejecting attach never receives a bridge to shut down, and a leaked connection's
   // poll timers keep the process alive. The presence goodbye is best-effort and self-bounding, so
   // it can never hold the disconnect.
@@ -107,8 +106,8 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
       if (attached) throw new Error('bridge already attached');
       attached = true;
       await server.connect(transport);
-      // BUG-28: wire the live push path BEFORE announcing presence, so the bridge is only
-      // advertised as reachable once it can actually deliver.
+      // Wire the live push path BEFORE announcing presence, so the bridge is only advertised as
+      // reachable once it can actually deliver.
       try {
         if (cfg.live_push.enabled) {
           await startPushLoop(server, plugin, allow, seen, {

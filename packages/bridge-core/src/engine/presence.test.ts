@@ -107,7 +107,7 @@ describe('encode/decode presence', () => {
     expect(rec?.topics[0]).toBe('ctx-0');
   });
 
-  it('SEC-09 — drops an over-long topics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
+  it('drops an over-long topics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
     const tooLong = 'x'.repeat(MAX_TOPIC_LEN + 1);
     const exact = 'y'.repeat(MAX_TOPIC_LEN);
     const rec = decodePresence(
@@ -117,7 +117,7 @@ describe('encode/decode presence', () => {
     expect(rec?.topics).not.toContain(tooLong);
   });
 
-  it('SEC-09 — drops an over-long postTopics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
+  it('drops an over-long postTopics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
     const tooLong = 'z'.repeat(MAX_TOPIC_LEN + 1);
     const exact = 'w'.repeat(MAX_TOPIC_LEN);
     const rec = decodePresence(
@@ -261,11 +261,11 @@ describe('computeRoster', () => {
     expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['claude-a', 'claude-b']);
   });
 
-  // SEC-03 — the self-reported `at` is untrusted; a far-future value must never enter the roster,
+  // The self-reported `at` is untrusted; a far-future value must never enter the roster,
   // where it would read as permanently `online` and pin a phantom hand-off target at the top forever.
-  const FUTURE_AT = 8_640_000_000_000_000; // the spoof value from the finding (max Date ms)
+  const FUTURE_AT = 8_640_000_000_000_000; // max representable Date ms
 
-  it('SEC-03 — a far-future spoofed `at` never enters the roster: no phantom online peer, no top slot', () => {
+  it('a far-future spoofed `at` never enters the roster: no phantom online peer, no top slot', () => {
     // An attacker plants an astronomical `at`; a legitimate peer beats at `now`. The spoof must be
     // dropped at decode — not clamped-to-now (which would re-read it as freshly live every call).
     const roster = computeRoster(
@@ -278,7 +278,7 @@ describe('computeRoster', () => {
     expect(roster[0]?.online).toBe(true);
   });
 
-  it('SEC-03 — a far-future spoof cannot outlive a legit peer that ages out (immune-forever regression)', () => {
+  it('a far-future spoof cannot outlive a legit peer that ages out (immune-forever regression)', () => {
     // Evaluate well past ttl AND sinceMs with no fresh beats: the legit peer correctly ages out and is
     // dropped, and the phantom must NOT be left behind as the sole surviving (online) hand-off target.
     const msgs = [
@@ -288,7 +288,7 @@ describe('computeRoster', () => {
     expect(computeRoster(msgs, now + 100 * ttl, opts)).toEqual([]);
   });
 
-  it('SEC-03 — decode rejects a beat beyond the skew tolerance but keeps one exactly at it', () => {
+  it('decode rejects a beat beyond the skew tolerance but keeps one exactly at it', () => {
     const at = (delta: number) => JSON.stringify({ v: 2, kind: 'hello', at: now + delta, topics: ['ctx'] });
     expect(decodePresence(at(MAX_CLOCK_SKEW_MS + 1), now)).toBeNull(); // just beyond tolerance ⇒ dropped
     expect(decodePresence(at(MAX_CLOCK_SKEW_MS), now)?.at).toBe(now + MAX_CLOCK_SKEW_MS); // boundary kept
@@ -296,20 +296,18 @@ describe('computeRoster', () => {
     expect(decodePresence(at(1e12))).not.toBeNull(); // pure decode (no now) leaves `at` unbounded
   });
 
-  it('SEC-03 — a legitimate small clock skew (at = now + 1s) still reads online', () => {
+  it('a legitimate small clock skew (at = now + 1s) still reads online', () => {
     const roster = computeRoster([beat('peer', 'heartbeat', now + 1_000, 1)], now, opts);
     expect(roster[0]?.online).toBe(true);
   });
 
-  it('SEC-03 — the guard leaves the normal past-TTL offline path intact (only far-future ats are dropped)', () => {
+  it('the far-future guard leaves the normal past-TTL offline path intact (only far-future ats are dropped)', () => {
     const roster = computeRoster([beat('old', 'heartbeat', now - ttl - 1, 1)], now, opts);
     expect(roster[0]?.online).toBe(false);
   });
 });
 
-// CX-05 payoff: the hand-off reachability predicate is now a PURE, directly-callable function that
-// lives beside computeRoster — no MCP client/server harness required (the whole point of the extract).
-describe('filterReachable (pure reachability predicate — CX-05)', () => {
+describe('filterReachable (pure reachability predicate)', () => {
   /** A roster entry; only `topics`/`postTopics` drive the predicate (online/lastSeenMs are inert here). */
   const entry = (handle: string, topics: string[], postTopics: string[] = []): RosterEntry => ({
     handle: asHandle(handle),
@@ -355,7 +353,7 @@ describe('filterReachable (pure reachability predicate — CX-05)', () => {
     expect(unscoped()).toEqual([]);
   });
 
-  it('(d) SEC-08 — a beat of 64 nested-quantifier postTopics returns in bounded time (no ReDoS hang)', () => {
+  it('(d) a beat of 64 nested-quantifier postTopics returns in bounded time (no ReDoS hang)', () => {
     // A hostile peer plants the maximum 64 catastrophic-backtracking sources; the reader's real,
     // short topic name is the match input. On the unfixed code a single `.test` against a 15-char
     // topic hangs the whole process for >8s — here the ReDoS screen rejects the sources up front, so
@@ -381,7 +379,7 @@ describe('filterReachable (pure reachability predicate — CX-05)', () => {
     expect(unscoped).toEqual([]);
   });
 
-  it('(d2) SEC-08 — a BOUNDED exact-count nested quantifier is also screened (no ReDoS hang)', () => {
+  it('(d2) a BOUNDED exact-count nested quantifier is also screened (no ReDoS hang)', () => {
     // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` has only `*` and a bounded exact
     // `{40}` (no unbounded outer quantifier), so the earlier screen — which rejected only UNBOUNDED
     // outer quantifiers — let it through, yet V8 unrolls `{40}` into 40 sequential `*`-bodies and the
@@ -409,7 +407,7 @@ describe('filterReachable (pure reachability predicate — CX-05)', () => {
     expect(unscoped).toEqual([]);
   });
 
-  it('(e) SEC-08 — a benign postTopics pattern still legitimately matches (screen preserves semantics)', () => {
+  it('(e) a benign postTopics pattern still legitimately matches (screen preserves semantics)', () => {
     const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
     // scoped: the peer's `team-.*` covers the scope.
     expect(

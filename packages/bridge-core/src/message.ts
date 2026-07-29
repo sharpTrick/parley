@@ -76,7 +76,7 @@ export interface BuildMessageInput {
 /**
  * The single sanctioned way to assemble a normalized {@link Message} from a backend record.
  * Centralizes branding (asHandle/asBackendMsgId/asCursor) and the {@link parseMentions} call so
- * mention + assembly semantics live in ONE place (CX-02). `topic` is passed pre-branded.
+ * mention + assembly semantics live in ONE place. `topic` is passed pre-branded.
  */
 export function buildMessage(input: BuildMessageInput): Message {
   return {

@@ -44,11 +44,7 @@ describe('filterHandles', () => {
   });
 });
 
-// SEC-15 — a caller-supplied `filter` is attacker-influenceable (one prompt-injection hop) and the
-// old `*`→`.*` RegExp translation backtracked catastrophically: `'*'.repeat(40)+'z'` against an
-// ordinary handle hung the event loop for ~47s. The linear two-pointer matcher must resolve any such
-// filter in bounded wall-clock time while preserving glob semantics.
-describe('glob ReDoS bounding (SEC-15)', () => {
+describe('glob ReDoS bounding', () => {
   const NO_Z = asHandle('claude-agent-oncall-payments'); // 28 chars, contains no 'z'
 
   it('returns promptly (bounded time) for a star-flood filter with a trailing non-match', () => {

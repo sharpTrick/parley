@@ -2,7 +2,7 @@ import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 
-// White-box handle onto the plugin's private stream-cache state (BUG-01 is about that cache).
+// White-box handle onto the plugin's private stream-cache state.
 type Internals = { js: unknown; jsm: unknown; ensured: Map<string, Promise<void>> };
 const peek = (p: NatsPlugin): Internals => p as unknown as Internals;
 
@@ -22,7 +22,7 @@ vi.mock('nats', async (importOriginal) => {
   };
 });
 
-describe('nats recovery — BUG-01: ensureStream must not cache a rejected promise', () => {
+describe('nats recovery — ensureStream must not cache a rejected promise', () => {
   it('evicts the cache entry on a transient failure and retries streams.add on the next call', async () => {
     const plugin = new NatsPlugin();
     let addCalls = 0;

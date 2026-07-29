@@ -60,7 +60,7 @@ export interface FetchRecentArgs {
    * budget on the MCP `fetch_recent` path, so every backend blocks with or without native support.
    * Omit / `0` = return immediately (the durable catch-up semantics). Blocking only engages
    * relative to a `since`; with no `since` the default recent window returns at once. The value
-   * is capped server-side before it reaches a plugin (issue #20).
+   * is capped server-side before it reaches a plugin.
    */
   blockMs?: number;
 }

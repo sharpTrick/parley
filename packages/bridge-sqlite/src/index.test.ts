@@ -108,11 +108,11 @@ describe('SqlitePlugin (seam smoke)', () => {
     expect(Number(id3)).toBeGreaterThan(Number(lastOldId));
   });
 
-  // BUG-27 (prune-timer unref): connect() with retention_days starts a prune setInterval. It must
-  // be .unref()'d so a leaked-but-never-disconnect()ed plugin cannot by itself pin the event loop
-  // (belt-and-suspenders behind buildBridge's disconnect-on-catch-up-failure). Drive connect() with
-  // retention set, capture the timer setInterval actually returned, and assert it is NOT ref'd.
-  it('BUG-27: the prune timer is unref()d so a leaked plugin cannot pin the event loop', async () => {
+  // connect() with retention_days starts a prune setInterval. It must be .unref()'d so a
+  // leaked-but-never-disconnect()ed plugin cannot by itself pin the event loop (belt-and-braces
+  // behind buildBridge's disconnect-on-catch-up-failure). Drive connect() with retention set,
+  // capture the timer setInterval actually returned, and assert it is NOT ref'd.
+  it('unref()s the prune timer so a leaked plugin cannot pin the event loop', async () => {
     const timers: Array<ReturnType<typeof setInterval>> = [];
     const realSetInterval = globalThis.setInterval;
     const spy = vi
@@ -137,7 +137,7 @@ describe('SqlitePlugin (seam smoke)', () => {
   });
 });
 
-describe('SqlitePlugin backendMsgId (BUG-40)', () => {
+describe('SqlitePlugin backendMsgId', () => {
   it('is a bare decimal rowid with no Number() artifacts', async () => {
     const p = await plugin();
     const id1 = await p.post(T, me, 'a');
@@ -195,7 +195,7 @@ describe('SqlitePlugin fetchRecent limit', () => {
   });
 });
 
-describe('SqlitePlugin poll-loop diagnostics (BUG-39)', () => {
+describe('SqlitePlugin poll-loop diagnostics', () => {
   it('diagnoses a permanently-failing poll tick and stops the loop after N failures', async () => {
     const p = await plugin(MIN_POLL_INTERVAL_MS); // fast poll so escalation is quick
     const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);

@@ -63,7 +63,7 @@ export class ReadStateStore {
   }
 
   private flush(): void {
-    // SEC-16: create the state dir 0700 and the file 0600 so a co-tenant on a shared host can't
+    // Keep the state dir 0700 and the file 0600, so a co-tenant on a shared host can't
     // read this instance's cursor positions. `mode` is masked by the umask (only ever *removing*
     // bits, so the result is ≤ these), and renameSync preserves the tmp file's mode into place.
     mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });

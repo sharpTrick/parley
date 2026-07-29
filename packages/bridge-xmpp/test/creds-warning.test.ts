@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
 
-// SEC-06 — XMPP must not silently authenticate with the repo-public default password. connect()
+// XMPP must not silently authenticate with the repo-public default password. connect()
 // performs a SASL handshake via @xmpp/client, so mock the client to a no-op transport (vi.mock is
 // hoisted above the import above, so the plugin binds the mock); the warning fires before
 // client()/xmpp.start(). The mock lets the whole connect() resolve so the gate sits on the happy path.
@@ -19,7 +19,7 @@ afterEach(() => {
 
 const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-describe('XMPP default-credential warning (SEC-06)', () => {
+describe('XMPP default-credential warning', () => {
   it('warns once, naming the backend and the key to set, when password is omitted', async () => {
     const warn = spyWarn();
     await new XmppPlugin().connect({ service: 'xmpp://127.0.0.1:5222', username: 'parley' });

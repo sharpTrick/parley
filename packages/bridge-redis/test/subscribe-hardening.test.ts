@@ -2,7 +2,7 @@ import { asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RedisPlugin } from '../src/index.js';
 
-// White-box tests for RedisPlugin.subscribe() hardening (work item 22 — BUG-11 + BUG-37). These
+// White-box tests for RedisPlugin.subscribe() hardening. These
 // mock the `redis` module so connect()/disconnect()/subscribe() run with NO live server; the live
 // seam conformance (post → fetchRecent, catch-up, dedup, multi-writer) is covered separately in
 // conformance.test.ts and requires a real Redis, and the live failure surface (unreachable
@@ -85,7 +85,7 @@ afterEach(() => {
   hoisted.readerQueue.length = 0;
 });
 
-describe('redis subscribe hardening — BUG-11: xInfoStream catch must not replay history', () => {
+describe('redis subscribe hardening — xInfoStream catch must not replay history', () => {
   // The CLASS: the "has this stream any history?" decision must rest on server STATE, never on the
   // wording of an error string. Every wording below is a real failure on an EXISTING stream, so
   // every one must propagate — including the ones that literally contain the old `no such key`
@@ -299,7 +299,7 @@ describe('redis subscribe hardening — a dead live path must not look like a qu
   });
 });
 
-describe('redis subscribe hardening — BUG-37: reader lifecycle + generation gating', () => {
+describe('redis subscribe hardening — reader lifecycle + generation gating', () => {
   it('registers the reader before connect() so a racing disconnect() tears it down (no leak)', async () => {
     const plugin = new RedisPlugin();
     await plugin.connect({ url: 'redis://mock' });

@@ -364,7 +364,7 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     expect(out.users).toEqual([]);
   });
 
-  it('SEC-08 — a beat of 64 nested-quantifier postTopics does not hang list_users (bounded time)', async () => {
+  it('a beat of 64 nested-quantifier postTopics does not hang list_users (bounded time)', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
     // A hostile peer plants the maximum 64 catastrophic-backtracking regex sources on the presence
     // topic (raw backend write — outside the tool allowlist), then the reader calls list_users. On
@@ -380,7 +380,7 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     expect(out.users).toEqual([]); // no shared channel ⇒ the pathological peer is excluded
   });
 
-  it('SEC-08 — a beat of 64 BOUNDED exact-count nested postTopics also does not hang list_users', async () => {
+  it('a beat of 64 BOUNDED exact-count nested postTopics also does not hang list_users', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
     // The bounded-quantifier bypass class: `([a-z-]*){40}[0-9]` uses no unbounded OUTER quantifier
     // (only `*` inside a bounded exact `{40}`), so it slipped the earlier screen, yet V8 unrolls the
@@ -449,7 +449,7 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
   it('surfaces an arbitrary backend failure as an isError result, not a fake-empty roster', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL });
     // A real outage (connection loss, auth expiry, DB error) rejects fetchRecent — it must NOT
-    // collapse into a healthy `{ users: [], truncated: false }` the agent would trust (BUG-13).
+    // collapse into a healthy `{ users: [], truncated: false }` the agent would trust.
     plugin.fetchRecent = async () => {
       throw new Error('backend down');
     };
@@ -516,7 +516,7 @@ describe('post_topics regex patterns + presence reservation', () => {
   });
 });
 
-describe('toolDepsFor (single ToolDeps factory — CX-09/CX-06)', () => {
+describe('toolDepsFor (single ToolDeps factory)', () => {
   it('derives the exact ToolDeps both roots previously assembled by hand; threads seen only via extras', () => {
     const plugin = new FakePlugin();
     const cfg = parseConfig({ identity: { handle: 'alice' }, topics: ['ctx', 'ctx-reviews'] });
@@ -534,7 +534,7 @@ describe('toolDepsFor (single ToolDeps factory — CX-09/CX-06)', () => {
     expect(deps.blockPollIntervalMs).toBe(cfg.catchup.block_poll_interval_ms);
     expect(deps.seen).toBe(seen);
 
-    // reactive HTTP root: omits extras ⇒ no SeenSet is threaded (CX-06 — no push loop, no dedup state).
+    // reactive HTTP root: omits extras ⇒ no SeenSet is threaded (no push loop, no dedup state).
     expect(toolDepsFor(plugin, cfg).seen).toBeUndefined();
   });
 });

@@ -18,7 +18,7 @@ import { startPresenceLoop } from './presence-loop.js';
 
 /**
  * A FakePlugin whose `post` can be held mid-flight — the shipped `FakePlugin.post` is effectively
- * synchronous (which is exactly why SQLite is immune to BUG-26), so we need a genuinely async post
+ * synchronous (which is exactly why SQLite is immune to this race), so we need a genuinely async post
  * to reproduce the stop()/heartbeat race on network backends.
  */
 class DeferredFakePlugin extends FakePlugin {
@@ -165,7 +165,7 @@ describe('presence loop', () => {
     expect(await beats(plugin)).toEqual(['hello', 'goodbye']);
   });
 
-  it('BUG-26 — goodbye is posted only AFTER an in-flight heartbeat settles (no post-goodbye heartbeat)', async () => {
+  it('goodbye is posted only AFTER an in-flight heartbeat settles (no post-goodbye heartbeat)', async () => {
     const deferred = new DeferredFakePlugin();
     await deferred.connect({});
     const loop = startPresenceLoop(deferred, asHandle('claude-a'), new Allowlist(['ctx']), {

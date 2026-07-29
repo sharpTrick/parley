@@ -5,7 +5,7 @@
  * reuse — so this is the single small, dependency-free implementation. Case-sensitive: handles
  * are compared verbatim.
  *
- * Matching is a linear-time two-pointer wildcard walk (SEC-15), NOT a translated `RegExp`. A
+ * Matching is a linear-time two-pointer wildcard walk, NOT a translated `RegExp`. A
  * caller-supplied `filter` is attacker-influenceable (one prompt-injection hop) and matched against
  * attacker-influenceable handles; the old `*`→`.*` translation backtracked catastrophically on
  * Node's engine — e.g. `'*'.repeat(40) + 'z'` against an ordinary handle hung the whole event loop

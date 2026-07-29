@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
 import { priv } from './fake-xmpp.js';
 
-// BUG-05 — empty-archive zero cursor. `fetchRecent` on a fresh/empty MUC returns the zero cursor
+// Empty-archive zero cursor. `fetchRecent` on a fresh/empty MUC returns the zero cursor
 // `''`; core persists it and feeds it back as `since`. The plugin must treat an empty/undefined
 // `since` as "from the very beginning" — a plain forward MAM query with NO `<after/>` — never
 // round-trip `''` as an RSM UID (which modern servers reject with item-not-found, bricking every
@@ -42,7 +42,7 @@ const makeCapturingClient = (): { iqs: El[]; iqCaller: { request(el: unknown): P
 /** The RSM `<set>` of the captured MAM query. */
 const rsmOf = (iq: El): El | undefined => iq.getChild('query', NS_MAM)?.getChild('set', NS_RSM);
 
-describe('XMPP empty-archive catch-up zero cursor (BUG-05)', () => {
+describe('XMPP empty-archive catch-up zero cursor', () => {
   it("treats an empty since ('') as forward-from-beginning: emits NO <after/>, resolves without item-not-found", async () => {
     const plugin = new XmppPlugin();
     const fake = makeCapturingClient();

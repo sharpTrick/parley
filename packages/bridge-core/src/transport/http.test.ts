@@ -91,12 +91,7 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
   });
 });
 
-// BUG-12: RemoteHttpServer.listen() must REJECT on a bind failure (EADDRINUSE, EACCES, bad host),
-// not resolve a never-bound server whose address() is null — a silent start-up failure the
-// composition root cannot detect, retry, or shut down from. The success callback must remove the
-// error listener so a later runtime 'error' on the live server cannot reject an already-settled
-// promise. Drives the real failure and observes the fixed behavior (green suite alone insufficient).
-describe('remote HTTP: listen() rejects on a bind error (BUG-12)', () => {
+describe('remote HTTP: listen() rejects on a bind error', () => {
   async function appOn() {
     const p = new FakePlugin();
     await p.connect({});
@@ -166,11 +161,7 @@ describe('remote HTTP: listen() rejects on a bind error (BUG-12)', () => {
   });
 });
 
-// CX-06: the reactive HTTP path builds a fresh MCP server PER POST but must NOT recompile the
-// allowlist (nor allocate a dead per-request SeenSet). The allowlist is derived once at app scope
-// via toolDepsFor and reused by every per-request reactive server. A grep already confirms `new
-// SeenSet` is gone from http.ts; this proves the allowlist compiles exactly once across N POSTs.
-describe('reactive HTTP: allowlist compiled once per app, not per POST (CX-06)', () => {
+describe('reactive HTTP: allowlist compiled once per app, not per POST', () => {
   it('derives the allowlist a single time at app scope regardless of request count', async () => {
     const spy = vi.spyOn(allowlistMod, 'allowlistFor');
     const plugin2 = new FakePlugin();
@@ -202,10 +193,7 @@ describe('reactive HTTP: allowlist compiled once per app, not per POST (CX-06)',
   });
 });
 
-// SEC-17: createRemoteHttpApp must FAIL CLOSED. Omitting BOTH `protect` and `insecureNoAuth` is not
-// "no auth" — it 401s (JSON-RPC -32001). Only the explicit, named `insecureNoAuth: true` opt-in
-// restores the open dev/loopback endpoint. Proves the behavior flips both ways.
-describe('reactive HTTP: fail closed by default (SEC-17)', () => {
+describe('reactive HTTP: fail closed by default', () => {
   const INIT = JSON.stringify({
     jsonrpc: '2.0',
     id: 1,
@@ -255,10 +243,7 @@ describe('reactive HTTP: fail closed by default (SEC-17)', () => {
   });
 });
 
-// SEC-14: the stateless /mcp 500 path must return the generic `message: 'internal error'` (never
-// err.message) to the client, and write the real error to stderr for the operator. Force a
-// transport-level throw so the catch fires deterministically.
-describe('reactive HTTP: 500 path hides internal detail, logs it (SEC-14)', () => {
+describe('reactive HTTP: 500 path hides internal detail, logs it', () => {
   it('returns generic "internal error" and console.errors the real error', async () => {
     const SECRET = 'SECRET /var/lib/parley.db backend driver detail';
     const p = new FakePlugin();

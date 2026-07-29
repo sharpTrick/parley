@@ -69,8 +69,8 @@ function wrap(kind: SqlDriver['kind'], db: RawDb): SqlDriver {
 }
 
 /**
- * Load the native module once (memoized). BUG-36: distinguish "not installed / no prebuilt" —
- * where the node:sqlite fallback is legitimate — from a real load error, which must surface.
+ * Load the native module once (memoized), distinguishing "not installed / no prebuilt" — where
+ * the node:sqlite fallback is legitimate — from a real load error, which must surface.
  * `undefined` = not yet attempted; `null` = absent (fall back); a function = the constructor.
  * Deliberately split from DB open so a bad path / permissions / corrupt-file error (which comes
  * from `new Database(path)`, not the `require`) is NOT mistaken for a missing module.
@@ -94,14 +94,14 @@ function loadBetterSqlite(): (new (p: string) => RawDb) | null {
  * Open a SQLite database with WAL + busy_timeout. Prefers the mature native driver
  * (better-sqlite3); falls back to Node's built-in `node:sqlite` ONLY if the native module fails
  * to *load* (e.g. no prebuilt for this ABI and no toolchain) — an *open* failure (bad path,
- * permissions, corrupt file) surfaces better-sqlite3's own precise message instead (BUG-36). The
- * plugin code above is driver-agnostic.
+ * permissions, corrupt file) surfaces better-sqlite3's own precise message instead. The plugin
+ * code above is driver-agnostic.
  */
 export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   const busy = opts.busyTimeoutMs ?? 5000;
   const onDisk = path !== ':memory:' && !path.startsWith('file::memory:');
-  // SEC-16: create the file 0600 BEFORE the driver can create it at the umask default, so there
-  // is no window in which the whole conversation store is world-readable.
+  // Keep this ahead of the driver open, so that there is no window in which the driver creates
+  // the whole conversation store at the umask default and it is briefly world-readable.
   if (onDisk) precreate(path);
   const Better = loadBetterSqlite();
   let driver: SqlDriver;
@@ -122,10 +122,10 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
       throw new Error(`node:sqlite fallback failed opening ${path}`, { cause: e });
     }
   }
-  // BUG-35: set busy_timeout FIRST so any later contention retries, THEN bounded-retry the WAL
-  // conversion. SQLite does NOT consult the busy handler for a journal-mode change, so a plain
-  // reorder is insufficient — a fresh-file delete→WAL conversion racing another opener returns
-  // SQLITE_BUSY immediately even with a timeout set.
+  // Keep busy_timeout first AND the WAL conversion bounded-retried, so that a fresh-file
+  // delete→WAL conversion racing another opener cannot crash connect(): SQLite does NOT consult
+  // the busy handler for a journal-mode change, so it returns SQLITE_BUSY immediately even with
+  // a timeout set.
   driver.exec(`PRAGMA busy_timeout = ${busy}`);
   for (let i = 0; ; i++) {
     try {
@@ -148,10 +148,10 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
     }
   }
   driver.exec('PRAGMA synchronous = NORMAL');
-  // SEC-16: an existing store (or a -wal/-shm sidecar SQLite created at the umask default) can
-  // still be group/world-readable, and neither driver exposes a mode option. Narrow anything
-  // wider, and say so — including when it cannot be done, which is what a second bridge running
-  // as a different UID hits.
+  // An existing store (or a -wal/-shm sidecar SQLite created at the umask default) can still be
+  // group/world-readable, and neither driver exposes a mode option. Narrow anything wider, and
+  // say so — including when it cannot be done, which is what a second bridge running as a
+  // different UID hits.
   if (onDisk) {
     for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
   }
@@ -185,7 +185,7 @@ function restrictMode(path: string): void {
     chmodSync(path, target);
     process.stderr.write(
       `parley-sqlite: tightened ${path} from 0${current.toString(8)} to 0${target.toString(8)} ` +
-        `(SEC-16: the message store must not be readable by other accounts)\n`,
+        `(the message store must not be readable by other accounts)\n`,
     );
   } catch (e) {
     process.stderr.write(

@@ -26,14 +26,14 @@ async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
   throw new Error('timed out waiting for condition');
 }
 
-// The audit's "Reconnect & liveness" case for NATS (BUG-02): a live subscription whose ephemeral
-// pull consumer is GC'd server-side must detect the loss and re-establish delivery — recreating the
-// consumer at DeliverPolicy.StartSequence lastSeq+1 so the outage gap is backfilled. We simulate the
-// server-side GC by deleting the consumer out-of-band, which the old code never noticed (silent
-// death). Network-gated: skipped unless a JetStream server answers at PARLEY_NATS_SERVERS.
+// A live subscription whose ephemeral pull consumer is GC'd server-side must detect the loss and
+// re-establish delivery — recreating the consumer at DeliverPolicy.StartSequence lastSeq+1 so the
+// outage gap is backfilled. The server-side GC is simulated by deleting the consumer out-of-band,
+// a loss that is otherwise silent. Network-gated: skipped unless a JetStream server answers at
+// PARLEY_NATS_SERVERS.
 const suite = (await isNatsUp(SERVERS)) ? describe : describe.skip;
 
-suite('nats recovery — BUG-02: live subscription survives ephemeral-consumer loss', () => {
+suite('nats recovery — live subscription survives ephemeral-consumer loss', () => {
   const tag = rand();
   const cfg = { servers: SERVERS, subject_prefix: `pt.${tag}.`, stream_prefix: `PT_${tag}_` };
 

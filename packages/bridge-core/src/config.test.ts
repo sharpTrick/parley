@@ -39,7 +39,7 @@ describe('config loader', () => {
     expect(pinned.presence.ttl_ms).toBe(500_000);
   });
 
-  it('BUG-34 — rejects presence.ttl_ms below heartbeat_ms; accepts ttl_ms >= heartbeat_ms and the 3× default', () => {
+  it('rejects presence.ttl_ms below heartbeat_ms; accepts ttl_ms >= heartbeat_ms and the 3× default', () => {
     // A pinned ttl below the (default 600s) heartbeat would read every live peer offline between beats.
     expect(() =>
       parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], presence: { ttl_ms: 5 } }),
@@ -230,7 +230,7 @@ describe('config loader', () => {
     ).toThrow();
   });
 
-  it('rejects an oidc block with no identity gate (SEC-05 fail-closed)', () => {
+  it('rejects an oidc block with no identity gate (fail-closed)', () => {
     const base = { identity: { handle: 'h' }, topics: ['a'] };
     const issuer = 'https://kc.example.com/realms/x';
     // Gate-less: none of allowed_subjects / allowed_usernames / required_role → rejected.
@@ -259,7 +259,7 @@ describe('config loader', () => {
     ).not.toThrow();
   });
 
-  it('rejects an http issuer but exempts loopback (SEC-19 https requirement)', () => {
+  it('rejects an http issuer but exempts loopback (https requirement)', () => {
     const base = { identity: { handle: 'h' }, topics: ['a'] };
     expect(() =>
       parseConfig({

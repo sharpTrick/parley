@@ -16,8 +16,8 @@ function openDb(path) {
     const { DatabaseSync } = require('node:sqlite');
     db = new DatabaseSync(path);
   }
-  // Same pragmas as driver.ts (BUG-35): busy_timeout FIRST, then bounded-retry the WAL
-  // conversion so a first-boot race against another opener degrades instead of crashing.
+  // Keep the same pragma order as driver.ts — busy_timeout first, then a bounded-retried WAL
+  // conversion — so that a first-boot race against another opener degrades instead of crashing.
   db.exec('PRAGMA busy_timeout = 5000');
   for (let i = 0; ; i++) {
     try {

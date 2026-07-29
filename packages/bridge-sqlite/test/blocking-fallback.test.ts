@@ -8,8 +8,8 @@ import { SqlitePlugin } from '../src/index.js';
 /**
  * SQLite is polling-only by design, so it does NOT block natively — it gets its long-poll from
  * core's generic `fetchRecentBlocking` wrapper. This proves that path end to end against a REAL
- * SqlitePlugin (no plugin change required — issue #20): a blocked fetch wakes promptly on a
- * concurrent post, and returns an empty page with a stable cursor at the timeout.
+ * SqlitePlugin, with no plugin change required: a blocked fetch wakes promptly on a concurrent
+ * post, and returns an empty page with a stable cursor at the timeout.
  */
 describe('sqlite + core fetchRecentBlocking (generic fallback, zero plugin change)', () => {
   const SENDER = asHandle('writer');

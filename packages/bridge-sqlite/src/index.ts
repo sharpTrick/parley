@@ -157,9 +157,9 @@ export class SqlitePlugin implements BackendPlugin {
 
     if (this.retentionDays !== undefined) {
       this.prune();
-      // BUG-27: unref the prune timer so a leaked-but-never-disconnect()ed plugin cannot by
-      // itself pin the event loop — pruning is a best-effort cost knob, not a reason to keep the
-      // process alive.
+      // Keep the .unref(), so that a leaked-but-never-disconnect()ed plugin cannot by itself pin
+      // the event loop — pruning is a best-effort cost knob, not a reason to keep the process
+      // alive.
       this.pruneTimer = setInterval(() => this.prune(), PRUNE_INTERVAL_MS).unref();
     }
   }
@@ -186,8 +186,8 @@ export class SqlitePlugin implements BackendPlugin {
     const stmt = this.require(this.insertStmt);
     const ts = new Date().toISOString();
     const info = stmt.run(topic, identity, content, ts, opts?.inReplyTo ?? null);
-    // No Number() round-trip: String() handles number and bigint alike, so a 64-bit rowid can
-    // never lose precision on the way to the dedup key (BUG-40).
+    // Keep String() rather than a Number() round-trip, so that a 64-bit rowid cannot lose
+    // precision on the way to the dedup key.
     return asBackendMsgId(String(info.lastInsertRowid));
   }
 
@@ -378,7 +378,7 @@ export class SqlitePlugin implements BackendPlugin {
 }
 
 /**
- * Classify a DB error for the background loops (BUG-39). Only damage that retrying cannot repair
+ * Classify a DB error for the background loops. Only damage that retrying cannot repair
  * is `fatal`; an unrecognised error is `unavailable`, so a class nobody anticipated backs off and
  * self-heals rather than permanently killing live push.
  */

@@ -21,7 +21,7 @@ import { GOODBYE_TIMEOUT_MS } from './presence-loop.js';
 import { buildBridge } from './stdio-bridge.js';
 
 /**
- * A recording BackendPlugin for the lifecycle tests (BUG-27 / BUG-28). It timestamps every seam
+ * A recording BackendPlugin for the lifecycle tests. It timestamps every seam
  * call into a single ordered `events` log so a test can assert the RELATIVE order of `subscribe`
  * (push wiring) vs `post` to the presence topic (presence hello). Failure injection is opt-in:
  * `fetchThrows` makes on-start catch-up fail; `subscribeThrowsOn` makes the push loop fail on a
@@ -119,7 +119,7 @@ async function within<T>(budget: number, work: Promise<T>): Promise<T | 'TIMED O
   ]);
 }
 
-describe('buildBridge lifecycle: catch-up failure rollback (BUG-27)', () => {
+describe('buildBridge lifecycle: catch-up failure rollback', () => {
   it('disconnects the plugin exactly once when on-start catch-up throws, then rejects', async () => {
     const plugin = new RecordingPlugin({ fetchThrows: true });
     const cfg = parseConfig({
@@ -137,7 +137,7 @@ describe('buildBridge lifecycle: catch-up failure rollback (BUG-27)', () => {
   });
 });
 
-describe('bridge attach ordering + rollback (BUG-28 / BUG-27)', () => {
+describe('bridge attach ordering + rollback', () => {
   it('wires the push loop (subscribe) BEFORE announcing presence (hello post)', async () => {
     const plugin = new RecordingPlugin();
     const cfg = parseConfig({

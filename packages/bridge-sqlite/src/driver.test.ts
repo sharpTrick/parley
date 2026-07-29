@@ -7,7 +7,7 @@ import { openDriver } from './driver.js';
 
 const mode = (f: string): number => statSync(f).mode & 0o777;
 
-// BUG-35/36 assertions exercise the native better-sqlite3 open/lock semantics specifically (the
+// The open/lock assertions below exercise native better-sqlite3 semantics specifically (the
 // node:sqlite fallback behaves differently), so load it directly and skip those blocks cleanly
 // when it is absent — matching openDriver, which only falls back on a module-*load* failure.
 const require = createRequire(import.meta.url);
@@ -24,11 +24,11 @@ const BetterCtor: (new (p: string) => RawConn) | null = (() => {
   }
 })();
 
-// SEC-16 — the SQLite DB (all message content, hand-offs, presence) plus its WAL sidecars must be
-// created 0600 so another local account on a shared host cannot read the conversation store.
-// Neither driver exposes a mode option, so openDriver chmods the DB after open; the -wal/-shm
-// sidecars, created lazily on first write, inherit the main DB's mode.
-describe('openDriver file permissions (SEC-16)', () => {
+// The SQLite DB (all message content, hand-offs, presence) plus its WAL sidecars must be created
+// 0600 so another local account on a shared host cannot read the conversation store. Neither
+// driver exposes a mode option, so openDriver chmods the DB after open; the -wal/-shm sidecars,
+// created lazily on first write, inherit the main DB's mode.
+describe('openDriver file permissions', () => {
   it('creates the DB and its -wal/-shm sidecars 0600', () => {
     const dir = mkdtempSync(join(tmpdir(), 'parley-sqlite-mode-'));
 
@@ -47,7 +47,7 @@ describe('openDriver file permissions (SEC-16)', () => {
     d.prepare('INSERT INTO t (x) VALUES (?)').run(1);
 
     expect(mode(dbPath)).toBe(0o600);
-    // Sidecars must exist after a write and must be locked down too (SEC-16 explicitly).
+    // Sidecars must exist after a write and must be locked down too.
     expect(mode(`${dbPath}-wal`)).toBe(0o600);
     expect(mode(`${dbPath}-shm`)).toBe(0o600);
     d.close();
@@ -68,11 +68,11 @@ describe('openDriver file permissions (SEC-16)', () => {
   });
 });
 
-// BUG-35 — a fresh-file delete→WAL conversion racing another opener must NOT crash connect().
-// SQLite does not consult the busy handler for a journal-mode change, so openDriver sets
-// busy_timeout first, bounded-retries the WAL pragma, and degrades to the default journal mode
-// rather than throwing "database is locked".
-describe.skipIf(BetterCtor === null)('openDriver concurrent first-boot WAL race (BUG-35)', () => {
+// A fresh-file delete→WAL conversion racing another opener must NOT crash connect(). SQLite does
+// not consult the busy handler for a journal-mode change, so openDriver sets busy_timeout first,
+// bounded-retries the WAL pragma, and degrades to the default journal mode rather than throwing
+// "database is locked".
+describe.skipIf(BetterCtor === null)('openDriver concurrent first-boot WAL race', () => {
   it('retries then degrades to a usable driver instead of throwing when WAL conversion is blocked', () => {
     const Ctor = BetterCtor as new (p: string) => RawConn;
     const dir = mkdtempSync(join(tmpdir(), 'parley-sqlite-wal-'));
@@ -110,10 +110,10 @@ describe.skipIf(BetterCtor === null)('openDriver concurrent first-boot WAL race 
   });
 });
 
-// BUG-36 — an *open* failure (bad path/permissions/corrupt file) must surface better-sqlite3's own
-// precise message, not be swallowed and replaced by the node:sqlite fallback. The fallback fires
-// only on a module-*load* failure.
-describe.skipIf(BetterCtor === null)('openDriver surfaces the real open error (BUG-36)', () => {
+// An *open* failure (bad path/permissions/corrupt file) must surface better-sqlite3's own precise
+// message, not be swallowed and replaced by the node:sqlite fallback. The fallback fires only on
+// a module-*load* failure.
+describe.skipIf(BetterCtor === null)('openDriver surfaces the real open error', () => {
   it("propagates better-sqlite3's own message, not node:sqlite's, on an open failure", () => {
     let caught: unknown;
     try {

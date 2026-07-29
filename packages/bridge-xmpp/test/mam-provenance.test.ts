@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
 import { type ArchiveItem, priv } from './fake-xmpp.js';
 
-// SEC-13 — XMPP MAM result provenance. `onMamResult` must accept a streamed
+// XMPP MAM result provenance. `onMamResult` must accept a streamed
 // `<result xmlns='urn:xmpp:mam:2'>` item ONLY when the outer message stanza's bare `from`
 // equals the room JID the in-flight query targeted; a result from any other JID is dropped
 // (never pushed into the collector, never returned from fetchRecent). And the query correlator
@@ -49,7 +49,7 @@ const mamResultMessage = (opts: {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-describe('XMPP MAM result provenance (SEC-13)', () => {
+describe('XMPP MAM result provenance', () => {
   const ROOM = 'myroom@muc.parley.local';
   const QUERYID = 'live-query-id-abc123';
 

@@ -26,7 +26,7 @@ describe('parseMentions', () => {
     expect(parseMentions('just some text')).toEqual([]);
   });
 
-  it('excludes trailing punctuation from the handle (BUG-21)', () => {
+  it('excludes trailing punctuation from the handle', () => {
     expect(parseMentions('ping @bob.')).toEqual(['bob']);
     expect(parseMentions('@bob-')).toEqual(['bob']);
     expect(parseMentions('@bob_')).toEqual(['bob']);
@@ -43,7 +43,7 @@ describe('parseMentions', () => {
     expect(parseMentions('@-')).toEqual([]);
   });
 
-  it('parsed handle satisfies the mention-filter predicate (BUG-21 end-to-end)', () => {
+  it('parsed handle satisfies the mention-filter predicate (end to end)', () => {
     // This is the exact predicate push-loop.ts evaluates for `mention_filter: true`.
     expect(parseMentions('ping @bob.').includes(asHandle('bob'))).toBe(true);
   });

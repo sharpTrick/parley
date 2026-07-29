@@ -60,7 +60,7 @@ export const MAX_TOPIC_LEN = 512;
  * `nowMs` is threaded in) rather than trusted — it never enters the roster. The untrusted `at` drives
  * both TTL freshness (`nowMs - at < ttlMs`) and the recency sort, so a far-future value would
  * otherwise read as permanently "live" and pin a phantom peer at the top of the roster forever, immune
- * to the `sinceMs`/`online_only` gates (SEC-03). Clamping `at` to `nowMs` instead does NOT fix this —
+ * to the `sinceMs`/`online_only` gates. Clamping `at` to `nowMs` instead does NOT fix this —
  * it re-clamps to the live now on every evaluation, so the age stays 0 and the phantom is always live;
  * the beat must be dropped, not clamped. ~5 min mirrors typical OIDC `clock_skew` handling; genuine
  * clock skew is far smaller, so legitimate beats are unaffected.
@@ -137,7 +137,7 @@ export function encodePresence(rec: PresenceRecord): string {
  * When `nowMs` is supplied ({@link computeRoster} threads in the roster's real clock), a beat whose
  * self-reported `at` is more than {@link MAX_CLOCK_SKEW_MS} in the future is REJECTED — an untrusted
  * far-future clock must never enter the roster, where it would read as permanently "live" and pin a
- * phantom peer online forever (SEC-03). A pure decode (no `nowMs`, e.g. round-trip tests) leaves `at`
+ * phantom peer online forever. A pure decode (no `nowMs`, e.g. round-trip tests) leaves `at`
  * unbounded.
  */
 export function decodePresence(content: string, nowMs?: number): PresenceRecord | null {
@@ -152,7 +152,7 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
   if (r.v !== 2) return null;
   if (r.kind !== 'hello' && r.kind !== 'heartbeat' && r.kind !== 'goodbye') return null;
   if (typeof r.at !== 'number' || !Number.isFinite(r.at)) return null;
-  // SEC-03: the self-reported clock is untrusted. Drop a beat whose `at` is implausibly far in the
+  // The self-reported clock is untrusted. Drop a beat whose `at` is implausibly far in the
   // future (beyond a small skew tolerance) so it can never enter the roster and be counted "live" —
   // clamping `at` to now would instead re-read it as freshly-live on every evaluation (age 0).
   if (nowMs !== undefined && r.at > nowMs + MAX_CLOCK_SKEW_MS) return null;
@@ -161,7 +161,7 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
   }
   // Truncate rather than reject: a fresh beat with an over-long list is still useful liveness. Drop
   // (don't truncate — that would fabricate a different topic name) any per-string over MAX_TOPIC_LEN
-  // before the count cap, so a hostile beat can't bloat roster memory / tool output (SEC-09).
+  // before the count cap, so a hostile beat can't bloat roster memory / tool output.
   const topics = (r.topics as string[]).filter((t) => t.length <= MAX_TOPIC_LEN).slice(0, MAX_RECORD_TOPICS);
   // `postTopics` is optional/additive: absent (old emitter) or malformed ⇒ [] rather than a
   // whole-record reject — the liveness signal is still worth keeping. Same count + per-string caps.
@@ -201,7 +201,7 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
   const byHandle = new Map<Handle, Map<string, PresenceRecord>>();
   for (const m of messages) {
     // Thread `nowMs` so decode drops an untrusted far-future `at` (beyond MAX_CLOCK_SKEW_MS) before it
-    // ever reaches the liveness/recency logic below (SEC-03) — legitimate small skew still decodes.
+    // ever reaches the liveness/recency logic below — legitimate small skew still decodes.
     const rec = decodePresence(m.content, nowMs);
     if (rec === null) continue;
     let insts = byHandle.get(m.senderHandle);
@@ -215,7 +215,7 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
   for (const [handle, insts] of byHandle) {
     const recs = [...insts.values()];
     // Every record here already has a trusted-enough `at`: decode rejected any beat more than
-    // MAX_CLOCK_SKEW_MS in the future (SEC-03), so a spoofed far-future beat never reaches this point
+    // MAX_CLOCK_SKEW_MS in the future, so a spoofed far-future beat never reaches this point
     // and cannot read as "live" or dominate the recency sort. Legitimate within-skew beats are kept.
     const live = recs.filter((r) => r.kind !== 'goodbye' && nowMs - r.at < opts.ttlMs);
     const online = live.length > 0;

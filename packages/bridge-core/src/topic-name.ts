@@ -1,5 +1,5 @@
 /**
- * Injective topic → backend-name mapping (DESIGN §4 seam; BUG-14/SEC-07/CX-03).
+ * Injective topic → backend-name mapping (DESIGN §4 seam).
  *
  * Backends map an opaque Parley {@link Topic} onto a backend-specific channel name (NATS
  * subject/stream, Matrix room alias, XMPP MUC JID) via a legal-charset fold. Those folds are

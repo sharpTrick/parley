@@ -13,7 +13,7 @@ import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
  * tools over the same seam, with NO `claude/channel` capability and NO push loop — the chat
  * client cannot receive pushes. `deps` is derived ONCE at app scope (see {@link createRemoteHttpApp})
  * and shared across every per-request server, so the allowlist/regexes are compiled a single time,
- * not per POST. No `seen` is passed: without a push loop there is no dedup state to maintain (CX-06).
+ * not per POST. No `seen` is passed: without a push loop there is no dedup state to maintain.
  */
 export function buildReactiveServer(deps: ToolDeps): McpServer {
   const server = new McpServer({ name: 'parley', version: CORE_VERSION }, { capabilities: { tools: {} } });
@@ -54,8 +54,9 @@ export function createRemoteHttpApp(
 ): RemoteHttpServer {
   const app = express();
   app.disable('x-powered-by');
-  // SEC-04: anti-clickjacking + hardening headers on every response, including the browser-facing
-  // OAuth /authorize consent page (owner-passphrase form) and /parley/consent. Applied app-wide
+  // Keep these anti-clickjacking / hardening headers on every response, so the browser-facing
+  // OAuth /authorize consent page (owner-passphrase form) and /parley/consent stay covered too.
+  // Applied app-wide
   // because the whole app is single-purpose. HSTS is ignored by browsers over plain HTTP, so it is
   // safe to send unconditionally and takes effect only on the HTTPS deployment.
   app.use((_req, res, next) => {
@@ -70,13 +71,13 @@ export function createRemoteHttpApp(
 
   // Derive the tool deps ONCE at app scope (config is constant): the allowlist/regexes and tool
   // descriptions are compiled a single time and reused by every per-request reactive server and by
-  // the presence loop below — no per-POST recompilation, no duplicate app-scope derivation (CX-09).
+  // the presence loop below — no per-POST recompilation.
   const deps = toolDepsFor(plugin, cfg);
 
   // The chat bridge is a long-lived participant too: announce presence off the shared plugin
-  // (the reactive servers are per-request and stateless, so presence lives at app scope). BUG-28:
-  // this is armed but NOT fired here — an app whose bind fails, or which is never listened on, must
-  // never advertise itself as reachable, so `listen` calls it only once the socket is up.
+  // (the reactive servers are per-request and stateless, so presence lives at app scope). Keep this
+  // armed but NOT fired here — `listen` calls it only once the socket is up, so an app whose bind
+  // fails, or which is never listened on, can never advertise itself as reachable.
   let presence: PresenceLoop | undefined;
   const announce = (): void => {
     if (cfg.presence.enabled) {
@@ -87,7 +88,7 @@ export function createRemoteHttpApp(
     }
   };
 
-  // SEC-17: fail CLOSED by default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
+  // Keep this fail-CLOSED default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
   // an open endpoint. A no-arg call must never mean "no auth".
   const failClosed: RequestHandler = (_req, res) => {
     res.status(401).json({
@@ -123,7 +124,7 @@ export function createRemoteHttpApp(
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
-      // SEC-14: never echo internal error detail to the client; log it for the operator instead.
+      // Never echo internal error detail to the client; log it for the operator instead.
       console.error('[parley] /mcp request failed:', err);
       if (!res.headersSent) {
         res.status(500).json({
@@ -142,7 +143,7 @@ export function createRemoteHttpApp(
   let httpServer: NodeHttpServer | undefined;
   return {
     app,
-    // BUG-12: REJECT on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
+    // Keep rejecting on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
     // never-bound server (address() === null) the composition root cannot detect, retry, or
     // cleanly shut down. Express 5 (`app.listen`) wraps our callback in `once()` and ALSO
     // registers it as `server.once('error', done)` BEFORE we can attach our own listener — so on

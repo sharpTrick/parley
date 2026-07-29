@@ -40,7 +40,7 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
 
 /**
  * Generic long-poll wrapper over the seam's `fetchRecent`, used ONLY by the MCP `fetch_recent`
- * tool (issue #20). It gives EVERY backend blocking semantics with zero plugin changes, and lets a
+ * tool. It gives EVERY backend blocking semantics with zero plugin changes, and lets a
  * backend that DOES honor `blockMs` natively block efficiently — the two compose:
  *
  *   - Each iteration calls `plugin.fetchRecent({ ...args, since, blockMs: remaining })`.
