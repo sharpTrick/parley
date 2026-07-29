@@ -1,5 +1,14 @@
 /**
- * Two lifecycle CLASSES that a single-instance plugin gets wrong quietly:
+ * Three lifecycle CLASSES that a single-instance plugin gets wrong quietly:
+ *
+ * (0) RECONNECT OWNERSHIP. Only the loss of an ESTABLISHED connection is a reconnect; every other
+ *     handshake failure belongs to the caller that asked for it. Deriving that distinction from
+ *     anything but "did this connection see `hello`" misreads the shapes where the failure settles
+ *     the handshake BEFORE the close it causes — a handshake timeout, or a websocket `error` from a
+ *     URL that refuses the connection — and hands each one a reconnect owner that immediately
+ *     redials, whose own failure mints another. The table below crosses every failure shape with
+ *     whether a live socket existed first, and grades both the owner count and the dial rate over a
+ *     sustained outage, because the harm is O(dials against `apps.connections.open`).
  *
  * (1) A lazily-memoized async singleton must not cache FAILURE. `wsReady` and `authTestPromise`
  *     are both "start it once, everyone awaits the same promise" fields; if a rejected promise
@@ -18,8 +27,8 @@
  *     send has no bound at all, which is what the `silent` mode is here to prove.
  */
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
-import { describe, expect, it } from 'vitest';
-import { SlackPlugin } from '../src/index.js';
+import { describe, expect, it, vi } from 'vitest';
+import { DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -60,6 +69,130 @@ async function settleWithin<T>(captured: Promise<Settled<T>>, ms: number): Promi
   const pending: Settled<T> = { status: 'pending' };
   return Promise.race([captured, sleep(ms).then(() => pending)]);
 }
+
+/** Long enough that a reconnect loop on its own backoff gets several attempts in. */
+const OUTAGE_MS = 2000;
+
+/** Dials `apps.connections.open` may cost over `elapsed` ms of unbroken outage. */
+const dialBound = (elapsed: number): number => Math.ceil(elapsed / DIAL_BACKOFF_MS) + 1;
+
+/**
+ * A way for Socket Mode to be unavailable. The first two settle the handshake through the socket's
+ * own close; the last two settle it BEFORE the close they cause, which is the distinction the owner
+ * count is graded on.
+ */
+const OUTAGES: Array<{ name: string; arm: (fake: FakeSlack) => void }> = [
+  {
+    name: 'apps.connections.open answering ok:false',
+    arm: (fake) => fake.failMethod('apps.connections.open', 'internal_error'),
+  },
+  { name: 'a socket that closes before hello', arm: (fake) => fake.setGreet('pre-hello-close') },
+  { name: 'a socket that accepts and stays silent', arm: (fake) => fake.setGreet('silent') },
+  {
+    name: 'a handed-out ws URL that refuses the connection',
+    arm: (fake) => fake.setWsUrl('ws://127.0.0.1:1/socket'),
+  },
+];
+
+const spyReconnect = (plugin: SlackPlugin) =>
+  vi.spyOn(plugin as unknown as { reconnect: () => Promise<void> }, 'reconnect');
+
+describe('slack reconnect ownership under a sustained outage', () => {
+  for (const outage of OUTAGES) {
+    for (const entry of ['subscribe', 'blocking-fetch'] as const) {
+      it(`${outage.name}, hit cold via ${entry}, mints no reconnect owner and dials O(wall clock)`, async () => {
+        const fake = await FakeSlack.start();
+        const topic = asTopic('C0COLD');
+        fake.createChannel(topic);
+        const plugin = await makePlugin(fake);
+        const reconnect = spyReconnect(plugin);
+        try {
+          outage.arm(fake);
+          const t0 = Date.now();
+          if (entry === 'subscribe') {
+            const outcome = await settleWithin(capture(plugin.subscribe(topic, () => undefined)), OUTAGE_MS);
+            expect(outcome.status).toBe('rejected');
+            await sleep(Math.max(0, OUTAGE_MS - (Date.now() - t0)));
+          } else {
+            await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: OUTAGE_MS });
+          }
+          const elapsed = Date.now() - t0;
+
+          // Nothing was ever established, so nothing was LOST: the failure belongs to the caller
+          // that asked for it, and a reconnect loop would redial on top of that caller's own retries.
+          expect(reconnect, 'reconnect owners').toHaveBeenCalledTimes(0);
+          expect(fake.hits('apps.connections.open')).toBeLessThanOrEqual(dialBound(elapsed));
+        } finally {
+          await plugin.disconnect();
+          await fake.close();
+        }
+      });
+    }
+
+    it(`an established socket dropped into ${outage.name} keeps exactly one reconnect owner`, async () => {
+      const fake = await FakeSlack.start();
+      const topic = asTopic('C0DROP');
+      fake.createChannel(topic);
+      const plugin = await makePlugin(fake);
+      try {
+        await plugin.subscribe(topic, () => undefined);
+        const reconnect = spyReconnect(plugin);
+        const dialsBefore = fake.hits('apps.connections.open');
+
+        outage.arm(fake);
+        const t0 = Date.now();
+        fake.dropSockets();
+        await sleep(OUTAGE_MS);
+        const elapsed = Date.now() - t0;
+
+        expect(reconnect, 'reconnect owners').toHaveBeenCalledTimes(1);
+        expect(fake.hits('apps.connections.open') - dialsBefore).toBeLessThanOrEqual(
+          dialBound(elapsed),
+        );
+      } finally {
+        await plugin.disconnect();
+        await fake.close();
+      }
+    });
+  }
+
+  it('one reconnect owner survives the whole outage and resumes live delivery on recovery', async () => {
+    const fake = await FakeSlack.start();
+    const topic = asTopic('C0RESUME');
+    fake.createChannel(topic);
+    const plugin = await makePlugin(fake);
+    try {
+      const received: string[] = [];
+      await plugin.subscribe(topic, (m) => received.push(m.content));
+      const reconnect = spyReconnect(plugin);
+
+      fake.setGreet('pre-hello-close');
+      fake.dropSockets();
+      // Sampled through the outage: a second concurrent `openSocket` orphans a socket nothing will
+      // ever close, which shows up as a live-socket count that ratchets rather than staying at most 1.
+      for (let i = 0; i < 20; i++) {
+        expect(fake.liveSockets, `live sockets ${i * 50}ms into the outage`).toBeLessThanOrEqual(1);
+        await sleep(50);
+      }
+
+      fake.setGreet('greet');
+      await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 8000, interval: 20 });
+      await plugin.post(topic, asHandle('writer'), 'after-recovery');
+      await vi.waitFor(() => expect(received).toContain('after-recovery'), {
+        timeout: 4000,
+        interval: 10,
+      });
+      expect(reconnect, 'reconnect owners across outage and recovery').toHaveBeenCalledTimes(1);
+      expect(fake.liveSockets).toBe(1);
+
+      await plugin.disconnect();
+      await vi.waitFor(() => expect(fake.liveSockets).toBe(0), { timeout: 4000, interval: 20 });
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+});
 
 interface Singleton {
   name: string;

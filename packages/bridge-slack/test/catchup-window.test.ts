@@ -74,6 +74,38 @@ async function drain(
   throw new Error('drain never terminated');
 }
 
+/**
+ * The page cap Slack applies to a commercially distributed non-Marketplace app — far below the
+ * `limit` the plugin asks for, and served without saying so. The table above grades the window
+ * arithmetic across layouts at the default page size; this grades the drain at the one page cap the
+ * README makes a claim about, so that claim is executable rather than prose.
+ */
+const REDUCED_TIER_PAGE = 15;
+
+describe('slack catch-up drains against a server capped far below the requested limit', () => {
+  it(`drains a page-straddling layout at pageSize=${REDUCED_TIER_PAGE}`, async () => {
+    const fake = await FakeSlack.start({ pageSize: REDUCED_TIER_PAGE });
+    const plugin = new SlackPlugin();
+    await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
+    try {
+      const topic = asTopic('C0PAGECAP');
+      const layout = LAYOUTS.find((l) => l.name === 'straddles-page-and-limit')!;
+      const seeded = fake.seed(topic, entriesOf(layout.runs));
+      const plain = seeded.filter((m) => m.subtype === undefined);
+
+      const { contents, cursors } = await drain(plugin, topic, asCursor('0'), 10);
+
+      expect(contents).toEqual(plain.map((m) => m.text));
+      // A drained `since` walk saw every entry above it, so the cursor ends above the trailing system
+      // records however the pages happened to be cut.
+      expect(cursors.at(-1)).toBe(seeded.at(-1)!.ts);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+});
+
 describe('slack catch-up window arithmetic', () => {
   for (const layout of LAYOUTS) {
     for (const sinceMode of SINCE_MODES) {

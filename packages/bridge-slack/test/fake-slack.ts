@@ -5,8 +5,8 @@
  *   - `ts` values are unique AND strictly increasing per channel (global counter suffix), even
  *     under concurrent writers — the property that makes ts a valid cursor.
  *   - `conversations.history` returns NEWEST-first with `oldest` EXCLUSIVE (unless `inclusive`),
- *     and pages at a FIXED size of 50 via `response_metadata.next_cursor`, so the conformance
- *     multi-writer case (100 messages) forces real multi-page assembly in the plugin.
+ *     and pages via `response_metadata.next_cursor` at a size the server picks and the caller cannot
+ *     raise (50 by default, so the 100-message conformance case forces real multi-page assembly).
  *   - A channel id that was never created answers `{ok:false, error:'channel_not_found'}` — an
  *     EXISTING but empty channel is the only thing that answers `ok:true, messages:[]`. Fabricating
  *     success for unknown ids would green the seam's absent-topic contract without testing it.
@@ -19,8 +19,8 @@ import type { AddressInfo } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { compareTs } from '../src/index.js';
 
-/** Fixed page size — small enough that the 100-message conformance case spans 3 pages. */
-const PAGE_SIZE = 50;
+/** Default page size — small enough that the 100-message conformance case spans 3 pages. */
+const DEFAULT_PAGE_SIZE = 50;
 
 interface StoredMessage {
   type: 'message';
@@ -94,6 +94,7 @@ export class FakeSlack {
 
   private readonly server: Server;
   private readonly wss: WebSocketServer;
+  private readonly pageSize: number;
   private readonly sockets = new Set<WebSocket>();
   /** Channels that EXIST. Anything else answers `channel_not_found`, like slack.com. */
   private readonly known = new Set<string>();
@@ -106,22 +107,35 @@ export class FakeSlack {
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
   private greet: GreetMode = 'greet';
+  /** The URL `apps.connections.open` hands out — see {@link setWsUrl}. */
+  private handedOutWsUrl?: string;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
   private counter = 0;
   private readonly channels = new Map<string, StoredMessage[]>();
 
-  private constructor(server: Server, wss: WebSocketServer, port: number) {
+  private constructor(server: Server, wss: WebSocketServer, port: number, pageSize: number) {
     this.server = server;
     this.wss = wss;
+    this.pageSize = pageSize;
     this.apiUrl = `http://127.0.0.1:${port}/api`;
     this.wsUrl = `ws://127.0.0.1:${port}/socket`;
   }
 
-  static async start(): Promise<FakeSlack> {
+  /**
+   * `pageSize` is how many objects `conversations.history` returns per page, whatever `limit` the
+   * caller asked for — real Slack caps it per rate-limit tier (15 objects for a commercially
+   * distributed non-Marketplace app, 1000 for an internal one) and silently serves fewer than asked.
+   */
+  static async start(opts?: { pageSize?: number }): Promise<FakeSlack> {
     const server = createServer();
     const wss = new WebSocketServer({ server });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const fake = new FakeSlack(server, wss, (server.address() as AddressInfo).port);
+    const fake = new FakeSlack(
+      server,
+      wss,
+      (server.address() as AddressInfo).port,
+      opts?.pageSize ?? DEFAULT_PAGE_SIZE,
+    );
 
     server.on('request', (req, res) => {
       void fake.handleHttp(req, res);
@@ -154,6 +168,15 @@ export class FakeSlack {
   /** How new Socket Mode connections behave — see {@link GreetMode}. */
   setGreet(mode: GreetMode): void {
     this.greet = mode;
+  }
+
+  /**
+   * Hand out `url` from `apps.connections.open` instead of this fake's own socket. Pointed at a
+   * closed port it is the everyday firewall/proxy/blip shape: the dial SUCCEEDS and the websocket
+   * then never connects, so the handshake settles through `error` rather than through a close.
+   */
+  setWsUrl(url: string): void {
+    this.handedOutWsUrl = url;
   }
 
   /** Create an EMPTY but existing channel (`ok:true, messages:[]`), unlike an unknown id. */
@@ -323,7 +346,7 @@ export class FakeSlack {
         return;
       case 'apps.connections.open':
         this.connectionsOpened++;
-        await replyAfterHook(method, { ok: true, url: this.wsUrl });
+        await replyAfterHook(method, { ok: true, url: this.handedOutWsUrl ?? this.wsUrl });
         return;
       case 'auth.test':
         reply({ ok: true, user: 'parley-bot', user_id: 'U0PARLEY', bot_id: 'B0PARLEY', team: 'T0FAKE' });
@@ -388,13 +411,13 @@ export class FakeSlack {
     }
     msgs.sort((a, b) => compareTs(orderOf(b), orderOf(a))); // NEWEST first, like Slack
     const offset = typeof body.cursor === 'string' ? Number(body.cursor) : 0;
-    const page = msgs.slice(offset, offset + PAGE_SIZE);
-    const hasMore = offset + PAGE_SIZE < msgs.length;
+    const page = msgs.slice(offset, offset + this.pageSize);
+    const hasMore = offset + this.pageSize < msgs.length;
     return {
       ok: true,
       messages: page,
       has_more: hasMore,
-      response_metadata: { next_cursor: hasMore ? String(offset + PAGE_SIZE) : '' },
+      response_metadata: { next_cursor: hasMore ? String(offset + this.pageSize) : '' },
     };
   }
 }

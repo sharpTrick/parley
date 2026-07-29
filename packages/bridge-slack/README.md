@@ -30,6 +30,20 @@ the next call re-walks the remainder. Draining a backlog therefore costs about
 is real wall-clock time after a long outage. Configure a **large `catchup.limit`** for Slack: the
 aggregate cost falls linearly with it.
 
+**…and the tier that decides whether that page figure is honoured.** The plugin asks for 200 objects
+per `conversations.history` page, but Slack caps the page — and the request rate — by app type. An
+**internal, customer-built app** (the one this README's provisioning section describes: created in
+your own workspace, installed there, not distributed) keeps the classic allowance: up to 1000 objects
+per request at 50+ requests/minute, so a 200-object page is served in full and the cost model above
+holds. A **commercially distributed app that is not listed on the Slack Marketplace** is capped, for
+apps created or newly installed since 2025-05-29, at **15 objects per request, one request per
+minute** — the server silently returns 15 however large a `limit` you send. Under that tier the cost
+model is off by more than an order of magnitude, "configure a large `catchup.limit`" stops being
+useful advice, and draining a long backlog is effectively impossible rather than merely slow; run
+Parley as an internal app, or get the app listed, if catch-up over a real backlog matters. (The plugin
+never assumes it got what it asked for: every window and trim decision counts what a page actually
+contained.)
+
 Threading is an approximation: `inReplyTo` becomes `thread_ts`. A plain thread reply does not
 surface at channel level — `conversations.history` does not return it, and the live path **drops**
 it for the same reason, so the two paths agree and nothing is delivered that a later catch-up could
@@ -58,15 +72,29 @@ only a backoff the bridge invents for itself is clamped, at `MAX_BACKOFF_MS` = 5
 that would not fit the call's `DEFAULT_DEADLINE_MS` = 30 s budget ends the call naming the figure
 rather than retrying sooner than Slack asked; a 429 with no usable hint waits
 `DEFAULT_BACKOFF_MS` = 500 ms. All three constants live in `@sharptrick/parley-net-util`. If the
-Socket Mode handshake fails, the long-poll path backs off before dialling `apps.connections.open`
-again, so a core poll loop cannot turn one `fetch_recent` into hundreds of handshakes against
-Slack's tightest limit; catch-up continues over HTTP in the meantime.
+Socket Mode handshake is unavailable, a blocked `fetchRecent` does **not** hand the call straight back
+for core to re-drive: it holds the caller's `block_ms`, retrying the handshake on its own backoff and
+re-querying history once at the end. One unavailable Socket Mode therefore costs a handful of
+`apps.connections.open` dials and two `conversations.history` reads per blocked call, rather than one
+of each per poll interval — both methods are separately rate-limited, and `conversations.history` is
+the tighter of the two. Only the loss of an **established** connection starts a reconnect loop, and
+only one such loop runs at a time; a handshake that never completed belongs to the caller that asked
+for it, so a failure cannot fan out into parallel redial loops.
 
 **Bounded waits.** A Socket Mode connection that opens and then says nothing is given
 `handshake_timeout_ms` (default 10 s) to send `hello` before the attempt is abandoned, and a
 blocking `fetchRecent` never waits longer than its own `block_ms` for that handshake. A
 `conversations.history` walk stops with a named error if the server repeats a page cursor or keeps
 handing out new ones past 2000 pages, rather than paging forever.
+
+That page ceiling is deliberately a **failure, not a truncation**: a walk resuming after a cursor
+cannot publish a `nextCursor` it has not read down to without stepping over history nobody would ever
+revisit. The consequence is that a topic whose backlog *above its stored cursor* exceeds
+2000 pages (400k messages at a full 200-object page — ~30k on the reduced tier above) rejects every
+catch-up with `exceeded 2000 pages` until the backlog shrinks, since the cursor cannot advance past
+it. There is no in-band recovery: **reset that topic's cursor** in the bridge's read-state file to a
+position inside the retained window, and catch-up resumes from there. Ordinary channels never reach
+this; a firehose channel mapped to a topic that was offline for a long time can.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
 nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning

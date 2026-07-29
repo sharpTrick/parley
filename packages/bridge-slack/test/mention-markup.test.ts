@@ -14,9 +14,23 @@ import { describe, expect, it, vi } from 'vitest';
 import { SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 
-const MENTION_MAP = { U0PARLEY: 'ctx-payments', S0OPS: 'ops-crew' };
+/**
+ * `toString` is a real configured entry that happens to name an `Object.prototype` member, so the
+ * meta-key rows below carry a positive control: an OWN entry must keep resolving while an INHERITED
+ * one must not answer at all.
+ */
+const MENTION_MAP: Record<string, string> = {
+  U0PARLEY: 'ctx-payments',
+  S0OPS: 'ops-crew',
+  toString: 'meta-mapped',
+};
 
-const ROWS: Array<{ name: string; text: string; mentions: string[] }> = [
+/**
+ * `content` is stated only where the rendered TEXT, not just the parsed handle, is the thing under
+ * test: an id resolved through a prototype chain renders a JS engine internal straight into agent
+ * context, which shows up in the text well before it shows up in `mentions`.
+ */
+const ROWS: Array<{ name: string; text: string; mentions: string[]; content?: string }> = [
   { name: 'mapped bare user id', text: 'hey <@U0PARLEY> please look', mentions: ['ctx-payments'] },
   {
     name: 'mapped user id with a label Slack supplied',
@@ -46,6 +60,38 @@ const ROWS: Array<{ name: string; text: string; mentions: string[] }> = [
     name: 'two mentions in one message',
     text: '<@U0PARLEY> and <@U0ALICE|alice> both',
     mentions: ['ctx-payments', 'alice'],
+  },
+  // META KEYS: an id is untrusted vendor text, so `mention_map[id]` must consult OWN entries only.
+  // Every row here is a key that `Object.prototype` answers for, at each lookup shape the rewrite has.
+  {
+    name: 'meta-key id that IS a configured entry',
+    text: 'hey <@toString> look',
+    mentions: ['meta-mapped'],
+    content: 'hey @meta-mapped look',
+  },
+  {
+    name: 'unconfigured meta-key bare id',
+    text: 'cc <@constructor>',
+    mentions: ['constructor'],
+    content: 'cc @constructor',
+  },
+  {
+    name: 'unconfigured meta-key id whose inherited value is an object',
+    text: 'cc <@__proto__>',
+    mentions: [],
+    content: 'cc @__proto__',
+  },
+  {
+    name: 'unconfigured meta-key usergroup',
+    text: 'ping <!subteam^valueOf>',
+    mentions: ['valueOf'],
+    content: 'ping @valueOf',
+  },
+  {
+    name: 'unconfigured meta-key id with a label Slack supplied',
+    text: 'cc <@hasOwnProperty|alice>',
+    mentions: ['alice'],
+    content: 'cc @alice',
   },
   // Not mentions: markup the rewrite must leave exactly as Slack wrote it.
   { name: 'date markup', text: 'due <!date^1392734382^{date}|Feb 18, 2014>', mentions: [] },
@@ -84,6 +130,7 @@ describe('slack mention markup becomes Parley handles on both delivery paths', (
       expect(messages).toHaveLength(ROWS.length);
       for (const [i, row] of ROWS.entries()) {
         expect(messages[i]!.mentions.map(String), row.name).toEqual(row.mentions);
+        if (row.content !== undefined) expect(messages[i]!.content, row.name).toBe(row.content);
       }
     });
   });
@@ -100,6 +147,7 @@ describe('slack mention markup becomes Parley handles on both delivery paths', (
       await vi.waitFor(() => expect(live).toHaveLength(ROWS.length), { timeout: 3000, interval: 10 });
       for (const [i, row] of ROWS.entries()) {
         expect(live[i]!.mentions.map(String), row.name).toEqual(row.mentions);
+        if (row.content !== undefined) expect(live[i]!.content, row.name).toBe(row.content);
       }
     });
   });
@@ -107,7 +155,9 @@ describe('slack mention markup becomes Parley handles on both delivery paths', (
   it('the rows that declare no mention keep their markup verbatim', async () => {
     await withPlugin(async (fake, plugin) => {
       const topic = asTopic('C0MENTRAW');
-      const untouched = ROWS.filter((r) => r.mentions.length === 0);
+      // A row that states its own `content` states it above; these are the ones claiming NOTHING
+      // was rewritten, so the markup is what they must read back as.
+      const untouched = ROWS.filter((r) => r.mentions.length === 0 && r.content === undefined);
       fake.seed(
         topic,
         untouched.map((r) => ({ text: r.text })),

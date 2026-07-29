@@ -69,32 +69,56 @@ describe('slack colliding topic → channel mappings', () => {
     },
   ];
 
+  /**
+   * Ownership must come from CONFIGURATION, not from call order. An ad-hoc `post`/`fetch_recent`
+   * naming a channel-id literal is a documented use case (DESIGN §14) and its topic is steerable by
+   * prompt-injected inbound content, so a literal that claimed first would let one call permanently
+   * disable a configured topic. Each row therefore drives BOTH orders: the configured topic must win
+   * whichever side calls first, and the literal must be the rejected one either way.
+   */
+  async function withAliasingPlugin(
+    body: (plugin: SlackPlugin) => Promise<void>,
+  ): Promise<void> {
+    const fake = await FakeSlack.start();
+    const plugin = new SlackPlugin();
+    await plugin.connect({
+      api_url: fake.apiUrl,
+      bot_token: 'xoxb-test',
+      app_token: 'xapp-test',
+      channel_map: { alpha: 'C0LIT' },
+    });
+    fake.createChannel('C0LIT');
+    try {
+      await body(plugin);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  }
+
+  const COLLISION = /alpha[\s\S]*C0LIT|C0LIT[\s\S]*alpha/;
+
+  /** The configured topic is still fully usable — the rejection displaced nothing. */
+  async function expectMappedTopicHealthy(plugin: SlackPlugin, text: string): Promise<void> {
+    await plugin.post(asTopic('alpha'), asHandle('writer'), text);
+    const { messages } = await plugin.fetchRecent({ topic: asTopic('alpha'), limit: 10 });
+    expect(messages.at(-1)?.content).toBe(text);
+  }
+
   for (const first of ENTRY_POINTS) {
     for (const second of ENTRY_POINTS) {
-      it(`${second.name} rejects the aliasing topic after ${first.name} claimed the channel`, async () => {
-        const fake = await FakeSlack.start();
-        const plugin = new SlackPlugin();
-        await plugin.connect({
-          api_url: fake.apiUrl,
-          bot_token: 'xoxb-test',
-          app_token: 'xapp-test',
-          channel_map: { alpha: 'C0LIT' },
-        });
-        fake.createChannel('C0LIT');
-        try {
+      it(`the unmapped literal loses the collision whichever side calls first: ${first.name} then ${second.name}`, async () => {
+        // `C0LIT` is unmapped, so it is used as a channel-id literal — `alpha`'s channel.
+        await withAliasingPlugin(async (plugin) => {
           await first.use(plugin, asTopic('alpha'));
-          // `C0LIT` is unmapped, so it is used as a channel-id literal — `alpha`'s channel.
-          await expect(second.use(plugin, asTopic('C0LIT'))).rejects.toThrow(
-            /alpha[\s\S]*C0LIT|C0LIT[\s\S]*alpha/,
-          );
-          // …and the owning topic still works: the rejection displaced nothing.
-          await plugin.post(asTopic('alpha'), asHandle('writer'), 'kept');
-          const { messages } = await plugin.fetchRecent({ topic: asTopic('alpha'), limit: 10 });
-          expect(messages.at(-1)?.content).toBe('kept');
-        } finally {
-          await plugin.disconnect();
-          await fake.close();
-        }
+          await expect(second.use(plugin, asTopic('C0LIT'))).rejects.toThrow(COLLISION);
+          await expectMappedTopicHealthy(plugin, 'kept after the literal was rejected');
+        });
+        await withAliasingPlugin(async (plugin) => {
+          await expect(first.use(plugin, asTopic('C0LIT'))).rejects.toThrow(COLLISION);
+          await second.use(plugin, asTopic('alpha'));
+          await expectMappedTopicHealthy(plugin, 'kept though the literal called first');
+        });
       });
     }
   }
@@ -123,6 +147,96 @@ describe('slack colliding topic → channel mappings', () => {
     } finally {
       await plugin.disconnect();
       await fake.close();
+    }
+  });
+});
+
+/**
+ * CLASS: an untrusted key indexed against a plain object literal. `topics`/`post_topics` in core are
+ * `z.string().min(1)`, so every one of these is a legal topic, and a `channel_map` lookup that walks
+ * the prototype chain answers for all of them: `Object.prototype` values stand in for configured
+ * entries, and the resulting channel is an object — which degrades into a route no `event.channel`
+ * string can match (a silent no-op) or a form field that reads `"undefined"` (a false
+ * `NoSuchTopicError` against a channel that exists). Mirrors `bridge-core`'s own guard in
+ * `engine/read-state.ts`, so the class is graded at both layers.
+ */
+const META_KEYS = ['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty'];
+
+describe('slack meta-key topics resolve to their own channel-id literal, never a prototype member', () => {
+  for (const key of META_KEYS) {
+    it(`\`${key}\` is used verbatim as a channel id on every seam entry point`, async () => {
+      const fake = await FakeSlack.start();
+      const plugin = new SlackPlugin();
+      // A neighbouring mapped topic, so the map is a populated object rather than an empty one.
+      await plugin.connect({
+        api_url: fake.apiUrl,
+        bot_token: 'xoxb-test',
+        app_token: 'xapp-test',
+        channel_map: { neighbour: 'C0NEIGHBOUR' },
+      });
+      const topic = asTopic(key);
+      try {
+        // The channel is created under the KEY ITSELF: the plugin must address that exact id, so a
+        // lookup answering with a prototype member turns every call below into channel_not_found.
+        fake.createChannel(key);
+        const live: string[] = [];
+        await plugin.subscribe(topic, (m) => live.push(m.content));
+
+        const id = await plugin.post(topic, asHandle('writer'), `posted to ${key}`);
+        expect(String(id).length).toBeGreaterThan(0);
+
+        const recent = await plugin.fetchRecent({ topic, limit: 10 });
+        expect(recent.messages.map((m) => m.content)).toEqual([`posted to ${key}`]);
+        const since = await plugin.fetchRecent({ topic, since: asCursor('0'), limit: 10 });
+        expect(since.messages.map((m) => m.content)).toEqual([`posted to ${key}`]);
+
+        // A route keyed by anything but the channel-id string is a subscription that never fires.
+        await vi.waitFor(() => expect(live).toEqual([`posted to ${key}`]), {
+          timeout: 3000,
+          interval: 10,
+        });
+      } finally {
+        await plugin.disconnect();
+        await fake.close();
+      }
+    });
+  }
+
+  it('a meta key MAPPED in channel_map still resolves to its configured channel', async () => {
+    const fake = await FakeSlack.start();
+    const plugin = new SlackPlugin();
+    // Computed keys, so that `__proto__` is an OWN property rather than the literal's proto setter.
+    await plugin.connect({
+      api_url: fake.apiUrl,
+      bot_token: 'xoxb-test',
+      channel_map: { ['__proto__']: 'C0PROTO', ['constructor']: 'C0CTOR' },
+    });
+    try {
+      for (const [key, channel] of [
+        ['__proto__', 'C0PROTO'],
+        ['constructor', 'C0CTOR'],
+      ] as const) {
+        fake.createChannel(channel);
+        await plugin.post(asTopic(key), asHandle('writer'), `into ${channel}`);
+        const { messages } = await plugin.fetchRecent({ topic: asTopic(key), limit: 10 });
+        expect(messages.map((m) => m.content), key).toEqual([`into ${channel}`]);
+      }
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
+  it('rejects a channel_map target that is not a channel id, naming the topic', async () => {
+    for (const bad of [null, 42, {}, [], '']) {
+      const plugin = new SlackPlugin();
+      await expect(
+        plugin.connect({
+          api_url: 'http://127.0.0.1:1/api',
+          channel_map: { alpha: bad } as Record<string, string>,
+        }),
+        JSON.stringify(bad),
+      ).rejects.toThrow(/alpha[\s\S]*not a channel id/);
     }
   });
 });

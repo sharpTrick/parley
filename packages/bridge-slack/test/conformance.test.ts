@@ -106,7 +106,7 @@ describe('slack identity fidelity', () => {
   });
 });
 
-describe('slack pagination & reconnect regressions', () => {
+describe('slack pagination regressions', () => {
   // With `since` set, a backlog larger than the old MAX_HISTORY_PAGES × PAGE_SIZE cap must still
   // return the TRUE oldest window and a `nextCursor` that never sits above unfetched history.
   it('`since` catch-up over a >cap backlog returns the true-oldest window, not a skipping cursor', async () => {
@@ -157,56 +157,6 @@ describe('slack pagination & reconnect regressions', () => {
       expect(result.messages.every((m) => m.content.startsWith('plain'))).toBe(true);
       // The newest plain message is included (the window reaches the tail of the channel).
       expect(result.messages.map((m) => m.content)).toContain('plain-new-9');
-    } finally {
-      await ctx.cleanup();
-    }
-  });
-
-  // A pre-`hello` socket close must start exactly ONE reconnect owner; repeated pre-`hello`
-  // closes during an outage must not accumulate parallel reconnect() loops.
-  it('repeated pre-`hello` closes keep exactly one reconnect owner, then settle cleanly', async () => {
-    const ctx = await makeContext();
-    try {
-      const t = ctx.freshTopic();
-      const received: string[] = [];
-      // Establish a live socket (greet=true → hello) so subscribe() resolves normally.
-      await ctx.plugin.subscribe(t, (m) => received.push(m.content));
-
-      // Count reconnect() OWNERS: the fix calls reconnect() once (on the live-socket drop) and the
-      // single loop retries internally; the bug calls reconnect() again per pre-`hello` close.
-      const reconnectSpy = vi.spyOn(
-        ctx.plugin as unknown as { reconnect: () => Promise<void> },
-        'reconnect',
-      );
-
-      // Every new connection now closes pre-`hello`; then drop the established (post-`hello`) socket.
-      ctx.fake.setGreet('pre-hello-close');
-      const opensBefore = ctx.fake.connectionsOpened;
-      ctx.fake.dropSockets();
-
-      // Let several reconnect ATTEMPTS elapse (one apps.connections.open each, on the backoff
-      // cadence). Under the bug this count balloons as loops stack; under the fix a single owner
-      // advances one attempt at a time.
-      await vi.waitFor(
-        () => expect(ctx.fake.connectionsOpened).toBeGreaterThanOrEqual(opensBefore + 3),
-        { timeout: 4000, interval: 10 },
-      );
-      expect(reconnectSpy).toHaveBeenCalledTimes(1);
-
-      // Finally greet again: a single clean reconnect settles and live delivery resumes.
-      const helloBefore = ctx.fake.helloSent;
-      ctx.fake.setGreet('greet');
-      await vi.waitFor(() => expect(ctx.fake.helloSent).toBeGreaterThan(helloBefore), {
-        timeout: 4000,
-        interval: 10,
-      });
-      await ctx.plugin.post(t, asHandle('writer'), 'after-recovery');
-      await vi.waitFor(() => expect(received).toContain('after-recovery'), {
-        timeout: 4000,
-        interval: 10,
-      });
-      // Recovery spawned no extra reconnect owners — still exactly one across the whole outage.
-      expect(reconnectSpy).toHaveBeenCalledTimes(1);
     } finally {
       await ctx.cleanup();
     }

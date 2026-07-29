@@ -1,6 +1,7 @@
 import {
   asBackendMsgId,
   asCursor,
+  asTopic,
   NoSuchTopicError,
   type BackendConfig,
   type BackendIdentity,
@@ -73,7 +74,7 @@ const ABSENT_ON_READ = ['channel_not_found', 'not_in_channel'];
 const ABSENT_ON_WRITE = ['channel_not_found'];
 
 /** First and maximum cooldown between poll-driven `apps.connections.open` dials. */
-const DIAL_BACKOFF_MS = 500;
+export const DIAL_BACKOFF_MS = 500;
 const MAX_DIAL_BACKOFF_MS = 5_000;
 
 /**
@@ -90,6 +91,14 @@ export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
  * read — that span sits below the cursor and no later catch-up would revisit it.
  */
 export const MAX_HISTORY_PAGES = 2_000;
+
+/**
+ * Objects asked for per `conversations.history` page. Slack caps this per rate-limit tier — 1000 for
+ * an internal customer-built app, 15 for a commercially distributed non-Marketplace one — and serves
+ * fewer than asked without saying so, so keep every window decision driven by what a page actually
+ * CONTAINED rather than by this figure.
+ */
+export const HISTORY_PAGE_LIMIT = 200;
 
 const asSeamError = (e: unknown, topic: Topic, absentCodes: string[]): unknown =>
   e instanceof SlackApiError && absentCodes.includes(e.code) ? new NoSuchTopicError(topic) : e;
@@ -183,10 +192,13 @@ export class SlackPlugin implements BackendPlugin {
   private apiUrl = 'https://slack.com/api';
   private botToken?: string;
   private appToken?: string;
-  private channelMap: Record<string, string> = {};
-  private mentionMap: Record<string, string> = {};
+  private channelMap: Record<string, string> = ownEntriesOnly({});
+  private mentionMap: Record<string, string> = ownEntriesOnly({});
   private handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS;
-  /** channel id → the FIRST topic that resolved to it — the one topic allowed to use it. */
+  /**
+   * channel id → the one topic allowed to use it: seeded from `channel_map` at {@link connect}, then
+   * claimed first-come by unmapped channel-id literals.
+   */
   private readonly channelOwner = new Map<string, Topic>();
   private connected = false;
   private stopped = false;
@@ -207,16 +219,24 @@ export class SlackPlugin implements BackendPlugin {
   /** Earliest wall clock at which a poll-driven handshake may dial — see {@link ensurePollSocket}. */
   private dialCooldownUntil = 0;
   private dialBackoffMs = DIAL_BACKOFF_MS;
+  /** Whether a {@link reconnect} loop already owns re-establishing the shared socket. */
+  private reconnecting = false;
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SlackBackendConfig;
     this.apiUrl = (cfg.api_url ?? 'https://slack.com/api').replace(/\/+$/, '');
     this.botToken = cfg.bot_token;
     this.appToken = cfg.app_token;
-    this.channelMap = requireDistinctChannels(cfg.channel_map ?? {});
-    this.mentionMap = cfg.mention_map ?? {};
+    this.channelMap = requireUsableChannelMap(cfg.channel_map ?? {});
+    this.mentionMap = ownEntriesOnly(cfg.mention_map ?? {});
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     this.channelOwner.clear();
+    // Keep configuration claiming its channels HERE, before any call arrives, so that an ad-hoc
+    // caller-supplied topic naming a mapped channel-id literal is the side that loses the collision
+    // — otherwise one `post` can permanently disable a configured topic (DESIGN §14).
+    for (const [topic, channel] of Object.entries(this.channelMap)) {
+      this.channelOwner.set(channel, asTopic(topic));
+    }
     this.stopped = false;
     this.connected = true;
     this.dialCooldownUntil = 0;
@@ -286,32 +306,56 @@ export class SlackPlugin implements BackendPlugin {
     if (blockMs <= 0 || args.since === undefined || first.messages.length > 0) {
       return first;
     }
+    return this.blockForMessage(args, args.since, Date.now() + blockMs);
+  }
 
+  /**
+   * Hold a blocked `fetchRecent` for the caller's whole budget: park on the shared Socket Mode
+   * stream once the handshake lands, and until then retry it on its own cooldown. Keep the wait HERE
+   * rather than returning an empty page the moment Socket Mode is unavailable, so that core's
+   * generic re-drive cannot turn one blocked `fetch_recent` into one `conversations.history` request
+   * per `block_poll_interval_ms` for the whole budget — a tiered method, on one channel.
+   */
+  private async blockForMessage(
+    args: FetchRecentArgs,
+    since: Cursor,
+    deadlineAt: number,
+  ): Promise<FetchRecentResult> {
+    const aborted: FetchRecentResult = { messages: [], nextCursor: since };
     const channel = this.channelFor(args.topic);
-    const sinceTs = String(args.since);
-    try {
+    const sinceTs = String(since);
+    while (!this.stopped) {
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) break;
       // The handshake is bounded by `handshake_timeout_ms`, which may be far longer than this
       // call's budget; keep the caller's own bound here too, so that `block_ms` stays the ceiling
       // a blocked `parley_fetch_recent` actually observes.
-      await withDeadline(this.ensurePollSocket(), blockMs);
-    } catch {
-      return first;
+      const live = await withDeadline(this.ensurePollSocket(), remaining).then(
+        () => true,
+        () => false,
+      );
+      // A teardown that landed while the handshake ran leaves nothing to wait on, and `runFetch`
+      // below would reject on the disconnected plugin; the caller gets its empty page instead.
+      if (this.stopped) return aborted;
+      if (!live) {
+        // Keep this wait on a waiter rather than a bare timer, so that `disconnect()` drains it
+        // instead of holding the caller for the rest of the dial cooldown.
+        await this.armWaiter(channel, sinceTs, Math.min(deadlineAt - Date.now(), DIAL_BACKOFF_MS))
+          .wait;
+        continue;
+      }
+      // Keep the waiter armed BEFORE the gap-closing re-query, so that a push landing while that
+      // query is in flight is caught rather than lost — a lost wakeup here blocks for the whole budget.
+      const { wait, wake } = this.armWaiter(channel, sinceTs, deadlineAt - Date.now());
+      const afterConnect = await this.runFetch(args);
+      if (afterConnect.messages.length > 0) {
+        wake();
+        return afterConnect;
+      }
+      await wait;
+      break;
     }
-    // A teardown that landed while the handshake ran leaves nothing to wait on, and `runFetch`
-    // below would reject on the disconnected plugin; the caller gets its empty page instead.
-    if (this.stopped) return { messages: [], nextCursor: args.since };
-    // Keep the waiter armed BEFORE the gap-closing re-query, so that a push landing while that
-    // query is in flight is caught rather than lost — a lost wakeup here blocks for the whole budget.
-    const { wait, wake } = this.armWaiter(channel, sinceTs, blockMs);
-
-    const afterConnect = await this.runFetch(args);
-    if (afterConnect.messages.length > 0) {
-      wake();
-      return afterConnect;
-    }
-
-    await wait;
-    if (this.stopped) return { messages: [], nextCursor: args.since };
+    if (this.stopped) return aborted;
     return this.runFetch(args);
   }
 
@@ -330,7 +374,7 @@ export class SlackPlugin implements BackendPlugin {
     const walked = new Set<string>();
     let pages = 0;
     for (;;) {
-      const body: Record<string, unknown> = { channel, limit: 200 };
+      const body: Record<string, unknown> = { channel, limit: HISTORY_PAGE_LIMIT };
       if (args.since !== undefined) body.oldest = args.since; // EXCLUSIVE (no `inclusive`)
       if (pageCursor !== undefined) body.cursor = pageCursor;
       const resp = await this.api<HistoryResponse>('conversations.history', body).catch(
@@ -352,7 +396,8 @@ export class SlackPlugin implements BackendPlugin {
         // never come to rest above unfetched older history — the skipped span sits below it and no
         // later catch-up would ever revisit it. Pages arrive newest-first, so retaining only the
         // oldest ~`limit + page_size` keeps memory at O(limit) while the walk runs.
-        if (collected.length > limit + 200) collected.splice(0, collected.length - (limit + 200));
+        const retain = limit + HISTORY_PAGE_LIMIT;
+        if (collected.length > retain) collected.splice(0, collected.length - retain);
       }
       if (pageCursor === undefined) break;
 
@@ -554,15 +599,15 @@ export class SlackPlugin implements BackendPlugin {
       const ws = new WebSocket(open.url);
       this.ws = ws;
       let settled = false;
+      let helloSeen = false;
       let handshake: ReturnType<typeof setTimeout>;
-      /** Settle the handshake exactly once; true when THIS call is the one that settled it. */
-      const settle = (err?: Error): boolean => {
-        if (settled) return false;
+      /** Settle the handshake exactly once. */
+      const settle = (err?: Error): void => {
+        if (settled) return;
         settled = true;
         clearTimeout(handshake);
         if (err === undefined) resolve();
         else reject(err);
-        return true;
       };
       // The only other exit from this promise is a message the peer may never send.
       handshake = setTimeout(() => {
@@ -574,41 +619,54 @@ export class SlackPlugin implements BackendPlugin {
         }
       }, this.handshakeTimeoutMs);
       ws.on('message', (data: RawData) => {
-        this.onEnvelope(ws, data, () => settle());
+        this.onEnvelope(ws, data, () => {
+          helloSeen = true;
+          settle();
+        });
       });
       ws.on('error', (err: Error) => {
         settle(err);
-        // Post-establishment errors surface as a close → the reconnect path below.
       });
       ws.on('close', () => {
         // Keep this settle AHEAD of the stopped/superseded return, so that a teardown closing the
         // socket always releases the callers awaiting the handshake instead of parking them for
         // the process lifetime. Keep it a bare reject — the owning caller (the first `subscribe`
-        // or the running `reconnect` loop) retries — so that a pre-`hello` close cannot stack a
-        // second reconnect loop per failed attempt, each clearing `wsReady` and defeating backoff.
-        const wasPreHello = settle(new Error('Slack Socket Mode connection closed before hello'));
+        // or the running `reconnect` loop) retries.
+        settle(new Error('Slack Socket Mode connection closed before hello'));
         if (this.stopped || this.ws !== ws) return;
         // Socket Mode URLs are SINGLE-USE: never redial the old URL.
         this.wsReady = undefined;
-        if (wasPreHello) return;
-        // Post-`hello` close: this connection was live; mint a fresh single-use URL.
+        // Keep this gated on `helloSeen` rather than on which call settled the handshake, so that a
+        // handshake timeout or a websocket `error` — both of which settle it BEFORE the close they
+        // cause — cannot be read as a live connection dropping and be handed a reconnect owner.
+        if (!helloSeen) return;
         void this.reconnect();
       });
     });
   }
 
-  /** Re-establish the shared socket with capped exponential backoff until stopped. */
+  /**
+   * Re-establish the shared socket with capped exponential backoff until stopped. Keep this
+   * single-owner, so that a close arriving while a loop is already retrying cannot start a second
+   * loop: every loop dials `apps.connections.open` — Slack's tightest-limit endpoint — and their
+   * failures compound instead of backing off.
+   */
   private async reconnect(): Promise<void> {
-    let backoffMs = 200;
-    while (!this.stopped) {
-      try {
-        await this.ensureSocket();
-        return;
-      } catch {
-        this.wsReady = undefined; // clear the rejected attempt so the next loop retries
-        await delay(backoffMs);
-        backoffMs = Math.min(backoffMs * 2, 5000);
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    try {
+      let backoffMs = 200;
+      while (!this.stopped) {
+        try {
+          await this.ensureSocket();
+          return;
+        } catch {
+          await delay(backoffMs);
+          backoffMs = Math.min(backoffMs * 2, 5000);
+        }
       }
+    } finally {
+      this.reconnecting = false;
     }
   }
 
@@ -648,7 +706,8 @@ export class SlackPlugin implements BackendPlugin {
       return;
     }
     if (env.type === 'disconnect') {
-      // Slack is rotating this connection out; close → the 'close' handler reconnects fresh.
+      // Keep this a close rather than a direct redial, so that the `close` handler stays the ONE
+      // place a fresh single-use URL is minted and a rotation cannot race a reconnect owner.
       try {
         ws.close();
       } catch {
@@ -699,7 +758,6 @@ export class SlackPlugin implements BackendPlugin {
     if (token !== undefined) headers.Authorization = `Bearer ${token}`;
     const url = `${this.apiUrl}/${method}`;
 
-    // Slack form convention: scalar → string; array/object arg → JSON.stringify(value).
     const form = new URLSearchParams();
     for (const [k, v] of Object.entries(body)) {
       if (v === undefined) continue;
@@ -745,13 +803,32 @@ export function compareTs(a: string, b: string): number {
 }
 
 /**
- * Reject a `channel_map` whose targets are not distinct. Keep this fail-fast, so that two topics
- * folding onto one channel cannot silently displace each other's route and relabel one topic's
- * traffic as the other's — crossing into a different topic's dedup and allowlist namespace.
+ * A config lookup table with NO prototype chain. Keep both config maps built this way, so that a key
+ * like `__proto__`, `constructor` or `toString` — legal in core's `topics`/`post_topics` and
+ * reachable straight from untrusted inbound mention markup — cannot answer with an
+ * `Object.prototype` member as if it were a configured entry.
  */
-function requireDistinctChannels(map: Record<string, string>): Record<string, string> {
+function ownEntriesOnly<T>(map: Record<string, T>): Record<string, T> {
+  const out = Object.create(null) as Record<string, T>;
+  for (const [key, value] of Object.entries(map)) out[key] = value;
+  return out;
+}
+
+/**
+ * Reject a `channel_map` that cannot be used as one. Keep this fail-fast, so that two topics folding
+ * onto one channel cannot silently displace each other's route and relabel one topic's traffic as
+ * the other's — crossing into a different topic's dedup and allowlist namespace — and so that a
+ * target that is not a channel id cannot reach the wire as `"undefined"` or a JSON blob.
+ */
+function requireUsableChannelMap(map: Record<string, string>): Record<string, string> {
   const owner = new Map<string, string>();
   for (const [topic, channel] of Object.entries(map)) {
+    if (typeof channel !== 'string' || channel.length === 0) {
+      throw new Error(
+        `Slack channel_map maps ${JSON.stringify(topic)} to ${JSON.stringify(channel)}, ` +
+          `which is not a channel id`,
+      );
+    }
     const prior = owner.get(channel);
     if (prior !== undefined) {
       throw new Error(
@@ -761,7 +838,7 @@ function requireDistinctChannels(map: Record<string, string>): Record<string, st
     }
     owner.set(channel, topic);
   }
-  return map;
+  return ownEntriesOnly(map);
 }
 
 /**

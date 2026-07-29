@@ -17,6 +17,7 @@ import {
   DEFAULT_DEADLINE_MS,
   MAX_BACKOFF_MS,
 } from '@sharptrick/parley-net-util';
+import { HISTORY_PAGE_LIMIT, MAX_HISTORY_PAGES } from '../src/index.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -121,5 +122,36 @@ describe('slack rate-limit docs track the shared helper', () => {
     const text = paragraph();
     expect(text).toMatch(/honoured\s+\*\*in full\*\*/);
     expect(text).not.toMatch(/`Retry-After`[\s\S]*honoured up to/);
+  });
+});
+
+/**
+ * CLASS: prose that quotes a number the source owns. The catch-up cost model is stated as a formula
+ * over the page size and the walk's page ceiling, and an operator sizes `catchup.limit` from it — so
+ * a change to either constant that leaves the paragraph behind is a wrong recommendation, not a typo.
+ */
+describe('slack catch-up docs track the figures the source sends', () => {
+  const readme = (): string => read('../README.md');
+
+  it('the stated page figure is the `limit` the source actually asks for', () => {
+    expect(readme()).toContain(`page = ${HISTORY_PAGE_LIMIT}`);
+  });
+
+  it('the walk ceiling and the operator recovery step are both documented', () => {
+    const text = readme();
+    expect(text).toContain(String(MAX_HISTORY_PAGES));
+    // A cap the cursor cannot advance past repeats on every catch-up, so the way out has to be in
+    // the README rather than in the reader's head.
+    expect(text).toMatch(/reset .*cursor|cursor .*reset/i);
+  });
+
+  it('states the tier that decides whether the page figure is honoured at all', () => {
+    // Both figures by value and both sides of the split: an operator cannot size `catchup.limit`
+    // from the cost model without knowing which allowance their app is on.
+    const text = readme();
+    expect(text).toMatch(/Marketplace/);
+    expect(text).toMatch(/15 objects per request/);
+    expect(text).toMatch(/one request per\s+minute/);
+    expect(text).toMatch(/internal,? customer-built app/i);
   });
 });

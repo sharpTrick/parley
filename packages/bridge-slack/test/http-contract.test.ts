@@ -354,6 +354,59 @@ describe('slack conversations.history paging terminates without the server’s h
     });
   }
 
+  /**
+   * CLASS: a termination guard that also has to be RECOVERABLE. Each guard above ends the walk by
+   * throwing, because a truncated walk must never publish a cursor above history it did not read — so
+   * the cursor cannot advance, and the same call is made again next catch-up. That is only acceptable
+   * if the guard is stateless: once the backlog fits, the very same `since` must make progress. A
+   * guard that latched, memoized or poisoned anything would leave the topic wedged forever.
+   */
+  const RECOVERABLE: Array<{ name: string; capped: Pager['next'] }> = [
+    { name: 'a repeated page cursor', capped: () => 'always-more' },
+    { name: 'a fresh cursor past the page ceiling', capped: (_arrived, hit) => `c${hit}` },
+  ];
+
+  for (const row of RECOVERABLE) {
+    it(`recovers with the same \`since\` once ${row.name} stops: the topic is not wedged`, async () => {
+      let capped = true;
+      let hit = 0;
+      const server = createServer((req, res) => {
+        void (async () => {
+          const arrived = new URLSearchParams(await readBody(req)).get('cursor') ?? undefined;
+          hit++;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              messages: [
+                { type: 'message', ts: '1700000000.000009', text: 'reachable', user: 'U0X' },
+              ],
+              response_metadata: { next_cursor: capped ? row.capped(arrived, hit) : '' },
+            }),
+          );
+        })();
+      });
+      const url = await listen(server);
+      const plugin = new SlackPlugin();
+      const args = { topic: asTopic('C0RECOVER'), since: asCursor('0'), limit: 10 };
+      try {
+        await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
+        await expect(plugin.fetchRecent(args)).rejects.toThrow(
+          /repeated page cursor|exceeded \d+ pages/,
+        );
+
+        // Same plugin, same `since`: nothing about the failure may persist into the next catch-up.
+        capped = false;
+        const recovered = await plugin.fetchRecent(args);
+        expect(recovered.messages.map((m) => m.content)).toEqual(['reachable']);
+        expect(String(recovered.nextCursor)).toBe('1700000000.000009');
+      } finally {
+        await plugin.disconnect();
+        await stop(server);
+      }
+    });
+  }
+
   it('a disconnect mid-walk ends it, and no further page is requested', async () => {
     const plugin = new SlackPlugin();
     let served = 0;
