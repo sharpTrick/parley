@@ -8,6 +8,12 @@
  *   - Channels must EXIST (`createChannel`) before they resolve; an unknown id answers
  *     `404 {"message":"Unknown Channel","code":10003}` exactly as Discord does, so the plugin's
  *     absent-topic mapping is exercised rather than papered over by an invented empty page.
+ *     `createChannel` takes the channel `type` (default `0`, a guild text channel), so a DM class
+ *     that can never carry push is representable.
+ *   - Every REST path REFUSES a request whose `Authorization` is not `Bot <token>` (`401`), the
+ *     gateway refuses an IDENTIFY without that token (4004) or missing a required intent (4014),
+ *     and `POST .../messages` refuses a body with no `allowed_mentions`. Keep those refusals here,
+ *     so that a plugin change which stops sending one loses a test instead of passing silently.
  *   - `GET /channels/:id/messages` honors `after` (EXCLUSIVE, BigInt compare), `before`
  *     (EXCLUSIVE, backward paging) and `limit` (1–100, else `400`), and returns the page
  *     NEWEST-FIRST — so the plugin's reverse-to-ascending is exercised.
@@ -22,9 +28,18 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
+import { REQUIRED_INTENTS } from '../src/intents.js';
 
 /** The fake's one bot account (`GET /users/@me`, and `author` on every stored message). */
-const BOT_USER = { id: '990000000000000001', username: 'parley-bot' };
+export const BOT_USER = { id: '990000000000000001', username: 'parley-bot' };
+
+/** The bot token the fake accepts unless `startFakeDiscord` is given another. */
+export const FAKE_TOKEN = 'fake-token';
+
+/** Discord channel types: a guild text channel, a DM, and a group DM. */
+export const GUILD_TEXT = 0;
+export const DM = 1;
+export const GROUP_DM = 3;
 
 /** Discord's hard cap on a bot message body. */
 export const CONTENT_LIMIT = 2000;
@@ -64,8 +79,13 @@ export interface FakeDiscord {
   apiUrl: string;
   /** Gateway websocket URL (also what `GET /gateway/bot` answers). */
   gatewayUrl: string;
-  /** Make a channel id resolvable. Ids that were never created answer 404 / code 10003. */
-  createChannel(id: string): void;
+  /**
+   * Make a channel id resolvable, as `type` (default {@link GUILD_TEXT}). Ids that were never
+   * created answer 404 / code 10003.
+   */
+  createChannel(id: string, type?: number): void;
+  /** Every `POST .../messages` body the fake accepted, oldest first. */
+  posts(): Array<{ channelId: string; body: Record<string, unknown> }>;
   /** Queue a scripted failure (or any response) for the next matching request(s). */
   injectFault(fault: FakeFault): void;
   /**
@@ -87,13 +107,16 @@ export interface FakeDiscord {
   close(): Promise<void>;
 }
 
-export async function startFakeDiscord(): Promise<FakeDiscord> {
+export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeDiscord> {
+  const token = opts?.token ?? FAKE_TOKEN;
   /** channel id → messages in arrival (= snowflake) order, oldest first. Absent = no such channel. */
   const channels = new Map<string, FakeMessage[]>();
+  const channelTypes = new Map<string, number>();
   /** Connected gateway sockets → { identified, per-socket dispatch seq }. */
   const sockets = new Map<WebSocket, { identified: boolean; seq: number }>();
   const faults: FakeFault[] = [];
   const requests: string[] = [];
+  const accepted: Array<{ channelId: string; body: Record<string, unknown> }> = [];
   let gatewayUrl = ''; // known after listen(); read lazily by the request handler
 
   const broadcast = (msg: FakeMessage): void => {
@@ -124,6 +147,10 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     requests.push(url.pathname + url.search);
 
+    if (req.headers.authorization !== `Bot ${token}`) {
+      return json(res, 401, { message: '401: Unauthorized', code: 0 });
+    }
+
     const fault = takeFault(url.pathname + url.search);
     if (fault !== undefined) {
       if (fault.rawBody !== undefined) {
@@ -141,6 +168,15 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
       return json(res, 200, BOT_USER);
     }
 
+    const one = /^\/api\/v10\/channels\/([^/]+)$/.exec(url.pathname);
+    if (one !== null && req.method === 'GET') {
+      const channelId = decodeURIComponent(one[1]!);
+      if (!channels.has(channelId)) {
+        return json(res, 404, { message: 'Unknown Channel', code: 10003 });
+      }
+      return json(res, 200, { id: channelId, type: channelTypes.get(channelId) ?? GUILD_TEXT });
+    }
+
     const m = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
     if (m !== null) {
       const channelId = decodeURIComponent(m[1]!);
@@ -151,8 +187,18 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
       if (req.method === 'POST') {
         const body = (await readJson(req)) as {
           content?: string;
+          allowed_mentions?: unknown;
           message_reference?: { message_id: string };
         };
+        // Absent `allowed_mentions` makes real Discord parse EVERY mention in `content`, so refuse
+        // the unbounded body here rather than accepting it and losing the blast-radius contract.
+        if (body.allowed_mentions === undefined) {
+          return json(res, 400, {
+            message: 'Invalid Form Body',
+            code: 50035,
+            errors: { allowed_mentions: { _errors: [{ code: 'MENTION_SCOPE_UNSPECIFIED' }] } },
+          });
+        }
         const content = body.content ?? '';
         if (content.length > CONTENT_LIMIT) {
           return json(res, 400, {
@@ -172,6 +218,7 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
             : {}),
         };
         list.push(msg);
+        accepted.push({ channelId, body: body as Record<string, unknown> });
         broadcast(msg);
         return json(res, 200, msg);
       }
@@ -209,6 +256,16 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
         return;
       }
       if (payload.op === 2) {
+        const d = (payload.d ?? {}) as { token?: unknown; intents?: unknown };
+        if (d.token !== token) {
+          ws.close(4004);
+          return;
+        }
+        const intents = typeof d.intents === 'number' ? d.intents : 0;
+        if (Object.values(REQUIRED_INTENTS).some((bit) => (intents & bit) === 0)) {
+          ws.close(4014);
+          return;
+        }
         state.identified = true;
         ws.send(
           JSON.stringify({
@@ -232,9 +289,11 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
   return {
     apiUrl: `http://127.0.0.1:${port}/api/v10`,
     gatewayUrl,
-    createChannel: (id: string) => {
+    createChannel: (id: string, type = GUILD_TEXT) => {
       if (!channels.has(id)) channels.set(id, []);
+      channelTypes.set(id, type);
     },
+    posts: () => [...accepted],
     injectFault: (fault: FakeFault) => faults.push({ ...fault }),
     deliver: (channelId, msg) => {
       const list = channels.get(channelId);

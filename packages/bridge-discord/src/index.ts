@@ -21,6 +21,9 @@ import {
   sanitizeBody,
 } from '@sharptrick/parley-net-util';
 import WebSocket from 'ws';
+import { INTENTS, REQUIRED_INTENTS } from './intents.js';
+
+export { REQUIRED_INTENTS } from './intents.js';
 
 /** Plugin-specific backend_config. */
 export interface DiscordBackendConfig {
@@ -44,6 +47,26 @@ export interface DiscordBackendConfig {
    * terminated and the attempt fails. Default 10000.
    */
   handshake_timeout_ms?: number;
+  /**
+   * How many bridge instances share this bot token AND open a gateway socket. Discord's
+   * 1000-IDENTIFY-per-24h quota is per BOT TOKEN, not per process, so the reconnect ceiling
+   * ({@link RECONNECT_CAP_MS}) is multiplied by this. Integer ≥ 1; default 1.
+   */
+  gateway_dialers?: number;
+  /**
+   * Mention scope for every `post`. Default `{ parse: ['users'], replied_user: false }` — widen it
+   * only deliberately: `@everyone`/`@here`/role pings reach the whole guild, and `post` content can
+   * be untrusted inbound text an agent relayed (DESIGN §14).
+   */
+  allowed_mentions?: AllowedMentions;
+}
+
+/** Discord's `allowed_mentions` object — the blast radius of a `post`'s mention markup. */
+export interface AllowedMentions {
+  parse?: string[];
+  users?: string[];
+  roles?: string[];
+  replied_user?: boolean;
 }
 
 /** A minimal Discord message object (the subset we read; REST and gateway share this shape). */
@@ -76,11 +99,20 @@ const OP = {
   HEARTBEAT_ACK: 11,
 } as const;
 
+/** The default mention scope of every `post` — see {@link DiscordBackendConfig.allowed_mentions}. */
+const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
+
 /**
- * GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT — without MESSAGE_CONTENT, content arrives empty.
- * MESSAGE_CONTENT is a PRIVILEGED intent: it must also be toggled on in the developer portal.
+ * Channel types that carry no `MESSAGE_CREATE` under this intent set (no `DIRECT_MESSAGES`), so a
+ * subscription on one can never deliver: DM (1) and group DM (3).
  */
-const INTENTS = (1 << 0) | (1 << 9) | (1 << 15);
+const UNPUSHABLE_CHANNEL_TYPES = new Map([
+  [1, 'a DM'],
+  [3, 'a group DM'],
+]);
+
+/** Discord REST error code for a channel that exists but this bot cannot access. */
+const MISSING_ACCESS = 50001;
 
 /**
  * Terminal Discord gateway close codes — authentication failed (4004), invalid/disallowed
@@ -101,12 +133,15 @@ const UNKNOWN_CHANNEL = 10003;
 const CONTENT_LIMIT = 2000;
 const PAGE_LIMIT = 100;
 
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 /**
- * Reconnect backoff ceiling. Keep it ABOVE 86.4s, so that a chronically flapping gateway stays
- * under Discord's 1000-IDENTIFY-per-24h quota — the penalty for exceeding it is a bot-token RESET,
- * which breaks every Parley instance sharing that bot until a human re-provisions it.
+ * Reconnect backoff ceiling FOR ONE DIALER. Keep it above 86.4s (= 86400s / 1000), so that a
+ * chronically flapping gateway stays under Discord's 1000-IDENTIFY-per-24h quota — the penalty for
+ * exceeding it is a bot-token RESET, which breaks every Parley instance sharing that bot until a
+ * human re-provisions it. The quota is per BOT TOKEN, so a fleet sharing one token multiplies this
+ * by `gateway_dialers`; keep them equal to the real fan-out, so that N instances flapping together
+ * still spend one token's budget.
  */
 export const RECONNECT_CAP_MS = 120_000;
 
@@ -149,6 +184,9 @@ export class DiscordPlugin implements BackendPlugin {
   /** Reverse of {@link channelMap}: channel id → the ONE topic that owns it. */
   private channelOwner = new Map<string, string>();
   private handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS;
+  /** {@link RECONNECT_CAP_MS} scaled by `gateway_dialers` — the fleet's share of ONE token's quota. */
+  private reconnectCapMs = RECONNECT_CAP_MS;
+  private allowedMentions: AllowedMentions = DEFAULT_ALLOWED_MENTIONS;
   private connected = false;
   private stopped = false;
   /**
@@ -219,6 +257,8 @@ export class DiscordPlugin implements BackendPlugin {
     this.channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
     this.channelOwner = requireDistinctChannels(this.channelMap);
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    this.reconnectCapMs = RECONNECT_CAP_MS * requireDialerCount(cfg.gateway_dialers);
+    this.allowedMentions = cfg.allowed_mentions ?? DEFAULT_ALLOWED_MENTIONS;
     this.fatalGateway = undefined;
     this.stopped = false;
     this.connected = true;
@@ -272,6 +312,7 @@ export class DiscordPlugin implements BackendPlugin {
     const res = await this.http('POST', `/channels/${encodeURIComponent(channelId)}/messages`, {
       body: {
         content,
+        allowed_mentions: this.allowedMentions,
         message_reference:
           opts?.inReplyTo !== undefined ? { message_id: opts.inReplyTo } : undefined,
       },
@@ -374,13 +415,7 @@ export class DiscordPlugin implements BackendPlugin {
     const res = await this.http('GET', path, { allowStatuses: [404] });
     if (res.status === 404) {
       const raw = await res.text().catch(() => '');
-      let code: unknown;
-      try {
-        code = (JSON.parse(raw) as { code?: number }).code;
-      } catch {
-        /* not JSON — not Unknown Channel either */
-      }
-      if (code === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
+      if (errorCode(raw) === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
       throw new Error(`Discord GET ${path} → 404: ${sanitizeBody(raw)}`);
     }
     return (await res.json()) as DiscordMessage[];
@@ -435,12 +470,61 @@ export class DiscordPlugin implements BackendPlugin {
    * established before this resolves; later subscribes just add their channel to the dispatch
    * map. Discord delivers a bot's own sends back as MESSAGE_CREATE, matching the other backends'
    * "including our own posts" live semantics.
+   *
+   * A TRANSIENT dial failure resolves rather than rejecting: the failed dial has already joined the
+   * reconnect ladder, the gateway carries only NEW messages, and catch-up owns history — so a
+   * subscription that goes live a backoff later loses nothing, while a rejection fails core's
+   * attach and takes the REST half of the bridge down with it. A TERMINAL close still rejects,
+   * because only a human can fix the token or the portal toggle.
+   *
+   * The channel is then checked once over REST, so that an id that can never deliver (typo'd,
+   * deleted, not invited, or a DM) is a line on stderr instead of a permanently idle bridge.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
     const channelId = this.channelId(topic);
     this.subs.set(channelId, { topic, handler });
-    await this.ensureGateway();
+    try {
+      await this.ensureGateway();
+    } catch (err) {
+      if (err instanceof TerminalGatewayCloseError) throw err;
+      process.stderr.write(
+        `parley-discord: live push for topic ${JSON.stringify(topic as string)} is not up yet ` +
+          `(${err instanceof Error ? err.message : String(err)}); the reconnect ladder is retrying\n`,
+      );
+    }
+    await this.requirePushableChannel(topic, channelId);
+  }
+
+  /**
+   * `GET /channels/<id>`, once per subscribed channel: an id Discord does not know becomes the
+   * seam's absent topic (core skips it with a diagnostic), and one that exists but cannot carry
+   * push — no access, or a DM class this intent set never receives — throws naming the channel and
+   * the reason.
+   */
+  private async requirePushableChannel(topic: Topic, channelId: string): Promise<void> {
+    const path = `/channels/${encodeURIComponent(channelId)}`;
+    const res = await this.http('GET', path, { allowStatuses: [403, 404] });
+    if (res.status === 403 || res.status === 404) {
+      const raw = await res.text().catch(() => '');
+      const code = errorCode(raw);
+      if (code === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
+      throw new Error(
+        code === MISSING_ACCESS
+          ? `Discord channel ${channelId} exists but this bot cannot access it (50001 Missing ` +
+            'Access) — invite the bot and grant View Channels / Read Message History'
+          : `Discord GET ${path} → ${res.status}: ${sanitizeBody(raw)}`,
+      );
+    }
+    const { type } = (await res.json()) as { type?: number };
+    const unpushable = type === undefined ? undefined : UNPUSHABLE_CHANNEL_TYPES.get(type);
+    if (unpushable !== undefined) {
+      throw new Error(
+        `Discord channel ${channelId} is ${unpushable} (type ${type}); the intent set is ` +
+          'GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT with no DIRECT_MESSAGES, so it receives no ' +
+          'live push — map this topic to a guild channel instead',
+      );
+    }
   }
 
   /**
@@ -458,11 +542,8 @@ export class DiscordPlugin implements BackendPlugin {
       const epoch = this.sessionEpoch;
       this.gatewayReady = this.openGateway().catch((err) => {
         // Keep clearing the memo here, so that one failed dial does not wedge every later caller
-        // on a rejected promise; the budget it just charged is what paces the retry.
-        if (epoch === this.sessionEpoch) {
-          this.gatewayReady = undefined;
-          this.chargeDialAttempt();
-        }
+        // on a rejected promise; the ladder openGateway just joined is what paces the retry.
+        if (epoch === this.sessionEpoch) this.gatewayReady = undefined;
         throw err;
       });
     }
@@ -484,7 +565,7 @@ export class DiscordPlugin implements BackendPlugin {
    * the backoff ladder regardless of who initiated it.
    */
   private chargeDialAttempt(): number {
-    const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, RECONNECT_CAP_MS);
+    const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, this.reconnectCapMs);
     const jitter = Math.floor(Math.random() * BACKOFF_JITTER_MS);
     const wait = Math.max(this.invalidSessionWaitMs, backoff + jitter);
     this.invalidSessionWaitMs = 0;
@@ -539,14 +620,33 @@ export class DiscordPlugin implements BackendPlugin {
     }
   }
 
-  /** Resolve the gateway wss URL (config override for tests/fakes; else `GET /gateway/bot`). */
+  /**
+   * Resolve the gateway wss URL (config override for tests/fakes; else `GET /gateway/bot`) and dial
+   * it. A failed FIRST dial joins the same backoff-and-reopen loop every later outage uses — keep
+   * it there, so that the outage most likely at process start is not the one case with no in-plugin
+   * recovery.
+   */
   private async openGateway(): Promise<void> {
-    let url = this.gatewayUrlOverride;
-    if (url === undefined) {
-      const res = await this.http('GET', '/gateway/bot');
-      url = ((await res.json()) as { url: string }).url;
+    const epoch = this.sessionEpoch;
+    let url: string;
+    try {
+      url = this.gatewayUrlOverride ?? (await this.resolveGatewayUrl());
+    } catch (err) {
+      this.chargeDialAttempt();
+      throw err;
     }
-    await this.openSocket(url);
+    try {
+      await this.openSocket(url);
+    } catch (err) {
+      if (err instanceof TerminalGatewayCloseError) this.chargeDialAttempt();
+      else this.scheduleReconnect(url, epoch);
+      throw err;
+    }
+  }
+
+  private async resolveGatewayUrl(): Promise<string> {
+    const res = await this.http('GET', '/gateway/bot');
+    return ((await res.json()) as { url: string }).url;
   }
 
   /**
@@ -730,10 +830,16 @@ export class DiscordPlugin implements BackendPlugin {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.stopped || epoch !== this.sessionEpoch) return;
-      void this.openSocket(url).catch((err) => {
-        if (err instanceof TerminalGatewayCloseError) return; // fatal — don't restart the storm
-        this.scheduleReconnect(url, epoch);
+      // Dial through the memo every other caller awaits, so that a re-entrant caller (core's 250 ms
+      // long-poll fallback) cannot open a second socket alongside this one and double the IDENTIFY
+      // rate the ladder is pacing.
+      const dial = this.openSocket(url).catch((err: unknown) => {
+        if (epoch === this.sessionEpoch) this.gatewayReady = undefined;
+        if (!(err instanceof TerminalGatewayCloseError)) this.scheduleReconnect(url, epoch);
+        throw err;
       });
+      this.gatewayReady = dial;
+      void dial.catch(() => undefined);
     }, wait);
   }
 
@@ -790,6 +896,32 @@ function requireDistinctChannels(map: Map<string, string>): Map<string, string> 
     owner.set(channel, topic);
   }
   return owner;
+}
+
+/** Discord's numeric error code from a JSON error body, or undefined when the body is not one. */
+function errorCode(raw: string): number | undefined {
+  try {
+    const { code } = JSON.parse(raw) as { code?: number };
+    return typeof code === 'number' ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reject a `gateway_dialers` that is not an integer ≥ 1. It divides ONE bot token's IDENTIFY quota,
+ * so a zero or fractional value silently shrinks the reconnect ceiling instead of widening it, and
+ * the penalty for overrunning the quota is a token RESET.
+ */
+function requireDialerCount(value: number | undefined): number {
+  if (value === undefined) return 1;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(
+      `Discord gateway_dialers must be an integer >= 1 (how many instances share this bot ` +
+        `token and open a gateway socket); got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
 }
 
 /** Settle with `p`, or reject at `ms` — the caller's budget, not the callee's, wins. */

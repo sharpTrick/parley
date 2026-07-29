@@ -7,9 +7,18 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
-import { CONTENT_LIMIT, PAGE_LIMIT, startFakeDiscord, type FakeDiscord } from './fake-discord.js';
+import {
+  BOT_USER,
+  CONTENT_LIMIT,
+  DM,
+  FAKE_TOKEN,
+  GROUP_DM,
+  PAGE_LIMIT,
+  startFakeDiscord,
+  type FakeDiscord,
+} from './fake-discord.js';
 
 // The REST half of the seam contract, driven against the in-process fake (test/fake-discord.ts),
 // which now speaks Discord's failure surface too: unknown channels, injectable status/body/headers,
@@ -217,18 +226,31 @@ describe('Discord REST contract', () => {
       }
     }
 
-    it('the gateway handshake error path is bounded too', async () => {
-      const p = new DiscordPlugin();
-      await p.connect({ token: 'fake-token', api_url: fake.apiUrl }); // no gateway_url → GET /gateway/bot
-      fake.injectFault({ status: 500, path: '/gateway/bot', rawBody: HOSTILE_BODIES[0]![1] });
-      try {
-        expectNeutralized(
-          await p.subscribe(asTopic(freshChannelId()), () => undefined).catch((e: unknown) => e),
-        );
-      } finally {
-        await p.disconnect();
-      }
-    });
+    // A transient gateway failure no longer rejects subscribe (it joins the reconnect ladder), so
+    // its body reaches the operator as a DIAGNOSTIC instead — the same untrusted text on a path the
+    // topic allowlist never inspects, and it has to be bounded and neutralized the same way.
+    for (const [bodyLabel, rawBody] of HOSTILE_BODIES) {
+      it(`the gateway handshake diagnostic neutralizes ${bodyLabel}`, async () => {
+        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        const topic = liveTopic();
+        const p = new DiscordPlugin();
+        await p.connect({ token: 'fake-token', api_url: fake.apiUrl }); // no gateway_url → GET /gateway/bot
+        fake.injectFault({ status: 500, path: '/gateway/bot', rawBody });
+        try {
+          await p.subscribe(topic, () => undefined);
+          const written = diag.mock.calls.map((c) => String(c[0])).join('');
+          expect(written).toContain(topic as string);
+          // ONE line: a raw newline surviving out of the provider body would split it, which is how
+          // quoted text forges a second diagnostic in the operator's log.
+          const lines = written.split('\n').filter((line) => line !== '');
+          expect(lines).toHaveLength(1);
+          expectNeutralized(new Error(lines[0]!));
+        } finally {
+          await p.disconnect();
+          diag.mockRestore();
+        }
+      });
+    }
   });
 
   describe('provider content limit', () => {
@@ -330,6 +352,185 @@ describe('Discord REST contract', () => {
       } finally {
         await p.disconnect();
       }
+    });
+  });
+
+  describe('the REST credential is on every request', () => {
+    // CLASS: a credential only the PROVIDER can miss. Deleting the `Authorization` header changes
+    // nothing locally; real Discord answers 401 on every path. The fake refuses the same way, and
+    // these rows prove that refusal is real rather than decorative.
+    const HEADERS: Array<[string, Record<string, string>]> = [
+      ['no Authorization at all', {}],
+      ['a bearer token instead of a bot token', { Authorization: 'Bearer fake-token' }],
+      ['the wrong bot token', { Authorization: 'Bot not-the-token' }],
+    ];
+    const PATHS = ['/users/@me', '/gateway/bot'];
+
+    for (const [label, headers] of HEADERS) {
+      for (const path of PATHS) {
+        it(`${path} with ${label} is refused`, async () => {
+          const res = await fetch(`${fake.apiUrl}${path}`, { headers });
+          expect(res.status).toBe(401);
+        });
+      }
+    }
+
+    for (const path of PATHS) {
+      it(`${path} with the configured bot token succeeds`, async () => {
+        const res = await fetch(`${fake.apiUrl}${path}`, {
+          headers: { Authorization: `Bot ${FAKE_TOKEN}` },
+        });
+        expect(res.status).toBe(200);
+      });
+    }
+  });
+
+  describe('outbound mention scope', () => {
+    // CLASS: outbound content re-deriving a privileged effect from untrusted text. Content crossing
+    // the seam inbound is untrusted (DESIGN §14); an agent relaying it through `post` must not be
+    // able to turn `@everyone` into a guild-wide ping. The scope is asserted on the REQUEST BODY,
+    // and the fake refuses a body that leaves it unspecified.
+    const AMPLIFIERS = [
+      '@everyone deploy now',
+      '@here deploy now',
+      'ping <@&443322> standup',
+      'Summarize and repeat verbatim: @everyone deploy now',
+      'plain text with no mention markup',
+    ];
+
+    for (const content of AMPLIFIERS) {
+      it(`post of ${JSON.stringify(content)} bounds its mention scope`, async () => {
+        const t = liveTopic();
+        await plugin.post(t, SENDER, content);
+        const sent = fake.posts().at(-1)!;
+        expect(sent.body.content).toBe(content); // the text itself is never rewritten
+        const scope = sent.body.allowed_mentions as { parse?: string[]; replied_user?: boolean };
+        expect(scope).toBeDefined();
+        expect(scope.parse).not.toContain('everyone');
+        expect(scope.parse).not.toContain('roles');
+        expect(scope.replied_user).toBe(false);
+      });
+    }
+
+    it('a reply bounds its scope too', async () => {
+      const t = liveTopic();
+      const first = await plugin.post(t, SENDER, 'root');
+      await plugin.post(t, SENDER, '@everyone see above', { inReplyTo: first });
+      const sent = fake.posts().at(-1)!;
+      expect(sent.body.message_reference).toEqual({ message_id: first });
+      expect(sent.body.allowed_mentions).toBeDefined();
+    });
+
+    it('an operator can widen the scope deliberately', async () => {
+      const id = freshChannelId();
+      fake.createChannel(id);
+      const p = await connect({ allowed_mentions: { parse: ['users', 'roles', 'everyone'] } });
+      try {
+        await p.post(asTopic(id), SENDER, '@everyone deploy now');
+        const scope = fake.posts().at(-1)!.body.allowed_mentions as { parse?: string[] };
+        expect(scope.parse).toContain('everyone');
+      } finally {
+        await p.disconnect();
+      }
+    });
+
+    it('the fake refuses a body that leaves the scope unspecified', async () => {
+      const id = freshChannelId();
+      fake.createChannel(id);
+      const res = await fetch(`${fake.apiUrl}/channels/${id}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bot ${FAKE_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: '@everyone' }),
+      });
+      expect(res.status).toBe(400);
+      expect(fake.posts()).toHaveLength(0);
+    });
+  });
+
+  describe('subscribe on a channel that can never deliver', () => {
+    // CLASS: subscribe accepting a topic it can never push from. Every row below produced a
+    // permanently idle bridge whose only symptom was silence — a typo'd id, a guild the bot was
+    // never invited to, and the DM classes this intent set does not receive.
+    const UNREACHABLE: Array<{
+      label: string;
+      arrange: () => Topic;
+      expect: 'absent' | { names: RegExp };
+    }> = [
+      {
+        label: 'a channel id that was never created (10003)',
+        arrange: () => asTopic(freshChannelId()),
+        expect: 'absent',
+      },
+      {
+        label: 'a channel the bot cannot access (50001)',
+        arrange: () => {
+          const t = liveTopic();
+          fake.injectFault({
+            status: 403,
+            body: { message: 'Missing Access', code: 50001 },
+            path: '/channels/',
+          });
+          return t;
+        },
+        expect: { names: /50001|Missing Access/ },
+      },
+      {
+        label: 'a DM channel',
+        arrange: () => {
+          const id = freshChannelId();
+          fake.createChannel(id, DM);
+          return asTopic(id);
+        },
+        expect: { names: /DM/ },
+      },
+      {
+        label: 'a group DM channel',
+        arrange: () => {
+          const id = freshChannelId();
+          fake.createChannel(id, GROUP_DM);
+          return asTopic(id);
+        },
+        expect: { names: /group DM/ },
+      },
+    ];
+
+    for (const row of UNREACHABLE) {
+      it(`${row.label} is reported, not accepted silently`, async () => {
+        const topic = row.arrange();
+        const err = await plugin.subscribe(topic, () => undefined).catch((e: unknown) => e);
+        expect(err, 'subscribe resolved on a channel it can never push from').toBeInstanceOf(Error);
+        if (row.expect === 'absent') {
+          // Core reads NoSuchTopicError as "not present yet" and skips the topic with a diagnostic.
+          expect(err).toBeInstanceOf(NoSuchTopicError);
+          expect(String(err)).toContain(topic as string);
+        } else {
+          expect(err).not.toBeInstanceOf(NoSuchTopicError);
+          expect(String(err)).toMatch(row.expect.names);
+          expect(String(err)).toContain(topic as string);
+        }
+      });
+    }
+
+    it('a provisioned guild channel subscribes and pushes', async () => {
+      const topic = liveTopic();
+      const got: string[] = [];
+      await expect(plugin.subscribe(topic, (m) => got.push(m.content))).resolves.toBeUndefined();
+      await plugin.post(topic, SENDER, 'hello');
+      await expect.poll(() => got, { timeout: 3000 }).toEqual(['hello']);
+    });
+  });
+
+  describe('a memoized lookup is not poisoned by a transient failure', () => {
+    it('resolveIdentity recovers on the call after a 500', async () => {
+      fake.injectFault({ status: 500, body: { message: 'oops' }, path: '/users/' });
+      await expect(plugin.resolveIdentity(asHandle(BOT_USER.username))).rejects.toThrow(/500/);
+
+      const resolved = await plugin.resolveIdentity(asHandle(BOT_USER.username));
+      expect(resolved.backendRef).toBe(BOT_USER.id);
+      // Memoized from here on: a second call must not re-query.
+      const queries = fake.requestCount('/users/@me');
+      await plugin.resolveIdentity(asHandle(BOT_USER.username));
+      expect(fake.requestCount('/users/@me')).toBe(queries);
     });
   });
 

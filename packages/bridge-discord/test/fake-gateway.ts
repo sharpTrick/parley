@@ -8,7 +8,13 @@
  * Every socket the plugin opens lands in {@link instances}; {@link state.onIdentify} scripts what
  * the "server" does when a socket sends op 2, which is where close codes, stalls and flaps are
  * driven from. Module state is per test FILE — call {@link resetGateway} in `beforeEach`.
+ *
+ * Like the real gateway, it REFUSES an IDENTIFY that does not carry the expected bot token (4004)
+ * or that is missing a required intent bit (4014) — keep those checks ahead of
+ * {@link state.onIdentify}, so that a plugin change which stops sending either cannot be scripted
+ * past them.
  */
+import { REQUIRED_INTENTS } from '../src/intents.js';
 
 export class FakeWs {
   static readonly OPEN = 1;
@@ -37,7 +43,17 @@ export class FakeWs {
     const frame = JSON.parse(String(data)) as { op: number; d?: unknown };
     this.sent.push(frame);
     if (frame.op === 2) {
-      state.onIdentify(this); // IDENTIFY
+      const d = (frame.d ?? {}) as { token?: unknown; intents?: unknown };
+      if (d.token !== state.expectToken) {
+        this.serverClose(4004);
+        return;
+      }
+      const intents = typeof d.intents === 'number' ? d.intents : 0;
+      if (state.requiredIntents.some((bit) => (intents & bit) === 0)) {
+        this.serverClose(4014);
+        return;
+      }
+      state.onIdentify(this);
       return;
     }
     if (frame.op === 1 && this.ackHeartbeats && this.readyState === FakeWs.OPEN) {
@@ -96,16 +112,27 @@ export class FakeWs {
 /** Every socket the plugin has opened, oldest first. */
 export const instances: FakeWs[] = [];
 
+/** The token every `vi.mock('ws')` suite connects with; the fake refuses any other. */
+export const FAKE_TOKEN = 't';
+
 /**
- * What the fake server does when a socket sends op 2 IDENTIFY (default: ack with READY), and
- * whether `close` events are delivered inline or a macrotask later (see {@link FakeWs.emitClose}).
+ * What the fake server does when a socket sends an ACCEPTED op 2 IDENTIFY (default: ack with
+ * READY), the credential and capability bits it demands on that frame, and whether `close` events
+ * are delivered inline or a macrotask later (see {@link FakeWs.emitClose}).
  */
-export const state = { onIdentify: (ws: FakeWs) => ws.ready(), asyncClose: false };
+export const state = {
+  onIdentify: (ws: FakeWs) => ws.ready(),
+  asyncClose: false,
+  expectToken: FAKE_TOKEN as unknown,
+  requiredIntents: Object.values(REQUIRED_INTENTS) as number[],
+};
 
 export function resetGateway(): void {
   instances.length = 0;
   state.onIdentify = (ws: FakeWs) => ws.ready();
   state.asyncClose = false;
+  state.expectToken = FAKE_TOKEN;
+  state.requiredIntents = Object.values(REQUIRED_INTENTS);
 }
 
 /** IDENTIFYs sent across ALL sockets — the quantity Discord's 1000/24h quota counts. */

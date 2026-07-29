@@ -48,6 +48,9 @@ describe('Discord long-poll while the live transport is…', () => {
     const pending = plugin.subscribe(TOPIC, () => undefined);
     const ws = instances.at(-1)!;
     ws.hello(HUGE_HB);
+    // Keep this ahead of `await pending`, so that subscribe's channel check can read its stubbed
+    // REST body: under fake timers a faked immediate drives the body stream.
+    await vi.advanceTimersByTimeAsync(0);
     await pending;
     return ws;
   };
@@ -226,6 +229,7 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
         const pendingSub = plugin.subscribe(TOPIC, () => undefined);
         const first = instances.at(-1)!;
         first.hello(HUGE_HB);
+        await vi.advanceTimersByTimeAsync(0);
         await pendingSub;
 
         const driven = new Set(instances);
@@ -301,6 +305,9 @@ describe('Discord long-poll: a wakeup arriving', () => {
     const pending = plugin.subscribe(TOPIC, () => undefined);
     const ws = instances.at(-1)!;
     ws.hello(HUGE_HB);
+    // Keep this ahead of `await pending`, so that subscribe's channel check can read its stubbed
+    // REST body: under fake timers a faked immediate drives the body stream.
+    await vi.advanceTimersByTimeAsync(0);
     await pending;
     return ws;
   };

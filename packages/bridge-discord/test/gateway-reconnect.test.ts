@@ -13,6 +13,7 @@ vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs
 import {
   BACKOFF_BASE_MS,
   BACKOFF_JITTER_MS,
+  DEFAULT_HANDSHAKE_TIMEOUT_MS,
   DiscordPlugin,
   INVALID_SESSION_MIN_WAIT_MS,
   INVALID_SESSION_SPREAD_MS,
@@ -20,6 +21,7 @@ import {
   STABLE_CONNECTION_MS,
 } from '../src/index.js';
 import { FakeWs, instances, resetGateway, state, totalIdentifies } from './fake-gateway.js';
+import { dialCeiling, dialPump } from './ladder.js';
 
 const gw = { instances, state, FakeWs };
 
@@ -30,7 +32,11 @@ const HUGE_HB = 1_000_000; // large enough that the heartbeat interval never fir
  */
 const NO_HANDSHAKE_TIMEOUT = 10_000_000;
 
-/** Open the shared socket and drive HELLO→IDENTIFY→READY on the freshly created FakeWs. */
+/**
+ * Open the shared socket and drive HELLO→IDENTIFY→READY on the freshly created FakeWs. Keep the
+ * timer tick before `await pending`, so that `subscribe`'s channel check can read its stubbed REST
+ * body — under fake timers the body stream is driven by a faked immediate, so awaiting first hangs.
+ */
 async function reachReady(
   plugin: DiscordPlugin,
   topic: Topic,
@@ -39,6 +45,7 @@ async function reachReady(
   const pending = plugin.subscribe(topic, opts?.handler ?? (() => undefined));
   const ws = gw.instances.at(-1)!; // created synchronously inside subscribe()→openSocket
   ws.hello(opts?.hb ?? HUGE_HB);
+  await vi.advanceTimersByTimeAsync(0);
   await pending;
   return ws;
 }
@@ -47,13 +54,24 @@ async function reachReady(
 const setTimeoutDelays = (spy: ReturnType<typeof vi.spyOn>): number[] =>
   spy.mock.calls.map((c) => c[1] as number).filter((d) => d !== NO_HANDSHAKE_TIMEOUT);
 
+/** REST is irrelevant to these cases; every call answers an empty page immediately. */
+const stubFetch = (): void => {
+  vi.stubGlobal('fetch', () =>
+    Promise.resolve(
+      new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),
+    ),
+  );
+};
+
 describe('Discord gateway reconnect & liveness', () => {
   beforeEach(() => {
     resetGateway();
+    stubFetch();
     vi.useFakeTimers();
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -262,15 +280,6 @@ function track<T>(p: Promise<T>): { settled: boolean; error?: unknown } {
   return state;
 }
 
-/** REST is irrelevant to these cases; every call answers an empty page immediately. */
-const stubFetch = (): void => {
-  vi.stubGlobal('fetch', () =>
-    Promise.resolve(
-      new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),
-    ),
-  );
-};
-
 describe('Discord gateway handshake never completes', () => {
   const HANDSHAKE = 3000;
   const BLOCK = 200;
@@ -284,26 +293,23 @@ describe('Discord gateway handshake never completes', () => {
     { label: 'READY arrives normally', identifyReplies: true, sendHello: true },
   ];
 
-  const ENTRIES: Array<{
-    label: string;
-    budget: number;
-    run: (p: DiscordPlugin) => Promise<unknown>;
-    stallOutcome: 'reject' | 'resolve';
-  }> = [
-    {
-      label: 'subscribe',
-      budget: HANDSHAKE,
-      run: (p) => p.subscribe(asTopic('900001'), () => undefined),
-      stallOutcome: 'reject',
-    },
-    {
-      label: 'fetchRecent(blockMs)',
-      budget: BLOCK,
-      run: (p) =>
-        p.fetchRecent({ topic: asTopic('900001'), since: asCursor('1'), blockMs: BLOCK }),
-      stallOutcome: 'resolve',
-    },
-  ];
+  // Both entry points RESOLVE on a stall: a stalled handshake is transient, the failed dial is
+  // already on the reconnect ladder, and the gateway carries only new messages — so neither call
+  // has anything to report but the diagnostic. Only a TERMINAL close rejects (its own suite below).
+  const ENTRIES: Array<{ label: string; budget: number; run: (p: DiscordPlugin) => Promise<unknown> }> =
+    [
+      {
+        label: 'subscribe',
+        budget: HANDSHAKE,
+        run: (p) => p.subscribe(asTopic('900001'), () => undefined),
+      },
+      {
+        label: 'fetchRecent(blockMs)',
+        budget: BLOCK,
+        run: (p) =>
+          p.fetchRecent({ topic: asTopic('900001'), since: asCursor('1'), blockMs: BLOCK }),
+      },
+    ];
 
   beforeEach(() => {
     resetGateway();
@@ -329,20 +335,24 @@ describe('Discord gateway handshake never completes', () => {
           handshake_timeout_ms: HANDSHAKE,
         });
 
+        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
         const state = track(entry.run(plugin));
         const ws = gw.instances.at(-1);
         if (stall.sendHello) ws?.hello(HUGE_HB);
 
         await vi.advanceTimersByTimeAsync(entry.budget * 2 + 500);
         expect(state.settled).toBe(true);
+        expect(state.error).toBeUndefined();
 
-        const stalled = !stall.identifyReplies;
-        if (stalled && entry.stallOutcome === 'reject') {
-          expect(state.error).toBeInstanceOf(Error);
-          expect(String(state.error)).toMatch(/handshake|READY/i);
+        // Only the subscribe row's budget IS the handshake budget; the blocking fetch hands its own
+        // (shorter) budget back long before the watchdog fires, which is the point of its row.
+        if (!stall.identifyReplies && entry.label === 'subscribe') {
           expect(ws?.terminated).toBe(true); // the dead socket is not left dangling
-        } else {
-          expect(state.error).toBeUndefined();
+          // A stall that resolves silently is the idle-bridge failure: subscribe owes the operator
+          // a line naming the topic it could not bring up.
+          const written = diag.mock.calls.map((c) => String(c[0])).join('');
+          expect(written).toContain('900001');
+          expect(written).toMatch(/handshake|READY/i);
         }
 
         await plugin.disconnect();
@@ -350,50 +360,137 @@ describe('Discord gateway handshake never completes', () => {
     }
   }
 
-  it('a stalled first open uses the default handshake timeout when none is configured', async () => {
+  it(`a stalled first open uses the default handshake timeout (${DEFAULT_HANDSHAKE_TIMEOUT_MS}ms) when none is configured`, async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     gw.state.onIdentify = () => undefined;
     const plugin = new DiscordPlugin();
     await plugin.connect({ token: 't', gateway_url: 'ws://fake' });
 
     const state = track(plugin.subscribe(asTopic('900002'), () => undefined));
-    gw.instances.at(-1)!.hello(HUGE_HB);
+    const ws = gw.instances.at(-1)!;
+    ws.hello(HUGE_HB);
 
-    await vi.advanceTimersByTimeAsync(60_000);
+    // Pinned to the exported default on BOTH sides: a shorter watchdog would fire early, a longer
+    // one (or none) would leave the call parked.
+    await vi.advanceTimersByTimeAsync(DEFAULT_HANDSHAKE_TIMEOUT_MS - 1);
+    expect(state.settled, 'the default watchdog fired early').toBe(false);
+    expect(ws.terminated).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(2);
+    expect(ws.terminated).toBe(true);
     expect(state.settled).toBe(true);
-    expect(state.error).toBeInstanceOf(Error);
 
     await plugin.disconnect();
   });
 
-  it('a handshake that stalls mid-reconnect retries instead of wedging the socket', async () => {
-    /** Advance time, HELLOing each freshly opened socket so the handshake actually starts. */
-    const pump = async (steps: number): Promise<void> => {
-      for (let i = 0; i < steps; i++) {
-        await vi.advanceTimersByTimeAsync(1000);
-        const ws = gw.instances.at(-1)!;
-        if (ws.readyState === gw.FakeWs.OPEN && ws.sent.length === 0) ws.hello(HUGE_HB);
-      }
-    };
+});
 
-    const plugin = new DiscordPlugin();
-    await plugin.connect({ token: 't', gateway_url: 'ws://fake', handshake_timeout_ms: HANDSHAKE });
-    const ws0 = await reachReady(plugin, asTopic('900003'));
+// A recovery loop that only covers the STEADY state is the defect this table exists for: the outage
+// most likely at process start is the first dial, and a ladder wired only into the post-READY close
+// path leaves that one case with no in-plugin retry at all. So the cells are over WHEN the failure
+// lands, not just how it fails, and each transient cell asserts recovery both ways — the plugin
+// re-dials on its own within the ladder's own bound, and live push works once the gateway heals.
+describe('Discord gateway recovery, whenever the failure lands', () => {
+  const HANDSHAKE = 3000;
+  const TOPIC = asTopic('910001');
+  /**
+   * Keep the pump step BELOW `handshake_timeout_ms`, so that a freshly dialed socket is driven before
+   * the watchdog terminates it — a coarser step turns every scripted failure into a handshake
+   * timeout and the cells stop testing what they name.
+   */
+  const STEP_MS = 1000;
+  /** Enough steps for several rungs of the 1s→2s→4s… ladder while the gateway stays broken. */
+  const BROKEN_STEPS = 16;
+  /** Once healed the ladder already sits several rungs up, so the wait has to clear a whole rung. */
+  const HEAL_STEPS = 240;
 
-    gw.state.onIdentify = () => undefined; // every attempt now stalls after IDENTIFY
-    ws0.serverClose(1006);
-    await pump(30);
-    const attemptsWhileStalled = gw.instances.length;
-    expect(attemptsWhileStalled).toBeGreaterThanOrEqual(3); // a timed-out handshake keeps retrying
+  const PHASES = ['the first dial', 'after READY', 'mid-reconnect'] as const;
 
-    gw.state.onIdentify = (ws: FakeWs) => ws.ready(); // the gateway recovers
-    await pump(30);
-    const healthy = gw.instances.at(-1)!;
-    expect(healthy.readyState).toBe(gw.FakeWs.OPEN);
-    expect(healthy.terminated).toBe(false);
-    expect(healthy.sent.some((f) => f.op === 2)).toBe(true);
+  const FAILURES: Array<{ label: string; terminal: boolean; onIdentify: (ws: FakeWs) => void }> = [
+    { label: 'a close before READY', terminal: false, onIdentify: (ws) => ws.serverClose(1006) },
+    { label: 'a handshake stall', terminal: false, onIdentify: () => undefined },
+    { label: 'a terminal close', terminal: true, onIdentify: (ws) => ws.serverClose(4014) },
+  ];
 
-    await plugin.disconnect();
+  beforeEach(() => {
+    resetGateway();
+    stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.useFakeTimers();
   });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (const phase of PHASES) {
+    for (const failure of FAILURES) {
+      it(`${failure.label} on ${phase}`, async () => {
+        const pump = dialPump((ms) => vi.advanceTimersByTimeAsync(ms), HUGE_HB);
+        const plugin = new DiscordPlugin();
+        await plugin.connect({
+          token: 't',
+          gateway_url: 'ws://fake',
+          handshake_timeout_ms: HANDSHAKE,
+        });
+        const got: string[] = [];
+        const handler = (m: { content: string }): void => got.push(m.content);
+
+        if (phase === 'the first dial') {
+          gw.state.onIdentify = failure.onIdentify;
+          void plugin.subscribe(TOPIC, handler).catch(() => undefined);
+          await pump(2, STEP_MS);
+        } else {
+          const ws0 = await reachReady(plugin, TOPIC, { handler });
+          gw.state.onIdentify = failure.onIdentify;
+          ws0.serverClose(1006);
+          await pump(phase === 'mid-reconnect' ? BROKEN_STEPS : 2, STEP_MS);
+        }
+        const dialsWhileBroken = gw.instances.length;
+
+        if (failure.terminal) {
+          // Fatal by design: it needs a human, so the loop must STOP rather than keep dialing.
+          await pump(BROKEN_STEPS + HEAL_STEPS, STEP_MS);
+          expect(gw.instances.length).toBe(dialsWhileBroken);
+          await plugin.disconnect();
+          return;
+        }
+
+        await pump(BROKEN_STEPS, STEP_MS);
+        expect(gw.instances.length, 'the plugin never re-dialed on its own').toBeGreaterThan(
+          dialsWhileBroken,
+        );
+        const brokenWindowMs = 2 * BROKEN_STEPS * STEP_MS;
+        expect(gw.instances.length).toBeLessThanOrEqual(dialCeiling(brokenWindowMs));
+
+        gw.state.onIdentify = (ws: FakeWs) => ws.ready(); // the gateway comes back
+        const healedFrom = gw.instances.length;
+        await pump(HEAL_STEPS, STEP_MS);
+        const live = gw.instances
+          .slice(healedFrom)
+          .find((ws) => ws.readyState === gw.FakeWs.OPEN && ws.identified());
+        expect(live, 'no socket reached IDENTIFY after the gateway healed').toBeDefined();
+
+        live!.serverSend({
+          op: 0,
+          t: 'MESSAGE_CREATE',
+          s: 11,
+          d: {
+            id: '910500',
+            channel_id: TOPIC as string,
+            content: 'back-online',
+            timestamp: '',
+            author: { id: '1', username: 'u' },
+          },
+        });
+        expect(got, 'live push did not resume after the gateway healed').toEqual(['back-online']);
+
+        await plugin.disconnect();
+      });
+    }
+  }
 });
 
 describe('Discord gateway terminal failures are never invisible', () => {
@@ -401,10 +498,12 @@ describe('Discord gateway terminal failures are never invisible', () => {
 
   beforeEach(() => {
     resetGateway();
+    stubFetch();
     vi.useFakeTimers();
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -473,10 +572,12 @@ describe('Discord IDENTIFY budget under sustained flapping', () => {
 
   beforeEach(() => {
     resetGateway();
+    stubFetch();
     vi.useFakeTimers();
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -525,11 +626,13 @@ describe('Discord backoff constants are the ones the code applies', () => {
   // computes with. Assert both against the exported constants, so neither can drift into prose.
   beforeEach(() => {
     resetGateway();
+    stubFetch();
     vi.useFakeTimers();
     vi.spyOn(Math, 'random').mockReturnValue(0);
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 

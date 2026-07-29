@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
-import { DiscordPlugin } from '../src/index.js';
+import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import {
   FakeWs,
   instances,
@@ -17,12 +17,11 @@ import {
   state,
   totalIdentifies,
 } from './fake-gateway.js';
+import { dialCeiling, ladderDelays } from './ladder.js';
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const QUOTA_PER_DAY = 1000;
-/** Headroom over the steady-state rate the {@link RECONNECT_CAP_MS} ladder settles at. */
-const MAX_SOCKETS_PER_HOUR = 42;
 const HUGE_HB = 1_000_000;
 const HANDSHAKE_MS = 10_000;
 const TOPIC = asTopic('880001');
@@ -136,13 +135,111 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
         initiator.start(plugin, TOPIC);
         await pump(HOUR_MS, failure.drive);
 
-        expect(instances.length).toBeLessThanOrEqual(MAX_SOCKETS_PER_HOUR);
+        // A BAND, not a ceiling: a cell that never re-dials satisfies any upper bound, so every
+        // transient-failure cell has to prove the ladder ran as well as that it stayed under quota.
+        expect(instances.length, 'the ladder never re-dialed, so the ceiling proves nothing')
+          .toBeGreaterThan(1);
+        expect(instances.length).toBeLessThanOrEqual(dialCeiling(HOUR_MS, RECONNECT_CAP_MS));
         expect(totalIdentifies() * (DAY_MS / HOUR_MS)).toBeLessThan(QUOTA_PER_DAY);
 
         await plugin.disconnect();
       });
     }
   }
+});
+
+// The quota Discord enforces is keyed by BOT TOKEN, not by process, and the README tells operators
+// to share one token across every bridge instance — so the invariant has to be summed over the
+// FLEET. Extrapolating a one-hour COUNT would charge the ladder's one-off ramp 24 times, so each
+// cell measures the spacing the ladder settles at and scales THAT to a day.
+describe('Discord IDENTIFY budget is per BOT TOKEN, not per process', () => {
+  const FLEET_SIZES = [1, 2, 4];
+  /** Far enough out that it is never a reconnect delay, so {@link ladderDelays} can drop it. */
+  const NO_HANDSHAKE_TIMEOUT = 10_000_000;
+
+  beforeEach(() => {
+    resetGateway();
+    stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (const dialers of FLEET_SIZES) {
+    it(`${dialers} instance(s) on one token stay under ${QUOTA_PER_DAY} IDENTIFYs/day`, async () => {
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      state.onIdentify = (ws: FakeWs) => ws.serverClose(1006); // every dial spends an IDENTIFY
+      const expectedCap = RECONNECT_CAP_MS * dialers;
+
+      const urls = Array.from({ length: dialers }, (_, i) => `ws://fleet-${i}`);
+      const fleet = await Promise.all(
+        urls.map(async (url) => {
+          const plugin = new DiscordPlugin();
+          await plugin.connect({
+            token: 't',
+            gateway_url: url,
+            gateway_dialers: dialers,
+            handshake_timeout_ms: NO_HANDSHAKE_TIMEOUT,
+          });
+          return plugin;
+        }),
+      );
+      for (const [i, plugin] of fleet.entries()) {
+        void plugin.subscribe(asTopic(`88100${i}`), () => undefined).catch(() => undefined);
+      }
+
+      const driven = new Set<FakeWs>();
+      for (let i = 0; i < 40; i++) {
+        await vi.advanceTimersByTimeAsync(expectedCap / 2);
+        for (const ws of [...instances]) {
+          if (driven.has(ws)) continue;
+          driven.add(ws);
+          ws.hello(HUGE_HB);
+        }
+      }
+
+      const steadyState = Math.max(...ladderDelays(setTimeoutSpy.mock.calls, NO_HANDSHAKE_TIMEOUT));
+      // The knob is applied by VALUE: ignore `gateway_dialers` and this is RECONNECT_CAP_MS.
+      expect(steadyState).toBe(expectedCap);
+      // …and the fleet's summed sustained rate is what the token is charged for.
+      expect(dialers * (DAY_MS / steadyState)).toBeLessThan(QUOTA_PER_DAY);
+      // Every instance actually climbed, so the number above measures a ladder that ran.
+      for (const url of urls) {
+        expect(instances.filter((ws) => ws.url === url).length).toBeGreaterThan(1);
+      }
+
+      await Promise.all(fleet.map((p) => p.disconnect()));
+    });
+  }
+
+  const BAD_DIALERS = [0, -1, 1.5];
+  for (const value of BAD_DIALERS) {
+    it(`gateway_dialers ${value} is refused at connect`, async () => {
+      const plugin = new DiscordPlugin();
+      await expect(
+        plugin.connect({ token: 't', gateway_url: 'ws://fake', gateway_dialers: value }),
+      ).rejects.toThrow(/gateway_dialers/);
+    });
+  }
+});
+
+let dispatchSeq = 0;
+const messageCreate = (topic: Topic, content: string): Record<string, unknown> => ({
+  op: 0,
+  t: 'MESSAGE_CREATE',
+  s: ++dispatchSeq,
+  d: {
+    id: String(900_000 + dispatchSeq),
+    channel_id: topic as string,
+    content,
+    timestamp: '',
+    author: { id: '1', username: 'u' },
+  },
 });
 
 describe('Discord session state does not leak across a connect/disconnect cycle', () => {
@@ -162,11 +259,19 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
     vi.restoreAllMocks();
   });
 
-  const session = async (plugin: DiscordPlugin, url: string): Promise<FakeWs> => {
+  const session = async (
+    plugin: DiscordPlugin,
+    url: string,
+    topic: Topic,
+    sink: string[],
+  ): Promise<FakeWs> => {
     await plugin.connect({ token: 't', gateway_url: url, handshake_timeout_ms: HANDSHAKE_MS });
-    const pending = plugin.subscribe(TOPIC, () => undefined);
+    const pending = plugin.subscribe(topic, (m) => sink.push(m.content));
     const ws = instances.at(-1)!;
     ws.hello(HUGE_HB);
+    // Keep this ahead of `await pending`, so that subscribe's channel check can read its stubbed
+    // REST body: under fake timers a faked immediate drives the body stream.
+    await vi.advanceTimersByTimeAsync(0);
     await pending;
     return ws;
   };
@@ -218,18 +323,7 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
     {
       label: 'a late MESSAGE_CREATE was in flight',
       first: async (_p, ws) => {
-        ws.serverSend({
-          op: 0,
-          t: 'MESSAGE_CREATE',
-          s: 7,
-          d: {
-            id: '901',
-            channel_id: TOPIC as string,
-            content: 'stale',
-            timestamp: '',
-            author: { id: '1', username: 'u' },
-          },
-        });
+        ws.serverSend(messageCreate(TOPIC, 'stale'));
       },
     },
   ];
@@ -241,7 +335,8 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
       })`, async () => {
         state.asyncClose = asyncClose;
         const plugin = new DiscordPlugin();
-        const ws0 = await session(plugin, OLD_URL);
+        const firstSink: string[] = [];
+        const ws0 = await session(plugin, OLD_URL, TOPIC, firstSink);
         await scenario.first(plugin, ws0);
         await plugin.disconnect();
         // Under async delivery the ONE pending timer is the fake's own deferred close event, so
@@ -252,7 +347,11 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
 
         state.onIdentify = (ws: FakeWs) => ws.ready();
         const opened = instances.length;
-        await session(plugin, NEW_URL);
+        const secondSink: string[] = [];
+        // A DIFFERENT topic, so that the second subscription cannot mask a surviving first-session
+        // entry by overwriting it — same-topic re-subscription hides the whole class.
+        const ws1 = await session(plugin, NEW_URL, LATE_TOPIC, secondSink);
+        const deliveredToFirst = firstSink.length;
         await vi.advanceTimersByTimeAsync(300_000);
 
         // Nothing from the first session may dial, IDENTIFY, or dispatch into the second one.
@@ -260,11 +359,13 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
         expect(openSockets()).toHaveLength(1);
         expect(openSockets()[0]!.url).toBe(NEW_URL);
 
-        // Usable, not merely un-dialed: sticky state set by a late event kills live push on the
-        // new session without ever opening a socket, which every count above still satisfies.
-        const settled = instances.length;
-        await expect(plugin.subscribe(LATE_TOPIC, () => undefined)).resolves.toBeUndefined();
-        expect(instances.length).toBe(settled);
+        // Usable, not merely un-dialed: the second session's own subscription must carry push,
+        // while the torn-down session's handler must be unreachable — a registry that survived
+        // disconnect() pushes live traffic into a consumer that is gone.
+        ws1.serverSend(messageCreate(TOPIC, 'to-the-dead-session'));
+        ws1.serverSend(messageCreate(LATE_TOPIC, 'to-the-live-session'));
+        expect(firstSink).toHaveLength(deliveredToFirst);
+        expect(secondSink).toEqual(['to-the-live-session']);
 
         await plugin.disconnect();
         await vi.advanceTimersByTimeAsync(1); // deliver the fake's own deferred close event
@@ -281,6 +382,7 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
     const pending = plugin.subscribe(TOPIC, () => undefined);
     const ws0 = instances.at(-1)!;
     ws0.hello(HB);
+    await vi.advanceTimersByTimeAsync(0);
     await pending;
 
     // A socket the plugin has moved on from (here: a stale handle the test kept) must not be able
@@ -290,6 +392,7 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
     const pending2 = plugin.subscribe(TOPIC, () => undefined);
     const ws1 = instances.at(-1)!;
     ws1.hello(HB);
+    await vi.advanceTimersByTimeAsync(0);
     await pending2;
 
     ws0.readyState = FakeWs.OPEN; // resurrect the orphan exactly as a late close-race would

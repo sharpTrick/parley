@@ -20,12 +20,12 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | ------------------------- | --------------- |
 | `connect(config)`         | Stores config; auth is stateless per request (`Authorization: Bot <token>`). The gateway socket opens lazily on first `subscribe`. |
 | topic → channel           | `channel_map[topic]` if present; otherwise the topic string is used **as a channel id literal** — the zero-config path when topics simply are channel ids. |
-| `post`                    | `POST /channels/<id>/messages` `{ content, message_reference? }` → returns the message `id`. `inReplyTo` maps to `message_reference.message_id` (a native Discord reply). **Discord caps a message at 2000 characters**; a longer `content` is rejected up front with an error naming the limit and the actual length (the plugin never chunks — one post is one `backendMsgId`). |
+| `post`                    | `POST /channels/<id>/messages` `{ content, allowed_mentions, message_reference? }` → returns the message `id`. `inReplyTo` maps to `message_reference.message_id` (a native Discord reply). **Discord caps a message at 2000 characters**; a longer `content` is rejected up front with an error naming the limit and the actual length (the plugin never chunks — one post is one `backendMsgId`). |
 | `backendMsgId` = `cursor` | The message **snowflake** id — time-ordered and strictly increasing per channel; serves as both the dedup key and the order key. Snowflakes are decimal strings and **not lexically comparable**; ordering is delegated to the API (core never compares cursors either). |
 | `fetchRecent` (no `since`) | `GET /channels/<id>/messages?limit=N` (newest-first) → reverse to ascending. The API caps a page at 100, so a larger `limit` pages **backwards** with `before=` until it is satisfied or the channel head is reached — the window is never silently truncated to 100. |
 | absent topic              | A channel Discord does not know (`10003 Unknown Channel`) makes `fetchRecent` reject with core's `NoSuchTopicError`, which core reads as "topic not present yet" (e.g. an empty `parley_list_users` roster). Every other non-2xx — including `50001 Missing Access`, where the channel exists but the bot cannot see it — stays a real failure. |
 | `fetchRecent` (`since`)   | `GET /channels/<id>/messages?after=<since>&limit=n` — `after` is **exclusive** server-side; each newest-first page is reversed, and for `limit > 100` the plugin pages forward advancing `after` until filled or a short page. |
-| `subscribe`               | **One shared gateway websocket** per plugin instance: HELLO → IDENTIFY (intents `GUILDS \| GUILD_MESSAGES \| MESSAGE_CONTENT`) → READY, then `MESSAGE_CREATE` dispatch per subscribed channel — including the bot's own sends. Starts at the tail; history is owned by catch-up. A handshake that stalls fails after `handshake_timeout_ms` rather than parking the call forever. Reconnect re-IDENTIFYs (no RESUME — the push gap is harmless; cursor catch-up reconciles) with backoff capped at 120s, and the cap is only forgiven once a socket stays up a minute — sustained flapping therefore stays under Discord's 1000-IDENTIFY/24h quota, whose penalty is a **bot-token reset**. A terminal close (4004/4010–4014) stops the loop, is reported on stderr, and makes later gateway calls fail fast with the reason. |
+| `subscribe`               | **One shared gateway websocket** per plugin instance: HELLO → IDENTIFY (intents `GUILDS \| GUILD_MESSAGES \| MESSAGE_CONTENT`) → READY, then `MESSAGE_CREATE` dispatch per subscribed channel — including the bot's own sends. Starts at the tail; history is owned by catch-up. The channel is then checked once (`GET /channels/<id>`): an id Discord does not know becomes `NoSuchTopicError` (core skips the topic with a diagnostic), and one the bot cannot access — or a DM/group-DM class this intent set never receives — throws naming the channel and the reason, instead of leaving a permanently idle bridge. A **transient** dial failure (stalled handshake, close before READY) does **not** fail `subscribe`: it is reported on stderr and joins the reconnect ladder, because failing here would fail core's attach and take the REST half of the bridge down with it. Reconnect re-IDENTIFYs (no RESUME — the push gap is harmless; cursor catch-up reconciles) with backoff capped at `120s × gateway_dialers`, and the cap is only forgiven once a socket stays up a minute — sustained flapping therefore stays under Discord's 1000-IDENTIFY/24h quota, whose penalty is a **bot-token reset**. A terminal close (4004/4010–4014) stops the loop, is reported on stderr, and makes later gateway calls fail fast with the reason. |
 | `resolveIdentity`         | `GET /users/@me` (memoized): our own bot handle resolves to its real user id; every other handle passes through as a string convention — Discord has **no global name → id lookup**. |
 
 `senderHandle` ← `author.username`, `content` ← `content`, `timestamp` ← the message `timestamp`
@@ -52,6 +52,8 @@ Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps 
 | `gateway_url` | _(unset)_                     | Gateway websocket URL override (tests/fakes). Default: resolved live via `GET /gateway/bot`. |
 | `channel_map` | `{}`                          | Parley topic → channel id. Unmapped topics are used as channel ids directly. Targets must be **distinct** — two topics folding onto one channel is rejected at `connect()`, because one of them would otherwise lose its subscription silently. A topic used as a literal channel id that another topic already maps to is refused the same way, on every call that resolves it. |
 | `handshake_timeout_ms` | `10000` | How long HELLO → IDENTIFY → READY may take before the socket is terminated and the attempt fails (the reconnect loop then retries with backoff). |
+| `gateway_dialers` | `1` | How many bridge instances **share this bot token and open a gateway socket**. The 1000-IDENTIFY/24h quota is per **bot token**, not per process, so the reconnect ceiling is `120s × gateway_dialers` — see "Multiple concurrent sessions". |
+| `allowed_mentions` | `{ parse: ["users"], replied_user: false }` | Mention scope of every `post`. The default lets a `<@id>` user mention ping and refuses `@everyone`/`@here`/role pings, because `post` content can be untrusted inbound text an agent relayed. Widen it (e.g. add `"roles"` or `"everyone"` to `parse`) only deliberately. |
 
 > **Presence needs a real channel.** Core enables presence by default (`presence.enabled: true`,
 > `presence.topic: parley-presence`), and on Discord a topic string **is a channel id** — so the
@@ -91,9 +93,11 @@ this package authors none of it:
    channels you'll map as topics.
 
 > **Topics must be GUILD channels.** The intent set is `GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT`
-> — no `DIRECT_MESSAGES` — so a DM or group-DM channel id receives **no live push at all**. REST
-> `post`/`fetchRecent` still work against it and `subscribe` still resolves, so the symptom is an
-> idle bridge with no error: check the channel class first when pushes never arrive.
+> — no `DIRECT_MESSAGES` — so a DM or group-DM channel id receives **no live push at all**.
+> `subscribe` checks the channel once and **refuses** one it can never push from, naming it: a DM or
+> group DM, a channel the bot cannot access (`50001`), or an id that does not exist at all — the
+> mistyped snowflake and the guild the bot was never invited to both land here rather than as an
+> idle bridge with no error.
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same bot)
 
@@ -106,6 +110,16 @@ Discord transcript matters, provision a distinct application/bot token per sessi
 that session's `backend_config` — the same role `identity.handle` plays for SQLite/Redis/NATS,
 just carried in the token. `channel_map` must agree across configs that share topics;
 `api_url`/`gateway_url` only ever vary for tests.
+
+> **The IDENTIFY quota is per BOT TOKEN, not per process — set `gateway_dialers`.** Discord allows
+> **1000 IDENTIFYs per 24h per bot token** and penalizes an overrun by **resetting the token**,
+> which kills every Parley instance on it until a human re-provisions. One instance whose gateway is
+> flapping re-dials at the ladder's ceiling, i.e. at most **720** times a day — so two or three
+> instances sharing a token on the default `gateway_dialers: 1` can together exceed the quota.
+> Set `gateway_dialers` to the number of push-enabled instances sharing the token (the ceiling
+> becomes `120s × gateway_dialers`, and the fleet's total stays at 720/day however many there are).
+> Instances that never open a gateway socket — no `subscribe`, no `block_ms` long-poll — cost
+> nothing against it and need not be counted.
 
 ## Tests
 

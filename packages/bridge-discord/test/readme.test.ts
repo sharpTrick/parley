@@ -6,7 +6,7 @@ import {
 } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { DiscordPlugin } from '../src/index.js';
+import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 
 // CLASS: a README paragraph describing a DEPENDENCY's behaviour, with nothing binding it to that
@@ -15,6 +15,10 @@ import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 // the prose cannot drift into describing a loop the plugin no longer runs.
 
 const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+
+/** Discord's own numbers: the per-token IDENTIFY quota and the window it is measured over. */
+const QUOTA_PER_DAY = 1000;
+const DAY_MS = 86_400_000;
 const RATE_LIMITS = README.slice(README.indexOf('## Rate limits'), README.indexOf('## Provisioning'));
 
 describe('bridge-discord README — the documented 429 rule is net-util’s actual rule', () => {
@@ -33,6 +37,26 @@ describe('bridge-discord README — the documented 429 rule is net-util’s actu
       expect(RATE_LIMITS).toContain(`${ms} ms`);
     });
   }
+});
+
+// CLASS: a README number a reader is invited to do ARITHMETIC with. The per-token IDENTIFY budget
+// paragraph exists so an operator can size `gateway_dialers`; if its numbers drift from the ladder's
+// exported constants, the advice becomes wrong in the direction that resets the bot token.
+describe('bridge-discord README — the IDENTIFY quota arithmetic is the ladder’s', () => {
+  const SESSIONS = README.slice(README.indexOf('## Multiple concurrent sessions'));
+
+  it('carries the per-token quota section', () => {
+    expect(SESSIONS).toContain('gateway_dialers');
+    expect(SESSIONS).toContain(String(QUOTA_PER_DAY));
+  });
+
+  it(`states one instance's ceiling as ${DAY_MS / RECONNECT_CAP_MS} dials/day`, () => {
+    expect(SESSIONS).toContain(`**${DAY_MS / RECONNECT_CAP_MS}**`);
+  });
+
+  it('states the cap the ladder actually applies', () => {
+    expect(SESSIONS).toContain(`${RECONNECT_CAP_MS / 1000}s × gateway_dialers`);
+  });
 });
 
 describe('bridge-discord 429 behaviour matches what the README promises', () => {
