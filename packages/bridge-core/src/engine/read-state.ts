@@ -41,6 +41,11 @@ export class ReadStateStore {
     return out;
   }
 
+  /** Where this instance's read-state lives on disk (surfaced in diagnostics). */
+  get path(): string {
+    return this.filePath;
+  }
+
   /** The persisted cursor for a topic, or undefined if this instance has never read it. */
   get(topic: Topic): Cursor | undefined {
     const value = this.state[topic];
