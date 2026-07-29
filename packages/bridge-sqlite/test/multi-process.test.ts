@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openDriver } from '../src/driver.js';
 import { SqlitePlugin } from '../src/index.js';
 import { SCHEMA } from '../src/schema.js';
@@ -149,6 +149,69 @@ describe.skipIf(BetterCtor === null)('busy_timeout is what makes a contended wri
     const { messages } = await plugin.fetchRecent({ topic: T });
     expect(messages.map((m) => m.content)).toEqual(['through-contention']);
   });
+});
+
+/**
+ * DESIGN §9 stakes "the cursor guarantees nothing is missed regardless of cadence" on the poll
+ * loop, but the only multi-process check in the suite grades the result through fetchRecent. A loop
+ * that missed rows committed by OTHER OS processes — a commit landing below `lastSeen` because
+ * rowids are allocated before commits are visible — would pass everything else in this package,
+ * since every other subscribe case writes from this process through the plugin's own statement.
+ */
+describe('the live poll loop sees every message other processes commit', () => {
+  const LOADS = [
+    { writers: 2, perWriter: 10 },
+    { writers: 4, perWriter: 25 },
+    { writers: 6, perWriter: 80 },
+  ];
+
+  for (const { writers, perWriter } of LOADS) {
+    it(`${writers} writer processes x ${perWriter} messages arrive live, exactly once`, async () => {
+      const path = join(dir(), 'p.db');
+      const plugin = new SqlitePlugin();
+      open.push(plugin);
+      await plugin.connect({ db_path: path, poll_interval_ms: 20 });
+
+      // Armed BEFORE any writer starts, so the whole run is inside the live window: anything the
+      // loop misses is loss, not history it was never meant to push.
+      const live: Array<{ id: string; cursor: string }> = [];
+      await plugin.subscribe(T, (m) => live.push({ id: m.backendMsgId, cursor: m.cursor }));
+
+      const children = Promise.all(
+        Array.from(
+          { length: writers },
+          (_unused, i) =>
+            new Promise<void>((resolve, reject) => {
+              const child = fork(writerScript, [path, T, String(perWriter), `w${i}`]);
+              child.on('exit', (code) =>
+                code === 0
+                  ? resolve()
+                  : reject(new Error(`writer ${i} exited with code ${String(code)}`)),
+              );
+              child.on('error', reject);
+            }),
+        ),
+      );
+      // The plugin's own post() contends too, so the shipped write path is one of the writers.
+      for (let i = 0; i < perWriter; i++) await plugin.post(T, me, `plugin-${i}`);
+      await children;
+
+      const total = (writers + 1) * perWriter;
+      await vi.waitFor(() => expect(live).toHaveLength(total), { timeout: 20_000, interval: 20 });
+
+      const viaCatchUp = await plugin.fetchRecent({ topic: T, limit: total });
+      expect(viaCatchUp.messages).toHaveLength(total);
+      // Exactly once, and the same set the store holds — no duplicates, no gaps.
+      expect(new Set(live.map((m) => m.id)).size).toBe(total);
+      expect(live.map((m) => m.id).sort()).toEqual(
+        viaCatchUp.messages.map((m) => m.backendMsgId).sort(),
+      );
+      // Delivered in cursor order: a loop that re-read a window would break this even while the
+      // set matched.
+      const rowids = live.map((m) => Number(m.cursor.split('.').at(-1)));
+      expect(rowids).toEqual([...rowids].sort((a, b) => a - b));
+    });
+  }
 });
 
 describe('one schema, many creators', () => {

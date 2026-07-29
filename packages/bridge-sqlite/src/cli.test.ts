@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseArgs, SQLITE_VERSION, USAGE } from './args.js';
+import { MAX_PAGE } from './index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgDir = join(here, '..');
@@ -129,9 +130,14 @@ describe('CLI argument parsing refuses what it cannot honour', () => {
   });
 });
 
-function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
+function writeConfig(
+  dir: string,
+  extra: Record<string, unknown> = {},
+  topLevel: string[] = [],
+): string {
   const cfgPath = join(dir, 'parley.config.yaml');
   const cfg = [
+    ...topLevel,
     'identity:',
     '  handle: eof-agent',
     // Pin read-state inside this test's tmp dir, so that a run cannot resume from the previous
@@ -154,6 +160,58 @@ function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
   writeFileSync(cfgPath, cfg + '\n');
   return cfgPath;
 }
+
+/**
+ * Core validates `catchup.limit` as any positive integer and this plugin refuses a page above
+ * MAX_PAGE, so a config core certifies as valid can still stop the bridge — after connect() has
+ * opened the store. Either outcome is defensible; a rejection that does not name the key the
+ * operator has to change is not, because the only other way to find it is reading plugin source.
+ */
+describe('a core config value this plugin constrains starts or is refused by name (e2e)', () => {
+  const CASES = [
+    { limit: 1, starts: true },
+    { limit: MAX_PAGE, starts: true },
+    { limit: MAX_PAGE + 1, starts: false },
+  ];
+
+  for (const { limit, starts } of CASES) {
+    it(`catchup.limit ${limit} ${starts ? 'starts the bridge' : 'is refused by name'}`, async () => {
+      const dir = tmp();
+      const cfgPath = writeConfig(dir, {}, ['catchup:', `  limit: ${limit}`]);
+      const child = spawn(process.execPath, [CLI, '--config', cfgPath], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      const verdict = await new Promise<'up' | 'exited'>((resolve, reject) => {
+        const to = setTimeout(() => reject(new Error(`no verdict in 15s: ${stderr}`)), 15_000);
+        child.stderr.on('data', (d: Buffer) => {
+          stderr += d.toString();
+          if (stderr.includes('bridge up')) {
+            clearTimeout(to);
+            resolve('up');
+          }
+        });
+        child.on('exit', () => {
+          clearTimeout(to);
+          resolve('exited');
+        });
+      });
+      child.stdin.end();
+      child.kill('SIGKILL');
+
+      if (starts) {
+        expect(verdict).toBe('up');
+        return;
+      }
+      expect(verdict).toBe('exited');
+      expect(stderr).not.toMatch(/bridge up/);
+      expect(stderr).toMatch(/parley-sqlite: fatal/);
+      // The operator's lever, named where they will read it.
+      expect(stderr).toContain('catchup.limit');
+      expect(stderr).toContain(String(MAX_PAGE));
+    });
+  }
+});
 
 // End-to-end: spawn the built CLI with a piped stdin, wait for "bridge up", then close the
 // parent's write end (EOF WITHOUT a signal — the orphaned-parent scenario). The child must run

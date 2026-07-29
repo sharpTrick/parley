@@ -45,6 +45,20 @@ The ceiling rejects rather than silently clamping: a caller that pages until a p
 short — which is how core's catch-up driver decides a topic is exhausted — would read a clamped
 page as the end of the topic and strand every message after it. Page to exhaustion for more.
 
+Core validates its own `catchup.limit` as any positive integer, so **keep `catchup.limit` at or
+below 10000**: a larger value loads cleanly and then stops the bridge during catch-up-on-start, with
+an error naming the key. Paging costs nothing — catch-up drains a topic however small the page.
+
+**Identifier range.** `backendMsgId` and the cursor's rowid travel as JS numbers, exact up to
+`Number.MAX_SAFE_INTEGER` (2^53−1) — far past any store SQLite will hold in practice. A store
+deliberately seeded with rowids above that is not supported: `post()`'s id and the id read back by
+`fetchRecent` would round differently.
+
+`backendMsgId` is the bare rowid, so unlike the cursor it carries no store identity and is unique
+only **within one store generation**. When you reset or replace the store, discard core's persisted
+read-state *and* restart the bridge — core's in-memory seen-set is keyed on `backendMsgId`, so a new
+generation's ids `1..N` would otherwise be mistaken for the old generation's and dropped.
+
 ### When the database goes away under a live subscription
 
 A poll tick that fails is classified, not blanket-retried. Lock contention (`SQLITE_BUSY`/
@@ -58,6 +72,11 @@ constructs `SqlitePlugin` itself — can read that state programmatically:
 plugin.subscriptionHealth();
 // [{ topic: 'ctx', state: 'live' | 'degraded' | 'stopped', consecutiveFailures, lastError }]
 ```
+
+After `disconnect()` every topic reads `stopped` rather than keeping its last live state, so a
+supervisor polling this cannot mistake a torn-down plugin for a healthy one. `connect()` refuses to
+run twice on one instance — a second one would orphan the running poll loops against the old store —
+so re-pointing an embedded plugin means `disconnect()` first, and the health map starts empty again.
 
 Under the shipped `parley-sqlite` CLI there is no route for it: the seam has no plugin-specific
 method, so **stderr is the only signal a deployed bridge emits** — capture it. Surfacing subscription
@@ -153,7 +172,10 @@ leaving the deployment to assume the store is protected.
 The driver prefers the mature native **`better-sqlite3`**, falling back to Node's built-in
 **`node:sqlite`** if the native module fails to load (no prebuilt binary for your platform/ABI and
 no toolchain to build one). Both are synchronous and support the same PRAGMAs; the plugin code
-above the driver doesn't care which one is active.
+above the driver doesn't care which one is active. `test/driver-parity.test.ts` grades **both**
+drivers on one set of assertions — pragma read-back, at-rest mode, insert-result shape and a full
+seam round-trip — with the fallback forced, so that parity is a checked claim rather than a
+statement about the driver that happened to be installed. `node:sqlite` needs Node ≥ 22.5.
 
 ## Run it (CLI)
 

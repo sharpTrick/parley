@@ -207,11 +207,17 @@ describe('this store’s own cursor is honoured up to the high-water mark and no
   });
 });
 
-const SIZES = [0, 1, 5, 50];
+/**
+ * The `before` dimension only varies which rowid the stale cursor names (none, the first, one well
+ * above the new store's high-water mark), so it needs three values rather than a square matrix; the
+ * `after` dimension decides whether the replay is empty or paged.
+ */
+const BEFORE_RESET = [0, 1, 50];
+const AFTER_RESET = [0, 50];
 
 describe('catch-up across a real store reset loses nothing', () => {
-  for (const before of SIZES) {
-    for (const after of SIZES) {
+  for (const before of BEFORE_RESET) {
+    for (const after of AFTER_RESET) {
       it(`${before} rows before the reset, ${after} rows after`, async () => {
         const path = dbPath();
         const old = await plugin(path);

@@ -127,6 +127,12 @@ export class SqlitePlugin implements BackendPlugin {
   private seqStmt?: SqlStatement;
 
   async connect(config: BackendConfig): Promise<void> {
+    if (this.driver !== undefined) {
+      throw new Error(
+        'parley-sqlite: already connected — call disconnect() before connecting again ' +
+          '(a second connect() would orphan every running poll loop against the previous store)',
+      );
+    }
     const cfg = validateBackendConfig(config);
     const dbPath = cfg.db_path ?? 'parley.db';
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
@@ -173,9 +179,22 @@ export class SqlitePlugin implements BackendPlugin {
     this.pruneBatchTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
+    for (const h of this.health.values()) {
+      h.state = 'stopped';
+      h.lastError = 'disconnected';
+    }
     this.driver?.close();
     this.driver = undefined;
     this.storeId = undefined;
+    // Keep these cleared with the driver that prepared them, so that a call after teardown reports
+    // require()'s "not connected" rather than the driver's "database connection is not open",
+    // which names neither this plugin nor the lifecycle mistake behind it.
+    this.insertStmt = undefined;
+    this.selectAfterStmt = undefined;
+    this.selectRecentStmt = undefined;
+    this.maxIdStmt = undefined;
+    this.pruneStmt = undefined;
+    this.seqStmt = undefined;
   }
 
   async post(
@@ -187,8 +206,6 @@ export class SqlitePlugin implements BackendPlugin {
     const stmt = this.require(this.insertStmt);
     const ts = new Date().toISOString();
     const info = stmt.run(topic, identity, content, ts, opts?.inReplyTo ?? null);
-    // Keep String() rather than a Number() round-trip, so that a 64-bit rowid cannot lose
-    // precision on the way to the dedup key.
     return asBackendMsgId(String(info.lastInsertRowid));
   }
 
@@ -395,7 +412,12 @@ export function classifyDbError(e: unknown): DbErrorClass {
   return 'unavailable';
 }
 
-function backoffMs(pollIntervalMs: number, failures: number): number {
+/**
+ * Degraded poll delay after `failures` consecutive non-lock failures: exponential from the
+ * configured interval, capped at {@link BACKOFF_CEILING_MS}. The cap is the README's promise that
+ * a topic whose store was briefly unreachable resumes live push within 30 s, not within days.
+ */
+export function backoffMs(pollIntervalMs: number, failures: number): number {
   const doublings = Math.min(failures - ESCALATE_AFTER + 1, 30);
   return Math.min(pollIntervalMs * 2 ** doublings, BACKOFF_CEILING_MS);
 }
@@ -522,8 +544,10 @@ function normalizeLimit(limit: number | undefined, topic: Topic): number {
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) {
     throw new Error(
       `parley-sqlite: invalid limit ${describe(limit)} for topic ${topic} — expected an integer ` +
-        `between 1 and ${MAX_PAGE} (SQLite reads a negative LIMIT as "no limit"; a page above ` +
-        `${MAX_PAGE} would come back short, which a caller cannot tell from an exhausted topic)`,
+        `between 1 and ${MAX_PAGE}; lower config \`catchup.limit\` (or the parley_fetch_recent ` +
+        `\`limit\` argument) to at most ${MAX_PAGE} (SQLite reads a negative LIMIT as "no limit"; ` +
+        `a page above ${MAX_PAGE} would come back short, which a caller cannot tell from an ` +
+        `exhausted topic)`,
     );
   }
   return limit;

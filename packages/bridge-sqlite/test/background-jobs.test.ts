@@ -3,7 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MIN_POLL_INTERVAL_MS, POLL_BATCH, PRUNE_BATCH, SqlitePlugin } from '../src/index.js';
+import {
+  backoffMs,
+  MAX_POLL_INTERVAL_MS,
+  MIN_POLL_INTERVAL_MS,
+  POLL_BATCH,
+  PRUNE_BATCH,
+  SqlitePlugin,
+} from '../src/index.js';
 
 /**
  * The plugin runs two background jobs — the per-topic poll loop and the retention prune — and both
@@ -151,6 +158,44 @@ describe('poll loop error-class matrix', () => {
       }
     });
   }
+});
+
+/**
+ * The degraded loop keeps probing forever, so its delay is the only thing bounding how long a topic
+ * whose store was briefly unreachable stays dark. The README promises 30 s. Every expectation here
+ * is a literal rather than a re-derivation from the constant, so raising or removing the ceiling —
+ * which the error-class matrix above cannot see, since a 13-failure burst never reaches it — turns
+ * this table red instead of shipping a multi-day recovery.
+ */
+describe('the degraded poll delay is bounded by the documented ceiling', () => {
+  const CEILING_MS = 30_000;
+
+  const DELAYS: Array<{ pollIntervalMs: number; failures: number; expected: number }> = [
+    { pollIntervalMs: MIN_POLL_INTERVAL_MS, failures: 10, expected: 20 },
+    { pollIntervalMs: MIN_POLL_INTERVAL_MS, failures: 14, expected: 320 },
+    { pollIntervalMs: 1000, failures: 10, expected: 2000 },
+    { pollIntervalMs: 1000, failures: 13, expected: 16_000 },
+    { pollIntervalMs: 1000, failures: 14, expected: CEILING_MS },
+    { pollIntervalMs: 1000, failures: 40, expected: CEILING_MS },
+    { pollIntervalMs: 1000, failures: 1000, expected: CEILING_MS },
+    { pollIntervalMs: 60_000, failures: 10, expected: CEILING_MS },
+    { pollIntervalMs: MAX_POLL_INTERVAL_MS, failures: 11, expected: CEILING_MS },
+  ];
+
+  for (const { pollIntervalMs, failures, expected } of DELAYS) {
+    it(`${pollIntervalMs} ms interval after ${failures} failures waits ${expected} ms`, () => {
+      expect(backoffMs(pollIntervalMs, failures)).toBe(expected);
+    });
+  }
+
+  it('never decreases as failures accumulate, and never exceeds the ceiling', () => {
+    for (const pollIntervalMs of [MIN_POLL_INTERVAL_MS, 250, 1000, MAX_POLL_INTERVAL_MS]) {
+      const series = Array.from({ length: 60 }, (_u, i) => backoffMs(pollIntervalMs, i + 10));
+      expect(series).toEqual([...series].sort((a, b) => a - b));
+      expect(Math.max(...series)).toBeLessThanOrEqual(CEILING_MS);
+      expect(Math.min(...series)).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe('retention prune error visibility', () => {
