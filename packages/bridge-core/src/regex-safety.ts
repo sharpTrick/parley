@@ -1,157 +1,173 @@
 /**
  * Structural ReDoS screening, shared by every path that compiles a regex it did not author:
- * `post_topics` from an operator's config (validated at load) and `postTopics` from an untrusted
- * peer's presence beat. Node's RegExp backtracks, so one hostile or merely careless source can wedge
- * the single-threaded process.
+ * `post_topics` from an operator's config (validated at load), `postTopics` from an untrusted peer's
+ * presence beat, and any {@link Allowlist} an embedder builds by hand. Node's RegExp backtracks, so
+ * one hostile or merely careless source can wedge the single-threaded process.
  */
 
 /**
- * Longest input we feed to a screened pattern. Topic names are short; clamping the compared string
- * caps the worst-case work of a low-degree match no matter how long the caller's string is.
+ * Longest input a screened pattern is ever matched against. Callers MUST clamp or refuse longer
+ * input, so that {@link MAX_AMBIGUITY} keeps meaning what it was calibrated to mean.
  */
 export const MAX_MATCH_INPUT = 64;
 
 /**
- * Most unbounded (`*` / `+` / `{n,}`) quantifiers we allow in one untrusted source. A handful is
- * ample for a real topic pattern; capping the count bounds the polynomial-backtracking degree of even
- * a nesting-free source (sequential `.*.*…`).
+ * Most backtracking paths a screened source may be able to explore against an input of
+ * {@link MAX_MATCH_INPUT} characters. Calibrated so the worst accepted source finishes in single-digit
+ * milliseconds on V8.
  */
-export const MAX_UNBOUNDED_QUANTIFIERS = 4;
+export const MAX_AMBIGUITY = 65_536;
+
+/** Paths charged to one unbounded quantifier (`*`, `+`, `{n,}`) over a {@link MAX_MATCH_INPUT} input. */
+const UNBOUNDED_COST = 16;
+
+const GROUP_PREFIX = /^\?(?::|=|!|<=|<!|<[A-Za-z_$][A-Za-z0-9_$]*>)/;
+
+interface Brace {
+  len: number;
+  min: number;
+  max: number;
+}
+
+function readBrace(src: string, i: number): Brace | null {
+  const m = /^\{(\d*)(,(\d*))?\}/.exec(src.slice(i));
+  if (!m || (m[1] === '' && m[3] === undefined)) return null;
+  const min = m[1] === '' ? 0 : Number.parseInt(m[1]!, 10);
+  const hasComma = m[2] !== undefined;
+  const max = !hasComma
+    ? min
+    : m[3] === ''
+      ? Number.POSITIVE_INFINITY
+      : Number.parseInt(m[3]!, 10);
+  return { len: m[0].length, min, max };
+}
+
+function repetitionCost(min: number, max: number): number {
+  if (max === Number.POSITIVE_INFINITY) return UNBOUNDED_COST;
+  return Math.min(Math.max(1, max - min + 1), UNBOUNDED_COST);
+}
 
 /**
- * Longest input string we ever feed to an untrusted peer pattern. Our own topic names are short, so
- * clamping the compared string caps the worst-case work of a (screened, low-degree) match no matter
- * how long a self-configured topic is.
- */
-const MAX_PEER_MATCH_INPUT = 64;
-
-/**
- * Conservative structural ReDoS screen for an untrusted regex source, run BEFORE compiling it. Node's
- * `RegExp` backtracks, so a hostile source can wedge the whole single-threaded process; catastrophic
- * blowup needs one of two structural shapes and we reject both:
- *   - a quantifier that lets a group whose body itself contains a quantifier or alternation repeat
- *     TWO OR MORE times — the exponential/polynomial signature. This covers an UNBOUNDED outer
- *     quantifier (`(x+)+`, `(a|a)*`, `(x*){2,}`) AND a BOUNDED exact/range count `>= 2` (`(x*){15}`,
- *     `(x?){250}`, `(x+){2,5}`): V8 unrolls `{n}`/`{n,m}` into up to n sequential copies of the risky
- *     body, so a bounded exact count over a `*`/`?`-body is just as catastrophic as an unbounded one
- *     (empirically `([a-z-]*){15}[0-9]` hangs Node for ~8s on a 15-char input). Only a bound of `<= 1`
- *     (`?`, `{0,1}`, `{1}`) is safe, since a body matched at most once cannot compound; or
- *   - more than {@link MAX_UNBOUNDED_QUANTIFIERS} unbounded quantifiers (`.*.*…`) — a high-degree
- *     polynomial blowup. (Because a risky body repeated `>= 2` times is rejected above, any
- *     multiplicity from unrolling a `{n}` over an unbounded-quantifier body is already excluded — so
- *     the unbounded count here need not itself be scaled by the unroll factor.)
- * Character-class interiors and escaped metacharacters are treated as literal. It is deliberately
- * conservative (it may reject some safe-but-exotic sources); a legitimate topic pattern never needs a
- * nested quantifier. Anything that still slips through as un-compilable is caught by the `try/catch`
- * in {@link compilePeerPatterns}.
+ * Conservative ReDoS screen for a regex source, run BEFORE compiling it. A source is refused when
+ * either:
+ *
+ *  - a group whose body is itself ambiguous (it contains a quantifier or an alternation) can repeat
+ *    two or more times — the exponential signature (`(x+)+`, `(a|a)*`, `(x*){15}`, `(x?){250}`). V8
+ *    unrolls `{n}`/`{n,m}` into sequential copies of the body, so a bounded count `>= 2` is as
+ *    catastrophic as an unbounded one; only a bound of `<= 1` cannot compound. Or:
+ *  - its ambiguity budget — the product of every independent choice the engine can backtrack over:
+ *    alternation branches, optional/bounded repetitions, and {@link UNBOUNDED_COST} per unbounded
+ *    quantifier — exceeds {@link MAX_AMBIGUITY}. This is what catches a quantifier-free blowup such as
+ *    a chain of ambiguous alternations (`(a|aa)(a|aa)…`) or of optional atoms (`a?a?a?…a`), neither
+ *    of which contains a nested quantifier at all.
+ *
+ * Character-class interiors and escaped metacharacters are treated as literal, and nesting is
+ * over-approximated, so the screen is deliberately stricter than necessary; a legitimate topic
+ * pattern is nowhere near either bound.
  */
 export function isRedosSafeSource(src: string): boolean {
-  let unbounded = 0;
-  // Per-open-group flag: did this group's body contain a quantifier or alternation (directly, or
-  // inherited from a nested non-quantified subgroup)? A quantified group with a risky body is the
-  // catastrophic case. Index 0 is the implicit top level (never itself quantified).
-  const risky: boolean[] = [false];
-  // Parse a `{...}` quantifier at `i`; null when `{` is a literal brace, not a valid quantifier.
-  // `unbounded` = open-ended reps (a comma is present, `{n,}`/`{n,m}`) — preserved for the polynomial
-  // count. `max` = the largest repetition the quantifier permits (Infinity when open-ended) — used to
-  // decide whether a risky body may repeat `>= 2` times.
-  const readBrace = (i: number): { len: number; unbounded: boolean; max: number } | null => {
-    const m = /^\{(\d*)(,(\d*))?\}/.exec(src.slice(i));
-    if (!m || (m[1] === '' && m[3] === undefined)) return null; // `{}` / bare `{` ⇒ literal
-    const min = m[1] === '' ? 0 : Number.parseInt(m[1]!, 10);
-    const hasComma = m[2] !== undefined;
-    // `{n}` ⇒ exactly n; `{n,}` ⇒ open-ended (Infinity); `{n,m}` ⇒ m; `{,m}` ⇒ m (min defaulted to 0).
-    const max = !hasComma ? min : m[3] === '' ? Number.POSITIVE_INFINITY : Number.parseInt(m[3]!, 10);
-    return { len: m[0].length, unbounded: hasComma, max };
+  let budget = 1;
+  const ambiguous: boolean[] = [false];
+  const branches: number[] = [1];
+  const charge = (factor: number): void => {
+    budget = Math.min(budget * factor, Number.MAX_SAFE_INTEGER);
   };
+  const markAmbiguous = (): void => {
+    ambiguous[ambiguous.length - 1] = true;
+  };
+
   for (let i = 0; i < src.length; ) {
     const ch = src[i]!;
     if (ch === '\\') {
-      i += 2; // escaped atom ⇒ literal
+      i += 2;
       continue;
     }
     if (ch === '[') {
-      // Character class: everything up to the closing `]` is literal (quantifier chars included).
       i++;
       if (src[i] === '^') i++;
-      if (src[i] === ']') i++; // a leading `]` is a literal class member
+      if (src[i] === ']') i++;
       while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
-      i++; // consume `]`
+      i++;
       continue;
     }
     if (ch === '(') {
-      risky.push(false);
+      ambiguous.push(false);
+      branches.push(1);
       i++;
+      const prefix = GROUP_PREFIX.exec(src.slice(i));
+      if (prefix) i += prefix[0].length;
       continue;
     }
     if (ch === ')') {
-      const body = risky.pop() ?? false;
+      const body = ambiguous.pop() ?? false;
+      const branchCount = branches.pop() ?? 1;
+      if (ambiguous.length === 0) ambiguous.push(false);
+      if (branches.length === 0) branches.push(1);
       i++;
       let quantified = false;
-      let quantUnbounded = false;
-      let quantMax = 1; // reps the group's quantifier permits (1 = none, `?`, `{0,1}`, `{1}` — all safe)
+      let quantMax = 1;
+      let quantMin = 1;
       const q = src[i];
       if (q === '*' || q === '+') {
         quantified = true;
-        quantUnbounded = true;
+        quantMin = q === '+' ? 1 : 0;
         quantMax = Number.POSITIVE_INFINITY;
         i++;
       } else if (q === '?') {
         quantified = true;
+        quantMin = 0;
         i++;
       } else if (q === '{') {
-        const b = readBrace(i);
+        const b = readBrace(src, i);
         if (b) {
           quantified = true;
-          quantUnbounded = b.unbounded;
+          quantMin = b.min;
           quantMax = b.max;
           i += b.len;
         }
       }
-      if (quantified && (src[i] === '?' || src[i] === '+')) i++; // lazy / possessive suffix
-      // A group with a risky body (its own quantifier or alternation) becomes catastrophic the moment
-      // it can repeat TWO OR MORE times — whether the outer quantifier is unbounded (`(x+)+`) OR a
-      // bounded exact/range count `>= 2` (`(x*){15}`, `(x?){250}`), which V8 unrolls into sequential
-      // copies of the risky body. Reject both; only a bound of `<= 1` (`?`/`{0,1}`/`{1}`) is safe.
+      if (quantified && (src[i] === '?' || src[i] === '+')) i++;
       if (body && quantMax >= 2) return false;
-      if (quantified && quantUnbounded) unbounded++;
-      const parent = risky.length - 1;
-      risky[parent] = risky[parent] || body || quantified;
+      charge(branchCount);
+      if (quantified) charge(repetitionCost(quantMin, quantMax));
+      if (body || quantified) markAmbiguous();
       continue;
     }
     if (ch === '|') {
-      risky[risky.length - 1] = true;
+      branches[branches.length - 1]!++;
+      markAmbiguous();
       i++;
       continue;
     }
     if (ch === '*' || ch === '+') {
-      // Unbounded quantifier on a single preceding atom.
-      unbounded++;
-      risky[risky.length - 1] = true;
+      charge(UNBOUNDED_COST);
+      markAmbiguous();
       i++;
       if (src[i] === '?' || src[i] === '+') i++;
       continue;
     }
     if (ch === '?') {
-      risky[risky.length - 1] = true;
+      charge(2);
+      markAmbiguous();
       i++;
+      if (src[i] === '?') i++;
       continue;
     }
     if (ch === '{') {
-      const b = readBrace(i);
+      const b = readBrace(src, i);
       if (b) {
-        if (b.unbounded) {
-          unbounded++;
-          risky[risky.length - 1] = true;
-        }
+        const cost = repetitionCost(b.min, b.max);
+        charge(cost);
+        if (cost > 1) markAmbiguous();
         i += b.len;
-        if (src[i] === '?') i++; // lazy suffix
+        if (src[i] === '?') i++;
         continue;
       }
-      i++; // literal brace
+      i++;
       continue;
     }
-    i++; // literal char
+    i++;
   }
-  return unbounded <= MAX_UNBOUNDED_QUANTIFIERS;
+  charge(branches[0] ?? 1);
+  return budget <= MAX_AMBIGUITY;
 }

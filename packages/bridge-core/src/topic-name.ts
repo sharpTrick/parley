@@ -14,10 +14,13 @@ import type { Topic } from './message.js';
  * Injective topic → backend-name mapping. `sanitize` is the backend's legal-charset fold
  * (unchanged from today). Whenever that fold is LOSSY for this topic — i.e. the sanitized
  * form differs from the raw topic string (character replacement, lowercasing, or truncation)
- * — we append `-<shorthash(raw)>` so two distinct topics can never share one backend name.
- * Naturally-safe topics (the conformance `t-<n>-<rand>` shape) pass through unchanged, so
- * existing rooms/streams keep their readable names. Hash is over the RAW topic's UTF-8 bytes,
- * exactly like bridge-postgres channelFor.
+ * — we append `<sep><shorthash(raw)>` so two distinct topics can never share one backend name.
+ * Hash is over the RAW topic's UTF-8 bytes, exactly like bridge-postgres channelFor.
+ *
+ * A naturally-safe topic passes through unchanged so existing rooms/streams keep their readable
+ * names — EXCEPT when it already looks like a disambiguated name, which would otherwise let a
+ * caller pick the raw topic `<sanitized><sep><hash>` and land in another topic's channel. Those
+ * are disambiguated too, keeping the two branches' outputs disjoint.
  */
 export function safeName(
   topic: Topic,
@@ -25,8 +28,16 @@ export function safeName(
   opts: { hashLen?: number; sep?: string } = {},
 ): string {
   const raw = topic as string;
+  const hashLen = opts.hashLen ?? 10;
+  const sep = opts.sep ?? '-';
   const sanitized = sanitize(raw);
-  if (sanitized === raw) return sanitized; // already legal — no disambiguation needed
-  const hash = createHash('sha1').update(raw, 'utf8').digest('hex').slice(0, opts.hashLen ?? 10);
-  return `${sanitized}${opts.sep ?? '-'}${hash}`;
+  if (sanitized === raw && !isDisambiguated(raw, sep, hashLen)) return sanitized;
+  const hash = createHash('sha1').update(raw, 'utf8').digest('hex').slice(0, hashLen);
+  return `${sanitized}${sep}${hash}`;
+}
+
+function isDisambiguated(name: string, sep: string, hashLen: number): boolean {
+  if (name.length <= sep.length + hashLen) return false;
+  if (!name.startsWith(sep, name.length - sep.length - hashLen)) return false;
+  return /^[0-9a-f]+$/.test(name.slice(name.length - hashLen));
 }

@@ -60,3 +60,64 @@ describe('safeName', () => {
     expect(out).toMatch(/^a_b\.[0-9a-f]{4}$/);
   });
 });
+
+// Injectivity is the whole point of safeName, so assert it as a property over a generated corpus
+// CLOSED UNDER safeName ITSELF: every name the mapping produces is fed back in as a raw topic.
+// Fixed lossy/lossless pairs can never see the collision that matters — a topic literally equal to
+// another topic's disambiguated `<sanitized><sep><hash>` output, which an attacker can compute.
+describe('safeName injectivity (generated, closed under its own output)', () => {
+  const folds: [string, (s: string) => string][] = [
+    ['NATS subject', sanitizeToken],
+    ['NATS stream', sanitizeName],
+    ['Matrix alias', sanitizeAlias],
+    ['XMPP localpart', sanitizeLocal],
+  ];
+
+  const SEEDS = [
+    'ops',
+    'Ops',
+    'OPS',
+    'team.frontend',
+    'team_frontend',
+    'team/frontend',
+    'a b',
+    'a_b',
+    'a.b',
+    'a/b',
+    'dev ops',
+    'dev/ops',
+    'ctx-payments',
+    't-1-abcd',
+    'x',
+    'X',
+    'a-0123456789',
+    'a-0123456789ab',
+  ];
+
+  it.each(folds)('is injective over the corpus and its closure (%s)', (_label, fold) => {
+    const corpus = new Set(SEEDS);
+    for (let round = 0; round < 2; round++) {
+      for (const raw of [...corpus]) corpus.add(safeName(asTopic(raw), fold));
+    }
+    const byName = new Map<string, string>();
+    for (const raw of corpus) {
+      const name = safeName(asTopic(raw), fold);
+      const clash = byName.get(name);
+      expect(clash, `${JSON.stringify(raw)} and ${JSON.stringify(clash)} both map to ${name}`).toBe(
+        undefined,
+      );
+      byName.set(name, raw);
+    }
+  });
+
+  it.each(folds)('a disambiguated name is never a fixed point of the mapping (%s)', (_l, fold) => {
+    const disambiguated = safeName(asTopic('a b'), fold);
+    expect(safeName(asTopic(disambiguated), fold)).not.toBe(disambiguated);
+  });
+
+  it.each(folds)('honours the closure property under custom sep/hashLen too (%s)', (_l, fold) => {
+    const opts = { hashLen: 4, sep: '.' };
+    const first = safeName(asTopic('a b'), fold, opts);
+    expect(safeName(asTopic(first), fold, opts)).not.toBe(first);
+  });
+});

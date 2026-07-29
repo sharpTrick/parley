@@ -35,7 +35,13 @@ export {
 } from './config.js';
 
 // Security: topic allowlist (DESIGN §14).
-export { Allowlist, allowlistFor, TopicNotAllowedError, type AllowlistOptions } from './allowlist.js';
+export {
+  Allowlist,
+  allowlistFor,
+  TopicNotAllowedError,
+  UnsafePatternError,
+  type AllowlistOptions,
+} from './allowlist.js';
 
 // Engine: dedup / ordering / catch-up / read-state (DESIGN §6/§7).
 export { SeenSet } from './engine/seen-set.js';

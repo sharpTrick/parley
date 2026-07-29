@@ -1,12 +1,30 @@
 import type { ParleyConfig } from './config.js';
 import { asTopic, type Topic } from './message.js';
-import { MAX_MATCH_INPUT } from './regex-safety.js';
+import { isRedosSafeSource, MAX_MATCH_INPUT } from './regex-safety.js';
 
 /** Raised when a tool call or subscription targets a topic outside the allowlist. */
 export class TopicNotAllowedError extends Error {
-  constructor(public readonly topic: string) {
-    super(`topic not allowed: ${JSON.stringify(topic)}`);
+  constructor(
+    public readonly topic: string,
+    reason?: string,
+  ) {
+    super(
+      reason === undefined
+        ? `topic not allowed: ${JSON.stringify(topic)}`
+        : `topic not allowed: ${JSON.stringify(topic)} — ${reason}`,
+    );
     this.name = 'TopicNotAllowedError';
+  }
+}
+
+/** Raised when a `post_topics` pattern could be driven into catastrophic backtracking. */
+export class UnsafePatternError extends Error {
+  constructor(public readonly pattern: string) {
+    super(
+      `post pattern risks catastrophic backtracking: ${JSON.stringify(pattern)} — a ` +
+        'caller-supplied topic could hang the bridge. Simplify it (see post_topics in the README).',
+    );
+    this.name = 'UnsafePatternError';
   }
 }
 
@@ -14,8 +32,9 @@ export class TopicNotAllowedError extends Error {
 export interface AllowlistOptions {
   /**
    * Regex sources additionally allowed for `post`/`fetch_recent` (NOT subscribe/catch-up).
-   * Each is compiled full-match anchored (`^(?:src)$`). Invalid sources should be rejected by
-   * config validation first; the constructor throws if one reaches here.
+   * Each is compiled full-match anchored (`^(?:src)$`) and screened for catastrophic backtracking.
+   * Config validation rejects both classes first; the constructor throws if one reaches here —
+   * `SyntaxError` for an uncompilable source, {@link UnsafePatternError} for an unsafe one.
    */
   postPatterns?: readonly string[];
   /** Topics never allowed via ANY path, even if matched by a pattern (the presence topic). */
@@ -51,23 +70,35 @@ export class Allowlist {
       if (this.reserved.has(t)) throw new TopicNotAllowedError(t); // reserved ∩ explicit is a config error
     }
     this.patternSources = opts.postPatterns ?? [];
-    this.patternRegexes = this.patternSources.map((src) => new RegExp(`^(?:${src})$`));
+    this.patternRegexes = this.patternSources.map((src) => {
+      if (!isRedosSafeSource(src)) throw new UnsafePatternError(src);
+      return new RegExp(`^(?:${src})$`);
+    });
   }
 
   /** True if the topic may be posted to / fetched: explicit OR pattern match, never reserved. */
   has(topic: string): boolean {
     if (this.reserved.has(topic)) return false;
     if (this.allowed.has(topic)) return true;
-    // Bound the string a pattern ever sees, so that a caller cannot drive a config pattern into
-    // deep backtracking with a long topic. Config load screens the patterns; this bounds the input.
+    // Keep the input clamp, so that MAX_AMBIGUITY still bounds what a screened pattern can spend.
     if (topic.length > MAX_MATCH_INPUT) return false;
     return this.patternRegexes.some((re) => re.test(topic));
   }
 
   /** Return the branded Topic if postable/fetchable; otherwise throw {@link TopicNotAllowedError}. */
   assert(topic: string): Topic {
-    if (!this.has(topic)) throw new TopicNotAllowedError(topic);
-    return asTopic(topic);
+    if (this.has(topic)) return asTopic(topic);
+    const overLong =
+      this.patternRegexes.length > 0 &&
+      topic.length > MAX_MATCH_INPUT &&
+      !this.reserved.has(topic);
+    if (overLong)
+      throw new TopicNotAllowedError(
+        topic,
+        `post_topics patterns are only matched against topics of at most ${MAX_MATCH_INPUT} ` +
+          `characters (this one is ${topic.length}); list it in \`topics\` instead`,
+      );
+    throw new TopicNotAllowedError(topic);
   }
 
   /** The EXPLICIT topics only, branded — what subscribe/catch-up/presence iterate. */

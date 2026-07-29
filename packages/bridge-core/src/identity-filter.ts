@@ -19,9 +19,7 @@ import type { Handle } from './message.js';
 /**
  * Longest glob `filter` we will evaluate; a longer pattern matches nothing. Handles and their globs
  * are short in practice, so this only trips on pathological input. Mirrored by a `.max()` on the
- * `parley_list_users` `filter` schema so Zod rejects an over-long filter before it reaches here —
- * but `matchGlob`/`filterHandles` are library functions callable outside the tool path, so the bound
- * is enforced here too.
+ * `parley_list_users` `filter` schema, which rejects an over-long filter before it reaches here.
  */
 export const MAX_GLOB_LEN = 256;
 
@@ -60,7 +58,7 @@ function globMatch(pattern: string, value: string): boolean {
   return p === P;
 }
 
-/** True if `value` matches the glob `pattern`. */
+/** The matcher primitive behind {@link filterHandles}; exported for its own unit tests. */
 export function matchGlob(pattern: string, value: string): boolean {
   return globMatch(pattern, value);
 }

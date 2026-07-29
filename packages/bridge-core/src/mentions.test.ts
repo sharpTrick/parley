@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseMentions } from './mentions.js';
+import { isMentionableHandle, parseMentions } from './mentions.js';
 import { asHandle } from './message.js';
 
 describe('parseMentions', () => {
@@ -47,4 +47,46 @@ describe('parseMentions', () => {
     // This is the exact predicate push-loop.ts evaluates for `mention_filter: true`.
     expect(parseMentions('ping @bob.').includes(asHandle('bob'))).toBe(true);
   });
+});
+
+// The mention grammar and the handle grammar must be one grammar: `mention_filter` compares a
+// configured handle against parsed mentions, so any handle isMentionableHandle admits has to be
+// reachable from content, and any it rejects must be unreachable. Widening either side alone
+// re-opens the silent-drop class, so assert the equivalence over a generator, not fixed strings.
+describe('isMentionableHandle agrees with parseMentions', () => {
+  const CANDIDATES = [
+    'a',
+    'bob',
+    'Bob',
+    'b0t',
+    'ctx-payments',
+    'a.b',
+    'a_b',
+    'a-b-c',
+    'x'.repeat(64),
+    '_bot',
+    '-bot',
+    '.bot',
+    'bot_',
+    'bot-',
+    'bot.',
+    'bot bot',
+    '@bot',
+    'bot@example.com',
+    'алиса',
+    '',
+    '.',
+    '-',
+    'a..b',
+    'a/b',
+    'a:b',
+  ];
+
+  it.each(CANDIDATES.map((h) => [JSON.stringify(h), h]))(
+    'round-trips exactly when it says it will (%s)',
+    (_label, handle) => {
+      const parsed = parseMentions(`hi @${handle} there`);
+      expect(parsed.includes(asHandle(handle))).toBe(isMentionableHandle(handle));
+    },
+  );
 });

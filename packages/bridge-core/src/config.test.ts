@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { instanceIdOf, parseConfig } from './config.js';
+import { parseMentions } from './mentions.js';
 
 describe('config loader', () => {
   it('applies defaults from a minimal config', () => {
@@ -277,6 +278,138 @@ describe('config loader', () => {
           mode: 'oidc',
           oidc: { issuer: 'http://127.0.0.1:8080/realms/x', required_role: 'parley-owner' },
         },
+      }),
+    ).not.toThrow();
+  });
+});
+
+// A key the schema does not know is a LOAD ERROR, not a silent strip. The class here is
+// "operator typo produces a bridge that quietly does nothing" — `live_push: {enable: true}` parsed
+// cleanly and left live push off. Walk a fully-populated config and near-miss every key, so a
+// field added later is covered the moment it appears in the fixture.
+describe('config rejects unknown keys', () => {
+  const FULL = {
+    instance_id: 'inst',
+    state_path: '/tmp/parley-state.json',
+    identity: { handle: 'h' },
+    topics: ['ctx'],
+    post_topics: ['ctx-.*'],
+    catchup: {
+      on_start: true,
+      limit: 10,
+      block_max_ms: 1000,
+      block_poll_interval_ms: 100,
+    },
+    live_push: { enabled: true, mention_filter: false },
+    presence: { enabled: true, topic: 'parley-presence', heartbeat_ms: 1000, ttl_ms: 3000 },
+    permissions: { skip_permissions: false },
+    auth: {
+      mode: 'oidc',
+      oidc: {
+        issuer: 'https://kc.example.com/realms/r',
+        audience: 'parley-mcp',
+        jwks_uri: 'https://kc.example.com/jwks',
+        required_scope: 'mcp',
+        allowed_subjects: ['sub-1'],
+        allowed_usernames: ['alice'],
+        required_role: 'parley-owner',
+        clock_skew_s: 30,
+      },
+    },
+    backend_config: { db_path: './x.db' },
+  };
+
+  it('accepts the fully-populated fixture', () => {
+    expect(() => parseConfig(structuredClone(FULL))).not.toThrow();
+  });
+
+  function keyPaths(node: unknown, prefix: string[] = []): string[][] {
+    if (typeof node !== 'object' || node === null || Array.isArray(node)) return [];
+    return Object.entries(node).flatMap(([k, v]) => [
+      [...prefix, k],
+      ...keyPaths(v, [...prefix, k]),
+    ]);
+  }
+
+  // `backend_config` is opaque to core (DESIGN §11), so its interior is deliberately open.
+  const paths = keyPaths(FULL).filter((p) => p[0] !== 'backend_config');
+
+  it.each(paths.map((p) => [p.join('.'), p]))(
+    'rejects a near-miss of %s instead of ignoring it',
+    (_label, path) => {
+      const mutated = structuredClone(FULL) as Record<string, unknown>;
+      let node = mutated;
+      for (const step of (path as string[]).slice(0, -1)) {
+        node = node[step] as Record<string, unknown>;
+      }
+      const leaf = (path as string[]).at(-1)!;
+      node[leaf.length > 1 ? leaf.slice(0, -1) : `${leaf}x`] = node[leaf];
+      delete node[leaf];
+      expect(() => parseConfig(mutated)).toThrow();
+    },
+  );
+
+  it.each([
+    ['live_push.enable', { identity: { handle: 'h' }, topics: ['t'], live_push: { enable: true } }],
+    ['catchup.limt', { identity: { handle: 'h' }, topics: ['t'], catchup: { limt: 5 } }],
+    ['presense', { identity: { handle: 'h' }, topics: ['t'], presense: { enabled: false } }],
+    ['identiy', { identiy: { handle: 'h' }, identity: { handle: 'h' }, topics: ['t'] }],
+    [
+      'permissions.skip_permission',
+      { identity: { handle: 'h' }, topics: ['t'], permissions: { skip_permission: true } },
+    ],
+  ])('rejects the operator typo %s', (_label, raw) => {
+    expect(() => parseConfig(raw)).toThrow();
+  });
+});
+
+// `mention_filter` compares a parsed @mention against `identity.handle`, so a handle the mention
+// grammar cannot produce silently drops EVERY inbound message. Either grammar may widen later;
+// the invariant is that the two agree, so assert the round trip rather than one bad handle.
+describe('mention_filter requires a mentionable handle', () => {
+  const HANDLES = [
+    'bob',
+    'a',
+    'ctx-payments',
+    'a.b',
+    'a_b',
+    '_bot',
+    '-bot',
+    '.bot',
+    'bot_',
+    'bot-',
+    'bot.',
+    'алиса',
+    'bot bot',
+    '@bot',
+    'bot@example.com',
+    'Bot',
+    'b0t',
+    'x'.repeat(64),
+  ];
+
+  it.each(HANDLES)('either rejects %s at load or can actually match it', (handle) => {
+    const raw = {
+      identity: { handle },
+      topics: ['t'],
+      live_push: { enabled: true, mention_filter: true },
+    };
+    let loaded = true;
+    try {
+      parseConfig(raw);
+    } catch {
+      loaded = false;
+    }
+    if (!loaded) return;
+    expect(parseMentions(`hi @${handle} there`)).toContain(handle);
+  });
+
+  it('leaves a non-mentionable handle usable when mention_filter is off', () => {
+    expect(() =>
+      parseConfig({
+        identity: { handle: 'parley-bot@localhost' },
+        topics: ['t'],
+        live_push: { enabled: true, mention_filter: false },
       }),
     ).not.toThrow();
   });

@@ -273,13 +273,13 @@ a real account:
 | `instance_id` | `identity.handle` | **Read-state namespace.** Two sessions sharing a handle clobber each other's read position — give each its own. Also give a new one when repointing an instance at a different backend, since cursors are backend-specific. |
 | `state_path` | `$XDG_STATE_HOME/parley/<instance>/read-state.json` | Where that cursor file lives. |
 | `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** |
-| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or announced. |
+| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or announced. Patterns are screened for catastrophic backtracking at load, and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
 | `catchup.on_start` | `true` | Drain everything newer than the stored cursor at startup. |
 | `catchup.limit` | `100` | Page size per `fetchRecent`. |
 | `catchup.block_max_ms` | `60000` | Server-side ceiling on `block_ms` (above). |
 | `catchup.block_poll_interval_ms` | `250` | Re-query cadence for core's generic long-poll fallback. Latency/cost only. |
 | `live_push.enabled` | `false` | Claude Code only — push `<channel>` events into a running session. |
-| `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. |
+| `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. Requires a handle an `@mention` can name (ASCII letters/digits, optional interior `.` `-` `_`); anything else is a load error rather than a bridge that silently receives nothing. |
 | `presence.enabled` | **`true`** | See the warning below. |
 | `presence.topic` | `parley-presence` | The one shared topic beats go to. Reserved: it can never appear in `topics`. |
 | `presence.heartbeat_ms` | `600000` | Beat cadence. |
@@ -295,6 +295,10 @@ a real account:
 
 There is no `backend` key: the backend is whichever `parley-<name>` binary you run. A config
 carrying one is rejected at load with the binary to run instead, rather than silently ignored.
+
+Every other key outside `backend_config` is checked too: an unrecognised one (`live_push: enable:`,
+`presense:`) is a load error naming it, not a silently dropped line that leaves you with a bridge
+quietly doing nothing. `backend_config` stays open — it is opaque to core.
 
 ---
 

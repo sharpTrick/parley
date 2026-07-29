@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Allowlist, TopicNotAllowedError } from './allowlist.js';
+import { Allowlist, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
 
 describe('Allowlist', () => {
   const allow = new Allowlist(['ctx-payments', 'ctx-payments-reviews']);
@@ -63,24 +63,56 @@ describe('Allowlist reserved topics', () => {
     );
   });
 
-  // The topic is caller-supplied, so however a pattern was written, matching must stay bounded.
-  // Guard the class: any over-long input, against any pattern, returns fast and fails closed.
-  it.each([
-    ['nested quantifier', '([a-z]+)+'],
-    ['alternation under a quantifier', '(a|a)*'],
-    ['many unbounded quantifiers', '.*.*.*.*.*'],
-    ['plain broad pattern', 'ctx-.*'],
-  ])('bounds match work against a hostile over-long topic (%s)', (_label, pattern) => {
-    const allow = new Allowlist(['ctx'], { postPatterns: [pattern] });
-    const hostile = 'a'.repeat(5000) + '!';
-    const started = Date.now();
-    expect(allow.has(hostile)).toBe(false);
-    expect(Date.now() - started).toBeLessThan(200);
-  });
-
   it('still matches ordinary topics up to the input bound', () => {
     const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*'] });
     expect(allow.has(`ctx-${'a'.repeat(59)}`)).toBe(true); // 63 chars, under the 64 cap
     expect(allow.has(`ctx-${'a'.repeat(80)}`)).toBe(false); // over it, refused rather than matched
+  });
+
+  it('says WHY an over-long topic was refused instead of just "not allowed"', () => {
+    const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*'] });
+    expect(() => allow.assert(`ctx-${'a'.repeat(80)}`)).toThrow(/at most 64 characters/);
+    expect(() => allow.assert('nope')).toThrow(/^topic not allowed: "nope"$/);
+  });
+});
+
+// `Allowlist` is public API: an embedder can construct one with patterns that never went through
+// parseConfig, and `has` is then driven by a caller-supplied topic. Screen at BOTH ends — refuse
+// the hostile source at construction, and bound the input the survivors ever see.
+describe('Allowlist pattern safety', () => {
+  const HOSTILE = [
+    ['nested quantifier', '([a-z]+)+'],
+    ['alternation under a quantifier', '(a|a)*'],
+    ['bounded repeat over a risky body', '([a-z]*){15}'],
+    ['many unbounded quantifiers', '.*.*.*.*.*'],
+    ['ambiguous alternation chain', `${'(a|aa)'.repeat(30)}b`],
+    ['ambiguous alternation chain (dot)', `${'(.|..)'.repeat(30)}z`],
+    ['optional-atom chain', `${'a?'.repeat(24)}${'a'.repeat(24)}b`],
+  ] as const;
+
+  it.each(HOSTILE)('refuses to compile a pattern that can blow up (%s)', (_label, pattern) => {
+    expect(() => new Allowlist(['ctx'], { postPatterns: [pattern] })).toThrow(UnsafePatternError);
+  });
+
+  // Two axes: pattern shape × topic length, INCLUDING lengths under the input clamp. The old
+  // single-axis table only fed a 5000-char topic, which `has` rejects on length before any regex
+  // runs — so it graded the clamp, never the matcher.
+  const LENGTHS = [1, 8, 32, 63, 64, 65, 256, 5000];
+  const SAFE = [
+    ['plain broad pattern', 'ctx-.*'],
+    ['character class', 'project-[a-z0-9-]+'],
+    ['alternation', '(alpha|beta)-.*'],
+    ['bounded repeat', 'ctx-\\d{1,4}'],
+    ['four unbounded quantifiers', '.*.*.*.*x'],
+  ] as const;
+
+  it.each(
+    SAFE.flatMap(([label, pattern]) => LENGTHS.map((len) => [`${label} @ ${len}`, pattern, len])),
+  )('bounds match work for any topic length (%s)', (_label, pattern, len) => {
+    const allow = new Allowlist(['ctx'], { postPatterns: [pattern as string] });
+    const topic = 'a'.repeat((len as number) - 1) + '!';
+    const started = Date.now();
+    expect(allow.has(topic)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(100);
   });
 });

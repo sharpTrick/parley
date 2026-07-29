@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
+import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 
 /**
@@ -10,40 +11,42 @@ import { isRedosSafeSource } from './regex-safety.js';
  * Protected Resource Metadata pointing at the issuer and validates inbound Bearer JWTs locally.
  * Nothing in this block is a secret (issuer/audience/claim policy are public-side config).
  */
-export const OidcAuthSchema = z.object({
-  /** OIDC issuer, e.g. https://kc.example.com/realms/myrealm. Discovery is fetched from
-   *  `<issuer>/.well-known/openid-configuration` at startup. Must be https — the JWKS trust
-   *  root depends on TLS — except on loopback, where test/dev fakes serve over http. */
-  issuer: z
-    .string()
-    .url()
-    .refine(
-      (u) => {
-        const url = new URL(u);
-        return (
-          url.protocol === 'https:' || url.hostname === '127.0.0.1' || url.hostname === 'localhost'
-        );
-      },
-      { message: 'auth.oidc.issuer must use https (the JWKS trust root depends on TLS)' },
-    ),
-  /** Expected `aud` value. Default: the canonical resource id (public URL + mcpPath). Keycloak
-   *  ignores RFC 8707 `resource`, so an audience mapper must emit this exact string — see
-   *  docs/keycloak-integration.md. */
-  audience: z.string().min(1).optional(),
-  /** Override the JWKS URI (default: `jwks_uri` from discovery). */
-  jwks_uri: z.string().url().optional(),
-  /** If set, the token's `scope` (space-separated) must include this value. */
-  required_scope: z.string().min(1).optional(),
-  /** Identity gates preserving the single-tenant posture: any that are set must ALL pass.
-   *  Issuer + audience validation is always mandatory regardless. */
-  allowed_subjects: z.array(z.string().min(1)).nonempty().optional(),
-  /** Matched against the `preferred_username` claim. */
-  allowed_usernames: z.array(z.string().min(1)).nonempty().optional(),
-  /** Required realm role (Keycloak `realm_access.roles`). */
-  required_role: z.string().min(1).optional(),
-  /** exp/nbf tolerance in seconds. */
-  clock_skew_s: z.number().int().min(0).max(300).default(30),
-});
+export const OidcAuthSchema = z
+  .object({
+    /** OIDC issuer, e.g. https://kc.example.com/realms/myrealm. Discovery is fetched from
+     *  `<issuer>/.well-known/openid-configuration` at startup. Must be https — the JWKS trust
+     *  root depends on TLS — except on loopback, where test/dev fakes serve over http. */
+    issuer: z
+      .string()
+      .url()
+      .refine(
+        (u) => {
+          const url = new URL(u);
+          return (
+            url.protocol === 'https:' || url.hostname === '127.0.0.1' || url.hostname === 'localhost'
+          );
+        },
+        { message: 'auth.oidc.issuer must use https (the JWKS trust root depends on TLS)' },
+      ),
+    /** Expected `aud` value. Default: the canonical resource id (public URL + mcpPath). Keycloak
+     *  ignores RFC 8707 `resource`, so an audience mapper must emit this exact string — see
+     *  docs/keycloak-integration.md. */
+    audience: z.string().min(1).optional(),
+    /** Override the JWKS URI (default: `jwks_uri` from discovery). */
+    jwks_uri: z.string().url().optional(),
+    /** If set, the token's `scope` (space-separated) must include this value. */
+    required_scope: z.string().min(1).optional(),
+    /** Identity gates preserving the single-tenant posture: any that are set must ALL pass.
+     *  Issuer + audience validation is always mandatory regardless. */
+    allowed_subjects: z.array(z.string().min(1)).nonempty().optional(),
+    /** Matched against the `preferred_username` claim. */
+    allowed_usernames: z.array(z.string().min(1)).nonempty().optional(),
+    /** Required realm role (Keycloak `realm_access.roles`). */
+    required_role: z.string().min(1).optional(),
+    /** exp/nbf tolerance in seconds. */
+    clock_skew_s: z.number().int().min(0).max(300).default(30),
+  })
+  .strict();
 
 export type OidcAuthConfig = z.infer<typeof OidcAuthSchema>;
 
@@ -53,6 +56,7 @@ export const AuthSchema = z
     mode: z.enum(['builtin', 'oidc']).default('builtin'),
     oidc: OidcAuthSchema.optional(),
   })
+  .strict()
   .superRefine((a, ctx) => {
     if (a.mode === 'oidc' && a.oidc === undefined) {
       ctx.addIssue({
@@ -101,9 +105,11 @@ const ConfigObject = z.object({
   instance_id: z.string().optional(),
   /** Override the read-state file path (default: XDG_STATE_HOME/parley/<instance>/read-state.json). */
   state_path: z.string().optional(),
-  identity: z.object({
-    handle: z.string().min(1),
-  }),
+  identity: z
+    .object({
+      handle: z.string().min(1),
+    })
+    .strict(),
   /** Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). */
   topics: z.array(z.string().min(1)).min(1),
   /**
@@ -130,12 +136,14 @@ const ConfigObject = z.object({
        */
       block_poll_interval_ms: z.number().int().positive().default(250),
     })
+    .strict()
     .default({}),
   live_push: z
     .object({
       enabled: z.boolean().default(false),
       mention_filter: z.boolean().default(false),
     })
+    .strict()
     .default({}),
   /**
    * Presence (DESIGN §7): the bridge announces itself (hello/heartbeat/goodbye) to ONE shared
@@ -152,6 +160,7 @@ const ConfigObject = z.object({
       heartbeat_ms: z.number().int().positive().default(600_000),
       ttl_ms: z.number().int().positive().optional(),
     })
+    .strict()
     .default({})
     // Dependent default: TTL tracks the heartbeat unless explicitly pinned.
     .transform((p) => ({ ...p, ttl_ms: p.ttl_ms ?? p.heartbeat_ms * 3 })),
@@ -163,6 +172,7 @@ const ConfigObject = z.object({
        */
       skip_permissions: z.boolean().default(false),
     })
+    .strict()
     .default({}),
   /** Remote-mode auth selection; ignored in local stdio mode. Absent = built-in OAuth AS. */
   auth: AuthSchema.default({}),
@@ -171,13 +181,20 @@ const ConfigObject = z.object({
 });
 
 /**
+ * Unknown keys are a load error, not silently dropped: a misspelled `live_push.enable` or
+ * `presense:` would otherwise leave the operator with a bridge that quietly does nothing.
+ * `backend_config` stays open — it is opaque to core (DESIGN §11).
+ */
+const StrictConfigObject = ConfigObject.strict();
+
+/**
  * The load-time config schema. Wraps {@link ConfigObject} with cross-field validation:
  *  - every `post_topics` pattern must be a compilable regex;
  *  - the reserved presence topic must not appear in the explicit `topics` list.
  * (A `post_topics` pattern that *could* match the presence topic is allowed — a broad `.*` is
  * legitimate — because the reserved guard in {@link Allowlist} blocks that at runtime.)
  */
-export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
+export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
   cfg.post_topics.forEach((src, i) => {
     try {
       new RegExp(src);
@@ -197,8 +214,9 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
         code: z.ZodIssueCode.custom,
         path: ['post_topics', i],
         message:
-          'pattern risks catastrophic backtracking (nested or repeated quantifier, or too many ' +
-          'unbounded quantifiers); a caller-supplied topic could hang the bridge. Simplify it.',
+          'pattern risks catastrophic backtracking (a repeatable ambiguous group, or too many ' +
+          'alternations / optional or unbounded quantifiers); a caller-supplied topic could hang ' +
+          'the bridge. Simplify it.',
       });
     }
   });
@@ -218,6 +236,17 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
       path: ['presence', 'ttl_ms'],
       message:
         'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
+    });
+  }
+  if (cfg.live_push.mention_filter && !isMentionableHandle(cfg.identity.handle)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['identity', 'handle'],
+      message:
+        `live_push.mention_filter matches ${JSON.stringify(cfg.identity.handle)} against the ` +
+        '@mentions parsed out of message content, and no message can ever produce that handle ' +
+        '(a mention is ASCII letters/digits, with optional interior "." "-" "_"). Every inbound ' +
+        'message would be dropped: choose a mentionable handle or set mention_filter: false.',
     });
   }
   if (cfg.permissions.skip_permissions) {
