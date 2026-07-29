@@ -19,11 +19,11 @@ export const TOPIC_KEY = 'app.parley.topic';
 export const ROOM_ID = '!room:fake';
 
 export interface Ev {
-  type: string;
-  event_id: string;
-  sender: string;
-  origin_server_ts: number;
-  content: Record<string, unknown>;
+  type: unknown;
+  event_id: unknown;
+  sender: unknown;
+  origin_server_ts: unknown;
+  content: unknown;
 }
 
 const jsonRes = (obj: unknown, status = 200): Response =>
@@ -47,11 +47,25 @@ export class FakeSynapse {
   /** How an injected `/sync` failure presents: an HTTP status, or a rejected fetch. */
   syncFailureMode: 'status' | 'network' = 'status';
   syncFailureStatus = 500;
+  /** Remaining `/messages` calls to fail — the catch-up read path's fault injection. */
+  messagesFailures = 0;
+  messagesFailureMode: 'status' | 'network' = 'status';
+  messagesFailureStatus = 500;
+  /** Called before each request is served, so a case can arm a fault at a chosen phase. */
+  onRequest: (method: string, path: string) => void = () => undefined;
   /** Wall-clock timestamps of incremental `/sync` attempts — the retry-pacing evidence. */
   readonly syncAttempts: number[] = [];
-  /** Stall this many `timeout=0` positioning syncs, so a wake source can be caught mid-setup. */
-  positioningDelays = 0;
-  positioningDelayMs = 0;
+  /** Count of `timeout=0` positioning syncs served so far; the next one's 1-based ordinal is this + 1. */
+  positioningSyncs = 0;
+  /**
+   * Which positioning sync to stall, by 1-based arrival ordinal. Keep this a per-request predicate
+   * rather than a "stall the first N" counter, so that a case naming one participant's positioning
+   * window cannot silently grade a different participant's.
+   */
+  stallPositioning: (ordinal: number) => boolean = () => false;
+  stallPositioningMs = 600;
+  /** Ordinals actually stalled — a case that stalled nobody is visible instead of quietly passing. */
+  readonly stalledPositioning: number[] = [];
 
   private ev(type: string, content: Record<string, unknown>): Ev {
     const e: Ev = {
@@ -76,6 +90,16 @@ export class FakeSynapse {
     return this.ev(type, {});
   }
 
+  /**
+   * Inject an `m.room.message` whose fields carry arbitrary JSON. Synapse enforces no schema on
+   * event content, so any room member can send these — they are what the plugin actually reads.
+   */
+  addHostile(fields: Partial<Ev>): Ev {
+    const e = this.ev('m.room.message', { msgtype: 'm.text', body: 'hostile' });
+    Object.assign(e, fields);
+    return e;
+  }
+
   readonly fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     // Yield to the macrotask queue on every request so the subscribe() poll loop (no delay on its
     // success path) can never starve vitest's timer-based vi.waitFor.
@@ -83,6 +107,7 @@ export class FakeSynapse {
     const url = new URL(typeof input === 'string' ? input : ((input as Request).url ?? String(input)));
     const method = (init?.method ?? 'GET').toUpperCase();
     const path = url.pathname;
+    this.onRequest(method, path);
 
     if (path.endsWith('/v3/login')) return jsonRes({ access_token: 'tok', user_id: '@parley:fake' });
     if (path.includes('/v3/directory/room/')) {
@@ -123,6 +148,11 @@ export class FakeSynapse {
     }
 
     if (/\/rooms\/[^/]+\/messages$/.test(path)) {
+      if (this.messagesFailures > 0) {
+        this.messagesFailures--;
+        if (this.messagesFailureMode === 'network') throw new Error('fake network reset');
+        return jsonRes({ errcode: 'M_UNKNOWN', error: 'injected' }, this.messagesFailureStatus);
+      }
       const dir = url.searchParams.get('dir');
       const limit = Number(url.searchParams.get('limit') ?? '10');
       const from = url.searchParams.get('from');
@@ -147,9 +177,10 @@ export class FakeSynapse {
       const len = this.timeline.length;
       if (since === null) {
         // Initial positioning sync (timeline limit 0) — skip history, just hand back a resume token.
-        if (this.positioningDelays > 0) {
-          this.positioningDelays--;
-          await new Promise((r) => setTimeout(r, this.positioningDelayMs));
+        const ordinal = ++this.positioningSyncs;
+        if (this.stallPositioning(ordinal)) {
+          this.stalledPositioning.push(ordinal);
+          await new Promise((r) => setTimeout(r, this.stallPositioningMs));
         }
         const at = this.timeline.length;
         return jsonRes({ next_batch: `p${at}`, rooms: { join: { [ROOM_ID]: { timeline: { events: [], limited: false } } } } });
@@ -194,17 +225,19 @@ export interface ConnectOptions {
   syncTimeoutMs?: number;
 }
 
+export const fakeConfig = (opts: ConnectOptions = {}): Record<string, unknown> => ({
+  homeserver_url: 'http://synapse.fake',
+  server_name: 'fake',
+  user: 'parley',
+  password: 'a-real-test-secret',
+  sync_timeout_ms: opts.syncTimeoutMs ?? 50,
+  ...(opts.shared === true ? { shared_room: 'parley_conformance' } : {}),
+  ...(opts.roomPreset !== undefined ? { room_preset: opts.roomPreset } : {}),
+  ...(opts.invite !== undefined ? { invite: opts.invite } : {}),
+});
+
 export async function connectFake(opts: ConnectOptions = {}): Promise<MatrixPlugin> {
   const p = new MatrixPlugin();
-  await p.connect({
-    homeserver_url: 'http://synapse.fake',
-    server_name: 'fake',
-    user: 'parley',
-    password: 'a-real-test-secret',
-    sync_timeout_ms: opts.syncTimeoutMs ?? 50,
-    ...(opts.shared === true ? { shared_room: 'parley_conformance' } : {}),
-    ...(opts.roomPreset !== undefined ? { room_preset: opts.roomPreset } : {}),
-    ...(opts.invite !== undefined ? { invite: opts.invite } : {}),
-  });
+  await p.connect(fakeConfig(opts));
   return p;
 }
