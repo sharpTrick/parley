@@ -8,15 +8,39 @@ larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding
 
 | Seam | NATS JetStream |
 |---|---|
-| topic | one JetStream **stream** per topic (`<stream_prefix><topic>`), subject `<subject_prefix><topic>` |
+| topic | one JetStream **stream** per topic (`<stream_prefix><folded topic>`), subject `<subject_prefix><folded topic>` |
 | `post` | `js.publish(subject, payload)` → `PubAck.seq` |
 | cursor / backendMsgId | the stream **sequence** number (contiguous + monotonic per per-topic stream) |
 | `fetchRecent({since})` | ephemeral consumer from `opt_start_seq = since+1` (exclusive); no `since` → last-`limit` window |
-| `subscribe` | a `consume()` ordered consumer with `DeliverPolicy.New` — genuine events, not a poll timer |
+| `subscribe` | an ephemeral `consume()` consumer resuming at `DeliverPolicy.StartSequence` `lastSeq+1`, rebuilt on any loss — genuine events, not a poll timer |
 | `resolveIdentity` | string convention |
 
 One stream per topic keeps sequence numbers contiguous, so the cursor is a clean per-topic monotonic
 integer. Core never compares cursor values — NATS delivers in seq order.
+
+`subscribe` is **not** a nats.js `OrderedConsumer`: it is a plain named ephemeral consumer plus an
+explicit watcher. The server GCs such a consumer after 30s of client absence and `consume()` does
+not self-heal, so the plugin watches the consumer's status and rebuilds on any loss (deleted, not
+found, stream gone, dropped link), resuming at `lastSeq + 1` so messages published during the
+outage are backfilled rather than skipped. The connection itself reconnects without an attempt
+limit — an outage longer than the driver's default budget must not permanently deafen the bridge.
+
+### Topic → subject / stream names
+
+NATS subject tokens may not contain `.`, `*`, `>` or whitespace, and stream names also bar `/` and
+`\`. Those characters fold to `_` — and because that fold is many-to-one, a folded name also carries
+a `-<sha1-10>` suffix over the raw topic so two distinct topics can never collide onto one stream.
+Topics that are already legal are used verbatim:
+
+| topic | subject (default prefix) | stream (default prefix) |
+|---|---|---|
+| `deploys` | `parley.deploys` | `PARLEY_deploys` |
+| `team.chat` | `parley.team_chat-<sha1-10>` | `PARLEY_team_chat-<sha1-10>` |
+| `ops/oncall` | `parley.ops/oncall` | `PARLEY_ops_oncall-<sha1-10>` |
+| `red team` | `parley.red_team-<sha1-10>` | `PARLEY_red_team-<sha1-10>` |
+
+So `nats stream ls` shows the bare name only for already-legal topics; anything folded carries the
+hash suffix.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
 nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
@@ -32,10 +56,23 @@ backend_config:
   subject_prefix: "parley."    # default; topic → subject parley.<topic>
   stream_prefix: "PARLEY_"     # default; topic → stream PARLEY_<topic>
   retention_days: 30           # optional; omit to keep every message forever (the default)
+
+  # Auth — pick one; secrets belong in backend_config/.env, never in core, never committed.
+  token: "…"                   # token auth
+  user: "alice"                # user/password auth
+  pass: "…"
+  creds_file: "/etc/parley/user.creds"   # NATS .creds (JWT + nkey seed), e.g. NGS
+  nkey_seed: "SU…"             # raw nkey seed; prefer creds_file
+
+  # TLS material (file paths)
+  tls:
+    ca_file: "/etc/parley/ca.pem"
+    cert_file: "/etc/parley/client.pem"
+    key_file: "/etc/parley/client-key.pem"
 ```
 
-Topic tokens must not contain `.`, `*`, `>`, or whitespace (NATS subject rules); they're sanitized
-to `_` for safety.
+`creds_file` wins over `nkey_seed` when both are set. See "Topic → subject / stream names" above for
+how a topic is folded onto a subject and a stream.
 
 ## Retention (optional)
 

@@ -16,6 +16,8 @@ vi.mock('nats', async (importOriginal) => {
       jetstream: () => ({}),
       jetstreamManager: async () => ({}),
       drain: async () => undefined,
+      close: async () => undefined,
+      isClosed: () => false,
     })),
   };
 });

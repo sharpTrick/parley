@@ -15,16 +15,21 @@ import {
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
+import { readFileSync } from 'node:fs';
 import {
   AckPolicy,
   connect,
   ConsumerEvents,
+  credsAuthenticator,
   DeliverPolicy,
+  nkeyAuthenticator,
+  type ConnectionOptions,
   type ConsumerMessages,
   type JetStreamClient,
   type JetStreamManager,
   type NatsConnection,
   type StreamConfig,
+  type StreamInfo,
 } from 'nats';
 
 /** Plugin-specific backend_config. */
@@ -42,12 +47,27 @@ export interface NatsBackendConfig {
    * already-existing stream — edit or recreate the stream out-of-band for that.
    */
   retention_days?: number;
+  /** Token auth (`-auth`/`authorization.token`). Secret — `backend_config`/`.env` only. */
+  token?: string;
+  /** User/password auth. Secret — `backend_config`/`.env` only. */
+  user?: string;
+  pass?: string;
+  /** Path to a NATS `.creds` file (JWT + nkey seed) — NGS and any JWT-secured cluster. */
+  creds_file?: string;
+  /** Raw nkey seed (`SU…`); prefer `creds_file`. Secret — `backend_config`/`.env` only. */
+  nkey_seed?: string;
+  /** TLS material, as file paths. */
+  tls?: { ca_file?: string; cert_file?: string; key_file?: string };
 }
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const INACTIVE_NS = 30_000_000_000; // 30s ephemeral-consumer cleanup
 const RESUBSCRIBE_BACKOFF_MS = 1000; // wait before retrying a consumer while the backend is unreachable
+const RECONNECT_WAIT_MS = 1000;
+const RECONNECT_JITTER_MS = 500;
+const FETCH_EXPIRY_MS = 2000;
+const DRAIN_TIMEOUT_MS = 2000;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -55,8 +75,8 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * NATS JetStream backend (DESIGN §6/§9) — the fabric backend. One JetStream STREAM per topic, so
  * the stream sequence number is a contiguous, monotonic per-topic `cursor` (= `backendMsgId`).
  * `post` = `js.publish` (→ seq); `fetchRecent` = an ephemeral consumer from `opt_start_seq`
- * (exclusive `since`); `subscribe` = a `consume()` ephemeral consumer starting at `DeliverPolicy.New`
- * that rebuilds itself on server-side loss (genuine events). Core never compares cursor values —
+ * (exclusive `since`); `subscribe` = a `consume()` ephemeral consumer resuming at the last delivered
+ * sequence that rebuilds itself on any loss (genuine events). Core never compares cursor values —
  * NATS delivers in seq order.
  */
 export class NatsPlugin implements BackendPlugin {
@@ -77,7 +97,7 @@ export class NatsPlugin implements BackendPlugin {
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
     this.ensured.clear(); // a fresh connection starts from a clean stream-cache (BUG-01)
-    this.nc = await connect({ servers: cfg.servers ?? '127.0.0.1:4222' });
+    this.nc = await connect(connectionOptions(cfg));
     this.js = this.nc.jetstream();
     this.jsm = await this.nc.jetstreamManager();
   }
@@ -91,12 +111,16 @@ export class NatsPlugin implements BackendPlugin {
         /* already closing */
       }
     }
-    if (this.nc !== undefined) {
-      await this.nc.drain().catch(() => undefined);
-      this.nc = undefined;
-    }
+    const nc = this.nc;
+    this.nc = undefined;
     this.js = undefined;
     this.jsm = undefined;
+    if (nc !== undefined) {
+      // Keep the bounded race: `maxReconnectAttempts: -1` means drain() never settles while the
+      // link is down, so an unraced await here hangs teardown for the life of the outage.
+      await Promise.race([nc.drain().catch(() => undefined), delay(DRAIN_TIMEOUT_MS)]);
+      await nc.close().catch(() => undefined);
+    }
   }
 
   async post(
@@ -105,19 +129,23 @@ export class NatsPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
-    await this.ensureStream(topic);
     const payload = JSON.stringify({
       sender: identity,
       content,
       ts: new Date().toISOString(),
       in_reply_to: opts?.inReplyTo ?? '',
     });
-    const ack = await this.requireJs().publish(this.subject(topic), enc.encode(payload));
-    return asBackendMsgId(String(ack.seq));
+    return this.withStream(topic, async () => {
+      const ack = await this.requireJs().publish(this.subject(topic), enc.encode(payload));
+      return asBackendMsgId(String(ack.seq));
+    });
   }
 
-  async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    await this.ensureStream(args.topic);
+  fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    return this.withStream(args.topic, () => this.readRecent(args));
+  }
+
+  private async readRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const stream = this.streamName(args.topic);
     const limit = args.limit ?? 100;
     const info = await this.requireJsm().streams.info(stream);
@@ -148,17 +176,44 @@ export class NatsPlugin implements BackendPlugin {
       ack_policy: AckPolicy.None,
       inactive_threshold: INACTIVE_NS,
     });
-    const consumer = await this.requireJs().consumers.get(stream, ci.name);
+    // From here the ephemeral consumer exists server-side, so a throw in get()/fetch() must delete
+    // it in the finally — otherwise it lingers until `inactive_threshold` (30s).
     const messages: Message[] = [];
-    const batch = await consumer.fetch({ max_messages: want, expires: 2000 });
-    for await (const m of batch) {
-      messages.push(rowToMessage(args.topic, m.seq, dec.decode(m.data)));
-      if (messages.length >= want) break;
+    let batch: ConsumerMessages | undefined;
+    try {
+      const consumer = await this.requireJs().consumers.get(stream, ci.name);
+      batch = await consumer.fetch({ max_messages: want, expires: FETCH_EXPIRY_MS });
+      for await (const m of batch) {
+        messages.push(rowToMessage(args.topic, m.seq, dec.decode(m.data)));
+        if (messages.length >= want) break;
+      }
+    } finally {
+      void batch?.close();
+      await this.jsm?.consumers.delete(stream, ci.name).catch(() => undefined);
     }
-    await this.requireJsm().consumers.delete(stream, ci.name).catch(() => undefined);
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor(String(lastSeq)));
+    // A short read (expiry, slow link, filter mismatch) must resume immediately BEFORE the window
+    // it failed to read: keep `startSeq - 1`, so that an empty page can never park the persisted
+    // cursor at the tail and silently drop everything in between.
+    const nextCursor = last !== undefined ? last.cursor : asCursor(String(startSeq - 1));
     return { messages, nextCursor };
+  }
+
+  /**
+   * Run `op` against the topic's stream, re-provisioning the stream once if it vanished
+   * out-of-band (`nats stream rm`, storage reset). `ensured` memoizes success, so without this a
+   * removed stream stays broken for the life of the process.
+   */
+  private async withStream<T>(topic: Topic, op: () => Promise<T>): Promise<T> {
+    await this.ensureStream(topic);
+    try {
+      return await op();
+    } catch (err) {
+      if (!isStreamMissing(err)) throw err;
+      this.ensured.delete(this.streamName(topic));
+      await this.ensureStream(topic);
+      return await op();
+    }
   }
 
   /**
@@ -238,19 +293,22 @@ export class NatsPlugin implements BackendPlugin {
   }
 
   /**
-   * Live path = an ephemeral `consume()` consumer starting at `DeliverPolicy.New` (DESIGN §9 —
-   * genuine events; history is owned by catch-up). A plain named ephemeral consumer is GC'd by the
-   * server after `INACTIVE_NS` of client absence (restart / partition), and `consume()` does not
-   * self-heal — so we watch `iter.status()` and, on `ConsumerDeleted`/`ConsumerNotFound`/
-   * `StreamNotFound`, rebuild the consumer at `DeliverPolicy.StartSequence` `lastSeq + 1`, which
-   * both restores delivery and backfills the outage gap (BUG-02). The outer loop honors
-   * `disconnect()`: `this.stopped` + the registered closer stop it without a rebuild.
+   * Live path = an ephemeral `consume()` consumer resuming at `DeliverPolicy.StartSequence`
+   * `lastSeq + 1` (DESIGN §9 — genuine events; history is owned by catch-up). `lastSeq` is seeded
+   * from the stream tail at subscribe time so the FIRST consumer, like every rebuilt one, backfills
+   * whatever landed while it was absent. A plain named ephemeral consumer is GC'd by the server
+   * after `INACTIVE_NS` of client absence (restart / partition) and `consume()` does not self-heal,
+   * so we watch `iter.status()` for `ConsumerDeleted`/`ConsumerNotFound`/`StreamNotFound` and close
+   * the iterator; ANY iterator exit rebuilds (BUG-02) — a connection drop ends `consume()` with no
+   * status event at all. The outer loop honors `disconnect()`: `this.stopped` + the registered
+   * closer stop it without a rebuild, as does a permanently closed connection.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
-    await this.ensureStream(topic);
     const stream = this.streamName(topic);
     const filterSubject = this.subject(topic);
-    let lastSeq: number | undefined; // undefined → start at DeliverPolicy.New (no gap to backfill yet)
+    const seeded = await this.streamInfo(topic);
+    let lastSeq = seeded.state.last_seq;
+    let created = seeded.created;
     let current: ConsumerMessages | undefined;
     // A single closer so disconnect() tears down whichever iterator is live at the time.
     this.subscriptions.push({
@@ -258,27 +316,36 @@ export class NatsPlugin implements BackendPlugin {
     } as unknown as ConsumerMessages);
 
     void (async () => {
-      while (!this.stopped) {
+      let rebuild = false;
+      while (this.live()) {
         let iter: ConsumerMessages;
         try {
+          if (rebuild) await delay(RESUBSCRIBE_BACKOFF_MS);
+          rebuild = true;
+          // A recreated stream restarts its sequences, so a position carried over from the old one
+          // would skip the new stream's messages (or ask for a sequence past its tail forever).
+          const info = await this.streamInfo(topic);
+          if (info.created !== created) {
+            created = info.created;
+            lastSeq = 0;
+          }
+          if (lastSeq > info.state.last_seq) lastSeq = info.state.last_seq;
           const ci = await this.requireJsm().consumers.add(stream, {
             filter_subject: filterSubject,
-            deliver_policy: lastSeq === undefined ? DeliverPolicy.New : DeliverPolicy.StartSequence,
-            ...(lastSeq === undefined ? {} : { opt_start_seq: lastSeq + 1 }),
+            deliver_policy: DeliverPolicy.StartSequence,
+            opt_start_seq: lastSeq + 1,
             ack_policy: AckPolicy.None,
             inactive_threshold: INACTIVE_NS,
           });
           const consumer = await this.requireJs().consumers.get(stream, ci.name);
           iter = await consumer.consume();
         } catch {
-          if (this.stopped) break;
-          await delay(RESUBSCRIBE_BACKOFF_MS); // backend momentarily unreachable — retry the consumer
-          continue;
+          if (!this.live()) break;
+          continue; // backend momentarily unreachable — retry the consumer after the backoff
         }
         current = iter;
 
         // The plain named consumer only notify()s on deletion/GC; surface it and force a rebuild.
-        let recreate = false;
         const statusTask = (async () => {
           try {
             for await (const s of await iter.status()) {
@@ -287,7 +354,6 @@ export class NatsPlugin implements BackendPlugin {
                 s.type === ConsumerEvents.ConsumerNotFound ||
                 s.type === ConsumerEvents.StreamNotFound
               ) {
-                recreate = true;
                 await iter.close(); // ends the message for-await below
                 break;
               }
@@ -311,13 +377,26 @@ export class NatsPlugin implements BackendPlugin {
           /* iterator closed on disconnect or consumer loss */
         }
         await statusTask;
-        if (this.stopped || !recreate) break; // clean disconnect vs. consumer-loss rebuild
+        if (this.stopped) break; // only a clean disconnect ends the loop; every other exit rebuilds
       }
     })();
   }
 
+  /**
+   * False once teardown began or the connection is closed for good — the only two reasons the live
+   * loop may stop rebuilding.
+   */
+  private live(): boolean {
+    return !this.stopped && this.nc !== undefined && !this.nc.isClosed();
+  }
+
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     return { handle, backendRef: handle };
+  }
+
+  /** Stream state, re-provisioning the stream if it vanished out-of-band. */
+  private streamInfo(topic: Topic): Promise<StreamInfo> {
+    return this.withStream(topic, () => this.requireJsm().streams.info(this.streamName(topic)));
   }
 
   /** Create the per-topic stream once (idempotent; tolerates concurrent creation). */
@@ -364,20 +443,68 @@ export class NatsPlugin implements BackendPlugin {
   }
 }
 
+/**
+ * Anything with publish rights on the subject can put arbitrary bytes in the stream, and a record
+ * that throws here is unreadable FOREVER — it sits in the stream and kills every catch-up page
+ * that covers it. So this is total: undecodable or wrongly-typed frames degrade to empty strings
+ * rather than raising (CLAUDE.md "inbound is untrusted" — the wire format, not just the content).
+ */
 function rowToMessage(topic: Topic, seq: number, raw: string): Message {
-  let fields: { sender?: string; content?: string; ts?: string } = {};
-  try {
-    fields = JSON.parse(raw) as typeof fields;
-  } catch {
-    /* leave empty */
-  }
+  const fields = decodeFields(raw);
   return buildMessage({
     topic,
-    sender: fields.sender ?? '',
-    content: fields.content ?? '',
-    timestamp: fields.ts ?? '',
+    sender: asString(fields.sender),
+    content: asString(fields.content),
+    timestamp: asString(fields.ts),
     id: String(seq),
   });
+}
+
+function decodeFields(raw: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    return parsed as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
+
+/** A stream that vanished out-of-band: JetStream 404s the manager and 503s the publish. */
+function isStreamMissing(err: unknown): boolean {
+  const code = (err as { code?: unknown }).code;
+  if (code === '503') return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /stream not found|no responders|503/i.test(msg);
+}
+
+function connectionOptions(cfg: NatsBackendConfig): ConnectionOptions {
+  const opts: ConnectionOptions = {
+    servers: cfg.servers ?? '127.0.0.1:4222',
+    // Keep the unbounded reconnect: nats.js defaults to 10 attempts, after which the connection
+    // CLOSES for good — every later post/fetch throws CONNECTION_CLOSED and live delivery stops.
+    maxReconnectAttempts: -1,
+    reconnectTimeWait: RECONNECT_WAIT_MS,
+    reconnectJitter: RECONNECT_JITTER_MS,
+  };
+  if (cfg.token !== undefined) opts.token = cfg.token;
+  if (cfg.user !== undefined) opts.user = cfg.user;
+  if (cfg.pass !== undefined) opts.pass = cfg.pass;
+  if (cfg.creds_file !== undefined) {
+    opts.authenticator = credsAuthenticator(readFileSync(cfg.creds_file));
+  } else if (cfg.nkey_seed !== undefined) {
+    opts.authenticator = nkeyAuthenticator(enc.encode(cfg.nkey_seed));
+  }
+  if (cfg.tls !== undefined) {
+    opts.tls = {
+      caFile: cfg.tls.ca_file,
+      certFile: cfg.tls.cert_file,
+      keyFile: cfg.tls.key_file,
+    };
+  }
+  return opts;
 }
 
 // Subject tokens may not contain `.`, `*`, `>`, or whitespace; stream names also bar `/ \`.
