@@ -30,25 +30,34 @@ afterEach(() => {
 
 const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
+// The warning must key on the CREDENTIALS, not on a literal DSN string: the README tells the
+// operator to provision exactly parley/parley, so every host, port, database and URL spelling that
+// carries that pair is the same published password and must warn.
+const DSN_CASES: [label: string, url: string | undefined, warns: boolean][] = [
+  ['url omitted (falls back to the default)', undefined, true],
+  ['the exact default DSN', 'postgres://parley:parley@127.0.0.1:5432/parley', true],
+  ['default creds via localhost', 'postgres://parley:parley@localhost:5432/parley', true],
+  ['default creds via a docker-network host', 'postgres://parley:parley@db/parley', true],
+  ['default creds, port omitted', 'postgres://parley:parley@127.0.0.1/parley', true],
+  ['default creds, different database', 'postgres://parley:parley@127.0.0.1:5432/other', true],
+  ['default creds, postgresql:// scheme', 'postgresql://parley:parley@db.internal:6432/app', true],
+  ['default user, real password', 'postgres://parley:hunter2@127.0.0.1:5432/parley', false],
+  ['real user, default password', 'postgres://app:parley@127.0.0.1:5432/parley', false],
+  ['a real DSN', 'postgres://app:s3cret@db.example.com:5432/prod', false],
+];
+
 describe('Postgres default-credential warning (SEC-06)', () => {
-  it('warns once, naming the backend and the key to set, when url is omitted', async () => {
+  it.each(DSN_CASES)('%s', async (_label, url, warns) => {
+    const warn = spyWarn();
+    await new PostgresPlugin().connect(url === undefined ? {} : { url });
+    expect(warn).toHaveBeenCalledTimes(warns ? 1 : 0);
+  });
+
+  it('names the backend and the key to set', async () => {
     const warn = spyWarn();
     await new PostgresPlugin().connect({});
-    expect(warn).toHaveBeenCalledTimes(1);
     const msg = String(warn.mock.calls[0]?.[0]);
     expect(msg).toContain('parley-postgres');
     expect(msg).toContain('url');
-  });
-
-  it('warns when url is set literally to the well-known default DSN', async () => {
-    const warn = spyWarn();
-    await new PostgresPlugin().connect({ url: 'postgres://parley:parley@127.0.0.1:5432/parley' });
-    expect(warn).toHaveBeenCalledTimes(1);
-  });
-
-  it('does NOT warn when a real DSN is supplied', async () => {
-    const warn = spyWarn();
-    await new PostgresPlugin().connect({ url: 'postgres://app:s3cret@db.example.com:5432/prod' });
-    expect(warn).not.toHaveBeenCalled();
   });
 });

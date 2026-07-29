@@ -1,4 +1,4 @@
-import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 
@@ -29,12 +29,13 @@ const state = vi.hoisted(() => ({
   connectGate: null as Deferred | null,
   // When true, `query('LISTEN …')` rejects (drives the BUG-29(1) failed-subscribe path).
   listenRejects: false,
-  // Rows the pool hands back on the NEXT drain SELECT (then it is emptied — one delivery).
-  drainRows: [] as Record<string, unknown>[],
+  // Rows the pool hands back, per topic, on the NEXT drain SELECT (then emptied — one delivery).
+  drainRows: new Map<string, Record<string, unknown>[]>(),
 }));
 
 interface MockClientShape {
   ended: boolean;
+  listened: string[];
   emit: (event: string, arg?: unknown) => void;
 }
 
@@ -42,6 +43,7 @@ vi.mock('pg', () => {
   class MockClient implements MockClientShape {
     private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
     ended = false;
+    readonly listened: string[] = [];
     constructor() {
       state.clients.push(this);
     }
@@ -60,6 +62,8 @@ vi.mock('pg', () => {
     }
     async query(sql: string): Promise<{ rows: unknown[] }> {
       if (state.listenRejects && /LISTEN/.test(sql)) throw new Error('LISTEN failed (mock)');
+      const listen = /^LISTEN "(.+)"$/.exec(sql);
+      if (listen !== null) this.listened.push(listen[1] as string);
       return { rows: [] };
     }
     async end(): Promise<void> {
@@ -67,12 +71,14 @@ vi.mock('pg', () => {
     }
   }
 
-  const poolQuery = async (sql: string): Promise<{ rows: unknown[] }> => {
+  const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
     if (/MAX\(seq\)/.test(sql)) return { rows: [{ max: '0' }] };
-    // Drain SELECT (seq > $2, ascending): hand back the queued rows once, then nothing.
-    if (/seq > \$2/.test(sql)) {
-      const rows = state.drainRows.splice(0);
-      return { rows };
+    // Drain SELECT (the push path's batch read): hand back the topic's queued rows once, then
+    // nothing. The blocking-fetch read is the same shape but parameterizes its LIMIT, so it
+    // stays empty and the two paths cannot consume each other's rows.
+    if (/seq > \$2/.test(sql) && /LIMIT \d+/.test(sql)) {
+      const topic = String(values?.[0]);
+      return { rows: state.drainRows.get(topic)?.splice(0) ?? [] };
     }
     return { rows: [] };
   };
@@ -84,7 +90,7 @@ vi.mock('pg', () => {
         query: vi.fn(async () => ({ rows: [] })),
         release: vi.fn(),
       })),
-      query: vi.fn(poolQuery),
+      query: vi.fn(poolQuery) as unknown as typeof poolQuery,
       end: vi.fn(async () => undefined),
     })),
     Client: MockClient,
@@ -98,7 +104,7 @@ beforeEach(() => {
   state.clients.length = 0;
   state.connectGate = null;
   state.listenRejects = false;
-  state.drainRows.length = 0;
+  state.drainRows.clear();
 });
 
 afterEach(() => {
@@ -183,14 +189,16 @@ describe('Postgres subscribe registration (BUG-29)', () => {
     expect(sub.handlers.length).toBe(2);
 
     // Deliver one row via a NOTIFY on the shared listener connection.
-    state.drainRows.push({
-      seq: '1',
-      topic: 't',
-      sender: asHandle('u'),
-      content: 'hi',
-      ts: new Date().toISOString(),
-      in_reply_to: null,
-    });
+    state.drainRows.set('t', [
+      {
+        seq: '1',
+        topic: 't',
+        sender: asHandle('u'),
+        content: 'hi',
+        ts: new Date().toISOString(),
+        in_reply_to: null,
+      },
+    ]);
     const listener = state.clients[0];
     listener?.emit('notification', { channel });
     await sleep(50);
@@ -201,4 +209,100 @@ describe('Postgres subscribe registration (BUG-29)', () => {
 
     await plugin.disconnect();
   });
+});
+
+// The reconnect loop exists to make a notification blackout cost latency and not a message: it
+// must re-LISTEN every channel a subscription or an in-flight blocking fetch still needs, and
+// re-drain every topic from its cursor. Asserting only that it must NOT resurrect a listener after
+// disconnect leaves the delivery guarantee itself unguarded, so this matrix pins it directly.
+
+const DRAIN_BATCH = 512;
+
+interface ReconnectCell {
+  topics: number;
+  waiters: number;
+  rows: number;
+}
+
+const RECONNECT_CELLS: ReconnectCell[] = [0, 1, 2].flatMap((topics) =>
+  [0, 1].flatMap((waiters) =>
+    [0, 1, DRAIN_BATCH + 1].map((rows) => ({ topics, waiters, rows })),
+  ),
+);
+
+function blackoutRows(topic: string, count: number): Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, i) => ({
+    seq: String(i + 1),
+    topic,
+    sender: asHandle('u'),
+    content: `m${i}`,
+    ts: new Date().toISOString(),
+    in_reply_to: null,
+  }));
+}
+
+describe('Postgres listener reconnect delivers what the blackout missed', () => {
+  it.each(
+    RECONNECT_CELLS.map(
+      (c) =>
+        [`${c.topics} subscription(s), ${c.waiters} blocking waiter(s), ${c.rows} row(s)`, c] as const,
+    ),
+  )('%s', async (_label, cell) => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL });
+
+    const seen = new Map<string, Message[]>();
+    const subTopics = Array.from({ length: cell.topics }, (_, i) => `sub${i}`);
+    for (const t of subTopics) {
+      seen.set(t, []);
+      await plugin.subscribe(asTopic(t), (m) => {
+        seen.get(t)?.push(m);
+      });
+    }
+
+    const waitTopic = 'waiting';
+    const waits: Promise<unknown>[] = [];
+    if (cell.waiters > 0) {
+      waits.push(
+        plugin.fetchRecent({ topic: asTopic(waitTopic), since: asCursor('0'), blockMs: 4000 }),
+      );
+      await sleep(20);
+    }
+
+    const channelsNeeded = [...(plugin as unknown as { listens: Map<string, unknown> }).listens.keys()];
+
+    // Queue the blackout rows, then drop the listener connection.
+    for (const t of subTopics) state.drainRows.set(t, blackoutRows(t, cell.rows));
+    const listener = state.clients[0];
+    if (listener === undefined) {
+      // Nothing subscribed and nothing waiting: the listener connection is lazy, so there is no
+      // blackout to recover from.
+      expect(channelsNeeded).toEqual([]);
+      await plugin.disconnect();
+      return;
+    }
+    listener.emit('end');
+
+    // Past the reconnect backoff, the replacement client must be live.
+    await sleep(900);
+    const replacement = state.clients.at(-1);
+    expect(replacement).toBeDefined();
+    expect(replacement).not.toBe(listener);
+    for (const channel of channelsNeeded) {
+      expect(replacement?.listened, `re-LISTEN missing for ${channel}`).toContain(channel);
+    }
+
+    // No NOTIFY is emitted: the reconnect's own re-drain is what must deliver these.
+    await sleep(100);
+    for (const t of subTopics) {
+      const got = seen.get(t) ?? [];
+      expect(got.map((m) => m.content)).toEqual(
+        Array.from({ length: cell.rows }, (_, i) => `m${i}`),
+      );
+      expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
+    }
+
+    await plugin.disconnect();
+    await Promise.all(waits);
+  }, 15000);
 });

@@ -34,9 +34,18 @@ Postgres serves this natively via `LISTEN`/`NOTIFY` on the topic channel. Core c
 ```yaml
 backend_config:
   url: "postgres://parley:parley@127.0.0.1:5432/parley"   # default
-  table_name: "parley_messages"   # default; [A-Za-z0-9_] only — senders live in <table_name>_senders
+  table_name: "parley_messages"   # default; [A-Za-z0-9_] only, max 52 bytes — see below
   pool_size: 5                     # default; max pooled query connections (LISTEN uses one extra)
+  retention_days: 30               # optional; omit to keep every message forever
 ```
+
+`table_name` is capped at 52 bytes because every other relation is derived from it by suffixing
+(`<table_name>_senders`, `_topic_seq`, `_notify`, `_notify_trg`) and PostgreSQL truncates
+identifiers at 63 bytes — a longer stem would silently make two of those the same relation.
+
+`retention_days` deletes rows older than the window on connect and hourly thereafter. `seq` is a
+`BIGSERIAL` and is never reused, so a cursor minted before a prune stays valid: a stale reader
+just gets fewer rows back, never a wrong or duplicate one.
 
 Secrets belong in the config/`.env`, never committed (CLAUDE.md conventions).
 
@@ -67,9 +76,12 @@ Use the **official `postgres` Docker image** (not authored here):
 
 ```bash
 docker run -d --name parley-postgres -p 5432:5432 \
-  -e POSTGRES_USER=parley -e POSTGRES_PASSWORD=parley -e POSTGRES_DB=parley \
+  -e POSTGRES_USER=parley -e POSTGRES_PASSWORD="$(openssl rand -hex 16)" -e POSTGRES_DB=parley \
   postgres:16-alpine
 ```
+
+Do not provision `parley`/`parley` outside a throwaway local box: that pair is published in this
+repo, and the plugin warns at `connect()` whenever the DSN carries it, whatever host it points at.
 
 (or the maintainer dev harness: `examples/dev-compose/`.)
 

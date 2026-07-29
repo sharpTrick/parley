@@ -469,14 +469,14 @@ auth:                      # remote/chat mode only; ignored under local stdio (�
 backend_config:            # opaque to core; passed verbatim to the plugin's connect()
   # sqlite:   { db_path, poll_interval_ms, retention_days? }
   #             poll_interval_ms is a latency knob only; no correctness impact
-  # redis:    { url, retention_days? }          postgres: { url }
+  # redis:    { url, retention_days? }          postgres: { url, table_name, pool_size, retention_days? }
   # matrix:   { homeserver_url, user, password | access_token, shared_room? }
   # xmpp:     { service, jid, password, muc_service }   nats: { servers, stream_prefix, retention_days? }
   # zulip / discord / slack / telegram: see each plugin's README
 ```
 
 `retention_days` is an opt-in prune knob on the backends whose store Parley itself owns (sqlite,
-redis, nats). Matrix and XMPP retention is a homeserver feature, not something an unprivileged
+postgres, redis, nats). Matrix and XMPP retention is a homeserver feature, not something an unprivileged
 bridge account can enact — see each plugin's README.
 
 Identity/topic→backend mapping is **convention-based by default** (derive

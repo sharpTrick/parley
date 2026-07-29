@@ -3,6 +3,7 @@ import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { Client } from 'pg';
 import { describe, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { MAX_TABLE_NAME_BYTES } from '../src/schema.js';
 
 const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
 
@@ -23,15 +24,20 @@ async function isPostgresUp(url: string): Promise<boolean> {
 let seq = 0;
 const rand = () => Math.random().toString(36).slice(2, 8);
 
-async function makeContext() {
-  const table = `parley_test_${rand()}`;
+// The NOTIFY channel is derived from the topic on BOTH sides (Node and the trigger), so the whole
+// suite is run over topic shapes that stress that derivation — not just the ASCII shape a naive
+// generator emits. Rotating rather than fixing keeps every case seeing several shapes.
+const TOPIC_SHAPES = ['plain', 'café', '日本語', 'room-🚀', 'école'.normalize('NFD'), ' padded '];
+
+async function makeContext(table: string) {
   const plugin = new PostgresPlugin();
   await plugin.connect({ url: PG_URL, table_name: table });
   return {
     plugin,
     // Postgres honors blockMs natively via LISTEN/NOTIFY (issue #20) — run the long-poll case.
     supportsBlockingFetch: true,
-    freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    freshTopic: (): Topic =>
+      asTopic(`${TOPIC_SHAPES[++seq % TOPIC_SHAPES.length] as string}-${seq}-${rand()}`),
     cleanup: async () => {
       await plugin.disconnect();
       // wipe this context's tables + trigger function
@@ -69,7 +75,16 @@ async function makeContext() {
 }
 
 if (await isPostgresUp(PG_URL)) {
-  runConformanceSuite('postgres', makeContext);
+  // Every relation this plugin creates is derived from `table_name` by suffixing, and PostgreSQL
+  // truncates identifiers at 63 bytes — so the longest accepted name is run end to end, not just a
+  // comfortably short one.
+  const longTable = `parley_test_${rand()}`.padEnd(MAX_TABLE_NAME_BYTES, 'x');
+  for (const [label, table] of [
+    ['short table_name', `parley_test_${rand()}`],
+    [`${MAX_TABLE_NAME_BYTES}-byte table_name`, longTable],
+  ] as const) {
+    runConformanceSuite(`postgres (${label})`, () => makeContext(table));
+  }
 } else {
   describe.skip(`seam conformance: postgres (no server at ${PG_URL})`, () => {
     it('skipped — start postgres (examples/dev-compose) to run', () => undefined);
