@@ -14,7 +14,7 @@ export const delay = (ms: number): Promise<void> => new Promise((r) => setTimeou
 
 /** Wait applied when a 429 carries no usable hint. */
 export const DEFAULT_BACKOFF_MS = 500;
-/** Ceiling on any single backoff, however large a value the server sent. */
+/** Ceiling on a backoff we invented ourselves. A server-stated hint is honoured past it. */
 export const MAX_BACKOFF_MS = 5_000;
 /** Attempts a single call will make before giving up. */
 export const DEFAULT_MAX_ATTEMPTS = 8;
@@ -24,32 +24,70 @@ export const DEFAULT_DEADLINE_MS = 30_000;
 export const MAX_ERROR_BODY = 2_048;
 
 /**
- * Normalize a backoff to `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`.
+ * Normalize a backoff we chose ourselves to `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`.
  *
  * `Number(null)` and `Number('')` are both `0`, so an absent `Retry-After` reads as "retry now" —
  * keep this clamp on the shared path, so that one plugin's parser bug cannot become a request
- * flood against the operator's own account.
+ * flood against the operator's own account. It does NOT bound a wait the server asked for: see
+ * {@link fetchWithRetry}.
  */
 export function clampBackoff(ms: number | undefined): number {
   if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return DEFAULT_BACKOFF_MS;
   return Math.min(ms, MAX_BACKOFF_MS);
 }
 
-/** Milliseconds from a `Retry-After` header (seconds per RFC 9110), or undefined if unusable. */
+/**
+ * Milliseconds from a `Retry-After` header, or undefined if unusable. RFC 9110 defines BOTH forms:
+ * `delay-seconds` and an HTTP-date. Reading only the first makes a date-form header look absent and
+ * falls back to {@link DEFAULT_BACKOFF_MS} — an order of magnitude sooner than the server asked.
+ */
 export function retryAfterFromHeader(res: Response): number | undefined {
-  const raw = Number(res.headers.get('retry-after'));
-  return Number.isFinite(raw) && raw > 0 ? raw * 1000 : undefined;
+  const raw = res.headers.get('retry-after');
+  if (raw === null) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return seconds > 0 ? seconds * 1000 : undefined;
+  const at = Date.parse(raw);
+  if (Number.isNaN(at)) return undefined;
+  const ms = at - Date.now();
+  return ms > 0 ? ms : undefined;
 }
 
+const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
+
 /**
- * Bound and neutralize an untrusted response body before it goes in an Error.
+ * Keep this on every path that embeds a transport error or a response body, so that a
+ * credential-bearing URL (Telegram carries the bot token in the path) never reaches model context
+ * or the operator's logs. The caller's `label` already identifies the call site without it.
+ */
+function redactUrls(text: string, url: string): string {
+  return text.split(url).join('<url>').replace(URL_LIKE, '<url>');
+}
+
+/** Node's `fetch` puts the real reason in `cause`, not in `message`. */
+function errorText(err: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = err;
+  for (let depth = 0; cur !== undefined && cur !== null && depth < 5; depth++) {
+    const text = cur instanceof Error ? cur.message : String(cur);
+    if (text.length > 0 && !parts.includes(text)) parts.push(text);
+    cur = cur instanceof Error ? (cur.cause as unknown) : undefined;
+  }
+  return parts.length > 0 ? parts.join(': ') : 'unknown transport failure';
+}
+
+/** C0/DEL, plus the separators and bidi overrides a body can use to forge lines or reverse text. */
+const NEUTRALIZED = /[\u0000-\u001F\u007F\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+
+/**
+ * Bound and flatten an untrusted response body before it goes in an Error.
  *
  * A thrown message becomes an `isError` tool result, i.e. model context. Keep the truncation and
- * the control-character strip, so that a hostile backend cannot push megabytes — or instructions —
- * down a path the topic allowlist never sees.
+ * the character strip, so that a hostile backend cannot push megabytes, forged line structure or
+ * bidi overrides down a path the topic allowlist never sees. It bounds and flattens ONLY — the
+ * body's words still reach the model, so do not read this as neutralizing what they say.
  */
 export function sanitizeBody(text: string): string {
-  const flat = text.replace(/[\u0000-\u001F\u007F]/g, ' ');
+  const flat = text.replace(NEUTRALIZED, ' ');
   return flat.length > MAX_ERROR_BODY ? `${flat.slice(0, MAX_ERROR_BODY)}… [truncated]` : flat;
 }
 
@@ -68,18 +106,49 @@ export interface FetchWithRetryOptions {
   allowStatuses?: number[];
   /** Attempts before giving up. Default {@link DEFAULT_MAX_ATTEMPTS}. */
   maxAttempts?: number;
-  /** Wall-clock budget for the whole call. Default {@link DEFAULT_DEADLINE_MS}. */
+  /**
+   * Wall-clock budget for the whole call, INCLUDING the time a single request spends in flight.
+   * A caller whose request legitimately blocks longer than {@link DEFAULT_DEADLINE_MS} (a
+   * long-poll) must raise this, so that its own request is not aborted at the default.
+   */
   deadlineMs?: number;
   /** Injectable clock, for tests. */
   now?: () => number;
 }
 
 /**
+ * One attempt, bounded by `budgetMs`. Without this an unanswered request outlives every bound the
+ * options declare — `isStopped` is never consulted while a request is in flight, so a stalled API
+ * pins the MCP tool call open for undici's own default and `disconnect()` cannot unblock it.
+ */
+async function fetchOnce(
+  url: string,
+  init: RequestInit,
+  budgetMs: number,
+  label: string,
+): Promise<Response> {
+  const deadline = AbortSignal.timeout(budgetMs);
+  const signal =
+    init.signal === undefined || init.signal === null
+      ? deadline
+      : AbortSignal.any([init.signal, deadline]);
+  try {
+    return await fetch(url, { ...init, signal });
+  } catch (err) {
+    if (init.signal?.aborted === true) throw err;
+    if (deadline.aborted) throw new Error(`${label} → deadline: no response within ${budgetMs}ms`);
+    throw new Error(`${label} → transport: ${sanitizeBody(redactUrls(errorText(err), url))}`);
+  }
+}
+
+/**
  * Shared HTTP-with-429-retry loop. Builds nothing itself — the caller passes a fully-formed `init`
  * (auth headers + encoded body + optional `signal`). Retries 429 within a bounded attempt and
  * wall-clock budget, stops the moment `isStopped()` is true, returns the `Response` on ok /
- * allowStatuses, else throws `<label> → <status>: <body>`. Backend response *shapes* (Slack's
- * `ok:false`, XMPP IQ) are NOT unified here — interpret those in the caller.
+ * allowStatuses, else throws `<label> → <status>: <body>`. A server asking for a longer wait than
+ * this call's deadline ends the call rather than being retried sooner than it asked. Backend
+ * response *shapes* (Slack's `ok:false`, XMPP IQ) are NOT unified here — interpret those in the
+ * caller.
  */
 export async function fetchWithRetry(
   url: string,
@@ -92,20 +161,38 @@ export async function fetchWithRetry(
   const started = now();
 
   for (let attempt = 1; ; attempt++) {
-    const res = await fetch(url, init);
+    const budget = deadlineMs - (now() - started);
+    if (budget <= 0) {
+      throw new Error(
+        `${opts.label} → deadline: exceeded ${deadlineMs}ms before attempt ${attempt}`,
+      );
+    }
+
+    const res = await fetchOnce(url, init, budget, opts.label);
+    if (opts.allowStatuses?.includes(res.status) ?? false) return res;
     if (res.status !== 429) {
-      if (res.ok || (opts.allowStatuses?.includes(res.status) ?? false)) return res;
-      throw new Error(`${opts.label} → ${res.status}: ${sanitizeBody(await res.text())}`);
+      if (res.ok) return res;
+      throw new Error(
+        `${opts.label} → ${res.status}: ${sanitizeBody(redactUrls(await res.text(), url))}`,
+      );
     }
 
     if (opts.isStopped()) throw new Error(`${opts.label} → 429 (disconnected)`);
 
     const hinted = (await opts.retryAfterOf?.(res)) ?? retryAfterFromHeader(res);
-    const wait = clampBackoff(hinted);
+    // Honour a server-stated wait IN FULL, so that we never retry sooner than the vendor asked —
+    // that is what escalates a rate limit into a ban. Only a wait we invented is clamped; an
+    // unreasonable hint is refused by the deadline below, which is the real governor.
+    const stated = hinted !== undefined && Number.isFinite(hinted) && hinted > 0;
+    const wait = stated ? (hinted as number) : clampBackoff(hinted);
     const elapsed = now() - started;
-    if (attempt >= maxAttempts || elapsed + wait > deadlineMs) {
+    const overDeadline = elapsed + wait > deadlineMs;
+    if (attempt >= maxAttempts || overDeadline) {
       throw new Error(
-        `${opts.label} → 429: still rate limited after ${attempt} attempts (${elapsed}ms)`,
+        stated && overDeadline
+          ? `${opts.label} → 429: upstream asked for ${Math.round(wait)}ms, past this call's ` +
+            `${deadlineMs}ms deadline (${elapsed}ms elapsed). Raise deadlineMs to wait it out.`
+          : `${opts.label} → 429: still rate limited after ${attempt} attempts (${elapsed}ms)`,
       );
     }
 

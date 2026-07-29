@@ -44,9 +44,14 @@ const RETRY_AFTER_ROWS: Array<{ header?: string; minGapMs: number; maxGapMs: num
   { header: 'abc', minGapMs: 400, maxGapMs: 1500 },
   { header: '1', minGapMs: 900, maxGapMs: 2000 },
   { header: '2', minGapMs: 1900, maxGapMs: 3000 },
-  // Above the shared clamp: still bounded, and still far above a hot loop.
-  { header: '9999', minGapMs: 4500, maxGapMs: 6500 },
+  // Above the clamp on a self-chosen backoff, inside the call deadline: Slack's ordinary tiered
+  // limit. The wait must be the server's own figure, not the 5s clamp.
+  { header: '6', minGapMs: 5900, maxGapMs: 7500 },
 ];
+
+// Past the deadline there is no wait that both honours the server and fits the call, so the call
+// ends instead of retrying early — naming the figure, so an operator can raise `deadlineMs`.
+const REFUSED_HINT = '9999';
 
 describe('slack 429 backoff honours the server-stated hint', () => {
   for (const row of RETRY_AFTER_ROWS) {
@@ -86,6 +91,30 @@ describe('slack 429 backoff honours the server-stated hint', () => {
       }
     });
   }
+
+  it(`Retry-After: ${REFUSED_HINT} → refused, naming the figure, without a second request`, async () => {
+    const arrivals: number[] = [];
+    const server = createServer((req, res) => {
+      void (async () => {
+        await readBody(req);
+        arrivals.push(Date.now());
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': REFUSED_HINT });
+        res.end(JSON.stringify({ ok: false, error: 'ratelimited' }));
+      })();
+    });
+    const url = await listen(server);
+    const plugin = new SlackPlugin();
+    try {
+      await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
+      await expect(plugin.post(asTopic('C0TEST'), asHandle('writer'), 'hello')).rejects.toThrow(
+        /upstream asked for 9999000ms, past this call's \d+ms deadline/,
+      );
+      expect(arrivals).toHaveLength(1);
+    } finally {
+      await plugin.disconnect();
+      await stop(server);
+    }
+  });
 });
 
 describe('BUG-25 — Slack api() form-encodes every method (read-method args survive)', () => {

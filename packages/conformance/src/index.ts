@@ -1,22 +1,43 @@
-import { asHandle, type BackendPlugin, type Message, type Topic } from '@sharptrick/parley-core';
+import {
+  asHandle,
+  type BackendPlugin,
+  type Message,
+  parseMentions,
+  type Topic,
+} from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { BackendFactory, ConformanceContext } from './factory.js';
+import { assertConformanceContext, type BackendFactory, type ConformanceContext } from './factory.js';
 
 export type { BackendFactory, ConformanceContext } from './factory.js';
+export { assertConformanceContext, CONTEXT_FIELDS } from './factory.js';
 
 const SENDER = asHandle('writer');
 const OTHER = asHandle('second-writer');
+
+const DRAIN_PAGE = 500;
 
 /**
  * Read every message in `topic` by PAGING to exhaustion. It must not read one oversized page: a
  * backend with a server-side page cap below the request would silently return a prefix, and the
  * assertions built on it would grade a partial view.
+ *
+ * The FIRST page has no `since`, which the suite itself pins as the NEWEST `limit` messages — so a
+ * full first page means the oldest messages are outside the window and paging forward can never
+ * reach them. Keep the guard, so that a caller raising a volume past {@link DRAIN_PAGE} gets an
+ * error naming the helper instead of a passing assertion over a silently truncated suffix.
  */
 async function drainAll(plugin: BackendPlugin, topic: Topic): Promise<Message[]> {
   const out: Message[] = [];
   let since: string | undefined;
   for (let page = 0; page < 200; page++) {
-    const res = await plugin.fetchRecent({ topic, since: since as never, limit: 500 });
+    const res = await plugin.fetchRecent({ topic, since: since as never, limit: DRAIN_PAGE });
+    if (since === undefined && res.messages.length >= DRAIN_PAGE) {
+      throw new Error(
+        `drainAll(${topic}): the since-less first page returned ${res.messages.length} messages, ` +
+          `filling the ${DRAIN_PAGE} limit — anything older is unreachable from here. Raise ` +
+          `DRAIN_PAGE or lower the volume; do not grade a partial view.`,
+      );
+    }
     out.push(...res.messages);
     if (res.messages.length === 0 || res.nextCursor === since) return out;
     since = res.nextCursor;
@@ -40,6 +61,14 @@ function expectWellFormedMessage(
   expect(typeof m.cursor).toBe('string');
   expect(m.cursor.length).toBeGreaterThan(0);
   expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
+  // `senderHandle` is asserted on every backend, not only the ones that round-trip `identity`:
+  // whoever the sender turns out to be, core routes and displays it.
+  expect(typeof m.senderHandle).toBe('string');
+  expect(m.senderHandle.length).toBeGreaterThan(0);
+  // `mentions` is what core's push loop filters on (transport/push-loop.ts) — a backend that
+  // drops it delivers NOTHING once mention filtering is on. Compared against the content the
+  // BACKEND returned, so a transport that rewrites mention syntax is still graded honestly.
+  expect(m.mentions).toEqual(parseMentions(m.content));
   if (expected.sender !== undefined) expect(m.senderHandle).toBe(expected.sender);
 }
 
@@ -52,7 +81,7 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
   describe(`seam conformance: ${name}`, () => {
     let ctx: ConformanceContext;
     beforeEach(async () => {
-      ctx = await factory();
+      ctx = assertConformanceContext(name, await factory());
     });
     afterEach(async () => {
       await ctx.cleanup();
@@ -161,21 +190,42 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(again.nextCursor).toBe(first.nextCursor);
     });
 
+    // The content carries an @mention so `mentions` is asserted non-vacuously on BOTH paths: core's
+    // push loop drops every message whose `mentions` misses the identity when filtering is on.
     it('the same message has identical backendMsgId + cursor via live push and via catch-up', async () => {
       const t = ctx.freshTopic();
+      const body = `x for @${OTHER}`;
       const live: Message[] = [];
       await ctx.plugin.subscribe(t, (m) => live.push(m));
-      const id = await ctx.plugin.post(t, SENDER, 'x');
+      const id = await ctx.plugin.post(t, SENDER, body);
       await vi.waitFor(() => expect(live).toHaveLength(1), { timeout: 3000, interval: 10 });
 
       const viaCatchUp = (await ctx.plugin.fetchRecent({ topic: t })).messages.find(
-        (m) => m.content === 'x',
+        (m) => m.content === body,
       );
       expect(viaCatchUp).toBeDefined();
       expect(live[0]!.backendMsgId).toBe(id);
       expect(live[0]!.backendMsgId).toBe(viaCatchUp!.backendMsgId);
       expect(live[0]!.cursor).toBe(viaCatchUp!.cursor);
-      expectWellFormedMessage(live[0]!, { topic: t, content: 'x' });
+      expectWellFormedMessage(live[0]!, { topic: t, content: body });
+      expectWellFormedMessage(viaCatchUp!, { topic: t, content: body });
+      expect(live[0]!.mentions).toContain(OTHER);
+      expect(viaCatchUp!.mentions).toContain(OTHER);
+    });
+
+    // `post`'s `opts.inReplyTo` is part of the seam and core's post tool passes it
+    // (transport/tools.ts), but no case ever supplied it — a plugin that 400s on a threaded reply,
+    // or takes a different endpoint for one, was certified conformant. The seam surfaces no reply
+    // field on Message, so the contract is exactly "accepted, and durable in order".
+    it('post accepts inReplyTo and the reply is durable, in order', async () => {
+      const t = ctx.freshTopic();
+      const parent = await ctx.plugin.post(t, SENDER, 'question');
+      const reply = await ctx.plugin.post(t, SENDER, 'answer', { inReplyTo: parent });
+      expect(reply).not.toBe(parent);
+
+      const { messages } = await ctx.plugin.fetchRecent({ topic: t });
+      expect(messages.map((m) => m.content)).toEqual(['question', 'answer']);
+      expect(messages.map((m) => m.backendMsgId)).toEqual([parent, reply]);
     });
 
     // Both of subscribe's documented guarantees at once: it delivers exactly the post-subscribe
@@ -220,6 +270,34 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expectWellFormedMessage(fromA[0]!, { topic: a, content: 'in-a' });
       expectWellFormedMessage(fromB[0]!, { topic: b, content: 'in-b' });
     });
+
+    // The same property on the OTHER delivery path. Every other subscribe case uses one topic, so a
+    // plugin whose live path ignored the topic filter passed: core would then emit a `<channel>`
+    // event for a topic the allowlist never admitted.
+    it('topics are isolated on the live path too', async () => {
+      const a = ctx.freshTopic();
+      const b = ctx.freshTopic();
+      const inA: Message[] = [];
+      const inB: Message[] = [];
+      await ctx.plugin.subscribe(a, (m) => inA.push(m));
+      await ctx.plugin.subscribe(b, (m) => inB.push(m));
+
+      await ctx.plugin.post(a, SENDER, 'live-a');
+      await ctx.plugin.post(b, SENDER, 'live-b');
+      await vi.waitFor(
+        () => {
+          expect(inA.length).toBeGreaterThanOrEqual(1);
+          expect(inB.length).toBeGreaterThanOrEqual(1);
+        },
+        { timeout: 5000, interval: 10 },
+      );
+
+      expect(inA.map((m) => m.content)).toEqual(['live-a']);
+      expect(inB.map((m) => m.content)).toEqual(['live-b']);
+      for (const m of inA) expect(m.topic).toBe(a);
+      for (const m of inB) expect(m.topic).toBe(b);
+    });
+
 
     it('resolveIdentity answers for the handle it was asked about', async () => {
       const id = await ctx.plugin.resolveIdentity(SENDER);

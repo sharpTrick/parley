@@ -40,3 +40,36 @@ export interface ConformanceContext {
 }
 
 export type BackendFactory = () => Promise<ConformanceContext>;
+
+/**
+ * The shape check behind the "REQUIRED" above. `tsconfig.json` covers only `src/**`, and vitest
+ * transpiles without typechecking, so no backend's context is ever seen by a compiler — a dropped
+ * capability field silently deletes the cases that read it instead of losing a build. Keep this
+ * runtime check, so that the requirement is enforced somewhere.
+ */
+export const CONTEXT_FIELDS: Record<keyof ConformanceContext, (v: unknown) => boolean> = {
+  plugin: (v) => typeof v === 'object' && v !== null,
+  freshTopic: (v) => typeof v === 'function',
+  cleanup: (v) => typeof v === 'function',
+  concurrentPost: (v) => typeof v === 'function' || v === 'unsupported',
+  supportsBlockingFetch: (v) => typeof v === 'boolean',
+  carriesSenderIdentity: (v) => typeof v === 'boolean',
+};
+
+/** Throws naming the backend and the offending field; returns the context so it can be inlined. */
+export function assertConformanceContext(name: string, ctx: unknown): ConformanceContext {
+  if (typeof ctx !== 'object' || ctx === null) {
+    throw new Error(`conformance context for ${name} is not an object`);
+  }
+  const record = ctx as Record<string, unknown>;
+  for (const [field, ok] of Object.entries(CONTEXT_FIELDS)) {
+    if (!ok(record[field])) {
+      throw new Error(
+        `conformance context for ${name} has an invalid \`${field}\`: ` +
+          `${JSON.stringify(record[field]) ?? typeof record[field]}. Every field of ` +
+          `ConformanceContext is required — an omitted one silently skips the cases that read it.`,
+      );
+    }
+  }
+  return ctx as ConformanceContext;
+}

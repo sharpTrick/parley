@@ -32,10 +32,12 @@ const RETRY_ROWS: RetryRow[] = [
     window: [50, 400],
   },
   { name: 'neither, falling back to the shared default', window: [DEFAULT_BACKOFF_MS - 50, 1500] },
+  // Above the clamp on a self-chosen backoff, inside the call deadline: honoured in full, because
+  // retrying sooner than the server asked is what escalates a rate limit.
   {
-    name: 'an absurd hint, clamped to the shared ceiling',
-    bodySeconds: 3600,
-    window: [MAX_BACKOFF_MS - 200, MAX_BACKOFF_MS + 1500],
+    name: 'a hint above the self-imposed clamp',
+    bodySeconds: (MAX_BACKOFF_MS + 2_000) / 1000,
+    window: [MAX_BACKOFF_MS + 1_800, MAX_BACKOFF_MS + 4_000],
   },
 ];
 
@@ -61,6 +63,16 @@ describe('zulip 429 retry honours the hint and stays inside the shared bounds', 
       expect(messages.map((m) => m.content)).toEqual(['through-the-limit']);
     }, 20_000);
   }
+
+  it('a hint past the call deadline is refused, naming it, without a second request', async () => {
+    const { plugin, fake } = await boot();
+    fake.rateLimit(POST, { times: 1, bodySeconds: 3600 });
+
+    await expect(plugin.post(asTopic(`429-absurd-${rand()}`), SENDER, 'x')).rejects.toThrow(
+      /upstream asked for 3600000ms, past this call's \d+ms deadline/,
+    );
+    expect(fake.requestCount(POST)).toBe(1);
+  });
 
   it('a permanently rate-limited route ends in a thrown error, not an unbounded retry loop', async () => {
     const { plugin, fake } = await boot();
