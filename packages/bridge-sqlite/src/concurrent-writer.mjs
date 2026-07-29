@@ -44,14 +44,20 @@ const [dbPath, topic, countStr, sender] = process.argv.slice(2);
 const count = Number(countStr);
 
 const db = openDb(dbPath);
-// Idempotent: the writer may race the plugin's own CREATE.
-db.exec(
-  `CREATE TABLE IF NOT EXISTS messages (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
-     topic TEXT NOT NULL, sender TEXT NOT NULL, content TEXT NOT NULL,
-     ts TEXT NOT NULL, in_reply_to TEXT
-   )`,
+// Idempotent: the writer may race the plugin's own CREATE, and either may win. Keep this text
+// byte-identical to SCHEMA in src/schema.ts — whichever process creates the file decides the
+// shape for every other one. test/multi-process.test.ts compares the two DDLs and fails on drift.
+db.exec(`
+CREATE TABLE IF NOT EXISTS messages (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  topic       TEXT NOT NULL,
+  sender      TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  ts          TEXT NOT NULL,           -- ISO 8601, informational only
+  in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
 );
+CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic, id);
+`);
 const stmt = db.prepare(
   'INSERT INTO messages (topic, sender, content, ts, in_reply_to) VALUES (?, ?, ?, ?, ?)',
 );

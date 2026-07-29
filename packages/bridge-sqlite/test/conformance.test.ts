@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
-import { asTopic, type Topic } from '@sharptrick/parley-core';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { SqlitePlugin } from '../src/index.js';
 
 // Forked OS-process writer (plain .mjs; no build needed) — the strongest proof of WAL +
@@ -45,7 +45,15 @@ runConformanceSuite('sqlite', async () => {
       await plugin.disconnect();
       rmSync(dir, { recursive: true, force: true });
     },
-    concurrentPost: (topic: Topic, writers: number, perWriter: number) =>
-      forkWriters(dbPath, topic, writers, perWriter),
+    // One of the contending writers is the plugin itself, writing through the shipped `post()`
+    // while the forked processes are still running — otherwise the check would prove the fixture's
+    // hand-rolled write path safe and never touch the code that ships.
+    concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
+      const children = forkWriters(dbPath, topic, writers - 1, perWriter);
+      for (let i = 0; i < perWriter; i++) {
+        await plugin.post(topic, asHandle('plugin'), `plugin-${i}`);
+      }
+      await children;
+    },
   };
 });

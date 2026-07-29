@@ -3,10 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SqlitePlugin } from './index.js';
+import { MIN_POLL_INTERVAL_MS, SqlitePlugin } from './index.js';
 
 const T = asTopic('ctx');
 const me = asHandle('alice');
+const ONE_MS_IN_DAYS = 1 / 86_400_000;
 const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-sqlite-')), 'p.db');
 
 let open: SqlitePlugin[] = [];
@@ -87,11 +88,11 @@ describe('SqlitePlugin (seam smoke)', () => {
     const lastOldId = await writer.post(T, me, 'old-2');
     await writer.disconnect();
 
-    // retention_days: 0 → cutoff is "now", strictly after the posts above → prunable immediately.
+    // A sub-millisecond window puts the cutoff just after the posts above → prunable immediately.
     await new Promise((r) => setTimeout(r, 5));
     const p = new SqlitePlugin();
     open.push(p);
-    await p.connect({ db_path: path, poll_interval_ms: 10, retention_days: 0 });
+    await p.connect({ db_path: path, poll_interval_ms: 10, retention_days: ONE_MS_IN_DAYS });
 
     await vi.waitFor(
       async () => {
@@ -216,7 +217,7 @@ describe('SqlitePlugin cursor integrity (BUG-22/23/40)', () => {
 
 describe('SqlitePlugin poll-loop diagnostics (BUG-39)', () => {
   it('diagnoses a permanently-failing poll tick and stops the loop after N failures', async () => {
-    const p = await plugin(5); // fast poll so escalation is quick
+    const p = await plugin(MIN_POLL_INTERVAL_MS); // fast poll so escalation is quick
     const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     let lines: string[] = [];
     try {
@@ -252,7 +253,7 @@ describe('SqlitePlugin poll-loop diagnostics (BUG-39)', () => {
   });
 
   it('takes the quiet-retry path for a SQLITE_BUSY/LOCKED tick — no diagnostic, keeps ticking', async () => {
-    const p = await plugin(5);
+    const p = await plugin(MIN_POLL_INTERVAL_MS);
     const busyErr = Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
     let calls = 0;
     // Swap in a statement whose .all always throws a lock-classed error, as WAL contention would.

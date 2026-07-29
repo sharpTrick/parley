@@ -25,18 +25,23 @@ export interface SqliteBackendConfig {
    * persisted by core from a previous run no longer lines up with this DB's ids. The same is true
    * of a recreated/wiped file. Because core's read-state outlives the DB, **clear any persisted
    * read-state whenever the DB is reset** — otherwise a stale high cursor would reference ids this
-   * DB never minted. `fetchRecent` guards this case (a `since` past the DB's high-water mark falls
-   * back to the recent window instead of silently skipping every post after the reset), but
-   * clearing stale read-state on reset is still the correct operational step.
+   * DB never minted. `fetchRecent` guards this case (a `since` past the DB's high-water mark
+   * replays the topic from its first row instead of silently skipping messages), but clearing
+   * stale read-state on reset is still the correct operational step.
    */
   db_path?: string;
-  /** Poll interval for the live `subscribe` loop. Latency knob only — no correctness impact (§9). */
+  /**
+   * Poll interval for the live `subscribe` loop. Latency knob only — no correctness impact (§9).
+   * Must be an integer between {@link MIN_POLL_INTERVAL_MS} and {@link MAX_POLL_INTERVAL_MS};
+   * `0` is rejected rather than accepted as a hot loop that pins a CPU against the DB.
+   */
   poll_interval_ms?: number;
   /**
    * Optional retention window in days: rows older than this are pruned on a background timer.
-   * Omit for the default — keep every message forever. Safe to enable at any time: `id` is
-   * `AUTOINCREMENT` and never reused, so a cursor/backendMsgId minted before a prune stays valid
-   * (a stale reader just gets fewer rows back, never a wrong or duplicate one).
+   * Omit for the default — keep every message forever. `0` and negatives are rejected: they mean
+   * "delete everything up to now", an irreversible wipe of the whole shared file. Safe to enable
+   * at any time: `id` is `AUTOINCREMENT` and never reused, so a cursor/backendMsgId minted before
+   * a prune stays valid (a stale reader just gets fewer rows back, never a wrong or duplicate one).
    */
   retention_days?: number;
 }
@@ -45,6 +50,40 @@ export interface SqliteBackendConfig {
 const POLL_BATCH = 512;
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the poll interval. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+/** Floor for `poll_interval_ms`: below this the loop is a hot spin, not a poll. */
+export const MIN_POLL_INTERVAL_MS = 10;
+/**
+ * Ceiling for `poll_interval_ms`. Keep it at setTimeout's 32-bit limit: Node silently clamps a
+ * larger delay to 1 ms, so an operator asking for a very slow poll would get a hot loop instead.
+ */
+export const MAX_POLL_INTERVAL_MS = 2_147_483_647;
+/** Consecutive non-lock poll failures before the loop escalates (backs off, or stops if fatal). */
+const ESCALATE_AFTER = 10;
+/** Ceiling on the degraded poll interval, so a down DB is re-probed forever but cheaply. */
+const BACKOFF_CEILING_MS = 30_000;
+/** Minimum gap between repeats of the same background-job diagnostic. */
+const DIAG_INTERVAL_MS = 60_000;
+
+/**
+ * Live state of one topic's poll loop. `degraded` means the loop is still probing on a backed-off
+ * interval and will self-heal; `stopped` means it will never deliver again without a reconnect.
+ */
+export type SubscriptionState = 'live' | 'degraded' | 'stopped';
+
+export interface SubscriptionHealth {
+  topic: Topic;
+  state: SubscriptionState;
+  consecutiveFailures: number;
+  lastError?: string;
+}
+
+/**
+ * How a DB error affects a background loop. `lock` is the sanctioned silent-retry case (WAL +
+ * busy_timeout resolve it). `unavailable` covers everything that can heal on its own — I/O errors,
+ * a read-only or full volume, a file that is briefly unopenable while a backup swaps it — so the
+ * loop must keep probing. `fatal` is reserved for damage no amount of retrying repairs.
+ */
+export type DbErrorClass = 'lock' | 'unavailable' | 'fatal';
 
 /**
  * The SQLite backend (DESIGN §9). Zero-infra, **polling-only** — no socket, no notify bus,
@@ -59,6 +98,9 @@ export class SqlitePlugin implements BackendPlugin {
   private stopped = false;
   private readonly cancellers: Array<() => void> = [];
   private pruneTimer?: ReturnType<typeof setInterval>;
+  private readonly health = new Map<Topic, SubscriptionHealth>();
+  private pruneFailures = 0;
+  private lastPruneDiag = 0;
 
   // Prepared statements (built once at connect).
   private insertStmt?: SqlStatement;
@@ -69,11 +111,14 @@ export class SqlitePlugin implements BackendPlugin {
   private seqStmt?: SqlStatement;
 
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as SqliteBackendConfig;
+    const cfg = validateBackendConfig(config);
     const dbPath = cfg.db_path ?? 'parley.db';
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
+    this.health.clear();
+    this.pruneFailures = 0;
+    this.lastPruneDiag = 0;
 
     const driver = openDriver(dbPath, {});
     driver.exec(SCHEMA);
@@ -144,13 +189,12 @@ export class SqlitePlugin implements BackendPlugin {
           `expected a numeric rowid cursor minted by this backend`,
       );
     }
-    // A well-formed but STALE cursor — one minted against a previous DB lifetime, so it points
-    // past this DB's AUTOINCREMENT high-water mark — is treated exactly like `since === undefined`
-    // for both the query AND the returned cursor (BUG-23): fall back to the default recent window
-    // so on-start catch-up self-heals after a reset, instead of binding `id > <stale>` → [] and
-    // silently dropping every post made after the reset.
-    const since =
-      args.since !== undefined && this.isStaleCursor(args.since) ? undefined : args.since;
+    // A well-formed but STALE cursor — minted against a previous DB lifetime, so it points past
+    // this DB's AUTOINCREMENT high-water mark — replays the topic from its first row (BUG-23).
+    // Keep it a replay: `id > <stale>` returns [] and drops every post made after the reset, and
+    // the default recent window silently skips everything older than the last `limit` rows while
+    // returning a cursor that claims they were read.
+    const since = args.since !== undefined && this.isStaleCursor(args.since) ? '0' : args.since;
     let rows: MessageRow[];
     if (since === undefined) {
       // Default window: the most recent `limit` messages, returned ascending by cursor.
@@ -168,7 +212,7 @@ export class SqlitePlugin implements BackendPlugin {
     }
     const messages = rows.map(rowToMessage);
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : (since ?? asCursor('0'));
+    const nextCursor = last !== undefined ? last.cursor : asCursor(since ?? '0');
     return { messages, nextCursor };
   }
 
@@ -195,14 +239,14 @@ export class SqlitePlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     let lastSeen = this.maxId(topic);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    // BUG-39: a permanent DB failure (file deleted/replaced/corrupted mid-run) makes the query
-    // throw identically every tick. Track consecutive non-transient failures so the loop can be
-    // diagnosed and escalated instead of spinning silently forever; rate-limit the diagnostic.
-    let consecutiveHardFailures = 0;
+    let failures = 0;
     let lastDiag = 0;
+    const health: SubscriptionHealth = { topic, state: 'live', consecutiveFailures: 0 };
+    this.health.set(topic, health);
 
     const tick = (): void => {
       if (this.stopped || this.driver === undefined) return;
+      let delay = this.pollIntervalMs;
       try {
         const rows = this.require(this.selectAfterStmt).all(
           topic,
@@ -217,34 +261,48 @@ export class SqlitePlugin implements BackendPlugin {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }
         }
-        consecutiveHardFailures = 0; // a clean tick clears the escalation counter
+        failures = 0;
+        health.state = 'live';
+        health.consecutiveFailures = 0;
+        health.lastError = undefined;
       } catch (e) {
-        if (isTransientLock(e)) {
-          // Transient lock/contention — WAL + busy_timeout handle it; retry next tick, quietly.
-          consecutiveHardFailures = 0;
+        const cls = classifyDbError(e);
+        if (cls === 'lock') {
+          // WAL + busy_timeout handle contention; retry next tick, quietly, without escalating.
+          failures = 0;
+          health.state = 'live';
+          health.consecutiveFailures = 0;
         } else {
-          consecutiveHardFailures++;
+          failures++;
+          health.consecutiveFailures = failures;
+          health.lastError = errMessage(e);
           const now = Date.now();
           // Rate-limited so a persistent failure doesn't flood stderr every poll_interval_ms —
           // but the very first hit is loud so the failure is never invisible.
-          if (now - lastDiag > 60_000 || consecutiveHardFailures === 1) {
+          if (now - lastDiag > DIAG_INTERVAL_MS || failures === 1) {
             lastDiag = now;
             process.stderr.write(
-              `parley-sqlite: poll error on topic "${topic}" (#${consecutiveHardFailures}): ` +
-                `${e instanceof Error ? e.message : String(e)}\n`,
+              `parley-sqlite: poll error on topic "${topic}" (#${failures}): ${errMessage(e)}\n`,
             );
           }
-          if (consecutiveHardFailures >= 10) {
-            // Permanent failure → stop the dead loop rather than spin forever with zero progress.
-            process.stderr.write(
-              `parley-sqlite: poll loop for topic "${topic}" stopped after ${consecutiveHardFailures} ` +
-                `consecutive failures; live push is down for this topic\n`,
-            );
-            return; // do NOT reschedule
+          if (failures >= ESCALATE_AFTER) {
+            if (cls === 'fatal') {
+              health.state = 'stopped';
+              process.stderr.write(
+                `parley-sqlite: poll loop for topic "${topic}" stopped after ${failures} ` +
+                  `consecutive unrecoverable failures; live push is down for this topic\n`,
+              );
+              return; // do NOT reschedule
+            }
+            // Keep probing here, however long it takes: subscribe()'s promise has already
+            // resolved and core has no other signal, so stopping is silent, permanent loss of
+            // live push for a topic whose DB was only temporarily unreachable.
+            health.state = 'degraded';
+            delay = backoffMs(this.pollIntervalMs, failures);
           }
         }
       }
-      if (!this.stopped) timer = setTimeout(tick, this.pollIntervalMs);
+      if (!this.stopped) timer = setTimeout(tick, delay);
     };
 
     this.cancellers.push(() => {
@@ -252,6 +310,15 @@ export class SqlitePlugin implements BackendPlugin {
     });
     tick();
     return Promise.resolve();
+  }
+
+  /**
+   * Programmatic view of every poll loop this plugin has started — the path an operator or a
+   * health check reads, since stderr is routinely discarded by an MCP stdio host.
+   */
+  subscriptionHealth(topic?: Topic): SubscriptionHealth[] {
+    const all = [...this.health.values()].map((h) => ({ ...h }));
+    return topic === undefined ? all : all.filter((h) => h.topic === topic);
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
@@ -264,14 +331,26 @@ export class SqlitePlugin implements BackendPlugin {
     return row?.maxId ?? 0;
   }
 
-  /** Delete rows older than `retention_days`. Best-effort — a transient lock retries next tick. */
+  /**
+   * Delete rows older than `retention_days`. A lock retries on the next interval, quietly; any
+   * other failure is reported, so a retention policy the process cannot enforce is never silent.
+   */
   private prune(): void {
     if (this.retentionDays === undefined || this.driver === undefined) return;
-    const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
     try {
+      const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
       this.require(this.pruneStmt).run(cutoff);
-    } catch {
-      // Transient lock/contention — retry on the next interval.
+      this.pruneFailures = 0;
+    } catch (e) {
+      if (classifyDbError(e) === 'lock') return;
+      this.pruneFailures++;
+      const now = Date.now();
+      if (now - this.lastPruneDiag > DIAG_INTERVAL_MS || this.pruneFailures === 1) {
+        this.lastPruneDiag = now;
+        process.stderr.write(
+          `parley-sqlite: retention prune failed (#${this.pruneFailures}): ${errMessage(e)}\n`,
+        );
+      }
     }
   }
 
@@ -282,15 +361,89 @@ export class SqlitePlugin implements BackendPlugin {
 }
 
 /**
- * BUG-39: classify a poll-tick error. SQLITE_BUSY/SQLITE_LOCKED are the sanctioned silent-retry
- * case (WAL + busy_timeout resolve them); everything else (`database disk image is malformed`,
- * `no such table: messages`, I/O errors after the file is removed) is a hard failure that must be
- * diagnosed and escalated rather than swallowed.
+ * Classify a DB error for the background loops (BUG-39). Only damage that retrying cannot repair
+ * is `fatal`; an unrecognised error is `unavailable`, so a class nobody anticipated backs off and
+ * self-heals rather than permanently killing live push.
  */
-function isTransientLock(e: unknown): boolean {
+export function classifyDbError(e: unknown): DbErrorClass {
   const code = (e as { code?: string } | null)?.code ?? '';
-  const msg = e instanceof Error ? e.message : String(e);
-  return /BUSY|LOCKED/.test(code) || /database is locked|database table is locked/i.test(msg);
+  const msg = errMessage(e);
+  if (/BUSY|LOCKED/.test(code) || /database is locked|database table is locked/i.test(msg)) {
+    return 'lock';
+  }
+  if (/CORRUPT|NOTADB/.test(code) || /malformed|file is not a database|no such table/i.test(msg)) {
+    return 'fatal';
+  }
+  return 'unavailable';
+}
+
+function backoffMs(pollIntervalMs: number, failures: number): number {
+  const doublings = Math.min(failures - ESCALATE_AFTER + 1, 30);
+  return Math.min(pollIntervalMs * 2 ** doublings, BACKOFF_CEILING_MS);
+}
+
+function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+const CONFIG_KEYS = ['db_path', 'poll_interval_ms', 'retention_days'] as const;
+
+function bad(key: string, reason: string): Error {
+  return new Error(`parley-sqlite: invalid backend_config.${key} — ${reason}`);
+}
+
+/**
+ * Validate `backend_config` before anything is opened or deleted (§11). Every rejection names the
+ * key and the plugin, and happens before `connect()` has touched the database, so a typo or a
+ * mis-typed retention window can never take an irreversible action.
+ */
+export function validateBackendConfig(config: BackendConfig): SqliteBackendConfig {
+  const cfg = config as Record<string, unknown>;
+  for (const key of Object.keys(cfg)) {
+    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `parley-sqlite: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
+      );
+    }
+  }
+
+  const dbPath = cfg['db_path'];
+  if (dbPath !== undefined && (typeof dbPath !== 'string' || dbPath === '')) {
+    throw bad('db_path', `expected a non-empty string, got ${describe(dbPath)}`);
+  }
+
+  const poll = cfg['poll_interval_ms'];
+  if (
+    poll !== undefined &&
+    (typeof poll !== 'number' ||
+      !Number.isInteger(poll) ||
+      poll < MIN_POLL_INTERVAL_MS ||
+      poll > MAX_POLL_INTERVAL_MS)
+  ) {
+    throw bad(
+      'poll_interval_ms',
+      `expected an integer between ${MIN_POLL_INTERVAL_MS} and ${MAX_POLL_INTERVAL_MS} ms, ` +
+        `got ${describe(poll)}`,
+    );
+  }
+
+  const retention = cfg['retention_days'];
+  if (retention !== undefined && (typeof retention !== 'number' || !(retention > 0))) {
+    throw bad(
+      'retention_days',
+      `expected a number > 0, got ${describe(retention)} — 0 or negative would delete the whole ` +
+        `history; omit the key to keep every message forever`,
+    );
+  }
+  if (typeof retention === 'number' && !Number.isFinite(retention)) {
+    throw bad('retention_days', `expected a finite number, got ${describe(retention)}`);
+  }
+
+  return cfg as SqliteBackendConfig;
+}
+
+function describe(v: unknown): string {
+  return typeof v === 'string' ? `'${v}'` : String(v);
 }
 
 function rowToMessage(row: MessageRow): Message {

@@ -1,4 +1,4 @@
-import { chmodSync } from 'node:fs';
+import { chmodSync, closeSync, openSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 // Lazy CJS require so the native module (better-sqlite3) or the built-in (node:sqlite)
@@ -99,6 +99,10 @@ function loadBetterSqlite(): (new (p: string) => RawDb) | null {
  */
 export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   const busy = opts.busyTimeoutMs ?? 5000;
+  const onDisk = path !== ':memory:' && !path.startsWith('file::memory:');
+  // SEC-16: create the file 0600 BEFORE the driver can create it at the umask default, so there
+  // is no window in which the whole conversation store is world-readable.
+  if (onDisk) precreate(path);
   const Better = loadBetterSqlite();
   let driver: SqlDriver;
   if (Better !== null) {
@@ -144,23 +148,50 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
     }
   }
   driver.exec('PRAGMA synchronous = NORMAL');
-  // SEC-16: SQLite creates the DB (and, since journal_mode = WAL above, its -wal/-shm sidecars)
-  // at the umask default — typically 0644, world-readable — and neither driver exposes a mode
-  // option, so chmod them to 0600 after open. Skip in-memory paths; the sidecars may not exist
-  // yet (e.g. before the first write), so guard each chmod individually.
-  if (path !== ':memory:' && !path.startsWith('file::memory:')) {
-    try {
-      chmodSync(path, 0o600);
-    } catch {
-      /* best-effort: file may be on a mode-less FS */
-    }
-    for (const sidecar of [`${path}-wal`, `${path}-shm`]) {
-      try {
-        chmodSync(sidecar, 0o600);
-      } catch {
-        /* not created yet / absent — ignore */
-      }
-    }
+  // SEC-16: an existing store (or a -wal/-shm sidecar SQLite created at the umask default) can
+  // still be group/world-readable, and neither driver exposes a mode option. Narrow anything
+  // wider, and say so — including when it cannot be done, which is what a second bridge running
+  // as a different UID hits.
+  if (onDisk) {
+    for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
   }
   return driver;
+}
+
+/**
+ * Claim the path at 0600 before anything else can create it. Stay silent on failure, so that a
+ * bad path or a permissions problem surfaces the driver's own precise open error below rather
+ * than this one.
+ */
+function precreate(path: string): void {
+  try {
+    closeSync(openSync(path, 'a', 0o600));
+  } catch {
+    /* the open below reports it */
+  }
+}
+
+/** Narrow a file that is readable beyond its owner, reporting both the change and any failure. */
+function restrictMode(path: string): void {
+  let current: number;
+  try {
+    current = statSync(path).mode & 0o777;
+  } catch {
+    return; // sidecar not created yet
+  }
+  if ((current & 0o077) === 0) return;
+  const target = current & 0o700;
+  try {
+    chmodSync(path, target);
+    process.stderr.write(
+      `parley-sqlite: tightened ${path} from 0${current.toString(8)} to 0${target.toString(8)} ` +
+        `(SEC-16: the message store must not be readable by other accounts)\n`,
+    );
+  } catch (e) {
+    process.stderr.write(
+      `parley-sqlite: cannot restrict ${path} (mode 0${current.toString(8)}, ` +
+        `${e instanceof Error ? e.message : String(e)}) — the message store is readable by other ` +
+        `accounts on this host\n`,
+    );
+  }
 }

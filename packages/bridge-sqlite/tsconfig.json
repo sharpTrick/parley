@@ -5,5 +5,6 @@
     "outDir": "dist"
   },
   "references": [{ "path": "../bridge-core" }],
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["src/**/*.test.ts"]
 }
