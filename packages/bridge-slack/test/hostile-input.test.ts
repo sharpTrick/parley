@@ -53,7 +53,53 @@ describe('slack colliding topic → channel mappings', () => {
     await plugin.disconnect();
   });
 
-  it('subscribe rejects an unmapped topic that collides with a mapped one', async () => {
+  /**
+   * A mapped topic and an unmapped channel-id literal collide only at USE, so the guard has to live
+   * on every seam method, not just `subscribe`. The documented chat default runs with live push OFF
+   * and never calls `subscribe` at all, so a guard that only exists there leaves the reactive
+   * deployment — the common one — silently running two topics over one channel.
+   */
+  const ENTRY_POINTS: Array<{ name: string; use: (p: SlackPlugin, t: Topic) => Promise<unknown> }> = [
+    { name: 'subscribe', use: (p, t) => p.subscribe(t, () => undefined) },
+    { name: 'post', use: (p, t) => p.post(t, asHandle('writer'), 'meant for the other topic') },
+    { name: 'fetchRecent', use: (p, t) => p.fetchRecent({ topic: t, limit: 10 }) },
+    {
+      name: 'fetchRecent-since',
+      use: (p, t) => p.fetchRecent({ topic: t, since: asCursor('0'), limit: 10 }),
+    },
+  ];
+
+  for (const first of ENTRY_POINTS) {
+    for (const second of ENTRY_POINTS) {
+      it(`${second.name} rejects the aliasing topic after ${first.name} claimed the channel`, async () => {
+        const fake = await FakeSlack.start();
+        const plugin = new SlackPlugin();
+        await plugin.connect({
+          api_url: fake.apiUrl,
+          bot_token: 'xoxb-test',
+          app_token: 'xapp-test',
+          channel_map: { alpha: 'C0LIT' },
+        });
+        fake.createChannel('C0LIT');
+        try {
+          await first.use(plugin, asTopic('alpha'));
+          // `C0LIT` is unmapped, so it is used as a channel-id literal — `alpha`'s channel.
+          await expect(second.use(plugin, asTopic('C0LIT'))).rejects.toThrow(
+            /alpha[\s\S]*C0LIT|C0LIT[\s\S]*alpha/,
+          );
+          // …and the owning topic still works: the rejection displaced nothing.
+          await plugin.post(asTopic('alpha'), asHandle('writer'), 'kept');
+          const { messages } = await plugin.fetchRecent({ topic: asTopic('alpha'), limit: 10 });
+          expect(messages.at(-1)?.content).toBe('kept');
+        } finally {
+          await plugin.disconnect();
+          await fake.close();
+        }
+      });
+    }
+  }
+
+  it('subscribe keeps the first topic live after rejecting the aliasing one', async () => {
     const fake = await FakeSlack.start();
     const plugin = new SlackPlugin();
     await plugin.connect({
@@ -68,7 +114,6 @@ describe('slack colliding topic → channel mappings', () => {
       await plugin.subscribe(asTopic('alpha'), (m) =>
         received.push({ topic: String(m.topic), content: m.content }),
       );
-      // `C0LIT` is unmapped, so it is used as a channel-id literal — the same channel as `alpha`.
       await expect(plugin.subscribe(asTopic('C0LIT'), () => undefined)).rejects.toThrow(/alpha/);
 
       // The first topic's route is intact: the rejected subscribe did not displace it.
@@ -105,6 +150,42 @@ const BAD_ENTRIES: Array<{ name: string; entry: unknown; surfacesAs?: string }> 
     name: 'null text',
     entry: { type: 'message', ts: '1700000000.000002', text: null, user: 'U0' },
     surfacesAs: '',
+  },
+  // RANGE, not shape: these match `\d+\.\d+` and reach `new Date(seconds * 1000)`, which THROWS
+  // outside the Date range — a rejection the cursor can never advance past, i.e. a wedged topic.
+  {
+    name: 'ts seconds past the Date range',
+    entry: { type: 'message', ts: '99999999999999999.000001', text: 'poison', user: 'U0' },
+  },
+  {
+    name: 'ts with 400 seconds digits',
+    entry: { type: 'message', ts: `${'9'.repeat(400)}.000001`, text: 'poison', user: 'U0' },
+  },
+  {
+    name: 'ts with 400 suffix digits',
+    entry: { type: 'message', ts: `1700000000.${'9'.repeat(400)}`, text: 'poison', user: 'U0' },
+  },
+  // IDENTITY, not shape: `senderHandle` must never be minted empty — the seam's own
+  // well-formedness rule forbids it and core's identity filter and roster read it directly.
+  {
+    name: 'no user and no bot_id',
+    entry: { type: 'message', ts: '1700000000.000003', text: 'ghost' },
+    surfacesAs: 'ghost',
+  },
+  {
+    name: 'null user, null bot_id',
+    entry: { type: 'message', ts: '1700000000.000004', text: 'ghost', user: null, bot_id: null },
+    surfacesAs: 'ghost',
+  },
+  {
+    name: 'empty-string user',
+    entry: { type: 'message', ts: '1700000000.000005', text: 'ghost', user: '' },
+    surfacesAs: 'ghost',
+  },
+  {
+    name: 'bot_id only',
+    entry: { type: 'message', ts: '1700000000.000006', text: 'app post', bot_id: 'B0APP' },
+    surfacesAs: 'app post',
   },
 ];
 
@@ -162,6 +243,7 @@ describe('slack history robustness: one hostile record must not wedge catch-up',
             for (const m of result.messages) {
               expect(String(m.backendMsgId).length, where).toBeGreaterThan(0);
               expect(String(m.cursor).length, where).toBeGreaterThan(0);
+              expect(String(m.senderHandle).length, where).toBeGreaterThan(0);
             }
             expect(String(result.nextCursor).length, where).toBeGreaterThan(0);
           }
@@ -169,6 +251,115 @@ describe('slack history robustness: one hostile record must not wedge catch-up',
       } finally {
         await plugin.disconnect();
         await fake.close();
+      }
+    });
+  }
+});
+
+/**
+ * CLASS: a field that passes the SHAPE guard but not the RANGE guard. The fixed table above names
+ * the widths someone thought of; this generates every `ts` the accepted shape admits — including
+ * the widths nobody thought of — and asserts the normalize path neither throws nor loses ground.
+ */
+const TS_WIDTHS = [1, 2, 9, 10, 11, 12, 13, 17, 40, 400];
+
+describe('slack ts range: every string the shape guard admits must normalize', () => {
+  const generated = TS_WIDTHS.flatMap((secs) =>
+    TS_WIDTHS.map((sub) => `${'9'.repeat(secs)}.${'1'.repeat(sub)}`),
+  );
+
+  it('the generator only produces strings the shape guard would accept', () => {
+    for (const ts of generated) expect(/^\d+\.\d+$/.test(ts)).toBe(true);
+    expect(generated.length).toBe(TS_WIDTHS.length ** 2);
+  });
+
+  it('history: no generated ts rejects the call or rolls the cursor backwards', async () => {
+    const fake = await FakeSlack.start();
+    const plugin = new SlackPlugin();
+    await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
+    try {
+      const topic = asTopic('C0TSGEN');
+      const anchor = fake.seed(topic, [{ text: 'anchor' }])[0]!;
+      fake.seedRaw(
+        topic,
+        generated.map((ts) => ({ type: 'message', ts, text: `gen-${ts.length}`, user: 'U0' })),
+      );
+
+      for (const since of [undefined, asCursor('0'), asCursor(anchor.ts)]) {
+        const result = await plugin.fetchRecent(
+          since === undefined ? { topic, limit: 100 } : { topic, since, limit: 100 },
+        );
+        expect(String(result.nextCursor).length).toBeGreaterThan(0);
+        for (const m of result.messages) {
+          expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
+          expect(String(m.senderHandle).length).toBeGreaterThan(0);
+        }
+      }
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
+  it('live push: no generated ts breaks the socket or reaches a handler unnormalized', async () => {
+    const fake = await FakeSlack.start();
+    const plugin = new SlackPlugin();
+    await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
+    try {
+      const topic = asTopic('C0TSLIVE');
+      fake.createChannel(topic);
+      const seen: string[] = [];
+      await plugin.subscribe(topic, (m) => {
+        expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
+        seen.push(m.content);
+      });
+      for (const ts of generated) {
+        fake.pushEnvelope({
+          type: 'events_api',
+          payload: { event: { type: 'message', channel: topic, ts, text: `gen-${ts}`, user: 'U0' } },
+        });
+      }
+      // The socket is still serving afterwards — an envelope that killed it would strand this.
+      await plugin.post(topic, asHandle('writer'), 'still alive');
+      await vi.waitFor(() => expect(seen).toContain('still alive'), { timeout: 3000, interval: 10 });
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+});
+
+describe('slack post: an ok:true reply is not a promise that `ts` is there', () => {
+  const REPLIES: Array<{ name: string; body: Record<string, unknown> }> = [
+    { name: 'no ts at all', body: { ok: true, channel: 'C0X' } },
+    { name: 'null ts', body: { ok: true, ts: null } },
+    { name: 'numeric ts', body: { ok: true, ts: 1700000000.1 } },
+    { name: 'empty ts', body: { ok: true, ts: '' } },
+    { name: 'unparseable ts', body: { ok: true, ts: 'abc' } },
+    { name: 'ts past the Date range', body: { ok: true, ts: '99999999999999999.000001' } },
+  ];
+
+  for (const reply of REPLIES) {
+    it(`rejects rather than branding an unusable dedup key: ${reply.name}`, async () => {
+      const { createServer } = await import('node:http');
+      const server = createServer((req, res) => {
+        void (async () => {
+          for await (const _ of req) void _;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(reply.body));
+        })();
+      });
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      const { port } = server.address() as { port: number };
+      const plugin = new SlackPlugin();
+      try {
+        await plugin.connect({ api_url: `http://127.0.0.1:${port}/api`, bot_token: 'xoxb-test' });
+        await expect(plugin.post(asTopic('C0X'), asHandle('writer'), 'hi')).rejects.toThrow(
+          /no usable ts/,
+        );
+      } finally {
+        await plugin.disconnect();
+        await new Promise<void>((r) => server.close(() => r()));
       }
     });
   }

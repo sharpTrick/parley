@@ -1,12 +1,22 @@
 /**
- * CLASS: the documented required scopes must equal the scopes the code actually exercises.
+ * CLASS: prose that restates something the code owns must be checked against the code.
  *
- * A scope in the provisioning list that no call needs is not free — operators grant it, and it
- * widens what a leaked `xoxb-` token can do (DESIGN §14). A call whose scope is undocumented is
- * worse: the bridge fails at runtime with a `missing_scope` nobody can map back. Both directions
- * are the same invariant, so this compares the Web API methods reachable from `src/` against the
- * README's method→scope table and requires equality.
+ * (1) The documented required scopes must equal the scopes the code actually exercises. A scope in
+ *     the provisioning list that no call needs is not free — operators grant it, and it widens what
+ *     a leaked `xoxb-` token can do (DESIGN §14). A call whose scope is undocumented is worse: the
+ *     bridge fails at runtime with a `missing_scope` nobody can map back.
+ *
+ * (2) The rate-limit paragraph restates a policy that lives in `@sharptrick/parley-net-util`, which
+ *     has already changed under it once — the README kept claiming a server-stated `Retry-After` was
+ *     clamped to 5 s long after the helper began honouring it in full. Prose cannot be diffed
+ *     against a helper, so the paragraph is required to name each constant it depends on BY VALUE,
+ *     imported from the helper: a policy change then fails here instead of misleading an operator.
  */
+import {
+  DEFAULT_BACKOFF_MS,
+  DEFAULT_DEADLINE_MS,
+  MAX_BACKOFF_MS,
+} from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -81,5 +91,35 @@ describe('slack provisioning docs', () => {
       expect(method).not.toMatch(/\.list$/);
       expect(scope).not.toMatch(/channels:read/);
     }
+  });
+});
+
+describe('slack rate-limit docs track the shared helper', () => {
+  const paragraph = (): string => {
+    const readme = read('../README.md');
+    const found = /\*\*Rate-limit behaviour\.\*\*([\s\S]*?)\n\n/.exec(readme);
+    expect(found, 'README has no **Rate-limit behaviour.** paragraph').not.toBeNull();
+    return found![1]!;
+  };
+
+  const seconds = (ms: number): string => `${ms / 1000} s`;
+
+  it('names every net-util constant it depends on, by value', () => {
+    const text = paragraph();
+    for (const [name, ms] of [
+      ['MAX_BACKOFF_MS', MAX_BACKOFF_MS],
+      ['DEFAULT_DEADLINE_MS', DEFAULT_DEADLINE_MS],
+    ] as const) {
+      expect(text, `${name} value missing`).toContain(seconds(ms));
+      expect(text, `${name} not named`).toContain(name);
+    }
+    expect(text).toContain('DEFAULT_BACKOFF_MS');
+    expect(text).toContain(`${DEFAULT_BACKOFF_MS} ms`);
+  });
+
+  it('does not restate the superseded rule that a stated hint is clamped', () => {
+    const text = paragraph();
+    expect(text).toMatch(/honoured\s+\*\*in full\*\*/);
+    expect(text).not.toMatch(/`Retry-After`[\s\S]*honoured up to/);
   });
 });

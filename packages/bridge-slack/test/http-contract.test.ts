@@ -13,7 +13,7 @@ import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { SlackPlugin } from '../src/index.js';
+import { MAX_HISTORY_PAGES, SlackPlugin } from '../src/index.js';
 
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -246,6 +246,134 @@ describe('Slack api() form-encodes every method (read-method args survive)', () 
       // arg → users_not_found → backendRef === handle (silent mis-resolution).
       expect(sawEmailArg).toBe(true);
       expect(identity.backendRef).toBe('U0ALICE');
+    } finally {
+      await plugin.disconnect();
+      await stop(server);
+    }
+  });
+});
+
+/**
+ * CLASS: a walk whose termination is delegated to the peer. `conversations.history` pages until the
+ * server stops handing out a `next_cursor`, so a server that never does — or that hands out one
+ * that does not advance — turns one `fetch_recent` into an unbounded request loop that `disconnect`
+ * cannot stop. Every row below asserts the call SETTLES, that it settles by naming why, and how
+ * many requests it cost; a walk that merely spun would time the row out instead of failing it, so
+ * the request count is asserted too.
+ */
+interface Pager {
+  name: string;
+  /** Cursor to answer with, given the cursor that arrived (undefined = first page). */
+  next: (arrived: string | undefined, hit: number) => string;
+  messagesPerPage: number;
+  since?: string;
+  expect: RegExp;
+  expectedRequests: number;
+}
+
+const PAGERS: Pager[] = [
+  {
+    name: 'a cursor that never changes',
+    next: () => 'always-more',
+    messagesPerPage: 0,
+    expect: /repeated page cursor/,
+    expectedRequests: 2,
+  },
+  {
+    name: 'a cursor cycling A → B → A',
+    next: (arrived) => (arrived === 'A' ? 'B' : 'A'),
+    messagesPerPage: 0,
+    expect: /repeated page cursor/,
+    expectedRequests: 3,
+  },
+  {
+    name: 'a fresh cursor forever, on empty pages',
+    next: (_arrived, hit) => `c${hit}`,
+    messagesPerPage: 0,
+    expect: new RegExp(`exceeded ${MAX_HISTORY_PAGES} pages`),
+    expectedRequests: MAX_HISTORY_PAGES,
+  },
+  {
+    name: 'a fresh cursor forever, on pages that never empty, resuming after a cursor',
+    next: (_arrived, hit) => `c${hit}`,
+    messagesPerPage: 5,
+    since: '0',
+    expect: new RegExp(`exceeded ${MAX_HISTORY_PAGES} pages`),
+    expectedRequests: MAX_HISTORY_PAGES,
+  },
+];
+
+function pagingServer(pager: Pager, onHit?: (hit: number) => void): Server {
+  let hit = 0;
+  let minted = 0;
+  return createServer((req, res) => {
+    void (async () => {
+      const arrived = new URLSearchParams(await readBody(req)).get('cursor') ?? undefined;
+      hit++;
+      onHit?.(hit);
+      const messages = Array.from({ length: pager.messagesPerPage }, () => ({
+        type: 'message',
+        ts: `1700000000.${String(++minted).padStart(6, '0')}`,
+        text: `m${minted}`,
+        user: 'U0X',
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          messages,
+          response_metadata: { next_cursor: pager.next(arrived, hit) },
+        }),
+      );
+    })();
+  });
+}
+
+describe('slack conversations.history paging terminates without the server’s help', () => {
+  for (const pager of PAGERS) {
+    it(`ends the walk on ${pager.name}, naming why`, async () => {
+      let served = 0;
+      const server = pagingServer(pager, (hit) => {
+        served = hit;
+      });
+      const url = await listen(server);
+      const plugin = new SlackPlugin();
+      try {
+        await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
+        const args = { topic: asTopic('C0PAGE'), limit: 10 };
+        await expect(
+          plugin.fetchRecent(
+            pager.since === undefined ? args : { ...args, since: asCursor(pager.since) },
+          ),
+        ).rejects.toThrow(pager.expect);
+        expect(served).toBe(pager.expectedRequests);
+      } finally {
+        await plugin.disconnect();
+        await stop(server);
+      }
+    });
+  }
+
+  it('a disconnect mid-walk ends it, and no further page is requested', async () => {
+    const plugin = new SlackPlugin();
+    let served = 0;
+    const server = pagingServer(
+      { name: 'endless', next: (_a, hit) => `c${hit}`, messagesPerPage: 0, expect: /x/, expectedRequests: 0 },
+      (hit) => {
+        served = hit;
+        if (hit === 5) void plugin.disconnect();
+      },
+    );
+    const url = await listen(server);
+    try {
+      await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
+      await expect(
+        plugin.fetchRecent({ topic: asTopic('C0PAGE'), since: asCursor('0'), limit: 10 }),
+      ).rejects.toThrow(/aborted — disconnected/);
+      const atStop = served;
+      await new Promise((r) => setTimeout(r, 200));
+      expect(served).toBe(atStop);
+      expect(served).toBeLessThan(MAX_HISTORY_PAGES);
     } finally {
       await plugin.disconnect();
       await stop(server);

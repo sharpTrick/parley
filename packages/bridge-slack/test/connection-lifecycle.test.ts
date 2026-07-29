@@ -8,22 +8,57 @@
  *     each singleton N times against a fake that fails the first K attempts, and asserts both that
  *     the endpoint was hit N times AND that attempt K+1 succeeds.
  *
- * (2) A teardown racing an in-flight resource acquisition must leave nothing open. `disconnect()`
- *     can land while `apps.connections.open` is still in flight; the socket that opens afterwards
- *     belongs to a plugin that is already stopped, and nothing will ever close it — it holds a
- *     process handle and burns one of the ~10 Socket Mode connections an app token gets.
+ * (2) A teardown racing an in-flight resource acquisition must leave nothing open AND must settle
+ *     what the caller is holding. `disconnect()` can land while `apps.connections.open` is still in
+ *     flight, or while the websocket that opened is waiting for a `hello` that a degraded Socket
+ *     Mode edge never sends. Grading only `liveSockets` grades socket hygiene and nothing the
+ *     caller observes, so the race table below states an OUTCOME per row: a blocking `fetchRecent`
+ *     must RESOLVE with an empty page at the cursor it was given (never reject), and a `subscribe`
+ *     must settle inside a bound. An acquisition whose only exit is a message the peer may never
+ *     send has no bound at all, which is what the `silent` mode is here to prove.
  */
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { SlackPlugin } from '../src/index.js';
-import { FakeSlack } from './fake-slack.js';
+import { FakeSlack, type GreetMode } from './fake-slack.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** Short enough that a silent handshake is provably bounded without a slow test. */
+const HANDSHAKE_MS = 400;
+
 async function makePlugin(fake: FakeSlack): Promise<SlackPlugin> {
   const plugin = new SlackPlugin();
-  await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
+  await plugin.connect({
+    api_url: fake.apiUrl,
+    bot_token: 'xoxb-test',
+    app_token: 'xapp-test',
+    handshake_timeout_ms: HANDSHAKE_MS,
+  });
   return plugin;
+}
+
+type Settled<T> =
+  | { status: 'fulfilled'; value: T }
+  | { status: 'rejected'; reason: unknown }
+  | { status: 'pending' };
+
+/**
+ * Attach the outcome handlers to `p` NOW — a call that rejects before the test gets round to
+ * awaiting it is an unhandled rejection, which vitest reports as a run-level error rather than a
+ * row failure — and report which way it went, or `pending`, once `ms` has passed. A test that
+ * simply awaits the call cannot fail on a call that never settles: it hangs.
+ */
+function capture<T>(p: Promise<T>): Promise<Settled<T>> {
+  return p.then(
+    (value): Settled<T> => ({ status: 'fulfilled', value }),
+    (reason: unknown): Settled<T> => ({ status: 'rejected', reason }),
+  );
+}
+
+async function settleWithin<T>(captured: Promise<Settled<T>>, ms: number): Promise<Settled<T>> {
+  const pending: Settled<T> = { status: 'pending' };
+  return Promise.race([captured, sleep(ms).then(() => pending)]);
 }
 
 interface Singleton {
@@ -124,37 +159,113 @@ describe('slack memoized async singletons', () => {
   });
 });
 
+const BLOCK_MS = 2000;
+
 describe('slack teardown racing an in-flight connect', () => {
-  for (const delayMs of [0, 1, 5, 20, 50, 120]) {
-    for (const start of ['subscribe', 'blocking-fetch'] as const) {
-      it(`disconnect ${delayMs}ms into ${start} leaves no socket open`, async () => {
-        const fake = await FakeSlack.start();
-        const topic = asTopic('C0RACE');
-        fake.createChannel(topic);
-        // Hold the handshake open long enough that the teardown lands mid-acquisition for the
-        // small delays and after establishment for the large ones.
-        fake.setLatency('apps.connections.open', 60);
-        const plugin = await makePlugin(fake);
-        try {
-          const inFlight =
-            start === 'subscribe'
-              ? plugin.subscribe(topic, () => undefined)
-              : plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 2000 });
-          const settled = inFlight.then(
-            () => undefined,
-            () => undefined,
-          );
+  for (const greet of ['greet', 'pre-hello-close', 'silent'] as GreetMode[]) {
+    for (const delayMs of [0, 1, 5, 20, 50, 120]) {
+      for (const start of ['subscribe', 'blocking-fetch'] as const) {
+        it(`disconnect ${delayMs}ms into ${start} on a ${greet} socket settles it and leaves no socket open`, async () => {
+          const fake = await FakeSlack.start();
+          const topic = asTopic('C0RACE');
+          fake.createChannel(topic);
+          fake.setGreet(greet);
+          // Hold the handshake open long enough that the teardown lands mid-acquisition for the
+          // small delays and after establishment for the large ones.
+          fake.setLatency('apps.connections.open', 60);
+          const plugin = await makePlugin(fake);
+          try {
+            const inFlight = capture<unknown>(
+              start === 'subscribe'
+                ? plugin.subscribe(topic, () => undefined)
+                : plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: BLOCK_MS }),
+            );
 
-          await sleep(delayMs);
-          await plugin.disconnect();
-          await settled;
-          await sleep(300);
+            await sleep(delayMs);
+            await plugin.disconnect();
+            // Generous versus the teardown, tight versus the budgets that would hide the bug:
+            // under `blockMs`, and under the handshake timeout the silent rows would otherwise run.
+            const outcome = await settleWithin(inFlight, 300);
 
-          expect(fake.liveSockets).toBe(0);
-        } finally {
-          await fake.close();
-        }
-      });
+            const where = `${start} / ${greet} / +${delayMs}ms`;
+            expect(outcome.status, where).not.toBe('pending');
+            if (start === 'blocking-fetch') {
+              // The caller's observable contract: an interrupted long-poll is an empty page at the
+              // cursor it was given — core surfaces a rejection here as a tool error.
+              expect(outcome.status, where).toBe('fulfilled');
+              const value = (outcome as { value: { messages: unknown[]; nextCursor: string } }).value;
+              expect(value.messages, where).toEqual([]);
+              expect(String(value.nextCursor), where).toBe('0');
+            }
+
+            await sleep(300);
+            expect(fake.liveSockets, where).toBe(0);
+          } finally {
+            await fake.close();
+          }
+        });
+      }
     }
   }
+
+  it('a socket that never says hello bounds subscribe and every blocking fetch on its own', async () => {
+    const fake = await FakeSlack.start();
+    const topic = asTopic('C0SILENT');
+    fake.createChannel(topic);
+    fake.setGreet('silent');
+    const plugin = await makePlugin(fake);
+    try {
+      // The long-poll's own budget, not the handshake's, is what a blocked fetch_recent observes —
+      // so ask for a budget well UNDER the handshake timeout and hold the call to it.
+      const fetchStarted = Date.now();
+      const fetched = await settleWithin(
+        capture(plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: HANDSHAKE_MS / 4 })),
+        HANDSHAKE_MS * 4,
+      );
+      expect(fetched.status).toBe('fulfilled');
+      expect(Date.now() - fetchStarted).toBeLessThan(HANDSHAKE_MS);
+
+      const subscribed = await settleWithin(
+        capture(plugin.subscribe(topic, () => undefined)),
+        HANDSHAKE_MS * 6,
+      );
+      expect(subscribed.status).toBe('rejected');
+      expect(String((subscribed as { reason: unknown }).reason)).toMatch(/no hello within \d+ms/);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
+  it('a handler registered before a disconnect never fires on the next connection', async () => {
+    const fake = await FakeSlack.start();
+    const stale = asTopic('C0STALE');
+    const fresh = asTopic('C0FRESH');
+    fake.createChannel(stale);
+    fake.createChannel(fresh);
+    const plugin = await makePlugin(fake);
+    try {
+      const before: string[] = [];
+      const after: string[] = [];
+      await plugin.subscribe(stale, (m) => before.push(m.content));
+      await plugin.disconnect();
+
+      await plugin.connect({
+        api_url: fake.apiUrl,
+        bot_token: 'xoxb-test',
+        app_token: 'xapp-test',
+        handshake_timeout_ms: HANDSHAKE_MS,
+      });
+      await plugin.subscribe(fresh, (m) => after.push(m.content));
+      await plugin.post(stale, asHandle('writer'), 'to the stale route');
+      await plugin.post(fresh, asHandle('writer'), 'to the live route');
+
+      await sleep(400);
+      expect(after).toEqual(['to the live route']);
+      expect(before).toEqual([]);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
 });

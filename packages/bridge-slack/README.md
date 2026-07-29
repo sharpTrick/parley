@@ -19,7 +19,8 @@ than the retention window silently gets fewer messages back on catch-up.
 | `fetchRecent({since})` | `conversations.history {oldest: since}` — `oldest` is EXCLUSIVE (we never set `inclusive`); pages arrive newest-first and are re-assembled ascending |
 | `subscribe` | **Socket Mode**: one shared websocket per plugin instance (`apps.connections.open` → single-use `wss://` URL) — real Events API pushes, not a poll timer |
 | `resolveIdentity` | handle with `@` → `users.lookupByEmail`; own bot name → `auth.test` user id; else passthrough |
-| `senderHandle` | the Slack **user/bot id of the poster** — the logical `identity` argument of `post` is NOT carried on the wire, so everything this bridge posts reads back as the one bot user (see *Multiple concurrent sessions*) |
+| `senderHandle` | the Slack **user/bot id of the poster** — the logical `identity` argument of `post` is NOT carried on the wire, so everything this bridge posts reads back as the one bot user (see *Multiple concurrent sessions*). An entry carrying neither `user` nor `bot_id` (some app/workflow posts) reads back as `unknown` |
+| `mentions` | Slack's `<@U…>` / `<@U…\|label>` / `<!subteam^S…\|@team>` / `<!here>` markup, rewritten to the `@handle` form core parses — see *Mentions* |
 | absent topic | `channel_not_found` (and `not_in_channel` on read) → the seam's `NoSuchTopicError`, i.e. "topic not present yet"; every other `ok:false` is a real error |
 
 **Catch-up cost.** Slack pages history newest-first while the seam wants the oldest unseen page, so
@@ -30,19 +31,42 @@ is real wall-clock time after a long outage. Configure a **large `catchup.limit`
 aggregate cost falls linearly with it.
 
 Threading is an approximation: `inReplyTo` becomes `thread_ts`. A plain thread reply does not
-surface at channel level (history or channel events), so it is durable but only visible inside the
-thread; a reply the author broadcasts to the channel arrives as a `thread_broadcast` entry with its
-own `ts` and **is** surfaced — that is the return path for replies to a threaded `post`.
+surface at channel level — `conversations.history` does not return it, and the live path **drops**
+it for the same reason, so the two paths agree and nothing is delivered that a later catch-up could
+not replay. It is durable but only visible inside the thread; a reply the author broadcasts to the
+channel arrives as a `thread_broadcast` entry with its own `ts` and **is** surfaced — that is the
+return path for replies to a threaded `post`.
 
-**Colliding topics fail at load.** Two topics that resolve to the same channel — both mapped in
-`channel_map`, or one mapped and the other an unmapped channel-id literal — are rejected by
-`connect` (respectively `subscribe`), naming both topics. Folding them would silently drop one
-topic's subscription and deliver that channel's traffic under the other topic's name.
+**Mentions.** Slack never puts `@handle` on the wire; it serializes a mention as `<@U0ABC>`,
+`<@U0ABC|label>`, `<!subteam^S0DEV|@team>` or `<!here>`. The plugin rewrites all four into the
+`@handle` form core's mention parser reads, so `live_push.mention_filter` works. Map the ids that
+matter to you with **`mention_map`** (Slack user/usergroup id → Parley handle); Slack's own label is
+the fallback, and an unmapped, unlabelled id surfaces as the bare id — visible, but it will not match
+a configured handle. Non-mention markup (`<!date^…>`, `<https://…|link>`, `<#C0…|general>`) is left
+verbatim.
 
-**Rate-limit behaviour.** A 429 is retried with the server's `Retry-After` honoured up to the shared
-backoff clamp (5 s). If the Socket Mode handshake fails, the long-poll path backs off before dialling
-`apps.connections.open` again, so a core poll loop cannot turn one `fetch_recent` into hundreds of
-handshakes against Slack's tightest limit; catch-up continues over HTTP in the meantime.
+**Colliding topics fail fast.** Two topics that resolve to the same channel — both mapped in
+`channel_map`, or one mapped and the other an unmapped channel-id literal — are rejected. A map
+whose targets collide fails at `connect`; a collision that only appears when an unmapped literal is
+used fails at first use, on **every** seam method (`post`, `fetchRecent` and `subscribe` alike, so a
+reactive-only deployment with `live_push.enabled: false` is guarded too), naming both topics.
+Folding them would silently drop one topic's subscription and deliver that channel's traffic under
+the other topic's name.
+
+**Rate-limit behaviour.** A 429 is retried with the server's `Retry-After` honoured **in full**:
+only a backoff the bridge invents for itself is clamped, at `MAX_BACKOFF_MS` = 5 s. A stated hint
+that would not fit the call's `DEFAULT_DEADLINE_MS` = 30 s budget ends the call naming the figure
+rather than retrying sooner than Slack asked; a 429 with no usable hint waits
+`DEFAULT_BACKOFF_MS` = 500 ms. All three constants live in `@sharptrick/parley-net-util`. If the
+Socket Mode handshake fails, the long-poll path backs off before dialling `apps.connections.open`
+again, so a core poll loop cannot turn one `fetch_recent` into hundreds of handshakes against
+Slack's tightest limit; catch-up continues over HTTP in the meantime.
+
+**Bounded waits.** A Socket Mode connection that opens and then says nothing is given
+`handshake_timeout_ms` (default 10 s) to send `hello` before the attempt is abandoned, and a
+blocking `fetchRecent` never waits longer than its own `block_ms` for that handshake. A
+`conversations.history` walk stops with a named error if the server repeats a page cursor or keeps
+handing out new ones past 2000 pages, rather than paging forever.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
 nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
@@ -59,6 +83,9 @@ backend_config:
   api_url: "https://slack.com/api"   # default; tests point this at an in-process fake
   channel_map:                  # Parley topic → channel id; unmapped topics = channel-id literals
     ctx-payments: "C0123456789"
+  mention_map:                  # Slack user/usergroup id → Parley handle (see Mentions)
+    U0PARLEY: "ctx-payments"
+  handshake_timeout_ms: 10000   # default; how long a silent Socket Mode socket may withhold `hello`
 ```
 
 ## App provisioning (pointers only — follow Slack's docs)

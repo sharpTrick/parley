@@ -180,7 +180,7 @@ describe('slack pagination & reconnect regressions', () => {
       );
 
       // Every new connection now closes pre-`hello`; then drop the established (post-`hello`) socket.
-      ctx.fake.setGreet(false);
+      ctx.fake.setGreet('pre-hello-close');
       const opensBefore = ctx.fake.connectionsOpened;
       ctx.fake.dropSockets();
 
@@ -195,7 +195,7 @@ describe('slack pagination & reconnect regressions', () => {
 
       // Finally greet again: a single clean reconnect settles and live delivery resumes.
       const helloBefore = ctx.fake.helloSent;
-      ctx.fake.setGreet(true);
+      ctx.fake.setGreet('greet');
       await vi.waitFor(() => expect(ctx.fake.helloSent).toBeGreaterThan(helloBefore), {
         timeout: 4000,
         interval: 10,

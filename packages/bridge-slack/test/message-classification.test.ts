@@ -19,40 +19,73 @@ import { compareTs, SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 
 /**
- * Every subtype the plugin can meet, with the REASON that decides it. The rule the source states is
- * "surface exactly what is new channel-level content with its own `ts`", so `surfaced` is derived
- * from `reason` below rather than asserted per row — a new subtype whose decision contradicts the
+ * Every record shape the plugin can meet, with the REASON that decides it. The rule the source
+ * states is "surface exactly what is new CHANNEL-LEVEL content with its own `ts`", so `surfaced` is
+ * derived from `reason` below rather than asserted per row — a shape whose decision contradicts the
  * stated rule cannot be added without the derivation failing.
+ *
+ * `thread` is the second axis: `conversations.history` does not return a plain thread reply, so a
+ * classifier that reads `subtype` alone surfaces one on the live path and nowhere else — a live-only
+ * message no restarted session can ever replay, which is exactly the asymmetry DESIGN §6/§7 forbids.
  */
-type Reason = 'new content' | 'mutation of an existing ts' | 'system record';
+type Reason =
+  | 'new content'
+  | 'mutation of an existing ts'
+  | 'system record'
+  | 'reply visible only inside its thread';
 
-const SUBTYPES: Array<{ subtype?: string; reason: Reason }> = [
-  { subtype: undefined, reason: 'new content' },
-  { subtype: 'bot_message', reason: 'new content' },
-  { subtype: 'file_share', reason: 'new content' },
-  { subtype: 'me_message', reason: 'new content' },
+type Thread = 'none' | 'parent' | 'reply';
+
+const SHAPES: Array<{ subtype?: string; thread: Thread; reason: Reason }> = [
+  { subtype: undefined, thread: 'none', reason: 'new content' },
+  { subtype: 'bot_message', thread: 'none', reason: 'new content' },
+  { subtype: 'file_share', thread: 'none', reason: 'new content' },
+  { subtype: 'me_message', thread: 'none', reason: 'new content' },
   // A thread reply broadcast to the channel: a fresh channel-level entry with its own `ts` and its
   // own text — and the only way a reply to a `post({inReplyTo})` thread reaches channel level.
-  { subtype: 'thread_broadcast', reason: 'new content' },
-  { subtype: 'channel_join', reason: 'system record' },
-  { subtype: 'channel_leave', reason: 'system record' },
-  { subtype: 'channel_topic', reason: 'system record' },
-  { subtype: 'channel_purpose', reason: 'system record' },
-  { subtype: 'channel_name', reason: 'system record' },
-  { subtype: 'message_changed', reason: 'mutation of an existing ts' },
-  { subtype: 'message_deleted', reason: 'mutation of an existing ts' },
-  { subtype: 'tombstone', reason: 'mutation of an existing ts' },
+  { subtype: 'thread_broadcast', thread: 'none', reason: 'new content' },
+  { subtype: 'channel_join', thread: 'none', reason: 'system record' },
+  { subtype: 'channel_leave', thread: 'none', reason: 'system record' },
+  { subtype: 'channel_topic', thread: 'none', reason: 'system record' },
+  { subtype: 'channel_purpose', thread: 'none', reason: 'system record' },
+  { subtype: 'channel_name', thread: 'none', reason: 'system record' },
+  { subtype: 'message_changed', thread: 'none', reason: 'mutation of an existing ts' },
+  { subtype: 'message_deleted', thread: 'none', reason: 'mutation of an existing ts' },
+  { subtype: 'tombstone', thread: 'none', reason: 'mutation of an existing ts' },
+  // A message that STARTED a thread carries its own ts as `thread_ts` and is channel-level.
+  { subtype: undefined, thread: 'parent', reason: 'new content' },
+  { subtype: undefined, thread: 'reply', reason: 'reply visible only inside its thread' },
+  { subtype: 'bot_message', thread: 'reply', reason: 'reply visible only inside its thread' },
+  { subtype: 'file_share', thread: 'reply', reason: 'reply visible only inside its thread' },
+  { subtype: 'thread_broadcast', thread: 'reply', reason: 'new content' },
 ];
 
 const surfaces = (row: { reason: Reason }): boolean => row.reason === 'new content';
 const label = (s?: string): string => s ?? 'plain';
-const expectedSurfaced = SUBTYPES.filter(surfaces).map((s) => label(s.subtype));
+const name = (row: { subtype?: string; thread: Thread }): string =>
+  row.thread === 'none' ? label(row.subtype) : `${label(row.subtype)}-${row.thread}`;
+const expectedSurfaced = SHAPES.filter(surfaces).map(name);
 
-describe('slack subtype classification', () => {
-  it('the table is exhaustive over reasons and names each subtype once', () => {
-    expect(new Set(SUBTYPES.map((s) => s.subtype)).size).toBe(SUBTYPES.length);
-    expect(new Set(SUBTYPES.map((s) => s.reason))).toEqual(
-      new Set<Reason>(['new content', 'mutation of an existing ts', 'system record']),
+const seedOf = (row: { subtype?: string; thread: Thread }): {
+  text: string;
+  subtype?: string;
+  thread?: 'parent' | 'reply';
+} => ({
+  text: name(row),
+  subtype: row.subtype,
+  thread: row.thread === 'none' ? undefined : row.thread,
+});
+
+describe('slack message classification', () => {
+  it('the table is exhaustive over reasons and names each shape once', () => {
+    expect(new Set(SHAPES.map(name)).size).toBe(SHAPES.length);
+    expect(new Set(SHAPES.map((s) => s.reason))).toEqual(
+      new Set<Reason>([
+        'new content',
+        'mutation of an existing ts',
+        'system record',
+        'reply visible only inside its thread',
+      ]),
     );
     expect(expectedSurfaced).toEqual([
       'plain',
@@ -60,6 +93,8 @@ describe('slack subtype classification', () => {
       'file_share',
       'me_message',
       'thread_broadcast',
+      'plain-parent',
+      'thread_broadcast-reply',
     ]);
   });
 
@@ -69,10 +104,7 @@ describe('slack subtype classification', () => {
     await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
     try {
       const topic = asTopic('C0HIST');
-      fake.seed(
-        topic,
-        SUBTYPES.map((s) => ({ text: label(s.subtype), subtype: s.subtype })),
-      );
+      fake.seed(topic, SHAPES.map(seedOf));
       const { messages } = await plugin.fetchRecent({ topic, limit: 100 });
       expect(messages.map((m) => m.content)).toEqual(expectedSurfaced);
     } finally {
@@ -91,13 +123,12 @@ describe('slack subtype classification', () => {
       const live: Message[] = [];
       await plugin.subscribe(topic, (m) => live.push(m));
 
-      for (const s of SUBTYPES) {
-        const event: Record<string, unknown> = {
-          ts: fake.mintTs(),
-          text: label(s.subtype),
-          user: 'U0PARLEY',
-        };
+      for (const s of SHAPES) {
+        const ts = fake.mintTs();
+        const event: Record<string, unknown> = { ts, text: name(s), user: 'U0PARLEY' };
         if (s.subtype !== undefined) event.subtype = s.subtype;
+        if (s.thread === 'parent') event.thread_ts = ts;
+        if (s.thread === 'reply') event.thread_ts = '1000000000.000001';
         fake.pushEvent(topic, event);
       }
 

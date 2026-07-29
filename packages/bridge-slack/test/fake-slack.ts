@@ -30,7 +30,24 @@ interface StoredMessage {
   bot_id: string;
   /** System/mutation records (`channel_join`, `message_changed`, …) carry a subtype; plain posts don't. */
   subtype?: string;
+  /** Set on a threaded entry: the parent's `ts` (a thread parent carries its own). */
+  thread_ts?: string;
 }
+
+/**
+ * How a new Socket Mode connection behaves. `silent` is the degraded edge: the TCP/WS connection is
+ * ACCEPTED and then nothing is ever sent — neither `hello` nor a close — which is the only shape
+ * that exercises a handshake with no liveness bound.
+ */
+export type GreetMode = 'greet' | 'pre-hello-close' | 'silent';
+
+/**
+ * A plain thread reply is invisible to `conversations.history` on real Slack while its `message`
+ * event still arrives on the channel stream. Keep this rule HERE and in the plugin's classifier
+ * only, so both delivery paths are graded against one statement of it.
+ */
+const isChannelLevel = (m: StoredMessage): boolean =>
+  typeof m.thread_ts !== 'string' || m.thread_ts === m.ts || m.subtype === 'thread_broadcast';
 
 /**
  * The fake orders and filters history with the PLUGIN'S OWN comparator, imported from src. Keep it
@@ -88,8 +105,7 @@ export class FakeSlack {
   private readonly hooks = new Map<string, (hit: number) => void | Promise<void>>();
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
-  /** When false, new Socket Mode connections are closed WITHOUT `hello` (pre-`hello` close). */
-  private greet = true;
+  private greet: GreetMode = 'greet';
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
   private counter = 0;
   private readonly channels = new Map<string, StoredMessage[]>();
@@ -121,22 +137,23 @@ export class FakeSlack {
           /* ignore non-JSON */
         }
       });
-      if (fake.greet) {
+      if (fake.greet === 'greet') {
         // Socket Mode greets with hello once the connection is ready (no envelope_id, no ack).
         fake.helloSent++;
         ws.send(JSON.stringify({ type: 'hello', num_connections: fake.sockets.size }));
-      } else {
-        // Pre-`hello` close: accept the socket then immediately close it WITHOUT a hello, so the
-        // plugin's pre-`hello` close branch is exercised on every reconnect attempt.
+      } else if (fake.greet === 'pre-hello-close') {
+        // Accept the socket then immediately close it WITHOUT a hello, so the plugin's pre-`hello`
+        // close branch is exercised on every reconnect attempt.
         ws.close();
       }
+      // 'silent': accepted and left open, saying nothing at all.
     });
     return fake;
   }
 
-  /** Toggle whether new Socket Mode connections receive `hello` or are closed pre-`hello`. */
-  setGreet(on: boolean): void {
-    this.greet = on;
+  /** How new Socket Mode connections behave — see {@link GreetMode}. */
+  setGreet(mode: GreetMode): void {
+    this.greet = mode;
   }
 
   /** Create an EMPTY but existing channel (`ok:true, messages:[]`), unlike an unknown id. */
@@ -229,13 +246,18 @@ export class FakeSlack {
    * produce. `ts` is minted the same way `postMessage` does (unique, strictly increasing), so entries
    * are returned in insertion (ascending-`ts`) order.
    */
-  seed(channel: string, entries: Array<{ text: string; subtype?: string }>): StoredMessage[] {
+  seed(
+    channel: string,
+    entries: Array<{ text: string; subtype?: string; thread?: 'parent' | 'reply' }>,
+  ): StoredMessage[] {
     this.createChannel(channel);
     const list = this.channels.get(channel) ?? [];
     const created = entries.map((e) => {
       const ts = this.mintTs();
       const msg: StoredMessage = { type: 'message', ts, text: e.text, user: 'U0PARLEY', bot_id: 'B0PARLEY' };
       if (e.subtype !== undefined) msg.subtype = e.subtype;
+      if (e.thread === 'parent') msg.thread_ts = ts;
+      if (e.thread === 'reply') msg.thread_ts = '1000000000.000001';
       list.push(msg);
       return msg;
     });
@@ -350,7 +372,9 @@ export class FakeSlack {
     const channel = body.channel;
     if (typeof channel !== 'string') return { ok: false, error: 'invalid_arguments' };
     if (!this.known.has(channel)) return { ok: false, error: 'channel_not_found' };
-    let msgs = [...(this.channels.get(channel) ?? [])];
+    let msgs = [...(this.channels.get(channel) ?? [])].filter(
+      (m) => m === null || typeof m !== 'object' || isChannelLevel(m),
+    );
     const oldest = body.oldest;
     if (typeof oldest === 'string') {
       // `oldest` is EXCLUSIVE unless the caller sets `inclusive` (the plugin never does). An entry
