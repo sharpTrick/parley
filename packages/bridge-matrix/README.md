@@ -12,12 +12,12 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | Seam concept            | Matrix mapping |
 | ----------------------- | -------------- |
 | `connect(config)`       | `POST /_matrix/client/v3/login` (`m.login.password`) → keep `access_token` + `user_id`; sent as `Authorization: Bearer <token>`. |
-| topic → room            | Canonical alias `#parley_<sanitizedTopic>:<server_name>`. `ensureRoom`: `GET /directory/room/<alias>`; on `404` `POST /createRoom` (`preset: public_chat`), then join. The create/resolve race (`M_ROOM_IN_USE`) resolves the alias instead. Cached per topic. |
-| `post`                  | `PUT /rooms/<room_id>/send/m.room.message/<txnId>` with `{ msgtype: "m.text", body, "app.parley.topic": <topic> }` → returns `event_id`. Unique `txnId` per send. |
+| topic → room            | Canonical alias `#parley_<sanitizedTopic>:<server_name>`. `ensureRoom`: `GET /directory/room/<alias>`; on `404` `POST /createRoom` (`preset: private_chat` → **`join_rule: invite`**, see below), then join. The create/resolve race (`M_ROOM_IN_USE`) resolves the alias instead. Cached per topic. |
+| `post`                  | `PUT /rooms/<room_id>/send/m.room.message/<txnId>` with `{ msgtype: "m.text", body, "app.parley.topic": <topic> }` → returns `event_id`. Unique `txnId` per send. `in_reply_to` is honored: it becomes `m.relates_to: { "m.in_reply_to": { event_id } }`, so a reply threads natively in Element. |
 | `backendMsgId` = `cursor` | The Matrix **`event_id`** — globally unique and distinct; serves as both the dedup key and the order key. |
-| `fetchRecent` (no `since`) | `GET /rooms/<room_id>/messages?dir=b&limit=N` → reverse to ascending. |
-| `fetchRecent` (`since`) | `GET /rooms/<room_id>/context/<since>?limit=0` → `end` token → `GET /rooms/<room_id>/messages?from=<end>&dir=f&limit=N`. `since` is made strictly **exclusive** (drop up to and including the cursor event). |
-| `subscribe`             | A filtered `/sync` long-poll loop. The initial `timeout=0` sync yields a `next_batch` that **skips history**; the loop then delivers each new `m.room.message` (including our own sends) in timeline order. `disconnect()` aborts the in-flight long-poll. |
+| `fetchRecent` (no `since`) | `GET /rooms/<room_id>/messages?dir=b&limit=N&filter={"types":["m.room.message"]}`, paged backwards until N **belonging** messages are collected (a raw page cap must never hide a topic sitting behind foreign-topic or reaction/membership traffic), then reversed to ascending. |
+| `fetchRecent` (`since`) | `GET /rooms/<room_id>/context/<since>?limit=0` → `end` token → `GET /rooms/<room_id>/messages?from=<end>&dir=f&limit=N`, paged forward until N belonging messages are collected. `since` is made strictly **exclusive** (drop up to and including the cursor event). A `since` that no longer resolves (purged / retention-expired) degrades to the recent window rather than throwing. |
+| `subscribe`             | A filtered `/sync` long-poll loop. The initial `timeout=0` sync yields a `next_batch` that **skips history**; the loop then delivers each new `m.room.message` (including our own sends) in timeline order. `disconnect()` aborts the in-flight long-poll. A failing `/sync` (revoked token, kick, homeserver fault) is reported on stderr and retried with exponential backoff up to 30s — never a silent hot loop. |
 | `resolveIdentity`       | `{ handle, backendRef: handle }` — string convention; a production bridge would map handles to provisioned Matrix users. |
 
 `senderHandle` ← `event.sender`, `content` ← `event.content.body`,
@@ -59,6 +59,20 @@ fixture uses this mode against a stable `#parley_conformance:parley.local`.
 > rate-limited single-tenant deployments. **Production leaves `shared_room` unset**, giving one
 > physically separate room per topic, where the tag is ignored and the room is the isolation boundary.
 
+## Security — topic rooms are invite-only by default
+
+The room alias is **deterministic** (`#parley_<sanitizedTopic>:<server_name>`) and therefore
+guessable, and Synapse federates by default. Note that `visibility: 'private'` only hides a room
+from the **room directory** — it does not restrict joins; the **join rule** does. So topic rooms are
+created with `preset: private_chat` → `join_rule: invite`: an uninvited account cannot read a
+topic's history, and cannot post messages that core would deliver into a live Claude Code session as
+`<channel>` events (the prompt-injection surface DESIGN §14 says to minimize), nor inject peers into
+the presence roster.
+
+Bring the accounts you *do* want in via `invite`. Set `room_preset: public_chat` only when you
+deliberately want a room anyone on the homeserver can join. Rooms that already exist are joined as
+they are — this setting applies to rooms this plugin **creates**.
+
 ## Config (`backend_config`)
 
 | key                | default                  | meaning |
@@ -69,6 +83,8 @@ fixture uses this mode against a stable `#parley_conformance:parley.local`.
 | `server_name`      | `parley.local`           | Used to build room aliases. |
 | `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout. |
 | `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. |
+| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below). |
+| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. |
 
 Secrets live in `backend_config` / `.env`, never in code.
 
