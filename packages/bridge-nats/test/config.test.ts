@@ -12,7 +12,10 @@ import { fakeJetStream, injectFake } from './fake-jetstream.js';
 // believes a cluster is authenticated when the connection is anonymous.
 // Class 2: a backend_config value is validated where it is READ, not where it eventually lands.
 // A value the backend reinterprets (JetStream reads `max_age: 0` as unlimited) or rejects much
-// later must fail at connect(), naming the field the operator actually wrote.
+// later must fail at connect(), naming the field the operator actually wrote. This covers EVERY
+// field the plugin reads, not just the one that prompted it: the prefixes are pasted onto a
+// subject and a stream name, so a wildcard token in one silently widens a per-topic stream to
+// capture a third party's subjects — an allowlisted topic delivering messages nobody allowlisted.
 vi.mock('nats', async (importOriginal) => {
   const actual = await importOriginal<typeof import('nats')>();
   return {
@@ -144,6 +147,62 @@ describe('nats backend_config — documented connection fields reach the driver'
       await plugin.disconnect();
     });
   }
+
+
+  const prefixes: { field: 'subject_prefix' | 'stream_prefix'; value: unknown; accepted?: true }[] = [
+    { field: 'subject_prefix', value: 'parley.', accepted: true },
+    { field: 'subject_prefix', value: '', accepted: true },
+    { field: 'subject_prefix', value: 'a.b.c.', accepted: true },
+    { field: 'subject_prefix', value: 'pw.*.' },
+    { field: 'subject_prefix', value: '*.' },
+    { field: 'subject_prefix', value: 'pw.>.' },
+    { field: 'subject_prefix', value: '>' },
+    { field: 'subject_prefix', value: 'pw x.' },
+    { field: 'subject_prefix', value: 'pw\t.' },
+    { field: 'subject_prefix', value: 'pw\n.' },
+    { field: 'subject_prefix', value: 'pw\u0000.' },
+    { field: 'subject_prefix', value: 42 },
+    { field: 'subject_prefix', value: null },
+    { field: 'subject_prefix', value: ['parley.'] },
+    { field: 'stream_prefix', value: 'PARLEY_', accepted: true },
+    { field: 'stream_prefix', value: '', accepted: true },
+    { field: 'stream_prefix', value: 'PB.x_' },
+    { field: 'stream_prefix', value: 'PB x_' },
+    { field: 'stream_prefix', value: 'PB*_' },
+    { field: 'stream_prefix', value: 'PB>_' },
+    { field: 'stream_prefix', value: 'PB/x_' },
+    { field: 'stream_prefix', value: 'PB\\x_' },
+    { field: 'stream_prefix', value: 'PB\u0000_' },
+    { field: 'stream_prefix', value: 7 },
+    { field: 'stream_prefix', value: {} },
+  ];
+
+  for (const row of prefixes) {
+    const label = typeof row.value === 'string' ? JSON.stringify(row.value) : String(row.value);
+    it(`${row.field} ${label} ${row.accepted === true ? 'is accepted' : 'is rejected at connect(), naming the field'}`, async () => {
+      const plugin = new NatsPlugin();
+      const config = { [row.field]: row.value };
+
+      if (row.accepted === true) {
+        await plugin.connect(config);
+        await plugin.disconnect();
+        return;
+      }
+      const err = await plugin.connect(config).then(() => undefined, (e: unknown) => e);
+      expect(String(err)).toContain(row.field);
+      expect(vi.mocked(connect)).not.toHaveBeenCalled();
+    });
+  }
+
+  // The consequence a wildcard prefix has, stated as behaviour rather than as a character class:
+  // the stream a topic maps to must cover that topic's subject and nothing else.
+  it('a rejected prefix can never widen a topic subject to match a foreign one', async () => {
+    const plugin = new NatsPlugin();
+    await expect(plugin.connect({ subject_prefix: 'pw.*.' })).rejects.toThrow(/subject_prefix/);
+
+    const names = plugin as unknown as { subject: (t: never) => string };
+    expect(names.subject(asTopic('deploys') as never)).toBe('parley.deploys');
+  });
 
   for (const c of cases.filter((x) => JSON.stringify(x.config).includes(SECRET))) {
     it(`never echoes the ${c.name} secret in a connection failure`, async () => {

@@ -2,50 +2,21 @@ import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { connect } from 'nats';
 import { afterAll, describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
-
-const SERVERS = process.env.PARLEY_NATS_SERVERS ?? '127.0.0.1:4222';
-
-async function isNatsUp(servers: string): Promise<boolean> {
-  try {
-    const nc = await connect({ servers, timeout: 1000, maxReconnectAttempts: 0 });
-    await nc.close();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const rand = () => Math.random().toString(36).slice(2, 8);
-
-async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (cond()) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error('timed out waiting for condition');
-}
+import { dropStreams, isNatsUp, rand, SERVERS, waitFor } from './helpers.js';
 
 // A live subscription whose ephemeral pull consumer is GC'd server-side must detect the loss and
 // re-establish delivery — recreating the consumer at DeliverPolicy.StartSequence lastSeq+1 so the
 // outage gap is backfilled. The server-side GC is simulated by deleting the consumer out-of-band,
 // a loss that is otherwise silent. Network-gated: skipped unless a JetStream server answers at
 // PARLEY_NATS_SERVERS.
-const suite = (await isNatsUp(SERVERS)) ? describe : describe.skip;
+const suite = (await isNatsUp()) ? describe : describe.skip;
 
 suite('nats recovery — live subscription survives ephemeral-consumer loss', () => {
   const tag = rand();
   const cfg = { servers: SERVERS, subject_prefix: `pt.${tag}.`, stream_prefix: `PT_${tag}_` };
 
   afterAll(async () => {
-    const nc = await connect({ servers: SERVERS });
-    const jsm = await nc.jetstreamManager();
-    for await (const s of jsm.streams.list()) {
-      if (s.config.name.startsWith(`PT_${tag}_`)) {
-        await jsm.streams.delete(s.config.name).catch(() => undefined);
-      }
-    }
-    await nc.drain();
+    await dropStreams(`PT_${tag}_`);
   });
 
   it('recreates the consumer and resumes delivery after the consumer is deleted', async () => {

@@ -9,10 +9,24 @@ import { describe, expect, it } from 'vitest';
 // tick. Server-gated tests therefore live in files that hold nothing else.
 // Class 2: a comment that narrates history instead of warning about a risk. CLAUDE.md: rationale
 // and tracker IDs belong in the commit message, where they cannot rot against the code.
+// Class 3: a shared fixture module exists and a file bypasses it. The gate and the stream cleanup
+// are the fixtures most often re-typed, and they are exactly the ones whose drift is invisible: a
+// gate tightened in one copy leaves the other files admitting a server the suite can no longer
+// use, under a green tick. Checked against whatever helpers.ts exports today, not a fixed list.
 const here = fileURLToPath(new URL('.', import.meta.url));
 const srcDir = join(here, '..', 'src');
 
 const POLICY_FILE = 'hygiene.test.ts';
+
+const helperModules = ['helpers.ts', 'fake-jetstream.ts', 'tcp-proxy.ts'];
+
+const exportsOf = (source: string): string[] => [
+  ...source.matchAll(/^export\s+(?:async\s+)?(?:function|const|class)\s+([A-Za-z_$][\w$]*)/gm),
+].map((m) => m[1] as string);
+
+const shared = helperModules.flatMap((name) =>
+  exportsOf(readFileSync(join(here, name), 'utf8')).map((symbol) => ({ symbol, from: name })),
+);
 
 const testFiles = readdirSync(here)
   .filter((f) => f.endsWith('.test.ts') && f !== POLICY_FILE)
@@ -27,6 +41,26 @@ describe('nats test hygiene — a gated file must not carry ungated coverage', (
     expect(testFiles.length).toBeGreaterThan(5);
     expect(testFiles.some((f) => /isNatsUp/.test(f.source))).toBe(true);
   });
+
+  it('finds the shared fixtures it is meant to police', () => {
+    expect(shared.map((s) => s.symbol)).toContain('isNatsUp');
+    expect(shared.map((s) => s.symbol)).toContain('dropStreams');
+    expect(shared.length).toBeGreaterThan(8);
+  });
+
+  for (const file of testFiles) {
+    it(`${file.name} imports the shared fixtures instead of re-declaring them`, () => {
+      const redeclared = shared
+        .filter(({ symbol }) =>
+          new RegExp(`^\\s*(?:export\\s+)?(?:async\\s+)?(?:function|const|let|class)\\s+${symbol}\\b`, 'm').test(
+            file.source,
+          ),
+        )
+        .map(({ symbol, from }) => `${symbol} (already in ${from})`);
+
+      expect({ file: file.name, redeclared }).toEqual({ file: file.name, redeclared: [] });
+    });
+  }
 
   for (const file of testFiles) {
     it(`${file.name} either gates every test or gates none`, () => {

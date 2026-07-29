@@ -10,19 +10,31 @@ larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding
 |---|---|
 | topic | one JetStream **stream** per topic (`<stream_prefix><folded topic>`), subject `<subject_prefix><folded topic>` |
 | `post` | `js.publish(subject, payload)` → `PubAck.seq` |
-| cursor / backendMsgId | the stream **sequence** number (contiguous + monotonic per per-topic stream) |
+| cursor | the stream **sequence** number — strictly increasing within the topic's own stream |
+| backendMsgId | `<stream incarnation>-<sequence>`: the sequence qualified by the stream's `created` stamp |
 | `fetchRecent({since})` | ephemeral consumer from `opt_start_seq = since+1` (exclusive); no `since` → last-`limit` window |
 | `subscribe` | an ephemeral `consume()` consumer resuming at `DeliverPolicy.StartSequence` `lastSeq+1`, rebuilt on any loss — genuine events, not a poll timer |
 | `resolveIdentity` | string convention |
 
-One stream per topic keeps sequence numbers contiguous, so the cursor is a clean per-topic monotonic
-integer. Core never compares cursor values — NATS delivers in seq order.
+One stream per topic keeps the sequence a clean per-topic monotonic integer, so it serves directly
+as the cursor. Core never compares cursor values — NATS delivers in seq order. The sequence range is
+**not** dense: `max_age` retention prunes the front and message deletes punch holes, so `last_seq -
+since` is an upper bound on what a page can return, never a count.
+
+`backendMsgId` is the sequence prefixed with the stream's incarnation, because a stream deleted and
+re-created out-of-band (`nats stream rm`, a storage reset) restarts its sequences at 1 — the bare
+sequence would hand core a dedup key it already holds, and core would drop the new stream's
+messages as duplicates. The cursor stays the bare sequence: it is the order key, and catch-up
+already falls back to the retained window when a persisted cursor sits past the tail.
 
 `subscribe` is **not** a nats.js `OrderedConsumer`: it is a plain named ephemeral consumer plus an
 explicit watcher. The server GCs such a consumer after 30s of client absence and `consume()` does
 not self-heal, so the plugin watches the consumer's status and rebuilds on any loss (deleted, not
 found, stream gone, dropped link), resuming at `lastSeq + 1` so messages published during the
-outage are backfilled rather than skipped. The connection itself reconnects without an attempt
+outage are backfilled rather than skipped. It rebuilds on a break in the consumer's **delivery
+sequence** too: `AckPolicy.None` means the server counts a message as delivered the instant it
+writes it to the link, so one written into a link that was already gone is never resent, and the
+hole in that counter is the only evidence it existed. The connection itself reconnects without an attempt
 limit — an outage longer than the driver's default budget must not permanently deafen the bridge.
 
 ### Topic → subject / stream names

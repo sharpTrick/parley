@@ -22,8 +22,23 @@ export interface FakeState {
   added?: { name?: string; max_age?: number; subjects?: string[] };
   /** Where the fault is injected on the read path. */
   failOn: 'get' | 'fetch' | 'iterate' | null;
+  /**
+   * Make a pull that is CLOSED mid-wait throw, the way a real one closed under a disconnect does —
+   * the termination a long-poll must swallow, and the only way to tell it apart from a fault.
+   */
+  throwOnClose: boolean;
   /** How many `consume()` iterators end silently — no consumer-loss status event, just EOF. */
   silentExits: number;
+  /**
+   * Sequences the FIRST `consume()` iterator counts as delivered and never yields — an
+   * `AckPolicy.None` message the server wrote to a link that was already gone. The client sees it
+   * only as a jump in `info.deliverySequence`.
+   */
+  swallowed: number[];
+  /** `created` stamp both `streams.add` and `streams.info` report — the stream's incarnation. */
+  streamCreated: string;
+  /** How many `publish` calls report the stream as gone — the out-of-band-removal path. */
+  publishMissing: number;
   /** Every ephemeral consumer created / destroyed, for leak assertions. */
   created: string[];
   deleted: string[];
@@ -43,7 +58,11 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     yieldLimit: Number.POSITIVE_INFINITY,
     expiryMs: 0,
     failOn: null,
+    throwOnClose: false,
     silentExits: 0,
+    swallowed: [],
+    publishMissing: 0,
+    streamCreated: '2026-01-01T00:00:00.000000000Z',
     created: [],
     deleted: [],
     lastStart: 0,
@@ -56,9 +75,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     streams: {
       add: async (cfg: { name?: string; max_age?: number; subjects?: string[] }) => {
         state.added = cfg;
-        return { config: { name: cfg.name ?? 'fake' } };
+        return { config: { name: cfg.name ?? 'fake' }, created: state.streamCreated };
       },
       info: async () => ({
+        created: state.streamCreated,
         state: {
           messages: state.records.length,
           first_seq: state.records[0]?.seq ?? 0,
@@ -88,7 +108,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         const start = state.lastStart;
         return {
           consume: async () => {
-            const silent = ++consumes <= state.silentExits;
+            const generation = ++consumes;
+            const silent = generation <= state.silentExits;
+            const swallowed = generation === 1 ? state.swallowed : [];
+            let delivery = 0;
             let closed = false;
             return {
               close: async () => {
@@ -102,7 +125,13 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
                   const due = state.records.filter((r) => r.seq >= next);
                   for (const r of due) {
                     next = r.seq + 1;
-                    yield { seq: r.seq, data: enc.encode(r.data) };
+                    delivery += 1;
+                    if (swallowed.includes(r.seq)) continue;
+                    yield {
+                      seq: r.seq,
+                      data: enc.encode(r.data),
+                      info: { deliverySequence: delivery },
+                    };
                   }
                   await new Promise((r) => setTimeout(r, 10));
                 }
@@ -115,16 +144,21 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
               .filter((r) => r.seq >= start)
               .slice(0, Math.min(max_messages, state.yieldLimit));
             let done = () => undefined as void;
+            let wasClosed = false;
             const closed = new Promise<void>((resolve) => {
               done = () => resolve();
             });
             return {
-              close: () => done(),
+              close: () => {
+                wasClosed = true;
+                done();
+              },
               [Symbol.asyncIterator]: async function* () {
                 if (state.failOn === 'iterate') throw new Error('injected: iterator failed');
                 for (const r of window) yield { seq: r.seq, data: enc.encode(r.data) };
                 if (window.length < max_messages && state.expiryMs > 0) {
                   await Promise.race([closed, new Promise((r) => setTimeout(r, state.expiryMs))]);
+                  if (wasClosed && state.throwOnClose) throw new Error('injected: pull closed');
                 }
               },
             };
@@ -132,7 +166,15 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         };
       },
     },
-    publish: async () => ({ seq: (state.records.at(-1)?.seq ?? 0) + 1 }),
+    publish: async () => {
+      if (state.publishMissing > 0) {
+        state.publishMissing -= 1;
+        throw new Error('503 no responders — stream not found');
+      }
+      const seq = (state.records.at(-1)?.seq ?? 0) + 1;
+      state.records.push({ seq, data: payload(`posted-${seq}`) });
+      return { seq };
+    },
   };
 
   return { js, jsm, state };
@@ -141,12 +183,31 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
 /**
  * Wire a fake into a plugin instance. `streamName` pre-seeds the stream cache so `connect()` isn't
  * needed; omit it to let the call under test drive `ensureStream` and record its `streams.add`.
+ * A pre-seeded stream carries its incarnation too — a plugin that has ensured a stream has read
+ * that stream's `created` stamp.
  */
 export function injectFake(plugin: unknown, fake: FakeJetStream, streamName?: string): void {
-  const peek = plugin as { js: unknown; jsm: unknown; ensured: Map<string, Promise<void>> };
+  const peek = plugin as {
+    js: unknown;
+    jsm: unknown;
+    ensured: Map<string, Promise<void>>;
+    incarnations: Map<string, string>;
+  };
   peek.js = fake.js;
   peek.jsm = fake.jsm;
-  if (streamName !== undefined) peek.ensured.set(streamName, Promise.resolve());
+  if (streamName !== undefined) {
+    peek.ensured.set(streamName, Promise.resolve());
+    peek.incarnations.set(streamName, fake.state.streamCreated.replace(/[^0-9A-Za-z]/g, ''));
+  }
+}
+
+/** A connection stub, so that the subscribe loop's `live()` gate passes with no server. */
+export function attachConnection(plugin: unknown, closed = false): void {
+  (plugin as { nc: unknown }).nc = {
+    isClosed: () => closed,
+    drain: async () => undefined,
+    close: async () => undefined,
+  };
 }
 
 export const payload = (content: string): string =>

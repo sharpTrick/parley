@@ -1,31 +1,53 @@
 import net from 'node:net';
 
+/** How a fault presents on the wire. The two shapes a driver reacts to completely differently. */
+export type FaultMode =
+  /** Sockets are destroyed: the peer sees RST at once and reconnects immediately. */
+  | 'reset'
+  /** Sockets stay open and nothing flows: the peer sees a live-but-silent link (a firewall DROP). */
+  | 'stall';
+
 /**
  * A TCP proxy the tests put in front of the real NATS server so an outage can be produced (and
- * healed) deterministically: `cut()` resets every live socket and refuses new ones, `heal()` lets
- * them through again. Reusable by any socket backend.
+ * healed) deterministically. Reusable by any socket backend.
  */
 export interface TcpProxy {
   /** `host:port` to hand to the plugin's `servers` config. */
   address: string;
-  /** Reset every live connection and refuse new ones until `heal()`. */
-  cut(): void;
-  /** Accept connections again. */
+  /** Break the link in `mode`, and refuse/blackhole new connections until `heal()`. */
+  cut(mode?: FaultMode): void;
+  /** Restore forwarding. Bytes stalled in flight are delivered; bytes cut by a reset are gone. */
   heal(): void;
   close(): Promise<void>;
 }
 
 export async function startTcpProxy(targetHost: string, targetPort: number): Promise<TcpProxy> {
   const live = new Set<net.Socket>();
-  let cutOff = false;
+  const stalled: (() => void)[] = [];
+  let mode: 'open' | FaultMode = 'open';
+
+  const wire = (from: net.Socket, to: net.Socket): void => {
+    const held: Buffer[] = [];
+    from.on('data', (chunk: Buffer) => {
+      if (mode === 'stall') held.push(chunk);
+      else to.write(chunk);
+    });
+    stalled.push(() => {
+      for (const chunk of held.splice(0)) to.write(chunk);
+    });
+  };
 
   const server = net.createServer((client) => {
-    if (cutOff) {
+    if (mode === 'reset') {
       client.destroy();
       return;
     }
-    const upstream = net.connect(targetPort, targetHost);
     live.add(client);
+    // Keep a stalled connection unwired, so that a reconnect during the fault blackholes like the
+    // link it is replacing instead of healing it early.
+    if (mode === 'stall') return;
+
+    const upstream = net.connect(targetPort, targetHost);
     live.add(upstream);
     const kill = (): void => {
       live.delete(client);
@@ -37,27 +59,33 @@ export async function startTcpProxy(targetHost: string, targetPort: number): Pro
     upstream.on('error', kill);
     client.on('close', kill);
     upstream.on('close', kill);
-    client.pipe(upstream);
-    upstream.pipe(client);
+    wire(client, upstream);
+    wire(upstream, client);
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as net.AddressInfo).port;
 
+  const destroyAll = (): void => {
+    for (const s of live) s.destroy();
+    live.clear();
+    stalled.length = 0;
+  };
+
   return {
     address: `127.0.0.1:${port}`,
-    cut: () => {
-      cutOff = true;
-      for (const s of live) s.destroy();
-      live.clear();
+    cut: (faultMode: FaultMode = 'reset') => {
+      mode = faultMode;
+      if (faultMode === 'reset') destroyAll();
     },
     heal: () => {
-      cutOff = false;
+      const wasStalled = mode === 'stall';
+      mode = 'open';
+      if (wasStalled) for (const flush of stalled.splice(0)) flush();
     },
     close: async () => {
-      cutOff = true;
-      for (const s of live) s.destroy();
-      live.clear();
+      mode = 'reset';
+      destroyAll();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };

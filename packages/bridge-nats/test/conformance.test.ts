@@ -1,23 +1,10 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { connect } from 'nats';
 import { describe, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
-
-const SERVERS = process.env.PARLEY_NATS_SERVERS ?? '127.0.0.1:4222';
-
-async function isNatsUp(servers: string): Promise<boolean> {
-  try {
-    const nc = await connect({ servers, timeout: 1000, maxReconnectAttempts: 0 });
-    await nc.close();
-    return true;
-  } catch {
-    return false;
-  }
-}
+import { dropStreams, isNatsUp, rand, SERVERS } from './helpers.js';
 
 let seq = 0;
-const rand = () => Math.random().toString(36).slice(2, 8);
 
 async function makeContext() {
   const tag = rand();
@@ -31,14 +18,7 @@ async function makeContext() {
     carriesSenderIdentity: true,
     cleanup: async () => {
       await plugin.disconnect();
-      const nc = await connect({ servers: SERVERS });
-      const jsm = await nc.jetstreamManager();
-      for await (const s of jsm.streams.list()) {
-        if (s.config.name.startsWith(`PT_${tag}_`)) {
-          await jsm.streams.delete(s.config.name).catch(() => undefined);
-        }
-      }
-      await nc.drain();
+      await dropStreams(`PT_${tag}_`);
     },
     concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
       const plugins = await Promise.all(
@@ -63,7 +43,7 @@ async function makeContext() {
   };
 }
 
-if (await isNatsUp(SERVERS)) {
+if (await isNatsUp()) {
   runConformanceSuite('nats', makeContext);
 } else {
   describe.skip(`seam conformance: nats (no server at ${SERVERS})`, () => {
