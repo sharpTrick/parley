@@ -28,6 +28,7 @@ async function makeContext() {
     plugin,
     supportsBlockingFetch: true, // fetchRecent honors blockMs natively via a JetStream pull expiry
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    carriesSenderIdentity: true,
     cleanup: async () => {
       await plugin.disconnect();
       const nc = await connect({ servers: SERVERS });

@@ -18,6 +18,7 @@ async function makeContext(): Promise<ConformanceContext> {
     // blocking-fetch conformance case runs directly against the plugin here.
     supportsBlockingFetch: true,
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();
@@ -202,6 +203,7 @@ async function makeRealContext(): Promise<ConformanceContext> {
     plugin,
     supportsBlockingFetch: true, // native /api/v1/events long-poll (issue #20)
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
     },

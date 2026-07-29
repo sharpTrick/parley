@@ -26,6 +26,7 @@ async function makeContext() {
       fake.createChannel(t);
       return t;
     },
+    carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();

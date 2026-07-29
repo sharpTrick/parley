@@ -27,11 +27,13 @@ async function makeContext() {
     supportsBlockingFetch: true,
     // An unmapped topic is used as the chat id literal — a fresh chat per test.
     freshTopic: (): Topic => asTopic(String(-1_002_000_000_000 - ++seq)),
+    carriesSenderIdentity: false, // posts as the bot account; `identity` is informational
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();
       rmSync(dir, { recursive: true, force: true });
     },
+    concurrentPost: 'unsupported' as const,
     // NO concurrentPost, deliberately: Telegram allows exactly ONE getUpdates consumer per
     // bot token (a second poller gets HTTP 409) and the observed-message store is one file
     // per process — multi-instance writers are structurally unrepresentable on this backend,

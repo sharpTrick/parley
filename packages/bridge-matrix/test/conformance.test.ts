@@ -50,6 +50,7 @@ async function makeContext() {
     supportsBlockingFetch: true,
     // Each topic is globally unique → its `app.parley.topic` tag isolates it inside the shared room.
     freshTopic: (): Topic => asTopic(`t-${++seq}-${Date.now().toString(36)}-${rand()}`),
+    carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
     },

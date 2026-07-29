@@ -34,6 +34,7 @@ async function makeContext() {
       fake.createChannel(id);
       return asTopic(id);
     },
+    carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();

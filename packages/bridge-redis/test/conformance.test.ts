@@ -32,6 +32,7 @@ async function makeContext() {
     plugin,
     supportsBlockingFetch: true, // Redis honors blockMs natively via XREAD BLOCK (issue #20)
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    carriesSenderIdentity: true,
     cleanup: async () => {
       await plugin.disconnect();
       // wipe this context's streams

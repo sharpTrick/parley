@@ -56,6 +56,7 @@ async function makeContext() {
     supportsBlockingFetch: true,
     // Each topic -> a fresh, unique MUC room, so tests are fully isolated.
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    carriesSenderIdentity: false,
     cleanup: async () => {
       await plugin.disconnect();
     },

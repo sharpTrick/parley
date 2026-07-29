@@ -38,6 +38,7 @@ async function makeContext(table: string) {
     supportsBlockingFetch: true,
     freshTopic: (): Topic =>
       asTopic(`${TOPIC_SHAPES[++seq % TOPIC_SHAPES.length] as string}-${seq}-${rand()}`),
+    carriesSenderIdentity: true,
     cleanup: async () => {
       await plugin.disconnect();
       // wipe this context's tables + trigger function

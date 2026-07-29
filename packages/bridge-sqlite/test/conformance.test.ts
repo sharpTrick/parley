@@ -41,6 +41,8 @@ runConformanceSuite('sqlite', async () => {
   return {
     plugin,
     freshTopic: (): Topic => asTopic(`t-${++topicSeq}`),
+    carriesSenderIdentity: true,
+    supportsBlockingFetch: false,
     cleanup: async () => {
       await plugin.disconnect();
       rmSync(dir, { recursive: true, force: true });

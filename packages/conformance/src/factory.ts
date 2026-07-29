@@ -1,8 +1,13 @@
 import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
 
 /**
- * What a backend provides so the shared suite can run against it. Written ONCE against the
- * seam; every backend (sqlite now; redis/matrix/xmpp/nats later) supplies a factory.
+ * What a backend provides so the shared suite can run against it. Written ONCE against the seam;
+ * every backend supplies a factory.
+ *
+ * The capability fields are REQUIRED and take an explicit negative, so that a backend which simply
+ * forgot one loses a compile rather than a test case. An optional flag whose absent value means
+ * "skip" silently trades coverage for convenience, which is how the blocking-fetch case went
+ * unexercised on backends that do implement it.
  */
 export interface ConformanceContext {
   /** A freshly connected plugin instance. */
@@ -12,20 +17,26 @@ export interface ConformanceContext {
   /** Disconnect + remove any scratch resources. */
   cleanup(): Promise<void>;
   /**
-   * Optional: drive `writers` independent concurrent writers, each posting `perWriter`
-   * messages to `topic`, to prove concurrent-write safety. For SQLite this forks real OS
-   * processes (WAL + busy_timeout); network backends use N client connections. Omit if a
-   * backend can't exercise true concurrency in tests.
+   * Drive `writers` independent concurrent writers, each posting `perWriter` messages to `topic`,
+   * to prove concurrent-write safety. For SQLite this forks real OS processes (WAL +
+   * busy_timeout); network backends use N client connections. `'unsupported'` states that the
+   * backend cannot represent concurrent writers at all — Telegram allows one `getUpdates` consumer
+   * per token, so a second poller gets HTTP 409.
    */
-  concurrentPost?(topic: Topic, writers: number, perWriter: number): Promise<void>;
+  concurrentPost: ((topic: Topic, writers: number, perWriter: number) => Promise<void>) | 'unsupported';
   /**
-   * Set by backends that honor `blockMs` NATIVELY in `fetchRecent` (Redis XREAD BLOCK, NATS pull
-   * expiry, Matrix `/sync` timeout, XMPP MUC wait, Postgres LISTEN/NOTIFY, …). When true, the
-   * shared blocking-fetch case runs directly against the plugin; when unset it is skipped, because
-   * that backend gets its long-poll from core's generic wrapper (tested in bridge-core), not the
-   * plugin (issue #20). SQLite is polling-only and leaves this unset.
+   * True for backends that honor `blockMs` NATIVELY in `fetchRecent` (Redis `XREAD BLOCK`, NATS
+   * pull expiry, Matrix `/sync` timeout, XMPP MUC wait, Postgres `LISTEN`/`NOTIFY`, …). False for a
+   * polling-only backend that gets its long-poll from core's generic wrapper instead — SQLite.
    */
-  supportsBlockingFetch?: boolean;
+  supportsBlockingFetch: boolean;
+  /**
+   * True when the backend round-trips the `identity` argument of `post` as the message's
+   * `senderHandle`. False for backends that stamp the authenticated account instead: every hosted
+   * SaaS posts as its bot user, and Matrix reports the homeserver-stamped `sender`. On those the
+   * `identity` argument is informational, and asserting it would be asserting a lie.
+   */
+  carriesSenderIdentity: boolean;
 }
 
 export type BackendFactory = () => Promise<ConformanceContext>;
