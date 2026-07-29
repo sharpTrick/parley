@@ -1,0 +1,79 @@
+{
+ "round": 1,
+ "base": "0f35f61",
+ "wakeAll": true,
+ "note": "13 of 14 critics recovered from an aborted run at base 1e0a7ab; the shared critic ran separately at 0f35f61. The two bases differ only in comments and docs.",
+ "counts": {
+  "total": 121,
+  "confirmed": 106,
+  "blocking": 53,
+  "plausible": 15
+ },
+ "byLens": {
+  "correctness": {
+   "total": 18,
+   "confirmed": 17,
+   "blocking": 13
+  },
+  "security": {
+   "total": 21,
+   "confirmed": 15,
+   "blocking": 7
+  },
+  "design-principles": {
+   "total": 8,
+   "confirmed": 8,
+   "blocking": 3
+  },
+  "truth-in-docs": {
+   "total": 13,
+   "confirmed": 11,
+   "blocking": 1
+  },
+  "concurrency-and-failure": {
+   "total": 27,
+   "confirmed": 23,
+   "blocking": 16
+  },
+  "protocol-conformance": {
+   "total": 9,
+   "confirmed": 9,
+   "blocking": 7
+  },
+  "test-integrity": {
+   "total": 13,
+   "confirmed": 13,
+   "blocking": 6
+  },
+  "operability-and-release": {
+   "total": 9,
+   "confirmed": 7,
+   "blocking": 0
+  },
+  "seam-integrity": {
+   "total": 1,
+   "confirmed": 1,
+   "blocking": 0
+  },
+  "maintainability": {
+   "total": 2,
+   "confirmed": 2,
+   "blocking": 0
+  }
+ },
+ "byTarget": {
+  "core-seam": 5,
+  "core-engine": 12,
+  "core-auth": 12,
+  "sqlite": 8,
+  "postgres": 7,
+  "redis": 9,
+  "matrix": 7,
+  "xmpp": 8,
+  "nats": 10,
+  "zulip": 10,
+  "discord": 10,
+  "slack": 11,
+  "telegram": 12
+ }
+}

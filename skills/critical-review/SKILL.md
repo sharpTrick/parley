@@ -36,6 +36,21 @@ Round 1: no args. Every critic runs, nothing is asleep yet.
 | `byLens` | Per-lens yield — the experiment's primary measurement. |
 | `byTarget` | Per-critic counts, plus `checked` for the ones that found nothing. |
 
+## Remediating a round
+
+Past the first few findings, do **not** fix them inline. Fan out one remediation agent per package,
+hand it that package's findings, and keep the orchestrator's context for adjudication and the
+commit. A round can produce a hundred findings; reading each one's code into a single context is
+what forces a mid-run compaction, and an orchestrator that has forgotten round 3 cannot notice that
+round 9 is re-finding it.
+
+Each remediation agent gets: the findings for its package, the fix cycle below as its contract, and
+instructions to report back what it fixed, what it declined and why, and which mutation it watched
+fail. It must not touch another package — parallel agents editing shared files is how a round
+corrupts its own baseline.
+
+The orchestrator then adjudicates the declines, runs the full suite once, and writes the commit.
+
 ## The fix cycle
 
 1. **Verify before fixing.** The critic already traced it, but confirm independently — a wrong fix
