@@ -230,6 +230,30 @@ blamed at `HEAD` instead of at each round's base, which credited later remediati
 earlier findings and reported round 2 at 51% instead of 26%. The line numbers in a findings record
 are only meaningful against the tree the critic read.
 
+### Mid-run decisions, and what was deliberately NOT changed
+
+Recorded because "we did not change the instrument" is only credible if the moments we could have
+are written down.
+
+At round 3, with the round costing ~4.3M tokens and iatrogenesis at 39%, the operator was presented
+with the projected cost of rounds 4-20 (~70M tokens) and offered three stop rules and three ways to
+cut per-round cost. **Both pre-registered mechanisms were kept unchanged:**
+
+- **Stop rule stays zero-CONFIRMED, running to the round-20 checkpoint** — not the blocking-gated
+  shadow rule, which would very likely fire within a few rounds. Comparability with ouroboros's
+  acting rule was judged worth more than the tokens. The shadow metric continues to be recorded, so
+  the "would a severity-gated rule under-stop?" question is still answered by this run, from the
+  data rather than from a decision.
+- **Quiescence stays as specified**, and its null result is the finding. Three rounds in it has
+  **never fired**: all 14 targets returned confirmed findings in all three rounds, so no target has
+  ever been eligible to sleep. The pre-registered question was *can a review loop safely stop looking
+  at what it has already cleared?* On a surface this deep the answer so far is that **nothing ever
+  gets cleared** — which makes the efficiency mechanism inert and its recall risk moot. That is a
+  more useful result than a tuned threshold would have been, and it only stays clean because the
+  threshold was not tuned.
+
+The fan-out (14 targets) was likewise left alone.
+
 ### Instrument observations
 
 - **`theme` is not being used as designed.** 136 findings carried **100 distinct themes**. The field
