@@ -1,15 +1,17 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
 import {
   clampBackoff,
   DEFAULT_BACKOFF_MS,
+  DEFAULT_DEADLINE_MS,
   delay,
   fetchWithRetry,
   MAX_BACKOFF_MS,
   MAX_ERROR_BODY,
   retryAfterFromHeader,
   sanitizeBody,
+  STOP_POLL_MS,
 } from '@sharptrick/parley-net-util';
 
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
@@ -134,6 +136,35 @@ describe('fetchWithRetry', () => {
     await expect(fetchWithRetry('https://x/y', {}, OPTS)).rejects.toThrow(
       'Test GET /thing → 500: boom',
     );
+  });
+
+  // `<label> → <status>: <body>` is a CONTRACT, not an incidental format: several backends recover
+  // the status by regex over it, so a reword there is a silent behaviour change. Pinned exactly
+  // (separator included) on this side, and carried as a field so nobody needs the regex.
+  it.each([
+    [400, 'bad request'],
+    [404, 'channel_not_found'],
+    [500, ''],
+    [503, 'unavailable'],
+  ])('throws the pinned `label → status: body` envelope for %i', async (status, body) => {
+    stubFetch([res(status, body)]);
+    const err = await rejects(fetchWithRetry('https://x/y', {}, OPTS));
+    expect(err.message).toBe(`Test GET /thing → ${status}: ${body}`);
+    expect(api.statusOf(err)).toBe(status);
+    expect(err.name).toBe('HttpStatusError');
+    expect(err).toBeInstanceOf(api.HttpStatusError);
+    expect((err as InstanceType<typeof api.HttpStatusError>).body).toBe(body);
+  });
+
+  it('statusOf reports no status for a transport failure', async () => {
+    vi.stubGlobal('fetch', () => Promise.reject(new TypeError('fetch failed')));
+    expect(api.statusOf(await rejects(fetchWithRetry('https://x/y', {}, OPTS)))).toBeUndefined();
+  });
+
+  // The point of the field: an ordinary Error whose PROSE happens to match the envelope is not a
+  // status failure, and a reader that recovers the status by regex cannot tell the difference.
+  it('statusOf reports no status for an unrelated error that merely looks like one', () => {
+    expect(api.statusOf(new Error('Test GET /thing → 404: nope'))).toBeUndefined();
   });
 
   it('does not treat an allowStatuses entry as a licence to swallow other failures', async () => {
@@ -356,6 +387,63 @@ describe('fetchWithRetry', () => {
     expect(state.calls).toBe(1);
   });
 
+  // REAL TIMERS on purpose: `captureWaits()` makes every `setTimeout` fire synchronously, which
+  // deletes the wait this class is about. A stop that is only checked around the sleep, never
+  // during it, holds `disconnect()` for the server's full stated wait — unbounded, so a routine
+  // `Retry-After: 25` keeps a torn-down plugin (and the MCP process) alive for 25 seconds.
+  const activeTimers = (): number =>
+    process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+
+  it.each([
+    [200, 0],
+    [200, 10],
+    [1_000, 10],
+    [1_000, 50],
+    [5_000, 0],
+    [5_000, 50],
+  ])(
+    'abandons a %ims server-stated backoff when the stop lands %ims in',
+    async (statedMs, stopAtMs) => {
+      const state = stubForever(() => res(429, '', { 'retry-after': String(statedMs / 1000) }));
+      let stopped = false;
+      setTimeout(() => {
+        stopped = true;
+      }, stopAtMs);
+      const timersBefore = activeTimers();
+
+      const started = Date.now();
+      const err = await rejects(
+        fetchWithRetry(
+          'https://x/y',
+          {},
+          { label: 'L', isStopped: () => stopped, deadlineMs: 60_000, maxAttempts: 100 },
+        ),
+      );
+      const elapsed = Date.now() - started;
+
+      expect(err.message).toBe('L → 429 (disconnected)');
+      expect(elapsed).toBeLessThan(stopAtMs + STOP_POLL_MS + 150);
+      expect(state.calls).toBe(1); // it never spent a request after the teardown
+      // Nothing is still armed: a backoff timer left running past the rejection pins the event
+      // loop, which is the other half of "disconnect() cannot make the process exit".
+      await delay(STOP_POLL_MS * 2);
+      expect(activeTimers()).toBeLessThanOrEqual(timersBefore);
+    },
+  );
+
+  it('still waits the full stated backoff when nothing stops it', async () => {
+    const state = stubFetch([res(429, '', { 'retry-after': '0.2' }), res(200, 'ok')]);
+    const started = Date.now();
+    const out = await fetchWithRetry(
+      'https://x/y',
+      {},
+      { label: 'L', isStopped: () => false, deadlineMs: 60_000 },
+    );
+    expect(out.status).toBe(200);
+    expect(state.calls).toBe(2);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(190);
+  });
+
   it('reports a transport failure with its cause, under the caller label', async () => {
     vi.stubGlobal('fetch', () =>
       Promise.reject(new TypeError('fetch failed', { cause: new Error('ECONNREFUSED') })),
@@ -522,5 +610,104 @@ describe('README', () => {
     expect(pkg.publishConfig?.access).toBe('public');
     expect(pkg.description.toLowerCase()).not.toContain('internal');
     expect(readme.toLowerCase()).not.toMatch(/exports exactly two things/);
+  });
+
+  // The README states a bound and names a constant as the thing that enforces it. Derive the
+  // prediction FROM the README and compare it with what the helper does, so that naming a constant
+  // which is not the governing one fails the doc — not only the row where the code disagrees.
+  describe('the stated-wait rule the README documents is the one the code runs', () => {
+    const sentence = (): string => {
+      const hits = readme
+        .split(/(?<=\.)\s+/)
+        .filter((s) => /ends? the call|ending the call/.test(s));
+      expect(hits).toHaveLength(1);
+      return hits[0] as string;
+    };
+
+    const documentedThreshold = (): number => {
+      const s = sentence();
+      const names = ['MAX_BACKOFF_MS', 'deadlineMs'].filter((n) => s.includes(n));
+      expect(names).toHaveLength(1); // exactly one constant is claimed to govern
+      return names[0] === 'MAX_BACKOFF_MS' ? MAX_BACKOFF_MS : DEFAULT_DEADLINE_MS;
+    };
+
+    it.each([2_000, 6_000, 10_000, 60_000, 120_000])(
+      'a %ims stated wait behaves as the README predicts',
+      async (requestedMs) => {
+        const predicted = requestedMs > documentedThreshold() ? 'stop' : 'retry';
+        const state = stubForever(() => res(429, '', { 'retry-after': String(requestedMs / 1000) }));
+        captureWaits();
+        let clock = 0;
+        const err = await rejects(
+          fetchWithRetry(
+            'https://x/y',
+            {},
+            { label: 'L', isStopped: () => false, maxAttempts: 4, now: () => (clock += 1) },
+          ),
+        );
+        const actual = state.calls === 1 ? 'stop' : 'retry';
+        expect(actual).toBe(predicted);
+        if (predicted === 'stop') expect(err.message).toMatch(/past this call's 30000ms deadline/);
+      },
+    );
+  });
+
+  // Shipped metadata that enumerates a set the repo already knows: re-derive it rather than pin
+  // today's list, so a backend that gains or drops the dependency moves the README with it.
+  describe('the consumer set is the real dependency graph', () => {
+    const packagesDir = new URL('../../', import.meta.url);
+    const SELF = '@sharptrick/parley-net-util';
+
+    const backends = (): { dir: string; consumes: boolean }[] =>
+      readdirSync(packagesDir)
+        .filter((d) => d.startsWith('bridge-') && d !== 'bridge-core' && d !== 'bridge-net-util')
+        .sort()
+        .map((dir) => {
+          const pkg = JSON.parse(
+            readFileSync(new URL(`${dir}/package.json`, packagesDir), 'utf8'),
+          ) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+          const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+          return { dir, consumes: SELF in deps };
+        });
+
+    const listed = (heading: string): string[] => {
+      const line = readme.split('\n').find((l) => l.includes(`**${heading}:**`));
+      expect(line, `README has no "${heading}:" line`).toBeDefined();
+      return (line as string)
+        .replace(/^.*\*\*.*?:\*\*/, '')
+        .replace(/\.\s*$/, '')
+        .split(',')
+        .map((n) => n.trim().toLowerCase())
+        .filter((n) => n.length > 0)
+        .sort();
+    };
+
+    it('names every backend that depends on this package, and no other', () => {
+      const expected = backends()
+        .filter((b) => b.consumes)
+        .map((b) => b.dir.replace('bridge-', ''))
+        .sort();
+      expect(listed('Consumed by')).toEqual(expected);
+    });
+
+    it('names every backend that does NOT depend on this package, and no other', () => {
+      const expected = backends()
+        .filter((b) => !b.consumes)
+        .map((b) => b.dir.replace('bridge-', ''))
+        .sort();
+      expect(listed('Not consumed by')).toEqual(expected);
+    });
+
+    // The npm `description` is read where nobody can check it against the repo, so it may not
+    // enumerate at all — an unnamable set cannot go stale.
+    it('the npm description enumerates no backend', () => {
+      const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+        description: string;
+      };
+      const named = backends()
+        .map((b) => b.dir.replace('bridge-', ''))
+        .filter((n) => pkg.description.toLowerCase().includes(n));
+      expect(named).toEqual([]);
+    });
   });
 });

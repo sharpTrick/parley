@@ -1,12 +1,14 @@
 {
-  "//": "vitest transpiles tests without typechecking them, and tsconfig.json covers only src. Run `npm run typecheck:test` (or point CI at this file) to compile the test sources too.",
+  "//": "vitest transpiles tests without typechecking them, and tsconfig.json covers only src. Run `npm run typecheck:test` (or point CI at this file) to compile the test sources too. The `paths` alias is load-bearing: without it the test sources resolve this package through node_modules to the built dist/, so the gate would grade a stale artifact while vitest grades src/.",
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
     "incremental": false,
     "declaration": false,
     "declarationMap": false,
-    "composite": false
+    "composite": false,
+    "baseUrl": ".",
+    "paths": { "@sharptrick/parley-conformance": ["./src/index.ts"] }
   },
   "include": ["src/**/*", "test/**/*"]
 }

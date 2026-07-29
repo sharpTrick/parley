@@ -40,4 +40,32 @@ describe('README', () => {
     const missing = consumers().filter((dir) => !readme.includes(`packages/${dir}`));
     expect(missing).toEqual([]);
   });
+
+  // The README justified the runtime validator with an absolute "no X in this repo" that this very
+  // package falsifies. Recompute the set instead of restating it: what is load-bearing is that no
+  // BACKEND typechecks its test sources, which is why a fixture's context literal is runtime-only.
+  describe('the claim behind the runtime context validator', () => {
+    const typechecksTests = (dir: string): boolean => {
+      for (const name of ['tsconfig.json', 'tsconfig.test.json']) {
+        let raw: string;
+        try {
+          raw = readFileSync(new URL(`${dir}/${name}`, packagesDir), 'utf8');
+        } catch {
+          continue;
+        }
+        const cfg = JSON.parse(raw) as { include?: string[] };
+        if ((cfg.include ?? []).some((g) => g.startsWith('test/'))) return true;
+      }
+      return false;
+    };
+
+    it('no backend that runs the suite typechecks its own test sources', () => {
+      expect(consumers().filter(typechecksTests)).toEqual([]);
+    });
+
+    it('does not claim NO tsconfig in the repo covers test/**, while some do', () => {
+      expect(readdirSync(packagesDir).filter(typechecksTests)).not.toEqual([]);
+      expect(readme).not.toMatch(/no tsconfig[^.]*includes? `?test/i);
+    });
+  });
 });

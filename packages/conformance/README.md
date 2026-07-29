@@ -28,8 +28,11 @@ Concretely, `runConformanceSuite` (`src/index.ts`) checks:
 - `post` accepts `opts.inReplyTo` and the reply is durable, in order;
 - `resolveIdentity` answers for the handle it was asked about, and distinct senders are not
   collapsed onto one another;
-- `blockMs` long-poll wakes on a concurrent post and returns empty at timeout
-  (`supportsBlockingFetch` backends);
+- `blockMs` long-poll wakes on a concurrent post and returns empty at timeout on a
+  `supportsBlockingFetch` backend — and, on one that declares it `false`, returns **promptly** and
+  empty instead of parking: the hint is optional, hanging on it is not;
+- a backend that declares `carriesSenderIdentity: false` still reports ONE stable, non-empty
+  `senderHandle` and keeps the two posts distinguishable by id;
 - concurrent multi-writer posts don't corrupt state and cursor ordering still holds
   (`concurrentPost` backends).
 
@@ -74,8 +77,11 @@ export type BackendFactory = () => Promise<ConformanceContext>;
 ```
 
 `runConformanceSuite` validates that shape at runtime (`assertConformanceContext`) and fails
-naming the backend and the offending field: no tsconfig in this repo includes `test/**`, so a
-missing field would otherwise compile fine and silently delete the cases that read it.
+naming the backend and the offending field. The runtime check is what enforces "required": **no
+backend package typechecks its own test sources** (only this package and `bridge-net-util` have a
+`tsconfig.test.json`, and neither compiles a backend's fixture), and vitest transpiles without
+typechecking — so a backend's context literal is only ever seen at runtime, and a missing field
+would otherwise silently delete the cases that read it rather than lose a build.
 
 Then, in the plugin package's own test file:
 

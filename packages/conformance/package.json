@@ -27,10 +27,21 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"
+  ],
+  "keywords": [
+    "mcp",
+    "parley",
+    "conformance",
+    "test-suite",
+    "backend-agnostic",
+    "pluggable-backend",
+    "message-bus",
+    "agent-messaging"
   ],
   "scripts": {
     "build": "tsc -b",

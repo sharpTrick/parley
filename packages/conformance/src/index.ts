@@ -299,6 +299,25 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     });
 
 
+    // `disconnect()` is declared to tear down the connection AND all subscriptions, but the suite
+    // only ever called it from `cleanup()` and asserted nothing about it — so a plugin that leaves
+    // its poll loop or socket running, or that keeps serving `post` afterwards, was certified.
+    // What is asserted here is what one client can see of its own teardown; whether the LIVE path
+    // truly stopped needs a second, independent client the context cannot hand out yet.
+    it('disconnect is idempotent and stops the plugin serving', async () => {
+      const t = ctx.freshTopic();
+      const live: Message[] = [];
+      await ctx.plugin.subscribe(t, (m) => live.push(m));
+      await ctx.plugin.post(t, SENDER, 'before-teardown');
+      await vi.waitFor(() => expect(live).toHaveLength(1), { timeout: 5000, interval: 10 });
+
+      await ctx.plugin.disconnect();
+      await ctx.plugin.disconnect();
+
+      await expect(ctx.plugin.post(t, SENDER, 'after-teardown')).rejects.toThrow();
+      expect(live).toHaveLength(1);
+    });
+
     it('resolveIdentity answers for the handle it was asked about', async () => {
       const id = await ctx.plugin.resolveIdentity(SENDER);
       expect(id.handle).toBe(SENDER);
@@ -314,17 +333,32 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(messages.map((m) => m.content)).toEqual(['from-first', 'from-second']);
       if (ctx.carriesSenderIdentity) {
         expect(messages.map((m) => m.senderHandle)).toEqual([SENDER, OTHER]);
+      } else {
+        // Declaring `identity` not carried buys a WEAKER contract, not none. Without this arm the
+        // flag deletes every sender assertion, so a backend that scrambles or blanks `senderHandle`
+        // — which core routes and displays — passes by flipping one boolean.
+        expect(new Set(messages.map((m) => m.senderHandle)).size).toBe(1);
+        expect(messages[0]!.senderHandle.length).toBeGreaterThan(0);
+        expect(messages[0]!.backendMsgId).not.toBe(messages[1]!.backendMsgId);
       }
     });
 
-    it('blockMs long-poll: returns promptly after a concurrent post, empty at timeout', async (testCtx) => {
-      if (!ctx.supportsBlockingFetch) {
-        testCtx.skip(); // backend gets long-poll from core's generic wrapper, not the plugin
-        return;
-      }
+    it('blockMs is honoured natively or ignored promptly — never a hang', async () => {
       const t = ctx.freshTopic();
       await ctx.plugin.post(t, SENDER, 'old');
       const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
+
+      if (!ctx.supportsBlockingFetch) {
+        // The hint is OPTIONAL; hanging on it is not. This is the only case in the suite that ever
+        // passes `blockMs`, so a plugin that parks forever on it — the worst behaviour available,
+        // stalling `parley_fetch_recent` for its whole timeout — used to be certified by the skip.
+        const startedIgnoring = Date.now();
+        const ignored = await ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 });
+        expect(ignored.messages).toEqual([]);
+        expect(ignored.nextCursor).toBe(tail);
+        expect(Date.now() - startedIgnoring).toBeLessThan(1000);
+        return;
+      }
 
       // (a) A blocked fetch at the tail wakes promptly when a message lands mid-wait.
       const started = Date.now();
@@ -348,6 +382,45 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(timedOut.nextCursor).toBe(newTail);
       // It actually waited (did not return instantly) — allow generous slack for slow CI.
       expect(Date.now() - idleStarted).toBeGreaterThanOrEqual(150);
+    });
+
+    // The window between a blocking `fetchRecent` issuing its read and registering its waiter. A
+    // message landing inside it is dropped by a plugin that parks at "from now" instead of at the
+    // caller's cursor — and is then invisible until something else wakes the call. Only 0-3ms
+    // discriminates: by ~5ms the waiter is registered and the case degenerates into the 50ms
+    // long-poll case above, which is why that one never caught this.
+    it.each([0, 1, 2, 3])('a post landing %ims into a blocking fetch is not missed', async (at) => {
+      const t = ctx.freshTopic();
+      await ctx.plugin.post(t, SENDER, 'old');
+      const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
+      const postLater = (): Promise<void> =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            void ctx.plugin.post(t, SENDER, 'racer').then(() => resolve());
+          }, at);
+        });
+
+      if (!ctx.supportsBlockingFetch) {
+        // The same hazard on a polling backend: a read racing the post must not report a cursor
+        // ABOVE the message it did not see, or that message is lost for good.
+        const landing = postLater();
+        const first = await ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 2000 });
+        await landing;
+        const second = await ctx.plugin.fetchRecent({
+          topic: t,
+          since: first.nextCursor,
+          blockMs: 2000,
+        });
+        expect([...first.messages, ...second.messages].map((m) => m.content)).toEqual(['racer']);
+        return;
+      }
+
+      // Issued BEFORE the post is scheduled and never awaited in between: awaiting it first is what
+      // hides the window, because the post then always lands after the waiter exists.
+      const pending = ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 });
+      const [woke] = await Promise.all([pending, postLater()]);
+      expect(woke.messages.map((m) => m.content)).toEqual(['racer']);
+      expect(woke.nextCursor).not.toBe(tail);
     });
 
     it('multi-process writes do not corrupt or error; cursor stays monotonic', async (testCtx) => {
