@@ -3,7 +3,9 @@ import { xml } from '@xmpp/client';
 import { expect } from 'vitest';
 import type { XmppPlugin } from '../src/index.js';
 
+const NS_MUC = 'http://jabber.org/protocol/muc';
 const NS_MUC_USER = 'http://jabber.org/protocol/muc#user';
+const NS_DELAY = 'urn:xmpp:delay';
 const NS_MAM = 'urn:xmpp:mam:2';
 const NS_SID = 'urn:xmpp:sid:0';
 const NS_FORWARD = 'urn:xmpp:forward:0';
@@ -35,6 +37,7 @@ export interface XmppPrivate {
   stopped: boolean;
   xmpp?: unknown;
   joined: Map<string, Promise<void>>;
+  rejoins: Map<string, { losses: number; at: number; timer?: ReturnType<typeof setTimeout> }>;
   pendingJoins: Map<string, { resolve(): void; reject(err: Error): void }>;
   pendingPosts: Map<string, { room: string; resolve(id: unknown): void; reject(err: Error): void }>;
   mamCollectors: Map<string, { room: string; items: ArchiveItem[] }>;
@@ -89,6 +92,8 @@ export const illegalCodepoint = (s: string): number | undefined => {
  */
 export class FakeXmpp {
   readonly sent: El[] = [];
+  /** `Date.now()` of each `sent` stanza, index for index — the only way to assert a send RATE. */
+  readonly sentAt: number[] = [];
   readonly archives = new Map<string, ArchiveItem[]>();
   readonly jid = { toString: () => 'parley@parley.local/res' };
 
@@ -114,6 +119,14 @@ export class FakeXmpp {
   mamIqError?: string;
   /** Bounce a post to a room this connection is not currently an occupant of, as a MUC does. */
   enforceOccupancy = false;
+
+  /**
+   * A server that ends this connection's occupancy again on EVERY successful join — a moderation
+   * bot that kicks the bridge on sight, a members-only room it is not a member of, a MUC component
+   * that is shutting down. Set to the presence the server answers with, or `undefined` for a room
+   * that keeps the joiner.
+   */
+  kickOnJoin?: { statuses?: string[]; destroy?: boolean };
 
   /** The occupant nick the plugin joined with; a reflection must come back from it. */
   nick = 'parley-test';
@@ -164,6 +177,7 @@ export class FakeXmpp {
     if (this.dead) throw new Error('stream closed');
     const stanza = el as El;
     this.sent.push(stanza);
+    this.sentAt.push(Date.now());
     if (this.strictXml && illegalCodepoint(String(stanza)) !== undefined) {
       this.killStream();
       throw new Error('not-well-formed: stream closed');
@@ -256,10 +270,11 @@ export class FakeXmpp {
 
   private onJoin(presence: El): void {
     const to = presence.attrs.to ?? '';
+    const room = to.slice(0, to.indexOf('/'));
     this.nick = to.slice(to.indexOf('/') + 1);
     if (this.joinReply === 'silent') return;
     if (this.joinReply === 'error') {
-      this.occupied.delete(to.slice(0, to.indexOf('/')));
+      this.occupied.delete(room);
       this.feed(
         xml(
           'presence',
@@ -269,7 +284,7 @@ export class FakeXmpp {
       );
       return;
     }
-    this.occupied.add(to.slice(0, to.indexOf('/')));
+    this.occupied.add(room);
     this.feed(
       xml(
         'presence',
@@ -277,6 +292,37 @@ export class FakeXmpp {
         xml('x', { xmlns: NS_MUC_USER }, xml('status', { code: '110' })),
       ),
     );
+    this.replayHistory(room, presence);
+    // On its own macrotask, so that a plugin that re-joins without deferring cannot starve the
+    // event loop — a storm has to be observable by a timer for a test to bound it.
+    if (this.kickOnJoin !== undefined) {
+      const kick = this.kickOnJoin;
+      setTimeout(() => this.endOccupancy(room, kick), 0);
+    }
+  }
+
+  /**
+   * What a MUC does on join unless the joiner asks for no history: push the room's recent archive
+   * back as ordinary live `<message type='groupchat'>` stanzas (XEP-0045 §7.2.15). A plugin that
+   * omits `<history maxstanzas='0'/>` therefore re-delivers old messages as new on every re-entry
+   * — the reconnect and occupancy-loss paths — so keep this modelled here, so that the join hint
+   * is load-bearing rather than decorative.
+   */
+  private replayHistory(room: string, presence: El): void {
+    const requested = presence.getChild('x', NS_MUC)?.getChild('history');
+    if (requested?.attrs.maxstanzas === '0') return;
+    const max = Number(requested?.attrs.maxstanzas ?? '20');
+    for (const item of (this.archives.get(room) ?? []).slice(-max)) {
+      this.feed(
+        xml(
+          'message',
+          { from: item.from, type: 'groupchat' },
+          xml('body', {}, item.body),
+          xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
+          xml('delay', { xmlns: NS_DELAY, stamp: item.stamp ?? new Date().toISOString() }),
+        ),
+      );
+    }
   }
 
   private onPost(message: El): void {

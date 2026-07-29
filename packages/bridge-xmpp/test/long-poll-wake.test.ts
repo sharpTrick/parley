@@ -128,6 +128,72 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
 
 });
 
+// Class: a teardown that must settle the operations still in flight, with no test that HAS one in
+// flight at teardown. Every case above either lets the budget expire or is woken by a message, so
+// disconnect()'s cancellation of parked long-polls — the loop the source says exists to prevent
+// leaked listeners and timers — could be deleted with the suite fully green. Left un-cancelled, a
+// fetch parked on a 60 s block_ms holds its timer to expiry after the bridge has stopped, so cli.ts's
+// shutdown waits on a plugin that is already dead. The table parks a fetch and tears the plugin down
+// at each stage of the blocking path.
+
+const DISCONNECT_BUDGET_MS = 5_000;
+/** A cancelled park returns in a round trip; only an un-cancelled one reaches the budget. */
+const CANCEL_MS = 500;
+
+type Teardown = 'before the first query' | 'while a query is in flight' | 'while parked';
+
+const teardowns: Teardown[] = [
+  'before the first query',
+  'while a query is in flight',
+  'while parked',
+];
+
+describe('XMPP disconnect settles a long-poll that is still parked', () => {
+  it.each(teardowns)('disconnecting %s returns the caller at once', async (when) => {
+    const plugin = new XmppPlugin();
+    const fake = new FakeXmpp();
+    const p = attach(plugin, fake);
+    const room = p.roomJid(TOPIC);
+    p.joined.set(room, Promise.resolve());
+    const seed = fake.archiveOnly(room, 'old');
+    fake.mamLatencyMs = 50;
+
+    let stopped: Promise<void> | undefined;
+    let stoppedAt = 0;
+    const stop = (): void => {
+      if (stopped !== undefined) return;
+      stoppedAt = Date.now();
+      stopped = plugin.disconnect();
+    };
+    if (when === 'while a query is in flight') fake.onMamInFlight = stop;
+
+    const pending = plugin.fetchRecent({
+      topic: TOPIC,
+      since: asCursor(seed.archId),
+      blockMs: DISCONNECT_BUDGET_MS,
+    });
+    if (when === 'before the first query') stop();
+    // Two 50 ms round trips precede the park, so 400 ms lands inside it and not inside a query.
+    const parked = when === 'while parked' ? setTimeout(stop, 400) : undefined;
+
+    const outcome = await pending.then(
+      (res) => res,
+      (err: Error) => err,
+    );
+    clearTimeout(parked);
+    expect(Date.now() - stoppedAt).toBeLessThan(CANCEL_MS);
+    if (outcome instanceof Error) {
+      expect(outcome.message).toMatch(/not connected/);
+    } else {
+      // An empty page carrying the caller's own cursor: nothing lost, the next call resumes here.
+      expect(outcome.messages).toEqual([]);
+      expect(String(outcome.nextCursor)).toBe(seed.archId);
+    }
+    expectNoLeaks(plugin);
+    await stopped;
+  });
+});
+
 // Class: a reconciliation window that LATCHES OFF, so a message the archive already holds is
 // withheld until the caller's whole budget expires. The blocking path wakes on the live copy and
 // then re-polls MAM for the archive to catch up; any re-poll allowance that is a fixed count times

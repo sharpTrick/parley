@@ -54,8 +54,13 @@ catch-up semantics.
   (322), a MUC service shutdown (332), a room destroy, and a component restart that simply forgets
   us all end occupancy with the stream still up. The plugin watches for its own
   `<presence type='unavailable'>` (a nick change, status 303, excluded) and for a post bounced as
-  "not an occupant", drops the room from its join cache, and re-joins subscribed rooms immediately
-  — catch-up-only rooms re-join on their next seam call.
+  "not an occupant", drops the room from its join cache, and re-joins subscribed rooms — catch-up-only
+  rooms re-join on their next seam call. That re-entry is **deferred and backs off** (200 ms, doubling
+  to a 30 s ceiling, with jitter), because the trigger is remote: a room that ends occupancy on every
+  join — a moderation bot, a members-only toggle, a MUC service that is shutting down — would
+  otherwise be re-joined as fast as the connection can send presence. After six consecutive losses
+  inside a minute the plugin logs one loud error and stops re-entering that room; live push for the
+  topic stays dead until a `post` or `fetch_recent` enters it again.
 - **Room lifetime = durability, and occupancy is not durable.** A *non-persistent* MUC room and
   its whole MAM archive are destroyed the moment the last occupant leaves — and occupancy is
   presence on one stream, so it ends at every disconnect, not only at shutdown: a network blip, a
@@ -80,7 +85,10 @@ catch-up semantics.
   Every caller string this plugin serialises — `post` content, the `since` cursor, `nick`,
   `muc_service`, `domain`, `username` — is refused up front with an error naming the offending
   codepoint, rather than put on the wire. (`topic` and `identity` are folded to a legal charset
-  instead, injectively, so they cannot collide.)
+  instead, injectively, so they cannot collide. Neither fold truncates: a JID localpart and resource
+  are capped at 1023 bytes, so a topic or `identity.handle` whose folded name would exceed that is
+  refused with an error naming this plugin and the length — folding it shorter is what would make two
+  of them collide.)
 - **One nick per logical identity.** The occupant nick is `identity.handle`, folded to the JID
   resource charset. Two sessions with different handles therefore get different senders on a shared
   account; two with the same handle are the same sender, which is what "same handle" means. If the
@@ -99,6 +107,10 @@ backend_config:
   # nick: optional; defaults to identity.handle (see "Multiple concurrent sessions")
   # mam_page: 200                    # default; RSM page size for catch-up paging
 ```
+
+Every key is checked before the connection is opened, and an **unknown key is a load error** naming
+the accepted set — a misspelled `muc_servce` would otherwise leave every room addressed at the
+default MUC service and every join bouncing a condition that names nothing.
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same server)
 

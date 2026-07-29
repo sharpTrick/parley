@@ -474,7 +474,8 @@ backend_config:            # opaque to core; passed verbatim to the plugin's con
   #             poll_interval_ms is a latency knob only; no correctness impact
   # redis:    { url, retention_days? }          postgres: { url, table_name, pool_size, retention_days? }
   # matrix:   { homeserver_url, user, password | access_token, shared_room? }
-  # xmpp:     { service, jid, password, muc_service }   nats: { servers, stream_prefix, retention_days? }
+  # xmpp:     { service, domain, muc_service, username, password, nick?, mam_page? }
+  # nats:     { servers, stream_prefix, retention_days? }
   # zulip / discord / slack / telegram: see each plugin's README
 ```
 

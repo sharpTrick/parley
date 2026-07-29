@@ -66,6 +66,13 @@ const MAM_PAGE = 200;
 const MAM_LAG_POLL_MS = 50;
 /** Floor between two stream-error reports, so a reconnect storm can't flood stderr. */
 const STREAM_ERROR_LOG_MS = 5_000;
+/** First wait before re-entering a room whose occupancy ended remotely; doubles per repeat loss. */
+const REJOIN_BASE_MS = 200;
+const REJOIN_CEILING_MS = 30_000;
+/** Consecutive remote losses within {@link REJOIN_WINDOW_MS} after which the room is left alone. */
+const REJOIN_LIMIT = 6;
+/** Occupancy held this long counts as recovered: the consecutive-loss count starts over. */
+const REJOIN_WINDOW_MS = 60_000;
 /** Bounded retry for the transient MUC cold-creation race (see {@link XmppPlugin.doJoin}). */
 const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
@@ -131,10 +138,78 @@ const assertXmlSafe = (value: string, what: string): void => {
   }
 };
 
-const mamPageOf = (configured: number | undefined): number => {
-  if (configured === undefined || !Number.isFinite(configured)) return MAM_PAGE;
-  return Math.max(1, Math.floor(configured));
-};
+/** Every key `backend_config` may carry. Also the set README and DESIGN §11 are checked against. */
+export const CONFIG_KEYS = [
+  'service',
+  'domain',
+  'muc_service',
+  'username',
+  'password',
+  'nick',
+  'mam_page',
+] as const;
+/** Keys that end up as one part of a JID, where a separator would silently build a different JID. */
+const JID_PART_KEYS = ['domain', 'muc_service', 'username'] as const;
+/** RFC 7622 §3.3/§3.4: a localpart or resourcepart longer than this is `jid-malformed`. */
+const JID_PART_MAX_BYTES = 1023;
+const MAX_MAM_PAGE = 10_000;
+
+const describeValue = (v: unknown): string => (typeof v === 'string' ? `'${v}'` : String(v));
+const bad = (key: string, reason: string): Error =>
+  new Error(`parley-xmpp: invalid backend_config.${key} — ${reason}`);
+
+/**
+ * Validate `backend_config` before the client is constructed (§11). Keep an unknown key a load
+ * error, so that a misspelled one cannot leave every room addressed at the default MUC service and
+ * every join bouncing a retryable condition that names neither the key nor this plugin.
+ */
+export function validateBackendConfig(config: BackendConfig): XmppBackendConfig {
+  const cfg = config as Record<string, unknown>;
+  for (const key of Object.keys(cfg)) {
+    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `parley-xmpp: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
+      );
+    }
+  }
+  for (const key of CONFIG_KEYS) {
+    if (key === 'mam_page') continue;
+    const value = cfg[key];
+    if (value !== undefined && (typeof value !== 'string' || value === '')) {
+      throw bad(key, `expected a non-empty string, got ${describeValue(value)}`);
+    }
+    if (typeof value === 'string') assertXmlSafe(value, `backend_config.${key}`);
+  }
+  for (const key of JID_PART_KEYS) {
+    const value = cfg[key];
+    if (typeof value === 'string' && /[\s@/]/.test(value)) {
+      throw bad(
+        key,
+        `${describeValue(value)} contains whitespace, '@' or '/' — it is one part of a JID, and a ` +
+          'separator here builds a different address than the one written',
+      );
+    }
+  }
+  const nick = cfg['nick'];
+  if (typeof nick === 'string' && nick.includes('/')) {
+    throw bad(
+      'nick',
+      `${describeValue(nick)} contains '/' — the nick is the JID resource, so this connection could ` +
+        'not recognise its own presence back from the room',
+    );
+  }
+  const page = cfg['mam_page'];
+  if (
+    page !== undefined &&
+    (typeof page !== 'number' || !Number.isInteger(page) || page < 1 || page > MAX_MAM_PAGE)
+  ) {
+    throw bad(
+      'mam_page',
+      `expected an integer between 1 and ${MAX_MAM_PAGE}, got ${describeValue(page)}`,
+    );
+  }
+  return cfg as XmppBackendConfig;
+}
 
 /** A minimal view of the ltx element / @xmpp client surface we use (no upstream types ship). */
 type El = {
@@ -250,6 +325,11 @@ export class XmppPlugin implements BackendPlugin {
 
   /** roomJid -> in-flight/settled join (cached like an "ensure"; idempotent). */
   private readonly joined = new Map<string, Promise<void>>();
+  /** roomJid -> consecutive remote occupancy losses and the deferred re-entry they scheduled. */
+  private readonly rejoins = new Map<
+    string,
+    { losses: number; at: number; timer?: ReturnType<typeof setTimeout> }
+  >();
   private readonly pendingJoins = new Map<string, PendingJoin>();
   /** origin-id -> resolver awaiting the MUC reflection that carries the archive id. */
   private readonly pendingPosts = new Map<string, PendingPost>();
@@ -266,20 +346,16 @@ export class XmppPlugin implements BackendPlugin {
   private readonly waiters = new Map<string, Set<(reason: WakeReason) => void>>();
 
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as XmppBackendConfig;
+    const cfg = validateBackendConfig(config);
     this.domain = cfg.domain ?? 'parley.local';
     this.mucService = cfg.muc_service ?? 'muc.parley.local';
     const username = cfg.username ?? 'parley';
     this.handle = username;
     this.nick = cfg.nick ?? `${username}-${rand()}`;
-    this.mamPage = mamPageOf(cfg.mam_page);
+    this.mamPage = cfg.mam_page ?? MAM_PAGE;
     this.stopped = false;
     this.nickAdoption = cfg.nick === undefined ? undefined : Promise.resolve();
     this.mamCheck = undefined;
-    assertXmlSafe(this.nick, 'backend_config.nick');
-    assertXmlSafe(this.mucService, 'backend_config.muc_service');
-    assertXmlSafe(this.domain, 'backend_config.domain');
-    assertXmlSafe(username, 'backend_config.username');
 
     const password = cfg.password ?? 'parleypass';
     if (cfg.password === undefined || password === 'parleypass') {
@@ -324,6 +400,8 @@ export class XmppPlugin implements BackendPlugin {
     for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire('cancel');
     this.waiters.clear();
     this.joined.clear();
+    for (const state of this.rejoins.values()) clearTimeout(state.timer);
+    this.rejoins.clear();
     this.mamCheck = undefined;
     if (this.xmpp !== undefined) {
       await this.xmpp.stop().catch(() => undefined);
@@ -627,13 +705,51 @@ export class XmppPlugin implements BackendPlugin {
    * restarted, or a post bounced as "not an occupant". `joined` caches a RESOLVED promise, so
    * without this the plugin would never re-enter the room: push would be permanently dead in
    * silence and every post would bounce forever. A join still in flight settles on its own.
+   *
+   * The re-entry is remote-driven, so it is DEFERRED and backs off: a room that ends occupancy on
+   * every join (a moderation bot, a members-only toggle, a MUC service shutting down) would
+   * otherwise be re-joined as fast as the loop can send presence — hundreds of stanzas a second at
+   * a service that is deliberately going away, and one stderr line each. Keep the re-join off the
+   * loss path itself, so that a loss delivered from inside a send cannot spin without ever yielding
+   * to a timer.
    */
   private onOccupancyLost(room: string, why: string): void {
     if (this.stopped) return;
     if (!this.joined.has(room) || this.pendingJoins.has(room)) return;
     this.joined.delete(room);
-    console.error(`[parley-xmpp] occupancy in ${room} ended (${why})`);
-    if (!this.subscriptions.has(room)) return;
+
+    const now = Date.now();
+    const prior = this.rejoins.get(room);
+    clearTimeout(prior?.timer);
+    const losses = prior !== undefined && now - prior.at < REJOIN_WINDOW_MS ? prior.losses + 1 : 1;
+
+    if (!this.subscriptions.has(room)) {
+      this.rejoins.set(room, { losses, at: now });
+      console.error(`[parley-xmpp] occupancy in ${room} ended (${why})`);
+      return;
+    }
+    if (losses > REJOIN_LIMIT) {
+      this.rejoins.set(room, { losses, at: now });
+      console.error(
+        `[parley-xmpp] occupancy in ${room} ended (${why}) ${losses} times inside ` +
+          `${REJOIN_WINDOW_MS} ms — not re-entering it again; live push for this topic stays dead ` +
+          'until a post or fetchRecent re-enters the room',
+      );
+      return;
+    }
+    const wait =
+      Math.min(REJOIN_CEILING_MS, REJOIN_BASE_MS * 2 ** (losses - 1)) +
+      Math.floor(Math.random() * REJOIN_BASE_MS);
+    console.error(`[parley-xmpp] occupancy in ${room} ended (${why}); re-joining in ${wait} ms`);
+    this.rejoins.set(room, {
+      losses,
+      at: now,
+      timer: setTimeout(() => this.rejoinAfterLoss(room), wait),
+    });
+  }
+
+  private rejoinAfterLoss(room: string): void {
+    if (this.stopped || !this.subscriptions.has(room)) return;
     void this.ensureJoinedRoom(room).catch((err: unknown) => {
       console.error(
         `[parley-xmpp] re-join after losing occupancy failed for ${room}: ` +
@@ -912,6 +1028,9 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   private joinOnce(room: string): Promise<void> {
+    // Resolve the connection BEFORE registering, so that a join attempted after disconnect cannot
+    // leave a correlator and a 15 s timer behind that nothing will ever settle.
+    const conn = this.require();
     return new Promise<void>((resolve, reject) => {
       // Settle only ever clears the map slot when the slot is still THIS entry: a reconnect
       // re-join for a room whose previous join is still in flight registers a successor under the
@@ -939,20 +1058,26 @@ export class XmppPlugin implements BackendPlugin {
         { to: `${room}/${this.nick}` },
         xml('x', { xmlns: NS_MUC }, xml('history', { maxstanzas: '0' })),
       );
-      this.require()
-        .send(presence)
-        .catch((err: unknown) => {
-          entry.reject(err instanceof Error ? err : new Error(String(err)));
-        });
+      conn.send(presence).catch((err: unknown) => {
+        entry.reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
   }
 
   private roomJid(topic: Topic): string {
-    return `${safeName(topic, sanitizeLocal)}@${this.mucService}`;
+    const local = safeName(topic, sanitizeLocal);
+    if (local.length > JID_PART_MAX_BYTES) {
+      throw new Error(
+        `parley-xmpp: topic is ${String(topic).length} characters, whose MUC room localpart would ` +
+          `be ${local.length} bytes — over the ${JID_PART_MAX_BYTES}-byte JID limit, which the ` +
+          'server answers with jid-malformed. Use a shorter topic.',
+      );
+    }
+    return `${local}@${this.mucService}`;
   }
 
   private require(): XmppClient {
-    if (this.xmpp === undefined) {
+    if (this.stopped || this.xmpp === undefined) {
       throw new Error('XmppPlugin not connected — call connect() first');
     }
     return this.xmpp;
@@ -960,11 +1085,26 @@ export class XmppPlugin implements BackendPlugin {
 }
 
 // JID localparts are case-insensitive and may not contain "&'/:<>@ or whitespace; fold to a
-// safe, lowercase token. freshTopic() values (t-<n>-<rand>) pass through unchanged.
+// safe, lowercase token. freshTopic() values (t-<n>-<rand>) pass through unchanged. Keep it free of
+// a length limit, as {@link sanitizeNick} is: the ceiling is enforced on the fold's RESULT, because
+// a fold that truncates makes safeName refuse the name it just built instead of returning it.
 const sanitizeLocal = (s: string): string => s.toLowerCase().replace(/[^a-z0-9.\-_]/g, '_');
 
 // A MUC nick is a JID resource: no control characters, and nothing that would split the JID. The
-// fold is injective via safeName, so two handles can never land on one occupant identity.
-const sanitizeNick = (s: string): string => s.replace(/[^A-Za-z0-9.\-_]/g, '_').slice(0, 64);
-const nickFor = (identity: Handle): string =>
-  String(identity) === '' ? '' : safeName(asTopic(String(identity)), sanitizeNick);
+// fold is injective via safeName, so two handles can never land on one occupant identity. Keep it
+// free of a length limit, so that safeName's disambiguating suffix survives a re-fold — a truncating
+// fold makes safeName refuse the handle outright, and with it every post made under that identity.
+const sanitizeNick = (s: string): string => s.replace(/[^A-Za-z0-9.\-_]/g, '_');
+const nickFor = (identity: Handle): string => {
+  const raw = String(identity);
+  if (raw === '') return '';
+  const nick = safeName(asTopic(raw), sanitizeNick);
+  if (nick.length > JID_PART_MAX_BYTES) {
+    throw new Error(
+      `parley-xmpp: identity.handle is ${raw.length} characters, whose MUC nick would be ` +
+        `${nick.length} bytes — over the ${JID_PART_MAX_BYTES}-byte JID resource limit. Use a shorter ` +
+        'identity.handle, or pin backend_config.nick.',
+    );
+  }
+  return nick;
+};
