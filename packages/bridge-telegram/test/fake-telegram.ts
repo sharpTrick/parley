@@ -52,7 +52,12 @@ export interface FakeTelegram {
     text: string,
   ): { messageId: number; release(): void };
   /** Fail every subsequent call to `method` with `status` (and Telegram's description), or clear it. */
-  failMethod(method: string, failure: { status: number; description: string } | undefined): void;
+  failMethod(method: string, failure: Failure | undefined): void;
+  /**
+   * Park every call to `method` until the returned handle is released — the only way to place a
+   * lifecycle call (disconnect, a second connect) INSIDE a specific await of `connect`.
+   */
+  holdMethod(method: string): { release(): void };
   /**
    * Break `method` at the TRANSPORT layer rather than with a status: the request is accepted and
    * then never answered / half-answered / cut mid-body. A client with no request timeout parks
@@ -61,11 +66,38 @@ export interface FakeTelegram {
   stallMethod(method: string, mode: StallMode | undefined): void;
   /** How many requests this fake has served for `method` — the poll loop's retry cadence. */
   callCount(method: string): number;
+  /**
+   * `Date.now()` of every request received for `method`, in order. The gap between consecutive
+   * entries IS the backoff the client applied — measured at the server, so it grades the retry
+   * knobs a plugin passes to net-util rather than any single parsing function.
+   */
+  callTimes(method: string): number[];
+  /** Long-polls currently parked. Drops to 0 when the client aborts them (plugin disconnect). */
+  parkedPolls(): number;
   /** Updates still retained: real Telegram DROPS everything the client has acknowledged. */
   retainedUpdates(): number;
   /** Every `sendMessage` body received, in order. */
   readonly sent: Record<string, unknown>[];
 }
+
+/**
+ * A failure to inject. Telegram states a 429's wait in BOTH the standard `Retry-After` header
+ * (seconds) and `parameters.retry_after` (seconds) in the JSON body, independently — a fake that
+ * can only emit one of them cannot grade which one a client prefers.
+ */
+export interface Failure {
+  status: number;
+  description: string;
+  /** `Retry-After` response header, in SECONDS. */
+  retryAfterHeader?: number;
+  /** `parameters.retry_after` body field, in SECONDS. */
+  retryAfterBody?: number;
+  /** Fail only this many calls, then serve normally. Default: every call. */
+  times?: number;
+}
+
+/** The bot behind {@link FakeTelegram.token} — what `getMe` answers. */
+export const BOT_IDENTITY = { id: 999_000_001, username: 'parley_test_bot' };
 
 /** How {@link FakeTelegram.stallMethod} breaks a request. */
 export type StallMode = 'never-answer' | 'half-body' | 'close-mid-body';
@@ -92,7 +124,7 @@ interface ParkedPoll {
   timer: NodeJS.Timeout;
 }
 
-const BOT = { id: 999_000_001, is_bot: true, username: 'parley_test_bot', first_name: 'Parley' };
+const BOT = { ...BOT_IDENTITY, is_bot: true, first_name: 'Parley' };
 const TOKEN = 'test-token';
 
 /**
@@ -135,11 +167,13 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const updates: TgUpdate[] = [];
   /** Long-polls parked until an update they can see arrives (or their timeout lapses). */
   const parked = new Set<ParkedPoll>();
-  const failures = new Map<string, { status: number; description: string }>();
+  const failures = new Map<string, Failure>();
   const stalls = new Map<string, StallMode>();
+  const holds = new Map<string, { promise: Promise<void>; release(): void }>();
   /** Responses deliberately left hanging — closed on shutdown so the process can exit. */
   const stalled = new Set<ServerResponse>();
   const calls = new Map<string, number>();
+  const times = new Map<string, number[]>();
   const sent: Record<string, unknown>[] = [];
 
   const mintMid = (chatId: string): number => {
@@ -171,9 +205,14 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     if (mode === 'close-mid-body') res.socket?.destroy();
   };
 
-  const reply = (res: ServerResponse, status: number, payload: unknown): void => {
+  const reply = (
+    res: ServerResponse,
+    status: number,
+    payload: unknown,
+    headers: Record<string, string> = {},
+  ): void => {
     if (res.writableEnded || res.destroyed) return;
-    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
     res.end(JSON.stringify(payload));
   };
 
@@ -212,6 +251,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     }
     const method = match[2] ?? '';
     calls.set(method, (calls.get(method) ?? 0) + 1);
+    times.set(method, [...(times.get(method) ?? []), Date.now()]);
     const stallMode = stalls.get(method);
     if (stallMode !== undefined) {
       stall(res, stallMode);
@@ -219,13 +259,27 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     }
     const failure = failures.get(method);
     if (failure !== undefined) {
-      reply(res, failure.status, {
+      if (failure.times !== undefined) {
+        if (failure.times <= 1) failures.delete(method);
+        else failures.set(method, { ...failure, times: failure.times - 1 });
+      }
+      const body: Record<string, unknown> = {
         ok: false,
         error_code: failure.status,
         description: failure.description,
-      });
+      };
+      if (failure.retryAfterBody !== undefined) {
+        body.parameters = { retry_after: failure.retryAfterBody };
+      }
+      const headers =
+        failure.retryAfterHeader === undefined
+          ? {}
+          : { 'Retry-After': String(failure.retryAfterHeader) };
+      reply(res, failure.status, body, headers);
       return;
     }
+    const hold = holds.get(method);
+    if (hold !== undefined) await hold.promise;
     const body = await readJsonBody(req);
     const chatRef = (): string | undefined => {
       const raw = String(url.searchParams.get('chat_id') ?? body.chat_id ?? '');
@@ -276,8 +330,10 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
           }, timeoutS * 1000),
         };
         parked.add(poll);
-        // Client aborted (plugin disconnect): unpark quietly.
-        req.on('close', () => {
+        // Client aborted (plugin disconnect): unpark quietly. Listen on the RESPONSE, not the
+        // request — the request stream is fully consumed by the time a poll parks, so `req` has
+        // already emitted 'close' and a listener added here would never fire.
+        res.on('close', () => {
           clearTimeout(poll.timer);
           parked.delete(poll);
         });
@@ -346,9 +402,21 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       };
     },
 
-    failMethod(method: string, failure: { status: number; description: string } | undefined): void {
+    failMethod(method: string, failure: Failure | undefined): void {
       if (failure === undefined) failures.delete(method);
       else failures.set(method, failure);
+    },
+
+    holdMethod(method: string): { release(): void } {
+      let release = (): void => undefined;
+      const promise = new Promise<void>((resolve) => {
+        release = () => {
+          holds.delete(method);
+          resolve();
+        };
+      });
+      holds.set(method, { promise, release });
+      return { release: () => release() };
     },
 
     stallMethod(method: string, mode: StallMode | undefined): void {
@@ -360,11 +428,20 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       return calls.get(method) ?? 0;
     },
 
+    callTimes(method: string): number[] {
+      return [...(times.get(method) ?? [])];
+    },
+
+    parkedPolls(): number {
+      return parked.size;
+    },
+
     retainedUpdates(): number {
       return updates.length;
     },
 
     async close(): Promise<void> {
+      for (const hold of [...holds.values()]) hold.release();
       for (const poll of [...parked]) answerPoll(poll);
       for (const res of stalled.values()) res.socket?.destroy();
       stalled.clear();

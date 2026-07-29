@@ -76,6 +76,7 @@ describe('telegram connect preflight', () => {
 
   it('rejects connect when a chat_map entry names no reachable chat', async () => {
     const fake = await startFake();
+    captureStderr();
     const plugin = new TelegramPlugin();
     await expect(
       connectTo(fake, { chat_map: { ops: 'not-a-chat-id' } }),
@@ -169,6 +170,26 @@ describe('telegram getUpdates error handling', () => {
       timeout: 5000,
       interval: 20,
     });
+  }, 20_000);
+
+  /**
+   * The two reasons a store refuses a record are fixed by different operator actions — raise
+   * `observed_max_chats` versus free the disk the compaction could not reopen the store on — so
+   * the diagnostic has to name which one happened rather than always blaming the chat cap.
+   */
+  it.each([
+    { name: 'the chat cap', open: true, cause: /maximum number of chats/ },
+    { name: 'a store with no append descriptor', open: false, cause: /no append descriptor/ },
+  ])('names $name as the reason a record was dropped', async ({ open, cause }) => {
+    const fake = await startFake();
+    const stderr = captureStderr();
+    await connectTo(fake);
+    vi.spyOn(ObservedStore.prototype, 'append').mockReturnValue(undefined);
+    vi.spyOn(ObservedStore.prototype, 'isOpen').mockReturnValue(open);
+
+    fake.injectUserMessage('-1009450001', 'alice', 'dropped');
+    await vi.waitFor(() => expect(stderr.join('')).toMatch(cause), { timeout: 8000, interval: 20 });
+    expect(stderr.join('')).toContain('-1009450001');
   }, 20_000);
 });
 
@@ -327,7 +348,9 @@ describe('telegram malformed cursor', () => {
 /**
  * `limit` means the same thing on both fetchRecent branches. `slice(-0)` is `slice(0)` — the
  * whole history — so an unnormalized limit inverts its own meaning at zero and drops leading
- * messages when negative.
+ * messages when negative. And on BOTH branches the cursor a caller is handed back must be at
+ * least the one it came in with: a truncated (or empty) page that reports '0' sends the next
+ * catch-up back to the beginning of the retained window, replaying everything.
  */
 describe('telegram fetchRecent limit normalization', () => {
   const LIMITS = [0, 1, 2, -5, 1000, undefined];
@@ -336,7 +359,10 @@ describe('telegram fetchRecent limit normalization', () => {
   it.each(LIMITS)('limit %s means the same with and without `since`', async (limit) => {
     const fake = await startFake();
     const plugin = await connectTo(fake);
+    const empty = asTopic('-1009900002');
     const topic = asTopic('-1009900001');
+    // An empty topic has no tail to report, on any limit.
+    expect((await plugin.fetchRecent({ topic: empty, limit })).nextCursor).toBe('0');
     for (const c of POSTED) await plugin.post(topic, SENDER, c);
 
     const cap = (n: number): number => (limit === undefined ? n : Math.max(0, Math.min(limit, n)));
@@ -349,6 +375,11 @@ describe('telegram fetchRecent limit normalization', () => {
 
     const all = (await plugin.fetchRecent({ topic })).messages;
     const since = all[0]!.cursor;
+    const topicTail = all.at(-1)!.cursor;
+    // The since-less branch always reports the topic's tail: it has already returned the newest
+    // messages there are, so nothing below the tail is left for a later catch-up to find.
+    expect(head.nextCursor).toBe(topicTail);
+
     const tail = await plugin.fetchRecent({ topic, since, limit });
     expect(tail.messages).toHaveLength(cap(POSTED.length - 1));
     expect(tail.messages.map((m) => m.content)).toEqual(
@@ -413,6 +444,7 @@ describe('telegram chat_id validation', () => {
 
   it.each(REFS.filter((r) => r.status === 400))('the plugin refuses a topic naming $name', async ({ ref }) => {
     const fake = await startFake();
+    captureStderr();
     const plugin = await connectTo(fake);
     const topic = asTopic(ref === '' ? ' ' : ref);
     await expect(plugin.post(topic, SENDER, 'x')).rejects.toThrow(/not a Telegram chat id/);

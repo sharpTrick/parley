@@ -58,10 +58,10 @@ everything delivered by `getUpdates`. Consequences:
   joined the chat, or from before the store file existed, **cannot be backfilled** — ever.
 - The store is **per process**: point a fresh deployment at the old `store_path` to keep its
   observed history; a new path starts empty.
-- It is **bounded**, on load and on every append: the newest `observed_retention_per_topic`
+- It is **bounded**, on load and on every append: the newest `observed_retention_per_chat`
   (default 10000) records **per chat**, across at most `observed_max_chats` (default 1000)
   chats. Anything older is dropped and the file is compacted, so raise
-  `observed_retention_per_topic` if you need `fetchRecent` to replay a deeper window.
+  `observed_retention_per_chat` if you need `fetchRecent` to replay a deeper window.
 - The chat cap **never evicts a chat this bridge serves** — one a `chat_map` entry resolves to,
   or one a seam call has named — on load or at runtime. A new unserved chat displaces the least
   recently active *unserved* chat instead, so a bot added to a flood of groups cannot crowd out
@@ -71,6 +71,13 @@ everything delivered by `getUpdates`. Consequences:
   those before the store is even opened, which closes the window entirely.
 - Compaction replaces the file by **rename**, never in place: a crash or a full disk mid-compaction
   leaves the previous file intact rather than a truncated one.
+- **A lost store file invalidates every outstanding cursor.** The cursor is this store's own
+  observation sequence, and a fresh file restarts that sequence at 1 — while core's saved cursor
+  (in its state directory, a different lifetime) still points at the old numbering. `fetchRecent`
+  from such a cursor **fails loudly** ("ahead of every message this store has observed") rather
+  than answering with a permanently short page; restore the original `store_path`, or clear the
+  saved cursor for the topic. This is why `store_path` defaults to an **absolute** path under the
+  same state directory rather than to the working directory the MCP client happened to pick.
 - Within the observed window the seam contract holds fully: stable ids, monotonic exclusive
   cursors, dedup across `getUpdates` backlog replays, cold-restart replay.
 
@@ -85,11 +92,20 @@ store's dedup makes the replay harmless.
 | ---------------- | -------------------------- | ------- |
 | `token`          | _(none)_                   | Bot token from @BotFather. A **secret** — `.env`/`backend_config` only, never committed. |
 | `api_url`        | `https://api.telegram.org` | Bot API base URL (override for tests or a [local Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server)). |
-| `store_path`     | `parley-telegram.jsonl`    | Observed-message store (append-only JSONL). One file per bridge process. |
+| `store_path`     | `$XDG_STATE_HOME/parley/telegram/observed.jsonl` (else `~/.local/state/…`) | Observed-message store (append-only JSONL). One file per bridge process; **absolute by default**, because a store file that goes missing invalidates every cursor issued from it (see **History limitations**). |
 | `poll_timeout_s` | `25`                       | `getUpdates` long-poll timeout, in **seconds** (Telegram's unit). Latency/cost knob only. |
 | `chat_map`       | _(empty)_                  | Parley topic → chat id (numeric or `@channelusername`). Unmapped topics are used as the chat id literal. |
-| `observed_retention_per_topic` | `10000`      | Newest-N observed records kept **per chat**, enforced on load *and* on every append; the file is compacted when records are evicted. Bounds how deep `fetchRecent` can replay — see **History limitations**. |
+| `observed_retention_per_chat` | `10000`       | Newest-N observed records kept **per chat**, enforced on load *and* on every append; the file is compacted when records are evicted. Bounds how deep `fetchRecent` can replay — see **History limitations**. |
+| `observed_retention_per_topic` | _(unset)_   | Deprecated spelling of `observed_retention_per_chat` — the bound is per chat, and `chat_map` can give one chat two topic names. Still honoured; the new key wins when both are set. |
 | `observed_max_chats` | `1000`                 | Max distinct chats kept in the store. Chats this bridge serves (a `chat_map` entry, or a topic a seam call has named) are never evicted; unconfigured ones (the bot can be added to a group by anyone) displace each other least-recently-active first once the cap is reached. |
+
+> **Presence needs a real chat id.** Core enables presence by default (`presence.enabled: true`,
+> `presence.topic: parley-presence`), and on Telegram a topic string **is a chat id** — so the
+> out-of-the-box topic is neither a numeric id nor an `@channelusername` and can never resolve.
+> Either set `presence.enabled: false`, or point `presence.topic` at a real chat (directly, or
+> through `chat_map`). Left as-is, every heartbeat fails (core's presence loop swallows it, by
+> design) and `parley_list_users` reports an empty roster; the plugin writes one throttled stderr
+> line per unresolvable topic so the failure is not completely silent.
 
 ## Provisioning a bot
 

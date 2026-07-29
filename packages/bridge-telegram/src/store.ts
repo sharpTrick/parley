@@ -2,12 +2,14 @@ import {
   appendFileSync,
   closeSync,
   fsyncSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
+import { dirname } from 'node:path';
 
 /**
  * One observed Telegram message, as persisted to the JSONL store. Everything needed to
@@ -100,6 +102,7 @@ export class ObservedStore {
     this.maxPerChat = maxPerChat > 0 ? maxPerChat : DEFAULT_MAX_PER_CHAT;
     this.maxChats = maxChats > 0 ? maxChats : DEFAULT_MAX_CHATS;
     for (const chatId of served) this.served.add(chatId);
+    mkdirSync(dirname(path), { recursive: true });
     let raw = '';
     try {
       raw = readFileSync(path, 'utf8');
@@ -142,13 +145,14 @@ export class ObservedStore {
 
   /**
    * Persist + index one record under a fresh observation sequence, holding both retention
-   * bounds. Returns the stored record, or `undefined` (writing nothing) if its composite id was
-   * already observed — dedup holds when the same message arrives twice, e.g. a `getUpdates`
-   * backlog replayed after a restart — or if every retained chat is served and this one is not.
+   * bounds. Returns the stored record, or `undefined` (writing nothing) when the record is
+   * refused: its composite id was already observed — dedup holds when the same message arrives
+   * twice, e.g. a `getUpdates` backlog replayed after a restart — or every retained chat is
+   * served and this one is not, or there is no append descriptor ({@link isOpen}).
    */
   append(observed: ObservedRecord): StoredRecord | undefined {
     if (this.seen.has(keyOf(observed))) return undefined;
-    if (this.fd === undefined) return undefined; // store closed — the append fd is released.
+    if (this.fd === undefined) return undefined;
     if (!this.admit(observed.chat_id)) return undefined;
     const rec: StoredRecord = { ...observed, seq: this.nextSeq++ };
     appendFileSync(this.fd, `${JSON.stringify(rec)}\n`);
@@ -172,6 +176,20 @@ export class ObservedStore {
   maxSeq(chatId: string): number {
     const list = this.byChat.get(chatId);
     return list?.at(-1)?.seq ?? 0;
+  }
+
+  /**
+   * The highest observation sequence this store has ever stamped or loaded (0 when none) — the
+   * ceiling on every cursor it can have issued. A `since` above it was minted by a store file
+   * this one did not inherit, so the messages it refers to are unreachable from here.
+   */
+  highWater(): number {
+    return this.nextSeq - 1;
+  }
+
+  /** True while the append descriptor is held — false after {@link close}, or if a reopen failed. */
+  isOpen(): boolean {
+    return this.fd !== undefined;
   }
 
   /** Total records currently retained across all chats (the dedup set holds exactly those). */
@@ -252,8 +270,14 @@ export class ObservedStore {
     if (this.fd === undefined) return;
     if (this.evictedSinceRewrite < Math.max(this.maxPerChat, this.size())) return;
     closeSync(this.fd);
-    this.rewrite();
-    this.fd = openSync(this.path, 'a');
+    // Release the descriptor number BEFORE the rewrite can throw, so that a failed compaction
+    // cannot leave appends writing into whatever file or socket has since reused it.
+    this.fd = undefined;
+    try {
+      this.rewrite();
+    } finally {
+      this.fd = openSync(this.path, 'a');
+    }
   }
 
   /**
