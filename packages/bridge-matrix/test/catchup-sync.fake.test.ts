@@ -91,6 +91,51 @@ describe('fetchRecent since-path drains a foreign block and always advances the 
   });
 });
 
+/**
+ * CLASS: a cursor must cross a block of traffic it cannot return, and must not move for traffic it
+ * simply has not reached. `/messages` bounds a page BEFORE filtering, so a page-sized block of
+ * another topic's events would wedge a cursor pinned at `since` forever — but advancing on a SHORT
+ * (end-of-timeline) page means any traffic on any other topic in a shared room silently moves this
+ * topic's cursor, breaking the seam's "since at the tail returns empty and a STABLE cursor" contract
+ * for every reader of that room.
+ */
+const FOREIGN_BLOCKS = [
+  { count: 1, movesTheCursor: false },
+  { count: 2, movesTheCursor: false },
+  { count: 10, movesTheCursor: true },
+  { count: 15, movesTheCursor: true },
+];
+
+describe('a foreign block moves this topic cursor only when it fills a page', () => {
+  for (const { count, movesTheCursor } of FOREIGN_BLOCKS) {
+    it(`${count} foreign event(s) after the cursor: moves it = ${movesTheCursor}`, async () => {
+      install();
+      const p = await connect(true);
+      const A = asTopic('topic-A');
+      const B = asTopic('topic-B');
+      const writer = asHandle('w');
+
+      const idA0 = await p.post(A, writer, 'a0');
+      for (let i = 0; i < count; i++) await p.post(B, writer, `b${i}`);
+
+      const at = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5 });
+      expect(at.messages).toEqual([]);
+      expect(String(at.nextCursor) !== String(idA0)).toBe(movesTheCursor);
+
+      // Whatever it reported, the cursor is replayable: the next on-topic message is returned from
+      // it exactly once, and the read is idempotent until then.
+      const again = await p.fetchRecent({ topic: A, since: at.nextCursor, limit: 5 });
+      expect(again.messages).toEqual([]);
+      const idA1 = await p.post(A, writer, 'a1');
+      const next = await p.fetchRecent({ topic: A, since: at.nextCursor, limit: 5 });
+
+      expect(next.messages.map((m) => m.content)).toEqual(['a1']);
+      expect(String(next.nextCursor)).toBe(String(idA1));
+      await p.disconnect();
+    });
+  }
+});
+
 describe('subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {
   it('delivers ALL N events ascending with no gap and no duplicate when the server truncates', async () => {
     const f = install();

@@ -32,11 +32,14 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** Kinds of timeline traffic that occupy raw page slots without belonging to the read topic. */
+/**
+ * Kinds of timeline traffic that occupy raw page slots without belonging to the read topic — one
+ * row per PREDICATE the plugin actually applies (the topic tag; the event type). Which non-message
+ * type it is never reaches a branch, so `m.reaction` and `m.room.member` are one row, not two.
+ */
 const NOISE = {
   'foreign-topic message': (f: FakeSynapse, i: number) => f.addMessage('someone-elses-topic', `n${i}`),
-  'm.reaction': (f: FakeSynapse) => f.addRaw('m.reaction'),
-  'm.room.member': (f: FakeSynapse) => f.addRaw('m.room.member'),
+  'non-message event': (f: FakeSynapse, i: number) => f.addRaw(i % 2 === 0 ? 'm.reaction' : 'm.room.member'),
 } as const;
 
 const NOISE_DEPTHS = [LIMIT - 1, LIMIT, LIMIT * 3];
@@ -105,17 +108,34 @@ describe('recent window: a raw page cap must not hide a topic behind noise', () 
  * How the cursor under test was minted. `lossless` marks the ones this plugin MINTED itself — those
  * must replay to everything after them. A cursor it never minted (purged / foreign) is allowed to
  * degrade to the documented recent window, but even then only ever to a SUFFIX: no mid-stream gap.
+ *
+ * `shape` enumerates every cursor FORM the plugin can emit, in one place a doc reviewer can diff
+ * against the README: an `event_id`, or the opaque `@parley-stream:` pagination token minted for a
+ * window that held no belonging message. A backend whose cursor is not uniformly one value type
+ * documents both or misleads whoever reads a `read-state.json`.
  */
+const SHAPES = {
+  'event id': (c: Cursor) => /^\$/.test(String(c)),
+  'stream token': (c: Cursor) => String(c).startsWith('@parley-stream:'),
+  'not minted by this plugin': () => true,
+} as const;
+
 const CURSOR_ORIGINS: Record<
   string,
-  { lossless: boolean; mint: (p: MatrixPlugin, t: Topic) => Promise<Cursor> }
+  {
+    lossless: boolean;
+    shape: keyof typeof SHAPES;
+    mint: (p: MatrixPlugin, t: Topic) => Promise<Cursor>;
+  }
 > = {
   'empty topic': {
     lossless: true,
+    shape: 'stream token',
     mint: async (p, t) => (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor,
   },
   'single-message topic': {
     lossless: true,
+    shape: 'event id',
     mint: async (p, t) => {
       await p.post(t, WRITER, 'seed');
       return (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor;
@@ -123,13 +143,25 @@ const CURSOR_ORIGINS: Record<
   },
   'window that was all foreign': {
     lossless: true,
+    shape: 'stream token',
     mint: async (p, t) => {
       for (let i = 0; i < LIMIT * 2; i++) fake.addMessage('someone-elses-topic', `n${i}`);
       return (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor;
     },
   },
+  'catch-up that crossed a page-sized foreign block': {
+    lossless: true,
+    shape: 'event id',
+    mint: async (p, t) => {
+      const seed = await p.post(t, WRITER, 'seed');
+      for (let i = 0; i < LIMIT * 2; i++) fake.addMessage('someone-elses-topic', `n${i}`);
+      return (await p.fetchRecent({ topic: t, since: asCursor(String(seed)), limit: LIMIT }))
+        .nextCursor;
+    },
+  },
   'purged event id': {
     lossless: false,
+    shape: 'not minted by this plugin',
     mint: async () => asCursor('$purged-by-retention:fake'),
   },
 };
@@ -141,6 +173,7 @@ describe('cursor contract: a minted cursor replays to everything after it, never
         const p = await connectFake({ shared: true });
         const t = asTopic('ctx-payments');
         const cursor = await origin.mint(p, t);
+        expect(SHAPES[origin.shape](cursor)).toBe(true);
 
         const expected: string[] = [];
         for (let i = 0; i < after; i++) {

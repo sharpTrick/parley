@@ -38,8 +38,11 @@ export class FakeSynapse {
   limitedEmitted = 0;
   /** False → `/directory/room/<alias>` 404s, forcing `POST /createRoom` (provisioning path). */
   aliasExists = true;
-  /** Every `POST /createRoom` body, in order. */
+  /** Every `POST /createRoom` body, in order — an ATTEMPT is recorded even when it is refused. */
   readonly createRoomBodies: Record<string, unknown>[] = [];
+  /** Remaining `POST /createRoom` calls to refuse with 429 — the per-user creation budget, spent. */
+  createRoomLimited = 0;
+  createRoomRetryAfterMs = 45_000;
   /** Every `PUT .../send/m.room.message/<txn>` body, in order. */
   readonly sentBodies: Record<string, unknown>[] = [];
   /** Remaining incremental-`/sync` calls to fail (`Infinity` = a permanent failure). */
@@ -66,6 +69,18 @@ export class FakeSynapse {
   stallPositioningMs = 600;
   /** Ordinals actually stalled — a case that stalled nobody is visible instead of quietly passing. */
   readonly stalledPositioning: number[] = [];
+  /**
+   * Called at the START of a stalled positioning sync — before its `next_batch` is read — so a case
+   * can land an event inside the exact window it names rather than racing a wall-clock timer.
+   */
+  duringPositioningStall: (ordinal: number) => void = () => undefined;
+  /**
+   * Called with each `/messages` request AFTER its response body has been computed and BEFORE that
+   * body is returned; the returned ms hold the response in flight. Lets a case land an event in the
+   * window where a reader has already snapshotted its (empty) result — the lost-wakeup shape — or
+   * stall one specific read (the `limited`-burst backfill) without touching the others.
+   */
+  holdMessages: (url: URL, body: { chunk: Ev[] }) => number = () => 0;
 
   private ev(type: string, content: Record<string, unknown>): Ev {
     const e: Ev = {
@@ -117,6 +132,13 @@ export class FakeSynapse {
     }
     if (path.endsWith('/v3/createRoom')) {
       this.createRoomBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+      if (this.createRoomLimited > 0) {
+        this.createRoomLimited--;
+        return jsonRes(
+          { errcode: 'M_LIMIT_EXCEEDED', error: 'Too many requests', retry_after_ms: this.createRoomRetryAfterMs },
+          429,
+        );
+      }
       this.aliasExists = true;
       return jsonRes({ room_id: ROOM_ID });
     }
@@ -156,16 +178,20 @@ export class FakeSynapse {
       const dir = url.searchParams.get('dir');
       const limit = Number(url.searchParams.get('limit') ?? '10');
       const from = url.searchParams.get('from');
-      if (dir === 'f') {
-        const b = from ? tokenPos(from) : 0;
-        const chunk = this.timeline.slice(b, b + limit);
-        return jsonRes({ chunk, start: `p${b}`, end: `p${b + chunk.length}` });
-      }
-      // dir=b (default for recentWindow — no `from` → newest-first from the tail).
-      const b = from ? tokenPos(from) : this.timeline.length;
-      const start = Math.max(0, b - limit);
-      const chunk = this.timeline.slice(start, b).reverse();
-      return jsonRes({ chunk, start: `p${b}`, end: `p${start}` });
+      const body = ((): { chunk: Ev[]; start: string; end: string } => {
+        if (dir === 'f') {
+          const b = from ? tokenPos(from) : 0;
+          const chunk = this.timeline.slice(b, b + limit);
+          return { chunk, start: `p${b}`, end: `p${b + chunk.length}` };
+        }
+        // dir=b (default for recentWindow — no `from` → newest-first from the tail).
+        const b = from ? tokenPos(from) : this.timeline.length;
+        const start = Math.max(0, b - limit);
+        return { chunk: this.timeline.slice(start, b).reverse(), start: `p${b}`, end: `p${start}` };
+      })();
+      const hold = this.holdMessages(url, body);
+      if (hold > 0) await new Promise((r) => setTimeout(r, hold));
+      return jsonRes(body);
     }
 
     if (path.endsWith('/v3/sync')) {
@@ -180,6 +206,7 @@ export class FakeSynapse {
         const ordinal = ++this.positioningSyncs;
         if (this.stallPositioning(ordinal)) {
           this.stalledPositioning.push(ordinal);
+          this.duringPositioningStall(ordinal);
           await new Promise((r) => setTimeout(r, this.stallPositioningMs));
         }
         const at = this.timeline.length;

@@ -1,16 +1,21 @@
-import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MatrixPlugin } from '../src/index.js';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
- * CLASS: rooms this plugin PROVISIONS must not be world-readable / world-writable by default. The
- * alias is deterministic and therefore guessable, and Synapse federates, so the join rule is the
- * only thing standing between a stranger's account and both the topic's history and a live agent
- * session's `<channel>` events. Opting back in must stay deliberate and visible in config.
+ * Two CLASSES over the same table.
  *
- * Every seam entry point provisions, so the table covers all of them: a first `post`, a first
- * `fetchRecent`, and a first `subscribe` (the presence topic is just another topic name).
+ *  1. Rooms this plugin PROVISIONS must not be world-readable / world-writable by default. The
+ *     alias is deterministic and therefore guessable, and Synapse federates, so the join rule is
+ *     the only thing standing between a stranger's account and both the topic's history and a live
+ *     agent session's `<channel>` events. Opting back in must stay deliberate and visible in config.
+ *  2. A READ never provisions. `fetchRecent`'s topic comes from the model, whose context is fed by
+ *     untrusted inbound messages, and core's allowlist admits pattern matches — so a read that
+ *     creates a room lets inbound data spend the homeserver's per-user room-creation budget
+ *     (Synapse: ~2-room burst, then ~1 room / 45s), after which the `post` that genuinely needs a
+ *     room is refused. `subscribe`'s topics come from the operator's route config, not the model,
+ *     and a route with no room has nothing to sync — it provisions.
  */
 
 const WRITER = asHandle('writer');
@@ -26,27 +31,73 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const ENTRY_POINTS: Record<string, (p: MatrixPlugin, t: Topic) => Promise<unknown>> = {
-  'first post': (p, t) => p.post(t, WRITER, 'hello'),
-  'first fetchRecent': (p, t) => p.fetchRecent({ topic: t, limit: 5 }),
-  'first subscribe': (p, t) => p.subscribe(t, () => undefined),
+const ENTRY_POINTS: Record<
+  string,
+  { provisions: boolean; drive: (p: MatrixPlugin, t: Topic) => Promise<unknown> }
+> = {
+  'first post': { provisions: true, drive: (p, t) => p.post(t, WRITER, 'hello') },
+  'first fetchRecent': {
+    provisions: false,
+    drive: (p, t) => p.fetchRecent({ topic: t, limit: 5 }),
+  },
+  'first subscribe': { provisions: true, drive: (p, t) => p.subscribe(t, () => undefined) },
 };
 
-describe('createRoom is not world-joinable by default', () => {
+describe('only a write provisions, and never into a world-joinable room', () => {
   for (const shared of [true, false]) {
-    for (const [entryName, drive] of Object.entries(ENTRY_POINTS)) {
-      for (const topicName of ['ctx-payments', 'parley-presence']) {
-        it(`${shared ? 'shared_room' : 'per-topic'} / ${entryName} / ${topicName}`, async () => {
+    for (const [entryName, entry] of Object.entries(ENTRY_POINTS)) {
+      for (const aliasExists of [true, false]) {
+        it(`${shared ? 'shared_room' : 'per-topic'} / ${entryName} / alias exists: ${aliasExists}`, async () => {
+          fake.aliasExists = aliasExists;
           const p = await connectFake({ shared });
-          await drive(p, asTopic(topicName));
+          await entry.drive(p, asTopic('ctx-payments'));
 
-          expect(fake.createRoomBodies).toHaveLength(1);
-          expect(fake.createRoomBodies[0]!.preset).not.toBe('public_chat');
+          const expected = !aliasExists && entry.provisions ? 1 : 0;
+          expect(fake.createRoomBodies).toHaveLength(expected);
+          for (const body of fake.createRoomBodies) expect(body.preset).not.toBe('public_chat');
           await p.disconnect();
         });
       }
     }
   }
+
+  it('a read on an unprovisioned topic degrades to an empty page, spending no creation budget', async () => {
+    fake.aliasExists = false;
+    fake.createRoomLimited = Number.POSITIVE_INFINITY; // the budget is already exhausted
+    const p = await connectFake({});
+    const t = asTopic('ctx-attacker-chose-this');
+
+    const absent = await p.fetchRecent({ topic: t, limit: 5 });
+
+    expect(absent.messages).toEqual([]);
+    expect(fake.createRoomBodies).toHaveLength(0);
+    // …and the same read starts working the moment a legitimate write provisions the room.
+    fake.aliasExists = true;
+    fake.addMessage(String(t), 'from-a-peer');
+    expect((await p.fetchRecent({ topic: t, limit: 5 })).messages.map((m) => m.content)).toEqual([
+      'from-a-peer',
+    ]);
+    await p.disconnect();
+  });
+
+  it('a blocking read waits for the room a peer has yet to create', async () => {
+    fake.aliasExists = false;
+    const p = await connectFake({});
+    const t = asTopic('ctx-not-yet');
+
+    const pending = p.fetchRecent({ topic: t, since: asCursor(''), blockMs: 3000, limit: 5 });
+    const appears = setTimeout(() => {
+      fake.aliasExists = true;
+      fake.addMessage(String(t), 'first-ever');
+    }, 200);
+
+    const got = await pending;
+    clearTimeout(appears);
+
+    expect(got.messages.map((m) => m.content)).toEqual(['first-ever']);
+    expect(fake.createRoomBodies).toHaveLength(0);
+    await p.disconnect();
+  }, 20_000);
 
   it('opting back in to a public room is explicit config, never a default', async () => {
     const p = await connectFake({ roomPreset: 'public_chat' });

@@ -15,7 +15,7 @@ import {
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
+import { DEFAULT_DEADLINE_MS, delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 
 /** Plugin-specific backend_config. */
 export interface MatrixBackendConfig {
@@ -61,6 +61,14 @@ export interface MatrixBackendConfig {
 
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 const TOPIC_KEY = 'app.parley.topic';
+
+/**
+ * Wall-clock budget for a `/sync` that asks the homeserver to block for `timeoutMs`. A long-poll
+ * legitimately outlives the shared {@link DEFAULT_DEADLINE_MS}, so every `/sync` call MUST pass
+ * this — at the default budget any `sync_timeout_ms` at or above 30000 aborts client-side before a
+ * conforming homeserver has answered, and the live path degrades to the retry backoff instead.
+ */
+export const syncDeadlineMs = (timeoutMs: number): number => timeoutMs + DEFAULT_DEADLINE_MS;
 
 /**
  * Cursor minted for a window that contained no belonging message: an opaque `/messages`
@@ -245,8 +253,15 @@ export class MatrixPlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    const roomId = await this.ensureRoom(args.topic);
+    const deadline = Date.now() + (args.blockMs ?? 0);
+    const roomId = await this.roomForRead(args.topic, deadline);
     const limit = args.limit ?? 100;
+    // A topic nobody has posted to has no room yet, and a read never provisions one. An empty page
+    // with a replayable cursor is the seam's answer: the `@parley-stream:` form with no token drains
+    // from the first visible event once the room does exist.
+    if (roomId === undefined) {
+      return { messages: [], nextCursor: args.since ?? asCursor(STREAM_CURSOR_PREFIX) };
+    }
 
     if (args.since === undefined) {
       return this.recentWindow(roomId, args.topic, limit);
@@ -256,7 +271,7 @@ export class MatrixPlugin implements BackendPlugin {
 
     // Engage the native long-poll ONLY when asked (blockMs > 0) and the exclusive query came back
     // empty — otherwise this is the plain durable catch-up.
-    const blockMs = args.blockMs ?? 0;
+    const blockMs = deadline - Date.now();
     if (blockMs <= 0 || first.messages.length > 0 || this.stopped) {
       return first;
     }
@@ -324,10 +339,13 @@ export class MatrixPlugin implements BackendPlugin {
   ): Promise<FetchRecentResult> {
     const messages: Message[] = [];
     let from = start;
-    // Keep tracking the last RAW event id across pages, so that {@link cursorPastForeignBlock} can
-    // advance past a full page of foreign-topic or non-message events: `/messages` bounds a page
-    // BEFORE filtering, so pinning `nextCursor` at `since` would be indistinguishable from "caught
-    // up" and would mask every later on-topic message forever.
+    // Keep tracking the last RAW event id of every FULL page, so that
+    // {@link cursorPastForeignBlock} can advance past a page-sized block of foreign-topic or
+    // non-message events: `/messages` bounds a page BEFORE filtering, so pinning `nextCursor` at
+    // `since` would be indistinguishable from "caught up" and would mask every later on-topic
+    // message forever. Keep the FULL-page condition as well — a short page IS the end of the
+    // timeline, and advancing there would move the cursor on foreign traffic alone, breaking the
+    // seam's stable-cursor contract for every topic that shares a room.
     let lastRawEventId: string | undefined;
     for (let page = 0; page < MAX_FORWARD_PAGES && messages.length < limit; page++) {
       const fromParam = from === undefined ? '' : `from=${encodeURIComponent(from)}&`;
@@ -337,7 +355,7 @@ export class MatrixPlugin implements BackendPlugin {
       );
       const { chunk, end } = (await fwdRes.json()) as { chunk: MatrixEvent[]; end?: string };
       if (chunk.length === 0) break; // genuine end of timeline.
-      const rawTail = chunk.at(-1)?.event_id;
+      const rawTail = chunk.length >= limit ? chunk.at(-1)?.event_id : undefined;
       if (typeof rawTail === 'string') lastRawEventId = rawTail;
       // The context `end` token is inconsistent at the boundary (it re-includes the `since` event
       // for a mid-stream event, but not for the tail). Make `since` strictly exclusive by dropping
@@ -367,7 +385,9 @@ export class MatrixPlugin implements BackendPlugin {
    * aborted); it never blocks past `blockMs`. When a `subscribe` loop already drives this topic we
    * hook its delivery ({@link liveTopics}) rather than open a second `/sync`; otherwise we drive a
    * dedicated bounded `/sync` with its OWN since token (never the subscribe loop's, so it cannot
-   * corrupt the live loop's position) to observe the wake.
+   * corrupt the live loop's position) to observe the wake. The park is spent in slices of
+   * {@link syncTimeoutMs}, each ending in the canonical re-query, so promptness never depends on a
+   * wake source staying healthy for the whole budget.
    */
   private async blockingFetch(
     roomId: string,
@@ -413,10 +433,13 @@ export class MatrixPlugin implements BackendPlugin {
           resolveParked();
         },
       };
+      // Keep the park sliced rather than spanning the whole budget, so that a wake source that stops
+      // observing — a subscribe loop in retry backoff, a loop stalled mid-backfill, a dedicated
+      // `/sync` that failed to position — costs one slice of latency and not the entire blockMs.
+      const slice = Math.min(remaining, this.syncTimeoutMs);
       // Keep the registration ahead of everything below, so that a delivery cannot land while this
-      // waiter is invisible. The timer is bounded by the REMAINING budget so re-arming after a
-      // spurious wake never overruns blockMs.
-      timer = setTimeout(waiter.wake, remaining);
+      // waiter is invisible.
+      timer = setTimeout(waiter.wake, slice);
       const set = this.waiters.get(roomId) ?? new Set<Waiter>();
       set.add(waiter);
       this.waiters.set(roomId, set);
@@ -432,7 +455,7 @@ export class MatrixPlugin implements BackendPlugin {
           const positioned = this.driveBoundedSync(
             roomId,
             topic,
-            remaining,
+            slice,
             syncController,
             waiter.wake,
           );
@@ -479,7 +502,7 @@ export class MatrixPlugin implements BackendPlugin {
       const initial = await this.http(
         'GET',
         `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`,
-        { signal: controller.signal },
+        { signal: controller.signal, deadlineMs: syncDeadlineMs(0) },
       );
       nextBatch = ((await initial.json()) as { next_batch: string }).next_batch;
     } catch {
@@ -516,7 +539,7 @@ export class MatrixPlugin implements BackendPlugin {
         const res = await this.http(
           'GET',
           `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${timeout}`,
-          { signal: controller.signal },
+          { signal: controller.signal, deadlineMs: syncDeadlineMs(timeout) },
         );
         const json = (await res.json()) as SyncResponse;
         nextBatch = json.next_batch ?? nextBatch;
@@ -601,7 +624,9 @@ export class MatrixPlugin implements BackendPlugin {
 
     // Establish the resume position BEFORE returning, so a post immediately after subscribe()
     // resolves is guaranteed to land in a subsequent sync (positioning is awaited).
-    const initial = await this.http('GET', `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`);
+    const initial = await this.http('GET', `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`, {
+      deadlineMs: syncDeadlineMs(0),
+    });
     let nextBatch = ((await initial.json()) as { next_batch: string }).next_batch;
     // Keep this seed of the backward-recovery boundary, and keep it read AFTER the positioning sync,
     // so that a `limited`-burst {@link backfill} cannot page past the subscription position into
@@ -622,7 +647,7 @@ export class MatrixPlugin implements BackendPlugin {
           const res = await this.http(
             'GET',
             `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${this.syncTimeoutMs}`,
-            { signal: controller.signal },
+            { signal: controller.signal, deadlineMs: syncDeadlineMs(this.syncTimeoutMs) },
           );
           json = (await res.json()) as SyncResponse;
         } catch (err) {
@@ -782,17 +807,23 @@ export class MatrixPlugin implements BackendPlugin {
     return contentOf(e)[TOPIC_KEY] === topic;
   }
 
-  /** Resolve (or create) the room for `topic`, memoized so concurrent first-posts don't double-create. */
-  private ensureRoom(topic: Topic): Promise<string> {
-    // In shared mode all topics collapse onto one room → one cache key, one resolve.
-    const localpart =
-      this.sharedLocalpart ?? `parley_${safeName(topic, sanitizeAlias)}`;
+  /** In shared mode all topics collapse onto one room → one cache key, one resolve. */
+  private roomKey(topic: Topic): string {
     // Keep this an escape, never a literal NUL byte, so that the file stays text to file(1) and
     // greppable by ripgrep.
-    const key = this.sharedLocalpart !== undefined ? '\u0000shared' : (topic as string);
+    return this.sharedLocalpart !== undefined ? '\u0000shared' : (topic as string);
+  }
+
+  private roomLocalpart(topic: Topic): string {
+    return this.sharedLocalpart ?? `parley_${safeName(topic, sanitizeAlias)}`;
+  }
+
+  /** Resolve (or create) the room for `topic`, memoized so concurrent first-posts don't double-create. */
+  private ensureRoom(topic: Topic): Promise<string> {
+    const key = this.roomKey(topic);
     const existing = this.rooms.get(key);
     if (existing !== undefined) return existing;
-    const pending = this.resolveOrCreateRoom(localpart).catch((err) => {
+    const pending = this.resolveOrCreateRoom(this.roomLocalpart(topic)).catch((err) => {
       // Don't poison the cache on transient failure — let the next call retry.
       this.rooms.delete(key);
       throw err;
@@ -801,8 +832,44 @@ export class MatrixPlugin implements BackendPlugin {
     return pending;
   }
 
+  /**
+   * The room for `topic` if its alias already resolves, else `undefined`. Keep every READ path on
+   * this rather than {@link ensureRoom}, so that a topic name chosen by an untrusted inbound message
+   * cannot spend the homeserver's per-user room-creation budget (Synapse: ~2-room burst, then ~1
+   * room / 45s) and starve the `post` that legitimately needs it.
+   */
+  private async existingRoom(topic: Topic): Promise<string | undefined> {
+    const key = this.roomKey(topic);
+    const cached = this.rooms.get(key);
+    if (cached !== undefined) return cached;
+    const roomId = await this.lookupAlias(this.aliasOf(this.roomLocalpart(topic)));
+    if (roomId === undefined) return undefined;
+    await this.joinRoom(roomId);
+    this.rooms.set(key, Promise.resolve(roomId));
+    return roomId;
+  }
+
+  /**
+   * {@link existingRoom}, re-polled until `deadline`. Keep the wait, so that a blocking read on a
+   * topic whose first message has not landed yet still waits for the peer's `post` to provision the
+   * room instead of returning instantly and turning an agent's long-poll into a spin.
+   */
+  private async roomForRead(topic: Topic, deadline: number): Promise<string | undefined> {
+    for (;;) {
+      const roomId = await this.existingRoom(topic);
+      if (roomId !== undefined) return roomId;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || this.stopped) return undefined;
+      await delay(Math.min(remaining, this.syncTimeoutMs));
+    }
+  }
+
+  private aliasOf(localpart: string): string {
+    return `#${localpart}:${this.serverName}`;
+  }
+
   private async resolveOrCreateRoom(localpart: string): Promise<string> {
-    const alias = `#${localpart}:${this.serverName}`;
+    const alias = this.aliasOf(localpart);
     const existing = await this.lookupAlias(alias);
     if (existing !== undefined) {
       await this.joinRoom(existing);
@@ -866,6 +933,7 @@ export class MatrixPlugin implements BackendPlugin {
       body?: unknown;
       signal?: AbortSignal;
       allowStatuses?: number[];
+      deadlineMs?: number;
     },
   ): Promise<Response> {
     const generation = this.generation;
@@ -888,6 +956,7 @@ export class MatrixPlugin implements BackendPlugin {
         isStopped: () => this.isStale(generation),
         retryAfterOf: readRetryAfter,
         allowStatuses: opts?.allowStatuses,
+        deadlineMs: opts?.deadlineMs,
       },
     );
   }
@@ -929,9 +998,10 @@ const isoTimestamp = (ts: unknown): string =>
   ).toISOString();
 
 /**
- * The cursor a forward page must report: the last belonging message's, else the raw page position
- * so a block of foreign-topic or non-message events is crossed rather than replayed forever, else
- * the input `since` when the page was empty and there was nothing to advance past.
+ * The cursor a forward page must report: the last belonging message's, else the last FULL raw
+ * page's position so a page-sized block of foreign-topic or non-message events is crossed rather
+ * than replayed forever, else the input `since` — which is what a short, all-foreign tail must
+ * report, so that traffic on another topic never moves this topic's cursor.
  */
 const cursorPastForeignBlock = (
   collected: Message[],
