@@ -6,10 +6,42 @@
     "Round 1 is not gradeable: there was no prior experiment commit for a line to be attributed to."
   ],
   "rounds": [
-    { "round": 2, "base": "4bc04e3", "findings": 136, "graded": 136, "selfInduced": 36, "preExisting": 100, "unresolvable": 0, "selfInducedPct": 26 },
-    { "round": 3, "base": "ddbeca9", "findings": 119, "graded": 119, "selfInduced": 46, "preExisting": 73, "unresolvable": 0, "selfInducedPct": 39 }
+    {
+      "round": 2,
+      "base": "4bc04e3",
+      "findings": 136,
+      "graded": 136,
+      "selfInduced": 36,
+      "preExisting": 100,
+      "unresolvable": 0,
+      "selfInducedPct": 26
+    },
+    {
+      "round": 3,
+      "base": "ddbeca9",
+      "findings": 119,
+      "graded": 119,
+      "selfInduced": 46,
+      "preExisting": 73,
+      "unresolvable": 0,
+      "selfInducedPct": 39
+    },
+    {
+      "round": 4,
+      "base": "7fb4c17",
+      "findings": 120,
+      "graded": 120,
+      "selfInduced": 68,
+      "preExisting": 52,
+      "unresolvable": 0,
+      "selfInducedPct": 57
+    }
   ],
   "comparison": {
-    "ouroboros": { "value": 66.7, "method": "post-hoc hand-label by the same agent that authored the fixes being judged", "note": "ouroboros's own corrections section flagged this as its weakest number" }
+    "ouroboros": {
+      "value": 66.7,
+      "method": "post-hoc hand-label by the same agent that authored the fixes being judged",
+      "note": "ouroboros's own corrections section flagged this as its weakest number"
+    }
   }
 }

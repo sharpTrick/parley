@@ -130,6 +130,7 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 1 | 14 / 14 | 139 | 124 | 61 | 15 | 0 | no |
 | 2 | 14 / 14 | 136 | 130 | 49 | 6 | 0 | no |
 | 3 | 14 / 14 | 119 | 115 | 38 | 4 | 0 | no |
+| 4 | 14 / 14 | 120 | 113 | 45 | 7 | 0 | no |
 
 Round 3 ran the **round-1 runner** — see "Process defects" below. It is kept in the series because
 all 14 critics still reviewed the correct targets full-surface and reached the worktrees and the
@@ -154,6 +155,20 @@ skipped, against real Redis, NATS, Postgres, Prosody, Synapse and Keycloak.
 | test-hygiene | *(not yet added)* | 7 / 7 / 0 |
 | operability-and-release | 11 / 9 / 0 | 5 / 4 / 0 |
 | seam-integrity | 1 / 1 / 0 | 0 / 0 / 0 |
+
+Round 4 (total / confirmed / blocking): test-integrity 31 / 31 / **12**, concurrency-and-failure
+16 / 15 / 10, security 15 / 14 / 8, design-principles 11 / 11 / 3, truth-in-docs 9 / 8 / 2,
+test-hygiene 9 / 9 / 0, protocol-conformance 8 / 6 / 2, correctness 8 / 7 / **6**, maintainability
+6 / 5 / 0, operability-and-release 4 / 4 / 1, seam-integrity 3 / 3 / 1.
+
+**test-integrity holds first place for a second round** (31 findings, 12 blocking) — it is now the
+lens the loop runs on, which is the same statement as the iatrogenesis figure from a different angle.
+**Security recovered** (8 → 15 findings, 4 → 8 blocking), which weakens the round-3 reading that it
+was decaying: the difference is that round 4 was the first round to execute the committed protocol,
+including the rule letting each critic stand up its own throwaway container. Postgres, matrix and
+xmpp critics each ran against a private server this round and verified against live behaviour rather
+than a fake. On a surface like this, **giving a critic a real server is worth more than another
+round.**
 
 Round 3, same order of columns (total / confirmed / blocking): test-integrity 28 / 28 / **12**,
 truth-in-docs 18 / 17 / 1, concurrency-and-failure 17 / 17 / **13**, correctness 11 / 11 / 3,
@@ -210,14 +225,21 @@ same agent that wrote the fixes being judged.
 | ---: | ---: | ---: | ---: | ---: |
 | 2 | 136 | 36 | 100 | **26%** |
 | 3 | 119 | 46 | 73 | **39%** |
+| 4 | 120 | 68 | 52 | **57%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
-The trend is the result: **the share of findings the loop created for itself is rising**, 26% → 39%,
-while the absolute count of pre-existing findings falls (100 → 73). That is the loop working as
-intended on the original surface and progressively turning on its own output — consistent with the
-test-integrity lens jumping to first place in round 3, and with ouroboros's two-regime split, but
-arriving much earlier here.
+The trend is the result, and by round 4 it is unambiguous: **the share of findings the loop created
+for itself is rising** — 26% → 39% → **57%** — while the absolute count of pre-existing findings
+falls, 100 → 73 → 52. Round 4 is the first round where the loop spent more of its effort on its own
+output than on the original codebase. That is ouroboros's two-regime split, reproduced on a much
+deeper surface and arriving at round 4 rather than round 11 — and it arrives while the *blocking*
+count goes UP (38 → 45), so this is not the loop running out of things to say. It is the loop
+becoming its own subject.
+
+Cost, for the same round: 2.11M review tokens for **52 pre-existing findings**, i.e. ~40K tokens per
+pre-existing defect for review alone, and roughly double once remediation is counted. That number,
+not the round count, is what a decision about a next experiment should be built on.
 
 Two caveats that cut against over-reading it. Line-granularity blame attributes the **last** touch,
 so a round that reformats or moves a line without introducing the defect is charged with it — this
