@@ -3,8 +3,9 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 // Resolve @sharptrick/parley-* to each package's TypeScript source so unit/conformance tests
-// run against source with no pre-build. (The forked multi-process write test and the
-// manual channel loop are the only things that need `npm run build` first.)
+// run against source with no pre-build. A test that instead executes a compiled entrypoint must
+// build it itself and verify the artifact is newer than its sources, so that it cannot pass
+// against a stale `dist/` (packages/bridge-sqlite/src/cli.test.ts is the worked example).
 const fromHere = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 /**

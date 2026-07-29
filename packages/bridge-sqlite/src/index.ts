@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   asBackendMsgId,
   asCursor,
@@ -7,6 +8,7 @@ import {
   type BackendMsgId,
   type BackendPlugin,
   buildMessage,
+  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
@@ -15,19 +17,16 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { openDriver, type SqlDriver, type SqlStatement } from './driver.js';
-import { type MessageRow, SCHEMA } from './schema.js';
+import { type MessageRow, SCHEMA, STORE_ID_KEY } from './schema.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
 export interface SqliteBackendConfig {
   /**
-   * Path to the SQLite file. Default `parley.db` in the cwd. `:memory:` is single-process only
-   * AND a brand-new database every process: its `AUTOINCREMENT` rowids restart at 1, so a cursor
-   * persisted by core from a previous run no longer lines up with this DB's ids. The same is true
-   * of a recreated/wiped file. Because core's read-state outlives the DB, **clear any persisted
-   * read-state whenever the DB is reset** — otherwise a stale high cursor would reference ids this
-   * DB never minted. `fetchRecent` guards this case (a `since` past the DB's high-water mark
-   * replays the topic from its first row instead of silently skipping messages), but clearing
-   * stale read-state on reset is still the correct operational step.
+   * Path to the SQLite file. Default `parley.db` in the cwd. `:memory:` is single-process only AND
+   * a brand-new database every process: its `AUTOINCREMENT` rowids restart at 1. Core's read-state
+   * outlives the database, so a cursor persisted before a reset no longer lines up with this
+   * store's ids — every cursor therefore carries the store's identity (`parley_meta.store_id`) and
+   * a cursor from another store replays the topic from its first row rather than skipping history.
    */
   db_path?: string;
   /**
@@ -47,9 +46,23 @@ export interface SqliteBackendConfig {
 }
 
 /** How many new rows a single poll tick drains at most before yielding. */
-const POLL_BATCH = 512;
+export const POLL_BATCH = 512;
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the poll interval. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+/**
+ * Rows one prune statement deletes. Keep it bounded, so that neither the event loop nor the
+ * file's single write lock is held for a duration that scales with the store — past a peer's
+ * `busy_timeout` their `post()` throws SQLITE_BUSY.
+ */
+export const PRUNE_BATCH = 5_000;
+/**
+ * Server-side ceiling on `fetchRecent`'s page. The driver is synchronous, and `limit` reaches it
+ * from a model whose context is untrusted inbound content, so an unbounded page is a whole-bridge
+ * stall. Callers page to exhaustion instead (the conformance suite's `drainAll` already does).
+ */
+export const MAX_PAGE = 1_000;
+/** Page size when a caller supplies no `limit`. */
+const DEFAULT_PAGE = 100;
 /** Floor for `poll_interval_ms`: below this the loop is a hot spin, not a poll. */
 export const MIN_POLL_INTERVAL_MS = 10;
 /**
@@ -87,17 +100,19 @@ export type DbErrorClass = 'lock' | 'unavailable' | 'fatal';
 
 /**
  * The SQLite backend (DESIGN §9). Zero-infra, **polling-only** — no socket, no notify bus,
- * no broker. The cursor (rowid) makes polling fully correct, so the poll interval is a pure
- * latency/cost knob. WAL + busy_timeout (in {@link openDriver}) make concurrent multi-process
- * posts safe (§9/§10).
+ * no broker. The cursor (`<storeId>.<rowid>`) makes polling fully correct, so the poll interval
+ * is a pure latency/cost knob. WAL + busy_timeout (in {@link openDriver}) make concurrent
+ * multi-process posts safe (§9/§10).
  */
 export class SqlitePlugin implements BackendPlugin {
   private driver?: SqlDriver;
   private pollIntervalMs = 1000;
   private retentionDays?: number;
   private stopped = false;
+  private storeId?: string;
   private readonly cancellers: Array<() => void> = [];
   private pruneTimer?: ReturnType<typeof setInterval>;
+  private pruneBatchTimer?: ReturnType<typeof setTimeout>;
   private readonly health = new Map<Topic, SubscriptionHealth>();
   private pruneFailures = 0;
   private lastPruneDiag = 0;
@@ -134,12 +149,11 @@ export class SqlitePlugin implements BackendPlugin {
       'SELECT id, topic, sender, content, ts, in_reply_to FROM messages WHERE topic = ? ORDER BY id DESC LIMIT ?',
     );
     this.maxIdStmt = driver.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM messages WHERE topic = ?');
-    this.pruneStmt = driver.prepare('DELETE FROM messages WHERE ts < ?');
-    // High-water mark of the AUTOINCREMENT sequence — the largest rowid this DB lifetime has
-    // ever minted (absent until the first insert). Lets `fetchRecent` detect a stale/foreign
-    // `since` cursor minted against a previous DB (a recreated file, or `:memory:` — a fresh DB
-    // every process) instead of silently skipping every post after the reset (BUG-23).
+    this.pruneStmt = driver.prepare(
+      'DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)',
+    );
     this.seqStmt = driver.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'messages'");
+    this.storeId = readOrMintStoreId(driver);
 
     if (this.retentionDays !== undefined) {
       this.prune();
@@ -154,10 +168,13 @@ export class SqlitePlugin implements BackendPlugin {
     this.stopped = true;
     if (this.pruneTimer !== undefined) clearInterval(this.pruneTimer);
     this.pruneTimer = undefined;
+    if (this.pruneBatchTimer !== undefined) clearTimeout(this.pruneBatchTimer);
+    this.pruneBatchTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
     this.driver?.close();
     this.driver = undefined;
+    this.storeId = undefined;
   }
 
   async post(
@@ -175,59 +192,51 @@ export class SqlitePlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    const limit = args.limit ?? 100;
-    // Validate the opaque cursor at the seam (BUG-22). A cursor this backend mints is the decimal
-    // rowid (`^\d+$`); anything else — a foreign/Matrix-style cursor (e.g. `'s123_456'`), or a
-    // value that slipped in via mis-namespaced read-state — would otherwise become Number(x) ===
-    // NaN, bind as SQL NULL, match zero rows with NO error, and re-echo itself as `nextCursor`,
-    // silently wedging this topic's catch-up forever. `\d+` also rejects '' (Number('') === 0
-    // would replay the whole topic). Throw loudly so core/the agent can drop the bad cursor and
-    // refetch the default window.
-    if (args.since !== undefined && !/^\d+$/.test(args.since)) {
-      throw new Error(
-        `parley-sqlite: malformed cursor '${args.since}' for topic ${args.topic} — ` +
-          `expected a numeric rowid cursor minted by this backend`,
-      );
-    }
-    // A well-formed but STALE cursor — minted against a previous DB lifetime, so it points past
-    // this DB's AUTOINCREMENT high-water mark — replays the topic from its first row (BUG-23).
-    // Keep it a replay: `id > <stale>` returns [] and drops every post made after the reset, and
-    // the default recent window silently skips everything older than the last `limit` rows while
-    // returning a cursor that claims they were read.
-    const since = args.since !== undefined && this.isStaleCursor(args.since) ? '0' : args.since;
+    const limit = normalizeLimit(args.limit, args.topic);
+    const storeId = this.require(this.storeId);
+    const resumeAfter = args.since === undefined ? undefined : this.resumeAfter(args.since, args.topic);
     let rows: MessageRow[];
-    if (since === undefined) {
-      // Default window: the most recent `limit` messages, returned ascending by cursor.
+    if (resumeAfter === undefined) {
       rows = this.require(this.selectRecentStmt).all(args.topic, limit) as MessageRow[];
       rows.reverse();
     } else {
-      // Exclusive: strictly after `since`, ascending. `since` is validated `^\d+$`, so bind it as
-      // a BigInt — no Number() round-trip / >2^53 precision loss (BUG-40). The `id` column's
-      // INTEGER affinity drives the `id > ?` comparison.
       rows = this.require(this.selectAfterStmt).all(
         args.topic,
-        BigInt(since),
+        resumeAfter,
         limit,
       ) as MessageRow[];
     }
-    const messages = rows.map(rowToMessage);
+    const messages = rows.map((row) => rowToMessage(row, storeId));
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : asCursor(since ?? '0');
-    return { messages, nextCursor };
+    return {
+      messages,
+      nextCursor: last?.cursor ?? mintCursor(storeId, resumeAfter ?? 0n),
+    };
   }
 
   /**
-   * True if a validated (`^\d+$`) `since` cursor points past this DB's AUTOINCREMENT high-water
-   * mark — i.e. it references a rowid this database lifetime has never minted, so it was minted
-   * against a previous DB (a recreated file, or `:memory:` which is a brand-new DB every process).
-   * Such a cursor must NOT drive an `id > since` query or it silently skips every post after the
-   * reset (BUG-23). `sqlite_sequence.seq` holds the largest rowid ever assigned (absent → 0). The
-   * BigInt compare avoids the >2^53 rounding a Number() coercion would introduce (BUG-40).
+   * The rowid a `since` cursor resumes strictly after. A cursor carrying a different store id —
+   * a recreated file, a `:memory:` process, another backend's numeric cursor reaching this plugin
+   * through mis-namespaced read-state — resumes from 0 and replays the topic, because its rowids
+   * name nothing in this store and `id > <foreign>` would silently drop everything below it. So
+   * does a cursor of this store that sits above the `AUTOINCREMENT` high-water mark, which is what
+   * a restore from an older backup produces.
    */
-  private isStaleCursor(since: string): boolean {
+  private resumeAfter(since: Cursor, topic: Topic): bigint {
+    const parsed = parseCursor(since);
+    if (parsed === undefined) {
+      throw new Error(
+        `parley-sqlite: malformed cursor '${since}' for topic ${topic} — ` +
+          `expected '<storeId>.<rowid>' minted by this backend`,
+      );
+    }
+    if (parsed.storeId !== this.require(this.storeId)) return 0n;
+    return parsed.rowid > this.highWater() ? 0n : parsed.rowid;
+  }
+
+  private highWater(): bigint {
     const row = this.require(this.seqStmt).get() as { seq: number | bigint } | undefined;
-    const highWater = row === undefined ? 0n : BigInt(row.seq);
-    return BigInt(since) > highWater;
+    return row === undefined ? 0n : BigInt(row.seq);
   }
 
   /**
@@ -237,6 +246,7 @@ export class SqlitePlugin implements BackendPlugin {
    * missed regardless of cadence.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    const storeId = this.require(this.storeId);
     let lastSeen = this.maxId(topic);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
@@ -256,11 +266,14 @@ export class SqlitePlugin implements BackendPlugin {
         for (const row of rows) {
           lastSeen = row.id;
           try {
-            handler(rowToMessage(row));
+            handler(rowToMessage(row, storeId));
           } catch {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }
         }
+        // Keep the immediate reschedule on a full batch, so that POLL_BATCH bounds per-tick work
+        // rather than capping throughput at one batch per poll interval.
+        if (rows.length === POLL_BATCH) delay = 0;
         failures = 0;
         health.state = 'live';
         health.consecutiveFailures = 0;
@@ -332,15 +345,19 @@ export class SqlitePlugin implements BackendPlugin {
   }
 
   /**
-   * Delete rows older than `retention_days`. A lock retries on the next interval, quietly; any
-   * other failure is reported, so a retention policy the process cannot enforce is never silent.
+   * Delete up to {@link PRUNE_BATCH} rows older than `retention_days`, rescheduling itself while
+   * batches come back full. A lock retries on the next interval, quietly; any other failure is
+   * reported, so a retention policy the process cannot enforce is never silent.
    */
   private prune(): void {
-    if (this.retentionDays === undefined || this.driver === undefined) return;
+    if (this.retentionDays === undefined || this.driver === undefined || this.stopped) return;
     try {
-      const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
-      this.require(this.pruneStmt).run(cutoff);
+      const cutoff = retentionCutoff(this.retentionDays);
+      const info = this.require(this.pruneStmt).run(cutoff, PRUNE_BATCH);
       this.pruneFailures = 0;
+      if (Number(info.changes) >= PRUNE_BATCH) {
+        this.pruneBatchTimer = setTimeout(() => this.prune(), 0).unref();
+      }
     } catch (e) {
       if (classifyDbError(e) === 'lock') return;
       this.pruneFailures++;
@@ -439,19 +456,84 @@ export function validateBackendConfig(config: BackendConfig): SqliteBackendConfi
     throw bad('retention_days', `expected a finite number, got ${describe(retention)}`);
   }
 
+  if (typeof retention === 'number') retentionCutoff(retention);
+
   return cfg as SqliteBackendConfig;
+}
+
+/**
+ * Rows with `ts` below this are outside the retention window. Throw rather than return a sentinel
+ * on an unrepresentable cutoff, so that a bogus window can never become a string that sorts below
+ * every ISO timestamp and prunes the entire store.
+ */
+function retentionCutoff(retentionDays: number): string {
+  const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
+  if (Number.isNaN(cutoff.getTime())) {
+    throw bad(
+      'retention_days',
+      `${describe(retentionDays)} puts the cutoff outside the representable date range, so every ` +
+        `prune would fail and the window would never be enforced`,
+    );
+  }
+  return cutoff.toISOString();
 }
 
 function describe(v: unknown): string {
   return typeof v === 'string' ? `'${v}'` : String(v);
 }
 
-function rowToMessage(row: MessageRow): Message {
+/**
+ * A cursor is `<storeId>.<rowid>`. A bare `<rowid>` parses with no store id — this backend before
+ * cursors carried identity, or another backend's numeric cursor — and names nothing here, so
+ * `resumeAfter` replays instead of trusting it.
+ */
+const CURSOR_RE = /^(?:([0-9a-f]{16})\.)?(\d+)$/;
+
+function parseCursor(raw: string): { storeId?: string; rowid: bigint } | undefined {
+  const m = CURSOR_RE.exec(raw);
+  if (m === null) return undefined;
+  return { storeId: m[1], rowid: BigInt(m[2] ?? '0') };
+}
+
+function mintCursor(storeId: string, rowid: number | bigint): Cursor {
+  return asCursor(`${storeId}.${rowid}`);
+}
+
+/**
+ * This store's identity, minted once and persisted. `INSERT OR IGNORE` then read back, so that
+ * two bridge processes racing a brand-new file agree on whichever id landed first.
+ */
+function readOrMintStoreId(driver: SqlDriver): string {
+  driver
+    .prepare('INSERT OR IGNORE INTO parley_meta (key, value) VALUES (?, ?)')
+    .run(STORE_ID_KEY, randomBytes(8).toString('hex'));
+  const row = driver.prepare('SELECT value FROM parley_meta WHERE key = ?').get(STORE_ID_KEY) as
+    | { value: string }
+    | undefined;
+  if (row === undefined) {
+    throw new Error('parley-sqlite: could not establish a store id in parley_meta');
+  }
+  return row.value;
+}
+
+function normalizeLimit(limit: number | undefined, topic: Topic): number {
+  if (limit === undefined) return DEFAULT_PAGE;
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(
+      `parley-sqlite: invalid limit ${describe(limit)} for topic ${topic} — expected an integer ` +
+        `>= 1 (SQLite reads a negative LIMIT as "no limit")`,
+    );
+  }
+  return Math.min(limit, MAX_PAGE);
+}
+
+function rowToMessage(row: MessageRow, storeId: string): Message {
   return buildMessage({
     topic: asTopic(row.topic),
     sender: row.sender,
     content: row.content,
     timestamp: row.ts,
     id: String(row.id),
+    cursor: mintCursor(storeId, row.id),
   });
 }

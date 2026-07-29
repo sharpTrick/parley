@@ -11,20 +11,36 @@ The **seam-proving reference backend** for [Parley](../../README.md) — zero-in
 |---|---|
 | topic | `topic` column value; one shared `messages` table, filtered per query |
 | `post` | `INSERT INTO messages (topic, sender, content, ts, in_reply_to)` → `lastInsertRowid` |
-| cursor / backendMsgId | the row `id` (`AUTOINCREMENT`) — monotonic and unique per topic |
+| backendMsgId | the row `id` (`AUTOINCREMENT`) — unique, never reused |
+| cursor | `<storeId>.<rowid>` — the row id prefixed with this store's identity (`parley_meta.store_id`); opaque to core |
 | `fetchRecent({since})` | `SELECT ... WHERE topic = ? AND id > ? ORDER BY id ASC` (exclusive); no `since` → last-`limit` window, reversed to ascending |
-| `subscribe` | a per-topic **poll loop**: `SELECT ... WHERE id > :lastSeen` every `poll_interval_ms`, advancing `lastSeen` |
+| `subscribe` | a per-topic **poll loop**: `SELECT ... WHERE id > :lastSeen` every `poll_interval_ms`, advancing `lastSeen`; a tick that fills its batch drains again at once rather than waiting the interval |
 | `resolveIdentity` | string convention (handle = backendRef) — local backend, not a provisioned account |
 
 There's no real event source to block on, so `subscribe` polls. The cursor makes this fully
 correct regardless of cadence — `poll_interval_ms` is a pure latency/cost knob, never a
-correctness concern.
+correctness concern and never a throughput ceiling.
 
-A `since` cursor that points past the database's high-water mark (one minted before the file was
-recreated, or by a previous `:memory:` process) **replays that topic from its first row** rather
-than binding `id > <stale>` and returning nothing. Catch-up therefore self-heals after a reset
-without skipping messages, whether or not the topic is empty — but clearing core's persisted
-read-state when you reset the DB is still the right operational step.
+### Cursors carry the store's identity
+
+Core's read-state outlives the database, so a `since` cursor can name a store that no longer
+exists — a recreated file, a previous `:memory:` process, or another backend's numeric cursor
+arriving through mis-namespaced read-state. Each store mints a random id at first open and prefixes
+every cursor with it, so a cursor from anywhere else is recognised as foreign and **replays that
+topic from its first row** instead of binding `id > <foreign rowid>` and skipping everything below
+it. The same holds for a cursor of this store that sits above the `AUTOINCREMENT` high-water mark,
+which is what restoring from an older backup produces. Catch-up therefore self-heals after a reset
+without skipping messages, whether or not the topic is empty — clearing core's persisted read-state
+on a reset is still tidier, but no longer load-bearing.
+
+A cursor of no recognisable shape (a Matrix-style `s123_456`, an empty string) is rejected with an
+error naming it, rather than absorbed as "matches nothing" — absorbing it would wedge the topic's
+catch-up forever instead of costing one page.
+
+**Page size.** `fetchRecent` caps `limit` at 1000 rows per page; `limit` values below 1, or
+non-integers, are rejected outright (SQLite reads a negative `LIMIT` as *no* limit). The driver is
+synchronous and `limit` reaches it from model-supplied tool arguments, so an unbounded page would
+stall the whole bridge. Page to exhaustion for more.
 
 ### When the database goes away under a live subscription
 
@@ -32,13 +48,17 @@ A poll tick that fails is classified, not blanket-retried. Lock contention (`SQL
 `SQLITE_LOCKED`) retries silently. Anything that can heal — I/O errors, a read-only remount, a
 full disk, a file briefly unopenable while a backup swaps it — is logged, then the loop **backs
 off exponentially (to 30 s) and keeps probing**, so the topic resumes delivering by itself. Only
-unrecoverable damage (a corrupt file, a dropped table) stops the loop. Because stderr is routinely
-discarded by an MCP stdio host, the state is also readable programmatically:
+unrecoverable damage (a corrupt file, a dropped table) stops the loop. An **embedder** — code that
+constructs `SqlitePlugin` itself — can read that state programmatically:
 
 ```ts
 plugin.subscriptionHealth();
 // [{ topic: 'ctx', state: 'live' | 'degraded' | 'stopped', consecutiveFailures, lastError }]
 ```
+
+Under the shipped `parley-sqlite` CLI there is no route for it: the seam has no plugin-specific
+method, so **stderr is the only signal a deployed bridge emits** — capture it. Surfacing subscription
+health above the seam needs a core-owned path and is not something this plugin can add alone.
 
 The retention prune reports failures the same way (quiet for lock contention, a rate-limited
 stderr line otherwise), so a retention policy the process cannot enforce is never silent.
@@ -66,7 +86,7 @@ fast with the offending key in the message rather than being absorbed:
 |---|---|---|
 | `db_path` | any non-empty string | `""`, non-strings |
 | `poll_interval_ms` | integer `10` … `2147483647` | `0` (a hot loop), negatives, fractions, values above the `setTimeout` ceiling (Node silently clamps those to 1 ms) |
-| `retention_days` | any number `> 0` | `0` and negatives — **not** "disabled"; they would delete the entire history. Omit the key for "keep forever" |
+| `retention_days` | any number `> 0` whose cutoff is a representable date | `0` and negatives — **not** "disabled"; they would delete the entire history. Omit the key for "keep forever". Also rejected: values so large the cutoff falls outside the representable date range, which would be accepted and then silently never enforced |
 
 Unknown keys are rejected too, so `retention_day: 30` is a startup error rather than a silent
 no-op.
@@ -81,6 +101,10 @@ minted before a prune stays valid — a reader that's been offline longer than t
 fewer rows back on catch-up, never a wrong or duplicate one. There's no error or signal for "this
 much history is gone"; it's a silent trim, so treat `retention_days` as "how much history do I
 actually want to keep," not just a storage-cap safety valve.
+
+The prune resolves its window through an index on `ts` and deletes in bounded batches, yielding
+between them — enabling retention on a large existing store must not hold the file's single write
+lock (or the event loop) long enough to push a peer bridge's `post()` past its `busy_timeout`.
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same file)
 
@@ -109,6 +133,14 @@ Every connection opens with `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = 
 `post` from another bridge instance retries instead of erroring. This is what makes multiple
 bridge processes writing the same file (or the conformance suite's `concurrentPost` check) safe.
 
+`synchronous = NORMAL` buys that throughput at a stated price: in WAL mode a transaction that has
+already committed **can be lost on power loss or an OS crash** before the next checkpoint (the file
+itself is never corrupted — this is a durability trade, not an integrity one). So a `post()` can
+return a `backendMsgId`, the agent can report the hand-off as delivered, and that message can be
+gone after an unclean shutdown, with the poster's read-state already advanced past it. `FULL` is
+not offered as a knob; if you need commit-level durability, this backend is the wrong one for that
+deployment.
+
 The store is created `0600` (the file is claimed at that mode *before* the driver opens it, so it
 is never briefly world-readable) and its `-wal`/`-shm` sidecars are narrowed to match. A store
 found wider than `0600` is tightened with a line on stderr naming it; if it cannot be tightened —
@@ -127,7 +159,13 @@ npm install && npm run build
 parley-sqlite --config parley.config.yaml
 # or: node packages/bridge-sqlite/dist/cli.js --config parley.config.yaml
 # or: PARLEY_CONFIG=parley.config.yaml parley-sqlite
+parley-sqlite --help      # also --version
 ```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** instead of falling back to
+the default `parley.config.yaml`, since that default names a different deployment's store, handle
+and topic allowlist.
 
 It's a stdio MCP server — stdout is the JSON-RPC channel, all diagnostics go to stderr. See the
 [root README quickstart](../../README.md#quickstart-v01-local-sqlite--claude-code) for wiring it
@@ -142,7 +180,9 @@ npx vitest run packages/bridge-sqlite
 ```
 
 No external service required — this is the only backend with no `docker`/`dev-compose`
-dependency. The shared `@sharptrick/parley-conformance` suite runs against a scratch database,
+dependency, and no prior `npm run build` either: the one test that executes the compiled
+entrypoint (`src/cli.test.ts`) builds it first if `dist/` is missing or older than `src/`, so it
+can never grade a stale artifact. The shared `@sharptrick/parley-conformance` suite runs against a scratch database,
 including the `concurrentPost` check: forked OS processes (`src/concurrent-writer.mjs`) write the
 same file while the plugin's own `post()` writes into it, so the shipped write path is one of the
 contending processes rather than a spectator.

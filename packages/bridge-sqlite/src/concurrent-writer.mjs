@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS messages (
   in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic, id);
+CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+CREATE TABLE IF NOT EXISTS parley_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `);
 const stmt = db.prepare(
   'INSERT INTO messages (topic, sender, content, ts, in_reply_to) VALUES (?, ?, ?, ?, ?)',

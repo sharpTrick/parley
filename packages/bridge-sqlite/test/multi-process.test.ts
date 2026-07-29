@@ -1,5 +1,5 @@
 import { fork } from 'node:child_process';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,13 +42,21 @@ afterEach(async () => {
   open = [];
 });
 
-describe('driver pragmas are observable, not just set', () => {
-  const PRAGMAS = [
-    { name: 'journal_mode', expected: 'wal' },
-    { name: 'busy_timeout', expected: 5000 },
-    { name: 'synchronous', expected: 1 },
-  ];
+/**
+ * Every pragma the driver sets buys a property and costs one. A pragma listed under
+ * "cross-process safety" whose cost goes unstated reads as free — `synchronous = NORMAL` is the
+ * live example: a committed post can be lost on power loss, in the store DESIGN calls the durable
+ * source of truth. Each entry therefore carries the consequence its README line has to state.
+ */
+const PRAGMAS = [
+  { name: 'journal_mode', expected: 'wal', consequence: /readers never block the writer/i },
+  { name: 'busy_timeout', expected: 5000, consequence: /retries instead of erroring/i },
+  { name: 'synchronous', expected: 1, consequence: /lost on power loss/i },
+];
 
+const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
+
+describe('driver pragmas are observable, not just set', () => {
   for (const p of PRAGMAS) {
     it(`${p.name} reads back as ${String(p.expected)} on a driver-opened DB`, () => {
       const path = join(dir(), 'p.db');
@@ -57,6 +65,11 @@ describe('driver pragmas are observable, not just set', () => {
       const value = Object.values(row)[0];
       expect(typeof value === 'string' ? value.toLowerCase() : value).toBe(p.expected);
       d.close();
+    });
+
+    it(`${p.name} is documented with its consequence, not just its name`, () => {
+      expect(README).toContain(p.name);
+      expect(README).toMatch(p.consequence);
     });
   }
 

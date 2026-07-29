@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asCursor, asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
@@ -6,27 +6,59 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { SqlitePlugin } from '../src/index.js';
 
 /**
- * A `since` cursor minted against a previous DB lifetime (recreated file, `:memory:`) points past
- * this DB's high-water mark. Whatever the guard does with it, catch-up must still be lossless:
- * paging from the stale fetch onward has to yield the whole topic, in order, with no gap — and the
- * answer must not depend on how the topic's size compares to `limit`.
+ * Core's read-state outlives the database, so `since` can name a store that no longer exists: a
+ * recreated file, a `:memory:` process, or another backend's numeric cursor arriving through
+ * mis-namespaced read-state. Every such cursor must REPLAY the topic — the one thing it must never
+ * do is bind `id > <foreign rowid>` and skip whatever sits below it, silently, behind a
+ * `nextCursor` that claims those messages were read.
  */
 
 const me = asHandle('alice');
-const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-cursor-')), 'p.db');
+const T = asTopic('ctx');
 
 let open: SqlitePlugin[] = [];
-async function plugin(): Promise<SqlitePlugin> {
+let dirs: string[] = [];
+
+function dbPath(): string {
+  const d = mkdtempSync(join(tmpdir(), 'parley-cursor-'));
+  dirs.push(d);
+  return join(d, 'p.db');
+}
+
+async function plugin(path = dbPath()): Promise<SqlitePlugin> {
   const p = new SqlitePlugin();
-  await p.connect({ db_path: dbFile(), poll_interval_ms: 20 });
+  await p.connect({ db_path: path, poll_interval_ms: 20 });
   open.push(p);
   return p;
 }
+
 afterEach(async () => {
   await Promise.all(open.map((p) => p.disconnect()));
   open = [];
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  dirs = [];
 });
 
+/** Wipe the database file and its sidecars, then reopen the same path — a store reset. */
+async function reset(p: SqlitePlugin, path: string): Promise<SqlitePlugin> {
+  await p.disconnect();
+  open = open.filter((o) => o !== p);
+  for (const f of [path, `${path}-wal`, `${path}-shm`]) rmSync(f, { force: true });
+  return plugin(path);
+}
+
+async function fill(p: SqlitePlugin, topic: Topic, contents: string[]): Promise<void> {
+  for (const c of contents) await p.post(topic, me, c);
+}
+
+async function storeIdOf(p: SqlitePlugin): Promise<string> {
+  const probe = asTopic('store-id-probe');
+  await p.post(probe, me, 'probe');
+  const { nextCursor } = await p.fetchRecent({ topic: probe });
+  return nextCursor.split('.')[0]!;
+}
+
+/** Page from `since` to exhaustion — what catch-up as a whole surfaces, not one page of it. */
 async function drainFrom(
   p: SqlitePlugin,
   topic: Topic,
@@ -48,46 +80,125 @@ async function drainFrom(
   throw new Error('paging did not terminate');
 }
 
-const LIMITS = [1, 3, 50];
+function expectStrictlyIncreasing(cursors: string[]): void {
+  const ids = cursors.map((c) => Number(c.split('.').at(-1)));
+  expect(ids.some(Number.isNaN)).toBe(false);
+  expect(ids).toEqual([...ids].sort((a, b) => a - b));
+  expect(new Set(ids).size).toBe(ids.length);
+}
 
-describe('stale-cursor catch-up is lossless for every (rows, limit)', () => {
-  for (const limit of LIMITS) {
-    for (const rows of [0, 1, limit - 1, limit, limit + 1, 3 * limit]) {
-      if (rows < 0) continue;
-      it(`limit ${limit}, ${rows} rows in the topic`, async () => {
-        const p = await plugin();
-        const t = asTopic(`t-${limit}-${rows}`);
-        const expected = Array.from({ length: rows }, (_u, i) => `m${i + 1}`);
-        for (const c of expected) await p.post(t, me, c);
-        // Another topic keeps the DB's high-water mark alive even when `t` is empty, so the
-        // empty-topic and populated-topic paths get the same kind of stale cursor.
-        await p.post(asTopic('other'), me, 'noise');
+/**
+ * Well-formed cursors belonging to some other store. The rowids straddle a 7-row topic's
+ * high-water mark on purpose: a foreign cursor BELOW that mark is exactly the one a high-water
+ * heuristic mistakes for its own and quietly resumes after.
+ */
+const FOREIGN_CURSORS: Array<{ name: string; make: (otherStoreId: string) => string }> = [
+  { name: 'a bare rowid below the high-water mark (nats seq, postgres bigserial)', make: () => '3' },
+  { name: 'a bare rowid at the high-water mark', make: () => '7' },
+  { name: 'a bare rowid above the high-water mark', make: () => '10000' },
+  { name: 'a telegram-sized bare id', make: () => '123456789' },
+  { name: 'another store’s cursor, low rowid', make: (other) => `${other}.2` },
+  { name: 'another store’s cursor, high rowid', make: (other) => `${other}.99999` },
+];
 
-        const stale = asCursor(String(10_000 + rows));
-        const drained = await drainFrom(p, t, stale, limit);
+describe('a cursor from another store replays the topic instead of skipping it', () => {
+  for (const shape of FOREIGN_CURSORS) {
+    it(shape.name, async () => {
+      const expected = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
+      const p = await plugin();
+      await fill(p, T, expected);
+      const otherStoreId = await storeIdOf(await plugin());
+
+      const drained = await drainFrom(p, T, asCursor(shape.make(otherStoreId)), 3);
+      expect(drained.contents).toEqual(expected);
+      expectStrictlyIncreasing(drained.cursors);
+    });
+  }
+
+  it('a cursor this store minted is still exclusive, not replayed', async () => {
+    const p = await plugin();
+    await fill(p, T, ['m0', 'm1', 'm2']);
+    const { messages } = await p.fetchRecent({ topic: T });
+    const afterFirst = await p.fetchRecent({ topic: T, since: messages[0]!.cursor });
+    expect(afterFirst.messages.map((m) => m.content)).toEqual(['m1', 'm2']);
+    expect(afterFirst.nextCursor).toBe(messages[2]!.cursor);
+  });
+});
+
+const SIZES = [0, 1, 5, 50];
+
+describe('catch-up across a real store reset loses nothing', () => {
+  for (const before of SIZES) {
+    for (const after of SIZES) {
+      it(`${before} rows before the reset, ${after} rows after`, async () => {
+        const path = dbPath();
+        const old = await plugin(path);
+        await fill(old, T, Array.from({ length: before }, (_u, i) => `old-${i}`));
+        const staleCursor = (await old.fetchRecent({ topic: T, limit: 500 })).nextCursor;
+
+        const fresh = await reset(old, path);
+        const expected = Array.from({ length: after }, (_u, i) => `new-${i}`);
+        await fill(fresh, T, expected);
+
+        const drained = await drainFrom(fresh, T, staleCursor, 3);
         expect(drained.contents).toEqual(expected);
-        // Cursors stay strictly increasing across pages — no repeats, no backtracking.
-        const ids = drained.cursors.map((c) => Number(c));
-        expect(ids).toEqual([...ids].sort((a, b) => a - b));
-        expect(new Set(ids).size).toBe(ids.length);
+        expectStrictlyIncreasing(drained.cursors);
       });
     }
   }
+});
 
-  it('an empty topic and a populated one answer a stale cursor the same way', async () => {
+describe('replay pages losslessly at every limit', () => {
+  for (const limit of [1, 2, 5, 50]) {
+    it(`limit ${limit}`, async () => {
+      const expected = Array.from({ length: 7 }, (_u, i) => `m${i}`);
+      const p = await plugin();
+      await fill(p, T, expected);
+      const drained = await drainFrom(p, T, asCursor('4'), limit);
+      expect(drained.contents).toEqual(expected);
+      expectStrictlyIncreasing(drained.cursors);
+    });
+  }
+
+  it('an empty topic answers a foreign cursor with a replayable cursor of this store', async () => {
     const p = await plugin();
+    await fill(p, asTopic('other'), ['noise']);
     const empty = asTopic('empty');
-    const full = asTopic('full');
-    for (let i = 0; i < 5; i++) await p.post(full, me, `m${i}`);
 
-    const stale = asCursor('99999');
-    const emptyRes = await p.fetchRecent({ topic: empty, since: stale, limit: 2 });
-    expect(emptyRes.messages).toEqual([]);
-    expect(emptyRes.nextCursor).toBe('0');
+    const first = await p.fetchRecent({ topic: empty, since: asCursor('99999'), limit: 2 });
+    expect(first.messages).toEqual([]);
+    expect(first.nextCursor).toBe(`${await storeIdOf(p)}.0`);
 
-    // The populated topic replays from the same origin rather than jumping to its tail: the first
-    // page starts at the topic's very first message.
-    const fullRes = await p.fetchRecent({ topic: full, since: stale, limit: 2 });
-    expect(fullRes.messages.map((m) => m.content)).toEqual(['m0', 'm1']);
+    const again = await p.fetchRecent({ topic: empty, since: first.nextCursor, limit: 2 });
+    expect(again.messages).toEqual([]);
+    expect(again.nextCursor).toBe(first.nextCursor);
   });
+});
+
+/**
+ * A cursor whose shape this backend cannot place at all must throw. Absorbing it would bind SQL
+ * NULL, match zero rows with no error, and re-echo itself as `nextCursor` — wedging the topic
+ * forever rather than losing one page.
+ */
+const MALFORMED_CURSORS = [
+  '',
+  's123_456',
+  'abc.5',
+  'zzzzzzzzzzzzzzzz.1',
+  '1.2.3',
+  '-1',
+  '1e3',
+  '5 ',
+];
+
+describe('a malformed cursor throws instead of silently matching nothing', () => {
+  for (const since of MALFORMED_CURSORS) {
+    it(`rejects ${JSON.stringify(since)}`, async () => {
+      const p = await plugin();
+      await fill(p, T, ['a', 'b']);
+      await expect(p.fetchRecent({ topic: T, since: asCursor(since) })).rejects.toThrow(
+        /parley-sqlite: malformed cursor/,
+      );
+    });
+  }
 });
