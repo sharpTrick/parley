@@ -20,7 +20,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive); no `since` → empty `<before/>` = last page; pages forward up to `limit` |
 | `subscribe` | every reflected groupchat `<message>` carrying a room `<stanza-id>` → `handler` (incl. own posts), in archive order |
 | `resolveIdentity` | string convention (handle = backendRef) |
-| sender | the occupant nick (resource of `room@svc/nick`) |
+| sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
 | timestamp | `<delay stamp>` from MAM forwarded messages if present, else now (informational only) |
 
 Archive ids are not lexically comparable, but core never compares cursors — the server's RSM
@@ -33,14 +33,29 @@ serves this natively via a live MUC wait plus a MAM reconcile (with an archival-
 caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return
 catch-up semantics.
 
-> **`post`'s `identity` argument (your config's `identity.handle`) is not used.** The sender is the
-> MUC occupant nick — see "Multiple concurrent sessions" for why this is usually fine, but not
-> always.
+> **`post`'s `identity` argument (your config's `identity.handle`) becomes the MUC occupant nick.**
+> The sender of every archived message is that nick, and it is the key core's `parley_list_users`
+> roster is built on — so unless you pin `nick` yourself, the first `post` takes `identity.handle`
+> as this connection's nick and the bridge keeps one stable identity across restarts. See
+> "Multiple concurrent sessions".
 
 ### Notes / caveats
 
-- **MAM is mandatory.** Without `mod_mam` + `mod_muc_mam` (Prosody) / `mod_mam` (ejabberd) the
-  room has no archive and `fetchRecent` returns nothing. This backend's catch-up is MAM.
+- **MAM is mandatory, and checked.** Without `mod_mam` + `mod_muc_mam` (Prosody) / `mod_mam`
+  (ejabberd) the room has no archive — and since the archive id is also the cursor and the
+  post-reflection correlator, a MAM-less server makes `post` unresolvable and `subscribe` a silent
+  no-op. The plugin therefore probes the room's `disco#info` for `urn:xmpp:mam:2` on its first join
+  and fails every seam call with an error naming the modules to enable, rather than timing out. A
+  server that answers disco but does not actually archive is caught on the next round trip: a
+  reflection with no `<stanza-id>`, or a MAM query answered `service-unavailable` /
+  `feature-not-implemented`, is reported the same way.
+- **Occupancy is rebuilt however it is lost.** A reconnect is only one way this connection stops
+  being an occupant: a kick (307), a ban (301), an affiliation change (321), a members-only switch
+  (322), a MUC service shutdown (332), a room destroy, and a component restart that simply forgets
+  us all end occupancy with the stream still up. The plugin watches for its own
+  `<presence type='unavailable'>` (a nick change, status 303, excluded) and for a post bounced as
+  "not an occupant", drops the room from its join cache, and re-joins subscribed rooms immediately
+  — catch-up-only rooms re-join on their next seam call.
 - **Room lifetime = durability, and occupancy is not durable.** A *non-persistent* MUC room and
   its whole MAM archive are destroyed the moment the last occupant leaves — and occupancy is
   presence on one stream, so it ends at every disconnect, not only at shutdown: a network blip, a
@@ -62,10 +77,15 @@ catch-up semantics.
 - **Content must be XML-legal.** XMPP is one long-lived XML document: a codepoint XML 1.0 forbids
   (a C0 control other than tab/newline/CR, a lone surrogate, U+FFFE/U+FFFF) is not a rejected
   message but the end of the stream, taking occupancy of every room on the connection with it.
-  `post` therefore refuses such content up front, with an error naming the offending codepoint,
-  rather than putting it on the wire.
-- **Unique nick per connection.** MUC nicks must be unique per room, so each connection defaults to
-  a random nick; concurrent writers can share a room without collision.
+  Every caller string this plugin serialises — `post` content, the `since` cursor, `nick`,
+  `muc_service`, `domain`, `username` — is refused up front with an error naming the offending
+  codepoint, rather than put on the wire. (`topic` and `identity` are folded to a legal charset
+  instead, injectively, so they cannot collide.)
+- **One nick per logical identity.** The occupant nick is `identity.handle`, folded to the JID
+  resource charset. Two sessions with different handles therefore get different senders on a shared
+  account; two with the same handle are the same sender, which is what "same handle" means. If the
+  nick is already taken by someone else in the room, the plugin logs a loud error and keeps posting
+  under its provisional nick — pin `nick` to a free name to resolve it permanently.
 
 ## Config (`backend_config`)
 
@@ -76,7 +96,8 @@ backend_config:
   muc_service: "muc.parley.local"    # default (rooms live here)
   username: "parley"                 # default
   password: "parleypass"             # default — keep secrets in .env, never commit
-  # nick: optional; defaults to a unique per-connection value
+  # nick: optional; defaults to identity.handle (see "Multiple concurrent sessions")
+  # mam_page: 200                    # default; RSM page size for catch-up paging
 ```
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same server)
@@ -87,21 +108,20 @@ across every one of them; `username`/`password` should usually match too, **but 
 field that must NOT, if you set it at all**:
 
 - **`service` / `domain` / `muc_service`** — the obvious ones.
-- **`username` / `password`** — as noted above, `post()` ignores the seam's `identity`, so the
-  actual sender is the MUC nick, not `identity.handle`. Unlike Matrix, though, sharing one XMPP
-  account across sessions is usually **fine**: leaving `nick` unset (the default) auto-generates a
-  random nick per connection, so every session still gets its own distinct sender for free even
-  with the same login.
-- **`nick` — must be unique per concurrent session if you set it, and nothing enforces that for
-  you.** MUC's unique-nickname rule is scoped to the *bare JID*: two sessions on the **same**
-  account (what the configs above recommend) can occupy one room under one pinned nick from two
-  resources, with **no error at any point** — both join, both post, and every message from both
-  is attributed to that single nick. It is a silent split, exactly like the other divergences on
-  this page. A loud `conflict` error only appears when the two sessions use **different** accounts.
-  Leave `nick` unset unless you need stable names, and if you do set it, give each session its own.
+- **`username` / `password`** — sharing one XMPP account across sessions is **fine**, unlike
+  Matrix. The sender is the MUC nick, not the login, and with `nick` unset each session takes its
+  own `identity.handle` as its nick — so distinct sessions stay distinct senders on one account,
+  and each keeps the same sender across restarts.
+- **`nick` — leave it unset.** Set, it must be unique per concurrent session and nothing enforces
+  that for you: MUC's unique-nickname rule is scoped to the *bare JID*, so two sessions on the
+  **same** account can occupy one room under one pinned nick from two resources with **no error at
+  any point** — both join, both post, and every message from both is attributed to that single
+  nick. A loud `conflict` error only appears when the two sessions use **different** accounts. The
+  same silent merge happens if you give two sessions the same `identity.handle`, which is the
+  honest reading of that config: they are one identity.
 
 Runnable multi-config examples (two Code sessions + a remote/chat config, sharing one XMPP account
-with auto-generated nicks): [`examples/multi-session/xmpp`](../../examples/multi-session/README.md).
+with per-handle nicks): [`examples/multi-session/xmpp`](../../examples/multi-session/README.md).
 
 ## Retention (server-side, not configured by this plugin)
 

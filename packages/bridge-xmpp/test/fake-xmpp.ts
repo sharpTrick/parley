@@ -9,6 +9,7 @@ const NS_SID = 'urn:xmpp:sid:0';
 const NS_FORWARD = 'urn:xmpp:forward:0';
 const NS_RSM = 'http://jabber.org/protocol/rsm';
 const NS_STANZAS = 'urn:ietf:params:xml:ns:xmpp-stanzas';
+const NS_DISCO_INFO = 'http://jabber.org/protocol/disco#info';
 
 export interface El {
   name: string;
@@ -28,6 +29,9 @@ export interface ArchiveItem {
 /** The plugin's private surface, reached by typed cast (the pattern the other suites use). */
 export interface XmppPrivate {
   nick: string;
+  mamPage: number;
+  nickAdoption?: Promise<void>;
+  mamCheck?: Promise<void>;
   stopped: boolean;
   xmpp?: unknown;
   joined: Map<string, Promise<void>>;
@@ -102,16 +106,45 @@ export class FakeXmpp {
   joinErrorCondition = 'conflict';
   joinErrorText = '';
 
+  /** Whether a room's disco#info advertises `urn:xmpp:mam:2` (i.e. muc_mam is loaded). */
+  discoMam = true;
+  /** Whether the MUC stamps its reflections with a room `<stanza-id>` (i.e. the archive ran). */
+  reflectStanzaId = true;
+  /** When set, every MAM IQ is answered with this stanza error condition instead of a `<fin/>`. */
+  mamIqError?: string;
+  /** Bounce a post to a room this connection is not currently an occupant of, as a MUC does. */
+  enforceOccupancy = false;
+
   /** The occupant nick the plugin joined with; a reflection must come back from it. */
   nick = 'parley-test';
   /** Enforce XML well-formedness on everything sent, as a real XMPP server does. */
   strictXml = true;
 
   private readonly handlers: Record<string, Array<(a?: unknown) => void>> = {};
+  private readonly occupied = new Set<string>();
   private seq = 0;
   private dead = false;
 
-  readonly iqCaller = { request: (iq: unknown): Promise<unknown> => this.onIq(iq as El) };
+  /** False once a stanza XML forbids has aborted the stream (and every room's archive with it). */
+  get alive(): boolean {
+    return !this.dead;
+  }
+
+  /**
+   * An IQ is a stanza on the same stream as everything else, so it gets the same well-formedness
+   * enforcement `send` does. Keep them symmetric, so that a field serialised only into an IQ
+   * (the RSM `<after>` cursor) cannot be exempt from the check by an accident of the fixture.
+   */
+  readonly iqCaller = {
+    request: (iq: unknown): Promise<unknown> => {
+      if (this.dead) return Promise.reject(new Error('stream closed'));
+      if (this.strictXml && illegalCodepoint(String(iq)) !== undefined) {
+        this.killStream();
+        return Promise.reject(new Error('not-well-formed: stream closed'));
+      }
+      return this.onIq(iq as El);
+    },
+  };
 
   on(event: string, cb: (a?: unknown) => void): void {
     (this.handlers[event] ??= []).push(cb);
@@ -182,6 +215,33 @@ export class FakeXmpp {
     return fresh;
   }
 
+  /**
+   * End this connection's occupancy of `room` the way a server does when it was not the stream
+   * that dropped: a self-directed `<presence type='unavailable'>` carrying the MUC status codes
+   * for a kick/ban/affiliation change, or a `<destroy/>` for a room that is gone.
+   */
+  endOccupancy(room: string, opts: { statuses?: string[]; destroy?: boolean } = {}): void {
+    const statuses = opts.statuses ?? [];
+    if (!statuses.includes('303')) this.occupied.delete(room);
+    const children = [
+      xml('status', { code: '110' }),
+      ...statuses.map((code) => xml('status', { code })),
+      ...(opts.destroy === true ? [xml('destroy', {})] : []),
+    ];
+    this.feed(
+      xml(
+        'presence',
+        { from: `${room}/${this.nick}`, type: 'unavailable' },
+        xml('x', { xmlns: NS_MUC_USER }, ...(children as never[])),
+      ),
+    );
+  }
+
+  /** Drop occupancy with NO presence at all, the way a restarted MUC component forgets it. */
+  forgetOccupancySilently(room: string): void {
+    this.occupied.delete(room);
+  }
+
   /** Reflect a live message that is NOT (yet) in the archive — a spurious long-poll wake. */
   reflectOnly(room: string, body: string, sender = 'someone'): void {
     this.feed(
@@ -199,6 +259,7 @@ export class FakeXmpp {
     this.nick = to.slice(to.indexOf('/') + 1);
     if (this.joinReply === 'silent') return;
     if (this.joinReply === 'error') {
+      this.occupied.delete(to.slice(0, to.indexOf('/')));
       this.feed(
         xml(
           'presence',
@@ -208,6 +269,7 @@ export class FakeXmpp {
       );
       return;
     }
+    this.occupied.add(to.slice(0, to.indexOf('/')));
     this.feed(
       xml(
         'presence',
@@ -222,13 +284,18 @@ export class FakeXmpp {
     const originId = message.getChild('origin-id', NS_SID)?.attrs.id ?? message.attrs.id ?? '';
     const body = message.getChildText('body') ?? '';
     if (this.postReply === 'silent') return;
-    if (this.postReply === 'error') {
+    const notAnOccupant = this.enforceOccupancy && !this.occupied.has(room);
+    if (this.postReply === 'error' || notAnOccupant) {
+      const condition = notAnOccupant ? 'not-acceptable' : this.postErrorCondition;
+      const text = notAnOccupant
+        ? 'You are not currently connected to this chat'
+        : this.postErrorText;
       this.feed(
         xml(
           'message',
           { from: room, type: 'error', id: originId },
           xml('origin-id', { xmlns: NS_SID, id: originId }),
-          errorEl(this.postErrorCondition, this.postErrorText),
+          errorEl(condition, text),
         ),
       );
       return;
@@ -240,14 +307,29 @@ export class FakeXmpp {
         { from: item.from, type: 'groupchat' },
         xml('body', {}, body),
         xml('origin-id', { xmlns: NS_SID, id: originId }),
-        xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
+        ...(this.reflectStanzaId
+          ? [xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId })]
+          : []),
       ),
     );
   }
 
   private async onIq(iq: El): Promise<unknown> {
+    if (iq.getChild('query', NS_DISCO_INFO) !== undefined) {
+      return xml(
+        'iq',
+        { type: 'result' },
+        xml(
+          'query',
+          { xmlns: NS_DISCO_INFO },
+          xml('feature', { var: 'http://jabber.org/protocol/muc' }),
+          ...(this.discoMam ? [xml('feature', { var: NS_MAM })] : []),
+        ),
+      );
+    }
     const query = iq.getChild('query', NS_MAM);
     if (query === undefined) return xml('iq', { type: 'result' });
+    if (this.mamIqError !== undefined) throw stanzaError(this.mamIqError);
     const room = iq.attrs.to ?? '';
     const queryid = query.attrs.queryid ?? '';
     await this.onMamRequest?.(room);
@@ -293,6 +375,10 @@ export class FakeXmpp {
   }
 }
 
+/** What `@xmpp/iq`'s caller rejects an errored IQ with: an Error carrying the defined condition. */
+const stanzaError = (condition: string): Error =>
+  Object.assign(new Error(condition), { condition });
+
 export const errorEl = (condition: string, text = ''): unknown =>
   xml(
     'error',
@@ -301,11 +387,17 @@ export const errorEl = (condition: string, text = ''): unknown =>
     ...(text !== '' ? [xml('text', { xmlns: NS_STANZAS }, text)] : []),
   );
 
-/** A plugin wired to `fake`, with the MUC handshake for `room` already satisfied. */
+/**
+ * A plugin wired to `fake`, with the MUC handshake for `room` already satisfied. The occupant nick
+ * is assigned here, so it is also PINNED here — otherwise the first `post` would take its
+ * `identity` argument as the nick and this fixture's `fake.nick` would be a lie one stanza later.
+ * Suites about nick adoption drive `connect()` instead.
+ */
 export const attach = (plugin: XmppPlugin, fake: FakeXmpp, room?: string): XmppPrivate => {
   const p = priv(plugin);
   p.xmpp = fake;
   p.nick = fake.nick;
+  p.nickAdoption = Promise.resolve();
   fake.on('stanza', (stanza) => p.onStanza(stanza)); // the wiring connect() does
   if (room !== undefined) p.joined.set(room, Promise.resolve());
   return p;

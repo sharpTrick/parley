@@ -57,7 +57,18 @@ const makeFakeClient = (): FakeClient => {
       sent.push(el as Stanza);
       return undefined;
     },
-    iqCaller: { request: async () => xml('iq', { type: 'result' }) },
+    iqCaller: {
+      request: async () =>
+        xml(
+          'iq',
+          { type: 'result' },
+          xml(
+            'query',
+            { xmlns: 'http://jabber.org/protocol/disco#info' },
+            xml('feature', { var: 'urn:xmpp:mam:2' }),
+          ),
+        ),
+    },
     jid: { toString: () => 'parley@parley.local/r' },
   };
 };

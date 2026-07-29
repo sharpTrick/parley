@@ -126,28 +126,59 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
     await plugin.disconnect();
   });
 
-  it('returns as soon as the archive catches up after a live wake (MAM lag)', async () => {
-    const plugin = new XmppPlugin();
-    const fake = new FakeXmpp();
-    const p = attach(plugin, fake);
-    const room = p.roomJid(TOPIC);
-    p.joined.set(room, Promise.resolve());
-    const seed = fake.archiveOnly(room, 'old');
+});
 
-    const started = Date.now();
-    const pending = plugin.fetchRecent({
-      topic: TOPIC,
-      since: asCursor(seed.archId),
-      blockMs: 4_000,
-    });
-    // Live copy first, archive commit 120 ms later: the wake alone cannot satisfy the fetch.
-    setTimeout(() => fake.reflectOnly(room, 'lagging'), 30);
-    setTimeout(() => fake.archiveOnly(room, 'lagging'), 150);
-    const res = await pending;
+// Class: a reconciliation window that LATCHES OFF, so a message the archive already holds is
+// withheld until the caller's whole budget expires. The blocking path wakes on the live copy and
+// then re-polls MAM for the archive to catch up; any re-poll allowance that is a fixed count times
+// a fixed interval is a cliff — an archive lag one millisecond past it drops the fetch back to a
+// single park over the entire remaining budget with nothing left to wake it, turning a 200 ms lag
+// into a 60 s empty return. The property is that the wait tracks the LAG, never the budget, so the
+// table crosses the lag axis with two budgets and bounds every row's latency by the lag rather
+// than by blockMs. The single 120 ms case this replaces sat just inside the old window and could
+// not fail.
 
-    expect(res.messages.map((m) => m.content)).toEqual(['lagging']);
-    expect(Date.now() - started).toBeLessThan(1_000);
-    expectNoLeaks(plugin);
-    await plugin.disconnect();
-  });
+const REFLECT_AT_MS = 30;
+/** Round-trip + timer granularity on top of the doubling re-poll's at-most-2x overshoot. */
+const LAG_OVERHEAD_MS = 300;
+
+const lagRows = [400, 3_000].flatMap((blockMs) =>
+  [0, 50, 120, 200, 400, 1_000]
+    .filter((lagMs) => lagMs + LAG_OVERHEAD_MS < blockMs)
+    .map((lagMs) => ({ blockMs, lagMs })),
+);
+
+describe('XMPP long-poll returns on archival lag, bounded by the lag and never by the budget', () => {
+  it.each(lagRows)(
+    'a $lagMs ms archive lag over a $blockMs ms budget',
+    async ({ blockMs, lagMs }) => {
+      const plugin = new XmppPlugin();
+      const fake = new FakeXmpp();
+      const p = attach(plugin, fake);
+      const room = p.roomJid(TOPIC);
+      p.joined.set(room, Promise.resolve());
+      const seed = fake.archiveOnly(room, 'old');
+
+      const started = Date.now();
+      const pending = plugin.fetchRecent({
+        topic: TOPIC,
+        since: asCursor(seed.archId),
+        blockMs,
+      });
+      // The live copy lands first; the archive commits `lagMs` later, so only a re-poll finds it.
+      const timers = [
+        setTimeout(() => fake.reflectOnly(room, 'lagging'), REFLECT_AT_MS),
+        setTimeout(() => fake.archiveOnly(room, 'lagging'), REFLECT_AT_MS + lagMs),
+      ];
+      const res = await pending;
+      const elapsed = Date.now() - started;
+      for (const t of timers) clearTimeout(t);
+
+      expect(res.messages.map((m) => m.content)).toEqual(['lagging']);
+      expect(elapsed).toBeLessThanOrEqual(2 * lagMs + LAG_OVERHEAD_MS);
+      expect(elapsed).toBeLessThan(blockMs * 0.9);
+      expectNoLeaks(plugin);
+      await plugin.disconnect();
+    },
+  );
 });

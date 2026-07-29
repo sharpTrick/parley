@@ -1,6 +1,7 @@
 import {
   asBackendMsgId,
   asCursor,
+  asTopic,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
@@ -31,10 +32,14 @@ export interface XmppBackendConfig {
   /** SASL password. Default `parleypass`. */
   password?: string;
   /**
-   * MUC nickname for this connection. MUST be unique per occupant in a room, so it
-   * defaults to a random per-instance value (concurrent writers each get their own).
+   * MUC nickname for this connection — the sender every archived message reports. Setting it
+   * pins the occupant identity; leaving it unset lets the bridge take its own `identity.handle`
+   * (the first `post`'s argument) as the nick, which is what makes the sender stable across
+   * restarts and keyed the same way core's roster is.
    */
   nick?: string;
+  /** RSM page size for MAM catch-up paging. Default 200. */
+  mam_page?: number;
 }
 
 // XML namespaces (XEP-0045 MUC, XEP-0313 MAM, XEP-0359 SID, XEP-0297 forward, XEP-0203 delay, RSM).
@@ -49,27 +54,44 @@ const NS_MUC_OWNER = 'http://jabber.org/protocol/muc#owner';
 const NS_ROOMCONFIG = 'http://jabber.org/protocol/muc#roomconfig';
 const NS_XDATA = 'jabber:x:data';
 const NS_STANZAS = 'urn:ietf:params:xml:ns:xmpp-stanzas';
+const NS_DISCO_INFO = 'http://jabber.org/protocol/disco#info';
 
 const JOIN_TIMEOUT_MS = 15_000;
 const POST_TIMEOUT_MS = 15_000;
 const MAM_TIMEOUT_MS = 15_000;
-/** Page size for forward MAM paging. */
+const DISCO_TIMEOUT_MS = 5_000;
+/** Default RSM page size for forward MAM paging (`backend_config.mam_page` overrides). */
 const MAM_PAGE = 200;
-/** Cadence of the bounded archival-lag re-poll that follows a live-message wake. */
+/** First archival-lag re-poll interval after a live-message wake; it doubles on each miss. */
 const MAM_LAG_POLL_MS = 50;
-/**
- * How many capped re-polls one live-message wake may buy. The product with
- * {@link MAM_LAG_POLL_MS} is the archival lag the long-poll can absorb; past it the fetch parks
- * again on the live stream, so the query count per blocked fetch is a function of how many
- * messages arrived, never of `blockMs`.
- */
-const MAM_LAG_REPOLLS = 4;
 /** Floor between two stream-error reports, so a reconnect storm can't flood stderr. */
 const STREAM_ERROR_LOG_MS = 5_000;
 /** Bounded retry for the transient MUC cold-creation race (see {@link XmppPlugin.doJoin}). */
 const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
 const RETRYABLE_CONDITIONS = ['item-not-found', 'recipient-unavailable', 'remote-server-not-found'];
+/**
+ * Bounce conditions that mean this connection is no longer an occupant of the room it addressed.
+ * Occupancy can end without the stream dropping, and the join cache would otherwise hold a
+ * resolved promise for a room we are not in.
+ */
+const NOT_AN_OCCUPANT_CONDITIONS = [
+  'not-acceptable',
+  'gone',
+  'item-not-found',
+  'recipient-unavailable',
+];
+/** XEP-0045 §7.6: our own occupant going unavailable to take a NEW nick, not to leave. */
+const STATUS_NICK_CHANGE = '303';
+/** XEP-0045 status codes that explain why our occupancy ended (kick, ban, affiliation, shutdown). */
+const OCCUPANCY_END_STATUS: Record<string, string> = {
+  '301': 'banned',
+  '307': 'kicked',
+  '321': 'affiliation change',
+  '322': 'room became members-only',
+  '332': 'MUC service shutting down',
+  '333': 'occupant technical error',
+};
 
 // Correlators (origin-id, nick) are published in the room on every post, so a co-occupant sees
 // them: keep this crypto-random, or an observer can predict the next one and race the reflection.
@@ -109,6 +131,11 @@ const assertXmlSafe = (value: string, what: string): void => {
   }
 };
 
+const mamPageOf = (configured: number | undefined): number => {
+  if (configured === undefined || !Number.isFinite(configured)) return MAM_PAGE;
+  return Math.max(1, Math.floor(configured));
+};
+
 /** A minimal view of the ltx element / @xmpp client surface we use (no upstream types ship). */
 type El = {
   name: string;
@@ -144,6 +171,22 @@ const stanzaError = (stanza: El): { condition: string; text: string } => {
 };
 const describeError = (e: { condition: string; text: string }): string =>
   e.text !== '' ? `${e.condition}: ${e.text}` : e.condition;
+
+const occupancyEndReason = (statuses: string[], x: El | undefined): string => {
+  const named = statuses.map((c) => OCCUPANCY_END_STATUS[c]).filter((s) => s !== undefined);
+  if (x?.getChild('destroy') !== undefined) named.push('room destroyed');
+  return named.length > 0 ? named.join(', ') : 'left the room';
+};
+
+const MAM_MISSING_HINT =
+  'this backend needs XEP-0313 MAM for MUC — enable mod_mam + muc_mam (Prosody) or mod_mam ' +
+  '(ejabberd); without an archive there is no cursor, no catch-up and no live delivery';
+const mamCondition = (err: unknown): string =>
+  typeof (err as { condition?: unknown })?.condition === 'string'
+    ? ((err as { condition: string }).condition)
+    : err instanceof Error
+      ? err.message
+      : String(err);
 
 /** Carries the XMPP error condition so the join loop can decide whether to retry. */
 class JoinError extends Error {
@@ -197,8 +240,13 @@ export class XmppPlugin implements BackendPlugin {
   private mucService = 'muc.parley.local';
   private handle = 'parley';
   private nick = `parley-${rand()}`;
+  private mamPage = MAM_PAGE;
   private stopped = false;
   private lastStreamErrorAt = 0;
+  /** Settled once the occupant nick is final: pinned by config, or taken from `post`'s identity. */
+  private nickAdoption?: Promise<void>;
+  /** Memoized disco#info probe for the one prerequisite this backend cannot work without. */
+  private mamCheck?: Promise<void>;
 
   /** roomJid -> in-flight/settled join (cached like an "ensure"; idempotent). */
   private readonly joined = new Map<string, Promise<void>>();
@@ -224,9 +272,14 @@ export class XmppPlugin implements BackendPlugin {
     const username = cfg.username ?? 'parley';
     this.handle = username;
     this.nick = cfg.nick ?? `${username}-${rand()}`;
+    this.mamPage = mamPageOf(cfg.mam_page);
     this.stopped = false;
+    this.nickAdoption = cfg.nick === undefined ? undefined : Promise.resolve();
+    this.mamCheck = undefined;
     assertXmlSafe(this.nick, 'backend_config.nick');
     assertXmlSafe(this.mucService, 'backend_config.muc_service');
+    assertXmlSafe(this.domain, 'backend_config.domain');
+    assertXmlSafe(username, 'backend_config.username');
 
     const password = cfg.password ?? 'parleypass';
     if (cfg.password === undefined || password === 'parleypass') {
@@ -271,6 +324,7 @@ export class XmppPlugin implements BackendPlugin {
     for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire('cancel');
     this.waiters.clear();
     this.joined.clear();
+    this.mamCheck = undefined;
     if (this.xmpp !== undefined) {
       await this.xmpp.stop().catch(() => undefined);
       this.xmpp = undefined;
@@ -279,18 +333,20 @@ export class XmppPlugin implements BackendPlugin {
 
   /**
    * `<message type='groupchat'>` into the topic's room, resolved by the MUC's own reflection
-   * (which carries the archive id). `identity` is informational only: the sender on the wire is
-   * this connection's MUC nick (see README "Multiple concurrent sessions"). `opts.inReplyTo` is
-   * IGNORED — XEP-0461 replies exist, but nothing this seam returns carries the relation back,
-   * so it is documented as dropped rather than half-implemented (README "Notes / caveats").
+   * (which carries the archive id). The sender on the wire is this connection's MUC nick, which
+   * unless pinned by config is taken from `identity` on the first post (see
+   * {@link adoptIdentityNick}). `opts.inReplyTo` is IGNORED — XEP-0461 replies exist, but nothing
+   * this seam returns carries the relation back, so it is documented as dropped rather than
+   * half-implemented (README "Notes / caveats").
    */
   async post(
     topic: Topic,
-    _identity: Handle,
+    identity: Handle,
     content: string,
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     assertXmlSafe(content, 'post content');
+    await this.adoptIdentityNick(identity);
     await this.ensureJoined(topic);
     const room = this.roomJid(topic);
     const originId = `o-${randomUUID()}`;
@@ -357,7 +413,7 @@ export class XmppPlugin implements BackendPlugin {
     while (items.length < limit) {
       const page = await this.mamQuery(topic, {
         after: cursor,
-        max: Math.min(MAM_PAGE, limit - items.length),
+        max: Math.min(this.mamPage, limit - items.length),
       });
       items.push(...page.items);
       if (page.complete || page.items.length === 0) break;
@@ -373,6 +429,13 @@ export class XmppPlugin implements BackendPlugin {
    * once the query is back, so the park is the interval asked for rather than what a slow server
    * left of it. An empty return is always safe — the page carries `nextCursor === since` and
    * core's wrapper polls the rest.
+   *
+   * Once a live message has been seen, the archive is known to be behind the stream, and the
+   * re-poll interval DOUBLES from {@link MAM_LAG_POLL_MS} instead of expiring back to the whole
+   * remaining budget: a lag longer than a fixed window would otherwise withhold a message that is
+   * already in the archive until the caller's `blockMs` ran out. Doubling keeps the return within
+   * a small multiple of the actual lag while the number of queries stays logarithmic in `blockMs`
+   * rather than linear in it.
    */
   private async blockingMam(
     topic: Topic,
@@ -382,7 +445,7 @@ export class XmppPlugin implements BackendPlugin {
   ): Promise<MamItem[]> {
     const deadline = Date.now() + blockMs;
     const room = this.roomJid(topic);
-    let lagRepolls = 0;
+    let lagPoll = 0;
     for (;;) {
       if (this.stopped || Date.now() >= deadline) return [];
       const waiter = this.armWaiter(room);
@@ -391,11 +454,11 @@ export class XmppPlugin implements BackendPlugin {
         if (items.length > 0) return items;
         if (this.stopped) return [];
         const budget = deadline - Date.now();
-        const park = lagRepolls > 0 ? Math.min(budget, MAM_LAG_POLL_MS) : budget;
+        const park = lagPoll > 0 ? Math.min(budget, lagPoll) : budget;
         if (park <= 0) return [];
         const reason = await waiter.park(park);
-        if (reason === 'message') lagRepolls = MAM_LAG_REPOLLS;
-        else if (reason === 'timeout' && lagRepolls > 0) lagRepolls--;
+        if (reason === 'message') lagPoll = MAM_LAG_POLL_MS;
+        else if (reason === 'timeout' && lagPoll > 0) lagPoll *= 2;
       } catch (err) {
         if (this.stopped) return [];
         throw err;
@@ -519,6 +582,9 @@ export class XmppPlugin implements BackendPlugin {
       const post = this.pendingPosts.get(originId);
       if (post === undefined || post.room !== room) return;
       this.pendingPosts.delete(originId);
+      if (NOT_AN_OCCUPANT_CONDITIONS.includes(err.condition)) {
+        this.onOccupancyLost(room, describeError(err));
+      }
       post.reject(new Error(`post rejected by ${room} (${describeError(err)})`));
       return;
     }
@@ -528,26 +594,52 @@ export class XmppPlugin implements BackendPlugin {
   private onPresence(stanza: El): void {
     const from = stanza.attrs.from ?? '';
     const room = bareOf(from);
+    const x = stanza.getChild('x', NS_MUC_USER);
+    const statuses = (x?.getChildren('status') ?? []).map((s) => s.attrs.code ?? '');
+    // Self-presence: our own nick echoed back, or status code 110.
+    const isSelf = resourceOf(from) === this.nick || statuses.includes('110');
+
+    if (stanza.attrs.type === 'unavailable') {
+      if (isSelf && !statuses.includes(STATUS_NICK_CHANGE)) {
+        this.onOccupancyLost(room, occupancyEndReason(statuses, x));
+      }
+      return;
+    }
+
     const pending = this.pendingJoins.get(room);
     if (pending === undefined) return;
-
     if (stanza.attrs.type === 'error') {
       const err = stanzaError(stanza);
       pending.reject(new JoinError(err.condition, room, err.text));
       return;
     }
-    // Self-presence: our own nick echoed back, or status code 110.
-    const x = stanza.getChild('x', NS_MUC_USER);
-    const statuses = x?.getChildren('status') ?? [];
-    const isSelf =
-      resourceOf(from) === this.nick || statuses.some((s) => s.attrs.code === '110');
     if (!isSelf) return;
     // Status 201 = we just CREATED the room; it stays locked until its owner submits a config.
-    if (statuses.some((s) => s.attrs.code === '201')) {
+    if (statuses.includes('201')) {
       this.configureRoom(room).finally(() => pending.resolve());
     } else {
       pending.resolve();
     }
+  }
+
+  /**
+   * Occupancy ended without the stream dropping — kicked, banned, room destroyed, MUC component
+   * restarted, or a post bounced as "not an occupant". `joined` caches a RESOLVED promise, so
+   * without this the plugin would never re-enter the room: push would be permanently dead in
+   * silence and every post would bounce forever. A join still in flight settles on its own.
+   */
+  private onOccupancyLost(room: string, why: string): void {
+    if (this.stopped) return;
+    if (!this.joined.has(room) || this.pendingJoins.has(room)) return;
+    this.joined.delete(room);
+    console.error(`[parley-xmpp] occupancy in ${room} ended (${why})`);
+    if (!this.subscriptions.has(room)) return;
+    void this.ensureJoinedRoom(room).catch((err: unknown) => {
+      console.error(
+        `[parley-xmpp] re-join after losing occupancy failed for ${room}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }
 
   /**
@@ -614,9 +706,17 @@ export class XmppPlugin implements BackendPlugin {
     if (originId !== undefined) {
       const pending = this.pendingPosts.get(originId);
       const ours = resourceOf(from) === this.nick && room === pending?.room;
-      if (pending !== undefined && ours && archId !== undefined) {
+      if (pending !== undefined && ours) {
         this.pendingPosts.delete(originId);
-        pending.resolve(asBackendMsgId(archId));
+        if (archId !== undefined) {
+          pending.resolve(asBackendMsgId(archId));
+        } else {
+          pending.reject(
+            new Error(
+              `${room} reflected this post without a <stanza-id> — ${MAM_MISSING_HINT}`,
+            ),
+          );
+        }
       }
     }
 
@@ -648,18 +748,20 @@ export class XmppPlugin implements BackendPlugin {
     opts: { after?: string; before?: boolean; max: number },
   ): Promise<{ items: MamItem[]; complete: boolean }> {
     const room = this.roomJid(topic);
-    const queryid = randomUUID();
-    const collector: MamItem[] = [];
-    this.mamCollectors.set(queryid, { room, items: collector });
-
     const rsm: unknown[] = [];
     // Keep the zero cursor '' omitting <after/> entirely, so that "from the beginning" never
     // depends on how a server answers an <after> UID it does not hold — RSM (XEP-0059) says
     // item-not-found, Prosody's mod_mam replays the whole archive.
-    if (opts.after !== undefined && opts.after !== '') rsm.push(xml('after', {}, opts.after));
+    if (opts.after !== undefined && opts.after !== '') {
+      assertXmlSafe(opts.after, 'catch-up cursor');
+      rsm.push(xml('after', {}, opts.after));
+    }
     rsm.push(xml('max', {}, String(opts.max)));
     if (opts.before === true) rsm.push(xml('before', {})); // empty <before/> => last page
 
+    const queryid = randomUUID();
+    const collector: MamItem[] = [];
+    this.mamCollectors.set(queryid, { room, items: collector });
     const iq = xml(
       'iq',
       { type: 'set', to: room },
@@ -673,6 +775,12 @@ export class XmppPlugin implements BackendPlugin {
       const fin = await this.require().iqCaller.request(iq, MAM_TIMEOUT_MS);
       const complete = fin.getChild('fin', NS_MAM)?.attrs.complete === 'true';
       return { items: collector.slice(), complete };
+    } catch (err) {
+      const condition = mamCondition(err);
+      if (condition === 'service-unavailable' || condition === 'feature-not-implemented') {
+        throw new Error(`MAM query on ${room} answered ${condition} — ${MAM_MISSING_HINT}`);
+      }
+      throw err;
     } finally {
       this.mamCollectors.delete(queryid);
     }
@@ -709,6 +817,62 @@ export class XmppPlugin implements BackendPlugin {
     }
   }
 
+  /**
+   * Take the bridge's logical handle as the occupant nick, unless `backend_config.nick` pinned
+   * one. The occupant nick is the sender of every archived message and therefore the key core's
+   * `parley_list_users` roster is built on; a random per-connection nick would make every restart
+   * of one bridge a new phantom identity that no one can hand work off to. Rooms already entered
+   * under the provisional nick are re-entered under the new one (XEP-0045 §7.6 nick change).
+   */
+  private adoptIdentityNick(identity: Handle): Promise<void> {
+    this.nickAdoption ??= this.switchNick(nickFor(identity));
+    return this.nickAdoption;
+  }
+
+  private async switchNick(wanted: string): Promise<void> {
+    if (wanted === '' || wanted === this.nick) return;
+    const previous = this.nick;
+    const rooms = [...this.joined.keys()];
+    this.nick = wanted;
+    if (rooms.length === 0) return;
+    this.joined.clear();
+    const results = await Promise.allSettled(rooms.map((r) => this.ensureJoinedRoom(r)));
+    if (results.every((r) => r.status === 'fulfilled')) return;
+    this.nick = previous;
+    this.joined.clear();
+    console.error(
+      `[parley-xmpp] could not take '${wanted}' as this connection's MUC nick (another occupant ` +
+        `holds it); posting as '${previous}' instead, so parley_list_users will report that ` +
+        'name. Pin backend_config.nick to a free name to fix this permanently.',
+    );
+    await Promise.allSettled(rooms.map((r) => this.ensureJoinedRoom(r)));
+  }
+
+  /**
+   * MAM is this backend's one hard prerequisite: the archive id IS the cursor and the post
+   * correlator. Probe the room's disco#info once per connection so a server without it fails with
+   * a message that names MAM, rather than as a post that times out and a subscribe that is
+   * silently dead. A server that will not answer disco at all is not evidence of anything, so
+   * keep that path permissive.
+   */
+  private assertMamAvailable(room: string): Promise<void> {
+    this.mamCheck ??= this.discoMam(room);
+    return this.mamCheck;
+  }
+
+  private async discoMam(room: string): Promise<void> {
+    const iq = xml('iq', { type: 'get', to: room }, xml('query', { xmlns: NS_DISCO_INFO }));
+    let info: El;
+    try {
+      info = await this.require().iqCaller.request(iq, DISCO_TIMEOUT_MS);
+    } catch {
+      return;
+    }
+    const features = info.getChild('query', NS_DISCO_INFO)?.getChildren('feature') ?? [];
+    if (features.some((f) => f.attrs.var === NS_MAM)) return;
+    throw new Error(`${room} does not advertise ${NS_MAM} — ${MAM_MISSING_HINT}`);
+  }
+
   /** Join a room with NO history (maxstanzas=0); cached so repeated calls are idempotent. */
   private ensureJoined(topic: Topic): Promise<void> {
     return this.ensureJoinedRoom(this.roomJid(topic));
@@ -717,7 +881,7 @@ export class XmppPlugin implements BackendPlugin {
   private ensureJoinedRoom(room: string): Promise<void> {
     const cached = this.joined.get(room);
     if (cached !== undefined) return cached;
-    const p = this.doJoin(room);
+    const p = this.doJoin(room).then(() => this.assertMamAvailable(room));
     this.joined.set(room, p);
     // If the join fails, drop the cache so a later call can retry.
     p.catch(() => {
@@ -798,3 +962,9 @@ export class XmppPlugin implements BackendPlugin {
 // JID localparts are case-insensitive and may not contain "&'/:<>@ or whitespace; fold to a
 // safe, lowercase token. freshTopic() values (t-<n>-<rand>) pass through unchanged.
 const sanitizeLocal = (s: string): string => s.toLowerCase().replace(/[^a-z0-9.\-_]/g, '_');
+
+// A MUC nick is a JID resource: no control characters, and nothing that would split the JID. The
+// fold is injective via safeName, so two handles can never land on one occupant identity.
+const sanitizeNick = (s: string): string => s.replace(/[^A-Za-z0-9.\-_]/g, '_').slice(0, 64);
+const nickFor = (identity: Handle): string =>
+  String(identity) === '' ? '' : safeName(asTopic(String(identity)), sanitizeNick);

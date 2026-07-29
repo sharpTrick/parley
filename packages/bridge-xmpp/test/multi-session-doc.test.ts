@@ -17,6 +17,8 @@ interface Row {
   name: string;
   a: Partial<XmppBackendConfig>;
   b: Partial<XmppBackendConfig>;
+  /** The `identity.handle` each session posts under; unset nicks are taken from it. */
+  handles?: [string, string];
   expected: Outcome;
 }
 
@@ -28,10 +30,17 @@ const rows: Row[] = [
     expected: 'merged-senders',
   },
   {
-    name: 'shared account + nick left unset: a distinct auto nick per connection',
+    name: 'shared account + nick unset, distinct identity.handle: distinct senders',
     a: {},
     b: {},
     expected: 'distinct-senders',
+  },
+  {
+    name: 'shared account + nick unset, the SAME identity.handle: silently merged',
+    a: {},
+    b: {},
+    handles: ['same-handle', 'same-handle'],
+    expected: 'merged-senders',
   },
   {
     name: 'shared account + a distinct pinned nick each: distinct senders',
@@ -56,17 +65,18 @@ describe.skipIf(!serverUp)('XMPP multi-session config claims (README)', () => {
     const a = new XmppPlugin();
     const b = new XmppPlugin();
     const topic = freshTopic('ms');
+    const [handleA, handleB] = row.handles ?? ['a', 'b'];
     try {
       await a.connect({ ...BASE, ...row.a });
       await b.connect({ ...BASE, ...row.b });
-      await a.post(topic, asHandle('a'), 'from-a');
+      await a.post(topic, asHandle(handleA), 'from-a');
 
       if (row.expected === 'loud-conflict') {
-        await expect(b.post(topic, asHandle('b'), 'from-b')).rejects.toThrow(/conflict/);
+        await expect(b.post(topic, asHandle(handleB), 'from-b')).rejects.toThrow(/conflict/);
         return;
       }
 
-      await b.post(topic, asHandle('b'), 'from-b');
+      await b.post(topic, asHandle(handleB), 'from-b');
       const read = await a.fetchRecent({ topic, limit: 10 });
       const senders = new Map(read.messages.map((m) => [m.content, String(m.senderHandle)]));
       expect([...senders.keys()].sort()).toEqual(['from-a', 'from-b']);
