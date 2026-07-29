@@ -32,3 +32,11 @@ read-state.json
 
 # Local project tooling metadata (not part of the repo)
 .project.yml
+
+# Throwaway probe scripts written at the repo root while investigating a backend by hand.
+# They import from dist/ and are never part of a package; a real test lives under a package's
+# test/ directory instead.
+/probe*.mjs
+/probe*.ts
+/scratch*.mjs
+/.*-smoke.mjs
