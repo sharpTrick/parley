@@ -20,10 +20,12 @@
  * may target it. That reservation binds the AGENT-FACING TOOL SURFACE only: it stops a
  * prompt-injected agent from writing beats through Parley. It is NOT an authenticity control —
  * anyone holding write credentials for the bus reaches the presence topic directly, below this
- * seam, so a roster entry is exactly as trustworthy as the backend's own sender attribution.
+ * seam. A roster entry's handle is SELF-REPORTED by the beat (the seam does not require a backend
+ * to carry the posting identity at all, and on a bot-token backend every session's beats arrive
+ * under one bot handle), so it is a reachability label, never proof of who is behind it.
  * Cryptographic or ACL-backed roster authenticity is out of scope for v1.
  */
-import type { Handle, Message } from '../message.js';
+import { asHandle, type Handle, type Message } from '../message.js';
 import { isRedosSafeSource, MAX_MATCH_INPUT } from '../regex-safety.js';
 
 /**
@@ -45,6 +47,12 @@ export const MAX_RECORD_TOPICS = 64;
  * unbounded string to bloat the roster's per-instance map (DESIGN §14). A real id is a UUID.
  */
 export const MAX_INSTANCE_ID_LEN = 128;
+
+/**
+ * Cap the length of an untrusted self-reported `handle` we retain — it becomes a roster key, so an
+ * unbounded string would bloat the roster map and `parley_list_users` output (DESIGN §14).
+ */
+export const MAX_HANDLE_LEN = 128;
 
 /**
  * Cap the length of each untrusted topic/post-pattern string a record may advertise (DESIGN §14).
@@ -73,16 +81,24 @@ export type PresenceKind = 'hello' | 'heartbeat' | 'goodbye';
 /**
  * The payload carried in a presence message's `content` (JSON). Versioned for forward-compat.
  *
- * `v: 2` carries TWO additive fields — `postTopics` and `instanceId` — each added WITHOUT a
- * version bump: older beats omit them and decode with `postTopics: []` / `instanceId: ''`; older
- * readers ignore them. Bumping `v` would make old readers reject new beats mid-rollout — additive
- * keeps mixed-version fleets interoperable (DESIGN §7).
+ * `v: 2` carries THREE additive fields — `postTopics`, `instanceId` and `handle` — each added
+ * WITHOUT a version bump: older beats omit them and decode with `postTopics: []` /
+ * `instanceId: ''` / no `handle`; older readers ignore them. Bumping `v` would make old readers
+ * reject new beats mid-rollout — additive keeps mixed-version fleets interoperable (DESIGN §7).
  */
 export interface PresenceRecord {
   v: 2;
   kind: PresenceKind;
   /** Emitter wall-clock (ms) when the beat was sent — used for TTL freshness (advisory; DESIGN §14). */
   at: number;
+  /**
+   * The emitting bridge's own handle. The seam does NOT require a backend to carry the posting
+   * identity — a bot-token backend delivers every session's beats under one bot handle — so the
+   * roster keys on this self-reported value and falls back to `Message.senderHandle` only for a
+   * pre-`handle` beat. Untrusted like every other field (see the module header): it is a
+   * reachability label, not an authenticity claim.
+   */
+  handle?: string;
   /** The emitter's explicit subscribed topics at beat time (its `topics` allowlist). */
   topics: string[];
   /**
@@ -176,14 +192,21 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
     typeof r.instanceId === 'string' && r.instanceId.length > 0
       ? r.instanceId.slice(0, MAX_INSTANCE_ID_LEN)
       : '';
-  return { v: 2, kind: r.kind, at: r.at, topics, postTopics, instanceId };
+  // `handle` is optional/additive: absent (old emitter) or malformed ⇒ undefined, and the roster
+  // falls back to the backend's sender attribution. Length-capped because it is untrusted.
+  const handle =
+    typeof r.handle === 'string' && r.handle.length > 0 ? r.handle.slice(0, MAX_HANDLE_LEN) : undefined;
+  return { v: 2, kind: r.kind, at: r.at, handle, topics, postTopics, instanceId };
 }
 
 /**
  * Reconstruct the reachability roster from the presence topic's messages (DESIGN §7).
  *
  * `messages` are pre-sorted ascending by cursor (the plugin's ordering guarantee, DESIGN §6), so
- * the LAST record per `(handle, instanceId)` is that instance's latest beat. Liveness is scoped
+ * the LAST record per `(handle, instanceId)` is that instance's latest beat. The handle comes from
+ * the RECORD ({@link emitterOf}), not from `Message.senderHandle`: a backend is free not to carry
+ * the posting identity, and on those every session's beats would otherwise collapse into one
+ * phantom peer. Liveness is scoped
  * PER INSTANCE: a handle is `online` iff ANY of its instances has a latest beat that is
  * `hello`/`heartbeat` (not `goodbye`) AND fresh (`nowMs - at < ttlMs`). Keying per instance means
  * a `goodbye` from an exiting process reaps only THAT process's slot — a relaunch's fresh instance
@@ -197,6 +220,16 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
  * when online, or the single last-known beat when offline. Entries sort most-recently-seen first so
  * the freshest hand-off candidates lead (online naturally floats up).
  */
+/**
+ * Which handle a beat belongs to. The seam does not require a backend to carry the posting identity
+ * (a bot-token backend delivers every session's beats under ONE bot handle), so the record's
+ * self-reported `handle` leads and `senderHandle` is the compatibility fallback for a beat emitted
+ * before the field existed.
+ */
+function emitterOf(rec: PresenceRecord, m: Message): Handle {
+  return rec.handle === undefined ? m.senderHandle : asHandle(rec.handle);
+}
+
 export function computeRoster(messages: Message[], nowMs: number, opts: RosterOptions): RosterEntry[] {
   const byHandle = new Map<Handle, Map<string, PresenceRecord>>();
   for (const m of messages) {
@@ -204,10 +237,11 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
     // ever reaches the liveness/recency logic below — legitimate small skew still decodes.
     const rec = decodePresence(m.content, nowMs);
     if (rec === null) continue;
-    let insts = byHandle.get(m.senderHandle);
+    const emitter = emitterOf(rec, m);
+    let insts = byHandle.get(emitter);
     if (insts === undefined) {
       insts = new Map();
-      byHandle.set(m.senderHandle, insts);
+      byHandle.set(emitter, insts);
     }
     insts.set(rec.instanceId, rec); // ascending cursor order ⇒ last write wins per instance
   }

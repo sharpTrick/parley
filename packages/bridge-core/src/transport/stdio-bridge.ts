@@ -105,10 +105,13 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
     async attach(transport) {
       if (attached) throw new Error('bridge already attached');
       attached = true;
-      await server.connect(transport);
-      // Wire the live push path BEFORE announcing presence, so the bridge is only advertised as
-      // reachable once it can actually deliver.
+      // Keep the transport handshake INSIDE the rollback window: `server.connect` can reject
+      // (stdio already consumed, EPIPE on a closed pipe) and the caller of a rejecting attach never
+      // receives a bridge to shut down, so a connect left outside would orphan the plugin's poll
+      // timers and hang the process. Wire the live push path BEFORE announcing presence, so the
+      // bridge is only advertised as reachable once it can actually deliver.
       try {
+        await server.connect(transport);
         if (cfg.live_push.enabled) {
           await startPushLoop(server, plugin, allow, seen, {
             mentionFilter: cfg.live_push.mention_filter,

@@ -54,8 +54,9 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
  *     re-scan the window.
  *
  * With `blockMs <= 0` this collapses to a single plain `fetchRecent` (current semantics). Blocking
- * only engages relative to a `since`: with no `since` the first fetch returns the recent window
- * immediately, exactly as before.
+ * engages whenever the queried window comes back EMPTY, with or without a `since` — a `since`-less
+ * call on a topic that already has messages returns them at once, but on an empty topic it waits
+ * out the budget like any other.
  */
 export async function fetchRecentBlocking(
   plugin: BackendPlugin,
@@ -68,6 +69,10 @@ export async function fetchRecentBlocking(
 
   let since: Cursor | undefined = args.since;
   for (;;) {
+    // Keep this ahead of the fetch, so that an already-aborted signal costs no backend query:
+    // `untilAborted` short-circuits on it, but the plugin call is EVALUATED first and its page then
+    // thrown away — once on entry, and once more for every nap the abort lands in.
+    if (opts.signal?.aborted) return abandoned(since);
     const remaining = deadline - now();
     const result = await untilAborted(
       plugin.fetchRecent({ ...args, since, blockMs: Math.max(0, remaining) }),
@@ -84,11 +89,6 @@ export async function fetchRecentBlocking(
     const nap = Math.min(opts.pollIntervalMs, Math.max(0, deadline - now()));
     if (nap <= 0) return result;
     await sleep(nap);
-    if (opts.signal?.aborted) {
-      // Re-query once so the returned cursor reflects anything that landed during the nap.
-      const last = await untilAborted(plugin.fetchRecent({ ...args, since, blockMs: 0 }), opts.signal);
-      return last === ABORTED ? abandoned(since) : last;
-    }
   }
 }
 

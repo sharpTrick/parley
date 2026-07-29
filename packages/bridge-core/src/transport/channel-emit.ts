@@ -4,8 +4,12 @@ import type { Message } from '../message.js';
 /** Claude Code's channel notification method (verified against the live channels-reference). */
 export const CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel';
 
-// Meta KEYS must be identifiers — Claude Code SILENTLY DROPS hyphenated keys (channels gate).
-const META_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * The complete set of meta keys core emits. Keep it a closed union of identifiers, so that a
+ * hyphenated key (`msg-id`) is a compile error rather than an attribute Claude Code SILENTLY DROPS
+ * at render time (channels gate).
+ */
+type ChannelMetaKey = 'topic' | 'sender' | 'cursor' | 'msg_id' | 'mentions';
 
 interface ChannelNotification {
   method: typeof CHANNEL_NOTIFICATION_METHOD;
@@ -14,8 +18,7 @@ interface ChannelNotification {
 
 /**
  * Map a Message to the channel event's `meta` (rendered as `<channel>` attributes). All keys
- * are identifiers (`topic`, `sender`, `cursor`, `msg_id`, `mentions`) — NEVER `msg-id`, which
- * would be silently dropped. Throws if a key is somehow not an identifier (defensive guard).
+ * are identifiers ({@link ChannelMetaKey}) — NEVER `msg-id`, which would be silently dropped.
  *
  * VALUES are forwarded verbatim, and several of them (`sender` above all) are writer-controlled on
  * backends that let a peer pick its own display name. Structured escaping is the renderer's job:
@@ -24,18 +27,15 @@ interface ChannelNotification {
  * DATA, never instructions (DESIGN §14, CHANNEL_INSTRUCTIONS).
  */
 export function channelMeta(m: Message): Record<string, string> {
-  const meta: Record<string, string> = {
-    topic: m.topic,
-    sender: m.senderHandle,
-    cursor: m.cursor,
-    msg_id: m.backendMsgId,
+  const meta: Record<string, string> = {};
+  const put = (key: ChannelMetaKey, value: string): void => {
+    meta[key] = value;
   };
-  if (m.mentions.length > 0) meta.mentions = m.mentions.join(',');
-  for (const key of Object.keys(meta)) {
-    if (!META_KEY_RE.test(key)) {
-      throw new Error(`channel meta key is not an identifier (would be silently dropped): ${key}`);
-    }
-  }
+  put('topic', m.topic);
+  put('sender', m.senderHandle);
+  put('cursor', m.cursor);
+  put('msg_id', m.backendMsgId);
+  if (m.mentions.length > 0) put('mentions', m.mentions.join(','));
   return meta;
 }
 

@@ -87,11 +87,30 @@ describe('presence loop', () => {
       v: 2,
       kind: 'hello',
       at: NOW,
+      handle: 'claude-a',
       topics: ['ctx', 'reviews'],
       postTopics: [],
       instanceId: 'inst-a',
     });
     await loop.stop();
+  });
+
+  /**
+   * The roster keys on the handle INSIDE the record, because a backend is free not to carry the
+   * posting identity. A beat that omits it degrades every session on such a backend into one
+   * phantom peer, so require it on every kind of beat rather than on the hello alone.
+   */
+  it('stamps the emitting handle on every beat, whatever the backend attributes the post to', async () => {
+    const loop = startPresenceLoop(plugin, asHandle('claude-a'), new Allowlist(['ctx']), {
+      presenceTopic: PRESENCE_TOPIC,
+      heartbeatMs: 30_000,
+      now: () => NOW,
+    });
+    await vi.advanceTimersByTimeAsync(30_000); // hello + one heartbeat
+    await loop.stop(); // + goodbye
+    const recs = await records(plugin);
+    expect(recs.map((r) => r.kind)).toEqual(['hello', 'heartbeat', 'goodbye']);
+    for (const r of recs) expect(r.handle).toBe('claude-a');
   });
 
   it('stamps a stable per-process instanceId on every beat, defaulting to a fresh random id', async () => {

@@ -6,6 +6,7 @@ import {
   encodePresence,
   filterReachable,
   MAX_CLOCK_SKEW_MS,
+  MAX_HANDLE_LEN,
   MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
   MAX_TOPIC_LEN,
@@ -305,6 +306,93 @@ describe('computeRoster', () => {
     const roster = computeRoster([beat('old', 'heartbeat', now - ttl - 1, 1)], now, opts);
     expect(roster[0]?.online).toBe(false);
   });
+});
+
+/**
+ * The seam does NOT require a backend to carry the posting identity — the conformance suite makes
+ * it explicitly optional, and a bot-token backend delivers every session's beats under one bot
+ * handle. A roster keyed on `Message.senderHandle` therefore collapses a whole fleet into a single
+ * phantom peer on those backends. Table both kinds of attribution and require the same answer from
+ * each: N emitting bridges are N roster entries, each carrying its OWN topics.
+ */
+describe('the roster keys on the emitting bridge, not on the backend sender', () => {
+  const now = 1_700_000_000_000;
+  const opts = { ttlMs: 90_000, sinceMs: 600_000 };
+  const BOT = 'parley-bot@localhost';
+
+  /** A beat that names its own emitter inside the record (what every current bridge posts). */
+  function selfNamed(handle: string, seq: number, sender: string): Message {
+    return {
+      topic: asTopic('parley-presence'),
+      senderHandle: asHandle(sender),
+      content: encodePresence({
+        v: 2,
+        kind: 'hello',
+        at: now - 1_000,
+        handle,
+        topics: [`topic-${handle}`],
+        postTopics: [],
+        instanceId: `inst-${handle}`,
+      }),
+      timestamp: new Date(seq * 1000).toISOString(),
+      backendMsgId: asBackendMsgId(String(seq)),
+      cursor: asCursor(String(seq)),
+      mentions: [],
+    };
+  }
+
+  const attributions: Array<[name: string, sender: (handle: string) => string]> = [
+    ['a backend that carries sender identity', (handle) => handle],
+    ['a bot-token backend that carries only its own', () => BOT],
+  ];
+
+  it.each(attributions)('%s: three bridges are three peers', (_name, sender) => {
+    const handles = ['ctx-payments', 'ctx-reviews', 'ops'];
+    const msgs = handles.map((h, i) => selfNamed(h, i + 1, sender(h)));
+    const roster = computeRoster(msgs, now, opts);
+
+    expect(roster.map((e) => e.handle).sort()).toEqual([...handles].sort());
+    for (const h of handles) {
+      expect(roster.find((e) => e.handle === h)?.topics).toEqual([`topic-${h}`]);
+    }
+    expect(roster.map((e) => e.handle)).not.toContain(BOT);
+  });
+
+  it('a pre-handle beat still keys on the backend sender (mixed-version compatibility)', () => {
+    const roster = computeRoster([beat('claude-old', 'hello', now - 1_000, 1)], now, opts);
+    expect(roster.map((e) => e.handle)).toEqual(['claude-old']);
+  });
+
+  it('old and new beats coexist as distinct peers', () => {
+    const msgs = [beat('claude-old', 'hello', now - 1_000, 1), selfNamed('claude-new', 2, BOT)];
+    expect(
+      computeRoster(msgs, now, opts)
+        .map((e) => e.handle)
+        .sort(),
+    ).toEqual(['claude-new', 'claude-old']);
+  });
+
+  it('truncates an over-long self-reported handle (untrusted input becomes a roster key)', () => {
+    const handle = 'h'.repeat(MAX_HANDLE_LEN + 50);
+    const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], handle }));
+    expect(rec?.handle).toHaveLength(MAX_HANDLE_LEN);
+  });
+
+  it.each([['a number', 42], ['an empty string', ''], ['null', null]])(
+    'ignores %s as a self-reported handle and falls back to the sender',
+    (_name, bad) => {
+      const msg: Message = {
+        topic: asTopic('parley-presence'),
+        senderHandle: asHandle('from-the-backend'),
+        content: JSON.stringify({ v: 2, kind: 'hello', at: now - 1_000, topics: ['ctx'], handle: bad }),
+        timestamp: new Date(1000).toISOString(),
+        backendMsgId: asBackendMsgId('1'),
+        cursor: asCursor('1'),
+        mentions: [],
+      };
+      expect(computeRoster([msg], now, opts).map((e) => e.handle)).toEqual(['from-the-backend']);
+    },
+  );
 });
 
 describe('filterReachable (pure reachability predicate)', () => {

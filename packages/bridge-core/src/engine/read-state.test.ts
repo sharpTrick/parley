@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, normalize, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -145,6 +145,75 @@ describe('ReadStateStore', () => {
       s.set(asTopic('ctx'), asCursor('1'));
       expect(new ReadStateStore(path).get(asTopic('ctx'))).toBe('1');
     });
+  });
+
+  /**
+   * The temp name is deliberately process-unique so concurrent flushes cannot interleave — which
+   * also means nothing ever collides with, overwrites, or cleans up an orphan. Catch-up flushes
+   * once per page per topic, so a directory that fails the write accumulates them without bound.
+   * Table the ways an atomic-rename writer can fail and require, in every one, that `set()` throws
+   * AND that the directory gained no `.tmp` entry.
+   */
+  describe('a failed atomic write leaves no debris', () => {
+    const failures: Array<[name: string, make: (dir: string) => string]> = [
+      [
+        'the rename target is a directory',
+        (dir) => {
+          const target = join(dir, 'read-state.json');
+          mkdirSync(target);
+          writeFileSync(join(target, 'occupant'), 'x', 'utf8');
+          return target;
+        },
+      ],
+      [
+        'the rename target is an empty directory',
+        (dir) => {
+          const target = join(dir, 'read-state.json');
+          mkdirSync(target);
+          return target;
+        },
+      ],
+      [
+        'the state directory path is a regular file',
+        (dir) => {
+          const blocker = join(dir, 'notadir');
+          writeFileSync(blocker, 'x', 'utf8');
+          return join(blocker, 'read-state.json');
+        },
+      ],
+    ];
+
+    const tmpEntries = (dir: string): string[] =>
+      readdirSync(dir, { recursive: true })
+        .map((e) => String(e))
+        .filter((e) => e.endsWith('.tmp'));
+
+    it.each(failures)('%s', (_name, make) => {
+      const dir = mkdtempSync(join(tmpdir(), 'parley-rs-fail-'));
+      const path = make(dir);
+      const store = new ReadStateStore(path);
+      expect(() => store.set(asTopic('t'), asCursor('1'))).toThrow();
+      expect(tmpEntries(dir)).toEqual([]);
+      // A repeated attempt (catch-up retries page by page) still deposits nothing.
+      expect(() => store.set(asTopic('t'), asCursor('2'))).toThrow();
+      expect(tmpEntries(dir)).toEqual([]);
+    });
+
+    it('a successful write leaves no temp file behind either', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'parley-rs-ok-'));
+      const path = join(dir, 'read-state.json');
+      new ReadStateStore(path).set(asTopic('t'), asCursor('1'));
+      expect(tmpEntries(dir)).toEqual([]);
+    });
+  });
+
+  /**
+   * `state_path` is an OPTIONAL string, so an empty override sails past `??` and becomes the path.
+   * Every downstream failure is then an unactionable ENOENT naming a random dotfile, so refuse it
+   * where the path is adopted.
+   */
+  it('refuses an empty path instead of adopting it', () => {
+    expect(() => new ReadStateStore('')).toThrow(/state_path/);
   });
 
   it('default path is namespaced by instanceId', () => {

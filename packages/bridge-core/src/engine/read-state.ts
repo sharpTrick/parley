@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { asCursor, type Cursor, type Topic } from '../message.js';
@@ -23,6 +23,9 @@ export class ReadStateStore {
   private readonly state: Record<string, string>;
 
   constructor(private readonly filePath: string) {
+    if (filePath.length === 0) {
+      throw new Error('read-state path must not be empty (config `state_path`)');
+    }
     this.state = ReadStateStore.load(filePath);
   }
 
@@ -71,8 +74,20 @@ export class ReadStateStore {
     // Keep the temp name process-unique, so that a concurrent flush cannot interleave into it and
     // leave a half-written file that load() would silently discard as corrupt.
     const tmp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
-    renameSync(tmp, this.filePath);
+    try {
+      writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+      renameSync(tmp, this.filePath);
+    } catch (err) {
+      // Keep the failed attempt's temp file from surviving: the name is deliberately
+      // process-unique, so nothing would ever collide with it, overwrite it, or clean it up, and a
+      // retried catch-up page would deposit another one on every attempt.
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // Nothing was written, or it is already gone — the directory is as we found it.
+      }
+      throw err;
+    }
   }
 }
 

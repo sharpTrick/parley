@@ -43,9 +43,9 @@ export interface RemoteHttpServer {
 
 /**
  * Create the remote-mode Express app: a Streamable-HTTP MCP endpoint backed by the reactive
- * server. Session-per-connection (stateful): a new transport + server is created on the
- * initialize request and reused by `mcp-session-id`. The same seam/tools are reused across
- * stdio and HTTP — only this transport/auth layer differs (DESIGN §10).
+ * server. STATELESS — a fresh transport + server per POST, no `mcp-session-id`, no SSE, no server
+ * push; GET and DELETE answer 405. The same seam/tools are reused across stdio and HTTP — only
+ * this transport/auth layer differs (DESIGN §10).
  */
 export function createRemoteHttpApp(
   plugin: BackendPlugin,
@@ -155,6 +155,14 @@ export function createRemoteHttpApp(
     // `httpServer = s` is set synchronously so close() can still find it.
     listen: (port, host = '127.0.0.1') =>
       new Promise<NodeHttpServer>((resolve, reject) => {
+        // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
+        // leave the first one bound forever and its presence loop beating past close(), advertising
+        // a shut-down bridge as online. A server that failed to bind is not live, so a failed
+        // listen stays retryable.
+        if (httpServer?.listening === true) {
+          reject(new Error('remote HTTP server already listening'));
+          return;
+        }
         const s = app.listen(port, host, (err?: Error) => {
           if (err) {
             reject(err);

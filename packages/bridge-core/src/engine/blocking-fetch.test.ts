@@ -205,6 +205,150 @@ describe('fetchRecentBlocking', () => {
     }
   });
 
+  /**
+   * A wall-clock bound plus "the cursor came back unchanged" is satisfied identically by a live
+   * branch and by a deleted one — which is how a post-nap re-query whose result was ALWAYS
+   * discarded (the abort wrapper short-circuits on the signal that got us there) survived every
+   * abort test while still firing a backend query per cancellation. Pin the exact number of
+   * `fetchRecent` calls per abort timing: that is the only assertion that can tell the two apart.
+   */
+  describe('no branch of the long-poll loop is unreachable', () => {
+    const T = asTopic('room');
+
+    /** A plugin that counts queries and, optionally, parks the first one until released. */
+    function counting(opts: { park?: boolean } = {}) {
+      const plugin = new FakePlugin();
+      const calls: FetchRecentArgs[] = [];
+      let release: (() => void) | undefined;
+      const orig = plugin.fetchRecent.bind(plugin);
+      plugin.fetchRecent = async (a: FetchRecentArgs): Promise<FetchRecentResult> => {
+        calls.push(a);
+        if (opts.park === true && calls.length > 1) {
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        }
+        return orig(a);
+      };
+      return { plugin, calls, release: () => release?.() };
+    }
+
+    it('an abort BEFORE the first fetch costs no backend query at all', async () => {
+      const { plugin, calls } = counting();
+      const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+      calls.length = 0;
+      const ac = new AbortController();
+      ac.abort();
+      const clock = fakeClock();
+
+      const res = await fetchRecentBlocking(
+        plugin,
+        { topic: T, since: tail },
+        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep, signal: ac.signal },
+      );
+      expect(calls).toHaveLength(0);
+      expect(res).toEqual({ messages: [], nextCursor: tail });
+    });
+
+    it('an abort DURING the nap costs exactly the one query already made', async () => {
+      const { plugin, calls } = counting();
+      const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+      calls.length = 0;
+      const ac = new AbortController();
+      const clock = fakeClock();
+
+      const pending = fetchRecentBlocking(
+        plugin,
+        { topic: T, since: tail },
+        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep, signal: ac.signal },
+      );
+      await flush(); // first (empty) iteration ran and parked on its poll sleep
+      expect(calls).toHaveLength(1);
+      ac.abort();
+      await clock.advance(250); // wake the nap into an aborted signal
+
+      const res = await pending;
+      expect(calls).toHaveLength(1); // no re-query on the way out
+      expect(res).toEqual({ messages: [], nextCursor: tail });
+    });
+
+    it('an abort while a fetch is IN FLIGHT costs exactly that query', async () => {
+      const { plugin, calls, release } = counting({ park: true });
+      const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+      calls.length = 0;
+      const ac = new AbortController();
+      const clock = fakeClock();
+
+      const pending = fetchRecentBlocking(
+        plugin,
+        { topic: T, since: tail },
+        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep, signal: ac.signal },
+      );
+      await flush();
+      await clock.advance(250); // second query starts and parks inside the plugin
+      expect(calls).toHaveLength(2);
+      ac.abort();
+
+      const res = await pending;
+      expect(calls).toHaveLength(2); // the parked page is abandoned, not re-queried
+      expect(res).toEqual({ messages: [], nextCursor: tail });
+      release();
+    });
+
+    it('an un-aborted budget queries once per poll interval and once at the deadline', async () => {
+      const { plugin, calls } = counting();
+      const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+      calls.length = 0;
+      const clock = fakeClock();
+
+      const pending = fetchRecentBlocking(
+        plugin,
+        { topic: T, since: tail },
+        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep },
+      );
+      await flush();
+      for (let i = 0; i < 4; i++) await clock.advance(250);
+      await pending;
+      expect(calls).toHaveLength(5); // 4 naps + the final at-deadline query
+    });
+  });
+
+  /**
+   * The doc once promised that a `since`-less call "returns the recent window immediately". That
+   * holds only when the window is non-empty; on an empty topic the loop blocks like any other.
+   * Table both axes so a doc claim that covers one cell and not the other is contradicted here.
+   */
+  describe('blocking engages on an EMPTY window, with or without a since', () => {
+    const T = asTopic('room');
+
+    it.each([
+      ['no since, topic has messages', false, true, 1],
+      ['no since, topic is empty', false, false, 5],
+      ['since at the tail, nothing newer', true, true, 5],
+    ])('%s', async (_name, withSince, seeded, expectedCalls) => {
+      const plugin = new FakePlugin();
+      if (seeded) await plugin.post(T, SENDER, 'old');
+      const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
+      const calls: FetchRecentArgs[] = [];
+      const orig = plugin.fetchRecent.bind(plugin);
+      plugin.fetchRecent = async (a: FetchRecentArgs): Promise<FetchRecentResult> => {
+        calls.push(a);
+        return orig(a);
+      };
+      const clock = fakeClock();
+
+      const pending = fetchRecentBlocking(
+        plugin,
+        withSince ? { topic: T, since: tail } : { topic: T },
+        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep },
+      );
+      await flush();
+      for (let i = 0; i < 4; i++) await clock.advance(250);
+      await pending;
+      expect(calls).toHaveLength(expectedCalls);
+    });
+  });
+
   it('stops early when the abort signal fires', async () => {
     const plugin = new FakePlugin();
     const t = asTopic('room');

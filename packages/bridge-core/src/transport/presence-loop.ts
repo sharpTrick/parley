@@ -70,18 +70,24 @@ export function startPresenceLoop(
   // One fresh per-process token for this loop's lifetime — scopes goodbye to this instance only.
   const instanceId = opts.instanceId ?? randomUUID();
 
+  // Keep the WHOLE call inside the try, so that a plugin whose `post` throws synchronously (a legal
+  // non-async implementation of the seam signature) is swallowed like a rejection instead of
+  // escaping as an unhandled rejection off the fire-and-forget beats below and killing the process.
   const beat = async (kind: PresenceKind): Promise<void> => {
-    const content = encodePresence({
-      v: 2,
-      kind,
-      at: now(),
-      topics: subscribedTopics,
-      postTopics,
-      instanceId,
-    });
-    await plugin.post(opts.presenceTopic, identity, content).catch(() => {
+    try {
+      const content = encodePresence({
+        v: 2,
+        kind,
+        at: now(),
+        handle: identity,
+        topics: subscribedTopics,
+        postTopics,
+        instanceId,
+      });
+      await plugin.post(opts.presenceTopic, identity, content);
+    } catch {
       // Best-effort: a dropped beat is harmless; TTL reconciles (engine/presence.ts).
-    });
+    }
   };
 
   // Serialize every beat through a single promise chain so `goodbye` is posted only AFTER every

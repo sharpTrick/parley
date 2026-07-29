@@ -4,6 +4,8 @@ import { parseConfig } from '../config.js';
 import {
   asBackendMsgId,
   asCursor,
+  asHandle,
+  asTopic,
   type BackendMsgId,
   type Handle,
   type Message,
@@ -17,6 +19,12 @@ import type {
   FetchRecentResult,
   MessageHandler,
 } from '../seam.js';
+import {
+  POST_BEHAVIOUR_NAMES,
+  POST_BEHAVIOURS,
+  unhandledDuring,
+  type PostBehaviour,
+} from '../testing/failure-shapes.js';
 import { GOODBYE_TIMEOUT_MS } from './presence-loop.js';
 import { buildBridge } from './stdio-bridge.js';
 
@@ -68,14 +76,16 @@ class RecordingPlugin implements BackendPlugin {
     }
   }
 
-  async post(
+  // Keep this method NON-async, so that a `rejects synchronously` behaviour really throws before
+  // returning a promise; an async wrapper would silently downgrade it to an ordinary rejection.
+  post(
     topic: Topic,
     _identity: Handle,
     content: string,
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     this.events.push({ type: 'post', topic, content });
-    const id = asBackendMsgId(String(++this.seq));
+    const id = Promise.resolve(asBackendMsgId(String(++this.seq)));
     return this.opts.post === undefined ? id : POST_BEHAVIOURS[this.opts.post](id);
   }
 
@@ -92,22 +102,8 @@ class RecordingPlugin implements BackendPlugin {
 
 const PRESENCE_TOPIC = 'parley-presence';
 
-/**
- * Every way a backend's `post` can behave on the presence path. The presence goodbye is chained
- * into `stop()`, which every teardown path awaits — so any of these must leave teardown bounded.
- * `never settles` is the production shape nobody tests: an HTTP plugin with no request timeout.
- */
-const POST_BEHAVIOURS = {
-  resolves: (id: BackendMsgId): Promise<BackendMsgId> => Promise.resolve(id),
-  rejects: (): Promise<BackendMsgId> => Promise.reject(new Error('post boom')),
-  'rejects synchronously': (): Promise<BackendMsgId> => {
-    throw new Error('post boom (sync)');
-  },
-  'never settles': (): Promise<BackendMsgId> => new Promise<BackendMsgId>(() => {}),
-  'settles long after the teardown budget': (id: BackendMsgId): Promise<BackendMsgId> =>
-    new Promise<BackendMsgId>((r) => setTimeout(() => r(id), 30_000).unref?.()),
-} as const;
-type PostBehaviour = keyof typeof POST_BEHAVIOURS;
+/** What `attach` accepts — the SDK's transport interface, as the bridge declares it. */
+type AnyTransport = Parameters<Awaited<ReturnType<typeof buildBridge>>['attach']>[0];
 
 /** Wall-clock ceiling a teardown must settle inside, whatever the backend does. */
 const TEARDOWN_BUDGET_MS = GOODBYE_TIMEOUT_MS + 1_500;
@@ -163,10 +159,12 @@ describe('bridge attach ordering + rollback', () => {
   });
 
   /**
-   * Rollback must cover EVERY failure point in the startup sequence, not the one that was reported.
-   * Same post-conditions in every row: the call rejects, the connection is released exactly once,
-   * and nothing ever announced this bridge as reachable. `connect` is the one row where there is
-   * nothing to release — it never got a connection.
+   * Rollback must cover EVERY awaited call in the startup sequence, not the one that was reported —
+   * including the transport handshake, which is not a seam call and so is easy to leave outside the
+   * rollback window while the table still reads as exhaustive. Same post-conditions in every row:
+   * the call rejects, the connection is released exactly once, and nothing ever announced this
+   * bridge as reachable. `connect` is the one row where there is nothing to release — it never got
+   * a connection.
    */
   describe('every startup failure point rolls back identically', () => {
     const cfgWith = (over: Record<string, unknown> = {}) =>
@@ -178,22 +176,29 @@ describe('bridge attach ordering + rollback', () => {
         ...over,
       });
 
+    const liveTransport = (): AnyTransport => InMemoryTransport.createLinkedPair()[1];
+    const failingTransport = (): AnyTransport => {
+      const [, t] = InMemoryTransport.createLinkedPair();
+      t.start = (): Promise<void> => Promise.reject(new Error('transport boom'));
+      return t;
+    };
+
     it.each([
-      ['connect', { connectThrows: true }, /connect boom/, 0],
-      ['on-start catch-up', { fetchThrows: true }, /catch-up boom/, 1],
-      ['subscribe of the FIRST topic', { subscribeThrowsOn: 'ctx' }, /subscribe boom/, 1],
-      ['subscribe of a LATER topic', { subscribeThrowsOn: 'ops' }, /subscribe boom/, 1],
+      ['connect', { connectThrows: true }, /connect boom/, 0, liveTransport],
+      ['on-start catch-up', { fetchThrows: true }, /catch-up boom/, 1, liveTransport],
+      ['the transport handshake', {}, /transport boom/, 1, failingTransport],
+      ['subscribe of the FIRST topic', { subscribeThrowsOn: 'ctx' }, /subscribe boom/, 1, liveTransport],
+      ['subscribe of a LATER topic', { subscribeThrowsOn: 'ops' }, /subscribe boom/, 1, liveTransport],
     ])(
       'a failure in %s rejects, releases the connection, and never announces presence',
-      async (_name, inject, message, expectedDisconnects) => {
+      async (_name, inject, message, expectedDisconnects, transport) => {
         const plugin = new RecordingPlugin(inject);
         const cfg = cfgWith();
 
         const failed = await (async () => {
           const bridge = await buildBridge(plugin, cfg).catch((e: Error) => e);
           if (bridge instanceof Error) return bridge;
-          const [, serverT] = InMemoryTransport.createLinkedPair();
-          return bridge.attach(serverT).then(
+          return bridge.attach(transport()).then(
             () => new Error('startup unexpectedly succeeded'),
             (e: Error) => e,
           );
@@ -217,24 +222,28 @@ describe('bridge attach ordering + rollback', () => {
    * plus exactly one disconnect in every cell.
    */
   describe('teardown is bounded whatever the presence post does', () => {
-    const behaviours = Object.keys(POST_BEHAVIOURS) as Array<keyof typeof POST_BEHAVIOURS>;
-
-    it.each(behaviours)('shutdown() completes with a post that %s', async (post) => {
+    it.each(POST_BEHAVIOUR_NAMES)('shutdown() completes with a post that %s', async (post) => {
       const plugin = new RecordingPlugin({ post });
       const cfg = parseConfig({
         identity: { handle: 'agent' },
         topics: ['ctx'],
         live_push: { enabled: false },
-        presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
+        // A live cadence, so the heartbeat site is exercised too and not just hello + goodbye.
+        presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 180_000 },
       });
-      const bridge = await buildBridge(plugin, cfg);
-      const [, serverT] = InMemoryTransport.createLinkedPair();
-      await bridge.attach(serverT);
-      expect(await within(TEARDOWN_BUDGET_MS, bridge.shutdown())).not.toBe('TIMED OUT');
+      const escaped = await unhandledDuring(async () => {
+        const bridge = await buildBridge(plugin, cfg);
+        const [, serverT] = InMemoryTransport.createLinkedPair();
+        await bridge.attach(serverT);
+        await new Promise((r) => setTimeout(r, 60)); // several heartbeats
+        expect(await within(TEARDOWN_BUDGET_MS, bridge.shutdown())).not.toBe('TIMED OUT');
+      });
       expect(plugin.disconnectCount).toBe(1);
+      // A best-effort beat may fail; it may never take the process down with it.
+      expect(escaped).toEqual([]);
     });
 
-    it.each(behaviours)('a failed attach rolls back with a post that %s', async (post) => {
+    it.each(POST_BEHAVIOUR_NAMES)('a failed attach rolls back with a post that %s', async (post) => {
       const plugin = new RecordingPlugin({ post, subscribeThrowsOn: 'ops' });
       const cfg = parseConfig({
         identity: { handle: 'agent' },
@@ -256,6 +265,11 @@ describe('bridge attach ordering + rollback', () => {
       // shutdown() after a rolled-back attach must not disconnect a second time.
       await bridge.shutdown();
       expect(plugin.disconnectCount).toBe(1);
+    });
+
+    it('the sync-throw behaviour reaches the bridge as a real synchronous throw', () => {
+      const plugin = new RecordingPlugin({ post: 'rejects synchronously' });
+      expect(() => plugin.post(asTopic('ctx'), asHandle('agent'), 'x')).toThrow();
     });
   });
 

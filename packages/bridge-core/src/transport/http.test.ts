@@ -7,25 +7,19 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as allowlistMod from '../allowlist.js';
 import { parseConfig } from '../config.js';
-import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
-import type { BackendMsgId } from '../message.js';
+import { decodePresence, DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
+import { asHandle, asTopic } from '../message.js';
+import {
+  installPost,
+  POST_BEHAVIOUR_NAMES,
+  unhandledDuring,
+  type PostBehaviour,
+} from '../testing/failure-shapes.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from './http.js';
 import { GOODBYE_TIMEOUT_MS } from './presence-loop.js';
 import { buildBridge } from './stdio-bridge.js';
 
-/** Mirrors the stdio root's teardown table (stdio-bridge.test.ts) — one rule, two composition roots. */
-const POST_BEHAVIOURS = {
-  resolves: (id: BackendMsgId): Promise<BackendMsgId> => Promise.resolve(id),
-  rejects: (): Promise<BackendMsgId> => Promise.reject(new Error('post boom')),
-  'rejects synchronously': (): Promise<BackendMsgId> => {
-    throw new Error('post boom (sync)');
-  },
-  'never settles': (): Promise<BackendMsgId> => new Promise<BackendMsgId>(() => {}),
-  'settles long after the teardown budget': (id: BackendMsgId): Promise<BackendMsgId> =>
-    new Promise<BackendMsgId>((r) => setTimeout(() => r(id), 30_000).unref?.()),
-} as const;
-type PostBehaviour = keyof typeof POST_BEHAVIOURS;
 const TEARDOWN_BUDGET_MS = GOODBYE_TIMEOUT_MS + 1_500;
 
 let remote: RemoteHttpServer;
@@ -119,15 +113,19 @@ describe('remote HTTP: listen() rejects on a bind error', () => {
     }
   });
 
-  it('rejects when the same RemoteHttpServer is asked to listen twice on one port', async () => {
+  it('a bind failure leaves the app retryable — a later listen(0) still succeeds', async () => {
+    const blocker = createHttpServer();
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+    const taken = (blocker.address() as AddressInfo).port;
     const { p, app } = await appOn();
-    const s1 = await app.listen(0);
-    const port = (s1.address() as AddressInfo).port;
     try {
-      await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      await expect(app.listen(taken)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      const s = await app.listen(0);
+      expect(s.address()).not.toBeNull();
     } finally {
       await app.close().catch(() => {});
       await p.disconnect();
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
   });
 
@@ -360,32 +358,170 @@ describe('presence is announced only once the transport is actually live', () =>
 });
 
 /**
+ * Starting a composition root twice must fail, not silently double up: the second start would
+ * overwrite the first server + presence loop, leaving a socket bound and a loop beating that no
+ * teardown can ever reach — so `parley_list_users` reports a shut-down bridge as online forever.
+ * One rule, both roots.
+ */
+describe('a composition root can only be started once', () => {
+  const startedCfg = () =>
+    parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
+    });
+
+  interface Started {
+    startAgain: () => Promise<unknown>;
+    stop: () => Promise<void>;
+    stillBound: () => boolean;
+  }
+
+  const roots: Record<string, (p: FakePlugin) => Promise<Started>> = {
+    'http listen()': async (p) => {
+      const app = createRemoteHttpApp(p, startedCfg(), { insecureNoAuth: true });
+      const s = await app.listen(0);
+      return {
+        startAgain: () => app.listen(0),
+        stop: () => app.close(),
+        stillBound: () => s.listening,
+      };
+    },
+    'stdio attach()': async (p) => {
+      const bridge = await buildBridge(p, startedCfg());
+      await bridge.attach(InMemoryTransport.createLinkedPair()[1]);
+      return {
+        startAgain: () => bridge.attach(InMemoryTransport.createLinkedPair()[1]),
+        stop: () => bridge.shutdown(),
+        stillBound: () => false,
+      };
+    },
+  };
+
+  async function kinds(p: FakePlugin): Promise<string[]> {
+    const { messages } = await p.fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) });
+    return messages.map((m) => decodePresence(m.content)?.kind ?? 'unknown');
+  }
+
+  it.each(Object.keys(roots))(
+    '%s rejects a second start, runs exactly one presence loop, and goes quiet on teardown',
+    async (name) => {
+      const p = new FakePlugin();
+      await p.connect({});
+      const started = await roots[name]!(p);
+      await vi.waitFor(async () => expect((await kinds(p)).length).toBeGreaterThan(0));
+
+      await expect(started.startAgain()).rejects.toThrow();
+      await new Promise((r) => setTimeout(r, 80)); // several heartbeat cadences
+
+      // A second loop would announce itself with its own hello.
+      expect((await kinds(p)).filter((k) => k === 'hello')).toHaveLength(1);
+
+      await started.stop();
+      expect(started.stillBound()).toBe(false);
+      const atStop = (await kinds(p)).length;
+      await new Promise((r) => setTimeout(r, 100));
+      expect((await kinds(p)).length).toBe(atStop); // nothing beats past teardown
+      await p.disconnect();
+    },
+  );
+});
+
+/**
+ * The public JSDoc once described the opposite design (session-per-connection, reused by
+ * `mcp-session-id`). Pin the observable session contract instead of the sentence, so a doc that
+ * regrows session affinity is contradicted by a failing test rather than by a neighbouring comment.
+ */
+describe('reactive HTTP is stateless: no session id, no GET/DELETE', () => {
+  const INIT = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'x', version: '0' } },
+  });
+
+  async function appOn() {
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+    });
+    const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+    const srv = await app.listen(0);
+    const port = (srv.address() as AddressInfo).port;
+    return { port, teardown: async () => (await app.close(), await p.disconnect()) };
+  }
+
+  it('the initialize response carries no mcp-session-id header', async () => {
+    const { port, teardown } = await appOn();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        body: INIT,
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('mcp-session-id')).toBeNull();
+    } finally {
+      await teardown();
+    }
+  });
+
+  it.each(['GET', 'DELETE'])('%s /mcp is 405 — there is no session to resume or terminate', async (method) => {
+    const { port, teardown } = await appOn();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method });
+      expect(res.status).toBe(405);
+    } finally {
+      await teardown();
+    }
+  });
+});
+
+/**
  * The HTTP root's close() awaits the same best-effort goodbye the stdio root does, so it inherits
  * the same hazard: a presence post that never settles must not hold the socket open forever.
  */
 describe('remote HTTP close() is bounded whatever the presence post does', () => {
-  it.each(Object.keys(POST_BEHAVIOURS) as PostBehaviour[])(
-    'close() completes with a post that %s',
-    async (behaviour) => {
-      const p = new FakePlugin();
-      await p.connect({});
-      const orig = p.post.bind(p);
-      p.post = async (...a: Parameters<FakePlugin['post']>) =>
-        POST_BEHAVIOURS[behaviour](await orig(...a));
-      const cfg = parseConfig({
-        identity: { handle: 'agent' },
-        topics: ['ctx'],
-        presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
-      });
-      const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
-      const s = await app.listen(0);
+  it.each(POST_BEHAVIOUR_NAMES)('close() completes with a post that %s', async (behaviour) => {
+    const p = new FakePlugin();
+    await p.connect({});
+    installPost(p, behaviour);
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      // A live cadence, so the heartbeat site is exercised too and not just hello + goodbye.
+      presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 180_000 },
+    });
+    const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+    let s: Awaited<ReturnType<typeof app.listen>> | undefined;
+    const escaped = await unhandledDuring(async () => {
+      s = await app.listen(0);
+      await new Promise((r) => setTimeout(r, 60)); // several heartbeats
       const closed = await Promise.race([
         app.close().then(() => 'CLOSED'),
         new Promise((r) => setTimeout(() => r('TIMED OUT'), TEARDOWN_BUDGET_MS).unref?.()),
       ]);
       expect(closed).toBe('CLOSED');
-      expect(s.listening).toBe(false);
-      await p.disconnect();
-    },
-  );
+    });
+    expect(s?.listening).toBe(false);
+    // A best-effort beat may fail; it may never take the process down with it.
+    expect(escaped).toEqual([]);
+    await p.disconnect();
+  });
+
+  /**
+   * The harness has to be able to produce the input the table names. Installing a sync-throwing
+   * behaviour through an `async` wrapper turns it into an ordinary rejection, and the row silently
+   * becomes a duplicate of `rejects` — coverage on paper, none in fact.
+   */
+  it('installs a sync-throwing post that really throws synchronously', async () => {
+    const p = new FakePlugin();
+    await p.connect({});
+    installPost(p, 'rejects synchronously');
+    expect(() => p.post(asTopic('ctx'), asHandle('agent'), 'x')).toThrow();
+    await p.disconnect();
+  });
 });
