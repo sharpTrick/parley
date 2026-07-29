@@ -146,58 +146,81 @@ describe('remote-mode boot invariants are enforced at the factory, not only in t
 });
 
 /**
- * The AS/RS endpoints are mounted at the origin root. If a base URL carrying a path were accepted,
- * the advertised RFC 9728 resource id would silently lose that path and every issued token would
- * 401 at the endpoint the client actually reaches.
+ * The advertised RFC 9728 resource id is `publicUrl + /mcp`, which keeps only scheme, host and
+ * port. A base URL varying in ANY other component is therefore either refused, or advertised as
+ * something the operator did not write — so every accepted row states the exact href it must
+ * produce, and the matrix varies one component at a time rather than the path alone. Both front
+ * doors run it: oidc mode does not route through the SDK's own issuer check, so a rule enforced
+ * only there would leave it the weaker of the two.
  */
-const BASE_URL_SHAPES: Array<[string, 'boots' | 'refuses']> = [
-  ['http://127.0.0.1:0/', 'boots'],
-  ['http://127.0.0.1:0', 'boots'],
-  ['http://127.0.0.1:0/parley', 'refuses'],
-  ['http://127.0.0.1:0/parley/', 'refuses'],
-  ['http://127.0.0.1:0/a/b/', 'refuses'],
+interface BaseUrlShape {
+  /** `PORT` is replaced with a free port before the URL is parsed. */
+  shape: string;
+  /** The exact resource href a booting row must advertise, or the message a refused row must carry. */
+  outcome: { boots: string } | { refuses: RegExp };
+}
+
+const BASE_URL_SHAPES: BaseUrlShape[] = [
+  { shape: 'http://127.0.0.1:PORT/', outcome: { boots: 'http://127.0.0.1:PORT/mcp' } },
+  { shape: 'http://127.0.0.1:PORT', outcome: { boots: 'http://127.0.0.1:PORT/mcp' } },
+  { shape: 'http://localhost:PORT/', outcome: { boots: 'http://localhost:PORT/mcp' } },
+  { shape: 'https://parley.example.com/', outcome: { boots: 'https://parley.example.com/mcp' } },
+  { shape: 'https://parley.example.com:8443/', outcome: { boots: 'https://parley.example.com:8443/mcp' } },
+  { shape: 'http://127.0.0.1:PORT/parley', outcome: { refuses: /no path/ } },
+  { shape: 'http://127.0.0.1:PORT/parley/', outcome: { refuses: /no path/ } },
+  { shape: 'http://127.0.0.1:PORT/a/b/', outcome: { refuses: /no path/ } },
+  { shape: 'http://127.0.0.1:PORT/?tenant=a', outcome: { refuses: /query string/ } },
+  { shape: 'http://127.0.0.1:PORT/#frag', outcome: { refuses: /fragment/ } },
+  { shape: 'http://owner:hunter2@127.0.0.1:PORT/', outcome: { refuses: /userinfo credentials/ } },
+  { shape: 'https://owner:hunter2@parley.example.com/', outcome: { refuses: /userinfo credentials/ } },
+  { shape: 'http://parley.example.com/', outcome: { refuses: /https outside loopback/ } },
 ];
 
+const shapeName = (s: BaseUrlShape): string =>
+  `${s.shape} ${'boots' in s.outcome ? 'boots' : 'is refused'}`;
+
 describe('the advertised resource id must match the URL the endpoint is served at', () => {
-  it.each(BASE_URL_SHAPES)(
-    'built-in OAuth front door with base %s %s',
-    async (shape: string, verdict: 'boots' | 'refuses') => {
-      const port = await freePort();
-      const base = new URL(shape.replace('127.0.0.1:0', `127.0.0.1:${port}`));
-      const build = (): RemoteAuthServer =>
-        createOAuthRemoteApp(plugin, baseCfg(), {
-          issuerUrl: base,
-          verifyOwner: async () => true,
-        });
-
-      if (verdict === 'refuses') {
-        expect(build).toThrow(/no path/);
-        return;
-      }
-      const server = build();
-      opened.push(server);
-      expect(server.resource.href).toBe(`${base.origin}/mcp`);
-    },
-  );
-
-  it.each(BASE_URL_SHAPES)(
-    'delegated OIDC front door with base %s %s',
-    async (shape: string, verdict: 'boots' | 'refuses') => {
-      const port = await freePort();
-      const base = new URL(shape.replace('127.0.0.1:0', `127.0.0.1:${port}`));
-      const build = (): Promise<RemoteAuthServer> =>
+  const FRONT_DOORS: Array<[string, (base: URL) => Promise<RemoteAuthServer>]> = [
+    [
+      'built-in OAuth',
+      async (base) =>
+        createOAuthRemoteApp(plugin, baseCfg(), { issuerUrl: base, verifyOwner: async () => true }),
+    ],
+    [
+      'delegated OIDC',
+      async (base) =>
         createOidcRemoteApp(plugin, baseCfg(), {
           publicUrl: base,
           oidc: { issuer: idp.issuer, clock_skew_s: 30, allowed_subjects: ['owner-sub'] } as never,
-        });
+        }),
+    ],
+  ];
 
-      if (verdict === 'refuses') {
-        await expect(build()).rejects.toThrow(/no path/);
+  const ROWS = FRONT_DOORS.flatMap(([door, build]) =>
+    BASE_URL_SHAPES.map((s): [string, BaseUrlShape, (base: URL) => Promise<RemoteAuthServer>] => [
+      `${door} front door: ${shapeName(s)}`,
+      s,
+      build,
+    ]),
+  );
+
+  it.each(ROWS)(
+    '%s',
+    async (
+      _name: string,
+      s: BaseUrlShape,
+      build: (base: URL) => Promise<RemoteAuthServer>,
+    ) => {
+      const port = String(await freePort());
+      const base = new URL(s.shape.replaceAll('PORT', port));
+
+      if ('refuses' in s.outcome) {
+        await expect(build(base)).rejects.toThrow(s.outcome.refuses);
         return;
       }
-      const server = await build();
+      const server = await build(base);
       opened.push(server);
-      expect(server.resource.href).toBe(`${base.origin}/mcp`);
+      expect(server.resource.href).toBe(s.outcome.boots.replaceAll('PORT', port));
     },
   );
 });

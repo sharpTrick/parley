@@ -511,3 +511,138 @@ describe('remote OAuth front door — credential lifecycle over HTTP', () => {
     expect(res.status).toBe(401);
   });
 });
+
+/**
+ * Every endpoint of this front door is rate-limited per client address, so the limiter is only a
+ * defence if that address is the CLIENT's. Under the shipped recipe (examples/self-host-remote
+ * terminates TLS at a reverse proxy) an unconfigured app sees only the proxy's loopback address:
+ * one bucket for everyone, which an anonymous attacker can exhaust to lock the owner out of the
+ * only path that authorizes the bridge. Assert the keying itself, on every limited route, under
+ * both topologies — the single-client 429 case above cannot tell "limited the attacker" from
+ * "limited everyone".
+ */
+interface LimitedRoute {
+  name: string;
+  hit: (base: string, client: string) => Promise<Response>;
+}
+
+const xff = (client: string): Record<string, string> => ({ 'x-forwarded-for': client });
+
+const LIMITED_ROUTES: LimitedRoute[] = [
+  {
+    name: '/parley/consent',
+    hit: (base, client) =>
+      fetch(`${base}/parley/consent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', ...xff(client) },
+        body: form({ consent_id: 'nonexistent', passphrase: 'wrong' }),
+        redirect: 'manual',
+      }),
+  },
+  {
+    name: '/authorize',
+    hit: (base, client) =>
+      fetch(`${base}/authorize?client_id=nobody`, { headers: xff(client), redirect: 'manual' }),
+  },
+  {
+    name: '/token',
+    hit: (base, client) =>
+      fetch(`${base}/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', ...xff(client) },
+        body: form({ grant_type: 'authorization_code', client_id: 'nobody' }),
+      }),
+  },
+  {
+    name: '/register',
+    hit: (base, client) =>
+      fetch(`${base}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...xff(client) },
+        body: JSON.stringify({ redirect_uris: [CLIENT_REDIRECT] }),
+      }),
+  },
+  {
+    name: '/revoke',
+    hit: (base, client) =>
+      fetch(`${base}/revoke`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', ...xff(client) },
+        body: form({ token: 'nothing', client_id: 'nobody' }),
+      }),
+  },
+];
+
+interface Topology {
+  name: string;
+  trustProxy: boolean | string;
+  /** Whether two X-Forwarded-For values must land in the SAME bucket under this topology. */
+  sharesBucket: boolean;
+}
+
+const TOPOLOGIES: Topology[] = [
+  // Direct exposure: the header is attacker-controlled noise and must not mint a fresh bucket.
+  { name: 'directly exposed', trustProxy: false, sharesBucket: true },
+  { name: 'behind one reverse-proxy hop', trustProxy: 'loopback', sharesBucket: false },
+];
+
+const ATTACKER = '203.0.113.9';
+const OWNER = '198.51.100.4';
+
+describe('a rate limiter must key on the client the operator actually deploys behind', () => {
+  let app: OAuthRemoteServer;
+  let base: string;
+
+  async function boot(trustProxy?: boolean | string): Promise<void> {
+    const port = await freePort();
+    base = `http://127.0.0.1:${port}`;
+    app = createOAuthRemoteApp(plugin, parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] }), {
+      issuerUrl: new URL(base),
+      verifyOwner: ownerVerifierFromPassphrase(OWNER_PASS),
+      ...(trustProxy !== undefined ? { trustProxy } : {}),
+    });
+    await app.listen(port);
+  }
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  const remaining = (res: Response): number => Number(res.headers.get('ratelimit-remaining'));
+
+  const ROWS = TOPOLOGIES.flatMap((t) =>
+    LIMITED_ROUTES.map((r): [string, Topology, LimitedRoute] => [
+      `${r.name} when ${t.name}`,
+      t,
+      r,
+    ]),
+  );
+
+  it.each(ROWS)('%s', async (_name: string, t: Topology, route: LimitedRoute) => {
+    await boot(t.trustProxy);
+    const first = remaining(await route.hit(base, ATTACKER));
+    const second = remaining(await route.hit(base, OWNER));
+    expect(first).toBeGreaterThan(0);
+    expect(second).toBe(t.sharesBucket ? first - 1 : first);
+  });
+
+  // An operator who never names a topology gets the safe one: an app that took the header on
+  // trust by default would be exploitable in exactly the deployment that never configured it.
+  it('treats an unconfigured app as directly exposed, not as trusting the header', async () => {
+    await boot();
+    const first = remaining(await LIMITED_ROUTES[0]!.hit(base, ATTACKER));
+    const second = remaining(await LIMITED_ROUTES[0]!.hit(base, OWNER));
+    expect(second).toBe(first - 1);
+  });
+
+  it('leaves the owner a way in after an anonymous flood, once the proxy hop is declared', async () => {
+    await boot('loopback');
+    const CONSENT_LIMIT = 10;
+    let last: Response | undefined;
+    for (let i = 0; i < CONSENT_LIMIT + 1; i++) {
+      last = await LIMITED_ROUTES[0]!.hit(base, ATTACKER);
+    }
+    expect(last!.status).toBe(429);
+    expect((await LIMITED_ROUTES[0]!.hit(base, OWNER)).status).toBe(403);
+  });
+});

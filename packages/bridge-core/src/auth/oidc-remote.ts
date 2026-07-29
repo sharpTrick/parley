@@ -9,7 +9,7 @@ import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { fetchOidcDiscovery } from './oidc-discovery.js';
 import { OidcTokenVerifier } from './oidc-verifier.js';
-import { assertIdentityGate, assertRootPath } from './invariants.js';
+import { assertIdentityGate, assertPublicBaseUrl } from './invariants.js';
 
 export interface OidcRemoteOptions {
   /** Public base URL of THIS resource server (what Claude reaches) — NOT the OAuth issuer;
@@ -49,7 +49,7 @@ export async function createOidcRemoteApp(
   opts: OidcRemoteOptions,
 ): Promise<OidcRemoteServer> {
   const mcpPath = opts.mcpPath ?? '/mcp';
-  assertRootPath(opts.publicUrl, 'publicUrl');
+  assertPublicBaseUrl(opts.publicUrl, 'publicUrl');
   const resource = new URL(mcpPath, opts.publicUrl); // canonical resource id (no trailing slash)
   const oidc = opts.oidc;
   assertIdentityGate(oidc);

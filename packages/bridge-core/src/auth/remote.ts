@@ -10,7 +10,7 @@ import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
-import { assertRootPath } from './invariants.js';
+import { assertPublicBaseUrl } from './invariants.js';
 
 export interface OAuthRemoteOptions {
   /** Public origin = issuer = base URL (AS = RS, single tenant). HTTPS in production; localhost ok in dev. */
@@ -20,6 +20,15 @@ export interface OAuthRemoteOptions {
   /** MCP endpoint path. Default `/mcp`. The canonical resource id is `issuerUrl + mcpPath` (no trailing slash). */
   mcpPath?: string;
   scopesSupported?: string[];
+  /**
+   * Express `trust proxy` value. Every endpoint below is rate-limited per client address, so this
+   * must describe the real deployment: the default `false` is correct only when the socket peer IS
+   * the client. Behind the TLS terminator of examples/self-host-remote, pass `'loopback'` (or the
+   * hop count) — otherwise every caller shares the proxy's address in a single bucket and an
+   * anonymous attacker can exhaust it to lock the owner out of the only path that authorizes the
+   * bridge.
+   */
+  trustProxy?: boolean | number | string | string[];
   /** Injectable clock for tests. */
   now?: () => number;
 }
@@ -45,7 +54,7 @@ export function createOAuthRemoteApp(
   oauth: OAuthRemoteOptions,
 ): OAuthRemoteServer {
   const mcpPath = oauth.mcpPath ?? '/mcp';
-  assertRootPath(oauth.issuerUrl, 'issuerUrl');
+  assertPublicBaseUrl(oauth.issuerUrl, 'issuerUrl');
   const resource = new URL(mcpPath, oauth.issuerUrl); // canonical resource id (no trailing slash)
 
   const provider = new ParleyOAuthProvider({
@@ -78,6 +87,8 @@ export function createOAuthRemoteApp(
     mcpPath,
     protect: bearer,
     configureApp: (app) => {
+      app.set('trust proxy', oauth.trustProxy ?? false);
+
       // OAuth AS endpoints + AS metadata + Protected Resource Metadata, mounted at the root.
       // (Do NOT add json/urlencoded parsers in front — these handlers install their own.)
       app.use(

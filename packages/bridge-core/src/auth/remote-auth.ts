@@ -13,6 +13,8 @@ export interface RemoteAuthOptions {
   mcpPath?: string;
   /** builtin mode only. */
   scopesSupported?: string[];
+  /** builtin mode only: Express `trust proxy` value for the rate limiters. See OAuthRemoteOptions. */
+  trustProxy?: boolean | number | string | string[];
   /** Injectable clock for tests. */
   now?: () => number;
   /** oidc mode only: injectable fetch for the boot-time discovery request. */
@@ -54,6 +56,7 @@ export async function createRemoteAuthApp(
     verifyOwner: opts.verifyOwner,
     ...(opts.mcpPath !== undefined ? { mcpPath: opts.mcpPath } : {}),
     ...(opts.scopesSupported !== undefined ? { scopesSupported: opts.scopesSupported } : {}),
+    ...(opts.trustProxy !== undefined ? { trustProxy: opts.trustProxy } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
 }

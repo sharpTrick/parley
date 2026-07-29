@@ -74,6 +74,84 @@ async function mintCode(p: ParleyOAuthProvider, client: OAuthClientInformationFu
   return code;
 }
 
+/**
+ * Every lifetime this provider grants is a policy number, and a sweep that advances past all of
+ * them at once cannot tell one from another: an inflated constant leaves the artefact usable a
+ * thousand times as long with nothing red. Each row pins its own TTL from BOTH sides.
+ */
+interface TtlCase {
+  name: string;
+  ttlMs: number;
+  /** Seed the artefact at the current clock; the probe exercises it at whatever the clock then reads. */
+  seed: (
+    p: ParleyOAuthProvider,
+    client: OAuthClientInformationFull,
+  ) => Promise<() => Promise<unknown>>;
+}
+
+const TTL_CASES: TtlCase[] = [
+  {
+    name: 'a pending owner consent',
+    ttlMs: 5 * 60_000,
+    seed: async (p, client) => {
+      await p.authorize(client, makeParams(), fakeRes());
+      const consentId = [...peek(p).pending.keys()].at(-1);
+      if (consentId === undefined) throw new Error('no pending consent seeded');
+      return () => p.completeConsent(consentId, GOOD_PASS);
+    },
+  },
+  {
+    name: 'an authorization code',
+    ttlMs: 60_000,
+    seed: async (p, client) => {
+      const code = await mintCode(p, client, makeParams());
+      return () => p.challengeForAuthorizationCode(client, code);
+    },
+  },
+  {
+    name: 'an access token',
+    ttlMs: 60 * 60_000,
+    seed: async (p, client) => {
+      const { access_token } = peek(p).issue(client.client_id, ['mcp'], RESOURCE.href);
+      return () => p.verifyAccessToken(access_token);
+    },
+  },
+  {
+    name: 'a refresh token',
+    ttlMs: 30 * 24 * 60 * 60_000,
+    seed: async (p, client) => {
+      const { refresh_token } = peek(p).issue(client.client_id, ['mcp'], RESOURCE.href);
+      if (refresh_token === undefined) throw new Error('no refresh token issued');
+      return () => p.exchangeRefreshToken(client, refresh_token);
+    },
+  },
+];
+
+describe('ParleyOAuthProvider — every TTL is bounded from both sides', () => {
+  async function probeAt(c: TtlCase, offsetMs: number): Promise<'usable' | 'refused'> {
+    let clock = 1_000_000;
+    const p = makeProvider(() => clock);
+    const client = makeClient();
+    peek(p).clients.set(client.client_id, client);
+    const probe = await c.seed(p, client);
+    clock += c.ttlMs + offsetMs;
+    try {
+      await probe();
+      return 'usable';
+    } catch {
+      return 'refused';
+    }
+  }
+
+  it.each(TTL_CASES.map((c) => [c.name, c]))(
+    '%s is usable just before its TTL and refused just after',
+    async (_name: string, c: TtlCase) => {
+      expect(await probeAt(c, -1000)).toBe('usable');
+      expect(await probeAt(c, 1000)).toBe('refused');
+    },
+  );
+});
+
 describe('ParleyOAuthProvider — expired state is swept, not left to accumulate', () => {
   it('sweeps every expired code/refresh/pending/access entry once the clock advances past their TTLs', async () => {
     let clock = 1_000_000;

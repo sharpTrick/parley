@@ -21,7 +21,9 @@ export async function fetchOidcDiscovery(
 
   let res: Response;
   try {
-    res = await fetchFn(url);
+    // Keep `redirect: 'manual'`, so that a 3xx cannot move the trust root to another origin
+    // before the issuer check ever sees the document.
+    res = await fetchFn(url, { redirect: 'manual' });
   } catch (err) {
     throw new Error(
       `OIDC discovery failed: cannot reach ${url} (${err instanceof Error ? err.message : String(err)})`,

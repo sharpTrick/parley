@@ -59,6 +59,57 @@ describe('auth-layer comment discipline', () => {
 });
 
 /**
+ * A symbol the barrel re-exports is something an operator can call directly, so the config
+ * schema's rules are not in front of it — whatever guards it must live in the function and be
+ * driven by a test. An entry point whose only coverage is an env-gated e2e file has none in the
+ * offline gate that decides whether a change lands.
+ */
+function importedNames(source: string): Set<string> {
+  const names = new Set<string>();
+  for (const match of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\.\/[\w.-]+\.js'/g)) {
+    for (const raw of (match[1] ?? '').split(',')) {
+      const name = raw.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0];
+      if (name !== undefined && name !== '') names.add(name);
+    }
+  }
+  return names;
+}
+
+function barrelExportedAuthValues(): string[] {
+  const barrel = readFileSync(`${CORE_SRC}index.ts`, 'utf8');
+  const out: string[] = [];
+  for (const match of barrel.matchAll(/export\s*\{([^}]*)\}\s*from\s*'\.\/auth\/[\w.-]+\.js'/g)) {
+    for (const raw of (match[1] ?? '').split(',')) {
+      const entry = raw.trim();
+      if (entry === '' || entry.startsWith('type ')) continue;
+      out.push(entry.split(/\s+as\s+/)[0]!);
+    }
+  }
+  return out;
+}
+
+describe('every public auth entry point is driven by the offline suite', () => {
+  const covered = new Set<string>();
+  for (const file of tsFiles(AUTH_DIR)) {
+    if (!file.endsWith('.test.ts') || file.endsWith('.e2e.test.ts')) continue;
+    for (const name of importedNames(readFileSync(file, 'utf8'))) covered.add(name);
+  }
+
+  const exported = barrelExportedAuthValues();
+
+  it('finds the barrel auth exports to scan', () => {
+    expect(exported.length).toBeGreaterThan(5);
+  });
+
+  it.each(exported.map((n) => [n]))(
+    '%s is imported by a test that runs without a live IdP',
+    (name: string) => {
+      expect(covered.has(name), `${name} is re-exported from src/index.ts but no non-e2e auth test imports it`).toBe(true);
+    },
+  );
+});
+
+/**
  * A suite that decides whether to run from a runtime reachability probe reports a green,
  * named, meaningless test when the dependency is merely slow or briefly down — in the same CI
  * job that claims to verify it. Opting out must be explicit.

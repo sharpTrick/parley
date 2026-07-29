@@ -47,6 +47,20 @@ function withGate(oidcExtras: Record<string, unknown> = {}): OidcAuthConfig {
   } as unknown as OidcAuthConfig;
 }
 
+/**
+ * The oidc config `boot()` will actually pass, with a check that no default survives on top of a
+ * key the caller varied: a fixture that re-sets the parameter under test after the spread turns
+ * every case that varies it into a case that asserts the default.
+ */
+function oidcConfigFor(oidcExtras: Record<string, unknown>): OidcAuthConfig {
+  const defaults: Record<string, unknown> = { issuer: idp.issuer };
+  const effective = { ...defaults, ...(withGate(oidcExtras) as unknown as Record<string, unknown>) };
+  for (const key of Object.keys(oidcExtras)) {
+    expect(effective[key], `boot() discarded the caller's oidc.${key}`).toEqual(oidcExtras[key]);
+  }
+  return effective as unknown as OidcAuthConfig;
+}
+
 /** Boot a delegated-RS remote app on a free port with the given oidc config extras. */
 async function boot(oidcExtras: Record<string, unknown> = {}): Promise<void> {
   const port = await freePort();
@@ -55,7 +69,7 @@ async function boot(oidcExtras: Record<string, unknown> = {}): Promise<void> {
   await plugin.connect({});
   remote = await createOidcRemoteApp(plugin, baseCfg(), {
     publicUrl: new URL(origin),
-    oidc: { ...withGate(oidcExtras), issuer: idp.issuer },
+    oidc: oidcConfigFor(oidcExtras),
   });
   await remote.listen(port);
 }
@@ -197,14 +211,40 @@ describe('remote OIDC front door (delegated resource server)', () => {
     expect(urlAud.status).toBe(401);
   });
 
-  it('authorizes valid tokens when the configured issuer has a trailing slash', async () => {
-    // Issuer configured WITH a trailing slash; the fake IdP mints `iss` WITHOUT one. The verifier
-    // must be built from the discovery document's canonical issuer, or jose's exact `iss` match
-    // rejects every token (healthy boot, 100% token rejection).
-    await boot({ issuer: `${idp.issuer}/` });
-    const res = await postMcp({ Authorization: `Bearer ${await idp.mint({ aud: `${origin}/mcp` })}` });
-    expect(res.status).toBe(200);
-  });
+  // The IdP mints `iss` in exactly one spelling. Every spelling of the CONFIGURED issuer that this
+  // server agrees to boot on must therefore still authorize that token: building the verifier from
+  // the configured string instead of the discovery document's canonical issuer is a healthy boot
+  // followed by 100% token rejection, which no boot-time check can see.
+  const ISSUER_SPELLINGS: Array<[string, string, 'boots' | 'refuses']> = [
+    ['exactly as the IdP publishes it', '', 'boots'],
+    ['with a trailing slash', '/', 'boots'],
+    ['with a doubled trailing slash', '//', 'refuses'],
+  ];
+
+  it.each(ISSUER_SPELLINGS)(
+    'an issuer configured %s %s',
+    async (_label: string, suffix: string, verdict: 'boots' | 'refuses') => {
+      const configured = `${idp.issuer}${suffix}`;
+      if (verdict === 'refuses') {
+        const port = await freePort();
+        plugin = new FakePlugin();
+        await plugin.connect({});
+        await expect(
+          createOidcRemoteApp(plugin, baseCfg(), {
+            publicUrl: new URL(`http://127.0.0.1:${port}`),
+            oidc: { ...withGate(), issuer: configured },
+          }),
+        ).rejects.toThrow(/OIDC discovery failed/);
+        await boot(); // satisfy afterEach
+        return;
+      }
+      await boot({ issuer: configured });
+      const res = await postMcp({
+        Authorization: `Bearer ${await idp.mint({ aud: `${origin}/mcp` })}`,
+      });
+      expect(res.status).toBe(200);
+    },
+  );
 
   it('enforces the identity gate end to end: a mismatched subject is 401', async () => {
     await boot({ allowed_subjects: ['owner-sub'] });
