@@ -36,28 +36,41 @@ jobs:
           node-version: "22.x"
           registry-url: "https://registry.npmjs.org"
 
-      # --- Test gate (mirrors ci.yml: Redis + NATS run for real, Matrix/XMPP self-skip) ---
+      # --- Test gate (mirrors ci.yml, including the no-skip assertion) ---
       # Runs on the npm bundled with Node 22 (via setup-node), exactly like ci.yml. Do NOT upgrade npm
       # before this gate: npm 12 (2026-07-08) changed install handling so `npm ci` no longer builds
       # better-sqlite3's native binary — which turned the whole SQLite suite red here on 2026-07-11 while
       # ci.yml (bundled npm) stayed green. The npm upgrade needed for trusted publishing runs after the gate.
-      - name: Start Redis
-        run: docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
-      - name: Start NATS (JetStream)
-        run: docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
-      - name: Wait for Redis + NATS to accept connections
-        shell: bash
-        run: |
-          for port in 6379 4222; do
-            for i in $(seq 1 30); do
-              (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && { echo "port $port up"; break; }
-              sleep 1
-            done
-          done
-
       - run: npm ci
       - run: npm run build
-      - run: npm test
+
+      # Same one-command bring-up as ci.yml and as a maintainer's laptop — the recipes live in
+      # examples/dev-compose/, never duplicated into workflow YAML. A release must not publish on
+      # a gate weaker than the PR's.
+      - name: Start backing services (redis, nats, postgres, xmpp, matrix, keycloak)
+        run: ./examples/dev-compose/dev-infra.sh up all
+
+      - run: npm test -- --reporter=default --reporter=json --outputFile=/tmp/vitest.json
+
+      # Publishing on a green-because-it-skipped run is the failure this guards against.
+      - name: Assert no test file skipped entirely
+        run: |
+          node -e '
+            const r = require("/tmp/vitest.json");
+            const dead = r.testResults.filter(
+              (f) => f.assertionResults.length > 0 && f.assertionResults.every((a) => a.status === "skipped"),
+            );
+            if (dead.length) {
+              console.error("refusing to release — these test files skipped ENTIRELY:");
+              for (const f of dead) console.error("  " + f.name);
+              process.exit(1);
+            }
+            console.log(`ok: 0 of ${r.testResults.length} test files skipped entirely`);
+          '
+
+      - name: Server logs on failure
+        if: failure()
+        run: docker compose -f examples/dev-compose/docker-compose.yml logs --tail=200
 
       # --- Release: bump decided from commits, tag + GitHub Release, lockstep npm publish ---
       # Trusted publishing (OIDC) needs npm >= 11.5.1, newer than Node 22 bundles — upgrade npm ONLY here,

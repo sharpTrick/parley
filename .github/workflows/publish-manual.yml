@@ -31,10 +31,18 @@ jobs:
           node-version: "22.x"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Ensure npm supports trusted publishing
-        run: npm install -g npm@latest
-
+      # Install and build on the npm bundled with Node 22, exactly like ci.yml and release.yml.
       - run: npm ci
       - run: npm run build
+
+      # Only now upgrade npm, and only as far as release.yml does. This used to be
+      # `npm install -g npm@latest` placed BEFORE `npm ci`, which is doubly wrong: npm 12
+      # (2026-07-08) stopped building better-sqlite3's native binary under `npm ci` — the exact
+      # breakage release.yml pins away from — so the recovery path installed with the known-bad
+      # npm and then published from that tree. This is the escape hatch used when a release has
+      # already gone wrong; it must be the most conservative path, not the least.
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g "npm@^11.5.1"
+
       - run: node scripts/stamp-version.mjs "${{ inputs.version }}"
       - run: node scripts/publish-workspaces.mjs

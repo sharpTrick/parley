@@ -22,31 +22,45 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
-      # Redis and NATS (JetStream) are cheap, single-container, no-config-needed servers, so their
-      # conformance suites run for real here — same `docker run` commands as each plugin's README.
-      # Matrix (Synapse) and XMPP (Prosody) need one-time server config generation + user
-      # registration (see examples/dev-compose/README.md) and are NOT wired into CI yet; their
-      # conformance suites skip themselves cleanly here, exactly as they would on any dev machine
-      # with no server running.
-      - name: Start Redis
-        run: docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
-
-      - name: Start NATS (JetStream)
-        run: docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
-
-      - name: Wait for Redis + NATS to accept connections
-        shell: bash
-        run: |
-          for port in 6379 4222; do
-            for i in $(seq 1 30); do
-              (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && { echo "port $port up"; break; }
-              sleep 1
-            done
-          done
-
       - run: npm ci
       - run: npm run build
-      - run: npm test
+
+      # Every server the suites can use, via the same script maintainers run locally
+      # (examples/dev-compose/dev-infra.sh) rather than a second copy of the recipes here — so CI
+      # and the dev path cannot drift. Brings up redis, nats, postgres, prosody, synapse and
+      # keycloak, waits for each to genuinely serve, and seeds the `parley` test account.
+      #
+      # Without this the suites do not fail — they `describe.skip` themselves and CI goes green
+      # having never exercised them. Before this step ran, 7 of 57 test files were skipped on every
+      # build, including the conformance suites for the two largest plugins (bridge-matrix at 803
+      # lines and bridge-xmpp at 674) and the entire external-OIDC auth path.
+      - name: Start backing services (redis, nats, postgres, xmpp, matrix, keycloak)
+        run: ./examples/dev-compose/dev-infra.sh up all
+
+      # One run, two reporters: the readable log for humans and JSON for the skip gate below.
+      - run: npm test -- --reporter=default --reporter=json --outputFile=/tmp/vitest.json
+
+      # A self-skipping suite is indistinguishable from a passing one in the summary line, so
+      # assert the property this job exists to provide: on CI, no file skips. Any backend whose
+      # server failed to come up silently removes its own coverage and still reports success.
+      - name: Assert no test file skipped entirely
+        run: |
+          node -e '
+            const r = require("/tmp/vitest.json");
+            const dead = r.testResults.filter(
+              (f) => f.assertionResults.length > 0 && f.assertionResults.every((a) => a.status === "skipped"),
+            );
+            if (dead.length) {
+              console.error("these test files skipped ENTIRELY — their server was unreachable:");
+              for (const f of dead) console.error("  " + f.name);
+              process.exit(1);
+            }
+            console.log(`ok: 0 of ${r.testResults.length} test files skipped entirely`);
+          '
+
+      - name: Server logs on failure
+        if: failure()
+        run: docker compose -f examples/dev-compose/docker-compose.yml logs --tail=200
 
   # Catch release-publish failures on the PR, not post-merge when release.yml runs on main. The
   # release publishes with OIDC / trusted publishing, which can't bootstrap a brand-new package —
