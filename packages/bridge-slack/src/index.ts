@@ -64,6 +64,10 @@ class SlackApiError extends Error {
 const ABSENT_ON_READ = ['channel_not_found', 'not_in_channel'];
 const ABSENT_ON_WRITE = ['channel_not_found'];
 
+/** First and maximum cooldown between poll-driven `apps.connections.open` dials. */
+const DIAL_BACKOFF_MS = 500;
+const MAX_DIAL_BACKOFF_MS = 5_000;
+
 const asSeamError = (e: unknown, topic: Topic, absentCodes: string[]): unknown =>
   e instanceof SlackApiError && absentCodes.includes(e.code) ? new NoSuchTopicError(topic) : e;
 
@@ -98,18 +102,31 @@ interface Waiter {
 }
 
 /**
- * The subtypes that carry NEW channel-level content: no subtype (a plain post), `bot_message`
- * (an app post), `file_share` (a file/screenshot posted with its caption) and `me_message`.
- * Widen this only for subtypes that are genuinely new content with their own `ts` — admitting a
- * mutation record (`message_changed`, `message_deleted`, `tombstone`) republishes an EXISTING `ts`
- * with different content, which breaks dedup for every reader; admitting a system record
- * (`channel_join`, `channel_topic`, …) puts join spam into agent context.
+ * The subtypes carrying new channel-level content, alongside a plain (subtype-less) post.
+ *
+ * Widen this only for a subtype that is new content with its own `ts`. Keep mutation records
+ * (`message_changed`, `message_deleted`, `tombstone`) out, so that a human utterance already
+ * delivered under its own id is not delivered a second time under the mutation's id; keep system
+ * records (`channel_join`, `channel_topic`, …) out, so that join spam stays out of agent context.
  */
-const SURFACED_SUBTYPES = new Set(['bot_message', 'file_share', 'me_message']);
+const SURFACED_SUBTYPES = new Set(['bot_message', 'file_share', 'me_message', 'thread_broadcast']);
+
+/**
+ * `ts` shape: `<seconds>.<fraction>`. Every inbound record is vendor- or attacker-controlled, so
+ * keep this narrow ahead of every use of `ts`, so that a malformed field cannot reach `compareTs`,
+ * `new Date(...)` or `asBackendMsgId` — where it throws, or mints an empty dedup key.
+ */
+const hasUsableTs = (m: unknown): m is SlackMessage =>
+  typeof m === 'object' &&
+  m !== null &&
+  typeof (m as SlackMessage).ts === 'string' &&
+  /^\d+\.\d+$/.test((m as SlackMessage).ts);
 
 /** A channel-level message we surface — see {@link SURFACED_SUBTYPES}. */
-const isPlainMessage = (m: SlackMessage): boolean =>
-  m.type === 'message' && (m.subtype === undefined || SURFACED_SUBTYPES.has(m.subtype));
+const isPlainMessage = (m: unknown): m is SlackMessage =>
+  hasUsableTs(m) &&
+  m.type === 'message' &&
+  (m.subtype === undefined || (typeof m.subtype === 'string' && SURFACED_SUBTYPES.has(m.subtype)));
 
 /**
  * Slack backend (DESIGN §6/§9) over the raw Web API (`fetch`) + Socket Mode (`ws`) — no Slack SDK.
@@ -139,22 +156,27 @@ export class SlackPlugin implements BackendPlugin {
   /** channel id → the topic + handler it feeds (Socket Mode events carry the channel id). */
   private readonly routes = new Map<string, { topic: Topic; handler: MessageHandler }>();
   /**
-   * channel id → the set of native long-poll waiters parked on that channel (issue #20). Populated
-   * only while a `fetchRecent({ blockMs })` is blocked; hooks the SAME shared Socket Mode stream as
+   * channel id → the set of native long-poll waiters parked on that channel. Populated only while
+   * a `fetchRecent({ blockMs })` is blocked; hooks the SAME shared Socket Mode stream as
    * `subscribe`, independent of whether any route is registered. Drained on wake/timeout/disconnect.
    */
   private readonly waiters = new Map<string, Set<Waiter>>();
   /** Memoized `auth.test` (our own bot identity) for {@link resolveIdentity}. */
   private authTestPromise?: Promise<AuthTestResponse>;
+  /** Earliest wall clock at which a poll-driven handshake may dial — see {@link ensurePollSocket}. */
+  private dialCooldownUntil = 0;
+  private dialBackoffMs = DIAL_BACKOFF_MS;
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SlackBackendConfig;
     this.apiUrl = (cfg.api_url ?? 'https://slack.com/api').replace(/\/+$/, '');
     this.botToken = cfg.bot_token;
     this.appToken = cfg.app_token;
-    this.channelMap = cfg.channel_map ?? {};
+    this.channelMap = requireDistinctChannels(cfg.channel_map ?? {});
     this.stopped = false;
     this.connected = true;
+    this.dialCooldownUntil = 0;
+    this.dialBackoffMs = DIAL_BACKOFF_MS;
   }
 
   async disconnect(): Promise<void> {
@@ -179,15 +201,14 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * `chat.postMessage`. THREADING IS AN APPROXIMATION: `inReplyTo` becomes `thread_ts`, which
-   * files the message under that thread — Slack thread replies do NOT surface at channel level
-   * (in `conversations.history` or channel-level `message` events) unless broadcast, so a
-   * threaded reply is durable but only visible when reading the thread. The conformance suite
-   * never uses `inReplyTo`; top-level posts (the normal Parley path) are unaffected.
+   * `chat.postMessage`. Threading is an approximation: `inReplyTo` becomes `thread_ts`, filing the
+   * message under that thread. A plain thread reply is only visible when reading the thread; a
+   * reply broadcast to the channel comes back as a `thread_broadcast` entry, which we surface.
+   * `identity` is the logical sender only — Slack stamps our bot user as the wire sender.
    */
   async post(
     topic: Topic,
-    identity: Handle,
+    _identity: Handle,
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
@@ -199,40 +220,19 @@ export class SlackPlugin implements BackendPlugin {
         throw asSeamError(e, topic, ABSENT_ON_WRITE);
       },
     );
-    // identity is the logical sender; Slack stamps the wire sender as our bot user.
-    void identity;
     return asBackendMsgId(resp.ts);
   }
 
   /**
-   * `conversations.history`, exclusive `oldest` = `since` (`inclusive` is NEVER set, keeping the
-   * API's default exclusivity — DESIGN §6's exclusive-`since` contract, server-side).
-   *
-   * COST CAVEAT: Slack returns pages NEWEST-first and `response_metadata.next_cursor` pages
-   * FURTHER BACK in time, while the seam wants the OLDEST unseen page (ascending, resuming after
-   * `since`). So with `since` set we must page ALL the way to the OLDEST end of `(since, now]` —
-   * until the cursor runs out — then sort ascending and take the FIRST `limit` entries. There is NO
-   * page cap on this walk: capping it would return the newest `limit` of a truncated set and set
-   * `nextCursor` ABOVE the never-fetched older messages, permanently skipping the middle of a long
-   * backlog (the skipped span sits below `nextCursor` and no later catch-up would ever revisit it —
-   * BUG-18). A reader that's been offline across a huge backlog therefore pays O(backlog / page)
-   * requests for one call — and the NEXT call re-walks the (now shorter) remainder, so draining a
-   * backlog end to end costs ~backlog² / (2 · limit · page) requests in aggregate, not
-   * O(backlog / page). Raise `catchup.limit` on Slack: the aggregate cost falls linearly with it.
-   * Memory stays O(limit) regardless: since pages arrive newest-first, the oldest
-   * live at the tail, so we retain only a rolling tail of ~`limit + page_size` collected messages
-   * and discard the newer ones as older pages arrive. Without `since` only the most recent `limit`
-   * are needed, so paging stops as soon as enough PLAIN (surfaced) messages have been collected —
-   * counting plain, not raw, so a system-subtype-heavy page can't cut the window short (BUG-31).
+   * `conversations.history` with `oldest` = `since`, exclusive (`inclusive` is NEVER set), plus the
+   * native long-poll when `blockMs` is asked for. The aggregate request cost of draining a backlog
+   * this way, and the `catchup.limit` that reduces it, are documented in the package README.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const first = await this.runFetch(args);
 
     const blockMs = args.blockMs ?? 0;
-    // Native long-poll engages ONLY when asked (blockMs > 0), resuming a `since`, and the exclusive
-    // query came back empty. Any other case is the unchanged durable catch-up. Returning early/empty
-    // is always safe — core's generic wrapper polls the remaining budget — so this stays conservative.
     if (blockMs <= 0 || args.since === undefined || first.messages.length > 0) {
       return first;
     }
@@ -240,27 +240,20 @@ export class SlackPlugin implements BackendPlugin {
     const channel = this.channelFor(args.topic);
     const sinceTs = String(args.since);
     try {
-      // Wait on the EXISTING shared Socket Mode stream (the one `subscribe` uses); never a 2nd socket.
-      await this.ensureSocket();
+      await this.ensurePollSocket();
     } catch {
-      // Live stream unavailable (e.g. no app token) — hand back the empty page; core polls onward.
       return first;
     }
-    // Arm the waiter FIRST, then run the gap-closing re-query, so the waiter is live across that
-    // snapshot window: a push that lands mid-query is caught, not lost (otherwise onEnvelope could
-    // process the push before this HTTP response resolves and the waiter is armed — a lost wakeup).
+    // Keep the waiter armed BEFORE the gap-closing re-query, so that a push landing while that
+    // query is in flight is caught rather than lost — a lost wakeup here blocks for the whole budget.
     const { wait, wake } = this.armWaiter(channel, sinceTs, blockMs);
 
-    // Re-query once the socket is live: a message may have landed in the gap between `first` and the
-    // socket becoming ready. If so, cancel the (now-redundant) waiter and return immediately.
     const afterConnect = await this.runFetch(args);
     if (afterConnect.messages.length > 0) {
       wake();
       return afterConnect;
     }
 
-    // Park on the live stream until a message strictly after `since` arrives, blockMs elapses, or we
-    // disconnect. Then re-run the canonical exclusive query for canonical ids/cursor.
     await wait;
     if (this.stopped) return { messages: [], nextCursor: args.since };
     return this.runFetch(args);
@@ -272,10 +265,9 @@ export class SlackPlugin implements BackendPlugin {
     const limit = args.limit ?? 100;
     const resumeAfterSince = args.since !== undefined;
 
-    // SURFACED messages only — every window decision below must count these, never raw entries.
-    // Counting raw lets a system-subtype-heavy stretch end the walk early (BUG-31) or survive the
-    // trim as a tail that filters down to nothing, which returns an empty page whose `nextCursor`
-    // is `since` — a caller looping on that cursor never reaches the messages behind it.
+    // Keep every window decision below counting SURFACED messages, never raw entries, so that a
+    // system-subtype-heavy stretch cannot end the walk early or survive the trim as a tail that
+    // filters down to nothing — an empty page whose `nextCursor` is `since` livelocks the caller.
     const collected: SlackMessage[] = [];
     let newestSeenTs: string | undefined;
     let pageCursor: string | undefined;
@@ -288,7 +280,7 @@ export class SlackPlugin implements BackendPlugin {
           throw asSeamError(e, args.topic, ABSENT_ON_READ);
         },
       );
-      const page = resp.messages ?? [];
+      const page = (resp.messages ?? []).filter(hasUsableTs);
       for (const m of page) {
         if (newestSeenTs === undefined || compareTs(m.ts, newestSeenTs) > 0) newestSeenTs = m.ts;
       }
@@ -299,17 +291,15 @@ export class SlackPlugin implements BackendPlugin {
         if (collected.length >= limit) break;
         if (pageCursor === undefined) break;
       } else {
-        // Resume-after-`since`: walk to the OLDEST end so `nextCursor` never sits above unfetched
-        // history (BUG-18). Pages are newest-first, so the oldest live at the tail; keep only the
-        // oldest ~`limit + page_size` so memory stays O(limit) while the request count is the
-        // documented O(backlog / page) cost caveat.
+        // Keep the resume-after-`since` walk uncapped, so that `nextCursor` can never come to rest
+        // above unfetched older history — the skipped span sits below it and no later catch-up
+        // would ever revisit it. Pages arrive newest-first, so retaining only the oldest
+        // ~`limit + page_size` keeps memory at O(limit) while the walk runs to cursor exhaustion.
         if (collected.length > limit + 200) collected.splice(0, collected.length - (limit + 200));
-        if (pageCursor === undefined) break; // NO page cap: walk to cursor exhaustion.
+        if (pageCursor === undefined) break;
       }
     }
 
-    // Defensive ascending re-sort after multi-page assembly (pages arrive newest-first; never
-    // trust concatenation order, and never compare `ts` lexically or as floats — compareTs).
     const events = collected.sort((a, b) => compareTs(a.ts, b.ts));
     const window = resumeAfterSince ? events.slice(0, limit) : events.slice(-limit);
     const messages = window.map((m) => slackToMessage(args.topic, m));
@@ -317,9 +307,9 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * The cursor for a window that surfaced nothing. Stepping past the system records is safe ONLY
-   * because the `since` walk ran to cursor exhaustion: every entry above `since` was seen and none
-   * was surfacable, so nothing can be skipped. Keep that exhaustiveness, or this drops messages.
+   * The cursor for a window that surfaced nothing. Keep the `since` walk exhaustive (see
+   * {@link runFetch}), so that stepping the cursor past those unsurfaced entries cannot skip a
+   * message: it is safe only because every entry above `since` was seen and none was surfacable.
    */
   private emptyCursor(args: FetchRecentArgs, newestSeenTs: string | undefined): Cursor {
     if (args.since !== undefined && newestSeenTs !== undefined) return asCursor(newestSeenTs);
@@ -328,18 +318,22 @@ export class SlackPlugin implements BackendPlugin {
 
   /**
    * Live path = ONE shared Socket Mode websocket (DESIGN §9 — genuine Events API pushes, not a
-   * poll timer). `apps.connections.open` (app token) mints a SINGLE-USE websocket URL; the socket
-   * is established — `hello` envelope received — BEFORE this resolves, so a post immediately after
-   * subscribe() is guaranteed to be pushed. Slack's Events API only pushes NEW events, so the
-   * subscription naturally starts at the tail; history is owned by catch-up. Our own
-   * `chat.postMessage` output IS delivered (Slack pushes the bot's messages back like anyone
-   * else's). On a `disconnect` envelope or socket close while running, we reconnect via a FRESH
-   * `apps.connections.open` with backoff — the push gap across the reconnect is reconciled by
-   * cursor catch-up (DESIGN §6). `disconnect()` closes the socket and stops the reconnect loop.
+   * poll timer). `apps.connections.open` (app token) mints a single-use websocket URL; the socket
+   * is established — `hello` received — before this resolves, so a post immediately after
+   * subscribe() is pushed. Slack pushes only NEW events, so the subscription starts at the tail
+   * and history stays owned by catch-up; the gap across a reconnect is reconciled the same way.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
-    this.routes.set(this.channelFor(topic), { topic, handler });
+    const channel = this.channelFor(topic);
+    const prior = this.routes.get(channel);
+    if (prior !== undefined && prior.topic !== topic) {
+      throw new Error(
+        `Slack topics ${JSON.stringify(prior.topic)} and ${JSON.stringify(topic)} both resolve to ` +
+          `channel ${channel}; each topic needs its own channel`,
+      );
+    }
+    this.routes.set(channel, { topic, handler });
     await this.ensureSocket();
   }
 
@@ -356,9 +350,13 @@ export class SlackPlugin implements BackendPlugin {
           email: handle,
         });
         return { handle, backendRef: resp.user.id };
-      } catch {
-        // users_not_found (or missing users:read.email scope) → name-convention passthrough.
-        return { handle, backendRef: handle };
+      } catch (e: unknown) {
+        // Keep this narrowed to "no such account", so that a provisioning failure
+        // (`missing_scope`, `invalid_auth`, a 429) cannot read back as a successful passthrough.
+        if (e instanceof SlackApiError && e.code === 'users_not_found') {
+          return { handle, backendRef: handle };
+        }
+        throw e;
       }
     }
     const auth = await this.authTest();
@@ -389,11 +387,34 @@ export class SlackPlugin implements BackendPlugin {
       // Memoize the connection, never the FAILURE: a cached rejection is replayed by every later
       // subscribe/blocking fetch without touching the network, so one transient
       // `apps.connections.open` error would disable live push for the process lifetime.
-      attempt.catch(() => {
-        if (this.wsReady === attempt) this.wsReady = undefined;
-      });
+      attempt.then(
+        () => {
+          this.dialCooldownUntil = 0;
+          this.dialBackoffMs = DIAL_BACKOFF_MS;
+        },
+        () => {
+          if (this.wsReady === attempt) this.wsReady = undefined;
+          this.dialCooldownUntil = Date.now() + this.dialBackoffMs;
+          this.dialBackoffMs = Math.min(this.dialBackoffMs * 2, MAX_DIAL_BACKOFF_MS);
+        },
+      );
     }
     return this.wsReady;
+  }
+
+  /**
+   * The long-poll's view of the shared socket. Core re-drives `fetchRecent` every
+   * `block_poll_interval_ms` (250 ms) for the whole `block_max_ms` budget, so keep the cooldown
+   * after a failed handshake, so that one unavailable Socket Mode cannot turn a single
+   * `fetch_recent` into hundreds of `apps.connections.open` calls — Slack's tightest rate limit.
+   */
+  private ensurePollSocket(): Promise<void> {
+    if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
+      return Promise.reject(
+        new Error('Slack Socket Mode handshake backing off after a failed apps.connections.open'),
+      );
+    }
+    return this.ensureSocket();
   }
 
   /**
@@ -440,8 +461,7 @@ export class SlackPlugin implements BackendPlugin {
   private async openSocket(): Promise<void> {
     // Socket Mode handshake uses the APP token; everything else uses the bot token.
     const open = await this.api<{ ok: boolean; url: string }>('apps.connections.open', {}, 'app');
-    // A disconnect that landed during that round trip already cleared `ws`/`wsReady`, and the
-    // close handler below declines to act once stopped — so dialing now would install a live
+    // Keep this abort, so that a disconnect landing during the round trip cannot leave a live
     // socket nothing will ever close, burning one of the ~10 connections per app token.
     if (this.stopped) throw new Error('Slack Socket Mode connect aborted — plugin disconnected');
     await new Promise<void>((resolve, reject) => {
@@ -468,10 +488,9 @@ export class SlackPlugin implements BackendPlugin {
         // Socket Mode URLs are SINGLE-USE: never redial the old URL.
         this.wsReady = undefined;
         if (!settled) {
-          // Pre-`hello` close: ONLY reject — the owning caller (the first `subscribe` OR the
-          // existing `reconnect` loop) retries. Spawning `reconnect()` here too would stack a
-          // second loop per failed attempt during an outage, each independently clearing
-          // `wsReady` and defeating the exponential backoff (BUG-30).
+          // Keep this to a bare reject — the owning caller (the first `subscribe` or the running
+          // `reconnect` loop) retries — so that a pre-`hello` close cannot stack a second
+          // reconnect loop per failed attempt, each clearing `wsReady` and defeating the backoff.
           settled = true;
           reject(new Error('Slack Socket Mode connection closed before hello'));
           return;
@@ -498,10 +517,10 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * One Socket Mode envelope. ACK FIRST, before ANY processing: an unacked envelope gets
-   * redelivered and the connection eventually dropped, and ack-first means a throwing handler
-   * can never starve acks. Events arrive in order on the single socket, so per-channel handler
-   * invocation stays in ascending `ts` order (the seam's per-topic ordering guarantee).
+   * One Socket Mode envelope. Keep the ack FIRST, before any processing, so that neither a
+   * dropped subtype, an unrouted channel, nor a throwing handler can starve it — Slack redelivers
+   * an unacked envelope and eventually drops the connection. Events arrive in order on the single
+   * socket, so per-channel handler invocation stays in ascending `ts` order.
    */
   private onEnvelope(ws: WebSocket, data: RawData, onHello: () => void): void {
     let env: SocketEnvelope;
@@ -510,13 +529,24 @@ export class SlackPlugin implements BackendPlugin {
     } catch {
       return; // not JSON — nothing to ack, nothing to route
     }
-    if (env.envelope_id !== undefined) {
+    if (typeof env !== 'object' || env === null) return;
+    if (typeof env.envelope_id === 'string') {
       try {
         ws.send(JSON.stringify({ envelope_id: env.envelope_id }));
       } catch {
         /* socket already closing; redelivery on the next connection covers it */
       }
     }
+    // Keep the whole post-ack body inside this catch, so that a malformed envelope throwing into a
+    // socket callback — where there is no caller to propagate to and node exits — cannot happen.
+    try {
+      this.routeEnvelope(ws, env, onHello);
+    } catch {
+      /* an inbound envelope is untrusted input; drop it, keep the socket serving */
+    }
+  }
+
+  private routeEnvelope(ws: WebSocket, env: SocketEnvelope, onHello: () => void): void {
     if (env.type === 'hello') {
       onHello();
       return;
@@ -532,7 +562,7 @@ export class SlackPlugin implements BackendPlugin {
     }
     if (env.type !== 'events_api') return;
     const event = env.payload?.event;
-    if (event === undefined || event.channel === undefined || !isPlainMessage(event)) return;
+    if (!isPlainMessage(event) || typeof event.channel !== 'string') return;
 
     // Wake any native long-poll waiters on this channel — independent of subscribe routes, since a
     // blocking `fetchRecent` may have no route registered. A message strictly after a waiter's floor
@@ -555,14 +585,11 @@ export class SlackPlugin implements BackendPlugin {
 
   /**
    * Single Web API entry point: `POST <api_url>/<method>`, `Authorization: Bearer <token>`, body
-   * `application/x-www-form-urlencoded` — Slack accepts form encoding UNIVERSALLY (incl.
-   * `chat.postMessage`), while read methods like `conversations.history`/`users.lookupByEmail`
-   * silently IGNORE JSON args, so every method is form-encoded to match the official SDK (scalar
-   * args → strings; array/object args → `JSON.stringify`). Every Slack response carries `ok`;
-   * `ok:false` throws with Slack's `error` code — that envelope shape is interpreted HERE, not in
-   * the shared helper. Transparently retries HTTP 429 honoring the `Retry-After` header (SECONDS,
-   * `> 0`-guarded so a header-less 429 backs off the default, never `delay(0)`). Retries stop the
-   * moment we disconnect, so an aborted test never leaves a loop hammering the API.
+   * `application/x-www-form-urlencoded`. Keep every method form-encoded, so that read methods
+   * (`conversations.history`, `users.lookupByEmail`) receive their args at all — slack.com
+   * silently ignores a JSON body for those. Every Slack response carries `ok`; `ok:false` throws
+   * with Slack's `error` code, interpreted here rather than in the shared HTTP helper, which owns
+   * the 429 retry loop, the `Retry-After` header and the backoff clamp.
    */
   private async api<T extends { ok: boolean }>(
     method: string,
@@ -588,9 +615,7 @@ export class SlackPlugin implements BackendPlugin {
       { method: 'POST', headers, body: form.toString() },
       {
         label: `Slack ${method}`,
-        // Stop retrying once disconnected, so an aborted test never leaves a loop hammering the API.
         isStopped: () => this.stopped,
-        retryAfterOf: readRetryAfter,
       },
     );
     const json = (await res.json()) as T & { error?: string };
@@ -623,6 +648,26 @@ export function compareTs(a: string, b: string): number {
   return Number(aSub.padEnd(width, '0') || '0') - Number(bSub.padEnd(width, '0') || '0');
 }
 
+/**
+ * Reject a `channel_map` whose targets are not distinct. Keep this fail-fast, so that two topics
+ * folding onto one channel cannot silently displace each other's route and relabel one topic's
+ * traffic as the other's — crossing into a different topic's dedup and allowlist namespace.
+ */
+function requireDistinctChannels(map: Record<string, string>): Record<string, string> {
+  const owner = new Map<string, string>();
+  for (const [topic, channel] of Object.entries(map)) {
+    const prior = owner.get(channel);
+    if (prior !== undefined) {
+      throw new Error(
+        `Slack channel_map maps both ${JSON.stringify(prior)} and ${JSON.stringify(topic)} to ` +
+          `channel ${channel}; each topic needs its own channel`,
+      );
+    }
+    owner.set(channel, topic);
+  }
+  return map;
+}
+
 function slackToMessage(topic: Topic, m: SlackMessage): Message {
   return buildMessage({
     topic,
@@ -634,14 +679,3 @@ function slackToMessage(topic: Topic, m: SlackMessage): Message {
   });
 }
 
-/**
- * Slack 429s carry `Retry-After` (SECONDS) in the header; there is no body retry field. Honor the
- * header only when it is a positive finite number — an absent/empty header parses as
- * `Number(null|'') === 0`, which must NOT be treated as "retry immediately" (BUG-41's 0 ms tight
- * loop). Cap the wait at 5s; otherwise fall to the 500 ms default.
- */
-function readRetryAfter(res: Response): number {
-  const header = Number(res.headers.get('retry-after')); // seconds
-  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
-  return 500;
-}

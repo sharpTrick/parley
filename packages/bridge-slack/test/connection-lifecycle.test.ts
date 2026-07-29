@@ -81,18 +81,42 @@ describe('slack memoized async singletons', () => {
     }
   }
 
-  it('a socket that fails to establish is retried, not replayed, on the blocking fetch path', async () => {
+  it('a socket that fails to establish is retried after the cooldown, not replayed and not stormed', async () => {
     const fake = await FakeSlack.start();
     const topic = asTopic('C0BLOCK');
     fake.createChannel(topic);
     const plugin = await makePlugin(fake);
     try {
       fake.failMethod('apps.connections.open', 'internal_error', 1);
-      // Degrades to the non-blocking path once; the NEXT blocking fetch must dial again.
+      // Degrades to the non-blocking path once, then cools down.
       await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
       const afterFirst = fake.hits('apps.connections.open');
+      // Core re-drives fetchRecent on its poll cadence; within the cooldown none of those dial.
+      for (let i = 0; i < 5; i++) {
+        await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 20 });
+      }
+      expect(fake.hits('apps.connections.open')).toBe(afterFirst);
+      // The failure is NOT memoized: once the cooldown lapses the next blocking fetch dials again.
+      await sleep(600);
       await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
       expect(fake.hits('apps.connections.open')).toBeGreaterThan(afterFirst);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
+  it('subscribe is never gated by the poll cooldown: each call dials', async () => {
+    const fake = await FakeSlack.start();
+    const topic = asTopic('C0SUBDIAL');
+    fake.createChannel(topic);
+    const plugin = await makePlugin(fake);
+    try {
+      fake.failMethod('apps.connections.open', 'internal_error', 2);
+      for (let i = 0; i < 2; i++) {
+        await expect(plugin.subscribe(topic, () => undefined)).rejects.toThrow();
+      }
+      expect(fake.hits('apps.connections.open')).toBe(2);
     } finally {
       await plugin.disconnect();
       await fake.close();

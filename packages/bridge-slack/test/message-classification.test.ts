@@ -18,27 +18,51 @@ import { describe, expect, it, vi } from 'vitest';
 import { compareTs, SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 
-/** Every subtype the plugin can meet, with its decision. `undefined` = a plain user message. */
-const SUBTYPES: Array<{ subtype?: string; surfaced: boolean }> = [
-  { subtype: undefined, surfaced: true },
-  { subtype: 'bot_message', surfaced: true },
-  { subtype: 'file_share', surfaced: true },
-  { subtype: 'me_message', surfaced: true },
-  { subtype: 'channel_join', surfaced: false },
-  { subtype: 'channel_leave', surfaced: false },
-  { subtype: 'channel_topic', surfaced: false },
-  { subtype: 'channel_purpose', surfaced: false },
-  { subtype: 'channel_name', surfaced: false },
-  { subtype: 'message_changed', surfaced: false },
-  { subtype: 'message_deleted', surfaced: false },
-  { subtype: 'thread_broadcast', surfaced: false },
-  { subtype: 'tombstone', surfaced: false },
+/**
+ * Every subtype the plugin can meet, with the REASON that decides it. The rule the source states is
+ * "surface exactly what is new channel-level content with its own `ts`", so `surfaced` is derived
+ * from `reason` below rather than asserted per row — a new subtype whose decision contradicts the
+ * stated rule cannot be added without the derivation failing.
+ */
+type Reason = 'new content' | 'mutation of an existing ts' | 'system record';
+
+const SUBTYPES: Array<{ subtype?: string; reason: Reason }> = [
+  { subtype: undefined, reason: 'new content' },
+  { subtype: 'bot_message', reason: 'new content' },
+  { subtype: 'file_share', reason: 'new content' },
+  { subtype: 'me_message', reason: 'new content' },
+  // A thread reply broadcast to the channel: a fresh channel-level entry with its own `ts` and its
+  // own text — and the only way a reply to a `post({inReplyTo})` thread reaches channel level.
+  { subtype: 'thread_broadcast', reason: 'new content' },
+  { subtype: 'channel_join', reason: 'system record' },
+  { subtype: 'channel_leave', reason: 'system record' },
+  { subtype: 'channel_topic', reason: 'system record' },
+  { subtype: 'channel_purpose', reason: 'system record' },
+  { subtype: 'channel_name', reason: 'system record' },
+  { subtype: 'message_changed', reason: 'mutation of an existing ts' },
+  { subtype: 'message_deleted', reason: 'mutation of an existing ts' },
+  { subtype: 'tombstone', reason: 'mutation of an existing ts' },
 ];
 
+const surfaces = (row: { reason: Reason }): boolean => row.reason === 'new content';
 const label = (s?: string): string => s ?? 'plain';
-const expectedSurfaced = SUBTYPES.filter((s) => s.surfaced).map((s) => label(s.subtype));
+const expectedSurfaced = SUBTYPES.filter(surfaces).map((s) => label(s.subtype));
 
 describe('slack subtype classification', () => {
+  it('the table is exhaustive over reasons and names each subtype once', () => {
+    expect(new Set(SUBTYPES.map((s) => s.subtype)).size).toBe(SUBTYPES.length);
+    expect(new Set(SUBTYPES.map((s) => s.reason))).toEqual(
+      new Set<Reason>(['new content', 'mutation of an existing ts', 'system record']),
+    );
+    expect(expectedSurfaced).toEqual([
+      'plain',
+      'bot_message',
+      'file_share',
+      'me_message',
+      'thread_broadcast',
+    ]);
+  });
+
   it('the history path surfaces exactly the decided set', async () => {
     const fake = await FakeSlack.start();
     const plugin = new SlackPlugin();

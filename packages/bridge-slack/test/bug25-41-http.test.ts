@@ -1,14 +1,13 @@
 /**
- * L2 verifier drive-tests for work item 01 (shared-http-retry-util):
- *   - BUG-41: a Slack 429 with NO `Retry-After` header must back off the 500 ms default,
- *     never `delay(0)` (the old inline parser's 0 ms tight loop).
- *   - BUG-25: Slack `api()` must form-encode every method so read-method args
- *     (`channel`/`oldest`/`cursor`/`email`) survive — the old `application/json` body was
- *     silently ignored by slack.com for read methods.
+ * HTTP-contract classes, driven against purpose-built in-process servers (not the conformance
+ * FakeSlack) so the exact status, headers and raw request bytes are under the test's control:
  *
- * These stand up purpose-built in-process HTTP fakes (not the conformance FakeSlack) so we can
- * return a header-less 429 and capture the exact Content-Type + raw bytes the plugin sends, and
- * DRIVE the real SlackPlugin.post/fetchRecent/resolveIdentity code paths.
+ *   - 429 backoff: an unusable `Retry-After` must fall to the default, a usable one must be waited
+ *     out, and neither may become a burst.
+ *   - Request encoding: every method must be form-encoded, or slack.com silently drops read-method
+ *     args (`channel` / `oldest` / `cursor` / `email`).
+ *   - Identity lookup: only "no such account" may pass through as a name convention; a provisioning
+ *     failure must surface, not read back as a successful resolution.
  */
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
@@ -31,67 +30,62 @@ async function listen(server: Server): Promise<string> {
 const stop = (server: Server): Promise<void> =>
   new Promise<void>((r) => server.close(() => r()));
 
-describe('BUG-41 — header-less 429 backs off the 500 ms default (no 0 ms hot loop)', () => {
-  it('documents the fix delta: old inline parser → 0 ms; guarded contract → 500 ms', () => {
-    // Old (buggy) inline logic: Number(null) === 0, Number.isFinite(0) === true, so it took the
-    // honor-the-header branch → Math.min(0 * 1000, 5000) === 0 → delay(0) → tight loop.
-    const oldBuggy = (h: number): number =>
-      Number.isFinite(h) ? Math.min(h * 1000, 5000) : 500;
-    expect(oldBuggy(Number(null))).toBe(0); // absent header
-    expect(oldBuggy(Number(''))).toBe(0); // empty header
+/**
+ * CLASS: a server-stated backoff hint must be honoured or refused, never silently shortened into a
+ * hammer loop — and an UNUSABLE hint must fall to the default, never to `delay(0)`. The table drives
+ * the real plugin against a 429-then-succeed server and measures the gap actually observed on the
+ * wire, so it grades the shipped path rather than a local re-declaration of the parser.
+ */
+const RETRY_AFTER_ROWS: Array<{ header?: string; minGapMs: number; maxGapMs: number }> = [
+  { header: undefined, minGapMs: 400, maxGapMs: 1500 },
+  { header: '', minGapMs: 400, maxGapMs: 1500 },
+  { header: '0', minGapMs: 400, maxGapMs: 1500 },
+  { header: '-1', minGapMs: 400, maxGapMs: 1500 },
+  { header: 'abc', minGapMs: 400, maxGapMs: 1500 },
+  { header: '1', minGapMs: 900, maxGapMs: 2000 },
+  { header: '2', minGapMs: 1900, maxGapMs: 3000 },
+  // Above the shared clamp: still bounded, and still far above a hot loop.
+  { header: '9999', minGapMs: 4500, maxGapMs: 6500 },
+];
 
-    // New unified-contract guard (mirrors src readRetryAfter): only honor a positive finite value.
-    const guarded = (h: number): number =>
-      Number.isFinite(h) && h > 0 ? Math.min(h * 1000, 5000) : 500;
-    expect(guarded(Number(null))).toBe(500);
-    expect(guarded(Number(''))).toBe(500);
-    expect(guarded(2)).toBe(2000); // a real positive header is still honored
-    expect(guarded(9999)).toBe(5000); // still capped at 5 s
-  });
+describe('slack 429 backoff honours the server-stated hint', () => {
+  for (const row of RETRY_AFTER_ROWS) {
+    it(`Retry-After: ${row.header ?? '(absent)'} → one wait of ${row.minGapMs}–${row.maxGapMs} ms, then success`, async () => {
+      const arrivals: number[] = [];
+      let calls = 0;
+      const server = createServer((req, res) => {
+        void (async () => {
+          await readBody(req);
+          arrivals.push(Date.now());
+          calls++;
+          if (calls === 1) {
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (row.header !== undefined) headers['Retry-After'] = row.header;
+            res.writeHead(429, headers);
+            res.end(JSON.stringify({ ok: false, error: 'ratelimited' }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ts: '1700000000.000001' }));
+        })();
+      });
+      const url = await listen(server);
+      const plugin = new SlackPlugin();
+      try {
+        await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
+        const id = await plugin.post(asTopic('C0TEST'), asHandle('writer'), 'hello');
 
-  it('waits ~500 ms between retries when the 429 carries no Retry-After header', async () => {
-    const arrivals: number[] = [];
-    let calls = 0;
-    const server = createServer((req, res) => {
-      void (async () => {
-        await readBody(req);
-        arrivals.push(Date.now());
-        calls++;
-        if (calls <= 2) {
-          // 429 with DELIBERATELY no Retry-After header — the BUG-41 trigger.
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'ratelimited' }));
-          return;
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, ts: '1700000000.000001' }));
-      })();
+        expect(String(id)).toBe('1700000000.000001');
+        expect(calls).toBe(2); // one 429, one wait, one success — never a burst
+        const gap = arrivals[1]! - arrivals[0]!;
+        expect(gap).toBeGreaterThanOrEqual(row.minGapMs);
+        expect(gap).toBeLessThan(row.maxGapMs);
+      } finally {
+        await plugin.disconnect();
+        await stop(server);
+      }
     });
-    const url = await listen(server);
-    const plugin = new SlackPlugin();
-    try {
-      await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
-      const t0 = Date.now();
-      const id = await plugin.post(asTopic('C0TEST'), asHandle('writer'), 'hello');
-      const total = Date.now() - t0;
-
-      expect(String(id)).toBe('1700000000.000001');
-      expect(calls).toBe(3); // two header-less 429s, then success
-
-      const gap1 = arrivals[1] - arrivals[0];
-      const gap2 = arrivals[2] - arrivals[1];
-      // A delay(0) hot loop would gap ~0–5 ms; the guarded default gaps ~500 ms.
-      expect(gap1).toBeGreaterThanOrEqual(400);
-      expect(gap2).toBeGreaterThanOrEqual(400);
-      // ...and it's the 500 ms default, not the 5 s cap.
-      expect(gap1).toBeLessThan(1500);
-      expect(gap2).toBeLessThan(1500);
-      expect(total).toBeGreaterThanOrEqual(800);
-    } finally {
-      await plugin.disconnect();
-      await stop(server);
-    }
-  });
+  }
 });
 
 describe('BUG-25 — Slack api() form-encodes every method (read-method args survive)', () => {
@@ -144,6 +138,56 @@ describe('BUG-25 — Slack api() form-encodes every method (read-method args sur
     } finally {
       await plugin.disconnect();
       await stop(server);
+    }
+  });
+
+  /**
+   * CLASS: a bare `catch` on an identity/permission lookup converts a diagnosable failure into a
+   * plausible-looking success. Only Slack's own "no such account" answer means "this handle is just
+   * a name"; every other outcome is a provisioning or transport fault the operator must be able to
+   * read, so it has to reach the caller with Slack's code in the message.
+   */
+  const LOOKUP_OUTCOMES: Array<{ name: string; reply: string; passthrough: boolean }> = [
+    { name: 'users_not_found', reply: 'users_not_found', passthrough: true },
+    { name: 'missing_scope', reply: 'missing_scope', passthrough: false },
+    { name: 'invalid_auth', reply: 'invalid_auth', passthrough: false },
+    { name: 'account_inactive', reply: 'account_inactive', passthrough: false },
+  ];
+
+  for (const outcome of LOOKUP_OUTCOMES) {
+    it(`resolveIdentity on \`${outcome.name}\` ${outcome.passthrough ? 'passes through' : 'surfaces the error'}`, async () => {
+      const server = createServer((req, res) => {
+        void (async () => {
+          await readBody(req);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: outcome.reply }));
+        })();
+      });
+      const url = await listen(server);
+      const plugin = new SlackPlugin();
+      try {
+        await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
+        const call = plugin.resolveIdentity(asHandle('alice@example.com'));
+        if (outcome.passthrough) {
+          expect((await call).backendRef).toBe('alice@example.com');
+        } else {
+          await expect(call).rejects.toThrow(new RegExp(outcome.reply));
+        }
+      } finally {
+        await plugin.disconnect();
+        await stop(server);
+      }
+    });
+  }
+
+  it('resolveIdentity surfaces a transport failure rather than resolving to the handle', async () => {
+    const plugin = new SlackPlugin();
+    try {
+      // Nothing is listening on this port, so `fetch` rejects before any Slack envelope exists.
+      await plugin.connect({ api_url: 'http://127.0.0.1:1/api', bot_token: 'xoxb-test' });
+      await expect(plugin.resolveIdentity(asHandle('alice@example.com'))).rejects.toThrow();
+    } finally {
+      await plugin.disconnect();
     }
   });
 

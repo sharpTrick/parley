@@ -17,6 +17,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
+import { compareTs } from '../src/index.js';
 
 /** Fixed page size — small enough that the 100-message conformance case spans 3 pages. */
 const PAGE_SIZE = 50;
@@ -31,14 +32,15 @@ interface StoredMessage {
   subtype?: string;
 }
 
-/** Same integer-wise ts comparison the plugin uses — independent copy, not imported from src. */
-function compareTs(a: string, b: string): number {
-  const [aSec, aSub] = a.split('.');
-  const [bSec, bSub] = b.split('.');
-  const bySec = Number(aSec) - Number(bSec);
-  if (bySec !== 0) return bySec;
-  return Number(aSub ?? '0') - Number(bSub ?? '0');
-}
+/**
+ * The fake orders and filters history with the PLUGIN'S OWN comparator, imported from src. Keep it
+ * imported, so that a fake that grades exclusive-`since` cannot drift from the rule it is grading —
+ * a paraphrased copy disagreed with src for every suffix that was not exactly six digits.
+ */
+const isOrderable = (m: StoredMessage): boolean =>
+  m !== null && typeof m.ts === 'string' && /^\d+\.\d+$/.test(m.ts);
+
+const orderOf = (m: StoredMessage): string => (isOrderable(m) ? m.ts : '0');
 
 const rand = (): string => Math.random().toString(36).slice(2, 10);
 
@@ -82,6 +84,8 @@ export class FakeSlack {
   private readonly failures = new Map<string, { code: string; times: number }>();
   /** method → artificial latency (ms), for racing a teardown against an in-flight request. */
   private readonly latency = new Map<string, number>();
+  /** method → a callback fired after its payload is computed, before it is written. */
+  private readonly hooks = new Map<string, (hit: number) => void | Promise<void>>();
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
   /** When false, new Socket Mode connections are closed WITHOUT `hello` (pre-`hello` close, BUG-30). */
@@ -174,6 +178,41 @@ export class FakeSlack {
     return envelopeId;
   }
 
+  /**
+   * Push an ARBITRARY envelope body — the shapes a vendor or an attacker can put on the wire that
+   * `pushEvent` cannot express (no `event`, a non-`events_api` type, a malformed `ts`). The
+   * `envelope_id` is minted here and recorded in {@link pushed}, so ack discipline is assertable
+   * for envelopes the plugin deliberately drops.
+   */
+  pushEnvelope(body: Record<string, unknown>): string {
+    const envelopeId = `env-${rand()}`;
+    this.pushed.add(envelopeId);
+    const envelope = JSON.stringify({ envelope_id: envelopeId, ...body });
+    for (const ws of this.sockets) ws.send(envelope);
+    return envelopeId;
+  }
+
+  /**
+   * Append raw, possibly MALFORMED history entries — the shapes a real API can return and `seed`
+   * cannot express (no `ts`, a numeric `ts`, a null entry). Deliberately untyped: the point is that
+   * the plugin must survive records its interface says are impossible.
+   */
+  seedRaw(channel: string, entries: unknown[]): void {
+    this.createChannel(channel);
+    const list = this.channels.get(channel) ?? [];
+    list.push(...(entries as StoredMessage[]));
+    this.channels.set(channel, list);
+  }
+
+  /**
+   * Run `fn` when `method` is served, AFTER its response payload has been computed and BEFORE it is
+   * written. That is the only place a test can land an event strictly inside a request's in-flight
+   * window — which is where the gap-closing re-query's lost-wakeup lives.
+   */
+  onHit(method: string, fn: (hit: number) => void | Promise<void>): void {
+    this.hooks.set(method, fn);
+  }
+
   /** Mint the next `ts` without storing anything (for pushed events with no history row). */
   mintTs(): string {
     return `${Math.floor(Date.now() / 1000)}.${String(++this.counter).padStart(6, '0')}`;
@@ -226,6 +265,12 @@ export class FakeSlack {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(payload));
     };
+    // The payload is computed BEFORE the hook runs, so an event the hook lands is genuinely
+    // concurrent with this request rather than reflected in its (already snapshotted) answer.
+    const replyAfterHook = async (method: string, payload: Record<string, unknown>): Promise<void> => {
+      await this.hooks.get(method)?.(this.hits(method));
+      reply(payload);
+    };
 
     if (req.method !== 'POST' || req.url === undefined || !req.url.startsWith('/api/')) {
       reply({ ok: false, error: 'unknown_method' });
@@ -249,14 +294,14 @@ export class FakeSlack {
 
     switch (method) {
       case 'chat.postMessage':
-        reply(this.postMessage(body));
+        await replyAfterHook(method, this.postMessage(body));
         return;
       case 'conversations.history':
-        reply(this.history(body));
+        await replyAfterHook(method, this.history(body));
         return;
       case 'apps.connections.open':
         this.connectionsOpened++;
-        reply({ ok: true, url: this.wsUrl });
+        await replyAfterHook(method, { ok: true, url: this.wsUrl });
         return;
       case 'auth.test':
         reply({ ok: true, user: 'parley-bot', user_id: 'U0PARLEY', bot_id: 'B0PARLEY', team: 'T0FAKE' });
@@ -308,12 +353,16 @@ export class FakeSlack {
     let msgs = [...(this.channels.get(channel) ?? [])];
     const oldest = body.oldest;
     if (typeof oldest === 'string') {
-      // `oldest` is EXCLUSIVE unless the caller sets `inclusive` (the plugin never does).
-      msgs = msgs.filter((m) =>
-        body.inclusive === true ? compareTs(m.ts, oldest) >= 0 : compareTs(m.ts, oldest) > 0,
+      // `oldest` is EXCLUSIVE unless the caller sets `inclusive` (the plugin never does). An entry
+      // with no orderable `ts` is never filtered out — those exist to reach the plugin, and a fake
+      // that quietly swallowed them would grade the plugin on input it never receives.
+      msgs = msgs.filter(
+        (m) =>
+          !isOrderable(m) ||
+          (body.inclusive === true ? compareTs(m.ts, oldest) >= 0 : compareTs(m.ts, oldest) > 0),
       );
     }
-    msgs.sort((a, b) => compareTs(b.ts, a.ts)); // NEWEST first, like Slack
+    msgs.sort((a, b) => compareTs(orderOf(b), orderOf(a))); // NEWEST first, like Slack
     const offset = typeof body.cursor === 'string' ? Number(body.cursor) : 0;
     const page = msgs.slice(offset, offset + PAGE_SIZE);
     const hasMore = offset + PAGE_SIZE < msgs.length;

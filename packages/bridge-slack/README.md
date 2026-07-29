@@ -29,9 +29,20 @@ the next call re-walks the remainder. Draining a backlog therefore costs about
 is real wall-clock time after a long outage. Configure a **large `catchup.limit`** for Slack: the
 aggregate cost falls linearly with it.
 
-Threading is an approximation: `inReplyTo` becomes `thread_ts`, and Slack thread replies don't
-surface at channel level (history or channel events) unless broadcast — durable, but only visible
-inside the thread.
+Threading is an approximation: `inReplyTo` becomes `thread_ts`. A plain thread reply does not
+surface at channel level (history or channel events), so it is durable but only visible inside the
+thread; a reply the author broadcasts to the channel arrives as a `thread_broadcast` entry with its
+own `ts` and **is** surfaced — that is the return path for replies to a threaded `post`.
+
+**Colliding topics fail at load.** Two topics that resolve to the same channel — both mapped in
+`channel_map`, or one mapped and the other an unmapped channel-id literal — are rejected by
+`connect` (respectively `subscribe`), naming both topics. Folding them would silently drop one
+topic's subscription and deliver that channel's traffic under the other topic's name.
+
+**Rate-limit behaviour.** A 429 is retried with the server's `Retry-After` honoured up to the shared
+backoff clamp (5 s). If the Socket Mode handshake fails, the long-poll path backs off before dialling
+`apps.connections.open` again, so a core poll loop cannot turn one `fetch_recent` into hundreds of
+handshakes against Slack's tightest limit; catch-up continues over HTTP in the meantime.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
 nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
