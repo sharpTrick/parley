@@ -66,7 +66,7 @@ const DEFAULT_MAX_CHATS = 1_000;
  * active UNSERVED chat instead, and is refused only when every retained chat is served.
  * The on-disk file is compacted once evictions since the last rewrite exceed the retained
  * record count, so the file stays within a constant factor of the in-memory bound instead of
- * growing forever (BUG-32).
+ * growing forever.
  *
  * ONE bridge process per store file AND per bot token, by design: a single process's appends
  * are atomic enough for JSONL, but two processes interleaving appends (or two `getUpdates`
@@ -76,13 +76,13 @@ const DEFAULT_MAX_CHATS = 1_000;
 export class ObservedStore {
   /** chat id → records ascending by `seq`; key order is least-recently-active first. */
   private readonly byChat = new Map<string, StoredRecord[]>();
-  /** The dedup set — the composite ids of the currently-retained records (BUG-32: bounded). */
+  /** The dedup set — the composite ids of the currently-retained records (bounded). */
   private readonly seen = new Set<string>();
   /** Chats this bridge serves (a configured topic resolves to them) — never evicted or refused. */
   private readonly served = new Set<string>();
-  /** Newest-N-per-chat retention bound (BUG-32). */
+  /** Newest-N-per-chat retention bound. */
   private readonly maxPerChat: number;
-  /** Max distinct chats retained (BUG-32) — the bot's chat membership is not ours to control. */
+  /** Max distinct chats retained — the bot's chat membership is not ours to control. */
   private readonly maxChats: number;
   /** Next observation sequence to stamp — store-wide, so an evicted chat can never reuse one. */
   private nextSeq = 1;
@@ -106,8 +106,8 @@ export class ObservedStore {
     } catch {
       // No store yet — first run against this path starts empty.
     }
-    // BUG-19: drop a crash-torn tail fragment (a final line with no trailing '\n') BEFORE any
-    // append, so the next record can't glue onto it. The repaired file is rewritten below.
+    // Drop a crash-torn tail fragment (a final line with no trailing '\n') BEFORE any append,
+    // so that the next record can't glue onto it. The repaired file is rewritten below.
     let torn = false;
     if (raw !== '' && !raw.endsWith('\n')) {
       const lastNl = raw.lastIndexOf('\n');
@@ -124,11 +124,10 @@ export class ObservedStore {
     }
     const cappedChats = this.applyChatCap();
     const trimmed = this.applyRetention() || cappedChats;
-    // Compact the on-disk file when we dropped a torn fragment (BUG-19) or over-retention
-    // records (BUG-32); the rewrite yields a clean, newline-terminated, bounded file. This runs
-    // AFTER the BUG-19 repair so the fragment is never carried into the compacted output.
+    // Compact the on-disk file when we dropped a torn fragment or over-retention records; the
+    // rewrite yields a clean, newline-terminated, bounded file. Keep this after the torn-tail
+    // repair, so that the fragment is never carried into the compacted output.
     if (torn || trimmed) this.rewrite();
-    // BUG-32: hold one append fd for the process instead of reopening the file per append.
     this.fd = openSync(path, 'a');
   }
 
@@ -149,7 +148,7 @@ export class ObservedStore {
    */
   append(observed: ObservedRecord): StoredRecord | undefined {
     if (this.seen.has(keyOf(observed))) return undefined;
-    if (this.fd === undefined) return undefined; // store closed — no-op (BUG-32: fd released).
+    if (this.fd === undefined) return undefined; // store closed — the append fd is released.
     if (!this.admit(observed.chat_id)) return undefined;
     const rec: StoredRecord = { ...observed, seq: this.nextSeq++ };
     appendFileSync(this.fd, `${JSON.stringify(rec)}\n`);
@@ -192,7 +191,7 @@ export class ObservedStore {
   }
 
   /**
-   * Make room for a record from `chatId` under the chat-count bound (BUG-32). A served chat and
+   * Make room for a record from `chatId` under the chat-count bound. A served chat and
    * one already held are always admitted; otherwise the least recently active UNSERVED chat is
    * evicted. False only when every retained chat is served.
    */
@@ -215,7 +214,7 @@ export class ObservedStore {
 
   /**
    * Hold the per-chat bound: newest {@link maxPerChat} records per chat, rebuilding the dedup
-   * `seen` set from the survivors so neither map grows without bound (BUG-32). Returns true
+   * `seen` set from the survivors so neither map grows without bound. Returns true
    * iff anything was evicted.
    */
   private applyRetention(): boolean {

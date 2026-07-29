@@ -29,12 +29,12 @@ afterEach(() => {
 });
 
 /**
- * BUG-19 / BUG-32: the observed-message store must repair a crash-torn tail on load and hold
- * its retention bounds at ALL times — a bound that only bites at load is no bound at all for a
- * bridge that never restarts.
+ * The observed-message store must repair a crash-torn tail on load and hold its retention
+ * bounds at ALL times — a bound that only bites at load is no bound at all for a bridge that
+ * never restarts.
  */
-describe('telegram ObservedStore durability (BUG-19 / BUG-32)', () => {
-  it('BUG-19: repairs a crash-torn tail so a later append survives a cold reload', () => {
+describe('telegram ObservedStore durability', () => {
+  it('repairs a crash-torn tail so a later append survives a cold reload', () => {
     // One complete record, then a crash-torn fragment of a second (NO trailing newline).
     writeFileSync(path, `${JSON.stringify(record('1', 1, 'first'))}\n{"chat_id":"1","mess`);
 
@@ -50,7 +50,7 @@ describe('telegram ObservedStore durability (BUG-19 / BUG-32)', () => {
     reloaded.close();
   });
 
-  it('BUG-32: bounds a pre-written file to newest-N, compacts it, and frees the fd on close', () => {
+  it('bounds a pre-written file to newest-N, compacts it, and frees the fd on close', () => {
     const N = 5;
     const lines = Array.from({ length: 20 }, (_, i) => JSON.stringify(record('1', i + 1, `m${i + 1}`)));
     writeFileSync(path, `${lines.join('\n')}\n`);

@@ -53,7 +53,7 @@ const contentsOf = async (plugin: TelegramPlugin, topic: Topic): Promise<string[
  * Every way a topic can NAME a chat, crossed with which seam call ran first and whether the
  * foreign message arrived before any of them. Inbound updates carry only a numeric `chat.id`,
  * so a bridge that learns the mapping on a write path files everything else under a phantom
- * topic — invisible forever, and persisted that way (BUG-08).
+ * topic — invisible forever, and persisted that way.
  */
 const SPELLINGS = [
   { name: 'numeric literal', topic: '-1009000001', chat: '-1009000001', config: {} },
@@ -85,7 +85,7 @@ const CELLS = SPELLINGS.flatMap((spelling) =>
   ),
 );
 
-describe('telegram inbound routing (BUG-08)', () => {
+describe('telegram inbound routing', () => {
   it.each(CELLS)(
     'topic as $spelling.name, first seam call $firstCall, message first: $arriveFirst',
     async ({ spelling, firstCall, arriveFirst }) => {
@@ -173,11 +173,11 @@ describe('telegram update normalization', () => {
 });
 
 /**
- * BUG-17: a foreign message accepted just before our own post (so a LOWER message_id) but
- * delivered to the bridge AFTER it must still reach the subscriber — delivery keys off the
- * store's dedup set, never a watermark our own post advanced past it.
+ * A foreign message accepted just before our own post (so a LOWER message_id) but delivered to
+ * the bridge AFTER it must still reach the subscriber — delivery keys off the store's dedup
+ * set, never a watermark our own post advanced past it.
  */
-describe('telegram own-post race (BUG-17)', () => {
+describe('telegram own-post race', () => {
   it('delivers a foreign message ingested after our higher-id post', async () => {
     const rig = await startRig();
     const chat = '-1005555555';

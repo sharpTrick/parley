@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MatrixPlugin } from '../src/index.js';
 
-// SEC-06 — Matrix must not silently log in with the repo-public default password. connect() does
+// Matrix must not silently log in with the repo-public default password. connect() does
 // live I/O (the m.login.password POST), so we stub fetch with a valid login response; the warning
 // fires before that POST. We still assert the whole connect() resolves so the gate sits on the
 // happy path, not an incidental network failure.
@@ -18,7 +18,7 @@ afterEach(() => {
 
 const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-describe('Matrix default-credential warning (SEC-06)', () => {
+describe('Matrix default-credential warning', () => {
   it('warns once, naming the backend and the key to set, when password is omitted', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => okLogin()));
     const warn = spyWarn();

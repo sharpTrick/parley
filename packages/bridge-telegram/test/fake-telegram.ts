@@ -10,7 +10,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *    per-topic numeric cursor are exercised for real), `update_id` a global one.
  *  - `chat.id` is a NUMBER on both `sendMessage` responses and injected updates (mirroring real
  *    Telegram), and `@channelusername` references resolve to a stable numeric id via `getChat` —
- *    exactly the shape BUG-08 needs (a string echo would mask it).
+ *    exactly the shape topic-to-chat routing needs (a string echo would mask it).
  *  - a `chat_id` that is neither numeric nor `@channelusername` is REJECTED with 400 ("chat not
  *    found"), and an unknown token with 401, as the real API does. Keep both, so that the
  *    conformance suite cannot pass on topics real Telegram would refuse.
@@ -44,7 +44,7 @@ export interface FakeTelegram {
   /**
    * Like {@link injectUserMessage} but mints the message_id NOW (so it can be LOWER than a post
    * that runs next) while WITHHOLDING the update from getUpdates until `release()` — reproduces
-   * the BUG-17 race (a foreign message accepted before our post, delivered to the bridge after).
+   * the own-post race (a foreign message accepted before our post, delivered to the bridge after).
    */
   injectUserMessageDeferred(
     chatId: string,
@@ -97,7 +97,7 @@ const TOKEN = 'test-token';
 
 /**
  * A known channel: its `@channelusername` resolves (via getChat) to this NUMERIC id, so tests
- * can drive the BUG-08 case (`@name` chat_map/topic → numeric inbound `chat.id` routing).
+ * can drive `@name` chat_map/topic → numeric inbound `chat.id` routing.
  */
 export const KNOWN_CHANNEL = { username: '@mychannel', id: -1_001_234_567_890 };
 

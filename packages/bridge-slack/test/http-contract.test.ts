@@ -117,7 +117,7 @@ describe('slack 429 backoff honours the server-stated hint', () => {
   });
 });
 
-describe('BUG-25 — Slack api() form-encodes every method (read-method args survive)', () => {
+describe('Slack api() form-encodes every method (read-method args survive)', () => {
   it('fetchRecent → conversations.history is form-encoded with channel/oldest args', async () => {
     let captured: { contentType?: string; raw: string } | undefined;
     const server = createServer((req, res) => {
@@ -129,7 +129,7 @@ describe('BUG-25 — Slack api() form-encodes every method (read-method args sur
           captured = { contentType: req.headers['content-type'], raw };
           const p = new URLSearchParams(raw);
           // A regression to a JSON body → URLSearchParams finds no `channel` → invalid_arguments,
-          // exactly as slack.com behaves — which is what makes BUG-25 CI-observable.
+          // exactly as slack.com behaves.
           if (p.get('channel') === null) {
             res.end(JSON.stringify({ ok: false, error: 'invalid_arguments' }));
             return;
@@ -228,7 +228,7 @@ describe('BUG-25 — Slack api() form-encodes every method (read-method args sur
         const p = new URLSearchParams(raw);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Only a form-parsed `email` resolves; a JSON body yields no `email` here → users_not_found
-        // → the plugin's silent try/catch passthrough (the BUG-25 mis-resolution casualty).
+        // → the plugin's silent try/catch passthrough.
         if (p.get('email') === 'alice@example.com') {
           sawEmailArg = true;
           res.end(JSON.stringify({ ok: true, user: { id: 'U0ALICE' } }));

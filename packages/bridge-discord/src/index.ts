@@ -75,7 +75,7 @@ const INTENTS = (1 << 0) | (1 << 9) | (1 << 15);
  * Terminal Discord gateway close codes — authentication failed (4004), invalid/disallowed
  * intents (4013/4014), invalid API version (4012), and the sharding-class errors (4010/4011).
  * None are recoverable by re-IDENTIFYing; retrying re-sends IDENTIFY on every attempt and burns
- * Discord's 1000-IDENTIFY/24h budget, which RESETS (invalidates) the bot token (BUG-07). Treat
+ * Discord's 1000-IDENTIFY/24h budget, which RESETS (invalidates) the bot token. Treat
  * them as fatal: stop reconnecting and surface the error.
  */
 const TERMINAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
@@ -151,7 +151,7 @@ export class DiscordPlugin implements BackendPlugin {
   /** Last dispatch sequence number, echoed in heartbeats. */
   private seq: number | null = null;
   /**
-   * Reconnect backoff attempt counter (BUG-07): grows the delay 1s→2s→…→{@link RECONNECT_CAP_MS}
+   * Reconnect backoff attempt counter: grows the delay 1s→2s→…→{@link RECONNECT_CAP_MS}
    * (with jitter) and is RESET to 0 only when a socket that reached READY also STAYED up for
    * {@link STABLE_CONNECTION_MS}.
    */
@@ -173,7 +173,7 @@ export class DiscordPlugin implements BackendPlugin {
   /** channel id → subscription; MESSAGE_CREATE dispatch routes through this. */
   private readonly subs = new Map<string, { topic: Topic; handler: MessageHandler }>();
   /**
-   * Native long-poll wakeups (issue #20): channel id → set of one-shot callbacks armed by a
+   * Native long-poll wakeups: channel id → set of one-shot callbacks armed by a
    * blocking `fetchRecent`. Any MESSAGE_CREATE on that channel — OR `disconnect()` — fires every
    * waiter so the blocked fetch re-queries and returns. Independent of `subs`: a blocking fetch
    * does NOT register a subscription, it only listens on the SHARED gateway socket the live path
@@ -280,7 +280,7 @@ export class DiscordPlugin implements BackendPlugin {
       return this.fetchSince(args.topic, args.since, limit);
     }
 
-    // Native long-poll (issue #20): the exclusive `since` query is empty, so wait on the SAME
+    // Native long-poll: the exclusive `since` query is empty, so wait on the SAME
     // gateway MESSAGE_CREATE stream the live path uses for a message on this channel — up to
     // blockMs — then re-run the exclusive REST query so ids/cursor stay canonical. Returning
     // early/empty is always safe (core polls the remaining budget), so any failure to establish
@@ -511,7 +511,7 @@ export class DiscordPlugin implements BackendPlugin {
    *
    * Reconnect (close / op 7 RECONNECT / op 9 INVALID SESSION while running): capped exponential
    * backoff with jitter (`scheduleReconnect`), reopen, re-IDENTIFY — except a TERMINAL close code
-   * (auth/intent/version/shard) stops the loop instead of burning the IDENTIFY budget (BUG-07).
+   * (auth/intent/version/shard) stops the loop instead of burning the IDENTIFY budget.
    * RESUME is deliberately SKIPPED — the push gap during the outage is harmless, because the live
    * path is best-effort and cursor catch-up (`fetchRecent` since the last persisted cursor)
    * reconciles anything missed (DESIGN §6).
@@ -562,9 +562,9 @@ export class DiscordPlugin implements BackendPlugin {
             heartbeat = setInterval(() => {
               if (ws.readyState !== WebSocket.OPEN) return;
               if (awaitedAck) {
-                // The previous beat was never ACKed (op 11) → the TCP connection is half-dead
-                // (BUG-20). terminate() (NOT close()) forces the `close` event IMMEDIATELY, so the
-                // existing close→scheduleReconnect path takes over within ONE interval instead of
+                // The previous beat was never ACKed (op 11) → the TCP connection is half-dead.
+                // terminate() (NOT close()) forces the `close` event IMMEDIATELY, so the existing
+                // close→scheduleReconnect path takes over within ONE interval instead of
                 // buffering beats into a dead socket for the ~15–25 min kernel TCP timeout.
                 ws.terminate();
                 return;
@@ -605,7 +605,7 @@ export class DiscordPlugin implements BackendPlugin {
                   /* handler is best-effort; never break the loop (DESIGN §6) */
                 }
               }
-              // Wake any long-poll fetch blocked on this channel (issue #20). It re-runs the
+              // Wake any long-poll fetch blocked on this channel. It re-runs the
               // exclusive REST query, so the wakeup only needs to signal "something arrived".
               const waiting = this.waiters.get(d.channel_id);
               if (waiting !== undefined) for (const fire of [...waiting]) fire();
@@ -623,15 +623,15 @@ export class DiscordPlugin implements BackendPlugin {
             break;
           }
           case 9: {
-            // INVALID SESSION — Discord mandates a random 1–5 s wait before re-identifying
-            // (BUG-07). Stash the min-wait for scheduleReconnect (which the close handler
-            // triggers), then drop the socket.
+            // INVALID SESSION — Discord mandates a random 1–5 s wait before re-identifying.
+            // Stash the min-wait for scheduleReconnect (which the close handler triggers), then
+            // drop the socket.
             this.op9MinWaitMs = 1000 + Math.floor(Math.random() * 4000);
             ws.close();
             break;
           }
           case 11: {
-            // HEARTBEAT_ACK — liveness (BUG-20). Clears the pending-ack flag; a MISSING ack (still
+            // HEARTBEAT_ACK — liveness. Clears the pending-ack flag; a MISSING ack (still
             // set at the next beat) is what forces ws.terminate() in the heartbeat interval above.
             awaitedAck = false;
             break;
@@ -659,7 +659,7 @@ export class DiscordPlugin implements BackendPlugin {
         }
         if (TERMINAL_CLOSE.has(code)) {
           // Fatal (auth/intent/version/shard): never auto-retry — re-IDENTIFYing on every attempt
-          // burns Discord's 1000-IDENTIFY/24h budget and resets the bot token (BUG-07). The close
+          // burns Discord's 1000-IDENTIFY/24h budget and resets the bot token. The close
           // is recorded and REPORTED in both phases: after READY nothing else would ever mention
           // it, and "live push silently stopped forever" is the worst failure this plugin has.
           const err = new TerminalGatewayCloseError(

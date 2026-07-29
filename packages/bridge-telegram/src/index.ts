@@ -36,7 +36,7 @@ export interface TelegramBackendConfig {
   /**
    * Max observed records retained PER chat in the local JSONL store. The newest N are kept —
    * on load AND on every append — and the file is compacted, so a long-lived bridge on a busy
-   * chat can't grow the store/RAM without limit or degrade `connect` (BUG-32). Older records
+   * chat can't grow the store/RAM without limit or degrade `connect`. Older records
    * fall outside Telegram's ~24-48h `getUpdates` replay horizon anyway (see README "History
    * limitations"). Default 10000.
    */
@@ -78,7 +78,7 @@ interface Subscription {
 }
 
 /**
- * A `fetchRecent` long-poll parked on a topic (issue #20). Resolved by the SHARED ingest path
+ * A `fetchRecent` long-poll parked on a topic. Resolved by the SHARED ingest path
  * (the one getUpdates loop, or an own post) when a message strictly after `sinceMid` lands, or
  * on `blockMs` timeout, or on disconnect. No second getUpdates consumer is ever opened.
  */
@@ -131,7 +131,7 @@ export class TelegramPlugin implements BackendPlugin {
   private stopped = false;
   /** Live subscriptions per CHAT ID, fed by the shared getUpdates loop and by post(). */
   private readonly subs = new Map<string, Subscription[]>();
-  /** Native long-poll waiters per CHAT ID (issue #20), resolved by ingest / timeout / disconnect. */
+  /** Native long-poll waiters per CHAT ID, resolved by ingest / timeout / disconnect. */
   private readonly waiters = new Map<string, Set<Waiter>>();
   /** In-flight getUpdates long-polls, aborted on disconnect so teardown is immediate. */
   private readonly controllers = new Set<AbortController>();
@@ -187,7 +187,7 @@ export class TelegramPlugin implements BackendPlugin {
     this.controllers.clear();
     this.subs.clear();
     this.chatIdByTopic = new Map();
-    // Unpark every native long-poll waiter (issue #20) so no blocked fetchRecent hangs past
+    // Unpark every native long-poll waiter so no blocked fetchRecent hangs past
     // teardown. Snapshot first: wake() mutates `waiters`. Each resumes, re-queries the (now
     // closed) store, and returns an empty page — returning early/empty is always safe.
     for (const set of [...this.waiters.values()]) for (const w of [...set]) w.wake();
@@ -252,7 +252,7 @@ export class TelegramPlugin implements BackendPlugin {
       return slice.map((rec) => recordToMessage(rec, args.topic));
     };
     let messages = query();
-    // Native long-poll (issue #20): ONLY when the exclusive `since` query came back empty. Park
+    // Native long-poll: ONLY when the exclusive `since` query came back empty. Park
     // up to `blockMs` for the SHARED ingest path (the one getUpdates loop, or an own post) to
     // deliver a message strictly after `since`, then re-run the same pure query. There is no
     // second getUpdates consumer — {@link ingest} wakes the waiter. The initial query and the
@@ -274,8 +274,8 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Park until the SHARED ingest path delivers a message strictly after `sinceMid` in `topic`
-   * (issue #20), or `blockMs` elapses, or {@link disconnect} fires. No second getUpdates
+   * Park until the SHARED ingest path delivers a message strictly after `sinceMid` in `topic`,
+   * or `blockMs` elapses, or {@link disconnect} fires. No second getUpdates
    * consumer: the one shared loop and own posts both flow through {@link ingest}, which wakes
    * the waiter. The waiter always self-cleans (timer cleared, removed from the set), so a
    * timed-out or resolved long-poll never leaks.
@@ -304,7 +304,7 @@ export class TelegramPlugin implements BackendPlugin {
     });
   }
 
-  /** Wake any native long-poll waiter on the chat whose `since` now trails `seq` (issue #20). */
+  /** Wake any native long-poll waiter on the chat whose `since` now trails `seq`. */
   private wakeWaiters(chatId: string, seq: number): void {
     const set = this.waiters.get(chatId);
     if (set === undefined) return;
@@ -344,7 +344,7 @@ export class TelegramPlugin implements BackendPlugin {
   /**
    * Topic → the canonical NUMERIC chat id it names (`chat_map` value or the topic used as a
    * chat id literal), memoized per topic. Every seam method resolves through here, so which
-   * one ran first cannot affect what is stored or retrievable (BUG-08). Registers the chat as
+   * one ran first cannot affect what is stored or retrievable. Registers the chat as
    * one this bridge serves, so the store's chat cap never drops it.
    */
   private chatIdFor(topic: Topic): Promise<string> {
@@ -369,7 +369,7 @@ export class TelegramPlugin implements BackendPlugin {
    * A chat id in canonical NUMERIC-string form. `@channelusername` values are resolved to their
    * numeric id via `getChat` (once per distinct name — memoized like {@link getMe}); numeric ids
    * pass straight through with NO network call. Keeps every index (and `StoredRecord.chat_id`)
-   * keyed by the numeric id Telegram always stamps on inbound `Update.chat.id` (BUG-08).
+   * keyed by the numeric id Telegram always stamps on inbound `Update.chat.id`.
    *
    * A reference that is neither form names no chat Telegram could ever serve (it answers 400,
    * "chat not found"), so it is rejected here rather than becoming a topic that silently stays
@@ -406,7 +406,7 @@ export class TelegramPlugin implements BackendPlugin {
    * dedup on the composite id, persist to the store under a fresh observation sequence, then
    * deliver to any live subscriber.
    *
-   * BUG-17: the store's dedup set is the once-only guarantee — a record back from `store.append`
+   * The store's dedup set is the once-only guarantee — a record back from `store.append`
    * already proves this message was never observed. The per-subscriber watermark is the FIXED
    * observation sequence captured AT subscribe (deliver only what was observed after the
    * subscribe point — "history is owned by catch-up, not push"); it is NEVER advanced here.
@@ -436,7 +436,7 @@ export class TelegramPlugin implements BackendPlugin {
       }
       return; // already observed, or past the store's bounds (DESIGN §6).
     }
-    // Native long-poll (issue #20): a genuinely-new message wakes any parked fetchRecent on this
+    // Native long-poll: a genuinely-new message wakes any parked fetchRecent on this
     // chat. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
     this.wakeWaiters(chatId, rec.seq);
     for (const sub of this.subs.get(chatId) ?? []) {

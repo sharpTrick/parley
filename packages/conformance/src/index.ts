@@ -229,7 +229,7 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     });
 
     // Both of subscribe's documented guarantees at once: it delivers exactly the post-subscribe
-    // tail (never replaying history as if it were live — BUG-11, which has already bitten a
+    // tail (never replaying history as if it were live — a defect that has already bitten a
     // shipped backend) and it delivers in ascending cursor order.
     it('subscribe delivers exactly the post-subscribe tail, once, in cursor order', async () => {
       const t = ctx.freshTopic();

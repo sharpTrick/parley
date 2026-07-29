@@ -88,7 +88,7 @@ export class FakeSlack {
   private readonly hooks = new Map<string, (hit: number) => void | Promise<void>>();
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
-  /** When false, new Socket Mode connections are closed WITHOUT `hello` (pre-`hello` close, BUG-30). */
+  /** When false, new Socket Mode connections are closed WITHOUT `hello` (pre-`hello` close). */
   private greet = true;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
   private counter = 0;
@@ -127,7 +127,7 @@ export class FakeSlack {
         ws.send(JSON.stringify({ type: 'hello', num_connections: fake.sockets.size }));
       } else {
         // Pre-`hello` close: accept the socket then immediately close it WITHOUT a hello, so the
-        // plugin's pre-`hello` close branch (BUG-30) is exercised on every reconnect attempt.
+        // plugin's pre-`hello` close branch is exercised on every reconnect attempt.
         ws.close();
       }
     });
@@ -255,7 +255,7 @@ export class FakeSlack {
     // The plugin form-encodes EVERY Web API call (application/x-www-form-urlencoded), exactly like
     // real Slack expects. A regression back to a JSON request body would drop these args here
     // (URLSearchParams finds no `key=value` pairs), so the conformance suite fails the way
-    // slack.com does — which is precisely what makes the BUG-25 fix CI-observable.
+    // slack.com does.
     const body: Record<string, unknown> = {};
     for (const [k, v] of new URLSearchParams(Buffer.concat(chunks).toString('utf8'))) {
       body[k] = decodeFormValue(v);

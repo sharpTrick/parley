@@ -21,7 +21,7 @@ async function makeContext() {
   });
   return {
     plugin,
-    // fetchRecent honors `blockMs` NATIVELY (issue #20): a parked fetch is woken by the SHARED
+    // fetchRecent honors `blockMs` NATIVELY: a parked fetch is woken by the SHARED
     // ingest path (the one getUpdates loop, or an own post) through ingest() — no second
     // getUpdates consumer. Run the shared blocking-fetch case directly against the plugin.
     supportsBlockingFetch: true,

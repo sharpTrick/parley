@@ -15,7 +15,7 @@ async function makeContext() {
   return {
     plugin,
     // Slack honors blockMs natively (parks on the shared Socket Mode stream), so the shared
-    // blocking-fetch conformance case runs directly against the plugin (issue #20).
+    // blocking-fetch conformance case runs directly against the plugin.
     supportsBlockingFetch: true,
     fake, // introspection for the ack-discipline test below (ignored by the shared suite)
     // A fresh "channel id" per test — unmapped topics are used as channel-id literals. The channel
@@ -107,9 +107,9 @@ describe('slack identity fidelity', () => {
 });
 
 describe('slack pagination & reconnect regressions', () => {
-  // BUG-18 — with `since` set, a backlog larger than the old MAX_HISTORY_PAGES × PAGE_SIZE cap must
-  // still return the TRUE oldest window and a `nextCursor` that never sits above unfetched history.
-  it('BUG-18: `since` catch-up over a >cap backlog returns the true-oldest window, not a skipping cursor', async () => {
+  // With `since` set, a backlog larger than the old MAX_HISTORY_PAGES × PAGE_SIZE cap must still
+  // return the TRUE oldest window and a `nextCursor` that never sits above unfetched history.
+  it('`since` catch-up over a >cap backlog returns the true-oldest window, not a skipping cursor', async () => {
     const ctx = await makeContext();
     try {
       const t = ctx.freshTopic();
@@ -134,9 +134,9 @@ describe('slack pagination & reconnect regressions', () => {
     }
   });
 
-  // BUG-31 — the no-`since` default window must count PLAIN (surfaced) messages toward `limit`, not
-  // raw entries, so a system-subtype-heavy recent page can't cut the window short.
-  it('BUG-31: default window pages past system-subtype-heavy pages to return a full plain window', async () => {
+  // The no-`since` default window must count PLAIN (surfaced) messages toward `limit`, not raw
+  // entries, so a system-subtype-heavy recent page can't cut the window short.
+  it('default window pages past system-subtype-heavy pages to return a full plain window', async () => {
     const ctx = await makeContext();
     try {
       const t = ctx.freshTopic();
@@ -162,9 +162,9 @@ describe('slack pagination & reconnect regressions', () => {
     }
   });
 
-  // BUG-30 — a pre-`hello` socket close must start exactly ONE reconnect owner; repeated pre-`hello`
+  // A pre-`hello` socket close must start exactly ONE reconnect owner; repeated pre-`hello`
   // closes during an outage must not accumulate parallel reconnect() loops.
-  it('BUG-30: repeated pre-`hello` closes keep exactly one reconnect owner, then settle cleanly', async () => {
+  it('repeated pre-`hello` closes keep exactly one reconnect owner, then settle cleanly', async () => {
     const ctx = await makeContext();
     try {
       const t = ctx.freshTopic();

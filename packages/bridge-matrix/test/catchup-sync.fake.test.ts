@@ -7,13 +7,11 @@ import type { MatrixPlugin } from '../src/index.js';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
- * Work item 17 — Matrix catch-up & sync correctness (BUG-03 / BUG-09 / BUG-10).
+ * Matrix catch-up & sync correctness.
  *
  * These drive the ACTUAL plugin code (fetchRecent / subscribe / backfill) against the in-memory
  * fake Synapse in `./fake-synapse.ts`. No live homeserver: the conformance suite
  * (`conformance.test.ts`) covers the live drive and is `describe.skip`'d when no Synapse answers.
- * This file is the code-level proof that each fix genuinely changes the runtime behavior, not
- * merely that the suite is green.
  */
 
 let fake: FakeSynapse;
@@ -32,7 +30,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('BUG-03 — fetchRecent since-path drains a foreign block and always advances the cursor', () => {
+describe('fetchRecent since-path drains a foreign block and always advances the cursor', () => {
   it('shared_room: a later on-topic message after a full page of foreign-topic events is returned', async () => {
     install();
     const p = await connect(true);
@@ -93,7 +91,7 @@ describe('BUG-03 — fetchRecent since-path drains a foreign block and always ad
   });
 });
 
-describe('BUG-09 — subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {
+describe('subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {
   it('delivers ALL N events ascending with no gap and no duplicate when the server truncates', async () => {
     const f = install();
     f.syncCap = 2; // server truncates any incremental sync to 2 events → forces limited:true
@@ -115,7 +113,7 @@ describe('BUG-09 — subscribe recovers a burst larger than the per-sync cap via
   });
 });
 
-describe('issue #20 — fetchRecent honors blockMs natively via a bounded /sync long-poll', () => {
+describe('fetchRecent honors blockMs natively via a bounded /sync long-poll', () => {
   it('wakes promptly when a message lands mid-wait, returning it via the canonical catch-up', async () => {
     install();
     const p = await connect(false); // per-topic room; no subscribe loop → dedicated bounded /sync
@@ -171,7 +169,7 @@ describe('issue #20 — fetchRecent honors blockMs natively via a bounded /sync 
   });
 });
 
-describe('BUG-10 — a purged/remapped cursor 404 falls back to the recent window instead of throwing', () => {
+describe('a purged/remapped cursor 404 falls back to the recent window instead of throwing', () => {
   it('fetchRecent with an unresolvable since resolves to the recent window (no throw)', async () => {
     const f = install();
     const p = await connect(false);

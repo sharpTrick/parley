@@ -1,8 +1,8 @@
 import { asCursor, asTopic, type MessageHandler, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// BUG-07 (reconnect storm resets the bot token) + BUG-20 (half-dead socket goes undetected) are
-// both in the gateway-socket machinery. They're driven here against an in-process FAKE gateway
+// The reconnect storm that resets the bot token and the undetected half-dead socket both live in
+// the gateway-socket machinery. They're driven here against an in-process FAKE gateway
 // (the `ws` module is mocked to a scriptable FakeWs, mirroring the XMPP suite's transport mock) so
 // close codes, backoff timers, op 9, and heartbeat-ACK timing are all deterministic under fake
 // timers — no real Discord, no real sockets.
@@ -39,7 +39,7 @@ async function reachReady(
 const setTimeoutDelays = (spy: ReturnType<typeof vi.spyOn>): number[] =>
   spy.mock.calls.map((c) => c[1] as number).filter((d) => d !== NO_HANDSHAKE_TIMEOUT);
 
-describe('Discord gateway reconnect & liveness (BUG-07, BUG-20)', () => {
+describe('Discord gateway reconnect & liveness', () => {
   beforeEach(() => {
     resetGateway();
     vi.useFakeTimers();
@@ -49,7 +49,7 @@ describe('Discord gateway reconnect & liveness (BUG-07, BUG-20)', () => {
     vi.restoreAllMocks();
   });
 
-  it('BUG-07: a terminal close (4014) stops the reconnect storm — gatewayReady cleared, no re-IDENTIFY flood', async () => {
+  it('a terminal close (4014) stops the reconnect storm — gatewayReady cleared, no re-IDENTIFY flood', async () => {
     const plugin = new DiscordPlugin();
     await plugin.connect({
       token: 't',
@@ -82,7 +82,7 @@ describe('Discord gateway reconnect & liveness (BUG-07, BUG-20)', () => {
     await plugin.disconnect();
   });
 
-  it('BUG-07: transient closes back off (growing, capped, not fixed 500 ms) and reset on READY', async () => {
+  it('transient closes back off (growing, capped, not fixed 500 ms) and reset on READY', async () => {
     vi.spyOn(Math, 'random').mockReturnValue(0); // deterministic: zero jitter
     const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     const plugin = new DiscordPlugin();
@@ -128,7 +128,7 @@ describe('Discord gateway reconnect & liveness (BUG-07, BUG-20)', () => {
     await plugin.disconnect();
   });
 
-  it('BUG-07: op 9 INVALID SESSION waits a randomized 1–5 s before re-identifying', async () => {
+  it('op 9 INVALID SESSION waits a randomized 1–5 s before re-identifying', async () => {
     vi.spyOn(Math, 'random').mockReturnValue(0.5); // op9 min-wait = 3000 ms (dominates the backoff)
     const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     const plugin = new DiscordPlugin();
@@ -161,7 +161,7 @@ describe('Discord gateway reconnect & liveness (BUG-07, BUG-20)', () => {
     await plugin.disconnect();
   });
 
-  it('BUG-20: a missed heartbeat-ACK terminates the half-dead socket → reconnect → push resumes', async () => {
+  it('a missed heartbeat-ACK terminates the half-dead socket → reconnect → push resumes', async () => {
     const HB = 10_000;
     const plugin = new DiscordPlugin();
     await plugin.connect({
