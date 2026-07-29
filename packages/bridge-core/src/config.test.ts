@@ -102,9 +102,6 @@ describe('config loader', () => {
     expect(cfg.backend_config).toEqual({ db_path: '/tmp/x.db', poll_interval_ms: 250 });
   });
 
-  // The `backend` field was parsed and then read by nothing, so `backend: matrix` ran whatever
-  // binary the user launched. Stripping it silently would preserve that lie; reject instead, and
-  // point at the real mechanism. Parameterized so the whole class stays guarded.
   it.each([
     ['local-sqlite', 'parley-sqlite'],
     ['matrix', 'parley-matrix'],
@@ -122,8 +119,6 @@ describe('config loader', () => {
     );
   });
 
-  // A security knob nothing reads must not be accepted-and-ignored: an operator who sets it would
-  // believe a sandbox mode is active that does not exist.
   it('rejects permissions.skip_permissions: true as unimplemented', () => {
     expect(() =>
       parseConfig({

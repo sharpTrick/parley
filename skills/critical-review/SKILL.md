@@ -40,7 +40,10 @@ Round 1: no args. Every critic runs, nothing is asleep yet.
 
 1. **Verify before fixing.** The critic already traced it, but confirm independently — a wrong fix
    is worse than a missed finding, and it manufactures work for the next round.
-2. **Fix every CONFIRMED finding, or justify it in writing.** No silent skips.
+2. **Fix every CONFIRMED finding, or adjudicate it in the commit message.** No silent skips, and no
+   arguing back through the codebase: a declined finding is recorded in the commit that closes the
+   round — weak, or outweighed by X — never as a comment or a doc paragraph aimed at the next
+   reviewer. The critic's job is to convince you; yours is to decide.
 3. **Ratchet the THEME into the suite, not the instance.** A parameterized case or a widened
    generator that would also catch inputs nobody tried. In the prior run, 87 of 92 findings wore
    distinct class labels but collapsed to ~12 themes, and 8 themes came back under fresh labels

@@ -1,12 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
 
-/**
- * `fetchWithRetry` is the one HTTP-with-429-retry loop shared by all five HTTP backends (Zulip,
- * Matrix, Discord, Telegram, Slack), and it shipped with no tests of its own — its behaviour was
- * only ever exercised indirectly through one Slack regression test. These cover the loop directly.
- */
-
 const OPTS = {
   label: 'Test GET /thing',
   isStopped: () => false,
@@ -53,8 +47,6 @@ describe('fetchWithRetry', () => {
     expect(seen).toEqual([init]);
   });
 
-  // The five backends have genuinely different "expected" non-2xx statuses (404 for a missing
-  // room, 409 for a duplicate join, …); the loop must hand those back rather than throw.
   it.each([404, 409, 410])('returns an allowStatuses status (%i) instead of throwing', async (s) => {
     stubFetch([res(s, 'nope')]);
     const out = await fetchWithRetry('https://x/y', {}, { ...OPTS, allowStatuses: [s] });
@@ -124,8 +116,6 @@ describe('fetchWithRetry', () => {
     expect(seen).toEqual(['2']);
   });
 
-  // A disconnected plugin must not keep a retry loop alive: the check happens BEFORE the wait, so
-  // shutdown is not delayed by a pending back-off, and it must not re-issue the request.
   it('stops on a 429 once isStopped() is true, without another request', async () => {
     const state = stubFetch([res(429)]);
     const retryAfterOf = vi.fn(() => 1);
@@ -156,10 +146,8 @@ describe('fetchWithRetry', () => {
     expect(state.calls).toBe(2);
   });
 
-  // BUG-41: `Number(null) === 0`, so a 429 with no Retry-After header must NOT become a 0 ms tight
-  // loop. fetchWithRetry DELEGATES that guard to each caller's retryAfterOf rather than enforcing
-  // it, so this pins the delegation contract: whatever the caller returns is what is waited. The
-  // matching guard on the callers' side is covered by each backend's own suite.
+  // Pins the delegation contract for BUG-41: the no-hot-loop guard lives in each caller's
+  // retryAfterOf, not here.
   it('waits precisely the caller-supplied backoff, including a pathological 0', async () => {
     stubFetch([res(429), res(200)]);
     const retryAfterOf = vi.fn(() => 0);

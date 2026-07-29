@@ -93,11 +93,8 @@ export type AuthConfig = z.infer<typeof AuthSchema>;
  * `.superRefine` on {@link ConfigSchema} below — they need the whole object.
  */
 const ConfigObject = z.object({
-  // NOTE: there is deliberately no `backend` field. Core cannot load a plugin by name without
-  // learning backend names, which the seam forbids (CLAUDE.md prime directive). The backend is
-  // chosen by *which binary you run* — `parley-sqlite`, `parley-matrix`, … — each of which is a
-  // ~60-line composition root that constructs its own plugin. A `backend:` key in a config file
-  // is rejected at load rather than silently ignored; see `assertNoBackendKey`.
+  // No `backend` field: naming a plugin here would put backend names in core, so that the seam's
+  // one-way dependency (CLAUDE.md) stays intact. See assertNoBackendKey.
   /** Read-state namespace; defaults to identity.handle. Distinct sessions sharing a handle
    *  MUST set distinct instance_ids (DESIGN §10). */
   instance_id: z.string().optional(),
@@ -160,12 +157,8 @@ const ConfigObject = z.object({
   permissions: z
     .object({
       /**
-       * DANGEROUS; sandbox-only; default OFF (DESIGN §2.5/§14).
-       *
-       * NOT IMPLEMENTED: nothing in core or any plugin reads this. It is rejected at load when set
-       * to `true` rather than accepted-and-ignored, because a security knob that silently does
-       * nothing is worse than an absent one — an operator who sets it believes a mode is active
-       * that is not.
+       * Not implemented (DESIGN §2.5/§14): nothing reads this, so `true` is a load error. Keep it
+       * rejected rather than ignored, so that no operator believes a sandbox mode is active.
        */
       skip_permissions: z.boolean().default(false),
     })
@@ -213,8 +206,6 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
         'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
     });
   }
-  // Fail fast rather than accept-and-ignore: nothing reads this, so honouring it silently would
-  // tell an operator a sandbox mode is active when none is.
   if (cfg.permissions.skip_permissions) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -229,12 +220,8 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
 export type ParleyConfig = z.infer<typeof ConfigSchema>;
 
 /**
- * Reject a legacy `backend:` key instead of letting zod strip it.
- *
- * The field used to exist, was parsed, and was then read by nothing at all — so a config saying
- * `backend: matrix` ran whatever binary the user happened to launch, silently. Stripping it would
- * preserve exactly that lie. Erroring names the real mechanism (run the matching binary) and costs
- * the user one edit, once.
+ * Reject a legacy `backend:` key rather than letting zod strip it, so that a config naming one
+ * backend can never run a different one silently.
  */
 function assertNoBackendKey(raw: unknown): void {
   if (typeof raw !== 'object' || raw === null || !('backend' in raw)) return;

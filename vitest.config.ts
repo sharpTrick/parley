@@ -8,11 +8,8 @@ import { defineConfig } from 'vitest/config';
 const fromHere = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 /**
- * DERIVED, never hand-listed. This map used to be written out package by package, and it drifted:
- * `@sharptrick/parley-net-util` was missing, so anything importing it resolved through the
- * workspace symlink to `dist/` instead. Its tests would then have graded a stale build rather than
- * the source — a suite that passes while the code under it is broken. Scanning `packages/` means a
- * new package is aliased the moment it exists, and the failure mode cannot come back.
+ * Derive this from `packages/` rather than hand-listing it, so that a package missing from the map
+ * cannot resolve through the workspace symlink and have its tests grade a stale `dist/` build.
  */
 function packageAliases(): Record<string, string> {
   const root = new URL('./packages/', import.meta.url);

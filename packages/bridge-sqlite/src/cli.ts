@@ -44,11 +44,8 @@ async function main(): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
-  // BUG-38: an orphaned bridge (parent Claude Code crashed / was SIGKILLed) receives stdin EOF
-  // but no signal. Without this it keeps polling the DB + heart-beating a ghost peer into every
-  // peer's parley_list_users forever. The stdio transport has already put stdin in flowing mode
-  // by now, so 'end' fires on EOF; the shuttingDown guard keeps double-invocation (end + close,
-  // or a signal racing EOF) idempotent.
+  // BUG-38: an orphaned bridge (parent crashed or SIGKILLed) gets stdin EOF and no signal, so keep
+  // these, so that it stops rather than heart-beating a ghost peer into every peer's roster.
   process.stdin.on('end', shutdown);
   process.stdin.on('close', shutdown);
 }

@@ -63,11 +63,6 @@ describe('catch-up driver', () => {
     expect(readState.get(T)).toBe('10');
   });
 
-  // Read-state is keyed by instance+topic but NOT by backend, and cursors are opaque and
-  // backend-specific. Repointing one instance_id at a different backend therefore replays a
-  // foreign cursor and the new plugin fails deep in a driver. Core cannot validate an opaque
-  // cursor, but it can say where the cursor came from. Guard the CLASS: any first-page failure
-  // that resumed from disk, whatever the plugin's error text.
   describe('resume-from-disk failures carry an actionable hint', () => {
     const rejectingPlugin = (message: string) =>
       ({
@@ -107,13 +102,10 @@ describe('catch-up driver', () => {
         }),
       );
       expect(err.message).toContain(path);
-      // Assert on `stack`, not just `message`: every caller prints `err.stack ?? err.message`, and
-      // a stack always opens with the message it was captured for. An earlier version of this
-      // wrapper copied the driver's stack onto the hint, which silently discarded the whole hint
-      // at the only place a human reads it — while a message-only assertion stayed green.
+      // Assert on `stack`, not only `message`, so that a wrapper which clobbers the stack cannot
+      // discard the hint at the one place a human reads it while this test stays green.
       expect(err.stack).toContain('resuming from the stored cursor');
       expect(err.stack).toContain(path);
-      // The driver's original error stays reachable rather than being swallowed by the wrapper.
       expect((err.cause as Error).message).toBe(backendError);
     });
 

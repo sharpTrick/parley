@@ -26,6 +26,9 @@ full surface with fresh contexts, ratcheting each fix into the suite, until revi
    package and carries all ten lenses. This is the experiment's main variable.
 3. **Verify before acting.** Reproduce or trace every finding against the code. `CONFIRMED` only
    when traced or reproduced; otherwise `PLAUSIBLE`.
+   **Adjudication lives in the commit message.** A finding may be declined — weak, or correct in
+   isolation but outweighed. Say so in the commit that closes the round, never as a comment or a
+   doc paragraph written at the next reviewer. The critic's job is to convince; yours is to decide.
 4. **Ratchet the class into the suite before closing.** Codify the *class* — a parameterized case or
    a widened generator — not the one input, so a later reviewer finds it already guarded.
 5. **Keep going until a round changes nothing substantive.** Convergence = a full round yielding
@@ -142,6 +145,10 @@ being tested, not a reason to skip anything.
 9. **operability-and-release** — bin/exports/files wiring, publish preflight, whether CI verifies
    what it claims, npm metadata.
 10. **maintainability** *(5% blocking; 43% of all ouroboros findings)* — dead code, duplication,
-    stale names and comments, unclear APIs. Kept deliberately as the **control arm**: ouroboros
-    concluded convergence "was gated by maintainability running out of nits, not by the app becoming
-    correct and secure." Whether that replicates on a deep surface is a finding, not an assumption.
+    stale names, unclear APIs, and **comment discipline** (`CLAUDE.md`): a comment earns its place
+    only by warning a future developer off a risky action, phrased as *"keep X, so that Y."* A
+    comment restating the code, narrating history, justifying a choice, or addressed to a reviewer
+    is a finding — and where a comment exists because the code is unclear, the finding is against
+    the *code*, not the comment. Kept deliberately as the **control arm**: ouroboros concluded
+    convergence "was gated by maintainability running out of nits, not by the app becoming correct
+    and secure." Whether that replicates on a deep surface is a finding, not an assumption.

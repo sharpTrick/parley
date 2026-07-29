@@ -1,17 +1,11 @@
-// One full round of the Careening adversarial review, executable so scope, coverage, structure
-// and convergence stop being judgment calls. Spawns one critic per package, FULL-SURFACE over that
-// package, each carrying all ten lenses; collects structured findings; applies the quiescence wake
-// rules; and returns a computed `converged` flag. See docs/REVIEW_PROTOCOL.md for the loop, the
-// anti-patterns, and why quiescence needs a wake-all round to be honest.
+// One round of the Careening adversarial review. Protocol: docs/REVIEW_PROTOCOL.md
 //
-//   Workflow({ name: "careening-review" })
-//   Workflow({ name: "careening-review", args: { round: 7, quiesced: ["bridge-slack"], changed: [...] } })
+//   Workflow({ name: "careening-review", args: { round, quiesced, changed, wakeAll } })
 //
-// args (all optional):
 //   round     — round number, for labels and the returned record
-//   quiesced  — package dirs that returned zero CONFIRMED previously and are asleep
-//   changed   — paths changed since the last round (from `git diff --name-only`); drives wake-up
-//   wakeAll   — force every critic to run. REQUIRED for a round that may declare convergence.
+//   quiesced  — previous round's `nextQuiesced`, verbatim
+//   changed   — `git diff --name-only <last-round-sha>..HEAD`; drives wake-up
+//   wakeAll   — run every critic. REQUIRED for any round that may declare convergence.
 
 export const meta = {
   name: 'careening-review',
@@ -20,13 +14,7 @@ export const meta = {
   phases: [{ title: 'Review', detail: 'one critic per awake package, in parallel' }],
 }
 
-// --- targets -----------------------------------------------------------------------------------
-// bridge-core dominates the surface, so it is split into three coherent review targets rather than
-// handed to one critic that would skim all of it. Everything else is one package, one critic.
-// `dirs` is the set of package directories a target OWNS — a target may cover more than one, and
-// the own-package wake rule keys on all of them. (Getting this wrong is subtle: `shared` reviews
-// both bridge-net-util and conformance, so keying on a single dir left conformance changes unable
-// to wake the very critic that reviews conformance.)
+// `dirs` must list EVERY package a target reviews, so that a change in any of them wakes it.
 const TARGETS = [
   { key: 'core-seam', dirs: ['bridge-core'], path: 'packages/bridge-core/src (seam.ts, message.ts, config.ts, allowlist.ts, identity-filter.ts, mentions.ts, topic-name.ts and their tests — NOT auth/, engine/ or transport/)' },
   { key: 'core-engine', dirs: ['bridge-core'], path: 'packages/bridge-core/src/engine and packages/bridge-core/src/transport' },
@@ -44,8 +32,6 @@ const TARGETS = [
   { key: 'shared', dirs: ['bridge-net-util', 'conformance'], path: 'packages/bridge-net-util and packages/conformance' },
 ]
 
-// Dependency edges, so wake-up is derived rather than judged. Core wakes everything; net-util wakes
-// the five HTTP backends; the conformance suite wakes every backend.
 const HTTP_BACKENDS = ['matrix', 'zulip', 'discord', 'slack', 'telegram']
 const BACKENDS = [
   'sqlite', 'redis', 'postgres', 'matrix', 'xmpp', 'nats', 'zulip', 'discord', 'slack', 'telegram',
@@ -56,13 +42,11 @@ function wakeSet(changedPaths) {
   const touched = (frag) => changedPaths.some((p) => p.includes(frag))
 
   for (const t of TARGETS) {
-    // A target always wakes for a change inside any package it owns.
     if (t.dirs.some((d) => changedPaths.some((p) => p.startsWith(`packages/${d}/`)))) woken.add(t.key)
   }
   if (touched('packages/bridge-core/')) for (const t of TARGETS) woken.add(t.key)
   if (touched('packages/bridge-net-util/')) for (const k of HTTP_BACKENDS) woken.add(k)
   if (touched('packages/conformance/')) for (const k of BACKENDS) woken.add(k)
-  // Repo-level contract changes wake everyone.
   if (['CLAUDE.md', 'DESIGN.md', 'docs/REVIEW_PROTOCOL.md', 'vitest.config.ts', 'tsconfig.base.json']
     .some((f) => changedPaths.includes(f))) {
     for (const t of TARGETS) woken.add(t.key)
@@ -169,18 +153,14 @@ const errored = results.filter((r) => r.errored).map((r) => r.target)
 
 if (errored.length) log(`WARNING: critics errored (not a clean round): ${errored.join(', ')}`)
 
-// Convergence, computed. A round that did not wake every critic can never declare it: a quiesced
-// package is a missing lens, and a missing lens cannot produce a clean signal.
+// Require wakeAll, so that convergence is never declared while a quiesced package is a missing lens.
 const converged = confirmed.length === 0 && errored.length === 0 && wakeAll
 
-// The shadow signal, recorded and never acted on. Ouroboros stopped on zero-CONFIRMED and left
-// "would a severity-gated rule have under-stopped?" as its open question; recording both answers it
-// from one run at no extra cost.
+// Shadow signal: recorded, never acted on.
 const blockingClean = blocking.length === 0 && errored.length === 0 && wakeAll
 
-// Retire critics that came back genuinely clean. `nextQuiesced` is the FULL set to pass back in on
-// the following round — targets that ran clean this round, plus the ones that were already asleep
-// and were not woken. Returning only the newly-clean ones would silently re-wake the rest.
+// `nextQuiesced` is the FULL set for the next round — pass it back verbatim, so that already-asleep
+// targets are not silently re-woken.
 const ranClean = results
   .filter((r) => !r.errored && r.findings.every((f) => f.verdict !== 'CONFIRMED'))
   .map((r) => r.target)

@@ -68,9 +68,13 @@ Full definitions in `docs/REVIEW_PROTOCOL.md`. In brief:
    `description` and `keywords` (these ship to npm), tool descriptions, JSDoc, comments.
 9. **operability-and-release** — `bin`/`exports`/`files` wiring, publish preflight, whether CI
    verifies what it claims, npm metadata.
-10. **maintainability** — dead code, duplication, stale or misleading names and comments, unclear
-    APIs. Real, but the lowest-yield lens on record: do not let it crowd out the diagnostic ones,
-    and hold it to the same evidence bar.
+10. **maintainability** — dead code, duplication, stale or misleading names, unclear APIs, and
+    **comment discipline** (see `CLAUDE.md`): a comment earns its place only by warning a future
+    developer off a risky action, phrased as "keep X, so that Y". A comment that restates the code,
+    narrates history, justifies a choice, or is addressed to a reviewer is a finding. Where a
+    comment exists because the code is unclear, file against the **code** — simpler, better named,
+    better factored — not against the comment. Real, but the lowest-yield lens on record: do not
+    let it crowd out the diagnostic ones, and hold it to the same evidence bar.
 
 ## Output contract
 

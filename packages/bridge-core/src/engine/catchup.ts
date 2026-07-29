@@ -50,19 +50,11 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
 }
 
 /**
- * Run the FIRST catch-up page — the only one that replays a cursor read off disk — and, if the
- * plugin rejects it, re-throw with the one hint core is able to give.
+ * Run the first catch-up page — the only one replaying a cursor read off disk — and annotate a
+ * rejection with the state-file path.
  *
- * Cursors are opaque to core and their format is the backend's own (a Redis stream id, a Postgres
- * BIGSERIAL, a Matrix event id, …), while read-state is keyed by instance and topic but NOT by
- * backend. So pointing one instance_id at a different backend hands the new plugin a cursor minted
- * by the old one, and it fails somewhere deep in a driver — e.g. Postgres reporting
- * `invalid input syntax for type bigint: "1785300194045-0"` on a Redis stream id. Core cannot
- * validate an opaque cursor, but it knows a disk cursor was in play and where the file is, which is
- * the difference between a driver stack trace and an actionable one.
- *
- * Only the first page is wrapped: every later cursor in the loop was minted by this same plugin in
- * this same run, so a failure there is a genuine backend error and must surface unadorned.
+ * Wrap only the first page, so that a later failure (whose cursor this plugin minted itself)
+ * surfaces as the plain backend error it is.
  */
 async function fetchWithResumeHint(
   plugin: BackendPlugin,
@@ -73,9 +65,8 @@ async function fetchWithResumeHint(
     return await plugin.fetchRecent(req);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    // `cause` keeps the driver's own error (and its stack) reachable. Do NOT copy err.stack onto
-    // the wrapper: callers print `err.stack ?? err.message`, and a stack always begins with the
-    // message it was captured for — so overwriting it silently throws this hint away.
+    // Never copy err.stack onto this wrapper, so that the hint survives: callers print
+    // `err.stack ?? err.message`, and a stack opens with the message it was captured for.
     throw new Error(
       `catch-up failed on topic ${JSON.stringify(req.topic)} while resuming from the stored ` +
         `cursor ${JSON.stringify(String(req.since))}: ${detail}\n` +
