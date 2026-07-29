@@ -51,4 +51,40 @@ describe('source hygiene', () => {
       `${name} (0x${byte.toString(16).padStart(2, '0')}) must be written as an escape, not a raw byte`,
     ).toEqual([]);
   });
+
+  /**
+   * A tracker id in a comment or a test name points at an issue a reader of this repository cannot
+   * open, and narrates history that CLAUDE.md puts in the commit message. Every round of review has
+   * filed it, and it kept coming back under new numbers, so the class is guarded rather than the
+   * instances. Test names matter as much as comments: the name is the first thing a human reads
+   * when a case fails, and a bare ticket id locates nothing.
+   *
+   * `docs/findings/` is exempt, so that archived findings records can quote code as it stood.
+   */
+  const TRACKER = /\b(?:BUG|SEC|CX|D)-\d+\b|\bissue #\d+/;
+  const codeFiles = files.filter(
+    (f) =>
+      ['.ts', '.js', '.mjs', '.cjs'].includes(extname(f)) &&
+      !f.includes('/docs/findings/') &&
+      !f.endsWith('source-hygiene.test.ts'),
+  );
+
+  it('finds code files to check (guards against a broken filter)', () => {
+    expect(codeFiles.length).toBeGreaterThan(50);
+  });
+
+  it('no comment or test name cites an issue tracker', () => {
+    const offenders: string[] = [];
+    for (const f of codeFiles) {
+      readFileSync(f, 'utf8')
+        .split('\n')
+        .forEach((line, i) => {
+          if (TRACKER.test(line)) offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
+        });
+    }
+    expect(
+      offenders,
+      'cite the behaviour, not the ticket — put the history in the commit message',
+    ).toEqual([]);
+  });
 });
