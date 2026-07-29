@@ -18,8 +18,14 @@ async function makeContext() {
     // blocking-fetch conformance case runs directly against the plugin (issue #20).
     supportsBlockingFetch: true,
     fake, // introspection for the ack-discipline test below (ignored by the shared suite)
-    // A fresh "channel id" per test — unmapped topics are used as channel-id literals.
-    freshTopic: (): Topic => asTopic(`C${++seq}${rand().toUpperCase()}`),
+    // A fresh "channel id" per test — unmapped topics are used as channel-id literals. The channel
+    // is CREATED in the fake: an id that was never created is `channel_not_found`, not an empty
+    // channel, so a test that means "empty topic" must say so explicitly.
+    freshTopic: (): Topic => {
+      const t = asTopic(`C${++seq}${rand().toUpperCase()}`);
+      fake.createChannel(t);
+      return t;
+    },
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();
@@ -71,6 +77,28 @@ describe('slack socket mode discipline', () => {
         },
         { timeout: 3000, interval: 10 },
       );
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+});
+
+describe('slack identity fidelity', () => {
+  // Slack stamps the posting BOT as the sender and `post` cannot override it, so two sessions
+  // sharing one bot token are indistinguishable on read-back — the fact the README's
+  // "give every session its own bot" warning rests on. Pinned here so a future change that
+  // starts carrying `identity` (or stops) has to move the README with it.
+  it('does NOT carry the logical identity: distinct handles read back as one sender', async () => {
+    const ctx = await makeContext();
+    try {
+      const t = ctx.freshTopic();
+      await ctx.plugin.post(t, asHandle('ctx-payments'), 'from payments');
+      await ctx.plugin.post(t, asHandle('ctx-reviews'), 'from reviews');
+
+      const { messages } = await ctx.plugin.fetchRecent({ topic: t });
+      expect(messages.map((m) => m.content)).toEqual(['from payments', 'from reviews']);
+      expect(new Set(messages.map((m) => m.senderHandle)).size).toBe(1);
+      expect(messages[0]!.senderHandle).not.toBe('ctx-payments');
     } finally {
       await ctx.cleanup();
     }

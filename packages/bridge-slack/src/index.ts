@@ -1,11 +1,13 @@
 import {
   asBackendMsgId,
   asCursor,
+  NoSuchTopicError,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
   buildMessage,
+  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
@@ -42,6 +44,29 @@ interface SlackMessage {
   channel?: string;
 }
 
+/** An `ok:false` Web API response, carrying Slack's machine-readable `error` code. */
+class SlackApiError extends Error {
+  constructor(
+    method: string,
+    readonly code: string,
+  ) {
+    super(`Slack ${method} → ${code}`);
+    this.name = 'SlackApiError';
+  }
+}
+
+/**
+ * Slack error codes that mean "this conversation is not there for us" — the seam's absent-topic
+ * contract ({@link NoSuchTopicError}), which core reads as "topic not present yet" rather than a
+ * backend failure. `not_in_channel` is absence for a READ (we cannot see the channel's history);
+ * for a WRITE it is a live misconfiguration and must surface as a real error.
+ */
+const ABSENT_ON_READ = ['channel_not_found', 'not_in_channel'];
+const ABSENT_ON_WRITE = ['channel_not_found'];
+
+const asSeamError = (e: unknown, topic: Topic, absentCodes: string[]): unknown =>
+  e instanceof SlackApiError && absentCodes.includes(e.code) ? new NoSuchTopicError(topic) : e;
+
 /** A Socket Mode envelope (the subset we route on). */
 interface SocketEnvelope {
   type?: string;
@@ -73,13 +98,18 @@ interface Waiter {
 }
 
 /**
- * A channel-level message we surface. Everything else (`message_changed`, `message_deleted`,
- * `channel_join`, thread broadcasts, …) is a mutation/system record, not a new message —
- * surfacing those would break dedup (same `ts`, different payload). Plain messages carry no
- * `subtype`; app/bot posts may carry `bot_message`.
+ * The subtypes that carry NEW channel-level content: no subtype (a plain post), `bot_message`
+ * (an app post), `file_share` (a file/screenshot posted with its caption) and `me_message`.
+ * Widen this only for subtypes that are genuinely new content with their own `ts` — admitting a
+ * mutation record (`message_changed`, `message_deleted`, `tombstone`) republishes an EXISTING `ts`
+ * with different content, which breaks dedup for every reader; admitting a system record
+ * (`channel_join`, `channel_topic`, …) puts join spam into agent context.
  */
+const SURFACED_SUBTYPES = new Set(['bot_message', 'file_share', 'me_message']);
+
+/** A channel-level message we surface — see {@link SURFACED_SUBTYPES}. */
 const isPlainMessage = (m: SlackMessage): boolean =>
-  m.type === 'message' && (m.subtype === undefined || m.subtype === 'bot_message');
+  m.type === 'message' && (m.subtype === undefined || SURFACED_SUBTYPES.has(m.subtype));
 
 /**
  * Slack backend (DESIGN §6/§9) over the raw Web API (`fetch`) + Socket Mode (`ws`) — no Slack SDK.
@@ -164,7 +194,11 @@ export class SlackPlugin implements BackendPlugin {
     this.require();
     const body: Record<string, unknown> = { channel: this.channelFor(topic), text: content };
     if (opts?.inReplyTo !== undefined) body.thread_ts = opts.inReplyTo;
-    const resp = await this.api<{ ok: boolean; ts: string }>('chat.postMessage', body);
+    const resp = await this.api<{ ok: boolean; ts: string }>('chat.postMessage', body).catch(
+      (e: unknown) => {
+        throw asSeamError(e, topic, ABSENT_ON_WRITE);
+      },
+    );
     // identity is the logical sender; Slack stamps the wire sender as our bot user.
     void identity;
     return asBackendMsgId(resp.ts);
@@ -182,7 +216,10 @@ export class SlackPlugin implements BackendPlugin {
    * `nextCursor` ABOVE the never-fetched older messages, permanently skipping the middle of a long
    * backlog (the skipped span sits below `nextCursor` and no later catch-up would ever revisit it —
    * BUG-18). A reader that's been offline across a huge backlog therefore pays O(backlog / page)
-   * requests for one call, but memory stays O(limit): since pages arrive newest-first, the oldest
+   * requests for one call — and the NEXT call re-walks the (now shorter) remainder, so draining a
+   * backlog end to end costs ~backlog² / (2 · limit · page) requests in aggregate, not
+   * O(backlog / page). Raise `catchup.limit` on Slack: the aggregate cost falls linearly with it.
+   * Memory stays O(limit) regardless: since pages arrive newest-first, the oldest
    * live at the tail, so we retain only a rolling tail of ~`limit + page_size` collected messages
    * and discard the newer ones as older pages arrive. Without `since` only the most recent `limit`
    * are needed, so paging stops as soon as enough PLAIN (surfaced) messages have been collected —
@@ -235,21 +272,31 @@ export class SlackPlugin implements BackendPlugin {
     const limit = args.limit ?? 100;
     const resumeAfterSince = args.since !== undefined;
 
+    // SURFACED messages only — every window decision below must count these, never raw entries.
+    // Counting raw lets a system-subtype-heavy stretch end the walk early (BUG-31) or survive the
+    // trim as a tail that filters down to nothing, which returns an empty page whose `nextCursor`
+    // is `since` — a caller looping on that cursor never reaches the messages behind it.
     const collected: SlackMessage[] = [];
+    let newestSeenTs: string | undefined;
     let pageCursor: string | undefined;
     for (;;) {
       const body: Record<string, unknown> = { channel, limit: 200 };
       if (args.since !== undefined) body.oldest = args.since; // EXCLUSIVE (no `inclusive`)
       if (pageCursor !== undefined) body.cursor = pageCursor;
-      const resp = await this.api<HistoryResponse>('conversations.history', body);
-      collected.push(...(resp.messages ?? []));
+      const resp = await this.api<HistoryResponse>('conversations.history', body).catch(
+        (e: unknown) => {
+          throw asSeamError(e, args.topic, ABSENT_ON_READ);
+        },
+      );
+      const page = resp.messages ?? [];
+      for (const m of page) {
+        if (newestSeenTs === undefined || compareTs(m.ts, newestSeenTs) > 0) newestSeenTs = m.ts;
+      }
+      collected.push(...page.filter(isPlainMessage));
       pageCursor = resp.response_metadata?.next_cursor || undefined;
 
       if (!resumeAfterSince) {
-        // Newest-first default window: stop once `limit` PLAIN (surfaced) messages are in hand.
-        // Counting RAW here would let a system-subtype-heavy first page (channel_join, …) end the
-        // walk short of a full window, dropping the older plain messages below `nextCursor` (BUG-31).
-        if (collected.filter(isPlainMessage).length >= limit) break;
+        if (collected.length >= limit) break;
         if (pageCursor === undefined) break;
       } else {
         // Resume-after-`since`: walk to the OLDEST end so `nextCursor` never sits above unfetched
@@ -263,11 +310,20 @@ export class SlackPlugin implements BackendPlugin {
 
     // Defensive ascending re-sort after multi-page assembly (pages arrive newest-first; never
     // trust concatenation order, and never compare `ts` lexically or as floats — compareTs).
-    const events = collected.filter(isPlainMessage).sort((a, b) => compareTs(a.ts, b.ts));
+    const events = collected.sort((a, b) => compareTs(a.ts, b.ts));
     const window = resumeAfterSince ? events.slice(0, limit) : events.slice(-limit);
     const messages = window.map((m) => slackToMessage(args.topic, m));
-    const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');
-    return { messages, nextCursor };
+    return { messages, nextCursor: messages.at(-1)?.cursor ?? this.emptyCursor(args, newestSeenTs) };
+  }
+
+  /**
+   * The cursor for a window that surfaced nothing. Stepping past the system records is safe ONLY
+   * because the `since` walk ran to cursor exhaustion: every entry above `since` was seen and none
+   * was surfacable, so nothing can be skipped. Keep that exhaustiveness, or this drops messages.
+   */
+  private emptyCursor(args: FetchRecentArgs, newestSeenTs: string | undefined): Cursor {
+    if (args.since !== undefined && newestSeenTs !== undefined) return asCursor(newestSeenTs);
+    return args.since ?? asCursor('0');
   }
 
   /**
@@ -327,7 +383,16 @@ export class SlackPlugin implements BackendPlugin {
 
   /** The shared socket, opened lazily on the first subscribe; resolves once `hello` is in. */
   private ensureSocket(): Promise<void> {
-    this.wsReady ??= this.openSocket();
+    if (this.wsReady === undefined) {
+      const attempt = this.openSocket();
+      this.wsReady = attempt;
+      // Memoize the connection, never the FAILURE: a cached rejection is replayed by every later
+      // subscribe/blocking fetch without touching the network, so one transient
+      // `apps.connections.open` error would disable live push for the process lifetime.
+      attempt.catch(() => {
+        if (this.wsReady === attempt) this.wsReady = undefined;
+      });
+    }
     return this.wsReady;
   }
 
@@ -375,6 +440,10 @@ export class SlackPlugin implements BackendPlugin {
   private async openSocket(): Promise<void> {
     // Socket Mode handshake uses the APP token; everything else uses the bot token.
     const open = await this.api<{ ok: boolean; url: string }>('apps.connections.open', {}, 'app');
+    // A disconnect that landed during that round trip already cleared `ws`/`wsReady`, and the
+    // close handler below declines to act once stopped — so dialing now would install a live
+    // socket nothing will ever close, burning one of the ~10 connections per app token.
+    if (this.stopped) throw new Error('Slack Socket Mode connect aborted — plugin disconnected');
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(open.url);
       this.ws = ws;
@@ -525,7 +594,7 @@ export class SlackPlugin implements BackendPlugin {
       },
     );
     const json = (await res.json()) as T & { error?: string };
-    if (!json.ok) throw new Error(`Slack ${method} → ${json.error ?? 'unknown_error'}`);
+    if (!json.ok) throw new SlackApiError(method, json.error ?? 'unknown_error');
     return json;
   }
 
@@ -537,18 +606,21 @@ export class SlackPlugin implements BackendPlugin {
 }
 
 /**
- * Compare two Slack `ts` values (`'<seconds>.<suffix>'`). A `ts` is NOT a float — parsing
- * `'1234567890.123456'` as a number loses low-order precision — and NOT lexically ordered
- * (suffix widths could differ). Compare the epoch-seconds part, then the suffix, both as
- * integers. Used only for defensive sorting after multi-page assembly; the API itself handles
- * `oldest` exclusivity and per-page order.
+ * Compare two Slack `ts` values (`'<seconds>.<suffix>'`) — the cursor order key.
+ *
+ * NOT a float compare: `Number('<seconds>.<suffix>')` loses the low-order digits outright once the
+ * seconds grow past the double's ~1 µs resolution there, collapsing distinct `ts` values to equal.
+ * NOT a lexical compare: seconds are unpadded, so `'2.…'` would sort after `'10.…'`. Compare the
+ * seconds as integers, then the suffix as a FRACTION — zero-padded to a common width, since a
+ * suffix is a place-value fraction (`.1` is 0.1 s, not 1 µs), not an integer count.
  */
 export function compareTs(a: string, b: string): number {
-  const [aSec, aSub] = a.split('.');
-  const [bSec, bSub] = b.split('.');
+  const [aSec, aSub = ''] = a.split('.');
+  const [bSec, bSub = ''] = b.split('.');
   const bySec = Number(aSec) - Number(bSec);
   if (bySec !== 0) return bySec;
-  return Number(aSub ?? '0') - Number(bSub ?? '0');
+  const width = Math.max(aSub.length, bSub.length);
+  return Number(aSub.padEnd(width, '0') || '0') - Number(bSub.padEnd(width, '0') || '0');
 }
 
 function slackToMessage(topic: Topic, m: SlackMessage): Message {

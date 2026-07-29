@@ -1,0 +1,136 @@
+/**
+ * Two lifecycle CLASSES that a single-instance plugin gets wrong quietly:
+ *
+ * (1) A lazily-memoized async singleton must not cache FAILURE. `wsReady` and `authTestPromise`
+ *     are both "start it once, everyone awaits the same promise" fields; if a rejected promise
+ *     stays in the field, every later caller replays the old error without touching the network,
+ *     so one transient failure disables that path for the whole process lifetime. The table drives
+ *     each singleton N times against a fake that fails the first K attempts, and asserts both that
+ *     the endpoint was hit N times AND that attempt K+1 succeeds.
+ *
+ * (2) A teardown racing an in-flight resource acquisition must leave nothing open. `disconnect()`
+ *     can land while `apps.connections.open` is still in flight; the socket that opens afterwards
+ *     belongs to a plugin that is already stopped, and nothing will ever close it — it holds a
+ *     process handle and burns one of the ~10 Socket Mode connections an app token gets.
+ */
+import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
+import { describe, expect, it } from 'vitest';
+import { SlackPlugin } from '../src/index.js';
+import { FakeSlack } from './fake-slack.js';
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function makePlugin(fake: FakeSlack): Promise<SlackPlugin> {
+  const plugin = new SlackPlugin();
+  await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
+  return plugin;
+}
+
+interface Singleton {
+  name: string;
+  method: string;
+  /** Make the next attempt fail (K times) in this singleton's characteristic way. */
+  arm: (fake: FakeSlack, times: number) => void;
+  drive: (plugin: SlackPlugin) => Promise<unknown>;
+}
+
+const SINGLETONS: Singleton[] = [
+  {
+    name: 'wsReady / apps.connections.open ok:false',
+    method: 'apps.connections.open',
+    arm: (fake, times) => fake.failMethod('apps.connections.open', 'internal_error', times),
+    drive: (plugin) => plugin.subscribe(asTopic('C0LIVE'), () => undefined),
+  },
+  {
+    name: 'authTestPromise / auth.test ok:false',
+    method: 'auth.test',
+    arm: (fake, times) => fake.failMethod('auth.test', 'internal_error', times),
+    drive: (plugin) => plugin.resolveIdentity(asHandle('parley-bot')),
+  },
+];
+
+describe('slack memoized async singletons', () => {
+  for (const singleton of SINGLETONS) {
+    for (const failFirst of [1, 3]) {
+      it(`${singleton.name}: ${failFirst} transient failures do not poison later attempts`, async () => {
+        const fake = await FakeSlack.start();
+        fake.createChannel('C0LIVE');
+        const plugin = await makePlugin(fake);
+        try {
+          singleton.arm(fake, failFirst);
+          const attempts = failFirst + 2;
+          const outcomes: Array<'ok' | 'threw'> = [];
+          for (let i = 0; i < attempts; i++) {
+            try {
+              await singleton.drive(plugin);
+              outcomes.push('ok');
+            } catch {
+              outcomes.push('threw');
+            }
+          }
+          // Every FAILING attempt reached the wire, and the eventual success is memoized after
+          // that: hits === failures + 1. A cached rejection collapses this to 1.
+          expect(fake.hits(singleton.method)).toBe(failFirst + 1);
+          expect(outcomes.slice(0, failFirst).every((o) => o === 'threw')).toBe(true);
+          expect(outcomes.slice(failFirst)).toEqual(Array(attempts - failFirst).fill('ok'));
+        } finally {
+          await plugin.disconnect();
+          await fake.close();
+        }
+      });
+    }
+  }
+
+  it('a socket that fails to establish is retried, not replayed, on the blocking fetch path', async () => {
+    const fake = await FakeSlack.start();
+    const topic = asTopic('C0BLOCK');
+    fake.createChannel(topic);
+    const plugin = await makePlugin(fake);
+    try {
+      fake.failMethod('apps.connections.open', 'internal_error', 1);
+      // Degrades to the non-blocking path once; the NEXT blocking fetch must dial again.
+      await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
+      const afterFirst = fake.hits('apps.connections.open');
+      await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
+      expect(fake.hits('apps.connections.open')).toBeGreaterThan(afterFirst);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+});
+
+describe('slack teardown racing an in-flight connect', () => {
+  for (const delayMs of [0, 1, 5, 20, 50, 120]) {
+    for (const start of ['subscribe', 'blocking-fetch'] as const) {
+      it(`disconnect ${delayMs}ms into ${start} leaves no socket open`, async () => {
+        const fake = await FakeSlack.start();
+        const topic = asTopic('C0RACE');
+        fake.createChannel(topic);
+        // Hold the handshake open long enough that the teardown lands mid-acquisition for the
+        // small delays and after establishment for the large ones.
+        fake.setLatency('apps.connections.open', 60);
+        const plugin = await makePlugin(fake);
+        try {
+          const inFlight =
+            start === 'subscribe'
+              ? plugin.subscribe(topic, () => undefined)
+              : plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 2000 });
+          const settled = inFlight.then(
+            () => undefined,
+            () => undefined,
+          );
+
+          await sleep(delayMs);
+          await plugin.disconnect();
+          await settled;
+          await sleep(300);
+
+          expect(fake.liveSockets).toBe(0);
+        } finally {
+          await fake.close();
+        }
+      });
+    }
+  }
+});

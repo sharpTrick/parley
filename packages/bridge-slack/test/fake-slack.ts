@@ -7,6 +7,9 @@
  *   - `conversations.history` returns NEWEST-first with `oldest` EXCLUSIVE (unless `inclusive`),
  *     and pages at a FIXED size of 50 via `response_metadata.next_cursor`, so the conformance
  *     multi-writer case (100 messages) forces real multi-page assembly in the plugin.
+ *   - A channel id that was never created answers `{ok:false, error:'channel_not_found'}` — an
+ *     EXISTING but empty channel is the only thing that answers `ok:true, messages:[]`. Fabricating
+ *     success for unknown ids would green the seam's absent-topic contract without testing it.
  *   - Every `chat.postMessage` pushes an `events_api` envelope to ALL connected sockets (Slack
  *     delivers the bot's own posts back), and incoming `{envelope_id}` acks are recorded so tests
  *     can assert the ack-every-envelope discipline.
@@ -73,6 +76,14 @@ export class FakeSlack {
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly sockets = new Set<WebSocket>();
+  /** Channels that EXIST. Anything else answers `channel_not_found`, like slack.com. */
+  private readonly known = new Set<string>();
+  /** method → the `ok:false` code to answer with, and how many more times. */
+  private readonly failures = new Map<string, { code: string; times: number }>();
+  /** method → artificial latency (ms), for racing a teardown against an in-flight request. */
+  private readonly latency = new Map<string, number>();
+  /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
+  readonly requests = new Map<string, number>();
   /** When false, new Socket Mode connections are closed WITHOUT `hello` (pre-`hello` close, BUG-30). */
   private greet = true;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
@@ -124,6 +135,50 @@ export class FakeSlack {
     this.greet = on;
   }
 
+  /** Create an EMPTY but existing channel (`ok:true, messages:[]`), unlike an unknown id. */
+  createChannel(channel: string): void {
+    if (!this.channels.has(channel)) this.channels.set(channel, []);
+    this.known.add(channel);
+  }
+
+  /** Answer `method` with `{ok:false, error:code}` for the next `times` calls. */
+  failMethod(method: string, code: string, times = Number.POSITIVE_INFINITY): void {
+    this.failures.set(method, { code, times });
+  }
+
+  /** Hold `method`'s response for `ms`, widening the in-flight window a teardown can race. */
+  setLatency(method: string, ms: number): void {
+    this.latency.set(method, ms);
+  }
+
+  /** How many times `method` reached the wire (counted before injected failures). */
+  hits(method: string): number {
+    return this.requests.get(method) ?? 0;
+  }
+
+  /** Sockets currently connected — must be 0 once a plugin has disconnected. */
+  get liveSockets(): number {
+    return this.sockets.size;
+  }
+
+  /** Push one raw `events_api` envelope (any subtype) to every connected socket. */
+  pushEvent(channel: string, event: Record<string, unknown>): string {
+    const envelopeId = `env-${rand()}`;
+    this.pushed.add(envelopeId);
+    const envelope = JSON.stringify({
+      envelope_id: envelopeId,
+      type: 'events_api',
+      payload: { event: { type: 'message', channel, ...event } },
+    });
+    for (const ws of this.sockets) ws.send(envelope);
+    return envelopeId;
+  }
+
+  /** Mint the next `ts` without storing anything (for pushed events with no history row). */
+  mintTs(): string {
+    return `${Math.floor(Date.now() / 1000)}.${String(++this.counter).padStart(6, '0')}`;
+  }
+
   /** Close every currently-connected Socket Mode socket (simulate an established-socket drop). */
   dropSockets(): void {
     for (const ws of this.sockets) ws.close();
@@ -136,9 +191,10 @@ export class FakeSlack {
    * are returned in insertion (ascending-`ts`) order.
    */
   seed(channel: string, entries: Array<{ text: string; subtype?: string }>): StoredMessage[] {
+    this.createChannel(channel);
     const list = this.channels.get(channel) ?? [];
     const created = entries.map((e) => {
-      const ts = `${Math.floor(Date.now() / 1000)}.${String(++this.counter).padStart(6, '0')}`;
+      const ts = this.mintTs();
       const msg: StoredMessage = { type: 'message', ts, text: e.text, user: 'U0PARLEY', bot_id: 'B0PARLEY' };
       if (e.subtype !== undefined) msg.subtype = e.subtype;
       list.push(msg);
@@ -180,7 +236,18 @@ export class FakeSlack {
       return;
     }
 
-    switch (req.url.slice('/api/'.length)) {
+    const method = req.url.slice('/api/'.length);
+    this.requests.set(method, this.hits(method) + 1);
+    const held = this.latency.get(method);
+    if (held !== undefined) await new Promise<void>((r) => setTimeout(r, held));
+    const failure = this.failures.get(method);
+    if (failure !== undefined && failure.times > 0) {
+      failure.times--;
+      reply({ ok: false, error: failure.code });
+      return;
+    }
+
+    switch (method) {
       case 'chat.postMessage':
         reply(this.postMessage(body));
         return;
@@ -212,9 +279,10 @@ export class FakeSlack {
     if (typeof channel !== 'string' || typeof text !== 'string') {
       return { ok: false, error: 'invalid_arguments' };
     }
+    if (!this.known.has(channel)) return { ok: false, error: 'channel_not_found' };
     // Unique AND per-channel monotonic even under concurrent writers: epoch seconds never move
     // backwards and the global counter suffix strictly increases (integer-wise, not lexically).
-    const ts = `${Math.floor(Date.now() / 1000)}.${String(++this.counter).padStart(6, '0')}`;
+    const ts = this.mintTs();
     const msg: StoredMessage = { type: 'message', ts, text, user: 'U0PARLEY', bot_id: 'B0PARLEY' };
     const list = this.channels.get(channel) ?? [];
     list.push(msg);
@@ -236,6 +304,7 @@ export class FakeSlack {
   private history(body: Record<string, unknown>): Record<string, unknown> {
     const channel = body.channel;
     if (typeof channel !== 'string') return { ok: false, error: 'invalid_arguments' };
+    if (!this.known.has(channel)) return { ok: false, error: 'channel_not_found' };
     let msgs = [...(this.channels.get(channel) ?? [])];
     const oldest = body.oldest;
     if (typeof oldest === 'string') {
