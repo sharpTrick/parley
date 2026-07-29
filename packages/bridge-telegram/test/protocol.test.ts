@@ -1,7 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
@@ -9,7 +8,6 @@ import { ObservedStore } from '../src/store.js';
 import { type FakeTelegram, KNOWN_CHANNEL, startFakeTelegram } from './fake-telegram.js';
 
 const SENDER = asHandle('me');
-const here = fileURLToPath(new URL('.', import.meta.url));
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -72,6 +70,44 @@ describe('telegram connect preflight', () => {
       plugin.connect({ store_path: storePath(), poll_timeout_s: 1, ...config(fake) }),
     ).rejects.toThrow();
     await plugin.disconnect();
+  });
+
+  /**
+   * A numeric knob is a promise: `poll_timeout_s: 0` is Telegram's "short polling", which turns the
+   * single ingestion loop into a request flood against the operator's token, a negative one kills
+   * ingestion outright, and a retention bound of 0 used to become the built-in 10000 — the
+   * opposite of what was asked, persisted to disk. Every knob × every out-of-domain value, so the
+   * class cannot come back through whichever knob is added next.
+   */
+  const NUMERIC_KNOBS = [
+    'poll_timeout_s',
+    'observed_retention_per_chat',
+    'observed_retention_per_topic',
+    'observed_max_chats',
+  ] as const;
+  const OUT_OF_DOMAIN = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1e9];
+  const KNOB_CELLS = NUMERIC_KNOBS.flatMap((key) =>
+    OUT_OF_DOMAIN.map((value) => ({ key, value })),
+  );
+
+  it.each(KNOB_CELLS)('rejects connect on $key = $value, naming the key', async ({ key, value }) => {
+    const fake = await startFake();
+    const plugin = new TelegramPlugin();
+    await expect(
+      plugin.connect({
+        token: fake.token,
+        api_url: fake.url,
+        store_path: storePath(),
+        poll_timeout_s: 1,
+        [key]: value,
+      }),
+    ).rejects.toThrow(new RegExp(`backend_config\\.${key}`));
+    await plugin.disconnect();
+  });
+
+  it.each(NUMERIC_KNOBS)('accepts %s at the low end of its range', async (key) => {
+    const fake = await startFake();
+    await expect(connectTo(fake, { [key]: 1 })).resolves.toBeDefined();
   });
 
   it('rejects connect when a chat_map entry names no reachable chat', async () => {
@@ -226,6 +262,37 @@ describe('telegram poll watchdog', () => {
     },
     30_000,
   );
+
+  /**
+   * The other side of the same budget. `pollBudgetMs()` (the long poll plus 40% slack) is the only
+   * number that may abandon a poll — a shared per-call default the plugin does not override
+   * instead cuts every HEALTHY long poll past `poll_timeout_s: 30`, turning the sole ingestion path
+   * into an abort-and-retry loop whose only symptom is one throttled stderr line a minute.
+   *
+   * Telegram accepts a `getUpdates` timeout up to 50s and most bot frameworks default to 30–50, so
+   * this has to hold past any shared default; proving it costs the wall-clock it claims.
+   */
+  it('does not abandon a healthy long poll at a shared per-call default', async () => {
+    const fake = await startFake();
+    const stderr = captureStderr();
+    const plugin = await connectTo(fake, { poll_timeout_s: 40 });
+    await vi.waitFor(() => expect(fake.parkedPolls()).toBe(1), { timeout: 5000, interval: 20 });
+
+    await new Promise((r) => setTimeout(r, 32_000));
+
+    expect(stderr.join('')).not.toMatch(/deadline|timed out/);
+    expect(fake.callCount('getUpdates')).toBe(1);
+    expect(fake.parkedPolls()).toBe(1);
+    const chat = '-1009300002';
+    const topic = asTopic(chat);
+    const live: Message[] = [];
+    await plugin.subscribe(topic, (m) => live.push(m));
+    fake.injectUserMessage(chat, 'alice', 'after the default deadline');
+    await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after the default deadline'), {
+      timeout: 5000,
+      interval: 20,
+    });
+  }, 60_000);
 });
 
 /**
@@ -252,6 +319,37 @@ describe('telegram getUpdates acknowledgement', () => {
     await new Promise((r) => setTimeout(r, 1200));
     expect(fake.callCount('getUpdates') - calls).toBeLessThanOrEqual(4);
   }, 20_000);
+
+  /**
+   * The cadence must not depend on the long poll being honoured. A proxy or a local Bot API server
+   * that answers `getUpdates` immediately would otherwise spin the single ingestion loop at the
+   * speed of the network — hundreds of requests a second against the operator's bot token, which
+   * is a flood-wait or a ban and no message loss anyone would notice first.
+   */
+  it.each([1, 25, 50])(
+    'stays below a handful of polls a second at poll_timeout_s %i when the long poll is ignored',
+    async (pollTimeoutS) => {
+      const fake = await startFake();
+      const plugin = await connectTo(fake, { poll_timeout_s: pollTimeoutS });
+      fake.ignoreLongPoll(true);
+      const chat = '-1009200002';
+      const topic = asTopic(chat);
+      const live: Message[] = [];
+      await plugin.subscribe(topic, (m) => live.push(m));
+
+      const calls = fake.callCount('getUpdates');
+      await new Promise((r) => setTimeout(r, 1000));
+      expect(fake.callCount('getUpdates') - calls).toBeLessThanOrEqual(8);
+
+      // Throttled, not stalled: a message still arrives promptly.
+      fake.injectUserMessage(chat, 'alice', 'still flowing');
+      await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('still flowing'), {
+        timeout: 3000,
+        interval: 10,
+      });
+    },
+    20_000,
+  );
 });
 
 /**
@@ -277,6 +375,29 @@ describe('telegram lifecycle', () => {
     const plugin = await connectTo(fake);
     await plugin.disconnect();
     await expect(invoke(plugin, call)).rejects.toThrow(/not connected/);
+  });
+
+  /**
+   * The same guard one await later. Every seam call resolves its topic across an await, so a call
+   * in flight when `disconnect()` lands resumes against a CLOSED store — realistic on shutdown,
+   * with a `parley_fetch_recent` still open as the bridge tears down. `close()` clears the
+   * per-chat index, so a fetchRecent that answers anyway reports a topic tail of zero and sends
+   * the next session's catch-up back to the start of the retained window, and a post reaches
+   * Telegram with nothing left to record it in.
+   */
+  it.each(SEAM_CALLS)('%s rejects when disconnect lands mid-call', async (call) => {
+    const fake = await startFake();
+    const plugin = await connectTo(fake);
+    const topic = asTopic('-1009100002');
+    for (const c of ['a', 'b', 'c']) await plugin.post(topic, SENDER, c);
+    const sentBefore = fake.sent.length;
+
+    const inFlight = invoke(plugin, call);
+    await plugin.disconnect();
+
+    await expect(inFlight).rejects.toThrow(/not connected/);
+    // A rejected post never reached Telegram, so nothing was sent that nothing can record.
+    expect(fake.sent).toHaveLength(sentBefore);
   });
 
   it('rejects a second connect and keeps exactly one poll loop', async () => {
@@ -450,24 +571,5 @@ describe('telegram chat_id validation', () => {
     await expect(plugin.post(topic, SENDER, 'x')).rejects.toThrow(/not a Telegram chat id/);
     await expect(plugin.fetchRecent({ topic })).rejects.toThrow(/not a Telegram chat id/);
     await expect(plugin.subscribe(topic, () => undefined)).rejects.toThrow(/not a Telegram chat id/);
-  });
-});
-
-/**
- * A shipped knob absent from the documented table is a knob operators cannot use and cannot
- * discover — and this one silently bounds the history the README's own section promises.
- */
-describe('telegram README config table', () => {
-  it('documents exactly the keys TelegramBackendConfig accepts', () => {
-    const source = readFileSync(join(here, '..', 'src', 'index.ts'), 'utf8');
-    const block = /export interface TelegramBackendConfig \{([\s\S]*?)\n\}/.exec(source)?.[1] ?? '';
-    const declared = [...block.matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1]);
-    expect(declared.length).toBeGreaterThan(0);
-
-    const readme = readFileSync(join(here, '..', 'README.md'), 'utf8');
-    const table = /## Config \(`backend_config`\)([\s\S]*?)\n## /.exec(readme)?.[1] ?? '';
-    const documented = [...table.matchAll(/^\| `(\w+)`/gm)].map((m) => m[1]);
-
-    expect([...documented].sort()).toEqual([...declared].sort());
   });
 });

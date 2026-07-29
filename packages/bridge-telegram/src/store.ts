@@ -55,6 +55,19 @@ const DEFAULT_MAX_PER_CHAT = 10_000;
 const DEFAULT_MAX_CHATS = 1_000;
 
 /**
+ * A retention bound is a promise about disk and memory. Keep it a hard failure rather than a
+ * substituted default, so that an operator who asks for a narrow bound never silently gets the
+ * built-in wide one — a deep local archive of every chat the bot is in, which is the opposite of
+ * what they configured.
+ */
+function requirePositiveInt(name: string, value: number): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`ObservedStore: ${name} must be a positive integer — got ${String(value)}`);
+  }
+  return value;
+}
+
+/**
  * Append-only JSONL store of every message this bridge has OBSERVED (own sends via the
  * `sendMessage` response + foreign messages via `getUpdates`). The Telegram Bot API exposes
  * NO history endpoint, so this store IS the durable, replayable history the seam contract
@@ -99,8 +112,8 @@ export class ObservedStore {
     maxChats = DEFAULT_MAX_CHATS,
     served: Iterable<string> = [],
   ) {
-    this.maxPerChat = maxPerChat > 0 ? maxPerChat : DEFAULT_MAX_PER_CHAT;
-    this.maxChats = maxChats > 0 ? maxChats : DEFAULT_MAX_CHATS;
+    this.maxPerChat = requirePositiveInt('maxPerChat', maxPerChat);
+    this.maxChats = requirePositiveInt('maxChats', maxChats);
     for (const chatId of served) this.served.add(chatId);
     mkdirSync(dirname(path), { recursive: true });
     let raw = '';

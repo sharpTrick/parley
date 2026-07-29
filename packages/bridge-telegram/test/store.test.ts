@@ -118,6 +118,47 @@ describe('telegram ObservedStore durability', () => {
     },
   );
 
+  /**
+   * The once-only guarantee (DESIGN §6, and the README's "dedup across `getUpdates` backlog
+   * replays"): the SECOND append of a composite id writes nothing and returns undefined, while
+   * a record differing in either half of the composite is a different message and is admitted.
+   * Telegram's `message_id` is unique only per chat, so both halves have to be in the key.
+   */
+  const DEDUP_CASES = [
+    { name: 'the same chat and message_id', chat: '-1', messageId: 1, admitted: false },
+    { name: 'the same message_id in another chat', chat: '-2', messageId: 1, admitted: true },
+    { name: 'another message_id in the same chat', chat: '-1', messageId: 2, admitted: true },
+  ];
+
+  it.each(DEDUP_CASES)('a second append of $name is admitted: $admitted', ({ chat, messageId, admitted }) => {
+    const store = new ObservedStore(path, 10, 10);
+    const first = store.append(record('-1', 1, 'once'));
+    expect(first).toBeDefined();
+
+    const second = store.append(record(chat, messageId, 'again'));
+    expect(second === undefined).toBe(!admitted);
+    expect(store.size()).toBe(admitted ? 2 : 1);
+    expect(lineCount(path)).toBe(admitted ? 2 : 1);
+    // A refused append leaves the first record — and its sequence — untouched.
+    expect(store.entries('-1').map((r) => [r.seq, r.content])).toEqual(
+      admitted && chat === '-1' ? [[1, 'once'], [2, 'again']] : [[1, 'once']],
+    );
+    store.close();
+
+    // The dedup set is rebuilt from the file, so the refusal survives a cold reload.
+    const reloaded = new ObservedStore(path, 10, 10);
+    expect(reloaded.append(record('-1', 1, 'again'))).toBeUndefined();
+    expect(reloaded.size()).toBe(admitted ? 2 : 1);
+    reloaded.close();
+  });
+
+  it('rejects a non-positive or fractional retention bound instead of substituting the default', () => {
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new ObservedStore(path, bad)).toThrow(/maxPerChat must be a positive integer/);
+      expect(() => new ObservedStore(path, 10, bad)).toThrow(/maxChats must be a positive integer/);
+    }
+  });
+
   it('bounds the number of chats, and admits a chat the bridge serves past the cap', () => {
     const store = new ObservedStore(path, 10, 2);
     store.serve('-500');

@@ -64,6 +64,12 @@ export interface FakeTelegram {
    * forever on all three, which no status-level failure can reproduce.
    */
   stallMethod(method: string, mode: StallMode | undefined): void;
+  /**
+   * Answer every `getUpdates` immediately, ignoring the `timeout` the client asked for — what a
+   * proxy or a local Bot API server that does not implement long polling does. The only way to
+   * see whether the ingestion loop has a floor under it, or spins at the speed of the network.
+   */
+  ignoreLongPoll(on: boolean): void;
   /** How many requests this fake has served for `method` — the poll loop's retry cadence. */
   callCount(method: string): number;
   /**
@@ -169,6 +175,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const parked = new Set<ParkedPoll>();
   const failures = new Map<string, Failure>();
   const stalls = new Map<string, StallMode>();
+  let longPollHonoured = true;
   const holds = new Map<string, { promise: Promise<void>; release(): void }>();
   /** Responses deliberately left hanging — closed on shutdown so the process can exit. */
   const stalled = new Set<ServerResponse>();
@@ -316,7 +323,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         const timeoutS = Number(url.searchParams.get('timeout') ?? body.timeout ?? 0);
         confirm(offset);
         const ready = pending(offset);
-        if (ready.length > 0 || timeoutS <= 0) {
+        if (ready.length > 0 || timeoutS <= 0 || !longPollHonoured) {
           reply(res, 200, { ok: true, result: ready });
           return;
         }
@@ -422,6 +429,11 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     stallMethod(method: string, mode: StallMode | undefined): void {
       if (mode === undefined) stalls.delete(method);
       else stalls.set(method, mode);
+    },
+
+    ignoreLongPoll(on: boolean): void {
+      longPollHonoured = !on;
+      if (on) for (const poll of [...parked]) answerPoll(poll);
     },
 
     callCount(method: string): number {

@@ -49,6 +49,12 @@ async function startRig(config: Record<string, unknown> = {}): Promise<Rig> {
 const contentsOf = async (plugin: TelegramPlugin, topic: Topic): Promise<string[]> =>
   (await plugin.fetchRecent({ topic, limit: 100 })).messages.map((m) => m.content);
 
+/** Cold restart: a fresh plugin instance on the same fake and the same store file. */
+const restart = async (rig: Rig): Promise<TelegramPlugin> => {
+  await rig.plugin.disconnect();
+  return rig.restart();
+};
+
 /**
  * Every way a topic can NAME a chat, crossed with which seam call ran first and whether the
  * foreign message arrived before any of them. Inbound updates carry only a numeric `chat.id`,
@@ -130,6 +136,58 @@ describe('telegram inbound routing', () => {
       await rig.plugin.disconnect();
       const restarted = await rig.restart();
       expect(await contentsOf(restarted, topic)).toContain('foreign');
+    },
+  );
+});
+
+/**
+ * Telegram resolves a `chat_id` NUMERICALLY, and stamps the normalized id on every inbound update
+ * and on its own `sendMessage` response. So a topic whose chat reference is numerically — but not
+ * textually — canonical must still collapse to that one key. A plugin that keys the store, the
+ * subscription and the fetch under the literal spelling makes the topic a permanent black hole:
+ * its posts are filed under a key nothing inbound will ever carry, and the Bot API has no history
+ * endpoint that could hand them back.
+ *
+ * One row per spelling, so a ref format nobody has tried yet (a wider supergroup id, a new
+ * prefix) fails on its own rather than hiding behind a neighbour.
+ */
+const NON_CANONICAL_SPELLINGS = [
+  { name: 'a leading zero', ref: '-01009300001', canonical: '-1009300001', config: {} },
+  { name: 'many leading zeros', ref: '-000001009300002', canonical: '-1009300002', config: {} },
+  { name: 'a positive id with leading zeros', ref: '004242', canonical: '4242', config: {} },
+  {
+    name: 'a chat_map value with a leading zero',
+    ref: 'ops',
+    canonical: '-1009300003',
+    config: { chat_map: { ops: '-01009300003' } },
+  },
+] as const;
+
+describe('telegram chat-id canonicalization', () => {
+  it.each(NON_CANONICAL_SPELLINGS)(
+    'a topic naming a chat by $name is one key with the id Telegram stamps',
+    async ({ ref, canonical, config }) => {
+      const rig = await startRig(config);
+      const topic = asTopic(ref);
+      const live: Message[] = [];
+      await rig.plugin.subscribe(topic, (m) => live.push(m));
+
+      const ownId = await rig.plugin.post(topic, SENDER, 'own');
+      expect(ownId as string).toMatch(new RegExp(`^${canonical}:\\d+$`));
+      // Our own post is retrievable under the spelling the caller used...
+      expect(await contentsOf(rig.plugin, topic)).toEqual(['own']);
+
+      // ...and an inbound update, which carries only the canonical id, routes to the same topic.
+      rig.fake.injectUserMessage(canonical, 'alice', 'foreign');
+      await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('foreign'), {
+        timeout: 3000,
+        interval: 10,
+      });
+      expect(live.at(-1)?.topic).toBe(topic);
+      expect(await contentsOf(rig.plugin, topic)).toEqual(['own', 'foreign']);
+
+      // The store filed both under the canonical id, so a cold restart still finds them.
+      expect(await contentsOf(await restart(rig), topic)).toEqual(['own', 'foreign']);
     },
   );
 });
@@ -283,6 +341,67 @@ describe('telegram own-post race', () => {
     const caughtUp = (await rig.plugin.fetchRecent({ topic, since: tail, limit: 1000 })).messages;
     expect(caughtUp.map((m) => m.content)).toEqual(all.slice(1));
     expect(live.map((m) => m.content).sort()).toEqual(all.slice(1).sort());
+  }, 20_000);
+});
+
+/**
+ * The once-only guarantee, from the plugin's side. Telegram retains an unacknowledged `getUpdates`
+ * backlog and re-serves it — that is what the README calls "dedup across `getUpdates` backlog
+ * replays … the store's dedup makes that replay harmless" — so the same `<chat>:<message_id>`
+ * really does arrive twice, in the same session and across a restart. Each route asserts the
+ * whole consequence: one record, one cursor, one live push, one line on disk. Guarding the ROUTE
+ * axis is what keeps the class covered when a new ingest path is added.
+ */
+describe('telegram observes each message once', () => {
+  const CHAT = '-1009777001';
+  const ROUTES = [
+    'redelivered in the same session',
+    'redelivered after a cold restart',
+    "redelivered as the bridge's own post",
+  ] as const;
+
+  it.each(ROUTES)('a message %s is stored, pushed and served exactly once', async (route) => {
+    const rig = await startRig();
+    const topic = asTopic(CHAT);
+    const own = route === "redelivered as the bridge's own post";
+    let messageId: number;
+    let content: string;
+
+    if (own) {
+      content = 'ours';
+      const id = await rig.plugin.post(topic, SENDER, content);
+      messageId = Number((id as string).split(':')[1]);
+    } else {
+      content = 'once';
+      messageId = rig.fake.injectUserMessage(CHAT, 'alice', content);
+      await vi.waitFor(async () => expect(await contentsOf(rig.plugin, topic)).toEqual([content]), {
+        timeout: 3000,
+        interval: 10,
+      });
+    }
+
+    // A live subscriber established BEFORE the replay: the duplicate must not reach it.
+    const restarted = route === 'redelivered after a cold restart' ? await restart(rig) : rig.plugin;
+    const live: Message[] = [];
+    await restarted.subscribe(topic, (m) => live.push(m));
+
+    rig.fake.injectRaw(CHAT, {
+      message_id: messageId,
+      from: { id: 5, is_bot: own, username: own ? 'parley_test_bot' : 'alice' },
+      text: content,
+    });
+    // A trailing distinct message pins the point at which the replay has been consumed.
+    rig.fake.injectUserMessage(CHAT, 'alice', 'after');
+    await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after'), {
+      timeout: 5000,
+      interval: 10,
+    });
+
+    expect(live.map((m) => m.content)).toEqual(['after']);
+    const page = await restarted.fetchRecent({ topic, limit: 100 });
+    expect(page.messages.map((m) => m.content)).toEqual([content, 'after']);
+    expect(new Set(page.messages.map((m) => m.cursor)).size).toBe(2);
+    expect(readFileSync(rig.storePath, 'utf8').trimEnd().split('\n')).toHaveLength(2);
   }, 20_000);
 });
 

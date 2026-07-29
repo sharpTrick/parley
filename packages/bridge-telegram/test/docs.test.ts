@@ -1,11 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { type FakeTelegram, startFakeTelegram } from './fake-telegram.js';
+import { type FakeTelegram, KNOWN_CHANNEL, startFakeTelegram } from './fake-telegram.js';
 
 const SENDER = asHandle('me');
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -159,6 +159,79 @@ describe('telegram config keys name the unit they bound', () => {
     for (let i = 0; i < 8; i++) await plugin.post(topic, SENDER, `m${i}`);
     const page = await plugin.fetchRecent({ topic, limit: 100 });
     expect(page.messages).toHaveLength(kept);
+  }, 20_000);
+});
+
+/**
+ * Two files carrying the same case cannot fail independently, and a reader of either cannot tell
+ * which one owns the check — so the next variant gets a third copy. Titles that are nothing but a
+ * table placeholder are exempt: the row supplies the real name.
+ */
+describe('telegram test suite hygiene', () => {
+  it('declares no case title in two files', () => {
+    const owners = new Map<string, string[]>();
+    for (const file of readdirSync(here).filter((f) => f.endsWith('.test.ts'))) {
+      const text = readFileSync(join(here, file), 'utf8');
+      for (const m of text.matchAll(
+        /^\s*(?:it|it\.each\([\s\S]*?\))\(\s*(['"`])((?:\\.|(?!\1).)*)\1/gm,
+      )) {
+        const title = m[2] as string;
+        if (/^[\s$%]*(?:[$%]\w+[\s.\w]*)?$/.test(title)) continue;
+        owners.set(title, [...(owners.get(title) ?? []), file]);
+      }
+    }
+    // Guard the extractor itself: a regex that stops matching would make this lint vacuous.
+    expect(owners.size).toBeGreaterThan(40);
+    expect([...owners].filter(([, files]) => new Set(files).size > 1)).toEqual([]);
+  });
+});
+
+/**
+ * A README row that claims an ABSENCE is the kind of claim nothing else can fail on, and this row
+ * used to claim more than the code delivers: resolving an `@channelusername` topic awaits
+ * `getChat`, so the first catch-up on such a topic really does need Telegram. Drive the seam call
+ * with `getChat` broken and grade the row against what the call actually does.
+ */
+describe('telegram fetchRecent network claim', () => {
+  const fetchRecentRow = readme.split('\n').find((l) => l.startsWith('| `fetchRecent`')) ?? '';
+
+  it('names the resolution cost instead of claiming no network call', () => {
+    expect(fetchRecentRow).not.toBe('');
+    expect(fetchRecentRow).toMatch(/getChat/);
+    expect(fetchRecentRow).toMatch(/no history endpoint is ever called/i);
+  });
+
+  it.each([
+    { name: 'a chat_map @name topic, resolved during connect', mapped: true, offlineSafe: true },
+    { name: 'an @name topic never named in chat_map', mapped: false, offlineSafe: false },
+  ])('$name is offline-safe: $offlineSafe', async ({ mapped, offlineSafe }) => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const fake = await startFakeTelegram();
+    const dir = mkdtempSync(join(tmpdir(), 'parley-tg-claim-'));
+    cleanups.push(async () => {
+      await fake.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const plugin = new TelegramPlugin();
+    await plugin.connect({
+      token: fake.token,
+      api_url: fake.url,
+      store_path: join(dir, 'store.jsonl'),
+      poll_timeout_s: 1,
+      chat_map: mapped ? { news: KNOWN_CHANNEL.username } : {},
+    });
+    cleanups.push(() => plugin.disconnect());
+    const topic = asTopic(mapped ? 'news' : KNOWN_CHANNEL.username);
+
+    // Telegram becomes unreachable AFTER connect: catch-up must not depend on it for a chat the
+    // bridge already resolved, and the README must not promise more than that.
+    fake.failMethod('getChat', { status: 500, description: 'Internal Server Error' });
+    const caughtUp = plugin.fetchRecent({ topic });
+    if (offlineSafe) {
+      expect((await caughtUp).messages).toEqual([]);
+      return;
+    }
+    await expect(caughtUp).rejects.toThrow(/getChat/);
   }, 20_000);
 });
 

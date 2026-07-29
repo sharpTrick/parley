@@ -16,7 +16,12 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
+import {
+  delay,
+  fetchWithRetry,
+  retryAfterFromHeader,
+  statusOf,
+} from '@sharptrick/parley-net-util';
 import { keyOf, type ObservedRecord, ObservedStore, type StoredRecord } from './store.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
@@ -32,7 +37,11 @@ export interface TelegramBackendConfig {
    * cursor: sequences restart at 1 and the messages below the old cursor are unreachable.
    */
   store_path?: string;
-  /** `getUpdates` long-poll timeout (SECONDS — Telegram's unit). Default 25. */
+  /**
+   * `getUpdates` long-poll timeout (SECONDS — Telegram's unit). Default 25, accepted range
+   * `[1, 50]`. `0` is Telegram's "short polling", which would turn the single ingestion loop into
+   * a request flood against the bot token, so it is a load error rather than a knob.
+   */
   poll_timeout_s?: number;
   /**
    * Parley topic → Telegram chat id. A topic missing from the map is used as the chat id
@@ -174,6 +183,7 @@ export class TelegramPlugin implements BackendPlugin {
     const generation = ++this.generation;
     try {
       const cfg = config as TelegramBackendConfig;
+      requireNumericKnobs(cfg);
       this.apiUrl = (cfg.api_url ?? 'https://api.telegram.org').replace(/\/+$/, '');
       this.token = cfg.token ?? '';
       this.pollTimeoutS = cfg.poll_timeout_s ?? 25;
@@ -260,9 +270,10 @@ export class TelegramPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
-    this.require(this.store);
+    const store = this.require(this.store);
     void identity; // sender is the bot account; see JSDoc above.
     const chatId = await this.chatIdFor(topic);
+    this.stillServing(store);
     const body: Record<string, unknown> = { chat_id: chatId, text: content };
     // Reply threading: only for a composite `<chat>:<mid>` naming THIS chat — a message id from
     // another chat is meaningless here (Telegram's message_id is per-chat) and would either 400
@@ -275,9 +286,13 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Durable catch-up = a pure query over the observed-message store (no network — the Bot API
-   * has no history endpoint; see the class doc for what that means). Exclusive `since` via a
-   * NUMERIC observation-sequence compare, ascending, sliced to `limit`.
+   * Durable catch-up = a query over the observed-message store: no history endpoint is ever
+   * called, because the Bot API has none (see the class doc for what that means). The one network
+   * cost is resolving an `@channelusername` topic to its numeric id — one memoized `getChat`,
+   * already paid during `connect` for every `chat_map` entry — so a topic named only by an
+   * `@name` literal can fail its FIRST catch-up if Telegram is unreachable.
+   *
+   * Exclusive `since` via a NUMERIC observation-sequence compare, ascending, sliced to `limit`.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const store = this.require(this.store);
@@ -295,6 +310,7 @@ export class TelegramPlugin implements BackendPlugin {
       );
     }
     const chatId = await this.chatIdFor(args.topic);
+    this.stillServing(store);
     // Normalize BEFORE slicing: a non-positive limit must mean "no messages" on both branches
     // (`slice(-0)` is `slice(0)` — the whole history — which would invert the argument).
     const limit = Math.max(0, Math.floor(args.limit ?? 100));
@@ -382,6 +398,7 @@ export class TelegramPlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const store = this.require(this.store);
     const chatId = await this.chatIdFor(topic);
+    this.stillServing(store);
     const sub: Subscription = { handler, watermark: store.maxSeq(chatId), topic };
     const list = this.subs.get(chatId);
     if (list === undefined) this.subs.set(chatId, [sub]);
@@ -394,8 +411,9 @@ export class TelegramPlugin implements BackendPlugin {
    * users by username (DESIGN §4).
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
-    this.require(this.store);
+    const store = this.require(this.store);
     const me = await this.getMe();
+    this.stillServing(store);
     if (me.username !== undefined && (handle as string) === me.username) {
       return { handle, backendRef: String(me.id) };
     }
@@ -434,16 +452,22 @@ export class TelegramPlugin implements BackendPlugin {
 
   /**
    * A chat id in canonical NUMERIC-string form. `@channelusername` values are resolved to their
-   * numeric id via `getChat` (once per distinct name — memoized like {@link getMe}); numeric ids
-   * pass straight through with NO network call. Keeps every index (and `StoredRecord.chat_id`)
-   * keyed by the numeric id Telegram always stamps on inbound `Update.chat.id`.
+   * numeric id via `getChat` (once per distinct name — memoized like {@link getMe}); a numeric id
+   * is normalized NUMERICALLY with no network call. Keeps every index (and
+   * `StoredRecord.chat_id`) keyed by the numeric id Telegram always stamps on inbound
+   * `Update.chat.id`.
+   *
+   * Normalize through `BigInt`, so that a spelling which is numerically but not textually
+   * canonical (`-0012345`) collapses to the one key inbound updates carry rather than becoming a
+   * topic whose posts land under a key nothing will ever match — and so that a chat id past
+   * `Number.MAX_SAFE_INTEGER` is not rounded on the way through.
    *
    * A reference that is neither form names no chat Telegram could ever serve (it answers 400,
    * "chat not found"), so it is rejected here rather than becoming a topic that silently stays
    * empty forever.
    */
   private canonicalChatId(chat: string): Promise<string> {
-    if (/^-?\d+$/.test(chat)) return Promise.resolve(chat);
+    if (/^-?\d+$/.test(chat)) return Promise.resolve(BigInt(chat).toString());
     if (!/^@[A-Za-z][A-Za-z0-9_]{3,31}$/.test(chat)) {
       return Promise.reject(
         new Error(
@@ -530,6 +554,7 @@ export class TelegramPlugin implements BackendPlugin {
     let offset = 0;
     while (this.generation === generation) {
       let updates: TgUpdate[];
+      const startedAt = Date.now();
       try {
         const json = await this.call<{ result?: TgUpdate[] }>(
           'GET',
@@ -539,21 +564,29 @@ export class TelegramPlugin implements BackendPlugin {
         updates = json.result ?? [];
       } catch (err) {
         if (this.generation !== generation) break;
+        const status = statusOf(err);
         // A rejected token or a wrong api_url never heals by retrying — surface it and stop,
         // so that the bridge is a loud failure instead of a silent black hole hammering the API.
-        if (FATAL_POLL_STATUSES.includes(statusOf(err) ?? 0)) {
+        if (status !== undefined && FATAL_POLL_STATUSES.includes(status)) {
           this.report(`getUpdates failed fatally, ingestion stopped: ${describe(err)}`);
           return;
         }
         // 409 Conflict = getUpdates is unavailable for this token: either another poller holds
         // it (Telegram allows exactly one) or a webhook is registered (call deleteWebhook).
         // Telegram's own description says which — it rides along in the error text.
-        const conflict = statusOf(err) === 409;
+        const conflict = status === 409;
         this.report(`getUpdates failed, retrying: ${describe(err)}`, { throttleAs: 'poll-failure' });
         await delay(conflict ? 3000 : 500);
         continue;
       }
       if (this.generation !== generation) break;
+      // Keep a floor under the IDLE loop, so that an upstream ignoring `timeout` (a proxy, a local
+      // Bot API server) cannot turn the single ingestion path into a request flood against the
+      // operator's bot token. A poll carrying updates is never throttled.
+      if (updates.length === 0) {
+        const idle = Date.now() - startedAt;
+        if (idle < MIN_IDLE_POLL_MS) await delay(MIN_IDLE_POLL_MS - idle);
+      }
       for (const u of updates) {
         offset = Math.max(offset, u.update_id + 1);
         const msg = u.message ?? u.channel_post;
@@ -611,12 +644,15 @@ export class TelegramPlugin implements BackendPlugin {
   /**
    * Single HTTP entry point (`<api_url>/bot<token><path>`) → parsed JSON body. Transparently
    * retries on 429 honoring Telegram's `parameters.retry_after` (SECONDS); retries stop the
-   * moment we disconnect. Throws on any other non-2xx with the status in the message (the poll
-   * loop matches `→ 409` to detect a competing poller).
+   * moment we disconnect. Throws on any other non-2xx as an `HttpStatusError` carrying the
+   * status as a field (the poll loop reads it with `statusOf`).
    *
-   * The request AND the body read run under one abort budget: a server that accepts the
-   * connection and then answers slowly, half-answers, or never answers must surface as a
-   * retryable error rather than parking the caller forever.
+   * `budgetMs` is the ONE wall-clock ceiling on the call, passed to net-util as its deadline
+   * rather than armed locally as well: a per-call budget the plugin computes and does not forward
+   * is silently overridden by the shared 30s default, which aborts every healthy long poll past
+   * `poll_timeout_s: 30`. net-util buffers the body inside that budget, so a server which accepts
+   * the connection and then answers slowly, half-answers or never answers surfaces as a retryable
+   * error rather than parking the caller forever.
    */
   private async call<T>(
     method: string,
@@ -627,12 +663,9 @@ export class TelegramPlugin implements BackendPlugin {
     const headers: Record<string, string> = {};
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
     const label = `Telegram ${method} ${path.split('?')[0] ?? path}`;
-    const budgetMs = opts?.budgetMs ?? REQUEST_BUDGET_MS;
+    const abortable = opts?.abortOnDisconnect === true;
     const controller = new AbortController();
-    if (opts?.abortOnDisconnect === true) this.controllers.add(controller);
-    const timer = setTimeout(() => {
-      controller.abort(new Error(`${label} timed out after ${budgetMs}ms with no response`));
-    }, budgetMs);
+    if (abortable) this.controllers.add(controller);
     try {
       const res = await fetchWithRetry(
         url,
@@ -640,18 +673,18 @@ export class TelegramPlugin implements BackendPlugin {
           method,
           headers,
           body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
-          signal: controller.signal,
+          signal: abortable ? controller.signal : undefined,
         },
         {
           label,
           // Stop retrying once disconnected — don't keep hammering the API post-teardown.
           isStopped: () => this.stopped,
           retryAfterOf: readRetryAfter,
+          deadlineMs: opts?.budgetMs ?? REQUEST_BUDGET_MS,
         },
       );
       return (await res.json()) as T;
     } finally {
-      clearTimeout(timer);
       this.controllers.delete(controller);
     }
   }
@@ -661,6 +694,20 @@ export class TelegramPlugin implements BackendPlugin {
       throw new Error('TelegramPlugin not connected — call connect() first');
     }
     return value;
+  }
+
+  /**
+   * Re-assert after every await that the instance is still serving the store this call started
+   * on. Keep this, so that a seam call resuming after `disconnect()` cannot answer out of a closed
+   * store: `close()` clears the per-chat index, so `fetchRecent` would report a topic tail of
+   * zero and send the next catch-up back to the beginning of the retained window.
+   */
+  private stillServing(store: ObservedStore): void {
+    if (this.store !== store) {
+      throw new Error(
+        'TelegramPlugin not connected — the connection this call started on was torn down',
+      );
+    }
   }
 }
 
@@ -749,14 +796,48 @@ function defaultStorePath(): string {
   return join(base, 'parley', 'telegram', 'observed.jsonl');
 }
 
-/** HTTP status carried by a {@link fetchWithRetry} error (`<label> → <status>: <body>`). */
-function statusOf(err: unknown): number | undefined {
-  const match = err instanceof Error ? /→ (\d{3})\b/.exec(err.message) : null;
-  return match === null ? undefined : Number(match[1]);
-}
-
 /** Statuses that mean the token/URL itself is wrong — retrying can only make it worse. */
 const FATAL_POLL_STATUSES = [401, 403, 404];
+
+/** Floor on how fast {@link TelegramPlugin.pollLoop} may re-poll after an EMPTY answer. */
+const MIN_IDLE_POLL_MS = 250;
+
+/**
+ * Accepted range of every numeric knob. Telegram accepts a `getUpdates` timeout up to 50s, and
+ * both retention bounds size in-memory state, so each has a ceiling as well as a floor.
+ */
+const NUMERIC_KNOBS: Record<NumericKnob, readonly [number, number]> = {
+  poll_timeout_s: [1, 50],
+  observed_retention_per_chat: [1, 10_000_000],
+  observed_retention_per_topic: [1, 10_000_000],
+  observed_max_chats: [1, 1_000_000],
+};
+
+/** The `backend_config` keys {@link NUMERIC_KNOBS} bounds — renaming one has to break the build. */
+type NumericKnob = keyof Pick<
+  TelegramBackendConfig,
+  'poll_timeout_s' | 'observed_retention_per_chat' | 'observed_retention_per_topic' | 'observed_max_chats'
+>;
+
+/**
+ * Fail `connect` on an out-of-domain knob, naming the key. Keep this ahead of every other effect,
+ * so that a value which would flood the vendor (`poll_timeout_s: 0`), kill the only ingestion path
+ * (a negative one) or silently widen a retention bound the operator narrowed is a load error
+ * rather than a running bridge doing the opposite of what the config asked.
+ */
+function requireNumericKnobs(cfg: TelegramBackendConfig): void {
+  for (const key of Object.keys(NUMERIC_KNOBS) as NumericKnob[]) {
+    const value = cfg[key];
+    if (value === undefined) continue;
+    const [min, max] = NUMERIC_KNOBS[key];
+    if (!Number.isInteger(value) || value < min || value > max) {
+      throw new Error(
+        `TelegramPlugin: backend_config.${key} must be an integer in [${min}, ${max}] — ` +
+          `got ${String(value)}`,
+      );
+    }
+  }
+}
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -764,18 +845,23 @@ function describe(err: unknown): string {
 
 /**
  * Telegram 429s carry `parameters.retry_after` (SECONDS) in the JSON body, and also send the
- * standard `Retry-After` header (SECONDS). Prefer the header, then the body — both `> 0`-guarded
- * so a `0`/negative value falls to the default rather than `delay(0)` — capped at 5s.
+ * standard `Retry-After` header. Prefer the header, then the body; `undefined` when neither
+ * carries a usable hint, which lets net-util supply the default backoff.
+ *
+ * Return it UNCLAMPED, so that a stated flood wait is honoured in full: Telegram's flood waits are
+ * routinely 30s+ and retrying sooner than the vendor asked is what escalates a rate limit into a
+ * token ban. A wait that cannot fit the call's deadline ends the call there — net-util's job, not
+ * this parser's.
  */
-async function readRetryAfter(res: Response): Promise<number> {
-  const header = Number(res.headers.get('retry-after'));
-  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
+async function readRetryAfter(res: Response): Promise<number | undefined> {
+  const header = retryAfterFromHeader(res);
+  if (header !== undefined) return header;
   try {
     const json = (await res.clone().json()) as { parameters?: { retry_after?: number } };
-    const s = json.parameters?.retry_after;
-    if (typeof s === 'number' && s > 0) return Math.min(s * 1000, 5000);
+    const seconds = json.parameters?.retry_after;
+    if (typeof seconds === 'number' && seconds > 0) return seconds * 1000;
   } catch {
-    /* fall through to default backoff */
+    /* no usable body hint */
   }
-  return 500;
+  return undefined;
 }

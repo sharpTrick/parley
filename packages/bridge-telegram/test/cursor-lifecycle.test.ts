@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
@@ -118,6 +118,49 @@ describe('telegram cursor across the store lifecycle', () => {
     expect(caughtUp.messages.map((m) => m.content)).toEqual(['d', 'e', 'f']);
     expect(Number(caughtUp.nextCursor)).toBeGreaterThan(Number(cursor));
   }, 20_000);
+
+  /**
+   * The boundary of the staleness check, one line at a time. Every case above damages the file by
+   * two or more sequences, so an off-by-one in the comparison is invisible: the likeliest real
+   * corruption is a stale backup or a lost compaction rename that costs exactly ONE record.
+   * Truncating the store line by line puts the surviving high-water at, above and below the held
+   * cursor, and the rule is a single inequality — serve when the store still reaches the cursor,
+   * throw the moment it does not.
+   */
+  const TRUNCATIONS = [-1, 0, 1, 2];
+
+  it.each(TRUNCATIONS)(
+    'a store whose high-water sits %i below the held cursor serves or throws accordingly',
+    async (below) => {
+      const rig = await startRig();
+      const topic = asTopic('-1009800904');
+      for (const c of ['a', 'b', 'c', 'd']) await rig.plugin.post(topic, SENDER, c);
+      const page = await rig.plugin.fetchRecent({ topic, limit: 100 });
+      // Hold the third message's cursor, so the file can be truncated to either side of it.
+      const cursor = page.messages[2]?.cursor as Cursor;
+      expect(Number(cursor)).toBe(3);
+
+      await rig.plugin.disconnect();
+      const lines = readFileSync(rig.storePath, 'utf8').trimEnd().split('\n');
+      const keep = Number(cursor) - below;
+      writeFileSync(rig.storePath, `${lines.slice(0, keep).join('\n')}\n`);
+      const restarted = await rig.restart();
+
+      if (below >= 1) {
+        await expect(restarted.fetchRecent({ topic, since: cursor })).rejects.toThrow(
+          /ahead of every message this store has observed/,
+        );
+        return;
+      }
+      const caughtUp = await restarted.fetchRecent({ topic, since: cursor, limit: 100 });
+      expect(caughtUp.messages.map((m) => m.content)).toEqual(keep > 3 ? ['d'] : []);
+      await restarted.post(topic, SENDER, 'e');
+      const after = await restarted.fetchRecent({ topic, since: cursor, limit: 100 });
+      expect(after.messages.map((m) => m.content)).toContain('e');
+      expect(Number(after.nextCursor)).toBeGreaterThan(Number(cursor));
+    },
+    20_000,
+  );
 
   /**
    * Retention evicting the record a cursor names is NOT a broken cursor — the sequence space is
