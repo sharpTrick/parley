@@ -45,6 +45,7 @@ origin Claude reaches (issuer = base = resource origin, AS = RS).
 
 ```bash
 PARLEY_ISSUER_URL='https://parley.example.com' \
+PARLEY_TRUST_PROXY='loopback' \
 PORT=3000 HOST=127.0.0.1 \
 PARLEY_CONFIG='examples/self-host-remote/parley.config.yaml' \
 node examples/self-host-remote/server.ts
@@ -57,6 +58,16 @@ parley.example.com {
   reverse_proxy 127.0.0.1:3000
 }
 ```
+
+**`PARLEY_TRUST_PROXY` is not optional once a proxy is in front.** Every OAuth endpoint —
+`/authorize`, `/token`, `/register`, `/revoke` and `/parley/consent` — is rate-limited per client
+address. With the proxy undeclared, that address is the proxy's, so every caller in the world
+shares one bucket: an anonymous attacker sending ~1 request per 90s keeps `/parley/consent` at
+HTTP 429 and locks *you* out of the only path that can authorize the bridge. Set it to
+`loopback` for the Caddy/nginx setup above (the proxy connects from 127.0.0.1), or to the number
+of proxy hops if the terminator is remote. Leave it **unset** when the process is exposed
+directly — then the socket peer really is the client, and trusting a caller-supplied
+`X-Forwarded-For` would let anyone mint a fresh quota per request.
 
 The server exposes (all under your public origin):
 - `POST /mcp` — the MCP endpoint (Bearer-protected, Streamable HTTP, stateless).

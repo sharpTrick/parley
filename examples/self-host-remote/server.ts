@@ -26,6 +26,10 @@ export interface StartRemoteOptions {
   ownerPassphrase?: string;
   /** Or a pre-computed scrypt hash (`scrypt$salt$hash`) for at-rest storage. */
   ownerSecretHash?: string;
+  /** Express `trust proxy` value. Leave unset when this process is directly exposed; set it to
+   *  `'loopback'` (or the hop count) behind the reverse proxy this README recommends, so the rate
+   *  limiters key on the caller rather than on the proxy's address. */
+  trustProxy?: boolean | number | string | string[];
 }
 
 /**
@@ -51,6 +55,7 @@ export async function startRemoteServer(opts: StartRemoteOptions): Promise<Remot
   const app = await createRemoteAuthApp(plugin, cfg, {
     publicUrl: opts.issuerUrl,
     ...(verifyOwner !== undefined ? { verifyOwner } : {}),
+    ...(opts.trustProxy !== undefined ? { trustProxy: opts.trustProxy } : {}),
   });
   await app.listen(opts.port, opts.host ?? '127.0.0.1');
 
@@ -73,6 +78,12 @@ function requireSecret(passphrase: string | undefined): string {
   return passphrase;
 }
 
+/** `PARLEY_TRUST_PROXY` as express understands it: a hop count, or a name/CIDR list such as `loopback`. */
+function parseTrustProxy(raw: string): number | string {
+  const hops = Number(raw);
+  return Number.isInteger(hops) && hops >= 0 ? hops : raw;
+}
+
 // CLI entrypoint: `node server.ts` (after `npm run build`). Reads secrets from the LOCAL env.
 async function main(): Promise<void> {
   // PARLEY_PUBLIC_URL is the preferred name; PARLEY_ISSUER_URL is kept as a compatible alias
@@ -92,6 +103,9 @@ async function main(): Promise<void> {
     issuerUrl,
     port,
     host: process.env.HOST ?? '127.0.0.1',
+    ...(process.env.PARLEY_TRUST_PROXY !== undefined
+      ? { trustProxy: parseTrustProxy(process.env.PARLEY_TRUST_PROXY) }
+      : {}),
     ...(process.env.PARLEY_OWNER_SECRET_HASH !== undefined
       ? { ownerSecretHash: process.env.PARLEY_OWNER_SECRET_HASH }
       : process.env.PARLEY_OWNER_PASSPHRASE !== undefined
