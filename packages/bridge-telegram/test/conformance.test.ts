@@ -6,15 +6,15 @@ import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { TelegramPlugin } from '../src/index.js';
 import { startFakeTelegram } from './fake-telegram.js';
 
+/** Supergroup-shaped chat ids: the fake rejects anything real Telegram would 400 on. */
 let seq = 0;
-const rand = () => Math.random().toString(36).slice(2, 8);
 
 async function makeContext() {
   const fake = await startFakeTelegram();
   const dir = mkdtempSync(join(tmpdir(), 'parley-tg-'));
   const plugin = new TelegramPlugin();
   await plugin.connect({
-    token: 'test-token',
+    token: fake.token,
     api_url: fake.url,
     store_path: join(dir, 'store.jsonl'),
     poll_timeout_s: 1,
@@ -26,7 +26,7 @@ async function makeContext() {
     // getUpdates consumer. Run the shared blocking-fetch case directly against the plugin.
     supportsBlockingFetch: true,
     // An unmapped topic is used as the chat id literal — a fresh chat per test.
-    freshTopic: (): Topic => asTopic(`chat-${++seq}-${rand()}`),
+    freshTopic: (): Topic => asTopic(String(-1_002_000_000_000 - ++seq)),
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();

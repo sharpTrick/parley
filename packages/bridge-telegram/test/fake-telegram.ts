@@ -11,6 +11,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *  - `chat.id` is a NUMBER on both `sendMessage` responses and injected updates (mirroring real
  *    Telegram), and `@channelusername` references resolve to a stable numeric id via `getChat` —
  *    exactly the shape BUG-08 needs (a string echo would mask it).
+ *  - a `chat_id` that is neither numeric nor `@channelusername` is REJECTED with 400 ("chat not
+ *    found"), and an unknown token with 401, as the real API does. Keep both, so that the
+ *    conformance suite cannot pass on topics real Telegram would refuse.
  *  - `sendMessage` does NOT enqueue the bot's own message as an update — mirrors real
  *    Telegram (a bot never sees its own sends via getUpdates), which forces the plugin's
  *    record-own-post-from-the-response path.
@@ -18,6 +21,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 export interface FakeTelegram {
   /** Base URL to hand the plugin as `api_url`. */
   url: string;
+  /** The only token this fake accepts; any other gets 401. */
+  token: string;
   /** Shut down: answer parked polls, drop connections, close the listener. */
   close(): Promise<void>;
   /**
@@ -26,6 +31,11 @@ export interface FakeTelegram {
    * enqueues an update, and wakes parked long-polls. Returns the minted message_id.
    */
   injectUserMessage(chatId: string, from: string, text: string): number;
+  /**
+   * Like {@link injectUserMessage} but for an arbitrary `Message` shape — a captioned photo, a
+   * sticker, a service message — so the plugin's normalization is exercised beyond plain text.
+   */
+  injectRaw(chatId: string, payload: Record<string, unknown>): number;
   /**
    * Like {@link injectUserMessage} but mints the message_id NOW (so it can be LOWER than a post
    * that runs next) while WITHHOLDING the update from getUpdates until `release()` — reproduces
@@ -36,15 +46,22 @@ export interface FakeTelegram {
     from: string,
     text: string,
   ): { messageId: number; release(): void };
+  /** Fail every subsequent call to `method` with `status` (and Telegram's description), or clear it. */
+  failMethod(method: string, failure: { status: number; description: string } | undefined): void;
+  /** How many requests this fake has served for `method` — the poll loop's retry cadence. */
+  callCount(method: string): number;
+  /** Every `sendMessage` body received, in order. */
+  readonly sent: Record<string, unknown>[];
 }
 
 interface TgMessage {
   message_id: number;
   date: number;
   chat: { id: number; type: string; username?: string };
-  from: { id: number; is_bot: boolean; username?: string; first_name: string };
-  text: string;
+  from?: { id: number; is_bot: boolean; username?: string; first_name: string };
+  text?: string;
   reply_to_message?: { message_id: number };
+  [key: string]: unknown;
 }
 
 interface TgUpdate {
@@ -59,6 +76,7 @@ interface ParkedPoll {
 }
 
 const BOT = { id: 999_000_001, is_bot: true, username: 'parley_test_bot', first_name: 'Parley' };
+const TOKEN = 'test-token';
 
 /**
  * A known channel: its `@channelusername` resolves (via getChat) to this NUMERIC id, so tests
@@ -66,23 +84,26 @@ const BOT = { id: 999_000_001, is_bot: true, username: 'parley_test_bot', first_
  */
 export const KNOWN_CHANNEL = { username: '@mychannel', id: -1_001_234_567_890 };
 
+/** What real Telegram accepts as a `chat_id`: a numeric id or `@channelusername`. */
+const VALID_CHAT_REF = /^(-?\d+|@[A-Za-z][A-Za-z0-9_]{3,31})$/;
+
 export async function startFakeTelegram(): Promise<FakeTelegram> {
   /** Next message_id PER CHAT (keyed by numeric-id string) — unique only within a chat. */
   const nextMid = new Map<string, number>();
   /** `@name` → numeric id (getChat resolutions). */
   const knownByUsername = new Map<string, number>([[KNOWN_CHANNEL.username, KNOWN_CHANNEL.id]]);
-  /** Stable synthetic numeric ids for non-numeric literals (the conformance suite's topics). */
+  /** Stable synthetic numeric ids for `@name` chats tests have not pre-registered. */
   const syntheticIds = new Map<string, number>();
-  let nextSynthetic = 5_000_000_001;
+  let nextSynthetic = -1_005_000_000_001;
 
-  /** Resolve any chat_id reference (`@name`, numeric, or synthetic literal) to a stable number. */
+  /** Resolve a VALID chat_id reference (`@name` or numeric) to a stable number. */
   const numericChatId = (raw: string): number => {
     const known = knownByUsername.get(raw);
     if (known !== undefined) return known;
     if (/^-?\d+$/.test(raw)) return Number(raw);
     let id = syntheticIds.get(raw);
     if (id === undefined) {
-      id = nextSynthetic++;
+      id = nextSynthetic--;
       syntheticIds.set(raw, id);
     }
     return id;
@@ -97,6 +118,9 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const updates: TgUpdate[] = [];
   /** Long-polls parked until an update they can see arrives (or their timeout lapses). */
   const parked = new Set<ParkedPoll>();
+  const failures = new Map<string, { status: number; description: string }>();
+  const calls = new Map<string, number>();
+  const sent: Record<string, unknown>[] = [];
 
   const mintMid = (chatId: string): number => {
     const mid = nextMid.get(chatId) ?? 1;
@@ -124,15 +148,45 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     }
   };
 
+  const enqueue = (chatId: string, payload: Record<string, unknown>): TgMessage => {
+    const id = numericChatId(chatId);
+    return {
+      message_id: mintMid(String(id)),
+      date: Math.floor(Date.now() / 1000),
+      chat: buildChat(chatId, id),
+      ...payload,
+    };
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? '/', 'http://fake');
-    const match = /^\/bot[^/]+\/(\w+)$/.exec(url.pathname);
+    const match = /^\/bot([^/]+)\/(\w+)$/.exec(url.pathname);
     if (match === null) {
       reply(res, 404, { ok: false, error_code: 404, description: 'Not Found' });
       return;
     }
-    const method = match[1];
+    if (match[1] !== TOKEN) {
+      reply(res, 401, { ok: false, error_code: 401, description: 'Unauthorized' });
+      return;
+    }
+    const method = match[2] ?? '';
+    calls.set(method, (calls.get(method) ?? 0) + 1);
+    const failure = failures.get(method);
+    if (failure !== undefined) {
+      reply(res, failure.status, {
+        ok: false,
+        error_code: failure.status,
+        description: failure.description,
+      });
+      return;
+    }
     const body = await readJsonBody(req);
+    const chatRef = (): string | undefined => {
+      const raw = String(url.searchParams.get('chat_id') ?? body.chat_id ?? '');
+      if (VALID_CHAT_REF.test(raw)) return raw;
+      reply(res, 400, { ok: false, error_code: 400, description: 'Bad Request: chat not found' });
+      return undefined;
+    };
 
     switch (method) {
       case 'getMe': {
@@ -140,20 +194,16 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         return;
       }
       case 'getChat': {
-        const raw = String(url.searchParams.get('chat_id') ?? body.chat_id ?? '');
+        const raw = chatRef();
+        if (raw === undefined) return;
         reply(res, 200, { ok: true, result: buildChat(raw, numericChatId(raw)) });
         return;
       }
       case 'sendMessage': {
-        const raw = String(body.chat_id ?? '');
-        const id = numericChatId(raw);
-        const message: TgMessage = {
-          message_id: mintMid(String(id)),
-          date: Math.floor(Date.now() / 1000),
-          chat: buildChat(raw, id),
-          from: BOT,
-          text: String(body.text ?? ''),
-        };
+        const raw = chatRef();
+        if (raw === undefined) return;
+        sent.push(body);
+        const message = enqueue(raw, { from: BOT, text: String(body.text ?? '') });
         if (typeof body.reply_to_message_id === 'number') {
           message.reply_to_message = { message_id: body.reply_to_message_id };
         }
@@ -205,21 +255,27 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   if (addr === null || typeof addr === 'string') throw new Error('fake telegram failed to bind');
 
   let userSeq = 1;
+  const human = (from: string): TgMessage['from'] => ({
+    id: userSeq++,
+    is_bot: false,
+    username: from,
+    first_name: from,
+  });
+
   return {
     url: `http://127.0.0.1:${addr.port}`,
+    token: TOKEN,
+    sent,
 
-    injectUserMessage(chatId: string, from: string, text: string): number {
-      const id = numericChatId(chatId);
-      const message: TgMessage = {
-        message_id: mintMid(String(id)),
-        date: Math.floor(Date.now() / 1000),
-        chat: buildChat(chatId, id),
-        from: { id: userSeq++, is_bot: false, username: from, first_name: from },
-        text,
-      };
+    injectRaw(chatId: string, payload: Record<string, unknown>): number {
+      const message = enqueue(chatId, payload);
       updates.push({ update_id: updateSeq++, message });
       wakeParked();
       return message.message_id;
+    },
+
+    injectUserMessage(chatId: string, from: string, text: string): number {
+      return this.injectRaw(chatId, { from: human(from), text });
     },
 
     injectUserMessageDeferred(
@@ -227,14 +283,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       from: string,
       text: string,
     ): { messageId: number; release(): void } {
-      const id = numericChatId(chatId);
-      const message: TgMessage = {
-        message_id: mintMid(String(id)),
-        date: Math.floor(Date.now() / 1000),
-        chat: buildChat(chatId, id),
-        from: { id: userSeq++, is_bot: false, username: from, first_name: from },
-        text,
-      };
+      const message = enqueue(chatId, { from: human(from), text });
       let released = false;
       return {
         messageId: message.message_id,
@@ -245,6 +294,15 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
           wakeParked();
         },
       };
+    },
+
+    failMethod(method: string, failure: { status: number; description: string } | undefined): void {
+      if (failure === undefined) failures.delete(method);
+      else failures.set(method, failure);
+    },
+
+    callCount(method: string): number {
+      return calls.get(method) ?? 0;
     },
 
     async close(): Promise<void> {
