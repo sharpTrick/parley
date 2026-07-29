@@ -15,7 +15,11 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { fetchWithRetry } from '@sharptrick/parley-net-util';
+import {
+  fetchWithRetry,
+  retryAfterFromHeader,
+  sanitizeBody,
+} from '@sharptrick/parley-net-util';
 import WebSocket from 'ws';
 
 /** Plugin-specific backend_config. */
@@ -49,6 +53,8 @@ interface DiscordMessage {
   content?: string;
   timestamp?: string;
   author?: { id: string; username: string };
+  /** Users referenced by `<@id>` markup in `content` — Discord resolves them for us. */
+  mentions?: Array<{ id: string; username: string }>;
 }
 
 /** A minimal gateway payload (opcodes we speak: 0/1/2/7/9/10/11). */
@@ -91,14 +97,14 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
  * under Discord's 1000-IDENTIFY-per-24h quota — the penalty for exceeding it is a bot-token RESET,
  * which breaks every Parley instance sharing that bot until a human re-provisions it.
  */
-const RECONNECT_CAP_MS = 120_000;
+export const RECONNECT_CAP_MS = 120_000;
 
 /**
  * How long a socket must stay up AFTER READY before its reconnect budget is forgiven. Keep this
  * well above zero, so that a gateway which drops immediately after READY cannot reset the backoff
  * on every cycle and re-IDENTIFY once a second — the same token-reset quota as above.
  */
-const STABLE_CONNECTION_MS = 60_000;
+export const STABLE_CONNECTION_MS = 60_000;
 
 /**
  * Discord backend (DESIGN §6/§9) — spoken to via the raw REST v10 API (global `fetch`) plus a
@@ -134,16 +140,16 @@ export class DiscordPlugin implements BackendPlugin {
   private ws?: WebSocket;
   /** Resolves once the gateway is IDENTIFYed and READY; first subscribe awaits it. */
   private gatewayReady?: Promise<void>;
-  private heartbeat?: NodeJS.Timeout;
+  /** True only while a socket that reached READY is still open — see {@link gatewayLive}. */
+  private live = false;
+  /**
+   * Heartbeat intervals of sockets still open. Each socket owns its own entry, so that a late
+   * HELLO on a superseded socket can never clear the LIVE socket's heartbeat and let Discord
+   * zombie-close a healthy connection.
+   */
+  private readonly heartbeats = new Set<NodeJS.Timeout>();
   /** Last dispatch sequence number, echoed in heartbeats. */
   private seq: number | null = null;
-  /**
-   * Half-dead-socket guard (BUG-20): set true after each heartbeat send, cleared on op 11
-   * HEARTBEAT_ACK. If still true when the next beat is due, the ack was missed → terminate() the
-   * socket. Reset when a fresh socket installs its heartbeat interval so it can't inherit a stale
-   * flag.
-   */
-  private awaitedAck = false;
   /**
    * Reconnect backoff attempt counter (BUG-07): grows the delay 1s→2s→…→{@link RECONNECT_CAP_MS}
    * (with jitter) and is RESET to 0 only when a socket that reached READY also STAYED up for
@@ -151,8 +157,17 @@ export class DiscordPlugin implements BackendPlugin {
    */
   private reconnectAttempts = 0;
   /**
-   * Minimum delay (ms) the NEXT reconnect must honor. Set by op 9 INVALID SESSION to the
-   * gateway-mandated random 1–5 s re-identify wait; consumed (and cleared) by scheduleReconnect.
+   * Earliest time any code path may open a gateway socket — the ONE IDENTIFY budget, shared by
+   * the reconnect loop and by {@link ensureGateway}. Keep every dial behind it, so that a caller
+   * that retries fast (core's 250 ms long-poll fallback) cannot re-IDENTIFY at its own cadence and
+   * burn Discord's 1000/24h quota, whose penalty is a bot-token RESET.
+   */
+  private nextDialAt = 0;
+  /** Pending reconnect, cleared by disconnect() so it cannot fire against the NEXT session. */
+  private reconnectTimer?: NodeJS.Timeout;
+  /**
+   * Minimum delay (ms) the NEXT dial must honor. Set by op 9 INVALID SESSION to the
+   * gateway-mandated random 1–5 s re-identify wait; consumed by {@link chargeDialAttempt}.
    */
   private op9MinWaitMs = 0;
   /** channel id → subscription; MESSAGE_CREATE dispatch routes through this. */
@@ -179,17 +194,25 @@ export class DiscordPlugin implements BackendPlugin {
     this.fatalGateway = undefined;
     this.stopped = false;
     this.connected = true;
+    this.reconnectAttempts = 0;
+    this.op9MinWaitMs = 0;
+    this.nextDialAt = 0;
+    this.seq = null;
+    this.live = false;
   }
 
   async disconnect(): Promise<void> {
     this.stopped = true;
     this.connected = false;
-    if (this.heartbeat !== undefined) {
-      clearInterval(this.heartbeat);
-      this.heartbeat = undefined;
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
     }
+    for (const beat of this.heartbeats) clearInterval(beat);
+    this.heartbeats.clear();
     this.ws?.close();
     this.ws = undefined;
+    this.live = false;
     this.gatewayReady = undefined;
     this.fatalGateway = undefined;
     this.subs.clear();
@@ -265,12 +288,12 @@ export class DiscordPlugin implements BackendPlugin {
     // same `blockMs` budget, so that a gateway which accepts the socket but never completes the
     // handshake cannot stretch this call past the cap core sized for the client's tool timeout.
     const deadline = Date.now() + blockMs;
-    let socketLive = true;
     try {
       await withDeadline(this.ensureGateway(), blockMs);
     } catch {
-      socketLive = false; // no live socket → skip the wait; the immediate page is still correct.
+      /* no socket → skip the wait below; the immediate page is still correct */
     }
+    const socketLive = this.gatewayLive();
     const remaining = deadline - Date.now();
     const rawChannelId = this.channelId(args.topic);
     // Arm the waiter BEFORE the first query so a message landing during it can't be lost.
@@ -321,9 +344,15 @@ export class DiscordPlugin implements BackendPlugin {
     const path = `/channels/${encodeURIComponent(this.channelId(topic))}/messages?${query}`;
     const res = await this.http('GET', path, { allowStatuses: [404] });
     if (res.status === 404) {
-      const body = (await res.json().catch(() => ({}))) as { code?: number };
-      if (body.code === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
-      throw new Error(`Discord GET ${path} → 404: ${JSON.stringify(body)}`);
+      const raw = await res.text().catch(() => '');
+      let code: unknown;
+      try {
+        code = (JSON.parse(raw) as { code?: number }).code;
+      } catch {
+        /* not JSON — not Unknown Channel either */
+      }
+      if (code === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
+      throw new Error(`Discord GET ${path} → 404: ${sanitizeBody(raw)}`);
     }
     return (await res.json()) as DiscordMessage[];
   }
@@ -394,13 +423,42 @@ export class DiscordPlugin implements BackendPlugin {
   private async ensureGateway(): Promise<void> {
     if (this.fatalGateway !== undefined) throw this.fatalGateway;
     if (this.gatewayReady === undefined) {
+      const wait = this.nextDialAt - Date.now();
+      if (wait > 0) {
+        throw new Error(`Discord gateway dial refused: backing off for another ${wait}ms`);
+      }
       this.gatewayReady = this.openGateway().catch((err) => {
-        // Don't poison the shared socket on transient failure — let the next caller retry.
+        // Don't poison the shared socket on transient failure — let the next caller retry, once
+        // the budget this failed dial just charged has elapsed.
         this.gatewayReady = undefined;
+        this.chargeDialAttempt();
         throw err;
       });
     }
     await this.gatewayReady;
+  }
+
+  /**
+   * A MESSAGE_CREATE-carrying socket exists right now. Distinct from `gatewayReady`, which is
+   * memoized across the whole reconnect cycle: a long-poll that armed its waiter on the memoized
+   * promise would sleep its entire budget on a socket that is down.
+   */
+  private gatewayLive(): boolean {
+    return this.live && this.ws !== undefined && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Charge one attempt against the shared IDENTIFY budget and return the delay it earned. Every
+   * path that opens (or fails to open) a socket goes through this, so the sustained dial rate is
+   * the backoff ladder regardless of who initiated it.
+   */
+  private chargeDialAttempt(): number {
+    const backoff = Math.min(1000 * 2 ** this.reconnectAttempts++, RECONNECT_CAP_MS);
+    const jitter = Math.floor(Math.random() * 1000);
+    const wait = Math.max(this.op9MinWaitMs, backoff + jitter);
+    this.op9MinWaitMs = 0;
+    this.nextDialAt = Date.now() + wait;
+    return wait;
   }
 
   /**
@@ -464,6 +522,8 @@ export class DiscordPlugin implements BackendPlugin {
       this.ws = ws;
       let ready = false;
       let readyAt = 0;
+      let heartbeat: NodeJS.Timeout | undefined;
+      let awaitedAck = false;
       // A socket Discord (or a proxy) accepts but never carries to READY would otherwise park
       // this promise forever — and with it subscribe(), bridge startup, and every blocking
       // fetchRecent that awaits the same gateway.
@@ -478,6 +538,12 @@ export class DiscordPlugin implements BackendPlugin {
       }, this.handshakeTimeoutMs);
 
       ws.on('message', (data) => {
+        if (this.ws !== ws) {
+          // Superseded (or post-disconnect) socket: it owns none of the shared state, and
+          // IDENTIFYing from here would spend budget on a connection nothing reads.
+          ws.close();
+          return;
+        }
         let payload: GatewayPayload;
         try {
           payload = JSON.parse(String(data)) as GatewayPayload;
@@ -488,12 +554,14 @@ export class DiscordPlugin implements BackendPlugin {
           case 10: {
             // HELLO → heartbeat cadence + IDENTIFY.
             const hello = payload.d as { heartbeat_interval: number };
-            if (this.heartbeat !== undefined) clearInterval(this.heartbeat);
-            // Fresh socket: don't inherit a stale "unacked" flag from a prior connection.
-            this.awaitedAck = false;
-            this.heartbeat = setInterval(() => {
+            if (heartbeat !== undefined) {
+              clearInterval(heartbeat);
+              this.heartbeats.delete(heartbeat);
+            }
+            awaitedAck = false;
+            heartbeat = setInterval(() => {
               if (ws.readyState !== WebSocket.OPEN) return;
-              if (this.awaitedAck) {
+              if (awaitedAck) {
                 // The previous beat was never ACKed (op 11) → the TCP connection is half-dead
                 // (BUG-20). terminate() (NOT close()) forces the `close` event IMMEDIATELY, so the
                 // existing close→scheduleReconnect path takes over within ONE interval instead of
@@ -501,9 +569,12 @@ export class DiscordPlugin implements BackendPlugin {
                 ws.terminate();
                 return;
               }
+              // Arm BEFORE sending, so that an ACK arriving in the same tick clears the flag it
+              // was meant to clear instead of being overwritten into a false "missed ack".
+              awaitedAck = true;
               ws.send(JSON.stringify({ op: 1, d: this.seq }));
-              this.awaitedAck = true;
             }, hello.heartbeat_interval);
+            this.heartbeats.add(heartbeat);
             ws.send(
               JSON.stringify({
                 op: 2,
@@ -521,6 +592,7 @@ export class DiscordPlugin implements BackendPlugin {
             if (payload.t === 'READY' && !ready) {
               ready = true;
               readyAt = Date.now();
+              this.live = true;
               clearTimeout(handshake);
               resolve();
             } else if (payload.t === 'MESSAGE_CREATE') {
@@ -546,7 +618,7 @@ export class DiscordPlugin implements BackendPlugin {
             break;
           }
           case 7: {
-            // RECONNECT — drop the socket; the close handler reconnects (promptly, no wait).
+            // RECONNECT — drop the socket; the close handler owns the reconnect.
             ws.close();
             break;
           }
@@ -561,7 +633,7 @@ export class DiscordPlugin implements BackendPlugin {
           case 11: {
             // HEARTBEAT_ACK — liveness (BUG-20). Clears the pending-ack flag; a MISSING ack (still
             // set at the next beat) is what forces ws.terminate() in the heartbeat interval above.
-            this.awaitedAck = false;
+            awaitedAck = false;
             break;
           }
           default:
@@ -575,11 +647,16 @@ export class DiscordPlugin implements BackendPlugin {
 
       ws.on('close', (code: number) => {
         clearTimeout(handshake);
-        if (this.heartbeat !== undefined) {
-          clearInterval(this.heartbeat);
-          this.heartbeat = undefined;
+        if (heartbeat !== undefined) {
+          clearInterval(heartbeat);
+          this.heartbeats.delete(heartbeat);
+          heartbeat = undefined;
         }
-        if (this.ws === ws) this.ws = undefined;
+        const current = this.ws === ws;
+        if (current) {
+          this.ws = undefined;
+          this.live = false;
+        }
         if (TERMINAL_CLOSE.has(code)) {
           // Fatal (auth/intent/version/shard): never auto-retry — re-IDENTIFYing on every attempt
           // burns Discord's 1000-IDENTIFY/24h budget and resets the bot token (BUG-07). The close
@@ -599,7 +676,7 @@ export class DiscordPlugin implements BackendPlugin {
           reject(new Error(`Discord gateway closed before READY (code ${code})`));
           return;
         }
-        if (this.stopped) return;
+        if (this.stopped || !current) return;
         if (Date.now() - readyAt >= STABLE_CONNECTION_MS) this.reconnectAttempts = 0;
         this.scheduleReconnect(url);
       });
@@ -607,19 +684,15 @@ export class DiscordPlugin implements BackendPlugin {
   }
 
   /**
-   * Backoff-and-reopen loop (re-IDENTIFY, no RESUME) until disconnect(). Capped exponential
-   * backoff with jitter (BUG-07): the per-instance attempt counter grows the delay (1s → 2s → 4s →
-   * … → 60s cap) and is RESET on a successful READY (case 0). `op9MinWaitMs`, set by an op 9
-   * INVALID SESSION, floors the delay at the gateway-mandated 1–5 s before re-identifying. A
-   * terminal close short-circuits the loop (openSocket rejects with TerminalGatewayCloseError).
+   * Backoff-and-reopen loop (re-IDENTIFY, no RESUME) until disconnect(), spending the same dial
+   * budget every other path spends ({@link chargeDialAttempt}). A terminal close short-circuits it
+   * (openSocket rejects with TerminalGatewayCloseError).
    */
   private scheduleReconnect(url: string): void {
     if (this.stopped) return;
-    const backoff = Math.min(1000 * 2 ** this.reconnectAttempts++, RECONNECT_CAP_MS);
-    const jitter = Math.floor(Math.random() * 1000);
-    const wait = Math.max(this.op9MinWaitMs, backoff + jitter);
-    this.op9MinWaitMs = 0;
-    setTimeout(() => {
+    const wait = this.chargeDialAttempt();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
       if (this.stopped) return;
       void this.openSocket(url).catch((err) => {
         if (err instanceof TerminalGatewayCloseError) return; // fatal — don't restart the storm
@@ -697,26 +770,43 @@ function toMessage(topic: Topic, m: DiscordMessage): Message {
   return buildMessage({
     topic,
     sender: m.author?.username ?? '',
-    content: m.content ?? '',
+    content: renderMentions(m),
     timestamp: m.timestamp ?? '',
     id: m.id,
   });
 }
 
+/** `<@id>` / `<@!id>` — how Discord serializes a user mention; NEVER the `@handle` text. */
+const USER_MENTION_RE = /<@!?(\d+)>/g;
+
 /**
- * Discord's 429 body carries `retry_after` in SECONDS (float); Discord ALSO sends the standard
- * `Retry-After` header (SECONDS). Prefer the header, then the body — both `> 0`-guarded — convert
- * to ms (ceil the float), cap at 5s, default 500.
+ * Rewrite Discord's user-mention markup to the `@username` form core's `parseMentions` reads, using
+ * the payload's own resolved `mentions[]`. Without this every mention crossing the seam is a raw
+ * snowflake, so `Message.mentions` never holds a Parley handle and core's mention filter drops
+ * every message. An id Discord did not resolve renders as Discord's own client renders it.
  */
-async function readRetryAfter(res: Response): Promise<number> {
-  const header = Number(res.headers.get('retry-after'));
-  if (Number.isFinite(header) && header > 0) return Math.min(Math.ceil(header * 1000), 5000);
+function renderMentions(m: DiscordMessage): string {
+  const content = m.content ?? '';
+  if (content === '') return content;
+  const byId = new Map((m.mentions ?? []).map((u) => [u.id, u.username]));
+  return content.replace(
+    USER_MENTION_RE,
+    (_raw, id: string) => `@${byId.get(id) ?? 'unknown-user'}`,
+  );
+}
+
+/**
+ * Discord's 429 hint: the standard `Retry-After` header, else Discord's own `retry_after` body
+ * field (SECONDS, float). The clamp and the no-hint default live in net-util's `clampBackoff`.
+ */
+async function readRetryAfter(res: Response): Promise<number | undefined> {
+  const header = retryAfterFromHeader(res);
+  if (header !== undefined) return header;
   try {
     const json = (await res.clone().json()) as { retry_after?: number };
-    const s = json.retry_after;
-    if (typeof s === 'number' && s > 0) return Math.min(Math.ceil(s * 1000), 5000);
+    const seconds = json.retry_after;
+    return typeof seconds === 'number' && seconds > 0 ? seconds * 1000 : undefined;
   } catch {
-    /* fall through to default backoff */
+    return undefined;
   }
-  return 500;
 }

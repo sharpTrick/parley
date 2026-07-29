@@ -29,7 +29,10 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | `resolveIdentity`         | `GET /users/@me` (memoized): our own bot handle resolves to its real user id; every other handle passes through as a string convention — Discord has **no global name → id lookup**. |
 
 `senderHandle` ← `author.username`, `content` ← `content`, `timestamp` ← the message `timestamp`
-(informational only — never used for ordering or dedup).
+(informational only — never used for ordering or dedup). Discord serializes a mention as `<@id>`
+markup, never as `@handle` text, so the plugin rewrites it to `@username` using the payload's own
+resolved `mentions[]` before core parses mentions — otherwise `Message.mentions` would hold raw
+snowflakes and core's `mention_filter` would drop every message.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
 nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
@@ -68,6 +71,11 @@ this package authors none of it:
 3. Invite the bot to your server via the OAuth2 URL generator with the `bot` scope and
    permissions to **View Channels**, **Send Messages**, and **Read Message History** in the
    channels you'll map as topics.
+
+> **Topics must be GUILD channels.** The intent set is `GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT`
+> — no `DIRECT_MESSAGES` — so a DM or group-DM channel id receives **no live push at all**. REST
+> `post`/`fetchRecent` still work against it and `subscribe` still resolves, so the symptom is an
+> idle bridge with no error: check the channel class first when pushes never arrive.
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same bot)
 

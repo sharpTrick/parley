@@ -7,90 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // close codes, backoff timers, op 9, and heartbeat-ACK timing are all deterministic under fake
 // timers — no real Discord, no real sockets.
 
-const gw = vi.hoisted(() => {
-  const instances: FakeWs[] = [];
-  // What the fake server does when a socket sends op 2 IDENTIFY (default: ack with READY).
-  const state = { onIdentify: (ws: FakeWs) => ws.ready() };
-
-  class FakeWs {
-    static readonly OPEN = 1;
-    static readonly CLOSED = 3;
-    readyState = FakeWs.OPEN;
-    sent: Array<{ op: number; d?: unknown }> = [];
-    terminated = false;
-    closedCode: number | undefined = undefined;
-    ackHeartbeats = true;
-    private readonly listeners: Record<string, Array<(arg: unknown) => void>> = {};
-
-    constructor(readonly url: string) {
-      instances.push(this);
-    }
-
-    on(event: string, cb: (arg: unknown) => void): this {
-      (this.listeners[event] ??= []).push(cb);
-      return this;
-    }
-    private fire(event: string, arg?: unknown): void {
-      for (const cb of this.listeners[event] ?? []) cb(arg);
-    }
-
-    // --- surface the plugin calls ---
-    send(data: unknown): void {
-      const frame = JSON.parse(String(data)) as { op: number; d?: unknown };
-      this.sent.push(frame);
-      if (frame.op === 2) {
-        state.onIdentify(this); // IDENTIFY
-        return;
-      }
-      if (frame.op === 1 && this.ackHeartbeats && this.readyState === FakeWs.OPEN) {
-        this.serverSend({ op: 11 }); // heartbeat → ACK (unless the server has gone silent)
-      }
-    }
-    close(code?: number): void {
-      if (this.readyState === FakeWs.CLOSED) return;
-      this.readyState = FakeWs.CLOSED;
-      this.closedCode = code ?? 1000;
-      this.fire('close', this.closedCode);
-    }
-    terminate(): void {
-      this.terminated = true;
-      if (this.readyState === FakeWs.CLOSED) return;
-      this.readyState = FakeWs.CLOSED;
-      this.closedCode = 1006;
-      this.fire('close', 1006);
-    }
-
-    // --- test-side "server" helpers ---
-    serverSend(payload: Record<string, unknown>): void {
-      this.fire('message', Buffer.from(JSON.stringify(payload)));
-    }
-    hello(interval: number): void {
-      this.serverSend({ op: 10, d: { heartbeat_interval: interval } });
-    }
-    ready(): void {
-      this.serverSend({ op: 0, t: 'READY', s: 1, d: { session_id: 'fake' } });
-    }
-    /** Server-initiated close with an explicit gateway code (does NOT set `terminated`). */
-    serverClose(code: number): void {
-      if (this.readyState === FakeWs.CLOSED) return;
-      this.readyState = FakeWs.CLOSED;
-      this.closedCode = code;
-      this.fire('close', code);
-    }
-    heartbeatsSent(): number {
-      return this.sent.filter((f) => f.op === 1).length;
-    }
-  }
-
-  return { instances, state, FakeWs };
-});
-
-vi.mock('ws', () => ({ default: gw.FakeWs }));
+vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
 // Imported after the mock is declared; vitest hoists vi.mock above all imports regardless.
-import { DiscordPlugin } from '../src/index.js';
+import { DiscordPlugin, RECONNECT_CAP_MS, STABLE_CONNECTION_MS } from '../src/index.js';
+import { FakeWs, instances, resetGateway, state, totalIdentifies } from './fake-gateway.js';
 
-type FakeWs = InstanceType<typeof gw.FakeWs>;
+const gw = { instances, state, FakeWs };
 
 const HUGE_HB = 1_000_000; // large enough that the heartbeat interval never fires during a test
 /**
@@ -98,9 +21,6 @@ const HUGE_HB = 1_000_000; // large enough that the heartbeat interval never fir
  * so a socket the test has not driven yet is never terminated underneath it.
  */
 const NO_HANDSHAKE_TIMEOUT = 10_000_000;
-
-const totalIdentifies = (): number =>
-  gw.instances.reduce((n, ws) => n + ws.sent.filter((f) => f.op === 2).length, 0);
 
 /** Open the shared socket and drive HELLO→IDENTIFY→READY on the freshly created FakeWs. */
 async function reachReady(
@@ -121,8 +41,7 @@ const setTimeoutDelays = (spy: ReturnType<typeof vi.spyOn>): number[] =>
 
 describe('Discord gateway reconnect & liveness (BUG-07, BUG-20)', () => {
   beforeEach(() => {
-    gw.instances.length = 0;
-    gw.state.onIdentify = (ws: FakeWs) => ws.ready();
+    resetGateway();
     vi.useFakeTimers();
   });
   afterEach(() => {
@@ -353,8 +272,7 @@ describe('Discord gateway handshake never completes', () => {
   ];
 
   beforeEach(() => {
-    gw.instances.length = 0;
-    gw.state.onIdentify = (ws: FakeWs) => ws.ready();
+    resetGateway();
     stubFetch();
     vi.useFakeTimers();
   });
@@ -448,8 +366,7 @@ describe('Discord gateway terminal failures are never invisible', () => {
   const TERMINAL_CLOSE = [4004, 4010, 4011, 4012, 4013, 4014];
 
   beforeEach(() => {
-    gw.instances.length = 0;
-    gw.state.onIdentify = (ws: FakeWs) => ws.ready();
+    resetGateway();
     vi.useFakeTimers();
   });
   afterEach(() => {
@@ -521,8 +438,7 @@ describe('Discord IDENTIFY budget under sustained flapping', () => {
   const QUOTA_PER_DAY = 1000;
 
   beforeEach(() => {
-    gw.instances.length = 0;
-    gw.state.onIdentify = (ws: FakeWs) => ws.ready();
+    resetGateway();
     vi.useFakeTimers();
   });
   afterEach(() => {
@@ -564,6 +480,82 @@ describe('Discord IDENTIFY budget under sustained flapping', () => {
       const delays = setTimeoutDelays(setTimeoutSpy).filter((d) => d >= 1000);
       const steadyState = Math.max(...delays);
       expect(DAY_MS / steadyState).toBeLessThan(QUOTA_PER_DAY);
+
+      await plugin.disconnect();
+    });
+  }
+});
+
+describe('Discord backoff constants are the ones the code applies', () => {
+  // The quota argument only holds if the ladder's ceiling and its reset rule are what a reader
+  // computes with. Assert both against the exported constants, so neither can drift into prose.
+  beforeEach(() => {
+    resetGateway();
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it(`the ladder tops out at exactly RECONNECT_CAP_MS (${RECONNECT_CAP_MS}ms)`, async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const plugin = new DiscordPlugin();
+    await plugin.connect({
+      token: 't',
+      gateway_url: 'ws://fake',
+      handshake_timeout_ms: NO_HANDSHAKE_TIMEOUT,
+    });
+
+    const ws0 = await reachReady(plugin, asTopic('cap'));
+    gw.state.onIdentify = (ws: FakeWs) => ws.serverClose(1006);
+    ws0.serverClose(1006);
+    for (let i = 0; i < 14; i++) {
+      await vi.advanceTimersByTimeAsync(2 * RECONNECT_CAP_MS);
+      const ws = gw.instances.at(-1)!;
+      if (ws.readyState === gw.FakeWs.OPEN) ws.hello(HUGE_HB);
+    }
+
+    const delays = setTimeoutDelays(setTimeoutSpy).filter((d) => d >= 1000);
+    expect(Math.max(...delays)).toBe(RECONNECT_CAP_MS);
+
+    await plugin.disconnect();
+  });
+
+  const STABILITY: Array<[string, number, boolean]> = [
+    ['one tick short of STABLE_CONNECTION_MS', STABLE_CONNECTION_MS - 1, false],
+    ['exactly STABLE_CONNECTION_MS', STABLE_CONNECTION_MS, true],
+  ];
+
+  for (const [label, upMs, resets] of STABILITY) {
+    it(`a connection that stayed up ${label} ${resets ? 'resets' : 'does not reset'} the ladder`, async () => {
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      const plugin = new DiscordPlugin();
+      await plugin.connect({
+        token: 't',
+        gateway_url: 'ws://fake',
+        handshake_timeout_ms: NO_HANDSHAKE_TIMEOUT,
+      });
+
+      const ws0 = await reachReady(plugin, asTopic('stable'));
+      gw.state.onIdentify = (ws: FakeWs) => ws.serverClose(1006);
+      ws0.serverClose(1006);
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(2 * RECONNECT_CAP_MS);
+        gw.instances.at(-1)!.hello(HUGE_HB); // climb: 1s → 2s → 4s → …
+      }
+
+      gw.state.onIdentify = (ws: FakeWs) => ws.ready();
+      await vi.advanceTimersByTimeAsync(2 * RECONNECT_CAP_MS);
+      const wsUp = gw.instances.at(-1)!;
+      wsUp.hello(HUGE_HB); // → READY
+      await vi.advanceTimersByTimeAsync(upMs);
+
+      const before = setTimeoutDelays(setTimeoutSpy).length;
+      wsUp.serverClose(1006);
+      const next = setTimeoutDelays(setTimeoutSpy).slice(before).at(-1)!;
+      expect(next === 1000).toBe(resets);
 
       await plugin.disconnect();
     });

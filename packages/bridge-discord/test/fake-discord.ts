@@ -42,12 +42,16 @@ interface FakeMessage {
   timestamp: string;
   author: { id: string; username: string };
   message_reference?: { message_id: string };
+  /** Users Discord resolved from `<@id>` markup in `content` — present on REST and gateway alike. */
+  mentions?: Array<{ id: string; username: string }>;
 }
 
 /** A scripted response served INSTEAD of the normal handler, once per queued entry. */
 export interface FakeFault {
   status: number;
   body?: unknown;
+  /** Served verbatim instead of `body` — the way to script a body no JSON encoder would produce. */
+  rawBody?: string;
   headers?: Record<string, string>;
   /** Only consume this fault for requests whose path contains this substring. */
   path?: string;
@@ -64,6 +68,18 @@ export interface FakeDiscord {
   createChannel(id: string): void;
   /** Queue a scripted failure (or any response) for the next matching request(s). */
   injectFault(fault: FakeFault): void;
+  /**
+   * Store and broadcast a message the fake did not mint from `post` — i.e. a HUMAN's, carrying
+   * whatever native markup and resolved `mentions[]` Discord would have put on it.
+   */
+  deliver(
+    channelId: string,
+    msg: {
+      content: string;
+      mentions?: Array<{ id: string; username: string }>;
+      author?: { id: string; username: string };
+    },
+  ): void;
   /** Requests received so far, optionally filtered to paths containing `pathIncludes`. */
   requestCount(pathIncludes?: string): number;
   /** Close every connected gateway socket with an explicit gateway close code. */
@@ -110,6 +126,11 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
 
     const fault = takeFault(url.pathname + url.search);
     if (fault !== undefined) {
+      if (fault.rawBody !== undefined) {
+        res.writeHead(fault.status, { 'Content-Type': 'application/json', ...fault.headers });
+        res.end(fault.rawBody);
+        return;
+      }
       return json(res, fault.status, fault.body ?? {}, fault.headers);
     }
 
@@ -215,6 +236,20 @@ export async function startFakeDiscord(): Promise<FakeDiscord> {
       if (!channels.has(id)) channels.set(id, []);
     },
     injectFault: (fault: FakeFault) => faults.push({ ...fault }),
+    deliver: (channelId, msg) => {
+      const list = channels.get(channelId);
+      if (list === undefined) throw new Error(`fake-discord: no such channel ${channelId}`);
+      const stored: FakeMessage = {
+        id: mintId(),
+        channel_id: channelId,
+        content: msg.content,
+        timestamp: new Date().toISOString(),
+        author: msg.author ?? { id: '112233445500', username: 'human' },
+        ...(msg.mentions !== undefined ? { mentions: msg.mentions } : {}),
+      };
+      list.push(stored);
+      broadcast(stored);
+    },
     requestCount: (pathIncludes?: string) =>
       pathIncludes === undefined
         ? requests.length

@@ -28,7 +28,7 @@ async function makeContext() {
     // A Parley topic IS a Discord channel id, and a channel must exist before anything can be
     // posted to or read from it — so provision it in the fake, exactly as a human would create
     // the channel in Discord. An id that was never created is a genuinely absent topic
-    // (NoSuchTopicError), covered in absent-topic.test.ts.
+    // (NoSuchTopicError), covered in rest-contract.test.ts.
     freshTopic: (): Topic => {
       const id = freshChannelId();
       fake.createChannel(id);
