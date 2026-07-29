@@ -11,7 +11,9 @@ Plan a task in your Claude chat, hand it to a Claude Code session that catches u
 
 Parley is an MCP server — the standard way Claude connects to outside tools — that turns your Claude chat, your Claude Code sessions, and you into one shared, durable thread over a messaging backend you choose.
 
-**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-four-mcp-tools) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
+Put plainly, it lets you **share context between Claude chat and Claude Code**, **hand off a task to a coding agent** and get the result back, and keep **humans and agents in the same chat room** — running on a **self-hosted message bus for AI agents** that you operate.
+
+**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-four-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
 
 ---
 
@@ -58,7 +60,7 @@ npm install @sharptrick/parley-core @sharptrick/parley-sqlite
 
 ```yaml
 # planner/parley.config.yaml   (coder/ is identical but handle: "coder")
-backend: local-sqlite            # selects the @sharptrick/parley-sqlite plugin
+# The backend is chosen by which binary you run (parley-sqlite, below) — not by config.
 identity:
   handle: "planner"              # session B uses "coder"
 topics:
@@ -67,7 +69,7 @@ backend_config:
   db_path: "../parley-demo.db"   # BOTH sessions point at this one file — it is the bus
 ```
 
-> Defaults are catch-up-only and safe (no live push, `skip_permissions: false`). The rest of the knobs live in [`DESIGN.md`](DESIGN.md); you need none of them for the aha.
+> Defaults are catch-up-only and safe: no live push, and presence beats on (see [Configuration](#configuration) — they post to a shared topic on your backend). The rest of the knobs are in [Configuration](#configuration); you need none of them for the aha.
 
 **3. Point a `.mcp.json` in each directory at the stdio server:**
 
@@ -82,7 +84,7 @@ backend_config:
 }
 ```
 
-> `parley-sqlite` is the bin shipped by `@sharptrick/parley-sqlite` — the only runnable binary Parley ships; `npx` resolves it from your local install.
+> `parley-sqlite` is the bin shipped by `@sharptrick/parley-sqlite`; `npx` resolves it from your local install. Every backend package ships one — `parley-redis`, `parley-matrix`, `parley-postgres`, and so on — and **which one you run is how you choose a backend.**
 
 **4. Run the hand-off.** Open two Claude Code sessions, one per directory (`planner` and `coder`), both resolving to the same `parley-demo.db`:
 
@@ -114,7 +116,7 @@ That's the round-trip. `parley_fetch_recent` hands back the message plus the boo
 <details>
 <summary><strong>Why this survives a restart (optional)</strong></summary>
 
-`nextCursor` is the whole trick: persist it, pass it back as `since`, and the next catch-up returns only messages *newer* than it — never re-sending one you already read. Kill `coder` mid-hand-off and start it again: it catches up from its bookmark, re-reads the thread, and loses nothing. Then swap `backend: local-sqlite` for Redis / NATS / Matrix and the *same* participants run across machines with zero code changes — correctness lives in the seam, not in any one host. The mechanics (`cursor`, `backendMsgId`) are spelled out in [How it works](#how-it-works).
+`nextCursor` is the whole trick: persist it, pass it back as `since`, and the next catch-up returns only messages *newer* than it — never re-sending one you already read. Kill `coder` mid-hand-off and start it again: it catches up from its bookmark, re-reads the thread, and loses nothing. Then run `parley-redis` / `parley-nats` / `parley-matrix` instead of `parley-sqlite` and the *same* participants run across machines with zero code changes — correctness lives in the seam, not in any one host. The mechanics (`cursor`, `backendMsgId`) are spelled out in [How it works](#how-it-works).
 </details>
 
 ---
@@ -138,7 +140,9 @@ The loop the hero promised — a Claude chat plans, a Claude Code session does t
 
 Step 4 is the real, in-production shape: chat→Code lands over the **durable catch-up** path. The other half — an *already-running* session reacting the instant you post — is the live-push preview ([below](#what-runs-today-and-whats-still-preview)), not needed here. Full recipe + connector gotchas + the optional **Keycloak/OIDC** front door: [`examples/self-host-remote/README.md`](examples/self-host-remote/README.md).
 
-> **Optional — land it on your phone.** Quickstart B reads back in Claude chat. To get the hero's phone experience, swap the SQLite backend for **Matrix** — the live-proven phone pick ([backends](#backends)): point `backend:` at the Matrix plugin, keep the same topics, and the plan → hand-off → result thread also shows up in an ordinary Matrix app on your phone. Same seam, zero participant-code changes; config is in the [`bridge-matrix` README](packages/bridge-matrix/README.md).
+> **Optional — land it on your phone.** Quickstart B reads back in Claude chat. To get the hero's phone experience, swap the SQLite backend for **Matrix** — the live-proven phone pick ([backends](#backends)): install `@sharptrick/parley-matrix`, run `parley-matrix` instead of `parley-sqlite`, swap `backend_config` for your homeserver's, and keep the same topics. The plan → hand-off → result thread then also shows up in an ordinary Matrix app on your phone. Same seam, zero participant-code changes; config is in the [`bridge-matrix` README](packages/bridge-matrix/README.md).
+>
+> Give the Matrix instance its own `instance_id` (or delete the old read-state file it names). Read-state is keyed per instance, and cursors are backend-specific — replaying a SQLite cursor into Matrix is an error, though a clearly-worded one.
 
 ---
 
@@ -197,12 +201,16 @@ Adding every backend after SQLite changed **zero** lines of `@sharptrick/parley-
 
 Ten backends — six live-tested against real implementations, four proven against in-process API fakes of the vendor protocol. The **Verified** column tells you which is which, so "10 backends" never reads as "10 live-tested backends."
 
+This is what **backend-agnostic MCP messaging** buys: the same six-method seam gives you
+**agent-to-agent messaging over Matrix/NATS** or plain SQLite, and moving between them changes a
+binary and a `backend_config` block, not a line of participant code.
+
 | Backend | Transport / mechanism | Cursor | Verified |
 |---|---|---|---|
 | SQLite | local file, polling-only (WAL, no broker) | `rowid` | `live` |
 | Redis | Redis Streams, blocking `XREAD` push | stream id | `live` |
 | Postgres | table + `LISTEN` / `NOTIFY` push | `BIGSERIAL` | `live` |
-| Matrix | hand-rolled Client-Server HTTP + `/sync` | sync token | `live` |
+| Matrix | hand-rolled Client-Server HTTP + `/sync` | `event_id` | `live` |
 | XMPP | MUC + MAM archive (server must enable MAM) | MAM id | `live` |
 | NATS | JetStream (persistent streams) | stream sequence | `live` |
 | Zulip | event-queue long-poll (raw `fetch`) | message id | `fake-conformance` + operator-run |
@@ -221,10 +229,72 @@ Every backend clears the identical seam contract — cursor monotonicity, exclus
 
 Distinct from the six seam methods a backend implements, these are the 4 tools Claude actually calls:
 
-- **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?}` → `{messages, nextCursor}`.
+- **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?, block_ms?}` → `{messages, nextCursor}`. With `block_ms` the call *waits* for the next message instead of returning an empty page, so a session polling for a reply pays for messages rather than for elapsed time — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
 - **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?}` → `{backendMsgId}`.
 - **`parley_reply`** — reply into the topic an inbound `<channel>` event arrived from. Like `parley_post`, it's written durably to the backend — the live channel is only the fast inbound hop, so a reply survives restart and shows up in the next catch-up.
 - **`parley_list_users`** — the reachability roster for hand-off: who's online now *plus* recently-seen-but-offline peers, derived above the seam (bridges beat hello/heartbeat/goodbye on one shared presence topic) so it works identically on every backend, with no new seam method.
+
+### Waiting for a reply (`block_ms`)
+
+A session that hands off work usually wants the answer. Without help that means polling
+`parley_fetch_recent` on a timer and burning a tool call per tick, most of them empty.
+
+Pass `block_ms` and the call blocks server-side until a message newer than `since` arrives, or the
+budget expires — whichever comes first:
+
+```jsonc
+{ "topic": "ctx-demo", "since": "<nextCursor from the last call>", "block_ms": 30000 }
+```
+
+It returns **the moment** a message lands, so the cost is one call per *message* rather than one
+per interval. The idiom for a session waiting on a hand-off is a loop that re-passes the cursor it
+just received; the [chat-hand-off skill](skills/chat-handoff/SKILL.md) has a runnable version.
+
+Keep `block_ms` comfortably under your client's tool timeout — a blocked call that outlives the
+timeout looks like a hang. Core clamps it to `catchup.block_max_ms` (default 60s) before it ever
+reaches a plugin, so a caller cannot exceed the server's own ceiling.
+
+Every backend implements this natively where the transport allows — Redis blocks on the stream,
+Postgres on `LISTEN`, Matrix on `/sync`, XMPP on a MUC wait, NATS on a pull expiry, and the chat
+SaaS backends on the socket they already hold open. SQLite has nothing to block on, so core
+supplies a generic re-query fallback (`catchup.block_poll_interval_ms`). Adding it required **zero**
+seam changes across all ten.
+
+---
+
+## Configuration
+
+Full reference in [`DESIGN.md` §11](DESIGN.md). The knobs worth knowing before you run this against
+a real account:
+
+| Key | Default | Why you'd touch it |
+|---|---|---|
+| `identity.handle` | *(required)* | This instance's logical name; what peers `@mention`. |
+| `instance_id` | `identity.handle` | **Read-state namespace.** Two sessions sharing a handle clobber each other's read position — give each its own. Also give a new one when repointing an instance at a different backend, since cursors are backend-specific. |
+| `state_path` | `$XDG_STATE_HOME/parley/<instance>/read-state.json` | Where that cursor file lives. |
+| `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** |
+| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or announced. |
+| `catchup.on_start` | `true` | Drain everything newer than the stored cursor at startup. |
+| `catchup.limit` | `100` | Page size per `fetchRecent`. |
+| `catchup.block_max_ms` | `60000` | Server-side ceiling on `block_ms` (above). |
+| `catchup.block_poll_interval_ms` | `250` | Re-query cadence for core's generic long-poll fallback. Latency/cost only. |
+| `live_push.enabled` | `false` | Claude Code only — push `<channel>` events into a running session. |
+| `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. |
+| `presence.enabled` | **`true`** | See the warning below. |
+| `presence.topic` | `parley-presence` | The one shared topic beats go to. Reserved: it can never appear in `topics`. |
+| `presence.heartbeat_ms` | `600000` | Beat cadence. |
+| `presence.ttl_ms` | `3 ×` heartbeat | Liveness window for `parley_list_users`. Must be ≥ the heartbeat. |
+| `backend_config` | `{}` | Opaque to core, passed verbatim to the plugin. Secrets live here — never committed. |
+
+> **Presence is on by default, and it writes to your backend.** Each bridge beats
+> hello/heartbeat/goodbye onto the shared `parley-presence` topic so `parley_list_users` can report
+> who is reachable. On SQLite that's an extra table's worth of rows. On a **real Matrix or Zulip
+> account it is a real room or stream**, created on first beat, that you did not ask for. If that's
+> unwanted — or the instance is a reactive-only chat front door that can't receive pushes anyway —
+> set `presence.enabled: false`.
+
+There is no `backend` key: the backend is whichever `parley-<name>` binary you run. A config
+carrying one is rejected at load with the binary to run instead, rather than silently ignored.
 
 ---
 
@@ -249,7 +319,7 @@ For a hardened setup, the maintainer runs Parley as their own single-tenant inst
 ## Project status & maintenance
 
 - **Single maintainer, MIT, no hosted service.** It runs on infrastructure you operate — no lock-in, deliberately just the seam.
-- **Pre-1.0 (`v0.8.0`), actively developed.** See the [GitHub Releases](https://github.com/sharpTrick/parley/releases) for cadence; the last-commit badge up top is the live pulse. Per project convention, early breaking changes land as `feat:` until 1.0 is deliberately cut.
+- **Pre-1.0, actively developed.** See the [GitHub Releases](https://github.com/sharpTrick/parley/releases) for cadence; the last-commit badge up top is the live pulse. Per project convention, early breaking changes land as `feat:` until 1.0 is deliberately cut.
 - **The one risk to price in.** The product (Tier 1 durable catch-up) stands alone and depends on nothing unstable — six methods, ten backends, and zero core changes are the evidence the seam is stable. The only experimental dependency is Tier 2 live push, which rides Anthropic's `claude/channel` research preview and may break on any Claude Code release — [scoped above](#what-runs-today-and-whats-still-preview), never load-bearing.
 - **Releases are automated.** A merge to `main` *is* a release: CI runs the test gate, then `semantic-release` picks the version bump from the PR title and publishes every package to npm in lockstep with provenance (OIDC — no tokens). See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - **Contributing.** Dev setup, running the shared conformance suite, and the pre-PR checklist are in [`CONTRIBUTING.md`](CONTRIBUTING.md); extending Parley with a new backend is the [*Add a backend*](#how-it-works) callout above.

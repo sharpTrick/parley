@@ -50,20 +50,29 @@ is informational only; ordering and dedup never use it.
 ## Config (`parley.config.yaml`)
 
 ```yaml
-backend: local-sqlite          # which plugin to load
-instance_id: agent-main        # read-state namespace; DISTINCT per concurrent session sharing a handle
+# No `backend:` key — the backend is whichever parley-<name> binary you run
+# (parley-sqlite here). A config carrying one is rejected at load.
+instance_id: agent-main         # read-state namespace; DISTINCT per concurrent session sharing a handle
 identity: { handle: "agent" }
 topics: ["ctx-demo"]            # THE allowlist — no wildcard default
-catchup: { on_start: true, limit: 100 }
+catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
-permissions: { skip_permissions: false }   # sandbox-only; default OFF, never flip on as convenience
+presence: { enabled: true, topic: "parley-presence", heartbeat_ms: 600000 }
 backend_config:                 # opaque to core; passed verbatim to the plugin's connect()
   db_path: "./parley.db"
 ```
 
 `backend_config` is the only backend-specific part of this file — see the plugin's own README for
 its shape. Two concurrent sessions must never share an `instance_id` (or default handle) — each
-owns its own read-state file, and a clash silently clobbers the other's catch-up position.
+owns its own read-state file, and a clash silently clobbers the other's catch-up position. Cursors
+are backend-specific too, so an instance repointed at a different backend needs a fresh
+`instance_id` (or its old read-state deleted); catch-up fails with a message saying exactly that.
+
+`presence.enabled` defaults to **true** and writes hello/heartbeat/goodbye to the shared
+`presence.topic` on your backend — on a real Matrix or Zulip account that is a room or stream
+created on first beat. Set it to `false` for reactive-only instances or where that is unwanted.
+`permissions.skip_permissions` is parsed but unimplemented; setting it to `true` is a load error
+rather than a silent no-op.
 
 ## MCP tools exposed
 

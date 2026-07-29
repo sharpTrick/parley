@@ -107,7 +107,7 @@ Doing it by hand takes three careful steps, because two Synapse defaults break a
      -u parley -p parleypass -a -c /data/homeserver.yaml http://localhost:8008
    ```
 
-`server_name=parley.local`, C–S API on `localhost:8008`. Room → topic, sync token → cursor; a
+`server_name=parley.local`, C–S API on `localhost:8008`. Room → topic, `event_id` → cursor; a
 bounded room-filtered `/sync` backs the native `block_ms`.
 
 ## Zulip (v0.6) — upstream compose, not authored here
