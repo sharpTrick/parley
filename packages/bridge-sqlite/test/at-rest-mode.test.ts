@@ -29,22 +29,51 @@ vi.mock('node:fs', async (importOriginal) => {
 const mode = (f: string): number => statSync(f).mode & 0o777;
 const dir = () => mkdtempSync(join(tmpdir(), 'parley-mode-'));
 
-const PRE_EXISTING: Array<{ name: string; setup?: number; warns: boolean }> = [
-  { name: 'absent', warns: false },
-  { name: '0600', setup: 0o600, warns: false },
-  { name: '0640', setup: 0o640, warns: true },
-  { name: '0644', setup: 0o644, warns: true },
-  { name: '0660', setup: 0o660, warns: true },
-  { name: '0666', setup: 0o666, warns: true },
+/**
+ * The store is three files, and the message content lives in the `-wal` as much as in the `.db`.
+ * An unclean shutdown of a looser build leaves a sidecar behind at its own mode, so each file has
+ * to be inspected on its own — a sidecar SQLite happens to create by inheriting the tightened
+ * `.db` mode proves nothing about one already on disk.
+ */
+const SUFFIX = { db: '', wal: '-wal', shm: '-shm' } as const;
+type StoreFile = keyof typeof SUFFIX;
+const FILES: StoreFile[] = ['db', 'wal', 'shm'];
+
+const PRE_EXISTING: Array<{
+  name: string;
+  setup: Partial<Record<StoreFile, number>>;
+  narrowed: StoreFile[];
+}> = [
+  { name: 'absent', setup: {}, narrowed: [] },
+  { name: 'db 0600', setup: { db: 0o600 }, narrowed: [] },
+  { name: 'db 0640', setup: { db: 0o640 }, narrowed: ['db'] },
+  { name: 'db 0644', setup: { db: 0o644 }, narrowed: ['db'] },
+  { name: 'db 0660', setup: { db: 0o660 }, narrowed: ['db'] },
+  { name: 'db 0666', setup: { db: 0o666 }, narrowed: ['db'] },
+  { name: 'db 0600, wal 0644', setup: { db: 0o600, wal: 0o644 }, narrowed: ['wal'] },
+  { name: 'db 0644, wal 0600', setup: { db: 0o644, wal: 0o600 }, narrowed: ['db'] },
+  { name: 'db 0600, shm 0666', setup: { db: 0o600, shm: 0o666 }, narrowed: ['shm'] },
+  {
+    name: 'db 0600, wal 0640, shm 0660',
+    setup: { db: 0o600, wal: 0o640, shm: 0o660 },
+    narrowed: ['wal', 'shm'],
+  },
+  {
+    name: 'all three 0644',
+    setup: { db: 0o644, wal: 0o644, shm: 0o644 },
+    narrowed: ['db', 'wal', 'shm'],
+  },
 ];
 
 describe('at-rest mode for every pre-existing store state', () => {
   for (const c of PRE_EXISTING) {
-    it(`${c.name}: ends at 0600 and ${c.warns ? 'reports the change' : 'stays quiet'}`, () => {
+    it(`${c.name}: every file ends at 0600, each change reported once`, () => {
       const path = join(dir(), 'p.db');
-      if (c.setup !== undefined) {
-        writeFileSync(path, '');
-        chmodSync(path, c.setup);
+      for (const f of FILES) {
+        const preset = c.setup[f];
+        if (preset === undefined) continue;
+        writeFileSync(`${path}${SUFFIX[f]}`, '');
+        chmodSync(`${path}${SUFFIX[f]}`, preset);
       }
       const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       let lines: string[] = [];
@@ -55,7 +84,7 @@ describe('at-rest mode for every pre-existing store state', () => {
         d.prepare('INSERT INTO t (x) VALUES (?)').run(1);
         lines = spy.mock.calls.map(([l]) => String(l));
         // Read the sidecars before close(): the checkpoint on close removes them.
-        modes = [path, `${path}-wal`, `${path}-shm`].map(mode);
+        modes = FILES.map((f) => mode(`${path}${SUFFIX[f]}`));
         d.close();
       } finally {
         spy.mockRestore();
@@ -63,9 +92,11 @@ describe('at-rest mode for every pre-existing store state', () => {
 
       expect(modes).toEqual([0o600, 0o600, 0o600]);
 
-      const notices = lines.filter((l) => /tightened|cannot restrict/.test(l));
-      expect(notices.length).toBe(c.warns ? 1 : 0);
-      if (c.warns) expect(notices[0]).toContain(path);
+      const tightened = lines
+        .map((l) => /tightened (\S+) from/.exec(l)?.[1])
+        .filter((f): f is string => f !== undefined);
+      expect(tightened).toEqual(c.narrowed.map((f) => `${path}${SUFFIX[f]}`));
+      expect(lines.filter((l) => /cannot restrict/.test(l))).toEqual([]);
     });
   }
 

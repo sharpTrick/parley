@@ -37,10 +37,13 @@ A cursor of no recognisable shape (a Matrix-style `s123_456`, an empty string) i
 error naming it, rather than absorbed as "matches nothing" — absorbing it would wedge the topic's
 catch-up forever instead of costing one page.
 
-**Page size.** `fetchRecent` caps `limit` at 1000 rows per page; `limit` values below 1, or
-non-integers, are rejected outright (SQLite reads a negative `LIMIT` as *no* limit). The driver is
-synchronous and `limit` reaches it from model-supplied tool arguments, so an unbounded page would
-stall the whole bridge. Page to exhaustion for more.
+**Page size.** `fetchRecent` serves at most 10000 rows in one page. A `limit` outside `1..10000` —
+above the ceiling, below 1, or a non-integer — is rejected outright with an error naming the
+ceiling (SQLite reads a negative `LIMIT` as *no* limit). The driver is synchronous and `limit`
+reaches it from model-supplied tool arguments, so an unbounded page would stall the whole bridge.
+The ceiling rejects rather than silently clamping: a caller that pages until a page comes back
+short — which is how core's catch-up driver decides a topic is exhausted — would read a clamped
+page as the end of the topic and strand every message after it. Page to exhaustion for more.
 
 ### When the database goes away under a live subscription
 

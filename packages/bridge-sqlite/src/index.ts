@@ -56,11 +56,12 @@ const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
  */
 export const PRUNE_BATCH = 5_000;
 /**
- * Server-side ceiling on `fetchRecent`'s page. The driver is synchronous, and `limit` reaches it
- * from a model whose context is untrusted inbound content, so an unbounded page is a whole-bridge
- * stall. Callers page to exhaustion instead (the conformance suite's `drainAll` already does).
+ * Largest page `fetchRecent` will serve. The driver is synchronous, and `limit` reaches it from a
+ * model whose context is untrusted inbound content, so an unbounded page is a whole-bridge stall.
+ * Keep a larger `limit` REJECTED rather than clamped, so that a page shorter than the one asked for
+ * always means the topic is exhausted — the test core's catch-up driver stops on.
  */
-export const MAX_PAGE = 1_000;
+export const MAX_PAGE = 10_000;
 /** Page size when a caller supplies no `limit`. */
 const DEFAULT_PAGE = 100;
 /** Floor for `poll_interval_ms`: below this the loop is a hot spin, not a poll. */
@@ -518,13 +519,14 @@ function readOrMintStoreId(driver: SqlDriver): string {
 
 function normalizeLimit(limit: number | undefined, topic: Topic): number {
   if (limit === undefined) return DEFAULT_PAGE;
-  if (!Number.isInteger(limit) || limit < 1) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) {
     throw new Error(
       `parley-sqlite: invalid limit ${describe(limit)} for topic ${topic} — expected an integer ` +
-        `>= 1 (SQLite reads a negative LIMIT as "no limit")`,
+        `between 1 and ${MAX_PAGE} (SQLite reads a negative LIMIT as "no limit"; a page above ` +
+        `${MAX_PAGE} would come back short, which a caller cannot tell from an exhausted topic)`,
     );
   }
-  return Math.min(limit, MAX_PAGE);
+  return limit;
 }
 
 function rowToMessage(row: MessageRow, storeId: string): Message {

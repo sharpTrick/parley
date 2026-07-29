@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asCursor, asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
@@ -39,22 +39,40 @@ afterEach(async () => {
   dirs = [];
 });
 
-/** Wipe the database file and its sidecars, then reopen the same path — a store reset. */
-async function reset(p: SqlitePlugin, path: string): Promise<SqlitePlugin> {
+const SIDECARS = ['', '-wal', '-shm'] as const;
+
+/** Close the store, act on its files while nothing holds them open, reopen the same path. */
+async function reopen(
+  p: SqlitePlugin,
+  path: string,
+  act: () => void,
+): Promise<SqlitePlugin> {
   await p.disconnect();
   open = open.filter((o) => o !== p);
-  for (const f of [path, `${path}-wal`, `${path}-shm`]) rmSync(f, { force: true });
+  act();
   return plugin(path);
+}
+
+/** Wipe the database file and its sidecars, then reopen the same path — a store reset. */
+const reset = (p: SqlitePlugin, path: string): Promise<SqlitePlugin> =>
+  reopen(p, path, () => {
+    for (const s of SIDECARS) rmSync(`${path}${s}`, { force: true });
+  });
+
+function copyStore(from: string, to: string): void {
+  for (const s of SIDECARS) {
+    rmSync(`${to}${s}`, { force: true });
+    if (existsSync(`${from}${s}`)) copyFileSync(`${from}${s}`, `${to}${s}`);
+  }
 }
 
 async function fill(p: SqlitePlugin, topic: Topic, contents: string[]): Promise<void> {
   for (const c of contents) await p.post(topic, me, c);
 }
 
+/** Read the store's identity off an empty topic's replayable cursor, without writing to it. */
 async function storeIdOf(p: SqlitePlugin): Promise<string> {
-  const probe = asTopic('store-id-probe');
-  await p.post(probe, me, 'probe');
-  const { nextCursor } = await p.fetchRecent({ topic: probe });
+  const { nextCursor } = await p.fetchRecent({ topic: asTopic('store-id-probe') });
   return nextCursor.split('.')[0]!;
 }
 
@@ -88,28 +106,35 @@ function expectStrictlyIncreasing(cursors: string[]): void {
 }
 
 /**
- * Well-formed cursors belonging to some other store. The rowids straddle a 7-row topic's
- * high-water mark on purpose: a foreign cursor BELOW that mark is exactly the one a high-water
- * heuristic mistakes for its own and quietly resumes after.
+ * Well-formed cursors this store cannot honour. The rowids straddle a 7-row topic's high-water
+ * mark on purpose: a cursor BELOW that mark is exactly the one a high-water heuristic mistakes for
+ * its own and quietly resumes after. The last row is this store's OWN id above its high-water mark
+ * — what a restore from an older backup leaves core holding — where the store id matches and only
+ * the high-water comparison stands between catch-up and skipping the whole restored history.
  */
-const FOREIGN_CURSORS: Array<{ name: string; make: (otherStoreId: string) => string }> = [
+const UNHONOURABLE_CURSORS: Array<{
+  name: string;
+  make: (ids: { other: string; own: string }) => string;
+}> = [
   { name: 'a bare rowid below the high-water mark (nats seq, postgres bigserial)', make: () => '3' },
   { name: 'a bare rowid at the high-water mark', make: () => '7' },
   { name: 'a bare rowid above the high-water mark', make: () => '10000' },
   { name: 'a telegram-sized bare id', make: () => '123456789' },
-  { name: 'another store’s cursor, low rowid', make: (other) => `${other}.2` },
-  { name: 'another store’s cursor, high rowid', make: (other) => `${other}.99999` },
+  { name: 'another store’s cursor, low rowid', make: ({ other }) => `${other}.2` },
+  { name: 'another store’s cursor, high rowid', make: ({ other }) => `${other}.99999` },
+  { name: 'this store’s own cursor one past the high-water mark', make: ({ own }) => `${own}.8` },
+  { name: 'this store’s own cursor far above the high-water mark', make: ({ own }) => `${own}.99999` },
 ];
 
-describe('a cursor from another store replays the topic instead of skipping it', () => {
-  for (const shape of FOREIGN_CURSORS) {
+describe('a cursor this store cannot honour replays the topic instead of skipping it', () => {
+  for (const shape of UNHONOURABLE_CURSORS) {
     it(shape.name, async () => {
       const expected = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
       const p = await plugin();
       await fill(p, T, expected);
-      const otherStoreId = await storeIdOf(await plugin());
+      const ids = { other: await storeIdOf(await plugin()), own: await storeIdOf(p) };
 
-      const drained = await drainFrom(p, T, asCursor(shape.make(otherStoreId)), 3);
+      const drained = await drainFrom(p, T, asCursor(shape.make(ids)), 3);
       expect(drained.contents).toEqual(expected);
       expectStrictlyIncreasing(drained.cursors);
     });
@@ -122,6 +147,63 @@ describe('a cursor from another store replays the topic instead of skipping it',
     const afterFirst = await p.fetchRecent({ topic: T, since: messages[0]!.cursor });
     expect(afterFirst.messages.map((m) => m.content)).toEqual(['m1', 'm2']);
     expect(afterFirst.nextCursor).toBe(messages[2]!.cursor);
+  });
+});
+
+/**
+ * The high-water comparison decides whether a cursor carrying THIS store's id is honoured. It is
+ * the only thing between a store restored from an older backup and `id > <future rowid>` matching
+ * nothing forever, and it has to read the store-wide AUTOINCREMENT sequence: a per-topic MAX(id)
+ * would call a legitimate cursor minted while a busier topic was written "from the future" and
+ * replay history the reader already has.
+ */
+describe('this store’s own cursor is honoured up to the high-water mark and no further', () => {
+  const ROWS = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
+  const HONOURED = [
+    { rowid: 0, remaining: ROWS },
+    { rowid: 1, remaining: ROWS.slice(1) },
+    { rowid: 6, remaining: ROWS.slice(6) },
+    { rowid: 7, remaining: [] },
+  ];
+
+  for (const { rowid, remaining } of HONOURED) {
+    it(`rowid ${rowid} resumes exclusively after it`, async () => {
+      const p = await plugin();
+      await fill(p, T, ROWS);
+      const own = await storeIdOf(p);
+
+      const drained = await drainFrom(p, T, asCursor(`${own}.${rowid}`), 3);
+      expect(drained.contents).toEqual(remaining);
+      expectStrictlyIncreasing(drained.cursors);
+    });
+  }
+
+  it('the mark is the store-wide sequence, not the topic’s own MAX(id)', async () => {
+    const p = await plugin();
+    await fill(p, T, ROWS);
+    await fill(p, asTopic('busier'), Array.from({ length: 20 }, (_u, i) => `b${i}`));
+    const own = await storeIdOf(p);
+
+    const drained = await drainFrom(p, T, asCursor(`${own}.20`), 3);
+    expect(drained.contents).toEqual([]);
+  });
+
+  it('a store restored from an older backup replays everything the backup still holds', async () => {
+    const path = dbPath();
+    const backup = dbPath();
+    const kept = Array.from({ length: 20 }, (_u, i) => `kept-${i}`);
+
+    let p = await plugin(path);
+    await fill(p, T, kept);
+
+    p = await reopen(p, path, () => copyStore(path, backup));
+    await fill(p, T, Array.from({ length: 30 }, (_u, i) => `rolled-back-${i}`));
+    const tail = (await p.fetchRecent({ topic: T, limit: 500 })).nextCursor;
+
+    p = await reopen(p, path, () => copyStore(backup, path));
+    const drained = await drainFrom(p, T, tail, 3);
+    expect(drained.contents).toEqual(kept);
+    expectStrictlyIncreasing(drained.cursors);
   });
 });
 
