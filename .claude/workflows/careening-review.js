@@ -115,10 +115,14 @@ function prompt(target) {
 }
 
 // --- run ---------------------------------------------------------------------------------------
-const round = (args && args.round) || 1
-const quiesced = new Set((args && args.quiesced) || [])
-const changed = (args && args.changed) || []
-const wakeAll = !!(args && args.wakeAll)
+// `args` arrives as a JSON STRING when the caller passes an object literal, which silently
+// defaulted round to 1 and wakeAll to false in round 2 — and wakeAll false makes a round
+// convergence-INELIGIBLE, so a clean round could never have stopped the loop. Parse both shapes.
+const rawArgs = typeof args === 'string' ? JSON.parse(args) : args
+const round = (rawArgs && rawArgs.round) || 1
+const quiesced = new Set((rawArgs && rawArgs.quiesced) || [])
+const changed = (rawArgs && rawArgs.changed) || []
+const wakeAll = !!(rawArgs && rawArgs.wakeAll)
 
 const woken = wakeAll ? new Set(TARGETS.map((t) => t.key)) : wakeSet(changed)
 const active = TARGETS.filter((t) => wakeAll || !quiesced.has(t.key) || woken.has(t.key))
