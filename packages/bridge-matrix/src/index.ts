@@ -663,7 +663,11 @@ export class MatrixPlugin implements BackendPlugin {
     // In shared mode all topics collapse onto one room → one cache key, one resolve.
     const localpart =
       this.sharedLocalpart ?? `parley_${safeName(topic, sanitizeAlias)}`;
-    const key = this.sharedLocalpart !== undefined ? ' shared' : (topic as string);
+    // NUL-prefixed sentinel: a topic can never contain U+0000, so this shared-mode cache key
+    // cannot collide with a real topic. Keep it an ESCAPE, never a literal NUL byte — a raw
+    // control character makes this file `data` to file(1) and makes ripgrep refuse to print
+    // matches, silently hiding the largest plugin from every grep-based search and review pass.
+    const key = this.sharedLocalpart !== undefined ? '\u0000shared' : (topic as string);
     const existing = this.rooms.get(key);
     if (existing !== undefined) return existing;
     const pending = this.resolveOrCreateRoom(localpart).catch((err) => {
