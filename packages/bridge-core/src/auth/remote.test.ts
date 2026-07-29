@@ -513,6 +513,113 @@ describe('remote OAuth front door — credential lifecycle over HTTP', () => {
 });
 
 /**
+ * The same "a failed exchange leaves nothing replayable" table as oauth-provider.test.ts, driven
+ * over HTTP so the SDK's PKCE verification — which runs BETWEEN the provider's two code methods and
+ * is invisible to a provider-level test — is inside the system under test. Each row states whether
+ * a subsequent fully-correct exchange of the same code still works; the one row where it does is the
+ * foreign client, because otherwise anyone who learned a code could deny the owner the token it
+ * stands for.
+ */
+interface FailedExchange {
+  name: string;
+  /** Mutate the otherwise-correct token request. `foreignClientId` is substituted when present. */
+  corrupt: (body: Record<string, string>, foreignClientId: string) => Record<string, string>;
+  replayable: boolean;
+}
+
+const FAILED_EXCHANGES: FailedExchange[] = [
+  {
+    name: 'a redirect_uri that does not match the one consented to',
+    corrupt: (b) => ({ ...b, redirect_uri: 'http://127.0.0.1:9999/other' }),
+    replayable: false,
+  },
+  {
+    name: 'an absent redirect_uri',
+    corrupt: ({ redirect_uri: _drop, ...b }) => b,
+    replayable: false,
+  },
+  {
+    name: 'a code_verifier that does not match the challenge',
+    corrupt: (b) => ({ ...b, code_verifier: b64url(randomBytes(32)) }),
+    replayable: false,
+  },
+  {
+    name: 'a resource this AS does not serve',
+    corrupt: (b) => ({ ...b, resource: 'https://evil.example/mcp' }),
+    replayable: false,
+  },
+  {
+    name: 'a foreign client presenting the code',
+    corrupt: (b, foreignClientId) => ({ ...b, client_id: foreignClientId }),
+    replayable: true,
+  },
+];
+
+describe('remote OAuth front door — a failed token exchange closes the code', () => {
+  it.each(FAILED_EXCHANGES.map((f) => [f.name, f]))(
+    '%s',
+    async (_name: string, f: FailedExchange) => {
+      const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+      const register = async (): Promise<Record<string, any>> =>
+        jget(
+          await fetch(as.registration_endpoint, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              redirect_uris: [CLIENT_REDIRECT],
+              token_endpoint_auth_method: 'none',
+            }),
+          }),
+        );
+      const client = await register();
+      const stranger = await register();
+
+      const { verifier, challenge } = pkce();
+      const authorizeUrl = new URL(as.authorization_endpoint);
+      authorizeUrl.search = form({
+        response_type: 'code',
+        client_id: client.client_id,
+        redirect_uri: CLIENT_REDIRECT,
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+        resource: `${origin}/mcp`,
+        scope: 'mcp',
+      });
+      const html = await (await fetch(authorizeUrl.href)).text();
+      const consentId = /name="consent_id" value="([^"]+)"/.exec(html)?.[1];
+      const consentRes = await postConsent(consentId!, OWNER_PASS);
+      const code = new URL(consentRes.headers.get('location')!).searchParams.get('code')!;
+
+      const correct: Record<string, string> = {
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: CLIENT_REDIRECT,
+        client_id: client.client_id,
+        code_verifier: verifier,
+        resource: `${origin}/mcp`,
+      };
+      const exchange = (body: Record<string, string>): Promise<Response> =>
+        fetch(as.token_endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: form(body),
+        });
+
+      const failed = await exchange(f.corrupt({ ...correct }, stranger.client_id));
+      expect(failed.status).toBeGreaterThanOrEqual(400);
+
+      const replay = await exchange(correct);
+      if (f.replayable) {
+        expect(replay.status).toBe(200);
+      } else {
+        expect(replay.status).toBeGreaterThanOrEqual(400);
+        expect((await jget(replay)).error).toBe('invalid_grant');
+      }
+    },
+  );
+});
+
+/**
  * Every endpoint of this front door is rate-limited per client address, so the limiter is only a
  * defence if that address is the CLIENT's. Under the shipped recipe (examples/self-host-remote
  * terminates TLS at a reverse proxy) an unconfigured app sees only the proxy's loopback address:

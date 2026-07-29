@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { Response } from 'express';
 import type { AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import {
@@ -20,9 +22,11 @@ const GOOD_PASS = 'open sesame';
 interface Internals {
   clients: Map<string, unknown>;
   codes: Map<string, unknown>;
+  redeeming: Map<string, unknown>;
   access: Map<string, unknown>;
   refresh: Map<string, unknown>;
   pending: Map<string, unknown>;
+  sweepTimer: { hasRef?: () => boolean };
   sweep(): void;
   issue(clientId: string, scopes: string[], resource: string, grantId?: string): OAuthTokens;
 }
@@ -152,31 +156,101 @@ describe('ParleyOAuthProvider — every TTL is bounded from both sides', () => {
   );
 });
 
-describe('ParleyOAuthProvider — expired state is swept, not left to accumulate', () => {
-  it('sweeps every expired code/refresh/pending/access entry once the clock advances past their TTLs', async () => {
-    let clock = 1_000_000;
-    const p = makeProvider(() => clock);
-    const client = makeClient();
-    peek(p).clients.set(client.client_id, client);
+/**
+ * The background sweeper is the only thing bounding these maps in a long-running server, and
+ * `pending` is the one an unauthenticated caller can grow. Driving the private `sweep()` directly
+ * cannot tell an armed timer from a dead one, so every row here advances a FAKE CLOCK and asserts
+ * the store emptied on its own. A store added to the provider should add a row.
+ */
+interface SweptStore {
+  name: string;
+  store: keyof Pick<Internals, 'pending' | 'codes' | 'redeeming' | 'access' | 'refresh'>;
+  ttlMs: number;
+  seed: (p: ParleyOAuthProvider, client: OAuthClientInformationFull) => Promise<void>;
+}
 
-    await p.authorize(client, makeParams(), fakeRes()); // seeds pending
-    await mintCode(p, client, makeParams()); // seeds a code (+ a second pending, already consumed)
-    peek(p).issue(client.client_id, ['mcp'], RESOURCE.href); // seeds access + refresh
+const SWEEP_CADENCE_MS = 60_000;
 
-    expect(peek(p).pending.size).toBeGreaterThan(0);
-    expect(peek(p).codes.size).toBe(1);
-    expect(peek(p).access.size).toBe(1);
-    expect(peek(p).refresh.size).toBe(1);
+const SWEPT_STORES: SweptStore[] = [
+  {
+    name: 'a pending owner consent',
+    store: 'pending',
+    ttlMs: 5 * 60_000,
+    seed: async (p, client) => {
+      await p.authorize(client, makeParams(), fakeRes());
+    },
+  },
+  {
+    name: 'an unredeemed authorization code',
+    store: 'codes',
+    ttlMs: 60_000,
+    seed: async (p, client) => {
+      await mintCode(p, client, makeParams());
+    },
+  },
+  {
+    name: 'a code whose PKCE challenge was handed out but never redeemed',
+    store: 'redeeming',
+    ttlMs: 60_000,
+    seed: async (p, client) => {
+      const code = await mintCode(p, client, makeParams());
+      await p.challengeForAuthorizationCode(client, code);
+    },
+  },
+  {
+    name: 'an access token',
+    store: 'access',
+    ttlMs: 60 * 60_000,
+    seed: async (p, client) => {
+      peek(p).issue(client.client_id, ['mcp'], RESOURCE.href);
+    },
+  },
+  {
+    name: 'a refresh token',
+    store: 'refresh',
+    ttlMs: 30 * 24 * 60 * 60_000,
+    seed: async (p, client) => {
+      peek(p).issue(client.client_id, ['mcp'], RESOURCE.href);
+    },
+  },
+];
 
-    clock += 31 * 24 * 60 * 60 * 1000; // past every TTL (refresh is the longest at 30 days)
-    peek(p).sweep();
+describe('ParleyOAuthProvider — the sweeper is armed, not merely present', () => {
+  it.each(SWEPT_STORES.map((s) => [s.name, s]))(
+    '%s is evicted by the timer alone, with nothing calling sweep()',
+    async (_name: string, s: SweptStore) => {
+      vi.useFakeTimers();
+      try {
+        const p = new ParleyOAuthProvider({
+          resource: RESOURCE,
+          verifyOwner: async (pass) => pass === GOOD_PASS,
+          consentPath: '/parley/consent',
+        });
+        try {
+          const client = makeClient();
+          peek(p).clients.set(client.client_id, client);
+          await s.seed(p, client);
+          expect(peek(p)[s.store].size).toBe(1);
 
-    expect(peek(p).pending.size).toBe(0);
-    expect(peek(p).codes.size).toBe(0);
-    expect(peek(p).access.size).toBe(0);
-    expect(peek(p).refresh.size).toBe(0);
+          vi.advanceTimersByTime(s.ttlMs + 2 * SWEEP_CADENCE_MS);
+
+          expect(peek(p)[s.store].size).toBe(0);
+        } finally {
+          p.stop();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('does not hold the event loop open while it waits for the next sweep', () => {
+    const p = makeProvider(() => 1);
+    expect(peek(p).sweepTimer.hasRef?.()).toBe(false);
   });
+});
 
+describe('ParleyOAuthProvider — expired state is swept, not left to accumulate', () => {
   it('deletes a found-but-expired access token lazily on verifyAccessToken', async () => {
     let clock = 5_000_000;
     const p = makeProvider(() => clock);
@@ -241,20 +315,208 @@ describe('ParleyOAuthProvider — expired state is swept, not left to accumulate
   });
 });
 
-describe('ParleyOAuthProvider — an authorization code is single-use on any failed exchange', () => {
-  it('consumes the code on a redirect_uri-mismatch attempt so a later correct exchange still fails', async () => {
-    const p = makeProvider(() => 2_000_000);
+/**
+ * Every way an exchange can fail once the code's own client is presenting it. The rule is not
+ * "any failure burns the code" — a stranger's failed attempt deliberately does NOT, or anyone who
+ * learned a code could deny the owner the token it stands for — so each row states which it is and
+ * why, and the ONE surviving row is the foreign-client case. The PKCE step is invisible here: the
+ * SDK runs it between challengeForAuthorizationCode and exchangeAuthorizationCode, so remote.test.ts
+ * drives the same table over HTTP where that step is inside the system under test.
+ */
+interface ExchangeFailure {
+  name: string;
+  attempt: (
+    p: ParleyOAuthProvider,
+    code: string,
+    owner: OAuthClientInformationFull,
+  ) => Promise<unknown>;
+  codeSurvives: boolean;
+}
+
+const EXCHANGE_FAILURES: ExchangeFailure[] = [
+  {
+    name: 'a redirect_uri that does not match the one consented to',
+    attempt: (p, code, owner) =>
+      p.exchangeAuthorizationCode(owner, code, undefined, 'https://evil.example/cb'),
+    codeSurvives: false,
+  },
+  {
+    name: 'an absent redirect_uri',
+    attempt: (p, code, owner) => p.exchangeAuthorizationCode(owner, code, undefined, undefined),
+    codeSurvives: false,
+  },
+  {
+    name: 'a resource this AS does not serve',
+    attempt: (p, code, owner) =>
+      p.exchangeAuthorizationCode(owner, code, undefined, REDIRECT, new URL('https://evil.example/mcp')),
+    codeSurvives: false,
+  },
+  {
+    name: 'a foreign client presenting it',
+    attempt: (p, code) =>
+      p.exchangeAuthorizationCode(makeClient('attacker-client'), code, undefined, REDIRECT),
+    codeSurvives: true,
+  },
+];
+
+describe("ParleyOAuthProvider — a failed exchange by the code's own client leaves nothing replayable", () => {
+  it.each(EXCHANGE_FAILURES.map((f) => [f.name, f]))(
+    '%s',
+    async (_name: string, f: ExchangeFailure) => {
+      const p = makeProvider(() => 2_000_000);
+      const client = makeClient();
+      const code = await mintCode(p, client, makeParams());
+
+      await expect(f.attempt(p, code, client)).rejects.toBeInstanceOf(Error);
+
+      const replay = p.exchangeAuthorizationCode(client, code, undefined, REDIRECT);
+      if (f.codeSurvives) {
+        await expect(replay).resolves.toMatchObject({ token_type: 'bearer' });
+      } else {
+        await expect(replay).rejects.toBeInstanceOf(InvalidGrantError);
+      }
+    },
+  );
+
+  it('closes the code once its PKCE challenge has been handed out', async () => {
+    const p = makeProvider(() => 2_100_000);
     const client = makeClient();
     const code = await mintCode(p, client, makeParams());
 
-    await expect(
-      p.exchangeAuthorizationCode(client, code, undefined, 'https://evil.example/cb'),
-    ).rejects.toBeInstanceOf(InvalidGrantError);
-    expect(peek(p).codes.has(code)).toBe(false); // consumed despite the failure
+    await expect(p.challengeForAuthorizationCode(client, code)).resolves.toBe('challenge-abc');
+    // A second hand-out is how a caller would retry after failing the challenge it was given.
+    await expect(p.challengeForAuthorizationCode(client, code)).rejects.toBeInstanceOf(
+      InvalidGrantError,
+    );
+    const tokens = await p.exchangeAuthorizationCode(client, code, undefined, REDIRECT);
+    expect(tokens.access_token).toBeTruthy();
+  });
+});
 
-    await expect(
-      p.exchangeAuthorizationCode(client, code, undefined, REDIRECT),
-    ).rejects.toBeInstanceOf(InvalidGrantError); // replay closed
+/**
+ * Acceptance is not the whole contract: a credential this AS mints is only as good as its own
+ * properties. Nothing else in the suite looks past truthiness, so a minting path shortened to three
+ * random bytes, or one that quietly widens the consented scope set, would leave every other row
+ * green while handing out a token guessable in seconds or one the owner never approved.
+ */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Bits of randomness the value actually carries: a v4 UUID spends 6 of its 128, base64url is raw. */
+function entropyBits(value: string): number {
+  if (UUID_SHAPE.test(value)) return 122;
+  return Buffer.from(value, 'base64url').byteLength * 8;
+}
+
+interface CredentialKindShape {
+  name: string;
+  minBits: number;
+  mint: (p: ParleyOAuthProvider, client: OAuthClientInformationFull) => Promise<string>;
+}
+
+const MINTED_CREDENTIALS: CredentialKindShape[] = [
+  {
+    name: 'an authorization code',
+    minBits: 122,
+    mint: (p, client) => mintCode(p, client, makeParams()),
+  },
+  {
+    name: 'an access token',
+    minBits: 256,
+    mint: async (p, client) => peek(p).issue(client.client_id, ['mcp'], RESOURCE.href).access_token,
+  },
+  {
+    name: 'a refresh token',
+    minBits: 256,
+    mint: async (p, client) => {
+      const rt = peek(p).issue(client.client_id, ['mcp'], RESOURCE.href).refresh_token;
+      if (rt === undefined) throw new Error('missing refresh token');
+      return rt;
+    },
+  },
+];
+
+describe('ParleyOAuthProvider — every credential this AS mints is unguessable', () => {
+  const MINTS = 200;
+
+  it.each(MINTED_CREDENTIALS.map((c) => [c.name, c]))(
+    '%s carries its full width of randomness and never repeats',
+    async (_name: string, c: CredentialKindShape) => {
+      const p = makeProvider(() => 1_100_000);
+      const client = makeClient();
+      peek(p).clients.set(client.client_id, client);
+      const seen = new Set<string>();
+      for (let i = 0; i < MINTS; i++) {
+        const value = await c.mint(p, client);
+        expect(entropyBits(value)).toBeGreaterThanOrEqual(c.minBits);
+        seen.add(value);
+      }
+      expect(seen.size).toBe(MINTS);
+    },
+  );
+});
+
+/**
+ * The scope set on the minted token is what the owner was shown on the consent page. The refresh
+ * path already pins "may narrow, never widen"; the authorization-code path had no scope assertion
+ * at all, so a grant that silently added one would have been invisible.
+ */
+const CONSENTED_SCOPES: string[][] = [[], ['mcp'], ['mcp', 'parley:read']];
+
+describe('ParleyOAuthProvider — a token carries exactly the scopes that were consented to', () => {
+  it.each(CONSENTED_SCOPES.map((s) => [JSON.stringify(s), s]))(
+    'code exchange of a consent for %s grants exactly those',
+    async (_label: string, scopes: string[]) => {
+      const p = makeProvider(() => 1_200_000);
+      const client = makeClient();
+      const code = await mintCode(p, client, makeParams({ scopes }));
+
+      const tokens = await p.exchangeAuthorizationCode(client, code, undefined, REDIRECT);
+      expect(tokens.scope).toBe(scopes.join(' '));
+      const info = await p.verifyAccessToken(tokens.access_token);
+      expect(info.scopes).toEqual(scopes);
+    },
+  );
+
+  it.each(CONSENTED_SCOPES.map((s) => [JSON.stringify(s), s]))(
+    'refresh rotation of a grant for %s grants exactly those',
+    async (_label: string, scopes: string[]) => {
+      const p = makeProvider(() => 1_300_000);
+      const client = makeClient();
+      const rt = peek(p).issue(client.client_id, scopes, RESOURCE.href).refresh_token;
+      if (rt === undefined) throw new Error('missing refresh token');
+
+      const tokens = await p.exchangeRefreshToken(client, rt);
+      expect(tokens.scope).toBe(scopes.join(' '));
+      const info = await p.verifyAccessToken(tokens.access_token);
+      expect(info.scopes).toEqual(scopes);
+    },
+  );
+});
+
+/**
+ * A deployment constraint that exists only in the implementation is one an operator meets as an
+ * outage. Every store here is process-local, which makes the front door single-process and makes a
+ * restart a re-consent; the class doc is where that is stated, so adding a sixth store has to
+ * update it.
+ */
+describe('ParleyOAuthProvider — its process-local stores are documented where they are declared', () => {
+  const source = readFileSync(fileURLToPath(new URL('oauth-provider.ts', import.meta.url)), 'utf8');
+  const classDoc = source.slice(0, source.indexOf('export class ParleyOAuthProvider'));
+  const stores = [...source.matchAll(/private readonly (\w+) = new Map/g)].map((m) => m[1]!);
+
+  it('finds the stores to check', () => {
+    expect(stores.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it.each(stores.map((s) => [s]))('the class doc names %s', (store: string) => {
+    expect(classDoc).toContain(`\`${store}\``);
+  });
+
+  it.each([
+    ['a restart or crash costs the owner a re-consent', /re-?consent/i],
+    ['the process cannot be replicated', /replicat/i],
+  ])('the class doc states that %s', (_label: string, pattern: RegExp) => {
+    expect(classDoc).toMatch(pattern);
   });
 });
 

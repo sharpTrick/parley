@@ -97,6 +97,30 @@ describe('close() releases every timer the factory acquired', () => {
     const leaked = [...created].filter((h) => !cleared.has(h));
     expect(leaked).toEqual([]);
   });
+
+  // A refed interval keeps node alive after close(), so a composition root that shut the bridge down
+  // never exits. Asserting it over the recorder rather than per-loop means a newly added loop behind
+  // any factory inherits the check.
+  it.each(FACTORIES)('%s arms no interval that can hold the process open', async (_name, build) => {
+    const created = new Set<{ hasRef?: () => boolean }>();
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+      ...args: Parameters<typeof setInterval>
+    ) => {
+      const handle = realSetInterval(...args);
+      created.add(handle);
+      return handle;
+    }) as typeof setInterval);
+
+    const server = await build();
+    try {
+      await server.listen(await freePort());
+      expect(created.size).toBeGreaterThan(0);
+      expect([...created].filter((h) => h.hasRef?.() !== false)).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 describe('close() drops the issued OAuth state', () => {

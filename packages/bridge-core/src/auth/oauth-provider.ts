@@ -69,10 +69,17 @@ export interface ParleyOAuthProviderOptions {
  * token requires the OWNER to consent with their secret. The SDK's handlers do PKCE S256
  * verification, DCR, and metadata; this provider supplies the issuing/verifying logic, gates
  * `authorize()` on owner consent, and binds tokens to the `/mcp` resource (RFC 8707 audience).
+ *
+ * Every store below is PROCESS-LOCAL and unpersisted — `clients` (DCR registrations), `codes` and
+ * `redeeming` (authorization codes), `access`, `refresh`, `pending` (consents). Two deployment
+ * constraints follow, and examples/self-host-remote/README.md states both: a restart or crash
+ * invalidates the connector's registration and its tokens, so the owner must re-consent; and the
+ * process cannot be replicated, because a code minted in one replica is unredeemable in another.
  */
 export class ParleyOAuthProvider implements OAuthServerProvider {
   private readonly clients = new Map<string, OAuthClientInformationFull>();
   private readonly codes = new Map<string, CodeRecord>();
+  private readonly redeeming = new Map<string, CodeRecord>();
   private readonly access = new Map<string, AccessRecord>();
   private readonly refresh = new Map<string, RefreshRecord>();
   private readonly pending = new Map<string, PendingConsent>();
@@ -91,6 +98,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     const nowMs = this.now();
     const nowSec = nowMs / 1000;
     for (const [k, r] of this.codes) if (r.expiresAtMs < nowMs) this.codes.delete(k);
+    for (const [k, r] of this.redeeming) if (r.expiresAtMs < nowMs) this.redeeming.delete(k);
     for (const [k, r] of this.refresh) if (r.expiresAtMs < nowMs) this.refresh.delete(k);
     for (const [k, r] of this.pending) if (r.expiresAtMs < nowMs) this.pending.delete(k);
     for (const [k, r] of this.access) if (r.expiresAt < nowSec) this.access.delete(k);
@@ -100,6 +108,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
   stop(): void {
     clearInterval(this.sweepTimer);
     this.codes.clear();
+    this.redeeming.clear();
     this.access.clear();
     this.refresh.clear();
     this.pending.clear();
@@ -200,12 +209,16 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): Promise<string> {
     const rec = this.codes.get(authorizationCode);
-    // Do not delete a valid code here, so that the SDK's PKCE check (which runs between this
-    // read-only call and exchangeAuthorizationCode) still has one to redeem.
     if (rec !== undefined && rec.expiresAtMs < this.now()) this.codes.delete(authorizationCode);
     if (rec === undefined || rec.clientId !== client.client_id || rec.expiresAtMs < this.now()) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
+    // Move the code out of `codes` before handing the challenge over, so that the SDK's PKCE check
+    // — which runs between this call and exchangeAuthorizationCode, out of this class's reach — can
+    // fail without leaving a code a second attempt could redeem. Only exchange reads `redeeming`,
+    // and a foreign client is refused above, so a stranger still cannot burn someone else's code.
+    this.codes.delete(authorizationCode);
+    this.redeeming.set(authorizationCode, rec);
     return rec.codeChallenge;
   }
 
@@ -216,14 +229,14 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     redirectUri?: string,
     resource?: URL,
   ): Promise<OAuthTokens> {
-    const rec = this.codes.get(authorizationCode);
+    const rec = this.codes.get(authorizationCode) ?? this.redeeming.get(authorizationCode);
     // Evict only on expiry, so that a foreign client presenting someone else's code cannot burn it.
-    if (rec !== undefined && rec.expiresAtMs < this.now()) this.codes.delete(authorizationCode);
+    if (rec !== undefined && rec.expiresAtMs < this.now()) this.forgetCode(authorizationCode);
     if (rec === undefined || rec.clientId !== client.client_id || rec.expiresAtMs < this.now()) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
     // Consume before every remaining check, so that a failed exchange leaves nothing replayable.
-    this.codes.delete(authorizationCode);
+    this.forgetCode(authorizationCode);
     if (redirectUri !== rec.redirectUri) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
@@ -283,6 +296,11 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     const rec = this.access.get(request.token) ?? this.refresh.get(request.token);
     if (rec === undefined || rec.clientId !== client.client_id) return;
     this.revokeGrant(rec.grantId);
+  }
+
+  private forgetCode(code: string): void {
+    this.codes.delete(code);
+    this.redeeming.delete(code);
   }
 
   private revokeGrant(grantId: string): void {

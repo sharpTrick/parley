@@ -10,7 +10,8 @@ import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
-import { assertPublicBaseUrl } from './invariants.js';
+import { hardenErrorSurface } from './error-surface.js';
+import { assertPublicBaseUrl, canonicalResourceId } from './invariants.js';
 
 export interface OAuthRemoteOptions {
   /** Public origin = issuer = base URL (AS = RS, single tenant). HTTPS in production; localhost ok in dev. */
@@ -55,7 +56,7 @@ export function createOAuthRemoteApp(
 ): OAuthRemoteServer {
   const mcpPath = oauth.mcpPath ?? '/mcp';
   assertPublicBaseUrl(oauth.issuerUrl, 'issuerUrl');
-  const resource = new URL(mcpPath, oauth.issuerUrl); // canonical resource id (no trailing slash)
+  const resource = canonicalResourceId(oauth.issuerUrl, mcpPath, 'mcpPath');
 
   const provider = new ParleyOAuthProvider({
     resource,
@@ -128,6 +129,8 @@ export function createOAuthRemoteApp(
       });
     },
   });
+
+  hardenErrorSurface(remote.app);
 
   const closeHttp = remote.close.bind(remote);
   return Object.assign(remote, {

@@ -69,6 +69,15 @@ of proxy hops if the terminator is remote. Leave it **unset** when the process i
 directly — then the socket peer really is the client, and trusting a caller-supplied
 `X-Forwarded-For` would let anyone mint a fresh quota per request.
 
+**Single process only, and a restart requires re-consent.** All OAuth state — the dynamic client
+registration Claude created, authorization codes, access tokens, refresh tokens and pending consents
+— lives in memory in this one process. Nothing is persisted, so a restart, crash or redeploy
+invalidates Claude's registration and both of its tokens: reconnect and enter your owner passphrase
+again. Nothing surfaces an error explaining why, so expect it. For the same reason the process
+**cannot be replicated** — pointing the reverse proxy at two instances gives a flow that fails at
+`/token` with `invalid_grant` roughly half the time, because the code was minted by one instance and
+redeemed against the other. Give the one process more room rather than adding replicas.
+
 The server exposes (all under your public origin):
 - `POST /mcp` — the MCP endpoint (Bearer-protected, Streamable HTTP, stateless).
 - `/.well-known/oauth-protected-resource/mcp` — Protected Resource Metadata (RFC 9728).

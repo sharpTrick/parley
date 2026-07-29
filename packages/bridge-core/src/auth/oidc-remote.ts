@@ -9,7 +9,13 @@ import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { fetchOidcDiscovery } from './oidc-discovery.js';
 import { OidcTokenVerifier } from './oidc-verifier.js';
-import { assertIdentityGate, assertPublicBaseUrl } from './invariants.js';
+import { hardenErrorSurface } from './error-surface.js';
+import {
+  assertIdentityGate,
+  assertPublicBaseUrl,
+  assertTrustRootUrl,
+  canonicalResourceId,
+} from './invariants.js';
 
 export interface OidcRemoteOptions {
   /** Public base URL of THIS resource server (what Claude reaches) — NOT the OAuth issuer;
@@ -50,12 +56,14 @@ export async function createOidcRemoteApp(
 ): Promise<OidcRemoteServer> {
   const mcpPath = opts.mcpPath ?? '/mcp';
   assertPublicBaseUrl(opts.publicUrl, 'publicUrl');
-  const resource = new URL(mcpPath, opts.publicUrl); // canonical resource id (no trailing slash)
+  const resource = canonicalResourceId(opts.publicUrl, mcpPath, 'mcpPath');
   const oidc = opts.oidc;
   assertIdentityGate(oidc);
+  assertTrustRootUrl(oidc.issuer, 'auth.oidc.issuer');
 
   const metadata = await fetchOidcDiscovery(oidc.issuer, opts.fetchFn ?? fetch);
   const jwksUri = oidc.jwks_uri ?? metadata.jwks_uri;
+  assertTrustRootUrl(jwksUri, oidc.jwks_uri === undefined ? 'the discovered jwks_uri' : 'auth.oidc.jwks_uri');
   if (oidc.jwks_uri === undefined) {
     // Defense-in-depth: a discovery-supplied JWKS must share the issuer's origin. An explicit
     // `auth.oidc.jwks_uri` config override is the trusted pin (e.g. a CDN-hosted JWKS).
@@ -108,6 +116,8 @@ export async function createOidcRemoteApp(
       );
     },
   });
+
+  hardenErrorSurface(remote.app);
 
   return Object.assign(remote, {
     verifier,

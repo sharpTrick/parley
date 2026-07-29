@@ -57,6 +57,20 @@ export const ACCEPTED_SIGNING_ALGORITHMS = [
  */
 const NON_ACCESS_TOKEN_TYPES = new Set(['id', 'refresh', 'logout', 'serialized-id']);
 
+/**
+ * `typ` values that positively identify a bearer access token: Keycloak's `Bearer` claim and
+ * RFC 9068's media type. A token that declares one of these is not an ID token whatever else it
+ * carries, so the claim-shape heuristic below must not overrule it.
+ */
+const ACCESS_TOKEN_TYPES = new Set(['bearer', 'at+jwt', 'application/at+jwt']);
+
+/**
+ * Claims OIDC Core defines only for an ID token: `nonce` is echoed from the authentication request,
+ * and `at_hash`/`c_hash` are digests of the access token and code the ID token was issued beside.
+ * They are how a `typ`-less IdP still gives an ID token away.
+ */
+const ID_TOKEN_ONLY_CLAIMS = ['nonce', 'at_hash', 'c_hash'];
+
 /** Keycloak-style realm-roles claim. */
 interface RealmAccessClaim {
   roles?: unknown;
@@ -154,12 +168,12 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
 }
 
 function isAccessToken(header: JWTHeaderParameters, payload: JWTPayload): boolean {
-  for (const typ of [header.typ, payload.typ]) {
-    if (typeof typ === 'string' && NON_ACCESS_TOKEN_TYPES.has(typ.toLowerCase())) return false;
-  }
-  // `nonce` is an ID-token claim echoed from the authentication request; an IdP that does not
-  // stamp `typ` still gives an ID token away this way.
-  return payload.nonce === undefined;
+  const declared = [header.typ, payload.typ]
+    .filter((typ): typ is string => typeof typ === 'string')
+    .map((typ) => typ.toLowerCase());
+  if (declared.some((typ) => NON_ACCESS_TOKEN_TYPES.has(typ))) return false;
+  if (declared.some((typ) => ACCESS_TOKEN_TYPES.has(typ))) return true;
+  return ID_TOKEN_ONLY_CLAIMS.every((claim) => payload[claim] === undefined);
 }
 
 function asUrl(s: string): URL | undefined {

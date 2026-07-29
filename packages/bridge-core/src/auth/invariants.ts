@@ -53,6 +53,70 @@ export function assertPublicBaseUrl(url: URL, field: string): void {
 }
 
 /**
+ * The other operand of the resource identifier. `new URL(mcpPath, base)` will happily accept an
+ * authority (`//host`, `/\host`), a scheme, or a query/fragment and hand back something that is not
+ * a path on this origin at all: the advertised resource, the audience every token is minted with,
+ * and the route the app actually serves then disagree, which is a permanent 404 behind a consent
+ * the owner already gave. A trailing slash names a different resource than the bare path.
+ */
+export function canonicalResourceId(base: URL, mcpPath: string, field: string): URL {
+  if (!mcpPath.startsWith('/')) {
+    throw new Error(
+      `${field} must be an absolute path beginning with "/" (got "${mcpPath}"). It is resolved ` +
+        `against the public base URL to form the advertised resource identifier.`,
+    );
+  }
+  if (mcpPath === '/') {
+    throw new Error(
+      `${field} must name a path (got "${mcpPath}"). Parley serves its OAuth endpoints at the ` +
+        `root of this origin, so the MCP endpoint cannot also live there.`,
+    );
+  }
+  if (mcpPath.endsWith('/')) {
+    throw new Error(
+      `${field} must not end in "/" (got "${mcpPath}"). A trailing slash names a different ` +
+        `resource than the bare path, and every token would carry that other audience.`,
+    );
+  }
+  const resource = new URL(mcpPath, base);
+  if (
+    resource.origin !== base.origin ||
+    resource.pathname !== mcpPath ||
+    resource.search !== '' ||
+    resource.hash !== ''
+  ) {
+    throw new Error(
+      `${field} must be a plain path on the ${base.origin} origin (got "${mcpPath}", which ` +
+        `resolves to "${resource.href}"). Anything else advertises a resource identifier this ` +
+        `server does not serve, so every token is minted for an endpoint that answers 404.`,
+    );
+  }
+  return resource;
+}
+
+/**
+ * A URL the auth layer will fetch a trust root from — the issuer's discovery document, or the JWKS
+ * every delegated-mode token is verified against. Over plaintext HTTP anyone on the path serves
+ * their own keys and forges a token that satisfies every other check, so the transport invariant
+ * belongs on each of them, not only on the issuer.
+ */
+export function assertTrustRootUrl(url: string, field: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${field} must be an absolute URL (got "${url}").`);
+  }
+  if (parsed.protocol !== 'https:' && !LOOPBACK_HOSTS.has(parsed.hostname)) {
+    throw new Error(
+      `${field} must use https outside loopback (got "${url}"). Parley fetches token ` +
+        `verification material from this URL, so anyone on the path can otherwise substitute ` +
+        `their own keys and mint tokens this server accepts.`,
+    );
+  }
+}
+
+/**
  * Delegated OIDC has no owner-consent step, so an identity gate is the only thing standing between
  * a shared realm and full bridge access for every user in it. `required_scope` does not count —
  * Claude's connector may request no scopes at all.

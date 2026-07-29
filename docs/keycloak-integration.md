@@ -163,6 +163,10 @@ auth:
 
     # Rarely needed:
     # jwks_uri: "https://kc.example.com/realms/myrealm/protocol/openid-connect/certs"
+    #   Overrides discovery AND its issuer-origin check, so it is a trust pin. It must be
+    #   https (loopback excepted, for dev fakes) or startup is refused: these are the keys
+    #   every token is verified against, and over http anyone on the path can substitute
+    #   their own and mint a token that passes iss, aud, exp and the identity gate.
     # clock_skew_s: 30                   # exp/nbf tolerance, 0–300
 ```
 

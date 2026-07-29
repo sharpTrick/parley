@@ -83,33 +83,69 @@ function verifier(): OidcTokenVerifier {
 }
 
 /**
- * Every shape an IdP hands out under the same signature, issuer and audience. Only a bearer access
- * token may authorize this resource; an ID token in particular is a client-side login receipt that
- * a deployment pinning `audience` to its connector's client_id would otherwise accept.
+ * Which combination of signals identifies an ID token, stated cell by cell rather than derived —
+ * the whole question this predicate answers. `typ` is the normative discriminator for every IdP the
+ * README names, so a declared kind decides on its own and the claim-shape signals only speak when no
+ * `typ` was stamped at all. That ordering matters both ways: `nonce` is NOT forbidden in an access
+ * token (RFC 9068 says nothing about it, and Keycloak put it there for authorization-code flows
+ * until v25), so treating it as decisive over a `typ: Bearer` token is a permanent 401 against a
+ * real IdP; while for a typ-less IdP it, `at_hash` and `c_hash` are the only thing separating a
+ * login receipt from authorization to act on this resource.
  */
-const TOKEN_KINDS: Array<[string, Record<string, unknown>, Record<string, unknown>, boolean]> = [
-  ['access token (Keycloak typ claim)', { typ: 'Bearer' }, {}, true],
-  ['access token (no typ at all)', {}, {}, true],
-  ['access token (generic JWT header typ)', { typ: 'Bearer' }, { typ: 'JWT' }, true],
-  ['ID token (typ claim, as Keycloak stamps it)', { typ: 'ID' }, {}, false],
-  ['ID token (lower-case typ claim)', { typ: 'id' }, {}, false],
-  ['ID token (typ in the JOSE header)', {}, { typ: 'ID' }, false],
-  ['ID token identified only by its nonce', { nonce: 'n-0S6_WzA2Mj' }, {}, false],
-  ['refresh token', { typ: 'Refresh' }, {}, false],
-  ['logout token', { typ: 'Logout' }, {}, false],
-  ['serialized ID token', { typ: 'Serialized-ID' }, {}, false],
+const NONCE = { nonce: 'n-0S6_WzA2Mj' };
+const AT_HASH = { at_hash: 'kQ5-ByE0nbnI0Vh9GJP7BA' };
+
+const TYP_VALUES: Array<[string, Record<string, unknown>]> = [
+  ['no typ at all', {}],
+  ['typ Bearer', { typ: 'Bearer' }],
+  ['typ ID', { typ: 'ID' }],
+  ['typ Refresh', { typ: 'Refresh' }],
+];
+
+/** accepted[typ index] for each (nonce, at_hash) combination. */
+const KIND_MATRIX: Array<[string, Record<string, unknown>, boolean[]]> = [
+  ['neither nonce nor at_hash', {}, [true, true, false, false]],
+  ['a nonce', NONCE, [false, true, false, false]],
+  ['an at_hash', AT_HASH, [false, true, false, false]],
+  ['both nonce and at_hash', { ...NONCE, ...AT_HASH }, [false, true, false, false]],
+];
+
+const MATRIX_ROWS = KIND_MATRIX.flatMap(([shapeLabel, shape, verdicts]) =>
+  TYP_VALUES.map(
+    ([typLabel, typClaims], i): [string, Record<string, unknown>, Record<string, unknown>, boolean] => [
+      `${typLabel} carrying ${shapeLabel}`,
+      { ...typClaims, ...shape },
+      {},
+      verdicts[i]!,
+    ],
+  ),
+);
+
+/** Vocabulary the matrix does not vary: casing, the JOSE-header position, and Keycloak's other kinds. */
+const KIND_VOCABULARY: Array<[string, Record<string, unknown>, Record<string, unknown>, boolean]> = [
+  ['a lower-case typ claim is still an ID token', { typ: 'id' }, {}, false],
+  ['a typ in the JOSE header is read too', {}, { typ: 'ID' }, false],
+  ['the generic JWT header typ does not overrule the Bearer claim', { typ: 'Bearer' }, { typ: 'JWT' }, true],
+  ['a deny-listed claim typ overrules a generic header typ', { typ: 'ID' }, { typ: 'JWT' }, false],
+  ['an RFC 9068 header typ is a positive access-token signal', { ...NONCE }, { typ: 'at+jwt' }, true],
+  ['a logout token', { typ: 'Logout' }, {}, false],
+  ['a serialized ID token', { typ: 'Serialized-ID' }, {}, false],
+  ['a typ-less token carrying only a c_hash', { c_hash: 'LDktKdoQak3Pk0cnXxCltA' }, {}, false],
 ];
 
 describe('OidcTokenVerifier — only an access token is an access token', () => {
-  it.each(TOKEN_KINDS)('%s', async (_label, claims, header, accepted) => {
-    const token = await mint('RS256', claims, header);
-    const result = verifier().verifyAccessToken(token);
-    if (accepted) {
-      await expect(result).resolves.toBeTruthy();
-    } else {
-      await expect(result).rejects.toBeInstanceOf(InvalidTokenError);
-    }
-  });
+  it.each([...MATRIX_ROWS, ...KIND_VOCABULARY])(
+    '%s',
+    async (_label, claims, header, accepted) => {
+      const token = await mint('RS256', claims, header);
+      const result = verifier().verifyAccessToken(token);
+      if (accepted) {
+        await expect(result).resolves.toBeTruthy();
+      } else {
+        await expect(result).rejects.toBeInstanceOf(InvalidTokenError);
+      }
+    },
+  );
 });
 
 describe('OidcTokenVerifier — signing-algorithm policy', () => {
