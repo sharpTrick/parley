@@ -13,10 +13,16 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay } from '@sharptrick/parley-net-util';
 import { createClient } from 'redis';
 
 type RedisClient = ReturnType<typeof createClient>;
+
+const DEFAULT_URL = 'redis://127.0.0.1:6379';
+const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
+/** A Redis Stream entry id — `<ms>` or `<ms>-<seq>`. Cursors and backendMsgIds are exactly this. */
+const CURSOR_PATTERN = /^\d+(-\d+)?$/;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Plugin-specific backend_config. */
 export interface RedisBackendConfig {
@@ -26,13 +32,137 @@ export interface RedisBackendConfig {
   key_prefix?: string;
   /** XREAD BLOCK timeout (ms) — the loop re-checks for shutdown each interval. Default 2000. */
   block_ms?: number;
+  /** How long the FIRST handshake may take before `connect()` rejects (ms). Default 5000. */
+  connect_timeout_ms?: number;
   /**
    * Optional retention window in days: entries older than this are (approximately) trimmed on
-   * every `post` via `XADD`'s own `MINID` trim option — no separate job or connection. Omit for
-   * the default — keep every entry forever. A topic with no new posts isn't trimmed until its
-   * next post (trimming is opportunistic, tied to write activity, not a background timer).
+   * every `post` via `XADD`'s own `MINID` trim option — no separate job or connection. Omit (or
+   * `null`) for the default — keep every entry forever; there is no "trim everything" mode. A
+   * topic with no new posts isn't trimmed until its next post (trimming is opportunistic, tied to
+   * write activity, not a background timer).
    */
-  retention_days?: number;
+  retention_days?: number | null;
+}
+
+/**
+ * The connection every parley-redis socket is built from — the command client, the
+ * `subscribe`/long-poll readers, and any test probe. Exported so a harness cannot be configured
+ * more defensively than the code under test.
+ *
+ * Keep the pre-`ready` `Error` return, so that `connect()` REJECTS against an unreachable or wrong
+ * endpoint; node-redis' default strategy retries forever and leaves `connect()` pending for the
+ * life of the process. After the first handshake the same strategy switches to bounded backoff, so
+ * a connection that was live still rides out an outage.
+ *
+ * Keep `disableOfflineQueue`, so that commands issued while disconnected REJECT instead of being
+ * queued for the length of the outage — a `parley_post` tool call must fail, not hang unbounded.
+ */
+export function createRedisClient(url: string, connectTimeoutMs: number): RedisClient {
+  let handshakeComplete = false;
+  const client = createClient({
+    url,
+    disableOfflineQueue: true,
+    socket: {
+      connectTimeout: connectTimeoutMs,
+      reconnectStrategy: (retries: number) =>
+        handshakeComplete
+          ? Math.min(50 * 2 ** retries, 2000)
+          : new Error(unreachable(url, connectTimeoutMs)),
+    },
+  });
+  client.on('ready', () => {
+    handshakeComplete = true;
+  });
+  client.on('error', () => {
+    /* the offline queue is disabled, so faults surface as command rejections; don't crash */
+  });
+  return client;
+}
+
+/**
+ * The one message every failed-to-come-up path reports, so which watchdog fired first — the
+ * socket's `connectTimeout`, the reconnect strategy, or the whole-handshake deadline — is not
+ * observable to a caller who only needs to know the endpoint is unusable.
+ */
+function unreachable(url: string, connectTimeoutMs: number): string {
+  return `parley-redis: cannot reach ${endpointOf(url)} (connect_timeout_ms=${connectTimeoutMs})`;
+}
+
+/**
+ * Bound a handshake END TO END, so that an endpoint which completes the TCP connection and then
+ * never speaks Redis (a hung server, a load balancer in front of a dead backend, a non-Redis port)
+ * cannot leave the bridge pending forever: node-redis' `connectTimeout` covers socket
+ * establishment only, so the protocol handshake after it has no watchdog of its own.
+ */
+async function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** `host:port` of a connection URL — never the password, which must not reach a log line. */
+function endpointOf(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.hostname}:${u.port === '' ? '6379' : u.port}`;
+  } catch {
+    return '<unparseable url>';
+  }
+}
+
+/**
+ * `retention_days` is multiplied into a destructive `XADD MINID` threshold, so every unusable
+ * value must be rejected at `connect()` rather than coerced: `0`/negative silently delete history
+ * (or every entry, forever, as it lands), a value past the epoch makes the threshold negative so
+ * every `post` throws, and a string/NaN produces an invalid stream id. `null` means "omitted",
+ * matching how DESIGN §11 spells an unset config value.
+ */
+function normalizeRetentionDays(value: number | null | undefined): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const maxDays = Math.floor(Date.now() / 86_400_000);
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > maxDays) {
+    throw new Error(
+      `parley-redis: retention_days must be a positive number of days no greater than ${maxDays} ` +
+        `(got ${JSON.stringify(value)}); omit it (or set null) to keep every entry forever`,
+    );
+  }
+  return value;
+}
+
+/**
+ * The last id a stream generated, or `'0'` when the stream does not exist.
+ *
+ * Keep the `EXISTS` probes, so that "no history yet" is decided by server STATE and never by
+ * matching `XINFO STREAM`'s `ERR no such key` wording: a Redis-compatible server, proxy or future
+ * release that words it differently would turn an empty stream into a hard failure, and any
+ * unrelated error whose text happens to contain that phrase would turn a real fault into a
+ * from-the-beginning replay of the whole retained history as live push (BUG-11).
+ */
+async function streamTail(client: RedisClient, key: string): Promise<string> {
+  if ((await client.exists(key)) === 0) return '0';
+  try {
+    return (await client.xInfoStream(key)).lastGeneratedId;
+  } catch (err) {
+    if ((await client.exists(key)) === 0) return '0'; // deleted in the EXISTS → XINFO gap
+    throw err;
+  }
+}
+
+/** Order two stream ids; a bare `<ms>` cursor has an implicit sequence of 0, as Redis reads it. */
+function compareIds(a: string, b: string): number {
+  const [aMs = '0', aSeq = '0'] = a.split('-');
+  const [bMs = '0', bSeq = '0'] = b.split('-');
+  if (BigInt(aMs) !== BigInt(bMs)) return BigInt(aMs) < BigInt(bMs) ? -1 : 1;
+  if (BigInt(aSeq) === BigInt(bSeq)) return 0;
+  return BigInt(aSeq) < BigInt(bSeq) ? -1 : 1;
 }
 
 /**
@@ -47,6 +177,8 @@ export class RedisPlugin implements BackendPlugin {
   private prefix = 'parley:';
   private blockMs = 2000;
   private retentionDays?: number;
+  private url = DEFAULT_URL;
+  private connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
   /**
    * Per-connect generation token. Bumped on every `connect()`/`disconnect()`; each `subscribe()`
    * captures the current value and gates its read loop on `gen === this.generation`. Because it
@@ -58,15 +190,27 @@ export class RedisPlugin implements BackendPlugin {
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as RedisBackendConfig;
+    const retentionDays = normalizeRetentionDays(cfg.retention_days);
+    // Tear the previous connection down first, so that a re-connect — which the generation token
+    // explicitly advertises as safe — cannot orphan a live socket per call until Redis hits
+    // maxclients. This also re-baselines the generation, so no prior loop can be revived.
+    await this.disconnect();
     this.prefix = cfg.key_prefix ?? 'parley:';
     this.blockMs = cfg.block_ms ?? 2000;
-    this.retentionDays = cfg.retention_days;
-    this.generation++; // re-baseline the generation so a fresh connect can't revive a prior loop
-    const client = createClient({ url: cfg.url ?? 'redis://127.0.0.1:6379' });
-    client.on('error', () => {
-      /* transient connection errors surface via command rejections; don't crash the process */
-    });
-    await client.connect();
+    this.retentionDays = retentionDays;
+    this.url = cfg.url ?? DEFAULT_URL;
+    this.connectTimeoutMs = cfg.connect_timeout_ms ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    const client = createRedisClient(this.url, this.connectTimeoutMs);
+    try {
+      await withDeadline(
+        client.connect(),
+        this.connectTimeoutMs,
+        unreachable(this.url, this.connectTimeoutMs),
+      );
+    } catch (err) {
+      await client.disconnect().catch(() => undefined);
+      throw err;
+    }
     this.client = client;
   }
 
@@ -112,13 +256,37 @@ export class RedisPlugin implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const key = this.key(args.topic);
     const limit = args.limit ?? 100;
+    // Validate the opaque cursor at the seam. A cursor this backend mints is a stream entry id
+    // (`<ms>[-<seq>]`); anything else — another backend's cursor, or '' / '$' / a truncated id via
+    // mis-namespaced read-state — would otherwise reach XRANGE as a raw `ERR Invalid stream ID`
+    // naming neither backend nor topic. Throw labelled so core can drop it and refetch the window.
+    if (args.since !== undefined && !CURSOR_PATTERN.test(args.since)) {
+      throw new Error(
+        `parley-redis: malformed cursor '${args.since}' for topic ${args.topic} — ` +
+          `expected a Redis Stream entry id ('<ms>' or '<ms>-<seq>') minted by this backend`,
+      );
+    }
+    let since: string | undefined = args.since;
     let entries: Array<{ id: string; message: Record<string, string> }>;
-    if (args.since === undefined) {
+    if (since === undefined) {
       // Default window: the most recent `limit` entries, returned ascending by cursor.
       entries = (await this.require().xRevRange(key, '+', '-', { COUNT: limit })).reverse();
     } else {
       // Exclusive: strictly after `since`, ascending. `(` makes XRANGE start exclusive.
-      entries = await this.require().xRange(key, `(${args.since}`, '+', { COUNT: limit });
+      entries = await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
+      // A well-formed but STALE cursor — minted against a different Redis, a re-created dataset, or
+      // by a peer whose clock ran ahead, so it sorts past this stream's last generated id — is
+      // treated exactly like `since === undefined` for both the query AND the returned cursor, so
+      // that on-start catch-up SELF-HEALS. Echoing the dead cursor back instead wedges this topic
+      // forever: every later fetch returns the same empty page, with no error to retry and no
+      // signal to distinguish it from "nothing new". Checked only once XRANGE came back empty — a
+      // non-empty page already proves the cursor is live, so the common path costs no round trip.
+      if (entries.length === 0 && (await this.isStaleCursor(key, since))) {
+        since = undefined;
+        entries = (await this.require().xRevRange(key, '+', '-', { COUNT: limit })).reverse();
+      }
+    }
+    if (since !== undefined && entries.length === 0) {
       // Native long-poll (issue #20): the canonical XRANGE was empty and the caller granted a
       // budget → wait up to `blockMs` for entries strictly after `since`. XREAD BLOCK is itself
       // the bounded wait, and a Stream entry id IS the cursor, so `XREAD ... STREAMS key <since>`
@@ -128,14 +296,29 @@ export class RedisPlugin implements BackendPlugin {
       // passes `> 0` yet floors to 0 — and `XREAD BLOCK 0` blocks FOREVER. Flooring first makes
       // such budgets correctly degrade to "return immediately, empty" (core polls the remainder).
       const block = Math.floor(args.blockMs ?? 0);
-      if (entries.length === 0 && block > 0) {
-        entries = await this.blockingRead(key, args.since, block, limit);
+      if (block > 0) {
+        entries = await this.blockingRead(key, since, block, limit);
       }
     }
     const messages = entries.map((e) => rowToMessage(args.topic, e.id, e.message));
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor('0-0'));
+    const nextCursor = last !== undefined ? last.cursor : asCursor(since ?? '0-0');
     return { messages, nextCursor };
+  }
+
+  /**
+   * True if a validated cursor sorts strictly past this stream's last generated id — i.e. it
+   * names an entry this stream has never minted, so it came from a different Redis, a re-created
+   * dataset, or a clock-skewed peer.
+   */
+  private async isStaleCursor(key: string, since: string): Promise<boolean> {
+    return compareIds(since, await this.lastGeneratedId(key)) > 0;
+  }
+
+  /** The stream's last generated id, or `0-0` when the stream does not exist yet. */
+  private async lastGeneratedId(key: string): Promise<string> {
+    const tail = await streamTail(this.require(), key);
+    return tail === '0' ? '0-0' : tail;
   }
 
   /**
@@ -161,13 +344,12 @@ export class RedisPlugin implements BackendPlugin {
     // Redis regardless of caller. The XRANGE path already returned the immediate answer ([]).
     if (blockMs <= 0) return [];
     const gen = this.generation;
-    const reader = this.require().duplicate();
-    reader.on('error', () => undefined);
+    const reader = this.newReader();
     // Register BEFORE connecting so a disconnect() racing this window can always find and close the
     // reader (mirrors the subscribe() pattern); registering after connect leaks a fresh duplicate.
     this.readers.push(reader);
     try {
-      await reader.connect();
+      await this.connectReader(reader);
       if (gen !== this.generation) return []; // disconnect() won the race during connect()
       // `id: since` (a concrete cursor, not '$') means XREAD returns everything strictly after
       // `since` — including an entry that landed in the XRANGE→XREAD gap — with no missed-message
@@ -188,20 +370,19 @@ export class RedisPlugin implements BackendPlugin {
 
   /**
    * Live path = an `XREAD BLOCK` loop on a dedicated connection (DESIGN §9 — genuine events, not a
-   * poll timer). Starts at `$` (new entries only; history is owned by catch-up). `disconnect()`
-   * tears the reader down, which breaks the blocking read.
+   * poll timer). Starts at the stream tail (new entries only; history is owned by catch-up).
+   * `disconnect()` tears the reader down, which breaks the blocking read.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     // Capture the generation this subscribe belongs to; every continuation below is gated on it
     // still being current, so a disconnect()/reconnect that ran meanwhile tears this loop down.
     const gen = this.generation;
-    const reader = this.require().duplicate();
-    reader.on('error', () => undefined);
+    const reader = this.newReader();
     // Register BEFORE connecting so a disconnect() racing this window can always find and close
     // the reader (BUG-37); registering after connect leaks a freshly-connected duplicate.
     this.readers.push(reader);
     try {
-      await reader.connect();
+      await this.connectReader(reader);
     } catch (err) {
       this.dropReader(reader);
       await reader.disconnect().catch(() => undefined);
@@ -222,27 +403,16 @@ export class RedisPlugin implements BackendPlugin {
     // returns without awaiting that read (`void loop()` below). A message added in that window
     // gets an id below the resolved '$' and is dropped forever. A concrete id has no such gap —
     // XREAD returns everything strictly after it, including messages added during startup.
-    let lastId = '0';
+    let lastId: string;
     try {
-      lastId = (await reader.xInfoStream(key)).lastGeneratedId;
+      lastId = await streamTail(reader, key);
     } catch (err) {
-      if (gen !== this.generation) {
-        // disconnect() raced in during the probe; it already tore the registered reader down.
-        this.dropReader(reader);
-        await reader.disconnect().catch(() => undefined);
-        return;
-      }
-      // Only a genuinely missing stream means "no history to skip" (node-redis surfaces
-      // `ERR no such key` for XINFO STREAM on a non-existent key). Any OTHER failure (socket drop,
-      // LOADING during a restart, READONLY after failover, NOPERM on XINFO) must NOT be seeded as
-      // '0' — that would XREAD from the start and replay the whole retained history as live
-      // <channel> push (BUG-11). Surface it so core observes the failure instead of flooding.
-      if (!/no such key/i.test(String((err as Error)?.message ?? err))) {
-        this.dropReader(reader);
-        await reader.disconnect().catch(() => undefined);
-        throw err;
-      }
-      // stream doesn't exist yet → '0' delivers everything from here on
+      this.dropReader(reader);
+      await reader.disconnect().catch(() => undefined);
+      // A disconnect() racing the probe already tore the registered reader down; that is a
+      // superseded subscription, not a fault to surface.
+      if (gen !== this.generation) return;
+      throw err;
     }
 
     const loop = async (): Promise<void> => {
@@ -280,6 +450,24 @@ export class RedisPlugin implements BackendPlugin {
 
   private key(topic: Topic): string {
     return `${this.prefix}${topic}`;
+  }
+
+  /**
+   * A dedicated connection for a blocking read. Built from the same fail-fast options as the
+   * command client rather than `duplicate()`d from it, so that a reader opened while Redis is
+   * unreachable rejects instead of retrying forever and hanging `subscribe()`.
+   */
+  private newReader(): RedisClient {
+    this.require();
+    return createRedisClient(this.url, this.connectTimeoutMs);
+  }
+
+  private async connectReader(reader: RedisClient): Promise<void> {
+    await withDeadline(
+      reader.connect(),
+      this.connectTimeoutMs,
+      unreachable(this.url, this.connectTimeoutMs),
+    );
   }
 
   /** Remove a specific reader from the registry (used when a subscribe tears its own reader down). */

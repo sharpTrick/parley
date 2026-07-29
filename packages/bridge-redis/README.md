@@ -32,8 +32,37 @@ backend_config:
   url: "redis://127.0.0.1:6379"   # default
   key_prefix: "parley:"            # default
   block_ms: 2000                   # XREAD BLOCK timeout (shutdown re-check interval)
-  retention_days: 30               # optional; omit to keep every entry forever (the default)
+  connect_timeout_ms: 5000         # how long the first handshake may take before connect() fails
+  retention_days: 30               # optional; omit (or null) to keep every entry forever (default)
 ```
+
+`retention_days` must be a positive number of days. `0`, a negative value, `NaN`, a quoted string
+and a value large enough to reach past the epoch are all rejected by `connect()` with an error
+naming the key — none of them mean "keep everything", and several of them silently delete history.
+Omit the key (or set it to `null`) for the default: keep every entry forever. There is no
+"trim everything" mode.
+
+An unreachable or wrong `url` makes `connect()` fail within `connect_timeout_ms` with
+`parley-redis: cannot reach <host>:<port>` on stderr — it never hangs waiting for a server that
+isn't there. While Redis is down, `post`/`fetchRecent` reject rather than queueing for the length
+of the outage; the client reconnects on its own once the server is back.
+
+## Credentials & exposure
+
+Redis has **no authentication by default** and its wire protocol is plaintext. An exposed parley
+Redis lets anyone read every topic's full history (agent context, hand-offs) and `XADD` forged
+messages under any `sender` — which the bridge then feeds into a live Claude Code session.
+
+- Bind published ports to loopback (`-p 127.0.0.1:6379:6379`). Docker's port publishing writes its
+  own iptables rules, so a bare `-p 6379:6379` is reachable from the network **even behind a host
+  firewall**.
+- Always set a password (`--requirepass`) and pass it in the URL:
+  `url: "redis://:${REDIS_PASSWORD}@127.0.0.1:6379"`. Keep the value in `.env` / your secret
+  store — never in a committed config file.
+- Use `rediss://` (TLS) whenever the server is not on localhost; the URL carries the password in
+  cleartext otherwise.
+- For the remote/chat deployment (DESIGN §10), reach the server over a private network, a
+  WireGuard/Tailscale link or an SSH tunnel. Do not publish 6379 to the internet.
 
 ## Retention (optional)
 
@@ -74,16 +103,19 @@ Runnable multi-config examples (two Code sessions + a remote/chat config, all sh
 Use the **official `redis` Docker image** (not authored here):
 
 ```bash
-docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
+docker run -d --name parley-redis -p 127.0.0.1:6379:6379 redis:7-alpine \
+  redis-server --requirepass "$REDIS_PASSWORD"
 ```
 
-(or the maintainer dev harness: `examples/dev-compose/`.)
+(or the maintainer dev harness: `examples/dev-compose/`.) See
+[Credentials & exposure](#credentials--exposure) before pointing anything but localhost at it.
 
 ## Conformance
 
 ```bash
-docker run -d --name parley-redis -p 6379:6379 redis:7-alpine
-npm test   # the shared @sharptrick/parley-conformance suite runs green against Redis
+docker run -d --name parley-redis -p 127.0.0.1:6379:6379 redis:7-alpine \
+  redis-server --requirepass "$REDIS_PASSWORD"
+PARLEY_REDIS_URL="redis://:$REDIS_PASSWORD@127.0.0.1:6379" npm test
 ```
 
 `PARLEY_REDIS_URL` overrides the URL; the suite skips itself if no server is reachable.

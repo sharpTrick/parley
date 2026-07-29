@@ -5,7 +5,8 @@ import { RedisPlugin } from '../src/index.js';
 // White-box tests for RedisPlugin.subscribe() hardening (work item 22 — BUG-11 + BUG-37). These
 // mock the `redis` module so connect()/disconnect()/subscribe() run with NO live server; the live
 // seam conformance (post → fetchRecent, catch-up, dedup, multi-writer) is covered separately in
-// conformance.test.ts and requires a real Redis.
+// conformance.test.ts and requires a real Redis, and the live failure surface (unreachable
+// endpoint, outage, retention, stale cursors) in failure-modes.test.ts.
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -19,16 +20,20 @@ interface FakeReader {
   on: (...a: unknown[]) => FakeReader;
   connect: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
+  exists: ReturnType<typeof vi.fn>;
   xInfoStream: ReturnType<typeof vi.fn>;
   xRead: ReturnType<typeof vi.fn>;
 }
 
-// Shared, hoisted so the vi.mock factory (hoisted above imports) can close over it. duplicate()
-// hands out one queued reader per subscribe under test.
+// Shared, hoisted so the vi.mock factory (hoisted above imports) can close over it. The plugin
+// builds its readers from the same createClient() factory as its command client (they must not be
+// configured differently), so a queued fake is handed out ahead of a plain command client.
 const hoisted = vi.hoisted(() => ({ readerQueue: [] as unknown[] }));
 
 vi.mock('redis', () => ({
   createClient: () => {
+    const queued = hoisted.readerQueue.shift();
+    if (queued !== undefined) return queued;
     const main: Record<string, unknown> = {
       isOpen: false,
       on: () => main,
@@ -37,11 +42,6 @@ vi.mock('redis', () => ({
       },
       disconnect: async () => {
         main.isOpen = false;
-      },
-      duplicate: () => {
-        const r = hoisted.readerQueue.shift();
-        if (r === undefined) throw new Error('test setup: no reader queued for duplicate()');
-        return r;
       },
     };
     return main;
@@ -60,6 +60,7 @@ function makeReader(overrides: Partial<FakeReader> = {}): FakeReader {
     disconnect: vi.fn(async () => {
       reader.isOpen = false;
     }),
+    exists: vi.fn(async () => 1),
     xInfoStream: vi.fn(async () => ({ lastGeneratedId: '0-0' })),
     xRead: vi.fn(
       (): Promise<XReadResult> => new Promise((resolve) => setTimeout(() => resolve(null), 20)),
@@ -84,62 +85,136 @@ afterEach(() => {
 });
 
 describe('redis subscribe hardening — BUG-11: xInfoStream catch must not replay history', () => {
-  it('surfaces a transient (non missing-key) xInfoStream error instead of seeding lastId=0', async () => {
+  // The CLASS: the "has this stream any history?" decision must rest on server STATE, never on the
+  // wording of an error string. Every wording below is a real failure on an EXISTING stream, so
+  // every one must propagate — including the ones that literally contain the old `no such key`
+  // substring, and the ones a Valkey/ElastiCache/proxy/future release would word differently.
+  const hardFailures = [
+    'LOADING Redis is loading the dataset in memory',
+    'READONLY You cannot write against a read only replica',
+    'NOPERM this user has no permissions to run the xinfo command',
+    'Socket closed unexpectedly',
+    'ERR no such key', // text says "missing"; EXISTS says otherwise → must NOT seed '0'
+    'ERR unknown command XINFO, with args beginning with: STREAM',
+  ];
+
+  it.each(hardFailures)(
+    'surfaces an xInfoStream failure on an existing stream (%s) instead of seeding lastId=0',
+    async (message) => {
+      const plugin = new RedisPlugin();
+      await plugin.connect({ url: 'redis://mock' });
+
+      const handler = vi.fn();
+      const reader = makeReader({
+        exists: vi.fn(async () => 1),
+        xInfoStream: vi.fn(async () => {
+          throw new Error(message);
+        }),
+      });
+      queue(reader);
+
+      // The failure is surfaced (subscribe rejects) rather than silently starting from '0'.
+      await expect(plugin.subscribe(asTopic('ops'), handler)).rejects.toThrow(message);
+      // The read loop never started → zero historical entries flooded through the handler.
+      expect(reader.xRead).not.toHaveBeenCalled();
+      expect(handler).not.toHaveBeenCalled();
+      // The reader was torn down and deregistered, not leaked.
+      expect(reader.disconnect).toHaveBeenCalledTimes(1);
+      expect(peek(plugin).readers).toHaveLength(0);
+
+      await plugin.disconnect();
+    },
+  );
+
+  // The inverse half of the class: a stream that genuinely does not exist must seed '0' no matter
+  // HOW the server words its XINFO error (or whether XINFO is even reached), because EXISTS is
+  // what decides.
+  const missingStream: Array<[string, Partial<FakeReader>]> = [
+    [
+      'EXISTS says 0 (XINFO never reached)',
+      {
+        exists: vi.fn(async () => 0),
+        xInfoStream: vi.fn(async () => {
+          throw new Error('test: xInfoStream must not be called for a missing stream');
+        }),
+      },
+    ],
+    [
+      'deleted in the EXISTS → XINFO gap, worded "ERR no such key"',
+      {
+        exists: vi
+          .fn()
+          .mockResolvedValueOnce(1)
+          .mockResolvedValue(0) as unknown as ReturnType<typeof vi.fn>,
+        xInfoStream: vi.fn(async () => {
+          throw new Error('ERR no such key');
+        }),
+      },
+    ],
+    [
+      'deleted in the gap, worded "NOKEY stream does not exist"',
+      {
+        exists: vi
+          .fn()
+          .mockResolvedValueOnce(1)
+          .mockResolvedValue(0) as unknown as ReturnType<typeof vi.fn>,
+        xInfoStream: vi.fn(async () => {
+          throw new Error('NOKEY stream does not exist');
+        }),
+      },
+    ],
+  ];
+
+  it.each(missingStream)(
+    'seeds lastId=0 for a genuinely missing stream (%s) and delivers a later posted message',
+    async (_label, overrides) => {
+      const plugin = new RedisPlugin();
+      await plugin.connect({ url: 'redis://mock' });
+
+      const received: Message[] = [];
+      let served = false;
+      const reader = makeReader({
+        ...overrides,
+        xRead: vi.fn((): Promise<XReadResult> => {
+          if (served) return new Promise((resolve) => setTimeout(() => resolve(null), 20));
+          served = true;
+          return Promise.resolve([
+            {
+              name: 'parley:new',
+              messages: [{ id: '1-0', message: { sender: 'alice', content: 'hello', ts: '' } }],
+            },
+          ]);
+        }),
+      });
+      queue(reader);
+
+      await plugin.subscribe(asTopic('new'), (m) => received.push(m));
+      await vi.waitFor(() => expect(received).toHaveLength(1));
+
+      expect(received[0]?.content).toBe('hello');
+      // First XREAD used the seeded start id '0' — no regression to first-subscribe-before-first-post.
+      const firstArgs = reader.xRead.mock.calls[0]?.[0] as { id: string };
+      expect(firstArgs.id).toBe('0');
+
+      await plugin.disconnect();
+    },
+  );
+
+  it('starts at the stream tail (not 0) when the stream already has history', async () => {
     const plugin = new RedisPlugin();
     await plugin.connect({ url: 'redis://mock' });
 
     const handler = vi.fn();
     const reader = makeReader({
-      // The realistic correlated case: subscribe() runs while Redis is restarting.
-      xInfoStream: vi.fn(async () => {
-        throw new Error('LOADING Redis is loading the dataset in memory');
-      }),
+      exists: vi.fn(async () => 1),
+      xInfoStream: vi.fn(async () => ({ lastGeneratedId: '55-3' })),
     });
     queue(reader);
 
-    // The failure is surfaced (subscribe rejects) rather than silently starting from '0'.
-    await expect(plugin.subscribe(asTopic('ops'), handler)).rejects.toThrow(/LOADING/);
-    // The read loop never started → zero historical entries flooded through the handler.
-    expect(reader.xRead).not.toHaveBeenCalled();
+    await plugin.subscribe(asTopic('ops'), handler);
+    await vi.waitFor(() => expect(reader.xRead.mock.calls.length).toBeGreaterThan(0));
+    expect((reader.xRead.mock.calls[0]?.[0] as { id: string }).id).toBe('55-3');
     expect(handler).not.toHaveBeenCalled();
-    // The reader was torn down and deregistered, not leaked.
-    expect(reader.disconnect).toHaveBeenCalledTimes(1);
-    expect(peek(plugin).readers).toHaveLength(0);
-
-    await plugin.disconnect();
-  });
-
-  it('still seeds lastId=0 for a genuinely missing stream and delivers a later posted message', async () => {
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: 'redis://mock' });
-
-    const received: Message[] = [];
-    let served = false;
-    const reader = makeReader({
-      // node-redis surfaces `ERR no such key` for XINFO STREAM on a non-existent stream.
-      xInfoStream: vi.fn(async () => {
-        throw new Error('ERR no such key');
-      }),
-      xRead: vi.fn((): Promise<XReadResult> => {
-        if (served) return new Promise((resolve) => setTimeout(() => resolve(null), 20));
-        served = true;
-        return Promise.resolve([
-          {
-            name: 'parley:new',
-            messages: [{ id: '1-0', message: { sender: 'alice', content: 'hello', ts: '' } }],
-          },
-        ]);
-      }),
-    });
-    queue(reader);
-
-    await plugin.subscribe(asTopic('new'), (m) => received.push(m));
-    await vi.waitFor(() => expect(received).toHaveLength(1));
-
-    expect(received[0]?.content).toBe('hello');
-    // First XREAD used the seeded start id '0' — no regression to first-subscribe-before-first-post.
-    const firstArgs = reader.xRead.mock.calls[0]?.[0] as { id: string };
-    expect(firstArgs.id).toBe('0');
 
     await plugin.disconnect();
   });

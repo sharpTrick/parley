@@ -1,14 +1,15 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { createClient } from 'redis';
 import { describe, it } from 'vitest';
-import { RedisPlugin } from '../src/index.js';
+import { createRedisClient, RedisPlugin } from '../src/index.js';
 
 const REDIS_URL = process.env.PARLEY_REDIS_URL ?? 'redis://127.0.0.1:6379';
 
+// Probe with the PLUGIN's own client builder, so that the harness can never be hardened where the
+// plugin is not: a probe with private fail-fast options would make the suite skip cleanly while
+// the shipped plugin hangs forever against the same endpoint.
 async function isRedisUp(url: string): Promise<boolean> {
-  const c = createClient({ url, socket: { connectTimeout: 800, reconnectStrategy: false } });
-  c.on('error', () => undefined);
+  const c = createRedisClient(url, 800);
   try {
     await c.connect();
     await c.ping();
@@ -34,8 +35,7 @@ async function makeContext() {
     cleanup: async () => {
       await plugin.disconnect();
       // wipe this context's streams
-      const admin = createClient({ url: REDIS_URL });
-      admin.on('error', () => undefined);
+      const admin = createRedisClient(REDIS_URL, 800);
       await admin.connect();
       const keys = await admin.keys(`${prefix}*`);
       if (keys.length > 0) await admin.del(keys);

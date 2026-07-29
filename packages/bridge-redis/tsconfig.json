@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../bridge-core" }, { "path": "../bridge-net-util" }],
+  "references": [{ "path": "../bridge-core" }],
   "include": ["src/**/*"]
 }
