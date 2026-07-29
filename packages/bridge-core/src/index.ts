@@ -7,7 +7,7 @@ export { CORE_VERSION } from './version.js';
 // The seam + normalized Message (DESIGN §4/§5/§6).
 export type { Topic, Handle, BackendMsgId, Cursor, Message, BuildMessageInput } from './message.js';
 export { asTopic, asHandle, asBackendMsgId, asCursor, buildMessage } from './message.js';
-export { safeName } from './topic-name.js';
+export { safeName, MIN_HASH_LEN } from './topic-name.js';
 export type {
   BackendPlugin,
   BackendConfig,
@@ -17,6 +17,7 @@ export type {
   MessageHandler,
 } from './seam.js';
 export { NoSuchTopicError } from './seam.js';
+export { isNoSuchTopicError } from './no-such-topic.js';
 
 // Shared helpers (used by plugins and core alike).
 export { parseMentions } from './mentions.js';

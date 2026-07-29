@@ -94,9 +94,9 @@ describe('Allowlist pattern safety', () => {
     expect(() => new Allowlist(['ctx'], { postPatterns: [pattern] })).toThrow(UnsafePatternError);
   });
 
-  // Two axes: pattern shape × topic length, INCLUDING lengths under the input clamp. The old
-  // single-axis table only fed a 5000-char topic, which `has` rejects on length before any regex
-  // runs — so it graded the clamp, never the matcher.
+  // Two axes: pattern shape × topic length. Lengths UNDER the input clamp are the ones that grade
+  // the matcher — `has` refuses anything over it before a regex runs, so a table of over-long
+  // topics alone only grades the clamp.
   const LENGTHS = [1, 8, 32, 63, 64, 65, 256, 5000];
   const SAFE = [
     ['plain broad pattern', 'ctx-.*'],

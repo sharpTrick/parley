@@ -102,9 +102,9 @@ const ConfigObject = z.object({
   // one-way dependency (CLAUDE.md) stays intact. See assertNoBackendKey.
   /** Read-state namespace; defaults to identity.handle. Distinct sessions sharing a handle
    *  MUST set distinct instance_ids (DESIGN §10). */
-  instance_id: z.string().optional(),
+  instance_id: z.string().min(1).optional(),
   /** Override the read-state file path (default: XDG_STATE_HOME/parley/<instance>/read-state.json). */
-  state_path: z.string().optional(),
+  state_path: z.string().min(1).optional(),
   identity: z
     .object({
       handle: z.string().min(1),

@@ -283,42 +283,49 @@ describe('config loader', () => {
   });
 });
 
-// A key the schema does not know is a LOAD ERROR, not a silent strip. The class here is
-// "operator typo produces a bridge that quietly does nothing" — `live_push: {enable: true}` parsed
-// cleanly and left live push off. Walk a fully-populated config and near-miss every key, so a
-// field added later is covered the moment it appears in the fixture.
-describe('config rejects unknown keys', () => {
-  const FULL = {
-    instance_id: 'inst',
-    state_path: '/tmp/parley-state.json',
-    identity: { handle: 'h' },
-    topics: ['ctx'],
-    post_topics: ['ctx-.*'],
-    catchup: {
-      on_start: true,
-      limit: 10,
-      block_max_ms: 1000,
-      block_poll_interval_ms: 100,
+// A fully-populated config, so that a field added later is covered by the walkers below the moment
+// it appears here.
+const FULL = {
+  instance_id: 'inst',
+  state_path: '/tmp/parley-state.json',
+  identity: { handle: 'h' },
+  topics: ['ctx'],
+  post_topics: ['ctx-.*'],
+  catchup: {
+    on_start: true,
+    limit: 10,
+    block_max_ms: 1000,
+    block_poll_interval_ms: 100,
+  },
+  live_push: { enabled: true, mention_filter: false },
+  presence: { enabled: true, topic: 'parley-presence', heartbeat_ms: 1000, ttl_ms: 3000 },
+  permissions: { skip_permissions: false },
+  auth: {
+    mode: 'oidc',
+    oidc: {
+      issuer: 'https://kc.example.com/realms/r',
+      audience: 'parley-mcp',
+      jwks_uri: 'https://kc.example.com/jwks',
+      required_scope: 'mcp',
+      allowed_subjects: ['sub-1'],
+      allowed_usernames: ['alice'],
+      required_role: 'parley-owner',
+      clock_skew_s: 30,
     },
-    live_push: { enabled: true, mention_filter: false },
-    presence: { enabled: true, topic: 'parley-presence', heartbeat_ms: 1000, ttl_ms: 3000 },
-    permissions: { skip_permissions: false },
-    auth: {
-      mode: 'oidc',
-      oidc: {
-        issuer: 'https://kc.example.com/realms/r',
-        audience: 'parley-mcp',
-        jwks_uri: 'https://kc.example.com/jwks',
-        required_scope: 'mcp',
-        allowed_subjects: ['sub-1'],
-        allowed_usernames: ['alice'],
-        required_role: 'parley-owner',
-        clock_skew_s: 30,
-      },
-    },
-    backend_config: { db_path: './x.db' },
-  };
+  },
+  backend_config: { db_path: './x.db' },
+};
 
+/** Walk to the object holding `path`'s leaf in a mutable clone. */
+function parentOf(root: Record<string, unknown>, path: string[]): Record<string, unknown> {
+  let node = root;
+  for (const step of path.slice(0, -1)) node = node[step] as Record<string, unknown>;
+  return node;
+}
+
+// A key the schema does not know is a LOAD ERROR, not a silent strip: an operator typo must not
+// produce a bridge that quietly does nothing.
+describe('config rejects unknown keys', () => {
   it('accepts the fully-populated fixture', () => {
     expect(() => parseConfig(structuredClone(FULL))).not.toThrow();
   });
@@ -338,10 +345,7 @@ describe('config rejects unknown keys', () => {
     'rejects a near-miss of %s instead of ignoring it',
     (_label, path) => {
       const mutated = structuredClone(FULL) as Record<string, unknown>;
-      let node = mutated;
-      for (const step of (path as string[]).slice(0, -1)) {
-        node = node[step] as Record<string, unknown>;
-      }
+      const node = parentOf(mutated, path as string[]);
       const leaf = (path as string[]).at(-1)!;
       node[leaf.length > 1 ? leaf.slice(0, -1) : `${leaf}x`] = node[leaf];
       delete node[leaf];
@@ -360,6 +364,64 @@ describe('config rejects unknown keys', () => {
     ],
   ])('rejects the operator typo %s', (_label, raw) => {
     expect(() => parseConfig(raw)).toThrow();
+  });
+});
+
+// Every string field in a config NAMES something — a path, a read-state namespace, a topic, an
+// issuer — and none of them can name it with the empty string. A field that accepts `''` loads
+// cleanly and fails later, far from the config: `state_path: ''` served traffic and then threw
+// ENOENT on the first cursor persist, and `instance_id: ''` silently merged two sessions' read
+// state. Walk the fixture so a string field added later is graded the moment it appears there.
+describe('config rejects an empty string in any field that names something', () => {
+  interface StringLeaf {
+    label: string;
+    path: string[];
+    index?: number;
+  }
+
+  function stringLeaves(node: unknown, prefix: string[] = []): StringLeaf[] {
+    if (typeof node !== 'object' || node === null) return [];
+    return Object.entries(node).flatMap(([key, value]) => {
+      const path = [...prefix, key];
+      const label = path.join('.');
+      if (typeof value === 'string') return [{ label, path }];
+      if (Array.isArray(value))
+        return value.flatMap((element, index) =>
+          typeof element === 'string' ? [{ label: `${label}[${index}]`, path, index }] : [],
+        );
+      return stringLeaves(value, path);
+    });
+  }
+
+  // `backend_config` is opaque to core (DESIGN §11) and may legitimately carry an empty string.
+  const leaves = stringLeaves(FULL).filter((l) => l.path[0] !== 'backend_config');
+
+  it('finds every string field in the fixture (guards against a broken walk)', () => {
+    expect(leaves.map((l) => l.label).sort()).toEqual([
+      'auth.mode',
+      'auth.oidc.allowed_subjects[0]',
+      'auth.oidc.allowed_usernames[0]',
+      'auth.oidc.audience',
+      'auth.oidc.issuer',
+      'auth.oidc.jwks_uri',
+      'auth.oidc.required_role',
+      'auth.oidc.required_scope',
+      'identity.handle',
+      'instance_id',
+      'post_topics[0]',
+      'presence.topic',
+      'state_path',
+      'topics[0]',
+    ]);
+  });
+
+  it.each(leaves.map((l) => [l.label, l] as const))('rejects %s set to ""', (_label, leaf) => {
+    const mutated = structuredClone(FULL) as Record<string, unknown>;
+    const node = parentOf(mutated, leaf.path);
+    const key = leaf.path.at(-1)!;
+    if (leaf.index === undefined) node[key] = '';
+    else (node[key] as string[])[leaf.index] = '';
+    expect(() => parseConfig(mutated)).toThrow();
   });
 });
 
