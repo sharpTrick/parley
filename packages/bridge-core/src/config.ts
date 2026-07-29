@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
+import { isRedosSafeSource } from './regex-safety.js';
 
 /**
  * Remote-mode auth via an external OIDC IdP (e.g. Keycloak) — the delegated resource-server
@@ -185,6 +186,19 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
         code: z.ZodIssueCode.custom,
         path: ['post_topics', i],
         message: `invalid regex: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return;
+    }
+    // The topic these patterns are matched against comes from a caller, so screen them here, so
+    // that one careless operator pattern cannot be driven into catastrophic backtracking by a
+    // hostile tool call.
+    if (!isRedosSafeSource(src)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['post_topics', i],
+        message:
+          'pattern risks catastrophic backtracking (nested or repeated quantifier, or too many ' +
+          'unbounded quantifiers); a caller-supplied topic could hang the bridge. Simplify it.',
       });
     }
   });

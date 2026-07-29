@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 
 const FORMAT = 'scrypt';
 const KEYLEN = 32;
+const SALTLEN = 16;
 
 // Verify off the event loop: scrypt is a deliberately expensive KDF, so the hot verify path uses
 // the async form to avoid a consent-guess flood stalling Node's single thread (CPU/latency DoS).
@@ -19,7 +20,7 @@ const scryptAsync = promisify(scrypt) as (
 /** Hash an owner passphrase as `scrypt$<saltB64>$<hashB64>` for at-rest storage. */
 export function hashOwnerSecret(passphrase: string): string {
   if (passphrase.length === 0) throw new Error('owner passphrase must not be empty');
-  const salt = randomBytes(16);
+  const salt = randomBytes(SALTLEN);
   const hash = scryptSync(passphrase, salt, KEYLEN);
   return `${FORMAT}$${salt.toString('base64')}$${hash.toString('base64')}`;
 }
@@ -32,10 +33,18 @@ export function makeOwnerVerifier(stored: string): (passphrase: string) => Promi
   }
   const salt = Buffer.from(parts[1], 'base64');
   const expected = Buffer.from(parts[2], 'base64');
+  // Reject degenerate material here, so that a zero-length hash can never reach
+  // timingSafeEqual(empty, empty) — which is true, and authorizes every passphrase.
+  if (salt.length !== SALTLEN || expected.length !== KEYLEN) {
+    throw new Error(
+      `invalid owner secret hash (expected a ${SALTLEN}-byte salt and a ${KEYLEN}-byte hash, ` +
+        `got ${salt.length} and ${expected.length})`,
+    );
+  }
   return async (passphrase: string): Promise<boolean> => {
     if (passphrase.length === 0) return false;
-    const actual = await scryptAsync(passphrase, salt, expected.length);
-    return actual.length === expected.length && timingSafeEqual(actual, expected);
+    const actual = await scryptAsync(passphrase, salt, KEYLEN);
+    return timingSafeEqual(actual, expected);
   };
 }
 

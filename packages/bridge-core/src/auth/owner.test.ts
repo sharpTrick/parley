@@ -27,4 +27,26 @@ describe('owner secret', () => {
     expect(() => makeOwnerVerifier('garbage')).toThrow();
     expect(() => hashOwnerSecret('')).toThrow();
   });
+
+  // Any stored string whose segments decode to the wrong length must be rejected when the verifier
+  // is BUILT. Accepting one and deciding at verify time is how a zero-length hash reaches
+  // timingSafeEqual(empty, empty) === true and authorizes every passphrase.
+  it.each([
+    ['empty hash segment', `scrypt$${'a'.repeat(24)}$`],
+    ['hash segment is base64 padding only', `scrypt$${'a'.repeat(24)}$=`],
+    ['both segments empty', 'scrypt$$'],
+    ['empty salt segment', `scrypt$$${Buffer.alloc(32).toString('base64')}`],
+    ['non-base64 hash segment', `scrypt$${'a'.repeat(24)}$!!!!`],
+    ['hash one byte short', `scrypt$${'a'.repeat(24)}$${Buffer.alloc(31).toString('base64')}`],
+    ['hash one byte long', `scrypt$${'a'.repeat(24)}$${Buffer.alloc(33).toString('base64')}`],
+    ['salt one byte short', `scrypt$${Buffer.alloc(15).toString('base64')}$${Buffer.alloc(32).toString('base64')}`],
+  ])('refuses to build a verifier from a degenerate stored hash (%s)', (_label, stored) => {
+    expect(() => makeOwnerVerifier(stored)).toThrow(/invalid owner secret hash/);
+  });
+
+  it('a real hash still round-trips after the length checks', async () => {
+    const verify = makeOwnerVerifier(hashOwnerSecret('correct horse'));
+    expect(await verify('correct horse')).toBe(true);
+    expect(await verify('correct horse ')).toBe(false);
+  });
 });

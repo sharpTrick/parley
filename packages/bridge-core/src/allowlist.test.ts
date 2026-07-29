@@ -62,4 +62,25 @@ describe('Allowlist reserved topics', () => {
       TopicNotAllowedError,
     );
   });
+
+  // The topic is caller-supplied, so however a pattern was written, matching must stay bounded.
+  // Guard the class: any over-long input, against any pattern, returns fast and fails closed.
+  it.each([
+    ['nested quantifier', '([a-z]+)+'],
+    ['alternation under a quantifier', '(a|a)*'],
+    ['many unbounded quantifiers', '.*.*.*.*.*'],
+    ['plain broad pattern', 'ctx-.*'],
+  ])('bounds match work against a hostile over-long topic (%s)', (_label, pattern) => {
+    const allow = new Allowlist(['ctx'], { postPatterns: [pattern] });
+    const hostile = 'a'.repeat(5000) + '!';
+    const started = Date.now();
+    expect(allow.has(hostile)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  it('still matches ordinary topics up to the input bound', () => {
+    const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*'] });
+    expect(allow.has(`ctx-${'a'.repeat(59)}`)).toBe(true); // 63 chars, under the 64 cap
+    expect(allow.has(`ctx-${'a'.repeat(80)}`)).toBe(false); // over it, refused rather than matched
+  });
 });

@@ -55,6 +55,28 @@ describe('config loader', () => {
     expect(() => parseConfig({ identity: { handle: 'h' }, topics: ['ctx'] })).not.toThrow();
   });
 
+  // post_topics are matched against caller-supplied topics, so a pattern that can be driven into
+  // catastrophic backtracking is a config error, not a runtime surprise. Guard the class.
+  it.each([
+    ['nested quantifier', '([a-z]+)+'],
+    ['alternation under a quantifier', '(a|a)*'],
+    ['bounded repeat over a risky body', '([a-z]*){15}'],
+    ['optional group repeated many times', '(a?){250}'],
+    ['too many unbounded quantifiers', '.*.*.*.*.*'],
+  ])('rejects a post_topics pattern that risks catastrophic backtracking (%s)', (_l, pattern) => {
+    expect(() =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: [pattern] }),
+    ).toThrow(/catastrophic backtracking/);
+  });
+
+  it.each([['ctx-.*'], ['project-[a-z0-9-]+'], ['(alpha|beta)-.*'], ['ctx-\\d{1,4}']])(
+    'still accepts an ordinary post_topics pattern (%s)',
+    (pattern) => {
+      const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: [pattern] });
+      expect(cfg.post_topics).toEqual([pattern]);
+    },
+  );
+
   it('accepts post_topics and rejects an uncompilable regex', () => {
     const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-.*'] });
     expect(cfg.post_topics).toEqual(['ctx-.*']);

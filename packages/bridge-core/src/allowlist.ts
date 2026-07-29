@@ -1,5 +1,6 @@
 import type { ParleyConfig } from './config.js';
 import { asTopic, type Topic } from './message.js';
+import { MAX_MATCH_INPUT } from './regex-safety.js';
 
 /** Raised when a tool call or subscription targets a topic outside the allowlist. */
 export class TopicNotAllowedError extends Error {
@@ -57,6 +58,9 @@ export class Allowlist {
   has(topic: string): boolean {
     if (this.reserved.has(topic)) return false;
     if (this.allowed.has(topic)) return true;
+    // Bound the string a pattern ever sees, so that a caller cannot drive a config pattern into
+    // deep backtracking with a long topic. Config load screens the patterns; this bounds the input.
+    if (topic.length > MAX_MATCH_INPUT) return false;
     return this.patternRegexes.some((re) => re.test(topic));
   }
 
