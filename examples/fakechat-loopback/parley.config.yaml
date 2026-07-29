@@ -2,7 +2,7 @@
 # Local stdio mode, SQLite backend, live push ON so the running Claude Code session
 # receives <channel> events.
 
-backend: local-sqlite
+# Run with: parley-sqlite --config <this file>   (the binary selects the backend)
 
 identity:
   handle: "agent"            # this session's logical handle

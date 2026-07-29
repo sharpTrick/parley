@@ -13,7 +13,7 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-xmpp
+# Run with: parley-xmpp --config <this file>   (the binary selects the backend)
 backend_config:
   # ── Must be IDENTICAL across every config on this server. ──
   service: "xmpp://xmpp.internal:5222"

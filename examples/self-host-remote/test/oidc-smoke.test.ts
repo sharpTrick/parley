@@ -28,7 +28,6 @@ beforeEach(async () => {
   writeFileSync(
     cfgPath,
     [
-      'backend: local-sqlite',
       'identity: { handle: "owner" }',
       'topics: ["ctx-handoff"]',
       'catchup: { on_start: false }',

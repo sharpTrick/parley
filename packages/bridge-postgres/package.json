@@ -29,6 +29,9 @@
       "default": "./dist/index.js"
     }
   },
+  "bin": {
+    "parley-postgres": "./dist/cli.js"
+  },
   "files": [
     "dist"
   ],

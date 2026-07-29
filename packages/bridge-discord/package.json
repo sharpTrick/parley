@@ -29,6 +29,9 @@
       "default": "./dist/index.js"
     }
   },
+  "bin": {
+    "parley-discord": "./dist/cli.js"
+  },
   "files": [
     "dist"
   ],

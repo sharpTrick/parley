@@ -15,7 +15,7 @@ presence:
 permissions:
   skip_permissions: false
 
-backend: local-redis
+# Run with: parley-redis --config <this file>   (the binary selects the backend)
 backend_config:
   url: "redis://redis.internal:6379"   # identical to both code-agent-*.yaml
   key_prefix: "parley:"                 # identical

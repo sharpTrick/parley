@@ -29,6 +29,9 @@
       "default": "./dist/index.js"
     }
   },
+  "bin": {
+    "parley-xmpp": "./dist/cli.js"
+  },
   "files": [
     "dist"
   ],

@@ -12,7 +12,7 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-redis
+# Run with: parley-redis --config <this file>   (the binary selects the backend)
 backend_config:
   url: "redis://redis.internal:6379"   # identical to code-agent-a.yaml — same server
   key_prefix: "parley:"                 # identical — same key namespace (see A's comment)

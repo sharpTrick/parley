@@ -16,7 +16,7 @@ presence:
 permissions:
   skip_permissions: false
 
-backend: local-sqlite
+# Run with: parley-sqlite --config <this file>   (the binary selects the backend)
 backend_config:
   db_path: "/var/lib/parley/parley-shared.db"   # identical to both code-agent-*.yaml
   poll_interval_ms: 1000                         # unused here (live_push is off) but harmless

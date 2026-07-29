@@ -13,7 +13,7 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-matrix
+# Run with: parley-matrix --config <this file>   (the binary selects the backend)
 backend_config:
   # ── Must be IDENTICAL across every config on this homeserver. ──
   homeserver_url: "https://matrix.internal:8008"

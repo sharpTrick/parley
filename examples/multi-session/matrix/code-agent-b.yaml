@@ -12,7 +12,7 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-matrix
+# Run with: parley-matrix --config <this file>   (the binary selects the backend)
 backend_config:
   homeserver_url: "https://matrix.internal:8008"   # identical to code-agent-a.yaml
   server_name: "parley.local"                        # identical

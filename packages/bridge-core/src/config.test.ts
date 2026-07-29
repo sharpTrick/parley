@@ -4,7 +4,6 @@ import { instanceIdOf, parseConfig } from './config.js';
 describe('config loader', () => {
   it('applies defaults from a minimal config', () => {
     const cfg = parseConfig({ identity: { handle: 'ctx-payments' }, topics: ['ctx-payments'] });
-    expect(cfg.backend).toBe('local-sqlite');
     expect(cfg.catchup).toEqual({
       on_start: true,
       limit: 100,
@@ -101,6 +100,47 @@ describe('config loader', () => {
       backend_config: { db_path: '/tmp/x.db', poll_interval_ms: 250 },
     });
     expect(cfg.backend_config).toEqual({ db_path: '/tmp/x.db', poll_interval_ms: 250 });
+  });
+
+  // The `backend` field was parsed and then read by nothing, so `backend: matrix` ran whatever
+  // binary the user launched. Stripping it silently would preserve that lie; reject instead, and
+  // point at the real mechanism. Parameterized so the whole class stays guarded.
+  it.each([
+    ['local-sqlite', 'parley-sqlite'],
+    ['matrix', 'parley-matrix'],
+    ['local-redis', 'parley-redis'],
+  ])('rejects the removed `backend` field (%s) and names the binary to run', (value, binary) => {
+    const load = (): unknown =>
+      parseConfig({ backend: value, identity: { handle: 'h' }, topics: ['a'] });
+    expect(load).toThrow(/`backend` is not a supported field/);
+    expect(load).toThrow(new RegExp(binary));
+  });
+
+  it('rejects a non-string `backend` without claiming a specific binary', () => {
+    expect(() => parseConfig({ backend: 42, identity: { handle: 'h' }, topics: ['a'] })).toThrow(
+      /`backend` is not a supported field/,
+    );
+  });
+
+  // A security knob nothing reads must not be accepted-and-ignored: an operator who sets it would
+  // believe a sandbox mode is active that does not exist.
+  it('rejects permissions.skip_permissions: true as unimplemented', () => {
+    expect(() =>
+      parseConfig({
+        identity: { handle: 'h' },
+        topics: ['a'],
+        permissions: { skip_permissions: true },
+      }),
+    ).toThrow(/not implemented/);
+  });
+
+  it('still accepts an explicit skip_permissions: false', () => {
+    const cfg = parseConfig({
+      identity: { handle: 'h' },
+      topics: ['a'],
+      permissions: { skip_permissions: false },
+    });
+    expect(cfg.permissions.skip_permissions).toBe(false);
   });
 
   it('instanceIdOf defaults to the handle but honors instance_id', () => {

@@ -12,7 +12,7 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-nats
+# Run with: parley-nats --config <this file>   (the binary selects the backend)
 backend_config:
   servers: "nats.internal:4222"   # identical to code-agent-a.yaml
   subject_prefix: "parley."       # identical (see A's comment on the stream-creation race)

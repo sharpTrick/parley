@@ -15,7 +15,7 @@ presence:
 permissions:
   skip_permissions: false
 
-backend: local-nats
+# Run with: parley-nats --config <this file>   (the binary selects the backend)
 backend_config:
   servers: "nats.internal:4222"   # identical to both code-agent-*.yaml
   subject_prefix: "parley."       # identical

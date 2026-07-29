@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+import { createStdioBridge, loadConfig, type ParleyConfig } from '@sharptrick/parley-core';
+import { XmppPlugin } from './index.js';
+
+// IMPORTANT: this is an MCP stdio server — stdout is the JSON-RPC channel. All diagnostics go
+// to stderr; never write to stdout here.
+
+interface CliArgs {
+  config: string;
+}
+
+function parseArgs(argv: string[]): CliArgs {
+  let config = process.env.PARLEY_CONFIG ?? 'parley.config.yaml';
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--config' || arg === '-c') {
+      const next = argv[i + 1];
+      if (next !== undefined) {
+        config = next;
+        i++;
+      }
+    } else if (arg !== undefined && arg.startsWith('--config=')) {
+      config = arg.slice('--config='.length);
+    }
+  }
+  return { config };
+}
+
+async function main(): Promise<void> {
+  const { config } = parseArgs(process.argv.slice(2));
+  const cfg: ParleyConfig = loadConfig(config);
+  const plugin = new XmppPlugin();
+  const bridge = await createStdioBridge(plugin, cfg);
+  process.stderr.write(
+    `parley-xmpp: bridge up — handle=${cfg.identity.handle} topics=[${cfg.topics.join(', ')}] ` +
+      `live_push=${String(cfg.live_push.enabled)}\n`,
+  );
+
+  let shuttingDown = false;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void bridge.shutdown().finally(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  // BUG-38: an orphaned bridge (parent Claude Code crashed / was SIGKILLed) receives stdin EOF
+  // but no signal. Without this it keeps polling the backend + heart-beating a ghost peer into
+  // every peer's parley_list_users forever. The stdio transport has already put stdin in flowing
+  // mode by now, so 'end' fires on EOF; the shuttingDown guard keeps double-invocation (end +
+  // close, or a signal racing EOF) idempotent.
+  process.stdin.on('end', shutdown);
+  process.stdin.on('close', shutdown);
+}
+
+main().catch((err: unknown) => {
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  process.stderr.write(`parley-xmpp: fatal: ${detail}\n`);
+  process.exit(1);
+});

@@ -93,8 +93,11 @@ export type AuthConfig = z.infer<typeof AuthSchema>;
  * `.superRefine` on {@link ConfigSchema} below — they need the whole object.
  */
 const ConfigObject = z.object({
-  /** Which backend plugin to load. v0.1 ships only local-sqlite. */
-  backend: z.string().default('local-sqlite'),
+  // NOTE: there is deliberately no `backend` field. Core cannot load a plugin by name without
+  // learning backend names, which the seam forbids (CLAUDE.md prime directive). The backend is
+  // chosen by *which binary you run* — `parley-sqlite`, `parley-matrix`, … — each of which is a
+  // ~60-line composition root that constructs its own plugin. A `backend:` key in a config file
+  // is rejected at load rather than silently ignored; see `assertNoBackendKey`.
   /** Read-state namespace; defaults to identity.handle. Distinct sessions sharing a handle
    *  MUST set distinct instance_ids (DESIGN §10). */
   instance_id: z.string().optional(),
@@ -156,7 +159,14 @@ const ConfigObject = z.object({
     .transform((p) => ({ ...p, ttl_ms: p.ttl_ms ?? p.heartbeat_ms * 3 })),
   permissions: z
     .object({
-      // DANGEROUS; sandbox-only; default OFF (DESIGN §2.5/§14). Read but unused in v0.1.
+      /**
+       * DANGEROUS; sandbox-only; default OFF (DESIGN §2.5/§14).
+       *
+       * NOT IMPLEMENTED: nothing in core or any plugin reads this. It is rejected at load when set
+       * to `true` rather than accepted-and-ignored, because a security knob that silently does
+       * nothing is worse than an absent one — an operator who sets it believes a mode is active
+       * that is not.
+       */
       skip_permissions: z.boolean().default(false),
     })
     .default({}),
@@ -203,12 +213,45 @@ export const ConfigSchema = ConfigObject.superRefine((cfg, ctx) => {
         'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
     });
   }
+  // Fail fast rather than accept-and-ignore: nothing reads this, so honouring it silently would
+  // tell an operator a sandbox mode is active when none is.
+  if (cfg.permissions.skip_permissions) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['permissions', 'skip_permissions'],
+      message:
+        'permissions.skip_permissions is not implemented — nothing in core or any plugin reads it. ' +
+        'Remove it (or set it to false); leaving it true would imply a permission mode that does not exist.',
+    });
+  }
 });
 
 export type ParleyConfig = z.infer<typeof ConfigSchema>;
 
+/**
+ * Reject a legacy `backend:` key instead of letting zod strip it.
+ *
+ * The field used to exist, was parsed, and was then read by nothing at all — so a config saying
+ * `backend: matrix` ran whatever binary the user happened to launch, silently. Stripping it would
+ * preserve exactly that lie. Erroring names the real mechanism (run the matching binary) and costs
+ * the user one edit, once.
+ */
+function assertNoBackendKey(raw: unknown): void {
+  if (typeof raw !== 'object' || raw === null || !('backend' in raw)) return;
+  const value = (raw as { backend: unknown }).backend;
+  const named = typeof value === 'string' ? value.replace(/^local-/, '') : undefined;
+  const suggestion =
+    named !== undefined ? `parley-${named}` : 'parley-sqlite, parley-matrix, parley-redis, …';
+  throw new Error(
+    'config: `backend` is not a supported field. The backend is selected by which binary you run, ' +
+      `not by config — run \`${suggestion}\` (each backend package ships its own bin). ` +
+      'Remove `backend:` from the config file.',
+  );
+}
+
 /** Validate + default a raw config object (already parsed from YAML/JSON). */
 export function parseConfig(raw: unknown): ParleyConfig {
+  assertNoBackendKey(raw);
   return ConfigSchema.parse(raw);
 }
 
