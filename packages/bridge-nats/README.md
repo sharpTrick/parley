@@ -19,12 +19,17 @@ larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding
 One stream per topic keeps the sequence a clean per-topic monotonic integer, so it serves directly
 as the cursor. Core never compares cursor values — NATS delivers in seq order. The sequence range is
 **not** dense: `max_age` retention prunes the front and message deletes punch holes, so `last_seq -
-since` is an upper bound on what a page can return, never a count.
+since` is an upper bound on what a page can return, never a count. A page therefore also ends when
+the pull falls quiet, not only when that bound is reached: a hole at `last_seq` itself is a position
+no sequence check can recognise, and waiting for it costs every read on the topic the pull's whole
+expiry.
 
 `backendMsgId` is the sequence prefixed with the stream's incarnation, because a stream deleted and
 re-created out-of-band (`nats stream rm`, a storage reset) restarts its sequences at 1 — the bare
 sequence would hand core a dedup key it already holds, and core would drop the new stream's
-messages as duplicates. The cursor stays the bare sequence: it is the order key, and catch-up
+messages as duplicates. `post` reads that stamp back after its own ack, so a stream re-provisioned
+between two posts — with no 503 for the plugin to notice — cannot re-mint the previous
+incarnation's ids. The cursor stays the bare sequence: it is the order key, and catch-up
 already falls back to the retained window when a persisted cursor sits past the tail.
 
 `subscribe` is **not** a nats.js `OrderedConsumer`: it is a plain named ephemeral consumer plus an

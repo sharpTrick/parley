@@ -67,6 +67,7 @@ const RESUBSCRIBE_BACKOFF_MS = 1000; // wait before retrying a consumer while th
 const RECONNECT_WAIT_MS = 1000;
 const RECONNECT_JITTER_MS = 500;
 const FETCH_EXPIRY_MS = 2000;
+const FETCH_IDLE_MS = 200; // close a pull this long without a message rather than wait out `expires`
 const DRAIN_TIMEOUT_MS = 2000;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,6 +102,7 @@ export class NatsPlugin implements BackendPlugin {
   private streamPrefix = 'PARLEY_';
   private retentionDays?: number;
   private stopped = false;
+  private epoch = 0;
   private readonly ensured = new Map<string, Promise<void>>();
   private readonly incarnations = new Map<string, string>();
   private readonly subscriptions: Closeable[] = [];
@@ -111,6 +113,7 @@ export class NatsPlugin implements BackendPlugin {
     this.streamPrefix = validatePrefix('stream_prefix', cfg.stream_prefix, 'PARLEY_', /[.*>/\\\s]/);
     this.retentionDays = validateRetentionDays(cfg.retention_days);
     this.stopped = false;
+    this.epoch += 1;
     this.ensured.clear();
     this.incarnations.clear();
     this.nc = await connect(connectionOptions(cfg));
@@ -120,6 +123,7 @@ export class NatsPlugin implements BackendPlugin {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    this.epoch += 1;
     const closing = this.subscriptions.splice(0).map(async (sub) => {
       try {
         await sub.close();
@@ -154,10 +158,27 @@ export class NatsPlugin implements BackendPlugin {
       ts: new Date().toISOString(),
       in_reply_to: opts?.inReplyTo ?? '',
     });
-    return this.withStream(topic, async () => {
+    const seq = await this.withStream(topic, async () => {
       const ack = await this.requireJs().publish(this.subject(topic), enc.encode(payload));
-      return asBackendMsgId(this.msgId(topic, ack.seq));
+      return ack.seq;
     });
+    await this.observeIncarnation(topic);
+    return asBackendMsgId(this.msgId(topic, seq));
+  }
+
+  /**
+   * Read the incarnation the id will carry AFTER the ack and OUTSIDE `withStream`'s retry: keep both,
+   * so that a stream re-provisioned without this plugin ever seeing a 503 cannot mint the previous
+   * incarnation's sequence again, and so that a failure here re-publishes nothing — the message has
+   * already landed, so this stays best-effort rather than telling the caller to post it twice.
+   */
+  private async observeIncarnation(topic: Topic): Promise<void> {
+    const stream = this.streamName(topic);
+    try {
+      this.noteIncarnation(stream, await this.requireJsm().streams.info(stream));
+    } catch {
+      /* the ack stands; the cached incarnation is the best available */
+    }
   }
 
   // Keep this `async`, so that a rejected `since` REJECTS: a synchronous throw out of a
@@ -214,16 +235,34 @@ export class NatsPlugin implements BackendPlugin {
     // finally's delete — an ephemeral consumer nobody deletes lingers for `inactive_threshold`.
     const messages: Message[] = [];
     let batch: ConsumerMessages | undefined;
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    let wentQuiet = false;
     try {
       const consumer = await this.requireJs().consumers.get(stream, ci.name);
       batch = await consumer.fetch({ max_messages: want, expires: FETCH_EXPIRY_MS });
-      for await (const m of batch) {
-        messages.push(this.rowToMessage(args.topic, m.seq, dec.decode(m.data)));
-        // Keep the tail break: `want` is an upper bound over a range that may be sparse, and a pull
-        // that asked for more than the stream holds waits out its whole `expires` otherwise.
-        if (messages.length >= want || m.seq >= lastSeq) break;
+      // Keep the idle close: `want` is an upper bound over a range that may be sparse — a deleted or
+      // pruned message anywhere in it, including at `last_seq` itself where no break below can fire,
+      // otherwise holds the pull for its whole `expires` on every call.
+      const live = batch;
+      const armIdleClose = (): void => {
+        clearTimeout(idle);
+        idle = setTimeout(() => {
+          wentQuiet = true;
+          void live.close();
+        }, FETCH_IDLE_MS);
+      };
+      armIdleClose();
+      try {
+        for await (const m of batch) {
+          armIdleClose();
+          messages.push(this.rowToMessage(args.topic, m.seq, dec.decode(m.data)));
+          if (messages.length >= want || m.seq >= lastSeq) break;
+        }
+      } catch (err) {
+        if (!wentQuiet) throw err;
       }
     } finally {
+      clearTimeout(idle);
       void batch?.close();
       await this.jsm?.consumers.delete(stream, ci.name).catch(() => undefined);
     }
@@ -331,10 +370,15 @@ export class NatsPlugin implements BackendPlugin {
    * the iterator; ANY iterator exit rebuilds — a connection drop ends `consume()` with no status
    * event at all — and so does a break in the consumer's delivery sequence, which is the only
    * evidence left of an `AckPolicy.None` message the server sent into a link that was already gone.
-   * The outer loop honors `disconnect()`: `this.stopped` + the registered closer stop it without a
-   * rebuild, as does a permanently closed connection.
+   * The outer loop honors `disconnect()`: the registered closer plus the epoch it captured stop it
+   * without a rebuild, as does a permanently closed connection. The epoch is what makes teardown
+   * final — `disconnect()` retires every loop, so one still parked in its backoff cannot wake into a
+   * later `connect()`'s live handles and deliver to a handler its owner already dropped.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    const epoch = this.epoch;
+    const running = (): boolean => this.epoch === epoch && this.live();
+    const retired = (): boolean => this.epoch !== epoch || this.stopped;
     const stream = this.streamName(topic);
     const filterSubject = this.subject(topic);
     const seeded = await this.streamInfo(topic);
@@ -352,10 +396,11 @@ export class NatsPlugin implements BackendPlugin {
 
     void (async () => {
       let rebuild = false;
-      while (this.live()) {
+      while (running()) {
         let iter: ConsumerMessages;
         try {
           if (rebuild) await delay(RESUBSCRIBE_BACKOFF_MS);
+          if (!running()) break;
           rebuild = true;
           // A recreated stream restarts its sequences, so a position carried over from the old one
           // would skip the new stream's messages (or ask for a sequence past its tail forever).
@@ -379,7 +424,7 @@ export class NatsPlugin implements BackendPlugin {
         } catch {
           await this.deleteConsumer(stream, currentName);
           currentName = undefined;
-          if (!this.live()) break;
+          if (!running()) break;
           continue; // backend momentarily unreachable — retry the consumer after the backoff
         }
         current = iter;
@@ -402,17 +447,19 @@ export class NatsPlugin implements BackendPlugin {
         })();
 
         try {
-          let nextDelivery = 0;
+          let nextDelivery = 1;
           let stale = false;
           for await (const m of iter) {
             // Keep draining a closed iterator instead of breaking out: nats.js runs the teardown
             // that stops the status listeners as a QUEUED item, so an abandoned iterator leaves
             // `statusTask` below awaiting forever.
             if (stale) continue;
-            // Keep the delivery-sequence check: with `AckPolicy.None` the server counts a message
-            // as delivered the moment it writes it to the link, so a gap here is a message that no
-            // reconnect will ever resend — only rebuilding from `lastSeq + 1` gets it back.
-            if (this.stopped || (nextDelivery !== 0 && m.info.deliverySequence !== nextDelivery)) {
+            // Keep the delivery-sequence check, counted from 1 so the FIRST delivery is checked
+            // too: with `AckPolicy.None` the server counts a message as delivered the moment it
+            // writes it to the link, so a gap here — or a first message that is not delivery 1 —
+            // is a message no reconnect will resend; only rebuilding from `lastSeq + 1` gets it
+            // back, and any primed-state exemption hides the hole that opened before it arrived.
+            if (retired() || m.info.deliverySequence !== nextDelivery) {
               stale = true;
               void iter.close().catch(() => undefined);
               continue;
@@ -431,7 +478,7 @@ export class NatsPlugin implements BackendPlugin {
         await statusTask;
         await this.deleteConsumer(stream, currentName);
         currentName = undefined;
-        if (this.stopped) break; // only a clean disconnect ends the loop; every other exit rebuilds
+        if (retired()) break; // only a clean disconnect ends the loop; every other exit rebuilds
       }
     })();
   }

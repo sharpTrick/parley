@@ -30,11 +30,13 @@ export interface FakeState {
   /** How many `consume()` iterators end silently — no consumer-loss status event, just EOF. */
   silentExits: number;
   /**
-   * Sequences the FIRST `consume()` iterator counts as delivered and never yields — an
-   * `AckPolicy.None` message the server wrote to a link that was already gone. The client sees it
-   * only as a jump in `info.deliverySequence`.
+   * Sequences ONE `consume()` iterator counts as delivered and never yields — an `AckPolicy.None`
+   * message the server wrote to a link that was already gone. The client sees it only as a jump in
+   * `info.deliverySequence`. `swallowGeneration` says WHICH iterator swallows them (1 = the first),
+   * so a hole can be injected into a rebuilt consumer as well as into the original.
    */
   swallowed: number[];
+  swallowGeneration: number;
   /** `created` stamp both `streams.add` and `streams.info` report — the stream's incarnation. */
   streamCreated: string;
   /** How many `publish` calls report the stream as gone — the out-of-band-removal path. */
@@ -61,6 +63,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     throwOnClose: false,
     silentExits: 0,
     swallowed: [],
+    swallowGeneration: 1,
     publishMissing: 0,
     streamCreated: '2026-01-01T00:00:00.000000000Z',
     created: [],
@@ -110,7 +113,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
           consume: async () => {
             const generation = ++consumes;
             const silent = generation <= state.silentExits;
-            const swallowed = generation === 1 ? state.swallowed : [];
+            const swallowed = generation === state.swallowGeneration ? state.swallowed : [];
             let delivery = 0;
             let closed = false;
             return {

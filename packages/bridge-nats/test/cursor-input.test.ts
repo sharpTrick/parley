@@ -86,66 +86,64 @@ describe('nats catch-up survives a stream re-provisioned under the cursor', () =
   });
 });
 
+/** A valid cursor is a decimal sequence; each mutator turns one into something else. */
+const decorate = (base: string): string[] => [
+  ` ${base}`,
+  `${base} `,
+  `\u0009${base}`,
+  `${base}\u000a`,
+  `+${base}`,
+  `-${base}`,
+  `${base}.5`,
+  `${base}e9`,
+  `0x${base}`,
+  `${base},${base}`,
+  `${base}${'0'.repeat(20)}`,
+  `${base}n`,
+  `٢${base}`,
+];
 const junkCursors = [
   '',
-  ' 1 ',
-  '1 ',
-  '+1',
+  ' ',
   'abc',
-  '-1',
-  '1.5',
-  '1e999',
   'Infinity',
   'NaN',
-  '0x2',
-  '99999999999999999999',
   'null',
+  'undefined',
+  'true',
   '{}',
   '[]',
-  '1,2',
-  '\t2',
+  '1e999',
+  '9007199254740992',
   '٢',
+  '１',
+  ...decorate('7'),
 ];
 
+// Every row is pinned to ONE outcome for EVERY read shape: rejection, naming the offending value,
+// with nothing created on the server. A table that instead branches on the outcome it is validating
+// passes whether the cursor is rejected or silently coerced to "no since", which is the defect.
 describe('nats rejects a cursor it could not have minted', () => {
   for (const junk of junkCursors) {
-    for (const read of reads) {
-      it(`${read.name} with since=${JSON.stringify(junk)} fails loudly, never silently empty`, async () => {
-        const { plugin } = withRecords(ALL);
+    it(`since=${JSON.stringify(junk)} rejects on every read shape and never reaches the server`, async () => {
+      for (const read of reads) {
+        const { plugin, fake } = withRecords(ALL);
+        let pending: Promise<unknown> = Promise.resolve();
 
-        const outcome = await plugin
-          .fetchRecent({ topic: TOPIC, since: asCursor(junk), ...read.extra })
-          .then((page) => page, (err: unknown) => err);
+        // Keep the synchronous-throw check on every row: a throw OUT of a Promise-returning seam
+        // method escapes every caller that only wrote `.catch()`.
+        expect(() => {
+          pending = plugin.fetchRecent({ topic: TOPIC, since: asCursor(junk), ...read.extra });
+        }, read.name).not.toThrow();
 
-        if (outcome instanceof Error) {
-          expect(outcome.message).toMatch(/invalid nats cursor/);
-          expect(outcome.message).toContain(JSON.stringify(junk));
-          return;
-        }
-        expect(outcome.messages.length).toBeGreaterThan(0);
-        expect(outcome.nextCursor).not.toBe(junk);
-      });
-    }
+        const rejection = await pending.then(
+          () => new Error('resolved instead of rejecting'),
+          (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
+        );
+        expect(rejection.message, read.name).toMatch(/invalid nats cursor/);
+        expect(rejection.message, read.name).toContain(JSON.stringify(junk));
+        expect(fake.state.created, read.name).toEqual([]);
+      }
+    });
   }
-
-  it('a rejected cursor rejects the promise instead of throwing synchronously', async () => {
-    const { plugin } = withRecords(ALL);
-    let pending: Promise<unknown> | undefined;
-
-    expect(() => {
-      pending = plugin.fetchRecent({ topic: TOPIC, since: asCursor('abc') });
-    }).not.toThrow();
-
-    await expect(pending).rejects.toThrow(/invalid nats cursor/);
-  });
-
-  it('a rejected cursor never reaches the server', async () => {
-    const { plugin, fake } = withRecords(ALL);
-
-    await expect(plugin.fetchRecent({ topic: TOPIC, since: asCursor('abc') })).rejects.toThrow(
-      /invalid nats cursor/,
-    );
-
-    expect(fake.state.created).toEqual([]);
-  });
 });

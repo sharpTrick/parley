@@ -6,7 +6,9 @@ import { fakeJetStream, injectFake, payload } from './fake-jetstream.js';
 // Class: the sequence range of a stream is NOT dense. `max_age` retention prunes the front,
 // per-subject limits and message deletes punch holes, so `last_seq - since` over-counts what the
 // server can actually deliver. A read that asks for more than exists holds the pull open for its
-// whole `expires` — a flat multi-second stall on every catch-up page, invisible in the result.
+// whole `expires` — a flat multi-second stall on every catch-up page, invisible in the result. The
+// hole at `last_seq` ITSELF is the position no sequence-based break can catch, and the shapes are
+// generated rather than enumerated so front, interior and TAIL holes all occur by construction.
 const TOPIC = asTopic('window');
 const STREAM = 'PARLEY_window';
 const EXPIRY_MS = 1500;
@@ -14,13 +16,48 @@ const EXPIRY_MS = 1500;
 const stream = (seqs: number[]): { seq: number; data: string }[] =>
   seqs.map((seq) => ({ seq, data: payload(`m${seq}`) }));
 
-const shapes = [
+/** `tail`: what the server reports as `last_seq`, which a deleted tail message leaves above the data. */
+interface Shape {
+  name: string;
+  seqs: number[];
+  tail?: number;
+}
+
+const mulberry32 = (seed: number): (() => number) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
+/**
+ * A pseudo-random subset of 1..span whose reported `last_seq` stays `span`. `tailHole` decides
+ * whether `span` itself survives — left to chance it lands on one side or the other and the position
+ * that matters most stops being covered.
+ */
+const sparse = (seed: number, tailHole: boolean, span = 12): Shape => {
+  const rnd = mulberry32(seed);
+  const kept = Array.from({ length: span }, (_, i) => i + 1)
+    .filter(() => rnd() < 0.6)
+    .filter((s) => s !== span);
+  const seqs = tailHole ? kept : [...kept, span];
+  return {
+    name: `generated #${seed} ${tailHole ? 'with a hole at last_seq' : 'reaching last_seq'} [${seqs.join(',')}] of ${span}`,
+    seqs,
+    tail: span,
+  };
+};
+
+const shapes: Shape[] = [
   { name: 'dense stream', seqs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] },
   { name: 'front pruned by max_age', seqs: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20] },
   { name: 'front pruned and interior holes', seqs: [11, 12, 15, 16, 20] },
   { name: 'interior holes only', seqs: [1, 4, 5, 9, 10] },
   { name: 'single message far from seq 1', seqs: [500] },
   { name: 'everything pruned', seqs: [] },
+  { name: 'last_seq names a deleted message', seqs: [1, 2], tail: 3 },
+  { name: 'only message deleted, last_seq left behind', seqs: [], tail: 4 },
+  ...[1, 2].flatMap((seed) => [sparse(seed, true), sparse(seed, false)]),
 ];
 
 const positions: { name: string; since?: string; limit?: number }[] = [
@@ -36,7 +73,11 @@ describe('nats fetch window — a sparse range must not burn the pull expiry', (
   for (const shape of shapes) {
     for (const pos of positions) {
       it(`${shape.name}, ${pos.name}: returns promptly and never invents a window`, async () => {
-        const fake = fakeJetStream({ records: stream(shape.seqs), expiryMs: EXPIRY_MS });
+        const fake = fakeJetStream({
+          records: stream(shape.seqs),
+          expiryMs: EXPIRY_MS,
+          ...(shape.tail === undefined ? {} : { visibleTail: shape.tail }),
+        });
         const plugin = new NatsPlugin();
         injectFake(plugin, fake, STREAM);
         const args = {
@@ -55,6 +96,9 @@ describe('nats fetch window — a sparse range must not burn the pull expiry', (
         expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
         expect(seqs.every((s) => shape.seqs.includes(s))).toBe(true);
         if (page.messages.length > 0) expect(page.nextCursor).toBe(page.messages.at(-1)?.cursor);
+        // A read of the whole retained window must still be COMPLETE: ending the page on a quiet
+        // pull may not truncate it, which is the way a promptness fix goes wrong.
+        if (pos.since === undefined && pos.limit === undefined) expect(seqs).toEqual(shape.seqs);
       });
     }
   }
