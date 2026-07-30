@@ -2,7 +2,6 @@ import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { openRig } from './rig.js';
 
-/** Supergroup-shaped chat ids: the fake rejects anything real Telegram would 400 on. */
 let seq = 0;
 
 async function makeContext() {
@@ -13,15 +12,15 @@ async function makeContext() {
     // ingest path (the one getUpdates loop, or an own post) through ingest() — no second
     // getUpdates consumer. Run the shared blocking-fetch case directly against the plugin.
     supportsBlockingFetch: true,
-    // An unmapped topic is used as the chat id literal — a fresh chat per test.
+    // Supergroup-shaped chat ids, one fresh chat per test: the fake rejects anything real
+    // Telegram would 400 on, and an unmapped topic is used as the chat id literal.
     freshTopic: (): Topic => asTopic(String(-1_002_000_000_000 - ++seq)),
     carriesSenderIdentity: false, // posts as the bot account; `identity` is informational
     cleanup: rig.close,
+    // Keep concurrentPost 'unsupported', so that the multi-writer case does not open a second
+    // getUpdates consumer on a token Telegram allows exactly one on (HTTP 409), or a second writer
+    // on the one-process observed-message store. One telegram bridge per bot token (README).
     concurrentPost: 'unsupported' as const,
-    // NO concurrentPost, deliberately: Telegram allows exactly ONE getUpdates consumer per
-    // bot token (a second poller gets HTTP 409) and the observed-message store is one file
-    // per process — multi-instance writers are structurally unrepresentable on this backend,
-    // so conformance case 6 skips. Run exactly one telegram bridge per bot token (README).
   };
 }
 

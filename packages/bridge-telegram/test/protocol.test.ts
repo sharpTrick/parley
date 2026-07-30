@@ -171,21 +171,114 @@ describe('telegram getUpdates error handling', () => {
    * The two reasons a store refuses a record are fixed by different operator actions — raise
    * `observed_max_chats` versus free the disk the compaction could not reopen the store on — so
    * the diagnostic has to name which one happened rather than always blaming the chat cap.
+   *
+   * The second axis is WHO can act on it. An inbound update has no caller, so the throttled stderr
+   * line is all there is. `post` has one: resolving with a `backendMsgId` the store never took hands
+   * back an id no `fetchRecent` will ever return and no reconnect can recover (own posts never come
+   * back via `getUpdates`) — a silent, permanent loss on the one path where the caller is still
+   * there to be told. The plugin already refuses that outcome when a teardown causes it; the cause
+   * cannot be what decides.
    */
-  it.each([
+  const REFUSAL_CAUSES = [
     { name: 'the chat cap', open: true, cause: /maximum number of chats/ },
     { name: 'a store with no append descriptor', open: false, cause: /no append descriptor/ },
-  ])('names $name as the reason a record was dropped', async ({ open, cause }) => {
+  ];
+  const REFUSAL_CELLS = REFUSAL_CAUSES.flatMap((refusal) =>
+    (['an inbound update', 'an own post'] as const).map((path) => ({ ...refusal, path })),
+  );
+
+  it.each(REFUSAL_CELLS)('names $name as the reason $path was dropped', async ({ open, cause, path }) => {
     const fake = await startFake();
     const stderr = captureStderr();
-    await connectTo(fake);
+    const store = storePath();
+    const plugin = await connectPlugin(fake, store);
+    const chat = '-1009450001';
     vi.spyOn(ObservedStore.prototype, 'append').mockReturnValue(undefined);
     vi.spyOn(ObservedStore.prototype, 'isOpen').mockReturnValue(open);
 
-    fake.injectUserMessage('-1009450001', 'alice', 'dropped');
-    await vi.waitFor(() => expect(stderr.join('')).toMatch(cause), { timeout: 8000, interval: 20 });
-    expect(stderr.join('')).toContain('-1009450001');
+    if (path === 'an inbound update') {
+      fake.injectUserMessage(chat, 'alice', 'dropped');
+      await vi.waitFor(() => expect(stderr.join('')).toMatch(cause), { timeout: 8000, interval: 20 });
+      expect(stderr.join('')).toContain(chat);
+      return;
+    }
+    const err = await plugin.post(asTopic(chat), SENDER, 'dropped').then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    // Telegram accepted it, so the rejection has to name what exists upstream and where it is
+    // missing — the caller cannot otherwise tell this from a message that never left.
+    expect(fake.sent.at(-1)?.text).toBe('dropped');
+    expect(err?.message).toContain(`${chat}:1`);
+    expect(err?.message).toContain(store);
+    expect((await plugin.fetchRecent({ topic: asTopic(chat), limit: 100 })).messages).toEqual([]);
   }, 20_000);
+});
+
+/**
+ * A memoized resolution must never remember a FAILURE. `chatIdByTopic` and `canonicalById` live for
+ * the whole connection, so one transient `getChat` failure would otherwise make an
+ * `@channelusername` topic permanently unresolvable: every post, subscribe and catch-up on it
+ * rejects for the life of the connection, and core's presence loop swallows the rejection, so the
+ * only symptom is a topic that is silently never delivered. Each cell fails the resolution ONCE and
+ * then repeats the identical call on the same instance.
+ */
+describe('telegram transient resolution failures', () => {
+  const FAILURES = [
+    {
+      name: 'a 500',
+      arm: (f: FakeTelegram) => f.failMethod('getChat', { status: 500, description: 'Internal Server Error' }),
+      clear: (f: FakeTelegram) => f.failMethod('getChat', undefined),
+    },
+    {
+      name: 'a transport failure',
+      arm: (f: FakeTelegram) => f.stallMethod('getChat', 'close-mid-body'),
+      clear: (f: FakeTelegram) => f.stallMethod('getChat', undefined),
+    },
+    {
+      name: 'a 429 asking for longer than the call has',
+      arm: (f: FakeTelegram) =>
+        f.failMethod('getChat', {
+          status: 429,
+          description: 'Too Many Requests: retry later',
+          retryAfterBody: 3600,
+        }),
+      clear: (f: FakeTelegram) => f.failMethod('getChat', undefined),
+    },
+    {
+      name: 'a 2xx carrying ok:false',
+      arm: (f: FakeTelegram) =>
+        f.malformMethod('getChat', '{"ok":false,"error_code":400,"description":"chat not found"}'),
+      clear: (f: FakeTelegram) => f.malformMethod('getChat', undefined),
+    },
+  ];
+  const RESOLVING_CALLS = ['post', 'fetchRecent', 'subscribe'] as const;
+  const MEMO_CELLS = FAILURES.flatMap((failure) =>
+    RESOLVING_CALLS.map((call) => ({ failure, call })),
+  );
+
+  it.each(MEMO_CELLS)(
+    '$failure.name resolving a topic fails $call once, and the next identical call succeeds',
+    async ({ failure, call }) => {
+      const fake = await startFake();
+      captureStderr();
+      const plugin = await connectTo(fake);
+      const topic = asTopic(KNOWN_CHANNEL.username);
+      const invoke = (): Promise<unknown> => {
+        if (call === 'post') return plugin.post(topic, SENDER, 'x');
+        if (call === 'fetchRecent') return plugin.fetchRecent({ topic });
+        return plugin.subscribe(topic, () => undefined);
+      };
+
+      failure.arm(fake);
+      await expect(invoke()).rejects.toThrow();
+      failure.clear(fake);
+      await expect(invoke()).resolves.not.toThrow();
+      // And the resolution really happened rather than being served from a poisoned memo.
+      await expect(plugin.fetchRecent({ topic, limit: 100 })).resolves.toBeDefined();
+    },
+    20_000,
+  );
 });
 
 /**
@@ -280,30 +373,56 @@ describe('telegram getUpdates acknowledgement', () => {
   }, 20_000);
 
   /**
-   * The cadence must not depend on the long poll being honoured. A proxy or a local Bot API server
-   * that answers `getUpdates` immediately would otherwise spin the single ingestion loop at the
-   * speed of the network — hundreds of requests a second against the operator's bot token, which
-   * is a flood-wait or a ban and no message loss anyone would notice first.
+   * The cadence must not depend on the upstream behaving. It is a property of the LOOP — "this
+   * iteration acknowledged nothing, so wait" — never of the answer's shape: a floor that only reads
+   * `updates.length === 0` is skipped entirely by an upstream that answers instantly with a batch it
+   * never retires, which spins the single ingestion loop at the speed of the network against the
+   * operator's bot token. That is a flood wait or a ban, and every record in the batch dedups, so
+   * there is no message loss to notice it by. One row per way a poll can come back without progress.
    */
-  it.each([1, 25, 50])(
-    'stays below a handful of polls a second at poll_timeout_s %i when the long poll is ignored',
-    async (pollTimeoutS) => {
+  const MISBEHAVIOURS = [
+    { name: 'the long poll is ignored', longPoll: true, offset: false, seed: false },
+    { name: 'offset is ignored', longPoll: false, offset: true, seed: true },
+    { name: 'an already-consumed batch is re-served', longPoll: true, offset: true, seed: true },
+    { name: 'only non-message updates arrive', longPoll: true, offset: false, seed: false, kind: 'edited' },
+  ];
+  const CADENCE_CELLS = [1, 25, 50].flatMap((pollTimeoutS) =>
+    MISBEHAVIOURS.map((misbehaviour) => ({ pollTimeoutS, misbehaviour })),
+  );
+
+  it.each(CADENCE_CELLS)(
+    'stays below a handful of polls a second at poll_timeout_s $pollTimeoutS when $misbehaviour.name',
+    async ({ pollTimeoutS, misbehaviour }) => {
       const fake = await startFake();
       const plugin = await connectTo(fake, { poll_timeout_s: pollTimeoutS });
-      fake.ignoreLongPoll(true);
       const chat = '-1009200002';
       const topic = asTopic(chat);
       const live: Message[] = [];
       await plugin.subscribe(topic, (m) => live.push(m));
+      // Arm the misbehaviour BEFORE seeding: an upstream that still honours `offset` deletes the
+      // batch as soon as the loop reads it, and there is then nothing left for it to re-serve.
+      fake.ignoreLongPoll(misbehaviour.longPoll);
+      fake.ignoreOffset(misbehaviour.offset);
+      if (misbehaviour.seed) {
+        fake.injectUserMessage(chat, 'alice', 'seed');
+        await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('seed'), {
+          timeout: 5000,
+          interval: 10,
+        });
+      }
+      if (misbehaviour.kind === 'edited') {
+        for (let i = 0; i < 5; i++) fake.injectRawUpdate({ edited_message: { message_id: i } });
+      }
 
       const calls = fake.callCount('getUpdates');
       await new Promise((r) => setTimeout(r, 1000));
-      expect(fake.callCount('getUpdates') - calls).toBeLessThanOrEqual(8);
-
-      // Throttled, not stalled: a message still arrives promptly.
+      const spent = fake.callCount('getUpdates') - calls;
+      expect(spent).toBeLessThanOrEqual(8);
+      // Throttled, never stalled: the loop is still polling, and a message still arrives promptly.
+      expect(spent).toBeGreaterThan(0);
       fake.injectUserMessage(chat, 'alice', 'still flowing');
       await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('still flowing'), {
-        timeout: 3000,
+        timeout: 5000,
         interval: 10,
       });
     },

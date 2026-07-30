@@ -72,6 +72,7 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 const { ObservedStore } = await import('../src/store.js');
+const { captureStderr } = await import('./rig.js');
 const { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await vi.importActual<
   typeof import('node:fs')
 >('node:fs');
@@ -139,13 +140,18 @@ describe('telegram ObservedStore compaction survives an interruption', () => {
   });
 
   it.each(INTERRUPTIONS)('at RUNTIME, %s leaves the store appendable and its fd valid', (at) => {
+    const stderr = captureStderr();
     const store = new ObservedStore(path, 2);
     expect(store.isOpen()).toBe(true);
     // Each append past the cap evicts one record; the second arms the amortized rewrite.
     expect(store.append(record(50, 50))).toBeDefined();
     const beforeCompaction = contentsOnDisk();
     interruption.at = at;
-    expect(() => store.append(record(51, 51))).toThrow(FAILURE[at]);
+    // The record is durable BEFORE the compaction runs, so the amortized rewrite failing is
+    // reported — never turned into a failed append the caller would report as a lost message.
+    expect(store.append(record(51, 51))).toBeDefined();
+    expect(stderr.join('')).toMatch(FAILURE[at]);
+    expect(stderr.join('')).toContain(`could not compact ${path}`);
     interruption.at = undefined;
 
     expect(store.isOpen()).toBe(true);

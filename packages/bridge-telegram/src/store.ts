@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -170,6 +171,10 @@ export class ObservedStore {
   private evictedSinceRewrite = 0;
   /** Persistent append descriptor — one open fd for the process, not open/close per append. */
   private fd: number | undefined;
+  /** Set by {@link close} — the difference between "released on purpose" and "lost the fd". */
+  private closed = false;
+  /** Wall-clock of the last compaction-failure diagnostic — the class throttle for it. */
+  private lastCompactReportAt = 0;
 
   constructor(
     private readonly path: string,
@@ -228,19 +233,61 @@ export class ObservedStore {
    * bounds. Returns the stored record, or `undefined` (writing nothing) when the record is
    * refused: its composite id was already observed — dedup holds when the same message arrives
    * twice, e.g. a `getUpdates` backlog replayed after a restart, whether or not retention has
-   * since evicted the record — or every retained chat is served and this one is not, or there is
-   * no append descriptor ({@link isOpen}).
+   * since evicted the record — or every retained chat is served and this one is not, or no append
+   * descriptor can be opened ({@link isOpen}). A refusal is silent here and LOUD at the seam: the
+   * plugin reports a dropped inbound update and rejects a `post` Telegram has already accepted.
    */
   append(observed: ObservedRecord): StoredRecord | undefined {
     if (this.has(keyOf(observed))) return undefined;
-    if (this.fd === undefined) return undefined;
+    const fd = this.openFd();
+    if (fd === undefined) return undefined;
     if (!this.admit(observed.chat_id)) return undefined;
     const rec: StoredRecord = { ...observed, seq: this.nextSeq++ };
-    appendFileSync(this.fd, `${JSON.stringify(rec)}\n`);
+    appendFileSync(fd, `${JSON.stringify(rec)}\n`);
     this.index(rec);
     this.applyRetention();
-    this.compactIfDue();
+    // Compaction is amortization, not durability: the record is already on disk and indexed here,
+    // so keep a failing rewrite off this return path — a throw would tell the caller its message was
+    // dropped while the store serves it, and no subscriber or parked long poll would ever see it.
+    try {
+      this.compactIfDue();
+    } catch (err) {
+      this.reportCompactionFailure(err);
+    }
     return rec;
+  }
+
+  /**
+   * A compaction that keeps failing fails on every append. Throttle the diagnostic to one line a
+   * minute — the same class throttle index.ts uses — so that a squatted temp path or a full disk
+   * cannot bury the store's other diagnostics under one line per message.
+   */
+  private reportCompactionFailure(err: unknown): void {
+    const now = Date.now();
+    if (now - this.lastCompactReportAt < 60_000) return;
+    this.lastCompactReportAt = now;
+    process.stderr.write(
+      `parley-telegram: could not compact ${this.path} ` +
+        `(${err instanceof Error ? err.message : String(err)}) — every record is retained and the ` +
+        `rewrite is retried on a later append\n`,
+    );
+  }
+
+  /**
+   * Hold the append descriptor, reopening one a failed compaction could not restore. Keep the
+   * retry, so that one transient EMFILE/ENOSPC inside a rewrite does not turn the store into a
+   * permanent black hole that refuses every later record. A store {@link close}d on purpose stays
+   * closed.
+   */
+  private openFd(): number | undefined {
+    if (this.fd !== undefined) return this.fd;
+    if (this.closed) return undefined;
+    try {
+      this.fd = openSync(this.path, 'a', OWNER_ONLY_FILE);
+    } catch {
+      return undefined;
+    }
+    return this.fd;
   }
 
   /**
@@ -289,6 +336,7 @@ export class ObservedStore {
     this.seen.clear();
     this.evicted.clear();
     this.served.clear();
+    this.closed = true;
     if (this.fd !== undefined) {
       closeSync(this.fd);
       this.fd = undefined;
@@ -407,10 +455,7 @@ export class ObservedStore {
       for (const rec of list) lines.push(JSON.stringify(rec));
     }
     const tmp = `${this.path}.tmp`;
-    // Keep the temp file owner-only, so that the rename cannot install a wider mode over a store
-    // that was tightened when it was created.
-    const fd = openSync(tmp, 'w', OWNER_ONLY_FILE);
-    restrictMode(tmp);
+    const fd = this.openTemp(tmp);
     try {
       if (lines.length > 0) writeSync(fd, `${lines.join('\n')}\n`);
       fsyncSync(fd);
@@ -428,17 +473,48 @@ export class ObservedStore {
     this.evictedSinceRewrite = 0;
   }
 
-  /** Adopt a loaded record's observation sequence, or stamp one if the file predates them. */
+  /**
+   * The compaction target, CREATED by this call. `<path>.tmp` is predictable and the rename
+   * publishes whatever it names over the store, so open it exclusively (`wx` — `O_EXCL|O_CREAT`
+   * refuses an existing file and never follows a symlink) and refuse anything already there that is
+   * not a regular file. Otherwise anyone who can create a file in the store's directory redirects
+   * the full plaintext of every observed message, and gets its mode changed for them.
+   */
+  private openTemp(tmp: string): number {
+    try {
+      return openSync(tmp, 'wx', OWNER_ONLY_FILE);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    if (!lstatSync(tmp).isFile()) {
+      throw new Error(
+        `ObservedStore: refusing to compact through '${tmp}' — it exists and is not a regular ` +
+          `file, so the rename would publish it as the observed-message store. Remove it.`,
+      );
+    }
+    unlinkSync(tmp);
+    return openSync(tmp, 'wx', OWNER_ONLY_FILE);
+  }
+
+  /**
+   * Adopt a loaded record's observation sequence. A line carrying none is garbled — the loader's
+   * try/catch drops it. Keep it a drop rather than a fresh stamp, so that a damaged line cannot be
+   * handed a sequence an agent's cursor already sits above and become permanently unreachable.
+   */
   private stamp(raw: Partial<StoredRecord> & ObservedRecord): StoredRecord {
-    const seq =
-      typeof raw.seq === 'number' && Number.isInteger(raw.seq) && raw.seq > 0
-        ? raw.seq
-        : this.nextSeq;
+    const { seq } = raw;
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq <= 0) {
+      throw new Error('record carries no observation sequence');
+    }
     if (seq >= this.nextSeq) this.nextSeq = seq + 1;
     return { ...raw, seq };
   }
 
-  /** Index a record: dedup-set + in-order insert (append-at-tail is the common case). */
+  /**
+   * Index a record: dedup-set + append at the chat's tail. Sequences are stamped strictly
+   * increasing and the file is written in per-chat order, so a chat's records only ever arrive
+   * ascending.
+   */
   private index(rec: StoredRecord): void {
     const id = keyOf(rec);
     if (this.seen.has(id)) return;
@@ -451,20 +527,6 @@ export class ObservedStore {
       this.byChat.delete(rec.chat_id);
     }
     this.byChat.set(rec.chat_id, list);
-    const last = list.at(-1);
-    if (last === undefined || last.seq < rec.seq) {
-      list.push(rec);
-      return;
-    }
-    // Rare out-of-order arrival (e.g. store lines interleaved across chats on reload):
-    // binary-search the insertion point to keep the array sorted ascending.
-    let lo = 0;
-    let hi = list.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if ((list[mid]?.seq ?? 0) < rec.seq) lo = mid + 1;
-      else hi = mid;
-    }
-    list.splice(lo, 0, rec);
+    list.push(rec);
   }
 }

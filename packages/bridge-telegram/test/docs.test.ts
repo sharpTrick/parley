@@ -191,6 +191,37 @@ describe('telegram test suite hygiene', () => {
     },
   ];
 
+  /**
+   * A comment about a conformance-context field that does not sit on that field is a claim nothing
+   * can fail on: `concurrentPost: 'unsupported'` carried a note reading "NO concurrentPost,
+   * deliberately" — telling a maintainer the field was absent when it was present, and the two
+   * spellings select different conformance clauses. Anchor every such note to the field it
+   * describes, so that changing a field cannot leave its narration behind.
+   */
+  it('annotates each conformance context field on the field itself', () => {
+    const lines = readFileSync(join(here, 'conformance.test.ts'), 'utf8').split('\n');
+    const fieldOn = (line: string): string | undefined => /^ {4}(\w+):/.exec(line)?.[1];
+    const fields = lines.map(fieldOn).filter((f): f is string => f !== undefined);
+    // Only multi-word identifiers: a bare `plugin` or `cleanup` is an English word a comment may
+    // use about anything, and a lint that reads those as references fires on ordinary prose.
+    const referable = fields.filter((f) => /[A-Z_]/.test(f));
+    expect(referable).toContain('concurrentPost');
+
+    let checked = 0;
+    for (const [i, line] of lines.entries()) {
+      const comment = /^\s*(?:\/\/|\*|\/\*)(.*)$/.exec(line)?.[1];
+      if (comment === undefined) continue;
+      const named = referable.filter((f) => new RegExp(`\\b${f}\\b`).test(comment));
+      if (named.length === 0) continue;
+      checked++;
+      // A trailing comment annotates its own line; a standalone one annotates the next field.
+      const annotated = fieldOn(line) ?? lines.slice(i + 1).map(fieldOn).find((f) => f !== undefined);
+      expect({ line: comment.trim(), annotated }).toEqual({ line: comment.trim(), annotated: named[0] });
+    }
+    // A rule nothing exercises is not a rule: at least one field carries a note naming it.
+    expect(checked).toBeGreaterThan(0);
+  });
+
   it.each(RIG_SHAPES)('leaves $what to rig.ts alone', ({ matches }) => {
     // rig.ts is the positive control: patterns that stop matching there make the list below vacuous.
     expect(matches(readFileSync(join(here, 'rig.ts'), 'utf8'))).toBe(true);

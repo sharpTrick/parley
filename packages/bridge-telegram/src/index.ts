@@ -20,6 +20,7 @@ import {
   delay,
   fetchWithRetry,
   retryAfterFromHeader,
+  sanitizeBody,
   statusOf,
 } from '@sharptrick/parley-net-util';
 import { keyOf, type ObservedRecord, ObservedStore, type StoredRecord } from './store.js';
@@ -276,9 +277,9 @@ export class TelegramPlugin implements BackendPlugin {
     // or thread onto an unrelated message that happens to share the number.
     const replyMid = parseCompositeMid(opts?.inReplyTo, chatId);
     if (replyMid !== undefined) body.reply_to_message_id = replyMid;
-    const json = await this.call<{ result: TgMessage }>('POST', '/sendMessage', { body });
-    const sentChatId = String(json.result.chat.id);
-    const sentId = keyOf({ chat_id: sentChatId, message_id: json.result.message_id });
+    const sent = requireSentMessage(await this.call('POST', '/sendMessage', { body }));
+    const sentChatId = String(sent.chat.id);
+    const sentId = keyOf({ chat_id: sentChatId, message_id: sent.message_id });
     // Re-assert AFTER the send too: a teardown landing here leaves a message Telegram has already
     // accepted and no store to record it in, and own posts never come back via `getUpdates`, so
     // reconnecting cannot recover it. Name the id, so that the caller knows what exists upstream.
@@ -289,7 +290,23 @@ export class TelegramPlugin implements BackendPlugin {
           `observed-message store at '${this.storePath}' (own posts never arrive via getUpdates).`,
       );
     }
-    this.ingest(store, sentChatId, json.result);
+    let refusal: unknown;
+    try {
+      this.ingest(store, sentChatId, sent);
+    } catch (err) {
+      refusal = err;
+    }
+    // The same outcome the teardown branch above refuses, from the other cause: Telegram has the
+    // message and the store did not take it. Resolving anyway hands back a `backendMsgId` no
+    // `fetchRecent` will ever return, which nothing downstream can detect.
+    if (!store.has(sentId)) {
+      throw new Error(
+        `TelegramPlugin: Telegram accepted ${sentId} and the observed-message store at ` +
+          `'${this.storePath}' did not record it, so the message exists in the chat and is ` +
+          `unreachable here (own posts never arrive via getUpdates)` +
+          `${refusal === undefined ? '' : `: ${describe(refusal)}`}`,
+      );
+    }
     return asBackendMsgId(sentId);
   }
 
@@ -490,11 +507,14 @@ export class TelegramPlugin implements BackendPlugin {
     }
     const cached = this.canonicalById.get(chat);
     if (cached !== undefined) return cached;
-    const pending = this.call<{ result: { id: number } }>(
-      'GET',
-      `/getChat?chat_id=${encodeURIComponent(chat)}`,
-    )
-      .then((json) => String(json.result.id))
+    const pending = this.call('GET', `/getChat?chat_id=${encodeURIComponent(chat)}`)
+      .then((result) => {
+        const id = (result as { id?: unknown }).id;
+        if (typeof id !== 'number' && typeof id !== 'string') {
+          throw new Error('Telegram GET /getChat → result: chat carries no id');
+        }
+        return String(id);
+      })
       .catch((err: unknown) => {
         // Don't poison the memo on transient failure — let the next call retry.
         this.canonicalById.delete(chat);
@@ -570,12 +590,15 @@ export class TelegramPlugin implements BackendPlugin {
       let updates: TgUpdate[];
       const startedAt = Date.now();
       try {
-        const json = await this.call<{ result?: TgUpdate[] }>(
+        const result = await this.call(
           'GET',
           `/getUpdates?timeout=${this.pollTimeoutS}&offset=${offset}`,
           { budgetMs: this.pollBudgetMs(), abortOnDisconnect: true },
         );
-        updates = json.result ?? [];
+        if (!Array.isArray(result)) {
+          throw new Error('Telegram GET /getUpdates → result: not an array of updates');
+        }
+        updates = result as TgUpdate[];
       } catch (err) {
         if (this.generation !== generation) break;
         const status = statusOf(err);
@@ -594,13 +617,7 @@ export class TelegramPlugin implements BackendPlugin {
         continue;
       }
       if (this.generation !== generation) break;
-      // Keep a floor under the IDLE loop, so that an upstream ignoring `timeout` (a proxy, a local
-      // Bot API server) cannot turn the single ingestion path into a request flood against the
-      // operator's bot token. A poll carrying updates is never throttled.
-      if (updates.length === 0) {
-        const idle = Date.now() - startedAt;
-        if (idle < MIN_IDLE_POLL_MS) await delay(MIN_IDLE_POLL_MS - idle);
-      }
+      const ackedBefore = offset;
       for (const u of updates) {
         offset = Math.max(offset, u.update_id + 1);
         const msg = u.message ?? u.channel_post;
@@ -612,6 +629,15 @@ export class TelegramPlugin implements BackendPlugin {
           // recoverable, losing the only getUpdates consumer takes live push down for good.
           this.report(`dropped update ${u.update_id}: ${describe(err)}`, { throttleAs: 'ingest' });
         }
+      }
+      // Keep a floor under an iteration that made NO PROGRESS, so that an upstream ignoring
+      // `timeout` OR ignoring `offset` (a proxy, a local Bot API server) cannot turn the single
+      // ingestion path into a request flood against the operator's bot token. Keying this on the
+      // acknowledgement rather than on the answer being empty, so that a batch re-served forever is
+      // throttled too — every record in it dedups, so nothing else would ever make it visible.
+      if (offset === ackedBefore) {
+        const idle = Date.now() - startedAt;
+        if (idle < MIN_IDLE_POLL_MS) await delay(MIN_IDLE_POLL_MS - idle);
       }
     }
   }
@@ -640,23 +666,27 @@ export class TelegramPlugin implements BackendPlugin {
     process.stderr.write(`parley-telegram: ${message}\n`);
   }
 
-  /** Memoized `getMe` — one network call per connect, shared by concurrent resolvers. */
+  /**
+   * Memoized `getMe` — one network call per connect, shared by concurrent resolvers. Only
+   * `connect` can populate this memo with a rejection, and `connect` clears it before every
+   * attempt, so a failure never has to be evicted here.
+   */
   private getMe(): Promise<{ id: number; username?: string }> {
     const existing = this.me;
     if (existing !== undefined) return existing;
-    const pending = this.call<{ result: { id: number; username?: string } }>('GET', '/getMe')
-      .then((json) => json.result)
-      .catch((err: unknown) => {
-        // Don't poison the memo on transient failure — let the next call retry.
-        this.me = undefined;
-        throw err;
-      });
+    const pending = this.call('GET', '/getMe').then((result) => {
+      const me = result as { id?: unknown; username?: unknown };
+      if (typeof me.id !== 'number') {
+        throw new Error('Telegram GET /getMe → result: bot identity carries no numeric id');
+      }
+      return { id: me.id, username: typeof me.username === 'string' ? me.username : undefined };
+    });
     this.me = pending;
     return pending;
   }
 
   /**
-   * Single HTTP entry point (`<api_url>/bot<token><path>`) → parsed JSON body. Transparently
+   * Single HTTP entry point (`<api_url>/bot<token><path>`) → the envelope's `result`. Transparently
    * retries on 429 honoring Telegram's `parameters.retry_after` (SECONDS); retries stop the
    * moment we disconnect. Throws on any other non-2xx as an `HttpStatusError` carrying the
    * status as a field (the poll loop reads it with `statusOf`).
@@ -668,11 +698,11 @@ export class TelegramPlugin implements BackendPlugin {
    * the connection and then answers slowly, half-answers or never answers surfaces as a retryable
    * error rather than parking the caller forever.
    */
-  private async call<T>(
+  private async call(
     method: string,
     path: string,
     opts?: { body?: unknown; budgetMs?: number; abortOnDisconnect?: boolean },
-  ): Promise<T> {
+  ): Promise<unknown> {
     const url = `${this.apiUrl}/bot${this.token}${path}`;
     const headers: Record<string, string> = {};
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
@@ -697,7 +727,7 @@ export class TelegramPlugin implements BackendPlugin {
           deadlineMs: opts?.budgetMs ?? REQUEST_BUDGET_MS,
         },
       );
-      return (await res.json()) as T;
+      return unwrapEnvelope(label, await res.text());
     } finally {
       this.controllers.delete(controller);
     }
@@ -723,6 +753,53 @@ export class TelegramPlugin implements BackendPlugin {
       );
     }
   }
+}
+
+/**
+ * The Bot API's own success signal: `{ok, result}`, where a REFUSAL is a 2xx carrying `ok:false`
+ * and a `description`. Keep this ahead of every caller, so that a rejecting middlebox or a
+ * non-conforming local Bot API server fails the call it broke — naming the endpoint and the
+ * upstream's own words — instead of passing `connect`'s preflight and resurfacing later as a
+ * contextless TypeError on a field that was never there.
+ *
+ * The body is untrusted and a thrown message becomes model context, so everything quoted out of it
+ * goes through net-util's `sanitizeBody`.
+ */
+function unwrapEnvelope(label: string, text: string): unknown {
+  const quote = (raw: string): string =>
+    raw.trim() === '' ? '<empty body>' : sanitizeBody(raw);
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new Error(`${label} → body: not JSON: ${quote(text)}`);
+  }
+  const env = body as { ok?: unknown; result?: unknown; description?: unknown } | null;
+  if (env === null || typeof env !== 'object' || Array.isArray(env)) {
+    throw new Error(`${label} → body: not a Bot API envelope: ${quote(text)}`);
+  }
+  if (env.ok !== true) {
+    throw new Error(
+      `${label} → ok:false: ${typeof env.description === 'string' ? quote(env.description) : quote(text)}`,
+    );
+  }
+  if (env.result === undefined || env.result === null) {
+    throw new Error(`${label} → ok:true with no result: ${quote(text)}`);
+  }
+  return env.result;
+}
+
+/** The `sendMessage` result, or a labelled failure — `post` reads two fields off it. */
+function requireSentMessage(result: unknown): TgMessage {
+  const msg = result as TgMessage | null;
+  if (msg === null || typeof msg !== 'object' || typeof msg.message_id !== 'number') {
+    throw new Error('Telegram POST /sendMessage → result: not a message object');
+  }
+  const id = (msg.chat as { id?: unknown } | undefined)?.id;
+  if (typeof id !== 'number' && typeof id !== 'string') {
+    throw new Error('Telegram POST /sendMessage → result: message carries no chat id');
+  }
+  return msg;
 }
 
 /**
@@ -813,7 +890,7 @@ function defaultStorePath(): string {
 /** Statuses that mean the token/URL itself is wrong — retrying can only make it worse. */
 const FATAL_POLL_STATUSES = [401, 403, 404];
 
-/** Floor on how fast {@link TelegramPlugin.pollLoop} may re-poll after an EMPTY answer. */
+/** Floor on how fast {@link TelegramPlugin.pollLoop} may re-poll after an answer that acked nothing. */
 const MIN_IDLE_POLL_MS = 250;
 
 /**

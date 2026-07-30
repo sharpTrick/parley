@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
@@ -500,6 +500,81 @@ describe('telegram poll-loop fault isolation', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(unhandled).toEqual([]);
   });
+});
+
+/**
+ * Store-visibility and delivery are ONE decision, and a step that runs after the record is already
+ * durable must not be able to split them. The amortized compaction is that step: it runs at the end
+ * of `append`, so a full disk or an unusable temp path used to throw out of a write that had already
+ * succeeded — the caller was told the message was dropped, no live subscriber was pushed it, and a
+ * parked long poll waited out its whole budget for a message the very next `fetchRecent` returned.
+ *
+ * Each cell fails one step on one ingest path and grades the invariant in BOTH directions: a record
+ * `fetchRecent` can see also reached every subscriber and woke every waiter, or it is absent
+ * everywhere and the caller was told so.
+ */
+describe('telegram store visibility and delivery', () => {
+  const FAILING_STEPS = [
+    { name: 'the record write', durable: false },
+    { name: 'the compaction after the write', durable: true },
+  ];
+  const INGEST_PATHS = ['an inbound update', 'an own post'] as const;
+  const AGREEMENT_CELLS = FAILING_STEPS.flatMap((step) =>
+    INGEST_PATHS.map((path) => ({ ...step, path })),
+  );
+
+  it.each(AGREEMENT_CELLS)('never disagree when $name fails on $path', async ({ durable, path }) => {
+    const stderr = captureStderr();
+    // Newest-1, so the very next append evicts and arms the amortized rewrite.
+    const rig = await startRig({ observed_retention_per_chat: 1 });
+    const chat = '-1006100001';
+    const topic = asTopic(chat);
+    await rig.plugin.post(topic, SENDER, 'seed');
+    const tail = (await rig.plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
+    const live: Message[] = [];
+    await rig.plugin.subscribe(topic, (m) => live.push(m));
+    const parked = rig.plugin.fetchRecent({ topic, since: tail, blockMs: 1500 });
+
+    if (durable) {
+      // A directory at the temp path: every compaction fails, and none of them can touch a record.
+      mkdirSync(`${rig.storePath}.tmp`);
+    } else {
+      vi.spyOn(ObservedStore.prototype, 'append').mockImplementationOnce(() => {
+        throw new Error('ENOSPC: no space left on device');
+      });
+    }
+
+    let postError: Error | undefined;
+    if (path === 'an own post') {
+      postError = await rig.plugin.post(topic, SENDER, 'subject').then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+    } else {
+      rig.fake.injectUserMessage(chat, 'alice', 'subject');
+    }
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await contentsOf(rig.plugin, topic)).includes('subject') ||
+            /dropped update/.test(stderr.join('')) ||
+            postError !== undefined,
+        ).toBe(true),
+      { timeout: 5000, interval: 20 },
+    );
+
+    // The step under test really failed — a cell whose obstruction never bit would grade nothing.
+    const reported = `${stderr.join('')}${postError?.message ?? ''}`;
+    expect(reported).toMatch(durable ? /could not compact/ : /ENOSPC/);
+    const woke = (await parked).messages.map((m) => m.content).includes('subject');
+    expect({
+      visible: (await contentsOf(rig.plugin, topic)).includes('subject'),
+      pushed: live.map((m) => m.content).includes('subject'),
+      woke,
+    }).toEqual({ visible: durable, pushed: durable, woke: durable });
+    // A post whose record never landed is never a resolved post.
+    if (path === 'an own post') expect(postError === undefined).toBe(durable);
+  }, 20_000);
 });
 
 /**

@@ -1,10 +1,15 @@
+import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -68,6 +73,37 @@ describe('telegram ObservedStore durability', () => {
     expect(reloaded.entries('1').map((r) => r.content)).toEqual(['first', 'third']);
     expect(reloaded.has(keyOf(recC))).toBe(true);
     reloaded.close();
+  });
+
+  /**
+   * A line with no observation sequence is a damaged line, not an older format: the sequence IS the
+   * cursor, so minting a fresh one for it files a record an agent's held cursor already sits above,
+   * where nothing can ever reach it. Drop it like any other garbled line and let the redelivery in.
+   */
+  it('drops a stored line carrying no observation sequence instead of minting one', () => {
+    const seqless = {
+      chat_id: '1',
+      message_id: 2,
+      sender: 's',
+      content: 'seqless',
+      ts: '2024-01-01T00:00:00.000Z',
+    };
+    writeFileSync(
+      path,
+      `${[
+        JSON.stringify(record('1', 1, 'first')),
+        JSON.stringify(seqless),
+        JSON.stringify(record('1', 3, 'third')),
+      ].join('\n')}\n`,
+    );
+
+    const store = new ObservedStore(path);
+    expect(store.entries('1').map((r) => r.content)).toEqual(['first', 'third']);
+    // Its id was never observed, so a redelivery of it is admitted — above every issued cursor.
+    expect(store.has(keyOf(seqless))).toBe(false);
+    expect(store.append(seqless)?.seq).toBe(4);
+    expect(store.entries('1').map((r) => r.seq)).toEqual([1, 3, 4]);
+    store.close();
   });
 
   it('bounds a pre-written file to newest-N, compacts it, and frees the fd on close', () => {
@@ -253,6 +289,68 @@ describe('telegram ObservedStore durability', () => {
     reloaded.close();
   });
 
+  /**
+   * The ordering and dedup rules over a GENERATED history rather than the shapes someone thought to
+   * write down: random chats, random message_ids, reloads at random points, with retention and
+   * compaction biting throughout. These are the invariants that make an in-order insert unnecessary
+   * — a chat's records only ever arrive ascending — so they are what has to hold if the append path
+   * is ever simplified again, and they fail on a whole class of ordering defects rather than on one
+   * input. Every run is a fixed seed, so a failure is reproducible.
+   */
+  it.each([1, 2, 3])('holds its ordering and dedup invariants over generated history %i', (run) => {
+    let seed = 7 + run * 977;
+    const rand = (n: number): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed % n;
+    };
+    const chats = ['-11', '-12', '-13'];
+    const admitted = new Map<string, number>();
+    let store = new ObservedStore(path, 4, chats.length);
+
+    for (let i = 0; i < 150; i++) {
+      const chatId = chats[rand(chats.length)] as string;
+      const messageId = 1 + rand(20);
+      const rec = record(chatId, messageId, `m-${chatId}-${messageId}`);
+      const highWater = store.highWater();
+      const stored = store.append(rec);
+
+      if (stored === undefined) {
+        // The only reason to refuse here is that the id was already observed — and a refusal never
+        // burns a sequence, which would leave a hole a later cursor compare reads as a lost message.
+        expect(admitted.has(keyOf(rec))).toBe(true);
+        expect(store.highWater()).toBe(highWater);
+      } else {
+        expect(admitted.has(keyOf(rec))).toBe(false);
+        expect(stored.seq).toBe(highWater + 1);
+        admitted.set(keyOf(rec), stored.seq);
+      }
+      for (const id of chats) {
+        const seqs = store.entries(id).map((r) => r.seq);
+        expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+        expect(new Set(seqs).size).toBe(seqs.length);
+        expect(seqs.length).toBeLessThanOrEqual(4);
+      }
+      // Reload at a random point: a cursor an agent holds outlives the process that issued it, so
+      // the sequence space may never regress across one.
+      if (rand(9) === 0) {
+        const highest = store.highWater();
+        store.close();
+        store = new ObservedStore(path, 4, chats.length);
+        expect(store.highWater()).toBe(highest);
+      }
+    }
+
+    // Everything ever admitted is still refused, and every retained record is one that was admitted.
+    for (const [id, seq] of admitted) {
+      expect(store.has(id)).toBe(true);
+      expect(seq).toBeLessThanOrEqual(store.highWater());
+    }
+    for (const id of chats) {
+      for (const rec of store.entries(id)) expect(admitted.get(keyOf(rec))).toBe(rec.seq);
+    }
+    store.close();
+  });
+
   it('rejects a non-positive or fractional retention bound instead of substituting the default', () => {
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => new ObservedStore(path, bad)).toThrow(/maxPerChat must be a positive integer/);
@@ -389,7 +487,7 @@ describe('telegram ObservedStore file permissions', () => {
     compact?: boolean;
     /** What must be unreadable by group and other. */
     targets: (path: string) => string[];
-    /** A path the store must NAME on stderr as tightened, if any. */
+    /** The one path the store must NAME on stderr as tightened; nothing else may be reported. */
     tightens?: (path: string) => string;
   }
 
@@ -413,6 +511,8 @@ describe('telegram ObservedStore file permissions', () => {
       targets: (p) => [p],
     },
     {
+      // A leftover temp file is REPLACED, never written through: it is unlinked and recreated
+      // exclusively, so its mode never reaches the store and there is nothing to tighten.
       name: 'the store file a compaction replaces over a leftover world-readable temp file',
       prepare: (p) => {
         mkdirSync(dirname(p), { recursive: true });
@@ -421,7 +521,6 @@ describe('telegram ObservedStore file permissions', () => {
       },
       compact: true,
       targets: (p) => [p],
-      tightens: (p) => `${p}.tmp`,
     },
     {
       name: 'a pre-existing world-readable store file',
@@ -431,6 +530,7 @@ describe('telegram ObservedStore file permissions', () => {
         loose(p);
       },
       targets: (p) => [p],
+      tightens: (p) => p,
     },
   ];
 
@@ -448,8 +548,75 @@ describe('telegram ObservedStore file permissions', () => {
 
     for (const target of targets(nested)) expect(modeOf(target) & 0o077).toBe(0);
     // A tightening is never silent, and a store that was already tight says nothing at all.
-    const named = tightens?.(nested) ?? (prepare === undefined ? undefined : nested);
+    const named = tightens?.(nested);
     if (named === undefined) expect(stderr).toEqual([]);
     else expect(stderr.join('')).toContain(`tightened ${named}`);
+  });
+
+  /**
+   * `<store_path>.tmp` is a predictable name in a directory the store does not own — `store_path`
+   * can be anywhere the operator put it, and `mkdirSync(…, {mode: 0o700})` applies only to
+   * directories the store itself created. A compaction renames whatever that name resolves to over
+   * the store, so anything already there that is not a regular file this call created would let a
+   * local attacker redirect the full plaintext of every observed message (and have its mode
+   * narrowed for them). Every kind of squatted temp path is graded on the same two outcomes.
+   */
+  const SQUATTED = [
+    { name: 'a world-readable regular file', kind: 'file' as const, compacts: true },
+    { name: 'a symlink to a file outside the store directory', kind: 'symlink-file' as const, compacts: false },
+    { name: 'a symlink to a directory outside the store directory', kind: 'symlink-dir' as const, compacts: false },
+    { name: 'a dangling symlink', kind: 'symlink-dangling' as const, compacts: false },
+    { name: 'a directory', kind: 'dir' as const, compacts: false },
+    { name: 'a FIFO', kind: 'fifo' as const, compacts: false },
+  ];
+
+  it.each(SQUATTED)('refuses to compact through $name, leaving what it points at alone', ({ kind, compacts }) => {
+    const outside = mkdtempSync(join(tmpdir(), 'parley-tg-victim-'));
+    const victimFile = join(outside, 'victim.txt');
+    const victimDir = join(outside, 'victim-dir');
+    writeFileSync(victimFile, 'private\n');
+    chmodSync(victimFile, 0o644);
+    mkdirSync(victimDir);
+    const store = join(dir, 'squat', 'store.jsonl');
+    mkdirSync(dirname(store), { recursive: true });
+    const tmp = `${store}.tmp`;
+    if (kind === 'file') writeFileSync(tmp, 'junk\n');
+    if (kind === 'symlink-file') symlinkSync(victimFile, tmp);
+    if (kind === 'symlink-dir') symlinkSync(victimDir, tmp);
+    if (kind === 'symlink-dangling') symlinkSync(join(outside, 'not-there'), tmp);
+    if (kind === 'dir') mkdirSync(tmp);
+    if (kind === 'fifo') execFileSync('mkfifo', [tmp]);
+
+    const stderr = captureStderr();
+    const observed = new ObservedStore(store, 2, 10);
+    // Eight appends under newest-2 drive several compactions.
+    for (let i = 1; i <= 8; i++) expect(observed.append(record('-1', i, `secret-${i}`))).toBeDefined();
+    observed.close();
+
+    // Nothing outside the store's own directory was touched, whatever the temp path pointed at.
+    expect(readFileSync(victimFile, 'utf8')).toBe('private\n');
+    expect(modeOf(victimFile)).toBe(0o644);
+    expect(readdirSync(victimDir)).toEqual([]);
+    if (compacts) {
+      expect(stderr.join('')).not.toMatch(/refusing to compact/);
+      expect(lineCount(store)).toBeLessThanOrEqual(4);
+      // The squatted file was replaced, not written through: the rename consumed a fresh one.
+      expect(existsSync(tmp)).toBe(false);
+      expect(readFileSync(store, 'utf8')).toContain('secret-8');
+    } else {
+      // Loud, and the store keeps every record rather than trading durability for a compaction —
+      // on the load path too, where a throw is the only way to say it.
+      expect(stderr.join('')).toMatch(/refusing to compact/);
+      expect(stderr.join('')).toContain(tmp);
+      expect(lineCount(store)).toBe(8);
+      expect(() => new ObservedStore(store, 2, 10)).toThrow(/refusing to compact/);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+    // Every record survived the obstruction, and the store compacts again once it clears.
+    const reopened = new ObservedStore(store, 2, 10);
+    expect(reopened.entries('-1').map((r) => r.content)).toEqual(['secret-7', 'secret-8']);
+    reopened.close();
+    expect(lineCount(store)).toBe(2);
+    rmSync(outside, { recursive: true, force: true });
   });
 });

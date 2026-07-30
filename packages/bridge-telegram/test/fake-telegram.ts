@@ -42,6 +42,12 @@ export interface FakeTelegram {
    */
   injectRaw(chatId: string, payload: Record<string, unknown>, as?: 'message' | 'channel_post'): number;
   /**
+   * Enqueue an update carrying no message this bridge reads (an edit, a reaction, a poll answer).
+   * Real Telegram still expects it to be ACKNOWLEDGED — a loop that only advances `offset` for the
+   * kinds it carries re-reads such a batch forever. Returns its `update_id`.
+   */
+  injectRawUpdate(payload: Record<string, unknown>): number;
+  /**
    * Like {@link injectUserMessage} but mints the message_id NOW (so it can be LOWER than a post
    * that runs next) while WITHHOLDING the update from getUpdates until `release()` — reproduces
    * the own-post race (a foreign message accepted before our post, delivered to the bridge after).
@@ -70,6 +76,20 @@ export interface FakeTelegram {
    * see whether the ingestion loop has a floor under it, or spins at the speed of the network.
    */
   ignoreLongPoll(on: boolean): void;
+  /**
+   * Stop honouring `offset`: never confirm, never delete, and re-serve the whole backlog on every
+   * poll — a caching proxy or a Bot API server that does not implement the acknowledgement half.
+   * The client's offset then never advances, so the loop keeps getting a NON-EMPTY answer with no
+   * progress in it, which the empty-answer shape cannot reproduce.
+   */
+  ignoreOffset(on: boolean): void;
+  /**
+   * Answer every call to `method` with HTTP 200 and exactly this body. A 2xx says nothing about
+   * success on this API — `ok` does — so a middlebox, a captive portal or a non-conforming local
+   * Bot API server can hand back a well-formed HTTP success carrying a refusal, a missing `result`
+   * or no JSON at all, which no status-level failure can reproduce.
+   */
+  malformMethod(method: string, body: string | undefined): void;
   /** How many requests this fake has served for `method` — the poll loop's retry cadence. */
   callCount(method: string): number;
   /**
@@ -175,7 +195,9 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const parked = new Set<ParkedPoll>();
   const failures = new Map<string, Failure>();
   const stalls = new Map<string, StallMode>();
+  const malformed = new Map<string, string>();
   let longPollHonoured = true;
+  let offsetHonoured = true;
   const holds = new Map<string, { promise: Promise<void>; release(): void }>();
   /** Responses deliberately left hanging — closed on shutdown so the process can exit. */
   const stalled = new Set<ServerResponse>();
@@ -189,7 +211,8 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     return mid;
   };
 
-  const pending = (offset: number): TgUpdate[] => updates.filter((u) => u.update_id >= offset);
+  const pending = (offset: number): TgUpdate[] =>
+    offsetHonoured ? updates.filter((u) => u.update_id >= offset) : [...updates];
 
   /**
    * Real Telegram treats a poll at `offset` as confirmation of everything below it and DELETES
@@ -197,7 +220,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
    * ever-growing backlog re-served on every poll instead of looking identical to a healthy one.
    */
   const confirm = (offset: number): void => {
-    if (offset <= 0) return;
+    if (!offsetHonoured || offset <= 0) return;
     for (let i = updates.length - 1; i >= 0; i--) {
       if ((updates[i]?.update_id ?? 0) < offset) updates.splice(i, 1);
     }
@@ -262,6 +285,12 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     const stallMode = stalls.get(method);
     if (stallMode !== undefined) {
       stall(res, stallMode);
+      return;
+    }
+    const malformedBody = malformed.get(method);
+    if (malformedBody !== undefined) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(malformedBody);
       return;
     }
     const failure = failures.get(method);
@@ -387,6 +416,13 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       return message.message_id;
     },
 
+    injectRawUpdate(payload: Record<string, unknown>): number {
+      const update = { ...payload, update_id: updateSeq++ } as TgUpdate;
+      updates.push(update);
+      wakeParked();
+      return update.update_id;
+    },
+
     injectUserMessage(chatId: string, from: string, text: string): number {
       return this.injectRaw(chatId, { from: human(from), text });
     },
@@ -434,6 +470,16 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     ignoreLongPoll(on: boolean): void {
       longPollHonoured = !on;
       if (on) for (const poll of [...parked]) answerPoll(poll);
+    },
+
+    ignoreOffset(on: boolean): void {
+      offsetHonoured = !on;
+      if (on) for (const poll of [...parked]) answerPoll(poll);
+    },
+
+    malformMethod(method: string, body: string | undefined): void {
+      if (body === undefined) malformed.delete(method);
+      else malformed.set(method, body);
     },
 
     callCount(method: string): number {
