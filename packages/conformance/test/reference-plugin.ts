@@ -16,7 +16,7 @@ import {
   NoSuchTopicError,
   type Topic,
 } from '@sharptrick/parley-core';
-import type { ConformanceContext } from '@sharptrick/parley-conformance';
+import { type ConformanceContext, PARK_FRACTION } from '@sharptrick/parley-conformance';
 
 /**
  * The backing store a family of {@link ReferencePlugin} instances share, so that several
@@ -435,7 +435,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         fetchRecent: async (args) => {
           const page = await inner.fetchRecent(args);
           if (args.since === undefined && args.blockMs !== undefined) {
-            const parkFor = Math.min(args.blockMs * 0.6, 20_000);
+            const parkFor = Math.min(args.blockMs * PARK_FRACTION, 20_000);
             await new Promise((resolve) => setTimeout(resolve, parkFor));
           }
           return page;

@@ -21,6 +21,7 @@ import {
   fetchWithRetry,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
+import { isIPv4, isIPv6 } from 'node:net';
 
 /** Every `preset` a config may ask for. Each member is graded and documented in the README table. */
 export const ROOM_PRESETS = ['private_chat', 'public_chat'] as const;
@@ -28,7 +29,11 @@ export type RoomPreset = (typeof ROOM_PRESETS)[number];
 
 /** Plugin-specific backend_config. */
 export interface MatrixBackendConfig {
-  /** Homeserver base URL. Default `http://127.0.0.1:8008`. */
+  /**
+   * Homeserver base URL. Default `http://127.0.0.1:8008`. `http://` to anything but loopback ships
+   * {@link password} and the access token it returns across the network in the clear, and
+   * `connect()` warns about it; use `https://` for a remote homeserver.
+   */
   homeserver_url?: string;
   /** Login user localpart. Default `parley`. */
   user?: string;
@@ -37,8 +42,8 @@ export interface MatrixBackendConfig {
   /** Homeserver `server_name` used to build room aliases. Default `parley.local`. */
   server_name?: string;
   /**
-   * Sync long-poll timeout (ms) — a positive whole number. The loop re-checks shutdown each
-   * interval. Default 25000.
+   * Sync long-poll timeout (ms) — a positive whole number, at most {@link MAX_SYNC_TIMEOUT_MS}. The
+   * loop re-checks shutdown each interval. Default 25000.
    */
   sync_timeout_ms?: number;
   /**
@@ -78,6 +83,17 @@ export interface MatrixBackendConfig {
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 const TOPIC_KEY = 'app.parley.topic';
 
+const DEFAULT_HOMESERVER_URL = 'http://127.0.0.1:8008';
+
+/** Largest delay Node's timers accept; past it every one of them silently becomes 1ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Largest accepted `sync_timeout_ms`: the one this plugin can still arm a real transport deadline
+ * for, since every `/sync` is bounded by {@link syncDeadlineMs} of it.
+ */
+export const MAX_SYNC_TIMEOUT_MS = MAX_TIMER_MS - DEFAULT_DEADLINE_MS;
+
 const isHttpUrl = (s: string): boolean => {
   try {
     const { protocol } = new URL(s);
@@ -114,8 +130,17 @@ function validateConfig(cfg: MatrixBackendConfig): void {
     reject('homeserver_url', 'an http(s) URL');
   }
   const timeout = cfg.sync_timeout_ms;
-  if (timeout !== undefined && !(Number.isInteger(timeout) && timeout > 0)) {
-    reject('sync_timeout_ms', 'a positive whole number of milliseconds (default 25000)');
+  if (
+    timeout !== undefined &&
+    !(Number.isInteger(timeout) && timeout > 0 && timeout <= MAX_SYNC_TIMEOUT_MS)
+  ) {
+    reject(
+      'sync_timeout_ms',
+      `a positive whole number of milliseconds, at most ${MAX_SYNC_TIMEOUT_MS} (default 25000)`,
+      ` The ceiling is Node's ${MAX_TIMER_MS}ms timer range less the ${DEFAULT_DEADLINE_MS}ms call ` +
+        'budget every /sync adds on top of it: past it the transport deadline clamps to 1ms, so ' +
+        'every /sync aborts client-side at once and the live path dies blaming the homeserver.',
+    );
   }
   const invite = cfg.invite;
   if (
@@ -149,6 +174,15 @@ const DEFAULT_PASSWORD = 'parleypass';
  */
 function configRisks(cfg: MatrixBackendConfig): string[] {
   const risks: string[] = [];
+  const plaintext = plaintextRemoteOrigin(cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL);
+  if (plaintext !== undefined) {
+    risks.push(
+      `backend_config.homeserver_url ${plaintext} is plaintext http:// to a non-loopback host, so ` +
+        'the m.login.password POST carries backend_config.password across the network in the ' +
+        'clear, and the access token it returns rides every later request the same way. Use ' +
+        'https:// for any remote homeserver.',
+    );
+  }
   if (cfg.password === undefined || cfg.password === DEFAULT_PASSWORD) {
     risks.push(
       `connecting with the built-in default password ('${DEFAULT_PASSWORD}'). Set ` +
@@ -175,11 +209,41 @@ function configRisks(cfg: MatrixBackendConfig): string[] {
   return risks;
 }
 
+/** The origin of a URL whose credentials would cross the network unencrypted, else `undefined`. */
+function plaintextRemoteOrigin(baseUrl: string): string | undefined {
+  try {
+    const { protocol, hostname, origin } = new URL(baseUrl);
+    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
+ * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
+ * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
+ * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
+ * address, counts as remote: an unproven host is warned about rather than excused.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
+  if (host === 'localhost') return true;
+  if (isIPv4(host)) return host.startsWith('127.');
+  if (!isIPv6(host)) return false;
+  const groups = host.split(':');
+  const tail = groups.pop() ?? '';
+  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
+  return Number.parseInt(tail, 16) === 1;
+}
+
 /**
  * Wall-clock budget for a `/sync` that asks the homeserver to block for `timeoutMs`. A long-poll
  * legitimately outlives the shared {@link DEFAULT_DEADLINE_MS}, so every `/sync` call MUST pass
  * this — at the default budget any `sync_timeout_ms` at or above 30000 aborts client-side before a
  * conforming homeserver has answered, and the live path degrades to the retry backoff instead.
+ * Bounded above by {@link MAX_SYNC_TIMEOUT_MS}, which {@link validateConfig} enforces so the result
+ * always fits a Node timer.
  */
 export const syncDeadlineMs = (timeoutMs: number): number => timeoutMs + DEFAULT_DEADLINE_MS;
 
@@ -316,8 +380,12 @@ export class MatrixPlugin implements BackendPlugin {
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as MatrixBackendConfig;
+    // Keep the validation ahead of the stand-down, so that a refused config leaves a working
+    // connection running instead of tearing it down on the way to a load error.
     validateConfig(cfg);
-    this.baseUrl = (cfg.homeserver_url ?? 'http://127.0.0.1:8008').replace(/\/+$/, '');
+    this.generation++;
+    this.standDown();
+    this.baseUrl = (cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL).replace(/\/+$/, '');
     this.serverName = cfg.server_name ?? 'parley.local';
     this.user = cfg.user ?? 'parley';
     this.password = cfg.password ?? DEFAULT_PASSWORD;
@@ -326,9 +394,6 @@ export class MatrixPlugin implements BackendPlugin {
     this.invite = cfg.invite ?? [];
     this.sharedLocalpart = cfg.shared_room;
     this.stopped = false;
-    this.generation++;
-    this.rooms.clear();
-    this.liveTopics.clear();
 
     for (const risk of configRisks(cfg)) console.warn(`[parley-matrix] SECURITY: ${risk}`);
 
@@ -346,18 +411,29 @@ export class MatrixPlugin implements BackendPlugin {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    this.standDown();
+    this.token = undefined;
+    this.userId = undefined;
+  }
+
+  /**
+   * End the current generation's background work and empty every registry describing it. Keep BOTH
+   * lifecycle entry points on this, so that a bare `connect()` — a reconnect with no preceding
+   * `disconnect()` — ends the previous generation's parks at once rather than one park slice later,
+   * which at the documented `sync_timeout_ms` is 25 seconds of a caller's `blockMs` spent waiting on
+   * a generation that is already gone.
+   */
+  private standDown(): void {
     for (const c of this.controllers) c.abort();
     this.controllers.clear();
     this.liveTopics.clear();
     this.rooms.clear();
     // Wake every blocked long-poll so its `fetchRecent` returns at once (each wake() clears its timer
     // and registration). Snapshot first — wake() mutates `waiters` — then clear so nothing outlives
-    // the disconnect; the in-flight `/sync` each drives (if any) was already aborted above.
+    // the teardown; the in-flight `/sync` each drives (if any) was already aborted above.
     const pending = [...this.waiters.values()].flatMap((set) => [...set]);
     this.waiters.clear();
     for (const w of pending) w.wake();
-    this.token = undefined;
-    this.userId = undefined;
   }
 
   async post(

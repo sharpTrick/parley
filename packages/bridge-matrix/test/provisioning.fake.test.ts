@@ -2,6 +2,15 @@ import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MatrixPlugin, ROOM_PRESETS } from '../src/index.js';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
+import {
+  A,
+  aliasForTopic,
+  HOMESERVER,
+  isMatrixUp,
+  retireRoom,
+  roomIdOf,
+  SERVER_NAME,
+} from './live-gate.js';
 
 /**
  * Two CLASSES over the same table.
@@ -240,22 +249,9 @@ describe('post honors the seam arguments it accepts', () => {
   });
 });
 
-const HOMESERVER = process.env.PARLEY_MATRIX_URL ?? 'http://127.0.0.1:8008';
-
-async function isMatrixUp(url: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${url.replace(/\/+$/, '')}/_matrix/client/versions`, {
-      signal: AbortSignal.timeout(1500),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 // The fake asserts what we SEND; only the homeserver can confirm what it actually enforces — a
 // preset whose server-side meaning drifts would pass every test above.
-const live = (await isMatrixUp(HOMESERVER)) ? describe : describe.skip;
+const live = (await isMatrixUp()) ? describe : describe.skip;
 
 live('live homeserver: the provisioned room really is invite-only', () => {
   it('m.room.join_rules reads back as `invite`', async () => {
@@ -263,29 +259,30 @@ live('live homeserver: the provisioned room really is invite-only', () => {
     const p = new MatrixPlugin();
     await p.connect({
       homeserver_url: HOMESERVER,
-      server_name: process.env.PARLEY_MATRIX_SERVER_NAME ?? 'parley.local',
-      user: process.env.PARLEY_MATRIX_USER ?? 'parley',
-      password: process.env.PARLEY_MATRIX_PASSWORD ?? 'parleypass',
+      server_name: SERVER_NAME,
+      user: A.user,
+      password: A.password,
       sync_timeout_ms: 5000,
     });
     // A FRESH topic each run, so the assertion is about a room this run actually provisioned —
     // reusing a stable alias would only ever re-read whatever the first run happened to create.
     const name = `join-rule-probe-${Date.now().toString(36)}`;
-    await p.post(asTopic(name), WRITER, 'probe');
-
+    const alias = aliasForTopic(name);
     const token = (p as unknown as { token: string }).token;
-    const serverName = process.env.PARLEY_MATRIX_SERVER_NAME ?? 'parley.local';
-    const alias = encodeURIComponent(`#parley_${name}:${serverName}`);
-    const dir = await fetch(`${HOMESERVER}/_matrix/client/v3/directory/room/${alias}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const { room_id: roomId } = (await dir.json()) as { room_id: string };
-    const state = await fetch(
-      `${HOMESERVER}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.join_rules`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
+    try {
+      await p.post(asTopic(name), WRITER, 'probe');
 
-    expect(((await state.json()) as { join_rule: string }).join_rule).toBe('invite');
-    await p.disconnect();
+      const roomId = await roomIdOf(token, alias);
+      expect(roomId, `${alias} did not resolve`).toBeDefined();
+      const state = await fetch(
+        `${HOMESERVER}/_matrix/client/v3/rooms/${encodeURIComponent(roomId!)}/state/m.room.join_rules`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+
+      expect(((await state.json()) as { join_rule: string }).join_rule).toBe('invite');
+    } finally {
+      await retireRoom(alias, [token]);
+      await p.disconnect();
+    }
   }, 30_000);
 });

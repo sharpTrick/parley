@@ -268,13 +268,20 @@ const AFTER: Record<string, (p: MatrixPlugin) => Promise<void>> = {
   disconnect: async (p) => {
     await p.disconnect();
   },
+  // `connect()` is the OTHER entry point that ends a generation, so it owes the same stand-down: a
+  // teardown only `disconnect()` performs leaves the park holding its timer, its registration and
+  // its dedicated `/sync` until its slice expires — 25s of a caller's blockMs at the documented
+  // sync_timeout_ms — while the plugin it belongs to is already gone.
+  'connect (a bare reconnect, no disconnect)': async (p) => {
+    await p.connect(fakeConfig({ syncTimeoutMs: SLOW_SYNC_MS }));
+  },
   'disconnect → connect': async (p) => {
     await p.disconnect();
     await p.connect(fakeConfig({ syncTimeoutMs: SLOW_SYNC_MS }));
   },
 };
 
-describe('a parked blocking fetchRecent does not outlive the disconnect', () => {
+describe('a parked blocking fetchRecent does not outlive the lifecycle call that ended it', () => {
   for (const roomExists of [true, false]) {
     for (const [name, after] of Object.entries(AFTER)) {
       it(`room exists: ${roomExists} / ${name}: settles at once, then issues nothing`, async () => {
@@ -297,6 +304,7 @@ describe('a parked blocking fetchRecent does not outlive the disconnect', () => 
         // The room the wait was polling for appears the instant the teardown lands: a park that
         // ignored it resolves the alias, joins, and reads — all with a cleared token.
         fake.aliasExists = true;
+        await settle(50); // let a request already on the wire at the teardown be recorded.
         const atTeardown = requests.length;
 
         expect((await pending).messages).toEqual([]);

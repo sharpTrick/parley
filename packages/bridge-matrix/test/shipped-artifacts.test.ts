@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { ROOM_PRESETS, type MatrixBackendConfig } from '../src/index.js';
 
 /**
- * Two CLASSES over what this package ships for an operator to copy.
+ * Three CLASSES over what this package ships — to an operator, and to CI.
  *
  *  1. A shipped example config is executable, not illustrative. The multi-session page insists each
  *     session use a DIFFERENT Matrix account, and the default preset makes every provisioned room
@@ -14,6 +14,12 @@ import { ROOM_PRESETS, type MatrixBackendConfig } from '../src/index.js';
  *     homeserver: it is a property of the three files.
  *  2. Every value a config union accepts is documented. A `room_preset` member absent from the
  *     README's config table is a privilege-granting option an operator meets only in the type.
+ *  3. A CI step gated on `--if-present` covers a package only if that package opts in. CI runs
+ *     `npm run typecheck:test --workspaces --if-present` on the stated grounds that otherwise "no
+ *     fixture in the repo is ever seen by a compiler" — a package with test sources and no such
+ *     script is silently skipped, and vitest transpiles without type-checking, so the
+ *     private-internals casts these fixtures rely on can go stale against a renamed field and keep
+ *     grading nothing.
  */
 
 const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
@@ -89,5 +95,31 @@ describe('every room_preset the config accepts is in the README config table', (
   it('names the preset it deliberately refuses, so the omission reads as a decision', () => {
     expect(README).toContain('trusted_private_chat');
     expect(ROOM_PRESETS as readonly string[]).not.toContain('trusted_private_chat');
+  });
+});
+
+describe('CI type-checks this package’s test sources rather than skipping it', () => {
+  const PKG_ROOT = new URL('../', import.meta.url);
+  const read = (name: string): unknown =>
+    JSON.parse(readFileSync(fileURLToPath(new URL(name, PKG_ROOT)), 'utf8'));
+
+  const pkg = read('package.json') as { scripts?: Record<string, string> };
+  const script = pkg.scripts?.['typecheck:test'];
+
+  it('declares the script the --if-present CI step looks for', () => {
+    expect(script).toBeDefined();
+  });
+
+  it('points that script at a tsconfig whose include covers every test source', () => {
+    const configFile = /(?:-p|--project)\s+(\S+)|\b(tsconfig\.\w+\.json)\b/.exec(script ?? '');
+    const named = configFile?.[1] ?? configFile?.[2];
+    expect(named, `typecheck:test does not name a tsconfig: ${String(script)}`).toBeDefined();
+
+    const project = read(named!) as { include?: string[] };
+    const testSources = readdirSync(fileURLToPath(new URL('test/', PKG_ROOT))).filter((f) =>
+      f.endsWith('.ts'),
+    );
+    expect(testSources.length).toBeGreaterThan(0);
+    expect(project.include).toContain('test/**/*');
   });
 });

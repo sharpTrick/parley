@@ -225,7 +225,7 @@ export class FakeSynapse {
     return e;
   }
 
-  readonly fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  readonly fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     // Yield to the macrotask queue on every request so the subscribe() poll loop (no delay on its
     // success path) can never starve vitest's timer-based vi.waitFor.
     await new Promise((r) => setTimeout(r, 1));
@@ -437,7 +437,9 @@ export interface ConnectOptions {
 }
 
 export const fakeConfig = (opts: ConnectOptions = {}): Record<string, unknown> => ({
-  homeserver_url: 'http://synapse.fake',
+  // https, so the fake fixture is not itself a config `connect()` must warn about: a SECURITY line
+  // every case emits is one no case can grade, and it buries the ones a case arms deliberately.
+  homeserver_url: 'https://synapse.fake',
   server_name: SERVER_NAME,
   user: 'parley',
   password: 'a-real-test-secret',

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MatrixPlugin, ROOM_PRESETS } from '../src/index.js';
+import { MAX_SYNC_TIMEOUT_MS, MatrixPlugin, ROOM_PRESETS, syncDeadlineMs } from '../src/index.js';
 
 /**
  * CLASS: a `backend_config` value whose only guard is the TypeScript type. Core loads
@@ -7,8 +7,12 @@ import { MatrixPlugin, ROOM_PRESETS } from '../src/index.js';
  * check at all — the declared union or `number` exists only at compile time. An unvalidated value
  * either reaches the wire (a `preset` lands verbatim in `POST /createRoom`; `trusted_private_chat`
  * hands every invitee power level 100 and lets any of them flip `m.room.join_rules` to public) or
- * reaches the park arithmetic (a `sync_timeout_ms` of 0 collapses every wait into a re-query storm).
- * Both must be LOAD ERRORS, the way `skip_permissions: true` is — never a lenient coercion.
+ * reaches the park arithmetic (a `sync_timeout_ms` of 0 collapses every wait into a re-query storm,
+ * and one past `MAX_SYNC_TIMEOUT_MS` overflows the timer its transport deadline is armed on, which
+ * Node clamps to 1ms — so every `/sync` aborts at once and the live path dies blaming the
+ * homeserver). Both must be LOAD ERRORS, the way `skip_permissions: true` is — never a lenient
+ * coercion, and bounded at BOTH ends: a range guarded only from below leaves the same collapse
+ * reachable from the top.
  *
  * The table walks EVERY typed field of `MatrixBackendConfig` and, per field, a value outside its
  * union/range and a value of the wrong JS type. Each row asserts the REJECTION, and that nothing at
@@ -51,7 +55,7 @@ const FIELDS: Record<string, { accepted: unknown[]; rejected: Record<string, unk
     rejected: { 'the wrong JS type': true, 'an empty string': '' },
   },
   sync_timeout_ms: {
-    accepted: [1, 25_000, 60_000],
+    accepted: [1, 25_000, 60_000, MAX_SYNC_TIMEOUT_MS],
     rejected: {
       'the wrong JS type': '5000',
       'zero — a park slice that never sleeps': 0,
@@ -59,6 +63,8 @@ const FIELDS: Record<string, { accepted: unknown[]; rejected: Record<string, unk
       'NaN': Number.NaN,
       'Infinity': Number.POSITIVE_INFINITY,
       'a fraction of a millisecond': 0.5,
+      'one past the ceiling — a deadline the timer clamps to 1ms': MAX_SYNC_TIMEOUT_MS + 1,
+      'the largest integer JS can count — a live path silently deleted': Number.MAX_SAFE_INTEGER,
     },
   },
   invite: {
@@ -84,7 +90,7 @@ beforeEach(() => {
   requests = [];
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: RequestInfo | URL) => {
+    vi.fn(async (input: string | URL | Request) => {
       requests.push(String(typeof input === 'string' ? input : ((input as Request).url ?? input)));
       return new Response(JSON.stringify({ access_token: 'tok', user_id: '@parley:fake' }), {
         status: 200,
@@ -126,6 +132,26 @@ describe('connect refuses a backend_config value the type system cannot enforce'
       await p.connect(cfg);
       await p.disconnect();
     });
+  }
+
+  /**
+   * Every knob whose value is handed to a timer, paired with the delay that knob actually arms.
+   * `setTimeout`/`AbortSignal.timeout` clamp anything past 2^31-1 to ONE millisecond, so a knob
+   * accepted above its own ceiling does not merely slow the path it configures down — it deletes it,
+   * with the operator's only evidence pointing at the homeserver. Generalized over knobs rather than
+   * written against `sync_timeout_ms`, so the next timing knob is graded the day it is added.
+   */
+  const TIMER_KNOBS: Record<string, (value: number) => number> = {
+    sync_timeout_ms: syncDeadlineMs,
+  };
+  const MAX_TIMER_MS = 2 ** 31 - 1;
+
+  for (const [knob, armedDelay] of Object.entries(TIMER_KNOBS)) {
+    for (const value of FIELDS[knob]!.accepted as number[]) {
+      it(`${knob} = ${value}: the timer it arms is one the runtime can represent`, () => {
+        expect(armedDelay(value)).toBeLessThanOrEqual(MAX_TIMER_MS);
+      });
+    }
   }
 
   it('the refusal of trusted_private_chat says what it would cost', async () => {

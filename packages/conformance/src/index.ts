@@ -34,10 +34,22 @@ export const SINCELESS_BLOCK_MS = 12_000;
  * How long that read may take. A bound compared against the BUDGET grades nothing: a plugin parking
  * for 95% of it still returns "under the budget", which is the hot path for every
  * `parley_fetch_recent` an agent makes before it holds a cursor. Keep this a fraction, so that the
- * assertion reads as "the plugin did not spend the budget" — while still leaving seconds of
- * headroom, because a since-less window fetch costs a loaded Matrix homeserver real time.
+ * assertion reads as "the plugin did not spend the budget".
+ *
+ * Keep the fraction between the slowest real backend and the parking control, so that widening it
+ * for one does not certify the other: Matrix measures 4.1-4.8 s here against a live Synapse — a
+ * room-provisioning positioning sync, not a park — and `BROKEN_VARIANTS`' parking plugin holds
+ * {@link PARK_FRACTION} of the budget. A bound outside that window either reds a conformant backend
+ * or greens the defect this clause exists to catch.
  */
-export const SINCELESS_RETURN_MS = SINCELESS_BLOCK_MS / 4;
+export const SINCELESS_RETURN_MS = SINCELESS_BLOCK_MS * (2 / 3);
+
+/**
+ * The share of its budget the parking control spends. Keep it above
+ * `SINCELESS_RETURN_MS / SINCELESS_BLOCK_MS`, so that the control still fails the bound it exists
+ * to fail.
+ */
+export const PARK_FRACTION = 0.9;
 
 /** The volume the paging clause is graded over. Exported so its row generator can be self-tested. */
 export const PAGING_VOLUME: readonly string[] = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];

@@ -2,11 +2,8 @@ import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, it } from 'vitest';
 import { MatrixPlugin } from '../src/index.js';
+import { A, HOMESERVER, isMatrixUp, SERVER_NAME } from './live-gate.js';
 
-const HOMESERVER = process.env.PARLEY_MATRIX_URL ?? 'http://127.0.0.1:8008';
-const SERVER_NAME = process.env.PARLEY_MATRIX_SERVER_NAME ?? 'parley.local';
-const USER = process.env.PARLEY_MATRIX_USER ?? 'parley';
-const PASSWORD = process.env.PARLEY_MATRIX_PASSWORD ?? 'parleypass';
 // Shared-room mode: Synapse rate-limits room CREATION hard (~2-room burst, then ~1 room / 45s per
 // user) while send/read/sync are unthrottled, so one-room-per-topic is infeasible for an
 // unprivileged login under a 20s test timeout. The suite needs ~7 fresh topics per run; we fold
@@ -26,8 +23,8 @@ const HOUSEKEEPING = asTopic('parley-conformance-prewarm');
 const configFor = (sharedRoom: string) => ({
   homeserver_url: HOMESERVER,
   server_name: SERVER_NAME,
-  user: USER,
-  password: PASSWORD,
+  user: A.user,
+  password: A.password,
   shared_room: sharedRoom,
   // Short long-poll so disconnect()/teardown is snappy under the test runner.
   sync_timeout_ms: 5000,
@@ -49,17 +46,6 @@ async function pickSharedRoom(): Promise<string> {
     return STABLE_ROOM;
   } finally {
     await probe.disconnect();
-  }
-}
-
-async function isMatrixUp(url: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${url.replace(/\/+$/, '')}/_matrix/client/versions`, {
-      signal: AbortSignal.timeout(1500),
-    });
-    return res.ok;
-  } catch {
-    return false;
   }
 }
 
@@ -111,7 +97,7 @@ function contextFactory(sharedRoom: string) {
   };
 }
 
-if (await isMatrixUp(HOMESERVER)) {
+if (await isMatrixUp()) {
   runConformanceSuite('matrix', contextFactory(await pickSharedRoom()));
 } else {
   describe.skip(`seam conformance: matrix (no homeserver at ${HOMESERVER})`, () => {

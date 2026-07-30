@@ -1,6 +1,6 @@
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MatrixPlugin } from '../src/index.js';
+import { MAX_SYNC_TIMEOUT_MS, type MatrixPlugin } from '../src/index.js';
 import { aliasForTopic, connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
@@ -114,6 +114,61 @@ describe('a small sync_timeout_ms cannot turn an idle wait into a request storm'
         expect(saw).toContain('fresh');
         expect(elapsed).toBeLessThan(PROMPT_MS);
         await p.disconnect();
+      }, 30_000);
+    }
+  }
+});
+
+/**
+ * The SAME class from the other end of the range, because a range guarded only from below leaves the
+ * collapse reachable from the top: `setTimeout`/`AbortSignal.timeout` clamp any delay past 2^31-1 to
+ * ONE millisecond, so a `sync_timeout_ms` whose {@link syncDeadlineMs} overflows that does not slow
+ * the live path down — it deletes it, every `/sync` aborting client-side at once while the operator's
+ * stderr blames the homeserver. `MAX_SYNC_TIMEOUT_MS` is the loader's ceiling and therefore the value
+ * under test; the grading is the runtime's own `TimeoutOverflowWarning`, so a ceiling raised past
+ * what a timer can hold fails HERE rather than against a real homeserver.
+ *
+ * Latency is graded against the caller's own budget rather than {@link PROMPT_MS}: at the top of the
+ * range one park slice IS the whole `blockMs`, which the README documents as the cost of a very
+ * large value. Delivery inside the budget is the guarantee; sub-second wakeup is not.
+ */
+const LARGE_TIMEOUTS = [MAX_SYNC_TIMEOUT_MS];
+/** Every driver's own `blockMs`/`waitFor` budget (4000ms), plus slack for the fake's round-trips. */
+const WITHIN_BUDGET_MS = 5000;
+
+/** Timer delays the runtime silently clamped during `run` — an empty list is the assertion. */
+async function clampedTimers(run: () => Promise<void>): Promise<string[]> {
+  const clamped: string[] = [];
+  const onWarning = (w: Error): void => {
+    if (w.name === 'TimeoutOverflowWarning') clamped.push(w.message);
+  };
+  process.on('warning', onWarning);
+  try {
+    await run();
+    // `process.emitWarning` defers to the next tick, so let the last ones land before unhooking.
+    await new Promise((r) => setImmediate(r));
+  } finally {
+    process.off('warning', onWarning);
+  }
+  return clamped;
+}
+
+describe('a large sync_timeout_ms cannot arm a timer the runtime silently clamps', () => {
+  for (const syncTimeoutMs of LARGE_TIMEOUTS) {
+    for (const [name, drive] of Object.entries(DRIVERS)) {
+      it(`sync_timeout_ms ${syncTimeoutMs} / ${name}: no clamped timer, still delivers`, async () => {
+        let run: Run | undefined;
+        const clamped = await clampedTimers(async () => {
+          const p = await connectFake({ syncTimeoutMs });
+          run = await drive(p);
+          await p.disconnect();
+        });
+
+        expect(clamped).toEqual([]);
+        expect(run!.saw).toContain('fresh');
+        expect(run!.elapsed).toBeLessThan(WITHIN_BUDGET_MS);
+        expect(run!.idleCost).toBeLessThanOrEqual(RATE_CEILING);
+        expect(run!.idleCost).toBeGreaterThanOrEqual(1); // it really did look
       }, 30_000);
     }
   }

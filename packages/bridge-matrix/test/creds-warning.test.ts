@@ -28,6 +28,8 @@ const SAFE: Record<string, unknown> = {
   password: 's3cret-real-pw',
 };
 
+const REMOTE_PLAINTEXT = 'http://matrix.example.org:8008';
+
 const RISKS = {
   'the built-in default password': {
     apply: (c: Record<string, unknown>) => ({ ...c, password: undefined }),
@@ -44,6 +46,11 @@ const RISKS = {
     apply: (c: Record<string, unknown>) => ({ ...c, room_preset: 'public_chat' }),
     signature: /backend_config\.room_preset/,
     names: ['public_chat', "default 'private_chat'"],
+  },
+  'a plaintext homeserver_url': {
+    apply: (c: Record<string, unknown>) => ({ ...c, homeserver_url: REMOTE_PLAINTEXT }),
+    signature: /backend_config\.homeserver_url/,
+    names: [REMOTE_PLAINTEXT, 'm.login.password', 'access token', 'https://'],
   },
 } as const;
 
@@ -74,6 +81,44 @@ describe('connect warns once per active trust-widening config knob', () => {
         }
       }
       for (const line of lines) expect(line).toContain('[parley-matrix]');
+    });
+  }
+});
+
+/**
+ * The plaintext row above proves the warning EXISTS; this table proves it is decided by what the
+ * host IS rather than by how it is spelled. A classifier that string-matches `127.0.0.1` excuses
+ * `127.0.0.1.example.com` — a name anyone can resolve wherever they like — and one that only checks
+ * the scheme warns about every loopback fixture until the operator stops reading the warnings.
+ */
+const ORIGINS: Record<string, boolean> = {
+  'http://127.0.0.1:8008': false,
+  'http://127.9.9.9:8008': false,
+  'http://[::1]:8008': false,
+  'http://[0:0:0:0:0:0:0:1]:8008': false,
+  'http://localhost:8008': false,
+  'https://127.0.0.1:8008': false,
+  'https://matrix.example.org': false,
+  'http://matrix.example.org': true,
+  'http://10.0.0.5:8008': true,
+  'http://127.0.0.1.example.com': true,
+  'http://localhost.example.com': true,
+  'http://[::ffff:127.0.0.1]:8008': true,
+};
+
+describe('the plaintext-credential warning is decided by the host, not by its spelling', () => {
+  for (const [homeserverUrl, warns] of Object.entries(ORIGINS)) {
+    it(`${homeserverUrl}: ${warns ? 'warns' : 'silent'}`, async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => okLogin()));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      await new MatrixPlugin().connect({ ...SAFE, homeserver_url: homeserverUrl });
+
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      expect(lines.filter((l) => /backend_config\.homeserver_url/.test(l))).toHaveLength(
+        warns ? 1 : 0,
+      );
+      expect(lines).toHaveLength(warns ? 1 : 0);
     });
   }
 });

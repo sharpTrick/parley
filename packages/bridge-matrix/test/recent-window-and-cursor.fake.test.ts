@@ -105,6 +105,76 @@ describe('recent window: a raw page cap must not hide a topic behind noise', () 
 });
 
 /**
+ * CLASS: a seam bound this package's own fixtures cannot exercise, because their traffic is
+ * homogeneous. `limit` is a HARD cap on the returned page (`packages/conformance` asserts
+ * `messages.length <= limit`, and pins the since-less window as the NEWEST `limit`), but both paging
+ * loops stop on `collected.length < limit` while each page may add a full `limit` belonging messages
+ * — so a page that lands PART-full overshoots, and only the final `slice(0, limit)` brings it back.
+ * Deleting either cap left every test in this package green, the live conformance run included: the
+ * tables above put their noise BEHIND or IN FRONT of the belonging traffic, never BETWEEN two runs of
+ * it, which is the only arrangement that makes a page land part-full.
+ *
+ * `k` is how many belonging messages the FIRST page finds (1 ≤ k < limit — at k = 0 the loop just
+ * pages again, at k = limit it stops), so the second page overshoots to `k + limit`.
+ */
+const CAP_LIMITS = [2, 3, 5];
+const FOREIGN = 'someone-elses-topic';
+
+describe('limit is a hard cap even when a page lands part-full', () => {
+  for (const limit of CAP_LIMITS) {
+    for (let k = 1; k < limit; k++) {
+      const label = `limit ${limit} / first page holds ${k} of them`;
+
+      it(`${label}: the since-less window returns exactly the newest ${limit}`, async () => {
+        const p = await connectFake({ shared: true });
+        const t = asTopic('capped');
+        const belonging: string[] = [];
+        for (let i = 0; i < limit; i++) {
+          belonging.push(`old-${i}`);
+          await p.post(t, WRITER, `old-${i}`);
+        }
+        for (let i = 0; i < limit - k; i++) fake.addMessage(FOREIGN, `f${i}`);
+        for (let i = 0; i < k; i++) {
+          belonging.push(`new-${i}`);
+          await p.post(t, WRITER, `new-${i}`);
+        }
+
+        const res = await p.fetchRecent({ topic: t, limit });
+
+        expect(res.messages).toHaveLength(limit);
+        expect(res.messages.map((m) => m.content)).toEqual(belonging.slice(-limit));
+        await p.disconnect();
+      });
+
+      it(`${label}: the exclusive-since page caps, and the rest is still reachable`, async () => {
+        const p = await connectFake({ shared: true });
+        const t = asTopic('capped');
+        const seed = await p.post(t, WRITER, 'seed');
+        const after: string[] = [];
+        for (let i = 0; i < k; i++) {
+          after.push(`a-${i}`);
+          await p.post(t, WRITER, `a-${i}`);
+        }
+        for (let i = 0; i < limit - 1 - k; i++) fake.addMessage(FOREIGN, `f${i}`);
+        for (let i = 0; i < limit; i++) {
+          after.push(`b-${i}`);
+          await p.post(t, WRITER, `b-${i}`);
+        }
+
+        const page = await p.fetchRecent({ topic: t, since: asCursor(String(seed)), limit });
+
+        expect(page.messages).toHaveLength(limit);
+        expect(page.messages.map((m) => m.content)).toEqual(after.slice(0, limit));
+        // Nothing the cap held back is lost: replaying the cursor drains the remainder in order.
+        const { contents } = await drainFrom(p, t, page.nextCursor, limit);
+        expect(contents).toEqual(after.slice(limit));
+        await p.disconnect();
+      });
+    }
+  }
+});
+
+/**
  * How the cursor under test was minted. `lossless` marks the ones this plugin MINTED itself — those
  * must replay to everything after them. A cursor it never minted (purged / foreign) is allowed to
  * degrade to the documented recent window, but even then only ever to a SUFFIX: no mid-stream gap.

@@ -1,8 +1,8 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { DEFAULT_DEADLINE_MS } from '@sharptrick/parley-net-util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { connectFake, FakeSynapse } from './fake-synapse.js';
-import { readRetryAfter } from '../src/index.js';
+import { connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
+import { type MatrixPlugin, readRetryAfter } from '../src/index.js';
 
 /**
  * Two CLASSES over Synapse's 429 (`M_LIMIT_EXCEEDED`) on room creation — the one limiter that
@@ -14,6 +14,9 @@ import { readRetryAfter } from '../src/index.js';
  *     honoured in full (the deadline is the only governor, and its message is the actionable one),
  *     and a hint-less 429 returns `undefined` so the shared default and ceiling apply once, in
  *     `clampBackoff`, rather than being re-tuned per backend.
+ *  3. A stop-the-work hook nothing observes. The retry loop is handed `isStopped`, and a torn-down
+ *     plugin that keeps retrying spends exactly the resource this whole file is about — Synapse's
+ *     ~1-room-per-45s creation budget — on a generation that is already gone.
  */
 
 const res429 = (body: unknown, headers: Record<string, string> = {}): Response =>
@@ -124,4 +127,47 @@ describe('a 429 on room creation is retried on the homeserver terms', () => {
     expect(fake.createRoomBodies).toHaveLength(1); // refused once, never hammered
     await p.disconnect();
   }, 20_000);
+});
+
+/**
+ * Both lifecycle calls that END a generation, so neither can be the one that forgets. `connect()`
+ * without a preceding `disconnect()` is a reconnect, and the retry loop it orphans is invisible to
+ * every registry the new generation just cleared — the only thing that stops it is the staleness
+ * hook under test.
+ */
+const TEARDOWNS: Record<string, (p: MatrixPlugin) => Promise<void>> = {
+  'disconnect()': async (p) => {
+    await p.disconnect();
+  },
+  'connect() — a bare reconnect': async (p) => {
+    await p.connect(fakeConfig({}));
+  },
+};
+
+/** Long enough for several retries before the teardown, short enough to leave many after it. */
+const STATED_WAIT_MS = 120;
+const TEAR_DOWN_AT_MS = 360;
+const OBSERVE_AFTER_MS = 900;
+
+describe('a 429 backoff on POST /createRoom stops the moment the generation ends', () => {
+  for (const [name, teardown] of Object.entries(TEARDOWNS)) {
+    it(`${name}: the attempt count is frozen at the teardown instant`, async () => {
+      fake.createRoomLimited = Number.POSITIVE_INFINITY;
+      fake.createRoomRetryAfterMs = STATED_WAIT_MS;
+      const p = await connectFake({});
+      const posting = p.post(asTopic('ctx-torn-down'), asHandle('w'), 'hello').catch(() => undefined);
+
+      await new Promise((r) => setTimeout(r, TEAR_DOWN_AT_MS));
+      const midBackoff = fake.createRoomBodies.length;
+      await teardown(p);
+      const atTeardown = fake.createRoomBodies.length;
+
+      await new Promise((r) => setTimeout(r, OBSERVE_AFTER_MS));
+
+      expect(midBackoff).toBeGreaterThan(1); // it really was mid-retry, not already finished
+      expect(fake.createRoomBodies).toHaveLength(atTeardown);
+      await posting;
+      await p.disconnect();
+    }, 20_000);
+  }
 });
