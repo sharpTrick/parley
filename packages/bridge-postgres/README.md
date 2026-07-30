@@ -95,17 +95,13 @@ a smaller one commits and a catch-up reader would skip the late row forever. The
 serializes same-topic commits into `seq` order (distinct topics don't contend), which is what
 keeps the cursor monotonic and lossless under genuinely concurrent writers.
 
-Two different tests hold that, and they prove different things:
+## Cursors
 
-- the conformance suite's `concurrentPost` check drives N independent plugin instances against one
-  table and reads the topic **after every writer has committed** — so it proves uniqueness and
-  post-hoc ordering, and it stays green even with the advisory lock deleted;
-- `test/cursor-loss.test.ts` runs a reader **interleaved with** the writers, advancing its own
-  cursor while writes are still in flight. That is the case the lock exists for, and it is the one
-  that fails without it.
-
-If you are tempted to remove or refactor the lock, run that second file — a green conformance run
-is not evidence.
+A cursor from this backend is a decimal `seq` — the `BIGSERIAL` primary key rendered as text — and
+`fetchRecent` accepts only that. A `since` that is anything else is refused with a
+`parley-postgres: invalid cursor …` error naming the value, before any SQL is issued: a cursor
+minted by a different backend, or invented by an agent, is a bad request rather than a query, and
+the caller gets a message it can act on instead of a PostgreSQL one.
 
 ## Run Postgres
 

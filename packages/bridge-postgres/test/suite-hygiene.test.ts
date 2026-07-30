@@ -56,3 +56,38 @@ describe('the real-server harness is shared, not restated', () => {
     }
   });
 });
+
+// The README is the package description surface on npm, so it is read by people who have only the
+// published `dist/` — not the repo, not the suite. Maintainer-internal argument aimed at the next
+// reviewer ('a green conformance run is not evidence', 'if you are tempted to refactor…') is both
+// useless to them and unverifiable: it rots against the suite it names, and CLAUDE.md puts that
+// reasoning in the commit message. Naming an internal test path is the same mistake with a
+// guaranteed expiry date.
+const PACKAGE_ROOT = join(HERE, '..');
+
+const REVIEWER_DIRECTED: [what: string, pattern: RegExp][] = [
+  ['an appeal to what a reviewer should believe', /is not evidence/i],
+  ['an instruction aimed at whoever edits next', /if you are tempted/i],
+  ['a direct address to a reviewer', /\ba reviewer\b/i],
+  ['a pointer to a test file by path', /[\w-]+\/[\w.-]*\.test\.ts/],
+  ['a pointer to a test file by name', /`[\w.-]+\.test\.ts`/],
+  ['an instruction to run part of the suite', /\brun (that|this) (second |first )?file\b/i],
+];
+
+function publishedDocs(): string[] {
+  return readdirSync(PACKAGE_ROOT)
+    .filter((f) => f.endsWith('.md'))
+    .sort();
+}
+
+describe('the published README talks to operators, not to reviewers', () => {
+  it('has a README to grade', () => {
+    expect(publishedDocs()).toContain('README.md');
+  });
+
+  it.each(publishedDocs())('%s carries no reviewer-directed prose', (file) => {
+    const src = readFileSync(join(PACKAGE_ROOT, file), 'utf8');
+    const found = REVIEWER_DIRECTED.filter(([, pattern]) => pattern.test(src)).map(([what]) => what);
+    expect(found, 'move this to the commit message').toEqual([]);
+  });
+});

@@ -1,5 +1,5 @@
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import {
   dropTable,
@@ -41,6 +41,8 @@ interface Priv {
 }
 
 const DRAINED = { subs: 0, subscribing: 0, listens: 0, waiters: 0, pendingAborts: 0 };
+
+const priv = (plugin: PostgresPlugin): Priv => plugin as unknown as Priv;
 
 function registrySizes(priv: Priv): Record<string, number> {
   return {
@@ -208,6 +210,84 @@ if (await isUp(PG_URL)) {
         await dropTable(table);
       }
     }, 60000);
+  });
+
+  // The sequences above are all SEQUENTIAL, and the guards they exercise are check-then-act: every
+  // one of them reads a field that `connect()` only publishes after its awaited bootstrap. Fired
+  // concurrently, N callers all pass the guard, all bootstrap, and all assign — and every resource
+  // but the last assignment's becomes unreachable: a Pool nothing can `end()` (holding `pool_size`
+  // server backends for the life of the process) and, with retention on, an interval still issuing
+  // DELETEs into a later lifecycle. Neither is visible on the instance afterwards, so the property
+  // is counted at the two places it IS visible: how many calls won, and what the SERVER still holds.
+  const CONCURRENCY = [2, 3, 5];
+  const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+  const CONCURRENT_CELLS = CONCURRENCY.flatMap((calls) =>
+    [false, true].map((retention) => ({ calls, retention })),
+  );
+
+  describe('concurrent connect() admits exactly one lifecycle', () => {
+    it.each(
+      CONCURRENT_CELLS.map(
+        (c) =>
+          [`${c.calls} concurrent connect(s), retention ${c.retention ? 'on' : 'off'}`, c] as const,
+      ),
+    )('%s', async (_label, cell) => {
+      const appName = `parley_cc_${rand()}`;
+      const table = `parley_cc_${rand()}`;
+      const url = `${PG_URL}?application_name=${appName}`;
+      const plugin = new PostgresPlugin();
+      const topic = asTopic(`cc-${rand()}`);
+      const config = {
+        url,
+        table_name: table,
+        ...(cell.retention ? { retention_days: 1 } : {}),
+      };
+
+      // Only the prune cadence, so an interval pg or the harness happens to arm is not miscounted.
+      const pruneIntervals: unknown[] = [];
+      const realSetInterval = globalThis.setInterval;
+      const spy = vi
+        .spyOn(globalThis, 'setInterval')
+        .mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) => {
+          const timer = (realSetInterval as (...a: unknown[]) => unknown)(fn, ms, ...rest);
+          if (ms === PRUNE_INTERVAL_MS) pruneIntervals.push(timer);
+          return timer;
+        }) as unknown as typeof setInterval);
+
+      try {
+        const settled = await Promise.allSettled(
+          Array.from({ length: cell.calls }, () => plugin.connect(config)),
+        );
+        const won = settled.filter((r) => r.status === 'fulfilled');
+        const lost = settled.filter((r) => r.status === 'rejected');
+        expect(won.length, 'more than one connect() published a lifecycle').toBe(1);
+        for (const r of lost) {
+          expect(String((r as PromiseRejectedResult).reason?.message)).toMatch(/^parley-postgres:/);
+        }
+        // A floor as well as a ceiling: retention on must arm exactly one prune interval, and
+        // retention off exactly none — "fewer is fine" would be satisfied by never pruning at all.
+        expect(pruneIntervals.length, 'prune intervals armed').toBe(cell.retention ? 1 : 0);
+
+        await plugin.post(topic, asHandle('u'), 'the winner still works');
+        expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+          'the winner still works',
+        ]);
+
+        await plugin.disconnect();
+        expect(registrySizes(priv(plugin)), 'registry state survived teardown').toEqual(DRAINED);
+        expect(priv(plugin).pool, 'pool survived teardown').toBeUndefined();
+        expect(
+          await settledBackendCount(appName),
+          'a connect() that lost the race left a pool nothing can end()',
+        ).toBe(0);
+      } finally {
+        spy.mockRestore();
+        for (const timer of pruneIntervals) clearInterval(timer as ReturnType<typeof setInterval>);
+        await plugin.disconnect().catch(() => undefined);
+        await dropTable(table);
+      }
+    }, 90000);
   });
 } else {
   describe.skip(`connection hygiene (no server at ${PG_URL})`, () => {

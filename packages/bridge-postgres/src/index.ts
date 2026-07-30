@@ -17,6 +17,7 @@ import {
 } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import { Client, Pool } from 'pg';
+import { parse as parseDsn } from 'pg-connection-string';
 import {
   assertTableName,
   badConfig,
@@ -126,17 +127,62 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
   return cfg as PostgresBackendConfig;
 }
 
-/** True when the DSN carries the repo-public `parley:parley` pair, whatever host/port/database. */
+/**
+ * True when the DSN carries the repo-public `parley:parley` pair, whatever host/port/database.
+ *
+ * Keep this deriving the credentials from `pg-connection-string` — the parser `new Pool({
+ * connectionString })` itself uses — so that every spelling pg honours is graded. Hand-parsing with
+ * `new URL` sees only the userinfo, so a DSN carrying the published pair as libpq `?user=`/
+ * `?password=` query parameters connects with it and warns about nothing.
+ */
 export function usesDefaultCredentials(url: string): boolean {
   try {
-    const parsed = new URL(url);
-    return (
-      decodeURIComponent(parsed.username) === DEFAULT_USER &&
-      decodeURIComponent(parsed.password) === DEFAULT_PASSWORD
-    );
+    const parsed = parseDsn(url);
+    // Keep these `||`, so that the env fallback still runs: the parser reports a credential the DSN
+    // omits as '', and pg authenticates such a DSN as PGUSER/PGPASSWORD.
+    const user = parsed.user || process.env['PGUSER'];
+    const password = parsed.password || process.env['PGPASSWORD'];
+    return user === DEFAULT_USER && password === DEFAULT_PASSWORD;
   } catch {
     return false;
   }
+}
+
+/** The largest value PostgreSQL's `bigint` holds — the ceiling on any cursor this backend mints. */
+const MAX_SEQ = 9223372036854775807n;
+
+/**
+ * Reject a `since` this backend cannot have minted, before it reaches `seq > $2::bigint`.
+ *
+ * `since` is opaque and agent-supplied (core's `parley_fetch_recent` passes `z.string()` straight
+ * through), and the cast decides what happens to anything else: `'abc'` raises SQLSTATE 22P02 and
+ * renders a database error into agent context, while `' 5 '`, `'0x10'` and `'-1'` are quietly
+ * accepted because bigint input is laxer than a cursor.
+ */
+function assertCursor(since: string): void {
+  if (!/^\d{1,19}$/.test(since) || BigInt(since) > MAX_SEQ) {
+    throw new Error(
+      `parley-postgres: invalid cursor ${JSON.stringify(since)} — a cursor from this backend is a ` +
+        `decimal sequence number between 0 and ${MAX_SEQ}. Pass one this backend returned as ` +
+        '`nextCursor`, or omit `since` to get the newest page.',
+    );
+  }
+}
+
+/**
+ * Wrap a listener-connection failure so a seam call names this plugin and the topic it was for.
+ * The listener is memoized and a drop starts a backoff reconnect, so during that window the raw
+ * driver string ('Client has encountered a connection error and is not queryable') is what escapes
+ * `subscribe` — and core's push loop rethrows anything that is not a `NoSuchTopicError`, so the
+ * whole live path fails to attach on a message naming neither the backend nor the topic.
+ */
+function listenerUnavailable(topic: Topic, err: unknown): Error {
+  const detail = err instanceof Error ? err.message : String(err);
+  if (detail.startsWith('parley-postgres:')) return err as Error;
+  return new Error(
+    `parley-postgres: could not establish the live path for topic '${topic}' — ${detail}. The ` +
+      'listener connection is down; a reconnect is in flight, so a retry succeeds once it lands.',
+  );
 }
 
 /** Per-channel LISTEN state shared by subscriptions and blocking waiters. */
@@ -172,6 +218,13 @@ interface TopicSubscription {
  */
 export class PostgresPlugin implements BackendPlugin {
   private pool?: Pool;
+  /**
+   * Armed synchronously by `connect()` before its first await. `this.pool` is only published after
+   * the awaited bootstrap, so two concurrent `connect()`s would both pass a `pool === undefined`
+   * guard, both bootstrap, and both assign — stranding the loser's pool and prune timer with no
+   * caller reference left to reclaim them.
+   */
+  private connecting = false;
   private url = DEFAULT_URL;
   private table = 'parley_messages';
   /** Relation names already double-quoted — the only spelling that may reach SQL text. */
@@ -216,12 +269,22 @@ export class PostgresPlugin implements BackendPlugin {
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = validateBackendConfig(config);
-    if (this.pool !== undefined) {
+    if (this.pool !== undefined || this.connecting) {
       throw new Error(
-        'parley-postgres: already connected — call disconnect() first. A second connect() would ' +
-          'strand the previous pool and prune timer with no way for the caller to reclaim them',
+        'parley-postgres: already connected (or a connect() is still in flight) — call ' +
+          'disconnect() first. A second connect() would strand the previous pool and prune timer ' +
+          'with no way for the caller to reclaim them',
       );
     }
+    this.connecting = true;
+    try {
+      await this.open(cfg);
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  private async open(cfg: PostgresBackendConfig): Promise<void> {
     this.url = cfg.url ?? DEFAULT_URL;
     this.table = assertTableName(cfg.table_name ?? 'parley_messages');
     this.names = quotedNames(this.table);
@@ -386,6 +449,7 @@ export class PostgresPlugin implements BackendPlugin {
       return this.pageResult((res.rows as MessageRow[]).reverse(), args);
     }
 
+    assertCursor(args.since);
     // Exclusive: strictly after `since`, ascending.
     let rows = await this.exclusiveSince(args.topic, args.since, limit);
     // Native long-poll: only when the exclusive `since` query came back EMPTY and the
@@ -544,7 +608,12 @@ export class PostgresPlugin implements BackendPlugin {
     handler: MessageHandler,
   ): Promise<TopicSubscription> {
     const epoch = this.epoch;
-    const listener = await this.ensureListener();
+    let listener: Client;
+    try {
+      listener = await this.ensureListener();
+    } catch (err) {
+      throw listenerUnavailable(topic, err);
+    }
     // Tail first: push never replays history (catch-up owns it).
     const res = await pool.query(
       `SELECT COALESCE(MAX(seq), 0)::text AS max FROM ${this.names.messages} WHERE topic = $1`,
@@ -561,7 +630,12 @@ export class PostgresPlugin implements BackendPlugin {
     // `this.subs` — otherwise the next reconnect re-LISTENs and re-drains a channel the caller was
     // told FAILED to subscribe. It also covers the tail-read → LISTEN window: a row committed in
     // it has seq > lastSeen, so the drain below still catches it.
-    const listen = await this.acquireListen(listener, channel);
+    let listen: ListenState;
+    try {
+      listen = await this.acquireListen(listener, channel);
+    } catch (err) {
+      throw listenerUnavailable(topic, err);
+    }
     // Registering here after a teardown is worse than failing: the entry survives into the next
     // connect(), where subscribe()'s fast path hands it back and no LISTEN is ever issued, so push
     // is silently dead for that topic.
@@ -761,6 +835,10 @@ export class PostgresPlugin implements BackendPlugin {
                ORDER BY ${this.names.messages}.seq ASC LIMIT ${DRAIN_BATCH}`,
               [sub.topic, sub.lastSeen],
             );
+            // `pool.end()` waits for this read, so a teardown that began while it was in flight is
+            // only observable HERE. Keep the re-check, so that a subscription `disconnect()` has
+            // already dropped cannot deliver one last batch into a handler on its way out.
+            if (this.stopped || epoch !== this.epoch) return;
             const rows = res.rows as MessageRow[];
             if (rows.length === 0) break;
             for (const row of rows) {
