@@ -1,48 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { type FakeTelegram, startFakeTelegram } from './fake-telegram.js';
+import { startRig } from './rig.js';
 
 const SENDER = asHandle('me');
-
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-  vi.restoreAllMocks();
-});
-
-interface Rig {
-  fake: FakeTelegram;
-  plugin: TelegramPlugin;
-  storePath: string;
-  restart(): Promise<TelegramPlugin>;
-}
-
-async function startRig(config: Record<string, unknown> = {}): Promise<Rig> {
-  const fake = await startFakeTelegram();
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-cursor-'));
-  const storePath = join(dir, 'store.jsonl');
-  cleanups.push(async () => {
-    await fake.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  const connect = async (): Promise<TelegramPlugin> => {
-    const plugin = new TelegramPlugin();
-    await plugin.connect({
-      token: fake.token,
-      api_url: fake.url,
-      store_path: storePath,
-      poll_timeout_s: 1,
-      ...config,
-    });
-    cleanups.push(() => plugin.disconnect());
-    return plugin;
-  };
-  return { fake, storePath, plugin: await connect(), restart: connect };
-}
 
 /**
  * The cursor is a sequence this PLUGIN generates, so its meaning is only as durable as the store

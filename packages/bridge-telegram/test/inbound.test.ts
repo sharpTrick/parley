@@ -1,50 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { ObservedStore } from '../src/store.js';
-import { type FakeTelegram, KNOWN_CHANNEL, startFakeTelegram } from './fake-telegram.js';
+import { KNOWN_CHANNEL } from './fake-telegram.js';
+import { captureStderr, registerCleanup, type Rig, startRig } from './rig.js';
 
 const SENDER = asHandle('me');
-
-interface Rig {
-  fake: FakeTelegram;
-  plugin: TelegramPlugin;
-  storePath: string;
-  /** Reconnect a NEW plugin instance against the same fake + store file (cold restart). */
-  restart(): Promise<TelegramPlugin>;
-}
-
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-});
-
-async function startRig(config: Record<string, unknown> = {}): Promise<Rig> {
-  const fake = await startFakeTelegram();
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-'));
-  const storePath = join(dir, 'store.jsonl');
-  cleanups.push(async () => {
-    await fake.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  const connect = async (): Promise<TelegramPlugin> => {
-    const plugin = new TelegramPlugin();
-    await plugin.connect({
-      token: fake.token,
-      api_url: fake.url,
-      store_path: storePath,
-      poll_timeout_s: 1,
-      ...config,
-    });
-    cleanups.push(() => plugin.disconnect());
-    return plugin;
-  };
-  const plugin = await connect();
-  return { fake, plugin, storePath, restart: connect };
-}
 
 const contentsOf = async (plugin: TelegramPlugin, topic: Topic): Promise<string[]> =>
   (await plugin.fetchRecent({ topic, limit: 100 })).messages.map((m) => m.content);
@@ -348,9 +310,15 @@ describe('telegram own-post race', () => {
  * The once-only guarantee, from the plugin's side. Telegram retains an unacknowledged `getUpdates`
  * backlog and re-serves it — that is what the README calls "dedup across `getUpdates` backlog
  * replays … the store's dedup makes that replay harmless" — so the same `<chat>:<message_id>`
- * really does arrive twice, in the same session and across a restart. Each route asserts the
- * whole consequence: one record, one cursor, one live push, one line on disk. Guarding the ROUTE
- * axis is what keeps the class covered when a new ingest path is added.
+ * really does arrive twice, in the same session and across a restart. Each cell asserts the whole
+ * consequence: one record, one cursor, one live push, one line on disk.
+ *
+ * The second axis is the RETENTION state of the record when the copy lands, because the dedup set IS
+ * the once-only guarantee: a store that forgets an id when retention evicts its record re-admits the
+ * copy under a FRESH observation sequence — the same `backendMsgId` at two cursors, the second one
+ * ABOVE the cursor the agent holds and out of observation order, which core cannot absorb (its dedup
+ * is a bounded in-memory LRU). Every route is therefore graded with the record still retained and
+ * with retention already past it, including past the compaction that drops its line from the file.
  */
 describe('telegram observes each message once', () => {
   const CHAT = '-1009777001';
@@ -360,49 +328,82 @@ describe('telegram observes each message once', () => {
     "redelivered as the bridge's own post",
   ] as const;
 
-  it.each(ROUTES)('a message %s is stored, pushed and served exactly once', async (route) => {
-    const rig = await startRig();
-    const topic = asTopic(CHAT);
-    const own = route === "redelivered as the bridge's own post";
-    let messageId: number;
-    let content: string;
+  const RETENTIONS = [
+    { at: 'retained', config: {}, retention: Number.POSITIVE_INFINITY, newer: 0 },
+    { at: 'the retention bound', config: { observed_retention_per_chat: 2 }, retention: 2, newer: 0 },
+    { at: 'evicted', config: { observed_retention_per_chat: 2 }, retention: 2, newer: 2 },
+    {
+      at: 'evicted and compacted out of the file',
+      config: { observed_retention_per_chat: 1 },
+      retention: 1,
+      newer: 3,
+    },
+  ];
 
-    if (own) {
-      content = 'ours';
-      const id = await rig.plugin.post(topic, SENDER, content);
-      messageId = Number((id as string).split(':')[1]);
-    } else {
-      content = 'once';
-      messageId = rig.fake.injectUserMessage(CHAT, 'alice', content);
-      await vi.waitFor(async () => expect(await contentsOf(rig.plugin, topic)).toEqual([content]), {
-        timeout: 3000,
+  const CELLS = ROUTES.flatMap((route) => RETENTIONS.map((state) => ({ route, ...state })));
+
+  it.each(CELLS)(
+    'a message $route while $at is stored, pushed and served exactly once',
+    async ({ route, config, retention, newer }) => {
+      const rig = await startRig(config);
+      const topic = asTopic(CHAT);
+      const own = route === "redelivered as the bridge's own post";
+      const content = own ? 'ours' : 'once';
+      const messageId = own
+        ? Number(((await rig.plugin.post(topic, SENDER, content)) as string).split(':')[1])
+        : rig.fake.injectUserMessage(CHAT, 'alice', content);
+
+      // Newer traffic drives the original past the retention bound BEFORE its copy arrives; drained
+      // first, so the live subscriber below only ever sees what the replay itself produces.
+      const fillers = Array.from({ length: newer }, (_, i) => `newer-${i}`);
+      for (const f of fillers) rig.fake.injectUserMessage(CHAT, 'alice', f);
+      const settled = [content, ...fillers];
+      const retainedTail = (of: string[]): string[] => of.slice(-Math.min(retention, of.length));
+      await vi.waitFor(
+        async () => expect(await contentsOf(rig.plugin, topic)).toEqual(retainedTail(settled)),
+        { timeout: 5000, interval: 10 },
+      );
+
+      // A live subscriber established BEFORE the replay: the duplicate must not reach it.
+      const restarted = route === 'redelivered after a cold restart' ? await restart(rig) : rig.plugin;
+      const live: Message[] = [];
+      await restarted.subscribe(topic, (m) => live.push(m));
+
+      rig.fake.injectRaw(CHAT, {
+        message_id: messageId,
+        from: { id: 5, is_bot: own, username: own ? 'parley_test_bot' : 'alice' },
+        text: content,
+      });
+      // A trailing distinct message pins the point at which the replay has been consumed.
+      rig.fake.injectUserMessage(CHAT, 'alice', 'after');
+      await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after'), {
+        timeout: 5000,
         interval: 10,
       });
-    }
 
-    // A live subscriber established BEFORE the replay: the duplicate must not reach it.
-    const restarted = route === 'redelivered after a cold restart' ? await restart(rig) : rig.plugin;
-    const live: Message[] = [];
-    await restarted.subscribe(topic, (m) => live.push(m));
-
-    rig.fake.injectRaw(CHAT, {
-      message_id: messageId,
-      from: { id: 5, is_bot: own, username: own ? 'parley_test_bot' : 'alice' },
-      text: content,
-    });
-    // A trailing distinct message pins the point at which the replay has been consumed.
-    rig.fake.injectUserMessage(CHAT, 'alice', 'after');
-    await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after'), {
-      timeout: 5000,
-      interval: 10,
-    });
-
-    expect(live.map((m) => m.content)).toEqual(['after']);
-    const page = await restarted.fetchRecent({ topic, limit: 100 });
-    expect(page.messages.map((m) => m.content)).toEqual([content, 'after']);
-    expect(new Set(page.messages.map((m) => m.cursor)).size).toBe(2);
-    expect(readFileSync(rig.storePath, 'utf8').trimEnd().split('\n')).toHaveLength(2);
-  }, 20_000);
+      expect(live.map((m) => m.content)).toEqual(['after']);
+      const kept = retainedTail([...settled, 'after']);
+      const page = await restarted.fetchRecent({ topic, limit: 100 });
+      expect(page.messages.map((m) => m.content)).toEqual(kept);
+      expect(new Set(page.messages.map((m) => m.cursor)).size).toBe(kept.length);
+      // And once on disk. The file trails the retained window by up to one compaction, so what is
+      // pinned here is the composite ids it carries: never the same one twice, and never a second
+      // copy of the replayed message — the dedup memory a compaction persists is not a record.
+      const ids = readFileSync(rig.storePath, 'utf8')
+        .split('\n')
+        .filter((l) => l !== '' && !l.startsWith('#'))
+        .map((l) => {
+          const rec = JSON.parse(l) as { chat_id: string; message_id: number };
+          return `${rec.chat_id}:${rec.message_id}`;
+        });
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(ids.filter((id) => id === `${CHAT}:${messageId}`)).toHaveLength(
+        kept.includes(content) ? 1 : 0,
+      );
+      expect(ids.length).toBeGreaterThanOrEqual(kept.length);
+    },
+    20_000,
+  );
 });
 
 const DATE = 1_600_000_000;
@@ -471,10 +472,9 @@ describe('telegram poll-loop fault isolation', () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (err: unknown): void => void unhandled.push(err);
     process.on('unhandledRejection', onUnhandled);
-    cleanups.push(() => void process.off('unhandledRejection', onUnhandled));
+    registerCleanup(() => void process.off('unhandledRejection', onUnhandled));
 
-    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    cleanups.push(() => void vi.restoreAllMocks());
+    captureStderr();
     const rig = await startRig();
     const chat = '-1006000123';
     const topic = asTopic(chat);
@@ -487,7 +487,6 @@ describe('telegram poll-loop fault isolation', () => {
       vi.spyOn(ObservedStore.prototype, 'append').mockImplementationOnce(() => {
         throw new Error('ENOSPC: no space left on device');
       });
-      cleanups.push(() => void vi.restoreAllMocks());
     }
 
     rig.fake.injectUserMessage(chat, 'alice', 'poison');
@@ -620,23 +619,49 @@ describe('telegram unconfigured-chat ingest', () => {
   }, 30_000);
 
   /**
-   * A refused record is permanent message loss — the update was acknowledged to Telegram before
-   * the store saw it — so it must never be silent.
+   * A refused record is permanent message loss — the update was acknowledged to Telegram before the
+   * store saw it — so it must never be silent. A DUPLICATE is the opposite: expected on every
+   * backlog replay, and reporting it would tell the operator to raise a bound that is not the
+   * problem. Both halves of the title are graded, and both kinds of duplicate are: one whose record
+   * is still retained, and one retention has already evicted.
    */
-  it('reports a record the store refuses, and does not report a plain duplicate', async () => {
-    const stderr: string[] = [];
-    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      stderr.push(String(chunk));
-      return true;
-    });
-    cleanups.push(() => void vi.restoreAllMocks());
+  const DUP_CHAT = '-1007001001';
+
+  it('reports a record the store refuses, and stays silent on a duplicate', async () => {
+    const stderr = captureStderr();
     // Both configured chats are served from connect, so the cap has no unserved chat to displace.
     const rig = await startRig({
       observed_max_chats: 2,
-      chat_map: { a: '-1007001001', b: '-1007001002' },
+      observed_retention_per_chat: 2,
+      chat_map: { a: DUP_CHAT, b: '-1007001002' },
     });
-    await rig.plugin.post(asTopic('a'), SENDER, 'a');
+    // The second served chat has to be present for the cap to have nothing unserved to displace.
     await rig.plugin.post(asTopic('b'), SENDER, 'b');
+    const evicted = rig.fake.injectUserMessage(DUP_CHAT, 'alice', 'oldest');
+    const retained = rig.fake.injectUserMessage(DUP_CHAT, 'alice', 'newer');
+    rig.fake.injectUserMessage(DUP_CHAT, 'alice', 'newest');
+    await vi.waitFor(
+      async () => expect(await contentsOf(rig.plugin, asTopic('a'))).toEqual(['newer', 'newest']),
+      { timeout: 8000, interval: 20 },
+    );
+
+    // Both copies are duplicates: one of a retained record, one of a record retention has dropped.
+    for (const [messageId, text] of [
+      [evicted, 'oldest'],
+      [retained, 'newer'],
+    ] as const) {
+      rig.fake.injectRaw(DUP_CHAT, {
+        message_id: messageId,
+        from: { id: 5, is_bot: false, username: 'alice' },
+        text,
+      });
+    }
+    rig.fake.injectUserMessage(DUP_CHAT, 'alice', 'sentinel');
+    await vi.waitFor(
+      async () => expect(await contentsOf(rig.plugin, asTopic('a'))).toContain('sentinel'),
+      { timeout: 8000, interval: 20 },
+    );
+    expect(stderr.join('')).not.toMatch(/dropped/);
 
     rig.fake.injectUserMessage('-1007009999', 'mallory', 'refused');
     await vi.waitFor(() => expect(stderr.join('')).toMatch(/dropped a message for chat/), {
@@ -644,5 +669,6 @@ describe('telegram unconfigured-chat ingest', () => {
       interval: 20,
     });
     expect(stderr.join('')).toContain('-1007009999');
+    expect(stderr.join('')).not.toContain(DUP_CHAT);
   }, 20_000);
 });

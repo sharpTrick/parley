@@ -107,11 +107,12 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** Record contents on disk — the dedup memory a compaction persists is not a record. */
 const contentsOnDisk = (): string[] =>
   readFileSync(path, 'utf8')
     .trimEnd()
     .split('\n')
-    .filter((l) => l !== '')
+    .filter((l) => l !== '' && !l.startsWith('#'))
     .map((l) => (JSON.parse(l) as { content: string }).content);
 
 describe('telegram ObservedStore compaction survives an interruption', () => {

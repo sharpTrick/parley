@@ -217,13 +217,9 @@ export class TelegramPlugin implements BackendPlugin {
         cfg.observed_max_chats,
         served,
       );
-      if (generation !== this.generation) {
-        store.close();
-        this.stillCurrent(generation);
-      }
       this.store = store;
       // ONE shared ingestion loop per instance (one getUpdates consumer per token — see class doc).
-      void this.pollLoop(generation).catch((err: unknown) => {
+      void this.pollLoop(generation, store).catch((err: unknown) => {
         this.report(`getUpdates loop stopped: ${describe(err)}`);
       });
     } finally {
@@ -281,8 +277,20 @@ export class TelegramPlugin implements BackendPlugin {
     const replyMid = parseCompositeMid(opts?.inReplyTo, chatId);
     if (replyMid !== undefined) body.reply_to_message_id = replyMid;
     const json = await this.call<{ result: TgMessage }>('POST', '/sendMessage', { body });
-    this.ingest(String(json.result.chat.id), json.result);
-    return asBackendMsgId(keyOf({ chat_id: String(json.result.chat.id), message_id: json.result.message_id }));
+    const sentChatId = String(json.result.chat.id);
+    const sentId = keyOf({ chat_id: sentChatId, message_id: json.result.message_id });
+    // Re-assert AFTER the send too: a teardown landing here leaves a message Telegram has already
+    // accepted and no store to record it in, and own posts never come back via `getUpdates`, so
+    // reconnecting cannot recover it. Name the id, so that the caller knows what exists upstream.
+    if (this.store !== store) {
+      throw new Error(
+        `TelegramPlugin not connected — the connection this call started on was torn down after ` +
+          `Telegram accepted ${sentId}, so the message exists in the chat and is missing from the ` +
+          `observed-message store at '${this.storePath}' (own posts never arrive via getUpdates).`,
+      );
+    }
+    this.ingest(store, sentChatId, json.result);
+    return asBackendMsgId(sentId);
   }
 
   /**
@@ -314,6 +322,8 @@ export class TelegramPlugin implements BackendPlugin {
     // Normalize BEFORE slicing: a non-positive limit must mean "no messages" on both branches
     // (`slice(-0)` is `slice(0)` — the whole history — which would invert the argument).
     const limit = Math.max(0, Math.floor(args.limit ?? 100));
+    const nothingNewer = (): boolean =>
+      !store.entries(chatId).some((r) => r.seq > Number(args.since));
     const query = (): Message[] => {
       const all = store.entries(chatId);
       const slice =
@@ -325,18 +335,20 @@ export class TelegramPlugin implements BackendPlugin {
       return slice.map((rec) => recordToMessage(rec, args.topic));
     };
     let messages = query();
-    // Native long-poll: ONLY when the exclusive `since` query came back empty. Park
-    // up to `blockMs` for the SHARED ingest path (the one getUpdates loop, or an own post) to
-    // deliver a message strictly after `since`, then re-run the same pure query. There is no
-    // second getUpdates consumer — {@link ingest} wakes the waiter. The initial query and the
-    // waiter registration run with NO await between them, so a message ingested during the wait
-    // can never slip through the gap. Empty page + STABLE cursor (=== `since`) at timeout is
-    // correct; returning early/empty is always safe, and we never block longer than `blockMs`.
+    // Native long-poll: ONLY when NOTHING in the store sits above the exclusive `since` — the
+    // unsliced predicate, never the sliced page, so that a `limit` which happens to return no rows
+    // cannot park a call the store could already answer. Park up to `blockMs` for the SHARED
+    // ingest path (the one getUpdates loop, or an own post) to deliver a message strictly after
+    // `since`, then re-run the same pure query. There is no second getUpdates consumer —
+    // {@link ingest} wakes the waiter. The predicate, the initial query and the waiter
+    // registration run with NO await between them, so a message ingested during the wait can never
+    // slip through the gap. Empty page + STABLE cursor (=== `since`) at timeout is correct;
+    // returning early/empty is always safe, and we never block longer than `blockMs`.
     if (
-      messages.length === 0 &&
       args.since !== undefined &&
       args.blockMs !== undefined &&
-      args.blockMs > 0
+      args.blockMs > 0 &&
+      nothingNewer()
     ) {
       await this.waitForMessage(chatId, Number(args.since), args.blockMs);
       messages = query();
@@ -497,6 +509,10 @@ export class TelegramPlugin implements BackendPlugin {
    * dedup on the composite id, persist to the store under a fresh observation sequence, then
    * deliver to any live subscriber.
    *
+   * The store is a PARAMETER, not `this.store`: both callers have already established that the
+   * generation they started on is still current, and neither awaits between that check and this
+   * call, so there is no "raced disconnect" case here to drop a message in.
+   *
    * The store's dedup set is the once-only guarantee — a record back from `store.append`
    * already proves this message was never observed. The per-subscriber watermark is the FIXED
    * observation sequence captured AT subscribe (deliver only what was observed after the
@@ -505,9 +521,7 @@ export class TelegramPlugin implements BackendPlugin {
    * own post but delivered after it still lands above the watermark and above every cursor
    * already handed out, so it reaches both the push path and catch-up.
    */
-  private ingest(chatId: string, msg: TgMessage): void {
-    const store = this.store;
-    if (store === undefined) return; // raced disconnect; drop.
+  private ingest(store: ObservedStore, chatId: string, msg: TgMessage): void {
     const content = contentOf(msg);
     if (content === undefined) return; // an update carrying nothing an agent could read.
     const observed: ObservedRecord = {
@@ -550,7 +564,7 @@ export class TelegramPlugin implements BackendPlugin {
    * store's dedup makes that replay harmless and doubles as offline catch-up. Accepts BOTH
    * `update.message` (groups/DMs) and `update.channel_post` (channels).
    */
-  private async pollLoop(generation: number): Promise<void> {
+  private async pollLoop(generation: number, store: ObservedStore): Promise<void> {
     let offset = 0;
     while (this.generation === generation) {
       let updates: TgUpdate[];
@@ -592,7 +606,7 @@ export class TelegramPlugin implements BackendPlugin {
         const msg = u.message ?? u.channel_post;
         if (msg === undefined) continue; // an update kind we don't carry (edits, reactions, …)
         try {
-          this.ingest(String(msg.chat.id), msg);
+          this.ingest(store, String(msg.chat.id), msg);
         } catch (err) {
           // Keep the loop alive across a failing store write (ENOSPC/EIO): losing one message is
           // recoverable, losing the only getUpdates consumer takes live push down for good.

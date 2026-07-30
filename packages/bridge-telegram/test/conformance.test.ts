@@ -1,26 +1,14 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asTopic, type Topic } from '@sharptrick/parley-core';
-import { TelegramPlugin } from '../src/index.js';
-import { startFakeTelegram } from './fake-telegram.js';
+import { openRig } from './rig.js';
 
 /** Supergroup-shaped chat ids: the fake rejects anything real Telegram would 400 on. */
 let seq = 0;
 
 async function makeContext() {
-  const fake = await startFakeTelegram();
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-'));
-  const plugin = new TelegramPlugin();
-  await plugin.connect({
-    token: fake.token,
-    api_url: fake.url,
-    store_path: join(dir, 'store.jsonl'),
-    poll_timeout_s: 1,
-  });
+  const rig = await openRig();
   return {
-    plugin,
+    plugin: rig.plugin,
     // fetchRecent honors `blockMs` NATIVELY: a parked fetch is woken by the SHARED
     // ingest path (the one getUpdates loop, or an own post) through ingest() — no second
     // getUpdates consumer. Run the shared blocking-fetch case directly against the plugin.
@@ -28,11 +16,7 @@ async function makeContext() {
     // An unmapped topic is used as the chat id literal — a fresh chat per test.
     freshTopic: (): Topic => asTopic(String(-1_002_000_000_000 - ++seq)),
     carriesSenderIdentity: false, // posts as the bot account; `identity` is informational
-    cleanup: async () => {
-      await plugin.disconnect();
-      await fake.close();
-      rmSync(dir, { recursive: true, force: true });
-    },
+    cleanup: rig.close,
     concurrentPost: 'unsupported' as const,
     // NO concurrentPost, deliberately: Telegram allows exactly ONE getUpdates consumer per
     // bot token (a second poller gets HTTP 409) and the observed-message store is one file

@@ -1,11 +1,13 @@
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
@@ -53,6 +55,58 @@ export const keyOf = (rec: Pick<StoredRecord, 'chat_id' | 'message_id'>): string
 const DEFAULT_MAX_PER_CHAT = 10_000;
 /** Default max distinct chats retained when the caller doesn't override it. */
 const DEFAULT_MAX_CHATS = 1_000;
+/**
+ * How many EVICTED composite ids stay refusable after their records are gone — store-wide, and
+ * deliberately independent of every retention bound. What Telegram can redeliver after this bridge
+ * has already observed it is one unacknowledged `getUpdates` batch (at most 100 updates, since the
+ * offset only advances on the NEXT poll), so keep this memory sized on THAT window rather than on
+ * the operator's retention knob: narrowing retention must not narrow the once-only guarantee with
+ * it. Own posts are never redelivered at all.
+ */
+const EVICTED_ID_MEMORY = 1_000;
+/**
+ * Marks the line a compaction writes to carry {@link ObservedStore.evicted} across a restart.
+ * Keep it INVALID JSON, so that a reader which predates it drops the line as garbled rather than
+ * indexing it as a record.
+ */
+const EVICTED_ID_LINE = '#evicted ';
+/** Mode for everything this store creates — the plaintext of every message the bridge has seen. */
+const OWNER_ONLY_FILE = 0o600;
+/** Mode for a directory this store creates for {@link ObservedStore.path}. */
+const OWNER_ONLY_DIR = 0o700;
+
+/**
+ * Narrow a store file readable beyond its owner, reporting the change. An `openSync` mode applies
+ * only to a file it CREATES, so an upgrade onto a store written by an earlier version — or a
+ * compaction output a broken umask widened — is otherwise left silently world-readable.
+ *
+ * Only files this store owns are touched: a pre-existing DIRECTORY can be the operator's working
+ * directory or a shared state root, and narrowing that on their behalf is a bigger surprise than
+ * the one it prevents.
+ */
+function restrictMode(path: string): void {
+  let current: number;
+  try {
+    current = statSync(path).mode & 0o777;
+  } catch {
+    return;
+  }
+  if ((current & 0o077) === 0) return;
+  const target = current & 0o700;
+  try {
+    chmodSync(path, target);
+    process.stderr.write(
+      `parley-telegram: tightened ${path} from 0${current.toString(8)} to 0${target.toString(8)} ` +
+        `(the observed-message store must not be readable by other accounts)\n`,
+    );
+  } catch (err) {
+    process.stderr.write(
+      `parley-telegram: cannot restrict ${path} (mode 0${current.toString(8)}, ` +
+        `${err instanceof Error ? err.message : String(err)}) — the observed-message store is ` +
+        `readable by other accounts on this host\n`,
+    );
+  }
+}
 
 /**
  * A retention bound is a promise about disk and memory. Keep it a hard failure rather than a
@@ -83,6 +137,15 @@ function requirePositiveInt(name: string, value: number): number {
  * record count, so the file stays within a constant factor of the in-memory bound instead of
  * growing forever.
  *
+ * Dedup outlives retention: an evicted record's composite id stays refusable for a further
+ * {@link EVICTED_ID_MEMORY} evictions. Keep the two horizons separate, so that a retention bound
+ * narrower than Telegram's ~24h `getUpdates` replay horizon cannot re-admit a message this bridge
+ * already served — which would hand the same `backendMsgId` out twice at two different cursors,
+ * the second above a cursor the agent already holds.
+ *
+ * Everything it creates is owner-only (0600 file, 0700 directory it had to make): this file is the
+ * full plaintext of every message the bridge has observed, in every chat the bot is in.
+ *
  * ONE bridge process per store file AND per bot token, by design: a single process's appends
  * are atomic enough for JSONL, but two processes interleaving appends (or two `getUpdates`
  * pollers racing on one token — Telegram answers the second with HTTP 409) are structurally
@@ -93,6 +156,8 @@ export class ObservedStore {
   private readonly byChat = new Map<string, StoredRecord[]>();
   /** The dedup set — the composite ids of the currently-retained records (bounded). */
   private readonly seen = new Set<string>();
+  /** Composite ids of evicted records, newest last — dedup memory past retention (bounded). */
+  private readonly evicted = new Set<string>();
   /** Chats this bridge serves (a configured topic resolves to them) — never evicted or refused. */
   private readonly served = new Set<string>();
   /** Newest-N-per-chat retention bound. */
@@ -115,7 +180,7 @@ export class ObservedStore {
     this.maxPerChat = requirePositiveInt('maxPerChat', maxPerChat);
     this.maxChats = requirePositiveInt('maxChats', maxChats);
     for (const chatId of served) this.served.add(chatId);
-    mkdirSync(dirname(path), { recursive: true });
+    mkdirSync(dirname(path), { recursive: true, mode: OWNER_ONLY_DIR });
     let raw = '';
     try {
       raw = readFileSync(path, 'utf8');
@@ -133,7 +198,8 @@ export class ObservedStore {
     for (const line of raw.split('\n')) {
       if (line.trim() === '') continue;
       try {
-        this.index(this.stamp(JSON.parse(line) as Partial<StoredRecord> & ObservedRecord));
+        if (line.startsWith(EVICTED_ID_LINE)) this.rememberEvicted(this.parseEvicted(line));
+        else this.index(this.stamp(JSON.parse(line) as Partial<StoredRecord> & ObservedRecord));
       } catch {
         // A torn/garbled line is dropped; every complete line loads.
       }
@@ -144,7 +210,8 @@ export class ObservedStore {
     // rewrite yields a clean, newline-terminated, bounded file. Keep this after the torn-tail
     // repair, so that the fragment is never carried into the compacted output.
     if (torn || trimmed) this.rewrite();
-    this.fd = openSync(path, 'a');
+    this.fd = openSync(path, 'a', OWNER_ONLY_FILE);
+    restrictMode(path);
   }
 
   /**
@@ -160,11 +227,12 @@ export class ObservedStore {
    * Persist + index one record under a fresh observation sequence, holding both retention
    * bounds. Returns the stored record, or `undefined` (writing nothing) when the record is
    * refused: its composite id was already observed — dedup holds when the same message arrives
-   * twice, e.g. a `getUpdates` backlog replayed after a restart — or every retained chat is
-   * served and this one is not, or there is no append descriptor ({@link isOpen}).
+   * twice, e.g. a `getUpdates` backlog replayed after a restart, whether or not retention has
+   * since evicted the record — or every retained chat is served and this one is not, or there is
+   * no append descriptor ({@link isOpen}).
    */
   append(observed: ObservedRecord): StoredRecord | undefined {
-    if (this.seen.has(keyOf(observed))) return undefined;
+    if (this.has(keyOf(observed))) return undefined;
     if (this.fd === undefined) return undefined;
     if (!this.admit(observed.chat_id)) return undefined;
     const rec: StoredRecord = { ...observed, seq: this.nextSeq++ };
@@ -175,9 +243,14 @@ export class ObservedStore {
     return rec;
   }
 
-  /** True iff this composite id has been observed. */
+  /**
+   * True iff this composite id has been observed and is still remembered — a retained record, or
+   * one retention evicted within the last {@link EVICTED_ID_MEMORY} evictions. This is the
+   * once-only question, so it is what {@link append} refuses on; {@link size} is the retained
+   * count, which is smaller.
+   */
   has(backendMsgId: string): boolean {
-    return this.seen.has(backendMsgId);
+    return this.seen.has(backendMsgId) || this.evicted.has(backendMsgId);
   }
 
   /** All records for `chatId`, ascending by observation sequence. Do not mutate. */
@@ -205,7 +278,7 @@ export class ObservedStore {
     return this.fd !== undefined;
   }
 
-  /** Total records currently retained across all chats (the dedup set holds exactly those). */
+  /** Total records currently RETAINED across all chats — see {@link has} for what is refusable. */
   size(): number {
     return this.seen.size;
   }
@@ -214,6 +287,7 @@ export class ObservedStore {
   close(): void {
     this.byChat.clear();
     this.seen.clear();
+    this.evicted.clear();
     this.served.clear();
     if (this.fd !== undefined) {
       closeSync(this.fd);
@@ -268,11 +342,32 @@ export class ObservedStore {
     return evicted;
   }
 
-  /** Retire evicted records: drop their dedup ids and arm compaction. Returns how many. */
+  /** Retire evicted records: move their dedup ids into the eviction memory and arm compaction. */
   private evict(records: readonly StoredRecord[]): number {
-    for (const rec of records) this.seen.delete(keyOf(rec));
+    const ids = records.map(keyOf);
+    for (const id of ids) this.seen.delete(id);
+    this.rememberEvicted(ids);
     this.evictedSinceRewrite += records.length;
     return records.length;
+  }
+
+  /** Hold the newest {@link EVICTED_ID_MEMORY} evicted ids, newest last (Set iterates in order). */
+  private rememberEvicted(ids: readonly string[]): void {
+    for (const id of ids) {
+      this.evicted.delete(id);
+      this.evicted.add(id);
+    }
+    for (const oldest of this.evicted) {
+      if (this.evicted.size <= EVICTED_ID_MEMORY) break;
+      this.evicted.delete(oldest);
+    }
+  }
+
+  /** The composite ids a previous compaction persisted (see {@link EVICTED_ID_LINE}). */
+  private parseEvicted(line: string): string[] {
+    const ids = JSON.parse(line.slice(EVICTED_ID_LINE.length)) as unknown;
+    if (!Array.isArray(ids)) return [];
+    return ids.filter((id): id is string => typeof id === 'string');
   }
 
   /**
@@ -289,7 +384,7 @@ export class ObservedStore {
     try {
       this.rewrite();
     } finally {
-      this.fd = openSync(this.path, 'a');
+      this.fd = openSync(this.path, 'a', OWNER_ONLY_FILE);
     }
   }
 
@@ -297,14 +392,25 @@ export class ObservedStore {
    * Rewrite the file from the retained records, via a temp file and a rename. Keep the replace
    * atomic, so that a crash or a full disk mid-compaction cannot truncate the only copy of
    * history this backend can ever produce.
+   *
+   * A compaction is where the evicted records' LINES leave the file, so it carries the eviction
+   * memory out with them ({@link EVICTED_ID_LINE}) — otherwise dedup would reach back only as far
+   * as the file, and a restart right after a compaction would re-admit a redelivered message the
+   * bridge had already served.
    */
   private rewrite(): void {
     const lines: string[] = [];
+    if (this.evicted.size > 0) {
+      lines.push(`${EVICTED_ID_LINE}${JSON.stringify([...this.evicted])}`);
+    }
     for (const list of this.byChat.values()) {
       for (const rec of list) lines.push(JSON.stringify(rec));
     }
     const tmp = `${this.path}.tmp`;
-    const fd = openSync(tmp, 'w');
+    // Keep the temp file owner-only, so that the rename cannot install a wider mode over a store
+    // that was tightened when it was created.
+    const fd = openSync(tmp, 'w', OWNER_ONLY_FILE);
+    restrictMode(tmp);
     try {
       if (lines.length > 0) writeSync(fd, `${lines.join('\n')}\n`);
       fsyncSync(fd);

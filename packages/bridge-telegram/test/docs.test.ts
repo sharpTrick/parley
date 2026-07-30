@@ -1,11 +1,19 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { type FakeTelegram, KNOWN_CHANNEL, startFakeTelegram } from './fake-telegram.js';
+import { KNOWN_CHANNEL } from './fake-telegram.js';
+import {
+  captureStderr,
+  connectTo,
+  registerCleanup,
+  startFake,
+  startRig,
+  storePath,
+} from './rig.js';
 
 const SENDER = asHandle('me');
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -14,30 +22,6 @@ const readme = readFileSync(join(here, '..', 'README.md'), 'utf8');
 const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as {
   description: string;
 };
-
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-  vi.restoreAllMocks();
-});
-
-async function connected(): Promise<{ fake: FakeTelegram; plugin: TelegramPlugin }> {
-  const fake = await startFakeTelegram();
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-docs-'));
-  cleanups.push(async () => {
-    await fake.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  const plugin = new TelegramPlugin();
-  await plugin.connect({
-    token: fake.token,
-    api_url: fake.url,
-    store_path: join(dir, 'store.jsonl'),
-    poll_timeout_s: 1,
-  });
-  cleanups.push(() => plugin.disconnect());
-  return { fake, plugin };
-}
 
 const configTable = /## Config \(`backend_config`\)([\s\S]*?)\n## /.exec(readme)?.[1] ?? '';
 const cursorRow = readme.split('\n').find((l) => l.startsWith('| `cursor`')) ?? '';
@@ -74,7 +58,7 @@ describe('telegram shipped metadata matches the seam mapping', () => {
   });
 
   it('and the cursor a fetched message carries really is the sequence, not its message_id', async () => {
-    const { plugin } = await connected();
+    const { plugin } = await startRig();
     // A first chat consumes sequences 1 and 2, so the second chat's message_id (1) and its
     // cursor (3) cannot coincide — a plugin returning either one would otherwise look identical.
     const first = asTopic('-1009850001');
@@ -139,21 +123,7 @@ describe('telegram config keys name the unit they bound', () => {
       kept: 2,
     },
   ])('$key bounds retention per chat', async ({ config, kept }) => {
-    const fake = await startFakeTelegram();
-    const dir = mkdtempSync(join(tmpdir(), 'parley-tg-keys-'));
-    cleanups.push(async () => {
-      await fake.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
-    const plugin = new TelegramPlugin();
-    await plugin.connect({
-      token: fake.token,
-      api_url: fake.url,
-      store_path: join(dir, 'store.jsonl'),
-      poll_timeout_s: 1,
-      ...config,
-    });
-    cleanups.push(() => plugin.disconnect());
+    const plugin = await connectTo(await startFake(), storePath(), config);
 
     const topic = asTopic('-1009860001');
     for (let i = 0; i < 8; i++) await plugin.post(topic, SENDER, `m${i}`);
@@ -184,6 +154,106 @@ describe('telegram test suite hygiene', () => {
     expect(owners.size).toBeGreaterThan(40);
     expect([...owners].filter(([, files]) => new Set(files).size > 1)).toEqual([]);
   });
+
+  /**
+   * Duplicate SCAFFOLDING is the same defect one level down, and a title-only lint cannot see it:
+   * the connect-a-plugin-against-the-fake-with-a-tmpdir rig was retyped in eight files under three
+   * names, with teardown contracts that had already drifted apart — so a fix to one was silently
+   * not applied to the other seven, and one copy asserted on a plugin it never connected. `rig.ts`
+   * owns both helpers, and is this lint's positive control: if the patterns stop matching THERE,
+   * the empty offender list below means nothing.
+   */
+  /**
+   * The enclosing declaration of every `plugin.connect(` in `text`: a named helper is a rig somebody
+   * retyped, an `it`/`describe` callback is a one-off inside a single case and stays where it is.
+   */
+  const rigHelpers = (text: string): string[] => {
+    const anchor =
+      /^\s*(?:export\s+)?(?:async\s+)?function (\w+)|^\s*(?:const|let) (\w+)(?::[^=\n]+)?\s*=\s*(?:async\s*)?\(|^\s*(?:it|test|describe)\b/gm;
+    const owners: string[] = [];
+    for (const call of text.matchAll(/\.connect\(/g)) {
+      const before = text.slice(0, call.index);
+      const enclosing = [...before.matchAll(anchor)].at(-1);
+      const named = enclosing?.[1] ?? enclosing?.[2];
+      if (named !== undefined) owners.push(named);
+    }
+    return owners;
+  };
+
+  const RIG_SHAPES = [
+    {
+      what: 'a named helper that connects a plugin',
+      matches: (text: string): boolean => rigHelpers(text).length > 0,
+    },
+    {
+      what: 'a stderr capture',
+      matches: (text: string): boolean => /spyOn\(process\.stderr/.test(text),
+    },
+  ];
+
+  it.each(RIG_SHAPES)('leaves $what to rig.ts alone', ({ matches }) => {
+    // rig.ts is the positive control: patterns that stop matching there make the list below vacuous.
+    expect(matches(readFileSync(join(here, 'rig.ts'), 'utf8'))).toBe(true);
+    const offenders = readdirSync(here)
+      .filter((f) => f.endsWith('.test.ts'))
+      .filter((f) => matches(readFileSync(join(here, f), 'utf8')));
+    expect(offenders).toEqual([]);
+  });
+});
+
+/**
+ * `store_path`'s default is executed by nothing else in this package — every other connect passes an
+ * explicit path — while the README and its JSDoc rest a load-bearing claim on it: ABSOLUTE, under
+ * the state directory core keeps its cursors in. A relative default silently starts a fresh sequence
+ * space whenever the bridge is relaunched from another working directory, and `fetchRecent` then
+ * rejects every cursor an agent is still holding as ahead of the store. The expectation is read out
+ * of the shipped README row, so the code and the claim cannot drift apart in either direction.
+ */
+describe('telegram default store path', () => {
+  const storePathRow = readme.split('\n').find((l) => l.startsWith('| `store_path`')) ?? '';
+  const documented = /\$XDG_STATE_HOME\/([\w./-]+)/.exec(storePathRow)?.[1] ?? '';
+  const fallbackBase = /else\s+`~\/([\w./-]+?)\/?…/.exec(storePathRow)?.[1] ?? '';
+
+  it('is documented as an absolute path with a state-directory suffix', () => {
+    expect(storePathRow).toMatch(/absolute/i);
+    expect(documented).toBe('parley/telegram/observed.jsonl');
+    expect(fallbackBase).toBe('.local/state');
+  });
+
+  const ENVS = [
+    { name: 'XDG_STATE_HOME set', base: (home: string): string => home, xdg: true },
+    { name: 'XDG_STATE_HOME unset', base: (home: string): string => join(home, fallbackBase), xdg: false },
+  ];
+
+  it.each(ENVS)('with $name it lands under the documented suffix, absolute', async ({ base, xdg }) => {
+    const home = mkdtempSync(join(tmpdir(), 'parley-tg-xdg-'));
+    const saved = { xdg: process.env.XDG_STATE_HOME, home: process.env.HOME };
+    registerCleanup(() => {
+      process.env.XDG_STATE_HOME = saved.xdg;
+      process.env.HOME = saved.home;
+      rmSync(home, { recursive: true, force: true });
+    });
+    // HOME is what `os.homedir()` reads on POSIX, so the unset case never touches the real one.
+    process.env.HOME = home;
+    if (xdg) process.env.XDG_STATE_HOME = home;
+    else delete process.env.XDG_STATE_HOME;
+
+    const fake = await startFake();
+    const plugin = new TelegramPlugin();
+    await plugin.connect({ token: fake.token, api_url: fake.url, poll_timeout_s: 1 });
+    registerCleanup(() => plugin.disconnect());
+    const topic = asTopic('-1009870001');
+    await plugin.post(topic, SENDER, 'default-path');
+
+    const expected = join(base(home), documented);
+    expect(isAbsolute(expected)).toBe(true);
+    expect(existsSync(expected)).toBe(true);
+    expect(readFileSync(expected, 'utf8')).toContain('default-path');
+    // And it is really the store this connection is answering out of.
+    expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+      'default-path',
+    ]);
+  }, 20_000);
 });
 
 /**
@@ -205,22 +275,11 @@ describe('telegram fetchRecent network claim', () => {
     { name: 'a chat_map @name topic, resolved during connect', mapped: true, offlineSafe: true },
     { name: 'an @name topic never named in chat_map', mapped: false, offlineSafe: false },
   ])('$name is offline-safe: $offlineSafe', async ({ mapped, offlineSafe }) => {
-    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const fake = await startFakeTelegram();
-    const dir = mkdtempSync(join(tmpdir(), 'parley-tg-claim-'));
-    cleanups.push(async () => {
-      await fake.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
-    const plugin = new TelegramPlugin();
-    await plugin.connect({
-      token: fake.token,
-      api_url: fake.url,
-      store_path: join(dir, 'store.jsonl'),
-      poll_timeout_s: 1,
+    captureStderr();
+    const fake = await startFake();
+    const plugin = await connectTo(fake, storePath(), {
       chat_map: mapped ? { news: KNOWN_CHANNEL.username } : {},
     });
-    cleanups.push(() => plugin.disconnect());
     const topic = asTopic(mapped ? 'news' : KNOWN_CHANNEL.username);
 
     // Telegram becomes unreachable AFTER connect: catch-up must not depend on it for a chat the
@@ -245,8 +304,8 @@ describe('telegram default presence topic', () => {
   const DEFAULT_PRESENCE_TOPIC = 'parley-presence';
 
   it('is either resolvable or documented as needing configuration', async () => {
-    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const { plugin } = await connected();
+    captureStderr();
+    const { plugin } = await startRig();
     const resolvable = await plugin
       .fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) })
       .then(() => true)
@@ -258,12 +317,8 @@ describe('telegram default presence topic', () => {
   }, 20_000);
 
   it('writes a diagnostic when a topic resolves to no chat, instead of failing silently', async () => {
-    const stderr: string[] = [];
-    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      stderr.push(String(chunk));
-      return true;
-    });
-    const { plugin } = await connected();
+    const stderr = captureStderr();
+    const { plugin } = await startRig();
     await expect(
       plugin.fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) }),
     ).rejects.toThrow(/not a Telegram chat id/);

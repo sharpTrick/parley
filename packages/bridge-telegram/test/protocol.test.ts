@@ -1,54 +1,15 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
+import { captureStderr, connectTo as connectPlugin, startFake, storePath } from './rig.js';
 import { ObservedStore } from '../src/store.js';
-import { type FakeTelegram, KNOWN_CHANNEL, startFakeTelegram } from './fake-telegram.js';
+import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
 
 const SENDER = asHandle('me');
 
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-  vi.restoreAllMocks();
-});
-
-async function startFake(): Promise<FakeTelegram> {
-  const fake = await startFakeTelegram();
-  cleanups.push(() => fake.close());
-  return fake;
-}
-
-function storePath(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-proto-'));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  return join(dir, 'store.jsonl');
-}
-
-async function connectTo(fake: FakeTelegram, extra: Record<string, unknown> = {}): Promise<TelegramPlugin> {
-  const plugin = new TelegramPlugin();
-  await plugin.connect({
-    token: fake.token,
-    api_url: fake.url,
-    store_path: storePath(),
-    poll_timeout_s: 1,
-    ...extra,
-  });
-  cleanups.push(() => plugin.disconnect());
-  return plugin;
-}
-
-/** Capture stderr diagnostics without letting them pollute the test output. */
-function captureStderr(): string[] {
-  const lines: string[] = [];
-  vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-    lines.push(String(chunk));
-    return true;
-  });
-  return lines;
-}
+const connectTo = (fake: FakeTelegram, extra: Record<string, unknown> = {}): Promise<TelegramPlugin> =>
+  connectPlugin(fake, storePath(), extra);
 
 /**
  * A backend that cannot authenticate must fail `connect`, not report "bridge up" and then be a
@@ -113,11 +74,9 @@ describe('telegram connect preflight', () => {
   it('rejects connect when a chat_map entry names no reachable chat', async () => {
     const fake = await startFake();
     captureStderr();
-    const plugin = new TelegramPlugin();
-    await expect(
-      connectTo(fake, { chat_map: { ops: 'not-a-chat-id' } }),
-    ).rejects.toThrow(/not a Telegram chat id/);
-    await plugin.disconnect();
+    await expect(connectTo(fake, { chat_map: { ops: 'not-a-chat-id' } })).rejects.toThrow(
+      /not a Telegram chat id/,
+    );
   });
 });
 
@@ -400,6 +359,77 @@ describe('telegram lifecycle', () => {
     expect(fake.sent).toHaveLength(sentBefore);
   });
 
+  /**
+   * WHERE in the call the teardown lands is a second axis, and the halves are not equivalent. Before
+   * the network call the message never left, so rejecting costs the caller nothing. AFTER it,
+   * Telegram has the message and this bridge has no store to record it in — and an own post never
+   * comes back via `getUpdates`, so unlike an inbound message it cannot be recovered on reconnect.
+   * Resolving with a `backendMsgId` no store will ever hold is the one outcome nothing downstream
+   * can detect: every cell therefore grades the call's outcome AND that nothing was accepted
+   * upstream without either a local record or an error naming what is missing.
+   */
+  const SEND_CHAT = '-1009100005';
+  const TEARDOWN_CELLS = [
+    { call: 'post' as const, hold: 'getChat', topic: KNOWN_CHANNEL.username, accepted: false },
+    { call: 'fetchRecent' as const, hold: 'getChat', topic: KNOWN_CHANNEL.username, accepted: false },
+    { call: 'subscribe' as const, hold: 'getChat', topic: KNOWN_CHANNEL.username, accepted: false },
+    { call: 'post' as const, hold: 'sendMessage', topic: SEND_CHAT, accepted: true },
+  ];
+
+  it.each(TEARDOWN_CELLS)(
+    '$call rejects when disconnect lands inside $hold, upstream accepted: $accepted',
+    async ({ call, hold, topic: t, accepted }) => {
+      const fake = await startFake();
+      const path = storePath();
+      const config = { token: fake.token, api_url: fake.url, store_path: path, poll_timeout_s: 1 };
+      const plugin = await connectPlugin(fake, path);
+      const seeded = asTopic(SEND_CHAT);
+      // Seeded on the numeric topic, whose resolution needs no network — so the hold below lands
+      // where the cell asks for it and not on a resolution this seed already paid for.
+      await plugin.post(seeded, SENDER, 'seed');
+      const topic = asTopic(t);
+      const sentBefore = fake.sent.length;
+      const holdCount = fake.callCount(hold);
+
+      const held = fake.holdMethod(hold);
+      const inFlight =
+        call === 'post'
+          ? plugin.post(topic, SENDER, 'lost?')
+          : call === 'fetchRecent'
+            ? plugin.fetchRecent({ topic })
+            : plugin.subscribe(topic, () => undefined);
+      await vi.waitFor(() => expect(fake.callCount(hold)).toBeGreaterThan(holdCount), {
+        timeout: 3000,
+        interval: 5,
+      });
+      await plugin.disconnect();
+      held.release();
+
+      const err = await inFlight.then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err?.message).toMatch(/not connected/);
+      expect(fake.sent).toHaveLength(sentBefore + (accepted ? 1 : 0));
+      if (accepted) {
+        // Telegram has it: the error has to name the `<chat>:<mid>` that exists upstream and is
+        // missing locally, or the caller cannot tell this from a message that never left.
+        expect(fake.sent.at(-1)?.text).toBe('lost?');
+        expect(err?.message).toContain(`${SEND_CHAT}:2`);
+        expect(err?.message).toContain(path);
+      }
+      // Either way the store never gained a record for it, and a reconnect does not invent one.
+      expect(readFileSync(path, 'utf8')).not.toContain('lost?');
+      const restarted = new TelegramPlugin();
+      await plugin.disconnect();
+      await restarted.connect(config);
+      const page = await restarted.fetchRecent({ topic: seeded, limit: 100 });
+      expect(page.messages.map((m) => m.content)).toEqual(['seed']);
+      await restarted.disconnect();
+    },
+    20_000,
+  );
+
   it('rejects a second connect and keeps exactly one poll loop', async () => {
     const fake = await startFake();
     const plugin = await connectTo(fake);
@@ -417,10 +447,8 @@ describe('telegram lifecycle', () => {
   it('disconnects idempotently and reconnects onto the same store', async () => {
     const fake = await startFake();
     const path = storePath();
-    const plugin = new TelegramPlugin();
     const config = { token: fake.token, api_url: fake.url, store_path: path, poll_timeout_s: 1 };
-    await plugin.connect(config);
-    cleanups.push(() => plugin.disconnect());
+    const plugin = await connectPlugin(fake, path);
     const topic = asTopic('-1009100003');
     await plugin.post(topic, SENDER, 'before');
 
@@ -509,6 +537,52 @@ describe('telegram fetchRecent limit normalization', () => {
     // The cursor never regresses, whatever the limit.
     expect(Number(tail.nextCursor)).toBeGreaterThanOrEqual(Number(since));
   });
+
+  /**
+   * `limit` and `blockMs` are independent knobs, and the decision to PARK belongs to the second one
+   * alone: whether anything sits above `since`, never how many rows the first one let through. A
+   * gate that reads the sliced page instead parks a call the store could answer immediately — at
+   * `limit: 0` it blocks for the whole `blockMs` on a topic full of messages and then returns
+   * nothing, which is the plugin's advertised native long-poll doing the opposite of its job.
+   *
+   * The product is what grades it: the limit table never passed `blockMs`, and the blocking cases
+   * never varied `limit`, so no cell of it was covered.
+   */
+  const BLOCK_CELLS = LIMITS.flatMap((limit) => [400, 5000].map((blockMs) => ({ limit, blockMs })));
+
+  it.each(BLOCK_CELLS)(
+    'limit $limit with blockMs $blockMs parks only when nothing is newer',
+    async ({ limit, blockMs }) => {
+      const fake = await startFake();
+      const plugin = await connectTo(fake);
+      const topic = asTopic('-1009900003');
+      await plugin.post(topic, SENDER, 'a');
+      const head = (await plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
+      await plugin.post(topic, SENDER, 'b');
+      await plugin.post(topic, SENDER, 'c');
+
+      // Something IS newer than `head`: the call must not park, whatever the limit does to the page.
+      const started = Date.now();
+      const served = await plugin.fetchRecent({ topic, since: head, limit, blockMs });
+      const elapsed = Date.now() - started;
+      expect(elapsed).toBeLessThan(Math.min(blockMs / 2, 200));
+      const expected = ['b', 'c'].slice(0, limit === undefined ? 2 : Math.max(0, limit));
+      expect(served.messages.map((m) => m.content)).toEqual(expected);
+      // An empty page never moves the caller backwards, so the next catch-up still finds b and c.
+      expect(Number(served.nextCursor)).toBeGreaterThanOrEqual(Number(head));
+      const next = await plugin.fetchRecent({ topic, since: served.nextCursor, limit: 100 });
+      expect([...served.messages, ...next.messages].map((m) => m.content)).toEqual(['b', 'c']);
+
+      // Nothing newer than the tail: NOW it must wait, and come back with a stable cursor.
+      const tail = (await plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
+      const idleStarted = Date.now();
+      const idle = await plugin.fetchRecent({ topic, since: tail, limit, blockMs: 400 });
+      expect(Date.now() - idleStarted).toBeGreaterThanOrEqual(350);
+      expect(idle.messages).toEqual([]);
+      expect(idle.nextCursor).toBe(tail);
+    },
+    20_000,
+  );
 });
 
 /**

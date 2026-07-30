@@ -71,6 +71,15 @@ everything delivered by `getUpdates`. Consequences:
   those before the store is even opened, which closes the window entirely.
 - Compaction replaces the file by **rename**, never in place: a crash or a full disk mid-compaction
   leaves the previous file intact rather than a truncated one.
+- **Dedup outlives retention.** Evicting a record does not make it re-admittable: the store keeps a
+  bounded memory of recently evicted `<chat>:<message_id>` ids (sized on Telegram's redelivery
+  window, *not* on `observed_retention_per_chat`), and a compaction carries that memory into the
+  file it writes. So a redelivered message is refused even when retention — however narrow you set
+  it — has already rolled past the record, instead of being re-admitted at a *fresh* cursor above
+  the one your agent is holding.
+- It is created **owner-only** (`0600`, in a `0700` directory it had to create), and a store file
+  left world-readable by an earlier version is tightened on load with one line on stderr. It holds
+  the plaintext of every message the bridge has seen.
 - **A lost store file invalidates every outstanding cursor.** The cursor is this store's own
   observation sequence, and a fresh file restarts that sequence at 1 — while core's saved cursor
   (in its state directory, a different lifetime) still points at the old numbering. `fetchRecent`

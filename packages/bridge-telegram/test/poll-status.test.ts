@@ -39,16 +39,9 @@ vi.mock('@sharptrick/parley-net-util', async (importOriginal) => {
   };
 });
 
-const { TelegramPlugin } = await import('../src/index.js');
-const { mkdtempSync, rmSync } = await vi.importActual<typeof import('node:fs')>('node:fs');
-const { tmpdir } = await import('node:os');
-const { join } = await import('node:path');
-const { startFakeTelegram } = await import('./fake-telegram.js');
+const { captureStderr, connectTo, startFake, storePath } = await import('./rig.js');
 
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-  vi.restoreAllMocks();
+afterEach(() => {
   failure.as = undefined;
   pollAttempts.length = 0;
 });
@@ -61,26 +54,10 @@ const CASES = [
 
 describe('telegram poll-loop status classification', () => {
   it.each(CASES)('a getUpdates failure delivered as a $as stops ingestion: $fatal', async ({ as, fatal }) => {
-    const stderr: string[] = [];
-    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      stderr.push(String(chunk));
-      return true;
-    });
-    const fake = await startFakeTelegram();
-    const dir = mkdtempSync(join(tmpdir(), 'parley-tg-status-'));
-    cleanups.push(async () => {
-      await fake.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
+    const stderr = captureStderr();
+    const fake = await startFake();
     failure.as = as;
-    const plugin = new TelegramPlugin();
-    await plugin.connect({
-      token: fake.token,
-      api_url: fake.url,
-      store_path: join(dir, 'store.jsonl'),
-      poll_timeout_s: 1,
-    });
-    cleanups.push(() => plugin.disconnect());
+    await connectTo(fake, storePath());
 
     await vi.waitFor(() => expect(pollAttempts.length).toBeGreaterThan(0), {
       timeout: 3000,

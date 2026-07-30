@@ -1,37 +1,9 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { TelegramPlugin } from '../src/index.js';
-import { type FakeTelegram, startFakeTelegram } from './fake-telegram.js';
+import { describe, expect, it } from 'vitest';
+import { startRig } from './rig.js';
 
 const SENDER = asHandle('me');
 const TOPIC = asTopic('-1009600001');
-
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-  vi.restoreAllMocks();
-});
-
-async function connected(): Promise<{ fake: FakeTelegram; plugin: TelegramPlugin }> {
-  const fake = await startFakeTelegram();
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-429-'));
-  cleanups.push(async () => {
-    await fake.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  const plugin = new TelegramPlugin();
-  await plugin.connect({
-    token: fake.token,
-    api_url: fake.url,
-    store_path: join(dir, 'store.jsonl'),
-    poll_timeout_s: 1,
-  });
-  cleanups.push(() => plugin.disconnect());
-  return { fake, plugin };
-}
 
 /**
  * Telegram rate-limits `sendMessage` aggressively, so the 429 path is this plugin's most likely
@@ -67,7 +39,7 @@ describe('telegram 429 backoff', () => {
   it.each(CASES)(
     '$name → $expected',
     async ({ retryAfterHeader, retryAfterBody, expected }) => {
-      const { fake, plugin } = await connected();
+      const { fake, plugin } = await startRig();
       fake.failMethod('sendMessage', {
         status: 429,
         description: 'Too Many Requests: retry later',
@@ -98,7 +70,7 @@ describe('telegram 429 backoff', () => {
   );
 
   it('gives up loudly rather than retrying a 429 forever', async () => {
-    const { fake, plugin } = await connected();
+    const { fake, plugin } = await startRig();
     fake.failMethod('sendMessage', {
       status: 429,
       description: 'Too Many Requests: retry later',

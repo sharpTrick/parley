@@ -1,7 +1,16 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { captureStderr } from './rig.js';
 import { keyOf, ObservedStore, type StoredRecord } from '../src/store.js';
 
 const record = (chatId: string, messageId: number, content: string, seq = messageId): StoredRecord => ({
@@ -13,9 +22,20 @@ const record = (chatId: string, messageId: number, content: string, seq = messag
   ts: new Date().toISOString(),
 });
 
-const lineCount = (path: string): number => {
-  const raw = readFileSync(path, 'utf8');
-  return raw === '' ? 0 : raw.trimEnd().split('\n').length;
+/** Record lines on disk — the dedup memory a compaction persists is not a record. */
+const lineCount = (path: string): number =>
+  readFileSync(path, 'utf8')
+    .split('\n')
+    .filter((l) => l !== '' && !l.startsWith('#')).length;
+
+const modeOf = (target: string): number => statSync(target).mode & 0o777;
+
+/** The composite ids a compaction carried out of the file — the persisted dedup memory. */
+const persistedEvictedIds = (path: string): string[] => {
+  const line = readFileSync(path, 'utf8')
+    .split('\n')
+    .find((l) => l.startsWith('#evicted '));
+  return line === undefined ? [] : (JSON.parse(line.slice('#evicted '.length)) as string[]);
 };
 
 let dir: string;
@@ -57,8 +77,10 @@ describe('telegram ObservedStore durability', () => {
 
     const store = new ObservedStore(path, N);
     expect(store.entries('1').map((r) => r.message_id)).toEqual([16, 17, 18, 19, 20]);
-    // The dedup set is bounded too: evicted (old) ids gone, retained ids present.
-    expect(store.has(keyOf(record('1', 1, '')))).toBe(false);
+    // Retention bounds what is RETAINED, never what is refusable: the evicted record leaves the
+    // queryable window and still cannot be re-admitted.
+    expect(store.size()).toBe(N);
+    expect(store.has(keyOf(record('1', 1, '')))).toBe(true);
     expect(store.has(keyOf(record('1', 20, '')))).toBe(true);
     store.close();
 
@@ -103,8 +125,8 @@ describe('telegram ObservedStore durability', () => {
         expect(kept.map((r) => r.message_id)).toEqual(
           Array.from({ length: Math.min(maxPerChat, appends) }, (_, k) => appends - kept.length + k + 1),
         );
-        // Evicted ids leave the dedup set, so it is bounded by the retained records.
-        expect(store.has(keyOf(record(chatId, 1, '')))).toBe(appends <= maxPerChat);
+        // Dedup outlives eviction: the oldest id is refused whether or not it is still retained.
+        expect(store.append(record(chatId, 1, 'replay'))).toBeUndefined();
       }
       store.close();
 
@@ -149,6 +171,85 @@ describe('telegram ObservedStore durability', () => {
     const reloaded = new ObservedStore(path, 10, 10);
     expect(reloaded.append(record('-1', 1, 'again'))).toBeUndefined();
     expect(reloaded.size()).toBe(admitted ? 2 : 1);
+    reloaded.close();
+  });
+
+  /**
+   * Retention and dedup are two different horizons, and the once-only guarantee is the dedup one.
+   * Telegram re-serves an unacknowledged `getUpdates` batch, so a record retention has already
+   * evicted can still be redelivered — and re-admitting it hands the same `backendMsgId` out twice
+   * at two different cursors, the second one ABOVE a cursor the agent already holds, which no
+   * bounded in-memory dedup downstream can absorb.
+   *
+   * The axis that decides it is how much of the eviction the file still shows: while the evicted
+   * LINES are there, a reload rebuilds the memory by trimming them again; once a compaction has
+   * carried them out, only the persisted memory can answer. Every cell drives the eviction, the
+   * replay, and then a genuinely new message — refusing everything is not the fix.
+   */
+  const REPLAY_CELLS = [
+    { maxPerChat: 1, newer: 1 },
+    { maxPerChat: 2, newer: 2 },
+    { maxPerChat: 2, newer: 6 },
+    { maxPerChat: 3, newer: 12 },
+    { maxPerChat: 5, newer: 40 },
+  ].flatMap((cell) => [
+    { ...cell, reload: false },
+    { ...cell, reload: true },
+  ]);
+
+  it.each(REPLAY_CELLS)(
+    'a record evicted under newest-$maxPerChat is still refused after $newer newer ones (reload: $reload)',
+    ({ maxPerChat, newer, reload }) => {
+      const CHAT = '-1001111000';
+      const first = record(CHAT, 1, 'one');
+      let store = new ObservedStore(path, maxPerChat, 10);
+      expect(store.append(first)).toBeDefined();
+      for (let i = 0; i < newer; i++) {
+        expect(store.append(record(CHAT, i + 2, `m${i + 2}`))).toBeDefined();
+      }
+      expect(store.entries(CHAT).some((r) => r.message_id === 1)).toBe(false);
+      if (reload) {
+        store.close();
+        store = new ObservedStore(path, maxPerChat, 10);
+      }
+
+      const retained = store.size();
+      const lines = lineCount(path);
+      const highWater = store.highWater();
+      expect(store.append(first)).toBeUndefined();
+      expect(store.has(keyOf(first))).toBe(true);
+      // Refused SILENTLY: nothing stored, no line written, and no sequence burnt — a burnt
+      // sequence would leave a hole a later cursor comparison reads as a lost message.
+      expect(store.size()).toBe(retained);
+      expect(lineCount(path)).toBe(lines);
+      expect(store.highWater()).toBe(highWater);
+      expect(store.entries(CHAT).some((r) => r.message_id === 1)).toBe(false);
+
+      // A genuinely new message is still admitted, above every cursor already issued.
+      expect(store.append(record(CHAT, 9999, 'new'))?.seq).toBe(highWater + 1);
+      store.close();
+    },
+  );
+
+  /**
+   * The persisted half of that memory, pinned directly: a compaction is where the evicted lines
+   * leave the file, so it has to carry their ids out with them. Without the line on disk the
+   * table above passes on its non-compacting cells alone.
+   */
+  it('carries the evicted ids out of the file when a compaction drops their lines', () => {
+    const CHAT = '-1001111001';
+    const store = new ObservedStore(path, 2, 10);
+    for (let i = 1; i <= 8; i++) expect(store.append(record(CHAT, i, `m${i}`))).toBeDefined();
+    store.close();
+
+    expect(lineCount(path)).toBe(2);
+    expect(persistedEvictedIds(path)).toEqual(
+      Array.from({ length: 6 }, (_, i) => `${CHAT}:${i + 1}`),
+    );
+    // The ids are on disk AND honoured on load, whichever record the replay names.
+    const reloaded = new ObservedStore(path, 2, 10);
+    for (let i = 1; i <= 8; i++) expect(reloaded.append(record(CHAT, i, `m${i}`))).toBeUndefined();
+    expect(reloaded.entries(CHAT).map((r) => r.content)).toEqual(['m7', 'm8']);
     reloaded.close();
   });
 
@@ -268,5 +369,87 @@ describe('telegram ObservedStore durability', () => {
     expect(next?.seq).toBeGreaterThan(seqs.at(-1) as number);
     expect(reloaded.entries('-1').at(-1)?.content).toBe('later');
     reloaded.close();
+  });
+});
+
+/**
+ * This file is the full plaintext of every message the bridge has observed — sender handles, chat
+ * ids and bodies, in every chat the bot is in — living in the same state directory where core keeps
+ * mere cursors at 0600 under a 0700 directory. Every path that CREATES or REPLACES it has to hold
+ * that, not just the first one: an `openSync` mode applies only to a file it creates, and a
+ * `renameSync` installs the temp file's mode over the target, so a store tightened on creation is
+ * re-widened by the next compaction unless the temp file is tight too.
+ */
+describe('telegram ObservedStore file permissions', () => {
+  interface Cell {
+    name: string;
+    /** Runs before the store is opened — an upgrade onto state an earlier version left behind. */
+    prepare?: (path: string) => void;
+    /** Append enough to force a compaction, so the file under test is a rewrite's output. */
+    compact?: boolean;
+    /** What must be unreadable by group and other. */
+    targets: (path: string) => string[];
+    /** A path the store must NAME on stderr as tightened, if any. */
+    tightens?: (path: string) => string;
+  }
+
+  const loose = (target: string): void => {
+    chmodSync(target, 0o666);
+    expect(modeOf(target) & 0o077).not.toBe(0);
+  };
+
+  const CELLS: Cell[] = [
+    {
+      name: 'the store file it creates',
+      targets: (p) => [p],
+    },
+    {
+      name: 'every directory it creates on the way',
+      targets: (p) => [dirname(p), dirname(dirname(p))],
+    },
+    {
+      name: 'the store file a compaction replaces',
+      compact: true,
+      targets: (p) => [p],
+    },
+    {
+      name: 'the store file a compaction replaces over a leftover world-readable temp file',
+      prepare: (p) => {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(`${p}.tmp`, 'junk from a crashed compaction\n');
+        loose(`${p}.tmp`);
+      },
+      compact: true,
+      targets: (p) => [p],
+      tightens: (p) => `${p}.tmp`,
+    },
+    {
+      name: 'a pre-existing world-readable store file',
+      prepare: (p) => {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, `${JSON.stringify(record('-1', 1, 'from an older version'))}\n`);
+        loose(p);
+      },
+      targets: (p) => [p],
+    },
+  ];
+
+  it.each(CELLS)('keeps $name owner-only', ({ prepare, compact, targets, tightens }) => {
+    // Nested, so the directories under test are ones the store had to create itself.
+    const nested = join(dir, 'nested', 'deep', 'store.jsonl');
+    prepare?.(nested);
+    const stderr = captureStderr();
+
+    const store = new ObservedStore(nested, 2, 10);
+    for (let i = 1; i <= (compact === true ? 8 : 1); i++) {
+      store.append(record('-1', 100 + i, `m${i}`));
+    }
+    store.close();
+
+    for (const target of targets(nested)) expect(modeOf(target) & 0o077).toBe(0);
+    // A tightening is never silent, and a store that was already tight says nothing at all.
+    const named = tightens?.(nested) ?? (prepare === undefined ? undefined : nested);
+    if (named === undefined) expect(stderr).toEqual([]);
+    else expect(stderr.join('')).toContain(`tightened ${named}`);
   });
 });
