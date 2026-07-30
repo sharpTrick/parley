@@ -4,12 +4,13 @@ import {
   asTopic,
   type BackendPlugin,
   type Cursor,
+  type FetchRecentResult,
   type Topic,
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
 import { SHAPES } from './cursor-shapes.js';
-import { aliasForTopic, connectFake, FakeSynapse } from './fake-synapse.js';
+import { aliasForTopic, connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
 
 /**
  * Two seam CLASSES, table-driven so a variant nobody tried is still covered:
@@ -319,4 +320,126 @@ describe('cursor contract: a minted cursor replays to everything after it, never
     expect(contents).toEqual(expected);
     await p.disconnect();
   });
+});
+
+/**
+ * CLASS: a read that SHORT-CIRCUITS may never report a position behind the caller's. Every case
+ * above drives a read that runs to completion, where the paging loop has always executed at least
+ * one page; a read that is torn down, retired by a reconnect, or refused by the homeserver executes
+ * none — and a cursor minted for a window nobody looked at is a claim about a position nobody
+ * observed. The stream form with no token is the dangerous one: it means "the first visible event in
+ * the room", and core's catch-up persists whatever cursor it is handed, so the next start drains the
+ * room from event 0 with a fresh seen-set and re-delivers all of it into agent context — in
+ * `shared_room` mode, every topic's.
+ */
+const HISTORY = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7'];
+
+/** How the read under test is prevented from completing normally. */
+const SHORT_CIRCUITS: Record<
+  string,
+  {
+    /** A transport FAULT, for which rejecting is the honest answer; a teardown is not one. */
+    faults: boolean;
+    run: (p: MatrixPlugin, drive: () => Promise<FetchRecentResult>) => Promise<FetchRecentResult>;
+  }
+> = {
+  'disconnect at the room-resolve await boundary': {
+    faults: false,
+    run: async (p, drive) => {
+      const pending = drive();
+      // Keep a handler on it across the lifecycle call, so that a read which rejects while that call
+      // is in flight is not ALSO an unhandled rejection — which fails the run under a different name.
+      void pending.catch(() => undefined);
+      await p.disconnect();
+      return pending;
+    },
+  },
+  'disconnect before the room is resolved': {
+    faults: false,
+    run: async (p, drive) => {
+      // A read whose room cache is cold must resolve the alias first, and a teardown there leaves it
+      // with no room at all — the one path where an empty stream token is legitimate (a topic with
+      // provably no history behind it), and therefore the one where minting it for a position the
+      // teardown stopped it from observing is invisible.
+      (p as unknown as { rooms: Map<string, unknown> }).rooms.clear();
+      const pending = drive();
+      void pending.catch(() => undefined);
+      await p.disconnect();
+      return pending;
+    },
+  },
+  'disconnect mid-page': {
+    faults: false,
+    run: async (p, drive) => {
+      fake.onRequest = (_method, path) => {
+        if (!path.endsWith('/messages')) return;
+        fake.onRequest = () => undefined;
+        void p.disconnect();
+      };
+      return drive();
+    },
+  },
+  'every /messages page 500s': {
+    faults: true,
+    run: async (_p, drive) => {
+      fake.messagesFailures = Number.POSITIVE_INFINITY;
+      return drive();
+    },
+  },
+  'a bare connect() retires the generation': {
+    faults: false,
+    run: async (p, drive) => {
+      const pending = drive();
+      void pending.catch(() => undefined);
+      await p.connect(fakeConfig({ shared: true }));
+      return pending;
+    },
+  },
+};
+
+/** Every cursor form a caller can arrive with, including the two this plugin mints itself. */
+const SINCE_FORMS: Record<string, (p: MatrixPlugin, t: Topic) => Promise<Cursor | undefined>> = {
+  'no since': async () => undefined,
+  'a minted event id': async (p, t) => (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor,
+  'a minted stream token': async (p) =>
+    (await p.fetchRecent({ topic: asTopic('a-topic-with-no-messages'), limit: LIMIT })).nextCursor,
+  'a purged event id': async () => asCursor('$purged-by-retention:fake'),
+};
+
+describe('a read that never completed reports the caller position, never one behind it', () => {
+  for (const [sinceName, mintSince] of Object.entries(SINCE_FORMS)) {
+    for (const [circuitName, circuit] of Object.entries(SHORT_CIRCUITS)) {
+      it(`${sinceName} / ${circuitName}: the cursor it reports replays nothing already delivered`, async () => {
+        const p = await connectFake({ shared: true });
+        const t = asTopic('ctx-payments');
+        for (const c of HISTORY) await p.post(t, WRITER, c);
+        const since = await mintSince(p, t);
+
+        const outcome = await circuit
+          .run(p, () => p.fetchRecent({ topic: t, since, limit: LIMIT }))
+          .catch((err: unknown) => err as Error);
+
+        if (since !== undefined && !circuit.faults) {
+          expect(
+            outcome,
+            'a teardown that was handed a caller position can always report it back',
+          ).not.toBeInstanceOf(Error);
+        }
+        if (outcome instanceof Error) return; // no cursor reported at all cannot regress one.
+
+        const q = await connectFake({ shared: true });
+        // What the caller could still legitimately be shown: everything its OWN position replays to,
+        // less whatever this call just handed it. A since-less caller has no position, and the
+        // seam's recent window is the newest messages — so having been handed them, it is at the tail.
+        const delivered = outcome.messages.map((m) => m.content);
+        const reachable =
+          since === undefined ? [] : (await drainFrom(q, t, since, LIMIT)).contents;
+        const owed = reachable.filter((c) => !delivered.includes(c));
+
+        expect((await drainFrom(q, t, outcome.nextCursor, LIMIT)).contents).toEqual(owed);
+        await q.disconnect();
+        await p.disconnect();
+      });
+    }
+  }
 });

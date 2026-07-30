@@ -89,6 +89,12 @@ export class FakeSynapse {
   createRoomLimited = 0;
   createRoomRetryAfterMs = 45_000;
   /**
+   * Status a `POST /createRoom` for an alias already taken answers with. Synapse says 409
+   * `M_ROOM_IN_USE`; some deployments and some paths answer 400 instead, and the plugin treats both
+   * as "somebody else got there first", so both are expressible here.
+   */
+  createRoomConflictStatus = 409;
+  /**
    * Status `POST /rooms/<id>/join` answers with. 403 = the invite-only room this account was never
    * invited to (a second Matrix account against a room the first created); 404 = the room is gone.
    */
@@ -97,6 +103,14 @@ export class FakeSynapse {
   readonly sentBodies: Record<string, unknown>[] = [];
   /** Remaining incremental-`/sync` calls to fail (`Infinity` = a permanent failure). */
   syncFailures = 0;
+  /**
+   * Bodies the next incremental `/sync` calls answer with VERBATIM, one per call, in order. These
+   * are the malformed-but-parseable shapes a homeserver, a proxy or a captive portal can put on the
+   * wire — `null`, an array, a scalar, a `timeline.events` that is not a list. Keep them expressible,
+   * so that the branch dereferencing a `/sync` body is graded against something `res.json()` accepts:
+   * an HTTP status or a network reject never reaches it.
+   */
+  readonly syncBodyOverrides: ((roomId: string) => unknown)[] = [];
   /** How an injected `/sync` failure presents: an HTTP status, or a rejected fetch. */
   syncFailureMode: 'status' | 'network' = 'status';
   syncFailureStatus = 500;
@@ -256,8 +270,18 @@ export class FakeSynapse {
           429,
         );
       }
-      this.aliasExists = true;
       const alias = `#${String(body.room_alias_name)}:${SERVER_NAME}`;
+      // Aliases are unique on a real homeserver: the loser of a create race is REFUSED, and must
+      // resolve and join the winner's room instead. Keep the refusal, so that the recovery branch is
+      // reachable at all — a fake that hands the existing room back with a 200 certifies a plugin
+      // that would throw against Synapse the first time two bridges first-post to one topic.
+      if (this.byAlias.has(alias)) {
+        return jsonRes(
+          { errcode: 'M_ROOM_IN_USE', error: 'Room alias already taken' },
+          this.createRoomConflictStatus,
+        );
+      }
+      this.aliasExists = true;
       this.lastAlias = alias;
       return jsonRes({ room_id: this.room(alias).roomId });
     }
@@ -386,6 +410,8 @@ export class FakeSynapse {
         if (this.syncFailureMode === 'network') throw new Error('fake network reset');
         return jsonRes({ errcode: 'M_FORBIDDEN', error: 'injected' }, this.syncFailureStatus);
       }
+      const override = this.syncBodyOverrides.shift();
+      if (override !== undefined) return jsonRes(override(syncRoom?.roomId ?? ''));
       const k = tokenPos(since);
       const cap = Math.min(filterLimit, this.syncCap);
       const newCount = len - k;

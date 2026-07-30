@@ -1,7 +1,11 @@
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MatrixPlugin, ROOM_PRESETS } from '../src/index.js';
-import { connectFake, FakeSynapse } from './fake-synapse.js';
+import {
+  aliasForTopic as fakeAliasForTopic,
+  connectFake,
+  FakeSynapse,
+} from './fake-synapse.js';
 import {
   A,
   aliasForTopic,
@@ -285,4 +289,214 @@ live('live homeserver: the provisioned room really is invite-only', () => {
       await p.disconnect();
     }
   }, 30_000);
+});
+
+/**
+ * CLASS: a provisioning race whose LOSER must recover rather than fail. Two bridges first-posting to
+ * the same topic both find the alias unresolved and both call `POST /createRoom`; a real homeserver
+ * enforces alias uniqueness, so exactly one wins and the other is refused. The loser must resolve the
+ * winner's alias and JOIN it — CLAUDE.md's "multi-process writes don't corrupt or error" — and the
+ * genuinely unresolvable case must still fail loudly, carrying the homeserver's own body.
+ *
+ * The live fixture cannot reach this: `conformance.test.ts` pre-warms each topic's room so its
+ * writers only resolve and join, and `live-per-topic.test.ts` is sequential.
+ */
+const RACE_OUTCOMES: Record<string, { status: number; resolvesAfter: boolean }> = {
+  'createRoom 409, then the alias resolves': { status: 409, resolvesAfter: true },
+  'createRoom 400, then the alias resolves': { status: 400, resolvesAfter: true },
+  'createRoom 409, then the alias still 404s': { status: 409, resolvesAfter: false },
+};
+
+const CONTENDED = asTopic('ctx-contended');
+
+/** The alias both racers ask for, composed from the plugin's own fold (see fake-synapse). */
+const contendedAlias = (shared: boolean): string => fakeAliasForTopic(String(CONTENDED), shared);
+
+/**
+ * Put the winner's room in the fake's directory, and decide whether the loser's SECOND lookup — the
+ * one the recovery branch makes after its create is refused — finds it. `aliasExists` is what the
+ * loser's FIRST lookup answers, so it stays false until the create has been refused.
+ */
+const winnerAlreadyCreated = (fake: FakeSynapse, alias: string, resolvesAfter: boolean): void => {
+  fake.addRaw('m.room.create', alias);
+  fake.aliasExists = false;
+  fake.onRequest = (_method, path) => {
+    if (path.endsWith('/createRoom')) fake.aliasExists = resolvesAfter;
+  };
+};
+
+/** Every `POST` this run issued against a room, as `<room_id>` — the evidence a join happened. */
+const joinedRooms = (fake: FakeSynapse): string[] =>
+  fake.requestUrls
+    .filter((u) => u.pathname.endsWith('/join'))
+    .map((u) => decodeURIComponent(u.pathname.split('/rooms/')[1]!.split('/')[0]!));
+
+describe('the loser of a create race joins the winner’s room instead of failing', () => {
+  for (const shared of [true, false]) {
+    for (const [outcomeName, outcome] of Object.entries(RACE_OUTCOMES)) {
+      for (const [entryName, entry] of Object.entries(ENTRY_POINTS)) {
+        if (!entry.provisions) continue; // a read never creates, so it never races a create.
+        const mode = shared ? 'shared_room' : 'per-topic';
+
+        it(`${mode} / ${outcomeName} / ${entryName}`, async () => {
+          const alias = contendedAlias(shared);
+          fake.createRoomConflictStatus = outcome.status;
+          winnerAlreadyCreated(fake, alias, outcome.resolvesAfter);
+          const p = await connectFake({ shared });
+
+          const drive = entry.drive(p, CONTENDED);
+          if (!outcome.resolvesAfter) {
+            // Loud, and carrying what the homeserver said — an unresolvable alias is not a state any
+            // retry recovers from, and the operator needs the errcode to tell it from a lost race.
+            await expect(drive).rejects.toThrow(
+              new RegExp(`createRoom failed \\(${outcome.status}\\)[\\s\\S]*M_ROOM_IN_USE`),
+            );
+            await p.disconnect();
+            return;
+          }
+
+          await drive;
+          expect(fake.createRoomBodies).toHaveLength(1); // it tried exactly once, then recovered
+          expect(fake.rooms).toHaveLength(1); // …and no second room was minted
+          expect(joinedRooms(fake)).toContain(fake.roomIdFor(alias));
+          if (entryName === 'first post') {
+            expect(fake.timelineOf(alias).map((e) => (e.content as { body: string }).body)).toContain(
+              'hello',
+            );
+          }
+          await p.disconnect();
+        });
+      }
+    }
+  }
+
+  it('a 403 on the JOIN that recovers the race still names the alias, the account and the fix', async () => {
+    const alias = contendedAlias(false);
+    winnerAlreadyCreated(fake, alias, true);
+    fake.joinStatus = 403;
+    const p = await connectFake({});
+
+    await expect(p.post(CONTENDED, WRITER, 'hello')).rejects.toThrow(
+      /#parley_ctx-contended:fake[\s\S]*@parley:fake[\s\S]*invite/,
+    );
+    await p.disconnect();
+  });
+
+  /**
+   * The race itself rather than a staged replay of it: every writer's FIRST post lands together, so
+   * whichever create wins is the fake's own scheduling. One room, and nobody's message lost.
+   */
+  for (const writers of [2, 4]) {
+    it(`${writers} bridges first-posting at once converge on one room`, async () => {
+      fake.aliasExists = false;
+      const alias = contendedAlias(false);
+      const bridges = await Promise.all(
+        Array.from({ length: writers }, () => connectFake({})),
+      );
+
+      await Promise.all(bridges.map((p, i) => p.post(CONTENDED, WRITER, `w${i}`)));
+
+      expect(fake.rooms).toHaveLength(1);
+      expect(
+        fake.timelineOf(alias).map((e) => (e.content as { body: string }).body).sort(),
+      ).toEqual(Array.from({ length: writers }, (_v, i) => `w${i}`));
+      for (const p of bridges) await p.disconnect();
+    }, 20_000);
+  }
+});
+
+/**
+ * CLASS: an unbounded, model-reachable side effect on a path documented as read-only. The tables
+ * above grade one write — `createRoom` — which leaves every OTHER state change a seam call makes
+ * ungraded, and a read makes one: it JOINs. That join is permanent (nothing in `src/` ever leaves or
+ * forgets a room), the topic naming it comes from the model, and the joined-room set is what bounds
+ * every later `/sync` — a cost this repo's own live fixture records as a session going from 3.4s to
+ * over 15s. Declaring the whole set per call makes a new write on a read path fail HERE rather than
+ * being discovered later as homeserver slowness.
+ */
+const WRITE_SHAPES: [RegExp, string][] = [
+  [/\/v3\/createRoom$/, 'POST /createRoom'],
+  [/\/join$/, 'POST /join'],
+  [/\/send\/m\.room\.message\//, 'PUT /send'],
+];
+
+/** Every state-changing request a driver issued, named — an unclassified one names itself and fails. */
+const recordWrites = (fake: FakeSynapse): (() => string[]) => {
+  const writes: string[] = [];
+  fake.onRequest = (method, path) => {
+    if (method === 'GET' || path.endsWith('/v3/login')) return;
+    writes.push(WRITE_SHAPES.find(([re]) => re.test(path))?.[1] ?? `${method} ${path}`);
+  };
+  return () => writes;
+};
+
+const SIDE_EFFECTS: Record<
+  string,
+  { aliasExists: boolean; effects: string[]; drive: (p: MatrixPlugin, t: Topic) => Promise<unknown> }
+> = {
+  'fetchRecent (no since) on a room that exists': {
+    aliasExists: true,
+    effects: ['POST /join'],
+    drive: (p, t) => p.fetchRecent({ topic: t, limit: 5 }),
+  },
+  'fetchRecent (no since) with block_ms on a room that exists': {
+    aliasExists: true,
+    effects: ['POST /join'],
+    drive: (p, t) => p.fetchRecent({ topic: t, limit: 5, blockMs: 300 }),
+  },
+  'fetchRecent (since) with block_ms on a topic with no room': {
+    aliasExists: false,
+    effects: [],
+    drive: (p, t) => p.fetchRecent({ topic: t, since: asCursor(''), limit: 5, blockMs: 300 }),
+  },
+  'post to a room that exists': {
+    aliasExists: true,
+    effects: ['POST /join', 'PUT /send'],
+    drive: (p, t) => p.post(t, WRITER, 'x'),
+  },
+  'post to a topic with no room': {
+    aliasExists: false,
+    effects: ['POST /createRoom', 'PUT /send'],
+    drive: (p, t) => p.post(t, WRITER, 'x'),
+  },
+  'subscribe to a room that exists': {
+    aliasExists: true,
+    effects: ['POST /join'],
+    drive: (p, t) => p.subscribe(t, () => undefined),
+  },
+  'subscribe to a topic with no room': {
+    aliasExists: false,
+    effects: ['POST /createRoom'],
+    drive: (p, t) => p.subscribe(t, () => undefined),
+  },
+};
+
+describe('every seam call issues exactly the state changes it is declared to', () => {
+  for (const [name, row] of Object.entries(SIDE_EFFECTS)) {
+    it(`${name}: ${row.effects.join(' + ') || 'nothing'}`, async () => {
+      fake.aliasExists = row.aliasExists;
+      const p = await connectFake({});
+      const writes = recordWrites(fake);
+
+      await row.drive(p, asTopic('ctx-declared'));
+
+      expect(writes()).toEqual(row.effects);
+      await p.disconnect();
+    }, 20_000);
+  }
+
+  it('a read of N distinct topics permanently joins N rooms', async () => {
+    fake.aliasExists = true;
+    const topics = ['ctx-a', 'ctx-b', 'ctx-c', 'ctx-d', 'ctx-e'].map(asTopic);
+    const p = await connectFake({});
+    const writes = recordWrites(fake);
+
+    for (const t of topics) await p.fetchRecent({ topic: t, limit: 5 });
+
+    // Unbounded in the number of topics a model can name, and permanent — which is why the README
+    // has to say so, and why `topics`/`post_topics` are the operator's only lever.
+    expect(writes()).toEqual(topics.map(() => 'POST /join'));
+    expect(fake.rooms).toHaveLength(topics.length);
+    await p.disconnect();
+  }, 20_000);
 });

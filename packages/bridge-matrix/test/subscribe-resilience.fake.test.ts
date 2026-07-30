@@ -1,4 +1,4 @@
-import { asTopic } from '@sharptrick/parley-core';
+import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
 
@@ -90,4 +90,123 @@ describe('subscribe loop does not silently hot-retry a permanent /sync failure',
       expect(reported.slice(0, 3)).toEqual([1, 2, 4]);
     }, 20_000);
   }
+});
+
+/**
+ * CLASS: a malformed-but-PARSEABLE upstream response must not escape a fire-and-forget loop. Every
+ * fault above is an HTTP status or a socket error, and both land in the loop's own try — so none of
+ * them ever reaches the code that dereferences a `/sync` body. A body `res.json()` accepts but whose
+ * shape the loop assumes (`null`, a scalar, a `timeline.events` that is not a list) throws from a
+ * `void`-ed promise instead: under Node's default that terminates an MCP stdio bridge, and at best
+ * the live path ends with no retry and nothing on stderr.
+ *
+ * Both fire-and-forget `/sync` drivers are graded, because they are separate loops with separate
+ * error handling: `subscribe`'s, and the dedicated bounded one a blocking `fetchRecent` drives when
+ * no subscription covers its topic.
+ */
+const FRESH = 'after-the-garbage';
+
+/** Shapes a homeserver, a proxy, or a captive portal can put on the wire that still parse as JSON. */
+const MALFORMED: Record<string, (roomId: string) => unknown> = {
+  'JSON null': () => null,
+  'an array': () => [],
+  'a bare string': () => 'ok',
+  'a number': () => 123,
+  'rooms: null': () => ({ next_batch: 'p0', rooms: null }),
+  'rooms.join is not a map': () => ({ next_batch: 'p0', rooms: { join: 'x' } }),
+  'next_batch is not a token': () => ({ next_batch: 42 }),
+  'timeline.events is not a list': (roomId) => ({
+    next_batch: 'p0',
+    rooms: { join: { [roomId]: { timeline: { events: 42, limited: false } } } },
+  }),
+};
+
+/** Each driver arms the body, lands one well-formed message behind it, and reports what arrived. */
+const DRIVERS: Record<string, (arm: () => void) => Promise<string[]>> = {
+  'the subscribe loop': async (arm) => {
+    const p = await connectFake({});
+    const t = asTopic('resilient');
+    const got: string[] = [];
+    await p.subscribe(t, (m) => got.push(m.content));
+    arm();
+    fake.addMessage(String(t), FRESH);
+    await vi
+      .waitFor(() => expect(got).toContain(FRESH), { timeout: 8000, interval: 20 })
+      .catch(() => undefined);
+    await p.disconnect();
+    return got;
+  },
+  'the dedicated /sync behind a blocking fetchRecent': async (arm) => {
+    const p = await connectFake({});
+    const t = asTopic('resilient');
+    await p.post(t, asHandle('writer'), 'seed');
+    const tail = (await p.fetchRecent({ topic: t, limit: 10 })).nextCursor;
+    arm();
+    const pending = p.fetchRecent({ topic: t, since: tail, blockMs: 8000, limit: 10 });
+    const lands = setTimeout(() => void fake.addMessage(String(t), FRESH), 100);
+    const got = (await pending).messages.map((m) => m.content);
+    clearTimeout(lands);
+    await p.disconnect();
+    return got;
+  },
+};
+
+describe('a malformed but parseable /sync body never escapes a background loop', () => {
+  for (const [bodyName, body] of Object.entries(MALFORMED)) {
+    for (const [driverName, drive] of Object.entries(DRIVERS)) {
+      it(`${bodyName} / ${driverName}: reported and retried, never an unhandled rejection`, async () => {
+        vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const escaped: unknown[] = [];
+        const onEscape = (reason: unknown): void => void escaped.push(reason);
+        process.on('unhandledRejection', onEscape);
+        let got: string[] = [];
+        try {
+          got = await drive(() => void fake.syncBodyOverrides.push(body));
+          await new Promise((r) => setTimeout(r, 50)); // let a rejection reach the event loop.
+        } finally {
+          process.off('unhandledRejection', onEscape);
+        }
+
+        expect(escaped.map(String)).toEqual([]);
+        expect(got).toContain(FRESH);
+      }, 30_000);
+    }
+  }
+
+  /**
+   * The one throw the ladder above cannot contain: the failure REPORT itself, which runs in the
+   * loop's `catch` and therefore outside every try. An MCP bridge speaks over stdio, and a closed
+   * pipe makes `console.error` throw — so the loop's own error path is the last place a rejection can
+   * escape from.
+   */
+  it('a stderr write that throws is contained too', async () => {
+    const escaped: unknown[] = [];
+    const onEscape = (reason: unknown): void => void escaped.push(reason);
+    process.on('unhandledRejection', onEscape);
+    let firstWrite = true;
+    vi.spyOn(console, 'error').mockImplementation(() => {
+      if (!firstWrite) return;
+      firstWrite = false;
+      throw new Error('EPIPE: stderr is closed');
+    });
+    const p = await connectFake({});
+    fake.syncFailureStatus = 500;
+    fake.syncFailures = Number.POSITIVE_INFINITY;
+
+    try {
+      await p.subscribe(asTopic('resilient'), () => undefined);
+      await vi
+        .waitFor(() => expect(fake.syncAttempts.length).toBeGreaterThanOrEqual(1), {
+          timeout: 4000,
+          interval: 20,
+        })
+        .catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      process.off('unhandledRejection', onEscape);
+      await p.disconnect();
+    }
+
+    expect(escaped.map(String)).toEqual([]);
+  }, 20_000);
 });

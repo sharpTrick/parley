@@ -30,17 +30,28 @@ nothing is newer than `since`, the call holds up to `block_ms` for a new message
 (possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. Matrix
 serves this natively via a room-filtered `/sync` long-poll (bounded), reconciled through
 `/messages`. Core caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the
-immediate-return catch-up semantics. Blocking engages only relative to a `since`, per the seam: a
-`fetch_recent` with no `since` is the default recent window and returns at once, even on a topic
-whose room does not exist yet.
+immediate-return catch-up semantics. Blocking engages on an **empty window, `since` or not** — the
+`fetch_recent` tool holds for the rest of the budget either way, because core re-enters the plugin
+with the cursor the first (empty) page reported. What differs is which wait this plugin serves
+natively: with a `since`, an empty exclusive window parks on the `/sync` long-poll; with no `since`,
+it parks only while the topic's room does not exist yet, and once it does a since-less window is the
+recent window and comes back at once.
 
-**Reads never provision.** `post` and `subscribe` create a topic's room when the alias does not
-resolve; `fetch_recent` does not — it returns an empty page with a replayable cursor and starts
-working the moment a peer's `post` creates the room (with `block_ms`, it waits for that within the
-budget). `fetch_recent`'s topic argument comes from the model, whose context is fed by untrusted
-inbound messages, and the allowlist admits pattern matches — so a read that provisioned would let
-inbound data spend Synapse's scarce per-user room-creation budget (see below) and starve the writes
-that need it.
+**Reads never provision — but they do JOIN.** `post` and `subscribe` create a topic's room when the
+alias does not resolve; `fetch_recent` does not — it returns an empty page with a replayable cursor
+and starts working the moment a peer's `post` creates the room (with `block_ms`, it waits for that
+within the budget). `fetch_recent`'s topic argument comes from the model, whose context is fed by
+untrusted inbound messages, and the allowlist admits pattern matches — so a read that provisioned
+would let inbound data spend Synapse's scarce per-user room-creation budget (see below) and starve
+the writes that need it.
+
+A read of a topic whose alias *does* resolve still **joins** that room, and this plugin never leaves
+one: the bridge account's joined-room set only grows, and it is what bounds `/sync` latency — a test
+fixture measured a session going from 3.4s to over 15s as rooms accumulated, which presents as a
+flaky homeserver rather than as an accumulated cost. There is no leave/forget lever in the plugin, so
+an operator bounds it from the config: keep `topics` and `post_topics` patterns tight, so a
+model-chosen topic name cannot name an unbounded set of rooms, and leave the rooms of retired topics
+out of band (any Matrix client, or `POST /rooms/<id>/leave` + `/forget`).
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** The homeserver
 > stamps `sender` from whichever account is logged in (`user`/`password` below) — see "Multiple

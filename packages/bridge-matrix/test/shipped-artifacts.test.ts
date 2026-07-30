@@ -181,3 +181,102 @@ describe('CI type-checks this package’s test sources rather than skipping it',
     expect(project.include).toContain('test/**/*');
   });
 });
+
+/**
+ * CLASS: a per-backend README describing CORE-owned tool semantics. `block_ms`, the `since`
+ * convention, the absent-topic answer and the `catchup.block_max_ms` clamp are all owned by
+ * `@sharptrick/parley-core` — the plugin never sees the tool surface — and this is the only backend
+ * README that adds sentences of its own about them. A claim here can therefore contradict the
+ * description core actually ships to the model, and the model believes the tool.
+ *
+ * Each row pins BOTH sides: the string core ships (so a reworded core description fails here rather
+ * than diverging in one package unnoticed) and what this README must, and must not, say about it.
+ */
+const CORE_SOURCES: Record<string, string> = {
+  'transport/tools.ts': readFileSync(
+    fileURLToPath(new URL('../../bridge-core/src/transport/tools.ts', import.meta.url)),
+    'utf8',
+  ),
+  'config.ts': readFileSync(
+    fileURLToPath(new URL('../../bridge-core/src/config.ts', import.meta.url)),
+    'utf8',
+  ),
+};
+const PLUGIN_SRC = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
+
+interface CoreOwnedClaim {
+  /** The string core ships, and where. */
+  core: { file: keyof typeof CORE_SOURCES; pattern: RegExp };
+  /** What this README must say about it. */
+  readme: RegExp;
+  /** What it must NOT say: the contradiction this class exists to catch. */
+  forbidden?: RegExp;
+  /** A plugin-source fact the README's claim rests on. */
+  pluginMustNotMatch?: RegExp;
+}
+
+const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
+  'block_ms holds an EMPTY window, with or without a since': {
+    core: { file: 'transport/tools.ts', pattern: /If the queried window is empty — whether or not/ },
+    readme: /Blocking engages on an \*\*empty window, `since` or not\*\*/,
+    // The tool routes ANY block_ms > 0 through fetchRecentBlocking, which re-enters with the cursor
+    // the first page reported — so a since-less call on an empty topic holds the whole budget.
+    forbidden: /returns at once, even on a topic\s+whose room does not exist yet/,
+  },
+  'the block_ms clamp defaults to 60s': {
+    core: { file: 'config.ts', pattern: /block_max_ms: z[\s\S]{0,400}?\.default\(60_000\)/ },
+    readme: /`catchup\.block_max_ms` \(default 60s\)/,
+  },
+  'an omitted since means the recent window': {
+    core: { file: 'transport/tools.ts', pattern: /Omit for the recent window/ },
+    readme: /`fetchRecent` \(no `since`\)/,
+  },
+  'an absent topic is an empty page here, never the topicAbsent answer': {
+    core: { file: 'transport/tools.ts', pattern: /topicAbsent: true/ },
+    readme: /reads as an empty page/,
+    // `topicAbsent` is core's rendering of NoSuchTopicError; this plugin never raises it, which is
+    // what makes the README's "empty page" true rather than a second name for the same thing.
+    pluginMustNotMatch: /NoSuchTopicError/,
+  },
+};
+
+describe('the README does not contradict the tool semantics core ships', () => {
+  it.each(Object.entries(CORE_OWNED_CLAIMS))('%s', (_name, claim) => {
+    expect(
+      CORE_SOURCES[claim.core.file],
+      `core reworded ${claim.core.file}: re-read it and re-state the README claim`,
+    ).toMatch(claim.core.pattern);
+    expect(README).toMatch(claim.readme);
+    if (claim.forbidden !== undefined) expect(README).not.toMatch(claim.forbidden);
+    if (claim.pluginMustNotMatch !== undefined) {
+      expect(PLUGIN_SRC).not.toMatch(claim.pluginMustNotMatch);
+    }
+  });
+});
+
+/**
+ * CLASS (paired with `provisioning.fake.test.ts`'s declared side effects): a permanent, unbounded
+ * resource a documented read-only path acquires. The plugin joins a room on every read and never
+ * leaves one, and the joined-room set is what bounds `/sync` latency — so the README paragraph that
+ * says a read never provisions has to name the join it DOES make, and the day the plugin grows a
+ * leave, this fails so the paragraph is rewritten rather than left stale.
+ */
+describe('the read-path paragraph names the side effect a read does have', () => {
+  const readsSection = (): string => {
+    const from = README.indexOf('**Reads never provision');
+    return README.slice(from, README.indexOf('\n## ', from));
+  };
+
+  it('finds the paragraph it is meant to grade', () => {
+    expect(readsSection()).toContain('Reads never provision');
+  });
+
+  it('names the JOIN, and what the joined-room set costs', () => {
+    expect(readsSection()).toMatch(/join/i);
+    expect(readsSection()).toMatch(/`\/sync`/);
+  });
+
+  it('the plugin still never leaves or forgets a room, as that paragraph says', () => {
+    expect(PLUGIN_SRC).not.toMatch(/\/(?:leave|forget)`/);
+  });
+});

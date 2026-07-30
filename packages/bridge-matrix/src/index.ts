@@ -448,11 +448,11 @@ export class MatrixPlugin implements BackendPlugin {
     // with a replayable cursor is the seam's answer: the `@parley-stream:` form with no token drains
     // from the first visible event once the room does exist.
     if (roomId === undefined) {
-      return { messages: [], nextCursor: args.since ?? asCursor(STREAM_CURSOR_PREFIX) };
+      return { messages: [], nextCursor: this.emptyWindowCursor(undefined, args.since, generation) };
     }
 
     if (args.since === undefined) {
-      return this.recentWindow(roomId, args.topic, limit, generation);
+      return this.recentWindow(roomId, args.topic, limit, generation, undefined);
     }
 
     const first = await this.fetchSince(roomId, args.topic, args.since, limit, generation);
@@ -525,7 +525,7 @@ export class MatrixPlugin implements BackendPlugin {
     // change) does not brick startup: `buildBridge` awaits `catchUpAll`, so a throw here fails
     // EVERY restart until the read-state file is hand-edited.
     if (ctxRes.status === 404) {
-      return this.recentWindow(roomId, topic, limit, generation);
+      return this.recentWindow(roomId, topic, limit, generation, sinceCursor);
     }
     const ctx = (await ctxRes.json()) as { end?: string };
     if (ctx.end === undefined) {
@@ -572,7 +572,7 @@ export class MatrixPlugin implements BackendPlugin {
           ? { allowStatuses: [400, 404] }
           : undefined,
       );
-      if (!fwdRes.ok) return this.recentWindow(roomId, topic, limit, generation);
+      if (!fwdRes.ok) return this.recentWindow(roomId, topic, limit, generation, sinceCursor);
       const { chunk, end } = (await fwdRes.json()) as { chunk: MatrixEvent[]; end?: string };
       if (chunk.length === 0) break; // genuine end of timeline.
       // Keep the `since` event both DROPPED and out of the page-fullness count, so that a
@@ -776,7 +776,7 @@ export class MatrixPlugin implements BackendPlugin {
           { signal: controller.signal, deadlineMs: syncDeadlineMs(timeout) },
         );
         const json = (await res.json()) as SyncResponse;
-        nextBatch = json.next_batch ?? nextBatch;
+        nextBatch = nextBatchOf(json.next_batch, nextBatch);
         const events = json.rooms?.join?.[roomId]?.timeline?.events ?? [];
         if (events.some((e) => this.belongs(e, topic))) {
           wake();
@@ -806,6 +806,7 @@ export class MatrixPlugin implements BackendPlugin {
     topic: Topic,
     limit: number,
     generation: number,
+    sinceCursor: Cursor | undefined,
   ): Promise<FetchRecentResult> {
     const collected: MessageEvent[] = [];
     let from: string | undefined;
@@ -835,11 +836,36 @@ export class MatrixPlugin implements BackendPlugin {
       .slice(0, limit)
       .reverse()
       .map((e) => eventToMessage(topic, e));
-    // Keep the `${STREAM_CURSOR_PREFIX}` form for an empty window rather than `''` — see
-    // STREAM_CURSOR_PREFIX for what minting `''` costs.
     const nextCursor =
-      messages.at(-1)?.cursor ?? asCursor(`${STREAM_CURSOR_PREFIX}${tailToken ?? ''}`);
+      messages.at(-1)?.cursor ?? this.emptyWindowCursor(tailToken, sinceCursor, generation);
     return { messages, nextCursor };
+  }
+
+  /**
+   * The cursor an EMPTY read reports: the timeline position it was actually read AT (`readAt`, in
+   * the `${STREAM_CURSOR_PREFIX}` form rather than `''` — see {@link STREAM_CURSOR_PREFIX} for what
+   * minting `''` costs), else the caller's own position.
+   *
+   * Keep the THROW for a read that observed NEITHER — no page and no `since` — so that a teardown
+   * landing before the first page cannot report `@parley-stream:` with no token, which means "the
+   * first visible event in the room" and is a position nothing observed. Core's catch-up persists
+   * whatever cursor it is handed, so a `disconnect()` racing startup catch-up would otherwise write
+   * "beginning of the room" to read-state and re-deliver the whole room on the next start.
+   */
+  private emptyWindowCursor(
+    readAt: string | undefined,
+    sinceCursor: Cursor | undefined,
+    generation: number,
+  ): Cursor {
+    if (readAt !== undefined) return asCursor(`${STREAM_CURSOR_PREFIX}${readAt}`);
+    if (sinceCursor !== undefined) return sinceCursor;
+    if (this.isStale(generation)) {
+      throw new Error(
+        '[parley-matrix] fetchRecent stood down before it read a page and was given no `since`, so ' +
+          'it has no read position to report; the plugin disconnected or reconnected mid-call.',
+      );
+    }
+    return asCursor(STREAM_CURSOR_PREFIX);
   }
 
   /**
@@ -882,62 +908,71 @@ export class MatrixPlugin implements BackendPlugin {
     const loop = async (): Promise<void> => {
       let consecutiveFailures = 0;
       while (!this.isStale(generation)) {
-        const controller = new AbortController();
-        this.controllers.add(controller);
-        let json: SyncResponse;
         const started = Date.now();
+        // Keep EVERY use of the parsed body inside this try, so that a malformed-but-parseable
+        // `/sync` — a JSON `null`, a `timeline.events` that is not a list — is reported and backed
+        // off like any other fault rather than escaping the loop as an unhandled rejection, which
+        // under Node's default terminates the bridge process.
         try {
-          const res = await this.http(
-            'GET',
-            `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${this.syncTimeoutMs}`,
-            { signal: controller.signal, deadlineMs: syncDeadlineMs(this.syncTimeoutMs) },
-          );
-          json = (await res.json()) as SyncResponse;
+          let json: SyncResponse;
+          const controller = new AbortController();
+          this.controllers.add(controller);
+          try {
+            const res = await this.http(
+              'GET',
+              `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${this.syncTimeoutMs}`,
+              { signal: controller.signal, deadlineMs: syncDeadlineMs(this.syncTimeoutMs) },
+            );
+            json = (await res.json()) as SyncResponse;
+          } finally {
+            this.controllers.delete(controller);
+          }
+          if (this.isStale(generation)) break;
+          consecutiveFailures = 0;
+          nextBatch = nextBatchOf(json.next_batch, nextBatch);
+          const timeline = json.rooms?.join?.[roomId]?.timeline;
+          const events = timeline?.events ?? [];
+          // The server truncated this sync's timeline to the filter cap; the omitted (older) events
+          // are reachable only by paging `prev_batch` backwards. Recover and deliver them ASCENDING
+          // before the new batch so no burst larger than the per-sync cap is silently dropped (the
+          // "handler fires once per inbound message" seam contract).
+          if (timeline?.limited === true && timeline.prev_batch !== undefined) {
+            let recovered: MessageEvent[] = [];
+            try {
+              recovered = await this.backfill(
+                roomId,
+                topic,
+                timeline.prev_batch,
+                lastDelivered,
+                new Set(events.map((e) => e.event_id)),
+              );
+            } catch {
+              /* backfill is best-effort; anything missed stays reachable via fetchRecent catch-up */
+            }
+            for (const e of recovered) {
+              lastDelivered = e.event_id;
+              this.deliver(roomId, topic, e, handler);
+            }
+          }
+          for (const e of events) {
+            if (!this.belongs(e, topic)) continue;
+            lastDelivered = e.event_id;
+            this.deliver(roomId, topic, e, handler);
+          }
         } catch (err) {
           if (this.isStale(generation)) break;
           consecutiveFailures++;
           reportSyncFailure(topic, consecutiveFailures, err);
           await delay(syncRetryDelayMs(consecutiveFailures));
           continue;
-        } finally {
-          this.controllers.delete(controller);
-        }
-        if (this.isStale(generation)) break;
-        consecutiveFailures = 0;
-        nextBatch = json.next_batch ?? nextBatch;
-        const timeline = json.rooms?.join?.[roomId]?.timeline;
-        const events = timeline?.events ?? [];
-        // The server truncated this sync's timeline to the filter cap; the omitted (older) events
-        // are reachable only by paging `prev_batch` backwards. Recover and deliver them ASCENDING
-        // before the new batch so no burst larger than the per-sync cap is silently dropped (the
-        // "handler fires once per inbound message" seam contract).
-        if (timeline?.limited === true && timeline.prev_batch !== undefined) {
-          let recovered: MessageEvent[] = [];
-          try {
-            recovered = await this.backfill(
-              roomId,
-              topic,
-              timeline.prev_batch,
-              lastDelivered,
-              new Set(events.map((e) => e.event_id)),
-            );
-          } catch {
-            /* backfill is best-effort; anything missed stays reachable via fetchRecent catch-up */
-          }
-          for (const e of recovered) {
-            lastDelivered = e.event_id;
-            this.deliver(roomId, topic, e, handler);
-          }
-        }
-        for (const e of events) {
-          if (!this.belongs(e, topic)) continue;
-          lastDelivered = e.event_id;
-          this.deliver(roomId, topic, e, handler);
         }
         if (returnedTooFast(started, this.syncTimeoutMs)) await delay(SYNC_IDLE_PACE_MS);
       }
     };
-    void loop();
+    // Keep the catch on this fire-and-forget call, so that anything the ladder inside `loop` does
+    // not already contain reaches the operator as a dead live path instead of an unhandled
+    // rejection, which under Node's default takes the whole bridge down with it.
+    void loop().catch((err: unknown) => reportLoopCrash(topic, err));
   }
 
   /** True once work started under `generation` must stand down: we disconnected, or reconnected. */
@@ -1350,6 +1385,33 @@ function reportSyncFailure(topic: Topic, consecutiveFailures: number, err: unkno
   console.error(
     `[parley-matrix] /sync failed for topic ${JSON.stringify(String(topic))} ` +
       `(${consecutiveFailures} consecutive; retrying in ${syncRetryDelayMs(consecutiveFailures)}ms): ${detail}`,
+  );
+}
+
+/**
+ * The resume token a `/sync` response advances to. Keep a non-string a THROW rather than adopting or
+ * ignoring it, so that a loop cannot resume from a token the homeserver will reject — or, on a
+ * server whose tokens are ordinal, silently seek past unread events — and instead reports and backs
+ * off from the last token that worked.
+ */
+const nextBatchOf = (raw: unknown, current: string): string => {
+  if (raw === undefined) return current;
+  if (typeof raw !== 'string') {
+    throw new Error(`/sync answered with a ${typeof raw} next_batch where a token was required`);
+  }
+  return raw;
+};
+
+/**
+ * Announce a `/sync` loop that ended on something its own retry ladder did not contain — the live
+ * path for this topic is gone until the next `subscribe`, and only `fetchRecent` catch-up still
+ * reads it.
+ */
+function reportLoopCrash(topic: Topic, err: unknown): void {
+  console.error(
+    `[parley-matrix] the /sync loop for topic ${JSON.stringify(String(topic))} ended on an ` +
+      `unexpected error; live delivery for it has stopped: ` +
+      `${err instanceof Error ? (err.stack ?? err.message) : String(err)}`,
   );
 }
 
