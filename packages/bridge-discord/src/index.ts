@@ -18,11 +18,11 @@ import {
 import {
   DEFAULT_DEADLINE_MS,
   fetchWithRetry,
+  isLoopbackHost,
   retryAfterFromHeader,
   sanitizeBody,
 } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
-import { isIPv4, isIPv6 } from 'node:net';
 import WebSocket from 'ws';
 import { INTENTS, REQUIRED_INTENTS } from './intents.js';
 
@@ -1143,23 +1143,6 @@ function plaintextRemoteOrigin(raw: string): { origin: string; secure: string } 
   }
 }
 
-/**
- * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
- * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
- * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
- * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
- * address, counts as remote: an unproven host is warned about rather than excused.
- */
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
-  if (host === 'localhost') return true;
-  if (isIPv4(host)) return host.startsWith('127.');
-  if (!isIPv6(host)) return false;
-  const groups = host.split(':');
-  const tail = groups.pop() ?? '';
-  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
-  return Number.parseInt(tail, 16) === 1;
-}
 
 /**
  * Length in the unit Discord's 2000-character cap counts: CODE POINTS, not UTF-16 code units. Keep

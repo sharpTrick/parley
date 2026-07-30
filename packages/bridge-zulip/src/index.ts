@@ -18,9 +18,10 @@ import {
   DEFAULT_DEADLINE_MS,
   delay,
   fetchWithRetry,
+  isLoopbackHost,
+  plaintextRemoteOrigin,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
-import { isIPv4, isIPv6 } from 'node:net';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -1131,38 +1132,6 @@ function pageAnchor(
   return String(id);
 }
 
-/**
- * The origin to name when the URL would put the Basic-auth credential on the wire in the clear,
- * else undefined. Keep the warning on the ORIGIN rather than the whole `site_url`, so that a secret
- * smuggled into a path of a key secret-hygiene classifies by NAME as harmless is not the thing
- * stderr — and the tool result core hands the model — prints.
- */
-function plaintextRemoteOrigin(baseUrl: string): string | undefined {
-  try {
-    const { protocol, hostname, origin } = new URL(baseUrl);
-    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this a
- * parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
- * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
- * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
- * address, counts as remote: an unproven host is warned about rather than excused.
- */
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
-  if (host === 'localhost') return true;
-  if (isIPv4(host)) return host.startsWith('127.');
-  if (!isIPv6(host)) return false;
-  const groups = host.split(':');
-  const tail = groups.pop() ?? '';
-  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
-  return Number.parseInt(tail, 16) === 1;
-}
 
 /**
  * Normalize one server-controlled record into a {@link Message}, or `undefined` when its `id` — the

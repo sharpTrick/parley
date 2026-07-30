@@ -92,6 +92,20 @@ TLS failure into an unenveloped one just by racing it.
   isolates, joiners, BOM) character, plus U+2028/U+2029, replacing unpaired surrogates. It bounds
   and flattens only — the body's words still reach the reader.
 
+## Plaintext-credential classification
+
+- `isLoopbackHost(hostname)` — loopback iff the host is exactly `localhost` or a literal
+  `127.0.0.0/8` / `::1` address. A parse, not a prefix match, so a resolvable DNS name shaped like an
+  address (`127.0.0.1.example.com`, `localhost.example.com`) is classified by what it *is* and still
+  gets warned about. Anything unproven — including an IPv4-mapped spelling of a loopback address —
+  counts as remote: the safe direction is to warn.
+- `plaintextRemoteOrigin(url)` — the ORIGIN to name when the URL would put a credential on the wire
+  in the clear, else `undefined`. Naming the origin rather than the whole configured URL keeps a
+  secret smuggled into a path out of stderr, and out of the tool result core hands the model.
+
+These live here because five backends warn about the same thing and a security predicate copied five
+times is a predicate fixed in one place and left wrong in four.
+
 ## Constants
 
 `DEFAULT_BACKOFF_MS` (500), `MAX_BACKOFF_MS` (5000 — the ceiling `clampBackoff` applies to a

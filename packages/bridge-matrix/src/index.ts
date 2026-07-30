@@ -20,10 +20,11 @@ import {
   DEFAULT_DEADLINE_MS,
   delay,
   fetchWithRetry,
+  isLoopbackHost,
+  plaintextRemoteOrigin,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
 import { createHash } from 'node:crypto';
-import { isIPv4, isIPv6 } from 'node:net';
 
 /** Every `preset` a config may ask for. Each member is graded and documented in the README table. */
 export const ROOM_PRESETS = ['private_chat', 'public_chat'] as const;
@@ -211,33 +212,7 @@ function configRisks(cfg: MatrixBackendConfig): string[] {
   return risks;
 }
 
-/** The origin of a URL whose credentials would cross the network unencrypted, else `undefined`. */
-function plaintextRemoteOrigin(baseUrl: string): string | undefined {
-  try {
-    const { protocol, hostname, origin } = new URL(baseUrl);
-    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
-/**
- * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
- * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
- * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
- * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
- * address, counts as remote: an unproven host is warned about rather than excused.
- */
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
-  if (host === 'localhost') return true;
-  if (isIPv4(host)) return host.startsWith('127.');
-  if (!isIPv6(host)) return false;
-  const groups = host.split(':');
-  const tail = groups.pop() ?? '';
-  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
-  return Number.parseInt(tail, 16) === 1;
-}
 
 /**
  * Wall-clock budget for a `/sync` that asks the homeserver to block for `timeoutMs`. A long-poll

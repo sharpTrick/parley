@@ -1,4 +1,3 @@
-import { isIPv4, isIPv6 } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -21,6 +20,8 @@ import {
 import {
   delay,
   fetchWithRetry,
+  isLoopbackHost,
+  plaintextRemoteOrigin,
   retryAfterFromHeader,
   sanitizeBody,
   statusOf,
@@ -982,37 +983,7 @@ const REQUEST_BUDGET_MS = 30_000;
 /** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see {@link plaintextRemoteOrigin}. */
 const DEFAULT_API_URL = 'https://api.telegram.org';
 
-/**
- * The origin of a base URL whose credentials would cross the network unencrypted, else `undefined`.
- * Telegram's is worse than the sibling backends' header-borne ones: the token rides the request
- * PATH, so it is in the request line every intermediary logs.
- */
-function plaintextRemoteOrigin(baseUrl: string): string | undefined {
-  try {
-    const { protocol, hostname, origin } = new URL(baseUrl);
-    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
-/**
- * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
- * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
- * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
- * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
- * address, counts as remote: an unproven host is warned about rather than excused.
- */
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
-  if (host === 'localhost') return true;
-  if (isIPv4(host)) return host.startsWith('127.');
-  if (!isIPv6(host)) return false;
-  const groups = host.split(':');
-  const tail = groups.pop() ?? '';
-  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
-  return Number.parseInt(tail, 16) === 1;
-}
 
 /**
  * Default observed-message store: `${XDG_STATE_HOME:-~/.local/state}/parley/telegram/observed.jsonl`
