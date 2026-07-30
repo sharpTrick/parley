@@ -21,7 +21,7 @@ vi.mock('pg', async () => {
 
   class MockClient extends FakeEmitter {
     async connect(): Promise<void> {}
-    async query(sql: string): Promise<{ rows: unknown[] }> {
+    async query(sql = ''): Promise<{ rows: unknown[] }> {
       state.queries.push(sql);
       return { rows: [] };
     }

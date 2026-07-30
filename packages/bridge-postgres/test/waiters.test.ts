@@ -28,6 +28,21 @@ const state = vi.hoisted(() => ({
   onListenAttempt: null as ((channel: string) => void) | null,
   /** When true, the exclusive-`since` read returns one row — a message has become visible. */
   rowVisible: false,
+  /**
+   * Holds the post-registration re-check reads open, so a doorbell can be made to ring while they
+   * are in flight. `expected` 0 disables the whole mechanism for every other cell in this file.
+   */
+  recheck: {
+    /** Cursor reads that precede the re-checks (one per waiter's own opening query). */
+    initial: 0,
+    expected: 0,
+    holdMs: 0,
+    outcome: 'empty' as 'empty' | 'reject',
+    seen: 0,
+    resolved: 0,
+    onAllIssued: null as (() => void) | null,
+    onAllResolved: null as (() => void) | null,
+  },
 }));
 
 interface MockClientShape {
@@ -77,23 +92,41 @@ vi.mock('pg', async () => {
     async end(): Promise<void> {}
   }
 
+  const CURSOR_READ = /seq > \$\d+::bigint/;
+
   const poolQuery = async (sql: string, values: readonly unknown[]): Promise<{ rows: unknown[] }> => {
     // Serve the row through the same cursor-honouring helper the other suites use. A fake that
     // returns it for every `seq > $2` regardless of the cursor makes the drain loop re-deliver it
     // forever, which is the fake's bug and not the plugin's.
-    const all = state.rowVisible
-      ? [
-          {
-            seq: '1',
-            topic: String(values[0]),
-            sender: 'u',
-            content: 'landed',
-            ts: new Date().toISOString(),
-            in_reply_to: null,
-          },
-        ]
-      : [];
-    return { rows: servePool(all, sql, values) ?? [] };
+    const serve = (): unknown[] => {
+      const all = state.rowVisible
+        ? [
+            {
+              seq: '1',
+              topic: String(values[0]),
+              sender: 'u',
+              content: 'landed',
+              ts: new Date().toISOString(),
+              in_reply_to: null,
+            },
+          ]
+        : [];
+      return servePool(all, sql, values) ?? [];
+    };
+
+    const held = state.recheck;
+    if (held.expected === 0 || !CURSOR_READ.test(sql)) return { rows: serve() };
+    const ordinal = ++held.seen;
+    if (ordinal <= held.initial || ordinal > held.initial + held.expected) return { rows: serve() };
+    // Answer from a snapshot taken when the statement STARTS, so that a row committed while this
+    // read is in flight is legitimately absent from its result — a re-check that saw rows the
+    // server would not have shown it cannot leave the waiter parked, and the cells below need it to.
+    const snapshot = serve();
+    if (ordinal === held.initial + held.expected) held.onAllIssued?.();
+    await sleep(held.holdMs);
+    if (++held.resolved === held.expected) held.onAllResolved?.();
+    if (held.outcome === 'reject') throw new Error('re-check failed (mock)');
+    return { rows: snapshot };
   };
 
   return {
@@ -114,6 +147,14 @@ beforeEach(() => {
   state.listenDelayMs = 100;
   state.onListenAttempt = null;
   state.rowVisible = false;
+  state.recheck.initial = 0;
+  state.recheck.expected = 0;
+  state.recheck.holdMs = 0;
+  state.recheck.outcome = 'empty';
+  state.recheck.seen = 0;
+  state.recheck.resolved = 0;
+  state.recheck.onAllIssued = null;
+  state.recheck.onAllResolved = null;
 });
 
 afterEach(() => {
@@ -354,6 +395,105 @@ describe('a row landing in the LISTEN snapshot window still wakes the waiter', (
     expect(took, 'the wait stalled instead of re-checking after the LISTEN').toBeLessThan(
       LISTEN_WINDOW_MS * 2,
     );
+
+    await plugin.disconnect();
+  }, 15000);
+});
+
+// The re-check above closes the LISTEN snapshot window, and the ORDER in which it is armed is what
+// makes it safe: the waiter must already be in `this.waiters` BEFORE the re-check is issued, so a
+// NOTIFY arriving while that read is in flight still finds someone to wake. Arm it afterwards
+// instead — register in the re-check's `.then()` — and the doorbell rings into an empty set while
+// the re-check's own snapshot legitimately predates the row, and the wait sleeps out its whole
+// budget with the message durably visible.
+//
+// Neither matrix above can see that. The first re-rings every 20ms, so a late registration still
+// catches the next ring; the second never rings at all and makes the row appear during the LISTEN,
+// which the re-check itself then finds. So these cells ring EXACTLY ONCE, and hold the re-check
+// open across the ring.
+
+type RingWhen = 'as the re-check is issued' | 'mid re-check' | 'after the re-check settles';
+
+interface DoorbellCell {
+  ring: RingWhen;
+  /** How the held re-check ends — either way it must leave the waiter parked for the doorbell. */
+  outcome: 'empty' | 'reject';
+  waiters: number;
+  withSubscription: boolean;
+}
+
+const RECHECK_HOLD_MS = 300;
+const DOORBELL_BLOCK_MS = 3000;
+
+const DOORBELL_CELLS: DoorbellCell[] = (
+  ['as the re-check is issued', 'mid re-check', 'after the re-check settles'] as RingWhen[]
+).flatMap((ring) =>
+  (['empty', 'reject'] as const).flatMap((outcome) =>
+    [
+      { waiters: 1, withSubscription: false },
+      { waiters: 3, withSubscription: false },
+      { waiters: 2, withSubscription: true },
+    ].map((shape) => ({ ring, outcome, ...shape })),
+  ),
+);
+
+describe('one doorbell ring around the closing re-check is always heard', () => {
+  it.each(
+    DOORBELL_CELLS.map(
+      (c) =>
+        [
+          `ring ${c.ring}, re-check ${c.outcome}, ${c.waiters} waiter(s)${
+            c.withSubscription ? ' sharing the channel with a subscription' : ''
+          }`,
+          c,
+        ] as const,
+    ),
+  )('%s', async (_label, cell) => {
+    state.recheck.initial = cell.waiters;
+    state.recheck.expected = cell.waiters;
+    state.recheck.holdMs = RECHECK_HOLD_MS;
+    state.recheck.outcome = cell.outcome;
+
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL });
+    const topic = asTopic('doorbell');
+    const channel = channelFor(topic);
+
+    let rings = 0;
+    const ring = (): void => {
+      rings++;
+      state.rowVisible = true;
+      state.clients[0]?.emit('notification', { channel });
+    };
+    state.recheck.onAllIssued = () => {
+      if (cell.ring === 'as the re-check is issued') ring();
+      if (cell.ring === 'mid re-check') setTimeout(ring, RECHECK_HOLD_MS / 2);
+    };
+    state.recheck.onAllResolved = () => {
+      if (cell.ring === 'after the re-check settles') setTimeout(ring, 20);
+    };
+
+    const started = Date.now();
+    const runs = Array.from({ length: cell.waiters }, () =>
+      plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: DOORBELL_BLOCK_MS }),
+    );
+    const joined = cell.withSubscription ? plugin.subscribe(topic, () => undefined) : undefined;
+
+    const pages = await Promise.all(runs);
+    const took = Date.now() - started;
+    await joined;
+
+    expect(rings, 'the cell must ring the doorbell exactly once').toBe(1);
+    expect(state.established, 'nothing rang a doorbell that was never installed').toContain(channel);
+    expect(
+      took,
+      'a NOTIFY that landed around the closing re-check was not heard: the waiter is armed after it',
+    ).toBeLessThan(DOORBELL_BLOCK_MS * 0.6);
+    for (const page of pages) {
+      expect(page.messages.map((m) => m.content), 'the visible row was not returned').toEqual([
+        'landed',
+      ]);
+    }
 
     await plugin.disconnect();
   }, 15000);
