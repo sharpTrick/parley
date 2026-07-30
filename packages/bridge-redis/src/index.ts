@@ -17,7 +17,9 @@ import { createClient } from 'redis';
 
 type RedisClient = ReturnType<typeof createClient>;
 
-const DEFAULT_URL = 'redis://127.0.0.1:6379';
+/** The endpoint `url` falls back to when omitted (or `null`). Exported so a test can name it
+ * without hard-coding an endpoint of its own. */
+export const DEFAULT_URL = 'redis://127.0.0.1:6379';
 const DEFAULT_KEY_PREFIX = 'parley:';
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_BLOCK_MS = 2000;
@@ -562,6 +564,9 @@ export class RedisPlugin implements BackendPlugin {
    * the connect generation so a disconnect/reconnect racing this window can never revive it. On
    * any early exit — timeout, teardown, or error — we return `[]`, which is always safe: the empty
    * page carries `nextCursor === since` and core polls the remaining budget on the MCP path.
+   *
+   * Keep `readWindow`'s floor as the only floor, so that `XREAD BLOCK 0` — which blocks FOREVER —
+   * can never be issued; `blockMs` arrives here already whole and positive.
    */
   private async blockingRead(
     key: string,
@@ -569,9 +574,6 @@ export class RedisPlugin implements BackendPlugin {
     blockMs: number,
     limit: number,
   ): Promise<Array<{ id: string; message: Record<string, string> }>> {
-    // Defensive floor: `XREAD BLOCK 0` blocks FOREVER, so a non-positive budget must never reach
-    // Redis regardless of caller. The XRANGE path already returned the immediate answer ([]).
-    if (blockMs <= 0) return [];
     const gen = this.generation;
     const reader = this.newReader();
     // Register BEFORE connecting so a disconnect() racing this window can always find and close the

@@ -129,8 +129,9 @@ docker run -d --name parley-redis -p 127.0.0.1:6379:6379 redis:7-alpine \
 ```
 
 There is also a maintainer dev harness, [`examples/dev-compose/`](../../examples/dev-compose/docker-compose.yml),
-but it is throwaway test infra, not this recipe: it publishes an **unauthenticated** Redis on
-**every interface**, so run it only on a host nothing else can route to. See
+but it is throwaway test infra, not this recipe: it publishes an **unauthenticated** Redis on the
+host's **loopback interface only**, which keeps it off the network but still leaves it readable and
+writable by every local user and container on that host. See
 [Credentials & exposure](#credentials--exposure) before pointing anything but localhost at it.
 
 ## Conformance

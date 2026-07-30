@@ -1,39 +1,20 @@
+import { readdirSync } from 'node:fs';
 import net from 'node:net';
-import { asHandle, type Cursor, type Topic } from '@sharptrick/parley-core';
+import { fileURLToPath } from 'node:url';
+import { loadConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { CONFIG_KEYS, createRedisClient, RedisPlugin } from '../src/index.js';
-import {
-  FAST_MS as FAST,
-  freshPrefix,
-  freshTopic as mintTopic,
-  isRedisUp,
-  REDIS_URL,
-  wipe,
-} from './support.js';
+import { CONFIG_KEYS, RedisPlugin } from '../src/index.js';
+import { rejectedByKnob, rejectedRows } from './config-fixtures.js';
+import { endpointOf, FAST_MS as FAST, freeEndpoint } from './support.js';
 
 // The failure surface the seam-conformance suite structurally cannot reach: it only ever runs
 // against a reachable server, with cursors this backend just minted and a default retention.
 // Everything here drives the REAL plugin (no `redis` mock) against a broken or hostile endpoint.
-
-const freshTopic = (): Topic => mintTopic('fm');
-
-// A server-dependent block must be REGISTERED and reported as skipped, never left unregistered:
-// a runtime `if` around describe() turns a missing server into a green file with fewer tests, which
-// no whole-file skip gate can see.
-const redisUp = await isRedisUp(REDIS_URL);
-
-async function settlesWithin<T>(work: Promise<T>, ms: number): Promise<'resolved' | 'rejected'> {
-  const timeout = Symbol('timeout');
-  const outcome = await Promise.race([
-    work.then(
-      () => 'resolved' as const,
-      () => 'rejected' as const,
-    ),
-    new Promise<typeof timeout>((r) => setTimeout(() => r(timeout), ms)),
-  ]);
-  if (outcome === timeout) throw new Error(`did not settle within ${ms}ms`);
-  return outcome;
-}
+//
+// Keep every case in this file server-INDEPENDENT: its unreachable endpoints are minted per row and
+// its degraded servers are in-process, so nothing here may skip. The live half lives in
+// `live-failure-modes.test.ts`, where a whole-file skip gate can see a missing server — a file that
+// mixes the two reports a clean pass with half its cases deleted.
 
 // ---------------------------------------------------------------------------------------------
 // CLASS: startup must fail fast, never hang, on an unreachable or wrong endpoint.
@@ -57,7 +38,7 @@ async function silentEndpoint(): Promise<{ url: string; close: () => void }> {
 
 describe('redis failure modes — connect() must fail fast, never hang', () => {
   const unreachable: Array<[string, () => Promise<{ url: string; close: () => void }>]> = [
-    ['closed port', async () => ({ url: 'redis://127.0.0.1:6399', close: () => undefined })],
+    ['closed port', async () => ({ url: await freeEndpoint(), close: () => undefined })],
     ['blackholed ip', async () => ({ url: 'redis://10.255.255.1:6379', close: () => undefined })],
     [
       'unresolvable host',
@@ -87,19 +68,13 @@ describe('redis failure modes — connect() must fail fast, never hang', () => {
   });
 
   it('names the endpoint but never the password', async () => {
+    const closed = await freeEndpoint();
+    const url = closed.replace('//', '//parley:hunter2@');
     const plugin = new RedisPlugin();
-    await expect(
-      plugin.connect({
-        url: 'redis://parley:hunter2@127.0.0.1:6399',
-        connect_timeout_ms: FAST,
-      }),
-    ).rejects.toThrow(/127\.0\.0\.1:6399/);
-    await expect(
-      plugin.connect({
-        url: 'redis://parley:hunter2@127.0.0.1:6399',
-        connect_timeout_ms: FAST,
-      }),
-    ).rejects.not.toThrow(/hunter2/);
+    await expect(plugin.connect({ url, connect_timeout_ms: FAST })).rejects.toThrow(
+      new RegExp(endpointOf(closed).replace(/\./g, '\\.')),
+    );
+    await expect(plugin.connect({ url, connect_timeout_ms: FAST })).rejects.not.toThrow(/hunter2/);
     await plugin.disconnect().catch(() => undefined);
   });
 });
@@ -110,75 +85,9 @@ describe('redis failure modes — connect() must fail fast, never hang', () => {
 // an XREAD BLOCK argument, a deadline, the connection URL, the Redis key), so the matrix below is
 // knob x value — a validator written for one knob does not pass for the others — and it is
 // generated over EVERY declared key, so a knob added later without a validator fails the suite.
+//
+// No server: every row is REJECTED by validation, which runs before the connection is opened.
 // ---------------------------------------------------------------------------------------------
-
-/** Values no millisecond/day knob can mean, whatever it is wired to. */
-const NEVER_A_KNOB: Array<[string, unknown]> = [
-  ['zero', 0],
-  ['negative', -1],
-  ['NaN', Number.NaN],
-  ['Infinity', Number.POSITIVE_INFINITY],
-  ['-Infinity', Number.NEGATIVE_INFINITY],
-  ['numeric string', '7'],
-  ['boolean', true],
-  ['object', {}],
-  ['array', [7]],
-];
-
-/**
- * Values no string knob can mean. The empty string is the one that matters most: it is what an
- * unexpanded `"${REDIS_URL}"` or an empty secret yields, and node-redis reads a falsy url as
- * "unset" and connects to the unauthenticated default endpoint instead.
- */
-const NEVER_A_STRING: Array<[string, unknown]> = [
-  ['the empty string', ''],
-  ['a number', 5],
-  ['boolean', true],
-  ['object', {}],
-  ['array', ['a']],
-];
-
-/**
- * Non-empty strings that clear the emptiness check and then fail INSIDE node-redis' constructor as a
- * bare `TypeError: Invalid URL`/`Invalid protocol` naming neither the plugin, the key, nor anything
- * an operator with a typo'd scheme could grep for — and only AFTER a live connection was torn down.
- */
-const NEVER_A_REDIS_URL: Array<[string, unknown]> = [
-  ['prose', 'not a url'],
-  ['a missing colon', 'redis//127.0.0.1'],
-  ['a bare host:port', '127.0.0.1:6379'],
-  ['the wrong scheme', 'http://127.0.0.1:6379'],
-  ['a scheme node-redis does not speak', 'redis+unix:///tmp/redis.sock'],
-  ['a scheme with no host', 'redis://'],
-];
-
-const rejectedByKnob: Record<string, Array<[string, unknown]>> = {
-  url: [...NEVER_A_STRING, ...NEVER_A_REDIS_URL],
-  key_prefix: NEVER_A_STRING,
-  retention_days: [
-    ...NEVER_A_KNOB,
-    ['past the epoch', 1e9],
-    ['negative fraction', -0.5],
-  ],
-  block_ms: [
-    ...NEVER_A_KNOB,
-    ['sub-millisecond fraction', 0.5],
-    ['fraction over one', 1.5],
-    ['negative fraction', -0.5],
-    ['beyond safe integer', 2 ** 53],
-  ],
-  connect_timeout_ms: [
-    ...NEVER_A_KNOB,
-    ['sub-millisecond fraction', 0.5],
-    ['fraction over one', 1.5],
-    ['negative fraction', -0.5],
-    ['beyond safe integer', 2 ** 53],
-  ],
-};
-
-const rejectedRows = Object.entries(rejectedByKnob).flatMap(([knob, values]) =>
-  values.map(([label, value]) => [knob, label, value] as [string, string, unknown]),
-);
 
 /** Keys an operator reaches for that this backend does not declare — a typo, a case variant, junk. */
 const unknownKeys: Array<[string, string, unknown]> = [
@@ -193,7 +102,7 @@ const unknownKeys: Array<[string, string, unknown]> = [
 describe('redis failure modes — backend_config validation', () => {
   it.each(rejectedRows)('connect() rejects %s = %s, naming the key', async (knob, _label, value) => {
     const plugin = new RedisPlugin();
-    await expect(plugin.connect({ url: REDIS_URL, [knob]: value })).rejects.toThrow(
+    await expect(plugin.connect({ [knob]: value })).rejects.toThrow(
       new RegExp(`parley-redis: ${knob}`),
     );
     await plugin.disconnect().catch(() => undefined);
@@ -209,7 +118,7 @@ describe('redis failure modes — backend_config validation', () => {
     'connect() rejects %s (%s), naming the key and the accepted set',
     async (_label, key, value) => {
       const plugin = new RedisPlugin();
-      const failure = await plugin.connect({ url: REDIS_URL, [key]: value }).then(
+      const failure = await plugin.connect({ [key]: value }).then(
         () => undefined,
         (err: Error) => err,
       );
@@ -221,17 +130,50 @@ describe('redis failure modes — backend_config validation', () => {
   );
 });
 
-// The inverse half of the validation class: a value the docs call "unset" must still be accepted,
-// or the validators above have merely traded a silent misconfiguration for a config file that
-// cannot load at all. Server-dependent — connect() has to reach a real Redis to resolve.
-describe.skipIf(!redisUp)('redis failure modes — an omitted-as-null knob still connects', () => {
-  it.each(CONFIG_KEYS)('connect() accepts %s set to null', async (knob) => {
-    const plugin = new RedisPlugin();
-    try {
-      await expect(plugin.connect({ url: REDIS_URL, [knob]: null })).resolves.toBeUndefined();
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
+// ---------------------------------------------------------------------------------------------
+// CLASS: a shipped runnable config the README points operators at cannot load. This plugin rejects
+// an UNDECLARED backend_config key outright, so a knob rename turns every example into a hard
+// startup error — and a regex scan for `redis://` (which is all these files used to get) cannot see
+// it. Generated over the directory, so an example added later is pulled in instead of escaping.
+// ---------------------------------------------------------------------------------------------
+
+const EXAMPLES = new URL('../../../examples/multi-session/redis/', import.meta.url);
+const exampleFiles = readdirSync(EXAMPLES).filter((f) => /\.ya?ml$/.test(f));
+
+/** Every validator message that means "this file cannot load", as opposed to "the server is away". */
+const REJECTED_BY_VALIDATION = new RegExp(
+  `parley-redis: (?:${CONFIG_KEYS.join('|')}) must|unknown backend_config key`,
+);
+
+const backendConfigOf = (file: string): Record<string, unknown> =>
+  loadConfig(fileURLToPath(new URL(file, EXAMPLES))).backend_config;
+
+describe('bridge-redis shipped example configs — every one still loads', () => {
+  it('ships at least one example, so the rows below are not vacuous', () => {
+    expect(exampleFiles).not.toEqual([]);
+  });
+
+  it.each(exampleFiles)('%s loads and declares only keys this backend accepts', (file) => {
+    const declared = Object.keys(backendConfigOf(file));
+    expect(declared, `${file} sets no backend_config key, so this row cannot fail`).not.toEqual([]);
+    for (const key of declared) {
+      expect(CONFIG_KEYS as readonly string[], `${file} sets '${key}'`).toContain(key);
     }
+  });
+
+  // The keys being declared is not enough: every VALUE has to survive the normalizers too. A value
+  // that does not is rejected before any connection is attempted, so this needs no server — the
+  // shipped examples point at `redis.internal`, which is unreachable from here by design.
+  it.each(exampleFiles)('%s carries values the validators accept', async (file) => {
+    const plugin = new RedisPlugin();
+    const failure = await plugin
+      .connect({ ...backendConfigOf(file), connect_timeout_ms: FAST })
+      .then(
+        () => undefined,
+        (err: Error) => err,
+      );
+    expect(failure?.message ?? '', `${file} cannot load`).not.toMatch(REJECTED_BY_VALIDATION);
+    await plugin.disconnect().catch(() => undefined);
   });
 });
 
@@ -386,784 +328,3 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
     }
   });
 });
-
-function endpointOf(url: string): string {
-  const u = new URL(url);
-  return `${u.hostname}:${u.port}`;
-}
-
-describe.skipIf(!redisUp)('redis failure modes — retention_days keeps history when unset', () => {
-  const accepted: Array<[string, number | null | undefined]> = [
-    ['omitted', undefined],
-    ['null (DESIGN §11 "unset")', null],
-    ['a real window', 7],
-  ];
-
-  it.each(accepted)('%s keeps every posted message', async (_label, value) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix, retention_days: value });
-    const t = freshTopic();
-    try {
-      for (let i = 0; i < 40; i++) await plugin.post(t, asHandle('w'), `m${i}`);
-      await new Promise((r) => setTimeout(r, 250)); // any wall-clock-threshold trim would bite here
-      for (let i = 40; i < 45; i++) await plugin.post(t, asHandle('w'), `m${i}`);
-      const page = await plugin.fetchRecent({ topic: t, limit: 10_000 });
-      expect(page.messages).toHaveLength(45);
-      expect(page.messages[0]?.content).toBe('m0');
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-});
-
-// -------------------------------------------------------------------------------------------
-// The inverse half of the knob class, and the half that actually catches a silent no-op: a value
-// connect() ACCEPTS must leave every seam path working. Rejecting bad values is not enough — a knob
-// that merely fails to be rejected can still make EVERY write fail behind a connect() that resolved,
-// or disable live push, with nothing to see at load time.
-//
-// GENERATED per knob, not hand-picked: `retention_days` reaches XADD as `days * 86_400_000`, so
-// whether a value works depends on its BINARY REPRESENTATION rather than its magnitude, and a fixed
-// row can only ever sample the values that happen to land on a whole millisecond. One wide row per
-// knob, so a failure names the offending value instead of hiding among green siblings.
-// -------------------------------------------------------------------------------------------
-
-/** Deterministic LCG, so a value that breaks the seam is reproducible on a re-run, not once in 50. */
-function seeded(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    return state / 0x1_0000_0000;
-  };
-}
-
-/** Retention windows the validator accepts: small rationals (rarely whole ms) plus random floats. */
-function retentionWindows(): number[] {
-  const out: number[] = [0.5, 7, 30];
-  for (let denom = 2; denom <= 13; denom++) {
-    for (const numer of [1, denom + 1, 30]) out.push(numer / denom);
-  }
-  const rnd = seeded(0x5eed);
-  for (let i = 0; i < 40; i++) out.push(0.001 + rnd() * 60);
-  return out;
-}
-
-/** Whole-millisecond budgets in [lo, hi) — the only shape either millisecond knob accepts. */
-function millisBudgets(seed: number, lo: number, hi: number): number[] {
-  const rnd = seeded(seed);
-  return Array.from({ length: 20 }, () => lo + Math.floor(rnd() * (hi - lo)));
-}
-
-/**
- * Values `connect()` accepts, per declared knob. Driven from CONFIG_KEYS below, so a knob added later
- * with no accepted-value set fails here instead of shipping a value nobody ever round-tripped.
- * `connect_timeout_ms` starts at 500, so that a budget shorter than a real handshake — a LOUD
- * rejection the operator asked for, not the silent breakage this class is about — stays out.
- */
-const acceptedByKnob: Record<string, unknown[]> = {
-  url: [REDIS_URL],
-  key_prefix: ['plain:', 'no-trailing-colon', 'with spaces:', 'unicode-\u00fc:', 'glob*chars?:'].map(
-    (flavour) => `${freshPrefix()}${flavour}`,
-  ),
-  retention_days: [null, ...retentionWindows()],
-  block_ms: [1, 2000, 120_000, ...millisBudgets(0xb10c, 1, 600_000)],
-  connect_timeout_ms: [5000, ...millisBudgets(0xc0de, 500, 30_000)],
-};
-
-/** Render a config value for a failure line; `JSON.stringify` alone turns NaN into `null`. */
-function label(value: unknown): string {
-  return typeof value === 'number' ? String(value) : JSON.stringify(value) ?? String(value);
-}
-
-describe.skipIf(!redisUp)('redis failure modes — an accepted config still delivers', () => {
-  it.each(CONFIG_KEYS)('every accepted %s round-trips post → fetchRecent', async (knob) => {
-    const values = acceptedByKnob[knob] ?? [];
-    expect(values.length, `no accepted values are declared for '${knob}'`).toBeGreaterThan(0);
-    const plugin = new RedisPlugin();
-    const prefixes = new Set<string>();
-    const broken: string[] = [];
-    try {
-      for (const value of values) {
-        const config: Record<string, unknown> = {
-          url: REDIS_URL,
-          key_prefix: freshPrefix(),
-          [knob]: value,
-        };
-        prefixes.add(String(config.key_prefix));
-        const t = freshTopic();
-        const failure = await (async () => {
-          await plugin.connect(config);
-          const id = await plugin.post(t, asHandle('w'), 'round-trip');
-          const page = await plugin.fetchRecent({ topic: t, limit: 10 });
-          if (page.messages.map((m) => m.backendMsgId).join() !== id) {
-            throw new Error(`fetchRecent returned ${JSON.stringify(page.messages)}`);
-          }
-        })().then(
-          () => undefined,
-          (err: Error) => err,
-        );
-        if (failure !== undefined) broken.push(`${label(value)} → ${failure.message}`);
-      }
-      expect(broken, `connect() accepted these ${knob} values and then broke the seam`).toEqual([]);
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
-      for (const prefix of prefixes) await wipe(prefix);
-    }
-  });
-
-  // The one path the round-trip above cannot see: a knob accepted at connect() that then silently
-  // kills LIVE push. `30 / 7` is deliberate — a window that is not a whole number of milliseconds.
-  it('live push still works with every knob set at once', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({
-      url: REDIS_URL,
-      key_prefix: prefix,
-      block_ms: 250,
-      connect_timeout_ms: 3000,
-      retention_days: 30 / 7,
-    });
-    const t = freshTopic();
-    const live: string[] = [];
-    try {
-      await plugin.subscribe(t, (m) => live.push(m.content));
-      const id = await plugin.post(t, asHandle('w'), 'pushed');
-      await expect.poll(() => live, { timeout: 5000, interval: 50 }).toEqual(['pushed']);
-      const page = await plugin.fetchRecent({ topic: t, limit: 10 });
-      expect(page.messages.map((m) => m.backendMsgId)).toEqual([id]);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-});
-
-// The teardown-ordering half of the same class: connect() validates its WHOLE config before it tears
-// the previous connection down, so a value an operator got wrong can never leave a live bridge with
-// no client and every later seam call answering "not connected". Driven over every rejection row of
-// every knob, because the ordering is a property of connect() rather than of any one knob.
-
-describe.skipIf(!redisUp)(
-  'redis failure modes — a rejected connect() must not destroy a live one',
-  () => {
-    it.each(CONFIG_KEYS)('every rejected %s leaves the live connection usable', async (knob) => {
-      const rows = rejectedByKnob[knob] ?? [];
-      expect(rows.length, `no rejection rows are declared for '${knob}'`).toBeGreaterThan(0);
-      const prefix = freshPrefix();
-      const plugin = new RedisPlugin();
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-      const t = freshTopic();
-      const destroyed: string[] = [];
-      try {
-        await plugin.post(t, asHandle('w'), 'before');
-        for (const [rowLabel, value] of rows) {
-          const rejection = await plugin
-            .connect({ url: REDIS_URL, key_prefix: prefix, [knob]: value })
-            .then(
-              () => undefined,
-              (err: Error) => err,
-            );
-          if (rejection === undefined) {
-            destroyed.push(`${rowLabel}: accepted, so this row proves nothing`);
-            continue;
-          }
-          const survived = await plugin.post(t, asHandle('w'), rowLabel).then(
-            () => true,
-            () => false,
-          );
-          if (!survived) destroyed.push(`${rowLabel}: ${rejection.message}`);
-        }
-        expect(
-          destroyed,
-          `a rejected ${knob} tore the live connection down before finishing validation`,
-        ).toEqual([]);
-        const page = await plugin.fetchRecent({ topic: t, limit: 1000 });
-        expect(page.messages.map((m) => m.content)).toContain('before');
-      } finally {
-        await plugin.disconnect().catch(() => undefined);
-        await wipe(prefix);
-      }
-    });
-  },
-);
-
-// -------------------------------------------------------------------------------------------
-// CLASS: a record this plugin did not write still has to normalize into a valid Message. Streams
-// are shared across sessions, plugin versions and anyone holding a redis-cli, so `sender`/`ts`
-// are not guaranteed to be there — and DESIGN §5 promises an ISO timestamp and a sender either way.
-// -------------------------------------------------------------------------------------------
-
-describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign writer', () => {
-  // Every row declares the timestamp it must DERIVE, not merely that one parses: an assertion of the
-  // form `!Number.isNaN(Date.parse(ts))` is satisfied by any constant, so replacing the derivation
-  // with `new Date(0)` would report 1970 for every message and the suite would certify it.
-  // `from-id` = the stream id's own millisecond component; `passthrough` = the entry's `ts` verbatim.
-  type Derivation = 'from-id' | 'passthrough';
-  const foreignEntries: Array<[string, Record<string, string>, Derivation]> = [
-    ['no recognised field at all', { unrelated: '1' }, 'from-id'],
-    ['content only (a human via redis-cli)', { content: 'hi from redis-cli' }, 'from-id'],
-    ['sender only', { sender: 'alice' }, 'from-id'],
-    ['an empty sender', { sender: '', content: 'anon' }, 'from-id'],
-    // One row per DERIVATION, not one per unusable spelling: an empty `ts`, `not-a-date` and a bare
-    // epoch number all take the same fallback, so extra spellings cannot fail for their own reason.
-    ['a ts that is not a date', { sender: 'alice', content: 'hi', ts: 'not-a-date' }, 'from-id'],
-    ['a ts of its own', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09.000Z' }, 'passthrough'],
-    ['extra unknown fields', { sender: 'alice', content: 'hi', shape: 'm.text', edited: '1' }, 'from-id'],
-    ['binary-ish content', { sender: 'alice', content: '\u00ff\u00fe\u0001bin' }, 'from-id'],
-  ];
-
-  it.each(foreignEntries)('normalizes an entry with %s', async (_label, fields, derivation) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      await writer.connect();
-      const id = await writer.xAdd(`${prefix}${t}`, '*', fields);
-      const page = await plugin.fetchRecent({ topic: t, limit: 10 });
-      const [m] = page.messages;
-      expect(m, 'the foreign entry did not come back at all').toBeDefined();
-      expect(m?.topic).toBe(t);
-      expect(m?.backendMsgId).toBe(id);
-      expect(m?.cursor).toBe(id);
-      expect(m?.content).toBe(fields.content ?? '');
-      expect(m?.senderHandle, 'an empty handle collides with every other empty handle').not.toBe('');
-      const expected =
-        derivation === 'passthrough' ? fields.ts : new Date(Number(id.split('-')[0])).toISOString();
-      expect(m?.timestamp, `timestamp is not derived ${derivation}`).toBe(expected);
-      expect(
-        Number.isNaN(Date.parse(m?.timestamp ?? '')),
-        `timestamp ${JSON.stringify(m?.timestamp)} is not ISO 8601 (DESIGN §5)`,
-      ).toBe(false);
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-
-  // The inverse half: an entry this plugin wrote must report the wall-clock time of the post. Only a
-  // bracketed window can say so — every other assertion on Message.timestamp here and in the shared
-  // conformance suite tests parseability, which any constant satisfies.
-  it('reports the wall-clock time of a post it made itself', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      const before = Date.now();
-      await plugin.post(t, asHandle('w'), 'now');
-      const after = Date.now();
-      const [m] = (await plugin.fetchRecent({ topic: t, limit: 10 })).messages;
-      const at = Date.parse(m?.timestamp ?? '');
-      expect(
-        at,
-        `timestamp ${JSON.stringify(m?.timestamp)} is outside the window the post ran in`,
-      ).toBeGreaterThanOrEqual(before - 1000);
-      expect(at).toBeLessThanOrEqual(after + 1000);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-
-  it('normalizes a foreign entry arriving over the LIVE path too', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    const live: Array<{ senderHandle: string; timestamp: string }> = [];
-    try {
-      await writer.connect();
-      await plugin.subscribe(t, (m) => live.push(m));
-      await writer.xAdd(`${prefix}${t}`, '*', { content: 'from redis-cli' });
-      await expect.poll(() => live.length, { timeout: 5000, interval: 50 }).toBe(1);
-      expect(live[0]?.senderHandle).not.toBe('');
-      expect(Number.isNaN(Date.parse(live[0]?.timestamp ?? ''))).toBe(false);
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-});
-
-// -------------------------------------------------------------------------------------------
-// CLASS: a cursor's PROVENANCE decides the outcome — mine works, foreign throws labelled,
-// beyond-high-water self-heals. The wedge invariant below catches the whole class at once.
-// -------------------------------------------------------------------------------------------
-
-describe.skipIf(!redisUp)('redis failure modes — cursor provenance', () => {
-  const foreign = [
-    ['a matrix-style token', 's123_456'],
-    ['a plain word', 'abc'],
-    ['the empty string', ''],
-    ['the XREAD tail sigil', '$'],
-    ['a three-part id', '0-0-0'],
-    ['a non-numeric sequence', '12-a'],
-    ['a negative id', '-1'],
-    ['a float', '12.5'],
-    ['an id with whitespace', ' 12-0'],
-    // All-digit, so the syntax check alone passes them — but each component of a stream id is a
-    // uint64, so these reach XRANGE as a bare `ERR Invalid stream ID` naming neither plugin nor topic.
-    ['a 64-bit overflow in the ms component', '99999999999999999999'],
-    ['exactly 2^64 in the ms component', '18446744073709551616-0'],
-    ['a 64-bit overflow in the sequence', '1-99999999999999999999'],
-    ['both components overflowing', '18446744073709551616-18446744073709551616'],
-  ] as const;
-
-  it.each(foreign)('throws a labelled error for %s', async (_label, since) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      await plugin.post(t, asHandle('w'), 'one');
-      await expect(
-        plugin.fetchRecent({ topic: t, since: since as unknown as Cursor }),
-      ).rejects.toThrow(new RegExp(`parley-redis: malformed cursor .* for topic ${t}`));
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-
-  const stale: Array<[string, () => string]> = [
-    ['an hour past the high-water mark', () => `${Date.now() + 3_600_000}-0`],
-    ['a day past it', () => `${Date.now() + 86_400_000}-5`],
-    ['a bare-ms id past it', () => `${Date.now() + 3_600_000}`],
-    // The inverse of the overflow rows above: 2^64-1 is the largest id Redis can mint, so the
-    // range check must heal it like any other future cursor rather than reject it as malformed.
-    ['the largest id a stream can ever mint', () => '18446744073709551615-0'],
-  ];
-
-  it.each(stale)('self-heals a cursor %s instead of wedging', async (_label, mint) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      await plugin.post(t, asHandle('w'), 'one');
-      await plugin.post(t, asHandle('w'), 'two');
-      const since = mint() as Cursor;
-
-      const page = await plugin.fetchRecent({ topic: t, since });
-      // The invariant that catches the whole wedge class: a non-empty topic must never answer a
-      // catch-up with BOTH an empty page and the same cursor back — that pair is a dead end.
-      expect(page.messages.length > 0 || page.nextCursor !== since).toBe(true);
-      expect(page.messages.map((m) => m.content)).toEqual(['one', 'two']);
-      expect(page.nextCursor).not.toBe(since);
-
-      // …and the healed cursor is live: it advances over the next post.
-      await plugin.post(t, asHandle('w'), 'three');
-      const next = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
-      expect(next.messages.map((m) => m.content)).toEqual(['three']);
-
-      // A stale cursor must not burn a long-poll budget waiting for entries that can never come.
-      const started = Date.now();
-      const blocked = await plugin.fetchRecent({ topic: t, since, blockMs: 3000 });
-      expect(Date.now() - started).toBeLessThan(1500);
-      expect(blocked.messages.length).toBeGreaterThan(0);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-
-  it('a cursor this backend minted still works, and the tail still returns a stable page', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      await plugin.post(t, asHandle('w'), 'one');
-      const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
-      await plugin.post(t, asHandle('w'), 'two');
-      const after = await plugin.fetchRecent({ topic: t, since: tail });
-      expect(after.messages.map((m) => m.content)).toEqual(['two']);
-      // At the tail: empty page, cursor unchanged — the ONE case where echoing `since` is right.
-      const drained = await plugin.fetchRecent({ topic: t, since: after.nextCursor });
-      expect(drained.messages).toEqual([]);
-      expect(drained.nextCursor).toBe(after.nextCursor);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
-});
-
-// -------------------------------------------------------------------------------------------
-// CLASS: a backend refusal escapes the seam as a bare RESP line naming neither the plugin, the
-// topic nor the key. The key namespace is shared with whatever else uses this Redis, so a prefix
-// collision is the ordinary way to reach it: an operator whose bridge will not start gets
-// `WRONGTYPE Operation against a key holding the wrong kind of value` and nothing to trace it by.
-// -------------------------------------------------------------------------------------------
-
-describe.skipIf(!redisUp)('redis failure modes — every seam call labels a backend refusal', () => {
-  const calls: Array<[string, (p: RedisPlugin, t: Topic) => Promise<unknown>]> = [
-    ['post', (p, t) => p.post(t, asHandle('w'), 'x')],
-    ['fetchRecent', (p, t) => p.fetchRecent({ topic: t })],
-    ['fetchRecent since', (p, t) => p.fetchRecent({ topic: t, since: asCursorish('1-0') })],
-    [
-      'fetchRecent blocking',
-      (p, t) => p.fetchRecent({ topic: t, since: asCursorish('1-0'), blockMs: 500 }),
-    ],
-    ['subscribe', (p, t) => p.subscribe(t, () => undefined)],
-  ];
-
-  it.each(calls)('%s names the plugin, the topic and the key', async (_label, call) => {
-    const prefix = freshPrefix();
-    const t = freshTopic();
-    const squatter = createRedisClient(REDIS_URL, FAST);
-    const plugin = new RedisPlugin();
-    try {
-      await squatter.connect();
-      // A plain string where the stream would live — what a prefix shared with another app looks like.
-      await squatter.set(`${prefix}${t}`, 'owned by another application');
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-      const failure = await call(plugin, t).then(
-        () => undefined,
-        (err: Error) => err,
-      );
-      expect(failure, 'a repurposed key was not reported at all').toBeInstanceOf(Error);
-      expect(failure?.message).toMatch(/^parley-redis:/);
-      expect(failure?.message, 'the operator cannot tell WHICH topic failed').toContain(t);
-      expect(failure?.message, 'the operator cannot tell which Redis key failed').toContain(
-        `${prefix}${t}`,
-      );
-      expect(failure?.message).toContain('WRONGTYPE');
-    } finally {
-      await squatter.disconnect().catch(() => undefined);
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    }
-  });
-});
-
-// -------------------------------------------------------------------------------------------
-// CLASS: a message that lands in the gap between the catch-up query and the moment the waiter is
-// armed is lost. The conformance long-poll case posts well after the fetch has registered, so it
-// can never discriminate; every row here starts the post WITHOUT awaiting the fetch, so the write
-// lands while the reader is still opening its connection — the arm-after-the-re-query defect.
-// -------------------------------------------------------------------------------------------
-
-describe.skipIf(!redisUp)('redis failure modes — the long-poll query-to-wait gap', () => {
-  // Only delays SHORTER than a reader handshake belong here. A longer one lands after the waiter
-  // has registered, where the shipped conformance long-poll case already pins delivery, so it would
-  // pass against the very defect this block exists to catch.
-  it.each([0, 1, 2, 3])(
-    'delivers a post issued %ims into the long-poll',
-    async (delayMs) => {
-      const prefix = freshPrefix();
-      const plugin = new RedisPlugin();
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 500 });
-      const t = freshTopic();
-      try {
-        await plugin.post(t, asHandle('w'), 'seed');
-        const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
-
-        const waiting = plugin.fetchRecent({ topic: t, since, blockMs: 5000 });
-        const posted = new Promise<void>((r) => setTimeout(r, delayMs)).then(() =>
-          plugin.post(t, asHandle('w'), 'fresh'),
-        );
-
-        const page = await waiting;
-        await posted;
-        expect(
-          page.messages.map((m) => m.content),
-          'the post landed in the query-to-wait gap and was never delivered',
-        ).toEqual(['fresh']);
-        expect(page.nextCursor).not.toBe(since);
-
-        // …and the returned cursor is the one the next catch-up must resume from: re-fetching with
-        // it returns nothing, so no message was skipped over on the way to it either.
-        const after = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
-        expect(after.messages).toEqual([]);
-      } finally {
-        await plugin.disconnect();
-        await wipe(prefix);
-      }
-    },
-  );
-});
-
-// -------------------------------------------------------------------------------------------
-// CLASS: every seam call must SETTLE within a bounded deadline while the backend is down, and
-// the plugin must recover when it comes back.
-// -------------------------------------------------------------------------------------------
-
-describe.skipIf(!redisUp)('redis failure modes — backend down mid-session', () => {
-  it.each([
-    ['post', (p: RedisPlugin, t: Topic) => p.post(t, asHandle('w'), 'during')],
-    ['fetchRecent', (p: RedisPlugin, t: Topic) => p.fetchRecent({ topic: t })],
-    [
-      'fetchRecent since',
-      (p: RedisPlugin, t: Topic) => p.fetchRecent({ topic: t, since: asCursorish('1-0') }),
-    ],
-    [
-      'fetchRecent blocking',
-      (p: RedisPlugin, t: Topic) =>
-        p.fetchRecent({ topic: t, since: asCursorish('1-0'), blockMs: 5000 }),
-    ],
-    ['resolveIdentity', (p: RedisPlugin) => p.resolveIdentity(asHandle('w'))],
-    ['subscribe', (p: RedisPlugin, t: Topic) => p.subscribe(t, () => undefined)],
-  ] as Array<[string, (p: RedisPlugin, t: Topic) => Promise<unknown>]>)(
-    '%s settles instead of queueing for the whole outage',
-    async (_label, call) => {
-      const proxy = await startProxy();
-      const prefix = freshPrefix();
-      const plugin = new RedisPlugin();
-      await plugin.connect({ url: proxy.url, key_prefix: prefix, connect_timeout_ms: FAST });
-      const t = freshTopic();
-      try {
-        await plugin.post(t, asHandle('w'), 'before');
-        proxy.kill();
-        await settledOutage(plugin, t);
-        // Generous vs. the 5s blocking budget above, brutal vs. "queued for the whole outage".
-        await expect(settlesWithin(call(plugin, t), 3000)).resolves.toMatch(
-          /resolved|rejected/,
-        );
-      } finally {
-        await plugin.disconnect().catch(() => undefined);
-        proxy.close();
-        await wipe(prefix);
-      }
-    },
-  );
-
-  it('recovers once the backend comes back', async () => {
-    const proxy = await startProxy();
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: proxy.url, key_prefix: prefix, connect_timeout_ms: FAST });
-    const t = freshTopic();
-    try {
-      await plugin.post(t, asHandle('w'), 'before');
-      proxy.kill();
-      await settledOutage(plugin, t);
-      await expect(settlesWithin(plugin.post(t, asHandle('w'), 'during'), 3000)).resolves.toBe(
-        'rejected',
-      );
-      await proxy.revive();
-      await expect
-        .poll(
-          async () => {
-            try {
-              await plugin.post(t, asHandle('w'), 'after');
-              return true;
-            } catch {
-              return false;
-            }
-          },
-          { timeout: 10_000, interval: 200 },
-        )
-        .toBe(true);
-      const page = await plugin.fetchRecent({ topic: t, limit: 100 });
-      expect(page.messages.map((m) => m.content)).toContain('after');
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
-      proxy.close();
-      await wipe(prefix);
-    }
-  });
-});
-
-// -------------------------------------------------------------------------------------------
-// CLASS: repeated lifecycle calls must not leak backend resources. Counted on the proxy, which
-// is an EXTERNAL observation of live sockets — the in-process `readers` array stays clean even
-// when connections are orphaned.
-// -------------------------------------------------------------------------------------------
-
-describe.skipIf(!redisUp)('redis failure modes — lifecycle must not leak connections', () => {
-  const sequences: Array<[string, (p: RedisPlugin, url: string, t: Topic) => Promise<void>]> = [
-    [
-      'connect·connect·disconnect',
-      async (p, url) => {
-        await p.connect({ url });
-        await p.connect({ url });
-        await p.disconnect();
-      },
-    ],
-    [
-      'connect·subscribe·connect·disconnect',
-      async (p, url, t) => {
-        await p.connect({ url });
-        await p.subscribe(t, () => undefined);
-        await p.connect({ url });
-        await p.disconnect();
-      },
-    ],
-    [
-      'connect·disconnect·disconnect',
-      async (p, url) => {
-        await p.connect({ url });
-        await p.disconnect();
-        await p.disconnect();
-      },
-    ],
-    [
-      'connect·subscribe·disconnect·connect·subscribe·disconnect',
-      async (p, url, t) => {
-        await p.connect({ url });
-        await p.subscribe(t, () => undefined);
-        await p.disconnect();
-        await p.connect({ url });
-        await p.subscribe(t, () => undefined);
-        await p.disconnect();
-      },
-    ],
-    [
-      'connect·fetchRecent(blocking)·connect·disconnect',
-      async (p, url, t) => {
-        await p.connect({ url, block_ms: 200 });
-        await p.fetchRecent({ topic: t, since: asCursorish('1-0'), blockMs: 200 });
-        await p.connect({ url });
-        await p.disconnect();
-      },
-    ],
-  ];
-
-  // OVERLAPPING lifecycle calls, which every sequence above misses by construction: each one reads
-  // plugin state before the other has written it, so a client can end up referenced by nothing and
-  // closeable by nobody. The final disconnect() is the assertion point — after it, zero sockets.
-  const overlapping: Array<[string, (p: RedisPlugin, url: string, t: Topic) => Promise<void>]> = [
-    [
-      'connect ∥ connect',
-      async (p, url) => {
-        await Promise.allSettled([p.connect({ url }), p.connect({ url })]);
-      },
-    ],
-    [
-      'connect ∥ connect ∥ connect',
-      async (p, url) => {
-        await Promise.allSettled([p.connect({ url }), p.connect({ url }), p.connect({ url })]);
-      },
-    ],
-    [
-      'connect ∥ disconnect',
-      async (p, url) => {
-        await Promise.allSettled([p.connect({ url }), p.disconnect()]);
-      },
-    ],
-    [
-      'connect ∥ subscribe',
-      async (p, url, t) => {
-        await Promise.allSettled([p.connect({ url }), p.subscribe(t, () => undefined)]);
-      },
-    ],
-    [
-      'connect·(disconnect ∥ subscribe)',
-      async (p, url, t) => {
-        await p.connect({ url });
-        await Promise.allSettled([p.disconnect(), p.subscribe(t, () => undefined)]);
-      },
-    ],
-    [
-      'connect·(connect ∥ fetchRecent(blocking))',
-      async (p, url, t) => {
-        await p.connect({ url, block_ms: 200 });
-        await Promise.allSettled([
-          p.connect({ url }),
-          p.fetchRecent({ topic: t, since: asCursorish('1-0'), blockMs: 500 }),
-        ]);
-      },
-    ],
-  ];
-
-  it.each([...sequences, ...overlapping])('%s returns every socket', async (_label, run) => {
-    const proxy = await startProxy();
-    const plugin = new RedisPlugin();
-    const t = freshTopic();
-    try {
-      await run(plugin, proxy.url, t);
-      await plugin.disconnect();
-      await expect.poll(() => proxy.live(), { timeout: 5000, interval: 50 }).toBe(0);
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
-      proxy.close();
-    }
-  });
-});
-
-function asCursorish(s: string): Cursor {
-  return s as unknown as Cursor;
-}
-
-/**
- * Wait out the socket-close error and the first reconnect attempts, so the measured call is issued
- * into a client that has SETTLED into "disconnected" — the state where an offline queue swallows
- * commands for the whole outage. Only the commands in flight when the socket dies are rejected by
- * the close itself, so measuring the very first call after a kill proves nothing.
- */
-async function settledOutage(plugin: RedisPlugin, topic: Topic): Promise<void> {
-  await settlesWithin(plugin.post(topic, asHandle('w'), 'flush').catch(() => undefined), 3000);
-  await new Promise((r) => setTimeout(r, 300));
-}
-
-interface Proxy {
-  url: string;
-  /** Live client sockets currently proxied — the externally observable resource count. */
-  live: () => number;
-  /** Drop the endpoint the way a crashed server does: stop listening, destroy every socket. */
-  kill: () => void;
-  revive: () => Promise<void>;
-  close: () => void;
-}
-
-/**
- * A TCP pass-through in front of the real Redis, so an outage can be simulated per test WITHOUT
- * shutting down a server other suites (and other agents) are using.
- */
-async function startProxy(): Promise<Proxy> {
-  const target = new URL(REDIS_URL);
-  const host = target.hostname;
-  const port = target.port === '' ? 6379 : Number(target.port);
-  const sockets = new Set<net.Socket>();
-  let server: net.Server;
-  let listenPort = 0;
-
-  const build = (): net.Server =>
-    net.createServer((client) => {
-      const upstream = net.connect(port, host);
-      sockets.add(client);
-      const teardown = (): void => {
-        sockets.delete(client);
-        client.destroy();
-        upstream.destroy();
-      };
-      client.on('error', teardown).on('close', teardown);
-      upstream.on('error', teardown).on('close', teardown);
-      client.pipe(upstream);
-      upstream.pipe(client);
-    });
-
-  server = build();
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  listenPort = (server.address() as net.AddressInfo).port;
-
-  const killSockets = (): void => {
-    for (const s of sockets) s.destroy();
-    sockets.clear();
-  };
-
-  return {
-    url: `redis://127.0.0.1:${listenPort}`,
-    live: () => sockets.size,
-    kill: () => {
-      server.close();
-      killSockets();
-    },
-    revive: async () => {
-      server = build();
-      await new Promise<void>((r) => server.listen(listenPort, '127.0.0.1', r));
-    },
-    close: () => {
-      server.close();
-      killSockets();
-    },
-  };
-}
