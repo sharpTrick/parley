@@ -327,7 +327,7 @@ export class NatsPlugin implements BackendPlugin {
     args: FetchRecentArgs,
     deadline: number,
   ): Promise<StreamInfo | undefined> {
-    const blocking = (args.blockMs ?? 0) > 0 && args.since !== undefined;
+    const blocking = (args.blockMs ?? 0) > 0;
     for (;;) {
       const info = await this.existingStream(args.topic);
       if (info !== undefined) return info;
@@ -395,7 +395,7 @@ export class NatsPlugin implements BackendPlugin {
       since === undefined || restarted ? this.cursorAt(stream, lastSeq) : (args.since as Cursor);
     const blockMs = args.blockMs ?? 0;
     const waitOrNothing = async (startSeq: number): Promise<FetchRecentResult> =>
-      blockMs > 0 && args.since !== undefined
+      blockMs > 0
         ? this.blockingFetch(stream, args.topic, startSeq, limit, deadline, emptyCursor)
         : { messages: [], nextCursor: emptyCursor };
 

@@ -147,13 +147,13 @@ describe('only a write provisions, and never into a world-joinable room', () => 
   }, 20_000);
 
   /**
-   * CLASS: `blockMs` engages only where the seam says it does — "relative to a `since`; with no
-   * `since` the default recent window returns at once". A since-less read that honoured the budget
-   * would pin an MCP tool call for the whole of `catchup.block_max_ms` (60s in production) on a
-   * topic the model pattern-matched out of untrusted context.
+   * CLASS: `blockMs` engages on an EMPTY window, with or without a `since` — so a topic with no room
+   * yet blocks either way, and the budget is the only thing that bounds it. Whatever the answer, a
+   * READ must never provision: the `createRoomBodies` assertion is what keeps a topic the model
+   * pattern-matched out of untrusted context from minting a room on someone's homeserver.
    */
   it.each([
-    { name: 'no since', since: undefined, blocks: false },
+    { name: 'no since', since: undefined, blocks: true },
     { name: 'a since', since: asCursor(''), blocks: true },
   ])('a never-posted topic with blockMs and $name: blocks = $blocks', async ({ since, blocks }) => {
     fake.aliasExists = false;

@@ -462,13 +462,12 @@ export class MatrixPlugin implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const generation = this.generation;
     const deadline = Date.now() + (args.blockMs ?? 0);
-    // The seam engages `blockMs` only relative to a `since`; a since-less read is the default recent
-    // window and returns at once, so it must not spend the budget waiting for a room to be
-    // provisioned.
+    // Park for the room only when the answer would otherwise be an EMPTY page: the seam blocks on an
+    // empty window, not on provisioning, so a topic whose room already exists must not spend the
+    // budget re-resolving it.
     const roomId =
-      args.since === undefined
-        ? await this.existingRoom(args.topic, generation)
-        : await this.roomForRead(args.topic, deadline, generation);
+      (await this.existingRoom(args.topic, generation)) ??
+      ((args.blockMs ?? 0) > 0 ? await this.roomForRead(args.topic, deadline, generation) : undefined);
     const limit = args.limit ?? 100;
     // A topic nobody has posted to has no room yet, and a read never provisions one. An empty page
     // with a replayable cursor is the seam's answer: the `@parley-stream:` form with no token drains

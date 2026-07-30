@@ -58,9 +58,10 @@ export interface FetchRecentArgs {
    * whatever arrived (possibly an empty page). It is only a hint: a plugin that ignores it (or
    * returns early/empty) is still correct — core's generic long-poll wrapper polls the remaining
    * budget on the MCP `fetch_recent` path, so every backend blocks with or without native support.
-   * Omit / `0` = return immediately (the durable catch-up semantics). Blocking only engages
-   * relative to a `since`; with no `since` the default recent window returns at once. The value
-   * is capped server-side before it reaches a plugin.
+   * Omit / `0` = return immediately (the durable catch-up semantics). Blocking engages whenever the
+   * queried window comes back EMPTY, with or without a `since`: a since-less read of a topic that
+   * already has messages returns them at once, but on an empty topic it waits out the budget like
+   * any other. The value is capped server-side before it reaches a plugin.
    */
   blockMs?: number;
 }
