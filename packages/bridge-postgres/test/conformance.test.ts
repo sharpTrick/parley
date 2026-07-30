@@ -2,7 +2,6 @@ import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
-import { MAX_TABLE_NAME_BYTES } from '../src/schema.js';
 import { dropTable, isUp, PG_URL, rand } from './pg-harness.js';
 
 let seq = 0;
@@ -52,16 +51,11 @@ async function makeContext(table: string) {
 }
 
 if (await isUp(PG_URL)) {
-  // Every relation this plugin creates is derived from `table_name` by suffixing, and PostgreSQL
-  // truncates identifiers at 63 bytes — so the longest accepted name is run end to end, not just a
-  // comfortably short one.
-  const longTable = `parley_test_${rand()}`.padEnd(MAX_TABLE_NAME_BYTES, 'x');
-  for (const [label, table] of [
-    ['short table_name', `parley_test_${rand()}`],
-    [`${MAX_TABLE_NAME_BYTES}-byte table_name`, longTable],
-  ] as const) {
-    runConformanceSuite(`postgres (${label})`, () => makeContext(table));
-  }
+  // One representative context. `table_name` reaches the server only during bootstrap — past
+  // `connect()` every seam method behaves identically whatever the stem was — so the accepted-name
+  // shapes are driven end to end once each in table-name.test.ts rather than by re-running all of
+  // this against a second stem.
+  runConformanceSuite('postgres', () => makeContext(`parley_test_${rand()}`));
 } else {
   describe.skip(`seam conformance: postgres (no server at ${PG_URL})`, () => {
     it('skipped — start postgres (examples/dev-compose) to run', () => undefined);

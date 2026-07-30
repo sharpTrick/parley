@@ -23,7 +23,10 @@ of their own and `resolveIdentity` returns that instead of echoing the handle.
 
 The NOTIFY payload (the new `seq`) is a **hint only** — payloads are size-limited and delivery is
 best-effort across reconnects, so subscribers always re-query from their last-seen cursor. A
-coalesced or dropped notification costs latency, never a message. The channel name is
+coalesced or dropped notification costs latency, never a message. NOTIFY is edge-triggered, so a
+drain that *fails* (a killed backend, a `statement_timeout`, a pooler hiccup) is retried on a
+doubling backoff rather than waiting for the next write to the topic: nothing is skipped, and a
+quiet topic converges without needing a doorbell that may never ring again. The channel name is
 `'parley_' || md5(convert_to(topic, 'UTF8'))`: fixed length, so any topic string stays under
 PostgreSQL's 63-byte identifier limit with no injection surface. The `convert_to` cast is
 load-bearing and not decorative — Node hashes UTF-8 bytes, so the trigger must too, or on a

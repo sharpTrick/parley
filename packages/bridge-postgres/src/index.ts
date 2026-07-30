@@ -56,8 +56,10 @@ const DEFAULT_URL = 'postgres://parley:parley@127.0.0.1:5432/parley';
 /** The repo-public credential pair the README's docker snippet provisions. */
 const DEFAULT_USER = 'parley';
 const DEFAULT_PASSWORD = 'parley';
-const MIN_POOL_SIZE = 1;
-const MAX_POOL_SIZE = 1000;
+/** Pooled connections `connect()` opens when `pool_size` is omitted. */
+export const DEFAULT_POOL_SIZE = 5;
+export const MIN_POOL_SIZE = 1;
+export const MAX_POOL_SIZE = 1000;
 /**
  * Widest retention window this backend accepts, in days (50 years). Keep a ceiling here, so that
  * every accepted window still has a cutoff a stored row could fall on: past it the cutoff first
@@ -68,6 +70,15 @@ const MAX_POOL_SIZE = 1000;
 export const MAX_RETENTION_DAYS = 18_250;
 /** How many rows one drain query pulls at most before re-querying. */
 const DRAIN_BATCH = 512;
+/** First gap before a failed drain is retried; doubles per consecutive failure. */
+const DRAIN_RETRY_BASE_MS = 50;
+/**
+ * Ceiling on the re-drain gap, so a database that stays down is re-probed forever but cheaply.
+ * Keep the retry unbounded in COUNT, so that push converges the way catch-up does: NOTIFY is
+ * edge-triggered, and a drain that gave up holds `lastSeen` behind a durably stored row with no
+ * later edge guaranteed to arrive.
+ */
+const DRAIN_RETRY_CEILING_MS = 30_000;
 /** Backoff between listener reconnect attempts after the connection drops. */
 const RECONNECT_DELAY_MS = 500;
 /**
@@ -196,18 +207,19 @@ function assertCursor(since: string): void {
 }
 
 /**
- * Wrap a listener-connection failure so a seam call names this plugin and the topic it was for.
- * The listener is memoized and a drop starts a backoff reconnect, so during that window the raw
- * driver string ('Client has encountered a connection error and is not queryable') is what escapes
- * `subscribe` — and core's push loop rethrows anything that is not a `NoSuchTopicError`, so the
- * whole live path fails to attach on a message naming neither the backend nor the topic.
+ * Wrap EVERY way `subscribe` can fail so the seam call names this plugin and the topic it was for.
+ * Each statement it runs has its own raw driver string — 'Client has encountered a connection error
+ * and is not queryable' from the memoized listener during a backoff reconnect, 'terminating
+ * connection due to administrator command' from a pooled read — and core's push loop rethrows
+ * anything that is not a `NoSuchTopicError`, so any of them stops the whole bridge coming up on a
+ * message naming neither the backend nor the topic.
  */
-function listenerUnavailable(topic: Topic, err: unknown): Error {
+function subscribeFailed(topic: Topic, err: unknown): Error {
   const detail = err instanceof Error ? err.message : String(err);
   if (detail.startsWith('parley-postgres:')) return err as Error;
   return new Error(
-    `parley-postgres: could not establish the live path for topic '${topic}' — ${detail}. The ` +
-      'listener connection is down; a reconnect is in flight, so a retry succeeds once it lands.',
+    `parley-postgres: could not establish the live path for topic '${topic}' — ${detail}. Nothing ` +
+      'was registered for that topic; a retry succeeds once the database is reachable again.',
   );
 }
 
@@ -270,6 +282,10 @@ interface TopicSubscription {
   draining: boolean;
   /** A notification arrived mid-drain — run the drain once more before going idle. */
   pending: boolean;
+  /** Armed backoff re-drain after a failed drain read; cleared once one succeeds. */
+  retryTimer?: ReturnType<typeof setTimeout>;
+  /** Gap the next re-drain will use — doubles per consecutive failure, reset by a success. */
+  retryDelayMs?: number;
 }
 
 /**
@@ -361,7 +377,7 @@ export class PostgresPlugin implements BackendPlugin {
       );
     }
 
-    const pool = new Pool({ connectionString: this.url, max: cfg.pool_size ?? 5 });
+    const pool = new Pool({ connectionString: this.url, max: cfg.pool_size ?? DEFAULT_POOL_SIZE });
     // Keep this no-op handler, so that an idle-client error (server restart) stays a rejected
     // command instead of an unhandled 'error' event that kills the process.
     pool.on('error', () => undefined);
@@ -441,6 +457,7 @@ export class PostgresPlugin implements BackendPlugin {
     this.pendingAborts.clear();
     this.waiters.clear();
     this.listens.clear();
+    for (const sub of this.subs.values()) this.clearRedrain(sub);
     this.subs.clear();
     this.subscribing.clear();
     const listener = this.listener;
@@ -646,7 +663,9 @@ export class PostgresPlugin implements BackendPlugin {
       return;
     }
 
-    const started = this.startSubscription(pool, topic, channel, handler);
+    const started = this.startSubscription(pool, topic, channel, handler).catch((err: unknown) => {
+      throw subscribeFailed(topic, err);
+    });
     this.subscribing.set(channel, started);
     try {
       await started;
@@ -665,12 +684,7 @@ export class PostgresPlugin implements BackendPlugin {
     handler: MessageHandler,
   ): Promise<TopicSubscription> {
     const epoch = this.epoch;
-    let listener: Client;
-    try {
-      listener = await this.ensureListener();
-    } catch (err) {
-      throw listenerUnavailable(topic, err);
-    }
+    const listener = await this.ensureListener();
     // Tail first: push never replays history (catch-up owns it).
     const res = await pool.query(
       `SELECT COALESCE(MAX(seq), 0)::text AS max FROM ${this.names.messages} WHERE topic = $1`,
@@ -687,12 +701,7 @@ export class PostgresPlugin implements BackendPlugin {
     // `this.subs` — otherwise the next reconnect re-LISTENs and re-drains a channel the caller was
     // told FAILED to subscribe. It also covers the tail-read → LISTEN window: a row committed in
     // it has seq > lastSeen, so the drain below still catches it.
-    let listen: ListenState;
-    try {
-      listen = await this.acquireListen(listener, channel);
-    } catch (err) {
-      throw listenerUnavailable(topic, err);
-    }
+    const listen = await this.acquireListen(listener, channel);
     // Registering here after a teardown is worse than failing: the entry survives into the next
     // connect(), where subscribe()'s fast path hands it back and no LISTEN is ever issued, so push
     // is silently dead for that topic.
@@ -909,6 +918,7 @@ export class PostgresPlugin implements BackendPlugin {
       return;
     }
     sub.draining = true;
+    this.clearRedrain(sub);
     const epoch = this.epoch;
     void (async () => {
       try {
@@ -941,13 +951,38 @@ export class PostgresPlugin implements BackendPlugin {
             }
           }
         } while (sub.pending && !this.stopped && epoch === this.epoch);
+        sub.retryDelayMs = undefined;
       } catch {
-        // Transient query failure — the next NOTIFY (or the reconnect re-drain) resumes from
-        // `lastSeen`; the cursor guarantees nothing is skipped.
+        this.scheduleRedrain(sub, epoch);
       } finally {
         sub.draining = false;
       }
     })();
+  }
+
+  /**
+   * Re-arm a failed drain on a doubling backoff. A NOTIFY is an EDGE: the drain that swallowed the
+   * failure leaves `lastSeen` behind a row that is already durably stored, and nothing guarantees a
+   * later post to the same topic — or a listener drop — ever rings the doorbell again, so without
+   * this the batch is dropped from the live path for good. Keep the arming epoch-guarded, so that a
+   * drain read rejecting after `disconnect()` cannot install a timer that outlives the lifecycle and
+   * fans a batch out to a torn-down session's handlers.
+   */
+  private scheduleRedrain(sub: TopicSubscription, epoch: number): void {
+    if (this.stopped || epoch !== this.epoch || sub.retryTimer !== undefined) return;
+    const delayMs = sub.retryDelayMs ?? DRAIN_RETRY_BASE_MS;
+    sub.retryDelayMs = Math.min(delayMs * 2, DRAIN_RETRY_CEILING_MS);
+    // Keep the unref, so a database that stays down cannot by itself pin the event loop — push is
+    // best-effort over a durable cursor, not a reason to keep the process alive.
+    sub.retryTimer = setTimeout(() => {
+      sub.retryTimer = undefined;
+      this.drain(sub);
+    }, delayMs).unref();
+  }
+
+  private clearRedrain(sub: TopicSubscription): void {
+    if (sub.retryTimer !== undefined) clearTimeout(sub.retryTimer);
+    sub.retryTimer = undefined;
   }
 
   private require(): Pool {

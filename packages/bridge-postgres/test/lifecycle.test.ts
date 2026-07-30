@@ -190,9 +190,10 @@ const CHORES: Chore[] = [
  * Every await in this plugin that a `disconnect()` can land in re-checks the epoch afterwards, and
  * the table below drives one row per chore into that window. Pinned by VALUE so a guard site added
  * later is a missing row rather than silence: a new one means a new await that can cross a
- * teardown, and it needs its own row here (or in teardown-delivery.test.ts, which owns the drain).
+ * teardown, and it needs its own row here, in teardown-delivery.test.ts (which owns a drain read
+ * parked at the boundary) or in push-self-heal.test.ts (which owns the drain's re-drain timer).
  */
-const EPOCH_GUARD_SITES = 10;
+const EPOCH_GUARD_SITES = 11;
 
 const SOURCE = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 

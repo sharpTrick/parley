@@ -1,6 +1,7 @@
 import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { MAX_TABLE_NAME_BYTES } from '../src/schema.js';
 import { dropTable, isUp, PG_URL, rand, sleep } from './pg-harness.js';
 
 // `table_name` is the one operator value that reaches SQL as text rather than as a bind parameter,
@@ -9,9 +10,27 @@ import { dropTable, isUp, PG_URL, rand, sleep } from './pg-harness.js';
 // trigger — not just on the comfortable ASCII stem the rest of the suite uses. Reserved words are
 // the interesting corpus: they pass the charset guard, so before the identifiers were quoted they
 // reached the server and came back as a bare parse error naming neither Parley nor the key.
+//
+// This is where the accepted-name SHAPES are graded, once each: the shape only reaches the server
+// during bootstrap, so re-running the whole conformance suite per shape buys nothing the first row
+// here does not.
 
-/** Reserved words plus the case the guard normalises — dropped before and after each case. */
-const NAMES = ['user', 'order', 'table', 'select', 'group', 'MixedCase'];
+/**
+ * Reserved words, the case the guard normalises, the shortest name, and the longest — the last one
+ * derived from the exported budget, so narrowing the budget re-tests the new maximum rather than a
+ * stale literal. That row is the only place a real server sees the maximal DDL, where the implicit
+ * `<table_name>_senders_pkey` overflows 63 bytes and PostgreSQL truncates it.
+ */
+const NAMES = [
+  'user',
+  'order',
+  'table',
+  'select',
+  'group',
+  'MixedCase',
+  'm',
+  `parley_tn_${rand()}`.padEnd(MAX_TABLE_NAME_BYTES, 'x'),
+];
 
 if (await isUp(PG_URL)) {
   describe('every table_name the guard accepts works end to end on a real server', () => {

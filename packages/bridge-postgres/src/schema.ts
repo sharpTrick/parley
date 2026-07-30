@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto';
  */
 
 /** PostgreSQL truncates identifiers past this many BYTES, silently merging two derived names. */
-const MAX_IDENTIFIER_BYTES = 63;
+export const MAX_IDENTIFIER_BYTES = 63;
 
 /**
  * Every suffix the schema appends to `table_name`. The accepted-name budget is derived from the
