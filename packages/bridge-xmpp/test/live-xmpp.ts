@@ -1,9 +1,12 @@
-import { asTopic, type Topic } from '@sharptrick/parley-core';
+import { asTopic, type BackendConfig, type Topic } from '@sharptrick/parley-core';
 import { client } from '@xmpp/client';
 import type { XmppBackendConfig } from '../src/index.js';
 
+/** A live config the suites hand straight to `connect()`, which takes the seam's `BackendConfig`. */
+type LiveConfig = XmppBackendConfig & BackendConfig;
+
 /** Shared wiring for the suites that need a real Prosody/ejabberd with MAM (see dev-compose). */
-export const BASE: XmppBackendConfig = {
+export const BASE: LiveConfig = {
   service: process.env.PARLEY_XMPP_SERVICE ?? 'xmpp://127.0.0.1:5222',
   domain: process.env.PARLEY_XMPP_DOMAIN ?? 'parley.local',
   muc_service: process.env.PARLEY_XMPP_MUC ?? 'muc.parley.local',
@@ -12,7 +15,7 @@ export const BASE: XmppBackendConfig = {
 };
 
 /** A SECOND account on the same server — the only way to observe MUC's cross-account nick conflict. */
-export const SECOND_ACCOUNT: XmppBackendConfig = {
+export const SECOND_ACCOUNT: LiveConfig = {
   ...BASE,
   username: process.env.PARLEY_XMPP_USER2 ?? 'parley2',
   password: process.env.PARLEY_XMPP_PASS2 ?? 'parleypass2',

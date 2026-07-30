@@ -30,7 +30,12 @@ vi.mock('@xmpp/client', async () => {
   };
 });
 
-import { CONFIG_KEYS, XmppPlugin } from '../src/index.js';
+import {
+  CONFIG_KEYS,
+  JID_PART_MAX_BYTES,
+  JID_SIZED_KEYS,
+  XmppPlugin,
+} from '../src/index.js';
 
 const valid: Record<string, unknown> = {
   service: 'xmpp://127.0.0.1:5222',
@@ -51,6 +56,22 @@ const label = (v: unknown): string =>
 const wrongValues = CONFIG_KEYS.flatMap((key) =>
   (key === 'mam_page' ? badNumbers : badStrings).map((value) => ({ key, value })),
 );
+
+/**
+ * The ceiling every JID part carries, per key that becomes one. A value one byte over is refused
+ * BY NAME rather than left to bounce as a bare `jid-malformed` naming neither the plugin nor the
+ * key, and the multibyte row is what makes `.length` an insufficient measure of it.
+ */
+const lengths = JID_SIZED_KEYS.flatMap((key) => [
+  { key, case: 'at the limit', value: 'x'.repeat(JID_PART_MAX_BYTES), accepted: true },
+  { key, case: 'one byte over', value: 'x'.repeat(JID_PART_MAX_BYTES + 1), accepted: false },
+  {
+    key,
+    case: 'under the limit in characters but over it in bytes',
+    value: 'é'.repeat(JID_PART_MAX_BYTES - 1),
+    accepted: false,
+  },
+]);
 
 /** Typos an operator actually makes: a transposition, a dropped letter, DESIGN's phantom key. */
 const unknownKeys = ['muc_servce', 'mucservice', 'usernam', 'jid', 'MAM_PAGE', 'nickname'];
@@ -102,6 +123,19 @@ describe('XMPP backend_config is validated before anything connects', () => {
       }
     },
   );
+
+  it.each(lengths)('$key $case', async ({ key, value, accepted }) => {
+    const before = mockState.clients;
+    const err = await connectWith({ ...valid, [key]: value });
+    if (accepted) {
+      expect(err).toBeUndefined();
+      return;
+    }
+    expect(err?.message ?? '').toContain('parley-xmpp');
+    expect(err?.message ?? '').toContain(`backend_config.${key}`);
+    expect(err?.message ?? '').toContain(String(JID_PART_MAX_BYTES));
+    expect(mockState.clients).toBe(before); // refused before any stream was opened
+  });
 
   it('a nick carrying the resource separator is refused', async () => {
     const err = await connectWith({ ...valid, nick: 'agent/one' });

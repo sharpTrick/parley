@@ -170,6 +170,68 @@ describe('XMPP reports the identity it collapses onto its one occupant nick', ()
   });
 });
 
+// Class: `resolveIdentity` answering a name the archive never carries. `backendRef` is the only
+// thing core can map a handle onto a backend by, and for a backend declaring
+// `carriesSenderIdentity: false` the honest answer is the sender its posts actually read back as —
+// which the per-handle fold stops being the moment the connection's nick is settled by anything
+// other than that handle. The table crosses every provenance the occupant nick has with the handle
+// being resolved, and grades `backendRef` against an OBSERVED `senderHandle` rather than a string
+// literal, so it survives a change to the fold.
+
+const ADOPTED = 'alice';
+const OTHER = 'carol';
+
+interface NickProvenance {
+  name: string;
+  cfg: Partial<XmppBackendConfig>;
+  reach(plugin: XmppPlugin, fake: FakeXmpp): Promise<void>;
+}
+const provenances: NickProvenance[] = [
+  { name: 'unset, nothing posted yet', cfg: {}, reach: async () => undefined },
+  { name: 'pinned by backend_config.nick', cfg: { nick: 'session-a' }, reach: async () => undefined },
+  {
+    name: "adopted from an earlier post's handle",
+    cfg: {},
+    reach: async (plugin) => {
+      await plugin.post(asTopic('t-ref-seed'), asHandle(ADOPTED), 'seed');
+    },
+  },
+  {
+    name: 'reverted to the provisional nick after a conflict',
+    cfg: {},
+    reach: async (plugin, fake) => {
+      fake.conflictNicks.add(ADOPTED);
+      await plugin.post(asTopic('t-ref-seed'), asHandle(ADOPTED), 'seed');
+    },
+  },
+];
+
+const refCells = provenances.flatMap((provenance) =>
+  [ADOPTED, OTHER].map((handle) => ({ provenance, handle })),
+);
+
+describe('XMPP resolveIdentity answers the nick a handle is read back under', () => {
+  it.each(refCells)('$provenance.name -> $handle', async ({ provenance, handle }) => {
+    const fake = new FakeXmpp();
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: PASSWORD, ...provenance.cfg });
+    try {
+      await provenance.reach(plugin, fake);
+
+      const { backendRef } = await plugin.resolveIdentity(asHandle(handle));
+      const topic = asTopic(`t-ref-${handle}`);
+      await plugin.post(topic, asHandle(handle), 'x');
+      const { messages } = await plugin.fetchRecent({ topic, limit: 5 });
+
+      expect(messages.map((m) => String(m.senderHandle))).toEqual([backendRef]);
+    } finally {
+      await plugin.disconnect();
+      mockState.client = undefined;
+    }
+  });
+});
+
 const serverUp = await canAuth(BASE);
 
 describe.skipIf(!serverUp)('XMPP sender identity against a real MUC archive', () => {

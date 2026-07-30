@@ -92,7 +92,9 @@ describe('XMPP long-poll query budget scales with wakes, never with blockMs', ()
     const LATENCY_MS = 200;
     const startedAt: number[] = [];
     const t0 = Date.now();
-    fake.onMamRequest = () => startedAt.push(Date.now() - t0);
+    fake.onMamRequest = (): void => {
+      startedAt.push(Date.now() - t0);
+    };
     fake.mamLatencyMs = LATENCY_MS;
 
     const wake = setTimeout(() => fake.reflectOnly(room, 'not-archived'), LATENCY_MS + 50);

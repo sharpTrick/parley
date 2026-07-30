@@ -85,7 +85,7 @@ describe('XMPP MAM result provenance', () => {
     expect(items[0]?.body).toBe('genuine archived message');
     // The forged archId (which would derail <after> paging as a forged cursor) never landed.
     expect(items.map((i) => i.archId)).not.toContain('FORGED-ARCH-9999');
-    expect(items.some((i) => i.body.includes('fabricated'))).toBe(false);
+    expect(items.some((i) => i.body?.includes('fabricated') === true)).toBe(false);
   });
 
   it('proves the drop is the provenance check, not a parse failure: the SAME attacker stanza IS collected when its from matches the queried room', () => {

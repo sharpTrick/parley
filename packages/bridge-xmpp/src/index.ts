@@ -163,8 +163,10 @@ export const CONFIG_KEYS = [
 ] as const;
 /** Keys that end up as one part of a JID, where a separator would silently build a different JID. */
 const JID_PART_KEYS = ['domain', 'muc_service', 'username'] as const;
+/** Keys whose value becomes one part of a JID, and so inherits that part's byte ceiling. */
+export const JID_SIZED_KEYS = [...JID_PART_KEYS, 'nick'] as const;
 /** RFC 7622 §3.3/§3.4: a localpart or resourcepart longer than this is `jid-malformed`. */
-const JID_PART_MAX_BYTES = 1023;
+export const JID_PART_MAX_BYTES = 1023;
 const MAX_MAM_PAGE = 10_000;
 
 /** Schemes whose stream starts in the clear; STARTTLS on them is opportunistic, never guaranteed. */
@@ -228,6 +230,18 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
         key,
         `${describeValue(value)} contains whitespace, '@' or '/' — it is one part of a JID, and a ` +
           'separator here builds a different address than the one written',
+      );
+    }
+  }
+  for (const key of JID_SIZED_KEYS) {
+    const value = cfg[key];
+    if (typeof value !== 'string') continue;
+    const bytes = Buffer.byteLength(value);
+    if (bytes > JID_PART_MAX_BYTES) {
+      throw bad(
+        key,
+        `is ${bytes} bytes — over the ${JID_PART_MAX_BYTES}-byte limit on the JID part it becomes, ` +
+          'which the server answers with jid-malformed on every stanza addressed through it',
       );
     }
   }
@@ -297,6 +311,7 @@ const occupancyEndReason = (statuses: string[], x: El | undefined): string => {
 const MAM_MISSING_HINT =
   'this backend needs XEP-0313 MAM for MUC — enable mod_mam + muc_mam (Prosody) or mod_mam ' +
   '(ejabberd); without an archive there is no cursor, no catch-up and no live delivery';
+const asError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));
 const conditionOf = (err: unknown): string =>
   typeof (err as { condition?: unknown })?.condition === 'string'
     ? ((err as { condition: string }).condition)
@@ -462,7 +477,15 @@ export class XmppPlugin implements BackendPlugin {
       }
       this.rejoinAfterReconnect();
     });
-    await xmpp.start();
+    // `@xmpp/reconnect` is listening from the moment the client is constructed, so keep the stop on
+    // the failure path: a client this call abandons goes on redialling — re-presenting `password`
+    // to a server the caller believes it never reached — with nothing left holding a handle on it.
+    try {
+      await xmpp.start();
+    } catch (err) {
+      await xmpp.stop().catch(() => undefined);
+      throw err;
+    }
     this.xmpp = xmpp;
   }
 
@@ -505,6 +528,7 @@ export class XmppPlugin implements BackendPlugin {
     assertXmlSafe(content, 'post content');
     await this.adoptIdentityNick(identity);
     await this.ensureJoined(topic);
+    const conn = this.require();
     const room = this.roomJid(topic);
     const originId = `o-${randomUUID()}`;
 
@@ -532,7 +556,16 @@ export class XmppPlugin implements BackendPlugin {
       xml('body', {}, content),
       xml('origin-id', { xmlns: NS_SID, id: originId }),
     );
-    await this.require().send(message);
+    // Keep a failed send settling the correlator instead of escaping past it, so that the caller
+    // holds the ONE promise this call made: an abandoned correlator rejects on its own timer, on a
+    // disconnect or on a reconnect with nothing holding it, and Node kills the process for it.
+    try {
+      await conn.send(message);
+    } catch (err) {
+      const pending = this.pendingPosts.get(originId);
+      this.pendingPosts.delete(originId);
+      pending?.reject(asError(err));
+    }
     return promise;
   }
 
@@ -713,13 +746,16 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   /**
-   * A handle's backend-native name is the MUC nick it occupies rooms under. Keep it the same
-   * {@link nickFor} fold `post` uses, so that `backendRef` names something that can actually appear
-   * as a `senderHandle` — the fold is lossy for any handle a JID resource cannot spell
-   * (`alice@corp.com`), and `parley_list_users` reports the folded name.
+   * A handle's backend-native name is the MUC nick its posts are read back under. One connection is
+   * one occupant, so once this connection's nick is settled — pinned by config, taken from the
+   * first post's identity, or reverted after a `conflict` — that nick is the sender of every
+   * handle's posts, and answering the per-handle {@link nickFor} fold instead would name someone no
+   * message in any room carries. Before the first post the nick is still open, and the fold is what
+   * this handle would take (lossy for a handle a JID resource cannot spell, `alice@corp.com`).
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
-    return { handle, backendRef: nickFor(handle) };
+    const settled = this.nickAdoption !== undefined;
+    return { handle, backendRef: settled ? this.nick : nickFor(handle) };
   }
 
   // ---- internals -----------------------------------------------------------
@@ -831,7 +867,8 @@ export class XmppPlugin implements BackendPlugin {
     if (pending === undefined) return;
     // Status 201 = we just CREATED the room; it stays locked until its owner submits a config.
     if (statuses.includes('201')) {
-      this.configureRoom(room).finally(() => pending.resolve());
+      const unlocked = (): void => pending.resolve();
+      void this.configureRoom(room).then(unlocked, unlocked);
     } else {
       pending.resolve();
     }
@@ -1159,13 +1196,20 @@ export class XmppPlugin implements BackendPlugin {
 
   /**
    * MAM is this backend's one hard prerequisite: the archive id IS the cursor and the post
-   * correlator. Probe the room's disco#info once per connection so a server without it fails with
-   * a message that names MAM, rather than as a post that times out and a subscribe that is
-   * silently dead. A server that will not answer disco at all is not evidence of anything, so
-   * keep that path permissive.
+   * correlator. Probe the room's disco#info so a server without it fails with a message that names
+   * MAM, rather than as a post that times out and a subscribe that is silently dead. A server that
+   * will not answer disco at all is not evidence of anything, so keep that path permissive.
+   *
+   * Only a SUCCESS is memoized: a rejected promise is not `undefined`, so keep the failure
+   * uncached, so that enabling muc_mam server-side is not a change the bridge can see only across
+   * a restart — and so that the next room's failure names the room it is about rather than
+   * replaying the first probe's.
    */
   private assertMamAvailable(room: string): Promise<void> {
-    this.mamCheck ??= this.discoMam(room);
+    this.mamCheck ??= this.discoMam(room).catch((err: unknown) => {
+      this.mamCheck = undefined;
+      throw err;
+    });
     return this.mamCheck;
   }
 
@@ -1277,8 +1321,7 @@ export class XmppPlugin implements BackendPlugin {
           clearTimeout(timer);
           outcome.then(
             () => settle(resolve),
-            (err: unknown) =>
-              settle(() => reject(err instanceof Error ? err : new Error(String(err)))),
+            (err: unknown) => settle(() => reject(asError(err))),
           );
         },
       };
@@ -1294,9 +1337,13 @@ export class XmppPlugin implements BackendPlugin {
         { to: `${room}/${this.nick}` },
         xml('x', { xmlns: NS_MUC }, xml('history', { maxstanzas: '0' })),
       );
-      conn.send(presence).catch((err: unknown) => {
-        entry.reject(err instanceof Error ? err : new Error(String(err)));
-      });
+      // A send that throws SYNCHRONOUSLY never reaches `.catch`; keep the try, so that it cannot
+      // reject the join while leaving this entry and its 15 s timer registered behind it.
+      try {
+        conn.send(presence).catch((err: unknown) => entry.reject(asError(err)));
+      } catch (err) {
+        entry.reject(asError(err));
+      }
     });
     // A re-drive (reconnect, nick switch, deferred re-entry after an occupancy loss) registers a
     // successor for a room whose join is still in flight. Settle the loser FROM the successor rather

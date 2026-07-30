@@ -266,3 +266,115 @@ describe('XMPP seam calls on a plugin that is not serving arm nothing', () => {
     await closing;
   });
 });
+
+// Class: a correlator/timer registered BEFORE a step that can fail, where the failure path returns
+// the caller's error without settling the registration. The states above only reach failures that
+// happen before anything is registered; this table reaches the ones that happen after, by breaking
+// the transport at each stage of a call the plugin has already committed to.
+//
+// The `unhandledRejection` collector is the part that generalises past any one line: a promise
+// created before a failable await and then abandoned rejects with nobody holding it, which under
+// Node's default `--unhandled-rejections=throw` kills the bridge process. It catches that shape
+// anywhere in the plugin, whether the orphan rejects on its own timer, on `disconnect()`, or on a
+// reconnect.
+
+interface TransportFault {
+  name: string;
+  apply(fake: FakeXmpp): void;
+}
+const faults: TransportFault[] = [
+  {
+    name: 'send() rejects',
+    apply: (fake) => {
+      fake.send = () => Promise.reject(new Error('stream closed'));
+    },
+  },
+  {
+    name: 'send() throws synchronously',
+    apply: (fake) => {
+      fake.send = () => {
+        throw new Error('stream closed');
+      };
+    },
+  },
+  {
+    name: 'iqCaller.request() rejects',
+    apply: (fake) => {
+      fake.iqCaller.request = () => Promise.reject(new Error('stream closed'));
+    },
+  },
+];
+
+const rooms: Array<{ name: string; reach(plugin: XmppPlugin): Promise<void> }> = [
+  {
+    name: 'with the room already joined',
+    reach: async (p) => {
+      await p.post(TOPIC, asHandle('a'), 'seed');
+    },
+  },
+  { name: 'with the room not joined yet', reach: async () => undefined },
+];
+
+const brokenTransport = faults.flatMap((fault) =>
+  rooms.flatMap((room) =>
+    entries
+      .filter((entry) => entry.name !== 'resolveIdentity')
+      .map((entry) => ({ fault, room, entry })),
+  ),
+);
+
+describe('XMPP seam calls whose transport fails mid-call leave nothing behind', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    mockState.client = undefined;
+  });
+
+  it.each(brokenTransport)('$entry.name $room.name when $fault.name', async ({
+    fault,
+    room,
+    entry,
+  }) => {
+    const orphans: unknown[] = [];
+    const collect = (err: unknown): void => {
+      orphans.push(err);
+    };
+    process.on('unhandledRejection', collect);
+    try {
+      vi.useFakeTimers();
+      const fake = new FakeXmpp();
+      mockState.client = fake;
+      const plugin = new XmppPlugin();
+      await plugin.connect(CONFIG);
+      await room.reach(plugin);
+      fault.apply(fake);
+
+      let settled = false;
+      const mark = (): void => {
+        settled = true;
+      };
+      void entry.call(plugin).then(mark, mark);
+      // A blocking fetch parks for its whole budget, so give every entry point the room to finish
+      // on its own terms — but stop the moment it does, so that a registry entry cleared by its own
+      // 15 s timeout cannot pass for one the failure path settled.
+      await vi.advanceTimersByTimeAsync(0);
+      for (let waited = 0; !settled && waited < 90_000; waited += 1_000) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      expect(settled, 'the seam call never settled').toBe(true);
+      expectNoLeaks(plugin);
+      expect(vi.getTimerCount()).toBe(0);
+
+      // Past every correlator's own timeout, then a teardown: the two moments an abandoned
+      // promise created earlier in the call would reject with nobody left holding it.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await plugin.disconnect();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      expect(orphans.map(String)).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', collect);
+    }
+  });
+});

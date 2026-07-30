@@ -20,7 +20,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive); no `since` → empty `<before/>` = last page; pages forward up to `limit` |
 | `subscribe` | every reflected groupchat `<message>` carrying a room `<stanza-id>` → `handler` (incl. own posts), in archive order |
 | admission | a stanza with **no `<body>`** — a subject change, a correction, a retraction, a chat state — is not a message on either path; an *empty* body is |
-| `resolveIdentity` | name convention: `backendRef` is the MUC nick the handle occupies rooms under — the same fold `post` applies (`alice@corp.com` → `alice_corp.com-<hash>`), so it matches the `senderHandle` that handle reads back as |
+| `resolveIdentity` | name convention: `backendRef` is the MUC nick this connection posts under, so it matches the `senderHandle` that handle reads back as. Once the nick is settled — pinned by `nick`, taken from the first `post`, or reverted after a `conflict` — **every** handle resolves to it, because one occupant is one sender; before the first `post` it is the fold `post` would apply to this handle (`alice@corp.com` → `alice_corp.com-<hash>`) |
 | sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
 | timestamp | `<delay stamp>` from MAM forwarded messages if present, else now (informational only) |
 

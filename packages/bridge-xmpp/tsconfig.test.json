@@ -1,0 +1,18 @@
+{
+  "//": "Type-check-only project covering the sources tsconfig.json excludes from the published build. vitest transpiles with esbuild and never type-checks, so without this project the test surface — including every `as unknown as XmppPrivate` cast — is checked by nothing.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "tsBuildInfoFile": "tsconfig.test.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": { "@sharptrick/parley-xmpp": ["./src/index.ts"] }
+  },
+  "references": [
+    { "path": "../bridge-core" },
+    { "path": "../bridge-net-util" },
+    { "path": "../conformance" }
+  ],
+  "include": ["src/**/*", "test/**/*"],
+  "exclude": []
+}
