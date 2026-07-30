@@ -91,6 +91,21 @@ a per-target copy of the fixed file and `cp` it back. This paragraph previously 
 "is a git checkout, so `git checkout --` restores it", which is the reasoning that produced all
 three losses.
 
+**Staged work in a worktree is not durable — extract and commit it the moment an agent reports.**
+The worktrees live under `/tmp`, so a container restart takes every uncommitted patch with it. In
+round 9 one agent finished, staged 13 files, and died before reporting; the restart then rolled the
+worktree back and its whole round was gone, while the thirteen targets already extracted and pushed
+survived untouched. Do not batch extraction to the end of a round.
+
+**A rolled-back container looks exactly like data loss, and the local repository cannot tell you
+otherwise.** After that same restart the local `HEAD`, the reflog, `git cat-file` on every later
+commit, and even the worktree pins all agreed that four rounds had never happened — because all four
+are reads of the same rolled-back filesystem, including `origin/<branch>`, which is just a file
+under `.git/refs/remotes/`. Only `git ls-remote` asks the remote. It showed the branch exactly where
+it had been pushed, and `git fetch` + `git reset --hard` restored everything. Three consistent
+readings from one instrument are not corroboration; check the one source the failure could not have
+touched before concluding anything is lost.
+
 Worktrees isolate the filesystem and **not** the backing services. A shared Redis, Postgres,
 Synapse, Prosody, Keycloak and NATS are one destructive test away from taking down every concurrent
 agent, and even without that, contention produces false reds — the NATS outage tests passed alone
