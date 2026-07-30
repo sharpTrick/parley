@@ -249,6 +249,37 @@ describe('telegram chat-cap claims are executed, not just written', () => {
  * which one owns the check — so the next variant gets a third copy. Titles that are nothing but a
  * table placeholder are exempt: the row supplies the real name.
  */
+/**
+ * The repo ships no linter and `tsconfig.base.json` enables neither `noUnusedLocals` nor
+ * `noUnusedParameters`, so nothing in CI can fail on a symbol the source imports and never uses.
+ * `isLoopbackHost` sat in this package's import list for exactly that reason, telling a reader the
+ * plaintext check was composed of two pieces when one of them was never called. Parameterized over
+ * `src/`, so a new module is covered the moment it lands.
+ */
+describe('telegram source imports are all used', () => {
+  const modules = readdirSync(join(here, '..', 'src')).filter((f) => f.endsWith('.ts'));
+
+  it.each(modules)('%s imports nothing it does not reference', (file) => {
+    const text = readFileSync(join(here, '..', 'src', file), 'utf8');
+    const imported: string[] = [];
+    for (const statement of text.matchAll(/^import\s+([\s\S]*?)\s+from\s+'[^']+';$/gm)) {
+      const clause = statement[1] as string;
+      const braced = /\{([\s\S]*)\}/.exec(clause)?.[1] ?? '';
+      for (const spec of braced.split(',')) {
+        const name = /(?:\bas\s+)?(\w+)\s*$/.exec(spec.trim())?.[1];
+        if (name !== undefined) imported.push(name);
+      }
+      const bare = /^(\w+)\s*(?:,|$)/.exec(clause)?.[1];
+      if (bare !== undefined) imported.push(bare);
+    }
+    // Guard the extractor: a pattern that stopped matching would make the check vacuous.
+    expect(imported.length).toBeGreaterThan(0);
+
+    const body = text.replace(/^import\s+[\s\S]*?\s+from\s+'[^']+';$/gm, '');
+    expect(imported.filter((name) => !new RegExp(`\\b${name}\\b`).test(body))).toEqual([]);
+  });
+});
+
 describe('telegram test suite hygiene', () => {
   it('declares no case title in two files', () => {
     const owners = new Map<string, string[]>();

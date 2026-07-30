@@ -79,29 +79,57 @@ describe('telegram ObservedStore durability', () => {
    * A line with no observation sequence is a damaged line, not an older format: the sequence IS the
    * cursor, so minting a fresh one for it files a record an agent's held cursor already sits above,
    * where nothing can ever reach it. Drop it like any other garbled line and let the redelivery in.
+   *
+   * The same holds for every OTHER field of the shape, and there it matters more rather than less,
+   * because a wrong type there survives being loaded: a record whose `content` is not a string
+   * reaches `buildMessage` and throws on every later `fetchRecent` for that chat, across restarts,
+   * and the Bot API has no history endpoint that could refill the topic — this file is the only
+   * copy. So the check runs over the whole record, and a file already carrying a bad line heals on
+   * load instead of bricking a chat forever.
    */
-  it('drops a stored line carrying no observation sequence instead of minting one', () => {
-    const seqless = {
-      chat_id: '1',
-      message_id: 2,
-      sender: 's',
-      content: 'seqless',
-      ts: '2024-01-01T00:00:00.000Z',
-    };
+  const DAMAGED = [
+    { name: 'no observation sequence', damage: { seq: undefined } },
+    { name: 'a fractional observation sequence', damage: { seq: 1.5 } },
+    { name: 'a zero observation sequence', damage: { seq: 0 } },
+    { name: 'a stringified observation sequence', damage: { seq: '2' } },
+    { name: 'a numeric content', damage: { content: 12345 } },
+    { name: 'an object content', damage: { content: { evil: 1 } } },
+    { name: 'a null content', damage: { content: null } },
+    { name: 'an object sender', damage: { sender: { evil: 1 } } },
+    { name: 'a numeric sender', damage: { sender: 7 } },
+    { name: 'a numeric chat_id', damage: { chat_id: 1 } },
+    { name: 'a numeric ts', damage: { ts: 1_700_000_000 } },
+    { name: 'a stringified message_id', damage: { message_id: '2' } },
+    { name: 'no message_id', damage: { message_id: undefined } },
+  ];
+
+  it.each(DAMAGED)('drops a stored line carrying $name instead of loading it', ({ damage }) => {
+    // A hand-written file arrives 0644, so the store tightens it and says so; that is its own
+    // case's subject, not this one's.
+    captureStderr();
     writeFileSync(
       path,
       `${[
         JSON.stringify(record('1', 1, 'first')),
-        JSON.stringify(seqless),
+        JSON.stringify({ ...record('1', 2, 'damaged'), ...damage }),
         JSON.stringify(record('1', 3, 'third')),
       ].join('\n')}\n`,
     );
 
     const store = new ObservedStore(path);
     expect(store.entries('1').map((r) => r.content)).toEqual(['first', 'third']);
-    // Its id was never observed, so a redelivery of it is admitted — above every issued cursor.
-    expect(store.has(keyOf(seqless))).toBe(false);
-    expect(store.append(seqless)?.seq).toBe(4);
+    // Whatever survives a load is the shape every reader downstream is entitled to assume.
+    for (const rec of store.entries('1')) {
+      expect({ content: typeof rec.content, sender: typeof rec.sender, ts: typeof rec.ts }).toEqual({
+        content: 'string',
+        sender: 'string',
+        ts: 'string',
+      });
+    }
+    // Its id was never observed, so a redelivery of it is admitted — above every issued cursor,
+    // because a dropped line never advances the sequence it failed to carry.
+    expect(store.has(keyOf({ chat_id: '1', message_id: 2 }))).toBe(false);
+    expect(store.append(record('1', 2, 'redelivered'))?.seq).toBe(4);
     expect(store.entries('1').map((r) => r.seq)).toEqual([1, 3, 4]);
     store.close();
   });

@@ -20,7 +20,6 @@ import {
 import {
   delay,
   fetchWithRetry,
-  isLoopbackHost,
   plaintextRemoteOrigin,
   retryAfterFromHeader,
   sanitizeBody,
@@ -339,11 +338,9 @@ export class TelegramPlugin implements BackendPlugin {
     const store = this.require(this.store);
     const sinceSeq =
       args.since === undefined ? undefined : this.requireOwnCursor(store, args.since, args.topic);
+    const limit = requireLimit(args.limit);
     const chatId = await this.chatIdFor(args.topic);
     this.stillServing(store);
-    // Normalize BEFORE slicing: a non-positive limit must mean "no messages" on both branches
-    // (`slice(-0)` is `slice(0)` — the whole history — which would invert the argument).
-    const limit = Math.max(0, Math.floor(args.limit ?? 100));
     const nothingNewer = (seq: number): boolean =>
       !store.entries(chatId).some((r) => r.seq > seq);
     const query = (): Message[] => {
@@ -402,7 +399,7 @@ export class TelegramPlugin implements BackendPlugin {
     const raw = since as string;
     if (/^\d+$/.test(raw)) {
       if (Number(raw) === 0) return 0;
-      throw new Error(this.foreignCursor(store, raw, topic));
+      throw new Error(this.unqualifiedCursor(store, raw, topic));
     }
     const qualified = /^([0-9a-f]{16})\.(\d+)$/.exec(raw);
     if (qualified === null) {
@@ -419,6 +416,22 @@ export class TelegramPlugin implements BackendPlugin {
       );
     }
     return seq;
+  }
+
+  /**
+   * A bare non-zero sequence carries no store identity, so nothing can say WHICH store's sequence
+   * space it names — this file's own under a build that predated the identity, or another's. Keep
+   * it off {@link foreignCursor}'s wording, so that a diagnostic an operator acts on cannot assert
+   * a provenance the cursor itself withholds.
+   */
+  private unqualifiedCursor(store: ObservedStore, raw: string, topic: Topic): string {
+    return (
+      `TelegramPlugin: cursor '${raw}' for topic '${topic as string}' carries no store identity, ` +
+      `so which observed-message store's observation sequence it names cannot be established ` +
+      `(this one is '${this.storePath}', identity ${store.epoch()}). Serving it could answer out ` +
+      `of an unrelated sequence space and leave the messages below it unreachable — clear the ` +
+      `saved cursor to catch up from the start of what this store retains.`
+    );
   }
 
   private foreignCursor(store: ObservedStore, raw: string, topic: Topic): string {
@@ -877,13 +890,20 @@ function requireSentMessage(result: unknown): TgMessage {
 }
 
 /**
- * Every field {@link TelegramPlugin.ingest} reads to build a record, validated where the object
- * arrives rather than where each one is dereferenced — and `date` validated for the RANGE the
- * record's timestamp is built over, not merely for being a number. Keep both halves of that check,
- * so that a message object missing `date`, or carrying one `Date` cannot represent, fails naming
- * the endpoint and the FIELD: `RangeError: Invalid time value` names neither, which is exactly what
- * {@link unwrapEnvelope} exists one layer up to prevent, and on the inbound path it is one
- * throttled stderr line for a message the Bot API can never redeliver.
+ * Every field {@link contentOf} and {@link senderOf} read for a VALUE — `message_id`, `chat.id`,
+ * `date`, `text`, `caption`, `from.id` and `from.username` — validated where the object arrives
+ * rather than where each one is dereferenced, and each for its DOMAIN as well as its type: `date`
+ * for the range the record's timestamp is built over, the two body fields and the two sender fields
+ * for being the strings a `Message` is contractually made of.
+ *
+ * Keep every one of those checks here, so that a non-conforming upstream cannot drive a record the
+ * store PERSISTS and reloads: a field that survives to `store.append` is written to the JSONL file,
+ * and a `content` that is not a string then throws inside `buildMessage` on every later
+ * `fetchRecent` for that chat, across restarts, with no Bot API call that could ever refill the
+ * topic. A field checked here is one throttled stderr line on the inbound path and a labelled
+ * rejection on `post`, naming the endpoint and the field — where `RangeError: Invalid time value`
+ * or `content.matchAll is not a function` names neither, which is exactly what
+ * {@link unwrapEnvelope} exists one layer up to prevent.
  */
 function requireMessage(label: string, value: unknown): TgMessage {
   const msg = value as TgMessage | null;
@@ -903,7 +923,50 @@ function requireMessage(label: string, value: unknown): TgMessage {
   if (Number.isNaN(new Date(msg.date * 1000).getTime())) {
     throw new Error(`${label}: message carries an out-of-range date (${String(msg.date)})`);
   }
+  const fields = msg as unknown as Record<string, unknown>;
+  for (const field of BODY_FIELDS) {
+    if (fields[field] !== undefined && typeof fields[field] !== 'string') {
+      throw new Error(`${label}: message carries a non-string ${field}`);
+    }
+  }
+  const from = fields.from;
+  if (from !== undefined) {
+    if (from === null || typeof from !== 'object' || Array.isArray(from)) {
+      throw new Error(`${label}: message carries a from that is not a user object`);
+    }
+    const user = from as Record<string, unknown>;
+    if (typeof user.id !== 'number' || !Number.isFinite(user.id)) {
+      throw new Error(`${label}: message carries no numeric from.id`);
+    }
+    if (user.username !== undefined && typeof user.username !== 'string') {
+      throw new Error(`${label}: message carries a non-string from.username`);
+    }
+  }
   return msg;
+}
+
+/** The optional fields {@link contentOf} takes the record's body from, in its own precedence order. */
+const BODY_FIELDS = ['text', 'caption'] as const;
+
+/**
+ * The page size {@link TelegramPlugin.fetchRecent} slices with: one normalization both its branches
+ * are driven from, and a load-shaped failure for a number outside the domain that has.
+ *
+ * Keep the two branches on ONE normalized value, so that a limit cannot mean opposite things on
+ * either side of `since`: `slice(-0)` is `slice(0)` — the whole retained window — so an
+ * un-normalized non-positive limit inverts its own argument, and `NaN` inverts it the other way
+ * (`slice(NaN)` is everything, `slice(0, NaN)` is nothing, i.e. a topic that looks permanently
+ * drained). Refuse rather than substitute the default, so that a caller asking for a page size this
+ * cannot answer hears about it instead of silently getting a different one.
+ */
+function requireLimit(limit: number | undefined): number {
+  if (limit === undefined) return 100;
+  if (!Number.isFinite(limit)) {
+    throw new Error(
+      `TelegramPlugin: fetchRecent limit must be a finite number — got ${String(limit)}`,
+    );
+  }
+  return Math.max(0, Math.floor(limit));
 }
 
 /**
@@ -958,9 +1021,11 @@ const MEDIA_KINDS = [
  * like joins/leaves) — those are not ingested at all rather than stored as blank lines.
  */
 function contentOf(msg: TgMessage): string | undefined {
-  const text = msg.text ?? msg.caption;
-  if (text !== undefined) return text;
   const fields = msg as unknown as Record<string, unknown>;
+  for (const field of BODY_FIELDS) {
+    const body = fields[field];
+    if (typeof body === 'string') return body;
+  }
   const kind = MEDIA_KINDS.find((k) => fields[k] !== undefined);
   return kind === undefined ? undefined : `[${kind}]`;
 }
@@ -982,8 +1047,6 @@ const REQUEST_BUDGET_MS = 30_000;
 
 /** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see {@link plaintextRemoteOrigin}. */
 const DEFAULT_API_URL = 'https://api.telegram.org';
-
-
 
 /**
  * Default observed-message store: `${XDG_STATE_HOME:-~/.local/state}/parley/telegram/observed.jsonl`

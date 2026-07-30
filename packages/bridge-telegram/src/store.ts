@@ -49,6 +49,9 @@ export interface StoredRecord {
 /** A message as observed, before the store stamps its observation sequence. */
 export type ObservedRecord = Omit<StoredRecord, 'seq'>;
 
+/** The {@link StoredRecord} fields a loaded line must carry as strings — see {@link ObservedStore.stamp}. */
+const RECORD_STRING_FIELDS = ['chat_id', 'sender', 'content', 'ts'] as const;
+
 /** The composite dedup key for a record — mirrors the plugin's backendMsgId. */
 export const keyOf = (rec: Pick<StoredRecord, 'chat_id' | 'message_id'>): string =>
   `${rec.chat_id}:${rec.message_id}`;
@@ -611,14 +614,26 @@ export class ObservedStore {
   }
 
   /**
-   * Adopt a loaded record's observation sequence. A line carrying none is garbled — the loader's
-   * try/catch drops it. Keep it a drop rather than a fresh stamp, so that a damaged line cannot be
-   * handed a sequence an agent's cursor already sits above and become permanently unreachable.
+   * Adopt a loaded record's observation sequence, and hold every other field to the type
+   * {@link StoredRecord} declares. A line failing either is garbled — the loader's try/catch drops
+   * it. Keep it a drop rather than a fresh stamp, so that a damaged line cannot be handed a
+   * sequence an agent's cursor already sits above and become permanently unreachable.
+   *
+   * Keep the field types checked HERE as well as at the seam, so that a file already carrying a
+   * record of the wrong shape heals on load instead of bricking its chat: a non-string `content`
+   * reaches `buildMessage` and throws on EVERY later `fetchRecent` for that chat, and no Bot API
+   * call can refill the topic once the store is the only copy.
    */
   private stamp(raw: Partial<StoredRecord> & ObservedRecord): StoredRecord {
     const { seq } = raw;
     if (typeof seq !== 'number' || !Number.isInteger(seq) || seq <= 0) {
       throw new Error('record carries no observation sequence');
+    }
+    for (const field of RECORD_STRING_FIELDS) {
+      if (typeof raw[field] !== 'string') throw new Error(`record carries a non-string ${field}`);
+    }
+    if (typeof raw.message_id !== 'number' || !Number.isFinite(raw.message_id)) {
+      throw new Error('record carries no numeric message_id');
     }
     if (seq >= this.nextSeq) this.nextSeq = seq + 1;
     return { ...raw, seq };
