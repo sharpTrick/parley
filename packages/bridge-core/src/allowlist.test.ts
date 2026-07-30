@@ -1,7 +1,14 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it } from 'vitest';
 import { Allowlist, allowlistFor, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
-import { parseConfig } from './config.js';
+import { MAX_POST_TOPICS, parseConfig } from './config.js';
+import { encodePresence } from './engine/presence.js';
+import { asHandle, type Topic } from './message.js';
 import { MAX_MATCH_INPUT } from './regex-safety.js';
+import { FakePlugin } from './testing/fake-plugin.js';
+import { registerTools, toolDepsFor } from './transport/tools.js';
 
 function compiles(src: string): boolean {
   try {
@@ -290,6 +297,14 @@ describe('Allowlist pattern safety', () => {
     expect(widened).toEqual([]);
   });
 
+  it('refuses more patterns than the collection cap, naming the cap', () => {
+    const overCap = Array.from({ length: MAX_POST_TOPICS + 1 }, (_, i) => `ctx-${i}-.*`);
+    expect(() => new Allowlist(['ctx'], { postPatterns: overCap })).toThrow(RangeError);
+    expect(() => new Allowlist(['ctx'], { postPatterns: overCap })).toThrow(
+      new RegExp(`at most ${MAX_POST_TOPICS} post patterns`),
+    );
+  });
+
   it('accepts a source only if it compiles on its own', () => {
     const safe = SAFE.map(([, pattern]) => pattern);
     const candidates = [
@@ -307,5 +322,237 @@ describe('Allowlist pattern safety', () => {
     });
     expect(accepted.filter((src) => !compiles(src))).toEqual([]);
     expect(accepted).toEqual(expect.arrayContaining(safe));
+  });
+});
+
+// The loader and the runtime gate must not disagree about the same topic STRING. `parseConfig`
+// refuses `topics: ['']` on the stated grounds that a field naming something can never be empty, so
+// a broad `post_topics` pattern must not admit it one layer down at the boundary DESIGN §14 puts
+// there — an empty topic reaches `plugin.post('', …)` and folds to an empty backend channel name
+// that no charset check catches. Derive the verdict from parseConfig and the pattern rather than
+// pinning it per row, so the two boundaries cannot drift apart again.
+describe('the runtime gate never admits a topic the loader forbids', () => {
+  const DEGENERATE_TOPICS = [
+    '',
+    ' ',
+    '\t',
+    '\n',
+    '.',
+    '..',
+    'a'.repeat(MAX_MATCH_INPUT + 1),
+    'parley-presence',
+  ];
+  const BROAD_PATTERNS = ['.*', '[a-z]*', 'x?', '(?:)', '[\\s\\S]*'];
+
+  const loaderAccepts = (topic: string): boolean => {
+    try {
+      parseConfig({ identity: { handle: 'h' }, topics: [topic] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const patternMatches = (pattern: string, topic: string): boolean =>
+    new RegExp(`^(?:${pattern})$`).test(topic);
+
+  const ROWS = DEGENERATE_TOPICS.flatMap((topic) =>
+    BROAD_PATTERNS.map(
+      (pattern) =>
+        [
+          `${JSON.stringify(topic)} under ${JSON.stringify(pattern)}`,
+          topic,
+          pattern,
+          loaderAccepts(topic) && topic.length <= MAX_MATCH_INPUT && patternMatches(pattern, topic),
+        ] as const,
+    ),
+  );
+
+  it('the table can fail in both directions, and on each clause independently', () => {
+    expect(DEGENERATE_TOPICS.filter((t) => !loaderAccepts(t))).toEqual(['', 'parley-presence']);
+    expect(ROWS.filter(([, , , expected]) => expected).length).toBeGreaterThan(8);
+    expect(ROWS.filter(([, , , expected]) => !expected).length).toBeGreaterThan(8);
+    // One row per clause of the verdict, so deleting any clause reddens something.
+    expect(ROWS.some(([, t, , e]) => t === '' && patternMatches('.*', t) && !e)).toBe(true);
+    expect(ROWS.some(([, t, , e]) => t.length > MAX_MATCH_INPUT && !e)).toBe(true);
+    expect(ROWS.some(([, t, , e]) => t === 'parley-presence' && !e)).toBe(true);
+  });
+
+  it.each(ROWS)('%s', (_label, topic, pattern, expected) => {
+    const allow = allowlistFor(
+      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], post_topics: [pattern] }),
+    );
+    expect(allow.has(topic)).toBe(expected);
+    if (expected) expect(allow.assert(topic)).toBe(topic);
+    else expect(() => allow.assert(topic)).toThrow(TopicNotAllowedError);
+  });
+
+  it('refuses an explicit empty topic at construction, as the loader does', () => {
+    expect(() => new Allowlist([''])).toThrow(TopicNotAllowedError);
+    expect(() => new Allowlist([''])).toThrow(/never be the empty string/);
+  });
+});
+
+// Which allowlist DIMENSION each caller-facing surface consults is a claim the class doc makes, and
+// it went stale: the doc called the explicit list the default scope of `parley_list_users`, while
+// the unscoped roster is the UNION of both dimensions. Assert the dimension by construction through
+// the real MCP surfaces, driven from parseConfig via the composition roots' own `toolDepsFor`, so a
+// surface that starts consulting a different dimension reddens here. A tool registered without a row
+// fails as a missing entry.
+describe('each caller-facing surface consults the allowlist dimension its doc names', () => {
+  const EXPLICIT_TOPIC = 'ctx-mine';
+  const PATTERN_ONLY_TOPIC = 'ctx-adhoc';
+  const UNREACHABLE_TOPIC = 'other-x';
+
+  type Dimension = 'EXPLICIT' | 'POST_FETCH' | 'BOTH';
+
+  interface Surface {
+    label: string;
+    tool?: string;
+    dimension: Dimension;
+    reaches: (h: Harness, topic: string) => Promise<boolean>;
+  }
+
+  interface Harness {
+    client: Client;
+    allow: ReturnType<typeof allowlistFor>;
+    plugin: FakePlugin;
+    presenceTopic: Topic;
+  }
+
+  const ok = async (client: Client, name: string, args: Record<string, unknown>): Promise<boolean> =>
+    ((await client.callTool({ name, arguments: args })) as { isError?: boolean }).isError !== true;
+
+  const rosterHandles = async (client: Client, args: Record<string, unknown>): Promise<string[]> => {
+    const res = (await client.callTool({ name: 'parley_list_users', arguments: args })) as {
+      isError?: boolean;
+      content: { text: string }[];
+    };
+    if (res.isError === true) return [];
+    return (JSON.parse(res.content[0]!.text) as { users: { handle: string }[] }).users.map(
+      (u) => u.handle,
+    );
+  };
+
+  /** Each peer subscribes to exactly one topic, so its presence in the roster names that topic. */
+  const peerOn = (topic: string): string => `peer-${topic}`;
+
+  const SURFACES: Surface[] = [
+    {
+      label: 'parley_post',
+      tool: 'parley_post',
+      dimension: 'POST_FETCH',
+      reaches: (h, topic) => ok(h.client, 'parley_post', { topic, content: 'x' }),
+    },
+    {
+      label: 'parley_reply',
+      tool: 'parley_reply',
+      dimension: 'POST_FETCH',
+      reaches: (h, topic) => ok(h.client, 'parley_reply', { topic, content: 'x' }),
+    },
+    {
+      label: 'parley_fetch_recent',
+      tool: 'parley_fetch_recent',
+      dimension: 'POST_FETCH',
+      reaches: (h, topic) => ok(h.client, 'parley_fetch_recent', { topic }),
+    },
+    {
+      label: 'parley_list_users scoped',
+      tool: 'parley_list_users',
+      dimension: 'POST_FETCH',
+      reaches: async (h, topic) =>
+        (await rosterHandles(h.client, { topic })).includes(peerOn(topic)),
+    },
+    {
+      label: 'parley_list_users unscoped',
+      dimension: 'BOTH',
+      reaches: async (h, topic) => (await rosterHandles(h.client, {})).includes(peerOn(topic)),
+    },
+    {
+      label: 'subscribe / catch-up',
+      dimension: 'EXPLICIT',
+      reaches: (h, topic) => Promise.resolve(h.allow.topics().some((t) => t === topic)),
+    },
+  ];
+
+  const REACHES: Record<Dimension, Record<string, boolean>> = {
+    EXPLICIT: { [EXPLICIT_TOPIC]: true, [PATTERN_ONLY_TOPIC]: false, [UNREACHABLE_TOPIC]: false },
+    POST_FETCH: { [EXPLICIT_TOPIC]: true, [PATTERN_ONLY_TOPIC]: true, [UNREACHABLE_TOPIC]: false },
+    BOTH: { [EXPLICIT_TOPIC]: true, [PATTERN_ONLY_TOPIC]: true, [UNREACHABLE_TOPIC]: false },
+  };
+
+  async function harness(): Promise<Harness> {
+    const cfg = parseConfig({
+      identity: { handle: 'me' },
+      topics: [EXPLICIT_TOPIC],
+      post_topics: ['ctx-.*'],
+    });
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    const deps = toolDepsFor(plugin, cfg);
+    for (const topic of [EXPLICIT_TOPIC, PATTERN_ONLY_TOPIC, UNREACHABLE_TOPIC])
+      await plugin.post(
+        deps.presenceTopic,
+        asHandle(peerOn(topic)),
+        encodePresence({
+          v: 2,
+          kind: 'heartbeat',
+          at: Date.now(),
+          handle: peerOn(topic),
+          topics: [topic],
+          postTopics: [],
+          instanceId: `i-${topic}`,
+        }),
+      );
+    const server = new McpServer(
+      { name: 'parley', version: '0.0.0' },
+      { capabilities: { tools: {} } },
+    );
+    registerTools(server, deps);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
+    await Promise.all([server.connect(serverT), client.connect(clientT)]);
+    return { client, allow: deps.allow, plugin, presenceTopic: deps.presenceTopic };
+  }
+
+  it('every registered tool has a row naming the dimension it consults', async () => {
+    const h = await harness();
+    const registered = (await h.client.listTools()).tools.map((t) => t.name).sort();
+    const covered = [...new Set(SURFACES.flatMap((s) => (s.tool === undefined ? [] : [s.tool])))];
+    expect(registered.filter((n) => !covered.includes(n))).toEqual([]);
+    expect(new Set(SURFACES.map((s) => s.dimension))).toEqual(
+      new Set<Dimension>(['EXPLICIT', 'POST_FETCH', 'BOTH']),
+    );
+  });
+
+  it.each(
+    SURFACES.flatMap((s) =>
+      [EXPLICIT_TOPIC, PATTERN_ONLY_TOPIC, UNREACHABLE_TOPIC].map(
+        (topic) => [`${s.label} → ${topic} (${s.dimension})`, s, topic] as const,
+      ),
+    ),
+  )('%s', async (_label, surface, topic) => {
+    const h = await harness();
+    expect(await surface.reaches(h, topic)).toBe(REACHES[surface.dimension][topic]);
+  });
+
+  // The other half of the union: a peer I cannot post to, but who advertises a post pattern reaching
+  // a topic I subscribe to, is unscoped-reachable through the EXPLICIT dimension alone.
+  it('the unscoped roster includes a peer reachable only inbound', async () => {
+    const h = await harness();
+    await h.plugin.post(
+      h.presenceTopic,
+      asHandle('peer-inbound'),
+      encodePresence({
+        v: 2,
+        kind: 'heartbeat',
+        at: Date.now(),
+        handle: 'peer-inbound',
+        topics: ['their-private'],
+        postTopics: ['ctx-.*'],
+        instanceId: 'i-inbound',
+      }),
+    );
+    expect(await rosterHandles(h.client, {})).toContain('peer-inbound');
+    expect(await rosterHandles(h.client, {})).not.toContain(peerOn(UNREACHABLE_TOPIC));
   });
 });

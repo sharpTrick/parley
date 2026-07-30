@@ -95,6 +95,9 @@ export type AuthConfig = z.infer<typeof AuthSchema>;
  * can spend, but `Allowlist.has` matches a caller-supplied topic against all of them in turn, so the
  * calibrated per-source cost multiplies by this count on every post/reply/fetch. Mirrors the
  * `MAX_RECORD_TOPICS` cap the presence path already puts on the same shape of untrusted list.
+ *
+ * `Allowlist` enforces it too, for the embedder that builds one without going through this schema;
+ * the `.max()` below is the earlier, better-located operator error.
  */
 export const MAX_POST_TOPICS = 64;
 

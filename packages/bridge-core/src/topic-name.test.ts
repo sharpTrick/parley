@@ -39,6 +39,41 @@ it('the fold table carries a fold that can empty a non-empty topic', () => {
   expect(folds.filter(([, fold]) => fold('!!!') === '').length).toBeGreaterThanOrEqual(2);
 });
 
+// A backend name that identifies no channel addresses the backend as a whole, and every topic that
+// folds to it would share it — the exact cross-delivery safeName exists to prevent. The fold is a
+// fixed point of the empty string, so no plugin's charset check can catch it: this is the layer that
+// has to. Grade the property over every fold and every topic in the corpora below, so the class
+// ("some input makes safeName return an empty name") is closed rather than the one input.
+describe('safeName never returns a name that identifies nothing', () => {
+  const EMPTYING_TOPICS = ['', ' ', '  ', '\t', '\n', '!!!', '...', '@@@', '\u00a0', '\u200b'];
+
+  it('the corpus contains inputs each branch of safeName can reach', () => {
+    expect(EMPTYING_TOPICS).toContain('');
+    expect(folds.some(([, fold]) => EMPTYING_TOPICS.some((t) => fold(t) === '' && t !== ''))).toBe(
+      true,
+    );
+    expect(folds.some(([, fold]) => fold('') === '')).toBe(true);
+  });
+
+  it.each(folds)('every emptying topic yields a non-empty name or a throw (%s)', (_l, fold) => {
+    for (const raw of EMPTYING_TOPICS) {
+      let name: string | undefined;
+      try {
+        name = safeName(asTopic(raw), fold);
+      } catch (e) {
+        expect((e as Error).message).toMatch(/EMPTY backend name/);
+        continue;
+      }
+      expect(name, `topic ${JSON.stringify(raw)} minted an empty backend name`).not.toBe('');
+    }
+  });
+
+  it('refuses the empty topic by name, whatever the fold', () => {
+    for (const [, fold] of folds)
+      expect(() => safeName(asTopic(''), fold)).toThrow(/EMPTY backend name/);
+  });
+});
+
 describe('safeName', () => {
   it('NATS: distinct topics with a colliding sanitized stream name map to distinct names', () => {
     const a = safeName(asTopic('team.frontend'), sanitizeName);

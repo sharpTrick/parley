@@ -35,10 +35,11 @@ export const MAX_HASH_LEN = createHash('sha1').update('').digest('hex').length;
  * caller pick the raw topic `<sanitized><sep><hash>` and land in another topic's channel. Those
  * are disambiguated too, keeping the two branches' outputs disjoint.
  *
- * Throws when `hashLen` is outside {@link MIN_HASH_LEN}…{@link MAX_HASH_LEN}, and when the name it
- * built is not a fixed point of `sanitize` — a truncating fold, or one whose charset excludes `sep` or
- * lowercase hex, would otherwise get back a name it rewrites, which is exactly the collision this
- * helper exists to prevent.
+ * Throws when `hashLen` is outside {@link MIN_HASH_LEN}…{@link MAX_HASH_LEN}, when the name it would
+ * return is EMPTY — a name identifying no channel addresses the backend as a whole, and every topic
+ * a fold empties would share it — and when the name it built is not a fixed point of `sanitize`: a
+ * truncating fold, or one whose charset excludes `sep` or lowercase hex, would otherwise get back a
+ * name it rewrites, which is exactly the collision this helper exists to prevent.
  */
 export function safeName(
   topic: Topic,
@@ -54,7 +55,7 @@ export function safeName(
         'A shorter suffix is brute-forceable, and two topics sharing one backend name cross-deliver.',
     );
   const sanitized = sanitize(raw);
-  if (sanitized === raw && !isDisambiguated(raw, sep, hashLen)) return sanitized;
+  if (sanitized === raw && !isDisambiguated(raw, sep, hashLen)) return assertNames(sanitized, raw);
   const hash = createHash('sha1').update(raw, 'utf8').digest('hex').slice(0, hashLen);
   const name = `${sanitized}${sep}${hash}`;
   const refolded = sanitize(name);
@@ -65,7 +66,16 @@ export function safeName(
         'survive the backend name rules (a length limit, or a charset excluding ' +
         `${JSON.stringify(sep)} or lowercase hex). Topics would collide on this backend.`,
     );
-  return name;
+  return assertNames(name, raw);
+}
+
+function assertNames(name: string, raw: string): string {
+  if (name !== '') return name;
+  throw new Error(
+    `safeName produced an EMPTY backend name for topic ${JSON.stringify(raw)}: a name that ` +
+      'identifies no channel addresses the backend as a whole, and every topic this fold empties ' +
+      'would share it. Reject the topic before it reaches the backend.',
+  );
 }
 
 function isDisambiguated(name: string, sep: string, hashLen: number): boolean {

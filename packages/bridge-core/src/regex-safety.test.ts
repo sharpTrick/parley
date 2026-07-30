@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allowlistFor } from './allowlist.js';
+import { Allowlist, allowlistFor } from './allowlist.js';
 import { MAX_POST_TOPICS, parseConfig } from './config.js';
 import { isRedosSafeSource, MAX_AMBIGUITY, MAX_MATCH_INPUT } from './regex-safety.js';
 import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
@@ -208,20 +208,52 @@ describe('a screened collection is bounded in aggregate, not only per source', (
     expect(isRedosSafeSource(`[ab]?${WORST}`)).toBe(false);
   });
 
-  it('post_topics at its cap stays inside the aggregate budget', () => {
-    const cfg = parseConfig({
-      identity: { handle: 'h' },
-      topics: ['ctx'],
-      post_topics: Array.from({ length: MAX_POST_TOPICS }, () => WORST),
-    });
-    const allow = allowlistFor(cfg);
-    expect(allow.patterns()).toHaveLength(MAX_POST_TOPICS);
-    const started = performance.now();
-    expect(allow.has(ADVERSARIAL)).toBe(false);
-    expect(performance.now() - started).toBeLessThan(AGGREGATE_BUDGET_MS);
+  // The cap has to live at the class that owns the screen, not only at the loader: `Allowlist` is
+  // exported public API, so an embedder builds one WITHOUT parseConfig and inherits the per-source
+  // calibration with no aggregate at all (64 copies of WORST cost 34 ms, 20 000 cost 7.5 s of blocked
+  // event loop). Grade both entry points from one table, so a bound enforced at only one of them is
+  // a red row rather than an invisible hole.
+  const ENTRY_POINTS: readonly (readonly [
+    label: string,
+    build: (patterns: string[]) => Allowlist,
+  ])[] = [
+    [
+      'new Allowlist({ postPatterns })',
+      (patterns) => new Allowlist(['ctx'], { postPatterns: patterns }),
+    ],
+    [
+      'allowlistFor(parseConfig({ post_topics }))',
+      (patterns) =>
+        allowlistFor(
+          parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], post_topics: patterns }),
+        ),
+    ],
+  ] as const;
+
+  it('grades every entry point that compiles a screened collection', () => {
+    expect(ENTRY_POINTS.map(([label]) => label)).toEqual([
+      'new Allowlist({ postPatterns })',
+      'allowlistFor(parseConfig({ post_topics }))',
+    ]);
   });
 
-  it('refuses one pattern past the cap, naming post_topics', () => {
+  it.each(ENTRY_POINTS)(
+    'a collection AT the cap stays inside the aggregate budget (%s)',
+    (_l, build) => {
+      const allow = build(Array.from({ length: MAX_POST_TOPICS }, () => WORST));
+      expect(allow.patterns()).toHaveLength(MAX_POST_TOPICS);
+      const started = performance.now();
+      expect(allow.has(ADVERSARIAL)).toBe(false);
+      expect(performance.now() - started).toBeLessThan(AGGREGATE_BUDGET_MS);
+    },
+  );
+
+  it.each(ENTRY_POINTS)('refuses one pattern past the cap (%s)', (_l, build) => {
+    const overCap = Array.from({ length: MAX_POST_TOPICS + 1 }, (_, i) => `ctx-${i}-.*`);
+    expect(() => build(overCap)).toThrow(new RegExp(`${MAX_POST_TOPICS}`));
+  });
+
+  it('the loader names the offending field, so the operator error stays better located', () => {
     const overCap = Array.from({ length: MAX_POST_TOPICS + 1 }, (_, i) => `ctx-${i}-.*`);
     let issuePaths: unknown[][] = [];
     try {
