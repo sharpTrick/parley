@@ -61,6 +61,7 @@ function makeProvider(now: () => number, opts: Partial<ParleyOAuthProviderOption
     resource: RESOURCE,
     verifyOwner: async (pass) => pass === GOOD_PASS,
     consentPath: '/parley/consent',
+    scopesSupported: ['mcp', 'parley:read'],
     now,
     ...opts,
   });
@@ -993,6 +994,12 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
   interface ClientState {
     name: string;
     stores: readonly string[];
+    /**
+     * Whether reaching this state costs the owner's passphrase. Anonymous state is state an
+     * attacker can mint for itself, so it must pin a slot against ordinary spam and yet never be
+     * the reason the owner is refused a registration — two properties one axis cannot express.
+     */
+    ownerApproved: boolean;
     seed: (p: ParleyOAuthProvider, client: OAuthClientInformationFull) => Promise<void>;
   }
 
@@ -1000,6 +1007,7 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     {
       name: 'a consent awaiting the owner passphrase',
       stores: ['pending'],
+      ownerApproved: false,
       seed: async (p, c) => {
         await p.authorize(c, makeParams(), fakeRes());
       },
@@ -1007,6 +1015,7 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     {
       name: 'an owner-approved code not yet exchanged',
       stores: ['codes'],
+      ownerApproved: true,
       seed: async (p, c) => {
         await mintCode(p, c, makeParams());
       },
@@ -1014,6 +1023,7 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     {
       name: 'a code mid-redemption at /token',
       stores: ['redeeming'],
+      ownerApproved: true,
       seed: async (p, c) => {
         await p.challengeForAuthorizationCode(c, await mintCode(p, c, makeParams()));
       },
@@ -1021,6 +1031,7 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     {
       name: 'an access token alone',
       stores: ['access'],
+      ownerApproved: true,
       seed: async (p, c) => {
         peek(p).refresh.delete(issuePair(p, c).refresh);
       },
@@ -1028,6 +1039,7 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     {
       name: 'a refresh token alone',
       stores: ['refresh'],
+      ownerApproved: true,
       seed: async (p, c) => {
         peek(p).access.delete(issuePair(p, c).access);
       },
@@ -1035,11 +1047,15 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     {
       name: 'both token halves',
       stores: ['access', 'refresh'],
+      ownerApproved: true,
       seed: async (p, c) => {
         issuePair(p, c);
       },
     },
   ];
+
+  const ANONYMOUS_STATES = CLIENT_STATES.filter((s) => !s.ownerApproved);
+  const OWNER_APPROVED_STATES = CLIENT_STATES.filter((s) => s.ownerApproved);
 
   // A store the provider gains but this table never seeds is a state the cap may silently evict.
   it('CLIENT_STATES covers every client-keyed store the provider declares', () => {
@@ -1052,6 +1068,16 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     const keyedByClient = declared.filter((n) => n !== 'clients').sort();
     const seeded = [...new Set(CLIENT_STATES.flatMap((s) => s.stores))].sort();
     expect(seeded).toEqual(keyedByClient);
+  });
+
+  // The second axis has to partition, or a row's verdict below says nothing about the store it
+  // stands for.
+  it('classifies every client-keyed store as owner-approved or anonymous, never both', () => {
+    const anonymous = new Set(ANONYMOUS_STATES.flatMap((s) => s.stores));
+    const approved = new Set(OWNER_APPROVED_STATES.flatMap((s) => s.stores));
+    expect([...anonymous].filter((s) => approved.has(s))).toEqual([]);
+    expect(anonymous.size).toBeGreaterThan(0);
+    expect(approved.size).toBeGreaterThan(0);
   });
 
   it.each(CLIENT_STATES.map((s) => [s.name, s]))(
@@ -1099,18 +1125,45 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
     },
   );
 
-  it('refuses a new registration rather than evicting the last in-use client', () => {
-    const p = makeProvider(() => 2_600_000);
+  /**
+   * Fill every slot with clients holding ONLY `state`, then hand back the owner's registration
+   * attempt. Whether that attempt is granted is the whole question: refusing it is the correct
+   * answer only when every slot is state the owner's own passphrase paid for.
+   */
+  const MAX_CLIENTS = 100;
+
+  async function saturateWith(p: ParleyOAuthProvider, state: ClientState): Promise<() => void> {
     const register = p.clientsStore.registerClient;
     if (register === undefined) throw new Error('registerClient not implemented');
-    for (let i = 0; i < 100; i++) {
-      const c = { client_id: `busy-${i}`, redirect_uris: [REDIRECT] } as OAuthClientInformationFull;
-      register(c);
-      issuePair(p, c);
+    for (let i = 0; i < MAX_CLIENTS; i++) {
+      const squatter = makeClient(`squatter-${i}`);
+      register(squatter);
+      await state.seed(p, squatter);
     }
-    expect(() =>
-      register({ client_id: 'one-too-many', redirect_uris: [REDIRECT] } as OAuthClientInformationFull),
-    ).toThrow(OAuthError);
-    expect(p.clientsStore.getClient('busy-0')).toBeDefined();
-  });
+    expect(peek(p).clients.size).toBe(MAX_CLIENTS);
+    return () => void register(makeClient('owner-claude'));
+  }
+
+  it.each(ANONYMOUS_STATES.map((s) => [s.name, s]))(
+    'MAX_CLIENTS clients holding only %s still leave the owner a registration slot',
+    async (_label: string, state: ClientState) => {
+      const p = makeProvider(() => 2_700_000);
+      const registerOwner = await saturateWith(p, state);
+
+      expect(registerOwner).not.toThrow();
+      expect(p.clientsStore.getClient('owner-claude')).toBeDefined();
+      expect(peek(p).clients.size).toBeLessThanOrEqual(MAX_CLIENTS);
+    },
+  );
+
+  it.each(OWNER_APPROVED_STATES.map((s) => [s.name, s]))(
+    'MAX_CLIENTS clients holding %s are refused a new registration rather than evicted',
+    async (_label: string, state: ClientState) => {
+      const p = makeProvider(() => 2_800_000);
+      const registerOwner = await saturateWith(p, state);
+
+      expect(registerOwner).toThrow(OAuthError);
+      expect(p.clientsStore.getClient('squatter-0')).toBeDefined();
+    },
+  );
 });

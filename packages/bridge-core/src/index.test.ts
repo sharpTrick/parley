@@ -138,4 +138,98 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
       'export the linked symbol, or state it in prose — a consumer cannot follow a link to a symbol they cannot import',
     ).toEqual([]);
   });
+
+  /**
+   * The same closure one step further out: a shipped type whose only sanctioned constructor is
+   * withheld. An out-of-tree composition root handed `registerTools` and `ToolDeps` but not
+   * `toolDepsFor` has to hand-assemble the dependency bag, so the next required field breaks every
+   * external root at compile time — precisely the lockstep edit the factory exists to prevent, and
+   * core's own roots are immune to it. Derive the pairs rather than naming them: a function whose
+   * declared return type IS an exported type is that type's constructor, and it ships or the type
+   * does not.
+   */
+  // Both shapes the package writes a function in: a declaration, and a `const` arrow (which is how
+  // every brand constructor is written) — a scanner that saw only one would call a type orphaned
+  // because it could not see the builder that ships.
+  const FN_STARTS = [
+    /(?:^|\n)(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g,
+    /(?:^|\n)(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:<[^<>()]*>)?\(/g,
+  ];
+
+  interface Declared {
+    name: string;
+    params: string;
+    returns: string;
+  }
+
+  /** Every declared function's name, its parameter text, and its declared return type. */
+  function declaredFunctions(src: string): Declared[] {
+    const out: Declared[] = [];
+    for (const start of FN_STARTS) {
+      for (const m of src.matchAll(start)) {
+        const open = m.index + m[0].length - 1;
+        let depth = 0;
+        let i = open;
+        do {
+          if (src[i] === '(') depth++;
+          else if (src[i] === ')') depth--;
+          i++;
+        } while (depth > 0 && i < src.length);
+        const tail = /^\s*:\s*([^{;=]+?)\s*(?:\{|=>)/.exec(src.slice(i));
+        if (tail) {
+          out.push({
+            name: m[1]!,
+            params: src.slice(open + 1, i - 1),
+            returns: tail[1]!.trim(),
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  const functions = files.flatMap((f) =>
+    declaredFunctions(readFileSync(f, 'utf8')).map((fn) => ({ ...fn, file: f.slice(SRC.length) })),
+  );
+
+  it.each([
+    ['a plain declaration', 'export function f(a: number): Thing {', 'Thing'],
+    ['a multi-line signature', 'export function f(\n  a: number,\n  b: string,\n): Thing {', 'Thing'],
+    ['a parameter that is itself a function', 'function f(p: (t: string) => boolean): Thing {', 'Thing'],
+    ['a generic signature', 'function f<T>(p: T): Thing {', 'Thing'],
+    ['a const arrow', 'export const f = (s: string): Thing => s as Thing;', 'Thing'],
+  ])('the signature scanner reads %s', (_label, src, expected) => {
+    expect(declaredFunctions(src).map((fn) => fn.returns)).toEqual([expected]);
+  });
+
+  it('finds declared functions to check (guards against a broken scan)', () => {
+    expect(functions.length).toBeGreaterThan(20);
+    const factory = functions.find((fn) => fn.name === 'toolDepsFor');
+    expect(factory?.returns).toBe('ToolDeps');
+    expect(functions.find((fn) => fn.name === 'registerTools')?.params).toContain('ToolDeps');
+  });
+
+  it('exports a constructor for every exported type its exported functions demand', () => {
+    // A type is ORPHANED when this package knows how to build it and ships none of those builders.
+    // An internal helper that merely happens to produce one is not a constructor: what matters is
+    // whether ANY sanctioned way in exists.
+    const builders = new Map<string, Declared[]>();
+    for (const fn of functions) builders.set(fn.returns, [...(builders.get(fn.returns) ?? []), fn]);
+    const orphaned = [...builders]
+      .filter(([type, fns]) => exposed.has(type) && !fns.some((fn) => exposed.has(fn.name)))
+      .map(([type]) => type);
+
+    const offenders: string[] = [];
+    for (const fn of functions) {
+      if (!exposed.has(fn.name)) continue;
+      for (const type of orphaned) {
+        if (new RegExp(`\\b${type}\\b`).test(fn.params))
+          offenders.push(`${fn.file}: ${fn.name}() takes ${type}, whose only builder index.ts withholds`);
+      }
+    }
+    expect(
+      offenders,
+      'export the factory too, or withhold the type — a consumer handed a type it cannot legally build assembles it by hand and breaks on the next field added to it',
+    ).toEqual([]);
+  });
 });

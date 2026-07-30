@@ -1,7 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import {
   DEFAULT_PRESENCE_TOPIC,
@@ -13,8 +13,8 @@ import {
 } from '../engine/presence.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asBackendMsgId, asCursor, asHandle, asTopic } from '../message.js';
-import { NoSuchTopicError, type FetchRecentArgs } from '../seam.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
+import { NoSuchTopicError, type FetchRecentArgs, type FetchRecentResult } from '../seam.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import {
@@ -1033,5 +1033,66 @@ describe('parley_list_users bounds the roster it hands the agent', () => {
     const { tools } = await client.listTools();
     const description = tools.find((t) => t.name === 'parley_list_users')!.description!;
     expect(description).toContain(`default ${DEFAULT_ROSTER_LIMIT}`);
+  });
+});
+
+/**
+ * `limit` is a maximum the seam only ASKS for — a plugin may hand back more, and
+ * `testing/nonconformant.ts` models exactly that shape. The roster's own caps bound what the AGENT
+ * sees, so an over-long page costs nothing visible: it is paid entirely in decode work, one
+ * `JSON.parse` per beat, invisible to any assertion about the answer. Grade the COST, across pages
+ * that sit under, on, and well over the limit, and pin WHICH end of the page survives the trim —
+ * a clamp keeping the wrong end reads identically in every count.
+ */
+describe('parley_list_users bounds the decode work an over-serving plugin can impose', () => {
+  const NOW = 2_000_000;
+
+  /** `n` well-formed beats, oldest first, each from its own handle so the roster keeps them apart. */
+  function presencePage(n: number): Message[] {
+    return Array.from({ length: n }, (_u, i) => ({
+      topic: PRESENCE_TOPIC,
+      senderHandle: asHandle('one-credential'),
+      content: encodePresence({
+        v: 2,
+        kind: 'heartbeat',
+        at: NOW - (n - i) * 10,
+        handle: `peer-${i}`,
+        topics: ['ctx'],
+        postTopics: [],
+        instanceId: `inst-${i}`,
+      }),
+      timestamp: new Date(NOW).toISOString(),
+      backendMsgId: asBackendMsgId(String(i)),
+      cursor: asCursor(String(i)),
+      mentions: [],
+    }));
+  }
+
+  it.each([
+    ['a page under the limit', PRESENCE_FETCH_LIMIT - 1],
+    ['a page exactly at the limit', PRESENCE_FETCH_LIMIT],
+    ['a page one beat over the limit', PRESENCE_FETCH_LIMIT + 1],
+    ['a page many times the limit', PRESENCE_FETCH_LIMIT * 3],
+  ])('%s costs at most one decode per retained beat', async (_name, pageSize) => {
+    const { client, plugin } = await harness({ topics: ['ctx'], now: () => NOW });
+    const page = presencePage(pageSize);
+    plugin.fetchRecent = async (): Promise<FetchRecentResult> => ({
+      messages: page,
+      nextCursor: asCursor(String(pageSize)),
+    });
+
+    const parses = vi.spyOn(JSON, 'parse');
+    const res = await client.callTool({ name: 'parley_list_users', arguments: {} });
+    const decoded = parses.mock.calls.filter(
+      ([text]) => typeof text === 'string' && text.includes('"kind"'),
+    ).length;
+    parses.mockRestore();
+
+    expect(decoded).toBe(Math.min(pageSize, PRESENCE_FETCH_LIMIT));
+    // The FRESHEST end is what a roster is for: the newest beat must survive, the oldest must not
+    // once the page over-serves. Both hold for every page size, over-long or not.
+    const out = parse(res) as RosterResult;
+    expect(out.users[0]!.handle).toBe(`peer-${pageSize - 1}`);
+    expect(out.users.map((u) => u.handle)).not.toContain('peer-0');
   });
 });

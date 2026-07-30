@@ -59,11 +59,15 @@ export function createOAuthRemoteApp(
   assertPublicBaseUrl(oauth.issuerUrl, 'issuerUrl');
   assertTrustProxy(oauth.trustProxy, 'trustProxy');
   const resource = canonicalResourceId(oauth.issuerUrl, mcpPath, 'mcpPath');
+  // One array reaches both the metadata document and the provider's /authorize check, so what this
+  // AS advertises and what it will actually issue cannot drift apart.
+  const scopesSupported = oauth.scopesSupported ?? ['mcp'];
 
   const provider = new ParleyOAuthProvider({
     resource,
     verifyOwner: oauth.verifyOwner,
     consentPath: CONSENT_PATH,
+    scopesSupported,
     ...(oauth.now !== undefined ? { now: oauth.now } : {}),
   });
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resource);
@@ -100,7 +104,7 @@ export function createOAuthRemoteApp(
           issuerUrl: oauth.issuerUrl,
           baseUrl: oauth.issuerUrl,
           resourceServerUrl: resource,
-          scopesSupported: oauth.scopesSupported ?? ['mcp'],
+          scopesSupported,
           resourceName: 'Parley',
           authorizationOptions: { rateLimit: { store: ownedStore() } },
           clientRegistrationOptions: { rateLimit: { store: ownedStore() } },

@@ -301,9 +301,27 @@ describe('a start interleaved with a stop leaves nothing running', () => {
   });
 });
 
-describe('reactive HTTP: allowlist compiled once per app, not per POST', () => {
-  it('derives the allowlist a single time at app scope regardless of request count', async () => {
+/**
+ * What app scope actually amortizes, MEASURED on both sides. A stateless transport splits its work
+ * in two — derived once when the app is built, and rebuilt for every POST — and a claim about which
+ * side a given piece falls on is worth exactly what the count that pins it is worth: an operator
+ * profiling a slow /mcp endpoint under a large `topics` + `post_topics` config is steered by it.
+ * So take a reading on each side: a total for what is shared, and a per-request DELTA for what is
+ * not, so that a piece silently moving between them fails here instead of being described wrongly.
+ */
+describe('reactive HTTP: what app scope amortizes, and what it does not', () => {
+  it('compiles the allowlist once for the app, and rebuilds the tool descriptions per POST', async () => {
     const spy = vi.spyOn(allowlistMod, 'allowlistFor');
+    const readers = new Set<unknown>();
+    const realTopics = allowlistMod.Allowlist.prototype.topics;
+    // `allow.topics()` is what `describeAllowed`/`topicList`/`topicSchema` walk to build each tool's
+    // description and enum, so its call count is the tool-description build count.
+    const described = vi
+      .spyOn(allowlistMod.Allowlist.prototype, 'topics')
+      .mockImplementation(function (this: allowlistMod.Allowlist): ReturnType<typeof realTopics> {
+        readers.add(this);
+        return realTopics.call(this);
+      });
     const plugin2 = new FakePlugin();
     await plugin2.connect({});
     // Presence off: keep this focused on the request path (a presence loop reuses deps.allow anyway).
@@ -318,16 +336,25 @@ describe('reactive HTTP: allowlist compiled once per app, not per POST', () => {
     const c = new Client({ name: 'x', version: '0.0.0' }, { capabilities: {} });
     await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
     try {
-      // Several POSTs, each building a brand-new reactive server + transport …
+      // Several POSTs, each building a brand-new reactive server + transport. `parley_post`'s
+      // handler never reads the topic list itself, so every call counted is a description rebuild.
+      described.mockClear();
       await c.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'a' } });
-      await c.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } });
-      await c.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } });
-      // … yet the allowlist (and its regex compilation) was built exactly once, at app scope.
+      const perPost = described.mock.calls.length;
+      await c.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'b' } });
+      await c.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'c' } });
+
+      // The descriptions are NOT amortized: they cost the same again on every POST.
+      expect(perPost).toBeGreaterThan(0);
+      expect(described.mock.calls.length).toBe(3 * perPost);
+      // The allowlist (and its regex compilation) IS: built exactly once, at app scope …
       expect(spy).toHaveBeenCalledTimes(1);
+      expect(readers.size).toBe(1); // … and every request read that same instance.
     } finally {
       await c.close();
       await app.close();
       await plugin2.disconnect();
+      described.mockRestore();
       spy.mockRestore();
     }
   });

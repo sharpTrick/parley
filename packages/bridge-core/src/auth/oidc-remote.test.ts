@@ -7,6 +7,7 @@ import { parseConfig, type OidcAuthConfig, type ParleyConfig } from '../config.j
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { startFakeOidc, type FakeOidc, type FakeOidcClaims } from '../testing/fake-oidc.js';
 import { createOidcRemoteApp, type OidcRemoteServer } from './oidc-remote.js';
+import { OidcTokenVerifier } from './oidc-verifier.js';
 import { createRemoteAuthApp } from './remote-auth.js';
 
 function freePort(): Promise<number> {
@@ -318,6 +319,51 @@ describe('remote OIDC front door (delegated resource server)', () => {
       oidc: { ...withGate(), issuer: idp.issuer },
     });
   });
+});
+
+/**
+ * A policy knob is only real where a caller can observe it. `clock_skew_s` is applied inside the
+ * verifier, but the SDK's requireBearerAuth re-checks `AuthInfo.expiresAt` against wall-clock with
+ * no tolerance of its own — so a verifier-only assertion pins a property no HTTP caller ever sees,
+ * and the exp half of the knob can be dead while that assertion stays green. Every row states the
+ * verifier's verdict AND the status the wire returns, and the two must agree.
+ */
+const SKEW_ROWS: Array<[string, number, FakeOidcClaims, number]> = [
+  ['exp 10 s ago at the default 30 s tolerance', 30, { expiresInS: -10 }, 200],
+  ['exp 120 s ago at 30 s tolerance', 30, { expiresInS: -120 }, 401],
+  ['exp 60 s ago at 120 s tolerance', 120, { expiresInS: -60 }, 200],
+  ['exp 10 s ago at zero tolerance', 0, { expiresInS: -10 }, 401],
+  ['exp 120 s ago at the maximum 300 s tolerance', 300, { expiresInS: -120 }, 200],
+  ['nbf 10 s away at the default 30 s tolerance', 30, { notBeforeInS: 10 }, 200],
+  ['nbf 120 s away at 30 s tolerance', 30, { notBeforeInS: 120 }, 401],
+  ['nbf 60 s away at 120 s tolerance', 120, { notBeforeInS: 60 }, 200],
+  ['nbf 10 s away at zero tolerance', 0, { notBeforeInS: 10 }, 401],
+  ['nbf 120 s away at the maximum 300 s tolerance', 300, { notBeforeInS: 120 }, 200],
+];
+
+describe('clock_skew_s reaches the wire, not just the verifier', () => {
+  it.each(SKEW_ROWS)(
+    '%s: the verifier and the HTTP front door agree',
+    async (_name: string, skewS: number, claims: FakeOidcClaims, status: number) => {
+      await boot({ clock_skew_s: skewS });
+      const aud = `${origin}/mcp`;
+      const token = await idp.mint({ aud, ...claims });
+
+      const verifier = new OidcTokenVerifier({
+        issuer: idp.issuer,
+        audience: aud,
+        jwksUri: idp.jwksUri,
+        clockSkewS: skewS,
+      });
+      const acceptedByVerifier = await verifier.verifyAccessToken(token).then(
+        () => true,
+        () => false,
+      );
+      expect(acceptedByVerifier).toBe(status === 200);
+
+      expect((await postMcp({ Authorization: `Bearer ${token}` })).status).toBe(status);
+    },
+  );
 });
 
 describe('createRemoteAuthApp selector', () => {

@@ -687,6 +687,216 @@ describe('a conformant client that never names its redirect_uri', () => {
   });
 });
 
+/** Register a client by DCR, returning the parsed body and the raw response. */
+async function dcr(
+  as: Record<string, any>,
+  metadata: Record<string, unknown> = {},
+): Promise<{ res: Response; body: Record<string, any> }> {
+  const res = await fetch(as.registration_endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      redirect_uris: [CLIENT_REDIRECT],
+      token_endpoint_auth_method: 'none',
+      ...metadata,
+    }),
+  });
+  return { res, body: await jget(res) };
+}
+
+const asMetadata = async (): Promise<Record<string, any>> =>
+  jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+
+function authorizeRequest(
+  as: Record<string, any>,
+  clientId: string,
+  overrides: Record<string, string | undefined> = {},
+): Promise<Response> {
+  const params: Record<string, string | undefined> = {
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: CLIENT_REDIRECT,
+    code_challenge: pkce().challenge,
+    code_challenge_method: 'S256',
+    resource: `${origin}/mcp`,
+    scope: 'mcp',
+    ...overrides,
+  };
+  const url = new URL(as.authorization_endpoint);
+  url.search = form(
+    Object.fromEntries(
+      Object.entries(params).filter((e): e is [string, string] => e[1] !== undefined),
+    ),
+  );
+  return fetch(url.href, { redirect: 'manual' });
+}
+
+/** The OAuth error code the AS answered with — from the error redirect or the JSON body. */
+async function oauthErrorOf(res: Response): Promise<{ code: string | number; body: string }> {
+  const body = await res.text();
+  const location = res.headers.get('location');
+  if (location !== null) {
+    const code = new URL(location, origin).searchParams.get('error');
+    if (code !== null) return { code, body };
+  }
+  if ((res.headers.get('content-type') ?? '').includes('json')) {
+    const code = (JSON.parse(body) as { error?: string }).error;
+    if (code !== undefined) return { code, body };
+  }
+  return { code: res.status, body };
+}
+
+/**
+ * Every value this AS advertises in its metadata is a promise about what it will accept, and a
+ * promise it does not enforce is worse than one it never made: `scopes_supported: ["mcp"]` beside an
+ * /authorize that grants `bogus-admin` puts an unadvertised scope in the token response AND renders
+ * the attacker's string as prose on the owner's approval page. Each row reads the advertised set out
+ * of the LIVE document, so a value added there tomorrow is covered the day it lands.
+ */
+interface MetadataPromise {
+  name: string;
+  metadataKey: string;
+  unadvertised: string;
+  drive: (as: Record<string, any>, clientId: string, value: string) => Promise<Response>;
+  /** The OAuth error code this AS answers with — asserted so a silent acceptance cannot pass. */
+  refusal: string;
+}
+
+const METADATA_PROMISES: MetadataPromise[] = [
+  {
+    name: 'a scope outside scopes_supported',
+    metadataKey: 'scopes_supported',
+    unadvertised: 'bogus-admin',
+    drive: (as, clientId, value) => authorizeRequest(as, clientId, { scope: `mcp ${value}` }),
+    refusal: 'invalid_scope',
+  },
+  {
+    name: 'a PKCE method outside code_challenge_methods_supported',
+    metadataKey: 'code_challenge_methods_supported',
+    unadvertised: 'plain',
+    drive: (as, clientId, value) =>
+      authorizeRequest(as, clientId, { code_challenge_method: value }),
+    refusal: 'invalid_request',
+  },
+  {
+    name: 'a response_type outside response_types_supported',
+    metadataKey: 'response_types_supported',
+    unadvertised: 'token',
+    drive: (as, clientId, value) => authorizeRequest(as, clientId, { response_type: value }),
+    refusal: 'invalid_request',
+  },
+  {
+    name: 'a grant_type outside grant_types_supported',
+    metadataKey: 'grant_types_supported',
+    unadvertised: 'password',
+    drive: (as, clientId, value) =>
+      fetch(as.token_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: form({ grant_type: value, client_id: clientId }),
+      }),
+    refusal: 'unsupported_grant_type',
+  },
+];
+
+describe('a value this AS advertises is a value it enforces', () => {
+  it.each(METADATA_PROMISES.map((p) => [p.name, p]))(
+    '%s is refused with an OAuth error, never honoured',
+    async (_name: string, promise: MetadataPromise) => {
+      const as = await asMetadata();
+      const advertised = as[promise.metadataKey] as string[];
+      expect(advertised, `${promise.metadataKey} is not advertised at all`).toBeInstanceOf(Array);
+      // A row whose value has since been advertised is testing nothing; fail loudly rather than pass.
+      expect(advertised).not.toContain(promise.unadvertised);
+
+      const { body: client } = await dcr(as);
+      const res = await promise.drive(as, client.client_id, promise.unadvertised);
+
+      const { code, body } = await oauthErrorOf(res);
+      expect(code).toBe(promise.refusal);
+      expect(body).not.toContain('consent_id');
+    },
+  );
+});
+
+/**
+ * The consent page leads with the redirect target because it is the one thing on it the client
+ * cannot choose freely — so it must stay readable for every redirect_uri that can reach it.
+ * `new URL(uri).origin` is the literal string 'null' for every non-special scheme, which collapses
+ * that signal exactly where the owner needs it and leaves the attacker-supplied client_name as the
+ * only identity on the page.
+ */
+interface RedirectRendering {
+  name: string;
+  redirectUri: string;
+  /** A substring uniquely derived from the URI that the identity line must carry. */
+  identity: string;
+  /** Material the URI carries that must NOT reach the page. */
+  absent?: string;
+}
+
+const REDIRECT_CORPUS: RedirectRendering[] = [
+  { name: 'an https URL', redirectUri: 'https://app.example/cb', identity: 'https://app.example' },
+  {
+    name: 'an http loopback URL',
+    redirectUri: 'http://127.0.0.1:9999/callback',
+    identity: 'http://127.0.0.1:9999',
+  },
+  { name: 'a native-app custom scheme', redirectUri: 'myapp://cb', identity: 'myapp://cb' },
+  {
+    name: 'a javascript: URI',
+    redirectUri: 'javascript:alert(1)',
+    identity: 'javascript:alert(1)',
+  },
+  { name: 'a data: URI', redirectUri: 'data:text/plain,hi', identity: 'data:text/plain,hi' },
+  {
+    name: 'an IPv6 literal host',
+    redirectUri: 'http://[::1]:8080/cb',
+    identity: 'http://[::1]:8080',
+  },
+  {
+    name: 'a userinfo-bearing URL',
+    redirectUri: 'https://user:hunter2@app.example/cb',
+    identity: 'https://app.example',
+    absent: 'hunter2',
+  },
+  {
+    name: 'a unicode host',
+    redirectUri: 'https://exämple.test/cb',
+    identity: 'https://xn--exmple-cua.test',
+  },
+];
+
+describe('the consent page names the redirect target for every URI that reaches it', () => {
+  it.each(REDIRECT_CORPUS.map((r) => [r.name, r]))(
+    '%s is either refused or rendered as itself, never as the literal null',
+    async (_name: string, row: RedirectRendering) => {
+      const as = await asMetadata();
+      const { res: regRes, body: client } = await dcr(as, {
+        redirect_uris: [row.redirectUri],
+        client_name: 'Totally Legit',
+      });
+      if (regRes.status !== 201) {
+        expect(regRes.status).toBeGreaterThanOrEqual(400);
+        return;
+      }
+
+      // Omit redirect_uri: a client with exactly one registered URI may, and the AS then renders the
+      // value IT stored rather than one the request echoed back.
+      const res = await authorizeRequest(as, client.client_id, { redirect_uri: undefined });
+      const html = await res.text();
+      if (!html.includes('consent_id')) {
+        expect(res.status).not.toBe(200);
+        return;
+      }
+
+      expect(html).toContain(`<strong>${row.identity}</strong>`);
+      expect(html).not.toContain('<strong>null</strong>');
+      if (row.absent !== undefined) expect(html).not.toContain(row.absent);
+    },
+  );
+});
+
 /**
  * Every endpoint of this front door is rate-limited per client address, so the limiter is only a
  * defence if that address is the CLIENT's. Under the shipped recipe (examples/self-host-remote

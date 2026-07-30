@@ -82,6 +82,13 @@ function isUsableCost({ N, r, p }: ScryptParams): boolean {
 /** Hash an owner passphrase as `scrypt$N=..,r=..,p=..$<saltB64>$<hashB64>` for at-rest storage. */
 export function hashOwnerSecret(passphrase: string, params: ScryptParams = DEFAULT_PARAMS): string {
   if (passphrase.length === 0) throw new Error('owner passphrase must not be empty');
+  // Refuse here what makeOwnerVerifier refuses, so that provisioning cannot hand the operator a
+  // record that only fails at boot — on a credential whose plaintext is already gone.
+  if (!isUsableCost(params)) {
+    throw new Error(
+      `invalid owner secret hash (scrypt parameters out of range: "${formatParams(params)}")`,
+    );
+  }
   const salt = randomBytes(SALTLEN);
   const hash = scryptSync(passphrase, salt, KEYLEN, scryptOptions(params));
   return `${FORMAT}$${formatParams(params)}$${salt.toString('base64')}$${hash.toString('base64')}`;

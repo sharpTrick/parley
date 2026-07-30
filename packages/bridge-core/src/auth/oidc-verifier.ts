@@ -71,6 +71,8 @@ const ACCESS_TOKEN_TYPES = new Set(['bearer', 'at+jwt', 'application/at+jwt']);
  */
 const ID_TOKEN_ONLY_CLAIMS = ['nonce', 'at_hash', 'c_hash'];
 
+const DEFAULT_CLOCK_SKEW_S = 30;
+
 /** Keycloak-style realm-roles claim. */
 interface RealmAccessClaim {
   roles?: unknown;
@@ -95,6 +97,7 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const { opts } = this;
+    const skewS = opts.clockSkewS ?? DEFAULT_CLOCK_SKEW_S;
     let payload: JWTPayload;
     let header: JWTHeaderParameters;
     try {
@@ -104,7 +107,7 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
         issuer: opts.issuer,
         audience: opts.audience,
         algorithms: ACCEPTED_SIGNING_ALGORITHMS,
-        clockTolerance: opts.clockSkewS ?? 30,
+        clockTolerance: skewS,
         ...(opts.now !== undefined ? { currentDate: new Date(opts.now()) } : {}),
       }));
     } catch {
@@ -135,7 +138,10 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
       token,
       clientId,
       scopes,
-      ...(typeof payload.exp === 'number' ? { expiresAt: payload.exp } : {}),
+      // Report the expiry INCLUDING the tolerance, so that requireBearerAuth — which re-checks this
+      // field against wall-clock with no tolerance of its own — cannot 401 a token this verifier
+      // just accepted, silently undoing the configured skew.
+      ...(typeof payload.exp === 'number' ? { expiresAt: payload.exp + skewS } : {}),
       // AuthInfo.resource must be a URL; with a fixed-string Keycloak audience (e.g.
       // "parley-mcp") there is no URL to report, so it is set only when the audience parses.
       ...(asUrl(opts.audience) !== undefined ? { resource: asUrl(opts.audience) } : {}),

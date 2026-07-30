@@ -191,6 +191,62 @@ describe('owner secret — a build-time validator must not defer its failure to 
 });
 
 /**
+ * A serializer that emits records its own deserializer refuses hands the operator a credential that
+ * fails at server boot, on a passphrase that can no longer be re-derived. Both halves are driven
+ * from ONE corpus — the reader's own in-range and out-of-range tables — so a future ceiling change
+ * cannot be applied to only one of them.
+ */
+function costOf(template: string): ScryptParams {
+  const m = /^scrypt\$N=(\d+),r=(\d+),p=(\d+)\$/.exec(template);
+  if (m === null) throw new Error(`cost template without a parameter block: ${template}`);
+  return { N: Number(m[1]), r: Number(m[2]), p: Number(m[3]) };
+}
+
+const COST_CORPUS: Array<[string, ScryptParams]> = [
+  ...IN_RANGE_COSTS,
+  ...PARAM_SETS,
+  ...OUT_OF_RANGE_COSTS.map(([label, template]): [string, ScryptParams] => [label, costOf(template)]),
+];
+
+function readerRefuses(params: ScryptParams): boolean {
+  const stored = `scrypt$N=${params.N},r=${params.r},p=${params.p}$${randomBytes(16).toString(
+    'base64',
+  )}$${randomBytes(32).toString('base64')}`;
+  try {
+    makeOwnerVerifier(stored);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// A refused row costs nothing either way — the writer must reject it without deriving — so only the
+// accepted rows need the cheapness filter the reader-side tables already use.
+const ROUND_TRIP = COST_CORPUS.filter(
+  ([, params]) => readerRefuses(params) || params.N * params.r <= 65536,
+);
+
+describe('owner secret — the writer accepts exactly what the reader accepts', () => {
+  const PASS = 'correct horse battery staple';
+
+  it('the corpus spans both verdicts, so the property cannot pass vacuously', () => {
+    expect(new Set(ROUND_TRIP.map(([, p]) => readerRefuses(p)))).toEqual(new Set([true, false]));
+  });
+
+  it.each(ROUND_TRIP)(
+    'hashOwnerSecret at %s throws exactly when makeOwnerVerifier would',
+    async (_label: string, params: ScryptParams) => {
+      if (readerRefuses(params)) {
+        expect(() => hashOwnerSecret(PASS, params)).toThrow(/invalid owner secret hash/);
+        return;
+      }
+      const stored = hashOwnerSecret(PASS, params);
+      expect(await makeOwnerVerifier(stored)(PASS)).toBe(true);
+    },
+  );
+});
+
+/**
  * An empty passphrase must never authorize, whatever the stored record says — and the short-circuit
  * that guarantees it is only provable against a record whose hash IS the derivation of the empty
  * string. Asserting `verify('') === false` against an ordinary record proves nothing: scrypt('')

@@ -149,9 +149,14 @@ describe('fetchRecentBlocking', () => {
    * Cancellation has to reach the thing actually doing the waiting, not just the wrapper around it.
    * Table both plugin flavours the seam allows — one that ignores `blockMs` (core naps between
    * calls) and one that honours it NATIVELY (the wait happens inside a single plugin call) — across
-   * every moment an abort can land, and assert a bounded wall-clock return in every cell. Real
-   * timers: the defect is that core stays parked inside `plugin.fetchRecent`, which a fake clock
-   * cannot express.
+   * every moment an abort can land AND every cadence an operator can configure, and assert a bounded
+   * wall-clock return in every cell. Real timers: the defect is that core stays parked — inside
+   * `plugin.fetchRecent`, or inside its own nap — which a fake clock cannot express.
+   *
+   * The cadence is a DIMENSION, not a constant. `catchup.block_poll_interval_ms` is an unbounded
+   * positive integer, so it can be set as coarse as the whole budget; a wait that only re-reads the
+   * signal at its boundaries then holds a cancelled long-poll for the entire budget, and a table
+   * that pins the cadence small is precisely what hides it.
    */
   describe('an aborted long-poll returns in bounded time on every plugin flavour', () => {
     const BUDGET_MS = 3000;
@@ -180,6 +185,12 @@ describe('fetchRecentBlocking', () => {
       'after several poll iterations': (ac: AbortController) => setTimeout(() => ac.abort(), 120).unref?.(),
     };
 
+    const cadences = {
+      'a cadence far finer than the budget': 40,
+      'a cadence half the budget': BUDGET_MS / 2,
+      'a cadence as coarse as the whole budget': BUDGET_MS,
+    };
+
     // `since` is a DIMENSION, not a constant: the tool explicitly invites a `since`-less long poll
     // ("Omit for the recent window"), and that is the column where no page has landed yet and no
     // cursor exists to hand back — so cancellation there cannot be a `nextCursor` at all.
@@ -191,7 +202,7 @@ describe('fetchRecentBlocking', () => {
     for (const [flavour, make] of Object.entries(flavours)) {
       for (const [when, fire] of Object.entries(timings)) {
         for (const [start, argsFor] of Object.entries(starts)) {
-          it(`${flavour} × aborted ${when} × ${start}`, async () => {
+          it.each(Object.entries(cadences))(`${flavour} × aborted ${when} × ${start} × %s`, async (_cadence, pollIntervalMs) => {
             const plugin = make();
             const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
             const ac = new AbortController();
@@ -200,7 +211,7 @@ describe('fetchRecentBlocking', () => {
             const outcome = await fetchRecentBlocking(
               plugin,
               { topic: T, ...argsFor(tail) },
-              { blockMs: BUDGET_MS, pollIntervalMs: 40, signal: ac.signal },
+              { blockMs: BUDGET_MS, pollIntervalMs, signal: ac.signal },
             ).then(
               (res) => ({ res }),
               (err: unknown) => ({ err }),
@@ -502,30 +513,4 @@ describe('fetchRecentBlocking', () => {
     });
   });
 
-  it('stops early when the abort signal fires', async () => {
-    const plugin = new FakePlugin();
-    const t = asTopic('room');
-    const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
-    const clock = fakeClock();
-    const ac = new AbortController();
-
-    const pending = fetchRecentBlocking(
-      plugin,
-      { topic: t, since: tail },
-      {
-        blockMs: 10_000,
-        pollIntervalMs: 250,
-        now: clock.now,
-        sleep: clock.sleep,
-        signal: ac.signal,
-      },
-    );
-    await flush();
-    ac.abort();
-    await clock.advance(250);
-
-    const res = await pending;
-    expect(res.messages).toEqual([]);
-    expect(res.nextCursor).toBe(tail);
-  });
 });

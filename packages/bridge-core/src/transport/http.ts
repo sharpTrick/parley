@@ -143,9 +143,8 @@ export function createRemoteHttpApp(
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
 
-  // Derive the tool deps ONCE at app scope (config is constant): the allowlist/regexes and tool
-  // descriptions are compiled a single time and reused by every per-request reactive server and by
-  // the presence loop below — no per-POST recompilation.
+  // Derive the tool deps ONCE at app scope (config is constant), so the allowlist and its compiled
+  // regexes are shared by every per-request reactive server and by the presence loop below.
   const deps = toolDepsFor(plugin, cfg);
 
   // The chat bridge is a long-lived participant too: announce presence off the shared plugin

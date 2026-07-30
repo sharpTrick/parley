@@ -65,7 +65,7 @@ export {
 } from './engine/presence.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
-export { registerTools, type ToolDeps } from './transport/tools.js';
+export { registerTools, toolDepsFor, type ToolDeps } from './transport/tools.js';
 export {
   emitChannel,
   channelMeta,

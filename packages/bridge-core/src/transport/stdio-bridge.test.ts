@@ -54,6 +54,7 @@ class RecordingPlugin implements BackendPlugin {
       subscribeThrowsOn?: string;
       connectThrows?: boolean;
       post?: PostBehaviour;
+      subscribeParks?: () => Promise<void>;
     } = {},
   ) {}
 
@@ -71,6 +72,7 @@ class RecordingPlugin implements BackendPlugin {
 
   async subscribe(topic: Topic, _handler: MessageHandler): Promise<void> {
     this.events.push({ type: 'subscribe', topic });
+    if (this.opts.subscribeParks !== undefined) await this.opts.subscribeParks();
     if (this.opts.subscribeThrowsOn === topic) {
       throw new Error(`subscribe boom on ${topic}`);
     }
@@ -213,6 +215,125 @@ describe('bridge attach ordering + rollback', () => {
         );
       },
     );
+  });
+
+  /**
+   * `shutdown()` racing `attach()`. Every await inside attach is a point where the latch can already
+   * be set by the time it resolves, and the steps AFTER it must not run — a presence loop started
+   * past teardown beats on forever, advertising a disconnected bridge as reachable, with shutdown()
+   * already spent. Park each await in turn, land a full shutdown() while it is parked, then release:
+   * one row per await point, so an await added to attach without a matching latch recheck fails its
+   * own row rather than riding along on a neighbour's.
+   *
+   * The release is deliberately UNLATCHED and therefore runs TWICE here — the parked step finishes
+   * AFTER shutdown released everything, re-acquiring what it was in the middle of (a transport
+   * handshake that completes after `server.close()`; a subscription registered after
+   * `plugin.disconnect()`), so the rollback has to release it again. The rows pin that: both the
+   * repeat count and the post-conditions it exists to produce.
+   */
+  describe('shutdown() landing mid-attach', () => {
+    /** A latch a parked step waits on, plus a signal that the step has reached it. */
+    function gate(): { park: () => Promise<void>; arrived: Promise<void>; open: () => void } {
+      let open!: () => void;
+      const opened = new Promise<void>((r) => {
+        open = r;
+      });
+      let reached!: () => void;
+      const arrived = new Promise<void>((r) => {
+        reached = r;
+      });
+      return {
+        park: async () => {
+          reached();
+          await opened;
+        },
+        arrived,
+        open,
+      };
+    }
+
+    type Gate = ReturnType<typeof gate>;
+    type Armed = { plugin: RecordingPlugin; transport: AnyTransport };
+
+    const PARK_POINTS: Array<[name: string, arm: (g: Gate) => Armed]> = [
+      [
+        'the transport handshake (server.connect)',
+        (g) => {
+          const [, transport] = InMemoryTransport.createLinkedPair();
+          const start = transport.start.bind(transport);
+          transport.start = async (): Promise<void> => {
+            await g.park();
+            return start();
+          };
+          return { plugin: new RecordingPlugin(), transport };
+        },
+      ],
+      [
+        'the push loop (plugin.subscribe)',
+        (g) => ({
+          plugin: new RecordingPlugin({ subscribeParks: g.park }),
+          transport: InMemoryTransport.createLinkedPair()[1],
+        }),
+      ],
+    ];
+
+    // A seam whose `disconnect` is NOT idempotent is the case the double release exposes: the second
+    // call must stay absorbed, never escaping as an unhandled rejection or a different attach error.
+    const DISCONNECTS = ['resolves every time', 'rejects on the second call'] as const;
+
+    it.each(
+      PARK_POINTS.flatMap(([name, arm]) =>
+        DISCONNECTS.map((d) => [name, d, arm] as [string, (typeof DISCONNECTS)[number], (g: Gate) => Armed]),
+      ),
+    )('parked in %s, with a disconnect that %s', async (_name, disconnects, arm) => {
+      const g = gate();
+      const { plugin, transport } = arm(g);
+      if (disconnects !== 'resolves every time') {
+        const real = plugin.disconnect.bind(plugin);
+        plugin.disconnect = async (): Promise<void> => {
+          await real();
+          if (plugin.disconnectCount > 1) throw new Error('disconnect boom (not idempotent)');
+        };
+      }
+      // ONE topic, so the parked step is the whole of its stage: `startPushLoop` iterates topics
+      // with no latch of its own, and a second topic would subscribe after teardown no matter which
+      // recheck is in place — hiding the recheck this row exists to witness.
+      const cfg = parseConfig({
+        identity: { handle: 'agent' },
+        topics: ['ctx'],
+        live_push: { enabled: true },
+        presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
+      });
+      const bridge = await buildBridge(plugin, cfg);
+      const closeSpy = vi.spyOn(bridge.server, 'close');
+
+      const escaped = await unhandledDuring(async () => {
+        const attaching = bridge.attach(transport).then(
+          () => 'resolved',
+          (e: Error) => e.message,
+        );
+        await g.arrived;
+        expect(await within(TEARDOWN_BUDGET_MS, bridge.shutdown())).not.toBe('TIMED OUT');
+        g.open();
+        expect(await within(TEARDOWN_BUDGET_MS, attaching)).toMatch(/bridge shut down while attaching/);
+        // Several heartbeat periods: a presence loop started past the latch would beat forever.
+        await new Promise((r) => setTimeout(r, 120));
+      });
+
+      expect(plugin.events.filter((e) => e.type === 'post' && e.topic === PRESENCE_TOPIC)).toEqual([]);
+      expect(escaped).toEqual([]);
+      // The step that resumes after teardown must start nothing further: once the bridge has
+      // disconnected, the only seam call left to make is the rollback's own second disconnect. This
+      // is what makes EVERY recheck falsifiable — the one guarding a later await would otherwise
+      // cover for a missing one guarding an earlier await, and the row would stay green.
+      const released = plugin.events.findIndex((e) => e.type === 'disconnect');
+      expect(plugin.events.slice(released + 1).filter((e) => e.type !== 'disconnect')).toEqual([]);
+      // Released TWICE, on purpose: the parked step finished after shutdown had already released
+      // everything, so a subscription it registered on a disconnected plugin is only reclaimed by
+      // the rollback's own second release. Latching that away leaves it dangling.
+      expect(plugin.disconnectCount).toBe(2);
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    });
   });
 
   /**

@@ -53,6 +53,12 @@ interface PendingConsent {
   redirectUriSupplied: boolean;
   expiresAtMs: number;
 }
+interface ClientState {
+  clientId: string;
+  expiresAtMs: number;
+  /** Whether reaching this state cost the owner's passphrase, or any anonymous caller can create it. */
+  ownerApproved: boolean;
+}
 
 /**
  * Whether the client itself wrote `redirect_uri` on the authorization request. The SDK's handler
@@ -76,9 +82,17 @@ export interface ParleyOAuthProviderOptions {
   verifyOwner: (passphrase: string) => Promise<boolean>;
   /** Path the consent form POSTs to (mounted by the remote app). */
   consentPath: string;
+  /**
+   * Scopes this AS advertises in its metadata. A request for anything outside the set is refused
+   * with `invalid_scope`; pass the SAME array the metadata document is built from, so the advertised
+   * set and the enforced one cannot drift.
+   */
+  scopesSupported?: string[];
   /** Clock injectable for tests; defaults to Date.now. */
   now?: () => number;
 }
+
+const DEFAULT_SCOPES_SUPPORTED = ['mcp'];
 
 /**
  * Single-tenant OAuth 2.1 + PKCE provider (DESIGN §10/§14). It is the authorization server for
@@ -132,27 +146,46 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     this.clients.clear();
   }
 
-  // Keep every client-keyed store listed here, so that a state the owner holds BEFORE any token
-  // exists — a consent awaiting their passphrase, an approved code not yet exchanged — still
-  // protects their registration from the eviction below.
-  private *clientStates(): Iterable<{ clientId: string; expiresAtMs: number }> {
+  // Keep every client-keyed store listed here, and keep `ownerApproved` honest: a state the owner
+  // holds BEFORE any token exists — an approved code not yet exchanged — still protects its
+  // registration from the eviction below, while a state an anonymous caller can create for itself
+  // does not.
+  private *clientStates(): Iterable<ClientState> {
     for (const r of this.access.values()) {
-      yield { clientId: r.clientId, expiresAtMs: r.expiresAt * 1000 };
+      yield { clientId: r.clientId, expiresAtMs: r.expiresAt * 1000, ownerApproved: true };
     }
-    for (const r of this.refresh.values()) yield r;
-    for (const r of this.codes.values()) yield r;
-    for (const r of this.redeeming.values()) yield r;
+    for (const store of [this.refresh, this.codes, this.redeeming]) {
+      for (const r of store.values()) {
+        yield { clientId: r.clientId, expiresAtMs: r.expiresAtMs, ownerApproved: true };
+      }
+    }
     for (const r of this.pending.values()) {
-      yield { clientId: r.client.client_id, expiresAtMs: r.expiresAtMs };
+      yield { clientId: r.client.client_id, expiresAtMs: r.expiresAtMs, ownerApproved: false };
     }
   }
 
-  private hasClientState(clientId: string): boolean {
+  private hasLiveState(clientId: string, accept: (state: ClientState) => boolean): boolean {
     const nowMs = this.now();
     for (const state of this.clientStates()) {
-      if (state.clientId === clientId && state.expiresAtMs >= nowMs) return true;
+      if (state.clientId === clientId && state.expiresAtMs >= nowMs && accept(state)) return true;
     }
     return false;
+  }
+
+  /**
+   * Who to shed when the map is full, in order of what the owner has invested: an idle registration
+   * first, then one holding nothing but a consent nobody has approved yet. A pending consent is
+   * state any anonymous caller can create by calling /authorize, so counting it as "in use" would
+   * let registration spam pin every slot and refuse the owner's connector outright — the very
+   * lock-out the cap exists to prevent. Only owner-approved state, which costs the passphrase, is
+   * unevictable.
+   */
+  private evictionCandidate(): string | undefined {
+    const ids = [...this.clients.keys()];
+    return (
+      ids.find((id) => !this.hasLiveState(id, () => true)) ??
+      ids.find((id) => !this.hasLiveState(id, (state) => state.ownerApproved))
+    );
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
@@ -162,9 +195,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       registerClient: (client) => {
         const full = client as OAuthClientInformationFull;
         if (!this.clients.has(full.client_id) && this.clients.size >= MAX_CLIENTS) {
-          // Only ever evict a client with no live grant state, so that unauthenticated DCR spam
-          // cannot push the owner's consented client out of the map and lock them out.
-          const evictable = [...this.clients.keys()].find((id) => !this.hasClientState(id));
+          const evictable = this.evictionCandidate();
           if (evictable === undefined) {
             throw new TemporarilyUnavailableError('client registration capacity reached');
           }
@@ -174,6 +205,16 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
         return full;
       },
     };
+  }
+
+  private assertScopes(scopes: string[] | undefined): void {
+    const supported = this.opts.scopesSupported ?? DEFAULT_SCOPES_SUPPORTED;
+    const unsupported = (scopes ?? []).filter((s) => !supported.includes(s));
+    if (unsupported.length > 0) {
+      throw new InvalidScopeError(
+        `this server does not issue the scope(s) ${unsupported.join(' ')}; it supports ${supported.join(' ')}`,
+      );
+    }
   }
 
   private assertResource(resource: URL | undefined): void {
@@ -194,6 +235,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     res: Response,
   ): Promise<void> {
     this.assertResource(params.resource);
+    this.assertScopes(params.scopes);
     const consentId = randomUUID();
     this.pending.set(consentId, {
       client,
@@ -392,7 +434,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
   ): string {
     const name = escapeHtml(client.client_name ?? client.client_id);
     const scopeList = (params.scopes ?? []).map(escapeHtml).join(', ') || '(none requested)';
-    const redirect = escapeHtml(new URL(params.redirectUri).origin);
+    const redirect = escapeHtml(identifyingRedirect(params.redirectUri));
     return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Parley — authorize</title>
@@ -410,6 +452,22 @@ button{margin-top:1.25rem;padding:.6rem 1.25rem;border:0;border-radius:8px;backg
 <label for="passphrase">Owner passphrase</label>
 <input id="passphrase" name="passphrase" type="password" autocomplete="off" autofocus required>
 <button type="submit">Approve</button></form></div></body></html>`;
+  }
+}
+
+/**
+ * The consent page leads with the redirect target because it is the one thing on the page the
+ * client cannot choose freely. `URL.origin` is the opaque string `'null'` for every non-special
+ * scheme (`myapp://cb`), so taking it unconditionally would print a literal `null` as the client's
+ * identity and leave the attacker-supplied `client_name` as the only thing the owner can read. Fall
+ * back to the whole URI, which at least names the scheme and host the code would be handed to.
+ */
+function identifyingRedirect(redirectUri: string): string {
+  try {
+    const { origin } = new URL(redirectUri);
+    return origin === 'null' ? redirectUri : origin;
+  } catch {
+    return redirectUri;
   }
 }
 

@@ -132,7 +132,10 @@ export async function fetchRecentBlocking(
 
     if (now() >= deadline || opts.blockMs <= 0 || opts.signal?.aborted) return result;
 
-    await sleep(Math.min(opts.pollIntervalMs, Math.max(0, deadline - now())));
+    // Race the nap against the signal, so that cancellation latency is bounded by the ABORT and not
+    // by the cadence: `block_poll_interval_ms` is an operator knob up to the whole budget, and a nap
+    // whose abort is only re-read at the next iteration holds a cancelled long-poll for all of it.
+    await untilAborted(sleep(Math.min(opts.pollIntervalMs, Math.max(0, deadline - now()))), opts.signal);
   }
 }
 
