@@ -1,5 +1,5 @@
 import { asHandle } from '@sharptrick/parley-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { XmppPlugin, type XmppBackendConfig } from '../src/index.js';
 import { BASE, canAuth, freshTopic, SECOND_ACCOUNT } from './live-xmpp.js';
 
@@ -57,6 +57,20 @@ const conflictRow: Row = {
   expected: 'loud-conflict',
 };
 
+/**
+ * The same clash with `nick` UNSET on the loser, which is the configuration the README recommends:
+ * the identity.handle it would adopt is already held by the other account, so it must fall back to
+ * its provisional per-connection nick and keep posting — the documented degradation, and the one that
+ * used to be a permanent hard failure whenever `post` was the first seam call.
+ */
+const fallbackRow: Row = {
+  name: 'DIFFERENT accounts, nick unset on the loser: it falls back and keeps posting',
+  a: { nick: 'taken-handle' },
+  b: { ...SECOND_ACCOUNT },
+  handles: ['irrelevant', 'taken-handle'],
+  expected: 'distinct-senders',
+};
+
 const serverUp = await canAuth(BASE);
 const secondAccount = serverUp && (await canAuth(SECOND_ACCOUNT));
 
@@ -99,4 +113,33 @@ describe.skipIf(!serverUp)('XMPP multi-session config claims (README)', () => {
   it.skipIf(!secondAccount)(conflictRow.name, async () => {
     await run(conflictRow);
   });
+
+  it.skipIf(!secondAccount)(fallbackRow.name, async () => {
+    const a = new XmppPlugin();
+    const b = new XmppPlugin();
+    const topic = freshTopic('ms-fallback');
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((m) => {
+      errors.push(String(m));
+    });
+    try {
+      await a.connect({ ...BASE, ...fallbackRow.a });
+      await b.connect({ ...BASE, ...fallbackRow.b });
+      await a.post(topic, asHandle('irrelevant'), 'from-a'); // 'a' occupies as 'taken-handle'
+
+      // 'b' would adopt 'taken-handle' from its identity and cannot, so it reverts — and posts.
+      await expect(b.post(topic, asHandle('taken-handle'), 'from-b')).resolves.toBeDefined();
+      expect(errors.join('\n')).toContain("could not take 'taken-handle'");
+
+      const read = await a.fetchRecent({ topic, limit: 10 });
+      const senders = new Map(read.messages.map((m) => [String(m.content), String(m.senderHandle)]));
+      expect([...senders.keys()].sort()).toEqual(['from-a', 'from-b']);
+      expect(senders.get('from-a')).toBe('taken-handle');
+      expect(senders.get('from-b')).not.toBe('taken-handle');
+    } finally {
+      spy.mockRestore();
+      await a.disconnect();
+      await b.disconnect();
+    }
+  }, 40_000);
 });

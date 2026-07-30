@@ -2,7 +2,7 @@ import { asTopic } from '@sharptrick/parley-core';
 import { xml } from '@xmpp/client';
 import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
-import { type ArchiveItem, priv } from './fake-xmpp.js';
+import { attach, type ArchiveItem, FakeXmpp, priv } from './fake-xmpp.js';
 
 // XMPP MAM result provenance. `onMamResult` must accept a streamed
 // `<result xmlns='urn:xmpp:mam:2'>` item ONLY when the outer message stanza's bare `from`
@@ -112,25 +112,13 @@ describe('XMPP MAM result provenance', () => {
 
   it('generates the MAM queryid with crypto.randomUUID(), not Math.random()', async () => {
     const plugin = new XmppPlugin();
-
-    // Fake @xmpp client: capture the queryid off the outgoing MAM <query> IQ and return an
-    // immediately-complete <fin> so mamQuery resolves without a broker.
-    let capturedQueryid: string | undefined;
-    const fakeClient = {
-      iqCaller: {
-        request: async (el: {
-          getChild(name: string, ns?: string): { attrs: Record<string, string> } | undefined;
-        }) => {
-          capturedQueryid = el.getChild('query', NS_MAM)?.attrs.queryid;
-          return xml('iq', { type: 'result' }, xml('fin', { xmlns: NS_MAM, complete: 'true' }));
-        },
-      },
-    };
-    priv(plugin).xmpp = fakeClient;
+    const fake = new FakeXmpp();
+    attach(plugin, fake);
 
     const res = await priv(plugin).mamQuery(asTopic('room1'), { max: 200 });
     expect(res.complete).toBe(true);
 
+    const capturedQueryid = fake.sentIqs[0]?.getChild('query', NS_MAM)?.attrs.queryid;
     expect(capturedQueryid).toBeDefined();
     // The Math.random() token was `q-...`; a crypto UUID matches the canonical UUID shape.
     expect(capturedQueryid).toMatch(UUID_RE);

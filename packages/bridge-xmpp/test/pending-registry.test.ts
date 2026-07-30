@@ -38,7 +38,7 @@ describe('XMPP keyed correlation registries (a superseded entry never unregister
     vi.useRealTimers();
   });
 
-  it('pendingJoins: a re-join registered while the first is in flight survives the first timing out', async () => {
+  it('pendingJoins: a re-join registered while the first is in flight survives, and the first settles with it', async () => {
     vi.useFakeTimers();
     const plugin = new XmppPlugin();
     const fake = new FakeXmpp();
@@ -62,13 +62,15 @@ describe('XMPP keyed correlation registries (a superseded entry never unregister
     );
     expect(p.pendingJoins.size).toBe(1);
 
-    await vi.advanceTimersByTimeAsync(11_000); // past the FIRST entry's timeout, not the second's
-    expect(await firstOutcome).toMatch(/superseded|timeout/);
-
-    // The successor is still registered and still completes on its own self-presence.
+    // Past the FIRST entry's own 15 s timeout. It is the successor's join that is in flight now, so
+    // the loser neither times out nor fails: it waits on the successor like its caller does.
+    await vi.advanceTimersByTimeAsync(11_000);
     expect(p.pendingJoins.size).toBe(1);
+    expect(vi.getTimerCount()).toBe(1); // the loser's timer went with its registration
+
     p.onStanza(selfPresence(room, p.nick));
     expect(await secondOutcome).toBe('resolved');
+    expect(await firstOutcome).toBe('resolved');
     expect(p.pendingJoins.size).toBe(0);
   });
 

@@ -23,8 +23,9 @@ async function makeContext() {
     concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
       // Keep the long-lived ctx.plugin joined before the transient writers arrive, so that the
       // room is created (and unlocked) by it: the writers then never hit the cold-creation race,
-      // and the archive is not at the mercy of the last writer leaving.
-      await plugin.fetchRecent({ topic, limit: 1 });
+      // and the archive is not at the mercy of the last writer leaving. It has to be a call that
+      // JOINS — a read deliberately does not create the room (README "A read never creates a room").
+      await plugin.subscribe(topic, () => undefined);
       const plugins = await Promise.all(
         Array.from({ length: writers }, async () => {
           const p = new XmppPlugin();

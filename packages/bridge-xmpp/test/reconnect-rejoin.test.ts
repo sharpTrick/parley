@@ -1,5 +1,4 @@
 import { asTopic } from '@sharptrick/parley-core';
-import { xml } from '@xmpp/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Class: state the transport silently drops on a reconnect and the plugin never rebuilds. The
@@ -20,58 +19,9 @@ vi.mock('@xmpp/client', async () => {
 
 // Imported after the mock is declared; vitest hoists vi.mock above all imports regardless.
 import { XmppPlugin } from '../src/index.js';
-import { priv } from './fake-xmpp.js';
+import { FakeXmpp, priv } from './fake-xmpp.js';
 
 const NS_MUC = 'http://jabber.org/protocol/muc';
-
-interface Stanza {
-  is(name: string, ns?: string): boolean;
-  attrs: Record<string, string>;
-  getChild(name: string, ns?: string): unknown;
-}
-interface FakeClient {
-  sent: Stanza[];
-  on(event: string, cb: (arg?: unknown) => void): void;
-  emit(event: string): void;
-  start(): Promise<unknown>;
-  stop(): Promise<unknown>;
-  send(el: unknown): Promise<unknown>;
-  iqCaller: { request(el: unknown, t?: number): Promise<unknown> };
-  jid: { toString(): string };
-}
-
-const makeFakeClient = (): FakeClient => {
-  const handlers: Record<string, Array<(arg?: unknown) => void>> = {};
-  const sent: Stanza[] = [];
-  return {
-    sent,
-    on(event, cb) {
-      (handlers[event] ??= []).push(cb);
-    },
-    emit(event) {
-      for (const cb of handlers[event] ?? []) cb();
-    },
-    start: async () => undefined,
-    stop: async () => undefined,
-    send: async (el: unknown) => {
-      sent.push(el as Stanza);
-      return undefined;
-    },
-    iqCaller: {
-      request: async () =>
-        xml(
-          'iq',
-          { type: 'result' },
-          xml(
-            'query',
-            { xmlns: 'http://jabber.org/protocol/disco#info' },
-            xml('feature', { var: 'urn:xmpp:mam:2' }),
-          ),
-        ),
-    },
-    jid: { toString: () => 'parley@parley.local/r' },
-  };
-};
 
 describe('XMPP MUC re-join after reconnect', () => {
   afterEach(() => {
@@ -86,7 +36,7 @@ describe('XMPP MUC re-join after reconnect', () => {
   it.each(entries)(
     'skips the first online, then re-joins a room entered $how and fails in-flight posts',
     async ({ subscribe }) => {
-      const fake = makeFakeClient();
+      const fake = new FakeXmpp();
       mockState.client = fake;
       const plugin = new XmppPlugin();
       await plugin.connect({ username: 'parley', password: 's3cret-real-pw' });

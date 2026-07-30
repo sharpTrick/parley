@@ -31,6 +31,8 @@ export interface ArchiveItem {
 /** The plugin's private surface, reached by typed cast (the pattern the other suites use). */
 export interface XmppPrivate {
   nick: string;
+  provisionalNick?: string;
+  roomNicks: Map<string, string>;
   mamPage: number;
   nickAdoption?: Promise<void>;
   mamCheck?: Promise<void>;
@@ -97,6 +99,15 @@ export class FakeXmpp {
   readonly archives = new Map<string, ArchiveItem[]>();
   readonly jid = { toString: () => 'parley@parley.local/res' };
 
+  /**
+   * Every IQ this connection sent, in order. Recorded on the same list as presences and messages —
+   * an IQ is a stanza on the same stream — so a suite that asserts on an outgoing query drives the
+   * stand-in that models the server's contract instead of hand-rolling a weaker one.
+   */
+  get sentIqs(): El[] {
+    return this.sent.filter((s) => s.is('iq'));
+  }
+
   /** Latency inserted between a MAM query's archive SNAPSHOT and its `<fin>` (a remote round trip). */
   mamLatencyMs = 0;
   /** Fires when a MAM query arrives, BEFORE it snapshots the archive. */
@@ -110,6 +121,31 @@ export class FakeXmpp {
   joinReply: 'self' | 'error' | 'silent' = 'self';
   joinErrorCondition = 'conflict';
   joinErrorText = '';
+  /** Delay before the MUC answers a join, so a second join can be driven while the first is open. */
+  joinLatencyMs = 0;
+  /** How many join presences to answer with `joinErrorCondition` before behaving normally. */
+  joinErrorsRemaining = 0;
+  /**
+   * Nicks another occupant already holds: a join asking for one is answered `conflict`, exactly as
+   * MUC's unique-nickname rule does. Keyed by NICK rather than by attempt count, so a fixture cannot
+   * accidentally make the provisional fallback nick conflict too.
+   */
+  readonly conflictNicks = new Set<string>();
+  /**
+   * A nick-locking service (XEP-0045 status 210): the room admits the joiner under a nick of its
+   * OWN choosing, and every reflection then comes back from that nick rather than the requested one.
+   */
+  assignNick?: string;
+
+  /**
+   * Rooms that exist. A MUC auto-creates a room on the first join, and only the creator's
+   * self-presence carries status 201; `discoUnknownRoom` is what a server answers for a room that
+   * was never created.
+   */
+  readonly rooms = new Set<string>();
+  discoUnknownRoom: 'result' | 'item-not-found' = 'result';
+  /** Whether a join that CREATES the room says so (status 201), which is what unlocks + configures it. */
+  announceCreation = false;
 
   /** Whether a room's disco#info advertises `urn:xmpp:mam:2` (i.e. muc_mam is loaded). */
   discoMam = true;
@@ -151,6 +187,8 @@ export class FakeXmpp {
   readonly iqCaller = {
     request: (iq: unknown): Promise<unknown> => {
       if (this.dead) return Promise.reject(new Error('stream closed'));
+      this.sent.push(iq as El);
+      this.sentAt.push(Date.now());
       if (this.strictXml && illegalCodepoint(String(iq)) !== undefined) {
         this.killStream();
         return Promise.reject(new Error('not-well-formed: stream closed'));
@@ -222,6 +260,7 @@ export class FakeXmpp {
   }
 
   private archiveOf(room: string): ArchiveItem[] {
+    this.rooms.add(room); // a room with an archive exists, however the fixture seeded it
     const existing = this.archives.get(room);
     if (existing !== undefined) return existing;
     const fresh: ArchiveItem[] = [];
@@ -269,27 +308,49 @@ export class FakeXmpp {
   }
 
   private onJoin(presence: El): void {
+    if (this.joinLatencyMs > 0) {
+      setTimeout(() => this.answerJoin(presence), this.joinLatencyMs);
+      return;
+    }
+    this.answerJoin(presence);
+  }
+
+  private answerJoin(presence: El): void {
+    if (this.dead) return;
     const to = presence.attrs.to ?? '';
     const room = to.slice(0, to.indexOf('/'));
-    this.nick = to.slice(to.indexOf('/') + 1);
+    const requested = to.slice(to.indexOf('/') + 1);
+    this.nick = this.assignNick ?? requested;
     if (this.joinReply === 'silent') return;
-    if (this.joinReply === 'error') {
+    const taken = this.conflictNicks.has(requested);
+    if (taken || this.joinReply === 'error' || this.joinErrorsRemaining > 0) {
+      if (!taken && this.joinErrorsRemaining > 0) this.joinErrorsRemaining--;
       this.occupied.delete(room);
       this.feed(
         xml(
           'presence',
           { from: to, type: 'error' },
-          errorEl(this.joinErrorCondition, this.joinErrorText),
+          taken ? errorEl('conflict') : errorEl(this.joinErrorCondition, this.joinErrorText),
         ),
       );
       return;
     }
+    const created = !this.rooms.has(room);
+    this.rooms.add(room);
     this.occupied.add(room);
     this.feed(
       xml(
         'presence',
-        { from: to },
-        xml('x', { xmlns: NS_MUC_USER }, xml('status', { code: '110' })),
+        { from: `${room}/${this.nick}` },
+        xml(
+          'x',
+          { xmlns: NS_MUC_USER },
+          xml('status', { code: '110' }),
+          ...(this.assignNick !== undefined && this.assignNick !== requested
+            ? [xml('status', { code: '210' })]
+            : []),
+          ...(created && this.announceCreation ? [xml('status', { code: '201' })] : []),
+        ),
       ),
     );
     this.replayHistory(room, presence);
@@ -362,6 +423,10 @@ export class FakeXmpp {
 
   private async onIq(iq: El): Promise<unknown> {
     if (iq.getChild('query', NS_DISCO_INFO) !== undefined) {
+      const room = iq.attrs.to ?? '';
+      if (this.discoUnknownRoom === 'item-not-found' && !this.rooms.has(room)) {
+        throw stanzaError('item-not-found');
+      }
       return xml(
         'iq',
         { type: 'result' },
@@ -445,6 +510,9 @@ export const attach = (plugin: XmppPlugin, fake: FakeXmpp, room?: string): XmppP
   p.nick = fake.nick;
   p.nickAdoption = Promise.resolve();
   fake.on('stanza', (stanza) => p.onStanza(stanza)); // the wiring connect() does
-  if (room !== undefined) p.joined.set(room, Promise.resolve());
+  if (room !== undefined) {
+    p.joined.set(room, Promise.resolve());
+    fake.rooms.add(room);
+  }
   return p;
 };

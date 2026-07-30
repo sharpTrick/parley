@@ -13,7 +13,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 
 | Seam | XMPP |
 |---|---|
-| topic | one MUC room `<sanitizedTopic>@<muc_service>` (default service `muc.parley.local`); auto-created on join |
+| topic | one MUC room `<sanitizedTopic>@<muc_service>` (default service `muc.parley.local`); auto-created by `post`/`subscribe`, never by `fetch_recent` |
 | join | `<presence to='room/nick'>` with `<history maxstanzas='0'/>` — no replay; tracked + ensured before post/fetch/subscribe |
 | `post` | `<message type='groupchat'><body/><origin-id id='<uuid>'/></message>`; resolves on the MUC's **reflection**, returning its `<stanza-id by='room' id='…'>` |
 | cursor / backendMsgId | the `<stanza-id>` / MAM archive id (XEP-0359 / XEP-0313) — identical via live push and via catch-up |
@@ -56,11 +56,12 @@ catch-up semantics.
   `<presence type='unavailable'>` (a nick change, status 303, excluded) and for a post bounced as
   "not an occupant", drops the room from its join cache, and re-joins subscribed rooms — catch-up-only
   rooms re-join on their next seam call. That re-entry is **deferred and backs off** (200 ms, doubling
-  to a 30 s ceiling, with jitter), because the trigger is remote: a room that ends occupancy on every
-  join — a moderation bot, a members-only toggle, a MUC service that is shutting down — would
-  otherwise be re-joined as fast as the connection can send presence. After six consecutive losses
-  inside a minute the plugin logs one loud error and stops re-entering that room; live push for the
-  topic stays dead until a `post` or `fetch_recent` enters it again.
+  to 6.4 s at the last step, plus up to 200 ms of jitter), because the trigger is remote: a room that
+  ends occupancy on every join — a moderation bot, a members-only toggle, a MUC service that is
+  shutting down — would otherwise be re-joined as fast as the connection can send presence. After 6
+  consecutive losses, each within a minute of the previous, the plugin logs one loud error and stops
+  re-entering that room; live push for the topic stays dead until a `post` or `fetch_recent` enters it
+  again.
 - **Room lifetime = durability, and occupancy is not durable.** A *non-persistent* MUC room and
   its whole MAM archive are destroyed the moment the last occupant leaves — and occupancy is
   presence on one stream, so it ends at every disconnect, not only at shutdown: a network blip, a
@@ -72,6 +73,23 @@ catch-up semantics.
   configure the MUC service to default rooms **persistent**, or pre-create persistent rooms for
   your topics. After a reconnect the plugin re-sends the join presence for every room it had
   entered — subscribed or catch-up-only — so push and post recover without waiting for a timeout.
+- **A read never creates a room.** `post` and `subscribe` join, which auto-creates the room and asks
+  for it to be persistent. `fetch_recent` does not: it probes the room's `disco#info` first and, if the
+  server answers `item-not-found`, returns an **empty page with the caller's own cursor** instead of
+  provisioning anything. Without that, a `post_topics` pattern with a wildcard in it would let an
+  agent mint an unbounded number of persistent rooms and MAM archives on a shared server just by
+  reading topic names that do not exist — and nothing here ever destroys one. Operators sharing a MUC
+  service with other users should also set `restrict_room_creation` (Prosody) and pre-create the rooms
+  for their topics.
+- **Carriage returns do not survive a round trip.** XMPP bodies are XML character data, and XML 1.0
+  §2.11 requires the *parser* to translate a literal CR (and CRLF) to a single LF before any
+  application sees it — `post('a\rb')` reads back as `a\nb`. The escape that would survive it
+  (`&#xD;`) has to be produced by the serializer, and `@xmpp/xml` does not emit it for text nodes, so
+  this cannot be fixed inside this plugin: pre-encoding the character reference would only get the `&`
+  escaped in turn. Every other byte round-trips exactly (the shared conformance suite pins newlines,
+  tabs, surrounding spaces, astral emoji and combining sequences), and an ordinary XMPP client shows
+  what an agent posted; an escape layer of our own would break both. Treat CR as **normalized to LF**,
+  not preserved.
 - **`post`'s `inReplyTo` is ignored.** The seam's optional reply parent is dropped: nothing this
   backend returns carries the relation back, so an XEP-0461 `<reply/>` would be write-only. A
   reply posts as an ordinary top-level message in the topic's room.
@@ -92,14 +110,20 @@ catch-up semantics.
 - **One nick per logical identity.** The occupant nick is `identity.handle`, folded to the JID
   resource charset. Two sessions with different handles therefore get different senders on a shared
   account; two with the same handle are the same sender, which is what "same handle" means. If the
-  nick is already taken by someone else in the room, the plugin logs a loud error and keeps posting
-  under its provisional nick — pin `nick` to a free name to resolve it permanently.
+  nick is already taken by someone else in the room, the join is answered `conflict` and the plugin
+  logs a loud error and keeps posting under its provisional per-connection nick — the same way
+  whichever seam call hit the conflict first. Pin `nick` to a free name to resolve it permanently; a
+  `conflict` on a **pinned** nick is a misconfiguration and fails the call instead.
+- **A nick the server rewrites is adopted.** A nick-locking deployment admits the join under a nick of
+  its own choosing and says so with status 210. The occupant nick is tracked **per room** from that
+  presence, so this bridge still recognises its own reflections (and reports the nick the room
+  actually shows) rather than stalling every post until its reflection timeout.
 
 ## Config (`backend_config`)
 
 ```yaml
 backend_config:
-  service: "xmpp://127.0.0.1:5222"   # default
+  service: "xmpp://127.0.0.1:5222"   # default; use xmpps:// (or wss://) for anything non-loopback
   domain: "parley.local"             # default (the user's host)
   muc_service: "muc.parley.local"    # default (rooms live here)
   username: "parley"                 # default
@@ -111,6 +135,13 @@ backend_config:
 Every key is checked before the connection is opened, and an **unknown key is a load error** naming
 the accepted set — a misspelled `muc_servce` would otherwise leave every room addressed at the
 default MUC service and every join bouncing a condition that names nothing.
+
+> **Use `xmpps://` off localhost.** `@xmpp/client`'s STARTTLS is *opportunistic* — it upgrades only a
+> stream whose peer advertises the feature — and SASL PLAIN is always offered, so with `xmpp://` (or
+> `ws://`) to a non-loopback host an on-path attacker that strips `<starttls/>` is handed
+> `backend_config.password` in cleartext. That configuration is not refused (a loopback dev server
+> legitimately runs unencrypted, which is why the Prosody snippet below sets
+> `allow_unencrypted_plain_auth`), but it warns loudly on stderr at connect.
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same server)
 

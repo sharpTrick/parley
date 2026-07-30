@@ -68,11 +68,13 @@ const MAM_LAG_POLL_MS = 50;
 const STREAM_ERROR_LOG_MS = 5_000;
 /** First wait before re-entering a room whose occupancy ended remotely; doubles per repeat loss. */
 const REJOIN_BASE_MS = 200;
-const REJOIN_CEILING_MS = 30_000;
-/** Consecutive remote losses within {@link REJOIN_WINDOW_MS} after which the room is left alone. */
+/** Consecutive remote losses, each within {@link REJOIN_WINDOW_MS} of the last, after which the
+ * room is left alone. */
 const REJOIN_LIMIT = 6;
 /** Occupancy held this long counts as recovered: the consecutive-loss count starts over. */
 const REJOIN_WINDOW_MS = 60_000;
+/** Longest wait the {@link REJOIN_LIMIT}-step ladder can produce, jitter excluded. */
+export const REJOIN_MAX_WAIT_MS = REJOIN_BASE_MS * 2 ** (REJOIN_LIMIT - 1);
 /** Bounded retry for the transient MUC cold-creation race (see {@link XmppPlugin.doJoin}). */
 const JOIN_RETRIES = 8;
 /** Conditions that mean "room not committed yet" — retryable during concurrent cold-start. */
@@ -153,6 +155,28 @@ const JID_PART_KEYS = ['domain', 'muc_service', 'username'] as const;
 /** RFC 7622 §3.3/§3.4: a localpart or resourcepart longer than this is `jid-malformed`. */
 const JID_PART_MAX_BYTES = 1023;
 const MAX_MAM_PAGE = 10_000;
+
+/** Schemes whose stream starts in the clear; STARTTLS on them is opportunistic, never guaranteed. */
+const PLAINTEXT_SCHEMES = ['xmpp:', 'ws:'];
+
+/**
+ * Whether `service` would put the SASL password on the network in the clear. `@xmpp/starttls`
+ * upgrades only when the peer ADVERTISES the feature and `@xmpp/client` registers SASL PLAIN
+ * unconditionally, so an on-path attacker that strips `<starttls/>` from the stream features is
+ * handed the credential — there is nothing in the library that refuses to go on without it.
+ */
+export function isPlaintextRemote(service: string): boolean {
+  const scheme = /^([a-z][a-z0-9+.-]*:)/i.exec(service.trim())?.[1]?.toLowerCase();
+  if (scheme === undefined || !PLAINTEXT_SCHEMES.includes(scheme)) return false;
+  const authority = service.trim().slice(scheme.length).replace(/^\/\//, '');
+  const host = (/^([^/?#]*)/.exec(authority)?.[1] ?? '')
+    .replace(/^[^@]*@/, '')
+    .replace(/^(\[[^\]]*]):\d+$/, '$1')
+    .replace(/^\[(.*)]$/, '$1')
+    .replace(/^([^:]*):\d+$/, '$1')
+    .toLowerCase();
+  return !(host === 'localhost' || host === '::1' || /^127\./.test(host) || host === '');
+}
 
 const describeValue = (v: unknown): string => (typeof v === 'string' ? `'${v}'` : String(v));
 const bad = (key: string, reason: string): Error =>
@@ -256,7 +280,7 @@ const occupancyEndReason = (statuses: string[], x: El | undefined): string => {
 const MAM_MISSING_HINT =
   'this backend needs XEP-0313 MAM for MUC — enable mod_mam + muc_mam (Prosody) or mod_mam ' +
   '(ejabberd); without an archive there is no cursor, no catch-up and no live delivery';
-const mamCondition = (err: unknown): string =>
+const conditionOf = (err: unknown): string =>
   typeof (err as { condition?: unknown })?.condition === 'string'
     ? ((err as { condition: string }).condition)
     : err instanceof Error
@@ -275,8 +299,13 @@ class JoinError extends Error {
 }
 
 interface PendingJoin {
+  /** The nick this join's presence was addressed to; only a presence naming it (or one carrying
+   * XEP-0045 status 210) can be attributed to it. */
+  nick: string;
   resolve(): void;
   reject(err: Error): void;
+  /** Hand this entry's outcome to a successor join for the same room (see {@link XmppPlugin.joinOnce}). */
+  settleFrom(outcome: Promise<void>): void;
 }
 interface PendingPost {
   /** The room this post was sent to; only its own reflection may resolve the correlator. */
@@ -315,6 +344,12 @@ export class XmppPlugin implements BackendPlugin {
   private mucService = 'muc.parley.local';
   private handle = 'parley';
   private nick = `parley-${rand()}`;
+  /**
+   * The per-connection nick this bridge started with, kept as the fallback for a nick another
+   * occupant already holds — `undefined` when `backend_config.nick` pinned the nick, where a
+   * `conflict` is a misconfiguration to surface rather than to work around.
+   */
+  private provisionalNick?: string;
   private mamPage = MAM_PAGE;
   private stopped = false;
   private lastStreamErrorAt = 0;
@@ -325,6 +360,13 @@ export class XmppPlugin implements BackendPlugin {
 
   /** roomJid -> in-flight/settled join (cached like an "ensure"; idempotent). */
   private readonly joined = new Map<string, Promise<void>>();
+  /**
+   * roomJid -> the occupant nick the ROOM reported for this connection, which a nick-locking
+   * service rewrites (XEP-0045 status 210). Keyed per room rather than held as one field, so that
+   * one room's rewrite cannot make this connection's own reflections in every OTHER room fail the
+   * provenance check in {@link onGroupchat} — every post there would then stall to its timeout.
+   */
+  private readonly roomNicks = new Map<string, string>();
   /** roomJid -> consecutive remote occupancy losses and the deferred re-entry they scheduled. */
   private readonly rejoins = new Map<
     string,
@@ -352,6 +394,7 @@ export class XmppPlugin implements BackendPlugin {
     const username = cfg.username ?? 'parley';
     this.handle = username;
     this.nick = cfg.nick ?? `${username}-${rand()}`;
+    this.provisionalNick = cfg.nick === undefined ? this.nick : undefined;
     this.mamPage = cfg.mam_page ?? MAM_PAGE;
     this.stopped = false;
     this.nickAdoption = cfg.nick === undefined ? undefined : Promise.resolve();
@@ -365,9 +408,18 @@ export class XmppPlugin implements BackendPlugin {
           'XMPP account provisioned with this password is world-readable/injectable.',
       );
     }
+    const service = cfg.service ?? 'xmpp://127.0.0.1:5222';
+    if (isPlaintextRemote(service)) {
+      console.warn(
+        `[parley-xmpp] SECURITY: service ${service} is a plaintext scheme to a non-loopback host. ` +
+          "@xmpp/client's STARTTLS is opportunistic and SASL PLAIN is always offered, so a peer " +
+          'that does not advertise (or that is stripped of) STARTTLS receives ' +
+          'backend_config.password in the clear. Use xmpps:// or wss://.',
+      );
+    }
 
     const xmpp = client({
-      service: cfg.service ?? 'xmpp://127.0.0.1:5222',
+      service,
       domain: this.domain,
       username,
       password,
@@ -399,7 +451,7 @@ export class XmppPlugin implements BackendPlugin {
     // blocked fetch wakes, sees `stopped`, and returns an empty page — no leaked listeners/timers.
     for (const set of [...this.waiters.values()]) for (const fire of [...set]) fire('cancel');
     this.waiters.clear();
-    this.joined.clear();
+    this.forgetAllRooms();
     for (const state of this.rejoins.values()) clearTimeout(state.timer);
     this.rejoins.clear();
     this.mamCheck = undefined;
@@ -458,20 +510,25 @@ export class XmppPlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    const since = args.since === undefined ? undefined : String(args.since);
+    if (!(await this.roomExists(args.topic))) {
+      return { messages: [], nextCursor: args.since ?? asCursor('') };
+    }
     await this.ensureJoined(args.topic);
     const limit = args.limit ?? 100;
 
-    const since = args.since === undefined ? undefined : String(args.since);
     let items: MamItem[];
     if (since === undefined) {
       // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
       items = (await this.mamQuery(args.topic, { before: true, max: limit })).items;
     } else {
       items = await this.exclusiveMam(args.topic, since, limit);
-      const blockMs = args.blockMs ?? 0;
-      if (items.length === 0 && blockMs > 0) {
-        items = await this.blockingMam(args.topic, since, limit, Math.floor(blockMs));
-      }
+    }
+    const blockMs = Math.floor(args.blockMs ?? 0);
+    if (items.length === 0 && blockMs > 0) {
+      // An empty last-page window and an empty window after the zero cursor are the same window,
+      // so the since-less arm long-polls on `''` rather than silently ignoring `blockMs`.
+      items = await this.blockingMam(args.topic, since ?? '', limit, blockMs);
     }
 
     const messages = items.map((it) => this.toMessage(args.topic, it));
@@ -672,10 +729,11 @@ export class XmppPlugin implements BackendPlugin {
   private onPresence(stanza: El): void {
     const from = stanza.attrs.from ?? '';
     const room = bareOf(from);
+    const resource = resourceOf(from);
     const x = stanza.getChild('x', NS_MUC_USER);
     const statuses = (x?.getChildren('status') ?? []).map((s) => s.attrs.code ?? '');
     // Self-presence: our own nick echoed back, or status code 110.
-    const isSelf = resourceOf(from) === this.nick || statuses.includes('110');
+    const isSelf = resource === this.occupantNick(room) || statuses.includes('110');
 
     if (stanza.attrs.type === 'unavailable') {
       if (isSelf && !statuses.includes(STATUS_NICK_CHANGE)) {
@@ -685,13 +743,31 @@ export class XmppPlugin implements BackendPlugin {
     }
 
     const pending = this.pendingJoins.get(room);
-    if (pending === undefined) return;
     if (stanza.attrs.type === 'error') {
       const err = stanzaError(stanza);
-      pending.reject(new JoinError(err.condition, room, err.text));
+      pending?.reject(new JoinError(err.condition, room, err.text));
       return;
     }
     if (!isSelf) return;
+    // A self-presence names the occupant nick it is about, and status 110 alone does NOT make it
+    // this join's: the answer to a superseded join carries 110 for the nick that join asked for.
+    // Attribute it to the nick the pending join was addressed to, or to an explicit service rewrite
+    // (XEP-0045 status 210), so that a join is never settled for a nick this connection does not
+    // hold — after which its own reflections fail the provenance check and every post stalls to
+    // POST_TIMEOUT_MS.
+    const assignedByService = statuses.includes('210');
+    const addressed = pending?.nick ?? this.occupantNick(room);
+    if (resource !== '' && resource !== addressed && !assignedByService) return;
+    if (resource !== '' && resource !== this.occupantNick(room)) {
+      if (assignedByService) {
+        console.error(
+          `[parley-xmpp] ${room} assigned this connection the occupant nick '${resource}' instead ` +
+            `of '${addressed}'; messages from this bridge in that room are attributed to it`,
+        );
+      }
+      this.roomNicks.set(room, resource);
+    }
+    if (pending === undefined) return;
     // Status 201 = we just CREATED the room; it stays locked until its owner submits a config.
     if (statuses.includes('201')) {
       this.configureRoom(room).finally(() => pending.resolve());
@@ -716,7 +792,7 @@ export class XmppPlugin implements BackendPlugin {
   private onOccupancyLost(room: string, why: string): void {
     if (this.stopped) return;
     if (!this.joined.has(room) || this.pendingJoins.has(room)) return;
-    this.joined.delete(room);
+    this.forgetRoom(room);
 
     const now = Date.now();
     const prior = this.rejoins.get(room);
@@ -731,15 +807,14 @@ export class XmppPlugin implements BackendPlugin {
     if (losses > REJOIN_LIMIT) {
       this.rejoins.set(room, { losses, at: now });
       console.error(
-        `[parley-xmpp] occupancy in ${room} ended (${why}) ${losses} times inside ` +
-          `${REJOIN_WINDOW_MS} ms — not re-entering it again; live push for this topic stays dead ` +
-          'until a post or fetchRecent re-enters the room',
+        `[parley-xmpp] occupancy in ${room} ended (${why}) ${losses} consecutive times, each ` +
+          `within ${REJOIN_WINDOW_MS} ms of the previous — not re-entering it again; live push for ` +
+          'this topic stays dead until a post or fetchRecent re-enters the room',
       );
       return;
     }
     const wait =
-      Math.min(REJOIN_CEILING_MS, REJOIN_BASE_MS * 2 ** (losses - 1)) +
-      Math.floor(Math.random() * REJOIN_BASE_MS);
+      REJOIN_BASE_MS * 2 ** (losses - 1) + Math.floor(Math.random() * REJOIN_BASE_MS);
     console.error(`[parley-xmpp] occupancy in ${room} ended (${why}); re-joining in ${wait} ms`);
     this.rejoins.set(room, {
       losses,
@@ -821,7 +896,7 @@ export class XmppPlugin implements BackendPlugin {
     const originId = stanza.getChild('origin-id', NS_SID)?.attrs.id;
     if (originId !== undefined) {
       const pending = this.pendingPosts.get(originId);
-      const ours = resourceOf(from) === this.nick && room === pending?.room;
+      const ours = resourceOf(from) === this.occupantNick(room) && room === pending?.room;
       if (pending !== undefined && ours) {
         this.pendingPosts.delete(originId);
         if (archId !== undefined) {
@@ -892,7 +967,7 @@ export class XmppPlugin implements BackendPlugin {
       const complete = fin.getChild('fin', NS_MAM)?.attrs.complete === 'true';
       return { items: collector.slice(), complete };
     } catch (err) {
-      const condition = mamCondition(err);
+      const condition = conditionOf(err);
       if (condition === 'service-unavailable' || condition === 'feature-not-implemented') {
         throw new Error(`MAM query on ${room} answered ${condition} — ${MAM_MISSING_HINT}`);
       }
@@ -921,9 +996,7 @@ export class XmppPlugin implements BackendPlugin {
   private rejoinAfterReconnect(): void {
     for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
     this.pendingPosts.clear();
-    const rooms = [...this.joined.keys()];
-    this.joined.clear();
-    for (const room of rooms) {
+    for (const room of this.forgetAllRooms()) {
       void this.ensureJoinedRoom(room).catch((err: unknown) => {
         console.error(
           `[parley-xmpp] re-join after reconnect failed for ${room}: ` +
@@ -945,23 +1018,53 @@ export class XmppPlugin implements BackendPlugin {
     return this.nickAdoption;
   }
 
+  /**
+   * Take `wanted` as the occupant nick and re-enter every room already joined under the old one.
+   * The `conflict` fallback lives in {@link doJoin}, not here: a nick taken by someone else has to
+   * behave the same whether the first seam call was a `post` (nothing joined yet, so this returns
+   * before any join is driven) or a `subscribe` — routing it through the join path is what makes
+   * the two orderings produce one outcome and one diagnostic.
+   */
   private async switchNick(wanted: string): Promise<void> {
     if (wanted === '' || wanted === this.nick) return;
-    const previous = this.nick;
-    const rooms = [...this.joined.keys()];
     this.nick = wanted;
+    const rooms = this.forgetAllRooms();
     if (rooms.length === 0) return;
-    this.joined.clear();
-    const results = await Promise.allSettled(rooms.map((r) => this.ensureJoinedRoom(r)));
-    if (results.every((r) => r.status === 'fulfilled')) return;
-    this.nick = previous;
-    this.joined.clear();
+    await Promise.allSettled(rooms.map((r) => this.ensureJoinedRoom(r)));
+  }
+
+  /**
+   * Fall back to the nick this connection started with when another occupant holds the one it
+   * asked for. Returns whether the nick actually changed — a pinned `backend_config.nick`, or a
+   * conflict on the provisional nick itself, has no fallback left and must surface.
+   */
+  private revertToProvisionalNick(): boolean {
+    const provisional = this.provisionalNick;
+    if (provisional === undefined || provisional === this.nick) return false;
     console.error(
-      `[parley-xmpp] could not take '${wanted}' as this connection's MUC nick (another occupant ` +
-        `holds it); posting as '${previous}' instead, so parley_list_users will report that ` +
+      `[parley-xmpp] could not take '${this.nick}' as this connection's MUC nick (another occupant ` +
+        `holds it); posting as '${provisional}' instead, so parley_list_users will report that ` +
         'name. Pin backend_config.nick to a free name to fix this permanently.',
     );
-    await Promise.allSettled(rooms.map((r) => this.ensureJoinedRoom(r)));
+    this.nick = provisional;
+    return true;
+  }
+
+  private occupantNick(room: string): string {
+    return this.roomNicks.get(room) ?? this.nick;
+  }
+
+  private forgetRoom(room: string): void {
+    this.joined.delete(room);
+    this.roomNicks.delete(room);
+  }
+
+  /** Drop every join, returning the rooms that have to be re-entered. */
+  private forgetAllRooms(): string[] {
+    const rooms = [...this.joined.keys()];
+    this.joined.clear();
+    this.roomNicks.clear();
+    return rooms;
   }
 
   /**
@@ -994,6 +1097,26 @@ export class XmppPlugin implements BackendPlugin {
     return this.ensureJoinedRoom(this.roomJid(topic));
   }
 
+  /**
+   * Whether the topic's MUC room already exists. Joining a room auto-CREATES it and then makes it
+   * persistent, so keep the READ path behind this check: `fetch_recent` takes a caller-supplied
+   * topic through nothing but the allowlist pattern, and a wildcard pattern would otherwise let a
+   * read mint an unbounded number of persistent rooms and archives that nothing ever reclaims.
+   * A server that answers the probe with anything other than `item-not-found` is not evidence the
+   * room is absent, so keep that path permissive.
+   */
+  private async roomExists(topic: Topic): Promise<boolean> {
+    const room = this.roomJid(topic);
+    if (this.joined.has(room)) return true;
+    const iq = xml('iq', { type: 'get', to: room }, xml('query', { xmlns: NS_DISCO_INFO }));
+    try {
+      await this.require().iqCaller.request(iq, DISCO_TIMEOUT_MS);
+      return true;
+    } catch (err) {
+      return conditionOf(err) !== 'item-not-found';
+    }
+  }
+
   private ensureJoinedRoom(room: string): Promise<void> {
     const cached = this.joined.get(room);
     if (cached !== undefined) return cached;
@@ -1001,7 +1124,7 @@ export class XmppPlugin implements BackendPlugin {
     this.joined.set(room, p);
     // If the join fails, drop the cache so a later call can retry.
     p.catch(() => {
-      if (this.joined.get(room) === p) this.joined.delete(room);
+      if (this.joined.get(room) === p) this.forgetRoom(room);
     });
     return p;
   }
@@ -1010,9 +1133,16 @@ export class XmppPlugin implements BackendPlugin {
    * Join with bounded retry for the transient cold-creation race: when N instances join a
    * brand-new room at once, exactly one creates it and the rest briefly see `item-not-found`
    * until that creation commits. Retry those; surface anything else.
+   *
+   * A `conflict` is the one other recoverable answer: the nick this connection asked for is held by
+   * another occupant, so it reverts to its provisional nick and re-joins once. The retry is also
+   * taken when a CONCURRENT join already reverted the nick, so that only the room that raced the
+   * revert pays for it rather than staying outside its room until the next seam call.
    */
   private async doJoin(room: string): Promise<void> {
+    let nickRetried = false;
     for (let attempt = 0; ; attempt++) {
+      const usedNick = this.nick;
       try {
         await this.joinOnce(room);
         return;
@@ -1021,6 +1151,13 @@ export class XmppPlugin implements BackendPlugin {
         if (cond !== undefined && RETRYABLE_CONDITIONS.includes(cond) && attempt < JOIN_RETRIES) {
           await delay(100 + 100 * attempt);
           continue;
+        }
+        if (cond === 'conflict' && !nickRetried) {
+          this.revertToProvisionalNick();
+          if (this.nick !== usedNick) {
+            nickRetried = true;
+            continue;
+          }
         }
         throw err;
       }
@@ -1031,7 +1168,8 @@ export class XmppPlugin implements BackendPlugin {
     // Resolve the connection BEFORE registering, so that a join attempted after disconnect cannot
     // leave a correlator and a 15 s timer behind that nothing will ever settle.
     const conn = this.require();
-    return new Promise<void>((resolve, reject) => {
+    let superseded: PendingJoin | undefined;
+    const attempt = new Promise<void>((resolve, reject) => {
       // Settle only ever clears the map slot when the slot is still THIS entry: a reconnect
       // re-join for a room whose previous join is still in flight registers a successor under the
       // same key, and an unguarded delete from the loser's timer would drop the successor's
@@ -1042,16 +1180,24 @@ export class XmppPlugin implements BackendPlugin {
         finish();
       };
       const entry: PendingJoin = {
+        nick: this.nick,
         resolve: () => settle(resolve),
         reject: (err) => settle(() => reject(err)),
+        settleFrom: (outcome) => {
+          clearTimeout(timer);
+          outcome.then(
+            () => settle(resolve),
+            (err: unknown) =>
+              settle(() => reject(err instanceof Error ? err : new Error(String(err)))),
+          );
+        },
       };
       const timer = setTimeout(
         () => entry.reject(new Error(`MUC join timeout for ${room}`)),
         JOIN_TIMEOUT_MS,
       );
-      const superseded = this.pendingJoins.get(room);
+      superseded = this.pendingJoins.get(room);
       this.pendingJoins.set(room, entry);
-      superseded?.reject(new Error(`MUC join superseded for ${room}`));
 
       const presence = xml(
         'presence',
@@ -1062,6 +1208,13 @@ export class XmppPlugin implements BackendPlugin {
         entry.reject(err instanceof Error ? err : new Error(String(err)));
       });
     });
+    // A re-drive (reconnect, nick switch, deferred re-entry after an occupancy loss) registers a
+    // successor for a room whose join is still in flight. Settle the loser FROM the successor rather
+    // than rejecting it: the caller that is awaiting it asked to be in the room, which is exactly
+    // what the successor is doing, and the alternative aborts an innocent subscribe/post/fetch —
+    // which startPushLoop rethrows, taking the whole bridge process down during startup.
+    superseded?.settleFrom(attempt);
+    return attempt;
   }
 
   private roomJid(topic: Topic): string {

@@ -248,3 +248,93 @@ describe('XMPP long-poll returns on archival lag, bounded by the lag and never b
     },
   );
 });
+
+// Class: an argument honoured on only ONE arm of the call it belongs to. `blockMs` sat inside the
+// `since !== undefined` branch, so a since-less `fetchRecent` returned in milliseconds while the
+// plugin declares `supportsBlockingFetch` and core's tool documents long-polling "whether or not you
+// passed since" — core then had to spend a whole pollIntervalMs nap before the native path engaged,
+// and a caller using the plugin directly got no blocking at all. An empty last-page window and an
+// empty window after the zero cursor are the SAME window, so the table crosses the since axis with
+// the archive's state and asserts, per cell, whether the call is allowed to return at once.
+
+const BLOCK_ARM_MS = 600;
+/** A return this quick cannot have waited out any budget. */
+const AT_ONCE_MS = 250;
+
+interface Arm {
+  name: string;
+  /** `null` = omit the argument entirely; `'tail'` = the archive's own last cursor. */
+  since: null | '' | 'tail' | 'arch-absent';
+}
+const arms: Arm[] = [
+  { name: 'since omitted', since: null },
+  { name: "since '' (the zero cursor)", since: '' },
+  { name: 'since the tail', since: 'tail' },
+];
+const histories = [
+  { name: 'an empty archive', seeded: false },
+  { name: 'an archive with history', seeded: true },
+];
+type Mode = 'blockMs 0' | 'blockMs > 0, nothing arrives' | 'blockMs > 0, a message arrives';
+const modes: Mode[] = [
+  'blockMs 0',
+  'blockMs > 0, nothing arrives',
+  'blockMs > 0, a message arrives',
+];
+
+const armCells = arms.flatMap((arm) =>
+  histories.flatMap((history) => modes.map((mode) => ({ arm, history, mode }))),
+);
+
+describe('XMPP honours blockMs on every arm of fetchRecent', () => {
+  it.each(armCells)('$arm.name over $history.name, $mode', async ({ arm, history, mode }) => {
+    const plugin = new XmppPlugin();
+    const fake = new FakeXmpp();
+    const p = attach(plugin, fake, undefined);
+    const room = p.roomJid(TOPIC);
+    p.joined.set(room, Promise.resolve());
+    if (history.seeded) fake.archiveOnly(room, 'old');
+
+    // The window is empty unless the archive holds something the cursor does not already cover.
+    const windowEmpty = arm.since === 'tail' || !history.seeded;
+    const since =
+      arm.since === null
+        ? undefined
+        : arm.since === 'tail'
+          ? ((await plugin.fetchRecent({ topic: TOPIC })).nextCursor as unknown as string)
+          : arm.since;
+    const blockMs = mode === 'blockMs 0' ? 0 : BLOCK_ARM_MS;
+
+    const started = Date.now();
+    const pending = plugin.fetchRecent({
+      topic: TOPIC,
+      limit: 10,
+      blockMs,
+      ...(since === undefined ? {} : { since: asCursor(since) }),
+    });
+    const arriving =
+      mode === 'blockMs > 0, a message arrives'
+        ? setTimeout(() => fake.deliver(room, 'fresh'), 50)
+        : undefined;
+    const res = await pending;
+    const elapsed = Date.now() - started;
+    clearTimeout(arriving);
+
+    if (!windowEmpty) {
+      expect(res.messages.map((m) => m.content)).toEqual(['old']);
+      expect(elapsed).toBeLessThan(AT_ONCE_MS);
+    } else if (mode === 'blockMs 0') {
+      expect(res.messages).toEqual([]);
+      expect(elapsed).toBeLessThan(AT_ONCE_MS);
+    } else if (mode === 'blockMs > 0, nothing arrives') {
+      expect(res.messages).toEqual([]);
+      expect(elapsed).toBeGreaterThanOrEqual(BLOCK_ARM_MS * 0.9); // it actually blocked
+      expect(String(res.nextCursor)).toBe(since ?? '');
+    } else {
+      expect(res.messages.map((m) => m.content)).toEqual(['fresh']);
+      expect(elapsed).toBeLessThan(BLOCK_ARM_MS * 0.8); // woken by the message, not by the budget
+    }
+    expectNoLeaks(plugin);
+    await plugin.disconnect();
+  }, 15_000);
+});
