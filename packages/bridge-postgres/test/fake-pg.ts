@@ -1,5 +1,6 @@
 /**
- * PostgreSQL's answer to the read shapes this plugin's push and catch-up paths depend on:
+ * The `pg` driver, faked once for the whole package: the Pool/Client surface this plugin drives
+ * (below), and PostgreSQL's answer to the read shapes its push and catch-up paths depend on:
  * `SELECT seq::text AS seq … WHERE topic = $1 [AND seq > $n::bigint] ORDER BY … LIMIT …`.
  *
  * A fake that hands rows back from a queue honours the cursor predicate and the ordering for free,
@@ -14,6 +15,8 @@
  * A shape this file cannot classify is an ERROR, never a default: silently serving an unrecognised
  * SELECT in ascending order is how a rewritten query passes a suite that no longer grades it.
  */
+
+import { EventEmitter } from 'node:events';
 
 export type FakeRow = Record<string, unknown>;
 
@@ -89,4 +92,68 @@ export function servePool(
   }
   if (TOPIC_READ.test(sql)) return serveTopicRead(all, sql, values);
   return undefined;
+}
+
+export interface FakeQueryResult {
+  rows: unknown[];
+  rowCount?: number;
+}
+
+export type FakePoolQuery = (
+  sql: string,
+  values: readonly unknown[],
+) => Promise<FakeQueryResult>;
+
+export interface FakePooledClient {
+  query: (sql?: string, values?: readonly unknown[]) => Promise<FakeQueryResult>;
+  release: () => void;
+}
+
+const bootstrapClient = (): FakePooledClient => ({
+  query: async () => ({ rows: [] }),
+  release: () => undefined,
+});
+
+/**
+ * The `on`/`emit` plumbing every driver fake here needs, with Node's real event semantics — an
+ * 'error' emitted while nothing is listening THROWS. Keep the fakes on this rather than a handlers
+ * record, so that a missing `on('error')` in the plugin fails a case instead of being absorbed.
+ */
+export class FakeEmitter extends EventEmitter {}
+
+/** `pg.Pool` reduced to the surface this plugin drives, on those same event semantics. */
+export class FakePool extends FakeEmitter {
+  constructor(
+    private readonly onQuery: FakePoolQuery = async () => ({ rows: [] }),
+    private readonly checkout: () => FakePooledClient = bootstrapClient,
+  ) {
+    super();
+  }
+
+  async connect(): Promise<FakePooledClient> {
+    return this.checkout();
+  }
+
+  async query(sql: string, values?: readonly unknown[]): Promise<FakeQueryResult> {
+    return this.onQuery(sql, values ?? []);
+  }
+
+  async end(): Promise<void> {}
+}
+
+export function fakePool(onQuery?: FakePoolQuery, checkout?: () => FakePooledClient): FakePool {
+  return new FakePool(onQuery, checkout);
+}
+
+/** `pg.Client` that answers nothing, for the suites whose subject is not the connection. */
+export class FakeIdleClient extends FakeEmitter {
+  async connect(): Promise<void> {}
+
+  async query(): Promise<FakeQueryResult> {
+    return { rows: [] };
+  }
+
+  async end(): Promise<void> {}
+
+  release(): void {}
 }

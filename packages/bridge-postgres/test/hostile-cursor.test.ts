@@ -16,28 +16,27 @@ import { PostgresPlugin } from '../src/index.js';
 
 const state = vi.hoisted(() => ({ queries: [] as string[] }));
 
-vi.mock('pg', () => {
-  const makeClient = () => ({
-    query: vi.fn(async (sql: string) => {
+vi.mock('pg', async () => {
+  const { FakeEmitter, fakePool } = await import('./fake-pg.js');
+
+  class MockClient extends FakeEmitter {
+    async connect(): Promise<void> {}
+    async query(sql: string): Promise<{ rows: unknown[] }> {
       state.queries.push(sql);
       return { rows: [] };
-    }),
-    release: vi.fn(),
-    on: vi.fn(),
-    connect: vi.fn(async () => undefined),
-    end: vi.fn(async () => undefined),
-  });
+    }
+    async end(): Promise<void> {}
+    release(): void {}
+  }
+
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => makeClient()),
-      query: vi.fn(async (sql: string) => {
+    Pool: vi.fn(() =>
+      fakePool(async (sql) => {
         state.queries.push(sql);
         return { rows: [] };
-      }),
-      end: vi.fn(async () => undefined),
-    })),
-    Client: vi.fn(() => makeClient()),
+      }, () => new MockClient()),
+    ),
+    Client: MockClient,
   };
 });
 

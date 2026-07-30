@@ -289,6 +289,49 @@ if (await isUp(PG_URL)) {
       }
     }, 90000);
   });
+
+  // A server restart, a failover, or an operator's `pg_terminate_backend` kills connections that are
+  // sitting IDLE in the pool: there is no query in flight to reject, so pg reports it as an 'error'
+  // event on the pool itself, and Node kills a process that is not listening for one. A stdio bridge
+  // dying with a driver stack trace is the worst possible failure mode for a plugin whose whole
+  // contract is that a dropped connection costs latency and never a message — so this is graded
+  // against a real kill, on a connection that really is idle, at each stage the plugin can be in.
+  const KILL_STAGES = ['idle after a post', 'with a live subscription'] as const;
+
+  describe('an administrator kill of the plugin’s connections never takes the process down', () => {
+    it.each(KILL_STAGES)('%s', async (stage) => {
+      const appName = `parley_kill_${rand()}`;
+      const table = `parley_kill_${rand()}`;
+      const url = `${PG_URL}?application_name=${appName}`;
+      const plugin = new PostgresPlugin();
+      const topic = asTopic(`kill-${rand()}`);
+      const crashes: unknown[] = [];
+      const record = (err: unknown): void => {
+        crashes.push(err);
+      };
+      process.on('uncaughtException', record);
+      try {
+        await plugin.connect({ url, table_name: table });
+        if (stage === 'with a live subscription') await plugin.subscribe(topic, () => undefined);
+        await plugin.post(topic, asHandle('u'), 'before the kill');
+
+        await terminateBackends(appName);
+        await sleep(800);
+        expect(crashes, 'a killed connection escaped as an uncaughtException').toEqual([]);
+
+        // The cursor outlives the socket: the next post reconnects and the history is intact.
+        await plugin.post(topic, asHandle('u'), 'after the kill');
+        expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+          'before the kill',
+          'after the kill',
+        ]);
+      } finally {
+        process.off('uncaughtException', record);
+        await plugin.disconnect().catch(() => undefined);
+        await dropTable(table);
+      }
+    }, 60000);
+  });
 } else {
   describe.skip(`connection hygiene (no server at ${PG_URL})`, () => {
     it('skipped — start postgres (examples/dev-compose) to run', () => undefined);

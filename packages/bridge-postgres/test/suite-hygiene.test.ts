@@ -12,17 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HARNESS = 'pg-harness.ts';
-
-/** Anything a test file must take from the harness instead of re-declaring. */
-const SHARED_HELPERS = [
-  'isUp',
-  'isPostgresUp',
-  'withAdmin',
-  'dropTable',
-  'backendCount',
-  'settledBackendCount',
-  'terminateBackends',
-];
+const FAKE = 'fake-pg.ts';
 
 const SELF = 'suite-hygiene.test.ts';
 
@@ -32,7 +22,31 @@ function testFiles(): string[] {
     .sort();
 }
 
+/**
+ * What a test file must take from the harness, READ OUT of the harness rather than listed here: a
+ * hand-kept list drifts into naming something the harness does not export, and an entry that has to
+ * be exempted to pass grades nothing at all.
+ */
+const SHARED_HELPERS = [
+  ...readFileSync(join(HERE, HARNESS), 'utf8').matchAll(/export\s+(?:async\s+)?function\s+(\w+)/g),
+]
+  .map((m) => m[1] as string)
+  .sort();
+
 describe('the real-server harness is shared, not restated', () => {
+  // Derived from the harness, so also pinned BY VALUE: deleting a helper from the harness would
+  // otherwise shrink the rule above to whatever is left, silently.
+  it('the harness still owns every real-server helper this rule enforces', () => {
+    expect(SHARED_HELPERS).toEqual([
+      'backendCount',
+      'dropTable',
+      'isUp',
+      'settledBackendCount',
+      'terminateBackends',
+      'withAdmin',
+    ]);
+  });
+
   it.each(testFiles())('%s declares no harness helper of its own', (file) => {
     const src = readFileSync(join(HERE, file), 'utf8');
     const redeclared = SHARED_HELPERS.filter((name) =>
@@ -45,15 +59,37 @@ describe('the real-server harness is shared, not restated', () => {
     const src = readFileSync(join(HERE, file), 'utf8');
     expect(src.includes('PARLEY_PG_URL'), `read PG_URL from ./${HARNESS}`).toBe(false);
   });
+});
 
-  it('the harness exports every helper the rule points files at', () => {
-    const src = readFileSync(join(HERE, HARNESS), 'utf8');
-    for (const name of SHARED_HELPERS) {
-      if (name === 'isPostgresUp') continue;
-      expect(src, `${HARNESS} does not export ${name}`).toMatch(
-        new RegExp(`export\\s+(async\\s+function|function|const)\\s+${name}\\b`),
-      );
-    }
+// The `vi.mock('pg')` fake was restated in eleven files, and the copies had already diverged in what
+// they answered. The one that mattered: every copy stubbed the connection's event surface as
+// `on: vi.fn()`, which swallows an 'error' the plugin has no handler for — the exact event that
+// kills the process on a server restart. So a fake that cannot raise it makes the missing handler
+// look like a passing suite. The Pool comes from ./fake-pg.ts now, and the shape of the copies is
+// what is banned rather than their names, so the next one inlined under a different name is caught.
+const RESTATED_DRIVER: [what: string, pattern: RegExp][] = [
+  ['an event surface stubbed with `on: vi.fn()`, which cannot raise an error', /\bon: vi\.fn\(/],
+  ['its own emitter plumbing', /\bemit\(event\b/],
+];
+
+function pgMockingFiles(): string[] {
+  return testFiles().filter((f) => readFileSync(join(HERE, f), 'utf8').includes("vi.mock('pg'"));
+}
+
+describe('the pg driver fake is shared, not restated', () => {
+  it('files in this package really do mock pg, so the rules below are not vacuous', () => {
+    expect(pgMockingFiles().length).toBeGreaterThan(0);
+  });
+
+  it.each(pgMockingFiles())('%s builds its Pool from the shared fake', (file) => {
+    const src = readFileSync(join(HERE, file), 'utf8');
+    expect(/\bfakePool\(/.test(src), `take the Pool from ./${FAKE}`).toBe(true);
+  });
+
+  it.each(testFiles())('%s restates no part of the driver fake', (file) => {
+    const src = readFileSync(join(HERE, file), 'utf8');
+    const found = RESTATED_DRIVER.filter(([, pattern]) => pattern.test(src)).map(([what]) => what);
+    expect(found, `extend ./${FAKE} instead`).toEqual([]);
   });
 });
 

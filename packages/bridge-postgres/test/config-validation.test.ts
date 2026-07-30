@@ -1,6 +1,7 @@
 import { asHandle, asTopic, type BackendConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin, validateBackendConfig } from '../src/index.js';
+import { assertTableName } from '../src/schema.js';
 import { dropTable, isUp, PG_URL, rand } from './pg-harness.js';
 
 /**
@@ -45,6 +46,21 @@ const EXEMPT: Record<string, unknown[]> = {
   retention_days: [0.5],
 };
 
+/**
+ * The two message shapes an operator's config can be refused with — one for a value, one for a key.
+ * They are what an operator greps for, so a third shape invented later has to fail here rather than
+ * quietly widening the contract.
+ */
+const REJECTION_SHAPES: [what: string, pattern: RegExp][] = [
+  [
+    'a refused value',
+    /^parley-postgres: invalid backend_config\.(url|table_name|pool_size|retention_days) — \S/,
+  ],
+  ['an unknown key', /^parley-postgres: unknown backend_config key '.+' — expected one of \S/],
+];
+
+const BAD_TABLE_NAMES = ['', '1abc', 'a-b', 'a b', 'drop;', 'x'.repeat(64), 'ünïcode'];
+
 describe('backend_config validation rejects every unusable value', () => {
   for (const key of Object.keys(GOOD_VALUES)) {
     for (const value of BAD_VALUES) {
@@ -52,7 +68,7 @@ describe('backend_config validation rejects every unusable value', () => {
       it(`${key} = ${JSON.stringify(value) ?? String(value)}`, () => {
         expect(() =>
           validateBackendConfig({ url: PG_URL, [key]: value } as unknown as BackendConfig),
-        ).toThrow(new RegExp(`parley-postgres:.*${key}`));
+        ).toThrow(new RegExp(`^parley-postgres: invalid backend_config\\.${key} — \\S`));
       });
     }
 
@@ -70,9 +86,49 @@ describe('backend_config validation rejects every unusable value', () => {
     (key) => {
       expect(() =>
         validateBackendConfig({ url: PG_URL, [key]: 30 } as unknown as BackendConfig),
-      ).toThrow(new RegExp(`parley-postgres: unknown backend_config key '${key}'`));
+      ).toThrow(new RegExp(`^parley-postgres: unknown backend_config key '${key}' — expected one of `));
     },
   );
+
+  it('every rejection takes one of the two shapes, and both of them are reached', () => {
+    const raised: string[] = [];
+    const attempt = (fn: () => unknown): void => {
+      try {
+        fn();
+      } catch (err) {
+        raised.push(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    for (const key of Object.keys(GOOD_VALUES)) {
+      for (const value of BAD_VALUES) {
+        if (EXEMPT[key]?.includes(value)) continue;
+        attempt(() =>
+          validateBackendConfig({ url: PG_URL, [key]: value } as unknown as BackendConfig),
+        );
+      }
+    }
+    for (const key of ['retention_day', 'poolsize']) {
+      attempt(() => validateBackendConfig({ url: PG_URL, [key]: 30 } as unknown as BackendConfig));
+    }
+    for (const name of BAD_TABLE_NAMES) attempt(() => assertTableName(name));
+
+    expect(
+      raised.filter((m) => !REJECTION_SHAPES.some(([, p]) => p.test(m))),
+      'a rejection invented a third message shape',
+    ).toEqual([]);
+    // A floor as well as a ceiling: an enumeration nothing exercises is satisfied by a validator
+    // that raises nothing at all.
+    for (const [what, pattern] of REJECTION_SHAPES) {
+      expect(
+        raised.filter((m) => pattern.test(m)).length,
+        `nothing was refused as ${what}`,
+      ).toBeGreaterThan(0);
+    }
+    expect(raised.length, 'far fewer rejections than cells attempted').toBeGreaterThan(
+      BAD_TABLE_NAMES.length + 2,
+    );
+  });
 });
 
 /** Resolve to 'hung' rather than letting a never-settling connect() blow the suite timeout. */

@@ -27,6 +27,7 @@ import {
   type MessageRow,
   quotedNames,
   type SchemaNames,
+  unknownConfigKey,
 } from './schema.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
@@ -80,9 +81,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
   const cfg = config as Record<string, unknown>;
   for (const key of Object.keys(cfg)) {
     if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
-      throw new Error(
-        `parley-postgres: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
-      );
+      throw unknownConfigKey(key, CONFIG_KEYS);
     }
   }
 

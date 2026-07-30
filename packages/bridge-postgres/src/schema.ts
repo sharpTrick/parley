@@ -43,14 +43,14 @@ const LONGEST_SUFFIX_BYTES = Math.max(
 /** The longest `table_name` whose every derived relation still fits in 63 bytes. */
 export const MAX_TABLE_NAME_BYTES = MAX_IDENTIFIER_BYTES - LONGEST_SUFFIX_BYTES;
 
-/**
- * The one rejection formatter for `backend_config` values. Every rejection this package raises —
- * from {@link assertTableName} as much as from `validateBackendConfig` — goes through here, so the
- * documented `parley-postgres: … backend_config.<key>` contract holds on every path an operator's
- * value can take.
- */
 export function badConfig(key: string, reason: string): Error {
   return new Error(`parley-postgres: invalid backend_config.${key} — ${reason}`);
+}
+
+export function unknownConfigKey(key: string, allowed: readonly string[]): Error {
+  return new Error(
+    `parley-postgres: unknown backend_config key '${key}' — expected one of ${allowed.join(', ')}`,
+  );
 }
 
 /**

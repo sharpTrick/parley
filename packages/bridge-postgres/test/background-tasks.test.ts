@@ -1,6 +1,8 @@
+import type { EventEmitter } from 'node:events';
 import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { fakePool } from './fake-pg.js';
 
 // Every fire-and-forget chore in this plugin (the prune tick, the drain loop, the listener
 // reconnect, a waiter's snapshot re-check) is best-effort by design: its failure must cost latency
@@ -13,24 +15,18 @@ const state = vi.hoisted(() => ({
   poolFails: false,
   /** When set, the LISTEN connection cannot be established — drives the reconnect failure path. */
   clientFails: false,
-  clients: [] as { emit: (event: string, arg?: unknown) => void }[],
+  clients: [] as { emit: (event: string, arg?: unknown) => boolean }[],
   /** The table, per topic — what the recovery read must actually come back with. */
   rows: new Map<string, Record<string, unknown>[]>(),
 }));
 
 vi.mock('pg', async () => {
-  const { servePool } = await import('./fake-pg.js');
+  const { FakeEmitter, fakePool, servePool } = await import('./fake-pg.js');
 
-  class MockClient {
-    private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+  class MockClient extends FakeEmitter {
     constructor() {
+      super();
       state.clients.push(this);
-    }
-    on(event: string, cb: (arg?: unknown) => void): void {
-      (this.handlers[event] ??= []).push(cb);
-    }
-    emit(event: string, arg?: unknown): void {
-      for (const cb of this.handlers[event] ?? []) cb(arg);
     }
     async connect(): Promise<void> {
       if (state.clientFails) throw new Error('listener connect failed (mock)');
@@ -45,22 +41,14 @@ vi.mock('pg', async () => {
   // Served through the same cursor-honouring helper as every other suite: a pool that answers []
   // for every windowed SELECT makes the post-failure recovery assertion below pass whether or not
   // the plugin ever recovered.
-  const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
-    if (state.poolFails) throw new Error('query failed (mock)');
-    const all = state.rows.get(String(values?.[0])) ?? [];
-    return { rows: servePool(all, sql, values ?? []) ?? [] };
-  };
-
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({
-        query: vi.fn(async () => ({ rows: [] })),
-        release: vi.fn(),
-      })),
-      query: vi.fn(poolQuery) as unknown as typeof poolQuery,
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() =>
+      fakePool(async (sql, values) => {
+        if (state.poolFails) throw new Error('query failed (mock)');
+        const all = state.rows.get(String(values[0])) ?? [];
+        return { rows: servePool(all, sql, values) ?? [] };
+      }),
+    ),
     Client: MockClient,
   };
 });
@@ -174,4 +162,72 @@ describe('background chores never escape as an unhandled rejection', () => {
     expect(String(page.nextCursor)).toBe('1');
     await plugin.disconnect();
   }, 10000);
+});
+
+// Node kills the process on an 'error' event nothing is listening for, and pg raises one per
+// CONNECTION, not per call: a server restart or an admin kill of a client sitting idle in the pool
+// arrives that way, with no query in flight to reject. So every connection surface this plugin owns
+// is graded here rather than one of them being covered by accident — a surface added later is a
+// missing row rather than silence.
+
+type Surface = 'pooled connection' | 'listener connection';
+type Phase = 'idle' | 'with a live subscription' | 'with a blocking fetch parked';
+
+const PHASES: Phase[] = ['idle', 'with a live subscription', 'with a blocking fetch parked'];
+
+/** The listener connection is lazy, so it only exists in the phases that open one. */
+const SURFACE_CELLS: { surface: Surface; phase: Phase }[] = PHASES.flatMap((phase) =>
+  (['pooled connection', 'listener connection'] as Surface[])
+    .filter((surface) => surface === 'pooled connection' || phase !== 'idle')
+    .map((surface) => ({ surface, phase })),
+);
+
+const ADMIN_KILL = 'terminating connection due to administrator command';
+
+describe("an 'error' event on a connection surface never reaches the process", () => {
+  it('an unhandled error event on this fake really does throw, so the cells below can fail', () => {
+    expect(() => fakePool().emit('error', new Error(ADMIN_KILL))).toThrow(ADMIN_KILL);
+  });
+
+  it.each(SURFACE_CELLS.map((c) => [`${c.surface}, ${c.phase}`, c] as const))(
+    '%s',
+    async (_label, cell) => {
+      const plugin = new PostgresPlugin();
+      await plugin.connect({ url: REAL_URL });
+      const topic = asTopic('t');
+
+      let parked: Promise<unknown> | undefined;
+      if (cell.phase === 'with a live subscription') await plugin.subscribe(topic, () => undefined);
+      if (cell.phase === 'with a blocking fetch parked') {
+        parked = plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 400 });
+        await sleep(20);
+      }
+
+      const priv = plugin as unknown as { pool?: EventEmitter; listener?: EventEmitter };
+      const surface = cell.surface === 'pooled connection' ? priv.pool : priv.listener;
+      expect(surface, 'this cell has no connection to grade, so it proves nothing').toBeDefined();
+      expect(() => (surface as EventEmitter).emit('error', new Error(ADMIN_KILL))).not.toThrow();
+
+      await parked;
+      expect(rejections, `${cell.surface} leaked a rejection`).toEqual([]);
+
+      state.rows.set('t', [
+        {
+          seq: '1',
+          topic: 't',
+          sender: 'u',
+          content: 'still serving',
+          ts: new Date().toISOString(),
+          in_reply_to: null,
+        },
+      ]);
+      const page = await plugin.fetchRecent({ topic, since: asCursor('0') });
+      expect(page.messages.map((m) => m.content), 'the read path died with the socket').toEqual([
+        'still serving',
+      ]);
+
+      await plugin.disconnect();
+    },
+    10000,
+  );
 });

@@ -8,25 +8,15 @@ import { assertTableName, buildSchema, MAX_TABLE_NAME_BYTES, schemaNames } from 
 // drives them from a corpus rather than the single always-safe name the conformance suite uses.
 
 const poolCtor = vi.hoisted(() => vi.fn());
-vi.mock('pg', () => {
-  const makeClient = () => ({
-    query: vi.fn(async () => ({ rows: [] })),
-    release: vi.fn(),
-    on: vi.fn(),
-    connect: vi.fn(async () => undefined),
-    end: vi.fn(async () => undefined),
-  });
+vi.mock('pg', async () => {
+  const { FakeIdleClient, fakePool } = await import('./fake-pg.js');
+
   return {
     Pool: vi.fn((...args: unknown[]) => {
       poolCtor(...args);
-      return {
-        on: vi.fn(),
-        connect: vi.fn(async () => makeClient()),
-        query: vi.fn(async () => ({ rows: [] })),
-        end: vi.fn(async () => undefined),
-      };
+      return fakePool();
     }),
-    Client: vi.fn(() => makeClient()),
+    Client: FakeIdleClient,
   };
 });
 

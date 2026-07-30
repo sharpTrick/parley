@@ -42,24 +42,18 @@ const state = vi.hoisted(() => ({
 interface MockClientShape {
   ended: boolean;
   listened: string[];
-  emit: (event: string, arg?: unknown) => void;
+  emit: (event: string, arg?: unknown) => boolean;
 }
 
 vi.mock('pg', async () => {
-  const { servePool } = await import('./fake-pg.js');
+  const { FakeEmitter, fakePool, servePool } = await import('./fake-pg.js');
 
-  class MockClient implements MockClientShape {
-    private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+  class MockClient extends FakeEmitter implements MockClientShape {
     ended = false;
     readonly listened: string[] = [];
     constructor() {
+      super();
       state.clients.push(this);
-    }
-    on(event: string, cb: (arg?: unknown) => void): void {
-      (this.handlers[event] ??= []).push(cb);
-    }
-    emit(event: string, arg?: unknown): void {
-      for (const cb of this.handlers[event] ?? []) cb(arg);
     }
     async connect(): Promise<void> {
       const gate = state.connectGate;
@@ -87,21 +81,13 @@ vi.mock('pg', async () => {
     }
   }
 
-  const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
-    const served = servePool(state.rows.get(String(values?.[0])) ?? [], sql, values ?? []);
+  const poolQuery = async (sql: string, values: readonly unknown[]): Promise<{ rows: unknown[] }> => {
+    const served = servePool(state.rows.get(String(values[0])) ?? [], sql, values);
     return { rows: served ?? [] };
   };
 
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({
-        query: vi.fn(async () => ({ rows: [] })),
-        release: vi.fn(),
-      })),
-      query: vi.fn(poolQuery) as unknown as typeof poolQuery,
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() => fakePool(poolQuery)),
     Client: MockClient,
   };
 });

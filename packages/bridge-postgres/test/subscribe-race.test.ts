@@ -1,4 +1,4 @@
-import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 
@@ -21,6 +21,14 @@ const state = vi.hoisted(() => ({
   listenCalls: [] as string[],
   /** When true, `query('LISTEN …')` rejects on the listener connection. */
   listenRejects: false,
+  /** Extra delay on the tail read and on the LISTEN, to widen the arming window on its own. */
+  tailMs: 0,
+  listenMs: 0,
+  /** Fired the instant the tail read has been served — the arming window is now open. */
+  onTailRead: null as (() => void) | null,
+  /** Fired when a LISTEN reaches the connection, before its delay, and once it has succeeded. */
+  onListenAttempt: null as (() => void) | null,
+  onListenEstablished: null as (() => void) | null,
   /**
    * Fired the moment a drain read is about to come back empty — the instant a row committed
    * elsewhere would land while the drain believes it has caught up.
@@ -29,24 +37,18 @@ const state = vi.hoisted(() => ({
 }));
 
 interface MockClientShape {
-  emit: (event: string, arg?: unknown) => void;
+  emit: (event: string, arg?: unknown) => boolean;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 vi.mock('pg', async () => {
-  const { servePool } = await import('./fake-pg.js');
+  const { FakeEmitter, fakePool, servePool } = await import('./fake-pg.js');
 
-  class MockClient implements MockClientShape {
-    private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+  class MockClient extends FakeEmitter implements MockClientShape {
     constructor() {
+      super();
       state.clients.push(this);
-    }
-    on(event: string, cb: (arg?: unknown) => void): void {
-      (this.handlers[event] ??= []).push(cb);
-    }
-    emit(event: string, arg?: unknown): void {
-      for (const cb of this.handlers[event] ?? []) cb(arg);
     }
     async connect(): Promise<void> {
       if (state.slowMs > 0) await sleep(state.slowMs);
@@ -55,35 +57,34 @@ vi.mock('pg', async () => {
       const listen = /^LISTEN "(.+)"$/.exec(sql);
       if (listen !== null) {
         state.listenCalls.push(listen[1] as string);
+        state.onListenAttempt?.();
+        if (state.listenMs > 0) await sleep(state.listenMs);
         if (state.slowMs > 0) await sleep(state.slowMs);
         if (state.listenRejects) throw new Error('LISTEN failed (mock)');
+        state.onListenEstablished?.();
       }
       return { rows: [] };
     }
     async end(): Promise<void> {}
   }
 
-  const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
-    if (/MAX\(seq\)/.test(sql) && state.slowMs > 0) await sleep(state.slowMs);
-    const served = servePool(state.rows.get(String(values?.[0])) ?? [], sql, values ?? []);
-    if (served !== undefined && served.length === 0 && state.onDrainEmpty !== null) {
-      const fire = state.onDrainEmpty;
-      state.onDrainEmpty = null;
-      fire();
-    }
-    return { rows: served ?? [] };
-  };
-
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({
-        query: vi.fn(async () => ({ rows: [] })),
-        release: vi.fn(),
-      })),
-      query: vi.fn(poolQuery) as unknown as typeof poolQuery,
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() =>
+      fakePool(async (sql, values) => {
+        if (/MAX\(seq\)/.test(sql)) {
+          if (state.slowMs > 0) await sleep(state.slowMs);
+          if (state.tailMs > 0) await sleep(state.tailMs);
+        }
+        const served = servePool(state.rows.get(String(values[0])) ?? [], sql, values);
+        if (/MAX\(seq\)/.test(sql)) state.onTailRead?.();
+        if (served !== undefined && served.length === 0 && state.onDrainEmpty !== null) {
+          const fire = state.onDrainEmpty;
+          state.onDrainEmpty = null;
+          fire();
+        }
+        return { rows: served ?? [] };
+      }),
+    ),
     Client: MockClient,
   };
 });
@@ -107,6 +108,11 @@ beforeEach(() => {
   state.clients.length = 0;
   state.listenCalls.length = 0;
   state.listenRejects = false;
+  state.tailMs = 0;
+  state.listenMs = 0;
+  state.onTailRead = null;
+  state.onListenAttempt = null;
+  state.onListenEstablished = null;
   state.rows.clear();
   state.onDrainEmpty = null;
 });
@@ -260,4 +266,117 @@ describe('drain honours the server-side batch cap', () => {
     },
     15000,
   );
+});
+
+// `subscribe` reads the topic's tail, LISTENs, registers, and only THEN drains from that tail. A row
+// that becomes visible anywhere between the tail read and the registration rang a doorbell nobody
+// was listening for yet, so the post-registration drain is the only thing that can ever deliver it —
+// nothing re-triggers one until the NEXT post to that topic. These cells widen the arming window and
+// NEVER ring the doorbell, so a cell can only pass if that drain ran. The pre-tail-read cell is the
+// other side: push does not replay history, so a row already visible must NOT arrive.
+
+type Landing =
+  | 'before the tail read'
+  | 'after the tail read'
+  | 'during the LISTEN'
+  | 'once the LISTEN is established';
+
+const LANDINGS: Landing[] = [
+  'before the tail read',
+  'after the tail read',
+  'during the LISTEN',
+  'once the LISTEN is established',
+];
+
+const ARMING_WINDOW_MS = 150;
+
+interface ArmingCell {
+  landing: Landing;
+  warm: boolean;
+}
+
+const ARMING_CELLS: ArmingCell[] = LANDINGS.flatMap((landing) =>
+  [false, true].map((warm) => ({ landing, warm })),
+);
+
+/** Make the row visible once, and report whether the moment this cell aimed at ever arrived. */
+function landOnce(topic: string): { land: () => void; landed: () => boolean } {
+  let fired = false;
+  return {
+    land: () => {
+      if (fired) return;
+      fired = true;
+      state.rows.set(topic, rows(topic, 1));
+    },
+    landed: () => fired,
+  };
+}
+
+describe('a row landing while subscribe arms the live path', () => {
+  it.each(
+    ARMING_CELLS.map(
+      (c) =>
+        [
+          `${c.landing}, ${c.warm ? 'listener already open for another topic' : 'cold listener'}`,
+          c,
+        ] as const,
+    ),
+  )('%s', async (_label, cell) => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL });
+    if (cell.warm) await plugin.subscribe(asTopic('elsewhere'), () => undefined);
+
+    const topic = 'arming';
+    const { land, landed } = landOnce(topic);
+    state.tailMs = ARMING_WINDOW_MS;
+    state.listenMs = ARMING_WINDOW_MS;
+    if (cell.landing === 'before the tail read') land();
+    else if (cell.landing === 'after the tail read') state.onTailRead = land;
+    else if (cell.landing === 'during the LISTEN') state.onListenAttempt = land;
+    else state.onListenEstablished = land;
+
+    const got: Message[] = [];
+    await plugin.subscribe(asTopic(topic), (m) => got.push(m));
+    await sleep(120);
+
+    expect(landed(), 'the moment this cell aims at never arrived, so it proves nothing').toBe(true);
+    expect(state.listenCalls, 'the channel was never LISTENed').toContain(
+      [...(plugin as unknown as { subs: Map<string, unknown> }).subs.keys()].at(-1),
+    );
+    expect(got.map((m) => m.content)).toEqual(
+      cell.landing === 'before the tail read' ? [] : ['m0'],
+    );
+    expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
+
+    await plugin.disconnect();
+  }, 15000);
+
+  it('a subscribe piggybacking an established LISTEN still drains its arming window', async () => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL });
+    const topic = 'piggyback';
+
+    const parked = plugin.fetchRecent({
+      topic: asTopic(topic),
+      since: asCursor('0'),
+      blockMs: 3000,
+    });
+    await sleep(40);
+    const listensBefore = state.listenCalls.length;
+
+    const { land, landed } = landOnce(topic);
+    state.tailMs = ARMING_WINDOW_MS;
+    state.onTailRead = land;
+
+    const got: Message[] = [];
+    await plugin.subscribe(asTopic(topic), (m) => got.push(m));
+    await sleep(120);
+
+    expect(landed(), 'the tail read never happened, so this case proves nothing').toBe(true);
+    expect(state.listenCalls.length, 'the waiter’s LISTEN was not reused').toBe(listensBefore);
+    expect(got.map((m) => m.content)).toEqual(['m0']);
+
+    await plugin.disconnect();
+    await parked;
+  }, 15000);
 });

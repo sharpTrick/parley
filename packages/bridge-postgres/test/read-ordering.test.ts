@@ -20,18 +20,12 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock('pg', async () => {
-  const { servePool: serve } = await import('./fake-pg.js');
+  const { FakeEmitter, fakePool, servePool: serve } = await import('./fake-pg.js');
 
-  class MockClient {
-    private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+  class MockClient extends FakeEmitter {
     constructor() {
+      super();
       state.clients.push(this);
-    }
-    on(event: string, cb: (arg?: unknown) => void): void {
-      (this.handlers[event] ??= []).push(cb);
-    }
-    emit(event: string, arg?: unknown): void {
-      for (const cb of this.handlers[event] ?? []) cb(arg);
     }
     async connect(): Promise<void> {}
     async query(): Promise<{ rows: unknown[] }> {
@@ -40,17 +34,8 @@ vi.mock('pg', async () => {
     async end(): Promise<void> {}
   }
 
-  const query = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => ({
-    rows: serve(state.rows, sql, values ?? []) ?? [],
-  });
-
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({ query: vi.fn(async () => ({ rows: [] })), release: vi.fn() })),
-      query: vi.fn(query) as unknown as typeof query,
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() => fakePool(async (sql, values) => ({ rows: serve(state.rows, sql, values) ?? [] }))),
     Client: MockClient,
   };
 });

@@ -15,7 +15,9 @@ const state = vi.hoisted(() => ({
   deletes: [] as string[],
 }));
 
-vi.mock('pg', () => {
+vi.mock('pg', async () => {
+  const { FakeIdleClient, fakePool } = await import('./fake-pg.js');
+
   const poolQuery = async (sql: string): Promise<{ rows: unknown[]; rowCount: number }> => {
     if (!/^\s*DELETE/.test(sql)) return { rows: [], rowCount: 0 };
     state.deletes.push(sql);
@@ -26,21 +28,8 @@ vi.mock('pg', () => {
   };
 
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({
-        query: vi.fn(async () => ({ rows: [] })),
-        release: vi.fn(),
-      })),
-      query: vi.fn(poolQuery) as unknown as typeof poolQuery,
-      end: vi.fn(async () => undefined),
-    })),
-    Client: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => undefined),
-      query: vi.fn(async () => ({ rows: [] })),
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() => fakePool(poolQuery)),
+    Client: FakeIdleClient,
   };
 });
 

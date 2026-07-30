@@ -31,7 +31,7 @@ const state = vi.hoisted(() => ({
 }));
 
 interface MockClientShape {
-  emit: (event: string, arg?: unknown) => void;
+  emit: (event: string, arg?: unknown) => boolean;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -45,18 +45,12 @@ function observedChannels(): string[] {
 }
 
 vi.mock('pg', async () => {
-  const { servePool } = await import('./fake-pg.js');
+  const { FakeEmitter, fakePool, servePool } = await import('./fake-pg.js');
 
-  class MockClient implements MockClientShape {
-    private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+  class MockClient extends FakeEmitter implements MockClientShape {
     constructor() {
+      super();
       state.clients.push(this);
-    }
-    on(event: string, cb: (arg?: unknown) => void): void {
-      (this.handlers[event] ??= []).push(cb);
-    }
-    emit(event: string, arg?: unknown): void {
-      for (const cb of this.handlers[event] ?? []) cb(arg);
     }
     async connect(): Promise<void> {}
     async query(sql: string): Promise<{ rows: unknown[] }> {
@@ -83,7 +77,7 @@ vi.mock('pg', async () => {
     async end(): Promise<void> {}
   }
 
-  const poolQuery = async (sql: string, values?: unknown[]): Promise<{ rows: unknown[] }> => {
+  const poolQuery = async (sql: string, values: readonly unknown[]): Promise<{ rows: unknown[] }> => {
     // Serve the row through the same cursor-honouring helper the other suites use. A fake that
     // returns it for every `seq > $2` regardless of the cursor makes the drain loop re-deliver it
     // forever, which is the fake's bug and not the plugin's.
@@ -91,7 +85,7 @@ vi.mock('pg', async () => {
       ? [
           {
             seq: '1',
-            topic: String(values?.[0]),
+            topic: String(values[0]),
             sender: 'u',
             content: 'landed',
             ts: new Date().toISOString(),
@@ -99,19 +93,11 @@ vi.mock('pg', async () => {
           },
         ]
       : [];
-    return { rows: servePool(all, sql, values ?? []) ?? [] };
+    return { rows: servePool(all, sql, values) ?? [] };
   };
 
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({
-        query: vi.fn(async () => ({ rows: [] })),
-        release: vi.fn(),
-      })),
-      query: vi.fn(poolQuery) as unknown as typeof poolQuery,
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() => fakePool(poolQuery)),
     Client: MockClient,
   };
 });

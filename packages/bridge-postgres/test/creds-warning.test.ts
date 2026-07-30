@@ -5,22 +5,12 @@ import { PostgresPlugin } from '../src/index.js';
 // (postgres://parley:parley@…). connect() opens a pool and runs the idempotent schema bootstrap,
 // so mock `pg` to a no-op pool/client; the warning fires before `new Pool(...)`. The mock lets the
 // whole connect() resolve so the gate sits on the happy path, not an incidental connection failure.
-vi.mock('pg', () => {
-  const makeClient = () => ({
-    query: vi.fn(async () => ({ rows: [] })),
-    release: vi.fn(),
-    on: vi.fn(),
-    connect: vi.fn(async () => undefined),
-    end: vi.fn(async () => undefined),
-  });
+vi.mock('pg', async () => {
+  const { FakeIdleClient, fakePool } = await import('./fake-pg.js');
+
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => makeClient()),
-      query: vi.fn(async () => ({ rows: [] })),
-      end: vi.fn(async () => undefined),
-    })),
-    Client: vi.fn(() => makeClient()),
+    Pool: vi.fn(() => fakePool()),
+    Client: FakeIdleClient,
   };
 });
 
