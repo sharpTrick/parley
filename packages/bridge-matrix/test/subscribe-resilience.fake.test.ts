@@ -53,9 +53,16 @@ describe('subscribe loop survives a transient /sync failure', () => {
   }
 });
 
+/** The `(N consecutive; …)` counts a run reported on stderr, in order. */
+const reportedFailureCounts = (calls: unknown[][]): number[] =>
+  calls
+    .map((c) => /\((\d+) consecutive;/.exec(String(c[0]))?.[1])
+    .filter((n): n is string => n !== undefined)
+    .map(Number);
+
 describe('subscribe loop does not silently hot-retry a permanent /sync failure', () => {
   for (const kind of Object.keys(FAILURES) as (keyof typeof FAILURES)[]) {
-    it(`${kind}: reports it on stderr and backs off`, async () => {
+    it(`${kind}: reports it on stderr, throttled, and backs off`, async () => {
       const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
       const p = await connectFake({});
       arm(kind, Number.POSITIVE_INFINITY);
@@ -67,11 +74,20 @@ describe('subscribe loop does not silently hot-retry a permanent /sync failure',
       });
       const [a0, a1, a2, a3] = fake.syncAttempts as [number, number, number, number];
       await p.disconnect();
+      const attempts = fake.syncAttempts.length;
 
-      expect(errors.mock.calls.length).toBeGreaterThan(0);
       expect(String(errors.mock.calls[0]![0])).toContain('/sync failed');
       // The gap between retries GROWS. A flat delay makes these two roughly equal.
       expect(a3 - a2).toBeGreaterThan((a1 - a0) * 2);
+
+      // The stated throttle, graded by CARDINALITY: an outage of `attempts` retries costs about
+      // log2(attempts) lines, at exactly the powers of two, each reported once. A ceiling alone is
+      // satisfied by logging nothing, so the floor is asserted too.
+      const reported = reportedFailureCounts(errors.mock.calls);
+      expect(reported).toEqual([...new Set(reported)]);
+      for (const n of reported) expect(n & (n - 1)).toBe(0);
+      expect(reported.length).toBeLessThanOrEqual(Math.floor(Math.log2(attempts)) + 1);
+      expect(reported.slice(0, 3)).toEqual([1, 2, 4]);
     }, 20_000);
   }
 });

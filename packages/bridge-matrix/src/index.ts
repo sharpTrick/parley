@@ -75,6 +75,43 @@ export interface MatrixBackendConfig {
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 const TOPIC_KEY = 'app.parley.topic';
 
+/** Repo-public login password every dev fixture ships with; never a secret. */
+const DEFAULT_PASSWORD = 'parleypass';
+
+/**
+ * Every config shape that widens this backend's trust boundary, phrased for the operator's stderr.
+ * A risk documented only in the README is one an operator who copied a fixture config never sees,
+ * so each of these warns from {@link MatrixPlugin.connect} — a warning rather than a load error,
+ * because each is a legitimate choice for a fixture or a rate-limited deployment.
+ */
+function configRisks(cfg: MatrixBackendConfig): string[] {
+  const risks: string[] = [];
+  if (cfg.password === undefined || cfg.password === DEFAULT_PASSWORD) {
+    risks.push(
+      `connecting with the built-in default password ('${DEFAULT_PASSWORD}'). Set ` +
+        'backend_config.password to a real secret; a network-reachable homeserver provisioned ' +
+        'with this password is world-readable/injectable.',
+    );
+  }
+  if (cfg.shared_room !== undefined) {
+    risks.push(
+      `backend_config.shared_room (${JSON.stringify(cfg.shared_room)}) folds EVERY topic into one ` +
+        `Matrix room, isolated only by the member-forgeable '${TOPIC_KEY}' event tag: any member ` +
+        'of that room can post a message tagged with any other topic, including the presence ' +
+        'topic. Leave shared_room unset in production so each topic gets its own room.',
+    );
+  }
+  if (cfg.room_preset === 'public_chat') {
+    risks.push(
+      "backend_config.room_preset 'public_chat' makes every room this bridge creates joinable by " +
+        'any account on the homeserver (and, under federation, beyond) via its guessable alias — ' +
+        "which admits readers of the topic's history and injectors of live agent events. Use the " +
+        "default 'private_chat' with backend_config.invite unless the room is deliberately open.",
+    );
+  }
+  return risks;
+}
+
 /**
  * Wall-clock budget for a `/sync` that asks the homeserver to block for `timeoutMs`. A long-poll
  * legitimately outlives the shared {@link DEFAULT_DEADLINE_MS}, so every `/sync` call MUST pass
@@ -155,7 +192,7 @@ export class MatrixPlugin implements BackendPlugin {
   private baseUrl = 'http://127.0.0.1:8008';
   private serverName = 'parley.local';
   private user = 'parley';
-  private password = 'parleypass';
+  private password = DEFAULT_PASSWORD;
   private syncTimeoutMs = 25_000;
   private roomPreset: RoomPreset = 'private_chat';
   private invite: string[] = [];
@@ -198,7 +235,7 @@ export class MatrixPlugin implements BackendPlugin {
     this.baseUrl = (cfg.homeserver_url ?? 'http://127.0.0.1:8008').replace(/\/+$/, '');
     this.serverName = cfg.server_name ?? 'parley.local';
     this.user = cfg.user ?? 'parley';
-    this.password = cfg.password ?? 'parleypass';
+    this.password = cfg.password ?? DEFAULT_PASSWORD;
     this.syncTimeoutMs = cfg.sync_timeout_ms ?? 25_000;
     this.roomPreset = cfg.room_preset ?? 'private_chat';
     this.invite = cfg.invite ?? [];
@@ -208,13 +245,7 @@ export class MatrixPlugin implements BackendPlugin {
     this.rooms.clear();
     this.liveTopics.clear();
 
-    if (cfg.password === undefined || this.password === 'parleypass') {
-      console.warn(
-        '[parley-matrix] SECURITY: connecting with the built-in default password ' +
-          "('parleypass'). Set backend_config.password to a real secret; a network-reachable " +
-          'homeserver provisioned with this password is world-readable/injectable.',
-      );
-    }
+    for (const risk of configRisks(cfg)) console.warn(`[parley-matrix] SECURITY: ${risk}`);
 
     const res = await this.http('POST', '/_matrix/client/v3/login', {
       body: {
@@ -268,14 +299,15 @@ export class MatrixPlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    const generation = this.generation;
     const deadline = Date.now() + (args.blockMs ?? 0);
     // The seam engages `blockMs` only relative to a `since`; a since-less read is the default recent
     // window and returns at once, so it must not spend the budget waiting for a room to be
     // provisioned.
     const roomId =
       args.since === undefined
-        ? await this.existingRoom(args.topic)
-        : await this.roomForRead(args.topic, deadline);
+        ? await this.existingRoom(args.topic, generation)
+        : await this.roomForRead(args.topic, deadline, generation);
     const limit = args.limit ?? 100;
     // A topic nobody has posted to has no room yet, and a read never provisions one. An empty page
     // with a replayable cursor is the seam's answer: the `@parley-stream:` form with no token drains
@@ -317,7 +349,12 @@ export class MatrixPlugin implements BackendPlugin {
     const since = String(sinceCursor);
     if (since.startsWith(STREAM_CURSOR_PREFIX)) {
       const token = since.slice(STREAM_CURSOR_PREFIX.length);
-      return this.drainForward(roomId, topic, token || undefined, undefined, limit, sinceCursor);
+      return this.drainForward(roomId, topic, token || undefined, undefined, limit, sinceCursor, {
+        // A read-state file is editable, truncatable, and survives a `shared_room`/`server_name`
+        // change, so this token may be one the homeserver rejects outright (Synapse: 400
+        // M_UNKNOWN "'from' parameter is invalid"). Degrade like the `event_id` branch's 404.
+        startTokenIsUntrusted: true,
+      });
     }
     // Keep the `''` branch: read-state files written before {@link STREAM_CURSOR_PREFIX} existed
     // carry that sentinel, and it must not reach `/context` — see STREAM_CURSOR_PREFIX.
@@ -356,6 +393,7 @@ export class MatrixPlugin implements BackendPlugin {
     sinceEventId: string | undefined,
     limit: number,
     sinceCursor: Cursor,
+    opts?: { startTokenIsUntrusted?: boolean },
   ): Promise<FetchRecentResult> {
     const messages: Message[] = [];
     let from = start;
@@ -372,15 +410,21 @@ export class MatrixPlugin implements BackendPlugin {
       const fwdRes = await this.http(
         'GET',
         `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?${fromParam}dir=f&limit=${limit}&filter=${MESSAGES_ONLY_FILTER}`,
+        page === 0 && opts?.startTokenIsUntrusted === true
+          ? { allowStatuses: [400, 404] }
+          : undefined,
       );
+      if (!fwdRes.ok) return this.recentWindow(roomId, topic, limit);
       const { chunk, end } = (await fwdRes.json()) as { chunk: MatrixEvent[]; end?: string };
       if (chunk.length === 0) break; // genuine end of timeline.
-      const rawTail = chunk.length >= limit ? chunk.at(-1)?.event_id : undefined;
+      // Keep the `since` event both DROPPED and out of the page-fullness count, so that a
+      // homeserver whose `/context` `end` token re-includes it can neither re-deliver it nor make
+      // an end-of-timeline page look full and move this topic's cursor on foreign traffic alone.
+      const reincluded =
+        sinceEventId !== undefined && chunk.some((e) => e.event_id === sinceEventId);
+      const rawTail =
+        chunk.length - (reincluded ? 1 : 0) >= limit ? chunk.at(-1)?.event_id : undefined;
       if (typeof rawTail === 'string') lastRawEventId = rawTail;
-      // The context `end` token is inconsistent at the boundary (it re-includes the `since` event
-      // for a mid-stream event, but not for the tail). Make `since` strictly exclusive by dropping
-      // everything up to AND INCLUDING the cursor event if it reappears in this page, THEN restrict
-      // to this topic (shared-room mode interleaves other topics in the same room).
       let events = chunk.filter(isMessageEvent);
       const idx =
         sinceEventId === undefined ? -1 : events.findIndex((e) => e.event_id === sinceEventId);
@@ -870,13 +914,16 @@ export class MatrixPlugin implements BackendPlugin {
    * cannot spend the homeserver's per-user room-creation budget (Synapse: ~2-room burst, then ~1
    * room / 45s) and starve the `post` that legitimately needs it.
    */
-  private async existingRoom(topic: Topic): Promise<string | undefined> {
+  private async existingRoom(topic: Topic, generation: number): Promise<string | undefined> {
     const key = this.roomKey(topic);
     const cached = this.rooms.get(key);
     if (cached !== undefined) return cached;
+    if (this.isStale(generation)) return undefined;
     const alias = this.aliasOf(this.roomLocalpart(topic));
     const roomId = await this.lookupAlias(alias);
-    if (roomId === undefined) return undefined;
+    // Keep this gate between the resolve and the join, so that a teardown landing mid-resolve
+    // cannot join a room with a cleared token and repopulate {@link rooms} for the next generation.
+    if (roomId === undefined || this.isStale(generation)) return undefined;
     await this.joinRoom(roomId, alias);
     this.rooms.set(key, Promise.resolve(roomId));
     return roomId;
@@ -885,15 +932,43 @@ export class MatrixPlugin implements BackendPlugin {
   /**
    * {@link existingRoom}, re-polled until `deadline`. Keep the wait, so that a blocking read on a
    * topic whose first message has not landed yet still waits for the peer's `post` to provision the
-   * room instead of returning instantly and turning an agent's long-poll into a spin.
+   * room instead of returning instantly and turning an agent's long-poll into a spin. Keep it gated
+   * on `generation` and interruptible, so that the poll stands down AT the `disconnect()` rather
+   * than one `sync_timeout_ms` later — and never under the next `connect()`.
    */
-  private async roomForRead(topic: Topic, deadline: number): Promise<string | undefined> {
+  private async roomForRead(
+    topic: Topic,
+    deadline: number,
+    generation: number,
+  ): Promise<string | undefined> {
     for (;;) {
-      const roomId = await this.existingRoom(topic);
+      if (this.isStale(generation)) return undefined;
+      const roomId = await this.existingRoom(topic, generation);
       if (roomId !== undefined) return roomId;
       const remaining = deadline - Date.now();
-      if (remaining <= 0 || this.stopped) return undefined;
-      await delay(Math.min(remaining, this.syncTimeoutMs));
+      if (remaining <= 0) return undefined;
+      await this.interruptibleDelay(Math.min(remaining, this.syncTimeoutMs));
+    }
+  }
+
+  /** Sleep, but no longer than the next `disconnect()` (which aborts every registered controller). */
+  private async interruptibleDelay(ms: number): Promise<void> {
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    try {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        controller.signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    } finally {
+      this.controllers.delete(controller);
     }
   }
 
@@ -1108,5 +1183,10 @@ function reportSyncFailure(topic: Topic, consecutiveFailures: number, err: unkno
   );
 }
 
-// Matrix alias localparts allow a restricted character set; map anything else to `_`.
-const sanitizeAlias = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, '_');
+/**
+ * Matrix alias localparts allow a restricted character set; map anything else to `_`. Exported so
+ * that this package's tests — and its fake homeserver's alias directory — grade THIS fold rather
+ * than a hand-copy of it: two topics folding onto one localpart share a room and cross-deliver, and
+ * {@link safeName} is what keeps the fold injective.
+ */
+export const sanitizeAlias = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, '_');

@@ -9,8 +9,9 @@ import { connectFake, FakeSynapse } from './fake-synapse.js';
  * `catchup.block_max_ms` defaults to 60s, so any of the three turns a landed message into a minute
  * of silence.
  *
- * The fake collapses every topic onto one room, so each cell here is also the shared-room case:
- * the blocked topic and the subscribed topic sit in the SAME room whenever they differ.
+ * The `shared_room` axis decides where the blocked and the subscribed topic live: the SAME room (a
+ * loop that observes the room may still not deliver the blocked topic) or two different ones (the
+ * loop cannot observe it at all).
  *
  * Two regimes, deliberately kept apart. The wake-source and phase tables run with the long-poll
  * slice set LONGER than the whole budget, so nothing but the wake source under test can end the

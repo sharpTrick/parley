@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MatrixPlugin } from '../src/index.js';
 
-// Matrix must not silently log in with the repo-public default password. connect() does
-// live I/O (the m.login.password POST), so we stub fetch with a valid login response; the warning
-// fires before that POST. We still assert the whole connect() resolves so the gate sits on the
-// happy path, not an incidental network failure.
+/**
+ * CLASS: a security posture that exists only in prose. Every config key that widens this backend's
+ * trust boundary must announce itself on the operator's stderr — a README paragraph is invisible to
+ * whoever copied a fixture config into production, and the repo's own conformance fixture is exactly
+ * such a config. connect() does live I/O (the m.login.password POST), so fetch is stubbed with a
+ * valid login; each warning fires before it, and the whole connect() must still resolve so the gate
+ * sits on the happy path rather than an incidental network failure.
+ */
+
 const okLogin = (): Response =>
   new Response(JSON.stringify({ access_token: 't', user_id: '@parley:parley.local' }), {
     status: 200,
@@ -16,30 +21,59 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+/** A config with every trust-widening knob at its safe setting. */
+const SAFE: Record<string, unknown> = {
+  homeserver_url: 'http://127.0.0.1:8008',
+  user: 'parley',
+  password: 's3cret-real-pw',
+};
 
-describe('Matrix default-credential warning', () => {
-  it('warns once, naming the backend and the key to set, when password is omitted', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => okLogin()));
-    const warn = spyWarn();
-    await new MatrixPlugin().connect({ homeserver_url: 'http://127.0.0.1:8008', user: 'parley' });
-    expect(warn).toHaveBeenCalledTimes(1);
-    const msg = String(warn.mock.calls[0]?.[0]);
-    expect(msg).toContain('parley-matrix');
-    expect(msg).toContain('password');
-  });
+const RISKS = {
+  'the built-in default password': {
+    apply: (c: Record<string, unknown>) => ({ ...c, password: undefined }),
+    /** Identifies the line, then the key an operator sets and the mitigation it must name. */
+    signature: /default password/,
+    names: ['backend_config.password', 'parleypass'],
+  },
+  'shared_room': {
+    apply: (c: Record<string, unknown>) => ({ ...c, shared_room: 'parley_all' }),
+    signature: /backend_config\.shared_room/,
+    names: ['app.parley.topic', 'Leave shared_room unset in production'],
+  },
+  'room_preset public_chat': {
+    apply: (c: Record<string, unknown>) => ({ ...c, room_preset: 'public_chat' }),
+    signature: /backend_config\.room_preset/,
+    names: ['public_chat', "default 'private_chat'"],
+  },
+} as const;
 
-  it('warns when password is set literally to the well-known default', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => okLogin()));
-    const warn = spyWarn();
-    await new MatrixPlugin().connect({ password: 'parleypass' });
-    expect(warn).toHaveBeenCalledTimes(1);
-  });
+type RiskName = keyof typeof RISKS;
+const RISK_NAMES = Object.keys(RISKS) as RiskName[];
 
-  it('does NOT warn when a real password is supplied', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => okLogin()));
-    const warn = spyWarn();
-    await new MatrixPlugin().connect({ password: 's3cret-real-pw', user: 'parley' });
-    expect(warn).not.toHaveBeenCalled();
-  });
+/** Every subset of the risky knobs, so a combination nobody tried is still graded. */
+const SUBSETS: RiskName[][] = Array.from({ length: 1 << RISK_NAMES.length }, (_, mask) =>
+  RISK_NAMES.filter((_n, i) => (mask & (1 << i)) !== 0),
+);
+
+describe('connect warns once per active trust-widening config knob', () => {
+  for (const active of SUBSETS) {
+    it(`${active.length === 0 ? 'a fully safe config' : active.join(' + ')}: ${active.length} warning(s)`, async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => okLogin()));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const config = active.reduce<Record<string, unknown>>((c, n) => RISKS[n].apply(c), SAFE);
+
+      await new MatrixPlugin().connect(config);
+
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      expect(lines).toHaveLength(active.length);
+      for (const name of RISK_NAMES) {
+        const matched = lines.filter((l) => RISKS[name].signature.test(l));
+        expect(matched, name).toHaveLength(active.includes(name) ? 1 : 0);
+        for (const mention of active.includes(name) ? RISKS[name].names : []) {
+          expect(matched[0]).toContain(mention);
+        }
+      }
+      for (const line of lines) expect(line).toContain('[parley-matrix]');
+    });
+  }
 });

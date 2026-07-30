@@ -1,22 +1,42 @@
-import { MatrixPlugin, type RoomPreset } from '../src/index.js';
+import { asTopic, safeName } from '@sharptrick/parley-core';
+import { MatrixPlugin, type RoomPreset, sanitizeAlias } from '../src/index.js';
 
 /**
- * In-memory fake Synapse: a `global.fetch` stub modelling ONE room's timeline plus Matrix
- * pagination tokens, alias directory, room creation, and injectable `/sync` failures. Shared by
- * every Matrix test file so a behavior proven here is proven against the real plugin code paths
- * (`fetchRecent` / `subscribe` / `backfill` / `ensureRoom`), not against a mock of them.
+ * In-memory fake Synapse: a `global.fetch` stub modelling an alias DIRECTORY of rooms — one
+ * `room_id` and one timeline per alias — plus Matrix pagination tokens, room creation, and
+ * injectable `/sync` failures. Shared by every Matrix test file so a behavior proven here is proven
+ * against the real plugin code paths (`fetchRecent` / `subscribe` / `backfill` / `ensureRoom`), not
+ * against a mock of them.
  *
- * Pagination-token model: a token `p<n>` is a boundary index into the timeline array.
+ * Keep the room-per-alias directory, so that the topic → room mapping is under test: a fake with one
+ * room certifies a plugin that resolves every topic to the same room, which in per-topic mode (the
+ * production configuration) is a total topic-isolation bypass.
+ *
+ * Pagination-token model: a token `p<n>` is a boundary index into that ROOM's timeline array.
  *   dir=f from p<n> → timeline[n], timeline[n+1], … ascending; end = p<n+count>
  *   dir=b from p<n> → timeline[n-1], timeline[n-2], … newest-first; end = p<n-count>
- *   /context/<id> → { start:p<i>, end:p<i> } (end re-includes the since event — the mid-stream case)
+ *   /context/<id> → { start:p<i>, end:p<i> } — an `end` that RE-INCLUDES the since event. Keep it
+ *   re-including, so that the plugin's exclusivity handling stays graded: the spec pins no
+ *   convention and Synapse's own `end` is exclusive, so matching Synapse would delete the only
+ *   coverage of the other legal shape. A `from` that is not `p<n>` is rejected 400, as Synapse does.
  *
  * The fake deliberately IGNORES the server-side `filter` on `/messages`, so client-side topic/type
- * filtering stays under test even though production offloads part of it to the homeserver.
+ * filtering stays under test even though production offloads part of it to the homeserver; what is
+ * actually SENT is graded from {@link FakeSynapse.messagesRequests}.
  */
 
 export const TOPIC_KEY = 'app.parley.topic';
-export const ROOM_ID = '!room:fake';
+export const SERVER_NAME = 'fake';
+/** The `shared_room` localpart every shared-mode fixture folds its topics into. */
+export const SHARED_LOCALPART = 'parley_conformance';
+
+/**
+ * The alias the plugin will ask for. Composed from the plugin's OWN exported fold, so a test naming
+ * a room cannot drift from the code that resolves it — and a fold regression fails on the wire
+ * assertions in `provisioning.fake.test.ts` rather than being mirrored here into a pass.
+ */
+export const aliasForTopic = (topic: string, shared = false): string =>
+  `#${shared ? SHARED_LOCALPART : `parley_${safeName(asTopic(topic), sanitizeAlias)}`}:${SERVER_NAME}`;
 
 export interface Ev {
   type: unknown;
@@ -26,16 +46,39 @@ export interface Ev {
   content: unknown;
 }
 
+export interface FakeRoom {
+  roomId: string;
+  alias: string;
+  timeline: Ev[];
+}
+
 const jsonRes = (obj: unknown, status = 200): Response =>
   new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 
+const notFound = (what: string): Response =>
+  jsonRes({ errcode: 'M_NOT_FOUND', error: `unknown ${what}` }, 404);
+
 export class FakeSynapse {
-  timeline: Ev[] = [];
+  private readonly byAlias = new Map<string, FakeRoom>();
+  private readonly byId = new Map<string, FakeRoom>();
   private counter = 0;
+  private roomCounter = 0;
+  /** Alias of the most recent directory lookup / createRoom — where an unrouted injection lands. */
+  private lastAlias?: string;
+  /** Every alias `/directory/room/` was asked to resolve, in order. */
+  readonly directoryLookups: string[] = [];
+  /** Every `/messages` request URL, in order — the evidence for what went on the wire. */
+  readonly messagesRequests: URL[] = [];
   /** How many events an incremental /sync will return before it truncates with `limited:true`. */
   syncCap = 100;
   /** Number of `limited:true` incremental syncs emitted — proves the backfill path was exercised. */
   limitedEmitted = 0;
+  /**
+   * By how many events a `limited` sync's `prev_batch` overlaps the batch it returned. Keep the
+   * non-zero settings exercised, so that the backfill's de-duplication guard stays reachable at all:
+   * Synapse's own `prev_batch` is exclusive, and a suite modelling only Synapse can never fire it.
+   */
+  prevBatchOverlap = 0;
   /** False → `/directory/room/<alias>` 404s, forcing `POST /createRoom` (provisioning path). */
   aliasExists = true;
   /** Every `POST /createRoom` body, in order — an ATTEMPT is recorded even when it is refused. */
@@ -87,7 +130,52 @@ export class FakeSynapse {
    */
   holdMessages: (url: URL, body: { chunk: Ev[] }) => number = () => 0;
 
-  private ev(type: string, content: Record<string, unknown>): Ev {
+  /** Rooms that exist, in creation order. */
+  get rooms(): FakeRoom[] {
+    return [...this.byId.values()];
+  }
+
+  /** Every event in every room — for an absence check that must not name a room. */
+  get allEvents(): Ev[] {
+    return this.rooms.flatMap((r) => r.timeline);
+  }
+
+  roomIdFor(alias: string): string | undefined {
+    return this.byAlias.get(alias)?.roomId;
+  }
+
+  timelineOf(alias: string): Ev[] {
+    return this.byAlias.get(alias)?.timeline ?? [];
+  }
+
+  private room(alias: string): FakeRoom {
+    const existing = this.byAlias.get(alias);
+    if (existing !== undefined) return existing;
+    const room: FakeRoom = {
+      roomId: `!room${this.roomCounter++}:${SERVER_NAME}`,
+      alias,
+      timeline: [],
+    };
+    this.byAlias.set(alias, room);
+    this.byId.set(room.roomId, room);
+    return room;
+  }
+
+  /**
+   * Where an injected event lands: the named alias, else the room the plugin last asked about. Keep
+   * the throw, so that an injection with no room to land in fails the case instead of silently
+   * grading nothing.
+   */
+  private target(alias?: string): FakeRoom {
+    const chosen = alias ?? this.lastAlias;
+    if (chosen === undefined)
+      throw new Error(
+        'FakeSynapse: no alias has been resolved yet — pass one to say which room to inject into',
+      );
+    return this.room(chosen);
+  }
+
+  private ev(type: string, content: Record<string, unknown>, room: FakeRoom): Ev {
     const e: Ev = {
       type,
       event_id: `$e${this.counter}:fake`,
@@ -96,26 +184,34 @@ export class FakeSynapse {
       content,
     };
     this.counter++;
-    this.timeline.push(e);
+    room.timeline.push(e);
     return e;
   }
 
   /** Inject a message from a "foreign" client (simulates a post that landed between polls). */
-  addMessage(topic: string, body: string): Ev {
-    return this.ev('m.room.message', { msgtype: 'm.text', body, [TOPIC_KEY]: topic });
+  addMessage(topic: string, body: string, alias?: string): Ev {
+    return this.ev(
+      'm.room.message',
+      { msgtype: 'm.text', body, [TOPIC_KEY]: topic },
+      this.target(alias),
+    );
   }
 
   /** Inject a non-`m.room.message` event (reaction / membership churn). */
-  addRaw(type: string): Ev {
-    return this.ev(type, {});
+  addRaw(type: string, alias?: string): Ev {
+    return this.ev(type, {}, this.target(alias));
   }
 
   /**
    * Inject an `m.room.message` whose fields carry arbitrary JSON. Synapse enforces no schema on
    * event content, so any room member can send these — they are what the plugin actually reads.
    */
-  addHostile(fields: Partial<Ev>): Ev {
-    const e = this.ev('m.room.message', { msgtype: 'm.text', body: 'hostile' });
+  addHostile(fields: Partial<Ev>, alias?: string): Ev {
+    const e = this.ev(
+      'm.room.message',
+      { msgtype: 'm.text', body: 'hostile' },
+      this.target(alias),
+    );
     Object.assign(e, fields);
     return e;
   }
@@ -130,13 +226,19 @@ export class FakeSynapse {
     this.onRequest(method, path);
 
     if (path.endsWith('/v3/login')) return jsonRes({ access_token: 'tok', user_id: '@parley:fake' });
-    if (path.includes('/v3/directory/room/')) {
+
+    const dirMatch = path.match(/\/v3\/directory\/room\/([^/]+)$/);
+    if (dirMatch) {
+      const alias = decodeURIComponent(dirMatch[1]!);
+      this.directoryLookups.push(alias);
+      this.lastAlias = alias;
       return this.aliasExists
-        ? jsonRes({ room_id: ROOM_ID })
+        ? jsonRes({ room_id: this.room(alias).roomId })
         : jsonRes({ errcode: 'M_NOT_FOUND', error: 'room alias not found' }, 404);
     }
     if (path.endsWith('/v3/createRoom')) {
-      this.createRoomBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      this.createRoomBodies.push(body);
       if (this.createRoomLimited > 0) {
         this.createRoomLimited--;
         return jsonRes(
@@ -145,32 +247,49 @@ export class FakeSynapse {
         );
       }
       this.aliasExists = true;
-      return jsonRes({ room_id: ROOM_ID });
+      const alias = `#${String(body.room_alias_name)}:${SERVER_NAME}`;
+      this.lastAlias = alias;
+      return jsonRes({ room_id: this.room(alias).roomId });
     }
+
+    const inRoom = ((): FakeRoom | undefined => {
+      const m = path.match(/\/v3\/rooms\/([^/]+)/);
+      return m === null ? undefined : this.byId.get(decodeURIComponent(m[1]!));
+    })();
+
     if (path.endsWith('/join')) {
-      if (this.joinStatus === 200) return jsonRes({ room_id: ROOM_ID });
-      const errcode = this.joinStatus === 403 ? 'M_FORBIDDEN' : 'M_NOT_FOUND';
-      return jsonRes({ errcode, error: 'You are not invited to this room.' }, this.joinStatus);
+      if (this.joinStatus !== 200) {
+        const errcode = this.joinStatus === 403 ? 'M_FORBIDDEN' : 'M_NOT_FOUND';
+        return jsonRes({ errcode, error: 'You are not invited to this room.' }, this.joinStatus);
+      }
+      if (inRoom === undefined) return notFound('room');
+      return jsonRes({ room_id: inRoom.roomId });
     }
 
     if (method === 'PUT' && /\/rooms\/[^/]+\/send\/m\.room\.message\//.test(path)) {
+      if (inRoom === undefined) return notFound('room');
       const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
       this.sentBodies.push(body);
-      const e = this.ev('m.room.message', {
-        msgtype: 'm.text',
-        body: body.body,
-        [TOPIC_KEY]: body[TOPIC_KEY],
-        ...(body['m.relates_to'] !== undefined ? { 'm.relates_to': body['m.relates_to'] } : {}),
-      });
+      const e = this.ev(
+        'm.room.message',
+        {
+          msgtype: 'm.text',
+          body: body.body,
+          [TOPIC_KEY]: body[TOPIC_KEY],
+          ...(body['m.relates_to'] !== undefined ? { 'm.relates_to': body['m.relates_to'] } : {}),
+        },
+        inRoom,
+      );
       return jsonRes({ event_id: e.event_id });
     }
 
     const ctx = path.match(/\/rooms\/[^/]+\/context\/([^/]+)$/);
     if (ctx) {
+      if (inRoom === undefined) return notFound('room');
       const evId = decodeURIComponent(ctx[1]!);
-      const idx = this.timeline.findIndex((e) => e.event_id === evId);
+      const idx = inRoom.timeline.findIndex((e) => e.event_id === evId);
       if (idx < 0) return jsonRes({ errcode: 'M_NOT_FOUND', error: 'event not found' }, 404);
-      return jsonRes({ start: `p${idx}`, end: `p${idx}`, event: this.timeline[idx] });
+      return jsonRes({ start: `p${idx}`, end: `p${idx}`, event: inRoom.timeline[idx] });
     }
     // An EMPTY cursor degenerates to `/context/` with no event id — Synapse answers 404 there, and
     // the plugin must never mint such a cursor (it decodes as "expired" and truncates the stream).
@@ -179,24 +298,30 @@ export class FakeSynapse {
     }
 
     if (/\/rooms\/[^/]+\/messages$/.test(path)) {
+      this.messagesRequests.push(url);
       if (this.messagesFailures > 0) {
         this.messagesFailures--;
         if (this.messagesFailureMode === 'network') throw new Error('fake network reset');
         return jsonRes({ errcode: 'M_UNKNOWN', error: 'injected' }, this.messagesFailureStatus);
       }
+      if (inRoom === undefined) return notFound('room');
+      const timeline = inRoom.timeline;
       const dir = url.searchParams.get('dir');
       const limit = Number(url.searchParams.get('limit') ?? '10');
       const from = url.searchParams.get('from');
+      if (from !== null && !/^p\d+$/.test(from)) {
+        return jsonRes({ errcode: 'M_UNKNOWN', error: "'from' parameter is invalid" }, 400);
+      }
       const body = ((): { chunk: Ev[]; start: string; end: string } => {
         if (dir === 'f') {
           const b = from ? tokenPos(from) : 0;
-          const chunk = this.timeline.slice(b, b + limit);
+          const chunk = timeline.slice(b, b + limit);
           return { chunk, start: `p${b}`, end: `p${b + chunk.length}` };
         }
         // dir=b (default for recentWindow — no `from` → newest-first from the tail).
-        const b = from ? tokenPos(from) : this.timeline.length;
+        const b = from ? tokenPos(from) : timeline.length;
         const start = Math.max(0, b - limit);
-        return { chunk: this.timeline.slice(start, b).reverse(), start: `p${b}`, end: `p${start}` };
+        return { chunk: timeline.slice(start, b).reverse(), start: `p${b}`, end: `p${start}` };
       })();
       const hold = this.holdMessages(url, body);
       if (hold > 0) await new Promise((r) => setTimeout(r, hold));
@@ -206,10 +331,18 @@ export class FakeSynapse {
     if (path.endsWith('/v3/sync')) {
       const since = url.searchParams.get('since');
       const filter = JSON.parse(url.searchParams.get('filter') ?? '{}') as {
-        room?: { timeline?: { limit?: number } };
+        room?: { rooms?: string[]; timeline?: { limit?: number } };
       };
       const filterLimit = filter.room?.timeline?.limit ?? 0;
-      const len = this.timeline.length;
+      const syncRoom = this.byId.get(filter.room?.rooms?.[0] ?? '');
+      const timeline = syncRoom?.timeline ?? [];
+      const joined = (payload: unknown): Response =>
+        jsonRes(
+          syncRoom === undefined
+            ? { next_batch: `p${timeline.length}`, rooms: { join: {} } }
+            : (payload as Record<string, unknown>),
+        );
+      const len = timeline.length;
       if (since === null) {
         // Initial positioning sync (timeline limit 0) — skip history, just hand back a resume token.
         const ordinal = ++this.positioningSyncs;
@@ -218,8 +351,10 @@ export class FakeSynapse {
           this.duringPositioningStall(ordinal);
           await new Promise((r) => setTimeout(r, this.stallPositioningMs));
         }
-        const at = this.timeline.length;
-        return jsonRes({ next_batch: `p${at}`, rooms: { join: { [ROOM_ID]: { timeline: { events: [], limited: false } } } } });
+        return joined({
+          next_batch: `p${timeline.length}`,
+          rooms: { join: { [syncRoom?.roomId ?? '']: { timeline: { events: [], limited: false } } } },
+        });
       }
       this.syncAttempts.push(Date.now());
       if (this.syncFailures > 0) {
@@ -230,21 +365,37 @@ export class FakeSynapse {
       const k = tokenPos(since);
       const cap = Math.min(filterLimit, this.syncCap);
       const newCount = len - k;
+      const roomKey = syncRoom?.roomId ?? '';
       if (newCount <= 0) {
-        return jsonRes({ next_batch: `p${k}`, rooms: { join: { [ROOM_ID]: { timeline: { events: [], limited: false } } } } });
+        return joined({
+          next_batch: `p${k}`,
+          rooms: { join: { [roomKey]: { timeline: { events: [], limited: false } } } },
+        });
       }
       if (newCount <= cap) {
-        const events = this.timeline.slice(k, len);
-        return jsonRes({ next_batch: `p${len}`, rooms: { join: { [ROOM_ID]: { timeline: { events, limited: false } } } } });
+        return joined({
+          next_batch: `p${len}`,
+          rooms: { join: { [roomKey]: { timeline: { events: timeline.slice(k, len), limited: false } } } },
+        });
       }
       // Burst larger than the effective per-sync cap: return only the newest `cap`, mark `limited`,
-      // and expose a `prev_batch` that paginates BACKWARD over the omitted (older) events.
+      // and expose a `prev_batch` that paginates BACKWARD over the omitted (older) events —
+      // re-including `prevBatchOverlap` of the batch's own oldest events.
       this.limitedEmitted++;
       const startIdx = len - cap;
-      const events = this.timeline.slice(startIdx, len);
-      return jsonRes({
+      return joined({
         next_batch: `p${len}`,
-        rooms: { join: { [ROOM_ID]: { timeline: { events, limited: true, prev_batch: `p${startIdx}` } } } },
+        rooms: {
+          join: {
+            [roomKey]: {
+              timeline: {
+                events: timeline.slice(startIdx, len),
+                limited: true,
+                prev_batch: `p${Math.min(startIdx + this.prevBatchOverlap, len)}`,
+              },
+            },
+          },
+        },
       });
     }
 
@@ -263,11 +414,11 @@ export interface ConnectOptions {
 
 export const fakeConfig = (opts: ConnectOptions = {}): Record<string, unknown> => ({
   homeserver_url: 'http://synapse.fake',
-  server_name: 'fake',
+  server_name: SERVER_NAME,
   user: 'parley',
   password: 'a-real-test-secret',
   sync_timeout_ms: opts.syncTimeoutMs ?? 50,
-  ...(opts.shared === true ? { shared_room: 'parley_conformance' } : {}),
+  ...(opts.shared === true ? { shared_room: SHARED_LOCALPART } : {}),
   ...(opts.roomPreset !== undefined ? { room_preset: opts.roomPreset } : {}),
   ...(opts.invite !== undefined ? { invite: opts.invite } : {}),
 });

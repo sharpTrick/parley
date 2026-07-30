@@ -1,4 +1,4 @@
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
 import { connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
@@ -15,6 +15,8 @@ const WRITER = asHandle('writer');
 const TOPIC = asTopic('lifecycle');
 /** Longer than the retry backoff the loop is parked in, so a resurrected loop has time to show. */
 const OBSERVE_MS = 3000;
+/** Long enough that a park which only re-checks on its next tick shows up as latency, not a race. */
+const SLOW_SYNC_MS = 4000;
 
 let fake: FakeSynapse;
 beforeEach(() => {
@@ -133,23 +135,58 @@ describe('every internal registry is empty after a lifecycle that stood the loop
   }, 30_000);
 });
 
-describe('a dedicated bounded /sync does not survive disconnect + connect', () => {
-  it('the blocking fetch returns at the disconnect and issues no more requests', async () => {
-    const p = await connectFake({});
-    await p.post(TOPIC, WRITER, 'seed');
-    const tail = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
-
-    const pending = p.fetchRecent({ topic: TOPIC, since: tail, blockMs: 30_000 });
-    await settle(100);
+/**
+ * CLASS: a plugin wait that watches only the shared stopped flag. Every background park must stand
+ * down AT the `disconnect()` — checked BEFORE its next request, not only after it — or it keeps
+ * talking to the homeserver with a cleared token, joins rooms post-teardown, and repopulates the
+ * registries the next `connect()` just cleared. The `roomExists` axis is what separates the two parks
+ * a blocking read can be sitting in: the room-provisioning poll (no room yet) and the `/sync`
+ * long-poll (room resolved).
+ */
+const AFTER: Record<string, (p: MatrixPlugin) => Promise<void>> = {
+  disconnect: async (p) => {
     await p.disconnect();
-    expect((await pending).messages).toEqual([]);
-
-    const attemptsAtDisconnect = fake.syncAttempts.length;
-    await p.connect(fakeConfig());
-    fake.addMessage(String(TOPIC), 'after-reconnect');
-    await settle(OBSERVE_MS);
-
-    expect(fake.syncAttempts.length).toBe(attemptsAtDisconnect);
+  },
+  'disconnect → connect': async (p) => {
     await p.disconnect();
-  }, 30_000);
+    await p.connect(fakeConfig({ syncTimeoutMs: SLOW_SYNC_MS }));
+  },
+};
+
+describe('a parked blocking fetchRecent does not outlive the disconnect', () => {
+  for (const roomExists of [true, false]) {
+    for (const [name, after] of Object.entries(AFTER)) {
+      it(`room exists: ${roomExists} / ${name}: settles at once, then issues nothing`, async () => {
+        const requests: string[] = [];
+        fake.onRequest = (method, path) => void requests.push(`${method} ${path}`);
+        const p = await connectFake({ syncTimeoutMs: SLOW_SYNC_MS });
+        let since = asCursor('');
+        if (roomExists) {
+          await p.post(TOPIC, WRITER, 'seed');
+          since = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
+        } else {
+          fake.aliasExists = false;
+        }
+
+        const pending = p.fetchRecent({ topic: TOPIC, since, blockMs: 30_000, limit: 5 });
+        await settle(100); // let the wait park
+
+        const torn = Date.now();
+        await after(p);
+        // The room the wait was polling for appears the instant the teardown lands: a park that
+        // ignored it resolves the alias, joins, and reads — all with a cleared token.
+        fake.aliasExists = true;
+        const atTeardown = requests.length;
+
+        expect((await pending).messages).toEqual([]);
+        const settledAfter = Date.now() - torn;
+
+        await settle(500);
+        expect(requests.slice(atTeardown)).toEqual([]);
+        expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
+        expect(settledAfter).toBeLessThan(SLOW_SYNC_MS / 4);
+        await p.disconnect();
+      }, 30_000);
+    }
+  }
 });

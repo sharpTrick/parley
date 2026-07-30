@@ -101,11 +101,15 @@ it does not degrade into an opaque `M_FORBIDDEN` from a later `/send` or `/messa
 | `password`         | `parleypass`             | Login password. |
 | `server_name`      | `parley.local`           | Used to build room aliases. |
 | `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout. Unbounded: each `/sync` gets a transport deadline of this plus a full 30s call budget, so raising it does not make the homeserver's own answer look like a timeout. It is also the cadence at which a blocking `fetch_recent` re-checks by itself, so a very large value slows the safety net that covers a `/sync` loop stuck in retry backoff. |
-| `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. |
-| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below). These are the only two accepted. |
+| `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. `connect()` warns on stderr while it is set. |
+| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below), and `connect()` warns on stderr while it is set. These are the only two accepted. |
 | `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares a topic; see "Multiple concurrent sessions". |
 
-Secrets live in `backend_config` / `.env`, never in code.
+Secrets live in `backend_config` / `.env`, never in code. Every key above that widens the trust
+boundary — the default password, `shared_room`, `room_preset: public_chat` — announces itself on
+stderr from `connect()`, so an operator who copied a fixture config sees the risk without reading
+this file. They are warnings, not load errors: each is a legitimate choice for a fixture or a
+rate-limited deployment.
 
 ## Multiple concurrent sessions (one `backend_config` per config file, same homeserver)
 

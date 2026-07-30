@@ -8,7 +8,7 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
-import { connectFake, FakeSynapse } from './fake-synapse.js';
+import { aliasForTopic, connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
  * Two seam CLASSES, table-driven so a variant nobody tried is still covered:
@@ -145,7 +145,8 @@ const CURSOR_ORIGINS: Record<
     lossless: true,
     shape: 'stream token',
     mint: async (p, t) => {
-      for (let i = 0; i < LIMIT * 2; i++) fake.addMessage('someone-elses-topic', `n${i}`);
+      for (let i = 0; i < LIMIT * 2; i++)
+        fake.addMessage('someone-elses-topic', `n${i}`, aliasForTopic(String(t), true));
       return (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor;
     },
   },
