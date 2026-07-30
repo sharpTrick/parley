@@ -20,9 +20,9 @@ export interface PresenceLoopOptions {
   /** The shared presence topic to announce on (`presence.topic`). */
   presenceTopic: Topic;
   /**
-   * Heartbeat cadence (ms). Must be `> 0`: a non-positive cadence is REJECTED, not clamped, because
+   * Heartbeat cadence (ms). Must be `>= 1`: anything below that is REJECTED, not clamped, because
    * `setInterval` floors it to ~1 ms and the loop becomes a post storm against the presence topic.
-   * Core's own config schema already guarantees a positive value.
+   * Core's own config schema already guarantees a positive integer.
    */
   heartbeatMs: number;
   /** Clock source; injectable for deterministic tests. Default `Date.now`. */
@@ -66,10 +66,10 @@ export function startPresenceLoop(
   allow: Allowlist,
   opts: PresenceLoopOptions,
 ): PresenceLoop {
-  // `setInterval` floors a non-positive delay to ~1 ms and coerces an out-of-range one to 1 ms, so
-  // both shapes become a post storm against the topic every peer reads.
-  if (!Number.isFinite(opts.heartbeatMs) || opts.heartbeatMs <= 0) {
-    throw new RangeError(`presence heartbeatMs must be a positive finite number (got ${opts.heartbeatMs})`);
+  // `setInterval` floors any delay below 1 ms to ~1 ms — a non-positive one, and a fractional one
+  // alike — so every such shape becomes a post storm against the topic every peer reads.
+  if (!Number.isFinite(opts.heartbeatMs) || opts.heartbeatMs < 1) {
+    throw new RangeError(`presence heartbeatMs must be a finite number >= 1 (got ${opts.heartbeatMs})`);
   }
   const now = opts.now ?? Date.now;
   // Subscribed topics and post_topics reach are both static config — capture once and advertise

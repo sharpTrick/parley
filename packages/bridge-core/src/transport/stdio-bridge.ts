@@ -89,15 +89,14 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   let attached = false;
   let presence: PresenceLoop | undefined;
   let toreDown = false;
-  // Keep this as the ONE teardown, so a failed attach releases exactly what shutdown() would — the
+  // Keep this as the ONE release, so a failed attach releases exactly what shutdown() would — the
   // caller of a rejecting attach never receives a bridge to shut down, and a leaked connection's
-  // poll timers keep the process alive. The presence goodbye is best-effort and self-bounding, so
-  // it can never hold the disconnect. Keep every step ATTEMPTED even after an earlier one rejects,
-  // so a backend whose close handshake fails (Matrix/XMPP/NATS all can) cannot leave the transport
-  // connected and the process unable to exit.
-  const teardown = async (): Promise<void> => {
-    if (toreDown) return;
-    toreDown = true;
+  // poll timers keep the process alive. It is deliberately UNLATCHED: an attach that loses the race
+  // with shutdown() has to release what it started after the latch was already set. The presence
+  // goodbye is best-effort and self-bounding, so it can never hold the disconnect. Keep every step
+  // ATTEMPTED even after an earlier one rejects, so a backend whose close handshake fails
+  // (Matrix/XMPP/NATS all can) cannot leave the transport connected and the process unable to exit.
+  const releaseAll = async (): Promise<void> => {
     const failures: unknown[] = [];
     const attempt = async (step: () => Promise<void>): Promise<void> => {
       try {
@@ -107,10 +106,16 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
       }
     };
     await presence?.stop().catch(() => {});
+    presence = undefined;
     await attempt(() => plugin.disconnect());
     await attempt(() => server.close());
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, 'bridge teardown failed');
+  };
+  const teardown = async (): Promise<void> => {
+    if (toreDown) return;
+    toreDown = true;
+    await releaseAll();
   };
   return {
     server,
@@ -122,13 +127,22 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
       // receives a bridge to shut down, so a connect left outside would orphan the plugin's poll
       // timers and hang the process. Wire the live push path BEFORE announcing presence, so the
       // bridge is only advertised as reachable once it can actually deliver.
+      //
+      // Keep re-reading the latch after every await, so that a shutdown() landing mid-attach is not
+      // overtaken by the steps still to come — a presence loop started after teardown beats on
+      // forever, advertising a disconnected bridge as reachable, and shutdown() is already spent.
+      const abortIfToreDown = (): void => {
+        if (toreDown) throw new Error('bridge shut down while attaching');
+      };
       try {
         await server.connect(transport);
+        abortIfToreDown();
         if (cfg.live_push.enabled) {
           await startPushLoop(server, plugin, allow, seen, {
             mentionFilter: cfg.live_push.mention_filter,
             identity,
           });
+          abortIfToreDown();
         }
         // Announce presence regardless of live_push — a reactive-only bridge is still a live
         // participant others can discover via parley_list_users (DESIGN §7).
@@ -139,7 +153,8 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
           });
         }
       } catch (e) {
-        await teardown().catch(() => {});
+        toreDown = true;
+        await releaseAll().catch(() => {});
         throw e;
       }
     },

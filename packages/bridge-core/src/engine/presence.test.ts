@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
+import { isRedosSafeSource, MAX_MATCH_INPUT } from '../regex-safety.js';
+import { SAFE_PATTERNS } from '../testing/regex-corpus.js';
 import {
   computeRoster,
   decodePresence,
@@ -10,6 +12,7 @@ import {
   MAX_HANDLE_LEN,
   MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
+  MAX_ROSTER_ENTRIES,
   MAX_TOPIC_LEN,
   type PresenceKind,
   type PresenceRecord,
@@ -453,6 +456,118 @@ describe('the per-record budget survives aggregation across instances', () => {
     expect(roster).toHaveLength(1);
     expect(roster[0]!.topics).toHaveLength(MAX_HANDLE_INSTANCES);
     expect(roster[0]!.lastSeenMs).toBe(now - 1_000);
+  });
+});
+
+/**
+ * Every cap above bounds ONE record or ONE handle, and each is multiplied by a factor none of them
+ * touches: how many ENTRIES the roster carries. A beat's `handle` is self-reported, so one
+ * credential mints as many peers as it has beats, and each of those peers advertises its own legal
+ * 64 patterns that `filterReachable` compiles and tests against every topic the caller subscribes
+ * to. `regex-safety.ts` states the ambiguity bound is per SOURCE and that the caller must also bound
+ * HOW MANY it holds; this is the case that pays for it. Sweep the multiplying dimensions one at a
+ * time — a cap restored on only one of them must not pass — take the costliest source the screen
+ * ACCEPTS from the shared corpus by MEASUREMENT rather than by name (a hard-coded one lets the
+ * corpus widen past the test), and grade the two things the caller actually pays: synchronous CPU
+ * and the bytes that land in the agent's context.
+ */
+describe('untrusted presence history cannot exceed a CPU or byte budget', () => {
+  const now = 1_000_000;
+  const opts = { ttlMs: 90_000, sinceMs: 600_000 };
+  /** PRESENCE_FETCH_LIMIT: the most beats one roster is ever built from. */
+  const PAGE = 500;
+  const CALLER_TOPICS = 20;
+  const CPU_BUDGET_MS = 500;
+  /** What one maximal entry can legally serialize to: topics AND postTopics, each capped both ways. */
+  const ENTRY_BYTES = 2 * MAX_RECORD_TOPICS * (MAX_TOPIC_LEN + 8) + 256;
+  const ROSTER_BUDGET_BYTES = MAX_ROSTER_ENTRIES * ENTRY_BYTES;
+
+  const worstAcceptedSource = (): string => {
+    const input = 'a'.repeat(MAX_MATCH_INPUT);
+    let worst = '';
+    let worstMs = -1;
+    for (const [, src] of SAFE_PATTERNS) {
+      if (!isRedosSafeSource(src)) continue;
+      const re = new RegExp(`^(?:${src})$`);
+      const t0 = performance.now();
+      for (let rep = 0; rep < 3; rep++) re.test(input);
+      const ms = performance.now() - t0;
+      if (ms > worstMs) {
+        worstMs = ms;
+        worst = src;
+      }
+    }
+    return worst;
+  };
+  const WORST = worstAcceptedSource();
+
+  /** Pad to the per-string cap so each cell is worst case in bytes as well as in backtracking. */
+  const padded = (head: string): string =>
+    head.length >= MAX_TOPIC_LEN ? head.slice(0, MAX_TOPIC_LEN) : head + 'y'.repeat(MAX_TOPIC_LEN - head.length);
+
+  function hostilePage(handles: number, instances: number, patterns: number): Message[] {
+    const page: Message[] = [];
+    let seq = 0;
+    for (let h = 0; h < handles; h++) {
+      for (let i = 0; i < instances; i++) {
+        seq++;
+        page.push({
+          topic: asTopic('parley-presence'),
+          // ONE writer holding ONE credential: every `handle` below is self-reported by the record.
+          senderHandle: asHandle('one-credential'),
+          content: encodePresence({
+            v: 2,
+            kind: 'heartbeat',
+            at: now - 1_000,
+            handle: `peer-${h}`,
+            topics: [padded(`t-${h}-${i}-`)],
+            postTopics: Array.from({ length: patterns }, (_u, j) => padded(`${WORST}${h}-${i}-${j}-`)),
+            instanceId: `inst-${i}`,
+          }),
+          timestamp: new Date(seq * 1000).toISOString(),
+          backendMsgId: asBackendMsgId(String(seq)),
+          cursor: asCursor(String(seq)),
+          mentions: [],
+        });
+      }
+    }
+    return page;
+  }
+
+  it('the corpus yields a source the screen accepts, at full length', () => {
+    expect(isRedosSafeSource(WORST)).toBe(true);
+    expect(isRedosSafeSource(padded(`${WORST}0-0-0-`))).toBe(true);
+  });
+
+  it.each([
+    ['nothing multiplied (control)', 1, 1, 1, 1],
+    ['handles alone', PAGE, 1, 1, 1],
+    ['instances alone', 1, PAGE, 1, 1],
+    ['patterns per beat alone', 1, 1, MAX_RECORD_TOPICS, 1],
+    ['caller topics alone', 1, 1, MAX_RECORD_TOPICS, CALLER_TOPICS],
+    ['handles × patterns', PAGE, 1, MAX_RECORD_TOPICS, 1],
+    ['handles × patterns × caller topics', PAGE, 1, MAX_RECORD_TOPICS, CALLER_TOPICS],
+    [
+      'the same page split across instances',
+      PAGE / MAX_HANDLE_INSTANCES,
+      MAX_HANDLE_INSTANCES,
+      MAX_RECORD_TOPICS,
+      CALLER_TOPICS,
+    ],
+  ])('%s', (_name, handles, instances, patterns, callerTopics) => {
+    const roster = computeRoster(hostilePage(handles, instances, patterns), now, opts);
+    expect(roster.length).toBeGreaterThan(0); // bounded, never emptied
+    expect(roster.length).toBeLessThanOrEqual(MAX_ROSTER_ENTRIES);
+    expect(JSON.stringify(roster).length).toBeLessThan(ROSTER_BUDGET_BYTES);
+
+    const mine = Array.from({ length: callerTopics }, (_u, i) => `mine-${i}`.padEnd(MAX_MATCH_INPUT, 'a'));
+    const unscopedT0 = performance.now();
+    filterReachable(roster, { scope: undefined, canPostTo: () => false, mySubscribedTopics: mine });
+    expect(performance.now() - unscopedT0).toBeLessThan(CPU_BUDGET_MS);
+
+    const scopedT0 = performance.now();
+    filterReachable(roster, { scope: mine[0]!, canPostTo: () => false, mySubscribedTopics: [] });
+    expect(performance.now() - scopedT0).toBeLessThan(CPU_BUDGET_MS);
   });
 });
 

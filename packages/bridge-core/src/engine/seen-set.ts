@@ -8,6 +8,12 @@ import type { BackendMsgId, Topic } from '../message.js';
 export const SEEN_MAX_PER_TOPIC = 4096;
 export const SEEN_MAX_TOPICS = 256;
 
+function requirePositiveInt(name: string, value: number): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(`SeenSet ${name} must be a positive integer (got ${value})`);
+  }
+}
+
 /**
  * Per-topic dedup set keyed on `backendMsgId` (DESIGN §6 — NEVER on timestamp).
  *
@@ -30,7 +36,14 @@ export class SeenSet {
   constructor(
     private readonly maxPerTopic = SEEN_MAX_PER_TOPIC,
     private readonly maxTopics = SEEN_MAX_TOPICS,
-  ) {}
+  ) {
+    // Keep these refused rather than clamped, so that a degenerate cap cannot silently DELETE the
+    // window instead of shrinking it: the LRU sweep evicts the very bucket `record` is about to
+    // write into, `firstSeen` then answers true forever, and every message is re-emitted as a
+    // `<channel>` event with no error and no log.
+    requirePositiveInt('maxPerTopic', maxPerTopic);
+    requirePositiveInt('maxTopics', maxTopics);
+  }
 
   private bucket(topic: Topic): { set: Set<BackendMsgId>; queue: BackendMsgId[] } {
     let set = this.sets.get(topic);

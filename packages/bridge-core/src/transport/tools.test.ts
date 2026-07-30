@@ -3,14 +3,27 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
-import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../engine/presence.js';
+import {
+  DEFAULT_PRESENCE_TOPIC,
+  encodePresence,
+  MAX_RECORD_TOPICS,
+  MAX_ROSTER_ENTRIES,
+  MAX_TOPIC_LEN,
+  type PresenceKind,
+} from '../engine/presence.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic } from '../message.js';
 import { NoSuchTopicError, type FetchRecentArgs } from '../seam.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { MAX_FETCH_LIMIT, PRESENCE_FETCH_LIMIT, registerTools, toolDepsFor } from './tools.js';
+import {
+  DEFAULT_ROSTER_LIMIT,
+  MAX_FETCH_LIMIT,
+  PRESENCE_FETCH_LIMIT,
+  registerTools,
+  toolDepsFor,
+} from './tools.js';
 
 interface ToolText {
   content: Array<{ type: string; text: string }>;
@@ -940,5 +953,85 @@ describe('a noisy presence emitter is disclosed, not silently hidden', () => {
     expect(out.users.length).toBeLessThanOrEqual(PRESENCE_PAGE);
     expect(out.users.length).toBeGreaterThan(0); // bounded, not emptied
     expect(out.truncated).toBe(true);
+  });
+});
+
+/**
+ * Every byte of a roster entry is untrusted self-reported text going verbatim into the agent's
+ * context, and an entry is bounded but not small — MAX_RECORD_TOPICS topics AND post-patterns, each
+ * up to MAX_TOPIC_LEN. So the entry COUNT decides the size of that context, and the handle a beat
+ * declares is as cheap to mint as a message: one writer fills the page with distinct peers. An
+ * omitted `limit` therefore has to mean a bounded page rather than "however many a stranger
+ * advertised". Grade the answer the AGENT receives — its serialized size, its entry count, and
+ * whether `truncated` admits the roster was cut — across the limits a caller can ask for.
+ */
+describe('parley_list_users bounds the roster it hands the agent', () => {
+  /** One maximal entry's legal serialization: topics AND postTopics, capped in count and in length. */
+  const ENTRY_BYTES = 2 * MAX_RECORD_TOPICS * (MAX_TOPIC_LEN + 8) + 512;
+  const filler = (tag: string): string => tag.padEnd(MAX_TOPIC_LEN, 'y');
+
+  /** One credential, PRESENCE_FETCH_LIMIT distinct self-reported peers, each maximally verbose. */
+  async function floodDistinctPeers(plugin: FakePlugin): Promise<void> {
+    const at = Date.now();
+    const topics = ['ctx', ...Array.from({ length: MAX_RECORD_TOPICS - 1 }, (_u, j) => filler(`t-${j}-`))];
+    const postTopics = Array.from({ length: MAX_RECORD_TOPICS }, (_u, j) => filler(`p-${j}-`));
+    for (let i = 0; i < PRESENCE_FETCH_LIMIT; i++) {
+      await plugin.post(
+        PRESENCE_TOPIC,
+        asHandle('one-credential'),
+        encodePresence({
+          v: 2,
+          kind: 'heartbeat',
+          at,
+          handle: `peer-${i}`,
+          topics,
+          postTopics,
+          instanceId: `inst-${i}`,
+        }),
+      );
+    }
+  }
+
+  it.each([
+    ['no limit asked for', undefined, DEFAULT_ROSTER_LIMIT],
+    ['a limit below the default', 5, 5],
+    ['a limit above the roster cap', 10_000, MAX_ROSTER_ENTRIES],
+  ])('%s', async (_name, limit, expectedMax) => {
+    const { client, plugin } = await harness({ topics: ['ctx'] });
+    await floodDistinctPeers(plugin);
+    const res = (await client.callTool({
+      name: 'parley_list_users',
+      arguments: limit === undefined ? {} : { limit },
+    })) as ToolText;
+    const text = res.content[0]!.text;
+    const out = JSON.parse(text) as RosterResult;
+
+    expect(out.users.length).toBeGreaterThan(0); // bounded, never emptied
+    expect(out.users.length).toBeLessThanOrEqual(expectedMax);
+    expect(text.length).toBeLessThan((expectedMax + 1) * ENTRY_BYTES);
+    expect(out.truncated).toBe(true);
+  });
+
+  it('a limit that cuts a roster the page could hold in full still says truncated', async () => {
+    const { client, plugin } = await harness({ topics: ['ctx'] });
+    for (const handle of ['claude-a', 'claude-b', 'claude-c']) {
+      await postBeat(plugin, handle, ['ctx'], 'heartbeat', Date.now());
+    }
+    const full = parse(await client.callTool({ name: 'parley_list_users', arguments: {} })) as RosterResult;
+    expect(full.users).toHaveLength(3);
+    expect(full.truncated).toBe(false); // nothing was cut — the flag is not simply always on
+
+    const cut = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: { limit: 2 } }),
+    ) as RosterResult;
+    expect(cut.users).toHaveLength(2);
+    expect(cut.truncated).toBe(true);
+  });
+
+  it('the description states the default the handler applies', async () => {
+    const { client } = await harness();
+    const { tools } = await client.listTools();
+    const description = tools.find((t) => t.name === 'parley_list_users')!.description!;
+    expect(description).toContain(`default ${DEFAULT_ROSTER_LIMIT}`);
   });
 });

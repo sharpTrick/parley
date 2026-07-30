@@ -216,6 +216,7 @@ export function createRemoteHttpApp(
 
   let httpServer: NodeHttpServer | undefined;
   let starting = false;
+  let binding: Promise<unknown> | undefined;
   return {
     app,
     // Keep rejecting on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
@@ -228,19 +229,18 @@ export function createRemoteHttpApp(
     // belt-and-suspenders for any error path that skips the callback; the success branch removes
     // it so a later runtime error on the live server cannot reject an already-settled promise.
     // `httpServer = s` is set synchronously so close() can still find it.
-    listen: (port, host = '127.0.0.1') =>
-      new Promise<NodeHttpServer>((resolve, reject) => {
-        // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
-        // leave the first one bound forever and its presence loop beating past close(), advertising
-        // a shut-down bridge as online. Latch this SYNCHRONOUSLY rather than reading
-        // `server.listening`, which stays false for the whole window between `app.listen` and its
-        // `listening` event — two overlapping starts both pass that check. A bind failure clears the
-        // latch, so a failed listen stays retryable.
-        if (starting || httpServer?.listening === true) {
-          reject(new Error('remote HTTP server already listening'));
-          return;
-        }
-        starting = true;
+    listen: (port, host = '127.0.0.1') => {
+      // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
+      // leave the first one bound forever and its presence loop beating past close(), advertising
+      // a shut-down bridge as online. Latch this SYNCHRONOUSLY rather than reading
+      // `server.listening`, which stays false for the whole window between `app.listen` and its
+      // `listening` event — two overlapping starts both pass that check. A bind failure clears the
+      // latch, so a failed listen stays retryable.
+      if (starting || httpServer?.listening === true) {
+        return Promise.reject(new Error('remote HTTP server already listening'));
+      }
+      starting = true;
+      const bound = new Promise<NodeHttpServer>((resolve, reject) => {
         const failed = (err: Error): void => {
           starting = false;
           reject(err);
@@ -256,13 +256,21 @@ export function createRemoteHttpApp(
         });
         s.once('error', failed);
         httpServer = s;
-      }),
+      });
+      // Keep this recorded for close(), so that a teardown arriving mid-bind can WAIT for the bind
+      // instead of reading `s.listening === false` and walking away from a socket and a presence
+      // loop that are about to exist with nothing left to stop them.
+      binding = bound.catch(() => undefined);
+      return bound;
+    },
     // Keep close() a no-op on a server that is not up — never listened on, bind failed, or already
     // closed — so that a `try { await listen() } finally { await close() }` root, or a signal
     // handler racing an explicit shutdown, cannot turn teardown into a fatal
     // ERR_SERVER_NOT_RUNNING. Dropping the reference is what makes it both idempotent and
     // re-listenable.
     close: async () => {
+      await binding;
+      binding = undefined;
       await presence?.stop().catch(() => {}); // best-effort goodbye, never blocks the close
       presence = undefined;
       const s = httpServer;

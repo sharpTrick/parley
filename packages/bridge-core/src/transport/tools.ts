@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
 import { fetchRecentBlocking, isFetchAbortedError } from '../engine/blocking-fetch.js';
-import { computeRoster, filterReachable } from '../engine/presence.js';
+import { computeRoster, filterReachable, MAX_ROSTER_ENTRIES } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { filterHandles, MAX_GLOB_LEN } from '../identity-filter.js';
 import {
@@ -32,6 +32,16 @@ export const PRESENCE_FETCH_LIMIT = 500;
  * seen and still surface as `online: false`. Bounded in practice by {@link PRESENCE_FETCH_LIMIT}.
  */
 const DEFAULT_ROSTER_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Default cap on the peers `parley_list_users` returns when the caller names none. Every field of an
+ * entry is untrusted, self-reported text going verbatim into the agent's context, and an entry is
+ * bounded but not small (`MAX_RECORD_TOPICS` topics AND post-patterns, each up to `MAX_TOPIC_LEN`),
+ * so the entry COUNT is what decides the size of that context. An omitted `limit` must not mean
+ * "however many a stranger chose to advertise"; a caller that wants more asks for more, and
+ * `truncated` says when the answer was cut.
+ */
+export const DEFAULT_ROSTER_LIMIT = 25;
 
 /**
  * Server-side ceiling on `parley_fetch_recent`'s `limit`. The value arrives from a model whose
@@ -303,10 +313,12 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         'to peers on that topic (subscribed to it, or able to post to it); omit for everyone you share ' +
         'a channel with — anyone you can post to, or who can post to a topic you subscribe to. ' +
         '`online_only: true` returns only live peers; `since_ms` bounds how far back offline peers are ' +
-        'included (default 24h); `limit` caps the result; `filter` is a glob over handles (e.g. ' +
+        `included (default 24h); \`limit\` caps the result (default ${DEFAULT_ROSTER_LIMIT}); \`filter\` ` +
+        'is a glob over handles (e.g. ' +
         '"claude-*"). A human using a plain chat client appears only once they send a message. Returns ' +
         '{ users: [{ handle, online, topics, postTopics, lastSeenMs }], truncated } (truncated=true ' +
-        'when the scanned presence history was full, so peers may be missing — a peer that beats far ' +
+        'when the answer was cut — the scanned presence history was full, the roster hit its entry ' +
+        'cap, or `limit` trimmed it — so peers may be missing; a peer that beats far ' +
         'more often than the rest can fill that history on its own and hide quieter ones, so treat a ' +
         'truncated roster as incomplete rather than as the whole bus). Configured ' +
         `topics: ${topicList(allow)}.`,
@@ -384,8 +396,11 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       if (online_only === true) users = users.filter((e) => e.online);
       // computeRoster already sorts most-recently-seen first; filter/slice preserve that order.
       users = filterHandles(users, filter);
-      if (limit !== undefined) users = users.slice(0, limit);
-      return textResult({ users, truncated });
+      const capped = users.slice(0, limit ?? DEFAULT_ROSTER_LIMIT);
+      return textResult({
+        users: capped,
+        truncated: truncated || roster.length >= MAX_ROSTER_ENTRIES || capped.length < users.length,
+      });
     },
   );
 }

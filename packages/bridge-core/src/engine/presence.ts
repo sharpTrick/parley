@@ -47,9 +47,11 @@ export const MAX_RECORD_TOPICS = 64;
 /**
  * Cap the instances of ONE handle a roster entry folds. Each instance contributes its own capped
  * topics/postTopics, and the number of instances is attacker-chosen (a fresh `instanceId` per beat),
- * so this is what stops the per-beat caps from being multiplied by the presence page size — both in
- * roster memory / `parley_list_users` output and in the untrusted patterns `filterReachable` compiles
- * (DESIGN §14). The freshest-beating instances are the ones kept.
+ * so without this the per-beat caps would be multiplied by the presence page size WITHIN one entry
+ * (DESIGN §14). It bounds one entry and nothing more — the entry COUNT is capped by
+ * {@link MAX_ROSTER_ENTRIES} and the pattern work by `filterReachable`'s own budget, because a
+ * self-reported handle is as cheap to mint as an `instanceId`. The freshest-beating instances are
+ * the ones kept.
  */
 export const MAX_HANDLE_INSTANCES = 8;
 
@@ -72,6 +74,16 @@ export const MAX_HANDLE_LEN = 128;
  * `parley_list_users` output. A real topic name / regex source is short.
  */
 export const MAX_TOPIC_LEN = 512;
+
+/**
+ * Cap the ENTRIES a roster carries, freshest-first. Every other cap here is per RECORD or per
+ * HANDLE, and the handle a beat reports is self-declared — one writer holding one credential mints
+ * as many handles as it has beats — so the record count is the factor that multiplies all of them
+ * into `parley_list_users` output and into {@link filterReachable}'s untrusted-pattern work. The
+ * presence page size is not a bound on it: it is a page of an attacker-chosen stream. A caller that
+ * fills this cap is told its roster is incomplete, exactly as a full presence page already is.
+ */
+export const MAX_ROSTER_ENTRIES = 128;
 
 /**
  * Tolerance (ms) for an emitter's self-reported wall-clock running AHEAD of ours. A beat whose `at`
@@ -287,7 +299,9 @@ function unionCapped(from: readonly PresenceRecord[], pick: (r: PresenceRecord) 
  * when online, or the single last-known beat when offline — bounded by {@link MAX_HANDLE_INSTANCES}
  * instances ({@link retainFreshest} chooses which) and {@link MAX_RECORD_TOPICS} unioned entries,
  * because the number of instances one writer mints is untrusted. Entries sort most-recently-seen
- * first so the freshest hand-off candidates lead (online naturally floats up).
+ * first so the freshest hand-off candidates lead (online naturally floats up), and the roster is
+ * then cut to {@link MAX_ROSTER_ENTRIES} — the handle count is attacker-chosen for exactly the
+ * reason the instance count is, and it multiplies every per-record cap below it.
  */
 export function computeRoster(messages: Message[], nowMs: number, opts: RosterOptions): RosterEntry[] {
   const byHandle = new Map<Handle, Map<string, PresenceRecord>>();
@@ -331,7 +345,7 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
   roster.sort(
     (a, b) => b.lastSeenMs - a.lastSeenMs || (a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0),
   );
-  return roster;
+  return roster.slice(0, MAX_ROSTER_ENTRIES);
 }
 
 /**
@@ -344,35 +358,53 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
  */
 const MAX_PEER_PATTERN_LEN = 512;
 
+/**
+ * Whole-call ceiling (ms) on the untrusted peer-pattern work ONE {@link filterReachable} spends.
+ * {@link isRedosSafeSource} bounds what a single screened match costs — and says so: the bound is per
+ * source, and the caller must bound how many it holds. Here the count is
+ * `entries × their advertised patterns × the caller's own topics`, and the first two factors are
+ * chosen by whoever writes the beats, so the per-source bound alone multiplies out to seconds of
+ * synchronous CPU on a page of legal beats. Node is single-threaded: that time is the whole bridge,
+ * long-polls and heartbeats included.
+ */
+const PEER_PATTERN_BUDGET_MS = 50;
 
 /**
- * Compile a peer's advertised `postTopics` sources into full-match regexes (`^(?:src)$`, mirroring
- * the Allowlist). Each source is length-capped ({@link MAX_PEER_PATTERN_LEN}), screened for
- * catastrophic backtracking ({@link isRedosSafeSource}), and wrapped in a `try/catch`; any source
- * that is over-long, screens as unsafe, or fails to compile is skipped — so a hostile beat can never
- * crash or hang `parley_list_users`.
+ * The peer-pattern matcher for ONE {@link filterReachable} call: each untrusted source is
+ * length-capped ({@link MAX_PEER_PATTERN_LEN}), screened for catastrophic backtracking
+ * ({@link isRedosSafeSource}), full-match-anchored (`^(?:src)$`, mirroring the Allowlist) and
+ * compiled AT MOST ONCE per call, then tested against only a bounded prefix of the input (our topic
+ * names are short; clamping keeps even a screened, low-degree match cheap). A source that is
+ * over-long, screens as unsafe, or fails to compile is skipped, and all of it runs under one
+ * {@link PEER_PATTERN_BUDGET_MS} deadline — past which a peer is simply not matched BY PATTERN. It
+ * still surfaces on a topic it explicitly advertises, so the degradation drops reach, never safety.
  */
-function compilePeerPatterns(sources: readonly string[]): RegExp[] {
-  const out: RegExp[] = [];
-  for (const src of sources) {
-    if (src.length > MAX_PEER_PATTERN_LEN) continue;
-    if (!isRedosSafeSource(src)) continue; // reject catastrophic-backtracking sources up front
-    try {
-      out.push(new RegExp(`^(?:${src})$`));
-    } catch {
-      // Un-compilable source from an untrusted peer — ignore it.
+function peerReach(): (sources: readonly string[], input: string) => boolean {
+  const deadline = Date.now() + PEER_PATTERN_BUDGET_MS;
+  const compiled = new Map<string, RegExp | null>();
+  const compile = (src: string): RegExp | null => {
+    const cached = compiled.get(src);
+    if (cached !== undefined) return cached;
+    let re: RegExp | null = null;
+    if (src.length <= MAX_PEER_PATTERN_LEN && isRedosSafeSource(src)) {
+      try {
+        re = new RegExp(`^(?:${src})$`);
+      } catch {
+        re = null; // un-compilable source from an untrusted peer
+      }
     }
-  }
-  return out;
-}
-
-/**
- * Test compiled untrusted patterns against a bounded prefix of `input` (our topic names are short;
- * clamping the compared string keeps even a screened, low-degree match cheap regardless of input).
- */
-function reachesBounded(patterns: readonly RegExp[], input: string): boolean {
-  const bounded = input.length > MAX_MATCH_INPUT ? input.slice(0, MAX_MATCH_INPUT) : input;
-  return patterns.some((re) => re.test(bounded));
+    compiled.set(src, re);
+    return re;
+  };
+  return (sources, input) => {
+    const bounded = input.length > MAX_MATCH_INPUT ? input.slice(0, MAX_MATCH_INPUT) : input;
+    for (const src of sources) {
+      if (Date.now() >= deadline) return false;
+      const re = compile(src);
+      if (re !== null && re.test(bounded)) return true;
+    }
+    return false;
+  };
 }
 
 /**
@@ -385,12 +417,12 @@ function reachesBounded(patterns: readonly RegExp[], input: string): boolean {
  *    topic it subscribes to (`opts.canPostTo`), OR it can post — per its advertised patterns — to a
  *    topic I subscribe to (`opts.mySubscribedTopics`).
  *
- * Peer `postTopics` are untrusted regex sources; {@link compilePeerPatterns} length-caps them,
- * screens out catastrophic-backtracking sources ({@link isRedosSafeSource}), and full-match-anchors
- * whatever survives, and {@link reachesBounded} then tests them against only a bounded prefix of the
- * caller's own topic names — so a hostile beat cannot wedge the loop. Passing
- * `canPostTo`/`mySubscribedTopics` as plain values/predicates keeps `engine/` free of any dependency
- * on `Allowlist`.
+ * Peer `postTopics` are untrusted regex sources; {@link peerReach} length-caps them, screens out
+ * catastrophic-backtracking sources ({@link isRedosSafeSource}), full-match-anchors whatever
+ * survives, tests it against only a bounded prefix of the caller's own topic names, and spends ONE
+ * {@link PEER_PATTERN_BUDGET_MS} budget across the whole call — so neither a hostile source nor an
+ * attacker-chosen NUMBER of them can wedge the loop. Passing `canPostTo`/`mySubscribedTopics` as
+ * plain values/predicates keeps `engine/` free of any dependency on `Allowlist`.
  */
 export function filterReachable(
   roster: RosterEntry[],
@@ -403,15 +435,12 @@ export function filterReachable(
     mySubscribedTopics: readonly string[];
   },
 ): RosterEntry[] {
+  const reaches = peerReach();
   return roster.filter((e) => {
     if (opts.scope !== undefined) {
-      return (
-        e.topics.includes(opts.scope) ||
-        reachesBounded(compilePeerPatterns(e.postTopics), opts.scope)
-      );
+      return e.topics.includes(opts.scope) || reaches(e.postTopics, opts.scope);
     }
     if (e.topics.some((t) => opts.canPostTo(t))) return true;
-    const theirReach = compilePeerPatterns(e.postTopics);
-    return opts.mySubscribedTopics.some((mt) => reachesBounded(theirReach, mt));
+    return opts.mySubscribedTopics.some((mt) => reaches(e.postTopics, mt));
   });
 }

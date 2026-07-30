@@ -210,6 +210,97 @@ describe('remote HTTP: close() resolves in whatever order the lifecycle runs', (
   });
 });
 
+/**
+ * Every row of the table above AWAITS its start, so none of them can reach the window a teardown
+ * actually races: a start that has been ASKED for but has not settled. In it a stop finds nothing
+ * bound yet, walks away, and the start then completes behind it — a socket and a presence loop with
+ * nothing left that can stop them, which is the same orphan a second overlapping start would make.
+ * One rule, both composition roots: after ANY interleaving of one start and one stop, nothing this
+ * root owns is still running, nothing beats, and a further stop still resolves.
+ */
+describe('a start interleaved with a stop leaves nothing running', () => {
+  type Op = 'start' | 'start-pending' | 'stop' | 'await-starts';
+
+  interface Root {
+    /** Begin a start. Rejections are the caller's to tolerate — an interleaved start may lose. */
+    start: () => Promise<unknown>;
+    stop: () => Promise<void>;
+    /** Anything this root still owns and a stop should already have released. */
+    running: () => boolean;
+  }
+
+  const lifecycleCfg = () =>
+    parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      live_push: { enabled: true },
+      presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
+    });
+
+  const ROOTS: Record<string, (p: FakePlugin) => Promise<Root>> = {
+    'http listen()/close()': async (p) => {
+      const app = createRemoteHttpApp(p, lifecycleCfg(), { insecureNoAuth: true });
+      const bound: Array<Awaited<ReturnType<typeof app.listen>>> = [];
+      return {
+        start: async () => bound.push(await app.listen(0)),
+        stop: () => app.close(),
+        running: () => bound.some((s) => s.listening),
+      };
+    },
+    'stdio attach()/shutdown()': async (p) => {
+      const bridge = await buildBridge(p, lifecycleCfg());
+      return {
+        start: () => bridge.attach(InMemoryTransport.createLinkedPair()[1]),
+        stop: () => bridge.shutdown(),
+        // The stdio root owns the plugin connection (and with it the poll timers), not a socket.
+        running: () => p.connected,
+      };
+    },
+  };
+
+  const SEQUENCES: Array<[name: string, ops: Op[]]> = [
+    ['stop before any start', ['stop']],
+    ['a settled start, then stop twice', ['start', 'stop', 'stop']],
+    ['stop while the start is still in flight', ['start-pending', 'stop', 'await-starts']],
+    ['stop twice while the start is still in flight', ['start-pending', 'stop', 'stop', 'await-starts']],
+    ['stop mid-start, then stop once it has settled', ['start-pending', 'stop', 'await-starts', 'stop']],
+    ['two overlapping starts, then stop', ['start-pending', 'start-pending', 'stop', 'await-starts']],
+  ];
+
+  const CELLS = Object.keys(ROOTS).flatMap((root) =>
+    SEQUENCES.map(([name, ops]) => [root, name, ops] as const),
+  );
+
+  it.each(CELLS)('%s: %s', async (rootName, _name, ops) => {
+    const p = new FakePlugin();
+    await p.connect({});
+    const root = await ROOTS[rootName]!(p);
+    const beatCount = async (): Promise<number> =>
+      (await p.fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) })).messages.length;
+    const pending: Array<Promise<unknown>> = [];
+    const settle = async (): Promise<void> => {
+      await Promise.allSettled(pending.splice(0));
+    };
+    try {
+      for (const op of ops) {
+        if (op === 'start') await root.start().catch(() => undefined);
+        else if (op === 'start-pending') pending.push(root.start());
+        else if (op === 'stop') await root.stop();
+        else await settle();
+      }
+      await settle();
+
+      expect(root.running()).toBe(false);
+      const atStop = await beatCount();
+      await new Promise((r) => setTimeout(r, 100)); // several heartbeat cadences
+      expect(await beatCount()).toBe(atStop);
+      await expect(root.stop()).resolves.toBeUndefined();
+    } finally {
+      await p.disconnect();
+    }
+  });
+});
+
 describe('reactive HTTP: allowlist compiled once per app, not per POST', () => {
   it('derives the allowlist a single time at app scope regardless of request count', async () => {
     const spy = vi.spyOn(allowlistMod, 'allowlistFor');
