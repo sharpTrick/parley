@@ -1,7 +1,7 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterAll, describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
-import { dropStreams, isNatsUp, rand, SERVERS } from './helpers.js';
+import { dropStreams, isNatsUp, rand, seqOf, SERVERS } from './helpers.js';
 
 // Class: a `backend_config` value that must match across the configs sharing one cluster either
 // diverges HARMLESSLY, or fails with an error naming the field the operator can change. The one
@@ -93,7 +93,7 @@ suite('nats prefix divergence across two configs on one cluster', () => {
       for (const limit of [1, 2, 100]) {
         const page = await plugin.fetchRecent({ topic, limit });
         expect(page.messages.map((m) => m.content)).toEqual(contents.slice(0, 4).slice(-limit));
-        expect(page.nextCursor).toBe('4');
+        expect(seqOf(page.nextCursor)).toBe(4);
       }
     } finally {
       await plugin.disconnect();

@@ -10,7 +10,6 @@ import { fakeJetStream, injectFake } from './fake-jetstream.js';
 // discriminating rows are the budgets BELOW that floor: any backend with a native long-poll
 // (Redis XREAD BLOCK, Zulip /events, Telegram getUpdates) can silently round a short budget up.
 const TOPIC = asTopic('budget');
-const STREAM = 'PARLEY_budget';
 
 // Far longer than any budget below, so the pull's own expiry can never be what ends the wait.
 const PULL_EXPIRY_MS = 10_000;
@@ -23,7 +22,7 @@ describe('nats long-poll honours its budget from both sides', () => {
     it(`an empty ${budget}ms long-poll waits, and returns within its budget`, async () => {
       const fake = fakeJetStream({ records: [], expiryMs: PULL_EXPIRY_MS });
       const plugin = new NatsPlugin();
-      injectFake(plugin, fake, STREAM);
+      injectFake(plugin, fake, TOPIC);
 
       const started = Date.now();
       const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: budget });
@@ -55,7 +54,7 @@ describe('nats long-poll keeps its budget across a stream that vanishes mid-poll
           streamMissingAfterMs: Math.round(budget * 0.9),
         });
         const plugin = new NatsPlugin();
-        injectFake(plugin, fake, STREAM);
+        injectFake(plugin, fake, TOPIC);
 
         const started = Date.now();
         const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: budget });

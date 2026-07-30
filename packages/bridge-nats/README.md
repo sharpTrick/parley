@@ -10,19 +10,21 @@ larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding
 |---|---|
 | topic | one JetStream **stream** per topic (`<stream_prefix><folded topic>`), subject `<subject_prefix><folded topic>` |
 | `post` | `js.publish(subject, payload)` → `PubAck.seq` |
-| cursor | the stream **sequence** number — strictly increasing within the topic's own stream |
+| cursor | `<stream incarnation>-<sequence>`: the stream sequence, strictly increasing within the topic's own stream, qualified by the stream's `created` stamp |
 | backendMsgId | `<stream incarnation>-<sequence>`: the sequence qualified by the stream's `created` stamp |
 | `fetchRecent({since})` | ephemeral consumer from `opt_start_seq = since+1` (exclusive); no `since` → last-`limit` window |
 | `subscribe` | an ephemeral `consume()` consumer resuming at `DeliverPolicy.StartSequence` `lastSeq+1`, rebuilt on any loss — genuine events, not a poll timer |
 | `resolveIdentity` | string convention |
 
-One stream per topic keeps the sequence a clean per-topic monotonic integer, so it serves directly
-as the cursor. Core never compares cursor values — NATS delivers in seq order. The sequence range is
-**not** dense: `max_age` retention prunes the front and message deletes punch holes, so `last_seq -
-since` is an upper bound on what a page can return, never a count. A page therefore also ends when
+One stream per topic keeps the sequence a clean per-topic monotonic integer, which is what the
+cursor orders by. Core never compares cursor values — NATS delivers in seq order. The sequence range
+is **not** dense: `max_age` retention prunes the front and message deletes punch holes, so `last_seq
+- since` is an upper bound on what a page can return, never a count. A page therefore also ends when
 the pull falls quiet, not only when that bound is reached: a hole at `last_seq` itself is a position
 no sequence check can recognise, and waiting for it costs every read on the topic the pull's whole
-expiry.
+expiry. A page with no `since` — core's cold start — walks backwards from the topic's tail in
+growing windows and stops as soon as it holds `limit` messages, so a deep hole above the topic's own
+history costs work proportional to the hole rather than to the history under it.
 
 `backendMsgId` is the sequence prefixed with the stream's incarnation, because a stream deleted and
 re-created out-of-band (`nats stream rm`, a storage reset) restarts its sequences at 1 — the bare
@@ -33,8 +35,17 @@ under the incarnation now on the server, and a post whose message is not the one
 rejected rather than handed back under an id the survivor will mint again for something else. That
 read-back is deliberately best-effort — failing it must not tell a caller to send a message that has
 already landed — so one window remains: when the incarnation read itself fails, the id carries the
-last incarnation the plugin observed. The cursor stays the bare sequence: it is the order key, and
-catch-up already falls back to the retained window when a persisted cursor sits past the tail.
+last incarnation the plugin observed.
+
+The **cursor** carries the same incarnation, for the same reason on the read side: a persisted cursor
+naming a sequence of a stream that is gone is a position the new incarnation reaches again for
+entirely different messages. Catch-up compares the cursor's incarnation with the stream's, so a
+re-provisioned stream is recognised exactly — whether the new incarnation is shorter than the
+persisted sequence or has already grown past it — and that read falls back to the retained window,
+i.e. it returns what a cold start returns rather than resuming at a sequence the new stream never
+assigned. A bare decimal `since` (the pre-0.x cursor form, or a hand-written one) names no
+incarnation, so it can only be judged by the tail it sits above — until the next page that returns a
+message hands back a qualified one.
 
 `subscribe` is **not** a nats.js `OrderedConsumer`: it is a plain named ephemeral consumer plus an
 explicit watcher. The server GCs such a consumer after 30s of client absence and `consume()` does

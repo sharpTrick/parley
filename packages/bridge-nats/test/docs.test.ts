@@ -147,10 +147,41 @@ describe('nats docs conformance', () => {
     expect(readme).toContain('naming `subject_prefix`/`stream_prefix`');
   });
 
-  const configKeys = ['token', 'user', 'pass', 'creds_file', 'nkey_seed', 'tls', 'retention_days'];
-  for (const key of configKeys) {
-    it(`README documents the \`${key}\` backend_config field`, () => {
-      expect(readme).toContain(key);
+  // A `readme.toContain(key)` is satisfied by any prose that happens to hold the word — 'token'
+  // matches "NATS subject tokens", 'pass' matches "is passed through" — so most of these rows could
+  // not fail on the drift they exist to catch. The field has to be documented WHERE A READER WOULD
+  // USE IT: as a key of the fenced `backend_config` block. The list is derived from the exported
+  // interface as well, so a new config field is undocumented-by-default rather than unpoliced.
+  const configBlock = (text: string): string =>
+    /```ya?ml\s*\nbackend_config:\n([\s\S]*?)```/.exec(text)?.[1] ?? '';
+
+  const documentsKey = (block: string, key: string): boolean =>
+    new RegExp(`^\\s*${key}:`, 'm').test(block);
+
+  const declaredKeys = [
+    ...(/export interface NatsBackendConfig \{([\s\S]*?)\n\}/
+      .exec(sources.find((f) => f.name === 'index.ts')?.text ?? '')?.[1] ?? '')
+      .matchAll(/^ {2}([a-z_]+)\??:/gm),
+  ].map((m) => m[1] as string);
+
+  it('finds the config surface it is meant to police', () => {
+    expect(declaredKeys).toContain('nkey_seed');
+    expect(declaredKeys.length).toBeGreaterThan(6);
+    expect(configBlock(readme)).toContain('servers:');
+  });
+
+  for (const key of declaredKeys) {
+    it(`the README's backend_config block documents \`${key}\``, () => {
+      expect(documentsKey(configBlock(readme), key)).toBe(true);
     });
   }
+
+  it('the config-block check reads the block, not the prose around it', () => {
+    const stripped = readme.replace(/```ya?ml\s*\nbackend_config:\n[\s\S]*?```/, '');
+    for (const key of declaredKeys) {
+      expect(documentsKey(configBlock(stripped), key), key).toBe(false);
+    }
+    expect(documentsKey('  token: "…"', 'token')).toBe(true);
+    expect(documentsKey('a token is passed through', 'token')).toBe(false);
+  });
 });

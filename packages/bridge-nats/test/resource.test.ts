@@ -14,7 +14,6 @@ import { fakeJetStream, injectFake, payload } from './fake-jetstream.js';
 // the identical call without `block_ms` raises. The two terminations a long-poll MUST swallow
 // (its own deadline, and disconnect()) are asserted in the same table, so narrowing the swallow
 // cannot be traded for silencing a real fault.
-const STREAM = 'PARLEY_leak';
 const TOPIC = asTopic('leak');
 
 const faults: ('get' | 'fetch' | 'iterate')[] = ['get', 'fetch', 'iterate'];
@@ -49,7 +48,7 @@ describe('nats reads — a backend fault is a fault on every read shape', () => 
       it(`${shape.name} ${failOn === null ? 'resolves when the read succeeds' : `rejects when the read throws in ${failOn}`}`, async () => {
         const fake = fakeJetStream({ records: shape.records, failOn });
         const plugin = new NatsPlugin();
-        injectFake(plugin, fake, STREAM);
+        injectFake(plugin, fake, TOPIC);
 
         expect(await outcome(() => plugin.fetchRecent(shape.args))).toBe(
           failOn === null ? 'resolved' : 'rejected',
@@ -83,7 +82,7 @@ describe('nats reads — a backend fault is a fault on every read shape', () => 
     it(`a long-poll returns an empty page when ${termination.name}`, async () => {
       const fake = fakeJetStream({ records: [], expiryMs: 10_000, throwOnClose: true });
       const plugin = new NatsPlugin();
-      injectFake(plugin, fake, STREAM);
+      injectFake(plugin, fake, TOPIC);
 
       const page = await termination.run(plugin);
       expect(page).toEqual({ messages: [], nextCursor: '0' });

@@ -71,7 +71,7 @@ const FETCH_EXPIRY_MS = 2000;
 const FETCH_EXPIRY_CEILING_MS = 30_000;
 const FETCH_IDLE_MS = 200; // close a pull this long without a message rather than wait out `expires`
 const LINK_PATIENCE_FACTOR = 3;
-const WIDEN_ATTEMPTS = 5;
+const WIDEN_FACTOR = 4;
 const DRAIN_TIMEOUT_MS = 2000;
 
 /**
@@ -103,8 +103,9 @@ const incarnationToken = (created: string | undefined): string =>
 
 /**
  * NATS JetStream backend (DESIGN §6/§9) — the fabric backend. One JetStream STREAM per topic, so
- * the stream sequence number is a strictly increasing per-topic `cursor`; `backendMsgId` qualifies
- * that sequence with the stream's incarnation, because a re-provisioned stream restarts at 1.
+ * the stream sequence number is a strictly increasing per-topic order key; `cursor` and
+ * `backendMsgId` both qualify that sequence with the stream's incarnation, because a re-provisioned
+ * stream restarts at 1.
  * `post` = `js.publish` (→ seq); `fetchRecent` = an ephemeral consumer from `opt_start_seq`
  * (exclusive `since`); `subscribe` = a `consume()` ephemeral consumer resuming at the last delivered
  * sequence that rebuilds itself on any loss (genuine events). Core never compares cursor values —
@@ -236,7 +237,7 @@ export class NatsPlugin implements BackendPlugin {
 
   private async readRecent(
     args: FetchRecentArgs,
-    since: number | undefined,
+    since: ParsedCursor | undefined,
     deadline: number,
   ): Promise<FetchRecentResult> {
     const stream = this.streamName(args.topic);
@@ -245,12 +246,19 @@ export class NatsPlugin implements BackendPlugin {
     this.noteIncarnation(stream, info);
     const lastSeq = info.state.last_seq;
     const firstSeq = info.state.first_seq;
-    // A `since` past the tail names a sequence this stream never had — it was re-provisioned
-    // underneath the cursor and its sequences restarted at 1. Keep the fall back to the retained
-    // window, so that catch-up cannot go permanently deaf waiting on a sequence that will not come.
-    const restarted = since !== undefined && since > lastSeq;
+    // A cursor minted by a DIFFERENT incarnation names a sequence of a stream that no longer
+    // exists: re-provisioning restarts the sequences at 1, so that number says nothing about where
+    // the new stream's history begins. Keep the fall back to the retained window, so that catch-up
+    // neither goes deaf waiting on a sequence that will not come nor silently skips everything the
+    // new incarnation holds below it. A legacy bare cursor names no incarnation, so it can only be
+    // judged by the tail it sits above.
+    const restarted =
+      since !== undefined &&
+      (since.incarnation === undefined
+        ? since.seq > lastSeq
+        : since.incarnation !== this.incarnation(stream));
     const emptyCursor =
-      since === undefined || restarted ? asCursor(String(lastSeq)) : (args.since as Cursor);
+      since === undefined || restarted ? this.cursorAt(stream, lastSeq) : (args.since as Cursor);
     const blockMs = args.blockMs ?? 0;
     const waitOrNothing = async (startSeq: number): Promise<FetchRecentResult> =>
       blockMs > 0 && args.since !== undefined
@@ -271,29 +279,27 @@ export class NatsPlugin implements BackendPlugin {
       // JetStream prunes from the front (`max_age`), so a `since` older than the retained window
       // must start at `first_seq`: the gap is gone either way, and asking below it stalls the pull
       // for its whole expiry waiting on sequences the server no longer has.
-      const startSeq = Math.max(since + 1, firstSeq, 1);
+      const startSeq = Math.max(since.seq + 1, firstSeq, 1);
       if (startSeq > tailSeq) return waitOrNothing(startSeq);
       const read = await this.pull(stream, args.topic, startSeq, Math.min(limit, tailSeq - startSeq + 1), tailSeq);
-      return { messages: read, nextCursor: shortReadCursor(read, startSeq) };
+      return { messages: read, nextCursor: this.shortReadCursor(stream, read, startSeq) };
     }
 
-    // The since-less page is the NEWEST `limit` messages. A window whose top sequences are all
-    // holes returns fewer — widen the start until it holds enough or reaches `first_seq`.
-    let read: Message[] = [];
-    let startSeq = 0;
-    for (let attempt = 0, span = limit; ; attempt++) {
-      startSeq = Math.max(firstSeq, tailSeq - span + 1, 1);
-      read = await this.pull(stream, args.topic, startSeq, tailSeq - startSeq + 1, tailSeq);
-      if (read.length >= limit || startSeq <= firstSeq) break;
-      // A window that held NOTHING locates no message at all, so widen to the whole retained range
-      // at once: doubling toward it spends a pull per step and stops short of a deep hole, which is
-      // what hands core's cold start an empty page and a cursor above the history it did not return.
-      if (read.length === 0) span = tailSeq - firstSeq + 1;
-      else if (attempt >= WIDEN_ATTEMPTS) break;
-      else span *= 2;
+    // The since-less page is the NEWEST `limit` messages, and the window above `tailSeq` may hold
+    // none of them (deletes, or a foreign publisher on a stream wider than this topic). Keep the
+    // walk BACKWARDS in growing windows, so that a deep hole costs work proportional to the hole
+    // rather than to the retained history: reading the whole range in one pull instead makes core's
+    // cold start stream — and materialize — every message the topic ever had to return `limit`.
+    const newest: Message[] = [];
+    let startSeq = tailSeq + 1;
+    for (let span = limit, top = tailSeq; newest.length < limit && top >= firstSeq; span *= WIDEN_FACTOR) {
+      startSeq = Math.max(firstSeq, top - span + 1, 1);
+      const read = await this.pull(stream, args.topic, startSeq, top - startSeq + 1, top, limit - newest.length);
+      newest.unshift(...read);
+      if (startSeq <= firstSeq) break;
+      top = startSeq - 1;
     }
-    const newest = read.slice(-limit);
-    return { messages: newest, nextCursor: shortReadCursor(newest, startSeq) };
+    return { messages: newest, nextCursor: this.shortReadCursor(stream, newest, startSeq) };
   }
 
   /** Sequence of the topic's own last message, when the server will name it. */
@@ -304,13 +310,19 @@ export class NatsPlugin implements BackendPlugin {
       .catch(() => undefined);
   }
 
-  /** One ephemeral pull from `startSeq`, ended by `want` messages, `tailSeq`, or a quiet link. */
+  /**
+   * One ephemeral pull from `startSeq`, ended by `want` messages, `tailSeq`, or a quiet link.
+   * Keep `keep` bounding what is RETAINED: a window is a range of sequences, so `want` messages may
+   * be far more than the page needs, and holding them all makes a page's memory proportional to the
+   * history rather than to `limit`.
+   */
   private async pull(
     stream: string,
     topic: Topic,
     startSeq: number,
     want: number,
     tailSeq: number,
+    keep = want,
   ): Promise<Message[]> {
     const jsm = this.requireJsm();
     const setupStarted = Date.now();
@@ -343,10 +355,16 @@ export class NatsPlugin implements BackendPlugin {
       };
       armIdleClose();
       try {
+        let read = 0;
         for await (const m of batch) {
           armIdleClose();
+          // Keep the tail EXCLUSIVE of what follows it: a window is one step of a walk, and a
+          // message above its top belongs to the step already taken — taking it again duplicates it.
+          if (m.seq > tailSeq) break;
           messages.push(this.rowToMessage(topic, m.seq, dec.decode(m.data)));
-          if (messages.length >= want || m.seq >= tailSeq) break;
+          if (messages.length > keep) messages.splice(0, messages.length - keep);
+          read += 1;
+          if (read >= want || m.seq >= tailSeq) break;
         }
       } catch (err) {
         if (!wentQuiet) throw err;
@@ -513,7 +531,6 @@ export class NatsPlugin implements BackendPlugin {
             created = info.created;
             lastSeq = 0;
           }
-          if (lastSeq > info.state.last_seq) lastSeq = info.state.last_seq;
           const ci = await this.requireJsm().consumers.add(stream, {
             filter_subject: filterSubject,
             deliver_policy: DeliverPolicy.StartSequence,
@@ -662,18 +679,36 @@ export class NatsPlugin implements BackendPlugin {
     this.incarnations.set(stream, incarnationToken(info.created));
   }
 
+  private incarnation(stream: string): string {
+    return this.incarnations.get(stream) ?? UNKNOWN_INCARNATION;
+  }
+
   /**
-   * The dedup key. A stream deleted and re-created out-of-band restarts its sequences at 1, so the
-   * bare sequence would hand core an id it has already seen and dedup would swallow a genuinely new
-   * message; the stream's `created` stamp distinguishes the incarnations. `cursor` stays the bare
-   * sequence — it is the ORDER key, and only its per-topic ordering is contracted.
+   * The dedup key AND the order key. A stream deleted and re-created out-of-band restarts its
+   * sequences at 1, so the bare sequence would hand core an id it has already seen — dedup would
+   * swallow a genuinely new message — and a persisted cursor would name a position in a stream that
+   * no longer exists, which the new incarnation reaches again for entirely different messages. The
+   * stream's `created` stamp distinguishes the incarnations for both.
    */
+  private cursorAt(stream: string, seq: number): Cursor {
+    return asCursor(`${this.incarnation(stream)}-${seq}`);
+  }
+
   private msgId(topic: Topic, seq: number): string {
-    return `${this.incarnations.get(this.streamName(topic)) ?? UNKNOWN_INCARNATION}-${seq}`;
+    return String(this.cursorAt(this.streamName(topic), seq));
+  }
+
+  /**
+   * A short read (expiry, slow link, filter mismatch) must resume immediately BEFORE the window it
+   * failed to read: keep `startSeq - 1`, so that an empty page can never park the persisted cursor
+   * at the tail and silently drop everything in between.
+   */
+  private shortReadCursor(stream: string, messages: Message[], startSeq: number): Cursor {
+    return messages.at(-1)?.cursor ?? this.cursorAt(stream, Math.max(startSeq - 1, 0));
   }
 
   private rowToMessage(topic: Topic, seq: number, raw: string): Message {
-    return rowToMessage(topic, seq, this.msgId(topic, seq), raw);
+    return rowToMessage(topic, this.msgId(topic, seq), raw);
   }
 
   private requireJs(): JetStreamClient {
@@ -686,20 +721,29 @@ export class NatsPlugin implements BackendPlugin {
   }
 }
 
+/** A cursor's two halves: which incarnation of the stream minted it, and where in it. */
+interface ParsedCursor {
+  /** Absent in the legacy bare-sequence form, which names no incarnation at all. */
+  incarnation?: string;
+  seq: number;
+}
+
 /**
- * A cursor this plugin minted is a decimal JetStream sequence number. Anything else is caller
- * input (`parley_fetch_recent` takes `since` as a free string) and is rejected here rather than
- * coerced by `Number()` into a silently-empty page or an opaque driver error.
+ * A cursor this plugin minted is `<stream incarnation>-<sequence>`; the bare decimal sequence is
+ * the legacy form and still parses. Anything else is caller input (`parley_fetch_recent` takes
+ * `since` as a free string) and is rejected here rather than coerced by `Number()` into a
+ * silently-empty page or an opaque driver error.
  */
-function parseCursor(since: Cursor | undefined): number | undefined {
+function parseCursor(since: Cursor | undefined): ParsedCursor | undefined {
   if (since === undefined) return undefined;
-  const n = Number(since);
-  if (!/^\d+$/.test(since) || !Number.isSafeInteger(n)) {
+  const parts = /^(?:([0-9A-Za-z]+)-)?(\d+)$/.exec(since);
+  const seq = parts === null ? Number.NaN : Number(parts[2]);
+  if (parts === null || !Number.isSafeInteger(seq)) {
     throw new Error(
       `invalid nats cursor ${JSON.stringify(String(since))} — expected a JetStream sequence number`,
     );
   }
-  return n;
+  return parts[1] === undefined ? { seq } : { incarnation: parts[1], seq };
 }
 
 /** Stands in for a topic token, so a prefix is judged by the name it actually composes. */
@@ -758,7 +802,7 @@ function validateRetentionDays(days: number | undefined): number | undefined {
  * that covers it. So this is total: undecodable or wrongly-typed frames degrade to empty strings
  * rather than raising (CLAUDE.md "inbound is untrusted" — the wire format, not just the content).
  */
-function rowToMessage(topic: Topic, seq: number, id: string, raw: string): Message {
+function rowToMessage(topic: Topic, id: string, raw: string): Message {
   const fields = decodeFields(raw);
   return buildMessage({
     topic,
@@ -766,7 +810,7 @@ function rowToMessage(topic: Topic, seq: number, id: string, raw: string): Messa
     content: asString(fields.content),
     timestamp: asString(fields.ts),
     id,
-    cursor: String(seq),
+    cursor: id,
   });
 }
 
@@ -782,16 +826,8 @@ function decodeFields(raw: string): Record<string, unknown> {
 
 const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
 
-/**
- * A short read (expiry, slow link, filter mismatch) must resume immediately BEFORE the window it
- * failed to read: keep `startSeq - 1`, so that an empty page can never park the persisted cursor at
- * the tail and silently drop everything in between.
- */
-const shortReadCursor = (messages: Message[], startSeq: number): Cursor =>
-  messages.at(-1)?.cursor ?? asCursor(String(Math.max(startSeq - 1, 0)));
-
 /** NATS subject interest: `*` matches exactly one token, `>` one or more trailing tokens. */
-function captures(pattern: string, subject: string): boolean {
+export function captures(pattern: string, subject: string): boolean {
   const tokens = pattern.split('.');
   const target = subject.split('.');
   for (let i = 0; i < tokens.length; i++) {

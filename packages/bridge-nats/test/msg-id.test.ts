@@ -17,10 +17,10 @@ import { waitFor } from './helpers.js';
 // holds, and core's SeenSet drops a genuinely NEW message on the floor. Both axes are crossed
 // deliberately: an id minter that only qualifies its counter on the recovery path it happens to see
 // (a 503, an info re-read) still collides when the store is replaced between two of its own calls.
-// `cursor` is deliberately NOT part of this class: it is the order key, opaque to core, and
-// restarting it is what the catch-up fallback already handles.
+// `cursor` carries the same qualification, for the same reason on the read side: a persisted cursor
+// naming a sequence of a store that no longer exists is a position the new store reaches again for
+// entirely different messages, and cursor-input.test.ts grades what catch-up does with one.
 const TOPIC = asTopic('reprovisioned');
-const STREAM = 'PARLEY_reprovisioned';
 
 /**
  * Successive incarnation stamps differing ONLY in the sub-second part, so that a fold which keeps
@@ -32,7 +32,7 @@ const nextStamp = (): string => `2026-03-04T05:06:07.${String(++stamped).padStar
 function withFake(): { plugin: NatsPlugin; fake: FakeJetStream } {
   const fake = fakeJetStream({ records: [], streamCreated: nextStamp() });
   const plugin = new NatsPlugin();
-  injectFake(plugin, fake, STREAM);
+  injectFake(plugin, fake, TOPIC);
   attachConnection(plugin);
   return { plugin, fake };
 }
@@ -238,13 +238,13 @@ describe('nats backendMsgId survives a stream re-provisioned under it', () => {
     await plugin.disconnect();
   });
 
-  it('keeps the cursor a bare sequence, and post/read agree on both values', async () => {
+  it('qualifies the cursor with the same incarnation, and post/read agree on both values', async () => {
     const { plugin, fake } = withFake();
     const posted = await plugin.post(TOPIC, 'sys' as never, 'one');
     const [read] = (await plugin.fetchRecent({ topic: TOPIC })).messages;
 
     expect(read?.backendMsgId).toBe(posted);
-    expect(read?.cursor).toBe('1');
+    expect(read?.cursor).toBe(String(posted));
     expect(String(posted)).not.toBe('1');
     expect(String(posted).endsWith('-1')).toBe(true);
     expect(fake.state.records).toHaveLength(1);

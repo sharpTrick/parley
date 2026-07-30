@@ -2,6 +2,7 @@ import { asCursor, asTopic, type Cursor } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 import { fakeJetStream, injectFake, payload, type FakeRecord } from './fake-jetstream.js';
+import { seqOf } from './helpers.js';
 
 // Class: the sequence range of a stream is NOT dense. `max_age` retention prunes the front,
 // per-subject limits and message deletes punch holes, so `last_seq - since` over-counts what the
@@ -16,7 +17,9 @@ import { fakeJetStream, injectFake, payload, type FakeRecord } from './fake-jets
 // every read shape, and every cell demands the whole window rather than merely a prompt return.
 const TOPIC = asTopic('window');
 const STREAM = 'PARLEY_window';
-const EXPIRY_MS = 1500;
+const OWN = 'parley.topic'; // the fake's default record subject
+const FOREIGN_SUBJECT = 'parley.someone-elses-topic';
+const EXPIRY_MS = 6000;
 
 const stream = (seqs: number[]): FakeRecord[] =>
   seqs.map((seq) => ({ seq, data: payload(`m${seq}`) }));
@@ -114,14 +117,14 @@ describe('nats fetch window — a sparse range must not burn the pull expiry', (
           ...(shape.tail === undefined ? {} : { visibleTail: shape.tail }),
         });
         const plugin = new NatsPlugin();
-        injectFake(plugin, fake, STREAM);
+        injectFake(plugin, fake, TOPIC);
 
         const started = Date.now();
         const page = await plugin.fetchRecent(argsFor(pos));
         const elapsed = Date.now() - started;
 
         expect(elapsed).toBeLessThan(EXPIRY_MS / 2);
-        const seqs = page.messages.map((m) => Number(m.cursor));
+        const seqs = page.messages.map((m) => seqOf(m.cursor));
         expect(seqs).toEqual(owed(shape, pos));
         if (page.messages.length > 0) expect(page.nextCursor).toBe(page.messages.at(-1)?.cursor);
       });
@@ -131,12 +134,12 @@ describe('nats fetch window — a sparse range must not burn the pull expiry', (
   it('an empty read from a long-dead cursor resumes at the retained window, not inside the gap', async () => {
     const fake = fakeJetStream({ records: stream([11, 12, 13]), yieldLimit: 0 });
     const plugin = new NatsPlugin();
-    injectFake(plugin, fake, STREAM);
+    injectFake(plugin, fake, TOPIC);
 
     const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('2') });
 
     expect(page.messages).toHaveLength(0);
-    expect(page.nextCursor).toBe('10');
+    expect(seqOf(page.nextCursor)).toBe(10);
 
     fake.state.yieldLimit = Number.POSITIVE_INFINITY;
     const resumed = await plugin.fetchRecent({ topic: TOPIC, since: page.nextCursor });
@@ -146,7 +149,7 @@ describe('nats fetch window — a sparse range must not burn the pull expiry', (
   it('draining a pruned stream from a long-dead cursor still yields every retained message', async () => {
     const fake = fakeJetStream({ records: stream([11, 12, 15, 16, 20]), expiryMs: EXPIRY_MS });
     const plugin = new NatsPlugin();
-    injectFake(plugin, fake, STREAM);
+    injectFake(plugin, fake, TOPIC);
 
     const seen: string[] = [];
     let since: Cursor = asCursor('0');
@@ -195,7 +198,7 @@ describe('nats fetch window — a stream-wide counter never stands in for the to
     const foreign = (seq: number): FakeRecord => ({
       seq,
       data: payload(`foreign${seq}`),
-      foreign: true,
+      subject: FOREIGN_SUBJECT,
     });
     return [
       ...stream(seqs),
@@ -216,10 +219,10 @@ describe('nats fetch window — a stream-wide counter never stands in for the to
               expiryMs: EXPIRY_MS,
             });
             const plugin = new NatsPlugin();
-            injectFake(plugin, fake, STREAM);
+            injectFake(plugin, fake, TOPIC);
             const page = await plugin.fetchRecent(argsFor(pos));
             return {
-              seqs: page.messages.map((m) => Number(m.cursor)),
+              seqs: page.messages.map((m) => seqOf(m.cursor)),
               contents: page.messages.map((m) => m.content),
               cursor: String(page.nextCursor),
               pulls: fake.state.created.length,
@@ -230,7 +233,7 @@ describe('nats fetch window — a stream-wide counter never stands in for the to
           const page = await read(depth);
           expect(page.seqs).toEqual(expected);
           expect(page.contents).toEqual(expected.map((s) => `m${s}`));
-          expect(page.cursor).toBe(String(expected.at(-1)));
+          expect(seqOf(page.cursor)).toBe(expected.at(-1));
           // The page alone does not say what it cost. The same topic without the foreign tail is
           // the same read: an anchor that follows the foreign publisher's sequences instead pays
           // extra pulls scanning back over messages it will never be shown.
@@ -259,11 +262,11 @@ describe('nats fetch window — a stream-wide counter never stands in for the to
   it('a cold start over a foreign tail names the topic tail, and draining from 0 loses nothing', async () => {
     const fake = fakeJetStream({ records: withForeignTail([1, 2, 3, 4, 5], 400), expiryMs: EXPIRY_MS });
     const plugin = new NatsPlugin();
-    injectFake(plugin, fake, STREAM);
+    injectFake(plugin, fake, TOPIC);
 
     const cold = await plugin.fetchRecent({ topic: TOPIC, limit: 2 });
     expect(cold.messages.map((m) => m.content)).toEqual(['m4', 'm5']);
-    expect(cold.nextCursor).toBe('5');
+    expect(seqOf(cold.nextCursor)).toBe(5);
 
     const seen: string[] = [];
     let since: Cursor = asCursor('0');
@@ -314,15 +317,64 @@ describe('nats pull fake fidelity — closing a pull loses what it had not deliv
         }
       ).streams;
 
-    await expect(streams(stream(held)).getMessage(STREAM, { last_by_subj: 'x' })).resolves.toMatchObject({
+    await expect(streams(stream(held)).getMessage(STREAM, { last_by_subj: OWN })).resolves.toMatchObject({
       seq: 5,
     });
-    await expect(streams(stream(held), 5).getMessage(STREAM, { last_by_subj: 'x' })).resolves.toMatchObject({
+    await expect(streams(stream(held), 5).getMessage(STREAM, { last_by_subj: OWN })).resolves.toMatchObject({
       seq: 5,
     });
-    await expect(streams(stream(held), 9).getMessage(STREAM, { last_by_subj: 'x' })).rejects.toThrow(
+    await expect(streams(stream(held), 9).getMessage(STREAM, { last_by_subj: OWN })).rejects.toThrow(
       /no message found/,
     );
+    // …and it answers from the SUBJECT it was handed, not from whatever the stream holds.
+    await expect(streams(stream(held)).getMessage(STREAM, { last_by_subj: FOREIGN_SUBJECT })).rejects.toThrow(
+      /no message found/,
+    );
+  });
+
+  // Class: the fake answers from a shortcut instead of from the request. Every foreign-publisher row
+  // above certifies that a read sees only its own subject — but only if the fake's consumer decides
+  // that from the `filter_subject` it was HANDED. The same holds for `opt_start_seq` and
+  // `max_messages`: a fake that ignores any of them grades a request the plugin never made.
+  describe('the fake consumer answers from its own config', () => {
+    const mixed: FakeRecord[] = [
+      { seq: 1, data: payload('own1') },
+      { seq: 2, data: payload('other'), subject: FOREIGN_SUBJECT },
+      { seq: 3, data: payload('own3') },
+      { seq: 4, data: payload('deeper'), subject: `${OWN}.deeper` },
+      { seq: 5, data: payload('own5') },
+    ];
+
+    const pullWith = async (
+      cfg: { filter_subject?: string; opt_start_seq?: number },
+      max_messages: number,
+    ): Promise<number[]> => {
+      const fake = fakeJetStream({ records: mixed });
+      const jsm = fake.jsm as { consumers: { add: (s: string, c: unknown) => Promise<{ name: string }> } };
+      await jsm.consumers.add(STREAM, cfg);
+      const consumer = await (
+        fake.js as { consumers: { get: () => Promise<{ fetch: (o: { max_messages: number }) => Promise<AsyncIterable<{ seq: number }>> }> } }
+      ).consumers.get();
+      const seen: number[] = [];
+      for await (const m of await consumer.fetch({ max_messages })) seen.push(m.seq);
+      return seen;
+    };
+
+    const rows: { name: string; cfg: { filter_subject?: string; opt_start_seq?: number }; max: number; seqs: number[] }[] = [
+      { name: 'honours filter_subject', cfg: { filter_subject: OWN, opt_start_seq: 1 }, max: 10, seqs: [1, 3, 5] },
+      { name: 'a sibling subject is a different consumer', cfg: { filter_subject: FOREIGN_SUBJECT, opt_start_seq: 1 }, max: 10, seqs: [2] },
+      { name: 'a deeper subject is not the topic', cfg: { filter_subject: `${OWN}.deeper`, opt_start_seq: 1 }, max: 10, seqs: [4] },
+      { name: 'a wildcard filter takes one token', cfg: { filter_subject: 'parley.*', opt_start_seq: 1 }, max: 10, seqs: [1, 2, 3, 5] },
+      { name: 'NO filter sees the whole stream, as the server would show it', cfg: { opt_start_seq: 1 }, max: 10, seqs: [1, 2, 3, 4, 5] },
+      { name: 'honours opt_start_seq', cfg: { filter_subject: OWN, opt_start_seq: 3 }, max: 10, seqs: [3, 5] },
+      { name: 'honours max_messages', cfg: { filter_subject: OWN, opt_start_seq: 1 }, max: 2, seqs: [1, 3] },
+    ];
+
+    for (const row of rows) {
+      it(row.name, async () => {
+        expect(await pullWith(row.cfg, row.max)).toEqual(row.seqs);
+      });
+    }
   });
 
   it('an unclosed pull yields its whole window', async () => {
@@ -366,11 +418,11 @@ describe('nats fetch window — patience scales with the link, not with a consta
             ...(shape.tail === undefined ? {} : { visibleTail: shape.tail }),
           });
           const plugin = new NatsPlugin();
-          injectFake(plugin, fake, STREAM);
+          injectFake(plugin, fake, TOPIC);
 
           const page = await plugin.fetchRecent(argsFor(pos));
 
-          expect(page.messages.map((m) => Number(m.cursor))).toEqual(owed(shape, pos));
+          expect(page.messages.map((m) => seqOf(m.cursor))).toEqual(owed(shape, pos));
           expect(page.nextCursor).toBe(page.messages.at(-1)?.cursor);
         }, 30_000);
       }
@@ -393,7 +445,7 @@ describe('nats fetch window — patience scales with the link, not with a consta
         expiryMs: 20_000,
       });
       const plugin = new NatsPlugin();
-      injectFake(plugin, fake, STREAM);
+      injectFake(plugin, fake, TOPIC);
 
       const started = Date.now();
       const page = await plugin.fetchRecent(argsFor(pos));
@@ -412,7 +464,7 @@ describe('nats fetch window — patience scales with the link, not with a consta
       expiryMs: 30_000,
     });
     const plugin = new NatsPlugin();
-    injectFake(plugin, fake, STREAM);
+    injectFake(plugin, fake, TOPIC);
 
     let since: Cursor = asCursor('0');
     const seen: string[] = [];
@@ -426,4 +478,63 @@ describe('nats fetch window — patience scales with the link, not with a consta
 
     expect(seen).toEqual(['m1', 'm2', 'm3']);
   }, 60_000);
+});
+
+// Class: work proportional to the HISTORY rather than to `limit`. Every row above states the page a
+// read returns and none of them states what the read cost, so a page that is correct because it
+// materialised the whole topic and threw all but `limit` away passes them all — and core's cold
+// start is exactly that read. The bound is asserted on what the fake was ASKED for and on what it
+// actually handed over, because the page cannot show either. Depth is crossed with the depth of the
+// hole above the topic tail: the cost may follow the hole, never the history.
+describe('nats fetch window — a page costs what the page holds, not what the topic holds', () => {
+  const LIMIT = 5;
+
+  /** `depth` topic messages, then `hole` sequences the topic no longer has above them. */
+  const deepHistory = (depth: number, hole: number): { records: FakeRecord[]; tail: number } => ({
+    records: stream(Array.from({ length: depth }, (_, i) => i + 1)),
+    tail: depth + hole,
+  });
+
+  // `LIMIT + 1` is the row where a window OVERSHOOTS: the first window holds nothing, and the wider
+  // one that follows covers far more of the topic than the page may return.
+  for (const depth of [10, 500, 5000]) {
+    for (const hole of [LIMIT, LIMIT + 1, 4 * LIMIT]) {
+      it(`${depth} messages under a ${hole}-deep hole: the read scales with the hole, not the depth`, async () => {
+        const { records, tail } = deepHistory(depth, hole);
+        const fake = fakeJetStream({ records, visibleTail: tail, expiryMs: EXPIRY_MS });
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake, TOPIC);
+
+        const page = await plugin.fetchRecent({ topic: TOPIC, limit: LIMIT });
+
+        expect(page.messages.map((m) => m.content)).toEqual(
+          Array.from({ length: LIMIT }, (_, i) => `m${depth - LIMIT + i + 1}`),
+        );
+        // A budget that admits the deepest history here would be met by reading all of it.
+        const budget = 8 * (hole + LIMIT);
+        expect(fake.state.yielded).toBeLessThanOrEqual(budget);
+        expect(Math.max(...fake.state.maxMessages)).toBeLessThanOrEqual(budget);
+      }, 60_000);
+    }
+  }
+
+  // The same bound from the other side: a pull STOPS at the tail it was given. Without that stop a
+  // page is ended only by the idle close, so the cost above is held up by a timer rather than by the
+  // read knowing where its window ends.
+  it('a pull stops at the topic tail instead of being ended by the idle close', async () => {
+    const fake = fakeJetStream({
+      records: stream(Array.from({ length: 40 }, (_, i) => i + 1)),
+      expiryMs: EXPIRY_MS,
+    });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake, TOPIC);
+
+    const started = Date.now();
+    const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), limit: 100 });
+
+    expect(page.messages).toHaveLength(40);
+    expect(fake.state.yielded).toBe(40);
+    // 200ms is the idle close; a read that ran to the tail never arms it to completion.
+    expect(Date.now() - started).toBeLessThan(200);
+  }, 20_000);
 });

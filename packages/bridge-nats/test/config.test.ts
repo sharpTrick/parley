@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect, nkeys, type ConnectionOptions } from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { NatsPlugin } from '../src/index.js';
+import { captures, NatsPlugin } from '../src/index.js';
 import { fakeJetStream, injectFake } from './fake-jetstream.js';
 
 // Class 1: every backend_config field the docs promise is actually honoured by the driver, and no
@@ -305,4 +305,95 @@ describe('nats backend_config — documented connection fields reach the driver'
       expect((err as Error).stack ?? '').not.toContain(SECRET);
     });
   }
+});
+
+// Class: a decision function reachable only through a rarely-configured path. `captures` is what
+// decides whether a PRE-EXISTING stream really covers this topic's subject — the only thing standing
+// between an operator's `parley.*` stream and either a spurious "differs from the instance that
+// created it" refusal or, in the other direction, an accepted stream that never carries the topic.
+// The one wildcard case above uses `parley.>`, so the single-token `*` arm was reachable by no test
+// at all. Driven from a generator as well as a table, so arities and wildcard positions no
+// hand-picked pair reaches are covered, and a future prefix change that alters token counts fails
+// here rather than in a live stream.
+describe('nats subject interest — captures(pattern, subject)', () => {
+  const rows: { pattern: string; subject: string; captured: boolean }[] = [
+    { pattern: 'parley.deploys', subject: 'parley.deploys', captured: true },
+    { pattern: 'parley.deploys', subject: 'parley.deploy', captured: false },
+    { pattern: 'parley.*', subject: 'parley.deploys', captured: true },
+    { pattern: 'parley.*', subject: 'parley.deploys.eu', captured: false },
+    { pattern: 'parley.*', subject: 'parley', captured: false },
+    { pattern: '*.deploys', subject: 'parley.deploys', captured: true },
+    { pattern: '*.deploys', subject: 'other.deploys', captured: true },
+    { pattern: '*', subject: 'parley', captured: true },
+    { pattern: '*', subject: 'parley.deploys', captured: false },
+    { pattern: 'a.*.c', subject: 'a.b.c', captured: true },
+    { pattern: 'a.*.c', subject: 'a.b.d', captured: false },
+    { pattern: 'a.*.c', subject: 'a.c', captured: false },
+    { pattern: 'parley.>', subject: 'parley.deploys', captured: true },
+    { pattern: 'parley.>', subject: 'parley.deploys.eu', captured: true },
+    { pattern: 'parley.>', subject: 'parley', captured: false },
+    { pattern: '>', subject: 'parley', captured: true },
+    { pattern: 'parley.*.>', subject: 'parley.eu.deploys', captured: true },
+    { pattern: 'parley.*.>', subject: 'parley.eu', captured: false },
+    { pattern: 'parley.deploys', subject: 'parley.deploys.eu', captured: false },
+    { pattern: 'parley.deploys.eu', subject: 'parley.deploys', captured: false },
+  ];
+
+  for (const row of rows) {
+    it(`${row.pattern} ${row.captured ? 'captures' : 'does not capture'} ${row.subject}`, () => {
+      expect(captures(row.pattern, row.subject)).toBe(row.captured);
+    });
+  }
+
+  /** Independent oracle: NATS interest as a regex over the same token rules. */
+  const oracle = (pattern: string, subject: string): boolean =>
+    new RegExp(
+      `^${pattern
+        .split('.')
+        .map((t) => (t === '*' ? '[^.]+' : t === '>' ? '[^.]+(\\.[^.]+)*' : t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+        .join('\\.')}$`,
+    ).test(subject);
+
+  const rnd = (seed: number): (() => number) => {
+    let s = seed;
+    return () => {
+      s = (s * 1103515245 + 12345) % 2147483648;
+      return s / 2147483648;
+    };
+  };
+
+  const generated = ((): { pattern: string; subject: string }[] => {
+    const next = rnd(7);
+    const tokens = ['a', 'b', 'c', 'deploys'];
+    const token = (): string => tokens[Math.floor(next() * tokens.length)] as string;
+    return Array.from({ length: 2000 }, () => {
+      const subject = Array.from({ length: 1 + Math.floor(next() * 4) }, token).join('.');
+      const parts = Array.from({ length: 1 + Math.floor(next() * 4) }, token);
+      const at = Math.floor(next() * parts.length);
+      const shape = next();
+      if (shape < 0.4) parts[at] = '*';
+      else if (shape < 0.6) parts.splice(at, parts.length - at, '>');
+      return { pattern: parts.join('.'), subject };
+    });
+  })();
+
+  it('agrees with an independent matcher over generated patterns and subjects', () => {
+    const disagreements = generated
+      .filter((g) => captures(g.pattern, g.subject) !== oracle(g.pattern, g.subject))
+      .map((g) => `${g.pattern} vs ${g.subject}`);
+    expect(disagreements).toEqual([]);
+  });
+
+  // A generator is worth what it emits: agreement over 2000 exact-match pairs would grade nothing.
+  it('emits both wildcards, in every position, and misses as well as matches', () => {
+    const held = (test: (g: { pattern: string; subject: string }) => boolean): number =>
+      generated.filter(test).length;
+    expect(held((g) => g.pattern.startsWith('*.'))).toBeGreaterThan(20);
+    expect(held((g) => /\.\*\./.test(g.pattern))).toBeGreaterThan(20);
+    expect(held((g) => g.pattern.endsWith('.*'))).toBeGreaterThan(20);
+    expect(held((g) => g.pattern.includes('>'))).toBeGreaterThan(20);
+    expect(held((g) => captures(g.pattern, g.subject))).toBeGreaterThan(100);
+    expect(held((g) => !captures(g.pattern, g.subject))).toBeGreaterThan(100);
+    expect(new Set(generated.map((g) => g.subject.split('.').length)).size).toBe(4);
+  });
 });

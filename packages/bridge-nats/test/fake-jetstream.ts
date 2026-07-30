@@ -5,24 +5,45 @@
  * destroying an ephemeral consumer, a link whose every round trip costs `latencyMs` — deterministic
  * instead of timing-dependent.
  */
+import type { Topic } from '@sharptrick/parley-core';
+
 const enc = new TextEncoder();
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
- * One stored message. `foreign` marks a record the stream captures but the topic's `filter_subject`
- * does not — a stream whose subject list is wider than one topic, which `ensureStream` accepts. It
- * counts toward every STREAM-wide counter and is invisible to every per-subject read.
+ * NATS subject interest, implemented here rather than imported from the plugin: this is the rule the
+ * fake GRADES the plugin's reads against, and a matcher shared with the code under test agrees with
+ * that code's own mistakes.
+ */
+export const subjectMatches = (pattern: string, subject: string): boolean => {
+  const tokens = pattern.split('.');
+  const target = subject.split('.');
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === '>') return target.length > i;
+    if (i >= target.length) return false;
+    if (tokens[i] !== '*' && tokens[i] !== target[i]) return false;
+  }
+  return tokens.length === target.length;
+};
+
+/**
+ * One stored message. `subject` defaults to `FakeState.subject` — the topic's own. A record on any
+ * OTHER subject is one the stream captures but the topic's `filter_subject` does not (a stream whose
+ * subject list is wider than one topic, which `ensureStream` accepts): it counts toward every
+ * STREAM-wide counter and must be invisible to every per-subject read.
  */
 export interface FakeRecord {
   seq: number;
   data: string;
-  foreign?: boolean;
+  subject?: string;
 }
 
 export interface FakeState {
   /** Stream contents: seq → JSON payload. */
   records: FakeRecord[];
+  /** Subject of a record that does not name its own — the topic under test. */
+  subject: string;
   /** How many messages ONE fetch yields before ending — the expiry/slow-link fault. */
   yieldLimit: number;
   /** `streams.info` reports this as `last_seq` (models a message landing after the snapshot). */
@@ -92,6 +113,13 @@ export interface FakeState {
   deleted: string[];
   /** `opt_start_seq` of the most recently created consumer. */
   lastStart: number;
+  /** `filter_subject` of the most recently created consumer; absent = the consumer set none. */
+  lastFilter?: string;
+  /** `filter_subject` of EVERY consumer created, in order. */
+  filters: (string | undefined)[];
+  /** `max_messages` of every `fetch`, and how many records the fake actually handed a pull. */
+  maxMessages: number[];
+  yielded: number;
 }
 
 export interface FakeJetStream {
@@ -103,6 +131,7 @@ export interface FakeJetStream {
 export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   const state: FakeState = {
     records: [],
+    subject: 'parley.topic',
     yieldLimit: Number.POSITIVE_INFINITY,
     latencyMs: 0,
     expiryMs: 0,
@@ -120,6 +149,9 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     created: [],
     deleted: [],
     lastStart: 0,
+    filters: [],
+    maxMessages: [],
+    yielded: 0,
     ...init,
   };
   let n = 0;
@@ -138,7 +170,14 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     throw new Error('stream not found');
   };
 
-  const onSubject = (r: FakeRecord): boolean => r.foreign !== true;
+  const subjectOf = (r: FakeRecord): string => r.subject ?? state.subject;
+  /**
+   * What THIS consumer sees. A consumer that set no `filter_subject` sees the whole stream, exactly
+   * as the server gives it — so a read that forgets the filter is a leak here rather than a fake
+   * that filtered on the reader's behalf.
+   */
+  const delivered = (r: FakeRecord): boolean =>
+    state.lastFilter === undefined || subjectMatches(state.lastFilter, subjectOf(r));
 
   const jsm = {
     streams: {
@@ -181,7 +220,8 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
           state.getMessageMissing -= 1;
           throw new Error('no message found');
         }
-        const own = state.records.filter(onSubject).at(-1);
+        const subj = req.last_by_subj;
+        const own = state.records.filter((r) => subj !== undefined && subjectMatches(subj, subjectOf(r))).at(-1);
         // NATS 2.10 answers LAST_BY_SUBJ out of the subject's newest RECORDED sequence, so once
         // that message is deleted the read 404s rather than naming the surviving one below it.
         const ownTailDeleted =
@@ -195,12 +235,14 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       },
     },
     consumers: {
-      add: async (_stream: string, cfg: { opt_start_seq?: number }) => {
+      add: async (_stream: string, cfg: { opt_start_seq?: number; filter_subject?: string }) => {
         await hop();
         await streamMissingAt('consumers.add');
         const name = `c${++n}`;
         state.created.push(name);
         state.lastStart = cfg.opt_start_seq ?? 0;
+        state.lastFilter = cfg.filter_subject;
+        state.filters.push(cfg.filter_subject);
         return { name };
       },
       delete: async (_stream: string, name: string) => {
@@ -219,6 +261,9 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         await streamMissingAt('consumers.get');
         if (state.failOn === 'get') throw new Error('injected: consumers.get failed');
         const start = state.lastStart;
+        const filter = state.lastFilter;
+        const visible = (r: FakeRecord): boolean =>
+          filter === undefined || subjectMatches(filter, subjectOf(r));
         return {
           consume: async () => {
             const generation = ++consumes;
@@ -235,7 +280,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
                 if (silent) return; // EOF with no status event — a dropped link, not a deletion
                 let next = start;
                 while (!closed) {
-                  const due = state.records.filter((r) => r.seq >= next && onSubject(r));
+                  const due = state.records.filter((r) => r.seq >= next && visible(r));
                   for (const r of due) {
                     next = r.seq + 1;
                     delivery += 1;
@@ -254,8 +299,9 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
           fetch: async ({ max_messages }: { max_messages: number }) => {
             await streamMissingAt('fetch');
             if (state.failOn === 'fetch') throw new Error('injected: fetch failed');
+            state.maxMessages.push(max_messages);
             const window = state.records
-              .filter((r) => r.seq >= start && onSubject(r))
+              .filter((r) => r.seq >= start && visible(r))
               .slice(0, Math.min(max_messages, state.yieldLimit));
             let release = () => undefined as void;
             let wasClosed = false;
@@ -285,6 +331,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
                 // so a closed pull delivers nothing further and a truncating reader LOSES messages.
                 for (const r of window) {
                   if ((await quiet(state.latencyMs)) === 'closed') break;
+                  state.yielded += 1;
                   yield { seq: r.seq, data: enc.encode(r.data) };
                 }
                 if (!wasClosed && window.length < max_messages && state.expiryMs > 0) {
@@ -297,14 +344,14 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         };
       },
     },
-    publish: async (_subject: string, data: Uint8Array) => {
+    publish: async (subject: string, data: Uint8Array) => {
       await hop();
       if (state.publishMissing > 0) {
         state.publishMissing -= 1;
         throw new Error('503 no responders — stream not found');
       }
       const seq = (state.records.at(-1)?.seq ?? 0) + 1;
-      state.records.push({ seq, data: new TextDecoder().decode(data) });
+      state.records.push({ seq, data: new TextDecoder().decode(data), subject });
       return { seq };
     },
   };
@@ -313,21 +360,26 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
 }
 
 /**
- * Wire a fake into a plugin instance. `streamName` pre-seeds the stream cache so `connect()` isn't
+ * Wire a fake into a plugin instance. `topic` pre-seeds the stream cache so `connect()` isn't
  * needed; omit it to let the call under test drive `ensureStream` and record its `streams.add`.
  * A pre-seeded stream carries its incarnation too — a plugin that has ensured a stream has read
- * that stream's `created` stamp.
+ * that stream's `created` stamp — and the fake's records are placed on the subject that topic
+ * composes, so a read that drops its `filter_subject` sees what the server would show it.
  */
-export function injectFake(plugin: unknown, fake: FakeJetStream, streamName?: string): void {
+export function injectFake(plugin: unknown, fake: FakeJetStream, topic?: Topic): void {
   const peek = plugin as {
     js: unknown;
     jsm: unknown;
     ensured: Map<string, Promise<void>>;
     incarnations: Map<string, string>;
+    subject: (t: Topic) => string;
+    streamName: (t: Topic) => string;
   };
   peek.js = fake.js;
   peek.jsm = fake.jsm;
-  if (streamName !== undefined) {
+  if (topic !== undefined) {
+    fake.state.subject = peek.subject(topic);
+    const streamName = peek.streamName(topic);
     peek.ensured.set(streamName, Promise.resolve());
     peek.incarnations.set(streamName, fake.state.streamCreated.replace(/[^0-9A-Za-z]/g, ''));
   }

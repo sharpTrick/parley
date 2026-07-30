@@ -8,7 +8,6 @@ import { fakeJetStream, injectFake, payload, type FakeJetStream } from './fake-j
 // so any fabricated cursor is silent, permanent message loss. Every read shape × every degree of
 // read completeness, with the incompleteness injected rather than waited for.
 const TOPIC = asTopic('cursors');
-const STREAM = 'PARLEY_cursors';
 const ALL = ['a', 'b', 'c', 'd', 'e'];
 
 function makePlugin(init: Partial<FakeJetStream['state']> = {}): {
@@ -20,7 +19,7 @@ function makePlugin(init: Partial<FakeJetStream['state']> = {}): {
     ...init,
   });
   const plugin = new NatsPlugin();
-  injectFake(plugin, fake, STREAM);
+  injectFake(plugin, fake, TOPIC);
   return { plugin, fake };
 }
 

@@ -25,6 +25,8 @@ vi.mock('nats', async (importOriginal) => {
   };
 });
 
+const ORPHAN = asTopic('orphan');
+
 describe('nats recovery — ensureStream must not cache a rejected promise', () => {
   it('evicts the cache entry on a transient failure and retries streams.add on the next call', async () => {
     const plugin = new NatsPlugin();
@@ -71,7 +73,6 @@ describe('nats recovery — ensureStream must not cache a rejected promise', () 
 // its resubscribe backoff — where an outage keeps it nearly all the time — wakes after that clear,
 // finds live handles, and delivers to a handler its owner already dropped, with no closer registered
 // for anyone to stop it. The pause is swept across the cycle instead of picking one lucky offset.
-const ORPHAN_STREAM = 'PARLEY_orphan';
 
 describe('nats recovery — a loop retired by disconnect() does not resurrect on the next connect()', () => {
   for (const pauseMs of [0, 400, 800, 1200]) {
@@ -79,18 +80,18 @@ describe('nats recovery — a loop retired by disconnect() does not resurrect on
       const fake = fakeJetStream({ records: [], silentExits: 5 });
       const plugin = new NatsPlugin();
       await plugin.connect({ servers: 'mock' });
-      injectFake(plugin, fake, ORPHAN_STREAM);
+      injectFake(plugin, fake, ORPHAN);
       attachConnection(plugin);
 
       const got: string[] = [];
-      await plugin.subscribe(asTopic('orphan'), (m) => {
+      await plugin.subscribe(ORPHAN, (m) => {
         got.push(m.content);
       });
       await sleep(pauseMs);
       await plugin.disconnect();
 
       await plugin.connect({ servers: 'mock' });
-      injectFake(plugin, fake, ORPHAN_STREAM);
+      injectFake(plugin, fake, ORPHAN);
       attachConnection(plugin);
       const created = fake.state.created.length;
       fake.state.records.push({ seq: 1, data: payload('after-reconnect') });

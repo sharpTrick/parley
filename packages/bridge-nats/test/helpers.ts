@@ -24,6 +24,9 @@ export async function isNatsUp(servers: string = SERVERS): Promise<boolean> {
 
 export const rand = (): string => Math.random().toString(36).slice(2, 8);
 
+/** The sequence half of a cursor — `<stream incarnation>-<sequence>`, or the legacy bare sequence. */
+export const seqOf = (cursor: string): number => Number(String(cursor).split('-').at(-1));
+
 export async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
