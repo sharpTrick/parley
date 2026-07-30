@@ -6,10 +6,9 @@
 
 ## Status
 
-- **Phase (adversarial review — the Careening experiment):** rounds 1–6 complete and pushed on
-  `claude/next-steps-q1540r`. Full suite **7580 tests, 4 skipped, green**, against real Redis, NATS,
+- **Phase (adversarial review — the Careening experiment):** rounds 1–7 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **8847 tests, 4 skipped, green**, against real Redis, NATS,
   Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
-  The suite series is **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580**.
 
   Findings per round (14 targets each, 0 errored every round):
 
@@ -35,10 +34,44 @@
   60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
   measured, it was not saturation.
 
+  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847**.
+
+  **Round 7's themes.** Fixture fidelity persisted from round 6 and stayed the most productive lens:
+  nats' fake modelled foreignness with a boolean instead of the subject, so deleting `filter_subject`
+  from all three `consumers.add` calls left the fake-backed suite green at 190/190 while a live
+  wildcard stream leaked a sibling topic into the handler; zulip's fake echoed `content` verbatim
+  while the real server strips edges, refuses empty bodies and truncates at 10 000 chars — modelling
+  it turned a FROZEN conformance clause red, because the plugin took neither arm.
+
+  New in round 7: **a suite that had already noticed a defect and frozen it as correct.** Slack's
+  `envelope-robustness` asserted `liveSockets === 2` under the label `orphaned sockets`. That is why
+  the socket leak survived six rounds — not that no one looked, but that the test named the bug and
+  blessed it.
+
+  **Three agents' guards failed their own first mutation** and each fixed the test rather than
+  reporting success: discord's fault boundary (the only unwrapped statement was the waiter fan-out),
+  shared's credential table (the `path segment` location echoed the whole path, so the pathname rule
+  claimed it whatever the token looked like — it graded the shape of nothing), and telegram's docs
+  cell (one served chat never exceeded the cap, so load-time eviction never bit). Mutation testing
+  is the only reason those three ratchets are real.
+
+  **Cross-target collisions are now a recurring cost.** Round 6 had none; round 7 had three. Core's
+  new `set()` validation contradicted a matrix table titled "every cursor form a read-state file can
+  hold" — matrix's row was the wrong one, since `load()` has always refused an empty cursor. Core's
+  new `MAX_BLOCK_MS` ceiling made slack's README cite an unreachable configuration. And the shared
+  target's tightened since-less bound reddened matrix, which answers that read in 4.1-4.8 s against
+  a live Synapse — a real provisioning cost, not a park.
+
+  **A process defect the worktrees do not cover.** Worktrees isolate each agent's repository; the
+  scratchpad is shared. Two agents independently wrote `index.ts.bak` there, and matrix's restore
+  pulled bridge-slack's source into `bridge-matrix/src/index.ts`. Both recovered from git. Recorded
+  in `docs/REVIEW_PROTOCOL.md` with the fix: per-target scratch paths, or better, `git checkout --`
+  instead of a backup at all.
+
   **Stop rule: two consecutive wake-all rounds with zero CONFIRMED findings, or round 20.** Offered
   the blocking-gated alternative at round 3 and deliberately declined it, to keep comparability with
   ouroboros's acting rule; the shadow metric is still recorded. Quiescence has never fired — all 14
-  targets have returned confirmed findings in all four rounds — and that null result is the finding.
+  targets have returned confirmed findings in all seven rounds — and that null result is the finding.
 
   **Before launching a round: `node scripts/careening-preflight.mjs`** (exit 1 = do not start). The
   docker daemon died mid-round in rounds 3, 4 and 5; round 5's six service-backed targets reviewed
