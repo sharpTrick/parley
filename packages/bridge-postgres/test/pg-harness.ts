@@ -15,6 +15,25 @@ export const rand = (): string => Math.random().toString(36).slice(2, 8);
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Report how `p` settled — or `'hung'` — within `budgetMs`, so a call that never comes back is
+ * read as the hang it is instead of blowing the whole file's timeout with no diagnosis.
+ */
+export async function settleWithin(p: Promise<unknown>, budgetMs: number): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    p.then(
+      () => 'resolved',
+      (e: unknown) => `rejected: ${e instanceof Error ? e.message : String(e)}`,
+    ),
+    new Promise<string>((r) => {
+      timer = setTimeout(() => r('hung'), budgetMs);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  return outcome;
+}
+
 /** Is a server reachable at `url`? Gates every real-server describe in this package. */
 export async function isUp(url: string = PG_URL): Promise<boolean> {
   const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });

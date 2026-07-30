@@ -3,11 +3,12 @@ import { PostgresPlugin } from '../src/index.js';
 
 // Retention is enabled on a table that already exists — typically one that has been accumulating
 // forever, because "keep every message" is the default. The first prune after an operator sets
-// `retention_days` therefore has the whole backlog to remove, and it runs on the same pool as
-// post(), whose transactions are already serialized per topic by an advisory lock. One unbatched
-// DELETE over millions of rows holds row locks and bloats WAL for as long as it takes, and every
-// post() behind it waits. So the property is not "the old rows are gone" — the real-server cases
-// cover that — it is that the work is issued in BOUNDED statements and still completes exactly.
+// `retention_days` therefore has the whole backlog to remove. Deleting old rows never blocks
+// inserting new ones under MVCC, so it is not post()'s locks that are at stake; what is, is that
+// one statement over millions of rows keeps a single transaction — and a snapshot that holds
+// vacuum off — open for as long as it runs, on a pooled connection post() shares for the same
+// span. So the property is not "the old rows are gone" — the real-server cases cover that — it is
+// that the work is issued in BOUNDED statements and still completes exactly.
 
 const state = vi.hoisted(() => ({
   /** Rows still older than the cutoff; each DELETE removes up to its own LIMIT. */

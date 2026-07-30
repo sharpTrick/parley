@@ -43,7 +43,8 @@ export interface PostgresBackendConfig {
   /** Max pooled connections for queries/writes (the LISTEN connection is separate). Default 5. */
   pool_size?: number;
   /**
-   * Optional retention window in days: rows older than this are pruned on a background timer.
+   * Optional retention window in days, greater than 0 and at most {@link MAX_RETENTION_DAYS}: rows
+   * older than it are pruned on a background timer.
    * Omit for the default — keep every message forever. Safe to enable at any time: `seq` is a
    * BIGSERIAL and never reused, so a cursor/backendMsgId minted before a prune stays valid (a
    * stale reader just gets fewer rows back, never a wrong or duplicate one).
@@ -57,16 +58,36 @@ const DEFAULT_USER = 'parley';
 const DEFAULT_PASSWORD = 'parley';
 const MIN_POOL_SIZE = 1;
 const MAX_POOL_SIZE = 1000;
+/**
+ * Widest retention window this backend accepts, in days (50 years). Keep a ceiling here, so that
+ * every accepted window still has a cutoff a stored row could fall on: past it the cutoff first
+ * predates any message this system wrote — pruning is then a permanent no-op the operator was
+ * told was running hourly — and further still it leaves the range a `Date` renders at all, which
+ * throws inside the best-effort prune and is swallowed there.
+ */
+export const MAX_RETENTION_DAYS = 18_250;
 /** How many rows one drain query pulls at most before re-querying. */
 const DRAIN_BATCH = 512;
 /** Backoff between listener reconnect attempts after the connection drops. */
 const RECONNECT_DELAY_MS = 500;
+/**
+ * How long a statement waits for a server-side lock before giving up, in ms. Every lock this
+ * plugin takes is held for one INSERT or one idempotent bootstrap, so reaching this means another
+ * session is sitting on it. Keep a bound here, so that a wedged lock cannot pin a pooled
+ * connection forever and starve every other seam call of pool capacity.
+ */
+export const LOCK_WAIT_MS = 5000;
+/**
+ * How long a seam call waits for the shared LISTEN connection — a first connect, or the backoff
+ * reconnect after a drop — before giving up. Bounded for the same reason as {@link LOCK_WAIT_MS}.
+ */
+export const LISTENER_WAIT_MS = 5000;
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the pool size. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 const CONFIG_KEYS = ['url', 'table_name', 'pool_size', 'retention_days'] as const;
 /** Rows one prune statement may delete, so retention never issues one unbounded table-wide DELETE. */
-const PRUNE_BATCH = 5000;
+export const PRUNE_BATCH = 5000;
 
 function describeValue(v: unknown): string {
   return typeof v === 'string' ? `'${v}'` : String(v);
@@ -112,15 +133,21 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
   }
 
   const retention = cfg['retention_days'];
-  if (retention !== undefined && (typeof retention !== 'number' || !(retention > 0))) {
+  if (
+    retention !== undefined &&
+    (typeof retention !== 'number' ||
+      !Number.isFinite(retention) ||
+      !(retention > 0) ||
+      retention > MAX_RETENTION_DAYS)
+  ) {
     throw badConfig(
       'retention_days',
-      `expected a number > 0, got ${describeValue(retention)} — 0 or negative would delete the ` +
-        `whole history; omit the key to keep every message forever`,
+      `expected a finite number of days in (0, ${MAX_RETENTION_DAYS}], got ` +
+        `${describeValue(retention)} — a window of 0 or less keeps nothing, and a window past ` +
+        `${MAX_RETENTION_DAYS} days puts the cutoff before any message this backend could have ` +
+        'written, so pruning would silently never run at all; omit the key to keep every message ' +
+        'forever',
     );
-  }
-  if (typeof retention === 'number' && !Number.isFinite(retention)) {
-    throw badConfig('retention_days', `expected a finite number, got ${describeValue(retention)}`);
   }
 
   return cfg as PostgresBackendConfig;
@@ -182,6 +209,41 @@ function listenerUnavailable(topic: Topic, err: unknown): Error {
     `parley-postgres: could not establish the live path for topic '${topic}' — ${detail}. The ` +
       'listener connection is down; a reconnect is in flight, so a retry succeeds once it lands.',
   );
+}
+
+/** PostgreSQL's SQLSTATE for a statement that gave up waiting on a lock (`lock_timeout`). */
+const LOCK_NOT_AVAILABLE = '55P03';
+
+/**
+ * Name a lock wait this plugin abandoned. `SET LOCAL lock_timeout` turns an indefinite wait into
+ * this error; without the rename it reaches the agent as PostgreSQL's bare 'canceling statement
+ * due to lock timeout', naming neither the plugin, the topic, nor the fact that nothing was written.
+ */
+function lockWaitAbandoned(what: string, err: unknown): Error {
+  if ((err as { code?: string } | undefined)?.code !== LOCK_NOT_AVAILABLE) return err as Error;
+  return new Error(
+    `parley-postgres: gave up after ${LOCK_WAIT_MS}ms waiting for the ${what} — another session is ` +
+      'holding it. Nothing was written; retry once that session commits or is terminated.',
+  );
+}
+
+/** Reject with `onTimeout()` if `p` has not settled within `budgetMs`; never leaves a timer behind. */
+async function withDeadline<T>(
+  p: Promise<T>,
+  budgetMs: number,
+  onTimeout: () => Error,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(onTimeout()), budgetMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Per-channel LISTEN state shared by subscriptions and blocking waiters. */
@@ -309,6 +371,7 @@ export class PostgresPlugin implements BackendPlugin {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(`SET LOCAL lock_timeout = ${LOCK_WAIT_MS}`);
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [this.table]);
       await client.query(buildSchema(this.table));
       await client.query('COMMIT');
@@ -316,7 +379,7 @@ export class PostgresPlugin implements BackendPlugin {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();
       await pool.end().catch(() => undefined);
-      throw err;
+      throw lockWaitAbandoned(`bootstrap lock on table '${this.table}'`, err);
     }
     client.release();
     // Same hazard the listener has, one resource up: a disconnect() can complete while the
@@ -342,11 +405,11 @@ export class PostgresPlugin implements BackendPlugin {
   /**
    * Delete rows older than `retention_days`, {@link PRUNE_BATCH} rows per statement. The first
    * prune after an operator enables retention on a long-lived table can have millions of rows to
-   * remove; keep it batched, so that it cannot become one long DELETE holding row locks while
-   * every advisory-lock-serialized `post()` queues behind it. Best-effort — a transient failure
-   * retries next tick. Keep the whole body inside the try, so that no arithmetic on an
-   * operator-supplied window can escape this un-awaited call as an unhandled rejection and take
-   * the process down.
+   * remove; keep it batched, so that it cannot become one transaction whose WAL volume and
+   * long-held snapshot grow with the whole backlog — a snapshot that old holds vacuum off every
+   * table in the database for as long as it runs. Best-effort — a transient failure retries next
+   * tick. Keep the whole body inside the try, so that no arithmetic on an operator-supplied window
+   * can escape this un-awaited call as an unhandled rejection and take the process down.
    */
   private async prune(): Promise<void> {
     if (this.retentionDays === undefined || this.pool === undefined) return;
@@ -417,6 +480,7 @@ export class PostgresPlugin implements BackendPlugin {
         [identity],
       );
       await client.query('BEGIN');
+      await client.query(`SET LOCAL lock_timeout = ${LOCK_WAIT_MS}`);
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [topic]);
       const res = await client.query(
         `INSERT INTO ${this.names.messages} (topic, sender, content, ts, in_reply_to)
@@ -427,7 +491,7 @@ export class PostgresPlugin implements BackendPlugin {
       return asBackendMsgId(String((res.rows[0] as { seq: string }).seq));
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
-      throw err;
+      throw lockWaitAbandoned(`write lock on topic '${topic}'`, err);
     } finally {
       client.release();
     }
@@ -502,7 +566,7 @@ export class PostgresPlugin implements BackendPlugin {
     const epoch = this.epoch;
     let listener: Client;
     try {
-      listener = await this.ensureListener();
+      listener = await this.ensureListener(Math.min(blockMs, LISTENER_WAIT_MS));
     } catch {
       return; // listener unavailable → skip the native wait; core polls the remaining budget
     }
@@ -515,12 +579,6 @@ export class PostgresPlugin implements BackendPlugin {
     } catch {
       return; // LISTEN failed → skip the native wait; core polls the remaining budget
     }
-    // disconnect() may have completed while LISTEN was in flight.
-    if (this.stopped || epoch !== this.epoch) {
-      this.releaseListen(channel, listen);
-      return;
-    }
-
     let waiters = this.waiters.get(channel);
     if (waiters === undefined) {
       waiters = new Set();
@@ -711,15 +769,27 @@ export class PostgresPlugin implements BackendPlugin {
     }
   }
 
-  /** Lazily create the shared LISTEN connection on first subscribe. */
-  private ensureListener(): Promise<Client> {
+  /**
+   * The shared LISTEN connection: created lazily on first subscribe, and REPLACED by the backoff
+   * reconnect after a drop. Keep the memo pointing at the reconnect that is in flight rather than
+   * at the client whose socket just closed, so that a `subscribe` issued during the blackout waits
+   * for the replacement and then succeeds — handed the dead client it is guaranteed to fail, and
+   * core's push loop rethrows that, so the whole bridge fails to come up. The wait is bounded, so
+   * an outage that outlasts `budgetMs` is a named error rather than a call that never settles.
+   */
+  private ensureListener(budgetMs = LISTENER_WAIT_MS): Promise<Client> {
     if (this.listenerPromise === undefined) {
-      this.listenerPromise = this.createListener().catch((err: unknown) => {
-        this.listenerPromise = undefined; // let a later subscribe retry
+      const attempt: Promise<Client> = this.createListener().catch((err: unknown) => {
+        if (this.listenerPromise === attempt) this.listenerPromise = undefined;
         throw err;
       });
+      this.listenerPromise = attempt;
     }
-    return this.listenerPromise;
+    return withDeadline(
+      this.listenerPromise,
+      budgetMs,
+      () => new Error(`the listener connection did not come up within ${budgetMs}ms`),
+    );
   }
 
   private async createListener(): Promise<Client> {
@@ -777,6 +847,17 @@ export class PostgresPlugin implements BackendPlugin {
     if (this.reconnecting) return;
     this.reconnecting = true;
     const epoch = this.epoch;
+    let landed!: (client: Client) => void;
+    let abandoned!: (err: unknown) => void;
+    const replacement = new Promise<Client>((resolve, reject) => {
+      landed = resolve;
+      abandoned = reject;
+    });
+    // Keep this handler, so that a reconnect abandoned with no seam call waiting on it is not an
+    // unhandled rejection that takes the process down.
+    replacement.catch(() => undefined);
+    this.listenerPromise = replacement;
+    let adopted = false;
     try {
       while (!this.stopped && epoch === this.epoch) {
         await delay(RECONNECT_DELAY_MS);
@@ -795,7 +876,8 @@ export class PostgresPlugin implements BackendPlugin {
             await client.query(`LISTEN "${channel}"`);
           }
           await this.adoptListener(client, epoch);
-          if (epoch === this.epoch) this.listenerPromise = Promise.resolve(client);
+          landed(client);
+          adopted = true;
           for (const sub of this.subs.values()) this.drain(sub);
           return;
         } catch {
@@ -804,6 +886,12 @@ export class PostgresPlugin implements BackendPlugin {
         }
       }
     } finally {
+      // A loop that gave up must settle the memo every waiting seam call is parked on, and clear
+      // it, so that a later subscribe starts a fresh listener instead of awaiting a dead promise.
+      if (!adopted) {
+        abandoned(new Error('the listener reconnect was abandoned by disconnect()'));
+        if (this.listenerPromise === replacement) this.listenerPromise = undefined;
+      }
       // Keep the flag owned by the lifecycle that set it, so that this loop exiting after a
       // disconnect() cannot clear a successor lifecycle's reconnect and let two run at once.
       if (epoch === this.epoch) this.reconnecting = false;

@@ -1,7 +1,7 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { PostgresPlugin } from '../src/index.js';
-import { dropTable, isUp, PG_URL, rand, withAdmin } from './pg-harness.js';
+import { PostgresPlugin, PRUNE_BATCH } from '../src/index.js';
+import { dropTable, isUp, PG_URL, rand, sleep, withAdmin } from './pg-harness.js';
 
 // Postgres creates and wholly owns its message table, so DESIGN §11 puts the retention knob on it
 // alongside sqlite/redis/nats. A config key that a sibling backend honours must never be silently
@@ -76,6 +76,65 @@ if (await isUp(PG_URL)) {
           left = (await plugin.fetchRecent({ topic, limit: 1 })).messages.length;
         }
         expect(left, 'prune stopped before the backlog was gone').toBe(0);
+      } finally {
+        await plugin.disconnect();
+        await dropTable(table);
+      }
+    }, 60000);
+
+    // The README tells an operator what enabling retention on a large table costs the write path.
+    // A claim about backend concurrency semantics that no case exercises is a claim nobody has
+    // checked, so the write path is measured against a prune that is deliberately in flight —
+    // either side of the batch size, and both on the topic being pruned and on an untouched one.
+    const BACKLOGS: [label: string, rows: number][] = [
+      ['under one batch', PRUNE_BATCH - 1],
+      ['over one batch', PRUNE_BATCH + 1],
+      ['several batches', PRUNE_BATCH * 3],
+    ];
+    /** A post is one INSERT under a per-topic advisory lock; anything near this is a stall. */
+    const POST_BUDGET_MS = 2000;
+
+    it.each(
+      BACKLOGS.flatMap(([label, rows]) =>
+        (['the topic being pruned', 'an untouched topic'] as const).map(
+          (where) => [`${label}, posting to ${where}`, rows, where] as const,
+        ),
+      ),
+    )('a post is not held up by a prune in flight: %s', async (_label, backlog, where) => {
+      const table = `parley_prn_${rand()}`;
+      const old = asTopic(`old-${rand()}`);
+      const target = where === 'the topic being pruned' ? old : asTopic(`new-${rand()}`);
+
+      const seeder = new PostgresPlugin();
+      await seeder.connect({ url: PG_URL, table_name: table });
+      await seeder.disconnect();
+      await withAdmin(async (admin) => {
+        await admin.query(
+          `INSERT INTO "${table}" (topic, sender, content, ts, in_reply_to)
+           SELECT $1, 'u', 'm' || g, $2, NULL FROM generate_series(1, $3::int) g`,
+          [old, new Date(Date.now() - 2 * 86_400_000).toISOString(), backlog],
+        );
+      });
+
+      const plugin = new PostgresPlugin();
+      // A one-day window: the seeded rows are two days old and go; anything posted now stays.
+      await plugin.connect({ url: PG_URL, table_name: table, retention_days: 1 });
+      try {
+        const slowest: number[] = [];
+        for (let i = 0; i < 5; i++) {
+          const started = Date.now();
+          await plugin.post(target, asHandle('u'), `during-prune-${i}`);
+          slowest.push(Date.now() - started);
+          await sleep(20);
+        }
+        expect(Math.max(...slowest), 'a post queued behind the retention DELETE').toBeLessThan(
+          POST_BUDGET_MS,
+        );
+
+        const { messages } = await plugin.fetchRecent({ topic: target, limit: 10 });
+        expect(messages.at(-1)?.content, 'the posts made during the prune are not there').toBe(
+          'during-prune-4',
+        );
       } finally {
         await plugin.disconnect();
         await dropTable(table);

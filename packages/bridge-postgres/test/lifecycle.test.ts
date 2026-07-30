@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
@@ -34,6 +35,11 @@ const state = vi.hoisted(() => ({
   listenAttempts: [] as string[],
   // When true, `query('LISTEN …')` rejects (drives the failed-subscribe path).
   listenRejects: false,
+  // When set, the next pooled DELETE parks on this deferred — the window between two prune
+  // batches, in which a disconnect() (and a successor connect()) can land.
+  deleteGate: null as Deferred | null,
+  /** Every DELETE the prune loop issued, in order. */
+  deletes: [] as string[],
   // The table, per topic. Rows STAY here: what a query returns is decided by the SQL's cursor
   // predicate and ORDER BY, exactly as the server decides it.
   rows: new Map<string, Record<string, unknown>[]>(),
@@ -81,7 +87,23 @@ vi.mock('pg', async () => {
     }
   }
 
-  const poolQuery = async (sql: string, values: readonly unknown[]): Promise<{ rows: unknown[] }> => {
+  const poolQuery = async (
+    sql: string,
+    values: readonly unknown[],
+  ): Promise<{ rows: unknown[]; rowCount?: number }> => {
+    if (/^\s*DELETE/.test(sql)) {
+      state.deletes.push(sql);
+      const gate = state.deleteGate;
+      if (gate !== null) {
+        state.deleteGate = null;
+        await gate.promise;
+      }
+      // A full batch, so the prune loop goes round again and re-reaches its teardown guard — but
+      // only a few, so a loop that no longer stops is a failed assertion rather than a suite that
+      // never finishes and reports nothing.
+      const limit = /LIMIT (\d+)/.exec(sql);
+      return { rows: [], rowCount: state.deletes.length <= 3 ? Number(limit?.[1] ?? 0) : 0 };
+    }
     const served = servePool(state.rows.get(String(values[0])) ?? [], sql, values);
     return { rows: served ?? [] };
   };
@@ -101,6 +123,8 @@ beforeEach(() => {
   state.listenGate = null;
   state.listenAttempts.length = 0;
   state.listenRejects = false;
+  state.deleteGate = null;
+  state.deletes.length = 0;
   state.rows.clear();
 });
 
@@ -146,7 +170,12 @@ async function until(pred: () => boolean, budgetMs = 2000): Promise<void> {
   while (!pred() && Date.now() < deadline) await sleep(2);
 }
 
-type Chore = 'subscribe-listen' | 'blocking-fetch' | 'reconnect-backoff' | 'reconnect-connect';
+type Chore =
+  | 'subscribe-listen'
+  | 'blocking-fetch'
+  | 'reconnect-backoff'
+  | 'reconnect-connect'
+  | 'prune-batch';
 type Next = 'disconnect' | 'disconnect+connect';
 
 const CHORES: Chore[] = [
@@ -154,13 +183,31 @@ const CHORES: Chore[] = [
   'blocking-fetch',
   'reconnect-backoff',
   'reconnect-connect',
+  'prune-batch',
 ];
+
+/**
+ * Every await in this plugin that a `disconnect()` can land in re-checks the epoch afterwards, and
+ * the table below drives one row per chore into that window. Pinned by VALUE so a guard site added
+ * later is a missing row rather than silence: a new one means a new await that can cross a
+ * teardown, and it needs its own row here (or in teardown-delivery.test.ts, which owns the drain).
+ */
+const EPOCH_GUARD_SITES = 10;
+
+const SOURCE = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 
 const CROSS_CELLS = CHORES.flatMap((chore) =>
   (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),
 );
 
 describe('a chore in flight when disconnect lands never touches the next lifecycle', () => {
+  it('every teardown/epoch guard in the source is represented by a row above', () => {
+    const sites = [...SOURCE.matchAll(/epoch !== this\.epoch/g)].length;
+    expect(sites, 'a guard site was added or removed — give the new await a row').toBe(
+      EPOCH_GUARD_SITES,
+    );
+  });
+
   it.each(CROSS_CELLS.map((c) => [`${c.chore}, ${c.next}`, c] as const))(
     '%s',
     async (_label, cell) => {
@@ -168,17 +215,31 @@ describe('a chore in flight when disconnect lands never touches the next lifecyc
       const priv = plugin as unknown as Priv;
       const topic = asTopic('t');
       const settle = (p: Promise<unknown>): Promise<unknown> => p.catch(() => undefined);
-      await plugin.connect({ url: REAL_URL });
+      // The prune loop is what parks on a DELETE, and it only runs when retention is configured.
+      await plugin.connect(
+        cell.chore === 'prune-batch' ? { url: REAL_URL, retention_days: 1 } : { url: REAL_URL },
+      );
 
       const pending: Promise<unknown>[] = [];
+      const settledAt: number[] = [];
+      const timed = (p: Promise<unknown>): Promise<unknown> =>
+        settle(p).then((v) => {
+          settledAt.push(Date.now());
+          return v;
+        });
       let release: (() => void) | undefined;
 
-      if (cell.chore === 'subscribe-listen' || cell.chore === 'blocking-fetch') {
+      if (cell.chore === 'prune-batch') {
+        const gate = deferred();
+        state.deleteGate = gate;
+        release = gate.resolve;
+        await until(() => state.deletes.length > 0);
+      } else if (cell.chore === 'subscribe-listen' || cell.chore === 'blocking-fetch') {
         const gate = deferred();
         state.listenGate = gate;
         release = gate.resolve;
         pending.push(
-          settle(
+          timed(
             cell.chore === 'subscribe-listen'
               ? plugin.subscribe(topic, () => undefined)
               : plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 4000 }),
@@ -207,10 +268,27 @@ describe('a chore in flight when disconnect lands never touches the next lifecyc
         await plugin.connect({ url: REAL_URL });
         await plugin.subscribe(topic, (m) => got.push(m));
       }
+      const deletesAtBoundary = state.deletes.length;
+      const releasedAt = Date.now();
       release?.();
       // Past one whole reconnect backoff, so a loop that did not abort has woken and acted.
       await sleep(900);
       await Promise.all(pending);
+
+      // The parked seam call has to come back when the teardown releases it, not when its own
+      // block budget finally runs out: a guard that only stops the chore from PUBLISHING still
+      // leaves the caller parked for up to catchup.block_max_ms past the teardown.
+      for (const at of settledAt) {
+        expect(at - releasedAt, 'a parked seam call outlived the teardown that released it').toBeLessThan(
+          1000,
+        );
+      }
+      // A chore woken after the boundary must not issue one more statement — least of all against
+      // the successor lifecycle's pool, which is a different table with a different retention.
+      expect(
+        state.deletes.length - deletesAtBoundary,
+        'the prune loop kept deleting past the teardown',
+      ).toBe(0);
 
       if (cell.next === 'disconnect') {
         expect(priv.listener, 'listener resurrected after disconnect').toBeUndefined();

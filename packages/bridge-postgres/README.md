@@ -55,20 +55,24 @@ name is lower-cased and double-quoted everywhere it reaches SQL, so a reserved w
 `table_name` rejection is formatted like the other knobs': `parley-postgres: invalid
 backend_config.table_name — …`.
 
-`retention_days` deletes rows older than the window on connect and hourly thereafter, in batches
-of 5000 rows per statement, so the first prune after enabling retention
-on a large table cannot become one long DELETE that every `post()` queues behind. `seq` is a
-`BIGSERIAL` and is never reused, so a cursor minted before a prune stays valid: a stale reader
-just gets fewer rows back, never a wrong or duplicate one. The sender registry is not pruned —
-it is bounded by the number of distinct handles, not by message volume.
+`retention_days` (greater than `0` and at most `18250`, about 50 years) deletes rows older than
+the window on connect and hourly thereafter, in batches of 5000 rows per statement: the first prune after
+enabling retention on a large table is many short transactions rather than one whose WAL volume,
+and whose vacuum-blocking snapshot, grow with the whole backlog. It does not hold `post()` up
+either way — deleting old rows never blocks inserting new ones. `seq` is a `BIGSERIAL` and is
+never reused, so a cursor minted before a prune stays valid: a stale reader just gets fewer rows
+back, never a wrong or duplicate one. The sender registry is not pruned — it is bounded by the
+number of distinct handles, not by message volume.
 
 `connect()` rejects if the plugin is already connected: call `disconnect()` first. A second
 `connect()` would otherwise strand the previous pool and prune timer with no way to reclaim them.
 
 Every key is validated before the pool is opened, and `connect()` rejects — naming the key — on an
 unrecognised key (a typo would otherwise silently disable the feature), a `pool_size` that is not
-an integer in `1..1000`, or a `retention_days` that is not a finite number greater than zero
-(`0`, a negative value or `null` would delete the entire history on connect).
+an integer in `1..1000`, or a `retention_days` that is not a finite number in `(0, 18250]`. Both
+ends of that range are refused rather than clamped: `0` or a negative window keeps nothing, and a
+window past 18250 days puts the cutoff before any message this backend could have written, which
+would leave pruning silently never running while this page says rows are removed hourly.
 
 Secrets belong in the config/`.env`, never committed (CLAUDE.md conventions).
 
@@ -82,7 +86,10 @@ config:
 - **`table_name`** — the hidden one. Topic `"ctx-payments"` in table `parley_messages` is a
   completely different table than in `app_messages`; every other field can look consistent while
   history silently splits in two.
-- **`pool_size`** is safe to vary per session — it's per-instance capacity, not shared state.
+- **`pool_size`** may differ per session — it is per-instance capacity, not shared state. It is a
+  head-of-line budget for *writes* as well as reads, though: a `post()` holds a pooled connection
+  while it waits for its per-topic lock, so `pool_size` posts contending one topic will delay that
+  instance's reads until those waits end. They always do end — see below.
 
 `connect()`'s bootstrap is idempotent and, on a table that is already bootstrapped, takes no
 table-level lock: the `CREATE TRIGGER` runs only when the trigger is missing. A rolling restart
@@ -94,6 +101,12 @@ at INSERT time, not COMMIT time, so without the lock a larger `seq` could become
 a smaller one commits and a catch-up reader would skip the late row forever. The per-topic lock
 serializes same-topic commits into `seq` order (distinct topics don't contend), which is what
 keeps the cursor monotonic and lossless under genuinely concurrent writers.
+
+Every wait on that lock is bounded: `post()` and `connect()`'s bootstrap both run under `SET LOCAL
+lock_timeout = 5000`, so a session sitting on the key (an abandoned transaction, a `psql` holding
+`pg_advisory_lock`) makes them fail after five seconds with a `parley-postgres: gave up after
+5000ms waiting for …` naming the topic or the table, and nothing is written. An unbounded wait
+would instead hold a pooled connection forever and take the instance's reads down with it.
 
 ## Cursors
 

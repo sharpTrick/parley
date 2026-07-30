@@ -41,6 +41,7 @@ describe('the real-server harness is shared, not restated', () => {
       'backendCount',
       'dropTable',
       'isUp',
+      'settleWithin',
       'settledBackendCount',
       'terminateBackends',
       'withAdmin',
@@ -90,6 +91,46 @@ describe('the pg driver fake is shared, not restated', () => {
     const src = readFileSync(join(HERE, file), 'utf8');
     const found = RESTATED_DRIVER.filter(([, pattern]) => pattern.test(src)).map(([what]) => what);
     expect(found, `extend ./${FAKE} instead`).toEqual([]);
+  });
+});
+
+// A 3x3 table here once named a property ('a seam call across a listener blackout never surfaces a
+// raw driver error') whose only assertion sat behind `if (rejection !== undefined)`. Four of the
+// nine cells cannot reject by construction, so they ran for seconds and graded nothing — and the
+// mutation the file exists to catch survived in every one of them. A row that can take either arm
+// has to say which arm it expects and assert it unconditionally, so a cell that changes arm fails
+// instead of passing quietly.
+
+/** Line numbers where an `expect(` sits inside an `if (… !== undefined)` block. */
+function conditionalAssertions(src: string): string[] {
+  const lines = src.split('\n');
+  const found: string[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (!/^\s*if\s*\([^)]*!==\s*undefined\s*\)\s*\{\s*$/.test(line)) continue;
+    let depth = 1;
+    for (let j = index + 1; j < lines.length; j++) {
+      const body = lines[j] as string;
+      if (/\bexpect\(/.test(body)) found.push(`${index + 1}: ${line.trim()}`);
+      depth += (body.match(/\{/g) ?? []).length - (body.match(/\}/g) ?? []).length;
+      if (depth <= 0) break;
+    }
+  }
+  return [...new Set(found)];
+}
+
+describe('no assertion hides behind a branch a row may never take', () => {
+  it('the rule can fire, so the cells below are not vacuous', () => {
+    expect(
+      conditionalAssertions('if (rejection !== undefined) {\n  expect(1).toBe(1);\n}\n'),
+    ).toHaveLength(1);
+  });
+
+  it.each(testFiles())('%s asserts its outcome unconditionally', (file) => {
+    const src = readFileSync(join(HERE, file), 'utf8');
+    expect(
+      conditionalAssertions(src),
+      'declare the outcome the row expects and assert it unconditionally',
+    ).toEqual([]);
   });
 });
 
