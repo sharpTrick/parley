@@ -162,3 +162,153 @@ describe('telegram malformed 2xx envelopes', () => {
     );
   }, 20_000);
 });
+
+const MESSAGE_CHAT = '-1009620001';
+
+/** A conforming Telegram `Message`, before a cell breaks exactly one field of it. */
+const conformingMessage = (): UpstreamMessage => ({
+  message_id: 4242,
+  chat: { id: Number(MESSAGE_CHAT) },
+  date: 1_600_000_000,
+  text: 'hi',
+});
+
+/**
+ * One level below the envelope: the message OBJECT. `unwrapEnvelope` only proves the upstream
+ * answered `{ok:true, result}` — it says nothing about the fields the plugin then reads off that
+ * result, and a non-conforming local Bot API server or a rewriting middlebox can hand back a
+ * message missing any of them. `date` used to be the one field nothing checked, so a message
+ * without it died on `new Date(undefined * 1000).toISOString()` — `RangeError: Invalid time value`,
+ * which names neither the endpoint nor the field, and on the inbound path is one throttled stderr
+ * line a minute for a whole class of permanently lost messages.
+ *
+ * Every required field x every way it can be wrong, through BOTH paths that build a record: the
+ * `sendMessage` result (where a caller is there to reject) and the ingestion loop (where there is
+ * not, so the loop must survive and say what it dropped and why).
+ */
+/** A Telegram `Message` object as it arrives — untyped, because a cell's job is to break it. */
+type UpstreamMessage = Record<string, unknown>;
+
+const REQUIRED_FIELDS = [
+  {
+    name: 'message_id',
+    break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, message_id: v }),
+    names: /message_id/,
+  },
+  { name: 'chat', break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, chat: v }), names: /chat id/ },
+  {
+    name: 'chat.id',
+    break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, chat: { id: v } }),
+    names: /chat id/,
+  },
+  { name: 'date', break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, date: v }), names: /date/ },
+];
+
+/** `undefined` drops the key on the way through JSON; the other two are never a valid scalar. */
+const BREAKAGES = [
+  { name: 'absent', value: undefined },
+  { name: 'null', value: null },
+  { name: 'the wrong type', value: [] },
+];
+
+const FIELD_CELLS = REQUIRED_FIELDS.flatMap((field) =>
+  BREAKAGES.map((breakage) => ({ field, breakage })),
+);
+
+describe('telegram non-conforming message objects', () => {
+  it.each(FIELD_CELLS)(
+    'post rejects when the sendMessage result has $field.name $breakage.name, naming the endpoint and the field',
+    async ({ field, breakage }) => {
+      captureStderr();
+      const fake = await startFake();
+      const path = storePath();
+      const plugin = await connectTo(fake, path);
+      fake.malformMethod(
+        'sendMessage',
+        JSON.stringify({ ok: true, result: field.break(conformingMessage(), breakage.value) }),
+      );
+
+      const topic = asTopic(MESSAGE_CHAT);
+      const err = await plugin.post(topic, SENDER, 'x').then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err).toBeDefined();
+      const message = err?.message ?? '';
+      expect(message).toContain('Telegram POST /sendMessage');
+      expect(message).toMatch(field.names);
+      expect(message).not.toMatch(/Invalid time value|Cannot read properties/);
+      // And nothing was recorded from a message object the plugin could not read.
+      expect((await plugin.fetchRecent({ topic })).messages).toEqual([]);
+    },
+    20_000,
+  );
+
+  it.each(FIELD_CELLS)(
+    'the ingestion loop drops an update whose message has $field.name $breakage.name, naming the endpoint and the field',
+    async ({ field, breakage }) => {
+      const stderr = captureStderr();
+      const fake = await startFake();
+      const plugin = await connectTo(fake, storePath());
+      const topic = asTopic(MESSAGE_CHAT);
+      await plugin.subscribe(topic, () => undefined);
+
+      const updateId = fake.injectRawUpdate({
+        message: field.break(conformingMessage(), breakage.value),
+      });
+      // A conforming message behind it pins the point at which the broken one has been consumed —
+      // and proves the single ingestion path survived it.
+      fake.injectUserMessage(MESSAGE_CHAT, 'alice', 'sentinel');
+      await vi.waitFor(
+        async () =>
+          expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toContain(
+            'sentinel',
+          ),
+        { timeout: 8000, interval: 20 },
+      );
+
+      const reported = stderr.join('');
+      expect(reported).toContain(`Telegram GET /getUpdates → update ${updateId}`);
+      expect(reported).toMatch(field.names);
+      expect(reported).not.toMatch(/Invalid time value|Cannot read properties/);
+      expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+        'sentinel',
+      ]);
+    },
+    20_000,
+  );
+
+  /**
+   * `update_id` is the acknowledgement, not a record field: `Math.max(offset, NaN)` is NaN and NaN
+   * is below nothing, so ONE id-less update from a non-conforming upstream would poison the offset
+   * for the life of the loop — Telegram would then re-serve the whole backlog on every poll and the
+   * bridge would never see another new message.
+   */
+  it('keeps acknowledging updates when one arrives with no update_id', async () => {
+    captureStderr();
+    const fake = await startFake();
+    fake.malformMethod(
+      'getUpdates',
+      JSON.stringify({ ok: true, result: [{ message: conformingMessage() }] }),
+    );
+    const plugin = await connectTo(fake, storePath());
+    const topic = asTopic(MESSAGE_CHAT);
+
+    await vi.waitFor(() => expect(fake.callCount('getUpdates')).toBeGreaterThan(2), {
+      timeout: 8000,
+      interval: 20,
+    });
+    fake.malformMethod('getUpdates', undefined);
+    fake.injectUserMessage(MESSAGE_CHAT, 'alice', 'after the id-less update');
+
+    await vi.waitFor(
+      async () =>
+        expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toContain(
+          'after the id-less update',
+        ),
+      { timeout: 8000, interval: 20 },
+    );
+    // The loop advanced its offset past the injected update rather than re-reading it forever.
+    await vi.waitFor(() => expect(fake.retainedUpdates()).toBe(0), { timeout: 8000, interval: 20 });
+  }, 20_000);
+});

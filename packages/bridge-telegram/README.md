@@ -22,7 +22,7 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | topic → chat       | `chat_map[topic]` if present, else the topic string is used as the chat id **literal**. Either way it must be a numeric id or `@channelusername` — anything else is rejected (Telegram answers 400 "chat not found"), never silently accepted as an empty topic. `@name` is resolved to its numeric id once via `getChat`, and **everything the plugin stores or routes is keyed by that numeric id**, so a chat named three different ways is one topic's worth of history no matter which seam call ran first. One topic ↔ one chat. |
 | `post`             | `POST /bot<token>/sendMessage` `{ chat_id, text, reply_to_message_id? }` → the returned message object is ingested into the local store immediately (own posts **never** arrive via `getUpdates`). A send Telegram accepted that the store did **not** record — a full disk, a store whose descriptor a failed compaction could not reopen, a teardown mid-call — **rejects**, naming the `<chat>:<message_id>` that exists upstream and the `store_path` it is missing from, rather than resolving with a `backendMsgId` no `fetchRecent` will ever return. `inReplyTo` threads via `reply_to_message_id: mid` only when it is a `<chat>:<mid>` composite naming **this** chat (`message_id` is unique per chat, so a composite from another chat is ignored). |
 | `backendMsgId`     | **Composite `<chat_id>:<message_id>`** — Telegram's `message_id` is only unique *per chat*, so the chat id is baked into the dedup key. |
-| `cursor`           | **`String(seq)`**, the store's own **observation sequence** — the order this bridge *saw* the message, not Telegram's `message_id`. A `message_id` is minted when the sender's message is accepted, so a message minted *before* one of our posts can be delivered *after* it and would sit forever below a cursor already issued; observation order is monotonic by construction. Exclusive-`since` is a **numeric** compare, never lexical. Zero cursor is `'0'`; a `since` that is not a run of digits is rejected as a malformed cursor rather than answered with a permanently empty page. |
+| `cursor`           | **`<store identity>.<seq>`**, where `seq` is the store's own **observation sequence** — the order this bridge *saw* the message, not Telegram's `message_id`. A `message_id` is minted when the sender's message is accepted, so a message minted *before* one of our posts can be delivered *after* it and would sit forever below a cursor already issued; observation order is monotonic by construction. Exclusive-`since` is a **numeric** compare on the sequence, never lexical. The identity half is minted once per store **file** (the sequence is per file and restarts at 1), so a cursor from a store file this one did not inherit is refused however far this store's own sequence has since climbed — see **History limitations**. Zero cursor is `'0'`, accepted bare because it sits below every sequence any store can stamp; anything that is neither `'0'` nor `<16 hex>.<digits>` is rejected as a malformed cursor rather than answered with a permanently empty page. |
 | `fetchRecent`      | A query over the local observed-message store: **no history endpoint is ever called**, because the Bot API has none (see **History limitations**). The one network cost is resolving an `@channelusername` topic to its numeric id — one memoized `getChat`, already paid during `connect` for every `chat_map` entry — so a topic named *only* by an `@name` literal can fail its **first** catch-up while Telegram is unreachable. Ascending **by observation order**, exclusive `since`, default window = most recent `limit` (100). |
 | `subscribe`        | Registers on the **one shared** `getUpdates` long-poll loop (`timeout=<poll_timeout_s>`, `offset` = confirmed `update_id + 1`, and a watchdog that abandons and re-polls a request the server accepts but never answers). Watermark = current max **observation sequence** for the topic, taken synchronously **before** `subscribe` resolves; starts at the tail — history is owned by catch-up. Accepts both `message` and `channel_post` updates. `disconnect()` aborts the in-flight long-poll. |
 | `resolveIdentity`  | The bot's own username (via memoized `getMe`) resolves to its numeric id; any other handle passes through as a name convention — the Bot API cannot look up arbitrary users. |
@@ -60,15 +60,20 @@ everything delivered by `getUpdates`. Consequences:
   observed history; a new path starts empty.
 - It is **bounded**, on load and on every append: the newest `observed_retention_per_chat`
   (default 10000) records **per chat**, across at most `observed_max_chats` (default 1000)
-  chats. Anything older is dropped and the file is compacted, so raise
-  `observed_retention_per_chat` if you need `fetchRecent` to replay a deeper window.
+  *unserved* chats **plus** the chats this bridge serves (below). Anything older is dropped and the
+  file is compacted, so raise `observed_retention_per_chat` if you need `fetchRecent` to replay a
+  deeper window. Size disk and RAM from `observed_retention_per_chat × (observed_max_chats +
+  the number of topics you point at this bridge)`: `observed_max_chats` alone is **not** a bound on
+  the total, because the served chats are exactly the ones it must not evict.
 - The chat cap **never evicts a chat this bridge serves** — one a `chat_map` entry resolves to,
   or one a seam call has named — on load or at runtime. A new unserved chat displaces the least
   recently active *unserved* chat instead, so a bot added to a flood of groups cannot crowd out
-  your own topics or starve them of admission. The one gap: a topic used as a **chat-id literal**
-  is not known to the bridge until some seam call names it, so a flood arriving in that window
-  can still displace it. **List the topics you care about in `chat_map`** — `connect` resolves
-  those before the store is even opened, which closes the window entirely.
+  your own topics or starve them of admission. That protection is **written into the store file**,
+  so a chat a seam call named in one run is still protected at the next load, before any seam call
+  in the new process could have named it again. The one gap: a topic used as a **chat-id literal**
+  is not known to the bridge until some seam call names it *for the first time ever*, so a flood
+  arriving in that window can still displace it. **List the topics you care about in `chat_map`** —
+  `connect` resolves those before the store is even opened, which closes the window entirely.
 - Compaction replaces the file by **rename**, never in place: a crash or a full disk mid-compaction
   leaves the previous file intact rather than a truncated one. It writes through a temp file it
   **creates exclusively** and refuses to compact through anything already sitting at that path that is
@@ -86,11 +91,17 @@ everything delivered by `getUpdates`. Consequences:
   the plaintext of every message the bridge has seen.
 - **A lost store file invalidates every outstanding cursor.** The cursor is this store's own
   observation sequence, and a fresh file restarts that sequence at 1 — while core's saved cursor
-  (in its state directory, a different lifetime) still points at the old numbering. `fetchRecent`
-  from such a cursor **fails loudly** ("ahead of every message this store has observed") rather
-  than answering with a permanently short page; restore the original `store_path`, or clear the
-  saved cursor for the topic. This is why `store_path` defaults to an **absolute** path under the
-  same state directory rather than to the working directory the MCP client happened to pick.
+  (in its state directory, a different lifetime) still points at the old numbering. Each store file
+  therefore carries a random **identity**, minted when it is created and baked into every cursor it
+  issues, and `fetchRecent` refuses a `since` carrying anyone else's ("was issued by a different
+  observed-message store") **however many new messages this store has since observed** — rather
+  than answering with a permanently short page once its own sequence climbs back past the stale
+  cursor. Restore the original `store_path`, or clear the saved cursor for the topic. This is why
+  `store_path` defaults to an **absolute** path under the same state directory rather than to the
+  working directory the MCP client happened to pick.
+  The residual: a file **partially** rolled back — same identity, records missing from the tail —
+  is caught only while its sequence has not yet been re-issued past the cursor you hold ("ahead of
+  every message this store has observed"). Restore a store file whole, or not at all.
 - Within the observed window the seam contract holds fully: stable ids, monotonic exclusive
   cursors, dedup across `getUpdates` backlog replays, cold-restart replay.
 
@@ -110,7 +121,7 @@ store's dedup makes the replay harmless.
 | `chat_map`       | _(empty)_                  | Parley topic → chat id (numeric or `@channelusername`). Unmapped topics are used as the chat id literal. |
 | `observed_retention_per_chat` | `10000`       | Newest-N observed records kept **per chat**, enforced on load *and* on every append; the file is compacted when records are evicted. Bounds how deep `fetchRecent` can replay — see **History limitations**. A positive integer: an out-of-domain value is a load error rather than a silent fall back to the default. |
 | `observed_retention_per_topic` | _(unset)_   | Deprecated spelling of `observed_retention_per_chat` — the bound is per chat, and `chat_map` can give one chat two topic names. Still honoured; the new key wins when both are set. |
-| `observed_max_chats` | `1000`                 | Max distinct chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or a topic a seam call has named) are never evicted; unconfigured ones (the bot can be added to a group by anyone) displace each other least-recently-active first once the cap is reached. |
+| `observed_max_chats` | `1000`                 | Max **unserved** chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or a topic a seam call has named — a mark that is persisted with the store) are never evicted and are retained *on top of* this cap, so it bounds the chats anyone-can-add-the-bot traffic creates, not the store's total. Unserved chats displace each other least-recently-active first once the cap is reached. |
 
 > **Presence needs a real chat id.** Core enables presence by default (`presence.enabled: true`,
 > `presence.topic: parley-presence`), and on Telegram a topic string **is a chat id** — so the

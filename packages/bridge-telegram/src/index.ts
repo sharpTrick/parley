@@ -9,6 +9,7 @@ import {
   type BackendMsgId,
   type BackendPlugin,
   buildMessage,
+  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
@@ -35,7 +36,8 @@ export interface TelegramBackendConfig {
    * Path of the observed-message JSONL store. Default {@link defaultStorePath} — an ABSOLUTE
    * path under the same state directory core keeps its read-state (cursors) in, so the two share
    * a lifetime. A store file that goes missing while a saved cursor survives invalidates that
-   * cursor: sequences restart at 1 and the messages below the old cursor are unreachable.
+   * cursor: sequences restart at 1 and the messages below the old cursor are unreachable, which
+   * `fetchRecent` reports rather than serving a short page (see {@link ObservedStore.epoch}).
    */
   store_path?: string;
   /**
@@ -61,10 +63,10 @@ export interface TelegramBackendConfig {
   /** Deprecated spelling of {@link observed_retention_per_chat}, which wins when both are set. */
   observed_retention_per_topic?: number;
   /**
-   * Max distinct chats retained in the local JSONL store. Anyone who can add the bot to a
-   * group can drive writes into `store_path`, so the chat count is bounded too; chats a
-   * configured topic resolves to are always retained, and an unconfigured chat past the cap
-   * displaces the least recently active unconfigured one. Default 1000.
+   * Max UNSERVED chats retained in the local JSONL store. Anyone who can add the bot to a
+   * group can drive writes into `store_path`, so that traffic is bounded; chats a configured topic
+   * or a seam call resolves to are always retained, on top of this cap, and an unserved chat past
+   * it displaces the least recently active unserved one. Default 1000.
    */
   observed_max_chats?: number;
 }
@@ -123,11 +125,12 @@ interface Waiter {
  * (DESIGN §6); within the observed window the contract holds fully.
  *
  * IDs: `backendMsgId = '<chat_id>:<message_id>'` (composite — Telegram's `message_id` is only
- * unique PER CHAT) and `cursor = String(seq)`, the store's local OBSERVATION sequence. Telegram's
- * own `message_id` is minted when the sender's message is accepted, not when this bridge sees it,
- * so a foreign message minted before our post can be delivered after it and would sit forever
- * below a cursor already handed out; observation order is monotonic by construction and cannot.
- * Exclusive-`since` is a NUMERIC compare — never lexical (`'10' < '9'` lexically).
+ * unique PER CHAT) and `cursor = '<store identity>.<seq>'`, where `seq` is the store's local
+ * OBSERVATION sequence and the identity is the store FILE's ({@link ObservedStore.epoch}).
+ * Telegram's own `message_id` is minted when the sender's message is accepted, not when this
+ * bridge sees it, so a foreign message minted before our post can be delivered after it and would
+ * sit forever below a cursor already handed out; observation order is monotonic by construction
+ * and cannot. Exclusive-`since` is a NUMERIC compare on the sequence — never lexical.
  *
  * Everything internal — the observed store, live subscriptions, long-poll waiters — is keyed by
  * the CANONICAL NUMERIC CHAT ID a topic resolves to, never by the topic string. `chat_map`, an
@@ -321,35 +324,24 @@ export class TelegramPlugin implements BackendPlugin {
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const store = this.require(this.store);
-    if (args.since !== undefined && !/^\d+$/.test(args.since as string)) {
-      throw new Error(
-        `TelegramPlugin: malformed cursor '${args.since as string}' for topic '${args.topic as string}'`,
-      );
-    }
-    if (args.since !== undefined && Number(args.since) > store.highWater()) {
-      throw new Error(
-        `TelegramPlugin: cursor '${args.since as string}' for topic '${args.topic as string}' is ` +
-          `ahead of every message this store has observed (high-water ${store.highWater()}). The ` +
-          `observed-message store at '${this.storePath}' is not the one that issued it, so the ` +
-          `messages it names are unreachable — restore that store file, or clear the saved cursor.`,
-      );
-    }
+    const sinceSeq =
+      args.since === undefined ? undefined : this.requireOwnCursor(store, args.since, args.topic);
     const chatId = await this.chatIdFor(args.topic);
     this.stillServing(store);
     // Normalize BEFORE slicing: a non-positive limit must mean "no messages" on both branches
     // (`slice(-0)` is `slice(0)` — the whole history — which would invert the argument).
     const limit = Math.max(0, Math.floor(args.limit ?? 100));
-    const nothingNewer = (): boolean =>
-      !store.entries(chatId).some((r) => r.seq > Number(args.since));
+    const nothingNewer = (seq: number): boolean =>
+      !store.entries(chatId).some((r) => r.seq > seq);
     const query = (): Message[] => {
       const all = store.entries(chatId);
       const slice =
-        args.since === undefined
+        sinceSeq === undefined
           ? // Default window: the most recent `limit` messages, ascending.
             all.slice(Math.max(0, all.length - limit))
           : // Exclusive: strictly after `since`, ascending. Numeric — never lexical.
-            all.filter((r) => r.seq > Number(args.since)).slice(0, limit);
-      return slice.map((rec) => recordToMessage(rec, args.topic));
+            all.filter((r) => r.seq > sinceSeq).slice(0, limit);
+      return slice.map((rec) => recordToMessage(rec, args.topic, store.epoch()));
     };
     let messages = query();
     // Native long-poll: ONLY when NOTHING in the store sits above the exclusive `since` — the
@@ -362,21 +354,67 @@ export class TelegramPlugin implements BackendPlugin {
     // slip through the gap. Empty page + STABLE cursor (=== `since`) at timeout is correct;
     // returning early/empty is always safe, and we never block longer than `blockMs`.
     if (
-      args.since !== undefined &&
+      sinceSeq !== undefined &&
       args.blockMs !== undefined &&
       args.blockMs > 0 &&
-      nothingNewer()
+      nothingNewer(sinceSeq)
     ) {
-      await this.waitForMessage(chatId, Number(args.since), args.blockMs);
+      await this.waitForMessage(chatId, sinceSeq, args.blockMs);
       messages = query();
     }
     const last = messages.at(-1);
     // An empty page must never move the caller backwards: hold `since` when there was one, and
     // otherwise report the topic's current tail — `limit: 0` on a topic with history would
-    // otherwise hand back '0' and make the next catch-up replay the whole retained window.
+    // otherwise hand back the zero cursor and make the next catch-up replay the whole retained
+    // window.
     const nextCursor =
-      last !== undefined ? last.cursor : (args.since ?? asCursor(String(store.maxSeq(chatId))));
+      last !== undefined
+        ? last.cursor
+        : (args.since ?? asCursor(`${store.epoch()}.${store.maxSeq(chatId)}`));
     return { messages, nextCursor };
+  }
+
+  /**
+   * The observation sequence `since` names, or a loud failure. A cursor is `<store epoch>.<seq>`:
+   * the sequence is minted per store FILE and restarts at 1, so the file's identity is what makes a
+   * cursor from a store this one did not inherit refusable however far this store's own sequence
+   * has since climbed. Without it the guard is only a high-water compare — it stops firing the
+   * moment a replacement store refills past the held cursor, and catch-up then answers a
+   * permanently short page that no Bot API call can ever complete.
+   *
+   * `'0'` is accepted bare and unqualified: it sits below every sequence any store can stamp, so it
+   * can only ever mean "from the beginning of what is retained".
+   */
+  private requireOwnCursor(store: ObservedStore, since: Cursor, topic: Topic): number {
+    const raw = since as string;
+    if (/^\d+$/.test(raw)) {
+      if (Number(raw) === 0) return 0;
+      throw new Error(this.foreignCursor(store, raw, topic));
+    }
+    const qualified = /^([0-9a-f]{16})\.(\d+)$/.exec(raw);
+    if (qualified === null) {
+      throw new Error(`TelegramPlugin: malformed cursor '${raw}' for topic '${topic as string}'`);
+    }
+    if (qualified[1] !== store.epoch()) throw new Error(this.foreignCursor(store, raw, topic));
+    const seq = Number(qualified[2]);
+    if (seq > store.highWater()) {
+      throw new Error(
+        `TelegramPlugin: cursor '${raw}' for topic '${topic as string}' is ` +
+          `ahead of every message this store has observed (high-water ${store.highWater()}). The ` +
+          `observed-message store at '${this.storePath}' has lost records it once held, so the ` +
+          `messages it names are unreachable — restore that store file, or clear the saved cursor.`,
+      );
+    }
+    return seq;
+  }
+
+  private foreignCursor(store: ObservedStore, raw: string, topic: Topic): string {
+    return (
+      `TelegramPlugin: cursor '${raw}' for topic '${topic as string}' was issued by a different ` +
+      `observed-message store (this one is '${this.storePath}', identity ${store.epoch()}). Its ` +
+      `observation sequences are unrelated to that cursor's, so the messages it names are ` +
+      `unreachable here — restore the store file that issued it, or clear the saved cursor.`
+    );
   }
 
   /**
@@ -570,7 +608,7 @@ export class TelegramPlugin implements BackendPlugin {
     for (const sub of this.subs.get(chatId) ?? []) {
       if (rec.seq <= sub.watermark) continue; // fixed subscribe-time value; never advanced.
       try {
-        sub.handler(recordToMessage(rec, sub.topic));
+        sub.handler(recordToMessage(rec, sub.topic, store.epoch()));
       } catch {
         /* handler is best-effort; never break the loop (DESIGN §6) */
       }
@@ -619,11 +657,20 @@ export class TelegramPlugin implements BackendPlugin {
       if (this.generation !== generation) break;
       const ackedBefore = offset;
       for (const u of updates) {
-        offset = Math.max(offset, u.update_id + 1);
-        const msg = u.message ?? u.channel_post;
+        // Acknowledge only an update that STATES an id. `Math.max(offset, NaN)` is NaN, which is
+        // below nothing, so one id-less update from a non-conforming upstream would otherwise
+        // poison the offset for the life of the loop and re-serve the whole backlog forever.
+        if (typeof u?.update_id === 'number' && Number.isFinite(u.update_id)) {
+          offset = Math.max(offset, u.update_id + 1);
+        }
+        const msg = u?.message ?? u?.channel_post;
         if (msg === undefined) continue; // an update kind we don't carry (edits, reactions, …)
         try {
-          this.ingest(store, String(msg.chat.id), msg);
+          const message = requireMessage(
+            `Telegram GET /getUpdates → update ${String(u.update_id)}`,
+            msg,
+          );
+          this.ingest(store, String(message.chat.id), message);
         } catch (err) {
           // Keep the loop alive across a failing store write (ENOSPC/EIO): losing one message is
           // recoverable, losing the only getUpdates consumer takes live push down for good.
@@ -789,15 +836,32 @@ function unwrapEnvelope(label: string, text: string): unknown {
   return env.result;
 }
 
-/** The `sendMessage` result, or a labelled failure — `post` reads two fields off it. */
+/** The `sendMessage` result, or a labelled failure. */
 function requireSentMessage(result: unknown): TgMessage {
-  const msg = result as TgMessage | null;
-  if (msg === null || typeof msg !== 'object' || typeof msg.message_id !== 'number') {
-    throw new Error('Telegram POST /sendMessage → result: not a message object');
+  return requireMessage('Telegram POST /sendMessage → result', result);
+}
+
+/**
+ * Every field {@link TelegramPlugin.ingest} reads to build a record, validated where the object
+ * arrives rather than where each one is dereferenced. `date` is checked here with the other two, so
+ * that a message object missing it fails naming the endpoint and the FIELD — Date arithmetic on a
+ * missing `date` otherwise produces the diagnostic, and `RangeError: Invalid time value` names
+ * neither, which is exactly what {@link unwrapEnvelope} exists one layer up to prevent.
+ */
+function requireMessage(label: string, value: unknown): TgMessage {
+  const msg = value as TgMessage | null;
+  if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
+    throw new Error(`${label}: not a message object`);
+  }
+  if (typeof msg.message_id !== 'number' || !Number.isFinite(msg.message_id)) {
+    throw new Error(`${label}: message carries no numeric message_id`);
   }
   const id = (msg.chat as { id?: unknown } | undefined)?.id;
   if (typeof id !== 'number' && typeof id !== 'string') {
-    throw new Error('Telegram POST /sendMessage → result: message carries no chat id');
+    throw new Error(`${label}: message carries no chat id`);
+  }
+  if (typeof msg.date !== 'number' || !Number.isFinite(msg.date)) {
+    throw new Error(`${label}: message carries no numeric date`);
   }
   return msg;
 }
@@ -861,14 +925,15 @@ function contentOf(msg: TgMessage): string | undefined {
   return kind === undefined ? undefined : `[${kind}]`;
 }
 
-function recordToMessage(rec: StoredRecord, topic: Topic): Message {
+/** A stored record as a seam message, its cursor qualified by the store file that stamped it. */
+function recordToMessage(rec: StoredRecord, topic: Topic, epoch: string): Message {
   return buildMessage({
     topic,
     sender: rec.sender,
     content: rec.content,
     timestamp: rec.ts,
     id: keyOf(rec),
-    cursor: String(rec.seq),
+    cursor: `${epoch}.${rec.seq}`,
   });
 }
 

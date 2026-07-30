@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   appendFileSync,
   chmodSync,
@@ -71,6 +72,18 @@ const EVICTED_ID_MEMORY = 1_000;
  * indexing it as a record.
  */
 const EVICTED_ID_LINE = '#evicted ';
+/**
+ * Marks the line carrying {@link ObservedStore.epoch} — the identity of this store FILE, minted
+ * once when it is created. Invalid JSON, for the reason {@link EVICTED_ID_LINE} gives.
+ */
+const EPOCH_LINE = '#epoch ';
+/**
+ * Marks a line carrying {@link ObservedStore.served} chat ids across a restart. Invalid JSON, for
+ * the reason {@link EVICTED_ID_LINE} gives.
+ */
+const SERVED_ID_LINE = '#served ';
+/** Shape of a store-file identity: 16 hex digits, so a cursor carrying one is unmistakable. */
+const EPOCH_PATTERN = /^[0-9a-f]{16}$/;
 /** Mode for everything this store creates — the plaintext of every message the bridge has seen. */
 const OWNER_ONLY_FILE = 0o600;
 /** Mode for a directory this store creates for {@link ObservedStore.path}. */
@@ -109,6 +122,28 @@ function restrictMode(path: string): void {
   }
 }
 
+/** The string ids a `#`-prefixed bookkeeping line carries, or none when it is garbled. */
+function parseIds(line: string, prefix: string): string[] {
+  const ids = JSON.parse(line.slice(prefix.length)) as unknown;
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((id): id is string => typeof id === 'string');
+}
+
+/**
+ * A store-file identity read off disk. Anything else is a damaged line: the loader drops it and the
+ * store mints a fresh identity, which invalidates the outstanding cursors LOUDLY rather than
+ * adopting a name that may not be the one that stamped the sequences in this file.
+ */
+function requireEpoch(raw: string): string {
+  const epoch = raw.trim();
+  if (!EPOCH_PATTERN.test(epoch)) throw new Error('ObservedStore: unreadable store identity');
+  return epoch;
+}
+
+function describe(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * A retention bound is a promise about disk and memory. Keep it a hard failure rather than a
  * substituted default, so that an operator who asks for a narrow bound never silently gets the
@@ -131,12 +166,20 @@ function requirePositiveInt(name: string, value: number): number {
  * Two bounds hold at ALL times — on load AND on every `append` — because both axes are
  * attacker-influenced: anyone who can post in a chat the bot is in drives records, and anyone
  * who can add the bot to a group drives chats. Per chat the newest {@link maxPerChat} records
- * are retained. Across chats at most {@link maxChats} are retained, and a chat this bridge
- * {@link serve}s is never evicted to make room — a new chat displaces the least recently
- * active UNSERVED chat instead, and is refused only when every retained chat is served.
+ * are retained. {@link maxChats} bounds the UNSERVED chats — a new one displaces the least
+ * recently active unserved chat, and is refused only when every retained chat is served — while a
+ * chat this bridge {@link serve}s is retained on top of that cap and never evicted to make room.
+ * That protection is persisted with the file, so it holds across a restart for every chat the
+ * store still carries records for, not only for the ones the caller re-declares at construction.
  * The on-disk file is compacted once evictions since the last rewrite exceed the retained
  * record count, so the file stays within a constant factor of the in-memory bound instead of
  * growing forever.
+ *
+ * The file carries an {@link epoch}: a random identity minted when it is created, which the plugin
+ * qualifies every cursor with. The observation sequence is per-FILE and restarts at 1, so without
+ * an identity a cursor minted by a store file that has since been lost becomes indistinguishable
+ * from one this store issued the moment the new sequence climbs past it — and catch-up answers a
+ * permanently short page instead of failing.
  *
  * Dedup outlives retention: an evicted record's composite id stays refusable for a further
  * {@link EVICTED_ID_MEMORY} evictions. Keep the two horizons separate, so that a retention bound
@@ -161,9 +204,11 @@ export class ObservedStore {
   private readonly evicted = new Set<string>();
   /** Chats this bridge serves (a configured topic resolves to them) — never evicted or refused. */
   private readonly served = new Set<string>();
+  /** Identity of the store FILE — see the class doc; every cursor the plugin issues carries it. */
+  private readonly epochId: string;
   /** Newest-N-per-chat retention bound. */
   private readonly maxPerChat: number;
-  /** Max distinct chats retained — the bot's chat membership is not ours to control. */
+  /** Max UNSERVED chats retained — the bot's chat membership is not ours to control. */
   private readonly maxChats: number;
   /** Next observation sequence to stamp — store-wide, so an evicted chat can never reuse one. */
   private nextSeq = 1;
@@ -173,8 +218,8 @@ export class ObservedStore {
   private fd: number | undefined;
   /** Set by {@link close} — the difference between "released on purpose" and "lost the fd". */
   private closed = false;
-  /** Wall-clock of the last compaction-failure diagnostic — the class throttle for it. */
-  private lastCompactReportAt = 0;
+  /** Wall-clock of the last diagnostic PER KIND, so one failure can't silence an unrelated one. */
+  private readonly lastReportAt = new Map<string, number>();
 
   constructor(
     private readonly path: string,
@@ -200,32 +245,78 @@ export class ObservedStore {
       raw = lastNl >= 0 ? raw.slice(0, lastNl + 1) : '';
       torn = true;
     }
+    let loadedEpoch = '';
     for (const line of raw.split('\n')) {
       if (line.trim() === '') continue;
       try {
-        if (line.startsWith(EVICTED_ID_LINE)) this.rememberEvicted(this.parseEvicted(line));
-        else this.index(this.stamp(JSON.parse(line) as Partial<StoredRecord> & ObservedRecord));
+        if (line.startsWith(EPOCH_LINE)) loadedEpoch = requireEpoch(line.slice(EPOCH_LINE.length));
+        else if (line.startsWith(SERVED_ID_LINE)) {
+          for (const id of parseIds(line, SERVED_ID_LINE)) this.served.add(id);
+        } else if (line.startsWith(EVICTED_ID_LINE)) {
+          this.rememberEvicted(parseIds(line, EVICTED_ID_LINE));
+        } else this.index(this.stamp(JSON.parse(line) as Partial<StoredRecord> & ObservedRecord));
       } catch {
         // A torn/garbled line is dropped; every complete line loads.
       }
     }
+    this.epochId = loadedEpoch === '' ? randomBytes(8).toString('hex') : loadedEpoch;
     const cappedChats = this.applyChatCap();
     const trimmed = this.applyRetention() || cappedChats;
     // Compact the on-disk file when we dropped a torn fragment or over-retention records; the
     // rewrite yields a clean, newline-terminated, bounded file. Keep this after the torn-tail
     // repair, so that the fragment is never carried into the compacted output.
-    if (torn || trimmed) this.rewrite();
+    const rewritten = torn || trimmed;
+    if (rewritten) this.rewrite();
     this.fd = openSync(path, 'a', OWNER_ONLY_FILE);
     restrictMode(path);
+    // Append rather than rewrite a file that carries no identity yet: a rewrite is a rename through
+    // `<path>.tmp`, so making it the price of opening a store would turn a squatted temp path into a
+    // bridge that cannot start at all.
+    if (loadedEpoch === '' && !rewritten) this.appendLine(`${EPOCH_LINE}${this.epochId}`);
   }
 
   /**
    * Mark `chatId` as one this bridge serves: a configured topic resolves to it, so it is
    * admitted past {@link maxChats} and never evicted to make room. Keep this, so that a flood
    * of unconfigured group chats cannot crowd out the operator's own topics.
+   *
+   * The mark is written to the file as well as held in memory. `chat_map` is re-resolved on every
+   * connect, but a topic named only by a seam call is not — so a protection that lived only in
+   * memory would lapse at the next restart and the load-time chat cap would evict the operator's
+   * own history, which the Bot API can never backfill.
    */
   serve(chatId: string): void {
+    if (this.served.has(chatId)) return;
     this.served.add(chatId);
+    this.appendLine(`${SERVED_ID_LINE}${JSON.stringify([chatId])}`);
+  }
+
+  /**
+   * Identity of the store FILE (see the class doc). The plugin qualifies every cursor with it, so
+   * that a cursor minted by a store file this one did not inherit is refused however far this
+   * store's own sequence has since climbed.
+   */
+  epoch(): string {
+    return this.epochId;
+  }
+
+  /**
+   * Write one bookkeeping line, reporting rather than throwing when it cannot be written. These
+   * lines carry protection and identity, not records: the caller of a seam method that triggers one
+   * has nothing to retry, and failing its call would report a message as lost that is not.
+   */
+  private appendLine(line: string): void {
+    const fd = this.openFd();
+    if (fd === undefined) return;
+    try {
+      appendFileSync(fd, `${line}\n`);
+    } catch (err) {
+      this.report(
+        'bookkeeping-line',
+        `could not record '${line.split(' ')[0] ?? ''}' in ${this.path} (${describe(err)}) — this ` +
+          `run is unaffected and the next restart loses what the line carried`,
+      );
+    }
   }
 
   /**
@@ -252,25 +343,25 @@ export class ObservedStore {
     try {
       this.compactIfDue();
     } catch (err) {
-      this.reportCompactionFailure(err);
+      this.report(
+        'compaction',
+        `could not compact ${this.path} (${describe(err)}) — every record is retained and the ` +
+          `rewrite is retried on a later append`,
+      );
     }
     return rec;
   }
 
   /**
-   * A compaction that keeps failing fails on every append. Throttle the diagnostic to one line a
-   * minute — the same class throttle index.ts uses — so that a squatted temp path or a full disk
-   * cannot bury the store's other diagnostics under one line per message.
+   * A failure that keeps failing fails on every append. Throttle the diagnostic per `kind` to one
+   * line a minute — the same class throttle index.ts uses — so that a squatted temp path or a full
+   * disk cannot bury the store's other diagnostics under one line per message.
    */
-  private reportCompactionFailure(err: unknown): void {
+  private report(kind: string, message: string): void {
     const now = Date.now();
-    if (now - this.lastCompactReportAt < 60_000) return;
-    this.lastCompactReportAt = now;
-    process.stderr.write(
-      `parley-telegram: could not compact ${this.path} ` +
-        `(${err instanceof Error ? err.message : String(err)}) — every record is retained and the ` +
-        `rewrite is retried on a later append\n`,
-    );
+    if (now - (this.lastReportAt.get(kind) ?? 0) < 60_000) return;
+    this.lastReportAt.set(kind, now);
+    process.stderr.write(`parley-telegram: ${message}\n`);
   }
 
   /**
@@ -411,13 +502,6 @@ export class ObservedStore {
     }
   }
 
-  /** The composite ids a previous compaction persisted (see {@link EVICTED_ID_LINE}). */
-  private parseEvicted(line: string): string[] {
-    const ids = JSON.parse(line.slice(EVICTED_ID_LINE.length)) as unknown;
-    if (!Array.isArray(ids)) return [];
-    return ids.filter((id): id is string => typeof id === 'string');
-  }
-
   /**
    * Compact once the dead lines on disk have grown to the live record count: the file then
    * stays within ~2x the in-memory bound while rewrites stay amortized O(1) per append.
@@ -444,10 +528,17 @@ export class ObservedStore {
    * A compaction is where the evicted records' LINES leave the file, so it carries the eviction
    * memory out with them ({@link EVICTED_ID_LINE}) — otherwise dedup would reach back only as far
    * as the file, and a restart right after a compaction would re-admit a redelivered message the
-   * bridge had already served.
+   * bridge had already served. The file's {@link epoch} and its {@link served} marks ride out the
+   * same way, and for the same reason.
+   *
+   * Only served chats this store still holds records for are carried: a chat with nothing to lose
+   * needs no protection, and that is what keeps the mark list bounded by the retained chat count
+   * instead of accumulating every chat ever named across every run.
    */
   private rewrite(): void {
-    const lines: string[] = [];
+    const lines: string[] = [`${EPOCH_LINE}${this.epochId}`];
+    const served = [...this.served].filter((id) => this.byChat.has(id));
+    if (served.length > 0) lines.push(`${SERVED_ID_LINE}${JSON.stringify(served)}`);
     if (this.evicted.size > 0) {
       lines.push(`${EVICTED_ID_LINE}${JSON.stringify([...this.evicted])}`);
     }
@@ -457,7 +548,7 @@ export class ObservedStore {
     const tmp = `${this.path}.tmp`;
     const fd = this.openTemp(tmp);
     try {
-      if (lines.length > 0) writeSync(fd, `${lines.join('\n')}\n`);
+      writeSync(fd, `${lines.join('\n')}\n`);
       fsyncSync(fd);
     } catch (err) {
       closeSync(fd);

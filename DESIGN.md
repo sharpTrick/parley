@@ -197,8 +197,11 @@ The same logical message can arrive twice — once via live push, once via `fetc
   - Telegram → the **local observation sequence** stamped by the observed-message store, NOT
     Telegram's per-chat `message_id` (which is minted when the sender's message is accepted, so
     one minted before our own post can be delivered after it and would sit below a cursor already
-    issued). `message_id` rides in the composite dedup key `<chat_id>:<message_id>` instead. The
-    Bot API exposes no history endpoint — no pre-join backfill; see §12 v0.6 caveat.
+    issued). `message_id` rides in the composite dedup key `<chat_id>:<message_id>` instead. That
+    sequence is per store FILE and restarts at 1, so the cursor is written `<store identity>.<seq>`
+    — a cursor minted by a store file this one did not inherit is refused rather than answered out
+    of an unrelated sequence space. The Bot API exposes no history endpoint — no pre-join backfill;
+    see §12 v0.6 caveat.
   - Slack → per-channel message `ts` (compared integer-wise, never as float/lexical).
 - The cursor is **opaque to core** and **keyed by `topic`**. The plugin decides the real
   granularity.

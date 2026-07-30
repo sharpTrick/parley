@@ -634,16 +634,23 @@ describe('telegram unconfigured-chat ingest', () => {
    * make the operator's own messages undeliverable — the update is acknowledged to Telegram the
    * moment it is read, so a refused record is gone for good.
    */
+  /**
+   * The third axis is the RESTART, because the protection has to be durable to be worth anything:
+   * `chat_map` is re-declared on every connect, a topic named only by a seam call is not, and the
+   * load-time chat cap runs before any seam call could name one. A protection that lived only in
+   * this process's memory would hand the operator's own history to the flood at the next restart —
+   * and the Bot API has no endpoint that could ever put it back.
+   */
   const STARVATION_CELLS = (['never', 'fetchRecent', 'subscribe', 'post'] as const).flatMap(
     (firstCall) =>
       (['before', 'after'] as const)
         .filter((flood) => !(firstCall === 'never' && flood === 'after'))
-        .map((flood) => ({ firstCall, flood })),
+        .flatMap((flood) => [false, true].map((coldRestart) => ({ firstCall, flood, coldRestart }))),
   );
 
   it.each(STARVATION_CELLS)(
-    'keeps the operator message when the topic is first named by $firstCall and the flood lands $flood it',
-    async ({ firstCall, flood }) => {
+    'keeps the operator message when the topic is first named by $firstCall, the flood lands $flood it, cold restart: $coldRestart',
+    async ({ firstCall, flood, coldRestart }) => {
       const rig = await startRig(STARVATION_CONFIG);
       const topic = asTopic(OPS_CHAT);
       const runFirstCall = async (): Promise<void> => {
@@ -665,8 +672,14 @@ describe('telegram unconfigured-chat ingest', () => {
       }
 
       expect(await contentsOf(rig.plugin, topic)).toContain('mine');
+      if (!coldRestart) return;
+      // Nothing may re-declare the topic in the new process before the flood arrives in it: the
+      // mark the previous run left on the file is the only thing that can be protecting it here.
+      const cold = { ...rig, plugin: await restart(rig) };
+      await floodAndWait(cold);
+      expect(await contentsOf(cold.plugin, topic)).toContain('mine');
     },
-    20_000,
+    30_000,
   );
 
   /**

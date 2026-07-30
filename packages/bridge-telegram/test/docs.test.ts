@@ -3,13 +3,15 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
 import {
   captureStderr,
   connectTo,
+  type Rig,
   registerCleanup,
+  seqOf,
   startFake,
   startRig,
   storePath,
@@ -41,6 +43,15 @@ describe('telegram shipped metadata matches the seam mapping', () => {
     { name: 'the npm description', text: () => pkg.description },
     { name: 'the README cursor row', text: () => cursorRow },
     {
+      name: 'the root README backend table row',
+      text: () => {
+        const root = readFileSync(join(here, '..', '..', '..', 'README.md'), 'utf8');
+        const row = root.split('\n').find((l) => l.startsWith('| Telegram |')) ?? '';
+        expect(row).not.toBe('');
+        return row;
+      },
+    },
+    {
       name: 'the DESIGN backend-cursor row',
       text: () => {
         const design = readFileSync(join(here, '..', '..', '..', 'DESIGN.md'), 'utf8');
@@ -71,7 +82,7 @@ describe('telegram shipped metadata matches the seam mapping', () => {
     expect(message?.backendMsgId).toBe(id);
     const messageId = (id as string).split(':')[1];
     expect(messageId).toBe('1');
-    expect(message?.cursor).toBe('3');
+    expect(seqOf(message?.cursor as string)).toBe(3);
     expect(message?.cursor).not.toBe(messageId);
   }, 20_000);
 });
@@ -130,6 +141,107 @@ describe('telegram config keys name the unit they bound', () => {
     const page = await plugin.fetchRecent({ topic, limit: 100 });
     expect(page.messages).toHaveLength(kept);
   }, 20_000);
+});
+
+/**
+ * A README sentence asserting an ABSOLUTE — "never evicts", "at most", "max distinct" — is the kind
+ * of claim nothing else in the suite can fail on, and both of this package's chat-cap absolutes
+ * used to be false in opposite directions: `observed_max_chats` documented a bound on the store's
+ * TOTAL chats while a served chat is admitted past it (an operator sizing disk from the row is
+ * under-provisioned), and "never evicts a chat this bridge serves ... on load or at runtime" did
+ * not survive a restart for a chat only a seam call had named (an operator trusting the row loses
+ * history the Bot API cannot backfill). So each absolute is bound to an EXECUTED cell: the
+ * retention the plugin actually delivers, measured across a cold restart, against what the row
+ * promises. A prose-only absolute is a claim that has not been graded.
+ */
+describe('telegram chat-cap claims are executed, not just written', () => {
+  const capRow = readme.split('\n').find((l) => l.startsWith('| `observed_max_chats`')) ?? '';
+  /** The whole markdown bullet a claim sits in — a promise is rarely one line long. */
+  const bulletContaining = (needle: RegExp): string => {
+    const lines = readme.split('\n');
+    const start = lines.findIndex((l) => l.startsWith('- ') && needle.test(l));
+    if (start < 0) return '';
+    const end = lines.findIndex((l, i) => i > start && !l.startsWith('  '));
+    return lines.slice(start, end < 0 ? undefined : end).join(' ');
+  };
+  const neverEvicts = bulletContaining(/never evicts/);
+
+  const ABSOLUTES = [
+    {
+      what: 'the observed_max_chats row',
+      claim: () => capRow,
+      // The cap bounds the chats a flood creates, never the store's total — the served chats are
+      // exactly the ones it must not evict, so it cannot bound a number that includes them.
+      requires: /unserved/i,
+      forbids: /max distinct chats kept in the store/i,
+    },
+    {
+      what: 'the never-evict bullet',
+      claim: () => neverEvicts,
+      // "on load" is only true if the mark outlives the process that made it.
+      requires: /store file|persist|restart|next load/i,
+      forbids: null,
+    },
+  ];
+
+  it.each(ABSOLUTES)('$what states the limit of its absolute', ({ claim, requires, forbids }) => {
+    const text = claim();
+    expect(text).not.toBe('');
+    expect(text).toMatch(requires);
+    if (forbids !== null) expect(text).not.toMatch(forbids);
+  });
+
+  const CAP = 2;
+  const SENTINEL = '-1009881111';
+  const OPS_CHATS = ['-1009880001', '-1009880002'];
+  const FLOOD_CHATS = Array.from({ length: 6 }, (_, i) => `-99880${i}`);
+
+  const contents = async (plugin: TelegramPlugin, chat: string): Promise<string[]> =>
+    (await plugin.fetchRecent({ topic: asTopic(chat), limit: 100 })).messages.map((m) => m.content);
+
+  /**
+   * Park until the ingestion loop has consumed everything injected so far, WITHOUT naming any chat
+   * under test — asking after a chat is itself a seam call that serves it, which is the protection
+   * being measured. The sentinel is served from `chat_map`, so polling it changes nothing.
+   */
+  const drain = async (rig: Rig, marker: string): Promise<void> => {
+    rig.fake.injectUserMessage(SENTINEL, 'ops', marker);
+    await vi.waitFor(async () => expect(await contents(rig.plugin, 'sentinel')).toContain(marker), {
+      timeout: 8000,
+      interval: 20,
+    });
+  };
+
+  it('bounds the chats nobody serves at the documented cap, at runtime and after a restart', async () => {
+    const rig = await startRig({ observed_max_chats: CAP, chat_map: { sentinel: SENTINEL } });
+    for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `flood-${c}`);
+    await drain(rig, 'settled');
+
+    await rig.plugin.disconnect();
+    const restarted = await rig.restart();
+    // Measured last, and only once: asking after a chat names it, which would protect it.
+    const kept: string[] = [];
+    for (const c of FLOOD_CHATS) {
+      if ((await contents(restarted, c)).length > 0) kept.push(c);
+    }
+    expect(kept.length).toBeLessThanOrEqual(CAP);
+    expect(kept.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('keeps a chat a seam call named on load, not only while the process that named it lives', async () => {
+    const rig = await startRig({ observed_max_chats: 1, chat_map: { sentinel: SENTINEL } });
+    for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `flood-${c}`);
+    await drain(rig, 'before');
+    // A seam call — not `chat_map` — is what names these, which is the half the bullet's
+    // "or one a seam call has named ... on load" is about.
+    for (const c of OPS_CHATS) await rig.plugin.post(asTopic(c), SENDER, 'mine');
+    for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `more-${c}`);
+    await drain(rig, 'after');
+
+    await rig.plugin.disconnect();
+    const restarted = await rig.restart();
+    for (const c of OPS_CHATS) expect(await contents(restarted, c)).toContain('mine');
+  }, 30_000);
 });
 
 /**

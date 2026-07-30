@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, vi } from 'vitest';
+import { afterEach, expect, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { type FakeTelegram, startFakeTelegram } from './fake-telegram.js';
 
@@ -109,6 +109,20 @@ export async function openRig(
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/** Matches a cursor this plugin issues: the store file's identity, then its observation sequence. */
+export const QUALIFIED_CURSOR = /^[0-9a-f]{16}\.\d+$/;
+
+/**
+ * The observation sequence a cursor names, asserting the qualified shape on the way through. A
+ * cursor is `<store epoch>.<seq>`, and the epoch half is what makes a cursor minted by a store file
+ * this one did not inherit refusable — so a test that compared cursors with `Number()` would read
+ * every one of them as `NaN` and compare nothing.
+ */
+export function seqOf(cursor: string): number {
+  expect(cursor).toMatch(QUALIFIED_CURSOR);
+  return Number(cursor.split('.')[1]);
 }
 
 /** Capture stderr diagnostics without letting them pollute the test output. */

@@ -216,7 +216,7 @@ binary and a `backend_config` block, not a line of participant code.
 | Zulip | event-queue long-poll (raw `fetch`) | message id | `fake-conformance` + operator-run |
 | Discord | gateway websocket (raw `ws`) | snowflake (Discord's time-sortable id) | `fake-conformance` |
 | Slack | Socket Mode websocket (raw `ws`) | `ts` | `fake-conformance` |
-| Telegram | Bot API `getUpdates` + local observed store | per-chat `message_id` | `fake-conformance` |
+| Telegram | Bot API `getUpdates` + local observed store | local observation sequence, qualified by the store file (`<id>.<seq>`) | `fake-conformance` |
 
 - **`live`** — exercised against real implementations in CI/dev: SQLite on a real on-disk file, real Redis/NATS binaries, live Synapse/Prosody homeservers, and Postgres 16 (SQLite, Redis, Matrix, NATS, XMPP, Postgres — 6 of 10).
 - **`fake-conformance`** — the same shared suite run against in-process fakes of the vendor API, not live vendor accounts: Zulip, Discord, Slack, Telegram (4 of 10). Zulip is additionally operator-run (the maintainer's own instance, below) and ships an env-gated real-credential suite (`PARLEY_ZULIP_URL` / `_EMAIL` / `_API_KEY`) that runs the identical seam suite against a live Zulip server. Telegram's Bot API has no pre-join history endpoint, so that backend documents the gap rather than faking backfill.

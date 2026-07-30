@@ -446,6 +446,120 @@ describe('telegram ObservedStore durability', () => {
   );
 
   /**
+   * `serve()` is how a topic named only by a SEAM CALL earns its protection — `chat_map` is
+   * re-declared on every construction, that is not. So the mark has to outlive the process: a
+   * protection rebuilt from the constructor argument alone evaporates at the next load, where the
+   * chat cap runs before any seam call could name a topic and evicts the operator's own history —
+   * which the Bot API has no endpoint to backfill.
+   *
+   * Every cell serves MORE chats than the cap admits and interleaves the flood through them, so a
+   * served chat is the oldest, the newest, and somewhere in between — the load-time cap would take
+   * the oldest first if the mark were gone. The reload passes NO served argument at all: what is
+   * under test is what the FILE carries, which is the half `chat_map` cannot stand in for.
+   */
+  const SERVED_PERSISTENCE_CASES = [
+    { served: 3, flood: 5, maxChats: 2 },
+    { served: 2, flood: 0, maxChats: 1 },
+    { served: 4, flood: 6, maxChats: 3 },
+    { served: 2, flood: 3, maxChats: 1 },
+    { served: 5, flood: 2, maxChats: 4 },
+  ];
+
+  it.each(SERVED_PERSISTENCE_CASES)(
+    '$served chats served at runtime keep their records across a reload under a cap of $maxChats',
+    ({ served, flood, maxChats }) => {
+      const servedIds = Array.from({ length: served }, (_, i) => `-70${i}`);
+      const floodIds = Array.from({ length: flood }, (_, i) => `-91${i}`);
+      const writer = new ObservedStore(path, 10, maxChats);
+      let mid = 0;
+      for (let i = 0; i < Math.max(served, flood); i++) {
+        const servedId = servedIds[i];
+        if (servedId !== undefined) {
+          writer.serve(servedId);
+          expect(writer.append(record(servedId, ++mid, `m-${servedId}`))).toBeDefined();
+        }
+        const floodId = floodIds[i];
+        // A flood append may be admitted, may displace another flood chat, or may be refused
+        // outright once every retained chat is served — all three are the cap doing its job.
+        if (floodId !== undefined) writer.append(record(floodId, ++mid, `f-${floodId}`));
+      }
+      writer.close();
+
+      const reloaded = new ObservedStore(path, 10, maxChats);
+      for (const id of servedIds) {
+        expect(reloaded.entries(id).map((r) => r.content)).toEqual([`m-${id}`]);
+      }
+      // The cap still bounds the chats nobody serves — protection is not a licence to keep
+      // everything, and a store over the cap on served chats alone has no room left for them.
+      const keptFlood = floodIds.filter((id) => reloaded.entries(id).length > 0);
+      expect(keptFlood.length).toBe(Math.max(0, maxChats - served));
+      // And it survives a SECOND reload: the mark is rewritten, not merely read once.
+      reloaded.close();
+      const again = new ObservedStore(path, 10, maxChats);
+      for (const id of servedIds) {
+        expect(again.entries(id).map((r) => r.content)).toEqual([`m-${id}`]);
+      }
+      again.close();
+    },
+  );
+
+  /**
+   * The identity of the store FILE, which is what makes a cursor from a store this one did not
+   * inherit refusable however far this store's own sequence has since climbed. It must be stable
+   * across reloads and across the compaction that rewrites every other line, and two files must
+   * never share one.
+   */
+  it('keeps one stable identity per store file, and mints a distinct one per file', () => {
+    const store = new ObservedStore(path, 2, 10);
+    const identity = store.epoch();
+    expect(identity).toMatch(/^[0-9a-f]{16}$/);
+    for (let i = 1; i <= 8; i++) expect(store.append(record('-1', i, `m${i}`))).toBeDefined();
+    // Compaction rewrites the whole file; the identity is not a line it may drop.
+    expect(store.epoch()).toBe(identity);
+    store.close();
+
+    const reloaded = new ObservedStore(path, 2, 10);
+    expect(reloaded.epoch()).toBe(identity);
+    reloaded.close();
+
+    const other = new ObservedStore(join(dir, 'other.jsonl'), 2, 10);
+    expect(other.epoch()).not.toBe(identity);
+    other.close();
+  });
+
+  /**
+   * Every way the identity line itself can be lost or damaged. A store that adopted a garbled one
+   * would answer a stale cursor out of a sequence space that cursor was never minted against.
+   */
+  const IDENTITY_DAMAGE = [
+    { name: 'the line removed', line: undefined },
+    { name: 'a truncated identity', line: '#epoch abc' },
+    { name: 'an over-long identity', line: '#epoch 00112233445566778899' },
+    { name: 'a non-hex identity', line: '#epoch zzzzzzzzzzzzzzzz' },
+    { name: 'an empty identity', line: '#epoch ' },
+  ];
+
+  it.each(IDENTITY_DAMAGE)('mints a fresh identity when the file carries $name', ({ line }) => {
+    const store = new ObservedStore(path, 10, 10);
+    const identity = store.epoch();
+    expect(store.append(record('-1', 1, 'a'))).toBeDefined();
+    store.close();
+
+    const kept = readFileSync(path, 'utf8')
+      .trimEnd()
+      .split('\n')
+      .filter((l) => !l.startsWith('#epoch'));
+    writeFileSync(path, `${[...(line === undefined ? [] : [line]), ...kept].join('\n')}\n`);
+
+    const reloaded = new ObservedStore(path, 10, 10);
+    expect(reloaded.epoch()).toMatch(/^[0-9a-f]{16}$/);
+    expect(reloaded.epoch()).not.toBe(identity);
+    // The records themselves are untouched — only the cursors minted against them are invalidated.
+    expect(reloaded.entries('-1').map((r) => r.content)).toEqual(['a']);
+    reloaded.close();
+  });
+
+  /**
    * The cursor is the store's own observation sequence, not Telegram's `message_id`: it must be
    * strictly increasing in the order records were APPENDED even when the ids they carry are not,
    * and it must survive a reload — a cursor an agent holds outlives the process that issued it.

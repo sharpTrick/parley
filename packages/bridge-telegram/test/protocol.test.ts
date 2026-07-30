@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { captureStderr, connectTo as connectPlugin, startFake, storePath } from './rig.js';
+import { captureStderr, connectTo as connectPlugin, seqOf, startFake, storePath } from './rig.js';
 import { ObservedStore } from '../src/store.js';
 import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
 
@@ -630,7 +630,7 @@ describe('telegram fetchRecent limit normalization', () => {
     const empty = asTopic('-1009900002');
     const topic = asTopic('-1009900001');
     // An empty topic has no tail to report, on any limit.
-    expect((await plugin.fetchRecent({ topic: empty, limit })).nextCursor).toBe('0');
+    expect(seqOf((await plugin.fetchRecent({ topic: empty, limit })).nextCursor)).toBe(0);
     for (const c of POSTED) await plugin.post(topic, SENDER, c);
 
     const cap = (n: number): number => (limit === undefined ? n : Math.max(0, Math.min(limit, n)));
@@ -654,7 +654,7 @@ describe('telegram fetchRecent limit normalization', () => {
       POSTED.slice(1, 1 + cap(POSTED.length - 1)),
     );
     // The cursor never regresses, whatever the limit.
-    expect(Number(tail.nextCursor)).toBeGreaterThanOrEqual(Number(since));
+    expect(seqOf(tail.nextCursor)).toBeGreaterThanOrEqual(seqOf(since));
   });
 
   /**
@@ -688,7 +688,7 @@ describe('telegram fetchRecent limit normalization', () => {
       const expected = ['b', 'c'].slice(0, limit === undefined ? 2 : Math.max(0, limit));
       expect(served.messages.map((m) => m.content)).toEqual(expected);
       // An empty page never moves the caller backwards, so the next catch-up still finds b and c.
-      expect(Number(served.nextCursor)).toBeGreaterThanOrEqual(Number(head));
+      expect(seqOf(served.nextCursor)).toBeGreaterThanOrEqual(seqOf(head));
       const next = await plugin.fetchRecent({ topic, since: served.nextCursor, limit: 100 });
       expect([...served.messages, ...next.messages].map((m) => m.content)).toEqual(['b', 'c']);
 
