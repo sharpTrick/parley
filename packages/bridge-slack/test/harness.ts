@@ -81,6 +81,18 @@ export function deliver(fake: FakeSlack, topic: Topic | string, text: string): v
   fake.pushEvent(channel, { ts: created!.ts, text, user: 'U0PARLEY' });
 }
 
+/**
+ * Native long-polls the plugin still has parked, read off the registry itself because the seam has
+ * no surface for it. A settled `fetchRecent({blockMs})` must leave none: a waiter that outlives its
+ * call holds a live timer and is iterated by every later live event on that channel, and NOTHING
+ * else in the suite can observe either — the registry's two lifecycle guards were both deletable
+ * with the suite green.
+ */
+export function parkedWaiters(plugin: SlackPlugin): number {
+  const { waiters } = plugin as unknown as { waiters: Map<string, Set<unknown>> };
+  return [...waiters.values()].reduce((total, set) => total + set.size, 0);
+}
+
 export type Settled<T> =
   | { status: 'fulfilled'; value: T }
   | { status: 'rejected'; reason: unknown }

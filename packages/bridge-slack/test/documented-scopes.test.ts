@@ -22,6 +22,8 @@ import {
   HISTORY_PAGE_LIMIT,
   MAX_DIAL_BACKOFF_MS,
   MAX_HISTORY_PAGES,
+  MAX_TIMER_MS,
+  TIMER_CONFIG_KEYS,
 } from '../src/index.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -162,9 +164,43 @@ describe('slack rate-limit docs track the shared helper', () => {
     // figures an operator sizes `block_max_ms` from.
     expect(text, 'still claims a logarithmic bound').not.toMatch(/O\(log/);
     expect(text).toContain('4 + block_ms / MAX_DIAL_BACKOFF_MS');
+    // The claim is only true because each rung resumes where the last read stopped; when it did
+    // not, the real figure was that bound MULTIPLIED by the pages above the caller's cursor.
+    const prose = text.replace(/\s+/g, ' ');
+    expect(prose, 'the per-rung resume is not stated').toMatch(
+      /Each rung resumes from the position the previous read walked to/,
+    );
+    expect(prose).toMatch(/\*\*once\*\* rather than once per rung/);
     expect(text).toContain(`${rungStarts(60_000).length} reads and dials`);
     expect(text).toContain(`~${rungStarts(MAX_BLOCK_MS).length} of each`);
     expect(text).toMatch(/\*\*linear\*\*, not logarithmic/);
+  });
+});
+
+/**
+ * CLASS: a load-time rule stated in prose. An operator reads the config section to find out which
+ * values are refused and which merely warn, and both answers live in the code — a README that
+ * quotes a ceiling the validator does not enforce sends them to debug the wrong layer.
+ */
+describe('slack config docs track what connect() actually enforces', () => {
+  const configSection = (): string => {
+    const found = /## Config \(`backend_config`\)([\s\S]*?)\n## /.exec(read('../README.md'));
+    expect(found, 'README has no Config section').not.toBeNull();
+    return found![1]!;
+  };
+
+  it('names the timer ceiling by value and every knob it applies to', () => {
+    const text = configSection();
+    expect(text, 'timer ceiling value missing').toContain(String(MAX_TIMER_MS));
+    for (const key of TIMER_CONFIG_KEYS) expect(text, `${key} undocumented`).toContain(key);
+  });
+
+  it('states that a plaintext remote api_url warns rather than fails, and what it leaks', () => {
+    const text = configSection();
+    expect(text).toMatch(/api_url/);
+    expect(text).toMatch(/warns/);
+    expect(text).toMatch(/loopback/);
+    expect(text).toMatch(/in the clear/);
   });
 });
 

@@ -198,7 +198,12 @@ describe('Slack api() form-encodes every method (read-method args survive)', () 
         await plugin.connect({ api_url: url, bot_token: 'xoxb-test' });
         const call = plugin.resolveIdentity(asHandle('alice@example.com'));
         if (outcome.passthrough) {
-          expect((await call).backendRef).toBe('alice@example.com');
+          // The WHOLE identity, not one field of it: a seam method whose return value no row states
+          // in full is one whose branches can be rewritten with the suite still green.
+          expect(await call).toEqual({
+            handle: 'alice@example.com',
+            backendRef: 'alice@example.com',
+          });
         } else {
           await expect(call).rejects.toThrow(new RegExp(outcome.reply));
         }

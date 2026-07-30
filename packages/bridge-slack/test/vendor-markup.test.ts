@@ -189,6 +189,98 @@ describe('slack escaping helpers', () => {
 });
 
 /**
+ * CLASS: a vendor-markup rewrite applied to UNBOUNDED untrusted text. Slack's own `text` limit is
+ * 40 000 characters, so every string below is a message anyone who can post in a mapped channel may
+ * legally send — and the rewrite runs on it inside `ws.on('message')` as well as on the history
+ * walk, i.e. on the single thread that also owes Slack an ack for every envelope. A pattern whose
+ * scan from one `<` can run past the next one costs O(n²) on exactly these shapes: 40 000
+ * characters of `<@` measured 1.5 s of fully blocked event loop, and one page of them over a minute.
+ *
+ * The rows are the START SHAPES a mention pattern can anchor on, crossed with length, because what
+ * makes the cost quadratic is the number of overlapping start positions rather than any one match.
+ * Time is the only observable — every row returns its text either way — so each asserts a per-
+ * message wall-clock budget on BOTH delivery paths, and that the socket is still serving afterwards.
+ * The next transport with its own markup inherits the table with its own units.
+ */
+const FLOOD_UNITS: Array<{ name: string; unit: string }> = [
+  { name: 'unterminated user mentions', unit: '<@' },
+  { name: 'unterminated broadcasts', unit: '<!' },
+  { name: 'unterminated labelled mentions', unit: '<@x|' },
+  { name: 'unterminated mentions with an empty body', unit: '<@|' },
+  { name: 'unterminated usergroups', unit: '<!subteam^' },
+  { name: 'unterminated channel links', unit: '<#' },
+  { name: 'bare less-thans', unit: '<' },
+  { name: 'bare ampersands', unit: '&' },
+  { name: 'complete mentions', unit: '<@U0BOSS>' },
+  { name: 'complete broadcasts', unit: '<!here>' },
+];
+
+/** Slack's own `text` ceiling is the largest a real workspace can hand us. */
+const FLOOD_LENGTHS = [10_000, 40_000];
+
+/** Wall clock one message of vendor markup may cost. Linear rewriting spends under 1 ms at 40 000. */
+const FLOOD_BUDGET_MS = 20;
+
+const floodTexts = (length: number): string[] =>
+  FLOOD_UNITS.map(({ unit }) => unit.repeat(Math.ceil(length / unit.length)).slice(0, length));
+
+describe('slack mention rewrite stays linear in the length of untrusted text', () => {
+  for (const length of FLOOD_LENGTHS) {
+    const budget = FLOOD_UNITS.length * FLOOD_BUDGET_MS;
+
+    it(`history: a page of ${length}-character floods costs under ${budget} ms`, async () => {
+      await withPlugin(async (fake, plugin) => {
+        const topic = asTopic('C0FLOODHIST');
+        const texts = floodTexts(length);
+        fake.seed(
+          topic,
+          texts.map((text) => ({ text })),
+        );
+
+        const t0 = Date.now();
+        const { messages } = await plugin.fetchRecent({ topic, limit: 100 });
+        const elapsed = Date.now() - t0;
+
+        expect(messages).toHaveLength(texts.length);
+        expect(elapsed, `${texts.length} messages of ${length} chars`).toBeLessThan(budget);
+      });
+    });
+
+    it(`live push: the same floods are delivered under ${budget} ms and the socket keeps serving`, async () => {
+      await withPlugin(async (fake, plugin) => {
+        const topic = asTopic('C0FLOODLIVE');
+        fake.createChannel(topic);
+        const live: Message[] = [];
+        await plugin.subscribe(topic, (m) => live.push(m));
+
+        const texts = floodTexts(length);
+        const t0 = Date.now();
+        const pushed = texts.map((text) => fake.pushEvent(topic, { ts: fake.mintTs(), text }));
+        await vi.waitFor(() => expect(live).toHaveLength(texts.length), {
+          timeout: 8000,
+          interval: 5,
+        });
+        expect(Date.now() - t0, `${texts.length} envelopes of ${length} chars`).toBeLessThan(budget);
+
+        // A blocked event loop starves the ack, which is what makes Slack redeliver and then drop
+        // the connection — so the ack is graded, not just the delivery.
+        await vi.waitFor(
+          () => {
+            for (const id of pushed) expect(fake.acked.has(id), `ack for ${id}`).toBe(true);
+          },
+          { timeout: 4000, interval: 5 },
+        );
+        await plugin.post(topic, asHandle('writer'), 'still alive');
+        await vi.waitFor(() => expect(live.at(-1)?.content).toBe('still alive'), {
+          timeout: 4000,
+          interval: 5,
+        });
+      });
+    });
+  }
+});
+
+/**
  * The fake refuses un-escaped markup, and that refusal is itself a guard that can rot. Drive it
  * directly, so a fake that silently stopped grading fails HERE instead of greening every row above.
  */

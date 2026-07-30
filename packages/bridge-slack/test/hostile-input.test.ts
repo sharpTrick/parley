@@ -12,8 +12,10 @@
  *     because the cursor never advances past the record that caused it.
  */
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { compareTs, SlackPlugin, TS_RE } from '../src/index.js';
+import { compareTs, MAX_TIMER_MS, SlackPlugin, TIMER_CONFIG_KEYS, TS_RE } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 import { capture } from './harness.js';
 
@@ -268,6 +270,128 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
 });
 
 /**
+ * CLASS: every `backend_config` value the declared TypeScript type cannot enforce at run time.
+ * `backend_config` is `z.record(z.unknown())` in core, so a number knob arrives unchecked and a
+ * string knob may not be a string at all — and each one lands somewhere that fails silently rather
+ * than loudly: a delay outside Node's timer range clamps to 1 ms (so the bound the knob exists to
+ * SET is the one thing it cannot express), and a URL is where every credentialed call is sent.
+ *
+ * The timer rows are derived from the interface rather than listed, so a knob added without a
+ * validation row fails HERE rather than reaching `setTimeout` unchecked.
+ */
+describe('slack backend_config knobs that reach a timer fail at load', () => {
+  /** The `?: number` keys `SlackBackendConfig` declares, read out of the source that declares them. */
+  function numericConfigKeysInSource(): string[] {
+    const src = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
+    const body = /export interface SlackBackendConfig \{([\s\S]*?)\n\}/.exec(src);
+    expect(body, 'SlackBackendConfig interface not found in src/index.ts').not.toBeNull();
+    return [...body![1]!.matchAll(/^ {2}(\w+)\?: number;$/gm)].map((m) => m[1]!);
+  }
+
+  it('every numeric knob the interface declares is validated', () => {
+    const declared = numericConfigKeysInSource();
+    // Both sides non-empty: an equality between two empty sets validates nothing.
+    expect(declared.length, 'numeric knobs found in the interface').toBeGreaterThan(0);
+    expect(new Set(TIMER_CONFIG_KEYS)).toEqual(new Set(declared));
+  });
+
+  /** Values `setTimeout` cannot use as the delay they claim to be — each clamps, wraps or throws. */
+  const UNUSABLE_DELAYS = [0, -1, 1.5, NaN, Infinity, 2 ** 31, 2 ** 53, '10000', null, {}];
+
+  for (const key of TIMER_CONFIG_KEYS) {
+    for (const bad of UNUSABLE_DELAYS) {
+      it(`rejects ${key} of ${JSON.stringify(bad) ?? String(bad)}, naming the key and the range`, async () => {
+        const plugin = new SlackPlugin();
+        await expect(
+          plugin.connect({ api_url: 'http://127.0.0.1:1/api', [key]: bad } as unknown as Record<
+            string,
+            unknown
+          >),
+        ).rejects.toThrow(new RegExp(`${key}[\\s\\S]*at most ${MAX_TIMER_MS}`));
+      });
+    }
+
+    it(`accepts ${key} across the usable range`, async () => {
+      for (const good of [1, 10_000, MAX_TIMER_MS]) {
+        const plugin = new SlackPlugin();
+        await plugin.connect({ api_url: 'http://127.0.0.1:1/api', [key]: good });
+        await plugin.disconnect();
+      }
+    });
+  }
+});
+
+/**
+ * CLASS: a credentialed endpoint taken from `backend_config`. Every backend in this repo takes one
+ * under its own key (`api_url`, `homeserver_url`, `site_url`, …), and each has the same two
+ * failure modes: a value that is not a URL at all, which must fail at LOAD naming the key rather
+ * than as a `TypeError` from inside the plugin; and a plaintext remote origin, which ships the
+ * bearer tokens across the network in the clear and must WARN, because nothing else about it fails.
+ * Loopback is the fixture case and stays silent — but only when the host really is loopback, which
+ * is why a DNS name shaped like one is a warning row rather than an excused one.
+ */
+describe('slack api_url: rejected when unusable, warned when it would leak the tokens', () => {
+  const CREDENTIALED_URLS: Array<{ url: unknown; outcome: 'silent' | 'warns' | 'rejects' }> = [
+    { url: undefined, outcome: 'silent' },
+    { url: 'https://slack.com/api', outcome: 'silent' },
+    { url: 'https://logger.internal.example/api', outcome: 'silent' },
+    { url: 'http://127.0.0.1:1/api', outcome: 'silent' },
+    { url: 'http://127.5.5.5/api', outcome: 'silent' },
+    { url: 'http://localhost:1234/api', outcome: 'silent' },
+    { url: 'http://[::1]:1234/api', outcome: 'silent' },
+    { url: 'http://logger.internal.example/api', outcome: 'warns' },
+    { url: 'http://10.0.0.5/api', outcome: 'warns' },
+    // Shaped like loopback, resolved like any other name: a prefix match would excuse both.
+    { url: 'http://127.0.0.1.example.com/api', outcome: 'warns' },
+    { url: 'http://localhost.example.com/api', outcome: 'warns' },
+    { url: '', outcome: 'rejects' },
+    { url: 'not-a-url', outcome: 'rejects' },
+    { url: 'ftp://example.com/api', outcome: 'rejects' },
+    { url: '//example.com/api', outcome: 'rejects' },
+    { url: 42, outcome: 'rejects' },
+    { url: null, outcome: 'rejects' },
+    { url: {}, outcome: 'rejects' },
+    { url: ['http://example.com/api'], outcome: 'rejects' },
+  ];
+
+  for (const row of CREDENTIALED_URLS) {
+    it(`${JSON.stringify(row.url) ?? 'an omitted api_url'} ${row.outcome}`, async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const plugin = new SlackPlugin();
+      const config = {
+        bot_token: 'xoxb-secret',
+        app_token: 'xapp-secret',
+        ...(row.url === undefined ? {} : { api_url: row.url }),
+      } as unknown as Record<string, unknown>;
+      try {
+        if (row.outcome === 'rejects') {
+          await expect(plugin.connect(config)).rejects.toThrow(/api_url[\s\S]*http\(s\) URL/);
+          expect(warn, 'a refused config warns about nothing').not.toHaveBeenCalled();
+          return;
+        }
+        await plugin.connect(config);
+        const said = warn.mock.calls.map((c) => String(c[0])).join('\n');
+        if (row.outcome === 'silent') {
+          expect(said, 'warned about a safe endpoint').toBe('');
+          return;
+        }
+        // The operator has to be able to act on it: which key, which origin, and what leaks.
+        expect(said).toContain('api_url');
+        expect(said).toContain(new URL(String(row.url)).origin);
+        expect(said).toContain('bot_token');
+        expect(said).toContain('app_token');
+        // Never the credentials themselves — a warning that leaks them into the log is the defect.
+        expect(said).not.toContain('xoxb-secret');
+        expect(said).not.toContain('xapp-secret');
+      } finally {
+        await plugin.disconnect();
+        warn.mockRestore();
+      }
+    });
+  }
+});
+
+/**
  * One bad record, at each position it can occupy in a page, with and without a `since`.
  * `surfacesAs` names the rows that are legitimately deliverable — a subtype-less entry with a
  * well-formed `ts` IS a message, however odd its text — so the table states which is which rather
@@ -326,6 +450,36 @@ const BAD_ENTRIES: Array<{ name: string; entry: unknown; surfacesAs?: string }> 
     name: 'bot_id only',
     entry: { type: 'message', ts: '1700000000.000006', text: 'app post', bot_id: 'B0APP' },
     surfacesAs: 'app post',
+  },
+  // TEXT, not shape: the field this table used to hold fixed at a short literal. `text` is the one
+  // attacker-controlled field with real length behind it (Slack's own limit is 40 000 characters),
+  // and it is the field every rewrite runs over, so a page carrying one must still return promptly.
+  // `vendor-markup.test.ts` grades the cost; these rows keep the CLASSIFICATION honest for the
+  // lengths that reach it. Each is its own `ts`, so the expectations below stay position-independent.
+  {
+    name: 'a 40 000-character mention flood',
+    entry: {
+      type: 'message',
+      ts: '1700000000.000007',
+      text: '<@'.repeat(20_000),
+      user: 'U0',
+    },
+    surfacesAs: '<@'.repeat(20_000),
+  },
+  {
+    name: 'a 40 000-character unterminated mention',
+    entry: {
+      type: 'message',
+      ts: '1700000000.000008',
+      text: `<@${'a'.repeat(39_998)}`,
+      user: 'U0',
+    },
+    surfacesAs: `<@${'a'.repeat(39_998)}`,
+  },
+  {
+    name: 'a 40 000-character entity flood',
+    entry: { type: 'message', ts: '1700000000.000009', text: '&amp;'.repeat(8_000), user: 'U0' },
+    surfacesAs: '&'.repeat(8_000),
   },
 ];
 

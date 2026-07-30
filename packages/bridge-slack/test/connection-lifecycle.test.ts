@@ -498,6 +498,121 @@ describe('slack teardown racing an in-flight connect', () => {
     }
   });
 
+});
+
+/**
+ * The third lifecycle class: `connect` as a TRANSITION, not just an entry point.
+ */
+describe('slack connect is a session boundary, not a partial reset', () => {
+  /**
+   * CLASS: a lifecycle field the SECOND entry into a session forgets to reset. The table above adds
+   * `disconnect` as the transition and holds the entry state fixed; this adds `connect` as a second
+   * transition axis, because `connect` is where the config — and therefore the tokens every one of
+   * those fields belongs to — changes. A half-reset leaves the previous session's routes firing off
+   * a socket the new configuration never opened, its `auth.test` answer standing in for a different
+   * `bot_token`, and its reconnect loop parked in a backoff that a later `connect` un-parks: it
+   * wakes, sees `stopped` false again, and dials `apps.connections.open` for a session that asked
+   * for no live path at all.
+   *
+   * Each row reaches a state under session A and then connects session B over it; the assertions
+   * are the same four for every row, so a field that survives one transition and not another cannot
+   * hide in a row of its own.
+   */
+  const STALE_TOPIC = 'C0SESSA';
+  const FRESH_TOPIC = 'C0SESSB';
+
+  const sessionConfig = (fake: FakeSlack, token: string): Record<string, unknown> => ({
+    api_url: fake.apiUrl,
+    bot_token: token,
+    app_token: `xapp-${token}`,
+    handshake_timeout_ms: HANDSHAKE_MS,
+  });
+
+  const ENTRY_STATES: Array<{
+    name: string;
+    arrive: (fake: FakeSlack, plugin: SlackPlugin, stale: (content: string) => void) => Promise<void>;
+  }> = [
+    { name: 'cold', arrive: async () => undefined },
+    {
+      name: 'connected, subscribed',
+      arrive: async (fake, plugin, stale) => {
+        await plugin.connect(sessionConfig(fake, 'xoxb-a'));
+        await plugin.subscribe(asTopic(STALE_TOPIC), (m) => stale(m.content));
+        await plugin.resolveIdentity(asHandle('parley-bot'));
+      },
+    },
+    {
+      name: 'connected, subscribed, disconnected',
+      arrive: async (fake, plugin, stale) => {
+        await plugin.connect(sessionConfig(fake, 'xoxb-a'));
+        await plugin.subscribe(asTopic(STALE_TOPIC), (m) => stale(m.content));
+        await plugin.resolveIdentity(asHandle('parley-bot'));
+        await plugin.disconnect();
+      },
+    },
+    {
+      name: 'disconnected while a reconnect loop was parked in its backoff',
+      arrive: async (fake, plugin, stale) => {
+        await plugin.connect(sessionConfig(fake, 'xoxb-a'));
+        await plugin.subscribe(asTopic(STALE_TOPIC), (m) => stale(m.content));
+        await plugin.resolveIdentity(asHandle('parley-bot'));
+        // An ESTABLISHED loss hands the redial to a reconnect owner; the failure parks it in the
+        // backoff that outlives the teardown below.
+        fake.failMethod('apps.connections.open', 'internal_error');
+        fake.dropSockets();
+        await sleep(150);
+        await plugin.disconnect();
+      },
+    },
+  ];
+
+  for (const state of ENTRY_STATES) {
+    it(`connect from ${state.name} starts a session that inherits nothing`, async () => {
+      const fake = await FakeSlack.start();
+      const plugin = new SlackPlugin();
+      const stale: string[] = [];
+      const fresh: string[] = [];
+      fake.createChannel(STALE_TOPIC);
+      fake.createChannel(FRESH_TOPIC);
+      try {
+        await state.arrive(fake, plugin, (content) => stale.push(content));
+
+        await plugin.connect(sessionConfig(fake, 'xoxb-b'));
+        const dialsAtConnect = fake.hits('apps.connections.open');
+        const authsAtConnect = fake.hits('auth.test');
+
+        // (a) Nothing the new session did not ask for is open, and nothing it did not ask for dials.
+        // The wait is longer than the parked reconnect backoff, so a resurrected loop shows up here.
+        await sleep(800);
+        fake.failMethod('apps.connections.open', 'internal_error', 0);
+        expect(fake.liveSockets, 'sockets held by a session that has not subscribed').toBe(0);
+        expect(fake.hits('apps.connections.open'), 'unrequested dials').toBe(dialsAtConnect);
+
+        // (b) The previous session's handler is not on the new session's stream.
+        await plugin.post(asTopic(STALE_TOPIC), asHandle('writer'), 'after the boundary');
+        await sleep(200);
+        expect(stale, 'a retired handler fired').toEqual([]);
+
+        // (c) The previous session's memoized identity is not answered for the new bot_token.
+        await plugin.resolveIdentity(asHandle('parley-bot'));
+        expect(fake.hits('auth.test'), 'auth.test re-issued for the new token').toBe(
+          authsAtConnect + 1,
+        );
+
+        // (d) …and the new session is fully usable, so none of the above is true by being broken.
+        await plugin.subscribe(asTopic(FRESH_TOPIC), (m) => fresh.push(m.content));
+        await plugin.post(asTopic(FRESH_TOPIC), asHandle('writer'), 'live in the new session');
+        await vi.waitFor(() => expect(fresh).toEqual(['live in the new session']), {
+          timeout: 4000,
+          interval: 10,
+        });
+      } finally {
+        await plugin.disconnect();
+        await fake.close();
+      }
+    });
+  }
+
   it('a handler registered before a disconnect never fires on the next connection', async () => {
     const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0STALE', 'C0FRESH'] });
     const stale = asTopic('C0STALE');

@@ -37,9 +37,35 @@
  */
 import { asCursor, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { DIAL_BACKOFF_MS } from '../src/index.js';
+import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, type SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
-import { deliver, rungStarts, startSlack, withSlack } from './harness.js';
+import {
+  deliver,
+  parkedWaiters,
+  rungStarts,
+  startSlack,
+  withSlack,
+  type SlackHarnessOptions,
+} from './harness.js';
+
+/**
+ * REGISTRY HYGIENE, asserted after every blocking row in this file rather than as a point test: once
+ * a `fetchRecent({blockMs})` has settled — woken, timed out, aborted by `disconnect()`, or released
+ * by a socket loss — the plugin must hold no parked waiter, and therefore no live waiter timer. The
+ * tables below already drive all four exits, and none of them could see the registry at all: both of
+ * its lifecycle guards (the `wake()` on a satisfied re-query, the drain on a lost socket) were
+ * deletable with 504 tests green.
+ */
+async function withBlocking<T>(
+  opts: SlackHarnessOptions,
+  fn: (fake: FakeSlack, plugin: SlackPlugin) => Promise<T>,
+): Promise<T> {
+  return withSlack(opts, async (fake, plugin) => {
+    const result = await fn(fake, plugin);
+    expect(parkedWaiters(plugin), 'waiters still parked after the call settled').toBe(0);
+    return result;
+  });
+}
 
 /** Where in the blocking pipeline the message lands. `arm` schedules the injection. */
 const STAGES: Array<{ name: string; arm: (fake: FakeSlack, topic: Topic) => void }> = [
@@ -81,7 +107,7 @@ describe('slack blocking fetch: the lost-wakeup window', () => {
     for (const blockMs of [800, 3000]) {
       it(`wakes natively when the message lands ${stage.name} (blockMs=${blockMs})`, async () => {
         const topic = asTopic('C0WAKE');
-        await withSlack({ channels: [topic] }, async (fake, plugin) => {
+        await withBlocking({ channels: [topic] }, async (fake, plugin) => {
           stage.arm(fake, topic);
 
           const t0 = Date.now();
@@ -140,7 +166,7 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
   for (const row of ELIGIBILITY) {
     it(`${row.wakes ? 'wakes on' : 'stays parked through'} ${row.name}`, async () => {
       const topic = asTopic('C0FLOOR');
-      await withSlack({ channels: [topic, 'C0OTHER'] }, async (fake, plugin) => {
+      await withBlocking({ channels: [topic, 'C0OTHER'] }, async (fake, plugin) => {
         // The floor is a real `ts` above everything in history, so the first query is empty and the
         // call parks; nothing the rows land is fetchable below it either, so EVERY row's page is
         // empty and elapsed time is the only thing that separates a wake from a budget burn.
@@ -169,7 +195,7 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
 
   it('two waiters at different floors on one channel: only the eligible one wakes', async () => {
     const topic = asTopic('C0TWOFLOORS');
-    await withSlack({ channels: [topic] }, async (fake, plugin) => {
+    await withBlocking({ channels: [topic] }, async (fake, plugin) => {
       const lowFloor = fake.mintTs();
       const between = fake.mintTs();
       const highFloor = fake.mintTs();
@@ -330,11 +356,105 @@ describe('slack blocking fetch: a degraded event source must not withhold durabl
           }[degradation.dials];
           expect(fake.hits('apps.connections.open'), 'dials').toBeLessThanOrEqual(dialCeiling);
           expect(fake.unauthedHits('conversations.history'), 'unauthenticated reads').toBe(0);
+          expect(parkedWaiters(plugin), 'waiters still parked after the call settled').toBe(0);
         } finally {
           await cleanup();
         }
       });
     }
+  }
+
+  /**
+   * The one degradation whose HANDLING is a latency guarantee rather than a bound: losing an
+   * established socket releases the parked caller AT THE LOSS, instead of leaving it to discover the
+   * dead stream when its rung expires. Every row above is bounded by a rung narrower than the drain
+   * saves, so none of them can see the difference — this one drops the socket just after a rung
+   * whose width is already {@link MAX_DIAL_BACKOFF_MS}, where the whole remaining budget is a single
+   * park.
+   */
+  it('a socket lost mid-park releases the caller on the loss, not on its rung', async () => {
+    const topic = asTopic('C0LOSTPARK');
+    const blockMs = 6000;
+    const lossAt = rungStarts(blockMs).find((s) => s >= MAX_DIAL_BACKOFF_MS / 2)! + 100;
+    await withBlocking({ channels: [topic] }, async (fake, plugin) => {
+      setTimeout(() => {
+        // History has it, the stream never will: the redial is refused so the ladder, not a
+        // recovered socket, is what has to deliver it.
+        fake.seed(topic, [{ text: 'durable' }]);
+        fake.failMethod('apps.connections.open', 'internal_error');
+        fake.dropSockets();
+      }, lossAt);
+
+      const t0 = Date.now();
+      const result = await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs });
+      const elapsed = Date.now() - t0;
+
+      expect(result.messages.map((m) => m.content)).toEqual(['durable']);
+      // Held to the rung (or to the deadline) instead of released on the loss, this is `blockMs`.
+      expect(elapsed, 'released on the socket loss').toBeLessThan(lossAt + SLACK_MS * 2);
+    });
+  });
+});
+
+/**
+ * The axis the ceiling above holds fixed at zero: how much traffic sits ABOVE the caller's cursor
+ * that this backend does not surface. `conversations.history` returns system and mutation records
+ * (`channel_join`, `message_changed`, …) that the plugin filters out, so a resume-after-`since` walk
+ * pages through all of them and returns nothing — perfectly ordinary channel traffic. If every rung
+ * of the ladder re-walks from the caller's original cursor, the per-call request count is
+ * `rungs × pages`, not `rungs + pages`: the wall-clock bound the poll-storm table states is then
+ * true only for the single-message fixture it runs on.
+ *
+ * The low rows are controls — with one page above the floor a re-walk costs the same as a re-read,
+ * so they cannot discriminate and exist to pin that the bound is ADDITIVE in the backlog rather than
+ * generous. Latency is graded alongside cost, because a walk that stopped re-reading entirely would
+ * satisfy every request ceiling here.
+ */
+const BACKLOG_SIZES = [0, 50, 300, 1000];
+
+/** Records `conversations.history` returns and the plugin does not surface. */
+const UNSURFACED_SUBTYPES = ['channel_join', 'message_changed'];
+
+const BACKLOG_BLOCK_MS = 3000;
+const BACKLOG_LANDING_MS = 1000;
+
+describe('slack blocking fetch: an unsurfaced backlog costs one walk, not one per ladder rung', () => {
+  for (const unsurfaced of BACKLOG_SIZES) {
+    it(`${unsurfaced} unsurfaced records above the cursor: one walk plus a single-page read per rung`, async () => {
+      const topic = asTopic('C0BACKLOG');
+      const pageSize = 50;
+      await withBlocking({ appToken: null, channels: [topic], pageSize }, async (fake, plugin) => {
+        const anchor = fake.seed(topic, [{ text: 'anchor' }])[0]!;
+        fake.seed(
+          topic,
+          Array.from({ length: unsurfaced }, (_, i) => ({
+            text: `sys ${i}`,
+            subtype: UNSURFACED_SUBTYPES[i % UNSURFACED_SUBTYPES.length]!,
+          })),
+        );
+        setTimeout(() => fake.seed(topic, [{ text: 'durable' }]), BACKLOG_LANDING_MS);
+
+        const before = fake.hits('conversations.history');
+        const t0 = Date.now();
+        const result = await plugin.fetchRecent({
+          topic,
+          since: asCursor(anchor.ts),
+          blockMs: BACKLOG_BLOCK_MS,
+        });
+        const elapsed = Date.now() - t0;
+        const reads = fake.hits('conversations.history') - before;
+
+        expect(result.messages.map((m) => m.content)).toEqual(['durable']);
+        expect(elapsed, 'elapsed vs ladder').toBeLessThanOrEqual(
+          dueBy(BACKLOG_LANDING_MS, BACKLOG_BLOCK_MS) + SLACK_MS,
+        );
+        // One walk over the backlog, then one page per rung: additive, never multiplicative.
+        const walkPages = Math.max(1, Math.ceil(unsurfaced / pageSize));
+        const rungs = rungStarts(BACKLOG_BLOCK_MS).length;
+        expect(reads, `${unsurfaced} unsurfaced records`).toBeLessThanOrEqual(walkPages + rungs + 2);
+        expect(reads, 'history re-read floor').toBeGreaterThanOrEqual(walkPages);
+      });
+    });
   }
 });
 
@@ -345,7 +465,7 @@ describe('slack blocking fetch: poll storm bound', () => {
   ] as const) {
     it(`an unavailable Socket Mode costs O(wall clock) requests on every method, not O(iterations) (blockMs=${blockMs}, poll=${pollIntervalMs})`, async () => {
       const topic = asTopic('C0STORM');
-      await withSlack({ channels: [topic] }, async (fake, plugin) => {
+      await withBlocking({ channels: [topic] }, async (fake, plugin) => {
         fake.failMethod('apps.connections.open', 'internal_error');
 
         await fetchRecentBlocking(
@@ -372,7 +492,7 @@ describe('slack blocking fetch: poll storm bound', () => {
 
   it('a handshake that recovers mid-budget still wakes natively', async () => {
     const topic = asTopic('C0RECOVER');
-    await withSlack({ channels: [topic] }, async (fake, plugin) => {
+    await withBlocking({ channels: [topic] }, async (fake, plugin) => {
       fake.failMethod('apps.connections.open', 'internal_error', 1);
       setTimeout(() => deliver(fake, topic, 'live'), 900);
 

@@ -17,6 +17,7 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay, fetchWithRetry, sanitizeBody } from '@sharptrick/parley-net-util';
+import { isIPv4, isIPv6 } from 'node:net';
 import { WebSocket, type RawData } from 'ws';
 
 /** Plugin-specific backend_config. */
@@ -120,6 +121,18 @@ export const DEFAULT_ROTATION_GRACE_MS = 10_000;
  * read — that span sits below the cursor and no later catch-up would revisit it.
  */
 export const MAX_HISTORY_PAGES = 2_000;
+
+const DEFAULT_API_URL = 'https://slack.com/api';
+
+/** Largest delay Node's timers accept; past it every one of them silently becomes 1ms. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Every `backend_config` key whose value is handed straight to `setTimeout`. Keep
+ * {@link validateConfig} iterating THIS list rather than naming the knobs it happens to know about,
+ * so that a timing knob added to {@link SlackBackendConfig} is unchecked in exactly one place.
+ */
+export const TIMER_CONFIG_KEYS = ['handshake_timeout_ms', 'rotation_grace_ms'] as const;
 
 /**
  * Objects asked for per `conversations.history` page. Slack caps this per rate-limit tier — 1000 for
@@ -261,16 +274,28 @@ export class SlackPlugin implements BackendPlugin {
   private dialBackoffMs = DIAL_BACKOFF_MS;
   /** Whether a {@link reconnect} loop already owns re-establishing the shared socket. */
   private reconnecting = false;
+  /** Bumped by every {@link disconnect}; a loop from a retired session must not act on wake. */
+  private session = 0;
   /** Sockets that have already spent their one pre-refresh rotation — see {@link routeEnvelope}. */
   private readonly rotating = new WeakSet<WebSocket>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SlackBackendConfig;
-    this.apiUrl = (cfg.api_url ?? 'https://slack.com/api').replace(/\/+$/, '');
+    // Keep every rejection ahead of the stand-down, so that a refused config leaves a working
+    // connection running instead of tearing it down on the way to a load error.
+    validateConfig(cfg);
+    const channelMap = requireUsableChannelMap(cfg.channel_map ?? {});
+    const mentionMap = requireUsableMap('mention_map', 'a handle', cfg.mention_map ?? {});
+    // A second connect() inherits nothing: the previous session's routes, sockets and memoized
+    // `auth.test` answer belong to its tokens, and leaving them would feed a handler the new
+    // configuration never registered off a socket it never opened.
+    if (this.connected) await this.disconnect();
+    for (const risk of configRisks(cfg)) console.warn(`[parley-slack] SECURITY: ${risk}`);
+    this.apiUrl = (cfg.api_url ?? DEFAULT_API_URL).replace(/\/+$/, '');
     this.botToken = cfg.bot_token;
     this.appToken = cfg.app_token;
-    this.channelMap = requireUsableChannelMap(cfg.channel_map ?? {});
-    this.mentionMap = requireUsableMap('mention_map', 'a handle', cfg.mention_map ?? {});
+    this.channelMap = channelMap;
+    this.mentionMap = mentionMap;
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     this.rotationGraceMs = cfg.rotation_grace_ms ?? DEFAULT_ROTATION_GRACE_MS;
     this.channelOwner.clear();
@@ -289,6 +314,12 @@ export class SlackPlugin implements BackendPlugin {
   async disconnect(): Promise<void> {
     this.stopped = true;
     this.connected = false;
+    // Retire the session id every parked loop captured, so that a `reconnect()` sitting in its
+    // backoff cannot resume against a LATER connect()'s configuration — it would dial
+    // `apps.connections.open` and open a socket the new session never asked for, behind no
+    // subscribe at all. Keep the flag cleared here too, so the new session can own its own loop.
+    this.session++;
+    this.reconnecting = false;
     this.routes.clear();
     this.channelOwner.clear();
     // Abort every blocked long-poll cleanly (clears their timers + registrations via wake()); the
@@ -349,7 +380,7 @@ export class SlackPlugin implements BackendPlugin {
     if (blockMs <= 0 || args.since === undefined || first.messages.length > 0) {
       return first;
     }
-    return this.blockForMessage(args, args.since, Date.now() + blockMs);
+    return this.blockForMessage(args, first.nextCursor, Date.now() + blockMs);
   }
 
   /**
@@ -368,10 +399,14 @@ export class SlackPlugin implements BackendPlugin {
     since: Cursor,
     deadlineAt: number,
   ): Promise<FetchRecentResult> {
-    const aborted: FetchRecentResult = { messages: [], nextCursor: since };
     const channel = this.channelFor(args.topic);
-    const sinceTs = String(since);
     const startedAt = Date.now();
+    // The floor the NEXT rung resumes from. Every re-query that surfaces nothing has still walked
+    // the backlog above it to cursor exhaustion, so carrying the position it reached forward turns
+    // N rungs over a channel with unsurfaced traffic (joins, thread replies) above the caller's
+    // cursor into one walk plus N-1 single-page reads, instead of N full walks.
+    let floor = since;
+    const aborted = (): FetchRecentResult => ({ messages: [], nextCursor: floor });
     while (!this.stopped) {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) break;
@@ -384,24 +419,25 @@ export class SlackPlugin implements BackendPlugin {
       ).catch(() => undefined);
       // A teardown that landed while the handshake ran leaves nothing to wait on, and `runFetch`
       // below would reject on the disconnected plugin; the caller gets its empty page instead.
-      if (this.stopped) return aborted;
+      if (this.stopped) return aborted();
       // Keep the waiter armed BEFORE the re-query, so that a push landing while that query is in
       // flight is caught rather than lost — a lost wakeup here blocks for the whole budget. A rung
       // waiter is a waiter rather than a bare timer, so that `disconnect()` drains it.
       const { wait, wake } = this.armWaiter(
         channel,
-        sinceTs,
+        String(floor),
         Math.min(deadlineAt - Date.now(), nextRungIn(Date.now() - startedAt)),
       );
-      const requeried = await this.runFetch(args);
+      const requeried = await this.runFetch({ ...args, since: floor });
       if (requeried.messages.length > 0) {
         wake();
         return requeried;
       }
+      floor = requeried.nextCursor;
       await wait;
     }
-    if (this.stopped) return aborted;
-    return this.runFetch(args);
+    if (this.stopped) return aborted();
+    return this.runFetch({ ...args, since: floor });
   }
 
   private async runFetch(args: FetchRecentArgs): Promise<FetchRecentResult> {
@@ -760,9 +796,10 @@ export class SlackPlugin implements BackendPlugin {
   private async reconnect(): Promise<void> {
     if (this.reconnecting) return;
     this.reconnecting = true;
+    const session = this.session;
     try {
       let backoffMs = 200;
-      while (!this.stopped) {
+      while (!this.stopped && this.session === session) {
         try {
           await this.ensureSocket();
           return;
@@ -772,7 +809,8 @@ export class SlackPlugin implements BackendPlugin {
         }
       }
     } finally {
-      this.reconnecting = false;
+      // Only while this loop is still the session's owner: a later session has its own.
+      if (this.session === session) this.reconnecting = false;
     }
   }
 
@@ -1033,6 +1071,88 @@ function requireUsableChannelMap(map: Record<string, string>): Record<string, st
   return ownEntriesOnly(map);
 }
 
+const isHttpUrl = (s: string): boolean => {
+  try {
+    const { protocol } = new URL(s);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Reject every `backend_config` value the declared type cannot enforce at run time. Core loads
+ * `backend_config` as `z.record(z.unknown())`, so each value below arrives unchecked and reaches
+ * either the URL every credentialed call is sent to or a `setTimeout` delay. Keep this a LOAD ERROR
+ * rather than a coercion, so that a timing knob outside Node's timer range fails the way
+ * `skip_permissions: true` does instead of silently clamping to 1ms — which disables the very bound
+ * the knob exists to set, under an error message quoting the figure that never applied.
+ */
+function validateConfig(cfg: SlackBackendConfig): void {
+  const reject = (key: keyof SlackBackendConfig, expected: string): never => {
+    const raw = cfg[key];
+    throw new Error(
+      `Slack backend_config.${key} = ` +
+        `${typeof raw === 'string' ? JSON.stringify(raw) : String(raw)} is not accepted: ` +
+        `expected ${expected}`,
+    );
+  };
+  if (cfg.api_url !== undefined && (typeof cfg.api_url !== 'string' || !isHttpUrl(cfg.api_url))) {
+    reject('api_url', 'an http(s) URL');
+  }
+  for (const key of TIMER_CONFIG_KEYS) {
+    const value = cfg[key];
+    if (value !== undefined && !(Number.isInteger(value) && value > 0 && value <= MAX_TIMER_MS)) {
+      reject(key, `a positive whole number of milliseconds, at most ${MAX_TIMER_MS}`);
+    }
+  }
+}
+
+/**
+ * Every config shape that widens this backend's trust boundary, phrased for the operator's stderr.
+ * A risk documented only in the README is one an operator who copied a fixture config never sees,
+ * so this warns from {@link SlackPlugin.connect} — a warning rather than a load error, because a
+ * plaintext endpoint is a legitimate choice for a loopback fixture or a recording proxy.
+ */
+function configRisks(cfg: SlackBackendConfig): string[] {
+  const plaintext = plaintextRemoteOrigin(cfg.api_url ?? DEFAULT_API_URL);
+  if (plaintext === undefined) return [];
+  return [
+    `backend_config.api_url ${plaintext} is plaintext http:// to a non-loopback host, so every Web ` +
+      'API call carries backend_config.bot_token across the network in the clear as an ' +
+      'Authorization header, and apps.connections.open carries backend_config.app_token the same ' +
+      'way. Use https:// for any remote endpoint.',
+  ];
+}
+
+/** The origin of a URL whose credentials would cross the network unencrypted, else `undefined`. */
+function plaintextRemoteOrigin(baseUrl: string): string | undefined {
+  try {
+    const { protocol, hostname, origin } = new URL(baseUrl);
+    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
+ * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
+ * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
+ * plaintext-credential warning. Anything else counts as remote: an unproven host is warned about
+ * rather than excused.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
+  if (host === 'localhost') return true;
+  if (isIPv4(host)) return host.startsWith('127.');
+  if (!isIPv6(host)) return false;
+  const groups = host.split(':');
+  const tail = groups.pop() ?? '';
+  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
+  return Number.parseInt(tail, 16) === 1;
+}
+
 /**
  * The poster's Slack user/bot id, before `mention_map` resolves it to a Parley handle. A workflow- or
  * app-authored entry can carry neither field, and an EMPTY `senderHandle` violates the seam's own
@@ -1052,8 +1172,14 @@ const senderOf = (m: SlackMessage): string => {
  * Slack ids and a bridge running with `mention_filter` on delivers nothing. `mention_map` supplies
  * the id → handle mapping; Slack's own label is the fallback, and an unmapped, unlabelled id stays
  * as the id (visible, but not a Parley handle).
+ *
+ * Keep `<` excluded from both bodies, so that the scan starting at one `<` cannot run past the next
+ * one: `text` is attacker-controlled up to Slack's own 40 000-character limit, and a body that
+ * swallows further `<` gives every one of them an overlapping start position to backtrack over —
+ * 40 000 characters of `<@` then cost seconds of the single-threaded event loop per message, which
+ * is the whole bridge, its Socket Mode acks included.
  */
-const MENTION_RE = /<([@!])([^>|\s]*)(?:\|([^>]*))?>/g;
+const MENTION_RE = /<([@!])([^<>|\s]*)(?:\|([^<>]*))?>/g;
 /** The `<!…>` bodies that ARE mentions; every other one (`<!date^…>`, …) is left as Slack wrote it. */
 const BROADCASTS = new Set(['here', 'channel', 'everyone']);
 

@@ -92,8 +92,11 @@ The ladder runs whether or not the handshake lands, because a completed handshak
 stream serves: an app whose Event Subscriptions lack `message.channels`, or one whose `app_token` is
 shared with a second process (see *Multiple concurrent sessions*), greets and then pushes nothing.
 The reactive-only configuration is covered by the same ladder: with no `app_token` there is no
-handshake to attempt, so history is polled and nothing is dialled. One blocked call therefore costs
-about `4 + block_ms / MAX_DIAL_BACKOFF_MS` reads — **16 reads and dials at the default 60 s** — rather
+handshake to attempt, so history is polled and nothing is dialled. Each rung resumes from the
+position the previous read walked to, so traffic above the caller's cursor that this backend does not
+surface (channel joins, edits, thread replies) is paged through **once** rather than once per rung.
+One blocked call therefore costs one walk over that backlog plus
+about `4 + block_ms / MAX_DIAL_BACKOFF_MS` single-page reads — **16 reads and dials at the default 60 s** — rather
 than one of each per poll interval. That count is **linear**, not logarithmic, in `block_ms` once the
 ladder reaches its cap: raising `catchup.block_max_ms` to core's ceiling of five
 minutes costs ~64 of each per blocked call. Both methods are separately rate-limited, and `conversations.history` is the tighter of the two.
@@ -136,6 +139,15 @@ backend_config:
   handshake_timeout_ms: 10000   # default; how long a silent Socket Mode socket may withhold `hello`
   rotation_grace_ms: 10000      # default; how long a rotated-out socket may stay open once replaced
 ```
+
+**What is checked at load, and what only warns.** `backend_config` is opaque to core, so this plugin
+is the only layer that sees these values. `api_url` must be an http(s) URL, and every `_ms` knob must
+be a positive whole number of milliseconds no larger than Node's timer range (`2147483647`) — past
+that, `setTimeout` silently clamps the delay to 1 ms, so the bound the knob exists to set is the one
+thing it cannot express. Both fail at `connect`, naming the key. A plaintext `http://` `api_url`
+pointed at a **non-loopback** host is a legitimate fixture choice and is accepted, but it **warns**
+at `connect`: every Web API call carries the `xoxb-` bot token across the network in the clear, and
+`apps.connections.open` carries the `xapp-` app token the same way.
 
 ## App provisioning (pointers only — follow Slack's docs)
 
