@@ -28,6 +28,7 @@ import {
   type JetStreamClient,
   type JetStreamManager,
   type NatsConnection,
+  type StoredMsg,
   type StreamConfig,
   type StreamInfo,
 } from 'nats';
@@ -67,8 +68,23 @@ const RESUBSCRIBE_BACKOFF_MS = 1000; // wait before retrying a consumer while th
 const RECONNECT_WAIT_MS = 1000;
 const RECONNECT_JITTER_MS = 500;
 const FETCH_EXPIRY_MS = 2000;
+const FETCH_EXPIRY_CEILING_MS = 30_000;
 const FETCH_IDLE_MS = 200; // close a pull this long without a message rather than wait out `expires`
+const LINK_PATIENCE_FACTOR = 3;
+const WIDEN_ATTEMPTS = 5;
 const DRAIN_TIMEOUT_MS = 2000;
+
+/**
+ * How long ONE pull waits, scaled by what its own setup round trips just cost. Keep the scaling: a
+ * constant idle close is armed before the first message can arrive (nats.js `fetch()` resolves as
+ * soon as the pull is queued locally), so on any link slower than the constant it closes the pull
+ * having read nothing and catch-up returns an empty page with a cursor that never advances.
+ */
+const pullPatience = (setupMs: number): { expires: number; idleMs: number } => {
+  const scaled = setupMs * LINK_PATIENCE_FACTOR;
+  const expires = Math.min(Math.max(FETCH_EXPIRY_MS, scaled), FETCH_EXPIRY_CEILING_MS);
+  return { expires, idleMs: Math.min(Math.max(FETCH_IDLE_MS, scaled), expires) };
+};
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -158,12 +174,38 @@ export class NatsPlugin implements BackendPlugin {
       ts: new Date().toISOString(),
       in_reply_to: opts?.inReplyTo ?? '',
     });
+    const stream = this.streamName(topic);
+    let published: string | undefined;
     const seq = await this.withStream(topic, async () => {
+      published = this.incarnations.get(stream);
       const ack = await this.requireJs().publish(this.subject(topic), enc.encode(payload));
       return ack.seq;
     });
     await this.observeIncarnation(topic);
+    if (this.incarnations.get(stream) !== published) {
+      await this.confirmSequence(stream, seq, payload);
+    }
     return asBackendMsgId(this.msgId(topic, seq));
+  }
+
+  /**
+   * A `PubAck` carries a stream and a sequence but no incarnation, so a stream re-provisioned around
+   * the publish leaves half of the id unproven. Keep this confirmation, so that a message acked by
+   * an incarnation that is already gone is reported as lost rather than handed back under an id the
+   * surviving incarnation will mint again for a DIFFERENT message — which core's dedup then drops.
+   */
+  private async confirmSequence(stream: string, seq: number, payload: string): Promise<void> {
+    let stored: StoredMsg;
+    try {
+      stored = await this.requireJsm().streams.getMessage(stream, { seq });
+    } catch (err) {
+      // Keep this narrow to a definite "no message there": an inconclusive read leaves the observed
+      // incarnation the best available, and rejecting a post whose message DID land tells the caller
+      // to send it twice.
+      if (!isMessageMissing(err)) return;
+      throw ackIncarnationUnknown(stream, seq);
+    }
+    if (dec.decode(stored.data) !== payload) throw ackIncarnationUnknown(stream, seq);
   }
 
   /**
@@ -199,33 +241,67 @@ export class NatsPlugin implements BackendPlugin {
     // underneath the cursor and its sequences restarted at 1. Keep the fall back to the retained
     // window, so that catch-up cannot go permanently deaf waiting on a sequence that will not come.
     const restarted = since !== undefined && since > lastSeq;
-    const tailWindow = Math.max(firstSeq, lastSeq - limit + 1, 1);
-    // JetStream prunes from the front (`max_age`), so a `since` older than the retained window must
-    // start at `first_seq`: the gap is gone either way, and asking below it stalls the pull for its
-    // whole expiry waiting on sequences the server no longer has.
-    const startSeq =
-      since === undefined || restarted ? tailWindow : Math.max(since + 1, firstSeq, 1);
     const emptyCursor =
       since === undefined || restarted ? asCursor(String(lastSeq)) : (args.since as Cursor);
-
     const blockMs = args.blockMs ?? 0;
-    if (info.state.messages === 0 || startSeq > lastSeq) {
-      if (blockMs > 0 && args.since !== undefined) {
-        return this.blockingFetch(
-          stream,
-          args.topic,
-          startSeq,
-          limit,
-          Date.now() + blockMs,
-          emptyCursor,
-        );
-      }
-      return { messages: [], nextCursor: emptyCursor };
-    }
-    const want = Math.min(limit, lastSeq - startSeq + 1);
+    const waitOrNothing = async (startSeq: number): Promise<FetchRecentResult> =>
+      blockMs > 0 && args.since !== undefined
+        ? this.blockingFetch(stream, args.topic, startSeq, limit, Date.now() + blockMs, emptyCursor)
+        : { messages: [], nextCursor: emptyCursor };
 
-    const ci = await this.requireJsm().consumers.add(stream, {
-      filter_subject: this.subject(args.topic),
+    if (info.state.messages === 0) return waitOrNothing(Math.max(lastSeq + 1, 1));
+
+    // `last_seq` is a SEQUENCE and `limit` is a COUNT, so a window sized down from `last_seq` can
+    // hold no message at all once anything has been deleted. Anchor it on the last message that
+    // actually exists instead.
+    const tailSeq =
+      (info.state.num_deleted ?? 0) > 0 ? await this.tailSequence(stream, args.topic, lastSeq) : lastSeq;
+
+    if (since !== undefined && !restarted) {
+      // JetStream prunes from the front (`max_age`), so a `since` older than the retained window
+      // must start at `first_seq`: the gap is gone either way, and asking below it stalls the pull
+      // for its whole expiry waiting on sequences the server no longer has.
+      const startSeq = Math.max(since + 1, firstSeq, 1);
+      if (startSeq > tailSeq) return waitOrNothing(startSeq);
+      const read = await this.pull(stream, args.topic, startSeq, Math.min(limit, tailSeq - startSeq + 1), tailSeq);
+      return { messages: read, nextCursor: shortReadCursor(read, startSeq) };
+    }
+
+    // The since-less page is the NEWEST `limit` messages. A window whose top sequences are all
+    // holes returns fewer — widen the start until it holds enough or reaches `first_seq`, so that
+    // an empty page can never hand core's cold start a cursor above history it did not return.
+    let read: Message[] = [];
+    let startSeq = 0;
+    for (let attempt = 0, span = limit; ; attempt++) {
+      startSeq = Math.max(firstSeq, tailSeq - span + 1, 1);
+      read = await this.pull(stream, args.topic, startSeq, tailSeq - startSeq + 1, tailSeq);
+      if (read.length >= limit || startSeq <= firstSeq || attempt >= WIDEN_ATTEMPTS) break;
+      span *= 2;
+    }
+    const newest = read.slice(-limit);
+    return { messages: newest, nextCursor: shortReadCursor(newest, startSeq) };
+  }
+
+  /** Sequence of the last message actually stored on the topic's subject. */
+  private async tailSequence(stream: string, topic: Topic, lastSeq: number): Promise<number> {
+    return this.requireJsm()
+      .streams.getMessage(stream, { last_by_subj: this.subject(topic) })
+      .then((msg) => msg.seq)
+      .catch(() => lastSeq);
+  }
+
+  /** One ephemeral pull from `startSeq`, ended by `want` messages, `tailSeq`, or a quiet link. */
+  private async pull(
+    stream: string,
+    topic: Topic,
+    startSeq: number,
+    want: number,
+    tailSeq: number,
+  ): Promise<Message[]> {
+    const jsm = this.requireJsm();
+    const setupStarted = Date.now();
+    const ci = await jsm.consumers.add(stream, {
+      filter_subject: this.subject(topic),
       deliver_policy: DeliverPolicy.StartSequence,
       opt_start_seq: startSeq,
       ack_policy: AckPolicy.None,
@@ -239,24 +315,24 @@ export class NatsPlugin implements BackendPlugin {
     let wentQuiet = false;
     try {
       const consumer = await this.requireJs().consumers.get(stream, ci.name);
-      batch = await consumer.fetch({ max_messages: want, expires: FETCH_EXPIRY_MS });
+      const patience = pullPatience(Date.now() - setupStarted);
+      batch = await consumer.fetch({ max_messages: want, expires: patience.expires });
       // Keep the idle close: `want` is an upper bound over a range that may be sparse — a deleted or
-      // pruned message anywhere in it, including at `last_seq` itself where no break below can fire,
-      // otherwise holds the pull for its whole `expires` on every call.
+      // pruned message anywhere in it otherwise holds the pull for its whole `expires` on every call.
       const live = batch;
       const armIdleClose = (): void => {
         clearTimeout(idle);
         idle = setTimeout(() => {
           wentQuiet = true;
           void live.close();
-        }, FETCH_IDLE_MS);
+        }, patience.idleMs);
       };
       armIdleClose();
       try {
         for await (const m of batch) {
           armIdleClose();
-          messages.push(this.rowToMessage(args.topic, m.seq, dec.decode(m.data)));
-          if (messages.length >= want || m.seq >= lastSeq) break;
+          messages.push(this.rowToMessage(topic, m.seq, dec.decode(m.data)));
+          if (messages.length >= want || m.seq >= tailSeq) break;
         }
       } catch (err) {
         if (!wentQuiet) throw err;
@@ -264,14 +340,11 @@ export class NatsPlugin implements BackendPlugin {
     } finally {
       clearTimeout(idle);
       void batch?.close();
-      await this.jsm?.consumers.delete(stream, ci.name).catch(() => undefined);
+      // Keep the handle captured at entry: `disconnect()` clears `this.jsm` as soon as its closers
+      // return, and reading it here instead skips the delete and leaks the consumer.
+      await jsm.consumers.delete(stream, ci.name).catch(() => undefined);
     }
-    const last = messages.at(-1);
-    // A short read (expiry, slow link, filter mismatch) must resume immediately BEFORE the window
-    // it failed to read: keep `startSeq - 1`, so that an empty page can never park the persisted
-    // cursor at the tail and silently drop everything in between.
-    const nextCursor = last !== undefined ? last.cursor : asCursor(String(startSeq - 1));
-    return { messages, nextCursor };
+    return messages;
   }
 
   /**
@@ -307,7 +380,8 @@ export class NatsPlugin implements BackendPlugin {
     const remaining = deadline - Date.now();
     if (remaining <= 0 || this.stopped) return { messages: [], nextCursor: fallback };
 
-    const ci = await this.requireJsm().consumers.add(stream, {
+    const jsm = this.requireJsm();
+    const ci = await jsm.consumers.add(stream, {
       filter_subject: this.subject(topic),
       deliver_policy: DeliverPolicy.StartSequence,
       opt_start_seq: startSeq,
@@ -320,6 +394,11 @@ export class NatsPlugin implements BackendPlugin {
     let batch: ConsumerMessages | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let expired = false;
+    let cleanedUp = (): void => undefined;
+    const cleanup = new Promise<void>((resolve) => {
+      cleanedUp = () => resolve();
+    });
+    let closer: Closeable | undefined;
     try {
       const consumer = await this.requireJs().consumers.get(stream, ci.name);
       // Keep the 1000ms floor: nats.js rejects a shorter `expires`, and the timer below — not
@@ -327,7 +406,16 @@ export class NatsPlugin implements BackendPlugin {
       batch = await consumer.fetch({ max_messages: limit, expires: Math.max(remaining, 1000) });
 
       const live = batch;
-      this.subscriptions.push(live);
+      // Keep the closer waiting on this read's own cleanup: `disconnect()` drops its handles the
+      // moment its closers return, so a closer that returns on `live.close()` alone leaves the
+      // ephemeral consumer undeleted on the server.
+      closer = {
+        close: async () => {
+          void live.close();
+          await Promise.race([cleanup, delay(DRAIN_TIMEOUT_MS)]);
+        },
+      };
+      this.subscriptions.push(closer);
       // Keep the timer armed off the LIVE clock, so that setup round-trips cannot push the return
       // past the caller's `blockMs`.
       timer = setTimeout(() => {
@@ -349,12 +437,13 @@ export class NatsPlugin implements BackendPlugin {
       if (!expired && !this.stopped) throw err;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      if (batch !== undefined) {
-        const i = this.subscriptions.indexOf(batch);
+      if (closer !== undefined) {
+        const i = this.subscriptions.indexOf(closer);
         if (i >= 0) this.subscriptions.splice(i, 1);
       }
       void batch?.close();
-      await this.jsm?.consumers.delete(stream, ci.name).catch(() => undefined);
+      await jsm.consumers.delete(stream, ci.name).catch(() => undefined);
+      cleanedUp();
     }
     const last = messages.at(-1);
     return { messages, nextCursor: last !== undefined ? last.cursor : fallback };
@@ -511,8 +600,9 @@ export class NatsPlugin implements BackendPlugin {
     let pending = this.ensured.get(name);
     if (pending === undefined) {
       pending = (async () => {
+        const subject = this.subject(topic);
         try {
-          const config: Partial<StreamConfig> = { name, subjects: [this.subject(topic)] };
+          const config: Partial<StreamConfig> = { name, subjects: [subject] };
           if (this.retentionDays !== undefined) {
             config.max_age = Math.round(this.retentionDays * NS_PER_DAY);
           }
@@ -521,8 +611,20 @@ export class NatsPlugin implements BackendPlugin {
           // Keep this swallow narrow to "already exists", so that a real add failure still surfaces
           // instead of being cached as a stream that was never created.
           const msg = err instanceof Error ? err.message : String(err);
+          if (/overlap/i.test(msg)) {
+            throw new Error(
+              `nats stream ${name} cannot capture ${subject} — another stream on this cluster already does: stream_prefix differs from the instance that created it while subject_prefix matches (${msg})`,
+            );
+          }
           if (!/already in use|already exists|name already/i.test(msg)) throw err;
-          this.noteIncarnation(name, await this.requireJsm().streams.info(name));
+          const info = await this.requireJsm().streams.info(name);
+          const subjects = info.config.subjects ?? [];
+          if (!subjects.some((pattern) => captures(pattern, subject))) {
+            throw new Error(
+              `nats stream ${name} already exists capturing ${JSON.stringify(subjects)}, which does not include ${JSON.stringify(subject)} — subject_prefix or stream_prefix differs from the instance that created it`,
+            );
+          }
+          this.noteIncarnation(name, info);
         }
       })().catch((err: unknown) => {
         // Keep the eviction, so that a transient failure does not poison the cache with a rejected
@@ -586,6 +688,9 @@ function parseCursor(since: Cursor | undefined): number | undefined {
   return n;
 }
 
+/** Stands in for a topic token, so a prefix is judged by the name it actually composes. */
+const PROBE_TOKEN = 'topic';
+
 /**
  * A prefix is pasted straight onto a subject or a stream name, so an operator's typo becomes a
  * NATS wildcard or an illegal name. A wildcard is the dangerous one: `pw.*.` makes the per-topic
@@ -607,6 +712,12 @@ function validatePrefix(
   if (offender !== undefined) {
     throw new Error(
       `invalid ${field} ${JSON.stringify(value)} — ${JSON.stringify(offender)} is not allowed in a NATS name`,
+    );
+  }
+  const composed = value + PROBE_TOKEN;
+  if (composed.split('.').some((token) => token === '')) {
+    throw new Error(
+      `invalid ${field} ${JSON.stringify(value)} — it composes the illegal name ${JSON.stringify(composed)}: no dot-separated token of a NATS name may be empty`,
     );
   }
   return value;
@@ -656,6 +767,39 @@ function decodeFields(raw: string): Record<string, unknown> {
 }
 
 const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
+
+/**
+ * A short read (expiry, slow link, filter mismatch) must resume immediately BEFORE the window it
+ * failed to read: keep `startSeq - 1`, so that an empty page can never park the persisted cursor at
+ * the tail and silently drop everything in between.
+ */
+const shortReadCursor = (messages: Message[], startSeq: number): Cursor =>
+  messages.at(-1)?.cursor ?? asCursor(String(Math.max(startSeq - 1, 0)));
+
+/** NATS subject interest: `*` matches exactly one token, `>` one or more trailing tokens. */
+function captures(pattern: string, subject: string): boolean {
+  const tokens = pattern.split('.');
+  const target = subject.split('.');
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === '>') return target.length > i;
+    if (i >= target.length) return false;
+    if (tokens[i] !== '*' && tokens[i] !== target[i]) return false;
+  }
+  return tokens.length === target.length;
+}
+
+const ackIncarnationUnknown = (stream: string, seq: number): Error =>
+  new Error(
+    `nats stream ${stream} was re-provisioned around this publish — sequence ${seq} does not hold the posted message in the incarnation now on the server, so it has no unambiguous id`,
+  );
+
+/** JetStream's answer when a sequence holds nothing, as opposed to a read that could not be made. */
+function isMessageMissing(err: unknown): boolean {
+  const code = (err as { code?: unknown }).code;
+  if (code === '404') return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /no message found|message not found|404/i.test(msg);
+}
 
 /** A stream that vanished out-of-band: JetStream 404s the manager and 503s the publish. */
 function isStreamMissing(err: unknown): boolean {

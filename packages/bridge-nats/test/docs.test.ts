@@ -110,6 +110,33 @@ describe('nats docs conformance', () => {
     expect(readme).toContain('`<stream incarnation>-<sequence>`');
   });
 
+  // A stated SYMPTOM is a claim like any other, and the wrong symptom is worse than none: an operator
+  // told a prefix mismatch splits history hunts for two halves of a conversation, while the bridge in
+  // front of them is refusing every post. The plugin now raises on a partial divergence, so the words
+  // that promised silence are retired from every surface that carries them — README and the runnable
+  // nats configs alike.
+  const exampleDir = fileURLToPath(new URL('../../../examples/multi-session/nats', import.meta.url));
+  const exampleConfigs = readdirSync(exampleDir)
+    .filter((f) => f.endsWith('.yaml'))
+    .map((f) => ({ name: `examples/multi-session/nats/${f}`, text: readFileSync(join(exampleDir, f), 'utf8') }));
+
+  it('finds the example configs it is meant to police', () => {
+    expect(exampleConfigs.length).toBeGreaterThan(2);
+  });
+
+  const retiredSymptoms = ['silently maps', 'splitting history with'];
+  for (const surface of [{ name: 'README.md', text: readme }, ...exampleConfigs]) {
+    for (const claim of retiredSymptoms) {
+      it(`${surface.name} no longer says a prefix mismatch "${claim}"`, () => {
+        expect(surface.text.toLowerCase()).not.toContain(claim);
+      });
+    }
+  }
+
+  it('README describes the divergence symptom the code produces', () => {
+    expect(readme).toContain('naming `subject_prefix`/`stream_prefix`');
+  });
+
   const configKeys = ['token', 'user', 'pass', 'creds_file', 'nkey_seed', 'tls', 'retention_days'];
   for (const key of configKeys) {
     it(`README documents the \`${key}\` backend_config field`, () => {

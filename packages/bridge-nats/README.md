@@ -111,9 +111,15 @@ server — all pointed at the same NATS. `servers`, `subject_prefix`/`stream_pre
 `retention_days` must be **identical** across every one of them:
 
 - **`servers`** — the obvious one.
-- **`subject_prefix`/`stream_prefix`** — the hidden one, same story as Redis's `key_prefix`: a
-  mismatch silently maps "the same" topic to a different subject/stream while every other field
-  still looks consistent.
+- **`subject_prefix`/`stream_prefix`** — the hidden one, and *unlike* Redis's `key_prefix` a partial
+  mismatch does not split history quietly: JetStream's own naming rules make it a hard failure.
+  Change `subject_prefix` alone and the second instance addresses the stream the first one created,
+  which captures a subject it never publishes to; change `stream_prefix` alone and its `streams.add`
+  collides with the first stream's subjects. Either way this plugin refuses at the first
+  `post`/`fetchRecent` with an error naming `subject_prefix`/`stream_prefix` and the subjects
+  involved, rather than letting the two instances drift. Change **both** and there is no collision
+  left to detect: each instance gets its own stream on its own subject, and *that* is the case where
+  history splits with no error at all.
 - **`retention_days`** — the trickiest, because it isn't really "per config" at all: it's **locked
   in at stream creation**. Whichever session's instance is first to touch a brand-new topic wins
   that topic's `max_age` *permanently*; every other config's value for that topic is silently never

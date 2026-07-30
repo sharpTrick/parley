@@ -21,19 +21,34 @@ export interface TcpProxy {
   close(): Promise<void>;
 }
 
-export async function startTcpProxy(targetHost: string, targetPort: number): Promise<TcpProxy> {
+/**
+ * `latencyMs` delays every forwarded byte, so a plugin's patience budgets are graded against a link
+ * that is slow rather than broken — the deployments the READMEs advertise (a remote cluster, NGS).
+ */
+export async function startTcpProxy(
+  targetHost: string,
+  targetPort: number,
+  latencyMs = 0,
+): Promise<TcpProxy> {
   const live = new Set<net.Socket>();
   const stalled: (() => void)[] = [];
   let mode: 'open' | FaultMode = 'open';
 
   const wire = (from: net.Socket, to: net.Socket): void => {
     const held: Buffer[] = [];
+    const forward = (chunk: Buffer): void => {
+      if (latencyMs <= 0) to.write(chunk);
+      else
+        setTimeout(() => {
+          if (!to.destroyed) to.write(chunk);
+        }, latencyMs);
+    };
     from.on('data', (chunk: Buffer) => {
       if (mode === 'stall') held.push(chunk);
-      else to.write(chunk);
+      else forward(chunk);
     });
     stalled.push(() => {
-      for (const chunk of held.splice(0)) to.write(chunk);
+      for (const chunk of held.splice(0)) forward(chunk);
     });
   };
 

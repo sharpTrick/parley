@@ -104,4 +104,23 @@ describe('nats cursor integrity — a short read must not skip what it did not r
     expect(page.messages.map((m) => m.content)).toEqual(['a', 'b']);
     expect(page.nextCursor).toBe(page.messages[1].cursor);
   });
+
+  // The same class over a link whose every round trip costs real time. A page truncated because the
+  // plugin ran out of patience is indistinguishable, in the result, from a page that read its whole
+  // window — so the completeness of `returned + replayed` is what has to hold at every latency.
+  for (const latencyMs of [0, 250, 600]) {
+    for (const shape of shapes.filter((s) => s.mode !== 'blockMs long-poll')) {
+      it(`${shape.mode} over a ${latencyMs}ms link: the page plus its replay is still complete`, async () => {
+        const { plugin, fake } = makePlugin({ ...shape.init, latencyMs, expiryMs: 30_000 });
+
+        const page = await plugin.fetchRecent(shape.args());
+        const returned = page.messages.map((m) => m.content);
+        fake.state.latencyMs = 0;
+        const replayed = await replayFrom(plugin, fake, TOPIC, page.nextCursor);
+
+        expect([...returned, ...replayed]).toEqual(shape.expected);
+        expect(returned.length).toBeGreaterThan(0);
+      }, 60_000);
+    }
+  }
 });

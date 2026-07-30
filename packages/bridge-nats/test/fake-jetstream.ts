@@ -2,9 +2,12 @@
  * A fault-injecting stand-in for the JetStream client/manager, wired into the plugin's private
  * `js`/`jsm` handles. It makes the failure modes a healthy localhost server never produces —
  * a fetch that expires having read part (or none) of its window, a throw between creating and
- * destroying an ephemeral consumer — deterministic instead of timing-dependent.
+ * destroying an ephemeral consumer, a link whose every round trip costs `latencyMs` — deterministic
+ * instead of timing-dependent.
  */
 const enc = new TextEncoder();
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export interface FakeState {
   /** Stream contents: seq → JSON payload. */
@@ -14,12 +17,22 @@ export interface FakeState {
   /** `streams.info` reports this as `last_seq` (models a message landing after the snapshot). */
   visibleTail?: number;
   /**
+   * What one round trip over this link costs: every manager/client call pays it, and so does each
+   * message a pull delivers. Keep the per-message cost, so that a client-side patience budget
+   * shorter than the link is a FAILING page here rather than a WAN-only defect.
+   */
+  latencyMs: number;
+  /**
    * How long a pull holds the connection open when its window yields fewer than `max_messages` —
    * the real `expires`. A read that asks for more than the stream can supply pays this in full.
    */
   expiryMs: number;
   /** Config of the last `streams.add`, for retention/naming assertions. */
   added?: { name?: string; max_age?: number; subjects?: string[] };
+  /** Subjects `streams.info` reports for the stream — a stream another config's prefixes created. */
+  subjects?: string[];
+  /** How `streams.add` fails: the name is taken, or another stream already captures the subject. */
+  addFails?: 'name-in-use' | 'subject-overlap';
   /** Where the fault is injected on the read path. */
   failOn: 'get' | 'fetch' | 'iterate' | null;
   /**
@@ -39,6 +52,17 @@ export interface FakeState {
   swallowGeneration: number;
   /** `created` stamp both `streams.add` and `streams.info` report — the stream's incarnation. */
   streamCreated: string;
+  /**
+   * Re-provision the stream DURING the Nth `streams.info` call (1 = the first): the call observes
+   * `swapCreatedTo` and the records are wiped, so an ack taken before it belongs to neither the
+   * incarnation the caller last saw nor the one it is about to see.
+   */
+  swapCreatedOnInfoCall?: number;
+  swapCreatedTo?: string;
+  /** How many `streams.info` calls have been served — for arming `swapCreatedOnInfoCall` mid-run. */
+  infoCalls: number;
+  /** How many `streams.getMessage` calls report no message found. */
+  getMessageMissing: number;
   /** How many `publish` calls report the stream as gone — the out-of-band-removal path. */
   publishMissing: number;
   /** Every ephemeral consumer created / destroyed, for leak assertions. */
@@ -58,14 +82,17 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   const state: FakeState = {
     records: [],
     yieldLimit: Number.POSITIVE_INFINITY,
+    latencyMs: 0,
     expiryMs: 0,
     failOn: null,
     throwOnClose: false,
     silentExits: 0,
     swallowed: [],
     swallowGeneration: 1,
-    publishMissing: 0,
     streamCreated: '2026-01-01T00:00:00.000000000Z',
+    getMessageMissing: 0,
+    publishMissing: 0,
+    infoCalls: 0,
     created: [],
     deleted: [],
     lastStart: 0,
@@ -74,29 +101,66 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   let n = 0;
   let consumes = 0;
 
+  /** Every call over this link pays one round trip. */
+  const hop = async (): Promise<void> => {
+    if (state.latencyMs > 0) await delay(state.latencyMs);
+  };
+
   const jsm = {
     streams: {
       add: async (cfg: { name?: string; max_age?: number; subjects?: string[] }) => {
+        await hop();
+        if (state.addFails === 'name-in-use') throw new Error('stream name already in use');
+        if (state.addFails === 'subject-overlap') {
+          throw new Error('subjects overlap with an existing stream');
+        }
         state.added = cfg;
-        return { config: { name: cfg.name ?? 'fake' }, created: state.streamCreated };
+        return { config: { name: cfg.name ?? 'fake', subjects: cfg.subjects }, created: state.streamCreated };
       },
-      info: async () => ({
-        created: state.streamCreated,
-        state: {
-          messages: state.records.length,
-          first_seq: state.records[0]?.seq ?? 0,
-          last_seq: state.visibleTail ?? state.records.at(-1)?.seq ?? 0,
-        },
-      }),
+      info: async () => {
+        await hop();
+        state.infoCalls += 1;
+        if (state.infoCalls === state.swapCreatedOnInfoCall) {
+          state.records = [];
+          state.streamCreated = state.swapCreatedTo ?? state.streamCreated;
+        }
+        const first = state.records[0]?.seq ?? 0;
+        const last = state.visibleTail ?? state.records.at(-1)?.seq ?? 0;
+        return {
+          created: state.streamCreated,
+          config: { subjects: state.subjects },
+          state: {
+            messages: state.records.length,
+            first_seq: first,
+            last_seq: last,
+            num_deleted: last === 0 ? 0 : last - first + 1 - state.records.length,
+          },
+        };
+      },
+      getMessage: async (_stream: string, req: { seq?: number; last_by_subj?: string }) => {
+        await hop();
+        if (state.getMessageMissing > 0) {
+          state.getMessageMissing -= 1;
+          throw new Error('no message found');
+        }
+        const found =
+          req.seq === undefined
+            ? state.records.at(-1)
+            : state.records.find((r) => r.seq === req.seq);
+        if (found === undefined) throw new Error('no message found');
+        return { seq: found.seq, data: enc.encode(found.data) };
+      },
     },
     consumers: {
       add: async (_stream: string, cfg: { opt_start_seq?: number }) => {
+        await hop();
         const name = `c${++n}`;
         state.created.push(name);
         state.lastStart = cfg.opt_start_seq ?? 0;
         return { name };
       },
       delete: async (_stream: string, name: string) => {
+        await hop();
         state.deleted.push(name);
         return true;
       },
@@ -107,6 +171,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   const js = {
     consumers: {
       get: async () => {
+        await hop();
         if (state.failOn === 'get') throw new Error('injected: consumers.get failed');
         const start = state.lastStart;
         return {
@@ -146,36 +211,54 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
             const window = state.records
               .filter((r) => r.seq >= start)
               .slice(0, Math.min(max_messages, state.yieldLimit));
-            let done = () => undefined as void;
+            let release = () => undefined as void;
             let wasClosed = false;
             const closed = new Promise<void>((resolve) => {
-              done = () => resolve();
+              release = () => resolve();
             });
+            /**
+             * Wait `ms`, or report that the pull was closed first. nats.js `stop()` is immediate, and
+             * keep the macrotask even at zero: a message off a socket NEVER arrives in the same tick
+             * as the pull request, so a budget that expires within one grades as truncation here.
+             */
+            const quiet = async (ms: number): Promise<'closed' | 'elapsed'> => {
+              if (wasClosed) return 'closed';
+              return Promise.race([
+                closed.then(() => 'closed' as const),
+                delay(Math.max(ms, 0)).then(() => 'elapsed' as const),
+              ]);
+            };
             return {
               close: () => {
                 wasClosed = true;
-                done();
+                release();
               },
               [Symbol.asyncIterator]: async function* () {
                 if (state.failOn === 'iterate') throw new Error('injected: iterator failed');
-                for (const r of window) yield { seq: r.seq, data: enc.encode(r.data) };
-                if (window.length < max_messages && state.expiryMs > 0) {
-                  await Promise.race([closed, new Promise((r) => setTimeout(r, state.expiryMs))]);
-                  if (wasClosed && state.throwOnClose) throw new Error('injected: pull closed');
+                // Keep the close check ahead of every yield: nats.js `stop()` unsubscribes at once,
+                // so a closed pull delivers nothing further and a truncating reader LOSES messages.
+                for (const r of window) {
+                  if ((await quiet(state.latencyMs)) === 'closed') break;
+                  yield { seq: r.seq, data: enc.encode(r.data) };
                 }
+                if (!wasClosed && window.length < max_messages && state.expiryMs > 0) {
+                  await quiet(state.expiryMs);
+                }
+                if (wasClosed && state.throwOnClose) throw new Error('injected: pull closed');
               },
             };
           },
         };
       },
     },
-    publish: async () => {
+    publish: async (_subject: string, data: Uint8Array) => {
+      await hop();
       if (state.publishMissing > 0) {
         state.publishMissing -= 1;
         throw new Error('503 no responders — stream not found');
       }
       const seq = (state.records.at(-1)?.seq ?? 0) + 1;
-      state.records.push({ seq, data: payload(`posted-${seq}`) });
+      state.records.push({ seq, data: new TextDecoder().decode(data) });
       return { seq };
     },
   };

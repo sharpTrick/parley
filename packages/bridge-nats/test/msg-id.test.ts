@@ -115,6 +115,65 @@ describe('nats backendMsgId survives a stream re-provisioned under it', () => {
     }
   }
 
+  // A `PubAck` carries a stream and a sequence but no incarnation, so the two halves of an id are
+  // observed by two separate round trips. Between them the stream can be replaced — and then the
+  // observed token labels a sequence it never owned, so the SURVIVING incarnation's own message at
+  // that sequence mints an id core already holds and core drops a genuinely new message. The rows
+  // above re-provision between whole calls; these re-provision inside `post` itself, which the
+  // post-ack read happens to cover only when it succeeds and observes the same stream twice.
+  const ackAmbiguities: { name: string; arm: (fake: FakeJetStream) => void }[] = [
+    {
+      name: 'the stream is re-provisioned during the post-ack incarnation read',
+      arm: (fake) => {
+        fake.state.swapCreatedOnInfoCall = fake.state.infoCalls + 1;
+        fake.state.swapCreatedTo = nextStamp();
+      },
+    },
+    {
+      name: 'the acked sequence holds no message in the incarnation now on the server',
+      arm: (fake) => {
+        reprovision(fake);
+        fake.state.getMessageMissing = 1;
+      },
+    },
+  ];
+
+  for (const ambiguity of ackAmbiguities) {
+    it(`post never labels a sequence with an incarnation it did not observe holding it, when ${ambiguity.name}`, async () => {
+      const { plugin, fake } = withFake();
+      const before = [
+        await plugin.post(TOPIC, 'sys' as never, 'one'),
+        await plugin.post(TOPIC, 'sys' as never, 'two'),
+      ];
+
+      ambiguity.arm(fake);
+      const outcome = await plugin
+        .post(TOPIC, 'sys' as never, 'three')
+        .then((id) => String(id), (err: unknown) => `rejected: ${String(err)}`);
+
+      // Whatever came back, the incarnation that SURVIVED now fills its own sequences — and none of
+      // the ids core reads out of it may be one `post` already handed back for another message.
+      fake.state.getMessageMissing = 0;
+      fake.state.swapCreatedOnInfoCall = undefined;
+      const surviving: string[] = [];
+      for (const content of ['four', 'five', 'six', 'seven']) {
+        surviving.push(String(await plugin.post(TOPIC, 'sys' as never, content)));
+      }
+      const readBack = (await plugin.fetchRecent({ topic: TOPIC })).messages;
+      const minted = [...before.map(String), ...(outcome.startsWith('rejected: ') ? [] : [outcome])];
+
+      const seen = new SeenSet();
+      for (const id of minted) seen.firstSeen(TOPIC, id as BackendMsgId);
+      expect(readBack.map((m) => seen.firstSeen(TOPIC, m.backendMsgId))).toEqual(
+        readBack.map(() => true),
+      );
+      expect(surviving.filter((id) => minted.includes(id))).toEqual([]);
+      if (outcome.startsWith('rejected: ')) expect(outcome).toMatch(/re-provisioned/);
+
+      await plugin.disconnect();
+    }, 20_000);
+  }
+
   it('keeps the cursor a bare sequence, and post/read agree on both values', async () => {
     const { plugin, fake } = withFake();
     const posted = await plugin.post(TOPIC, 'sys' as never, 'one');
