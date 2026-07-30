@@ -17,6 +17,7 @@
  */
 import { asCursor, asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
 import { SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 
@@ -213,24 +214,228 @@ describe('slack socket mode: untrusted envelopes', () => {
     }
   });
 
-  it('a `disconnect` envelope is acked before the socket is rotated out', async () => {
+  it('a `disconnect` envelope rotates the socket and live delivery resumes', async () => {
     const h = await harness();
     try {
       const live: Message[] = [];
       await h.plugin.subscribe(h.topic, (m) => live.push(m));
-      const id = h.fake.pushEnvelope({ type: 'disconnect', reason: 'refresh_requested' });
+      // Real Socket Mode sends `disconnect` with NO `envelope_id` — Slack asks for an ack only on
+      // `events_api`/`slash_commands`/`interactive` — so there is nothing here to ack, and the
+      // observable is the rotation itself.
+      const dialsBefore = h.fake.connectionsOpened;
+      h.fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'refresh_requested' });
 
-      await vi.waitFor(() => expect(h.fake.acked).toContain(id), { timeout: 3000, interval: 10 });
-      // …and the plugin re-establishes, so live delivery resumes on the fresh connection.
-      await vi.waitFor(() => expect(h.fake.liveSockets).toBeGreaterThan(0), {
-        timeout: 4000,
-        interval: 10,
-      });
+      // A live-socket count of 1 is also true of the socket that has not closed YET, so wait for the
+      // replacement handshake itself before asserting delivery resumed on it.
+      await vi.waitFor(
+        () => {
+          expect(h.fake.connectionsOpened).toBeGreaterThan(dialsBefore);
+          expect(h.fake.liveSockets).toBe(1);
+        },
+        { timeout: 4000, interval: 10 },
+      );
       await h.plugin.post(h.topic, asHandle('writer'), 'after rotate');
       await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after rotate'), {
         timeout: 4000,
         interval: 10,
       });
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+/**
+ * An ack is exactly `{envelope_id}` and nothing else; every envelope the fake PUSHES carries a `type`
+ * as well. Reading the shape rather than the direction keeps this usable on a prototype shared by
+ * both ends of the connection.
+ */
+function ackIdOf(data: unknown): string | undefined {
+  if (typeof data !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(data) as Record<string, unknown>;
+    const keys = Object.keys(parsed);
+    if (keys.length === 1 && keys[0] === 'envelope_id' && typeof parsed.envelope_id === 'string') {
+      return parsed.envelope_id;
+    }
+  } catch {
+    /* not JSON — not an ack */
+  }
+  return undefined;
+}
+
+/**
+ * The order in which the plugin CALLED `send`, interleaved with markers its handler pushes.
+ *
+ * Arrival order at the fake cannot express this contract at all: the fake shares this process's event
+ * loop, so a synchronous handler always finishes before any ack can be read off the socket — which is
+ * why the only surviving guard on ack-first was an artefact of the fixture minting an `envelope_id`
+ * for an envelope Slack never asks to have acked. The call order is the contract, and it is
+ * observable only here.
+ */
+function journalSends(journal: string[]): () => void {
+  const real = WebSocket.prototype.send;
+  const patched = function (this: WebSocket, data: unknown, ...rest: unknown[]): unknown {
+    const ack = ackIdOf(data);
+    if (ack !== undefined) journal.push(`ack:${ack}`);
+    return (real as unknown as (...a: unknown[]) => unknown).call(this, data, ...rest);
+  };
+  WebSocket.prototype.send = patched as unknown as typeof WebSocket.prototype.send;
+  return () => {
+    WebSocket.prototype.send = real;
+  };
+}
+
+/**
+ * How the handler behaves once it is reached. Slack redelivers an unacked envelope and eventually
+ * drops the connection, so NO handler behaviour may be observable before the ack is on the wire —
+ * a handler that never returns is the limiting case, and the blocking row is its testable form.
+ */
+const HANDLER_BEHAVIOURS: Array<{ name: string; run: () => void }> = [
+  { name: 'returns normally', run: () => undefined },
+  {
+    name: 'throws',
+    run: () => {
+      throw new Error('handler exploded');
+    },
+  },
+  {
+    name: 'throws a non-Error',
+    run: () => {
+      throw 'handler exploded';
+    },
+  },
+  {
+    name: 'blocks the event loop',
+    run: () => {
+      const until = Date.now() + 150;
+      while (Date.now() < until) {
+        /* deliberately starving the loop the ack would otherwise be flushed on */
+      }
+    },
+  },
+];
+
+describe('slack socket mode: the ack precedes any handler processing', () => {
+  for (const behaviour of HANDLER_BEHAVIOURS) {
+    it(`a handler that ${behaviour.name} is never reached before its envelope is acked`, async () => {
+      const h = await harness();
+      const journal: string[] = [];
+      // Patch AFTER the handshake, so the journal holds only the envelope under test.
+      await h.plugin.subscribe(h.topic, () => {
+        journal.push('handler');
+        behaviour.run();
+      });
+      const stop = journalSends(journal);
+      try {
+        const before = new Set(h.fake.pushed);
+        await h.plugin.post(h.topic, asHandle('writer'), 'ordered');
+        await vi.waitFor(() => expect(journal).toContain('handler'), { timeout: 3000, interval: 5 });
+
+        const [id] = [...h.fake.pushed].filter((p) => !before.has(p));
+        expect(id, 'exactly one new envelope').toBeDefined();
+        expect(journal).toEqual([`ack:${id!}`, 'handler']);
+        await vi.waitFor(() => expect(h.fake.acked).toContain(id!), { timeout: 3000, interval: 5 });
+      } finally {
+        stop();
+        await h.cleanup();
+      }
+    });
+  }
+});
+
+/**
+ * CLASS: a vendor-signalled rotation must not drop live events. Slack sends
+ * `{type:'disconnect', reason:'warning'}` ~10 s ahead of a routine refresh precisely so a client can
+ * establish the replacement FIRST and drain the old connection. Closing on the warning converts a
+ * zero-gap rotation into a dial-round-trip gap — and because `subscribe` restarts at the tail and
+ * core's push loop performs no periodic catch-up, every event in that gap is lost to the live path
+ * for the rest of the session.
+ */
+const DISCONNECT_REASONS: Array<{ reason?: string; preOpens: boolean }> = [
+  { reason: 'warning', preOpens: true },
+  { reason: 'refresh_requested', preOpens: false },
+  { reason: 'link_disabled', preOpens: false },
+  { reason: undefined, preOpens: false },
+];
+
+describe('slack socket mode: disconnect reason drives the rotation', () => {
+  for (const { reason, preOpens } of DISCONNECT_REASONS) {
+    for (const parked of [false, true] as const) {
+      it(`reason=${String(reason)} ${preOpens ? 'opens the replacement first' : 'closes at once'}, with a blocking fetch ${parked ? 'parked' : 'absent'}`, async () => {
+        const h = await harness();
+        try {
+          const live: Message[] = [];
+          await h.plugin.subscribe(h.topic, (m) => live.push(m));
+          const blocked = parked
+            ? h.plugin.fetchRecent({ topic: h.topic, since: asCursor('0'), blockMs: 4000 })
+            : undefined;
+          if (parked) await new Promise((r) => setTimeout(r, 250));
+          expect(h.fake.liveSockets).toBe(1);
+          const dialsBefore = h.fake.connectionsOpened;
+
+          h.fake.pushUnackedEnvelope({
+            ...(reason === undefined ? {} : { reason }),
+            type: 'disconnect',
+          });
+
+          if (preOpens) {
+            // The replacement is up while the old socket is still serving: that overlap IS the grace
+            // Slack sends the warning for, and it is the only shape with no gap.
+            await vi.waitFor(() => expect(h.fake.liveSockets).toBe(2), {
+              timeout: 4000,
+              interval: 5,
+            });
+            // A message pushed DURING the rotation window still reaches the handler — the class guard.
+            const mid = h.fake.seed(h.topic, [{ text: 'mid-rotation' }])[0]!;
+            h.fake.pushEvent(h.topic, { ts: mid.ts, text: 'mid-rotation', user: 'U0HUMAN' });
+            await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('mid-rotation'), {
+              timeout: 4000,
+              interval: 5,
+            });
+            // Slack then closes the old half; exactly one socket must be live once it settles.
+            h.fake.dropOldestSocket();
+          }
+
+          // Exactly ONE handshake per rotation, and exactly one socket left holding the stream —
+          // a count of 1 taken before the old socket closed would pass without a rotation at all.
+          await vi.waitFor(
+            () => {
+              expect(h.fake.connectionsOpened, 'replacement handshake').toBe(dialsBefore + 1);
+              expect(h.fake.liveSockets, 'sockets after rotation').toBe(1);
+            },
+            { timeout: 6000, interval: 10 },
+          );
+          await h.plugin.post(h.topic, asHandle('writer'), 'after rotate');
+          await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after rotate'), {
+            timeout: 4000,
+            interval: 10,
+          });
+          if (blocked !== undefined) {
+            const result = await blocked;
+            expect(result.messages.length, 'the parked fetch still returns a page').toBeGreaterThan(0);
+          }
+        } finally {
+          await h.cleanup();
+        }
+      });
+    }
+  }
+
+  // An envelope is untrusted input, so the grace must not become a dial amplifier: a flood of
+  // warnings on one socket buys exactly one replacement.
+  it('a flood of warnings on one socket costs exactly one extra handshake', async () => {
+    const h = await harness();
+    try {
+      await h.plugin.subscribe(h.topic, () => undefined);
+      const dialsBefore = h.fake.connectionsOpened;
+      for (let i = 0; i < 40; i++) {
+        h.fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+      }
+      await vi.waitFor(() => expect(h.fake.liveSockets).toBe(2), { timeout: 4000, interval: 5 });
+      await new Promise((r) => setTimeout(r, 400));
+      expect(h.fake.connectionsOpened - dialsBefore, 'extra handshakes').toBe(1);
+      expect(h.fake.liveSockets, 'orphaned sockets').toBe(2);
     } finally {
       await h.cleanup();
     }

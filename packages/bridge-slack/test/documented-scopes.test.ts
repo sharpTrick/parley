@@ -17,7 +17,12 @@ import {
   DEFAULT_DEADLINE_MS,
   MAX_BACKOFF_MS,
 } from '@sharptrick/parley-net-util';
-import { HISTORY_PAGE_LIMIT, MAX_HISTORY_PAGES } from '../src/index.js';
+import {
+  DIAL_BACKOFF_MS,
+  HISTORY_PAGE_LIMIT,
+  MAX_DIAL_BACKOFF_MS,
+  MAX_HISTORY_PAGES,
+} from '../src/index.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -122,6 +127,79 @@ describe('slack rate-limit docs track the shared helper', () => {
     const text = paragraph();
     expect(text).toMatch(/honoured\s+\*\*in full\*\*/);
     expect(text).not.toMatch(/`Retry-After`[\s\S]*honoured up to/);
+  });
+
+  // The same paragraph now quotes the degradation ladder, and an operator reads its cost/latency
+  // claim off those two figures — so they are pinned by value from the source, like the net-util set.
+  it('names the degradation ladder constants it depends on, by value', () => {
+    const text = paragraph();
+    expect(text, 'DIAL_BACKOFF_MS not named').toContain('DIAL_BACKOFF_MS');
+    expect(text, 'DIAL_BACKOFF_MS value missing').toContain(`${DIAL_BACKOFF_MS} ms`);
+    expect(text, 'MAX_DIAL_BACKOFF_MS not named').toContain('MAX_DIAL_BACKOFF_MS');
+    expect(text, 'MAX_DIAL_BACKOFF_MS value missing').toContain(seconds(MAX_DIAL_BACKOFF_MS));
+  });
+
+  // The superseded claim itself: the plugin re-queried history exactly once, at the deadline. An
+  // operator reading that sizes `block_max_ms` expecting a minute of latency to be normal.
+  it('does not restate the superseded rule that history is re-read only at the end', () => {
+    expect(paragraph()).not.toMatch(/re-querying history once at the end|two `conversations\.history`/);
+  });
+});
+
+/**
+ * CLASS: a README consequence about CORE behaviour, asserted against core rather than narrated.
+ *
+ * The "give every session its own bot" warning used to justify itself with a roster collapse —
+ * "their presence heartbeats all arrive as the same `senderHandle`, the roster collapses them into
+ * one phantom peer … and hand-off by handle then targets the wrong instance". Core stopped working
+ * that way: `computeRoster` keys on the presence RECORD's self-reported `handle` and scopes liveness
+ * per per-process `instanceId`, precisely so bot-token backends do not collapse. The prose outlived
+ * the mechanism, and an operator reading it provisions a second Slack app to avoid a failure that
+ * does not occur. `computeRoster` is not exported from `@sharptrick/parley-core`, so the mechanism is
+ * pinned from its source: if core goes back to keying on `senderHandle`, this fails and the README
+ * has to move with it.
+ */
+describe('slack multi-session docs track the roster mechanism in core', () => {
+  const presenceSource = (): string => read('../../bridge-core/src/engine/presence.ts');
+
+  const emitterOfBody = (): string => {
+    const found = /function emitterOf\([^)]*\): Handle \{([\s\S]*?)\n\}/.exec(presenceSource());
+    expect(found, 'bridge-core presence.ts has no emitterOf(rec, m) function').not.toBeNull();
+    return found![1]!;
+  };
+
+  it('core keys the roster on the record handle, with senderHandle only as the fallback', () => {
+    const body = emitterOfBody();
+    // The record's handle leads; `senderHandle` may appear only as the undefined-fallback arm.
+    expect(body).toMatch(/rec\.handle === undefined \?[\s\S]*m\.senderHandle[\s\S]*rec\.handle/);
+    expect(presenceSource(), 'liveness is scoped per instance').toContain('rec.instanceId');
+  });
+
+  /** The section with its line wrapping collapsed, so a claim is matched as prose, not as layout. */
+  const multiSession = (): string => {
+    const readme = read('../README.md');
+    const found = /## Multiple concurrent sessions[\s\S]*?\n## /.exec(readme);
+    expect(found, 'README has no Multiple concurrent sessions section').not.toBeNull();
+    return found![0]!.replace(/\s+/g, ' ');
+  };
+
+  it('does not restate the superseded roster-collapse consequence', () => {
+    const text = multiSession();
+    for (const claim of [/roster collapses/i, /phantom peer/i, /targets the wrong instance/i]) {
+      expect(text, `superseded claim still present: ${String(claim)}`).not.toMatch(claim);
+    }
+  });
+
+  it('states the consequences that do survive, and that the roster is not one of them', () => {
+    const text = multiSession();
+    // Attribution in agent context, which the conformance identity case pins executably…
+    expect(text).toMatch(/senderHandle/);
+    expect(text).toMatch(/one bot id/i);
+    // …the Socket Mode connection quota…
+    expect(text).toMatch(/~10 concurrent connections per app token/);
+    // …and an explicit statement that `parley_list_users` is unaffected, so the corrected claim is
+    // itself pinned rather than merely absent.
+    expect(text).toMatch(/`parley_list_users` is \*\*not\*\* affected/);
   });
 });
 

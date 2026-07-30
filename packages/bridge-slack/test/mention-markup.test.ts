@@ -100,6 +100,113 @@ const ROWS: Array<{ name: string; text: string; mentions: string[]; content?: st
   { name: 'plain text with no markup', text: 'nothing to see', mentions: [] },
 ];
 
+/**
+ * CLASS: one configured mapping, applied to every surface that carries a Slack id.
+ *
+ * `mention_map` is "Slack user/usergroup id → Parley handle", and it used to govern `content` only —
+ * so the same configured person surfaced as `@alice` inside the text and as an opaque `U0ALICE` in
+ * `senderHandle`. Two identities for one human: the roster, a `filter` glob over handles, and any
+ * "who said this" reasoning saw the id while the text said the handle. Every row below asserts BOTH
+ * fields from the SAME record, so a future field carrying an id has to declare whether the map
+ * applies to it rather than inheriting an answer by accident.
+ */
+const IDENTITY_ROWS: Array<{
+  name: string;
+  event: Record<string, unknown>;
+  senderHandle: string;
+  mentions: string[];
+}> = [
+  {
+    name: 'a mapped user id',
+    event: { user: 'U0PARLEY', text: 'hi <@U0PARLEY>' },
+    senderHandle: 'ctx-payments',
+    mentions: ['ctx-payments'],
+  },
+  {
+    name: 'an unmapped user id',
+    event: { user: 'U0ALICE', text: 'hi <@U0ALICE>' },
+    senderHandle: 'U0ALICE',
+    mentions: ['U0ALICE'],
+  },
+  {
+    name: 'a bot_id only, mapped',
+    event: { bot_id: 'S0OPS', text: 'from the ops app' },
+    senderHandle: 'ops-crew',
+    mentions: [],
+  },
+  {
+    name: 'a bot_id only, unmapped',
+    event: { bot_id: 'B0HOOK', text: 'from a webhook' },
+    senderHandle: 'B0HOOK',
+    mentions: [],
+  },
+  {
+    name: 'a user id that takes precedence over a bot_id',
+    event: { user: 'U0PARLEY', bot_id: 'B0HOOK', text: 'both fields present' },
+    senderHandle: 'ctx-payments',
+    mentions: [],
+  },
+  {
+    name: 'neither a user nor a bot_id',
+    event: { text: 'from a workflow' },
+    senderHandle: 'unknown',
+    mentions: [],
+  },
+  {
+    name: 'a meta-key id that IS a configured entry',
+    event: { user: 'toString', text: 'hi <@toString>' },
+    senderHandle: 'meta-mapped',
+    mentions: ['meta-mapped'],
+  },
+  {
+    name: 'a meta-key id that is NOT configured',
+    event: { user: 'constructor', text: 'hi <@constructor>' },
+    senderHandle: 'constructor',
+    mentions: ['constructor'],
+  },
+];
+
+describe('slack mention_map governs sender attribution and mention markup alike', () => {
+  for (const row of IDENTITY_ROWS) {
+    it(`${row.name}: same handle on the history and live paths`, async () => {
+      await withPlugin(async (fake, plugin) => {
+        const topic = asTopic('C0IDENT');
+        fake.createChannel(topic);
+        const live: Message[] = [];
+        await plugin.subscribe(topic, (m) => live.push(m));
+
+        const ts = fake.mintTs();
+        fake.seedRaw(topic, [{ type: 'message', ts, ...row.event }]);
+        fake.pushEvent(topic, { ts, ...row.event });
+        await vi.waitFor(() => expect(live).toHaveLength(1), { timeout: 3000, interval: 10 });
+
+        const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
+        for (const [where, m] of [
+          ['live', live[0]!],
+          ['history', messages[0]!],
+        ] as const) {
+          expect(String(m.senderHandle), `${where} senderHandle`).toBe(row.senderHandle);
+          expect(m.mentions.map(String), `${where} mentions`).toEqual(row.mentions);
+        }
+      });
+    });
+  }
+
+  // The point of the class, stated once: a mapped id must not read back as an id on ANY surface.
+  it('no surface keeps the raw id for a mapped sender', async () => {
+    await withPlugin(async (fake, plugin) => {
+      const topic = asTopic('C0IDENTRAW');
+      fake.seed(topic, [{ text: 'x' }]);
+      fake.seedRaw(topic, [
+        { type: 'message', ts: fake.mintTs(), user: 'U0PARLEY', text: 'from parley' },
+      ]);
+      const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
+      expect(messages.map((m) => String(m.senderHandle))).not.toContain('U0PARLEY');
+      expect(messages.at(-1)!.senderHandle).toBe('ctx-payments');
+    });
+  });
+});
+
 async function withPlugin<T>(fn: (fake: FakeSlack, plugin: SlackPlugin) => Promise<T>): Promise<T> {
   const fake = await FakeSlack.start();
   const plugin = new SlackPlugin();
@@ -167,18 +274,32 @@ describe('slack mention markup becomes Parley handles on both delivery paths', (
     });
   });
 
-  it('a message the bridge posts to itself round-trips as its own handle', async () => {
+  // The rewrite reads markup Slack put on the wire, never markup Parley did: `post` escapes its
+  // content, so a mention can only ever be inbound. Both paths must agree on that, which is what
+  // keeps a relayed `<@U0PARLEY>` from becoming a real mention (see `vendor-markup.test.ts`).
+  it('the rewrite fires only for inbound markup, never for markup the bridge posted', async () => {
     await withPlugin(async (fake, plugin) => {
       const topic = asTopic('C0MENTSELF');
       fake.createChannel(topic);
       const live: Message[] = [];
       await plugin.subscribe(topic, (m) => live.push(m));
       await plugin.post(topic, asHandle('writer'), 'over to you <@U0PARLEY>');
+      fake.seed(topic, [{ text: 'inbound <@U0PARLEY>' }]);
+      fake.pushEvent(topic, { ts: fake.mintTs(), text: 'inbound <@U0PARLEY>', user: 'U0HUMAN' });
 
-      await vi.waitFor(() => expect(live).toHaveLength(1), { timeout: 3000, interval: 10 });
-      expect(live[0]!.mentions.map(String)).toEqual(['ctx-payments']);
+      await vi.waitFor(() => expect(live).toHaveLength(2), { timeout: 3000, interval: 10 });
       const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
-      expect(messages.at(-1)!.mentions.map(String)).toEqual(['ctx-payments']);
+      for (const [where, posted, inbound] of [
+        ['live', live[0]!, live[1]!],
+        ['history', messages[0]!, messages[1]!],
+      ] as const) {
+        expect(posted.content, where).toBe('over to you <@U0PARLEY>');
+        // Core's parser still reads the bare `@U0PARLEY` token out of the literal text; what must
+        // never appear is the CONFIGURED handle, which is what a `mention_filter` is armed on.
+        expect(posted.mentions.map(String), where).not.toContain('ctx-payments');
+        expect(inbound.content, where).toBe('inbound @ctx-payments');
+        expect(inbound.mentions.map(String), where).toEqual(['ctx-payments']);
+      }
     });
   });
 });

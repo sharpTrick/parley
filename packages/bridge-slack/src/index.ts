@@ -73,9 +73,13 @@ class SlackApiError extends Error {
 const ABSENT_ON_READ = ['channel_not_found', 'not_in_channel'];
 const ABSENT_ON_WRITE = ['channel_not_found'];
 
-/** First and maximum cooldown between poll-driven `apps.connections.open` dials. */
+/**
+ * First and maximum rung of the degraded-Socket-Mode ladder: the cooldown between poll-driven
+ * `apps.connections.open` dials, and the interval at which a blocked `fetchRecent` re-reads
+ * `conversations.history` while the live stream is not yet serving it.
+ */
 export const DIAL_BACKOFF_MS = 500;
-const MAX_DIAL_BACKOFF_MS = 5_000;
+export const MAX_DIAL_BACKOFF_MS = 5_000;
 
 /**
  * How long a Socket Mode connection may stay silent after opening before we give up on `hello`.
@@ -107,6 +111,8 @@ const asSeamError = (e: unknown, topic: Topic, absentCodes: string[]): unknown =
 interface SocketEnvelope {
   type?: string;
   envelope_id?: string;
+  /** Only on a `disconnect` envelope: `warning` (a pre-refresh notice) / `refresh_requested` / …. */
+  reason?: string;
   payload?: { event?: SlackMessage };
 }
 
@@ -221,6 +227,8 @@ export class SlackPlugin implements BackendPlugin {
   private dialBackoffMs = DIAL_BACKOFF_MS;
   /** Whether a {@link reconnect} loop already owns re-establishing the shared socket. */
   private reconnecting = false;
+  /** Sockets that have already spent their one pre-refresh rotation — see {@link routeEnvelope}. */
+  private readonly rotating = new WeakSet<WebSocket>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SlackBackendConfig;
@@ -278,7 +286,10 @@ export class SlackPlugin implements BackendPlugin {
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     this.require();
-    const body: Record<string, unknown> = { channel: this.channelFor(topic), text: content };
+    const body: Record<string, unknown> = {
+      channel: this.channelFor(topic),
+      text: escapeSlackText(content),
+    };
     if (opts?.inReplyTo !== undefined) body.thread_ts = opts.inReplyTo;
     const resp = await this.api<{ ok: boolean; ts?: string }>('chat.postMessage', body).catch(
       (e: unknown) => {
@@ -310,11 +321,14 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * Hold a blocked `fetchRecent` for the caller's whole budget: park on the shared Socket Mode
-   * stream once the handshake lands, and until then retry it on its own cooldown. Keep the wait HERE
-   * rather than returning an empty page the moment Socket Mode is unavailable, so that core's
-   * generic re-drive cannot turn one blocked `fetch_recent` into one `conversations.history` request
-   * per `block_poll_interval_ms` for the whole budget — a tiered method, on one channel.
+   * Hold a blocked `fetchRecent` for the caller's whole budget. Once the Socket Mode handshake
+   * lands, park on the shared stream. Until it does — a missing `app_token`, a failing handshake, a
+   * socket that accepts and stays silent — re-query `conversations.history` on the SAME capped
+   * ladder the dial cooldown uses, so that a message already durable in history is delivered on the
+   * next rung instead of being withheld until the deadline. Keep the whole wait HERE rather than
+   * returning an empty page the moment Socket Mode is unavailable, so that core's generic re-drive
+   * cannot turn one blocked `fetch_recent` into one `conversations.history` request per
+   * `block_poll_interval_ms` for the whole budget — a tiered method, on one channel.
    */
   private async blockForMessage(
     args: FetchRecentArgs,
@@ -324,36 +338,37 @@ export class SlackPlugin implements BackendPlugin {
     const aborted: FetchRecentResult = { messages: [], nextCursor: since };
     const channel = this.channelFor(args.topic);
     const sinceTs = String(since);
+    let rungMs = DIAL_BACKOFF_MS;
     while (!this.stopped) {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) break;
-      // The handshake is bounded by `handshake_timeout_ms`, which may be far longer than this
-      // call's budget; keep the caller's own bound here too, so that `block_ms` stays the ceiling
-      // a blocked `parley_fetch_recent` actually observes.
-      const live = await withDeadline(this.ensurePollSocket(), remaining).then(
+      // The handshake is bounded by `handshake_timeout_ms`, which may be far longer than one ladder
+      // rung; bound the wait for it by the rung too, so that a socket which accepts and then says
+      // nothing cannot hold the caller past the next history re-query.
+      const live = await withDeadline(this.ensurePollSocket(), Math.min(remaining, rungMs)).then(
         () => true,
         () => false,
       );
       // A teardown that landed while the handshake ran leaves nothing to wait on, and `runFetch`
       // below would reject on the disconnected plugin; the caller gets its empty page instead.
       if (this.stopped) return aborted;
-      if (!live) {
-        // Keep this wait on a waiter rather than a bare timer, so that `disconnect()` drains it
-        // instead of holding the caller for the rest of the dial cooldown.
-        await this.armWaiter(channel, sinceTs, Math.min(deadlineAt - Date.now(), DIAL_BACKOFF_MS))
-          .wait;
-        continue;
-      }
-      // Keep the waiter armed BEFORE the gap-closing re-query, so that a push landing while that
-      // query is in flight is caught rather than lost — a lost wakeup here blocks for the whole budget.
-      const { wait, wake } = this.armWaiter(channel, sinceTs, deadlineAt - Date.now());
-      const afterConnect = await this.runFetch(args);
-      if (afterConnect.messages.length > 0) {
+      // Keep the waiter armed BEFORE the re-query, so that a push landing while that query is in
+      // flight is caught rather than lost — a lost wakeup here blocks for the whole budget. A rung
+      // waiter is a waiter rather than a bare timer, so that `disconnect()` drains it.
+      const budget = deadlineAt - Date.now();
+      const { wait, wake } = this.armWaiter(
+        channel,
+        sinceTs,
+        live ? budget : Math.min(budget, rungMs),
+      );
+      const requeried = await this.runFetch(args);
+      if (requeried.messages.length > 0) {
         wake();
-        return afterConnect;
+        return requeried;
       }
       await wait;
-      break;
+      if (live) break;
+      rungMs = Math.min(rungMs * 2, MAX_DIAL_BACKOFF_MS);
     }
     if (this.stopped) return aborted;
     return this.runFetch(args);
@@ -447,7 +462,23 @@ export class SlackPlugin implements BackendPlugin {
     this.require();
     const channel = this.channelFor(topic);
     this.routes.set(channel, { topic, handler });
-    await this.ensureSocket();
+    try {
+      await this.ensureSocket();
+      // Socket Mode says nothing about whether this channel exists or is readable, so a typo'd
+      // `channel_map` target or a channel the bot was never invited to would otherwise subscribe
+      // successfully and deliver nothing, forever. Probe it, so that absence reaches core as the
+      // seam's own answer and gets logged and skipped.
+      await this.api<HistoryResponse>('conversations.history', { channel, limit: 1 }).catch(
+        (e: unknown) => {
+          throw asSeamError(e, topic, ABSENT_ON_READ);
+        },
+      );
+    } catch (e: unknown) {
+      // A rejected subscribe is not subscribed: leaving the route would feed a handler core has
+      // already given up on, on a topic it logged as skipped.
+      this.routes.delete(channel);
+      throw e;
+    }
   }
 
   /**
@@ -540,6 +571,14 @@ export class SlackPlugin implements BackendPlugin {
    * `fetch_recent` into hundreds of `apps.connections.open` calls — Slack's tightest rate limit.
    */
   private ensurePollSocket(): Promise<void> {
+    // A reactive-only deployment configures no `app_token`, so the handshake can never be served;
+    // keep it from dialling at all, so that a blocked fetch spends its budget re-reading history
+    // rather than on `apps.connections.open` calls that are answered `not_authed` every time.
+    if (this.appToken === undefined) {
+      return Promise.reject(
+        new Error('Slack Socket Mode needs an app_token; this deployment has no live push'),
+      );
+    }
     if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
       return Promise.reject(
         new Error('Slack Socket Mode handshake backing off after a failed apps.connections.open'),
@@ -706,6 +745,19 @@ export class SlackPlugin implements BackendPlugin {
       return;
     }
     if (env.type === 'disconnect') {
+      // `reason: 'warning'` is Slack's ~10 s notice ahead of a routine refresh, sent precisely so a
+      // client can establish the replacement FIRST and drain this socket. Closing on it converts a
+      // zero-gap rotation into a dial-round-trip gap, and `subscribe` restarts at the tail, so every
+      // event in that gap is lost to the live path for good.
+      if (env.reason === 'warning') {
+        // An envelope is untrusted input: one rotation per socket, and never while a reconnect owner
+        // is already dialling, so that a flood of warnings cannot become a flood of handshakes.
+        if (this.ws !== ws || this.reconnecting || this.rotating.has(ws)) return;
+        this.rotating.add(ws);
+        this.wsReady = undefined;
+        void this.reconnect();
+        return;
+      }
       // Keep this a close rather than a direct redial, so that the `close` handler stays the ONE
       // place a fresh single-use URL is minted and a rotation cannot race a reconnect owner.
       try {
@@ -842,9 +894,10 @@ function requireUsableChannelMap(map: Record<string, string>): Record<string, st
 }
 
 /**
- * The poster's Slack user/bot id. A workflow- or app-authored entry can carry neither field, and an
- * EMPTY `senderHandle` violates the seam's own well-formedness rule and lands in core's identity
- * filter and roster as a blank peer, so fall back to a stable non-empty name.
+ * The poster's Slack user/bot id, before `mention_map` resolves it to a Parley handle. A workflow- or
+ * app-authored entry can carry neither field, and an EMPTY `senderHandle` violates the seam's own
+ * well-formedness rule and lands in core's identity filter and roster as a blank peer, so fall back
+ * to a stable non-empty name.
  */
 const senderOf = (m: SlackMessage): string => {
   for (const id of [m.user, m.bot_id]) {
@@ -864,6 +917,26 @@ const MENTION_RE = /<([@!])([^>|\s]*)(?:\|([^>]*))?>/g;
 /** The `<!…>` bodies that ARE mentions; every other one (`<!date^…>`, …) is left as Slack wrote it. */
 const BROADCASTS = new Set(['here', 'channel', 'everyone']);
 
+/**
+ * Slack's `text` field is its own markup language, and the sender owns the escaping of the three
+ * characters that drive it. Escape them on the way OUT, so that relayed content — an inbound Matrix
+ * message, a prompt-injected agent turn — carrying `<!channel>`, `<!here>` or `<@U…>` is delivered
+ * as literal text instead of becoming a real workspace broadcast or mention. `&` goes first, so that
+ * an already-escaped-looking payload is not silently unescaped by the later replacements.
+ */
+export const escapeSlackText = (text: string): string =>
+  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * The inverse, applied on the way IN so one round trip is the identity and a re-post cannot compound
+ * the escaping. `&amp;` goes LAST, so that `&amp;lt;` decodes to the literal `&lt;` a user typed
+ * rather than all the way to `<`. Keep this AFTER {@link renderMentions}, so that markup a human
+ * typed as literal text (`&lt;!channel&gt;`) can never be decoded into markup and then rewritten as
+ * a mention.
+ */
+export const unescapeSlackText = (text: string): string =>
+  text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
 function renderMentions(text: string, mentionMap: Record<string, string>): string {
   return text.replace(MENTION_RE, (raw, sigil: string, body: string, label?: string) => {
     if (sigil === '!' && !BROADCASTS.has(body) && !body.startsWith('subteam^')) return raw;
@@ -876,10 +949,11 @@ function renderMentions(text: string, mentionMap: Record<string, string>): strin
 }
 
 function slackToMessage(topic: Topic, m: SlackMessage, mentionMap: Record<string, string>): Message {
+  const id = senderOf(m);
   return buildMessage({
     topic,
-    sender: senderOf(m),
-    content: renderMentions(m.text ?? '', mentionMap),
+    sender: mentionMap[id] ?? id,
+    content: unescapeSlackText(renderMentions(m.text ?? '', mentionMap)),
     // Informational only (DESIGN §5) — derived from the ts seconds, never used for ordering.
     timestamp: new Date(Number(m.ts.split('.')[0]) * 1000).toISOString(),
     id: m.ts,

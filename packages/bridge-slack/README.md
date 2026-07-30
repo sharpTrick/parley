@@ -19,7 +19,7 @@ than the retention window silently gets fewer messages back on catch-up.
 | `fetchRecent({since})` | `conversations.history {oldest: since}` — `oldest` is EXCLUSIVE (we never set `inclusive`); pages arrive newest-first and are re-assembled ascending |
 | `subscribe` | **Socket Mode**: one shared websocket per plugin instance (`apps.connections.open` → single-use `wss://` URL) — real Events API pushes, not a poll timer |
 | `resolveIdentity` | handle with `@` → `users.lookupByEmail`; own bot name → `auth.test` user id; else passthrough |
-| `senderHandle` | the Slack **user/bot id of the poster** — the logical `identity` argument of `post` is NOT carried on the wire, so everything this bridge posts reads back as the one bot user (see *Multiple concurrent sessions*). An entry carrying neither `user` nor `bot_id` (some app/workflow posts) reads back as `unknown` |
+| `senderHandle` | the poster's Slack **user/bot id, resolved through `mention_map`** — one configured mapping governs both the handle and the rewritten mention markup, so a mapped person is not two identities in agent context; an unmapped id surfaces as the bare id. The logical `identity` argument of `post` is NOT carried on the wire, so everything this bridge posts reads back as the one bot user (see *Multiple concurrent sessions*). An entry carrying neither `user` nor `bot_id` (some app/workflow posts) reads back as `unknown` |
 | `mentions` | Slack's `<@U…>` / `<@U…\|label>` / `<!subteam^S…\|@team>` / `<!here>` markup, rewritten to the `@handle` form core parses — see *Mentions* |
 | absent topic | `channel_not_found` (and `not_in_channel` on read) → the seam's `NoSuchTopicError`, i.e. "topic not present yet"; every other `ok:false` is a real error |
 
@@ -59,6 +59,16 @@ the fallback, and an unmapped, unlabelled id surfaces as the bare id — visible
 a configured handle. Non-mention markup (`<!date^…>`, `<https://…|link>`, `<#C0…|general>`) is left
 verbatim.
 
+**Escaping, and why `post` cannot mention anyone.** Slack's `text` field is markup, and the sender
+owns the escaping of `&`, `<` and `>`. Everything Parley relays is untrusted — an inbound Matrix or
+Discord message, a prompt-injected agent turn — so `post` escapes all three: content carrying
+`<!channel>`, `<!here>`, `<!everyone>` or `<@U0BOSS>` is delivered as **literal text**, never as a
+workspace broadcast or a real mention. The read side decodes the same three entities (Slack returns
+them escaped, including for text a human typed), so one `post` → `fetchRecent` round trip is the
+identity and re-posting a message read out of Slack cannot compound the escaping. The consequence to
+know: Parley cannot address a Slack user by native mention — write the `@handle` form and map it with
+`mention_map` instead.
+
 **Colliding topics fail fast.** Two topics that resolve to the same channel — both mapped in
 `channel_map`, or one mapped and the other an unmapped channel-id literal — are rejected. A map
 whose targets collide fails at `connect`; a collision that only appears when an unmapped literal is
@@ -73,11 +83,17 @@ that would not fit the call's `DEFAULT_DEADLINE_MS` = 30 s budget ends the call 
 rather than retrying sooner than Slack asked; a 429 with no usable hint waits
 `DEFAULT_BACKOFF_MS` = 500 ms. All three constants live in `@sharptrick/parley-net-util`. If the
 Socket Mode handshake is unavailable, a blocked `fetchRecent` does **not** hand the call straight back
-for core to re-drive: it holds the caller's `block_ms`, retrying the handshake on its own backoff and
-re-querying history once at the end. One unavailable Socket Mode therefore costs a handful of
-`apps.connections.open` dials and two `conversations.history` reads per blocked call, rather than one
-of each per poll interval — both methods are separately rate-limited, and `conversations.history` is
-the tighter of the two. Only the loss of an **established** connection starts a reconnect loop, and
+for core to re-drive: it holds the caller's `block_ms` and degrades to polling, re-reading
+`conversations.history` on a capped ladder that starts at `DIAL_BACKOFF_MS` = 500 ms and doubles to
+`MAX_DIAL_BACKOFF_MS` = 5 s, retrying the handshake on the same rungs. That matters for latency, not
+only cost: the message is already durable in history, so it is delivered on the **next rung** instead
+of being withheld until the deadline — which at the default `block_max_ms` of 60 s would be a minute
+of silent delay per message for as long as Socket Mode stayed unreachable. The reactive-only
+configuration is covered by the same ladder: with no `app_token` there is no handshake to attempt, so
+history is polled and nothing is dialled. One unavailable Socket Mode therefore costs O(log
+`block_ms`) reads and dials per blocked call rather than one of each per poll interval — both methods
+are separately rate-limited, and `conversations.history` is the tighter of the two.
+Only the loss of an **established** connection starts a reconnect loop, and
 only one such loop runs at a time; a handshake that never completed belongs to the caller that asked
 for it, so a failure cannot fan out into parallel redial loops.
 
@@ -147,11 +163,14 @@ server — all pointed at the same workspace:
 
 - **`bot_token` / `app_token`** — **give every session its own bot** (its own app, or at least its
   own bot user). Slack stamps the posting bot as the sender and `post` cannot override it, so
-  sessions sharing one bot token are indistinguishable on read-back: their presence heartbeats all
-  arrive as the same `senderHandle`, the roster collapses them into one phantom peer advertising
-  whichever beat landed last, and hand-off by handle then targets the wrong instance. Socket Mode
-  also allows only ~10 concurrent connections per app token; each plugin instance holds ONE, and
-  every open socket receives **every** subscribed event and filters locally.
+  sessions sharing one bot token are indistinguishable on read-back: every session's messages arrive
+  under the one bot id, so neither a human reading the channel nor an agent reasoning over
+  `senderHandle` in its context can tell which session spoke. `parley_list_users` is **not** affected
+  — a presence beat carries its emitter's handle inside the record and core keys the roster on that,
+  with liveness scoped per random per-process instance id, so two sessions on one bot token still
+  appear as two peers with their own topics. Socket Mode also allows only ~10 concurrent connections
+  per app token; each plugin instance holds ONE, and every open socket receives **every** subscribed
+  event and filters locally.
 - **`presence.topic`** — must be mapped in `channel_map` to a real channel id (or presence
   disabled). The default `parley-presence` is not a channel id, so it resolves to a channel that
   does not exist and the roster stays empty.

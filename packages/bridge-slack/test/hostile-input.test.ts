@@ -13,7 +13,7 @@
  */
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { SlackPlugin } from '../src/index.js';
+import { compareTs, SlackPlugin, TS_RE } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 
 const COLLIDING: Array<{ name: string; map: Record<string, string>; topics: [string, string] }> = [
@@ -233,7 +233,7 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
       await expect(
         plugin.connect({
           api_url: 'http://127.0.0.1:1/api',
-          channel_map: { alpha: bad } as Record<string, string>,
+          channel_map: { alpha: bad } as unknown as Record<string, string>,
         }),
         JSON.stringify(bad),
       ).rejects.toThrow(/alpha[\s\S]*not a channel id/);
@@ -371,23 +371,50 @@ describe('slack history robustness: one hostile record must not wedge catch-up',
 });
 
 /**
- * CLASS: a field that passes the SHAPE guard but not the RANGE guard. The fixed table above names
- * the widths someone thought of; this generates every `ts` the accepted shape admits — including
- * the widths nobody thought of — and asserts the normalize path neither throws nor loses ground.
+ * CLASS: a field that passes the SHAPE guard but not the RANGE guard, and — the reason this block was
+ * rewritten — a test that RESTATES a guard it could import. The self-check below used to assert the
+ * generator against a paraphrase (`\d+\.\d+`) rather than against `TS_RE`, so it could not fail: 85 of
+ * its 121 rows are in fact REJECTED by the real guard, while the describe claimed every generated
+ * string was admitted. Both arms are now named, and each row states which side of the guard it is on,
+ * so tightening or loosening `TS_RE` moves rows across the split instead of quietly emptying it.
  */
-const TS_WIDTHS = [1, 2, 9, 10, 11, 12, 13, 17, 40, 400];
+const TS_WIDTHS = [1, 2, 9, 10, 11, 12, 13, 14, 17, 40, 400];
 
-describe('slack ts range: every string the shape guard admits must normalize', () => {
-  const generated = TS_WIDTHS.flatMap((secs) =>
-    TS_WIDTHS.map((sub) => `${'9'.repeat(secs)}.${'1'.repeat(sub)}`),
-  );
+const GENERATED = TS_WIDTHS.flatMap((secs) =>
+  TS_WIDTHS.map((sub) => `${'9'.repeat(secs)}.${'1'.repeat(sub)}`),
+);
+const ADMITTED = GENERATED.filter((ts) => TS_RE.test(ts));
+const REJECTED = GENERATED.filter((ts) => !TS_RE.test(ts));
 
-  it('the generator only produces strings the shape guard would accept', () => {
-    for (const ts of generated) expect(/^\d+\.\d+$/.test(ts)).toBe(true);
-    expect(generated.length).toBe(TS_WIDTHS.length ** 2);
+describe('slack ts range: the shape guard admits and rejects exactly what it says', () => {
+  it('every generated row is classified by the exported guard, not by a paraphrase of it', () => {
+    for (const ts of GENERATED) {
+      const [secs = '', sub = ''] = ts.split('.');
+      // The guard's own digit bounds, restated ONLY as the expectation — the guard itself is imported.
+      expect(TS_RE.test(ts), ts).toBe(secs.length <= 12 && sub.length <= 12);
+    }
+    expect(GENERATED.length).toBe(TS_WIDTHS.length ** 2);
+    // Both arms non-empty: a guard change that emptied either one would leave the tables below
+    // asserting nothing while still passing.
+    expect(ADMITTED.length).toBeGreaterThan(0);
+    expect(REJECTED.length).toBeGreaterThan(0);
+    expect(ADMITTED.length + REJECTED.length).toBe(GENERATED.length);
   });
 
-  it('history: no generated ts rejects the call or rolls the cursor backwards', async () => {
+  // Positive controls at the boundary, on both sides of the dot independently — the widths a
+  // generated sweep can drift away from.
+  it.each([
+    ['12 seconds digits', `${'9'.repeat(12)}.1`, true],
+    ['13 seconds digits', `${'9'.repeat(13)}.1`, false],
+    ['12 suffix digits', `1.${'1'.repeat(12)}`, true],
+    ['13 suffix digits', `1.${'1'.repeat(13)}`, false],
+    ['12 on both sides', `${'9'.repeat(12)}.${'1'.repeat(12)}`, true],
+    ['13 on both sides', `${'9'.repeat(13)}.${'1'.repeat(13)}`, false],
+  ])('%s is %s', (_label, ts, admitted) => {
+    expect(TS_RE.test(ts)).toBe(admitted);
+  });
+
+  it('history: every ADMITTED ts normalizes, and every REJECTED one is dropped', async () => {
     const fake = await FakeSlack.start();
     const plugin = new SlackPlugin();
     await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
@@ -396,18 +423,32 @@ describe('slack ts range: every string the shape guard admits must normalize', (
       const anchor = fake.seed(topic, [{ text: 'anchor' }])[0]!;
       fake.seedRaw(
         topic,
-        generated.map((ts) => ({ type: 'message', ts, text: `gen-${ts.length}`, user: 'U0' })),
+        GENERATED.map((ts) => ({ type: 'message', ts, text: `gen-${ts}`, user: 'U0' })),
       );
 
       for (const since of [undefined, asCursor('0'), asCursor(anchor.ts)]) {
+        const where = `since=${String(since)}`;
         const result = await plugin.fetchRecent(
-          since === undefined ? { topic, limit: 100 } : { topic, since, limit: 100 },
+          since === undefined ? { topic, limit: 1000 } : { topic, since, limit: 1000 },
         );
-        expect(String(result.nextCursor).length).toBeGreaterThan(0);
+        expect(String(result.nextCursor).length, where).toBeGreaterThan(0);
+        const surfaced = new Set(result.messages.map((m) => String(m.backendMsgId)));
         for (const m of result.messages) {
-          expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
-          expect(String(m.senderHandle).length).toBeGreaterThan(0);
+          expect(Number.isNaN(Date.parse(m.timestamp)), where).toBe(false);
+          expect(String(m.senderHandle).length, where).toBeGreaterThan(0);
+          expect(String(m.cursor).length, where).toBeGreaterThan(0);
         }
+        // Two independent filters meet here: the exclusive `oldest` floor, which legitimately hides
+        // an admitted `ts` below it, and the shape guard. Only the second one is under test, so the
+        // floor is applied to the expectation with the plugin's OWN comparator.
+        const aboveFloor = (ts: string): boolean =>
+          since === undefined || compareTs(ts, String(since)) > 0;
+        // The admitted arm must actually ARRIVE — a guard that rejected everything would otherwise
+        // satisfy "nothing malformed got through" perfectly.
+        const expected = ADMITTED.filter(aboveFloor);
+        expect(expected.length, `${where}: admitted rows in range`).toBeGreaterThan(0);
+        for (const ts of expected) expect(surfaced.has(ts), `${where}: admitted ${ts}`).toBe(true);
+        for (const ts of REJECTED) expect(surfaced.has(ts), `${where}: rejected ${ts}`).toBe(false);
       }
     } finally {
       await plugin.disconnect();
@@ -415,7 +456,7 @@ describe('slack ts range: every string the shape guard admits must normalize', (
     }
   });
 
-  it('live push: no generated ts breaks the socket or reaches a handler unnormalized', async () => {
+  it('live push: every ADMITTED ts reaches the handler, every REJECTED one is dropped, socket survives', async () => {
     const fake = await FakeSlack.start();
     const plugin = new SlackPlugin();
     await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
@@ -425,9 +466,9 @@ describe('slack ts range: every string the shape guard admits must normalize', (
       const seen: string[] = [];
       await plugin.subscribe(topic, (m) => {
         expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
-        seen.push(m.content);
+        seen.push(String(m.backendMsgId));
       });
-      for (const ts of generated) {
+      for (const ts of GENERATED) {
         fake.pushEnvelope({
           type: 'events_api',
           payload: { event: { type: 'message', channel: topic, ts, text: `gen-${ts}`, user: 'U0' } },
@@ -435,7 +476,12 @@ describe('slack ts range: every string the shape guard admits must normalize', (
       }
       // The socket is still serving afterwards — an envelope that killed it would strand this.
       await plugin.post(topic, asHandle('writer'), 'still alive');
-      await vi.waitFor(() => expect(seen).toContain('still alive'), { timeout: 3000, interval: 10 });
+      await vi.waitFor(() => expect(seen.length).toBeGreaterThan(ADMITTED.length), {
+        timeout: 3000,
+        interval: 10,
+      });
+      for (const ts of ADMITTED) expect(seen, `admitted ${ts}`).toContain(ts);
+      for (const ts of REJECTED) expect(seen, `rejected ${ts}`).not.toContain(ts);
     } finally {
       await plugin.disconnect();
       await fake.close();

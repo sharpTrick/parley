@@ -23,10 +23,19 @@
  *     by iteration count — for EVERY method the path touches, not just the one a past fix looked at:
  *     an unavailable Socket Mode must not turn a single `fetch_recent` into hundreds of
  *     `apps.connections.open` handshakes, nor into hundreds of `conversations.history` reads.
+ *
+ * (4) DEGRADED SOURCE. The plugin declares `supportsBlockingFetch`, so core's generic 250 ms
+ *     re-drive can never compensate for a budget the plugin consumed inside ONE call. Every way the
+ *     live stream can fail to serve — no `app_token` at all, a handshake that errors, a socket that
+ *     closes before `hello`, a socket that accepts and says nothing, a ws URL that refuses — must
+ *     therefore keep re-reading history on a bounded ladder, because the message is ALREADY durable
+ *     there. A request ceiling alone cannot state that: parking until the deadline and doing no work
+ *     satisfies every ceiling perfectly, which is why the table below grades DELIVERY LATENCY
+ *     against the ladder's own rungs and pins a work FLOOR next to each ceiling.
  */
 import { asCursor, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { SlackPlugin } from '../src/index.js';
+import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 
 /** Land a message in history AND on the live socket, exactly as a real workspace write would. */
@@ -219,6 +228,126 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
 /** Every Slack method a blocked `fetchRecent` may touch; each is separately rate-limited. */
 const BOUNDED_METHODS = ['apps.connections.open', 'conversations.history'] as const;
 
+/**
+ * The degradation ladder the plugin re-reads history on, derived from its OWN exported constants
+ * rather than restated: rung starts, in ms from the moment the block began.
+ */
+function rungStarts(blockMs: number): number[] {
+  const starts = [0];
+  let at = 0;
+  let width = DIAL_BACKOFF_MS;
+  while (at < blockMs) {
+    at += width;
+    starts.push(at);
+    width = Math.min(width * 2, MAX_DIAL_BACKOFF_MS);
+  }
+  return starts;
+}
+
+/**
+ * When a message durable in history at `landedAt` must have been DELIVERED by: the first ladder rung
+ * at or after it, and never later than the deadline (the final re-query). This is the assertion that
+ * "park until the deadline and do nothing" cannot satisfy.
+ */
+const dueBy = (landedAt: number, blockMs: number): number =>
+  Math.min(rungStarts(blockMs).find((s) => s >= landedAt) ?? blockMs, blockMs);
+
+/** Request/scheduling jitter allowed on top of a ladder rung. */
+const SLACK_MS = 400;
+
+/**
+ * A way for the live event source not to serve, with history still perfectly readable. `appToken`
+ * is stated per row because "no app token at all" is a legal reactive-only config, not a fault.
+ */
+const DEGRADATIONS: Array<{
+  name: string;
+  appToken?: string;
+  arm: (fake: FakeSlack) => void;
+}> = [
+  { name: 'no app_token at all', arm: () => undefined },
+  {
+    name: 'apps.connections.open answering ok:false',
+    appToken: 'xapp-test',
+    arm: (fake) => fake.failMethod('apps.connections.open', 'internal_error'),
+  },
+  {
+    name: 'a socket that closes before hello',
+    appToken: 'xapp-test',
+    arm: (fake) => fake.setGreet('pre-hello-close'),
+  },
+  {
+    name: 'a socket that accepts and stays silent',
+    appToken: 'xapp-test',
+    arm: (fake) => fake.setGreet('silent'),
+  },
+  {
+    name: 'a handed-out ws URL that refuses the connection',
+    appToken: 'xapp-test',
+    arm: (fake) => fake.setWsUrl('ws://127.0.0.1:1/socket'),
+  },
+];
+
+const DEGRADED_BLOCK_MS = 4000;
+/** Where in the budget the message becomes durable in history. */
+const LANDING_FRACTIONS = [0.1, 0.5, 0.9];
+
+describe('slack blocking fetch: a degraded event source must not withhold durable history', () => {
+  for (const degradation of DEGRADATIONS) {
+    for (const fraction of LANDING_FRACTIONS) {
+      const landing = Math.round(DEGRADED_BLOCK_MS * fraction);
+      it(`${degradation.name}: a message durable at ${fraction * 100}% of the budget is delivered on the next ladder rung`, async () => {
+        const fake = await FakeSlack.start();
+        const plugin = new SlackPlugin();
+        await plugin.connect({
+          api_url: fake.apiUrl,
+          bot_token: 'xoxb-test',
+          ...(degradation.appToken === undefined ? {} : { app_token: degradation.appToken }),
+          handshake_timeout_ms: 30_000,
+        });
+        try {
+          const topic = asTopic('C0DEGRADED');
+          fake.createChannel(topic);
+          degradation.arm(fake);
+          // History ONLY — no socket push, because the whole point is that no live stream is serving.
+          setTimeout(() => fake.seed(topic, [{ text: 'durable' }]), landing);
+
+          const t0 = Date.now();
+          const result = await fetchRecentBlocking(
+            plugin,
+            { topic, since: asCursor('0') },
+            { blockMs: DEGRADED_BLOCK_MS, pollIntervalMs: 250 },
+          );
+          const elapsed = Date.now() - t0;
+
+          expect(result.messages.map((m) => m.content)).toEqual(['durable']);
+          // The class: withholding it until the deadline is the defect, so the ceiling is the LADDER,
+          // not the budget. Only the last row may legitimately land at the deadline.
+          expect(elapsed, `elapsed vs ladder`).toBeLessThanOrEqual(
+            dueBy(landing, DEGRADED_BLOCK_MS) + SLACK_MS,
+          );
+          expect(elapsed, 'cannot return before the message exists').toBeGreaterThanOrEqual(
+            landing - SLACK_MS,
+          );
+          // And it stays cheap: the ladder caps every method by wall clock, not by iterations.
+          for (const method of BOUNDED_METHODS) {
+            expect(fake.hits(method), method).toBeLessThanOrEqual(
+              rungStarts(DEGRADED_BLOCK_MS).length + 2,
+            );
+          }
+          // A config with no app token must not dial a handshake it can never complete.
+          if (degradation.appToken === undefined) {
+            expect(fake.hits('apps.connections.open'), 'futile dials').toBe(0);
+          }
+          expect(fake.unauthedHits('conversations.history'), 'unauthenticated reads').toBe(0);
+        } finally {
+          await plugin.disconnect();
+          await fake.close();
+        }
+      });
+    }
+  }
+});
+
 describe('slack blocking fetch: poll storm bound', () => {
   for (const [blockMs, pollIntervalMs] of [
     [3000, 250],
@@ -245,9 +374,16 @@ describe('slack blocking fetch: poll storm bound', () => {
 
         // Re-driving per iteration is blockMs/pollIntervalMs requests (12 and 60 here). One bound
         // over the method name, so a path that trades one method's storm for another cannot pass.
+        const rungs = rungStarts(blockMs).length;
         for (const method of BOUNDED_METHODS) {
-          expect(fake.hits(method), method).toBeLessThanOrEqual(Math.ceil(blockMs / 1000) + 1);
+          expect(fake.hits(method), `${method} ceiling`).toBeLessThanOrEqual(rungs + 2);
         }
+        // …paired with a FLOOR, so that holding the budget and re-reading NOTHING — which passes
+        // every ceiling above with room to spare — fails here instead.
+        expect(fake.hits('conversations.history'), 'history re-read floor').toBeGreaterThanOrEqual(
+          rungs,
+        );
+        expect(fake.hits('apps.connections.open'), 'dial floor').toBeGreaterThanOrEqual(2);
       } finally {
         await plugin.disconnect();
         await fake.close();

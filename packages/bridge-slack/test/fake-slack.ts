@@ -62,6 +62,14 @@ const orderOf = (m: StoredMessage): string => (isOrderable(m) ? m.ts : '0');
 const rand = (): string => Math.random().toString(36).slice(2, 10);
 
 /**
+ * Slack's `text` is markup and the SENDER owns escaping `&`, `<` and `>`. Removing the three legal
+ * entities leaves a string in which any surviving one of those characters is an un-escaped byte the
+ * sender put on the wire — where Slack would parse it as control markup.
+ */
+const stripEntities = (text: string): string => text.replace(/&(amp|lt|gt);/g, '');
+const UNESCAPED_MARKUP = /[&<>]/;
+
+/**
  * Decode one form field the way real Slack does: scalar args arrive as plain strings; array/object
  * args were `JSON.stringify`d by the plugin, so parse those back — but ONLY when the value actually
  * looks like a JSON object/array. A numeric-looking scalar (e.g. a `ts` cursor `oldest`) MUST stay
@@ -106,6 +114,8 @@ export class FakeSlack {
   private readonly hooks = new Map<string, (hit: number) => void | Promise<void>>();
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
+  /** method → requests that arrived with NO `Authorization` header (answered `not_authed`). */
+  readonly unauthenticated = new Map<string, number>();
   private greet: GreetMode = 'greet';
   /** The URL `apps.connections.open` hands out — see {@link setWsUrl}. */
   private handedOutWsUrl?: string;
@@ -200,9 +210,19 @@ export class FakeSlack {
     return this.requests.get(method) ?? 0;
   }
 
+  /** How many of {@link hits} arrived with no bearer token at all. */
+  unauthedHits(method: string): number {
+    return this.unauthenticated.get(method) ?? 0;
+  }
+
   /** Sockets currently connected — must be 0 once a plugin has disconnected. */
   get liveSockets(): number {
     return this.sockets.size;
+  }
+
+  /** The `text` bytes as they reached the wire, before any read-side decoding. */
+  rawTexts(channel: string): string[] {
+    return (this.channels.get(channel) ?? []).map((m) => m.text);
   }
 
   /** Push one raw `events_api` envelope (any subtype) to every connected socket. */
@@ -230,6 +250,26 @@ export class FakeSlack {
     const envelope = JSON.stringify({ envelope_id: envelopeId, ...body });
     for (const ws of this.sockets) ws.send(envelope);
     return envelopeId;
+  }
+
+  /**
+   * Push an envelope with NO `envelope_id`, which is how real Socket Mode sends `hello` and
+   * `disconnect` — Slack asks for an ack only on `events_api`/`slash_commands`/`interactive`. Keep
+   * control envelopes on this method, so that no test can grade ack discipline against an envelope
+   * Slack never asks to have acked.
+   */
+  pushUnackedEnvelope(body: Record<string, unknown>): void {
+    const envelope = JSON.stringify(body);
+    for (const ws of this.sockets) ws.send(envelope);
+  }
+
+  /**
+   * Close the LEAST-recently-connected socket — the old half of a Socket Mode rotation, which
+   * `dropSockets` cannot express because it would take the replacement down with it.
+   */
+  dropOldestSocket(): void {
+    const [oldest] = this.sockets;
+    oldest?.close();
   }
 
   /**
@@ -321,13 +361,17 @@ export class FakeSlack {
       reply({ ok: false, error: 'unknown_method' });
       return;
     }
+
+    const method = req.url.slice('/api/'.length);
+    // Keep the counter AHEAD of the auth check, so that a storm of token-less calls cannot score
+    // zero against every `hits()` ceiling in the suite — the counter's meaning is "reached the wire".
+    this.requests.set(method, this.hits(method) + 1);
     if (req.headers.authorization === undefined) {
+      this.unauthenticated.set(method, this.unauthedHits(method) + 1);
       reply({ ok: false, error: 'not_authed' });
       return;
     }
 
-    const method = req.url.slice('/api/'.length);
-    this.requests.set(method, this.hits(method) + 1);
     const held = this.latency.get(method);
     if (held !== undefined) await new Promise<void>((r) => setTimeout(r, held));
     const failure = this.failures.get(method);
@@ -370,6 +414,12 @@ export class FakeSlack {
       return { ok: false, error: 'invalid_arguments' };
     }
     if (!this.known.has(channel)) return { ok: false, error: 'channel_not_found' };
+    // Real Slack ACCEPTS this and turns it into a live broadcast/mention; refuse it here instead, so
+    // that dropping the sender's escaping cannot pass silently. `unescaped_markup` is this fake's
+    // own sentinel — Slack has no such code, and no production path may depend on it.
+    if (UNESCAPED_MARKUP.test(stripEntities(text))) {
+      return { ok: false, error: 'unescaped_markup' };
+    }
     // Unique AND per-channel monotonic even under concurrent writers: epoch seconds never move
     // backwards and the global counter suffix strictly increases (integer-wise, not lexically).
     const ts = this.mintTs();
