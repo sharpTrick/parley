@@ -1,8 +1,11 @@
 import {
+  Allowlist,
   asCursor,
   asHandle,
   asTopic,
   NoSuchTopicError,
+  SeenSet,
+  startPushLoop,
   type BackendPlugin,
   type Topic,
 } from '@sharptrick/parley-core';
@@ -19,6 +22,9 @@ import {
   startFakeDiscord,
   type FakeDiscord,
 } from './fake-discord.js';
+
+/** A blocking window wide enough that a prompt REST failure lands well inside the call's budget. */
+const BLOCK_MS = 2000;
 
 // The REST half of the seam contract, driven against the in-process fake (test/fake-discord.ts),
 // which now speaks Discord's failure surface too: unknown channels, injectable status/body/headers,
@@ -72,7 +78,7 @@ describe('Discord REST contract', () => {
       ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
       [
         'fetchRecent (blocking)',
-        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 100 }),
+        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: BLOCK_MS }),
       ],
     ];
 
@@ -114,7 +120,7 @@ describe('Discord REST contract', () => {
         ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') }), 'channel'],
         [
           'fetchRecent (blocking)',
-          (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 100 }),
+          (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: BLOCK_MS }),
           'channel',
         ],
         ['resolveIdentity', (p) => p.resolveIdentity(asHandle('someone')), 'user'],
@@ -254,6 +260,19 @@ describe('Discord REST contract', () => {
   });
 
   describe('provider content limit', () => {
+    // CLASS: a provider limit re-implemented locally in the wrong unit. Discord counts CODE POINTS;
+    // `String.length` counts UTF-16 units, which refuses astral text at half the real limit and
+    // quotes a number the provider never measured. An ascii-only table cannot tell the two apart, so
+    // the sizes are crossed with an ALPHABET — and the fake counts code points too, so a cell fails
+    // whenever the plugin's unit and the provider model's disagree in EITHER direction.
+    const ALPHABETS: Array<[string, (points: number) => string]> = [
+      ['ascii', (n) => 'x'.repeat(n)],
+      ['astral emoji', (n) => '\u{1F642}'.repeat(n)],
+      // Two code points per rendered character: a grapheme count would be half of Discord's.
+      ['combining sequences', (n) => 'e\u0301'.repeat(n >> 1) + (n % 2 === 1 ? 'e' : '')],
+      ['CJK extension B', (n) => '\u{2A6B2}'.repeat(n)],
+    ];
+
     const SIZES: Array<[string, number, 'ok' | 'rejected']> = [
       ['limit-1', CONTENT_LIMIT - 1, 'ok'],
       ['exactly limit', CONTENT_LIMIT, 'ok'],
@@ -261,20 +280,29 @@ describe('Discord REST contract', () => {
       ['far over limit', CONTENT_LIMIT * 3, 'rejected'],
     ];
 
-    for (const [label, size, outcome] of SIZES) {
-      it(`post of ${label} characters is ${outcome}`, async () => {
-        const t = liveTopic();
-        const content = 'x'.repeat(size);
-        if (outcome === 'ok') {
-          await expect(plugin.post(t, SENDER, content)).resolves.toBeDefined();
-          return;
-        }
-        const err = await plugin.post(t, SENDER, content).catch((e: unknown) => e);
-        expect(err).toBeInstanceOf(Error);
-        // Actionable: names the limit AND the actual length, not Discord's Invalid Form Body blob.
-        expect(String(err)).toContain(String(CONTENT_LIMIT));
-        expect(String(err)).toContain(String(size));
-      });
+    for (const [alphabet, build] of ALPHABETS) {
+      for (const [label, size, outcome] of SIZES) {
+        it(`post of ${label} ${alphabet} characters is ${outcome}`, async () => {
+          const t = liveTopic();
+          const content = build(size);
+          expect([...content], 'the row does not build the size it claims').toHaveLength(size);
+          if (outcome === 'ok') {
+            // The provider model accepts it too: a plugin cap stricter than Discord's is refusing
+            // content Discord would have taken, which no local assertion can see.
+            await expect(plugin.post(t, SENDER, content)).resolves.toBeDefined();
+            const { messages } = await plugin.fetchRecent({ topic: t, limit: 1 });
+            expect([...messages[0]!.content]).toHaveLength(size);
+            return;
+          }
+          const err = await plugin.post(t, SENDER, content).catch((e: unknown) => e);
+          expect(err).toBeInstanceOf(Error);
+          // Actionable: names the limit AND the length IN THE PROVIDER'S UNIT, not Discord's
+          // Invalid Form Body blob and not a UTF-16 count twice the real one.
+          expect(String(err)).toContain(String(CONTENT_LIMIT));
+          expect(String(err)).toContain(String(size));
+          expect(fake.posts(), 'the over-limit body reached the provider').toHaveLength(0);
+        });
+      }
     }
   });
 
@@ -448,68 +476,76 @@ describe('Discord REST contract', () => {
   });
 
   describe('subscribe on a channel that can never deliver', () => {
-    // CLASS: subscribe accepting a topic it can never push from. Every row below produced a
-    // permanently idle bridge whose only symptom was silence — a typo'd id, a guild the bot was
-    // never invited to, and the DM classes this intent set does not receive.
-    const UNREACHABLE: Array<{
-      label: string;
-      arrange: () => Topic;
-      expect: 'absent' | { names: RegExp };
-    }> = [
-      {
-        label: 'a channel id that was never created (10003)',
-        arrange: () => asTopic(freshChannelId()),
-        expect: 'absent',
-      },
-      {
-        label: 'a channel the bot cannot access (50001)',
-        arrange: () => {
-          const t = liveTopic();
-          fake.injectFault({
-            status: 403,
-            body: { message: 'Missing Access', code: 50001 },
-            path: '/channels/',
-          });
-          return t;
-        },
-        expect: { names: /50001|Missing Access/ },
-      },
-      {
-        label: 'a DM channel',
-        arrange: () => {
-          const id = freshChannelId();
-          fake.createChannel(id, DM);
-          return asTopic(id);
-        },
-        expect: { names: /DM/ },
-      },
-      {
-        label: 'a group DM channel',
-        arrange: () => {
-          const id = freshChannelId();
-          fake.createChannel(id, GROUP_DM);
-          return asTopic(id);
-        },
-        expect: { names: /group DM/ },
-      },
-    ];
+    // CLASS: a capability check written as a denylist over a provider enum. A two-entry denylist
+    // admits every id an operator most plausibly mis-copies from Discord's UI — a category, a forum
+    // or media container, a voice or stage channel — and each one is a permanently idle topic whose
+    // only symptom is silence. So the whole enum is enumerated here rather than sampled, PLUS the
+    // gaps and the ids beyond it, which is where a type Discord adds later would land.
+    const CHANNEL_TYPE_NAMES: Record<number, string> = {
+      0: 'GUILD_TEXT',
+      1: 'DM',
+      2: 'GUILD_VOICE',
+      3: 'GROUP_DM',
+      4: 'GUILD_CATEGORY',
+      5: 'GUILD_ANNOUNCEMENT',
+      10: 'ANNOUNCEMENT_THREAD',
+      11: 'PUBLIC_THREAD',
+      12: 'PRIVATE_THREAD',
+      13: 'GUILD_STAGE_VOICE',
+      14: 'GUILD_DIRECTORY',
+      15: 'GUILD_FORUM',
+      16: 'GUILD_MEDIA',
+    };
+    /**
+     * The types a `MESSAGE_CREATE` can name under GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT, pinned
+     * BY VALUE here — a table generated from the plugin's own set could not see a deletion from it.
+     */
+    const PUSHABLE_TYPES = new Set([0, 2, 5, 10, 11, 12, 13]);
+    const PROBED_TYPES = Array.from({ length: 21 }, (_, type) => type);
 
-    for (const row of UNREACHABLE) {
-      it(`${row.label} is reported, not accepted silently`, async () => {
-        const topic = row.arrange();
-        const err = await plugin.subscribe(topic, () => undefined).catch((e: unknown) => e);
-        expect(err, 'subscribe resolved on a channel it can never push from').toBeInstanceOf(Error);
-        if (row.expect === 'absent') {
-          // Core reads NoSuchTopicError as "not present yet" and skips the topic with a diagnostic.
-          expect(err).toBeInstanceOf(NoSuchTopicError);
-          expect(String(err)).toContain(topic as string);
-        } else {
-          expect(err).not.toBeInstanceOf(NoSuchTopicError);
-          expect(String(err)).toMatch(row.expect.names);
-          expect(String(err)).toContain(topic as string);
+    /** subscribe RESOLVES on an unpushable channel: rejecting costs every other topic (below). */
+    for (const type of PROBED_TYPES) {
+      const name = CHANNEL_TYPE_NAMES[type] ?? `an undocumented type ${type}`;
+      const pushable = PUSHABLE_TYPES.has(type);
+      it(`${name} (type ${type}) is ${pushable ? 'accepted' : 'named on stderr'}`, async () => {
+        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        const id = freshChannelId();
+        fake.createChannel(id, type);
+        await expect(plugin.subscribe(asTopic(id), () => undefined)).resolves.toBeUndefined();
+        const written = diag.mock.calls.map((c) => String(c[0])).join('');
+        if (pushable) {
+          expect(written, 'a pushable channel was reported as unusable').toBe('');
+          return;
         }
+        expect(written, 'an unpushable channel was accepted in silence').toContain(id);
+        expect(written).toContain(`type ${type}`);
+        // Registry rolled back: a subscription whose check failed must not sit in the dispatch map.
+        const subs = (plugin as unknown as { subs: Map<string, unknown> }).subs;
+        expect(subs.has(id), 'the dispatch registry kept an unpushable subscription').toBe(false);
       });
     }
+
+    it('a channel id that was never created (10003) is the seam absent topic', async () => {
+      const absent = asTopic(freshChannelId());
+      const err = await plugin.subscribe(absent, () => undefined).catch((e: unknown) => e);
+      // Core reads NoSuchTopicError as "not present yet" and skips the topic with a diagnostic.
+      expect(err).toBeInstanceOf(NoSuchTopicError);
+      expect(String(err)).toContain(absent as string);
+    });
+
+    it('a channel the bot cannot access (50001) is named on stderr', async () => {
+      const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      const topic = liveTopic();
+      fake.injectFault({
+        status: 403,
+        body: { message: 'Missing Access', code: 50001 },
+        path: '/channels/',
+      });
+      await expect(plugin.subscribe(topic, () => undefined)).resolves.toBeUndefined();
+      const written = diag.mock.calls.map((c) => String(c[0])).join('');
+      expect(written).toContain(topic as string);
+      expect(written).toMatch(/50001|Missing Access/);
+    });
 
     it('a provisioned guild channel subscribes and pushes', async () => {
       const topic = liveTopic();
@@ -518,6 +554,80 @@ describe('Discord REST contract', () => {
       await plugin.post(topic, SENDER, 'hello');
       await expect.poll(() => got, { timeout: 3000 }).toEqual(['hello']);
     });
+  });
+
+  describe('one unpushable topic does not take the whole bridge down', () => {
+    // CLASS: a per-topic failure whose blast radius is the whole bridge. Core's push loop rethrows
+    // anything that is not NoSuchTopicError and a rejecting attach tears the bridge down, so a
+    // plugin that rejects on ONE mis-mapped id costs every other topic its live push AND its
+    // catch-up. Driven through core's own entry point — asserting only that the plugin method
+    // rejects is silent about what the rejection costs.
+    const REASONS: Array<{ label: string; arrange: (id: string) => void }> = [
+      { label: 'a DM', arrange: (id) => fake.createChannel(id, DM) },
+      { label: 'a group DM', arrange: (id) => fake.createChannel(id, GROUP_DM) },
+      { label: 'a category', arrange: (id) => fake.createChannel(id, 4) },
+      {
+        label: 'a channel the bot cannot access (50001)',
+        arrange: (id) => {
+          fake.createChannel(id);
+          fake.injectFault({
+            status: 403,
+            body: { message: 'Missing Access', code: 50001 },
+            path: `/channels/${id}`,
+          });
+        },
+      },
+      {
+        // A CONTROL: a transient failure of the check itself must not cost the other topics either,
+        // and must not drop a subscription whose channel may be perfectly fine.
+        label: 'a transient 500 on the channel check',
+        arrange: (id) => {
+          fake.createChannel(id);
+          fake.injectFault({ status: 500, body: { message: 'oops' }, path: `/channels/${id}` });
+        },
+      },
+    ];
+
+    for (const reason of REASONS) {
+      it(`${reason.label} leaves the other topics live`, async () => {
+        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        const first = freshChannelId();
+        const second = freshChannelId();
+        const bad = freshChannelId();
+        fake.createChannel(first);
+        fake.createChannel(second);
+        reason.arrange(bad);
+
+        const p = await connect();
+        const pushed: string[] = [];
+        const target = {
+          server: {
+            notification: (n: { params: { content: string } }) => {
+              pushed.push(n.params.content);
+              return Promise.resolve();
+            },
+          },
+        } as unknown as Parameters<typeof startPushLoop>[0];
+
+        try {
+          await expect(
+            startPushLoop(target, p, new Allowlist([first, second, bad]), new SeenSet(), {
+              mentionFilter: false,
+              identity: asHandle('me'),
+            }),
+            'one mis-mapped topic failed the whole attach',
+          ).resolves.toBeUndefined();
+
+          await p.post(asTopic(first), SENDER, 'to-the-first-topic');
+          await expect.poll(() => pushed, { timeout: 3000 }).toEqual(['to-the-first-topic']);
+          const { messages } = await p.fetchRecent({ topic: asTopic(second) });
+          expect(messages).toEqual([]); // catch-up still serves the other topics
+          expect(diag.mock.calls.map((c) => String(c[0])).join('')).toContain(bad);
+        } finally {
+          await p.disconnect();
+        }
+      });
+    }
   });
 
   describe('a memoized lookup is not poisoned by a transient failure', () => {

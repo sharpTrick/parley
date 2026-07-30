@@ -17,23 +17,14 @@ import {
   state,
   totalIdentifies,
 } from './fake-gateway.js';
+import { HUGE_HB, NO_HANDSHAKE_TIMEOUT, reachReady, stubFetch } from './harness.js';
 import { dialCeiling, ladderDelays } from './ladder.js';
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const QUOTA_PER_DAY = 1000;
-const HUGE_HB = 1_000_000;
 const HANDSHAKE_MS = 10_000;
 const TOPIC = asTopic('880001');
-
-/** Every REST call answers an empty page: these cases are about dials, not messages. */
-const stubFetch = (): void => {
-  vi.stubGlobal('fetch', () =>
-    Promise.resolve(
-      new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),
-    ),
-  );
-};
 
 const connectPlugin = async (): Promise<DiscordPlugin> => {
   const plugin = new DiscordPlugin();
@@ -154,8 +145,6 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
 // cell measures the spacing the ladder settles at and scales THAT to a day.
 describe('Discord IDENTIFY budget is per BOT TOKEN, not per process', () => {
   const FLEET_SIZES = [1, 2, 4];
-  /** Far enough out that it is never a reconnect delay, so {@link ladderDelays} can drop it. */
-  const NO_HANDSHAKE_TIMEOUT = 10_000_000;
 
   beforeEach(() => {
     resetGateway();
@@ -259,22 +248,23 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
     vi.restoreAllMocks();
   });
 
-  const session = async (
-    plugin: DiscordPlugin,
-    url: string,
-    topic: Topic,
-    sink: string[],
-  ): Promise<FakeWs> => {
+  const openTo = async (plugin: DiscordPlugin, url: string): Promise<void> => {
     await plugin.connect({ token: 't', gateway_url: url, handshake_timeout_ms: HANDSHAKE_MS });
-    const pending = plugin.subscribe(topic, (m) => sink.push(m.content));
-    const ws = instances.at(-1)!;
-    ws.hello(HUGE_HB);
-    // Keep this ahead of `await pending`, so that subscribe's channel check can read its stubbed
-    // REST body: under fake timers a faked immediate drives the body stream.
-    await vi.advanceTimersByTimeAsync(0);
-    await pending;
-    return ws;
   };
+
+  const subscribed = (plugin: DiscordPlugin, topic: Topic, sink: string[]): Promise<FakeWs> =>
+    reachReady(plugin, topic, { handler: (m) => sink.push(m.content) });
+
+  const waitersOf = (plugin: DiscordPlugin): Map<string, Set<() => void>> =>
+    (plugin as unknown as { waiters: Map<string, Set<() => void>> }).waiters;
+
+  // WHICH call retires the first session. `connect()` is documented as starting the NEXT session, so
+  // it owes the same teardown `disconnect()` does — a socket left dispatching while `live` reads
+  // false degrades every later native long-poll to an immediate return, silently and for good.
+  const TRANSITIONS: Array<{ label: string; retire: (p: DiscordPlugin) => Promise<void> }> = [
+    { label: 'disconnect() then connect()', retire: (p) => p.disconnect() },
+    { label: 'connect() alone', retire: async () => undefined },
+  ];
 
   // Each scenario leaves the FIRST session in a different state before it is torn down; none of
   // them may reach into the second one. Crossed with WHEN that state's socket event is delivered:
@@ -330,48 +320,62 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
 
   for (const scenario of SCENARIOS) {
     for (const asyncClose of [false, true]) {
-      it(`a second session is unaffected when ${scenario.label} (close delivered ${
-        asyncClose ? 'async' : 'inline'
-      })`, async () => {
-        state.asyncClose = asyncClose;
-        const plugin = new DiscordPlugin();
-        const firstSink: string[] = [];
-        const ws0 = await session(plugin, OLD_URL, TOPIC, firstSink);
-        await scenario.first(plugin, ws0);
-        await plugin.disconnect();
-        // Under async delivery the ONE pending timer is the fake's own deferred close event, so
-        // only the inline mode can read the count as "what the plugin left behind".
-        if (!asyncClose) {
-          expect(vi.getTimerCount(), 'a timer outlived the first teardown').toBe(0);
-        }
+      for (const transition of TRANSITIONS) {
+        it(`a second session is unaffected when ${scenario.label}, via ${transition.label} (close delivered ${
+          asyncClose ? 'async' : 'inline'
+        })`, async () => {
+          state.asyncClose = asyncClose;
+          const plugin = new DiscordPlugin();
+          const firstSink: string[] = [];
+          await openTo(plugin, OLD_URL);
+          const ws0 = await subscribed(plugin, TOPIC, firstSink);
+          await scenario.first(plugin, ws0);
 
-        state.onIdentify = (ws: FakeWs) => ws.ready();
-        const opened = instances.length;
-        const secondSink: string[] = [];
-        // A DIFFERENT topic, so that the second subscription cannot mask a surviving first-session
-        // entry by overwriting it — same-topic re-subscription hides the whole class.
-        const ws1 = await session(plugin, NEW_URL, LATE_TOPIC, secondSink);
-        const deliveredToFirst = firstSink.length;
-        await vi.advanceTimersByTimeAsync(300_000);
+          await transition.retire(plugin);
+          state.onIdentify = (ws: FakeWs) => ws.ready();
+          const opened = instances.length;
+          await openTo(plugin, NEW_URL);
+          // Under async delivery the ONE pending timer is the fake's own deferred close event, so
+          // only the inline mode can read the count as "what the plugin left behind".
+          if (!asyncClose) {
+            expect(vi.getTimerCount(), 'a timer outlived the first session').toBe(0);
+          }
 
-        // Nothing from the first session may dial, IDENTIFY, or dispatch into the second one.
-        expect(instances.slice(opened).map((ws) => ws.url)).toEqual([NEW_URL]);
-        expect(openSockets()).toHaveLength(1);
-        expect(openSockets()[0]!.url).toBe(NEW_URL);
+          const secondSink: string[] = [];
+          // A DIFFERENT topic, so that the second subscription cannot mask a surviving first-session
+          // entry by overwriting it — same-topic re-subscription hides the whole class.
+          const ws1 = await subscribed(plugin, LATE_TOPIC, secondSink);
+          const deliveredToFirst = firstSink.length;
+          await vi.advanceTimersByTimeAsync(300_000);
 
-        // Usable, not merely un-dialed: the second session's own subscription must carry push,
-        // while the torn-down session's handler must be unreachable — a registry that survived
-        // disconnect() pushes live traffic into a consumer that is gone.
-        ws1.serverSend(messageCreate(TOPIC, 'to-the-dead-session'));
-        ws1.serverSend(messageCreate(LATE_TOPIC, 'to-the-live-session'));
-        expect(firstSink).toHaveLength(deliveredToFirst);
-        expect(secondSink).toEqual(['to-the-live-session']);
+          // Nothing from the first session may dial, IDENTIFY, or dispatch into the second one.
+          expect(instances.slice(opened).map((ws) => ws.url)).toEqual([NEW_URL]);
+          expect(openSockets()).toHaveLength(1);
+          expect(openSockets()[0]!.url).toBe(NEW_URL);
 
-        await plugin.disconnect();
-        await vi.advanceTimersByTimeAsync(1); // deliver the fake's own deferred close event
-        expect(openSockets()).toHaveLength(0);
-        expect(vi.getTimerCount()).toBe(0); // no interval, watchdog or reconnect outlives teardown
-      });
+          // Usable, not merely un-dialed: the second session's own subscription must carry push,
+          // while the torn-down session's handler must be unreachable — a registry that survived
+          // the transition pushes live traffic into a consumer that is gone.
+          ws1.serverSend(messageCreate(TOPIC, 'to-the-dead-session'));
+          ws1.serverSend(messageCreate(LATE_TOPIC, 'to-the-live-session'));
+          expect(firstSink).toHaveLength(deliveredToFirst);
+          expect(secondSink).toEqual(['to-the-live-session']);
+
+          // The new session's socket has to be LIVE, not merely open: a blocking fetch that arms no
+          // waiter returns instantly for the rest of the process, which every assertion above misses.
+          const blocked = plugin
+            .fetchRecent({ topic: LATE_TOPIC, since: asCursor('1'), blockMs: 30_000 })
+            .catch(() => undefined);
+          await vi.advanceTimersByTimeAsync(10);
+          expect(waitersOf(plugin).size, 'the long-poll armed no waiter, so it never waits').toBe(1);
+
+          await plugin.disconnect();
+          await blocked;
+          await vi.advanceTimersByTimeAsync(1); // deliver the fake's own deferred close event
+          expect(openSockets()).toHaveLength(0);
+          expect(vi.getTimerCount()).toBe(0); // no interval, watchdog or reconnect outlives teardown
+        });
+      }
     }
   }
 

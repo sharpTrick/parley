@@ -13,17 +13,9 @@ vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs
 import { DiscordPlugin } from '../src/index.js';
 import { REQUIRED_INTENTS } from '../src/intents.js';
 import { FAKE_TOKEN, FakeWs, instances, resetGateway, state } from './fake-gateway.js';
+import { HUGE_HB, reachReady, stubFetch } from './harness.js';
 
-const HUGE_HB = 1_000_000;
 const TOPIC = asTopic('920001');
-
-const stubFetch = (): void => {
-  vi.stubGlobal('fetch', () =>
-    Promise.resolve(
-      new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),
-    ),
-  );
-};
 
 interface IdentifyPayload {
   token?: unknown;
@@ -46,11 +38,7 @@ describe('Discord IDENTIFY carries the credential and capability bits', () => {
   const identify = async (): Promise<IdentifyPayload> => {
     const plugin = new DiscordPlugin();
     await plugin.connect({ token: FAKE_TOKEN, gateway_url: 'ws://fake' });
-    const pending = plugin.subscribe(TOPIC, () => undefined);
-    const ws = instances.at(-1)!;
-    ws.hello(HUGE_HB);
-    await vi.advanceTimersByTimeAsync(0);
-    await pending;
+    const ws = await reachReady(plugin, TOPIC);
     const frame = ws.sent.find((f) => f.op === 2);
     expect(frame, 'the plugin never sent an IDENTIFY').toBeDefined();
     await plugin.disconnect();
@@ -135,11 +123,7 @@ describe('the fake gateway refuses an IDENTIFY the real one would refuse', () =>
   it('accepts the frame the plugin actually sends', async () => {
     const plugin = new DiscordPlugin();
     await plugin.connect({ token: FAKE_TOKEN, gateway_url: 'ws://fake' });
-    const pending = plugin.subscribe(TOPIC, () => undefined);
-    const ws = instances.at(-1)!;
-    ws.hello(HUGE_HB);
-    await vi.advanceTimersByTimeAsync(0);
-    await expect(pending).resolves.toBeUndefined();
+    const ws = await reachReady(plugin, TOPIC);
     expect(ws.readyState).toBe(FakeWs.OPEN);
     expect(ws.closedCode).toBeUndefined();
 

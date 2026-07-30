@@ -103,12 +103,23 @@ const OP = {
 const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
 
 /**
- * Channel types that carry no `MESSAGE_CREATE` under this intent set (no `DIRECT_MESSAGES`), so a
- * subscription on one can never deliver: DM (1) and group DM (3).
+ * Channel types that DO carry `MESSAGE_CREATE` under this intent set (GUILDS | GUILD_MESSAGES |
+ * MESSAGE_CONTENT, no `DIRECT_MESSAGES`): guild text (0), the text chat of voice (2) and stage (13)
+ * channels, announcements (5), and the three thread classes (10/11/12). Keep this an ALLOWLIST, so
+ * that an id no `MESSAGE_CREATE` can ever name — a category, a forum or media container, a
+ * directory, a DM, or a type Discord adds after this was written — is named on stderr instead of
+ * becoming a permanently idle topic.
  */
-const UNPUSHABLE_CHANNEL_TYPES = new Map([
+const PUSHABLE_CHANNEL_TYPES = new Set([0, 2, 5, 10, 11, 12, 13]);
+
+/** How to describe the channel types an operator most plausibly mis-copies from Discord's UI. */
+const CHANNEL_TYPE_NAMES = new Map([
   [1, 'a DM'],
   [3, 'a group DM'],
+  [4, 'a category'],
+  [14, 'a directory'],
+  [15, 'a forum container (its threads carry the messages)'],
+  [16, 'a media container (its threads carry the messages)'],
 ]);
 
 /** Discord REST error code for a channel that exists but this bot cannot access. */
@@ -251,28 +262,46 @@ export class DiscordPlugin implements BackendPlugin {
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as DiscordBackendConfig;
+    const channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
+    const channelOwner = requireDistinctChannels(channelMap);
+    const reconnectCapMs = RECONNECT_CAP_MS * requireDialerCount(cfg.gateway_dialers);
+
+    // Retire the previous session BEFORE installing the new config, so that a re-entrant connect()
+    // cannot leave the old socket dispatching into a plugin whose `live` flag says there is none —
+    // which silently degrades every later native long-poll to an immediate return.
+    this.stopped = true;
+    this.sessionEpoch++;
+    this.teardownSession();
+
     this.apiUrl = (cfg.api_url ?? 'https://discord.com/api/v10').replace(/\/+$/, '');
     this.token = cfg.token;
     this.gatewayUrlOverride = cfg.gateway_url;
-    this.channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
-    this.channelOwner = requireDistinctChannels(this.channelMap);
+    this.channelMap = channelMap;
+    this.channelOwner = channelOwner;
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
-    this.reconnectCapMs = RECONNECT_CAP_MS * requireDialerCount(cfg.gateway_dialers);
+    this.reconnectCapMs = reconnectCapMs;
     this.allowedMentions = cfg.allowed_mentions ?? DEFAULT_ALLOWED_MENTIONS;
-    this.fatalGateway = undefined;
     this.stopped = false;
     this.connected = true;
-    this.sessionEpoch++;
     this.reconnectAttempts = 0;
     this.invalidSessionWaitMs = 0;
     this.nextDialAt = 0;
     this.seq = null;
-    this.live = false;
   }
 
   async disconnect(): Promise<void> {
     this.stopped = true;
     this.connected = false;
+    this.teardownSession();
+  }
+
+  /**
+   * Release everything one session owns: the socket, its heartbeat, the pending reconnect, the
+   * readiness memo, the dispatch registry, every armed long-poll waiter, and the identity memo.
+   * Callers set `stopped` and `sessionEpoch` first, so that a close or watchdog this releases cannot
+   * dial or mark state fatal on behalf of the session that is ending.
+   */
+  private teardownSession(): void {
     if (this.reconnectTimer !== undefined) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -302,9 +331,10 @@ export class DiscordPlugin implements BackendPlugin {
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     this.require();
-    if (content.length > CONTENT_LIMIT) {
+    const characters = countCharacters(content);
+    if (characters > CONTENT_LIMIT) {
       throw new Error(
-        `Discord caps a message at ${CONTENT_LIMIT} characters; this post is ${content.length}. ` +
+        `Discord caps a message at ${CONTENT_LIMIT} characters; this post is ${characters}. ` +
           'Split it across posts (chunking here would break the one-post/one-backendMsgId contract).',
       );
     }
@@ -345,7 +375,6 @@ export class DiscordPlugin implements BackendPlugin {
     }
 
     const blockMs = args.blockMs ?? 0;
-    // No long-poll requested → the durable exclusive-since page, exactly as before.
     if (blockMs <= 0) {
       return this.fetchSince(args.topic, args.since, limit);
     }
@@ -354,9 +383,10 @@ export class DiscordPlugin implements BackendPlugin {
     // gateway MESSAGE_CREATE stream the live path uses for a message on this channel — up to
     // blockMs — then re-run the exclusive REST query so ids/cursor stay canonical. Returning
     // early/empty is always safe (core polls the remaining budget), so any failure to establish
-    // the live socket degrades gracefully to the immediate query. Keep the CONNECT inside the
-    // same `blockMs` budget, so that a gateway which accepts the socket but never completes the
-    // handshake cannot stretch this call past the cap core sized for the client's tool timeout.
+    // the live socket degrades gracefully to the immediate query. Keep EVERY leg — the connect and
+    // both REST queries — inside the same `blockMs` budget, so that neither a gateway that accepts
+    // the socket without completing the handshake nor a rate-limited REST query can stretch this
+    // call past the cap core sized for the client's tool timeout.
     const deadline = Date.now() + blockMs;
     try {
       await withDeadline(this.ensureGateway(), blockMs);
@@ -369,13 +399,35 @@ export class DiscordPlugin implements BackendPlugin {
     // Arm the waiter BEFORE the first query so a message landing during it can't be lost.
     const waiter = socketLive && remaining > 0 ? this.armWaiter(rawChannelId, remaining) : undefined;
     try {
-      const first = await this.fetchSince(args.topic, args.since, limit);
+      const first = await this.fetchWithin(args.topic, args.since, limit, deadline);
       if (first.messages.length > 0 || waiter === undefined) return first;
       await waiter.fired; // resolves on MESSAGE_CREATE for this channel, timeout, or disconnect
       if (this.stopped) return { messages: [], nextCursor: args.since };
-      return await this.fetchSince(args.topic, args.since, limit);
+      return await this.fetchWithin(args.topic, args.since, limit, deadline);
     } finally {
       waiter?.cancel();
+    }
+  }
+
+  /**
+   * One catch-up page bounded by the long-poll's own `deadline`. A budget already spent, or spent
+   * while the query was in flight, answers the empty replayable page — core polls the rest of its
+   * budget and this call still owes an answer within `blockMs`. A failure that arrives BEFORE the
+   * deadline is a real one and propagates, so bounding the leg cannot hide a 404 or a 500.
+   */
+  private async fetchWithin(
+    topic: Topic,
+    since: Cursor,
+    limit: number,
+    deadline: number,
+  ): Promise<FetchRecentResult> {
+    const budget = deadline - Date.now();
+    if (budget <= 0) return { messages: [], nextCursor: since };
+    try {
+      return await this.fetchSince(topic, since, limit, budget);
+    } catch (err) {
+      if (Date.now() >= deadline) return { messages: [], nextCursor: since };
+      throw err;
     }
   }
 
@@ -385,7 +437,12 @@ export class DiscordPlugin implements BackendPlugin {
    * last (largest) returned id until filled or a short page says the tail is reached. Empty →
    * `nextCursor` echoes `since` (stable, replayable).
    */
-  private async fetchSince(topic: Topic, since: Cursor, limit: number): Promise<FetchRecentResult> {
+  private async fetchSince(
+    topic: Topic,
+    since: Cursor,
+    limit: number,
+    deadlineMs?: number,
+  ): Promise<FetchRecentResult> {
     const messages: Message[] = [];
     let after = String(since);
     while (messages.length < limit) {
@@ -393,6 +450,7 @@ export class DiscordPlugin implements BackendPlugin {
       const chunk = await this.getMessages(
         topic,
         `after=${encodeURIComponent(after)}&limit=${page}`,
+        deadlineMs,
       );
       if (chunk.length === 0) break;
       const ascending = chunk.reverse();
@@ -410,9 +468,13 @@ export class DiscordPlugin implements BackendPlugin {
    * while every other non-2xx — including a 404 that is not Unknown Channel, and `50001 Missing
    * Access`, which means the channel exists but this bot is misconfigured — stays a real failure.
    */
-  private async getMessages(topic: Topic, query: string): Promise<DiscordMessage[]> {
+  private async getMessages(
+    topic: Topic,
+    query: string,
+    deadlineMs?: number,
+  ): Promise<DiscordMessage[]> {
     const path = `/channels/${encodeURIComponent(this.channelId(topic))}/messages?${query}`;
-    const res = await this.http('GET', path, { allowStatuses: [404] });
+    const res = await this.http('GET', path, { allowStatuses: [404], deadlineMs });
     if (res.status === 404) {
       const raw = await res.text().catch(() => '');
       if (errorCode(raw) === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
@@ -477,8 +539,11 @@ export class DiscordPlugin implements BackendPlugin {
    * attach and takes the REST half of the bridge down with it. A TERMINAL close still rejects,
    * because only a human can fix the token or the portal toggle.
    *
-   * The channel is then checked once over REST, so that an id that can never deliver (typo'd,
-   * deleted, not invited, or a DM) is a line on stderr instead of a permanently idle bridge.
+   * The channel is then checked once over REST. A channel that can never carry push (a DM class, a
+   * category or forum container, no access) is ONE topic's misconfiguration, so it is a line on
+   * stderr and a dropped subscription — rejecting fails core's attach and would take catch-up and
+   * `post` for every OTHER topic down with it. An id Discord does not know at all is the seam's
+   * absent topic and still rejects, because core is built to skip that one topic and carry on.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
@@ -487,44 +552,76 @@ export class DiscordPlugin implements BackendPlugin {
     try {
       await this.ensureGateway();
     } catch (err) {
-      if (err instanceof TerminalGatewayCloseError) throw err;
-      process.stderr.write(
-        `parley-discord: live push for topic ${JSON.stringify(topic as string)} is not up yet ` +
-          `(${err instanceof Error ? err.message : String(err)}); the reconnect ladder is retrying\n`,
+      if (err instanceof TerminalGatewayCloseError) {
+        this.subs.delete(channelId);
+        throw err;
+      }
+      this.warn(
+        `live push for topic ${JSON.stringify(topic as string)} is not up yet ` +
+          `(${reasonOf(err)}); ${
+            this.reconnectTimer === undefined
+              ? 'no reconnect is scheduled'
+              : 'the reconnect ladder is retrying'
+          }`,
       );
     }
-    await this.requirePushableChannel(topic, channelId);
+
+    let unpushable: string | undefined;
+    try {
+      unpushable = await this.unpushableReason(topic, channelId);
+    } catch (err) {
+      if (err instanceof NoSuchTopicError) {
+        this.subs.delete(channelId);
+        throw err;
+      }
+      this.warn(
+        `could not verify that topic ${JSON.stringify(topic as string)} can carry live push ` +
+          `(${reasonOf(err)}); leaving the subscription wired`,
+      );
+      return;
+    }
+    if (unpushable !== undefined) {
+      this.subs.delete(channelId);
+      this.warn(
+        `topic ${JSON.stringify(topic as string)} maps to channel ${channelId}, which ${unpushable}` +
+          ' — this topic gets no live push; map it to a guild text channel instead',
+      );
+    }
   }
 
   /**
-   * `GET /channels/<id>`, once per subscribed channel: an id Discord does not know becomes the
-   * seam's absent topic (core skips it with a diagnostic), and one that exists but cannot carry
-   * push — no access, or a DM class this intent set never receives — throws naming the channel and
-   * the reason.
+   * `GET /channels/<id>`, once per subscribed channel: why this channel can never carry a
+   * `MESSAGE_CREATE` for this topic, or undefined when it can. An id Discord does not know throws
+   * {@link NoSuchTopicError} (the seam's absent topic); a transport or server failure throws, and
+   * the caller treats that as unverified rather than unpushable.
    */
-  private async requirePushableChannel(topic: Topic, channelId: string): Promise<void> {
+  private async unpushableReason(topic: Topic, channelId: string): Promise<string | undefined> {
     const path = `/channels/${encodeURIComponent(channelId)}`;
     const res = await this.http('GET', path, { allowStatuses: [403, 404] });
     if (res.status === 403 || res.status === 404) {
       const raw = await res.text().catch(() => '');
       const code = errorCode(raw);
       if (code === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
-      throw new Error(
-        code === MISSING_ACCESS
-          ? `Discord channel ${channelId} exists but this bot cannot access it (50001 Missing ` +
-            'Access) — invite the bot and grant View Channels / Read Message History'
-          : `Discord GET ${path} → ${res.status}: ${sanitizeBody(raw)}`,
-      );
+      if (code === MISSING_ACCESS) {
+        return (
+          'this bot cannot access (50001 Missing Access) — invite the bot and grant View ' +
+          'Channels / Read Message History'
+        );
+      }
+      throw new Error(`Discord GET ${path} → ${res.status}: ${sanitizeBody(raw)}`);
     }
     const { type } = (await res.json()) as { type?: number };
-    const unpushable = type === undefined ? undefined : UNPUSHABLE_CHANNEL_TYPES.get(type);
-    if (unpushable !== undefined) {
-      throw new Error(
-        `Discord channel ${channelId} is ${unpushable} (type ${type}); the intent set is ` +
-          'GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT with no DIRECT_MESSAGES, so it receives no ' +
-          'live push — map this topic to a guild channel instead',
-      );
-    }
+    if (type === undefined || PUSHABLE_CHANNEL_TYPES.has(type)) return undefined;
+    const named = CHANNEL_TYPE_NAMES.get(type) ?? 'a channel type that carries no guild messages';
+    return (
+      `is ${named} (type ${type}); the intent set is GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT ` +
+      'with no DIRECT_MESSAGES, so no MESSAGE_CREATE can name it'
+    );
+  }
+
+  /** Every operator-facing diagnostic, on ONE line: a body's own newlines forge a second entry. */
+  private warn(line: string): void {
+    process.stderr.write(`parley-discord: ${line.replace(/\s*\n\s*/g, ' ')}\n`);
   }
 
   /**
@@ -621,27 +718,29 @@ export class DiscordPlugin implements BackendPlugin {
   }
 
   /**
-   * Resolve the gateway wss URL (config override for tests/fakes; else `GET /gateway/bot`) and dial
-   * it. A failed FIRST dial joins the same backoff-and-reopen loop every later outage uses — keep
-   * it there, so that the outage most likely at process start is not the one case with no in-plugin
-   * recovery.
+   * One dial attempt, end to end. A failed dial joins the same backoff-and-reopen loop every later
+   * outage uses — keep the whole attempt inside it, URL RESOLUTION INCLUDED, so that the outage
+   * most likely at process start (a 5xx or a 429 on `GET /gateway/bot`) is not the one case with no
+   * in-plugin recovery.
    */
   private async openGateway(): Promise<void> {
     const epoch = this.sessionEpoch;
-    let url: string;
     try {
-      url = this.gatewayUrlOverride ?? (await this.resolveGatewayUrl());
-    } catch (err) {
-      this.chargeDialAttempt();
-      throw err;
-    }
-    try {
-      await this.openSocket(url);
+      await this.dial();
     } catch (err) {
       if (err instanceof TerminalGatewayCloseError) this.chargeDialAttempt();
-      else this.scheduleReconnect(url, epoch);
+      else this.scheduleReconnect(epoch);
       throw err;
     }
+  }
+
+  /**
+   * Resolve the gateway wss URL (config override for tests/fakes; else `GET /gateway/bot`) and open
+   * the socket. Re-resolved per attempt: Discord does not promise the url survives an outage.
+   */
+  private async dial(): Promise<void> {
+    const url = this.gatewayUrlOverride ?? (await this.resolveGatewayUrl());
+    await this.openSocket(url);
   }
 
   private async resolveGatewayUrl(): Promise<string> {
@@ -809,7 +908,7 @@ export class DiscordPlugin implements BackendPlugin {
             process.stderr.write(`parley-discord: ${err.message}\n`);
           } else if (ready) {
             if (Date.now() - readyAt >= STABLE_CONNECTION_MS) this.reconnectAttempts = 0;
-            this.scheduleReconnect(url, epoch);
+            this.scheduleReconnect(epoch);
           }
         }
         // The socket that would have woken them is gone: release every blocked long-poll so it
@@ -824,7 +923,7 @@ export class DiscordPlugin implements BackendPlugin {
    * budget every other path spends ({@link chargeDialAttempt}). A terminal close short-circuits it
    * (openSocket rejects with TerminalGatewayCloseError).
    */
-  private scheduleReconnect(url: string, epoch: number): void {
+  private scheduleReconnect(epoch: number): void {
     if (this.stopped || epoch !== this.sessionEpoch) return;
     const wait = this.chargeDialAttempt();
     this.reconnectTimer = setTimeout(() => {
@@ -833,13 +932,13 @@ export class DiscordPlugin implements BackendPlugin {
       // Dial through the memo every other caller awaits, so that a re-entrant caller (core's 250 ms
       // long-poll fallback) cannot open a second socket alongside this one and double the IDENTIFY
       // rate the ladder is pacing.
-      const dial = this.openSocket(url).catch((err: unknown) => {
+      const attempt = this.dial().catch((err: unknown) => {
         if (epoch === this.sessionEpoch) this.gatewayReady = undefined;
-        if (!(err instanceof TerminalGatewayCloseError)) this.scheduleReconnect(url, epoch);
+        if (!(err instanceof TerminalGatewayCloseError)) this.scheduleReconnect(epoch);
         throw err;
       });
-      this.gatewayReady = dial;
-      void dial.catch(() => undefined);
+      this.gatewayReady = attempt;
+      void attempt.catch(() => undefined);
     }, wait);
   }
 
@@ -852,7 +951,7 @@ export class DiscordPlugin implements BackendPlugin {
   private async http(
     method: string,
     path: string,
-    opts?: { body?: unknown; allowStatuses?: number[] },
+    opts?: { body?: unknown; allowStatuses?: number[]; deadlineMs?: number },
   ): Promise<Response> {
     const url = `${this.apiUrl}${path}`;
     const headers: Record<string, string> = {};
@@ -872,6 +971,7 @@ export class DiscordPlugin implements BackendPlugin {
         isStopped: () => this.stopped,
         retryAfterOf: readRetryAfter,
         allowStatuses: opts?.allowStatuses,
+        deadlineMs: opts?.deadlineMs,
       },
     );
   }
@@ -897,6 +997,16 @@ function requireDistinctChannels(map: Map<string, string>): Map<string, string> 
   }
   return owner;
 }
+
+/**
+ * Length in the unit Discord's 2000-character cap counts: CODE POINTS, not UTF-16 code units. Keep
+ * the spread, so that astral text (emoji, CJK extensions, historic scripts) is not refused at half
+ * the real limit under a length the provider never measured.
+ */
+const countCharacters = (content: string): number => [...content].length;
+
+/** The text of a caught rejection, for a diagnostic that must never crash on a non-Error. */
+const reasonOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /** Discord's numeric error code from a JSON error body, or undefined when the body is not one. */
 function errorCode(raw: string): number | undefined {

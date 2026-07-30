@@ -21,47 +21,21 @@ import {
   STABLE_CONNECTION_MS,
 } from '../src/index.js';
 import { FakeWs, instances, resetGateway, state, totalIdentifies } from './fake-gateway.js';
+import {
+  HUGE_HB,
+  NO_HANDSHAKE_TIMEOUT,
+  openedSocket,
+  reachReady,
+  stubFetch,
+  type FetchStub,
+} from './harness.js';
 import { dialCeiling, dialPump } from './ladder.js';
 
 const gw = { instances, state, FakeWs };
 
-const HUGE_HB = 1_000_000; // large enough that the heartbeat interval never fires during a test
-/**
- * These cases drive close codes and backoff, not handshakes: park the handshake watchdog far out
- * so a socket the test has not driven yet is never terminated underneath it.
- */
-const NO_HANDSHAKE_TIMEOUT = 10_000_000;
-
-/**
- * Open the shared socket and drive HELLO→IDENTIFY→READY on the freshly created FakeWs. Keep the
- * timer tick before `await pending`, so that `subscribe`'s channel check can read its stubbed REST
- * body — under fake timers the body stream is driven by a faked immediate, so awaiting first hangs.
- */
-async function reachReady(
-  plugin: DiscordPlugin,
-  topic: Topic,
-  opts?: { hb?: number; handler?: MessageHandler },
-): Promise<FakeWs> {
-  const pending = plugin.subscribe(topic, opts?.handler ?? (() => undefined));
-  const ws = gw.instances.at(-1)!; // created synchronously inside subscribe()→openSocket
-  ws.hello(opts?.hb ?? HUGE_HB);
-  await vi.advanceTimersByTimeAsync(0);
-  await pending;
-  return ws;
-}
-
 /** Backoff delays only: the per-socket handshake watchdog is not a reconnect step. */
 const setTimeoutDelays = (spy: ReturnType<typeof vi.spyOn>): number[] =>
   spy.mock.calls.map((c) => c[1] as number).filter((d) => d !== NO_HANDSHAKE_TIMEOUT);
-
-/** REST is irrelevant to these cases; every call answers an empty page immediately. */
-const stubFetch = (): void => {
-  vi.stubGlobal('fetch', () =>
-    Promise.resolve(
-      new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),
-    ),
-  );
-};
 
 describe('Discord gateway reconnect & liveness', () => {
   beforeEach(() => {
@@ -388,8 +362,10 @@ describe('Discord gateway handshake never completes', () => {
 // A recovery loop that only covers the STEADY state is the defect this table exists for: the outage
 // most likely at process start is the first dial, and a ladder wired only into the post-READY close
 // path leaves that one case with no in-plugin retry at all. So the cells are over WHEN the failure
-// lands, not just how it fails, and each transient cell asserts recovery both ways — the plugin
-// re-dials on its own within the ladder's own bound, and live push works once the gateway heals.
+// lands and over HOW the dial fails — including the bootstrap step OUTSIDE the socket, `GET
+// /gateway/bot`, which on the production configuration (no `gateway_url`) is the whole live path's
+// single point of no return. Each transient cell asserts recovery both ways: the plugin re-dialed on
+// its own within the ladder's own bound, and live push works once the gateway heals.
 describe('Discord gateway recovery, whenever the failure lands', () => {
   const HANDSHAKE = 3000;
   const TOPIC = asTopic('910001');
@@ -402,20 +378,79 @@ describe('Discord gateway recovery, whenever the failure lands', () => {
   /** Enough steps for several rungs of the 1s→2s→4s… ladder while the gateway stays broken. */
   const BROKEN_STEPS = 16;
   /** Once healed the ladder already sits several rungs up, so the wait has to clear a whole rung. */
-  const HEAL_STEPS = 240;
+  const HEAL_STEPS = 160;
 
   const PHASES = ['the first dial', 'after READY', 'mid-reconnect'] as const;
 
-  const FAILURES: Array<{ label: string; terminal: boolean; onIdentify: (ws: FakeWs) => void }> = [
-    { label: 'a close before READY', terminal: false, onIdentify: (ws) => ws.serverClose(1006) },
-    { label: 'a handshake stall', terminal: false, onIdentify: () => undefined },
-    { label: 'a terminal close', terminal: true, onIdentify: (ws) => ws.serverClose(4014) },
+  /**
+   * How the dial fails. A `socket` failure needs a url to dial, so it runs under BOTH url sources; a
+   * `resolve` failure breaks the url lookup itself, which only exists when the url is not configured.
+   * `dials` is the count of ATTEMPTS the plugin has made — sockets, or url lookups when no socket is
+   * ever created — so a cell can prove the ladder ran rather than only that it stayed under a bound.
+   */
+  interface Failure {
+    label: string;
+    terminal: boolean;
+    onlyResolvedUrl: boolean;
+    fail: (rest: FetchStub) => void;
+    heal: (rest: FetchStub) => void;
+    dials: (rest: FetchStub) => number;
+  }
+
+  const socketFailure = (
+    label: string,
+    terminal: boolean,
+    onIdentify: (ws: FakeWs) => void,
+  ): Failure => ({
+    label,
+    terminal,
+    onlyResolvedUrl: false,
+    fail: () => {
+      gw.state.onIdentify = onIdentify;
+    },
+    heal: () => {
+      gw.state.onIdentify = (ws: FakeWs) => ws.ready();
+    },
+    dials: () => gw.instances.length,
+  });
+
+  const resolveFailure = (label: string, fault: FetchStub['gatewayFault']): Failure => ({
+    label,
+    terminal: false,
+    onlyResolvedUrl: true,
+    fail: (rest) => {
+      rest.gatewayFault = fault;
+    },
+    heal: (rest) => {
+      rest.gatewayFault = undefined;
+    },
+    dials: (rest) => rest.count('/gateway/bot'),
+  });
+
+  const FAILURES: Failure[] = [
+    socketFailure('a close before READY', false, (ws) => ws.serverClose(1006)),
+    socketFailure('a handshake stall', false, () => undefined),
+    socketFailure('a terminal close', true, (ws) => ws.serverClose(4014)),
+    resolveFailure('a 500 on GET /gateway/bot', { status: 500 }),
+    resolveFailure('a 429 on GET /gateway/bot', {
+      status: 429,
+      headers: { 'retry-after': '60' },
+    }),
+    resolveFailure('a transport error on GET /gateway/bot', { transport: true }),
   ];
+
+  const URL_SOURCES = [
+    { label: 'a configured gateway_url', configured: true },
+    { label: 'a url resolved per attempt', configured: false },
+  ];
+
+  let rest: FetchStub;
+  let diag: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     resetGateway();
-    stubFetch();
-    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    rest = stubFetch();
+    diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     vi.spyOn(Math, 'random').mockReturnValue(0);
     vi.useFakeTimers();
   });
@@ -427,70 +462,100 @@ describe('Discord gateway recovery, whenever the failure lands', () => {
 
   for (const phase of PHASES) {
     for (const failure of FAILURES) {
-      it(`${failure.label} on ${phase}`, async () => {
-        const pump = dialPump((ms) => vi.advanceTimersByTimeAsync(ms), HUGE_HB);
-        const plugin = new DiscordPlugin();
-        await plugin.connect({
-          token: 't',
-          gateway_url: 'ws://fake',
-          handshake_timeout_ms: HANDSHAKE,
-        });
-        const got: string[] = [];
-        const handler = (m: { content: string }): void => got.push(m.content);
+      for (const source of URL_SOURCES) {
+        if (failure.onlyResolvedUrl && source.configured) continue;
+        it(`${failure.label} on ${phase}, with ${source.label}`, async () => {
+          const pump = dialPump((ms) => vi.advanceTimersByTimeAsync(ms), HUGE_HB);
+          const plugin = new DiscordPlugin();
+          await plugin.connect({
+            token: 't',
+            ...(source.configured ? { gateway_url: 'ws://fake' } : {}),
+            handshake_timeout_ms: HANDSHAKE,
+          });
+          const got: string[] = [];
+          const handler = (m: { content: string }): void => got.push(m.content);
 
-        if (phase === 'the first dial') {
-          gw.state.onIdentify = failure.onIdentify;
-          void plugin.subscribe(TOPIC, handler).catch(() => undefined);
-          await pump(2, STEP_MS);
-        } else {
-          const ws0 = await reachReady(plugin, TOPIC, { handler });
-          gw.state.onIdentify = failure.onIdentify;
-          ws0.serverClose(1006);
-          await pump(phase === 'mid-reconnect' ? BROKEN_STEPS : 2, STEP_MS);
-        }
-        const dialsWhileBroken = gw.instances.length;
+          if (phase === 'the first dial') {
+            failure.fail(rest);
+            void plugin.subscribe(TOPIC, handler).catch(() => undefined);
+            await pump(2, STEP_MS);
+          } else {
+            const ws0 = await reachReady(plugin, TOPIC, { handler });
+            failure.fail(rest);
+            ws0.serverClose(1006);
+            await pump(phase === 'mid-reconnect' ? BROKEN_STEPS : 2, STEP_MS);
+          }
+          const dialsWhileBroken = failure.dials(rest);
 
-        if (failure.terminal) {
-          // Fatal by design: it needs a human, so the loop must STOP rather than keep dialing.
-          await pump(BROKEN_STEPS + HEAL_STEPS, STEP_MS);
-          expect(gw.instances.length).toBe(dialsWhileBroken);
+          if (failure.terminal) {
+            // Fatal by design: it needs a human, so the loop must STOP rather than keep dialing.
+            await pump(BROKEN_STEPS + HEAL_STEPS, STEP_MS);
+            expect(failure.dials(rest)).toBe(dialsWhileBroken);
+            await plugin.disconnect();
+            return;
+          }
+
+          await pump(BROKEN_STEPS, STEP_MS);
+          expect(failure.dials(rest), 'the plugin never re-dialed on its own').toBeGreaterThan(
+            dialsWhileBroken,
+          );
+          const brokenWindowMs = 2 * BROKEN_STEPS * STEP_MS;
+          expect(failure.dials(rest)).toBeLessThanOrEqual(dialCeiling(brokenWindowMs) + 1);
+
+          // The diagnostic subscribe wrote may only claim a retry while one is actually pending.
+          if (phase === 'the first dial') {
+            const written = diag.mock.calls.map((c) => String(c[0])).join('');
+            expect(written).toContain(TOPIC as string);
+            expect(written).toContain('the reconnect ladder is retrying');
+          }
+
+          failure.heal(rest); // the gateway comes back
+          const healedFrom = gw.instances.length;
+          await pump(HEAL_STEPS, STEP_MS);
+          const live = gw.instances
+            .slice(healedFrom)
+            .find((ws) => ws.readyState === gw.FakeWs.OPEN && ws.identified());
+          expect(live, 'no socket reached IDENTIFY after the gateway healed').toBeDefined();
+
+          live!.serverSend({
+            op: 0,
+            t: 'MESSAGE_CREATE',
+            s: 11,
+            d: {
+              id: '910500',
+              channel_id: TOPIC as string,
+              content: 'back-online',
+              timestamp: '',
+              author: { id: '1', username: 'u' },
+            },
+          });
+          expect(got, 'live push did not resume after the gateway healed').toEqual(['back-online']);
+
           await plugin.disconnect();
-          return;
-        }
-
-        await pump(BROKEN_STEPS, STEP_MS);
-        expect(gw.instances.length, 'the plugin never re-dialed on its own').toBeGreaterThan(
-          dialsWhileBroken,
-        );
-        const brokenWindowMs = 2 * BROKEN_STEPS * STEP_MS;
-        expect(gw.instances.length).toBeLessThanOrEqual(dialCeiling(brokenWindowMs));
-
-        gw.state.onIdentify = (ws: FakeWs) => ws.ready(); // the gateway comes back
-        const healedFrom = gw.instances.length;
-        await pump(HEAL_STEPS, STEP_MS);
-        const live = gw.instances
-          .slice(healedFrom)
-          .find((ws) => ws.readyState === gw.FakeWs.OPEN && ws.identified());
-        expect(live, 'no socket reached IDENTIFY after the gateway healed').toBeDefined();
-
-        live!.serverSend({
-          op: 0,
-          t: 'MESSAGE_CREATE',
-          s: 11,
-          d: {
-            id: '910500',
-            channel_id: TOPIC as string,
-            content: 'back-online',
-            timestamp: '',
-            author: { id: '1', username: 'u' },
-          },
         });
-        expect(got, 'live push did not resume after the gateway healed').toEqual(['back-online']);
-
-        await plugin.disconnect();
-      });
+      }
     }
   }
+
+  // A url the plugin resolved ONCE and cached would keep dialing an address the outage may have
+  // retired. Nothing above can see that: the fake answers the same url every time.
+  it('re-resolves the gateway url on every attempt', async () => {
+    rest.gatewayUrl = 'ws://first';
+    const plugin = new DiscordPlugin();
+    await plugin.connect({ token: 't', handshake_timeout_ms: HANDSHAKE });
+    gw.state.onIdentify = (ws: FakeWs) => ws.serverClose(1006);
+    const before = gw.instances.length;
+    void plugin.subscribe(TOPIC, () => undefined).catch(() => undefined);
+    const first = await openedSocket(before);
+    expect(first.url).toBe('ws://first');
+
+    rest.gatewayUrl = 'ws://second'; // Discord hands out a different edge after the outage
+    const pump = dialPump((ms) => vi.advanceTimersByTimeAsync(ms), HUGE_HB);
+    await pump(8, 1000);
+
+    expect(gw.instances.at(-1)!.url).toBe('ws://second');
+    await plugin.disconnect();
+  });
 });
 
 describe('Discord gateway terminal failures are never invisible', () => {

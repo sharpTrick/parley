@@ -72,6 +72,8 @@ export interface FakeFault {
   path?: string;
   /** Serve it this many times (default 1). */
   times?: number;
+  /** Hold the response this long before writing it — a request that stalls rather than fails. */
+  delayMs?: number;
 }
 
 export interface FakeDiscord {
@@ -153,6 +155,20 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
 
     const fault = takeFault(url.pathname + url.search);
     if (fault !== undefined) {
+      if (fault.delayMs !== undefined) {
+        // Give up the hold as soon as the client walks away, so that a stall a caller's deadline
+        // aborted cannot outlive the case and write onto a destroyed response after `close()`.
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, fault.delayMs);
+          const stop = (): void => {
+            clearTimeout(timer);
+            resolve();
+          };
+          req.once('aborted', stop);
+          res.once('close', stop);
+        });
+        if (res.destroyed) return;
+      }
       if (fault.rawBody !== undefined) {
         res.writeHead(fault.status, { 'Content-Type': 'application/json', ...fault.headers });
         res.end(fault.rawBody);
@@ -200,7 +216,9 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
           });
         }
         const content = body.content ?? '';
-        if (content.length > CONTENT_LIMIT) {
+        // CODE POINTS, the unit Discord counts. Measuring UTF-16 units here would make the cap
+        // self-confirming: a plugin using the same wrong unit would look correct on astral text.
+        if ([...content].length > CONTENT_LIMIT) {
           return json(res, 400, {
             message: 'Invalid Form Body',
             code: 50035,

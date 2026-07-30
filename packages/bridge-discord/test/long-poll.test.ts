@@ -10,6 +10,7 @@ vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs
 
 import { DiscordPlugin } from '../src/index.js';
 import { FakeWs, instances, resetGateway, state } from './fake-gateway.js';
+import { HUGE_HB, reachReady, stubFetch, type FetchStub } from './harness.js';
 
 const TOPIC = asTopic('770001');
 const SINCE = asCursor('1');
@@ -19,7 +20,6 @@ const HANDSHAKE_MS = 500;
 const ARRIVES_AT_MS = 1000;
 /** The message must surface within a poll cycle or two of becoming visible — never at `blockMs`. */
 const SLACK_MS = 2000;
-const HUGE_HB = 1_000_000;
 
 const MESSAGE = {
   id: '900000000000000009',
@@ -30,30 +30,8 @@ const MESSAGE = {
 };
 
 describe('Discord long-poll while the live transport is…', () => {
-  let visible = false;
-
   /** REST is healthy throughout: it simply starts returning the message once it has landed. */
-  const stubFetch = (): void => {
-    vi.stubGlobal('fetch', () =>
-      Promise.resolve(
-        new Response(JSON.stringify(visible ? [MESSAGE] : []), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      ),
-    );
-  };
-
-  const reachReady = async (plugin: DiscordPlugin): Promise<FakeWs> => {
-    const pending = plugin.subscribe(TOPIC, () => undefined);
-    const ws = instances.at(-1)!;
-    ws.hello(HUGE_HB);
-    // Keep this ahead of `await pending`, so that subscribe's channel check can read its stubbed
-    // REST body: under fake timers a faked immediate drives the body stream.
-    await vi.advanceTimersByTimeAsync(0);
-    await pending;
-    return ws;
-  };
+  let rest: FetchStub;
 
   const TRANSPORTS: Array<{
     label: string;
@@ -64,14 +42,14 @@ describe('Discord long-poll while the live transport is…', () => {
     {
       label: 'healthy',
       setup: async (plugin) => {
-        await reachReady(plugin);
+        await reachReady(plugin, TOPIC);
       },
       driveNew: (ws) => ws.hello(HUGE_HB),
     },
     {
       label: 'closed and reconnecting',
       setup: async (plugin) => {
-        const ws = await reachReady(plugin);
+        const ws = await reachReady(plugin, TOPIC);
         state.onIdentify = () => undefined;
         ws.serverClose(1006);
       },
@@ -87,7 +65,7 @@ describe('Discord long-poll while the live transport is…', () => {
     {
       label: 'terminally closed',
       setup: async (plugin) => {
-        const ws = await reachReady(plugin);
+        const ws = await reachReady(plugin, TOPIC);
         ws.serverClose(4014);
       },
       driveNew: () => undefined,
@@ -103,8 +81,7 @@ describe('Discord long-poll while the live transport is…', () => {
 
   beforeEach(() => {
     resetGateway();
-    visible = false;
-    stubFetch();
+    rest = stubFetch();
     vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     vi.useFakeTimers();
   });
@@ -127,6 +104,7 @@ describe('Discord long-poll while the live transport is…', () => {
       const driven = new Set(instances);
       const started = Date.now();
       let settledAt: number | undefined;
+      let arrived = false;
       const pending = fetchRecentBlocking(
         plugin,
         { topic: TOPIC, since: SINCE },
@@ -138,9 +116,10 @@ describe('Discord long-poll while the live transport is…', () => {
 
       for (let t = 0; t < BLOCK_MS && settledAt === undefined; t += 100) {
         await vi.advanceTimersByTimeAsync(100);
-        if (!visible && Date.now() - started >= ARRIVES_AT_MS) {
-          visible = true;
+        if (!arrived && Date.now() - started >= ARRIVES_AT_MS) {
+          arrived = true;
           // A real arrival is BOTH: durable over REST and, when a socket is live, a dispatch.
+          rest.page = [MESSAGE];
           const live = instances.find((ws) => ws.readyState === FakeWs.OPEN && ws.identified());
           live?.serverSend({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: MESSAGE });
         }
@@ -165,18 +144,7 @@ describe('Discord long-poll while the live transport is…', () => {
 // the message is durable over a healthy REST API while the call sleeps its whole budget.
 
 describe('Discord long-poll when the live transport dies mid-wait', () => {
-  let visible = false;
-
-  const stubFetch = (): void => {
-    vi.stubGlobal('fetch', () =>
-      Promise.resolve(
-        new Response(JSON.stringify(visible ? [MESSAGE] : []), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      ),
-    );
-  };
+  let rest: FetchStub;
 
   const LOSSES: Array<{ label: string; kill: (ws: FakeWs) => void; driveNew: (ws: FakeWs) => void }> =
     [
@@ -205,8 +173,7 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
 
   beforeEach(() => {
     resetGateway();
-    visible = false;
-    stubFetch();
+    rest = stubFetch();
     vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     vi.spyOn(Math, 'random').mockReturnValue(0);
     vi.useFakeTimers();
@@ -226,16 +193,13 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
           gateway_url: 'ws://fake',
           handshake_timeout_ms: HANDSHAKE_MS,
         });
-        const pendingSub = plugin.subscribe(TOPIC, () => undefined);
-        const first = instances.at(-1)!;
-        first.hello(HUGE_HB);
-        await vi.advanceTimersByTimeAsync(0);
-        await pendingSub;
+        const first = await reachReady(plugin, TOPIC);
 
         const driven = new Set(instances);
         const started = Date.now();
         let settledAt: number | undefined;
         let killed = false;
+        let arrived = false;
         const pending = fetchRecentBlocking(
           plugin,
           { topic: TOPIC, since: SINCE },
@@ -252,8 +216,9 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
             killed = true;
             loss.kill(first);
           }
-          if (!visible && elapsed >= ARRIVES_AT_MS) {
-            visible = true;
+          if (!arrived && elapsed >= ARRIVES_AT_MS) {
+            arrived = true;
+            rest.page = [MESSAGE];
             const live = instances.find((ws) => ws.readyState === FakeWs.OPEN && ws.identified());
             live?.serverSend({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: MESSAGE });
           }
@@ -283,37 +248,10 @@ describe('Discord long-poll: a wakeup arriving', () => {
   /** A prompt wakeup settles in a handful of ticks; sleeping the budget settles at BLOCK_MS. */
   const WAKE_SLACK_MS = 500;
 
-  let visible = false;
-  let held: Array<() => void> = [];
-  let holdNextGet = false;
-
-  const stubFetch = (): void => {
-    vi.stubGlobal('fetch', () => {
-      // Snapshot at REQUEST time: a held query answers the page it read, not one taken later.
-      const body = JSON.stringify(visible ? [MESSAGE] : []);
-      const reply = (): Response =>
-        new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
-      if (holdNextGet) {
-        holdNextGet = false;
-        return new Promise<Response>((resolve) => held.push(() => resolve(reply())));
-      }
-      return Promise.resolve(reply());
-    });
-  };
-
-  const reachReady = async (plugin: DiscordPlugin): Promise<FakeWs> => {
-    const pending = plugin.subscribe(TOPIC, () => undefined);
-    const ws = instances.at(-1)!;
-    ws.hello(HUGE_HB);
-    // Keep this ahead of `await pending`, so that subscribe's channel check can read its stubbed
-    // REST body: under fake timers a faked immediate drives the body stream.
-    await vi.advanceTimersByTimeAsync(0);
-    await pending;
-    return ws;
-  };
+  let rest: FetchStub;
 
   const arrive = (ws?: FakeWs): void => {
-    visible = true;
+    rest.page = [MESSAGE];
     if (ws !== undefined && ws.readyState === FakeWs.OPEN && ws.identified()) {
       ws.serverSend({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: MESSAGE });
     }
@@ -324,7 +262,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
       {
         label: 'before the call',
         drive: async (p, call) => {
-          const ws = await reachReady(p);
+          const ws = await reachReady(p, TOPIC);
           arrive(ws);
           call();
           await vi.advanceTimersByTimeAsync(50);
@@ -348,20 +286,20 @@ describe('Discord long-poll: a wakeup arriving', () => {
       {
         label: 'during the first REST query',
         drive: async (p, call) => {
-          const ws = await reachReady(p);
-          holdNextGet = true;
+          const ws = await reachReady(p, TOPIC);
+          rest.holdNextPage();
           call();
           await vi.advanceTimersByTimeAsync(10);
-          expect(held).toHaveLength(1);
+          expect(rest.parked()).toBe(1);
           arrive(ws);
-          held.shift()!();
+          rest.release();
           await vi.advanceTimersByTimeAsync(50);
         },
       },
       {
         label: 'after the first REST query',
         drive: async (p, call) => {
-          const ws = await reachReady(p);
+          const ws = await reachReady(p, TOPIC);
           call();
           await vi.advanceTimersByTimeAsync(10);
           arrive(ws);
@@ -372,10 +310,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
 
   beforeEach(() => {
     resetGateway();
-    visible = false;
-    held = [];
-    holdNextGet = false;
-    stubFetch();
+    rest = stubFetch();
     vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     vi.useFakeTimers();
   });
@@ -423,7 +358,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
       gateway_url: 'ws://fake',
       handshake_timeout_ms: HANDSHAKE_MS,
     });
-    await reachReady(plugin);
+    await reachReady(plugin, TOPIC);
 
     const started = Date.now();
     let settledAt: number | undefined;
@@ -457,7 +392,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
       gateway_url: 'ws://fake',
       handshake_timeout_ms: HANDSHAKE_MS,
     });
-    await reachReady(plugin);
+    await reachReady(plugin, TOPIC);
 
     const started = Date.now();
     let settledAt: number | undefined;
