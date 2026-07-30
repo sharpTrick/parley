@@ -67,6 +67,17 @@
       "unresolvable": 0,
       "selfInducedPct": 66,
       "note": "First fall in the series (80 -> 66). Pre-existing findings ROSE 18 -> 27. Verified by re-running the same oracle over rounds 5 and 6, which reproduced their recorded 60/72 and 80/81 exactly."
+    },
+    {
+      "round": 8,
+      "base": "d77ff75",
+      "findings": 73,
+      "graded": 72,
+      "selfInduced": 40,
+      "preExisting": 32,
+      "unresolvable": 1,
+      "selfInducedPct": 56,
+      "note": "Second consecutive fall (80 -> 66 -> 56). Pre-existing findings rose again, 18 -> 27 -> 32."
     }
   ],
   "comparison": {
@@ -121,9 +132,16 @@
         "selfInduced": 13,
         "preExisting": 10,
         "selfInducedPct": 57
+      },
+      {
+        "round": 8,
+        "blocking": 25,
+        "selfInduced": 15,
+        "preExisting": 9,
+        "selfInducedPct": 62
       }
     ],
-    "reading": "Pre-existing BLOCKING findings fall 36 -> 25 -> 20 -> 11 -> 5 through round 6, then RISE to 10 in round 7, while blocking self-induction falls 81% -> 57%. The five-round monotone rise (27 -> 34 -> 56 -> 72 -> 81) does not continue. Round 6's reading - that the loop was running out of original codebase - was premature: round 7 found twice as many pre-existing blocking defects as round 6 did, including a malformed gateway frame that kills the whole MCP server process. Whatever round 6 measured, it was not saturation of the original surface."
+    "reading": "Pre-existing BLOCKING findings fall 36 -> 25 -> 20 -> 11 -> 5 through round 6, then RISE: 10 in round 7, 9 in round 8. Blocking self-induction peaked at 81% in round 6 and has fallen since (57%, 62%). The five-round monotone rise did not continue, and round 6's reading - that the loop was running out of original codebase - is refuted by two subsequent rounds. Total findings are flattening (90, 79, 73) while the ORIGINAL-defect yield holds roughly steady, which is a different regime from the one ouroboros described: not a loop consuming its own output, but one whose per-round yield is decaying slowly while still reaching new ground."
   },
   "inertRemediations": {
     "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
