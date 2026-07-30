@@ -137,8 +137,21 @@ all 14 critics still reviewed the correct targets full-surface and reached the w
 mutation requirement through `docs/REVIEW_PROTOCOL.md`; but it is a protocol-version confound and
 any cross-round claim has to say so.
 
-Tests in the suite: **460 → 1428** (round 1 remediation) **→ 2545** (round 2 remediation), none
+Tests in the suite after each round's remediation: **460 → 1428 → 2545 → 3926 → 5241**, none
 skipped, against real Redis, NATS, Postgres, Prosody, Synapse and Keycloak.
+
+That series is itself a finding. The suite grew **11.4×** across four rounds while the count of
+pre-existing defects found per round fell (100 → 73 → 52). Round 4 added 1315 tests to find 52
+things that were wrong before the experiment started. Some of that growth is real coverage of real
+gaps — the `node:sqlite` fallback driver had none at all, and Discord's fakes checked neither
+authentication nor capability bits — but the ratio is the cost the next experiment has to answer for.
+
+Round 4 was also the first round where agents **deleted** tests as well as adding them, once the
+prompt told them to prefer it: bridge-nats shed 29 rows from one file while covering strictly more,
+bridge-sqlite deleted 16, and bridge-redis replaced 9 hand-picked rows with 6 generated ones. Nothing
+in rounds 1–3 was ever removed. Test-hygiene as a *lens* produced 7–9 findings a round and zero
+blocking ones; test-hygiene as an *instruction to the fixer* changed behaviour immediately. That gap
+between measuring a property and asking for it is the most actionable thing in this dataset.
 
 ### Per-lens yield (total / confirmed / blocking)
 

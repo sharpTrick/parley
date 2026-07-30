@@ -6,6 +6,46 @@
 
 ## Status
 
+- **Phase (adversarial review — the Careening experiment):** rounds 1–4 complete and pushed on
+  `claude/next-steps-q1540r`; round 5 running. Full suite **5241 tests, 3 skipped, green**, against
+  real Redis, NATS, Postgres, Prosody, Synapse and Keycloak (all six now bound to loopback only).
+  The suite series is **460 → 1428 → 2545 → 3926 → 5241**.
+
+  Findings per round (14 targets each, 0 errored every round):
+
+  | round | findings | CONFIRMED | blocking | self-induced |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 139 | 124 | 61 | — (not gradeable) |
+  | 2 | 136 | 130 | 49 | 26% |
+  | 3 | 119 | 115 | 38 | 39% |
+  | 4 | 120 | 113 | 45 | 57% |
+
+  **Stop rule: two consecutive wake-all rounds with zero CONFIRMED findings, or round 20.** Offered
+  the blocking-gated alternative at round 3 and deliberately declined it, to keep comparability with
+  ouroboros's acting rule; the shadow metric is still recorded. Quiescence has never fired — all 14
+  targets have returned confirmed findings in all four rounds — and that null result is the finding.
+
+  Per-round data and the full writeup live in
+  `docs/findings/critical-review/2026-07-29-careening/`. Round N's procedure: re-pin worktrees
+  (`node scripts/careening-worktrees.mjs setup <sha>`), then
+  `Workflow({scriptPath: ".claude/workflows/careening-review.js", args: {round, quiesced: [],
+  changed: [], wakeAll: true}})` — **by scriptPath, never by name**: a named workflow resolves to a
+  snapshot registered at session start, and round 3 silently ran the round-1 script that way.
+
+  Then one remediation agent per target, each in its own worktree, staged and uncommitted; the
+  orchestrator extracts with `git diff --cached` and commits per package. 14 patches per round have
+  applied with zero real conflicts, because targets are disjoint packages. Worktrees exist because
+  mutation testing is mandatory and a mutation on a shared tree is another agent's phantom failure.
+
+  **Three defects this experiment created and later found**, worth knowing about because they are
+  the substance of the iatrogenesis number: a round-3 helper (`isNoSuchTopicError`) that shipped as
+  dead code with all five call sites still on `instanceof`; a round-2 ID-token rule that rejected any
+  `nonce` and so permanently 401'd Keycloak deployments the README recommends; and a round-3 stream
+  incarnation read from cached state, so an unobserved re-provision still minted a duplicate id.
+  All three passed their own round's tests.
+
+## Status (pre-review, retained)
+
 - **Phase (consolidation → 1.0-ready):** ✅ Published at **v0.9.0**, `main` green, no open issues
   or PRs. Everything in `TASKS.md` is checked. The current branch closes the gap between what the
   repo *claims* and what it *does*, ahead of a deliberate 1.0 (`docs/1.0-readiness.md`):
