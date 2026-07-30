@@ -93,6 +93,9 @@ const MAX_MESSAGES_PER_FETCH = 5000;
 /** `zerver/lib/message.py` `MAX_TOPIC_NAME_LENGTH`: longer subjects are truncated on send. */
 const MAX_TOPIC_NAME_LENGTH = 60;
 
+/** `settings.MAX_MESSAGE_LENGTH`: `normalize_body` truncates a longer body on send. */
+const MAX_MESSAGE_LENGTH = 10_000;
+
 /** Milliseconds a best-effort teardown request may take before it is abandoned. */
 const TEARDOWN_TIMEOUT_MS = 2000;
 
@@ -236,14 +239,26 @@ export class ZulipPlugin implements BackendPlugin {
    * establish, so `connect` only validates and captures config. Every value that could otherwise
    * fail late (an unusable `site_url`, an empty `stream`) or fail silently (an `events_timeout_ms`
    * that makes the push loop hot) is rejected here, naming the offending key.
+   *
+   * A `connect()` over a live connection tears that one down FIRST, against the config it was made
+   * with. Keep the teardown here and the validation ahead of it, so that no per-connection registry
+   * — subscribe loops, event queues, blocking-fetch waiters — can address the new connection with
+   * the old one's state, and a rejected config leaves the live connection running.
    */
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as ZulipBackendConfig;
-    this.baseUrl = requireHttpUrl(orDefault(cfg.site_url, 'http://127.0.0.1:9991'));
-    this.email = requireNonEmpty('email', orDefault(cfg.email, 'parley-bot@localhost'));
-    this.apiKey = requireNonEmpty('api_key', orDefault(cfg.api_key, 'parley-api-key'), true);
-    this.stream = requireNonEmpty('stream', orDefault(cfg.stream, 'parley'));
-    this.eventsTimeoutMs = requireEventsTimeout(cfg.events_timeout_ms);
+    assertKnownKeys(cfg);
+    const baseUrl = requireHttpUrl(orDefault(cfg.site_url, 'http://127.0.0.1:9991'));
+    const email = requireNonEmpty('email', orDefault(cfg.email, 'parley-bot@localhost'));
+    const apiKey = requireNonEmpty('api_key', orDefault(cfg.api_key, 'parley-api-key'), true);
+    const stream = requireNonEmpty('stream', orDefault(cfg.stream, 'parley'));
+    const eventsTimeoutMs = requireEventsTimeout(cfg.events_timeout_ms);
+    if (this.connected) await this.disconnect();
+    this.baseUrl = baseUrl;
+    this.email = email;
+    this.apiKey = apiKey;
+    this.stream = stream;
+    this.eventsTimeoutMs = eventsTimeoutMs;
     this.claimedWireTopics.clear();
     this.generation++;
     this.teardown = new AbortController();
@@ -340,6 +355,10 @@ export class ZulipPlugin implements BackendPlugin {
    * `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) → the new message `id`.
    * `identity` is informational only: Zulip stamps the sender from the authenticated bot account
    * (see README "Multiple concurrent sessions"). `opts.inReplyTo` is ignored: Zulip threads by topic.
+   *
+   * A body the server would REWRITE is refused rather than sent ({@link requireSendableBody}), the
+   * same arm {@link wireTopic} takes: a hand-off stored altered reports success and is read back as
+   * something else.
    */
   async post(
     topic: Topic,
@@ -348,8 +367,9 @@ export class ZulipPlugin implements BackendPlugin {
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     this.require();
+    const body = requireSendableBody(content);
     const res = await this.http('POST', '/api/v1/messages', {
-      form: { type: 'stream', to: this.stream, topic: this.claimWireTopic(topic), content },
+      form: { type: 'stream', to: this.stream, topic: this.claimWireTopic(topic), content: body },
     });
     const id = ((await res.json()) as { id?: number } | null)?.id;
     if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
@@ -1190,6 +1210,68 @@ async function readRetryAfter(res: Response): Promise<number | undefined> {
  */
 function orDefault<T>(value: T | undefined, fallback: T): T | undefined {
   return value === undefined ? fallback : value;
+}
+
+/**
+ * The body as Zulip would store it, or a throw. `zerver/lib/message.py::normalize_body` right-strips
+ * the body, drops its leading newlines, refuses an empty or NUL-carrying one, and TRUNCATES past
+ * `MAX_MESSAGE_LENGTH` — every one of those a silent rewrite of a payload `post` already reported as
+ * durable, so each is refused here naming what the server would have done, exactly as an unusable
+ * topic is. Measured in code points, which is what Python's `len` counts.
+ */
+function requireSendableBody(content: string): string {
+  const rewritten = content.replace(/\s+$/u, '').replace(/^\n+/, '');
+  if (rewritten === '') {
+    throw new Error(
+      'Zulip rejects an empty message body (Zulip strips trailing whitespace and leading newlines ' +
+        `before storing, and ${JSON.stringify(content)} normalizes to nothing).`,
+    );
+  }
+  if (rewritten.includes('\u0000')) {
+    throw new Error('Zulip rejects a message body containing a NUL (U+0000). Remove it.');
+  }
+  if (rewritten !== content) {
+    const edge = content.replace(/\s+$/u, '') === content ? 'leading newlines' : 'trailing whitespace';
+    throw new Error(
+      `Zulip rewrites a message body on send: it strips ${edge}, so this message would be stored ` +
+        'altered and read back as something else. Trim it before posting.',
+    );
+  }
+  const length = [...content].length;
+  if (length > MAX_MESSAGE_LENGTH) {
+    throw new Error(
+      `Zulip message too long: ${length} characters, max ${MAX_MESSAGE_LENGTH} (Zulip truncates a ` +
+        'longer body on send, so the message would be stored altered). Shorten it or split it.',
+    );
+  }
+  return content;
+}
+
+/**
+ * Every key {@link ZulipBackendConfig} declares. Keep the `satisfies` on it, so that a key added to
+ * the interface without being listed here is a compile error rather than a key `connect()` rejects.
+ */
+const CONFIG_KEYS = Object.keys({
+  site_url: 0,
+  email: 0,
+  api_key: 0,
+  stream: 0,
+  events_timeout_ms: 0,
+} satisfies Record<keyof Required<ZulipBackendConfig>, 0>);
+
+/**
+ * Reject a key `backend_config` does not declare, before any value is read. Keep it a load error,
+ * so that a mistyped `api_kye` cannot fall through to the built-in default credential, nor a
+ * mistyped `events_timeout` leave the poll cap at a value the operator believes they replaced.
+ */
+function assertKnownKeys(cfg: object): void {
+  for (const key of Object.keys(cfg)) {
+    if (!CONFIG_KEYS.includes(key)) {
+      throw new Error(
+        `backend_config: unknown key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
+      );
+    }
+  }
 }
 
 /** A `//user:password@` authority — the one part of a URL that is a credential by construction. */

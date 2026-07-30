@@ -9,7 +9,7 @@
  */
 import { asTopic, type Cursor } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import type { FakeZulip } from './fake-zulip.js';
+import { FAULTS, type FakeZulip } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip, type ZulipPair } from './harness.js';
 
 const boot = useZulip();
@@ -61,7 +61,7 @@ const LOOP_STATES: LoopState[] = [
     name: 'a loop parked in failure backoff (500 on /events)',
     prepare: async ({ plugin, fake }, topic) => {
       await plugin.subscribe(asTopic(topic), () => undefined);
-      fake.failRoute('GET /api/v1/events', { status: 500 });
+      fake.failRoute('GET /api/v1/events', FAULTS.serverError);
       await sleep(600);
     },
     reusesTheLoopQueue: false,
@@ -70,10 +70,7 @@ const LOOP_STATES: LoopState[] = [
     name: 'a loop taking a non-queue 400 on /events',
     prepare: async ({ plugin, fake }, topic) => {
       await plugin.subscribe(asTopic(topic), () => undefined);
-      fake.failRoute('GET /api/v1/events', {
-        status: 400,
-        body: { result: 'error', code: 'BAD_REQUEST', msg: 'nope' },
-      });
+      fake.failRoute('GET /api/v1/events', FAULTS.nonQueueBadRequest);
       await sleep(600);
     },
     reusesTheLoopQueue: false,
@@ -94,7 +91,7 @@ const LOOP_STATES: LoopState[] = [
     name: 'a loop answering /events 200 with a body carrying no events',
     prepare: async ({ plugin, fake }, topic) => {
       await plugin.subscribe(asTopic(topic), () => undefined);
-      fake.failRoute('GET /api/v1/events', { status: 200, body: { result: 'success' } });
+      fake.failRoute('GET /api/v1/events', FAULTS.emptyBody);
       await sleep(600);
     },
     reusesTheLoopQueue: false,
@@ -110,7 +107,7 @@ const LOOP_STATES: LoopState[] = [
   {
     name: 'a loop that never started because register keeps failing',
     prepare: async ({ plugin, fake }, topic) => {
-      fake.failRoute(REGISTER, { status: 500 });
+      fake.failRoute(REGISTER, FAULTS.serverError);
       await expect(plugin.subscribe(asTopic(topic), () => undefined)).rejects.toThrow();
       await sleep(50);
       fake.clearRouteFailures();
@@ -120,7 +117,7 @@ const LOOP_STATES: LoopState[] = [
   {
     name: 'no queue can be opened at all (register is 500 throughout)',
     prepare: async ({ fake }) => {
-      fake.failRoute(REGISTER, { status: 500 });
+      fake.failRoute(REGISTER, FAULTS.serverError);
     },
     reusesTheLoopQueue: false,
   },
@@ -209,27 +206,19 @@ describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe
   const DEGRADATIONS: Array<{ name: string; apply: (fake: FakeZulip) => void }> = [
     {
       name: 'every event queue is rejected as stale',
-      apply: (fake) =>
-        fake.failRoute('GET /api/v1/events', {
-          status: 400,
-          body: { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'gone' },
-        }),
+      apply: (fake) => fake.failRoute('GET /api/v1/events', FAULTS.staleQueue),
     },
     {
       name: '/events answers 500',
-      apply: (fake) => fake.failRoute('GET /api/v1/events', { status: 500 }),
+      apply: (fake) => fake.failRoute('GET /api/v1/events', FAULTS.serverError),
     },
     {
       name: '/events answers 200 carrying no events',
-      apply: (fake) => fake.failRoute('GET /api/v1/events', { status: 200, body: { result: 'success' } }),
+      apply: (fake) => fake.failRoute('GET /api/v1/events', FAULTS.emptyBody),
     },
     {
       name: '/events answers 200 carrying only a heartbeat',
-      apply: (fake) =>
-        fake.failRoute('GET /api/v1/events', {
-          status: 200,
-          body: { result: 'success', events: [{ id: 1, type: 'heartbeat' }] },
-        }),
+      apply: (fake) => fake.failRoute('GET /api/v1/events', FAULTS.heartbeatOnly),
     },
     {
       name: '/events is a black hole',
@@ -304,7 +293,7 @@ describe('zulip blocking fetchRecent never overruns its blockMs', () => {
     { name: 'a responsive server', apply: () => undefined },
     {
       name: 'DELETE /events answering 500',
-      apply: (fake: FakeZulip) => fake.failRoute('DELETE /api/v1/events', { status: 500 }),
+      apply: (fake: FakeZulip) => fake.failRoute('DELETE /api/v1/events', FAULTS.serverError),
     },
     {
       name: 'DELETE /events a black hole',
@@ -397,7 +386,7 @@ describe('zulip blocking fetchRecent tracks a loop degrading and recovering', ()
 
       const started = Date.now();
       // The loop is healthy when the wait is armed and breaks immediately afterwards.
-      const broke = setTimeout(() => fake.failRoute('GET /api/v1/events', { status: 500 }), 30);
+      const broke = setTimeout(() => fake.failRoute('GET /api/v1/events', FAULTS.serverError), 30);
       const repaired = setTimeout(() => mode.repair(fake), 300);
       const late = setTimeout(() => void plugin.post(topic, SENDER, 'late'), 400);
       const res = await plugin.fetchRecent({ topic, since: tail, blockMs: BLOCK_MS });

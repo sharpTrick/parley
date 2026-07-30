@@ -8,27 +8,18 @@
  * The key list is read from the source's own `ZulipBackendConfig`, so a `backend_config` secret added
  * later is graded the day it is declared rather than the day someone remembers this file exists.
  */
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
-
-const SOURCE = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
+import { DECLARED_CONFIG_KEYS, DECLARED_CONFIG_TYPES } from './harness.js';
 
 /**
- * The declared type of each key, parsed from the source. It decides what a REJECTION may echo: a
- * value of the declared type is the diagnostic, and a value of any other type is a mis-paste whose
- * type says everything useful — echoing its content is how a credential pasted into the wrong key
- * reaches stderr and model context.
+ * The declared type of each key decides what a REJECTION may echo: a value of the declared type is
+ * the diagnostic, and a value of any other type is a mis-paste whose type says everything useful —
+ * echoing its content is how a credential pasted into the wrong key reaches stderr and model
+ * context.
  */
-const CONFIG_TYPES = ((): Record<string, string> => {
-  const body = /export interface ZulipBackendConfig \{([\s\S]*?)\n\}/.exec(SOURCE)?.[1] ?? '';
-  return Object.fromEntries(
-    [...body.matchAll(/^ {2}(\w+)\??: (\w+);/gm)].map((m) => [m[1] as string, m[2] as string]),
-  );
-})();
-
-const CONFIG_KEYS = Object.keys(CONFIG_TYPES);
+const CONFIG_TYPES = DECLARED_CONFIG_TYPES;
+const CONFIG_KEYS = DECLARED_CONFIG_KEYS;
 
 /** A key whose value is a credential. Matched on the NAME so a future secret is covered on arrival. */
 const SECRET_KEY = /key|secret|token|password|credential/i;

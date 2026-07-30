@@ -7,7 +7,7 @@
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
-import { rand, SENDER, sleep, useZulip } from './harness.js';
+import { DECLARED_CONFIG_KEYS, rand, SENDER, sleep, useZulip } from './harness.js';
 import { startFakeZulip } from './fake-zulip.js';
 
 const boot = useZulip();
@@ -82,6 +82,81 @@ describe('zulip backend_config: no value is accepted into a hot loop or a deferr
       }
     });
   }
+});
+
+/**
+ * CLASS: no key `backend_config` does not implement is accepted. A key the plugin never reads is a
+ * silent no-op that takes the DEFAULT — for `api_key` the world-known built-in one, which then
+ * authenticates every request against the operator's real server. The near misses are GENERATED
+ * from the declared key set, so the rows widen with the config surface instead of pinning one typo.
+ */
+const NEAR_MISSES: Array<(key: string) => { name: string; typo: string }> = [
+  (key) => ({ name: 'a dropped first character', typo: key.slice(1) }),
+  (key) => ({ name: 'a dropped last character', typo: key.slice(0, -1) }),
+  (key) => ({
+    name: 'a transposed pair',
+    typo: key.slice(0, -2) + (key.at(-1) ?? '') + (key.at(-2) ?? ''),
+  }),
+  (key) => ({ name: 'snake_case swapped for camelCase', typo: key.replace(/_(.)/g, (_m, c: string) => c.toUpperCase()) }),
+  (key) => ({ name: 'a doubled character', typo: (key.at(0) ?? '') + key }),
+];
+
+/** A value that must never reach anything readable, whichever key it was mistyped into. */
+const MISTYPED_SECRET = 'sup3r-s3cret-mistyped';
+
+describe('zulip backend_config: a key the plugin does not implement is a load error', () => {
+  for (const key of DECLARED_CONFIG_KEYS) {
+    it(`every near miss of ${key} is rejected, naming the offending key`, async () => {
+      const misses = NEAR_MISSES.map((make) => make(key)).filter(
+        (m) => m.typo !== '' && !DECLARED_CONFIG_KEYS.includes(m.typo),
+      );
+      expect(misses.length).toBeGreaterThan(0);
+      for (const { name, typo } of misses) {
+        const attempt = new ZulipPlugin().connect({
+          site_url: 'https://z.example.com',
+          [typo]: MISTYPED_SECRET,
+        });
+        const err = await attempt.then(
+          () => undefined,
+          (e: unknown) => e as Error,
+        );
+        expect(err?.message, `${key}: ${name}`).toContain(typo);
+        // The key is the whole diagnostic; its VALUE reaches stderr and model context.
+        expect(err?.message, `${key}: ${name}`).not.toContain(MISTYPED_SECRET);
+      }
+    });
+  }
+
+  it('names the accepted set, and it is exactly the declared one', async () => {
+    const err = await new ZulipPlugin()
+      .connect({ site_url: 'https://z.example.com', nonsense: 1 })
+      .then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+    expect(err).toBeDefined();
+    const named = DECLARED_CONFIG_KEYS.filter((k) => (err?.message ?? '').includes(k));
+    expect(named).toEqual(DECLARED_CONFIG_KEYS);
+  });
+
+  it('an unknown key is refused before any other validation, and before a live connection is torn down', async () => {
+    const fake = await startFakeZulip();
+    const plugin = new ZulipPlugin();
+    try {
+      await plugin.connect({ site_url: fake.url });
+      await expect(plugin.connect({ site_url: 'not-a-url', api_kye: 'x' })).rejects.toThrow(
+        'api_kye',
+      );
+      const topic = asTopic(`survives-${rand()}`);
+      await plugin.post(topic, SENDER, 'still connected');
+      expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+        'still connected',
+      ]);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      await fake.close();
+    }
+  });
 });
 
 describe('zulip backend_config defaults', () => {

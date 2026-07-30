@@ -7,7 +7,7 @@
 import { asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { GAP_FILL_PAGE, TAIL_PROBE_PAGE } from '../src/index.js';
-import type { FakeZulip } from './fake-zulip.js';
+import { FAULTS, type FakeZulip } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
@@ -128,7 +128,7 @@ const DEAD_SUBSCRIBE_MODES = [
   },
   {
     name: 'register fails',
-    break: (fake: FakeZulip) => fake.failRoute('POST /api/v1/register', { status: 500 }),
+    break: (fake: FakeZulip) => fake.failRoute('POST /api/v1/register', FAULTS.serverError),
     repair: (fake: FakeZulip) => fake.clearRouteFailures(),
   },
 ];

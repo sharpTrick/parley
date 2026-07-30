@@ -5,15 +5,10 @@
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import type { FakeZulip } from './fake-zulip.js';
+import { FAULTS, type FakeZulip } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
-
-const BAD_QUEUE = {
-  status: 400,
-  body: { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'gone' },
-};
 
 /**
  * Every request the loop can issue. The bound below is asserted on ALL of them, not on the one the
@@ -46,40 +41,33 @@ const PERMANENT_FAILURES: Array<{
   {
     name: 'every /events poll is answered 200 with a body carrying no events',
     counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) =>
-      fake.failRoute('GET /api/v1/events', { status: 200, body: { result: 'success' } }),
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.emptyBody),
   },
   {
     name: 'every /events poll is answered 200 with an unparseable body',
     counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) =>
-      fake.failRoute('GET /api/v1/events', { status: 200, body: { events: 'not-an-array' } }),
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.unparseableEvents),
   },
   {
     name: 'the api key was revoked (401 on /events)',
     counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) =>
-      fake.failRoute('GET /api/v1/events', { status: 401, body: { result: 'error', msg: 'Invalid API key' } }),
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.revokedKey),
   },
   {
     name: 'the server is broken (500 on /events)',
     counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', { status: 500 }),
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.serverError),
   },
   {
     name: 'a non-queue 400 on /events',
     counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) =>
-      fake.failRoute('GET /api/v1/events', {
-        status: 400,
-        body: { result: 'error', code: 'BAD_REQUEST', msg: 'nope' },
-      }),
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.nonQueueBadRequest),
   },
   {
     name: 're-register keeps failing after a queue GC',
     counted: 'POST /api/v1/register',
     apply: (fake: FakeZulip) => {
-      fake.failRoute('POST /api/v1/register', { status: 500 });
+      fake.failRoute('POST /api/v1/register', FAULTS.serverError);
       fake.gcQueues();
     },
   },
@@ -88,13 +76,13 @@ const PERMANENT_FAILURES: Array<{
     // fresh queue is rejected at once, so the failure is in the RECOVERY path, not in a request.
     name: 'every freshly registered queue is rejected as stale',
     counted: 'POST /api/v1/register',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', BAD_QUEUE),
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.staleQueue),
   },
   {
     name: 'every fresh queue is rejected as stale and the gap-fill reads fail too',
     counted: 'POST /api/v1/register',
     apply: (fake: FakeZulip) => {
-      fake.failRoute('GET /api/v1/events', BAD_QUEUE);
+      fake.failRoute('GET /api/v1/events', FAULTS.staleQueue);
       fake.failMessagesReads(1_000_000);
     },
   },
@@ -141,7 +129,7 @@ describe('zulip push loop backs off and reports when it fails permanently', () =
 
 const SERVER_STATES = [
   { name: 'responsive', apply: () => undefined },
-  { name: 'answering 500', apply: (fake: FakeZulip) => fake.failRoute('DELETE /api/v1/events', { status: 500 }) },
+  { name: 'answering 500', apply: (fake: FakeZulip) => fake.failRoute('DELETE /api/v1/events', FAULTS.serverError) },
   { name: 'a black hole', apply: (fake: FakeZulip) => fake.hangRoute('DELETE /api/v1/events') },
 ];
 

@@ -5,9 +5,27 @@
  */
 import type { ConformanceContext } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
 import { type FakeZulip, startFakeZulip } from './fake-zulip.js';
+
+/**
+ * The declared type of every `backend_config` key, parsed from the source's own
+ * `ZulipBackendConfig`. Read it rather than hand-listing the keys, so a key added later is graded
+ * the day it is declared — and graded by the SAME set everywhere, so the config table and the
+ * secret-hygiene table cannot end up describing two different surfaces.
+ */
+export const DECLARED_CONFIG_TYPES: Record<string, string> = ((): Record<string, string> => {
+  const source = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
+  const body = /export interface ZulipBackendConfig \{([\s\S]*?)\n\}/.exec(source)?.[1] ?? '';
+  return Object.fromEntries(
+    [...body.matchAll(/^ {2}(\w+)\??: (\w+);/gm)].map((m) => [m[1] as string, m[2] as string]),
+  );
+})();
+
+export const DECLARED_CONFIG_KEYS = Object.keys(DECLARED_CONFIG_TYPES);
 
 export const rand = (): string => Math.random().toString(36).slice(2, 8);
 export const SENDER = asHandle('writer');

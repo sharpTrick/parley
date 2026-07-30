@@ -19,6 +19,16 @@ export const SERVER_CONSTRAINTS = {
   maxTopicNameLength: 60,
   /** `zerver/actions/message_send.py` TOPIC_TRUNCATION_MESSAGE. */
   topicTruncationSuffix: '...',
+  /** `settings.MAX_MESSAGE_LENGTH` — `normalize_body` truncates a longer body on send. */
+  maxMessageLength: 10_000,
+  /** `zerver/lib/message.py` `truncate_body` marker, appended to a body that is truncated. */
+  bodyTruncationSuffix: '\n[message truncated]',
+  /** `zerver/lib/message.py::normalize_body`: `body.rstrip().lstrip('\n')` before the body is stored. */
+  stripsBodyEdges: true,
+  /** `normalize_body` rejects a body that normalizes to empty. */
+  rejectsEmptyBody: true,
+  /** `normalize_body` rejects a body carrying a NUL. */
+  rejectsNulInBody: true,
   /** `zerver/lib/topic.py` `Q(subject__iexact=…)` — topics (and streams) compare case-folded. */
   foldsTopicCase: true,
   /** Every endpoint requires HTTP Basic credentials that match a real bot account. */
@@ -118,6 +128,39 @@ export interface RateLimit {
   headerSeconds?: number;
   bodySeconds?: number;
 }
+
+/**
+ * The server faults the tables inject, named once beside the fake that serves them. Each is a WIRE
+ * SHAPE a real Zulip produces, so correcting one corrects every table that injects it; a shape
+ * restated as an inline literal in two test files drifts in one of them while both stay green
+ * (`fixture-hygiene.test.ts` lints for that).
+ */
+export const FAULTS = {
+  /** The server is broken — no body worth modelling, the status is the whole fault. */
+  serverError: { status: 500 },
+  /** `zerver/tornado/views.py`: the queue is gone (GCd after ~10 min idle, or never existed). */
+  staleQueue: {
+    status: 400,
+    body: {
+      result: 'error',
+      code: 'BAD_EVENT_QUEUE_ID',
+      queue_id: '(forced)',
+      msg: 'Bad event queue id: (forced)',
+    },
+  },
+  /** A 400 that is NOT about the queue: recovering by re-registering would be a flood. */
+  nonQueueBadRequest: { status: 400, body: { result: 'error', code: 'BAD_REQUEST', msg: 'nope' } },
+  revokedKey: { status: 401, body: { result: 'error', msg: 'Invalid API key' } },
+  /** A well-formed 200 carrying no events at all — a wake that never came, with no status to see. */
+  emptyBody: { status: 200, body: { result: 'success' } },
+  /** A poll answered only by the queue's keep-alive: an answer, but not a delivery. */
+  heartbeatOnly: {
+    status: 200,
+    body: { result: 'success', events: [{ id: 1, type: 'heartbeat' }] },
+  },
+  /** A 200 whose `events` is not an array — the declared wire type says this cannot arrive. */
+  unparseableEvents: { status: 200, body: { result: 'success', events: 'not-an-array' } },
+} as const satisfies Record<string, RouteFailure>;
 
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
@@ -324,10 +367,15 @@ export async function startFakeZulip(opts?: {
 
     switch (route) {
       case 'POST /api/v1/messages': {
+        const body = normalizeBody(form.get('content') ?? ''); // the server rewrites bodies too
+        if (typeof body !== 'string') {
+          json(res, 400, { result: 'error', code: 'BAD_REQUEST', msg: body.msg });
+          return;
+        }
         const id = append({
           display_recipient: form.get('to') ?? '',
           subject: truncateTopic(form.get('topic') ?? ''), // the server rewrites over-long topics
-          content: form.get('content') ?? '',
+          content: body,
           sender_email: auth.email,
           sender_full_name: 'Parley Bot',
         });
@@ -553,6 +601,21 @@ function toArray(v: FakeCredentials | FakeCredentials[] | undefined): FakeCreden
 /** A request flag read the way Zulip reads it: absent means the documented server DEFAULT. */
 function flagIsTrue(raw: string | null, flag: keyof typeof SERVER_CONSTRAINTS.requestFlagDefaults): boolean {
   return (raw ?? SERVER_CONSTRAINTS.requestFlagDefaults[flag]) === 'true';
+}
+
+/**
+ * `zerver/lib/message.py::normalize_body` — the rewrite every accepted send goes through: the body
+ * is right-stripped and its leading newlines removed, an empty or NUL-carrying result is refused,
+ * and a longer one is truncated to `maxMessageLength` code points with the truncation marker.
+ */
+function normalizeBody(body: string): string | { msg: string } {
+  const stripped = body.replace(/\s+$/u, '').replace(/^\n+/, '');
+  if (stripped === '') return { msg: 'Message must not be empty' };
+  if (stripped.includes('\u0000')) return { msg: 'Message must not contain null bytes' };
+  const chars = [...stripped];
+  if (chars.length <= SERVER_CONSTRAINTS.maxMessageLength) return stripped;
+  const suffix = SERVER_CONSTRAINTS.bodyTruncationSuffix;
+  return chars.slice(0, SERVER_CONSTRAINTS.maxMessageLength - [...suffix].length).join('') + suffix;
 }
 
 /** Zulip stores at most 60 characters of subject, replacing the tail with an ellipsis. */

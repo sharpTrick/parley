@@ -13,7 +13,7 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 
 | Seam concept              | Zulip mapping |
 | ------------------------- | ------------- |
-| `connect(config)`         | No session to establish — Zulip auth is per-request HTTP Basic (`email:api_key`). `connect` captures config; a bad URL/key surfaces on the first call. |
+| `connect(config)`         | No session to establish — Zulip auth is per-request HTTP Basic (`email:api_key`). `connect` captures config; a bad URL/key surfaces on the first call. Calling it again over a live connection disconnects that one first (its queues are deleted against the site it was made with); a rejected config leaves the live connection running. |
 | topic → stream + topic    | ONE configured Zulip **stream** (default `parley`) carries all Parley traffic; each Parley topic is a Zulip **topic** within it. |
 | `post`                    | `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) with `{ type: "stream", to: <stream>, topic, content }` → returns the new message `id`. |
 | `backendMsgId` = `cursor` | The Zulip **message `id`** — a globally monotonic integer (hence per-topic monotonic); serves as both the dedup key and the order key. Zero cursor is `'0'`. |
@@ -51,6 +51,20 @@ Zulip's topic namespace is not quite Parley's, so the plugin maps between them e
   write-only — posts land under a name the read narrow never matches. The plugin refuses such a
   topic with a clear error at `post`/`fetchRecent`/`subscribe` instead.
 
+## Message bodies: 10 000 characters, no ragged edges
+
+Zulip normalizes every body it accepts (`zerver/lib/message.py::normalize_body`) before storing it,
+so a payload it would rewrite is refused at `post` rather than acknowledged with an id and stored
+as something else:
+
+- **10 000 characters, hard** (code points). A longer body is truncated on send and marked
+  `[message truncated]` — for a context hand-off, silently. `post` refuses it, naming the measured
+  length; split the hand-off instead.
+- **Trailing whitespace and leading newlines are stripped** by the server, so a body carrying
+  either is refused. Leading *spaces* and all interior whitespace survive untouched.
+- **An empty (or whitespace-only) body and a body containing a NUL are rejected** by the server;
+  `post` refuses them up front with the reason.
+
 ## The one inexactness: topics are mutable
 
 Zulip topics are **mutable namespaces** — admins (and, under the default org policy, members) can
@@ -71,7 +85,10 @@ stream with only bots posting, this never happens on its own.
 | `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. |
 | `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). Clamped to `[250, 600000]` ms, so no value can make the loop poll hot. |
 
-Every key is validated at `connect()`, which throws naming the offending key: `site_url` must be a
+A key `backend_config` does not declare is a **load error** naming it and the accepted set — a
+typo'd `api_kye` would otherwise be a silent no-op that authenticates every request with the
+built-in default key. Every declared key is validated at `connect()`, which throws naming the
+offending key: `site_url` must be a
 bare absolute `http(s)` base URL — no `user:password@` (Zulip authenticates from `email`/`api_key`,
 and a credential in the URL would be echoed by every diagnostic that names the site) and no query or
 fragment — `email`/`api_key`/`stream` must be non-empty, and `events_timeout_ms` must be a positive,

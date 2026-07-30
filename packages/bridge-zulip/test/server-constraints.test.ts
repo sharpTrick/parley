@@ -4,9 +4,9 @@
  * credentials that must belong to a real account. The fake models each one
  * ({@link SERVER_CONSTRAINTS}), so these tables fail here exactly as they would fail live.
  */
-import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { type FakeMember, SERVER_CONSTRAINTS } from './fake-zulip.js';
+import { type FakeMember, type FakeZulip, SERVER_CONSTRAINTS } from './fake-zulip.js';
 import { rand, SENDER, useZulip } from './harness.js';
 
 const boot = useZulip();
@@ -206,6 +206,204 @@ describe('zulip topic case folding vs the topic allowlist', () => {
       const { messages } = await plugin.fetchRecent({ topic });
       expect(messages.map((m) => m.content)).toEqual(['ours', 'theirs']);
       expect(messages.map((m) => m.topic)).toEqual([topic, topic]);
+    });
+  }
+});
+
+/**
+ * CLASS: every server-side rewrite of a WRITE the plugin issues is modelled by the fake and graded
+ * by a row here — `post` either round-trips the payload exactly or refuses it naming the constraint.
+ * A rewrite the plugin lets through returns a message id for a message the server stored as
+ * something else, which is the one answer the seam does not allow: the TOPIC rewrites had rows,
+ * the BODY rewrites had none, and a 15 000-character hand-off was accepted and stored truncated.
+ */
+interface WriteRewrite {
+  /** Which {@link SERVER_CONSTRAINTS} entries the row grades; every key must be claimed by one. */
+  constraints: Array<keyof typeof SERVER_CONSTRAINTS>;
+  name: string;
+  /** A prior write on the base topic, so a row can grade a rewrite that needs a claim to exist. */
+  claimsBaseFirst?: true;
+  topic?: (base: Topic) => Topic;
+  content: string;
+  /** Absent = the payload must survive the round trip byte for byte. */
+  refuses?: RegExp;
+}
+
+const MAX_BODY = SERVER_CONSTRAINTS.maxMessageLength;
+
+const WRITE_REWRITES: WriteRewrite[] = [
+  {
+    constraints: ['maxTopicNameLength', 'topicTruncationSuffix'],
+    name: 'a topic one code point past the cap',
+    topic: () => asTopic('t'.repeat(SERVER_CONSTRAINTS.maxTopicNameLength + 1)),
+    content: 'x',
+    refuses: /61 characters/,
+  },
+  {
+    constraints: ['maxTopicNameLength'],
+    name: 'a topic exactly at the cap',
+    topic: () => asTopic(`t${rand()}`.padEnd(SERVER_CONSTRAINTS.maxTopicNameLength, 'x')),
+    content: 'x',
+  },
+  {
+    constraints: ['foldsTopicCase'],
+    name: 'a topic differing from a claimed one only in case',
+    claimsBaseFirst: true,
+    topic: (base) => asTopic(base.toUpperCase()),
+    content: 'x',
+    refuses: /collision/i,
+  },
+  {
+    constraints: ['maxMessageLength', 'bodyTruncationSuffix'],
+    name: 'a body one code point past the cap',
+    content: 'x'.repeat(MAX_BODY + 1),
+    refuses: new RegExp(`${MAX_BODY + 1} characters`),
+  },
+  {
+    constraints: ['maxMessageLength'],
+    name: 'a body exactly at the cap',
+    content: 'x'.repeat(MAX_BODY),
+  },
+  {
+    constraints: ['maxMessageLength'],
+    name: 'an astral body at the cap in code points but past it in UTF-16 units',
+    content: '\u{1F600}'.repeat(MAX_BODY),
+  },
+  {
+    constraints: ['stripsBodyEdges'],
+    name: 'a body with trailing spaces',
+    content: '  hand-off  ',
+    refuses: /trailing whitespace/,
+  },
+  {
+    constraints: ['stripsBodyEdges'],
+    name: 'a body with a trailing newline',
+    content: 'hand-off\n',
+    refuses: /trailing whitespace/,
+  },
+  {
+    constraints: ['stripsBodyEdges'],
+    name: 'a body with a leading newline',
+    content: '\nhand-off',
+    refuses: /leading newline/,
+  },
+  {
+    constraints: ['stripsBodyEdges'],
+    name: 'a body with leading spaces, which the server keeps',
+    content: '  hand-off',
+  },
+  {
+    constraints: ['stripsBodyEdges'],
+    name: 'a body whose interior whitespace is all the server leaves alone',
+    content: 'hand\n\n  off\tdone',
+  },
+  {
+    constraints: ['rejectsEmptyBody'],
+    name: 'an empty body',
+    content: '',
+    refuses: /empty/,
+  },
+  {
+    constraints: ['rejectsEmptyBody'],
+    name: 'a whitespace-only body',
+    content: '  \n\t ',
+    refuses: /empty/,
+  },
+  {
+    constraints: ['rejectsNulInBody'],
+    name: 'a body carrying a NUL',
+    content: 'hand\u0000off',
+    refuses: /NUL/,
+  },
+];
+
+/** Constraints that govern a READ or the transport rather than a write, and where each is graded. */
+const NON_WRITE_CONSTRAINTS: Record<string, string> = {
+  maxMessagesPerFetch: 'the page-size table at the top of this file',
+  requiresValidCredentials: 'the credentials case below',
+  requestFlagDefaults: 'wire-format-flags.test.ts',
+};
+
+describe('zulip post never lets the server rewrite a write', () => {
+  for (const row of WRITE_REWRITES) {
+    const verdict = row.refuses === undefined ? 'round-trips exactly' : 'is refused, naming the constraint';
+    it(`${row.name} ${verdict}`, async () => {
+      const { plugin } = await boot();
+      const base = asTopic(`write-${rand()}`);
+      if (row.claimsBaseFirst === true) await plugin.post(base, SENDER, 'claimed');
+      const topic = row.topic?.(base) ?? base;
+
+      if (row.refuses !== undefined) {
+        await expect(plugin.post(topic, SENDER, row.content)).rejects.toThrow(row.refuses);
+        return;
+      }
+      await plugin.post(topic, SENDER, row.content);
+      const { messages } = await plugin.fetchRecent({ topic });
+      expect(messages.map((m) => m.content)).toEqual([row.content]);
+    });
+  }
+
+  it('every modelled server constraint is claimed by a write row or declared a read constraint', () => {
+    const claimed = new Set<string>([
+      ...WRITE_REWRITES.flatMap((r) => r.constraints),
+      ...Object.keys(NON_WRITE_CONSTRAINTS),
+    ]);
+    expect(Object.keys(SERVER_CONSTRAINTS).filter((key) => !claimed.has(key))).toEqual([]);
+  });
+});
+
+/**
+ * The plugin refuses every body the server would rewrite, which puts the fake's own model out of
+ * reach of any call the plugin can make — so the model is graded on the wire instead. Without this,
+ * the fake could quietly go back to echoing the payload and every content clause the shared
+ * conformance suite grades against this backend would be graded against an echo.
+ */
+describe('the fake rewrites a body exactly as Zulip documents', () => {
+  const rawPost = async (fake: FakeZulip, topic: string, content: string): Promise<Response> =>
+    fetch(`${fake.url}/api/v1/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ type: 'stream', to: 'parley', topic, content }).toString(),
+    });
+
+  const STORED: Array<{ name: string; sent: string; stored: string }> = [
+    { name: 'strips trailing whitespace', sent: 'hand-off \t\n ', stored: 'hand-off' },
+    { name: 'strips leading newlines', sent: '\n\nhand-off', stored: 'hand-off' },
+    { name: 'keeps leading spaces', sent: '  hand-off', stored: '  hand-off' },
+    {
+      name: 'truncates a body past the cap, marker included',
+      sent: 'x'.repeat(MAX_BODY + 5000),
+      stored:
+        'x'.repeat(MAX_BODY - [...SERVER_CONSTRAINTS.bodyTruncationSuffix].length) +
+        SERVER_CONSTRAINTS.bodyTruncationSuffix,
+    },
+  ];
+
+  for (const row of STORED) {
+    it(row.name, async () => {
+      const { plugin, fake } = await boot();
+      const topic = `fake-${rand()}`;
+      expect((await rawPost(fake, topic, row.sent)).status).toBe(200);
+      const { messages } = await plugin.fetchRecent({ topic: asTopic(topic) });
+      expect(messages.map((m) => m.content)).toEqual([row.stored]);
+    });
+  }
+
+  const REFUSED = [
+    { name: 'an empty body', sent: '' },
+    { name: 'a whitespace-only body', sent: '   ' },
+    { name: 'a body carrying a NUL', sent: 'hand\u0000off' },
+  ];
+
+  for (const row of REFUSED) {
+    it(`refuses ${row.name}`, async () => {
+      const { plugin, fake } = await boot();
+      const topic = `fake-${rand()}`;
+      expect((await rawPost(fake, topic, row.sent)).status).toBe(400);
+      expect((await plugin.fetchRecent({ topic: asTopic(topic) })).messages).toEqual([]);
     });
   }
 });

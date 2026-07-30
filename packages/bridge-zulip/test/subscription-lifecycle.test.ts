@@ -7,6 +7,7 @@
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
+import { FAULTS } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip, type ZulipPair } from './harness.js';
 
 const boot = useZulip();
@@ -30,6 +31,8 @@ interface ParkPoint {
   repair?: (pair: ZulipPair) => void;
   /** How long to watch for a loop that comes back; must outlast whatever it is sleeping off. */
   observeMs?: number;
+  /** Registrations this park makes FAIL, which mint no queue and so cannot balance a queue ledger. */
+  registerFails?: true;
 }
 
 const PARK_POINTS: ParkPoint[] = [
@@ -40,7 +43,7 @@ const PARK_POINTS: ParkPoint[] = [
   {
     name: 'a failure backoff deeper than the teardown budget (500 on /events)',
     park: async ({ fake }) => {
-      fake.failRoute('GET /api/v1/events', { status: 500 });
+      fake.failRoute('GET /api/v1/events', FAULTS.serverError);
       await sleep(DEEP_BACKOFF_MS);
     },
     repair: ({ fake }) => fake.clearRouteFailures(),
@@ -49,11 +52,12 @@ const PARK_POINTS: ParkPoint[] = [
   {
     name: 'the backoff after a failed re-register',
     park: async ({ fake }) => {
-      fake.failRoute(REGISTER, { status: 500 });
+      fake.failRoute(REGISTER, FAULTS.serverError);
       fake.gcQueues();
       await sleep(SETTLE_MS);
     },
     repair: ({ fake }) => fake.clearRouteFailures(),
+    registerFails: true,
   },
   {
     name: 'a gap-fill in flight',
@@ -111,6 +115,69 @@ describe('zulip push loop dies with its subscription, whatever it is parked in',
         expect(got).toHaveLength(deliveredAtTeardown);
         expect(fake.requestCount(REGISTER)).toBe(registersAtTeardown);
       });
+    }
+  }
+});
+
+/**
+ * CLASS: every per-connection registry starts a connection EMPTY, on every entry path. `connect()`
+ * is reachable without a `disconnect()` before it, and a registry cleared in only one of those paths
+ * leaves the previous connection's state addressing the new one — a blocking `fetchRecent` spends
+ * its whole budget parked behind a wake source that no longer exists, and the old server's event
+ * queues are never released. The table crosses both entry paths with both servers, because a
+ * reconnect to a DIFFERENT site_url is also where a queue id minted by one server is offered to
+ * another. The park points are shared with the table above, so a state added there is graded here.
+ */
+describe('zulip starts every connection from clean per-connection state', () => {
+  const ENTRIES = [
+    { name: 'disconnect then connect', disconnectFirst: true },
+    { name: 'connect with no disconnect', disconnectFirst: false },
+  ];
+  const TARGETS = [
+    { name: 'the same server', elsewhere: false },
+    { name: 'a different server', elsewhere: true },
+  ];
+  const WAKE_BLOCK_MS = 4000;
+  /** A wake that lands inside this is a wake; anything slower is the caller's budget expiring. */
+  const WAKE_WITHIN_MS = 1500;
+
+  for (const point of PARK_POINTS.filter((p) => p.registerFails !== true)) {
+    for (const entry of ENTRIES) {
+      for (const target of TARGETS) {
+        it(`${entry.name} against ${target.name} with a loop parked in ${point.name}`, async () => {
+          const pair = await boot();
+          const { plugin, fake } = pair;
+          const topic = asTopic(`reset-${rand()}`);
+          await plugin.subscribe(topic, () => undefined);
+          await plugin.post(topic, SENDER, 'live');
+          await sleep(200);
+          await point.park(pair, topic);
+          point.repair?.(pair);
+
+          const next = target.elsewhere ? (await boot()).fake : fake;
+          if (entry.disconnectFirst) await plugin.disconnect();
+          await plugin.connect({ site_url: next.url, events_timeout_ms: 500 });
+
+          // Taken now, so the queues the new connection opens on the same server cannot flatter it.
+          const releasedOnOld = fake.requestCount(DELETE_QUEUE);
+          const mintedOnOld = fake.requestCount(REGISTER);
+
+          await plugin.post(topic, SENDER, 'seed');
+          const tail = (await plugin.fetchRecent({ topic })).nextCursor;
+          const registersBefore = next.requestCount(REGISTER);
+          const started = Date.now();
+          const late = setTimeout(() => void plugin.post(topic, SENDER, 'late'), 200);
+          const res = await plugin.fetchRecent({ topic, since: tail, blockMs: WAKE_BLOCK_MS });
+          clearTimeout(late);
+
+          expect(res.messages.map((m) => m.content)).toEqual(['late']);
+          expect(Date.now() - started).toBeLessThan(WAKE_WITHIN_MS);
+          // The new connection carries no subscription, so the blocked fetch must have opened a
+          // queue of its OWN — the other half of "it did not park behind the old one".
+          expect(next.requestCount(REGISTER)).toBeGreaterThan(registersBefore);
+          expect(releasedOnOld).toBeGreaterThanOrEqual(mintedOnOld);
+        }, 30_000);
+      }
     }
   }
 });
