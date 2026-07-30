@@ -67,12 +67,15 @@ function repetitionCost(min: number, max: number): number {
  *
  * A source the scan cannot follow to the end — an unterminated class, an unbalanced group, a
  * trailing escape — is refused rather than accepted: losing track of the grammar means the
- * remainder was never screened. So everything the screen accepts also compiles on its own.
+ * remainder was never screened. So is one the scan does follow but V8 rejects: a quantifier with
+ * nothing to repeat (`*a`, `a**`, `\b?`, `^*`) or a `{n,m}` whose min exceeds its max. So
+ * everything the screen accepts also compiles on its own.
  */
 export function isRedosSafeSource(src: string): boolean {
   let budget = 1;
   const ambiguous: boolean[] = [false];
   const branches: number[] = [1];
+  let quantifiable = false;
   const charge = (factor: number): void => {
     budget = Math.min(budget * factor, Number.MAX_SAFE_INTEGER);
   };
@@ -85,6 +88,7 @@ export function isRedosSafeSource(src: string): boolean {
     if (ch === '\\') {
       i += 2;
       if (i > src.length) return false;
+      quantifiable = src[i - 1] !== 'b' && src[i - 1] !== 'B';
       continue;
     }
     if (ch === '[') {
@@ -95,6 +99,7 @@ export function isRedosSafeSource(src: string): boolean {
       while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
       if (i >= src.length) return false;
       i++;
+      quantifiable = true;
       continue;
     }
     if (ch === '(') {
@@ -103,6 +108,7 @@ export function isRedosSafeSource(src: string): boolean {
       i++;
       const prefix = GROUP_PREFIX.exec(src.slice(i));
       if (prefix) i += prefix[0].length;
+      quantifiable = false;
       continue;
     }
     if (ch === ')') {
@@ -126,53 +132,64 @@ export function isRedosSafeSource(src: string): boolean {
       } else if (q === '{') {
         const b = readBrace(src, i);
         if (b) {
+          if (b.min > b.max) return false;
           quantified = true;
           quantMin = b.min;
           quantMax = b.max;
           i += b.len;
         }
       }
-      if (quantified && (src[i] === '?' || src[i] === '+')) i++;
+      if (quantified && src[i] === '?') i++;
       if (body && quantMax >= 2) return false;
       charge(branchCount);
       if (quantified) charge(repetitionCost(quantMin, quantMax));
       if (body || quantified) markAmbiguous();
+      quantifiable = !quantified;
       continue;
     }
     if (ch === '|') {
       branches[branches.length - 1]!++;
       markAmbiguous();
       i++;
+      quantifiable = false;
       continue;
     }
     if (ch === '*' || ch === '+') {
+      if (!quantifiable) return false;
       charge(UNBOUNDED_COST);
       markAmbiguous();
       i++;
-      if (src[i] === '?' || src[i] === '+') i++;
+      if (src[i] === '?') i++;
+      quantifiable = false;
       continue;
     }
     if (ch === '?') {
+      if (!quantifiable) return false;
       charge(2);
       markAmbiguous();
       i++;
       if (src[i] === '?') i++;
+      quantifiable = false;
       continue;
     }
     if (ch === '{') {
       const b = readBrace(src, i);
       if (b) {
+        if (!quantifiable || b.min > b.max) return false;
         const cost = repetitionCost(b.min, b.max);
         charge(cost);
         if (cost > 1) markAmbiguous();
         i += b.len;
         if (src[i] === '?') i++;
+        quantifiable = false;
         continue;
       }
       i++;
+      quantifiable = true;
       continue;
     }
     i++;
+    quantifiable = ch !== '^' && ch !== '$';
   }
   if (ambiguous.length !== 1) return false;
   charge(branches[0] ?? 1);

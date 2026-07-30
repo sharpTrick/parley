@@ -1,5 +1,4 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { EventEmitter } from 'node:events';
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -55,29 +54,6 @@ function tmp(): string {
 }
 afterAll(() => {
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
-});
-
-// The CLI's stdin EOF/close wiring must run shutdown() and must be idempotent under the
-// shuttingDown guard — 'end' + 'close' (or a signal racing EOF) must call shutdown ONCE. This
-// mirrors the exact wiring in cli.ts against a stdin stub.
-describe('stdin EOF shutdown wiring is idempotent (unit)', () => {
-  it('runs shutdown exactly once across end + close', async () => {
-    const stdin = new EventEmitter();
-    let shutdownCalls = 0;
-    // Replicate cli.ts's guarded shutdown wiring verbatim.
-    let shuttingDown = false;
-    const shutdown = (): void => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      shutdownCalls++;
-    };
-    stdin.on('end', shutdown);
-    stdin.on('close', shutdown);
-
-    stdin.emit('end');
-    stdin.emit('close'); // second event must be a no-op thanks to the guard
-    expect(shutdownCalls).toBe(1);
-  });
 });
 
 /**

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { SqlParam } from '../src/driver.js';
 import {
   backoffMs,
   MAX_POLL_INTERVAL_MS,
@@ -11,6 +12,7 @@ import {
   PRUNE_BATCH,
   SqlitePlugin,
 } from '../src/index.js';
+import { SQL } from '../src/schema.js';
 
 /**
  * The plugin runs two background jobs — the per-topic poll loop and the retention prune — and both
@@ -242,19 +244,48 @@ describe('background jobs do bounded work per statement', () => {
     for (let i = 0; i < rows; i++) await p.post(topic, me, `m${i}`);
   }
 
-  it('the prune resolves its window through an index, not a table scan', async () => {
-    const p = await plugin();
-    await fill(p, T, 50);
-    const holder = p as unknown as { driver: { prepare(sql: string): Stmt } };
-    const plan = holder.driver
-      .prepare(
-        'EXPLAIN QUERY PLAN DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)',
-      )
-      .all(new Date().toISOString(), PRUNE_BATCH) as Array<{ detail: string }>;
-    const detail = plan.map((r) => r.detail).join(' | ');
-    expect(detail).toMatch(/idx_messages_ts/);
-    expect(detail).not.toMatch(/SCAN messages\b(?!.*USING)/);
+  /**
+   * Planned from `SQL` — the same map `connect()` prepares from — so that the statement this grades
+   * is the statement that runs. A plan check against SQL restated in the test certifies a copy, and
+   * every degradation it exists to catch (a predicate the index cannot serve, a dropped LIMIT
+   * subquery, a reordered term) ships green.
+   */
+  const PLANNED: Array<{ name: keyof typeof SQL; params: SqlParam[]; index: RegExp | null }> = [
+    { name: 'selectAfter', params: [T, 0, POLL_BATCH], index: /idx_messages_topic_id/ },
+    { name: 'selectRecent', params: [T, 100], index: /idx_messages_topic_id/ },
+    { name: 'maxId', params: [T], index: /idx_messages_topic_id/ },
+    { name: 'prune', params: [new Date().toISOString(), PRUNE_BATCH], index: /idx_messages_ts/ },
+    { name: 'seq', params: [], index: null },
+  ];
+  const NO_PLAN: Array<keyof typeof SQL> = ['insert'];
+
+  it('every statement the plugin prepares is either planned below or an insert', () => {
+    expect([...PLANNED.map((s) => s.name), ...NO_PLAN].sort()).toEqual(Object.keys(SQL).sort());
   });
+
+  for (const { name, params, index } of PLANNED) {
+    it(`${name} resolves through an index, not a table scan`, async () => {
+      const p = await plugin();
+      await fill(p, T, 50);
+      const holder = p as unknown as { driver: { prepare(sql: string): Stmt } };
+      const plan = holder.driver.prepare(`EXPLAIN QUERY PLAN ${SQL[name]}`).all(...params) as Array<{
+        detail: string;
+      }>;
+      const steps = plan.map((r) => r.detail);
+      const onMessages = steps.filter((s) => /\bmessages\b/.test(s));
+      if (index === null) {
+        expect(onMessages).toEqual([]);
+        return;
+      }
+      // Keep this matching on SEARCH rather than on the index name, so that a COVERING INDEX *scan*
+      // — which still walks the whole store — cannot pass as index use.
+      expect(onMessages.length).toBeGreaterThan(0);
+      for (const step of onMessages) {
+        expect(step).toMatch(/^SEARCH messages USING (COVERING INDEX|INDEX|INTEGER PRIMARY KEY)/);
+      }
+      expect(steps.join(' | ')).toMatch(index);
+    });
+  }
 
   it('a prune larger than one batch yields to the event loop between batches', async () => {
     const path = dbFile();

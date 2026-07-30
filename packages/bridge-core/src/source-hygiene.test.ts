@@ -73,18 +73,27 @@ describe('source hygiene', () => {
     expect(codeFiles.length).toBeGreaterThan(50);
   });
 
-  it('no comment or test name cites an issue tracker', () => {
+  /**
+   * The same class one step further out: a comment that dates itself. "unchanged from today" and
+   * "as of now" resolve to no date and no baseline for the next reader, and go false the moment the
+   * thing they describe moves — while the code they sit above stays correct. CLAUDE.md puts that in
+   * the commit message, where it cannot rot against the code.
+   */
+  const TEMPORAL =
+    /unchanged from today|as of (?:today|now|this writing)|at the time of writing|\bin round \d|\bthe reviewer\b|\bas things stand\b|\bfor the time being\b/i;
+
+  it.each([
+    ['cites an issue tracker', TRACKER, 'cite the behaviour, not the ticket'],
+    ['dates itself', TEMPORAL, 'state the risk, not when it was written'],
+  ])('no comment or test name %s', (_label, pattern, advice) => {
     const offenders: string[] = [];
     for (const f of codeFiles) {
       readFileSync(f, 'utf8')
         .split('\n')
         .forEach((line, i) => {
-          if (TRACKER.test(line)) offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
+          if (pattern.test(line)) offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
         });
     }
-    expect(
-      offenders,
-      'cite the behaviour, not the ticket — put the history in the commit message',
-    ).toEqual([]);
+    expect(offenders, `${advice} — put the history in the commit message`).toEqual([]);
   });
 });

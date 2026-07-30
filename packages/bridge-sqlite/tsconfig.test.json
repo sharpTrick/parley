@@ -1,0 +1,12 @@
+{
+  "//": "Type-check-only project covering the sources tsconfig.json excludes from the published build. vitest transpiles with esbuild and never type-checks, so without this project the test surface is checked by nothing.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "tsBuildInfoFile": "tsconfig.test.tsbuildinfo"
+  },
+  "references": [{ "path": "../bridge-core" }, { "path": "../conformance" }],
+  "include": ["src/**/*", "test/**/*"],
+  "exclude": []
+}

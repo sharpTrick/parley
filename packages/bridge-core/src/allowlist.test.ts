@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Allowlist, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
+import { MAX_MATCH_INPUT } from './regex-safety.js';
 
 function compiles(src: string): boolean {
   try {
@@ -72,15 +73,9 @@ describe('Allowlist reserved topics', () => {
     );
   });
 
-  it('still matches ordinary topics up to the input bound', () => {
+  // The over-long refusal and its message are graded at the clamp itself in stated-bounds.test.ts.
+  it('refuses an unmatched topic without inventing a reason', () => {
     const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*'] });
-    expect(allow.has(`ctx-${'a'.repeat(59)}`)).toBe(true); // 63 chars, under the 64 cap
-    expect(allow.has(`ctx-${'a'.repeat(80)}`)).toBe(false); // over it, refused rather than matched
-  });
-
-  it('says WHY an over-long topic was refused instead of just "not allowed"', () => {
-    const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*'] });
-    expect(() => allow.assert(`ctx-${'a'.repeat(80)}`)).toThrow(/at most 64 characters/);
     expect(() => allow.assert('nope')).toThrow(/^topic not allowed: "nope"$/);
   });
 });
@@ -89,41 +84,63 @@ describe('Allowlist reserved topics', () => {
 // parseConfig, and `has` is then driven by a caller-supplied topic. Screen at BOTH ends — refuse
 // the hostile source at construction, and bound the input the survivors ever see.
 describe('Allowlist pattern safety', () => {
-  const HOSTILE = [
-    ['nested quantifier', '([a-z]+)+'],
-    ['alternation under a quantifier', '(a|a)*'],
-    ['bounded repeat over a risky body', '([a-z]*){15}'],
-    ['many unbounded quantifiers', '.*.*.*.*.*'],
-    ['ambiguous alternation chain', `${'(a|aa)'.repeat(30)}b`],
-    ['ambiguous alternation chain (dot)', `${'(.|..)'.repeat(30)}z`],
-    ['optional-atom chain', `${'a?'.repeat(24)}${'a'.repeat(24)}b`],
-  ] as const;
-
-  it.each(HOSTILE)('refuses to compile a pattern that can blow up (%s)', (_label, pattern) => {
-    expect(() => new Allowlist(['ctx'], { postPatterns: [pattern] })).toThrow(UnsafePatternError);
+  // Which sources the constructor refuses is graded against the shared hostile/safe corpus, at every
+  // layer that compiles an unauthored pattern, in regex-screen-parity.test.ts.
+  it('refuses an unsafe source with UnsafePatternError, naming the pattern', () => {
+    expect(() => new Allowlist(['ctx'], { postPatterns: ['([a-z]+)+'] })).toThrow(
+      UnsafePatternError,
+    );
+    expect(() => new Allowlist(['ctx'], { postPatterns: ['([a-z]+)+'] })).toThrow(/\(\[a-z\]\+\)\+/);
   });
 
-  // Two axes: pattern shape × topic length. Lengths UNDER the input clamp are the ones that grade
-  // the matcher — `has` refuses anything over it before a regex runs, so a table of over-long
-  // topics alone only grades the clamp.
-  const LENGTHS = [1, 8, 32, 63, 64, 65, 256, 5000];
-  const SAFE = [
-    ['plain broad pattern', 'ctx-.*'],
-    ['character class', 'project-[a-z0-9-]+'],
-    ['alternation', '(alpha|beta)-.*'],
-    ['bounded repeat', 'ctx-\\d{1,4}'],
-    ['four unbounded quantifiers', '.*.*.*.*x'],
+  // Two axes: pattern shape × topic length, each at a topic the pattern DOES match and one it does
+  // not. A table of non-matching topics grades only the clamp, and the verdict is derived from
+  // MAX_MATCH_INPUT rather than pinned false everywhere, so a clamp that swallowed a legal topic
+  // (or a pattern that stopped matching) reddens here rather than shipping.
+  const LENGTHS = [1, 8, 32, 63, MAX_MATCH_INPUT, MAX_MATCH_INPUT + 1, 256, 5000];
+  const SAFE: readonly (readonly [string, string, (len: number) => string | undefined])[] = [
+    ['plain broad pattern', 'ctx-.*', (len) => (len >= 4 ? `ctx-${'a'.repeat(len - 4)}` : undefined)],
+    [
+      'character class',
+      'project-[a-z0-9-]+',
+      (len) => (len >= 9 ? `project-${'a'.repeat(len - 8)}` : undefined),
+    ],
+    ['alternation', '(alpha|beta)-.*', (len) => (len >= 5 ? `beta-${'a'.repeat(len - 5)}` : undefined)],
+    [
+      'bounded repeat',
+      'ctx-\\d{1,4}',
+      (len) => (len >= 5 && len <= 8 ? `ctx-${'1'.repeat(len - 4)}` : undefined),
+    ],
+    ['four unbounded quantifiers', '.*.*.*.*x', (len) => `${'a'.repeat(len - 1)}x`],
   ] as const;
 
-  it.each(
-    SAFE.flatMap(([label, pattern]) => LENGTHS.map((len) => [`${label} @ ${len}`, pattern, len])),
-  )('bounds match work for any topic length (%s)', (_label, pattern, len) => {
-    const allow = new Allowlist(['ctx'], { postPatterns: [pattern as string] });
-    const topic = 'a'.repeat((len as number) - 1) + '!';
-    const started = Date.now();
-    expect(allow.has(topic)).toBe(false);
-    expect(Date.now() - started).toBeLessThan(100);
+  const MATCH_ROWS = SAFE.flatMap(([label, pattern, matching]) =>
+    LENGTHS.flatMap((len) => {
+      const hit = matching(len);
+      const rows: [string, string, string, boolean][] = [
+        [`${label} @ ${len} (no match)`, pattern, `${'a'.repeat(len - 1)}!`, false],
+      ];
+      if (hit !== undefined)
+        rows.push([`${label} @ ${len} (match)`, pattern, hit, len <= MAX_MATCH_INPUT]);
+      return rows;
+    }),
+  );
+
+  it('covers both verdicts on both sides of the clamp', () => {
+    expect(MATCH_ROWS.filter(([, , , expected]) => expected).length).toBeGreaterThan(15);
+    expect(MATCH_ROWS.filter(([label]) => label.includes('(match)')).length).toBeGreaterThan(25);
+    expect(MATCH_ROWS.every(([, , topic]) => topic.length > 0)).toBe(true);
   });
+
+  it.each(MATCH_ROWS)(
+    'bounds match work and answers correctly (%s)',
+    (_label, pattern, topic, expected) => {
+      const allow = new Allowlist(['ctx'], { postPatterns: [pattern] });
+      const started = Date.now();
+      expect(allow.has(topic)).toBe(expected);
+      expect(Date.now() - started).toBeLessThan(100);
+    },
+  );
 
   // The constructor validates the bare source but matches with `^(?:src)$`. An unbalanced source is
   // uncompilable alone yet LEGAL once wrapped, because the anchors re-associate into one branch of an

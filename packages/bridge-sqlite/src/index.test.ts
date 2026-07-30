@@ -13,7 +13,8 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SqlDriver } from './driver.js';
-import { MAX_PAGE, MIN_POLL_INTERVAL_MS, SqlitePlugin } from './index.js';
+import { MAX_PAGE, SqlitePlugin } from './index.js';
+import { MESSAGE_COLUMNS, SQL } from './schema.js';
 
 const T = asTopic('ctx');
 const me = asHandle('alice');
@@ -233,6 +234,33 @@ describe('SqlitePlugin post persists inReplyTo', () => {
       expect(rawReplyTo(p, child)).toBe(parent ?? null);
     });
   }
+
+  /**
+   * The flip side: a column the read paths fetch on every page and every poll tick but that
+   * `rowToMessage` drops is pure cost, and it leaves a reader of this backend unable to tell a
+   * broken feature from an absent one. `in_reply_to` is the live example — written, never read back.
+   */
+  it('every column a read path selects is carried into the Message', async () => {
+    const p = await plugin();
+    const driver = (p as unknown as { driver: SqlDriver }).driver;
+    driver
+      .prepare('INSERT INTO messages (topic, sender, content, ts, in_reply_to) VALUES (?,?,?,?,?)')
+      .run(T, 'sender-7f3a', 'content-91b2', '2024-01-01T00:00:00.000Z', 'parent-c4d5');
+
+    const { messages } = await p.fetchRecent({ topic: T });
+    const carried = JSON.stringify(messages[0]);
+    const row = driver.prepare(SQL.selectRecent).get(T, 1) as Record<string, unknown>;
+    expect(Object.keys(row)).toEqual([...MESSAGE_COLUMNS]);
+    for (const [column, value] of Object.entries(row)) {
+      expect(carried, `${column} is selected but no Message field carries it`).toContain(
+        String(value),
+      );
+    }
+  });
+
+  it('the read paths select exactly the columns a Message carries', () => {
+    expect([...MESSAGE_COLUMNS]).toEqual(['id', 'topic', 'sender', 'content', 'ts']);
+  });
 });
 
 /**
@@ -321,67 +349,3 @@ describe('SqlitePlugin fetchRecent limit', () => {
   });
 });
 
-describe('SqlitePlugin poll-loop diagnostics', () => {
-  it('diagnoses a permanently-failing poll tick and stops the loop after N failures', async () => {
-    const p = await plugin(MIN_POLL_INTERVAL_MS); // fast poll so escalation is quick
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    let lines: string[] = [];
-    try {
-      await p.subscribe(T, () => {});
-      // Induce a PERMANENT (non-transient) failure under the running loop: drop the table so every
-      // subsequent tick's SELECT throws "no such table: messages" identically.
-      (p as unknown as { driver: { exec(sql: string): void } }).driver.exec('DROP TABLE messages');
-      await vi.waitFor(
-        () => {
-          lines = spy.mock.calls.map(([c]) => String(c));
-          // Escalation: the loop stops itself rather than spinning silently forever.
-          expect(lines.some((w) => /poll loop for topic "ctx" stopped/.test(w))).toBe(true);
-        },
-        { timeout: 3000, interval: 10 },
-      );
-    } finally {
-      spy.mockRestore();
-    }
-
-    // Not silent — a diagnostic names the failing topic (pre-fix the catch was empty).
-    expect(lines.some((w) => /poll error on topic "ctx"/.test(w))).toBe(true);
-    // Rate-limited — NOT one line per tick: only the first hard failure logs (the rest are
-    // suppressed until the 60 s window), so at most a couple of "poll error" lines, not dozens.
-    const diag = lines.filter((w) => /poll error on topic "ctx"/.test(w));
-    expect(diag.length).toBeLessThanOrEqual(2);
-
-    // Stopped means stopped: no reschedule → no further ticks → no further stderr writes.
-    const spy2 = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    await new Promise((r) => setTimeout(r, 60));
-    const wroteAfterStop = spy2.mock.calls.length;
-    spy2.mockRestore();
-    expect(wroteAfterStop).toBe(0);
-  });
-
-  it('takes the quiet-retry path for a SQLITE_BUSY/LOCKED tick — no diagnostic, keeps ticking', async () => {
-    const p = await plugin(MIN_POLL_INTERVAL_MS);
-    const busyErr = Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
-    let calls = 0;
-    // Swap in a statement whose .all always throws a lock-classed error, as WAL contention would.
-    (
-      p as unknown as { selectAfterStmt: { all: (...a: unknown[]) => unknown[] } }
-    ).selectAfterStmt = {
-      all: () => {
-        calls++;
-        throw busyErr;
-      },
-    };
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    let wrote: string[] = [];
-    try {
-      await p.subscribe(T, () => {});
-      // A transient lock never escalates, so the loop keeps ticking — `calls` climbs past several.
-      await vi.waitFor(() => expect(calls).toBeGreaterThan(3), { timeout: 2000, interval: 10 });
-      wrote = spy.mock.calls.map(([c]) => String(c));
-    } finally {
-      spy.mockRestore();
-    }
-    // Quiet: a lock-classed error writes NO diagnostic and never stops the loop.
-    expect(wrote.some((w) => /poll error|poll loop/.test(w))).toBe(false);
-  });
-});

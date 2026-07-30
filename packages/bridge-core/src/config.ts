@@ -263,15 +263,23 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
 export type ParleyConfig = z.infer<typeof ConfigSchema>;
 
 /**
+ * A config value is only interpolated into the `parley-<name>` suggestion when it is a bare package
+ * suffix. Keep this narrow, so that a generated or third-party config file cannot put its own text
+ * inside a command the operator is being told to run.
+ */
+const BACKEND_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
+/**
  * Reject a legacy `backend:` key rather than letting zod strip it, so that a config naming one
  * backend can never run a different one silently.
  */
 function assertNoBackendKey(raw: unknown): void {
   if (typeof raw !== 'object' || raw === null || !('backend' in raw)) return;
   const value = (raw as { backend: unknown }).backend;
-  const named = typeof value === 'string' ? value.replace(/^local-/, '') : undefined;
-  const suggestion =
-    named !== undefined ? `parley-${named}` : 'parley-sqlite, parley-matrix, parley-redis, …';
+  const named = typeof value === 'string' ? value.replace(/^local-/, '') : '';
+  const suggestion = BACKEND_NAME.test(named)
+    ? `parley-${named}`
+    : 'parley-sqlite, parley-matrix, parley-redis, …';
   throw new Error(
     'config: `backend` is not a supported field. The backend is selected by which binary you run, ' +
       `not by config — run \`${suggestion}\` (each backend package ships its own bin). ` +

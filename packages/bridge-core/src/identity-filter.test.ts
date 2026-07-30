@@ -86,12 +86,26 @@ describe('filterHandles', () => {
     { handle: asHandle('human-x') },
   ];
 
-  it('returns all when filter is undefined', () => {
-    expect(filterHandles(items)).toHaveLength(3);
-  });
-
   it('applies the glob', () => {
     expect(filterHandles(items, 'claude-*').map((i) => i.handle)).toEqual(['claude-a', 'claude-b']);
+  });
+
+  // An optional string has exactly two legal readings — absent, or a value that narrows. The third
+  // behaviour, silently returning nothing, is the one a caller cannot tell apart from "nobody is
+  // reachable", and `''` is what a client that serialises an unset field sends. The tool schema
+  // accepts it (`.max` with no `.min`), so every spelling of "unset" must land on the same answer.
+  const OMITTED = [
+    ['omitted', undefined],
+    ['empty string', ''],
+  ] as const;
+
+  it.each(OMITTED)('keeps every handle when the filter is %s', (_label, filter) => {
+    expect(filterHandles(items, filter)).toEqual(items);
+  });
+
+  it('still narrows for a filter that names something, so "keep all" is not the only answer', () => {
+    expect(filterHandles(items, 'human-*')).toEqual([{ handle: asHandle('human-x') }]);
+    expect(filterHandles(items, 'nobody-*')).toEqual([]);
   });
 });
 

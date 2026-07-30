@@ -20,13 +20,14 @@ import type { Topic } from './message.js';
  */
 export const MIN_HASH_LEN = 10;
 
-const HASH_HEX_LEN = createHash('sha1').update('').digest('hex').length;
+/** Widest suffix there are digest bytes for; a caller asking for more is refused, not padded. */
+export const MAX_HASH_LEN = createHash('sha1').update('').digest('hex').length;
 
 /**
- * Injective topic → backend-name mapping. `sanitize` is the backend's legal-charset fold
- * (unchanged from today). Whenever that fold is LOSSY for this topic — i.e. the sanitized
- * form differs from the raw topic string (character replacement, lowercasing, or truncation)
- * — we append `<sep><shorthash(raw)>` so two distinct topics can never share one backend name.
+ * Injective topic → backend-name mapping. `sanitize` is the backend's legal-charset fold. Whenever
+ * that fold is LOSSY for this topic — i.e. the sanitized form differs from the raw topic string
+ * (character replacement, lowercasing, or truncation) — we append `<sep><shorthash(raw)>` so two
+ * distinct topics can never share one backend name.
  * Hash is over the RAW topic's UTF-8 bytes, exactly like bridge-postgres channelFor.
  *
  * A naturally-safe topic passes through unchanged so existing rooms/streams keep their readable
@@ -34,8 +35,8 @@ const HASH_HEX_LEN = createHash('sha1').update('').digest('hex').length;
  * caller pick the raw topic `<sanitized><sep><hash>` and land in another topic's channel. Those
  * are disambiguated too, keeping the two branches' outputs disjoint.
  *
- * Throws when `hashLen` is outside {@link MIN_HASH_LEN}…digest width, and when the name it built is
- * not a fixed point of `sanitize` — a truncating fold, or one whose charset excludes `sep` or
+ * Throws when `hashLen` is outside {@link MIN_HASH_LEN}…{@link MAX_HASH_LEN}, and when the name it
+ * built is not a fixed point of `sanitize` — a truncating fold, or one whose charset excludes `sep` or
  * lowercase hex, would otherwise get back a name it rewrites, which is exactly the collision this
  * helper exists to prevent.
  */
@@ -47,9 +48,9 @@ export function safeName(
   const raw = topic as string;
   const hashLen = opts.hashLen ?? MIN_HASH_LEN;
   const sep = opts.sep ?? '-';
-  if (!Number.isInteger(hashLen) || hashLen < MIN_HASH_LEN || hashLen > HASH_HEX_LEN)
+  if (!Number.isInteger(hashLen) || hashLen < MIN_HASH_LEN || hashLen > MAX_HASH_LEN)
     throw new RangeError(
-      `safeName hashLen must be an integer in [${MIN_HASH_LEN}, ${HASH_HEX_LEN}]; got ${hashLen}. ` +
+      `safeName hashLen must be an integer in [${MIN_HASH_LEN}, ${MAX_HASH_LEN}]; got ${hashLen}. ` +
         'A shorter suffix is brute-forceable, and two topics sharing one backend name cross-deliver.',
     );
   const sanitized = sanitize(raw);

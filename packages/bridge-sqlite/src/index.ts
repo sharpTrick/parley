@@ -16,8 +16,11 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { classifyDbError, type DbErrorClass, errMessage } from './classify.js';
 import { openDriver, type SqlDriver, type SqlStatement } from './driver.js';
-import { type MessageRow, SCHEMA, STORE_ID_KEY } from './schema.js';
+import { type MessageRow, SCHEMA, SQL, STORE_ID_KEY } from './schema.js';
+
+export { classifyDbError, type DbErrorClass };
 
 /** Plugin-specific backend_config (DESIGN §11). */
 export interface SqliteBackendConfig {
@@ -93,14 +96,6 @@ export interface SubscriptionHealth {
 }
 
 /**
- * How a DB error affects a background loop. `lock` is the sanctioned silent-retry case (WAL +
- * busy_timeout resolve it). `unavailable` covers everything that can heal on its own — I/O errors,
- * a read-only or full volume, a file that is briefly unopenable while a backup swaps it — so the
- * loop must keep probing. `fatal` is reserved for damage no amount of retrying repairs.
- */
-export type DbErrorClass = 'lock' | 'unavailable' | 'fatal';
-
-/**
  * The SQLite backend (DESIGN §9). Zero-infra, **polling-only** — no socket, no notify bus,
  * no broker. The cursor (`<storeId>.<rowid>`) makes polling fully correct, so the poll interval
  * is a pure latency/cost knob. WAL + busy_timeout (in {@link openDriver}) make concurrent
@@ -136,32 +131,36 @@ export class SqlitePlugin implements BackendPlugin {
     }
     const cfg = validateBackendConfig(config);
     const dbPath = cfg.db_path ?? 'parley.db';
+
+    const driver = openDriver(dbPath, {});
+    let prepared: PreparedStatements;
+    let storeId: string;
+    try {
+      driver.exec(SCHEMA);
+      prepared = prepare(driver);
+      storeId = readOrMintStoreId(driver);
+    } catch (e) {
+      // Keep connect() all-or-nothing: close the handle and leave every field untouched, so that a
+      // failed connect neither leaks a driver per attempt nor leaves an instance that answers
+      // "already connected" to the next connect() and "not connected" to every operation.
+      driver.close();
+      throw e;
+    }
+
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
     this.health.clear();
     this.pruneFailures = 0;
     this.lastPruneDiag = 0;
-
-    const driver = openDriver(dbPath, {});
-    driver.exec(SCHEMA);
     this.driver = driver;
-
-    this.insertStmt = driver.prepare(
-      'INSERT INTO messages (topic, sender, content, ts, in_reply_to) VALUES (?, ?, ?, ?, ?)',
-    );
-    this.selectAfterStmt = driver.prepare(
-      'SELECT id, topic, sender, content, ts, in_reply_to FROM messages WHERE topic = ? AND id > ? ORDER BY id ASC LIMIT ?',
-    );
-    this.selectRecentStmt = driver.prepare(
-      'SELECT id, topic, sender, content, ts, in_reply_to FROM messages WHERE topic = ? ORDER BY id DESC LIMIT ?',
-    );
-    this.maxIdStmt = driver.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM messages WHERE topic = ?');
-    this.pruneStmt = driver.prepare(
-      'DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)',
-    );
-    this.seqStmt = driver.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'messages'");
-    this.storeId = readOrMintStoreId(driver);
+    this.insertStmt = prepared.insert;
+    this.selectAfterStmt = prepared.selectAfter;
+    this.selectRecentStmt = prepared.selectRecent;
+    this.maxIdStmt = prepared.maxId;
+    this.pruneStmt = prepared.prune;
+    this.seqStmt = prepared.seq;
+    this.storeId = storeId;
 
     if (this.retentionDays !== undefined) {
       this.prune();
@@ -397,23 +396,6 @@ export class SqlitePlugin implements BackendPlugin {
 }
 
 /**
- * Classify a DB error for the background loops. Only damage that retrying cannot repair
- * is `fatal`; an unrecognised error is `unavailable`, so a class nobody anticipated backs off and
- * self-heals rather than permanently killing live push.
- */
-export function classifyDbError(e: unknown): DbErrorClass {
-  const code = (e as { code?: string } | null)?.code ?? '';
-  const msg = errMessage(e);
-  if (/BUSY|LOCKED/.test(code) || /database is locked|database table is locked/i.test(msg)) {
-    return 'lock';
-  }
-  if (/CORRUPT|NOTADB/.test(code) || /malformed|file is not a database|no such table/i.test(msg)) {
-    return 'fatal';
-  }
-  return 'unavailable';
-}
-
-/**
  * Degraded poll delay after `failures` consecutive non-lock failures: exponential from the
  * configured interval, capped at {@link BACKOFF_CEILING_MS}. The cap is the README's promise that
  * a topic whose store was briefly unreachable resumes live push within 30 s, not within days.
@@ -421,10 +403,6 @@ export function classifyDbError(e: unknown): DbErrorClass {
 export function backoffMs(pollIntervalMs: number, failures: number): number {
   const doublings = Math.min(failures - ESCALATE_AFTER + 1, 30);
   return Math.min(pollIntervalMs * 2 ** doublings, BACKOFF_CEILING_MS);
-}
-
-function errMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 const CONFIG_KEYS = ['db_path', 'poll_interval_ms', 'retention_days'] as const;
@@ -490,7 +468,7 @@ export function validateBackendConfig(config: BackendConfig): SqliteBackendConfi
  * on an unrepresentable cutoff, so that a bogus window can never become a string that sorts below
  * every ISO timestamp and prunes the entire store.
  */
-function retentionCutoff(retentionDays: number): string {
+export function retentionCutoff(retentionDays: number): string {
   const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
   if (Number.isNaN(cutoff.getTime())) {
     throw bad(
@@ -521,6 +499,14 @@ function parseCursor(raw: string): { storeId?: string; rowid: bigint } | undefin
 
 function mintCursor(storeId: string, rowid: number | bigint): Cursor {
   return asCursor(`${storeId}.${rowid}`);
+}
+
+type PreparedStatements = { [K in keyof typeof SQL]: SqlStatement };
+
+function prepare(driver: SqlDriver): PreparedStatements {
+  return Object.fromEntries(
+    Object.entries(SQL).map(([name, sql]) => [name, driver.prepare(sql)]),
+  ) as PreparedStatements;
 }
 
 /**

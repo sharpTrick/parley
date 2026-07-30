@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
 import { asTopic } from './message.js';
-import { MIN_HASH_LEN, safeName } from './topic-name.js';
+import { MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 
 // Representative copies of each backend's legal-charset fold (byte-for-byte the plugins' own
 // module-private regexes). safeName must make each of them injective; asserting against these
@@ -71,16 +71,17 @@ describe('safeName', () => {
 
 // The suffix IS the injectivity argument, so its width is not a caller preference: at 4 hex chars a
 // second preimage of a chosen name is found in tens of thousands of tries. Refuse anything a caller
-// could weaken it to, at the boundary rather than at one sampled value.
+// could weaken it to. Both ends of the legal range are graded AT the bound in stated-bounds.test.ts;
+// what is graded here is the non-integer and non-finite shapes, and the width of what comes back.
 describe('safeName refuses a suffix too short to disambiguate', () => {
-  it.each([0, 1, 2, 4, 8, MIN_HASH_LEN - 1, -4, 2.5, 41, Number.NaN, Number.POSITIVE_INFINITY])(
+  it.each([0, 1, 2, 4, 8, -4, 2.5, Number.NaN, Number.POSITIVE_INFINITY])(
     'rejects hashLen %s',
     (hashLen) => {
       expect(() => safeName(asTopic('a b'), sanitizeAlias, { hashLen })).toThrow(RangeError);
     },
   );
 
-  it.each([MIN_HASH_LEN, MIN_HASH_LEN + 1, 20, 40])('accepts hashLen %s', (hashLen) => {
+  it.each([MIN_HASH_LEN, MIN_HASH_LEN + 1, 20, MAX_HASH_LEN])('accepts hashLen %s', (hashLen) => {
     const out = safeName(asTopic('a b'), sanitizeAlias, { hashLen });
     expect(out).toMatch(new RegExp(`^a_b-[0-9a-f]{${hashLen}}$`));
   });

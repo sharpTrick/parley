@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { isRedosSafeSource, MAX_MATCH_INPUT } from './regex-safety.js';
+import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
 
 // The screen's only real contract: whatever it accepts must MATCH in bounded time, for every input
 // a caller can reach it with. Enumerating blowup shapes is not enough — the class this guards is
@@ -9,59 +10,28 @@ const PER_MATCH_BUDGET_MS = 50;
 
 const chain = (unit: string, n: number): string => unit.repeat(n);
 
+// Accept/refuse verdicts are graded in regex-screen-parity.test.ts against the shared corpus, at
+// every layer that compiles an unauthored source. What is graded HERE is the match cost of what the
+// screen lets through, so the corpus is that same list plus the same families at INTERMEDIATE
+// repetition counts — the accepted-but-nearly-hostile region, which is where a mis-calibrated
+// budget shows up.
 const CORPUS: string[] = [
-  // Ordinary topic patterns — these MUST stay accepted (an over-strict screen is a bug too).
-  'ctx-.*',
-  'project-[a-z0-9-]+',
-  '(alpha|beta)-.*',
-  'ctx-\\d{1,4}',
-  'exp/[a-z]+',
-  '.*',
-  '(a|b|c|d|e|f|g|h)-[0-9]{2}',
-  // Nested / repeated ambiguous bodies (the classic shapes).
-  '([a-z]+)+',
-  '(a*)*',
-  '(a|a)*',
-  '([a-z]*){15}',
-  '(a?){250}',
-  '(a|aa)+',
-  '(?:a|aa){8}',
-  // Sequential unbounded quantifiers.
+  ...SAFE_PATTERNS.map(([, src]) => src),
+  ...HOSTILE_PATTERNS.map(([, src]) => src),
   ...[2, 3, 4, 5, 6].map((n) => chain('.*', n) + 'x'),
   ...[2, 4].map((n) => chain('[a-z]*', n) + 'x'),
-  '.*?.*?x',
-  // Ambiguous alternation chains — quantifier-free, exponential.
   ...[2, 4, 8, 16, 20, 30].map((n) => chain('(a|aa)', n) + 'b'),
   ...[4, 16, 30].map((n) => chain('(.|..)', n) + 'z'),
   ...[4, 16, 24].map((n) => chain('(a|b|ab)', n) + 'z'),
   ...[4, 16, 24].map((n) => chain('(?:a|aa)', n) + 'b'),
   ...[4, 16].map((n) => chain('([ab]|[ab][ab])', n) + 'z'),
-  // Optional-atom chains — also quantifier-free and exponential.
   ...[4, 12, 20, 24].map((n) => chain('a?', n) + chain('a', n) + 'b'),
   ...[4, 12, 20].map((n) => chain('[ab]?', n) + chain('a', n) + 'z'),
-  // Bounded repeats that unroll into ambiguity.
   ...[2, 4, 8, 16].map((n) => chain('[ab]{1,3}', n) + 'z'),
   ...[2, 6, 12].map((n) => chain('a{0,2}', n) + chain('a', n) + 'z'),
-  // Escapes and classes the parser must treat as literal.
-  '\\(a\\|aa\\)\\(a\\|aa\\)',
-  '[*+?{}()|]+',
-  '[\\]]*x',
 ];
 
-const HOSTILE: [label: string, src: string][] = [
-  ['nested quantifier', '([a-z]+)+'],
-  ['alternation under a quantifier', '(a|a)*'],
-  ['bounded repeat over a risky body', '([a-z]*){15}'],
-  ['optional group repeated many times', '(a?){250}'],
-  ['too many unbounded quantifiers', '.*.*.*.*.*'],
-  ['ambiguous alternation chain', `${chain('(a|aa)', 30)}b`],
-  ['ambiguous alternation chain (dot)', `${chain('(.|..)', 30)}z`],
-  ['ambiguous alternation chain (non-capturing)', `${chain('(?:a|aa)', 24)}b`],
-  ['three-branch alternation chain', `${chain('(a|b|ab)', 24)}z`],
-  ['optional-atom chain', `${chain('a?', 24)}${chain('a', 24)}b`],
-  ['optional-class chain', `${chain('[ab]?', 20)}${chain('a', 20)}z`],
-  ['bounded-repeat chain', `${chain('[ab]{1,3}', 16)}z`],
-];
+const HOSTILE = HOSTILE_PATTERNS.map(([label, src]) => [label, src] as [string, string]);
 
 // The screen hand-rolls the regex grammar, so anything it mis-parses hides the rest of the source
 // from it. Character classes are the trap: under PCRE a leading `]` joins the class, under V8 it
@@ -98,6 +68,53 @@ function compiles(src: string): boolean {
   }
 }
 
+/** Every character that can change how the hand-rolled scan parses what follows it. */
+const META = [
+  'a', '.', '*', '+', '?', '|', '(', ')', '[', ']', '{', '}', ',', '1', '2', '\\', '^', '$', 'b',
+  ':', '=', '!',
+];
+
+/** Every source of length 1…maxLen over {@link META}. */
+function enumerateSources(maxLen: number): string[] {
+  let level = [''];
+  const out: string[] = [];
+  for (let len = 0; len < maxLen; len++) {
+    level = level.flatMap((prefix) => META.map((c) => prefix + c));
+    out.push(...level);
+  }
+  return out;
+}
+
+/**
+ * Every kind of atom crossed with every quantifier spelling — including the ones a random sample of
+ * a 22-character alphabet will never land on, such as a reversed `{3,2}` or a doubled `**`, and the
+ * ones with no atom in front of them at all.
+ */
+function quantifierShapes(): string[] {
+  const atoms = ['', 'a', '.', '\\d', '\\b', '[ab]', '(a)', '(?:a)', '(?=a)', '^', '$'];
+  const quantifiers = [
+    '', '*', '+', '?', '**', '*?', '*+', '??', '+?', '+*', '{2}', '{2,}', '{2,3}', '{3,2}', '{2,1}',
+    '{0,0}', '{1}', '{,2}', '{2,}?', '{}', '{a}', '{2}{3}', '{2}*',
+  ];
+  return atoms.flatMap((atom) =>
+    quantifiers.flatMap((q) => [atom + q, `${atom}${q}x`, `x${atom}${q}`]),
+  );
+}
+
+/** Longer sources, sampled deterministically so a failure is reproducible without a fixture file. */
+function sampleSources(count: number, minLen: number, maxLen: number): string[] {
+  let seed = 0x2f6e2b1;
+  const next = (): number => (seed = (seed * 1103515245 + 12345) % 2147483648);
+  const out: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const len = minLen + (next() % (maxLen - minLen + 1));
+    let src = '';
+    for (let j = 0; j < len; j++) src += META[next() % META.length]!;
+    out.push(src);
+  }
+  return out;
+}
+
 /** Inputs drawn from the pattern's own literal alphabet, at every length up to the caller clamp. */
 function inputsFor(src: string): string[] {
   const literals = new Set(src.match(/[A-Za-z0-9]/g) ?? []);
@@ -131,23 +148,6 @@ describe('isRedosSafeSource', () => {
     60_000,
   );
 
-  it.each([
-    ['ctx-.*'],
-    ['project-[a-z0-9-]+'],
-    ['(alpha|beta)-.*'],
-    ['ctx-\\d{1,4}'],
-    ['exp/[a-z]+'],
-    ['(a|b|c|d|e|f|g|h)-[0-9]{2}'],
-    ['(?:ops|dev|qa)-[a-z]+'],
-    ['\\(a\\|aa\\)\\(a\\|aa\\)'],
-  ])('accepts an ordinary topic pattern (%s)', (src) => {
-    expect(isRedosSafeSource(src)).toBe(true);
-  });
-
-  it.each(HOSTILE)('rejects a source that can blow up (%s)', (_label, src) => {
-    expect(isRedosSafeSource(src)).toBe(false);
-  });
-
   it('rejects every blowup shape hidden behind a character class', () => {
     const leaked = CLASS_PREFIXES.flatMap((prefix) =>
       HOSTILE.flatMap(([label, src]) =>
@@ -163,9 +163,25 @@ describe('isRedosSafeSource', () => {
     expect(leaked).toEqual([]);
   });
 
+  // The screen's doc promises everything it accepts also compiles on its own, and that promise is
+  // the argument a future reader would use to delete allowlist.ts's assertCompilesAlone. A
+  // hand-picked candidate list cannot reach the shapes that break it — a quantifier with nothing to
+  // repeat (`*a`, `a**`, `^?`) or a reversed `{n,m}` — so enumerate the metacharacter alphabet.
   it('never accepts a source that does not compile on its own', () => {
-    const candidates = [...CORPUS, ...TRUNCATIONS, ...CLASS_PREFIXES.map((p) => p + '.*')];
-    const accepted = candidates.filter((src) => isRedosSafeSource(src));
-    expect(accepted.filter((src) => !compiles(src))).toEqual([]);
+    const candidates = [
+      ...CORPUS,
+      ...TRUNCATIONS,
+      ...CLASS_PREFIXES.map((p) => p + '.*'),
+      ...enumerateSources(3),
+      ...quantifierShapes(),
+      ...sampleSources(30_000, 4, 8),
+    ];
+    const uncompilable = candidates.filter((src) => !compiles(src));
+    // Floors, so that a shrunken or mis-seeded generator cannot pass by enumerating only sources
+    // that trivially compile: the interesting region is the one V8 refuses.
+    expect(candidates.length).toBeGreaterThan(40_000);
+    expect(uncompilable.length).toBeGreaterThan(2_000);
+    const leaked = [...new Set(candidates.filter((src) => isRedosSafeSource(src) && !compiles(src)))];
+    expect(leaked.slice(0, 20), `${leaked.length} accepted source(s) do not compile`).toEqual([]);
   });
 });

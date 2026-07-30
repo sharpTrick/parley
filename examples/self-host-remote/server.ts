@@ -84,6 +84,30 @@ function parseTrustProxy(raw: string): number | string {
   return Number.isInteger(hops) && hops >= 0 ? hops : raw;
 }
 
+/**
+ * The builtin-only options, read from the environment, and dropped entirely in any other mode.
+ *
+ * Keep the mode check here, so that an env var left over from a previous deployment cannot fail the
+ * boot: the front door REFUSES a builtin-only option rather than discarding it, so passing
+ * `trustProxy` under `auth.mode: oidc` is a startup error rather than a no-op.
+ */
+export function builtinOnlyOptions(
+  mode: string,
+  env: NodeJS.ProcessEnv,
+): Pick<StartRemoteOptions, 'trustProxy' | 'ownerSecretHash' | 'ownerPassphrase'> {
+  if (mode !== 'builtin') return {};
+  return {
+    ...(env.PARLEY_TRUST_PROXY !== undefined
+      ? { trustProxy: parseTrustProxy(env.PARLEY_TRUST_PROXY) }
+      : {}),
+    ...(env.PARLEY_OWNER_SECRET_HASH !== undefined
+      ? { ownerSecretHash: env.PARLEY_OWNER_SECRET_HASH }
+      : env.PARLEY_OWNER_PASSPHRASE !== undefined
+        ? { ownerPassphrase: env.PARLEY_OWNER_PASSPHRASE }
+        : {}),
+  };
+}
+
 // CLI entrypoint: `node server.ts` (after `npm run build`). Reads secrets from the LOCAL env.
 async function main(): Promise<void> {
   // PARLEY_PUBLIC_URL is the preferred name; PARLEY_ISSUER_URL is kept as a compatible alias
@@ -103,14 +127,7 @@ async function main(): Promise<void> {
     issuerUrl,
     port,
     host: process.env.HOST ?? '127.0.0.1',
-    ...(process.env.PARLEY_TRUST_PROXY !== undefined
-      ? { trustProxy: parseTrustProxy(process.env.PARLEY_TRUST_PROXY) }
-      : {}),
-    ...(process.env.PARLEY_OWNER_SECRET_HASH !== undefined
-      ? { ownerSecretHash: process.env.PARLEY_OWNER_SECRET_HASH }
-      : process.env.PARLEY_OWNER_PASSPHRASE !== undefined
-        ? { ownerPassphrase: process.env.PARLEY_OWNER_PASSPHRASE }
-        : {}),
+    ...builtinOnlyOptions(cfg.auth.mode, process.env),
   });
 
   const authNote =

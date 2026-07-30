@@ -52,8 +52,12 @@ export function matchGlob(pattern: string, value: string): boolean {
   return globMatch(pattern, value);
 }
 
-/** Keep the handles matching `filter`; when `filter` is undefined, keep them all. */
+/**
+ * Keep the handles matching `filter`; an absent filter keeps them all. A client that serialises an
+ * unset filter as `''` means "no filter", so treat it as absent, so that the one answer a caller
+ * cannot tell apart from a real outage — an empty roster — is never how an omitted filter reads.
+ */
 export function filterHandles<T extends { handle: Handle }>(items: T[], filter?: string): T[] {
-  if (filter === undefined) return items;
+  if (filter === undefined || filter === '') return items;
   return items.filter((i) => globMatch(filter, i.handle));
 }

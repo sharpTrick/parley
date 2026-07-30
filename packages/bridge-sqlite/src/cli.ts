@@ -2,6 +2,7 @@
 import { createStdioBridge, loadConfig, type ParleyConfig } from '@sharptrick/parley-core';
 import { parseArgs, USAGE } from './args.js';
 import { SqlitePlugin } from './index.js';
+import { installShutdown } from './shutdown.js';
 
 // IMPORTANT: this is an MCP stdio server — stdout is the JSON-RPC channel. All diagnostics go
 // to stderr; never write to stdout here.
@@ -24,18 +25,9 @@ async function main(): Promise<void> {
       `live_push=${String(cfg.live_push.enabled)}\n`,
   );
 
-  let shuttingDown = false;
-  const shutdown = (): void => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  installShutdown(process, () => {
     void bridge.shutdown().finally(() => process.exit(0));
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-  // An orphaned bridge (parent crashed or SIGKILLed) gets stdin EOF and no signal, so keep these,
-  // so that it stops rather than heart-beating a ghost peer into every peer's roster.
-  process.stdin.on('end', shutdown);
-  process.stdin.on('close', shutdown);
+  });
 }
 
 main().catch((err: unknown) => {

@@ -1,5 +1,6 @@
 import { chmodSync, closeSync, openSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { classifyDbError, errMessage } from './classify.js';
 
 // Lazy CJS require so the native module (better-sqlite3) or the built-in (node:sqlite)
 // is only loaded on demand — and the experimental warning for node:sqlite only appears
@@ -98,47 +99,72 @@ function loadBetterSqlite(): (new (p: string) => RawDb) | null {
  * code above is driver-agnostic.
  */
 export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
-  const busy = opts.busyTimeoutMs ?? 5000;
   const onDisk = path !== ':memory:' && !path.startsWith('file::memory:');
   // Keep this ahead of the driver open, so that there is no window in which the driver creates
   // the whole conversation store at the umask default and it is briefly world-readable.
   if (onDisk) precreate(path);
+  const driver = openConnection(path);
+  try {
+    applyPragmas(driver, opts.busyTimeoutMs ?? 5000);
+  } catch (e) {
+    // Keep the close on the failure path, so that a caller retrying a permanently-failing open —
+    // a supervisor restarting a bridge against a typo'd path — cannot leak a handle per attempt.
+    driver.close();
+    throw e;
+  }
+  // An existing store (or a -wal/-shm sidecar SQLite created at the umask default) can still be
+  // group/world-readable, and neither driver exposes a mode option. Narrow anything wider, and
+  // say so — including when it cannot be done, which is what a second bridge running as a
+  // different UID hits.
+  if (onDisk) {
+    for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
+  }
+  return driver;
+}
+
+function openConnection(path: string): SqlDriver {
   const Better = loadBetterSqlite();
-  let driver: SqlDriver;
   if (Better !== null) {
     // Construct OUTSIDE any try/catch: a bad path / permissions / corrupt file throws its OWN
     // actionable message rather than being swallowed and replaced by node:sqlite's vaguer one.
-    driver = wrap('better-sqlite3', new Better(path));
-  } else {
-    try {
-      const mod = require('node:sqlite') as { DatabaseSync: new (p: string) => RawDb };
-      driver = wrap('node:sqlite', new mod.DatabaseSync(path));
-    } catch (e) {
-      // The native module was absent AND the builtin fallback also failed → surface the fallback
-      // failure WITH the original error attached as `cause`, not in place of it.
-      process.stderr.write(
-        'parley-sqlite: better-sqlite3 unavailable; node:sqlite fallback failed\n',
-      );
-      throw new Error(`node:sqlite fallback failed opening ${path}`, { cause: e });
-    }
+    return wrap('better-sqlite3', new Better(path));
   }
+  try {
+    const mod = require('node:sqlite') as { DatabaseSync: new (p: string) => RawDb };
+    return wrap('node:sqlite', new mod.DatabaseSync(path));
+  } catch (e) {
+    // The native module was absent AND the builtin fallback also failed → surface the fallback
+    // failure WITH the original error attached as `cause`, not in place of it.
+    process.stderr.write('parley-sqlite: better-sqlite3 unavailable; node:sqlite fallback failed\n');
+    throw new Error(`node:sqlite fallback failed opening ${path}`, { cause: e });
+  }
+}
+
+/** How many times a lock-classed WAL conversion is retried before the driver degrades. */
+export const WAL_RETRIES = 20;
+
+function applyPragmas(driver: SqlDriver, busyTimeoutMs: number): void {
   // Keep busy_timeout first AND the WAL conversion bounded-retried, so that a fresh-file
   // delete→WAL conversion racing another opener cannot crash connect(): SQLite does NOT consult
   // the busy handler for a journal-mode change, so it returns SQLITE_BUSY immediately even with
   // a timeout set.
-  driver.exec(`PRAGMA busy_timeout = ${busy}`);
+  driver.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   for (let i = 0; ; i++) {
     try {
       // WAL: readers don't block the single writer; multiple processes can post concurrently.
       driver.exec('PRAGMA journal_mode = WAL');
       break;
     } catch (e) {
-      if (i >= 20) {
+      // Only contention is worth waiting out. Keep everything else propagating on the first
+      // attempt, so that a file that is not a database, a read-only mount or a full volume shows
+      // its own error instead of ~300 ms of blocking spin and a line blaming a peer's write lock.
+      if (classifyDbError(e) !== 'lock') throw e;
+      if (i >= WAL_RETRIES) {
         // WAL is persistent; the conversion race only exists until the file is first converted.
         // Degrade rather than crash connect(): the default journal mode is still correct.
         process.stderr.write(
           `parley-sqlite: WAL conversion still busy after ${i} retries; ` +
-            `continuing in default journal mode: ${e instanceof Error ? e.message : String(e)}\n`,
+            `continuing in default journal mode: ${errMessage(e)}\n`,
         );
         break;
       }
@@ -148,14 +174,6 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
     }
   }
   driver.exec('PRAGMA synchronous = NORMAL');
-  // An existing store (or a -wal/-shm sidecar SQLite created at the umask default) can still be
-  // group/world-readable, and neither driver exposes a mode option. Narrow anything wider, and
-  // say so — including when it cannot be done, which is what a second bridge running as a
-  // different UID hits.
-  if (onDisk) {
-    for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
-  }
-  return driver;
 }
 
 /**

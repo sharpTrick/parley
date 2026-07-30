@@ -37,6 +37,7 @@
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck": "tsc -b tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },
