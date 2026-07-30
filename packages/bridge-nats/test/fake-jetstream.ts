@@ -61,7 +61,22 @@ export interface FakeState {
   expiryMs: number;
   /** Config of the last `streams.add`, for retention/naming assertions. */
   added?: { name?: string; max_age?: number; subjects?: string[] };
-  /** Subjects `streams.info` reports for the stream — a stream another config's prefixes created. */
+  /** How many times `streams.add` was called — a read path that provisions is a non-zero here. */
+  addCalls: number;
+  /**
+   * The topic has no stream yet: `streams.info` 404s until something calls `streams.add`. The
+   * pre-state a read must answer without creating one, and the one a healthy localhost server
+   * never shows a test that posts first.
+   */
+  streamAbsent: boolean;
+  /** What `streams.find` names for the topic's subject; absent = no stream matches it. */
+  rivalStream?: string;
+  /**
+   * Subjects `streams.info` reports for the stream. Defaults to `[subject]` — a real stream always
+   * carries a subject list, and a fake that reports none certifies a read path that never checks
+   * whether the stream it found is even the topic's. Set it to model a stream another config's
+   * prefixes created.
+   */
   subjects?: string[];
   /** How `streams.add` fails: the name is taken, or another stream already captures the subject. */
   addFails?: 'name-in-use' | 'subject-overlap';
@@ -136,6 +151,8 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     latencyMs: 0,
     expiryMs: 0,
     failOn: null,
+    addCalls: 0,
+    streamAbsent: false,
     throwOnClose: false,
     silentExits: 0,
     swallowed: [],
@@ -183,15 +200,24 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     streams: {
       add: async (cfg: { name?: string; max_age?: number; subjects?: string[] }) => {
         await hop();
+        state.addCalls += 1;
         if (state.addFails === 'name-in-use') throw new Error('stream name already in use');
         if (state.addFails === 'subject-overlap') {
           throw new Error('subjects overlap with an existing stream');
         }
         state.added = cfg;
+        state.streamAbsent = false;
         return { config: { name: cfg.name ?? 'fake', subjects: cfg.subjects }, created: state.streamCreated };
+      },
+      find: async (subject: string) => {
+        await hop();
+        if (state.rivalStream === undefined) throw new Error('no stream matches subject');
+        void subject;
+        return state.rivalStream;
       },
       info: async () => {
         await hop();
+        if (state.streamAbsent) throw new Error('stream not found');
         if (state.infoFailures > 0) {
           state.infoFailures -= 1;
           throw new Error('injected: streams.info failed');
@@ -205,7 +231,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         const last = state.visibleTail ?? state.records.at(-1)?.seq ?? 0;
         return {
           created: state.streamCreated,
-          config: { subjects: state.subjects },
+          config: { subjects: state.subjects ?? [state.subject] },
           state: {
             messages: state.records.length,
             first_seq: first,

@@ -26,6 +26,14 @@ expiry. A page with no `since` — core's cold start — walks backwards from th
 growing windows and stops as soon as it holds `limit` messages, so a deep hole above the topic's own
 history costs work proportional to the hole rather than to the history under it.
 
+Only a **write** provisions a topic's stream: `post` and `subscribe` create it, and `fetchRecent`
+never does. A read of a topic nobody has posted to returns an empty page with the bare cursor `0`,
+which sits below every sequence, so the catch-up that follows the peer's first `post` starts at that
+stream's first message. A stream has no client-absence timeout to reclaim it and `retention_days` is
+off by default, so one created by a read would be permanent — and topic names reach this plugin from
+`post_topics`, which is a regex over names an untrusted inbound message can choose. A blocking read
+of a topic with no stream waits for one to appear rather than making it.
+
 `backendMsgId` is the sequence prefixed with the stream's incarnation, because a stream deleted and
 re-created out-of-band (`nats stream rm`, a storage reset) restarts its sequences at 1 — the bare
 sequence would hand core a dedup key it already holds, and core would drop the new stream's
@@ -113,8 +121,8 @@ built-in retention (this plugin just supplies the value), so no separate pruning
 It's off by default — `max_age` is unset and JetStream keeps every message forever unless you opt
 in. It must be a positive number of days: `0` is rejected at `connect()` rather than passed
 through, because JetStream reads `max_age: 0` as *unlimited* — the opposite of what it reads as.
-Omit the field for that, don't write `0`. **It only applies when this plugin is the one that creates the stream** (the first `post`,
-`fetchRecent`, or `subscribe` on a fresh topic) — changing `retention_days` later does not
+Omit the field for that, don't write `0`. **It only applies when this plugin is the one that creates the stream** (the first `post`
+or `subscribe` on a fresh topic — a `fetchRecent` never creates one) — changing `retention_days` later does not
 retroactively update an already-existing stream; use `nats stream edit` (or recreate it) for that.
 As with the other backends, catch-up after the retention window just returns less history, with no
 error signaling that anything expired.

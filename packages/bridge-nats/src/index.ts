@@ -24,6 +24,7 @@ import {
   DeliverPolicy,
   nkeyAuthenticator,
   type ConnectionOptions,
+  type ConsumerConfig,
   type ConsumerMessages,
   type JetStreamClient,
   type JetStreamManager,
@@ -93,7 +94,47 @@ interface Closeable {
   close: () => unknown;
 }
 
+/**
+ * One ephemeral consumer, deleted exactly once by whichever racer reaches it first: the call that
+ * created it, or a `disconnect()` that landed inside its creation round trip. Keep {@link reap}
+ * waiting on the in-flight `consumers.add`, so that a teardown arriving before the server has named
+ * the consumer still deletes it — a name that arrives after teardown has dropped the link has
+ * nothing left to delete it, and the orphan lingers for `inactive_threshold`.
+ */
+class EphemeralConsumer {
+  name?: string;
+  private adding: Promise<unknown> = Promise.resolve();
+  private reaped = false;
+
+  constructor(
+    private readonly jsm: JetStreamManager,
+    private readonly stream: string,
+  ) {}
+
+  /**
+   * Keep the request and the record of it in ONE synchronous step: a teardown can only interleave at
+   * an await, so nothing can observe a consumer being created with no reaper watching for its name.
+   */
+  add(config: Partial<ConsumerConfig>): Promise<string> {
+    const added = this.jsm.consumers.add(this.stream, config).then((ci) => {
+      this.name = ci.name;
+      return ci.name;
+    });
+    this.adding = added.catch(() => undefined);
+    return added;
+  }
+
+  async reap(): Promise<void> {
+    await Promise.race([this.adding, delay(DRAIN_TIMEOUT_MS)]);
+    if (this.reaped || this.name === undefined) return;
+    this.reaped = true;
+    await this.jsm.consumers.delete(this.stream, this.name).catch(() => undefined);
+  }
+}
+
 const NS_PER_DAY = 86_400_000_000_000;
+const MAX_STREAM_NAME_BYTES = 255; // JetStream's own cap on a stream name
+const ABSENT_STREAM_POLL_MS = 250; // how often a blocking read re-asks whether the stream exists yet
 const CONTROL_CHARS = new RegExp('[\\u0000-\\u001f\\u007f]');
 const UNKNOWN_INCARNATION = '0';
 
@@ -118,6 +159,7 @@ export class NatsPlugin implements BackendPlugin {
   private subjectPrefix = 'parley.';
   private streamPrefix = 'PARLEY_';
   private retentionDays?: number;
+  private connecting = false;
   private stopped = false;
   private epoch = 0;
   private readonly ensured = new Map<string, Promise<void>>();
@@ -125,17 +167,47 @@ export class NatsPlugin implements BackendPlugin {
   private readonly subscriptions: Closeable[] = [];
 
   async connect(config: BackendConfig): Promise<void> {
+    if (this.nc !== undefined || this.connecting) {
+      throw new Error(
+        'parley-nats: already connected (or a connect() is still in flight) — call disconnect() ' +
+          'first. A second connect() would strand the previous connection, whose unbounded ' +
+          'reconnect loop keeps its socket alive with no way for the caller to reclaim it',
+      );
+    }
     const cfg = config as NatsBackendConfig;
-    this.subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/);
-    this.streamPrefix = validatePrefix('stream_prefix', cfg.stream_prefix, 'PARLEY_', /[.*>/\\\s]/);
-    this.retentionDays = validateRetentionDays(cfg.retention_days);
+    const subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/);
+    const streamPrefix = validatePrefix(
+      'stream_prefix',
+      cfg.stream_prefix,
+      'PARLEY_',
+      /[.*>/\\\s]/,
+      MAX_STREAM_NAME_BYTES,
+    );
+    const retentionDays = validateRetentionDays(cfg.retention_days);
+    this.connecting = true;
+    let nc: NatsConnection;
+    let jsm: JetStreamManager;
+    try {
+      nc = await connect(connectionOptions(cfg));
+      try {
+        jsm = await nc.jetstreamManager();
+      } catch (err) {
+        await nc.close().catch(() => undefined);
+        throw err;
+      }
+    } finally {
+      this.connecting = false;
+    }
+    this.subjectPrefix = subjectPrefix;
+    this.streamPrefix = streamPrefix;
+    this.retentionDays = retentionDays;
     this.stopped = false;
     this.epoch += 1;
     this.ensured.clear();
     this.incarnations.clear();
-    this.nc = await connect(connectionOptions(cfg));
-    this.js = this.nc.jetstream();
-    this.jsm = await this.nc.jetstreamManager();
+    this.nc = nc;
+    this.js = nc.jetstream();
+    this.jsm = jsm;
   }
 
   async disconnect(): Promise<void> {
@@ -228,22 +300,84 @@ export class NatsPlugin implements BackendPlugin {
   // Promise-returning seam method escapes every caller that only wrote `.catch()`.
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const since = parseCursor(args.since);
-    // Keep the deadline out here: `withStream` runs its operation a second time when the stream
-    // vanished mid-read, and a deadline minted inside that closure hands the retry a fresh budget —
-    // twice the `block_ms` the caller was promised.
+    // Keep the deadline out here: the wait for an absent stream and the read itself are two stages
+    // of ONE budget, and a deadline minted inside either hands the other a fresh one.
     const deadline = Date.now() + (args.blockMs ?? 0);
-    return this.withStream(args.topic, () => this.readRecent(args, since, deadline));
+    const info = await this.streamForRead(args, deadline);
+    if (info === undefined) return absentTopicPage(args);
+    try {
+      return await this.readRecent(args, since, deadline, info);
+    } catch (err) {
+      // A stream that vanished mid-read is the absent topic again, and a read must not put it back:
+      // re-provisioning here is what let a caller-named topic spend the cluster's stream budget.
+      if (!isStreamMissing(err)) throw err;
+      return absentTopicPage(args);
+    }
+  }
+
+  /**
+   * The topic's stream if the server already has one, else `undefined` — a read NEVER creates one.
+   * Keep every read path here rather than on {@link ensureStream}, so that a topic named by an
+   * untrusted inbound message cannot spend the cluster's stream and storage budget with calls that
+   * write nothing. `post` and `subscribe` still provision: both are gated by the topic allowlist.
+   * A blocking read polls instead of creating, so a long-poll issued before the peer's first `post`
+   * still waits for the stream that post will make.
+   */
+  private async streamForRead(
+    args: FetchRecentArgs,
+    deadline: number,
+  ): Promise<StreamInfo | undefined> {
+    const blocking = (args.blockMs ?? 0) > 0 && args.since !== undefined;
+    for (;;) {
+      const info = await this.existingStream(args.topic);
+      if (info !== undefined) return info;
+      const remaining = deadline - Date.now();
+      if (!blocking || remaining <= 0 || this.stopped) return undefined;
+      await delay(Math.min(remaining, ABSENT_STREAM_POLL_MS));
+    }
+  }
+
+  private async existingStream(topic: Topic): Promise<StreamInfo | undefined> {
+    const name = this.streamName(topic);
+    const subject = this.subject(topic);
+    let info: StreamInfo;
+    try {
+      info = await this.requireJsm().streams.info(name);
+    } catch (err) {
+      if (!isStreamMissing(err)) throw err;
+      await this.refuseRivalStream(name, subject);
+      return undefined;
+    }
+    assertCaptures(name, subject, info.config.subjects ?? []);
+    this.noteIncarnation(name, info);
+    return info;
+  }
+
+  /**
+   * No stream under THIS config's name — but a stream under another name may already carry the
+   * topic's subject, which is a bridge pointed at the wrong stream rather than an empty topic.
+   * Keep the check, so that a diverging `stream_prefix` reports the field the operator can change
+   * on the read path too; `post` learns the same thing from the overlap its `streams.add` is
+   * refused with, and a read must not create a stream to find out.
+   */
+  private async refuseRivalStream(name: string, subject: string): Promise<void> {
+    const rival = await this.requireJsm()
+      .streams.find(subject)
+      .catch(() => undefined);
+    if (rival === undefined || rival === name) return;
+    throw new Error(
+      `nats stream ${name} does not exist, but ${rival} already captures ${JSON.stringify(subject)} — stream_prefix differs from the instance that created it`,
+    );
   }
 
   private async readRecent(
     args: FetchRecentArgs,
     since: ParsedCursor | undefined,
     deadline: number,
+    info: StreamInfo,
   ): Promise<FetchRecentResult> {
     const stream = this.streamName(args.topic);
     const limit = args.limit ?? 100;
-    const info = await this.requireJsm().streams.info(stream);
-    this.noteIncarnation(stream, info);
     const lastSeq = info.state.last_seq;
     const firstSeq = info.state.first_seq;
     // A cursor minted by a DIFFERENT incarnation names a sequence of a stream that no longer
@@ -324,23 +458,33 @@ export class NatsPlugin implements BackendPlugin {
     tailSeq: number,
     keep = want,
   ): Promise<Message[]> {
+    // Keep the handle captured at entry: `disconnect()` clears `this.jsm` as soon as its closers
+    // return, and reading it later instead skips the delete and leaks the consumer.
     const jsm = this.requireJsm();
-    const setupStarted = Date.now();
-    const ci = await jsm.consumers.add(stream, {
-      filter_subject: this.subject(topic),
-      deliver_policy: DeliverPolicy.StartSequence,
-      opt_start_seq: startSeq,
-      ack_policy: AckPolicy.None,
-      inactive_threshold: INACTIVE_NS,
-    });
-    // Keep every step after `consumers.add` inside the try, so that a throw still reaches the
+    const ephemeral = new EphemeralConsumer(jsm, stream);
+    // Keep every step from `consumers.add` on inside the try, so that a throw still reaches the
     // finally's delete — an ephemeral consumer nobody deletes lingers for `inactive_threshold`.
     const messages: Message[] = [];
     let batch: ConsumerMessages | undefined;
     let idle: ReturnType<typeof setTimeout> | undefined;
     let wentQuiet = false;
+    const closer: Closeable = {
+      close: async () => {
+        void batch?.close();
+        await ephemeral.reap();
+      },
+    };
+    this.subscriptions.push(closer);
     try {
-      const consumer = await this.requireJs().consumers.get(stream, ci.name);
+      const setupStarted = Date.now();
+      const name = await ephemeral.add({
+        filter_subject: this.subject(topic),
+        deliver_policy: DeliverPolicy.StartSequence,
+        opt_start_seq: startSeq,
+        ack_policy: AckPolicy.None,
+        inactive_threshold: INACTIVE_NS,
+      });
+      const consumer = await this.requireJs().consumers.get(stream, name);
       const patience = pullPatience(Date.now() - setupStarted);
       batch = await consumer.fetch({ max_messages: want, expires: patience.expires });
       // Keep the idle close: `want` is an upper bound over a range that may be sparse — a deleted or
@@ -371,12 +515,16 @@ export class NatsPlugin implements BackendPlugin {
       }
     } finally {
       clearTimeout(idle);
+      this.unregister(closer);
       void batch?.close();
-      // Keep the handle captured at entry: `disconnect()` clears `this.jsm` as soon as its closers
-      // return, and reading it here instead skips the delete and leaks the consumer.
-      await jsm.consumers.delete(stream, ci.name).catch(() => undefined);
+      await ephemeral.reap();
     }
     return messages;
+  }
+
+  private unregister(closer: Closeable): void {
+    const i = this.subscriptions.indexOf(closer);
+    if (i >= 0) this.subscriptions.splice(i, 1);
   }
 
   /**
@@ -413,41 +561,45 @@ export class NatsPlugin implements BackendPlugin {
     if (remaining <= 0 || this.stopped) return { messages: [], nextCursor: fallback };
 
     const jsm = this.requireJsm();
-    const ci = await jsm.consumers.add(stream, {
-      filter_subject: this.subject(topic),
-      deliver_policy: DeliverPolicy.StartSequence,
-      opt_start_seq: startSeq,
-      ack_policy: AckPolicy.None,
-      inactive_threshold: INACTIVE_NS,
-    });
-    // Keep every step after `consumers.add` inside the try, so that a throw still reaches the
+    const ephemeral = new EphemeralConsumer(jsm, stream);
+    // Keep every step from `consumers.add` on inside the try, so that a throw still reaches the
     // finally's delete — an ephemeral consumer nobody deletes lingers for `inactive_threshold`.
     const messages: Message[] = [];
     let batch: ConsumerMessages | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let expired = false;
+    let polling = false;
     let cleanedUp = (): void => undefined;
     const cleanup = new Promise<void>((resolve) => {
       cleanedUp = () => resolve();
     });
-    let closer: Closeable | undefined;
+    // Keep the closer registered BEFORE the consumer is asked for and waiting on this read's own
+    // cleanup: `disconnect()` drops its handles the moment its closers return, so one registered
+    // late leaves a consumer created inside the teardown window, and one that returns on
+    // `batch.close()` alone leaves the consumer this read is still about to delete.
+    const closer: Closeable = {
+      close: async () => {
+        void batch?.close();
+        if (polling) await Promise.race([cleanup, delay(DRAIN_TIMEOUT_MS)]);
+        await ephemeral.reap();
+      },
+    };
+    this.subscriptions.push(closer);
     try {
-      const consumer = await this.requireJs().consumers.get(stream, ci.name);
+      const name = await ephemeral.add({
+        filter_subject: this.subject(topic),
+        deliver_policy: DeliverPolicy.StartSequence,
+        opt_start_seq: startSeq,
+        ack_policy: AckPolicy.None,
+        inactive_threshold: INACTIVE_NS,
+      });
+      const consumer = await this.requireJs().consumers.get(stream, name);
       // Keep the 1000ms floor: nats.js rejects a shorter `expires`, and the timer below — not
       // `expires` — is what honours a sub-second `blockMs`.
       batch = await consumer.fetch({ max_messages: limit, expires: Math.max(remaining, 1000) });
+      polling = true;
 
       const live = batch;
-      // Keep the closer waiting on this read's own cleanup: `disconnect()` drops its handles the
-      // moment its closers return, so a closer that returns on `live.close()` alone leaves the
-      // ephemeral consumer undeleted on the server.
-      closer = {
-        close: async () => {
-          void live.close();
-          await Promise.race([cleanup, delay(DRAIN_TIMEOUT_MS)]);
-        },
-      };
-      this.subscriptions.push(closer);
       // Keep the timer armed off the LIVE clock, so that setup round-trips cannot push the return
       // past the caller's `blockMs`.
       timer = setTimeout(() => {
@@ -469,12 +621,9 @@ export class NatsPlugin implements BackendPlugin {
       if (!expired && !this.stopped) throw err;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      if (closer !== undefined) {
-        const i = this.subscriptions.indexOf(closer);
-        if (i >= 0) this.subscriptions.splice(i, 1);
-      }
+      this.unregister(closer);
       void batch?.close();
-      await jsm.consumers.delete(stream, ci.name).catch(() => undefined);
+      await ephemeral.reap();
       cleanedUp();
     }
     const last = messages.at(-1);
@@ -500,18 +649,21 @@ export class NatsPlugin implements BackendPlugin {
     const epoch = this.epoch;
     const running = (): boolean => this.epoch === epoch && this.live();
     const retired = (): boolean => this.epoch !== epoch || this.stopped;
+    // Keep the handle captured at entry, as `pull()` does: `disconnect()` clears `this.jsm` as soon
+    // as its closers return, and reading it inside the loop instead skips the delete and leaks the
+    // consumer for its whole `inactive_threshold`.
+    const jsm = this.requireJsm();
     const stream = this.streamName(topic);
     const filterSubject = this.subject(topic);
     const seeded = await this.streamInfo(topic);
     let lastSeq = seeded.state.last_seq;
     let created = seeded.created;
     let current: ConsumerMessages | undefined;
-    let currentName: string | undefined;
+    let ephemeral = new EphemeralConsumer(jsm, stream);
     this.subscriptions.push({
       close: async () => {
         await current?.close();
-        await this.deleteConsumer(stream, currentName);
-        currentName = undefined;
+        await ephemeral.reap();
       },
     });
 
@@ -531,23 +683,25 @@ export class NatsPlugin implements BackendPlugin {
             created = info.created;
             lastSeq = 0;
           }
-          const ci = await this.requireJsm().consumers.add(stream, {
+          if (!running()) break;
+          // Keep the new reaper and its `add` in ONE synchronous step: the closer above reads this
+          // slot, so a teardown that interleaved between them would watch the wrong consumer.
+          ephemeral = new EphemeralConsumer(jsm, stream);
+          const name = await ephemeral.add({
             filter_subject: filterSubject,
             deliver_policy: DeliverPolicy.StartSequence,
             opt_start_seq: lastSeq + 1,
             ack_policy: AckPolicy.None,
             inactive_threshold: INACTIVE_NS,
           });
-          currentName = ci.name;
-          const consumer = await this.requireJs().consumers.get(stream, ci.name);
-          iter = await consumer.consume();
+          const consumer = await this.requireJs().consumers.get(stream, name);
+          current = await consumer.consume();
+          iter = current;
         } catch {
-          await this.deleteConsumer(stream, currentName);
-          currentName = undefined;
+          await ephemeral.reap();
           if (!running()) break;
           continue; // backend momentarily unreachable — retry the consumer after the backoff
         }
-        current = iter;
 
         const statusTask = (async () => {
           try {
@@ -596,16 +750,10 @@ export class NatsPlugin implements BackendPlugin {
           /* iterator closed on disconnect or consumer loss */
         }
         await statusTask;
-        await this.deleteConsumer(stream, currentName);
-        currentName = undefined;
+        await ephemeral.reap();
         if (retired()) break; // only a clean disconnect ends the loop; every other exit rebuilds
       }
     })();
-  }
-
-  private async deleteConsumer(stream: string, name: string | undefined): Promise<void> {
-    if (name === undefined) return;
-    await this.jsm?.consumers.delete(stream, name).catch(() => undefined);
   }
 
   /**
@@ -649,12 +797,7 @@ export class NatsPlugin implements BackendPlugin {
           }
           if (!/already in use|already exists|name already/i.test(msg)) throw err;
           const info = await this.requireJsm().streams.info(name);
-          const subjects = info.config.subjects ?? [];
-          if (!subjects.some((pattern) => captures(pattern, subject))) {
-            throw new Error(
-              `nats stream ${name} already exists capturing ${JSON.stringify(subjects)}, which does not include ${JSON.stringify(subject)} — subject_prefix or stream_prefix differs from the instance that created it`,
-            );
-          }
+          assertCaptures(name, subject, info.config.subjects ?? []);
           this.noteIncarnation(name, info);
         }
       })().catch((err: unknown) => {
@@ -672,7 +815,14 @@ export class NatsPlugin implements BackendPlugin {
     return this.subjectPrefix + safeName(topic, sanitizeToken);
   }
   private streamName(topic: Topic): string {
-    return this.streamPrefix + safeName(topic, sanitizeName);
+    const name = this.streamPrefix + safeName(topic, sanitizeName);
+    const bytes = Buffer.byteLength(name, 'utf8');
+    if (bytes > MAX_STREAM_NAME_BYTES) {
+      throw new Error(
+        `nats stream name ${JSON.stringify(name)} is ${bytes} bytes, over JetStream's limit of ${MAX_STREAM_NAME_BYTES} — shorten the topic ${JSON.stringify(String(topic))} or stream_prefix ${JSON.stringify(this.streamPrefix)}`,
+      );
+    }
+    return name;
   }
 
   private noteIncarnation(stream: string, info: { created?: string }): void {
@@ -721,16 +871,29 @@ export class NatsPlugin implements BackendPlugin {
   }
 }
 
+/**
+ * The page a read of a topic with no stream returns. The bare `0` names no incarnation and sits
+ * below every sequence, so the catch-up that follows the peer's first `post` starts at the new
+ * stream's first message instead of being judged a cursor from a dead incarnation and served the
+ * newest window — which would skip everything below it.
+ */
+const ABSENT_TOPIC_CURSOR = asCursor('0');
+
+const absentTopicPage = (args: FetchRecentArgs): FetchRecentResult => ({
+  messages: [],
+  nextCursor: args.since ?? ABSENT_TOPIC_CURSOR,
+});
+
 /** A cursor's two halves: which incarnation of the stream minted it, and where in it. */
 interface ParsedCursor {
-  /** Absent in the legacy bare-sequence form, which names no incarnation at all. */
+  /** Absent in the bare-sequence form: a legacy cursor, or {@link ABSENT_TOPIC_CURSOR}. */
   incarnation?: string;
   seq: number;
 }
 
 /**
- * A cursor this plugin minted is `<stream incarnation>-<sequence>`; the bare decimal sequence is
- * the legacy form and still parses. Anything else is caller input (`parley_fetch_recent` takes
+ * A cursor this plugin minted is `<stream incarnation>-<sequence>`; the bare decimal sequence names
+ * no incarnation and still parses. Anything else is caller input (`parley_fetch_recent` takes
  * `since` as a free string) and is rejected here rather than coerced by `Number()` into a
  * silently-empty page or an opaque driver error.
  */
@@ -761,6 +924,7 @@ function validatePrefix(
   value: string | undefined,
   fallback: string,
   illegal: RegExp,
+  maxComposedBytes?: number,
 ): string {
   if (value === undefined) return fallback;
   if (typeof value !== 'string') {
@@ -776,6 +940,12 @@ function validatePrefix(
   if (composed.split('.').some((token) => token === '')) {
     throw new Error(
       `invalid ${field} ${JSON.stringify(value)} — it composes the illegal name ${JSON.stringify(composed)}: no dot-separated token of a NATS name may be empty`,
+    );
+  }
+  const bytes = Buffer.byteLength(composed, 'utf8');
+  if (maxComposedBytes !== undefined && bytes > maxComposedBytes) {
+    throw new Error(
+      `invalid ${field} ${JSON.stringify(value)} — it composes ${JSON.stringify(composed)} at ${bytes} bytes, over the ${maxComposedBytes}-byte limit, so no topic could be named at all`,
     );
   }
   return value;
@@ -836,6 +1006,18 @@ export function captures(pattern: string, subject: string): boolean {
     if (tokens[i] !== '*' && tokens[i] !== target[i]) return false;
   }
   return tokens.length === target.length;
+}
+
+/**
+ * The stream a topic maps to must carry that topic's subject. A stream that does not is a bridge
+ * pointed at the wrong place, not an empty topic — refuse on EVERY path that meets one, so that a
+ * read cannot answer "nothing here" forever while the messages sit under another prefix.
+ */
+function assertCaptures(name: string, subject: string, subjects: string[]): void {
+  if (subjects.some((pattern) => captures(pattern, subject))) return;
+  throw new Error(
+    `nats stream ${name} already exists capturing ${JSON.stringify(subjects)}, which does not include ${JSON.stringify(subject)} — subject_prefix or stream_prefix differs from the instance that created it`,
+  );
 }
 
 const ackIncarnationUnknown = (stream: string, seq: number): Error =>

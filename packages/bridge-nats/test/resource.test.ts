@@ -1,4 +1,4 @@
-import { asCursor, asTopic, type Cursor } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 import { fakeJetStream, injectFake, payload } from './fake-jetstream.js';
@@ -89,4 +89,107 @@ describe('nats reads — a backend fault is a fault on every read shape', () => 
       expect(fake.state.deleted).toEqual(fake.state.created);
     }, 20_000);
   }
+});
+
+// Class 3: which seam methods may leave a DURABLE server-side object behind, stated as a table over
+// every method against both pre-states rather than as a property of the one method that got it
+// wrong. A read that provisions lets any caller-named topic spend the cluster's stream and storage
+// budget with calls that store nothing — `post_topics` is a regex and inbound is untrusted — so the
+// permission is granted per method, and a method added later is refused by default because it has
+// no row saying otherwise. `PROBE` composes the fake's own default subject, so the plugin's stream
+// cache is left empty and `ensureStream` runs for real.
+const PROBE = asTopic('topic');
+
+const seamCalls: {
+  name: string;
+  provisions: boolean;
+  run: (plugin: NatsPlugin, topic: Topic) => Promise<unknown>;
+}[] = [
+  { name: 'post', provisions: true, run: (p, t) => p.post(t, asHandle('sys'), 'x') },
+  { name: 'subscribe', provisions: true, run: (p, t) => p.subscribe(t, () => undefined) },
+  { name: 'fetchRecent with no since', provisions: false, run: (p, t) => p.fetchRecent({ topic: t }) },
+  {
+    name: 'fetchRecent from a since',
+    provisions: false,
+    run: (p, t) => p.fetchRecent({ topic: t, since: asCursor('0') }),
+  },
+  {
+    name: 'a blockMs long-poll',
+    provisions: false,
+    run: (p, t) => p.fetchRecent({ topic: t, since: asCursor('0'), blockMs: 300 }),
+  },
+  { name: 'resolveIdentity', provisions: false, run: (p) => p.resolveIdentity(asHandle('sys')) },
+];
+
+const preStates = [
+  { name: 'a topic with no stream', absent: true },
+  { name: 'a topic whose stream already exists', absent: false },
+];
+
+/** Every message a cursor still reaches, read in pages of `limit`. */
+async function drain(
+  plugin: NatsPlugin,
+  topic: Topic,
+  from: Cursor,
+  limit: number,
+): Promise<string[]> {
+  const seen: string[] = [];
+  let cursor = from;
+  for (let page = 0; page < 20; page++) {
+    const read = await plugin.fetchRecent({ topic, since: cursor, limit });
+    if (read.messages.length === 0) return seen;
+    seen.push(...read.messages.map((m) => m.content));
+    cursor = read.nextCursor;
+  }
+  return seen;
+}
+
+describe('nats provisioning — only a write may create the topic’s stream', () => {
+  for (const call of seamCalls) {
+    for (const pre of preStates) {
+      it(`${call.name} on ${pre.name} calls streams.add ${call.provisions ? 'once' : 'never'}`, async () => {
+        const fake = fakeJetStream({ records: [], streamAbsent: pre.absent });
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake);
+
+        await call.run(plugin, PROBE);
+
+        expect(fake.state.addCalls).toBe(call.provisions ? 1 : 0);
+      }, 20_000);
+    }
+  }
+
+  it('a read of a topic with no stream answers with an empty page and a cursor that replays', async () => {
+    const fake = fakeJetStream({ records: [], streamAbsent: true });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake);
+
+    const first = await plugin.fetchRecent({ topic: PROBE });
+    expect(first.messages).toEqual([]);
+    const again = await plugin.fetchRecent({ topic: PROBE, since: first.nextCursor });
+    expect(again).toEqual({ messages: [], nextCursor: first.nextCursor });
+    expect(fake.state.addCalls).toBe(0);
+
+    // The stream arrives, and the cursor taken before it existed must sit BELOW its first message.
+    // Drained in pages SMALLER than the history, because that is the only shape that can tell the
+    // two failures apart: a cursor the plugin judges to be from a dead incarnation is served the
+    // NEWEST window instead of the oldest, which returns messages while silently skipping the ones
+    // below it — invisible whenever one page happens to cover everything.
+    const posted = ['m1', 'm2', 'm3', 'm4', 'm5'];
+    for (const content of posted) await plugin.post(PROBE, asHandle('sys'), content);
+    expect(await drain(plugin, PROBE, first.nextCursor, 2)).toEqual(posted);
+  });
+
+  // A stream missing under THIS name while another already carries the topic's subject is a bridge
+  // pointed at the wrong stream, not an empty topic — and a read cannot create one to find out.
+  it('a read names stream_prefix when another stream already captures the topic’s subject', async () => {
+    const fake = fakeJetStream({ records: [], streamAbsent: true, rivalStream: 'OTHER_topic' });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake);
+
+    const err = await plugin.fetchRecent({ topic: PROBE }).then(() => undefined, (e: unknown) => e);
+    expect(String(err)).toContain('stream_prefix');
+    expect(String(err)).toContain('OTHER_topic');
+    expect(fake.state.addCalls).toBe(0);
+  });
 });

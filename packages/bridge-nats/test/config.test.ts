@@ -227,6 +227,74 @@ describe('nats backend_config — documented connection fields reach the driver'
     }
   }
 
+  // The same contract on its LENGTH axis. JetStream caps a stream name at 255 bytes, and the name
+  // is composed from a field the operator writes and a topic a CALLER can name through `post_topics`
+  // — so the refusal has to say which half is over, on both the write and the read path. The rows
+  // sit exactly either side of the limit, from both directions, so any bound that is off by one
+  // fails here rather than at someone's first post.
+  const MAX_STREAM_NAME = 255;
+  const rep = (n: number): string => 'a'.repeat(n);
+
+  const prefixLengths: { name: string; value: string; accepted?: true }[] = [
+    { name: `composes exactly ${MAX_STREAM_NAME}`, value: rep(MAX_STREAM_NAME - PROBE.length), accepted: true },
+    { name: `composes ${MAX_STREAM_NAME + 1}`, value: rep(MAX_STREAM_NAME - PROBE.length + 1) },
+    { name: 'is far past the limit', value: rep(400) },
+  ];
+
+  for (const row of prefixLengths) {
+    it(`stream_prefix that ${row.name} is ${row.accepted === true ? 'accepted' : 'rejected at connect(), naming the field'}`, async () => {
+      const plugin = new NatsPlugin();
+      const err = await plugin
+        .connect({ stream_prefix: row.value })
+        .then(() => undefined, (e: unknown) => e);
+
+      if (row.accepted === true) {
+        expect(err).toBeUndefined();
+        await plugin.disconnect();
+        return;
+      }
+      expect(String(err)).toContain('stream_prefix');
+      expect(String(err)).toContain(String(MAX_STREAM_NAME));
+      expect(vi.mocked(connect)).not.toHaveBeenCalled();
+    });
+  }
+
+  const topicLengths: { prefix: string; topicLen: number; accepted?: true }[] = [
+    { prefix: 'P_', topicLen: MAX_STREAM_NAME - 2, accepted: true },
+    { prefix: 'P_', topicLen: MAX_STREAM_NAME - 1 },
+    { prefix: rep(MAX_STREAM_NAME - PROBE.length), topicLen: PROBE.length, accepted: true },
+    { prefix: rep(MAX_STREAM_NAME - PROBE.length), topicLen: PROBE.length + 1 },
+    { prefix: 'P_', topicLen: 1000 },
+  ];
+
+  for (const row of topicLengths) {
+    const composed = row.prefix.length + row.topicLen;
+    for (const call of ['post', 'fetchRecent'] as const) {
+      it(`${call} on a topic composing a ${composed}-byte stream name is ${row.accepted === true ? 'accepted' : 'refused, naming the topic and stream_prefix'}`, async () => {
+        const plugin = new NatsPlugin();
+        await plugin.connect({ stream_prefix: row.prefix });
+        const topic = asTopic(rep(row.topicLen));
+        // A refused name throws before any I/O, so only the accepted rows need a backend at all.
+        if (row.accepted === true) injectFake(plugin, fakeJetStream({ records: [] }), topic);
+
+        const err = await (call === 'post'
+          ? plugin.post(topic, asHandle('sys'), 'x')
+          : plugin.fetchRecent({ topic })
+        ).then(() => undefined, (e: unknown) => e);
+
+        if (row.accepted === true) {
+          expect(err).toBeUndefined();
+          await plugin.disconnect();
+          return;
+        }
+        expect(String(err)).toContain('stream_prefix');
+        expect(String(err)).toContain(String(MAX_STREAM_NAME));
+        expect(String(err)).toContain(JSON.stringify(String(topic)));
+        await plugin.disconnect();
+      });
+    }
+  }
+
   it('the composed-name predicate rejects an empty token and spares a legal name', () => {
     expect(legalSubject('parley.topic')).toBe(true);
     expect(legalSubject('parley..topic')).toBe(false);
