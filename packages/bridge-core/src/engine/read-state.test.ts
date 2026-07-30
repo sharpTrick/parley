@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, normalize, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { asCursor, asTopic } from '../message.js';
+import { asCursor, asTopic, type Cursor } from '../message.js';
 import { defaultReadStatePath, ReadStateStore } from './read-state.js';
 
 const tmpFile = () => join(mkdtempSync(join(tmpdir(), 'parley-rs-')), 'read-state.json');
@@ -38,6 +38,46 @@ describe('ReadStateStore', () => {
     writeFileSync(path, '[]', 'utf8');
     new ReadStateStore(path).set(asTopic('t'), asCursor('c'));
     expect(new ReadStateStore(path).get(asTopic('t'))).toBe('c');
+  });
+
+  /**
+   * `load` already refuses a non-string cursor because one would wedge catch-up — but the WRITE side
+   * took anything, and `undefined` is the shape a plugin that returns no `nextCursor` actually hands
+   * over. `JSON.stringify` omits an undefined value, so that write deleted the topic's key on disk:
+   * the position was not merely stale on the next boot, it was gone, and the topic cold-restarted.
+   * Table the value shapes both sides can see and require the same verdict from each, so a new one
+   * cannot be accepted by one side and discarded by the other.
+   */
+  describe('a cursor that load() would refuse is refused by set() too', () => {
+    const SHAPES: Array<[label: string, value: unknown, accepted: boolean]> = [
+      ['a plain string', '43', true],
+      ['a string that looks numeric but is one', '0', true],
+      ['undefined (no nextCursor at all)', undefined, false],
+      ['null', null, false],
+      ['a number', 44, false],
+      ['an empty string', '', false],
+      ['an object', { a: 1 }, false],
+    ];
+
+    it.each(SHAPES)('%s', (_label, value, accepted) => {
+      const path = tmpFile();
+      const T = asTopic('ctx');
+      const store = new ReadStateStore(path);
+      store.set(T, asCursor('42'));
+
+      const write = () => store.set(T, value as Cursor);
+      if (accepted) {
+        write();
+        expect(new ReadStateStore(path).get(T)).toBe(value);
+        return;
+      }
+      expect(write).toThrow(TypeError);
+      // The previously persisted position must survive in memory AND on disk — a refused write may
+      // never leave the topic worse off than not writing at all.
+      expect(store.get(T)).toBe('42');
+      expect(new ReadStateStore(path).get(T)).toBe('42');
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ ctx: '42' });
+    });
   });
 
   it('drops non-string cursor values at load', () => {
@@ -177,32 +217,42 @@ describe('ReadStateStore', () => {
    * AND that the directory gained no `.tmp` entry.
    */
   describe('a failed atomic write leaves no debris', () => {
-    const failures: Array<[name: string, make: (dir: string) => string]> = [
-      [
-        'the rename target is a directory',
-        (dir) => {
+    interface WriteFailure {
+      name: string;
+      make: (dir: string) => string;
+      /** Undo the condition, so the SAME store's next flush succeeds. */
+      heal: (path: string) => void;
+    }
+
+    const failures: WriteFailure[] = [
+      {
+        name: 'the rename target is a directory',
+        make: (dir) => {
           const target = join(dir, 'read-state.json');
           mkdirSync(target);
           writeFileSync(join(target, 'occupant'), 'x', 'utf8');
           return target;
         },
-      ],
-      [
-        'the rename target is an empty directory',
-        (dir) => {
+        heal: (path) => rmSync(path, { recursive: true }),
+      },
+      {
+        name: 'the rename target is an empty directory',
+        make: (dir) => {
           const target = join(dir, 'read-state.json');
           mkdirSync(target);
           return target;
         },
-      ],
-      [
-        'the state directory path is a regular file',
-        (dir) => {
+        heal: (path) => rmSync(path, { recursive: true }),
+      },
+      {
+        name: 'the state directory path is a regular file',
+        make: (dir) => {
           const blocker = join(dir, 'notadir');
           writeFileSync(blocker, 'x', 'utf8');
           return join(blocker, 'read-state.json');
         },
-      ],
+        heal: (path) => rmSync(dirname(path)),
+      },
     ];
 
     const tmpEntries = (dir: string): string[] =>
@@ -210,14 +260,45 @@ describe('ReadStateStore', () => {
         .map((e) => String(e))
         .filter((e) => e.endsWith('.tmp'));
 
-    it.each(failures)('%s', (_name, make) => {
+    it.each(failures.map((f) => [f.name, f] as const))('%s', (_name, f) => {
       const dir = mkdtempSync(join(tmpdir(), 'parley-rs-fail-'));
-      const path = make(dir);
+      const path = f.make(dir);
       const store = new ReadStateStore(path);
       expect(() => store.set(asTopic('t'), asCursor('1'))).toThrow();
       expect(tmpEntries(dir)).toEqual([]);
       // A repeated attempt (catch-up retries page by page) still deposits nothing.
       expect(() => store.set(asTopic('t'), asCursor('2'))).toThrow();
+      expect(tmpEntries(dir)).toEqual([]);
+    });
+
+    /**
+     * A flush that fails must leave its topics PENDING: the next successful flush is what finally
+     * publishes them. Clearing the pending set unconditionally passes the debris table above
+     * unchanged, and only shows up here — the failed topic never reaches disk at all, so a later
+     * flush for an unrelated topic quietly publishes a file that is missing a read position.
+     */
+    it.each(
+      failures.flatMap((f) =>
+        [1, 2].flatMap((attempts) =>
+          (['the same topic', 'a different topic'] as const).map(
+            (retry) => [`${f.name}, ${attempts} failed write(s), retried on ${retry}`, f, attempts, retry] as const,
+          ),
+        ),
+      ),
+    )('%s', (_name, f, attempts, retry) => {
+      const dir = mkdtempSync(join(tmpdir(), 'parley-rs-heal-'));
+      const path = f.make(dir);
+      const store = new ReadStateStore(path);
+      for (let i = 1; i <= attempts; i++) {
+        expect(() => store.set(asTopic('blocked'), asCursor(`b${i}`))).toThrow();
+      }
+      f.heal(path);
+      store.set(asTopic(retry === 'the same topic' ? 'blocked' : 'other'), asCursor('ok'));
+
+      const expected =
+        retry === 'the same topic' ? { blocked: 'ok' } : { blocked: `b${attempts}`, other: 'ok' };
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(expected);
+      expect(new ReadStateStore(path).get(asTopic('blocked'))).toBe(expected.blocked);
       expect(tmpEntries(dir)).toEqual([]);
     });
 

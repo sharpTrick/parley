@@ -197,42 +197,19 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
       ? (r.postTopics as string[]).filter((t) => t.length <= MAX_TOPIC_LEN).slice(0, MAX_RECORD_TOPICS)
       : [];
   // `instanceId` is optional/additive: absent (old emitter) or malformed ⇒ '' (the anonymous
-  // instance, i.e. today's per-handle collapse) rather than a whole-record reject. Length-capped
-  // because it is untrusted (DESIGN §14).
-  const instanceId =
-    typeof r.instanceId === 'string' && r.instanceId.length > 0
-      ? r.instanceId.slice(0, MAX_INSTANCE_ID_LEN)
-      : '';
+  // instance, i.e. today's per-handle collapse) rather than a whole-record reject.
+  const instanceId = typeof r.instanceId === 'string' && r.instanceId.length > 0 ? r.instanceId : '';
   // `handle` is optional/additive: absent (old emitter) or malformed ⇒ undefined, and the roster
-  // falls back to the backend's sender attribution. Length-capped because it is untrusted.
-  const handle =
-    typeof r.handle === 'string' && r.handle.length > 0 ? r.handle.slice(0, MAX_HANDLE_LEN) : undefined;
+  // falls back to the backend's sender attribution.
+  const handle = typeof r.handle === 'string' && r.handle.length > 0 ? r.handle : undefined;
+  // Both become roster MAP KEYS, so drop the whole record (don't truncate — that would fabricate a
+  // different identity and merge two peers, or two instances, into one slot) when either is over
+  // its cap. This is the policy the list fields above already apply to an over-long member.
+  if (instanceId.length > MAX_INSTANCE_ID_LEN) return null;
+  if (handle !== undefined && handle.length > MAX_HANDLE_LEN) return null;
   return { v: 2, kind: r.kind, at: r.at, handle, topics, postTopics, instanceId };
 }
 
-/**
- * Reconstruct the reachability roster from the presence topic's messages (DESIGN §7).
- *
- * `messages` are pre-sorted ascending by cursor (the plugin's ordering guarantee, DESIGN §6), so
- * the LAST record per `(handle, instanceId)` is that instance's latest beat. The handle comes from
- * the RECORD ({@link emitterOf}), not from `Message.senderHandle`: a backend is free not to carry
- * the posting identity, and on those every session's beats would otherwise collapse into one
- * phantom peer. Liveness is scoped
- * PER INSTANCE: a handle is `online` iff ANY of its instances has a latest beat that is
- * `hello`/`heartbeat` (not `goodbye`) AND fresh (`nowMs - at < ttlMs`). Keying per instance means
- * a `goodbye` from an exiting process reaps only THAT process's slot — a relaunch's fresh instance
- * (new random `instanceId`) is never clobbered by the old process's trailing `goodbye`. TTL is the
- * real liveness gate — it reclaims crashed instances that never sent a `goodbye`.
- *
- * An OFFLINE handle (no live instance) is still surfaced — a post to its topic lands durably and it
- * catches up on next start, so it is a valid hand-off target — as long as it was last seen within
- * `sinceMs`; older handles are dropped. `online` is independent of `sinceMs` (a live handle always
- * appears). A handle's advertised `topics`/`postTopics` are the union across its live instances
- * when online, or the single last-known beat when offline — bounded by {@link MAX_HANDLE_INSTANCES}
- * instances and {@link MAX_RECORD_TOPICS} unioned entries, because the number of instances one
- * writer mints is untrusted. Entries sort most-recently-seen first so the freshest hand-off
- * candidates lead (online naturally floats up).
- */
 /**
  * Which handle a beat belongs to. The seam does not require a backend to carry the posting identity
  * (a bot-token backend delivers every session's beats under ONE bot handle), so the record's
@@ -243,17 +220,32 @@ function emitterOf(rec: PresenceRecord, m: Message): Handle {
   return rec.handle === undefined ? m.senderHandle : asHandle(rec.handle);
 }
 
+/** Which of two beats loses its instance slot first: a `goodbye` before any live beat, then the older. */
+function evictedBefore(a: PresenceRecord, b: PresenceRecord): boolean {
+  const aGone = a.kind === 'goodbye';
+  const bGone = b.kind === 'goodbye';
+  return aGone === bGone ? a.at < b.at : aGone;
+}
+
 /**
  * Record a handle's latest beat per instance, keeping at most {@link MAX_HANDLE_INSTANCES} of them.
- * Re-inserting on every beat orders the map least-recently-heard first, so the evicted instance is
- * the stalest one rather than a long-lived peer a flood of fresh `instanceId`s pushed out.
+ *
+ * Keep eviction ranked by the BEAT ({@link evictedBefore}), never by arrival order: a handle whose
+ * sessions churn faster than its heartbeat posts a run of short-lived instances after a long-lived
+ * one, and evicting by arrival drops the live instance and reports a reachable peer offline.
  */
 function retainFreshest(insts: Map<string, PresenceRecord>, rec: PresenceRecord): void {
-  insts.delete(rec.instanceId);
   insts.set(rec.instanceId, rec);
-  for (const stalest of insts.keys()) {
-    if (insts.size <= MAX_HANDLE_INSTANCES) break;
-    insts.delete(stalest);
+  while (insts.size > MAX_HANDLE_INSTANCES) {
+    let evictId = '';
+    let evict: PresenceRecord | undefined;
+    for (const [id, r] of insts) {
+      if (evict === undefined || evictedBefore(r, evict)) {
+        evictId = id;
+        evict = r;
+      }
+    }
+    insts.delete(evictId);
   }
 }
 
@@ -274,6 +266,29 @@ function unionCapped(from: readonly PresenceRecord[], pick: (r: PresenceRecord) 
   return [...out];
 }
 
+/**
+ * Reconstruct the reachability roster from the presence topic's messages (DESIGN §7).
+ *
+ * `messages` are pre-sorted ascending by cursor (the plugin's ordering guarantee, DESIGN §6), so
+ * the LAST record per `(handle, instanceId)` is that instance's latest beat. The handle comes from
+ * the RECORD ({@link emitterOf}), not from `Message.senderHandle`: a backend is free not to carry
+ * the posting identity, and on those every session's beats would otherwise collapse into one
+ * phantom peer. Liveness is scoped PER INSTANCE: a handle is `online` iff ANY of its instances has a
+ * latest beat that is `hello`/`heartbeat` (not `goodbye`) AND fresh (`nowMs - at < ttlMs`). Keying
+ * per instance means a `goodbye` from an exiting process reaps only THAT process's slot — a
+ * relaunch's fresh instance (new random `instanceId`) is never clobbered by the old process's
+ * trailing `goodbye`. TTL is the real liveness gate — it reclaims crashed instances that never sent
+ * a `goodbye`.
+ *
+ * An OFFLINE handle (no live instance) is still surfaced — a post to its topic lands durably and it
+ * catches up on next start, so it is a valid hand-off target — as long as it was last seen within
+ * `sinceMs`; older handles are dropped. `online` is independent of `sinceMs` (a live handle always
+ * appears). A handle's advertised `topics`/`postTopics` are the union across its live instances
+ * when online, or the single last-known beat when offline — bounded by {@link MAX_HANDLE_INSTANCES}
+ * instances ({@link retainFreshest} chooses which) and {@link MAX_RECORD_TOPICS} unioned entries,
+ * because the number of instances one writer mints is untrusted. Entries sort most-recently-seen
+ * first so the freshest hand-off candidates lead (online naturally floats up).
+ */
 export function computeRoster(messages: Message[], nowMs: number, opts: RosterOptions): RosterEntry[] {
   const byHandle = new Map<Handle, Map<string, PresenceRecord>>();
   for (const m of messages) {

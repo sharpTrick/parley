@@ -25,7 +25,7 @@ import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
  * bounds the OFFLINE lookback: a `since_ms` reaching further back than this many beats can silently
  * under-report older peers — the handler flags that with `truncated: true` when the page is full.
  */
-const PRESENCE_FETCH_LIMIT = 500;
+export const PRESENCE_FETCH_LIMIT = 500;
 
 /**
  * Default offline lookback for `parley_list_users` (24h): how far back a peer can have last been
@@ -39,7 +39,7 @@ const DEFAULT_ROSTER_WINDOW_MS = 24 * 60 * 60 * 1000;
  * (serialisation, then the dedup warm-up that can flush the seen-set), so an unbounded page is a
  * denial-of-service knob. Clamped rather than refused, exactly as `block_ms` is.
  */
-const MAX_FETCH_LIMIT = 1_000;
+export const MAX_FETCH_LIMIT = 1_000;
 
 /** Dependencies the reactive/reply tools close over. */
 export interface ToolDeps {
@@ -112,7 +112,7 @@ function describeAllowed(allow: Allowlist): string {
   if (pats.length > 0) {
     s += ` Also allowed (post/fetch only): any topic fully matching regex ${pats
       .map((p) => JSON.stringify(p))
-      .join(', ')}.`;
+      .join(', ')} — except the reserved presence topic, which is refused even when a pattern covers it.`;
   }
   return s;
 }
@@ -320,8 +320,10 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
           .string()
           .optional()
           .describe(
-            'Optional topic to scope to. Omit for all configured topics; the default scope is the ' +
-              'configured topics.',
+            'Optional topic to scope the roster to peers on that topic (subscribed to it, or able ' +
+              'to post to it). Omit for everyone you share a channel with in either direction — ' +
+              'which includes peers on topics you only reach through a post pattern, not just the ' +
+              'configured ones.',
           ),
         online_only: z
           .boolean()

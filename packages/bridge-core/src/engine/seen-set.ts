@@ -1,6 +1,14 @@
 import type { BackendMsgId, Topic } from '../message.js';
 
 /**
+ * The dedup window every composition root gets: `new SeenSet()` takes no arguments, so these two
+ * numbers ARE the production capacity. Exported so the suite can grade the default-constructed
+ * instance against them instead of only against injected test values.
+ */
+export const SEEN_MAX_PER_TOPIC = 4096;
+export const SEEN_MAX_TOPICS = 256;
+
+/**
  * Per-topic dedup set keyed on `backendMsgId` (DESIGN §6 — NEVER on timestamp).
  *
  * The same logical message can arrive twice: once via live push, once via `fetchRecent`
@@ -20,8 +28,8 @@ export class SeenSet {
   private readonly queues = new Map<Topic, BackendMsgId[]>();
 
   constructor(
-    private readonly maxPerTopic = 4096,
-    private readonly maxTopics = 256,
+    private readonly maxPerTopic = SEEN_MAX_PER_TOPIC,
+    private readonly maxTopics = SEEN_MAX_TOPICS,
   ) {}
 
   private bucket(topic: Topic): { set: Set<BackendMsgId>; queue: BackendMsgId[] } {

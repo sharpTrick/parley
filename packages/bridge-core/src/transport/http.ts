@@ -215,6 +215,7 @@ export function createRemoteHttpApp(
   app.delete(mcpPath, protect, methodNotAllowed);
 
   let httpServer: NodeHttpServer | undefined;
+  let starting = false;
   return {
     app,
     // Keep rejecting on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
@@ -231,22 +232,29 @@ export function createRemoteHttpApp(
       new Promise<NodeHttpServer>((resolve, reject) => {
         // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
         // leave the first one bound forever and its presence loop beating past close(), advertising
-        // a shut-down bridge as online. A server that failed to bind is not live, so a failed
-        // listen stays retryable.
-        if (httpServer?.listening === true) {
+        // a shut-down bridge as online. Latch this SYNCHRONOUSLY rather than reading
+        // `server.listening`, which stays false for the whole window between `app.listen` and its
+        // `listening` event — two overlapping starts both pass that check. A bind failure clears the
+        // latch, so a failed listen stays retryable.
+        if (starting || httpServer?.listening === true) {
           reject(new Error('remote HTTP server already listening'));
           return;
         }
+        starting = true;
+        const failed = (err: Error): void => {
+          starting = false;
+          reject(err);
+        };
         const s = app.listen(port, host, (err?: Error) => {
           if (err) {
-            reject(err);
+            failed(err);
             return;
           }
-          s.off('error', reject);
+          s.off('error', failed);
           announce();
           resolve(s);
         });
-        s.once('error', reject);
+        s.once('error', failed);
         httpServer = s;
       }),
     // Keep close() a no-op on a server that is not up — never listened on, bind failed, or already
@@ -259,6 +267,7 @@ export function createRemoteHttpApp(
       presence = undefined;
       const s = httpServer;
       httpServer = undefined;
+      starting = false;
       if (s === undefined || !s.listening) return;
       s.closeIdleConnections();
       // Keep this deadline armed: `s.close()` alone resolves only once every in-flight request has

@@ -319,21 +319,42 @@ describe('fetchRecentBlocking', () => {
       release();
     });
 
-    it('an un-aborted budget queries once per poll interval and once at the deadline', async () => {
+    /**
+     * `block_ms` is documented as "hold up to this long", so the caller's budget is a BOUND, not a
+     * rounding hint — and every case here used to pick a budget that was an exact multiple of the
+     * cadence, the one column where clamping the nap to the remaining budget and not clamping it are
+     * the same expression. With the shipped 250 ms cadence, a `block_ms: 10` on an empty topic then
+     * overruns by 25x. Cross the two knobs (cadence finer than, equal to, and coarser than the
+     * budget) and pin BOTH the virtual-clock instant the call resolves at and the exact query count:
+     * the count alone cannot see an overrun, and the clock alone cannot see a lost poll.
+     */
+    it.each([
+      ['a budget that is an exact multiple of the cadence', 1000, 250, 1000, 5],
+      ['a budget that is not a multiple of the cadence', 900, 250, 900, 5],
+      ['a cadence coarser than the whole budget', 10, 250, 10, 2],
+      ['a one-millisecond budget', 1, 1000, 1, 2],
+    ])('%s resolves at its deadline, not at the next tick', async (_name, blockMs, pollIntervalMs, at, queries) => {
       const { plugin, calls } = counting();
       const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
       calls.length = 0;
       const clock = fakeClock();
 
+      let settledAt: number | undefined;
       const pending = fetchRecentBlocking(
         plugin,
         { topic: T, since: tail },
-        { blockMs: 1000, pollIntervalMs: 250, now: clock.now, sleep: clock.sleep },
-      );
+        { blockMs, pollIntervalMs, now: clock.now, sleep: clock.sleep },
+      ).then((r) => {
+        settledAt = clock.now();
+        return r;
+      });
       await flush();
-      for (let i = 0; i < 4; i++) await clock.advance(250);
+      for (let i = 0; i < blockMs + pollIntervalMs && settledAt === undefined; i++) await clock.advance(1);
       await pending;
-      expect(calls).toHaveLength(5); // 4 naps + the final at-deadline query
+
+      expect(settledAt).toBe(at);
+      expect(settledAt).toBeLessThanOrEqual(blockMs); // the caller's budget is a bound, not a hint
+      expect(calls).toHaveLength(queries); // one query per nap, plus the final at-deadline query
     });
   });
 

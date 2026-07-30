@@ -70,34 +70,51 @@ describe('encode/decode presence', () => {
   });
 
   /**
-   * Every length/count cap at decode is one axis — (field, kind of overflow, expectation) — so table
-   * it rather than writing a case per field: a cap added to a new PresenceRecord field joins a row
-   * instead of needing a new body, and the caps actually covered are visible without reading six
-   * prose names. The two axes differ in KIND, so they are two tables: a scalar string is truncated to
-   * its cap, while a list caps its COUNT and DROPS an over-long member (truncating a topic name would
-   * fabricate a different topic).
+   * Every length cap at decode is one axis — (field, how far over, expectation) — so table it rather
+   * than writing a case per field: a cap added to a new PresenceRecord field joins a row instead of
+   * needing a new body. The ONE policy in every cell is that an over-cap string never becomes a
+   * different valid value; where it lands differs only because `handle`/`instanceId` become roster
+   * MAP KEYS, so a truncated one would silently merge two peers (or two instances) into one slot and
+   * has to take its whole record with it.
    */
-  it.each([
-    ['instanceId', MAX_INSTANCE_ID_LEN],
-    ['handle', MAX_HANDLE_LEN],
-  ] as const)('truncates an over-long %s to its cap (untrusted input becomes roster state)', (field, cap) => {
-    const beyond = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: 'x'.repeat(cap + 50) });
-    expect(decodePresence(beyond)?.[field]).toHaveLength(cap);
-    const exact = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: 'y'.repeat(cap) });
-    expect(decodePresence(exact)?.[field]).toHaveLength(cap);
+  describe('an over-cap string is never truncated into a different valid value', () => {
+    const OVER = [
+      ['one character over', 1],
+      ['far over', 5_000],
+    ] as const;
+
+    it.each(
+      ([['instanceId', MAX_INSTANCE_ID_LEN], ['handle', MAX_HANDLE_LEN]] as const).flatMap(([field, cap]) =>
+        OVER.map(([label, by]) => [field, cap, label, by] as const),
+      ),
+    )('%s at its cap %i is kept, %s rejects the whole record', (field, cap, _label, by) => {
+      const at = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: 'y'.repeat(cap) });
+      expect(decodePresence(at)?.[field]).toHaveLength(cap);
+      const over = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: 'x'.repeat(cap + by) });
+      expect(decodePresence(over)).toBeNull();
+    });
+
+    it.each(
+      (['topics', 'postTopics'] as const).flatMap((field) =>
+        OVER.map(([label, by]) => [field, label, by] as const),
+      ),
+    )('%s keeps a member at MAX_TOPIC_LEN and drops one %s', (field, _label, by) => {
+      const atTheCap = 'y'.repeat(MAX_TOPIC_LEN);
+      const over = 'x'.repeat(MAX_TOPIC_LEN + by);
+      const rec = decodePresence(
+        JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: [over, 'keep-me', atTheCap] }),
+      );
+      expect(rec?.[field]).toEqual(['keep-me', atTheCap]);
+    });
   });
 
-  it.each(['topics', 'postTopics'] as const)('%s caps its count and drops over-long members', (field) => {
-    const record = (value: string[]) =>
-      decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: value }));
-
+  it.each(['topics', 'postTopics'] as const)('%s caps its COUNT at MAX_RECORD_TOPICS', (field) => {
     const many = Array.from({ length: MAX_RECORD_TOPICS + 10 }, (_unused, i) => `e-${i}`);
-    expect(record(many)?.[field]).toHaveLength(MAX_RECORD_TOPICS);
-    expect(record(many)?.[field][0]).toBe('e-0');
-
-    const tooLong = 'x'.repeat(MAX_TOPIC_LEN + 1);
-    const atTheCap = 'y'.repeat(MAX_TOPIC_LEN);
-    expect(record([tooLong, 'keep-me', atTheCap])?.[field]).toEqual(['keep-me', atTheCap]);
+    const rec = decodePresence(
+      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: many }),
+    );
+    expect(rec?.[field]).toHaveLength(MAX_RECORD_TOPICS);
+    expect(rec?.[field][0]).toBe('e-0');
   });
 
   it('rejects malformed / non-presence content (untrusted input)', () => {
@@ -371,23 +388,52 @@ describe('the per-record budget survives aggregation across instances', () => {
     expect(entry.lastSeenMs).toBe(now - 800);
   });
 
-  it('retains the instances still beating and evicts the stalest', () => {
-    const flood = Array.from({ length: MAX_HANDLE_INSTANCES * 4 }, (_unused, i) =>
-      beat('claude-a', 'heartbeat', now - 1_000, 10 + i, [`ctx-flood-${i}`], [], `flood-${i}`),
+  /**
+   * Which instances survive the cap is a function of the BEATS, not of the order they arrived in —
+   * `instance_id` defaults to the handle and agent sessions are ephemeral, so a handle whose sessions
+   * churn faster than its heartbeat routinely posts a long-lived instance FIRST and a run of
+   * short-lived ones after it. Cross the survivor's arrival position with the sibling kind, the
+   * sibling count and whether the survivor is the freshest or the stalest of them, and compute the
+   * expectation from the policy: a live instance outranks any `goodbye`, and among same-kind beats
+   * the freshest `at` wins. The evicted cell is asserted too — a retention rule that keeps everything
+   * would satisfy a survival-only table.
+   */
+  describe('the instance cap keeps the freshest live instances, whatever order they arrived in', () => {
+    const N = MAX_HANDLE_INSTANCES;
+    const POSITIONS = ['before', 'interleaved', 'after'] as const;
+    const KINDS = ['heartbeat', 'goodbye'] as const;
+    const COUNTS = [N, N * 2, N * 4];
+    const AGES = ['freshest', 'stalest'] as const;
+
+    const CELLS = POSITIONS.flatMap((position) =>
+      KINDS.flatMap((kind) =>
+        COUNTS.flatMap((count) => AGES.map((age) => [position, kind, count, age] as const)),
+      ),
     );
-    const entry = computeRoster(
-      [
-        beat('claude-a', 'heartbeat', now - 5_000, 1, ['ctx-silent'], [], 'inst-silent'),
-        beat('claude-a', 'heartbeat', now - 5_000, 2, ['ctx-loud'], [], 'inst-loud'),
-        ...flood,
-        beat('claude-a', 'heartbeat', now - 500, 999, ['ctx-loud'], [], 'inst-loud'),
-      ],
-      now,
-      opts,
-    )[0]!;
-    expect(entry.topics).toContain('ctx-loud'); // beat again after the flood ⇒ retained
-    expect(entry.topics).not.toContain('ctx-silent'); // silent since its first beat ⇒ evicted
-    expect(entry.topics.length).toBeLessThanOrEqual(MAX_HANDLE_INSTANCES);
+
+    it.each(CELLS)(
+      'survivor beating %s a flood of %i %s siblings, and the %s of them',
+      (position, kind, count, age) => {
+        const survivorAt = age === 'freshest' ? now - 500 : now - 60_000;
+        const siblingAt = (i: number) => (age === 'freshest' ? now - 50_000 + i : now - 1_000 - i);
+        const siblings = Array.from({ length: count }, (_unused, i) =>
+          beat('claude-a', kind, siblingAt(i), 100 + i, [`ctx-sib-${i}`], [], `sib-${i}`),
+        );
+        const survivor = beat('claude-a', 'heartbeat', survivorAt, 1, ['ctx-survivor'], [], 'inst-survivor');
+        const at = position === 'before' ? 0 : position === 'after' ? siblings.length : count >> 1;
+        const page = [...siblings.slice(0, at), survivor, ...siblings.slice(at)];
+
+        // The survivor loses its slot only when every sibling outranks it: same kind, and fresher.
+        const retained = kind === 'goodbye' || age === 'freshest';
+        const entry = computeRoster(page, now, opts)[0]!;
+
+        // Exact, not "at most": an online entry advertises every LIVE instance it retained, so a
+        // rule that kept nothing, or that folded the departed siblings back in, fails here too.
+        expect(entry.online).toBe(true);
+        expect(entry.topics).toHaveLength(kind === 'goodbye' ? 1 : N);
+        expect(entry.topics.includes('ctx-survivor')).toBe(retained);
+      },
+    );
   });
 
   /**
@@ -458,6 +504,57 @@ describe('the roster keys on the emitting bridge, not on the backend sender', ()
       expect(roster.find((e) => e.handle === h)?.topics).toEqual([`topic-${h}`]);
     }
     expect(roster.map((e) => e.handle)).not.toContain(BOT);
+  });
+
+  /**
+   * `handle` and `instanceId` are the roster's two map keys, so a length cap that TRUNCATED them
+   * would merge peers that share a prefix into one entry (unioning their topics and reporting one
+   * online while only the other is) and let one instance's `goodbye` reap another's slot. Pin both
+   * key axes against an in-cap control, so the drop policy cannot be relaxed back to a slice.
+   */
+  it.each([
+    ['handle', MAX_HANDLE_LEN],
+    ['instanceId', MAX_INSTANCE_ID_LEN],
+  ] as const)('two records differing only past the %s cap are never merged', (field, cap) => {
+    const shared = 'p'.repeat(cap);
+    const record = (suffix: string, topic: string) => ({
+      v: 2,
+      kind: 'hello',
+      at: now - 1_000,
+      topics: [topic],
+      ...(field === 'handle'
+        ? { handle: shared + suffix }
+        : { handle: 'claude-a', instanceId: shared + suffix }),
+    });
+    const msg = (body: object, seq: number): Message => ({
+      topic: asTopic('parley-presence'),
+      senderHandle: asHandle('bot'),
+      content: JSON.stringify(body),
+      timestamp: new Date(seq * 1000).toISOString(),
+      backendMsgId: asBackendMsgId(String(seq)),
+      cursor: asCursor(String(seq)),
+      mentions: [],
+    });
+
+    const overCap = computeRoster(
+      [msg(record('-one', 'ctx-one'), 1), msg(record('-two', 'ctx-two'), 2)],
+      now,
+      opts,
+    );
+    expect(overCap).toEqual([]); // both dropped — never one entry carrying both peers' topics
+
+    // Control: the same two records inside the cap stay two distinct keys.
+    const inCap = computeRoster(
+      [
+        msg({ ...record('', 'ctx-one'), [field]: 'in-cap-one' }, 1),
+        msg({ ...record('', 'ctx-two'), [field]: 'in-cap-two' }, 2),
+      ],
+      now,
+      opts,
+    );
+    const topics = inCap.flatMap((e) => e.topics).sort();
+    expect(topics).toEqual(['ctx-one', 'ctx-two']);
+    expect(inCap).toHaveLength(field === 'handle' ? 2 : 1); // one handle, two instances
   });
 
   it('a pre-handle beat still keys on the backend sender (mixed-version compatibility)', () => {

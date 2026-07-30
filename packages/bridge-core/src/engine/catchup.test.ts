@@ -49,6 +49,33 @@ describe('catch-up driver', () => {
     expect(seen.firstSeen(T, asBackendMsgId('3'))).toBe(false);
   });
 
+  /**
+   * The driver writes whatever `nextCursor` a page carried straight into read-state, and the seam's
+   * TYPE is no guarantee — a JS plugin, or a TS one returning a value typed away, can omit it. The
+   * persisted position is the only thing standing between a restart and a cold re-drain, so require
+   * that a page core cannot use fails on the page that produced it rather than erasing the position.
+   */
+  it.each([
+    ['no nextCursor at all', {}],
+    ['a null nextCursor', { nextCursor: null }],
+    ['a numeric nextCursor', { nextCursor: 7 }],
+    ['an empty-string nextCursor', { nextCursor: '' }],
+  ])('a page carrying %s leaves the stored read position intact', async (_label, over) => {
+    const path = rsPath();
+    const readState = new ReadStateStore(path);
+    readState.set(T, asCursor('42'));
+    const plugin = {
+      fetchRecent: (): Promise<FetchRecentResult> =>
+        Promise.resolve({ messages: [], ...over } as unknown as FetchRecentResult),
+    } as unknown as BackendPlugin;
+
+    await expect(
+      catchUpTopic({ plugin, topic: T, limit: 10, readState, seen: new SeenSet() }),
+    ).rejects.toThrow(TypeError);
+    expect(readState.get(T)).toBe('42');
+    expect(new ReadStateStore(path).get(T)).toBe('42');
+  });
+
   it('second catch-up returns only newer (exclusive since)', async () => {
     const p = await seeded(3, 'a');
     const readState = new ReadStateStore(rsPath());

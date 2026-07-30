@@ -92,13 +92,25 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   // Keep this as the ONE teardown, so a failed attach releases exactly what shutdown() would — the
   // caller of a rejecting attach never receives a bridge to shut down, and a leaked connection's
   // poll timers keep the process alive. The presence goodbye is best-effort and self-bounding, so
-  // it can never hold the disconnect.
+  // it can never hold the disconnect. Keep every step ATTEMPTED even after an earlier one rejects,
+  // so a backend whose close handshake fails (Matrix/XMPP/NATS all can) cannot leave the transport
+  // connected and the process unable to exit.
   const teardown = async (): Promise<void> => {
     if (toreDown) return;
     toreDown = true;
+    const failures: unknown[] = [];
+    const attempt = async (step: () => Promise<void>): Promise<void> => {
+      try {
+        await step();
+      } catch (e) {
+        failures.push(e);
+      }
+    };
     await presence?.stop().catch(() => {});
-    await plugin.disconnect();
-    await server.close();
+    await attempt(() => plugin.disconnect());
+    await attempt(() => server.close());
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, 'bridge teardown failed');
   };
   return {
     server,

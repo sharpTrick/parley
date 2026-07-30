@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asTopic } from '../message.js';
-import { SeenSet } from './seen-set.js';
+import { SeenSet, SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS } from './seen-set.js';
 
 const T = asTopic('t');
 const T2 = asTopic('t2');
@@ -61,6 +61,41 @@ describe('SeenSet', () => {
         s.markSeen(T, id(2)); // the hot topic keeps being written to
       }
       expect(s.has(T, id(2))).toBe(true);
+    });
+  });
+
+  /**
+   * Every other case here INJECTS its own capacity, so the no-argument constructor the composition
+   * roots actually use was graded nowhere: collapsing either default to 2 left the whole suite
+   * green while a three-topic bridge re-emitted `<channel>` events on every catch-up/live overlap.
+   * Grade the default-constructed instance at its boundary, and pin the two numbers by VALUE as
+   * well — a table derived from the constants moves with them and cannot see a silent shrink.
+   */
+  describe('the shipped defaults are the ones a no-argument SeenSet gets', () => {
+    it('pins the documented capacity', () => {
+      expect([SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS]).toEqual([4096, 256]);
+    });
+
+    it('holds exactly maxPerTopic ids in one topic before evicting the oldest', () => {
+      const s = new SeenSet();
+      for (let i = 0; i < SEEN_MAX_PER_TOPIC; i++) s.markSeen(T, id(i));
+      expect(s.has(T, id(0))).toBe(true); // at the cap nothing has been dropped yet
+      expect(s.has(T, id(SEEN_MAX_PER_TOPIC - 1))).toBe(true);
+      s.markSeen(T, id(SEEN_MAX_PER_TOPIC)); // one past it evicts exactly the oldest
+      expect(s.has(T, id(0))).toBe(false);
+      expect(s.has(T, id(1))).toBe(true);
+      expect(s.has(T, id(SEEN_MAX_PER_TOPIC))).toBe(true);
+    });
+
+    it('holds exactly maxTopics buckets before evicting the coldest', () => {
+      const s = new SeenSet();
+      const topic = (i: number) => asTopic(`t${i}`);
+      for (let i = 0; i < SEEN_MAX_TOPICS; i++) s.markSeen(topic(i), id(1));
+      expect(s.has(topic(0), id(1))).toBe(true);
+      s.markSeen(topic(SEEN_MAX_TOPICS), id(1));
+      expect(s.has(topic(0), id(1))).toBe(false);
+      expect(s.has(topic(1), id(1))).toBe(true);
+      expect(s.has(topic(SEEN_MAX_TOPICS), id(1))).toBe(true);
     });
   });
 

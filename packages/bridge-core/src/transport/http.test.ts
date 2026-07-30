@@ -476,6 +476,54 @@ describe('a composition root can only be started once', () => {
       await p.disconnect();
     },
   );
+
+  /**
+   * Every row above AWAITS the first start, so none of them enters the window the guard actually has
+   * to cover: between `app.listen()` and its `listening` event, `server.listening` reports false, and
+   * a guard reading it lets a second overlapping call bind too — orphaning the first socket and its
+   * presence loop where no `close()` can ever reach them.
+   */
+  const overlapping: Record<
+    string,
+    (p: FakePlugin) => Promise<{ starts: Array<Promise<unknown>>; stop: () => Promise<void> }>
+  > = {
+    'http listen()': async (p) => {
+      const app = createRemoteHttpApp(p, startedCfg(), { insecureNoAuth: true });
+      return { starts: [app.listen(0), app.listen(0)], stop: () => app.close() };
+    },
+    'stdio attach()': async (p) => {
+      const bridge = await buildBridge(p, startedCfg());
+      return {
+        starts: [
+          bridge.attach(InMemoryTransport.createLinkedPair()[1]),
+          bridge.attach(InMemoryTransport.createLinkedPair()[1]),
+        ],
+        stop: () => bridge.shutdown(),
+      };
+    },
+  };
+
+  it.each(Object.keys(overlapping))('%s rejects a second start that OVERLAPS the first', async (name) => {
+    const p = new FakePlugin();
+    await p.connect({});
+    const { starts, stop } = await overlapping[name]!(p);
+    const settled = await Promise.allSettled(starts);
+
+    expect(settled.map((s) => s.status).sort()).toEqual(['fulfilled', 'rejected']);
+    await new Promise((r) => setTimeout(r, 80)); // several heartbeat cadences
+    expect((await kinds(p)).filter((k) => k === 'hello')).toHaveLength(1);
+
+    await stop();
+    for (const s of settled) {
+      const bound =
+        s.status === 'fulfilled' ? (s.value as { listening?: boolean } | undefined)?.listening : undefined;
+      if (bound !== undefined) expect(bound).toBe(false); // teardown reached whatever bound
+    }
+    const atStop = (await kinds(p)).length;
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await kinds(p)).length).toBe(atStop);
+    await p.disconnect();
+  });
 });
 
 /**
@@ -781,17 +829,31 @@ describe('the insecure-no-auth endpoint answers only to the hosts it was configu
   it('a request whose Host names the attacker is refused, whatever it puts in Origin', async () => {
     const { port, teardown } = await appOn({ insecureNoAuth: true });
     try {
+      // Header SPELLING is its own axis: `Host` is case-insensitive per RFC 9110 and browsers and
+      // proxies do send mixed case, so a gate that compares raw bytes locks a legitimate client out
+      // — while a suffix like `127.0.0.1.evil.com` must still be a different host, not a prefix
+      // match. Every existing row sent an already-lowercase value, so the normalisation itself was
+      // free to disappear.
       const HOSTS: Array<[label: string, host: (port: number) => string, expected: number]> = [
         ['the loopback address it is bound to', (p) => `127.0.0.1:${p}`, ALLOWED],
         ['localhost', (p) => `localhost:${p}`, ALLOWED],
+        ['localhost in mixed case', () => 'LocalHost', ALLOWED],
+        ['localhost upper-cased', () => 'LOCALHOST', ALLOWED],
+        ['the bracketed IPv6 loopback', () => '[::1]', ALLOWED],
+        ['the bracketed IPv6 loopback with a port', (p) => `[::1]:${p}`, ALLOWED],
         ['a rebinding attacker domain', () => 'files.attacker.example', REFUSED],
+        ['a rebinding attacker domain in mixed case', () => 'Files.Attacker.Example', REFUSED],
         ['an attacker domain on the right port', (p) => `attacker.example:${p}`, REFUSED],
+        ['a loopback-prefixed attacker domain', (p) => `127.0.0.1.evil.example:${p}`, REFUSED],
+        ['a loopback name with a trailing dot', (p) => `localhost.:${p}`, REFUSED],
         ['a public name this bridge was never told about', () => 'parley.example.com', REFUSED],
       ];
       const ORIGINS: Array<[label: string, origin: string | undefined, allowed: boolean]> = [
         ['no Origin (a non-browser client)', undefined, true],
         ['a loopback Origin', 'http://127.0.0.1', true],
+        ['a mixed-case loopback Origin', 'http://LocalHost', true],
         ['an attacker Origin', 'https://evil.example', false],
+        ['an attacker Origin in mixed case', 'https://Evil.Example', false],
         ['the opaque null Origin', 'null', false],
       ];
       for (const [hostLabel, host, hostExpected] of HOSTS) {
@@ -813,6 +875,23 @@ describe('the insecure-no-auth endpoint answers only to the hosts it was configu
     try {
       expect(await statusFor(port, 'parley.internal')).toBe(ALLOWED);
       expect(await statusFor(port, `127.0.0.1:${port}`)).toBe(REFUSED);
+    } finally {
+      await teardown();
+    }
+  });
+
+  // The CONFIGURED side of the comparison is untested by the table above, which only varies the
+  // incoming header. An operator who writes their host the way their DNS zone does must not find
+  // every lowercase request refused.
+  it('a mixed-case allowedHosts entry still matches a lowercase Host', async () => {
+    const { port, teardown } = await appOn({
+      insecureNoAuth: true,
+      allowedHosts: ['Parley.Internal', 'HTTPS://Parley.Example:8443'],
+    });
+    try {
+      expect(await statusFor(port, 'parley.internal')).toBe(ALLOWED);
+      expect(await statusFor(port, 'parley.example')).toBe(ALLOWED);
+      expect(await statusFor(port, 'other.internal')).toBe(REFUSED);
     } finally {
       await teardown();
     }

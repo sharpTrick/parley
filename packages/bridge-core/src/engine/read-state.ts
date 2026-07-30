@@ -63,6 +63,15 @@ export class ReadStateStore {
 
   /** Persist a new read position for a topic (atomic). */
   set(topic: Topic, cursor: Cursor): void {
+    // Screen with the same predicate load() applies. A plugin that hands back no `nextCursor` (or a
+    // numeric one) would otherwise DELETE this topic's stored position on the next flush, silently
+    // cold-restarting catch-up on the following boot instead of failing on the page that caused it.
+    if (typeof cursor !== 'string' || cursor.length === 0) {
+      throw new TypeError(
+        `read-state cursor for topic ${JSON.stringify(topic)} must be a non-empty string ` +
+          `(got ${JSON.stringify(cursor) ?? typeof cursor}); the backend returned no usable nextCursor`,
+      );
+    }
     this.state[topic] = cursor;
     this.pending.add(topic);
     this.flush();

@@ -267,6 +267,62 @@ describe('bridge attach ordering + rollback', () => {
       expect(plugin.disconnectCount).toBe(1);
     });
 
+    /**
+     * A teardown step that REJECTS is the case the table above cannot reach: every `post` behaviour
+     * it injects is swallowed by the best-effort presence beat. Latching the "already torn down"
+     * flag and then short-circuiting on the first rejection skipped `server.close()` forever and made
+     * every retry a silent no-op — on the stdio root that leaves stdin resumed, so an operator's
+     * signal handler awaiting shutdown() never returns. Cross the failing step with both teardown
+     * entry points and require, in every cell, that the OTHER steps still ran exactly once.
+     */
+    describe('a rejecting teardown step never cancels the others', () => {
+      const STEPS = ['plugin.disconnect', 'server.close', 'both'] as const;
+      const ENTRIES = ['shutdown()', 'the rollback inside a failed attach'] as const;
+
+      it.each(STEPS.flatMap((step) => ENTRIES.map((entry) => [step, entry] as const)))(
+        '%s rejects, torn down via %s',
+        async (step, entry) => {
+          const failingAttach = entry !== 'shutdown()';
+          const plugin = new RecordingPlugin(failingAttach ? { subscribeThrowsOn: 'ops' } : {});
+          if (step !== 'server.close') {
+            plugin.disconnect = (): Promise<void> => {
+              plugin.disconnectCount++;
+              return Promise.reject(new Error('disconnect boom'));
+            };
+          }
+          const cfg = parseConfig({
+            identity: { handle: 'agent' },
+            topics: ['ctx', 'ops'],
+            live_push: { enabled: failingAttach },
+            presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
+          });
+          const bridge = await buildBridge(plugin, cfg);
+          const closeSpy = vi.spyOn(bridge.server, 'close');
+          if (step !== 'plugin.disconnect') closeSpy.mockRejectedValue(new Error('close boom'));
+
+          const [, serverT] = InMemoryTransport.createLinkedPair();
+          const first = failingAttach
+            ? await within(TEARDOWN_BUDGET_MS, bridge.attach(serverT).catch((e: Error) => e.message))
+            : await (async () => {
+                await bridge.attach(serverT);
+                return within(TEARDOWN_BUDGET_MS, bridge.shutdown().then(() => 'resolved', (e: Error) => e.message));
+              })();
+
+          expect(first).not.toBe('TIMED OUT');
+          // Every step ran exactly once, whichever one of them rejected.
+          expect(plugin.disconnectCount).toBe(1);
+          expect(closeSpy).toHaveBeenCalledTimes(1);
+
+          // A retry is a no-op rather than a second release — and never hangs.
+          expect(
+            await within(TEARDOWN_BUDGET_MS, bridge.shutdown().then(() => 'resolved', () => 'rejected')),
+          ).not.toBe('TIMED OUT');
+          expect(plugin.disconnectCount).toBe(1);
+          expect(closeSpy).toHaveBeenCalledTimes(1);
+        },
+      );
+    });
+
     it('the sync-throw behaviour reaches the bridge as a real synchronous throw', () => {
       const plugin = new RecordingPlugin({ post: 'rejects synchronously' });
       expect(() => plugin.post(asTopic('ctx'), asHandle('agent'), 'x')).toThrow();

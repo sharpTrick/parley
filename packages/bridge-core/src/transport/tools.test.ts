@@ -10,7 +10,7 @@ import { asBackendMsgId, asCursor, asHandle, asTopic } from '../message.js';
 import { NoSuchTopicError, type FetchRecentArgs } from '../seam.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { registerTools, toolDepsFor } from './tools.js';
+import { MAX_FETCH_LIMIT, PRESENCE_FETCH_LIMIT, registerTools, toolDepsFor } from './tools.js';
 
 interface ToolText {
   content: Array<{ type: string; text: string }>;
@@ -372,8 +372,8 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
 
   it('flags truncated when the scanned presence history fills the page', async () => {
     const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
-    // Fill the fetch page (PRESENCE_FETCH_LIMIT = 500) so older offline peers could be clipped.
-    for (let i = 0; i < 500; i++) {
+    // Fill the fetch page so older offline peers could be clipped.
+    for (let i = 0; i < PRESENCE_FETCH_LIMIT; i++) {
       await postBeat(plugin, 'flood', ['ctx'], 'heartbeat', NOW - 1_000 - i);
     }
     const out = parse(
@@ -495,6 +495,43 @@ describe('post_topics regex patterns + presence reservation', () => {
       expect(res.content[0]!.text).toContain('topic not allowed');
     }
   });
+
+  /**
+   * A description is shipped to the model in the tool list, so a claim it makes is as load-bearing as
+   * the handler — and a claim only prose asserts drifts silently. Pair each one with the behaviour it
+   * describes in the SAME case, so neither half can move alone.
+   */
+  describe('the advertised allowlist matches what the handler accepts', () => {
+    it('a pattern advertised as "any topic fully matching" discloses the presence exception', async () => {
+      const { client } = await harness({ postPatterns: ['.*'] });
+      const { tools } = await client.listTools();
+      for (const name of ['parley_post', 'parley_fetch_recent'] as const) {
+        const description = tools.find((t) => t.name === name)!.description!;
+        expect(description).toContain('any topic fully matching regex ".*"');
+        expect(description).toMatch(/reserved presence topic/);
+      }
+    });
+
+    it('the unscoped roster reaches beyond the configured topics, as its `topic` field now says', async () => {
+      const { client, plugin } = await harness({ topics: ['ctx-mine'], postPatterns: ['ctx-.*'] });
+      await postBeat(plugin, 'pattern-only-peer', ['ctx-theirs'], 'hello', Date.now());
+      const out = parse(
+        await client.callTool({ name: 'parley_list_users', arguments: {} }),
+      ) as RosterResult;
+      // `ctx-theirs` is not a configured topic — only a pattern reaches it — yet the peer is listed.
+      expect(out.users.map((u) => u.handle)).toEqual(['pattern-only-peer']);
+
+      const { tools } = await client.listTools();
+      const props = tools.find((t) => t.name === 'parley_list_users')!.inputSchema.properties as Record<
+        string,
+        { description?: string }
+      >;
+      const topicField = props.topic?.description ?? '';
+      expect(topicField).toMatch(/either direction/);
+      // The claim the behaviour above contradicts. Its absence is the point of this case.
+      expect(topicField).not.toMatch(/default scope is the\s+configured topics/);
+    });
+  });
 });
 
 /**
@@ -552,6 +589,31 @@ describe('the fetch_recent description says what the handler does', () => {
 describe('every numeric tool argument is bounded before it reaches the backend', () => {
   const VALUES = [1, 100, 10_000, Number.MAX_SAFE_INTEGER];
 
+  // Both ceilings are shipped defaults no caller can override, and every case around them derives
+  // its probe from the constant — so a silent shrink would move the whole table with it. Pin the
+  // two by VALUE as well, and grade the fetch cap AT its boundary rather than only above it: a
+  // one-sided "<= cap" is satisfied by a handler that clamps everything to 1.
+  it('pins the shipped ceilings', () => {
+    expect([MAX_FETCH_LIMIT, PRESENCE_FETCH_LIMIT]).toEqual([1_000, 500]);
+  });
+
+  it.each([
+    ['one under the cap', MAX_FETCH_LIMIT - 1, MAX_FETCH_LIMIT - 1],
+    ['at the cap', MAX_FETCH_LIMIT, MAX_FETCH_LIMIT],
+    ['one over the cap', MAX_FETCH_LIMIT + 1, MAX_FETCH_LIMIT],
+    ['far over the cap', MAX_FETCH_LIMIT * 1_000, MAX_FETCH_LIMIT],
+  ])('parley_fetch_recent limit %s reaches the backend as %i', async (_label, asked, expected) => {
+    const { client, plugin } = await harness();
+    const seen: FetchRecentArgs[] = [];
+    const orig = plugin.fetchRecent.bind(plugin);
+    plugin.fetchRecent = async (a: FetchRecentArgs) => {
+      seen.push(a);
+      return orig(a);
+    };
+    await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: asked } });
+    expect(seen.map((c) => c.limit)).toEqual([expected]);
+  });
+
   it.each(VALUES)('parley_fetch_recent with limit=%d and block_ms=%d', async (value) => {
     const { client, plugin } = await harness({ blockMaxMs: 40, blockPollIntervalMs: 20 });
     const seen: FetchRecentArgs[] = [];
@@ -596,8 +658,8 @@ describe('every numeric tool argument is bounded before it reaches the backend',
     ) as RosterResult;
 
     // The roster's cost is fixed by the presence page, whatever the caller asks for.
-    for (const call of seen) expect(call.limit).toBe(500);
-    expect(out.users.length).toBeLessThanOrEqual(Math.min(value, 500));
+    for (const call of seen) expect(call.limit).toBe(PRESENCE_FETCH_LIMIT);
+    expect(out.users.length).toBeLessThanOrEqual(Math.min(value, PRESENCE_FETCH_LIMIT));
   });
 });
 
