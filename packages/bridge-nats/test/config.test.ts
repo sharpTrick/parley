@@ -2,10 +2,17 @@ import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { connect, nkeys, type ConnectionOptions } from 'nats';
+import {
+  connect,
+  credsAuthenticator,
+  nkeyAuthenticator,
+  nkeys,
+  type ConnectionOptions,
+} from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { captures, NatsPlugin } from '../src/index.js';
+import { captures, NatsPlugin, plaintextRemoteServer } from '../src/index.js';
 import { fakeJetStream, injectFake } from './fake-jetstream.js';
+import { declaredConfigKeys, legalStreamName, legalSubject } from './helpers.js';
 
 // Class 1: every backend_config field the docs promise is actually honoured by the driver, and no
 // secret value is echoed back out. A credential the plugin silently drops means the operator
@@ -27,6 +34,10 @@ vi.mock('nats', async (importOriginal) => {
       close: async () => undefined,
       isClosed: () => false,
     })),
+    // Wrapped, not replaced: `typeof o.authenticator === 'function'` is true of either factory's
+    // output, so WHICH one ran is the only observable that can grade a documented precedence.
+    credsAuthenticator: vi.fn(actual.credsAuthenticator),
+    nkeyAuthenticator: vi.fn(actual.nkeyAuthenticator),
   };
 });
 
@@ -199,13 +210,6 @@ describe('nats backend_config — documented connection fields reach the driver'
   // placement is what the character list cannot see — every character of `parley..` is allowed, and
   // the empty token it composes is not a subject any server will accept.
   const PROBE = 'topic';
-  const CONTROL = new RegExp('[\\u0000-\\u001f\\u007f]');
-  const legalSubject = (name: string): boolean =>
-    name.length > 0 &&
-    name.split('.').every((token) => token.length > 0 && !/[*>\s]/.test(token) && !CONTROL.test(token));
-  const legalStreamName = (name: string): boolean =>
-    name.length > 0 && !/[.*>/\\\s]/.test(name) && !CONTROL.test(name);
-
   const composedCases = ['', 'a', 'a.', 'a.b', 'a.b.c.', '.', '..', '.a.', 'a..', 'a..b.', 'a.b..c.'];
 
   for (const field of ['subject_prefix', 'stream_prefix'] as const) {
@@ -373,6 +377,256 @@ describe('nats backend_config — documented connection fields reach the driver'
       expect((err as Error).stack ?? '').not.toContain(SECRET);
     });
   }
+});
+
+// Class: a backend_config key the plugin does not recognise is silently ignored. Every field here is
+// either a credential or an addressing decision, so the silence is expensive in both directions: a
+// misspelled `token` connects anonymously while the operator believes the cluster is authenticated,
+// and a misspelled `subject_prefix` addresses a different stream than the sibling session it was
+// meant to share with. The near misses are generated off the declared interface rather than listed,
+// so a field added later is policed by default. The `cases` table above is the neighbouring test
+// that cannot reach this: every row spells its key correctly.
+describe('nats backend_config — an unrecognised key is refused, not dropped', () => {
+  beforeEach(() => {
+    vi.mocked(connect).mockClear();
+  });
+
+  const declared = declaredConfigKeys();
+  const nearMisses = (key: string): string[] => [
+    key.slice(0, -1),
+    `${key.slice(0, -2)}${key.at(-1) ?? ''}${key.at(-2) ?? ''}`,
+    `${key}s`,
+    key.toUpperCase(),
+  ];
+
+  const typos = [...new Set(declared.flatMap(nearMisses))].filter((t) => !declared.includes(t));
+
+  it('generates a near miss for every declared key', () => {
+    expect(declared).toContain('nkey_seed');
+    expect(typos).toContain('tokens');
+    expect(typos.length).toBeGreaterThanOrEqual(declared.length * 3);
+  });
+
+  for (const typo of typos) {
+    it(`refuses backend_config.${typo}, naming the key, before connecting`, async () => {
+      const plugin = new NatsPlugin();
+
+      const err = await plugin
+        .connect({ servers: '127.0.0.1:4222', [typo]: 'x' })
+        .then(() => undefined, (e: unknown) => e);
+
+      expect(String(err)).toContain(typo);
+      expect(vi.mocked(connect)).not.toHaveBeenCalled();
+    });
+  }
+
+  it('accepts a config that sets every declared key at once', async () => {
+    const full: Record<string, unknown> = {
+      servers: '127.0.0.1:4222',
+      subject_prefix: 'parley.',
+      stream_prefix: 'PARLEY_',
+      retention_days: 30,
+      token: SECRET,
+      user: 'alice',
+      pass: SECRET,
+      creds_file: credsPath,
+      nkey_seed: seed,
+      tls: { ca_file: '/tmp/ca.pem' },
+    };
+    expect(Object.keys(full).sort()).toEqual([...declared].sort());
+
+    const plugin = new NatsPlugin();
+    await plugin.connect(full);
+    await plugin.disconnect();
+    expect(vi.mocked(connect)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Class: a documented precedence between two config fields that can both be set. Both auth
+// factories return a function, so `typeof o.authenticator === 'function'` holds whichever one ran —
+// the assertion has to be on WHICH credential reached the driver. One row per pair of credential
+// groups, with the groups derived from the declared interface, so a new auth field arrives with no
+// declared outcome rather than silently untested.
+describe('nats auth precedence — which credential reaches the driver when two are set', () => {
+  beforeEach(() => {
+    vi.mocked(connect).mockClear();
+    vi.mocked(credsAuthenticator).mockClear();
+    vi.mocked(nkeyAuthenticator).mockClear();
+  });
+
+  const groups = {
+    token: { fields: ['token'], config: { token: SECRET }, reached: () => captured().token === SECRET },
+    'user/pass': {
+      fields: ['user', 'pass'],
+      config: { user: 'alice', pass: SECRET },
+      reached: () => captured().user === 'alice' && captured().pass === SECRET,
+    },
+    creds_file: {
+      fields: ['creds_file'],
+      config: { creds_file: credsPath },
+      reached: () => vi.mocked(credsAuthenticator).mock.calls.length === 1,
+    },
+    nkey_seed: {
+      fields: ['nkey_seed'],
+      config: { nkey_seed: seed },
+      reached: () => vi.mocked(nkeyAuthenticator).mock.calls.length === 1,
+    },
+  } as const;
+
+  type Group = keyof typeof groups;
+  const names = Object.keys(groups) as Group[];
+
+  it('every declared credential field belongs to exactly one group', () => {
+    const NON_AUTH = ['servers', 'subject_prefix', 'stream_prefix', 'retention_days', 'tls'];
+    const grouped = names.flatMap((n) => [...groups[n].fields]);
+    expect([...grouped, ...NON_AUTH].sort()).toEqual([...declaredConfigKeys()].sort());
+  });
+
+  // `wins` names the groups whose credential must still reach the driver with both set. NATS itself
+  // arbitrates a token against user/pass, so those pairs are both-reach; the README promises
+  // creds_file over nkey_seed, and that is the one pair with a loser.
+  const pairs: { a: Group; b: Group; wins: Group[] }[] = [];
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      const a = names[i] as Group;
+      const b = names[j] as Group;
+      const exclusive = a === 'creds_file' && b === 'nkey_seed';
+      pairs.push({ a, b, wins: exclusive ? [a] : [a, b] });
+    }
+  }
+
+  it('covers every pair of credential groups', () => {
+    expect(pairs).toHaveLength((names.length * (names.length - 1)) / 2);
+  });
+
+  for (const pair of pairs) {
+    it(`${pair.a} + ${pair.b} both set: ${pair.wins.join(' and ')} reach${pair.wins.length === 1 ? 'es' : ''} the driver`, async () => {
+      const plugin = new NatsPlugin();
+      await plugin.connect({ ...groups[pair.a].config, ...groups[pair.b].config });
+
+      const reached = [pair.a, pair.b].filter((g) => groups[g].reached());
+      expect(reached).toEqual(pair.wins);
+      await plugin.disconnect();
+    });
+  }
+});
+
+// Class: a credential-bearing config that would put the secret on an unencrypted remote link must
+// SAY SO. A NATS credential rides the CONNECT frame of the first round trip, and nats.js upgrades a
+// `nats://` link only when `tls` asks it to — so this is not refused (a loopback fixture and a
+// TLS-terminating sidecar are both legitimate), it is reported. The table crosses every dimension
+// that can independently flip the answer: the scheme, the host's class, whether `tls` is set, and
+// whether there is a secret to expose at all. The `never echoes the secret` rows below are the
+// neighbouring test that cannot reach this: they grade the failure message, not the transport.
+describe('nats transport safety — a credential on an unencrypted remote link warns', () => {
+  const warningsFrom = async (config: Record<string, unknown>): Promise<string[]> => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const plugin = new NatsPlugin();
+      await plugin.connect(config);
+      await plugin.disconnect();
+      return warn.mock.calls.map((c) => String(c[0]));
+    } finally {
+      warn.mockRestore();
+    }
+  };
+
+  const PLAINTEXT_SCHEMES = ['nats://', 'ws://', ''];
+  const ENCRYPTED_SCHEMES = ['tls://', 'wss://'];
+  const LOOPBACK_HOSTS = ['127.0.0.1:4222', 'localhost:4222', '[::1]:4222', '127.0.0.44'];
+  // Hosts that read as loopback to a prefix or substring match but are ordinary registrable names
+  // their owner points wherever they like, plus two integer spellings of 127.0.0.1.
+  const LOOKALIKE_HOSTS = ['127.0.0.1.evil.com', 'localhost.evil.com', '2130706433', '0177.0.0.1'];
+  const REMOTE_HOSTS = ['nats.example.com:4222', '203.0.113.9:4222', ...LOOKALIKE_HOSTS];
+
+  it('the plaintext scheme set is exactly nats://, ws:// and a bare host:port', () => {
+    for (const scheme of PLAINTEXT_SCHEMES) {
+      expect(plaintextRemoteServer(`${scheme}remote.example:4222`)).toBeDefined();
+    }
+    for (const scheme of ENCRYPTED_SCHEMES) {
+      expect(plaintextRemoteServer(`${scheme}remote.example:4222`)).toBeUndefined();
+    }
+  });
+
+  it.each(LOOKALIKE_HOSTS)('%s is classified remote, not loopback', (host) => {
+    expect(plaintextRemoteServer(`nats://${host}`)).toBeDefined();
+  });
+
+  const cells: { server: string; secret: boolean; tls: boolean; warns: boolean }[] = [];
+  for (const [schemes, plaintext] of [
+    [PLAINTEXT_SCHEMES, true],
+    [ENCRYPTED_SCHEMES, false],
+  ] as const) {
+    for (const scheme of schemes) {
+      for (const [hosts, loopback] of [
+        [LOOPBACK_HOSTS, true],
+        [REMOTE_HOSTS, false],
+      ] as const) {
+        for (const host of hosts) {
+          for (const secret of [true, false]) {
+            for (const tls of [true, false]) {
+              cells.push({
+                server: `${scheme}${host}`,
+                secret,
+                tls,
+                warns: plaintext && !loopback && secret && !tls,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  it.each(cells)(
+    'servers $server (secret $secret, tls $tls) warns as documented',
+    async ({ server, secret, tls, warns }) => {
+      const warned = await warningsFrom({
+        servers: server,
+        ...(secret ? { token: SECRET } : {}),
+        ...(tls ? { tls: { ca_file: '/tmp/ca.pem' } } : {}),
+      });
+
+      expect(warned).toHaveLength(warns ? 1 : 0);
+      for (const line of warned) {
+        expect(line).toContain('parley-nats');
+        expect(line).toContain(server);
+        expect(line).toContain('token');
+        expect(line).not.toContain(SECRET);
+      }
+    },
+  );
+
+  // Every field that IS a credential has to be named by the warning; a field that is not must not
+  // raise one on its own. Derived from the same `cases` table the pass-through rows use, so a new
+  // auth field is unpoliced-by-default rather than silently exempt.
+  const credentialKeys = ['token', 'user', 'pass', 'creds_file', 'nkey_seed'];
+
+  it('every documented auth field is one of the credentials this warning knows about', () => {
+    for (const key of credentialKeys) expect(declaredConfigKeys()).toContain(key);
+  });
+
+  it.each(cases)('$name on a remote plaintext server names the field it would expose', async (c) => {
+    const exposed = Object.keys(c.config).filter((k) => credentialKeys.includes(k));
+    const warned = await warningsFrom({ ...c.config, servers: 'nats://nats.example.com:4222' });
+
+    expect(warned).toHaveLength(exposed.length === 0 ? 0 : 1);
+    for (const field of exposed) expect(warned[0]).toContain(field);
+    for (const line of warned) expect(line).not.toContain(SECRET);
+  });
+
+  it('warns once per offending entry when servers is a list', async () => {
+    const warned = await warningsFrom({
+      servers: ['nats://127.0.0.1:4222', 'nats://a.example.com:4222', 'tls://b.example.com:4222', 'nats://c.example.com:4222'],
+      token: SECRET,
+    });
+
+    expect(warned).toHaveLength(2);
+    expect(warned.map((l) => (/servers "([^"]+)"/.exec(l) ?? [])[1])).toEqual([
+      'nats://a.example.com:4222',
+      'nats://c.example.com:4222',
+    ]);
+  });
 });
 
 // Class: a decision function reachable only through a rarely-configured path. `captures` is what

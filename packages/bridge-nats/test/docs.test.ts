@@ -108,16 +108,81 @@ describe('nats docs conformance', () => {
     );
   });
 
-  it('README documents the backendMsgId shape the code actually mints', () => {
+  // The cursor and the backendMsgId are the SAME minted value, so a surface describing them
+  // differently is not imprecision — it is a claim about a distinction the minter does not make, and
+  // a reader who believes it writes a bare decimal `since` and is served the newest window instead
+  // of resuming. Graded on all three published surfaces at once, so a future rename of the shape
+  // reddens every surface rather than only the one somebody remembered.
+  const minted = (): { cursor: string; id: string; shape: string } => {
     const plugin = new NatsPlugin() as unknown as {
       incarnations: Map<string, string>;
       streamName: (t: Topic) => string;
       msgId: (t: Topic, seq: number) => string;
+      cursorAt: (stream: string, seq: number) => string;
     };
     const topic = asTopic('deploys');
-    plugin.incarnations.set(plugin.streamName(topic), '20260101T000000Z');
-    expect(plugin.msgId(topic, 42)).toBe('20260101T000000Z-42');
-    expect(readme).toContain('`<stream incarnation>-<sequence>`');
+    const stream = plugin.streamName(topic);
+    plugin.incarnations.set(stream, '20260101T000000Z');
+    return {
+      cursor: String(plugin.cursorAt(stream, 42)),
+      id: plugin.msgId(topic, 42),
+      shape: '<stream incarnation>-<sequence>',
+    };
+  };
+
+  it('mints one value for both the cursor and the backendMsgId', () => {
+    const { cursor, id } = minted();
+    expect(cursor).toBe('20260101T000000Z-42');
+    expect(id).toBe(cursor);
+  });
+
+  /**
+   * What a surface says a value IS, in the `<something> as the <role>` shape npm prose uses. The
+   * noun phrase stops at a conjunction, so a claim about one role cannot swallow the other's.
+   */
+  const roleClaim = (text: string, role: string): string | undefined =>
+    new RegExp(`(?<![-\\w])((?:(?!\\b(?:as|and|or)\\b)[\\w-]+ ){0,6}[\\w-]+) as (?:the )?${role}\\b`, 'i')
+      .exec(text)?.[1]
+      ?.trim()
+      .toLowerCase();
+
+  const shapeSurfaces = [
+    { name: 'README.md', text: readme },
+    { name: 'the npm description', text: manifest.description },
+    { name: 'src/index.ts', text: sources.find((f) => f.name === 'index.ts')?.text ?? '' },
+  ];
+
+  for (const surface of shapeSurfaces) {
+    it(`${surface.name} names both roles and the incarnation qualification the minter applies`, () => {
+      expect(surface.text.toLowerCase()).toContain('incarnation');
+      expect(surface.text).toContain('cursor');
+      expect(surface.text).toContain('backendMsgId');
+    });
+
+    it(`${surface.name} does not describe the cursor and the backendMsgId as different values`, () => {
+      const cursorClaim = roleClaim(surface.text, 'cursor');
+      const idClaim = roleClaim(surface.text, 'backendMsgId');
+      if (cursorClaim === undefined || idClaim === undefined) return;
+      expect({ cursorClaim, idClaim }).toEqual({ cursorClaim, idClaim: cursorClaim });
+    });
+  }
+
+  it('README documents the shape in both mapping rows', () => {
+    const { shape } = minted();
+    expect(readme.match(new RegExp(`\`${shape}\``, 'g')) ?? []).toHaveLength(2);
+  });
+
+  it('the differing-claim check reads a contrast and spares a shared one', () => {
+    const drifted =
+      'the per-topic stream sequence as the cursor and an incarnation-qualified sequence as the backendMsgId';
+    expect(roleClaim(drifted, 'cursor')).toBe('the per-topic stream sequence');
+    expect(roleClaim(drifted, 'backendMsgId')).toBe('an incarnation-qualified sequence');
+    expect(roleClaim(drifted, 'cursor')).not.toBe(roleClaim(drifted, 'backendMsgId'));
+
+    const shared =
+      'an incarnation-qualified sequence as the cursor, and an incarnation-qualified sequence as the backendMsgId';
+    expect(roleClaim(shared, 'cursor')).toBe('an incarnation-qualified sequence');
+    expect(roleClaim(shared, 'backendMsgId')).toBe(roleClaim(shared, 'cursor'));
   });
 
   // A stated SYMPTOM is a claim like any other, and the wrong symptom is worse than none: an operator

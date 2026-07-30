@@ -15,6 +15,7 @@ import {
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
+import { isLoopbackHost } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import {
   AckPolicy,
@@ -174,6 +175,7 @@ export class NatsPlugin implements BackendPlugin {
           'reconnect loop keeps its socket alive with no way for the caller to reclaim it',
       );
     }
+    assertKnownConfigKeys(config);
     const cfg = config as NatsBackendConfig;
     const subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/);
     const streamPrefix = validatePrefix(
@@ -184,6 +186,8 @@ export class NatsPlugin implements BackendPlugin {
       MAX_STREAM_NAME_BYTES,
     );
     const retentionDays = validateRetentionDays(cfg.retention_days);
+    // Report on stderr, NEVER stdout, so that cli.ts's JSON-RPC channel stays parseable.
+    for (const risk of plaintextCredentialRisks(cfg)) console.warn(`[parley-nats] SECURITY: ${risk}`);
     this.connecting = true;
     let nc: NatsConnection;
     let jsm: JetStreamManager;
@@ -299,6 +303,7 @@ export class NatsPlugin implements BackendPlugin {
   // Keep this `async`, so that a rejected `since` REJECTS: a synchronous throw out of a
   // Promise-returning seam method escapes every caller that only wrote `.catch()`.
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    const limit = normalizeLimit(args.limit, args.topic);
     const since = parseCursor(args.since);
     // Keep the deadline out here: the wait for an absent stream and the read itself are two stages
     // of ONE budget, and a deadline minted inside either hands the other a fresh one.
@@ -306,7 +311,7 @@ export class NatsPlugin implements BackendPlugin {
     const info = await this.streamForRead(args, deadline);
     if (info === undefined) return absentTopicPage(args);
     try {
-      return await this.readRecent(args, since, deadline, info);
+      return await this.readRecent(args, since, deadline, info, limit);
     } catch (err) {
       // A stream that vanished mid-read is the absent topic again, and a read must not put it back:
       // re-provisioning here is what let a caller-named topic spend the cluster's stream budget.
@@ -375,9 +380,9 @@ export class NatsPlugin implements BackendPlugin {
     since: ParsedCursor | undefined,
     deadline: number,
     info: StreamInfo,
+    limit: number,
   ): Promise<FetchRecentResult> {
     const stream = this.streamName(args.topic);
-    const limit = args.limit ?? 100;
     const lastSeq = info.state.last_seq;
     const firstSeq = info.state.first_seq;
     // A cursor minted by a DIFFERENT incarnation names a sequence of a stream that no longer
@@ -909,6 +914,57 @@ function parseCursor(since: Cursor | undefined): ParsedCursor | undefined {
   return parts[1] === undefined ? { seq } : { incarnation: parts[1], seq };
 }
 
+const DEFAULT_PAGE = 100;
+
+const describeValue = (v: unknown): string =>
+  typeof v === 'string' ? JSON.stringify(v) : String(v);
+
+/**
+ * A page size below 1 — or one that is not a number at all — makes every window this read computes
+ * empty, and an empty page still mints a cursor. Reject it here, before any cursor exists: a
+ * `nextCursor` core persists for a page it was never going to be given is silent, permanent loss of
+ * everything under it.
+ */
+function normalizeLimit(limit: number | undefined, topic: Topic): number {
+  if (limit === undefined) return DEFAULT_PAGE;
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(
+      `invalid nats limit ${describeValue(limit)} for topic ${JSON.stringify(String(topic))} — ` +
+        'expected an integer of at least 1',
+    );
+  }
+  return limit;
+}
+
+const CONFIG_KEYS = [
+  'servers',
+  'subject_prefix',
+  'stream_prefix',
+  'retention_days',
+  'token',
+  'user',
+  'pass',
+  'creds_file',
+  'nkey_seed',
+  'tls',
+] as const satisfies readonly (keyof NatsBackendConfig)[];
+
+/**
+ * A key this plugin does not read is a key it silently drops, and every field here is either a
+ * credential or an addressing decision: a misspelled `token` connects anonymously, a misspelled
+ * `subject_prefix` addresses a different stream than the sibling instance the operator meant to
+ * share with. Refuse at connect(), naming the offender, rather than honouring the default.
+ */
+function assertKnownConfigKeys(config: BackendConfig): void {
+  for (const key of Object.keys(config)) {
+    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `parley-nats: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
+      );
+    }
+  }
+}
+
 /** Stands in for a topic token, so a prefix is judged by the name it actually composes. */
 const PROBE_TOKEN = 'topic';
 
@@ -1041,9 +1097,66 @@ function isStreamMissing(err: unknown): boolean {
   return /stream not found|no responders|503/i.test(msg);
 }
 
+/** The schemes nats.js opens unencrypted. A bare `host:port` is one of them — it reads as `nats:`. */
+const PLAINTEXT_SCHEMES = ['nats:', 'ws:'];
+/** Where nats.js connects when `backend_config.servers` is unset. */
+const DEFAULT_SERVERS = '127.0.0.1:4222';
+
+/**
+ * The server as written when it would carry the CONNECT frame's credential in the clear, else
+ * undefined. nats.js upgrades a `nats://`/`ws://` link only when `backend_config.tls` asks it to or
+ * the server refuses to go on without it, and it sends `token`/`user`/`pass` in the first frame
+ * either way — so a plaintext scheme to a host we cannot PROVE is loopback is a credential on the
+ * wire. Keep an unparseable server on the warned side, so that an address this cannot classify is
+ * reported rather than excused.
+ */
+export function plaintextRemoteServer(server: string): string | undefined {
+  const text = server.trim();
+  const scheme = /^([a-z][a-z0-9+.-]*:)\/\//i.exec(text)?.[1]?.toLowerCase();
+  if (scheme !== undefined && !PLAINTEXT_SCHEMES.includes(scheme)) return undefined;
+  // Keep the authority split by hand rather than through `URL`, so that every scheme is classified
+  // by the same rules: `URL` canonicalizes an integer-form IPv4 host for `ws:` and leaves it alone
+  // for `nats:`, which would excuse under one scheme exactly what it warns about under the other.
+  const authority = scheme === undefined ? text : text.slice(scheme.length + 2);
+  const host = (/^([^/?#]*)/.exec(authority)?.[1] ?? '')
+    .replace(/^[^@]*@/, '')
+    .replace(/^(\[[^\]]*]):\d+$/, '$1')
+    .replace(/^([^:[]*):\d+$/, '$1')
+    .toLowerCase();
+  return host !== '' && isLoopbackHost(host) ? undefined : text;
+}
+
+/** Which `backend_config` fields would cross the link, named — never their values. */
+const credentialFields = (cfg: NatsBackendConfig): string[] =>
+  (['token', 'user', 'pass', 'creds_file', 'nkey_seed'] as const).filter(
+    (field) => cfg[field] !== undefined,
+  );
+
+/**
+ * One warning per `servers` entry that would put a configured credential on an unencrypted remote
+ * link. A warning rather than a load error: a cluster fronted by a TLS-terminating sidecar, and a
+ * loopback fixture, are both legitimate — but neither is a reason for the mistake to be silent.
+ */
+function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
+  const fields = credentialFields(cfg);
+  if (fields.length === 0 || cfg.tls !== undefined) return [];
+  const servers = [cfg.servers ?? DEFAULT_SERVERS].flat();
+  return servers.flatMap((server) => {
+    const plaintext = plaintextRemoteServer(String(server));
+    return plaintext === undefined
+      ? []
+      : [
+          `backend_config.servers ${JSON.stringify(plaintext)} is an unencrypted NATS scheme to a ` +
+            'non-loopback host and backend_config.tls is unset, so the CONNECT frame carries ' +
+            `backend_config.${fields.join('/')} across the network in the clear. Use tls:// (or ` +
+            'wss://), or set backend_config.tls.',
+        ];
+  });
+}
+
 function connectionOptions(cfg: NatsBackendConfig): ConnectionOptions {
   const opts: ConnectionOptions = {
-    servers: cfg.servers ?? '127.0.0.1:4222',
+    servers: cfg.servers ?? DEFAULT_SERVERS,
     // Keep the unbounded reconnect: nats.js defaults to 10 attempts, after which the connection
     // CLOSES for good — every later post/fetch throws CONNECTION_CLOSED and live delivery stops.
     maxReconnectAttempts: -1,
@@ -1068,6 +1181,9 @@ function connectionOptions(cfg: NatsBackendConfig): ConnectionOptions {
   return opts;
 }
 
-// Subject tokens may not contain `.`, `*`, `>`, or whitespace; stream names also bar `/ \`.
-const sanitizeToken = (s: string): string => s.replace(/[.*>\s]/g, '_');
-const sanitizeName = (s: string): string => s.replace(/[.*>/\\\s]/g, '_');
+// Subject tokens may not contain `.`, `*`, `>`, whitespace or a control character; stream names
+// also bar `/ \`. Keep the control range folded here as well as rejected in `validatePrefix`, so
+// that a topic — which a caller names through `post_topics`, unlike a prefix an operator writes —
+// cannot compose a name the JetStream API answers with an unparseable frame.
+const sanitizeToken = (s: string): string => s.replace(/[.*>\s\u0000-\u001f\u007f]/g, '_');
+const sanitizeName = (s: string): string => s.replace(/[.*>/\\\s\u0000-\u001f\u007f]/g, '_');

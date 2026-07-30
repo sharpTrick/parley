@@ -67,8 +67,10 @@ limit — an outage longer than the driver's default budget must not permanently
 
 ### Topic → subject / stream names
 
-NATS subject tokens may not contain `.`, `*`, `>` or whitespace, and stream names also bar `/` and
-`\`. Those characters fold to `_` — and because that fold is many-to-one, a folded name also carries
+NATS subject tokens may not contain `.`, `*`, `>`, whitespace or a control character, and stream
+names also bar `/` and `\`. A topic is named by a *caller* — `post_topics` is a regex over names an
+untrusted inbound message can choose — so all of those fold to `_` here rather than reaching the
+server inside a name it cannot parse. Because that fold is many-to-one, a folded name also carries
 a `-<sha1-10>` suffix over the raw topic so two distinct topics can never collide onto one stream.
 Topics that are already legal are used verbatim:
 
@@ -113,6 +115,12 @@ backend_config:
 
 `creds_file` wins over `nkey_seed` when both are set. See "Topic → subject / stream names" above for
 how a topic is folded onto a subject and a stream.
+
+A NATS credential travels in the CONNECT frame of the very first round trip, and `nats://` (or a
+bare `host:port`, which means the same thing) is an unencrypted link. So a credential pointed at a
+non-loopback host with no `tls:` block is on the wire in the clear: `connect()` warns on stderr,
+naming the server and which field it would expose — never its value. Use `tls://`/`wss://`, or set
+`tls:`. A loopback server is not warned about.
 
 ## Retention (optional)
 

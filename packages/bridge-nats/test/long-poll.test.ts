@@ -36,17 +36,53 @@ describe('nats long-poll honours its budget from both sides', () => {
   }
 });
 
-// Class: a caller-supplied deadline computed INSIDE a closure a retry re-runs is minted afresh by
-// that retry, so the caller is served the budget once per attempt. The read path re-enters itself
-// wherever `withStream` can see a stream that vanished out-of-band, and every such point is late
-// enough in a long-poll to double it — the budget above is only a bound while nothing retries.
-describe('nats long-poll keeps its budget across a stream that vanishes mid-poll', () => {
+// Class: ONE budget spent across BOTH stages of a read. `fetchRecent` waits for an absent stream and
+// then waits in the pull, and a deadline minted inside either stage hands the other a fresh one —
+// which serves a caller's `block_ms` once per stage, invisibly, in the result. The rows above cannot
+// see it: they spend the whole budget in the pull, with the stream present from the first call.
+describe('nats long-poll spends ONE budget across the absent-stream wait and the pull', () => {
+  const budgets = [500, 1000, 2000];
+  const appearances = [0.5, 0.9];
+
+  for (const budget of budgets) {
+    for (const fraction of appearances) {
+      it(`a stream created ${fraction * 100}% into a ${budget}ms budget still returns within it`, async () => {
+        const fake = fakeJetStream({ records: [], expiryMs: PULL_EXPIRY_MS, streamAbsent: true });
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake, TOPIC);
+        const appears = setTimeout(() => {
+          fake.state.streamAbsent = false;
+        }, Math.round(budget * fraction));
+
+        try {
+          const started = Date.now();
+          const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: budget });
+          const elapsed = Date.now() - started;
+
+          expect(page.messages).toEqual([]);
+          expect(fake.state.streamAbsent).toBe(false);
+          expect(elapsed).toBeGreaterThanOrEqual(budget * 0.5);
+          expect(elapsed).toBeLessThan(budget * 1.2);
+        } finally {
+          clearTimeout(appears);
+          await plugin.disconnect();
+        }
+      }, 20_000);
+    }
+  }
+});
+
+// Class: a stream removed out-of-band DURING a long-poll is the absent topic again, and answering it
+// must neither re-provision the stream nor spend a second budget doing so. The lower bound here comes
+// from the injected removal time, not from the plugin's patience — the budget's floor is graded by
+// the rows above.
+describe('nats long-poll answers a stream that vanishes mid-poll without overrunning its budget', () => {
   const vanishPoints = ['consumers.add', 'consumers.get', 'fetch'] as const;
   const budgets = [500, 1000, 2000];
 
   for (const point of vanishPoints) {
     for (const budget of budgets) {
-      it(`a stream removed at ${point}, ${budget}ms budget: the retry inherits the caller's deadline`, async () => {
+      it(`a stream removed at ${point}, ${budget}ms budget: returns the absent-topic page in budget`, async () => {
         const fake = fakeJetStream({
           records: [],
           expiryMs: PULL_EXPIRY_MS,

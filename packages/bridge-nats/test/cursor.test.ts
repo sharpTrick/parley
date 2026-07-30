@@ -104,6 +104,76 @@ describe('nats cursor integrity — a short read must not skip what it did not r
     expect(page.nextCursor).toBe(page.messages[1].cursor);
   });
 
+  // The same class from the ARGUMENT side. A `limit` below 1 (or one that is not an integer) makes
+  // every window this read computes empty, and an empty page still mints a cursor — one that sits at
+  // the topic's tail, i.e. silent permanent loss of everything under it. So the contract is that an
+  // out-of-contract argument REJECTS naming itself, before the read has created anything at all.
+  // Crossed with every read shape, because each mints its cursor down a different branch. The
+  // window.test.ts `positions` table is the neighbouring test that cannot reach this: its `limit`
+  // is only ever undefined, 2 or 3.
+  const badLimits = [
+    0,
+    -1,
+    -100,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+  ];
+
+  for (const shape of shapes) {
+    for (const limit of badLimits) {
+      it(`${shape.mode}, limit ${limit}: rejects naming the argument and reads nothing`, async () => {
+        const { plugin, fake } = makePlugin(shape.init);
+
+        await expect(plugin.fetchRecent({ ...shape.args(), limit })).rejects.toThrow(/limit/);
+        expect({ created: fake.state.created, added: fake.state.addCalls }).toEqual({
+          created: [],
+          added: 0,
+        });
+      });
+    }
+  }
+
+  // The other half of the same contract: a limit that IS in contract must not be refused, and the
+  // page it returns must still be lossless. Without these rows a plugin could pass every row above
+  // by rejecting every read. A since-LESS page is the newest `limit` messages by definition
+  // (seam.ts §6), so a truncating limit legitimately puts the older ones out of reach there and
+  // nowhere else.
+  const goodLimits = [1, 2, 5, 100, 2 ** 53];
+
+  for (const shape of shapes) {
+    for (const limit of goodLimits) {
+      it(`${shape.mode}, limit ${limit}: the page plus its replay is still complete`, async () => {
+        const { plugin, fake } = makePlugin(shape.init);
+        const newestWindow = shape.args().since === undefined;
+
+        const page = await plugin.fetchRecent({ ...shape.args(), limit });
+        const returned = page.messages.map((m) => m.content);
+        expect(returned.length).toBeLessThanOrEqual(limit);
+        const replayed = await replayFrom(plugin, fake, TOPIC, page.nextCursor);
+
+        expect([...returned, ...replayed]).toEqual(
+          newestWindow ? shape.expected.slice(-limit) : shape.expected,
+        );
+      }, 20_000);
+    }
+  }
+
+  // `blockMs` is a HINT the seam lets a plugin ignore, so a degenerate one is not an error — but it
+  // must not become a fabricated cursor either. These rows pin the outcome the seam does demand.
+  for (const blockMs of [-1, Number.NaN, Number.NEGATIVE_INFINITY]) {
+    it(`a degenerate blockMs of ${blockMs} returns the window with a cursor that replays losslessly`, async () => {
+      const { plugin, fake } = makePlugin();
+
+      const page = await plugin.fetchRecent({ topic: TOPIC, blockMs });
+      const returned = page.messages.map((m) => m.content);
+      const replayed = await replayFrom(plugin, fake, TOPIC, page.nextCursor);
+
+      expect([...returned, ...replayed]).toEqual(ALL);
+    });
+  }
+
   // The same class over a link whose every round trip costs real time. A page truncated because the
   // plugin ran out of patience is indistinguishable, in the result, from a page that read its whole
   // window — so the completeness of `returned + replayed` is what has to hold at every latency.
