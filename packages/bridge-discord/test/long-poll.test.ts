@@ -1,10 +1,11 @@
 import { asCursor, asTopic, fetchRecentBlocking } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// A `block_ms` fetch may only WAIT on the gateway while the gateway can actually wake it. In every
-// other transport state the plugin has to hand back its immediate page so core's poll fallback
-// owns the wait — otherwise one tool call sleeps its whole budget on a socket that cannot deliver,
-// on a backend whose REST half is perfectly healthy. The table below is over that transport state.
+// CLASS: a plugin-level table whose assertions are satisfied by a core-level fallback. Every cell
+// here that is about the PLUGIN's waiter drives `plugin.fetchRecent` DIRECTLY, because core's
+// `fetchRecentBlocking` re-queries every 250 ms and therefore returns the message whether or not
+// the plugin ever armed a waiter — a table routed through it stays green with the whole native
+// long-poll deleted. One wrapper cell is kept at the bottom, and it says which layer it can see.
 
 vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
@@ -18,6 +19,10 @@ const BLOCK_MS = 60_000;
 const POLL_MS = 250;
 const HANDSHAKE_MS = 500;
 const ARRIVES_AT_MS = 1000;
+/** A prompt settle is a handful of ticks; sleeping the budget settles at BLOCK_MS. */
+const WAKE_SLACK_MS = 500;
+/** The longest a call may take to notice the gateway cannot wake it — the handshake watchdog. */
+const DEAD_SETTLE_MS = HANDSHAKE_MS + WAKE_SLACK_MS;
 /** The message must surface within a poll cycle or two of becoming visible — never at `blockMs`. */
 const SLACK_MS = 2000;
 
@@ -29,23 +34,29 @@ const MESSAGE = {
   author: { id: '5', username: 'human' },
 };
 
-describe('Discord long-poll while the live transport is…', () => {
-  /** REST is healthy throughout: it simply starts returning the message once it has landed. */
+const connect = async (): Promise<DiscordPlugin> => {
+  const plugin = new DiscordPlugin();
+  await plugin.connect({ token: 't', gateway_url: 'ws://fake', handshake_timeout_ms: HANDSHAKE_MS });
+  return plugin;
+};
+
+/** The waiters the plugin has armed — a cell that armed none proves nothing about releasing one. */
+const armedWaiters = (plugin: DiscordPlugin): number =>
+  (plugin as unknown as { waiters: Map<string, unknown> }).waiters.size;
+
+describe('a native blocking fetchRecent on a gateway that cannot wake it', () => {
+  // A `block_ms` fetch may only WAIT while a LIVE socket can deliver MESSAGE_CREATE. In every other
+  // transport state the plugin owes its immediate page so core's poll fallback owns the wait —
+  // otherwise one tool call sleeps its whole budget on a socket that cannot deliver, on a backend
+  // whose REST half is perfectly healthy.
   let rest: FetchStub;
 
-  const TRANSPORTS: Array<{
+  const DEAD: Array<{
     label: string;
     setup: (plugin: DiscordPlugin) => Promise<void>;
     /** Applied to every socket opened AFTER setup — a gateway that is not coming back stays mute. */
     driveNew: (ws: FakeWs) => void;
   }> = [
-    {
-      label: 'healthy',
-      setup: async (plugin) => {
-        await reachReady(plugin, TOPIC);
-      },
-      driveNew: (ws) => ws.hello(HUGE_HB),
-    },
     {
       label: 'closed and reconnecting',
       setup: async (plugin) => {
@@ -83,6 +94,7 @@ describe('Discord long-poll while the live transport is…', () => {
     resetGateway();
     rest = stubFetch();
     vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(Math, 'random').mockReturnValue(0);
     vi.useFakeTimers();
   });
   afterEach(() => {
@@ -91,38 +103,23 @@ describe('Discord long-poll while the live transport is…', () => {
     vi.restoreAllMocks();
   });
 
-  for (const transport of TRANSPORTS) {
-    it(`${transport.label}: a message visible at ${ARRIVES_AT_MS}ms is returned promptly`, async () => {
-      const plugin = new DiscordPlugin();
-      await plugin.connect({
-        token: 't',
-        gateway_url: 'ws://fake',
-        handshake_timeout_ms: HANDSHAKE_MS,
-      });
+  for (const transport of DEAD) {
+    it(`${transport.label}: the call hands its empty page back instead of sleeping`, async () => {
+      const plugin = await connect();
       await transport.setup(plugin);
 
       const driven = new Set(instances);
       const started = Date.now();
       let settledAt: number | undefined;
-      let arrived = false;
-      const pending = fetchRecentBlocking(
-        plugin,
-        { topic: TOPIC, since: SINCE },
-        { blockMs: BLOCK_MS, pollIntervalMs: POLL_MS },
-      ).then((r) => {
-        settledAt = Date.now();
-        return r;
-      });
+      const pending = plugin
+        .fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS })
+        .then((r) => {
+          settledAt = Date.now();
+          return r;
+        });
 
-      for (let t = 0; t < BLOCK_MS && settledAt === undefined; t += 100) {
-        await vi.advanceTimersByTimeAsync(100);
-        if (!arrived && Date.now() - started >= ARRIVES_AT_MS) {
-          arrived = true;
-          // A real arrival is BOTH: durable over REST and, when a socket is live, a dispatch.
-          rest.page = [MESSAGE];
-          const live = instances.find((ws) => ws.readyState === FakeWs.OPEN && ws.identified());
-          live?.serverSend({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: MESSAGE });
-        }
+      for (let t = 0; t < BLOCK_MS && settledAt === undefined; t += 10) {
+        await vi.advanceTimersByTimeAsync(10);
         for (const ws of [...instances]) {
           if (driven.has(ws)) continue;
           driven.add(ws);
@@ -131,19 +128,24 @@ describe('Discord long-poll while the live transport is…', () => {
       }
 
       const result = await pending;
-      expect(result.messages.map((m) => m.content)).toEqual(['fresh']);
-      expect(settledAt! - started).toBeLessThanOrEqual(ARRIVES_AT_MS + SLACK_MS);
+      expect(result.messages).toEqual([]);
+      expect(result.nextCursor, 'the cursor must stay replayable').toBe(SINCE);
+      expect(armedWaiters(plugin), 'a waiter was armed on a socket that cannot fire it').toBe(0);
+      expect(
+        settledAt! - started,
+        'the call slept its budget on a gateway that could never wake it',
+      ).toBeLessThanOrEqual(DEAD_SETTLE_MS);
+      expect(rest.count('/messages'), 'the immediate REST page was never fetched').toBeGreaterThan(0);
 
       await plugin.disconnect();
     });
   }
 });
 
-// The table above can only ever describe the transport at CALL START. A socket that dies while a
-// waiter is already armed is the same defect one tick later, and nothing else can wake that waiter:
-// the message is durable over a healthy REST API while the call sleeps its whole budget.
-
-describe('Discord long-poll when the live transport dies mid-wait', () => {
+describe('a native blocking fetchRecent whose socket dies mid-wait', () => {
+  // The table above can only ever describe the transport at CALL START. A socket that dies while a
+  // waiter is already armed is the same defect one tick later, and only the plugin can notice: the
+  // socket that would have woken the waiter is the one that went away.
   let rest: FetchStub;
 
   const LOSSES: Array<{ label: string; kill: (ws: FakeWs) => void; driveNew: (ws: FakeWs) => void }> =
@@ -168,7 +170,8 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
       },
     ];
 
-  /** When the socket dies, relative to the start of the blocking call. */
+  /** When the socket dies, relative to the start of the blocking call: inside the first REST
+   *  query's turn, and long after the waiter is armed. */
   const LOST_AT_MS = [10, 600];
 
   beforeEach(() => {
@@ -186,42 +189,30 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
 
   for (const loss of LOSSES) {
     for (const lostAt of LOST_AT_MS) {
-      it(`${loss.label} at ${lostAt}ms still returns a ${ARRIVES_AT_MS}ms message promptly`, async () => {
-        const plugin = new DiscordPlugin();
-        await plugin.connect({
-          token: 't',
-          gateway_url: 'ws://fake',
-          handshake_timeout_ms: HANDSHAKE_MS,
-        });
+      it(`${loss.label} at ${lostAt}ms releases the wait`, async () => {
+        const plugin = await connect();
         const first = await reachReady(plugin, TOPIC);
 
         const driven = new Set(instances);
         const started = Date.now();
         let settledAt: number | undefined;
-        let killed = false;
-        let arrived = false;
-        const pending = fetchRecentBlocking(
-          plugin,
-          { topic: TOPIC, since: SINCE },
-          { blockMs: BLOCK_MS, pollIntervalMs: POLL_MS },
-        ).then((r) => {
-          settledAt = Date.now();
-          return r;
-        });
+        const pending = plugin
+          .fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS })
+          .then((r) => {
+            settledAt = Date.now();
+            return r;
+          });
+
+        // Kill the socket unconditionally rather than from inside the settle loop: a call that
+        // returned before `lostAt` would otherwise skip both the kill and the check below, and
+        // every later row would pass without a waiter ever existing.
+        await vi.advanceTimersByTimeAsync(lostAt);
+        expect(settledAt, 'the call settled before the socket it waits on was lost').toBeUndefined();
+        expect(armedWaiters(plugin), 'nothing was armed, so the loss below releases nothing').toBe(1);
+        loss.kill(first);
 
         for (let t = 0; t < BLOCK_MS && settledAt === undefined; t += 10) {
           await vi.advanceTimersByTimeAsync(10);
-          const elapsed = Date.now() - started;
-          if (!killed && elapsed >= lostAt) {
-            killed = true;
-            loss.kill(first);
-          }
-          if (!arrived && elapsed >= ARRIVES_AT_MS) {
-            arrived = true;
-            rest.page = [MESSAGE];
-            const live = instances.find((ws) => ws.readyState === FakeWs.OPEN && ws.identified());
-            live?.serverSend({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: MESSAGE });
-          }
           for (const ws of [...instances]) {
             if (driven.has(ws)) continue;
             driven.add(ws);
@@ -230,8 +221,14 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
         }
 
         const result = await pending;
-        expect(result.messages.map((m) => m.content)).toEqual(['fresh']);
-        expect(settledAt! - started).toBeLessThanOrEqual(ARRIVES_AT_MS + SLACK_MS);
+        expect(result.messages).toEqual([]);
+        expect(result.nextCursor, 'the cursor must stay replayable').toBe(SINCE);
+        expect(armedWaiters(plugin), 'a waiter outlived the socket that could fire it').toBe(0);
+        expect(
+          settledAt! - started,
+          'the call kept sleeping on a socket that had already gone away',
+        ).toBeLessThanOrEqual(lostAt + WAKE_SLACK_MS);
+        expect(rest.count('/messages')).toBeGreaterThan(0);
 
         await plugin.disconnect();
       });
@@ -239,15 +236,7 @@ describe('Discord long-poll when the live transport dies mid-wait', () => {
   }
 });
 
-// The waiter exists to be armed BEFORE the first REST query and released on disconnect. Both are
-// invisible to a table over transport state: every row there is satisfied by core's 250 ms poll
-// fallback. These drive the plugin's own blocking call, where nothing else can re-query, and pin
-// the phase at which the wakeup lands.
-
 describe('Discord long-poll: a wakeup arriving', () => {
-  /** A prompt wakeup settles in a handful of ticks; sleeping the budget settles at BLOCK_MS. */
-  const WAKE_SLACK_MS = 500;
-
   let rest: FetchStub;
 
   const arrive = (ws?: FakeWs): void => {
@@ -322,12 +311,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
 
   for (const phase of PHASES) {
     it(`${phase.label} is not lost`, async () => {
-      const plugin = new DiscordPlugin();
-      await plugin.connect({
-        token: 't',
-        gateway_url: 'ws://fake',
-        handshake_timeout_ms: HANDSHAKE_MS,
-      });
+      const plugin = await connect();
 
       const started = Date.now();
       let settledAt: number | undefined;
@@ -352,12 +336,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
   }
 
   it('nothing arriving settles at blockMs with a replayable cursor', async () => {
-    const plugin = new DiscordPlugin();
-    await plugin.connect({
-      token: 't',
-      gateway_url: 'ws://fake',
-      handshake_timeout_ms: HANDSHAKE_MS,
-    });
+    const plugin = await connect();
     await reachReady(plugin, TOPIC);
 
     const started = Date.now();
@@ -386,12 +365,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
   for (const asyncClose of [false, true]) {
    it(`disconnect() releases an in-flight long-poll (close delivered ${asyncClose ? 'async' : 'inline'})`, async () => {
     state.asyncClose = asyncClose;
-    const plugin = new DiscordPlugin();
-    await plugin.connect({
-      token: 't',
-      gateway_url: 'ws://fake',
-      handshake_timeout_ms: HANDSHAKE_MS,
-    });
+    const plugin = await connect();
     await reachReady(plugin, TOPIC);
 
     const started = Date.now();
@@ -403,8 +377,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
         return r;
       });
     await vi.advanceTimersByTimeAsync(10);
-    const waiters = (plugin as unknown as { waiters: Map<string, Set<() => void>> }).waiters;
-    expect(waiters.size, 'nothing was armed, so the teardown below proves nothing').toBe(1);
+    expect(armedWaiters(plugin), 'nothing was armed, so the teardown below proves nothing').toBe(1);
 
     await plugin.disconnect();
     await vi.advanceTimersByTimeAsync(0);
@@ -415,4 +388,56 @@ describe('Discord long-poll: a wakeup arriving', () => {
     expect((await pending).messages).toEqual([]);
    });
   }
+});
+
+describe('the plugin composes with core’s poll fallback', () => {
+  // The ONE cell that is deliberately about the WRAPPER: with the gateway terminally closed the
+  // plugin can never wake anything, so only core's 250 ms poll can return the message. It says
+  // nothing about the native waiter — that is what every table above is for.
+  let rest: FetchStub;
+
+  beforeEach(() => {
+    resetGateway();
+    rest = stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('a terminally closed gateway still returns a message that lands mid-wait', async () => {
+    const plugin = await connect();
+    const ws = await reachReady(plugin, TOPIC);
+    ws.serverClose(4014);
+
+    const started = Date.now();
+    let settledAt: number | undefined;
+    let arrived = false;
+    const pending = fetchRecentBlocking(
+      plugin,
+      { topic: TOPIC, since: SINCE },
+      { blockMs: BLOCK_MS, pollIntervalMs: POLL_MS },
+    ).then((r) => {
+      settledAt = Date.now();
+      return r;
+    });
+
+    for (let t = 0; t < BLOCK_MS && settledAt === undefined; t += 100) {
+      await vi.advanceTimersByTimeAsync(100);
+      if (!arrived && Date.now() - started >= ARRIVES_AT_MS) {
+        arrived = true;
+        rest.page = [MESSAGE];
+      }
+    }
+
+    const result = await pending;
+    expect(result.messages.map((m) => m.content)).toEqual(['fresh']);
+    expect(settledAt! - started).toBeGreaterThanOrEqual(ARRIVES_AT_MS);
+    expect(settledAt! - started).toBeLessThanOrEqual(ARRIVES_AT_MS + SLACK_MS);
+
+    await plugin.disconnect();
+  });
 });

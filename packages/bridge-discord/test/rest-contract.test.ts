@@ -73,20 +73,45 @@ describe('Discord REST contract', () => {
     // The seam gives a plugin exactly two legal answers for an absent topic: an empty page with a
     // replayable cursor, or NoSuchTopicError. Core branches on NoSuchTopicError to return an empty
     // roster, so an unmapped presence topic must not surface as a raw HTTP failure.
-    const READS: Array<[string, (p: BackendPlugin, t: Topic) => Promise<unknown>]> = [
-      ['fetchRecent (default window)', (p, t) => p.fetchRecent({ topic: t })],
-      ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
+    //
+    // CLASS: a seam classification decided AFTER a budget check. Both answers are legal, but the
+    // same channel flipping between them on a timing race is not: whether the operator sees "topic
+    // not present yet" or an ordinary empty window would depend on how much of `block_ms` survived
+    // the legs before the 404 landed. `block_ms` is clamped from above and never floored, so a
+    // model may pass 1. The BUDGETS axis is that clamp's whole range; the LATENCY axis is a
+    // provider that answers slower than the budget left.
+    const BUDGETS = [0, 1, 50, BLOCK_MS];
+    const LATENCIES = [0, 120];
+    const READS: Array<[string, (p: BackendPlugin, t: Topic, blockMs: number) => Promise<unknown>]> =
       [
-        'fetchRecent (blocking)',
-        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: BLOCK_MS }),
-      ],
-    ];
+        [
+          'fetchRecent (default window)',
+          (p, t, blockMs) => p.fetchRecent({ topic: t, ...(blockMs > 0 ? { blockMs } : {}) }),
+        ],
+        [
+          'fetchRecent (since)',
+          (p, t, blockMs) =>
+            p.fetchRecent({ topic: t, since: asCursor('1'), ...(blockMs > 0 ? { blockMs } : {}) }),
+        ],
+      ];
 
     for (const [label, run] of READS) {
-      it(`${label} on a channel that does not exist rejects with NoSuchTopicError`, async () => {
-        const absent = asTopic(freshChannelId()); // never created in the fake
-        await expect(run(plugin, absent)).rejects.toBeInstanceOf(NoSuchTopicError);
-      });
+      for (const blockMs of BUDGETS) {
+        for (const latency of LATENCIES) {
+          it(`${label} with block_ms ${blockMs} and a ${latency}ms 404 is NoSuchTopicError`, async () => {
+            const absent = asTopic(freshChannelId()); // never created in the fake
+            if (latency > 0) {
+              fake.injectFault({
+                status: 404,
+                body: { message: 'Unknown Channel', code: 10003 },
+                path: '/channels/',
+                delayMs: latency,
+              });
+            }
+            await expect(run(plugin, absent, blockMs)).rejects.toBeInstanceOf(NoSuchTopicError);
+          });
+        }
+      }
     }
 
     it('the default presence topic (a non-snowflake name) is absent, not a raw HTTP failure', async () => {
@@ -333,15 +358,11 @@ describe('Discord REST contract', () => {
   describe('a topic named after an Object.prototype member', () => {
     // A keyed lookup off a plain object answers for names it was never given. On this seam that
     // turns a topic into a channel id nobody configured — and a 404 from it reads as an ABSENT
-    // topic rather than a misconfiguration, so the failure is silent.
-    const PROTOTYPE_NAMES = [
-      'constructor',
-      'toString',
-      'valueOf',
-      'hasOwnProperty',
-      '__proto__',
-      'isPrototypeOf',
-    ];
+    // topic rather than a misconfiguration, so the failure is silent. Every inherited data or
+    // method name resolves through the SAME lookup, so one stands for all of them; keep
+    // `__proto__`, so that a map built by assignment stays covered — `obj['__proto__'] = id` sets
+    // the prototype instead of a key, which no other name on Object.prototype does.
+    const PROTOTYPE_NAMES = ['constructor', 'toString', '__proto__'];
 
     for (const name of PROTOTYPE_NAMES) {
       it(`${name} used as a channel id literal round-trips`, async () => {

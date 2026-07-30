@@ -16,6 +16,7 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import {
+  DEFAULT_DEADLINE_MS,
   fetchWithRetry,
   retryAfterFromHeader,
   sanitizeBody,
@@ -143,6 +144,16 @@ const UNKNOWN_CHANNEL = 10003;
 /** Discord's hard caps: characters per message, and messages per `GET .../messages` page. */
 const CONTENT_LIMIT = 2000;
 const PAGE_LIMIT = 100;
+
+/**
+ * The smallest REST budget the FIRST query of a `fetchRecent` runs under, however little of the
+ * call's budget survived the legs before it. Keep it above zero, so that whether an absent channel
+ * answers {@link NoSuchTopicError} or an ordinary empty window is decided by the channel and not by
+ * the clock — a `block_ms` a model chose small, or a gateway leg that ate it, otherwise flips the
+ * seam's absent-topic classification into "nothing new here" and the operator sees an idle topic
+ * with no error.
+ */
+const MIN_QUERY_BUDGET_MS = 250;
 
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 
@@ -354,6 +365,8 @@ export class DiscordPlugin implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const limit = args.limit ?? 100;
+    const blockMs = args.blockMs ?? 0;
+    const deadline = Date.now() + (blockMs > 0 ? blockMs : DEFAULT_DEADLINE_MS);
 
     if (args.since === undefined) {
       // Keep paging BACKWARDS with `before` past the API's 100-per-page cap, so that a larger
@@ -361,22 +374,21 @@ export class DiscordPlugin implements BackendPlugin {
       // older than it.
       const newestFirst: DiscordMessage[] = [];
       let before: string | undefined;
-      while (newestFirst.length < limit) {
-        const page = Math.min(limit - newestFirst.length, PAGE_LIMIT);
-        const query = before === undefined ? `limit=${page}` : `limit=${page}&before=${before}`;
-        const chunk = await this.getMessages(args.topic, query);
-        if (chunk.length === 0) break;
+      for (let page = 0; newestFirst.length < limit; page++) {
+        const size = Math.min(limit - newestFirst.length, PAGE_LIMIT);
+        const query = before === undefined ? `limit=${size}` : `limit=${size}&before=${before}`;
+        const chunk = await this.pageWithin(args.topic, query, deadline, page);
+        if (chunk === undefined || chunk.length === 0) break;
         newestFirst.push(...chunk);
         before = chunk.at(-1)!.id;
-        if (chunk.length < page) break;
+        if (chunk.length < size) break;
       }
       const messages = newestFirst.reverse().map((m) => toMessage(args.topic, m));
       return { messages, nextCursor: messages.at(-1)?.cursor ?? asCursor('0') };
     }
 
-    const blockMs = args.blockMs ?? 0;
     if (blockMs <= 0) {
-      return this.fetchSince(args.topic, args.since, limit);
+      return this.fetchSince(args.topic, args.since, limit, deadline);
     }
 
     // Native long-poll: the exclusive `since` query is empty, so wait on the SAME
@@ -387,7 +399,6 @@ export class DiscordPlugin implements BackendPlugin {
     // both REST queries — inside the same `blockMs` budget, so that neither a gateway that accepts
     // the socket without completing the handshake nor a rate-limited REST query can stretch this
     // call past the cap core sized for the client's tool timeout.
-    const deadline = Date.now() + blockMs;
     try {
       await withDeadline(this.ensureGateway(), blockMs);
     } catch {
@@ -402,7 +413,7 @@ export class DiscordPlugin implements BackendPlugin {
       const first = await this.fetchWithin(args.topic, args.since, limit, deadline);
       if (first.messages.length > 0 || waiter === undefined) return first;
       await waiter.fired; // resolves on MESSAGE_CREATE for this channel, timeout, or disconnect
-      if (this.stopped) return { messages: [], nextCursor: args.since };
+      if (this.stopped || Date.now() >= deadline) return first;
       return await this.fetchWithin(args.topic, args.since, limit, deadline);
     } finally {
       waiter?.cancel();
@@ -410,10 +421,13 @@ export class DiscordPlugin implements BackendPlugin {
   }
 
   /**
-   * One catch-up page bounded by the long-poll's own `deadline`. A budget already spent, or spent
-   * while the query was in flight, answers the empty replayable page — core polls the rest of its
-   * budget and this call still owes an answer within `blockMs`. A failure that arrives BEFORE the
-   * deadline is a real one and propagates, so bounding the leg cannot hide a 404 or a 500.
+   * One catch-up walk bounded by the long-poll's own `deadline`. A budget spent while a query was
+   * in flight answers the empty replayable page — core polls the rest of its budget and this call
+   * still owes an answer within `blockMs`. A failure that arrives BEFORE the deadline is a real one
+   * and propagates, so bounding the leg cannot hide a 404 or a 500. An ABSENT TOPIC escapes that
+   * swallow whatever the clock says: it is a seam classification, not a transport failure, and a
+   * classification that depends on the budget left when the 404 landed is one the caller cannot act
+   * on.
    */
   private async fetchWithin(
     topic: Topic,
@@ -421,44 +435,66 @@ export class DiscordPlugin implements BackendPlugin {
     limit: number,
     deadline: number,
   ): Promise<FetchRecentResult> {
-    const budget = deadline - Date.now();
-    if (budget <= 0) return { messages: [], nextCursor: since };
     try {
-      return await this.fetchSince(topic, since, limit, budget);
+      return await this.fetchSince(topic, since, limit, deadline);
     } catch (err) {
+      if (err instanceof NoSuchTopicError) throw err;
       if (Date.now() >= deadline) return { messages: [], nextCursor: since };
       throw err;
     }
   }
 
   /**
-   * One exclusive-`since` catch-up page. `?after=` is exclusive server-side; each page comes back
+   * One exclusive-`since` catch-up walk. `?after=` is exclusive server-side; each page comes back
    * newest-first → reverse to ascending; for limit > 100, page forward advancing `after` to the
-   * last (largest) returned id until filled or a short page says the tail is reached. Empty →
-   * `nextCursor` echoes `since` (stable, replayable).
+   * last (largest) returned id until filled, or a short page says the tail is reached, or the
+   * call's shared `deadline` runs out. Empty → `nextCursor` echoes `since` (stable, replayable).
    */
   private async fetchSince(
     topic: Topic,
     since: Cursor,
     limit: number,
-    deadlineMs?: number,
+    deadline: number,
   ): Promise<FetchRecentResult> {
     const messages: Message[] = [];
     let after = String(since);
-    while (messages.length < limit) {
-      const page = Math.min(limit - messages.length, PAGE_LIMIT);
-      const chunk = await this.getMessages(
-        topic,
-        `after=${encodeURIComponent(after)}&limit=${page}`,
-        deadlineMs,
-      );
-      if (chunk.length === 0) break;
+    for (let page = 0; messages.length < limit; page++) {
+      const size = Math.min(limit - messages.length, PAGE_LIMIT);
+      const query = `after=${encodeURIComponent(after)}&limit=${size}`;
+      const chunk = await this.pageWithin(topic, query, deadline, page);
+      if (chunk === undefined || chunk.length === 0) break;
       const ascending = chunk.reverse();
       for (const m of ascending) messages.push(toMessage(topic, m));
       after = ascending.at(-1)!.id;
-      if (chunk.length < page) break;
+      if (chunk.length < size) break;
     }
     return { messages, nextCursor: messages.at(-1)?.cursor ?? since };
+  }
+
+  /**
+   * The `page`th page of a walk sharing ONE absolute `deadline`, or undefined once that deadline
+   * has ended the walk. Re-read the clock per page, so that a limit spanning N pages cannot spend N
+   * times the budget the caller set — a per-attempt DURATION restarts it on every round trip. Page
+   * ZERO runs even on a spent budget ({@link MIN_QUERY_BUDGET_MS}): a call that answers an empty
+   * window without ever asking is guessing. A failure on a LATER page whose deadline has passed
+   * ends the walk rather than failing it, so a bounded call still answers with the pages it did
+   * gather and a cursor to resume from; every other failure propagates.
+   */
+  private async pageWithin(
+    topic: Topic,
+    query: string,
+    deadline: number,
+    page: number,
+  ): Promise<DiscordMessage[] | undefined> {
+    const remaining = deadline - Date.now();
+    const budget = page === 0 ? Math.max(remaining, MIN_QUERY_BUDGET_MS) : remaining;
+    if (budget <= 0) return undefined;
+    try {
+      return await this.getMessages(topic, query, budget);
+    } catch (err) {
+      if (page === 0 || err instanceof NoSuchTopicError || Date.now() < deadline) throw err;
+      return undefined;
+    }
   }
 
   /**
