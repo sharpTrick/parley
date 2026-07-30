@@ -58,9 +58,12 @@ Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps 
 > **Presence needs a real channel.** Core enables presence by default (`presence.enabled: true`,
 > `presence.topic: parley-presence`), and on Discord a topic string **is a channel id** — so the
 > out-of-the-box topic is not a channel that can exist. Either set `presence.enabled: false`, or
-> point `presence.topic` at a real channel id (directly or through `channel_map`). Left as-is,
-> heartbeats fail (the presence loop swallows it, by design) and `parley_list_users` reports an
-> empty roster, because the topic is genuinely absent.
+> point `presence.topic` at a real channel id (directly or through `channel_map`). Left as-is, the
+> presence heartbeat fails (the presence loop swallows it, by design) and `parley_list_users`
+> cannot report a roster. Whether that surfaces as an **empty roster** (`10003 Unknown Channel`,
+> which the seam maps to an absent topic) or as an **HTTP error** depends on how Discord's router
+> classifies a channel id that is not a snowflake — this package does not pin that, so treat the
+> default presence topic as unconfigured rather than as a supported empty state.
 
 ## Rate limits (429)
 

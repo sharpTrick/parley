@@ -390,6 +390,106 @@ describe('Discord long-poll: a wakeup arriving', () => {
   }
 });
 
+describe('the REST cost of a long-poll is its wakeups, not its budget', () => {
+  // CLASS: a plugin that re-queries because time passed rather than because something happened.
+  // Every table above asserts LATENCY, and a duplicate page query is invisible to a latency bound
+  // (a localhost round trip fits inside any slack) — but it doubles the call rate against a bot
+  // token whose global limits routinely ask for longer than a whole call's budget. So the axis is
+  // WHAT WOKE THE CALL, and the assertion is the exact number of `…/messages` queries it issued:
+  // one for the mandatory immediate page, plus one more only when something OTHER than the
+  // deadline said there might be new state to read.
+  let rest: FetchStub;
+
+  beforeEach(() => {
+    resetGateway();
+    rest = stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const queries = (): number => rest.count('/messages');
+
+  // The budget is the axis a leak would ride: page 0 always runs (MIN_QUERY_BUDGET_MS), so a
+  // post-wake query that does not check the deadline costs a second one at EVERY budget.
+  for (const blockMs of [1, 50, 1500, BLOCK_MS]) {
+    it(`times out after ${blockMs}ms with nothing arriving: exactly one query`, async () => {
+      const plugin = await connect();
+      await reachReady(plugin, TOPIC);
+
+      const pending = plugin.fetchRecent({ topic: TOPIC, since: SINCE, blockMs });
+      await vi.advanceTimersByTimeAsync(blockMs + 10);
+
+      expect((await pending).messages).toEqual([]);
+      expect(queries(), 'the timed-out wait re-queried for nothing').toBe(1);
+      await plugin.disconnect();
+    });
+  }
+
+  it('a MESSAGE_CREATE wakes it: exactly two queries', async () => {
+    const plugin = await connect();
+    const ws = await reachReady(plugin, TOPIC);
+
+    const pending = plugin.fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS });
+    await vi.advanceTimersByTimeAsync(10);
+    rest.page = [MESSAGE];
+    ws.serverSend({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: MESSAGE });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect((await pending).messages.map((m) => m.content)).toEqual(['fresh']);
+    expect(queries(), 'the wakeup did not cost exactly one re-read').toBe(2);
+    await plugin.disconnect();
+  });
+
+  it('the socket dies mid-wait: exactly two queries', async () => {
+    // The socket that would have woken it is gone, so what it carried before dying is unknown —
+    // one re-read is the point of releasing the waiter. A THIRD would mean the release itself
+    // re-armed something.
+    const plugin = await connect();
+    const ws = await reachReady(plugin, TOPIC);
+
+    const pending = plugin.fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS });
+    await vi.advanceTimersByTimeAsync(10);
+    state.onIdentify = () => undefined;
+    ws.serverClose(1006);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect((await pending).messages).toEqual([]);
+    expect(queries()).toBe(2);
+    await plugin.disconnect();
+  });
+
+  it('the transport was never live: exactly one query', async () => {
+    state.onIdentify = (ws: FakeWs) => ws.serverClose(1006);
+    const plugin = await connect();
+
+    const pending = plugin.fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS });
+    for (let t = 0; t < HANDSHAKE_MS * 2; t += 10) await vi.advanceTimersByTimeAsync(10);
+
+    expect((await pending).messages).toEqual([]);
+    expect(queries(), 'a call that never armed a waiter still queried twice').toBe(1);
+    await plugin.disconnect();
+  });
+
+  it('disconnect() releases it: exactly one query', async () => {
+    const plugin = await connect();
+    await reachReady(plugin, TOPIC);
+
+    const pending = plugin.fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS });
+    await vi.advanceTimersByTimeAsync(10);
+    await plugin.disconnect();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect((await pending).messages).toEqual([]);
+    expect(queries(), 'a torn-down plugin queried the provider again').toBe(1);
+  });
+});
+
 describe('the plugin composes with core’s poll fallback', () => {
   // The ONE cell that is deliberately about the WRAPPER: with the gateway terminally closed the
   // plugin can never wake anything, so only core's 250 ms poll can return the message. It says

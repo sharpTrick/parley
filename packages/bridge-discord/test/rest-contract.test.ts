@@ -114,7 +114,12 @@ describe('Discord REST contract', () => {
       }
     }
 
-    it('the default presence topic (a non-snowflake name) is absent, not a raw HTTP failure', async () => {
+    // What this pins is the PLUGIN's classification of a 10003 on a non-numeric id, not Discord's:
+    // the fake keys channels by an arbitrary string and answers 10003 for anything it does not
+    // hold, whereas the real router puts `/channels/{channel.id}` through a snowflake converter and
+    // may answer its own 404 instead. The README no longer promises which one the default presence
+    // topic gets, so this cell must not be read as covering that claim.
+    it('a 10003 on a non-snowflake channel id is the seam absent topic, not a raw HTTP failure', async () => {
       await expect(plugin.fetchRecent({ topic: asTopic('parley-presence') })).rejects.toBeInstanceOf(
         NoSuchTopicError,
       );
@@ -284,6 +289,44 @@ describe('Discord REST contract', () => {
     }
   });
 
+  describe('a diagnostic the sanitizer never saw', () => {
+    // CLASS: a one-line guarantee credited to the wrong layer. Every cell above reaches stderr
+    // through net-util's `sanitizeBody`, which strips control characters upstream — so the scrub in
+    // the plugin's own `warn` is unmeasured there, and the guarantee would move silently to an
+    // unverified line if the sanitizer changed. These cells carry text the sanitizer never touches:
+    // a `channel_map` VALUE, interpolated raw into the unpushable-channel diagnostic. The axis is
+    // the TERMINATOR, because a scrub written for `\n` alone lets every other one through.
+    const TERMINATORS: Array<[string, string]> = [
+      ['a line feed', '\n'],
+      ['a carriage return', '\r'],
+      ['a CRLF', '\r\n'],
+      ['a line separator', '\u2028'],
+      ['a paragraph separator', '\u2029'],
+      ['a line feed with padding around it', ' \t\n\t '],
+      ['a run of them', '\n\r\n\u2028'],
+    ];
+
+    for (const [label, terminator] of TERMINATORS) {
+      it(`${label} in a channel id cannot forge a second diagnostic`, async () => {
+        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        const id = `${freshChannelId()}${terminator}parley-discord: FORGED`;
+        fake.createChannel(id, DM); // unpushable, so the diagnostic quotes the id verbatim
+        const p = await connect({ channel_map: { alpha: id } });
+        try {
+          await p.subscribe(asTopic('alpha'), () => undefined);
+          const written = diag.mock.calls.map((c) => String(c[0])).join('');
+          expect(written, 'nothing was written, so this cell measures nothing').not.toBe('');
+          expect(written).toContain('FORGED'); // the text is quoted, just never on its own line
+          expect(written.split(/[\r\n\u2028\u2029]/).filter((line) => line !== '')).toHaveLength(1);
+          expect(written.endsWith('\n')).toBe(true);
+        } finally {
+          await p.disconnect();
+          diag.mockRestore();
+        }
+      });
+    }
+  });
+
   describe('provider content limit', () => {
     // CLASS: a provider limit re-implemented locally in the wrong unit. Discord counts CODE POINTS;
     // `String.length` counts UTF-16 units, which refuses astral text at half the real limit and
@@ -402,6 +445,95 @@ describe('Discord REST contract', () => {
         await p.disconnect();
       }
     });
+  });
+
+  describe('a topic that tries to reshape the provider request', () => {
+    // CLASS: a caller-supplied topic changing the SHAPE of the request, not just its target. An
+    // unmapped topic IS the channel-id path segment (the documented zero-config path), core's
+    // Allowlist puts no character restriction on a topic string, and an anchored `post_topics`
+    // pattern like `ctx-.*` still admits an arbitrary caller-chosen suffix — so the id reaching the
+    // URL is model-influenced text. Every cell asserts the same invariant on the paths the provider
+    // actually saw: one channel route, whose single segment decodes back to the id the call named.
+    // The prototype-pollution table above is the nearest neighbour and every id in it is URL-safe,
+    // so it cannot see any of this.
+    // `escapes` marks an id that cannot be carried as a path segment at all: `encodeURIComponent`
+    // leaves `.` and `..` alone and the URL parser then REMOVES them, so the only way such an id
+    // stays on the route is to be refused before a request is built.
+    const HOSTILE_IDS: Array<{ id: string; escapes?: true }> = [
+      { id: 'a/b' },
+      { id: 'x/../../users/@me' },
+      { id: 'x?limit=1' },
+      { id: 'x#frag' },
+      { id: 'x%2F' },
+      { id: 'x&after=0' },
+      { id: 'has space' },
+      { id: 'naïve' },
+      { id: '.', escapes: true },
+      { id: '..', escapes: true },
+    ];
+
+    const CHANNEL_ROUTE = /^\/api\/v10\/channels\/([^/?#]+)(\/messages)?(\?[^#]*)?$/;
+
+    const expectStayedOnRoute = (
+      paths: string[],
+      channelId: string,
+      escapes: boolean,
+      err: unknown,
+    ): void => {
+      for (const path of paths) {
+        const route = CHANNEL_ROUTE.exec(path);
+        expect(route, `the topic steered the call to ${path}`).not.toBeNull();
+        expect(decodeURIComponent(route![1]!), `the channel segment of ${path}`).toBe(channelId);
+      }
+      if (!escapes) {
+        expect(paths.length, 'the entry point issued no request at all').toBeGreaterThan(0);
+        return;
+      }
+      // Refusing it is the ONLY way to stay on the route, and the refusal has to name the id —
+      // silently dropping the call would satisfy the path assertion above just as well.
+      expect(paths, 'an id that cannot be a path segment reached the provider').toEqual([]);
+      expect(String(err)).toContain(JSON.stringify(channelId));
+    };
+
+    const ENTRIES: Array<[string, (p: DiscordPlugin, t: Topic) => Promise<unknown>]> = [
+      ['post', (p, t) => p.post(t, SENDER, 'hi')],
+      ['fetchRecent (default window)', (p, t) => p.fetchRecent({ topic: t })],
+      ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
+      [
+        'fetchRecent (blocking)',
+        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 50 }),
+      ],
+      ['subscribe', (p, t) => p.subscribe(t, () => undefined)],
+    ];
+
+    // A `channel_map` VALUE is operator-supplied rather than model-supplied, but it lands in the
+    // same interpolation — so both sources run the same table rather than trusting one of them.
+    const SOURCES: Array<[string, (id: string) => Promise<{ p: DiscordPlugin; topic: Topic }>]> = [
+      ['a topic used as a channel id literal', async (id) => ({ p: plugin, topic: asTopic(id) })],
+      [
+        'a channel_map value',
+        async (id) => ({ p: await connect({ channel_map: { 'ctx-1': id } }), topic: asTopic('ctx-1') }),
+      ],
+    ];
+
+    for (const { id, escapes } of HOSTILE_IDS) {
+      for (const [sourceLabel, arrange] of SOURCES) {
+        for (const [entryLabel, run] of ENTRIES) {
+          it(`${entryLabel} keeps ${JSON.stringify(id)} inside one channel route (${sourceLabel})`, async () => {
+            vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+            fake.createChannel(id);
+            const { p, topic } = await arrange(id);
+            const before = fake.requests().length;
+            try {
+              const err = await run(p, topic).then(() => undefined, (e: unknown) => e);
+              expectStayedOnRoute(fake.requests().slice(before), id, escapes === true, err);
+            } finally {
+              if (p !== plugin) await p.disconnect();
+            }
+          });
+        }
+      }
+    }
   });
 
   describe('the REST credential is on every request', () => {

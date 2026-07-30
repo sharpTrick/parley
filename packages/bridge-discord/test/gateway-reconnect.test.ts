@@ -239,6 +239,101 @@ describe('Discord gateway reconnect & liveness', () => {
   });
 });
 
+// CLASS: a per-socket resource released only by teardown. `disconnect()` clears the whole
+// `heartbeats` set, so every assertion made AFTER it passes whether or not the socket that ended
+// released its own interval — and a gateway that flaps leaks one live `setInterval` per reconnect,
+// each of which keeps the event loop alive so the process cannot exit on stdin EOF. The axis is
+// therefore the WAY one socket ends, and every cell asserts at the boundary, before any teardown.
+describe('a socket that ends releases its own heartbeat, before any disconnect()', () => {
+  const HB = 10_000;
+  const TOPIC = asTopic('c11');
+
+  const heartbeatsOf = (plugin: DiscordPlugin): Set<unknown> =>
+    (plugin as unknown as { heartbeats: Set<unknown> }).heartbeats;
+
+  /** How one socket ends, and whether the ladder is expected to bring another one back. */
+  const ENDINGS: Array<{ label: string; end: (ws: FakeWs) => Promise<void>; retries: boolean }> = [
+    {
+      label: 'a transient server close (1006)',
+      end: async (ws) => ws.serverClose(1006),
+      retries: true,
+    },
+    {
+      label: 'a terminal close (4014)',
+      end: async (ws) => ws.serverClose(4014),
+      retries: false,
+    },
+    {
+      label: 'op 7 RECONNECT',
+      end: async (ws) => ws.serverSend({ op: 7 }),
+      retries: true,
+    },
+    {
+      label: 'op 9 INVALID SESSION',
+      end: async (ws) => ws.serverSend({ op: 9, d: false }),
+      retries: true,
+    },
+    {
+      label: 'a zombie socket (no HEARTBEAT_ACK)',
+      end: async (ws) => {
+        ws.ackHeartbeats = false;
+        await vi.advanceTimersByTimeAsync(2 * HB); // beat, then terminate on the missed ack
+      },
+      retries: true,
+    },
+  ];
+
+  beforeEach(() => {
+    resetGateway();
+    stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (const ending of ENDINGS) {
+    // Repeated, because ONE cycle passes under a leak that merely fails to clean up: only the
+    // second and third show the set growing with the cycle count.
+    const cycles = ending.retries ? 3 : 1;
+    it(`${ending.label}, over ${cycles} cycle(s)`, async () => {
+      const plugin = new DiscordPlugin();
+      await plugin.connect({
+        token: 't',
+        gateway_url: 'ws://fake',
+        handshake_timeout_ms: NO_HANDSHAKE_TIMEOUT,
+      });
+
+      let ws = await reachReady(plugin, TOPIC, { hb: HB });
+      for (let cycle = 1; cycle <= cycles; cycle++) {
+        expect(heartbeatsOf(plugin).size, `cycle ${cycle}: no interval to release`).toBe(1);
+        await ending.end(ws);
+
+        expect(
+          heartbeatsOf(plugin).size,
+          `cycle ${cycle}: the closed socket kept its heartbeat interval`,
+        ).toBe(0);
+        // The only timer a closed socket may leave behind is the ladder's own pending re-dial.
+        expect(vi.getTimerCount(), `cycle ${cycle}: a timer outlived the socket`).toBeLessThanOrEqual(
+          ending.retries ? 1 : 0,
+        );
+        if (!ending.retries) break;
+
+        await vi.advanceTimersByTimeAsync(2 * RECONNECT_CAP_MS);
+        ws = gw.instances.at(-1)!;
+        ws.hello(HB);
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      await plugin.disconnect();
+    });
+  }
+});
+
 /** Observe a promise's settlement without awaiting it (fake timers drive the clock). */
 function track<T>(p: Promise<T>): { settled: boolean; error?: unknown } {
   const state: { settled: boolean; error?: unknown } = { settled: false };

@@ -655,9 +655,13 @@ export class DiscordPlugin implements BackendPlugin {
     );
   }
 
-  /** Every operator-facing diagnostic, on ONE line: a body's own newlines forge a second entry. */
+  /**
+   * Every operator-facing diagnostic, on ONE line. Keep the scrub covering EVERY line terminator,
+   * not just `\n`, so that quoted provider text cannot forge a second entry in the operator's log —
+   * a bare `\r` splits or overwrites a line in most readers just as a newline does.
+   */
   private warn(line: string): void {
-    process.stderr.write(`parley-discord: ${line.replace(/\s*\n\s*/g, ' ')}\n`);
+    process.stderr.write(`parley-discord: ${line.replace(/\s*[\r\n\u2028\u2029]\s*/g, ' ')}\n`);
   }
 
   /**
@@ -736,7 +740,7 @@ export class DiscordPlugin implements BackendPlugin {
    */
   private channelId(topic: Topic): string {
     const mapped = this.channelMap.get(topic as string);
-    if (mapped !== undefined) return mapped;
+    if (mapped !== undefined) return requireRoutableChannel(topic, mapped);
     const owner = this.channelOwner.get(topic as string);
     if (owner !== undefined) {
       throw new Error(
@@ -744,7 +748,7 @@ export class DiscordPlugin implements BackendPlugin {
           `resolve to channel ${topic as string}; give each topic its own channel_map target`,
       );
     }
-    return topic as string;
+    return requireRoutableChannel(topic, topic as string);
   }
 
   private require(): void {
@@ -831,85 +835,112 @@ export class DiscordPlugin implements BackendPlugin {
         } catch {
           return; // not JSON — not ours to crash on
         }
-        switch (payload.op) {
-          case OP.HELLO: {
-            const hello = payload.d as { heartbeat_interval: number };
-            if (heartbeat !== undefined) {
-              clearInterval(heartbeat);
-              this.heartbeats.delete(heartbeat);
-            }
-            awaitedAck = false;
-            heartbeat = setInterval(() => {
-              if (ws.readyState !== WebSocket.OPEN) return;
-              if (awaitedAck) {
-                // The previous beat was never ACKed (op 11) → the TCP connection is half-dead.
-                // terminate() (NOT close()) forces the `close` event IMMEDIATELY, so the existing
-                // close→scheduleReconnect path takes over within ONE interval instead of
-                // buffering beats into a dead socket for the ~15–25 min kernel TCP timeout.
-                ws.terminate();
-                return;
+        // Keep EVERY branch below inside this boundary, so that a frame no opcode branch expected
+        // ends one socket instead of the process: a throw in a `ws` listener is an
+        // uncaughtException, which takes the REST half and every other topic down with it.
+        try {
+          switch (payload.op) {
+            case OP.HELLO: {
+              const interval = heartbeatIntervalOf(payload.d);
+              if (interval === undefined) {
+                this.warn(
+                  'gateway sent a HELLO with no usable heartbeat_interval ' +
+                    `(${shapeOf(payload.d)}); closing the socket so the ladder retries`,
+                );
+                ws.close();
+                break;
               }
-              // Arm BEFORE sending, so that an ACK arriving in the same tick clears the flag it
-              // was meant to clear instead of being overwritten into a false "missed ack".
-              awaitedAck = true;
-              ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
-            }, hello.heartbeat_interval);
-            this.heartbeats.add(heartbeat);
-            ws.send(
-              JSON.stringify({
-                op: OP.IDENTIFY,
-                d: {
-                  token: this.token ?? '',
-                  intents: INTENTS,
-                  properties: { os: 'linux', browser: 'parley', device: 'parley' },
-                },
-              }),
-            );
-            break;
-          }
-          case OP.DISPATCH: {
-            if (payload.s !== null && payload.s !== undefined) this.seq = payload.s;
-            if (payload.t === 'READY' && !ready) {
-              ready = true;
-              readyAt = Date.now();
-              this.live = true;
-              clearTimeout(handshake);
-              resolve();
-            } else if (payload.t === 'MESSAGE_CREATE') {
-              const d = payload.d as DiscordMessage;
-              const sub = this.subs.get(d.channel_id);
-              if (sub !== undefined) {
-                try {
-                  sub.handler(toMessage(sub.topic, d));
-                } catch {
-                  /* handler is best-effort; never break the loop (DESIGN §6) */
+              if (heartbeat !== undefined) {
+                clearInterval(heartbeat);
+                this.heartbeats.delete(heartbeat);
+              }
+              awaitedAck = false;
+              heartbeat = setInterval(() => {
+                if (ws.readyState !== WebSocket.OPEN) return;
+                if (awaitedAck) {
+                  // The previous beat was never ACKed (op 11) → the TCP connection is half-dead.
+                  // terminate() (NOT close()) forces the `close` event IMMEDIATELY, so the existing
+                  // close→scheduleReconnect path takes over within ONE interval instead of
+                  // buffering beats into a dead socket for the ~15–25 min kernel TCP timeout.
+                  ws.terminate();
+                  return;
                 }
-              }
-              const waiting = this.waiters.get(d.channel_id);
-              if (waiting !== undefined) for (const fire of [...waiting]) fire();
+                // Arm BEFORE sending, so that an ACK arriving in the same tick clears the flag it
+                // was meant to clear instead of being overwritten into a false "missed ack".
+                awaitedAck = true;
+                ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
+              }, interval);
+              this.heartbeats.add(heartbeat);
+              ws.send(
+                JSON.stringify({
+                  op: OP.IDENTIFY,
+                  d: {
+                    token: this.token ?? '',
+                    intents: INTENTS,
+                    properties: { os: 'linux', browser: 'parley', device: 'parley' },
+                  },
+                }),
+              );
+              break;
             }
-            break;
+            case OP.DISPATCH: {
+              if (typeof payload.s === 'number') this.seq = payload.s;
+              if (payload.t === 'READY' && !ready) {
+                ready = true;
+                readyAt = Date.now();
+                this.live = true;
+                clearTimeout(handshake);
+                resolve();
+              } else if (payload.t === 'MESSAGE_CREATE') {
+                const d = dispatchedMessage(payload.d);
+                if (d === undefined) {
+                  this.warn(
+                    `gateway sent a MESSAGE_CREATE with no usable id or channel_id (${shapeOf(
+                      payload.d,
+                    )}); dropping it`,
+                  );
+                  break;
+                }
+                const sub = this.subs.get(d.channel_id);
+                if (sub !== undefined) {
+                  try {
+                    sub.handler(toMessage(sub.topic, d));
+                  } catch {
+                    /* handler is best-effort; never break the loop (DESIGN §6) */
+                  }
+                }
+                const waiting = this.waiters.get(d.channel_id);
+                if (waiting !== undefined) for (const fire of [...waiting]) fire();
+              }
+              break;
+            }
+            case OP.HEARTBEAT: {
+              ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
+              break;
+            }
+            case OP.RECONNECT: {
+              ws.close();
+              break;
+            }
+            case OP.INVALID_SESSION: {
+              this.invalidSessionWaitMs =
+                INVALID_SESSION_MIN_WAIT_MS + Math.floor(Math.random() * INVALID_SESSION_SPREAD_MS);
+              ws.close();
+              break;
+            }
+            case OP.HEARTBEAT_ACK: {
+              awaitedAck = false;
+              break;
+            }
+            default:
+              break;
           }
-          case OP.HEARTBEAT: {
-            ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
-            break;
-          }
-          case OP.RECONNECT: {
-            ws.close();
-            break;
-          }
-          case OP.INVALID_SESSION: {
-            this.invalidSessionWaitMs =
-              INVALID_SESSION_MIN_WAIT_MS + Math.floor(Math.random() * INVALID_SESSION_SPREAD_MS);
-            ws.close();
-            break;
-          }
-          case OP.HEARTBEAT_ACK: {
-            awaitedAck = false;
-            break;
-          }
-          default:
-            break;
+        } catch (err) {
+          this.warn(
+            `gateway frame op ${String(payload.op)} could not be handled ` +
+              `(${reasonOf(err)}); closing the socket so the ladder retries`,
+          );
+          ws.close();
         }
       });
 
@@ -1044,6 +1075,33 @@ const countCharacters = (content: string): number => [...content].length;
 /** The text of a caught rejection, for a diagnostic that must never crash on a non-Error. */
 const reasonOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** How a refused gateway payload is named in a diagnostic, without quoting the payload itself. */
+const shapeOf = (d: unknown): string => (d === null ? 'null' : `a ${typeof d}`);
+
+/**
+ * A HELLO's heartbeat period, or undefined when the gateway sent no usable one. Refuse a
+ * non-positive interval as well as a missing one, so that a `0` cannot turn `setInterval` into a
+ * per-millisecond beat against Discord's rate limiter.
+ */
+function heartbeatIntervalOf(d: unknown): number | undefined {
+  if (typeof d !== 'object' || d === null) return undefined;
+  const { heartbeat_interval: ms } = d as { heartbeat_interval?: unknown };
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+/**
+ * A MESSAGE_CREATE payload, or undefined when it carries no usable routing key or id. `id` becomes
+ * both `backendMsgId` and `cursor`, so a frame without one would cross the seam carrying `undefined`
+ * into core's dedup set and into the cursor it persists for the topic.
+ */
+function dispatchedMessage(d: unknown): DiscordMessage | undefined {
+  if (typeof d !== 'object' || d === null) return undefined;
+  const { channel_id: channel, id } = d as { channel_id?: unknown; id?: unknown };
+  return typeof channel === 'string' && typeof id === 'string'
+    ? (d as unknown as DiscordMessage)
+    : undefined;
+}
+
 /** Discord's numeric error code from a JSON error body, or undefined when the body is not one. */
 function errorCode(raw: string): number | undefined {
   try {
@@ -1052,6 +1110,24 @@ function errorCode(raw: string): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Refuse a channel id that cannot survive as a path segment. `encodeURIComponent` is what keeps a
+ * topic string inside `/channels/<id>/…`, and it leaves `.` and `..` untouched — but those are DOT
+ * SEGMENTS, which the URL parser removes, so such an id silently retargets the call at a different
+ * Discord route instead of naming a channel. Keep the refusal here, so that every entry point
+ * resolving a topic is covered by one check.
+ */
+function requireRoutableChannel(topic: Topic, id: string): string {
+  if (id === '' || /^\.{1,2}$/.test(id)) {
+    throw new Error(
+      `Discord topic ${JSON.stringify(topic as string)} resolves to channel id ` +
+        `${JSON.stringify(id)}, which is not a usable URL path segment; point the topic at a real ` +
+        'channel id (directly or through channel_map)',
+    );
+  }
+  return id;
 }
 
 /**

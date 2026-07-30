@@ -104,6 +104,8 @@ export interface FakeDiscord {
   ): void;
   /** Requests received so far, optionally filtered to paths containing `pathIncludes`. */
   requestCount(pathIncludes?: string): number;
+  /** The raw `path?query` of every request received so far, oldest first — undecoded. */
+  requests(): string[];
   /** Close every connected gateway socket with an explicit gateway close code. */
   closeGateway(code: number): void;
   close(): Promise<void>;
@@ -331,6 +333,7 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
       pathIncludes === undefined
         ? requests.length
         : requests.filter((p) => p.includes(pathIncludes)).length,
+    requests: () => [...requests],
     closeGateway: (code: number) => {
       for (const ws of sockets.keys()) ws.close(code);
     },
