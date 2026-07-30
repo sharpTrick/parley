@@ -67,6 +67,18 @@ commit (`scripts/careening-worktrees.mjs`). That makes "full-surface at commit X
 than a matter of the orchestrator's discipline, and it makes mutating source safe, which is what
 lets mutation-testing be required below.
 
+Worktrees isolate an agent's *repository*, and **not** the scratchpad. Every concurrent agent is
+handed the same scratch directory, so a backup written there under an obvious name — `index.ts.bak`
+— is a filename two agents will pick independently. In round 7 they did: the Matrix agent restored
+its backup and got **bridge-slack's source into `bridge-matrix/src/index.ts`**, and the Postgres
+agent hit the mirror image of the same collision. Both caught it and recovered from git, but a run
+that did not would have committed one package's implementation into another.
+
+So: **scratch files go under a per-target path** (`/tmp/careening/<target>-scratch/`), never the
+shared scratchpad, and never a bare name in a shared directory. Better still, do not back a file up
+at all — the worktree is a git checkout, so `git checkout -- <file>` restores it from a source no
+sibling can write to.
+
 Worktrees isolate the filesystem and **not** the backing services. A shared Redis, Postgres,
 Synapse, Prosody, Keycloak and NATS are one destructive test away from taking down every concurrent
 agent, and even without that, contention produces false reds — the NATS outage tests passed alone

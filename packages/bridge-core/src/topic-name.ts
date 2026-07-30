@@ -28,7 +28,7 @@ export const MAX_HASH_LEN = createHash('sha1').update('').digest('hex').length;
  * that fold is LOSSY for this topic — i.e. the sanitized form differs from the raw topic string
  * (character replacement, lowercasing, or truncation) — we append `<sep><shorthash(raw)>` so two
  * distinct topics can never share one backend name.
- * Hash is over the RAW topic's UTF-8 bytes, exactly like bridge-postgres channelFor.
+ * Hash is over the RAW topic's UTF-8 bytes.
  *
  * A naturally-safe topic passes through unchanged so existing rooms/streams keep their readable
  * names — EXCEPT when it already looks like a disambiguated name, which would otherwise let a

@@ -124,6 +124,61 @@ describe('source hygiene', () => {
   const TEMPORAL =
     /unchanged from today|as of (?:today|now|this writing)|at the time of writing|\bin round \d|\bthe reviewer\b|\bas things stand\b|\bfor the time being\b/i;
 
+  /**
+   * The prime directive as a prose rule. `bridge-core` must never depend on a backend plugin, and a
+   * comment that explains core's behaviour by pointing AT one is that dependency in the only form
+   * the import graph cannot catch. It also rots invisibly: the instance that prompted this rule said
+   * core's `safeName` hashed "exactly like bridge-postgres channelFor", and the two had long since
+   * diverged — truncated sha1 against full md5 — so the sentence was both a violation and false.
+   *
+   * This file is exempt, so that the rule can name the packages it bans.
+   */
+  const BACKEND_PACKAGES = [
+    'sqlite',
+    'redis',
+    'postgres',
+    'matrix',
+    'xmpp',
+    'nats',
+    'zulip',
+    'discord',
+    'slack',
+    'telegram',
+  ];
+  const PLUGIN_REFERENCE = new RegExp(`\\bbridge-(?:${BACKEND_PACKAGES.join('|')})\\b`);
+  const coreFiles = codeFiles.filter(
+    (f) => f.includes('/packages/bridge-core/src/') && !f.endsWith('source-hygiene.test.ts'),
+  );
+
+  it('finds core files to check (guards against a broken filter)', () => {
+    expect(coreFiles.length).toBeGreaterThan(20);
+  });
+
+  it.each([
+    ['a plugin package', 'bridge-postgres', true],
+    ['a plugin package mid-sentence', 'hashed like bridge-matrix does', true],
+    ['the core package itself', 'bridge-core owns this', false],
+    ['a backend word that is not a package', 'the postgres backend does this too', false],
+  ])('the plugin-reference rule matches %s', (_label, text, expected) => {
+    expect(PLUGIN_REFERENCE.test(text)).toBe(expected);
+  });
+
+  it('no comment or test name in bridge-core names a backend plugin package', () => {
+    const offenders: string[] = [];
+    for (const f of coreFiles) {
+      readFileSync(f, 'utf8')
+        .split('\n')
+        .forEach((line, i) => {
+          if (PLUGIN_REFERENCE.test(commentaryOf(line)))
+            offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
+        });
+    }
+    expect(
+      offenders,
+      'core explains itself without naming a backend — dependencies point one way in prose too',
+    ).toEqual([]);
+  });
+
   it.each([
     ['cites an issue tracker', TRACKER, 'cite the behaviour, not the ticket'],
     ['dates itself', TEMPORAL, 'state the risk, not when it was written'],
