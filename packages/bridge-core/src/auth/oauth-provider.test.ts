@@ -12,6 +12,7 @@ import {
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { escapeHtml } from './html.js';
 import { ParleyOAuthProvider, type ParleyOAuthProviderOptions } from './oauth-provider.js';
 
 const RESOURCE = new URL('https://bridge.example/mcp');
@@ -1166,4 +1167,124 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
       expect(p.clientsStore.getClient('squatter-0')).toBeDefined();
     },
   );
+});
+
+/**
+ * The consent page is the one document where the owner types their passphrase, and everything on it
+ * except the passphrase field is interpolated from somewhere a client can reach. A corpus of benign
+ * values renders identically with or without the escape at any given site, so the table below is
+ * keyed on the SITE rather than the value: each one is driven with material that breaks out of HTML
+ * and asserted to arrive escaped.
+ */
+const HOSTILE_PAYLOADS: string[] = [
+  '"><script>alert(1)</script>',
+  '</strong><img/src=x/onerror=alert(1)>',
+  "'onmouseover='alert(1)",
+  'a&b',
+];
+
+interface InterpolationSite {
+  name: string;
+  /** Wrap the payload in the carrier that reaches this site; the page must show the CARRIER escaped. */
+  carry: (payload: string) => string;
+  render: (carried: string) => Promise<string>;
+}
+
+async function renderConsentPage(overrides: {
+  clientName?: string;
+  scopes?: string[];
+  redirectUri?: string;
+  consentPath?: string;
+}): Promise<string> {
+  const redirectUri = overrides.redirectUri ?? REDIRECT;
+  const scopes = overrides.scopes ?? ['mcp'];
+  let html = '';
+  const res: Record<string, unknown> = {
+    req: { method: 'GET', query: { redirect_uri: redirectUri }, body: {} },
+  };
+  res.status = () => res;
+  res.type = () => res;
+  res.send = (body: string) => {
+    html = body;
+    return res;
+  };
+  const p = makeProvider(() => 1, {
+    scopesSupported: scopes,
+    ...(overrides.consentPath !== undefined ? { consentPath: overrides.consentPath } : {}),
+  });
+  const client = {
+    client_id: 'client-1',
+    redirect_uris: [redirectUri],
+    ...(overrides.clientName !== undefined ? { client_name: overrides.clientName } : {}),
+  } as OAuthClientInformationFull;
+  await p.authorize(client, makeParams({ redirectUri, scopes }), res as unknown as Response);
+  return html;
+}
+
+const INTERPOLATION_SITES: InterpolationSite[] = [
+  {
+    name: 'the client-supplied name',
+    carry: (payload) => payload,
+    render: (carried) => renderConsentPage({ clientName: carried }),
+  },
+  {
+    name: 'a requested scope',
+    carry: (payload) => payload,
+    render: (carried) => renderConsentPage({ scopes: [carried] }),
+  },
+  {
+    name: 'the redirect target',
+    carry: (payload) => `myapp:${payload}`,
+    render: (carried) => renderConsentPage({ redirectUri: carried }),
+  },
+  {
+    name: "the consent form's action path",
+    carry: (payload) => `/parley/${payload}`,
+    render: (carried) => renderConsentPage({ consentPath: carried }),
+  },
+];
+
+describe('ParleyOAuthProvider — every value the consent page interpolates arrives escaped', () => {
+  const ROWS = INTERPOLATION_SITES.flatMap((site) =>
+    HOSTILE_PAYLOADS.map((payload): [string, InterpolationSite, string] => [
+      `${site.name} carrying ${payload}`,
+      site,
+      payload,
+    ]),
+  );
+
+  it.each(ROWS)('%s', async (_name: string, site: InterpolationSite, payload: string) => {
+    const carried = site.carry(payload);
+    const html = await site.render(carried);
+
+    expect(html).toContain(escapeHtml(carried));
+    expect(html).not.toContain(carried);
+  });
+});
+
+/**
+ * A behavioural row can only reach a site a request can reach, and `consent_id` is server-minted —
+ * so its escape, and the escape at whatever site someone adds next, is pinned by nothing above.
+ * Read the interpolations out of the template itself and require every one to pass through the
+ * shared escaper.
+ */
+describe('ParleyOAuthProvider — the consent template escapes at every interpolation, reachable or not', () => {
+  const source = readFileSync(fileURLToPath(new URL('oauth-provider.ts', import.meta.url)), 'utf8');
+  const start = source.indexOf('private consentPage(');
+  const template = source.slice(start, source.indexOf('\n  }\n', start));
+  const bound = new Map(
+    [...template.matchAll(/const (\w+) = (.+);$/gm)].map((m): [string, string] => [m[1]!, m[2]!]),
+  );
+  const interpolations = [...new Set([...template.matchAll(/\$\{([^}]*)\}/g)].map((m) => m[1]!.trim()))];
+
+  it('finds the interpolations to check', () => {
+    expect(start).toBeGreaterThan(0);
+    expect(interpolations.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it.each(interpolations.map((expr) => [expr]))('${%s} is escaped', (expr: string) => {
+    const escapedInPlace = expr.includes('escapeHtml');
+    const escapedWhereBound = bound.get(expr)?.includes('escapeHtml') ?? false;
+    expect(escapedInPlace || escapedWhereBound).toBe(true);
+  });
 });

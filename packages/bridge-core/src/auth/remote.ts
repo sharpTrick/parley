@@ -37,6 +37,12 @@ export interface OAuthRemoteOptions {
 
 const CONSENT_PATH = '/parley/consent';
 
+/**
+ * The built-in OAuth front door. Its `close()` is TERMINAL, unlike the idempotent and re-listenable
+ * one on {@link RemoteHttpServer} it extends: it drops every issued credential and shuts down the
+ * provider's sweeper and the rate limiters' stores, none of which are re-armed. A later `listen()`
+ * is refused rather than serving a complete authorization server whose background eviction is dead.
+ */
 export interface OAuthRemoteServer extends RemoteHttpServer {
   provider: ParleyOAuthProvider;
   /** The canonical RFC 8707 resource identifier (token audience). */
@@ -116,6 +122,7 @@ export function createOAuthRemoteApp(
       // Owner-consent submit (browser-driven). The /authorize handler renders a consent page that
       // POSTs here; on the correct owner passphrase we mint the code and redirect back to Claude.
       app.post(CONSENT_PATH, consentLimiter, express.urlencoded({ extended: false }), async (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
         const body = (req.body ?? {}) as Record<string, unknown>;
         const consentId = String(body.consent_id ?? '');
         const passphrase = String(body.passphrase ?? '');
@@ -139,10 +146,19 @@ export function createOAuthRemoteApp(
   hardenErrorSurface(remote.app);
 
   const closeHttp = remote.close.bind(remote);
+  const listenHttp = remote.listen.bind(remote);
+  let closed = false;
   return Object.assign(remote, {
     provider,
     resource,
+    listen: async (port: number, host?: string) => {
+      if (closed) {
+        throw new Error('this remote auth app has been closed and cannot listen again');
+      }
+      return listenHttp(port, host);
+    },
     close: async (): Promise<void> => {
+      closed = true;
       provider.stop();
       for (const store of stores) store.shutdown();
       await closeHttp();

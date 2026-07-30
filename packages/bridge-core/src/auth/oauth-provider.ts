@@ -75,6 +75,13 @@ function redirectUriWasSupplied(res: Response): boolean {
   return (body?.redirect_uri ?? query?.redirect_uri) !== undefined;
 }
 
+// Keep this filter, so that `scope=` or a doubled space cannot be refused as an unsupported scope
+// whose name is the empty string — an error_description naming nothing, on a flow the client cannot
+// recover from. RFC 6749 §3.3 spells a scope token `1*NQCHAR`: an empty one never names one.
+function namedScopes(scopes: string[]): string[] {
+  return scopes.filter((s) => s.length > 0);
+}
+
 export interface ParleyOAuthProviderOptions {
   /** Canonical resource (RS) identifier = the public /mcp URL (no trailing slash). Audience for tokens. */
   resource: URL;
@@ -235,15 +242,17 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     res: Response,
   ): Promise<void> {
     this.assertResource(params.resource);
-    this.assertScopes(params.scopes);
+    const consented =
+      params.scopes === undefined ? params : { ...params, scopes: namedScopes(params.scopes) };
+    this.assertScopes(consented.scopes);
     const consentId = randomUUID();
     this.pending.set(consentId, {
       client,
-      params,
+      params: consented,
       redirectUriSupplied: redirectUriWasSupplied(res),
       expiresAtMs: this.now() + CONSENT_TTL_MS,
     });
-    res.status(200).type('html').send(this.consentPage(consentId, client, params));
+    res.status(200).type('html').send(this.consentPage(consentId, client, consented));
   }
 
   /**
@@ -336,7 +345,8 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     if (rec === undefined || rec.clientId !== client.client_id || rec.expiresAtMs < this.now()) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
-    if (scopes !== undefined && !scopes.every((s) => rec.scopes.includes(s))) {
+    const requested = scopes === undefined ? undefined : namedScopes(scopes);
+    if (requested !== undefined && !requested.every((s) => rec.scopes.includes(s))) {
       throw new InvalidScopeError('requested scope exceeds the original grant');
     }
     this.assertResource(resource);
@@ -345,7 +355,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     this.revokeGrant(rec.grantId);
     return this.issue(
       client.client_id,
-      scopes ?? rec.scopes,
+      requested ?? rec.scopes,
       resource?.href ?? rec.resource,
       rec.grantId,
     );

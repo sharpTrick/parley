@@ -57,7 +57,7 @@ afterEach(async () => {
 });
 
 /** Drive the full connector OAuth flow and return tokens. */
-async function runOAuthFlow(passphrase = OWNER_PASS) {
+async function runOAuthFlow(scope = 'mcp') {
   // (a) Protected Resource Metadata (RFC 9728) — note the /mcp suffix on the well-known path.
   const prm = await jget(await fetch(`${origin}/.well-known/oauth-protected-resource/mcp`));
   expect(prm.resource).toBe(`${origin}/mcp`);
@@ -95,7 +95,7 @@ async function runOAuthFlow(passphrase = OWNER_PASS) {
     code_challenge_method: 'S256',
     state,
     resource: `${origin}/mcp`,
-    scope: 'mcp',
+    scope,
   });
   const consentHtml = await (await fetch(authorizeUrl.href)).text();
   const consentId = /name="consent_id" value="([^"]+)"/.exec(consentHtml)?.[1];
@@ -105,7 +105,7 @@ async function runOAuthFlow(passphrase = OWNER_PASS) {
   const consentRes = await fetch(`${origin}/parley/consent`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: form({ consent_id: consentId!, passphrase }),
+    body: form({ consent_id: consentId!, passphrase: OWNER_PASS }),
     redirect: 'manual',
   });
   expect(consentRes.status).toBe(302);
@@ -128,10 +128,10 @@ async function runOAuthFlow(passphrase = OWNER_PASS) {
     }),
   });
   expect(tokRes.status).toBe(200);
-  const tokens = await jget(tokRes);
+  const tokens = await jget(tokRes.clone());
   expect(tokens.access_token).toBeTruthy();
   expect(tokens.refresh_token).toBeTruthy();
-  return { client, tokens, asMeta: as };
+  return { client, tokens, asMeta: as, tokenRes: tokRes };
 }
 
 async function mcpClientWithToken(accessToken: string): Promise<Client> {
@@ -865,6 +865,27 @@ const REDIRECT_CORPUS: RedirectRendering[] = [
     redirectUri: 'https://exämple.test/cb',
     identity: 'https://xn--exmple-cua.test',
   },
+  // The scheme denylist stops javascript:/data:, but any other opaque scheme registers, and WHATWG
+  // URL leaves < > " & ' untouched in an opaque path — so this line is a stored-XSS sink on the very
+  // page the owner types the passphrase into unless it is escaped.
+  {
+    name: 'a custom scheme carrying a tag breakout',
+    redirectUri: 'myapp:"><script>alert(1)</script>',
+    identity: 'myapp:&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;',
+    absent: '<script>alert(1)</script>',
+  },
+  {
+    name: 'a custom scheme carrying an ampersand and a quote',
+    redirectUri: "myapp:cb?a=1&b='2",
+    identity: 'myapp:cb?a=1&amp;b=&#39;2',
+    absent: "b='2",
+  },
+  {
+    name: 'a custom scheme carrying a closing tag',
+    redirectUri: 'myapp:</strong><img/src=x/onerror=alert(1)>',
+    identity: 'myapp:&lt;/strong&gt;&lt;img/src=x/onerror=alert(1)&gt;',
+    absent: '<img/src=x',
+  },
 ];
 
 describe('the consent page names the redirect target for every URI that reaches it', () => {
@@ -1080,5 +1101,151 @@ describe('a rate limiter must key on the client the operator actually deploys be
     }
     expect(last!.status).toBe(429);
     expect((await LIMITED_ROUTES[0]!.hit(base, OWNER)).status).toBe(403);
+  });
+});
+
+/**
+ * RFC 6749 §5.1 and the OAuth 2.1 BCP make a response that conveys a credential `no-store`, and the
+ * SDK sets it on every endpoint it renders. The consent redirect carries the authorization code in
+ * its `Location`, and the 403 gates it — both are hand-mounted here, so the table drives the SDK's
+ * endpoints and Parley's own through the same assertion rather than trusting the hand-written ones
+ * to have remembered.
+ */
+interface CredentialResponse {
+  name: string;
+  status: number;
+  hit: () => Promise<Response>;
+}
+
+const CREDENTIAL_RESPONSES: CredentialResponse[] = [
+  {
+    name: 'the /authorize consent page',
+    status: 200,
+    hit: async () => {
+      const as = await asMetadata();
+      const { body: client } = await dcr(as);
+      return authorizeRequest(as, client.client_id);
+    },
+  },
+  {
+    name: 'a dynamic client registration at /register',
+    status: 201,
+    hit: async () => (await dcr(await asMetadata())).res,
+  },
+  {
+    name: 'the authorization-code exchange at /token',
+    status: 200,
+    hit: async () => (await runOAuthFlow()).tokenRes,
+  },
+  {
+    name: 'a revocation at /revoke',
+    status: 200,
+    hit: async () => {
+      const { client, tokens, asMeta } = await runOAuthFlow();
+      return fetch(asMeta.revocation_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: form({ token: tokens.access_token, client_id: client.client_id }),
+      });
+    },
+  },
+  {
+    name: 'the owner-approved /parley/consent redirect carrying the code',
+    status: 302,
+    hit: async () => postConsent(await authorizeToConsentId(), OWNER_PASS),
+  },
+  {
+    name: 'the refused /parley/consent page',
+    status: 403,
+    hit: () => postConsent('nonexistent', 'wrong'),
+  },
+];
+
+describe('every front-door response that carries or gates a credential is no-store', () => {
+  it.each(CREDENTIAL_RESPONSES.map((r) => [r.name, r]))(
+    '%s',
+    async (_name: string, r: CredentialResponse) => {
+      const res = await r.hit();
+      expect(res.status).toBe(r.status);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+    },
+  );
+});
+
+/**
+ * `scope` is one space-delimited field, and the SDK tokenises it with `split(' ')` at BOTH /authorize
+ * and the refresh grant — so `scope=`, a stray leading space or a doubled one each hand the provider
+ * an empty token. RFC 6749's `scope-token = 1*NQCHAR` means an empty token can never name a scope, so
+ * it has to be dropped rather than refused as an unsupported one: refusing it answers the client with
+ * an `invalid_scope` whose description names nothing at all. Every refused row therefore states the
+ * token the error must name, which a pair of happy values cannot express.
+ */
+interface ScopeRequest {
+  name: string;
+  scope: string;
+  /** The scope set the AS must settle on, or undefined when the request is refused. */
+  granted?: string[];
+  /** Refused rows only: the token the error_description must name. */
+  refuses?: string;
+}
+
+const SCOPE_REQUESTS: ScopeRequest[] = [
+  { name: 'the advertised scope', scope: 'mcp', granted: ['mcp'] },
+  { name: 'an empty scope parameter', scope: '', granted: [] },
+  { name: 'a lone space', scope: ' ', granted: [] },
+  { name: 'a trailing space', scope: 'mcp ', granted: ['mcp'] },
+  { name: 'a leading space', scope: ' mcp', granted: ['mcp'] },
+  { name: 'a doubled space', scope: 'mcp  mcp', granted: ['mcp'] },
+  { name: 'a tab where a space belongs', scope: 'mcp\tmcp', refuses: 'mcp\tmcp' },
+  { name: 'the advertised scope in the wrong case', scope: 'MCP', refuses: 'MCP' },
+  { name: 'an unadvertised scope beside a good one', scope: 'mcp admin', refuses: 'admin' },
+];
+
+const scopeSet = (scope: unknown): Set<string> =>
+  new Set(String(scope).split(' ').filter(Boolean));
+
+const SCOPE_ROWS = SCOPE_REQUESTS.map((r): [string, ScopeRequest] => [r.name, r]);
+
+describe('a degenerate scope token is dropped, and a named one is refused by name', () => {
+  it.each(SCOPE_ROWS)('%s at /authorize', async (_name: string, row: ScopeRequest) => {
+    if (row.granted !== undefined) {
+      const { tokens } = await runOAuthFlow(row.scope);
+      expect(scopeSet(tokens.scope)).toEqual(new Set(row.granted));
+      return;
+    }
+    const as = await asMetadata();
+    const { body: client } = await dcr(as);
+    const res = await authorizeRequest(as, client.client_id, { scope: row.scope });
+
+    const { code, body } = await oauthErrorOf(res);
+    expect(code).toBe('invalid_scope');
+    expect(body).not.toContain('consent_id');
+    const description = new URL(res.headers.get('location')!, origin).searchParams.get(
+      'error_description',
+    );
+    expect(description).toContain(row.refuses);
+  });
+
+  it.each(SCOPE_ROWS)('%s at the refresh grant', async (_name: string, row: ScopeRequest) => {
+    const { client, tokens, asMeta } = await runOAuthFlow();
+    const res = await fetch(asMeta.token_endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form({
+        grant_type: 'refresh_token',
+        refresh_token: tokens.refresh_token,
+        client_id: client.client_id,
+        resource: `${origin}/mcp`,
+        scope: row.scope,
+      }),
+    });
+
+    if (row.granted === undefined) {
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect((await jget(res)).error).toBe('invalid_scope');
+      return;
+    }
+    expect(res.status).toBe(200);
+    expect(scopeSet((await jget(res)).scope)).toEqual(new Set(row.granted));
   });
 });
