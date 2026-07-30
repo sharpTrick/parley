@@ -230,20 +230,20 @@ describe('redis subscribe hardening — xInfoStream catch must not replay histor
 // same refusals — but a caller of either has already been told the call succeeded, so a fault no
 // retry can clear must reach the operator on BOTH, while one that heals must be ridden out on both.
 // The axes that matter are the path and the reason, never the retry count.
-describe('redis hardening — a refusal is diagnosed on every XREAD path', () => {
-  const reasons: Array<[string, string, 'permanent' | 'transient']> = [
-    ['a bad BLOCK argument', 'ERR timeout is not an integer or out of range', 'permanent'],
-    ['an unauthenticated connection', 'NOAUTH Authentication required.', 'permanent'],
-    ['an ACL revoked mid-session', 'NOPERM this user has no permissions to run the xread command', 'permanent'],
-    ['a wrong password after failover', 'WRONGPASS invalid username-password pair', 'permanent'],
-    ['the key repurposed', 'WRONGTYPE Operation against a key holding the wrong kind of value', 'permanent'],
-    ['a closed client', 'ClientClosedError', 'transient'],
-    ['a reset socket', 'read ECONNRESET', 'transient'],
-    ['an unexpectedly closed socket', 'Socket closed unexpectedly', 'transient'],
-    ['a server still loading its dataset', 'LOADING Redis is loading the dataset in memory', 'transient'],
-    ['a failover redirect', 'MOVED 3999 127.0.0.1:6381', 'transient'],
-  ];
+const reasons: Array<[string, string, 'permanent' | 'transient']> = [
+  ['a bad BLOCK argument', 'ERR timeout is not an integer or out of range', 'permanent'],
+  ['an unauthenticated connection', 'NOAUTH Authentication required.', 'permanent'],
+  ['an ACL revoked mid-session', 'NOPERM this user has no permissions to run the xread command', 'permanent'],
+  ['a wrong password after failover', 'WRONGPASS invalid username-password pair', 'permanent'],
+  ['the key repurposed', 'WRONGTYPE Operation against a key holding the wrong kind of value', 'permanent'],
+  ['a closed client', 'ClientClosedError', 'transient'],
+  ['a reset socket', 'read ECONNRESET', 'transient'],
+  ['an unexpectedly closed socket', 'Socket closed unexpectedly', 'transient'],
+  ['a server still loading its dataset', 'LOADING Redis is loading the dataset in memory', 'transient'],
+  ['a failover redirect', 'MOVED 3999 127.0.0.1:6381', 'transient'],
+];
 
+describe('redis hardening — a refusal is diagnosed on every XREAD path', () => {
   const paths = ['subscribe', 'blocking fetchRecent'] as const;
 
   const rows = paths.flatMap((path) =>
@@ -349,6 +349,112 @@ describe('redis hardening — a refusal is diagnosed on every XREAD path', () =>
     } finally {
       stderr.mockRestore();
       await plugin.disconnect();
+    }
+  });
+});
+
+// CLASS: a permanent/transient axis with no DURATION to it. "Transient" is a judgement about
+// whether a retry could clear the fault, not an observation that one did — a `MOVED` this
+// non-cluster client can never follow, or a replica stuck `LOADING`, is classified transient and
+// retried forever. Every row above heals within three reads, so none of them can reach the state
+// that matters: `subscribe()` resolved, core still advertises the topic as subscribed, live
+// delivery has been dead since startup, and nothing was ever written anywhere.
+//
+// Driven off the same reason list, so a code added to the classifier is graded on both axes.
+// On fake timers, because the loop's own backoff is what makes a sustained fault take seconds of
+// wall clock to reach.
+describe('redis hardening — a transient fault that never clears is still reported', () => {
+  const transient = reasons.filter(([, , kind]) => kind === 'transient');
+
+  /** After how many failed reads the fake starts answering; `never` = the fault never clears. */
+  const durations: Array<[string, number | 'never']> = [
+    ['never clears', 'never'],
+    ['clears long after the loop went quiet', 7],
+  ];
+
+  const rows = transient.flatMap(([reason, message]) =>
+    durations.map(
+      ([duration, healAfter]) =>
+        [`${reason} (${message}) that ${duration}`, message, healAfter] as [
+          string,
+          string,
+          number | 'never',
+        ],
+    ),
+  );
+
+  const linesMatching = (stderr: ReturnType<typeof vi.spyOn>, re: RegExp): string[] =>
+    stderr.mock.calls.map((c) => String(c[0])).filter((line) => re.test(line));
+
+  it.each(rows)('%s', async (_label, message, healAfter) => {
+    vi.useFakeTimers();
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const plugin = new RedisPlugin();
+    await plugin.connect({ url: 'redis://mock' });
+
+    const delivered: string[] = [];
+    let failures = 0;
+    let served = false;
+    const reader = makeReader({
+      xRead: vi.fn((): Promise<XReadResult> => {
+        if (healAfter === 'never' || failures < healAfter) {
+          failures++;
+          return Promise.reject(new Error(message));
+        }
+        if (served) return new Promise((resolve) => setTimeout(() => resolve(null), 20));
+        served = true;
+        return Promise.resolve([
+          {
+            name: 'parley:ops',
+            messages: [{ id: '7-0', message: { sender: 'bob', content: 'healed', ts: '' } }],
+          },
+        ]);
+      }),
+    });
+    queue(reader);
+
+    try {
+      await plugin.subscribe(asTopic('ops'), (m) => delivered.push(m.content));
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const degraded = linesMatching(stderr, /DEGRADED/);
+      expect(
+        degraded,
+        'a fault classified transient failed every read and was never reported at all, so the ' +
+          'topic is indistinguishable from a quiet one',
+      ).toHaveLength(1);
+      expect(degraded[0]).toMatch(/^parley-redis:/);
+      expect(degraded[0], 'the operator cannot tell WHICH topic stopped delivering').toContain(
+        'ops',
+      );
+      expect(degraded[0], 'the line names no cause to act on').toContain(message);
+      expect(
+        linesMatching(stderr, /STOPPED/),
+        'a fault a retry can clear was reported as terminal',
+      ).toEqual([]);
+
+      if (healAfter === 'never') {
+        const reads = reader.xRead.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(
+          reader.xRead.mock.calls.length,
+          'the loop gave up instead of riding the fault out',
+        ).toBeGreaterThan(reads);
+        expect(
+          linesMatching(stderr, /DEGRADED/),
+          'one sustained fault floods stderr with a line per failed read',
+        ).toHaveLength(1);
+        expect(delivered).toEqual([]);
+      } else {
+        expect(delivered, 'the loop never recovered once the fault cleared').toEqual(['healed']);
+        const resumed = linesMatching(stderr, /RESUMED/);
+        expect(resumed, 'the recovery from a reported outage was never reported').toHaveLength(1);
+        expect(resumed[0]).toContain('ops');
+      }
+    } finally {
+      stderr.mockRestore();
+      await plugin.disconnect();
+      vi.useRealTimers();
     }
   });
 });

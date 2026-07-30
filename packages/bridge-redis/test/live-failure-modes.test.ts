@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { asHandle, type Cursor, type Topic } from '@sharptrick/parley-core';
+import { asBackendMsgId, asHandle, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { CONFIG_KEYS, createRedisClient, DEFAULT_URL, RedisPlugin } from '../src/index.js';
 import { label, rejectedByKnob } from './config-fixtures.js';
@@ -303,6 +303,64 @@ describe.skipIf(!redisUp)('redis failure modes — an accepted config still deli
   });
 });
 
+// -------------------------------------------------------------------------------------------
+// CLASS: a knob graded only by what connect() does with its VALUE, so the prose is free to explain
+// it by a mechanism it is not on the path of. `block_ms` is the XREAD BLOCK timeout — how long an
+// idle read parks before re-arming — and was documented in two places as `subscribe`'s shutdown
+// re-check interval, which `disconnect()` never waits for (it destroys the reader socket, breaking
+// the parked read at once). Both halves of the claim are measured here AGAINST THE INTERVAL, so the
+// rows cannot pass by the value being small, and the README rule that grades the prose cannot drift
+// away from the behaviour it describes.
+// -------------------------------------------------------------------------------------------
+
+describe.skipIf(!redisUp)('redis failure modes — block_ms is an idle re-arm interval only', () => {
+  const parked = async (
+    plugin: RedisPlugin,
+    topic: Topic,
+    handler: (m: { content: string }) => void = () => undefined,
+  ): Promise<void> => {
+    await plugin.subscribe(topic, handler);
+    await new Promise((r) => setTimeout(r, 200)); // let the loop reach its first XREAD BLOCK
+  };
+
+  it.each([2000, 60_000])('disconnect() does not wait out a block_ms of %i', async (blockMs) => {
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    const t = freshTopic();
+    try {
+      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: blockMs });
+      await parked(plugin, t);
+      const started = Date.now();
+      await plugin.disconnect();
+      expect(
+        Date.now() - started,
+        `disconnect() waited out the block_ms of ${blockMs}, so it IS a shutdown knob`,
+      ).toBeLessThan(blockMs / 2);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      await wipe(prefix);
+    }
+  });
+
+  it('a live post is delivered without waiting out a block_ms of 60000', async () => {
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    const t = freshTopic();
+    const live: string[] = [];
+    try {
+      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 60_000 });
+      // Parked FIRST, so the row cannot pass on the first read happening to land after the post:
+      // a loop that re-armed on a timer instead of blocking would be asleep for the interval here.
+      await parked(plugin, t, (m) => live.push(m.content));
+      await plugin.post(t, asHandle('w'), 'pushed');
+      await expect.poll(() => live, { timeout: 5000, interval: 50 }).toEqual(['pushed']);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      await wipe(prefix);
+    }
+  });
+});
+
 // The teardown-ordering half of the same class: connect() validates its WHOLE config before it tears
 // the previous connection down, so a value an operator got wrong can never leave a live bridge with
 // no client and every later seam call answering "not connected". Driven over every rejection row of
@@ -473,6 +531,72 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
 });
 
 // -------------------------------------------------------------------------------------------
+// CLASS: a value this plugin writes to the backend that NO seam-level assertion can observe.
+// `Message` carries no reply member and `rowToMessage` never reads one, so `in_reply_to` — the
+// seam's only threading argument — could be dropped from the XADD with the whole suite green,
+// including the conformance clause that posts with `inReplyTo` and reads the reply back. The stream
+// outlives this plugin version and is shared with every other session and anyone holding a
+// redis-cli, so what is on the wire is a contract even where nothing in this process reads it back.
+//
+// Read back through an INDEPENDENT client and graded from the entry's own field map, so a field
+// added to `post` later is pulled into the table rather than escaping it by being new.
+// -------------------------------------------------------------------------------------------
+
+describe.skipIf(!redisUp)('redis failure modes — what post writes is what the stream holds', () => {
+  const parents: Array<[string, string | undefined]> = [
+    ['a reply', '1700-3'],
+    ['a top-level post', undefined],
+  ];
+
+  it.each(parents)('%s carries every declared field and no others', async (_label, parent) => {
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    const writer = createRedisClient(REDIS_URL, FAST);
+    const t = freshTopic();
+    try {
+      await writer.connect();
+      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
+      const before = Date.now();
+      const id = await plugin.post(
+        t,
+        asHandle('alice'),
+        'hello',
+        parent === undefined ? undefined : { inReplyTo: asBackendMsgId(parent) },
+      );
+      const after = Date.now();
+
+      const [entry] = await writer.xRange(`${prefix}${t}`, id, id);
+      const fields = entry?.message ?? {};
+      const expected: Record<string, (value: string) => void> = {
+        sender: (v) => expect(v).toBe('alice'),
+        content: (v) => expect(v).toBe('hello'),
+        ts: (v) => {
+          expect(v, 'ts is not in ISO 8601 form (DESIGN §5)').toBe(
+            new Date(Date.parse(v)).toISOString(),
+          );
+          expect(Date.parse(v)).toBeGreaterThanOrEqual(before - 1000);
+          expect(Date.parse(v)).toBeLessThanOrEqual(after + 1000);
+        },
+        in_reply_to: (v) =>
+          expect(v, 'the seam threading argument was dropped on the floor').toBe(parent ?? ''),
+      };
+
+      expect(
+        Object.keys(fields).sort(),
+        'a field post writes has no declared expectation here (or a declared one never arrived)',
+      ).toEqual(Object.keys(expected).sort());
+      for (const [field, assertValue] of Object.entries(expected)) {
+        assertValue(fields[field] ?? '');
+      }
+    } finally {
+      await writer.disconnect().catch(() => undefined);
+      await plugin.disconnect().catch(() => undefined);
+      await wipe(prefix);
+    }
+  });
+});
+
+// -------------------------------------------------------------------------------------------
 // CLASS: a cursor's PROVENANCE decides the outcome — mine works, foreign throws labelled,
 // beyond-high-water self-heals. The wedge invariant below catches the whole class at once.
 // -------------------------------------------------------------------------------------------
@@ -531,6 +655,12 @@ describe.skipIf(!redisUp)('redis failure modes — cursor provenance', () => {
 // shapes below meaningful — they are derived from the uint64 bound each id component is, rather
 // than hand-picked, because a hand-picked ceiling value samples whichever spelling the server
 // happens to accept and grades a narrower class than the one it names.
+//
+//   * SPELLING. A stream entry id has more than one spelling, and `assertMintedCursor` calls every
+//     one of them well-formed, so core rethrows whatever a guard refuses. Shapes built from
+//     `BigInt.toString()` can only ever produce the spelling the plugin mints itself, which grades
+//     every boundary guard exclusively against its own output — and a guard that compares a cursor
+//     by STRING passes that grading while a leading zero walks straight past it.
 // -------------------------------------------------------------------------------------------
 
 interface Tail {
@@ -542,6 +672,25 @@ const tailOf = (id: string): Tail => {
   const [ms = '0', seq = '0'] = id.split('-');
   return { ms: BigInt(ms), seq: BigInt(seq) };
 };
+
+/** The same entry id, written with `msZeros`/`seqZeros` leading zeros on its components. */
+function respell(id: string, msZeros: number, seqZeros: number): string {
+  const pad = (part: string, zeros: number): string => `${'0'.repeat(zeros)}${part}`;
+  const [ms = '0', seq] = id.split('-');
+  return seq === undefined ? pad(ms, msZeros) : `${pad(ms, msZeros)}-${pad(seq, seqZeros)}`;
+}
+
+/**
+ * Every spelling of one id core can hand back. A bare-ms id has no sequence to pad, so its
+ * sequence rows collapse onto the millisecond ones — deliberately, since which components a shape
+ * even has is part of what the axis grades.
+ */
+const spellings: Array<[string, (id: string) => string]> = [
+  ['as this backend mints it', (id) => id],
+  ['with a leading zero on the millisecond', (id) => respell(id, 1, 0)],
+  ['with a leading zero on the sequence', (id) => respell(id, 0, 1)],
+  ['zero-padded on both components', (id) => respell(id, 3, 3)],
+];
 
 type Writer = ReturnType<typeof createRedisClient>;
 
@@ -613,13 +762,15 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
   ];
 
   const rows = states.flatMap(([stateLabel, seed]) =>
-    shapes.map(
-      ([shapeLabel, mint]) =>
-        [`${shapeLabel}, on a stream ${stateLabel}`, seed, mint] as [
-          string,
-          StreamState,
-          (tail: Tail) => string,
-        ],
+    shapes.flatMap(([shapeLabel, mint]) =>
+      spellings.map(
+        ([spellingLabel, respellIt]) =>
+          [
+            `${shapeLabel} ${spellingLabel}, on a stream ${stateLabel}`,
+            seed,
+            (tail: Tail) => respellIt(mint(tail)),
+          ] as [string, StreamState, (tail: Tail) => string],
+      ),
     ),
   );
 
@@ -661,11 +812,24 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
   // back untouched. Healing it re-delivers the whole retained history as if it were new. Reaching
   // the comparison at all requires an empty XRANGE, so the entries are deleted while the stream (and
   // its last-generated-id) survives — which is what a retention trim leaves behind.
-  const belowTail: Array<[string, (tail: Tail) => string]> = [
+  const belowTailShapes: Array<[string, (tail: Tail) => string]> = [
     ['the tail itself', (t) => `${t.ms}-${t.seq}`],
     ['one sequence below the tail', (t) => `${t.ms}-${t.seq - 1n}`],
     ['one millisecond below the tail', (t) => `${t.ms - 1n}-0`],
   ];
+
+  // Carrying the same spelling axis here is what keeps the fix to the heal honest in BOTH
+  // directions: canonicalising a cursor on the way in would satisfy every ceiling row above while
+  // silently rewriting a live cursor into one the caller never minted.
+  const belowTail = belowTailShapes.flatMap(([shapeLabel, mint]) =>
+    spellings.map(
+      ([spellingLabel, respellIt]) =>
+        [`${shapeLabel} ${spellingLabel}`, (tail: Tail) => respellIt(mint(tail))] as [
+          string,
+          (tail: Tail) => string,
+        ],
+    ),
+  );
 
   it.each(belowTail)('echoes a cursor at or below the tail: %s', async (_label, mint) => {
     const prefix = freshPrefix();

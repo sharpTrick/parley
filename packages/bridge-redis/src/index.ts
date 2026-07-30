@@ -46,6 +46,16 @@ const UNKNOWN_SENDER = 'unknown';
  * Everything else (socket faults, `LOADING`, failover redirects) heals on its own and is retried.
  */
 const PERMANENT_SERVER_ERROR = /^(ERR|NOAUTH|WRONGPASS|NOPERM|WRONGTYPE|NOPROTO|EXECABORT)\b/;
+/** First and largest wait between two failed reads of the `subscribe` loop. */
+const RETRY_BASE_MS = 100;
+const RETRY_MAX_MS = 2000;
+/**
+ * Consecutive failed reads before the `subscribe` loop calls a fault it classified as transient
+ * SUSTAINED and says so once. A fault that in fact never clears — a cluster redirect a non-cluster
+ * client can never follow, a replica stuck `LOADING` — otherwise leaves live delivery dead and
+ * completely silent behind a `subscribe()` that resolved.
+ */
+const DEGRADED_AFTER_FAILURES = 5;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -56,8 +66,10 @@ export interface RedisBackendConfig {
   /** Stream key prefix. Default `parley:`. One Redis Stream per topic: `<prefix><topic>`. */
   key_prefix?: string;
   /**
-   * `XREAD BLOCK` timeout (ms) — the `subscribe` loop re-checks for shutdown each interval. Default
-   * 2000. Must be a positive whole number; anything else is rejected by `connect()`.
+   * `XREAD BLOCK` timeout (ms) — how long the `subscribe` loop parks per read before re-arming on
+   * an idle stream. A cost knob only: delivery is driven by the read waking, and `disconnect()`
+   * destroys the reader socket rather than waiting out the interval. Default 2000. Must be a
+   * positive whole number; anything else is rejected by `connect()`.
    */
   block_ms?: number;
   /**
@@ -561,8 +573,12 @@ export class RedisPlugin implements BackendPlugin {
       // and is refused outright (`ERR invalid start ID for the interval`), which would wedge the
       // topic — the one thing the heal exists to prevent. Nothing can sort after that id, so the
       // empty page is also the honest answer.
+      //
+      // Keep the comparison NUMERIC, so that a spelling of the same id — `018446744073709551615-…`,
+      // which the cursor validator accepts as well-formed — cannot slip past the guard and reach
+      // that refusal anyway.
       entries =
-        since === MAX_ENTRY_ID
+        compareIds(since, MAX_ENTRY_ID) >= 0
           ? []
           : await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
       // A well-formed but STALE cursor — minted against a different Redis, a re-created dataset, or
@@ -712,6 +728,8 @@ export class RedisPlugin implements BackendPlugin {
     }
 
     const loop = async (): Promise<void> => {
+      let failures = 0;
+      let degraded = false;
       while (gen === this.generation) {
         let res:
           | Array<{ name: string; messages: Array<{ id: string; message: Record<string, string> }> }>
@@ -727,10 +745,18 @@ export class RedisPlugin implements BackendPlugin {
             reportLiveDeliveryStopped(this.url, topic, respError);
             break;
           }
-          await delay(100);
+          failures++;
+          if (failures === DEGRADED_AFTER_FAILURES) {
+            degraded = true;
+            reportLiveDeliveryDegraded(this.url, topic, failures, errorText(err));
+          }
+          await delay(Math.min(RETRY_BASE_MS * 2 ** (failures - 1), RETRY_MAX_MS));
           continue;
         }
         if (gen !== this.generation) break;
+        if (degraded) reportLiveDeliveryResumed(this.url, topic, failures);
+        degraded = false;
+        failures = 0;
         if (res === null) continue; // BLOCK timed out with no new entries
         for (const stream of res) {
           for (const entry of stream.messages) {
@@ -803,6 +829,31 @@ function reportLiveDeliveryStopped(url: string, topic: Topic, respError: string)
     `parley-redis: live delivery STOPPED for topic '${topic}' — the server refused the stream ` +
       `read: ${fromServer(url, respError)}. Catch-up still works; fix the cause and restart the ` +
       `bridge.\n`,
+  );
+}
+
+/**
+ * Keep this stderr line, so that a fault the loop keeps RETRYING does not look identical to a quiet
+ * topic either: the retry is right — the fault may still clear — but an operator whose stream reads
+ * have all failed has no other way to learn that live delivery has been dead since startup. Worded
+ * as still-retrying, so it is not confused with the STOPPED line above.
+ */
+function reportLiveDeliveryDegraded(
+  url: string,
+  topic: Topic,
+  failures: number,
+  error: string,
+): void {
+  process.stderr.write(
+    `parley-redis: live delivery DEGRADED for topic '${topic}' — ${failures} stream reads in a ` +
+      `row failed and it is still retrying: ${fromServer(url, error)}. Catch-up still works.\n`,
+  );
+}
+
+function reportLiveDeliveryResumed(url: string, topic: Topic, failures: number): void {
+  process.stderr.write(
+    `parley-redis: live delivery RESUMED for topic '${topic}' at ${endpointOf(url)} after ` +
+      `${failures} failed stream reads.\n`,
   );
 }
 

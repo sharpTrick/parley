@@ -39,15 +39,15 @@ catch-up semantics, and a budget below 1ms floors to nothing and returns immedia
 `WRONGTYPE` class that stops the `subscribe` loop) fails the call with a labelled error rather than
 being reported as an empty long poll, so the operator sees it instead of core re-opening a doomed
 reader for every nap of the granted budget. (Distinct from the `block_ms` config knob above, which
-is `subscribe`'s shutdown re-check interval.)
+is the `subscribe` loop's idle re-arm interval.)
 
 ## Config (`backend_config`)
 
 ```yaml
 backend_config:
-  url: "redis://127.0.0.1:6379"   # default
-  key_prefix: "parley:"            # default
-  block_ms: 2000                   # XREAD BLOCK timeout (shutdown re-check interval)
+  url: "redis://127.0.0.1:6379"   # default — the server every session shares
+  key_prefix: "parley:"            # default — one Stream per topic, key <prefix><topic>
+  block_ms: 2000                   # XREAD BLOCK timeout — the subscribe loop's idle re-arm interval
   connect_timeout_ms: 5000         # how long the first handshake may take before connect() fails
   retention_days: 30               # optional; omit (or null) to keep every entry forever (default)
 ```
@@ -66,6 +66,12 @@ the server reject every `XREAD`, which kills live push *permanently* behind a `s
 resolved, and `block_ms: 0` blocks the reader forever. Omit a key (or set it to `null`) for its
 default.
 
+`block_ms` is a **cost knob, not a latency or shutdown one**: it is how long each `XREAD` parks
+before re-arming on an idle stream, so it sets how often an idle subscription round-trips and
+nothing else. A message is delivered the moment the parked read wakes, whatever the interval is, and
+`disconnect()` destroys the reader socket rather than waiting the interval out — **shutdown does not
+wait for `block_ms`**, so raising it costs nothing at teardown and lowering it buys nothing there.
+
 An unreachable or wrong `url` makes `connect()` fail within `connect_timeout_ms` with
 `parley-redis: cannot reach <host>:<port>` on stderr — it never hangs waiting for a server that
 isn't there. `connect()` also issues one `PING`, so a server that is reachable but cannot serve the
@@ -83,6 +89,12 @@ transient faults, but a fault the server will never stop returning (`NOAUTH`, `N
 change, `WRONGTYPE` if the key is repurposed) stops the loop and writes one line to stderr —
 `parley-redis: live delivery STOPPED for topic '<topic>' …` — so a live path that can no longer
 deliver never looks like a quiet topic.
+
+A transient fault that in fact never clears — a `MOVED` redirect this non-cluster client can never
+follow, a replica stuck `LOADING` — would look quiet too, so the loop backs off (100ms doubling to
+2s) and, once several reads in a row have failed, writes one line naming the topic and the server's
+own error: `parley-redis: live delivery DEGRADED for topic '<topic>' … still retrying`. It keeps
+retrying, and writes a matching `RESUMED` line when a read finally succeeds.
 
 ## Credentials & exposure
 

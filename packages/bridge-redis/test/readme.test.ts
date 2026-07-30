@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { CONFIG_KEYS } from '../src/index.js';
 
 // CLASS: a shipped infra recipe must not be insecure by default. A copy-pasteable `docker run`
 // that publishes a port on every interface hands an unauthenticated Redis — full message history,
@@ -272,6 +273,7 @@ const documentedBehaviours: Array<[string, RegExp]> = [
   ['a cursor of no recognisable shape is rejected by name', /rejected with an error naming it/],
   ['a seam refusal names the plugin, the topic and the key', /labelled the same way, naming the plugin/],
   ['a permanent refusal stops live delivery loudly', /live delivery STOPPED/],
+  ['a transient fault that never clears is reported without giving up', /live delivery DEGRADED/],
   ['a sub-millisecond long-poll budget returns immediately', /floors to nothing and returns immediately/],
   ['a permanent refusal fails the long poll instead of emptying it', /rather than\s+being reported as an empty long poll/],
   ['retention trims approximately, and only on write', /approximate/],
@@ -283,6 +285,67 @@ describe('bridge-redis README — every behaviour the suite pins is described he
       phrase.test(text),
       `the README never describes it — nothing matches ${String(phrase)}`,
     ).toBe(true);
+  });
+});
+
+// CLASS: prose that explains a knob by a mechanism the knob is not on the path of. A knob's
+// accept/reject rules are documented exhaustively here, which reads as complete while saying
+// nothing an operator can act on — and round 8 found `block_ms` documented in two places as
+// `subscribe`'s "shutdown re-check interval" when `disconnect()` destroys the reader socket and
+// never waits for it, so lowering the knob to make shutdown responsive changes nothing but idle
+// churn. Generated from CONFIG_KEYS, so a knob added later with no declared observable fails here
+// instead of shipping described by nothing (or by the wrong thing).
+
+interface KnobProse {
+  /** The effect this knob actually has, which its prose must name. */
+  names: RegExp;
+  /**
+   * A mechanism the knob is NOT on the path of. Prose may still mention the two together — that is
+   * how a reader learns the knob is not the lever — but only while carrying `disclaims`.
+   */
+  notOnThePathOf?: { mechanism: RegExp; disclaims: RegExp };
+}
+
+const knobProse: Record<string, KnobProse> = {
+  url: { names: /the server every session shares/i },
+  key_prefix: { names: /one Stream per topic/i },
+  block_ms: {
+    names: /idle re-arm interval/i,
+    notOnThePathOf: {
+      mechanism: /shutdown|teardown|disconnect/i,
+      disclaims: /shutdown does not\s+wait for/i,
+    },
+  },
+  connect_timeout_ms: { names: /how long the first handshake may take/i },
+  retention_days: { names: /trims entries older than the window/i },
+};
+
+describe('bridge-redis README — every knob is described by an effect it has', () => {
+  it.each(CONFIG_KEYS)('%s', (knob) => {
+    const rule = knobProse[knob];
+    expect(
+      rule,
+      `no observable is declared for '${knob}', so its prose can describe anything at all`,
+    ).toBeDefined();
+    if (rule === undefined) return;
+
+    const blocks = paragraphsNaming(text, knob);
+    expect(blocks, `the README never mentions '${knob}'`).not.toEqual([]);
+    expect(
+      rule.names.test(text),
+      `the README never names what '${knob}' does — nothing matches ${String(rule.names)}`,
+    ).toBe(true);
+
+    const wrong = rule.notOnThePathOf;
+    if (wrong === undefined) return;
+    const claiming = blocks.filter(
+      (block) => wrong.mechanism.test(block) && !wrong.disclaims.test(block),
+    );
+    expect(
+      claiming,
+      `the README ties '${knob}' to ${String(wrong.mechanism)} — a mechanism it is not on the ` +
+        `path of — without saying so, so an operator tunes it expecting an effect it cannot have`,
+    ).toEqual([]);
   });
 });
 
