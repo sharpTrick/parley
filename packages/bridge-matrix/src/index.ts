@@ -12,6 +12,7 @@ import {
   type Handle,
   type Message,
   type MessageHandler,
+  MIN_HASH_LEN,
   safeName,
   type Topic,
 } from '@sharptrick/parley-core';
@@ -21,6 +22,7 @@ import {
   fetchWithRetry,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
+import { createHash } from 'node:crypto';
 import { isIPv4, isIPv6 } from 'node:net';
 
 /** Every `preset` a config may ask for. Each member is graded and documented in the README table. */
@@ -454,8 +456,6 @@ export class MatrixPlugin implements BackendPlugin {
       { body: { msgtype: 'm.text', body: content, [TOPIC_KEY]: topic, ...relation } },
     );
     const json = (await res.json()) as { event_id: string };
-    // identity is the logical sender; on Matrix the homeserver stamps `sender` as our user_id.
-    void identity;
     return asBackendMsgId(json.event_id);
   }
 
@@ -478,10 +478,10 @@ export class MatrixPlugin implements BackendPlugin {
     }
 
     if (args.since === undefined) {
-      return this.recentWindow(roomId, args.topic, limit);
+      return this.recentWindow(roomId, args.topic, limit, generation);
     }
 
-    const first = await this.fetchSince(roomId, args.topic, args.since, limit);
+    const first = await this.fetchSince(roomId, args.topic, args.since, limit, generation);
 
     // Engage the native long-poll ONLY when asked (blockMs > 0) and the exclusive query came back
     // empty — otherwise this is the plain durable catch-up.
@@ -492,7 +492,15 @@ export class MatrixPlugin implements BackendPlugin {
     // Wait on the live `/sync` primitive (the same one `subscribe` uses) up to the budget for a new
     // belonging event in the room, then re-run the canonical exclusive `/messages` query so the
     // returned ids/cursor stay canonical. A timeout leaves the empty page + `first`'s cursor.
-    return this.blockingFetch(roomId, args.topic, args.since, limit, blockMs, first.nextCursor);
+    return this.blockingFetch(
+      roomId,
+      args.topic,
+      args.since,
+      limit,
+      blockMs,
+      first.nextCursor,
+      generation,
+    );
   }
 
   /**
@@ -506,21 +514,31 @@ export class MatrixPlugin implements BackendPlugin {
     topic: Topic,
     sinceCursor: Cursor,
     limit: number,
+    generation: number,
   ): Promise<FetchRecentResult> {
     const since = String(sinceCursor);
     if (since.startsWith(STREAM_CURSOR_PREFIX)) {
       const token = since.slice(STREAM_CURSOR_PREFIX.length);
-      return this.drainForward(roomId, topic, token || undefined, undefined, limit, sinceCursor, {
-        // A read-state file is editable, truncatable, and survives a `shared_room`/`server_name`
-        // change, so this token may be one the homeserver rejects outright (Synapse: 400
-        // M_UNKNOWN "'from' parameter is invalid"). Degrade like the `event_id` branch's 404.
-        startTokenIsUntrusted: true,
-      });
+      return this.drainForward(
+        roomId,
+        topic,
+        token || undefined,
+        undefined,
+        limit,
+        sinceCursor,
+        generation,
+        {
+          // A read-state file is editable, truncatable, and survives a `shared_room`/`server_name`
+          // change, so this token may be one the homeserver rejects outright (Synapse: 400
+          // M_UNKNOWN "'from' parameter is invalid"). Degrade like the `event_id` branch's 404.
+          startTokenIsUntrusted: true,
+        },
+      );
     }
     // Keep the `''` branch: read-state files written before {@link STREAM_CURSOR_PREFIX} existed
     // carry that sentinel, and it must not reach `/context` — see STREAM_CURSOR_PREFIX.
     if (since === '') {
-      return this.drainForward(roomId, topic, undefined, undefined, limit, sinceCursor);
+      return this.drainForward(roomId, topic, undefined, undefined, limit, sinceCursor, generation);
     }
     // Exclusive `since`: locate the cursor event, then page forward from just after it.
     const ctxRes = await this.http(
@@ -533,13 +551,13 @@ export class MatrixPlugin implements BackendPlugin {
     // change) does not brick startup: `buildBridge` awaits `catchUpAll`, so a throw here fails
     // EVERY restart until the read-state file is hand-edited.
     if (ctxRes.status === 404) {
-      return this.recentWindow(roomId, topic, limit);
+      return this.recentWindow(roomId, topic, limit, generation);
     }
     const ctx = (await ctxRes.json()) as { end?: string };
     if (ctx.end === undefined) {
       return { messages: [], nextCursor: sinceCursor };
     }
-    return this.drainForward(roomId, topic, ctx.end, since, limit, sinceCursor);
+    return this.drainForward(roomId, topic, ctx.end, since, limit, sinceCursor, generation);
   }
 
   /**
@@ -554,6 +572,7 @@ export class MatrixPlugin implements BackendPlugin {
     sinceEventId: string | undefined,
     limit: number,
     sinceCursor: Cursor,
+    generation: number,
     opts?: { startTokenIsUntrusted?: boolean },
   ): Promise<FetchRecentResult> {
     const messages: Message[] = [];
@@ -566,7 +585,11 @@ export class MatrixPlugin implements BackendPlugin {
     // timeline, and advancing there would move the cursor on foreign traffic alone, breaking the
     // seam's stable-cursor contract for every topic that shares a room.
     let lastRawEventId: string | undefined;
-    for (let page = 0; page < MAX_FORWARD_PAGES && messages.length < limit; page++) {
+    for (
+      let page = 0;
+      page < MAX_FORWARD_PAGES && messages.length < limit && !this.isStale(generation);
+      page++
+    ) {
       const fromParam = from === undefined ? '' : `from=${encodeURIComponent(from)}&`;
       const fwdRes = await this.http(
         'GET',
@@ -575,7 +598,7 @@ export class MatrixPlugin implements BackendPlugin {
           ? { allowStatuses: [400, 404] }
           : undefined,
       );
-      if (!fwdRes.ok) return this.recentWindow(roomId, topic, limit);
+      if (!fwdRes.ok) return this.recentWindow(roomId, topic, limit, generation);
       const { chunk, end } = (await fwdRes.json()) as { chunk: MatrixEvent[]; end?: string };
       if (chunk.length === 0) break; // genuine end of timeline.
       // Keep the `since` event both DROPPED and out of the page-fullness count, so that a
@@ -628,8 +651,8 @@ export class MatrixPlugin implements BackendPlugin {
     limit: number,
     blockMs: number,
     bestCursor: Cursor,
+    generation: number,
   ): Promise<FetchRecentResult> {
-    const generation = this.generation;
     const deadline = Date.now() + blockMs;
     let best = bestCursor;
     // Wait in a loop so a SPURIOUS wake does not end the call early. The dedicated `/sync` can
@@ -700,13 +723,13 @@ export class MatrixPlugin implements BackendPlugin {
         }
 
         if (this.isStale(generation)) return { messages: [], nextCursor: best };
-        const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit);
+        const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit, generation);
         if (recheck.messages.length > 0) return recheck;
         best = recheck.nextCursor;
 
         await parked;
         if (this.isStale(generation)) return { messages: [], nextCursor: best };
-        const after = await this.fetchSince(roomId, topic, sinceCursor, limit);
+        const after = await this.fetchSince(roomId, topic, sinceCursor, limit, generation);
         if (after.messages.length > 0) return after;
         best = after.nextCursor;
         // Empty ⇒ the deadline timer fired or the wake was spurious. Loop: the top re-checks the
@@ -808,11 +831,16 @@ export class MatrixPlugin implements BackendPlugin {
     roomId: string,
     topic: Topic,
     limit: number,
+    generation: number,
   ): Promise<FetchRecentResult> {
     const collected: MessageEvent[] = [];
     let from: string | undefined;
     let tailToken: string | undefined;
-    for (let page = 0; page < MAX_BACKFILL_PAGES && collected.length < limit; page++) {
+    for (
+      let page = 0;
+      page < MAX_BACKFILL_PAGES && collected.length < limit && !this.isStale(generation);
+      page++
+    ) {
       const fromParam = from === undefined ? '' : `from=${encodeURIComponent(from)}&`;
       const res = await this.http(
         'GET',
@@ -1042,7 +1070,7 @@ export class MatrixPlugin implements BackendPlugin {
   }
 
   private roomLocalpart(topic: Topic): string {
-    return this.sharedLocalpart ?? `parley_${safeName(topic, sanitizeAlias)}`;
+    return this.sharedLocalpart ?? boundedLocalpart(topic, this.serverName);
   }
 
   /** Resolve (or create) the room for `topic`, memoized so concurrent first-posts don't double-create. */
@@ -1356,5 +1384,40 @@ function reportSyncFailure(topic: Topic, consecutiveFailures: number, err: unkno
  * that this package's tests — and its fake homeserver's alias directory — grade THIS fold rather
  * than a hand-copy of it: two topics folding onto one localpart share a room and cross-deliver, and
  * {@link safeName} is what keeps the fold injective.
+ *
+ * Keep the output ASCII, so that {@link boundedLocalpart} may count its length limit in characters.
  */
 export const sanitizeAlias = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, '_');
+
+/** Bytes Matrix allows in a room alias, `#` and `:<server_name>` included. */
+const MAX_ALIAS_BYTES = 255;
+
+const ALIAS_PREFIX = 'parley_';
+
+/**
+ * The alias localpart for `topic`, bounded so `#<localpart>:<server_name>` stays inside
+ * {@link MAX_ALIAS_BYTES}. Past that the homeserver refuses `createRoom` with a 400 naming neither
+ * the topic nor this plugin, while every read of the same topic returns the empty page a
+ * never-written topic returns — so the topic silently never works. An over-long name keeps a digest
+ * of the whole raw topic ({@link MIN_HASH_LEN} wide, as {@link safeName} mints) and truncates only
+ * the readable half, so the fold stays injective.
+ */
+function boundedLocalpart(topic: Topic, serverName: string): string {
+  const budget = MAX_ALIAS_BYTES - Buffer.byteLength(`#:${serverName}`, 'utf8');
+  const name = `${ALIAS_PREFIX}${safeName(topic, sanitizeAlias)}`;
+  if (name.length <= budget) return name;
+  const keep = budget - ALIAS_PREFIX.length - 1 - MIN_HASH_LEN;
+  if (keep < 1) {
+    throw new Error(
+      `[parley-matrix] backend_config.server_name ${JSON.stringify(serverName)} leaves no room ` +
+        `for a distinct alias localpart: #<localpart>:<server_name> must fit ${MAX_ALIAS_BYTES} ` +
+        `bytes, and topic ${JSON.stringify(String(topic))} needs at least ` +
+        `${ALIAS_PREFIX.length + 1 + MIN_HASH_LEN + 1} of them. Use a shorter server_name.`,
+    );
+  }
+  const digest = createHash('sha1')
+    .update(String(topic), 'utf8')
+    .digest('hex')
+    .slice(0, MIN_HASH_LEN);
+  return `${ALIAS_PREFIX}${sanitizeAlias(String(topic)).slice(0, keep)}-${digest}`;
+}

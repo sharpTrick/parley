@@ -1,7 +1,7 @@
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
-import { connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
+import { aliasForTopic, connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
 
 /**
  * CLASS: no background loop may outlive the `disconnect()` that stopped it — including across a
@@ -166,6 +166,21 @@ const disconnectDuring = (
 /** Requests that must never follow a teardown: every long-poll and every catch-up read. */
 const POST_TEARDOWN_FORBIDDEN = /\/v3\/sync|\/messages$|\/context\//;
 
+/** The page size every driver below reads with, so a noise depth can be stated in pages. */
+const PAGE_LIMIT = 5;
+
+/**
+ * Raw timeline noise the teardown table seeds before it arms, in PAGES of `PAGE_LIMIT`. `/messages`
+ * bounds a page BEFORE filtering, so non-belonging events are what force a read to page: a room
+ * holding one page of them lets every paging loop exit on its first empty chunk, and a gate missing
+ * from the loop is then unobservable no matter which phase the teardown lands in.
+ */
+const seedNoisePages = (pages: number): void => {
+  for (let i = 0; i < pages * PAGE_LIMIT; i++) {
+    fake.addRaw(i % 2 === 0 ? 'm.reaction' : 'm.room.member', aliasForTopic(String(TOPIC)));
+  }
+};
+
 const TEARDOWN_DRIVERS: Record<
   string,
   {
@@ -177,29 +192,39 @@ const TEARDOWN_DRIVERS: Record<
 > = {
   'a since-less fetchRecent': {
     writes: false,
-    drive: (p) => p.fetchRecent({ topic: TOPIC, limit: 5 }),
+    drive: (p) => p.fetchRecent({ topic: TOPIC, limit: PAGE_LIMIT }),
   },
   'a post': { writes: true, drive: (p) => p.post(TOPIC, WRITER, 'x') },
   'a subscribe': { writes: false, drive: (p) => p.subscribe(TOPIC, () => undefined) },
   'a blocking fetchRecent from the empty sentinel': {
     writes: false,
-    drive: (p) => p.fetchRecent({ topic: TOPIC, since: asCursor(''), blockMs: 1500, limit: 5 }),
+    drive: (p) =>
+      p.fetchRecent({ topic: TOPIC, since: asCursor(''), blockMs: 1500, limit: PAGE_LIMIT }),
   },
   'a blocking fetchRecent parked at the tail': {
     writes: false,
     setup: async (p) => {
       await p.post(TOPIC, WRITER, 'seed');
-      return (await p.fetchRecent({ topic: TOPIC, limit: 5 })).nextCursor;
+      return (await p.fetchRecent({ topic: TOPIC, limit: PAGE_LIMIT })).nextCursor;
     },
     drive: (p, since) =>
-      p.fetchRecent({ topic: TOPIC, since: since as never, blockMs: 1500, limit: 5 }),
+      p.fetchRecent({ topic: TOPIC, since: since as never, blockMs: 1500, limit: PAGE_LIMIT }),
   },
 };
 
-/** Each phase names the drivers that actually reach it, so no row can arm a request nobody issues. */
-const TEARDOWN_PHASES: Record<string, { matches: (path: string) => boolean; drivers: string[] }> = {
+/**
+ * Each phase names the drivers that actually reach it, so no row can arm a request nobody issues,
+ * and how DEEP a read the room holds when it does. Depth can only change the outcome where the
+ * teardown lands on a request the read may issue AGAIN — every other phase stands the call down
+ * before its first page, so those rows stay at one depth rather than paying for a third copy.
+ */
+const TEARDOWN_PHASES: Record<
+  string,
+  { matches: (path: string) => boolean; drivers: string[]; noisePages: number[] }
+> = {
   'the /directory alias lookup': {
     matches: (path) => path.includes('/directory/room/'),
+    noisePages: [0],
     drivers: [
       'a since-less fetchRecent',
       'a post',
@@ -209,6 +234,7 @@ const TEARDOWN_PHASES: Record<string, { matches: (path: string) => boolean; driv
   },
   'the /join that follows it': {
     matches: (path) => path.endsWith('/join'),
+    noisePages: [0],
     drivers: [
       'a since-less fetchRecent',
       'a post',
@@ -218,10 +244,12 @@ const TEARDOWN_PHASES: Record<string, { matches: (path: string) => boolean; driv
   },
   'the positioning /sync': {
     matches: (path) => path.endsWith('/v3/sync'),
+    noisePages: [0],
     drivers: ['a subscribe', 'a blocking fetchRecent parked at the tail'],
   },
   'a /messages page': {
     matches: (path) => path.endsWith('/messages'),
+    noisePages: [1, 2, 5],
     drivers: ['a since-less fetchRecent', 'a blocking fetchRecent from the empty sentinel'],
   },
 };
@@ -229,29 +257,33 @@ const TEARDOWN_PHASES: Record<string, { matches: (path: string) => boolean; driv
 describe('a disconnect landing inside a round-trip leaves nothing behind', () => {
   for (const [phaseName, phase] of Object.entries(TEARDOWN_PHASES)) {
     for (const driverName of phase.drivers) {
-      const driver = TEARDOWN_DRIVERS[driverName]!;
-      it(`${driverName} / disconnect lands during ${phaseName}`, async () => {
-        const p = await connectFake({});
-        const ctx = await driver.setup?.(p);
-        const sentBefore = fake.sentBodies.length;
-        const armed = disconnectDuring(p, phase.matches);
+      for (const noisePages of phase.noisePages) {
+        const driver = TEARDOWN_DRIVERS[driverName]!;
+        const depth = noisePages === 0 ? '' : ` / ${noisePages} page(s) deep`;
+        it(`${driverName} / disconnect lands during ${phaseName}${depth}`, async () => {
+          const p = await connectFake({});
+          seedNoisePages(noisePages);
+          const ctx = await driver.setup?.(p);
+          const sentBefore = fake.sentBodies.length;
+          const armed = disconnectDuring(p, phase.matches);
 
-        await driver.drive(p, ctx).catch(() => undefined);
-        const settled = armed.since().length;
-        await settle(300);
+          await driver.drive(p, ctx).catch(() => undefined);
+          const settled = armed.since().length;
+          await settle(300);
 
-        expect(armed.fired()).toBe(true);
-        // Nothing the teardown cleared came back…
-        expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
-        // …no long-poll or catch-up read ran against the cleared token (an in-flight room resolve
-        // may still finish — it is bounded, idempotent and hands its result to nobody)…
-        expect(armed.since().filter((r) => POST_TEARDOWN_FORBIDDEN.test(r))).toEqual([]);
-        expect(armed.since().slice(settled)).toEqual([]);
-        // …and the caller's own write is graded the other way, so no row can pass by standing
-        // everything down indiscriminately.
-        expect(fake.sentBodies.length - sentBefore).toBe(driver.writes ? 1 : 0);
-        await p.disconnect();
-      }, 30_000);
+          expect(armed.fired()).toBe(true);
+          // Nothing the teardown cleared came back…
+          expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
+          // …no long-poll or catch-up read ran against the cleared token (an in-flight room resolve
+          // may still finish — it is bounded, idempotent and hands its result to nobody)…
+          expect(armed.since().filter((r) => POST_TEARDOWN_FORBIDDEN.test(r))).toEqual([]);
+          expect(armed.since().slice(settled)).toEqual([]);
+          // …and the caller's own write is graded the other way, so no row can pass by standing
+          // everything down indiscriminately.
+          expect(fake.sentBodies.length - sentBefore).toBe(driver.writes ? 1 : 0);
+          await p.disconnect();
+        }, 30_000);
+      }
     }
   }
 });

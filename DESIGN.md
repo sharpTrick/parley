@@ -187,8 +187,10 @@ The same logical message can arrive twice — once via live push, once via `fetc
   - SQLite → `INTEGER PRIMARY KEY AUTOINCREMENT` / rowid (free monotonic sequence).
   - Redis → stream entry ID (`XADD` IDs are monotonic).
   - Matrix → `event_id` (globally unique; "strictly after" resolved server-side via
-    `/context/<event_id>` → a forward pagination token). The `/sync` token drives the LIVE loop
-    only — it is not the cursor.
+    `/context/<event_id>` → a forward pagination token). A window that held no message of the topic
+    has no `event_id` to name, so it mints the second form `@parley-stream:<pagination token>` —
+    the timeline position that window was read AT, replayed as the forward `/messages` start. The
+    `/sync` token drives the LIVE loop only — it is never a cursor.
   - XMPP → MAM archive id.
   - NATS → JetStream sequence number.
   - Postgres → `BIGSERIAL` seq (per-topic advisory lock keeps seq order == commit order).

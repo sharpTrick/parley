@@ -8,6 +8,7 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
+import { SHAPES } from './cursor-shapes.js';
 import { aliasForTopic, connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
@@ -179,17 +180,9 @@ describe('limit is a hard cap even when a page lands part-full', () => {
  * must replay to everything after them. A cursor it never minted (purged / foreign) is allowed to
  * degrade to the documented recent window, but even then only ever to a SUFFIX: no mid-stream gap.
  *
- * `shape` enumerates every cursor FORM the plugin can emit, in one place a doc reviewer can diff
- * against the README: an `event_id`, or the opaque `@parley-stream:` pagination token minted for a
- * window that held no belonging message. A backend whose cursor is not uniformly one value type
- * documents both or misleads whoever reads a `read-state.json`.
+ * `shape` names the cursor FORM the origin produces, out of {@link SHAPES} — the single table both
+ * these tests and the doc-parity check in `shipped-artifacts.test.ts` are driven from.
  */
-const SHAPES = {
-  'event id': (c: Cursor) => /^\$/.test(String(c)),
-  'stream token': (c: Cursor) => String(c).startsWith('@parley-stream:'),
-  'not minted by this plugin': () => true,
-} as const;
-
 const CURSOR_ORIGINS: Record<
   string,
   {
@@ -244,7 +237,7 @@ describe('cursor contract: a minted cursor replays to everything after it, never
         const p = await connectFake({ shared: true });
         const t = asTopic('ctx-payments');
         const cursor = await origin.mint(p, t);
-        expect(SHAPES[origin.shape](cursor)).toBe(true);
+        expect(SHAPES[origin.shape].is(cursor)).toBe(true);
 
         const expected: string[] = [];
         for (let i = 0; i < after; i++) {
@@ -267,6 +260,46 @@ describe('cursor contract: a minted cursor replays to everything after it, never
       });
     }
   }
+
+  /**
+   * CLASS: a cursor's POSITION, as distinct from its replayability. Every case above grades what a
+   * cursor DRAINS, which a token minted at the room's beginning satisfies just as well as one minted
+   * at the tip — it simply re-reads history the session has already seen (in `shared_room` mode,
+   * every topic's). The discriminating property is stability: replaying a cursor minted on a window
+   * that gained nothing must return no messages AND the same cursor back. Parameterized over how
+   * many backward pages the window had to walk, because that is what makes a first-page token and a
+   * last-page token differ at all.
+   */
+  for (const pages of [1, 2, 5]) {
+    it(`a window that walked ${pages} backward page(s) mints a cursor that stays put`, async () => {
+      const p = await connectFake({ shared: true });
+      const t = asTopic('ctx-payments');
+      for (let i = 0; i < pages * LIMIT; i++)
+        fake.addMessage(FOREIGN, `n${i}`, aliasForTopic(String(t), true));
+
+      const minted = (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor;
+      const replay = await p.fetchRecent({ topic: t, since: minted, limit: LIMIT });
+
+      expect(replay.messages).toEqual([]);
+      expect(String(replay.nextCursor)).toBe(String(minted));
+      await p.disconnect();
+    });
+  }
+
+  it('a topic whose room does not exist yet mints a cursor that stays put', async () => {
+    fake.aliasExists = false; // a read never provisions, so there is no timeline to name a token in
+    const p = await connectFake({ shared: true });
+    const t = asTopic('never-created');
+
+    const minted = (await p.fetchRecent({ topic: t, limit: LIMIT })).nextCursor;
+    const replay = await p.fetchRecent({ topic: t, since: minted, limit: LIMIT });
+
+    expect(String(minted)).toBe('@parley-stream:');
+    expect(SHAPES['stream token'].is(minted)).toBe(true);
+    expect(replay.messages).toEqual([]);
+    expect(String(replay.nextCursor)).toBe(String(minted));
+    await p.disconnect();
+  });
 
   it('an empty window never mints a cursor that resolves as "expired"', async () => {
     const p = await connectFake({ shared: true });

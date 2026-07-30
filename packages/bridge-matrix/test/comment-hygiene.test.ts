@@ -95,6 +95,34 @@ describe('source comments carry no tracker history', () => {
 });
 
 /**
+ * CLASS: a statement that exists only to name something. `void x;` emits no code, so it survives
+ * purely on the comment above it — and nothing here requires the reference: the repo configures no
+ * ESLint/Biome, and `tsconfig.base.json` sets neither `noUnusedLocals` nor `noUnusedParameters`. The
+ * seam is what puts the parameter in the signature; what this backend does with it belongs in the
+ * README and the commit message, not in a no-op with a footnote.
+ */
+const DEAD_REFERENCE = /^\s*void\s+[A-Za-z_$][\w$]*\s*;\s*$/;
+
+describe('no statement exists only to reference a name', () => {
+  it('tells a dead reference from a deliberately unawaited call', () => {
+    expect(DEAD_REFERENCE.test('    void identity;')).toBe(true);
+    expect(DEAD_REFERENCE.test('void loop();')).toBe(false);
+    expect(DEAD_REFERENCE.test('    void this.pollBoundedSync(roomId, topic);')).toBe(false);
+  });
+
+  for (const file of sources) {
+    it(`${file} has none`, () => {
+      const offenders = readFileSync(join(SRC, file), 'utf8')
+        .split('\n')
+        .map((line, i) => ({ line, n: i + 1 }))
+        .filter(({ line }) => DEAD_REFERENCE.test(line));
+
+      expect(offenders.map(({ n, line }) => `${file}:${n}: ${line.trim()}`)).toEqual([]);
+    });
+  }
+});
+
+/**
  * CLASS: one rationale, written once. A causal chain restated at three call sites is three copies
  * that can disagree, and the next change to the behaviour has to find all of them — which is exactly
  * the rot CLAUDE.md routes to the commit message.

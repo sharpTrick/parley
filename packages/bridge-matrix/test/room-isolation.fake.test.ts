@@ -1,7 +1,14 @@
 import { asHandle, asTopic, type FetchRecentResult, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MatrixPlugin } from '../src/index.js';
-import { aliasForTopic, connectFake, type Ev, FakeSynapse } from './fake-synapse.js';
+import { MatrixPlugin } from '../src/index.js';
+import {
+  aliasForTopic,
+  connectFake,
+  type Ev,
+  fakeConfig,
+  FakeSynapse,
+  SERVER_NAME,
+} from './fake-synapse.js';
 
 /**
  * CLASS: a fake with ONE instance of the resource the plugin routes over certifies nothing about the
@@ -189,6 +196,78 @@ describe('an alias-hostile topic name folds to a legal, injective localpart', ()
     expect(contents(await p.fetchRecent({ topic: asTopic('a_b'), limit: 10 }))).toEqual([
       'underscore',
     ]);
+    await p.disconnect();
+  });
+});
+
+/**
+ * CLASS: a backend name rule with a LENGTH cap, which a charset fold cannot satisfy on its own. The
+ * table above states the bound (`byteLength(alias) <= 255`) over rows too short to ever reach it, so
+ * every row passed while a long topic produced an alias the homeserver refuses outright — and the
+ * two halves of the seam then disagree about the same topic: `post` rejects with the homeserver's
+ * own 400, while `fetchRecent` reports the empty page a never-written topic reports. Generated at
+ * the boundary the fixture's `server_name` puts it, including a multi-byte row where the topic's
+ * character count and its byte count diverge.
+ */
+const LOCALPART_BUDGET = 255 - `#:${SERVER_NAME}`.length;
+/** Longest topic that still folds to an alias byte-for-byte, i.e. with no suffix and no truncation. */
+const EXACT_FIT = LOCALPART_BUDGET - 'parley_'.length;
+
+const LENGTHS: { name: string; topic: string }[] = [
+  { name: 'well inside the limit', topic: 'x'.repeat(200) },
+  { name: 'exactly at the limit', topic: 'x'.repeat(EXACT_FIT) },
+  { name: 'one byte past it', topic: 'x'.repeat(EXACT_FIT + 1) },
+  { name: 'past it by a page', topic: 'x'.repeat(EXACT_FIT + 256) },
+  { name: 'far past it', topic: 'y'.repeat(1024) },
+  { name: 'multi-byte, sanitized inside the limit', topic: 'é'.repeat(120) },
+  { name: 'multi-byte, sanitized past it', topic: 'é'.repeat(LOCALPART_BUDGET) },
+];
+
+describe('a topic longer than the alias limit still folds to a legal, injective alias', () => {
+  for (const { name, topic } of LENGTHS) {
+    it(`${name} (${topic.length} chars): provisions one alias the homeserver would accept`, async () => {
+      fake.aliasExists = false;
+      const p = await connectFake({});
+      await p.post(asTopic(topic), WRITER, 'hello');
+
+      const localpart = String(fake.createRoomBodies[0]!.room_alias_name);
+      const alias = `#${localpart}:${SERVER_NAME}`;
+      expect(fake.directoryLookups).toEqual([alias]);
+      expect(alias).toMatch(ALIAS_LEGAL);
+      expect(Buffer.byteLength(alias, 'utf8')).toBeLessThanOrEqual(255);
+      // …and the topic actually works: the same fold resolves it on the way back out.
+      expect(contents(await p.fetchRecent({ topic: asTopic(topic), limit: 10 }))).toEqual(['hello']);
+      await p.disconnect();
+    });
+  }
+
+  it('two over-long topics sharing every truncated byte land in two different rooms', async () => {
+    const p = await connectFake({});
+    const base = 'z'.repeat(1024);
+
+    await p.post(asTopic(`${base}-one`), WRITER, 'first');
+    await p.post(asTopic(`${base}-two`), WRITER, 'second');
+
+    expect(fake.rooms).toHaveLength(2);
+    expect(contents(await p.fetchRecent({ topic: asTopic(`${base}-one`), limit: 10 }))).toEqual([
+      'first',
+    ]);
+    expect(contents(await p.fetchRecent({ topic: asTopic(`${base}-two`), limit: 10 }))).toEqual([
+      'second',
+    ]);
+    await p.disconnect();
+  });
+
+  it('a server_name leaving no room for a distinct localpart fails naming the plugin and the topic', async () => {
+    const p = new MatrixPlugin();
+    await p.connect({ ...fakeConfig(), server_name: 's'.repeat(250) });
+
+    await expect(p.post(asTopic('ctx-payments'), WRITER, 'hello')).rejects.toThrow(
+      /\[parley-matrix\][\s\S]*"ctx-payments"/,
+    );
+    await expect(p.fetchRecent({ topic: asTopic('ctx-payments'), limit: 10 })).rejects.toThrow(
+      /\[parley-matrix\][\s\S]*"ctx-payments"/,
+    );
     await p.disconnect();
   });
 });

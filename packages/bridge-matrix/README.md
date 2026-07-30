@@ -104,7 +104,7 @@ it does not degrade into an opaque `M_FORBIDDEN` from a later `/send` or `/messa
 | `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout; a positive whole number of milliseconds, at most `2147453647` (anything else is a load error). Each `/sync` gets a transport deadline of this plus a full 30s call budget, so raising it does not make the homeserver's own answer look like a timeout — and the ceiling is exactly the largest value whose deadline still fits Node's `2^31 - 1` timer range, past which every timer clamps to 1ms and the live path would die blaming the homeserver. It is also the cadence at which a blocking `fetch_recent` re-checks by itself, so a very large value slows the safety net that covers a `/sync` loop stuck in retry backoff. A small value does not turn that safety net into a request storm: every park sleeps at least 250ms, and a `/sync` that answers faster than it long-polled for is paced. |
 | `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. `connect()` warns on stderr while it is set. |
 | `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below), and `connect()` warns on stderr while it is set. These are the only two accepted — any other value is a load error. |
-| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares a topic; see "Multiple concurrent sessions". |
+| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares any room with this one — a listed topic, or the presence topic every presence-enabled bridge writes to; see "Multiple concurrent sessions". |
 
 Secrets live in `backend_config` / `.env`, never in code. Every key above that widens the trust
 boundary — the default password, a plaintext `http://` `homeserver_url` to a non-loopback host,
@@ -140,6 +140,15 @@ rule** — they should each be **different**:
   its live path delivers nothing. Since you cannot know which session gets there first, list the
   peers on **every** config — that is what the shipped examples below do. (Rooms that already exist
   are joined as they are, so `invite` cannot repair a room somebody else created without you.)
+- **`invite` covers every room a config *writes to*, not only the topics it lists.** Presence is on
+  by default (`presence.enabled: true`), and each bridge beats to the reserved presence topic
+  (`presence.topic`, default `parley-presence`) — which in production, one room per topic, is its
+  own invite-only room. Two sessions with entirely **disjoint** `topics` therefore still meet there,
+  and the one that did not create it is locked out **silently**: the presence loop swallows the
+  heartbeat's `M_FORBIDDEN`, so that session simply never appears in any peer's `parley_list_users`
+  roster and sees nothing in its own. So `invite` must list **every account running a
+  presence-enabled bridge on this homeserver**, whatever its topics — and likewise any account whose
+  `post_topics` patterns can reach a topic yours does.
 
 Runnable multi-config examples (two Code sessions with distinct accounts + a remote/chat config,
 all sharing one homeserver): [`examples/multi-session/matrix`](../../examples/multi-session/README.md).
