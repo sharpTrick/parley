@@ -278,6 +278,67 @@ describe('safeName injectivity (generated, closed under its own output)', () => 
   });
 });
 
+// A minted name is not an internal value: it becomes the Matrix room alias, the NATS stream and the
+// XMPP MUC an operator's history already lives in. Changing the digest, its truncation or the suffix
+// layout renames every existing channel — a silent data loss no shape assertion can see, because
+// `/^team_frontend-[0-9a-f]{10}$/` matches the old name and the new one alike. So pin the VALUE, in
+// the package that owns the function, one vector per fold and one per branch.
+describe('safeName is pinned to the exact names backends already carry', () => {
+  const GOLDEN: [string, (s: string) => string, string, { hashLen?: number; sep?: string }, string][] =
+    [
+      ['NATS subject', sanitizeToken, 'team.frontend', {}, 'team_frontend-08edf065f7'],
+      ['NATS subject', sanitizeToken, 'ctx-payments', {}, 'ctx-payments'],
+      ['NATS stream', sanitizeName, 'team/frontend', {}, 'team_frontend-222ee3741b'],
+      ['Matrix alias', sanitizeAlias, 'a b', {}, 'a_b-7dbde93504'],
+      ['Matrix alias', sanitizeAlias, 'a/b', {}, 'a_b-3ec69c85a4'],
+      ['Matrix alias', sanitizeAlias, 't-1-abcd', {}, 't-1-abcd'],
+      ['Matrix alias', sanitizeAlias, 'a-0123456789', {}, 'a-0123456789-3ad74c5e61'],
+      ['XMPP localpart', sanitizeLocal, 'Ops', {}, 'ops-907a54c2b2'],
+      ['XMPP localpart', sanitizeLocal, DEFAULT_PRESENCE_TOPIC, {}, 'parley-presence'],
+      ['deleting fold', sanitizeDelete, '!!!', {}, '-9a7b006d20'],
+      ['lowercasing deleting fold', sanitizeLowerDelete, 'Ops!', {}, 'ops-c2acb669c8'],
+      ['Matrix alias', sanitizeAlias, 'a b', { hashLen: 16, sep: '.' }, 'a_b.7dbde93504122a70'],
+      [
+        'Matrix alias',
+        sanitizeAlias,
+        'a b',
+        { hashLen: MAX_HASH_LEN },
+        'a_b-7dbde93504122a707f849f2c12bdd9de71b41929',
+      ],
+    ];
+
+  it('carries a vector for every fold, and for each branch of the mapping', () => {
+    expect([...new Set(GOLDEN.map(([label]) => label))].sort()).toEqual(
+      folds.map(([label]) => label).sort(),
+    );
+    const lossless = GOLDEN.filter(([, fold, topic, , name]) => fold(topic) === name);
+    const disambiguated = GOLDEN.filter(([, fold, topic, , name]) => fold(topic) !== name);
+    expect(lossless.length).toBeGreaterThanOrEqual(2);
+    expect(disambiguated.length).toBeGreaterThanOrEqual(8);
+    // The already-disambiguated topic: lossless under the fold, yet still given a suffix.
+    expect(GOLDEN.some(([, fold, topic, , name]) => fold(topic) === topic && name !== topic)).toBe(
+      true,
+    );
+    expect(GOLDEN.some(([, , , opts]) => opts.sep !== undefined || opts.hashLen !== undefined)).toBe(
+      true,
+    );
+  });
+
+  const vectorLabel = (g: (typeof GOLDEN)[number]): string =>
+    `${g[0]}: ${JSON.stringify(g[2])}${Object.keys(g[3]).length === 0 ? '' : ` ${JSON.stringify(g[3])}`}`;
+
+  it('names every vector distinctly, so a failure locates its row', () => {
+    expect(new Set(GOLDEN.map(vectorLabel)).size).toBe(GOLDEN.length);
+  });
+
+  it.each(GOLDEN.map((g) => [vectorLabel(g), g] as const))(
+    'mints %s unchanged',
+    (_label, [, fold, topic, opts, expected]) => {
+      expect(safeName(asTopic(topic), fold, opts)).toBe(expected);
+    },
+  );
+});
+
 // The presence topic is reserved by EXACT string equality in the Allowlist, so the guarantee that a
 // broad `post_topics` pattern cannot reach the roster rests on near-miss variants staying distinct
 // TOPICS all the way down to the backend name. This is the layer that decides that.

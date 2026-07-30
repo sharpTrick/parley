@@ -40,7 +40,7 @@ is informational only; ordering and dedup never use it.
 | Config | `ConfigSchema`, `parseConfig`, `loadConfig`, `instanceIdOf` | Validates `parley.config.yaml`. |
 | Allowlist | `Allowlist`, `TopicNotAllowedError` | `config.topics` **is** the allowlist — no wildcard default. |
 | Engine | `SeenSet`, `ReadStateStore`, `catchUpTopic` / `catchUpAll` | Dedup set, per-instance read-cursor persistence, catch-up orchestration. |
-| Reactive tools | `registerTools` | `parley_fetch_recent` / `parley_post` / `parley_reply` MCP tools. |
+| Reactive tools | `registerTools`, `toolDepsFor` | `parley_fetch_recent` / `parley_post` / `parley_reply` / `parley_list_users` MCP tools. |
 | Live push | `emitChannel`, `channelMeta`, `startPushLoop` | Emits `claude/channel` `<channel>` notifications to already-running Code sessions. |
 | Local bridge | `buildBridge`, `createStdioBridge` | Composes plugin + tools + push loop into one stdio MCP server. |
 | Remote bridge (v0.2) | `buildReactiveServer`, `createRemoteHttpApp`, `createOAuthRemoteApp` | Streamable-HTTP transport + single-tenant OAuth 2.1 + PKCE front door. |
@@ -55,6 +55,7 @@ is informational only; ordering and dedup never use it.
 instance_id: agent-main         # read-state namespace; DISTINCT per concurrent session sharing a handle
 identity: { handle: "agent" }
 topics: ["ctx-demo"]            # THE allowlist — no wildcard default
+post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to any fully-matching topic (not subscribed)
 catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
 presence: { enabled: true, topic: "parley-presence", heartbeat_ms: 600000 }
@@ -78,12 +79,15 @@ rather than a silent no-op.
 
 | Tool | Role | Effect |
 |---|---|---|
-| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit? }` → `{ messages, nextCursor }`. Marks returned ids seen so the push loop won't re-deliver them. |
+| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. Marks returned ids seen so the push loop won't re-deliver them. |
 | `parley_post` | write (reactive) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. The chat side's only write path. |
-| `parley_reply` | write (channel) | Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
+| `parley_reply` | write (channel) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
+| `parley_list_users` | presence (reactive) | `{ filter?, topic?, online_only?, since_ms?, limit? }` → `{ users: [{ handle, online, topics, postTopics, lastSeenMs }], truncated }`. The hand-off roster, rebuilt on demand from the shared presence topic. |
 
-All three go through the topic `Allowlist` — any topic outside `config.topics` throws
-`TopicNotAllowedError`.
+Every topic argument goes through the topic `Allowlist`, which accepts a topic listed in
+`config.topics` **or** one fully matching a `post_topics` pattern — so `post_topics` genuinely
+widens the read/write surface beyond `topics` — and never the reserved `presence.topic`, even when
+a pattern covers it. Anything else throws `TopicNotAllowedError`.
 
 ## Local (stdio) bridge
 

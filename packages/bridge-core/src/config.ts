@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
+import { DEFAULT_PRESENCE_TOPIC, MAX_RECORD_TOPICS } from './engine/presence.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 
@@ -128,8 +128,18 @@ const ConfigObject = z.object({
       handle: z.string().min(1),
     })
     .strict(),
-  /** Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). */
-  topics: z.array(z.string().min(1)).min(1),
+  /**
+   * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped at
+   * {@link MAX_RECORD_TOPICS}: every presence beat advertises this whole list and every reader caps
+   * a record at that count, so a longer list would load cleanly and then under-advertise this bridge
+   * on its trailing topics forever — no peer would ever see it as a hand-off partner there.
+   */
+  topics: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(MAX_RECORD_TOPICS, {
+      message: `topics accepts at most ${MAX_RECORD_TOPICS} entries: a presence beat carries the whole list and every reader keeps only the first ${MAX_RECORD_TOPICS}, so the rest would be silently unreachable for hand-off`,
+    }),
   /**
    * Extra topics allowed for `post`/`fetch_recent` ONLY, as full-match regex sources (anchored
    * `^(?:…)$` at compile time). Lets a chat instance post to ad-hoc topics without listing each

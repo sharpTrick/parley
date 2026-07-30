@@ -143,37 +143,68 @@ describe('catch-up driver', () => {
       expect((err.cause as Error).message).toBe(backendError);
     });
 
-    it('leaves a cold-start failure unadorned (no disk cursor was involved)', async () => {
-      const readState = new ReadStateStore(rsPath()); // nothing stored for T
-      const err = await rejectionOf(
-        catchUpTopic({
-          plugin: rejectingPlugin('connection refused'),
-          topic: T,
-          limit: 100,
-          readState,
-          seen: new SeenSet(),
-        }),
-      );
-      expect(err.message).toBe('connection refused');
-      expect(err.message).not.toMatch(/instance_id/);
-    });
+    /**
+     * The hint names a state file and advises deleting it, so it belongs to the ONE page that
+     * replays a cursor read off disk and to no other: told it about a transient mid-pagination blip,
+     * an operator deletes read-state and re-drains the whole history. Cross "was a cursor stored"
+     * with which page rejects — exactly one cell is annotated, so widening the scope to every page
+     * and narrowing it to none each flip a cell.
+     */
+    describe('the resume hint is scoped to the page that replays the stored cursor', () => {
+      /** Serves one message per page with an advancing cursor, rejecting on the chosen page. */
+      const failingOnPage = (failAt: number): BackendPlugin => {
+        let page = 0;
+        return {
+          fetchRecent: (a: FetchRecentArgs): Promise<FetchRecentResult> => {
+            const n = page++;
+            if (n === failAt) return Promise.reject(new Error('ECONNRESET'));
+            return Promise.resolve({
+              messages: [
+                {
+                  topic: a.topic,
+                  senderHandle: me,
+                  content: `m${n}`,
+                  timestamp: '1970-01-01T00:00:00.000Z',
+                  backendMsgId: asBackendMsgId(String(n)),
+                  cursor: asCursor(String(n + 1)),
+                  mentions: [],
+                } as Message,
+              ],
+              nextCursor: asCursor(String(n + 1)),
+            });
+          },
+        } as unknown as BackendPlugin;
+      };
 
-    it('does not adorn a mid-pagination failure — that cursor was minted by this same plugin', async () => {
-      const p = await seeded(10);
-      const readState = new ReadStateStore(rsPath());
-      let calls = 0;
-      const flaky = {
-        fetchRecent: (req: Parameters<typeof p.fetchRecent>[0]) => {
-          calls++;
-          if (calls > 1) return Promise.reject(new Error('backend went away'));
-          return p.fetchRecent(req);
-        },
-      } as unknown as Parameters<typeof catchUpTopic>[0]['plugin'];
-
-      const err = await rejectionOf(
-        catchUpTopic({ plugin: flaky, topic: T, limit: 3, readState, seen: new SeenSet() }),
+      const CELLS = [true, false].flatMap((resumed) =>
+        [0, 1, 3].map((failAt) => [resumed, failAt] as const),
       );
-      expect(err.message).toBe('backend went away');
+
+      it.each(CELLS)('stored cursor=%s, page %i rejects', async (resumed, failAt) => {
+        const path = rsPath();
+        const readState = new ReadStateStore(path);
+        if (resumed) readState.set(T, asCursor('0'));
+
+        const err = await rejectionOf(
+          catchUpTopic({
+            plugin: failingOnPage(failAt),
+            topic: T,
+            limit: 1,
+            readState,
+            seen: new SeenSet(),
+          }),
+        );
+
+        if (resumed && failAt === 0) {
+          expect(err.message).toMatch(/resuming from the stored cursor/);
+          expect(err.message).toContain(path);
+          expect(err.message).toMatch(/instance_id/);
+          expect((err.cause as Error).message).toBe('ECONNRESET');
+        } else {
+          expect(err.message).toBe('ECONNRESET');
+          expect(err.cause).toBeUndefined();
+        }
+      });
     });
   });
 

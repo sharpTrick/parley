@@ -128,6 +128,38 @@ describe('presence loop', () => {
     await loop.stop();
   });
 
+  /**
+   * The default id exists for a property only observable ACROSS loops — a relaunched bridge must not
+   * be reaped by the previous process's trailing `goodbye` — and every other case here injects one,
+   * so a constant satisfied the whole file. Start several loops with no injected id, require the ids
+   * to be pairwise distinct, then feed their REAL beats through computeRoster: with a shared id the
+   * survivor's hello is clobbered and a live bridge reads offline for a full TTL window.
+   */
+  it.each([2, 3])(
+    '%i loops with no injected instanceId mint distinct ids, so a relaunch outlives the old goodbye',
+    async (n) => {
+      const loops = Array.from({ length: n }, () =>
+        startPresenceLoop(plugin, asHandle('claude-a'), new Allowlist(['ctx']), {
+          presenceTopic: PRESENCE_TOPIC,
+          heartbeatMs: 30_000,
+          now: () => NOW,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0); // flush every hello
+      const ids = new Set((await records(plugin)).map((r) => r.instanceId));
+      expect(ids.size).toBe(n);
+      expect(ids.has('')).toBe(false); // real ids, not the anonymous sentinel
+
+      // The older processes exit only AFTER the newest has said hello — the relaunch overlap.
+      for (const old of loops.slice(0, -1)) await old.stop();
+      const { messages } = await plugin.fetchRecent({ topic: PRESENCE_TOPIC });
+      expect(computeRoster(messages, NOW, { ttlMs: 90_000, sinceMs: 600_000 })).toEqual([
+        { handle: 'claude-a', online: true, topics: ['ctx'], postTopics: [], lastSeenMs: NOW },
+      ]);
+      await loops.at(-1)!.stop();
+    },
+  );
+
   it('advertises the post_topics reach (pattern sources) on every beat', async () => {
     const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*', 'general'] });
     const loop = startPresenceLoop(plugin, asHandle('claude-a'), allow, {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { asBackendMsgId, asTopic } from '../message.js';
+import { asBackendMsgId, asTopic, type Topic } from '../message.js';
 import { SeenSet, SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS } from './seen-set.js';
 
 const T = asTopic('t');
@@ -53,14 +53,62 @@ describe('SeenSet', () => {
       expect(s.has(asTopic(`t${100 - MAX_TOPICS}`), id(1))).toBe(true);
     });
 
-    it('re-touching a topic keeps it alive across a wave of new ones', () => {
-      const s = new SeenSet(4, MAX_TOPICS);
+    /**
+     * Which topics survive is decided by the LAST WRITE, not by the order they were first added —
+     * that refresh is the whole reason a live push topic outlives a wave of ad-hoc `fetch_recent`
+     * ones. A wave no larger than the cap evicts nothing and therefore grades nothing, so every row
+     * here overflows it, and each asserts the whole survivor SET: insert-order FIFO answers a
+     * different set for the interleaved pattern, and any policy that keeps or drops everything fails
+     * the controls. The same shape grades any later bounded cache in core.
+     */
+    describe('eviction keeps the most-recently-WRITTEN topics, not the first-added ones', () => {
+      const hot = asTopic('hot');
+      const noise = (n: number) => Array.from({ length: n }, (_unused, i) => asTopic(`n${i}`));
+
+      const PATTERNS = {
+        'written once, before the wave': (n: number) => [hot, ...noise(n)],
+        'written once, after the wave': (n: number) => [...noise(n), hot],
+        'refreshed before every new topic': (n: number) => noise(n).flatMap((t) => [hot, t]),
+      };
+
+      /** The declared policy: the `maxTopics` topics whose most recent write is the latest. */
+      const survivorsOf = (seq: Topic[], maxTopics: number): Set<Topic> => {
+        const lastWrite = new Map<Topic, number>();
+        seq.forEach((t, i) => lastWrite.set(t, i));
+        return new Set(
+          [...lastWrite]
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, maxTopics)
+            .map(([t]) => t),
+        );
+      };
+
+      const CELLS = [2, 4, MAX_TOPICS].flatMap((maxTopics) =>
+        [maxTopics + 1, maxTopics * 2, maxTopics * 10].flatMap((wave) =>
+          (Object.keys(PATTERNS) as Array<keyof typeof PATTERNS>).map(
+            (pattern) => [maxTopics, wave, pattern] as const,
+          ),
+        ),
+      );
+
+      it.each(CELLS)('maxTopics=%i, a wave of %i, the hot topic %s', (maxTopics, wave, pattern) => {
+        const seq = PATTERNS[pattern](wave);
+        const s = new SeenSet(4, maxTopics);
+        for (const t of seq) s.markSeen(t, id(1));
+        const alive = new Set([...new Set(seq)].filter((t) => s.has(t, id(1))));
+        expect(alive).toEqual(survivorsOf(seq, maxTopics));
+      });
+    });
+
+    it('a read is not a write: has() and a repeat firstSeen do not refresh recency', () => {
+      const s = new SeenSet(4, 2);
       s.markSeen(T, id(1));
-      for (let i = 0; i < MAX_TOPICS - 1; i++) {
-        s.markSeen(asTopic(`noise${i}`), id(1));
-        s.markSeen(T, id(2)); // the hot topic keeps being written to
-      }
-      expect(s.has(T, id(2))).toBe(true);
+      s.markSeen(T2, id(1));
+      expect(s.has(T, id(1))).toBe(true);
+      expect(s.firstSeen(T, id(1))).toBe(false);
+      s.markSeen(asTopic('t3'), id(1)); // overflows: the coldest by WRITE is still T
+      expect(s.has(T, id(1))).toBe(false);
+      expect(s.has(T2, id(1))).toBe(true);
     });
   });
 

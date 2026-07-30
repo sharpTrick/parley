@@ -210,20 +210,108 @@ describe('computeRoster', () => {
     ]);
   });
 
-  it('an offline handle uses its single last-known beat for topics/reach', () => {
-    const msgs = [
-      beat('claude-a', 'heartbeat', now - 2_000, 1, ['ctx-old'], ['old-.*']),
-      beat('claude-a', 'goodbye', now - 500, 2, ['ctx-new'], ['new-.*']),
+  /**
+   * A handle's advertised reach is folded across its instances — the union of the LIVE ones when any
+   * is online, and the single FRESHEST beat when none is — and the fold direction is unobservable
+   * with one instance, which is all any case here used to feed. Cross the instance count with how
+   * the handle went offline (goodbye, TTL, a mix) and with whether one is still live, and assert the
+   * reported topics/postTopics by value: folding to the oldest instance, or letting departed
+   * instances back into an online entry, flips a row while `lastSeenMs` still reads fresh.
+   */
+  describe('folding a handle across instances reports the freshest, never the oldest', () => {
+    /** One instance of the handle: its id (repeat one to re-beat the same instance), kind, age, topic. */
+    type Inst = [id: string, kind: PresenceKind, ageMs: number, topic: string];
+
+    const page = (insts: Inst[]): Message[] =>
+      insts.map(([id, kind, ageMs, topic], i) =>
+        beat('claude-a', kind, now - ageMs, i + 1, [topic], [`${topic}-.*`], id),
+      );
+
+    const ROWS: Array<
+      [name: string, insts: Inst[], online: boolean, topics: string[], lastSeenAgeMs: number]
+    > = [
+      [
+        'one anonymous instance, its latest beat superseding its earlier one',
+        [['', 'heartbeat', 2_000, 'ctx-old'], ['', 'goodbye', 500, 'ctx-new']],
+        false,
+        ['ctx-new'],
+        500,
+      ],
+      ['one instance, gone by goodbye', [['i0', 'goodbye', 500, 'ctx-0']], false, ['ctx-0'], 500],
+      [
+        'one instance, aged past the ttl',
+        [['i0', 'heartbeat', ttl + 500, 'ctx-0']],
+        false,
+        ['ctx-0'],
+        ttl + 500,
+      ],
+      [
+        'two instances, both gone by goodbye',
+        [
+          ['inst-old', 'goodbye', 50_000, 'ctx-old'],
+          ['inst-new', 'goodbye', 1_000, 'ctx-new'],
+        ],
+        false,
+        ['ctx-new'],
+        1_000,
+      ],
+      [
+        'two instances, both aged past the ttl',
+        [
+          ['inst-old', 'heartbeat', ttl + 50_000, 'ctx-old'],
+          ['inst-new', 'heartbeat', ttl + 1_000, 'ctx-new'],
+        ],
+        false,
+        ['ctx-new'],
+        ttl + 1_000,
+      ],
+      [
+        'four instances offline by a mix of goodbye and ttl',
+        [
+          ['a', 'heartbeat', ttl + 5_000, 'ctx-a'],
+          ['b', 'goodbye', 60_000, 'ctx-b'],
+          ['c', 'heartbeat', ttl + 2_000, 'ctx-c'],
+          ['d', 'goodbye', 500, 'ctx-d'],
+        ],
+        false,
+        ['ctx-d'],
+        500,
+      ],
+      [
+        'four instances, one live behind a fresher goodbye',
+        [
+          ['live', 'heartbeat', 1_000, 'ctx-live'],
+          ['gone', 'goodbye', 500, 'ctx-gone'],
+          ['stale', 'heartbeat', ttl + 9_000, 'ctx-stale'],
+          ['older', 'goodbye', 70_000, 'ctx-older'],
+        ],
+        true,
+        ['ctx-live'],
+        500,
+      ],
+      [
+        'four instances, two live',
+        [
+          ['live-1', 'heartbeat', 1_000, 'ctx-live-1'],
+          ['live-2', 'heartbeat', 2_000, 'ctx-live-2'],
+          ['gone', 'goodbye', 300, 'ctx-gone'],
+          ['stale', 'heartbeat', ttl + 1, 'ctx-stale'],
+        ],
+        true,
+        ['ctx-live-1', 'ctx-live-2'],
+        300,
+      ],
     ];
-    expect(computeRoster(msgs, now, opts)).toEqual([
-      {
-        handle: 'claude-a',
-        online: false,
-        topics: ['ctx-new'],
-        postTopics: ['new-.*'],
-        lastSeenMs: now - 500,
-      },
-    ]);
+
+    it.each(ROWS)('%s', (_name, insts, online, topics, lastSeenAgeMs) => {
+      const roster = computeRoster(page(insts), now, opts);
+      expect(roster).toHaveLength(1);
+      const entry = roster[0]!;
+      expect(entry.online).toBe(online);
+      expect([...entry.topics].sort()).toEqual([...topics].sort());
+      expect([...entry.postTopics].sort()).toEqual(topics.map((t) => `${t}-.*`).sort());
+      expect(entry.lastSeenMs).toBe(now - lastSeenAgeMs);
+    });
   });
 
   it('reclaims a handle by TTL (no goodbye) — offline once its last beat ages past ttl, still listed within since', () => {

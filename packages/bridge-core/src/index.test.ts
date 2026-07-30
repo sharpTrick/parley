@@ -232,4 +232,43 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
       'export the factory too, or withhold the type — a consumer handed a type it cannot legally build assembles it by hand and breaks on the next field added to it',
     ).toEqual([]);
   });
+
+  /**
+   * The mirror of the rule above: a type the barrel ships that no shipped function names at all. It
+   * is not merely useless — a consumer who can name `RosterEntry` but cannot obtain, parse or hand
+   * one back reaches into this package's unpublished `src/` to work around it, which `files: ["dist"]`
+   * does not even publish. Derive the pairs from the barrel's own `engine/`/`transport/` clauses, so
+   * the next type added there without a producer fails here without anyone naming it.
+   */
+  const ENGINE_CLAUSE = /export\s+\{([^}]*)\}\s+from\s+'(\.\/(?:engine|transport)\/[^']+)'/g;
+  const barrelTypes = [...barrel.matchAll(ENGINE_CLAUSE)].flatMap(([, clause, module]) =>
+    clause!
+      .split(',')
+      .map((spec) => spec.trim())
+      .filter((spec) => spec.startsWith('type '))
+      .map((spec) => ({
+        module: module!,
+        name: spec.replace(/^type\s+/, '').split(/\s+as\s+/).pop()!.trim(),
+      })),
+  );
+
+  it('finds re-exported engine/transport types to check (guards against a broken scan)', () => {
+    expect(barrelTypes.length).toBeGreaterThan(5);
+    expect(barrelTypes.map((t) => t.name)).toContain('CatchUpArgs'); // an inline `type` specifier
+    expect(barrelTypes.map((t) => t.name)).toContain('ToolDeps'); // a multi-line clause
+  });
+
+  it('names every engine/transport type it exports in a function it also exports', () => {
+    const shipped = functions.filter((fn) => exposed.has(fn.name));
+    const offenders = barrelTypes
+      .filter(
+        ({ name }) =>
+          !shipped.some((fn) => new RegExp(`\\b${name}\\b`).test(`${fn.params} ${fn.returns}`)),
+      )
+      .map(({ name, module }) => `${name} (from ${module}) is exported with no exported producer or consumer`);
+    expect(
+      offenders,
+      'withhold the type, or export the function that produces or consumes it — a type with no reachable API sends consumers into this package’s unpublished src/',
+    ).toEqual([]);
+  });
 });

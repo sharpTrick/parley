@@ -9,7 +9,9 @@
  *   1. STABLE, UNIQUE `backendMsgId` per message — the dedup key.
  *   2. MONOTONIC, IN-ORDER, EXCLUSIVE-`since` cursor delivery — order is a PLUGIN guarantee.
  *      `fetchRecent` returns messages pre-sorted ascending by cursor; `subscribe`'s handler
- *      is invoked in ascending order. Core never compares cursor values (DESIGN §6).
+ *      is invoked in ascending order. Core never ORDERS or PARSES a cursor (DESIGN §6) — but it
+ *      does compare two for byte equality, as the no-progress brake in `catchUpTopic`. A cursor
+ *      naming a position must therefore be byte-stable across calls.
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
 
@@ -116,8 +118,7 @@ export interface BackendPlugin {
    *
    * A topic that has NEVER been posted to returns an EMPTY PAGE (`messages: []`) with a
    * REPLAYABLE `nextCursor` — passing that `nextCursor` back as `since` again yields `[]`
-   * and the same cursor (the SQLite reference backend returns `{ messages: [], nextCursor:
-   * '0' }`). A plugin that genuinely cannot represent an absent topic (e.g. a chat channel
+   * and the same cursor. A plugin that genuinely cannot represent an absent topic (e.g. a chat channel
    * that does not exist) MAY throw {@link NoSuchTopicError} instead; core treats that as
    * "topic not present yet", distinct from a real backend failure (which propagates).
    */

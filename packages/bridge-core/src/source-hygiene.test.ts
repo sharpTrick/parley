@@ -154,44 +154,116 @@ describe('source hygiene', () => {
     expect(coreFiles.length).toBeGreaterThan(20);
   });
 
-  it.each([
-    ['a plugin package', 'bridge-postgres', true],
-    ['a plugin package mid-sentence', 'hashed like bridge-matrix does', true],
-    ['the core package itself', 'bridge-core owns this', false],
-    ['a backend word that is not a package', 'the postgres backend does this too', false],
-  ])('the plugin-reference rule matches %s', (_label, text, expected) => {
-    expect(PLUGIN_REFERENCE.test(text)).toBe(expected);
+  /**
+   * Each rule below is a regex PLUS the sentence a reader gets when it fires, and the two drift
+   * apart in silence: a message that claims more than its matcher checks is counted as coverage the
+   * suite does not provide, and a matcher that has stopped firing at all reads exactly like a clean
+   * repository. So every rule declares the lines it must flag and the lines it must not, phrased as
+   * its own message phrases the claim — and the plugin rule's positives are GENERATED from the
+   * package list, so a package added there but not reachable by the regex fails here.
+   *
+   * The plugin rule's message names a PACKAGE for the same reason: that is the dependency the
+   * import graph cannot catch, while naming a wire protocol (a Matrix room alias, a NATS subject)
+   * is how core describes the shapes it maps onto — a `passes` row, not an offence.
+   */
+  interface Lint {
+    label: string;
+    pattern: RegExp;
+    files: string[];
+    advice: string;
+    fires: string[];
+    passes: string[];
+  }
+
+  const LINTS: Lint[] = [
+    {
+      label: 'in bridge-core, names a backend plugin package',
+      pattern: PLUGIN_REFERENCE,
+      files: coreFiles,
+      advice:
+        'core explains itself without naming a backend PACKAGE — dependencies point one way in prose too',
+      fires: BACKEND_PACKAGES.map((p) => `hashed exactly like bridge-${p} does`).concat([
+        'bridge-postgres',
+        '// see bridge-redis for the same shape',
+      ]),
+      passes: [
+        'bridge-core owns this',
+        'bridge-net-util shares the retry policy',
+        'the postgres backend does this too',
+        'a Matrix room alias, a NATS subject, an XMPP MUC JID',
+      ],
+    },
+    {
+      label: 'cites an issue tracker',
+      pattern: TRACKER,
+      files: codeFiles,
+      advice: 'cite the behaviour, not the ticket',
+      fires: ['fixed by BUG-12', 'SEC-3 tracks this', 'CX-9 again', 'D-1 covers it', 'closes issue #42'],
+      passes: ['a bug in the decoder', 'SECTION-3 of the design', 'D-day', 'issue 42 is stale'],
+    },
+    {
+      label: 'dates itself',
+      pattern: TEMPORAL,
+      files: codeFiles,
+      advice: 'state the risk, not when it was written',
+      fires: [
+        'unchanged from today',
+        'as of today it holds',
+        'as of now this is fine',
+        'as of this writing',
+        'at the time of writing',
+        'added in round 3',
+        'the reviewer asked for this',
+        'as things stand',
+        'kept for the time being',
+      ],
+      passes: [
+        'today the cursor advances',
+        'reviewers read this first',
+        'in round numbers, a page is 100',
+        'the round trip is lossless',
+      ],
+    },
+  ];
+
+  it('every rule declares controls on both sides, and the package list drives the plugin rule', () => {
+    expect(LINTS.map((l) => l.label)).toEqual([
+      'in bridge-core, names a backend plugin package',
+      'cites an issue tracker',
+      'dates itself',
+    ]);
+    for (const lint of LINTS) {
+      expect(lint.fires.length, lint.label).toBeGreaterThan(0);
+      expect(lint.passes.length, lint.label).toBeGreaterThan(0);
+      expect(lint.files.length, lint.label).toBeGreaterThan(20);
+    }
+    expect(LINTS[0]!.fires.length).toBeGreaterThan(BACKEND_PACKAGES.length);
   });
 
-  it('no comment or test name in bridge-core names a backend plugin package', () => {
+  it.each(LINTS.flatMap((l) => l.fires.map((text) => [l.label, text, l.pattern] as const)))(
+    'the rule "%s" fires on %j',
+    (_label, text, pattern) => {
+      expect(pattern.test(text)).toBe(true);
+    },
+  );
+
+  it.each(LINTS.flatMap((l) => l.passes.map((text) => [l.label, text, l.pattern] as const)))(
+    'the rule "%s" leaves %j alone',
+    (_label, text, pattern) => {
+      expect(pattern.test(text)).toBe(false);
+    },
+  );
+
+  it.each(LINTS.map((l) => [l.label, l] as const))('no comment or test name %s', (_label, lint) => {
     const offenders: string[] = [];
-    for (const f of coreFiles) {
+    for (const f of lint.files) {
       readFileSync(f, 'utf8')
         .split('\n')
         .forEach((line, i) => {
-          if (PLUGIN_REFERENCE.test(commentaryOf(line)))
+          if (lint.pattern.test(commentaryOf(line)))
             offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
         });
     }
-    expect(
-      offenders,
-      'core explains itself without naming a backend — dependencies point one way in prose too',
-    ).toEqual([]);
-  });
-
-  it.each([
-    ['cites an issue tracker', TRACKER, 'cite the behaviour, not the ticket'],
-    ['dates itself', TEMPORAL, 'state the risk, not when it was written'],
-  ])('no comment or test name %s', (_label, pattern, advice) => {
-    const offenders: string[] = [];
-    for (const f of codeFiles) {
-      readFileSync(f, 'utf8')
-        .split('\n')
-        .forEach((line, i) => {
-          if (pattern.test(commentaryOf(line)))
-            offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
-        });
-    }
-    expect(offenders, `${advice} — put the history in the commit message`).toEqual([]);
+    expect(offenders, `${lint.advice} — put the history in the commit message`).toEqual([]);
   });
 });
