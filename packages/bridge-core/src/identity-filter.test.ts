@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { asHandle } from './message.js';
 import { filterHandles, matchGlob, MAX_GLOB_LEN } from './identity-filter.js';
 
-// Semantics the generated corpus below cannot reach: literals outside its {a,b} alphabet, regex
+// Semantics the generated corpus below cannot reach: literals outside its {a,b,*,?} alphabet, regex
 // metacharacters, and case. Backtracking is graded there, exhaustively, and is deliberately not
-// restated here.
+// restated here. The glob metacharacters appear as VALUE literals so a failure names the shape.
 describe('matchGlob semantics beyond the generated corpus', () => {
   it.each([
     ['claude-*', 'claude-payments', true],
@@ -23,6 +23,9 @@ describe('matchGlob semantics beyond the generated corpus', () => {
     ['a***b', 'axyzb', true],
     ['a*b', 'axyzb', true],
     ['**', 'anything', true],
+    ['*', '*ops', true],
+    ['a*', 'a*b', true],
+    ['*', '**', true],
   ])('matchGlob(%j, %j) === %s', (pattern, value, expected) => {
     expect(matchGlob(pattern, value)).toBe(expected);
   });
@@ -56,14 +59,19 @@ describe('matchGlob agrees with an exhaustive reference matcher', () => {
     return all;
   }
 
+  // A glob metacharacter is only special on the PATTERN side; on the value side it is an ordinary
+  // character a handle may legally contain. Both alphabets therefore carry `*` and `?`, so the
+  // corpus reaches the case where the two sides line up and a literal can be mistaken for a wildcard.
   const PATTERNS = words(['a', 'b', '*', '?'], 5);
-  const VALUES = words(['a', 'b'], 5);
+  const VALUES = words(['a', 'b', '*', '?'], 4);
 
   it('generates a corpus wide enough to reach the backtrack arm', () => {
     expect(PATTERNS.length).toBe(1365);
-    expect(VALUES.length).toBe(63);
+    expect(VALUES.length).toBe(341);
     expect(PATTERNS).toContain('*ab');
     expect(VALUES).toContain('aaab');
+    expect(VALUES).toContain('*ab');
+    expect(VALUES).toContain('?ab');
   });
 
   it('never disagrees over the whole pattern × value corpus', () => {

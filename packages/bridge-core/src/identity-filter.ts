@@ -28,13 +28,15 @@ function globMatch(pattern: string, value: string): boolean {
   let lastStar = -1;
   let starEnd = 0;
   while (s < S) {
-    if (p < P && (pattern[p] === '?' || pattern[p] === value[s])) {
-      p++;
-      s++;
-    } else if (p < P && pattern[p] === '*') {
+    // Keep the `*` arm ahead of the literal arm, so that a `*` occurring in the VALUE cannot be
+    // consumed as a literal and lose the backtrack point the rest of the walk depends on.
+    if (p < P && pattern[p] === '*') {
       lastStar = p;
       starEnd = s;
       p++;
+    } else if (p < P && (pattern[p] === '?' || pattern[p] === value[s])) {
+      p++;
+      s++;
     } else if (lastStar !== -1) {
       p = lastStar + 1;
       starEnd++;

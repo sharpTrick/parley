@@ -11,12 +11,33 @@ const sanitizeName = (s: string): string => s.replace(/[.*>/\\\s]/g, '_'); // NA
 const sanitizeAlias = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, '_'); // Matrix alias
 const sanitizeLocal = (s: string): string => s.toLowerCase().replace(/[^a-z0-9.\-_]/g, '_'); // XMPP JID
 
+// Every shipped fold REPLACES an illegal character, so none of them can map a non-empty topic to the
+// empty string — and a fold that cannot do that never reaches the length at which safeName's
+// pass-through and disambiguating branches meet. A third-party fold that DELETES instead is an
+// equally natural shape for public API, so grade both kinds.
+const sanitizeDelete = (s: string): string => s.replace(/[^a-z0-9_-]/g, '');
+const sanitizeLowerDelete = (s: string): string => s.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+
 const folds: [string, (s: string) => string][] = [
   ['NATS subject', sanitizeToken],
   ['NATS stream', sanitizeName],
   ['Matrix alias', sanitizeAlias],
   ['XMPP localpart', sanitizeLocal],
+  ['deleting fold', sanitizeDelete],
+  ['lowercasing deleting fold', sanitizeLowerDelete],
 ];
+
+it('the fold table carries a fold that can empty a non-empty topic', () => {
+  expect(folds.map(([label]) => label)).toEqual([
+    'NATS subject',
+    'NATS stream',
+    'Matrix alias',
+    'XMPP localpart',
+    'deleting fold',
+    'lowercasing deleting fold',
+  ]);
+  expect(folds.filter(([, fold]) => fold('!!!') === '').length).toBeGreaterThanOrEqual(2);
+});
 
 describe('safeName', () => {
   it('NATS: distinct topics with a colliding sanitized stream name map to distinct names', () => {
@@ -181,7 +202,18 @@ describe('safeName injectivity (generated, closed under its own output)', () => 
     'X',
     'a-0123456789',
     'a-0123456789ab',
+    '  ',
+    ' ',
+    '!!!',
   ];
+
+  it('the corpus contains a topic a deleting fold empties, so the closure reaches the boundary', () => {
+    const emptied = SEEDS.filter((s) => sanitizeDelete(s) === '');
+    expect(emptied.length).toBeGreaterThanOrEqual(3);
+    const minted = emptied.map((s) => safeName(asTopic(s), sanitizeDelete));
+    expect(minted.every((n) => n.length === 1 + MIN_HASH_LEN)).toBe(true);
+    expect(new Set(minted).size).toBe(emptied.length);
+  });
 
   it.each(folds)('is injective over the corpus and its closure (%s)', (_label, fold) => {
     const corpus = new Set(SEEDS);

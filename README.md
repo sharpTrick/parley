@@ -273,13 +273,13 @@ a real account:
 | `instance_id` | `identity.handle` | **Read-state namespace.** Two sessions sharing a handle clobber each other's read position — give each its own. Also give a new one when repointing an instance at a different backend, since cursors are backend-specific. |
 | `state_path` | `$XDG_STATE_HOME/parley/<instance>/read-state.json` | Where that cursor file lives. |
 | `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** |
-| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or announced. Patterns are screened for catastrophic backtracking at load, and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
+| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or announced. Patterns are screened for catastrophic backtracking at load, capped at **64 patterns** (every post/fetch matches its topic against all of them), and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
 | `catchup.on_start` | `true` | Drain everything newer than the stored cursor at startup. |
 | `catchup.limit` | `100` | Page size per `fetchRecent`. |
 | `catchup.block_max_ms` | `60000` | Server-side ceiling on `block_ms` (above). |
 | `catchup.block_poll_interval_ms` | `250` | Re-query cadence for core's generic long-poll fallback. Latency/cost only. |
 | `live_push.enabled` | `false` | Claude Code only — push `<channel>` events into a running session. |
-| `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. Requires a handle an `@mention` can name (ASCII letters/digits, optional interior `.` `-` `_`); anything else is a load error rather than a bridge that silently receives nothing. |
+| `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. Only the live push path reads it, so `true` with `live_push.enabled: false` is a load error rather than a filter that never runs. Requires a handle an `@mention` can name (ASCII letters/digits, optional interior `.` `-` `_`); anything else is a load error rather than a bridge that silently receives nothing. |
 | `presence.enabled` | **`true`** | See the warning below. |
 | `presence.topic` | `parley-presence` | The one shared topic beats go to. Reserved: it can never appear in `topics`. |
 | `presence.heartbeat_ms` | `600000` | Beat cadence. |

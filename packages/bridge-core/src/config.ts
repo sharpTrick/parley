@@ -91,6 +91,14 @@ export const AuthSchema = z
 export type AuthConfig = z.infer<typeof AuthSchema>;
 
 /**
+ * Most `post_topics` patterns one config may carry. {@link isRedosSafeSource} bounds what ONE source
+ * can spend, but `Allowlist.has` matches a caller-supplied topic against all of them in turn, so the
+ * calibrated per-source cost multiplies by this count on every post/reply/fetch. Mirrors the
+ * `MAX_RECORD_TOPICS` cap the presence path already puts on the same shape of untrusted list.
+ */
+export const MAX_POST_TOPICS = 64;
+
+/**
  * The single config object that drives a bridge (DESIGN §11). Sane defaults everywhere.
  * `backend_config` is opaque to core and passed verbatim to the plugin's `connect()`.
  *
@@ -117,9 +125,11 @@ const ConfigObject = z.object({
    * `^(?:…)$` at compile time). Lets a chat instance post to ad-hoc topics without listing each
    * one. These are NEVER subscribed / caught up on / announced in presence — that stays the
    * explicit `topics` list. The presence topic can never be matched (it is reserved). Invalid
-   * regexes are rejected at load (DESIGN §14).
+   * regexes are rejected at load (DESIGN §14). Capped at {@link MAX_POST_TOPICS}: the ReDoS screen
+   * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
+   * one of them, so the count is the other half of that bound.
    */
-  post_topics: z.array(z.string().min(1)).default([]),
+  post_topics: z.array(z.string().min(1)).max(MAX_POST_TOPICS).default([]),
   catchup: z
     .object({
       on_start: z.boolean().default(true),
@@ -238,7 +248,21 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
         'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
     });
   }
-  if (cfg.live_push.mention_filter && !isMentionableHandle(cfg.identity.handle)) {
+  if (cfg.live_push.mention_filter && !cfg.live_push.enabled) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['live_push', 'mention_filter'],
+      message:
+        'live_push.mention_filter is only read on the live push path, which live_push.enabled: ' +
+        'false never starts — so it would filter nothing. Set live_push.enabled: true, or remove ' +
+        'mention_filter.',
+    });
+  }
+  if (
+    cfg.live_push.enabled &&
+    cfg.live_push.mention_filter &&
+    !isMentionableHandle(cfg.identity.handle)
+  ) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['identity', 'handle'],

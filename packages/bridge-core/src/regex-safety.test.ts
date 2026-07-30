@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { isRedosSafeSource, MAX_MATCH_INPUT } from './regex-safety.js';
+import { allowlistFor } from './allowlist.js';
+import { MAX_POST_TOPICS, parseConfig } from './config.js';
+import { isRedosSafeSource, MAX_AMBIGUITY, MAX_MATCH_INPUT } from './regex-safety.js';
 import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
 
 // The screen's only real contract: whatever it accepts must MATCH in bounded time, for every input
@@ -187,5 +189,46 @@ describe('isRedosSafeSource', () => {
     expect(uncompilable.length).toBeGreaterThan(2_000);
     const leaked = [...new Set(candidates.filter((src) => isRedosSafeSource(src) && !compiles(src)))];
     expect(leaked.slice(0, 20), `${leaked.length} accepted source(s) do not compile`).toEqual([]);
+  });
+});
+
+// MAX_AMBIGUITY bounds ONE source. `Allowlist.has` runs every compiled pattern against the same
+// caller-supplied topic, so a post/reply/fetch pays that bound once PER SOURCE — an uncapped
+// collection makes a per-source calibration meaningless. Fill the collection to its documented
+// maximum with the worst source the screen accepts AT the bound, derived from the constants so
+// raising either constant re-grades this instead of silently widening the hole.
+describe('a screened collection is bounded in aggregate, not only per source', () => {
+  const WORST = chain('[ab]?', Math.log2(MAX_AMBIGUITY)) + chain('a', 16) + 'z';
+  const ADVERSARIAL = 'a'.repeat(MAX_MATCH_INPUT);
+  const AGGREGATE_BUDGET_MS = 1_000;
+
+  it('the source really sits at the ambiguity bound', () => {
+    expect(Number.isInteger(Math.log2(MAX_AMBIGUITY))).toBe(true);
+    expect(isRedosSafeSource(WORST)).toBe(true);
+    expect(isRedosSafeSource(`[ab]?${WORST}`)).toBe(false);
+  });
+
+  it('post_topics at its cap stays inside the aggregate budget', () => {
+    const cfg = parseConfig({
+      identity: { handle: 'h' },
+      topics: ['ctx'],
+      post_topics: Array.from({ length: MAX_POST_TOPICS }, () => WORST),
+    });
+    const allow = allowlistFor(cfg);
+    expect(allow.patterns()).toHaveLength(MAX_POST_TOPICS);
+    const started = performance.now();
+    expect(allow.has(ADVERSARIAL)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(AGGREGATE_BUDGET_MS);
+  });
+
+  it('refuses one pattern past the cap, naming post_topics', () => {
+    const overCap = Array.from({ length: MAX_POST_TOPICS + 1 }, (_, i) => `ctx-${i}-.*`);
+    let issuePaths: unknown[][] = [];
+    try {
+      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], post_topics: overCap });
+    } catch (e) {
+      issuePaths = (e as { issues?: { path: unknown[] }[] }).issues?.map((i) => i.path) ?? [];
+    }
+    expect(issuePaths).toContainEqual(['post_topics']);
   });
 });

@@ -69,7 +69,7 @@ export function safeName(
 }
 
 function isDisambiguated(name: string, sep: string, hashLen: number): boolean {
-  if (name.length <= sep.length + hashLen) return false;
+  if (name.length < sep.length + hashLen) return false;
   if (!name.startsWith(sep, name.length - sep.length - hashLen)) return false;
   return /^[0-9a-f]+$/.test(name.slice(name.length - hashLen));
 }

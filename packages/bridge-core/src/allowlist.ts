@@ -63,8 +63,9 @@ export interface AllowlistOptions {
  * never make it postable/fetchable, so a peer cannot spoof the presence roster.
  *
  * Inbound is untrusted (DESIGN §14): message content becomes agent context and is never treated
- * as a privileged instruction. A reply always targets the inbound topic, which is subscribed
- * (thus in the explicit list) and therefore already allowed.
+ * as a privileged instruction. A reply carries a caller-supplied topic and is gated by the same
+ * POST/FETCH set as a post — so it reaches any explicit topic or `post_topics` match, and nothing
+ * else. It is not confined to the topic the inbound message arrived from.
  */
 export class Allowlist {
   private readonly allowed: Set<string>;

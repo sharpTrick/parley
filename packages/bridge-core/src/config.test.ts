@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { instanceIdOf, parseConfig } from './config.js';
+import { allowlistFor } from './allowlist.js';
+import { instanceIdOf, parseConfig, type ParleyConfig } from './config.js';
 import { parseMentions } from './mentions.js';
 
 describe('config loader', () => {
@@ -485,6 +486,94 @@ describe('mention_filter requires a mentionable handle', () => {
         live_push: { enabled: true, mention_filter: false },
       }),
     ).not.toThrow();
+  });
+});
+
+// This module refuses `permissions.skip_permissions: true` and every unknown key on one argument:
+// a setting nothing reads leaves the operator with a bridge that quietly does nothing. A knob that
+// is only read under ANOTHER knob is the same argument one level in, so grade the pairs as a class —
+// a knob is legal beneath a disabled enabler only if something still reads it. `probe` is what does
+// the reading; a pair with nothing behind it can only pass by being a load error.
+describe('a knob is never accepted beneath a disabled enabler unless something reads it', () => {
+  interface DependentKnob {
+    path: readonly string[];
+    base: Record<string, unknown>;
+    set: Record<string, unknown>;
+    probe: (cfg: ParleyConfig) => unknown;
+  }
+
+  const NOTHING_READS_IT = Symbol('no reader while the enabler is off');
+
+  const KNOBS: readonly (readonly [label: string, knob: DependentKnob])[] = [
+    [
+      'live_push.mention_filter under live_push.enabled',
+      {
+        path: ['live_push', 'mention_filter'],
+        base: { live_push: { enabled: false } },
+        set: { live_push: { enabled: false, mention_filter: true } },
+        probe: () => NOTHING_READS_IT,
+      },
+    ],
+    [
+      'presence.topic under presence.enabled',
+      {
+        path: ['presence', 'topic'],
+        base: { presence: { enabled: false } },
+        set: { presence: { enabled: false, topic: 'roster-x' } },
+        probe: (cfg) => allowlistFor(cfg).has('roster-x'),
+      },
+    ],
+    [
+      'presence.heartbeat_ms under presence.enabled',
+      {
+        path: ['presence', 'heartbeat_ms'],
+        base: { presence: { enabled: false } },
+        set: { presence: { enabled: false, heartbeat_ms: 60_000 } },
+        probe: (cfg) => cfg.presence.ttl_ms,
+      },
+    ],
+    [
+      'presence.ttl_ms under presence.enabled',
+      {
+        path: ['presence', 'ttl_ms'],
+        base: { presence: { enabled: false } },
+        set: { presence: { enabled: false, ttl_ms: 900_000 } },
+        probe: (cfg) => cfg.presence.ttl_ms,
+      },
+    ],
+  ] as const;
+
+  const load = (extra: Record<string, unknown>): ParleyConfig =>
+    parseConfig({
+      identity: { handle: 'h' },
+      topics: ['ctx'],
+      post_topics: ['.*'],
+      ...extra,
+    });
+
+  it('pins the pairs and keeps one with no reader behind it', () => {
+    expect(KNOBS.map(([label]) => label)).toEqual([
+      'live_push.mention_filter under live_push.enabled',
+      'presence.topic under presence.enabled',
+      'presence.heartbeat_ms under presence.enabled',
+      'presence.ttl_ms under presence.enabled',
+    ]);
+    expect(KNOBS.filter(([, k]) => k.probe(load(k.base)) === NOTHING_READS_IT).length).toBe(1);
+  });
+
+  it.each(KNOBS)('%s', (_label, knob) => {
+    let withKnob: ParleyConfig | undefined;
+    let issuePaths: unknown[][] = [];
+    try {
+      withKnob = load(knob.set);
+    } catch (e) {
+      issuePaths = (e as { issues?: { path: unknown[] }[] }).issues?.map((i) => i.path) ?? [];
+    }
+    if (withKnob === undefined) {
+      expect(issuePaths).toContainEqual([...knob.path]);
+      return;
+    }
+    expect(knob.probe(withKnob)).not.toEqual(knob.probe(load(knob.base)));
   });
 });
 

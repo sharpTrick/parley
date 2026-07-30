@@ -15,6 +15,10 @@ export const MAX_MATCH_INPUT = 64;
  * Most backtracking paths a screened source may be able to explore against an input of
  * {@link MAX_MATCH_INPUT} characters. Calibrated so the worst accepted source finishes in single-digit
  * milliseconds on V8.
+ *
+ * The bound is PER SOURCE. A caller that matches one input against a collection of screened sources
+ * pays it once per source, so it must also bound HOW MANY it holds — `post_topics` caps the count at
+ * `MAX_POST_TOPICS`, and the presence path at `MAX_RECORD_TOPICS`.
  */
 export const MAX_AMBIGUITY = 65_536;
 
