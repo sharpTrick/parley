@@ -35,6 +35,17 @@
       "preExisting": 52,
       "unresolvable": 0,
       "selfInducedPct": 57
+    },
+    {
+      "round": 5,
+      "base": "c9a6a2d",
+      "findings": 129,
+      "graded": 128,
+      "selfInduced": 77,
+      "preExisting": 51,
+      "unresolvable": 1,
+      "selfInducedPct": 60,
+      "note": "Round 5 reviewed with no docker daemon for its six service-backed targets, so its pre-existing count is a FLOOR: live-only defects could not surface."
     }
   ],
   "comparison": {

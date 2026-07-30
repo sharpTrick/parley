@@ -131,6 +131,16 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 2 | 14 / 14 | 136 | 130 | 49 | 6 | 0 | no |
 | 3 | 14 / 14 | 119 | 115 | 38 | 4 | 0 | no |
 | 4 | 14 / 14 | 120 | 113 | 45 | 7 | 0 | no |
+| 5 | 14 / 14 | 129 | 117 | 39 | 12 | 0 | no |
+
+**Round 5 is degraded and its numbers should carry an asterisk.** The docker daemon died during the
+round, so the six service-backed targets (redis, postgres, matrix, xmpp, nats, core-auth) reviewed
+against source and fakes only — the postgres critic reported all nine of its server-gated files
+self-skipping, and matrix reported the same. The findings are real code findings, and the mutations
+run against non-server cases are valid, but defects that only a live server surfaces could not appear.
+Given round 4's result that a real server is worth more to a critic than another round, this makes
+round 5's pre-existing count a FLOOR rather than a measurement. Verification was pushed into
+remediation instead, where every agent reproduces against live services before fixing.
 
 Round 3 ran the **round-1 runner** — see "Process defects" below. It is kept in the series because
 all 14 critics still reviewed the correct targets full-surface and reached the worktrees and the
@@ -239,6 +249,7 @@ same agent that wrote the fixes being judged.
 | 2 | 136 | 36 | 100 | **26%** |
 | 3 | 119 | 46 | 73 | **39%** |
 | 4 | 120 | 68 | 52 | **57%** |
+| 5 | 129 | 77 | 51 | **60%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
