@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SqlParam } from '../src/driver.js';
 import {
   backoffMs,
+  ESCALATE_AFTER,
   MAX_POLL_INTERVAL_MS,
   MIN_POLL_INTERVAL_MS,
   POLL_BATCH,
@@ -14,6 +15,9 @@ import {
   SqlitePlugin,
 } from '../src/index.js';
 import { SQL } from '../src/schema.js';
+import { expectHealth } from './health.js';
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * The plugin runs two background jobs — the per-topic poll loop and the retention prune — and both
@@ -112,7 +116,9 @@ describe('poll loop error-class matrix', () => {
             timeout: 8000,
             interval: 10,
           });
-          expect(p.subscriptionHealth(T)[0]?.state).toBe('live');
+          expectHealth(p.subscriptionHealth(T), [
+            { topic: T, state: 'live', consecutiveFailures: 0 },
+          ]);
         } else {
           await vi.waitFor(() => expect(p.subscriptionHealth(T)[0]?.state).toBe('stopped'), {
             timeout: 3000,
@@ -151,13 +157,21 @@ describe('poll loop error-class matrix', () => {
       const diags = lines.filter((l) => /poll error|poll loop/.test(l));
       if (c.quiet) {
         expect(diags).toEqual([]);
-        expect(p.subscriptionHealth(T)[0]?.state).toBe('live');
+        expectHealth(p.subscriptionHealth(T), [
+          { topic: T, state: 'live', consecutiveFailures: 0 },
+        ]);
       } else {
         expect(diags.length).toBeGreaterThan(0);
         // Rate-limited: a persistent failure must not write one line per poll interval.
         expect(diags.length).toBeLessThanOrEqual(3);
-        expect(p.subscriptionHealth(T)[0]?.state).toBe(c.healable ? 'degraded' : 'stopped');
-        expect(p.subscriptionHealth(T)[0]?.lastError).toContain(c.make().message);
+        expectHealth(p.subscriptionHealth(T), [
+          {
+            topic: T,
+            state: c.healable ? 'degraded' : 'stopped',
+            consecutiveFailures: { atLeast: ESCALATE_AFTER },
+            lastError: new RegExp(escapeRegExp(c.make().message)),
+          },
+        ]);
       }
     });
   }
@@ -205,7 +219,7 @@ describe('a throwing handler is a consumer fault, not a store outage', () => {
       }
       expect(survived).toEqual(SENT.filter((_c, nth) => !f.fails(nth)));
       expect(lines.filter((l) => /poll error|poll loop/.test(l))).toEqual([]);
-      expect(p.subscriptionHealth(T)).toEqual([{ topic: T, state: 'live', consecutiveFailures: 0 }]);
+      expectHealth(p.subscriptionHealth(T), [{ topic: T, state: 'live', consecutiveFailures: 0 }]);
     });
   }
 });

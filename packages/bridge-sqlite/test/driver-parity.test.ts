@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { openDriver as OpenDriver, SqlDriver } from '../src/driver.js';
+import { NODE_SQLITE_MIN, type openDriver as OpenDriver, type SqlDriver } from '../src/driver.js';
 import type { SqlitePlugin as SqlitePluginClass } from '../src/index.js';
 import { SCHEMA } from '../src/schema.js';
 
@@ -39,12 +39,12 @@ const KINDS: Array<SqlDriver['kind']> = ['better-sqlite3', 'node:sqlite'];
  * un-prebuilt install does — the memoized ctor in driver.ts is why this needs a module reset rather
  * than a flag.
  */
-async function load(kind: SqlDriver['kind']): Promise<{
+async function loadWithout(missing: string[]): Promise<{
   openDriver: typeof OpenDriver;
   SqlitePlugin: typeof SqlitePluginClass;
 }> {
   vi.resetModules();
-  if (kind === 'node:sqlite') {
+  if (missing.length > 0) {
     vi.doMock('node:module', async (importOriginal) => {
       const real = await importOriginal<typeof import('node:module')>();
       return {
@@ -53,9 +53,10 @@ async function load(kind: SqlDriver['kind']): Promise<{
         createRequire: (from: string | URL) => {
           const inner = real.createRequire(from);
           const absent = ((id: string) => {
-            if (id === 'better-sqlite3') {
-              throw Object.assign(new Error("Cannot find module 'better-sqlite3'"), {
-                code: 'MODULE_NOT_FOUND',
+            if (missing.includes(id)) {
+              // A builtin this Node predates fails with its own code, not MODULE_NOT_FOUND.
+              throw Object.assign(new Error(`Cannot find module '${id}'`), {
+                code: id.startsWith('node:') ? 'ERR_UNKNOWN_BUILTIN_MODULE' : 'MODULE_NOT_FOUND',
               });
             }
             return inner(id) as unknown;
@@ -72,6 +73,9 @@ async function load(kind: SqlDriver['kind']): Promise<{
   return { openDriver: driver.openDriver, SqlitePlugin: index.SqlitePlugin };
 }
 
+const load = (kind: SqlDriver['kind']): ReturnType<typeof loadWithout> =>
+  loadWithout(kind === 'node:sqlite' ? ['better-sqlite3'] : []);
+
 let open: SqlitePluginClass[] = [];
 afterEach(async () => {
   await Promise.all(open.map((p) => p.disconnect()));
@@ -82,12 +86,32 @@ afterEach(async () => {
 
 it('grades every driver this package can select at runtime', () => {
   // A silent skip here would certify the fallback on the incumbent's results, so say which driver
-  // is missing and why: node:sqlite arrived in Node 22.5, and `engines` allows 22.0.
+  // is missing and why: node:sqlite arrived in Node 22.5, which is this package's declared floor.
   expect(loadable('better-sqlite3'), 'better-sqlite3 must load for the parity baseline').toBe(true);
   expect(
     loadable('node:sqlite'),
     `node:sqlite is unavailable on Node ${process.versions.node}; parity for the fallback driver is UNGRADED`,
   ).toBe(true);
+});
+
+/**
+ * `engines` keeps this package off a Node that has neither driver; the message is what an operator
+ * gets when they land there anyway — a runtime downgrade under an existing install, or an install
+ * that ignored the engine warning. "fallback failed" alone names neither the cause nor the fix.
+ */
+it('with neither driver available, the failure names the Node version node:sqlite needs', async () => {
+  const { openDriver } = await loadWithout(['better-sqlite3', 'node:sqlite']);
+  const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  try {
+    const attempt = (): SqlDriver => openDriver(join(dir(), 'p.db'));
+    expect(attempt).toThrow(new RegExp(`node:sqlite requires Node >= ${NODE_SQLITE_MIN}`));
+    expect(attempt).toThrow(process.versions.node);
+    expect(attempt).toThrow(/better-sqlite3/);
+    const lines = spy.mock.calls.map(([l]) => String(l));
+    expect(lines.filter((l) => l.includes(NODE_SQLITE_MIN)).length).toBeGreaterThan(0);
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 describe.each(KINDS)('driver parity: %s', (kind) => {

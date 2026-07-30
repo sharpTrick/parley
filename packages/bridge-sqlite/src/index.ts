@@ -43,7 +43,10 @@ export interface SqliteBackendConfig {
    * Omit for the default — keep every message forever. `0` and negatives are rejected: they mean
    * "delete everything up to now", an irreversible wipe of the whole shared file. Safe to enable
    * at any time: `id` is `AUTOINCREMENT` and never reused, so a cursor/backendMsgId minted before
-   * a prune stays valid (a stale reader just gets fewer rows back, never a wrong or duplicate one).
+   * a prune stays valid (catch-up across a prune returns fewer rows, never a wrong or duplicate
+   * one). Which rows go is decided by `ts` — the wall clock of whichever process posted them, not
+   * the cursor — so skew between hosts sharing one file shifts which messages survive, and a row
+   * can be pruned before any reader's cursor has reached it.
    */
   retention_days?: number;
 }
@@ -76,7 +79,7 @@ export const MIN_POLL_INTERVAL_MS = 10;
  */
 export const MAX_POLL_INTERVAL_MS = 2_147_483_647;
 /** Consecutive non-lock poll failures before the loop escalates (backs off, or stops if fatal). */
-const ESCALATE_AFTER = 10;
+export const ESCALATE_AFTER = 10;
 /** Ceiling on the degraded poll interval, so a down DB is re-probed forever but cheaply. */
 const BACKOFF_CEILING_MS = 30_000;
 /** Minimum gap between repeats of the same background-job diagnostic. */
@@ -108,6 +111,7 @@ export class SqlitePlugin implements BackendPlugin {
   private stopped = false;
   private storeId?: string;
   private readonly cancellers: Array<() => void> = [];
+  private readonly caughtUpThrough = new Map<Topic, bigint>();
   private pruneTimer?: ReturnType<typeof setInterval>;
   private pruneBatchTimer?: ReturnType<typeof setTimeout>;
   private readonly health: SubscriptionHealth[] = [];
@@ -179,6 +183,9 @@ export class SqlitePlugin implements BackendPlugin {
     this.pruneBatchTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
+    // Keep the hand-off points cleared with the driver, so that a reconnect onto a different or
+    // reset store cannot resume a live loop at a rowid belonging to the previous one.
+    this.caughtUpThrough.clear();
     for (const h of this.health) {
       h.state = 'stopped';
       h.lastError = 'disconnected';
@@ -224,12 +231,22 @@ export class SqlitePlugin implements BackendPlugin {
         limit,
       ) as MessageRow[];
     }
-    const messages = rows.map((row) => rowToMessage(row, storeId));
-    const last = messages.at(-1);
+    const servedThrough = rows.at(-1)?.id ?? resumeAfter ?? 0n;
+    this.recordCatchUp(args.topic, BigInt(servedThrough));
     return {
-      messages,
-      nextCursor: last?.cursor ?? mintCursor(storeId, resumeAfter ?? 0n),
+      messages: rows.map((row) => rowToMessage(row, storeId)),
+      nextCursor: mintCursor(storeId, servedThrough),
     };
+  }
+
+  /**
+   * Remember the rowid this topic's catch-up has accounted for — the row `nextCursor` names, which
+   * is the caller's persisted read position. Only ever advances, so a caller that re-reads an
+   * older page cannot pull a later {@link subscribe} back over messages catch-up already served.
+   */
+  private recordCatchUp(topic: Topic, rowid: bigint): void {
+    const seen = this.caughtUpThrough.get(topic);
+    if (seen === undefined || rowid > seen) this.caughtUpThrough.set(topic, rowid);
   }
 
   /**
@@ -258,14 +275,19 @@ export class SqlitePlugin implements BackendPlugin {
   }
 
   /**
-   * Live path = a per-topic poll loop (DESIGN §9, polling-only). Starts at the current max
-   * rowid (history is owned by catch-up, not push). `SELECT WHERE id > :lastSeen ASC` per tick,
-   * advancing `lastSeen`. `disconnect()` cancels the loop. The cursor guarantees nothing is
-   * missed regardless of cadence.
+   * Live path = a per-topic poll loop (DESIGN §9, polling-only). `SELECT WHERE id > :lastSeen ASC`
+   * per tick, advancing `lastSeen`. `disconnect()` cancels the loop. The cursor guarantees nothing
+   * is missed regardless of cadence.
+   *
+   * It starts where this topic's catch-up handed off, not at the current max rowid: core runs
+   * catch-up to completion and arms `subscribe` later, so a start point sampled here would skip
+   * everything a peer committed in between — below the sampled mark, above the read position
+   * catch-up persisted, and therefore owned by neither path. Sampling is right only for a topic
+   * catch-up never read: its rows are history the live path has never owned.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const storeId = this.require(this.storeId);
-    let lastSeen = this.maxId(topic);
+    let lastSeen: number | bigint = this.caughtUpThrough.get(topic) ?? this.maxId(topic);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let lastDiag = 0;
@@ -303,6 +325,7 @@ export class SqlitePlugin implements BackendPlugin {
           failures = 0;
           health.state = 'live';
           health.consecutiveFailures = 0;
+          health.lastError = undefined;
         } else {
           failures++;
           health.consecutiveFailures = failures;

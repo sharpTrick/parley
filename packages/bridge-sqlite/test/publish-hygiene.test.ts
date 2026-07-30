@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { NODE_SQLITE_MIN } from '../src/driver.js';
 
 /**
  * What ships to npm is decided by `files` + the tsconfig's emit set, both of which are easy to
@@ -17,6 +18,7 @@ const tsconfig = JSON.parse(readFileSync(join(pkgDir, 'tsconfig.json'), 'utf8'))
 const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as {
   license?: string;
   files?: string[];
+  engines?: { node?: string };
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
 };
@@ -75,6 +77,65 @@ describe('published tarball hygiene', () => {
     it(`${mod} is an optionalDependency, so a failed native install is survivable`, () => {
       expect(Object.keys(manifest.optionalDependencies ?? {})).toContain(mod);
       expect(Object.keys(manifest.dependencies ?? {})).not.toContain(mod);
+    });
+  }
+
+  /**
+   * `engines` is what npm installs against, and this package reaches for a `node:` builtin that is
+   * NEWER than the runtime floor every other package here declares. A floor below the builtin
+   * admits an install where the optional native module was skipped and the advertised fallback
+   * cannot exist — the manifest promising a runtime the degraded path cannot run on.
+   *
+   * A specifier absent from this table fails rather than defaulting to "ancient": deciding a
+   * builtin's floor is the check, and `node:sqlite` outran the manifest once already.
+   */
+  const BUILTIN_SINCE: Record<string, string> = {
+    'node:child_process': '0.0.0',
+    'node:crypto': '0.0.0',
+    'node:fs': '0.0.0',
+    'node:module': '0.0.0',
+    'node:os': '0.0.0',
+    'node:path': '0.0.0',
+    'node:process': '0.0.0',
+    'node:sqlite': NODE_SQLITE_MIN,
+    'node:url': '0.0.0',
+  };
+
+  const shippedSources = sourcesUnder('src').filter(
+    (f) => f.endsWith('.ts') && !/\.(test|spec)\.ts$/.test(f),
+  );
+  const BUILTINS_USED = [
+    ...new Set(
+      shippedSources.flatMap((f) =>
+        [
+          ...readFileSync(join(pkgDir, 'src', f), 'utf8').matchAll(/['"](node:[a-z_/]+)['"]/g),
+        ].map((m) => m[1] as string),
+      ),
+    ),
+  ].sort();
+
+  const cmp = (a: string, b: string): number => {
+    const x = a.split('.').map(Number);
+    const y = b.split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      const d = (x[i] ?? 0) - (y[i] ?? 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  };
+
+  it('the manifest declares a runtime floor at all', () => {
+    expect(BUILTINS_USED.length).toBeGreaterThan(0);
+    expect(manifest.engines?.node).toMatch(/^>=\s*\d+\.\d+\.\d+$/);
+  });
+
+  for (const builtin of BUILTINS_USED) {
+    it(`engines.node is not below the Node that introduced ${builtin}`, () => {
+      const since = BUILTIN_SINCE[builtin];
+      expect(since, `no known introduction version for ${builtin} — add one`).toBeDefined();
+      const floor = /^>=\s*(\d+\.\d+\.\d+)$/.exec(manifest.engines?.node ?? '')?.[1];
+      expect(floor).toBeDefined();
+      expect(cmp(floor as string, since as string), `${floor} must be >= ${since}`).toBeGreaterThanOrEqual(0);
     });
   }
 

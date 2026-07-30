@@ -141,9 +141,27 @@ function openConnection(path: string): SqlDriver {
   } catch (e) {
     // The native module was absent AND the builtin fallback also failed → surface the fallback
     // failure WITH the original error attached as `cause`, not in place of it.
-    process.stderr.write('parley-sqlite: better-sqlite3 unavailable; node:sqlite fallback failed\n');
-    throw new Error(`node:sqlite fallback failed opening ${path}`, { cause: e });
+    const detail = `node:sqlite fallback failed opening ${path}${versionHint(e)}`;
+    process.stderr.write(`parley-sqlite: better-sqlite3 unavailable; ${detail}\n`);
+    throw new Error(detail, { cause: e });
   }
+}
+
+/** Node version that introduced `node:sqlite`; below it the fallback driver does not exist. */
+export const NODE_SQLITE_MIN = '22.5.0';
+
+/**
+ * Name the version requirement when the BUILTIN is what is missing — the one fallback failure an
+ * operator cannot diagnose from the error itself, since a Node too old to carry `node:sqlite`
+ * reports it exactly as it reports a typo'd module.
+ */
+function versionHint(e: unknown): string {
+  const code = (e as NodeJS.ErrnoException).code;
+  if (code !== 'ERR_UNKNOWN_BUILTIN_MODULE' && code !== 'MODULE_NOT_FOUND') return '';
+  return (
+    `: node:sqlite requires Node >= ${NODE_SQLITE_MIN} and this is ${process.versions.node} — ` +
+    `install better-sqlite3, or upgrade Node`
+  );
 }
 
 /** How many times a lock-classed WAL conversion is retried before the driver degrades. */

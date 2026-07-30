@@ -5,7 +5,7 @@
   "description": "Parley SQLite backend: zero-infra, polling-only seam implementation. The seam-proving reference backend.",
   "license": "MIT",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.5.0"
   },
   "repository": {
     "type": "git",

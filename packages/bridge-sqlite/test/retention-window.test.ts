@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import type { SqlDriver } from '../src/driver.js';
@@ -16,6 +17,7 @@ import { retentionCutoff, SqlitePlugin } from '../src/index.js';
 const T = asTopic('ctx');
 const me = asHandle('alice');
 const DAY_MS = 86_400_000;
+const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
 
 const dirs: string[] = [];
 function dbFile(): string {
@@ -72,6 +74,87 @@ describe('retentionCutoff resolves a window to a boundary in the past', () => {
       vi.useRealTimers();
     }
   });
+});
+
+/**
+ * The window is judged against `ts`, and `ts` is the wall clock of whichever process posted the
+ * row — the one decision this backend makes on a timestamp the schema calls informational. So
+ * retention and the cursor disagree by construction, and the disagreement is observable: a skewed
+ * peer's row is deleted while rows above AND below it in cursor order survive. Graded here because
+ * it is a documented loss model, not an accident — pruning by a rowid watermark instead would turn
+ * these red, which is exactly when the README paragraph below would need rewriting.
+ */
+describe('retention judges a row by the poster’s clock, not by its cursor position', () => {
+  const WINDOW_DAYS = 1 / 24;
+  const HOUR_MS = 3_600_000;
+  const SKEWS = [
+    { name: 'a peer whose clock is 2 h behind', skewMs: -2 * HOUR_MS, survives: false },
+    { name: 'a peer whose clock agrees', skewMs: 0, survives: true },
+    { name: 'a peer whose clock is 2 h ahead', skewMs: 2 * HOUR_MS, survives: true },
+  ];
+
+  /** Plant rows in the given order (so rowids follow it), then connect with retention on. */
+  async function plantAndPrune(
+    rows: Array<{ content: string; skewMs: number }>,
+  ): Promise<Array<{ content: string; rowid: number }>> {
+    const path = dbFile();
+    const writer = new SqlitePlugin();
+    await writer.connect({ db_path: path, poll_interval_ms: 20 });
+    const stmt = (writer as unknown as { driver: SqlDriver }).driver.prepare(
+      'INSERT INTO messages (topic, sender, content, ts) VALUES (?, ?, ?, ?)',
+    );
+    for (const r of rows) {
+      stmt.run(T, me, r.content, new Date(Date.now() + r.skewMs).toISOString());
+    }
+    await writer.disconnect();
+
+    const p = new SqlitePlugin();
+    open.push(p);
+    await p.connect({ db_path: path, poll_interval_ms: 20, retention_days: WINDOW_DAYS });
+    const { messages } = await p.fetchRecent({ topic: T, limit: 100 });
+    return messages.map((m) => ({ content: m.content, rowid: Number(m.backendMsgId) }));
+  }
+
+  for (const skew of SKEWS) {
+    it(`${skew.name}: its row ${skew.survives ? 'survives' : 'is deleted'} whatever its rowid`, async () => {
+      const survivors = await plantAndPrune([
+        { content: 'in-step-below', skewMs: 0 },
+        { content: 'skewed', skewMs: skew.skewMs },
+        { content: 'in-step-above', skewMs: 0 },
+      ]);
+      const contents = survivors.map((r) => r.content);
+
+      expect(contents).toContain('in-step-below');
+      expect(contents).toContain('in-step-above');
+      expect(contents.includes('skewed')).toBe(skew.survives);
+      if (!skew.survives) {
+        // The deleted row sits BETWEEN two survivors: what went is not a prefix in cursor order.
+        const rowids = survivors.map((r) => r.rowid);
+        expect(Math.min(...rowids)).toBeLessThan(2);
+        expect(Math.max(...rowids)).toBeGreaterThan(2);
+      }
+    });
+  }
+
+  /**
+   * The behaviour above is a LOSS MODEL, and the README is where an operator sizing
+   * `retention_days` reads it. Stated in terms of reader downtime alone it reads as "offline less
+   * than the window ⇒ nothing lost", which is false the moment two hosts' clocks disagree.
+   */
+  const README_CLAIMS = [
+    { what: 'that the cutoff is judged against the poster’s clock', pattern: /poster'?’?s wall clock/i },
+    { what: 'that clock skew between hosts shifts which rows survive', pattern: /clock skew/i },
+    {
+      what: 'that a row can go before a reader’s cursor reaches it',
+      pattern: /reader'?’?s cursor has reached it/i,
+    },
+  ];
+
+  for (const claim of README_CLAIMS) {
+    it(`the README states ${claim.what}`, () => {
+      expect(README.replace(/\s+/g, ' ')).toMatch(claim.pattern);
+    });
+  }
 });
 
 /**

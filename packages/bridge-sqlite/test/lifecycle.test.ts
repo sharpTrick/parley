@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openDriver, type SqlDriver } from '../src/driver.js';
 import { SqlitePlugin } from '../src/index.js';
 import { SCHEMA } from '../src/schema.js';
+import { type ExpectedHealth, expectHealth } from './health.js';
 
 /**
  * `connect`/`disconnect` are the entire lifecycle the seam declares, and an embedder — or a future
@@ -361,16 +362,21 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
     await p.subscribe(asTopic('other'), () => {});
     await p.post(T, me, 'while-live');
     await vi.waitFor(() => expect(got).toEqual(['while-live']), { timeout: 2000, interval: 5 });
-    expect(p.subscriptionHealth().map((h) => h.state)).toEqual(['live', 'live']);
+    const other = asTopic('other');
+    expectHealth(p.subscriptionHealth(), [
+      { topic: T, state: 'live', consecutiveFailures: 0 },
+      { topic: other, state: 'live', consecutiveFailures: 0 },
+    ]);
 
     await p.disconnect();
 
-    const after = p.subscriptionHealth();
-    expect(after.map((h) => h.topic)).toEqual(['ctx', 'other']);
-    expect(after.map((h) => h.state)).toEqual(['stopped', 'stopped']);
-    expect(after.every((h) => h.lastError !== undefined)).toBe(true);
+    const torndown: ExpectedHealth[] = [
+      { topic: T, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
+      { topic: other, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
+    ];
+    expectHealth(p.subscriptionHealth(), torndown);
     await new Promise((r) => setTimeout(r, 60));
-    expect(p.subscriptionHealth().map((h) => h.state)).toEqual(['stopped', 'stopped']);
+    expectHealth(p.subscriptionHealth(), torndown);
   });
 
   /**
@@ -385,7 +391,14 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
       const sinks = Array.from({ length: loops }, () => [] as string[]);
       for (const sink of sinks) await p.subscribe(T, (m) => sink.push(m.content));
 
-      expect(p.subscriptionHealth(T).map((h) => h.state)).toEqual(Array(loops).fill('live'));
+      const live = (state: 'live' | 'stopped'): ExpectedHealth[] =>
+        Array.from({ length: loops }, () => ({
+          topic: T,
+          state,
+          consecutiveFailures: 0,
+          ...(state === 'stopped' ? { lastError: /^disconnected$/ } : {}),
+        }));
+      expectHealth(p.subscriptionHealth(T), live('live'));
 
       await p.post(T, me, 'fan-out');
       await vi.waitFor(
@@ -394,7 +407,7 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
       );
 
       await p.disconnect();
-      expect(p.subscriptionHealth(T).map((h) => h.state)).toEqual(Array(loops).fill('stopped'));
+      expectHealth(p.subscriptionHealth(T), live('stopped'));
     });
   }
 
@@ -406,7 +419,7 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
     await p.disconnect();
 
     await p.connect(cfg(path));
-    expect(p.subscriptionHealth()).toEqual([]);
+    expectHealth(p.subscriptionHealth(), []);
 
     const got: string[] = [];
     await p.subscribe(T, (m) => got.push(m.content));
@@ -415,6 +428,6 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
       timeout: 2000,
       interval: 5,
     });
-    expect(p.subscriptionHealth().map((h) => h.state)).toEqual(['live']);
+    expectHealth(p.subscriptionHealth(), [{ topic: T, state: 'live', consecutiveFailures: 0 }]);
   });
 });

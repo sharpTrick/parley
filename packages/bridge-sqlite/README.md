@@ -129,10 +129,19 @@ no-op.
 once immediately at connect). It's off by default — messages are kept forever unless you opt in;
 `0` is **not** the way to say "disabled" (it means "delete everything up to now") and is rejected.
 Safe to turn on at any time: `id` is `AUTOINCREMENT` and never reused, so a `cursor`/`backendMsgId`
-minted before a prune stays valid — a reader that's been offline longer than the window just gets
-fewer rows back on catch-up, never a wrong or duplicate one. There's no error or signal for "this
-much history is gone"; it's a silent trim, so treat `retention_days` as "how much history do I
-actually want to keep," not just a storage-cap safety valve.
+minted before a prune stays valid — catch-up across a prune returns fewer rows, never a wrong or a
+duplicate one. There's no error or signal for "this much history is gone"; it's a silent trim, so
+treat `retention_days` as "how much history do I actually want to keep," not just a storage-cap
+safety valve.
+
+**Which rows go is decided by `ts` — the poster's wall clock**, written by whichever process called
+`post()`, and not by the cursor the rest of this backend is built on. Two consequences, both
+silent. Clock skew between bridges sharing one file shifts which messages survive: a peer whose
+host clock runs 2 h behind writes rows that a 1 h window deletes on the very next prune, however
+new they are and whatever rowid they hold. And because of that, a message can be pruned **before
+any reader's cursor has reached it** — being offline for less than the window does not by itself
+guarantee you saw everything; that holds only while the clocks agree. Keep `retention_days` well
+above the largest clock skew you expect between hosts sharing the file.
 
 The prune resolves its window through an index on `ts` and deletes in bounded batches, yielding
 between them — enabling retention on a large existing store must not hold the file's single write
@@ -206,7 +215,7 @@ the default `parley.config.yaml`, since that default names a different deploymen
 and topic allowlist.
 
 It's a stdio MCP server — stdout is the JSON-RPC channel, all diagnostics go to stderr. See the
-[root README quickstart](../../README.md#quickstart-v01-local-sqlite--claude-code) for wiring it
+[root README quickstart](../../README.md#quickstart-a-the-local-taste-5-min-zero-infra) for wiring it
 up as a Claude Code channel, and
 [`examples/fakechat-loopback`](../../examples/fakechat-loopback/MANUAL-CHECKLIST.md) for a full
 live walkthrough (including driving the loop from a second shell).
