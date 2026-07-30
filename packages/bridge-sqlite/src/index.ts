@@ -110,7 +110,7 @@ export class SqlitePlugin implements BackendPlugin {
   private readonly cancellers: Array<() => void> = [];
   private pruneTimer?: ReturnType<typeof setInterval>;
   private pruneBatchTimer?: ReturnType<typeof setTimeout>;
-  private readonly health = new Map<Topic, SubscriptionHealth>();
+  private readonly health: SubscriptionHealth[] = [];
   private pruneFailures = 0;
   private lastPruneDiag = 0;
 
@@ -150,7 +150,7 @@ export class SqlitePlugin implements BackendPlugin {
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
-    this.health.clear();
+    this.health.length = 0;
     this.pruneFailures = 0;
     this.lastPruneDiag = 0;
     this.driver = driver;
@@ -179,7 +179,7 @@ export class SqlitePlugin implements BackendPlugin {
     this.pruneBatchTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
-    for (const h of this.health.values()) {
+    for (const h of this.health) {
       h.state = 'stopped';
       h.lastError = 'disconnected';
     }
@@ -270,7 +270,7 @@ export class SqlitePlugin implements BackendPlugin {
     let failures = 0;
     let lastDiag = 0;
     const health: SubscriptionHealth = { topic, state: 'live', consecutiveFailures: 0 };
-    this.health.set(topic, health);
+    this.health.push(health);
 
     const tick = (): void => {
       if (this.stopped || this.driver === undefined) return;
@@ -348,7 +348,7 @@ export class SqlitePlugin implements BackendPlugin {
    * health check reads, since stderr is routinely discarded by an MCP stdio host.
    */
   subscriptionHealth(topic?: Topic): SubscriptionHealth[] {
-    const all = [...this.health.values()].map((h) => ({ ...h }));
+    const all = this.health.map((h) => ({ ...h }));
     return topic === undefined ? all : all.filter((h) => h.topic === topic);
   }
 

@@ -208,6 +208,60 @@ describe('this store’s own cursor is honoured up to the high-water mark and no
 });
 
 /**
+ * Every honoured-cursor case above runs on ONE connection, where the store id is trivially stable
+ * whether it was read back from `parley_meta` or re-minted in memory. The `<storeId>` prefix only
+ * earns its place if it survives the generation boundary core's persisted read-state is designed
+ * for: a bridge restart against the same file. Re-minting instead would make each restart treat
+ * core's read position as foreign and replay the whole window — which core's in-memory seen-set
+ * cannot suppress, so a Code session would re-emit it as `<channel>` events on every start.
+ */
+describe('a cursor stays exclusive across a generation boundary that did not change the store', () => {
+  const ROWS = Array.from({ length: 7 }, (_u, i) => `m${i}`);
+  /** Rowids of the first, a middle and the tail row. Rowid 0 replays either way and grades nothing. */
+  const POSITIONS = [1, 4, 7];
+
+  const GENERATIONS: Array<{
+    name: string;
+    next: (p: SqlitePlugin, path: string) => Promise<SqlitePlugin>;
+  }> = [
+    {
+      name: 'the same process closes the store and reopens it',
+      next: (p, path) => reopen(p, path, () => {}),
+    },
+    {
+      name: 'a second bridge opens the file the first still holds',
+      next: (_p, path) => plugin(path),
+    },
+  ];
+
+  for (const gen of GENERATIONS) {
+    it(`${gen.name}: same store id, and every cursor still resumes after itself`, async () => {
+      const path = dbPath();
+      const before = await plugin(path);
+      await fill(before, T, ROWS);
+      const idBefore = await storeIdOf(before);
+      const cursors = (await before.fetchRecent({ topic: T, limit: 500 })).messages.map(
+        (m) => m.cursor,
+      );
+
+      const after = await gen.next(before, path);
+      expect(await storeIdOf(after)).toBe(idBefore);
+
+      for (const rowid of POSITIONS) {
+        const drained = await drainFrom(after, T, cursors[rowid - 1]!, 3);
+        expect(drained.contents).toEqual(ROWS.slice(rowid));
+      }
+
+      const tail = cursors.at(-1)!;
+      await fill(after, T, ['written-in-the-new-generation']);
+      expect((await drainFrom(after, T, tail, 3)).contents).toEqual([
+        'written-in-the-new-generation',
+      ]);
+    });
+  }
+});
+
+/**
  * The `before` dimension only varies which rowid the stale cursor names (none, the first, one well
  * above the new store's high-water mark), so it needs three values rather than a square matrix; the
  * `after` dimension decides whether the replay is empty or paged.
@@ -266,7 +320,9 @@ describe('replay pages losslessly at every limit', () => {
 /**
  * A cursor whose shape this backend cannot place at all must throw. Absorbing it would bind SQL
  * NULL, match zero rows with no error, and re-echo itself as `nextCursor` — wedging the topic
- * forever rather than losing one page.
+ * silently and forever. Throwing is not the cheaper half of a cheap choice: catch-up-on-start
+ * propagates it, so the bridge refuses to start until read-state is cleared (graded end to end in
+ * src/cli.test.ts).
  */
 const MALFORMED_CURSORS = [
   '',

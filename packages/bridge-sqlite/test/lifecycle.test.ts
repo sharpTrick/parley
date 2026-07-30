@@ -373,6 +373,31 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
     expect(p.subscriptionHealth().map((h) => h.state)).toEqual(['stopped', 'stopped']);
   });
 
+  /**
+   * `subscribe()` starts an independent loop per call, including on a topic already subscribed. A
+   * report keyed by topic would collapse those into one record, so a supervisor could read a
+   * surviving loop's `live` for a sibling that has permanently stopped.
+   */
+  for (const loops of [1, 2, 3]) {
+    it(`${loops} loop(s) on one topic report ${loops} record(s), and every one of them delivers`, async () => {
+      const p = tracked();
+      await p.connect(cfg(dbFile()));
+      const sinks = Array.from({ length: loops }, () => [] as string[]);
+      for (const sink of sinks) await p.subscribe(T, (m) => sink.push(m.content));
+
+      expect(p.subscriptionHealth(T).map((h) => h.state)).toEqual(Array(loops).fill('live'));
+
+      await p.post(T, me, 'fan-out');
+      await vi.waitFor(
+        () => expect(sinks).toEqual(Array.from({ length: loops }, () => ['fan-out'])),
+        { timeout: 2000, interval: 5 },
+      );
+
+      await p.disconnect();
+      expect(p.subscriptionHealth(T).map((h) => h.state)).toEqual(Array(loops).fill('stopped'));
+    });
+  }
+
   it('a reconnect reports nothing from the previous generation until it subscribes again', async () => {
     const path = dbFile();
     const p = tracked();

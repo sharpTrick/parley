@@ -34,8 +34,13 @@ without skipping messages, whether or not the topic is empty — clearing core's
 on a reset is still tidier, but no longer load-bearing.
 
 A cursor of no recognisable shape (a Matrix-style `s123_456`, an empty string) is rejected with an
-error naming it, rather than absorbed as "matches nothing" — absorbing it would wedge the topic's
-catch-up forever instead of costing one page.
+error naming it, rather than absorbed as "matches nothing" — absorbing it would re-echo itself as
+`nextCursor` and wedge that topic's catch-up silently and forever. Rejecting is not free, and it
+does not cost one page: catch-up-on-start propagates the error, so **the bridge exits non-zero on
+every start until the stale read-state is cleared** (core's message names the state file and the
+fix). A loud stop an operator can act on beats a silent one, but it is a stop. Note the asymmetry —
+a foreign cursor that is merely *numeric* (a NATS sequence, a Telegram id) is a shape this backend
+can place, so it replays instead of stopping the bridge.
 
 **Page size.** `fetchRecent` serves at most 10000 rows in one page. A `limit` outside `1..10000` —
 above the ceiling, below 1, or a non-integer — is rejected outright with an error naming the
@@ -73,6 +78,10 @@ constructs `SqlitePlugin` itself — can read that state programmatically:
 plugin.subscriptionHealth();
 // [{ topic: 'ctx', state: 'live' | 'degraded' | 'stopped', consecutiveFailures, lastError }]
 ```
+
+There is one record per `subscribe()` call, in the order the loops were started — `subscribe()` on a
+topic already subscribed runs a second, independent loop, and reports a second record, so a
+supervisor can never read one loop's `live` for another loop that has stopped.
 
 After `disconnect()` every topic reads `stopped` rather than keeping its last live state, so a
 supervisor polling this cannot mistake a torn-down plugin for a healthy one. `connect()` refuses to
@@ -213,9 +222,11 @@ including the `concurrentPost` check: forked OS processes (`src/concurrent-write
 same file while the plugin's own `post()` writes into it, so the shipped write path is one of the
 contending processes rather than a spectator.
 
-`test/multi-process.test.ts` covers the pragmas themselves: each one is asserted through an
-observable consequence (`PRAGMA` read-back, the `-wal` sidecar appearing on disk, a contended
-write retrying for the full `busy_timeout` window and `post()` waiting out a lock another OS
-process holds), so silently dropping one turns a test red. It also compares the DDL produced by
-every creator of the `messages` table — the plugin and the forked writer fixture — and fails on
+`test/driver-parity.test.ts` grades the pragma read-back: it reads every one back off a live
+connection, on both drivers, so silently dropping one turns a test red.
+`test/multi-process.test.ts` grades what those pragmas buy, through observable consequences rather
+than through the source that sets them — the `-wal` sidecar appearing on disk, a contended write
+retrying for the full `busy_timeout` window, `post()` waiting out a lock another OS process holds,
+and the live poll loop seeing every row other OS processes commit. It also compares the DDL produced
+by every creator of the `messages` table — the plugin and the forked writer fixture — and fails on
 drift, since whichever process creates the file first decides the shape for all of them.

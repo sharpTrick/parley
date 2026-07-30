@@ -163,6 +163,53 @@ describe('poll loop error-class matrix', () => {
 });
 
 /**
+ * The matrix above only ever breaks the SELECT, so the loop's error path is graded for database
+ * failures alone. The other thing that runs inside a tick is the consumer's handler, and its
+ * exceptions reach the same catch: core's push loop emits into an MCP stdio transport that can be
+ * closed under it. Classified as a database error, one broken consumer would be diagnosed as a
+ * store outage and, past the escalation threshold, back the topic off toward 30 s — throttling live
+ * push for a store that is perfectly healthy.
+ */
+describe('a throwing handler is a consumer fault, not a store outage', () => {
+  const HANDLER_FAULTS: Array<{ name: string; fails: (nth: number) => boolean }> = [
+    { name: 'throws on the first message only', fails: (nth) => nth === 0 },
+    { name: 'throws on a burst, then recovers', fails: (nth) => nth < BURST },
+    { name: 'throws on every message it is ever given', fails: () => true },
+  ];
+
+  const SENT = Array.from({ length: BURST + 3 }, (_u, i) => `m${i}`);
+
+  for (const f of HANDLER_FAULTS) {
+    it(`${f.name}: keeps delivering, stays silent, stays live`, async () => {
+      const p = await plugin();
+      const offered: string[] = [];
+      const survived: string[] = [];
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let lines: string[] = [];
+      try {
+        let seen = 0;
+        await p.subscribe(T, (m) => {
+          const nth = seen++;
+          offered.push(m.content);
+          if (f.fails(nth)) throw new Error(`consumer blew up on ${m.content}`);
+          survived.push(m.content);
+        });
+        for (const c of SENT) await p.post(T, me, c);
+        await vi.waitFor(() => expect(offered).toEqual(SENT), { timeout: 8000, interval: 10 });
+        // Well past the escalation threshold, so a throw that was swallowed but still COUNTED shows.
+        await new Promise((r) => setTimeout(r, 200));
+        lines = spy.mock.calls.map(([l]) => String(l));
+      } finally {
+        spy.mockRestore();
+      }
+      expect(survived).toEqual(SENT.filter((_c, nth) => !f.fails(nth)));
+      expect(lines.filter((l) => /poll error|poll loop/.test(l))).toEqual([]);
+      expect(p.subscriptionHealth(T)).toEqual([{ topic: T, state: 'live', consecutiveFailures: 0 }]);
+    });
+  }
+});
+
+/**
  * The degraded loop keeps probing forever, so its delay is the only thing bounding how long a topic
  * whose store was briefly unreachable stays dark. The README promises 30 s. Every expectation here
  * is a literal rather than a re-derivation from the constant, so raising or removing the ceiling —

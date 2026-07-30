@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -137,6 +137,35 @@ function writeConfig(
   return cfgPath;
 }
 
+/** Start the built CLI on `cfgPath` and report whether it came up or died before it could. */
+async function runBridge(
+  cfgPath: string,
+): Promise<{ verdict: 'up' | 'exited'; code: number | null; stderr: string }> {
+  const child = spawn(process.execPath, [CLI, '--config', cfgPath], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  const outcome = await new Promise<{ verdict: 'up' | 'exited'; code: number | null }>(
+    (resolve, reject) => {
+      const to = setTimeout(() => reject(new Error(`no verdict in 15s: ${stderr}`)), 15_000);
+      child.stderr.on('data', (d: Buffer) => {
+        stderr += d.toString();
+        if (stderr.includes('bridge up')) {
+          clearTimeout(to);
+          resolve({ verdict: 'up', code: null });
+        }
+      });
+      child.on('exit', (code) => {
+        clearTimeout(to);
+        resolve({ verdict: 'exited', code });
+      });
+    },
+  );
+  child.stdin.end();
+  child.kill('SIGKILL');
+  return { ...outcome, stderr };
+}
+
 /**
  * Core validates `catchup.limit` as any positive integer and this plugin refuses a page above
  * MAX_PAGE, so a config core certifies as valid can still stop the bridge — after connect() has
@@ -153,27 +182,7 @@ describe('a core config value this plugin constrains starts or is refused by nam
   for (const { limit, starts } of CASES) {
     it(`catchup.limit ${limit} ${starts ? 'starts the bridge' : 'is refused by name'}`, async () => {
       const dir = tmp();
-      const cfgPath = writeConfig(dir, {}, ['catchup:', `  limit: ${limit}`]);
-      const child = spawn(process.execPath, [CLI, '--config', cfgPath], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      let stderr = '';
-      const verdict = await new Promise<'up' | 'exited'>((resolve, reject) => {
-        const to = setTimeout(() => reject(new Error(`no verdict in 15s: ${stderr}`)), 15_000);
-        child.stderr.on('data', (d: Buffer) => {
-          stderr += d.toString();
-          if (stderr.includes('bridge up')) {
-            clearTimeout(to);
-            resolve('up');
-          }
-        });
-        child.on('exit', () => {
-          clearTimeout(to);
-          resolve('exited');
-        });
-      });
-      child.stdin.end();
-      child.kill('SIGKILL');
+      const { verdict, stderr } = await runBridge(writeConfig(dir, {}, ['catchup:', `  limit: ${limit}`]));
 
       if (starts) {
         expect(verdict).toBe('up');
@@ -185,6 +194,56 @@ describe('a core config value this plugin constrains starts or is refused by nam
       // The operator's lever, named where they will read it.
       expect(stderr).toContain('catchup.limit');
       expect(stderr).toContain(String(MAX_PAGE));
+    });
+  }
+});
+
+/**
+ * The README tells an operator what a stale persisted cursor costs. Stated smaller than the price
+ * the process actually pays, it sends them hunting for one lost page while the bridge is refusing
+ * to start at all — so the prose and the process verdict are graded in the same row, and a change
+ * to either that desynchronizes them turns this red.
+ */
+describe('the documented cost of a stale persisted cursor is the cost the CLI pays (e2e)', () => {
+  const README = readFileSync(join(pkgDir, 'README.md'), 'utf8').replace(/\s+/g, ' ');
+
+  const CASES: Array<{ name: string; cursor: string; starts: boolean; documented: RegExp }> = [
+    {
+      name: 'an unparseable cursor left behind by another backend',
+      cursor: 's123_456',
+      starts: false,
+      documented: /the bridge exits non-zero on every start until the stale read-state is cleared/,
+    },
+    {
+      name: 'a foreign but numeric cursor',
+      cursor: '123456789',
+      starts: true,
+      documented: /merely \*numeric\*[^.]{0,160}replays instead of stopping the bridge/,
+    },
+  ];
+
+  for (const c of CASES) {
+    it(`${c.name} ${c.starts ? 'replays and the bridge starts' : 'stops the bridge until read-state is cleared'}`, async () => {
+      expect(README).toMatch(c.documented);
+
+      const dir = tmp();
+      const cfgPath = writeConfig(dir);
+      const statePath = join(dir, 'read-state.json');
+      writeFileSync(statePath, JSON.stringify({ ctx: c.cursor }));
+
+      const { verdict, code, stderr } = await runBridge(cfgPath);
+
+      if (c.starts) {
+        expect(verdict).toBe('up');
+        return;
+      }
+      expect(verdict).toBe('exited');
+      expect(code).not.toBe(0);
+      expect(stderr).not.toMatch(/bridge up/);
+      expect(stderr).toMatch(/parley-sqlite: fatal/);
+      expect(stderr).toMatch(/malformed cursor/);
+      // The one file an operator has to touch to get the bridge back.
+      expect(stderr).toContain(statePath);
     });
   }
 });

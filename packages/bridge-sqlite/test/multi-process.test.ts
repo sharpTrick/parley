@@ -65,6 +65,47 @@ describe('driver pragmas are observable, not just set', () => {
     });
   }
 
+  /**
+   * A README sentence naming a test file is an instruction to go read that file. Naming the wrong
+   * one certifies a property against a file that does not grade it, and keeps reading true after
+   * the file that does is deleted — so each claim is pinned to the file holding its evidence, and
+   * to no other named file.
+   */
+  const ATTRIBUTIONS: Array<{ what: string; claim: RegExp; file: string; evidence: RegExp }> = [
+    {
+      what: 'the pragma read-back',
+      claim: /read-back|read back/i,
+      file: 'test/driver-parity.test.ts',
+      evidence: /PRAGMA \$\{p\.name\}/,
+    },
+    {
+      what: 'the -wal sidecar appearing on disk',
+      claim: /-wal.{0,3} sidecar/i,
+      file: 'test/multi-process.test.ts',
+      evidence: /\$\{path\}-wal/,
+    },
+  ];
+
+  const NAMED = [...new Set(ATTRIBUTIONS.map((a) => a.file))];
+  const sentencesNaming = (file: string): string[] =>
+    README.replace(/\s+/g, ' ')
+      .split(/(?<=\.)\s/)
+      .filter((s) => s.includes(file));
+
+  for (const a of ATTRIBUTIONS) {
+    it(`the README credits ${a.what} to ${a.file}, and that file holds the evidence`, () => {
+      const own = sentencesNaming(a.file);
+      expect(own.length).toBeGreaterThan(0);
+      expect(own.filter((s) => a.claim.test(s)).length).toBeGreaterThan(0);
+      expect(
+        readFileSync(fileURLToPath(new URL(`../${a.file}`, import.meta.url)), 'utf8'),
+      ).toMatch(a.evidence);
+      for (const other of NAMED.filter((f) => f !== a.file)) {
+        expect(sentencesNaming(other).filter((s) => a.claim.test(s))).toEqual([]);
+      }
+    });
+  }
+
   it('WAL is live on disk: a write materializes the -wal sidecar', () => {
     const path = join(dir(), 'p.db');
     const d = openDriver(path);
