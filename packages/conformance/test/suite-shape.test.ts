@@ -1,8 +1,35 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { CLAUSES, CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
+import { CLAUSES, CONTEXT_FIELDS, PAGING_VOLUME, pageLimitsFor } from '@sharptrick/parley-conformance';
 
 const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
+
+/** The harness's own per-case ceiling. Read, not restated: it is what pre-empts every budget below. */
+function testTimeoutMs(): number {
+  const found = /testTimeout:\s*([\d_]+)/.exec(vitestConfig)?.[1];
+  return Number((found ?? '').replaceAll('_', ''));
+}
+
+/**
+ * Every wall-clock budget the suite sets for itself, as `[what, ms]`. A budget ABOVE the harness's
+ * `testTimeout` can never be reached: vitest kills the case first, so the carefully-worded
+ * diagnostic the budget exists to produce is dead code and the operator gets a generic timeout.
+ */
+function selfImposedBudgets(): [string, number][] {
+  const out: [string, number][] = [];
+  const patterns = [
+    /(?:timeout|blockMs):\s*([\d_]+)/g,
+    /_MS\s*=\s*([\d_]+)/g,
+    /Date\.now\(\)\s*\+\s*([\d_]+)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const m of source.matchAll(pattern)) {
+      out.push([m[0] as string, Number((m[1] as string).replaceAll('_', ''))]);
+    }
+  }
+  return out;
+}
 
 /**
  * Every `it(...)` body in the suite, split on the top-level case boundary. Keyed on the case's
@@ -158,6 +185,52 @@ describe('the suite grades every backend it certifies', () => {
     const regions = guardedRegions(snippet);
     expect(regions).toHaveLength(regionCount);
     expect(regions.every((r) => r.region.includes('expect('))).toBe(asserts);
+  });
+
+  /**
+   * A page-size row that pages IDENTICALLY to another row discriminates nothing and still costs a
+   * fresh connect/teardown on every backend. Three of the five rows used to be the same single-page
+   * case, and the uneven truncation — where a page-boundary off-by-one lives — was not a row at all.
+   * Graded as a property of the generator against the volume, so lowering the message list fails
+   * here instead of quietly collapsing the table again.
+   */
+  describe('the page-size table', () => {
+    const remaining = PAGING_VOLUME.length - 1;
+    const pageShape = (limit: number): string => {
+      const pages: number[] = [];
+      for (let left = remaining; left > 0; left -= limit) pages.push(Math.min(limit, left));
+      return pages.join('+');
+    };
+    const shapes = (): string[] => pageLimitsFor(remaining).map(pageShape);
+
+    it('pages differently on every row', () => {
+      expect(shapes().length).toBeGreaterThan(3);
+      expect(new Set(shapes()).size).toBe(shapes().length);
+    });
+
+    it('covers the shapes a page-boundary cursor bug needs', () => {
+      // One at a time, an exact division into several pages, an uneven final page, and one whole page.
+      expect(shapes()).toContain(Array.from({ length: remaining }, () => '1').join('+'));
+      expect(shapes().some((s) => s.split('+').length > 2 && new Set(s.split('+')).size === 1)).toBe(
+        true,
+      );
+      expect(
+        shapes().some((s) => {
+          const pages = s.split('+');
+          return pages.length > 1 && pages.at(-1) !== pages[0];
+        }),
+      ).toBe(true);
+      expect(shapes()).toContain(String(remaining));
+    });
+  });
+
+  it('reads a testTimeout out of the harness config, so the budget rows below grade something', () => {
+    expect(testTimeoutMs()).toBeGreaterThan(0);
+    expect(selfImposedBudgets().length).toBeGreaterThan(3);
+  });
+
+  it.each(selfImposedBudgets())('keeps the budget `%s` under the harness timeout', (_what, ms) => {
+    expect(ms).toBeLessThan(testTimeoutMs());
   });
 
   // A required context field nobody reads is a field a fixture author must supply for nothing —

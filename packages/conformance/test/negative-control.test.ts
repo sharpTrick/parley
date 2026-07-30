@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { CLAUSES } from '@sharptrick/parley-conformance';
 import { BROKEN_VARIANTS } from './reference-plugin.js';
 
 /**
@@ -46,6 +47,32 @@ beforeAll(async () => {
 
 const results = (): { fullName: string; status: string }[] =>
   report.testResults.flatMap((f) => f.assertionResults);
+
+/**
+ * The one-to-one-ness, made mechanical. A clause with no variant is a clause whose assertions can be
+ * gutted with this whole package — negative control included — staying green; seven of them were in
+ * exactly that state, the lost-wakeup race among them. Nothing in the clause registry or the
+ * suite-shape checks can see it, because both grade only that a case with the right title exists.
+ */
+describe('every clause the suite grades has a plugin that fails it', () => {
+  it.each(CLAUSES.map((c) => [c]))('%s', (clause) => {
+    const controls = BROKEN_VARIANTS.filter(
+      (v) => clause.includes(v.mustFail) || v.mustFail.includes(clause),
+    );
+    expect(
+      controls.map((v) => v.name),
+      `no BROKEN_VARIANTS entry names "${clause}" — add the plugin mutation that proves the ` +
+        `clause's assertions can fail`,
+    ).not.toEqual([]);
+  });
+
+  it('has no variant aimed at a clause the suite no longer grades', () => {
+    const orphans = BROKEN_VARIANTS.filter(
+      (v) => !CLAUSES.some((c) => c.includes(v.mustFail) || v.mustFail.includes(c)),
+    );
+    expect(orphans.map((v) => v.name)).toEqual([]);
+  });
+});
 
 describe('the suite rejects a non-conformant plugin', () => {
   // Without this the per-variant rows below read an empty report and pass having graded nothing.

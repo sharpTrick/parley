@@ -364,25 +364,47 @@ describe('fetchWithRetry', () => {
   // Discord and Slack escalate repeated 429s to longer global bans. The `Retry-After` header is a
   // FLOOR: crossed with every shape of caller parser, including ones that shrink it (which is what
   // two shipped backends' parsers did), no performed wait may fall below the header's own figure.
-  const HEADER_ROWS: [string, () => Record<string, string>, number, string][] = [
-    ['delay-seconds past the deadline', () => ({ 'retry-after': '60' }), 60_000, 'stop'],
-    ['HTTP-date past the deadline', () => ({ 'retry-after': httpDate(120_000) }), 120_000, 'stop'],
-    ['delay-seconds well within the deadline', () => ({ 'retry-after': '2' }), 2_000, 'retry'],
+  // Each row states the header as a LIST of field-values, appended one at a time: a gateway and an
+  // origin both setting `Retry-After` is what `Headers.get` returns as `"120, 120"`, and reading
+  // that as no hint at all retried at the 500ms default against a server asking for two minutes.
+  const HEADER_ROWS: [string, () => string[], number, string][] = [
+    ['delay-seconds past the deadline', () => ['60'], 60_000, 'stop'],
+    ['HTTP-date past the deadline', () => [httpDate(120_000)], 120_000, 'stop'],
+    ['delay-seconds well within the deadline', () => ['2'], 2_000, 'retry'],
     // HTTP-date has one-second granularity, so +3s guarantees only 2s of delay.
-    ['HTTP-date well within the deadline', () => ({ 'retry-after': httpDate(3_000) }), 2_000, 'retry'],
+    ['HTTP-date well within the deadline', () => [httpDate(3_000)], 2_000, 'retry'],
     // The discriminating pair: above MAX_BACKOFF_MS, which bounds only a backoff we invented, and
     // inside the deadline — so the wait must be the server's full figure, not the 5s clamp. This is
     // the ordinary Slack/Telegram rate limit, and clamping it is what escalates a 429 into a ban.
-    ['delay-seconds above the self-imposed clamp', () => ({ 'retry-after': '10' }), 10_000, 'retry'],
-    ['HTTP-date above the self-imposed clamp', () => ({ 'retry-after': httpDate(9_000) }), 8_000, 'retry'],
-    ['zero', () => ({ 'retry-after': '0' }), 0, 'retry'],
-    ['empty', () => ({ 'retry-after': '' }), 0, 'retry'],
-    ['unparseable', () => ({ 'retry-after': 'abc' }), 0, 'retry'],
-    ['fractional seconds', () => ({ 'retry-after': '0.5' }), 500, 'retry'],
-    ['negative', () => ({ 'retry-after': '-5' }), 0, 'retry'],
-    ['a date already past', () => ({ 'retry-after': httpDate(-60_000) }), 0, 'retry'],
-    ['absent', () => ({}), 0, 'retry'],
+    ['delay-seconds above the self-imposed clamp', () => ['10'], 10_000, 'retry'],
+    ['HTTP-date above the self-imposed clamp', () => [httpDate(9_000)], 8_000, 'retry'],
+    ['zero', () => ['0'], 0, 'retry'],
+    ['empty', () => [''], 0, 'retry'],
+    ['unparseable', () => ['abc'], 0, 'retry'],
+    ['fractional seconds', () => ['0.5'], 500, 'retry'],
+    ['negative', () => ['-5'], 0, 'retry'],
+    ['a date already past', () => [httpDate(-60_000)], 0, 'retry'],
+    ['absent', () => [], 0, 'retry'],
+    // Multi-valued: whatever the largest field-value states is the floor, and the whole header is
+    // never no-hint just because it carries more than one value.
+    ['the same delay-seconds twice', () => ['2', '2'], 2_000, 'retry'],
+    ['the same delay-seconds twice, past the deadline', () => ['60', '60'], 60_000, 'stop'],
+    ['two different delay-seconds', () => ['2', '10'], 10_000, 'retry'],
+    ['two HTTP-dates', () => [httpDate(3_000), httpDate(9_000)], 8_000, 'retry'],
+    ['a delay-seconds beside an HTTP-date', () => ['2', httpDate(9_000)], 8_000, 'retry'],
+    ['a usable value beside an unparseable one', () => ['abc', '10'], 10_000, 'retry'],
+    ['two unparseable values', () => ['abc', 'def'], 0, 'retry'],
+    // Spellings `Number` accepts and RFC 9110 `delay-seconds` does not. Read as a figure they would
+    // be 500s and 1000s — past the deadline, so a misparse ENDS the call on a routine 429.
+    ['a hexadecimal spelling', () => ['0x1F4'], 0, 'retry'],
+    ['an exponent spelling', () => ['1e3'], 0, 'retry'],
   ];
+
+  const headersOf = (values: string[]): Headers => {
+    const headers = new Headers();
+    for (const value of values) headers.append('retry-after', value);
+    return headers;
+  };
 
   // Every shape a consumer's own `retryAfterOf` can take. `bridge-telegram` and `bridge-matrix`
   // ship the clamping one; a hint that is absent, zero, NaN or negative is no hint at all.
@@ -396,16 +418,16 @@ describe('fetchWithRetry', () => {
   ];
 
   it.each(
-    HEADER_ROWS.flatMap(([label, headers, requestedMs, outcome]) =>
+    HEADER_ROWS.flatMap(([label, values, requestedMs, outcome]) =>
       PARSERS.map(
         ([parserLabel, retryAfterOf]) =>
-          [`${label}, with ${parserLabel}`, headers, requestedMs, outcome, retryAfterOf] as const,
+          [`${label}, with ${parserLabel}`, values, requestedMs, outcome, retryAfterOf] as const,
       ),
     ),
   )(
     'never retries sooner than the server asked (%s)',
-    async (_label, headers, requestedMs, outcome, retryAfterOf) => {
-      const state = stubForever(() => res(429, '', headers()));
+    async (_label, values, requestedMs, outcome, retryAfterOf) => {
+      const state = stubForever(() => new Response('', { status: 429, headers: headersOf(values()) }));
       const waits = captureWaits();
       let clock = 0;
       const err = await rejects(
@@ -709,6 +731,35 @@ describe('fetchWithRetry', () => {
     expect(err.message).not.toContain(CANARY);
   });
 
+  // The other half of the class: not another SPELLING of the same location, but another URL
+  // COMPONENT a credential can sit in. `credentialParts` split the pathname only, so a token in
+  // userinfo or a query value survived into an error message whenever a body echoed that fragment
+  // alone — and the README's "keep credentials out of the query" precondition had nothing enforcing
+  // it. Indexed by location so the next component is a row, not a rewrite.
+  const CREDENTIAL_LOCATIONS: [string, string, string][] = [
+    ['a path segment', `https://api.example.test/bot123:${CANARY}/getMe`, `bot123:${CANARY}`],
+    ['userinfo', `https://user:${CANARY}@api.example.test/v1/x`, `user:${CANARY}@api.example.test`],
+    ['a query value', `https://api.example.test/v1/x?access_token=${CANARY}`, `access_token=${CANARY}`],
+  ];
+
+  it.each(
+    CREDENTIAL_LOCATIONS.flatMap(([location, url, fragment]) =>
+      VECTORS.flatMap(([vector, make]) =>
+        (
+          [
+            ['the whole URL', url],
+            ['the bare fragment', fragment],
+          ] as const
+        ).map(([echo, echoed]) => [`${location}, ${vector}, echoing ${echo}`, url, echoed, make] as const),
+      ),
+    ),
+  )('never leaks a credential carried in %s', async (_label, url, echoed, make) => {
+    vi.stubGlobal('fetch', make(echoed));
+    const err = await rejects(fetchWithRetry(url, {}, { label: 'L', isStopped: () => false }));
+    expect(err.message).toContain('L → ');
+    expect(err.message).not.toContain(CANARY);
+  });
+
   // The one vector with no stub at all: a real `fetch` rejecting on a URL it cannot even parse.
   it('never leaks a credential-bearing URL that fetch itself refuses to parse', async () => {
     const err = await rejects(
@@ -922,23 +973,96 @@ describe('README', () => {
     );
   });
 
+  // The mechanism the loop actually runs, against what the docs attribute to it. `fetchWithRetry`
+  // has never clamped anything — the only backoff it invents is the fixed `DEFAULT_BACKOFF_MS` —
+  // while the npm description sold a "backoff clamp" as one of its features and the README named
+  // `MAX_BACKOFF_MS` as one of the loop's own bounds. Derived from the source with the clamp helper
+  // cut out, so wiring the clamp into the loop and advertising it again have to happen together.
+  describe('the docs attribute to the loop only what the loop reaches', () => {
+    const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      description: string;
+    };
+    const CLAMP_NAMES = ['clampBackoff', 'MAX_BACKOFF_MS'];
+
+    /** Comments stripped, and the clamp helper — which is a plugin's tool, not the loop's — removed. */
+    const loopCode = (): string => {
+      const bare = src.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
+      const from = bare.indexOf('export function clampBackoff');
+      const to = bare.indexOf('\n}', from);
+      return bare.slice(0, from) + bare.slice(to + 2);
+    };
+
+    /** Mentions that are a USE, i.e. everything but the name's own `export` line. */
+    const uses = (name: string, text: string): number =>
+      [...text.matchAll(new RegExp(`\\b${name}\\b`, 'g'))].length -
+      [...text.matchAll(new RegExp(`export (?:const|function) ${name}\\b`, 'g'))].length;
+
+    it('finds the loop and the clamp, so the rows below are not reading an empty string', () => {
+      expect(loopCode()).toContain('export async function fetchWithRetry');
+      expect(loopCode().length).toBeGreaterThan(1_000);
+      expect(uses('DEFAULT_BACKOFF_MS', loopCode())).toBeGreaterThan(0);
+      expect(src).toContain('export function clampBackoff');
+    });
+
+    it.each(CLAMP_NAMES)('the loop does not reach `%s`', (name) => {
+      expect(uses(name, loopCode())).toBe(0);
+    });
+
+    // Sold on the npm page, where nobody can check it against the code.
+    it.each(['backoff clamp', ...CLAMP_NAMES])('the npm description does not advertise "%s"', (claim) => {
+      expect(pkg.description).not.toContain(claim);
+    });
+
+    // Prose is the risk here, so the check is over the BULLET that names it: whichever bullet
+    // mentions the clamp must be the one that says the loop does not apply it.
+    it.each(CLAMP_NAMES)('every README bullet naming `%s` says the loop does not use it', (name) => {
+      const bullets = readme.split(/\n(?=-\s)/).filter((b) => b.includes(name));
+      expect(bullets.length).toBeGreaterThan(0);
+      for (const bullet of bullets) {
+        expect(bullet).toMatch(/never calls it|does not call them|not to anything `fetchWithRetry` does/);
+      }
+    });
+  });
+
   // Shipped metadata that enumerates a set the repo already knows: re-derive it rather than pin
   // today's list, so a backend that gains or drops the dependency moves the README with it.
   describe('the consumer set is the real dependency graph', () => {
     const packagesDir = new URL('../../', import.meta.url);
     const SELF = '@sharptrick/parley-net-util';
+    const SUITE = '@sharptrick/parley-conformance';
 
+    /**
+     * A package is a backend iff it is GRADED by the shared conformance suite. Derived from the
+     * manifests, not from the `bridge-*` directory prefix: that prefix needed a growing exception
+     * list (`bridge-core`, this package) because it names a naming convention rather than the
+     * property, and the next non-backend added under it would have joined the set silently.
+     */
     const backends = (): { dir: string; consumes: boolean }[] =>
       readdirSync(packagesDir)
-        .filter((d) => d.startsWith('bridge-') && d !== 'bridge-core' && d !== 'bridge-net-util')
-        .sort()
         .map((dir) => {
-          const pkg = JSON.parse(
-            readFileSync(new URL(`${dir}/package.json`, packagesDir), 'utf8'),
-          ) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
-          const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-          return { dir, consumes: SELF in deps };
-        });
+          try {
+            return {
+              dir,
+              pkg: JSON.parse(
+                readFileSync(new URL(`${dir}/package.json`, packagesDir), 'utf8'),
+              ) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> },
+            };
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((v): v is { dir: string; pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> } } => v !== undefined)
+        .map(({ dir, pkg }) => ({ dir, deps: { ...pkg.dependencies, ...pkg.devDependencies } }))
+        .filter(({ deps }) => SUITE in deps)
+        .sort((a, b) => a.dir.localeCompare(b.dir))
+        .map(({ dir, deps }) => ({ dir, consumes: SELF in deps }));
+
+    it('derives a backend set that is neither empty nor this package', () => {
+      expect(backends().length).toBeGreaterThan(5);
+      expect(backends().map((b) => b.dir)).not.toContain('bridge-net-util');
+      expect(backends().map((b) => b.dir)).not.toContain('bridge-core');
+    });
 
     const listed = (heading: string): string[] => {
       const line = readme.split('\n').find((l) => l.includes(`**${heading}:**`));

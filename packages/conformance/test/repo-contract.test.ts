@@ -47,6 +47,50 @@ describe('every published package carries the same discovery metadata', () => {
   });
 });
 
+/**
+ * "Which packages are backends" is derived in several places, and deriving it from the `bridge-*`
+ * DIRECTORY prefix needs a growing exception list — neither `bridge-core` nor `bridge-net-util` is a
+ * `BackendPlugin` — so the next non-backend added under that prefix joins the set silently. The
+ * manifest is the honest source: a backend is a package GRADED by this suite. Cross-checked here
+ * against the independent evidence, the fixture that actually runs it.
+ */
+describe('the backend set is derived from the manifests, not from a directory prefix', () => {
+  const SUITE = '@sharptrick/parley-conformance';
+
+  const dependsOnSuite = (): string[] =>
+    manifests()
+      .filter(({ pkg }) => SUITE in { ...pkg.dependencies, ...pkg.devDependencies })
+      .map(({ dir }) => dir)
+      .sort();
+
+  const runsTheSuite = (): string[] =>
+    manifests()
+      .filter(({ dir, pkg }) => {
+        if (pkg.name === SUITE) return false; // the suite's own controls are not a backend
+        try {
+          return readFileSync(
+            new URL(`${dir}/test/conformance.test.ts`, packagesDir),
+            'utf8',
+          ).includes('runConformanceSuite(');
+        } catch {
+          return false;
+        }
+      })
+      .map(({ dir }) => dir)
+      .sort();
+
+  it('every package that declares the suite runs it, and every package that runs it declares it', () => {
+    expect(dependsOnSuite().length).toBeGreaterThan(5);
+    expect(dependsOnSuite()).toEqual(runsTheSuite());
+  });
+
+  it('excludes what a `bridge-*` prefix would have needed an exception for', () => {
+    for (const dir of ['bridge-core', 'bridge-net-util', 'conformance']) {
+      expect(dependsOnSuite()).not.toContain(dir);
+    }
+  });
+});
+
 // A `tsconfig.test.json` that resolves its own package through node_modules typechecks the BUILT
 // dist/, not the sources vitest runs — so the one gate that would have caught a changed public
 // surface grades a stale artifact and passes.

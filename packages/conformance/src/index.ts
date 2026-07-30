@@ -17,6 +17,26 @@ const OTHER = asHandle('second-writer');
 const DRAIN_PAGE = 500;
 
 /**
+ * Wall-clock budget for the interleaved reader's give-up diagnostic. Keep it well UNDER the
+ * harness's own `testTimeout`, so that the loop loses the race to its own message: a larger number
+ * makes the one line naming the stuck topic unreachable and reports a generic timeout instead.
+ */
+const READER_BUDGET_MS = 15_000;
+
+/** The volume the paging clause is graded over. Exported so its row generator can be self-tested. */
+export const PAGING_VOLUME: readonly string[] = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
+
+/**
+ * Page sizes that page DIFFERENTLY over `remaining` messages: one at a time, two exact divisions at
+ * different depths, an uneven truncation, and exactly the remainder. Derived from the volume rather
+ * than hard-coded, so that changing the message list cannot silently collapse several rows onto one
+ * behaviour — `[1, 2, 4, 5, 6]` over 4 remaining ran the same single-page case three times and never
+ * ran the uneven truncation at all, which is where a page-boundary off-by-one lives.
+ */
+export const pageLimitsFor = (remaining: number): number[] =>
+  [...new Set([1, 2, 3, remaining - 1, remaining])].filter((n) => n >= 1).sort((a, b) => a - b);
+
+/**
  * Read every message in `topic` by PAGING to exhaustion. It must not read one oversized page: a
  * backend with a server-side page cap below the request would silently return a prefix, and the
  * assertions built on it would grade a partial view.
@@ -92,6 +112,7 @@ export const CLAUSES: readonly string[] = [
   'either round-trips',
   'post accepts inReplyTo',
   'exactly the post-subscribe tail',
+  'written by an independent client',
   'topics are isolated',
   'on the live path too',
   'disconnect is idempotent',
@@ -165,9 +186,9 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
 
     // A truncating `limit` is where the most dangerous cursor bug lives: reporting the topic tail
     // instead of the last RETURNED message silently drops everything in between, with no error.
-    it.each([1, 2, 4, 5, 6])('paging from a cursor with limit %i is lossless', async (limit) => {
+    it.each(pageLimitsFor(PAGING_VOLUME.length - 1))('paging from a cursor with limit %i is lossless', async (limit) => {
       const t = ctx.freshTopic();
-      const posted = ['m0', 'm1', 'm2', 'm3', 'm4'];
+      const posted = PAGING_VOLUME;
       for (const c of posted) await ctx.plugin.post(t, SENDER, c);
 
       const all = await drainAll(ctx.plugin, t);
@@ -267,9 +288,10 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     // or takes a different endpoint for one, was certified conformant. The seam surfaces no reply
     // field on Message, so the contract is exactly "accepted, and durable in order".
     // Every other case posts short ASCII ('a', 'same', 'm0'), so nothing certified that `post`
-    // round-trips content AT ALL. Carriage return is deliberately NOT a row: XMPP carries bodies in
-    // XML character data, where CR is normalized to LF by the parser before any plugin sees it, so
-    // a CR row would pin one backend's transport rather than the seam.
+    // round-trips content AT ALL. Carriage return is not a row YET: an XMPP body is XML character
+    // data, whose parser normalizes CR to LF before any plugin sees it, so no plugin can round-trip
+    // one — but refusing it is the arm this clause already permits, and bridge-xmpp accepts a CR and
+    // stores an LF. Add the row when that plugin refuses; adding it first only reddens the backend.
     // The same `parley_post` could behave four different ways across
     // certified backends, and a backend that silently rewrote or truncated a payload would pass in
     // full. Refusing a payload is a visible, legitimate answer; altering it silently is not.
@@ -334,6 +356,41 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(live.map((m) => m.backendMsgId)).toEqual(
         viaCatchUp.slice(before.length).map((m) => m.backendMsgId),
       );
+    });
+
+    // Every other subscribe case posts through the SAME client that registered the handler, so a
+    // plugin whose live path merely echoes its own writes — a loopback that registers no
+    // server-side listener at all — passed conformance in full. That is precisely the case Parley
+    // exists for: a human posts in chat, an agent must receive it. `concurrentPost` is the
+    // independent writer the context can already hand out; two of them, because SQLite's fixture
+    // counts `ctx.plugin` as one of the contending writers.
+    it('subscribe delivers a message written by an independent client', async (testCtx) => {
+      if (ctx.concurrentPost === 'unsupported') {
+        testCtx.skip();
+        return;
+      }
+      const t = ctx.freshTopic();
+      const live: Message[] = [];
+      await ctx.plugin.subscribe(t, (m) => live.push(m));
+      await ctx.concurrentPost(t, 2, 1);
+      await vi.waitFor(() => expect(live.length).toBeGreaterThanOrEqual(2), {
+        timeout: 5000,
+        interval: 10,
+      });
+
+      const viaCatchUp = await drainAll(ctx.plugin, t);
+      expect(viaCatchUp).toHaveLength(2);
+      // Compared as SETS: two independent writers race, and the suite grades live ORDER against a
+      // single writer elsewhere. What is graded here is that both writes arrived, exactly once,
+      // under the same identity catch-up reports — the agreement core's dedup depends on.
+      const ids = (ms: Message[]): string[] => ms.map((m) => String(m.backendMsgId)).sort();
+      expect(live).toHaveLength(2);
+      expect(ids(live)).toEqual(ids(viaCatchUp));
+      for (const m of live) {
+        expect(m.topic).toBe(t);
+        expect(m.mentions).toEqual(parseMentions(m.content));
+        expect(m.senderHandle.length).toBeGreaterThan(0);
+      }
     });
 
     it('topics are isolated', async () => {
@@ -523,7 +580,7 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       let cursor = start;
       let writing = true;
       const readLoop = (async () => {
-        const giveUpAt = Date.now() + 60_000;
+        const giveUpAt = Date.now() + READER_BUDGET_MS;
         while (Date.now() < giveUpAt) {
           // Sample `writing` BEFORE the fetch, so that an empty page taken while a writer was
           // still in flight cannot be read as "drained" once that writer lands — otherwise the

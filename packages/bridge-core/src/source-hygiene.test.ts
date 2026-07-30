@@ -74,6 +74,48 @@ describe('source hygiene', () => {
   });
 
   /**
+   * These rules are about COMMENTS and test NAMES, so scan only those. A sibling comment lint has to
+   * quote the shapes it bans — `example: '// as discussed with the reviewer, this stays.'` is a
+   * negative control proving its matcher fires — and a line-wide grep reads that fixture as an
+   * offence. Exempting the FILE would have excused `connection-hygiene`, `publish-hygiene` and
+   * `secret-hygiene` too, which are not comment lints at all; matching the stated scope is narrower
+   * and needs no allowlist.
+   */
+  const STRINGS = /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+  const TITLE = /^\s*(?:it|test|describe)(?:\.\w+)*(?:\.each\([^)]*\))?\s*\(\s*(['"`])((?:[^\\]|\\.)*?)\1/;
+
+  /**
+   * The text these rules govern, and nothing else. Blanking string literals BEFORE looking for `//`
+   * is what separates a comment from a fixture that quotes one, and it keeps a TRAILING comment in
+   * scope — matching on line shape instead would let `const x = 1; // as of now` through, trading a
+   * false positive for a false negative.
+   */
+  const commentaryOf = (line: string): string => {
+    const title = TITLE.exec(line)?.[2] ?? '';
+    const code = line.replace(STRINGS, (m) => m[0]!.repeat(m.length));
+    const at = Math.min(
+      ...[code.indexOf('//'), code.indexOf('/*')].filter((i) => i >= 0).concat(Number.MAX_SAFE_INTEGER),
+    );
+    const trimmed = line.trim();
+    const block = trimmed.startsWith('*') ? trimmed : '';
+    return `${title} ${at === Number.MAX_SAFE_INTEGER ? block : line.slice(at)}`;
+  };
+
+  it.each([
+    ['a whole-line comment', '// as discussed with the reviewer, this stays.', true],
+    ['a trailing comment', 'const x = 1; // as of now this is fine', true],
+    ['a JSDoc continuation', ' * kept as of today', true],
+    ['a test name', "  it('as of today it holds', () => {})", true],
+    ['a lint fixture quoting a comment', "  example: '// as discussed with the reviewer, x.',", false],
+    ['a pattern declaration', 'const TEMPORAL = /the reviewer/i;', false],
+    ['a URL containing //', "const u = 'https://x/as-of-today';", false],
+  ])('scans %s', (_label, line, expected) => {
+    expect(/the reviewer|as of (?:today|now)|for the time being/i.test(commentaryOf(line))).toBe(
+      expected,
+    );
+  });
+
+  /**
    * The same class one step further out: a comment that dates itself. "unchanged from today" and
    * "as of now" resolve to no date and no baseline for the next reader, and go false the moment the
    * thing they describe moves — while the code they sit above stays correct. CLAUDE.md puts that in
@@ -91,7 +133,8 @@ describe('source hygiene', () => {
       readFileSync(f, 'utf8')
         .split('\n')
         .forEach((line, i) => {
-          if (pattern.test(line)) offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
+          if (pattern.test(commentaryOf(line)))
+            offenders.push(`${f.slice(REPO.length)}:${i + 1}: ${line.trim()}`);
         });
     }
     expect(offenders, `${advice} — put the history in the commit message`).toEqual([]);

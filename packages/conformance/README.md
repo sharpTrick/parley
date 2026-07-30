@@ -29,11 +29,20 @@ them stops owning a case — a conformance clause used to be deletable with noth
   matching `parseMentions(content)` (core's push loop filters on it);
 - the same message has an identical `backendMsgId`/`cursor` via live push and via catch-up, and
   `subscribe` delivers exactly the post-subscribe tail, once, in cursor order;
+- `subscribe` delivers a message **written by an independent client** — not only the subscriber's
+  own writes. This is the case Parley exists for (a human posts in chat, an agent must receive it),
+  and a plugin whose live path registers no server-side listener and merely echoes its own `post`
+  used to pass in full. Graded through `concurrentPost`, so it skips only where the backend cannot
+  represent a second writer at all;
 - topics are isolated on catch-up, and on the live path too;
 - disconnect is idempotent and stops the plugin serving;
 - post either round-trips a payload exactly — newline, surrounding spaces, an astral emoji, a
-  combining sequence, a tab — or refuses it, never altering it silently. Carriage return is not
-  graded: XMPP bodies are XML character data, where CR is normalized to LF before a plugin sees it;
+  combining sequence, a tab — or refuses it, never altering it silently. Carriage return is not yet a
+  row, and not because it cannot be graded: XMPP carries bodies as XML character data, where the
+  parser normalizes CR to LF (XML 1.0 §2.11) before any plugin sees it, so the wire genuinely
+  cannot round-trip one — but *refusing* it is the other arm this clause already permits, and
+  `bridge-xmpp` today accepts a CR and stores an LF, which is exactly the silent alteration the
+  clause forbids. The row lands once that plugin refuses instead;
 - post accepts inReplyTo and the reply is durable, in order;
 - resolveIdentity answers for the handle it was asked about;
 - distinct senders are not collapsed onto one another;
@@ -96,12 +105,13 @@ export type BackendFactory = () => Promise<ConformanceContext>;
 ```
 
 `runConformanceSuite` validates that shape at runtime (`assertConformanceContext`) and fails
-naming the backend and the offending field. The runtime check is what enforces "required":
-**some backend packages still do not typecheck their own test sources**, and vitest transpiles
-without typechecking — so for those, a context literal is only ever seen at runtime, and a missing
-field would silently delete the cases that read it rather than lose a build. A package that adds a
-`tsconfig.test.json` gets the field checked at compile time as well; the runtime check stays because
-it is the only thing covering the ones that have not.
+naming the backend and the offending field. That runtime check is what enforces "required": vitest
+transpiles test sources without typechecking them, so a plugin package with no `tsconfig.test.json`
+never has its fixture seen by a compiler at all — its context literal is checked only when the suite
+runs, and a missing field would silently delete the cases that read it instead of losing a build.
+Packages are adopting `tsconfig.test.json` one at a time, so this claim is not a fixed list: this
+package's own tests recompute how many suite consumers still lack one and assert the validator is
+still doing work, so that the day none do, retiring it becomes a question asked rather than assumed.
 
 Then, in the plugin package's own test file:
 
@@ -156,13 +166,13 @@ everywhere:
 
 - `reference.test.ts` runs the whole suite against an in-memory `ReferencePlugin` that is
   conformant by construction (both arms of the absent-topic contract). It must pass.
-- `negative-control.test.ts` runs the suite against a table of deliberately broken plugins —
-  inclusive `since`, a constant `topic`, a constant `backendMsgId`, an oldest-first default window,
-  a history-replaying `subscribe`, a post that still serves after `disconnect`, dropped `mentions`,
-  a blank `senderHandle`, a stalled cursor, an unreplayable absent-topic cursor, a plain `Error`
-  instead of `NoSuchTopicError`, a fetch that parks on `blockMs` — and requires each one to FAIL the
-  case built to catch it. Vitest cannot invert a suite's result in-process, so that run happens in a
-  child process behind `PARLEY_CONFORMANCE_BROKEN=1` and this test grades its JSON report.
+- `negative-control.test.ts` runs the suite against `BROKEN_VARIANTS` — one deliberately
+  non-conformant plugin per way a backend can be wrong — and requires each one to FAIL the case built
+  to catch it. **Every clause in `CLAUSES` must own such a variant**, asserted mechanically rather
+  than kept in step by hand: seven clauses once had no control at all, so their assertions could be
+  gutted with this whole package staying green while every backend kept being certified against the
+  weakened clause. Vitest cannot invert a suite's result in-process, so that run happens in a child
+  process behind `PARLEY_CONFORMANCE_BROKEN=1` and this test grades its JSON report.
 
 Plus the self-tests: that the context validator rejects a malformed fixture, that every clause in
 `CLAUSES` still owns a case, and that no case buys itself out of asserting on a capability flag.

@@ -19,6 +19,24 @@ import {
 import type { ConformanceContext } from '@sharptrick/parley-conformance';
 
 /**
+ * The backing store a family of {@link ReferencePlugin} instances share, so that several
+ * independently-connected clients can see one another's writes — which is what every real backend's
+ * `concurrentPost` builds out of N connections, and what a live path graded only against its own
+ * writes never exercises.
+ */
+export interface ReferenceStore {
+  seq: number;
+  readonly log: Map<string, Message[]>;
+  subscriptions: { topic: string; handler: MessageHandler; owner: object }[];
+}
+
+export const newReferenceStore = (): ReferenceStore => ({
+  seq: 0,
+  log: new Map(),
+  subscriptions: [],
+});
+
+/**
  * An in-memory backend that is conformant BY CONSTRUCTION — the suite's reference control.
  *
  * Every real backend needs a server, so on a machine with none reachable the suite grades nothing
@@ -27,10 +45,12 @@ import type { ConformanceContext } from '@sharptrick/parley-conformance';
  * assertion in the suite from quietly becoming vacuous.
  */
 export class ReferencePlugin implements BackendPlugin {
-  private seq = 0;
   private connected = false;
-  private readonly log = new Map<string, Message[]>();
-  private readonly live = new Map<string, MessageHandler[]>();
+  private readonly store: ReferenceStore;
+
+  constructor(store: ReferenceStore = newReferenceStore()) {
+    this.store = store;
+  }
 
   connect(_config: BackendConfig): Promise<void> {
     this.connected = true;
@@ -39,13 +59,13 @@ export class ReferencePlugin implements BackendPlugin {
 
   disconnect(): Promise<void> {
     this.connected = false;
-    this.live.clear();
+    this.store.subscriptions = this.store.subscriptions.filter((s) => s.owner !== this);
     return Promise.resolve();
   }
 
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
-    this.live.set(String(topic), [...(this.live.get(String(topic)) ?? []), handler]);
+    this.store.subscriptions.push({ topic: String(topic), handler, owner: this });
   }
 
   async post(
@@ -55,7 +75,7 @@ export class ReferencePlugin implements BackendPlugin {
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     this.require();
-    const id = String(++this.seq).padStart(12, '0');
+    const id = String(++this.store.seq).padStart(12, '0');
     const message = buildMessage({
       topic,
       sender: String(identity),
@@ -63,14 +83,14 @@ export class ReferencePlugin implements BackendPlugin {
       timestamp: new Date().toISOString(),
       id,
     });
-    this.log.set(String(topic), [...(this.log.get(String(topic)) ?? []), message]);
-    for (const handler of this.live.get(String(topic)) ?? []) handler(message);
+    this.store.log.set(String(topic), [...(this.store.log.get(String(topic)) ?? []), message]);
+    for (const s of this.store.subscriptions) if (s.topic === String(topic)) s.handler(message);
     return asBackendMsgId(id);
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
-    const history = this.log.get(String(args.topic)) ?? [];
+    const history = this.store.log.get(String(args.topic)) ?? [];
     const limit = args.limit ?? 100;
     if (args.since === undefined) {
       const window = history.slice(Math.max(0, history.length - limit));
@@ -96,20 +116,36 @@ export class ReferencePlugin implements BackendPlugin {
 
 let seq = 0;
 
-async function context(plugin: BackendPlugin): Promise<ConformanceContext> {
+/**
+ * `concurrentPost` drives N separately-connected clients over the shared store, exactly as every
+ * shipped fixture drives N plugin instances against one server. Keep it OFF `ctx.plugin`, so that
+ * the writers the suite calls independent really are.
+ */
+async function context(plugin: BackendPlugin, store: ReferenceStore): Promise<ConformanceContext> {
   await plugin.connect({});
   return {
     plugin,
     freshTopic: (): Topic => asTopic(`ref-${++seq}-${Math.random().toString(36).slice(2, 8)}`),
     cleanup: () => plugin.disconnect(),
     concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
-      await Promise.all(
-        Array.from({ length: writers }, async (_unused, w) => {
-          for (let i = 0; i < perWriter; i++) {
-            await plugin.post(topic, `w${w}` as Handle, `w${w}-${i}`);
-          }
+      const clients = await Promise.all(
+        Array.from({ length: writers }, async () => {
+          const p = new ReferencePlugin(store);
+          await p.connect({});
+          return p;
         }),
       );
+      try {
+        await Promise.all(
+          clients.map(async (p, w) => {
+            for (let i = 0; i < perWriter; i++) {
+              await p.post(topic, `w${w}` as Handle, `w${w}-${i}`);
+            }
+          }),
+        );
+      } finally {
+        await Promise.all(clients.map((p) => p.disconnect()));
+      }
     },
     supportsBlockingFetch: false,
     carriesSenderIdentity: true,
@@ -117,32 +153,39 @@ async function context(plugin: BackendPlugin): Promise<ConformanceContext> {
   };
 }
 
-export const makeReferenceContext = (): Promise<ConformanceContext> => context(new ReferencePlugin());
+export const makeReferenceContext = (): Promise<ConformanceContext> => {
+  const store = newReferenceStore();
+  return context(new ReferencePlugin(store), store);
+};
 
 /**
  * A reference plugin taking the OTHER arm of the seam's absent-topic MAY: it throws
  * `NoSuchTopicError` for a topic nothing has been posted to. Without this nothing in the repo
  * produces that error for the suite (or for core's mapping of it) to grade.
  */
-export const makeThrowingReferenceContext = async (): Promise<ConformanceContext> => {
-  const inner = new ReferencePlugin();
-  const posted = new Set<string>();
+async function throwingReference(
+  absent: (topic: string) => Error,
+): Promise<ConformanceContext> {
+  const store = newReferenceStore();
+  const inner = new ReferencePlugin(store);
+  // Presence is read off the STORE, not off this wrapper's own writes: an independent client's post
+  // creates the topic just as a human's message would.
   const plugin: BackendPlugin = {
     connect: (c) => inner.connect(c),
     disconnect: () => inner.disconnect(),
     subscribe: (t, h) => inner.subscribe(t, h),
-    post: async (t, i, c, o) => {
-      posted.add(String(t));
-      return inner.post(t, i, c, o);
-    },
+    post: (t, i, c, o) => inner.post(t, i, c, o),
     fetchRecent: async (args) => {
-      if (!posted.has(String(args.topic))) throw new NoSuchTopicError(String(args.topic));
+      if (!store.log.has(String(args.topic))) throw absent(String(args.topic));
       return inner.fetchRecent(args);
     },
     resolveIdentity: (h) => inner.resolveIdentity(h),
   };
-  return { ...(await context(plugin)), absentTopicBehaviour: 'throws' };
-};
+  return { ...(await context(plugin, store)), absentTopicBehaviour: 'throws' };
+}
+
+export const makeThrowingReferenceContext = (): Promise<ConformanceContext> =>
+  throwingReference((topic) => new NoSuchTopicError(topic));
 
 /** One wrapper per way a plugin can be non-conformant, and the case each one must break. */
 export interface BrokenVariant {
@@ -155,7 +198,8 @@ export interface BrokenVariant {
 const wrap = async (
   over: (inner: ReferencePlugin) => Partial<BackendPlugin>,
 ): Promise<ConformanceContext> => {
-  const inner = new ReferencePlugin();
+  const store = newReferenceStore();
+  const inner = new ReferencePlugin(store);
   const base: BackendPlugin = {
     connect: (c) => inner.connect(c),
     disconnect: () => inner.disconnect(),
@@ -164,7 +208,7 @@ const wrap = async (
     fetchRecent: (a) => inner.fetchRecent(a),
     resolveIdentity: (h) => inner.resolveIdentity(h),
   };
-  return context({ ...base, ...over(inner) });
+  return context({ ...base, ...over(inner) }, store);
 };
 
 export const BROKEN_VARIANTS: BrokenVariant[] = [
@@ -308,28 +352,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   {
     name: 'a plain Error for an absent topic instead of NoSuchTopicError',
     mustFail: 'never-posted topic',
-    make: async () => {
-      const ctx = await makeThrowingReferenceContext();
-      const inner = ctx.plugin;
-      const posted = new Set<string>();
-      return {
-        ...ctx,
-        plugin: {
-          connect: (c) => inner.connect(c),
-          disconnect: () => inner.disconnect(),
-          subscribe: (t, h) => inner.subscribe(t, h),
-          resolveIdentity: (h) => inner.resolveIdentity(h),
-          post: async (t, i, c, o) => {
-            posted.add(String(t));
-            return inner.post(t, i, c, o);
-          },
-          fetchRecent: async (args) => {
-            if (!posted.has(String(args.topic))) throw new Error('nope');
-            return inner.fetchRecent(args);
-          },
-        },
-      };
-    },
+    make: () => throwingReference(() => new Error('nope')),
   },
   {
     // The pre-commit-sequence hazard, in memory: report the tail row's cursor while withholding the
@@ -372,5 +395,146 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
           return page;
         },
       })),
+  },
+  {
+    // Content-keyed identity: the shape a backend that treats a repost as the same message has.
+    // Core's dedup namespace is `backendMsgId`, so two turns with the same words collapse into one.
+    name: 'a post that dedupes identical content',
+    mustFail: 'the same content posted twice',
+    make: () =>
+      wrap((inner) => ({
+        post: async (t, i, c, o) => {
+          const seen = (await inner.fetchRecent({ topic: t, limit: 10_000 })).messages.find(
+            (m) => m.content === c,
+          );
+          return seen?.backendMsgId ?? inner.post(t, i, c, o);
+        },
+      })),
+  },
+  {
+    // A cursor at the tail that re-serves the newest message: the catch-up loop then replays the
+    // last message on every poll forever, because `since` never gets past it.
+    name: 'a tail cursor that re-delivers the newest message',
+    mustFail: 'since at the tail',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined || page.messages.length > 0) return page;
+          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+          const newest = all.messages.at(-1);
+          if (newest === undefined || String(newest.cursor) !== String(args.since)) return page;
+          return { messages: [newest], nextCursor: newest.cursor };
+        },
+      })),
+  },
+  {
+    name: 'a post that rejects a threaded reply',
+    mustFail: 'post accepts inReplyTo',
+    make: () =>
+      wrap((inner) => ({
+        post: (t, i, c, o) =>
+          o?.inReplyTo === undefined
+            ? inner.post(t, i, c, o)
+            : Promise.reject(new Error('threaded replies unsupported')),
+      })),
+  },
+  {
+    // A live path that fans every message to every handler regardless of topic: core then emits a
+    // `<channel>` event for a topic the allowlist never admitted.
+    name: 'a live path that ignores its topic filter',
+    mustFail: 'on the live path too',
+    make: () =>
+      wrap((inner) => {
+        const registered: { topic: string; handler: MessageHandler }[] = [];
+        return {
+          subscribe: async (topic, handler) => {
+            registered.push({ topic: String(topic), handler });
+            await inner.subscribe(topic, handler);
+          },
+          post: async (t, i, c, o) => {
+            const id = await inner.post(t, i, c, o);
+            const landed = (await inner.fetchRecent({ topic: t, limit: 1 })).messages.at(-1);
+            if (landed !== undefined) {
+              for (const s of registered) if (s.topic !== String(t)) s.handler(landed);
+            }
+            return id;
+          },
+        };
+      }),
+  },
+  {
+    name: 'a resolveIdentity that answers about someone else',
+    mustFail: 'resolveIdentity answers',
+    make: () =>
+      wrap(() => ({
+        resolveIdentity: (handle) =>
+          Promise.resolve({
+            handle: `not-${String(handle)}` as Handle,
+            backendRef: 'reference:constant',
+          }),
+      })),
+  },
+  {
+    // The lost-wakeup race: park "from now" instead of at the caller's cursor, so a message landing
+    // between the read and the waiter is reported as already-consumed and can never be fetched.
+    name: 'a blocking read that parks from now instead of at the caller cursor',
+    mustFail: 'blocking fetch is not missed',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined || args.blockMs === undefined) return page;
+          if (page.messages.length > 0) return page;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+          return { messages: [], nextCursor: all.nextCursor };
+        },
+      })),
+  },
+  {
+    // Each writer numbering from its own sequence — the cursor namespace a backend gets when the
+    // ordering key is per-connection rather than per-topic. Cursors then collide across writers.
+    name: 'a cursor namespace that restarts per writer',
+    mustFail: 'multi-process writes',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          const perSender = new Map<string, number>();
+          return {
+            ...page,
+            messages: page.messages.map((m) => {
+              const n = (perSender.get(String(m.senderHandle)) ?? 0) + 1;
+              perSender.set(String(m.senderHandle), n);
+              return { ...m, cursor: asCursor(String(n).padStart(12, '0')) };
+            }),
+          };
+        },
+      })),
+  },
+  {
+    // The loopback: a live path that only ever echoes writes made through THIS client. Every other
+    // subscribe case posts through the subscribing client, so nothing else can see it.
+    name: 'a live path that only echoes its own writes',
+    mustFail: 'written by an independent client',
+    make: () =>
+      wrap((inner) => {
+        const registered: { topic: string; handler: MessageHandler }[] = [];
+        return {
+          subscribe: (topic, handler) => {
+            registered.push({ topic: String(topic), handler });
+            return Promise.resolve();
+          },
+          post: async (t, i, c, o) => {
+            const id = await inner.post(t, i, c, o);
+            const landed = (await inner.fetchRecent({ topic: t, limit: 1 })).messages.at(-1);
+            if (landed !== undefined) {
+              for (const s of registered) if (s.topic === String(t)) s.handler(landed);
+            }
+            return id;
+          },
+        };
+      }),
   },
 ];

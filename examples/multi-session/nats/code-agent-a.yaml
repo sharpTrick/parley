@@ -17,9 +17,10 @@ permissions:
 backend_config:
   # ── Must be IDENTICAL across every config sharing this NATS cluster. ──
   servers: "nats.internal:4222"
-  # ── Must ALSO be identical — same hidden risk as Redis's key_prefix: a mismatch here
-  #    silently maps "the same" topic to a different subject/stream, splitting history with
-  #    no error while every other field still looks consistent. ──
+  # ── Must ALSO be identical, and unlike Redis's key_prefix a PARTIAL mismatch here is a hard
+  #    failure, not split history: change one of the two and the bridge refuses at the first
+  #    post/fetch, naming the field. Change BOTH and each instance quietly gets its own stream
+  #    on its own subject — that is the case nothing can detect for you. ──
   subject_prefix: "parley."
   stream_prefix: "PARLEY_"
   # ── Should be identical, and for a different reason than sqlite/redis: this is LOCKED IN

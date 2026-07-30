@@ -63,9 +63,15 @@ describe('README', () => {
     expect(missing).toEqual([]);
   });
 
-  // The README justified the runtime validator with an absolute "no X in this repo" that this very
-  // package falsifies. Recompute the set instead of restating it: what is load-bearing is that no
-  // BACKEND typechecks its test sources, which is why a fixture's context literal is runtime-only.
+  /**
+   * The README justifies the runtime validator by a fact about the repo, and both the sentence and
+   * this check have pinned an ABSOLUTE that decays as the repo improves: first "no tsconfig covers
+   * test/**" (false the day this package got one), then "no backend typechecks its own test sources"
+   * (false the day a backend added a `tsconfig.test.json` — and it found a real type error doing it).
+   * A deficiency is the wrong thing to hold invariant. What keeps the validator NECESSARY is that at
+   * least one consumer's fixture is still never seen by a compiler, so that is what is asserted, and
+   * the count reaching zero turns retiring the validator into a question instead of a silent lie.
+   */
   describe('the claim behind the runtime context validator', () => {
     const typechecksTests = (dir: string): boolean => {
       for (const name of ['tsconfig.json', 'tsconfig.test.json']) {
@@ -81,18 +87,52 @@ describe('README', () => {
       return false;
     };
 
-    // Assert what keeps the runtime validator NECESSARY, not a count of who has caught up. Pinning
-    // "nobody typechecks their tests" makes the suite go red when a backend IMPROVES, which is what
-    // happened the moment bridge-sqlite and bridge-slack added a test project. It becomes a real
-    // question only when the set empties.
-    it('at least one backend running the suite does not typecheck its own test sources', () => {
-      const without = consumers().filter((d) => !typechecksTests(d));
-      expect(without, 'every consumer now typechecks its tests — the runtime context validator may no longer be load-bearing, so re-justify it or drop it').not.toEqual([]);
+    const workspaceDirs = (): string[] =>
+      readdirSync(packagesDir).filter((dir) => {
+        try {
+          readFileSync(new URL(`${dir}/package.json`, packagesDir), 'utf8');
+          return true;
+        } catch {
+          return false;
+        }
+      });
+
+    it('is not vacuous: some package does typecheck its test sources', () => {
+      expect(workspaceDirs().filter(typechecksTests)).not.toEqual([]);
+      expect(consumers().length).toBeGreaterThan(5);
     });
 
-    it('does not claim NO tsconfig in the repo covers test/**, while some do', () => {
-      expect(readdirSync(packagesDir).filter(typechecksTests)).not.toEqual([]);
-      expect(readme).not.toMatch(/no tsconfig[^.]*includes? `?test/i);
+    it('the validator is still load-bearing — a suite consumer does not typecheck its fixture', () => {
+      expect(
+        consumers().filter((dir) => !typechecksTests(dir)),
+        'every suite consumer now typechecks its own fixture, so a missing context field would ' +
+          'lose a build on its own — decide deliberately whether assertConformanceContext still ' +
+          'earns its place instead of leaving this row to rot',
+      ).not.toEqual([]);
+    });
+
+    /**
+     * The paragraph that carries the justification. The set it describes changes as packages adopt
+     * `tsconfig.test.json`, so it must state the REASON and name no member: a list here goes stale
+     * silently, which is how both earlier spellings of this claim became false.
+     */
+    const validatorParagraph = (): string => {
+      const paragraphs = readme.split(/\n\s*\n/).filter((p) => p.includes('assertConformanceContext'));
+      expect(paragraphs, 'the README no longer justifies the runtime validator anywhere').toHaveLength(1);
+      return paragraphs[0] as string;
+    };
+
+    it('states the reason without naming which packages typecheck their tests', () => {
+      expect(workspaceDirs().filter((dir) => validatorParagraph().includes(dir))).toEqual([]);
+    });
+
+    // Whitespace-insensitive: the claim is prose, so a line wrap must not let it back in.
+    it.each([
+      ['no tsconfig in the repo covers test/**', /no\s+tsconfig[^.]*includes?\s+`?test/i],
+      ['no backend typechecks its own test sources', /\bno\s+backend[^.]*typecheck/i],
+      ['only two named packages have a test tsconfig', /only\s+this\s+package\s+and/i],
+    ])('does not restate the decayed absolute "%s"', (_label, shape) => {
+      expect(readme.replaceAll(/\s+/g, ' ')).not.toMatch(shape);
     });
   });
 });
