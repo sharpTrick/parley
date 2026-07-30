@@ -75,9 +75,21 @@ agent hit the mirror image of the same collision. Both caught it and recovered f
 that did not would have committed one package's implementation into another.
 
 So: **scratch files go under a per-target path** (`/tmp/careening/<target>-scratch/`), never the
-shared scratchpad, and never a bare name in a shared directory. Better still, do not back a file up
-at all — the worktree is a git checkout, so `git checkout -- <file>` restores it from a source no
-sibling can write to.
+shared scratchpad, and never a bare name in a shared directory.
+
+**Never `git stash` in a worktree.** The stash stack lives in the COMMON git dir, so worktrees do not
+isolate it — it is the same trap one level down. In round 8 the Postgres and core-auth agents each
+stashed to measure a baseline; a sibling pushed between one agent's push and its pop, and each `pop`
+restored the *other's* work into the wrong worktree. Both recovered from dangling stash commits, but
+a run that did not notice would have committed one package's implementation into another.
+
+**And `git checkout -- <file>` is a mutation restorer only for a file you have not otherwise
+edited.** Three round-8 agents used it to undo a mutation and wiped their own in-progress fix along
+with it, because it restores from the index or HEAD — which, in a worktree pinned to the round base,
+is the code *before* the remediation. Either `git add` the fix first, so the index holds it, or keep
+a per-target copy of the fixed file and `cp` it back. This paragraph previously said the worktree
+"is a git checkout, so `git checkout --` restores it", which is the reasoning that produced all
+three losses.
 
 Worktrees isolate the filesystem and **not** the backing services. A shared Redis, Postgres,
 Synapse, Prosody, Keycloak and NATS are one destructive test away from taking down every concurrent
