@@ -26,7 +26,7 @@
  *     must settle inside a bound. An acquisition whose only exit is a message the peer may never
  *     send has no bound at all, which is what the `silent` mode is here to prove.
  */
-import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
@@ -371,6 +371,128 @@ describe('slack teardown racing an in-flight connect', () => {
       );
       expect(subscribed.status).toBe('rejected');
       expect(String((subscribed as { reason: unknown }).reason)).toMatch(/no hello within \d+ms/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  /**
+   * CLASS: teardown must close every socket the plugin HOLDS, not the one field it happens to track.
+   * A `disconnect: warning` rotation deliberately runs two Socket Mode connections at once, so any
+   * state that can hold more than one is a state `disconnect()` owes an answer for — an orphan goes
+   * on acking envelopes to Slack, marking them delivered against a bridge that has cleared its
+   * routes, and burns one of the ~10 connections an app token gets.
+   *
+   * `live` is asserted BEFORE the teardown, so a row cannot silently stop reaching the state it
+   * names and go on passing on the strength of the teardown alone.
+   */
+  const SOCKET_STATES: Array<{
+    name: string;
+    live: number;
+    reach: (fake: FakeSlack, plugin: SlackPlugin, topic: Topic) => Promise<void>;
+  }> = [
+    { name: 'cold', live: 0, reach: async () => undefined },
+    {
+      name: 'establishing',
+      live: 1,
+      reach: async (fake, plugin, topic) => {
+        fake.setGreet('silent');
+        void capture(plugin.subscribe(topic, () => undefined));
+        await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 4000, interval: 5 });
+      },
+    },
+    {
+      name: 'established',
+      live: 1,
+      reach: async (_fake, plugin, topic) => {
+        await plugin.subscribe(topic, () => undefined);
+      },
+    },
+    {
+      name: 'rotating',
+      live: 2,
+      reach: async (fake, plugin, topic) => {
+        await plugin.subscribe(topic, () => undefined);
+        // The replacement stays silent, so the overlap the rotation opens is stable rather than a
+        // window a poll has to catch; Slack never closes its half here either.
+        fake.setGreet('silent');
+        fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+        await vi.waitFor(() => expect(fake.liveSockets).toBe(2), { timeout: 4000, interval: 5 });
+      },
+    },
+  ];
+
+  for (const state of SOCKET_STATES) {
+    it(`disconnect from the ${state.name} state closes every socket the plugin holds`, async () => {
+      // Long enough that a silent socket stays open across the row rather than being reaped by the
+      // handshake bound mid-assertion.
+      const { fake, plugin } = await startSlack({
+        handshakeTimeoutMs: 5000,
+        channels: ['C0OWN'],
+      });
+      try {
+        await state.reach(fake, plugin, asTopic('C0OWN'));
+        expect(fake.liveSockets, `${state.name}: sockets held`).toBe(state.live);
+
+        await plugin.disconnect();
+        await vi.waitFor(() => expect(fake.liveSockets).toBe(0), { timeout: 4000, interval: 5 });
+      } finally {
+        await fake.close();
+      }
+    });
+  }
+
+  /**
+   * CLASS: any period in which the plugin holds more than one event source for one channel. Slack
+   * OPENS that period deliberately — the warning exists so the replacement is up before the old
+   * socket goes — but the plugin owns its END: Slack routes each payload to any ONE of an app's open
+   * connections and promises nothing about ordering across them, and an edge that never closes its
+   * half would otherwise leave one established connection behind per rotation, against the ~10 an
+   * app token gets. The fake never closes the old half here, so only the plugin can end this.
+   */
+  const ROTATION_GRACE_MS = 500;
+
+  it('a rotation bounds its own grace, and the replacement carries the stream', async () => {
+    const { fake, plugin, cleanup } = await startPlugin({
+      channels: ['C0ROTATE'],
+      rotationGraceMs: ROTATION_GRACE_MS,
+    });
+    const topic = asTopic('C0ROTATE');
+    try {
+      const seen: string[] = [];
+      await plugin.subscribe(topic, (m) => seen.push(m.content));
+      expect(fake.helloSent).toBe(1);
+
+      fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+      // The grace opens: both connections are up, which is what makes the rotation gapless…
+      await vi.waitFor(() => expect(fake.liveSockets).toBe(2), { timeout: 4000, interval: 5 });
+      expect(fake.helloSent, 'replacement established').toBe(2);
+      // …and closes on the plugin's own clock, not the vendor's.
+      await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 4000, interval: 5 });
+
+      await plugin.post(topic, asHandle('writer'), 'after the rotation');
+      await vi.waitFor(() => expect(seen).toContain('after the rotation'), {
+        timeout: 4000,
+        interval: 10,
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('every rotation is bounded, so a flood of warnings cannot accumulate connections', async () => {
+    const { fake, plugin, cleanup } = await startPlugin({
+      channels: ['C0ROTFLOOD'],
+      rotationGraceMs: ROTATION_GRACE_MS,
+    });
+    const topic = asTopic('C0ROTFLOOD');
+    try {
+      await plugin.subscribe(topic, () => undefined);
+      for (let i = 0; i < 4; i++) {
+        fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+        await vi.waitFor(() => expect(fake.liveSockets).toBe(2), { timeout: 4000, interval: 5 });
+        await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 4000, interval: 5 });
+      }
     } finally {
       await cleanup();
     }

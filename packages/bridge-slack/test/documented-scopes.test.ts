@@ -25,6 +25,7 @@ import {
 } from '../src/index.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { rungStarts } from './harness.js';
 
@@ -156,13 +157,13 @@ describe('slack rate-limit docs track the shared helper', () => {
     // then again on the prose below, so the two cannot drift apart.
     expect(rungStarts(4_000).length, 'rungs at 4 s').toBe(5);
     expect(rungStarts(60_000).length, 'rungs at 60 s').toBe(16);
-    expect(rungStarts(600_000).length, 'rungs at 600 s').toBe(124);
+    expect(rungStarts(MAX_BLOCK_MS).length, 'rungs at the core ceiling').toBe(64);
     // Linear past the cap is the property the superseded claim got wrong; state it, and the two
     // figures an operator sizes `block_max_ms` from.
     expect(text, 'still claims a logarithmic bound').not.toMatch(/O\(log/);
     expect(text).toContain('4 + block_ms / MAX_DIAL_BACKOFF_MS');
     expect(text).toContain(`${rungStarts(60_000).length} reads and dials`);
-    expect(text).toContain(`~${rungStarts(600_000).length} of each`);
+    expect(text).toContain(`~${rungStarts(MAX_BLOCK_MS).length} of each`);
     expect(text).toMatch(/\*\*linear\*\*, not logarithmic/);
   });
 });

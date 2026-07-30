@@ -16,7 +16,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
+import { delay, fetchWithRetry, sanitizeBody } from '@sharptrick/parley-net-util';
 import { WebSocket, type RawData } from 'ws';
 
 /** Plugin-specific backend_config. */
@@ -39,6 +39,8 @@ export interface SlackBackendConfig {
   mention_map?: Record<string, string>;
   /** Milliseconds a Socket Mode connection may stay silent after opening before `hello`. */
   handshake_timeout_ms?: number;
+  /** Milliseconds a rotated-out Socket Mode connection may stay open after its replacement is up. */
+  rotation_grace_ms?: number;
 }
 
 /** The subset of a Slack message object (history entry / `message` event) that we read. */
@@ -65,6 +67,21 @@ class SlackApiError extends Error {
 }
 
 /**
+ * A 200 carrying `ok:true` that is not the shape the method documents. `ok:true` is a claim about
+ * the CALL, not about the body: a captive portal, a proxy error page or a vendor change hands back
+ * a payload whose fields are absent or the wrong type, and every field read out of one reaches
+ * either the seam (a dedup key, a `senderHandle`) or the wire (a websocket URL). Keep the method in
+ * the message, so that a failure repeating on every catch-up names the call that caused it instead
+ * of surfacing as an engine-level `TypeError` from inside the plugin.
+ */
+class SlackShapeError extends Error {
+  constructor(method: string, detail: string) {
+    super(`Slack ${method} → ${detail}`);
+    this.name = 'SlackShapeError';
+  }
+}
+
+/**
  * Slack error codes that mean "this conversation is not there for us" — the seam's absent-topic
  * contract ({@link NoSuchTopicError}), which core reads as "topic not present yet" rather than a
  * backend failure. `not_in_channel` is absence for a READ (we cannot see the channel's history);
@@ -87,6 +104,14 @@ export const MAX_DIAL_BACKOFF_MS = 5_000;
  * cannot park `subscribe` and every blocking `fetchRecent` for the process lifetime.
  */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a socket that has been handed a `disconnect: warning` may stay open once its replacement
+ * is being dialled. Slack states the notice as ~10 s and closes its own half at the end of it; keep
+ * a bound of our own here, so that an edge which never closes leaves neither an established
+ * connection per rotation nor a second event source feeding one channel indefinitely.
+ */
+export const DEFAULT_ROTATION_GRACE_MS = 10_000;
 
 /**
  * Hard ceiling on the pages one `conversations.history` walk may request. The walk is otherwise
@@ -116,9 +141,10 @@ interface SocketEnvelope {
   payload?: { event?: SlackMessage };
 }
 
+/** `messages` is deliberately `unknown`: an `ok:true` body is vendor-controlled, not a contract. */
 interface HistoryResponse {
   ok: boolean;
-  messages?: SlackMessage[];
+  messages?: unknown;
   response_metadata?: { next_cursor?: string };
 }
 
@@ -201,6 +227,7 @@ export class SlackPlugin implements BackendPlugin {
   private channelMap: Record<string, string> = ownEntriesOnly({});
   private mentionMap: Record<string, string> = ownEntriesOnly({});
   private handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS;
+  private rotationGraceMs = DEFAULT_ROTATION_GRACE_MS;
   /**
    * channel id → the one topic allowed to use it: seeded from `channel_map` at {@link connect}, then
    * claimed first-come by unmapped channel-id literals.
@@ -210,6 +237,13 @@ export class SlackPlugin implements BackendPlugin {
   private stopped = false;
   /** ONE shared Socket Mode websocket per plugin instance, opened lazily on first subscribe. */
   private ws?: WebSocket;
+  /**
+   * Every socket this plugin has open, which during a rotation is MORE than {@link ws}. Keep
+   * teardown reading this set rather than that field, so that a `disconnect()` inside the rotation
+   * grace cannot leave an established connection nothing will ever close — it goes on acking
+   * envelopes to Slack, which marks them delivered, against a bridge that has cleared its routes.
+   */
+  private readonly sockets = new Set<WebSocket>();
   /** Pending/established socket, resolved once the current connection has seen `hello`. */
   private wsReady?: Promise<void>;
   /** channel id → the topic + handler it feeds (Socket Mode events carry the channel id). */
@@ -236,8 +270,9 @@ export class SlackPlugin implements BackendPlugin {
     this.botToken = cfg.bot_token;
     this.appToken = cfg.app_token;
     this.channelMap = requireUsableChannelMap(cfg.channel_map ?? {});
-    this.mentionMap = ownEntriesOnly(cfg.mention_map ?? {});
+    this.mentionMap = requireUsableMap('mention_map', 'a handle', cfg.mention_map ?? {});
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    this.rotationGraceMs = cfg.rotation_grace_ms ?? DEFAULT_ROTATION_GRACE_MS;
     this.channelOwner.clear();
     // Keep configuration claiming its channels HERE, before any call arrives, so that an ad-hoc
     // caller-supplied topic naming a mapped channel-id literal is the side that loses the collision
@@ -261,14 +296,9 @@ export class SlackPlugin implements BackendPlugin {
     this.drainWaiters();
     this.waiters.clear();
     this.wsReady = undefined;
-    if (this.ws !== undefined) {
-      try {
-        this.ws.close();
-      } catch {
-        /* already closing/closed */
-      }
-      this.ws = undefined;
-    }
+    this.closeSockets();
+    this.sockets.clear();
+    this.ws = undefined;
     this.authTestPromise = undefined;
   }
 
@@ -295,10 +325,13 @@ export class SlackPlugin implements BackendPlugin {
         throw asSeamError(e, topic, ABSENT_ON_WRITE);
       },
     );
-    // `ok:true` is not a promise that `ts` is there; branding whatever came back would hand core an
-    // undefined dedup key that collapses with every other one.
+    // Branding whatever came back would hand core an undefined dedup key that collapses with every
+    // other one.
     if (typeof resp.ts !== 'string' || !TS_RE.test(resp.ts)) {
-      throw new Error(`Slack chat.postMessage returned no usable ts for topic ${JSON.stringify(topic)}`);
+      throw new SlackShapeError(
+        'chat.postMessage',
+        `returned no usable ts for topic ${JSON.stringify(topic)}`,
+      );
     }
     return asBackendMsgId(resp.ts);
   }
@@ -374,7 +407,11 @@ export class SlackPlugin implements BackendPlugin {
   private async runFetch(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const channel = this.channelFor(args.topic);
-    const limit = args.limit ?? 100;
+    // The seam declares `limit?: number` with no floor, and this is the only layer that can keep
+    // one: `slice(-0)` is `slice(0)`, so an unfloored 0 returns the WHOLE page a caller asked for
+    // none of, and a negative one returns an arbitrary middle of it.
+    const asked = Math.trunc(args.limit ?? 100);
+    const limit = Number.isNaN(asked) ? 1 : Math.max(1, asked);
     const resumeAfterSince = args.since !== undefined;
 
     // Keep every window decision below counting SURFACED messages, never raw entries, so that a
@@ -394,7 +431,10 @@ export class SlackPlugin implements BackendPlugin {
           throw asSeamError(e, args.topic, ABSENT_ON_READ);
         },
       );
-      const page = (resp.messages ?? []).filter(hasUsableTs);
+      if (!Array.isArray(resp.messages)) {
+        throw new SlackShapeError('conversations.history', 'returned no usable messages array');
+      }
+      const page = (resp.messages as unknown[]).filter(hasUsableTs);
       for (const m of page) {
         if (newestSeenTs === undefined || compareTs(m.ts, newestSeenTs) > 0) newestSeenTs = m.ts;
       }
@@ -437,8 +477,7 @@ export class SlackPlugin implements BackendPlugin {
     const messages = window.map((m) => slackToMessage(args.topic, m, this.mentionMap));
     return {
       messages,
-      nextCursor:
-        messages.at(-1)?.cursor ?? emptyCursor(args, newestSeenTs, pageCursor === undefined),
+      nextCursor: messages.at(-1)?.cursor ?? emptyCursor(args, newestSeenTs),
     };
   }
 
@@ -481,10 +520,15 @@ export class SlackPlugin implements BackendPlugin {
     this.require();
     if (handle.includes('@')) {
       try {
-        const resp = await this.api<{ ok: boolean; user: { id: string } }>('users.lookupByEmail', {
-          email: handle,
-        });
-        return { handle, backendRef: resp.user.id };
+        const resp = await this.api<{ ok: boolean; user?: { id?: unknown } }>(
+          'users.lookupByEmail',
+          { email: handle },
+        );
+        const id = resp.user?.id;
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new SlackShapeError('users.lookupByEmail', 'returned no usable user.id');
+        }
+        return { handle, backendRef: id };
       } catch (e: unknown) {
         // Keep this narrowed to "no such account", so that a provisioning failure
         // (`missing_scope`, `invalid_auth`, a 429) cannot read back as a successful passthrough.
@@ -635,13 +679,18 @@ export class SlackPlugin implements BackendPlugin {
 
   private async openSocket(): Promise<void> {
     // Socket Mode handshake uses the APP token; everything else uses the bot token.
-    const open = await this.api<{ ok: boolean; url: string }>('apps.connections.open', {}, 'app');
+    const open = await this.api<{ ok: boolean; url?: unknown }>('apps.connections.open', {}, 'app');
     // Keep this abort, so that a disconnect landing during the round trip cannot leave a live
     // socket nothing will ever close, burning one of the ~10 connections per app token.
     if (this.stopped) throw new Error('Slack Socket Mode connect aborted — plugin disconnected');
+    const url = open.url;
+    if (typeof url !== 'string' || !/^wss?:\/\//.test(url)) {
+      throw new SlackShapeError('apps.connections.open', 'returned no usable websocket url');
+    }
     await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(open.url);
+      const ws = new WebSocket(url);
       this.ws = ws;
+      this.sockets.add(ws);
       let settled = false;
       let helloSeen = false;
       let handshake: ReturnType<typeof setTimeout>;
@@ -672,6 +721,7 @@ export class SlackPlugin implements BackendPlugin {
         settle(err);
       });
       ws.on('close', () => {
+        this.sockets.delete(ws);
         // Keep this settle AHEAD of the stopped/superseded return, so that a teardown closing the
         // socket always releases the callers awaiting the handshake instead of parking them for
         // the process lifetime. Keep it a bare reject — the owning caller (the first `subscribe`
@@ -688,6 +738,17 @@ export class SlackPlugin implements BackendPlugin {
         void this.reconnect();
       });
     });
+  }
+
+  /** Close every open socket. A socket removes itself from the set on its own `close` event. */
+  private closeSockets(): void {
+    for (const ws of [...this.sockets]) {
+      try {
+        ws.close();
+      } catch {
+        /* already closing/closed */
+      }
+    }
   }
 
   /**
@@ -718,8 +779,13 @@ export class SlackPlugin implements BackendPlugin {
   /**
    * One Socket Mode envelope. Keep the ack FIRST, before any processing, so that neither a
    * dropped subtype, an unrouted channel, nor a throwing handler can starve it — Slack redelivers
-   * an unacked envelope and eventually drops the connection. Events arrive in order on the single
-   * socket, so per-channel handler invocation stays in ascending `ts` order.
+   * an unacked envelope and eventually drops the connection.
+   *
+   * Ascending-`ts` handler invocation is a PLUGIN guarantee and nothing here orders anything: it
+   * rests on ONE connection feeding a channel, which a rotation deliberately suspends — Slack routes
+   * each payload to any one of an app's open connections and promises nothing about order across
+   * them. Keep {@link DEFAULT_ROTATION_GRACE_MS} bounding that overlap, so that the exposure is the
+   * handful of seconds Slack asks for and not the process lifetime.
    */
   private onEnvelope(ws: WebSocket, data: RawData, onHello: () => void): void {
     let env: SocketEnvelope;
@@ -761,6 +827,18 @@ export class SlackPlugin implements BackendPlugin {
         if (this.ws !== ws || this.reconnecting || this.rotating.has(ws)) return;
         this.rotating.add(ws);
         this.wsReady = undefined;
+        // The grace is Slack's to open and OURS to close: an edge that never closes its half, or a
+        // peer that keeps sending warnings, would otherwise leave one established connection behind
+        // per rotation — against the ~10 per app token, and against a channel's ordering, which
+        // holds only while one connection feeds it.
+        const grace = setTimeout(() => {
+          try {
+            ws.close();
+          } catch {
+            /* already closing/closed */
+          }
+        }, this.rotationGraceMs);
+        ws.once('close', () => clearTimeout(grace));
         void this.reconnect();
         return;
       }
@@ -830,7 +908,16 @@ export class SlackPlugin implements BackendPlugin {
         isStopped: () => this.stopped,
       },
     );
-    const json = (await res.json()) as T & { error?: string };
+    const text = await res.text();
+    let json: T & { error?: string };
+    try {
+      json = JSON.parse(text) as T & { error?: string };
+    } catch {
+      throw new SlackShapeError(method, `non-JSON body: ${sanitizeBody(text)}`);
+    }
+    if (typeof json !== 'object' || json === null) {
+      throw new SlackShapeError(method, `non-object body: ${sanitizeBody(text)}`);
+    }
     if (!json.ok) throw new SlackApiError(method, json.error ?? 'unknown_error');
     return json;
   }
@@ -860,18 +947,15 @@ function nextRungIn(elapsedMs: number): number {
 }
 
 /**
- * The cursor for a window that surfaced nothing. A walk that ran to cursor exhaustion saw every
- * entry above its floor and surfaced none of them, so it may publish the newest one it read — on the
- * no-`since` path as well, where standing still on `'0'` makes every later catch-up re-walk the whole
- * channel. Keep the step gated on `exhausted`, so that a walk which stopped early can never advance
+ * The cursor for a window that surfaced nothing. Every walk that reaches here ran to cursor
+ * exhaustion — with `limit` floored at 1 the early break always leaves a message to take the cursor
+ * from, and every other way the walk can end short is a throw — so the newest entry it read sits
+ * above nothing it skipped, and publishing it is what stops each later catch-up re-walking the whole
+ * channel. Keep those short exits throwing, so that a truncated walk can never reach here and step
  * the cursor over history it did not read.
  */
-function emptyCursor(
-  args: FetchRecentArgs,
-  newestSeenTs: string | undefined,
-  exhausted: boolean,
-): Cursor {
-  if (exhausted && newestSeenTs !== undefined) return asCursor(newestSeenTs);
+function emptyCursor(args: FetchRecentArgs, newestSeenTs: string | undefined): Cursor {
+  if (newestSeenTs !== undefined) return asCursor(newestSeenTs);
   return args.since ?? asCursor('0');
 }
 
@@ -906,20 +990,37 @@ function ownEntriesOnly<T>(map: Record<string, T>): Record<string, T> {
 }
 
 /**
- * Reject a `channel_map` that cannot be used as one. Keep this fail-fast, so that two topics folding
- * onto one channel cannot silently displace each other's route and relabel one topic's traffic as
- * the other's — crossing into a different topic's dedup and allowlist namespace — and so that a
- * target that is not a channel id cannot reach the wire as `"undefined"` or a JSON blob.
+ * Reject a `backend_config` lookup table whose values cannot be used as ones. `backend_config` is
+ * opaque to core, so this is the only layer that sees these values, and every one of them reaches
+ * either the wire (`channel_map`) or a `Message` field (`mention_map`). Keep this fail-fast at load
+ * for BOTH maps, so that a blank or non-string value cannot reach the wire as `"undefined"` or a
+ * JSON blob, nor cross the seam as a `senderHandle` that is empty or is not a string at all.
  */
-function requireUsableChannelMap(map: Record<string, string>): Record<string, string> {
-  const owner = new Map<string, string>();
-  for (const [topic, channel] of Object.entries(map)) {
-    if (typeof channel !== 'string' || channel.length === 0) {
+function requireUsableMap(
+  configKey: string,
+  what: string,
+  map: Record<string, string>,
+): Record<string, string> {
+  for (const [key, value] of Object.entries(map)) {
+    if (typeof value !== 'string' || value.length === 0) {
       throw new Error(
-        `Slack channel_map maps ${JSON.stringify(topic)} to ${JSON.stringify(channel)}, ` +
-          `which is not a channel id`,
+        `Slack ${configKey} maps ${JSON.stringify(key)} to ${JSON.stringify(value)}, ` +
+          `which is not ${what}`,
       );
     }
+  }
+  return ownEntriesOnly(map);
+}
+
+/**
+ * The above, plus `channel_map`'s own many-to-one hazard: two topics folding onto one channel
+ * silently displace each other's route and relabel one topic's traffic as the other's, crossing into
+ * a different topic's dedup and allowlist namespace.
+ */
+function requireUsableChannelMap(map: Record<string, string>): Record<string, string> {
+  const checked = requireUsableMap('channel_map', 'a channel id', map);
+  const owner = new Map<string, string>();
+  for (const [topic, channel] of Object.entries(checked)) {
     const prior = owner.get(channel);
     if (prior !== undefined) {
       throw new Error(

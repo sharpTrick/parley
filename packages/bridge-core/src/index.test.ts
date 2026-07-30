@@ -39,6 +39,7 @@ describe('public barrel surface', () => {
     'safeName',
     'MIN_HASH_LEN',
     'MAX_HASH_LEN',
+    'MAX_BLOCK_MS',
     'NoSuchTopicError',
     'isNoSuchTopicError',
     'parseMentions',

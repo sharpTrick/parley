@@ -95,8 +95,8 @@ The reactive-only configuration is covered by the same ladder: with no `app_toke
 handshake to attempt, so history is polled and nothing is dialled. One blocked call therefore costs
 about `4 + block_ms / MAX_DIAL_BACKOFF_MS` reads — **16 reads and dials at the default 60 s** — rather
 than one of each per poll interval. That count is **linear**, not logarithmic, in `block_ms` once the
-ladder reaches its cap: raising `catchup.block_max_ms` to ten minutes costs ~124 of each per blocked
-call. Both methods are separately rate-limited, and `conversations.history` is the tighter of the two.
+ladder reaches its cap: raising `catchup.block_max_ms` to core's ceiling of five
+minutes costs ~64 of each per blocked call. Both methods are separately rate-limited, and `conversations.history` is the tighter of the two.
 Only the loss of an **established** connection starts a reconnect loop, and
 only one such loop runs at a time; a handshake that never completed belongs to the caller that asked
 for it, so a failure cannot fan out into parallel redial loops.
@@ -134,6 +134,7 @@ backend_config:
   mention_map:                  # Slack user/usergroup id → Parley handle (see Mentions)
     U0PARLEY: "ctx-payments"
   handshake_timeout_ms: 10000   # default; how long a silent Socket Mode socket may withhold `hello`
+  rotation_grace_ms: 10000      # default; how long a rotated-out socket may stay open once replaced
 ```
 
 ## App provisioning (pointers only — follow Slack's docs)

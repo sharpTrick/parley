@@ -18,6 +18,8 @@ export interface SlackHarnessOptions {
   channelMap?: Record<string, string>;
   /** Omitted by default, so the plugin's own DEFAULT_HANDSHAKE_TIMEOUT_MS applies. */
   handshakeTimeoutMs?: number;
+  /** Omitted by default, so the plugin's own DEFAULT_ROTATION_GRACE_MS applies. */
+  rotationGraceMs?: number;
   /** `conversations.history` objects per page — the tier cap, which the caller cannot raise. */
   pageSize?: number;
   greet?: GreetMode;
@@ -48,6 +50,7 @@ export async function startSlack(opts: SlackHarnessOptions = {}): Promise<SlackH
     ...(opts.handshakeTimeoutMs === undefined
       ? {}
       : { handshake_timeout_ms: opts.handshakeTimeoutMs }),
+    ...(opts.rotationGraceMs === undefined ? {} : { rotation_grace_ms: opts.rotationGraceMs }),
   });
   return {
     fake,

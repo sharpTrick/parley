@@ -141,6 +141,57 @@ describe('slack catch-up publishes the position an exhaustive walk reached', () 
   }
 });
 
+/**
+ * CLASS: a seam argument used in arithmetic without a floor. `FetchRecentArgs.limit` is declared
+ * `number | undefined` with no lower bound, and the window is cut with `slice(-limit)` — where
+ * `slice(-0)` is `slice(0)`, the WHOLE page, and `slice(5)` for -5 is an arbitrary middle of it.
+ * Core's own schema happens to clamp it, but the plugin's contract is the plugin's to keep. The rows
+ * below start BELOW 1, which is where the existing LIMITS table cannot look, and each one is drained
+ * afterwards so a floor that merely truncates cannot also lose the messages it withheld.
+ */
+const SEEDED = 30;
+const LIMIT_ROWS = [-5, -1, 0, 1, 2, undefined];
+
+describe('slack fetchRecent floors a non-positive limit', () => {
+  for (const limit of LIMIT_ROWS) {
+    for (const sinceMode of ['none', 'zero'] as const) {
+      it(`limit=${String(limit)} / since=${sinceMode} returns at most max(1, limit) and stays replayable`, async () => {
+        const { fake, plugin, cleanup } = await startSlack({ appToken: null });
+        try {
+          const topic = asTopic('C0LIMIT');
+          const seeded = fake.seed(
+            topic,
+            Array.from({ length: SEEDED }, (_, i) => ({ text: `m${i}` })),
+          );
+          const args = { topic, ...(limit === undefined ? {} : { limit }) };
+          const since = sinceMode === 'none' ? undefined : asCursor('0');
+
+          const page = await plugin.fetchRecent(since === undefined ? args : { ...args, since });
+
+          const ceiling = limit === undefined ? SEEDED : Math.max(1, limit);
+          expect(page.messages.length, 'page size').toBeLessThanOrEqual(ceiling);
+          expect(page.messages.length, 'page size').toBeGreaterThan(0);
+          // Without `since` the page is the NEWEST it may carry; with one, the OLDEST above the floor.
+          const texts = seeded.map((m) => m.text);
+          expect(page.messages.map((m) => m.content)).toEqual(
+            sinceMode === 'none'
+              ? texts.slice(-page.messages.length)
+              : texts.slice(0, page.messages.length),
+          );
+
+          // A floor that truncates must not also swallow: the published cursor still reaches the rest.
+          const rest = await plugin.fetchRecent({ topic, since: page.nextCursor, limit: SEEDED });
+          const seen = [...page.messages.map((m) => m.content), ...rest.messages.map((m) => m.content)];
+          expect(new Set(seen).size, 'no message delivered twice').toBe(seen.length);
+          if (sinceMode === 'zero') expect(seen).toEqual(texts);
+        } finally {
+          await cleanup();
+        }
+      });
+    }
+  }
+});
+
 describe('slack catch-up window arithmetic', () => {
   for (const layout of LAYOUTS) {
     for (const sinceMode of SINCE_MODES) {

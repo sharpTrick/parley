@@ -423,7 +423,7 @@ describe('slack socket mode: disconnect reason drives the rotation', () => {
       await vi.waitFor(() => expect(h.fake.liveSockets).toBe(2), { timeout: 4000, interval: 5 });
       await new Promise((r) => setTimeout(r, 400));
       expect(h.fake.connectionsOpened - dialsBefore, 'extra handshakes').toBe(1);
-      expect(h.fake.liveSockets, 'orphaned sockets').toBe(2);
+      expect(h.fake.liveSockets, 'sockets inside the rotation grace').toBe(2);
     } finally {
       await h.cleanup();
     }

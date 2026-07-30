@@ -33,6 +33,7 @@ export {
   parseConfig,
   loadConfig,
   instanceIdOf,
+  MAX_BLOCK_MS,
 } from './config.js';
 
 // Security: topic allowlist (DESIGN §14).

@@ -15,6 +15,7 @@ import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core
 import { describe, expect, it, vi } from 'vitest';
 import { compareTs, SlackPlugin, TS_RE } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
+import { capture } from './harness.js';
 
 const COLLIDING: Array<{ name: string; map: Record<string, string>; topics: [string, string] }> = [
   {
@@ -227,17 +228,42 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
     }
   });
 
-  it('rejects a channel_map target that is not a channel id, naming the topic', async () => {
-    for (const bad of [null, 42, {}, [], '']) {
-      const plugin = new SlackPlugin();
-      await expect(
-        plugin.connect({
-          api_url: 'http://127.0.0.1:1/api',
-          channel_map: { alpha: bad } as unknown as Record<string, string>,
-        }),
-        JSON.stringify(bad),
-      ).rejects.toThrow(/alpha[\s\S]*not a channel id/);
+  /**
+   * CLASS: every `Record<string, string>` in `backend_config` whose values reach a `Message` field or
+   * the wire. `backend_config` is opaque to core, so this plugin is the ONLY layer that ever sees
+   * these values — and each map spends them somewhere unforgiving: a `channel_map` target becomes a
+   * form field (`"undefined"`, a JSON blob), a `mention_map` value becomes `Message.senderHandle`
+   * directly, reintroducing exactly the empty/non-string handle `senderOf`'s fallback exists to
+   * prevent. Both must fail at LOAD, naming the offending key.
+   */
+  const CONFIG_MAPS = [
+    { key: 'channel_map', what: 'a channel id' },
+    { key: 'mention_map', what: 'a handle' },
+  ] as const;
+  const UNUSABLE_TARGETS = [null, 42, true, {}, [], ''];
+
+  for (const map of CONFIG_MAPS) {
+    for (const bad of UNUSABLE_TARGETS) {
+      it(`rejects a ${map.key} value of ${JSON.stringify(bad)}, naming the key`, async () => {
+        const plugin = new SlackPlugin();
+        await expect(
+          plugin.connect({
+            api_url: 'http://127.0.0.1:1/api',
+            [map.key]: { alpha: bad },
+          } as unknown as Record<string, unknown>),
+        ).rejects.toThrow(new RegExp(`${map.key}[\\s\\S]*alpha[\\s\\S]*not ${map.what}`));
+      });
     }
+  }
+
+  it('accepts both maps when every value is a usable string', async () => {
+    const plugin = new SlackPlugin();
+    await plugin.connect({
+      api_url: 'http://127.0.0.1:1/api',
+      channel_map: { alpha: 'C0AAA' },
+      mention_map: { U0PARLEY: 'alpha' },
+    });
+    await plugin.disconnect();
   });
 });
 
@@ -489,38 +515,139 @@ describe('slack ts range: the shape guard admits and rejects exactly what it say
   });
 });
 
-describe('slack post: an ok:true reply is not a promise that `ts` is there', () => {
-  const REPLIES: Array<{ name: string; body: Record<string, unknown> }> = [
-    { name: 'no ts at all', body: { ok: true, channel: 'C0X' } },
-    { name: 'null ts', body: { ok: true, ts: null } },
-    { name: 'numeric ts', body: { ok: true, ts: 1700000000.1 } },
-    { name: 'empty ts', body: { ok: true, ts: '' } },
-    { name: 'unparseable ts', body: { ok: true, ts: 'abc' } },
-    { name: 'ts past the Date range', body: { ok: true, ts: '99999999999999999.000001' } },
-  ];
+/**
+ * CLASS: every field the plugin reads out of an `ok:true` envelope. `ok:true` is a claim about the
+ * CALL, not about the body — a captive portal, a proxy error page or a vendor change answers 200
+ * with fields that are absent, null or another type entirely. Unguarded, each one surfaces as an
+ * engine-level `TypeError`/`SyntaxError` naming neither the method nor the plugin, and on
+ * `conversations.history` it repeats on every catch-up, which is the wedged topic this file exists
+ * to prevent. Every row therefore has to name the Slack method that produced it.
+ */
+async function withReplyingServer(
+  reply: { text: string; contentType: string },
+  body: (plugin: SlackPlugin) => Promise<void>,
+): Promise<void> {
+  const { createServer } = await import('node:http');
+  const server = createServer((req, res) => {
+    void (async () => {
+      for await (const _ of req) void _;
+      res.writeHead(200, { 'Content-Type': reply.contentType });
+      res.end(reply.text);
+    })();
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address() as { port: number };
+  const plugin = new SlackPlugin();
+  try {
+    await plugin.connect({
+      api_url: `http://127.0.0.1:${port}/api`,
+      bot_token: 'xoxb-test',
+      app_token: 'xapp-test',
+    });
+    await body(plugin);
+  } finally {
+    await plugin.disconnect();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+}
 
-  for (const reply of REPLIES) {
-    it(`rejects rather than branding an unusable dedup key: ${reply.name}`, async () => {
-      const { createServer } = await import('node:http');
-      const server = createServer((req, res) => {
-        void (async () => {
-          for await (const _ of req) void _;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(reply.body));
-        })();
+const OK_TRUE_READERS: Array<{
+  method: string;
+  field: string;
+  /** A value of the wrong shape for this field — for a nested read, wrong one level down. */
+  malformed: unknown;
+  drive: (plugin: SlackPlugin) => Promise<unknown>;
+}> = [
+  {
+    method: 'chat.postMessage',
+    field: 'ts',
+    malformed: 1700000000.1,
+    drive: (p) => p.post(asTopic('C0OK'), asHandle('writer'), 'hi'),
+  },
+  {
+    method: 'conversations.history',
+    field: 'messages',
+    malformed: { '0': { type: 'message', ts: '1700000000.000001' } },
+    drive: (p) => p.fetchRecent({ topic: asTopic('C0OK'), since: asCursor('0'), limit: 10 }),
+  },
+  {
+    method: 'users.lookupByEmail',
+    field: 'user',
+    malformed: { id: 42 },
+    drive: (p) => p.resolveIdentity(asHandle('someone@example.com')),
+  },
+  {
+    method: 'apps.connections.open',
+    field: 'url',
+    malformed: 'http://not-a-websocket.example',
+    drive: (p) => p.subscribe(asTopic('C0OK'), () => undefined),
+  },
+];
+
+const MALFORMED_BODIES: Array<{
+  name: string;
+  of: (field: string, malformed: unknown) => { text: string; contentType: string };
+}> = [
+  {
+    name: 'the field absent',
+    of: () => ({ text: JSON.stringify({ ok: true }), contentType: 'application/json' }),
+  },
+  {
+    name: 'the field null',
+    of: (field) => ({
+      text: JSON.stringify({ ok: true, [field]: null }),
+      contentType: 'application/json',
+    }),
+  },
+  {
+    name: 'the field the wrong shape',
+    of: (field, malformed) => ({
+      text: JSON.stringify({ ok: true, [field]: malformed }),
+      contentType: 'application/json',
+    }),
+  },
+  {
+    name: 'a non-JSON 200 (captive portal)',
+    of: () => ({ text: '<html>captive portal</html>', contentType: 'text/html' }),
+  },
+  { name: 'an empty 200', of: () => ({ text: '', contentType: 'application/json' }) },
+  // Parses fine and is not an object, so the `ok` read itself is what throws without a guard.
+  {
+    name: 'a JSON 200 whose body is null',
+    of: () => ({ text: 'null', contentType: 'application/json' }),
+  },
+];
+
+describe('slack ok:true is not a promise that the field the caller reads is there', () => {
+  for (const reader of OK_TRUE_READERS) {
+    for (const shape of MALFORMED_BODIES) {
+      it(`${reader.method} with ${shape.name} rejects, naming the method`, async () => {
+        await withReplyingServer(shape.of(reader.field, reader.malformed), async (plugin) => {
+          const outcome = await capture(reader.drive(plugin));
+          expect(outcome.status, `${reader.method} / ${shape.name}`).toBe('rejected');
+          expect(String((outcome as { reason: unknown }).reason)).toContain(reader.method);
+        });
       });
-      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-      const { port } = server.address() as { port: number };
-      const plugin = new SlackPlugin();
-      try {
-        await plugin.connect({ api_url: `http://127.0.0.1:${port}/api`, bot_token: 'xoxb-test' });
-        await expect(plugin.post(asTopic('C0X'), asHandle('writer'), 'hi')).rejects.toThrow(
-          /no usable ts/,
-        );
-      } finally {
-        await plugin.disconnect();
-        await new Promise<void>((r) => server.close(() => r()));
-      }
+    }
+  }
+});
+
+/**
+ * The `ts` rows above cover the SHAPE of the field; these cover its VALUE — strings the shape guard
+ * admits and `TS_RE` does not, which would otherwise be branded as a dedup key that collapses with
+ * every other unusable one.
+ */
+describe('slack post: an ok:true reply is not a promise that `ts` is usable', () => {
+  for (const ts of ['', 'abc', '99999999999999999.000001']) {
+    it(`rejects rather than branding an unusable dedup key: ts ${JSON.stringify(ts)}`, async () => {
+      await withReplyingServer(
+        { text: JSON.stringify({ ok: true, ts }), contentType: 'application/json' },
+        async (plugin) => {
+          await expect(plugin.post(asTopic('C0X'), asHandle('writer'), 'hi')).rejects.toThrow(
+            /no usable ts/,
+          );
+        },
+      );
     });
   }
 });
