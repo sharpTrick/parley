@@ -24,8 +24,10 @@ export interface El {
 export interface ArchiveItem {
   archId: string;
   from: string;
-  body: string;
+  /** `null` for an archived stanza carrying no `<body>` at all (a subject change, a retraction). */
+  body: string | null;
   stamp?: string;
+  subject?: string;
 }
 
 /** The plugin's private surface, reached by typed cast (the pattern the other suites use). */
@@ -164,8 +166,16 @@ export class FakeXmpp {
    */
   kickOnJoin?: { statuses?: string[]; destroy?: boolean };
 
-  /** The occupant nick the plugin joined with; a reflection must come back from it. */
+  /** The occupant nick a room this connection has not joined here falls back to. */
   nick = 'parley-test';
+  /**
+   * roomJid -> the nick this connection actually entered THAT room under. Occupancy is per room on a
+   * real MUC: one connection can hold `alice` in one room and a fallback nick in another, which is
+   * the only state in which a stale connection-wide nick is observable at all. Keep the reflection,
+   * the archived sender and the leave presence reading from here, so that a fixture cannot agree
+   * with a plugin that lost track of which room it is whom in.
+   */
+  readonly occupantNicks = new Map<string, string>();
   /** Enforce XML well-formedness on everything sent, as a real XMPP server does. */
   strictXml = true;
 
@@ -240,12 +250,24 @@ export class FakeXmpp {
 
   /** Archive `body` as if `sender` had said it, and reflect it live (the push + wake path). */
   deliver(room: string, body: string, sender = 'someone'): ArchiveItem {
-    const item = this.archiveOnly(room, body, sender);
+    return this.deliverItem(room, { body, sender });
+  }
+
+  /**
+   * Archive an arbitrary stanza shape and reflect it live, so the two paths are driven from ONE
+   * description of the stanza. A MUC archives more than chat: a subject change and a retraction
+   * carry no `<body>`, and a room-level announcement carries no occupant resource in its `from`.
+   */
+  deliverItem(
+    room: string,
+    shape: { body: string | null; subject?: string; sender?: string | null },
+  ): ArchiveItem {
+    const item = this.archiveItem(room, shape);
     this.feed(
       xml(
         'message',
         { from: item.from, type: 'groupchat' },
-        xml('body', {}, body),
+        ...(this.itemChildren(item) as never[]),
         xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
       ),
     );
@@ -254,9 +276,30 @@ export class FakeXmpp {
 
   /** Archive `body` WITHOUT reflecting it (models MAM committing before the live copy lands). */
   archiveOnly(room: string, body: string, sender = 'someone'): ArchiveItem {
-    const item = { archId: `arch-${++this.seq}`, from: `${room}/${sender}`, body };
+    return this.archiveItem(room, { body, sender });
+  }
+
+  /** {@link archiveOnly} for a stanza that is not plain chat (see {@link deliverItem}). */
+  archiveItem(
+    room: string,
+    shape: { body: string | null; subject?: string; sender?: string | null },
+  ): ArchiveItem {
+    const sender = shape.sender === undefined ? 'someone' : shape.sender;
+    const item: ArchiveItem = {
+      archId: `arch-${++this.seq}`,
+      from: sender === null ? room : `${room}/${sender}`,
+      body: shape.body,
+      subject: shape.subject,
+    };
     this.archiveOf(room).push(item);
     return item;
+  }
+
+  private itemChildren(item: ArchiveItem): unknown[] {
+    return [
+      ...(item.body === null ? [] : [xml('body', {}, item.body)]),
+      ...(item.subject === undefined ? [] : [xml('subject', {}, item.subject)]),
+    ];
   }
 
   private archiveOf(room: string): ArchiveItem[] {
@@ -275,7 +318,11 @@ export class FakeXmpp {
    */
   endOccupancy(room: string, opts: { statuses?: string[]; destroy?: boolean } = {}): void {
     const statuses = opts.statuses ?? [];
-    if (!statuses.includes('303')) this.occupied.delete(room);
+    const nick = this.nickIn(room);
+    if (!statuses.includes('303')) {
+      this.occupied.delete(room);
+      this.occupantNicks.delete(room);
+    }
     const children = [
       xml('status', { code: '110' }),
       ...statuses.map((code) => xml('status', { code })),
@@ -284,7 +331,7 @@ export class FakeXmpp {
     this.feed(
       xml(
         'presence',
-        { from: `${room}/${this.nick}`, type: 'unavailable' },
+        { from: `${room}/${nick}`, type: 'unavailable' },
         xml('x', { xmlns: NS_MUC_USER }, ...(children as never[])),
       ),
     );
@@ -293,6 +340,7 @@ export class FakeXmpp {
   /** Drop occupancy with NO presence at all, the way a restarted MUC component forgets it. */
   forgetOccupancySilently(room: string): void {
     this.occupied.delete(room);
+    this.occupantNicks.delete(room);
   }
 
   /** Reflect a live message that is NOT (yet) in the archive — a spurious long-poll wake. */
@@ -315,12 +363,17 @@ export class FakeXmpp {
     this.answerJoin(presence);
   }
 
+  /** The nick this connection holds in `room` — its own occupancy, not the last join anywhere. */
+  nickIn(room: string): string {
+    return this.occupantNicks.get(room) ?? this.nick;
+  }
+
   private answerJoin(presence: El): void {
     if (this.dead) return;
     const to = presence.attrs.to ?? '';
     const room = to.slice(0, to.indexOf('/'));
     const requested = to.slice(to.indexOf('/') + 1);
-    this.nick = this.assignNick ?? requested;
+    const admitted = this.assignNick ?? requested;
     if (this.joinReply === 'silent') return;
     const taken = this.conflictNicks.has(requested);
     if (taken || this.joinReply === 'error' || this.joinErrorsRemaining > 0) {
@@ -338,10 +391,11 @@ export class FakeXmpp {
     const created = !this.rooms.has(room);
     this.rooms.add(room);
     this.occupied.add(room);
+    this.occupantNicks.set(room, admitted);
     this.feed(
       xml(
         'presence',
-        { from: `${room}/${this.nick}` },
+        { from: `${room}/${admitted}` },
         xml(
           'x',
           { xmlns: NS_MUC_USER },
@@ -378,7 +432,7 @@ export class FakeXmpp {
         xml(
           'message',
           { from: item.from, type: 'groupchat' },
-          xml('body', {}, item.body),
+          ...(this.itemChildren(item) as never[]),
           xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
           xml('delay', { xmlns: NS_DELAY, stamp: item.stamp ?? new Date().toISOString() }),
         ),
@@ -407,7 +461,7 @@ export class FakeXmpp {
       );
       return;
     }
-    const item = this.archiveOnly(room, body, this.nick);
+    const item = this.archiveOnly(room, body, this.nickIn(room));
     this.feed(
       xml(
         'message',
@@ -472,7 +526,7 @@ export class FakeXmpp {
             xml(
               'forwarded',
               { xmlns: NS_FORWARD },
-              xml('message', { from: item.from }, xml('body', {}, item.body)),
+              xml('message', { from: item.from }, ...(this.itemChildren(item) as never[])),
             ),
           ),
         ),
@@ -513,6 +567,7 @@ export const attach = (plugin: XmppPlugin, fake: FakeXmpp, room?: string): XmppP
   if (room !== undefined) {
     p.joined.set(room, Promise.resolve());
     fake.rooms.add(room);
+    fake.occupantNicks.set(room, fake.nick);
   }
   return p;
 };

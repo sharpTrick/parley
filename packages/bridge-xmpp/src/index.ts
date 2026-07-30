@@ -113,6 +113,17 @@ const bareOf = (full: string): string => {
   const i = full.indexOf('/');
   return i === -1 ? full : full.slice(0, i);
 };
+/**
+ * Who a stanza's `from` says said it: the occupant nick, or — for a room-level stanza, which has no
+ * resource — the room itself. Keep the room out of `fallback`, so that a service announcement is
+ * never attributed to this bridge's own handle and read back as something it said.
+ */
+const senderOf = (from: string, fallback: string): string => {
+  const nick = resourceOf(from);
+  if (nick !== '') return nick;
+  const bare = bareOf(from);
+  return bare !== '' ? bare : fallback;
+};
 
 /** The first codepoint of `s` outside XML 1.0's `Char` production, or `undefined` if all are legal. */
 const xmlIllegalCodepoint = (s: string): number | undefined => {
@@ -158,6 +169,12 @@ const MAX_MAM_PAGE = 10_000;
 
 /** Schemes whose stream starts in the clear; STARTTLS on them is opportunistic, never guaranteed. */
 const PLAINTEXT_SCHEMES = ['xmpp:', 'ws:'];
+/**
+ * The whole 127.0.0.0/8 block as an ADDRESS. Keep it anchored at both ends, so that a registrable
+ * hostname beginning `127.` — which resolves wherever its owner points it — cannot be classified
+ * loopback and silence the only warning on the cleartext-credential path.
+ */
+const LOOPBACK_V4 = /^127(\.\d{1,3}){3}$/;
 
 /**
  * Whether `service` would put the SASL password on the network in the clear. `@xmpp/starttls`
@@ -175,7 +192,7 @@ export function isPlaintextRemote(service: string): boolean {
     .replace(/^\[(.*)]$/, '$1')
     .replace(/^([^:]*):\d+$/, '$1')
     .toLowerCase();
-  return !(host === 'localhost' || host === '::1' || /^127\./.test(host) || host === '');
+  return !(host === 'localhost' || host === '::1' || LOOPBACK_V4.test(host) || host === '');
 }
 
 const describeValue = (v: unknown): string => (typeof v === 'string' ? `'${v}'` : String(v));
@@ -316,9 +333,13 @@ interface PendingPost {
 interface MamItem {
   archId: string;
   from: string;
-  body: string;
+  /** `null` for a stanza with no `<body>` at all — a subject change, a retraction, a chat state. */
+  body: string | null;
   stamp?: string;
 }
+/** A {@link MamItem} the seam can carry: the live path admits exactly these, so catch-up must too. */
+type BodiedItem = MamItem & { body: string };
+const hasBody = (it: MamItem): it is BodiedItem => it.body !== null;
 interface Subscription {
   topic: Topic;
   handlers: MessageHandler[];
@@ -355,15 +376,19 @@ export class XmppPlugin implements BackendPlugin {
   private lastStreamErrorAt = 0;
   /** Settled once the occupant nick is final: pinned by config, or taken from `post`'s identity. */
   private nickAdoption?: Promise<void>;
+  /** The nick taken from the FIRST post's identity; `undefined` when config pinned one instead. */
+  private adoptedNick?: string;
+  private identityCollapseReported = false;
   /** Memoized disco#info probe for the one prerequisite this backend cannot work without. */
   private mamCheck?: Promise<void>;
 
   /** roomJid -> in-flight/settled join (cached like an "ensure"; idempotent). */
   private readonly joined = new Map<string, Promise<void>>();
   /**
-   * roomJid -> the occupant nick the ROOM reported for this connection, which a nick-locking
-   * service rewrites (XEP-0045 status 210). Keyed per room rather than held as one field, so that
-   * one room's rewrite cannot make this connection's own reflections in every OTHER room fail the
+   * roomJid -> the occupant nick this connection actually holds in that room, once it differs from
+   * {@link nick}: a nick-locking service rewrote it (XEP-0045 status 210), or the connection nick
+   * moved on while this room stayed entered. Keyed per room rather than held as one field, so that
+   * one room's nick cannot make this connection's own reflections in every OTHER room fail the
    * provenance check in {@link onGroupchat} — every post there would then stall to its timeout.
    */
   private readonly roomNicks = new Map<string, string>();
@@ -398,6 +423,8 @@ export class XmppPlugin implements BackendPlugin {
     this.mamPage = cfg.mam_page ?? MAM_PAGE;
     this.stopped = false;
     this.nickAdoption = cfg.nick === undefined ? undefined : Promise.resolve();
+    this.adoptedNick = undefined;
+    this.identityCollapseReported = false;
     this.mamCheck = undefined;
 
     const password = cfg.password ?? 'parleypass';
@@ -517,10 +544,10 @@ export class XmppPlugin implements BackendPlugin {
     await this.ensureJoined(args.topic);
     const limit = args.limit ?? 100;
 
-    let items: MamItem[];
+    let items: BodiedItem[];
     if (since === undefined) {
       // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
-      items = (await this.mamQuery(args.topic, { before: true, max: limit })).items;
+      items = (await this.mamQuery(args.topic, { before: true, max: limit })).items.filter(hasBody);
     } else {
       items = await this.exclusiveMam(args.topic, since, limit);
     }
@@ -541,16 +568,20 @@ export class XmppPlugin implements BackendPlugin {
    * Forward, exclusive MAM catch-up strictly after `since`, paged up to `limit`. `since === ''`
    * (the empty archive's zero cursor) means "from the very beginning": the first page omits
    * `<after/>` (guarded in mamQuery), later pages advance on real archive ids.
+   *
+   * Keep the page's UNFILTERED tail as the next `<after/>` and the loop's stop condition, so that a
+   * page made entirely of items the seam does not carry still advances past them — filtering before
+   * that would read as "archive exhausted" and withhold everything behind them forever.
    */
-  private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<MamItem[]> {
-    const items: MamItem[] = [];
+  private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<BodiedItem[]> {
+    const items: BodiedItem[] = [];
     let cursor = since; // may be '' on the first iteration → no <after/> emitted
     while (items.length < limit) {
       const page = await this.mamQuery(topic, {
         after: cursor,
         max: Math.min(this.mamPage, limit - items.length),
       });
-      items.push(...page.items);
+      items.push(...page.items.filter(hasBody));
       if (page.complete || page.items.length === 0) break;
       cursor = page.items[page.items.length - 1]!.archId;
     }
@@ -577,7 +608,7 @@ export class XmppPlugin implements BackendPlugin {
     since: string,
     limit: number,
     blockMs: number,
-  ): Promise<MamItem[]> {
+  ): Promise<BodiedItem[]> {
     const deadline = Date.now() + blockMs;
     const room = this.roomJid(topic);
     let lagPoll = 0;
@@ -877,7 +908,7 @@ export class XmppPlugin implements BackendPlugin {
     collector.items.push({
       archId: result.attrs.id ?? '',
       from: inner.attrs.from ?? '',
-      body: inner.getChildText('body') ?? '',
+      body: inner.getChild('body') === undefined ? null : (inner.getChildText('body') ?? ''),
       stamp: delay?.attrs.stamp,
     });
   }
@@ -977,11 +1008,10 @@ export class XmppPlugin implements BackendPlugin {
     }
   }
 
-  private toMessage(topic: Topic, it: MamItem): Message {
-    const nick = resourceOf(it.from);
+  private toMessage(topic: Topic, it: BodiedItem): Message {
     return buildMessage({
       topic,
-      sender: nick !== '' ? nick : this.handle,
+      sender: senderOf(it.from, this.handle),
       content: it.body,
       timestamp: it.stamp ?? new Date().toISOString(),
       id: it.archId,
@@ -1012,10 +1042,32 @@ export class XmppPlugin implements BackendPlugin {
    * `parley_list_users` roster is built on; a random per-connection nick would make every restart
    * of one bridge a new phantom identity that no one can hand work off to. Rooms already entered
    * under the provisional nick are re-entered under the new one (XEP-0045 §7.6 nick change).
+   *
+   * One connection is one occupant, so a LATER `post` under a different handle is archived under the
+   * adopted nick rather than its own — the collapse this backend declares by answering
+   * `carriesSenderIdentity: false`. It is reported once, because a sender the archive disagrees with
+   * is otherwise indistinguishable from the seam working.
    */
   private adoptIdentityNick(identity: Handle): Promise<void> {
-    this.nickAdoption ??= this.switchNick(nickFor(identity));
+    const wanted = nickFor(identity);
+    if (this.nickAdoption === undefined) {
+      this.adoptedNick = wanted;
+      this.nickAdoption = this.switchNick(wanted);
+    } else if (this.adoptedNick !== undefined && wanted !== this.adoptedNick) {
+      this.reportIdentityCollapse(wanted);
+    }
     return this.nickAdoption;
+  }
+
+  private reportIdentityCollapse(wanted: string): void {
+    if (this.identityCollapseReported) return;
+    this.identityCollapseReported = true;
+    console.error(
+      `[parley-xmpp] this connection posts as '${this.adoptedNick ?? this.nick}' (taken from the ` +
+        `first post's identity.handle), so a post under '${wanted}' is archived — and read back — ` +
+        `as '${this.adoptedNick ?? this.nick}'. One MUC occupant is one sender: run one bridge per ` +
+        'handle, or pin backend_config.nick, if the two must stay distinct.',
+    );
   }
 
   /**
@@ -1035,19 +1087,27 @@ export class XmppPlugin implements BackendPlugin {
 
   /**
    * Fall back to the nick this connection started with when another occupant holds the one it
-   * asked for. Returns whether the nick actually changed — a pinned `backend_config.nick`, or a
-   * conflict on the provisional nick itself, has no fallback left and must surface.
+   * asked for, while `joiningRoom` is the room whose join was answered `conflict`. A pinned
+   * `backend_config.nick`, or a conflict on the provisional nick itself, has no fallback left and
+   * leaves the nick alone so the condition surfaces.
+   *
+   * Every OTHER room this connection already occupies keeps the nick it entered under: it is still
+   * that room's occupant, and dropping the connection-wide nick out from under it would make its own
+   * reflections fail the provenance check in {@link onGroupchat} — every post there would stall to
+   * POST_TIMEOUT_MS with nothing left to re-reconcile it.
    */
-  private revertToProvisionalNick(): boolean {
+  private revertToProvisionalNick(joiningRoom: string): void {
     const provisional = this.provisionalNick;
-    if (provisional === undefined || provisional === this.nick) return false;
+    if (provisional === undefined || provisional === this.nick) return;
     console.error(
       `[parley-xmpp] could not take '${this.nick}' as this connection's MUC nick (another occupant ` +
         `holds it); posting as '${provisional}' instead, so parley_list_users will report that ` +
         'name. Pin backend_config.nick to a free name to fix this permanently.',
     );
+    for (const room of this.joined.keys()) {
+      if (room !== joiningRoom) this.roomNicks.set(room, this.occupantNick(room));
+    }
     this.nick = provisional;
-    return true;
   }
 
   private occupantNick(room: string): string {
@@ -1153,7 +1213,7 @@ export class XmppPlugin implements BackendPlugin {
           continue;
         }
         if (cond === 'conflict' && !nickRetried) {
-          this.revertToProvisionalNick();
+          this.revertToProvisionalNick(room);
           if (this.nick !== usedNick) {
             nickRetried = true;
             continue;

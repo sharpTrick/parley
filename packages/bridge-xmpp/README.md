@@ -19,6 +19,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | cursor / backendMsgId | the `<stanza-id>` / MAM archive id (XEP-0359 / XEP-0313) — identical via live push and via catch-up |
 | `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive); no `since` → empty `<before/>` = last page; pages forward up to `limit` |
 | `subscribe` | every reflected groupchat `<message>` carrying a room `<stanza-id>` → `handler` (incl. own posts), in archive order |
+| admission | a stanza with **no `<body>`** — a subject change, a correction, a retraction, a chat state — is not a message on either path; an *empty* body is |
 | `resolveIdentity` | string convention (handle = backendRef) |
 | sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
 | timestamp | `<delay stamp>` from MAM forwarded messages if present, else now (informational only) |
@@ -112,8 +113,14 @@ catch-up semantics.
   account; two with the same handle are the same sender, which is what "same handle" means. If the
   nick is already taken by someone else in the room, the join is answered `conflict` and the plugin
   logs a loud error and keeps posting under its provisional per-connection nick — the same way
-  whichever seam call hit the conflict first. Pin `nick` to a free name to resolve it permanently; a
-  `conflict` on a **pinned** nick is a misconfiguration and fails the call instead.
+  whichever seam call hit the conflict first. Rooms it had already entered under the other nick stay
+  entered under it (occupancy is per room), so only the room that hit the conflict changes sender.
+  Pin `nick` to a free name to resolve it permanently; a `conflict` on a **pinned** nick is a
+  misconfiguration and fails the call instead.
+- **One bridge is one sender.** A connection is a single MUC occupant, so the occupant nick is taken
+  from the FIRST `post`'s `identity.handle` and a later `post` under a different handle is archived
+  — and read back — under the first one. That collapse is reported once on stderr; run one bridge
+  per handle, or pin `nick`, if two handles must stay distinct.
 - **A nick the server rewrites is adopted.** A nick-locking deployment admits the join under a nick of
   its own choosing and says so with status 210. The occupant nick is tracked **per room** from that
   presence, so this bridge still recognises its own reflections (and reports the nick the room

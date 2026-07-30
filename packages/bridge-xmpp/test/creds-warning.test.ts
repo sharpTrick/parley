@@ -56,7 +56,25 @@ describe('XMPP default-credential warning', () => {
 const PLAINTEXT = ['xmpp://', 'ws://'];
 const ENCRYPTED = ['xmpps://', 'wss://'];
 const LOOPBACK = ['127.0.0.1:5222', 'localhost:5222', '[::1]:5222', '::1', '127.0.0.44'];
-const REMOTE = ['xmpp.example.com:5222', 'xmpp.example.com', '203.0.113.9:5222', '[2001:db8::1]:5222'];
+// Hosts that read as loopback to a PREFIX or substring match but are ordinary registrable names
+// their owner points wherever they like, plus two integer spellings of 127.0.0.1 that are not
+// dotted quads. Every LOOPBACK entry is also probed with a domain suffixed onto it, so a loopback
+// form added above brings its own lookalike with it instead of waiting to be enumerated.
+const LOOKALIKE = [
+  ...LOOPBACK.map((host) => `${host}.evil.example`),
+  '127.evil.com',
+  '127.0.0.1.evil.com',
+  'localhost.evil.com',
+  '0177.0.0.1',
+  '2130706433',
+];
+const REMOTE = [
+  'xmpp.example.com:5222',
+  'xmpp.example.com',
+  '203.0.113.9:5222',
+  '[2001:db8::1]:5222',
+  ...LOOKALIKE,
+];
 
 interface Cell {
   service: string;
@@ -92,6 +110,10 @@ describe('XMPP transport safety', () => {
   it('the plaintext scheme set is exactly xmpp:// and ws://', () => {
     for (const scheme of PLAINTEXT) expect(isPlaintextRemote(`${scheme}remote.example`)).toBe(true);
     for (const scheme of ENCRYPTED) expect(isPlaintextRemote(`${scheme}remote.example`)).toBe(false);
+  });
+
+  it.each(LOOKALIKE)('%s is classified remote, not loopback', (host) => {
+    expect(isPlaintextRemote(`xmpp://${host}`)).toBe(true);
   });
 
   it.each(cells)('$service (password $password) warns as documented', async (cell) => {

@@ -81,6 +81,95 @@ describe('XMPP attributes a bridge to one stable handle across a restart', () =>
   });
 });
 
+// Class: a seam argument honoured on the first call and silently discarded on every later one. One
+// XMPP connection is one MUC occupant, so `post`'s `identity` can only be taken once — which is
+// what `carriesSenderIdentity: false` declares — but a caller that posts under a second handle
+// otherwise gets a success, an archived message attributed to the FIRST handle, and nothing
+// anywhere saying so. The table drives both configurations of the occupant nick and both a
+// differing and a repeated handle, and pins WHICH of them reports.
+interface CollapseRow {
+  name: string;
+  cfg: Partial<XmppBackendConfig>;
+  handles: string[];
+  reports: boolean;
+}
+
+const REPORT = 'is archived — and read back — as';
+
+const collapseRows: CollapseRow[] = [
+  {
+    name: 'nick unset, a second post under a different handle',
+    cfg: {},
+    handles: ['alice', 'bob'],
+    reports: true,
+  },
+  {
+    name: 'nick unset, every post under the same handle',
+    cfg: {},
+    handles: ['alice', 'alice', 'alice'],
+    reports: false,
+  },
+  {
+    // A pinned nick is the operator SAYING the sender is not the handle, and the README documents
+    // it. Reporting here would fire on every post of a configuration that is working as designed.
+    name: 'nick pinned, posts under different handles',
+    cfg: { nick: 'pinned-session' },
+    handles: ['alice', 'bob'],
+    reports: false,
+  },
+];
+
+const postAll = async (
+  cfg: Partial<XmppBackendConfig>,
+  topic: ReturnType<typeof asTopic>,
+  handles: string[],
+): Promise<{ errors: string[]; senders: string[]; contents: string[] }> => {
+  const errors: string[] = [];
+  vi.spyOn(console, 'error').mockImplementation((m) => {
+    errors.push(String(m));
+  });
+  mockState.client = new FakeXmpp();
+  const plugin = new XmppPlugin();
+  await plugin.connect({ password: PASSWORD, ...cfg });
+  try {
+    for (const h of handles) await plugin.post(topic, asHandle(h), `from-${h}`);
+    const read = await plugin.fetchRecent({ topic, limit: 10 });
+    return {
+      errors,
+      senders: read.messages.map((m) => String(m.senderHandle)),
+      contents: read.messages.map((m) => m.content),
+    };
+  } finally {
+    await plugin.disconnect();
+    vi.restoreAllMocks();
+    mockState.client = undefined;
+  }
+};
+
+describe('XMPP reports the identity it collapses onto its one occupant nick', () => {
+  it.each(collapseRows)('$name', async (row) => {
+    const topic = asTopic(`t-collapse-${row.handles.join('-')}-${String(row.cfg.nick)}`);
+    const { errors, senders, contents } = await postAll(row.cfg, topic, row.handles);
+
+    const reported = errors.filter((m) => m.includes(REPORT));
+    expect(reported).toHaveLength(row.reports ? 1 : 0);
+    if (row.reports) for (const h of new Set(row.handles)) expect(reported[0]).toContain(`'${h}'`);
+    // Whatever it reports, the seam contract is unchanged: one occupant is one sender.
+    expect(contents).toEqual(row.handles.map((h) => `from-${h}`));
+    expect(new Set(senders).size).toBe(1);
+  });
+
+  it('reports it once however many further handles arrive', async () => {
+    const { errors } = await postAll({}, asTopic('t-collapse-many'), [
+      'alice',
+      'bob',
+      'carol',
+      'dave',
+    ]);
+    expect(errors.filter((m) => m.includes(REPORT))).toHaveLength(1);
+  });
+});
+
 const serverUp = await canAuth(BASE);
 
 describe.skipIf(!serverUp)('XMPP sender identity against a real MUC archive', () => {
