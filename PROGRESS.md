@@ -25,6 +25,11 @@
   ouroboros's acting rule; the shadow metric is still recorded. Quiescence has never fired — all 14
   targets have returned confirmed findings in all four rounds — and that null result is the finding.
 
+  **Before launching a round: `node scripts/careening-preflight.mjs`** (exit 1 = do not start). The
+  docker daemon died mid-round in rounds 3, 4 and 5; round 5's six service-backed targets reviewed
+  with no servers at all, so its pre-existing count is a floor. Restart with
+  `dockerd &` then `./examples/dev-compose/dev-infra.sh up all`.
+
   Per-round data and the full writeup live in
   `docs/findings/critical-review/2026-07-29-careening/`. Round N's procedure: re-pin worktrees
   (`node scripts/careening-worktrees.mjs setup <sha>`), then

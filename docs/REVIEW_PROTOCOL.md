@@ -88,6 +88,20 @@ Reuse the image and flags from `examples/dev-compose/docker-compose.yml` rather 
 recipe — that file is the canonical setup, and a divergent one tests something the project does not
 ship.
 
+## The services being up is a precondition, and it is CHECKED
+
+Run `node scripts/careening-preflight.mjs` before launching a round; a non-zero exit means the round
+must not start. It verifies the docker daemon and that all six services answer on loopback.
+
+This exists because the daemon died mid-round three times in five rounds, and each time the critics
+carried on without their servers and reported it only in prose — where the operator finds it after
+the round has already been paid for. Round 5's six service-backed targets reviewed against source and
+fakes alone, which makes its pre-existing-defect count a floor rather than a measurement.
+
+A round that LOSES the services partway cannot be detected by a preflight. If a critic reports a
+missing service, the round is degraded: say so in the data, and treat its pre-existing count as a
+lower bound rather than re-running it, unless the tokens are cheaper than the uncertainty.
+
 ## The test suite's green state is GIVEN
 
 The suite is green before a round is launched; that is a precondition, not a question. **Do not
