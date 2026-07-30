@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asCursor, asHandle, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it } from 'vitest';
+import { openDriver } from '../src/driver.js';
 import { SqlitePlugin } from '../src/index.js';
+import { SCHEMA, STORE_ID_KEY } from '../src/schema.js';
 
 /**
  * Core's read-state outlives the database, so `since` can name a store that no longer exists: a
@@ -345,4 +347,72 @@ describe('a malformed cursor throws instead of silently matching nothing', () =>
       );
     });
   }
+});
+
+/**
+ * The table above grades what this backend REJECTS; nothing grades what it MINTS against the same
+ * grammar. `parley_meta.store_id` is a persisted string, prefixed onto every cursor and never
+ * checked on the way in — so a value the parser cannot place makes the plugin hand out cursors it
+ * rejects on the next catch-up. That is fatal rather than degraded: catch-up-on-start propagates
+ * the throw, and re-minting reproduces the same unparseable prefix, so every bridge sharing the
+ * file fails to start until the row is repaired. Reachable from a hand edit, a restore or
+ * migration tool, or any peer with write access to the shared store.
+ */
+const PLANTED_STORE_IDS: Array<{ name: string; value: string }> = [
+  { name: 'empty', value: '' },
+  { name: 'not hex at all', value: 'legacy-store' },
+  { name: 'uppercase hex', value: 'AABBCCDDEEFF0011' },
+  { name: 'hex carrying the cursor separator', value: 'de.adbeef' },
+  { name: 'one digit short', value: '0123456789abcde' },
+  { name: 'one digit long', value: '0123456789abcdef0' },
+  { name: 'far too long', value: 'a'.repeat(64) },
+  { name: 'a single non-hex letter', value: '0123456789abcdeg' },
+  { name: 'well-formed (the control)', value: 'deadbeefcafe0123' },
+];
+
+function plantStoreId(path: string, value: string): void {
+  const d = openDriver(path, {});
+  try {
+    d.exec(SCHEMA);
+    d.prepare('INSERT OR REPLACE INTO parley_meta (key, value) VALUES (?, ?)').run(
+      STORE_ID_KEY,
+      value,
+    );
+  } finally {
+    d.close();
+  }
+}
+
+describe('a cursor this backend mints is always a cursor this backend accepts', () => {
+  for (const { name, value } of PLANTED_STORE_IDS) {
+    it(`store_id ${name}: connect refuses it by name, or every cursor it mints round-trips`, async () => {
+      const path = dbPath();
+      plantStoreId(path, value);
+
+      const p = new SqlitePlugin();
+      try {
+        await p.connect({ db_path: path, poll_interval_ms: 20 });
+      } catch (e) {
+        expect(String(e)).toMatch(new RegExp(`parley_meta\\.${STORE_ID_KEY}`));
+        return;
+      }
+      open.push(p);
+
+      await fill(p, T, ['m0', 'm1']);
+      const page = await p.fetchRecent({ topic: T });
+      const empty = await p.fetchRecent({ topic: asTopic('never-written') });
+      const minted = [...page.messages.map((m) => m.cursor), page.nextCursor, empty.nextCursor];
+      for (const since of minted) {
+        await expect(p.fetchRecent({ topic: T, since })).resolves.toBeDefined();
+      }
+    });
+  }
+
+  it('the control store id is the one that connects, so the table is not "refuse everything"', async () => {
+    const path = dbPath();
+    plantStoreId(path, 'deadbeefcafe0123');
+    const p = await plugin(path);
+    await fill(p, T, ['m0']);
+    expect((await p.fetchRecent({ topic: T })).nextCursor).toBe('deadbeefcafe0123.1');
+  });
 });

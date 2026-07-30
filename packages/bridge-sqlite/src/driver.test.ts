@@ -259,3 +259,44 @@ describe.skipIf(BetterCtor === null)('openDriver surfaces the real open error', 
     expect(elapsed).toBeLessThan(150);
   });
 });
+
+/**
+ * The fallback is only reachable now that better-sqlite3 is an OPTIONAL dependency, so a skipped
+ * install silently lands an operator on the slower experimental driver. Grade the announcement,
+ * not just the substitution: without a line on stderr the only symptom is the performance.
+ */
+describe('the node:sqlite fallback announces itself', () => {
+  it.each([
+    ['MODULE_NOT_FOUND', 'MODULE_NOT_FOUND'],
+    ['ERR_DLOPEN_FAILED', 'ERR_DLOPEN_FAILED'],
+  ])('says so on stderr when better-sqlite3 fails to load with %s', async (_label, code) => {
+    const mod = await import('node:module');
+    const loader = mod.default as unknown as {
+      _load(req: string, ...rest: unknown[]): unknown;
+    };
+    const original = loader._load;
+    loader._load = function (req: string, ...rest: unknown[]): unknown {
+      if (req === 'better-sqlite3') {
+        const e = new Error(`stubbed ${code}`) as NodeJS.ErrnoException;
+        e.code = code;
+        throw e;
+      }
+      return original.call(this, req, ...rest);
+    };
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.resetModules();
+    try {
+      const { openDriver: fresh } = await import('./driver.js');
+      const driver = fresh(':memory:');
+      expect(driver.kind).toBe('node:sqlite');
+      const said = spy.mock.calls.map((c) => String(c[0])).join('');
+      expect(said).toMatch(/better-sqlite3 unavailable/);
+      expect(said).toMatch(/node:sqlite/);
+      driver.close();
+    } finally {
+      loader._load = original;
+      spy.mockRestore();
+      vi.resetModules();
+    }
+  });
+});

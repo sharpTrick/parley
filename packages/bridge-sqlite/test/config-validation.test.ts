@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic, type BackendConfig } from '@sharptrick/parley-core';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { SqlitePlugin } from '../src/index.js';
+import { MAX_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS, SqlitePlugin } from '../src/index.js';
 
 /**
  * `backend_config` is untyped YAML from an operator. Every knob is validated before the database
@@ -129,6 +129,42 @@ describe('connect() rejects every bad backend_config value', () => {
     const { messages } = await reader.fetchRecent({ topic: T });
     expect(messages.map((m) => m.content)).toEqual(['precious']);
   });
+});
+
+/**
+ * `BAD_VALUES` only ever probes a bound from far outside it (`1e308`), which any ceiling at all
+ * rejects — so a bound could be re-tuned to a value that breaks what it exists to prevent and
+ * nothing above would notice. These edges are READ FROM the exported constants rather than
+ * restated, so re-tuning one re-grades its own accept/reject edge and a new bounded key is graded
+ * by adding a row rather than by remembering to hand-pick four more literals.
+ */
+const BOUNDED_KEYS: Array<{ key: string; min: number; max: number; step: number }> = [
+  { key: 'poll_interval_ms', min: MIN_POLL_INTERVAL_MS, max: MAX_POLL_INTERVAL_MS, step: 1 },
+];
+
+describe('every bounded knob is graded at its own edges', () => {
+  for (const { key, min, max, step } of BOUNDED_KEYS) {
+    for (const value of [min, Math.floor((min + max) / 2), max]) {
+      it(`${key} = ${value} is accepted`, async () => {
+        await inScratchCwd(async () => {
+          const p = new SqlitePlugin();
+          open.push(p);
+          const cfg = { db_path: dbFile(), [key]: value } as unknown as BackendConfig;
+          await expect(p.connect(cfg)).resolves.toBeUndefined();
+        });
+      });
+    }
+
+    for (const value of [min - step, max + step]) {
+      it(`${key} = ${value} is rejected, naming both bounds`, async () => {
+        const p = new SqlitePlugin();
+        const cfg = { db_path: dbFile(), [key]: value } as unknown as BackendConfig;
+        await expect(p.connect(cfg)).rejects.toThrow(
+          new RegExp(`parley-sqlite: invalid backend_config\\.${key}.*${min}.*${max}`),
+        );
+      });
+    }
+  }
 });
 
 /**

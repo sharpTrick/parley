@@ -42,7 +42,9 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@sharptrick/parley-core": "^0.1.0",
+    "@sharptrick/parley-core": "^0.1.0"
+  },
+  "optionalDependencies": {
     "better-sqlite3": "^12"
   },
   "devDependencies": {

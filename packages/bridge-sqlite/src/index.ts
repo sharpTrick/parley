@@ -51,7 +51,7 @@ export interface SqliteBackendConfig {
 /** How many new rows a single poll tick drains at most before yielding. */
 export const POLL_BATCH = 512;
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the poll interval. */
-const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+export const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 /**
  * Rows one prune statement deletes. Keep it bounded, so that neither the event loop nor the
  * file's single write lock is held for a duration that scales with the store — past a peer's
@@ -138,7 +138,7 @@ export class SqlitePlugin implements BackendPlugin {
     try {
       driver.exec(SCHEMA);
       prepared = prepare(driver);
-      storeId = readOrMintStoreId(driver);
+      storeId = readOrMintStoreId(driver, dbPath);
     } catch (e) {
       // Keep connect() all-or-nothing: close the handle and leave every field untouched, so that a
       // failed connect neither leaks a driver per attempt nor leaves an instance that answers
@@ -485,11 +485,18 @@ function describe(v: unknown): string {
 }
 
 /**
+ * Shape of `parley_meta.store_id`. Keep the mint side, the parse side and the connect-time check
+ * deriving from THIS one pattern, so that the plugin cannot mint a cursor its own parser rejects.
+ */
+const STORE_ID_PATTERN = '[0-9a-f]{16}';
+const STORE_ID_RE = new RegExp(`^${STORE_ID_PATTERN}$`);
+
+/**
  * A cursor is `<storeId>.<rowid>`. A bare `<rowid>` parses with no store id — this backend before
  * cursors carried identity, or another backend's numeric cursor — and names nothing here, so
  * `resumeAfter` replays instead of trusting it.
  */
-const CURSOR_RE = /^(?:([0-9a-f]{16})\.)?(\d+)$/;
+const CURSOR_RE = new RegExp(`^(?:(${STORE_ID_PATTERN})\\.)?(\\d+)$`);
 
 function parseCursor(raw: string): { storeId?: string; rowid: bigint } | undefined {
   const m = CURSOR_RE.exec(raw);
@@ -511,9 +518,12 @@ function prepare(driver: SqlDriver): PreparedStatements {
 
 /**
  * This store's identity, minted once and persisted. `INSERT OR IGNORE` then read back, so that
- * two bridge processes racing a brand-new file agree on whichever id landed first.
+ * two bridge processes racing a brand-new file agree on whichever id landed first. The read-back
+ * is checked against the cursor grammar rather than trusted: it is written into every cursor this
+ * store mints, so a value the parser cannot place would make the plugin mint cursors it rejects on
+ * the next catch-up — which core propagates, so every bridge sharing the file fails to start.
  */
-function readOrMintStoreId(driver: SqlDriver): string {
+function readOrMintStoreId(driver: SqlDriver, dbPath: string): string {
   driver
     .prepare('INSERT OR IGNORE INTO parley_meta (key, value) VALUES (?, ?)')
     .run(STORE_ID_KEY, randomBytes(8).toString('hex'));
@@ -522,6 +532,15 @@ function readOrMintStoreId(driver: SqlDriver): string {
     | undefined;
   if (row === undefined) {
     throw new Error('parley-sqlite: could not establish a store id in parley_meta');
+  }
+  if (!STORE_ID_RE.test(row.value)) {
+    throw new Error(
+      `parley-sqlite: ${dbPath} carries an unusable parley_meta.${STORE_ID_KEY} ` +
+        `${describe(row.value)} — expected ${STORE_ID_PATTERN}. Every cursor this backend mints ` +
+        `carries it, so this store would hand out cursors its own parser rejects; restore the ` +
+        `original value, or delete the row to mint a fresh identity (readers then replay rather ` +
+        `than skip)`,
+    );
   }
   return row.value;
 }

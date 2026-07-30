@@ -131,7 +131,13 @@ function openConnection(path: string): SqlDriver {
   }
   try {
     const mod = require('node:sqlite') as { DatabaseSync: new (p: string) => RawDb };
-    return wrap('node:sqlite', new mod.DatabaseSync(path));
+    const driver = wrap('node:sqlite', new mod.DatabaseSync(path));
+    // Announce the substitution, so that an operator whose optional install was skipped learns it
+    // from a line rather than from the performance difference.
+    process.stderr.write(
+      'parley-sqlite: better-sqlite3 unavailable; using the node:sqlite fallback driver\n',
+    );
+    return driver;
   } catch (e) {
     // The native module was absent AND the builtin fallback also failed → surface the fallback
     // failure WITH the original error attached as `cause`, not in place of it.

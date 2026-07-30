@@ -10,6 +10,7 @@ import {
   MIN_POLL_INTERVAL_MS,
   POLL_BATCH,
   PRUNE_BATCH,
+  PRUNE_INTERVAL_MS,
   SqlitePlugin,
 } from '../src/index.js';
 import { SQL } from '../src/schema.js';
@@ -361,6 +362,133 @@ describe('background jobs do bounded work per statement', () => {
     // Batches are separate turns of the loop, so the heartbeat ran while the store was draining.
     expect(ticks).toBeGreaterThan(0);
   });
+});
+
+/**
+ * Both background jobs take a cadence from configuration, and validating one is not observing it.
+ * Every latency assertion in this file is an UPPER bound, so a loop that ignored `poll_interval_ms`
+ * and rescheduled at 0 — re-querying the shared file per topic per process about a thousand times a
+ * second, contending for the WAL read lock with every peer's `post()` — would pass all of them, and
+ * pass them harder. These two tables grade the interval a configured value actually produces: for
+ * the poll loop, that ticks track the configured cadence in BOTH directions; for the prune, that
+ * the timer firing prunes again rather than merely existing with the right argument.
+ */
+
+interface Cadence {
+  pollIntervalMs: number;
+  /** Rows written after `subscribe`, drained before the quiet window is measured. */
+  backlog: number;
+}
+
+/**
+ * `MAX_POLL_INTERVAL_MS` is in the table because the ceiling exists to keep `setTimeout` from
+ * silently clamping an over-32-bit delay to 1 ms: raising it turns the slowest configurable poll
+ * into the hot loop it is there to prevent, which shows up here as ticks in a quiet window.
+ */
+const CADENCE: Cadence[] = [
+  { pollIntervalMs: MIN_POLL_INTERVAL_MS, backlog: 0 },
+  { pollIntervalMs: 50, backlog: 0 },
+  { pollIntervalMs: 200, backlog: 0 },
+  { pollIntervalMs: 200, backlog: POLL_BATCH },
+  { pollIntervalMs: 250, backlog: POLL_BATCH + 1 },
+  { pollIntervalMs: 60_000, backlog: 0 },
+  { pollIntervalMs: MAX_POLL_INTERVAL_MS, backlog: 0 },
+];
+
+describe('the poll loop runs at the interval it was configured with', () => {
+  const WINDOW_MS = 600;
+
+  /** One tick = one `selectAfter`, so counting the statement counts ticks. */
+  function countSelects(p: SqlitePlugin): () => number {
+    const holder = p as unknown as { selectAfterStmt: Stmt };
+    const real = holder.selectAfterStmt;
+    let calls = 0;
+    holder.selectAfterStmt = {
+      all: (...a: unknown[]) => {
+        calls++;
+        return real.all(...a);
+      },
+      get: (...a: unknown[]) => real.get(...a),
+      run: (...a: unknown[]) => real.run(...a),
+    };
+    return () => calls;
+  }
+
+  for (const { pollIntervalMs, backlog } of CADENCE) {
+    it(`${pollIntervalMs} ms with ${backlog} rows pending: ticks track the interval`, async () => {
+      const p = new SqlitePlugin();
+      open.push(p);
+      await p.connect({ db_path: dbFile(), poll_interval_ms: pollIntervalMs });
+
+      const got: string[] = [];
+      let firstAt = 0;
+      await p.subscribe(T, (m) => {
+        firstAt ||= Date.now();
+        got.push(m.content);
+      });
+      const selects = countSelects(p);
+
+      if (backlog > 0) {
+        const stmt = (p as unknown as { insertStmt: Stmt }).insertStmt;
+        const ts = new Date().toISOString();
+        const expected = Array.from({ length: backlog }, (_u, i) => `m${i}`);
+        for (const c of expected) stmt.run(T, me, c, ts, null);
+        await vi.waitFor(() => expect(got).toHaveLength(backlog), { timeout: 10_000, interval: 5 });
+        expect(got).toEqual(expected);
+        await new Promise((r) => setTimeout(r, 5));
+        // A tick that fills its batch drains again at once, so the whole backlog lands in one
+        // burst and a full batch is always followed by another query before the interval elapses.
+        expect(Date.now() - firstAt).toBeLessThan(pollIntervalMs);
+        expect(selects()).toBeGreaterThanOrEqual(Math.floor(backlog / POLL_BATCH) + 1);
+      }
+
+      const before = selects();
+      await new Promise((r) => setTimeout(r, WINDOW_MS));
+      const ticks = selects() - before;
+      const nominal = WINDOW_MS / pollIntervalMs;
+      expect(ticks).toBeLessThanOrEqual(Math.floor(nominal) + 2);
+      expect(ticks).toBeGreaterThanOrEqual(Math.floor(nominal / 2));
+    });
+  }
+});
+
+/**
+ * `retention_days` is what an operator sets; {@link PRUNE_INTERVAL_MS} is how often the promise is
+ * kept. index.test.ts pins the argument handed to `setInterval` — which a timer that fires into a
+ * no-op, or a one-shot that prunes only at connect, satisfies just as well. What an operator
+ * observes is a row that goes stale AFTER a prune and is gone by the next one.
+ */
+describe('the retention prune re-runs on its cadence, not only at connect', () => {
+  const windowMs = PRUNE_INTERVAL_MS / 2;
+
+  async function contents(p: SqlitePlugin): Promise<string[]> {
+    return (await p.fetchRecent({ topic: T })).messages.map((m) => m.content);
+  }
+
+  for (const nth of [1, 2, 3]) {
+    it(`a row written after prune #${nth - 1} survives until prune #${nth} and no longer`, async () => {
+      vi.useFakeTimers();
+      const p = new SqlitePlugin();
+      open.push(p);
+      try {
+        await p.connect({
+          db_path: dbFile(),
+          poll_interval_ms: 1000,
+          retention_days: windowMs / 86_400_000,
+        });
+        await vi.advanceTimersByTimeAsync((nth - 1) * PRUNE_INTERVAL_MS);
+        await p.post(T, me, 'written-between-prunes');
+
+        await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS - 1);
+        expect(await contents(p)).toEqual(['written-between-prunes']);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await contents(p)).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
 });
 
 /**

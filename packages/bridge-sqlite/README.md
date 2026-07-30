@@ -180,8 +180,11 @@ the usual cause is a second bridge running as a different UID — that is report
 leaving the deployment to assume the store is protected.
 
 The driver prefers the mature native **`better-sqlite3`**, falling back to Node's built-in
-**`node:sqlite`** if the native module fails to load (no prebuilt binary for your platform/ABI and
-no toolchain to build one). Both are synchronous and support the same PRAGMAs; the plugin code
+**`node:sqlite`** if the native module fails to load — either because it is absent (it is an
+**`optionalDependency`**, so an install that finds no prebuilt binary for your platform/ABI and no
+toolchain to build one skips it and carries on instead of aborting) or because it stopped loading
+against this Node (an ABI mismatch after a major upgrade). Both are synchronous and support the
+same PRAGMAs; the plugin code
 above the driver doesn't care which one is active. `test/driver-parity.test.ts` grades **both**
 drivers on one set of assertions — pragma read-back, at-rest mode, insert-result shape and a full
 seam round-trip — with the fallback forced, so that parity is a checked claim rather than a
