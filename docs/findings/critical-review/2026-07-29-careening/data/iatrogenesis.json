@@ -54,5 +54,40 @@
       "method": "post-hoc hand-label by the same agent that authored the fixes being judged",
       "note": "ouroboros's own corrections section flagged this as its weakest number"
     }
+  },
+  "blockingOnly": {
+    "method": "Same git-blame oracle, restricted to CONFIRMED findings of severity=blocking \u2014 the ones that gate the stop rule and represent real risk.",
+    "why": "Overall iatrogenesis mixes suggestions and blocking findings. The blocking split is what says whether the loop is still finding things that MATTER in the original codebase, or is now mostly finding and fixing its own.",
+    "rounds": [
+      {
+        "round": 2,
+        "blocking": 49,
+        "selfInduced": 13,
+        "preExisting": 36,
+        "selfInducedPct": 27
+      },
+      {
+        "round": 3,
+        "blocking": 38,
+        "selfInduced": 13,
+        "preExisting": 25,
+        "selfInducedPct": 34
+      },
+      {
+        "round": 4,
+        "blocking": 45,
+        "selfInduced": 25,
+        "preExisting": 20,
+        "selfInducedPct": 56
+      },
+      {
+        "round": 5,
+        "blocking": 39,
+        "selfInduced": 28,
+        "preExisting": 11,
+        "selfInducedPct": 72
+      }
+    ],
+    "reading": "Pre-existing BLOCKING findings fall 36 -> 25 -> 20 -> 11 while the blocking total stays roughly flat (49, 38, 45, 39). The loop's blocking output is therefore increasingly self-referential: by round 5, 72% of blocking findings are against lines the experiment itself wrote. Round 5's figure is additionally distorted upward because six service-backed targets reviewed without live servers, so genuinely pre-existing live-only defects could not surface."
   }
 }
