@@ -207,10 +207,13 @@ Three tiers cover this mode:
   RS256 JWTs — valid/expired/wrong-aud/wrong-iss/rogue-key tokens, scope and identity gates,
   and full MCP tool calls through the real SDK client. `examples/self-host-remote/test/oidc-smoke.test.ts`
   boots the reference server from YAML alone.
-- **Gated, real Keycloak:** `packages/bridge-core/src/auth/keycloak.e2e.test.ts` self-skips
-  unless a realm answers at `http://127.0.0.1:8080/realms/parley` (override with
-  `PARLEY_KEYCLOAK_URL`). Stand one up with the maintainer dev compose — realm, users, roles,
-  and the audience mapper are imported automatically:
+- **Gated, real Keycloak:** `packages/bridge-core/src/auth/keycloak.e2e.test.ts` runs whenever a
+  realm answers at `http://127.0.0.1:8080/realms/parley` (override with `PARLEY_KEYCLOAK_URL`).
+  It does **not** skip itself when one does not: after waiting 30s for the realm it FAILS, so an
+  unreachable IdP turns the run red instead of quietly verifying nothing. The only way out is the
+  deliberate opt-out `PARLEY_E2E=0`. CI starts keycloak in its dev-compose step, so the gate is
+  always live there. Stand one up with the maintainer dev compose — realm, users, roles, and the
+  audience mapper are imported automatically:
 
   ```bash
   docker compose -f examples/dev-compose/docker-compose.yml up -d keycloak

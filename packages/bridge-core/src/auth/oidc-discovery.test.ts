@@ -72,12 +72,6 @@ const DISCOVERY_CASES: DiscoveryCase[] = [
     outcome: /returned HTTP 500/,
   },
   {
-    name: 'HTTP 302 redirecting the trust root to another origin',
-    respond: () =>
-      new Response(null, { status: 302, headers: { location: `${EVIL}/.well-known/x` } }),
-    outcome: /returned HTTP 302/,
-  },
-  {
     name: 'the body is not JSON at all',
     respond: () => new Response('<html>login</html>', { status: 200 }),
     outcome: /invalid document/,
@@ -186,9 +180,41 @@ describe('fetchOidcDiscovery — the request itself', () => {
     },
   );
 
-  it('refuses to follow a redirect rather than letting one reposition the trust root', async () => {
-    const { fetchFn, calls } = recording(() => json(metadataFor(ISSUER)));
-    await fetchOidcDiscovery(ISSUER, fetchFn);
-    expect(calls[0]?.init?.redirect).toBe('manual');
-  });
+  /**
+   * A stub that HONOURS `init.redirect` the way a user agent does, because asserting the literal
+   * option pins the flag and not its effect: swap the fetch for a wrapper that drops the option and
+   * the flag assertion still passes while the trust root moves. When the option is not 'manual' the
+   * redirect target answers with a document naming the CONFIGURED issuer, so nothing downstream of
+   * the fetch — least of all the issuer check — can tell it from a direct answer.
+   */
+  const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+
+  function redirectHonouring(status: number): Recorder {
+    return recording((url) => {
+      if (url.startsWith(EVIL)) return json(metadataFor(ISSUER));
+      return new Response(null, {
+        status,
+        headers: { location: `${EVIL}/.well-known/openid-configuration` },
+      });
+    });
+  }
+
+  it.each(REDIRECT_STATUSES.map((s) => [s]))(
+    'an HTTP %i cannot reposition the trust root on another origin',
+    async (status: number) => {
+      const { fetchFn, calls } = redirectHonouring(status);
+      const honoured = (async (input: unknown, init?: RequestInit) => {
+        const res = await fetchFn(input as string, init);
+        if (init?.redirect === 'manual' || res.status < 300 || res.status > 399) return res;
+        const location = res.headers.get('location');
+        if (location === null) return res;
+        return fetchFn(location, init);
+      }) as unknown as typeof fetch;
+
+      await expect(fetchOidcDiscovery(ISSUER, honoured)).rejects.toThrow(
+        new RegExp(`returned HTTP ${status}`),
+      );
+      expect(calls.map((c) => c.url)).toEqual([`${ISSUER}/.well-known/openid-configuration`]);
+    },
+  );
 });

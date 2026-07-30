@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 const AUTH_DIR = fileURLToPath(new URL('.', import.meta.url));
 const CORE_SRC = fileURLToPath(new URL('..', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 
 function tsFiles(dir: string, recurse = false): string[] {
   const out: string[] = [];
@@ -129,6 +130,71 @@ describe('no suite may skip itself into green', () => {
       expect(source, `${file} selects a skip without an explicit env opt-out`).toMatch(
         /process\.env\./,
       );
+    },
+  );
+});
+
+function filesUnder(dir: string, ending: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) {
+      continue;
+    }
+    const path = `${dir}${entry.name}`;
+    if (entry.isDirectory()) out.push(...filesUnder(`${path}/`, ending));
+    else if (entry.name.endsWith(ending)) out.push(path);
+  }
+  return out;
+}
+
+/**
+ * The gate above is only half of the promise: the other half is what the docs tell a contributor
+ * it does. A paragraph claiming an e2e suite skips itself, while the suite fails instead, sends
+ * someone to debug a red run the doc told them could not happen — so a paragraph naming a suite
+ * may talk about skipping only if it also names every switch that suite reads. Driven off the file
+ * list rather than a hardcoded pair, a new e2e suite and a new doc are covered the day they land.
+ * docs/findings/ is excluded: those files are a frozen record of what a reviewer said, not a claim
+ * this repo is making.
+ */
+describe('no doc describes an e2e gate the suite does not implement', () => {
+  const suites = filesUnder(`${REPO_ROOT}packages/`, '.e2e.test.ts');
+  const docs = filesUnder(REPO_ROOT, '.md').filter((f) => !f.includes('/docs/findings/'));
+
+  it('finds the e2e suites and the docs that could describe them', () => {
+    expect(suites.length).toBeGreaterThan(0);
+    expect(docs.length).toBeGreaterThan(5);
+  });
+
+  const REFERENCES = suites.flatMap((suite) => {
+    const rel = suite.slice(REPO_ROOT.length);
+    const switches = [
+      ...new Set(
+        [...readFileSync(suite, 'utf8').matchAll(/process\.env\.(\w+)/g)].map((m) => m[1]!),
+      ),
+    ];
+    return docs.flatMap((doc) =>
+      readFileSync(doc, 'utf8')
+        .split(/\n[ \t]*\n/)
+        .map((paragraph, i): [string, string[], string] => [
+          `${doc.slice(REPO_ROOT.length)} paragraph ${i} on ${rel}`,
+          switches,
+          paragraph,
+        ])
+        .filter(([, , paragraph]) => paragraph.includes(rel)),
+    );
+  });
+
+  it('finds at least one doc paragraph naming an e2e suite', () => {
+    expect(REFERENCES.length).toBeGreaterThan(0);
+  });
+
+  it.each(REFERENCES)(
+    '%s names every env switch it gates on, if it claims a skip at all',
+    (_name: string, switches: string[], paragraph: string) => {
+      if (!/\bskip/i.test(paragraph)) return;
+      for (const name of switches) {
+        expect(paragraph, `claims a skip without naming ${name}`).toContain(name);
+      }
     },
   );
 });

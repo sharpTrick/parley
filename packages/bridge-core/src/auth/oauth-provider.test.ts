@@ -984,16 +984,79 @@ describe('ParleyOAuthProvider — nothing it hands out is a handle on its own st
 });
 
 describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in use', () => {
-  const ACTIVE_SHAPES = [
-    ['access token only', (p: ParleyOAuthProvider, rt: string) => peek(p).refresh.delete(rt)],
-    ['refresh token only', (p: ParleyOAuthProvider, _rt: string, at?: string) =>
-      peek(p).access.delete(at ?? '')],
-    ['both halves live', () => undefined],
-  ] as const;
+  /**
+   * Every state the provider keys by client_id, one row per store — including the ones that exist
+   * before a token does. A table enumerating only token-holding shapes cannot see an eviction
+   * predicate that scans only the token maps, and that is the whole window an owner's consent
+   * lives in.
+   */
+  interface ClientState {
+    name: string;
+    stores: readonly string[];
+    seed: (p: ParleyOAuthProvider, client: OAuthClientInformationFull) => Promise<void>;
+  }
 
-  it.each(ACTIVE_SHAPES.map(([label, prune]) => [label, prune]))(
-    'a consented client holding %s survives unauthenticated registration spam',
-    async (_label: string, prune: (p: ParleyOAuthProvider, rt: string, at?: string) => unknown) => {
+  const CLIENT_STATES: ClientState[] = [
+    {
+      name: 'a consent awaiting the owner passphrase',
+      stores: ['pending'],
+      seed: async (p, c) => {
+        await p.authorize(c, makeParams(), fakeRes());
+      },
+    },
+    {
+      name: 'an owner-approved code not yet exchanged',
+      stores: ['codes'],
+      seed: async (p, c) => {
+        await mintCode(p, c, makeParams());
+      },
+    },
+    {
+      name: 'a code mid-redemption at /token',
+      stores: ['redeeming'],
+      seed: async (p, c) => {
+        await p.challengeForAuthorizationCode(c, await mintCode(p, c, makeParams()));
+      },
+    },
+    {
+      name: 'an access token alone',
+      stores: ['access'],
+      seed: async (p, c) => {
+        peek(p).refresh.delete(issuePair(p, c).refresh);
+      },
+    },
+    {
+      name: 'a refresh token alone',
+      stores: ['refresh'],
+      seed: async (p, c) => {
+        peek(p).access.delete(issuePair(p, c).access);
+      },
+    },
+    {
+      name: 'both token halves',
+      stores: ['access', 'refresh'],
+      seed: async (p, c) => {
+        issuePair(p, c);
+      },
+    },
+  ];
+
+  // A store the provider gains but this table never seeds is a state the cap may silently evict.
+  it('CLIENT_STATES covers every client-keyed store the provider declares', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('./oauth-provider.ts', import.meta.url)),
+      'utf8',
+    );
+    const declared = [...source.matchAll(/private readonly (\w+) = new Map/g)].map((m) => m[1]!);
+    expect(declared).toContain('clients');
+    const keyedByClient = declared.filter((n) => n !== 'clients').sort();
+    const seeded = [...new Set(CLIENT_STATES.flatMap((s) => s.stores))].sort();
+    expect(seeded).toEqual(keyedByClient);
+  });
+
+  it.each(CLIENT_STATES.map((s) => [s.name, s]))(
+    'a client holding only %s survives unauthenticated registration spam',
+    async (_label: string, state: ClientState) => {
       const p = makeProvider(() => 2_500_000);
       const store = p.clientsStore;
       const register = store.registerClient;
@@ -1001,8 +1064,7 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
 
       const owner = makeClient('legit-claude');
       register(owner);
-      const pair = issuePair(p, owner);
-      prune(p, pair.refresh, pair.access);
+      await state.seed(p, owner);
 
       for (let i = 0; i < 150; i++) {
         register({ client_id: `spam-${i}`, redirect_uris: [REDIRECT] } as OAuthClientInformationFull);
@@ -1011,6 +1073,29 @@ describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in u
       expect(store.getClient('legit-claude')).toBeDefined();
       expect(peek(p).clients.size).toBeLessThanOrEqual(100); // the cap still holds
       expect(store.getClient('spam-0')).toBeUndefined(); // inactive registrations are still shed
+    },
+  );
+
+  // The mirror of the rows above: state the provider has already let expire must stop pinning the
+  // registration, or a lapsed consent becomes a permanent slot leak an attacker can farm.
+  it.each(CLIENT_STATES.map((s) => [s.name, s]))(
+    'a client whose %s has expired becomes evictable again',
+    async (_label: string, state: ClientState) => {
+      let clock = 3_000_000;
+      const p = makeProvider(() => clock);
+      const register = p.clientsStore.registerClient;
+      if (register === undefined) throw new Error('registerClient not implemented');
+
+      const stale = makeClient('stale-client');
+      register(stale);
+      await state.seed(p, stale);
+      clock += 40 * 24 * 60 * 60 * 1000; // past every TTL this provider mints
+
+      for (let i = 0; i < 150; i++) {
+        register({ client_id: `later-${i}`, redirect_uris: [REDIRECT] } as OAuthClientInformationFull);
+      }
+
+      expect(p.clientsStore.getClient('stale-client')).toBeUndefined();
     },
   );
 

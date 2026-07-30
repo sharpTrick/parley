@@ -132,13 +132,25 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     this.clients.clear();
   }
 
-  private hasLiveCredential(clientId: string): boolean {
-    const nowMs = this.now();
+  // Keep every client-keyed store listed here, so that a state the owner holds BEFORE any token
+  // exists — a consent awaiting their passphrase, an approved code not yet exchanged — still
+  // protects their registration from the eviction below.
+  private *clientStates(): Iterable<{ clientId: string; expiresAtMs: number }> {
     for (const r of this.access.values()) {
-      if (r.clientId === clientId && r.expiresAt >= nowMs / 1000) return true;
+      yield { clientId: r.clientId, expiresAtMs: r.expiresAt * 1000 };
     }
-    for (const r of this.refresh.values()) {
-      if (r.clientId === clientId && r.expiresAtMs >= nowMs) return true;
+    for (const r of this.refresh.values()) yield r;
+    for (const r of this.codes.values()) yield r;
+    for (const r of this.redeeming.values()) yield r;
+    for (const r of this.pending.values()) {
+      yield { clientId: r.client.client_id, expiresAtMs: r.expiresAtMs };
+    }
+  }
+
+  private hasClientState(clientId: string): boolean {
+    const nowMs = this.now();
+    for (const state of this.clientStates()) {
+      if (state.clientId === clientId && state.expiresAtMs >= nowMs) return true;
     }
     return false;
   }
@@ -150,9 +162,9 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       registerClient: (client) => {
         const full = client as OAuthClientInformationFull;
         if (!this.clients.has(full.client_id) && this.clients.size >= MAX_CLIENTS) {
-          // Only ever evict a client with no live token, so that unauthenticated DCR spam
+          // Only ever evict a client with no live grant state, so that unauthenticated DCR spam
           // cannot push the owner's consented client out of the map and lock them out.
-          const evictable = [...this.clients.keys()].find((id) => !this.hasLiveCredential(id));
+          const evictable = [...this.clients.keys()].find((id) => !this.hasClientState(id));
           if (evictable === undefined) {
             throw new TemporarilyUnavailableError('client registration capacity reached');
           }

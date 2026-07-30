@@ -1,7 +1,7 @@
 import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { STATUS_CODES } from 'node:http';
-import express from 'express';
+import express, { type Response as ExpressResponse } from 'express';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -274,6 +274,47 @@ interface ErrorShape {
   status: number;
 }
 
+/**
+ * The other axis of the same handler: WHEN the error arrives. Past the first byte the handler can
+ * no longer render anything, and attempting to must not raise a second error that displaces the
+ * original — the only report of the real failure — in the operator's log.
+ */
+interface ErrorTiming {
+  name: string;
+  /** Leaves the response in the phase this row is about, then the route raises. */
+  begin: (res: ExpressResponse) => void;
+  /** What the client is still owed: a body, or nothing because the socket was cut. */
+  client: { status: number; body: string } | 'aborted';
+  /** Whether the original error must continue past the handler rather than be rendered by it. */
+  delegates: boolean;
+}
+
+const ERROR_TIMINGS: ErrorTiming[] = [
+  {
+    name: 'before any byte is written',
+    begin: () => undefined,
+    client: { status: 500, body: '500 Internal Server Error' },
+    delegates: false,
+  },
+  {
+    name: 'after a partial write, with the response still open',
+    begin: (res) => {
+      res.status(200).type('txt');
+      res.write('partial');
+    },
+    client: 'aborted',
+    delegates: true,
+  },
+  {
+    name: 'after the response was already ended',
+    begin: (res) => {
+      res.status(200).type('txt').send('partial');
+    },
+    client: { status: 200, body: 'partial' },
+    delegates: true,
+  },
+];
+
 const ERROR_SHAPES: ErrorShape[] = [
   { name: 'no status at all', make: () => new Error('boom'), status: 500 },
   {
@@ -321,9 +362,11 @@ describe('the terminal error handler answers every error shape with a bare statu
       if (shape === undefined) throw new Error('unknown shape');
       next(shape.make());
     });
-    app.post('/after-send', (_req, res, next) => {
-      res.status(200).type('txt').send('partial');
-      next(new Error('raised once the response was already on the wire'));
+    app.post('/timing/:row', (req, res, next) => {
+      const row = ERROR_TIMINGS[Number(req.params.row)];
+      if (row === undefined) throw new Error('unknown timing');
+      row.begin(res);
+      next(new Error(markerFor(Number(req.params.row))));
     });
     hardenErrorSurface(app);
 
@@ -355,11 +398,31 @@ describe('the terminal error handler answers every error shape with a bare statu
     },
   );
 
-  // Re-sending on a response already on the wire throws ERR_HTTP_HEADERS_SENT inside the error
-  // handler, which kills the connection mid-body. The client must still receive what was sent.
-  it('leaves a response that was already sent alone', async () => {
-    const res = await fetch(`${base}/after-send`, { method: 'POST' });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('partial');
-  });
+  it.each(ERROR_TIMINGS.map((t, i): [string, ErrorTiming, number] => [t.name, t, i]))(
+    'an error arriving %s is answered without the handler raising a second one',
+    async (_name: string, timing: ErrorTiming, row: number) => {
+      let observed: { status: number; body: string } | 'aborted';
+      try {
+        const res = await fetch(`${base}/timing/${row}`, { method: 'POST' });
+        observed = { status: res.status, body: await res.text() };
+      } catch {
+        observed = 'aborted';
+      }
+      expect(observed).toEqual(timing.client);
+
+      await settled();
+      const reports = logged.mock.calls.map((c) => c.map((a) => String(a)).join(' '));
+      expect(reports.join('\n')).not.toMatch(/Cannot set headers|ERR_HTTP_HEADERS_SENT/);
+      expect(reports.filter((r) => r.includes(markerFor(row)))).toHaveLength(
+        timing.delegates ? 2 : 1,
+      );
+    },
+  );
 });
+
+const markerFor = (row: number): string => `error-timing-row-${row}`;
+
+/** Express logs the delegated error after the client sees the socket close; give it that tick. */
+async function settled(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
