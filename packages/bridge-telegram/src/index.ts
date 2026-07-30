@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -30,7 +31,11 @@ import { keyOf, type ObservedRecord, ObservedStore, type StoredRecord } from './
 export interface TelegramBackendConfig {
   /** Bot token from @BotFather. A secret — lives in `backend_config`/`.env`, never in code. */
   token?: string;
-  /** Bot API base URL. Default `https://api.telegram.org` (override for tests / local servers). */
+  /**
+   * Bot API base URL. Default {@link DEFAULT_API_URL} (override for tests / local servers). A
+   * plaintext `http://` base pointed at a non-loopback host is warned about on `connect`: this API
+   * carries the token in the URL PATH, so every request line then puts it on the wire in the clear.
+   */
   api_url?: string;
   /**
    * Path of the observed-message JSONL store. Default {@link defaultStorePath} — an ABSOLUTE
@@ -90,10 +95,9 @@ interface TgUpdate {
   channel_post?: TgMessage;
 }
 
-/** A live subscription: deliver anything whose observation sequence exceeds the watermark. */
+/** A live subscription: deliver everything ingested after it was registered. */
 interface Subscription {
   handler: MessageHandler;
-  watermark: number;
   /** The Parley topic this subscriber named the chat by — stamped on what it receives. */
   topic: Topic;
 }
@@ -144,7 +148,7 @@ interface Waiter {
  * Telegram bridge per bot token — see README.md, "Multiple concurrent sessions".
  */
 export class TelegramPlugin implements BackendPlugin {
-  private apiUrl = 'https://api.telegram.org';
+  private apiUrl = DEFAULT_API_URL;
   private token = '';
   private pollTimeoutS = 25;
   /** topic → chat id (unmapped topics fall through to the topic string itself). */
@@ -188,8 +192,16 @@ export class TelegramPlugin implements BackendPlugin {
     try {
       const cfg = config as TelegramBackendConfig;
       requireNumericKnobs(cfg);
-      this.apiUrl = (cfg.api_url ?? 'https://api.telegram.org').replace(/\/+$/, '');
+      this.apiUrl = (cfg.api_url ?? DEFAULT_API_URL).replace(/\/+$/, '');
       this.token = cfg.token ?? '';
+      const plaintext = plaintextRemoteOrigin(this.apiUrl);
+      if (plaintext !== undefined) {
+        this.report(
+          `SECURITY: backend_config.api_url ${plaintext} is plaintext http:// to a non-loopback ` +
+            `host. This API carries the bot token in the URL PATH, so every request line puts it ` +
+            `on the network in the clear and into the logs of every proxy on the way. Use https://.`,
+        );
+      }
       this.pollTimeoutS = cfg.poll_timeout_s ?? 25;
       this.stopped = false;
       this.me = undefined;
@@ -457,16 +469,17 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Live path: register on the shared `getUpdates` loop. The watermark (current max observation
-   * sequence for the topic) is established SYNCHRONOUSLY before this resolves, so a post racing
-   * a fresh subscribe can never be missed — the ingest path delivers anything observed after,
-   * in ascending order. Starts at the tail: history is owned by catch-up, not push.
+   * Live path: register on the shared `getUpdates` loop. Registration is synchronous once the chat
+   * resolves, and {@link ingest} runs only for a record `store.append` has just stamped — a
+   * sequence above everything observed before this call — so a post racing a fresh subscribe can
+   * never be missed, and nothing already in the store can replay here: history is owned by
+   * catch-up, not push.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const store = this.require(this.store);
     const chatId = await this.chatIdFor(topic);
     this.stillServing(store);
-    const sub: Subscription = { handler, watermark: store.maxSeq(chatId), topic };
+    const sub: Subscription = { handler, topic };
     const list = this.subs.get(chatId);
     if (list === undefined) this.subs.set(chatId, [sub]);
     else list.push(sub);
@@ -571,13 +584,13 @@ export class TelegramPlugin implements BackendPlugin {
    * generation they started on is still current, and neither awaits between that check and this
    * call, so there is no "raced disconnect" case here to drop a message in.
    *
-   * The store's dedup set is the once-only guarantee — a record back from `store.append`
-   * already proves this message was never observed. The per-subscriber watermark is the FIXED
-   * observation sequence captured AT subscribe (deliver only what was observed after the
-   * subscribe point — "history is owned by catch-up, not push"); it is NEVER advanced here.
-   * Because the sequence is stamped in OBSERVATION order, a foreign message accepted before our
-   * own post but delivered after it still lands above the watermark and above every cursor
-   * already handed out, so it reaches both the push path and catch-up.
+   * The store's dedup set is the once-only guarantee — a record back from `store.append` already
+   * proves this message was never observed, and carries a sequence above every one stamped before
+   * it. That is also what keeps history off the push path ("history is owned by catch-up, not
+   * push"): this runs for freshly appended records only, never for anything a subscriber could
+   * have caught up to. Because the sequence is stamped in OBSERVATION order, a foreign message
+   * accepted before our own post but delivered after it still lands above every cursor already
+   * handed out, so it reaches both the push path and catch-up.
    */
   private ingest(store: ObservedStore, chatId: string, msg: TgMessage): void {
     const content = contentOf(msg);
@@ -606,7 +619,6 @@ export class TelegramPlugin implements BackendPlugin {
     // chat. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
     this.wakeWaiters(chatId, rec.seq);
     for (const sub of this.subs.get(chatId) ?? []) {
-      if (rec.seq <= sub.watermark) continue; // fixed subscribe-time value; never advanced.
       try {
         sub.handler(recordToMessage(rec, sub.topic, store.epoch()));
       } catch {
@@ -657,10 +669,12 @@ export class TelegramPlugin implements BackendPlugin {
       if (this.generation !== generation) break;
       const ackedBefore = offset;
       for (const u of updates) {
-        // Acknowledge only an update that STATES an id. `Math.max(offset, NaN)` is NaN, which is
-        // below nothing, so one id-less update from a non-conforming upstream would otherwise
-        // poison the offset for the life of the loop and re-serve the whole backlog forever.
-        if (typeof u?.update_id === 'number' && Number.isFinite(u.update_id)) {
+        // Acknowledge only an update stating an id in the domain this arithmetic is defined on.
+        // `Math.max(offset, NaN)` is NaN, which is below nothing, so one id-less update from a
+        // non-conforming upstream would poison the offset for the life of the loop and re-serve
+        // the whole backlog forever; an id outside the safe-integer range poisons it the other
+        // way, acknowledging updates that never arrived and going deaf to every later one.
+        if (typeof u?.update_id === 'number' && Number.isSafeInteger(u.update_id)) {
           offset = Math.max(offset, u.update_id + 1);
         }
         const msg = u?.message ?? u?.channel_post;
@@ -710,7 +724,22 @@ export class TelegramPlugin implements BackendPlugin {
       if (now - (this.lastReportAt.get(kind) ?? 0) < 60_000) return;
       this.lastReportAt.set(kind, now);
     }
-    process.stderr.write(`parley-telegram: ${message}\n`);
+    process.stderr.write(`parley-telegram: ${this.withoutToken(message)}\n`);
+  }
+
+  /**
+   * Strip the bot token from a diagnostic. This API carries the credential in the URL PATH, so an
+   * upstream that echoes the request line — a rejecting middlebox, a non-conforming local Bot API
+   * server — puts it in a body; net-util redacts the status and transport paths, but a 2xx envelope
+   * reaches neither. Keep EVERY message this plugin throws or reports going through here, so that a
+   * new diagnostic cannot put the token into model context or the operator's logs.
+   */
+  private withoutToken(text: string): string {
+    let out = text;
+    for (const spelling of new Set([this.token, encodeURIComponent(this.token)])) {
+      if (spelling.length > 1) out = out.split(spelling).join('<redacted>');
+    }
+    return out;
   }
 
   /**
@@ -775,6 +804,11 @@ export class TelegramPlugin implements BackendPlugin {
         },
       );
       return unwrapEnvelope(label, await res.text());
+    } catch (err) {
+      // Rewrite in place rather than rethrowing a new Error, so that HttpStatusError survives and
+      // the poll loop's `statusOf` still reads the status it branches on.
+      if (err instanceof Error) err.message = this.withoutToken(err.message);
+      throw err;
     } finally {
       this.controllers.delete(controller);
     }
@@ -843,10 +877,12 @@ function requireSentMessage(result: unknown): TgMessage {
 
 /**
  * Every field {@link TelegramPlugin.ingest} reads to build a record, validated where the object
- * arrives rather than where each one is dereferenced. `date` is checked here with the other two, so
- * that a message object missing it fails naming the endpoint and the FIELD — Date arithmetic on a
- * missing `date` otherwise produces the diagnostic, and `RangeError: Invalid time value` names
- * neither, which is exactly what {@link unwrapEnvelope} exists one layer up to prevent.
+ * arrives rather than where each one is dereferenced — and `date` validated for the RANGE the
+ * record's timestamp is built over, not merely for being a number. Keep both halves of that check,
+ * so that a message object missing `date`, or carrying one `Date` cannot represent, fails naming
+ * the endpoint and the FIELD: `RangeError: Invalid time value` names neither, which is exactly what
+ * {@link unwrapEnvelope} exists one layer up to prevent, and on the inbound path it is one
+ * throttled stderr line for a message the Bot API can never redeliver.
  */
 function requireMessage(label: string, value: unknown): TgMessage {
   const msg = value as TgMessage | null;
@@ -862,6 +898,9 @@ function requireMessage(label: string, value: unknown): TgMessage {
   }
   if (typeof msg.date !== 'number' || !Number.isFinite(msg.date)) {
     throw new Error(`${label}: message carries no numeric date`);
+  }
+  if (Number.isNaN(new Date(msg.date * 1000).getTime())) {
+    throw new Error(`${label}: message carries an out-of-range date (${String(msg.date)})`);
   }
   return msg;
 }
@@ -939,6 +978,41 @@ function recordToMessage(rec: StoredRecord, topic: Topic, epoch: string): Messag
 
 /** Wall-clock ceiling on one non-poll call, matching net-util's own per-call deadline. */
 const REQUEST_BUDGET_MS = 30_000;
+
+/** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see {@link plaintextRemoteOrigin}. */
+const DEFAULT_API_URL = 'https://api.telegram.org';
+
+/**
+ * The origin of a base URL whose credentials would cross the network unencrypted, else `undefined`.
+ * Telegram's is worse than the sibling backends' header-borne ones: the token rides the request
+ * PATH, so it is in the request line every intermediary logs.
+ */
+function plaintextRemoteOrigin(baseUrl: string): string | undefined {
+  try {
+    const { protocol, hostname, origin } = new URL(baseUrl);
+    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
+ * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
+ * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
+ * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
+ * address, counts as remote: an unproven host is warned about rather than excused.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
+  if (host === 'localhost') return true;
+  if (isIPv4(host)) return host.startsWith('127.');
+  if (!isIPv6(host)) return false;
+  const groups = host.split(':');
+  const tail = groups.pop() ?? '';
+  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
+  return Number.parseInt(tail, 16) === 1;
+}
 
 /**
  * Default observed-message store: `${XDG_STATE_HOME:-~/.local/state}/parley/telegram/observed.jsonl`

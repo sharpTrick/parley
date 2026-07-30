@@ -428,6 +428,74 @@ describe('telegram getUpdates acknowledgement', () => {
     },
     20_000,
   );
+
+  /**
+   * The upstream-conformance axis of the same cadence property. `offset` is the only acknowledgement
+   * this protocol has and its sole input is `update_id` — a field a rewriting middlebox or a
+   * non-conforming local Bot API server supplies. A value the arithmetic is not defined on poisons
+   * the offset in one of two silent directions: NaN is below everything, so the loop re-reads one
+   * backlog forever and never sees another message, while a value past the safe-integer range is
+   * above everything, so the loop acknowledges updates that never arrived and goes deaf to every
+   * one that follows. Neither loses a message loudly — every re-serve dedups — so the offset the
+   * loop puts ON THE WIRE is where it is visible at all.
+   *
+   * NaN and Infinity are not rows: `JSON.stringify` writes both as `null`, so the null row IS their
+   * spelling on the wire.
+   */
+  const NON_CONFORMING_IDS = [
+    { name: 'no update_id at all', update: {} },
+    { name: 'a null update_id', update: { update_id: null } },
+    { name: 'a string update_id', update: { update_id: 'seventeen' } },
+    { name: 'a fractional update_id', update: { update_id: 1.5 } },
+    { name: 'an update_id past the safe-integer range', update: { update_id: 1e21 } },
+    { name: 'a negative update_id', update: { update_id: -5 } },
+  ];
+
+  const CARRIER_CHAT = '-1009200003';
+
+  it.each(NON_CONFORMING_IDS)(
+    'keeps acknowledging, ingesting and pacing when an update arrives with $name',
+    async ({ update }) => {
+      const fake = await startFake();
+      const plugin = await connectTo(fake, { poll_timeout_s: 1 });
+      const topic = asTopic(CARRIER_CHAT);
+      const live: Message[] = [];
+      await plugin.subscribe(topic, (m) => live.push(m));
+
+      fake.injectMalformedUpdate({
+        ...update,
+        message: {
+          message_id: 777,
+          date: 1_600_000_000,
+          chat: { id: Number(CARRIER_CHAT) },
+          from: { id: 5, is_bot: false, username: 'alice' },
+          text: 'carried by a non-conforming update',
+        },
+      });
+      // A conforming update behind it: acknowledging THIS one is what the poisoned offset would
+      // have taken down with it.
+      fake.injectUserMessage(CARRIER_CHAT, 'alice', 'sentinel');
+      await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('sentinel'), {
+        timeout: 8000,
+        interval: 20,
+      });
+
+      // The message the non-conforming update carried is ingested — exactly once, however many
+      // times an upstream that cannot order it re-serves it.
+      expect(live.filter((m) => m.content === 'carried by a non-conforming update')).toHaveLength(1);
+
+      const before = fake.callCount('getUpdates');
+      await new Promise((r) => setTimeout(r, 1000));
+      expect(fake.callCount('getUpdates') - before).toBeLessThanOrEqual(8);
+      // Every offset the loop put on the wire over that second stayed a plain non-negative integer,
+      // and advanced: `NaN`, `2.5` and `1e+21` are each a loop that has silently stopped
+      // acknowledging — deaf from here on, with no lost message to notice it by.
+      const offsets = fake.pollOffsets();
+      for (const offset of offsets) expect(offset).toMatch(/^\d+$/);
+      expect(Math.max(...offsets.map(Number))).toBeGreaterThan(0);
+    },
+    20_000,
+  );
 });
 
 /**

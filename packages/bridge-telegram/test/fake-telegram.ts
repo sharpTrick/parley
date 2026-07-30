@@ -16,7 +16,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *    conformance suite cannot pass on topics real Telegram would refuse.
  *  - a poll at `offset` CONFIRMS and DELETES every update below it, as the real API does — a
  *    bridge that never advances its offset therefore re-reads a growing backlog forever here
- *    too, instead of looking indistinguishable from a healthy one.
+ *    too, instead of looking indistinguishable from a healthy one. An update whose `update_id` this
+ *    fake cannot order ({@link FakeTelegram.injectMalformedUpdate}) is neither confirmed nor
+ *    skipped, so it is re-served on every poll — the shape a rewriting middlebox produces, and the
+ *    only one under which a client's acknowledgement guard has anything to do.
  *  - `sendMessage` does NOT enqueue the bot's own message as an update — mirrors real
  *    Telegram (a bot never sees its own sends via getUpdates), which forces the plugin's
  *    record-own-post-from-the-response path.
@@ -47,6 +50,13 @@ export interface FakeTelegram {
    * kinds it carries re-reads such a batch forever. Returns its `update_id`.
    */
   injectRawUpdate(payload: Record<string, unknown>): number;
+  /**
+   * Enqueue an update EXACTLY as given — including a non-conforming `update_id` (absent, a string,
+   * out of range). `offset` is the only acknowledgement this protocol has and its sole input is a
+   * field a middlebox or a local Bot API server can get wrong, so a fake that always stamps a valid
+   * one leaves the plugin's guard against that with no reachable failing input.
+   */
+  injectMalformedUpdate(payload: Record<string, unknown>): void;
   /**
    * Like {@link injectUserMessage} but mints the message_id NOW (so it can be LOWER than a post
    * that runs next) while WITHHOLDING the update from getUpdates until `release()` — reproduces
@@ -98,6 +108,13 @@ export interface FakeTelegram {
    * knobs a plugin passes to net-util rather than any single parsing function.
    */
   callTimes(method: string): number[];
+  /**
+   * The `offset` query value of every `getUpdates` received, VERBATIM. The acknowledgement protocol
+   * is a number the client computes from an upstream-controlled field, so the spelling it puts on
+   * the wire (`NaN`, `1e+21`, `2.5`) is the only place a poisoned offset is visible before the
+   * bridge silently goes deaf.
+   */
+  pollOffsets(): string[];
   /** Long-polls currently parked. Drops to 0 when the client aborts them (plugin disconnect). */
   parkedPolls(): number;
   /** Updates still retained: real Telegram DROPS everything the client has acknowledged. */
@@ -151,7 +168,12 @@ interface ParkedPoll {
 }
 
 const BOT = { ...BOT_IDENTITY, is_bot: true, first_name: 'Parley' };
-const TOKEN = 'test-token';
+/**
+ * Shaped like a real @BotFather token (`<bot id>:<secret>`), so that the COLON is exercised: it is
+ * what makes the token's percent-encoded spelling differ from its raw one, and a diagnostic can
+ * echo either. A token of plain word characters cannot tell the two apart.
+ */
+const TOKEN = '8114253900:AAHfake-Bot-Token_For_Tests_0123456789';
 
 /**
  * A known channel: its `@channelusername` resolves (via getChat) to this NUMERIC id, so tests
@@ -204,6 +226,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const calls = new Map<string, number>();
   const times = new Map<string, number[]>();
   const sent: Record<string, unknown>[] = [];
+  const offsetsSeen: string[] = [];
 
   const mintMid = (chatId: string): number => {
     const mid = nextMid.get(chatId) ?? 1;
@@ -211,8 +234,18 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     return mid;
   };
 
+  /**
+   * Whether this fake can place an update in the `offset` ordering at all. One carrying a
+   * non-conforming `update_id` ({@link FakeTelegram.injectMalformedUpdate}) can be neither served
+   * in order nor confirmed, so it is re-served on every poll — which is what an injecting middlebox
+   * or a broken local Bot API server looks like from the client, and the only shape under which the
+   * client's own acknowledgement guard has anything to do.
+   */
+  const orderable = (u: TgUpdate): boolean =>
+    Number.isSafeInteger(u.update_id) && u.update_id >= 0;
+
   const pending = (offset: number): TgUpdate[] =>
-    offsetHonoured ? updates.filter((u) => u.update_id >= offset) : [...updates];
+    offsetHonoured ? updates.filter((u) => !orderable(u) || u.update_id >= offset) : [...updates];
 
   /**
    * Real Telegram treats a poll at `offset` as confirmation of everything below it and DELETES
@@ -222,7 +255,10 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const confirm = (offset: number): void => {
     if (!offsetHonoured || offset <= 0) return;
     for (let i = updates.length - 1; i >= 0; i--) {
-      if ((updates[i]?.update_id ?? 0) < offset) updates.splice(i, 1);
+      const update = updates[i];
+      if (update !== undefined && orderable(update) && update.update_id < offset) {
+        updates.splice(i, 1);
+      }
     }
   };
 
@@ -348,6 +384,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         return;
       }
       case 'getUpdates': {
+        offsetsSeen.push(String(url.searchParams.get('offset') ?? body.offset ?? ''));
         const offset = Number(url.searchParams.get('offset') ?? body.offset ?? 0);
         const timeoutS = Number(url.searchParams.get('timeout') ?? body.timeout ?? 0);
         confirm(offset);
@@ -423,6 +460,11 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       return update.update_id;
     },
 
+    injectMalformedUpdate(payload: Record<string, unknown>): void {
+      updates.push(payload as unknown as TgUpdate);
+      wakeParked();
+    },
+
     injectUserMessage(chatId: string, from: string, text: string): number {
       return this.injectRaw(chatId, { from: human(from), text });
     },
@@ -488,6 +530,10 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
 
     callTimes(method: string): number[] {
       return [...(times.get(method) ?? [])];
+    },
+
+    pollOffsets(): string[] {
+      return [...offsetsSeen];
     },
 
     parkedPolls(): number {

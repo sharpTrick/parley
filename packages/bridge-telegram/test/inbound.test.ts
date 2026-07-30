@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { ObservedStore } from '../src/store.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
-import { captureStderr, registerCleanup, type Rig, startRig } from './rig.js';
+import { captureStderr, registerCleanup, type Rig, seqOf, startRig } from './rig.js';
 
 const SENDER = asHandle('me');
 
@@ -303,6 +303,49 @@ describe('telegram own-post race', () => {
     const caughtUp = (await rig.plugin.fetchRecent({ topic, since: tail, limit: 1000 })).messages;
     expect(caughtUp.map((m) => m.content)).toEqual(all.slice(1));
     expect(live.map((m) => m.content).sort()).toEqual(all.slice(1).sort());
+  }, 20_000);
+});
+
+/**
+ * "History is owned by catch-up, not push" — the property a per-subscriber watermark used to claim
+ * to implement while never once firing. What actually holds it is that ingest runs only for a record
+ * `store.append` has just stamped, so nothing already in the store can reach a subscriber. That is
+ * invisible in a suite that only ever subscribes to an empty topic, so each depth here has real
+ * history behind the subscribe point, and own posts and late-delivered foreign messages are
+ * interleaved across it: the subscriber must receive EXACTLY what was admitted after it registered,
+ * in ascending observation order, and nothing from before — a replay would hand an agent messages
+ * below the cursor it is already holding.
+ */
+describe('telegram push starts at the subscribe point', () => {
+  const CHAT = '-1005558000';
+
+  it.each([0, 1, 7])('a subscriber behind %i already-observed messages sees only what follows', async (depth) => {
+    const rig = await startRig();
+    const topic = asTopic(CHAT);
+    for (let i = 0; i < depth; i++) await rig.plugin.post(topic, SENDER, `history-${i}`);
+    rig.fake.injectUserMessage(CHAT, 'bob', 'history-foreign');
+    const history = [...Array.from({ length: depth }, (_, i) => `history-${i}`), 'history-foreign'];
+    await vi.waitFor(async () => expect(await contentsOf(rig.plugin, topic)).toEqual(history), {
+      timeout: 5000,
+      interval: 10,
+    });
+
+    const live: Message[] = [];
+    await rig.plugin.subscribe(topic, (m) => live.push(m));
+    // Interleaved after the subscribe point: a deferred foreign message is accepted BEFORE our own
+    // post and delivered after it, which is the one ordering a message_id-based scheme gets wrong.
+    const deferred = rig.fake.injectUserMessageDeferred(CHAT, 'bob', 'after-foreign');
+    await rig.plugin.post(topic, SENDER, 'after-own');
+    deferred.release();
+
+    await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after-foreign'), {
+      timeout: 5000,
+      interval: 10,
+    });
+    expect(live.map((m) => m.content)).toEqual(['after-own', 'after-foreign']);
+    const sequences = live.map((m) => seqOf(m.cursor as string));
+    expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+    expect(Math.min(...sequences)).toBeGreaterThan(history.length);
   }, 20_000);
 });
 

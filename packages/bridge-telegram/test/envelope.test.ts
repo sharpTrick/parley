@@ -189,7 +189,30 @@ const conformingMessage = (): UpstreamMessage => ({
 /** A Telegram `Message` object as it arrives — untyped, because a cell's job is to break it. */
 type UpstreamMessage = Record<string, unknown>;
 
-const REQUIRED_FIELDS = [
+interface RequiredField {
+  name: string;
+  break: (m: UpstreamMessage, v: unknown) => UpstreamMessage;
+  names: RegExp;
+  /**
+   * Values of the RIGHT type that the field's own use rejects. A field validated for its type but
+   * not for its domain passes validation and dies later, unlabelled, at the point of use — which is
+   * the whole reason validation lives here. Only a field whose use HAS a domain declares any.
+   */
+  outOfDomain?: { name: string; value: unknown }[];
+}
+
+/**
+ * `date` is turned into an ISO timestamp, so its domain is the range `Date` can represent: a finite
+ * number well outside it (`1e15` seconds) survived a `Number.isFinite` check and resurfaced as
+ * `RangeError: Invalid time value` — naming neither endpoint nor field, and on the inbound path
+ * costing the message permanently, because the update was acknowledged to Telegram before ingest
+ * ran and the Bot API has no history endpoint to ask again. NaN and Infinity are absent as values
+ * because they cannot cross the wire: `JSON.stringify` writes both as `null`, which the shared
+ * `null` breakage already covers.
+ */
+const MAX_DATE_SECONDS = 8.64e12;
+
+const REQUIRED_FIELDS: RequiredField[] = [
   {
     name: 'message_id',
     break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, message_id: v }),
@@ -201,7 +224,16 @@ const REQUIRED_FIELDS = [
     break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, chat: { id: v } }),
     names: /chat id/,
   },
-  { name: 'date', break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, date: v }), names: /date/ },
+  {
+    name: 'date',
+    break: (m: UpstreamMessage, v: unknown): UpstreamMessage => ({ ...m, date: v }),
+    names: /date/,
+    outOfDomain: [
+      { name: 'far past the end of time', value: 1e15 },
+      { name: 'far before the start of time', value: -1e15 },
+      { name: 'one second past the last representable instant', value: MAX_DATE_SECONDS + 1 },
+    ],
+  },
 ];
 
 /** `undefined` drops the key on the way through JSON; the other two are never a valid scalar. */
@@ -212,7 +244,7 @@ const BREAKAGES = [
 ];
 
 const FIELD_CELLS = REQUIRED_FIELDS.flatMap((field) =>
-  BREAKAGES.map((breakage) => ({ field, breakage })),
+  [...BREAKAGES, ...(field.outOfDomain ?? [])].map((breakage) => ({ field, breakage })),
 );
 
 describe('telegram non-conforming message objects', () => {
@@ -277,6 +309,30 @@ describe('telegram non-conforming message objects', () => {
     },
     20_000,
   );
+
+  /**
+   * The other edge of the same domain: a range check that refuses what it should accept silently
+   * drops real traffic, and the endpoints of a range are where an off-by-one lives.
+   */
+  it.each([
+    { name: 'the epoch', date: 0 },
+    { name: 'the last representable instant', date: MAX_DATE_SECONDS },
+    { name: 'the first representable instant', date: -MAX_DATE_SECONDS },
+  ])('post accepts a sendMessage result dated $name', async ({ date }) => {
+    captureStderr();
+    const fake = await startFake();
+    const plugin = await connectTo(fake, storePath());
+    fake.malformMethod(
+      'sendMessage',
+      JSON.stringify({ ok: true, result: { ...conformingMessage(), date } }),
+    );
+
+    const topic = asTopic(MESSAGE_CHAT);
+    await expect(plugin.post(topic, SENDER, 'x')).resolves.toBeDefined();
+    const stored = (await plugin.fetchRecent({ topic })).messages;
+    expect(stored).toHaveLength(1);
+    expect(Date.parse(stored[0]?.timestamp ?? '')).toBe(date * 1000);
+  }, 20_000);
 
   /**
    * `update_id` is the acknowledgement, not a record field: `Math.max(offset, NaN)` is NaN and NaN

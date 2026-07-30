@@ -218,6 +218,13 @@ export class ObservedStore {
   private fd: number | undefined;
   /** Set by {@link close} — the difference between "released on purpose" and "lost the fd". */
   private closed = false;
+  /**
+   * A write that threw may have left bytes with no terminating newline (a short write on ENOSPC),
+   * and the constructor's torn-tail repair only runs at LOAD. Keep the flag, so that the next line
+   * opens a fresh one instead of gluing onto the fragment — which would lose a record `append` had
+   * already returned as durable, alongside the fragment.
+   */
+  private tornTail = false;
   /** Wall-clock of the last diagnostic PER KIND, so one failure can't silence an unrelated one. */
   private readonly lastReportAt = new Map<string, number>();
 
@@ -309,7 +316,7 @@ export class ObservedStore {
     const fd = this.openFd();
     if (fd === undefined) return;
     try {
-      appendFileSync(fd, `${line}\n`);
+      this.writeLine(fd, line);
     } catch (err) {
       this.report(
         'bookkeeping-line',
@@ -334,7 +341,7 @@ export class ObservedStore {
     if (fd === undefined) return undefined;
     if (!this.admit(observed.chat_id)) return undefined;
     const rec: StoredRecord = { ...observed, seq: this.nextSeq++ };
-    appendFileSync(fd, `${JSON.stringify(rec)}\n`);
+    this.writeLine(fd, JSON.stringify(rec));
     this.index(rec);
     this.applyRetention();
     // Compaction is amortization, not durability: the record is already on disk and indexed here,
@@ -350,6 +357,21 @@ export class ObservedStore {
       );
     }
     return rec;
+  }
+
+  /**
+   * Write one newline-terminated line, opening a fresh one first when {@link tornTail} says the
+   * previous write may have stopped mid-line. The fragment then loads as its own garbled line and
+   * is dropped, instead of swallowing the record written after it.
+   */
+  private writeLine(fd: number, line: string): void {
+    try {
+      appendFileSync(fd, this.tornTail ? `\n${line}\n` : `${line}\n`);
+      this.tornTail = false;
+    } catch (err) {
+      this.tornTail = true;
+      throw err;
+    }
   }
 
   /**
@@ -562,6 +584,7 @@ export class ObservedStore {
     closeSync(fd);
     renameSync(tmp, this.path);
     this.evictedSinceRewrite = 0;
+    this.tornTail = false;
   }
 
   /**
