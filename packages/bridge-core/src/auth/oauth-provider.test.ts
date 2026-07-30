@@ -33,9 +33,13 @@ interface Internals {
 }
 const peek = (p: ParleyOAuthProvider): Internals => p as unknown as Internals;
 
-/** Fake express Response — authorize() only calls status().type().send(). */
-function fakeRes(): Response {
-  const r: Record<string, unknown> = {};
+/**
+ * Fake express Response — authorize() only calls status().type().send(), and reads `req` to see
+ * whether the client itself wrote redirect_uri. `query` mirrors what the SDK's GET /authorize
+ * handler parsed, so omitting the key models a client that let the AS default it.
+ */
+function fakeRes(query: Record<string, string> = { redirect_uri: REDIRECT }): Response {
+  const r: Record<string, unknown> = { req: { method: 'GET', query, body: {} } };
   r.status = () => r;
   r.type = () => r;
   r.send = () => r;
@@ -69,8 +73,13 @@ afterEach(() => {
 });
 
 /** Drive authorize → completeConsent to mint a live authorization code, returning it. */
-async function mintCode(p: ParleyOAuthProvider, client: OAuthClientInformationFull, params: AuthorizationParams): Promise<string> {
-  await p.authorize(client, params, fakeRes());
+async function mintCode(
+  p: ParleyOAuthProvider,
+  client: OAuthClientInformationFull,
+  params: AuthorizationParams,
+  res: Response = fakeRes(),
+): Promise<string> {
+  await p.authorize(client, params, res);
   const consentId = [...peek(p).pending.keys()].at(-1);
   if (consentId === undefined) throw new Error('no pending consent seeded');
   const { redirectUrl } = await p.completeConsent(consentId, GOOD_PASS);
@@ -548,25 +557,70 @@ describe('ParleyOAuthProvider — a refresh may narrow scope but never widen it'
   });
 });
 
-describe('ParleyOAuthProvider — redirect_uri is bound unconditionally, not only when present', () => {
-  it('rejects a token exchange that omits redirect_uri', async () => {
-    const p = makeProvider(() => 4_000_000);
+/**
+ * RFC 6749 §4.1.3 makes redirect_uri REQUIRED at /token only if the client sent it at /authorize —
+ * and the SDK defaults `params.redirectUri` to the single registered URI when it did not, so the
+ * provider sees the same params either way. Getting this wrong in the strict direction is invisible
+ * until after the owner has consented and the code is burned, and the only diagnostic the client
+ * ever sees is a generic invalid_grant. Every combination of the two hops, plus a value that does
+ * not match, states its own outcome.
+ */
+interface RedirectBinding {
+  suppliedAtAuthorize: boolean;
+  atToken: string | undefined;
+  accepted: boolean;
+}
+
+const REDIRECT_BINDINGS: RedirectBinding[] = [
+  { suppliedAtAuthorize: true, atToken: REDIRECT, accepted: true },
+  { suppliedAtAuthorize: true, atToken: undefined, accepted: false },
+  { suppliedAtAuthorize: true, atToken: 'https://evil.example/cb', accepted: false },
+  { suppliedAtAuthorize: false, atToken: undefined, accepted: true },
+  { suppliedAtAuthorize: false, atToken: REDIRECT, accepted: true },
+  { suppliedAtAuthorize: false, atToken: 'https://evil.example/cb', accepted: false },
+];
+
+const bindingName = (b: RedirectBinding): string =>
+  `${b.suppliedAtAuthorize ? 'sent' : 'omitted'} at /authorize, ${
+    b.atToken === undefined ? 'omitted' : `sent as ${b.atToken}`
+  } at /token is ${b.accepted ? 'accepted' : 'refused'}`;
+
+describe('ParleyOAuthProvider — redirect_uri is bound at /token exactly when the client bound it at /authorize', () => {
+  it.each(REDIRECT_BINDINGS.map((b): [string, RedirectBinding] => [bindingName(b), b]))(
+    '%s',
+    async (_name: string, b: RedirectBinding) => {
+      const p = makeProvider(() => 4_000_000);
+      const client = makeClient();
+      const code = await mintCode(
+        p,
+        client,
+        makeParams(),
+        fakeRes(b.suppliedAtAuthorize ? { redirect_uri: REDIRECT } : {}),
+      );
+
+      const exchange = p.exchangeAuthorizationCode(client, code, undefined, b.atToken);
+      if (b.accepted) {
+        await expect(exchange).resolves.toMatchObject({ token_type: 'bearer' });
+      } else {
+        await expect(exchange).rejects.toBeInstanceOf(InvalidGrantError);
+      }
+    },
+  );
+
+  // A response the SDK handed us without a request object leaves the question unanswerable, and the
+  // strict answer is the safe one.
+  it('treats an unreadable authorization request as having supplied it', async () => {
+    const p = makeProvider(() => 4_500_000);
     const client = makeClient();
-    const code = await mintCode(p, client, makeParams());
+    const bare: Record<string, unknown> = {};
+    bare.status = () => bare;
+    bare.type = () => bare;
+    bare.send = () => bare;
+    const code = await mintCode(p, client, makeParams(), bare as unknown as Response);
 
     await expect(
       p.exchangeAuthorizationCode(client, code, undefined, undefined),
     ).rejects.toBeInstanceOf(InvalidGrantError);
-  });
-
-  it('still succeeds for a legitimate exchange that includes the matching redirect_uri', async () => {
-    const p = makeProvider(() => 4_500_000);
-    const client = makeClient();
-    const code = await mintCode(p, client, makeParams());
-
-    const tokens = await p.exchangeAuthorizationCode(client, code, undefined, REDIRECT);
-    expect(tokens.access_token).toBeTruthy();
-    expect(tokens.token_type).toBe('bearer');
   });
 });
 

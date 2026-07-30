@@ -6,10 +6,24 @@ import type { OidcAuthConfig } from '../config.js';
  * that actually protects the deployment lives here.
  */
 
-// Keep IPv6 loopback out, so that a base URL this guard accepts always boots on BOTH front doors:
-// the built-in one hands issuerUrl to the SDK, which refuses any non-https issuer whatever its host.
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
+// Keep this set equal to the SDK's own issuer exemption — `checkIssuerUrl` in
+// @modelcontextprotocol/sdk/server/auth/router.js exempts exactly `localhost` and `127.0.0.1` — so
+// that a base URL this guard accepts also boots on the built-in front door, which hands issuerUrl
+// straight to it. Widening this set (IPv6 loopback, a .localhost name) boots here and dies there.
+export const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
 const LOOPBACK_LIST = [...LOOPBACK_HOSTS].join(' and ');
+
+const TRANSPORT_SCHEMES = new Set(['http:', 'https:']);
+
+function assertTransportScheme(url: URL, field: string, href: string): void {
+  if (TRANSPORT_SCHEMES.has(url.protocol)) return;
+  throw new Error(
+    `${field} must use the https or http scheme (got "${url.protocol}" in "${href}"). Anything ` +
+      `else names something no HTTP client can dereference, and a non-special scheme has the ` +
+      `literal origin "null", which makes every same-origin check downstream compare "null" ` +
+      `against itself and pass.`,
+  );
+}
 
 /**
  * The advertised RFC 9728 resource identifier is `publicUrl + mcpPath`, and building it drops every
@@ -19,6 +33,7 @@ const LOOPBACK_LIST = [...LOOPBACK_HOSTS].join(' and ');
  * Refuse each of them by name so the operator learns which one.
  */
 export function assertPublicBaseUrl(url: URL, field: string): void {
+  assertTransportScheme(url, field, url.href);
   if (url.username !== '' || url.password !== '') {
     throw new Error(
       `${field} must not carry userinfo credentials (got "${url.origin}" with a username or ` +
@@ -50,9 +65,10 @@ export function assertPublicBaseUrl(url: URL, field: string): void {
   if (url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
     throw new Error(
       `${field} must use https outside loopback (got "${url.href}"). Only ${LOOPBACK_LIST} are ` +
-        `exempt, for local development — IPv6 loopback is not, because the built-in OAuth front ` +
-        `door refuses a non-https issuer whatever its host. The bearer tokens and the owner ` +
-        `passphrase this origin carries have no confidentiality without TLS.`,
+        `exempt, for local development: they are exactly the hosts the built-in OAuth front door's ` +
+        `own issuer check exempts, so any other host — an IPv6 loopback literal included — would ` +
+        `be accepted here and refused there. The bearer tokens and the owner passphrase this ` +
+        `origin carries have no confidentiality without TLS.`,
     );
   }
 }
@@ -126,6 +142,7 @@ export function assertTrustRootUrl(url: string, field: string): void {
   } catch {
     throw new Error(`${field} must be an absolute URL (got "${url}").`);
   }
+  assertTransportScheme(parsed, field, url);
   if (parsed.protocol !== 'https:' && !LOOPBACK_HOSTS.has(parsed.hostname)) {
     throw new Error(
       `${field} must use https outside loopback (got "${url}"). Parley fetches token ` +
@@ -133,6 +150,24 @@ export function assertTrustRootUrl(url: string, field: string): void {
         `their own keys and mint tokens this server accepts.`,
     );
   }
+}
+
+const UNBOUNDED_TRUST = new Set<unknown>([true, 'true']);
+
+/**
+ * Keep this refusal, so that `req.ip` can never be a value the caller wrote: Express resolves it
+ * from the `trust proxy` setting, and every rate limiter on a front door keys on it — including the
+ * brute-force gate on the owner passphrase, the single secret that authorizes the whole bridge.
+ */
+export function assertTrustProxy(value: unknown, field: string): void {
+  if (!UNBOUNDED_TRUST.has(value)) return;
+  throw new Error(
+    `${field} must not be ${JSON.stringify(value)}. It trusts every hop of X-Forwarded-For, so ` +
+      `req.ip becomes a header the caller writes and every per-address rate limit on this front ` +
+      `door is defeated by rotating it — an anonymous attacker gets unlimited guesses at the ` +
+      `owner passphrase. Name the real topology instead: "loopback" for the reverse proxy in ` +
+      `examples/self-host-remote, the number of proxy hops as a number, or the proxies' CIDR.`,
+  );
 }
 
 const MAX_CLOCK_SKEW_S = 300;

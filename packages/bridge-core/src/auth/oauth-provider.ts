@@ -30,6 +30,7 @@ const MAX_CLIENTS = 100;
 interface CodeRecord {
   clientId: string;
   redirectUri: string;
+  redirectUriSupplied: boolean;
   codeChallenge: string;
   scopes: string[];
   resource: string;
@@ -49,7 +50,23 @@ interface RefreshRecord {
 interface PendingConsent {
   client: OAuthClientInformationFull;
   params: AuthorizationParams;
+  redirectUriSupplied: boolean;
   expiresAtMs: number;
+}
+
+/**
+ * Whether the client itself wrote `redirect_uri` on the authorization request. The SDK's handler
+ * defaults `params.redirectUri` to the client's single registered URI when it was absent, so by the
+ * time the provider sees the params the two cases are indistinguishable — and RFC 6749 §4.1.3 makes
+ * the parameter REQUIRED at /token only in the first of them. Reading both containers keeps the
+ * answer "supplied" whenever it might have been, which is the strict side.
+ */
+function redirectUriWasSupplied(res: Response): boolean {
+  const req = (res as { req?: { body?: unknown; query?: unknown } }).req;
+  if (req === undefined) return true;
+  const body = req.body as Record<string, unknown> | undefined;
+  const query = req.query as Record<string, unknown> | undefined;
+  return (body?.redirect_uri ?? query?.redirect_uri) !== undefined;
 }
 
 export interface ParleyOAuthProviderOptions {
@@ -166,7 +183,12 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     this.assertResource(params.resource);
     const consentId = randomUUID();
-    this.pending.set(consentId, { client, params, expiresAtMs: this.now() + CONSENT_TTL_MS });
+    this.pending.set(consentId, {
+      client,
+      params,
+      redirectUriSupplied: redirectUriWasSupplied(res),
+      expiresAtMs: this.now() + CONSENT_TTL_MS,
+    });
     res.status(200).type('html').send(this.consentPage(consentId, client, params));
   }
 
@@ -192,6 +214,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     this.codes.set(code, {
       clientId: pend.client.client_id,
       redirectUri: pend.params.redirectUri,
+      redirectUriSupplied: pend.redirectUriSupplied,
       codeChallenge: pend.params.codeChallenge, // stored; SDK verifies S256 at /token
       scopes: pend.params.scopes ?? [],
       resource: pend.params.resource?.href ?? this.opts.resource.href,
@@ -237,7 +260,10 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     }
     // Consume before every remaining check, so that a failed exchange leaves nothing replayable.
     this.forgetCode(authorizationCode);
-    if (redirectUri !== rec.redirectUri) {
+    // Keep the exchange unbound when the client never wrote redirect_uri at /authorize, so that a
+    // single-registered-URI client the SDK defaulted for is not refused here — after the owner's
+    // consent is already spent and the code burned, with only a generic invalid_grant to go on.
+    if ((rec.redirectUriSupplied || redirectUri !== undefined) && redirectUri !== rec.redirectUri) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
     this.assertResource(resource);

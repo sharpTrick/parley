@@ -620,6 +620,74 @@ describe('remote OAuth front door — a failed token exchange closes the code', 
 });
 
 /**
+ * A client with exactly ONE registered redirect URI may legally omit `redirect_uri` at both hops
+ * (RFC 6749 §4.1.3 requires it at /token only if it was present at /authorize). The SDK defaults it
+ * at /authorize and forwards `undefined` at /token, so a provider that binds it unconditionally
+ * refuses the exchange AFTER the owner has consented and the code is spent — with a generic
+ * invalid_grant as the whole diagnostic. Driven over HTTP because the flag distinguishing the two
+ * cases is only readable from the real request.
+ */
+describe('a conformant client that never names its redirect_uri', () => {
+  it('completes the flow with redirect_uri omitted at /authorize and at /token', async () => {
+    const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+    const reg = await fetch(as.registration_endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [CLIENT_REDIRECT],
+        token_endpoint_auth_method: 'none',
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+      }),
+    });
+    expect(reg.status).toBe(201);
+    const client = await jget(reg);
+
+    const { verifier, challenge } = pkce();
+    const state = randomBytes(8).toString('hex');
+    const authorizeUrl = new URL(as.authorization_endpoint);
+    authorizeUrl.search = form({
+      response_type: 'code',
+      client_id: client.client_id,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      state,
+      resource: `${origin}/mcp`,
+      scope: 'mcp',
+    });
+    const consentHtml = await (await fetch(authorizeUrl.href)).text();
+    const consentId = /name="consent_id" value="([^"]+)"/.exec(consentHtml)?.[1];
+    expect(consentId).toBeTruthy();
+
+    const consentRes = await fetch(`${origin}/parley/consent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form({ consent_id: consentId!, passphrase: OWNER_PASS }),
+      redirect: 'manual',
+    });
+    expect(consentRes.status).toBe(302);
+    const back = new URL(consentRes.headers.get('location')!);
+    expect(back.origin + back.pathname).toBe(CLIENT_REDIRECT);
+    const code = back.searchParams.get('code');
+    expect(code).toBeTruthy();
+
+    const tokRes = await fetch(as.token_endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form({
+        grant_type: 'authorization_code',
+        code: code!,
+        client_id: client.client_id,
+        code_verifier: verifier,
+        resource: `${origin}/mcp`,
+      }),
+    });
+    expect(tokRes.status).toBe(200);
+    expect((await jget(tokRes)).access_token).toBeTruthy();
+  });
+});
+
+/**
  * Every endpoint of this front door is rate-limited per client address, so the limiter is only a
  * defence if that address is the CLIENT's. Under the shipped recipe (examples/self-host-remote
  * terminates TLS at a reverse proxy) an unconfigured app sees only the proxy's loopback address:
@@ -680,27 +748,54 @@ const LIMITED_ROUTES: LimitedRoute[] = [
   },
 ];
 
+/**
+ * Which address the limiter ends up keyed on, under the deployment these tests actually run in:
+ * the request arrives from loopback carrying `<forged>, <real client>`, the chain a proxy that
+ * appends the peer it saw would produce. `forged` is the part the caller writes.
+ */
+type KeyedOn = 'socket' | 'client' | 'forged';
+
 interface Topology {
   name: string;
-  trustProxy: boolean | string;
-  /** Whether two X-Forwarded-For values must land in the SAME bucket under this topology. */
-  sharesBucket: boolean;
+  trustProxy: boolean | number | string;
+  /** Refused rows say who refuses: our own guard by name, or Express's proxy-addr parser. */
+  outcome: { keyedOn: KeyedOn } | { refusedBy: 'parley' | 'express' };
 }
 
 const TOPOLOGIES: Topology[] = [
-  // Direct exposure: the header is attacker-controlled noise and must not mint a fresh bucket.
-  { name: 'directly exposed', trustProxy: false, sharesBucket: true },
-  { name: 'behind one reverse-proxy hop', trustProxy: 'loopback', sharesBucket: false },
+  // Direct exposure: the header is caller-controlled noise and must not mint a fresh bucket.
+  { name: 'directly exposed', trustProxy: false, outcome: { keyedOn: 'socket' } },
+  { name: 'behind one reverse-proxy hop', trustProxy: 'loopback', outcome: { keyedOn: 'client' } },
+  { name: 'behind one hop given as a count', trustProxy: 1, outcome: { keyedOn: 'client' } },
+  { name: 'proxies named by CIDR', trustProxy: '203.0.113.0/24', outcome: { keyedOn: 'socket' } },
+  // A hop count LARGER than the real chain trusts one forged element. The guard bounds how far
+  // trust can reach; it cannot check the operator's arithmetic — and this row is what proves the
+  // probe below can see a forged-keyed bucket at all, so the rows above are not vacuous.
+  { name: 'a hop count larger than the real chain', trustProxy: 2, outcome: { keyedOn: 'forged' } },
+  { name: 'every hop trusted', trustProxy: true, outcome: { refusedBy: 'parley' } },
+  { name: 'every hop trusted, spelled as an env var', trustProxy: 'true', outcome: { refusedBy: 'parley' } },
+  { name: 'a wildcard', trustProxy: '*', outcome: { refusedBy: 'express' } },
+  { name: 'a CIDR covering the whole address space', trustProxy: '0.0.0.0/0', outcome: { refusedBy: 'express' } },
 ];
 
 const ATTACKER = '203.0.113.9';
 const OWNER = '198.51.100.4';
 
+/** `<forged>, <real client>` pairs: same client twice, then a different client. */
+const PROBES: Array<[forged: string, client: string]> = [
+  ['9.9.9.1', OWNER],
+  ['9.9.9.2', OWNER],
+  ['9.9.9.1', ATTACKER],
+];
+
+const bucketOf = (keyedOn: KeyedOn, forged: string, client: string): string =>
+  keyedOn === 'socket' ? 'socket' : keyedOn === 'client' ? client : forged;
+
 describe('a rate limiter must key on the client the operator actually deploys behind', () => {
-  let app: OAuthRemoteServer;
+  let app: OAuthRemoteServer | undefined;
   let base: string;
 
-  async function boot(trustProxy?: boolean | string): Promise<void> {
+  async function boot(trustProxy?: boolean | number | string): Promise<void> {
     const port = await freePort();
     base = `http://127.0.0.1:${port}`;
     app = createOAuthRemoteApp(plugin, parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] }), {
@@ -712,12 +807,16 @@ describe('a rate limiter must key on the client the operator actually deploys be
   }
 
   afterEach(async () => {
-    await app.close();
+    const running = app;
+    app = undefined;
+    await running?.close();
   });
 
   const remaining = (res: Response): number => Number(res.headers.get('ratelimit-remaining'));
+  const limitOf = (res: Response): number => Number(res.headers.get('ratelimit-limit'));
 
-  const ROWS = TOPOLOGIES.flatMap((t) =>
+  const ACCEPTED = TOPOLOGIES.filter((t) => 'keyedOn' in t.outcome);
+  const ROWS = ACCEPTED.flatMap((t) =>
     LIMITED_ROUTES.map((r): [string, Topology, LimitedRoute] => [
       `${r.name} when ${t.name}`,
       t,
@@ -726,11 +825,31 @@ describe('a rate limiter must key on the client the operator actually deploys be
   );
 
   it.each(ROWS)('%s', async (_name: string, t: Topology, route: LimitedRoute) => {
+    if (!('keyedOn' in t.outcome)) throw new Error('accepted rows only');
     await boot(t.trustProxy);
-    const first = remaining(await route.hit(base, ATTACKER));
-    const second = remaining(await route.hit(base, OWNER));
-    expect(first).toBeGreaterThan(0);
-    expect(second).toBe(t.sharesBucket ? first - 1 : first);
+    const spent = new Map<string, number>();
+    let limit: number | undefined;
+    for (const [forged, client] of PROBES) {
+      const res = await route.hit(base, `${forged}, ${client}`);
+      limit ??= limitOf(res);
+      expect(limit).toBeGreaterThan(0);
+      const key = bucketOf(t.outcome.keyedOn, forged, client);
+      const n = (spent.get(key) ?? 0) + 1;
+      spent.set(key, n);
+      expect(remaining(res)).toBe(limit - n);
+    }
+  });
+
+  const REFUSED = TOPOLOGIES.filter((t) => 'refusedBy' in t.outcome).map(
+    (t): [string, Topology] => [t.name, t],
+  );
+
+  it.each(REFUSED)('refuses %s at the factory', async (_name: string, t: Topology) => {
+    if (!('refusedBy' in t.outcome)) throw new Error('refused rows only');
+    const booting = boot(t.trustProxy);
+    await (t.outcome.refusedBy === 'parley'
+      ? expect(booting).rejects.toThrow(/trustProxy must not be/)
+      : expect(booting).rejects.toThrow());
   });
 
   // An operator who never names a topology gets the safe one: an app that took the header on

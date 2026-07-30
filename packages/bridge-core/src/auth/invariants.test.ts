@@ -4,6 +4,9 @@ import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { parseConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
+import { createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
+import { assertPublicBaseUrl, LOOPBACK_HOSTS } from './invariants.js';
 import { createOidcRemoteApp } from './oidc-remote.js';
 import { createRemoteAuthApp, type RemoteAuthServer } from './remote-auth.js';
 import { createOAuthRemoteApp } from './remote.js';
@@ -384,12 +387,61 @@ const BASE_URL_SHAPES: BaseUrlShape[] = [
   },
   {
     shape: 'http://[::1]:PORT',
-    outcome: { refuses: /IPv6 loopback is not/ },
+    outcome: { refuses: /Only 127\.0\.0\.1 and localhost are exempt/ },
   },
+  // The scheme is a component of its own. A non-special one parses with origin "null", so the
+  // cross-origin check in canonicalResourceId compares "null" to "null" and cannot fire — the
+  // loopback exemption then admits a one-character typo and every token is minted for a resource
+  // identifier naming a protocol nothing speaks.
+  { shape: 'htp://localhost:PORT', outcome: { refuses: /https or http scheme/ } },
+  { shape: 'foo://127.0.0.1:PORT', outcome: { refuses: /https or http scheme/ } },
+  { shape: 'ws://localhost:PORT/', outcome: { refuses: /https or http scheme/ } },
+  { shape: 'file://localhost/', outcome: { refuses: /https or http scheme/ } },
 ];
 
 const shapeName = (s: BaseUrlShape): string =>
   `${s.shape} ${'boots' in s.outcome ? 'boots' : 'is refused'}`;
+
+/**
+ * The loopback exemption is a claim about a DEPENDENCY: the built-in door hands issuerUrl to the
+ * SDK's `checkIssuerUrl`, which exempts its own fixed host set. A host in one set and not the other
+ * is a base URL that boots on one front door and dies inside the other, so the rule is asserted
+ * against the SDK itself rather than restated in a comment that cannot fail.
+ */
+describe('the loopback exemption is exactly the one the SDK issuer check applies', () => {
+  const STUB_PROVIDER = { clientsStore: { registerClient: () => undefined } } as unknown as
+    OAuthServerProvider;
+
+  const sdkAccepts = (url: URL): boolean => {
+    try {
+      createOAuthMetadata({ provider: STUB_PROVIDER, issuerUrl: url, baseUrl: url });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const weAccept = (url: URL): boolean => {
+    try {
+      assertPublicBaseUrl(url, 'issuerUrl');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // A table generated FROM the set cannot see a member deleted from it, so the membership is also
+  // pinned by value.
+  it('names 127.0.0.1 and localhost, and nothing else', () => {
+    expect([...LOOPBACK_HOSTS].sort()).toEqual(['127.0.0.1', 'localhost']);
+  });
+
+  const HOSTS = [...LOOPBACK_HOSTS, '[::1]', 'localhost.localdomain', 'parley.example.com'];
+
+  it.each(HOSTS)('http://%s is accepted by both guards or by neither', (host: string) => {
+    const url = new URL(`http://${host}:8080`);
+    expect(weAccept(url)).toBe(sdkAccepts(url));
+  });
+});
 
 /**
  * The second operand. `new URL(path, base)` will take an authority (`//host`, and `/\host`, which
@@ -657,6 +709,29 @@ const TRUST_ROOT_ROWS: TrustRootRow[] = [
     }),
     discovery: { issuer: HTTPS_ISSUER, jwks_uri: 'https://kc.corp.example/realms/parley/certs' },
     refuses: /auth\.oidc\.jwks_uri must use https outside loopback/,
+  },
+  // The scheme is its own component: `new URL` accepts any of them, and a non-special one leaves
+  // the loopback exemption looking at a hostname that means nothing. Both trust roots must refuse
+  // a scheme the fetch can never speak, not only a plaintext one.
+  {
+    name: 'issuer on a scheme nothing fetches',
+    oidc: () => ({
+      issuer: 'htp://localhost:8080/realms/parley',
+      allowed_subjects: ['owner-sub'],
+      clock_skew_s: 30,
+    }),
+    refuses: /auth\.oidc\.issuer must use the https or http scheme/,
+  },
+  {
+    name: 'jwks_uri on a scheme nothing fetches',
+    oidc: () => ({
+      issuer: HTTPS_ISSUER,
+      jwks_uri: 'htp://127.0.0.1:9/keys',
+      allowed_subjects: ['owner-sub'],
+      clock_skew_s: 30,
+    }),
+    discovery: { issuer: HTTPS_ISSUER, jwks_uri: 'https://kc.corp.example/realms/parley/certs' },
+    refuses: /auth\.oidc\.jwks_uri must use the https or http scheme/,
   },
   {
     name: 'jwks_uri that is not a URL at all',

@@ -11,7 +11,7 @@ import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js
 import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
 import { hardenErrorSurface } from './error-surface.js';
-import { assertPublicBaseUrl, canonicalResourceId } from './invariants.js';
+import { assertPublicBaseUrl, assertTrustProxy, canonicalResourceId } from './invariants.js';
 
 export interface OAuthRemoteOptions {
   /** Public origin = issuer = base URL (AS = RS, single tenant). HTTPS in production; localhost ok in dev. */
@@ -27,7 +27,8 @@ export interface OAuthRemoteOptions {
    * the client. Behind the TLS terminator of examples/self-host-remote, pass `'loopback'` (or the
    * hop count) — otherwise every caller shares the proxy's address in a single bucket and an
    * anonymous attacker can exhaust it to lock the owner out of the only path that authorizes the
-   * bridge.
+   * bridge. `true` is refused: it trusts an unbounded number of hops, which hands the limiter's
+   * key to the caller and removes the protection entirely.
    */
   trustProxy?: boolean | number | string | string[];
   /** Injectable clock for tests. */
@@ -56,6 +57,7 @@ export function createOAuthRemoteApp(
 ): OAuthRemoteServer {
   const mcpPath = oauth.mcpPath ?? '/mcp';
   assertPublicBaseUrl(oauth.issuerUrl, 'issuerUrl');
+  assertTrustProxy(oauth.trustProxy, 'trustProxy');
   const resource = canonicalResourceId(oauth.issuerUrl, mcpPath, 'mcpPath');
 
   const provider = new ParleyOAuthProvider({
