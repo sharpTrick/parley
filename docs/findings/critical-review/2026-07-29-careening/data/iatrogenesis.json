@@ -46,6 +46,16 @@
       "unresolvable": 1,
       "selfInducedPct": 60,
       "note": "Round 5 reviewed with no docker daemon for its six service-backed targets, so its pre-existing count is a FLOOR: live-only defects could not surface."
+    },
+    {
+      "round": 6,
+      "base": "c0c229e",
+      "findings": 90,
+      "graded": 90,
+      "selfInduced": 72,
+      "preExisting": 18,
+      "unresolvable": 0,
+      "selfInducedPct": 80
     }
   ],
   "comparison": {
@@ -86,6 +96,13 @@
         "selfInduced": 28,
         "preExisting": 11,
         "selfInducedPct": 72
+      },
+      {
+        "round": 6,
+        "blocking": 26,
+        "selfInduced": 21,
+        "preExisting": 5,
+        "selfInducedPct": 81
       }
     ],
     "reading": "Pre-existing BLOCKING findings fall 36 -> 25 -> 20 -> 11 while the blocking total stays roughly flat (49, 38, 45, 39). The loop's blocking output is therefore increasingly self-referential: by round 5, 72% of blocking findings are against lines the experiment itself wrote. Round 5's figure is additionally distorted upward because six service-backed targets reviewed without live servers, so genuinely pre-existing live-only defects could not surface."

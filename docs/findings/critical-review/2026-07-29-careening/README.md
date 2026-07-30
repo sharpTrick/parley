@@ -132,6 +132,7 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 3 | 14 / 14 | 119 | 115 | 38 | 4 | 0 | no |
 | 4 | 14 / 14 | 120 | 113 | 45 | 7 | 0 | no |
 | 5 | 14 / 14 | 129 | 117 | 39 | 12 | 0 | no |
+| 6 | 14 / 14 | 90 | 86 | 26 | 4 | 0 | no |
 
 **Round 5 is degraded and its numbers should carry an asterisk.** The docker daemon died during the
 round, so the six service-backed targets (redis, postgres, matrix, xmpp, nats, core-auth) reviewed
@@ -250,6 +251,7 @@ same agent that wrote the fixes being judged.
 | 3 | 119 | 46 | 73 | **39%** |
 | 4 | 120 | 68 | 52 | **57%** |
 | 5 | 129 | 77 | 51 | **60%** |
+| 6 | 90 | 72 | 18 | **80%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
