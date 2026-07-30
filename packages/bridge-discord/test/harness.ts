@@ -7,7 +7,7 @@
 import type { MessageHandler, Topic } from '@sharptrick/parley-core';
 import { vi } from 'vitest';
 import type { DiscordPlugin } from '../src/index.js';
-import { instances, type FakeWs } from './fake-gateway.js';
+import { instances, REQUIRED_GATEWAY_QUERY, type FakeWs } from './fake-gateway.js';
 
 /** Large enough that a socket's heartbeat interval never fires inside a case. */
 export const HUGE_HB = 1_000_000;
@@ -50,6 +50,18 @@ export async function openedSocket(after: number): Promise<FakeWs> {
   const ws = instances.at(-1);
   if (ws === undefined) throw new Error('the plugin opened no gateway socket');
   return ws;
+}
+
+/**
+ * A dialed url with Discord's required connect params stripped, for the cases that ask WHICH edge
+ * was dialed rather than how. The params themselves are enforced by the fakes (a socket dialed
+ * without them is closed 4012) and asserted in `wire-contract.test.ts`.
+ */
+export function dialedBase(url: string): string {
+  const parsed = new URL(url);
+  for (const key of Object.keys(REQUIRED_GATEWAY_QUERY)) parsed.searchParams.delete(key);
+  const path = parsed.pathname === '/' ? '' : parsed.pathname;
+  return `${parsed.origin}${path}${parsed.search}`;
 }
 
 /** How `GET /gateway/bot` fails, for the cells that break URL resolution rather than the socket. */

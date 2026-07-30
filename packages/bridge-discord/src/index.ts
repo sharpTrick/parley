@@ -21,6 +21,8 @@ import {
   retryAfterFromHeader,
   sanitizeBody,
 } from '@sharptrick/parley-net-util';
+import { readFileSync } from 'node:fs';
+import { isIPv4, isIPv6 } from 'node:net';
 import WebSocket from 'ws';
 import { INTENTS, REQUIRED_INTENTS } from './intents.js';
 
@@ -102,6 +104,34 @@ const OP = {
 
 /** The default mention scope of every `post` — see {@link DiscordBackendConfig.allowed_mentions}. */
 const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
+
+/**
+ * Query params Discord documents as REQUIRED on the gateway CONNECT url — and which the url
+ * `GET /gateway/bot` hands back carries NEITHER of. Keep both on every dial, so that the socket
+ * does not land on a decommissioned API version: that answers close 4012, which is terminal, so the
+ * ladder stops and a correctly provisioned bot never starts.
+ */
+const GATEWAY_QUERY: Record<string, string> = { v: '10', encoding: 'json' };
+
+/** This package's published version — the release pipeline stamps `package.json`, never source. */
+const VERSION = (
+  JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    version: string;
+  }
+).version;
+
+/**
+ * Discord's REST API requires a `DiscordBot ($url, $version)` User-Agent and documents that a
+ * request without a valid one "may be blocked and return a Cloudflare error". Keep the version read
+ * from the manifest, so that a release cannot ship a stale literal.
+ */
+const USER_AGENT = `DiscordBot (https://github.com/sharpTrick/parley, ${VERSION})`;
+
+/** Schemes that put a bot token on the wire in the clear, and what to use instead. */
+const PLAINTEXT_SCHEMES = new Map([
+  ['http:', 'https://'],
+  ['ws:', 'wss://'],
+]);
 
 /**
  * Channel types that DO carry `MESSAGE_CREATE` under this intent set (GUILDS | GUILD_MESSAGES |
@@ -298,6 +328,8 @@ export class DiscordPlugin implements BackendPlugin {
     this.invalidSessionWaitMs = 0;
     this.nextDialAt = 0;
     this.seq = null;
+
+    for (const risk of plaintextCredentialRisks(cfg)) this.warn(`SECURITY: ${risk}`);
   }
 
   async disconnect(): Promise<void> {
@@ -779,8 +811,8 @@ export class DiscordPlugin implements BackendPlugin {
    * the socket. Re-resolved per attempt: Discord does not promise the url survives an outage.
    */
   private async dial(): Promise<void> {
-    const url = this.gatewayUrlOverride ?? (await this.resolveGatewayUrl());
-    await this.openSocket(url);
+    const base = this.gatewayUrlOverride ?? (await this.resolveGatewayUrl());
+    await this.openSocket(gatewayDialUrl(base));
   }
 
   private async resolveGatewayUrl(): Promise<string> {
@@ -1010,7 +1042,8 @@ export class DiscordPlugin implements BackendPlugin {
   }
 
   /**
-   * Single HTTP entry point. Adds `Authorization: Bot <token>`, JSON encodes, and transparently
+   * Single HTTP entry point. Adds `Authorization: Bot <token>` and Discord's required
+   * {@link USER_AGENT}, JSON encodes, and transparently
    * retries on 429 honoring Discord's JSON `retry_after` (SECONDS, float — converted to ms).
    * Retries stop the moment we disconnect, so an aborted test never leaves a loop hammering the
    * API. Throws on unexpected non-2xx.
@@ -1021,7 +1054,7 @@ export class DiscordPlugin implements BackendPlugin {
     opts?: { body?: unknown; allowStatuses?: number[]; deadlineMs?: number },
   ): Promise<Response> {
     const url = `${this.apiUrl}${path}`;
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { 'User-Agent': USER_AGENT };
     if (this.token !== undefined) headers.Authorization = `Bot ${this.token}`;
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
 
@@ -1063,6 +1096,69 @@ function requireDistinctChannels(map: Map<string, string>): Map<string, string> 
     owner.set(channel, topic);
   }
   return owner;
+}
+
+/**
+ * The url actually dialed: the resolved (or overridden) base carrying {@link GATEWAY_QUERY}. The
+ * params are SET rather than defaulted, so that a base carrying a stale `v` or an `encoding` this
+ * plugin cannot parse never decides the wire format; every other param on the base survives.
+ */
+function gatewayDialUrl(base: string): string {
+  const url = new URL(base);
+  for (const [key, value] of Object.entries(GATEWAY_QUERY)) url.searchParams.set(key, value);
+  return url.toString();
+}
+
+/**
+ * Every configured endpoint that would carry the bot token in the clear, phrased for the operator's
+ * stderr. A warning rather than a load error, so that a loopback fake or a dev proxy still runs.
+ */
+function plaintextCredentialRisks(cfg: DiscordBackendConfig): string[] {
+  const endpoints: Array<[key: string, value: string | undefined, carries: string]> = [
+    ['api_url', cfg.api_url, 'the `Authorization: Bot <token>` header of every REST call'],
+    ['gateway_url', cfg.gateway_url, 'the bot token in the gateway IDENTIFY'],
+  ];
+  const risks: string[] = [];
+  for (const [key, value, carries] of endpoints) {
+    if (value === undefined) continue;
+    const plaintext = plaintextRemoteOrigin(value);
+    if (plaintext === undefined) continue;
+    risks.push(
+      `backend_config.${key} ${plaintext.origin} is a plaintext scheme to a non-loopback host, so ` +
+        `${carries} crosses the network unencrypted, where anyone on the path can take the token ` +
+        `and post as this bot. Use ${plaintext.secure} for any remote endpoint.`,
+    );
+  }
+  return risks;
+}
+
+/** The origin of a plaintext-scheme URL to a non-loopback host, with the scheme to use instead. */
+function plaintextRemoteOrigin(raw: string): { origin: string; secure: string } | undefined {
+  try {
+    const { protocol, hostname, origin } = new URL(raw);
+    const secure = PLAINTEXT_SCHEMES.get(protocol);
+    return secure !== undefined && !isLoopbackHost(hostname) ? { origin, secure } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this
+ * a parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
+ * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
+ * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
+ * address, counts as remote: an unproven host is warned about rather than excused.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
+  if (host === 'localhost') return true;
+  if (isIPv4(host)) return host.startsWith('127.');
+  if (!isIPv6(host)) return false;
+  const groups = host.split(':');
+  const tail = groups.pop() ?? '';
+  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
+  return Number.parseInt(tail, 16) === 1;
 }
 
 /**

@@ -22,6 +22,7 @@ import {
 } from '../src/index.js';
 import { FakeWs, instances, resetGateway, state, totalIdentifies } from './fake-gateway.js';
 import {
+  dialedBase,
   HUGE_HB,
   NO_HANDSHAKE_TIMEOUT,
   openedSocket,
@@ -642,13 +643,13 @@ describe('Discord gateway recovery, whenever the failure lands', () => {
     const before = gw.instances.length;
     void plugin.subscribe(TOPIC, () => undefined).catch(() => undefined);
     const first = await openedSocket(before);
-    expect(first.url).toBe('ws://first');
+    expect(dialedBase(first.url)).toBe('ws://first');
 
     rest.gatewayUrl = 'ws://second'; // Discord hands out a different edge after the outage
     const pump = dialPump((ms) => vi.advanceTimersByTimeAsync(ms), HUGE_HB);
     await pump(8, 1000);
 
-    expect(gw.instances.at(-1)!.url).toBe('ws://second');
+    expect(dialedBase(gw.instances.at(-1)!.url)).toBe('ws://second');
     await plugin.disconnect();
   });
 });

@@ -12,8 +12,15 @@ vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs
 
 import { DiscordPlugin } from '../src/index.js';
 import { REQUIRED_INTENTS } from '../src/intents.js';
-import { FAKE_TOKEN, FakeWs, instances, resetGateway, state } from './fake-gateway.js';
-import { HUGE_HB, reachReady, stubFetch } from './harness.js';
+import {
+  FAKE_TOKEN,
+  FakeWs,
+  instances,
+  REQUIRED_GATEWAY_QUERY,
+  resetGateway,
+  state,
+} from './fake-gateway.js';
+import { HUGE_HB, reachReady, stubFetch, type FetchStub } from './harness.js';
 
 const TOPIC = asTopic('920001');
 
@@ -129,4 +136,192 @@ describe('the fake gateway refuses an IDENTIFY the real one would refuse', () =>
 
     await plugin.disconnect();
   });
+});
+
+// CLASS: a vendor wire obligation carried on the CONNECT URL rather than in a frame — invisible to
+// a fake that accepts any url. Discord documents `v` and `encoding` as REQUIRED, and the url
+// `GET /gateway/bot` hands back carries neither, so an unversioned dial lands on a decommissioned
+// API version and is closed 4012 — TERMINAL, which stops the ladder and fails the first subscribe,
+// i.e. a correctly provisioned bot never starts. Both url SOURCES run every base shape, because the
+// override is the one the tests use and the resolved one is the only one production uses.
+describe('the gateway CONNECT url carries the params Discord requires', () => {
+  let rest: FetchStub;
+
+  beforeEach(() => {
+    resetGateway();
+    rest = stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const BASES: Array<{ label: string; base: string; keeps?: [string, string] }> = [
+    { label: 'no query at all', base: 'ws://edge.test' },
+    { label: 'a trailing slash', base: 'ws://edge.test/' },
+    { label: 'a path', base: 'ws://edge.test/gateway' },
+    { label: 'the required params already set', base: 'ws://edge.test/?v=10&encoding=json' },
+    {
+      label: 'an unrelated param',
+      base: 'ws://edge.test/?compress=zlib-stream',
+      keeps: ['compress', 'zlib-stream'],
+    },
+    { label: 'a stale v', base: 'ws://edge.test/?v=6' },
+    { label: 'an encoding this plugin cannot parse', base: 'ws://edge.test/?encoding=etf' },
+  ];
+
+  const SOURCES: Array<[string, (base: string) => Promise<DiscordPlugin>]> = [
+    [
+      'a gateway_url override',
+      async (base) => {
+        const plugin = new DiscordPlugin();
+        await plugin.connect({ token: FAKE_TOKEN, gateway_url: base });
+        return plugin;
+      },
+    ],
+    [
+      'a url resolved via GET /gateway/bot',
+      async (base) => {
+        rest.gatewayUrl = base;
+        const plugin = new DiscordPlugin();
+        await plugin.connect({ token: FAKE_TOKEN });
+        return plugin;
+      },
+    ],
+  ];
+
+  for (const { label, base, keeps } of BASES) {
+    for (const [sourceLabel, arrange] of SOURCES) {
+      it(`dials a base with ${label} versioned and JSON-encoded (via ${sourceLabel})`, async () => {
+        const plugin = await arrange(base);
+        const ws = await reachReady(plugin, TOPIC);
+
+        const dialed = new URL(ws.url);
+        for (const [key, value] of Object.entries(REQUIRED_GATEWAY_QUERY)) {
+          expect(dialed.searchParams.getAll(key), `${key} on ${ws.url}`).toEqual([value]);
+        }
+        expect(dialed.origin).toBe(new URL(base).origin);
+        expect(dialed.pathname).toBe(new URL(base).pathname);
+        if (keeps !== undefined) expect(dialed.searchParams.get(keeps[0])).toBe(keeps[1]);
+        // The socket the fake accepted, not merely a string: a refused dial closes 4012.
+        expect(ws.closedCode).toBeUndefined();
+
+        await plugin.disconnect();
+      });
+    }
+  }
+
+  // The negative control for the enforcement above: without it every row would pass on a plugin
+  // that dials the bare url, because nothing else in the suite reads the connect url.
+  it('the fake refuses a socket dialed without them, before any HELLO', () => {
+    const ws = new FakeWs('ws://edge.test');
+    ws.hello(HUGE_HB);
+    expect(ws.closedCode).toBe(4012);
+  });
+});
+
+// CLASS: a gateway obligation only the real provider punishes. op 1 is how Discord probes a socket
+// it suspects is dead: a client that does not answer with its own op 1 is closed, and every
+// subscription and every parked long-poll on that socket dies with it — on a schedule only the
+// provider controls, so nothing local reproduces it. The fake closes 4009 on an unanswered probe,
+// so the branch cannot be deleted without losing rows. (op 7, op 9 and a withheld op 11 are driven
+// by gateway-reconnect.test.ts.)
+describe('the client answers a server-initiated heartbeat request', () => {
+  beforeEach(() => {
+    resetGateway();
+    stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const connected = async (): Promise<DiscordPlugin> => {
+    const plugin = new DiscordPlugin();
+    await plugin.connect({ token: FAKE_TOKEN, gateway_url: 'ws://fake' });
+    return plugin;
+  };
+
+  // The `d` axis: a heartbeat carries the last dispatch `s` the socket saw, which is what lets
+  // Discord tell a live session from a stalled one — `null` until it has dispatched anything.
+  const PHASES: Array<{
+    label: string;
+    drive: (plugin: DiscordPlugin) => Promise<FakeWs>;
+    answers: boolean;
+    seq?: number | null;
+  }> = [
+    {
+      label: 'before READY, with nothing dispatched yet',
+      drive: async (plugin) => {
+        state.onIdentify = () => undefined; // accepted, but READY withheld
+        void plugin.subscribe(TOPIC, () => undefined).catch(() => undefined);
+        const ws = instances.at(-1)!;
+        ws.hello(HUGE_HB);
+        await vi.advanceTimersByTimeAsync(0);
+        return ws;
+      },
+      answers: true,
+      seq: null,
+    },
+    {
+      label: 'after READY',
+      drive: async (plugin) => reachReady(plugin, TOPIC),
+      answers: true,
+      seq: 1,
+    },
+    {
+      label: 'after a run of dispatches',
+      drive: async (plugin) => {
+        const ws = await reachReady(plugin, TOPIC);
+        for (const s of [2, 3, 4]) {
+          ws.serverSend({ op: 0, t: 'MESSAGE_CREATE', s, d: dispatched(String(900 + s)) });
+        }
+        return ws;
+      },
+      answers: true,
+      seq: 4,
+    },
+    {
+      label: 'on a socket the plugin has superseded',
+      drive: async (plugin) => {
+        const ws = await reachReady(plugin, TOPIC);
+        await plugin.connect({ token: FAKE_TOKEN, gateway_url: 'ws://fake' });
+        return ws;
+      },
+      answers: false,
+    },
+  ];
+
+  for (const phase of PHASES) {
+    it(`${phase.label}: ${phase.answers ? 'echoes the last dispatch seq' : 'stays silent'}`, async () => {
+      const plugin = await connected();
+      const ws = await phase.drive(plugin);
+      const before = ws.heartbeatsSent();
+
+      ws.requestHeartbeat();
+
+      expect(ws.heartbeatsSent()).toBe(before + (phase.answers ? 1 : 0));
+      if (phase.answers) {
+        expect(ws.heartbeatSeqs().at(-1)).toBe(phase.seq);
+        expect(ws.seqSent()).toBe(phase.seq); // the assertion above compares to what WAS dispatched
+        expect(ws.closedCode).toBeUndefined();
+      }
+
+      await plugin.disconnect();
+    });
+  }
+});
+
+const dispatched = (id: string): Record<string, unknown> => ({
+  id,
+  channel_id: TOPIC as string,
+  content: 'hi',
+  timestamp: '',
+  author: { id: '1', username: 'u' },
 });

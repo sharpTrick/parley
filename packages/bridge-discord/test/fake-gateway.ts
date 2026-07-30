@@ -10,11 +10,24 @@
  * driven from. Module state is per test FILE — call {@link resetGateway} in `beforeEach`.
  *
  * Like the real gateway, it REFUSES an IDENTIFY that does not carry the expected bot token (4004)
- * or that is missing a required intent bit (4014) — keep those checks ahead of
- * {@link state.onIdentify}, so that a plugin change which stops sending either cannot be scripted
- * past them.
+ * or that is missing a required intent bit (4014), a CONNECT url missing Discord's required
+ * `v`/`encoding` query params (4012, before any HELLO), and a socket that does not answer a
+ * server-initiated op 1 (4009) — keep those checks ahead of {@link state.onIdentify}, so that a
+ * plugin change which stops sending one cannot be scripted past them.
  */
 import { REQUIRED_INTENTS } from '../src/intents.js';
+
+/** The CONNECT-url query Discord requires; a socket dialed without it never reaches HELLO. */
+export const REQUIRED_GATEWAY_QUERY: Record<string, string> = { v: '10', encoding: 'json' };
+
+export const gatewayQueryOk = (url: string): boolean => {
+  try {
+    const { searchParams } = new URL(url);
+    return Object.entries(REQUIRED_GATEWAY_QUERY).every(([k, v]) => searchParams.get(k) === v);
+  } catch {
+    return false;
+  }
+};
 
 export class FakeWs {
   static readonly OPEN = 1;
@@ -25,8 +38,12 @@ export class FakeWs {
   closedCode: number | undefined = undefined;
   ackHeartbeats = true;
   private readonly listeners: Record<string, Array<(arg: unknown) => void>> = {};
+  private readonly unversioned: boolean;
+  /** The `s` of the last dispatch this "server" sent — what a client heartbeat must echo. */
+  private dispatchedSeq: number | null = null;
 
   constructor(readonly url: string) {
+    this.unversioned = !gatewayQueryOk(url);
     instances.push(this);
   }
 
@@ -86,7 +103,30 @@ export class FakeWs {
 
   // --- test-side "server" helpers ---
   serverSend(payload: Record<string, unknown>): void {
+    if (this.unversioned) {
+      this.serverClose(4012); // real Discord answers an unversioned connect, not the protocol
+      return;
+    }
+    if (typeof payload.s === 'number') this.dispatchedSeq = payload.s;
     this.fire('message', Buffer.from(JSON.stringify(payload)));
+  }
+  /**
+   * Discord probes a socket it suspects is dead with a server-initiated op 1 and closes one that
+   * does not answer with its own op 1. Model the punishment here rather than in a case, so that a
+   * client which stops answering loses every case that probes instead of only an assertion.
+   */
+  requestHeartbeat(): void {
+    const before = this.heartbeatsSent();
+    this.serverSend({ op: 1 });
+    if (this.heartbeatsSent() === before) this.serverClose(4009);
+  }
+  /** The `d` of every heartbeat the client sent, oldest first — each must echo {@link seqSent}. */
+  heartbeatSeqs(): unknown[] {
+    return this.sent.filter((f) => f.op === 1).map((f) => f.d);
+  }
+  /** The last dispatch `s` this socket sent, or null when it has dispatched nothing. */
+  seqSent(): number | null {
+    return this.dispatchedSeq;
   }
   hello(interval: number): void {
     this.serverSend({ op: 10, d: { heartbeat_interval: interval } });

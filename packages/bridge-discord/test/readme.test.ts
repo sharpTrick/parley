@@ -5,7 +5,7 @@ import {
   MAX_BACKOFF_MS,
 } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 
@@ -56,6 +56,79 @@ describe('bridge-discord README — the IDENTIFY quota arithmetic is the ladder�
 
   it('states the cap the ladder actually applies', () => {
     expect(SESSIONS).toContain(`${RECONNECT_CAP_MS / 1000}s × gateway_dialers`);
+  });
+});
+
+// CLASS: a README that documents the isolation rule but not the case that breaks it. The `subscribe`
+// row argues at length that a per-topic failure must not fail core's attach — and a TERMINAL gateway
+// close on the first subscribe does exactly that, taking the REST half down with it. So each class
+// of gateway failure is DRIVEN here and the observed attach outcome is required to have a sentence
+// in the README naming it: a row whose behaviour and prose disagree fails.
+describe('bridge-discord README — the gateway-failure prose is the observed behaviour', () => {
+  const SUBSCRIBE_ROW = README.slice(README.indexOf('| `subscribe`'), README.indexOf('| `resolveIdentity`'));
+  const PROVISIONING = README.slice(README.indexOf('## Provisioning'));
+
+  /** What the README must SAY for each observed outcome, and where it must say it. */
+  const OUTCOMES = {
+    resolves: [/does \*\*not\*\* fail `subscribe`/],
+    rejects: [/it fails `subscribe`/, /the bridge exits/, /parley-discord: fatal/],
+  } as const;
+
+  const FAILURES: Array<{
+    label: string;
+    arrange: (fake: FakeDiscord) => void;
+    outcome: keyof typeof OUTCOMES;
+    /** Omit `gateway_url` so the failure is the url LOOKUP rather than the socket. */
+    resolveUrl?: boolean;
+  }> = [
+    { label: 'a transient drop before READY (1006)', arrange: (f) => f.scriptGateway('drop'), outcome: 'resolves' },
+    { label: 'a handshake that stalls', arrange: (f) => f.scriptGateway('stall'), outcome: 'resolves' },
+    {
+      label: 'a GET /gateway/bot that answers 500',
+      arrange: (f) => f.injectFault({ status: 500, path: '/gateway/bot', body: { message: 'nope' } }),
+      outcome: 'resolves',
+      resolveUrl: true,
+    },
+    { label: 'terminal 4004 (bad token)', arrange: (f) => f.scriptGateway(4004), outcome: 'rejects' },
+    { label: 'terminal 4012 (invalid API version)', arrange: (f) => f.scriptGateway(4012), outcome: 'rejects' },
+    { label: 'terminal 4014 (disallowed intent)', arrange: (f) => f.scriptGateway(4014), outcome: 'rejects' },
+  ];
+
+  for (const failure of FAILURES) {
+    it(`${failure.label} → subscribe ${failure.outcome}, and the README says so`, async () => {
+      vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      const fake = await startFakeDiscord();
+      const topic = asTopic('740000000000000009');
+      fake.createChannel(topic as string);
+      failure.arrange(fake);
+
+      const plugin = new DiscordPlugin();
+      await plugin.connect({
+        token: 'fake-token',
+        api_url: fake.apiUrl,
+        handshake_timeout_ms: 150,
+        ...(failure.resolveUrl === true ? {} : { gateway_url: fake.gatewayUrl }),
+      });
+      const attach = await plugin
+        .subscribe(topic, () => undefined)
+        .then(() => 'resolves' as const, () => 'rejects' as const);
+
+      expect(attach).toBe(failure.outcome);
+      for (const sentence of OUTCOMES[failure.outcome]) {
+        expect(
+          sentence.test(SUBSCRIBE_ROW) || sentence.test(PROVISIONING),
+          `the README never states that ${failure.label} ${failure.outcome === 'rejects' ? 'fails core’s attach' : 'is survivable'}`,
+        ).toBe(true);
+      }
+
+      await plugin.disconnect();
+      await fake.close();
+      vi.restoreAllMocks();
+    });
+  }
+
+  it('names the terminal close codes the plugin actually treats as terminal', () => {
+    expect(SUBSCRIBE_ROW).toContain('4004/4010–4014');
   });
 });
 

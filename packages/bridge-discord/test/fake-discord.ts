@@ -10,10 +10,13 @@
  *     absent-topic mapping is exercised rather than papered over by an invented empty page.
  *     `createChannel` takes the channel `type` (default `0`, a guild text channel), so a DM class
  *     that can never carry push is representable.
- *   - Every REST path REFUSES a request whose `Authorization` is not `Bot <token>` (`401`), the
- *     gateway refuses an IDENTIFY without that token (4004) or missing a required intent (4014),
- *     and `POST .../messages` refuses a body with no `allowed_mentions`. Keep those refusals here,
- *     so that a plugin change which stops sending one loses a test instead of passing silently.
+ *   - Every REST path REFUSES a request whose `User-Agent` is not Discord's required
+ *     `DiscordBot ($url, $version)` (`403`, the way Cloudflare answers in front of the API) or whose
+ *     `Authorization` is not `Bot <token>` (`401`); the gateway refuses a CONNECT url missing the
+ *     required `v`/`encoding` query params (4012), an IDENTIFY without that token (4004) or missing
+ *     a required intent (4014), and `POST .../messages` refuses a body with no `allowed_mentions`.
+ *     Keep those refusals here, so that a plugin change which stops sending one loses a test
+ *     instead of passing silently.
  *   - `GET /channels/:id/messages` honors `after` (EXCLUSIVE, BigInt compare), `before`
  *     (EXCLUSIVE, backward paging) and `limit` (1–100, else `400`), and returns the page
  *     NEWEST-FIRST — so the plugin's reverse-to-ascending is exercised.
@@ -22,13 +25,18 @@
  *     receive their own sends), with a per-socket event seq `s`.
  *   - `injectFault` scripts any status/headers/body (429 with header and/or body `retry_after`,
  *     403 Missing Access, 500 …) so the error half of the plugin is testable; `closeGateway`
- *     forces a gateway close code onto live sockets.
+ *     forces a gateway close code onto live sockets, and `scriptGateway` decides how the NEXT
+ *     connection is answered (a close code, a drop, or a stall).
  *   - Gateway: op 10 HELLO on connect; op 2 IDENTIFY → op 0 READY; op 1 heartbeat → op 11 ack.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { REQUIRED_INTENTS } from '../src/intents.js';
+import { gatewayQueryOk } from './fake-gateway.js';
+
+/** Discord's documented User-Agent shape; Cloudflare may block a request without one. */
+export const USER_AGENT_RE = /^DiscordBot \(.+, .+\)$/;
 
 /** The fake's one bot account (`GET /users/@me`, and `author` on every stored message). */
 export const BOT_USER = { id: '990000000000000001', username: 'parley-bot' };
@@ -106,8 +114,16 @@ export interface FakeDiscord {
   requestCount(pathIncludes?: string): number;
   /** The raw `path?query` of every request received so far, oldest first — undecoded. */
   requests(): string[];
+  /** The `User-Agent` of every request received so far, oldest first (`''` when absent). */
+  userAgents(): string[];
   /** Close every connected gateway socket with an explicit gateway close code. */
   closeGateway(code: number): void;
+  /**
+   * How the fake answers every LATER gateway connection: `undefined` speaks the protocol, a number
+   * closes with that code before HELLO, `'drop'` cuts the connection (1006), and `'stall'` accepts
+   * the socket and then says nothing.
+   */
+  scriptGateway(script: number | 'stall' | 'drop' | undefined): void;
   close(): Promise<void>;
 }
 
@@ -120,8 +136,10 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
   const sockets = new Map<WebSocket, { identified: boolean; seq: number }>();
   const faults: FakeFault[] = [];
   const requests: string[] = [];
+  const userAgents: string[] = [];
   const accepted: Array<{ channelId: string; body: Record<string, unknown> }> = [];
   let gatewayUrl = ''; // known after listen(); read lazily by the request handler
+  let gatewayScript: number | 'stall' | 'drop' | undefined;
 
   const broadcast = (msg: FakeMessage): void => {
     for (const [ws, state] of sockets) {
@@ -150,7 +168,13 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     requests.push(url.pathname + url.search);
+    userAgents.push(req.headers['user-agent'] ?? '');
 
+    // Cloudflare sits in FRONT of the API, so an unidentified client never reaches the credential
+    // check — keep this first, so that a row varying the token cannot mask a missing User-Agent.
+    if (!USER_AGENT_RE.test(req.headers['user-agent'] ?? '')) {
+      return json(res, 403, { message: 'error code: 1010', code: 0 });
+    }
     if (req.headers.authorization !== `Bot ${token}`) {
       return json(res, 401, { message: '401: Unauthorized', code: 0 });
     }
@@ -264,7 +288,16 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
   }
 
   const wss = new WebSocketServer({ server });
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    if (!gatewayQueryOk(`ws://127.0.0.1${req.url ?? ''}`)) {
+      ws.close(4012); // an unversioned connect never gets HELLO out of real Discord either
+      return;
+    }
+    if (gatewayScript !== undefined) {
+      if (typeof gatewayScript === 'number') ws.close(gatewayScript);
+      else if (gatewayScript === 'drop') ws.terminate();
+      return;
+    }
     const state = { identified: false, seq: 0 };
     sockets.set(ws, state);
     ws.on('close', () => sockets.delete(ws));
@@ -334,8 +367,12 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
         ? requests.length
         : requests.filter((p) => p.includes(pathIncludes)).length,
     requests: () => [...requests],
+    userAgents: () => [...userAgents],
     closeGateway: (code: number) => {
       for (const ws of sockets.keys()) ws.close(code);
+    },
+    scriptGateway: (script) => {
+      gatewayScript = script;
     },
     close: async () => {
       for (const ws of sockets.keys()) ws.terminate();

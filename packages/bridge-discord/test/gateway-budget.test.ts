@@ -17,7 +17,7 @@ import {
   state,
   totalIdentifies,
 } from './fake-gateway.js';
-import { HUGE_HB, NO_HANDSHAKE_TIMEOUT, reachReady, stubFetch } from './harness.js';
+import { dialedBase, HUGE_HB, NO_HANDSHAKE_TIMEOUT, reachReady, stubFetch } from './harness.js';
 import { dialCeiling, ladderDelays } from './ladder.js';
 
 const HOUR_MS = 3_600_000;
@@ -199,7 +199,7 @@ describe('Discord IDENTIFY budget is per BOT TOKEN, not per process', () => {
       expect(dialers * (DAY_MS / steadyState)).toBeLessThan(QUOTA_PER_DAY);
       // Every instance actually climbed, so the number above measures a ladder that ran.
       for (const url of urls) {
-        expect(instances.filter((ws) => ws.url === url).length).toBeGreaterThan(1);
+        expect(instances.filter((ws) => dialedBase(ws.url) === url).length).toBeGreaterThan(1);
       }
 
       await Promise.all(fleet.map((p) => p.disconnect()));
@@ -349,9 +349,9 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
           await vi.advanceTimersByTimeAsync(300_000);
 
           // Nothing from the first session may dial, IDENTIFY, or dispatch into the second one.
-          expect(instances.slice(opened).map((ws) => ws.url)).toEqual([NEW_URL]);
+          expect(instances.slice(opened).map((ws) => dialedBase(ws.url))).toEqual([NEW_URL]);
           expect(openSockets()).toHaveLength(1);
-          expect(openSockets()[0]!.url).toBe(NEW_URL);
+          expect(dialedBase(openSockets()[0]!.url)).toBe(NEW_URL);
 
           // Usable, not merely un-dialed: the second session's own subscription must carry push,
           // while the torn-down session's handler must be unreachable — a registry that survived

@@ -10,6 +10,7 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
 import {
@@ -20,8 +21,16 @@ import {
   GROUP_DM,
   PAGE_LIMIT,
   startFakeDiscord,
+  USER_AGENT_RE,
   type FakeDiscord,
 } from './fake-discord.js';
+
+/** Read from the manifest the release pipeline stamps — never a literal this file could stale. */
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    version: string;
+  }
+).version;
 
 /** A blocking window wide enough that a prompt REST failure lands well inside the call's budget. */
 const BLOCK_MS = 2000;
@@ -536,34 +545,102 @@ describe('Discord REST contract', () => {
     }
   });
 
-  describe('the REST credential is on every request', () => {
-    // CLASS: a credential only the PROVIDER can miss. Deleting the `Authorization` header changes
-    // nothing locally; real Discord answers 401 on every path. The fake refuses the same way, and
-    // these rows prove that refusal is real rather than decorative.
-    const HEADERS: Array<[string, Record<string, string>]> = [
-      ['no Authorization at all', {}],
-      ['a bearer token instead of a bot token', { Authorization: 'Bearer fake-token' }],
-      ['the wrong bot token', { Authorization: 'Bot not-the-token' }],
-    ];
-    const PATHS = ['/users/@me', '/gateway/bot'];
+  describe('the headers Discord requires are on every request', () => {
+    // CLASS: a header only the PROVIDER can miss. Dropping `Authorization` or the `User-Agent`
+    // Discord's reference mandates (`DiscordBot ($url, $version)`) changes nothing in-process; real
+    // Discord answers 401, and Cloudflare — which sits in FRONT of the API — blocks a client that
+    // does not identify itself. So the axis is (required header × every path the plugin calls), the
+    // fake refuses both, and the last case asserts the plugin's OWN calls satisfy them.
+    const OTHER_UA = 'DiscordBot (https://example.test/other-client, 9.9.9)';
 
-    for (const [label, headers] of HEADERS) {
-      for (const path of PATHS) {
-        it(`${path} with ${label} is refused`, async () => {
-          const res = await fetch(`${fake.apiUrl}${path}`, { headers });
-          expect(res.status).toBe(401);
+    const CALLS: Array<[string, (id: string) => { path: string; init?: RequestInit }]> = [
+      ['GET /users/@me', () => ({ path: '/users/@me' })],
+      ['GET /gateway/bot', () => ({ path: '/gateway/bot' })],
+      ['GET /channels/:id', (id) => ({ path: `/channels/${id}` })],
+      ['GET /channels/:id/messages', (id) => ({ path: `/channels/${id}/messages?limit=1` })],
+      [
+        'POST /channels/:id/messages',
+        (id) => ({
+          path: `/channels/${id}/messages`,
+          init: {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: 'hi', allowed_mentions: { parse: [] } }),
+          },
+        }),
+      ],
+    ];
+
+    const REFUSALS: Array<[string, Record<string, string>, number]> = [
+      ['no Authorization at all', { 'User-Agent': OTHER_UA }, 401],
+      [
+        'a bearer token instead of a bot token',
+        { 'User-Agent': OTHER_UA, Authorization: 'Bearer fake-token' },
+        401,
+      ],
+      ['the wrong bot token', { 'User-Agent': OTHER_UA, Authorization: 'Bot not-the-token' }, 401],
+      ['no User-Agent beyond the runtime default', { Authorization: `Bot ${FAKE_TOKEN}` }, 403],
+      [
+        'a User-Agent that is not Discord’s shape',
+        { 'User-Agent': 'parley/1.0', Authorization: `Bot ${FAKE_TOKEN}` },
+        403,
+      ],
+      [
+        'a DiscordBot User-Agent carrying no version',
+        {
+          'User-Agent': 'DiscordBot (https://example.test/other-client)',
+          Authorization: `Bot ${FAKE_TOKEN}`,
+        },
+        403,
+      ],
+    ];
+
+    const send = (
+      id: string,
+      call: (id: string) => { path: string; init?: RequestInit },
+      headers: Record<string, string>,
+    ): Promise<Response> => {
+      const { path, init } = call(id);
+      return fetch(`${fake.apiUrl}${path}`, {
+        ...init,
+        headers: { ...(init?.headers as Record<string, string>), ...headers },
+      });
+    };
+
+    for (const [label, headers, status] of REFUSALS) {
+      for (const [callLabel, call] of CALLS) {
+        it(`${callLabel} with ${label} is refused ${status}`, async () => {
+          expect((await send(liveTopic() as string, call, headers)).status).toBe(status);
         });
       }
     }
 
-    for (const path of PATHS) {
-      it(`${path} with the configured bot token succeeds`, async () => {
-        const res = await fetch(`${fake.apiUrl}${path}`, {
-          headers: { Authorization: `Bot ${FAKE_TOKEN}` },
-        });
-        expect(res.status).toBe(200);
+    for (const [callLabel, call] of CALLS) {
+      it(`${callLabel} with both required headers succeeds`, async () => {
+        const headers = { 'User-Agent': OTHER_UA, Authorization: `Bot ${FAKE_TOKEN}` };
+        expect((await send(liveTopic() as string, call, headers)).status).toBe(200);
       });
     }
+
+    // The plugin's own traffic, across every seam entry point that makes a REST call: the version
+    // segment is read from the manifest rather than restated, so a hand-written literal in `http()`
+    // that stops tracking releases loses this case.
+    it('every request the plugin makes carries a versioned DiscordBot User-Agent', async () => {
+      const topic = liveTopic();
+      await plugin.post(topic, SENDER, 'hello');
+      await plugin.fetchRecent({ topic });
+      await plugin.resolveIdentity(SENDER);
+      await plugin.subscribe(topic, () => undefined);
+
+      const seen = fake.userAgents();
+      expect(seen.length).toBeGreaterThan(3);
+      for (const ua of seen) {
+        expect(ua, 'a request reached Discord without the required User-Agent').toMatch(
+          USER_AGENT_RE,
+        );
+        expect(ua).toContain(`, ${PACKAGE_VERSION})`);
+      }
+    });
   });
 
   describe('outbound mention scope', () => {
@@ -620,7 +697,11 @@ describe('Discord REST contract', () => {
       fake.createChannel(id);
       const res = await fetch(`${fake.apiUrl}/channels/${id}/messages`, {
         method: 'POST',
-        headers: { Authorization: `Bot ${FAKE_TOKEN}`, 'Content-Type': 'application/json' },
+        headers: {
+          Authorization: `Bot ${FAKE_TOKEN}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'DiscordBot (https://example.test/other-client, 9.9.9)',
+        },
         body: JSON.stringify({ content: '@everyone' }),
       });
       expect(res.status).toBe(400);
