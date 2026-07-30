@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { readdirSync, readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
@@ -165,6 +166,39 @@ async function timersLeftBy(body: () => Promise<unknown>): Promise<TimerEntry[]>
 
 const res = (status: number, body = '', headers: Record<string, string> = {}): Response =>
   new Response(body, { status, headers });
+
+/**
+ * Registrations a call can leave on a signal it does not own. `AbortSignal.any` records the
+ * composite in the SOURCE signal's DEPENDENT set rather than as a listener, and Node prunes none of
+ * them while the source lives — so this reads both, or a leak simply moves from one to the other.
+ */
+const dependentsKey = (signal: AbortSignal): symbol | undefined =>
+  Object.getOwnPropertySymbols(signal).find((s) => /DependantSignals/i.test(String(s.description)));
+
+function registrationsOn(signal: AbortSignal): { listeners: number; dependents: number } {
+  const key = dependentsKey(signal);
+  const set =
+    key === undefined ? undefined : (signal as unknown as Record<symbol, { size?: number }>)[key];
+  return { listeners: getEventListeners(signal, 'abort').length, dependents: set?.size ?? 0 };
+}
+
+/** Run `n` calls against ONE caller-owned controller, and report what they left on its signal. */
+async function residueLeftBy(n: number): Promise<{ listeners: number; dependents: number }> {
+  const controller = new AbortController();
+  let call = 0;
+  vi.stubGlobal('fetch', () => Promise.resolve(res(++call % 2 === 0 ? 500 : 200, 'body')));
+  for (let i = 0; i < n; i++) {
+    await fetchWithRetry(
+      'https://x/y',
+      { signal: controller.signal },
+      { label: 'L', isStopped: () => false, maxAttempts: 1 },
+    ).then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+  return registrationsOn(controller.signal);
+}
 
 const rejects = async (p: Promise<unknown>): Promise<Error> =>
   p.then(
@@ -567,6 +601,31 @@ describe('fetchWithRetry', () => {
     expect(err.message.startsWith('L → 429: ')).toBe(true);
   });
 
+  // The same class one exit further along: a teardown ends the retry AFTER the 429 arrived, so the
+  // status is just as known here as at the attempt cap. A caller that branches on `statusOf` — to
+  // tell "we were rate limited" from "the transport died" while shutting down — reads the field on
+  // every exit or on none.
+  it.each([
+    ['a stop already true when the 429 lands', () => true],
+    [
+      'a stop landing during the backoff',
+      (() => {
+        let stopped = false;
+        setTimeout(() => {
+          stopped = true;
+        }, 5);
+        return () => stopped;
+      })(),
+    ],
+  ])('reports 429 through statusOf when a disconnect ends the retry on %s', async (_label, isStopped) => {
+    stubForever(() => res(429, '', { 'retry-after': '0.05' }));
+    const err = await rejects(
+      fetchWithRetry('https://x/y', {}, { label: 'L', isStopped, deadlineMs: 60_000 }),
+    );
+    expect(err.message).toBe('L → 429 (disconnected)');
+    expect(api.statusOf(err)).toBe(429);
+  });
+
   it('falls back to the Retry-After header when the caller supplies no parser', async () => {
     stubFetch([res(429, '', { 'retry-after': '2' }), res(200)]);
     const waits = captureWaits();
@@ -752,6 +811,30 @@ describe('fetchWithRetry', () => {
     expect(leaked).toEqual([]);
   });
 
+  /**
+   * The same class as the timer ledger, on the other thing a call can leave behind: a registration
+   * on an object the CALLER owns. This package's own docs invite one lifetime controller per plugin
+   * ("the mechanism a plugin uses to cut a long-poll short on disconnect"), and it is published, so
+   * a long-poll issuing a request every 2s against one controller must not accumulate 43 200
+   * registrations a day. Counted at several N so growth shows as a trend rather than a threshold.
+   */
+  describe('a call leaves no registration on a caller-owned signal', () => {
+    it('reads registrations at all, so the rows below are not counting a renamed internal', () => {
+      const controller = new AbortController();
+      const before = registrationsOn(controller.signal);
+      const composites = [1, 2, 3].map(() => AbortSignal.any([controller.signal]));
+      controller.signal.addEventListener('abort', () => undefined);
+      const after = registrationsOn(controller.signal);
+      expect(composites).toHaveLength(3);
+      expect(after.dependents - before.dependents).toBe(3);
+      expect(after.listeners - before.listeners).toBe(1);
+    });
+
+    it.each([1, 10, 200])('after %i calls', async (n) => {
+      expect(await residueLeftBy(n)).toEqual({ listeners: 0, dependents: 0 });
+    });
+  });
+
   it('still waits the full stated backoff when nothing stops it', async () => {
     const state = stubFetch([res(429, '', { 'retry-after': '0.2' }), res(200, 'ok')]);
     const started = Date.now();
@@ -796,8 +879,10 @@ describe('fetchWithRetry', () => {
   ];
 
   type Wrap = (fetchImpl: () => Promise<Response>) => () => Promise<Response>;
+  /** A failure shape that echoes the URL back at us, as the `fetch` that produces it. */
+  type Vector = (echoed: string) => (() => Promise<Response>) | undefined;
 
-  const VECTORS: [string, (echoed: string) => (() => Promise<Response>) | undefined][] = [
+  const VECTORS: [string, Vector][] = [
     ['a DNS failure echoing it', (e) => () => Promise.reject(new TypeError(`request to ${e} failed: ENOTFOUND`))],
     [
       'a TLS failure carrying it in the cause chain',
@@ -842,15 +927,12 @@ describe('fetchWithRetry', () => {
     ],
   ];
 
-  it.each(
-    SPELLINGS.flatMap(([spelling, spell]) =>
-      VECTORS.flatMap(([vector, make]) =>
-        SIGNAL_STATES.map(
-          ([state, arm]) => [`${vector}, ${spelling}, ${state}`, spell, make, arm] as const,
-        ),
-      ),
-    ),
-  )('never leaks a credential-bearing URL in an error (%s)', async (_label, spell, make, arm) => {
+  /** The envelope one cell produces, having asserted the two properties every cell must have. */
+  const envelopeOf = async (
+    spell: (url: string) => string,
+    make: Vector,
+    arm: () => { init: RequestInit; wrap: Wrap },
+  ): Promise<string> => {
     const { init, wrap } = arm();
     vi.stubGlobal('fetch', wrap(make(spell(SECRET_URL)) as () => Promise<Response>));
     const err = await rejects(
@@ -858,7 +940,62 @@ describe('fetchWithRetry', () => {
     );
     expect(err.message.startsWith('Telegram GET /getMe → ')).toBe(true);
     expect(err.message).not.toContain(CANARY);
+    return err.message;
+  };
+
+  const NO_CALLER_SIGNAL = SIGNAL_STATES[0]![1];
+  const CANONICAL_SPELLING = SPELLINGS[0]![1];
+
+  /**
+   * The two axes below are ADDED, not multiplied: the spelling only ever changes the string handed
+   * to `redactUrls`, and the caller-signal state is read only by `isCallerAbort` in `fetchOnce`'s
+   * catch, so no spelling can change which branch a signal state takes. Crossed, they spent 72 cells
+   * discriminating what 33 do, and reported the product as coverage of a shape it cannot grade.
+   */
+  it('crosses an axis only where its own values reach different outcomes', async () => {
+    const bySpelling: string[] = [];
+    for (const [, spell] of SPELLINGS) {
+      bySpelling.push(await envelopeOf(spell, VECTORS[0]![1], NO_CALLER_SIGNAL));
+    }
+    const byVector: string[] = [];
+    for (const [, make] of VECTORS) {
+      byVector.push(await envelopeOf(CANONICAL_SPELLING, make, NO_CALLER_SIGNAL));
+    }
+    expect(new Set(bySpelling).size).toBeGreaterThan(1);
+    expect(new Set(byVector).size).toBeGreaterThan(1);
   });
+
+  // The pinning half: the signal axis reaches ONE outcome here, which is why it crosses the vectors
+  // alone. A change that lets the caller's signal state decide the envelope — the defect that took
+  // the raw, unredacted rejection out to the caller — reddens this row rather than hiding inside a
+  // product where every cell asserts the same thing.
+  it('the caller-signal axis reaches one outcome, which is why it does not cross the spellings', async () => {
+    const byState: string[] = [];
+    for (const [, arm] of SIGNAL_STATES) {
+      byState.push(await envelopeOf(CANONICAL_SPELLING, VECTORS[0]![1], arm));
+    }
+    expect(byState).toHaveLength(SIGNAL_STATES.length);
+    expect(new Set(byState).size).toBe(1);
+  });
+
+  it.each(
+    SPELLINGS.flatMap(([spelling, spell]) =>
+      VECTORS.map(([vector, make]) => [`${vector}, ${spelling}`, spell, make] as const),
+    ),
+  )('never leaks a credential-bearing URL in an error (%s)', async (_label, spell, make) => {
+    await envelopeOf(spell, make, NO_CALLER_SIGNAL);
+  });
+
+  it.each(
+    VECTORS.flatMap(([vector, make]) =>
+      SIGNAL_STATES.map(([state, arm]) => [`${vector}, ${state}`, make, arm] as const),
+    ),
+  )(
+    'keeps a failure that races the caller’s own teardown inside the envelope (%s)',
+    async (_label, make, arm) => {
+      await envelopeOf(CANONICAL_SPELLING, make, arm);
+    },
+  );
 
   // The other rejection the caller-signal exit used to let out bare: an oversized body is detected
   // while READING, not by any signal, so a plugin tearing down mid-read got

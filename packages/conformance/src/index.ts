@@ -173,12 +173,18 @@ export const CLAUSES: readonly string[] = [
  * - `disconnect-stops-live-delivery`: nothing reaches a handler after `disconnect()` — the loop or
  *   socket that goes round once more decides whether core keeps emitting `<channel>` events for a
  *   backend it believes is gone, and whether the MCP process can exit.
+ * - `post-id-agreement`: the id `post` RETURNS is the id the read paths report for that message.
+ *   Core stores what `post` returned as the dedup key without reading it back, so a plugin that
+ *   spells the two differently — a composite key built one way on the write path and another on the
+ *   read path — re-delivers its own messages on every catch-up. The uniqueness assertions cannot see
+ *   it: a re-spelled id is still unique and still stable.
  */
 export const ASSERTED_PROPERTIES: readonly string[] = [
   'nextCursor-agreement',
   'nextCursor-stability',
   'limit-honoured',
   'disconnect-stops-live-delivery',
+  'post-id-agreement',
 ];
 
 /**
@@ -619,9 +625,13 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       if (!ctx.supportsBlockingFetch) {
         // The same hazard on a polling backend: a read racing the post must not report a cursor
         // ABOVE the message it did not see, or that message is lost for good.
-        const landing = postLater();
+        let landingFailure: unknown;
+        const landing = postLater().catch((err: unknown) => {
+          landingFailure = err;
+        });
         const first = await ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 2000 });
         await landing;
+        if (landingFailure !== undefined) throw landingFailure;
         const second = await ctx.plugin.fetchRecent({
           topic: t,
           since: first.nextCursor,
@@ -660,6 +670,11 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       const seen: string[] = [];
       let cursor = start;
       let writing = true;
+      let readFailure: unknown;
+      // The handler is attached AT CREATION, so that this budget expiring while the writers are
+      // still in flight fails THIS case with the line naming the stuck topic: a rejection landing
+      // before the `await` below has no handler at all, and surfaces as a process-level unhandled
+      // rejection that takes every other case in the file with it.
       const readLoop = (async () => {
         const giveUpAt = Date.now() + READER_BUDGET_MS;
         while (Date.now() < giveUpAt) {
@@ -677,11 +692,14 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
           await new Promise((resolve) => setTimeout(resolve, 1));
         }
         throw new Error(`the interleaved reader did not drain ${t}`);
-      })();
+      })().catch((err: unknown) => {
+        readFailure = err;
+      });
 
       await ctx.concurrentPost(t, writers, perWriter);
       writing = false;
       await readLoop;
+      if (readFailure !== undefined) throw readFailure;
 
       const stored = (await drainAll(ctx.plugin, t)).slice(1).map((m) => String(m.backendMsgId));
       expect(stored).toHaveLength(writers * perWriter);

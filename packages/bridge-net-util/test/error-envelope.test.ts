@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { delay, fetchWithRetry, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import { delay, fetchWithRetry, MAX_ERROR_BODY, statusOf } from '@sharptrick/parley-net-util';
 
 /**
  * A REAL server, not a `Response` stub. Every stub in this package hands back a fully-buffered
@@ -130,7 +130,7 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
 
     const fetchBody = async (
       query: string,
-      opts: { deadlineMs?: number; maxBodyBytes?: number } = {},
+      opts: { deadlineMs?: number; maxBodyBytes?: number; allowStatuses?: number[] } = {},
     ): Promise<{ outcome: Outcome; tookBytes: number; elapsedMs: number; rssGrowth: number }> => {
       const tag = `t${++seq}`;
       served.set(tag, 0);
@@ -157,34 +157,71 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
     // this is the coarse memory bound; the CATEGORICAL one is the outcome shape against `then=stall`.
     const BUFFER_SLACK = 8 * MB;
 
-    // A response that can only become an error message: the read must stop a few KB in, whatever the
-    // upstream offers, and neither the outcome nor the time may depend on the offer.
+    /**
+     * The statuses the caller is NEVER handed, and whether the body becomes the error message. A
+     * 429's body is only ever `retryAfterOf`'s input, so the rate limit's own diagnostic is what the
+     * caller reads — but the read is bounded exactly as an error body's is.
+     *
+     * Crossed with the volume axis, because a status-specific exemption from the cap is invisible to
+     * a table whose every row is one status: `keeps()` used to treat a 429 as a response the caller
+     * might read, so the one status a hostile upstream controls and repeats pulled `maxBodyBytes`
+     * (16 MiB by default) on every one of up to 8 attempts.
+     */
+    const DOOMED_STATUSES: [number, boolean][] = [
+      [404, true],
+      [429, false],
+      [500, true],
+    ];
+
     // A body BELOW the cap has nothing to truncate, so it ends the stream normally; the rows above
     // it never end, which is what makes the outcome shape decide the case rather than a threshold.
-    it.each([
+    const VOLUMES: [number, string][] = [
       [1024, 'end'],
       [4 * MB, 'stall'],
       [64 * MB, 'stall'],
-    ] as const)(
-      'ends a doomed body of %i bytes (%s) on the cap, not on the deadline',
-      async (bytes, then) => {
-        const run = await fetchBody(`status=500&bytes=${bytes}&then=${then}`, {
+    ];
+
+    // A response that can only become an error message: the read must stop a few KB in, whatever the
+    // upstream offers, and neither the outcome nor the time may depend on the offer.
+    it.each(
+      DOOMED_STATUSES.flatMap(([status, echoesBody]) =>
+        VOLUMES.map(([bytes, then]) => [status, bytes, then, echoesBody] as const),
+      ),
+    )(
+      'ends a doomed %i body of %i bytes (%s) on the cap, not on the deadline',
+      async (status, bytes, then, echoesBody) => {
+        const run = await fetchBody(`status=${status}&bytes=${bytes}&then=${then}`, {
           deadlineMs: DEADLINE_MS,
         });
         const message = (run.outcome as { error: Error }).error.message;
         expect(run.outcome.kind).toBe('rejected');
         // A reader that waits for the stream to END can only get here on the deadline signal.
-        expect(message.startsWith(`${LABEL} → 500: `)).toBe(true);
+        expect(message.startsWith(`${LABEL} → ${status}: `)).toBe(true);
         expect(message.length).toBeLessThanOrEqual(MAX_ERROR_BODY + 200);
         // A FLOOR as well as a ceiling: a read that gave up before taking anything would satisfy
-        // every bound here while telling the operator nothing about why the upstream failed.
-        expect(message).toContain('A');
+        // every bound here while telling the operator nothing about why the upstream failed. A 429
+        // takes the other side of it — its body reaches nobody, so it may not reach the message.
+        if (echoesBody) expect(message).toContain('A');
+        else expect(message).not.toContain('AAAA');
         expect(run.tookBytes).toBeGreaterThan(0);
         expect(run.tookBytes).toBeLessThan(BUFFER_SLACK);
         expect(run.elapsedMs).toBeLessThan(DEADLINE_MS);
         expect(run.rssGrowth).toBeLessThan(32 * MB);
       },
     );
+
+    // The other side of the same split: a status the caller DOES get back is read to `maxBodyBytes`,
+    // including a 429 the caller declared expected — which the loop must hand over rather than
+    // treat as its own retry material.
+    it.each([200, 429])('reads a %i the caller is handed up to maxBodyBytes', async (status) => {
+      const run = await fetchBody(`status=${status}&bytes=65536`, {
+        maxBodyBytes: 256 * 1024,
+        allowStatuses: [429],
+      });
+      expect(run.outcome.kind).toBe('resolved');
+      expect((run.outcome as { text: string }).text).toHaveLength(65_536);
+      expect(run.tookBytes).toBe(65_536);
+    });
 
     // A body the caller WILL parse cannot be silently truncated — half a JSON document is a corrupt
     // parse, not a smaller one — so past `maxBodyBytes` the call fails, still under the label.
@@ -206,6 +243,46 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
       );
       expect(run.tookBytes).toBeLessThan(BUFFER_SLACK);
       expect(run.elapsedMs).toBeLessThan(DEADLINE_MS);
+    });
+  });
+
+  /**
+   * The class the `<label> → <status>: <body>` envelope only covers one shape of: once a status has
+   * been received, EVERY way the call can still fail must report it through `statusOf`. A caller
+   * branching on 429 — Telegram's fatal-status branch, any backoff — silently stops firing the
+   * moment one rejection shape drops the status, and the rejections that drop it are the ones an
+   * upstream can produce at will: an oversized body and a body that dies mid-stream.
+   */
+  describe('a rejection after the status is known reports that status', () => {
+    const OVERSIZED = [200, 404, 429];
+    const MID_STREAM = [404, 429, 500];
+
+    it.each([
+      ...OVERSIZED.map((status) => ['an oversized body', status] as const),
+      ...MID_STREAM.map((status) => ['a body that dies mid-stream', status] as const),
+    ])('%s on a %i', async (shape, status) => {
+      const query =
+        shape === 'an oversized body'
+          ? `status=${status}&bytes=1048576&then=stall`
+          : `status=${status}&body=errors mid-stream`;
+      const err = await fetchWithRetry(
+        `${origin}/x?${query}`,
+        {},
+        {
+          label: LABEL,
+          isStopped: () => false,
+          maxAttempts: 1,
+          deadlineMs: 2_000,
+          maxBodyBytes: 4096,
+          allowStatuses: [404, 429],
+        },
+      ).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err, 'expected a rejection').toBeDefined();
+      expect((err as Error).message.startsWith(`${LABEL} → `)).toBe(true);
+      expect(statusOf(err)).toBe(status);
     });
   });
 

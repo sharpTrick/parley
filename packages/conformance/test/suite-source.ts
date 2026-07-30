@@ -45,6 +45,59 @@ export const BOOLEAN_CAPABILITIES = CAPABILITY_FIELDS.filter((field) => {
   return accepts(true) && accepts(false) && !accepts('either');
 });
 
+/** The initializer of a `const`/`let`, scanned to the `;` that ends it at nesting depth 0. */
+function initializerAt(text: string, from: number): string {
+  let depth = 0;
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i] as string;
+    if ('({['.includes(ch)) depth++;
+    else if (')}]'.includes(ch)) depth--;
+    else if (ch === ';' && depth === 0) return text.slice(from, i + 1);
+  }
+  return text.slice(from);
+}
+
+/** A binding whose initializer is a function, not a promise already running. */
+function definesAFunction(init: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < init.length; i++) {
+    const ch = init[i] as string;
+    if ('({['.includes(ch)) depth++;
+    else if (')}]'.includes(ch)) depth--;
+    else if (depth === 0 && ch === '=' && init[i + 1] === '>') return true;
+  }
+  return false;
+}
+
+/**
+ * Promises a case starts EAGERLY and first awaits only after some other `await` — the interleaved
+ * reader's loop, a post scheduled to race a fetch. Between the two there is no handler, so a
+ * rejection landing in that window (a self-imposed budget giving up while the writers are still
+ * going) is a process-level unhandled rejection: it fails the whole FILE, with none of the
+ * diagnostic the budget exists to produce, and takes every unrelated case with it.
+ *
+ * Reported with whether a handler is attached at creation, which is what makes the budget reachable
+ * as this case's own failure.
+ */
+export function deferredPromises(body: string): { name: string; handled: boolean }[] {
+  const out: { name: string; handled: boolean }[] = [];
+  for (const m of body.matchAll(/\b(?:const|let)\s+(\w+)(?:\s*:[^=;]+)?\s*=\s*/g)) {
+    const name = m[1] as string;
+    const from = (m.index as number) + m[0].length;
+    const init = initializerAt(body, from);
+    if (/^await\b/.test(init) || definesAFunction(init)) continue;
+    const rest = body.slice(from + init.length);
+    // The awaiting use, matched WITH its `await`, so that the awaiting statement's own keyword is
+    // not what the window below is measured against.
+    const use = new RegExp(`await\\s+${name}\\b|await\\s+Promise\\.\\w+\\([^)]*\\b${name}\\b`).exec(
+      rest,
+    );
+    if (use === null || !/\bawait\b/.test(rest.slice(0, use.index))) continue;
+    out.push({ name, handled: /\.catch\(/.test(init) });
+  }
+  return out;
+}
+
 export function guardedBlock(text: string, open: number): string {
   let depth = 0;
   for (let i = open; i < text.length; i++) {

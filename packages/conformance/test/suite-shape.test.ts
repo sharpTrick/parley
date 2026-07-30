@@ -8,7 +8,7 @@ import {
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
 } from '@sharptrick/parley-conformance';
-import { cases, guardedRegions, suiteSource as source } from './suite-source.js';
+import { cases, deferredPromises, guardedRegions, suiteSource as source } from './suite-source.js';
 
 const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
 
@@ -237,6 +237,56 @@ describe('the suite grades every backend it certifies', () => {
         }
       },
     );
+  });
+
+  /**
+   * The budget rows below grade a budget's SIZE; this grades whether it can be reported at all. The
+   * interleaved reader's 15 s give-up threw from a promise nothing had subscribed to yet, so on a
+   * backend whose 100 concurrent posts take longer than that, the run reports an unhandled rejection
+   * and loses every other case in the file — instead of the one red case naming the stuck topic.
+   */
+  describe('every eagerly-started promise can report its own failure', () => {
+    const deferred = (): [string, string, boolean][] =>
+      cases().flatMap((c) =>
+        deferredPromises(c.body).map(
+          ({ name, handled }) => [c.title, name, handled] as [string, string, boolean],
+        ),
+      );
+
+    it('finds eagerly-started promises, so the rows below are not an empty table', () => {
+      expect(deferred().length).toBeGreaterThan(1);
+    });
+
+    it.each(deferred())('"%s" handles `%s` at creation', (_title, name, handled) => {
+      expect(
+        handled,
+        `\`${name}\` is awaited only after another await, so a rejection in between has no handler ` +
+          `— attach one where it is created and rethrow after the await`,
+      ).toBe(true);
+    });
+
+    // The detector against the shapes it has to tell apart, so it cannot regress to finding nothing
+    // — which would make every row above pass by grading an empty list.
+    it.each([
+      [
+        'an eager promise awaited after another await',
+        'const p = go();\nawait other();\nawait p;',
+        ['p'],
+        false,
+      ],
+      [
+        'the same promise handled at creation',
+        'const p = go().catch((e) => { failure = e; });\nawait other();\nawait p;',
+        ['p'],
+        true,
+      ],
+      ['a promise awaited in the next statement', 'const p = go();\nawait Promise.all([p, q]);', [], true],
+      ['a promise awaited in the same statement', 'const p = await go();\nawait other();\np.x;', [], true],
+      ['a function definition awaited later', 'const p = () => go();\nawait other();\nawait p();', [], true],
+    ])('sees %s', (_label, snippet, names, allHandled) => {
+      expect(deferredPromises(snippet).map((d) => d.name)).toEqual(names);
+      expect(deferredPromises(snippet).every((d) => d.handled)).toBe(allHandled);
+    });
   });
 
   it('reads a testTimeout out of the harness config, so the budget rows below grade something', () => {

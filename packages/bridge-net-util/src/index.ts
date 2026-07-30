@@ -277,7 +277,8 @@ export interface FetchWithRetryOptions {
   /**
    * Per-backend `Retry-After` extraction → milliseconds, or undefined when the response carries no
    * usable hint. Only the body field differs between APIs; the header, the clamp and the default
-   * are handled here. Receives the 429 `Response` (clone it before reading the body).
+   * are handled here. Receives the 429 `Response` (clone it before reading the body) — a body the
+   * caller never sees, so it is bounded to a few KB rather than to `maxBodyBytes`.
    *
    * A source of an ADDITIONAL hint, never a ceiling: the standard `Retry-After` header is a FLOOR
    * this cannot lower. Do not clamp what you return here, so that a parser bug cannot retry sooner
@@ -327,24 +328,40 @@ export class HttpStatusError extends Error {
 }
 
 /**
- * HTTP status behind a {@link fetchWithRetry} rejection, or undefined when it was not a status
- * failure. Matched by `name`, not `instanceof`, so a plugin resolving a second copy of this package
- * is still graded honestly.
+ * HTTP status behind a {@link fetchWithRetry} rejection, or undefined when no response was received.
+ * Read off the FIELD, not off `instanceof` or the message, so a plugin resolving a second copy of
+ * this package is still graded honestly — and so every rejection raised after a status was received
+ * reports it, not only the `<label> → <status>: <body>` one.
  */
 export function statusOf(err: unknown): number | undefined {
-  if (err instanceof Error && err.name === 'HttpStatusError') {
-    const { status } = err as HttpStatusError;
-    return Number.isFinite(status) ? status : undefined;
-  }
-  return undefined;
+  if (!(err instanceof Error)) return undefined;
+  const { status } = err as { status?: unknown };
+  return typeof status === 'number' && Number.isFinite(status) ? status : undefined;
 }
 
-/** Bytes of a doomed body worth pulling off the socket: enough that {@link MAX_ERROR_BODY} chars of
- * it survive `sanitizeBody` even when every character is four bytes of UTF-8. */
+/**
+ * Bytes of a body the caller will never be handed worth pulling off the socket: enough that
+ * {@link MAX_ERROR_BODY} chars of it survive `sanitizeBody` even when every character is four bytes
+ * of UTF-8, and enough for a `retryAfterOf` parser to find a hint in a 429's JSON envelope.
+ */
 const DOOMED_BODY_BYTES = MAX_ERROR_BODY * 4;
 
 /** Thrown by name so a caller can tell "the upstream flooded us" from an ordinary status failure. */
 class BodyTooLargeError extends Error {}
+
+/**
+ * A rejection raised after the response's status was known. Keep the status ON the error, so that a
+ * caller branching through {@link statusOf} keeps branching on the paths that fail while READING —
+ * a rate limit that also floods, or dies mid-body, is still a rate limit.
+ */
+class LabelledError extends Error {
+  readonly status: number | undefined;
+
+  constructor(message: string, status: number | undefined) {
+    super(message);
+    this.status = status;
+  }
+}
 
 /**
  * Read at most `maxBytes` of `res`, then cancel the stream. Keep the bound INSIDE the read, so that
@@ -390,10 +407,12 @@ async function readBounded(
  * signal this module armed — an unlabeled `TimeoutError` reaching the caller escapes every
  * guarantee below.
  *
- * A response the caller will never be handed becomes at most {@link MAX_ERROR_BODY} characters of
- * error message, so it is read to {@link DOOMED_BODY_BYTES} and the rest dropped. One the caller
- * WILL parse cannot be silently truncated — a half body is a corrupt parse, not a smaller one — so
- * past `maxBytes` it fails instead.
+ * A response the caller will never be handed — including a 429 the loop only ever retries on, whose
+ * body reaches nobody but `retryAfterOf` — is read to {@link DOOMED_BODY_BYTES} and the rest
+ * dropped. Keep the retried statuses on this side of the split, so that the one status a hostile
+ * upstream controls and repeats is not the one exempt from the cap. One the caller WILL parse
+ * cannot be silently truncated — a half body is a corrupt parse, not a smaller one — so past
+ * `maxBytes` it fails instead.
  */
 async function buffered(res: Response, maxBytes: number, doomed: boolean): Promise<Response> {
   const { text, overflowed } = await readBounded(res, doomed ? DOOMED_BODY_BYTES : maxBytes);
@@ -430,15 +449,39 @@ async function fetchOnce(
   const { label } = opts;
   const deadline = AbortSignal.timeout(budgetMs);
   const caller = init.signal ?? undefined;
-  const signal = caller === undefined ? deadline : AbortSignal.any([caller, deadline]);
+  const controller = new AbortController();
+  // Compose by a listener this call REMOVES rather than by `AbortSignal.any`, so that a caller
+  // holding one controller for a plugin's lifetime — the documented way to cut a long-poll short —
+  // does not accumulate a registration per request: Node records each composite in the source
+  // signal's dependent set and prunes none of them while the source lives.
+  const onDeadline = (): void => controller.abort(deadline.reason);
+  const onCaller = (): void => controller.abort(caller?.reason);
+  deadline.addEventListener('abort', onDeadline, { once: true });
+  if (caller !== undefined) {
+    if (caller.aborted) controller.abort(caller.reason);
+    else caller.addEventListener('abort', onCaller, { once: true });
+  }
+
+  let received: number | undefined;
   try {
-    const res = await fetch(url, { ...init, signal });
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    received = res.status;
     return await buffered(res, opts.maxBytes, !opts.keeps(res));
   } catch (err) {
     if (caller !== undefined && isCallerAbort(err, caller)) throw caller.reason;
-    if (deadline.aborted) throw new Error(`${label} → deadline: no response within ${budgetMs}ms`);
-    if (err instanceof BodyTooLargeError) throw new Error(`${label} → body: ${err.message}`);
-    throw new Error(`${label} → transport: ${sanitizeBody(redactUrls(errorText(err), url))}`);
+    if (deadline.aborted) {
+      throw new LabelledError(`${label} → deadline: no response within ${budgetMs}ms`, received);
+    }
+    if (err instanceof BodyTooLargeError) {
+      throw new LabelledError(`${label} → body: ${err.message}`, received);
+    }
+    throw new LabelledError(
+      `${label} → transport: ${sanitizeBody(redactUrls(errorText(err), url))}`,
+      received,
+    );
+  } finally {
+    deadline.removeEventListener('abort', onDeadline);
+    caller?.removeEventListener('abort', onCaller);
   }
 }
 
@@ -521,7 +564,7 @@ export async function fetchWithRetry(
     label: opts.label,
     maxBytes: opts.maxBodyBytes ?? MAX_RESPONSE_BYTES,
     keeps: (res: Response): boolean =>
-      res.ok || res.status === 429 || (opts.allowStatuses?.includes(res.status) ?? false),
+      res.ok || (opts.allowStatuses?.includes(res.status) ?? false),
   };
 
   for (let attempt = 1; ; attempt++) {
@@ -539,7 +582,7 @@ export async function fetchWithRetry(
       throw new HttpStatusError(opts.label, res.status, await errorBody(res, url));
     }
 
-    if (opts.isStopped()) throw new Error(`${opts.label} → 429 (disconnected)`);
+    if (opts.isStopped()) throw new LabelledError(`${opts.label} → 429 (disconnected)`, 429);
 
     // Honour a server-stated wait IN FULL, so that we never retry sooner than the vendor asked —
     // that is what escalates a rate limit into a ban. The header is a FLOOR the caller's parser
@@ -564,10 +607,18 @@ export async function fetchWithRetry(
 
     const waitedItOut = await sleepUnlessStopped(wait, opts.isStopped);
     if (!waitedItOut || opts.isStopped()) {
-      throw new Error(`${opts.label} → 429 (disconnected)`);
+      throw new LabelledError(`${opts.label} → 429 (disconnected)`, 429);
     }
   }
 }
+
+/**
+ * The schemes that carry a credential under TLS. Keep the set on the SECURE side, so that a scheme
+ * this classifier has never met — `ws:`, which is how a gateway handshake carries a bot token, and
+ * whatever a backend dials next — is warned about rather than passed: `undefined` is read by every
+ * caller as "no plaintext-credential risk".
+ */
+const SECURE_SCHEMES = new Set(['https:', 'wss:']);
 
 /**
  * The origin to name when the URL would put a credential on the wire in the clear, else undefined.
@@ -577,8 +628,13 @@ export async function fetchWithRetry(
  */
 export function plaintextRemoteOrigin(baseUrl: string): string | undefined {
   try {
-    const { protocol, hostname, origin } = new URL(baseUrl);
-    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
+    const { protocol, hostname, host } = new URL(baseUrl);
+    if (SECURE_SCHEMES.has(protocol) || hostname === '' || isLoopbackHost(hostname)) {
+      return undefined;
+    }
+    // Built rather than read off `origin`, which is the string "null" for every scheme the URL
+    // parser does not know — an operator cannot act on that.
+    return `${protocol}//${host}`;
   } catch {
     return undefined;
   }

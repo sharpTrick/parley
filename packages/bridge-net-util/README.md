@@ -4,8 +4,8 @@ A tiny HTTP helper: one `fetch` + 429-retry loop, plus the `delay` any backend t
 It is published to npm, so **everything below is public API** — a change to any of these names is
 a breaking change.
 
-- **Consumed by:** Discord, Matrix, Postgres, Redis, Slack, Telegram, XMPP, Zulip.
-- **Not consumed by:** NATS, SQLite.
+- **Consumed by:** Discord, Matrix, NATS, Postgres, Redis, Slack, Telegram, XMPP, Zulip.
+- **Not consumed by:** SQLite.
 
 Both lines are re-derived from the workspace manifests by this package's own tests, so a backend
 that gains or drops the dependency moves them.
@@ -23,8 +23,11 @@ that gains or drops the dependency moves them.
 - **`HttpStatusError`** — what an unallowed non-2xx throws. Its `message` is exactly
   `` `${label} → ${status}: ${body}` `` — a pinned contract, since several backends' tests read it —
   and it also carries `label`, `status` and `body` as fields.
-- **`statusOf(err)`** — the status behind such a rejection, or `undefined`. Branch on this instead
-  of re-parsing the message; it matches by `name`, so a duplicated copy of this package still works.
+- **`statusOf(err)`** — the status behind a rejection, or `undefined` when no response was received.
+  Branch on this instead of re-parsing the message; it reads the `status` field rather than the
+  class, so a duplicated copy of this package still works — and every rejection raised *after* a
+  status arrived reports it, including the ones that fail while reading the body (`→ body:`,
+  `→ transport:`, `→ deadline:`), not only the `<label> → <status>: <body>` one.
 
 Three bounds are worth knowing before you call it:
 
@@ -39,9 +42,12 @@ Three bounds are worth knowing before you call it:
   loop does not call them.)
 - `maxBodyBytes` (default `MAX_RESPONSE_BYTES`) is a ceiling on the bytes **one response** puts in
   memory, applied while reading rather than after: a response over it fails with
-  `<label> → body: …` instead of handing back a body your `res.json()` would misparse. A response
-  that can only become an error message is read to a few kilobytes and the rest dropped, so a
-  hostile upstream cannot spend your RSS producing a 2 KB message.
+  `<label> → body: …` instead of handing back a body your `res.json()` would misparse. It applies
+  only to a response you are HANDED (a 2xx, or an `allowStatuses` one). A response you never see —
+  an error body, and a 429 the loop only retries on — is read to a few kilobytes and the rest
+  dropped, so a hostile upstream cannot spend your RSS producing a 2 KB message however many times
+  it repeats the status. A 429 body is bounded by that same few kilobytes when your `retryAfterOf`
+  reads it, which is ample for a JSON rate-limit envelope.
 
 The `Retry-After` header is a **floor**, and `retryAfterOf` is a source of an *additional* hint,
 never a ceiling: whichever is longer wins. Do not clamp what your parser returns — retrying
@@ -101,10 +107,15 @@ TLS failure into an unenveloped one just by racing it.
   counts as remote: the safe direction is to warn.
 - `plaintextRemoteOrigin(url)` — the ORIGIN to name when the URL would put a credential on the wire
   in the clear, else `undefined`. Naming the origin rather than the whole configured URL keeps a
-  secret smuggled into a path out of stderr, and out of the tool result core hands the model.
+  secret smuggled into a path out of stderr, and out of the tool result core hands the model. The
+  cleartext side is everything that is **not** a known-secure scheme (`https:`, `wss:`), so `ws:` —
+  how a gateway handshake carries a bot token — warns, and so does a scheme this classifier has
+  never met: `undefined` reads as "no plaintext-credential risk", which is not an answer to give
+  about an unproven scheme. A URL with no host (`file:`, `mailto:`) names no remote endpoint and
+  answers `undefined`.
 
-These live here because five backends warn about the same thing and a security predicate copied five
-times is a predicate fixed in one place and left wrong in four.
+These live here so the backends that warn about the same thing share one classifier: a security
+predicate copied per backend is a predicate fixed in one place and left wrong in the others.
 
 ## Constants
 

@@ -310,7 +310,37 @@ const wrap = async (
   return context({ ...delegate(inner), ...over(inner) }, store, caps);
 };
 
+/**
+ * Ways a plugin can return an id from `post` that is unique, stable, and NOT the id its own read
+ * paths report for that message. Every uniqueness assertion in the suite passes for each of these,
+ * so only the agreement assertions can see them.
+ *
+ * `identity` is deliberately not a row: it is the conformant plugin, and a variant that fails
+ * nothing is exactly the vacuous control this table exists to forbid. Nor is an uppercasing
+ * re-spelling, which is the identity on the reference plugin's numeric ids for the same reason.
+ */
+const POST_ID_RESPELLINGS: [label: string, spell: (id: string, topic: string) => string][] = [
+  ['under a prefix', (id) => `msg-${id}`],
+  // Telegram's `<chat_id>:<message_id>` is a composite the write and read paths build separately.
+  ['as a composite key the read path builds differently', (id, topic) => `${topic}:${id}`],
+];
+
+const respelledPostId = ([label, spell]: [
+  string,
+  (id: string, topic: string) => string,
+]): BrokenVariant => ({
+  name: `a post that returns its id ${label}`,
+  mutates: 'post-id-agreement',
+  mustFail: 'in order, with unique ids and distinct cursors',
+  make: () =>
+    wrap((inner) => ({
+      post: async (t, i, c, o) =>
+        asBackendMsgId(spell(String(await inner.post(t, i, c, o)), String(t))),
+    })),
+});
+
 export const BROKEN_VARIANTS: BrokenVariant[] = [
+  ...POST_ID_RESPELLINGS.map(respelledPostId),
   {
     name: 'inclusive since',
     mutates: 'fetchRecent',
@@ -846,7 +876,8 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             const page = await inner.fetchRecent({ ...args, blockMs: undefined });
             if (args.since === undefined || args.blockMs === undefined) return page;
             if (page.messages.length > 0) return page;
-            await new Promise((resolve) => setTimeout(resolve, Math.min(args.blockMs, 4_200)));
+            const parkFor = Math.min(args.blockMs, 4_200);
+            await new Promise((resolve) => setTimeout(resolve, parkFor));
             return inner.fetchRecent({ ...args, blockMs: undefined });
           },
         }),
