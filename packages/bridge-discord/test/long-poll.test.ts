@@ -258,17 +258,22 @@ describe('Discord long-poll: a wakeup arriving', () => {
         },
       },
       {
+        // The wakeup lands between IDENTIFY and READY, so the socket has to finish the handshake
+        // it is already in — a SECOND HELLO would be answered by ending the socket, since one
+        // IDENTIFY per socket is what keeps a repeating peer off Discord's per-token quota.
         label: 'while the gateway handshake is still completing',
         drive: async (p, call) => {
-          state.onIdentify = () => undefined;
+          let identifying: FakeWs | undefined;
+          state.onIdentify = (s: FakeWs) => {
+            identifying = s;
+          };
           call();
           await vi.advanceTimersByTimeAsync(10);
           const ws = instances.at(-1)!;
           ws.hello(HUGE_HB);
           await vi.advanceTimersByTimeAsync(10);
           arrive(undefined);
-          state.onIdentify = (s: FakeWs) => s.ready();
-          ws.hello(HUGE_HB);
+          identifying!.ready();
           await vi.advanceTimersByTimeAsync(50);
         },
       },

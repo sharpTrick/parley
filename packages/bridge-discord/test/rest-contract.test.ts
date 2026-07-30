@@ -9,7 +9,7 @@ import {
   type BackendPlugin,
   type Topic,
 } from '@sharptrick/parley-core';
-import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY, sanitizeBody } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
@@ -299,41 +299,78 @@ describe('Discord REST contract', () => {
   });
 
   describe('a diagnostic the sanitizer never saw', () => {
-    // CLASS: a one-line guarantee credited to the wrong layer. Every cell above reaches stderr
+    // CLASS: a one-line guarantee credited to the wrong layer, and a locally re-implemented
+    // character class narrower than the shared one it mirrors. Every cell above reaches stderr
     // through net-util's `sanitizeBody`, which strips control characters upstream — so the scrub in
     // the plugin's own `warn` is unmeasured there, and the guarantee would move silently to an
     // unverified line if the sanitizer changed. These cells carry text the sanitizer never touches:
-    // a `channel_map` VALUE, interpolated raw into the unpushable-channel diagnostic. The axis is
-    // the TERMINATOR, because a scrub written for `\n` alone lets every other one through.
-    const TERMINATORS: Array<[string, string]> = [
-      ['a line feed', '\n'],
-      ['a carriage return', '\r'],
+    // a `channel_map` VALUE, interpolated raw into the unpushable-channel diagnostic.
+    //
+    // The character axis is GENERATED from the same classes net-util neutralizes, never listed by
+    // hand: a hand-listed axis certifies whatever the scrub already handles as coverage (U+0085 NEL
+    // and U+009B CSI are the two that were missing last time it was listed).
+    const NEUTRALIZED = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+    const neutralizedCodepoints = (): number[] => {
+      const points: number[] = [];
+      for (let cp = 0; cp <= 0x10ffff; cp++) {
+        if (cp >= 0xd800 && cp <= 0xdfff) continue; // lone surrogates are a different guard
+        if (NEUTRALIZED.test(String.fromCodePoint(cp))) points.push(cp);
+      }
+      return points;
+    };
+
+    /** Subscribe a topic whose channel id carries `injected`, and return everything stderr got. */
+    const diagnosticFor = async (injected: string): Promise<string> => {
+      const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      const id = `${freshChannelId()}${injected}parley-discord: FORGED`;
+      fake.createChannel(id, DM); // unpushable, so the diagnostic quotes the id verbatim
+      const p = await connect({ channel_map: { alpha: id } });
+      try {
+        await p.subscribe(asTopic('alpha'), () => undefined);
+        return diag.mock.calls.map((c) => String(c[0])).join('');
+      } finally {
+        await p.disconnect();
+        diag.mockRestore();
+      }
+    };
+
+    const expectOneLine = (written: string, injected: string, at = 'the injected text'): void => {
+      expect(written, 'nothing was written, so this cell measures nothing').not.toBe('');
+      expect(written).toContain('FORGED'); // the text is quoted, just never on its own line
+      expect(written.split(/[\r\n\u2028\u2029]/).filter((line) => line !== '')).toHaveLength(1);
+      expect(written.endsWith('\n')).toBe(true);
+      expect(NEUTRALIZED.test(written.slice(0, -1)), `${at} survived into the line`).toBe(false);
+      // PARITY, both directions: the plugin's own scrub must accept and reject exactly what the
+      // shared neutralizer does, so a second copy of the character class cannot drift from it.
+      expect(written, `${at} is not rendered as the shared neutralizer renders it`).toContain(
+        sanitizeBody(injected),
+      );
+    };
+
+    // Structure the character axis cannot reach: a terminator PAIR, padding that a collapsing
+    // scrub might eat around, and a run of them.
+    const COMPOSITES: Array<[string, string]> = [
       ['a CRLF', '\r\n'],
-      ['a line separator', '\u2028'],
-      ['a paragraph separator', '\u2029'],
       ['a line feed with padding around it', ' \t\n\t '],
       ['a run of them', '\n\r\n\u2028'],
     ];
 
-    for (const [label, terminator] of TERMINATORS) {
+    for (const [label, injected] of COMPOSITES) {
       it(`${label} in a channel id cannot forge a second diagnostic`, async () => {
-        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-        const id = `${freshChannelId()}${terminator}parley-discord: FORGED`;
-        fake.createChannel(id, DM); // unpushable, so the diagnostic quotes the id verbatim
-        const p = await connect({ channel_map: { alpha: id } });
-        try {
-          await p.subscribe(asTopic('alpha'), () => undefined);
-          const written = diag.mock.calls.map((c) => String(c[0])).join('');
-          expect(written, 'nothing was written, so this cell measures nothing').not.toBe('');
-          expect(written).toContain('FORGED'); // the text is quoted, just never on its own line
-          expect(written.split(/[\r\n\u2028\u2029]/).filter((line) => line !== '')).toHaveLength(1);
-          expect(written.endsWith('\n')).toBe(true);
-        } finally {
-          await p.disconnect();
-          diag.mockRestore();
-        }
+        expectOneLine(await diagnosticFor(injected), injected);
       });
     }
+
+    it('no character the shared neutralizer strips can forge a second diagnostic', async () => {
+      const points = neutralizedCodepoints();
+      expect(points.length, 'the generated axis is empty, so this case measures nothing')
+        .toBeGreaterThan(100);
+      for (const cp of points) {
+        const injected = String.fromCodePoint(cp);
+        const at = `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+        expectOneLine(await diagnosticFor(injected), injected, at);
+      }
+    });
   });
 
   describe('provider content limit', () => {

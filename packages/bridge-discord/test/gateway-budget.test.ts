@@ -137,6 +137,96 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
       });
     }
   }
+
+  // The FAILURES axis above is parameterized over how a DIAL fails, so every IDENTIFY it counts is
+  // one the ladder charged for. This axis is the other half: what a peer can make an ALREADY-OPEN
+  // socket do. The frames cost the peer one send each, so anything the plugin answers with is
+  // amplification it pays for out of a 1000-per-24h quota whose overrun RESETS the bot token —
+  // and `gateway_url` reaching a peer that is not discord.com is a configuration the plugin only
+  // warns about. Keep the axis a table of OPCODES rather than the HELLO that prompted it: the same
+  // "peer frame drives an uncharged expensive action" arrives next wearing op 7 or a resume frame.
+  describe('a frame on an ESTABLISHED socket buys no IDENTIFY', () => {
+    const FLOOD = 500;
+
+    const PEER_FRAMES: Array<{
+      label: string;
+      frame: (n: number) => Record<string, unknown>;
+      /** Whether the socket is expected to outlive the flood — a row that ends it says so. */
+      survives: boolean;
+    }> = [
+      {
+        label: 'op 10 HELLO',
+        frame: () => ({ op: 10, d: { heartbeat_interval: HUGE_HB } }),
+        survives: false,
+      },
+      { label: 'op 1 HEARTBEAT', frame: () => ({ op: 1, d: null }), survives: true },
+      { label: 'op 7 RECONNECT', frame: () => ({ op: 7, d: null }), survives: false },
+      { label: 'op 9 INVALID_SESSION', frame: () => ({ op: 9, d: false }), survives: false },
+      {
+        label: 'op 0 with an unknown t',
+        frame: (n) => ({ op: 0, t: 'GUILD_MEMBER_UPDATE', s: n, d: {} }),
+        survives: true,
+      },
+      { label: 'an unknown op', frame: (n) => ({ op: 42, s: n, d: {} }), survives: true },
+    ];
+
+    /** Ladder charges so far: {@link chargeDialAttempt} bumps this on every dial it paces. */
+    const chargesOf = (plugin: DiscordPlugin): number =>
+      (plugin as unknown as { reconnectAttempts: number }).reconnectAttempts;
+
+    const framesSent = (): number => instances.reduce((n, ws) => n + ws.sent.length, 0);
+
+    // Crossed with WHEN the close lands, because a socket the plugin has closed keeps receiving:
+    // real `ws` finishes the close handshake a tick later and delivers whatever is already queued,
+    // so under async delivery the peer keeps reaching a listener that has nothing left to do.
+    // Crossed with WHEN the close lands, because a socket the plugin has closed keeps receiving:
+    // real `ws` finishes the close handshake a tick later and delivers whatever is already queued,
+    // so under async delivery the peer keeps reaching a listener that has nothing left to do.
+    for (const peer of PEER_FRAMES) {
+      for (const asyncClose of [false, true]) {
+        const delivery = asyncClose ? 'async' : 'inline';
+        it(`${FLOOD}x ${peer.label} costs no unbudgeted IDENTIFY (close delivered ${delivery})`, async () => {
+          state.asyncClose = asyncClose;
+          const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+          const plugin = await connectPlugin();
+          const ws = await reachReady(plugin, TOPIC);
+          expect(totalIdentifies()).toBe(1); // the handshake's own, and the only one so far
+          diag.mockClear();
+
+          for (let n = 0; n < FLOOD; n++) ws.serverSend(peer.frame(n));
+
+          // (a) Every IDENTIFY on the wire is either the first dial or a step the ladder charged
+          // for, so the sustained rate is the ladder's whatever the peer sends and however fast.
+          expect(
+            totalIdentifies(),
+            'a peer frame bought an IDENTIFY the ladder never charged for',
+          ).toBeLessThanOrEqual(1 + chargesOf(plugin));
+          for (const socket of instances) {
+            expect(
+              socket.sent.filter((f) => f.op === 2).length,
+              'one socket IDENTIFYed twice',
+            ).toBeLessThanOrEqual(1);
+          }
+          // (b) …and the answer to N frames is bounded by N, with no IDENTIFY term in the bound.
+          expect(framesSent(), 'the peer got back more frames than it sent').toBeLessThanOrEqual(
+            FLOOD + instances.length,
+          );
+          // Each row states what the flood did to the socket, so a row cannot pass by being
+          // dropped on the floor: an ignored frame and an ended socket are different answers.
+          expect(
+            openSockets(),
+            `the socket ${peer.survives ? 'died' : 'survived'} the flood`,
+          ).toHaveLength(peer.survives ? 1 : 0);
+          // stderr answers too: a diagnostic per frame is the same amplification wearing a
+          // different sink, and it is the operator's log that gets buried.
+          expect(diag.mock.calls.length, 'the flood drove a diagnostic per frame')
+            .toBeLessThanOrEqual(instances.length);
+
+          await plugin.disconnect();
+        });
+      }
+    }
+  });
 });
 
 // The quota Discord enforces is keyed by BOT TOKEN, not by process, and the README tells operators

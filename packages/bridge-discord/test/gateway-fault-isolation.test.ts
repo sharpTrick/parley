@@ -25,6 +25,17 @@ const REACTION_MS = 250;
 
 const HELLO_OK = JSON.stringify({ op: 10, d: { heartbeat_interval: SANE_HEARTBEAT_MS } });
 
+/**
+ * How a row proves the LISTENER came back rather than waiting on the clock: a frame the plugin
+ * visibly answers in this phase, and the opcode of the answer. A socket that has already IDENTIFYed
+ * answers a further HELLO by ending itself — one IDENTIFY per socket is what keeps a repeating peer
+ * off Discord's per-token quota — so the ready phase probes with a server heartbeat instead.
+ */
+const PROBE: Record<'pre-ready' | 'ready', { frame: string; answer: number }> = {
+  'pre-ready': { frame: HELLO_OK, answer: 2 },
+  ready: { frame: JSON.stringify({ op: 1, d: null }), answer: 1 },
+};
+
 interface HostileGateway {
   url: string;
   /** Answer IDENTIFY with READY (and open with a well-formed HELLO) — off for pre-READY rows. */
@@ -150,8 +161,10 @@ describe('a malformed gateway frame never escapes the message listener', () => {
     delivered: string[];
     /** Whether the plugin answered the frame (or the one after it) or ended the socket. */
     reaction: 'frame' | 'close';
-    /** Opcodes the plugin sent AFTER the frame — `2` means the socket lived to IDENTIFY again. */
+    /** Opcodes the plugin sent AFTER the frame — {@link Survival.probe} means the socket lived. */
     answered: number[];
+    /** The opcode this phase's {@link PROBE} expects back, once the listener is still running. */
+    probe: number;
   }
 
   /**
@@ -159,9 +172,9 @@ describe('a malformed gateway frame never escapes the message listener', () => {
    * and the plugin both survived. A row that reached READY first gets a subscribed channel, so the
    * dispatch branch runs with a registered handler rather than against an empty map.
    *
-   * `followUp` appends a well-formed HELLO the plugin visibly answers, so a row waits on the
-   * LISTENER rather than on the clock; rows whose frame is expected to END the socket switch it off
-   * and wait on the close instead.
+   * `followUp` appends this phase's {@link PROBE} frame, so a row waits on the LISTENER rather than
+   * on the clock; rows whose frame is expected to END the socket switch it off and wait on the close
+   * instead.
    */
   const survives = async (
     frame: string,
@@ -181,14 +194,19 @@ describe('a malformed gateway frame never escapes the message listener', () => {
       const sentBefore = gateway.received().length;
       const settled = gateway.reacted();
       gateway.send(frame);
-      if (followUp) gateway.send(HELLO_OK);
+      if (followUp) gateway.send(PROBE[phase].frame);
       const reaction = await settled;
 
       expect(crashes.map(String), 'a malformed frame reached the process as an uncaught error')
         .toEqual([]);
       const { messages } = await plugin.fetchRecent({ topic: TOPIC, limit: 10 });
       expect(messages, 'the REST half stopped answering after the malformed frame').toEqual([]);
-      return { delivered, reaction, answered: gateway.received().slice(sentBefore) };
+      return {
+        delivered,
+        reaction,
+        answered: gateway.received().slice(sentBefore),
+        probe: PROBE[phase].answer,
+      };
     } finally {
       await plugin.disconnect();
       await subscribed;
@@ -255,7 +273,7 @@ describe('a malformed gateway frame never escapes the message listener', () => {
   for (const phase of ['pre-ready', 'ready'] as const) {
     for (const d of DISPATCH_SHAPES) {
       it(`a MESSAGE_CREATE whose d is ${d} costs one message, not the socket (${phase})`, async () => {
-        const { delivered, answered } = await survives(
+        const { delivered, answered, probe } = await survives(
           `{"op":0,"t":"MESSAGE_CREATE","s":2,"d":${d}}`,
           phase,
         );
@@ -265,7 +283,7 @@ describe('a malformed gateway frame never escapes the message listener', () => {
           .toEqual([]);
         // One unusable dispatch is one dropped message. Ending the socket over it would spend a
         // reconnect out of Discord's per-token IDENTIFY quota for a frame nobody needed.
-        expect(answered, 'one malformed dispatch cost the whole socket').toContain(2);
+        expect(answered, 'one malformed dispatch cost the whole socket').toContain(probe);
       });
     }
   }

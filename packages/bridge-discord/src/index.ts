@@ -688,12 +688,12 @@ export class DiscordPlugin implements BackendPlugin {
   }
 
   /**
-   * Every operator-facing diagnostic, on ONE line. Keep the scrub covering EVERY line terminator,
-   * not just `\n`, so that quoted provider text cannot forge a second entry in the operator's log —
-   * a bare `\r` splits or overwrites a line in most readers just as a newline does.
+   * Every operator-facing diagnostic, on ONE line. Keep the scrub delegated to net-util's shared
+   * neutralizer instead of a local character class, so that a family nobody listed — U+0085 NEL,
+   * U+009B CSI, an ESC that rewrites the line above — cannot forge an entry in the operator's log.
    */
   private warn(line: string): void {
-    process.stderr.write(`parley-discord: ${line.replace(/\s*[\r\n\u2028\u2029]\s*/g, ' ')}\n`);
+    process.stderr.write(`parley-discord: ${sanitizeBody(line)}\n`);
   }
 
   /**
@@ -841,6 +841,7 @@ export class DiscordPlugin implements BackendPlugin {
       let readyAt = 0;
       let heartbeat: NodeJS.Timeout | undefined;
       let awaitedAck = false;
+      let identified = false;
       // A socket Discord (or a proxy) accepts but never carries to READY would otherwise park
       // this promise forever — and with it subscribe(), bridge startup, and every blocking
       // fetchRecent that awaits the same gateway.
@@ -855,9 +856,11 @@ export class DiscordPlugin implements BackendPlugin {
       }, this.handshakeTimeoutMs);
 
       ws.on('message', (data) => {
-        if (this.ws !== ws) {
-          // Superseded (or post-disconnect) socket: it owns none of the shared state, and
-          // IDENTIFYing from here would spend budget on a connection nothing reads.
+        if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+          // Superseded, post-disconnect, or already closed by a branch below: such a socket owns
+          // none of the shared state, and IDENTIFYing from here would spend budget on a connection
+          // nothing reads. Keep the readyState half, so that a peer which keeps sending after we
+          // closed cannot drive one diagnostic per frame while the close handshake finishes.
           ws.close();
           return;
         }
@@ -873,6 +876,18 @@ export class DiscordPlugin implements BackendPlugin {
         try {
           switch (payload.op) {
             case OP.HELLO: {
+              // Discord sends exactly ONE HELLO per connection, and an IDENTIFY is the scarce
+              // thing here: keep the send behind this flag, so that a peer repeating HELLO on an
+              // open socket cannot spend the 1000-IDENTIFY-per-24h quota at its own frame rate —
+              // the penalty is a bot-token RESET that breaks every Parley instance sharing it.
+              if (identified) {
+                this.warn(
+                  'gateway sent a second HELLO on a socket that has already IDENTIFYed; ' +
+                    'closing it so the ladder paces the next attempt',
+                );
+                ws.close();
+                break;
+              }
               const interval = heartbeatIntervalOf(payload.d);
               if (interval === undefined) {
                 this.warn(
@@ -882,11 +897,6 @@ export class DiscordPlugin implements BackendPlugin {
                 ws.close();
                 break;
               }
-              if (heartbeat !== undefined) {
-                clearInterval(heartbeat);
-                this.heartbeats.delete(heartbeat);
-              }
-              awaitedAck = false;
               heartbeat = setInterval(() => {
                 if (ws.readyState !== WebSocket.OPEN) return;
                 if (awaitedAck) {
@@ -903,6 +913,7 @@ export class DiscordPlugin implements BackendPlugin {
                 ws.send(JSON.stringify({ op: OP.HEARTBEAT, d: this.seq }));
               }, interval);
               this.heartbeats.add(heartbeat);
+              identified = true;
               ws.send(
                 JSON.stringify({
                   op: OP.IDENTIFY,
