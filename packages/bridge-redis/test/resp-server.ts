@@ -42,6 +42,17 @@ function takeCommand(buf: Buffer): { consumed: number; argv: string[] } | undefi
 
 export interface RespEndpoint {
   url: string;
+  /**
+   * Client sockets accepted and not yet seen closed — the externally observable resource count.
+   *
+   * Keep the `data` handler above as the only reader, so that this number can ever FALL: an
+   * accepted socket whose readable side is never resumed does not observe the peer's close, so an
+   * endpoint that ignores its input reports every socket as live forever and turns "the plugin
+   * leaked" and "this fixture never read" into the same measurement.
+   */
+  live: () => number;
+  /** Every client socket ever accepted, so a row that opened none cannot pass by finding none live. */
+  accepted: () => number;
   close: () => void;
 }
 
@@ -53,10 +64,13 @@ export interface RespEndpoint {
 export async function respEndpoint(
   reply: (argv: string[]) => string | undefined,
 ): Promise<RespEndpoint> {
-  const held: net.Socket[] = [];
+  const held = new Set<net.Socket>();
+  let acceptedCount = 0;
   const server = net.createServer((sock) => {
-    held.push(sock);
+    acceptedCount++;
+    held.add(sock);
     let buf = Buffer.alloc(0);
+    sock.on('close', () => held.delete(sock));
     sock.on('error', () => undefined);
     sock.on('data', (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
@@ -73,6 +87,8 @@ export async function respEndpoint(
   const { port } = server.address() as net.AddressInfo;
   return {
     url: `redis://127.0.0.1:${port}`,
+    live: () => held.size,
+    accepted: () => acceptedCount,
     close: () => {
       for (const s of held) s.destroy();
       server.close();

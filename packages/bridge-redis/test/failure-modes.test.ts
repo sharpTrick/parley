@@ -297,6 +297,79 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
     ['a non-ASCII password', 'pässwörd'],
   ];
 
+  // -------------------------------------------------------------------------------------------
+  // CLASS: a lifecycle call that FAILS must return every socket it opened. The reader half of this
+  // is graded live — `live-failure-modes.test.ts` counts sockets on a stalling proxy — but every
+  // row there starts from a connect() that SUCCEEDED, so the COMMAND client's own failure paths are
+  // graded by nothing: there the handshake is still in flight when the deadline fires, and once
+  // connect() has thrown, nothing retains the client for a later disconnect() to reclaim.
+  //
+  // Generated over WHERE the failure lands, because each arrival leaves node-redis holding a
+  // different amount of connection, and over REPEATS, because one orphan per attempt is what
+  // exhausts an operator's file descriptors while a single-attempt row stays green.
+  // -------------------------------------------------------------------------------------------
+
+  const brokenServers: Array<[string, (argv: string[]) => string | undefined]> = [
+    ['never speaks RESP', () => undefined],
+    [
+      'answers the handshake and never PING',
+      (argv) => (commandOf(argv) === 'ping' ? undefined : '+OK\r\n'),
+    ],
+    ['refuses the handshake', () => respError('NOAUTH', 'Authentication required.')],
+    [
+      'refuses PING',
+      (argv) =>
+        commandOf(argv) === 'ping'
+          ? respError('NOPERM', "this user has no permissions to run the 'ping' command")
+          : '+OK\r\n',
+    ],
+  ];
+
+  /** TCP client sockets this process is holding open — the half no remote server can observe. */
+  const activeTcpHandles = (): number =>
+    process.getActiveResourcesInfo().filter((r) => r === 'TCPSocketWrap').length;
+
+  const leakRows = brokenServers.flatMap(([label, reply]) =>
+    [1, 3].map(
+      (attempts) =>
+        [`${label}, ${attempts}x`, reply, attempts] as [
+          string,
+          (argv: string[]) => string | undefined,
+          number,
+        ],
+    ),
+  );
+
+  it.each(leakRows)('a connect() that fails returns every socket: %s', async (
+    _label,
+    reply,
+    attempts,
+  ) => {
+    const endpoint = await respEndpoint(reply);
+    const plugin = new RedisPlugin();
+    const before = activeTcpHandles();
+    try {
+      for (let i = 0; i < attempts; i++) {
+        await expect(
+          plugin.connect({ url: endpoint.url, connect_timeout_ms: FAST }),
+        ).rejects.toThrow(/^parley-redis:/);
+      }
+      expect(
+        endpoint.accepted(),
+        'no connection was opened at all, so this row grades nothing',
+      ).toBeGreaterThanOrEqual(attempts);
+      await expect
+        .poll(() => endpoint.live(), { timeout: 5000, interval: 50 })
+        .toBe(0);
+      await expect
+        .poll(() => activeTcpHandles(), { timeout: 5000, interval: 50 })
+        .toBeLessThanOrEqual(before);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      endpoint.close();
+    }
+  });
+
   it.each(passwords)('a server echoing AUTH never gets %s back', async (_label, password) => {
     const inTheUrl = encodeURIComponent(password);
     const seen: string[] = [];

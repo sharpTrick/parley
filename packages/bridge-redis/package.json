@@ -37,6 +37,7 @@
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "clean": "tsc -b --clean",
     "test": "vitest run --root ../.. packages/bridge-redis",
     "prepublishOnly": "npm run build"

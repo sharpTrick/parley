@@ -383,7 +383,7 @@ describe('redis hardening — a transient fault that never clears is still repor
     ),
   );
 
-  const linesMatching = (stderr: ReturnType<typeof vi.spyOn>, re: RegExp): string[] =>
+  const linesMatching = (stderr: { mock: { calls: unknown[][] } }, re: RegExp): string[] =>
     stderr.mock.calls.map((c) => String(c[0])).filter((line) => re.test(line));
 
   it.each(rows)('%s', async (_label, message, healAfter) => {

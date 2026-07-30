@@ -10,8 +10,8 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { RedisPlugin } from '../src/index.js';
-import { freshPrefix, freshTopic as mintTopic, isRedisUp, REDIS_URL, wipe } from './support.js';
+import type { RedisPlugin } from '../src/index.js';
+import { freshTopic as mintTopic, isRedisUp, REDIS_URL, withPlugin } from './support.js';
 
 // CLASS: a plugin comment or README asserts a behaviour that lives in another package. This plugin
 // throws on a cursor it did not mint and heals one that merely sorts past the stream's tail; what
@@ -27,29 +27,24 @@ interface Rig {
   topic: Topic;
   readState: ReadStateStore;
   drain: () => Promise<number>;
-  cleanup: () => Promise<void>;
 }
 
-async function rig(storedCursor: string): Promise<Rig> {
-  const prefix = freshPrefix();
-  const plugin = new RedisPlugin();
-  await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-  const topic = freshTopic();
-  const readState = new ReadStateStore(
-    join(mkdtempSync(join(tmpdir(), 'parley-redis-catchup-')), 'read-state.json'),
-  );
-  readState.set(topic, asCursor(storedCursor));
-  const seen = new SeenSet();
-  return {
-    plugin,
-    topic,
-    readState,
-    drain: () => catchUpTopic({ plugin, topic, limit: 100, readState, seen }),
-    cleanup: async () => {
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    },
-  };
+/** A connected plugin whose topic core has already read up to `storedCursor`, ready to catch up. */
+function withRig(storedCursor: string, body: (rig: Rig) => Promise<void>): Promise<void> {
+  return withPlugin({}, async ({ plugin }) => {
+    const topic = freshTopic();
+    const readState = new ReadStateStore(
+      join(mkdtempSync(join(tmpdir(), 'parley-redis-catchup-')), 'read-state.json'),
+    );
+    readState.set(topic, asCursor(storedCursor));
+    const seen = new SeenSet();
+    await body({
+      plugin,
+      topic,
+      readState,
+      drain: () => catchUpTopic({ plugin, topic, limit: 100, readState, seen }),
+    });
+  });
 }
 
 describe.skipIf(!redisUp)('redis + core catch-up — what core actually does with each cursor', () => {
@@ -62,9 +57,8 @@ describe.skipIf(!redisUp)('redis + core catch-up — what core actually does wit
     ['a plain word', 'abc'],
   ] as const;
 
-  it.each(foreign)('aborts catch-up on %s, naming the plugin and the state file', async (_l, c) => {
-    const r = await rig(c);
-    try {
+  it.each(foreign)('aborts catch-up on %s, naming the plugin and the state file', async (_l, c) =>
+    withRig(c, async (r) => {
       await r.plugin.post(r.topic, asHandle('w'), 'one');
       const failure = await r.drain().then(
         () => undefined,
@@ -76,17 +70,13 @@ describe.skipIf(!redisUp)('redis + core catch-up — what core actually does wit
       expect(failure?.message).toContain(r.readState.path);
       // The read position was NOT advanced, so a restart hits the same wall until an operator acts.
       expect(r.readState.get(r.topic)).toBe(c);
-    } finally {
-      await r.cleanup();
-    }
-  });
+    }));
 
   // The deliberate asymmetry: a cursor that is well-formed but sorts past the stream's last generated
   // id IS recovered — by this plugin, silently, with core never seeing an error at all.
   it('drains the whole window for a cursor past the high-water mark', async () => {
     const future = `${Date.now() + 86_400_000}-0`;
-    const r = await rig(future);
-    try {
+    await withRig(future, async (r) => {
       await r.plugin.post(r.topic, asHandle('w'), 'one');
       await r.plugin.post(r.topic, asHandle('w'), 'two');
       await expect(r.drain()).resolves.toBe(2);
@@ -94,19 +84,13 @@ describe.skipIf(!redisUp)('redis + core catch-up — what core actually does wit
       // …and the advanced cursor is live: a second catch-up drains only what arrived since.
       await r.plugin.post(r.topic, asHandle('w'), 'three');
       await expect(r.drain()).resolves.toBe(1);
-    } finally {
-      await r.cleanup();
-    }
+    });
   });
 
-  it('drains only what is newer than a cursor this backend minted', async () => {
-    const r = await rig('0-1');
-    try {
+  it('drains only what is newer than a cursor this backend minted', async () =>
+    withRig('0-1', async (r) => {
       await r.plugin.post(r.topic, asHandle('w'), 'one');
       await expect(r.drain()).resolves.toBe(1);
       await expect(r.drain()).resolves.toBe(0);
-    } finally {
-      await r.cleanup();
-    }
-  });
+    }));
 });

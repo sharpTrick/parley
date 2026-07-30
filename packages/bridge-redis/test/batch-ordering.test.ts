@@ -1,13 +1,11 @@
 import { asHandle, type Cursor, type Message, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { createRedisClient, RedisPlugin } from '../src/index.js';
 import {
-  FAST_MS as FAST,
-  freshPrefix,
   freshTopic as mintTopic,
   isRedisUp,
   REDIS_URL,
-  wipe,
+  withPlugin,
+  withWriter,
 } from './support.js';
 
 // CLASS: a delivery path that can return N>1 messages is only ever graded on N==1. The seam
@@ -31,17 +29,13 @@ const BURSTS = [2, 5, 25];
 const contents = (n: number): string[] => Array.from({ length: n }, (_v, i) => `m${i}`);
 
 async function burst(key: string, want: string[]): Promise<void> {
-  const writer = createRedisClient(REDIS_URL, FAST);
-  await writer.connect();
-  try {
+  await withWriter(async (writer) => {
     const tx = writer.multi();
     for (const content of want) {
       tx.xAdd(key, '*', { sender: 'burst', content, ts: new Date().toISOString(), in_reply_to: '' });
     }
     await tx.exec();
-  } finally {
-    await writer.disconnect().catch(() => undefined);
-  }
+  });
 }
 
 /** Order a stream id the way Redis does; a bare `<ms>` has an implicit sequence of 0. */
@@ -67,13 +61,10 @@ function expectOrderedAndUnique(messages: Message[]): void {
 }
 
 describe.skipIf(!redisUp)('redis batch delivery — subscribe, on a burst wider than one entry', () => {
-  it.each(BURSTS)('delivers a burst of %i once each, in ascending cursor order', async (n) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 4000 });
-    const t = freshTopic();
-    const seen: Message[] = [];
-    try {
+  it.each(BURSTS)('delivers a burst of %i once each, in ascending cursor order', async (n) =>
+    withPlugin({ block_ms: 4000 }, async ({ plugin, prefix }) => {
+      const t = freshTopic();
+      const seen: Message[] = [];
       await plugin.subscribe(t, (m) => seen.push(m));
       // A delivered post proves the read loop is PARKED on a blocking XREAD, so the burst below
       // lands in one batch rather than being drained an entry at a time during startup.
@@ -90,20 +81,13 @@ describe.skipIf(!redisUp)('redis batch delivery — subscribe, on a burst wider 
       // whole batch on the next iteration, which is only visible after the batch itself was graded.
       await new Promise((r) => setTimeout(r, 300));
       expect(seen.map((m) => m.content), 'the batch was re-delivered').toEqual(['armed', ...want]);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+    }));
 });
 
 describe.skipIf(!redisUp)('redis batch delivery — a blocking fetchRecent woken by a burst', () => {
-  it.each(BURSTS)('honours limit and order when %i+2 entries arrive at once', async (limit) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
+  it.each(BURSTS)('honours limit and order when %i+2 entries arrive at once', async (limit) =>
+    withPlugin({}, async ({ plugin, prefix }) => {
+      const t = freshTopic();
       await plugin.post(t, asHandle('w'), 'seed');
       const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
       const want = contents(limit + 2);
@@ -127,9 +111,5 @@ describe.skipIf(!redisUp)('redis batch delivery — a blocking fetchRecent woken
       expect(rest.messages.map((m) => m.content), 'the truncated remainder was skipped').toEqual(
         want.slice(limit),
       );
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+    }));
 });

@@ -11,6 +11,8 @@ import {
   isRedisUp,
   REDIS_URL,
   wipe,
+  withPlugin,
+  withWriter,
 } from './support.js';
 
 // The half of the failure surface that needs a real server. EVERY block here is gated on `redisUp`
@@ -144,46 +146,39 @@ describe.skipIf(!redisUp)('redis failure modes — retention_days trims, and onl
     ],
   ];
 
-  it.each(rows)('%s', async (_label, row) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    const t = freshTopic();
-    const key = `${prefix}${t}`;
-    try {
-      await writer.connect();
-      const seeded = row.seeded(await streamNodeMaxEntries(writer));
-      const base = Date.now() - row.ageDays * 86_400_000;
-      for (let i = 0; i < seeded; i++) {
-        await writer.xAdd(key, `${base + i}-0`, { sender: 'w', content: `old${i}` });
-      }
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, retention_days: row.days });
-      await plugin.post(t, asHandle('w'), 'fresh');
+  it.each(rows)('%s', async (_label, row) =>
+    withPlugin({ retention_days: row.days }, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const key = `${prefix}${t}`;
+        const seeded = row.seeded(await streamNodeMaxEntries(writer));
+        const base = Date.now() - row.ageDays * 86_400_000;
+        for (let i = 0; i < seeded; i++) {
+          await writer.xAdd(key, `${base + i}-0`, { sender: 'w', content: `old${i}` });
+        }
+        await plugin.post(t, asHandle('w'), 'fresh');
 
-      const remaining = await writer.xLen(key);
-      const page = await plugin.fetchRecent({ topic: t, limit: 10_000 });
-      if (row.effect === 'trimmed') {
-        expect(
-          remaining,
-          `${seeded} entries ${row.ageDays} days old survived a ${row.days}-day window, so ` +
-            `retention_days did nothing at all`,
-        ).toBe(1);
-        expect(page.messages.map((m) => m.content)).toEqual(['fresh']);
-      } else {
-        expect(
-          remaining,
-          `entries the ${String(row.days)}-day window covers were trimmed anyway`,
-        ).toBe(seeded + 1);
-        expect(page.messages).toHaveLength(seeded + 1);
-        expect(page.messages[0]?.content).toBe('old0');
-        expect(page.messages.at(-1)?.content).toBe('fresh');
-      }
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    }
-  });
+        const remaining = await writer.xLen(key);
+        const page = await plugin.fetchRecent({ topic: t, limit: 10_000 });
+        if (row.effect === 'trimmed') {
+          expect(
+            remaining,
+            `${seeded} entries ${row.ageDays} days old survived a ${row.days}-day window, so ` +
+              `retention_days did nothing at all`,
+          ).toBe(1);
+          expect(page.messages.map((m) => m.content)).toEqual(['fresh']);
+        } else {
+          expect(
+            remaining,
+            `entries the ${String(row.days)}-day window covers were trimmed anyway`,
+          ).toBe(seeded + 1);
+          expect(page.messages).toHaveLength(seeded + 1);
+          expect(page.messages[0]?.content).toBe('old0');
+          expect(page.messages.at(-1)?.content).toBe('fresh');
+        }
+      }),
+    ),
+  );
 });
 
 // -------------------------------------------------------------------------------------------
@@ -278,29 +273,19 @@ describe.skipIf(!redisUp)('redis failure modes — an accepted config still deli
 
   // The one path the round-trip above cannot see: a knob accepted at connect() that then silently
   // kills LIVE push. `30 / 7` is deliberate — a window that is not a whole number of milliseconds.
-  it('live push still works with every knob set at once', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({
-      url: REDIS_URL,
-      key_prefix: prefix,
-      block_ms: 250,
-      connect_timeout_ms: 3000,
-      retention_days: 30 / 7,
-    });
-    const t = freshTopic();
-    const live: string[] = [];
-    try {
-      await plugin.subscribe(t, (m) => live.push(m.content));
-      const id = await plugin.post(t, asHandle('w'), 'pushed');
-      await expect.poll(() => live, { timeout: 5000, interval: 50 }).toEqual(['pushed']);
-      const page = await plugin.fetchRecent({ topic: t, limit: 10 });
-      expect(page.messages.map((m) => m.backendMsgId)).toEqual([id]);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+  it('live push still works with every knob set at once', async () =>
+    withPlugin(
+      { block_ms: 250, connect_timeout_ms: 3000, retention_days: 30 / 7 },
+      async ({ plugin }) => {
+        const t = freshTopic();
+        const live: string[] = [];
+        await plugin.subscribe(t, (m) => live.push(m.content));
+        const id = await plugin.post(t, asHandle('w'), 'pushed');
+        await expect.poll(() => live, { timeout: 5000, interval: 50 }).toEqual(['pushed']);
+        const page = await plugin.fetchRecent({ topic: t, limit: 10 });
+        expect(page.messages.map((m) => m.backendMsgId)).toEqual([id]);
+      },
+    ));
 });
 
 // -------------------------------------------------------------------------------------------
@@ -323,42 +308,27 @@ describe.skipIf(!redisUp)('redis failure modes — block_ms is an idle re-arm in
     await new Promise((r) => setTimeout(r, 200)); // let the loop reach its first XREAD BLOCK
   };
 
-  it.each([2000, 60_000])('disconnect() does not wait out a block_ms of %i', async (blockMs) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const t = freshTopic();
-    try {
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: blockMs });
-      await parked(plugin, t);
+  it.each([2000, 60_000])('disconnect() does not wait out a block_ms of %i', async (blockMs) =>
+    withPlugin({ block_ms: blockMs }, async ({ plugin }) => {
+      await parked(plugin, freshTopic());
       const started = Date.now();
       await plugin.disconnect();
       expect(
         Date.now() - started,
         `disconnect() waited out the block_ms of ${blockMs}, so it IS a shutdown knob`,
       ).toBeLessThan(blockMs / 2);
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    }
-  });
+    }));
 
-  it('a live post is delivered without waiting out a block_ms of 60000', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const t = freshTopic();
-    const live: string[] = [];
-    try {
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 60_000 });
+  it('a live post is delivered without waiting out a block_ms of 60000', async () =>
+    withPlugin({ block_ms: 60_000 }, async ({ plugin }) => {
+      const t = freshTopic();
+      const live: string[] = [];
       // Parked FIRST, so the row cannot pass on the first read happening to land after the post:
       // a loop that re-armed on a timer instead of blocking would be asleep for the interval here.
       await parked(plugin, t, (m) => live.push(m.content));
       await plugin.post(t, asHandle('w'), 'pushed');
       await expect.poll(() => live, { timeout: 5000, interval: 50 }).toEqual(['pushed']);
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    }
-  });
+    }));
 });
 
 // The teardown-ordering half of the same class: connect() validates its WHOLE config before it tears
@@ -369,15 +339,12 @@ describe.skipIf(!redisUp)('redis failure modes — block_ms is an idle re-arm in
 describe.skipIf(!redisUp)(
   'redis failure modes — a rejected connect() must not destroy a live one',
   () => {
-    it.each(CONFIG_KEYS)('every rejected %s leaves the live connection usable', async (knob) => {
-      const rows = rejectedByKnob[knob] ?? [];
-      expect(rows.length, `no rejection rows are declared for '${knob}'`).toBeGreaterThan(0);
-      const prefix = freshPrefix();
-      const plugin = new RedisPlugin();
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-      const t = freshTopic();
-      const destroyed: string[] = [];
-      try {
+    it.each(CONFIG_KEYS)('every rejected %s leaves the live connection usable', async (knob) =>
+      withPlugin({}, async ({ plugin, prefix }) => {
+        const rows = rejectedByKnob[knob] ?? [];
+        expect(rows.length, `no rejection rows are declared for '${knob}'`).toBeGreaterThan(0);
+        const t = freshTopic();
+        const destroyed: string[] = [];
         await plugin.post(t, asHandle('w'), 'before');
         for (const [rowLabel, value] of rows) {
           const rejection = await plugin
@@ -402,11 +369,8 @@ describe.skipIf(!redisUp)(
         ).toEqual([]);
         const page = await plugin.fetchRecent({ topic: t, limit: 1000 });
         expect(page.messages.map((m) => m.content)).toContain('before');
-      } finally {
-        await plugin.disconnect().catch(() => undefined);
-        await wipe(prefix);
-      }
-    });
+      }),
+    );
   },
 );
 
@@ -429,13 +393,15 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
   // release. For `from-id` one row per unusable spelling would prove nothing: an empty `ts`,
   // `not-a-date` and a bare epoch number all take the same fallback.
   type Derivation = 'from-id' | 'from-ts';
+  /** One ISO instant, so the two tables below cannot disagree about what a usable `ts` looks like. */
+  const WELL_KNOWN_TS = '2020-05-06T07:08:09.000Z';
   const foreignEntries: Array<[string, Record<string, string>, Derivation]> = [
     ['no recognised field at all', { unrelated: '1' }, 'from-id'],
     ['content only (a human via redis-cli)', { content: 'hi from redis-cli' }, 'from-id'],
     ['sender only', { sender: 'alice' }, 'from-id'],
     ['an empty sender', { sender: '', content: 'anon' }, 'from-id'],
     ['a ts that is not a date', { sender: 'alice', content: 'hi', ts: 'not-a-date' }, 'from-id'],
-    ['an ISO ts of its own', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09.000Z' }, 'from-ts'],
+    ['an ISO ts of its own', { sender: 'a', content: 'hi', ts: WELL_KNOWN_TS }, 'from-ts'],
     ['an ISO ts with an offset', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09+02:00' }, 'from-ts'],
     ['an ISO date with no time', { sender: 'a', content: 'hi', ts: '2020-05-06' }, 'from-ts'],
     ['an RFC 2822 ts', { sender: 'a', content: 'hi', ts: 'Tue, 05 Nov 2024 10:00:00 GMT' }, 'from-ts'],
@@ -446,50 +412,42 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
     ['binary-ish content', { sender: 'alice', content: '\u00ff\u00fe\u0001bin' }, 'from-id'],
   ];
 
-  it.each(foreignEntries)('normalizes an entry with %s', async (_label, fields, derivation) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      await writer.connect();
-      const id = await writer.xAdd(`${prefix}${t}`, '*', fields);
-      const page = await plugin.fetchRecent({ topic: t, limit: 10 });
-      const [m] = page.messages;
-      expect(m, 'the foreign entry did not come back at all').toBeDefined();
-      expect(m?.topic).toBe(t);
-      expect(m?.backendMsgId).toBe(id);
-      expect(m?.cursor).toBe(id);
-      expect(m?.content).toBe(fields.content ?? '');
-      expect(m?.senderHandle, 'an empty handle collides with every other empty handle').not.toBe('');
-      const source =
-        derivation === 'from-ts' ? Date.parse(fields.ts ?? '') : Number(id.split('-')[0]);
-      expect(m?.timestamp, `timestamp is not derived ${derivation}`).toBe(
-        new Date(source).toISOString(),
-      );
-      // Parseability is not the contract: `Date.parse` accepts `12/25/2021` and `2020`, so only
-      // re-serializing to the canonical form can say the value IS ISO 8601 (DESIGN §5).
-      expect(
-        m?.timestamp,
-        `timestamp ${JSON.stringify(m?.timestamp)} is not in ISO 8601 form (DESIGN §5)`,
-      ).toBe(new Date(m?.timestamp ?? '').toISOString());
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+  it.each(foreignEntries)('normalizes an entry with %s', async (_label, fields, derivation) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const id = await writer.xAdd(`${prefix}${t}`, '*', fields);
+        const page = await plugin.fetchRecent({ topic: t, limit: 10 });
+        const [m] = page.messages;
+        expect(m, 'the foreign entry did not come back at all').toBeDefined();
+        expect(m?.topic).toBe(t);
+        expect(m?.backendMsgId).toBe(id);
+        expect(m?.cursor).toBe(id);
+        expect(m?.content).toBe(fields.content ?? '');
+        expect(m?.senderHandle, 'an empty handle collides with every other empty handle').not.toBe(
+          '',
+        );
+        const source =
+          derivation === 'from-ts' ? Date.parse(fields.ts ?? '') : Number(id.split('-')[0]);
+        expect(m?.timestamp, `timestamp is not derived ${derivation}`).toBe(
+          new Date(source).toISOString(),
+        );
+        // Parseability is not the contract: `Date.parse` accepts `12/25/2021` and `2020`, so only
+        // re-serializing to the canonical form can say the value IS ISO 8601 (DESIGN §5).
+        expect(
+          m?.timestamp,
+          `timestamp ${JSON.stringify(m?.timestamp)} is not in ISO 8601 form (DESIGN §5)`,
+        ).toBe(new Date(m?.timestamp ?? '').toISOString());
+      }),
+    ),
+  );
 
   // The inverse half: an entry this plugin wrote must report the wall-clock time of the post. Only a
   // bracketed window can say so — every other assertion on Message.timestamp here and in the shared
   // conformance suite tests parseability, which any constant satisfies.
-  it('reports the wall-clock time of a post it made itself', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
+  it('reports the wall-clock time of a post it made itself', async () =>
+    withPlugin({}, async ({ plugin }) => {
+      const t = freshTopic();
       const before = Date.now();
       await plugin.post(t, asHandle('w'), 'now');
       const after = Date.now();
@@ -500,34 +458,115 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
         `timestamp ${JSON.stringify(m?.timestamp)} is outside the window the post ran in`,
       ).toBeGreaterThanOrEqual(before - 1000);
       expect(at).toBeLessThanOrEqual(after + 1000);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+    }));
 
-  it('normalizes a foreign entry arriving over the LIVE path too', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    const live: Array<{ senderHandle: string; timestamp: string }> = [];
-    try {
-      await writer.connect();
-      await plugin.subscribe(t, (m) => live.push(m));
-      await writer.xAdd(`${prefix}${t}`, '*', { content: 'from redis-cli', ts: '12/25/2021' });
-      await expect.poll(() => live.length, { timeout: 5000, interval: 50 }).toBe(1);
-      expect(live[0]?.senderHandle).not.toBe('');
-      expect(live[0]?.timestamp, 'the live path forwards a non-ISO ts verbatim').toBe(
-        new Date(Date.parse('12/25/2021')).toISOString(),
-      );
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+  // ----------------------------------------------------------------------------------------
+  // The axis the field table above holds fixed: every one of its rows writes at `'*'`, so the
+  // ENTRY ID — the other value a foreign writer chooses, and the one the timestamp falls back to —
+  // is graded by nothing. Both components of a stream id are uint64, which reaches far past the
+  // instant `Date` can represent, so an id is arithmetic input from an untrusted writer: a value
+  // out of that range throws `RangeError` out of `fetchRecent` (permanently, since the entry is
+  // durable) and is swallowed on the `subscribe` path, dropping the entry with no diagnostic.
+  //
+  // The ids are DERIVED from the uint64 bound and from `Date`'s own range rather than hand-picked,
+  // and every row is graded on BOTH paths, so neither half can be fixed while the other still
+  // throws.
+  // ----------------------------------------------------------------------------------------
+
+  /** The bound each component of a stream entry id is held to. */
+  const ID_CEILING = 2n ** 64n - 1n;
+  /** The last instant `Date` can represent; `new Date` of one millisecond more is a `RangeError`. */
+  const LAST_DATE_MS = 8_640_000_000_000_000n;
+
+  const foreignIds: Array<[string, string]> = [
+    ['the first id a stream can hold', '1-0'],
+    ['a present-day id', `${Date.now()}-0`],
+    ['the last millisecond Date can represent', `${LAST_DATE_MS}-0`],
+    ['one millisecond past what Date can represent', `${LAST_DATE_MS + 1n}-0`],
+    ['the first millisecond past a safe integer', `${2n ** 53n + 1n}-0`],
+    ['the ceiling millisecond at sequence zero', `${ID_CEILING}-0`],
+    ['the largest id a stream can ever mint', `${ID_CEILING}-${ID_CEILING}`],
+  ];
+
+  /** Whether the entry carries a usable `ts` of its own — which decides where the derivation comes from. */
+  const tsRows: Array<[string, Record<string, string>, Derivation]> = [
+    ['no usable ts', { sender: 'mallory', content: 'hi' }, 'from-id'],
+    ['an ISO ts of its own', { sender: 'mallory', content: 'hi', ts: WELL_KNOWN_TS }, 'from-ts'],
+  ];
+
+  const idRows = foreignIds.flatMap(([idLabel, id]) =>
+    tsRows.map(
+      ([tsLabel, fields, derivation]) =>
+        [`${idLabel}, with ${tsLabel}`, id, fields, derivation] as [
+          string,
+          string,
+          Record<string, string>,
+          Derivation,
+        ],
+    ),
+  );
+
+  it.each(idRows)('normalizes an entry written at %s', async (_label, id, fields, derivation) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const live: Array<{ timestamp: string }> = [];
+        // Subscribed FIRST, so the same entry is graded on the live path and on catch-up: the live
+        // half swallows its own throw, so only an entry that must ARRIVE can see it.
+        await plugin.subscribe(t, (m) => live.push(m));
+        await writer.xAdd(`${prefix}${t}`, id, fields);
+
+        const page = await plugin.fetchRecent({ topic: t, limit: 10 });
+        const [m] = page.messages;
+        expect(m, `fetchRecent did not return the entry written at ${id}`).toBeDefined();
+        expect(m?.backendMsgId).toBe(id);
+        await expect.poll(() => live.length, { timeout: 5000, interval: 50 }).toBe(1);
+
+        const ms = BigInt(id.split('-')[0] ?? '0');
+        const derived =
+          derivation === 'from-ts'
+            ? new Date(Date.parse(fields.ts ?? '')).toISOString()
+            : ms <= LAST_DATE_MS
+              ? new Date(Number(ms)).toISOString()
+              : undefined;
+        for (const [path, timestamp] of [
+          ['fetchRecent', m?.timestamp],
+          ['subscribe', live[0]?.timestamp],
+        ] as const) {
+          // ISO 8601 (DESIGN §5) whatever the writer chose — the invariant an id out of Date's
+          // range breaks by throwing rather than by returning something wrong.
+          expect(
+            timestamp,
+            `${path}: timestamp ${JSON.stringify(timestamp)} is not in ISO 8601 form (DESIGN §5)`,
+          ).toBe(new Date(Date.parse(timestamp ?? '')).toISOString());
+          // …and where the entry names a representable instant, it is the one reported: without
+          // this the whole table is satisfied by reporting 1970 for every message.
+          if (derived !== undefined) {
+            expect(timestamp, `${path}: timestamp is not derived ${derivation}`).toBe(derived);
+          }
+        }
+
+        // …and the topic is not wedged: the entry is durable, so a throw here repeats forever.
+        const again = await plugin.fetchRecent({ topic: t, limit: 10 });
+        expect(again.messages.map((x) => x.backendMsgId)).toEqual([id]);
+      }),
+    ),
+  );
+
+  it('normalizes a foreign entry arriving over the LIVE path too', async () =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const live: Array<{ senderHandle: string; timestamp: string }> = [];
+        await plugin.subscribe(t, (m) => live.push(m));
+        await writer.xAdd(`${prefix}${t}`, '*', { content: 'from redis-cli', ts: '12/25/2021' });
+        await expect.poll(() => live.length, { timeout: 5000, interval: 50 }).toBe(1);
+        expect(live[0]?.senderHandle).not.toBe('');
+        expect(live[0]?.timestamp, 'the live path forwards a non-ISO ts verbatim').toBe(
+          new Date(Date.parse('12/25/2021')).toISOString(),
+        );
+      }),
+    ));
 });
 
 // -------------------------------------------------------------------------------------------
@@ -548,52 +587,45 @@ describe.skipIf(!redisUp)('redis failure modes — what post writes is what the 
     ['a top-level post', undefined],
   ];
 
-  it.each(parents)('%s carries every declared field and no others', async (_label, parent) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    const t = freshTopic();
-    try {
-      await writer.connect();
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-      const before = Date.now();
-      const id = await plugin.post(
-        t,
-        asHandle('alice'),
-        'hello',
-        parent === undefined ? undefined : { inReplyTo: asBackendMsgId(parent) },
-      );
-      const after = Date.now();
+  it.each(parents)('%s carries every declared field and no others', async (_label, parent) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const before = Date.now();
+        const id = await plugin.post(
+          t,
+          asHandle('alice'),
+          'hello',
+          parent === undefined ? undefined : { inReplyTo: asBackendMsgId(parent) },
+        );
+        const after = Date.now();
 
-      const [entry] = await writer.xRange(`${prefix}${t}`, id, id);
-      const fields = entry?.message ?? {};
-      const expected: Record<string, (value: string) => void> = {
-        sender: (v) => expect(v).toBe('alice'),
-        content: (v) => expect(v).toBe('hello'),
-        ts: (v) => {
-          expect(v, 'ts is not in ISO 8601 form (DESIGN §5)').toBe(
-            new Date(Date.parse(v)).toISOString(),
-          );
-          expect(Date.parse(v)).toBeGreaterThanOrEqual(before - 1000);
-          expect(Date.parse(v)).toBeLessThanOrEqual(after + 1000);
-        },
-        in_reply_to: (v) =>
-          expect(v, 'the seam threading argument was dropped on the floor').toBe(parent ?? ''),
-      };
+        const [entry] = await writer.xRange(`${prefix}${t}`, id, id);
+        const fields = entry?.message ?? {};
+        const expected: Record<string, (value: string) => void> = {
+          sender: (v) => expect(v).toBe('alice'),
+          content: (v) => expect(v).toBe('hello'),
+          ts: (v) => {
+            expect(v, 'ts is not in ISO 8601 form (DESIGN §5)').toBe(
+              new Date(Date.parse(v)).toISOString(),
+            );
+            expect(Date.parse(v)).toBeGreaterThanOrEqual(before - 1000);
+            expect(Date.parse(v)).toBeLessThanOrEqual(after + 1000);
+          },
+          in_reply_to: (v) =>
+            expect(v, 'the seam threading argument was dropped on the floor').toBe(parent ?? ''),
+        };
 
-      expect(
-        Object.keys(fields).sort(),
-        'a field post writes has no declared expectation here (or a declared one never arrived)',
-      ).toEqual(Object.keys(expected).sort());
-      for (const [field, assertValue] of Object.entries(expected)) {
-        assertValue(fields[field] ?? '');
-      }
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    }
-  });
+        expect(
+          Object.keys(fields).sort(),
+          'a field post writes has no declared expectation here (or a declared one never arrived)',
+        ).toEqual(Object.keys(expected).sort());
+        for (const [field, assertValue] of Object.entries(expected)) {
+          assertValue(fields[field] ?? '');
+        }
+      }),
+    ),
+  );
 });
 
 // -------------------------------------------------------------------------------------------
@@ -620,21 +652,14 @@ describe.skipIf(!redisUp)('redis failure modes — cursor provenance', () => {
     ['both components overflowing', '18446744073709551616-18446744073709551616'],
   ] as const;
 
-  it.each(foreign)('throws a labelled error for %s', async (_label, since) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
+  it.each(foreign)('throws a labelled error for %s', async (_label, since) =>
+    withPlugin({}, async ({ plugin }) => {
+      const t = freshTopic();
       await plugin.post(t, asHandle('w'), 'one');
       await expect(
         plugin.fetchRecent({ topic: t, since: since as unknown as Cursor }),
       ).rejects.toThrow(new RegExp(`parley-redis: malformed cursor .* for topic ${t}`));
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+    }));
 });
 
 // -------------------------------------------------------------------------------------------
@@ -774,38 +799,32 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
     ),
   );
 
-  it.each(rows)('%s', async (_label, seed, mint) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
-      await writer.connect();
-      const { expected, tail } = await seed(writer, `${prefix}${t}`);
-      const since = mint(tail) as Cursor;
+  it.each(rows)('%s', async (_label, seed, mint) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const { expected, tail } = await seed(writer, `${prefix}${t}`);
+        const since = mint(tail) as Cursor;
 
-      // The invariant that catches the whole wedge class, whatever the stream holds: a catch-up must
-      // never answer with BOTH an empty page and the same cursor back — that pair is a dead end that
-      // repeats forever, and on an EMPTY stream it is the only way the heal can be observed at all.
-      const started = Date.now();
-      const page = await plugin.fetchRecent({ topic: t, since, blockMs: 2000 });
-      expect(page.messages.length > 0 || page.nextCursor !== since).toBe(true);
-      expect(page.messages.map((m) => m.content)).toEqual(expected);
-      expect(page.nextCursor).not.toBe(since);
-      // …and a cursor that can never come true must not burn the granted budget waiting for it.
-      expect(Date.now() - started).toBeLessThan(1000);
+        // The invariant that catches the whole wedge class, whatever the stream holds: a catch-up
+        // must never answer with BOTH an empty page and the same cursor back — that pair is a dead
+        // end that repeats forever, and on an EMPTY stream it is the only way the heal can be
+        // observed at all.
+        const started = Date.now();
+        const page = await plugin.fetchRecent({ topic: t, since, blockMs: 2000 });
+        expect(page.messages.length > 0 || page.nextCursor !== since).toBe(true);
+        expect(page.messages.map((m) => m.content)).toEqual(expected);
+        expect(page.nextCursor).not.toBe(since);
+        // …and a cursor that can never come true must not burn the granted budget waiting for it.
+        expect(Date.now() - started).toBeLessThan(1000);
 
-      // …and the healed cursor is live: it advances over the next post rather than replaying.
-      await plugin.post(t, asHandle('w'), 'three');
-      const next = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
-      expect(next.messages.map((m) => m.content)).toEqual(['three']);
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+        // …and the healed cursor is live: it advances over the next post rather than replaying.
+        await plugin.post(t, asHandle('w'), 'three');
+        const next = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
+        expect(next.messages.map((m) => m.content)).toEqual(['three']);
+      }),
+    ),
+  );
 
   // The other direction of the same comparison, and the one an over-eager heal breaks: a cursor at
   // or BELOW the last generated id names an entry this stream really did mint, so it must be echoed
@@ -831,38 +850,28 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
     ),
   );
 
-  it.each(belowTail)('echoes a cursor at or below the tail: %s', async (_label, mint) => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    const writer = createRedisClient(REDIS_URL, FAST);
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    const key = `${prefix}${t}`;
-    try {
-      await writer.connect();
-      const tail = await seedTwoInOneMillisecond(writer, key);
-      await dropEntries(writer, key);
-      const since = mint(tail) as Cursor;
+  it.each(belowTail)('echoes a cursor at or below the tail: %s', async (_label, mint) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const key = `${prefix}${t}`;
+        const tail = await seedTwoInOneMillisecond(writer, key);
+        await dropEntries(writer, key);
+        const since = mint(tail) as Cursor;
 
-      const page = await plugin.fetchRecent({ topic: t, since });
-      expect(page.messages).toEqual([]);
-      expect(
-        page.nextCursor,
-        'a live cursor was healed, so the next catch-up replays the whole history',
-      ).toBe(since);
-    } finally {
-      await writer.disconnect().catch(() => undefined);
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+        const page = await plugin.fetchRecent({ topic: t, since });
+        expect(page.messages).toEqual([]);
+        expect(
+          page.nextCursor,
+          'a live cursor was healed, so the next catch-up replays the whole history',
+        ).toBe(since);
+      }),
+    ),
+  );
 
-  it('a cursor this backend minted still works, and the tail still returns a stable page', async () => {
-    const prefix = freshPrefix();
-    const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-    const t = freshTopic();
-    try {
+  it('a cursor this backend minted still works, and the tail still returns a stable page', async () =>
+    withPlugin({}, async ({ plugin }) => {
+      const t = freshTopic();
       await plugin.post(t, asHandle('w'), 'one');
       const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
       await plugin.post(t, asHandle('w'), 'two');
@@ -872,11 +881,7 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
       const drained = await plugin.fetchRecent({ topic: t, since: after.nextCursor });
       expect(drained.messages).toEqual([]);
       expect(drained.nextCursor).toBe(after.nextCursor);
-    } finally {
-      await plugin.disconnect();
-      await wipe(prefix);
-    }
-  });
+    }));
 });
 
 // -------------------------------------------------------------------------------------------
@@ -898,33 +903,27 @@ describe.skipIf(!redisUp)('redis failure modes — every seam call labels a back
     ['subscribe', (p, t) => p.subscribe(t, () => undefined)],
   ];
 
-  it.each(calls)('%s names the plugin, the topic and the key', async (_label, call) => {
-    const prefix = freshPrefix();
-    const t = freshTopic();
-    const squatter = createRedisClient(REDIS_URL, FAST);
-    const plugin = new RedisPlugin();
-    try {
-      await squatter.connect();
-      // A plain string where the stream would live — what a prefix shared with another app looks like.
-      await squatter.set(`${prefix}${t}`, 'owned by another application');
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix });
-      const failure = await call(plugin, t).then(
-        () => undefined,
-        (err: Error) => err,
-      );
-      expect(failure, 'a repurposed key was not reported at all').toBeInstanceOf(Error);
-      expect(failure?.message).toMatch(/^parley-redis:/);
-      expect(failure?.message, 'the operator cannot tell WHICH topic failed').toContain(t);
-      expect(failure?.message, 'the operator cannot tell which Redis key failed').toContain(
-        `${prefix}${t}`,
-      );
-      expect(failure?.message).toContain('WRONGTYPE');
-    } finally {
-      await squatter.disconnect().catch(() => undefined);
-      await plugin.disconnect().catch(() => undefined);
-      await wipe(prefix);
-    }
-  });
+  it.each(calls)('%s names the plugin, the topic and the key', async (_label, call) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (squatter) => {
+        const t = freshTopic();
+        // A plain string where the stream would live — what a prefix shared with another app
+        // looks like.
+        await squatter.set(`${prefix}${t}`, 'owned by another application');
+        const failure = await call(plugin, t).then(
+          () => undefined,
+          (err: Error) => err,
+        );
+        expect(failure, 'a repurposed key was not reported at all').toBeInstanceOf(Error);
+        expect(failure?.message).toMatch(/^parley-redis:/);
+        expect(failure?.message, 'the operator cannot tell WHICH topic failed').toContain(t);
+        expect(failure?.message, 'the operator cannot tell which Redis key failed').toContain(
+          `${prefix}${t}`,
+        );
+        expect(failure?.message).toContain('WRONGTYPE');
+      }),
+    ),
+  );
 });
 
 // -------------------------------------------------------------------------------------------
@@ -938,40 +937,30 @@ describe.skipIf(!redisUp)('redis failure modes — the long-poll query-to-wait g
   // Only delays SHORTER than a reader handshake belong here. A longer one lands after the waiter
   // has registered, where the shipped conformance long-poll case already pins delivery, so it would
   // pass against the very defect this block exists to catch.
-  it.each([0, 1, 2, 3])(
-    'delivers a post issued %ims into the long-poll',
-    async (delayMs) => {
-      const prefix = freshPrefix();
-      const plugin = new RedisPlugin();
-      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 500 });
+  it.each([0, 1, 2, 3])('delivers a post issued %ims into the long-poll', async (delayMs) =>
+    withPlugin({ block_ms: 500 }, async ({ plugin }) => {
       const t = freshTopic();
-      try {
-        await plugin.post(t, asHandle('w'), 'seed');
-        const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
+      await plugin.post(t, asHandle('w'), 'seed');
+      const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
 
-        const waiting = plugin.fetchRecent({ topic: t, since, blockMs: 5000 });
-        const posted = new Promise<void>((r) => setTimeout(r, delayMs)).then(() =>
-          plugin.post(t, asHandle('w'), 'fresh'),
-        );
+      const waiting = plugin.fetchRecent({ topic: t, since, blockMs: 5000 });
+      const posted = new Promise<void>((r) => setTimeout(r, delayMs)).then(() =>
+        plugin.post(t, asHandle('w'), 'fresh'),
+      );
 
-        const page = await waiting;
-        await posted;
-        expect(
-          page.messages.map((m) => m.content),
-          'the post landed in the query-to-wait gap and was never delivered',
-        ).toEqual(['fresh']);
-        expect(page.nextCursor).not.toBe(since);
+      const page = await waiting;
+      await posted;
+      expect(
+        page.messages.map((m) => m.content),
+        'the post landed in the query-to-wait gap and was never delivered',
+      ).toEqual(['fresh']);
+      expect(page.nextCursor).not.toBe(since);
 
-        // …and the returned cursor is the one the next catch-up must resume from: re-fetching with
-        // it returns nothing, so no message was skipped over on the way to it either.
-        const after = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
-        expect(after.messages).toEqual([]);
-      } finally {
-        await plugin.disconnect();
-        await wipe(prefix);
-      }
-    },
-  );
+      // …and the returned cursor is the one the next catch-up must resume from: re-fetching with
+      // it returns nothing, so no message was skipped over on the way to it either.
+      const after = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
+      expect(after.messages).toEqual([]);
+    }));
 
   // CLASS: the sub-millisecond long-poll budget. `blockMs` is typed `number`, so 0.5 clears `> 0`
   // and floors to 0 — and `XREAD BLOCK 0` blocks FOREVER. The floor lives in exactly one place, so

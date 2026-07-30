@@ -1,6 +1,11 @@
 import net from 'node:net';
 import { asTopic, type Topic } from '@sharptrick/parley-core';
-import { createRedisClient, DEFAULT_URL } from '../src/index.js';
+import {
+  createRedisClient,
+  DEFAULT_URL,
+  RedisPlugin,
+  type RedisBackendConfig,
+} from '../src/index.js';
 
 // One liveness gate, one topic minter, one endpoint minter and one cleanup path for every live-server
 // file in this package. Keep them here, so that two copies of the skip gate cannot drift and leave
@@ -61,6 +66,45 @@ let seq = 0;
 
 /** A topic no other test (or concurrent run) shares; `kind` names the file for a stray-key hunt. */
 export const freshTopic = (kind: string): Topic => asTopic(`${kind}-${++seq}-${rand()}`);
+
+/**
+ * One connected plugin in a key namespace no other case shares, torn down and wiped however `body`
+ * ends. `config` overrides anything but the namespace, which the rig owns because it also cleans it.
+ *
+ * Keep the setup and the teardown here rather than restated per case, so that a change to either —
+ * draining stray readers, asserting no key survives the wipe — reaches every case instead of the
+ * subset whose copy someone remembered to edit.
+ */
+export async function withPlugin<T>(
+  config: RedisBackendConfig,
+  body: (rig: { plugin: RedisPlugin; prefix: string }) => Promise<T>,
+): Promise<T> {
+  const prefix = freshPrefix();
+  const plugin = new RedisPlugin();
+  try {
+    await plugin.connect({ url: REDIS_URL, ...config, key_prefix: prefix });
+    return await body({ plugin, prefix });
+  } finally {
+    await plugin.disconnect().catch(() => undefined);
+    await wipe(prefix);
+  }
+}
+
+/**
+ * An INDEPENDENT connection to the same server, closed however `body` ends — what a case uses to
+ * write or read a stream without going through the code under test.
+ */
+export async function withWriter<T>(
+  body: (writer: ReturnType<typeof createRedisClient>) => Promise<T>,
+): Promise<T> {
+  const writer = createRedisClient(REDIS_URL, FAST_MS);
+  try {
+    await writer.connect();
+    return await body(writer);
+  } finally {
+    await writer.disconnect().catch(() => undefined);
+  }
+}
 
 /** Delete every key a test's prefix owns; cleanup failures never mask the test's own verdict. */
 export async function wipe(prefix: string): Promise<void> {

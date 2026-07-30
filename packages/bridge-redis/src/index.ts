@@ -40,6 +40,8 @@ const MAX_ID_COMPONENT = 2n ** 64n - 1n;
 const MAX_ENTRY_ID = `${MAX_ID_COMPONENT}-${MAX_ID_COMPONENT}`;
 /** The sender of an entry written by something other than this plugin, which carries no `sender`. */
 const UNKNOWN_SENDER = 'unknown';
+/** The last instant ECMAScript `Date` can represent; one millisecond further is a `RangeError`. */
+const MAX_DATE_MS = 8_640_000_000_000_000;
 /**
  * RESP error codes the server returns when it UNDERSTOOD a command and refused it — a bad
  * argument, a revoked ACL, a repurposed key. Retrying cannot clear any of them without an operator.
@@ -882,7 +884,17 @@ function rowToMessage(topic: Topic, id: string, fields: Record<string, string>):
  */
 function entryTimestamp(id: string, ts: string | undefined): string {
   const at = ts === undefined ? Number.NaN : Date.parse(ts);
-  if (!Number.isNaN(at)) return new Date(at).toISOString();
-  const ms = Number(id.split('-')[0]);
-  return new Date(Number.isSafeInteger(ms) && ms >= 0 ? ms : 0).toISOString();
+  return isoAt(Number.isNaN(at) ? Number(id.split('-')[0]) : at);
+}
+
+/**
+ * Keep every millisecond an entry can yield funnelled through here, so that a value a foreign writer
+ * CHOSE cannot throw `RangeError` out of the seam: a stream entry id's millisecond component is a
+ * uint64, so an `XADD <key> 9000000000000000-0` from anyone holding a redis-cli names an instant
+ * past the range `Date` can represent, and the throw would wedge `fetchRecent` for that topic
+ * forever (the entry is durable) while the `subscribe` loop's best-effort catch dropped it in
+ * silence.
+ */
+function isoAt(ms: number): string {
+  return new Date(ms >= 0 && ms <= MAX_DATE_MS ? ms : 0).toISOString();
 }
