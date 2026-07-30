@@ -129,7 +129,7 @@ export interface PresenceRecord {
   instanceId: string;
 }
 
-/** A participant surfaced by {@link computeRoster} — either online now or offline-but-recently-seen. */
+/** A participant in a `parley_list_users` roster — either online now or offline-but-recently-seen. */
 export interface RosterEntry {
   handle: Handle;
   /** True iff at least one of this handle's instances has a fresh, non-`goodbye` latest beat. */
@@ -142,7 +142,7 @@ export interface RosterEntry {
   lastSeenMs: number;
 }
 
-/** The two liveness windows {@link computeRoster} applies. */
+/** The two liveness windows the roster computation applies. */
 export interface RosterOptions {
   /** Online cutoff: an instance is live iff its latest non-`goodbye` beat is newer than this (ms). */
   ttlMs: number;

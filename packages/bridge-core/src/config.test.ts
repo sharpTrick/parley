@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { allowlistFor } from './allowlist.js';
-import { instanceIdOf, parseConfig, type ParleyConfig } from './config.js';
+import { instanceIdOf, MAX_BLOCK_MS, parseConfig, type ParleyConfig } from './config.js';
 import { parseMentions } from './mentions.js';
+import { HANDLE_CANDIDATES } from './testing/handle-corpus.js';
 
 describe('config loader', () => {
   it('applies defaults from a minimal config', () => {
@@ -435,48 +436,71 @@ describe('config rejects a degenerate number in any numeric field', () => {
     if (ZERO_IS_LEGAL.has(label)) expect(parse).not.toThrow();
     else expect(parse).toThrow();
   });
+
+  // A docstring that promises a relationship — `block_max_ms` is clamped "safely below MCP / client
+  // tool timeouts" — is worth only what the schema behind it enforces. So grade the ceiling too:
+  // a knob with one refuses the first step past it, and a knob without one says so out loud. A knob
+  // added later has no row and fails as a missing entry rather than as silent acceptance.
+  const CEILINGS = new Map<string, number | null>([
+    ['auth.oidc.clock_skew_s', 300],
+    ['catchup.block_max_ms', MAX_BLOCK_MS],
+    ['catchup.block_poll_interval_ms', null],
+    ['catchup.limit', null],
+    ['presence.heartbeat_ms', null],
+    ['presence.ttl_ms', null],
+  ]);
+
+  const FAR_ABOVE_ANY_PLAUSIBLE_CAP = 86_400_000;
+
+  // `ttl_ms >= heartbeat_ms` is graded on its own in stated-bounds.test.ts; keep the pair consistent
+  // here, so that a missing ceiling can never be answered by the cross-field rule instead.
+  function withCeilingProbe(leaf: NumericLeaf, value: number): Record<string, unknown> {
+    const mutated = withValue(leaf, value);
+    const presence = mutated.presence as { heartbeat_ms: number; ttl_ms: number };
+    presence.ttl_ms = Math.max(presence.ttl_ms, presence.heartbeat_ms);
+    return mutated;
+  }
+
+  it.each(leaves.map((l) => [l.label, l] as const))(
+    'grades %s against its documented ceiling',
+    (label, leaf) => {
+      expect(
+        CEILINGS.has(label),
+        `${label} has no ceiling row: add a number, or null for "deliberately unbounded"`,
+      ).toBe(true);
+      const ceiling = CEILINGS.get(label) ?? null;
+      if (ceiling === null) {
+        expect(() => parseConfig(withCeilingProbe(leaf, FAR_ABOVE_ANY_PLAUSIBLE_CAP))).not.toThrow();
+        return;
+      }
+      expect(() => parseConfig(withCeilingProbe(leaf, ceiling))).not.toThrow();
+      expect(() => parseConfig(withCeilingProbe(leaf, ceiling + 1))).toThrow();
+    },
+  );
 });
 
 // `mention_filter` compares a parsed @mention against `identity.handle`, so a handle the mention
 // grammar cannot produce silently drops EVERY inbound message. Either grammar may widen later;
 // the invariant is that the two agree, so assert the round trip rather than one bad handle.
 describe('mention_filter requires a mentionable handle', () => {
-  const HANDLES = [
-    'bob',
-    'a',
-    'ctx-payments',
-    'a.b',
-    'a_b',
-    '_bot',
-    '-bot',
-    '.bot',
-    'bot_',
-    'bot-',
-    'bot.',
-    'алиса',
-    'bot bot',
-    '@bot',
-    'bot@example.com',
-    'Bot',
-    'b0t',
-    'x'.repeat(64),
-  ];
-
-  it.each(HANDLES)('either rejects %s at load or can actually match it', (handle) => {
-    const raw = {
-      identity: { handle },
-      topics: ['t'],
-      live_push: { enabled: true, mention_filter: true },
-    };
-    let loaded = true;
-    try {
-      parseConfig(raw);
-    } catch {
-      loaded = false;
-    }
-    if (!loaded) return;
-    expect(parseMentions(`hi @${handle} there`)).toContain(handle);
-  });
+  it.each(HANDLE_CANDIDATES.map((h) => [JSON.stringify(h), h] as const))(
+    'either rejects %s at load or can actually match it',
+    (_label, handle) => {
+      const raw = {
+        identity: { handle },
+        topics: ['t'],
+        live_push: { enabled: true, mention_filter: true },
+      };
+      let loaded = true;
+      try {
+        parseConfig(raw);
+      } catch {
+        loaded = false;
+      }
+      if (!loaded) return;
+      expect(parseMentions(`hi @${handle} there`)).toContain(handle);
+    },
+  );
 
   it('leaves a non-mentionable handle usable when mention_filter is off', () => {
     expect(() =>

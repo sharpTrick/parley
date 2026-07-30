@@ -99,6 +99,13 @@ export type AuthConfig = z.infer<typeof AuthSchema>;
 export const MAX_POST_TOPICS = 64;
 
 /**
+ * Longest server-side clamp `catchup.block_max_ms` may name. A blocked `parley_fetch_recent` holds
+ * the tool call open for its whole clamp, so a clamp past every configurable MCP client tool timeout
+ * turns the long-poll into the client-side timeout the field exists to stay under.
+ */
+export const MAX_BLOCK_MS = 300_000;
+
+/**
  * The single config object that drives a bridge (DESIGN §11). Sane defaults everywhere.
  * `backend_config` is opaque to core and passed verbatim to the plugin's `connect()`.
  *
@@ -137,9 +144,17 @@ const ConfigObject = z.object({
       /**
        * Server-side cap (ms) on the `parley_fetch_recent` `block_ms` long-poll. A
        * caller's `block_ms` is clamped to this before it reaches a plugin, kept safely below MCP /
-       * client tool timeouts so a blocked call never trips them. Default 60s.
+       * client tool timeouts so a blocked call never trips them. Default 60s, capped at
+       * {@link MAX_BLOCK_MS}.
        */
-      block_max_ms: z.number().int().nonnegative().default(60_000),
+      block_max_ms: z
+        .number()
+        .int()
+        .nonnegative()
+        .max(MAX_BLOCK_MS, {
+          message: `catchup.block_max_ms must be <= ${MAX_BLOCK_MS} (ms): a blocked parley_fetch_recent holds the tool call for the whole clamp, and a longer one trips the MCP client tool timeout this field exists to stay under`,
+        })
+        .default(60_000),
       /**
        * Poll cadence (ms) for core's generic long-poll fallback — how often it re-queries when a
        * backend does not block natively. No correctness impact; latency/cost knob only.
