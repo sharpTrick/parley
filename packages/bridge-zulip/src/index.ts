@@ -110,16 +110,38 @@ const MIN_EVENTS_TIMEOUT_MS = 250;
 const MAX_EVENTS_TIMEOUT_MS = 600_000;
 const DEFAULT_EVENTS_TIMEOUT_MS = 25_000;
 
-/** Pace of a blocked `fetchRecent`'s retries while no live wake primitive is available. */
+/**
+ * Pace of a blocked `fetchRecent`'s retries while no live wake primitive is available, escalating
+ * per failed attempt the way the push loop's backoff does. Keep the escalation, so that a server
+ * answering every wake attempt at once — rejecting the queue, refusing to park — cannot turn one
+ * caller's budget into hundreds of registrations against a backend already in trouble.
+ */
 const BLOCKED_FETCH_RETRY_MS = 400;
+const BLOCKED_FETCH_RETRY_MAX_MS = 5000;
+
+const blockedFetchPause = (attempt: number): number =>
+  Math.min(BLOCKED_FETCH_RETRY_MS * 2 ** attempt, BLOCKED_FETCH_RETRY_MAX_MS);
 
 /**
- * Wall-clock budget for a request that asks the server to PARK for `blockMs`. Keep every parking
- * request on this, so that the shared {@link DEFAULT_DEADLINE_MS} never severs a healthy idle
- * long-poll: an aborted-but-uncapped poll reads to the loop as a backend failure, and the whole
+ * Wall-clock budget for a request the PUSH LOOP asks the server to park for. Keep the loop's
+ * parking requests on this, so that the shared {@link DEFAULT_DEADLINE_MS} never severs a healthy
+ * idle long-poll: an aborted-but-uncapped poll reads to the loop as a backend failure, and the whole
  * documented `events_timeout_ms` range above 30s would degrade into escalating backoff instead.
  */
 const longPollDeadlineMs = (blockMs: number): number => Math.max(0, blockMs) + DEFAULT_DEADLINE_MS;
+
+/** Wall-clock one request issued at the very end of a spent budget still gets to answer in. */
+const REQUEST_ANSWER_MS = 500;
+
+/**
+ * Wall-clock budget for a request made inside a caller's `blockMs`: what the caller has left, plus
+ * enough for the last request of a spent budget to still be issued and answered. Keep every request
+ * under a caller's budget on this, so that a rate-limit hint reaching past that budget is refused
+ * outright — the 429 backoff races only `isStopped()`, so no deadline signal can interrupt it and
+ * a routine `Retry-After: 8` would otherwise spend eight seconds of a 300ms `fetchRecent`.
+ */
+const budgetedDeadlineMs = (deadline: number): number =>
+  Math.max(0, deadline - Date.now()) + REQUEST_ANSWER_MS;
 
 /** Largest offset `Date` can represent; past it `toISOString()` throws a RangeError. */
 const MAX_TIMESTAMP_MS = 8.64e15;
@@ -129,6 +151,14 @@ const MAX_TIMESTAMP_MS = 8.64e15;
  * derived from it and cannot stop straddling a page boundary if it changes.
  */
 export const GAP_FILL_PAGE = 500;
+
+/**
+ * Records the pre-subscribe watermark probe reads. Keep it a WINDOW rather than a single record, so
+ * that an unusable newest record cannot hide the topic's real tail: the probe would then have to
+ * navigate past it by that record's own bad id, land nowhere, and read an empty topic — arming a
+ * gap-fill that replays the entire history through the live handler.
+ */
+export const TAIL_PROBE_PAGE = 100;
 
 /**
  * Zulip backend (DESIGN §6/§9) — self-hosted, and the closest native fit of any backend: Zulip's
@@ -227,9 +257,10 @@ export class ZulipPlugin implements BackendPlugin {
           'Zulip bot provisioned with this key is world-readable/injectable.',
       );
     }
-    if (isPlaintextRemote(this.baseUrl)) {
+    const plaintext = plaintextRemoteOrigin(this.baseUrl);
+    if (plaintext !== undefined) {
       console.warn(
-        `[parley-zulip] SECURITY: site_url ${this.baseUrl} is plaintext http:// to a non-loopback ` +
+        `[parley-zulip] SECURITY: site_url ${plaintext} is plaintext http:// to a non-loopback ` +
           'host, so the bot email and api_key travel the network as an unencrypted HTTP Basic ' +
           'header on every request. Use https://.',
       );
@@ -334,21 +365,25 @@ export class ZulipPlugin implements BackendPlugin {
    * `include_anchor=false` + `num_after=<limit>` — the anchor itself is excluded, making `since`
    * strictly exclusive server-side. Without: `anchor=newest` + `num_before=<limit>` for the most
    * recent window. Zulip returns messages ascending by id — no client-side reordering needed.
+   *
+   * `blockMs` is a ceiling on the WHOLE call, not just on the wait: every request the call makes
+   * carries the budget that is left, so none of them can spend it on a rate-limit hint.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const limit = args.limit ?? 100;
-    let messages = await this.fetchMessages(args.topic, args.since, limit);
     const blockMs = args.blockMs ?? 0;
-    if (messages.length === 0 && args.since !== undefined && blockMs > 0) {
-      messages = await this.blockingFetch(args.topic, args.since, limit, blockMs);
+    const deadline = blockMs > 0 ? Date.now() + blockMs : undefined;
+    let messages = await this.fetchMessages(args.topic, args.since, limit, { deadline });
+    if (messages.length === 0 && args.since !== undefined && deadline !== undefined) {
+      messages = await this.blockingFetch(args.topic, args.since, limit, deadline);
     }
     const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');
     return { messages, nextCursor };
   }
 
   /**
-   * Wait up to `blockMs` for a message strictly after `since`, then re-run the normal exclusive
+   * Wait until `deadline` for a message strictly after `since`, then re-run the normal exclusive
    * query and return it (possibly empty, with a cursor === `since`, which is correct at timeout).
    *
    * Each pass arms the best wake primitive currently available ({@link armWake}), re-checks history
@@ -361,20 +396,19 @@ export class ZulipPlugin implements BackendPlugin {
     topic: Topic,
     since: Cursor,
     limit: number,
-    blockMs: number,
+    deadline: number,
   ): Promise<Message[]> {
-    const deadline = Date.now() + blockMs;
-    while (!this.stopped && Date.now() < deadline) {
-      const wake = await this.armWake(topic, deadline);
+    for (let attempt = 0; !this.stopped && Date.now() < deadline; attempt++) {
+      const wake = await this.armWake(topic, deadline, blockedFetchPause(attempt));
       try {
-        const raced = this.stopped ? [] : await this.fetchMessages(topic, since, limit);
+        const raced = this.stopped ? [] : await this.fetchMessages(topic, since, limit, { deadline });
         if (raced.length > 0) return raced;
         await wake.waited;
       } finally {
         wake.release();
       }
       if (this.stopped) return [];
-      const got = await this.fetchMessages(topic, since, limit);
+      const got = await this.fetchMessages(topic, since, limit, { deadline });
       if (got.length > 0) return got;
     }
     return [];
@@ -390,13 +424,13 @@ export class ZulipPlugin implements BackendPlugin {
    * Keep the disconnect check here rather than in each arm, so that neither can be reached after
    * teardown and neither has to re-check for it.
    */
-  private async armWake(topic: Topic, deadline: number): Promise<Wake> {
+  private async armWake(topic: Topic, deadline: number, pauseMs: number): Promise<Wake> {
     if (this.stopped) return { waited: Promise.resolve(), release: () => undefined };
     const live = this.waiters.get(topic);
     if (live !== undefined && live.healthy > 0) {
       return this.armSubscriptionWaiter(topic, deadline - Date.now());
     }
-    return this.armDedicatedQueue(topic, deadline);
+    return this.armDedicatedQueue(topic, deadline, pauseMs);
   }
 
   /**
@@ -430,23 +464,23 @@ export class ZulipPlugin implements BackendPlugin {
    * unavailable — the whole reason a caller can end up here — the wait degrades to a bounded pause
    * so the caller's next history read still lands inside its budget instead of at the end of it.
    */
-  private async armDedicatedQueue(topic: Topic, deadline: number): Promise<Wake> {
+  private async armDedicatedQueue(topic: Topic, deadline: number, pauseMs: number): Promise<Wake> {
     const noop = { release: () => undefined };
     let reg: { queue_id: string; last_event_id: number };
     // Bound the registration by the caller's deadline too: a slow or black-holed register is
     // otherwise a wait the caller never asked for, ahead of the wait it did.
     const bound = this.deadlineAbort(deadline);
     try {
-      reg = await this.register(this.wireTopic(topic), bound.signal);
+      reg = await this.register(this.wireTopic(topic), bound.signal, budgetedDeadlineMs(deadline));
     } catch {
-      return { waited: this.pause(deadline), ...noop };
+      return { waited: this.pause(deadline, pauseMs), ...noop };
     } finally {
       bound.done();
     }
     const state: QueueState = { queueId: reg.queue_id };
     this.queues.add(state);
     return {
-      waited: this.pollForWake(reg, deadline),
+      waited: this.pollForWake(reg, deadline, pauseMs),
       release: () => {
         this.queues.delete(state);
         this.deleteQueueDetached(reg.queue_id);
@@ -458,10 +492,15 @@ export class ZulipPlugin implements BackendPlugin {
    * One `/api/v1/events` long-poll on a dedicated queue, resolving on the wake edge (a matching
    * message), at `deadline`, or on disconnect. The events themselves are discarded — the caller
    * re-reads history — so an outright failure only costs the caller a bounded pause.
+   *
+   * Keep the pace on EVERY answer that carries no message, not just on a non-2xx: a poll answered
+   * at once with a heartbeat, with no events, or by a server ignoring `dont_block=false` is a wake
+   * that never came, and each pass mints and drops a fresh event queue.
    */
   private async pollForWake(
     reg: { queue_id: string; last_event_id: number },
     deadline: number,
+    pauseMs: number,
   ): Promise<void> {
     if (this.stopped || deadline - Date.now() <= 0) return;
     const bound = this.deadlineAbort(deadline);
@@ -474,21 +513,24 @@ export class ZulipPlugin implements BackendPlugin {
         },
         signal: bound.signal,
         allowStatuses: [400],
-        deadlineMs: longPollDeadlineMs(deadline - Date.now()),
+        deadlineMs: budgetedDeadlineMs(deadline),
       });
-      // Keep the pace on a non-2xx, so that a queue the server rejects outright — answering at once
-      // instead of blocking — cannot turn the caller's retries into a spin.
-      if (!res.ok) await this.pause(deadline);
+      const woke =
+        res.ok &&
+        asArray(((await res.json()) as EventsResponse | null)?.events).some(
+          (e) => e?.type === 'message',
+        );
+      if (!woke) await this.pause(deadline, pauseMs);
     } catch {
-      if (!bound.signal.aborted) await this.pause(deadline);
+      if (!bound.signal.aborted) await this.pause(deadline, pauseMs);
     } finally {
       bound.done();
     }
   }
 
-  /** A {@link BLOCKED_FETCH_RETRY_MS} pause that never outlives `deadline` or a disconnect. */
-  private pause(deadline: number): Promise<void> {
-    return this.interruptibleDelay(Math.min(BLOCKED_FETCH_RETRY_MS, deadline - Date.now()));
+  /** A pause that never outlives `deadline` or a disconnect. */
+  private pause(deadline: number, ms: number): Promise<void> {
+    return this.interruptibleDelay(Math.min(ms, deadline - Date.now()));
   }
 
   /** `delay` that also ends on `disconnect()`, so that teardown never waits out a backoff. */
@@ -523,7 +565,8 @@ export class ZulipPlugin implements BackendPlugin {
    * The delivery watermark is probed BEFORE register and the handshake window is then closed by an
    * armed gap-fill: anything landing between the probe and the queue's birth reaches no queue, and
    * anything landing after it is deduped against the watermark, so every message newer than the
-   * probe is delivered EXACTLY once.
+   * probe is delivered EXACTLY once. A probe that cannot establish a tail at all ({@link probeTail})
+   * arms no gap-fill: with no watermark to replay FROM, the only honest window is the queue's own.
    *
    * Queue GC: Zulip garbage-collects queues after ~10 min idle; the server then answers
    * `BAD_EVENT_QUEUE_ID`. Recovery: drop the superseded queue, re-register (new tail) and ARM a
@@ -551,8 +594,7 @@ export class ZulipPlugin implements BackendPlugin {
     const signal = this.teardown.signal;
     const alive = (): boolean => !this.stopped && this.generation === generation;
     const wire = this.claimWireTopic(topic);
-    const tail = await this.fetchMessages(topic, undefined, 1);
-    let lastDeliveredId = Number(tail.at(-1)?.backendMsgId ?? '0');
+    let lastDeliveredId = await this.probeTail(topic);
     const reg = await this.register(wire);
     const state: QueueState = { queueId: reg.queue_id };
     if (!alive()) {
@@ -742,7 +784,7 @@ export class ZulipPlugin implements BackendPlugin {
         if (m === undefined) continue;
         sawMessage = true; // a message landed on this topic — release any blocked fetchers
         const id = Number(m.backendMsgId);
-        if (id <= lastDeliveredId) continue; // already gap-filled — dedup
+        if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue; // gap-filled — dedup
         lastDeliveredId = id;
         deliver(m);
       }
@@ -848,6 +890,18 @@ export class ZulipPlugin implements BackendPlugin {
   }
 
   /**
+   * The id the live path may treat as already delivered: the newest USABLE message on `topic`, `0`
+   * when the server showed no record at all, and `undefined` when it showed only records carrying
+   * no usable id — a tail that cannot be established, and so one nothing may be replayed from.
+   */
+  private async probeTail(topic: Topic): Promise<number | undefined> {
+    const { messages, sawRecords } = await this.readWindow(topic, undefined, TAIL_PROBE_PAGE);
+    const newest = messages.at(-1);
+    if (newest !== undefined) return Number(newest.backendMsgId);
+    return sawRecords ? undefined : 0;
+  }
+
+  /**
    * Shared narrowed read used by fetchRecent AND the gap-fill after a queue GC. Paginates so the
    * seam's `limit` stays honest: Zulip rejects `num_before + num_after > 5000` outright, so a
    * larger caller limit is served as successive pages rather than propagated as a 400.
@@ -856,13 +910,29 @@ export class ZulipPlugin implements BackendPlugin {
     topic: Topic,
     since: Cursor | undefined,
     limit: number,
-    signal?: AbortSignal,
+    opts?: { signal?: AbortSignal; deadline?: number },
   ): Promise<Message[]> {
+    return (await this.readWindow(topic, since, limit, opts)).messages;
+  }
+
+  /**
+   * {@link fetchMessages}, also reporting whether the server showed any record AT ALL — which an
+   * empty message list cannot tell you, because every record it showed may have been unusable.
+   */
+  private async readWindow(
+    topic: Topic,
+    since: Cursor | undefined,
+    limit: number,
+    opts?: { signal?: AbortSignal; deadline?: number },
+  ): Promise<{ messages: Message[]; sawRecords: boolean }> {
+    const signal = opts?.signal;
+    const deadlineMs = opts?.deadline === undefined ? undefined : budgetedDeadlineMs(opts.deadline);
     const narrow = JSON.stringify([
       { operator: 'stream', operand: this.stream },
       { operator: 'topic', operand: this.wireTopic(topic) },
     ]);
     const out: Message[] = [];
+    let sawRecords = false;
     let remaining = Math.max(0, limit);
     let anchor = since === undefined ? 'newest' : String(since);
     let includeAnchor = since === undefined;
@@ -876,8 +946,9 @@ export class ZulipPlugin implements BackendPlugin {
         num_after: since === undefined ? '0' : String(page),
         apply_markdown: 'false', // raw content, not rendered HTML
       };
-      const res = await this.http('GET', '/api/v1/messages', { query, signal });
+      const res = await this.http('GET', '/api/v1/messages', { query, signal, deadlineMs });
       const raw = asArray(((await res.json()) as { messages?: ZulipMessage[] } | null)?.messages);
+      sawRecords ||= raw.length > 0;
       const got = raw.flatMap((m) => zulipToMessage(topic, m) ?? []); // Zulip returns ascending by id
       if (got.length < raw.length) {
         console.warn(
@@ -900,16 +971,18 @@ export class ZulipPlugin implements BackendPlugin {
       anchor = next;
       includeAnchor = false;
     }
-    return out;
+    return { messages: out, sawRecords };
   }
 
   /** Register a `<stream, topic>`-narrowed message event queue; its birth is the topic's tail. */
   private async register(
     wireTopic: string,
     signal?: AbortSignal,
+    deadlineMs?: number,
   ): Promise<{ queue_id: string; last_event_id: number }> {
     const res = await this.http('POST', '/api/v1/register', {
       signal,
+      deadlineMs,
       form: {
         event_types: JSON.stringify(['message']),
         narrow: JSON.stringify([
@@ -948,7 +1021,7 @@ export class ZulipPlugin implements BackendPlugin {
     let cursor = asCursor(String(sinceId));
     for (;;) {
       // May throw (non-2xx / network blip / teardown) → the caller retries from `onProgress`.
-      const messages = await this.fetchMessages(topic, cursor, page, signal);
+      const messages = await this.fetchMessages(topic, cursor, page, { signal });
       for (const m of messages) deliver(m);
       const last = messages.at(-1);
       if (last === undefined) return Number(cursor);
@@ -1030,13 +1103,18 @@ function pageAnchor(
   return String(id);
 }
 
-/** True when the URL would put the Basic-auth credential on the wire in the clear. */
-function isPlaintextRemote(baseUrl: string): boolean {
+/**
+ * The origin to name when the URL would put the Basic-auth credential on the wire in the clear,
+ * else undefined. Keep the warning on the ORIGIN rather than the whole `site_url`, so that a secret
+ * smuggled into a path of a key secret-hygiene classifies by NAME as harmless is not the thing
+ * stderr — and the tool result core hands the model — prints.
+ */
+function plaintextRemoteOrigin(baseUrl: string): string | undefined {
   try {
-    const { protocol, hostname } = new URL(baseUrl);
-    return protocol === 'http:' && !isLoopbackHost(hostname);
+    const { protocol, hostname, origin } = new URL(baseUrl);
+    return protocol === 'http:' && !isLoopbackHost(hostname) ? origin : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -1114,20 +1192,43 @@ function orDefault<T>(value: T | undefined, fallback: T): T | undefined {
   return value === undefined ? fallback : value;
 }
 
-/** `site_url` must be usable as a base URL now, not at first request. */
+/** A `//user:password@` authority — the one part of a URL that is a credential by construction. */
+const URL_USERINFO = /\/\/[^/?#\s]*@/;
+
+/**
+ * `site_url` must be usable as a base URL now, not at first request — and must be a base URL and
+ * nothing else. A credential in it is REFUSED rather than carried: Zulip authenticates from
+ * `email`/`api_key`, secret hygiene keys on the config key NAME (`site_url` is not a secret one),
+ * and the value is echoed by the plaintext warning and by every diagnostic that names the site.
+ * A query or fragment is refused for the same fail-fast reason it would break every request path.
+ */
 function requireHttpUrl(raw: unknown): string {
   const trimmed = typeof raw === 'string' ? raw.trim().replace(/\/+$/, '') : '';
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
   } catch {
+    const shown = typeof raw === 'string' ? raw.replace(URL_USERINFO, '//<redacted>@') : raw;
     throw new Error(
-      `backend_config.site_url must be an absolute http(s) URL (got ${JSON.stringify(raw)})`,
+      `backend_config.site_url must be an absolute http(s) URL (got ${describeRejected(shown, 'string')})`,
     );
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(
       `backend_config.site_url must use http: or https: (got ${JSON.stringify(parsed.protocol)})`,
+    );
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(
+      'backend_config.site_url must not carry a username or password: Zulip authenticates from ' +
+        'backend_config.email/api_key, and a credential in the URL is disclosed by every ' +
+        'diagnostic that names the site. Remove the userinfo from site_url.',
+    );
+  }
+  if (parsed.search !== '' || parsed.hash !== '') {
+    throw new Error(
+      'backend_config.site_url must be a bare base URL: a query or fragment is appended to every ' +
+        'request path and can hide a credential in a key hygiene treats as non-secret.',
     );
   }
   return trimmed;
@@ -1140,10 +1241,20 @@ function requireHttpUrl(raw: unknown): string {
  */
 function requireNonEmpty(key: string, value: unknown, secret = false): string {
   if (typeof value !== 'string' || value.trim() === '') {
-    const got = secret ? describeShape(value) : JSON.stringify(value);
+    const got = secret ? describeShape(value) : describeRejected(value, 'string');
     throw new Error(`backend_config.${key} must be a non-empty string (got ${got})`);
   }
   return value;
+}
+
+/**
+ * The rejected value itself, or its SHAPE when its type is not the one the key declares. A value of
+ * the wrong type is a mis-paste and its type is the whole diagnostic, so echoing the content only
+ * discloses whatever was pasted — which is how a credential ends up in a key whose NAME secret
+ * hygiene classifies as harmless. A value of the RIGHT type is echoed: there the content is the bug.
+ */
+function describeRejected(value: unknown, declared: 'string' | 'number'): string {
+  return typeof value === declared ? JSON.stringify(value) : describeShape(value);
 }
 
 /** Enough of a value to debug the wrong shape, never enough to disclose it. */
@@ -1164,7 +1275,7 @@ function requireEventsTimeout(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw new Error(
       'backend_config.events_timeout_ms must be a positive, finite number of milliseconds ' +
-        `(got ${JSON.stringify(value)})`,
+        `(got ${describeRejected(value, 'number')})`,
     );
   }
   return Math.min(Math.max(value, MIN_EVENTS_TIMEOUT_MS), MAX_EVENTS_TIMEOUT_MS);

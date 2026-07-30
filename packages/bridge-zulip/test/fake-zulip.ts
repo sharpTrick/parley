@@ -141,6 +141,14 @@ export interface FakeZulip {
   servedMessagesReadFailures(): number;
   /** Fail every request on `route` (e.g. `GET /api/v1/events`) until cleared. */
   failRoute(route: string, failure: RouteFailure): void;
+  /**
+   * Answer every `GET /api/v1/messages` with a FULL page — as many records as the request asked for
+   * — whose every `id` is `edgeId`. A server whose pages do not move the anchor the client asked
+   * from is what a read that navigates by the page's edge record can walk in circles on, and it is
+   * NOT reachable by injecting records: the normal read filters strictly by id, so its pages always
+   * advance however mangled the records in them are.
+   */
+  stallAnchor(edgeId: unknown): void;
   /** Accept every request on `route` and never answer it — an unreachable-but-open server. */
   hangRoute(route: string): void;
   /** Answer the next `times` requests on `route` with a 429 carrying the given retry hint(s). */
@@ -192,6 +200,7 @@ export async function startFakeZulip(opts?: {
   const rateLimits = new Map<string, RateLimit>();
   const routeDelays = new Map<string, number>();
   const hangRoutes = new Set<string>();
+  let anchorStall: { edgeId: unknown } | undefined;
   const requestCounts = new Map<string, number>();
   const requestParams = new Map<string, Array<Record<string, string>>>();
   let responseHook: ((route: string) => void) | undefined;
@@ -350,6 +359,23 @@ export async function startFakeZulip(opts?: {
         }>;
         const stream = narrow.find((n) => n.operator === 'stream')?.operand;
         const topic = narrow.find((n) => n.operator === 'topic')?.operand;
+        if (anchorStall !== undefined) {
+          const page = numBefore + numAfter;
+          json(res, 200, {
+            result: 'success',
+            messages: Array.from({ length: page }, () => ({
+              id: anchorStall?.edgeId,
+              type: 'stream',
+              display_recipient: stream ?? 'parley',
+              subject: topic ?? '',
+              content: 'stalled',
+              sender_email: 'someone@example.com',
+              sender_full_name: 'Someone Else',
+              timestamp: Math.floor(Date.now() / 1000),
+            })),
+          });
+          return;
+        }
         const pool = messages.filter(
           (m) =>
             (stream === undefined || fold(m.display_recipient) === fold(stream)) &&
@@ -473,6 +499,9 @@ export async function startFakeZulip(opts?: {
       for (const q of queues.values()) dropWaiter(q, true);
     },
     hangRoute: (route) => hangRoutes.add(route),
+    stallAnchor: (edgeId) => {
+      anchorStall = { edgeId };
+    },
     rateLimit: (route, limit) => rateLimits.set(route, { ...limit }),
     holdResponse: (route, ms) => routeDelays.set(route, ms),
     clearRouteFailures: () => {
@@ -480,6 +509,7 @@ export async function startFakeZulip(opts?: {
       rateLimits.clear();
       routeDelays.clear();
       hangRoutes.clear();
+      anchorStall = undefined;
     },
     requestCount: (route) => requestCounts.get(route) ?? 0,
     sentParams: (route) => [...(requestParams.get(route) ?? [])],

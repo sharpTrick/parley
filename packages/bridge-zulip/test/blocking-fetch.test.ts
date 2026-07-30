@@ -197,24 +197,77 @@ describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe
     });
   }
 
-  it('does not spin when the server rejects every event queue it is handed', async () => {
-    const { plugin, fake } = await boot();
-    const topic = asTopic(`spin-${rand()}`);
-    await plugin.post(topic, SENDER, 'old');
-    const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
-    // A rejected queue ANSWERS rather than blocking, so an unpaced retry loop runs flat out.
-    fake.failRoute('GET /api/v1/events', {
-      status: 400,
-      body: { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'gone' },
-    });
+  /**
+   * With no live loop to piggyback on, every pass of a blocked fetch mints and drops an event queue
+   * of its own, so the pace of those passes is a RATE against the operator's server — Zulip's
+   * default per-user limit is 200 requests/minute, and core's `catchup.block_max_ms` defaults to
+   * 60s. A flat pace that looks fine over one second is 50× over budget over that minute, so the
+   * bound is expressed per second of budget and asserted on EVERY route a pass touches, including
+   * the ones that answer 200: a wake that never came is the same non-event whether the server said
+   * so with an error, with an empty body, or by ignoring the request to park.
+   */
+  const DEGRADATIONS: Array<{ name: string; apply: (fake: FakeZulip) => void }> = [
+    {
+      name: 'every event queue is rejected as stale',
+      apply: (fake) =>
+        fake.failRoute('GET /api/v1/events', {
+          status: 400,
+          body: { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'gone' },
+        }),
+    },
+    {
+      name: '/events answers 500',
+      apply: (fake) => fake.failRoute('GET /api/v1/events', { status: 500 }),
+    },
+    {
+      name: '/events answers 200 carrying no events',
+      apply: (fake) => fake.failRoute('GET /api/v1/events', { status: 200, body: { result: 'success' } }),
+    },
+    {
+      name: '/events answers 200 carrying only a heartbeat',
+      apply: (fake) =>
+        fake.failRoute('GET /api/v1/events', {
+          status: 200,
+          body: { result: 'success', events: [{ id: 1, type: 'heartbeat' }] },
+        }),
+    },
+    {
+      name: '/events is a black hole',
+      apply: (fake) => fake.hangRoute('GET /api/v1/events'),
+    },
+  ];
+  /** Every route one pass of a blocked fetch issues — the recovery routes that answer 200 included. */
+  const PASS_ROUTES = [
+    REGISTER,
+    'GET /api/v1/events',
+    'DELETE /api/v1/events',
+    'GET /api/v1/messages',
+  ] as const;
 
-    const started = Date.now();
-    const res = await plugin.fetchRecent({ topic, since: tail, blockMs: 1200 });
+  for (const mode of DEGRADATIONS) {
+    for (const blockMs of [1200, 6000]) {
+      it(`paces its own retries over ${blockMs}ms when ${mode.name}`, async () => {
+        const { plugin, fake } = await boot();
+        const topic = asTopic(`spin-${rand()}`);
+        await plugin.post(topic, SENDER, 'old');
+        const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
+        mode.apply(fake);
+        const before = new Map(PASS_ROUTES.map((r) => [r, fake.requestCount(r)]));
 
-    expect(res.messages).toEqual([]);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
-    expect(fake.requestCount(REGISTER)).toBeLessThan(10);
-  });
+        const started = Date.now();
+        const res = await plugin.fetchRecent({ topic, since: tail, blockMs });
+
+        expect(res.messages).toEqual([]);
+        // The budget is spent waiting, not returned early — the other half of "does not spin".
+        expect(Date.now() - started).toBeGreaterThanOrEqual(blockMs - 100);
+        const passes = Math.ceil(2 + blockMs / 2000);
+        const spent = PASS_ROUTES.map((r) => [r, fake.requestCount(r) - (before.get(r) ?? 0)]);
+        // Two history reads per pass; every other route is issued at most once.
+        const over = spent.filter(([r, n]) => (n as number) > passes * (r === PASS_ROUTES[3] ? 2 : 1));
+        expect([over, spent]).toEqual([[], spent]);
+      }, 20_000);
+    }
+  }
 
   it('a topic with no live loop still waits out its budget rather than returning instantly', async () => {
     const { plugin } = await boot();
@@ -239,8 +292,15 @@ describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe
 describe('zulip blocking fetchRecent never overruns its blockMs', () => {
   /** Scheduling, the history re-read, and the fake's own round trips. */
   const SLACK_MS = 700;
+  /** Far past every budget below, so honouring one is unmistakable rather than a slow round trip. */
+  const HINT_SECONDS = 8;
 
-  const SLOW_STATES = [
+  const SLOW_STATES: Array<{
+    name: string;
+    apply: (fake: FakeZulip) => void;
+    /** A rate-limited HISTORY read has no answer to give inside the budget, so it fails loudly. */
+    rejects?: boolean;
+  }> = [
     { name: 'a responsive server', apply: () => undefined },
     {
       name: 'DELETE /events answering 500',
@@ -266,6 +326,31 @@ describe('zulip blocking fetchRecent never overruns its blockMs', () => {
       name: '/events slower than the whole budget',
       apply: (fake: FakeZulip) => fake.holdResponse('GET /api/v1/events', 4000),
     },
+    // A rate limit is the one slow answer the server DICTATES the length of, and the retry sleep
+    // that honours it races only `isStopped()` — no caller deadline can cut it short, so a hint
+    // must be refused up front by a budget rather than waited out. Every route the wait path
+    // touches gets a row, and both hint carriers (header and body field) are exercised.
+    {
+      name: `a 429 on register hinting ${HINT_SECONDS}s in the header`,
+      apply: (fake: FakeZulip) =>
+        fake.rateLimit(REGISTER, { times: 1, headerSeconds: HINT_SECONDS }),
+    },
+    {
+      name: `a 429 on /events hinting ${HINT_SECONDS}s in the header`,
+      apply: (fake: FakeZulip) =>
+        fake.rateLimit('GET /api/v1/events', { times: 1, headerSeconds: HINT_SECONDS }),
+    },
+    {
+      name: `a 429 on /events hinting ${HINT_SECONDS}s in the body field`,
+      apply: (fake: FakeZulip) =>
+        fake.rateLimit('GET /api/v1/events', { times: 1, bodySeconds: HINT_SECONDS }),
+    },
+    {
+      name: `a 429 on the history read hinting ${HINT_SECONDS}s in the header`,
+      apply: (fake: FakeZulip) =>
+        fake.rateLimit('GET /api/v1/messages', { times: 1, headerSeconds: HINT_SECONDS }),
+      rejects: true,
+    },
   ];
 
   for (const state of SLOW_STATES) {
@@ -278,12 +363,20 @@ describe('zulip blocking fetchRecent never overruns its blockMs', () => {
         state.apply(fake);
 
         const started = Date.now();
-        const res = await plugin.fetchRecent({ topic, since: tail, blockMs });
+        const pending = plugin.fetchRecent({ topic, since: tail, blockMs });
+        if (state.rejects === true) {
+          await expect(pending).rejects.toThrow('429');
+          expect(Date.now() - started).toBeLessThanOrEqual(blockMs + SLACK_MS);
+          return;
+        }
+        const res = await pending;
         const elapsed = Date.now() - started;
 
         expect(res.messages).toEqual([]);
         expect(elapsed).toBeLessThanOrEqual(blockMs + SLACK_MS);
-      });
+        // The budget is a ceiling on the whole call, not a licence to abandon the wait early.
+        expect(elapsed).toBeGreaterThanOrEqual(blockMs - 100);
+      }, 20_000);
     }
   }
 });

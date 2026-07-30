@@ -16,8 +16,9 @@
  * shapes with the caller's `limit`, because a page is only full — and the pagination anchor only
  * load-bearing — when the records dropped fill the page the caller asked for.
  */
-import { asTopic, type Message } from '@sharptrick/parley-core';
+import { asCursor, asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
+import { SERVER_CONSTRAINTS } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
@@ -142,6 +143,56 @@ describe('a hostile record shape never throws out of fetchRecent', () => {
     });
     await expect(plugin.subscribe(topic, () => undefined)).rejects.toThrow('usable queue_id');
   });
+});
+
+/**
+ * CLASS: a paginating read must TERMINATE whatever the server answers with. The read navigates by
+ * the RAW edge record of the page it just took — which is what lets it walk past records it cannot
+ * use — so a server answering a full page whose edge carries an id that does not move in the
+ * direction of travel walks it onto the same page forever. Every early return in that walk is
+ * required to name the answer that makes it fire; a defensive clause no fixture can reach is
+ * counted as coverage and grades nothing.
+ */
+describe('a server whose pages do not advance the anchor cannot spin the read', () => {
+  /** Each shape stops the walk via a different clause, so no row stands in for its neighbour. */
+  const NON_ADVANCING_EDGES = [
+    { name: 'zero', edgeId: 0 },
+    { name: 'negative', edgeId: -1 },
+    { name: 'fractional', edgeId: 1.5 },
+    { name: 'the id it was already asked from', edgeId: 7 },
+    { name: 'a string', edgeId: 'nope' },
+    { name: 'absent', edgeId: undefined },
+  ];
+  const DIRECTIONS: Array<{ name: string; since: Cursor | undefined }> = [
+    { name: 'the since-less backward walk', since: undefined },
+    { name: 'a since-based forward walk', since: asCursor('7') },
+  ];
+  /** A walk that terminates takes the stalled page and one probe past it; anything more is a spin. */
+  const MAX_PAGES = 3;
+
+  for (const edge of NON_ADVANCING_EDGES) {
+    for (const direction of DIRECTIONS) {
+      for (const limit of [3, SERVER_CONSTRAINTS.maxMessagesPerFetch + 1]) {
+        it(`ends ${direction.name} at limit ${limit} when every page edge is ${edge.name}`, async () => {
+          vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+          const { plugin, fake } = await boot();
+          const topic = asTopic(`stall-${rand()}`);
+          fake.stallAnchor(edge.edgeId);
+
+          const outcome = await Promise.race([
+            plugin
+              .fetchRecent({ topic, since: direction.since, limit })
+              .then(() => 'returned')
+              .catch(() => 'threw'),
+            sleep(3000).then(() => 'spun'),
+          ]);
+
+          expect(outcome).toBe('returned');
+          expect(fake.requestCount('GET /api/v1/messages')).toBeLessThanOrEqual(MAX_PAGES);
+        }, 20_000);
+      }
+    }
+  }
 });
 
 describe('a live push loop survives the same gauntlet', () => {

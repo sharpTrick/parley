@@ -6,8 +6,9 @@
  */
 import { asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
+import { GAP_FILL_PAGE, TAIL_PROBE_PAGE } from '../src/index.js';
 import type { FakeZulip } from './fake-zulip.js';
-import { rand, SENDER, useZulip } from './harness.js';
+import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
 
@@ -47,6 +48,75 @@ describe('zulip subscribe handshake windows', () => {
       expect(got.map((m) => m.content)).toEqual(['racer', 'after']);
     });
   }
+});
+
+/**
+ * CLASS: the pre-subscribe watermark decides what the live path treats as ALREADY delivered, and it
+ * is read out of the same server-controlled records everything else is. A record the read cannot use
+ * is not the end of history, and the plugin must not derive a watermark from one — a watermark that
+ * falls back to zero arms a gap-fill that replays the whole topic through the live handler, which is
+ * the seam's "subscribe delivers exactly the post-subscribe tail" clause failing in the loudest way.
+ * The table crosses every unusable shape the newest record can arrive in with the history behind it,
+ * including a whole probe window of them, where no tail can be established at all.
+ */
+describe('zulip subscribe never replays history it could not read a tail from', () => {
+  /**
+   * Shapes of `id` that make a record unusable — it is both the dedup key and the cursor. Only the
+   * shapes a server can ORDER are here: an id that is not a comparable number lands in no read
+   * window at all, so it cannot reach the probe, and it is graded on the push path instead
+   * (untrusted-payload.test.ts drives every hazard shape through a live queue).
+   */
+  const UNUSABLE_IDS: Array<{ name: string; value: unknown }> = [
+    { name: 'zero', value: 0 },
+    { name: 'negative', value: -1 },
+    { name: 'fractional', value: 1.5 },
+    { name: 'past the safe-integer range', value: 1e18 },
+  ];
+  /** Straddles the gap-fill page, so a replay would also have to paginate to be complete. */
+  const HISTORIES = [0, 1, 3, GAP_FILL_PAGE + 1];
+
+  for (const shape of UNUSABLE_IDS) {
+    for (const history of HISTORIES) {
+      it(`delivers only the post-subscribe tail past a newest record whose id is ${shape.name}, over ${history} message(s) of history`, async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const { plugin, fake } = await boot();
+        const topic = asTopic(`watermark-${rand()}`);
+        for (let i = 0; i < history; i++) fake.injectMessage({ topic, content: `h${i}` });
+        fake.injectRaw({ topic, fields: { id: shape.value } });
+
+        const got: Message[] = [];
+        await plugin.subscribe(topic, (m) => got.push(m));
+        await plugin.post(topic, SENDER, 'after');
+
+        await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(['after']), {
+          timeout: 5000,
+          interval: 10,
+        });
+        // Settle: a gap-fill armed from a watermark that fell behind replays on the NEXT pass.
+        await sleep(400);
+        expect(got.map((m) => m.content)).toEqual(['after']);
+      }, 20_000);
+    }
+  }
+
+  it(`delivers only the post-subscribe tail when the whole ${TAIL_PROBE_PAGE}-record probe window is unusable`, async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`blind-${rand()}`);
+    for (let i = 0; i < 3; i++) fake.injectMessage({ topic, content: `h${i}` });
+    for (let i = 0; i < TAIL_PROBE_PAGE; i++) fake.injectRaw({ topic, fields: { id: 0 } });
+
+    const got: Message[] = [];
+    await plugin.subscribe(topic, (m) => got.push(m));
+    await plugin.post(topic, SENDER, 'after');
+
+    await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(['after']), {
+      timeout: 5000,
+      interval: 10,
+    });
+    await sleep(400);
+    expect(got.map((m) => m.content)).toEqual(['after']);
+  }, 20_000);
 });
 
 /** Every way the handshake can end without a live loop behind it. */

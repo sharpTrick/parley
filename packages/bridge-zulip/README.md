@@ -71,10 +71,14 @@ stream with only bots posting, this never happens on its own.
 | `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. |
 | `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). Clamped to `[250, 600000]` ms, so no value can make the loop poll hot. |
 
-Every key is validated at `connect()`, which throws naming the offending key: `site_url` must be an
-absolute `http(s)` URL, `email`/`api_key`/`stream` must be non-empty, and `events_timeout_ms` must
-be a positive, finite number (`0` is an error, not "no cap"). A key that is present but empty (a
-bare `site_url:` in YAML) is reported rather than silently replaced by its default.
+Every key is validated at `connect()`, which throws naming the offending key: `site_url` must be a
+bare absolute `http(s)` base URL — no `user:password@` (Zulip authenticates from `email`/`api_key`,
+and a credential in the URL would be echoed by every diagnostic that names the site) and no query or
+fragment — `email`/`api_key`/`stream` must be non-empty, and `events_timeout_ms` must be a positive,
+finite number (`0` is an error, not "no cap"). A key that is present but empty (a bare `site_url:`
+in YAML) is reported rather than silently replaced by its default. A rejection echoes the offending
+value only when its type is the one the key declares; any other type is reported by shape, so a
+credential pasted into the wrong key is not disclosed.
 
 Secrets live in `backend_config` / `.env`, never in code.
 
