@@ -15,7 +15,7 @@ vi.mock('@xmpp/client', async () => {
 });
 
 import { XmppPlugin } from '../src/index.js';
-import { FakeXmpp, priv } from './fake-xmpp.js';
+import { type ArchiveItem, FakeXmpp, priv } from './fake-xmpp.js';
 
 interface Shape {
   name: string;
@@ -95,6 +95,80 @@ describe('XMPP admits the same archived stanzas via live push and via catch-up',
     const page = await plugin.fetchRecent({ topic, since: first.archId as never, limit: 10 });
     expect(page.messages.map((m) => m.content)).toEqual(['two']);
     expect(String(page.nextCursor)).toBe(last.archId);
+    await plugin.disconnect();
+    mockState.client = undefined;
+  });
+});
+
+// Class: a window whose ADMITTED set is empty reporting a cursor that precedes what this plugin has
+// already read from the topic. `''` is the zero cursor — "this room's archive from message one" —
+// so a since-less window made entirely of stanzas the seam drops used to rewind past every message
+// it had issued, and the next call replayed the whole room. The two axes are the `since` arm and
+// what the tail of the archive is made of; the filter runs on one of them and the rewind on the
+// other, which is why driving only the `since`-given arm (above) left this half unguarded.
+
+type Arm = 'no cursor' | 'the zero cursor' | 'a real archive id';
+type Tail =
+  | 'all bodied'
+  | 'a bodiless last row'
+  | 'a wholly bodiless tail'
+  | 'a wholly bodiless archive';
+
+const bodies: Record<Tail, Array<string | null>> = {
+  'all bodied': ['b1', 'b2', 'b3', 'b4'],
+  'a bodiless last row': ['b1', 'b2', 'b3', null],
+  'a wholly bodiless tail': ['b1', 'b2', null, null],
+  'a wholly bodiless archive': [null, null, null, null],
+};
+
+/** `limit` small enough that the since-LESS window is the archive tail, and only it. */
+const TAIL_WINDOW = 2;
+
+/** The rows each arm's read covers — derived, so a change to either axis moves the expectation. */
+const windowOf = (archive: ArchiveItem[], arm: Arm): ArchiveItem[] =>
+  arm === 'no cursor'
+    ? archive.slice(-TAIL_WINDOW)
+    : arm === 'the zero cursor'
+      ? archive
+      : archive.slice(1);
+
+const cursorRows = (Object.keys(bodies) as Tail[]).flatMap((tail) =>
+  (['no cursor', 'the zero cursor', 'a real archive id'] as Arm[]).map((arm) => ({ arm, tail })),
+);
+
+describe('XMPP catch-up cursor never moves back past what it has already read', () => {
+  it.each(cursorRows)('$arm over $tail', async ({ arm, tail }) => {
+    const fake = new FakeXmpp();
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: 'reader' });
+    const topic = asTopic('muc-cursor');
+    const room = priv(plugin).roomJid(topic);
+    const archive = bodies[tail].map((body) => fake.archiveItem(room, { body }));
+
+    const window = windowOf(archive, arm);
+    const admitted = window.filter((it) => it.body !== null);
+    const since =
+      arm === 'no cursor' ? undefined : arm === 'the zero cursor' ? '' : archive[0]!.archId;
+
+    const page = await plugin.fetchRecent({
+      topic,
+      ...(since === undefined ? {} : { since: since as never }),
+      limit: arm === 'no cursor' ? TAIL_WINDOW : 100,
+    });
+
+    expect(page.messages.map((m) => m.content)).toEqual(admitted.map((it) => it.body));
+    // The cursor is the last row the read RETURNED, or — when it returned none — the last row it
+    // SAW. Never the caller's own cursor, and never '', both of which sit behind the window.
+    expect(String(page.nextCursor)).toBe((admitted.at(-1) ?? window.at(-1))!.archId);
+
+    // Feeding it back must deliver only what arrived afterwards: nothing the window already
+    // covered, and nothing from the archive prefix the window deliberately skipped.
+    const fresh = fake.archiveItem(room, { body: 'after' });
+    const replay = await plugin.fetchRecent({ topic, since: page.nextCursor, limit: 100 });
+    expect(replay.messages.map((m) => m.content)).toEqual(['after']);
+    expect(String(replay.nextCursor)).toBe(fresh.archId);
+
     await plugin.disconnect();
     mockState.client = undefined;
   });

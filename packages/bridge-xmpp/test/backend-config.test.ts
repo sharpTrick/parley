@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 
 // Class: a plugin taking `backend_config` by unchecked cast. Core deliberately leaves the object
@@ -32,6 +32,7 @@ vi.mock('@xmpp/client', async () => {
 
 import {
   CONFIG_KEYS,
+  isPlaintextRemote,
   JID_PART_MAX_BYTES,
   JID_SIZED_KEYS,
   XmppPlugin,
@@ -243,5 +244,37 @@ describe('XMPP identity/nick doc claims are retired everywhere or nowhere', () =
 
   it.each(claimCells(current))('$surface states "$claim"', ({ surface, pattern }) => {
     expect(textOf(surface)).toMatch(pattern);
+  });
+});
+
+// Class: a shipped example config that trips a warning the code itself emits. All three runnable
+// XMPP configs named a plaintext `service` at a non-loopback host — precisely what the plugin's
+// README tells operators not to use and what connect() answers with a SECURITY line at every start,
+// so the project's own copy-paste starting point WAS the misconfiguration and the warning became
+// background noise. Every example is graded, against the code's own predicate rather than against a
+// literal scheme, so a new example file or a new scheme is covered the day it lands.
+
+const exampleConfigs = (): Array<{ file: string; service: string }> => {
+  const dir = new URL('../../../examples/multi-session/xmpp/', import.meta.url);
+  return readdirSync(dir)
+    .filter((file) => file.endsWith('.yaml'))
+    .map((file) => ({
+      file,
+      service: /^\s*service:\s*"([^"]+)"/m.exec(readFileSync(new URL(file, dir), 'utf8'))?.[1] ?? '',
+    }));
+};
+
+describe('the shipped XMPP example configs trip none of the warnings this plugin emits', () => {
+  it('there are example configs to grade', () => {
+    expect(exampleConfigs().map((c) => c.file).sort()).toEqual([
+      'code-agent-a.yaml',
+      'code-agent-b.yaml',
+      'remote-chat.yaml',
+    ]);
+  });
+
+  it.each(exampleConfigs())('$file declares a service connect() does not warn about', ({ service }) => {
+    expect(service).toMatch(/\S/);
+    expect(isPlaintextRemote(service)).toBe(false);
   });
 });

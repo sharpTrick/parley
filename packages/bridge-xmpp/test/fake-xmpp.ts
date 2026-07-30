@@ -21,6 +21,21 @@ export interface El {
   getChildText(name: string, ns?: string): string | null;
 }
 
+/**
+ * One archived stanza as the fixture describes it. `injected` is the XEP-0203/0359 children a
+ * co-occupant put on its OWN message: a MUC reflects those verbatim to the room, so they reach the
+ * live path — and never the archive, whose `<forwarded>` envelope the server builds itself.
+ */
+export interface StanzaShape {
+  body: string | null;
+  subject?: string;
+  /** `null` for a room-level stanza: its `from` is the bare room JID, with no occupant resource. */
+  sender?: string | null;
+  /** The stamp the SERVER records for this row (the MAM `<forwarded><delay/>`). */
+  stamp?: string;
+  injected?: unknown[];
+}
+
 export interface ArchiveItem {
   archId: string;
   from: string;
@@ -191,7 +206,17 @@ export class FakeXmpp {
   readonly occupantNicks = new Map<string, string>();
   /** Enforce XML well-formedness on everything sent, as a real XMPP server does. */
   strictXml = true;
+  /** When set, `start()` rejects with it: a stream that never came up (refused socket, bad SASL). */
+  startError?: string;
+  /**
+   * How many times this client was stopped. `@xmpp/reconnect` listens from construction, so a
+   * client the plugin abandons without stopping goes on redialling and delivering stanzas — this
+   * counter and {@link feed}'s stopped check are what make such an orphan observable at all.
+   */
+  stops = 0;
 
+  /** Whether `stop()` has taken this client down; `start()` brings it back, as the real one does. */
+  private streamStopped = false;
   private readonly handlers: Record<string, Array<(a?: unknown) => void>> = {};
   private readonly occupied = new Set<string>();
   private seq = 0;
@@ -226,11 +251,18 @@ export class FakeXmpp {
   emit(event: string, arg?: unknown): void {
     for (const cb of this.handlers[event] ?? []) cb(arg);
   }
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
+  async start(): Promise<void> {
+    if (this.startError !== undefined) throw new Error(this.startError);
+    this.streamStopped = false;
+  }
+  async stop(): Promise<void> {
+    this.stops++;
+    this.streamStopped = true;
+  }
 
-  /** Push a stanza into the plugin exactly as the stream would. */
+  /** Push a stanza into the plugin exactly as the stream would — a stopped stream pushes nothing. */
   feed(el: unknown): void {
+    if (this.dead || this.streamStopped) return;
     this.emit('stanza', el);
   }
 
@@ -271,16 +303,14 @@ export class FakeXmpp {
    * description of the stanza. A MUC archives more than chat: a subject change and a retraction
    * carry no `<body>`, and a room-level announcement carries no occupant resource in its `from`.
    */
-  deliverItem(
-    room: string,
-    shape: { body: string | null; subject?: string; sender?: string | null },
-  ): ArchiveItem {
+  deliverItem(room: string, shape: StanzaShape): ArchiveItem {
     const item = this.archiveItem(room, shape);
     this.feed(
       xml(
         'message',
         { from: item.from, type: 'groupchat' },
         ...(this.itemChildren(item) as never[]),
+        ...((shape.injected ?? []) as never[]),
         xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
       ),
     );
@@ -292,17 +322,17 @@ export class FakeXmpp {
     return this.archiveItem(room, { body, sender });
   }
 
-  /** {@link archiveOnly} for a stanza that is not plain chat (see {@link deliverItem}). */
-  archiveItem(
-    room: string,
-    shape: { body: string | null; subject?: string; sender?: string | null },
-  ): ArchiveItem {
+  /** {@link archiveOnly} for a stanza that is not plain chat (see {@link deliverItem}). Only the
+   * fields a SERVER attests reach the archive: `injected` is what the occupant wrote, and it is
+   * carried by the live reflection alone. */
+  archiveItem(room: string, shape: StanzaShape): ArchiveItem {
     const sender = shape.sender === undefined ? 'someone' : shape.sender;
     const item: ArchiveItem = {
       archId: `arch-${++this.seq}`,
       from: sender === null ? room : `${room}/${sender}`,
       body: shape.body,
       subject: shape.subject,
+      stamp: shape.stamp,
     };
     this.archiveOf(room).push(item);
     return item;
@@ -564,6 +594,9 @@ export class FakeXmpp {
           xml(
             'forwarded',
             { xmlns: NS_FORWARD },
+            ...(item.stamp === undefined
+              ? []
+              : [xml('delay', { xmlns: NS_DELAY, stamp: item.stamp })]),
             xml('message', { from: item.from }, ...(this.itemChildren(item) as never[])),
           ),
         ),

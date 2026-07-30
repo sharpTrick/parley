@@ -22,7 +22,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | admission | a stanza with **no `<body>`** — a subject change, a correction, a retraction, a chat state — is not a message on either path; an *empty* body is |
 | `resolveIdentity` | name convention: `backendRef` is the MUC nick this connection posts under, so it matches the `senderHandle` that handle reads back as. Once the nick is settled — pinned by `nick`, taken from the first `post`, or reverted after a `conflict` — **every** handle resolves to it, because one occupant is one sender; before the first `post` it is the fold `post` would apply to this handle (`alice@corp.com` → `alice_corp.com-<hash>`) |
 | sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
-| timestamp | `<delay stamp>` from MAM forwarded messages if present, else now (informational only) |
+| timestamp | the `<delay stamp>` the SERVER attested — MAM's `<forwarded>` envelope, or on the live path a `<delay>` the room itself added — else now. A `<delay>` naming any other entity is an occupant's own and is ignored, so a co-occupant cannot choose it (informational only) |
 
 Archive ids are not lexically comparable, but core never compares cursors — the server's RSM
 `<after>` defines "strictly after" and the MAM archive defines order.
@@ -148,7 +148,9 @@ default MUC service and every join bouncing a condition that names nothing.
 > **Use `xmpps://` off localhost.** `@xmpp/client`'s STARTTLS is *opportunistic* — it upgrades only a
 > stream whose peer advertises the feature — and SASL PLAIN is always offered, so with `xmpp://` (or
 > `ws://`) to a non-loopback host an on-path attacker that strips `<starttls/>` is handed
-> `backend_config.password` in cleartext. That configuration is not refused (a loopback dev server
+> `backend_config.password` in cleartext. A `service` with **no scheme at all** warns the same way:
+> `@xmpp/resolve` answers that form by DNS-SRV, and its candidate list ends at a cleartext
+> `xmpp://…:5222` it falls back to as soon as 5223 refuses. That configuration is not refused (a loopback dev server
 > legitimately runs unencrypted, which is why the Prosody snippet below sets
 > `allow_unencrypted_plain_auth`), but it warns loudly on stderr at connect.
 

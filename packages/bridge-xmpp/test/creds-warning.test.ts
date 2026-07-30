@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Class: a credential this backend puts on the network with no diagnostic. Two independent ways
-// that happens here — the repo-public default password, and a plaintext `service` scheme to a
-// non-loopback host, where @xmpp/starttls only upgrades a stream the PEER offers to upgrade while
-// @xmpp/client always registers SASL PLAIN. Neither is refused (a loopback dev server legitimately
-// runs unencrypted, and the README's own Prosody snippet sets allow_unencrypted_plain_auth), so the
-// contract is that no cell is SILENT: the transport table below crosses every scheme this library
-// accepts with every host class and both password kinds, and asserts exactly which cells warn.
+// that happens here — the repo-public default password, and a `service` that can terminate on a
+// cleartext socket at a non-loopback host, where @xmpp/starttls only upgrades a stream the PEER
+// offers to upgrade while @xmpp/client always registers SASL PLAIN. Neither is refused (a loopback
+// dev server legitimately runs unencrypted, and the README's own Prosody snippet sets
+// allow_unencrypted_plain_auth), so the contract is that no cell is SILENT.
+//
+// The transport table crosses the URI FORM with the host class and both password kinds. Form is
+// its own axis because the guard used to key on the scheme alone: a service with no scheme — the
+// standard DNS-SRV form — matched nothing in the plaintext set and went silent, while
+// @xmpp/resolve routes exactly that form through SRV and falls back to cleartext xmpp://…:5222.
+// Only an explicitly encrypted scheme is safe; every other form is a way to reach a plain socket.
 
 const mockState = vi.hoisted(() => ({ client: undefined as unknown }));
 vi.mock('@xmpp/client', async () => {
@@ -51,10 +56,22 @@ describe('XMPP default-credential warning', () => {
   });
 });
 
-// The transport half. `schemes` is pinned by VALUE as well as driven into the table: a scheme
-// dropped from the plaintext set would otherwise silently delete its own rows.
-const PLAINTEXT = ['xmpp://', 'ws://'];
-const ENCRYPTED = ['xmpps://', 'wss://'];
+// The transport half. `forms` is pinned by VALUE as well as driven into the table: a form dropped
+// from it would otherwise silently delete its own rows.
+interface Form {
+  name: string;
+  service(host: string): string;
+  /** Whether this form's stream is encrypted before SASL runs — the only reason to stay silent. */
+  encrypted: boolean;
+}
+const forms: Form[] = [
+  { name: 'xmpp://', service: (h) => `xmpp://${h}`, encrypted: false },
+  { name: 'ws://', service: (h) => `ws://${h}`, encrypted: false },
+  { name: 'xmpps://', service: (h) => `xmpps://${h}`, encrypted: true },
+  { name: 'wss://', service: (h) => `wss://${h}`, encrypted: true },
+  { name: 'no scheme (DNS-SRV)', service: (h) => h, encrypted: false },
+  { name: 'scheme-relative', service: (h) => `//${h}`, encrypted: false },
+];
 const LOOPBACK = ['127.0.0.1:5222', 'localhost:5222', '[::1]:5222', '::1', '127.0.0.44'];
 // Hosts that read as loopback to a PREFIX or substring match but are ordinary registrable names
 // their owner points wherever they like, plus two integer spellings of 127.0.0.1 that are not
@@ -84,36 +101,37 @@ interface Cell {
 }
 
 const cells: Cell[] = [];
-for (const [schemes, plaintext] of [
-  [PLAINTEXT, true],
-  [ENCRYPTED, false],
-] as const) {
-  for (const scheme of schemes) {
-    for (const [hosts, loopback] of [
-      [LOOPBACK, true],
-      [REMOTE, false],
-    ] as const) {
-      for (const host of hosts) {
-        for (const password of ['a-real-secret', undefined]) {
-          cells.push({
-            service: `${scheme}${host}`,
-            password,
-            expected: { credential: password === undefined, transport: plaintext && !loopback },
-          });
-        }
+for (const form of forms) {
+  for (const [hosts, loopback] of [
+    [LOOPBACK, true],
+    [REMOTE, false],
+  ] as const) {
+    for (const host of hosts) {
+      for (const password of ['a-real-secret', undefined]) {
+        cells.push({
+          service: form.service(host),
+          password,
+          expected: {
+            credential: password === undefined,
+            transport: !form.encrypted && !loopback,
+          },
+        });
       }
     }
   }
 }
 
 describe('XMPP transport safety', () => {
-  it('the plaintext scheme set is exactly xmpp:// and ws://', () => {
-    for (const scheme of PLAINTEXT) expect(isPlaintextRemote(`${scheme}remote.example`)).toBe(true);
-    for (const scheme of ENCRYPTED) expect(isPlaintextRemote(`${scheme}remote.example`)).toBe(false);
+  it('only an explicitly encrypted scheme is classified safe', () => {
+    for (const form of forms) {
+      expect(isPlaintextRemote(form.service('remote.example'))).toBe(!form.encrypted);
+    }
   });
 
   it.each(LOOKALIKE)('%s is classified remote, not loopback', (host) => {
-    expect(isPlaintextRemote(`xmpp://${host}`)).toBe(true);
+    for (const form of forms.filter((f) => !f.encrypted)) {
+      expect(isPlaintextRemote(form.service(host))).toBe(true);
+    }
   });
 
   it.each(cells)('$service (password $password) warns as documented', async (cell) => {
@@ -122,7 +140,7 @@ describe('XMPP transport safety', () => {
       ...(cell.password === undefined ? {} : { password: cell.password }),
     });
     const credential = warned.filter((m) => m.includes('default password'));
-    const transport = warned.filter((m) => m.includes('plaintext scheme'));
+    const transport = warned.filter((m) => m.includes('in the clear'));
     expect(credential).toHaveLength(cell.expected.credential ? 1 : 0);
     expect(transport).toHaveLength(cell.expected.transport ? 1 : 0);
     // Nothing else was reported, so a cell that must warn cannot be riding another's line.

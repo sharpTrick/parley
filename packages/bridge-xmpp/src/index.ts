@@ -125,6 +125,19 @@ const senderOf = (from: string, fallback: string): string => {
   return bare !== '' ? bare : fallback;
 };
 
+/**
+ * The `<delay>` stamp on a live stanza, and only the room's own: XEP-0203 §4 puts the entity that
+ * added the delay in `from`, and a MUC reflects an occupant's `<delay>` to the room verbatim. Keep
+ * this check, so that a co-occupant cannot choose the timestamp core shows the agent — the catch-up
+ * path reads the server-built `<forwarded>` envelope, and the two paths have to agree.
+ */
+const roomStamp = (stanza: El, room: string): string | undefined => {
+  const delay = stanza.getChild('delay', NS_DELAY);
+  if (delay === undefined) return undefined;
+  const addedBy = delay.attrs.from;
+  return addedBy === undefined || addedBy === room ? delay.attrs.stamp : undefined;
+};
+
 /** The first codepoint of `s` outside XML 1.0's `Char` production, or `undefined` if all are legal. */
 const xmlIllegalCodepoint = (s: string): number | undefined => {
   for (const ch of s) {
@@ -169,8 +182,12 @@ export const JID_SIZED_KEYS = [...JID_PART_KEYS, 'nick'] as const;
 export const JID_PART_MAX_BYTES = 1023;
 const MAX_MAM_PAGE = 10_000;
 
-/** Schemes whose stream starts in the clear; STARTTLS on them is opportunistic, never guaranteed. */
-const PLAINTEXT_SCHEMES = ['xmpp:', 'ws:'];
+/**
+ * The only schemes whose stream is encrypted before SASL runs. Keep the classification stated this
+ * way round, so that a service form this list does not recognise — `xmpp://`, `ws://`, or the bare
+ * DNS-SRV host form that carries no scheme at all — is treated as unsafe rather than as unknown.
+ */
+const ENCRYPTED_SCHEMES = ['xmpps:', 'wss:'];
 /**
  * The whole 127.0.0.0/8 block as an ADDRESS. Keep it anchored at both ends, so that a registrable
  * hostname beginning `127.` — which resolves wherever its owner points it — cannot be classified
@@ -179,15 +196,21 @@ const PLAINTEXT_SCHEMES = ['xmpp:', 'ws:'];
 const LOOPBACK_V4 = /^127(\.\d{1,3}){3}$/;
 
 /**
- * Whether `service` would put the SASL password on the network in the clear. `@xmpp/starttls`
+ * Whether `service` may put the SASL password on the network in the clear. `@xmpp/starttls`
  * upgrades only when the peer ADVERTISES the feature and `@xmpp/client` registers SASL PLAIN
  * unconditionally, so an on-path attacker that strips `<starttls/>` from the stream features is
  * handed the credential — there is nothing in the library that refuses to go on without it.
+ *
+ * A service carrying no scheme is UNKNOWN transport, not safe transport: `@xmpp/resolve` routes
+ * everything without `://` through DNS-SRV, and its candidate list always ends at a cleartext
+ * `xmpp://<addr>:5222` that `fallbackConnect` walks to as soon as 5223 refuses the socket.
  */
 export function isPlaintextRemote(service: string): boolean {
-  const scheme = /^([a-z][a-z0-9+.-]*:)/i.exec(service.trim())?.[1]?.toLowerCase();
-  if (scheme === undefined || !PLAINTEXT_SCHEMES.includes(scheme)) return false;
-  const authority = service.trim().slice(scheme.length).replace(/^\/\//, '');
+  const trimmed = service.trim();
+  const mark = trimmed.indexOf('://');
+  const scheme = mark === -1 ? undefined : trimmed.slice(0, mark + 1).toLowerCase();
+  if (scheme !== undefined && ENCRYPTED_SCHEMES.includes(scheme)) return false;
+  const authority = (mark === -1 ? trimmed : trimmed.slice(mark + 3)).replace(/^\/\//, '');
   const host = (/^([^/?#]*)/.exec(authority)?.[1] ?? '')
     .replace(/^[^@]*@/, '')
     .replace(/^(\[[^\]]*]):\d+$/, '$1')
@@ -355,6 +378,12 @@ interface MamItem {
 /** A {@link MamItem} the seam can carry: the live path admits exactly these, so catch-up must too. */
 type BodiedItem = MamItem & { body: string };
 const hasBody = (it: MamItem): it is BodiedItem => it.body !== null;
+/** One archive window: the rows the seam carries, and where in the archive the read actually got to. */
+interface ReadWindow {
+  items: BodiedItem[];
+  /** Archive id of the last row the read SAW, admitted or not; `undefined` when it saw none. */
+  tail?: string;
+}
 interface Subscription {
   topic: Topic;
   handlers: MessageHandler[];
@@ -428,6 +457,13 @@ export class XmppPlugin implements BackendPlugin {
   private readonly waiters = new Map<string, Set<(reason: WakeReason) => void>>();
 
   async connect(config: BackendConfig): Promise<void> {
+    if (this.xmpp !== undefined) {
+      throw new Error(
+        'parley-xmpp: already connected — call disconnect() before connect() again. Taking the ' +
+          'second client would abandon the first, which goes on redialling with ' +
+          'backend_config.password while its stanza handlers still drive this plugin.',
+      );
+    }
     const cfg = validateBackendConfig(config);
     this.domain = cfg.domain ?? 'parley.local';
     this.mucService = cfg.muc_service ?? 'muc.parley.local';
@@ -453,10 +489,12 @@ export class XmppPlugin implements BackendPlugin {
     const service = cfg.service ?? 'xmpp://127.0.0.1:5222';
     if (isPlaintextRemote(service)) {
       console.warn(
-        `[parley-xmpp] SECURITY: service ${service} is a plaintext scheme to a non-loopback host. ` +
-          "@xmpp/client's STARTTLS is opportunistic and SASL PLAIN is always offered, so a peer " +
-          'that does not advertise (or that is stripped of) STARTTLS receives ' +
-          'backend_config.password in the clear. Use xmpps:// or wss://.',
+        `[parley-xmpp] SECURITY: service ${service} can put backend_config.password on the ` +
+          'network in the clear — it names a non-loopback host over a plaintext scheme, or over ' +
+          'no scheme at all, which @xmpp/resolve answers by DNS-SRV whose candidate list ends at ' +
+          "a cleartext xmpp://…:5222. @xmpp/client's STARTTLS is opportunistic and SASL PLAIN is " +
+          'always offered, so a peer that does not advertise (or that is stripped of) STARTTLS ' +
+          'receives the password. Use xmpps:// or wss://.',
       );
     }
 
@@ -577,15 +615,20 @@ export class XmppPlugin implements BackendPlugin {
     await this.ensureJoined(args.topic);
     const limit = args.limit ?? 100;
 
-    let items = await this.readWindow(args.topic, since, limit);
+    let window = await this.readWindow(args.topic, since, limit);
     const blockMs = Math.floor(args.blockMs ?? 0);
-    if (items.length === 0 && blockMs > 0) {
-      items = await this.blockingMam(args.topic, since, limit, blockMs);
+    if (window.items.length === 0 && blockMs > 0) {
+      window = await this.blockingMam(args.topic, since, limit, blockMs, window);
     }
 
-    const messages = items.map((it) => this.toMessage(args.topic, it));
-    const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor(''));
+    const messages = window.items.map((it) => this.toMessage(args.topic, it));
+    // Keep an EMPTY page's cursor on the window's unfiltered tail, so that a window of nothing but
+    // stanzas the seam drops advances past them instead of reporting '' — the zero cursor, which
+    // asks for this room's archive from message one. Keep a page that DID carry rows reporting its
+    // own last row, so that a truncated page cannot skip what it withheld (conformance grades it).
+    const nextCursor =
+      messages.at(-1)?.cursor ??
+      (window.tail === undefined ? (args.since ?? asCursor('')) : asCursor(window.tail));
     return { messages, nextCursor };
   }
 
@@ -598,9 +641,10 @@ export class XmppPlugin implements BackendPlugin {
     topic: Topic,
     since: string | undefined,
     limit: number,
-  ): Promise<BodiedItem[]> {
+  ): Promise<ReadWindow> {
     if (since === undefined) {
-      return (await this.mamQuery(topic, { before: true, max: limit })).items.filter(hasBody);
+      const page = await this.mamQuery(topic, { before: true, max: limit });
+      return { items: page.items.filter(hasBody), tail: page.items.at(-1)?.archId };
     }
     return this.exclusiveMam(topic, since, limit);
   }
@@ -618,26 +662,28 @@ export class XmppPlugin implements BackendPlugin {
    * that answers `<after>X</after>` with a page tailed by X again spins here forever inside a seam
    * call that nothing above it times out.
    */
-  private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<BodiedItem[]> {
+  private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<ReadWindow> {
     const items: BodiedItem[] = [];
     let cursor = since; // may be '' on the first iteration → no <after/> emitted
+    let tail: string | undefined;
     while (items.length < limit) {
       const page = await this.mamQuery(topic, {
         after: cursor,
         max: Math.min(this.mamPage, limit - items.length),
       });
       items.push(...page.items.filter(hasBody));
-      if (page.complete || page.items.length === 0) break;
-      const next = page.items[page.items.length - 1]!.archId;
-      if (next === cursor) {
+      const pageTail = page.items.at(-1)?.archId;
+      if (pageTail !== undefined) tail = pageTail;
+      if (page.complete || pageTail === undefined) break;
+      if (pageTail === cursor) {
         throw new Error(
           `MAM paging on ${this.roomJid(topic)} did not advance: the page after '${cursor}' ends ` +
             'at that same archive id and is not marked complete, so catch-up cannot make progress',
         );
       }
-      cursor = next;
+      cursor = pageTail;
     }
-    return items;
+    return { items, tail };
   }
 
   /**
@@ -645,8 +691,8 @@ export class XmppPlugin implements BackendPlugin {
    * re-reading {@link readWindow}, so that a message reflected during the query's round trip
    * fires an already-registered waiter instead of firing into the void; its park timer only starts
    * once the query is back, so the park is the interval asked for rather than what a slow server
-   * left of it. An empty return is always safe — the page carries `nextCursor === since` and
-   * core's wrapper polls the rest.
+   * left of it. An empty return is always safe — it carries the last window this call actually read,
+   * whose cursor never precedes `since`, and core's wrapper polls the rest.
    *
    * Once a live message has been seen, the archive is known to be behind the stream, and the
    * re-poll interval DOUBLES from {@link MAM_LAG_POLL_MS} instead of expiring back to the whole
@@ -660,25 +706,26 @@ export class XmppPlugin implements BackendPlugin {
     since: string | undefined,
     limit: number,
     blockMs: number,
-  ): Promise<BodiedItem[]> {
+    firstRead: ReadWindow,
+  ): Promise<ReadWindow> {
     const deadline = Date.now() + blockMs;
     const room = this.roomJid(topic);
+    let latest = firstRead;
     let lagPoll = 0;
     for (;;) {
-      if (this.stopped || Date.now() >= deadline) return [];
+      if (this.stopped || Date.now() >= deadline) return latest;
       const waiter = this.armWaiter(room);
       try {
-        const items = await this.readWindow(topic, since, limit);
-        if (items.length > 0) return items;
-        if (this.stopped) return [];
+        latest = await this.readWindow(topic, since, limit);
+        if (latest.items.length > 0 || this.stopped) return latest;
         const budget = deadline - Date.now();
         const park = lagPoll > 0 ? Math.min(budget, lagPoll) : budget;
-        if (park <= 0) return [];
+        if (park <= 0) return latest;
         const reason = await waiter.park(park);
         if (reason === 'message') lagPoll = MAM_LAG_POLL_MS;
         else if (reason === 'timeout' && lagPoll > 0) lagPoll *= 2;
       } catch (err) {
-        if (this.stopped) return [];
+        if (this.stopped) return latest;
         throw err;
       } finally {
         waiter.cancel();
@@ -1016,12 +1063,7 @@ export class XmppPlugin implements BackendPlugin {
     if (sub === undefined) return;
     const body = stanza.getChildText('body');
     if (body === null) return;
-    const msg = this.toMessage(sub.topic, {
-      archId,
-      from,
-      body,
-      stamp: stanza.getChild('delay', NS_DELAY)?.attrs.stamp,
-    });
+    const msg = this.toMessage(sub.topic, { archId, from, body, stamp: roomStamp(stanza, room) });
     for (const h of sub.handlers) {
       try {
         h(msg);

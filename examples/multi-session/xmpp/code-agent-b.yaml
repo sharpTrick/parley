@@ -14,7 +14,7 @@ permissions:
 
 # Run with: parley-xmpp --config <this file>   (the binary selects the backend)
 backend_config:
-  service: "xmpp://xmpp.internal:5222"   # identical to code-agent-a.yaml
+  service: "xmpps://xmpp.internal:5223"  # identical to code-agent-a.yaml
   domain: "parley.local"                  # identical
   muc_service: "muc.parley.local"         # identical
   username: "parley"                       # identical — fine, see code-agent-a.yaml's nick note
