@@ -26,7 +26,10 @@ export const SERVER_CONSTRAINTS = {
   /**
    * `zerver/lib/request.py` defaults: a client that does not opt out gets RENDERED HTML content
    * (`apply_markdown`), the anchor message included in a narrowed read (`include_anchor`), and a
-   * blocking events poll (`dont_block`). Each default is the WRONG value for this bridge.
+   * blocking events poll (`dont_block`). The first two are the WRONG value for this bridge; the third
+   * already IS the value it wants, which is why a flag cannot be graded by behaviour alone — a
+   * default that coincides with the bridge's choice makes omitting the flag indistinguishable from
+   * sending it, until the day the server flips the default.
    */
   requestFlagDefaults: { apply_markdown: 'true', include_anchor: 'true', dont_block: 'false' },
 } as const;
@@ -131,6 +134,11 @@ export interface FakeZulip {
   failNextMessagesRead(): void;
   /** Make the next `n` `GET /api/v1/messages` reads fail with a 502, then behave normally. */
   failMessagesReads(n: number): void;
+  /**
+   * How many injected history-read failures the fake has actually SERVED. A test that arms one can
+   * assert its fault was exercised rather than armed for a read the code under test never issues.
+   */
+  servedMessagesReadFailures(): number;
   /** Fail every request on `route` (e.g. `GET /api/v1/events`) until cleared. */
   failRoute(route: string, failure: RouteFailure): void;
   /** Accept every request on `route` and never answer it — an unreachable-but-open server. */
@@ -146,6 +154,12 @@ export interface FakeZulip {
   clearRouteFailures(): void;
   /** How many requests the fake has served for `route`. */
   requestCount(route: string): number;
+  /**
+   * The query and form parameters of every request received on `route`, in order — what the client
+   * actually put on the wire, which is the only way to grade a flag whose server default happens to
+   * equal the value the client wants.
+   */
+  sentParams(route: string): Array<Record<string, string>>;
   /** Called right after each request is answered — the injection point for handshake races. */
   setResponseHook(hook: ((route: string) => void) | undefined): void;
   /** Deliver a message without going through the plugin (a third party posting concurrently). */
@@ -173,11 +187,13 @@ export async function startFakeZulip(opts?: {
   let msgSeq = 0;
   let queueSeq = 0;
   let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
+  let failMessagesReadsServed = 0;
   const routeFailures = new Map<string, RouteFailure>();
   const rateLimits = new Map<string, RateLimit>();
   const routeDelays = new Map<string, number>();
   const hangRoutes = new Set<string>();
   const requestCounts = new Map<string, number>();
+  const requestParams = new Map<string, Array<Record<string, string>>>();
   let responseHook: ((route: string) => void) | undefined;
   const messages: WireMessage[] = []; // ascending by id by construction
   const queues = new Map<string, Queue>();
@@ -252,6 +268,8 @@ export async function startFakeZulip(opts?: {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://fake');
     const route = `${req.method} ${url.pathname}`;
+    const sent: Record<string, string> = Object.fromEntries(url.searchParams);
+    requestParams.set(route, [...(requestParams.get(route) ?? []), sent]);
 
     // Every real Zulip endpoint requires Basic auth for a REAL account; the sender is stamped from it.
     const auth = parseBasicAuth(req);
@@ -293,6 +311,7 @@ export async function startFakeZulip(opts?: {
       return;
     }
     const form = new URLSearchParams(await readBody(req));
+    Object.assign(sent, Object.fromEntries(form));
 
     switch (route) {
       case 'POST /api/v1/messages': {
@@ -311,6 +330,7 @@ export async function startFakeZulip(opts?: {
         // Injected transient failure: a proxy 502 on the history read (gap-fill / fetchRecent).
         if (failMessagesReadsRemaining > 0) {
           failMessagesReadsRemaining--;
+          failMessagesReadsServed++;
           json(res, 502, { result: 'error', msg: 'Bad gateway' });
           return;
         }
@@ -447,6 +467,7 @@ export async function startFakeZulip(opts?: {
     failMessagesReads: (n: number) => {
       failMessagesReadsRemaining = n;
     },
+    servedMessagesReadFailures: () => failMessagesReadsServed,
     failRoute: (route, failure) => {
       routeFailures.set(route, { ...failure });
       for (const q of queues.values()) dropWaiter(q, true);
@@ -461,6 +482,7 @@ export async function startFakeZulip(opts?: {
       hangRoutes.clear();
     },
     requestCount: (route) => requestCounts.get(route) ?? 0,
+    sentParams: (route) => [...(requestParams.get(route) ?? [])],
     setResponseHook: (hook) => {
       responseHook = hook;
     },

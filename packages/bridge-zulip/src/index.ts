@@ -20,6 +20,7 @@ import {
   fetchWithRetry,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
+import { isIPv4, isIPv6 } from 'node:net';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -118,8 +119,7 @@ const BLOCKED_FETCH_RETRY_MS = 400;
  * long-poll: an aborted-but-uncapped poll reads to the loop as a backend failure, and the whole
  * documented `events_timeout_ms` range above 30s would degrade into escalating backoff instead.
  */
-export const longPollDeadlineMs = (blockMs: number): number =>
-  Math.max(0, blockMs) + DEFAULT_DEADLINE_MS;
+const longPollDeadlineMs = (blockMs: number): number => Math.max(0, blockMs) + DEFAULT_DEADLINE_MS;
 
 /** Largest offset `Date` can represent; past it `toISOString()` throws a RangeError. */
 const MAX_TIMESTAMP_MS = 8.64e15;
@@ -183,7 +183,11 @@ export class ZulipPlugin implements BackendPlugin {
    * event queue for the topic.
    */
   private readonly waiters = new Map<Topic, TopicWaiters>();
-  /** Wire topic → the one Parley topic that claimed it, so a case-fold collision fails fast. */
+  /**
+   * Wire topic → the one Parley topic that claimed it by WRITING there, so a case-fold collision
+   * fails fast. Only `post` and `subscribe` claim: a read addresses history it did not create, and a
+   * registry a read can write is a namespace any caller-supplied topic name can take hostage.
+   */
   private readonly claimedWireTopics = new Map<string, Topic>();
   /**
    * Releases for every in-flight timed wait — blocking-fetch waits of both kinds and a push loop's
@@ -241,6 +245,7 @@ export class ZulipPlugin implements BackendPlugin {
   async disconnect(): Promise<void> {
     this.stopped = true;
     this.generation++;
+    this.claimedWireTopics.clear();
     this.teardown.abort();
     for (const abort of this.pendingAborts) abort();
     this.pendingAborts.clear();
@@ -313,7 +318,7 @@ export class ZulipPlugin implements BackendPlugin {
   ): Promise<BackendMsgId> {
     this.require();
     const res = await this.http('POST', '/api/v1/messages', {
-      form: { type: 'stream', to: this.stream, topic: this.wireTopic(topic), content },
+      form: { type: 'stream', to: this.stream, topic: this.claimWireTopic(topic), content },
     });
     const id = ((await res.json()) as { id?: number } | null)?.id;
     if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
@@ -432,7 +437,7 @@ export class ZulipPlugin implements BackendPlugin {
     // otherwise a wait the caller never asked for, ahead of the wait it did.
     const bound = this.deadlineAbort(deadline);
     try {
-      reg = await this.register(topic, bound.signal);
+      reg = await this.register(this.wireTopic(topic), bound.signal);
     } catch {
       return { waited: this.pause(deadline), ...noop };
     } finally {
@@ -545,9 +550,10 @@ export class ZulipPlugin implements BackendPlugin {
     const generation = this.generation;
     const signal = this.teardown.signal;
     const alive = (): boolean => !this.stopped && this.generation === generation;
+    const wire = this.claimWireTopic(topic);
     const tail = await this.fetchMessages(topic, undefined, 1);
     let lastDeliveredId = Number(tail.at(-1)?.backendMsgId ?? '0');
-    const reg = await this.register(topic);
+    const reg = await this.register(wire);
     const state: QueueState = { queueId: reg.queue_id };
     if (!alive()) {
       await this.deleteQueue(reg.queue_id);
@@ -570,6 +576,13 @@ export class ZulipPlugin implements BackendPlugin {
     let degraded = false;
     /** Whether `state.queueId` has ever answered an events poll — the only proof push works. */
     let queueProven = false;
+    /**
+     * Whether the next poll asks the server to PARK. Cleared by a cap so the poll after one asks for
+     * whatever is queued right now: our own cap aborts a healthy idle park and a black-holed one
+     * without a byte either way, and a non-blocking poll — which a live server must answer at once —
+     * is the only thing that tells them apart.
+     */
+    let parking = true;
     const deliver = (m: Message): void => {
       if (!alive()) return;
       try {
@@ -652,13 +665,14 @@ export class ZulipPlugin implements BackendPlugin {
         capped = true;
         controller.abort();
       }, this.eventsTimeoutMs);
+      const parked = parking;
       let json: EventsResponse;
       try {
         const res = await this.http('GET', '/api/v1/events', {
           query: {
             queue_id: state.queueId,
             last_event_id: String(lastEventId),
-            dont_block: 'false',
+            dont_block: parked ? 'false' : 'true',
           },
           signal: controller.signal,
           allowStatuses: [400],
@@ -667,25 +681,30 @@ export class ZulipPlugin implements BackendPlugin {
         json = ((await res.json()) as EventsResponse | null) ?? {};
       } catch {
         if (!alive()) return false;
-        // Keep the `capped` branch, so that the healthy idle poll cap is never mistaken for a
-        // failure and escalated into backoff on every long-poll cycle. A server that PARKED the
-        // poll long enough to be capped accepted the queue — a stale one is rejected at once.
-        if (capped) {
-          queueProven = true;
-          recovered();
-        } else await backoff('events long-poll failed');
+        // Keep the cap of a PARKED poll off the failure path, so that the healthy idle cap is never
+        // escalated into backoff on every long-poll cycle. A poll that asked for what is already
+        // queued has no such excuse: capping THAT one is a server producing no bytes at all.
+        if (capped && parked) parking = false;
+        else {
+          await backoff(
+            capped
+              ? 'an events poll asking for the queue as it stands produced no response'
+              : 'events long-poll failed',
+          );
+        }
         return true;
       } finally {
         clearTimeout(timer);
         this.controllers.delete(controller);
       }
+      parking = true;
       if (!alive()) return false;
       if (json.result === 'error') {
         if (json.code === 'BAD_EVENT_QUEUE_ID') {
           // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
           try {
             const superseded = state.queueId;
-            const fresh = await this.register(topic, signal);
+            const fresh = await this.register(wire, signal);
             this.deleteQueueDetached(superseded);
             state.queueId = fresh.queue_id;
             lastEventId = fresh.last_event_id;
@@ -706,9 +725,17 @@ export class ZulipPlugin implements BackendPlugin {
         return true;
       }
       queueProven = true;
+      const events = asArray(json.events);
+      // A parked poll answers with an event or a heartbeat; keep the empty answer paced, so that a
+      // server which ignores `dont_block=false` — or hands back a body carrying no events at all —
+      // cannot turn the loop into a flat-out request flood that still grades itself healthy.
+      if (parked && events.length === 0) {
+        await backoff('an events poll that asked to park answered with no events');
+        return true;
+      }
       recovered();
       let sawMessage = false;
-      for (const ev of asArray(json.events)) {
+      for (const ev of events) {
         if (typeof ev?.id === 'number' && ev.id > lastEventId) lastEventId = ev.id; // ack heartbeats too
         if (ev?.type !== 'message') continue;
         const m = zulipToMessage(topic, ev.message);
@@ -805,6 +832,17 @@ export class ZulipPlugin implements BackendPlugin {
           'matches topics case-insensitively, so they would share one history. Rename one.',
       );
     }
+    return wire;
+  }
+
+  /**
+   * The Zulip topic a WRITE addresses: `post`'s send and `subscribe`'s queue are the durable state a
+   * case-fold collision would merge, so they are the only paths that claim the wire name. Keep reads
+   * out of here, so that reading a case variant of a configured topic cannot make every later write
+   * to that topic fail for the life of the process.
+   */
+  private claimWireTopic(topic: Topic): string {
+    const wire = this.wireTopic(topic);
     this.claimedWireTopics.set(wire, topic);
     return wire;
   }
@@ -853,11 +891,13 @@ export class ZulipPlugin implements BackendPlugin {
       if (since === undefined) out.unshift(...got);
       else out.push(...got);
       remaining -= got.length;
-      const edge = since === undefined ? got[0] : got.at(-1);
-      // Keep this on the RAW count, so that dropping one unusable record cannot be mistaken for the
-      // end of history and silently truncate the window a caller asked for.
-      if (raw.length < page || edge === undefined) break;
-      anchor = String(edge.cursor);
+      // Keep BOTH the termination and the next anchor on the RAW page, so that dropping records —
+      // even every record of a page — cannot be mistaken for the end of history and silently
+      // truncate the window a caller asked for.
+      if (raw.length < page) break;
+      const next = pageAnchor(since === undefined ? raw[0] : raw.at(-1), anchor, since === undefined);
+      if (next === undefined) break;
+      anchor = next;
       includeAnchor = false;
     }
     return out;
@@ -865,7 +905,7 @@ export class ZulipPlugin implements BackendPlugin {
 
   /** Register a `<stream, topic>`-narrowed message event queue; its birth is the topic's tail. */
   private async register(
-    topic: Topic,
+    wireTopic: string,
     signal?: AbortSignal,
   ): Promise<{ queue_id: string; last_event_id: number }> {
     const res = await this.http('POST', '/api/v1/register', {
@@ -874,7 +914,7 @@ export class ZulipPlugin implements BackendPlugin {
         event_types: JSON.stringify(['message']),
         narrow: JSON.stringify([
           ['stream', this.stream],
-          ['topic', this.wireTopic(topic)],
+          ['topic', wireTopic],
         ]),
         apply_markdown: 'false',
       },
@@ -972,16 +1012,50 @@ export class ZulipPlugin implements BackendPlugin {
   }
 }
 
+/**
+ * The anchor that walks past the page just read, taken from the RAW edge record so that a page whose
+ * every record was unusable still advances. `undefined` when the edge carries no id that moves the
+ * anchor in the direction of travel — keep that guard, so that a server answering with an unmoving
+ * id cannot spin the read on one page forever.
+ */
+function pageAnchor(
+  edge: ZulipMessage | undefined,
+  from: string,
+  backwards: boolean,
+): string | undefined {
+  const id = edge?.id;
+  if (typeof id !== 'number' || !Number.isFinite(id)) return undefined;
+  const current = Number(from);
+  if (Number.isFinite(current) && (backwards ? id >= current : id <= current)) return undefined;
+  return String(id);
+}
+
 /** True when the URL would put the Basic-auth credential on the wire in the clear. */
 function isPlaintextRemote(baseUrl: string): boolean {
   try {
     const { protocol, hostname } = new URL(baseUrl);
-    if (protocol !== 'http:') return false;
-    const host = hostname.replace(/^\[|]$/g, '');
-    return !(host === 'localhost' || host === '::1' || /^127\./.test(host));
+    return protocol === 'http:' && !isLoopbackHost(hostname);
   } catch {
     return false;
   }
+}
+
+/**
+ * Loopback iff the host is exactly `localhost` or a literal `127.0.0.0/8` / `::1` address. Keep this a
+ * parse rather than a prefix match, so that a resolvable DNS name shaped like an address —
+ * `127.0.0.1.example.com`, `localhost.example.com` — is classified by what it is and still gets the
+ * plaintext-credential warning. Anything else, including an IPv4-mapped spelling of a loopback
+ * address, counts as remote: an unproven host is warned about rather than excused.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
+  if (host === 'localhost') return true;
+  if (isIPv4(host)) return host.startsWith('127.');
+  if (!isIPv6(host)) return false;
+  const groups = host.split(':');
+  const tail = groups.pop() ?? '';
+  if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
+  return Number.parseInt(tail, 16) === 1;
 }
 
 /**

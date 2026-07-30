@@ -143,6 +143,59 @@ describe('zulip topic case folding vs the topic allowlist', () => {
     });
   }
 
+  /**
+   * Which call touches a variant FIRST decides nothing about who owns the wire name: only a WRITE
+   * claims it. A read addresses history it did not create, so a read of a variant — a topic name the
+   * model chooses, which a widened `post_topics` pattern need not have configured — must never be
+   * able to disable the configured topic's own writes for the life of the process.
+   */
+  const PATHS = ['post', 'subscribe', 'fetchRecent'] as const;
+  const touch = async (
+    plugin: Awaited<ReturnType<typeof boot>>['plugin'],
+    path: (typeof PATHS)[number],
+    topic: ReturnType<typeof asTopic>,
+  ): Promise<void> => {
+    if (path === 'post') await plugin.post(topic, SENDER, 'x');
+    else if (path === 'subscribe') await plugin.subscribe(topic, () => undefined);
+    else await plugin.fetchRecent({ topic });
+  };
+  const CLAIMS: Record<(typeof PATHS)[number], boolean> = {
+    post: true,
+    subscribe: true,
+    fetchRecent: false,
+  };
+
+  for (const first of PATHS) {
+    for (const second of PATHS) {
+      const verdict = CLAIMS[first] ? 'is refused' : 'still works';
+      it(`${second} on the configured topic after ${first} on a case variant ${verdict}`, async () => {
+        const { plugin } = await boot();
+        const configured = asTopic(`tmp-a-${rand()}`);
+        const variant = asTopic(configured.toUpperCase());
+
+        await touch(plugin, first, variant);
+        const call = touch(plugin, second, configured);
+        if (CLAIMS[first]) {
+          await expect(call).rejects.toThrow(/collision/i);
+          return;
+        }
+        await call;
+        await plugin.post(configured, SENDER, 'y');
+        expect((await plugin.fetchRecent({ topic: configured })).messages.at(-1)?.content).toBe('y');
+      });
+    }
+  }
+
+  it('a read of many case variants leaves every configured topic writable', async () => {
+    const { plugin } = await boot();
+    const configured = Array.from({ length: 40 }, () => asTopic(`bulk-${rand()}`));
+    for (const topic of configured) await plugin.fetchRecent({ topic: asTopic(topic.toUpperCase()) });
+    for (const topic of configured) await plugin.post(topic, SENDER, 'x');
+    for (const topic of configured) {
+      expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual(['x']);
+    }
+  });
+
   for (const script of ['ops', 'αρετη', 'алфа']) {
     it(`a third party's upper-case ${JSON.stringify(script)} lands in the SAME Parley topic`, async () => {
       const { plugin, fake } = await boot();

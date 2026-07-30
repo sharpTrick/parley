@@ -36,20 +36,33 @@ runConformanceSuite('zulip', fakeServerPass);
  * straddle the page boundary with where the failure lands, and asserts exactly-once by counting
  * DISTINCT ids against deliveries, so a duplicate fails instead of being absorbed by an
  * order-and-content comparison.
+ *
+ * A failure point is only generated for a window with enough pages to REACH it, and every row
+ * asserts the fault it injected was actually served: a row whose precondition its own crossed
+ * dimension cannot satisfy is a near-copy of "nothing" that pays full setup cost and grades nothing,
+ * so it must fail rather than pass.
  */
 describe('zulip queue GC recovery', () => {
   const DEAD_WINDOWS = [3, GAP_FILL_PAGE, GAP_FILL_PAGE + 100, 2 * GAP_FILL_PAGE + 1];
 
+  /**
+   * History reads a clean gap-fill of `window` messages issues: one per full page, plus a final read
+   * that comes back short (empty when the window divides evenly into pages) and ends the walk.
+   */
+  const cleanReads = (window: number): number =>
+    window % GAP_FILL_PAGE === 0 ? window / GAP_FILL_PAGE + 1 : Math.ceil(window / GAP_FILL_PAGE);
+
   const FAILURE_POINTS = [
-    { name: 'nothing', failsAfter: () => false },
-    { name: 'the read after the 1st page', failsAfter: (n: number) => n === 1 },
-    { name: 'the read after the 2nd page', failsAfter: (n: number) => n === 2 },
-    { name: 'the read after the 3rd page', failsAfter: (n: number) => n === 3 },
-    { name: 'every other read', failsAfter: (n: number) => n % 2 === 1 },
+    { name: 'nothing', after: 0, failsAfter: () => false },
+    { name: 'the read after the 1st page', after: 1, failsAfter: (n: number) => n === 1 },
+    { name: 'the read after the 2nd page', after: 2, failsAfter: (n: number) => n === 2 },
+    // Arms after every odd read, so a window with more pages keeps re-arming as the walk resumes.
+    { name: 'every other read', after: 1, failsAfter: (n: number) => n % 2 === 1 },
   ];
 
   for (const deadWindow of DEAD_WINDOWS) {
-    for (const point of FAILURE_POINTS) {
+    // A failure armed after the LAST clean read fires on a read the gap-fill never issues.
+    for (const point of FAILURE_POINTS.filter((p) => p.after < cleanReads(deadWindow))) {
       it(`replays ${deadWindow} dead-window message(s) exactly once with ${point.name} failing`, async () => {
         const { plugin, fake } = await boot();
         const topic = asTopic(`gc-${rand()}`);
@@ -85,9 +98,37 @@ describe('zulip queue GC recovery', () => {
 
         expect(got.map((m) => m.content)).toEqual(expected);
         expect(new Set(got.map((m) => m.backendMsgId)).size).toBe(got.length);
+        expect(fake.servedMessagesReadFailures() > 0).toBe(point.after > 0);
       }, 60_000);
     }
   }
+
+  /**
+   * A dead window can be a whole page of records the plugin cannot use — their `id` is both its dedup
+   * key and its cursor. Dropping them all must still walk the anchor past them, or the gap-fill
+   * reports the gap CLOSED at the old watermark and everything behind them is never pushed and never
+   * retried. No `limit`-based read case can reach this: only the gap-fill sizes its own page.
+   */
+  it('replays what is behind a full page of unusable records in the dead window', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`gc-unusable-${rand()}`);
+    const got: Message[] = [];
+    await plugin.subscribe(topic, (m) => got.push(m));
+
+    await plugin.post(topic, SENDER, 'before');
+    await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 5000, interval: 10 });
+
+    fake.expireQueues();
+    for (let i = 0; i < GAP_FILL_PAGE; i++) fake.injectRaw({ topic, fields: { id: 1.5 + i } });
+    const behind = ['u0', 'u1', 'u2'];
+    for (const content of behind) fake.injectMessage({ topic, content });
+
+    await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(['before', ...behind]), {
+      timeout: 30_000,
+      interval: 10,
+    });
+  }, 60_000);
 
   /**
    * The gap-fill's per-page wake is the ONLY edge a blocked `fetchRecent` piggybacking on a

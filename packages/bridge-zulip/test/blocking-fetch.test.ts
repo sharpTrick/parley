@@ -2,8 +2,10 @@
  * A blocking `fetchRecent` must wake from whatever primitive is available at that moment — a live
  * subscribe loop's queue when one is draining the topic, its own short-lived queue when not, and a
  * paced retry when the server offers no push at all. The table walks every state a subscription can
- * be in while a caller is blocked on the same topic; the class it guards is that NONE of them
- * silently costs the caller its whole budget.
+ * be in while a caller is blocked on the same topic, crossing the ways a loop can lose its ability
+ * to deliver — answering with an error, answering with nothing usable, and never answering at all.
+ * The class it guards is that a caller NEVER parks behind a loop that cannot wake it: a loop that is
+ * not delivering must stop being advertised as piggyback-able, so the fetch opens its own queue.
  */
 import { asTopic, type Cursor } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
@@ -20,8 +22,18 @@ const REGISTER = 'POST /api/v1/register';
 interface LoopState {
   name: string;
   prepare: (pair: ZulipPair, topic: string) => Promise<void>;
-  /** True when a live loop's queue must carry the wake — no second queue may be opened. */
+  /**
+   * True when a live loop's queue must carry the wake — no second queue may be opened. False is the
+   * other half of the same claim and is asserted just as hard: the fetch must open a queue of its
+   * OWN, because a loop that cannot deliver must not be advertised as piggyback-able.
+   */
   reusesTheLoopQueue: boolean;
+  /**
+   * How long the wake may take. Only a state where NO wake edge exists anywhere — the server accepts
+   * every `/events` poll and answers none, so the fetch's own queue is as mute as the loop's — is
+   * allowed the whole budget; everything else has a live edge and must use it.
+   */
+  wakesWithin?: number;
 }
 
 const LOOP_STATES: LoopState[] = [
@@ -67,6 +79,27 @@ const LOOP_STATES: LoopState[] = [
     reusesTheLoopQueue: false,
   },
   {
+    // The one fault that never yields a status code: our own long-poll cap is the only thing that
+    // ends the request, so a loop grading itself on that cap alone would look healthy forever.
+    name: "a loop whose /events is a black hole (accepted, never answered)",
+    prepare: async ({ plugin, fake }, topic) => {
+      await plugin.subscribe(asTopic(topic), () => undefined);
+      fake.hangRoute('GET /api/v1/events');
+      await sleep(1200); // past two full events_timeout_ms caps
+    },
+    reusesTheLoopQueue: false,
+    wakesWithin: BLOCK_MS + 700,
+  },
+  {
+    name: 'a loop answering /events 200 with a body carrying no events',
+    prepare: async ({ plugin, fake }, topic) => {
+      await plugin.subscribe(asTopic(topic), () => undefined);
+      fake.failRoute('GET /api/v1/events', { status: 200, body: { result: 'success' } });
+      await sleep(600);
+    },
+    reusesTheLoopQueue: false,
+  },
+  {
     name: 'a loop whose queue was GCd, re-registering and gap-filling',
     prepare: async ({ plugin, fake }, topic) => {
       await plugin.subscribe(asTopic(topic), () => undefined);
@@ -95,7 +128,8 @@ const LOOP_STATES: LoopState[] = [
 
 describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe loop is in', () => {
   for (const state of LOOP_STATES) {
-    it(`wakes within ${PROMPT_MS}ms of a concurrent post with ${state.name}`, async () => {
+    const within = state.wakesWithin ?? PROMPT_MS;
+    it(`wakes within ${within}ms of a concurrent post with ${state.name}`, async () => {
       const pair = await boot();
       const { plugin, fake } = pair;
       const topic = asTopic(`wake-${rand()}`);
@@ -111,10 +145,12 @@ describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe
 
       expect(res.messages.map((m) => m.content)).toEqual(['late']);
       expect(res.nextCursor).not.toBe(tail);
-      expect(Date.now() - started).toBeLessThan(PROMPT_MS);
-      if (state.reusesTheLoopQueue) {
-        expect(fake.requestCount(REGISTER) - queuesBefore).toBe(0);
-      }
+      expect(Date.now() - started).toBeLessThan(within);
+      // Both directions, so that "did not piggyback" cannot be satisfied by doing nothing: a healthy
+      // loop must carry the wake on its own queue, and an unhealthy one must have handed the fetch
+      // back its own.
+      const opened = fake.requestCount(REGISTER) - queuesBefore;
+      expect(opened === 0, `${opened} queue(s) opened`).toBe(state.reusesTheLoopQueue);
     });
   }
 

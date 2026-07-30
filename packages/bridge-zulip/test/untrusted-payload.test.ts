@@ -11,6 +11,10 @@
  * says it cannot hold, so a field added to the wire type meets the whole hazard list by adding one
  * name; the push case then drives the same gauntlet through a LIVE event queue, because the read
  * path and the loop normalize the record at two different call sites.
+ *
+ * Dropping a record must also never truncate the read: the second table crosses the unusable-`id`
+ * shapes with the caller's `limit`, because a page is only full — and the pagination anchor only
+ * load-bearing — when the records dropped fill the page the caller asked for.
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
@@ -74,6 +78,40 @@ describe('a hostile record shape never throws out of fetchRecent', () => {
         expect(after.messages, where).toEqual([]);
       }
     }, 20_000);
+  }
+
+  /**
+   * `id` shapes the plugin cannot use as a cursor that still ORDER after the history behind them, so
+   * a whole page can consist of them. A shape that mangles the record's order too (a negative or
+   * non-numeric id) cannot model a page — Zulip ids are monotonic — so those stay in the sweep above.
+   */
+  const UNUSABLE_IDS = [
+    { name: 'fractional', value: 1.5 },
+    { name: 'past the safe-integer range', value: 1e18 },
+  ];
+
+  /** Small enough to be served whole, and one of them equals the page the caller asked for. */
+  const AHEAD = [1, 3];
+
+  for (const shape of UNUSABLE_IDS) {
+    for (const ahead of AHEAD) {
+      for (const limit of [1, 2, 100]) {
+        it(`limit ${limit} reads past ${ahead} record(s) whose \`id\` is ${shape.name}`, async () => {
+          vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+          const { plugin, fake } = await boot();
+          const topic = asTopic(`unusable-${rand()}`);
+          await plugin.post(topic, SENDER, 'behind');
+          for (let i = 0; i < ahead; i++) {
+            fake.injectRaw({ topic, fields: { id: shape.value + i } });
+          }
+
+          const { messages, nextCursor } = await plugin.fetchRecent({ topic, limit });
+          expect(messages.map((m) => m.content)).toEqual(['behind']);
+          expect(Number(nextCursor)).toBeGreaterThan(0);
+          expect((await plugin.fetchRecent({ topic, since: nextCursor })).messages).toEqual([]);
+        });
+      }
+    }
   }
 
   it('a messages response that is not an object with an array under `messages` reads as empty', async () => {

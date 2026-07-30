@@ -22,8 +22,39 @@ const BAD_QUEUE = {
  */
 const LOOP_ROUTES = ['POST /api/v1/register', 'GET /api/v1/events', 'GET /api/v1/messages'] as const;
 
-/** Ways the push loop can fail forever — none of them is recoverable by retrying harder. */
-const PERMANENT_FAILURES = [
+/**
+ * Ways the push loop can stop making progress forever — none of them recoverable by retrying harder.
+ * The dimension is deliberately wider than "ways to get an error status": the failures that carry no
+ * status code at all — a poll that is accepted and never answered, or answered with a body carrying
+ * nothing — are the ones a loop grading itself on its own client-side abort cannot see.
+ */
+const PERMANENT_FAILURES: Array<{
+  name: string;
+  counted: (typeof LOOP_ROUTES)[number];
+  apply: (fake: FakeZulip) => void;
+  /** Wall clock the report must arrive inside; a fault with no status code takes a cycle to prove. */
+  observeMs?: number;
+}> = [
+  {
+    // The only failure mode that never yields a status code: the plugin's own long-poll cap is what
+    // ends the request, so a loop that reads its own abort as "the server parked for us" is blind.
+    name: 'the server accepts every /events poll and never answers it',
+    counted: 'GET /api/v1/events',
+    apply: (fake: FakeZulip) => fake.hangRoute('GET /api/v1/events'),
+    observeMs: 5000,
+  },
+  {
+    name: 'every /events poll is answered 200 with a body carrying no events',
+    counted: 'GET /api/v1/events',
+    apply: (fake: FakeZulip) =>
+      fake.failRoute('GET /api/v1/events', { status: 200, body: { result: 'success' } }),
+  },
+  {
+    name: 'every /events poll is answered 200 with an unparseable body',
+    counted: 'GET /api/v1/events',
+    apply: (fake: FakeZulip) =>
+      fake.failRoute('GET /api/v1/events', { status: 200, body: { events: 'not-an-array' } }),
+  },
   {
     name: 'the api key was revoked (401 on /events)',
     counted: 'GET /api/v1/events',
@@ -94,7 +125,7 @@ describe('zulip push loop backs off and reports when it fails permanently', () =
 
       const before = new Map(LOOP_ROUTES.map((r) => [r, fake.requestCount(r)]));
       mode.apply(fake);
-      await sleep(3000);
+      await sleep(mode.observeMs ?? 3000);
       const attempts = new Map(
         LOOP_ROUTES.map((r) => [r, fake.requestCount(r) - (before.get(r) ?? 0)]),
       );
