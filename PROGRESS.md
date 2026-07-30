@@ -6,8 +6,8 @@
 
 ## Status
 
-- **Phase (adversarial review — the Careening experiment):** rounds 1–7 complete and pushed on
-  `claude/next-steps-q1540r`. Full suite **8847 tests, 4 skipped, green**, against real Redis, NATS,
+- **Phase (adversarial review — the Careening experiment):** rounds 1–8 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **9706 tests, 4 skipped, green**, against real Redis, NATS,
   Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
 
   Findings per round (14 targets each, 0 errored every round):
@@ -21,6 +21,7 @@
   | 5 | 129 | 117 | 39 | 60% | 72% |
   | 6 | 90 | 86 | 26 | 80% | 81% |
   | 7 | 79 | 75 | 23 | 66% | 57% |
+  | 8 | 73 | 71 | 25 | 56% | 62% |
 
   Round 6 was the first round where every count fell at once — findings 129→90, CONFIRMED 117→86,
   blocking 39→26 — while self-induction rose to 80%, and I read that as the loop running out of
@@ -34,7 +35,31 @@
   60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
   measured, it was not saturation.
 
-  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847**.
+  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706**.
+
+  **Round 8 changed the frozen seam for the first time**, on Patrick's adjudication. `seam.ts` said
+  `blockMs` engages "only relative to a `since`"; core's long-poll wrapper, the `parley_fetch_recent`
+  tool description and the conformance suite all said the opposite, and eight of ten backends already
+  behaved the other way. The frozen file was the minority report. It matters because a since-less read
+  is the FIRST call of every session — the one an agent makes before it holds a cursor.
+
+  **Round 8's saturation signal is package-local, not global.** core-auth's critic ran 27 mutations
+  over its whole surface — unbinding `redirect_uri` at `/token`, dropping the RFC 8707 audience check,
+  deleting the empty-passphrase guard, 24 more — and the existing suite caught **all 27**, so it filed
+  no test-integrity and no test-hygiene finding at all. That is what a package with no vacuous tests
+  looks like under this protocol, on the deepest security surface in the repo, after eight rounds.
+
+  **Two more process defects, both produced BY this protocol's own advice.** The stash stack lives in
+  the common git dir, so two agents restored each other's work into the wrong worktrees; and
+  `git checkout -- <file>`, which the protocol recommended for undoing a mutation, restores from the
+  round base and wiped three agents' in-progress fixes. Both are round 7's `index.ts.bak` collision
+  one level down: isolation that holds for the working tree and silently does not below it.
+
+  **A measurement trap worth remembering.** A matrix conformance timing failure looked like it was
+  caused by the seam change; it reproduced identically at HEAD without the change, and vanished on a
+  recreated Synapse. The shared homeserver degrades from accumulated EVENTS, not just joined rooms —
+  the joined-room count used as a proxy in round 7 read a healthy 10 throughout. Recreate the server and
+  re-measure before attributing a live-server timing change to a diff.
 
   **Round 7's themes.** Fixture fidelity persisted from round 6 and stayed the most productive lens:
   nats' fake modelled foreignness with a boolean instead of the subject, so deleting `filter_subject`
