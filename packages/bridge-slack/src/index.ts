@@ -76,7 +76,7 @@ const ABSENT_ON_WRITE = ['channel_not_found'];
 /**
  * First and maximum rung of the degraded-Socket-Mode ladder: the cooldown between poll-driven
  * `apps.connections.open` dials, and the interval at which a blocked `fetchRecent` re-reads
- * `conversations.history` while the live stream is not yet serving it.
+ * `conversations.history` for as long as the live stream has delivered it nothing.
  */
 export const DIAL_BACKOFF_MS = 500;
 export const MAX_DIAL_BACKOFF_MS = 5_000;
@@ -256,11 +256,10 @@ export class SlackPlugin implements BackendPlugin {
     this.connected = false;
     this.routes.clear();
     this.channelOwner.clear();
-    // Abort every blocked long-poll cleanly (clears their timers + registrations via wake()). Snapshot
-    // first — wake() mutates `waiters` — then clear so no timer/listener outlives the disconnect.
-    const pending = [...this.waiters.values()].flatMap((set) => [...set]);
+    // Abort every blocked long-poll cleanly (clears their timers + registrations via wake()); the
+    // `stopped` flag above stops any of them re-arming.
+    this.drainWaiters();
     this.waiters.clear();
-    for (const waiter of pending) waiter.wake();
     this.wsReady = undefined;
     if (this.ws !== undefined) {
       try {
@@ -321,14 +320,15 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * Hold a blocked `fetchRecent` for the caller's whole budget. Once the Socket Mode handshake
-   * lands, park on the shared stream. Until it does — a missing `app_token`, a failing handshake, a
-   * socket that accepts and stays silent — re-query `conversations.history` on the SAME capped
-   * ladder the dial cooldown uses, so that a message already durable in history is delivered on the
-   * next rung instead of being withheld until the deadline. Keep the whole wait HERE rather than
-   * returning an empty page the moment Socket Mode is unavailable, so that core's generic re-drive
-   * cannot turn one blocked `fetch_recent` into one `conversations.history` request per
-   * `block_poll_interval_ms` for the whole budget — a tiered method, on one channel.
+   * Hold a blocked `fetchRecent` for the caller's whole budget, parked on the shared Socket Mode
+   * stream and re-querying `conversations.history` on the SAME capped ladder the dial cooldown uses.
+   * Keep that ladder running whether or not the handshake lands, so that a message already durable
+   * in history is delivered on the next rung instead of being withheld to the deadline: a completed
+   * handshake is not proof the stream serves — an app with no `message.channels` subscription, or an
+   * `app_token` shared with another process, greets and then pushes nothing. Keep the whole wait
+   * HERE rather than returning an empty page the moment Socket Mode is unavailable, so that core's
+   * generic re-drive cannot turn one blocked `fetch_recent` into one `conversations.history` request
+   * per `block_poll_interval_ms` for the whole budget — a tiered method, on one channel.
    */
   private async blockForMessage(
     args: FetchRecentArgs,
@@ -338,28 +338,27 @@ export class SlackPlugin implements BackendPlugin {
     const aborted: FetchRecentResult = { messages: [], nextCursor: since };
     const channel = this.channelFor(args.topic);
     const sinceTs = String(since);
-    let rungMs = DIAL_BACKOFF_MS;
+    const startedAt = Date.now();
     while (!this.stopped) {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) break;
       // The handshake is bounded by `handshake_timeout_ms`, which may be far longer than one ladder
       // rung; bound the wait for it by the rung too, so that a socket which accepts and then says
       // nothing cannot hold the caller past the next history re-query.
-      const live = await withDeadline(this.ensurePollSocket(), Math.min(remaining, rungMs)).then(
-        () => true,
-        () => false,
-      );
+      await withDeadline(
+        this.ensurePollSocket(),
+        Math.min(remaining, nextRungIn(Date.now() - startedAt)),
+      ).catch(() => undefined);
       // A teardown that landed while the handshake ran leaves nothing to wait on, and `runFetch`
       // below would reject on the disconnected plugin; the caller gets its empty page instead.
       if (this.stopped) return aborted;
       // Keep the waiter armed BEFORE the re-query, so that a push landing while that query is in
       // flight is caught rather than lost — a lost wakeup here blocks for the whole budget. A rung
       // waiter is a waiter rather than a bare timer, so that `disconnect()` drains it.
-      const budget = deadlineAt - Date.now();
       const { wait, wake } = this.armWaiter(
         channel,
         sinceTs,
-        live ? budget : Math.min(budget, rungMs),
+        Math.min(deadlineAt - Date.now(), nextRungIn(Date.now() - startedAt)),
       );
       const requeried = await this.runFetch(args);
       if (requeried.messages.length > 0) {
@@ -367,8 +366,6 @@ export class SlackPlugin implements BackendPlugin {
         return requeried;
       }
       await wait;
-      if (live) break;
-      rungMs = Math.min(rungMs * 2, MAX_DIAL_BACKOFF_MS);
     }
     if (this.stopped) return aborted;
     return this.runFetch(args);
@@ -438,17 +435,11 @@ export class SlackPlugin implements BackendPlugin {
     const events = collected.sort((a, b) => compareTs(a.ts, b.ts));
     const window = resumeAfterSince ? events.slice(0, limit) : events.slice(-limit);
     const messages = window.map((m) => slackToMessage(args.topic, m, this.mentionMap));
-    return { messages, nextCursor: messages.at(-1)?.cursor ?? this.emptyCursor(args, newestSeenTs) };
-  }
-
-  /**
-   * The cursor for a window that surfaced nothing. Keep the `since` walk exhaustive (see
-   * {@link runFetch}), so that stepping the cursor past those unsurfaced entries cannot skip a
-   * message: it is safe only because every entry above `since` was seen and none was surfacable.
-   */
-  private emptyCursor(args: FetchRecentArgs, newestSeenTs: string | undefined): Cursor {
-    if (args.since !== undefined && newestSeenTs !== undefined) return asCursor(newestSeenTs);
-    return args.since ?? asCursor('0');
+    return {
+      messages,
+      nextCursor:
+        messages.at(-1)?.cursor ?? emptyCursor(args, newestSeenTs, pageCursor === undefined),
+    };
   }
 
   /**
@@ -541,8 +532,19 @@ export class SlackPlugin implements BackendPlugin {
     return this.authTestPromise;
   }
 
-  /** The shared socket, opened lazily on the first subscribe; resolves once `hello` is in. */
+  /**
+   * The shared socket, opened lazily on the first subscribe; resolves once `hello` is in. A
+   * reactive-only deployment configures no `app_token`, so the handshake can never be served; keep
+   * that named rejection HERE rather than in one caller, so that neither `subscribe` nor a blocked
+   * `fetchRecent` dials `apps.connections.open` — Slack's tightest-limit endpoint — to be answered
+   * `not_authed` every time, under an error naming neither `app_token` nor Socket Mode.
+   */
   private ensureSocket(): Promise<void> {
+    if (this.appToken === undefined) {
+      return Promise.reject(
+        new Error('Slack Socket Mode needs an app_token; this deployment has no live push'),
+      );
+    }
     if (this.wsReady === undefined) {
       const attempt = this.openSocket();
       this.wsReady = attempt;
@@ -571,14 +573,6 @@ export class SlackPlugin implements BackendPlugin {
    * `fetch_recent` into hundreds of `apps.connections.open` calls — Slack's tightest rate limit.
    */
   private ensurePollSocket(): Promise<void> {
-    // A reactive-only deployment configures no `app_token`, so the handshake can never be served;
-    // keep it from dialling at all, so that a blocked fetch spends its budget re-reading history
-    // rather than on `apps.connections.open` calls that are answered `not_authed` every time.
-    if (this.appToken === undefined) {
-      return Promise.reject(
-        new Error('Slack Socket Mode needs an app_token; this deployment has no live push'),
-      );
-    }
     if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
       return Promise.reject(
         new Error('Slack Socket Mode handshake backing off after a failed apps.connections.open'),
@@ -626,6 +620,17 @@ export class SlackPlugin implements BackendPlugin {
     set.add(waiter);
     this.waiters.set(channel, set);
     return { wait, wake: waiter.wake };
+  }
+
+  /**
+   * Release every parked long-poll (`wake()` mutates `waiters`, so snapshot both levels). Keep the
+   * loss of an ESTABLISHED socket calling this, so that a caller parked on a stream that has stopped
+   * serving falls back to the history ladder instead of holding its whole budget on a dead socket.
+   */
+  private drainWaiters(): void {
+    for (const set of [...this.waiters.values()]) {
+      for (const waiter of [...set]) waiter.wake();
+    }
   }
 
   private async openSocket(): Promise<void> {
@@ -679,6 +684,7 @@ export class SlackPlugin implements BackendPlugin {
         // handshake timeout or a websocket `error` — both of which settle it BEFORE the close they
         // cause — cannot be read as a live connection dropping and be handed a reconnect owner.
         if (!helloSeen) return;
+        this.drainWaiters();
         void this.reconnect();
       });
     });
@@ -834,6 +840,39 @@ export class SlackPlugin implements BackendPlugin {
       throw new Error('SlackPlugin not connected — call connect() first');
     }
   }
+}
+
+/**
+ * Time until the next rung of the degradation ladder, given how long a blocked call has been parked:
+ * rungs start at 0, {@link DIAL_BACKOFF_MS}, and each subsequent doubling capped at
+ * {@link MAX_DIAL_BACKOFF_MS}. Keep the position derived from WALL CLOCK rather than counted per
+ * iteration, so that an early wake (a socket loss draining the waiters) cannot advance the ladder and
+ * push the next history re-read further out than the rung it was due on.
+ */
+function nextRungIn(elapsedMs: number): number {
+  let at = 0;
+  let width = DIAL_BACKOFF_MS;
+  while (at + width <= elapsedMs) {
+    at += width;
+    width = Math.min(width * 2, MAX_DIAL_BACKOFF_MS);
+  }
+  return at + width - elapsedMs;
+}
+
+/**
+ * The cursor for a window that surfaced nothing. A walk that ran to cursor exhaustion saw every
+ * entry above its floor and surfaced none of them, so it may publish the newest one it read — on the
+ * no-`since` path as well, where standing still on `'0'` makes every later catch-up re-walk the whole
+ * channel. Keep the step gated on `exhausted`, so that a walk which stopped early can never advance
+ * the cursor over history it did not read.
+ */
+function emptyCursor(
+  args: FetchRecentArgs,
+  newestSeenTs: string | undefined,
+  exhausted: boolean,
+): Cursor {
+  if (exhausted && newestSeenTs !== undefined) return asCursor(newestSeenTs);
+  return args.since ?? asCursor('0');
 }
 
 /**

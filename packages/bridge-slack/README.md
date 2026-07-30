@@ -81,18 +81,22 @@ the other topic's name.
 only a backoff the bridge invents for itself is clamped, at `MAX_BACKOFF_MS` = 5 s. A stated hint
 that would not fit the call's `DEFAULT_DEADLINE_MS` = 30 s budget ends the call naming the figure
 rather than retrying sooner than Slack asked; a 429 with no usable hint waits
-`DEFAULT_BACKOFF_MS` = 500 ms. All three constants live in `@sharptrick/parley-net-util`. If the
-Socket Mode handshake is unavailable, a blocked `fetchRecent` does **not** hand the call straight back
-for core to re-drive: it holds the caller's `block_ms` and degrades to polling, re-reading
-`conversations.history` on a capped ladder that starts at `DIAL_BACKOFF_MS` = 500 ms and doubles to
-`MAX_DIAL_BACKOFF_MS` = 5 s, retrying the handshake on the same rungs. That matters for latency, not
-only cost: the message is already durable in history, so it is delivered on the **next rung** instead
-of being withheld until the deadline — which at the default `block_max_ms` of 60 s would be a minute
-of silent delay per message for as long as Socket Mode stayed unreachable. The reactive-only
-configuration is covered by the same ladder: with no `app_token` there is no handshake to attempt, so
-history is polled and nothing is dialled. One unavailable Socket Mode therefore costs O(log
-`block_ms`) reads and dials per blocked call rather than one of each per poll interval — both methods
-are separately rate-limited, and `conversations.history` is the tighter of the two.
+`DEFAULT_BACKOFF_MS` = 500 ms. All three constants live in `@sharptrick/parley-net-util`. A blocked
+`fetchRecent` does **not** hand the call straight back for core to re-drive when the live stream is
+not delivering: it holds the caller's `block_ms` and re-reads `conversations.history` on a capped
+ladder that starts at `DIAL_BACKOFF_MS` = 500 ms and doubles to `MAX_DIAL_BACKOFF_MS` = 5 s, retrying
+the handshake on the same rungs. That matters for latency, not only cost: the message is already
+durable in history, so it is delivered on the **next rung** instead of being withheld until the
+deadline — which at the default `block_max_ms` of 60 s would be a minute of silent delay per message.
+The ladder runs whether or not the handshake lands, because a completed handshake is not proof the
+stream serves: an app whose Event Subscriptions lack `message.channels`, or one whose `app_token` is
+shared with a second process (see *Multiple concurrent sessions*), greets and then pushes nothing.
+The reactive-only configuration is covered by the same ladder: with no `app_token` there is no
+handshake to attempt, so history is polled and nothing is dialled. One blocked call therefore costs
+about `4 + block_ms / MAX_DIAL_BACKOFF_MS` reads — **16 reads and dials at the default 60 s** — rather
+than one of each per poll interval. That count is **linear**, not logarithmic, in `block_ms` once the
+ladder reaches its cap: raising `catchup.block_max_ms` to ten minutes costs ~124 of each per blocked
+call. Both methods are separately rate-limited, and `conversations.history` is the tighter of the two.
 Only the loss of an **established** connection starts a reconnect loop, and
 only one such loop runs at a time; a handshake that never completed belongs to the caller that asked
 for it, so a failure cannot fan out into parallel redial loops.
@@ -161,16 +165,20 @@ targets public channels.)
 A real deployment is several configs — one per Claude Code session plus one for the remote/chat
 server — all pointed at the same workspace:
 
-- **`bot_token` / `app_token`** — **give every session its own bot** (its own app, or at least its
-  own bot user). Slack stamps the posting bot as the sender and `post` cannot override it, so
+- **`bot_token` / `app_token`** — **give every push-capable session its own Slack app** (its own
+  `app_token`; a second bot user inside one app is **not** enough — see the routing note below).
+  Slack stamps the posting bot as the sender and `post` cannot override it, so
   sessions sharing one bot token are indistinguishable on read-back: every session's messages arrive
   under the one bot id, so neither a human reading the channel nor an agent reasoning over
   `senderHandle` in its context can tell which session spoke. `parley_list_users` is **not** affected
   — a presence beat carries its emitter's handle inside the record and core keys the roster on that,
   with liveness scoped per random per-process instance id, so two sessions on one bot token still
-  appear as two peers with their own topics. Socket Mode also allows only ~10 concurrent connections
-  per app token; each plugin instance holds ONE, and every open socket receives **every** subscribed
-  event and filters locally.
+  appear as two peers with their own topics. Socket Mode allows ~10 concurrent connections per app
+  token and each plugin instance holds ONE, but the connections are **not** parallel copies of the
+  stream: Slack routes each payload to **exactly one** of an app's open connections, with no
+  guaranteed pattern. Two sessions sharing an `app_token` therefore each receive an arbitrary subset
+  of the live pushes — silent, per-session live-path loss that only catch-up repairs (the blocking
+  `fetch_recent` ladder above bounds how long it goes unnoticed).
 - **`presence.topic`** — must be mapped in `channel_map` to a real channel id (or presence
   disabled). The default `parley-presence` is not a channel id, so it resolves to a channel that
   does not exist and the roster stays empty.

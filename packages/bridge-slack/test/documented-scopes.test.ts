@@ -26,6 +26,7 @@ import {
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { rungStarts } from './harness.js';
 
 const read = (rel: string): string =>
   readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
@@ -144,6 +145,26 @@ describe('slack rate-limit docs track the shared helper', () => {
   it('does not restate the superseded rule that history is re-read only at the end', () => {
     expect(paragraph()).not.toMatch(/re-querying history once at the end|two `conversations\.history`/);
   });
+
+  // The paragraph's COST claim, computed from the ladder rather than characterised. `O(log block_ms)`
+  // was true only by coincidence at the default budget: the ladder caps, so the rung count is linear
+  // in `block_ms` past the cap, and an operator who raises `block_max_ms` on the strength of a
+  // logarithmic bound buys two orders of magnitude more requests than the prose promised.
+  it('states a per-call request bound the ladder actually produces', () => {
+    const text = paragraph();
+    // The rung counts the ladder yields, pinned by value: a reshaped ladder fails HERE first, and
+    // then again on the prose below, so the two cannot drift apart.
+    expect(rungStarts(4_000).length, 'rungs at 4 s').toBe(5);
+    expect(rungStarts(60_000).length, 'rungs at 60 s').toBe(16);
+    expect(rungStarts(600_000).length, 'rungs at 600 s').toBe(124);
+    // Linear past the cap is the property the superseded claim got wrong; state it, and the two
+    // figures an operator sizes `block_max_ms` from.
+    expect(text, 'still claims a logarithmic bound').not.toMatch(/O\(log/);
+    expect(text).toContain('4 + block_ms / MAX_DIAL_BACKOFF_MS');
+    expect(text).toContain(`${rungStarts(60_000).length} reads and dials`);
+    expect(text).toContain(`~${rungStarts(600_000).length} of each`);
+    expect(text).toMatch(/\*\*linear\*\*, not logarithmic/);
+  });
 });
 
 /**
@@ -188,6 +209,18 @@ describe('slack multi-session docs track the roster mechanism in core', () => {
     for (const claim of [/roster collapses/i, /phantom peer/i, /targets the wrong instance/i]) {
       expect(text, `superseded claim still present: ${String(claim)}`).not.toMatch(claim);
     }
+  });
+
+  // The vendor rule the section's advice rests on: Socket Mode routes each payload to ONE of an
+  // app's open connections. The README used to claim the opposite ("every open socket receives every
+  // subscribed event"), which turns "at least its own bot user" into advice that silently drops half
+  // of each session's live pushes. `multi-session-push.test.ts` grades the behaviour; this keeps the
+  // prose from drifting back.
+  it('does not restate the superseded claim that every open socket receives every event', () => {
+    const text = multiSession();
+    expect(text).not.toMatch(/every open socket receives/i);
+    expect(text).toMatch(/exactly one\*\* of an app's open connections/);
+    expect(text).toMatch(/own Slack app/i);
   });
 
   it('states the consequences that do survive, and that the roster is not one of them', () => {

@@ -30,45 +30,21 @@ import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
-
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+import {
+  capture,
+  settleWithin,
+  sleep,
+  startSlack,
+  type SlackHarness,
+  type SlackHarnessOptions,
+} from './harness.js';
 
 /** Short enough that a silent handshake is provably bounded without a slow test. */
 const HANDSHAKE_MS = 400;
 
-async function makePlugin(fake: FakeSlack): Promise<SlackPlugin> {
-  const plugin = new SlackPlugin();
-  await plugin.connect({
-    api_url: fake.apiUrl,
-    bot_token: 'xoxb-test',
-    app_token: 'xapp-test',
-    handshake_timeout_ms: HANDSHAKE_MS,
-  });
-  return plugin;
-}
-
-type Settled<T> =
-  | { status: 'fulfilled'; value: T }
-  | { status: 'rejected'; reason: unknown }
-  | { status: 'pending' };
-
-/**
- * Attach the outcome handlers to `p` NOW — a call that rejects before the test gets round to
- * awaiting it is an unhandled rejection, which vitest reports as a run-level error rather than a
- * row failure — and report which way it went, or `pending`, once `ms` has passed. A test that
- * simply awaits the call cannot fail on a call that never settles: it hangs.
- */
-function capture<T>(p: Promise<T>): Promise<Settled<T>> {
-  return p.then(
-    (value): Settled<T> => ({ status: 'fulfilled', value }),
-    (reason: unknown): Settled<T> => ({ status: 'rejected', reason }),
-  );
-}
-
-async function settleWithin<T>(captured: Promise<Settled<T>>, ms: number): Promise<Settled<T>> {
-  const pending: Settled<T> = { status: 'pending' };
-  return Promise.race([captured, sleep(ms).then(() => pending)]);
-}
+/** Every row here runs on the same short handshake bound; only `opts` varies. */
+const startPlugin = (opts: SlackHarnessOptions = {}): Promise<SlackHarness> =>
+  startSlack({ handshakeTimeoutMs: HANDSHAKE_MS, ...opts });
 
 /** Long enough that a reconnect loop on its own backoff gets several attempts in. */
 const OUTAGE_MS = 2000;
@@ -101,10 +77,8 @@ describe('slack reconnect ownership under a sustained outage', () => {
   for (const outage of OUTAGES) {
     for (const entry of ['subscribe', 'blocking-fetch'] as const) {
       it(`${outage.name}, hit cold via ${entry}, mints no reconnect owner and dials O(wall clock)`, async () => {
-        const fake = await FakeSlack.start();
+        const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0COLD'] });
         const topic = asTopic('C0COLD');
-        fake.createChannel(topic);
-        const plugin = await makePlugin(fake);
         const reconnect = spyReconnect(plugin);
         try {
           outage.arm(fake);
@@ -123,17 +97,14 @@ describe('slack reconnect ownership under a sustained outage', () => {
           expect(reconnect, 'reconnect owners').toHaveBeenCalledTimes(0);
           expect(fake.hits('apps.connections.open')).toBeLessThanOrEqual(dialBound(elapsed));
         } finally {
-          await plugin.disconnect();
-          await fake.close();
+          await cleanup();
         }
       });
     }
 
     it(`an established socket dropped into ${outage.name} keeps exactly one reconnect owner`, async () => {
-      const fake = await FakeSlack.start();
+      const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0DROP'] });
       const topic = asTopic('C0DROP');
-      fake.createChannel(topic);
-      const plugin = await makePlugin(fake);
       try {
         await plugin.subscribe(topic, () => undefined);
         const reconnect = spyReconnect(plugin);
@@ -150,17 +121,14 @@ describe('slack reconnect ownership under a sustained outage', () => {
           dialBound(elapsed),
         );
       } finally {
-        await plugin.disconnect();
-        await fake.close();
+        await cleanup();
       }
     });
   }
 
   it('one reconnect owner survives the whole outage and resumes live delivery on recovery', async () => {
-    const fake = await FakeSlack.start();
+    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0RESUME'] });
     const topic = asTopic('C0RESUME');
-    fake.createChannel(topic);
-    const plugin = await makePlugin(fake);
     try {
       const received: string[] = [];
       await plugin.subscribe(topic, (m) => received.push(m.content));
@@ -188,8 +156,7 @@ describe('slack reconnect ownership under a sustained outage', () => {
       await plugin.disconnect();
       await vi.waitFor(() => expect(fake.liveSockets).toBe(0), { timeout: 4000, interval: 20 });
     } finally {
-      await plugin.disconnect();
-      await fake.close();
+      await cleanup();
     }
   });
 });
@@ -221,9 +188,7 @@ describe('slack memoized async singletons', () => {
   for (const singleton of SINGLETONS) {
     for (const failFirst of [1, 3]) {
       it(`${singleton.name}: ${failFirst} transient failures do not poison later attempts`, async () => {
-        const fake = await FakeSlack.start();
-        fake.createChannel('C0LIVE');
-        const plugin = await makePlugin(fake);
+        const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0LIVE'] });
         try {
           singleton.arm(fake, failFirst);
           const attempts = failFirst + 2;
@@ -242,18 +207,15 @@ describe('slack memoized async singletons', () => {
           expect(outcomes.slice(0, failFirst).every((o) => o === 'threw')).toBe(true);
           expect(outcomes.slice(failFirst)).toEqual(Array(attempts - failFirst).fill('ok'));
         } finally {
-          await plugin.disconnect();
-          await fake.close();
+          await cleanup();
         }
       });
     }
   }
 
   it('a socket that fails to establish is retried after the cooldown, not replayed and not stormed', async () => {
-    const fake = await FakeSlack.start();
+    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0BLOCK'] });
     const topic = asTopic('C0BLOCK');
-    fake.createChannel(topic);
-    const plugin = await makePlugin(fake);
     try {
       fake.failMethod('apps.connections.open', 'internal_error', 1);
       // Degrades to the non-blocking path once, then cools down.
@@ -269,16 +231,13 @@ describe('slack memoized async singletons', () => {
       await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
       expect(fake.hits('apps.connections.open')).toBeGreaterThan(afterFirst);
     } finally {
-      await plugin.disconnect();
-      await fake.close();
+      await cleanup();
     }
   });
 
   it('subscribe is never gated by the poll cooldown: each call dials', async () => {
-    const fake = await FakeSlack.start();
+    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0SUBDIAL'] });
     const topic = asTopic('C0SUBDIAL');
-    fake.createChannel(topic);
-    const plugin = await makePlugin(fake);
     try {
       fake.failMethod('apps.connections.open', 'internal_error', 2);
       for (let i = 0; i < 2; i++) {
@@ -286,10 +245,61 @@ describe('slack memoized async singletons', () => {
       }
       expect(fake.hits('apps.connections.open')).toBe(2);
     } finally {
-      await plugin.disconnect();
-      await fake.close();
+      await cleanup();
     }
   });
+});
+
+/**
+ * CLASS: a precondition on a shared resource must be checked where the resource is acquired, not in
+ * one of its callers. `subscribe` and a blocking `fetchRecent` both need the shared Socket Mode
+ * socket, and a reactive-only deployment configures no `app_token` at all — a legal configuration.
+ * A guard living in one caller leaves the other dialling `apps.connections.open`, Slack's
+ * tightest-limit endpoint, once per configured topic at startup, under a vendor error naming neither
+ * `app_token` nor Socket Mode. Both entry points are graded on the same two observables: what the
+ * caller is told, and whether anything reached the wire.
+ */
+const SOCKET_ENTRIES: Array<{
+  name: string;
+  /** Whether the absent-token outcome is a rejection naming the token, or a degraded empty page. */
+  rejects: boolean;
+  run: (plugin: SlackPlugin, topic: string) => Promise<unknown>;
+}> = [
+  {
+    name: 'subscribe',
+    rejects: true,
+    run: (plugin, topic) => plugin.subscribe(asTopic(topic), () => undefined),
+  },
+  {
+    name: 'blocking fetchRecent',
+    rejects: false,
+    run: (plugin, topic) =>
+      plugin.fetchRecent({ topic: asTopic(topic), since: asCursor('0'), blockMs: 300 }),
+  },
+];
+
+describe('slack entry points that need the shared socket agree about a missing app_token', () => {
+  for (const entry of SOCKET_ENTRIES) {
+    for (const appToken of ['xapp-test', null] as const) {
+      const absent = appToken === null;
+      it(`${entry.name} with ${absent ? 'no' : 'an'} app_token ${absent ? 'never dials' : 'dials'}`, async () => {
+        const { fake, plugin, cleanup } = await startPlugin({ appToken, channels: ['C0TOKEN'] });
+        try {
+          const outcome = await capture(entry.run(plugin, 'C0TOKEN'));
+          if (absent && entry.rejects) {
+            expect(outcome.status).toBe('rejected');
+            expect(String((outcome as { reason: unknown }).reason)).toMatch(/app_token/);
+          } else {
+            expect(outcome.status).toBe('fulfilled');
+          }
+          expect(fake.hits('apps.connections.open'), 'dials').toBe(absent ? 0 : 1);
+          expect(fake.unauthedHits('apps.connections.open'), 'token-less dials').toBe(0);
+        } finally {
+          await cleanup();
+        }
+      });
+    }
+  }
 });
 
 const BLOCK_MS = 2000;
@@ -299,14 +309,14 @@ describe('slack teardown racing an in-flight connect', () => {
     for (const delayMs of [0, 1, 5, 20, 50, 120]) {
       for (const start of ['subscribe', 'blocking-fetch'] as const) {
         it(`disconnect ${delayMs}ms into ${start} on a ${greet} socket settles it and leaves no socket open`, async () => {
-          const fake = await FakeSlack.start();
-          const topic = asTopic('C0RACE');
-          fake.createChannel(topic);
-          fake.setGreet(greet);
           // Hold the handshake open long enough that the teardown lands mid-acquisition for the
           // small delays and after establishment for the large ones.
-          fake.setLatency('apps.connections.open', 60);
-          const plugin = await makePlugin(fake);
+          const { fake, plugin } = await startPlugin({
+            channels: ['C0RACE'],
+            greet,
+            arm: (f: FakeSlack) => f.setLatency('apps.connections.open', 60),
+          });
+          const topic = asTopic('C0RACE');
           try {
             const inFlight = capture<unknown>(
               start === 'subscribe'
@@ -342,11 +352,8 @@ describe('slack teardown racing an in-flight connect', () => {
   }
 
   it('a socket that never says hello bounds subscribe and every blocking fetch on its own', async () => {
-    const fake = await FakeSlack.start();
+    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0SILENT'], greet: 'silent' });
     const topic = asTopic('C0SILENT');
-    fake.createChannel(topic);
-    fake.setGreet('silent');
-    const plugin = await makePlugin(fake);
     try {
       // The long-poll's own budget, not the handshake's, is what a blocked fetch_recent observes —
       // so ask for a budget well UNDER the handshake timeout and hold the call to it.
@@ -365,18 +372,14 @@ describe('slack teardown racing an in-flight connect', () => {
       expect(subscribed.status).toBe('rejected');
       expect(String((subscribed as { reason: unknown }).reason)).toMatch(/no hello within \d+ms/);
     } finally {
-      await plugin.disconnect();
-      await fake.close();
+      await cleanup();
     }
   });
 
   it('a handler registered before a disconnect never fires on the next connection', async () => {
-    const fake = await FakeSlack.start();
+    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0STALE', 'C0FRESH'] });
     const stale = asTopic('C0STALE');
     const fresh = asTopic('C0FRESH');
-    fake.createChannel(stale);
-    fake.createChannel(fresh);
-    const plugin = await makePlugin(fake);
     try {
       const before: string[] = [];
       const after: string[] = [];
@@ -397,8 +400,7 @@ describe('slack teardown racing an in-flight connect', () => {
       expect(after).toEqual(['to the live route']);
       expect(before).toEqual([]);
     } finally {
-      await plugin.disconnect();
-      await fake.close();
+      await cleanup();
     }
   });
 });

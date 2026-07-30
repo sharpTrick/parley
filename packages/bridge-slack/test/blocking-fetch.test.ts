@@ -26,23 +26,20 @@
  *
  * (4) DEGRADED SOURCE. The plugin declares `supportsBlockingFetch`, so core's generic 250 ms
  *     re-drive can never compensate for a budget the plugin consumed inside ONE call. Every way the
- *     live stream can fail to serve — no `app_token` at all, a handshake that errors, a socket that
- *     closes before `hello`, a socket that accepts and says nothing, a ws URL that refuses — must
- *     therefore keep re-reading history on a bounded ladder, because the message is ALREADY durable
- *     there. A request ceiling alone cannot state that: parking until the deadline and doing no work
- *     satisfies every ceiling perfectly, which is why the table below grades DELIVERY LATENCY
- *     against the ladder's own rungs and pins a work FLOOR next to each ceiling.
+ *     live stream can fail to serve must therefore keep re-reading history on a bounded ladder,
+ *     because the message is ALREADY durable there — and "the handshake failed" is only half of
+ *     those ways. A stream that ESTABLISHES and then delivers nothing (no `message.channels`
+ *     subscription; an `app_token` whose payloads Slack routed to another process's socket; a socket
+ *     lost mid-park) withholds exactly the same durable history, so the table crosses both halves
+ *     against the same ladder. A request ceiling alone cannot state that: parking until the deadline
+ *     and doing no work satisfies every ceiling perfectly, which is why the table grades DELIVERY
+ *     LATENCY against the ladder's own rungs and pins a work FLOOR next to each ceiling.
  */
 import { asCursor, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
+import { DIAL_BACKOFF_MS } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
-
-/** Land a message in history AND on the live socket, exactly as a real workspace write would. */
-function deliver(fake: FakeSlack, topic: Topic, text: string): void {
-  const [created] = fake.seed(topic, [{ text }]);
-  fake.pushEvent(topic, { ts: created!.ts, text, user: 'U0PARLEY' });
-}
+import { deliver, rungStarts, startSlack, withSlack } from './harness.js';
 
 /** Where in the blocking pipeline the message lands. `arm` schedules the injection. */
 const STAGES: Array<{ name: string; arm: (fake: FakeSlack, topic: Topic) => void }> = [
@@ -83,16 +80,8 @@ describe('slack blocking fetch: the lost-wakeup window', () => {
   for (const stage of STAGES) {
     for (const blockMs of [800, 3000]) {
       it(`wakes natively when the message lands ${stage.name} (blockMs=${blockMs})`, async () => {
-        const fake = await FakeSlack.start();
-        const plugin = new SlackPlugin();
-        await plugin.connect({
-          api_url: fake.apiUrl,
-          bot_token: 'xoxb-test',
-          app_token: 'xapp-test',
-        });
-        try {
-          const topic = asTopic('C0WAKE');
-          fake.createChannel(topic);
+        const topic = asTopic('C0WAKE');
+        await withSlack({ channels: [topic] }, async (fake, plugin) => {
           stage.arm(fake, topic);
 
           const t0 = Date.now();
@@ -102,10 +91,7 @@ describe('slack blocking fetch: the lost-wakeup window', () => {
           expect(result.messages.map((m) => m.content)).toEqual(['live']);
           // A waiter armed after the re-query misses the mid-query push and burns the full budget.
           expect(elapsed).toBeLessThan(blockMs / 2);
-        } finally {
-          await plugin.disconnect();
-          await fake.close();
-        }
+        });
       });
     }
   }
@@ -153,13 +139,8 @@ const ELIGIBILITY: Array<{
 describe('slack blocking fetch: only an above-floor event on its own channel wakes a waiter', () => {
   for (const row of ELIGIBILITY) {
     it(`${row.wakes ? 'wakes on' : 'stays parked through'} ${row.name}`, async () => {
-      const fake = await FakeSlack.start();
-      const plugin = new SlackPlugin();
-      await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
-      try {
-        const topic = asTopic('C0FLOOR');
-        fake.createChannel(topic);
-        fake.createChannel('C0OTHER');
+      const topic = asTopic('C0FLOOR');
+      await withSlack({ channels: [topic, 'C0OTHER'] }, async (fake, plugin) => {
         // The floor is a real `ts` above everything in history, so the first query is empty and the
         // call parks; nothing the rows land is fetchable below it either, so EVERY row's page is
         // empty and elapsed time is the only thing that separates a wake from a budget burn.
@@ -182,20 +163,13 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
           expect(String(result.nextCursor)).toBe(floor);
           expect(elapsed).toBeGreaterThanOrEqual(BLOCK_MS * 0.8);
         }
-      } finally {
-        await plugin.disconnect();
-        await fake.close();
-      }
+      });
     });
   }
 
   it('two waiters at different floors on one channel: only the eligible one wakes', async () => {
-    const fake = await FakeSlack.start();
-    const plugin = new SlackPlugin();
-    await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
-    try {
-      const topic = asTopic('C0TWOFLOORS');
-      fake.createChannel(topic);
+    const topic = asTopic('C0TWOFLOORS');
+    await withSlack({ channels: [topic] }, async (fake, plugin) => {
       const lowFloor = fake.mintTs();
       const between = fake.mintTs();
       const highFloor = fake.mintTs();
@@ -218,31 +192,12 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
       expect(high.messages).toEqual([]);
       expect(String(high.nextCursor)).toBe(highFloor);
       expect(elapsed).toBeGreaterThanOrEqual(BLOCK_MS * 0.8);
-    } finally {
-      await plugin.disconnect();
-      await fake.close();
-    }
+    });
   });
 });
 
 /** Every Slack method a blocked `fetchRecent` may touch; each is separately rate-limited. */
 const BOUNDED_METHODS = ['apps.connections.open', 'conversations.history'] as const;
-
-/**
- * The degradation ladder the plugin re-reads history on, derived from its OWN exported constants
- * rather than restated: rung starts, in ms from the moment the block began.
- */
-function rungStarts(blockMs: number): number[] {
-  const starts = [0];
-  let at = 0;
-  let width = DIAL_BACKOFF_MS;
-  while (at < blockMs) {
-    at += width;
-    starts.push(at);
-    width = Math.min(width * 2, MAX_DIAL_BACKOFF_MS);
-  }
-  return starts;
-}
 
 /**
  * When a message durable in history at `landedAt` must have been DELIVERED by: the first ladder rung
@@ -256,34 +211,71 @@ const dueBy = (landedAt: number, blockMs: number): number =>
 const SLACK_MS = 400;
 
 /**
- * A way for the live event source not to serve, with history still perfectly readable. `appToken`
- * is stated per row because "no app token at all" is a legal reactive-only config, not a fault.
+ * A way for the live event source not to serve, with history still perfectly readable. `appToken` is
+ * stated per row because "no app token at all" is a legal reactive-only config, not a fault; `dials`
+ * states who is allowed to redial, because a socket that was ESTABLISHED and then lost hands the
+ * redial to the reconnect owner, on its own backoff rather than on the caller's ladder.
+ *
+ * The last four rows are the axis a handshake-centric table cannot see: the handshake SUCCEEDS and
+ * the stream still does not deliver. That is not an exotic edge — an app whose Event Subscriptions
+ * lack `message.channels`, or whose `app_token` is shared with a second process (Socket Mode routes
+ * each payload to exactly ONE of an app's connections), greets and then pushes nothing at all.
  */
 const DEGRADATIONS: Array<{
   name: string;
   appToken?: string;
+  dials: 'none' | 'ladder' | 'reconnect';
   arm: (fake: FakeSlack) => void;
 }> = [
-  { name: 'no app_token at all', arm: () => undefined },
+  { name: 'no app_token at all', dials: 'none', arm: () => undefined },
   {
     name: 'apps.connections.open answering ok:false',
     appToken: 'xapp-test',
+    dials: 'ladder',
     arm: (fake) => fake.failMethod('apps.connections.open', 'internal_error'),
   },
   {
     name: 'a socket that closes before hello',
     appToken: 'xapp-test',
+    dials: 'ladder',
     arm: (fake) => fake.setGreet('pre-hello-close'),
   },
   {
     name: 'a socket that accepts and stays silent',
     appToken: 'xapp-test',
+    dials: 'ladder',
     arm: (fake) => fake.setGreet('silent'),
   },
   {
     name: 'a handed-out ws URL that refuses the connection',
     appToken: 'xapp-test',
+    dials: 'ladder',
     arm: (fake) => fake.setWsUrl('ws://127.0.0.1:1/socket'),
+  },
+  {
+    name: 'a socket that greets and then pushes no event at all',
+    appToken: 'xapp-test',
+    dials: 'ladder',
+    arm: () => undefined,
+  },
+  {
+    name: 'an established socket dropped mid-park, redials failing',
+    appToken: 'xapp-test',
+    dials: 'reconnect',
+    arm: (fake) => {
+      setTimeout(() => {
+        fake.failMethod('apps.connections.open', 'internal_error');
+        fake.dropSockets();
+      }, 300);
+    },
+  },
+  {
+    name: 'an established socket dropped mid-park that reconnects',
+    appToken: 'xapp-test',
+    dials: 'reconnect',
+    arm: (fake) => {
+      setTimeout(() => fake.dropSockets(), 300);
+    },
   },
 ];
 
@@ -296,17 +288,13 @@ describe('slack blocking fetch: a degraded event source must not withhold durabl
     for (const fraction of LANDING_FRACTIONS) {
       const landing = Math.round(DEGRADED_BLOCK_MS * fraction);
       it(`${degradation.name}: a message durable at ${fraction * 100}% of the budget is delivered on the next ladder rung`, async () => {
-        const fake = await FakeSlack.start();
-        const plugin = new SlackPlugin();
-        await plugin.connect({
-          api_url: fake.apiUrl,
-          bot_token: 'xoxb-test',
-          ...(degradation.appToken === undefined ? {} : { app_token: degradation.appToken }),
-          handshake_timeout_ms: 30_000,
+        const topic = asTopic('C0DEGRADED');
+        const { fake, plugin, cleanup } = await startSlack({
+          appToken: degradation.appToken ?? null,
+          handshakeTimeoutMs: 30_000,
+          channels: [topic],
         });
         try {
-          const topic = asTopic('C0DEGRADED');
-          fake.createChannel(topic);
           degradation.arm(fake);
           // History ONLY — no socket push, because the whole point is that no live stream is serving.
           setTimeout(() => fake.seed(topic, [{ text: 'durable' }]), landing);
@@ -328,20 +316,22 @@ describe('slack blocking fetch: a degraded event source must not withhold durabl
           expect(elapsed, 'cannot return before the message exists').toBeGreaterThanOrEqual(
             landing - SLACK_MS,
           );
-          // And it stays cheap: the ladder caps every method by wall clock, not by iterations.
-          for (const method of BOUNDED_METHODS) {
-            expect(fake.hits(method), method).toBeLessThanOrEqual(
-              rungStarts(DEGRADED_BLOCK_MS).length + 2,
-            );
-          }
-          // A config with no app token must not dial a handshake it can never complete.
-          if (degradation.appToken === undefined) {
-            expect(fake.hits('apps.connections.open'), 'futile dials').toBe(0);
-          }
+          // And it stays cheap: the ladder caps history re-reads by wall clock, not by iterations.
+          const ladderCeiling = rungStarts(DEGRADED_BLOCK_MS).length + 2;
+          expect(fake.hits('conversations.history'), 'history reads').toBeLessThanOrEqual(
+            ladderCeiling,
+          );
+          // Dials are bounded by whoever owns them: nobody without an app_token, the caller's ladder
+          // while nothing was ever established, the reconnect owner's own backoff after a loss.
+          const dialCeiling = {
+            none: 0,
+            ladder: ladderCeiling,
+            reconnect: Math.ceil(elapsed / DIAL_BACKOFF_MS) + 1,
+          }[degradation.dials];
+          expect(fake.hits('apps.connections.open'), 'dials').toBeLessThanOrEqual(dialCeiling);
           expect(fake.unauthedHits('conversations.history'), 'unauthenticated reads').toBe(0);
         } finally {
-          await plugin.disconnect();
-          await fake.close();
+          await cleanup();
         }
       });
     }
@@ -354,16 +344,8 @@ describe('slack blocking fetch: poll storm bound', () => {
     [3000, 50],
   ] as const) {
     it(`an unavailable Socket Mode costs O(wall clock) requests on every method, not O(iterations) (blockMs=${blockMs}, poll=${pollIntervalMs})`, async () => {
-      const fake = await FakeSlack.start();
-      const plugin = new SlackPlugin();
-      await plugin.connect({
-        api_url: fake.apiUrl,
-        bot_token: 'xoxb-test',
-        app_token: 'xapp-test',
-      });
-      try {
-        const topic = asTopic('C0STORM');
-        fake.createChannel(topic);
+      const topic = asTopic('C0STORM');
+      await withSlack({ channels: [topic] }, async (fake, plugin) => {
         fake.failMethod('apps.connections.open', 'internal_error');
 
         await fetchRecentBlocking(
@@ -384,20 +366,13 @@ describe('slack blocking fetch: poll storm bound', () => {
           rungs,
         );
         expect(fake.hits('apps.connections.open'), 'dial floor').toBeGreaterThanOrEqual(2);
-      } finally {
-        await plugin.disconnect();
-        await fake.close();
-      }
+      });
     });
   }
 
   it('a handshake that recovers mid-budget still wakes natively', async () => {
-    const fake = await FakeSlack.start();
-    const plugin = new SlackPlugin();
-    await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
-    try {
-      const topic = asTopic('C0RECOVER');
-      fake.createChannel(topic);
+    const topic = asTopic('C0RECOVER');
+    await withSlack({ channels: [topic] }, async (fake, plugin) => {
       fake.failMethod('apps.connections.open', 'internal_error', 1);
       setTimeout(() => deliver(fake, topic, 'live'), 900);
 
@@ -410,9 +385,6 @@ describe('slack blocking fetch: poll storm bound', () => {
 
       expect(result.messages.map((m) => m.content)).toEqual(['live']);
       expect(Date.now() - t0).toBeLessThan(2500);
-    } finally {
-      await plugin.disconnect();
-      await fake.close();
-    }
+    });
   });
 });

@@ -19,8 +19,9 @@
  */
 import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { escapeSlackText, SlackPlugin, unescapeSlackText } from '../src/index.js';
+import { escapeSlackText, unescapeSlackText } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
+import { withSlack } from './harness.js';
 
 /**
  * Vendor control markup, and the plain characters that build it. `amplifies` names the rows that
@@ -45,22 +46,8 @@ const PAYLOADS: Array<{ name: string; content: string; amplifies: boolean }> = [
   { name: 'plain text with no markup at all', content: 'nothing to escape here', amplifies: false },
 ];
 
-async function withPlugin<T>(fn: (fake: FakeSlack, plugin: SlackPlugin) => Promise<T>): Promise<T> {
-  const fake = await FakeSlack.start();
-  const plugin = new SlackPlugin();
-  await plugin.connect({
-    api_url: fake.apiUrl,
-    bot_token: 'xoxb-test',
-    app_token: 'xapp-test',
-    mention_map: { U0BOSS: 'the-boss', S0OPS: 'ops-crew' },
-  });
-  try {
-    return await fn(fake, plugin);
-  } finally {
-    await plugin.disconnect();
-    await fake.close();
-  }
-}
+/** The one axis this file varies: the mention map its payloads name. */
+const withPlugin = withSlack.bind(null, { mentionMap: { U0BOSS: 'the-boss', S0OPS: 'ops-crew' } });
 
 describe('slack post: relayed content never reaches Slack as control markup', () => {
   for (const payload of PAYLOADS) {

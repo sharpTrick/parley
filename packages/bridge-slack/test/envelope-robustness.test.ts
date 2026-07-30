@@ -20,6 +20,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
+import { startSlack } from './harness.js';
 
 const ROUTED = 'C0ROUTED';
 const UNROUTED = 'C0UNROUTED';
@@ -106,21 +107,8 @@ interface Harness {
 }
 
 async function harness(): Promise<Harness> {
-  const fake = await FakeSlack.start();
-  const plugin = new SlackPlugin();
-  await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
-  const topic = asTopic(ROUTED);
-  fake.createChannel(topic);
-  fake.createChannel(UNROUTED);
-  return {
-    fake,
-    plugin,
-    topic,
-    cleanup: async () => {
-      await plugin.disconnect();
-      await fake.close();
-    },
-  };
+  const started = await startSlack({ channels: [ROUTED, UNROUTED] });
+  return { ...started, topic: asTopic(ROUTED) };
 }
 
 /** Watch for the crash shape a throw inside `ws.on('message')` produces. */

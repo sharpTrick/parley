@@ -11,8 +11,7 @@
  */
 import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { SlackPlugin } from '../src/index.js';
-import { FakeSlack } from './fake-slack.js';
+import { withSlack } from './harness.js';
 
 /**
  * `toString` is a real configured entry that happens to name an `Object.prototype` member, so the
@@ -207,23 +206,8 @@ describe('slack mention_map governs sender attribution and mention markup alike'
   });
 });
 
-async function withPlugin<T>(fn: (fake: FakeSlack, plugin: SlackPlugin) => Promise<T>): Promise<T> {
-  const fake = await FakeSlack.start();
-  const plugin = new SlackPlugin();
-  await plugin.connect({
-    api_url: fake.apiUrl,
-    bot_token: 'xoxb-test',
-    app_token: 'xapp-test',
-    mention_map: MENTION_MAP,
-    handshake_timeout_ms: 2000,
-  });
-  try {
-    return await fn(fake, plugin);
-  } finally {
-    await plugin.disconnect();
-    await fake.close();
-  }
-}
+/** The one axis this file varies: the mention map every row's expectations are written against. */
+const withPlugin = withSlack.bind(null, { mentionMap: MENTION_MAP, handshakeTimeoutMs: 2000 });
 
 describe('slack mention markup becomes Parley handles on both delivery paths', () => {
   it('history: every row yields the handles it declares', async () => {

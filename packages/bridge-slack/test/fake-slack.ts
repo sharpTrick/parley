@@ -10,9 +10,9 @@
  *   - A channel id that was never created answers `{ok:false, error:'channel_not_found'}` — an
  *     EXISTING but empty channel is the only thing that answers `ok:true, messages:[]`. Fabricating
  *     success for unknown ids would green the seam's absent-topic contract without testing it.
- *   - Every `chat.postMessage` pushes an `events_api` envelope to ALL connected sockets (Slack
- *     delivers the bot's own posts back), and incoming `{envelope_id}` acks are recorded so tests
- *     can assert the ack-every-envelope discipline.
+ *   - Every `chat.postMessage` pushes an `events_api` envelope (Slack delivers the bot's own posts
+ *     back) to exactly ONE connected socket, as Socket Mode routes payloads, and incoming
+ *     `{envelope_id}` acks are recorded so tests can assert the ack-every-envelope discipline.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -114,6 +114,12 @@ export class FakeSlack {
   private readonly hooks = new Map<string, (hit: number) => void | Promise<void>>();
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
+  /**
+   * Every `conversations.history` request body as it arrived on the wire, in order. The plugin's
+   * page size, `oldest` floor and page `cursor` are only real if they are ON the request; asserting
+   * them against the source constant instead grades a number no request carries.
+   */
+  readonly historyRequests: Array<Record<string, unknown>> = [];
   /** method → requests that arrived with NO `Authorization` header (answered `not_authed`). */
   readonly unauthenticated = new Map<string, number>();
   private greet: GreetMode = 'greet';
@@ -121,6 +127,8 @@ export class FakeSlack {
   private handedOutWsUrl?: string;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
   private counter = 0;
+  /** Round-robin position for {@link deliverToOneSocket}. */
+  private nextSocket = 0;
   private readonly channels = new Map<string, StoredMessage[]>();
 
   private constructor(server: Server, wss: WebSocketServer, port: number, pageSize: number) {
@@ -225,16 +233,29 @@ export class FakeSlack {
     return (this.channels.get(channel) ?? []).map((m) => m.text);
   }
 
-  /** Push one raw `events_api` envelope (any subtype) to every connected socket. */
+  /**
+   * Deliver one payload the way Socket Mode does: to exactly ONE of the app's open connections.
+   * Slack does not fan an event out — "when multiple connections are active, each payload may be
+   * sent to any of the connections" — so two sessions sharing an app token each see a subset. Keep
+   * this single-delivery, so that no test can rest on a fan-out the vendor does not perform.
+   */
+  private deliverToOneSocket(envelope: string): void {
+    const open = [...this.sockets];
+    if (open.length === 0) return;
+    open[this.nextSocket++ % open.length]!.send(envelope);
+  }
+
+  /** Push one raw `events_api` envelope (any subtype) — see {@link deliverToOneSocket}. */
   pushEvent(channel: string, event: Record<string, unknown>): string {
     const envelopeId = `env-${rand()}`;
     this.pushed.add(envelopeId);
-    const envelope = JSON.stringify({
-      envelope_id: envelopeId,
-      type: 'events_api',
-      payload: { event: { type: 'message', channel, ...event } },
-    });
-    for (const ws of this.sockets) ws.send(envelope);
+    this.deliverToOneSocket(
+      JSON.stringify({
+        envelope_id: envelopeId,
+        type: 'events_api',
+        payload: { event: { type: 'message', channel, ...event } },
+      }),
+    );
     return envelopeId;
   }
 
@@ -247,8 +268,7 @@ export class FakeSlack {
   pushEnvelope(body: Record<string, unknown>): string {
     const envelopeId = `env-${rand()}`;
     this.pushed.add(envelopeId);
-    const envelope = JSON.stringify({ envelope_id: envelopeId, ...body });
-    for (const ws of this.sockets) ws.send(envelope);
+    this.deliverToOneSocket(JSON.stringify({ envelope_id: envelopeId, ...body }));
     return envelopeId;
   }
 
@@ -428,20 +448,32 @@ export class FakeSlack {
     list.push(msg);
     this.channels.set(channel, list);
 
-    // Events API push to every connected Socket Mode client (own posts included, like Slack).
+    // Events API push (own posts included, like Slack) — to ONE connection, see deliverToOneSocket.
     const envelopeId = `env-${rand()}`;
     this.pushed.add(envelopeId);
-    const envelope = JSON.stringify({
-      envelope_id: envelopeId,
-      type: 'events_api',
-      payload: { event: { ...msg, channel } },
-    });
-    for (const ws of this.sockets) ws.send(envelope);
+    this.deliverToOneSocket(
+      JSON.stringify({
+        envelope_id: envelopeId,
+        type: 'events_api',
+        payload: { event: { ...msg, channel } },
+      }),
+    );
 
     return { ok: true, channel, ts };
   }
 
+  /**
+   * The objects one page may carry: what the caller ASKED for, capped by the tier's own page size
+   * and defaulting to Slack's documented 100 when the request omits `limit`. Serving `pageSize`
+   * regardless would hide a request that dropped, renamed or mistyped the parameter.
+   */
+  private pageLength(body: Record<string, unknown>): number {
+    const asked = Number(body.limit);
+    return Math.min(Number.isInteger(asked) && asked > 0 ? asked : 100, this.pageSize);
+  }
+
   private history(body: Record<string, unknown>): Record<string, unknown> {
+    this.historyRequests.push(body);
     const channel = body.channel;
     if (typeof channel !== 'string') return { ok: false, error: 'invalid_arguments' };
     if (!this.known.has(channel)) return { ok: false, error: 'channel_not_found' };
@@ -461,13 +493,14 @@ export class FakeSlack {
     }
     msgs.sort((a, b) => compareTs(orderOf(b), orderOf(a))); // NEWEST first, like Slack
     const offset = typeof body.cursor === 'string' ? Number(body.cursor) : 0;
-    const page = msgs.slice(offset, offset + this.pageSize);
-    const hasMore = offset + this.pageSize < msgs.length;
+    const size = this.pageLength(body);
+    const page = msgs.slice(offset, offset + size);
+    const hasMore = offset + size < msgs.length;
     return {
       ok: true,
       messages: page,
       has_more: hasMore,
-      response_metadata: { next_cursor: hasMore ? String(offset + this.pageSize) : '' },
+      response_metadata: { next_cursor: hasMore ? String(offset + size) : '' },
     };
   }
 }

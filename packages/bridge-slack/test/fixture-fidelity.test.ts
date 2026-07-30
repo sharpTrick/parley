@@ -4,9 +4,17 @@
  * `fake.acked` — so a counter that misses the very requests under test, or an envelope the fake
  * invents an id for, turns a whole family of ceilings into decoration. `documented-scopes.test.ts`
  * uses the same pattern for its source extractors.
+ *
+ * The same class covers a request PARAMETER the fixture ignores: a page size the fake serves
+ * regardless of what was asked leaves the README's cost model gradeable only against the source
+ * constant — a figure no request would then carry — so the parameters the history walk is built from
+ * are asserted ON THE WIRE and against an observable page count.
  */
+import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
+import { HISTORY_PAGE_LIMIT } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
+import { startSlack } from './harness.js';
 
 const call = async (
   fake: FakeSlack,
@@ -65,4 +73,50 @@ describe('the fake counts every request that reached the wire', () => {
       await fake.close();
     }
   });
+});
+
+/** Tier caps around the plugin's own request: below it, at the default fake page, and above it. */
+const TIER_PAGE_SIZES = [15, 50, 1000];
+const SEEDED = 300;
+
+describe('the history walk asks the wire for what the source claims', () => {
+  for (const pageSize of TIER_PAGE_SIZES) {
+    it(`serves min(${HISTORY_PAGE_LIMIT}, ${pageSize}) per page, and every request states its limit`, async () => {
+      const topic = asTopic('C0WIRE');
+      const { fake, plugin, cleanup } = await startSlack({
+        pageSize,
+        appToken: null,
+        channels: [topic],
+      });
+      try {
+        fake.seed(
+          topic,
+          Array.from({ length: SEEDED }, (_, i) => ({ text: `m${i}` })),
+        );
+
+        const { messages } = await plugin.fetchRecent({
+          topic,
+          since: asCursor('0'),
+          limit: SEEDED,
+        });
+
+        expect(messages).toHaveLength(SEEDED);
+        // The page the server actually served, observed as a request count rather than taken on
+        // trust: a request that dropped or renamed `limit` falls to Slack's default of 100 and pages
+        // more often.
+        const pages = Math.ceil(SEEDED / Math.min(HISTORY_PAGE_LIMIT, pageSize));
+        expect(fake.hits('conversations.history'), 'pages walked').toBe(pages);
+        expect(fake.historyRequests).toHaveLength(pages);
+        for (const [i, request] of fake.historyRequests.entries()) {
+          expect(request.limit, `page ${i} limit`).toBe(String(HISTORY_PAGE_LIMIT));
+          expect(request.channel, `page ${i} channel`).toBe(String(topic));
+          // `oldest` is the exclusive floor and must ride EVERY page of the walk, not just the first.
+          expect(request.oldest, `page ${i} oldest`).toBe('0');
+          expect(typeof request.cursor, `page ${i} cursor`).toBe(i === 0 ? 'undefined' : 'string');
+        }
+      } finally {
+        await cleanup();
+      }
+    });
+  }
 });

@@ -15,7 +15,7 @@
 import { asCursor, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { compareTs, SlackPlugin } from '../src/index.js';
-import { FakeSlack } from './fake-slack.js';
+import { startSlack } from './harness.js';
 
 interface Run {
   n: number;
@@ -84,9 +84,10 @@ const REDUCED_TIER_PAGE = 15;
 
 describe('slack catch-up drains against a server capped far below the requested limit', () => {
   it(`drains a page-straddling layout at pageSize=${REDUCED_TIER_PAGE}`, async () => {
-    const fake = await FakeSlack.start({ pageSize: REDUCED_TIER_PAGE });
-    const plugin = new SlackPlugin();
-    await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
+    const { fake, plugin, cleanup } = await startSlack({
+      pageSize: REDUCED_TIER_PAGE,
+      appToken: null,
+    });
     try {
       const topic = asTopic('C0PAGECAP');
       const layout = LAYOUTS.find((l) => l.name === 'straddles-page-and-limit')!;
@@ -100,10 +101,44 @@ describe('slack catch-up drains against a server capped far below the requested 
       // records however the pages happened to be cut.
       expect(cursors.at(-1)).toBe(seeded.at(-1)!.ts);
     } finally {
-      await plugin.disconnect();
-      await fake.close();
+      await cleanup();
     }
   });
+});
+
+/**
+ * The layout the drain table cannot grade: a channel where NOTHING is surfacable. Every page is
+ * fetched and discarded, so the walk's only output is the position it reached — and a walk that
+ * reports `'0'` instead makes core store `'0'`, so the next catch-up pays for the whole channel
+ * again, forever. A cursor assertion alone would pass a cursor that merely LOOKS advanced, so the
+ * cost of the second call is asserted in requests.
+ */
+describe('slack catch-up publishes the position an exhaustive walk reached', () => {
+  for (const sinceMode of ['none', 'zero'] as const) {
+    it(`a walk that surfaces nothing still advances (since=${sinceMode})`, async () => {
+      const { fake, plugin, cleanup } = await startSlack({ appToken: null });
+      try {
+        const topic = asTopic('C0UNSURFACED');
+        const seeded = fake.seed(topic, entriesOf([{ n: 300, subtype: 'channel_join' }]));
+
+        const first = await plugin.fetchRecent(
+          sinceMode === 'none' ? { topic, limit: 100 } : { topic, since: asCursor('0'), limit: 100 },
+        );
+        const walked = fake.hits('conversations.history');
+
+        expect(first.messages).toEqual([]);
+        expect(String(first.nextCursor)).toBe(seeded.at(-1)!.ts);
+        // The walk really did read the whole channel — otherwise the cursor above is a guess.
+        expect(walked, 'pages walked').toBeGreaterThan(1);
+
+        const second = await plugin.fetchRecent({ topic, since: first.nextCursor, limit: 100 });
+        expect(second.messages).toEqual([]);
+        expect(fake.hits('conversations.history') - walked, 'pages re-walked').toBe(1);
+      } finally {
+        await cleanup();
+      }
+    });
+  }
 });
 
 describe('slack catch-up window arithmetic', () => {
@@ -111,9 +146,7 @@ describe('slack catch-up window arithmetic', () => {
     for (const sinceMode of SINCE_MODES) {
       for (const limit of LIMITS) {
         it(`drains ${layout.name} / since=${sinceMode} / limit=${limit} to completion`, async () => {
-          const fake = await FakeSlack.start();
-          const plugin = new SlackPlugin();
-          await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
+          const { fake, plugin, cleanup } = await startSlack({ appToken: null });
           try {
             const topic = asTopic('C0LAYOUT');
             const seeded = fake.seed(topic, entriesOf(layout.runs));
@@ -136,12 +169,12 @@ describe('slack catch-up window arithmetic', () => {
             for (let i = 1; i < cursors.length; i++) {
               expect(compareTs(cursors[i]!, cursors[i - 1]!)).toBeGreaterThanOrEqual(0);
             }
-            // A drained `since` walk saw every entry above it, so the cursor must end ABOVE the
-            // trailing system records too — otherwise each later catch-up re-walks them forever.
-            if (sinceMode !== 'none') expect(cursors.at(-1)).toBe(seeded.at(-1)!.ts);
+            // A drain that ran to exhaustion saw every entry above its floor, so the cursor must end
+            // ABOVE the trailing system records — otherwise each later catch-up re-walks them
+            // forever. The no-`since` walk reaches exhaustion too, so it owes the same answer.
+            expect(cursors.at(-1)).toBe(seeded.at(-1)!.ts);
           } finally {
-            await plugin.disconnect();
-            await fake.close();
+            await cleanup();
           }
         });
       }
