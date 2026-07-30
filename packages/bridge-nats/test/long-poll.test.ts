@@ -35,5 +35,38 @@ describe('nats long-poll honours its budget from both sides', () => {
       expect(elapsed).toBeLessThan(budget + SLACK_MS);
     }, 20_000);
   }
+});
 
+// Class: a caller-supplied deadline computed INSIDE a closure a retry re-runs is minted afresh by
+// that retry, so the caller is served the budget once per attempt. The read path re-enters itself
+// wherever `withStream` can see a stream that vanished out-of-band, and every such point is late
+// enough in a long-poll to double it — the budget above is only a bound while nothing retries.
+describe('nats long-poll keeps its budget across a stream that vanishes mid-poll', () => {
+  const vanishPoints = ['consumers.add', 'consumers.get', 'fetch'] as const;
+  const budgets = [500, 1000, 2000];
+
+  for (const point of vanishPoints) {
+    for (const budget of budgets) {
+      it(`a stream removed at ${point}, ${budget}ms budget: the retry inherits the caller's deadline`, async () => {
+        const fake = fakeJetStream({
+          records: [],
+          expiryMs: PULL_EXPIRY_MS,
+          streamMissingOn: point,
+          streamMissingAfterMs: Math.round(budget * 0.9),
+        });
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake, STREAM);
+
+        const started = Date.now();
+        const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: budget });
+        const elapsed = Date.now() - started;
+
+        expect(page.messages).toEqual([]);
+        expect(page.nextCursor).toBe('0');
+        expect(fake.state.streamMissingOn).toBeUndefined();
+        expect(elapsed).toBeGreaterThanOrEqual(budget * 0.5);
+        expect(elapsed).toBeLessThan(budget * 1.4);
+      }, 20_000);
+    }
+  }
 });

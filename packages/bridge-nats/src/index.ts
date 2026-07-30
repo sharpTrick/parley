@@ -210,9 +210,9 @@ export class NatsPlugin implements BackendPlugin {
 
   /**
    * Read the incarnation the id will carry AFTER the ack and OUTSIDE `withStream`'s retry: keep both,
-   * so that a stream re-provisioned without this plugin ever seeing a 503 cannot mint the previous
-   * incarnation's sequence again, and so that a failure here re-publishes nothing — the message has
-   * already landed, so this stays best-effort rather than telling the caller to post it twice.
+   * so that a stream re-provisioned without this plugin ever seeing a 503 is caught by the sequence
+   * read-back, and so that a failure here re-publishes nothing — the message has already landed, so
+   * this stays best-effort rather than telling the caller to post it twice.
    */
   private async observeIncarnation(topic: Topic): Promise<void> {
     const stream = this.streamName(topic);
@@ -227,10 +227,18 @@ export class NatsPlugin implements BackendPlugin {
   // Promise-returning seam method escapes every caller that only wrote `.catch()`.
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const since = parseCursor(args.since);
-    return this.withStream(args.topic, () => this.readRecent(args, since));
+    // Keep the deadline out here: `withStream` runs its operation a second time when the stream
+    // vanished mid-read, and a deadline minted inside that closure hands the retry a fresh budget —
+    // twice the `block_ms` the caller was promised.
+    const deadline = Date.now() + (args.blockMs ?? 0);
+    return this.withStream(args.topic, () => this.readRecent(args, since, deadline));
   }
 
-  private async readRecent(args: FetchRecentArgs, since?: number): Promise<FetchRecentResult> {
+  private async readRecent(
+    args: FetchRecentArgs,
+    since: number | undefined,
+    deadline: number,
+  ): Promise<FetchRecentResult> {
     const stream = this.streamName(args.topic);
     const limit = args.limit ?? 100;
     const info = await this.requireJsm().streams.info(stream);
@@ -246,16 +254,18 @@ export class NatsPlugin implements BackendPlugin {
     const blockMs = args.blockMs ?? 0;
     const waitOrNothing = async (startSeq: number): Promise<FetchRecentResult> =>
       blockMs > 0 && args.since !== undefined
-        ? this.blockingFetch(stream, args.topic, startSeq, limit, Date.now() + blockMs, emptyCursor)
+        ? this.blockingFetch(stream, args.topic, startSeq, limit, deadline, emptyCursor)
         : { messages: [], nextCursor: emptyCursor };
 
     if (info.state.messages === 0) return waitOrNothing(Math.max(lastSeq + 1, 1));
 
-    // `last_seq` is a SEQUENCE and `limit` is a COUNT, so a window sized down from `last_seq` can
-    // hold no message at all once anything has been deleted. Anchor it on the last message that
-    // actually exists instead.
-    const tailSeq =
-      (info.state.num_deleted ?? 0) > 0 ? await this.tailSequence(stream, args.topic, lastSeq) : lastSeq;
+    // Every counter in `state` is STREAM-wide, and `last_seq` is a SEQUENCE where `limit` is a
+    // COUNT: it moves for a message this topic deleted and for a message on a subject this topic
+    // does not own, so a window sized down from it can hold nothing at all. Anchor on the last
+    // message the topic itself has — and keep the fall back to `last_seq`, so that a server which
+    // will not name that message (2.10 answers `last_by_subj` with 404 once the subject's newest
+    // has been deleted) is still served by the widening below.
+    const tailSeq = (await this.tailSequence(stream, args.topic)) ?? lastSeq;
 
     if (since !== undefined && !restarted) {
       // JetStream prunes from the front (`max_age`), so a `since` older than the retained window
@@ -268,26 +278,30 @@ export class NatsPlugin implements BackendPlugin {
     }
 
     // The since-less page is the NEWEST `limit` messages. A window whose top sequences are all
-    // holes returns fewer — widen the start until it holds enough or reaches `first_seq`, so that
-    // an empty page can never hand core's cold start a cursor above history it did not return.
+    // holes returns fewer — widen the start until it holds enough or reaches `first_seq`.
     let read: Message[] = [];
     let startSeq = 0;
     for (let attempt = 0, span = limit; ; attempt++) {
       startSeq = Math.max(firstSeq, tailSeq - span + 1, 1);
       read = await this.pull(stream, args.topic, startSeq, tailSeq - startSeq + 1, tailSeq);
-      if (read.length >= limit || startSeq <= firstSeq || attempt >= WIDEN_ATTEMPTS) break;
-      span *= 2;
+      if (read.length >= limit || startSeq <= firstSeq) break;
+      // A window that held NOTHING locates no message at all, so widen to the whole retained range
+      // at once: doubling toward it spends a pull per step and stops short of a deep hole, which is
+      // what hands core's cold start an empty page and a cursor above the history it did not return.
+      if (read.length === 0) span = tailSeq - firstSeq + 1;
+      else if (attempt >= WIDEN_ATTEMPTS) break;
+      else span *= 2;
     }
     const newest = read.slice(-limit);
     return { messages: newest, nextCursor: shortReadCursor(newest, startSeq) };
   }
 
-  /** Sequence of the last message actually stored on the topic's subject. */
-  private async tailSequence(stream: string, topic: Topic, lastSeq: number): Promise<number> {
+  /** Sequence of the topic's own last message, when the server will name it. */
+  private async tailSequence(stream: string, topic: Topic): Promise<number | undefined> {
     return this.requireJsm()
       .streams.getMessage(stream, { last_by_subj: this.subject(topic) })
-      .then((msg) => msg.seq)
-      .catch(() => lastSeq);
+      .then((msg) => msg.seq as number | undefined)
+      .catch(() => undefined);
   }
 
   /** One ephemeral pull from `startSeq`, ended by `want` messages, `tailSeq`, or a quiet link. */

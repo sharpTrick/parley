@@ -9,9 +9,20 @@ const enc = new TextEncoder();
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * One stored message. `foreign` marks a record the stream captures but the topic's `filter_subject`
+ * does not — a stream whose subject list is wider than one topic, which `ensureStream` accepts. It
+ * counts toward every STREAM-wide counter and is invisible to every per-subject read.
+ */
+export interface FakeRecord {
+  seq: number;
+  data: string;
+  foreign?: boolean;
+}
+
 export interface FakeState {
   /** Stream contents: seq → JSON payload. */
-  records: { seq: number; data: string }[];
+  records: FakeRecord[];
   /** How many messages ONE fetch yields before ending — the expiry/slow-link fault. */
   yieldLimit: number;
   /** `streams.info` reports this as `last_seq` (models a message landing after the snapshot). */
@@ -59,8 +70,19 @@ export interface FakeState {
    */
   swapCreatedOnInfoCall?: number;
   swapCreatedTo?: string;
+  /** What the incarnation the swap installs holds, given what the old one held. Default: nothing. */
+  swapRecordsTo?: (held: FakeRecord[]) => FakeRecord[];
   /** How many `streams.info` calls have been served — for arming `swapCreatedOnInfoCall` mid-run. */
   infoCalls: number;
+  /** How many `streams.info` calls fail outright — the post-ack incarnation read `post` swallows. */
+  infoFailures: number;
+  /**
+   * A ONE-SHOT "stream not found" at this point of a read, `streamMissingAfterMs` into it: the
+   * out-of-band removal `withStream` re-ensures around, arriving late enough in a long-poll that a
+   * retry granted a fresh budget overruns the caller's.
+   */
+  streamMissingOn?: 'consumers.add' | 'consumers.get' | 'fetch';
+  streamMissingAfterMs: number;
   /** How many `streams.getMessage` calls report no message found. */
   getMessageMissing: number;
   /** How many `publish` calls report the stream as gone — the out-of-band-removal path. */
@@ -93,6 +115,8 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     getMessageMissing: 0,
     publishMissing: 0,
     infoCalls: 0,
+    infoFailures: 0,
+    streamMissingAfterMs: 0,
     created: [],
     deleted: [],
     lastStart: 0,
@@ -105,6 +129,16 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   const hop = async (): Promise<void> => {
     if (state.latencyMs > 0) await delay(state.latencyMs);
   };
+
+  /** Fire the one-shot removal if it is armed for `point`, then disarm it so the retry succeeds. */
+  const streamMissingAt = async (point: FakeState['streamMissingOn']): Promise<void> => {
+    if (state.streamMissingOn !== point) return;
+    state.streamMissingOn = undefined;
+    await delay(state.streamMissingAfterMs);
+    throw new Error('stream not found');
+  };
+
+  const onSubject = (r: FakeRecord): boolean => r.foreign !== true;
 
   const jsm = {
     streams: {
@@ -119,9 +153,13 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       },
       info: async () => {
         await hop();
+        if (state.infoFailures > 0) {
+          state.infoFailures -= 1;
+          throw new Error('injected: streams.info failed');
+        }
         state.infoCalls += 1;
         if (state.infoCalls === state.swapCreatedOnInfoCall) {
-          state.records = [];
+          state.records = state.swapRecordsTo?.(state.records) ?? [];
           state.streamCreated = state.swapCreatedTo ?? state.streamCreated;
         }
         const first = state.records[0]?.seq ?? 0;
@@ -143,9 +181,14 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
           state.getMessageMissing -= 1;
           throw new Error('no message found');
         }
+        const own = state.records.filter(onSubject).at(-1);
+        // NATS 2.10 answers LAST_BY_SUBJ out of the subject's newest RECORDED sequence, so once
+        // that message is deleted the read 404s rather than naming the surviving one below it.
+        const ownTailDeleted =
+          state.visibleTail !== undefined && own !== undefined && state.visibleTail > own.seq;
         const found =
           req.seq === undefined
-            ? state.records.at(-1)
+            ? (ownTailDeleted ? undefined : own)
             : state.records.find((r) => r.seq === req.seq);
         if (found === undefined) throw new Error('no message found');
         return { seq: found.seq, data: enc.encode(found.data) };
@@ -154,6 +197,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     consumers: {
       add: async (_stream: string, cfg: { opt_start_seq?: number }) => {
         await hop();
+        await streamMissingAt('consumers.add');
         const name = `c${++n}`;
         state.created.push(name);
         state.lastStart = cfg.opt_start_seq ?? 0;
@@ -172,6 +216,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     consumers: {
       get: async () => {
         await hop();
+        await streamMissingAt('consumers.get');
         if (state.failOn === 'get') throw new Error('injected: consumers.get failed');
         const start = state.lastStart;
         return {
@@ -190,7 +235,7 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
                 if (silent) return; // EOF with no status event — a dropped link, not a deletion
                 let next = start;
                 while (!closed) {
-                  const due = state.records.filter((r) => r.seq >= next);
+                  const due = state.records.filter((r) => r.seq >= next && onSubject(r));
                   for (const r of due) {
                     next = r.seq + 1;
                     delivery += 1;
@@ -207,9 +252,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
             };
           },
           fetch: async ({ max_messages }: { max_messages: number }) => {
+            await streamMissingAt('fetch');
             if (state.failOn === 'fetch') throw new Error('injected: fetch failed');
             const window = state.records
-              .filter((r) => r.seq >= start)
+              .filter((r) => r.seq >= start && onSubject(r))
               .slice(0, Math.min(max_messages, state.yieldLimit));
             let release = () => undefined as void;
             let wasClosed = false;

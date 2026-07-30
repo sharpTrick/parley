@@ -28,9 +28,13 @@ expiry.
 re-created out-of-band (`nats stream rm`, a storage reset) restarts its sequences at 1 — the bare
 sequence would hand core a dedup key it already holds, and core would drop the new stream's
 messages as duplicates. `post` reads that stamp back after its own ack, so a stream re-provisioned
-between two posts — with no 503 for the plugin to notice — cannot re-mint the previous
-incarnation's ids. The cursor stays the bare sequence: it is the order key, and catch-up
-already falls back to the retained window when a persisted cursor sits past the tail.
+between two posts — with no 503 for the plugin to notice — is caught: the acked sequence is re-read
+under the incarnation now on the server, and a post whose message is not the one sitting there is
+rejected rather than handed back under an id the survivor will mint again for something else. That
+read-back is deliberately best-effort — failing it must not tell a caller to send a message that has
+already landed — so one window remains: when the incarnation read itself fails, the id carries the
+last incarnation the plugin observed. The cursor stays the bare sequence: it is the order key, and
+catch-up already falls back to the retained window when a persisted cursor sits past the tail.
 
 `subscribe` is **not** a nats.js `OrderedConsumer`: it is a plain named ephemeral consumer plus an
 explicit watcher. The server GCs such a consumer after 30s of client absence and `consume()` does

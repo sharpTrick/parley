@@ -98,6 +98,16 @@ describe('nats docs conformance', () => {
     expect(assertions('sequences are never contiguous', 'contiguous')).toEqual([]);
   });
 
+  // An absolute claim over a code path that swallows its own failure is a claim the plugin does not
+  // keep. The post-ack incarnation read is best-effort by design, so the README states the window
+  // that leaves open — and msg-id.test.ts pins the behaviour inside it.
+  it('README states the residual window of the post-ack incarnation read instead of denying it', () => {
+    expect(readme.toLowerCase()).not.toContain('cannot re-mint');
+    expect(readme.replace(/\s+/g, ' ')).toContain(
+      'the id carries the last incarnation the plugin observed',
+    );
+  });
+
   it('README documents the backendMsgId shape the code actually mints', () => {
     const plugin = new NatsPlugin() as unknown as {
       incarnations: Map<string, string>;

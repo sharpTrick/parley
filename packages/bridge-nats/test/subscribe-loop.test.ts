@@ -77,6 +77,80 @@ describe('nats subscribe loop — a swallowed delivery is recovered', () => {
   }, 20_000);
 });
 
+// Class 3: the live loop's resume position is only meaningful inside ONE incarnation of the store.
+// A stream deleted and re-created out-of-band restarts its sequences at 1, so a position carried
+// over from the incarnation before it names messages in the new one that were never sent — and the
+// downward clamp that looks like it covers this only fires when the new incarnation happens to be
+// SHORTER than the position carried over. Every row asserts that each message of the NEW
+// incarnation reaches the handler exactly once, across both the rebuild causes the loop has and
+// all three ways the new tail can sit against the position carried over.
+describe('nats subscribe loop — a re-provisioned stream is resumed as a new store', () => {
+  const record = (seq: number, tag: string): { seq: number; data: string } => ({
+    seq,
+    data: payload(`${tag}${seq}`),
+  });
+
+  const causes = [
+    {
+      name: 'a silent iterator EOF',
+      carried: 5,
+      seed: [1, 2, 3, 4, 5],
+      arm: (fake: ReturnType<typeof fakeJetStream>): void => {
+        fake.state.silentExits = 1;
+      },
+      afterSubscribe: (): void => undefined,
+    },
+    {
+      name: 'a hole in the delivery sequence',
+      carried: 2,
+      seed: [],
+      arm: (fake: ReturnType<typeof fakeJetStream>): void => {
+        fake.state.swallowed = [3];
+        fake.state.swallowGeneration = 1;
+      },
+      afterSubscribe: (fake: ReturnType<typeof fakeJetStream>): void => {
+        for (let seq = 1; seq <= 5; seq++) fake.state.records.push(record(seq, 'o'));
+      },
+    },
+  ];
+
+  const tails = [
+    { name: 'below the position carried over', of: (carried: number) => carried - 1 },
+    { name: 'equal to the position carried over', of: (carried: number) => carried },
+    { name: 'above the position carried over', of: (carried: number) => carried + 3 },
+  ];
+
+  for (const cause of causes) {
+    for (const tail of tails) {
+      it(`after ${cause.name}, a new incarnation whose tail is ${tail.name} is delivered whole`, async () => {
+        const fresh = Array.from({ length: tail.of(cause.carried) }, (_, i) => record(i + 1, 'n'));
+        const fake = fakeJetStream({
+          records: cause.seed.map((seq) => record(seq, 'o')),
+          swapCreatedOnInfoCall: 3, // the rebuild's own re-read of the stream
+          swapCreatedTo: '2027-09-09T09:09:09.000000009Z',
+          swapRecordsTo: () => fresh,
+        });
+        cause.arm(fake);
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake, STREAM);
+        attachConnection(plugin);
+
+        const got: string[] = [];
+        await plugin.subscribe(asTopic('reborn'), (m) => {
+          got.push(m.content);
+        });
+        cause.afterSubscribe(fake);
+
+        const owed = fresh.map((_, i) => `n${i + 1}`);
+        await waitFor(() => owed.every((c) => got.includes(c)), 15000);
+        expect(got.filter((c) => c.startsWith('n'))).toEqual(owed);
+
+        await plugin.disconnect();
+      }, 25_000);
+    }
+  }
+});
+
 describe('nats subscribe loop — every unplanned iterator exit rebuilds', () => {
   it('rebuilds after an iterator EOF that carried no consumer-loss event, resuming at lastSeq+1', async () => {
     const fake = fakeJetStream({ records: [], silentExits: 1 });

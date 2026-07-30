@@ -119,18 +119,55 @@ describe('nats backendMsgId survives a stream re-provisioned under it', () => {
   // observed by two separate round trips. Between them the stream can be replaced — and then the
   // observed token labels a sequence it never owned, so the SURVIVING incarnation's own message at
   // that sequence mints an id core already holds and core drops a genuinely new message. The rows
-  // above re-provision between whole calls; these re-provision inside `post` itself, which the
-  // post-ack read happens to cover only when it succeeds and observes the same stream twice.
-  const ackAmbiguities: { name: string; arm: (fake: FakeJetStream) => void }[] = [
+  // above re-provision between whole calls; these re-provision inside `post` itself, and cross that
+  // with what the surviving incarnation HOLDS at the acked sequence — a guard that only recognises
+  // an empty sequence is blind to the incarnation that already refilled it, and one that rejects
+  // whatever it is shown is no guard either, so `resolves` rows carry the floor.
+  const ackAmbiguities: {
+    name: string;
+    outcome: 'rejects' | 'resolves';
+    arm: (fake: FakeJetStream) => void;
+  }[] = [
     {
-      name: 'the stream is re-provisioned during the post-ack incarnation read',
+      name: 'the surviving incarnation holds nothing at the acked sequence',
+      outcome: 'rejects',
       arm: (fake) => {
         fake.state.swapCreatedOnInfoCall = fake.state.infoCalls + 1;
         fake.state.swapCreatedTo = nextStamp();
       },
     },
     {
-      name: 'the acked sequence holds no message in the incarnation now on the server',
+      name: 'the surviving incarnation holds a DIFFERENT message at the acked sequence',
+      outcome: 'rejects',
+      arm: (fake) => {
+        fake.state.swapCreatedOnInfoCall = fake.state.infoCalls + 1;
+        fake.state.swapCreatedTo = nextStamp();
+        fake.state.swapRecordsTo = (held) =>
+          held.map((r) => ({ seq: r.seq, data: payload(`intruder${r.seq}`) }));
+      },
+    },
+    {
+      name: 'the surviving incarnation holds messages only BELOW the acked sequence',
+      outcome: 'rejects',
+      arm: (fake) => {
+        fake.state.swapCreatedOnInfoCall = fake.state.infoCalls + 1;
+        fake.state.swapCreatedTo = nextStamp();
+        fake.state.swapRecordsTo = (held) =>
+          held.slice(0, -1).map((r) => ({ seq: r.seq, data: payload(`intruder${r.seq}`) }));
+      },
+    },
+    {
+      name: 'the surviving incarnation holds exactly the message that was acked',
+      outcome: 'resolves',
+      arm: (fake) => {
+        fake.state.swapCreatedOnInfoCall = fake.state.infoCalls + 1;
+        fake.state.swapCreatedTo = nextStamp();
+        fake.state.swapRecordsTo = (held) => held;
+      },
+    },
+    {
+      name: 'the read of the acked sequence itself reports nothing there',
+      outcome: 'rejects',
       arm: (fake) => {
         reprovision(fake);
         fake.state.getMessageMissing = 1;
@@ -138,41 +175,68 @@ describe('nats backendMsgId survives a stream re-provisioned under it', () => {
     },
   ];
 
+  /**
+   * Every id this run minted, against the message it labelled. One id over two messages IS the
+   * defect: core's SeenSet holds the first and drops the second as a duplicate.
+   */
+  const ledger = (): ((id: string, content: string) => void) => {
+    const held = new Map<string, string>();
+    return (id, content) => {
+      expect(held.get(id) ?? content, `id ${id} labels both ${held.get(id)} and ${content}`).toBe(
+        content,
+      );
+      held.set(id, content);
+    };
+  };
+
   for (const ambiguity of ackAmbiguities) {
     it(`post never labels a sequence with an incarnation it did not observe holding it, when ${ambiguity.name}`, async () => {
       const { plugin, fake } = withFake();
-      const before = [
-        await plugin.post(TOPIC, 'sys' as never, 'one'),
-        await plugin.post(TOPIC, 'sys' as never, 'two'),
-      ];
+      const label = ledger();
+      for (const content of ['one', 'two']) {
+        label(String(await plugin.post(TOPIC, 'sys' as never, content)), content);
+      }
 
       ambiguity.arm(fake);
       const outcome = await plugin
         .post(TOPIC, 'sys' as never, 'three')
         .then((id) => String(id), (err: unknown) => `rejected: ${String(err)}`);
+      const rejected = outcome.startsWith('rejected: ');
+      expect(rejected).toBe(ambiguity.outcome === 'rejects');
+      if (rejected) expect(outcome).toMatch(/re-provisioned/);
+      else label(outcome, 'three');
 
-      // Whatever came back, the incarnation that SURVIVED now fills its own sequences — and none of
-      // the ids core reads out of it may be one `post` already handed back for another message.
+      // Whatever came back, the incarnation that SURVIVED now fills its own sequences — and no id
+      // core reads out of it may be one `post` already handed back for a different message.
       fake.state.getMessageMissing = 0;
       fake.state.swapCreatedOnInfoCall = undefined;
-      const surviving: string[] = [];
       for (const content of ['four', 'five', 'six', 'seven']) {
-        surviving.push(String(await plugin.post(TOPIC, 'sys' as never, content)));
+        label(String(await plugin.post(TOPIC, 'sys' as never, content)), content);
       }
-      const readBack = (await plugin.fetchRecent({ topic: TOPIC })).messages;
-      const minted = [...before.map(String), ...(outcome.startsWith('rejected: ') ? [] : [outcome])];
-
-      const seen = new SeenSet();
-      for (const id of minted) seen.firstSeen(TOPIC, id as BackendMsgId);
-      expect(readBack.map((m) => seen.firstSeen(TOPIC, m.backendMsgId))).toEqual(
-        readBack.map(() => true),
-      );
-      expect(surviving.filter((id) => minted.includes(id))).toEqual([]);
-      if (outcome.startsWith('rejected: ')) expect(outcome).toMatch(/re-provisioned/);
+      for (const m of (await plugin.fetchRecent({ topic: TOPIC })).messages) {
+        label(String(m.backendMsgId), m.content);
+      }
 
       await plugin.disconnect();
     }, 20_000);
   }
+
+  // The residual window the README states: the post-ack incarnation read is best-effort BY DESIGN —
+  // failing it must not tell a caller to send a message that has already landed — so an id minted
+  // while that read is failing carries the last incarnation the plugin observed, not the one on the
+  // server. Pinned here so the README cannot drift back into denying it.
+  it('an id minted while the incarnation read is failing carries the last observed incarnation', async () => {
+    const { plugin, fake } = withFake();
+    const observed = String(await plugin.post(TOPIC, 'sys' as never, 'one')).split('-')[0];
+
+    fake.state.infoFailures = 1;
+    const id = String(await plugin.post(TOPIC, 'sys' as never, 'two'));
+
+    expect(id).toBe(`${observed ?? ''}-2`);
+    expect(fake.state.infoFailures).toBe(0);
+
+    await plugin.disconnect();
+  });
 
   it('keeps the cursor a bare sequence, and post/read agree on both values', async () => {
     const { plugin, fake } = withFake();
