@@ -6,19 +6,25 @@
 
 ## Status
 
-- **Phase (adversarial review — the Careening experiment):** rounds 1–4 complete and pushed on
-  `claude/next-steps-q1540r`; round 5 running. Full suite **5241 tests, 3 skipped, green**, against
-  real Redis, NATS, Postgres, Prosody, Synapse and Keycloak (all six now bound to loopback only).
-  The suite series is **460 → 1428 → 2545 → 3926 → 5241**.
+- **Phase (adversarial review — the Careening experiment):** rounds 1–6 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **7580 tests, 4 skipped, green**, against real Redis, NATS,
+  Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
+  The suite series is **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580**.
 
   Findings per round (14 targets each, 0 errored every round):
 
-  | round | findings | CONFIRMED | blocking | self-induced |
-  | ---: | ---: | ---: | ---: | ---: |
-  | 1 | 139 | 124 | 61 | — (not gradeable) |
-  | 2 | 136 | 130 | 49 | 26% |
-  | 3 | 119 | 115 | 38 | 39% |
-  | 4 | 120 | 113 | 45 | 57% |
+  | round | findings | CONFIRMED | blocking | self-induced | blocking self-induced |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 139 | 124 | 61 | — (not gradeable) | — |
+  | 2 | 136 | 130 | 49 | 26% | 27% |
+  | 3 | 119 | 115 | 38 | 39% | 34% |
+  | 4 | 120 | 113 | 45 | 57% | 56% |
+  | 5 | 129 | 117 | 39 | 60% | 72% |
+  | 6 | 90 | 86 | 26 | 80% | 81% |
+
+  Round 6 is the first round where **every count fell at once** — findings 129→90, CONFIRMED
+  117→86, blocking 39→26 — while self-induction rose to 80%. Pre-existing blocking findings have
+  fallen 36 → 25 → 20 → 11 → 5. The loop is running out of original codebase to find things in.
 
   **Stop rule: two consecutive wake-all rounds with zero CONFIRMED findings, or round 20.** Offered
   the blocking-gated alternative at round 3 and deliberately declined it, to keep comparability with
@@ -42,12 +48,37 @@
   applied with zero real conflicts, because targets are disjoint packages. Worktrees exist because
   mutation testing is mandatory and a mutation on a shared tree is another agent's phantom failure.
 
-  **Three defects this experiment created and later found**, worth knowing about because they are
+  **Four defects this experiment created and later found**, worth knowing about because they are
   the substance of the iatrogenesis number: a round-3 helper (`isNoSuchTopicError`) that shipped as
   dead code with all five call sites still on `instanceof`; a round-2 ID-token rule that rejected any
-  `nonce` and so permanently 401'd Keycloak deployments the README recommends; and a round-3 stream
-  incarnation read from cached state, so an unobserved re-provision still minted a duplicate id.
-  All three passed their own round's tests.
+  `nonce` and so permanently 401'd Keycloak deployments the README recommends; a round-3 stream
+  incarnation read from cached state, so an unobserved re-provision still minted a duplicate id; and
+  a round-2 read-state flush that spread the whole in-memory map over a re-read, clobbering a
+  sibling instance's more-advanced cursor. All four passed their own round's tests.
+
+  **And one of a different species, found in round 6: a remediation that never applied.** Round 5's
+  nats `tailSequence` repair keyed on `getMessage(stream, {last_by_subj})`, which NATS 2.10 answers
+  with "no message found" whenever that subject's newest message has been deleted — confirmed by
+  direct probe for deletes of `{12}`, `{11,12}` and `{5..12}`. The repair therefore never fires on a
+  real server for the case it was written for; the widening loop has always carried it. The fake
+  concealed this by answering from surviving records. Making the fake faithful turned three existing
+  window rows from vacuous into real. Count this separately from iatrogenesis: not a defect
+  introduced, a fix that was inert from the day it landed.
+
+  **Round 6's dominant theme was fixture fidelity** — five of ten targets found a fake that could
+  not express the failure being guarded against. postgres: eleven `vi.mock('pg')` Pool fakes stubbed
+  `on: vi.fn()`, so the process-killing `error` event was unraisable by construction. xmpp: the fake
+  carried one connection-wide nick, so all three conflict-revert rows passed vacuously. slack:
+  `FakeSlack` broadcast every Socket Mode envelope to every socket, while Slack's docs say a payload
+  "may be sent to any of the connections" — the README's fanout claim was true in test and false in
+  production. zulip: `injectRaw`'s non-comparable ids never reach the read window, so the drop
+  assertions pass whether the plugin drops them or never sees them. nats: as above.
+
+  **A live-server failure that was cumulative state, not flake.** matrix conformance degraded 3.4 s
+  → 10.3 s → >15 s within one session and started failing 11 of 32 cases: `existingRoom()` joins and
+  the fixture never leaves, so the `parley` account's joined-room set grows without bound and every
+  `/sync` slows. Recreating Synapse fixed it. The instinct to loosen the timeout would have buried a
+  real resource leak in the test fixture.
 
 ## Status (pre-review, retained)
 

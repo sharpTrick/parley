@@ -106,5 +106,45 @@
       }
     ],
     "reading": "Pre-existing BLOCKING findings fall 36 -> 25 -> 20 -> 11 while the blocking total stays roughly flat (49, 38, 45, 39). The loop's blocking output is therefore increasingly self-referential: by round 5, 72% of blocking findings are against lines the experiment itself wrote. Round 5's figure is additionally distorted upward because six service-backed targets reviewed without live servers, so genuinely pre-existing live-only defects could not surface."
+  },
+  "inertRemediations": {
+    "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
+    "why": "Distinct from iatrogenesis. Iatrogenesis counts defects the experiment INTRODUCED. This counts fixes the experiment believed it had landed that were inert from the day they shipped - a failure mode a git-blame oracle cannot see, because the line exists and blames to the experiment either way.",
+    "instances": [
+      {
+        "introducedRound": 5,
+        "foundRound": 6,
+        "package": "bridge-nats",
+        "what": "The tailSequence repair keyed on getMessage(stream, {last_by_subj}), which NATS 2.10 answers 'no message found' whenever that subject's newest message has been deleted.",
+        "evidence": "Direct probe against nats:2.10-alpine: deletes of {12}, {11,12} and {5..12} all yield 'no message found'; deleting {1,2} still returns seq 12.",
+        "concealedBy": "The fake answered last_by_subj from surviving records, giving the repair a code path the real server does not offer.",
+        "consequence": "The widening loop had carried the case all along. Making the fake faithful turned three existing window rows from vacuous into real."
+      }
+    ]
+  },
+  "fixtureFidelity": {
+    "why": "Round 6's dominant theme, and the one an automated loop is structurally worst at: a fake that cannot express the failure makes the guard unfalsifiable, so the defect is invisible to every round that came before.",
+    "round6": [
+      {
+        "package": "bridge-postgres",
+        "what": "Eleven vi.mock('pg') Pool fakes stubbed on: vi.fn(), so the unhandled 'error' event that kills the process could not be raised by any test."
+      },
+      {
+        "package": "bridge-xmpp",
+        "what": "FakeXmpp carried one connection-wide nick; with fake and plugin both reverted, all three conflict-revert rows pass vacuously."
+      },
+      {
+        "package": "bridge-slack",
+        "what": "FakeSlack broadcast each Socket Mode envelope to every socket. Slack's docs: a payload 'may be sent to any of the connections'. The README's fanout claim was true in test, false in production."
+      },
+      {
+        "package": "bridge-zulip",
+        "what": "injectRaw's doc claims a record reaches both the history read and the queue; for non-comparable ids the fake's own id filter excludes it, so drop assertions pass whether the plugin drops it or never sees it."
+      },
+      {
+        "package": "bridge-nats",
+        "what": "See inertRemediations: last_by_subj answered from surviving records, a semantics NATS does not have."
+      }
+    ]
   }
 }
