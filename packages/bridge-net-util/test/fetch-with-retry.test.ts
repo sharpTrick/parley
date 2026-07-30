@@ -450,11 +450,79 @@ describe('fetchWithRetry', () => {
         const reported = Number(/asked for (\d+)ms/.exec(err.message)?.[1]);
         expect(reported).toBeGreaterThanOrEqual(requestedMs - 2_000);
       } else {
+        // Eight of the header rows state nothing, so comparing against `requestedMs` alone made 48
+        // of these cells `w >= 0` — vacuously true, and the only backoff the module invents for
+        // itself asserted nowhere. The floor is whichever is larger, and it is never zero.
+        const floorMs = Math.max(requestedMs, DEFAULT_BACKOFF_MS);
+        expect(floorMs).toBeGreaterThan(0);
         expect(state.calls).toBeGreaterThan(1);
-        for (const w of waits) expect(w).toBeGreaterThanOrEqual(requestedMs);
+        expect(waits.length).toBeGreaterThan(0);
+        for (const w of waits) expect(w).toBeGreaterThanOrEqual(floorMs);
       }
     },
   );
+
+  // A floor of 500 is satisfied by 500, 5 000 or 50 000 alike, so the one wait this module invents
+  // for itself is also pinned exactly — including its ceiling.
+  it('waits exactly the default backoff for a 429 with no hint of any kind', async () => {
+    stubFetch([res(429, 'slow down'), res(200, 'ok')]);
+    const waits = captureWaits();
+    const out = await fetchWithRetry('https://x/y', {}, { label: 'L', isStopped: () => false });
+    expect(out.status).toBe(200);
+    expect(waits).toEqual([DEFAULT_BACKOFF_MS]);
+  });
+
+  // A caller's parser is arbitrary code, and the ordinary one reads the body: `res.clone().json()`
+  // against a CDN's HTML 429 page throws. Unguarded, THAT error left the module — no label, no
+  // redaction, and `statusOf` undefined, so a caller branching on 429 saw nothing. A hook that
+  // cannot read the body means "no usable hint"; it may not fail the call and it may not lower the
+  // header's floor. Every shipped parser happens to catch internally, which is why nothing was red.
+  const HOSTILE_PARSERS: [string, (res: Response) => number | undefined][] = [
+    [
+      'a parser that throws',
+      () => {
+        throw new SyntaxError("Unexpected token '<', \"<html>rate\"... is not valid JSON");
+      },
+    ],
+    ['a parser that rejects', () => Promise.reject(new Error('body unreadable')) as never],
+    ['a parser that returns a non-number', () => 'soon' as never],
+  ];
+
+  it.each(
+    HOSTILE_PARSERS.flatMap(([parserLabel, retryAfterOf]) =>
+      (
+        [
+          ['no Retry-After', {}, DEFAULT_BACKOFF_MS],
+          ['a Retry-After floor', { 'retry-after': '2' }, 2_000],
+        ] as [string, Record<string, string>, number][]
+      ).map(
+        ([headerLabel, headers, floorMs]) =>
+          [`${parserLabel}, with ${headerLabel}`, retryAfterOf, headers, floorMs] as const,
+      ),
+    ),
+  )('keeps %s inside the error envelope', async (_label, retryAfterOf, headers, floorMs) => {
+    stubForever(() => res(429, '<html>rate limited</html>', headers));
+    const waits = captureWaits();
+    let clock = 0;
+    const err = await rejects(
+      fetchWithRetry(
+        'https://x/y',
+        {},
+        {
+          label: 'L',
+          isStopped: () => false,
+          maxAttempts: 2,
+          deadlineMs: 60_000,
+          retryAfterOf,
+          now: () => (clock += 1),
+        },
+      ),
+    );
+    expect(err.message.startsWith('L → 429: ')).toBe(true);
+    expect(api.statusOf(err)).toBe(429);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toBeGreaterThanOrEqual(floorMs);
+  });
 
   // The one status this module is built around was the one `statusOf` could not report: the
   // exhaustion rejection was a plain Error, so a caller branching on the field saw undefined and
@@ -731,32 +799,86 @@ describe('fetchWithRetry', () => {
     expect(err.message).not.toContain(CANARY);
   });
 
-  // The other half of the class: not another SPELLING of the same location, but another URL
-  // COMPONENT a credential can sit in. `credentialParts` split the pathname only, so a token in
-  // userinfo or a query value survived into an error message whenever a body echoed that fragment
-  // alone — and the README's "keep credentials out of the query" precondition had nothing enforcing
-  // it. Indexed by location so the next component is a row, not a rewrite.
-  const CREDENTIAL_LOCATIONS: [string, string, string][] = [
-    ['a path segment', `https://api.example.test/bot123:${CANARY}/getMe`, `bot123:${CANARY}`],
-    ['userinfo', `https://user:${CANARY}@api.example.test/v1/x`, `user:${CANARY}@api.example.test`],
-    ['a query value', `https://api.example.test/v1/x?access_token=${CANARY}`, `access_token=${CANARY}`],
+  // The other half of the class: not another SPELLING of the same location, but the SHAPE the
+  // credential itself takes, crossed with the URL component it sits in. Path segments were kept
+  // only when they contained a `:`, so Discord's `/api/webhooks/<id>/<token>` — a token with no
+  // punctuation at all — reached model context whenever a body echoed the bare path, while the one
+  // existing path row passed on Telegram's colon. Every row echoes the component ALONE: the whole
+  // URL is claimed by the byte-exact split (and by the scheme sweep) in the table above.
+  const SHAPES: [string, string][] = [
+    ['colon-joined', `bot123:${CANARY}`],
+    ['opaque, no punctuation at all', CANARY.replaceAll('-', '')],
+    ['base64url, with - and _', `dGtu-${CANARY}_9`],
+  ];
+
+  const LOCATIONS: [string, (secret: string) => { url: string; fragment: string }][] = [
+    [
+      'a path segment',
+      (s) => ({
+        url: `https://api.example.test/api/webhooks/12345/${s}`,
+        fragment: `/api/webhooks/12345/${s}`,
+      }),
+    ],
+    [
+      'userinfo',
+      (s) => ({
+        url: `https://user:${s}@api.example.test/v1/x`,
+        fragment: `user:${s}@api.example.test`,
+      }),
+    ],
+    [
+      'a query value',
+      (s) => ({
+        url: `https://api.example.test/v1/x?access_token=${s}`,
+        fragment: `access_token=${s}`,
+      }),
+    ],
   ];
 
   it.each(
-    CREDENTIAL_LOCATIONS.flatMap(([location, url, fragment]) =>
-      VECTORS.flatMap(([vector, make]) =>
-        (
-          [
-            ['the whole URL', url],
-            ['the bare fragment', fragment],
-          ] as const
-        ).map(([echo, echoed]) => [`${location}, ${vector}, echoing ${echo}`, url, echoed, make] as const),
+    LOCATIONS.flatMap(([location, build]) =>
+      SHAPES.flatMap(([shape, secret]) =>
+        VECTORS.map(
+          ([vector, make]) =>
+            [`${location}, ${shape}, ${vector}`, build(secret), secret, make] as const,
+        ),
       ),
     ),
-  )('never leaks a credential carried in %s', async (_label, url, echoed, make) => {
-    vi.stubGlobal('fetch', make(echoed));
-    const err = await rejects(fetchWithRetry(url, {}, { label: 'L', isStopped: () => false }));
+  )('never leaks a credential carried in %s, echoed alone', async (_label, target, secret, make) => {
+    vi.stubGlobal('fetch', make(target.fragment));
+    const err = await rejects(
+      fetchWithRetry(target.url, {}, { label: 'L', isStopped: () => false }),
+    );
     expect(err.message).toContain('L → ');
+    expect(err.message).not.toContain(secret);
+  });
+
+  // The other direction, which is a defect too: a path segment is also a WORD, and every API's
+  // error prose uses its own method names. Redacting on length alone struck `getUpdates` out of
+  // Telegram's own 409 and left the operator reading "can't use <redacted> method".
+  it.each([
+    [
+      'a method name beside a credential',
+      `https://api.example.test/bot123:${CANARY}/getUpdates`,
+      "can't use getUpdates method while webhook is active",
+      'getUpdates',
+    ],
+    [
+      'a resource name',
+      'https://api.example.test/api/v1/conversations',
+      'conversations is not enabled for this workspace',
+      'conversations',
+    ],
+    [
+      'a dotted method name',
+      'https://api.example.test/api/chat.postMessage',
+      'chat.postMessage requires a scope you do not have',
+      'chat.postMessage',
+    ],
+  ])('keeps %s in the body it explains', async (_label, url, body, word) => {
+    vi.stubGlobal('fetch', () => Promise.resolve(res(409, body)));
+    const err = await rejects(fetchWithRetry(url, {}, { label: 'L', isStopped: () => false }));
+    expect(err.message).toContain(word);
     expect(err.message).not.toContain(CANARY);
   });
 
@@ -835,6 +957,65 @@ describe('retryAfterFromHeader', () => {
     expect(
       retryAfterFromHeader(new Response('', { headers: { 'retry-after': httpDate(-60_000) } })),
     ).toBeUndefined();
+  });
+
+  // An HTTP-date states a point on the SERVER's clock, so subtracting OUR clock reads a real
+  // 30-second wait as negative on a client a minute fast — i.e. as no hint at all, which retries at
+  // the 500ms default against a server that asked for sixty times that. The mirror case inflates a
+  // routine hint past the deadline and ends the call. Every row here derives its dates from the
+  // server's clock, which `httpDate()` cannot do.
+  const SKEWS: [string, number][] = [
+    ['two minutes ahead of the server', -120_000],
+    ['a second ahead', -1_000],
+    ['in step', 0],
+    ['a second behind', 1_000],
+    ['two minutes behind', 120_000],
+  ];
+
+  const HINT_FORMS: [string, (serverAt: number, ms: number) => string][] = [
+    ['an HTTP-date', (serverAt, ms) => new Date(serverAt + ms).toUTCString()],
+    ['delay-seconds', (_serverAt, ms) => String(ms / 1000)],
+  ];
+
+  const STATED_MS = 30_000;
+
+  it.each(
+    SKEWS.flatMap(([skew, ahead]) =>
+      HINT_FORMS.map(([form, spell]) => [`${form}, client ${skew}`, ahead, spell] as const),
+    ),
+  )('reads the server-stated wait unchanged (%s)', async (_label, ahead, spell) => {
+    const serverAt = Date.now() - ahead;
+    const headers = {
+      date: new Date(serverAt).toUTCString(),
+      'retry-after': spell(serverAt, STATED_MS),
+    };
+    expect(retryAfterFromHeader(new Response('', { headers }))).toBe(STATED_MS);
+
+    stubForever(() => res(429, '', headers));
+    const waits = captureWaits();
+    let clock = 0;
+    await rejects(
+      fetchWithRetry(
+        'https://x/y',
+        {},
+        {
+          label: 'L',
+          isStopped: () => false,
+          maxAttempts: 2,
+          deadlineMs: 120_000,
+          now: () => (clock += 1),
+        },
+      ),
+    );
+    expect(waits).toEqual([STATED_MS]);
+  });
+
+  it('falls back to our own clock when the response offers no Date header', () => {
+    const at = retryAfterFromHeader(
+      new Response('', { headers: { 'retry-after': httpDate(30_000) } }),
+    );
+    expect(at).toBeGreaterThan(28_000);
+    expect(at).toBeLessThanOrEqual(30_000);
   });
 });
 

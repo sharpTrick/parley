@@ -46,15 +46,22 @@ Three bounds are worth knowing before you call it:
 The `Retry-After` header is a **floor**, and `retryAfterOf` is a source of an *additional* hint,
 never a ceiling: whichever is longer wins. Do not clamp what your parser returns — retrying
 sooner than the vendor asked is what escalates a rate limit into a global ban, and this loop will
-not let a parser do it. A header set twice (a gateway plus the origin) reads as the longest wait
-either value states, not as no hint at all.
+not let a parser do it. A parser that throws or rejects — `res.clone().json()` against a CDN's HTML
+429 page — counts as no hint rather than failing the call, and the header floor still applies. A
+header set twice (a gateway plus the origin) reads as the longest wait either value states, not as
+no hint at all. An HTTP-date is read against the response's own `Date` header where there is one, so
+a skewed client clock cannot turn a stated wait into no hint.
 
 Errors never carry the request URL: several backends (Telegram) put a credential in the path, and
 a thrown message becomes an MCP `isError` result, i.e. model context. `label` identifies the call.
 Redaction covers the URL byte-for-byte, any `scheme://…` spelling of it, and every component that
-can carry a credential on its own — the path and its `:`-bearing segments, the userinfo, and each
-query value — so a proxy or a hostile body that echoes one fragment alone is covered too. A bare
-`host/path` with no scheme is not treated as a URL, so keep credentials out of the host.
+can carry a credential on its own — the whole path, every path segment that is `:`-bearing or long
+and not spelled like a method name (Telegram's `bot<id>:<token>` and Discord's punctuation-free
+webhook token are both covered; `getUpdates` and `chat.postMessage` are left in the body's prose,
+where an API's own error text uses them), the userinfo, and each query value, each in both its
+encoded and decoded spelling — so a proxy or a hostile body that echoes one fragment alone is
+covered too. A bare `host/path` with no scheme is not treated as a URL, so keep credentials out of
+the host, and out of a path segment short enough to pass for `api` or `v1`.
 
 ## Helpers
 

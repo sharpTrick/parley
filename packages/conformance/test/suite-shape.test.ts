@@ -69,6 +69,17 @@ function guardedBlock(text: string, open: number): string {
   return text.slice(open);
 }
 
+/**
+ * The region as far as its first unconditional `return`. An arm that returns FIRST and asserts
+ * afterwards has done nothing, and a check that greps the whole region for `expect(` reads the dead
+ * tail as coverage — which is exactly how the cheapest coverage-for-a-boolean trade would be spelled
+ * once the bare `return` itself is guarded.
+ */
+const upToFirstReturn = (region: string): string => {
+  const at = region.search(/\breturn;/);
+  return at < 0 ? region : region.slice(0, at);
+};
+
 function guardedRegions(body: string): { field: string; region: string }[] {
   const out: { field: string; region: string }[] = [];
   for (const field of CAPABILITY_FIELDS) {
@@ -80,7 +91,7 @@ function guardedRegions(body: string): { field: string; region: string }[] {
       // The 'unsupported' sentinel is the one legitimate skip, and the check above governs it. Keep
       // it exempt HERE only, so that a boolean flag can never borrow the same excuse.
       if (header.includes("'unsupported'")) continue;
-      out.push({ field, region: guardedBlock(body, open) });
+      out.push({ field, region: upToFirstReturn(guardedBlock(body, open)) });
     }
   }
   return out;
@@ -142,13 +153,25 @@ describe('the suite grades every backend it certifies', () => {
 
   // The same trade, spelled as a bare `return` instead of a skip — invisible to any check that greps
   // for `skip`. Every region a case guards on a capability has to assert something.
-  it.each(cases().map((c) => [c.title]))('makes every capability branch of %s assert', (title) => {
-    const owner = cases().find((c) => c.title === title) as { body: string };
-    for (const { field, region } of guardedRegions(owner.body)) {
-      expect(region, `\`ctx.${field}\` in "${title}" guards a region that asserts nothing`).toContain(
-        'expect(',
-      );
-    }
+  //
+  // A row per REGION, not per case: only a few cases carry a capability guard at all, so a table
+  // over every registered case spent most of its rows looping over an empty list — indistinguishable
+  // in the report from the rows that grade something.
+  const guardedByCase = (): [string, string, string][] =>
+    cases().flatMap((c) =>
+      guardedRegions(c.body).map(
+        ({ field, region }) => [field, c.title, region] as [string, string, string],
+      ),
+    );
+
+  it('finds capability-guarded regions, so the rows below are not an empty table', () => {
+    expect(guardedByCase().length).toBeGreaterThan(3);
+  });
+
+  it.each(guardedByCase())('makes the `%s` branch of "%s" assert', (field, title, region) => {
+    expect(region, `\`ctx.${field}\` in "${title}" guards a region that asserts nothing`).toContain(
+      'expect(',
+    );
   });
 
   // The detector itself, against the shapes it has to recognize — so it cannot regress to knowing
@@ -180,6 +203,13 @@ describe('the suite grades every backend it certifies', () => {
       "if (ctx.concurrentPost === 'unsupported') { testCtx.skip(); return; }",
       0,
       true,
+    ],
+    [
+      // The same trade one line further down: leave the assertions in place and step over them.
+      'an arm that returns before the assertions it still contains',
+      'if (!ctx.supportsBlockingFetch) {\n  return;\n  expect(1).toBe(1);\n}',
+      1,
+      false,
     ],
   ])('sees %s', (_label, snippet, regionCount, asserts) => {
     const regions = guardedRegions(snippet);

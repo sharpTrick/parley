@@ -59,6 +59,17 @@ function oneRetryAfterValue(raw: string, from: number): number | undefined {
 }
 
 /**
+ * When the server says "now". An HTTP-date `Retry-After` is a point on the SERVER's clock (RFC 9110
+ * §10.2.3), so measuring it against ours turns a client clock a minute ahead into a negative wait —
+ * i.e. no hint at all — and a client behind into a wait past the deadline. Keep the `Date` header as
+ * the origin whenever the response offers one, so that the hint is skew-invariant.
+ */
+function serverNow(res: Response): number {
+  const at = Date.parse(res.headers.get('date') ?? '');
+  return Number.isNaN(at) ? Date.now() : at;
+}
+
+/**
  * Milliseconds from a `Retry-After` header, or undefined if unusable. RFC 9110 defines BOTH forms:
  * `delay-seconds` and an HTTP-date. Reading only the first makes a date-form header look absent and
  * falls back to {@link DEFAULT_BACKOFF_MS} — an order of magnitude sooner than the server asked.
@@ -71,7 +82,7 @@ function oneRetryAfterValue(raw: string, from: number): number | undefined {
 export function retryAfterFromHeader(res: Response): number | undefined {
   const raw = res.headers.get('retry-after');
   if (raw === null) return undefined;
-  const from = Date.now();
+  const from = serverNow(res);
   const candidates = [raw, ...raw.split(',')]
     .map((part) => oneRetryAfterValue(part, from))
     .filter((ms): ms is number => ms !== undefined && ms > 0);
@@ -85,9 +96,46 @@ const usableHint = (ms: number | undefined): number | undefined =>
 const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
 
 /**
+ * Longest path segment treated as ordinary routing vocabulary on length alone. A segment past it is
+ * opaque enough to be a token — Discord's `/api/webhooks/<id>/<token>` carries one with no
+ * punctuation at all — while a shorter one is a word like `api` or `v1`.
+ */
+const ROUTE_WORD_CHARS = 8;
+
+/**
+ * How a method name is spelled at any length: `getUpdates`, `conversations`, `chat.postMessage`.
+ * Keep this exemption, so that redaction cannot strike a segment out of the PROSE of an error body:
+ * Telegram's own 409 reads "can't use getUpdates method while webhook is active", and an operator
+ * shown "can't use <redacted> method" has been told less than nothing.
+ */
+const ROUTE_WORD = /^[A-Za-z.]+$/;
+
+const carriesSecret = (part: string): boolean =>
+  part.includes(':') || (part.length > ROUTE_WORD_CHARS && !ROUTE_WORD.test(part));
+
+/**
+ * Both sides of the percent-encoding boundary. `URL` hands userinfo back ENCODED (a password's own
+ * `:` comes out as `%3A`) and query values back DECODED, so a component's getter is only one of the
+ * two spellings a body or a transport error can echo. Keep both, so that a token cannot survive
+ * redaction by being written the way the other half of the parser spells it.
+ */
+function spellings(part: string): string[] {
+  const out = new Set([part, encodeURIComponent(part)]);
+  // Keep the catch: a stray `%` in a URL makes `decodeURIComponent` throw, and this runs on the
+  // path that is BUILDING an error message.
+  try {
+    out.add(decodeURIComponent(part));
+  } catch {
+    out.add(part);
+  }
+  return [...out];
+}
+
+/**
  * The parts of the request URL that are themselves a secret. Telegram's path is
- * `/bot<id>:<token>/<method>`, and a transport or a hostile body can echo the path alone — which no
- * scheme-anchored sweep and no byte-identical comparison against the full URL would catch.
+ * `/bot<id>:<token>/<method>` and Discord's is `/api/webhooks/<id>/<token>`, and a transport or a
+ * hostile body can echo the path alone — which no scheme-anchored sweep and no byte-identical
+ * comparison against the full URL would catch.
  *
  * Every component a credential can hide in is enumerated, not just the path: userinfo and a query
  * value are the two other places an API key is conventionally carried, and a body echoing one of
@@ -102,12 +150,12 @@ function credentialParts(url: string): string[] {
   }
   const { pathname, username, password, searchParams } = parsed;
   const parts = [
-    ...[pathname, ...pathname.split('/')].filter((part) => part.includes(':')),
+    ...[pathname, ...pathname.split('/')].filter(carriesSecret),
     username,
     password,
     ...[...searchParams.values()],
   ];
-  return parts.filter((part) => part.length > 1);
+  return [...new Set(parts.flatMap(spellings))].filter((part) => part.length > 1);
 }
 
 /**
@@ -235,9 +283,6 @@ export function statusOf(err: unknown): number | undefined {
   return undefined;
 }
 
-/** Statuses whose `Response` may not carry a body at all (the constructor throws if one is given). */
-const NULL_BODY_STATUS = new Set([204, 205, 304]);
-
 /** Bytes of a doomed body worth pulling off the socket: enough that {@link MAX_ERROR_BODY} chars of
  * it survive `sanitizeBody` even when every character is four bytes of UTF-8. */
 const DOOMED_BODY_BYTES = MAX_ERROR_BODY * 4;
@@ -299,7 +344,7 @@ async function buffered(res: Response, maxBytes: number, doomed: boolean): Promi
   if (overflowed && !doomed) {
     throw new BodyTooLargeError(`response body exceeded ${maxBytes} bytes`);
   }
-  const body = text.length === 0 || NULL_BODY_STATUS.has(res.status) ? null : text;
+  const body = text.length === 0 ? null : text;
   const { status, statusText, headers } = res;
   return new Response(body, { status, statusText, headers });
 }
@@ -329,6 +374,24 @@ async function fetchOnce(
     if (deadline.aborted) throw new Error(`${label} → deadline: no response within ${budgetMs}ms`);
     if (err instanceof BodyTooLargeError) throw new Error(`${label} → body: ${err.message}`);
     throw new Error(`${label} → transport: ${sanitizeBody(redactUrls(errorText(err), url))}`);
+  }
+}
+
+/**
+ * The caller's own `Retry-After` parser, whose failure is not this call's failure. A hook that reads
+ * the body — `res.clone().json()` against an HTML 429 page from a CDN — throws, and an unguarded
+ * hook throws THAT out of the loop: unlabeled, unredacted, and carrying no status for a caller to
+ * branch on. Keep the catch, so that a parser which cannot read the body means "no usable hint"
+ * rather than an error outside the envelope; the header floor is computed independently of it.
+ */
+async function callerHint(
+  parse: FetchWithRetryOptions['retryAfterOf'],
+  res: Response,
+): Promise<number | undefined> {
+  try {
+    return await parse?.(res);
+  } catch {
+    return undefined;
   }
 }
 
@@ -417,7 +480,7 @@ export async function fetchWithRetry(
     // that is what escalates a rate limit into a ban. The header is a FLOOR the caller's parser
     // cannot lower, and an unreasonable hint is refused by the deadline below, not shortened.
     const header = usableHint(retryAfterFromHeader(res));
-    const parsed = usableHint(await opts.retryAfterOf?.(res));
+    const parsed = usableHint(await callerHint(opts.retryAfterOf, res));
     const hinted = header === undefined ? parsed : Math.max(header, parsed ?? 0);
     const stated = hinted !== undefined;
     const wait = hinted ?? DEFAULT_BACKOFF_MS;

@@ -192,6 +192,14 @@ export interface BrokenVariant {
   name: string;
   /** A case title the suite MUST fail for this variant. */
   mustFail: string;
+  /**
+   * The `Message` field or seam call this variant corrupts. The clause↔variant mapping is per
+   * CLAUSE, so a clause could keep its control while individual assertions INSIDE it had none — six
+   * of them did, and neutering all six at once left this whole package green. Keyed by field, the
+   * requirement is mechanical in both directions: a `Message` field no variant names is a field the
+   * suite can stop asserting on for free.
+   */
+  mutates: string;
   make: () => Promise<ConformanceContext>;
 }
 
@@ -214,6 +222,7 @@ const wrap = async (
 export const BROKEN_VARIANTS: BrokenVariant[] = [
   {
     name: 'inclusive since',
+    mutates: 'fetchRecent',
     mustFail: 'only newer messages (exclusive)',
     make: () =>
       wrap((inner) => ({
@@ -228,6 +237,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a constant topic on every message',
+    mutates: 'topic',
     mustFail: 'topics are isolated',
     make: () =>
       wrap((inner) => ({
@@ -242,6 +252,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a constant backendMsgId',
+    mutates: 'backendMsgId',
     mustFail: 'unique ids and distinct cursors',
     make: () =>
       wrap((inner) => ({
@@ -256,6 +267,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'an oldest-first default window',
+    mutates: 'fetchRecent',
     mustFail: 'returns the NEWEST messages',
     make: () =>
       wrap((inner) => ({
@@ -272,6 +284,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a subscribe that replays history as live',
+    mutates: 'subscribe',
     mustFail: 'exactly the post-subscribe tail',
     make: () =>
       wrap((inner) => ({
@@ -284,6 +297,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a post that still serves after disconnect',
+    mutates: 'disconnect',
     mustFail: 'disconnect is idempotent',
     make: () =>
       wrap((inner) => {
@@ -302,6 +316,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'mentions dropped from every message',
+    mutates: 'mentions',
     mustFail: 'via live push and via catch-up',
     make: () =>
       wrap((inner) => ({
@@ -313,6 +328,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a blank senderHandle',
+    mutates: 'senderHandle',
     mustFail: 'not collapsed onto one another',
     make: () =>
       wrap((inner) => ({
@@ -327,6 +343,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a cursor that does not advance past a truncating limit',
+    mutates: 'cursor',
     mustFail: 'paging from a cursor with limit',
     make: () =>
       wrap((inner) => ({
@@ -339,6 +356,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'an unreplayable cursor on an absent topic',
+    mutates: 'cursor',
     mustFail: 'never-posted topic',
     make: () =>
       wrap(() => ({
@@ -351,6 +369,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a plain Error for an absent topic instead of NoSuchTopicError',
+    mutates: 'fetchRecent',
     mustFail: 'never-posted topic',
     make: () => throwingReference(() => new Error('nope')),
   },
@@ -359,6 +378,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // row itself, exactly as a BIGSERIAL reader sees seq 42 committed while 41 is not. Only a reader
     // placed INSIDE the write window can see it.
     name: 'a cursor that advances past a row it did not return',
+    mutates: 'cursor',
     mustFail: 'interleaved with concurrent writers',
     make: () =>
       wrap((inner) => ({
@@ -376,6 +396,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // Silent alteration, the failure mode a "post then read one short ASCII string" suite cannot
     // see: accept the payload, store something else, report success.
     name: 'content flattened on the way in',
+    mutates: 'content',
     mustFail: 'either round-trips',
     make: () =>
       wrap((inner) => ({
@@ -384,6 +405,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a fetch that parks forever on blockMs',
+    mutates: 'fetchRecent',
     mustFail: 'blockMs is honoured natively or ignored promptly',
     make: () =>
       wrap((inner) => ({
@@ -397,9 +419,28 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       })),
   },
   {
+    // The same hang one argument away: park on a budget that came WITHOUT a cursor. That is the
+    // first iteration of core's long-poll wrapper, so it stalls every fetch an agent makes before
+    // it has a cursor — while the variant above, which parks only on an empty page, sails through.
+    name: 'a fetch that parks on a since-less blockMs',
+    mutates: 'fetchRecent',
+    mustFail: 'blockMs is honoured natively or ignored promptly',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined && args.blockMs !== undefined) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(args.blockMs ?? 0, 20_000)));
+          }
+          return page;
+        },
+      })),
+  },
+  {
     // Content-keyed identity: the shape a backend that treats a repost as the same message has.
     // Core's dedup namespace is `backendMsgId`, so two turns with the same words collapse into one.
     name: 'a post that dedupes identical content',
+    mutates: 'post',
     mustFail: 'the same content posted twice',
     make: () =>
       wrap((inner) => ({
@@ -415,6 +456,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // A cursor at the tail that re-serves the newest message: the catch-up loop then replays the
     // last message on every poll forever, because `since` never gets past it.
     name: 'a tail cursor that re-delivers the newest message',
+    mutates: 'cursor',
     mustFail: 'since at the tail',
     make: () =>
       wrap((inner) => ({
@@ -430,6 +472,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a post that rejects a threaded reply',
+    mutates: 'post',
     mustFail: 'post accepts inReplyTo',
     make: () =>
       wrap((inner) => ({
@@ -443,6 +486,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // A live path that fans every message to every handler regardless of topic: core then emits a
     // `<channel>` event for a topic the allowlist never admitted.
     name: 'a live path that ignores its topic filter',
+    mutates: 'subscribe',
     mustFail: 'on the live path too',
     make: () =>
       wrap((inner) => {
@@ -465,6 +509,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a resolveIdentity that answers about someone else',
+    mutates: 'resolveIdentity',
     mustFail: 'resolveIdentity answers',
     make: () =>
       wrap(() => ({
@@ -479,6 +524,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // The lost-wakeup race: park "from now" instead of at the caller's cursor, so a message landing
     // between the read and the waiter is reported as already-consumed and can never be fetched.
     name: 'a blocking read that parks from now instead of at the caller cursor',
+    mutates: 'fetchRecent',
     mustFail: 'blocking fetch is not missed',
     make: () =>
       wrap((inner) => ({
@@ -496,6 +542,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // Each writer numbering from its own sequence — the cursor namespace a backend gets when the
     // ordering key is per-connection rather than per-topic. Cursors then collide across writers.
     name: 'a cursor namespace that restarts per writer',
+    mutates: 'cursor',
     mustFail: 'multi-process writes',
     make: () =>
       wrap((inner) => ({
@@ -517,6 +564,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // The loopback: a live path that only ever echoes writes made through THIS client. Every other
     // subscribe case posts through the subscribing client, so nothing else can see it.
     name: 'a live path that only echoes its own writes',
+    mutates: 'subscribe',
     mustFail: 'written by an independent client',
     make: () =>
       wrap((inner) => {
@@ -536,5 +584,114 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
           },
         };
       }),
+  },
+  {
+    // Every variant above corrupts something a WHOLE clause is built on, so the assertions inside a
+    // clause had no control of their own: `timestamp` was asserted parseable and no plugin anywhere
+    // produced an unparseable one. Core rejects ordering on it, but it is what an operator reads.
+    name: 'a timestamp no clock could have produced',
+    mutates: 'timestamp',
+    mustFail: 'in order, with unique ids and distinct cursors',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          return {
+            ...page,
+            messages: page.messages.map((m) => ({ ...m, timestamp: 'the other day' })),
+          };
+        },
+      })),
+  },
+  {
+    // Blank ONE cursor, not all of them: blanking every cursor also collapses the distinct-cursor
+    // assertion, and a control that trips two assertions cannot tell which one is still alive.
+    name: 'an empty cursor on the oldest message of a page',
+    mutates: 'cursor',
+    mustFail: 'in order, with unique ids and distinct cursors',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          return {
+            ...page,
+            messages: page.messages.map((m, i) => (i === 0 ? { ...m, cursor: asCursor('') } : m)),
+          };
+        },
+      })),
+  },
+  {
+    // The same, one level down: `post` reports the blank id too, so the id it returns still matches
+    // the one catch-up reports and the uniqueness assertions still hold. All that is left is the
+    // length check — which nothing could fail before this.
+    name: 'an empty backendMsgId, reported the same way by post',
+    mutates: 'backendMsgId',
+    mustFail: 'in order, with unique ids and distinct cursors',
+    make: () =>
+      wrap((inner) => {
+        const blanked = new Set<string>();
+        return {
+          post: async (t, i, c, o) => {
+            const opens = (await inner.fetchRecent({ topic: t, limit: 1 })).messages.length === 0;
+            const id = await inner.post(t, i, c, o);
+            if (!opens) return id;
+            blanked.add(String(id));
+            return asBackendMsgId('');
+          },
+          fetchRecent: async (args) => {
+            const page = await inner.fetchRecent(args);
+            return {
+              ...page,
+              messages: page.messages.map((m) =>
+                blanked.has(String(m.backendMsgId)) ? { ...m, backendMsgId: asBackendMsgId('') } : m,
+              ),
+            };
+          },
+        };
+      }),
+  },
+  {
+    // The IDEMPOTENT half of "disconnect is idempotent and stops the plugin serving". The variant
+    // above it only stops serving; deleting the second `disconnect()` call cost nothing.
+    name: 'a disconnect that throws on the second call',
+    mutates: 'disconnect',
+    mustFail: 'disconnect is idempotent',
+    make: async () => {
+      const ctx = await wrap((inner) => {
+        let calls = 0;
+        return {
+          disconnect: async () => {
+            calls++;
+            if (calls > 1) throw new Error('already disconnected');
+            await inner.disconnect();
+          },
+        };
+      });
+      // The teardown must SWALLOW it, so that the case which calls `disconnect()` twice is the only
+      // one that fails: an afterEach that rethrows reddens all 21 and the control proves nothing.
+      return { ...ctx, cleanup: () => ctx.plugin.disconnect().then(() => undefined, () => undefined) };
+    },
+  },
+  {
+    // `backendRef` is how core addresses the account behind a handle. The variant above answers
+    // about the wrong handle; nothing produced an empty ref, so that assertion graded nothing.
+    name: 'an empty backendRef',
+    mutates: 'resolveIdentity',
+    mustFail: 'resolveIdentity answers',
+    make: () => wrap(() => ({ resolveIdentity: (handle) => Promise.resolve({ handle, backendRef: '' }) })),
+  },
+  {
+    // The id `post` RETURNS, which core stores as the dedup key without reading the topic back.
+    // Catch-up stays honest here, so only the assertions over post's own return value can see it.
+    name: 'a post that returns one id for every message',
+    mutates: 'post',
+    mustFail: 'in order, with unique ids and distinct cursors',
+    make: () =>
+      wrap((inner) => ({
+        post: async (t, i, c, o) => {
+          await inner.post(t, i, c, o);
+          return asBackendMsgId('one-id-for-all');
+        },
+      })),
   },
 ];

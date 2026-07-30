@@ -27,6 +27,13 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+      # Each package's `tsconfig.json` covers `src/**` only and vitest transpiles tests without
+      # typechecking them, so without this step no fixture in the repo is ever seen by a compiler and
+      # every `tsconfig.test.json` is configuration nothing runs. Keep it AFTER the build: a test
+      # config resolves its dependencies through their built `dist/*.d.ts`.
+      - run: npm run typecheck:test --workspaces --if-present
+      - run: npm run typecheck --workspaces --if-present
+
       # Every server the suites can use, via the same script maintainers run locally
       # (examples/dev-compose/dev-infra.sh) rather than a second copy of the recipes here — so CI
       # and the dev path cannot drift. Brings up redis, nats, postgres, prosody, synapse and

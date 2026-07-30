@@ -6,6 +6,7 @@ const packagesDir = new URL('../../', import.meta.url);
 interface Manifest {
   name?: string;
   private?: boolean;
+  scripts?: Record<string, string>;
   description?: string;
   keywords?: string[];
   files?: string[];
@@ -115,5 +116,42 @@ describe('a test tsconfig typechecks its own sources, not its dist', () => {
     const { name } = manifests().find((m) => m.dir === dir)?.pkg as { name: string };
     const parsed = JSON.parse(cfg) as { compilerOptions?: { paths?: Record<string, string[]> } };
     expect(parsed.compilerOptions?.paths?.[name]).toEqual(['./src/index.ts']);
+  });
+
+  // The half that decides whether any of the above is alive. The configs and the scripts existed and
+  // were asserted correct, while CI ran `npm ci`, `tsc -b` (src only) and vitest (which transpiles
+  // without typechecking) — so a type error in any fixture in this repo passed CI in full, and the
+  // gate this file calls "the one that would have caught a changed public surface" never ran.
+  const ci = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+
+  it('reads a CI workflow that builds and tests, so the rows below grade something', () => {
+    expect(ci).toMatch(/npm run build/);
+    expect(ci).toMatch(/npm test/);
+  });
+
+  // Keyed on the script that COMPILES the config, not on one blessed script name: the four packages
+  // that have one do not agree on what to call it, and a hard-coded name would grade three of them
+  // and silently excuse the fourth.
+  const compilesItsTests = (pkg: Manifest): string[] =>
+    Object.entries(pkg.scripts ?? {})
+      .filter(([, cmd]) => cmd.includes('tsconfig.test.json'))
+      .map(([name]) => name);
+
+  it.each(withTestTsconfig().map(({ dir }) => dir))('CI runs %s’s test typecheck', (dir) => {
+    const { pkg } = manifests().find((m) => m.dir === dir) as { pkg: Manifest };
+    const scripts = compilesItsTests(pkg);
+    expect(
+      scripts,
+      `packages/${dir} ships a tsconfig.test.json but no script compiles it`,
+    ).not.toEqual([]);
+    const invoked = scripts.some(
+      (name) =>
+        new RegExp(`npm run ${name}\\s+--workspaces`).test(ci) ||
+        new RegExp(`npm run ${name}\\b[^\\n]*\\b${dir}\\b`).test(ci),
+    );
+    expect(
+      invoked || ci.includes(`packages/${dir}/tsconfig.test.json`),
+      `no CI step invokes packages/${dir}'s ${scripts.join('/')}, so its fixture is never compiled`,
+    ).toBe(true);
   });
 });

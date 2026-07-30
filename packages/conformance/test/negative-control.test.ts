@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { asTopic, buildMessage } from '@sharptrick/parley-core';
 import { CLAUSES } from '@sharptrick/parley-conformance';
-import { BROKEN_VARIANTS } from './reference-plugin.js';
+import { BROKEN_VARIANTS, ReferencePlugin } from './reference-plugin.js';
 
 /**
  * The suite's negative control. A suite that accepts every plugin certifies nothing, and an
@@ -31,7 +32,7 @@ beforeAll(async () => {
   try {
     const run = await promisify(execFile)(
       'npx',
-      ['vitest', 'run', TARGET, '--reporter=json', `--outputFile=${out}`, '--testTimeout=20000'],
+      ['vitest', 'run', TARGET, '--reporter=json', `--outputFile=${out}`, '--testTimeout=30000'],
       {
         cwd: REPO_ROOT,
         env: { ...process.env, PARLEY_CONFORMANCE_BROKEN: '1', CI: '1' },
@@ -71,6 +72,44 @@ describe('every clause the suite grades has a plugin that fails it', () => {
       (v) => !CLAUSES.some((c) => c.includes(v.mustFail) || v.mustFail.includes(c)),
     );
     expect(orphans.map((v) => v.name)).toEqual([]);
+  });
+});
+
+/**
+ * One level down from the clause. A clause keeps its control while an assertion INSIDE it has none:
+ * six could be neutered at once — the `timestamp` parse, the length of `backendMsgId`, `cursor` and
+ * `backendRef`, the second `disconnect()`, and the uniqueness of the ids `post` returns — with this
+ * package, negative control included, staying green.
+ *
+ * Derived from the `Message` a plugin actually builds rather than a hand-kept list, so a field added
+ * to the seam's own type arrives here as a red row instead of an untested one.
+ */
+describe('every Message field the suite reads has a plugin that corrupts it', () => {
+  const MESSAGE_FIELDS = Object.keys(
+    buildMessage({ topic: asTopic('t'), sender: 's', content: 'c', timestamp: 'ts', id: 'i' }),
+  );
+  const SEAM_CALLS = Object.getOwnPropertyNames(ReferencePlugin.prototype).filter(
+    (n) => n !== 'constructor',
+  );
+
+  it('reads the fields off a real Message, so the rows below are not an empty table', () => {
+    expect(MESSAGE_FIELDS).toEqual(expect.arrayContaining(['cursor', 'backendMsgId', 'timestamp']));
+    expect(MESSAGE_FIELDS.length).toBeGreaterThan(5);
+  });
+
+  it.each(MESSAGE_FIELDS)('a variant corrupts `%s`', (field) => {
+    expect(
+      BROKEN_VARIANTS.filter((v) => v.mutates === field).map((v) => v.name),
+      `no BROKEN_VARIANTS entry mutates \`${field}\` — every assertion the suite makes about it can ` +
+        `be deleted with this package staying green`,
+    ).not.toEqual([]);
+  });
+
+  it('every variant names something real as what it corrupts', () => {
+    const vocabulary = new Set([...MESSAGE_FIELDS, ...SEAM_CALLS]);
+    expect(
+      BROKEN_VARIANTS.filter((v) => !vocabulary.has(v.mutates)).map((v) => `${v.name} → ${v.mutates}`),
+    ).toEqual([]);
   });
 });
 

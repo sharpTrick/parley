@@ -23,6 +23,16 @@ const DRAIN_PAGE = 500;
  */
 const READER_BUDGET_MS = 15_000;
 
+/**
+ * Budget offered to the since-less blocking read, and the bound on how long that read may take.
+ *
+ * Keep it just under the harness's own per-case timeout: a since-less window fetch costs SECONDS on
+ * a loaded Matrix homeserver, and the assertion has to read as "the plugin did not spend the
+ * budget", never as a grade of the backend's latency. At this size a read that trips it has already
+ * spent more than the rest of the case leaves, so it cannot be the marginal cause of a red.
+ */
+const SINCELESS_BLOCK_MS = 19_000;
+
 /** The volume the paging clause is graded over. Exported so its row generator can be self-tested. */
 export const PAGING_VOLUME: readonly string[] = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
 
@@ -481,7 +491,19 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     it('blockMs is honoured natively or ignored promptly — never a hang', async () => {
       const t = ctx.freshTopic();
       await ctx.plugin.post(t, SENDER, 'old');
-      const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
+
+      // The since-LESS arm, graded on BOTH capability arms and carried by the fetch this case
+      // already had to make. Core's long-poll wrapper issues its first iteration with the caller's
+      // own `since` — undefined whenever the agent holds no cursor yet — so this is the hot path
+      // for every `parley_fetch_recent` that carries a block budget and no cursor. seam.ts and
+      // engine/blocking-fetch.ts agree here: a default window that HAS messages returns at once.
+      // Every other case in this suite passes a `since`, so nothing else can see a plugin that
+      // parks instead and holds the tool open for its whole budget.
+      const openedAt = Date.now();
+      const opening = await ctx.plugin.fetchRecent({ topic: t, blockMs: SINCELESS_BLOCK_MS });
+      const tail = opening.nextCursor;
+      expect(opening.messages.map((m) => m.content)).toEqual(['old']);
+      expect(Date.now() - openedAt).toBeLessThan(SINCELESS_BLOCK_MS);
 
       if (!ctx.supportsBlockingFetch) {
         // The hint is OPTIONAL; hanging on it is not. This is the only case in the suite that ever
