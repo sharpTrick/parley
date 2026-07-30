@@ -21,10 +21,19 @@
   | 4 | 120 | 113 | 45 | 57% | 56% |
   | 5 | 129 | 117 | 39 | 60% | 72% |
   | 6 | 90 | 86 | 26 | 80% | 81% |
+  | 7 | 79 | 75 | 23 | 66% | 57% |
 
-  Round 6 is the first round where **every count fell at once** — findings 129→90, CONFIRMED
-  117→86, blocking 39→26 — while self-induction rose to 80%. Pre-existing blocking findings have
-  fallen 36 → 25 → 20 → 11 → 5. The loop is running out of original codebase to find things in.
+  Round 6 was the first round where every count fell at once — findings 129→90, CONFIRMED 117→86,
+  blocking 39→26 — while self-induction rose to 80%, and I read that as the loop running out of
+  original codebase. **Round 7 refutes that reading.** Self-induction fell 80% → 66%, blocking
+  self-induction fell 81% → 57%, and pre-existing findings ROSE 18 → 27 (blocking 5 → 10). The loop
+  found twice as many original blocking defects in round 7 as in round 6, including a malformed
+  gateway frame that kills the whole MCP server process. The five-round monotone rise
+  (27 → 34 → 56 → 72 → 81) simply does not continue.
+
+  The oracle was re-run over rounds 5 and 6 before this was believed, and reproduced their recorded
+  60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
+  measured, it was not saturation.
 
   **Stop rule: two consecutive wake-all rounds with zero CONFIRMED findings, or round 20.** Offered
   the blocking-gated alternative at round 3 and deliberately declined it, to keep comparability with
