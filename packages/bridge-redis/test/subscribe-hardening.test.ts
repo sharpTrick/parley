@@ -225,11 +225,12 @@ describe('redis subscribe hardening — xInfoStream catch must not replay histor
   });
 });
 
-// CLASS: the subscribe read loop hides a non-recoverable backend fault. subscribe() has already
-// resolved and core keeps advertising this instance as subscribed, so a loop that can never deliver
-// again must not be indistinguishable from a quiet topic — while a fault that DOES heal must still
-// be ridden out. The axis that matters is the reason, not the retry count.
-describe('redis subscribe hardening — a dead live path must not look like a quiet topic', () => {
+// CLASS: the same backend fault is diagnosed on one delivery path and swallowed on another. Both
+// `subscribe` and a blocking `fetchRecent` issue XREAD on a reader of their own, so both meet the
+// same refusals — but a caller of either has already been told the call succeeded, so a fault no
+// retry can clear must reach the operator on BOTH, while one that heals must be ridden out on both.
+// The axes that matter are the path and the reason, never the retry count.
+describe('redis hardening — a refusal is diagnosed on every XREAD path', () => {
   const reasons: Array<[string, string, 'permanent' | 'transient']> = [
     ['a bad BLOCK argument', 'ERR timeout is not an integer or out of range', 'permanent'],
     ['an unauthenticated connection', 'NOAUTH Authentication required.', 'permanent'],
@@ -243,7 +244,21 @@ describe('redis subscribe hardening — a dead live path must not look like a qu
     ['a failover redirect', 'MOVED 3999 127.0.0.1:6381', 'transient'],
   ];
 
-  it.each(reasons)('%s (%s) is %s', async (_label, message, kind) => {
+  const paths = ['subscribe', 'blocking fetchRecent'] as const;
+
+  const rows = paths.flatMap((path) =>
+    reasons.map(
+      ([reason, message, kind]) =>
+        [`${path}: ${reason} (${message}) is ${kind}`, path, message, kind] as [
+          string,
+          (typeof paths)[number],
+          string,
+          'permanent' | 'transient',
+        ],
+    ),
+  );
+
+  it.each(rows)('%s', async (_label, path, message, kind) => {
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const plugin = new RedisPlugin();
     await plugin.connect({ url: 'redis://mock' });
@@ -271,24 +286,59 @@ describe('redis subscribe hardening — a dead live path must not look like a qu
     queue(reader);
 
     try {
-      await plugin.subscribe(asTopic('ops'), (m) => received.push(m));
-
-      if (kind === 'transient') {
-        await vi.waitFor(() => expect(received.map((m) => m.content)).toEqual(['healed']), {
-          timeout: 3000,
-        });
-        expect(stderr).not.toHaveBeenCalled();
-        return;
+      let failure: Error | undefined;
+      if (path === 'subscribe') {
+        await plugin.subscribe(asTopic('ops'), (m) => received.push(m));
+        if (kind === 'transient') {
+          // The loop rides it out and delivers, so waiting for the delivery IS the settle point.
+          await vi.waitFor(() => expect(received.map((m) => m.content)).toEqual(['healed']), {
+            timeout: 3000,
+          });
+        } else {
+          await vi.waitFor(() => expect(stderr).toHaveBeenCalled(), { timeout: 3000 });
+        }
+      } else {
+        const page = await plugin
+          .fetchRecent({ topic: asTopic('ops'), since: '1-0' as unknown as Cursor, blockMs: 200 })
+          .catch((err: Error) => {
+            failure = err;
+            return undefined;
+          });
+        // A long poll has no retry loop of its own — core polls the remaining budget — so a
+        // transient fault is answered by the empty page the caller can always be handed.
+        if (kind === 'transient') {
+          expect(page?.messages).toEqual([]);
+          expect(page?.nextCursor).toBe('1-0');
+        }
       }
 
-      // Surfaced: one labelled stderr line naming the topic and the server's reason.
-      await vi.waitFor(() => expect(stderr).toHaveBeenCalled(), { timeout: 3000 });
-      const line = String(stderr.mock.calls[0]?.[0]);
-      expect(line).toMatch(/^parley-redis:/);
-      expect(line).toContain('ops');
-      expect(line).toContain(message);
+      // The class invariant, identical on both paths: a fault no retry can clear reaches the
+      // operator — as a rejected seam call or as a stderr line — and one that heals reaches nobody.
+      const diagnosed = failure !== undefined || stderr.mock.calls.length > 0;
+      expect(
+        diagnosed,
+        kind === 'permanent'
+          ? `${path} swallowed a permanent refusal: no error, no stderr, nothing to fix`
+          : `${path} reported a fault that heals on its own`,
+      ).toBe(kind === 'permanent');
 
-      // …and the loop STOPPED rather than retrying a fault no retry can clear.
+      if (kind === 'transient') return;
+
+      if (failure !== undefined) {
+        expect(failure.message).toMatch(/^parley-redis:/);
+        expect(failure.message, 'the operator cannot tell WHICH topic failed').toContain('ops');
+        expect(failure.message, 'the operator cannot tell which Redis key failed').toContain(
+          'parley:ops',
+        );
+        expect(failure.message).toContain(message);
+      } else {
+        const line = String(stderr.mock.calls[0]?.[0]);
+        expect(line).toMatch(/^parley-redis:/);
+        expect(line).toContain('ops');
+        expect(line).toContain(message);
+      }
+
+      // …and the path STOPPED rather than retrying a fault no retry can clear.
       const frozen = reader.xRead.mock.calls.length;
       await sleep(400);
       expect(reader.xRead.mock.calls.length).toBe(frozen);
@@ -337,43 +387,110 @@ describe('redis long-poll — the blocking read starts at the caller cursor, nev
   });
 });
 
-describe('redis subscribe hardening — reader lifecycle + generation gating', () => {
-  it('registers the reader before connect() so a racing disconnect() tears it down (no leak)', async () => {
+// CLASS: a supersession gate that exists on every lifecycle path but is graded on only one. Every
+// reader-opening path captures the connect generation and re-checks it at each continuation, but the
+// checks were asserted for `subscribe` alone — both of the long poll's could be deleted with the
+// whole suite green. A reader that outlives the `disconnect()` which superseded it holds a socket
+// for the rest of the granted budget and can hand back messages written after teardown, which the
+// conformance clause "disconnect stops the plugin serving" forbids.
+//
+// Two axes: the PATH that opened the reader, and WHERE `disconnect()` wins the race — inside the
+// handshake (which `tearDown` deliberately leaves alone, so only the gate can close it) or parked in
+// the read (where the entries are already in flight). Held on deferreds rather than timing, so the
+// window is exact instead of likely.
+describe('redis hardening — a superseded reader serves nobody, on every path', () => {
+  function deferred<T>(): { promise: Promise<T>; settle: (value: T) => void } {
+    let settle!: (value: T) => void;
+    const promise = new Promise<T>((resolve) => {
+      settle = resolve;
+    });
+    return { promise, settle };
+  }
+
+  const paths = ['subscribe', 'blocking fetchRecent'] as const;
+  const races = ['the reader handshake', 'the blocking read'] as const;
+
+  const cells = paths.flatMap((path) =>
+    races.map(
+      (race) =>
+        [`${path}: disconnect() during ${race}`, path, race] as [
+          string,
+          (typeof paths)[number],
+          (typeof races)[number],
+        ],
+    ),
+  );
+
+  it.each(cells)('%s', async (_label, path, race) => {
     const plugin = new RedisPlugin();
     await plugin.connect({ url: 'redis://mock' });
 
-    let releaseConnect!: () => void;
+    const late: XReadResult = [
+      {
+        name: 'parley:ops',
+        messages: [{ id: '9-0', message: { sender: 'bob', content: 'late', ts: '' } }],
+      },
+    ];
+    const handshake = deferred<void>();
+    const parked = deferred<XReadResult>();
     const reader = makeReader({
-      // Hold connect() open so disconnect() can win the race while it is in flight.
-      connect: vi.fn(
-        () =>
-          new Promise<void>((resolve) => {
-            releaseConnect = () => {
-              reader.isOpen = true;
-              resolve();
-            };
-          }),
+      connect: vi.fn(async () => {
+        if (race === 'the reader handshake') await handshake.promise;
+        reader.isOpen = true;
+      }),
+      xRead: vi.fn(
+        (): Promise<XReadResult> =>
+          race === 'the blocking read' ? parked.promise : Promise.resolve(late),
       ),
     });
     queue(reader);
 
-    const subP = plugin.subscribe(asTopic('ops'), vi.fn());
-    // subscribe() runs synchronously up to `await reader.connect()`, so the reader is already
-    // registered — the whole point of register-before-connect.
-    expect(peek(plugin).readers).toContain(reader);
+    const delivered: string[] = [];
+    const run =
+      path === 'subscribe'
+        ? plugin.subscribe(asTopic('ops'), (m) => delivered.push(m.content))
+        : plugin
+            .fetchRecent({
+              topic: asTopic('ops'),
+              since: '1-0' as unknown as Cursor,
+              blockMs: 2000,
+            })
+            .then((page) => {
+              delivered.push(...page.messages.map((m) => m.content));
+            });
 
-    // disconnect() wins the race while connect() is still pending.
+    if (race === 'the reader handshake') {
+      // Registered while its connect() is still held: every reader-opening path registers BEFORE
+      // connecting, so `disconnect()` can always find one whose handshake it must not interrupt.
+      await vi.waitFor(() => expect(peek(plugin).readers).toContain(reader), { timeout: 3000 });
+    } else {
+      await vi.waitFor(() => expect(reader.xRead).toHaveBeenCalled(), { timeout: 3000 });
+    }
+
     await plugin.disconnect();
+    handshake.settle();
+    parked.settle(late);
+    await run;
+    await sleep(100); // a straggling loop would deliver here
 
-    // Now let the straggling connect() resolve; subscribe() must NOT leak the connected reader.
-    releaseConnect();
-    await subP;
-
-    expect(peek(plugin).readers).toHaveLength(0);
-    expect(reader.isOpen).toBe(false); // torn down, not a leaked connected duplicate keeping the loop alive
-    expect(reader.disconnect).toHaveBeenCalled();
+    expect(
+      delivered,
+      'a superseded reader handed back a message that landed after disconnect()',
+    ).toEqual([]);
+    expect(peek(plugin).readers, 'the superseded reader is still registered').toHaveLength(0);
+    expect(reader.disconnect, 'the superseded reader was never closed').toHaveBeenCalled();
+    expect(reader.isOpen, 'the superseded reader still holds its socket').toBe(false);
+    if (race === 'the reader handshake') {
+      expect(
+        reader.xRead,
+        'XREAD BLOCK was issued on a connection disconnect() had already superseded, so the ' +
+          'socket lives for the whole granted budget past teardown',
+      ).not.toHaveBeenCalled();
+    }
   });
+});
 
+describe('redis subscribe hardening — reader lifecycle + generation gating', () => {
   it('does not revive a prior loop after disconnect()/connect() and does not cross-deliver', async () => {
     const plugin = new RedisPlugin();
     await plugin.connect({ url: 'redis://mock' });

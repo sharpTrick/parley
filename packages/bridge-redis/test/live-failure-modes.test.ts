@@ -80,27 +80,107 @@ describe.skipIf(!redisUp)('redis failure modes — an omitted-as-null knob still
   });
 });
 
-describe.skipIf(!redisUp)('redis failure modes — retention_days keeps history when unset', () => {
-  const accepted: Array<[string, number | null | undefined]> = [
-    ['omitted', undefined],
-    ['null (DESIGN §11 "unset")', null],
-    ['a real window', 7],
+// -------------------------------------------------------------------------------------------
+// CLASS: a config knob whose only observable effect is on BACKEND STATE, graded solely by its
+// negative direction. Every retention row used to assert history was KEPT — which a plugin that
+// never sends the trim at all satisfies perfectly, so `retention_days` could be made a complete
+// no-op with nothing red. Both directions are generated from one table below.
+//
+// The old entries are written at EXPLICIT ids by an independent writer, so "older than the window"
+// is a property of the data rather than of how long the test slept, and the trim is triggered by
+// one `post` through the plugin — the only thing that ever trims.
+// -------------------------------------------------------------------------------------------
+
+interface Retention {
+  days: number | null | undefined;
+  /** How far in the past the seeded entries' ids sit. */
+  ageDays: number;
+  /** Seeded entries, as a function of the server's stream node size — `~` trims whole nodes. */
+  seeded: (nodeMax: number) => number;
+  effect: 'trimmed' | 'kept';
+}
+
+/**
+ * The server's `stream-node-max-entries`. `MINID ~` trims whole listpack nodes, so how many old
+ * entries must be seeded before ANY of them can go is the server's setting, not a number this file
+ * may assume.
+ */
+async function streamNodeMaxEntries(client: Writer): Promise<number> {
+  const reported = Number((await client.configGet('stream-node-max-entries'))[
+    'stream-node-max-entries'
+  ]);
+  expect(
+    Number.isSafeInteger(reported) && reported > 1,
+    `the server reported stream-node-max-entries=${reported}, so the rows below prove nothing`,
+  ).toBe(true);
+  return reported;
+}
+
+describe.skipIf(!redisUp)('redis failure modes — retention_days trims, and only what it must', () => {
+  const rows: Array<[string, Retention]> = [
+    [
+      'a window shorter than the history trims it away',
+      { days: 1, ageDays: 30, seeded: (n) => 2 * n, effect: 'trimmed' },
+    ],
+    [
+      'a window that is not a whole number of milliseconds still trims',
+      { days: 30 / 7, ageDays: 30, seeded: (n) => 2 * n, effect: 'trimmed' },
+    ],
+    [
+      'a window longer than the history keeps every entry',
+      { days: 30, ageDays: 1, seeded: (n) => 2 * n, effect: 'kept' },
+    ],
+    [
+      'less than one node of expired entries is kept — the trim is approximate',
+      { days: 1, ageDays: 30, seeded: (n) => n - 1, effect: 'kept' },
+    ],
+    [
+      'omitted keeps every entry forever',
+      { days: undefined, ageDays: 30, seeded: (n) => 2 * n, effect: 'kept' },
+    ],
+    [
+      'null (DESIGN §11 "unset") keeps every entry forever',
+      { days: null, ageDays: 30, seeded: (n) => 2 * n, effect: 'kept' },
+    ],
   ];
 
-  it.each(accepted)('%s keeps every posted message', async (_label, value) => {
+  it.each(rows)('%s', async (_label, row) => {
     const prefix = freshPrefix();
     const plugin = new RedisPlugin();
-    await plugin.connect({ url: REDIS_URL, key_prefix: prefix, retention_days: value });
+    const writer = createRedisClient(REDIS_URL, FAST);
     const t = freshTopic();
+    const key = `${prefix}${t}`;
     try {
-      for (let i = 0; i < 40; i++) await plugin.post(t, asHandle('w'), `m${i}`);
-      await new Promise((r) => setTimeout(r, 250)); // any wall-clock-threshold trim would bite here
-      for (let i = 40; i < 45; i++) await plugin.post(t, asHandle('w'), `m${i}`);
+      await writer.connect();
+      const seeded = row.seeded(await streamNodeMaxEntries(writer));
+      const base = Date.now() - row.ageDays * 86_400_000;
+      for (let i = 0; i < seeded; i++) {
+        await writer.xAdd(key, `${base + i}-0`, { sender: 'w', content: `old${i}` });
+      }
+      await plugin.connect({ url: REDIS_URL, key_prefix: prefix, retention_days: row.days });
+      await plugin.post(t, asHandle('w'), 'fresh');
+
+      const remaining = await writer.xLen(key);
       const page = await plugin.fetchRecent({ topic: t, limit: 10_000 });
-      expect(page.messages).toHaveLength(45);
-      expect(page.messages[0]?.content).toBe('m0');
+      if (row.effect === 'trimmed') {
+        expect(
+          remaining,
+          `${seeded} entries ${row.ageDays} days old survived a ${row.days}-day window, so ` +
+            `retention_days did nothing at all`,
+        ).toBe(1);
+        expect(page.messages.map((m) => m.content)).toEqual(['fresh']);
+      } else {
+        expect(
+          remaining,
+          `entries the ${String(row.days)}-day window covers were trimmed anyway`,
+        ).toBe(seeded + 1);
+        expect(page.messages).toHaveLength(seeded + 1);
+        expect(page.messages[0]?.content).toBe('old0');
+        expect(page.messages.at(-1)?.content).toBe('fresh');
+      }
     } finally {
-      await plugin.disconnect();
+      await writer.disconnect().catch(() => undefined);
+      await plugin.disconnect().catch(() => undefined);
       await wipe(prefix);
     }
   });
@@ -282,17 +362,28 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
   // Every row declares the timestamp it must DERIVE, not merely that one parses: an assertion of the
   // form `!Number.isNaN(Date.parse(ts))` is satisfied by any constant, so replacing the derivation
   // with `new Date(0)` would report 1970 for every message and the suite would certify it.
-  // `from-id` = the stream id's own millisecond component; `passthrough` = the entry's `ts` verbatim.
-  type Derivation = 'from-id' | 'passthrough';
+  // `from-id` = the stream id's own millisecond component; `from-ts` = the entry's own `ts`.
+  //
+  // The `from-ts` rows carry a SPELLING axis, because DESIGN §5 declares a FORMAT and not merely a
+  // parseable string: `Date.parse` accepts RFC 2822, `MM/DD/YYYY`, a bare year and a date with no
+  // time, and forwarding one verbatim puts it into `Message.timestamp` — where which spellings are
+  // accepted is implementation-defined, so the same entry can normalize differently per Node
+  // release. For `from-id` one row per unusable spelling would prove nothing: an empty `ts`,
+  // `not-a-date` and a bare epoch number all take the same fallback.
+  type Derivation = 'from-id' | 'from-ts';
   const foreignEntries: Array<[string, Record<string, string>, Derivation]> = [
     ['no recognised field at all', { unrelated: '1' }, 'from-id'],
     ['content only (a human via redis-cli)', { content: 'hi from redis-cli' }, 'from-id'],
     ['sender only', { sender: 'alice' }, 'from-id'],
     ['an empty sender', { sender: '', content: 'anon' }, 'from-id'],
-    // One row per DERIVATION, not one per unusable spelling: an empty `ts`, `not-a-date` and a bare
-    // epoch number all take the same fallback, so extra spellings cannot fail for their own reason.
     ['a ts that is not a date', { sender: 'alice', content: 'hi', ts: 'not-a-date' }, 'from-id'],
-    ['a ts of its own', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09.000Z' }, 'passthrough'],
+    ['an ISO ts of its own', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09.000Z' }, 'from-ts'],
+    ['an ISO ts with an offset', { sender: 'a', content: 'hi', ts: '2020-05-06T07:08:09+02:00' }, 'from-ts'],
+    ['an ISO date with no time', { sender: 'a', content: 'hi', ts: '2020-05-06' }, 'from-ts'],
+    ['an RFC 2822 ts', { sender: 'a', content: 'hi', ts: 'Tue, 05 Nov 2024 10:00:00 GMT' }, 'from-ts'],
+    ["a ts in Date's own toString form", { sender: 'a', content: 'hi', ts: 'Mon Jan 01 2020' }, 'from-ts'],
+    ['a MM/DD/YYYY ts', { sender: 'a', content: 'hi', ts: '12/25/2021' }, 'from-ts'],
+    ['a bare-year ts', { sender: 'a', content: 'hi', ts: '2020' }, 'from-ts'],
     ['extra unknown fields', { sender: 'alice', content: 'hi', shape: 'm.text', edited: '1' }, 'from-id'],
     ['binary-ish content', { sender: 'alice', content: '\u00ff\u00fe\u0001bin' }, 'from-id'],
   ];
@@ -314,13 +405,17 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
       expect(m?.cursor).toBe(id);
       expect(m?.content).toBe(fields.content ?? '');
       expect(m?.senderHandle, 'an empty handle collides with every other empty handle').not.toBe('');
-      const expected =
-        derivation === 'passthrough' ? fields.ts : new Date(Number(id.split('-')[0])).toISOString();
-      expect(m?.timestamp, `timestamp is not derived ${derivation}`).toBe(expected);
+      const source =
+        derivation === 'from-ts' ? Date.parse(fields.ts ?? '') : Number(id.split('-')[0]);
+      expect(m?.timestamp, `timestamp is not derived ${derivation}`).toBe(
+        new Date(source).toISOString(),
+      );
+      // Parseability is not the contract: `Date.parse` accepts `12/25/2021` and `2020`, so only
+      // re-serializing to the canonical form can say the value IS ISO 8601 (DESIGN §5).
       expect(
-        Number.isNaN(Date.parse(m?.timestamp ?? '')),
-        `timestamp ${JSON.stringify(m?.timestamp)} is not ISO 8601 (DESIGN §5)`,
-      ).toBe(false);
+        m?.timestamp,
+        `timestamp ${JSON.stringify(m?.timestamp)} is not in ISO 8601 form (DESIGN §5)`,
+      ).toBe(new Date(m?.timestamp ?? '').toISOString());
     } finally {
       await writer.disconnect().catch(() => undefined);
       await plugin.disconnect();
@@ -363,10 +458,12 @@ describe.skipIf(!redisUp)('redis failure modes — entries written by a foreign 
     try {
       await writer.connect();
       await plugin.subscribe(t, (m) => live.push(m));
-      await writer.xAdd(`${prefix}${t}`, '*', { content: 'from redis-cli' });
+      await writer.xAdd(`${prefix}${t}`, '*', { content: 'from redis-cli', ts: '12/25/2021' });
       await expect.poll(() => live.length, { timeout: 5000, interval: 50 }).toBe(1);
       expect(live[0]?.senderHandle).not.toBe('');
-      expect(Number.isNaN(Date.parse(live[0]?.timestamp ?? ''))).toBe(false);
+      expect(live[0]?.timestamp, 'the live path forwards a non-ISO ts verbatim').toBe(
+        new Date(Date.parse('12/25/2021')).toISOString(),
+      );
     } finally {
       await writer.disconnect().catch(() => undefined);
       await plugin.disconnect();

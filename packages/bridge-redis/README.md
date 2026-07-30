@@ -10,20 +10,36 @@ the seam in `packages/bridge-redis/src/index.ts`; adding it required **zero** `@
 | topic | one Stream per topic, key `<prefix><topic>` (default prefix `parley:`) |
 | `post` | `XADD <key> * {sender, content, ts, in_reply_to}` |
 | cursor / backendMsgId | the Stream entry id (`XADD *`, e.g. `1700-0`) — monotonic per stream |
-| `fetchRecent({since})` | `XRANGE <key> (since +` (exclusive); no `since` → `XREVRANGE … COUNT` window |
+| `fetchRecent({since})` | `XRANGE <key> (since +` (exclusive), unless `since` is past the stream's last generated id (see below); no `since` → `XREVRANGE … COUNT` window |
 | `subscribe` | **`XREAD BLOCK`** loop on a dedicated connection — real events, not a poll timer |
 | `resolveIdentity` | string convention (handle = backendRef) |
 
 Stream ids aren't lexically comparable, but core never compares cursors — Redis returns entries in
 order and `fetchRecent` is exclusive on `since`.
 
+**A cursor past the stream's high-water mark self-heals.** Core's read-state outlives the Redis it
+was minted against, so a `since` can sort *above* the stream's last generated id — a re-created
+dataset, a repointed `url`, a changed `key_prefix`, an evicted or deleted key, a peer whose clock
+ran ahead. Such a cursor is treated exactly like an unset one: catch-up **replays the most recent
+`limit` entries** — messages strictly *older* than the cursor you asked to read after — and returns
+a **lower** `nextCursor`. Echoing the dead cursor back instead would wedge that topic forever, with
+every later fetch returning the same empty page and nothing to distinguish it from "nothing new".
+A cursor at or *below* the last generated id names an entry this stream really did mint, so it is
+honoured exclusively and echoed back untouched even when the entries themselves are gone. A cursor
+of no recognisable shape (a Matrix-style `s123_456`, `$`, an empty string, a value too large for
+the uint64 each id component is) is rejected with an error naming it and the topic.
+
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` also accepts an optional request-level
 `block_ms`: when nothing is newer than `since`, the call holds up to `block_ms` for a new message
 before returning (possibly empty), so a polling agent's token cost scales with messages, not
 wall-clock time. Redis serves this natively via an `XREAD BLOCK` on a dedicated reader connection.
 Core caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return
-catch-up semantics. (Distinct from the `block_ms` config knob above, which is `subscribe`'s
-shutdown re-check interval.)
+catch-up semantics, and a budget below 1ms floors to nothing and returns immediately — `XREAD BLOCK
+0` would block forever. A refusal the server will never stop returning (the same `NOAUTH`/`NOPERM`/
+`WRONGTYPE` class that stops the `subscribe` loop) fails the call with a labelled error rather than
+being reported as an empty long poll, so the operator sees it instead of core re-opening a doomed
+reader for every nap of the granted budget. (Distinct from the `block_ms` config knob above, which
+is `subscribe`'s shutdown re-check interval.)
 
 ## Config (`backend_config`)
 

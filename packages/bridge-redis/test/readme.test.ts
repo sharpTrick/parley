@@ -64,7 +64,7 @@ describe('bridge-redis README — shipped infra recipes must not be insecure by 
 
 const manifest = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
-) as { scripts?: Record<string, string> };
+) as { scripts?: Record<string, string>; description?: string };
 
 /** Every `npm test` / `npm run <script>` line in the README, with leading env assignments stripped. */
 function npmScriptInvocations(md: string): Array<[string, string]> {
@@ -257,4 +257,65 @@ describe('bridge-redis shipped artifacts — a compose file the README links is 
       ).toBe(true);
     },
   );
+});
+
+// CLASS: a behaviour this package's suite pins but its own prose never mentions. An operator has
+// only the README and the npm page, so a behaviour that lives solely in a test cannot be predicted
+// by anyone who has to run this thing — and the plugin's most surprising behaviours are exactly the
+// ones the mapping table's one-line summaries flatten away.
+
+/** A behaviour the suite pins, and the phrase the README must carry for it. */
+const documentedBehaviours: Array<[string, RegExp]> = [
+  ['a cursor past the high-water mark self-heals', /self-heal/i],
+  ['…by replaying a window OLDER than the cursor asked for', /replays the most recent/],
+  ['a cursor at or below the tail is echoed back untouched', /echoed back untouched/],
+  ['a cursor of no recognisable shape is rejected by name', /rejected with an error naming it/],
+  ['a seam refusal names the plugin, the topic and the key', /labelled the same way, naming the plugin/],
+  ['a permanent refusal stops live delivery loudly', /live delivery STOPPED/],
+  ['a sub-millisecond long-poll budget returns immediately', /floors to nothing and returns immediately/],
+  ['a permanent refusal fails the long poll instead of emptying it', /rather than\s+being reported as an empty long poll/],
+  ['retention trims approximately, and only on write', /approximate/],
+];
+
+describe('bridge-redis README — every behaviour the suite pins is described here', () => {
+  it.each(documentedBehaviours)('%s', (_label, phrase) => {
+    expect(
+      phrase.test(text),
+      `the README never describes it — nothing matches ${String(phrase)}`,
+    ).toBe(true);
+  });
+});
+
+/**
+ * A claim this package's prose makes about behaviour the code QUALIFIES, with the qualification it
+ * must carry. Graded on every surface that ships on its own: the README renders on the npm page,
+ * and `description` reaches search results and `npm view` without it.
+ */
+const qualifiedClaims: Array<[string, RegExp, RegExp]> = [
+  ['catch-up is exclusive on `since`', /exclusive/i, /self-heal/i],
+];
+
+const prose: Array<[string, string]> = [
+  ['README.md', text],
+  ['package.json description', manifest.description ?? ''],
+];
+
+describe('bridge-redis shipped prose — a qualified claim is never shipped bare', () => {
+  it.each(
+    prose.flatMap(([where, source]) =>
+      qualifiedClaims.map(
+        ([claim, makes, caveat]): [string, string, RegExp, RegExp] => [
+          `${where}: ${claim}`,
+          source,
+          makes,
+          caveat,
+        ],
+      ),
+    ),
+  )('%s', (_label, source, makes, caveat) => {
+    expect(makes.test(source), 'nothing here makes the claim, so this row grades nothing').toBe(
+      true,
+    );
+    expect(caveat.test(source), 'the claim ships without its qualification').toBe(true);
+  });
 });

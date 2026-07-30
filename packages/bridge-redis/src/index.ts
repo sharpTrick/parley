@@ -346,7 +346,9 @@ function compareIds(a: string, b: string): number {
 /**
  * Redis Streams backend (DESIGN §6/§9) — the FIRST event-driven push backend. A Stream entry id
  * (`XADD *`, e.g. `1700-0`) is monotonic per stream and serves as BOTH `backendMsgId` (dedup key)
- * and `cursor` (order key). `fetchRecent` = `XRANGE` (exclusive `(since`); `subscribe` = an
+ * and `cursor` (order key). `fetchRecent` = `XRANGE` (exclusive `(since`, except that a `since`
+ * past the stream's last generated id is treated as unset and replays the recent window, so
+ * catch-up self-heals); `subscribe` = an
  * `XREAD BLOCK` loop on a dedicated connection driven by REAL events, not a poll timer. Stream ids
  * are not lexically comparable, but core never compares cursors — Redis returns entries in order.
  */
@@ -561,9 +563,9 @@ export class RedisPlugin implements BackendPlugin {
    *
    * The reader is registered in `this.readers` BEFORE the blocking call so a concurrent
    * `disconnect()` finds and tears it down (breaking the blocking read), and the loop is gated on
-   * the connect generation so a disconnect/reconnect racing this window can never revive it. On
-   * any early exit — timeout, teardown, or error — we return `[]`, which is always safe: the empty
-   * page carries `nextCursor === since` and core polls the remaining budget on the MCP path.
+   * the connect generation so a disconnect/reconnect racing this window can never revive it. On a
+   * timeout, a teardown or a transient socket fault we return `[]`, which is safe: the empty page
+   * carries `nextCursor === since` and core polls the remaining budget on the MCP path.
    *
    * Keep `readWindow`'s floor as the only floor, so that `XREAD BLOCK 0` — which blocks FOREVER —
    * can never be issued; `blockMs` arrives here already whole and positive.
@@ -588,10 +590,11 @@ export class RedisPlugin implements BackendPlugin {
       const res = await reader.xRead({ key, id: since }, { BLOCK: blockMs, COUNT: limit });
       if (gen !== this.generation || res === null) return [];
       return res[0]?.messages ?? [];
-    } catch {
-      // Timeout is null (handled above); a throw here is teardown or a transient socket drop.
-      // Returning [] is safe (core polls the remainder) and never masks a real fault — the
-      // canonical XRANGE above already succeeded against the live connection.
+    } catch (err) {
+      // Keep the refusal rethrow, so that a NOPERM/WRONGTYPE that ends the long poll is not silent
+      // while `subscribe` reports the identical fault: core answers an empty page by napping and
+      // retrying, so a swallowed refusal burns the caller's whole budget opening doomed readers.
+      if (gen === this.generation && serverRefusal(err) !== undefined) throw err;
       return [];
     } finally {
       this.dropReader(reader);
@@ -761,9 +764,15 @@ function rowToMessage(topic: Topic, id: string, fields: Record<string, string>):
   });
 }
 
-/** The entry's own `ts` when it is a real date, else the stream id's own millisecond component. */
+/**
+ * The entry's own `ts` when it is a real date, else the stream id's own millisecond component —
+ * either way RE-SERIALIZED rather than forwarded, so that a foreign writer's `Mon Jan 01 2020` or
+ * `12/25/2021` cannot reach `Message.timestamp`, which DESIGN §5 declares is ISO 8601: which
+ * non-ISO spellings `Date.parse` accepts is implementation-defined and varies by Node release.
+ */
 function entryTimestamp(id: string, ts: string | undefined): string {
-  if (ts !== undefined && !Number.isNaN(Date.parse(ts))) return ts;
+  const at = ts === undefined ? Number.NaN : Date.parse(ts);
+  if (!Number.isNaN(at)) return new Date(at).toISOString();
   const ms = Number(id.split('-')[0]);
   return new Date(Number.isSafeInteger(ms) && ms >= 0 ? ms : 0).toISOString();
 }
