@@ -24,6 +24,13 @@ const DRAIN_PAGE = 500;
 const READER_BUDGET_MS = 15_000;
 
 /**
+ * How long a torn-down plugin is watched before its live path is called stopped. Long enough that a
+ * subscription which outlived `disconnect()` has delivered, and far enough under the harness's own
+ * per-case timeout that the assertion is what reports the leak.
+ */
+const TEARDOWN_SETTLE_MS = 500;
+
+/**
  * Budget offered to the since-less blocking read. Keep it well under the harness's own per-case
  * timeout, so that a plugin which parks for the whole thing FAILS the bound below instead of being
  * killed by vitest — a generic timeout names neither the plugin's behaviour nor this clause.
@@ -163,11 +170,15 @@ export const CLAUSES: readonly string[] = [
  * - `nextCursor-stability`: an empty page's cursor does not move, so a drained catch-up loop stays
  *   drained instead of re-reading the window forever.
  * - `limit-honoured`: a page never carries more rows than `limit`.
+ * - `disconnect-stops-live-delivery`: nothing reaches a handler after `disconnect()` — the loop or
+ *   socket that goes round once more decides whether core keeps emitting `<channel>` events for a
+ *   backend it believes is gone, and whether the MCP process can exit.
  */
 export const ASSERTED_PROPERTIES: readonly string[] = [
   'nextCursor-agreement',
   'nextCursor-stability',
   'limit-honoured',
+  'disconnect-stops-live-delivery',
 ];
 
 /**
@@ -488,8 +499,12 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     // `disconnect()` is declared to tear down the connection AND all subscriptions, but the suite
     // only ever called it from `cleanup()` and asserted nothing about it — so a plugin that leaves
     // its poll loop or socket running, or that keeps serving `post` afterwards, was certified.
-    // What is asserted here is what one client can see of its own teardown; whether the LIVE path
-    // truly stopped needs a second, independent client the context cannot hand out yet.
+    // The live half is graded by WATCHING the handler across a settle window: re-reading `live` the
+    // instant teardown returns cannot fail, because nothing in between could have delivered. What
+    // the window catches is the loop or socket that outlived `disconnect()` and went round once
+    // more. Grading it with a fresh WRITE instead is still out of reach — a fixture may legitimately
+    // count `ctx.plugin` as one of the contending writers `concurrentPost` drives, as
+    // bridge-sqlite's deliberately does, so there is no client here that survives the teardown.
     it('disconnect is idempotent and stops the plugin serving', async () => {
       const t = ctx.freshTopic();
       const live: Message[] = [];
@@ -501,7 +516,10 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       await ctx.plugin.disconnect();
 
       await expect(ctx.plugin.post(t, SENDER, 'after-teardown')).rejects.toThrow();
-      expect(live).toHaveLength(1);
+      await new Promise((resolve) => setTimeout(resolve, TEARDOWN_SETTLE_MS));
+      expect(live, 'a torn-down plugin delivered again — something outlived disconnect()').toHaveLength(
+        1,
+      );
     });
 
     it('resolveIdentity answers for the handle it was asked about', async () => {

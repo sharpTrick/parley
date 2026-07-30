@@ -28,12 +28,15 @@ export interface ReferenceStore {
   seq: number;
   readonly log: Map<string, Message[]>;
   subscriptions: { topic: string; handler: MessageHandler; owner: object }[];
+  /** Fired by every `post`, so a plugin built `blocking` can honour `blockMs` on a real wake. */
+  writes: (() => void)[];
 }
 
 export const newReferenceStore = (): ReferenceStore => ({
   seq: 0,
   log: new Map(),
   subscriptions: [],
+  writes: [],
 });
 
 /**
@@ -47,9 +50,11 @@ export const newReferenceStore = (): ReferenceStore => ({
 export class ReferencePlugin implements BackendPlugin {
   private connected = false;
   private readonly store: ReferenceStore;
+  private readonly blocking: boolean;
 
-  constructor(store: ReferenceStore = newReferenceStore()) {
+  constructor(store: ReferenceStore = newReferenceStore(), blocking = false) {
     this.store = store;
+    this.blocking = blocking;
   }
 
   connect(_config: BackendConfig): Promise<void> {
@@ -85,11 +90,31 @@ export class ReferencePlugin implements BackendPlugin {
     });
     this.store.log.set(String(topic), [...(this.store.log.get(String(topic)) ?? []), message]);
     for (const s of this.store.subscriptions) if (s.topic === String(topic)) s.handler(message);
+    for (const wake of this.store.writes.splice(0)) wake();
     return asBackendMsgId(id);
   }
 
+  /**
+   * `blocking` is the OTHER arm of `supportsBlockingFetch`, and it has to be honoured for real: the
+   * suite's native-blocking assertions grade waking on the message rather than on the budget, and a
+   * poll would satisfy them by accident. Keep the read and the waiter in ONE synchronous turn, so
+   * that a write landing between them cannot be lost — that window is what the suite's 0-3 ms race
+   * case exists to open, and a fixture with the hazard in it grades nothing.
+   */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
+    const page = this.read(args);
+    if (!this.blocking || args.blockMs === undefined || page.messages.length > 0) return page;
+    const until = Date.now() + args.blockMs;
+    for (let left = args.blockMs; left > 0; left = until - Date.now()) {
+      await this.nextWrite(left);
+      const woken = this.read(args);
+      if (woken.messages.length > 0) return woken;
+    }
+    return this.read(args);
+  }
+
+  private read(args: FetchRecentArgs): FetchRecentResult {
     const history = this.store.log.get(String(args.topic)) ?? [];
     const limit = args.limit ?? 100;
     if (args.since === undefined) {
@@ -98,6 +123,22 @@ export class ReferencePlugin implements BackendPlugin {
     }
     const after = history.filter((m) => String(m.cursor) > String(args.since)).slice(0, limit);
     return { messages: after, nextCursor: this.tail(after, args.since) };
+  }
+
+  private nextWrite(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const wake = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(() => {
+        const at = this.store.writes.indexOf(wake);
+        if (at >= 0) this.store.writes.splice(at, 1);
+        resolve();
+      }, ms);
+      this.store.writes.push(wake);
+    });
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
@@ -117,11 +158,38 @@ export class ReferencePlugin implements BackendPlugin {
 let seq = 0;
 
 /**
+ * The capability flags every fixture here used to hard-code, which made them a CONSTANT rather than
+ * an axis: with `supportsBlockingFetch` false everywhere, nothing in this package ever ran the
+ * suite's native-blocking half or the true arm of its lost-wakeup race, and both could be deleted
+ * with the package green while eight backends that declare the capability kept being certified
+ * against them. Every fixture below states which arm it takes, and `BROKEN_VARIANTS` covers both.
+ */
+type Capabilities = Pick<ConformanceContext, 'supportsBlockingFetch' | 'carriesSenderIdentity'>;
+
+const DEFAULT_CAPABILITIES: Capabilities = {
+  supportsBlockingFetch: false,
+  carriesSenderIdentity: true,
+};
+
+const delegate = (inner: ReferencePlugin): BackendPlugin => ({
+  connect: (c) => inner.connect(c),
+  disconnect: () => inner.disconnect(),
+  subscribe: (t, h) => inner.subscribe(t, h),
+  post: (t, i, c, o) => inner.post(t, i, c, o),
+  fetchRecent: (a) => inner.fetchRecent(a),
+  resolveIdentity: (h) => inner.resolveIdentity(h),
+});
+
+/**
  * `concurrentPost` drives N separately-connected clients over the shared store, exactly as every
  * shipped fixture drives N plugin instances against one server. Keep it OFF `ctx.plugin`, so that
  * the writers the suite calls independent really are.
  */
-async function context(plugin: BackendPlugin, store: ReferenceStore): Promise<ConformanceContext> {
+async function context(
+  plugin: BackendPlugin,
+  store: ReferenceStore,
+  caps: Partial<Capabilities> = {},
+): Promise<ConformanceContext> {
   await plugin.connect({});
   return {
     plugin,
@@ -147,8 +215,8 @@ async function context(plugin: BackendPlugin, store: ReferenceStore): Promise<Co
         await Promise.all(clients.map((p) => p.disconnect()));
       }
     },
-    supportsBlockingFetch: false,
-    carriesSenderIdentity: true,
+    ...DEFAULT_CAPABILITIES,
+    ...caps,
     absentTopicBehaviour: 'empty-page',
   };
 }
@@ -156,6 +224,35 @@ async function context(plugin: BackendPlugin, store: ReferenceStore): Promise<Co
 export const makeReferenceContext = (): Promise<ConformanceContext> => {
   const store = newReferenceStore();
   return context(new ReferencePlugin(store), store);
+};
+
+/**
+ * The positive control on the OTHER arm of `supportsBlockingFetch` — a reference that really honours
+ * `blockMs` inside `fetchRecent`, as Redis, NATS, Matrix, Postgres, XMPP, Slack, Discord and Zulip
+ * declare they do. Without it the suite's native-blocking assertions are satisfiable by nothing in
+ * this repo, which is indistinguishable from their being deleted.
+ */
+export const makeBlockingReferenceContext = (): Promise<ConformanceContext> => {
+  const store = newReferenceStore();
+  return context(new ReferencePlugin(store, true), store, { supportsBlockingFetch: true });
+};
+
+/** The handle a backend that stamps its own account reports instead of `post`'s `identity`. */
+const STAMPED = 'reference-bot' as Handle;
+
+/**
+ * The positive control on the false arm of `carriesSenderIdentity`: a backend that posts as its
+ * authenticated account, which is what every hosted SaaS does and what Matrix's homeserver-stamped
+ * `sender` amounts to. The weaker contract that arm buys is graded here rather than nowhere.
+ */
+export const makeStampedSenderReferenceContext = (): Promise<ConformanceContext> => {
+  const store = newReferenceStore();
+  const inner = new ReferencePlugin(store);
+  const plugin: BackendPlugin = {
+    ...delegate(inner),
+    post: (t, _identity, c, o) => inner.post(t, STAMPED, c, o),
+  };
+  return context(plugin, store, { carriesSenderIdentity: false });
 };
 
 /**
@@ -171,15 +268,11 @@ async function throwingReference(
   // Presence is read off the STORE, not off this wrapper's own writes: an independent client's post
   // creates the topic just as a human's message would.
   const plugin: BackendPlugin = {
-    connect: (c) => inner.connect(c),
-    disconnect: () => inner.disconnect(),
-    subscribe: (t, h) => inner.subscribe(t, h),
-    post: (t, i, c, o) => inner.post(t, i, c, o),
+    ...delegate(inner),
     fetchRecent: async (args) => {
       if (!store.log.has(String(args.topic))) throw absent(String(args.topic));
       return inner.fetchRecent(args);
     },
-    resolveIdentity: (h) => inner.resolveIdentity(h),
   };
   return { ...(await context(plugin, store)), absentTopicBehaviour: 'throws' };
 }
@@ -203,20 +296,18 @@ export interface BrokenVariant {
   make: () => Promise<ConformanceContext>;
 }
 
+/**
+ * The inner plugin is built to MATCH the capabilities the fixture declares — a variant that declares
+ * native `blockMs` gets an inner that really honours it — so that the only thing failing the arm is
+ * the wrapper's own defect and not the fixture lying about what it supports.
+ */
 const wrap = async (
   over: (inner: ReferencePlugin) => Partial<BackendPlugin>,
+  caps: Partial<Capabilities> = {},
 ): Promise<ConformanceContext> => {
   const store = newReferenceStore();
-  const inner = new ReferencePlugin(store);
-  const base: BackendPlugin = {
-    connect: (c) => inner.connect(c),
-    disconnect: () => inner.disconnect(),
-    subscribe: (t, h) => inner.subscribe(t, h),
-    post: (t, i, c, o) => inner.post(t, i, c, o),
-    fetchRecent: (a) => inner.fetchRecent(a),
-    resolveIdentity: (h) => inner.resolveIdentity(h),
-  };
-  return context({ ...base, ...over(inner) }, store);
+  const inner = new ReferencePlugin(store, caps.supportsBlockingFetch ?? false);
+  return context({ ...delegate(inner), ...over(inner) }, store, caps);
 };
 
 export const BROKEN_VARIANTS: BrokenVariant[] = [
@@ -740,6 +831,142 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             ? inner.fetchRecent(args)
             : inner.fetchRecent({ ...args, limit: args.limit + 1 }),
       })),
+  },
+  {
+    // The blocking arm's TIMING assertion — "it woke on the message, not on the budget expiring" —
+    // which every fixture in this package used to be on the wrong side of the flag to reach. This
+    // plugin returns the right messages under the right cursor; all it does is ignore the wake.
+    name: 'a native blocking read that returns at the budget instead of on the message',
+    mutates: 'fetchRecent',
+    mustFail: 'blockMs is honoured natively or ignored promptly',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            const page = await inner.fetchRecent({ ...args, blockMs: undefined });
+            if (args.since === undefined || args.blockMs === undefined) return page;
+            if (page.messages.length > 0) return page;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(args.blockMs, 4_200)));
+            return inner.fetchRecent({ ...args, blockMs: undefined });
+          },
+        }),
+        { supportsBlockingFetch: true },
+      ),
+  },
+  {
+    // The blocking arm's empty-timeout cursor. A drained long-poll that reports a MOVED cursor makes
+    // the caller's next `since` skip a window it never read, and only the native arm passes a
+    // `blockMs` that is allowed to expire empty.
+    name: 'a native blocking read whose cursor moves on an empty timeout',
+    mutates: 'nextCursor-stability',
+    mustFail: 'blockMs is honoured natively or ignored promptly',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            const page = await inner.fetchRecent(args);
+            if (args.since === undefined || args.blockMs === undefined) return page;
+            if (page.messages.length > 0) return page;
+            return { ...page, nextCursor: asCursor(`${String(page.nextCursor)}-drift`) };
+          },
+        }),
+        { supportsBlockingFetch: true },
+      ),
+  },
+  {
+    // The lost-wakeup race on the arm that actually blocks. The variant below it takes the same
+    // shape on a polling backend; with every fixture declaring the polling arm, the true arm of the
+    // 0-3 ms case had no control at all and could be deleted with this package green.
+    name: 'a native blocking read that parks from now instead of at the caller cursor',
+    mutates: 'fetchRecent',
+    mustFail: 'blocking fetch is not missed',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            const page = await inner.fetchRecent({ ...args, blockMs: undefined });
+            if (args.since === undefined || args.blockMs === undefined) return page;
+            if (page.messages.length > 0) return page;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+            return { messages: [], nextCursor: all.nextCursor };
+          },
+        }),
+        { supportsBlockingFetch: true },
+      ),
+  },
+  {
+    // Declaring `identity` not carried buys a WEAKER contract, not none: whoever the sender turns
+    // out to be, it is ONE account and core routes and displays it. Every fixture here declared the
+    // capability true, so the whole false arm — the only thing keeping that flag honest — ran
+    // nowhere and could be deleted with this package green.
+    name: 'a scrambled senderHandle on a backend that declares identity not carried',
+    mutates: 'senderHandle',
+    mustFail: 'not collapsed onto one another',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            const page = await inner.fetchRecent(args);
+            return {
+              ...page,
+              messages: page.messages.map((m, i) => ({ ...m, senderHandle: `who-${i}` as Handle })),
+            };
+          },
+        }),
+        { carriesSenderIdentity: false },
+      ),
+  },
+  {
+    // The same flag one clause over: `expectWellFormedMessage` drops its `senderHandle` EQUALITY
+    // check on the false arm and keeps the non-emptiness one, and nothing declaring that arm could
+    // fail it.
+    name: 'a blank senderHandle on a backend that declares identity not carried',
+    mutates: 'senderHandle',
+    mustFail: 'in order, with unique ids and distinct cursors',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            const page = await inner.fetchRecent(args);
+            return {
+              ...page,
+              messages: page.messages.map((m) => ({ ...m, senderHandle: '' as Handle })),
+            };
+          },
+        }),
+        { carriesSenderIdentity: false },
+      ),
+  },
+  {
+    // The half of teardown the case could not see: a loop that outlives `disconnect()` and goes
+    // round once more, pushing into a handler core believes is gone. Until the case watched the
+    // handler across a settle window its `expect(live).toHaveLength(1)` could not fail — nothing
+    // between the teardown and the assertion could have delivered anything.
+    name: 'a disconnect that leaves its poll loop delivering',
+    mutates: 'disconnect-stops-live-delivery',
+    mustFail: 'disconnect is idempotent',
+    make: () =>
+      wrap((inner) => {
+        const registered: { topic: Topic; handler: MessageHandler }[] = [];
+        let torn = false;
+        return {
+          subscribe: async (topic, handler) => {
+            registered.push({ topic, handler });
+            await inner.subscribe(topic, handler);
+          },
+          disconnect: async () => {
+            if (!torn) {
+              torn = true;
+              for (const s of registered) {
+                const last = (await inner.fetchRecent({ topic: s.topic, limit: 1 })).messages.at(-1);
+                if (last !== undefined) setTimeout(() => s.handler(last), 10);
+              }
+            }
+            await inner.disconnect();
+          },
+        };
+      }),
   },
   {
     // The id `post` RETURNS, which core stores as the dedup key without reading the topic back.

@@ -933,39 +933,57 @@ describe('fetchWithRetry', () => {
     ),
   ];
 
-  const LOCATIONS: [string, (secret: string) => { url: string; fragment: string }][] = [
+  /**
+   * The length above which a path segment or a query value stops reading as routing vocabulary. Read
+   * off the README for the same reason the method-name bound is: moving the bound moves the tables
+   * built on it rather than leaving rows that grade the old one.
+   */
+  const routeWordBound = (): number =>
+    documentedFigure(/Long means \*\*longer than (\d+) characters\*\*/, 'the route-word bound');
+
+  /**
+   * Components whose rule CONSULTS what they carry — the per-segment and per-query-value rules, both
+   * of which weigh length against the method-name exemption. Only these can grade a value axis, so
+   * only these are crossed with one.
+   */
+  const SHAPED_LOCATIONS: [string, (v: string) => { url: string; fragment: string }][] = [
     [
-      'a path segment',
-      (s) => ({
-        url: `https://api.example.test/api/webhooks/12345/${s}`,
-        fragment: `/api/webhooks/12345/${s}`,
-      }),
+      'a path segment echoed on its own',
+      (v) => ({ url: `https://api.example.test/api/webhooks/12345/${v}`, fragment: v }),
     ],
     [
-      // The row above echoes the WHOLE path, which the pathname rule claims on the digits in
-      // `/12345/` whatever the token looks like — so it grades the shape of nothing. Only the bare
-      // segment reaches the per-segment rule, which is where the method-name exemption lives.
-      'a path segment echoed on its own',
-      (s) => ({ url: `https://api.example.test/api/webhooks/12345/${s}`, fragment: s }),
+      'a query value echoed on its own',
+      (v) => ({ url: `https://api.example.test/v1/x?access_token=${v}`, fragment: v }),
+    ],
+  ];
+
+  /**
+   * Components claimed WHATEVER they carry: the whole pathname (claimed on the `/12345/` inside it)
+   * and userinfo (credential-by-construction, deliberately taking no exemption). Crossed with a
+   * value axis these spent 45 cells apiece on one code path and reported as coverage of a shape they
+   * cannot grade, indistinguishable in the report from the rows that do. One row each instead — and
+   * the row below pins them as unconditional, so a rule that starts consulting the value reddens
+   * here and gets moved into the cross-product rather than quietly re-growing an inert axis.
+   */
+  const UNCONDITIONAL_LOCATIONS: [string, (v: string) => { url: string; fragment: string }][] = [
+    [
+      'the whole path',
+      (v) => ({
+        url: `https://api.example.test/api/webhooks/12345/${v}`,
+        fragment: `/api/webhooks/12345/${v}`,
+      }),
     ],
     [
       'userinfo',
-      (s) => ({
-        url: `https://user:${s}@api.example.test/v1/x`,
-        fragment: `user:${s}@api.example.test`,
-      }),
-    ],
-    [
-      'a query value',
-      (s) => ({
-        url: `https://api.example.test/v1/x?access_token=${s}`,
-        fragment: `access_token=${s}`,
+      (v) => ({
+        url: `https://user:${v}@api.example.test/v1/x`,
+        fragment: `user:${v}@api.example.test`,
       }),
     ],
   ];
 
   it.each(
-    LOCATIONS.flatMap(([location, build]) =>
+    SHAPED_LOCATIONS.flatMap(([location, build]) =>
       SHAPES().flatMap(([shape, secret]) =>
         VECTORS.map(
           ([vector, make]) =>
@@ -980,6 +998,88 @@ describe('fetchWithRetry', () => {
     );
     expect(err.message).toContain('L → ');
     expect(err.message).not.toContain(secret);
+  });
+
+  it.each(
+    UNCONDITIONAL_LOCATIONS.flatMap(([location, build]) =>
+      VECTORS.map(
+        ([vector, make]) => [`${location}, ${vector}`, build(`bot123:${CANARY}`), make] as const,
+      ),
+    ),
+  )('never leaks a credential carried in %s, echoed alone', async (_label, target, make) => {
+    vi.stubGlobal('fetch', make(target.fragment));
+    const err = await rejects(
+      fetchWithRetry(target.url, {}, { label: 'L', isStopped: () => false }),
+    );
+    expect(err.message).toContain('L → ');
+    expect(err.message).not.toContain(CANARY);
+  });
+
+  it.each(UNCONDITIONAL_LOCATIONS)(
+    '%s is claimed whatever it carries, which is why no value axis crosses it',
+    async (_label, build) => {
+      const target = build('newest');
+      vi.stubGlobal('fetch', () => Promise.resolve(res(409, `no route for ${target.fragment}`)));
+      const err = await rejects(
+        fetchWithRetry(target.url, {}, { label: 'L', isStopped: () => false }),
+      );
+      expect(err.message).not.toContain(target.fragment);
+    },
+  );
+
+  /**
+   * The leak table's mirror, on the axis a leak table cannot see: what a component legitimately IS,
+   * either side of the two bounds the rule is built on. Redaction that claimed every query value
+   * struck Matrix's `timeout=30000` and Zulip's `dont_block=false`, `anchor=newest`, `num_before=10`
+   * out of the untrusted body — including from inside longer words, which turned "you have 100
+   * messages and no permission" into "you have <redacted>0 messages and <redacted> permission".
+   * Both outcomes are rows, so a location that stops discriminating collapses the non-vacuity check
+   * beside it instead of passing quietly.
+   */
+  const VALUE_SHAPES = (): [string, string, boolean][] => [
+    ['an ordinary word', 'newest', true],
+    ['a boolean literal', 'false', true],
+    ['a small integer', '10', true],
+    ['a five-digit integer', '30000', true],
+    ['digits exactly at the route-word bound', '9'.repeat(routeWordBound()), true],
+    ['a resource name', 'conversations', true],
+    ['a dotted method name', 'chat.postMessage', true],
+    [
+      'a method name exactly at the method-name bound',
+      cycle('conversations.history.list', methodNameBound()),
+      true,
+    ],
+    ['digits one past the route-word bound', '9'.repeat(routeWordBound() + 1), false],
+    [
+      'an opaque token past the method-name bound',
+      cycle('QWERTYuiop-_asdFGH12345jklZXCVbnm', methodNameBound() + 1),
+      false,
+    ],
+  ];
+
+  it('crosses the value axis only where both outcomes are reachable', () => {
+    expect(new Set(VALUE_SHAPES().map(([, , survives]) => survives))).toEqual(
+      new Set([true, false]),
+    );
+    expect(SHAPED_LOCATIONS.length).toBeGreaterThan(1);
+    expect(VALUE_SHAPES().length).toBeGreaterThan(5);
+  });
+
+  it.each(
+    SHAPED_LOCATIONS.flatMap(([location, build]) =>
+      VALUE_SHAPES().map(
+        ([shape, value, survives]) =>
+          [`${location}, ${shape}`, build(value), value, survives] as const,
+      ),
+    ),
+  )('redacts on the value, not on the location (%s)', async (_label, target, value, survives) => {
+    const body = `the parameter ${target.fragment} is not enabled for this workspace`;
+    vi.stubGlobal('fetch', () => Promise.resolve(res(409, body)));
+    const err = await rejects(
+      fetchWithRetry(target.url, {}, { label: 'L', isStopped: () => false }),
+    );
+    if (survives) expect(err.message).toContain(value);
+    else expect(err.message).not.toContain(value);
   });
 
   // The other direction, which is a defect too: a path segment is also a WORD, and every API's
@@ -1154,6 +1254,70 @@ describe('retryAfterFromHeader', () => {
     expect(
       retryAfterFromHeader(new Response('', { headers: { 'retry-after': httpDate(-60_000) } })),
     ).toBeUndefined();
+  });
+
+  /**
+   * A gateway and an origin both setting the header make `Headers.get` join them, and the whole
+   * joined string is tried first because a single HTTP-date carries a comma of its own. Deferring
+   * that attempt to a bare `Date.parse` — the laxity the delay-seconds branch is pinned against —
+   * reads a leading 4-digit second count as a YEAR: `"3600, 5"` becomes May of the year 3600 and
+   * dominates the max by twelve orders of magnitude, so the call ends advising an operator to raise
+   * a deadline past a wait of fifty trillion milliseconds.
+   *
+   * The first field-value is SWEPT over 1-to-4-digit second counts rather than hand-picked, so the
+   * next year-shaped figure is already a row. Every row states the max of the field-values parsed
+   * INDIVIDUALLY, which is what the README promises.
+   */
+  const SECOND_COUNTS = [1, 5, 12, 59, 120, 999, 1200, 1900, 2026, 3600, 9999];
+
+  it.each(
+    SECOND_COUNTS.flatMap((first) =>
+      [5, 12, 4000].map((second) => [first, second] as [number, number]),
+    ),
+  )('reads a header set twice (%i then %i) as the longer field-value', (first, second) => {
+    const headers = new Headers();
+    headers.append('retry-after', String(first));
+    headers.append('retry-after', String(second));
+    expect(retryAfterFromHeader(new Response('', { headers }))).toBe(
+      Math.max(first, second) * 1000,
+    );
+  });
+
+  it('finds a joined header at all, so the rows above are not reading one value', () => {
+    const headers = new Headers();
+    headers.append('retry-after', '3600');
+    headers.append('retry-after', '5');
+    expect(headers.get('retry-after')).toBe('3600, 5');
+  });
+
+  /**
+   * The three `HTTP-date` spellings RFC 9110 §5.6.7 defines must all be read, and nothing else may
+   * be: pinning the spelling is what stops `Date.parse` inventing a wait out of a string that is not
+   * a date. `undefined` here means "no usable hint", i.e. the fixed default backoff.
+   */
+  const from = (spelling: string, at: number): number | undefined =>
+    retryAfterFromHeader(
+      new Response('', {
+        headers: { date: new Date(at - 60_000).toUTCString(), 'retry-after': spelling },
+      }),
+    );
+
+  it.each([
+    ['IMF-fixdate', 'Fri, 06 Nov 2099 08:49:37 GMT', Date.UTC(2099, 10, 6, 8, 49, 37)],
+    ['obsolete RFC 850', 'Saturday, 06-Nov-32 08:49:37 GMT', Date.UTC(2032, 10, 6, 8, 49, 37)],
+    ['asctime', 'Fri Nov  6 08:49:37 2099', Date.UTC(2099, 10, 6, 8, 49, 37)],
+  ])('reads the %s spelling of an HTTP-date', (_label, spelling, at) => {
+    expect(from(spelling, at)).toBe(60_000);
+  });
+
+  it.each([
+    ['an ISO date', '2099-01-01'],
+    ['an RFC 3339 timestamp', '2099-11-06T08:49:37Z'],
+    ['a slashed date', '01/01/3600'],
+    ['a date with no day-of-week', '06 Nov 2099 08:49:37 GMT'],
+    ['a day name followed by an ISO date', 'Fri 2099-11-06'],
+  ])('does not invent a wait out of %s', (_label, spelling) => {
+    expect(from(spelling, Date.UTC(2099, 10, 6, 8, 49, 37))).toBeUndefined();
   });
 
   // An HTTP-date states a point on the SERVER's clock, so subtracting OUR clock reads a real

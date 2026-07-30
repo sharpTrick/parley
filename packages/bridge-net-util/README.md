@@ -55,17 +55,21 @@ a skewed client clock cannot turn a stated wait into no hint.
 Errors never carry the request URL: several backends (Telegram) put a credential in the path, and
 a thrown message becomes an MCP `isError` result, i.e. model context. `label` identifies the call.
 Redaction covers the URL byte-for-byte, any `scheme://…` spelling of it, and every component that
-can carry a credential on its own — the whole path, every path segment that is `:`-bearing or long
-and not spelled like a method name (Telegram's `bot<id>:<token>` and Discord's punctuation-free
-webhook token are both covered; `getUpdates` and `chat.postMessage` are left in the body's prose,
-where an API's own error text uses them), the userinfo, and each query value, each in both its
-encoded and decoded spelling — so a proxy or a hostile body that echoes one fragment alone is
-covered too. The method-name exemption is bounded at **24 characters**: a longer run of letters and
+can carry a credential on its own — the whole path, every path segment **and every query value**
+that is `:`-bearing or long and not spelled like a method name (Telegram's `bot<id>:<token>` and
+Discord's punctuation-free webhook token are both covered; `getUpdates` and `chat.postMessage` are
+left in the body's prose, where an API's own error text uses them), and the userinfo, each in both
+its encoded and decoded spelling — so a proxy or a hostile body that echoes one fragment alone is
+covered too. Long means **longer than 8 characters**: at or under that lies the routing vocabulary a
+backend puts in a query string — Matrix's `timeout=30000`, Zulip's `dont_block=false` and
+`anchor=newest` — and striking those out would gut the body that explains itself with them.
+Userinfo takes neither exemption: it is credential-by-construction, so a short password is redacted
+too. The method-name exemption is bounded at **24 characters**: a longer run of letters and
 dots is a JWT or an alphabetic token, not a word, and is redacted like any other opaque segment.
 A bare `host/path` with no scheme is not treated as a URL, so keep credentials out of the host, out
-of a path segment short enough to pass for `api` or `v1`, and out of one **24 characters or
-shorter** spelled with letters and dots alone — `postMessage` is indistinguishable from an
-11-letter secret.
+of a path segment or query value short enough to pass for `api` or `v1`, and out of one
+**24 characters or shorter** spelled with letters and dots alone — `postMessage` is
+indistinguishable from an 11-letter secret.
 
 A rejection is labelled and redacted whatever the caller's own `signal` is doing. Only an abort
 that IS the caller's own comes back raw — tearing a plugin down mid-request cannot turn a DNS or

@@ -8,8 +8,8 @@ import {
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
 } from '@sharptrick/parley-conformance';
+import { cases, guardedRegions, suiteSource as source } from './suite-source.js';
 
-const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
 
 /** The harness's own per-case ceiling. Read, not restated: it is what pre-empts every budget below. */
@@ -33,72 +33,6 @@ function selfImposedBudgets(): [string, number][] {
   for (const pattern of patterns) {
     for (const m of source.matchAll(pattern)) {
       out.push([m[0] as string, Number((m[1] as string).replaceAll('_', ''))]);
-    }
-  }
-  return out;
-}
-
-/**
- * Every `it(...)` body in the suite, split on the top-level case boundary. Keyed on the case's
- * OPENING only — an earlier version tried to match the whole `it.each(...)` head, so a case whose
- * table spanned several lines was invisible to every check in this file, title included.
- */
-function cases(): { title: string; body: string }[] {
-  const out: { title: string; body: string }[] = [];
-  const starts = [...source.matchAll(/^ {4}it(?:\.each)?\(/gm)];
-  for (const [i, m] of starts.entries()) {
-    const from = m.index;
-    const to = i + 1 < starts.length ? starts[i + 1]!.index : source.length;
-    const body = source.slice(from, to);
-    // The title is the string literal the callback follows, not the first one in the body: an
-    // `it.each` table's own cells come first and are not titles.
-    out.push({ title: /\('([^']+)',\s*(?:async\b|\()/.exec(body)?.[1] ?? `case ${i}`, body });
-  }
-  return out;
-}
-
-/** The capability fields a case could branch on to buy itself out of asserting. */
-const CAPABILITY_FIELDS = Object.keys(CONTEXT_FIELDS).filter(
-  (f) => !['plugin', 'freshTopic', 'cleanup'].includes(f),
-);
-
-/**
- * Where a case body decides to do less. Detected as a SHAPE — a `ctx.<capability>` test followed by
- * a region — rather than by the one spelling `testCtx.skip()`, because the cheapest way to
- * reintroduce the coverage-for-a-boolean trade is a bare `return` that no spelling-match can see.
- */
-function guardedBlock(text: string, open: number): string {
-  let depth = 0;
-  for (let i = open; i < text.length; i++) {
-    if (text[i] === '{') depth++;
-    else if (text[i] === '}' && --depth === 0) return text.slice(open, i + 1);
-  }
-  return text.slice(open);
-}
-
-/**
- * The region as far as its first unconditional `return`. An arm that returns FIRST and asserts
- * afterwards has done nothing, and a check that greps the whole region for `expect(` reads the dead
- * tail as coverage — which is exactly how the cheapest coverage-for-a-boolean trade would be spelled
- * once the bare `return` itself is guarded.
- */
-const upToFirstReturn = (region: string): string => {
-  const at = region.search(/\breturn;/);
-  return at < 0 ? region : region.slice(0, at);
-};
-
-function guardedRegions(body: string): { field: string; region: string }[] {
-  const out: { field: string; region: string }[] = [];
-  for (const field of CAPABILITY_FIELDS) {
-    for (const m of body.matchAll(new RegExp(`ctx\\.${field}\\b`, 'g'))) {
-      const open = body.indexOf('{', m.index);
-      if (open < 0) continue;
-      const header = body.slice(body.lastIndexOf('\n', m.index) + 1, open + 1);
-      if (!header.includes('if (')) continue;
-      // The 'unsupported' sentinel is the one legitimate skip, and the check above governs it. Keep
-      // it exempt HERE only, so that a boolean flag can never borrow the same excuse.
-      if (header.includes("'unsupported'")) continue;
-      out.push({ field, region: upToFirstReturn(guardedBlock(body, open)) });
     }
   }
   return out;
