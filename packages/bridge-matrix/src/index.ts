@@ -36,7 +36,10 @@ export interface MatrixBackendConfig {
   password?: string;
   /** Homeserver `server_name` used to build room aliases. Default `parley.local`. */
   server_name?: string;
-  /** Sync long-poll timeout (ms). The loop re-checks shutdown each interval. Default 25000. */
+  /**
+   * Sync long-poll timeout (ms) — a positive whole number. The loop re-checks shutdown each
+   * interval. Default 25000.
+   */
   sync_timeout_ms?: number;
   /**
    * OPTIONAL shared-room mode (test fixtures / rate-limited deployments). When set to an alias
@@ -63,9 +66,9 @@ export interface MatrixBackendConfig {
    * events into a live agent session. Set `public_chat` only for a deliberately human-joinable
    * room; peers you want in an invite-only room go in {@link invite}.
    *
-   * Keep Matrix's third preset, `trusted_private_chat`, OUT of this union, so that no config can
-   * hand every invitee power level 100 — which lets any of them flip `m.room.join_rules` to public
-   * and defeat the guarantee above.
+   * Keep Matrix's third preset, `trusted_private_chat`, out of {@link ROOM_PRESETS} AND refused at
+   * run time by {@link validateConfig}, so that no config can hand every invitee power level 100 —
+   * which lets any of them flip `m.room.join_rules` to public and defeat the guarantee above.
    */
   room_preset?: RoomPreset;
   /** MXIDs invited to rooms this plugin creates (an invite-only room admits nobody else). */
@@ -74,6 +77,66 @@ export interface MatrixBackendConfig {
 
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 const TOPIC_KEY = 'app.parley.topic';
+
+const isHttpUrl = (s: string): boolean => {
+  try {
+    const { protocol } = new URL(s);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Reject every `backend_config` value the declared type cannot enforce at run time. Core loads
+ * `backend_config` as `z.record(z.unknown())`, so each knob below arrives unchecked and goes
+ * straight onto the `POST /createRoom` wire or into the park arithmetic. Keep this a LOAD ERROR
+ * rather than a coercion or a warning, so that an unsupported privilege or timing knob fails the way
+ * `skip_permissions: true` does instead of taking effect in a shape nothing else in the plugin
+ * expects.
+ */
+function validateConfig(cfg: MatrixBackendConfig): void {
+  const reject = (key: keyof MatrixBackendConfig, expected: string, why = ''): never => {
+    const raw = cfg[key];
+    throw new Error(
+      `[parley-matrix] backend_config.${key} = ` +
+        `${typeof raw === 'string' ? JSON.stringify(raw) : String(raw)} is not accepted: ` +
+        `expected ${expected}.${why}`,
+    );
+  };
+  for (const key of ['homeserver_url', 'user', 'password', 'server_name', 'shared_room'] as const) {
+    const v = cfg[key];
+    if (v !== undefined && (typeof v !== 'string' || v.length === 0)) {
+      reject(key, 'a non-empty string');
+    }
+  }
+  if (cfg.homeserver_url !== undefined && !isHttpUrl(cfg.homeserver_url)) {
+    reject('homeserver_url', 'an http(s) URL');
+  }
+  const timeout = cfg.sync_timeout_ms;
+  if (timeout !== undefined && !(Number.isInteger(timeout) && timeout > 0)) {
+    reject('sync_timeout_ms', 'a positive whole number of milliseconds (default 25000)');
+  }
+  const invite = cfg.invite;
+  if (
+    invite !== undefined &&
+    (!Array.isArray(invite) || invite.some((m) => typeof m !== 'string' || m.length === 0))
+  ) {
+    reject('invite', 'an array of non-empty MXID strings');
+  }
+  if (
+    cfg.room_preset !== undefined &&
+    !(ROOM_PRESETS as readonly string[]).includes(cfg.room_preset)
+  ) {
+    reject(
+      'room_preset',
+      `one of ${ROOM_PRESETS.join(', ')}`,
+      " Matrix's `trusted_private_chat` is refused deliberately: it hands every invitee power " +
+        'level 100, so any of them can flip m.room.join_rules to public and defeat the invite-only ' +
+        'guarantee the default preset exists for.',
+    );
+  }
+}
 
 /** Repo-public login password every dev fixture ships with; never a secret. */
 const DEFAULT_PASSWORD = 'parleypass';
@@ -164,6 +227,27 @@ const contentOf = (e: MatrixEvent): Record<string, unknown> =>
 
 /** Real per-sync timeline cap for the incremental `/sync` filter and the backfill page size. */
 const INCREMENTAL_TIMELINE_LIMIT = 100;
+/**
+ * Floor on how long any park may last, independent of `sync_timeout_ms`. Every slice ends in a full
+ * canonical catch-up (`/context` + `/messages`) or an alias lookup, so keep this floor, so that a
+ * small — but perfectly legal — `sync_timeout_ms` cannot turn one idle wait into thousands of
+ * homeserver requests and spend the deployment's rate-limit budget on nothing.
+ */
+const MIN_PARK_SLICE_MS = 250;
+/**
+ * Pace between `/sync` calls that came back far sooner than the long-poll they asked for. A
+ * conforming homeserver blocks server-side; keep the pace, so that a non-blocking or degenerate one
+ * cannot hot-spin a loop that has no deadline to stop it.
+ */
+const SYNC_IDLE_PACE_MS = 25;
+
+/**
+ * Whether a `/sync` answered so fast that the loop must pace itself. Keep the pace floor as well as
+ * the half-timeout test, so that a SMALL `sync_timeout_ms` — for which half the timeout is already
+ * shorter than a round-trip — cannot make the guard unreachable and reopen the hot spin.
+ */
+const returnedTooFast = (startedAt: number, timeoutMs: number): boolean =>
+  Date.now() - startedAt < Math.max(timeoutMs / 2, SYNC_IDLE_PACE_MS);
 /** Bound on forward catch-up pagination so an all-foreign timeline terminates instead of spinning. */
 const MAX_FORWARD_PAGES = 50;
 /** Bound on backward `limited`-burst recovery pagination so it always terminates. */
@@ -232,6 +316,7 @@ export class MatrixPlugin implements BackendPlugin {
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as MatrixBackendConfig;
+    validateConfig(cfg);
     this.baseUrl = (cfg.homeserver_url ?? 'http://127.0.0.1:8008').replace(/\/+$/, '');
     this.serverName = cfg.server_name ?? 'parley.local';
     this.user = cfg.user ?? 'parley';
@@ -509,7 +594,7 @@ export class MatrixPlugin implements BackendPlugin {
       // Keep the park sliced rather than spanning the whole budget, so that a wake source that stops
       // observing — a subscribe loop in retry backoff, a loop stalled mid-backfill, a dedicated
       // `/sync` that failed to position — costs one slice of latency and not the entire blockMs.
-      const slice = Math.min(remaining, this.syncTimeoutMs);
+      const slice = this.parkSlice(remaining);
       // Keep the registration ahead of everything below, so that a delivery cannot land while this
       // waiter is invisible.
       timer = setTimeout(waiter.wake, slice);
@@ -538,6 +623,7 @@ export class MatrixPlugin implements BackendPlugin {
           await Promise.race([positioned, parked]);
         }
 
+        if (this.isStale(generation)) return { messages: [], nextCursor: best };
         const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit);
         if (recheck.messages.length > 0) return recheck;
         best = recheck.nextCursor;
@@ -623,10 +709,9 @@ export class MatrixPlugin implements BackendPlugin {
           wake();
           return;
         }
-        // A conforming homeserver blocks server-side for ~`timeout` when idle. If the sync returned
-        // far sooner with nothing belonging (a non-blocking/degenerate server), pace the loop so we
-        // don't hot-spin the remaining budget — still bounded by `deadline`.
-        if (Date.now() - started < timeout / 2) await delay(Math.min(remaining, 25));
+        if (returnedTooFast(started, timeout)) {
+          await delay(Math.min(remaining, SYNC_IDLE_PACE_MS));
+        }
       }
     } catch {
       /* aborted (disconnect/wake) or transient — the blockMs timer still resolves the wait */
@@ -681,17 +766,19 @@ export class MatrixPlugin implements BackendPlugin {
 
   /**
    * Live path = a filtered `/sync` long-poll loop (DESIGN §9 — genuine events, not a poll timer).
-   * The initial sync (timeline limit 0) yields a `next_batch` that SKIPS history; the loop then
-   * delivers every `m.room.message` for this topic appended after it — INCLUDING our own sends —
-   * in timeline order. `disconnect()` aborts the in-flight long-poll and stops the loop.
+   * The initial sync yields a `next_batch` that SKIPS history; the loop then delivers every
+   * `m.room.message` for this topic appended after it — INCLUDING our own sends — in timeline order.
+   * `disconnect()` aborts the in-flight long-poll and stops the loop.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const generation = this.generation;
     const roomId = await this.ensureRoom(topic);
-    // Two filters: the initial position uses `timeline.limit: 0` to skip history; the loop uses a
-    // REAL timeline limit so a burst that overflows the per-sync cap is reported via
-    // `limited`/`prev_batch` (and recoverable) instead of being silently truncated.
-    const initParam = encodeURIComponent(JSON.stringify(this.syncFilter(roomId, 0)));
+    if (this.isStale(generation)) return;
+    // Two filters: the initial position asks for `timeline.limit: 1` — the newest event, never
+    // delivered, only the boundary {@link backfill} stops at; the loop uses a REAL timeline limit so
+    // a burst that overflows the per-sync cap is reported via `limited`/`prev_batch` (and
+    // recoverable) instead of being silently truncated.
+    const initParam = encodeURIComponent(JSON.stringify(this.syncFilter(roomId, 1)));
     const incParam = encodeURIComponent(
       JSON.stringify(this.syncFilter(roomId, INCREMENTAL_TIMELINE_LIMIT)),
     );
@@ -701,12 +788,13 @@ export class MatrixPlugin implements BackendPlugin {
     const initial = await this.http('GET', `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`, {
       deadlineMs: syncDeadlineMs(0),
     });
-    let nextBatch = ((await initial.json()) as { next_batch: string }).next_batch;
-    // Keep this seed of the backward-recovery boundary, and keep it read AFTER the positioning sync,
-    // so that a `limited`-burst {@link backfill} cannot page past the subscription position into
-    // PRE-subscription history and leak it as live events — in `shared_room` mode `lastDelivered`
-    // would otherwise stay `undefined` through any amount of other-topic traffic.
-    let lastDelivered: string | undefined = await this.timelineTip(roomId);
+    const positioned = (await initial.json()) as SyncResponse;
+    let nextBatch = positioned.next_batch ?? '';
+    // Keep this boundary read from the SAME response as `nextBatch`, so that a `limited`-burst
+    // {@link backfill} stops EXACTLY at the subscription position: a boundary read one round-trip
+    // later swallows everything that landed in between, and one read earlier pages back past the
+    // position into PRE-subscription history and leaks it as live events.
+    let lastDelivered: string | undefined = timelineTipOf(positioned, roomId);
     // Keep this registration after positioning AND behind the staleness gate, so that a concurrent
     // blocking `fetchRecent` only ever hooks a wake source that is both able to observe its message
     // and still running — a key added by a loop that has already stood down is a permanent phantom.
@@ -719,6 +807,7 @@ export class MatrixPlugin implements BackendPlugin {
         const controller = new AbortController();
         this.controllers.add(controller);
         let json: SyncResponse;
+        const started = Date.now();
         try {
           const res = await this.http(
             'GET',
@@ -767,6 +856,7 @@ export class MatrixPlugin implements BackendPlugin {
           lastDelivered = e.event_id;
           this.deliver(roomId, topic, e, handler);
         }
+        if (returnedTooFast(started, this.syncTimeoutMs)) await delay(SYNC_IDLE_PACE_MS);
       }
     };
     void loop();
@@ -786,7 +876,7 @@ export class MatrixPlugin implements BackendPlugin {
     }
   }
 
-  /** Build the `/sync` room filter with a given timeline limit (0 = skip history for positioning). */
+  /** Build the `/sync` room filter with a given timeline limit (0 = no history at all). */
   private syncFilter(roomId: string, timelineLimit: number) {
     return {
       room: {
@@ -799,21 +889,6 @@ export class MatrixPlugin implements BackendPlugin {
       presence: { limit: 0 },
       account_data: { limit: 0 },
     };
-  }
-
-  /**
-   * The `event_id` of the most-recent event in `roomId` (ANY type — a state event is a valid
-   * boundary since `backfill` matches by id, not by topic/type), or `undefined` for a room with no
-   * timeline history.
-   */
-  private async timelineTip(roomId: string): Promise<string | undefined> {
-    const res = await this.http(
-      'GET',
-      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=1`,
-    );
-    const { chunk } = (await res.json()) as { chunk: MatrixEvent[] };
-    const tip = chunk.at(0)?.event_id;
-    return typeof tip === 'string' ? tip : undefined;
   }
 
   /**
@@ -921,10 +996,12 @@ export class MatrixPlugin implements BackendPlugin {
     if (this.isStale(generation)) return undefined;
     const alias = this.aliasOf(this.roomLocalpart(topic));
     const roomId = await this.lookupAlias(alias);
-    // Keep this gate between the resolve and the join, so that a teardown landing mid-resolve
-    // cannot join a room with a cleared token and repopulate {@link rooms} for the next generation.
+    // Keep a gate on BOTH sides of the join, so that a teardown landing mid-resolve or mid-JOIN can
+    // neither talk to the homeserver with a cleared token nor repopulate {@link rooms} for the next
+    // generation.
     if (roomId === undefined || this.isStale(generation)) return undefined;
     await this.joinRoom(roomId, alias);
+    if (this.isStale(generation)) return undefined;
     this.rooms.set(key, Promise.resolve(roomId));
     return roomId;
   }
@@ -947,8 +1024,13 @@ export class MatrixPlugin implements BackendPlugin {
       if (roomId !== undefined) return roomId;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return undefined;
-      await this.interruptibleDelay(Math.min(remaining, this.syncTimeoutMs));
+      await this.interruptibleDelay(this.parkSlice(remaining));
     }
+  }
+
+  /** How long a park may sleep before it re-queries: never past `remaining`, never below the floor. */
+  private parkSlice(remaining: number): number {
+    return Math.min(remaining, Math.max(this.syncTimeoutMs, MIN_PARK_SLICE_MS));
   }
 
   /** Sleep, but no longer than the next `disconnect()` (which aborts every registered controller). */
@@ -1082,6 +1164,16 @@ export class MatrixPlugin implements BackendPlugin {
     );
   }
 }
+
+/**
+ * The `event_id` of the newest event a positioning `/sync` snapshot carries (ANY type — a state
+ * event is a valid boundary since `backfill` matches by id, not by topic/type), or `undefined` for a
+ * room with no timeline history.
+ */
+const timelineTipOf = (sync: SyncResponse, roomId: string): string | undefined => {
+  const tip = sync.rooms?.join?.[roomId]?.timeline?.events?.at(-1)?.event_id;
+  return typeof tip === 'string' ? tip : undefined;
+};
 
 interface SyncResponse {
   next_batch?: string;

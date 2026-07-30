@@ -86,7 +86,8 @@ they are — this setting applies to rooms this plugin **creates**.
 
 Matrix's third preset, `trusted_private_chat`, is deliberately **not accepted**: it gives every
 invitee power level 100, so any of them could set `m.room.join_rules` to `public` and undo the
-guarantee above.
+guarantee above. `connect()` refuses it — and any other value outside the table below — as a **load
+error**, naming what it would cost.
 
 A join this account is not admitted to **fails loudly**, naming the alias, the MXID and the fix —
 it does not degrade into an opaque `M_FORBIDDEN` from a later `/send` or `/messages`, or into a
@@ -100,9 +101,9 @@ it does not degrade into an opaque `M_FORBIDDEN` from a later `/send` or `/messa
 | `user`             | `parley`                 | Login localpart. |
 | `password`         | `parleypass`             | Login password. |
 | `server_name`      | `parley.local`           | Used to build room aliases. |
-| `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout. Unbounded: each `/sync` gets a transport deadline of this plus a full 30s call budget, so raising it does not make the homeserver's own answer look like a timeout. It is also the cadence at which a blocking `fetch_recent` re-checks by itself, so a very large value slows the safety net that covers a `/sync` loop stuck in retry backoff. |
+| `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout; a positive whole number of milliseconds (anything else is a load error). Unbounded above: each `/sync` gets a transport deadline of this plus a full 30s call budget, so raising it does not make the homeserver's own answer look like a timeout. It is also the cadence at which a blocking `fetch_recent` re-checks by itself, so a very large value slows the safety net that covers a `/sync` loop stuck in retry backoff. A small value does not turn that safety net into a request storm: every park sleeps at least 250ms, and a `/sync` that answers faster than it long-polled for is paced. |
 | `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. `connect()` warns on stderr while it is set. |
-| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below), and `connect()` warns on stderr while it is set. These are the only two accepted. |
+| `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below), and `connect()` warns on stderr while it is set. These are the only two accepted — any other value is a load error. |
 | `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares a topic; see "Multiple concurrent sessions". |
 
 Secrets live in `backend_config` / `.env`, never in code. Every key above that widens the trust

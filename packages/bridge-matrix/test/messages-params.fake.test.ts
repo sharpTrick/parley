@@ -11,7 +11,7 @@ import { connectFake, FakeSynapse } from './fake-synapse.js';
  * so the filter can only be graded on the wire.
  *
  * Each call site is identified by (dir, limit, from) — never by the filter itself, which is what is
- * under test — and every recorded request must match exactly one, so a fifth call site added later
+ * under test — and every recorded request must match exactly one, so a fourth call site added later
  * cannot slip in ungraded.
  */
 
@@ -29,14 +29,10 @@ const CALL_SITES: Record<string, { match: (u: URL) => boolean; filter: string | 
     match: (u) => q(u, 'dir') === 'b' && q(u, 'limit') === String(LIMIT),
     filter: MESSAGES_ONLY,
   },
-  // These two match a boundary `event_id` that may itself be a state event, which a filtered page
-  // would hide — so for them the CORRECT wire is no filter at all.
+  // This one matches a boundary `event_id` that may itself be a state event, which a filtered page
+  // would hide — so for it the CORRECT wire is no filter at all.
   'backfill (a `limited` burst)': {
     match: (u) => q(u, 'dir') === 'b' && q(u, 'limit') === '100' && u.searchParams.has('from'),
-    filter: null,
-  },
-  'timelineTip (the subscribe boundary)': {
-    match: (u) => q(u, 'dir') === 'b' && q(u, 'limit') === '1' && !u.searchParams.has('from'),
     filter: null,
   },
 };
@@ -52,7 +48,7 @@ afterEach(() => {
 });
 
 describe('every /messages call site sends the filter its page semantics require', () => {
-  it('all four fire, each with exactly the filter it needs', async () => {
+  it('all three fire, each with exactly the filter it needs', async () => {
     fake.syncCap = 2;
     const p = await connectFake({});
     const t = asTopic('wire');
@@ -63,7 +59,7 @@ describe('every /messages call site sends the filter its page semantics require'
     await p.fetchRecent({ topic: t, since: tail, limit: LIMIT }); // context + drainForward
 
     const got: string[] = [];
-    await p.subscribe(t, (m) => got.push(m.content)); // timelineTip
+    await p.subscribe(t, (m) => got.push(m.content));
     for (let i = 0; i < 5; i++) fake.addMessage(String(t), `burst${i}`); // 5 > syncCap → backfill
     await vi.waitFor(() => expect(got).toHaveLength(5), { timeout: 4000, interval: 10 });
     await p.disconnect();

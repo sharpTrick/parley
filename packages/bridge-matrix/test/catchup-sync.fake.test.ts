@@ -223,46 +223,128 @@ describe('a foreign block moves this topic cursor only when it fills a page', ()
 });
 
 /**
- * CLASS: a de-duplication guard whose triggering condition the fake cannot construct. Recovering a
- * `limited` burst pages backwards from `prev_batch`, and whether that token re-includes the batch it
- * arrived with is not pinned by the spec — Synapse's is exclusive, so the plugin's `skip` set never
- * fires against it and could be deleted with the suite green. Sweeping the overlap makes
- * the boundary itself an axis: every cell must deliver exactly the burst, once, ascending.
+ * Two CLASSES over one table.
+ *
+ *  1. A de-duplication guard whose triggering condition the fake cannot construct. Recovering a
+ *     `limited` burst pages backwards from `prev_batch`, and whether that token re-includes the batch
+ *     it arrived with is not pinned by the spec — Synapse's is exclusive, so the plugin's `skip` set
+ *     never fires against it and could be deleted with the suite green. Sweeping the overlap makes
+ *     the boundary itself an axis.
+ *  2. A live-path recovery boundary established at a DIFFERENT INSTANT than the subscription
+ *     position. The backward recovery stops at "the last event already delivered", and that boundary
+ *     has to be the subscription position exactly: read one round-trip LATER and everything that
+ *     landed in between is graded as already-delivered and silently dropped; read EARLIER (or not at
+ *     all) and the recovery pages back past the position and replays PRE-subscription history as
+ *     live events. `WHEN_EVENTS_LAND` puts a burst on each side of that instant, and every row is
+ *     seeded with pre-subscription history so both directions are graded at once.
+ *
+ * Every cell must deliver EXACTLY the post-position events, once, ascending.
  */
 const PREV_BATCH_OVERLAPS = [0, 1, 2];
 const SYNC_CAPS = [1, 2, 3];
 const BURST = 5;
+/** On-topic history that exists BEFORE subscribe — never live, in either room mode. */
+const PRE_HISTORY = ['h0', 'h1', 'h2', 'h3'];
+const WINDOW = ['w0', 'w1', 'w2'];
+
+/**
+ * Where the first tranche of live events lands. `arm` returns the proof it fired, so a row that
+ * armed nothing fails instead of quietly grading the other cell.
+ */
+const WHEN_EVENTS_LAND: Record<
+  string,
+  { landed: string[]; arm: (f: FakeSynapse, land: (c: string) => void) => () => boolean }
+> = {
+  'after subscribe() returns': { landed: [], arm: () => () => true },
+  'between the subscription position and subscribe() returning': {
+    landed: WINDOW,
+    arm: (f, land) => {
+      let fired = false;
+      f.afterPositioningSync = (ordinal) => {
+        if (ordinal !== 1 || fired) return;
+        fired = true;
+        for (const c of WINDOW) land(c);
+      };
+      return () => fired;
+    },
+  },
+};
 
 describe('subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {
-  for (const overlap of PREV_BATCH_OVERLAPS) {
-    for (const syncCap of SYNC_CAPS) {
-      it(`prev_batch overlaps the batch by ${overlap} / per-sync cap ${syncCap}: exactly the burst, once`, async () => {
-        const f = install();
-        f.syncCap = syncCap; // truncates any incremental sync → forces limited:true
-        f.prevBatchOverlap = overlap;
-        const p = await connect(false); // per-topic room, fresh (no prior history)
-        const T = asTopic('burst');
+  for (const [whenName, when] of Object.entries(WHEN_EVENTS_LAND)) {
+    for (const overlap of PREV_BATCH_OVERLAPS) {
+      for (const syncCap of SYNC_CAPS) {
+        it(`prev_batch overlaps by ${overlap} / per-sync cap ${syncCap} / events land ${whenName}: exactly the post-position events, once`, async () => {
+          const f = install();
+          f.syncCap = syncCap; // truncates any incremental sync → forces limited:true
+          f.prevBatchOverlap = overlap;
+          const p = await connect(false); // per-topic room
+          const T = asTopic('burst');
+          const writer = asHandle('w');
+          for (const c of PRE_HISTORY) await p.post(T, writer, c);
 
-        const got: string[] = [];
-        await p.subscribe(T, (m) => got.push(m.content));
+          const got: string[] = [];
+          const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
+          await p.subscribe(T, (m) => got.push(m.content));
 
-        // While the loop is between polls, the whole burst lands at once (> syncCap → truncated).
-        const expected = Array.from({ length: BURST }, (_, i) => `m${i}`);
-        for (const c of expected) f.addMessage(String(T), c);
+          // While the loop is between polls, the rest of the burst lands at once (> syncCap →
+          // truncated), so recovery through `prev_batch` is the only way any of it is delivered.
+          const burst = Array.from({ length: BURST }, (_, i) => `m${i}`);
+          for (const c of burst) f.addMessage(String(T), c);
+          const expected = [...when.landed, ...burst];
 
-        await vi.waitFor(() => expect(got.length).toBeGreaterThanOrEqual(BURST), {
-          timeout: 4000,
-          interval: 10,
+          await vi.waitFor(() => expect(got.length).toBeGreaterThanOrEqual(expected.length), {
+            timeout: 4000,
+            interval: 10,
+          });
+          // Keep this settle, so that a DUPLICATE arriving one poll later fails the row instead of
+          // landing after the assertion read it.
+          await new Promise((r) => setTimeout(r, 150));
+
+          expect(fired()).toBe(true);
+          expect(got).toEqual(expected); // ascending, complete, in order, no duplicate, no history
+          expect(f.limitedEmitted).toBeGreaterThan(0); // the truncation/backfill path actually ran
+          await p.disconnect();
         });
-        // Keep this settle, so that a DUPLICATE arriving one poll later fails the row instead of
-        // landing after the assertion read it.
-        await new Promise((r) => setTimeout(r, 150));
-
-        expect(got).toEqual(expected); // ascending, complete, in order, no duplicate
-        expect(f.limitedEmitted).toBeGreaterThan(0); // the truncation/backfill path actually ran
-        await p.disconnect();
-      });
+      }
     }
+  }
+
+  /**
+   * The same boundary in `shared_room` mode, where the pre-subscription history the recovery must
+   * not page into is mostly ANOTHER topic's — the case in which a boundary derived from this topic's
+   * own messages does not exist at all.
+   */
+  for (const [whenName, when] of Object.entries(WHEN_EVENTS_LAND)) {
+    it(`shared_room / events land ${whenName}: foreign pre-history is never replayed as live`, async () => {
+      const f = install();
+      f.syncCap = 2;
+      f.prevBatchOverlap = 1;
+      const p = await connect(true);
+      const T = asTopic('burst');
+      const writer = asHandle('w');
+      for (const c of PRE_HISTORY) await p.post(asTopic('someone-else'), writer, c);
+      await p.post(T, writer, 'mine-before-subscribe');
+
+      const got: string[] = [];
+      const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
+      await p.subscribe(T, (m) => got.push(m.content));
+
+      const burst = Array.from({ length: BURST }, (_, i) => `m${i}`);
+      for (const c of burst) f.addMessage(String(T), c);
+      const expected = [...when.landed, ...burst];
+
+      await vi.waitFor(() => expect(got.length).toBeGreaterThanOrEqual(expected.length), {
+        timeout: 4000,
+        interval: 10,
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(fired()).toBe(true);
+      expect(got).toEqual(expected);
+      expect(f.limitedEmitted).toBeGreaterThan(0);
+      await p.disconnect();
+    });
   }
 });
 
@@ -326,9 +408,11 @@ describe('fetchRecent honors blockMs natively via a bounded /sync long-poll', ()
  * CLASS: two cursor forms with asymmetric error handling. `buildBridge` AWAITS `catchUpAll`, so any
  * cursor a read-state file can hold and the homeserver can refuse must degrade to the documented
  * recent window — a throw here does not fail one read, it fails every subsequent restart until the
- * file is hand-edited. The forms are every shape a `read-state.json` can carry: this plugin's own two
+ * file is hand-edited. The forms are every shape a `since` argument can carry: this plugin's own two
  * (`event_id`, `@parley-stream:`), the pre-prefix sentinel, and a value from another backend. The
- * last row is the negative control: a cursor the homeserver DOES resolve must not degrade.
+ * sentinel is the one form `ReadStateStore` refuses outright, so it grades the cold-start path
+ * instead. The last row is the negative control: a cursor the homeserver DOES resolve must not
+ * degrade.
  */
 const STALE_CURSORS: Record<
   string,
@@ -336,6 +420,8 @@ const STALE_CURSORS: Record<
     since: (p: MatrixPlugin, ids: string[]) => Promise<Cursor>;
     /** Set when the cursor can only be minted before the topic has a room. */
     mintFirst?: true;
+    /** Set when `ReadStateStore` refuses the form outright, so catch-up runs as a cold start. */
+    refusedByReadState?: true;
     expected: string[];
   }
 > = {
@@ -349,6 +435,7 @@ const STALE_CURSORS: Record<
   },
   'the pre-prefix empty sentinel': {
     since: async () => asCursor(''),
+    refusedByReadState: true,
     expected: ['a', 'b', 'c'],
   },
   'a @parley-stream: token the homeserver rejects (400 on /messages)': {
@@ -383,7 +470,13 @@ describe('every cursor form a read-state file can hold comes up rather than thro
       expect(String(res.nextCursor)).toBe(String(res.messages.at(-1)!.backendMsgId));
       // The same cursor through the startup path, which is where a throw is unrecoverable.
       const readState = new ReadStateStore(rsPath());
-      readState.set(T, since);
+      if (row.refusedByReadState === true) {
+        expect(() => readState.set(T, since)).toThrow(TypeError);
+        expect(readState.get(T)).toBeUndefined();
+      } else {
+        readState.set(T, since);
+        expect(readState.get(T)).toBe(since);
+      }
       const total = await catchUpTopic({
         plugin: p,
         topic: T,

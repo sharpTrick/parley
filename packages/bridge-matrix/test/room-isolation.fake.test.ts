@@ -35,12 +35,21 @@ const bodiesIn = (alias: string): unknown[] =>
     .filter((e: Ev) => e.type === 'm.room.message')
     .map((e: Ev) => (e.content as { body?: unknown }).body);
 
-/** The room_ids a run actually read from, taken off the recorded `/messages` URLs. */
-const roomsRead = (): string[] => [
-  ...new Set(
-    fake.messagesRequests.map((u) => decodeURIComponent(/\/rooms\/([^/]+)\//.exec(u.pathname)![1]!)),
-  ),
-];
+/**
+ * The room_ids a run actually READ from: every room-scoped catch-up path plus the room each `/sync`
+ * scoped its filter to. Keep the `/sync` half — in per-topic mode that filter is the entire live-path
+ * isolation boundary, and a subscribe that reads no `/messages` at all would otherwise be graded on
+ * an empty list.
+ */
+const roomIdsRead = (u: URL): string[] => {
+  const read = /\/rooms\/([^/]+)\/(messages|context)/.exec(u.pathname);
+  if (read !== null) return [decodeURIComponent(read[1]!)];
+  if (!u.pathname.endsWith('/v3/sync')) return [];
+  const filter = JSON.parse(u.searchParams.get('filter') ?? '{}') as { room?: { rooms?: string[] } };
+  return filter.room?.rooms ?? [];
+};
+
+const roomsRead = (): string[] => [...new Set(fake.requestUrls.flatMap(roomIdsRead))];
 
 const MODES = [
   { name: 'per-topic', shared: false },
@@ -116,7 +125,7 @@ describe('a topic is read out of its own room only', () => {
         const p = await connectFake({ shared: mode.shared });
         await p.post(A, WRITER, 'a0');
         await p.post(B, WRITER, 'b0');
-        fake.messagesRequests.length = 0;
+        fake.requestUrls.length = 0;
 
         const seen = await row.observe(p, async () => {
           await p.post(A, WRITER, 'a1');

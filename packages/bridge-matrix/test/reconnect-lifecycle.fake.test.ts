@@ -136,6 +136,127 @@ describe('every internal registry is empty after a lifecycle that stood the loop
 });
 
 /**
+ * CLASS: a staleness gate placed BEFORE the await it is supposed to cover. Every seam call resolves
+ * a room over two or three round-trips, and a `disconnect()` can land inside any one of them: the
+ * work then completes against a cleared token and writes its result into a registry the teardown has
+ * already emptied, handing the NEXT generation a room, a route or a waiter it never asked for. A gate
+ * checked only before the await it guards cannot see that.
+ *
+ * WHERE the disconnect lands is driven off the fake's own request hook — the teardown runs while the
+ * named request is in flight, not racing a wall-clock timer — and each row proves the phase it names
+ * actually fired, so a row that armed nothing fails instead of grading some other window.
+ */
+const disconnectDuring = (
+  p: MatrixPlugin,
+  matches: (path: string) => boolean,
+): { fired: () => boolean; since: () => string[] } => {
+  let after: string[] | undefined;
+  fake.onRequest = (method, path) => {
+    if (after !== undefined) {
+      after.push(`${method} ${path}`);
+      return;
+    }
+    if (!matches(path)) return;
+    after = [];
+    void p.disconnect();
+  };
+  return { fired: () => after !== undefined, since: () => after ?? [] };
+};
+
+/** Requests that must never follow a teardown: every long-poll and every catch-up read. */
+const POST_TEARDOWN_FORBIDDEN = /\/v3\/sync|\/messages$|\/context\//;
+
+const TEARDOWN_DRIVERS: Record<
+  string,
+  {
+    setup?: (p: MatrixPlugin) => Promise<unknown>;
+    drive: (p: MatrixPlugin, ctx: unknown) => Promise<unknown>;
+    /** True only for `post`: the caller's own WRITE finishes rather than standing down. */
+    writes: boolean;
+  }
+> = {
+  'a since-less fetchRecent': {
+    writes: false,
+    drive: (p) => p.fetchRecent({ topic: TOPIC, limit: 5 }),
+  },
+  'a post': { writes: true, drive: (p) => p.post(TOPIC, WRITER, 'x') },
+  'a subscribe': { writes: false, drive: (p) => p.subscribe(TOPIC, () => undefined) },
+  'a blocking fetchRecent from the empty sentinel': {
+    writes: false,
+    drive: (p) => p.fetchRecent({ topic: TOPIC, since: asCursor(''), blockMs: 1500, limit: 5 }),
+  },
+  'a blocking fetchRecent parked at the tail': {
+    writes: false,
+    setup: async (p) => {
+      await p.post(TOPIC, WRITER, 'seed');
+      return (await p.fetchRecent({ topic: TOPIC, limit: 5 })).nextCursor;
+    },
+    drive: (p, since) =>
+      p.fetchRecent({ topic: TOPIC, since: since as never, blockMs: 1500, limit: 5 }),
+  },
+};
+
+/** Each phase names the drivers that actually reach it, so no row can arm a request nobody issues. */
+const TEARDOWN_PHASES: Record<string, { matches: (path: string) => boolean; drivers: string[] }> = {
+  'the /directory alias lookup': {
+    matches: (path) => path.includes('/directory/room/'),
+    drivers: [
+      'a since-less fetchRecent',
+      'a post',
+      'a subscribe',
+      'a blocking fetchRecent from the empty sentinel',
+    ],
+  },
+  'the /join that follows it': {
+    matches: (path) => path.endsWith('/join'),
+    drivers: [
+      'a since-less fetchRecent',
+      'a post',
+      'a subscribe',
+      'a blocking fetchRecent from the empty sentinel',
+    ],
+  },
+  'the positioning /sync': {
+    matches: (path) => path.endsWith('/v3/sync'),
+    drivers: ['a subscribe', 'a blocking fetchRecent parked at the tail'],
+  },
+  'a /messages page': {
+    matches: (path) => path.endsWith('/messages'),
+    drivers: ['a since-less fetchRecent', 'a blocking fetchRecent from the empty sentinel'],
+  },
+};
+
+describe('a disconnect landing inside a round-trip leaves nothing behind', () => {
+  for (const [phaseName, phase] of Object.entries(TEARDOWN_PHASES)) {
+    for (const driverName of phase.drivers) {
+      const driver = TEARDOWN_DRIVERS[driverName]!;
+      it(`${driverName} / disconnect lands during ${phaseName}`, async () => {
+        const p = await connectFake({});
+        const ctx = await driver.setup?.(p);
+        const sentBefore = fake.sentBodies.length;
+        const armed = disconnectDuring(p, phase.matches);
+
+        await driver.drive(p, ctx).catch(() => undefined);
+        const settled = armed.since().length;
+        await settle(300);
+
+        expect(armed.fired()).toBe(true);
+        // Nothing the teardown cleared came back…
+        expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
+        // …no long-poll or catch-up read ran against the cleared token (an in-flight room resolve
+        // may still finish — it is bounded, idempotent and hands its result to nobody)…
+        expect(armed.since().filter((r) => POST_TEARDOWN_FORBIDDEN.test(r))).toEqual([]);
+        expect(armed.since().slice(settled)).toEqual([]);
+        // …and the caller's own write is graded the other way, so no row can pass by standing
+        // everything down indiscriminately.
+        expect(fake.sentBodies.length - sentBefore).toBe(driver.writes ? 1 : 0);
+        await p.disconnect();
+      }, 30_000);
+    }
+  }
+});
+
+/**
  * CLASS: a plugin wait that watches only the shared stopped flag. Every background park must stand
  * down AT the `disconnect()` — checked BEFORE its next request, not only after it — or it keeps
  * talking to the homeserver with a cleared token, joins rooms post-teardown, and repopulates the

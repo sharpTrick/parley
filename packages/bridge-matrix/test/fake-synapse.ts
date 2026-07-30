@@ -69,6 +69,8 @@ export class FakeSynapse {
   readonly directoryLookups: string[] = [];
   /** Every `/messages` request URL, in order — the evidence for what went on the wire. */
   readonly messagesRequests: URL[] = [];
+  /** Every request URL, in order — the evidence for which rooms a run actually touched. */
+  readonly requestUrls: URL[] = [];
   /** How many events an incremental /sync will return before it truncates with `limited:true`. */
   syncCap = 100;
   /** Number of `limited:true` incremental syncs emitted — proves the backfill path was exercised. */
@@ -122,6 +124,13 @@ export class FakeSynapse {
    * can land an event inside the exact window it names rather than racing a wall-clock timer.
    */
   duringPositioningStall: (ordinal: number) => void = () => undefined;
+  /**
+   * Called once a positioning sync's body — its `next_batch` AND the timeline tip that goes with it
+   * — has been computed, and BEFORE it is returned. An event landed here is strictly newer than the
+   * position the subscriber is about to resume from, so it MUST be delivered live; it is the window
+   * a boundary read one round-trip after the position silently swallows.
+   */
+  afterPositioningSync: (ordinal: number) => void = () => undefined;
   /**
    * Called with each `/messages` request AFTER its response body has been computed and BEFORE that
    * body is returned; the returned ms hold the response in flight. Lets a case land an event in the
@@ -223,6 +232,7 @@ export class FakeSynapse {
     const url = new URL(typeof input === 'string' ? input : ((input as Request).url ?? String(input)));
     const method = (init?.method ?? 'GET').toUpperCase();
     const path = url.pathname;
+    this.requestUrls.push(url);
     this.onRequest(method, path);
 
     if (path.endsWith('/v3/login')) return jsonRes({ access_token: 'tok', user_id: '@parley:fake' });
@@ -344,17 +354,31 @@ export class FakeSynapse {
         );
       const len = timeline.length;
       if (since === null) {
-        // Initial positioning sync (timeline limit 0) — skip history, just hand back a resume token.
+        // Initial positioning sync: a resume token plus the newest `filterLimit` events, snapshotted
+        // TOGETHER the way a real homeserver does — an initial sync's timeline is what precedes its
+        // own next_batch, so a case landing an event after this point lands it strictly after both.
         const ordinal = ++this.positioningSyncs;
         if (this.stallPositioning(ordinal)) {
           this.stalledPositioning.push(ordinal);
           this.duringPositioningStall(ordinal);
           await new Promise((r) => setTimeout(r, this.stallPositioningMs));
         }
-        return joined({
-          next_batch: `p${timeline.length}`,
-          rooms: { join: { [syncRoom?.roomId ?? '']: { timeline: { events: [], limited: false } } } },
+        const at = timeline.length;
+        const res = joined({
+          next_batch: `p${at}`,
+          rooms: {
+            join: {
+              [syncRoom?.roomId ?? '']: {
+                timeline: {
+                  events: timeline.slice(Math.max(0, at - filterLimit), at),
+                  limited: filterLimit < at,
+                },
+              },
+            },
+          },
         });
+        this.afterPositioningSync(ordinal);
+        return res;
       }
       this.syncAttempts.push(Date.now());
       if (this.syncFailures > 0) {
