@@ -13,12 +13,11 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SqlDriver } from './driver.js';
-import { MAX_PAGE, SqlitePlugin } from './index.js';
+import { MAX_PAGE, MIN_RETENTION_DAYS, SqlitePlugin } from './index.js';
 import { MESSAGE_COLUMNS, SQL } from './schema.js';
 
 const T = asTopic('ctx');
 const me = asHandle('alice');
-const ONE_MS_IN_DAYS = 1 / 86_400_000;
 const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-sqlite-')), 'p.db');
 
 let open: SqlitePlugin[] = [];
@@ -147,13 +146,16 @@ describe('SqlitePlugin retention_days', () => {
     await writer.connect({ db_path: path, poll_interval_ms: 10 });
     await writer.post(T, me, 'old-1');
     const lastOldId = await writer.post(T, me, 'old-2');
+    // Age the rows rather than shrinking the window under the floor: a window that short is
+    // refused, because accepting it would empty the store on this very prune.
+    (writer as unknown as { driver: SqlDriver }).driver
+      .prepare('UPDATE messages SET ts = ?')
+      .run(new Date(Date.now() - 10 * 60_000).toISOString());
     await writer.disconnect();
 
-    // A sub-millisecond window puts the cutoff just after the posts above → prunable immediately.
-    await new Promise((r) => setTimeout(r, 5));
     const p = new SqlitePlugin();
     open.push(p);
-    await p.connect({ db_path: path, poll_interval_ms: 10, retention_days: ONE_MS_IN_DAYS });
+    await p.connect({ db_path: path, poll_interval_ms: 10, retention_days: MIN_RETENTION_DAYS });
 
     await vi.waitFor(
       async () => {

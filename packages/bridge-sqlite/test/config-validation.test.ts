@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic, type BackendConfig } from '@sharptrick/parley-core';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { MAX_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS, SqlitePlugin } from '../src/index.js';
+import {
+  MAX_POLL_INTERVAL_MS,
+  MIN_POLL_INTERVAL_MS,
+  MIN_RETENTION_DAYS,
+  SqlitePlugin,
+} from '../src/index.js';
 
 /**
  * `backend_config` is untyped YAML from an operator. Every knob is validated before the database
@@ -168,40 +173,77 @@ describe('every bounded knob is graded at its own edges', () => {
 });
 
 /**
- * Accepting a retention window is a promise to enforce it. A value whose cutoff lands outside the
- * representable date range used to pass validation and then fail every prune forever, leaving an
- * operator watching history grow while their config said otherwise.
+ * `retention_days` is the only irreversible knob, and its guard used to name the SENTINEL instead of
+ * the hazard: `0` and negatives were refused for "would delete the entire history" while
+ * `Number.MIN_VALUE` and `1e-9` were accepted and did exactly that on the prune `connect()` runs
+ * immediately. So the accepted arm asserts the STORE, not that connect resolved — "no prune-failure
+ * diagnostic" is what let the class through, since a message planted inside every window under test
+ * cannot tell "prunes correctly" from "does not prune at all". Which side of a window a prune
+ * deletes is retention-window.test.ts's (window x age) table; this one owns the accept/reject edge.
+ *
+ * The edges are READ FROM {@link MIN_RETENTION_DAYS} rather than restated, so re-tuning the floor
+ * re-grades its own boundary instead of quietly moving out from under these rows.
  */
-describe('every accepted retention_days actually prunes', () => {
-  for (const days of [1 / 86_400_000, 0.5, 1, 30, 3650, 1e6]) {
-    it(`retention_days = ${String(days)} runs a prune with no failure diagnostic`, async () => {
+describe('the retention_days floor rejects every window that empties the store', () => {
+  const REJECTED = [
+    0,
+    -1,
+    Number.MIN_VALUE,
+    1e-12,
+    1e-9,
+    1 / 86_400_000,
+    MIN_RETENTION_DAYS / 2,
+    1e30,
+    1e308,
+    Number.MAX_VALUE,
+  ];
+  const ACCEPTED = [MIN_RETENTION_DAYS, MIN_RETENTION_DAYS * 1.5, 0.5, 1, 30, 3650, 1e6];
+
+  for (const days of REJECTED) {
+    it(`retention_days = ${String(days)} is refused, naming the key and the floor`, async () => {
       const path = dbFile();
       const writer = new SqlitePlugin();
       await writer.connect({ db_path: path, poll_interval_ms: 20 });
-      await writer.post(T, me, 'old');
+      await writer.post(T, me, 'precious');
       await writer.disconnect();
-      await new Promise((r) => setTimeout(r, 5));
+
+      const p = new SqlitePlugin();
+      await expect(p.connect({ db_path: path, poll_interval_ms: 20, retention_days: days })).rejects
+        .toThrow(/parley-sqlite: invalid backend_config\.retention_days/);
+
+      const reader = new SqlitePlugin();
+      open.push(reader);
+      await reader.connect({ db_path: path, poll_interval_ms: 20 });
+      const { messages } = await reader.fetchRecent({ topic: T });
+      expect(messages.map((m) => m.content)).toEqual(['precious']);
+    });
+  }
+
+  for (const days of ACCEPTED) {
+    it(`retention_days = ${String(days)} is accepted and leaves a message posted just now alone`, async () => {
+      const path = dbFile();
+      const writer = new SqlitePlugin();
+      await writer.connect({ db_path: path, poll_interval_ms: 20 });
+      await writer.post(T, me, 'precious');
+      await writer.disconnect();
 
       const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       let lines: string[] = [];
+      const p = new SqlitePlugin();
+      open.push(p);
       try {
-        const p = new SqlitePlugin();
-        open.push(p);
-        await p.connect({ db_path: path, poll_interval_ms: 20, retention_days: days });
+        await expect(
+          p.connect({ db_path: path, poll_interval_ms: 20, retention_days: days }),
+        ).resolves.toBeUndefined();
         lines = spy.mock.calls.map(([l]) => String(l));
       } finally {
         spy.mockRestore();
       }
+      // An accepted window is also a promise the process can KEEP: a cutoff outside the
+      // representable date range used to validate and then fail every prune forever.
       expect(lines.filter((l) => /retention prune failed/.test(l))).toEqual([]);
-    });
-  }
-
-  for (const days of [1e308, 1e30, Number.MAX_VALUE]) {
-    it(`retention_days = ${String(days)} is rejected rather than accepted-and-never-enforced`, async () => {
-      const p = new SqlitePlugin();
-      await expect(p.connect({ db_path: dbFile(), retention_days: days })).rejects.toThrow(
-        /parley-sqlite: invalid backend_config.retention_days/,
-      );
+      const { messages } = await p.fetchRecent({ topic: T });
+      expect(messages.map((m) => m.content)).toEqual(['precious']);
     });
   }
 });

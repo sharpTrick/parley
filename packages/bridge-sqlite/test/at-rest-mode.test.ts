@@ -1,8 +1,8 @@
-import { chmodSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
-import { openDriver } from '../src/driver.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { type openDriver as OpenDriver, openDriver } from '../src/driver.js';
 
 const hoisted = vi.hoisted(() => ({ chmodFails: false }));
 vi.mock('node:fs', async (importOriginal) => {
@@ -24,10 +24,83 @@ vi.mock('node:fs', async (importOriginal) => {
  * down, or left group/world-readable by an older version. The mode must end at 0600 in every case,
  * and any time the store is (or stays) readable by another account the operator must be told,
  * never silently.
+ *
+ * Every case OWNS its umask rather than inheriting the runner's, because the umask is what decides
+ * how much of this is graded: under 0077 the driver's own create is already 0600, so the entire
+ * pre-creation window can be deleted with every assertion here still passing. Nothing in
+ * `.github/workflows/ci.yml` or `vitest.config.ts` pins one.
  */
 
 const mode = (f: string): number => statSync(f).mode & 0o777;
 const dir = () => mkdtempSync(join(tmpdir(), 'parley-mode-'));
+
+const UMASKS = [0o000, 0o022, 0o077];
+const oct = (m: number): string => `0${m.toString(8).padStart(3, '0')}`;
+
+let previousUmask: number | undefined;
+function withUmask(mask: number): void {
+  previousUmask ??= process.umask(mask);
+}
+afterEach(() => {
+  if (previousUmask !== undefined) process.umask(previousUmask);
+  previousUmask = undefined;
+  vi.doUnmock('node:module');
+  vi.resetModules();
+});
+
+/**
+ * A copy of the driver whose native constructor records what was on disk at the instant it ran.
+ * The pre-creation claim is about a WINDOW, and the final mode cannot see one: the only moment the
+ * window is observable is the driver's own open.
+ */
+async function loadRecordingDriver(): Promise<{
+  openDriver: typeof OpenDriver;
+  atOpen: () => { existed: boolean; mode?: number };
+}> {
+  const seen: Array<{ existed: boolean; mode?: number }> = [];
+  vi.resetModules();
+  vi.doMock('node:module', async (importOriginal) => {
+    const real = await importOriginal<typeof import('node:module')>();
+    return {
+      ...real,
+      default: real,
+      createRequire: (from: string | URL) => {
+        const inner = real.createRequire(from);
+        const recording = ((id: string) => {
+          const mod: unknown = inner(id);
+          if (id !== 'better-sqlite3') return mod;
+          return new Proxy(mod as new (p: string) => object, {
+            construct: (target, args) => {
+              const path = String(args[0]);
+              seen.push(
+                existsSync(path) ? { existed: true, mode: mode(path) } : { existed: false },
+              );
+              return Reflect.construct(target, args) as object;
+            },
+          });
+        }) as unknown as NodeJS.Require;
+        return Object.assign(recording, inner);
+      },
+    };
+  });
+  const driver = await import('../src/driver.js');
+  return { openDriver: driver.openDriver, atOpen: () => seen[0] ?? { existed: false } };
+}
+
+describe('the store is claimed at 0600 before the driver can create it', () => {
+  for (const umask of UMASKS) {
+    it(`umask ${oct(umask)}: the file the driver opens already exists at 0600`, async () => {
+      withUmask(umask);
+      const { openDriver: recording, atOpen } = await loadRecordingDriver();
+      const d = recording(join(dir(), 'p.db'));
+      d.close();
+      expect(
+        atOpen(),
+        'nothing was recorded: the native constructor never ran, so this graded no window at all',
+      ).toEqual({ existed: true, mode: 0o600 });
+    });
+  }
+});
 
 /**
  * The store is three files, and the message content lives in the `-wal` as much as in the `.db`.
@@ -65,9 +138,11 @@ const PRE_EXISTING: Array<{
   },
 ];
 
-describe('at-rest mode for every pre-existing store state', () => {
+describe.each(UMASKS.map(oct))('at-rest mode for every pre-existing store state (umask %s)', (label) => {
+  const umask = Number.parseInt(label, 8);
   for (const c of PRE_EXISTING) {
     it(`${c.name}: every file ends at 0600, each change reported once`, () => {
+      withUmask(umask);
       const path = join(dir(), 'p.db');
       for (const f of FILES) {
         const preset = c.setup[f];
@@ -101,6 +176,7 @@ describe('at-rest mode for every pre-existing store state', () => {
   }
 
   it('a store that cannot be tightened is reported, not silently left open', () => {
+    withUmask(umask);
     const path = join(dir(), 'p.db');
     writeFileSync(path, '');
     chmodSync(path, 0o644);

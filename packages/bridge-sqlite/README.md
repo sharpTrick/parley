@@ -118,7 +118,7 @@ fast with the offending key in the message rather than being absorbed:
 |---|---|---|
 | `db_path` | any non-empty string | `""`, non-strings |
 | `poll_interval_ms` | integer `10` … `2147483647` | `0` (a hot loop), negatives, fractions, values above the `setTimeout` ceiling (Node silently clamps those to 1 ms) |
-| `retention_days` | any number `> 0` whose cutoff is a representable date | `0` and negatives — **not** "disabled"; they would delete the entire history. Omit the key for "keep forever". Also rejected: values so large the cutoff falls outside the representable date range, which would be accepted and then silently never enforced |
+| `retention_days` | any number `>= 1/1440` (one minute) whose cutoff is a representable date | `0`, negatives, and any window shorter than a minute — **not** "disabled"; each deletes the entire history on the prune `connect()` runs immediately, so `1e-9` is refused for the same reason `0` is. Omit the key for "keep forever". Also rejected: values so large the cutoff falls outside the representable date range, which would be accepted and then silently never enforced |
 
 Unknown keys are rejected too, so `retention_day: 30` is a startup error rather than a silent
 no-op.
@@ -127,7 +127,8 @@ no-op.
 
 `retention_days` prunes rows older than the window on a background timer (checked hourly, plus
 once immediately at connect). It's off by default — messages are kept forever unless you opt in;
-`0` is **not** the way to say "disabled" (it means "delete everything up to now") and is rejected.
+`0` is **not** the way to say "disabled" (it means "delete everything up to now") and is rejected,
+as is any window under a minute, which has the same effect on the first prune.
 Safe to turn on at any time: `id` is `AUTOINCREMENT` and never reused, so a `cursor`/`backendMsgId`
 minted before a prune stays valid — catch-up across a prune returns fewer rows, never a wrong or a
 duplicate one. There's no error or signal for "this much history is gone"; it's a silent trim, so

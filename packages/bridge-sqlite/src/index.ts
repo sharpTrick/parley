@@ -40,8 +40,9 @@ export interface SqliteBackendConfig {
   poll_interval_ms?: number;
   /**
    * Optional retention window in days: rows older than this are pruned on a background timer.
-   * Omit for the default — keep every message forever. `0` and negatives are rejected: they mean
-   * "delete everything up to now", an irreversible wipe of the whole shared file. Safe to enable
+   * Omit for the default — keep every message forever. Anything below {@link MIN_RETENTION_DAYS}
+   * is rejected: `0`, negatives and a window too short to hold a conversation all mean "delete
+   * everything up to now", an irreversible wipe of the whole shared file. Safe to enable
    * at any time: `id` is `AUTOINCREMENT` and never reused, so a cursor/backendMsgId minted before
    * a prune stays valid (catch-up across a prune returns fewer rows, never a wrong or duplicate
    * one). Which rows go is decided by `ts` — the wall clock of whichever process posted them, not
@@ -74,10 +75,24 @@ const DEFAULT_PAGE = 100;
 /** Floor for `poll_interval_ms`: below this the loop is a hot spin, not a poll. */
 export const MIN_POLL_INTERVAL_MS = 10;
 /**
+ * Floor for `retention_days`: one minute, expressed in days. `connect()` prunes immediately, so a
+ * window too short to hold a conversation empties the whole shared file the moment it is accepted —
+ * the outcome `0` and negatives are refused for, reached just as well by `Number.MIN_VALUE`,
+ * `1e-9`, or a unit slip that meant milliseconds.
+ */
+export const MIN_RETENTION_DAYS = 1 / 1440;
+/**
  * Ceiling for `poll_interval_ms`. Keep it at setTimeout's 32-bit limit: Node silently clamps a
  * larger delay to 1 ms, so an operator asking for a very slow poll would get a hot loop instead.
  */
 export const MAX_POLL_INTERVAL_MS = 2_147_483_647;
+/**
+ * Most catch-up hand-off points held at once. `fetchRecent`'s topic is caller-supplied, and core
+ * admits any topic a `post_topics` pattern matches, so the ledger is capped rather than left to
+ * grow one entry per distinct topic ever fetched. An evicted topic's {@link SqlitePlugin.subscribe}
+ * samples the current tail, exactly as a topic catch-up never read does.
+ */
+export const CATCHUP_LEDGER_MAX = 1024;
 /** Consecutive non-lock poll failures before the loop escalates (backs off, or stops if fatal). */
 export const ESCALATE_AFTER = 10;
 /** Ceiling on the degraded poll interval, so a down DB is re-probed forever but cheaply. */
@@ -243,10 +258,21 @@ export class SqlitePlugin implements BackendPlugin {
    * Remember the rowid this topic's catch-up has accounted for — the row `nextCursor` names, which
    * is the caller's persisted read position. Only ever advances, so a caller that re-reads an
    * older page cannot pull a later {@link subscribe} back over messages catch-up already served.
+   *
+   * Bounded at {@link CATCHUP_LEDGER_MAX}, least-recently-recorded first: the topic is supplied by
+   * the caller and a `post_topics` pattern makes the set of fetchable topics unbounded, so an
+   * unevicted ledger grows for the life of a long-running bridge.
    */
   private recordCatchUp(topic: Topic, rowid: bigint): void {
     const seen = this.caughtUpThrough.get(topic);
-    if (seen === undefined || rowid > seen) this.caughtUpThrough.set(topic, rowid);
+    if (seen !== undefined && rowid <= seen) return;
+    this.caughtUpThrough.delete(topic);
+    this.caughtUpThrough.set(topic, rowid);
+    while (this.caughtUpThrough.size > CATCHUP_LEDGER_MAX) {
+      const oldest = this.caughtUpThrough.keys().next().value;
+      if (oldest === undefined) return;
+      this.caughtUpThrough.delete(oldest);
+    }
   }
 
   /**
@@ -283,7 +309,8 @@ export class SqlitePlugin implements BackendPlugin {
    * catch-up to completion and arms `subscribe` later, so a start point sampled here would skip
    * everything a peer committed in between — below the sampled mark, above the read position
    * catch-up persisted, and therefore owned by neither path. Sampling is right only for a topic
-   * catch-up never read: its rows are history the live path has never owned.
+   * catch-up never read — or one whose hand-off point aged out of {@link CATCHUP_LEDGER_MAX}: its
+   * rows are history the live path has never owned.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const storeId = this.require(this.storeId);
@@ -295,7 +322,7 @@ export class SqlitePlugin implements BackendPlugin {
     this.health.push(health);
 
     const tick = (): void => {
-      if (this.stopped || this.driver === undefined) return;
+      if (this.tornDown()) return;
       let delay = this.pollIntervalMs;
       try {
         const rows = this.require(this.selectAfterStmt).all(
@@ -304,6 +331,10 @@ export class SqlitePlugin implements BackendPlugin {
           POLL_BATCH,
         ) as MessageRow[];
         for (const row of rows) {
+          // Keep these re-checks around EVERY handler call, so that a handler which tears the
+          // plugin down re-entrantly stops the loop at that row: the rest of the batch is already
+          // in memory, and the bookkeeping below would report a torn-down loop as live.
+          if (this.tornDown()) return;
           lastSeen = row.id;
           try {
             handler(rowToMessage(row, storeId));
@@ -311,6 +342,7 @@ export class SqlitePlugin implements BackendPlugin {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }
         }
+        if (this.tornDown()) return;
         // Keep the immediate reschedule on a full batch, so that POLL_BATCH bounds per-tick work
         // rather than capping throughput at one batch per poll interval.
         if (rows.length === POLL_BATCH) delay = 0;
@@ -412,6 +444,10 @@ export class SqlitePlugin implements BackendPlugin {
     }
   }
 
+  private tornDown(): boolean {
+    return this.stopped || this.driver === undefined;
+  }
+
   private require<T>(value: T | undefined): T {
     if (value === undefined) throw new Error('SqlitePlugin not connected — call connect() first');
     return value;
@@ -470,11 +506,15 @@ export function validateBackendConfig(config: BackendConfig): SqliteBackendConfi
   }
 
   const retention = cfg['retention_days'];
-  if (retention !== undefined && (typeof retention !== 'number' || !(retention > 0))) {
+  if (
+    retention !== undefined &&
+    (typeof retention !== 'number' || !(retention >= MIN_RETENTION_DAYS))
+  ) {
     throw bad(
       'retention_days',
-      `expected a number > 0, got ${describe(retention)} — 0 or negative would delete the whole ` +
-        `history; omit the key to keep every message forever`,
+      `expected a number >= ${MIN_RETENTION_DAYS} (one minute), got ${describe(retention)} — a ` +
+        `window this short deletes the whole history on the connect() prune, which is what 0 and ` +
+        `negatives were already refused for; omit the key to keep every message forever`,
     );
   }
   if (typeof retention === 'number' && !Number.isFinite(retention)) {

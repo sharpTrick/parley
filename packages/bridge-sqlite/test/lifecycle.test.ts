@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openDriver, type SqlDriver } from '../src/driver.js';
-import { SqlitePlugin } from '../src/index.js';
+import { POLL_BATCH, SqlitePlugin } from '../src/index.js';
 import { SCHEMA } from '../src/schema.js';
 import { type ExpectedHealth, expectHealth } from './health.js';
 
@@ -351,6 +351,61 @@ describe('a connect() that fails after opening the store leaves nothing behind',
       expect(openHandles() - before).toBe(0);
     },
   );
+});
+
+/**
+ * A handler runs synchronously inside the poll tick, so a consumer that shuts the bridge down on an
+ * inbound control message re-enters the plugin while a batch of rows is already in memory. Nothing
+ * may reach the handler from that point on — the conformance clause `disconnect-stops-live-delivery`
+ * is what core's `<channel>` emission rests on, and it is graded there only from OUTSIDE the
+ * handler, where no row can be pending when the flag flips.
+ *
+ * Fake timers make the batch explicit rather than raced: every row posted between two ticks arrives
+ * in one, so the teardown row is a POSITION in a known batch.
+ */
+describe('a teardown started from inside a handler stops delivery at that row', () => {
+  const teardownPositions = (pending: number): number[] =>
+    [...new Set([1, Math.ceil(pending / 2), pending])];
+
+  for (const pending of [1, 2, POLL_BATCH]) {
+    for (const at of teardownPositions(pending)) {
+      for (const twice of [false, true]) {
+        it(`${pending} row(s) in the batch, handler disconnects ${twice ? 'twice ' : ''}on row ${at}`, async () => {
+          const path = dbFile();
+          const p = tracked();
+          await p.connect(cfg(path));
+          const got: string[] = [];
+
+          vi.useFakeTimers();
+          try {
+            await p.subscribe(T, (m) => {
+              got.push(m.content);
+              if (got.length !== at) return;
+              void p.disconnect();
+              if (twice) void p.disconnect();
+            });
+            for (let i = 0; i < pending; i++) await p.post(T, me, `m${i}`);
+            await vi.advanceTimersByTimeAsync(1000);
+
+            expect(got).toEqual(Array.from({ length: at }, (_unused, i) => `m${i}`));
+            expectHealth(p.subscriptionHealth(), [
+              { topic: T, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
+            ]);
+
+            // The loop must be gone, not merely out of rows: a second client keeps writing to the
+            // same file while the timers run on.
+            const peer = tracked();
+            await peer.connect(cfg(path));
+            for (let i = 0; i < 3; i++) await peer.post(T, me, `after-${i}`);
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(got).toEqual(Array.from({ length: at }, (_unused, i) => `m${i}`));
+          } finally {
+            vi.useRealTimers();
+          }
+        });
+      }
+    }
+  }
 });
 
 describe('subscriptionHealth never reports a loop that cannot deliver', () => {
