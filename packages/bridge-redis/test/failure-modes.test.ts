@@ -5,6 +5,14 @@ import { loadConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { CONFIG_KEYS, RedisPlugin } from '../src/index.js';
 import { rejectedByKnob, rejectedRows } from './config-fixtures.js';
+import {
+  commandOf,
+  expectSafeError,
+  respEndpoint,
+  respError,
+  SECRET,
+  withArgs,
+} from './resp-server.js';
 import { endpointOf, FAST_MS as FAST, freeEndpoint } from './support.js';
 
 // The failure surface the seam-conformance suite structurally cannot reach: it only ever runs
@@ -69,12 +77,14 @@ describe('redis failure modes — connect() must fail fast, never hang', () => {
 
   it('names the endpoint but never the password', async () => {
     const closed = await freeEndpoint();
-    const url = closed.replace('//', '//parley:hunter2@');
+    const url = closed.replace('//', `//parley:${SECRET}@`);
     const plugin = new RedisPlugin();
     await expect(plugin.connect({ url, connect_timeout_ms: FAST })).rejects.toThrow(
       new RegExp(endpointOf(closed).replace(/\./g, '\\.')),
     );
-    await expect(plugin.connect({ url, connect_timeout_ms: FAST })).rejects.not.toThrow(/hunter2/);
+    await expect(plugin.connect({ url, connect_timeout_ms: FAST })).rejects.not.toThrow(
+      new RegExp(SECRET),
+    );
     await plugin.disconnect().catch(() => undefined);
   });
 });
@@ -180,131 +190,58 @@ describe('bridge-redis shipped example configs — every one still loads', () =>
 // ---------------------------------------------------------------------------------------------
 // CLASS: connect() reports success against an endpoint that cannot serve the seam. Every row is
 // REACHABLE — the handshake completes — so the fail-fast table above cannot see any of them.
+//
+// Three axes, because each one hides a different failure from a hand-listed table:
+//   * CODE. `PERMANENT_SERVER_ERROR` lists seven refusal codes; a table that names four grades the
+//     three it left out not at all. Generated from the shipped list, so a code added later has a
+//     row before it has a bug.
+//   * ARRIVAL. A refusal that lands on the HANDSHAKE survives only as an emitted `error` event
+//     (node-redis reports the connect itself as the reconnect strategy's generic failure); one that
+//     lands on the first COMMAND arrives as the thrown rejection. Those are two different reads.
+//   * ECHO. A real Redis appends `, with args beginning with: '<arg>', …` to a refusal — so a
+//     server that does not know `AUTH` hands this client its own password back inside the error the
+//     plugin then composes and cli.ts writes to stderr. A fake that answers with a bare
+//     `-ERR unknown command` cannot produce the failure mode that matters.
 // ---------------------------------------------------------------------------------------------
 
-/** One RESP command, or `undefined` while `buf` still holds a partial one. */
-function takeCommand(buf: string): { consumed: number; argv: string[] } | undefined {
-  if (!buf.startsWith('*')) {
-    const nl = buf.indexOf('\r\n');
-    return nl === -1 ? undefined : { consumed: nl + 2, argv: [buf.slice(0, nl)] };
-  }
-  const head = buf.indexOf('\r\n');
-  if (head === -1) return undefined;
-  const argc = Number(buf.slice(1, head));
-  let at = head + 2;
-  const argv: string[] = [];
-  for (let i = 0; i < argc; i++) {
-    if (buf[at] !== '$') return undefined;
-    const lenEnd = buf.indexOf('\r\n', at);
-    if (lenEnd === -1) return undefined;
-    const len = Number(buf.slice(at + 1, lenEnd));
-    const start = lenEnd + 2;
-    if (buf.length < start + len + 2) return undefined;
-    argv.push(buf.slice(start, start + len));
-    at = start + len + 2;
-  }
-  return { consumed: at, argv };
-}
-
-/**
- * A TCP endpoint that speaks enough RESP to complete node-redis' handshake and then answers each
- * command with whatever `reply` returns (`undefined` = stay silent). In-process, so the degraded
- * server rows below need no container and cannot skip themselves.
- */
-async function respEndpoint(
-  reply: (argv: string[]) => string | undefined,
-): Promise<{ url: string; close: () => void }> {
-  const held: net.Socket[] = [];
-  const server = net.createServer((sock) => {
-    held.push(sock);
-    let buf = '';
-    sock.on('error', () => undefined);
-    sock.on('data', (chunk) => {
-      buf += chunk.toString('latin1');
-      for (;;) {
-        const cmd = takeCommand(buf);
-        if (cmd === undefined) break;
-        buf = buf.slice(cmd.consumed);
-        const out = reply(cmd.argv);
-        if (out !== undefined) sock.write(out);
-      }
-    });
-  });
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const { port } = server.address() as net.AddressInfo;
-  return {
-    url: `redis://127.0.0.1:${port}`,
-    close: () => {
-      for (const s of held) s.destroy();
-      server.close();
-    },
-  };
-}
-
-const isPing = (argv: string[]): boolean => /^ping$/i.test(argv[0] ?? '');
-
-/** A server whose handshake succeeds and which then answers the first real command with `error`. */
-const refusesCommands =
-  (error: string) =>
-  (argv: string[]): string =>
-    isPing(argv) ? error : '+OK\r\n';
-
 describe('redis failure modes — a reachable server that cannot serve the seam', () => {
-  interface Degraded {
-    reply: (argv: string[]) => string | undefined;
-    /** Whether the URL carries a password — a handshake-time refusal needs one to be sent. */
-    password: boolean;
-    expected: RegExp;
-  }
-
-  const degraded: Array<[string, Degraded]> = [
-    [
-      'password-protected, no password in the URL',
-      {
-        // A real `--requirepass` server answers CLIENT SETINFO with NOAUTH too, and node-redis
-        // SWALLOWS that — which is exactly why the handshake alone proves nothing.
-        reply: () => '-NOAUTH Authentication required.\r\n',
-        password: false,
-        expected: /refused a command: NOAUTH/,
-      },
-    ],
-    [
-      'password-protected, wrong password',
-      {
-        reply: () => '-WRONGPASS invalid username-password pair or user is disabled.\r\n',
-        password: true,
-        expected: /refused a command: WRONGPASS/,
-      },
-    ],
-    [
-      'authenticated, but the ACL forbids the commands the seam needs',
-      {
-        reply: refusesCommands('-NOPERM this user has no permissions to run the ping command\r\n'),
-        password: true,
-        expected: /refused a command: NOPERM/,
-      },
-    ],
-    [
-      'a non-Redis TCP speaker that answers the handshake',
-      {
-        reply: refusesCommands('-ERR unknown command\r\n'),
-        password: true,
-        expected: /refused a command: ERR/,
-      },
-    ],
-    [
-      'answers the handshake then never answers a command',
-      {
-        reply: (argv) => (isPing(argv) ? undefined : '+OK\r\n'),
-        password: true,
-        expected: /did not answer PING/,
-      },
-    ],
+  /** Every code `PERMANENT_SERVER_ERROR` treats as "only an operator can clear this". */
+  const refusals: Array<[string, string]> = [
+    ['ERR', "unknown command 'PING'"],
+    ['NOAUTH', 'Authentication required.'],
+    ['WRONGPASS', 'invalid username-password pair or user is disabled.'],
+    ['NOPERM', "this user has no permissions to run the 'ping' command"],
+    ['WRONGTYPE', 'Operation against a key holding the wrong kind of value'],
+    ['NOPROTO', 'unsupported protocol version'],
+    ['EXECABORT', 'Transaction discarded because of previous errors.'],
   ];
 
-  it.each(degraded)('connect() rejects: %s', async (_label, row) => {
-    const endpoint = await respEndpoint(row.reply);
-    const url = row.password ? endpoint.url.replace('//', '//:hunter2@') : endpoint.url;
+  /** Where the refusal lands — which decides which of the two reads has to find it. */
+  const arrivals: Array<[string, (argv: string[]) => boolean]> = [
+    ['on the handshake', () => true],
+    ['on the first command', (argv) => commandOf(argv) === 'ping'],
+  ];
+
+  const echoes: Array<[string, boolean]> = [
+    ['a bare refusal', false],
+    ['a refusal quoting its arguments', true],
+  ];
+
+  const rows = refusals.flatMap(([code, text]) =>
+    arrivals.flatMap(([arrival, refuses]) =>
+      echoes.map(
+        ([echo, echoesArgs]) =>
+          [`${code} ${arrival}, ${echo}`, code, refuses, echoesArgs] as const,
+      ),
+    ),
+  );
+
+  it.each(rows)('connect() rejects: %s', async (_label, code, refuses, echoesArgs) => {
+    const text = refusals.find(([c]) => c === code)?.[1] ?? '';
+    const endpoint = await respEndpoint((argv) =>
+      refuses(argv) ? respError(code, echoesArgs ? text + withArgs(argv) : text) : '+OK\r\n',
+    );
+    const url = endpoint.url.replace('//', `//parley:${SECRET}@`);
     const plugin = new RedisPlugin();
     try {
       const failure = await plugin.connect({ url, connect_timeout_ms: FAST }).then(
@@ -315,12 +252,76 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
         failure,
         'connect() resolved against a server that cannot serve the seam',
       ).toBeInstanceOf(Error);
-      expect(failure?.message).toMatch(row.expected);
+      expect(failure?.message).toMatch(new RegExp(`refused a command: ${code}\\b`));
       expect(failure?.message).toContain(endpointOf(endpoint.url));
-      expect(failure?.message).not.toContain('hunter2');
+      expectSafeError('connect()', failure, SECRET);
       // A refusal must not be reported as a network problem, or the operator debugs the wrong layer.
-      if (!/did not answer/.test(failure?.message ?? '')) {
-        expect(failure?.message).not.toMatch(/cannot reach/);
+      expect(failure?.message).not.toMatch(/cannot reach/);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      endpoint.close();
+    }
+  });
+
+  it('rejects a server that answers the handshake and then never answers a command', async () => {
+    const endpoint = await respEndpoint((argv) =>
+      commandOf(argv) === 'ping' ? undefined : '+OK\r\n',
+    );
+    const plugin = new RedisPlugin();
+    try {
+      const failure = await plugin
+        .connect({ url: endpoint.url.replace('//', `//parley:${SECRET}@`), connect_timeout_ms: FAST })
+        .then(
+          () => undefined,
+          (err: Error) => err,
+        );
+      expect(failure?.message).toMatch(/did not answer PING/);
+      expect(failure?.message).toContain(endpointOf(endpoint.url));
+      expectSafeError('connect()', failure, SECRET);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      endpoint.close();
+    }
+  });
+
+  // A password has TWO spellings and a server can echo either: the DECODED one the client puts on
+  // the wire (which comes back in `with args beginning with:`), and the PERCENT-ENCODED one the URL
+  // carries (which comes back when anything quotes the connection string). A sweep that knows one
+  // misses the other, so the fake below echoes both and every row asserts neither survives — and
+  // asserts first that the fake really received the wire form, so a row cannot pass by never
+  // exercising the echo at all.
+  const passwords: Array<[string, string]> = [
+    ['a plain password', SECRET],
+    ['a password with URL-unsafe characters', 'p@ss:w0rd/2'],
+    ['a password with a percent sign', '50%off'],
+    ['a non-ASCII password', 'pässwörd'],
+  ];
+
+  it.each(passwords)('a server echoing AUTH never gets %s back', async (_label, password) => {
+    const inTheUrl = encodeURIComponent(password);
+    const seen: string[] = [];
+    const endpoint = await respEndpoint((argv) => {
+      if (commandOf(argv) === 'auth') seen.push(...argv.slice(1));
+      return respError(
+        'ERR',
+        `unknown command '${argv[0] ?? ''}'${withArgs(argv)} (userinfo '${inTheUrl}')`,
+      );
+    });
+    const plugin = new RedisPlugin();
+    try {
+      const url = endpoint.url.replace('//', `//:${inTheUrl}@`);
+      const failure = await plugin.connect({ url, connect_timeout_ms: FAST }).then(
+        () => undefined,
+        (err: Error) => err,
+      );
+      expect(seen, 'the fake never received the credential, so this row grades nothing').toContain(
+        password,
+      );
+      expect(failure?.message, 'nothing was redacted, so this row grades nothing').toContain(
+        '<redacted>',
+      );
+      for (const spelling of new Set([password, inTheUrl])) {
+        expectSafeError('connect()', failure, spelling);
       }
     } finally {
       await plugin.disconnect().catch(() => undefined);

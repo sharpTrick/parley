@@ -525,6 +525,12 @@ describe.skipIf(!redisUp)('redis failure modes — cursor provenance', () => {
 //   * ID COMPONENT. A cursor that differs from the tail only in its SEQUENCE exercises the second
 //     half of the id comparison, which a table of "an hour ahead" rows never reaches. The ids are
 //     written explicitly, so two entries share one millisecond deterministically rather than by luck.
+//
+// The graded invariant is "no well-formed cursor EVER dead-ends", not one heal outcome: a row that
+// throws fails the same way a row that echoes the cursor back does. That is what makes the ceiling
+// shapes below meaningful — they are derived from the uint64 bound each id component is, rather
+// than hand-picked, because a hand-picked ceiling value samples whichever spelling the server
+// happens to accept and grades a narrower class than the one it names.
 // -------------------------------------------------------------------------------------------
 
 interface Tail {
@@ -587,15 +593,23 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
     ],
   ];
 
+  /** The bound each component of a stream entry id is held to; every ceiling shape derives from it. */
+  const CEILING = 2n ** 64n - 1n;
+
   /** Cursor shapes that sort past any tail these states can produce. */
   const shapes: Array<[string, (tail: Tail) => string]> = [
     ['one sequence past the tail', (t) => `${t.ms}-${t.seq + 1n}`],
     ['one millisecond past the tail', (t) => `${t.ms + 1n}-0`],
     ['an hour past the tail', (t) => `${t.ms + 3_600_000n}-0`],
     ['a bare-ms id past the tail', (t) => `${t.ms + 3_600_000n}`],
-    // The inverse of the uint64-overflow rejection rows: 2^64-1 is the largest id Redis can mint, so
-    // the range check must heal it like any other future cursor rather than reject it as malformed.
-    ['the largest id a stream can ever mint', () => '18446744073709551615-0'],
+    // The inverse of the uint64-overflow rejection rows: every one of these is a well-formed id a
+    // stream could in principle hold, so the heal owes each the recent window rather than a
+    // rejection. The top of the id space is its own case: `(<max>-<max>` is the one exclusive range
+    // start Redis cannot express, so a cursor there reaches XRANGE as a hard refusal.
+    ['the ceiling millisecond at sequence zero', () => `${CEILING}-0`],
+    ['the ceiling millisecond one below the ceiling sequence', () => `${CEILING}-${CEILING - 1n}`],
+    ['the largest id a stream can ever mint', () => `${CEILING}-${CEILING}`],
+    ['a bare ceiling millisecond', () => `${CEILING}`],
   ];
 
   const rows = states.flatMap(([stateLabel, seed]) =>

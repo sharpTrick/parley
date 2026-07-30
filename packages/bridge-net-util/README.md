@@ -4,8 +4,8 @@ A tiny HTTP helper: one `fetch` + 429-retry loop, plus the `delay` any backend t
 It is published to npm, so **everything below is public API** — a change to any of these names is
 a breaking change.
 
-- **Consumed by:** Discord, Matrix, Postgres, Slack, Telegram, XMPP, Zulip.
-- **Not consumed by:** NATS, Redis, SQLite.
+- **Consumed by:** Discord, Matrix, Postgres, Redis, Slack, Telegram, XMPP, Zulip.
+- **Not consumed by:** NATS, SQLite.
 
 Both lines are re-derived from the workspace manifests by this package's own tests, so a backend
 that gains or drops the dependency moves them.

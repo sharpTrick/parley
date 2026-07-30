@@ -13,6 +13,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { sanitizeBody } from '@sharptrick/parley-net-util';
 import { createClient } from 'redis';
 
 type RedisClient = ReturnType<typeof createClient>;
@@ -34,7 +35,9 @@ export const CONFIG_KEYS = [
 /** A Redis Stream entry id — `<ms>` or `<ms>-<seq>`. Cursors and backendMsgIds are exactly this. */
 const CURSOR_PATTERN = /^\d+(-\d+)?$/;
 /** Both components of a stream entry id are unsigned 64-bit; a larger one is not an id at all. */
-const MAX_ID_COMPONENT = 18446744073709551615n;
+const MAX_ID_COMPONENT = 2n ** 64n - 1n;
+/** The largest entry id a stream can ever hold — and the one cursor `(<id>` cannot start after. */
+const MAX_ENTRY_ID = `${MAX_ID_COMPONENT}-${MAX_ID_COMPONENT}`;
 /** The sender of an entry written by something other than this plugin, which carries no `sender`. */
 const UNKNOWN_SENDER = 'unknown';
 /**
@@ -122,11 +125,55 @@ function serverRefusal(err: unknown): string | undefined {
 }
 
 /**
+ * Every spelling this connection's password can be echoed back in: the one the URL carries, which
+ * `URL` hands back PERCENT-ENCODED, and the one the client puts on the wire, which is the decoded
+ * one. A sweep that knows a single spelling is half a sweep.
+ */
+function passwordSpellings(url: string): string[] {
+  let password: string;
+  try {
+    password = new URL(url).password;
+  } catch {
+    return [];
+  }
+  if (password === '') return [];
+  const spellings = new Set([password]);
+  try {
+    spellings.add(decodeURIComponent(password));
+  } catch {
+    /* a stray '%' makes it no escape sequence at all; the spelling above is then the only one */
+  }
+  return [...spellings];
+}
+
+/**
+ * Server-supplied text, made safe to put in an `Error` (which core renders into model context) or
+ * in a log line: this connection's own password struck out, then bounded and stripped of the
+ * control and format characters a hostile reply would forge line structure with.
+ *
+ * Keep this on every path that embeds a RESP error, so that a server which quotes back the
+ * arguments it was given — which is exactly what Redis's own `unknown command '<cmd>', with args
+ * beginning with: '<arg>'` does to AUTH — cannot hand this plugin its own password to log.
+ */
+function fromServer(url: string, text: string): string {
+  let redacted = text;
+  for (const spelling of passwordSpellings(url)) {
+    redacted = redacted.split(spelling).join('<redacted>');
+  }
+  return sanitizeBody(redacted);
+}
+
+const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/**
  * A server that is reachable but cannot serve the seam. Distinct from {@link unreachable}, so that
  * an operator debugging a `WRONGPASS` is not sent to look at the network instead of the credential.
  */
 function refused(url: string, respError: string): string {
-  return `parley-redis: connected to ${endpointOf(url)} but the server refused a command: ${respError}`;
+  return (
+    `parley-redis: connected to ${endpointOf(url)} but the server refused a command: ` +
+    fromServer(url, respError)
+  );
 }
 
 /** A server that completed the handshake and then did not answer the first command in time. */
@@ -318,22 +365,6 @@ function assertMintedCursor(topic: Topic, since: string): void {
   }
 }
 
-/**
- * Keep every backend refusal labelled, so that a repurposed key or a revoked ACL reaches the
- * operator naming the plugin, the topic and the Redis key rather than as a bare RESP line
- * (`WRONGTYPE Operation against a key holding the wrong kind of value`) that names none of them and
- * cannot be traced back to which topic, prefix or process produced it.
- */
-async function labelled<T>(topic: Topic, key: string, work: () => Promise<T>): Promise<T> {
-  try {
-    return await work();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message.startsWith('parley-redis:')) throw err;
-    throw new Error(`parley-redis: ${message} (topic ${topic}, key '${key}')`);
-  }
-}
-
 /** Order two stream ids; a bare `<ms>` cursor has an implicit sequence of 0, as Redis reads it. */
 function compareIds(a: string, b: string): number {
   const [aMs = '0', aSeq = '0'] = a.split('-');
@@ -392,6 +423,22 @@ export class RedisPlugin implements BackendPlugin {
     return this.serialize(() => this.tearDown());
   }
 
+  /**
+   * Keep every backend refusal labelled, so that a repurposed key or a revoked ACL reaches the
+   * operator naming the plugin, the topic and the Redis key rather than as a bare RESP line
+   * (`WRONGTYPE Operation against a key holding the wrong kind of value`) that names none of them
+   * and cannot be traced back to which topic, prefix or process produced it.
+   */
+  private async labelled<T>(topic: Topic, key: string, work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('parley-redis:')) throw err;
+      const text = fromServer(this.url, errorText(err));
+      throw new Error(`parley-redis: ${text} (topic ${topic}, key '${key}')`);
+    }
+  }
+
   private serialize<T>(work: () => Promise<T>): Promise<T> {
     const settled = this.lifecycle.then(
       () => undefined,
@@ -440,7 +487,9 @@ export class RedisPlugin implements BackendPlugin {
     } catch (err) {
       const respError = serverRefusal(err) ?? serverRefusal(lastEmittedError.get(client));
       await client.disconnect().catch(() => undefined);
-      throw respError !== undefined ? new Error(refused(this.url, respError)) : err;
+      throw respError !== undefined
+        ? new Error(refused(this.url, respError))
+        : new Error(fromServer(this.url, errorText(err)));
     }
     this.client = client;
   }
@@ -464,7 +513,7 @@ export class RedisPlugin implements BackendPlugin {
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     const key = this.key(topic);
-    const id = await labelled(topic, key, () =>
+    const id = await this.labelled(topic, key, () =>
       this.require().xAdd(
         key,
         '*',
@@ -493,7 +542,7 @@ export class RedisPlugin implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const key = this.key(args.topic);
-    return labelled(args.topic, key, () => this.readWindow(args, key));
+    return this.labelled(args.topic, key, () => this.readWindow(args, key));
   }
 
   private async readWindow(args: FetchRecentArgs, key: string): Promise<FetchRecentResult> {
@@ -506,7 +555,16 @@ export class RedisPlugin implements BackendPlugin {
       entries = (await this.require().xRevRange(key, '+', '-', { COUNT: limit })).reverse();
     } else {
       // Exclusive: strictly after `since`, ascending. `(` makes XRANGE start exclusive.
-      entries = await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
+      //
+      // Keep the ceiling out of XRANGE, so that a cursor at the top of the id space still reaches
+      // the heal below: `(<max>-<max>` asks the server to start after an id with nothing above it
+      // and is refused outright (`ERR invalid start ID for the interval`), which would wedge the
+      // topic — the one thing the heal exists to prevent. Nothing can sort after that id, so the
+      // empty page is also the honest answer.
+      entries =
+        since === MAX_ENTRY_ID
+          ? []
+          : await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
       // A well-formed but STALE cursor — minted against a different Redis, a re-created dataset, or
       // by a peer whose clock ran ahead, so it sorts past this stream's last generated id — is
       // treated exactly like `since === undefined` for both the query AND the returned cursor, so
@@ -608,7 +666,7 @@ export class RedisPlugin implements BackendPlugin {
    * `disconnect()` tears the reader down, which breaks the blocking read.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
-    return labelled(topic, this.key(topic), () => this.startReadLoop(topic, handler));
+    return this.labelled(topic, this.key(topic), () => this.startReadLoop(topic, handler));
   }
 
   private async startReadLoop(topic: Topic, handler: MessageHandler): Promise<void> {
@@ -666,7 +724,7 @@ export class RedisPlugin implements BackendPlugin {
           if (respError !== undefined) {
             this.dropReader(reader);
             await reader.disconnect().catch(() => undefined);
-            reportLiveDeliveryStopped(topic, respError);
+            reportLiveDeliveryStopped(this.url, topic, respError);
             break;
           }
           await delay(100);
@@ -740,10 +798,11 @@ export class RedisPlugin implements BackendPlugin {
  * subscribed to the topic, and nothing else in the process would ever mention the fault. stdout is
  * the MCP JSON-RPC channel — diagnostics only ever go to stderr.
  */
-function reportLiveDeliveryStopped(topic: Topic, respError: string): void {
+function reportLiveDeliveryStopped(url: string, topic: Topic, respError: string): void {
   process.stderr.write(
     `parley-redis: live delivery STOPPED for topic '${topic}' — the server refused the stream ` +
-      `read: ${respError}. Catch-up still works; fix the cause and restart the bridge.\n`,
+      `read: ${fromServer(url, respError)}. Catch-up still works; fix the cause and restart the ` +
+      `bridge.\n`,
   );
 }
 
