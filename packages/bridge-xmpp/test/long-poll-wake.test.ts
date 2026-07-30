@@ -249,22 +249,29 @@ describe('XMPP long-poll returns on archival lag, bounded by the lag and never b
   );
 });
 
-// Class: an argument honoured on only ONE arm of the call it belongs to. `blockMs` sat inside the
-// `since !== undefined` branch, so a since-less `fetchRecent` returned in milliseconds while the
-// plugin declares `supportsBlockingFetch` and core's tool documents long-polling "whether or not you
-// passed since" — core then had to spend a whole pollIntervalMs nap before the native path engaged,
-// and a caller using the plugin directly got no blocking at all. An empty last-page window and an
-// empty window after the zero cursor are the SAME window, so the table crosses the since axis with
-// the archive's state and asserts, per cell, whether the call is allowed to return at once.
+// Class: an argument honoured on only ONE arm of the call it belongs to, and — the same defect one
+// turn further in — an argument that changes WHICH WINDOW a read returns rather than only when it
+// returns. `blockMs` first sat inside the `since !== undefined` branch, so a since-less
+// `fetchRecent` returned in milliseconds while the plugin declares `supportsBlockingFetch` and
+// core's tool documents long-polling "whether or not you passed since". Making it block was not
+// enough: the since-less arm parked on the ZERO cursor, so a since-less fetch that HAD to wait came
+// back with the OLDEST `limit` of the burst it woke on while the same call over an already-populated
+// archive returns the NEWEST — the conformance clause "a since-less fetch returns the NEWEST
+// messages" silently inverted by a latency hint, on exactly the call core's fetchRecentBlocking
+// makes for an agent that holds no cursor. The table crosses the since axis with the archive's
+// state, with whether one message or a burst larger than `limit` arrives, and grades every arrival
+// cell against what the SAME call answers with `blockMs: 0` once the messages are already there.
 
 const BLOCK_ARM_MS = 600;
 /** A return this quick cannot have waited out any budget. */
 const AT_ONCE_MS = 250;
+/** Small enough that a burst can exceed it without the fixture archiving hundreds of stanzas. */
+const ARM_LIMIT = 3;
 
 interface Arm {
   name: string;
   /** `null` = omit the argument entirely; `'tail'` = the archive's own last cursor. */
-  since: null | '' | 'tail' | 'arch-absent';
+  since: null | '' | 'tail';
 }
 const arms: Arm[] = [
   { name: 'since omitted', since: null },
@@ -275,11 +282,17 @@ const histories = [
   { name: 'an empty archive', seeded: false },
   { name: 'an archive with history', seeded: true },
 ];
-type Mode = 'blockMs 0' | 'blockMs > 0, nothing arrives' | 'blockMs > 0, a message arrives';
+interface Mode {
+  name: string;
+  blocks: boolean;
+  /** Messages delivered 50 ms into the block; 0 = nothing arrives. */
+  burst: number;
+}
 const modes: Mode[] = [
-  'blockMs 0',
-  'blockMs > 0, nothing arrives',
-  'blockMs > 0, a message arrives',
+  { name: 'blockMs 0', blocks: false, burst: 0 },
+  { name: 'blockMs > 0, nothing arrives', blocks: true, burst: 0 },
+  { name: 'blockMs > 0, one message arrives', blocks: true, burst: 1 },
+  { name: 'blockMs > 0, a burst longer than limit arrives', blocks: true, burst: ARM_LIMIT + 3 },
 ];
 
 const armCells = arms.flatMap((arm) =>
@@ -287,7 +300,7 @@ const armCells = arms.flatMap((arm) =>
 );
 
 describe('XMPP honours blockMs on every arm of fetchRecent', () => {
-  it.each(armCells)('$arm.name over $history.name, $mode', async ({ arm, history, mode }) => {
+  it.each(armCells)('$arm.name over $history.name, $mode.name', async ({ arm, history, mode }) => {
     const plugin = new XmppPlugin();
     const fake = new FakeXmpp();
     const p = attach(plugin, fake, undefined);
@@ -303,18 +316,19 @@ describe('XMPP honours blockMs on every arm of fetchRecent', () => {
         : arm.since === 'tail'
           ? ((await plugin.fetchRecent({ topic: TOPIC })).nextCursor as unknown as string)
           : arm.since;
-    const blockMs = mode === 'blockMs 0' ? 0 : BLOCK_ARM_MS;
+    const args = {
+      topic: TOPIC,
+      limit: ARM_LIMIT,
+      ...(since === undefined ? {} : { since: asCursor(since) }),
+    };
 
     const started = Date.now();
-    const pending = plugin.fetchRecent({
-      topic: TOPIC,
-      limit: 10,
-      blockMs,
-      ...(since === undefined ? {} : { since: asCursor(since) }),
-    });
+    const pending = plugin.fetchRecent({ ...args, blockMs: mode.blocks ? BLOCK_ARM_MS : 0 });
     const arriving =
-      mode === 'blockMs > 0, a message arrives'
-        ? setTimeout(() => fake.deliver(room, 'fresh'), 50)
+      mode.burst > 0
+        ? setTimeout(() => {
+            for (let i = 0; i < mode.burst; i++) fake.deliver(room, `fresh-${i}`);
+          }, 50)
         : undefined;
     const res = await pending;
     const elapsed = Date.now() - started;
@@ -323,16 +337,24 @@ describe('XMPP honours blockMs on every arm of fetchRecent', () => {
     if (!windowEmpty) {
       expect(res.messages.map((m) => m.content)).toEqual(['old']);
       expect(elapsed).toBeLessThan(AT_ONCE_MS);
-    } else if (mode === 'blockMs 0') {
+    } else if (!mode.blocks || mode.burst === 0) {
       expect(res.messages).toEqual([]);
-      expect(elapsed).toBeLessThan(AT_ONCE_MS);
-    } else if (mode === 'blockMs > 0, nothing arrives') {
-      expect(res.messages).toEqual([]);
-      expect(elapsed).toBeGreaterThanOrEqual(BLOCK_ARM_MS * 0.9); // it actually blocked
-      expect(String(res.nextCursor)).toBe(since ?? '');
+      if (mode.blocks) {
+        expect(elapsed).toBeGreaterThanOrEqual(BLOCK_ARM_MS * 0.9); // it actually blocked
+        expect(String(res.nextCursor)).toBe(since ?? '');
+      } else {
+        expect(elapsed).toBeLessThan(AT_ONCE_MS);
+      }
     } else {
-      expect(res.messages.map((m) => m.content)).toEqual(['fresh']);
       expect(elapsed).toBeLessThan(BLOCK_ARM_MS * 0.8); // woken by the message, not by the budget
+      // blockMs may change WHEN this call returns and nothing else: the same arm, asked once the
+      // burst is already archived, must answer the same window and the same cursor.
+      const control = await plugin.fetchRecent({ ...args, blockMs: 0 });
+      expect(res.messages.map((m) => m.content)).toEqual(
+        control.messages.map((m) => m.content),
+      );
+      expect(String(res.nextCursor)).toBe(String(control.nextCursor));
+      expect(res.messages.length).toBe(Math.min(mode.burst, ARM_LIMIT));
     }
     expectNoLeaks(plugin);
     await plugin.disconnect();

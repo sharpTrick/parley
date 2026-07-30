@@ -19,7 +19,7 @@ vi.mock('@xmpp/client', async () => {
 });
 
 import { XmppPlugin } from '../src/index.js';
-import { FakeXmpp, priv, type XmppPrivate } from './fake-xmpp.js';
+import { attach, FakeXmpp, priv, type XmppPrivate } from './fake-xmpp.js';
 
 const TOPIC = asTopic('t-membership');
 const NICK = 'occupant';
@@ -38,6 +38,18 @@ type Loss = (b: Bridge) => Promise<void>;
 /** How the server would keep ending occupancy, for the routes it announces with a presence. */
 type Repeat = { statuses?: string[]; destroy?: boolean };
 
+/**
+ * Bounce conditions that mean "you are not an occupant of this room". The plugin's own table is the
+ * thing under test, so this list is written out rather than imported: dropping an entry there makes
+ * that row stop recovering, and adding one makes the negative control below re-enter a room it must
+ * not. Real services disagree on which they send — Prosody bounces `item-not-found` for a room
+ * destroyed while we held it joined — so a table with rows for one entry is a table one server-side
+ * upgrade away from a silently dead topic.
+ */
+const OCCUPANCY_BOUNCES = ['not-acceptable', 'gone', 'item-not-found', 'recipient-unavailable'];
+/** A bounce that does NOT mean that: no voice in a moderated room. Occupancy is intact. */
+const VOICE_BOUNCE = 'forbidden';
+
 const losses: Array<{ how: string; lose: Loss; repeat?: Repeat }> = [
   {
     how: 'the stream reconnected (occupancy is presence; the library does not resend it)',
@@ -46,44 +58,30 @@ const losses: Array<{ how: string; lose: Loss; repeat?: Repeat }> = [
       fake.emit('online'); // the reconnect
     },
   },
+  // One row per DETECTION branch, not per status code: kick, ban, affiliation, members-only and
+  // shutdown all reach onPresence through the same `unavailable` + self + no-303 test, and the code
+  // itself is read only by the reason map, which "reports why occupancy ended" grades one row per
+  // entry. Keep the per-code rows there rather than here, so that each costs a stanza instead of a
+  // connect/join/post/re-join cycle it cannot independently fail.
   {
-    how: 'we were kicked (status 307)',
+    how: 'the server announced the end with our own unavailable presence',
     lose: async ({ fake, room }) => fake.endOccupancy(room, { statuses: ['307'] }),
     repeat: { statuses: ['307'] },
-  },
-  {
-    how: 'we were banned (status 301)',
-    lose: async ({ fake, room }) => fake.endOccupancy(room, { statuses: ['301'] }),
-    repeat: { statuses: ['301'] },
-  },
-  {
-    how: 'our affiliation changed us out of a members-only room (status 321)',
-    lose: async ({ fake, room }) => fake.endOccupancy(room, { statuses: ['321'] }),
-    repeat: { statuses: ['321'] },
-  },
-  {
-    how: 'the room became members-only (status 322)',
-    lose: async ({ fake, room }) => fake.endOccupancy(room, { statuses: ['322'] }),
-    repeat: { statuses: ['322'] },
-  },
-  {
-    how: 'the MUC service is shutting down (status 332)',
-    lose: async ({ fake, room }) => fake.endOccupancy(room, { statuses: ['332'] }),
-    repeat: { statuses: ['332'] },
   },
   {
     how: 'the room was destroyed',
     lose: async ({ fake, room }) => fake.endOccupancy(room, { destroy: true }),
     repeat: { destroy: true },
   },
-  {
-    how: 'the MUC component restarted, and we only learn of it from a bounced post',
-    lose: async ({ plugin, fake, room }) => {
+  ...OCCUPANCY_BOUNCES.map((condition) => ({
+    how: `the MUC forgot us silently and bounced the next post ${condition}`,
+    lose: async ({ plugin, fake, room }: Bridge): Promise<void> => {
       // No presence at all: the server simply forgot us, exactly as a component restart does.
+      fake.occupancyBounceCondition = condition;
       fake.forgetOccupancySilently(room);
-      await expect(plugin.post(TOPIC, asHandle('a'), 'lost')).rejects.toThrow(/not-acceptable/);
+      await expect(plugin.post(TOPIC, asHandle('a'), 'lost')).rejects.toThrow(condition);
     },
-  },
+  })),
 ];
 
 const build = async (): Promise<Bridge> => {
@@ -142,6 +140,24 @@ describe('XMPP re-enters a room after occupancy ends, however it ended', () => {
     await plugin.disconnect();
   });
 
+  it(`a ${VOICE_BOUNCE} bounce leaves occupancy alone instead of re-entering the room`, async () => {
+    const bridge = await build();
+    const { plugin, fake, p, room } = bridge;
+    await plugin.post(TOPIC, asHandle('a'), 'before');
+    const cachedJoin = p.joined.get(room);
+    const joinsBefore = joinPresences(fake, room);
+
+    fake.occupancyBounceCondition = VOICE_BOUNCE;
+    fake.forgetOccupancySilently(room);
+    await expect(plugin.post(TOPIC, asHandle('a'), 'muted')).rejects.toThrow(VOICE_BOUNCE);
+    await new Promise((r) => setTimeout(r, 500)); // longer than REJOIN_BASE_MS + its jitter
+
+    expect(joinPresences(fake, room)).toBe(joinsBefore);
+    expect(p.joined.get(room)).toBe(cachedJoin);
+    expect(p.rejoins.size).toBe(0);
+    await plugin.disconnect();
+  });
+
   it('leaves no re-join timer armed after disconnect', async () => {
     const bridge = await build();
     const { plugin, fake, p, room } = bridge;
@@ -168,6 +184,55 @@ describe('XMPP re-enters a room after occupancy ends, however it ended', () => {
   });
 });
 
+// Class: a constant table of protocol codes whose entries no row reaches. The XEP-0045 status code
+// on the unavailable presence is the ONLY thing that distinguishes a kick from a ban from a service
+// shutdown, and the plugin's whole use of it is one stderr line — so a map that had never been read
+// by an assertion could be reduced to `return 'left the room'` with the entire package suite green,
+// leaving an operator watching a room go quiet with no way to tell moderation from an outage. One
+// row per entry, each asserting its own word, plus the joined form and the no-code fallback.
+
+const errorsFor = (spy: ReturnType<typeof vi.spyOn>): string[] =>
+  spy.mock.calls.map((c) => String(c[0]));
+
+interface EndReason {
+  name: string;
+  statuses?: string[];
+  destroy?: boolean;
+  reason: string;
+}
+
+const endReasons: EndReason[] = [
+  { name: 'status 301', statuses: ['301'], reason: 'banned' },
+  { name: 'status 307', statuses: ['307'], reason: 'kicked' },
+  { name: 'status 321', statuses: ['321'], reason: 'affiliation change' },
+  { name: 'status 322', statuses: ['322'], reason: 'room became members-only' },
+  { name: 'status 332', statuses: ['332'], reason: 'MUC service shutting down' },
+  { name: 'status 333', statuses: ['333'], reason: 'occupant technical error' },
+  { name: 'a <destroy/>', destroy: true, reason: 'room destroyed' },
+  { name: 'a kick during a shutdown', statuses: ['307', '332'], reason: 'kicked, MUC service shutting down' },
+  { name: 'no code at all', statuses: [], reason: 'left the room' },
+  { name: 'an unknown code', statuses: ['999'], reason: 'left the room' },
+];
+
+describe('XMPP reports why occupancy ended', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(endReasons)('$name is reported as "$reason"', ({ statuses, destroy, reason }) => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const plugin = new XmppPlugin();
+    const fake = new FakeXmpp();
+    const room = priv(plugin).roomJid(TOPIC);
+    attach(plugin, fake, room);
+
+    fake.endOccupancy(room, { statuses, destroy });
+
+    // Not subscribed, so the loss is reported and left alone — the reporting is the whole subject.
+    expect(errorsFor(errors)).toEqual([`[parley-xmpp] occupancy in ${room} ended (${reason})`]);
+  });
+});
+
 // Class: remote-driven recovery with no backoff and no cap. Every row above loses occupancy exactly
 // once, which is the one shape that cannot observe a storm: a room that ends occupancy on EVERY
 // join (a moderation bot, a members-only toggle, a MUC component shutting down) turned the recovery
@@ -179,8 +244,6 @@ describe('XMPP re-enters a room after occupancy ends, however it ended', () => {
 // both the presences sent inside a fixed window and the reports written.
 
 const repeatable = losses.filter((l) => l.repeat !== undefined);
-const errorsFor = (spy: ReturnType<typeof vi.spyOn>): string[] =>
-  spy.mock.calls.map((c) => String(c[0]));
 
 describe('XMPP bounds its re-entry when a room keeps ending occupancy', () => {
   afterEach(() => {

@@ -145,21 +145,50 @@ describe('XMPP a join re-driven under an in-flight one never fails the original 
 
 // The third re-drive: the first `post` taking `identity.handle` as the occupant nick clears the
 // join cache for every room, including one whose join has not answered yet. It cannot be a row
-// above because a post is what triggers it, so the in-flight call is always a different one.
+// above because a post is what triggers it, so the in-flight call is always a different one — and
+// it is the only re-drive that changes the NICK, so it is also the only one where the server's
+// answer to the superseded join names a name the successor never asked for. The `answers` axis
+// therefore carries both halves: the superseded join answered successfully, and answered with each
+// refusal a MUC can send. Attributing the refusal to the successor rejects a caller that is about
+// to be in the room (startPushLoop rethrows it, taking the process down during startup) and, for
+// `conflict`, drags the connection back to its random provisional nick while telling the operator a
+// handle nobody holds was taken.
+const REFUSALS = ['forbidden', 'conflict', 'registration-required', 'item-not-found'];
+
+interface Answer {
+  name: string;
+  /** Armed once the superseded join's presence is out and before the nick switch re-drives it. */
+  arm(fake: FakeXmpp): void;
+}
+const answers: Answer[] = [
+  { name: 'successfully', arm: () => undefined },
+  ...REFUSALS.map((condition) => ({
+    name: `with ${condition}`,
+    arm: (fake: FakeXmpp): void => {
+      fake.joinErrorCondition = condition;
+      fake.joinErrorsRemaining = 1; // only the FIRST (superseded) join is refused
+    },
+  })),
+];
+
+const adoptCells = (['subscribe', 'fetchRecent'] as const).flatMap((which) =>
+  answers.map((answer) => ({ which, answer })),
+);
+
 describe('XMPP a join re-driven by the first post adopting its identity nick', () => {
   afterEach(() => {
     mockState.client = undefined;
   });
 
-  it.each(['subscribe', 'fetchRecent'] as const)(
-    'an in-flight %s completes when the nick switch re-drives its join',
-    async (which) => {
+  it.each(adoptCells)(
+    'an in-flight $which completes when the superseded join is answered $answer.name',
+    async ({ which, answer }) => {
       const fake = new FakeXmpp();
       fake.joinLatencyMs = JOIN_LATENCY_MS;
       mockState.client = fake;
       const plugin = new XmppPlugin();
       await plugin.connect({ password: 'a-real-secret' }); // nick unset: the first post adopts one
-      const topic = asTopic(`t-adopt-${which}`);
+      const topic = asTopic(`t-adopt-${which}-${answer.name}`.replace(/\W+/g, '-'));
       const room = priv(plugin).roomJid(topic);
       const provisional = priv(plugin).nick;
 
@@ -168,11 +197,13 @@ describe('XMPP a join re-driven by the first post adopting its identity nick', (
           ? plugin.subscribe(topic, () => undefined)
           : plugin.fetchRecent({ topic, limit: 5 });
       await untilJoinInFlight(plugin, room);
+      answer.arm(fake);
       const posted = plugin.post(topic, asHandle('ctx-payments'), 'one');
 
       await expect(pending).resolves.not.toBeInstanceOf(Error);
       expect(String(await posted)).toMatch(/^arch-/);
-      // The nick really did change, so the row is not passing because nothing was re-driven.
+      // The nick really did change, so the row is not passing because nothing was re-driven — and
+      // an answer meant for the nick it left cannot drag it back to the provisional one.
       expect(priv(plugin).nick).toBe('ctx-payments');
       expect(priv(plugin).nick).not.toBe(provisional);
       expect(priv(plugin).joined.size).toBe(1);

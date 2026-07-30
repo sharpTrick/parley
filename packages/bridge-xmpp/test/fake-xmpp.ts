@@ -155,8 +155,21 @@ export class FakeXmpp {
   reflectStanzaId = true;
   /** When set, every MAM IQ is answered with this stanza error condition instead of a `<fin/>`. */
   mamIqError?: string;
+  /**
+   * A MAM peer that never makes progress: every query — whatever `<after>` it carries — is answered
+   * with the SAME page, tailed by the id the next `<after>` will therefore repeat, and never marked
+   * complete. `bodies: false` makes the items ones the seam does not carry, so a paging loop cannot
+   * be rescued by its own body filter either. Only the loop's own advance check can end this.
+   */
+  nonAdvancingMam?: { bodies: boolean; complete: 'false' | 'omitted' };
   /** Bounce a post to a room this connection is not currently an occupant of, as a MUC does. */
   enforceOccupancy = false;
+  /**
+   * The condition such a bounce carries. Prosody answers `item-not-found` for a room that is gone
+   * and `not-acceptable` for one it no longer holds us in, and ejabberd differs again — so which
+   * conditions mean "no longer an occupant" is a table, not a literal.
+   */
+  occupancyBounceCondition = 'not-acceptable';
 
   /**
    * A server that ends this connection's occupancy again on EVERY successful join — a moderation
@@ -447,7 +460,7 @@ export class FakeXmpp {
     if (this.postReply === 'silent') return;
     const notAnOccupant = this.enforceOccupancy && !this.occupied.has(room);
     if (this.postReply === 'error' || notAnOccupant) {
-      const condition = notAnOccupant ? 'not-acceptable' : this.postErrorCondition;
+      const condition = notAnOccupant ? this.occupancyBounceCondition : this.postErrorCondition;
       const text = notAnOccupant
         ? 'You are not currently connected to this chat'
         : this.postErrorText;
@@ -499,6 +512,22 @@ export class FakeXmpp {
     const queryid = query.attrs.queryid ?? '';
     await this.onMamRequest?.(room);
 
+    if (this.nonAdvancingMam !== undefined) {
+      const { bodies, complete } = this.nonAdvancingMam;
+      // A round trip is a macrotask. Keep this yield, so that a plugin looping on these pages
+      // starves the timer queue no more than a real server would — without it a paging regression
+      // wedges the whole runner instead of failing its own case on the test timeout.
+      await sleep(1);
+      for (const archId of ['stuck-a', 'stuck-b']) {
+        this.feedMamResult(room, queryid, { archId, from: `${room}/x`, body: bodies ? 'x' : null });
+      }
+      return xml(
+        'iq',
+        { type: 'result' },
+        xml('fin', { xmlns: NS_MAM, ...(complete === 'omitted' ? {} : { complete: 'false' }) }),
+      );
+    }
+
     const set = query.getChild('set', NS_RSM);
     const after = set?.getChildText('after');
     const max = Number(set?.getChildText('max') ?? '50');
@@ -515,27 +544,30 @@ export class FakeXmpp {
 
     await this.onMamInFlight?.(room);
     if (this.mamLatencyMs > 0) await sleep(this.mamLatencyMs);
-    for (const item of window) {
-      this.feed(
-        xml(
-          'message',
-          { from: room },
-          xml(
-            'result',
-            { xmlns: NS_MAM, queryid, id: item.archId },
-            xml(
-              'forwarded',
-              { xmlns: NS_FORWARD },
-              xml('message', { from: item.from }, ...(this.itemChildren(item) as never[])),
-            ),
-          ),
-        ),
-      );
-    }
+    for (const item of window) this.feedMamResult(room, queryid, item);
     return xml(
       'iq',
       { type: 'result' },
       xml('fin', { xmlns: NS_MAM, complete: String(complete) }),
+    );
+  }
+
+  /** One streamed `<result>` of a MAM page — the shape every archived stanza comes back in. */
+  private feedMamResult(room: string, queryid: string, item: ArchiveItem): void {
+    this.feed(
+      xml(
+        'message',
+        { from: room },
+        xml(
+          'result',
+          { xmlns: NS_MAM, queryid, id: item.archId },
+          xml(
+            'forwarded',
+            { xmlns: NS_FORWARD },
+            xml('message', { from: item.from }, ...(this.itemChildren(item) as never[])),
+          ),
+        ),
+      ),
     );
   }
 }

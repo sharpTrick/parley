@@ -59,3 +59,42 @@ describe('XMPP MAM paging returns each archived message exactly once, in order',
     await plugin.disconnect();
   });
 });
+
+// Class: a seam call whose loop termination depends ENTIRELY on server-supplied progress. Every exit
+// from the paging loop above is the peer declaring one — `complete`, an empty page, or `limit`
+// bodied items — so a peer that answers each `<after>X</after>` with a page tailed by X again and
+// never marks it complete re-issues the identical query forever, inside a call nothing above times
+// out: core's fetchRecentBlocking bounds its own naps but awaits the plugin unbounded, so the MCP
+// fetch_recent never answers and the agent hangs with no error anywhere. The table walks the shapes
+// a page can take without advancing — bodied and body-less items (the seam's own filter must not be
+// what saves it), `complete='false'` and `complete` omitted entirely — and demands the call SETTLE.
+
+const SETTLE_MS = 2_000;
+const nonAdvancing = ([true, false] as const).flatMap((bodies) =>
+  (['false', 'omitted'] as const).map((complete) => ({ bodies, complete })),
+);
+
+describe('XMPP MAM paging settles instead of spinning when the archive never advances', () => {
+  it.each(nonAdvancing)(
+    'a page of $bodies-bodied items with complete $complete fails fast, naming the room',
+    async (fault) => {
+      const fake = new FakeXmpp();
+      fake.nonAdvancingMam = fault;
+      mockState.client = fake;
+      const plugin = new XmppPlugin();
+      await plugin.connect({ password: 'a-real-secret', nick: 'pager', mam_page: 2 });
+      const room = priv(plugin).roomJid(TOPIC);
+
+      const started = Date.now();
+      const outcome = await plugin
+        .fetchRecent({ topic: TOPIC, since: asCursor(''), limit: 50 })
+        .then(() => 'resolved', (e: Error) => e.message);
+
+      expect(Date.now() - started).toBeLessThan(SETTLE_MS);
+      expect(outcome).toContain(room);
+      expect(outcome).toMatch(/did not advance/);
+      await plugin.disconnect();
+    },
+    SETTLE_MS * 2,
+  );
+});

@@ -35,6 +35,9 @@ const charsets = {
   'ascii-legal': (len: number) => 'a'.repeat(len),
   'contains-space': (len: number) => `a${' '.repeat(len)}a`.slice(0, len),
   'contains-slash': (len: number) => `a${'/'.repeat(len)}a`.slice(0, len),
+  // The JID separator an operator's handle actually carries: `alice@corp.com` folds LOSSILY, so it
+  // is the shape where a name reported back unfolded matches nothing the archive holds.
+  'contains-at': (len: number) => `a${'@'.repeat(len)}a`.slice(0, len),
   'upper-and-dot': (len: number) => `A.${'B'.repeat(len)}`.slice(0, len),
   'non-ascii': (len: number) => 'ä'.repeat(len),
   'astral-emoji': (len: number) => '🚀'.repeat(len).slice(0, len),
@@ -92,8 +95,16 @@ const shared = (inputs: string[], nameOf: (s: string) => string): string[] => {
 
 const roomOf = (topic: string): string => priv(new XmppPlugin()).roomJid(asTopic(topic));
 
-/** The nick this plugin actually puts on the wire: the resource of its MUC join presence. */
-const nickOnTheWire = async (handle: string): Promise<string> => {
+interface Posted {
+  /** The nick this plugin actually puts on the wire: the resource of its MUC join presence. */
+  nick: string;
+  /** What the archive gives back as the sender of that post — what an operator actually sees. */
+  sender: string;
+  /** What the seam says this handle's backend-native name is. */
+  backendRef: string;
+}
+
+const postAs = async (handle: string): Promise<Posted> => {
   const fake = new FakeXmpp();
   mockState.client = fake;
   const plugin = new XmppPlugin();
@@ -105,9 +116,17 @@ const nickOnTheWire = async (handle: string): Promise<string> => {
     fake.sent
       .filter((s) => s.is('presence') && (s.attrs.to ?? '').startsWith(`${room}/`))
       .at(-1)?.attrs.to ?? '';
+  const read = await plugin.fetchRecent({ topic, limit: 1 });
+  const identity = await plugin.resolveIdentity(asHandle(handle));
   await plugin.disconnect();
-  return to.slice(`${room}/`.length);
+  return {
+    nick: to.slice(`${room}/`.length),
+    sender: String(read.messages.at(-1)?.senderHandle ?? ''),
+    backendRef: identity.backendRef,
+  };
 };
+
+const nickOnTheWire = async (handle: string): Promise<string> => (await postAs(handle)).nick;
 
 describe('XMPP topic -> MUC room fold is total and injective', () => {
   it.each(cells)('a $len-char $charset topic yields one legal localpart', ({ value }) => {
@@ -163,6 +182,21 @@ describe('XMPP identity.handle -> MUC nick fold is total and injective', () => {
     ]);
     expect(shared([a, b], (h) => nicks.get(h) as string)).toEqual([]);
   });
+
+  // Class: a seam accessor reporting a backend-native identifier the backend does not actually use.
+  // `backendRef` is defined as the XMPP-side name behind a handle, and the fold is LOSSY wherever
+  // the handle carries a character a JID resource cannot (`alice@corp.com`) — so answering with the
+  // raw handle hands an operator the one string that will never appear in parley_list_users or as a
+  // senderHandle. Riding the same generator makes any future divergence between the fold and the
+  // accessor a red row rather than just the `@` case.
+  it.each(cells)(
+    'resolveIdentity of a $len-char $charset handle answers the nick it posts and reads back under',
+    async ({ value }) => {
+      const { nick, sender, backendRef } = await postAs(value);
+      expect(backendRef).toBe(nick);
+      expect(backendRef).toBe(sender);
+    },
+  );
 
   it('a handle whose nick cannot fit a JID resource is refused by name, and post says so', async () => {
     const fake = new FakeXmpp();

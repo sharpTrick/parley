@@ -544,24 +544,32 @@ export class XmppPlugin implements BackendPlugin {
     await this.ensureJoined(args.topic);
     const limit = args.limit ?? 100;
 
-    let items: BodiedItem[];
-    if (since === undefined) {
-      // No cursor at all: default window = most recent `limit` (RSM "last page" via empty <before/>).
-      items = (await this.mamQuery(args.topic, { before: true, max: limit })).items.filter(hasBody);
-    } else {
-      items = await this.exclusiveMam(args.topic, since, limit);
-    }
+    let items = await this.readWindow(args.topic, since, limit);
     const blockMs = Math.floor(args.blockMs ?? 0);
     if (items.length === 0 && blockMs > 0) {
-      // An empty last-page window and an empty window after the zero cursor are the same window,
-      // so the since-less arm long-polls on `''` rather than silently ignoring `blockMs`.
-      items = await this.blockingMam(args.topic, since ?? '', limit, blockMs);
+      items = await this.blockingMam(args.topic, since, limit, blockMs);
     }
 
     const messages = items.map((it) => this.toMessage(args.topic, it));
     const last = messages.at(-1);
     const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor(''));
     return { messages, nextCursor };
+  }
+
+  /**
+   * The window `args` asks for: the most recent `limit` (RSM "last page" via an empty `<before/>`)
+   * when no cursor was given, otherwise everything strictly after it. `blockMs` re-reads THIS, so
+   * that the argument changes when a fetch returns and never which window it returns.
+   */
+  private async readWindow(
+    topic: Topic,
+    since: string | undefined,
+    limit: number,
+  ): Promise<BodiedItem[]> {
+    if (since === undefined) {
+      return (await this.mamQuery(topic, { before: true, max: limit })).items.filter(hasBody);
+    }
+    return this.exclusiveMam(topic, since, limit);
   }
 
   /**
@@ -572,6 +580,10 @@ export class XmppPlugin implements BackendPlugin {
    * Keep the page's UNFILTERED tail as the next `<after/>` and the loop's stop condition, so that a
    * page made entirely of items the seam does not carry still advances past them — filtering before
    * that would read as "archive exhausted" and withhold everything behind them forever.
+   *
+   * Keep the strict-advance check too: every other exit is the SERVER declaring progress, so a peer
+   * that answers `<after>X</after>` with a page tailed by X again spins here forever inside a seam
+   * call that nothing above it times out.
    */
   private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<BodiedItem[]> {
     const items: BodiedItem[] = [];
@@ -583,14 +595,21 @@ export class XmppPlugin implements BackendPlugin {
       });
       items.push(...page.items.filter(hasBody));
       if (page.complete || page.items.length === 0) break;
-      cursor = page.items[page.items.length - 1]!.archId;
+      const next = page.items[page.items.length - 1]!.archId;
+      if (next === cursor) {
+        throw new Error(
+          `MAM paging on ${this.roomJid(topic)} did not advance: the page after '${cursor}' ends ` +
+            'at that same archive id and is not marked complete, so catch-up cannot make progress',
+        );
+      }
+      cursor = next;
     }
     return items;
   }
 
   /**
    * Native long-poll: MUC-live-wait + MAM-reconcile. Each round REGISTERS the room waiter before
-   * running the exclusive MAM query, so that a message reflected during the query's round trip
+   * re-reading {@link readWindow}, so that a message reflected during the query's round trip
    * fires an already-registered waiter instead of firing into the void; its park timer only starts
    * once the query is back, so the park is the interval asked for rather than what a slow server
    * left of it. An empty return is always safe — the page carries `nextCursor === since` and
@@ -605,7 +624,7 @@ export class XmppPlugin implements BackendPlugin {
    */
   private async blockingMam(
     topic: Topic,
-    since: string,
+    since: string | undefined,
     limit: number,
     blockMs: number,
   ): Promise<BodiedItem[]> {
@@ -616,7 +635,7 @@ export class XmppPlugin implements BackendPlugin {
       if (this.stopped || Date.now() >= deadline) return [];
       const waiter = this.armWaiter(room);
       try {
-        const items = await this.exclusiveMam(topic, since, limit);
+        const items = await this.readWindow(topic, since, limit);
         if (items.length > 0) return items;
         if (this.stopped) return [];
         const budget = deadline - Date.now();
@@ -693,8 +712,14 @@ export class XmppPlugin implements BackendPlugin {
     }
   }
 
+  /**
+   * A handle's backend-native name is the MUC nick it occupies rooms under. Keep it the same
+   * {@link nickFor} fold `post` uses, so that `backendRef` names something that can actually appear
+   * as a `senderHandle` — the fold is lossy for any handle a JID resource cannot spell
+   * (`alice@corp.com`), and `parley_list_users` reports the folded name.
+   */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
-    return { handle, backendRef: handle };
+    return { handle, backendRef: nickFor(handle) };
   }
 
   // ---- internals -----------------------------------------------------------
@@ -775,6 +800,11 @@ export class XmppPlugin implements BackendPlugin {
 
     const pending = this.pendingJoins.get(room);
     if (stanza.attrs.type === 'error') {
+      // Keep an error presence attributed by the nick it names, as the self-presence arm below is,
+      // so that a superseded join's refusal cannot fail the successor that is about to succeed —
+      // which startPushLoop rethrows — or revert the nick over a name this connection never asked
+      // for. A service rewrite (status 210) admits an occupant; it never appears on a refusal.
+      if (pending !== undefined && resource !== '' && resource !== pending.nick) return;
       const err = stanzaError(stanza);
       pending?.reject(new JoinError(err.condition, room, err.text));
       return;

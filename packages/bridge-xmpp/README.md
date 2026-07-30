@@ -20,7 +20,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive); no `since` → empty `<before/>` = last page; pages forward up to `limit` |
 | `subscribe` | every reflected groupchat `<message>` carrying a room `<stanza-id>` → `handler` (incl. own posts), in archive order |
 | admission | a stanza with **no `<body>`** — a subject change, a correction, a retraction, a chat state — is not a message on either path; an *empty* body is |
-| `resolveIdentity` | string convention (handle = backendRef) |
+| `resolveIdentity` | name convention: `backendRef` is the MUC nick the handle occupies rooms under — the same fold `post` applies (`alice@corp.com` → `alice_corp.com-<hash>`), so it matches the `senderHandle` that handle reads back as |
 | sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
 | timestamp | `<delay stamp>` from MAM forwarded messages if present, else now (informational only) |
 
@@ -32,7 +32,9 @@ nothing is newer than `since`, the call holds up to `block_ms` for a new message
 (possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. XMPP
 serves this natively via a live MUC wait plus a MAM reconcile (with an archival-lag re-poll). Core
 caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return
-catch-up semantics.
+catch-up semantics. It changes only *when* the call returns: a `block_ms` fetch answers the same
+window the same call answers without one — the newest `limit` when `since` is omitted, everything
+strictly after it when it is not.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) becomes the MUC occupant nick.**
 > The sender of every archived message is that nick, and it is the key core's `parley_list_users`

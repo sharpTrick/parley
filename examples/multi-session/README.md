@@ -77,17 +77,24 @@ for each session, same idea as `instance_id`, just carried in the "wrong" config
 | Key | | Risk if it diverges |
 |---|---|---|
 | `service` / `domain` / `muc_service` | ✅ | obvious |
-| `username` / `password` | ✅ (usually fine to share — see below) | |
-| `nick` | 🔀 **must NOT match if set** | see callout below |
+| `username` / `password` | ✅ (fine to share — see below) | |
+| `nick` | 🔀⚠️ **must NOT match if set, and nothing checks it** | see callout below |
+| `identity.handle` (not in `backend_config`) | 🔀⚠️ **must NOT match** | it *is* the sender — see callout below |
 
-**The catch:** like Matrix, XMPP's `post()` ignores the seam's `identity` (`_identity` — unused) —
-the actual sender is the MUC **nick**. Unlike Matrix, though, leaving `nick` **unset** is safe to
-share: the plugin auto-generates a random one per connection (`${username}-${rand()}`), so sessions
-sharing `username`/`password` still get distinct (if randomly-labeled) sender attribution for free.
-The risk only appears if you pin `nick` to a fixed, human-readable value for one session and then
-copy that same config to another — MUC requires unique nicknames per room, so the second session's
-join **fails outright** (a real error, not a silent misattribution like Matrix). If you want stable,
-readable nicks, give each session its own.
+**The catch:** unlike Matrix, XMPP's `post()` **does** use the seam's `identity`. The sender is the
+MUC **nick**, and with `nick` unset the first post takes its own `identity.handle` as that nick, so
+a session keeps the same sender across restarts and core's roster is keyed the same way. Sharing
+`username`/`password` is therefore fine — the field that must differ per session is
+`identity.handle`.
+
+**Neither uniqueness is enforced for you, and the failure is silent.** MUC's unique-nickname rule is
+scoped to the *bare JID*, so two sessions on the **same account** occupy one room under one nick
+from two resources with **no error at any point** — both join, both post, and every message from
+both is attributed to that single nick. That is what you get by copying a pinned `nick` between two
+configs, and equally by giving two sessions the same `identity.handle`. A loud `conflict` only
+appears when the two sessions use **different accounts**; there the loser falls back to its random
+per-connection nick and keeps posting, with one stderr warning. Leave `nick` unset and give each
+session its own `identity.handle`.
 
 ## Running one of these
 

@@ -142,3 +142,72 @@ describe('XMPP backend_config keys agree across code, README and DESIGN', () => 
     expect([...designKeys()].sort()).toEqual([...CONFIG_KEYS].sort());
   });
 });
+
+// Class: a claim graded behaviourally in ONE file that survives verbatim in another shipped doc.
+// `multi-session-doc.test.ts` pins what actually happens when two sessions share an account — a
+// silent sender merge, never an error — but it grades only the package README's wording. The
+// example page and the three runnable configs an operator actually copies still described the
+// pre-nick-adoption plugin: `post()` ignoring `identity`, a random per-connection nick handing every
+// session distinct attribution "for free", and a duplicate pinned nick failing "outright" — a SAFETY
+// claim inverted, since the real outcome is the silent merge. Every doc surface that describes this
+// contract is graded together here: a retired phrase may appear in none of them, and the current
+// claim must appear in all, so a behavioural fix that does not propagate is a red row rather than
+// rot nobody re-reads.
+
+/** Comment markers and line wrapping are formatting; a claim must not hide behind either. */
+const flatten = (text: string): string => text.replace(/^\s*#+\s?/gm, '').replace(/\s+/g, ' ');
+
+/** One `##`/`###` section of a markdown file — the Matrix section makes true claims XMPP retired. */
+const section = (markdown: string, heading: RegExp): string => {
+  const found = markdown.split(/^(?=#{2,3} )/m).find((part) => heading.test(part));
+  expect(found).toBeDefined();
+  return found as string;
+};
+
+const surfaces = (): Array<{ name: string; text: string }> => [
+  { name: 'packages/bridge-xmpp/README.md', text: repoFile('packages/bridge-xmpp/README.md') },
+  {
+    name: 'examples/multi-session/README.md (XMPP section)',
+    text: section(repoFile('examples/multi-session/README.md'), /^### XMPP\b/),
+  },
+  {
+    name: 'examples/multi-session/xmpp/*.yaml',
+    text: ['code-agent-a', 'code-agent-b', 'remote-chat']
+      .map((f) => repoFile(`examples/multi-session/xmpp/${f}.yaml`))
+      .join('\n'),
+  },
+];
+
+const retired = [
+  { claim: "post() ignores the seam's identity", pattern: /post\(\)[^.]{0,120}ignor/i },
+  { claim: 'the identity parameter is unused (_identity)', pattern: /_identity/ },
+  {
+    claim: 'the occupant nick is auto-generated at random per connection',
+    pattern: /auto-generat|\$\{username\}-\$\{rand/i,
+  },
+  { claim: 'a duplicate pinned nick fails outright', pattern: /fails?\s+outright/i },
+];
+
+const current = [
+  { claim: 'identity.handle is what the sender comes from', pattern: /identity\.handle/ },
+  {
+    claim: 'a shared identity merges senders with no error',
+    pattern: /no error at (any point|all)/i,
+  },
+];
+
+const claimCells = <T extends { claim: string }>(claims: T[]): Array<T & { surface: string }> =>
+  claims.flatMap((c) => surfaces().map((s) => ({ ...c, surface: s.name })));
+
+const textOf = (name: string): string =>
+  flatten(surfaces().find((s) => s.name === name)?.text as string);
+
+describe('XMPP identity/nick doc claims are retired everywhere or nowhere', () => {
+  it.each(claimCells(retired))('$surface no longer claims "$claim"', ({ surface, pattern }) => {
+    expect(textOf(surface)).not.toMatch(pattern);
+  });
+
+  it.each(claimCells(current))('$surface states "$claim"', ({ surface, pattern }) => {
+    expect(textOf(surface)).toMatch(pattern);
+  });
+});

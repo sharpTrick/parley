@@ -1,6 +1,6 @@
 instance_id: "code-agent-a"
 identity:
-  handle: "agent-a"                       # NOTE: XMPP's post() ignores this too — see backend_config below.
+  handle: "agent-a"                       # On XMPP this IS the sender: it becomes the MUC nick.
 topics:
   - "ctx-payments"
   - "ctx-infra"
@@ -23,13 +23,15 @@ backend_config:
   #    the `nick` note below for why. ──
   username: "parley"
   password: "change-me"
-  # ── `nick` is intentionally left UNSET. Like Matrix, XMPP's post() ignores the seam's
-  #    `identity` — the real sender is the MUC nick, not `identity.handle` above. But unlike
-  #    Matrix, leaving `nick` unset is safe to share across sessions: the plugin auto-generates
-  #    a random one per connection (`${username}-${rand()}`), so each session still gets its
-  #    own distinct (if randomly-labeled) sender for free. Only pin `nick` to a fixed value if
-  #    you want a stable, readable name — and if you do, it MUST be unique per concurrent
-  #    session. Do NOT expect a duplicate to be caught for you: MUC's unique-nickname rule is
-  #    per bare JID, so two sessions sharing THIS account join the same room under the same
-  #    pinned nick with no error at all, and every message from both is attributed to that one
-  #    nick. (A `conflict` error only happens between different accounts.)
+  # ── `nick` is intentionally left UNSET. Unlike Matrix, XMPP's post() DOES use the seam's
+  #    `identity`: the sender is the MUC nick, and with `nick` unset the first post takes
+  #    `identity.handle` above as that nick — so the sender is stable across restarts and is the
+  #    name parley_list_users reports. The field that must be unique per concurrent session is
+  #    therefore `identity.handle`, NOT this account.
+  #    Pin `nick` only to override that, and if you do it MUST be unique per session. Do NOT
+  #    expect a duplicate to be caught for you, either way: MUC's unique-nickname rule is per
+  #    bare JID, so two sessions sharing THIS account occupy the same room under one nick with no
+  #    error at all — whether they got there by copying a pinned `nick` or by sharing an
+  #    `identity.handle` — and every message from both is attributed to that one nick.
+  #    (A `conflict` error only happens between different accounts, and there the loser falls
+  #    back to a random per-connection nick and keeps posting.)

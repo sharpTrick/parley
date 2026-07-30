@@ -1,5 +1,5 @@
 identity:
-  handle: "owner"
+  handle: "owner"           # Distinct from both code-agent-*.yaml: on XMPP it IS the sender.
 topics:
   - "ctx-payments"
   - "ctx-infra"
@@ -22,4 +22,5 @@ backend_config:
   muc_service: "muc.parley.local"         # identical
   username: "parley"                       # identical
   password: "change-me"                    # identical
-  # `nick` left unset — auto-randomized, distinct from both Code sessions' nicks for free.
+  # `nick` left unset — this config posts as its own `identity.handle` ("owner"), which is what
+  # keeps it distinct from both Code sessions on this shared account. See code-agent-a.yaml.
