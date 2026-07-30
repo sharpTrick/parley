@@ -1,5 +1,5 @@
-import { createServer as createHttpServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { createServer as createHttpServer, request } from 'node:http';
+import { connect, type AddressInfo, type Socket } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -574,5 +574,269 @@ describe('remote HTTP close() is bounded whatever the presence post does', () =>
     installPost(p, 'rejects synchronously');
     expect(() => p.post(asTopic('ctx'), asHandle('agent'), 'x')).toThrow();
     await p.disconnect();
+  });
+});
+
+/**
+ * The presence goodbye is only one of the things that can hold a teardown. Node's `server.close()`
+ * waits for every in-flight REQUEST, and `parley_fetch_recent` is designed to hold one open for its
+ * whole long-poll budget — so a bridge whose goodbye has already advertised it as gone keeps serving
+ * for up to `catchup.block_max_ms` while the supervisor's stop grace period runs out. Table the
+ * connection states a client can leave behind and require one fixed budget in every cell; the
+ * presence-only table above varies the post and cannot fail on request-driven hangs.
+ */
+describe('remote HTTP close() is bounded whatever a client is doing', () => {
+  const BLOCK_MAX_MS = 4_000;
+  const CLOSE_BUDGET_MS = 1_000;
+
+  async function serving() {
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+      catchup: { block_max_ms: BLOCK_MAX_MS, block_poll_interval_ms: 100 },
+    });
+    const app = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+    const srv = await app.listen(0);
+    return { p, app, port: (srv.address() as AddressInfo).port };
+  }
+
+  /** A long-poll POST that will still be parked when close() runs. */
+  function longPoll(port: number): Promise<unknown> {
+    return fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'parley_fetch_recent', arguments: { topic: 'ctx', block_ms: BLOCK_MAX_MS } },
+      }),
+    }).catch(() => undefined);
+  }
+
+  /** A raw socket that connects and then either idles or sends a partial request. */
+  function rawSocket(port: number, send?: string): Promise<Socket> {
+    return new Promise((resolve) => {
+      const socket = connect({ host: '127.0.0.1', port }, () => {
+        if (send !== undefined) socket.write(send);
+        resolve(socket);
+      });
+      socket.on('error', () => {});
+    });
+  }
+
+  const STATES: Array<[name: string, arrange: (port: number) => Promise<() => void>]> = [
+    ['no client at all', async () => () => {}],
+    [
+      'a long-poll fetch_recent in flight',
+      async (port) => {
+        const pending = longPoll(port);
+        await new Promise((r) => setTimeout(r, 200)); // parked inside the poll loop
+        return () => void pending;
+      },
+    ],
+    [
+      'a completed request holding a keep-alive connection',
+      async (port) => {
+        const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+        });
+        await res.text();
+        return () => {};
+      },
+    ],
+    [
+      'a socket that connected and sent nothing',
+      async (port) => {
+        const socket = await rawSocket(port);
+        return () => socket.destroy();
+      },
+    ],
+    [
+      'a socket part-way through a request',
+      async (port) => {
+        const socket = await rawSocket(port, 'POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 99\r\n\r\n{');
+        return () => socket.destroy();
+      },
+    ],
+    [
+      'a long-poll in flight AND an idle socket',
+      async (port) => {
+        const pending = longPoll(port);
+        const socket = await rawSocket(port);
+        await new Promise((r) => setTimeout(r, 200));
+        return () => {
+          void pending;
+          socket.destroy();
+        };
+      },
+    ],
+  ];
+
+  it.each(STATES)('close() settles inside its budget with %s', async (_name, arrange) => {
+    const { p, app, port } = await serving();
+    const release = await arrange(port);
+    try {
+      const t0 = Date.now();
+      await app.close();
+      expect(Date.now() - t0).toBeLessThan(CLOSE_BUDGET_MS);
+    } finally {
+      release();
+      await p.disconnect();
+    }
+  });
+
+  /** The stdio root's teardown obeys the same rule; one budget, both composition roots. */
+  it('stdio shutdown() settles inside its budget with a long-poll in flight', async () => {
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+      catchup: { block_max_ms: BLOCK_MAX_MS, block_poll_interval_ms: 100 },
+    });
+    const bridge = await buildBridge(p, cfg);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const c = new Client({ name: 'x', version: '0.0.0' }, { capabilities: {} });
+    await Promise.all([bridge.attach(serverT), c.connect(clientT)]);
+    const pending = c
+      .callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', block_ms: BLOCK_MAX_MS } })
+      .catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 200));
+    const t0 = Date.now();
+    await bridge.shutdown();
+    expect(Date.now() - t0).toBeLessThan(CLOSE_BUDGET_MS);
+    await c.close();
+    void pending;
+    await p.disconnect();
+  });
+});
+
+/**
+ * DNS rebinding is the one attack a loopback bind does not stop: the operator visits an attacker
+ * page, the attacker re-resolves its own domain to 127.0.0.1, and the browser then treats requests to
+ * the bridge as SAME-origin — so CORS stops protecting the JSON POST and the page can drive
+ * parley_post / parley_fetch_recent. The `Host` (and `Origin`, when the browser sends one) is the only
+ * thing that still names the attacker, so table both headers against the modes and require a 403 for
+ * every cell that is not the deployment's own name.
+ */
+describe('the insecure-no-auth endpoint answers only to the hosts it was configured for', () => {
+  const INIT = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'x', version: '0' } },
+  });
+
+  async function appOn(opts: Parameters<typeof createRemoteHttpApp>[2]) {
+    const p = new FakePlugin();
+    await p.connect({});
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      presence: { enabled: false },
+    });
+    const app = createRemoteHttpApp(p, cfg, opts);
+    const srv = await app.listen(0);
+    const port = (srv.address() as AddressInfo).port;
+    return { port, teardown: async () => (await app.close(), await p.disconnect()) };
+  }
+
+  /** `fetch` will not let us forge Host, so speak HTTP/1.1 over a raw socket. */
+  function statusFor(port: number, host: string, origin?: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const req = request(
+        {
+          host: '127.0.0.1',
+          port,
+          method: 'POST',
+          path: '/mcp',
+          headers: {
+            host,
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+            'content-length': Buffer.byteLength(INIT),
+            ...(origin === undefined ? {} : { origin }),
+          },
+        },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode ?? 0));
+        },
+      );
+      req.on('error', reject);
+      req.end(INIT);
+    });
+  }
+
+  const ALLOWED = 200;
+  const REFUSED = 403;
+
+  it('a request whose Host names the attacker is refused, whatever it puts in Origin', async () => {
+    const { port, teardown } = await appOn({ insecureNoAuth: true });
+    try {
+      const HOSTS: Array<[label: string, host: (port: number) => string, expected: number]> = [
+        ['the loopback address it is bound to', (p) => `127.0.0.1:${p}`, ALLOWED],
+        ['localhost', (p) => `localhost:${p}`, ALLOWED],
+        ['a rebinding attacker domain', () => 'files.attacker.example', REFUSED],
+        ['an attacker domain on the right port', (p) => `attacker.example:${p}`, REFUSED],
+        ['a public name this bridge was never told about', () => 'parley.example.com', REFUSED],
+      ];
+      const ORIGINS: Array<[label: string, origin: string | undefined, allowed: boolean]> = [
+        ['no Origin (a non-browser client)', undefined, true],
+        ['a loopback Origin', 'http://127.0.0.1', true],
+        ['an attacker Origin', 'https://evil.example', false],
+        ['the opaque null Origin', 'null', false],
+      ];
+      for (const [hostLabel, host, hostExpected] of HOSTS) {
+        for (const [originLabel, origin, originAllowed] of ORIGINS) {
+          const expected = hostExpected === ALLOWED && originAllowed ? ALLOWED : REFUSED;
+          expect(
+            await statusFor(port, host(port), origin),
+            `Host: ${hostLabel} × Origin: ${originLabel}`,
+          ).toBe(expected);
+        }
+      }
+    } finally {
+      await teardown();
+    }
+  });
+
+  it('an explicit allowedHosts list replaces the loopback default', async () => {
+    const { port, teardown } = await appOn({ insecureNoAuth: true, allowedHosts: ['parley.internal'] });
+    try {
+      expect(await statusFor(port, 'parley.internal')).toBe(ALLOWED);
+      expect(await statusFor(port, `127.0.0.1:${port}`)).toBe(REFUSED);
+    } finally {
+      await teardown();
+    }
+  });
+
+  /**
+   * A bearer-protected deployment is normally reached through a proxy under a public name this layer
+   * is never told, and a rebinding page cannot forge an Authorization header — so the gate is off
+   * there unless the operator asks for it. Pin that, so the default is a decision rather than an
+   * accident nobody notices when it changes.
+   */
+  it('a protected deployment is not host-gated unless allowedHosts says so', async () => {
+    const { port, teardown } = await appOn({ protect: (_req, _res, next) => next() });
+    try {
+      expect(await statusFor(port, 'parley.example.com')).toBe(ALLOWED);
+    } finally {
+      await teardown();
+    }
+    const gated = await appOn({ protect: (_req, _res, next) => next(), allowedHosts: ['parley.example.com'] });
+    try {
+      expect(await statusFor(gated.port, 'parley.example.com')).toBe(ALLOWED);
+      expect(await statusFor(gated.port, 'other.example.com')).toBe(REFUSED);
+    } finally {
+      await gated.teardown();
+    }
   });
 });

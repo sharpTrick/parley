@@ -7,7 +7,7 @@ import { catchUpTopic } from '../engine/catchup.js';
 import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asBackendMsgId, asHandle, asTopic, type Message, type Topic } from '../message.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic, type Message, type Topic } from '../message.js';
 import { NoSuchTopicError, type BackendPlugin, type MessageHandler } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { memoryReadState } from '../testing/nonconformant.js';
@@ -221,5 +221,88 @@ describe('startPushLoop (core emit handler)', () => {
       const { start } = await wireOver(['ctx', 'ops'], 'ops', () => new Error('subscribe boom'));
       await expect(start).rejects.toThrow(/subscribe boom/);
     });
+  });
+});
+
+/**
+ * `m.topic` is a PLUGIN-supplied field that decides which `<channel topic=…>` the agent sees, and a
+ * backend's subscribe primitive can be coarser than a topic — a NATS wildcard subject, a Matrix room
+ * carrying several logical topics, a Zulip stream. Core enforces the allowlist on the SUBSCRIBE call;
+ * without a re-check on delivery, an over-delivering plugin puts an unsubscribed topic (or a presence
+ * beat, which DESIGN §14 says never surfaces as a `<channel>` event) straight into agent context.
+ * Table what such a plugin can hand back, including near-misses that a loose comparison would admit.
+ */
+describe('a plugin that over-delivers cannot put an unsubscribed topic into the session', () => {
+  /** A plugin whose subscribe only captures the handler, so the test decides what gets delivered. */
+  async function capturing() {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    let deliver: MessageHandler | undefined;
+    plugin.subscribe = async (_topic: Topic, handler: MessageHandler) => {
+      deliver = handler;
+    };
+    const { server, calls } = fakeServer();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await startPushLoop(
+      server,
+      plugin,
+      new Allowlist(['ctx'], { reserved: [DEFAULT_PRESENCE_TOPIC] }),
+      new SeenSet(),
+      { mentionFilter: false, identity: asHandle('me') },
+    );
+    let seq = 0;
+    return {
+      calls,
+      errors,
+      push: (topic: string) => {
+        seq += 1;
+        deliver?.({
+          topic: asTopic(topic),
+          senderHandle: asHandle('bob'),
+          content: `body ${seq}`,
+          timestamp: new Date(seq * 1000).toISOString(),
+          backendMsgId: asBackendMsgId(String(seq)),
+          cursor: asCursor(String(seq)),
+          mentions: [],
+        });
+      },
+    };
+  }
+
+  const DELIVERED: Array<[label: string, topic: string, emitted: boolean]> = [
+    ['the subscribed topic', 'ctx', true],
+    ['a sibling topic that was never allow-listed', 'ops-secret', false],
+    ['the reserved presence topic', DEFAULT_PRESENCE_TOPIC, false],
+    ['the subscribed topic in another case', 'CTX', false],
+    ['the subscribed topic with trailing whitespace', 'ctx ', false],
+    ['a topic that merely extends the subscribed one', 'ctx-other', false],
+    ['the empty topic', '', false],
+  ];
+
+  it.each(DELIVERED)('%s is emitted: %s', async (_label, topic, emitted) => {
+    const bus = await capturing();
+    try {
+      bus.push(topic);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(bus.calls).toHaveLength(emitted ? 1 : 0);
+      if (!emitted) expect(bus.errors).toHaveBeenCalled(); // the operator hears about it
+    } finally {
+      bus.errors.mockRestore();
+    }
+  });
+
+  it('delivered all at once, exactly the subscribed topic reaches the session', async () => {
+    const bus = await capturing();
+    try {
+      for (const [, topic] of DELIVERED) bus.push(topic);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(bus.calls).toHaveLength(1);
+      expect(bus.calls[0]!.params.meta.topic).toBe('ctx');
+      // One warning for the whole loop: the topic string is untrusted, so a per-topic ledger would be
+      // an unbounded map keyed by plugin input.
+      expect(bus.errors).toHaveBeenCalledTimes(1);
+    } finally {
+      bus.errors.mockRestore();
+    }
   });
 });

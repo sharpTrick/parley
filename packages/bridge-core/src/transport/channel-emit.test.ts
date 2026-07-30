@@ -91,6 +91,10 @@ describe('channelMeta', () => {
       ['RTL override', 'a\u202Eb'],
       ['angle brackets', '<script>alert(1)</script>'],
       ['very long', 'A'.repeat(100_000)],
+      // A hyphen in a VALUE must never reshape a key: `msg-id` is silently dropped by the renderer,
+      // and nothing in the type system stops a literal-typed key from carrying one.
+      ['a hyphenated identifier', 'msg-id'],
+      ['a key-shaped assignment', 'msg-id="7'],
     ] as const;
 
     const FIELDS = {
@@ -101,7 +105,9 @@ describe('channelMeta', () => {
       mentions: (v: string) => msg({ mentions: [asHandle(v)] }),
     } as const;
 
-    const BASELINE = Object.keys(channelMeta(msg())).sort();
+    // A hard-coded list, NOT one derived from channelMeta: a baseline read out of the code under test
+    // shrinks with it, so a dropped key would leave every row below green.
+    const BASELINE = ['cursor', 'mentions', 'msg_id', 'sender', 'topic'];
 
     for (const [field, build] of Object.entries(FIELDS)) {
       it.each(HOSTILE)(`${field} carrying %s stays one field`, (_label, hostile) => {

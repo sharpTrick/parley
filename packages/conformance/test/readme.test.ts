@@ -81,8 +81,13 @@ describe('README', () => {
       return false;
     };
 
-    it('no backend that runs the suite typechecks its own test sources', () => {
-      expect(consumers().filter(typechecksTests)).toEqual([]);
+    // Assert what keeps the runtime validator NECESSARY, not a count of who has caught up. Pinning
+    // "nobody typechecks their tests" makes the suite go red when a backend IMPROVES, which is what
+    // happened the moment bridge-sqlite and bridge-slack added a test project. It becomes a real
+    // question only when the set empties.
+    it('at least one backend running the suite does not typecheck its own test sources', () => {
+      const without = consumers().filter((d) => !typechecksTests(d));
+      expect(without, 'every consumer now typechecks its tests — the runtime context validator may no longer be load-bearing, so re-justify it or drop it').not.toEqual([]);
     });
 
     it('does not claim NO tsconfig in the repo covers test/**, while some do', () => {

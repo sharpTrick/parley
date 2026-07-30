@@ -4,7 +4,9 @@
   "compilerOptions": {
     "noEmit": true,
     "rootDir": ".",
-    "tsBuildInfoFile": "tsconfig.test.tsbuildinfo"
+    "tsBuildInfoFile": "tsconfig.test.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": { "@sharptrick/parley-sqlite": ["./src/index.ts"] }
   },
   "references": [{ "path": "../bridge-core" }, { "path": "../conformance" }],
   "include": ["src/**/*", "test/**/*"],

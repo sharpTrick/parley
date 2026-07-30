@@ -35,9 +35,47 @@ async function closeQuietly(what: string, target: { close: () => Promise<void> }
   }
 }
 
+/**
+ * How long {@link RemoteHttpServer.close} lets an in-flight request finish before its socket is
+ * destroyed. Node's `server.close()` waits for every open connection, and a `parley_fetch_recent`
+ * long-poll holds one for its whole `catchup.block_max_ms` budget (60 s by default) — past a
+ * `docker stop` grace period, so the process is SIGKILLed mid-teardown while the presence goodbye
+ * has already advertised it as gone. The tool layer answers an aborted long-poll with an empty
+ * result, so cutting one short is safe.
+ */
+const CLOSE_GRACE_MS = 250;
+
+/**
+ * Host header values accepted when no explicit `allowedHosts` is configured: loopback only, on any
+ * port. This is the DNS-rebinding gate — a browser the operator visits can be pointed at
+ * 127.0.0.1 by re-resolving an attacker domain, and the request is then same-origin so CORS does
+ * not protect it. Only the `Host`/`Origin` the attacker's page carries gives it away.
+ */
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '[::1]'];
+
+/** The host part of a `Host`/`Origin` header value, port stripped, lowercased. */
+function hostnameOf(value: string): string {
+  const authority = value.includes('://') ? value.slice(value.indexOf('://') + 3) : value;
+  const hostname = authority.startsWith('[')
+    ? authority.slice(0, authority.indexOf(']') + 1)
+    : (authority.split(':')[0] ?? '');
+  return hostname.toLowerCase();
+}
+
 export interface RemoteHttpOptions {
   /** Middleware protecting the /mcp route (e.g. requireBearerAuth). Default: FAIL CLOSED (401). */
   protect?: RequestHandler;
+  /**
+   * Hostnames this app answers to (ports ignored). Requests whose `Host` — or whose `Origin`, when
+   * the browser sent one — names anything else get a 403, which is what stops DNS rebinding from
+   * reaching the endpoint through a browser the operator visits.
+   *
+   * Enforced whenever this is set, and by default whenever {@link insecureNoAuth} is on (loopback
+   * only). A bearer-protected deployment without this option is not gated here: it is typically
+   * reached through a proxy under a public name this layer is not told, and a rebinding page cannot
+   * forge the `Authorization` header anyway.
+   */
+  allowedHosts?: string[];
   /**
    * Explicitly run /mcp with NO auth — dev/loopback only. Named so the insecurity is visible at
    * the call site. Ignored when `protect` is set. Default: false (fail closed).
@@ -80,6 +118,28 @@ export function createRemoteHttpApp(
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     next();
   });
+  const allowedHosts =
+    opts.allowedHosts ?? (opts.insecureNoAuth === true && opts.protect === undefined ? LOOPBACK_HOSTS : undefined);
+  if (allowedHosts !== undefined) {
+    const allowed = new Set(allowedHosts.map((h) => hostnameOf(h)));
+    // Keep this ahead of configureApp, so that the OAuth consent/authorize routes are covered too.
+    app.use((req, res, next) => {
+      const origin = req.headers.origin;
+      const bad =
+        !allowed.has(hostnameOf(req.headers.host ?? '')) ||
+        (typeof origin === 'string' && origin.length > 0 && !allowed.has(hostnameOf(origin)));
+      if (bad) {
+        res.status(403).json({
+          jsonrpc: '2.0',
+          error: { code: -32002, message: 'Forbidden: host not allowed' },
+          id: null,
+        });
+        return;
+      }
+      next();
+    });
+  }
+
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
 
@@ -200,9 +260,18 @@ export function createRemoteHttpApp(
       const s = httpServer;
       httpServer = undefined;
       if (s === undefined || !s.listening) return;
-      await new Promise<void>((resolve, reject) => {
-        s.close((e) => (e ? reject(e) : resolve()));
-      });
+      s.closeIdleConnections();
+      // Keep this deadline armed: `s.close()` alone resolves only once every in-flight request has
+      // finished, and a long-poll's is measured in tens of seconds.
+      const cutoff = setTimeout(() => s.closeAllConnections(), CLOSE_GRACE_MS);
+      cutoff.unref?.();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          s.close((e) => (e ? reject(e) : resolve()));
+        });
+      } finally {
+        clearTimeout(cutoff);
+      }
     },
   };
 }

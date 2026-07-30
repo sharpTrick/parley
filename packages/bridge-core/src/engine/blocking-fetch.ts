@@ -5,7 +5,12 @@ import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.
 export interface BlockingFetchOptions {
   /** Total long-poll budget in ms. Already clamped to the server cap by the caller. */
   blockMs: number;
-  /** Poll cadence for the generic fallback (used only when a plugin returns early/empty). */
+  /**
+   * Poll cadence for the generic fallback (used only when a plugin returns early/empty). Must be
+   * `> 0`: a non-positive cadence is REJECTED, not clamped, because silently degrading it turns a
+   * long poll into a single fetch — the opposite of what this function is for. Core's own config
+   * schema already guarantees a positive value.
+   */
   pollIntervalMs: number;
   /** Monotonic clock in ms. Default `Date.now`. */
   now?: () => number;
@@ -33,6 +38,26 @@ export class FetchAbortedError extends Error {
     super('fetch_recent cancelled before any page was read');
     this.name = 'FetchAbortedError';
   }
+}
+
+/**
+ * The literal {@link FetchAbortedError} assigns to `this.name`. Keep it a literal rather than
+ * `FetchAbortedError.name`, so that a bundler mangling the class binding cannot make the marker on
+ * an instance and the marker being compared against diverge.
+ */
+const ABORTED_MARKER = 'FetchAbortedError';
+
+/**
+ * True for a {@link FetchAbortedError} raised by ANY copy of this package.
+ *
+ * `instanceof` answers "was this thrown by MY class object", not "is this a cancellation". A tree
+ * with two installs of `@sharptrick/parley-core` has two distinct classes, and an `instanceof` check
+ * then renders a routine client cancellation to the agent as a backend failure. Recognise it by its
+ * marker instead, exactly as `isNoSuchTopicError` does for the absence sentinel.
+ */
+export function isFetchAbortedError(err: unknown): boolean {
+  if (err instanceof FetchAbortedError) return true;
+  return typeof err === 'object' && err !== null && (err as { name?: unknown }).name === ABORTED_MARKER;
 }
 
 const ABORTED = Symbol('aborted');
@@ -76,6 +101,14 @@ export async function fetchRecentBlocking(
   args: FetchRecentArgs,
   opts: BlockingFetchOptions,
 ): Promise<FetchRecentResult> {
+  if (!(opts.pollIntervalMs > 0)) {
+    throw new RangeError(`pollIntervalMs must be > 0 (got ${opts.pollIntervalMs})`);
+  }
+  // A non-finite budget is neither `> 0` nor `<= 0`, so every deadline comparison below answers false
+  // and the loop naps forever — refuse it here rather than hanging the caller's request.
+  if (!Number.isFinite(opts.blockMs)) {
+    throw new RangeError(`blockMs must be finite (got ${opts.blockMs})`);
+  }
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? realSleep;
   const deadline = now() + Math.max(0, opts.blockMs);
@@ -99,9 +132,7 @@ export async function fetchRecentBlocking(
 
     if (now() >= deadline || opts.blockMs <= 0 || opts.signal?.aborted) return result;
 
-    const nap = Math.min(opts.pollIntervalMs, Math.max(0, deadline - now()));
-    if (nap <= 0) return result;
-    await sleep(nap);
+    await sleep(Math.min(opts.pollIntervalMs, Math.max(0, deadline - now())));
   }
 }
 

@@ -3,7 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
-import { FetchAbortedError, fetchRecentBlocking } from '../engine/blocking-fetch.js';
+import { fetchRecentBlocking, isFetchAbortedError } from '../engine/blocking-fetch.js';
 import { computeRoster, filterReachable } from '../engine/presence.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { filterHandles, MAX_GLOB_LEN } from '../identity-filter.js';
@@ -178,7 +178,9 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     {
       description:
         'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
-        'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor }. ' +
+        'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor } — ' +
+        'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
+        'does not exist yet, or the long-poll was cancelled); re-issue without `since` in that case. ' +
         'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
         'long-poll: if the queried window is empty — whether or not you passed `since` — the call ' +
         'holds until a message arrives or the timeout elapses (capped server-side), so a polling ' +
@@ -231,7 +233,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       } catch (e) {
         // A long-poll the client cancelled is not a failure: answer it like any other empty window,
         // so that a routine cancellation is never rendered to the agent as a tool error.
-        if (e instanceof FetchAbortedError) return textResult({ messages: [], nextCursor: args.since });
+        if (isFetchAbortedError(e)) return textResult({ messages: [], nextCursor: args.since });
         if (!isNoSuchTopicError(e)) throw e;
         // Echo the caller's position back: replaying it once the topic exists reads from where
         // they were, and omitting it (no `since` given) reads the recent window.
@@ -304,7 +306,9 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         'included (default 24h); `limit` caps the result; `filter` is a glob over handles (e.g. ' +
         '"claude-*"). A human using a plain chat client appears only once they send a message. Returns ' +
         '{ users: [{ handle, online, topics, postTopics, lastSeenMs }], truncated } (truncated=true ' +
-        'when the scanned presence history was full, so older offline peers may be missing). Configured ' +
+        'when the scanned presence history was full, so peers may be missing — a peer that beats far ' +
+        'more often than the rest can fill that history on its own and hide quieter ones, so treat a ' +
+        'truncated roster as incomplete rather than as the whole bus). Configured ' +
         `topics: ${topicList(allow)}.`,
       inputSchema: {
         filter: z
@@ -357,8 +361,14 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       }
       // A full page means older presence history was clipped — offline coverage is best-effort.
       const truncated = page.messages.length >= PRESENCE_FETCH_LIMIT;
+      // `limit` is a maximum the seam only asks for: a plugin may hand back MORE (nonconformant.ts
+      // models it), and every extra beat is another entry in agent-facing output. Fold the freshest.
+      const beats =
+        page.messages.length > PRESENCE_FETCH_LIMIT
+          ? page.messages.slice(-PRESENCE_FETCH_LIMIT)
+          : page.messages;
 
-      const roster = computeRoster(page.messages, now(), {
+      const roster = computeRoster(beats, now(), {
         ttlMs: deps.presenceTtlMs,
         sinceMs,
       });

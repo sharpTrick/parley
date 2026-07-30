@@ -6,6 +6,7 @@ import {
   encodePresence,
   filterReachable,
   MAX_CLOCK_SKEW_MS,
+  MAX_HANDLE_INSTANCES,
   MAX_HANDLE_LEN,
   MAX_INSTANCE_ID_LEN,
   MAX_RECORD_TOPICS,
@@ -61,12 +62,6 @@ describe('encode/decode presence', () => {
     expect(decodePresence(empty)?.instanceId).toBe('');
   });
 
-  it('truncates an over-long instanceId', () => {
-    const instanceId = 'x'.repeat(MAX_INSTANCE_ID_LEN + 50);
-    const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], instanceId }));
-    expect(rec?.instanceId).toHaveLength(MAX_INSTANCE_ID_LEN);
-  });
-
   it('drops a malformed postTopics to [] rather than rejecting the whole beat (untrusted input)', () => {
     const bad = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [42, ''] });
     expect(decodePresence(bad)?.postTopics).toEqual([]);
@@ -74,13 +69,35 @@ describe('encode/decode presence', () => {
     expect(decodePresence(notArray)?.postTopics).toEqual([]);
   });
 
-  it('truncates an over-long postTopics list', () => {
-    const postTopics = Array.from({ length: MAX_RECORD_TOPICS + 10 }, (_, i) => `p-${i}`);
-    const rec = decodePresence(
-      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics }),
-    );
-    expect(rec?.postTopics).toHaveLength(MAX_RECORD_TOPICS);
-    expect(rec?.postTopics[0]).toBe('p-0');
+  /**
+   * Every length/count cap at decode is one axis — (field, kind of overflow, expectation) — so table
+   * it rather than writing a case per field: a cap added to a new PresenceRecord field joins a row
+   * instead of needing a new body, and the caps actually covered are visible without reading six
+   * prose names. The two axes differ in KIND, so they are two tables: a scalar string is truncated to
+   * its cap, while a list caps its COUNT and DROPS an over-long member (truncating a topic name would
+   * fabricate a different topic).
+   */
+  it.each([
+    ['instanceId', MAX_INSTANCE_ID_LEN],
+    ['handle', MAX_HANDLE_LEN],
+  ] as const)('truncates an over-long %s to its cap (untrusted input becomes roster state)', (field, cap) => {
+    const beyond = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: 'x'.repeat(cap + 50) });
+    expect(decodePresence(beyond)?.[field]).toHaveLength(cap);
+    const exact = JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: 'y'.repeat(cap) });
+    expect(decodePresence(exact)?.[field]).toHaveLength(cap);
+  });
+
+  it.each(['topics', 'postTopics'] as const)('%s caps its count and drops over-long members', (field) => {
+    const record = (value: string[]) =>
+      decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], [field]: value }));
+
+    const many = Array.from({ length: MAX_RECORD_TOPICS + 10 }, (_unused, i) => `e-${i}`);
+    expect(record(many)?.[field]).toHaveLength(MAX_RECORD_TOPICS);
+    expect(record(many)?.[field][0]).toBe('e-0');
+
+    const tooLong = 'x'.repeat(MAX_TOPIC_LEN + 1);
+    const atTheCap = 'y'.repeat(MAX_TOPIC_LEN);
+    expect(record([tooLong, 'keep-me', atTheCap])?.[field]).toEqual(['keep-me', atTheCap]);
   });
 
   it('rejects malformed / non-presence content (untrusted input)', () => {
@@ -101,32 +118,6 @@ describe('encode/decode presence', () => {
     expect(decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: [''] }))).toBeNull();
   });
 
-  it('truncates an over-long topics list rather than rejecting it', () => {
-    const topics = Array.from({ length: MAX_RECORD_TOPICS + 10 }, (_, i) => `ctx-${i}`);
-    const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics }));
-    expect(rec?.topics).toHaveLength(MAX_RECORD_TOPICS);
-    expect(rec?.topics[0]).toBe('ctx-0');
-  });
-
-  it('drops an over-long topics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
-    const tooLong = 'x'.repeat(MAX_TOPIC_LEN + 1);
-    const exact = 'y'.repeat(MAX_TOPIC_LEN);
-    const rec = decodePresence(
-      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: [tooLong, 'ctx', exact] }),
-    );
-    expect(rec?.topics).toEqual(['ctx', exact]);
-    expect(rec?.topics).not.toContain(tooLong);
-  });
-
-  it('drops an over-long postTopics string but keeps the normal one and one of exactly MAX_TOPIC_LEN', () => {
-    const tooLong = 'z'.repeat(MAX_TOPIC_LEN + 1);
-    const exact = 'w'.repeat(MAX_TOPIC_LEN);
-    const rec = decodePresence(
-      JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], postTopics: [tooLong, 'ctx-.*', exact] }),
-    );
-    expect(rec?.postTopics).toEqual(['ctx-.*', exact]);
-    expect(rec?.postTopics).not.toContain(tooLong);
-  });
 });
 
 describe('computeRoster', () => {
@@ -199,20 +190,6 @@ describe('computeRoster', () => {
     ]);
   });
 
-  it('unions topics/postTopics across an online handle live instances', () => {
-    const msgs = [
-      beat('claude-a', 'hello', now - 2_000, 1, ['ctx-a'], ['a-.*'], 'inst-1'),
-      beat('claude-a', 'heartbeat', now - 800, 2, ['ctx-b'], ['b-.*'], 'inst-2'),
-    ];
-    const roster = computeRoster(msgs, now, opts);
-    expect(roster).toHaveLength(1);
-    const entry = roster[0]!;
-    expect(entry.online).toBe(true);
-    expect([...entry.topics].sort()).toEqual(['ctx-a', 'ctx-b']);
-    expect([...entry.postTopics].sort()).toEqual(['a-.*', 'b-.*']);
-    expect(entry.lastSeenMs).toBe(now - 800);
-  });
-
   it('an offline handle uses its single last-known beat for topics/reach', () => {
     const msgs = [
       beat('claude-a', 'heartbeat', now - 2_000, 1, ['ctx-old'], ['old-.*']),
@@ -262,49 +239,174 @@ describe('computeRoster', () => {
     expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['claude-a', 'claude-b']);
   });
 
-  // The self-reported `at` is untrusted; a far-future value must never enter the roster,
-  // where it would read as permanently `online` and pin a phantom hand-off target at the top forever.
-  const FUTURE_AT = 8_640_000_000_000_000; // max representable Date ms
+  /**
+   * The self-reported `at` is untrusted, and every case about it is one parameter: `at - now`. Table
+   * the offset instead of writing a body per point, with the boundary rows DERIVED from
+   * MAX_CLOCK_SKEW_MS so moving the constant moves the boundary instead of leaving stale prose names
+   * behind. A far-future value must never enter the roster: it would read as permanently `online` and
+   * pin a phantom hand-off target at the top of the list forever, immune to both windows.
+   */
+  describe('the untrusted `at` is trusted only inside the skew tolerance', () => {
+    const FUTURE_AT = 8_640_000_000_000_000; // max representable Date ms
 
-  it('a far-future spoofed `at` never enters the roster: no phantom online peer, no top slot', () => {
-    // An attacker plants an astronomical `at`; a legitimate peer beats at `now`. The spoof must be
-    // dropped at decode — not clamped-to-now (which would re-read it as freshly live every call).
-    const roster = computeRoster(
-      [beat('zzz-attacker', 'heartbeat', FUTURE_AT, 1, ['dev']), beat('real', 'heartbeat', now, 2, ['ctx'])],
+    /** `top` is who leads the recency sort — the slot a phantom peer would otherwise pin forever. */
+    const OFFSETS: Array<
+      [label: string, offset: number, decoded: boolean, online: boolean, listed: boolean, top: string]
+    > = [
+      ['aged past the ttl but inside the since window', -ttl - 1, true, false, true, 'real'],
+      ['older than the since window', -since - 1, true, false, false, 'real'],
+      ['a fresh past beat', -1_000, true, true, true, 'real'],
+      ['a legitimate small clock skew', 1_000, true, true, true, 'zzz-spoof'],
+      ['exactly at the skew tolerance', MAX_CLOCK_SKEW_MS, true, true, true, 'zzz-spoof'],
+      ['one ms beyond the skew tolerance', MAX_CLOCK_SKEW_MS + 1, false, false, false, 'real'],
+      ['a far-future spoof', 1e12, false, false, false, 'real'],
+      ['the maximum representable date', FUTURE_AT - now, false, false, false, 'real'],
+    ];
+
+    it.each(OFFSETS)(
+      '%s (offset %i ms) ⇒ decoded=%s, online=%s, listed=%s, roster led by %s',
+      (_label, offset, decoded, online, listed, top) => {
+        const at = now + offset;
+        const rec = decodePresence(JSON.stringify({ v: 2, kind: 'heartbeat', at, topics: ['ctx'] }), now);
+        expect(rec !== null).toBe(decoded);
+        if (decoded) expect(rec?.at).toBe(at);
+
+        // A legitimate peer beats alongside it, so a surviving spoof has to displace it to lead.
+        const roster = computeRoster(
+          [beat('zzz-spoof', 'heartbeat', at, 1, ['dev']), beat('real', 'heartbeat', now - 1, 2)],
+          now,
+          opts,
+        );
+        const entry = roster.find((e) => e.handle === 'zzz-spoof');
+        expect(entry !== undefined).toBe(listed);
+        expect(entry?.online ?? false).toBe(online);
+        expect(roster[0]?.handle).toBe(top);
+      },
+    );
+
+    it('a pure decode with no nowMs leaves `at` unbounded (round-trip callers)', () => {
+      expect(decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: now + 1e12, topics: ['ctx'] }))).not.toBeNull();
+    });
+
+    it('a rejected spoof cannot outlive a legit peer that ages out (immune-forever regression)', () => {
+      // The SAME page evaluated at a much later now: the legit peer correctly ages out of both
+      // windows, and the phantom must not be left behind as the sole surviving hand-off target.
+      const msgs = [beat('zzz-spoof', 'heartbeat', FUTURE_AT, 1, ['dev']), beat('real', 'heartbeat', now, 2)];
+      expect(computeRoster(msgs, now, opts).map((e) => e.handle)).toEqual(['real']);
+      expect(computeRoster(msgs, now + 100 * ttl, opts)).toEqual([]);
+    });
+  });
+});
+
+/**
+ * MAX_RECORD_TOPICS / MAX_TOPIC_LEN bound ONE beat. computeRoster then unions across every instance
+ * of a handle, and the instance count is chosen by whoever writes the beats (a fresh `instanceId` per
+ * beat costs nothing), so a per-record cap alone multiplies by the presence page size — 500 beats of
+ * 64 max-length topics reached a 33 MB roster that `parley_list_users` returns verbatim into the
+ * agent's context and that filterReachable then compiles 32,000 untrusted regexes out of.
+ *
+ * Table the axes that MULTIPLY and assert the budget on the OUTPUT, so a new PresenceRecord field
+ * inherits it: exact entry counts (a ceiling alone is satisfied by returning nothing), a fixed byte
+ * ceiling per entry, and a wall-clock bound on the regex compile that consumes it.
+ */
+describe('the per-record budget survives aggregation across instances', () => {
+  const now = 1_000_000;
+  const ttl = 90_000;
+  const opts = { ttlMs: ttl, sinceMs: 600_000 };
+  /** 64 topics + 64 postTopics of 512 chars, plus JSON quoting and the entry's scalar fields. */
+  const ENTRY_BUDGET_BYTES = 100_000;
+  const COMPILE_BOUND_MS = 200;
+
+  const padded = (prefix: string, len: number): string =>
+    prefix.length >= len ? prefix.slice(0, len) : prefix + 'x'.repeat(len - prefix.length);
+
+  function hostilePage(instances: number, perRecord: number, strLen: number): Message[] {
+    return Array.from({ length: instances }, (_unused, i) =>
+      beat(
+        'attacker',
+        'heartbeat',
+        now - 1_000,
+        i + 1,
+        Array.from({ length: perRecord }, (_u, j) => padded(`t-${i}-${j}-`, strLen)),
+        Array.from({ length: perRecord }, (_u, j) => padded(`p-${i}-${j}-`, strLen)),
+        `inst-${i}`,
+      ),
+    );
+  }
+
+  it.each([
+    [1, 64, MAX_TOPIC_LEN],
+    [8, 64, MAX_TOPIC_LEN],
+    [500, 64, MAX_TOPIC_LEN],
+    [500, 1, MAX_TOPIC_LEN],
+    [500, 64, 8],
+  ])('%i instances × %i entries × %i-char strings', (instances, perRecord, strLen) => {
+    const roster = computeRoster(hostilePage(instances, perRecord, strLen), now, opts);
+    expect(roster).toHaveLength(1); // one writer is one peer, however many instances it mints
+
+    const entry = roster[0]!;
+    const folded = Math.min(instances, MAX_HANDLE_INSTANCES) * perRecord;
+    const expected = Math.min(folded, MAX_RECORD_TOPICS);
+    // Exact, not just "<= cap": the caps must bound the union without emptying the peer's reach.
+    expect(entry.topics).toHaveLength(expected);
+    expect(entry.postTopics).toHaveLength(expected);
+    expect(JSON.stringify(entry).length).toBeLessThan(ENTRY_BUDGET_BYTES);
+
+    const t0 = performance.now();
+    filterReachable(roster, { scope: undefined, canPostTo: () => false, mySubscribedTopics: ['ctx'] });
+    expect(performance.now() - t0).toBeLessThan(COMPILE_BOUND_MS);
+  });
+
+  it('still unions the reach of a handle live instances (the cap is a ceiling, not a replacement)', () => {
+    const msgs = [
+      beat('claude-a', 'hello', now - 2_000, 1, ['ctx-a'], ['a-.*'], 'inst-1'),
+      beat('claude-a', 'heartbeat', now - 800, 2, ['ctx-b'], ['b-.*'], 'inst-2'),
+    ];
+    const roster = computeRoster(msgs, now, opts);
+    expect(roster).toHaveLength(1);
+    const entry = roster[0]!;
+    expect(entry.online).toBe(true);
+    expect([...entry.topics].sort()).toEqual(['ctx-a', 'ctx-b']);
+    expect([...entry.postTopics].sort()).toEqual(['a-.*', 'b-.*']);
+    expect(entry.lastSeenMs).toBe(now - 800);
+  });
+
+  it('retains the instances still beating and evicts the stalest', () => {
+    const flood = Array.from({ length: MAX_HANDLE_INSTANCES * 4 }, (_unused, i) =>
+      beat('claude-a', 'heartbeat', now - 1_000, 10 + i, [`ctx-flood-${i}`], [], `flood-${i}`),
+    );
+    const entry = computeRoster(
+      [
+        beat('claude-a', 'heartbeat', now - 5_000, 1, ['ctx-silent'], [], 'inst-silent'),
+        beat('claude-a', 'heartbeat', now - 5_000, 2, ['ctx-loud'], [], 'inst-loud'),
+        ...flood,
+        beat('claude-a', 'heartbeat', now - 500, 999, ['ctx-loud'], [], 'inst-loud'),
+      ],
       now,
       opts,
+    )[0]!;
+    expect(entry.topics).toContain('ctx-loud'); // beat again after the flood ⇒ retained
+    expect(entry.topics).not.toContain('ctx-silent'); // silent since its first beat ⇒ evicted
+    expect(entry.topics.length).toBeLessThanOrEqual(MAX_HANDLE_INSTANCES);
+  });
+
+  /**
+   * `limit` is a maximum the seam only ASKS for — nonconformant.ts models a page longer than it as a
+   * shape core's loops must survive — so the number of records folded here is plugin-chosen, not
+   * bounded by the request. At this size an unbounded fold is not merely large: it is a RangeError
+   * from a spread whose argument count is the record count, so `parley_list_users` answers with an
+   * internal error instead of a roster.
+   */
+  it('folds a page far longer than any requested limit into a bounded entry', () => {
+    // Past the argument-count ceiling a spread of one record per beat hits (~125k on Node 22), so an
+    // unbounded fold fails loudly here rather than merely returning something large.
+    const page = Array.from({ length: 130_000 }, (_unused, i) =>
+      beat('attacker', 'heartbeat', now - 1_000, i + 1, [`ctx-${i}`], [], `inst-${i}`),
     );
-    expect(roster.map((e) => e.handle)).toEqual(['real']); // only the legit peer survives
-    expect(roster.find((e) => e.handle === 'zzz-attacker')).toBeUndefined(); // no online AND no offline phantom
-    expect(roster[0]?.online).toBe(true);
-  });
-
-  it('a far-future spoof cannot outlive a legit peer that ages out (immune-forever regression)', () => {
-    // Evaluate well past ttl AND sinceMs with no fresh beats: the legit peer correctly ages out and is
-    // dropped, and the phantom must NOT be left behind as the sole surviving (online) hand-off target.
-    const msgs = [
-      beat('zzz-attacker', 'heartbeat', FUTURE_AT, 1, ['dev']),
-      beat('real', 'heartbeat', now, 2, ['ctx']),
-    ];
-    expect(computeRoster(msgs, now + 100 * ttl, opts)).toEqual([]);
-  });
-
-  it('decode rejects a beat beyond the skew tolerance but keeps one exactly at it', () => {
-    const at = (delta: number) => JSON.stringify({ v: 2, kind: 'hello', at: now + delta, topics: ['ctx'] });
-    expect(decodePresence(at(MAX_CLOCK_SKEW_MS + 1), now)).toBeNull(); // just beyond tolerance ⇒ dropped
-    expect(decodePresence(at(MAX_CLOCK_SKEW_MS), now)?.at).toBe(now + MAX_CLOCK_SKEW_MS); // boundary kept
-    expect(decodePresence(at(1e12), now)).toBeNull(); // far future ⇒ dropped
-    expect(decodePresence(at(1e12))).not.toBeNull(); // pure decode (no now) leaves `at` unbounded
-  });
-
-  it('a legitimate small clock skew (at = now + 1s) still reads online', () => {
-    const roster = computeRoster([beat('peer', 'heartbeat', now + 1_000, 1)], now, opts);
-    expect(roster[0]?.online).toBe(true);
-  });
-
-  it('the far-future guard leaves the normal past-TTL offline path intact (only far-future ats are dropped)', () => {
-    const roster = computeRoster([beat('old', 'heartbeat', now - ttl - 1, 1)], now, opts);
-    expect(roster[0]?.online).toBe(false);
+    const roster = computeRoster(page, now, opts);
+    expect(roster).toHaveLength(1);
+    expect(roster[0]!.topics).toHaveLength(MAX_HANDLE_INSTANCES);
+    expect(roster[0]!.lastSeenMs).toBe(now - 1_000);
   });
 });
 
@@ -370,12 +472,6 @@ describe('the roster keys on the emitting bridge, not on the backend sender', ()
         .map((e) => e.handle)
         .sort(),
     ).toEqual(['claude-new', 'claude-old']);
-  });
-
-  it('truncates an over-long self-reported handle (untrusted input becomes a roster key)', () => {
-    const handle = 'h'.repeat(MAX_HANDLE_LEN + 50);
-    const rec = decodePresence(JSON.stringify({ v: 2, kind: 'hello', at: 1, topics: ['ctx'], handle }));
-    expect(rec?.handle).toHaveLength(MAX_HANDLE_LEN);
   });
 
   it.each([['a number', 42], ['an empty string', ''], ['null', null]])(

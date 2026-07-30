@@ -208,3 +208,31 @@ describe('presence loop', () => {
     expect(roster.find((e) => e.handle === 'claude-a')?.online).toBe(false);
   });
 });
+
+/**
+ * `startPresenceLoop` is public API, so its cadence is whatever a caller passes; only core's config
+ * schema guarantees a positive one. A clamp turned a degenerate cadence into a ~1 ms interval — a post
+ * storm against the shared presence topic every peer reads — so the loop refuses it at the boundary
+ * instead, and refuses it BEFORE announcing anything.
+ */
+describe('a degenerate heartbeat cadence is refused before the loop announces', () => {
+  it.each([
+    ['zero', 0],
+    ['negative', -5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('%s', async (_name, heartbeatMs) => {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    expect(() =>
+      startPresenceLoop(plugin, asHandle('claude-a'), new Allowlist(['ctx']), {
+        presenceTopic: PRESENCE_TOPIC,
+        heartbeatMs,
+        now: () => NOW,
+      }),
+    ).toThrow(RangeError);
+    // Real timers here: a clamped cadence would beat within a couple of ms of construction.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await beats(plugin)).toEqual([]); // no hello, so no peer ever saw it as reachable
+  });
+});

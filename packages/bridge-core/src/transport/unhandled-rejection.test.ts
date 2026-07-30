@@ -184,7 +184,7 @@ describe('every fire-and-forget statement in engine/ + transport/ is a known one
     'transport/http.ts: closeQuietly(\'transport\', transport);',
     'transport/http.ts: closeQuietly(\'reactive server\', server);',
     'transport/presence-loop.ts: enqueue(\'hello\');',
-    'transport/presence-loop.ts: enqueue(\'heartbeat\'), heartbeatClamp(opts.heartbeatMs));',
+    'transport/presence-loop.ts: enqueue(\'heartbeat\'), opts.heartbeatMs);',
     'transport/presence-loop.ts: work.catch(() => undefined).then(() => {',
     'transport/push-loop.ts: emitChannel(server, m).catch(() => {',
   ];

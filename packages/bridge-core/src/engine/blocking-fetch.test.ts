@@ -7,7 +7,7 @@ import {
   NONCONFORMANT_SHAPES,
   pagingProbe,
 } from '../testing/nonconformant.js';
-import { FetchAbortedError, fetchRecentBlocking } from './blocking-fetch.js';
+import { FetchAbortedError, fetchRecentBlocking, type BlockingFetchOptions } from './blocking-fetch.js';
 
 const SENDER = asHandle('writer');
 
@@ -435,6 +435,49 @@ describe('fetchRecentBlocking', () => {
       for (let i = 0; i < 6; i++) await clock.advance(250);
       await pending; // the assertion is that this settles at all
       expect(calls.length).toBeLessThanOrEqual(6);
+    });
+  });
+
+  /**
+   * `fetchRecentBlocking` is public API, so its cadence and budget arrive from whatever a caller
+   * passes — core's config schema constrains only the values core itself supplies. A non-positive
+   * cadence used to collapse the long poll into ONE fetch with no error and no warning, which is the
+   * opposite of what the function is for and was reachable by no test in either direction. Table the
+   * degenerate values against what each knob PROMISES, so a knob added to BlockingFetchOptions later
+   * inherits a row rather than a silent no-op.
+   */
+  describe('a degenerate cadence or budget is refused, not silently honoured', () => {
+    const T = asTopic('room');
+
+    const KNOBS: Array<[name: string, over: Partial<BlockingFetchOptions>, outcome: 'refused' | 'one plain fetch']> = [
+      ['pollIntervalMs 0', { pollIntervalMs: 0 }, 'refused'],
+      ['pollIntervalMs -1', { pollIntervalMs: -1 }, 'refused'],
+      ['pollIntervalMs NaN', { pollIntervalMs: Number.NaN }, 'refused'],
+      // `blockMs <= 0` is DOCUMENTED as "do not long-poll": one plain fetch, not an error.
+      ['blockMs 0', { blockMs: 0 }, 'one plain fetch'],
+      ['blockMs -1', { blockMs: -1 }, 'one plain fetch'],
+      // Neither `> 0` nor `<= 0`: every deadline comparison answers false and the loop never ends.
+      ['blockMs NaN', { blockMs: Number.NaN }, 'refused'],
+      ['blockMs Infinity', { blockMs: Number.POSITIVE_INFINITY }, 'refused'],
+    ];
+
+    it.each(KNOBS)('%s', async (_name, over, outcome) => {
+      const { plugin, calls } = pagingProbe(() => ({ messages: [], nextCursor: asCursor('tail') }));
+      const clock = fakeClock();
+      const run = fetchRecentBlocking(plugin, { topic: T }, {
+        blockMs: 60_000,
+        pollIntervalMs: 250,
+        now: clock.now,
+        sleep: clock.sleep,
+        ...over,
+      });
+      if (outcome === 'refused') {
+        await expect(run).rejects.toThrow(RangeError);
+        expect(calls).toHaveLength(0); // refused at the boundary, before any backend query
+        return;
+      }
+      await expect(run).resolves.toEqual({ messages: [], nextCursor: 'tail' });
+      expect(calls).toHaveLength(1); // exactly the documented single passthrough
     });
   });
 

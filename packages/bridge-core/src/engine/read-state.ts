@@ -15,12 +15,14 @@ import { asCursor, type Cursor, type Topic } from '../message.js';
  * rename prevents corruption.
  *
  * Exclusivity is a CONVENTION, not an enforced lock: `instance_id` defaults to the handle, so two
- * sessions sharing a handle land on one file. Each flush therefore merges over a re-read of disk
- * and writes through a process-unique temp name, so the worst case is a single topic's cursor
- * losing a race — not a whole session's read position, and never a half-written file.
+ * sessions sharing a handle land on one file. Each flush therefore writes only the topics THIS
+ * store has set since its last flush, over a re-read of disk, through a process-unique temp name —
+ * so the worst case is a single topic's cursor losing a race, not a whole session's read position,
+ * and never a half-written file.
  */
 export class ReadStateStore {
   private readonly state: Record<string, string>;
+  private readonly pending = new Set<string>();
 
   constructor(private readonly filePath: string) {
     if (filePath.length === 0) {
@@ -62,6 +64,7 @@ export class ReadStateStore {
   /** Persist a new read position for a topic (atomic). */
   set(topic: Topic, cursor: Cursor): void {
     this.state[topic] = cursor;
+    this.pending.add(topic);
     this.flush();
   }
 
@@ -70,13 +73,19 @@ export class ReadStateStore {
     // read this instance's cursor positions. `mode` is masked by the umask (only ever *removing*
     // bits, so the result is ≤ these), and renameSync preserves the tmp file's mode into place.
     mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
-    const merged = { ...ReadStateStore.load(this.filePath), ...this.state };
+    // Write only the topics this store actually advanced. Spreading the whole in-memory map would
+    // republish every position this instance ever held, rolling another session on the same path
+    // back to where THIS one last read — a persistent regression, not a lost race, and one that
+    // re-drains and re-emits already-delivered messages after a restart.
+    const merged = ReadStateStore.load(this.filePath);
+    for (const topic of this.pending) merged[topic] = this.state[topic]!;
     // Keep the temp name process-unique, so that a concurrent flush cannot interleave into it and
     // leave a half-written file that load() would silently discard as corrupt.
     const tmp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
     try {
       writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
       renameSync(tmp, this.filePath);
+      this.pending.clear(); // keep a failed write's topics pending, so that the next flush retries them
     } catch (err) {
       // Keep the failed attempt's temp file from surviving: the name is deliberately
       // process-unique, so nothing would ever collide with it, overwrite it, or clean it up, and a

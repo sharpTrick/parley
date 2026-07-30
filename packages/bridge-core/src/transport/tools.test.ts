@@ -6,7 +6,7 @@ import { Allowlist } from '../allowlist.js';
 import { DEFAULT_PRESENCE_TOPIC, encodePresence, type PresenceKind } from '../engine/presence.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asHandle, asTopic } from '../message.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic } from '../message.js';
 import { NoSuchTopicError, type FetchRecentArgs } from '../seam.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -735,5 +735,148 @@ describe('every tool honours NoSuchTopicError identically', () => {
       await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } }),
     ) as { messages: unknown[]; nextCursor?: string; topicAbsent?: boolean };
     expect(coldStart).toEqual({ messages: [], topicAbsent: true });
+  });
+});
+
+/**
+ * The tool DESCRIPTION is the whole contract an agent reads. It promised `{ messages, nextCursor }`
+ * unconditionally while two handler paths return no cursor at all (JSON.stringify drops `undefined`),
+ * so an agent doing `since = res.nextCursor` re-issues a since-less read and re-reads the whole recent
+ * window — duplicate content in the session, caused by the doc rather than by the code. Core must not
+ * mint a cursor here (DESIGN §6), so the shape and the sentence have to be pinned TOGETHER: every cell
+ * that omits `nextCursor` also requires the description to say so.
+ */
+describe('parley_fetch_recent returns the key set its description promises', () => {
+  const DISCLOSES_OMISSION = 'nextCursor is omitted';
+
+  const OUTCOMES = {
+    'a normal read': (_plugin: FakePlugin) => ({}),
+    'an absent topic': (plugin: FakePlugin) => {
+      plugin.fetchRecent = async (): Promise<never> => {
+        throw new NoSuchTopicError('ctx');
+      };
+      return { topicAbsent: true };
+    },
+    'a cancelled long-poll': (plugin: FakePlugin) => {
+      plugin.fetchRecent = async (): Promise<never> => {
+        throw new FetchAbortedError();
+      };
+      return { block_ms: 200 };
+    },
+  } as const;
+
+  const KEYS: Record<keyof typeof OUTCOMES, Record<'with a since' | 'without a since', string[]>> = {
+    'a normal read': {
+      'with a since': ['messages', 'nextCursor'],
+      'without a since': ['messages', 'nextCursor'],
+    },
+    'an absent topic': {
+      'with a since': ['messages', 'nextCursor', 'topicAbsent'],
+      'without a since': ['messages', 'topicAbsent'],
+    },
+    'a cancelled long-poll': {
+      'with a since': ['messages', 'nextCursor'],
+      'without a since': ['messages'],
+    },
+  };
+
+  for (const outcome of Object.keys(OUTCOMES) as Array<keyof typeof OUTCOMES>) {
+    it.each(['with a since', 'without a since'] as const)(`${outcome}, %s`, async (start) => {
+      const { client, plugin } = await harness();
+      const extra = OUTCOMES[outcome](plugin) as Record<string, unknown>;
+      const args = { topic: 'ctx', ...(start === 'with a since' ? { since: 'c-7' } : {}), ...extra };
+      const res = await client.callTool({ name: 'parley_fetch_recent', arguments: args });
+      const expected = KEYS[outcome][start];
+      expect(Object.keys(parse(res) as object).sort()).toEqual([...expected].sort());
+
+      // The description and the handler cannot drift apart: a cell that omits the cursor is only
+      // legitimate while the description warns the agent about it.
+      const { tools } = await client.listTools();
+      const description = tools.find((t) => t.name === 'parley_fetch_recent')!.description!;
+      expect(description).toContain('Returns { messages, nextCursor }');
+      if (!expected.includes('nextCursor')) expect(description).toContain(DISCLOSES_OMISSION);
+    });
+  }
+});
+
+/**
+ * The roster is rebuilt from ONE fixed page of the presence topic, so occupancy of that page is a
+ * shared resource: a peer beating far more often than the rest fills it on its own and every quieter
+ * peer disappears from hand-off discovery. The seam cannot page BACKWARD (`fetchRecent` takes a
+ * `since`, not a `before`), so core cannot recover them — which makes the tool description the control,
+ * and an undisclosed silent gap the actual defect. Pin both halves: the flag the handler raises, and
+ * the sentence that tells the agent what a raised flag means.
+ */
+describe('a noisy presence emitter is disclosed, not silently hidden', () => {
+  const PRESENCE_PAGE = 500; // the handler's PRESENCE_FETCH_LIMIT
+
+  it('a flooder that fills the presence page marks the roster truncated', async () => {
+    const { client, plugin } = await harness();
+    const now = Date.now();
+    // A real backend answers with the MOST RECENT window, so model that rather than FakePlugin's
+    // oldest-first slice: the quiet peer's single beat is the one that falls off the page.
+    await postBeat(plugin, 'quiet-peer', ['ctx'], 'hello', now - 1_000, [], 'quiet-1');
+    for (let i = 0; i < PRESENCE_PAGE; i++) {
+      await postBeat(plugin, 'flooder', ['ctx'], 'heartbeat', now - 500, [], `flood-${i}`);
+    }
+    const all = plugin.fetchRecent.bind(plugin);
+    plugin.fetchRecent = async (args) => {
+      const page = await all({ ...args, limit: 10_000 });
+      const limit = args.limit ?? page.messages.length;
+      const messages = page.messages.slice(-limit);
+      return { messages, nextCursor: messages.at(-1)?.cursor ?? page.nextCursor };
+    };
+
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as { users: Array<{ handle: string }>; truncated: boolean };
+
+    expect(out.truncated).toBe(true); // the only signal the caller gets
+    expect(out.users.map((u) => u.handle)).toEqual(['flooder']);
+    expect(out.users.map((u) => u.handle)).not.toContain('quiet-peer');
+
+    const { tools } = await client.listTools();
+    const description = tools.find((t) => t.name === 'parley_list_users')!.description!;
+    expect(description).toContain('truncated=true');
+    // Saying "older offline peers may be missing" would understate it: a LIVE peer can be missing too.
+    expect(description).toMatch(/beats far more often|hide quieter/);
+  });
+
+  /**
+   * `limit` is what the handler ASKS for, not what it gets — nonconformant.ts models a longer page as
+   * a shape core must survive — and every extra beat is another roster entry going verbatim into the
+   * agent's context. Fold at most one page's worth however many the plugin hands back.
+   */
+  it('an over-delivering presence page still yields a bounded roster', async () => {
+    const { client, plugin } = await harness();
+    const now = Date.now();
+    const OVER = PRESENCE_PAGE * 4;
+    plugin.fetchRecent = async () => {
+      const messages = Array.from({ length: OVER }, (_unused, i) => ({
+        topic: PRESENCE_TOPIC,
+        senderHandle: asHandle(`peer-${i}`),
+        content: encodePresence({
+          v: 2 as const,
+          kind: 'heartbeat' as const,
+          at: now - 1_000,
+          topics: ['ctx'],
+          postTopics: [],
+          instanceId: `inst-${i}`,
+        }),
+        timestamp: new Date(i * 1000).toISOString(),
+        backendMsgId: asBackendMsgId(String(i)),
+        cursor: asCursor(String(i)),
+        mentions: [],
+      }));
+      return { messages, nextCursor: asCursor(String(OVER)) };
+    };
+
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as { users: unknown[]; truncated: boolean };
+
+    expect(out.users.length).toBeLessThanOrEqual(PRESENCE_PAGE);
+    expect(out.users.length).toBeGreaterThan(0); // bounded, not emptied
+    expect(out.truncated).toBe(true);
   });
 });

@@ -19,7 +19,11 @@ import { encodePresence, type PresenceKind } from '../engine/presence.js';
 export interface PresenceLoopOptions {
   /** The shared presence topic to announce on (`presence.topic`). */
   presenceTopic: Topic;
-  /** Heartbeat cadence (ms). */
+  /**
+   * Heartbeat cadence (ms). Must be `> 0`: a non-positive cadence is REJECTED, not clamped, because
+   * `setInterval` floors it to ~1 ms and the loop becomes a post storm against the presence topic.
+   * Core's own config schema already guarantees a positive value.
+   */
   heartbeatMs: number;
   /** Clock source; injectable for deterministic tests. Default `Date.now`. */
   now?: () => number;
@@ -62,6 +66,11 @@ export function startPresenceLoop(
   allow: Allowlist,
   opts: PresenceLoopOptions,
 ): PresenceLoop {
+  // `setInterval` floors a non-positive delay to ~1 ms and coerces an out-of-range one to 1 ms, so
+  // both shapes become a post storm against the topic every peer reads.
+  if (!Number.isFinite(opts.heartbeatMs) || opts.heartbeatMs <= 0) {
+    throw new RangeError(`presence heartbeatMs must be a positive finite number (got ${opts.heartbeatMs})`);
+  }
   const now = opts.now ?? Date.now;
   // Subscribed topics and post_topics reach are both static config — capture once and advertise
   // them on every beat. `postTopics` are the raw pattern SOURCES (peers compile them defensively).
@@ -99,7 +108,7 @@ export function startPresenceLoop(
   const enqueue = (kind: PresenceKind): Promise<void> => (tail = tail.then(() => beat(kind)));
 
   void enqueue('hello');
-  const timer = setInterval(() => void enqueue('heartbeat'), heartbeatClamp(opts.heartbeatMs));
+  const timer = setInterval(() => void enqueue('heartbeat'), opts.heartbeatMs);
   // Don't keep the process alive solely for heartbeats.
   timer.unref?.();
 
@@ -112,11 +121,6 @@ export function startPresenceLoop(
       await bounded(enqueue('goodbye'), opts.goodbyeTimeoutMs ?? GOODBYE_TIMEOUT_MS);
     },
   };
-}
-
-/** setInterval treats <=0 as 0 and floors to ~1ms; guard against a misconfigured cadence. */
-function heartbeatClamp(ms: number): number {
-  return ms > 0 ? ms : 1;
 }
 
 /** Resolve when `work` settles or `ms` elapses, whichever is first — never reject, never linger. */

@@ -85,45 +85,67 @@ describe('ReadStateStore', () => {
       ],
     ];
 
-    const orders: Array<[name: string, run: (a: ReadStateStore, b: ReadStateStore) => void]> = [
+    /** One store's write. The store label is what makes two sessions distinguishable. */
+    type Step = [store: 'a' | 'b', topic: string, cursor: string];
+
+    /**
+     * TOPIC OVERLAP is the axis that matters, and the original table had none: every row wrote
+     * DISJOINT topics, so a flush that republished this store's whole in-memory map looked correct.
+     * The regression only shows when two stores touch the SAME topic and one of them then flushes an
+     * unrelated third — the flush rolls the shared topic back to where this store last read it.
+     */
+    const SHAPES: Array<[name: string, steps: Step[]]> = [
+      ['disjoint topics', [['a', 'ctx', '10'], ['b', 'ops', '5']]],
+      ['the same topic', [['a', 'ctx', '10'], ['b', 'ctx', '20']]],
       [
-        'sequential',
-        (a, b) => {
-          a.set(asTopic('ctx'), asCursor('10'));
-          b.set(asTopic('ops'), asCursor('5'));
-        },
+        'the same topic, then an unrelated third',
+        [['a', 'ctx', '10'], ['b', 'ctx', '20'], ['a', 'notes', '7']],
       ],
       [
-        'interleaved',
-        (a, b) => {
-          a.set(asTopic('ctx'), asCursor('1'));
-          b.set(asTopic('ops'), asCursor('2'));
-          a.set(asTopic('ctx'), asCursor('10'));
-          b.set(asTopic('ops'), asCursor('5'));
-        },
-      ],
-      [
-        'reversed',
-        (a, b) => {
-          b.set(asTopic('ops'), asCursor('5'));
-          a.set(asTopic('ctx'), asCursor('10'));
-        },
+        'the same topic advanced by both, alternating',
+        [['a', 'ctx', '10'], ['b', 'ctx', '20'], ['a', 'ctx', '30'], ['b', 'ops', '4']],
       ],
     ];
 
-    for (const [pathName, make] of paths) {
-      for (const [orderName, run] of orders) {
-        it(`${pathName}, written ${orderName}`, () => {
-          const path = make();
-          const a = new ReadStateStore(path);
-          const b = new ReadStateStore(path);
-          run(a, b);
+    const ORDERS: Array<[name: string, arrange: (steps: Step[]) => Step[]]> = [
+      ['in order', (steps) => steps],
+      ['reversed', (steps) => [...steps].reverse()],
+      // Each store flushes an earlier position for every topic first, so the two stores' writes
+      // interleave rather than running as two clean halves.
+      ['interleaved with earlier positions', (steps) => [...steps.map(([s, t, c]) => [s, t, `0${c}`] as Step), ...steps]],
+    ];
+
+    for (const [shapeName, steps] of SHAPES) {
+      for (const [orderName, arrange] of ORDERS) {
+        it(`${shapeName}, written ${orderName}`, () => {
+          const path = tmpFile();
+          const stores = { a: new ReadStateStore(path), b: new ReadStateStore(path) };
+          const expected: Record<string, string> = {};
+          for (const [store, topic, cursor] of arrange(steps)) {
+            stores[store].set(asTopic(topic), asCursor(cursor));
+            expected[topic] = cursor; // last writer wins, per topic — the strongest correct rule
+          }
+          // The WHOLE map, not two known keys: nothing may hold a value older than the last one
+          // written to it, and no topic may vanish.
+          expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(expected);
           const reopened = new ReadStateStore(path);
-          expect(reopened.get(asTopic('ctx'))).toBe('10');
-          expect(reopened.get(asTopic('ops'))).toBe('5');
+          for (const [topic, cursor] of Object.entries(expected)) {
+            expect(reopened.get(asTopic(topic))).toBe(cursor);
+          }
         });
       }
     }
+
+    it.each(paths)('two stores on %s keep both positions', (_name, make) => {
+      const path = make();
+      const a = new ReadStateStore(path);
+      const b = new ReadStateStore(path);
+      a.set(asTopic('ctx'), asCursor('10'));
+      b.set(asTopic('ops'), asCursor('5'));
+      const reopened = new ReadStateStore(path);
+      expect(reopened.get(asTopic('ctx'))).toBe('10');
+      expect(reopened.get(asTopic('ops'))).toBe('5');
+    });
 
     it('distinct instanceIds stay fully independent', () => {
       process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), 'parley-rs-xdg-'));

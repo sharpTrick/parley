@@ -5,9 +5,10 @@ import type { Message } from '../message.js';
 export const CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel';
 
 /**
- * The complete set of meta keys core emits. Keep it a closed union of identifiers, so that a
- * hyphenated key (`msg-id`) is a compile error rather than an attribute Claude Code SILENTLY DROPS
- * at render time (channels gate).
+ * The complete set of meta keys core emits. Keep every one an identifier — `msg-id` and friends are
+ * SILENTLY DROPPED by Claude Code at render time (channels gate), and TypeScript places no identifier
+ * constraint on a string-literal type, so nothing here would flag one. The key shape and the exact
+ * key set are pinned by the assertions in channel-emit.test.ts.
  */
 type ChannelMetaKey = 'topic' | 'sender' | 'cursor' | 'msg_id' | 'mentions';
 

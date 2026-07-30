@@ -6,7 +6,11 @@ import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
 // a caller can reach it with. Enumerating blowup shapes is not enough — the class this guards is
 // "a source whose backtracking is exponential without containing a nested quantifier at all"
 // (alternation chains, optional-atom chains), which no quantifier-counting screen can see.
-const PER_MATCH_BUDGET_MS = 50;
+// Generous on purpose. The defect is EXPONENTIAL — the shapes this guards take seconds, or never
+// return — so three orders of magnitude of headroom costs no detection power, while a tight bound
+// fails on scheduler jitter instead: 50ms flaked at 59ms and 81ms under full-suite CPU contention,
+// which is a red suite that says nothing about the screen.
+const PER_MATCH_BUDGET_MS = 500;
 
 const chain = (unit: string, n: number): string => unit.repeat(n);
 

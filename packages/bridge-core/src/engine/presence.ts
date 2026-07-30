@@ -38,9 +38,20 @@ export const DEFAULT_PRESENCE_TOPIC = 'parley-presence';
 
 /**
  * Cap the topics (and, independently, the post-pattern sources) a single record may advertise —
- * a hostile peer can't bloat the roster or hand us an unbounded pattern list (DESIGN §14).
+ * a hostile peer can't bloat the roster or hand us an unbounded pattern list (DESIGN §14). Applied
+ * at decode per BEAT and again to the union {@link computeRoster} folds across a handle's instances:
+ * a per-beat cap alone does not compose, because one writer mints as many `instanceId`s as it likes.
  */
 export const MAX_RECORD_TOPICS = 64;
+
+/**
+ * Cap the instances of ONE handle a roster entry folds. Each instance contributes its own capped
+ * topics/postTopics, and the number of instances is attacker-chosen (a fresh `instanceId` per beat),
+ * so this is what stops the per-beat caps from being multiplied by the presence page size — both in
+ * roster memory / `parley_list_users` output and in the untrusted patterns `filterReachable` compiles
+ * (DESIGN §14). The freshest-beating instances are the ones kept.
+ */
+export const MAX_HANDLE_INSTANCES = 8;
 
 /**
  * Cap the length of an untrusted `instanceId` we retain — a hostile beat can't hand us an
@@ -217,8 +228,10 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
  * catches up on next start, so it is a valid hand-off target — as long as it was last seen within
  * `sinceMs`; older handles are dropped. `online` is independent of `sinceMs` (a live handle always
  * appears). A handle's advertised `topics`/`postTopics` are the union across its live instances
- * when online, or the single last-known beat when offline. Entries sort most-recently-seen first so
- * the freshest hand-off candidates lead (online naturally floats up).
+ * when online, or the single last-known beat when offline — bounded by {@link MAX_HANDLE_INSTANCES}
+ * instances and {@link MAX_RECORD_TOPICS} unioned entries, because the number of instances one
+ * writer mints is untrusted. Entries sort most-recently-seen first so the freshest hand-off
+ * candidates lead (online naturally floats up).
  */
 /**
  * Which handle a beat belongs to. The seam does not require a backend to carry the posting identity
@@ -228,6 +241,37 @@ export function decodePresence(content: string, nowMs?: number): PresenceRecord 
  */
 function emitterOf(rec: PresenceRecord, m: Message): Handle {
   return rec.handle === undefined ? m.senderHandle : asHandle(rec.handle);
+}
+
+/**
+ * Record a handle's latest beat per instance, keeping at most {@link MAX_HANDLE_INSTANCES} of them.
+ * Re-inserting on every beat orders the map least-recently-heard first, so the evicted instance is
+ * the stalest one rather than a long-lived peer a flood of fresh `instanceId`s pushed out.
+ */
+function retainFreshest(insts: Map<string, PresenceRecord>, rec: PresenceRecord): void {
+  insts.delete(rec.instanceId);
+  insts.set(rec.instanceId, rec);
+  for (const stalest of insts.keys()) {
+    if (insts.size <= MAX_HANDLE_INSTANCES) break;
+    insts.delete(stalest);
+  }
+}
+
+/**
+ * Union one untrusted string field across the instances feeding a roster entry, re-applying
+ * {@link MAX_RECORD_TOPICS} to the RESULT. This is where the per-beat caps stop composing: without
+ * it, `instances × MAX_RECORD_TOPICS × MAX_TOPIC_LEN` bytes of one writer's strings reach roster
+ * memory, `parley_list_users` output, and the regex compiler in {@link filterReachable}.
+ */
+function unionCapped(from: readonly PresenceRecord[], pick: (r: PresenceRecord) => string[]): string[] {
+  const out = new Set<string>();
+  for (const rec of from) {
+    for (const value of pick(rec)) {
+      out.add(value);
+      if (out.size >= MAX_RECORD_TOPICS) return [...out];
+    }
+  }
+  return [...out];
 }
 
 export function computeRoster(messages: Message[], nowMs: number, opts: RosterOptions): RosterEntry[] {
@@ -243,7 +287,7 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
       insts = new Map();
       byHandle.set(emitter, insts);
     }
-    insts.set(rec.instanceId, rec); // ascending cursor order ⇒ last write wins per instance
+    retainFreshest(insts, rec);
   }
   const roster: RosterEntry[] = [];
   for (const [handle, insts] of byHandle) {
@@ -253,15 +297,18 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
     // and cannot read as "live" or dominate the recency sort. Legitimate within-skew beats are kept.
     const live = recs.filter((r) => r.kind !== 'goodbye' && nowMs - r.at < opts.ttlMs);
     const online = live.length > 0;
-    const lastSeenMs = Math.max(...recs.map((r) => r.at)); // freshest beat of ANY kind
+    // Keep this a reduce rather than `Math.max(...)`: the argument count would be the instance count,
+    // which a plugin returning a page longer than the requested limit chooses, and a spread of that
+    // many arguments throws RangeError instead of producing a roster.
+    const lastSeenMs = recs.reduce((max, r) => (r.at > max ? r.at : max), Number.NEGATIVE_INFINITY);
     if (!online && nowMs - lastSeenMs >= opts.sinceMs) continue; // offline & too stale ⇒ drop
     // Topics/reach: union across live instances when online; the single last-known beat when offline.
     const from = online ? live : [recs.reduce((a, b) => (b.at >= a.at ? b : a))];
     roster.push({
       handle,
       online,
-      topics: [...new Set(from.flatMap((r) => r.topics))],
-      postTopics: [...new Set(from.flatMap((r) => r.postTopics))],
+      topics: unionCapped(from, (r) => r.topics),
+      postTopics: unionCapped(from, (r) => r.postTopics),
       lastSeenMs,
     });
   }

@@ -96,11 +96,12 @@ export type BackendFactory = () => Promise<ConformanceContext>;
 ```
 
 `runConformanceSuite` validates that shape at runtime (`assertConformanceContext`) and fails
-naming the backend and the offending field. The runtime check is what enforces "required": **no
-backend package typechecks its own test sources** (only this package and `bridge-net-util` have a
-`tsconfig.test.json`, and neither compiles a backend's fixture), and vitest transpiles without
-typechecking — so a backend's context literal is only ever seen at runtime, and a missing field
-would otherwise silently delete the cases that read it rather than lose a build.
+naming the backend and the offending field. The runtime check is what enforces "required":
+**some backend packages still do not typecheck their own test sources**, and vitest transpiles
+without typechecking — so for those, a context literal is only ever seen at runtime, and a missing
+field would silently delete the cases that read it rather than lose a build. A package that adds a
+`tsconfig.test.json` gets the field checked at compile time as well; the runtime check stays because
+it is the only thing covering the ones that have not.
 
 Then, in the plugin package's own test file:
 
