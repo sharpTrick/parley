@@ -31,16 +31,17 @@ export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 export const STOP_POLL_MS = 25;
 
 /**
- * Normalize a backoff a PLUGIN chose itself (a reconnect ladder, a poll interval) to
+ * Normalize a backoff a PLUGIN chose itself (a reconnect ladder, a poll interval) into
  * `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`. `Number(null)` and `Number('')` are both `0`, so an
- * unchecked parse reads as "retry now"; this floor turns that into a wait.
+ * unchecked parse reads as "retry now"; the floor turns that — and every other figure under it —
+ * into a wait, so a ladder built on a misparsed hint cannot hot-spin.
  *
  * It does NOT bound a wait the server asked for, and {@link fetchWithRetry} deliberately does not
  * put it on a stated hint: see there.
  */
 export function clampBackoff(ms: number | undefined): number {
-  if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return DEFAULT_BACKOFF_MS;
-  return Math.min(ms, MAX_BACKOFF_MS);
+  if (ms === undefined || !Number.isFinite(ms)) return DEFAULT_BACKOFF_MS;
+  return Math.min(Math.max(ms, DEFAULT_BACKOFF_MS), MAX_BACKOFF_MS);
 }
 
 /**
@@ -103,15 +104,25 @@ const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
 const ROUTE_WORD_CHARS = 8;
 
 /**
- * How a method name is spelled at any length: `getUpdates`, `conversations`, `chat.postMessage`.
- * Keep this exemption, so that redaction cannot strike a segment out of the PROSE of an error body:
+ * How a method name is spelled: `getUpdates`, `conversations`, `chat.postMessage`. Keep this
+ * exemption, so that redaction cannot strike a segment out of the PROSE of an error body:
  * Telegram's own 409 reads "can't use getUpdates method while webhook is active", and an operator
  * shown "can't use <redacted> method" has been told less than nothing.
  */
 const ROUTE_WORD = /^[A-Za-z.]+$/;
 
+/**
+ * Longest segment the exemption above covers. Keep a ceiling on it, so that a credential spelled
+ * with no digit and no punctuation — a 32-character alphabetic webhook token, a dotted JWT — cannot
+ * buy its way out of redaction by reading as a very long method name.
+ */
+const METHOD_NAME_CHARS = 24;
+
+const routingVocabulary = (part: string): boolean =>
+  part.length <= METHOD_NAME_CHARS && ROUTE_WORD.test(part);
+
 const carriesSecret = (part: string): boolean =>
-  part.includes(':') || (part.length > ROUTE_WORD_CHARS && !ROUTE_WORD.test(part));
+  part.includes(':') || (part.length > ROUTE_WORD_CHARS && !routingVocabulary(part));
 
 /**
  * Both sides of the percent-encoding boundary. `URL` hands userinfo back ENCODED (a password's own
@@ -350,6 +361,17 @@ async function buffered(res: Response, maxBytes: number, doomed: boolean): Promi
 }
 
 /**
+ * Whether `err` IS the caller's own abort, rather than something that failed while the caller
+ * happened to be aborting. Keep the test on the ERROR, so that a transport failure racing a
+ * plugin's `disconnect()` still leaves through the labelled, redacted envelope: reading the
+ * SIGNAL's state alone hands that caller a raw `request to <credential-bearing URL> failed`.
+ */
+function isCallerAbort(err: unknown, signal: AbortSignal): boolean {
+  if (!signal.aborted) return false;
+  return err === (signal.reason as unknown) || (err instanceof Error && err.name === 'AbortError');
+}
+
+/**
  * One attempt, bounded by `budgetMs`. Without this an unanswered request outlives every bound the
  * options declare — `isStopped` is never consulted while a request is in flight, so a stalled API
  * pins the MCP tool call open for undici's own default and `disconnect()` cannot unblock it.
@@ -362,15 +384,13 @@ async function fetchOnce(
 ): Promise<Response> {
   const { label } = opts;
   const deadline = AbortSignal.timeout(budgetMs);
-  const signal =
-    init.signal === undefined || init.signal === null
-      ? deadline
-      : AbortSignal.any([init.signal, deadline]);
+  const caller = init.signal ?? undefined;
+  const signal = caller === undefined ? deadline : AbortSignal.any([caller, deadline]);
   try {
     const res = await fetch(url, { ...init, signal });
     return await buffered(res, opts.maxBytes, !opts.keeps(res));
   } catch (err) {
-    if (init.signal?.aborted === true) throw err;
+    if (caller !== undefined && isCallerAbort(err, caller)) throw caller.reason;
     if (deadline.aborted) throw new Error(`${label} → deadline: no response within ${budgetMs}ms`);
     if (err instanceof BodyTooLargeError) throw new Error(`${label} → body: ${err.message}`);
     throw new Error(`${label} → transport: ${sanitizeBody(redactUrls(errorText(err), url))}`);

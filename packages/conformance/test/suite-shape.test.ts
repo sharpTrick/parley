@@ -1,6 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { CLAUSES, CONTEXT_FIELDS, PAGING_VOLUME, pageLimitsFor } from '@sharptrick/parley-conformance';
+import {
+  CLAUSES,
+  CONTEXT_FIELDS,
+  PAGING_VOLUME,
+  pageLimitsFor,
+  SINCELESS_BLOCK_MS,
+  SINCELESS_RETURN_MS,
+} from '@sharptrick/parley-conformance';
 
 const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
@@ -254,6 +261,50 @@ describe('the suite grades every backend it certifies', () => {
     });
   });
 
+  /**
+   * A latency bound compared against the budget that produced it discriminates nothing: "the plugin
+   * returned inside the budget it was handed" is true of a plugin that parked for all but the last
+   * millisecond of it. The since-less blocking arm offered 19 000 ms and asserted `< 19_000`, so a
+   * plugin that parks on every cursor-less `parley_fetch_recent` was certified.
+   *
+   * The paired half is a BROKEN_VARIANTS control that parks for a FRACTION of the budget — this row
+   * forbids the degenerate bound, the control forbids a merely lenient one.
+   */
+  describe('no elapsed-time bound is the budget that produced it', () => {
+    const EXPORTED: Record<string, number> = { SINCELESS_BLOCK_MS, SINCELESS_RETURN_MS };
+    const figure = (token: string): number =>
+      EXPORTED[token] ?? Number(token.replaceAll('_', ''));
+
+    const budgetsOf = (body: string): string[] =>
+      [...body.matchAll(/blockMs:\s*([A-Za-z_][\w]*|[\d_]+)/g)].map((m) => m[1] as string);
+    const boundsOf = (body: string): string[] =>
+      [...body.matchAll(/toBeLessThan\(\s*([A-Za-z_][\w]*|[\d_]+)\s*\)/g)].map((m) => m[1] as string);
+
+    const blocking = (): { title: string; body: string }[] =>
+      cases().filter((c) => budgetsOf(c.body).length > 0);
+
+    it('finds cases that offer a blockMs budget, so the row below grades something', () => {
+      expect(blocking().length).toBeGreaterThan(0);
+      expect(blocking().flatMap((c) => boundsOf(c.body)).length).toBeGreaterThan(0);
+      expect(figure('SINCELESS_BLOCK_MS')).toBe(SINCELESS_BLOCK_MS);
+      expect(figure('5000')).toBe(5000);
+    });
+
+    it.each(blocking().map((c) => [c.title, c.body] as const))(
+      '"%s" bounds elapsed time strictly under every budget it hands out',
+      (_title, body) => {
+        const budgets = budgetsOf(body).map(figure);
+        for (const token of boundsOf(body)) {
+          expect(
+            budgets,
+            `the elapsed bound \`${token}\` is one of the blockMs budgets this case offers, so a ` +
+              `plugin that parks for the whole budget still satisfies it`,
+          ).not.toContain(figure(token));
+        }
+      },
+    );
+  });
+
   it('reads a testTimeout out of the harness config, so the budget rows below grade something', () => {
     expect(testTimeoutMs()).toBeGreaterThan(0);
     expect(selfImposedBudgets().length).toBeGreaterThan(3);
@@ -263,10 +314,26 @@ describe('the suite grades every backend it certifies', () => {
     expect(ms).toBeLessThan(testTimeoutMs());
   });
 
+  // The teardown must not dereference the binding the CASES use: that binding is assigned only
+  // after validation, so an `await ctx.cleanup()` in `afterEach` throws a TypeError on exactly the
+  // fixture whose live connection most needs closing. Behaviour is graded against `openContext` in
+  // context-validation.test.ts; this is the wiring that has to keep reaching it.
+  it('tears the fixture down through a binding a rejected fixture cannot leave unassigned', () => {
+    const setup = /beforeEach\(async \(\) => \{[\s\S]*?\n {4}\}\);/.exec(source)?.[0];
+    const teardown = /afterEach\(async \(\) => \{[\s\S]*?\n {4}\}\);/.exec(source)?.[0];
+    expect(setup, 'no beforeEach found').toBeDefined();
+    expect(teardown, 'no afterEach found').toBeDefined();
+    expect(setup as string).toContain('openContext');
+    expect(teardown as string).not.toMatch(/\bctx\b/);
+  });
+
   // A required context field nobody reads is a field a fixture author must supply for nothing —
   // and, worse, looks like coverage.
+  // Matched as a property READ rather than as `ctx.<field>`: the teardown deliberately does not go
+  // through `ctx`, and pinning that one spelling would force it back onto the binding a rejected
+  // fixture leaves unassigned.
   it.each(Object.keys(CONTEXT_FIELDS))('reads the required field `%s`', (field) => {
-    expect(source).toContain(`ctx.${field}`);
+    expect(source, `nothing in the suite reads \`${field}\``).toMatch(new RegExp(`\\.${field}\\b`));
   });
 
   // Both arms of each boolean capability must ASSERT. Pinned by name so that deleting the weaker

@@ -16,6 +16,16 @@ import {
 
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
 
+/** The published description, read once: several checks below derive a bound FROM it. */
+const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+
+/** A figure the README states, as the figure — so restating it here cannot drift from the prose. */
+function documentedFigure(pattern: RegExp, what: string): number {
+  const found = pattern.exec(README);
+  if (found === null) throw new Error(`the README no longer states ${what}`);
+  return Number(found[1]);
+}
+
 const OPTS = {
   label: 'Test GET /thing',
   isStopped: () => false,
@@ -369,29 +379,28 @@ describe('fetchWithRetry', () => {
   // that as no hint at all retried at the 500ms default against a server asking for two minutes.
   const HEADER_ROWS: [string, () => string[], number, string][] = [
     ['delay-seconds past the deadline', () => ['60'], 60_000, 'stop'],
-    ['HTTP-date past the deadline', () => [httpDate(120_000)], 120_000, 'stop'],
+    ['HTTP-date past the deadline', () => [pinnedDate(120_000)], 120_000, 'stop'],
     ['delay-seconds well within the deadline', () => ['2'], 2_000, 'retry'],
-    // HTTP-date has one-second granularity, so +3s guarantees only 2s of delay.
-    ['HTTP-date well within the deadline', () => [httpDate(3_000)], 2_000, 'retry'],
+    ['HTTP-date well within the deadline', () => [pinnedDate(3_000)], 3_000, 'retry'],
     // The discriminating pair: above MAX_BACKOFF_MS, which bounds only a backoff we invented, and
     // inside the deadline — so the wait must be the server's full figure, not the 5s clamp. This is
     // the ordinary Slack/Telegram rate limit, and clamping it is what escalates a 429 into a ban.
     ['delay-seconds above the self-imposed clamp', () => ['10'], 10_000, 'retry'],
-    ['HTTP-date above the self-imposed clamp', () => [httpDate(9_000)], 8_000, 'retry'],
+    ['HTTP-date above the self-imposed clamp', () => [pinnedDate(9_000)], 8_000, 'retry'],
     ['zero', () => ['0'], 0, 'retry'],
     ['empty', () => [''], 0, 'retry'],
     ['unparseable', () => ['abc'], 0, 'retry'],
     ['fractional seconds', () => ['0.5'], 500, 'retry'],
     ['negative', () => ['-5'], 0, 'retry'],
-    ['a date already past', () => [httpDate(-60_000)], 0, 'retry'],
+    ['a date already past', () => [pinnedDate(-60_000)], 0, 'retry'],
     ['absent', () => [], 0, 'retry'],
     // Multi-valued: whatever the largest field-value states is the floor, and the whole header is
     // never no-hint just because it carries more than one value.
     ['the same delay-seconds twice', () => ['2', '2'], 2_000, 'retry'],
     ['the same delay-seconds twice, past the deadline', () => ['60', '60'], 60_000, 'stop'],
     ['two different delay-seconds', () => ['2', '10'], 10_000, 'retry'],
-    ['two HTTP-dates', () => [httpDate(3_000), httpDate(9_000)], 8_000, 'retry'],
-    ['a delay-seconds beside an HTTP-date', () => ['2', httpDate(9_000)], 8_000, 'retry'],
+    ['two HTTP-dates', () => [pinnedDate(3_000), pinnedDate(9_000)], 8_000, 'retry'],
+    ['a delay-seconds beside an HTTP-date', () => ['2', pinnedDate(9_000)], 8_000, 'retry'],
     ['a usable value beside an unparseable one', () => ['abc', '10'], 10_000, 'retry'],
     ['two unparseable values', () => ['abc', 'def'], 0, 'retry'],
     // Spellings `Number` accepts and RFC 9110 `delay-seconds` does not. Read as a figure they would
@@ -400,8 +409,20 @@ describe('fetchWithRetry', () => {
     ['an exponent spelling', () => ['1e3'], 0, 'retry'],
   ];
 
+  /**
+   * Keep the response's `Date` and its HTTP-date `Retry-After` on ONE pinned instant, so that a row
+   * asserting a floor cannot fail on the milliseconds the harness itself took: `toUTCString()`
+   * truncates to whole seconds, and a floor stated as `offset - 1000` had no slack left for elapsed
+   * time. Reading both from the same clock also makes the stated floor the exact figure rather than
+   * a second-wide range.
+   */
+  const SERVER_INSTANT = Date.UTC(2026, 6, 30, 12, 0, 0);
+  const pinnedDate = (offsetMs: number): string =>
+    new Date(SERVER_INSTANT + offsetMs).toUTCString();
+
   const headersOf = (values: string[]): Headers => {
     const headers = new Headers();
+    headers.set('date', new Date(SERVER_INSTANT).toUTCString());
     for (const value of values) headers.append('retry-after', value);
     return headers;
   };
@@ -774,6 +795,8 @@ describe('fetchWithRetry', () => {
     ['the credential path segment alone', (u) => new URL(u).pathname.split('/')[1] as string],
   ];
 
+  type Wrap = (fetchImpl: () => Promise<Response>) => () => Promise<Response>;
+
   const VECTORS: [string, (echoed: string) => (() => Promise<Response>) | undefined][] = [
     ['a DNS failure echoing it', (e) => () => Promise.reject(new TypeError(`request to ${e} failed: ENOTFOUND`))],
     [
@@ -786,17 +809,74 @@ describe('fetchWithRetry', () => {
     ['a 4xx body echoing it back', (e) => () => Promise.resolve(res(404, `no route for ${e}`))],
   ];
 
+  /**
+   * What the CALLER's own `signal` is doing when the failure lands — the third axis, because a
+   * plugin's `disconnect()` aborts mid-request and every long-poller holds a controller for exactly
+   * that. A transport failure that RACES the abort is still a transport failure: deciding on the
+   * signal's state rather than on the error's identity took the raw, unlabeled, unredacted
+   * rejection straight out to the caller. None of these vectors IS an abort, so every cell must
+   * still come back inside the envelope.
+   */
+  const SIGNAL_STATES: [string, () => { init: RequestInit; wrap: Wrap }][] = [
+    ['no caller signal', () => ({ init: {}, wrap: (f) => f })],
+    [
+      'a caller signal aborted before the call',
+      () => {
+        const controller = new AbortController();
+        controller.abort(new Error('torn down'));
+        return { init: { signal: controller.signal }, wrap: (f) => f };
+      },
+    ],
+    [
+      'a caller signal aborted in the same turn as the failure',
+      () => {
+        const controller = new AbortController();
+        return {
+          init: { signal: controller.signal },
+          wrap: (f) => () => {
+            controller.abort(new Error('torn down'));
+            return f();
+          },
+        };
+      },
+    ],
+  ];
+
   it.each(
     SPELLINGS.flatMap(([spelling, spell]) =>
-      VECTORS.map(([vector, make]) => [`${vector}, ${spelling}`, spell, make] as const),
+      VECTORS.flatMap(([vector, make]) =>
+        SIGNAL_STATES.map(
+          ([state, arm]) => [`${vector}, ${spelling}, ${state}`, spell, make, arm] as const,
+        ),
+      ),
     ),
-  )('never leaks a credential-bearing URL in an error (%s)', async (_label, spell, make) => {
-    vi.stubGlobal('fetch', make(spell(SECRET_URL)));
+  )('never leaks a credential-bearing URL in an error (%s)', async (_label, spell, make, arm) => {
+    const { init, wrap } = arm();
+    vi.stubGlobal('fetch', wrap(make(spell(SECRET_URL)) as () => Promise<Response>));
     const err = await rejects(
-      fetchWithRetry(SECRET_URL, {}, { label: 'Telegram GET /getMe', isStopped: () => false }),
+      fetchWithRetry(SECRET_URL, init, { label: 'Telegram GET /getMe', isStopped: () => false }),
     );
-    expect(err.message).toContain('Telegram GET /getMe');
+    expect(err.message.startsWith('Telegram GET /getMe → ')).toBe(true);
     expect(err.message).not.toContain(CANARY);
+  });
+
+  // The other rejection the caller-signal exit used to let out bare: an oversized body is detected
+  // while READING, not by any signal, so a plugin tearing down mid-read got
+  // `response body exceeded N bytes` with no label and no status for a caller to branch on.
+  it('labels an oversized body even while the caller is aborting', async () => {
+    const controller = new AbortController();
+    vi.stubGlobal('fetch', () => {
+      controller.abort(new Error('torn down'));
+      return Promise.resolve(res(200, 'A'.repeat(4096)));
+    });
+    const err = await rejects(
+      fetchWithRetry(
+        'https://x/y',
+        { signal: controller.signal },
+        { label: 'L', isStopped: () => false, maxBodyBytes: 512 },
+      ),
+    );
+    expect(err.message).toBe('L → body: response body exceeded 512 bytes');
   });
 
   // The other half of the class: not another SPELLING of the same location, but the SHAPE the
@@ -805,10 +885,52 @@ describe('fetchWithRetry', () => {
   // punctuation at all — reached model context whenever a body echoed the bare path, while the one
   // existing path row passed on Telegram's colon. Every row echoes the component ALONE: the whole
   // URL is claimed by the byte-exact split (and by the scheme sweep) in the table above.
-  const SHAPES: [string, string][] = [
+  /**
+   * The alphabets real vendors mint credentials from, generated to length rather than hand-picked.
+   * Three hand-picked shapes passed only because each happened to carry a digit or a hyphen: the
+   * all-alphabetic and dotted-JWT shapes read as method names to the route-word exemption and
+   * reached model context in full.
+   */
+  const cycle = (alphabet: string, n: number): string =>
+    Array.from({ length: n }, (_, i) => alphabet[i % alphabet.length]).join('');
+
+  const dottedJwt = (n: number): string => {
+    const each = Math.max(1, Math.floor((n - 2) / 3));
+    return [
+      cycle('eyJhbGciOiJIUzIINiJ', each),
+      cycle('eyJzdWIiOiJhYmMifQ', each),
+      cycle('SflKxwRJSMeKKFtwo', Math.max(1, n - 2 - 2 * each)),
+    ].join('.');
+  };
+
+  const ALPHABETS: [string, (n: number) => string][] = [
+    ['base64url', (n) => cycle('QWERTYuiop-_asdFGH12345jklZXCVbnm', n)],
+    ['base62 alphanumeric', (n) => cycle('QWERTYuiopasdFGH12345jklZXCVbnm', n)],
+    ['all-lowercase alphabetic', (n) => cycle('qwertyuiopasdfghjklzxcvbnm', n)],
+    ['all-mixed-case alphabetic', (n) => cycle('zSXqVvNlrIWmEuBhTgKcPdJfAeRyQoUn', n)],
+    ['hex', (n) => cycle('0123456789abcdef', n)],
+    ['base32', (n) => cycle('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567', n)],
+    ['a dotted three-part JWT', dottedJwt],
+  ];
+
+  /**
+   * One character past the exemption the README states, and the two lengths Discord and GitHub
+   * actually mint. Read off the README, so that moving the bound moves the table with it rather
+   * than leaving a row that grades the old one.
+   */
+  const methodNameBound = (): number =>
+    documentedFigure(
+      /method-name exemption is bounded at \*\*(\d+) characters\*\*/,
+      'the method-name exemption bound',
+    );
+
+  const secretLengths = (): number[] => [methodNameBound() + 1, 68];
+
+  const SHAPES = (): [string, string][] => [
     ['colon-joined', `bot123:${CANARY}`],
-    ['opaque, no punctuation at all', CANARY.replaceAll('-', '')],
-    ['base64url, with - and _', `dGtu-${CANARY}_9`],
+    ...ALPHABETS.flatMap(([alphabet, mint]) =>
+      secretLengths().map((n): [string, string] => [`${alphabet} × ${n}`, mint(n)]),
+    ),
   ];
 
   const LOCATIONS: [string, (secret: string) => { url: string; fragment: string }][] = [
@@ -818,6 +940,13 @@ describe('fetchWithRetry', () => {
         url: `https://api.example.test/api/webhooks/12345/${s}`,
         fragment: `/api/webhooks/12345/${s}`,
       }),
+    ],
+    [
+      // The row above echoes the WHOLE path, which the pathname rule claims on the digits in
+      // `/12345/` whatever the token looks like — so it grades the shape of nothing. Only the bare
+      // segment reaches the per-segment rule, which is where the method-name exemption lives.
+      'a path segment echoed on its own',
+      (s) => ({ url: `https://api.example.test/api/webhooks/12345/${s}`, fragment: s }),
     ],
     [
       'userinfo',
@@ -837,7 +966,7 @@ describe('fetchWithRetry', () => {
 
   it.each(
     LOCATIONS.flatMap(([location, build]) =>
-      SHAPES.flatMap(([shape, secret]) =>
+      SHAPES().flatMap(([shape, secret]) =>
         VECTORS.map(
           ([vector, make]) =>
             [`${location}, ${shape}, ${vector}`, build(secret), secret, make] as const,
@@ -856,6 +985,11 @@ describe('fetchWithRetry', () => {
   // The other direction, which is a defect too: a path segment is also a WORD, and every API's
   // error prose uses its own method names. Redacting on length alone struck `getUpdates` out of
   // Telegram's own 409 and left the operator reading "can't use <redacted> method".
+  // The bound is a BOUND, not a coincidence: a segment exactly at the documented length is still
+  // routing vocabulary, and the generated table above starts one character past it. Deleting this
+  // row would let the exemption shrink to nothing while every leak row stayed green.
+  const atBound = (): string => cycle('conversations.history.list', methodNameBound());
+
   it.each([
     [
       'a method name beside a credential',
@@ -874,6 +1008,12 @@ describe('fetchWithRetry', () => {
       'https://api.example.test/api/chat.postMessage',
       'chat.postMessage requires a scope you do not have',
       'chat.postMessage',
+    ],
+    [
+      'a method name exactly at the documented exemption bound',
+      `https://api.example.test/api/${atBound()}`,
+      `${atBound()} is not enabled for this workspace`,
+      atBound(),
     ],
   ])('keeps %s in the body it explains', async (_label, url, body, word) => {
     vi.stubGlobal('fetch', () => Promise.resolve(res(409, body)));
@@ -912,14 +1052,71 @@ function httpDate(offsetMs: number): string {
   return new Date(Date.now() + offsetMs).toUTCString();
 }
 
+/**
+ * A normalizer whose stated output range is not the range it produces is the whole defect: the
+ * function documented `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]` and returned 1 for 1, which is the
+ * hot-spin the floor exists to prevent. So the interval is PARSED out of the README and the docs'
+ * own claim is what the sweep below is graded against — a table of hand-listed pairs pinned the
+ * contradiction as intended behaviour instead.
+ */
 describe('clampBackoff', () => {
+  const documentedInterval = (): [number, number] => {
+    const found = /into `\[(\w+), (\w+)\]`/.exec(README);
+    if (found === null) throw new Error("the README no longer states clampBackoff's interval");
+    const value = (name: string): number => {
+      const v = (api as unknown as Record<string, unknown>)[name];
+      expect(typeof v, `\`${name}\` is not an exported number`).toBe('number');
+      return v as number;
+    };
+    return [value(found[1] as string), value(found[2] as string)];
+  };
+
+  const SWEEP = [
+    ...Array.from({ length: 41 }, (_, i) => i),
+    ...Array.from({ length: 41 }, (_, i) => i * 250),
+    -1e9,
+    -1,
+    0.5,
+    499.9,
+    1e9,
+  ];
+
+  it('reads an interval out of the README, so the rows below grade something', () => {
+    const [lo, hi] = documentedInterval();
+    expect(lo).toBeGreaterThan(0);
+    expect(hi).toBeGreaterThan(lo);
+    expect(SWEEP.some((ms) => ms < lo)).toBe(true);
+    expect(SWEEP.some((ms) => ms > hi)).toBe(true);
+  });
+
+  it('lands every finite input inside the documented interval', () => {
+    const [lo, hi] = documentedInterval();
+    for (const ms of SWEEP) {
+      const out = clampBackoff(ms);
+      expect(out, `clampBackoff(${ms})`).toBeGreaterThanOrEqual(lo);
+      expect(out, `clampBackoff(${ms})`).toBeLessThanOrEqual(hi);
+    }
+  });
+
+  it('is the identity on everything already inside the interval', () => {
+    const [lo, hi] = documentedInterval();
+    for (const ms of SWEEP.filter((n) => n >= lo && n <= hi)) expect(clampBackoff(ms)).toBe(ms);
+  });
+
+  it.each([undefined, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'reads the unusable input %s as the documented lower bound',
+    (bad) => {
+      expect(clampBackoff(bad as number | undefined)).toBe(documentedInterval()[0]);
+    },
+  );
+
   it.each([
     [undefined, DEFAULT_BACKOFF_MS],
     [0, DEFAULT_BACKOFF_MS],
     [-1, DEFAULT_BACKOFF_MS],
-    [Number.NaN, DEFAULT_BACKOFF_MS],
-    [Number.POSITIVE_INFINITY, DEFAULT_BACKOFF_MS],
-    [1, 1],
+    [1, DEFAULT_BACKOFF_MS],
+    [DEFAULT_BACKOFF_MS - 1, DEFAULT_BACKOFF_MS],
+    [DEFAULT_BACKOFF_MS, DEFAULT_BACKOFF_MS],
     [MAX_BACKOFF_MS, MAX_BACKOFF_MS],
     [MAX_BACKOFF_MS + 1, MAX_BACKOFF_MS],
     [1e9, MAX_BACKOFF_MS],
@@ -1091,7 +1288,7 @@ describe('delay', () => {
 // The README is the only description an npm consumer reads, and every exported name is a semver
 // commitment. Generated from the entry point, so a new export fails until it is documented.
 describe('README', () => {
-  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const readme = README;
 
   // `toContain(name)` over the whole file counts incidental prose as documentation: short names
   // like `delay` match a sentence that never mentions the export. Require the name in a code span.
@@ -1284,5 +1481,81 @@ describe('README', () => {
         .filter((n) => pkg.description.toLowerCase().includes(n));
       expect(named).toEqual([]);
     });
+  });
+});
+
+/**
+ * Every export here is a semver commitment the whole workspace publishes in lockstep, so a name no
+ * consumer imports is a promise kept for nobody. `clampBackoff` reached this state unnoticed: its
+ * only trace outside this package was a COMMENT in a backend describing behaviour it does not have.
+ * Derived from the entry point rather than a list, so the next dead export fails here instead of
+ * shipping by default — and keeping one is a decision that has to be written down.
+ */
+describe('every export earns its place', () => {
+  const packagesDir = new URL('../../', import.meta.url);
+  const SELF = '@sharptrick/parley-net-util';
+
+  const INTENTIONALLY_UNCONSUMED: Record<string, string> = {
+    clampBackoff:
+      'the applier of MAX_BACKOFF_MS, which three backends read and two document by name',
+    DEFAULT_MAX_ATTEMPTS: 'the documented default of FetchWithRetryOptions.maxAttempts',
+    MAX_RESPONSE_BYTES: 'the documented default of FetchWithRetryOptions.maxBodyBytes',
+    STOP_POLL_MS: 'the documented bound on how long disconnect waits on a backoff',
+  };
+
+  /**
+   * Comments stripped, so that a name mentioned only in prose does not read as a consumer — which
+   * is precisely how the dead export looked consumed.
+   */
+  const consumerFiles = (): { path: string; code: string }[] => {
+    const out: { path: string; code: string }[] = [];
+    for (const dir of readdirSync(packagesDir)) {
+      if (dir === 'bridge-net-util') continue;
+      for (const sub of ['src', 'test']) {
+        let names: string[] = [];
+        try {
+          names = readdirSync(new URL(`${dir}/${sub}/`, packagesDir));
+        } catch {
+          continue;
+        }
+        for (const name of names.filter((n) => n.endsWith('.ts'))) {
+          const path = `${dir}/${sub}/${name}`;
+          const text = readFileSync(new URL(path, packagesDir), 'utf8');
+          if (!text.includes(SELF)) continue;
+          out.push({
+            path,
+            code: text.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, ''),
+          });
+        }
+      }
+    }
+    return out;
+  };
+
+  const consumers = (name: string): string[] =>
+    consumerFiles()
+      .filter(({ code }) => new RegExp(`\\b${name}\\b`).test(code))
+      .map(({ path }) => path);
+
+  it('finds consumers at all, so the rows below are not reading an empty set', () => {
+    expect(consumerFiles().length).toBeGreaterThan(5);
+    expect(consumers('fetchWithRetry').length).toBeGreaterThan(3);
+    expect(Object.keys(api).length).toBeGreaterThan(5);
+  });
+
+  it.each(Object.keys(api).sort())('`%s` is imported somewhere, or kept on purpose', (name) => {
+    const importers = consumers(name);
+    if (importers.length > 0) {
+      expect(
+        INTENTIONALLY_UNCONSUMED[name],
+        `\`${name}\` has consumers (${importers[0] as string}) — drop it from INTENTIONALLY_UNCONSUMED`,
+      ).toBeUndefined();
+      return;
+    }
+    expect(
+      INTENTIONALLY_UNCONSUMED[name],
+      `nothing under packages/*/src or packages/*/test imports \`${name}\` — delete it, or record ` +
+        `in INTENTIONALLY_UNCONSUMED why this package still commits to the name`,
+    ).toBeDefined();
   });
 });

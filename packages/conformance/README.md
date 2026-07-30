@@ -48,7 +48,10 @@ them stops owning a case — a conformance clause used to be deletable with noth
 - distinct senders are not collapsed onto one another;
 - blockMs is honoured natively or ignored promptly — never a hang: it wakes on a concurrent post
   and returns empty at timeout on a `supportsBlockingFetch` backend, and returns promptly and empty
-  on one that declares it `false`. The hint is optional; hanging on it is not;
+  on one that declares it `false`. The hint is optional; hanging on it is not. A since-LESS read
+  carrying a block budget must come back in a FRACTION of it (`SINCELESS_RETURN_MS`), not merely
+  inside it: that is the hot path for every `parley_fetch_recent` an agent makes before it holds a
+  cursor, and a bound set at the budget itself certifies a plugin that parks for all of it;
 - a post landing in the window between a blocking fetch issuing its read and registering its
   waiter is not missed — a blocking fetch is not missed by 0-3ms of race;
 - a backend that declares `carriesSenderIdentity: false` still reports ONE stable, non-empty

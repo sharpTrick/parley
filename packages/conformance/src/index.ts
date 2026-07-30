@@ -6,10 +6,10 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { assertConformanceContext, type BackendFactory, type ConformanceContext } from './factory.js';
+import { type BackendFactory, type ConformanceContext, openContext } from './factory.js';
 
 export type { BackendFactory, ConformanceContext } from './factory.js';
-export { assertConformanceContext, CONTEXT_FIELDS } from './factory.js';
+export { assertConformanceContext, CONTEXT_FIELDS, openContext } from './factory.js';
 
 const SENDER = asHandle('writer');
 const OTHER = asHandle('second-writer');
@@ -24,14 +24,20 @@ const DRAIN_PAGE = 500;
 const READER_BUDGET_MS = 15_000;
 
 /**
- * Budget offered to the since-less blocking read, and the bound on how long that read may take.
- *
- * Keep it just under the harness's own per-case timeout: a since-less window fetch costs SECONDS on
- * a loaded Matrix homeserver, and the assertion has to read as "the plugin did not spend the
- * budget", never as a grade of the backend's latency. At this size a read that trips it has already
- * spent more than the rest of the case leaves, so it cannot be the marginal cause of a red.
+ * Budget offered to the since-less blocking read. Keep it well under the harness's own per-case
+ * timeout, so that a plugin which parks for the whole thing FAILS the bound below instead of being
+ * killed by vitest — a generic timeout names neither the plugin's behaviour nor this clause.
  */
-const SINCELESS_BLOCK_MS = 19_000;
+export const SINCELESS_BLOCK_MS = 12_000;
+
+/**
+ * How long that read may take. A bound compared against the BUDGET grades nothing: a plugin parking
+ * for 95% of it still returns "under the budget", which is the hot path for every
+ * `parley_fetch_recent` an agent makes before it holds a cursor. Keep this a fraction, so that the
+ * assertion reads as "the plugin did not spend the budget" — while still leaving seconds of
+ * headroom, because a since-less window fetch costs a loaded Matrix homeserver real time.
+ */
+export const SINCELESS_RETURN_MS = SINCELESS_BLOCK_MS / 4;
 
 /** The volume the paging clause is graded over. Exported so its row generator can be self-tested. */
 export const PAGING_VOLUME: readonly string[] = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
@@ -135,6 +141,24 @@ export const CLAUSES: readonly string[] = [
 ];
 
 /**
+ * What the suite asserts that is neither a `Message` FIELD nor a seam CALL. The clause↔variant and
+ * field↔variant mappings both stop above these, which is how five cursor and limit assertions could
+ * be deleted at once — negative control included — with this package staying green. Each term owns a
+ * `BROKEN_VARIANTS` entry, exactly as every `Message` field does.
+ *
+ * - `nextCursor-agreement`: a page's `nextCursor` is the cursor of the last row IT returned, never
+ *   the topic's tail — reporting the tail on a truncated page drops everything in between.
+ * - `nextCursor-stability`: an empty page's cursor does not move, so a drained catch-up loop stays
+ *   drained instead of re-reading the window forever.
+ * - `limit-honoured`: a page never carries more rows than `limit`.
+ */
+export const ASSERTED_PROPERTIES: readonly string[] = [
+  'nextCursor-agreement',
+  'nextCursor-stability',
+  'limit-honoured',
+];
+
+/**
  * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend
  * conforms iff: stable-unique backendMsgId AND monotonic, in-order, exclusive-`since` cursor
  * delivery. Write once here; run against every backend via {@link BackendFactory}.
@@ -142,11 +166,16 @@ export const CLAUSES: readonly string[] = [
 export function runConformanceSuite(name: string, factory: BackendFactory): void {
   describe(`seam conformance: ${name}`, () => {
     let ctx: ConformanceContext;
+    let live: ConformanceContext | undefined;
     beforeEach(async () => {
-      ctx = assertConformanceContext(name, await factory());
+      live = undefined;
+      ctx = await openContext(name, factory);
+      live = ctx;
     });
     afterEach(async () => {
-      await ctx.cleanup();
+      const done = live;
+      live = undefined;
+      await done?.cleanup();
     });
 
     it('post → fetchRecent returns messages in order, with unique ids and distinct cursors', async () => {
@@ -503,7 +532,7 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       const opening = await ctx.plugin.fetchRecent({ topic: t, blockMs: SINCELESS_BLOCK_MS });
       const tail = opening.nextCursor;
       expect(opening.messages.map((m) => m.content)).toEqual(['old']);
-      expect(Date.now() - openedAt).toBeLessThan(SINCELESS_BLOCK_MS);
+      expect(Date.now() - openedAt).toBeLessThan(SINCELESS_RETURN_MS);
 
       if (!ctx.supportsBlockingFetch) {
         // The hint is OPTIONAL; hanging on it is not. This is the only case in the suite that ever

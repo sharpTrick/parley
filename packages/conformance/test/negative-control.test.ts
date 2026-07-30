@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { asTopic, buildMessage } from '@sharptrick/parley-core';
-import { CLAUSES } from '@sharptrick/parley-conformance';
+import { ASSERTED_PROPERTIES, CLAUSES } from '@sharptrick/parley-conformance';
 import { BROKEN_VARIANTS, ReferencePlugin } from './reference-plugin.js';
 
 /**
@@ -105,8 +105,22 @@ describe('every Message field the suite reads has a plugin that corrupts it', ()
     ).not.toEqual([]);
   });
 
+  /**
+   * One level down again. `mutates` keyed on a `Message` field or a seam call cannot name an
+   * assertion about the PAGE — `nextCursor` agreeing with the last row returned, a drained cursor
+   * staying put, `limit` being honoured — so five such assertions could be deleted together with
+   * this package, negative control included, staying green.
+   */
+  it.each(ASSERTED_PROPERTIES.map((p) => [p]))('a variant covers `%s`', (property) => {
+    expect(
+      BROKEN_VARIANTS.filter((v) => v.mutates === property).map((v) => v.name),
+      `no BROKEN_VARIANTS entry mutates \`${property}\` — the assertions the suite makes about it ` +
+        `can all be deleted with this package staying green`,
+    ).not.toEqual([]);
+  });
+
   it('every variant names something real as what it corrupts', () => {
-    const vocabulary = new Set([...MESSAGE_FIELDS, ...SEAM_CALLS]);
+    const vocabulary = new Set([...MESSAGE_FIELDS, ...SEAM_CALLS, ...ASSERTED_PROPERTIES]);
     expect(
       BROKEN_VARIANTS.filter((v) => !vocabulary.has(v.mutates)).map((v) => `${v.name} → ${v.mutates}`),
     ).toEqual([]);

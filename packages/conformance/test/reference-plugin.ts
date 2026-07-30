@@ -422,6 +422,11 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // The same hang one argument away: park on a budget that came WITHOUT a cursor. That is the
     // first iteration of core's long-poll wrapper, so it stalls every fetch an agent makes before
     // it has a cursor — while the variant above, which parks only on an empty page, sails through.
+    //
+    // A FRACTION of the budget, not all of it. Parking for the whole budget is the one park an
+    // assertion phrased as "under the budget" can catch, so a control that spends it all leaves
+    // that phrasing looking like a working guard; this one is only caught by a bound that is a real
+    // fraction, which is the property the clause claims to grade.
     name: 'a fetch that parks on a since-less blockMs',
     mutates: 'fetchRecent',
     mustFail: 'blockMs is honoured natively or ignored promptly',
@@ -430,7 +435,8 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         fetchRecent: async (args) => {
           const page = await inner.fetchRecent(args);
           if (args.since === undefined && args.blockMs !== undefined) {
-            await new Promise((resolve) => setTimeout(resolve, Math.min(args.blockMs ?? 0, 20_000)));
+            const parkFor = Math.min(args.blockMs * 0.6, 20_000);
+            await new Promise((resolve) => setTimeout(resolve, parkFor));
           }
           return page;
         },
@@ -679,6 +685,61 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     mutates: 'resolveIdentity',
     mustFail: 'resolveIdentity answers',
     make: () => wrap(() => ({ resolveIdentity: (handle) => Promise.resolve({ handle, backendRef: '' }) })),
+  },
+  {
+    // `nextCursor` on a since-LESS page. Every variant that touches the default window corrupts the
+    // MESSAGES, so the cursor assertion beside them graded nothing: report where the window STARTS
+    // instead of where it ends and a catch-up loop re-reads the whole window on every poll.
+    // Applied only when the window was truncated, so the clause that owns the shape is the one
+    // that fails rather than every case that reads without a `since`.
+    name: 'a truncated since-less page that reports its oldest row',
+    mutates: 'nextCursor-agreement',
+    mustFail: 'returns the NEWEST messages',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since !== undefined || page.messages.length === 0) return page;
+          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+          if (all.messages.length === page.messages.length) return page;
+          return { ...page, nextCursor: page.messages[0]!.cursor };
+        },
+      })),
+  },
+  {
+    // The other half of "since at the tail returns empty and a stable cursor". The variant that
+    // re-delivers the newest message is caught by the EMPTINESS assertion; a cursor that drifts
+    // while the page stays empty is caught by nothing else, and the catch-up loop it produces never
+    // settles — every poll reports a new cursor for the same drained window.
+    name: 'a tail cursor that drifts while the page stays empty',
+    mutates: 'nextCursor-stability',
+    mustFail: 'since at the tail',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined || page.messages.length > 0) return page;
+          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+          const newest = all.messages.at(-1);
+          if (newest === undefined || String(newest.cursor) !== String(args.since)) return page;
+          return { ...page, nextCursor: asCursor(`${String(page.nextCursor)}-drift`) };
+        },
+      })),
+  },
+  {
+    // A server-side page cap the plugin does not enforce, or an off-by-one in the slice. Nothing
+    // produced an over-long page, so `limit` could stop being honoured entirely — and a caller
+    // paging with a bounded window would silently read past it.
+    name: 'a page one row longer than the limit it was given',
+    mutates: 'limit-honoured',
+    mustFail: 'paging from a cursor with limit',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: (args) =>
+          args.limit === undefined
+            ? inner.fetchRecent(args)
+            : inner.fetchRecent({ ...args, limit: args.limit + 1 }),
+      })),
   },
   {
     // The id `post` RETURNS, which core stores as the dedup key without reading the topic back.

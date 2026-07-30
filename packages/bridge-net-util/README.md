@@ -60,15 +60,24 @@ and not spelled like a method name (Telegram's `bot<id>:<token>` and Discord's p
 webhook token are both covered; `getUpdates` and `chat.postMessage` are left in the body's prose,
 where an API's own error text uses them), the userinfo, and each query value, each in both its
 encoded and decoded spelling — so a proxy or a hostile body that echoes one fragment alone is
-covered too. A bare `host/path` with no scheme is not treated as a URL, so keep credentials out of
-the host, and out of a path segment short enough to pass for `api` or `v1`.
+covered too. The method-name exemption is bounded at **24 characters**: a longer run of letters and
+dots is a JWT or an alphabetic token, not a word, and is redacted like any other opaque segment.
+A bare `host/path` with no scheme is not treated as a URL, so keep credentials out of the host, out
+of a path segment short enough to pass for `api` or `v1`, and out of one **24 characters or
+shorter** spelled with letters and dots alone — `postMessage` is indistinguishable from an
+11-letter secret.
+
+A rejection is labelled and redacted whatever the caller's own `signal` is doing. Only an abort
+that IS the caller's own comes back raw — tearing a plugin down mid-request cannot turn a DNS or
+TLS failure into an unenveloped one just by racing it.
 
 ## Helpers
 
 - **`delay(ms)`** — a `setTimeout` promise (the single copy that replaces the per-plugin duplicates).
 - **`clampBackoff(ms)`** — normalize a backoff **a plugin chose itself** (a reconnect ladder, a poll
-  interval) into `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`. `fetchWithRetry` never calls it: a wait the
-  server stated must not be clamped.
+  interval) into `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]` — a figure under the floor comes back AS the
+  floor, so a ladder built on a misparsed hint cannot hot-spin. `fetchWithRetry` never calls it: a
+  wait the server stated must not be clamped.
 - **`retryAfterFromHeader(res)`** — milliseconds from `Retry-After`, in **both** RFC 9110 forms
   (`delay-seconds`, decimal only, plus the de-facto fraction; and HTTP-date), or `undefined` when
   the header carries no usable hint. A multi-valued header yields the **longest** wait any of its

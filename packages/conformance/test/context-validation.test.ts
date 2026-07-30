@@ -2,8 +2,10 @@ import { asTopic, type BackendPlugin, type Topic } from '@sharptrick/parley-core
 import { describe, expect, it } from 'vitest';
 import {
   assertConformanceContext,
+  type BackendFactory,
   CONTEXT_FIELDS,
   type ConformanceContext,
+  openContext,
 } from '@sharptrick/parley-conformance';
 
 function reference(): ConformanceContext {
@@ -86,5 +88,92 @@ describe('assertConformanceContext', () => {
 
   it('checks every field of the reference context', () => {
     expect(Object.keys(CONTEXT_FIELDS).sort()).toEqual(Object.keys(reference()).sort());
+  });
+});
+
+/**
+ * Teardown must run whatever setup ran. A factory CONNECTS before it returns, so every way a
+ * fixture can be wrong lands after a live plugin exists — and the validator used to throw from
+ * inside `beforeEach` with the context never assigned, leaving `afterEach` to dereference
+ * `undefined` and the connection to survive the case. Thirty-two cases, thirty-two live sockets and
+ * poll loops on Matrix or Postgres, which is a hung run rather than a clean red.
+ *
+ * A row per WAY a factory can be wrong, so the next one is covered by the shape of the table.
+ */
+describe('a fixture is disconnected however it turns out to be wrong', () => {
+  const failing = (
+    build: (record: () => void) => unknown,
+  ): { factory: BackendFactory; disconnects: () => number } => {
+    let disconnects = 0;
+    return {
+      factory: (() => Promise.resolve(build(() => disconnects++))) as BackendFactory,
+      disconnects: () => disconnects,
+    };
+  };
+
+  const WRONG: [string, (record: () => void) => unknown, RegExp, boolean][] = [
+    [
+      'an invalid capability flag',
+      (record) => ({ ...reference(), supportsBlockingFetch: undefined, cleanup: async () => record() }),
+      /invalid `supportsBlockingFetch`/,
+      true,
+    ],
+    [
+      'a missing capability flag',
+      (record) => {
+        const ctx: Record<string, unknown> = { ...reference(), cleanup: async () => record() };
+        delete ctx.concurrentPost;
+        return ctx;
+      },
+      /invalid `concurrentPost`/,
+      true,
+    ],
+    [
+      'a plugin that is not an object',
+      (record) => ({ ...reference(), plugin: 'a plugin', cleanup: async () => record() }),
+      /invalid `plugin`/,
+      true,
+    ],
+    ['a factory that returns a non-object', () => 'not a context', /is not an object/, false],
+    ['a factory that returns null', () => null, /is not an object/, false],
+    [
+      // The teardown itself failing must not mask the fixture problem that caused it to run.
+      'a cleanup that rejects on a fixture that is already invalid',
+      (record) => ({
+        ...reference(),
+        carriesSenderIdentity: 'yes',
+        cleanup: async () => {
+          record();
+          throw new Error('teardown exploded');
+        },
+      }),
+      /invalid `carriesSenderIdentity`/,
+      true,
+    ],
+  ];
+
+  it.each(WRONG)('disconnects after %s', async (_label, build, names, disconnects) => {
+    const { factory, disconnects: count } = failing(build);
+    const err: unknown = await openContext('my-backend', factory).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(names);
+    expect((err as Error).message).not.toMatch(/Cannot read properties of undefined/);
+    expect((err as Error).message).toContain('my-backend');
+    expect(count(), 'the fixture was left connected').toBe(disconnects ? 1 : 0);
+  });
+
+  it('hands a well-formed fixture straight back, connected', async () => {
+    const ctx = await openContext('ref', (() => Promise.resolve(reference())) as BackendFactory);
+    expect(ctx.supportsBlockingFetch).toBe(false);
+  });
+
+  it('lets a rejecting factory reject, without inventing a teardown for a fixture that never was', async () => {
+    const boom = new Error('the server never came up');
+    await expect(
+      openContext('ref', (() => Promise.reject(boom)) as BackendFactory),
+    ).rejects.toBe(boom);
   });
 });

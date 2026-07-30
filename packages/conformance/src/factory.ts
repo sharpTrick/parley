@@ -67,6 +67,27 @@ export const CONTEXT_FIELDS: Record<keyof ConformanceContext, (v: unknown) => bo
   absentTopicBehaviour: (v) => v === undefined || v === 'empty-page' || v === 'throws',
 };
 
+/**
+ * Build a fixture and validate it, disconnecting again if it turns out to be malformed. Keep the
+ * teardown on the RAW fixture, so that a context rejected for one bad capability flag is still torn
+ * down: the factory has already CONNECTED the plugin by the time it returns, and a validator that
+ * throws on the way out otherwise strands a live socket and poll loop per case — which is how a run
+ * hangs instead of failing cleanly.
+ */
+export async function openContext(
+  name: string,
+  factory: BackendFactory,
+): Promise<ConformanceContext> {
+  const raw: unknown = await factory();
+  try {
+    return assertConformanceContext(name, raw);
+  } catch (err) {
+    const cleanup = (raw as Partial<ConformanceContext> | null | undefined)?.cleanup;
+    if (typeof cleanup === 'function') await cleanup.call(raw).catch(() => undefined);
+    throw err;
+  }
+}
+
 /** Throws naming the backend and the offending field; returns the context so it can be inlined. */
 export function assertConformanceContext(name: string, ctx: unknown): ConformanceContext {
   if (typeof ctx !== 'object' || ctx === null) {
