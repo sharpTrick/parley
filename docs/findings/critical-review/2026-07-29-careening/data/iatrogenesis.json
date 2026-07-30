@@ -78,6 +78,16 @@
       "unresolvable": 1,
       "selfInducedPct": 56,
       "note": "Second consecutive fall (80 -> 66 -> 56). Pre-existing findings rose again, 18 -> 27 -> 32."
+    },
+    {
+      "round": 9,
+      "base": "8115eb3",
+      "findings": 71,
+      "graded": 71,
+      "selfInduced": 45,
+      "preExisting": 26,
+      "unresolvable": 0,
+      "selfInducedPct": 63
     }
   ],
   "comparison": {
@@ -139,9 +149,16 @@
         "selfInduced": 15,
         "preExisting": 9,
         "selfInducedPct": 62
+      },
+      {
+        "round": 9,
+        "blocking": 28,
+        "selfInduced": 17,
+        "preExisting": 11,
+        "selfInducedPct": 61
       }
     ],
-    "reading": "Pre-existing BLOCKING findings fall 36 -> 25 -> 20 -> 11 -> 5 through round 6, then RISE: 10 in round 7, 9 in round 8. Blocking self-induction peaked at 81% in round 6 and has fallen since (57%, 62%). The five-round monotone rise did not continue, and round 6's reading - that the loop was running out of original codebase - is refuted by two subsequent rounds. Total findings are flattening (90, 79, 73) while the ORIGINAL-defect yield holds roughly steady, which is a different regime from the one ouroboros described: not a loop consuming its own output, but one whose per-round yield is decaying slowly while still reaching new ground."
+    "reading": "Pre-existing BLOCKING findings: 36, 25, 20, 11, 5, then 10, 9, 11 across rounds 7-9. The fall through round 6 did not continue; the series has been flat near 10 for three rounds while blocking self-induction sits in the 57-62% band. Overall self-induction: 26, 39, 57, 60, 80, 66, 56, 63 - round 6's 80% is an outlier, not a trend. Total findings are flattening (90, 79, 73, 71) with the original-defect yield roughly steady, which is NOT ouroboros's described regime of a loop consuming its own output at rising cost per finding."
   },
   "inertRemediations": {
     "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
@@ -182,5 +199,32 @@
         "what": "See inertRemediations: last_by_subj answered from surviving records, a semantics NATS does not have."
       }
     ]
+  },
+  "mutationSaturation": {
+    "why": "The clearest saturation signal this experiment has produced is not the finding count - it is what a full-surface mutation sweep catches. A package whose suite kills every mutation has no vacuous tests left to find, which is the test-integrity and test-hygiene lenses running dry.",
+    "observations": [
+      {
+        "round": 8,
+        "target": "core-auth",
+        "mutations": 27,
+        "caught": 27,
+        "note": "Filed no test-integrity and no test-hygiene finding at all."
+      },
+      {
+        "round": 9,
+        "target": "core-engine",
+        "mutations": 52,
+        "caught": 48,
+        "note": "4 survived and were reported as findings."
+      },
+      {
+        "round": 9,
+        "target": "core-auth",
+        "mutations": 52,
+        "caught": 48,
+        "note": "2 of the 4 survivors were semantically equivalent mutations (no behaviour change to detect); 2 real."
+      }
+    ],
+    "reading": "Both core targets now need ~50 mutations to surface a handful of survivors, where earlier rounds found vacuous guards by inspection. The instrument's cost per finding is rising on the packages that have been worked hardest, which is the ouroboros knee arriving per-package rather than run-wide."
   }
 }
