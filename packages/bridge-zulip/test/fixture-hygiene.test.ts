@@ -8,7 +8,12 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { FAULTS } from './fake-zulip.js';
+import {
+  type EventsFaultRow,
+  FAULTS,
+  PERSISTENT_EVENTS_FAULTS,
+  TRANSIENT_EVENTS_FAULTS,
+} from './fake-zulip.js';
 
 const TEST_DIR = fileURLToPath(new URL('./', import.meta.url));
 const TEST_FILES = readdirSync(TEST_DIR).filter((f) => f.endsWith('.test.ts'));
@@ -88,12 +93,44 @@ describe('zulip test fixtures are shared, not restated', () => {
   });
 
   it('the shared vocabulary is the one the fake serves, and every entry is used', () => {
-    const used = new Set(
+    const named = new Set(
       TEST_FILES.flatMap((file) => {
         const source = readFileSync(`${TEST_DIR}${file}`, 'utf8');
         return [...source.matchAll(/FAULTS\.(\w+)/g)].map((m) => m[1] as string);
       }),
     );
-    expect(Object.keys(FAULTS).filter((name) => !used.has(name))).toEqual([]);
+    const graded = new Set([...TRANSIENT_EVENTS_FAULTS, ...PERSISTENT_EVENTS_FAULTS].map((r) => r.key));
+    expect(Object.keys(FAULTS).filter((name) => !named.has(name) && !graded.has(name))).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: a fault shape graded on only ONE axis ships as covered while its mirror property goes
+ * unmeasured. A table that always injects `times: 1` grades survival-and-recovery and can never see
+ * a hot spin; a table that always injects persistently grades pacing and can never see a loop that
+ * fails to recover. The shapes are enumerated once and crossed with both axes, so this checks the
+ * crossing rather than today's row list — a shape excluded from one axis fails here by name.
+ */
+describe('every zulip fault shape is graded on both axes', () => {
+  const keysOf = (rows: EventsFaultRow[]): Set<string> => new Set(rows.map((r) => r.key));
+
+  it('covers the whole vocabulary transiently and persistently', () => {
+    const missing = (rows: EventsFaultRow[]): string[] =>
+      Object.keys(FAULTS).filter((name) => !keysOf(rows).has(name));
+    expect({
+      transient: missing(TRANSIENT_EVENTS_FAULTS),
+      persistent: missing(PERSISTENT_EVENTS_FAULTS),
+    }).toEqual({ transient: [], persistent: [] });
+  });
+
+  it('the axes differ in persistence, not only in name', () => {
+    expect({
+      transientForever: TRANSIENT_EVENTS_FAULTS.filter((r) => r.failure.times === undefined).map(
+        (r) => r.key,
+      ),
+      persistentOnce: PERSISTENT_EVENTS_FAULTS.filter((r) => r.failure.times !== undefined).map(
+        (r) => r.key,
+      ),
+    }).toEqual({ transientForever: [], persistentOnce: [] });
   });
 });

@@ -45,6 +45,14 @@ export const SERVER_CONSTRAINTS = {
 } as const;
 
 /**
+ * `zerver/lib/rate_limiter.py` / zulip.com/api/rate-limits: the documented default API budget, in
+ * requests per minute per USER — not per connection, per queue or per topic. The fake does not
+ * enforce it (a 429 is injected deliberately, see {@link FakeZulip.rateLimit}); it is stated here so
+ * a config bound can be graded against the server's budget rather than against a local hunch.
+ */
+export const ZULIP_DEFAULT_RATE_LIMIT_PER_MIN = 200;
+
+/**
  * Zulip's Markdown rendering, modelled just far enough that a client which forgets
  * `apply_markdown=false` gets HTML instead of source text and cannot mistake one for the other.
  */
@@ -129,6 +137,9 @@ export interface RateLimit {
   bodySeconds?: number;
 }
 
+/** The id the fake mints for the first message of a run; every later one is greater. */
+export const FIRST_MESSAGE_ID = 1;
+
 /**
  * The server faults the tables inject, named once beside the fake that serves them. Each is a WIRE
  * SHAPE a real Zulip produces, so correcting one corrects every table that injects it; a shape
@@ -153,6 +164,8 @@ export const FAULTS = {
   revokedKey: { status: 401, body: { result: 'error', msg: 'Invalid API key' } },
   /** A well-formed 200 carrying no events at all — a wake that never came, with no status to see. */
   emptyBody: { status: 200, body: { result: 'success' } },
+  /** A 200 carrying neither `result` nor `events` — a proxy's idea of a success page. */
+  bodylessSuccess: { status: 200, body: {} },
   /** A poll answered only by the queue's keep-alive: an answer, but not a delivery. */
   heartbeatOnly: {
     status: 200,
@@ -160,7 +173,70 @@ export const FAULTS = {
   },
   /** A 200 whose `events` is not an array — the declared wire type says this cannot arrive. */
   unparseableEvents: { status: 200, body: { result: 'success', events: 'not-an-array' } },
+  /** The other spelling of the same lie: an OBJECT where the array was declared. */
+  eventsAsObject: { status: 200, body: { result: 'success', events: {} } },
+  /** An array of the right shape holding entries of the wrong one. */
+  nullEvents: { status: 200, body: { result: 'success', events: [null] } },
+  numericEvents: { status: 200, body: { result: 'success', events: [7] } },
+  /** A message event carrying no message: the type says `message` and the payload says otherwise. */
+  messageEventWithoutMessage: {
+    status: 200,
+    body: { result: 'success', events: [{ id: 0, type: 'message', message: null }] },
+  },
+  messageEventWithStringMessage: {
+    status: 200,
+    body: { result: 'success', events: [{ id: 0, type: 'message', message: 'gotcha' }] },
+  },
+  /**
+   * A DELIVERABLE message on an event whose own `id` cannot be acked, so the queue re-serves it on
+   * every poll: the one malformed shape that carries a real message, and so the one a loop grading
+   * itself on "did a message arrive" reads as healthy forever. The message is the FIRST one the
+   * fake mints ({@link FIRST_MESSAGE_ID}) — an un-acked event re-serves a message the client has
+   * already been given, which is what makes the redelivery invisible to the handler.
+   */
+  unackableMessageEvent: {
+    status: 200,
+    body: {
+      result: 'success',
+      events: [
+        {
+          id: 'not-a-number',
+          type: 'message',
+          message: {
+            id: FIRST_MESSAGE_ID,
+            content: 're-served by an event that never acks',
+            sender_email: 'someone@example.com',
+            timestamp: 1_700_000_000,
+          },
+        },
+      ],
+    },
+  },
 } as const satisfies Record<string, RouteFailure>;
+
+/** One fault shape, ready to inject on `GET /api/v1/events`, named by its vocabulary key. */
+export interface EventsFaultRow {
+  key: keyof typeof FAULTS;
+  failure: RouteFailure;
+}
+
+/**
+ * The fault vocabulary crossed with the two axes every shape has to be graded on, because neither
+ * axis can see the other's defect: a shape injected ONCE grades survival — the loop recovers and
+ * keeps delivering — and a loop that hot-spins for a single request is indistinguishable there from
+ * one that paces. The same shape injected UNTIL CLEARED grades pacing, which is the only way a
+ * silent request flood becomes visible. Persistence is therefore a dimension of the vocabulary
+ * rather than a literal each row repeats, so a shape added here is graded on both axes the day it
+ * is declared (`fixture-hygiene.test.ts` holds that).
+ */
+const eventsFaultRows = (persistent: boolean): EventsFaultRow[] =>
+  Object.entries(FAULTS).map(([key, failure]) => ({
+    key: key as keyof typeof FAULTS,
+    failure: persistent ? { ...failure } : { ...failure, times: 1 },
+  }));
+
+export const TRANSIENT_EVENTS_FAULTS: EventsFaultRow[] = eventsFaultRows(false);
+export const PERSISTENT_EVENTS_FAULTS: EventsFaultRow[] = eventsFaultRows(true);
 
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
@@ -203,8 +279,8 @@ export interface FakeZulip {
    */
   holdResponse(route: string, ms: number): void;
   clearRouteFailures(): void;
-  /** How many requests the fake has served for `route`. */
-  requestCount(route: string): number;
+  /** How many requests the fake has served for `route`, or on EVERY route when none is named. */
+  requestCount(route?: string): number;
   /**
    * The query and form parameters of every request received on `route`, in order — what the client
    * actually put on the wire, which is the only way to grade a flag whose server default happens to
@@ -235,7 +311,7 @@ export async function startFakeZulip(opts?: {
   const heartbeatMs = opts?.heartbeatMs ?? 10_000;
   const members = opts?.members ?? MEMBERS;
   const accounts = toArray(opts?.credentials) ?? DEFAULT_CREDENTIALS;
-  let msgSeq = 0;
+  let msgSeq = FIRST_MESSAGE_ID - 1;
   let queueSeq = 0;
   let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
   let failMessagesReadsServed = 0;
@@ -559,7 +635,10 @@ export async function startFakeZulip(opts?: {
       hangRoutes.clear();
       anchorStall = undefined;
     },
-    requestCount: (route) => requestCounts.get(route) ?? 0,
+    requestCount: (route) =>
+      route === undefined
+        ? [...requestCounts.values()].reduce((a, b) => a + b, 0)
+        : (requestCounts.get(route) ?? 0),
     sentParams: (route) => [...(requestParams.get(route) ?? [])],
     setResponseHook: (hook) => {
       responseHook = hook;

@@ -5,7 +5,7 @@
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { FAULTS, type FakeZulip } from './fake-zulip.js';
+import { FAULTS, type FakeZulip, PERSISTENT_EVENTS_FAULTS } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
@@ -20,8 +20,15 @@ const LOOP_ROUTES = ['POST /api/v1/register', 'GET /api/v1/events', 'GET /api/v1
 /**
  * Ways the push loop can stop making progress forever — none of them recoverable by retrying harder.
  * The dimension is deliberately wider than "ways to get an error status": the failures that carry no
- * status code at all — a poll that is accepted and never answered, or answered with a body carrying
- * nothing — are the ones a loop grading itself on its own client-side abort cannot see.
+ * status code at all — a poll that is accepted and never answered, or answered with a body the loop
+ * cannot ack — are the ones a loop grading itself on its own client-side abort, or on the answer
+ * being non-empty, cannot see.
+ *
+ * The PERSISTENT axis of the shared fault vocabulary supplies one row per shape (injected with no
+ * `times`, so it never clears), because pacing is invisible to an injection that clears after one
+ * request. The bespoke rows below it are the failures that are not a single wire shape at all: a
+ * request nobody answers, and the RECOVERY paths — re-register and gap-fill — which are exactly
+ * where an unpaced retry hides from a counter watching the route the fault was injected into.
  */
 const PERMANENT_FAILURES: Array<{
   name: string;
@@ -30,6 +37,11 @@ const PERMANENT_FAILURES: Array<{
   /** Wall clock the report must arrive inside; a fault with no status code takes a cycle to prove. */
   observeMs?: number;
 }> = [
+  ...PERSISTENT_EVENTS_FAULTS.map((row) => ({
+    name: `every /events poll is answered ${row.key} (${row.failure.status})`,
+    counted: 'GET /api/v1/events' as const,
+    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', row.failure),
+  })),
   {
     // The only failure mode that never yields a status code: the plugin's own long-poll cap is what
     // ends the request, so a loop that reads its own abort as "the server parked for us" is blind.
@@ -39,44 +51,12 @@ const PERMANENT_FAILURES: Array<{
     observeMs: 5000,
   },
   {
-    name: 'every /events poll is answered 200 with a body carrying no events',
-    counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.emptyBody),
-  },
-  {
-    name: 'every /events poll is answered 200 with an unparseable body',
-    counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.unparseableEvents),
-  },
-  {
-    name: 'the api key was revoked (401 on /events)',
-    counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.revokedKey),
-  },
-  {
-    name: 'the server is broken (500 on /events)',
-    counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.serverError),
-  },
-  {
-    name: 'a non-queue 400 on /events',
-    counted: 'GET /api/v1/events',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.nonQueueBadRequest),
-  },
-  {
     name: 're-register keeps failing after a queue GC',
     counted: 'POST /api/v1/register',
     apply: (fake: FakeZulip) => {
       fake.failRoute('POST /api/v1/register', FAULTS.serverError);
       fake.gcQueues();
     },
-  },
-  {
-    // A poll reaching a shard that does not own the queue: every re-register SUCCEEDS and the
-    // fresh queue is rejected at once, so the failure is in the RECOVERY path, not in a request.
-    name: 'every freshly registered queue is rejected as stale',
-    counted: 'POST /api/v1/register',
-    apply: (fake: FakeZulip) => fake.failRoute('GET /api/v1/events', FAULTS.staleQueue),
   },
   {
     name: 'every fresh queue is rejected as stale and the gap-fill reads fail too',

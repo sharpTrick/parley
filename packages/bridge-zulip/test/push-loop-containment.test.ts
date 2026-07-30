@@ -6,35 +6,19 @@
  * derived from it has no handler at all, and on Node 22 an unhandled rejection is an uncaught
  * exception: `src/cli.ts` installs no handler, so the MCP stdio server exits.
  *
- * The existing lifecycle and operability tables only ever inject TRANSPORT faults (status codes,
- * hangs, queue GCs). These rows inject faults inside the loop's own body instead — the shapes an
- * events response can take that no status code models — and grade three independent properties per
- * row: the process stays clean, the loop keeps delivering, and a tolerated shape is not reported as
- * a failure.
+ * This is the TRANSIENT axis of the shared fault vocabulary: every shape the server can answer a
+ * poll with, injected ONCE, grading three independent properties per row — the process stays clean,
+ * the loop resumes delivering on both sides of the fault, and one bad answer is not reported to the
+ * operator as an outage. Survival is all this axis can see: a loop that spins flat out for the one
+ * request looks exactly like one that paces, which is why `operability.test.ts` runs the same
+ * vocabulary persistently and grades the request RATE.
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import type { FakeZulip } from './fake-zulip.js';
+import { TRANSIENT_EVENTS_FAULTS } from './fake-zulip.js';
 import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
-
-/** An events response body the plugin's declared `EventsResponse` says cannot arrive. */
-const MALFORMED_EVENTS: Array<{ name: string; body: Record<string, unknown> }> = [
-  { name: '`events` is an object, not an array', body: { result: 'success', events: {} } },
-  { name: '`events` is a string', body: { result: 'success', events: 'nope' } },
-  { name: '`events` holds nulls', body: { result: 'success', events: [null] } },
-  { name: '`events` holds numbers', body: { result: 'success', events: [7] } },
-  {
-    name: 'a message event whose `message` is null',
-    body: { result: 'success', events: [{ id: 0, type: 'message', message: null }] },
-  },
-  {
-    name: 'a message event whose `message` is a string',
-    body: { result: 'success', events: [{ id: 0, type: 'message', message: 'gotcha' }] },
-  },
-  { name: 'neither `result` nor `events`', body: {} },
-];
 
 /** Collect what Node would otherwise turn into an uncaught exception. */
 async function withRejectionCollector(body: (rejections: unknown[]) => Promise<void>): Promise<void> {
@@ -51,24 +35,27 @@ async function withRejectionCollector(body: (rejections: unknown[]) => Promise<v
 const parleyErrors = (spy: ReturnType<typeof vi.spyOn>): string[] =>
   spy.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('[parley-zulip]'));
 
-describe('a malformed events response is tolerated without ending push', () => {
-  for (const fault of MALFORMED_EVENTS) {
-    it(fault.name, async () => {
+describe('one bad events answer is tolerated without ending push', () => {
+  for (const row of TRANSIENT_EVENTS_FAULTS) {
+    it(`survives a single ${row.key} answer and keeps delivering`, async () => {
       await withRejectionCollector(async (rejections) => {
         const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const { plugin, fake }: { plugin: import('../src/index.js').ZulipPlugin; fake: FakeZulip } =
-          await boot();
+        const { plugin, fake } = await boot();
         const topic = asTopic(`fault-${rand()}`);
-        fake.failRoute('GET /api/v1/events', { status: 200, body: fault.body, times: 1 });
 
         const got: Message[] = [];
         await plugin.subscribe(topic, (m) => got.push(m));
+        // Deliver first, so the watermark is past the message a re-served event carries: an
+        // un-ackable event hands back one the handler has already seen, not a new one.
+        await plugin.post(topic, SENDER, 'before the fault');
+        await sleep(300);
+        fake.failRoute('GET /api/v1/events', row.failure);
         await sleep(300);
         await plugin.post(topic, SENDER, 'after the fault');
         await sleep(600);
 
         expect(rejections).toEqual([]);
-        expect(got.map((m) => m.content)).toEqual(['after the fault']);
+        expect(got.map((m) => m.content)).toEqual(['before the fault', 'after the fault']);
         expect(parleyErrors(error)).toEqual([]);
       });
     }, 20_000);

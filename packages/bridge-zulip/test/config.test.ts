@@ -5,16 +5,57 @@
  * the push loop into a silent, unlogged request flood against their own server.
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
-import { DECLARED_CONFIG_KEYS, rand, SENDER, sleep, useZulip } from './harness.js';
-import { startFakeZulip } from './fake-zulip.js';
+import {
+  DECLARED_CONFIG_KEYS,
+  DECLARED_CONFIG_TYPES,
+  rand,
+  SENDER,
+  sleep,
+  useZulip,
+} from './harness.js';
+import { startFakeZulip, ZULIP_DEFAULT_RATE_LIMIT_PER_MIN } from './fake-zulip.js';
 
 const boot = useZulip();
 
+const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
+
+/** The `events_timeout_ms` row of the README's config table — the claims below are read out of it. */
+const CAP_DOC = /^\| `events_timeout_ms`\s*\|\s*`(\d+)`\s*\|(.*)$/m.exec(README);
+
+/** The bounds the README publishes: `[floor, ceiling]` and the default. */
+const DOCUMENTED_CAP = {
+  defaultMs: Number(CAP_DOC?.[1]),
+  floorMs: Number(/Clamped to `\[(\d+), \d+]`/.exec(CAP_DOC?.[2] ?? '')?.[1]),
+};
+
+/**
+ * Requests one cap spends per subscribed topic: the parked poll, then the `dont_block=true` probe
+ * that tells a healthy idle cap from a black-holed server. The README publishes this number because
+ * an operator has to multiply by it; here it turns the poll cap into a RATE.
+ */
+const REQUESTS_PER_CAP = 2;
+
+/** Requests a minute the documented bounds imply for `topics` subscribed topics at `capMs`. */
+const documentedRatePerMin = (capMs: number, topics: number): number =>
+  (topics * REQUESTS_PER_CAP * 60_000) / capMs;
+
+/**
+ * The published rate plus what an observation window cannot control: scheduling jitter (relative),
+ * and the register handshake and the poll already in flight when the clock starts (a fixed few).
+ * Keep the relative part tight, so that a THIRD request entering the cycle is still a failure —
+ * a ceiling of twice the published rate is one no per-cap cost this side of doubling can fail.
+ */
+const rateCeiling = (expectedInWindow: number): number => Math.ceil(expectedInWindow * 1.25) + 2;
+
+const observedCeiling = (topics: number, observeMs: number): number =>
+  rateCeiling((documentedRatePerMin(DOCUMENTED_CAP.floorMs, topics) * observeMs) / 60_000);
+
 /** A poll cap can only be called honest if this many requests cannot fit in the window. */
 const OBSERVE_MS = 800;
-const SANE_REQUEST_CEILING = 20;
 
 interface ConfigRow {
   key: string;
@@ -70,7 +111,9 @@ describe('zulip backend_config: no value is accepted into a hot loop or a deferr
         const got: Message[] = [];
         await plugin.subscribe(topic, (m) => got.push(m));
         await sleep(OBSERVE_MS);
-        expect(fake.requestCount('GET /api/v1/events')).toBeLessThan(SANE_REQUEST_CEILING);
+        expect(fake.requestCount('GET /api/v1/events')).toBeLessThanOrEqual(
+          observedCeiling(1, OBSERVE_MS),
+        );
 
         // Accepted means WORKING, not merely quiet: the push path must still deliver.
         await plugin.post(topic, SENDER, 'live');
@@ -82,6 +125,69 @@ describe('zulip backend_config: no value is accepted into a hot loop or a deferr
       }
     });
   }
+});
+
+/**
+ * CLASS: a config bound that is legal locally and illegal against the SERVER. What an idle push loop
+ * costs is a RATE — {@link REQUESTS_PER_CAP} requests per cap per subscribed topic — and Zulip bills
+ * it against a budget kept per USER, so a bound checked as "few enough requests in one window with
+ * one topic" measures the wrong quantity entirely and no floor can fail it. These rows measure the
+ * rate against the bounds the README publishes, in both dimensions the operator actually varies, so
+ * a floor lowered, a request added to the cycle, or a README that drifts from either fails here
+ * rather than in a deployment sitting in permanent 429 backoff.
+ */
+describe('the idle push loop costs what the README publishes', () => {
+  it('publishes bounds these rows can be read from', () => {
+    expect(DOCUMENTED_CAP.floorMs).toBeGreaterThan(0);
+    expect(DOCUMENTED_CAP.defaultMs).toBeGreaterThan(DOCUMENTED_CAP.floorMs);
+  });
+
+  const RATE_OBSERVE_MS = 2400;
+  /** Below the floor, at the floor, and above it — the clamp is a documented claim of its own. */
+  const CAPS = [1, DOCUMENTED_CAP.floorMs, 1000];
+
+  for (const capMs of CAPS) {
+    for (const topics of [1, 4]) {
+      it(`events_timeout_ms ${capMs} × ${topics} topic(s) stays inside the published rate`, async () => {
+        const fake = await startFakeZulip({ heartbeatMs: 60_000 });
+        const plugin = new ZulipPlugin();
+        await plugin.connect({ site_url: fake.url, events_timeout_ms: capMs });
+        try {
+          for (let i = 0; i < topics; i++) {
+            await plugin.subscribe(asTopic(`rate-${i}-${rand()}`), () => undefined);
+          }
+          const before = fake.requestCount('GET /api/v1/events');
+          await sleep(RATE_OBSERVE_MS);
+          const polls = fake.requestCount('GET /api/v1/events') - before;
+          const effectiveCap = Math.max(capMs, DOCUMENTED_CAP.floorMs);
+          const ceiling = rateCeiling(
+            (documentedRatePerMin(effectiveCap, topics) * RATE_OBSERVE_MS) / 60_000,
+          );
+          // Both directions: a loop that stopped polling is not a loop that is cheap.
+          expect([polls > 0, polls <= ceiling, { polls, ceiling }]).toEqual([
+            true,
+            true,
+            { polls, ceiling },
+          ]);
+        } finally {
+          await plugin.disconnect().catch(() => undefined);
+          await fake.close();
+        }
+      }, 20_000);
+    }
+  }
+
+  it(`the default cap leaves a session under Zulip's ${ZULIP_DEFAULT_RATE_LIMIT_PER_MIN}/min budget`, () => {
+    const topics = 8;
+    expect(documentedRatePerMin(DOCUMENTED_CAP.defaultMs, topics)).toBeLessThan(
+      ZULIP_DEFAULT_RATE_LIMIT_PER_MIN,
+    );
+  });
+
+  it('the README states the per-cap cost and the budget an operator multiplies against', () => {
+    expect(CAP_DOC?.[2]).toContain(`\`${REQUESTS_PER_CAP}\``);
+    expect(CAP_DOC?.[2]).toContain(`\`${ZULIP_DEFAULT_RATE_LIMIT_PER_MIN}\``);
+  });
 });
 
 /**
@@ -152,6 +258,59 @@ describe('zulip backend_config: a key the plugin does not implement is a load er
       expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
         'still connected',
       ]);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      await fake.close();
+    }
+  });
+});
+
+/**
+ * CLASS: a README sentence that states the wrong failure TIME. Whether a misconfiguration is
+ * refused at load or surfaces at the first request is the whole operator experience — one is a
+ * bridge that never comes up, the other is a bridge that comes up and then fails a hand-off — and
+ * a doc can state it wrongly while every behavioural test stays green. The keys are read out of the
+ * README's own config table, so the claim widens with the documented surface rather than pinning
+ * today's five, and both halves of the corrected sentence are graded: what `connect()` refuses, and
+ * what it cannot possibly refuse because it never speaks to the server.
+ */
+const README_CONFIG_KEYS = [
+  ...(/## Config \(`backend_config`\)([\s\S]*?)\n## /.exec(README)?.[1] ?? '').matchAll(
+    /^\| `(\w+)`\s*\|/gm,
+  ),
+].map((m) => m[1] as string);
+
+/** A value of the declared TYPE that no key can accept, so the rejection is about the key. */
+const UNUSABLE_BY_TYPE: Record<string, unknown> = { string: '   ', number: 0 };
+
+describe('zulip backend_config fails at the time the README says it does', () => {
+  it('the config table documents exactly the keys the plugin declares', () => {
+    expect(README_CONFIG_KEYS).toEqual(DECLARED_CONFIG_KEYS);
+  });
+
+  for (const key of README_CONFIG_KEYS) {
+    it(`${key}: an unusable value is refused by connect(), not carried into the first call`, async () => {
+      const fake = await startFakeZulip();
+      const plugin = new ZulipPlugin();
+      try {
+        const unusable = UNUSABLE_BY_TYPE[DECLARED_CONFIG_TYPES[key] ?? ''];
+        expect(unusable, `no unusable value declared for ${key}`).toBeDefined();
+        await expect(plugin.connect({ site_url: fake.url, [key]: unusable })).rejects.toThrow(key);
+        expect(fake.requestCount()).toBe(0);
+      } finally {
+        await plugin.disconnect().catch(() => undefined);
+        await fake.close();
+      }
+    });
+  }
+
+  it('a well-formed config asks the server nothing, so a wrong host or key can only surface later', async () => {
+    const fake = await startFakeZulip();
+    const plugin = new ZulipPlugin();
+    try {
+      await plugin.connect({ site_url: fake.url, api_key: 'wrong-but-well-formed' });
+      expect(fake.requestCount()).toBe(0);
+      await expect(plugin.post(asTopic(`late-${rand()}`), SENDER, 'x')).rejects.toThrow('401');
     } finally {
       await plugin.disconnect().catch(() => undefined);
       await fake.close();

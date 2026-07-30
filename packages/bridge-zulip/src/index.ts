@@ -106,8 +106,11 @@ const LOOP_FAILURES_BEFORE_REPORT = 3;
 const LOOP_FAILURE_REPORT_INTERVAL = 20;
 
 /**
- * Bounds on the effective long-poll cap. Keep the floor, so that no `events_timeout_ms` a config
- * can carry turns the push loop into an unthrottled request flood against the operator's server.
+ * Bounds on the effective long-poll cap. Keep the floor, so that no `events_timeout_ms` a config can
+ * carry leaves the push loop polling with no cap at all. What it bounds is the SHAPE of the idle
+ * load and not its affordability: a cap is spent twice over — parked poll, then liveness probe — for
+ * each subscribed topic, which puts the floor an order of magnitude above the request budget a
+ * default Zulip gives a bot. The README's config table carries that arithmetic for the operator.
  */
 const MIN_EVENTS_TIMEOUT_MS = 250;
 const MAX_EVENTS_TIMEOUT_MS = 600_000;
@@ -787,18 +790,13 @@ export class ZulipPlugin implements BackendPlugin {
         return true;
       }
       queueProven = true;
-      const events = asArray(json.events);
-      // A parked poll answers with an event or a heartbeat; keep the empty answer paced, so that a
-      // server which ignores `dont_block=false` — or hands back a body carrying no events at all —
-      // cannot turn the loop into a flat-out request flood that still grades itself healthy.
-      if (parked && events.length === 0) {
-        await backoff('an events poll that asked to park answered with no events');
-        return true;
-      }
-      recovered();
       let sawMessage = false;
-      for (const ev of events) {
-        if (typeof ev?.id === 'number' && ev.id > lastEventId) lastEventId = ev.id; // ack heartbeats too
+      let acked = false;
+      for (const ev of asArray(json.events)) {
+        if (typeof ev?.id === 'number' && ev.id > lastEventId) {
+          lastEventId = ev.id; // ack heartbeats too
+          acked = true;
+        }
         if (ev?.type !== 'message') continue;
         const m = zulipToMessage(topic, ev.message);
         if (m === undefined) continue;
@@ -811,6 +809,16 @@ export class ZulipPlugin implements BackendPlugin {
       // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
       // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
       if (sawMessage) this.wake(topic);
+      // Grade the answer on whether it MOVED the queue, not on whether it carried bytes: a parked
+      // poll the ack cannot advance past is re-issued unchanged forever. Keep it paced, so that a
+      // server ignoring `dont_block=false` — or answering with no events, stale ids, or ids that
+      // are not numbers at all — cannot turn the loop into a request flood that grades itself
+      // healthy. A live queue's own heartbeat carries a fresh id, so an idle queue stays off this.
+      if (parked && !acked) {
+        await backoff('an events poll that asked to park answered without advancing the queue');
+        return true;
+      }
+      recovered();
       return true;
     };
 
