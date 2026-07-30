@@ -70,6 +70,41 @@ const PARAM_SETS: Array<[string, ScryptParams]> = [
   ['more parallelism', { N: 4096, r: 8, p: 3 }],
 ];
 
+/**
+ * The whole job of this validator is to refuse a degenerate record at BUILD time. A cost that is
+ * out of node:crypto's range but slips through resurfaces as a thrown RangeError from the async
+ * KDF — on the consent POST, which is the owner's only way in, and as a non-ConsentError it becomes
+ * a bare 500 that names nothing. `N & (N - 1)` evaluated in int32 was exactly that hole: every N
+ * congruent to a power of two mod 2^32 passed, including 2^32 + 2, which scrypt cannot accept.
+ */
+const OUT_OF_RANGE_COSTS: Array<[string, string]> = [
+  ...[
+    0,
+    1,
+    2 ** 31,
+    2 ** 32,
+    2 ** 32 + 2,
+    2 ** 33 + 2,
+    6442450944,
+    Number.MAX_SAFE_INTEGER,
+  ].map((N): [string, string] => [`N=${N}`, `scrypt$N=${N},r=8,p=1$SALT$HASH`]),
+  ['N beyond Number.MAX_SAFE_INTEGER', `scrypt$N=${(10n ** 21n).toString()},r=8,p=1$SALT$HASH`],
+  ['N=65536 at r=1 (node caps N below 2**(16r))', 'scrypt$N=65536,r=1,p=1$SALT$HASH'],
+  ['N=1048576 at r=8 (one step over the memory ceiling)', 'scrypt$N=1048576,r=8,p=1$SALT$HASH'],
+  ['r=100000 (a ~200 GB derivation)', 'scrypt$N=16384,r=100000,p=1$SALT$HASH'],
+  ['p=0', 'scrypt$N=16384,r=8,p=0$SALT$HASH'],
+  ['p=1000000', 'scrypt$N=16384,r=8,p=1000000$SALT$HASH'],
+];
+
+/** Costs at the edge of what is allowed, so the guard cannot be satisfied by refusing everything. */
+const IN_RANGE_COSTS: Array<[string, ScryptParams]> = [
+  ['the smallest cost', { N: 2, r: 1, p: 1 }],
+  ['the largest N that fits at r=1', { N: 32768, r: 1, p: 1 }],
+  ['a large N within the memory ceiling', { N: 524288, r: 8, p: 1 }],
+  ['the widest block size', { N: 1024, r: 64, p: 1 }],
+  ['the most parallelism', { N: 1024, r: 8, p: 16 }],
+];
+
 describe('owner secret — the stored record describes the parameters that produced it', () => {
   const PASS = 'correct horse battery staple';
 
@@ -108,10 +143,96 @@ describe('owner secret — the stored record describes the parameters that produ
     ['a zero block size', 'scrypt$N=16384,r=0,p=1$SALT$HASH'],
     ['an empty parameter block', 'scrypt$$SALT$HASH'],
     ['a fifth field', 'scrypt$N=16384,r=8,p=1$SALT$HASH$extra'],
+    ...OUT_OF_RANGE_COSTS,
   ])('refuses to build a verifier from %s', (_label: string, template: string) => {
     const stored = template
       .replace('SALT', randomBytes(16).toString('base64'))
       .replace('HASH', randomBytes(32).toString('base64'));
     expect(() => makeOwnerVerifier(stored)).toThrow(/invalid owner secret hash/);
+  });
+});
+
+describe('owner secret — a build-time validator must not defer its failure to the login path', () => {
+  it.each(IN_RANGE_COSTS)('accepts %s', (_label: string, params: ScryptParams) => {
+    const stored = `scrypt$N=${params.N},r=${params.r},p=${params.p}$${randomBytes(16).toString(
+      'base64',
+    )}$${randomBytes(32).toString('base64')}`;
+    expect(() => makeOwnerVerifier(stored)).not.toThrow();
+  });
+
+  const CORPUS: string[] = [
+    ...OUT_OF_RANGE_COSTS.map(([, template]) => template),
+    // Deriving at the top of the accepted range costs seconds; the build-time row above covers it,
+    // so this property only needs records cheap enough to actually run.
+    ...IN_RANGE_COSTS.filter(([, p]) => p.N * p.r <= 65536).map(
+      ([, p]) => `scrypt$N=${p.N},r=${p.r},p=${p.p}$SALT$HASH`,
+    ),
+    ...PARAM_SETS.map(([, p]) => `scrypt$N=${p.N},r=${p.r},p=${p.p}$SALT$HASH`),
+    'scrypt$SALT$HASH',
+  ].map((template) =>
+    template
+      .replace('SALT', randomBytes(16).toString('base64'))
+      .replace('HASH', randomBytes(32).toString('base64')),
+  );
+
+  it.each(CORPUS.map((stored, i) => [`record ${i}: ${stored.split('$')[1]}`, stored]))(
+    'either throws for %s or returns a verifier that resolves',
+    async (_label: string, stored: string) => {
+      let verify: ((passphrase: string) => Promise<boolean>) | undefined;
+      try {
+        verify = makeOwnerVerifier(stored);
+      } catch (err) {
+        expect((err as Error).message).toMatch(/invalid owner secret hash/);
+        return;
+      }
+      await expect(verify('any passphrase at all')).resolves.toBeTypeOf('boolean');
+    },
+  );
+});
+
+/**
+ * An empty passphrase must never authorize, whatever the stored record says — and the short-circuit
+ * that guarantees it is only provable against a record whose hash IS the derivation of the empty
+ * string. Asserting `verify('') === false` against an ordinary record proves nothing: scrypt('')
+ * simply derives a non-matching hash, so the assertion holds with the guard deleted.
+ */
+describe('owner secret — the empty-passphrase guard', () => {
+  // A record written WITHOUT a parameter block is re-derived at owner.ts's DEFAULT_PARAMS, so the
+  // adversarial record for that form has to be derived at those same parameters.
+  const READ_AT: Array<[string, boolean, ScryptParams]> = [
+    ['a parameterised record', true, { N: 1024, r: 8, p: 1 }],
+    ['a legacy parameterless record', false, { N: 16384, r: 8, p: 1 }],
+  ];
+
+  function recordFor(passphrase: string, withParams: boolean, params: ScryptParams): string {
+    const salt = randomBytes(16);
+    const hash = scryptSync(passphrase, salt, 32, {
+      ...params,
+      maxmem: 256 * params.N * params.r + 1024 * 1024,
+    });
+    return [
+      'scrypt',
+      ...(withParams ? [`N=${params.N},r=${params.r},p=${params.p}`] : []),
+      salt.toString('base64'),
+      hash.toString('base64'),
+    ].join('$');
+  }
+
+  it.each(READ_AT)(
+    'refuses an empty passphrase against %s whose hash IS scrypt("")',
+    async (_label: string, withParams: boolean, params: ScryptParams) => {
+      // Negative control: the identical construction with a real passphrase verifies, so the record
+      // shape and parameters are ones the verifier reads correctly. Without it, a record the
+      // verifier simply cannot read would make the assertion below pass for the wrong reason.
+      expect(await makeOwnerVerifier(recordFor('a real one', withParams, params))('a real one')).toBe(
+        true,
+      );
+
+      expect(await makeOwnerVerifier(recordFor('', withParams, params))('')).toBe(false);
+    },
+  );
+
+  it('still refuses an empty passphrase against an ordinary record', async () => {
+    expect(await makeOwnerVerifier(hashOwnerSecret('a real one'))('')).toBe(false);
   });
 });

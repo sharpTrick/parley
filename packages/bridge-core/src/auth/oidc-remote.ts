@@ -11,7 +11,7 @@ import { fetchOidcDiscovery } from './oidc-discovery.js';
 import { OidcTokenVerifier } from './oidc-verifier.js';
 import { hardenErrorSurface } from './error-surface.js';
 import {
-  assertIdentityGate,
+  assertOidcPolicy,
   assertPublicBaseUrl,
   assertTrustRootUrl,
   canonicalResourceId,
@@ -58,7 +58,7 @@ export async function createOidcRemoteApp(
   assertPublicBaseUrl(opts.publicUrl, 'publicUrl');
   const resource = canonicalResourceId(opts.publicUrl, mcpPath, 'mcpPath');
   const oidc = opts.oidc;
-  assertIdentityGate(oidc);
+  assertOidcPolicy(oidc);
   assertTrustRootUrl(oidc.issuer, 'auth.oidc.issuer');
 
   const metadata = await fetchOidcDiscovery(oidc.issuer, opts.fetchFn ?? fetch);

@@ -24,6 +24,30 @@ export interface RemoteAuthOptions {
 export type RemoteAuthServer = OAuthRemoteServer | OidcRemoteServer;
 
 /**
+ * Which mode each option reaches. An option the selected mode never forwards is a silent no-op, and
+ * `trustProxy` is the one standing between an anonymous flood and the owner's only way in — so a
+ * caller who sets it in the wrong mode has to hear about it at boot, not from a rate limiter that
+ * was never keyed the way they asked.
+ */
+const MODE_ONLY_OPTIONS: Array<[keyof RemoteAuthOptions, 'builtin' | 'oidc']> = [
+  ['verifyOwner', 'builtin'],
+  ['scopesSupported', 'builtin'],
+  ['trustProxy', 'builtin'],
+  ['fetchFn', 'oidc'],
+];
+
+function assertOptionsMatchMode(mode: 'builtin' | 'oidc', opts: RemoteAuthOptions): void {
+  const stray = MODE_ONLY_OPTIONS.filter(([key, only]) => only !== mode && opts[key] !== undefined);
+  if (stray.length === 0) return;
+  throw new Error(
+    `auth.mode "${mode}" does not use ${stray.map(([key]) => key).join(', ')} — ` +
+      `${stray.length === 1 ? 'it is' : 'they are'} ` +
+      `${stray.map(([, only]) => `"${only}"`).join('/')}-mode only, and would be silently ` +
+      'discarded. Remove it, or switch modes.',
+  );
+}
+
+/**
  * The remote-mode front-door selector (DESIGN §10): dispatch on `cfg.auth.mode` between the
  * built-in single-tenant OAuth AS (default; owner-passphrase consent) and the delegated
  * resource-server mode where an external OIDC IdP (e.g. Keycloak) authorizes the connector.
@@ -33,6 +57,7 @@ export async function createRemoteAuthApp(
   cfg: ParleyConfig,
   opts: RemoteAuthOptions,
 ): Promise<RemoteAuthServer> {
+  assertOptionsMatchMode(cfg.auth.mode, opts);
   if (cfg.auth.mode === 'oidc') {
     // ConfigSchema guarantees the block exists when mode === 'oidc'.
     const oidc = cfg.auth.oidc;

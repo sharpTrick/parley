@@ -9,6 +9,7 @@ import {
   InvalidTokenError,
   OAuthError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ParleyOAuthProvider, type ParleyOAuthProviderOptions } from './oauth-provider.js';
@@ -846,6 +847,86 @@ describe('ParleyOAuthProvider — a resource this AS does not serve is refused u
       await expect(p.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
     },
   );
+});
+
+/**
+ * `verifyAccessToken`'s return value becomes `req.auth` on every protected request, so anything
+ * mutable in it is a handle on the token store. Pushing a scope onto `info.scopes` used to widen the
+ * stored grant permanently — and the refresh-narrowing check reads the same array, so every later
+ * rotation carried the injected scope too. One row per mutable field, asserting a second read of the
+ * same credential AND a rotation of its grant are unchanged.
+ */
+interface MutableField {
+  name: string;
+  mutate: (info: AuthInfo) => void;
+}
+
+const MUTABLE_FIELDS: MutableField[] = [
+  { name: 'scopes (push)', mutate: (info) => void info.scopes.push('admin') },
+  { name: 'scopes (splice)', mutate: (info) => void info.scopes.splice(0, info.scopes.length) },
+  {
+    name: 'resource (pathname)',
+    mutate: (info) => {
+      if (info.resource !== undefined) info.resource.pathname = '/elsewhere';
+    },
+  },
+];
+
+describe('ParleyOAuthProvider — nothing it hands out is a handle on its own store', () => {
+  it.each(MUTABLE_FIELDS.map((f): [string, MutableField] => [f.name, f]))(
+    'mutating %s of an AuthInfo changes neither a re-read nor a rotation',
+    async (_name: string, field: MutableField) => {
+      const p = makeProvider(() => 5_000_000);
+      const client = makeClient();
+      const pair = issuePair(p, client);
+
+      const before = await p.verifyAccessToken(pair.access);
+      const snapshot = { scopes: [...before.scopes], resource: before.resource?.href };
+      expect(snapshot.scopes.length).toBeGreaterThan(0);
+      expect(snapshot.resource).toBeTypeOf('string');
+      field.mutate(before);
+
+      const after = await p.verifyAccessToken(pair.access);
+      expect(after.scopes).toEqual(snapshot.scopes);
+      expect(after.resource?.href).toBe(snapshot.resource);
+
+      const rotated = await p.exchangeRefreshToken(client, pair.refresh);
+      expect(rotated.scope).toBe(snapshot.scopes.join(' '));
+      const info = await p.verifyAccessToken(rotated.access_token);
+      expect(info.scopes).toEqual(snapshot.scopes);
+      expect(info.resource?.href).toBe(snapshot.resource);
+    },
+  );
+
+  // The other direction: an array the CALLER still holds. The SDK owns the scopes it passes to
+  // exchangeRefreshToken, so storing that array by reference lets the caller edit the grant after
+  // the fact — a defect reachable with no access to the provider's internals at all.
+  it('an array the caller keeps after exchangeRefreshToken is not the stored grant', async () => {
+    const p = makeProvider(() => 5_200_000);
+    const client = makeClient();
+    const pair = issuePair(p, client);
+
+    const requested = ['mcp'];
+    const tokens = await p.exchangeRefreshToken(client, pair.refresh, requested);
+    requested.push('admin');
+
+    expect((await p.verifyAccessToken(tokens.access_token)).scopes).toEqual(['mcp']);
+    if (tokens.refresh_token === undefined) throw new Error('missing refresh token');
+    expect((await p.exchangeRefreshToken(client, tokens.refresh_token)).scope).toBe('mcp');
+  });
+
+  it('a widened AuthInfo cannot be laundered through the refresh narrowing check', async () => {
+    const p = makeProvider(() => 5_100_000);
+    const client = makeClient();
+    const pair = issuePair(p, client);
+
+    const info = await p.verifyAccessToken(pair.access);
+    info.scopes.push('admin');
+
+    await expect(p.exchangeRefreshToken(client, pair.refresh, ['admin'])).rejects.toBeInstanceOf(
+      InvalidScopeError,
+    );
+  });
 });
 
 describe('ParleyOAuthProvider — the DCR cap never evicts a client that is in use', () => {

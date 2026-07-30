@@ -281,7 +281,13 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     if (rec.resource !== undefined && rec.resource.href !== this.opts.resource.href) {
       throw new InvalidTokenError('access token is invalid or expired');
     }
-    return rec;
+    // Copy every mutable field out, so that a consumer mutating req.auth cannot widen the stored
+    // grant — the refresh-narrowing check reads the same array on every later rotation.
+    return {
+      ...rec,
+      scopes: [...rec.scopes],
+      ...(rec.resource !== undefined ? { resource: new URL(rec.resource.href) } : {}),
+    };
   }
 
   /**
@@ -320,14 +326,14 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     this.access.set(accessToken, {
       token: accessToken,
       clientId,
-      scopes,
+      scopes: [...scopes],
       expiresAt: Math.floor(this.now() / 1000) + ACCESS_TTL_SEC,
       resource: resourceUrl,
       grantId,
     });
     this.refresh.set(refreshToken, {
       clientId,
-      scopes,
+      scopes: [...scopes],
       resource,
       expiresAtMs: this.now() + REFRESH_TTL_SEC * 1000,
       grantId,

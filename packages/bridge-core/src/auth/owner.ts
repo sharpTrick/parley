@@ -57,10 +57,26 @@ function parseParams(block: string): ScryptParams {
       `invalid owner secret hash (scrypt parameters must be exactly N, r and p, got "${block}")`,
     );
   }
-  if (N < 2 || (N & (N - 1)) !== 0 || r < 1 || p < 1) {
+  if (!isUsableCost({ N, r, p })) {
     throw new Error(`invalid owner secret hash (scrypt parameters out of range: "${block}")`);
   }
   return { N, r, p };
+}
+
+// Keep these ceilings inside what node:crypto will accept and allocate, so that a stored record can
+// never defer its failure to a RangeError on the owner's only login path. Testing N with `&` is out
+// for the same reason: bitwise operands truncate to int32.
+const MAX_SCRYPT_MEMORY = 1 << 30;
+const MAX_R = 64;
+const MAX_P = 16;
+
+/** Every precondition node:crypto's scrypt puts on N, r and p, plus a memory ceiling of our own. */
+function isUsableCost({ N, r, p }: ScryptParams): boolean {
+  if (!Number.isSafeInteger(N) || !Number.isSafeInteger(r) || !Number.isSafeInteger(p)) return false;
+  if (N < 2 || r < 1 || r > MAX_R || p < 1 || p > MAX_P) return false;
+  if (128 * r * (N + p + 2) > MAX_SCRYPT_MEMORY) return false;
+  if (N >= 2 ** (16 * r)) return false;
+  return Math.log2(N) % 1 === 0;
 }
 
 /** Hash an owner passphrase as `scrypt$N=..,r=..,p=..$<saltB64>$<hashB64>` for at-rest storage. */

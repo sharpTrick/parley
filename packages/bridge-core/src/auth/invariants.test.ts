@@ -146,6 +146,206 @@ describe('remote-mode boot invariants are enforced at the factory, not only in t
 });
 
 /**
+ * A boot invariant that mirrors a schema rule must mirror ALL of it. The schema says a gate is a
+ * NON-EMPTY list of non-empty strings; a factory check that only asks "is the key present" accepts
+ * `allowed_subjects: []`, which satisfies "a gate exists" and matches nobody — the server boots
+ * healthy and then 401s every valid token, with nothing at boot naming the cause. The same halving
+ * applies to every bounded scalar in the block, so each key is crossed with the degenerate values
+ * its schema rule excludes AND with the extremes that rule allows.
+ */
+interface OidcValueRow {
+  key: string;
+  value: unknown;
+  outcome: { refuses: RegExp } | 'boots';
+}
+
+const BLANK_GATE = /must name at least one non-blank value/;
+
+const OIDC_VALUE_ROWS: OidcValueRow[] = [
+  ...['allowed_subjects', 'allowed_usernames'].flatMap((key) =>
+    [
+      [[], BLANK_GATE],
+      [[''], BLANK_GATE],
+      [[' '], BLANK_GATE],
+      [['\t'], BLANK_GATE],
+      [['real-value', ''], BLANK_GATE],
+    ].map(([value, refuses]): OidcValueRow => ({ key, value, outcome: { refuses: refuses as RegExp } })),
+  ),
+  { key: 'required_role', value: '', outcome: { refuses: BLANK_GATE } },
+  { key: 'required_role', value: '   ', outcome: { refuses: BLANK_GATE } },
+  { key: 'allowed_subjects', value: ['real-value'], outcome: 'boots' },
+  { key: 'allowed_usernames', value: ['a', 'b'], outcome: 'boots' },
+  { key: 'required_role', value: 'parley-owner', outcome: 'boots' },
+  { key: 'audience', value: '', outcome: { refuses: /audience must not be blank/ } },
+  { key: 'audience', value: '  ', outcome: { refuses: /audience must not be blank/ } },
+  { key: 'audience', value: 'parley-mcp', outcome: 'boots' },
+  ...[-1, 301, Number.NaN, Number.POSITIVE_INFINITY, 1.5].map(
+    (value): OidcValueRow => ({
+      key: 'clock_skew_s',
+      value,
+      outcome: { refuses: /clock_skew_s must be an integer between 0 and 300/ },
+    }),
+  ),
+  { key: 'clock_skew_s', value: 0, outcome: 'boots' },
+  { key: 'clock_skew_s', value: 300, outcome: 'boots' },
+];
+
+describe('a factory check that mirrors a schema rule must mirror all of it', () => {
+  it.each(
+    OIDC_VALUE_ROWS.map((row): [string, OidcValueRow] => [
+      `${row.key}: ${typeof row.value === 'number' ? String(row.value) : JSON.stringify(row.value)} ${
+        row.outcome === 'boots' ? 'boots' : 'is refused'
+      }`,
+      row,
+    ]),
+  )('%s', async (_name: string, row: OidcValueRow) => {
+    // A gate key under test supplies its own gate; every other key needs one beside it, so the
+    // row cannot pass on the identity-gate error it was not written to provoke.
+    const isGate = row.key.startsWith('allowed_') || row.key === 'required_role';
+    const build = oidcApp({
+      ...(isGate ? {} : { allowed_subjects: ['owner-sub'] }),
+      [row.key]: row.value,
+    });
+    if (row.outcome === 'boots') {
+      const server = await build();
+      opened.push(server);
+      expect(server.resource.pathname).toBe('/mcp');
+      return;
+    }
+    await expect(build()).rejects.toThrow(row.outcome.refuses);
+  });
+
+  it('an empty gate is refused rather than booting a server that rejects a valid token', async () => {
+    // The defect this row exists for was reachable only end to end: the factory accepted
+    // allowed_subjects: [], the app served PRM, and a correct IdP token then 401'd forever.
+    await expect(oidcApp({ allowed_subjects: [] })()).rejects.toThrow(BLANK_GATE);
+    const server = await oidcApp({ allowed_subjects: ['owner-sub'] })();
+    opened.push(server);
+    const port = Number(server.resource.port);
+    await server.listen(port);
+    const token = await idp.mint({ aud: server.resource.href, sub: 'owner-sub' });
+    const res = await fetch(server.resource.href, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+/**
+ * Every option `createRemoteAuthApp` accepts belongs to exactly one mode, and the selector forwards
+ * only its own mode's. Silently discarding the other mode's is worst for `trustProxy`: it is what
+ * keys the rate limiters, so a caller who sets it and is ignored believes they are protected from a
+ * flood that can lock the owner out of the only path that authorizes the bridge.
+ */
+interface ModeOption {
+  key: string;
+  mode: 'builtin' | 'oidc';
+  value: (recorder: { called: string[] }) => unknown;
+  /** What proves the value reached the server it was forwarded to. */
+  observe: (server: RemoteAuthServer, recorder: { called: string[] }) => Promise<void>;
+}
+
+const MODE_OPTIONS: ModeOption[] = [
+  {
+    key: 'verifyOwner',
+    mode: 'builtin',
+    value: () => async () => true,
+    observe: async (server) => {
+      expect(server).toHaveProperty('provider');
+    },
+  },
+  {
+    key: 'trustProxy',
+    mode: 'builtin',
+    value: () => 'loopback',
+    observe: async (server) => {
+      expect(server.app.get('trust proxy')).toBe('loopback');
+    },
+  },
+  {
+    key: 'scopesSupported',
+    mode: 'builtin',
+    value: () => ['mcp', 'parley:admin'],
+    observe: async (server) => {
+      const port = Number(server.resource.port);
+      await server.listen(port);
+      const as = (await (
+        await fetch(`${server.resource.origin}/.well-known/oauth-authorization-server`)
+      ).json()) as Record<string, unknown>;
+      expect(as.scopes_supported).toEqual(['mcp', 'parley:admin']);
+    },
+  },
+  {
+    key: 'fetchFn',
+    mode: 'oidc',
+    value: (recorder) => (async (input: unknown, init?: RequestInit) => {
+      recorder.called.push(String(input));
+      return fetch(String(input), init);
+    }) as unknown as typeof fetch,
+    observe: async (_server, recorder) => {
+      expect(recorder.called).toHaveLength(1);
+      expect(recorder.called[0]).toContain('/.well-known/openid-configuration');
+    },
+  },
+];
+
+async function buildInMode(
+  mode: 'builtin' | 'oidc',
+  extra: Record<string, unknown>,
+): Promise<RemoteAuthServer> {
+  const origin = `http://127.0.0.1:${await freePort()}`;
+  const cfg =
+    mode === 'oidc'
+      ? parseConfig({
+          identity: { handle: 'agent' },
+          topics: ['ctx'],
+          auth: { mode: 'oidc', oidc: { issuer: idp.issuer, allowed_subjects: ['owner-sub'] } },
+        })
+      : baseCfg();
+  return createRemoteAuthApp(plugin, cfg, {
+    publicUrl: new URL(origin),
+    ...(mode === 'builtin' && extra.verifyOwner === undefined ? { verifyOwner: async () => true } : {}),
+    ...extra,
+  });
+}
+
+describe('the front-door selector never silently discards an option belonging to the other mode', () => {
+  it.each(MODE_OPTIONS.map((o): [string, ModeOption] => [`${o.key} (${o.mode} only)`, o]))(
+    '%s is refused by name in the other mode',
+    async (_name: string, option: ModeOption) => {
+      const other = option.mode === 'builtin' ? 'oidc' : 'builtin';
+      const recorder = { called: [] as string[] };
+      await expect(
+        buildInMode(other, { [option.key]: option.value(recorder) }),
+      ).rejects.toThrow(new RegExp(option.key));
+    },
+  );
+
+  it.each(MODE_OPTIONS.map((o): [string, ModeOption] => [`${o.key} (${o.mode} only)`, o]))(
+    '%s is observable on the server it belongs to',
+    async (_name: string, option: ModeOption) => {
+      const recorder = { called: [] as string[] };
+      const server = await buildInMode(option.mode, { [option.key]: option.value(recorder) });
+      opened.push(server);
+      await option.observe(server, recorder);
+    },
+  );
+
+  it('names every option it refuses, not just the first', async () => {
+    const build = (): Promise<RemoteAuthServer> =>
+      buildInMode('oidc', { trustProxy: 'loopback', scopesSupported: ['mcp'] });
+    await expect(build()).rejects.toThrow(/trustProxy/);
+    await expect(build()).rejects.toThrow(/scopesSupported/);
+  });
+});
+
+/**
  * The advertised RFC 9728 resource id is `publicUrl + mcpPath` — a function of TWO inputs, both
  * caller-supplied, which keeps only scheme, host and port of the first. A base URL varying in ANY
  * other component, or a path that is not a plain path on that origin, is therefore either refused
@@ -175,6 +375,17 @@ const BASE_URL_SHAPES: BaseUrlShape[] = [
   { shape: 'http://owner:hunter2@127.0.0.1:PORT/', outcome: { refuses: /userinfo credentials/ } },
   { shape: 'https://owner:hunter2@parley.example.com/', outcome: { refuses: /userinfo credentials/ } },
   { shape: 'http://parley.example.com/', outcome: { refuses: /https outside loopback/ } },
+  // Every shape this guard accepts must boot on EVERY front door. IPv6 loopback used to pass here
+  // and then die inside the SDK with "Issuer URL must be HTTPS" on the built-in door only, pointing
+  // the operator at TLS, which cannot help — so the refusal must carry OUR message, naming the rule.
+  {
+    shape: 'http://[::1]:PORT/',
+    outcome: { refuses: /Only 127\.0\.0\.1 and localhost are exempt/ },
+  },
+  {
+    shape: 'http://[::1]:PORT',
+    outcome: { refuses: /IPv6 loopback is not/ },
+  },
 ];
 
 const shapeName = (s: BaseUrlShape): string =>
@@ -207,6 +418,26 @@ const MCP_PATH_SHAPES: McpPathShape[] = [
   { path: `/${BACKSLASH}evil.example/mcp`, outcome: { refuses: /plain path on the/ } },
   { path: '/mcp?x=1', outcome: { refuses: /plain path on the/ } },
   { path: '/mcp#f', outcome: { refuses: /plain path on the/ } },
+  // A path that NORMALIZES survives every clause above — same origin, no query, no fragment — and
+  // is caught only by the byte-for-byte pathname round-trip. Without it `/mcp/../admin` advertises
+  // `<origin>/admin` while Express registers the literal string, so nothing the operator consented
+  // to can ever be reached.
+  { path: '/mcp/../admin', outcome: { refuses: /plain path on the/ } },
+  { path: '/./mcp', outcome: { refuses: /plain path on the/ } },
+  { path: '/mcp/./v1', outcome: { refuses: /plain path on the/ } },
+  { path: '/MCP/../mcp', outcome: { refuses: /plain path on the/ } },
+  { path: '/mcp//v1', outcome: { refuses: /literal path of/ } },
+  // Express reads the same string as a route pattern, a grammar `new URL` knows nothing about:
+  // '/mcp:v1' registered a named parameter and served every /mcp<suffix>, and '/mcp*' threw an
+  // opaque path-to-regexp error at boot instead of ours.
+  { path: '/mcp:v1', outcome: { refuses: /literal path of/ } },
+  { path: '/:x', outcome: { refuses: /literal path of/ } },
+  { path: '/mcp*', outcome: { refuses: /literal path of/ } },
+  { path: '/mcp(a)', outcome: { refuses: /literal path of/ } },
+  { path: '/mcp+', outcome: { refuses: /literal path of/ } },
+  { path: '/mcp%2Fx', outcome: { refuses: /literal path of/ } },
+  { path: '/m cp', outcome: { refuses: /plain path on the/ } },
+  { path: '/mcp{a}', outcome: { refuses: /plain path on the/ } },
 ];
 
 interface FrontDoor {
@@ -299,6 +530,37 @@ describe('the advertised resource id must match the URL the endpoint is served a
       expect(server.resource.origin).toBe(base.origin);
     },
   );
+
+  /**
+   * The refusals above are a property of one string; this is a property of the running server. The
+   * advertised resource identifier must be the WHOLE served route set — a 404 on a neighbouring
+   * path is the ceiling, and the 401 on the advertised path is the floor that stops the whole row
+   * from passing on a server that serves nothing at all.
+   */
+  const ACCEPTED_PATHS = MCP_PATH_SHAPES.filter((s) => 'boots' in s.outcome).map((s) => s.path);
+
+  it.each(ACCEPTED_PATHS)('mcpPath %s is served at exactly that path and nowhere near it', async (mcpPath: string) => {
+    const port = await freePort();
+    const server = await FRONT_DOORS[1]!.build(new URL(`http://127.0.0.1:${port}`), mcpPath);
+    opened.push(server);
+    await server.listen(port);
+    const post = (path: string): Promise<Response> =>
+      fetch(`http://127.0.0.1:${port}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        body: '{}',
+      });
+
+    expect((await post(mcpPath)).status).toBe(401);
+    for (const neighbour of [
+      `${mcpPath}TOTALLY-ELSE`,
+      `${mcpPath}/extra`,
+      `${mcpPath.slice(0, -1)}`,
+      `${mcpPath}.json`,
+    ]) {
+      expect((await post(neighbour)).status, `POST ${neighbour}`).toBe(404);
+    }
+  });
 });
 
 /**
@@ -373,6 +635,28 @@ const TRUST_ROOT_ROWS: TrustRootRow[] = [
     oidc: () => ({ issuer: HTTPS_ISSUER, allowed_subjects: ['owner-sub'], clock_skew_s: 30 }),
     discovery: { issuer: HTTPS_ISSUER, jwks_uri: 'http://jwks.attacker-reachable.example/keys' },
     refuses: /jwks_uri must use https outside loopback/,
+  },
+  // IPv6 loopback is not a loopback exemption anywhere, so the trust-root guard has to agree with
+  // the base-URL guard: one set, one policy, both messages ours.
+  {
+    name: 'issuer http on IPv6 loopback',
+    oidc: () => ({
+      issuer: 'http://[::1]:8080/realms/parley',
+      allowed_subjects: ['owner-sub'],
+      clock_skew_s: 30,
+    }),
+    refuses: /auth\.oidc\.issuer must use https outside loopback/,
+  },
+  {
+    name: 'jwks_uri pinned to http on IPv6 loopback',
+    oidc: () => ({
+      issuer: HTTPS_ISSUER,
+      jwks_uri: 'http://[::1]:9/keys',
+      allowed_subjects: ['owner-sub'],
+      clock_skew_s: 30,
+    }),
+    discovery: { issuer: HTTPS_ISSUER, jwks_uri: 'https://kc.corp.example/realms/parley/certs' },
+    refuses: /auth\.oidc\.jwks_uri must use https outside loopback/,
   },
   {
     name: 'jwks_uri that is not a URL at all',

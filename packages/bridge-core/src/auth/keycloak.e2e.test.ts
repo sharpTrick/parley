@@ -206,6 +206,53 @@ if (OPTED_OUT) {
       }
     });
 
+    /**
+     * The offline near-miss table drives a fake IdP; this drives a real realm without touching it.
+     * Each gate is derived from the LIVE claims of a real user, perturbed one way, so the token
+     * under test is genuinely valid and differs from the gate only in the way named. In Keycloak
+     * every realm on a host shares one origin and one JWKS, so exactness here is the whole of the
+     * single-tenant posture.
+     */
+    it.each([
+      ['a gate that is a prefix of the real value', (v: string) => v.slice(0, -1)],
+      ['a gate the real value is a prefix of', (v: string) => `${v}-staging`],
+      ['a gate differing only in case', (v: string) => v.toUpperCase()],
+      ['a gate with the real value as a substring', (v: string) => `x${v}x`],
+      ['a gate with trailing whitespace', (v: string) => `${v} `],
+    ])('refuses a live realm token against %s', async (_label: string, perturb: (v: string) => string) => {
+      const token = await accessToken('parley', 'parleypass');
+      const claims = decodeJwtPayload(token);
+      const sub = claims.sub as string;
+      const username = claims.preferred_username as string;
+      expect(sub).toBeTypeOf('string');
+      expect(username).toBe('parley');
+
+      for (const gate of [
+        { allowed_subjects: [perturb(sub)] },
+        { allowed_usernames: [perturb(username)] },
+      ]) {
+        const { remote, plugin, origin } = await bootAgainstKeycloak(gate);
+        try {
+          expect((await postMcp(origin, token)).status, JSON.stringify(gate)).toBe(401);
+        } finally {
+          await remote.close();
+          await plugin.disconnect();
+        }
+      }
+
+      // The floor: the same live token against the UNPERTURBED gates is admitted, so a 401 above
+      // cannot be the realm or the audience mapper failing for an unrelated reason.
+      for (const gate of [{ allowed_subjects: [sub] }, { allowed_usernames: [username] }]) {
+        const { remote, plugin, origin } = await bootAgainstKeycloak(gate);
+        try {
+          expect((await postMcp(origin, token)).status, JSON.stringify(gate)).toBe(200);
+        } finally {
+          await remote.close();
+          await plugin.disconnect();
+        }
+      }
+    });
+
     it('refuses a realm ID token presented as a bearer access token', async () => {
       const { id_token } = await passwordGrant('parley', 'parleypass', 'openid');
       expect(id_token).toBeTypeOf('string');

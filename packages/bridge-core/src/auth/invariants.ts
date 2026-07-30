@@ -6,7 +6,10 @@ import type { OidcAuthConfig } from '../config.js';
  * that actually protects the deployment lives here.
  */
 
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+// Keep IPv6 loopback out, so that a base URL this guard accepts always boots on BOTH front doors:
+// the built-in one hands issuerUrl to the SDK, which refuses any non-https issuer whatever its host.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
+const LOOPBACK_LIST = [...LOOPBACK_HOSTS].join(' and ');
 
 /**
  * The advertised RFC 9728 resource identifier is `publicUrl + mcpPath`, and building it drops every
@@ -46,11 +49,15 @@ export function assertPublicBaseUrl(url: URL, field: string): void {
   }
   if (url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
     throw new Error(
-      `${field} must use https outside loopback (got "${url.href}"). The bearer tokens and the ` +
-        `owner passphrase this origin carries have no confidentiality without TLS.`,
+      `${field} must use https outside loopback (got "${url.href}"). Only ${LOOPBACK_LIST} are ` +
+        `exempt, for local development — IPv6 loopback is not, because the built-in OAuth front ` +
+        `door refuses a non-https issuer whatever its host. The bearer tokens and the owner ` +
+        `passphrase this origin carries have no confidentiality without TLS.`,
     );
   }
 }
+
+const LITERAL_PATH = /^(?:\/[A-Za-z0-9._~-]+)+$/;
 
 /**
  * The other operand of the resource identifier. `new URL(mcpPath, base)` will happily accept an
@@ -58,6 +65,11 @@ export function assertPublicBaseUrl(url: URL, field: string): void {
  * a path on this origin at all: the advertised resource, the audience every token is minted with,
  * and the route the app actually serves then disagree, which is a permanent 404 behind a consent
  * the owner already gave. A trailing slash names a different resource than the bare path.
+ *
+ * The same string is also read as an Express route pattern, a THIRD grammar in which ':', '*',
+ * '(', ')' and '+' are metacharacters — `/mcp:v1` registers a named parameter that serves every
+ * `/mcp<anything>`. Requiring a conservative literal charset makes the string mean the same thing
+ * in all three.
  */
 export function canonicalResourceId(base: URL, mcpPath: string, field: string): URL {
   if (!mcpPath.startsWith('/')) {
@@ -91,6 +103,13 @@ export function canonicalResourceId(base: URL, mcpPath: string, field: string): 
         `server does not serve, so every token is minted for an endpoint that answers 404.`,
     );
   }
+  if (!LITERAL_PATH.test(mcpPath)) {
+    throw new Error(
+      `${field} must be a literal path of "/"-separated segments drawn from A-Z a-z 0-9 . _ ~ - ` +
+        `(got "${mcpPath}"). Express reads this same string as a route pattern, where ":", "*", ` +
+        `"(", ")" and "+" match paths other than the one advertised as the resource identifier.`,
+    );
+  }
   return resource;
 }
 
@@ -116,21 +135,62 @@ export function assertTrustRootUrl(url: string, field: string): void {
   }
 }
 
+const MAX_CLOCK_SKEW_S = 300;
+
+function isNonBlank(value: unknown): boolean {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function namesSomebody(value: readonly string[] | string | undefined): boolean {
+  return Array.isArray(value) ? value.length > 0 && value.every(isNonBlank) : isNonBlank(value);
+}
+
 /**
- * Delegated OIDC has no owner-consent step, so an identity gate is the only thing standing between
- * a shared realm and full bridge access for every user in it. `required_scope` does not count —
- * Claude's connector may request no scopes at all.
+ * Every rule the config schema puts on the `auth.oidc` block, restated where it is depended on.
+ * Mirroring a rule only halfway is worse than not mirroring it: `allowed_subjects: []` satisfies
+ * "a gate is present" and matches nothing, so the server boots healthy and then 401s every valid
+ * token with nothing at boot naming the cause. Delegated OIDC has no owner-consent step, so a gate
+ * that matches SOMEONE is the only thing standing between a shared realm and full bridge access for
+ * every user in it — `required_scope` does not count, Claude's connector may request no scopes.
  */
-export function assertIdentityGate(oidc: OidcAuthConfig): void {
-  if (
-    oidc.allowed_subjects === undefined &&
-    oidc.allowed_usernames === undefined &&
-    oidc.required_role === undefined
-  ) {
+export function assertOidcPolicy(oidc: OidcAuthConfig): void {
+  const gates: Array<[string, readonly string[] | string | undefined]> = [
+    ['allowed_subjects', oidc.allowed_subjects],
+    ['allowed_usernames', oidc.allowed_usernames],
+    ['required_role', oidc.required_role],
+  ];
+  const effective = gates.filter(([, value]) => namesSomebody(value));
+  const blank = gates.filter(([, value]) => value !== undefined && !namesSomebody(value));
+  if (blank.length > 0) {
+    throw new Error(
+      `auth.oidc ${blank.map(([name, v]) => `${name}=${JSON.stringify(v)}`).join(', ')} ` +
+        'must name at least one non-blank value. A blank or empty gate is not an open gate — no ' +
+        'token claim can equal it, so the server would boot healthy and then reject the callers ' +
+        'the gate was written to admit. Remove the key or give it a value.',
+    );
+  }
+  if (effective.length === 0) {
     throw new Error(
       'auth.mode "oidc" requires an identity gate: set at least one of allowed_subjects / ' +
         'allowed_usernames / required_role to preserve the single-tenant posture ' +
         '(required_scope alone is not sufficient). See docs/keycloak-integration.md.',
+    );
+  }
+  if (oidc.audience !== undefined && !isNonBlank(oidc.audience)) {
+    throw new Error(
+      `auth.oidc.audience must not be blank (got ${JSON.stringify(oidc.audience)}). Every token ` +
+        'is matched against it exactly, so a blank audience rejects all of them.',
+    );
+  }
+  const skew = oidc.clock_skew_s;
+  if (
+    skew !== undefined &&
+    (!Number.isInteger(skew) || skew < 0 || skew > MAX_CLOCK_SKEW_S)
+  ) {
+    throw new Error(
+      `auth.oidc.clock_skew_s must be an integer between 0 and ${MAX_CLOCK_SKEW_S} seconds ` +
+        `(got ${JSON.stringify(skew)}). A negative or non-finite tolerance is handed straight to ` +
+        'the JWT verifier, and a large one keeps expired tokens alive.',
     );
   }
 }

@@ -113,7 +113,36 @@ const DISCOVERY_CASES: DiscoveryCase[] = [
     respond: () => json(metadataFor(ISSUER)),
     outcome: 'resolves',
   },
+  ...nearMissIssuers(ISSUER),
 ];
+
+/**
+ * The two rejection rows above differ from the configured issuer by ORIGIN, which a compare
+ * downgraded to `new URL(x).origin` still catches. In Keycloak every realm on a host shares one
+ * origin, so the exact string compare is the only thing separating realm `parley` from realm
+ * `corp-everyone` — and each row below is the configured issuer with its PATH perturbed one way.
+ */
+function nearMissVariants(issuer: string): Array<[string, string]> {
+  const { origin, pathname } = new URL(issuer);
+  return [
+    ['a sibling realm on the same host', `${origin}/realms/corp-everyone`],
+    ['a path the configured one has as its prefix', `${origin}${pathname.slice(0, -1)}`],
+    ['a path with the configured one as its prefix', `${origin}${pathname}-staging`],
+    ['a path differing only in case', `${origin}${pathname.toUpperCase()}`],
+    ['a doubled separator', `${origin}//realms/parley`],
+    ['a doubled trailing slash', `${origin}${pathname}//`],
+    ['the bare origin', origin],
+  ];
+}
+
+function nearMissIssuers(issuer: string): DiscoveryCase[] {
+  const { origin } = new URL(issuer);
+  return nearMissVariants(issuer).map(([label, documentIssuer]) => ({
+    name: `the document names ${label} (${documentIssuer})`,
+    respond: () => json(metadataFor(documentIssuer, `${origin}/certs`)),
+    outcome: /does not match configured issuer/,
+  }));
+}
 
 describe('fetchOidcDiscovery — every rejection branch of the boot-time trust-root fetch', () => {
   it.each(DISCOVERY_CASES.map((c) => [c.name, c]))(
@@ -129,6 +158,17 @@ describe('fetchOidcDiscovery — every rejection branch of the boot-time trust-r
       await expect(call).rejects.toThrow(c.outcome);
     },
   );
+
+  // A near-miss row that drifted to another origin would still be refused by an origin-only
+  // compare, and would count as coverage of a check it no longer reaches.
+  it('every near-miss issuer differs from the configured one only below the origin', () => {
+    const variants = nearMissVariants(ISSUER);
+    expect(variants).toHaveLength(7);
+    for (const [, documentIssuer] of variants) {
+      expect(documentIssuer).not.toBe(ISSUER);
+      expect(new URL(documentIssuer).origin).toBe(new URL(ISSUER).origin);
+    }
+  });
 });
 
 describe('fetchOidcDiscovery — the request itself', () => {
