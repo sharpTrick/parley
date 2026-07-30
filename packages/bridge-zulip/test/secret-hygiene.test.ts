@@ -109,22 +109,32 @@ describe('a rejected config value never discloses a secret', () => {
   });
 
   /**
-   * Classification by key NAME cannot see a credential smuggled into a key it calls harmless, and a
-   * URL carries three places one can ride along in. Every declared key meets every hiding place; the
-   * sentinel must reach nothing readable whether the value is accepted or rejected. `site_url` — the
-   * only key whose value is ECHOED when accepted — also declares what must still be said about it,
-   * so a cell cannot pass by the plugin having gone silent.
+   * Classification by key NAME cannot see a credential smuggled into a key it calls harmless, so
+   * every declared key meets every CARRIER a mis-paste can arrive in and the sentinel must reach
+   * nothing readable, whether the value is accepted or rejected. The carriers are deliberately not
+   * all URL-shaped: pinning them to URLs pins the guard to the redaction of the day (a `//…@`
+   * authority), and a bare secret, a whitespace-padded one, a scheme-less one and one whose first
+   * `:`-separated token becomes a URL SCHEME all walk straight past that. `site_url` — the only key
+   * whose value is ECHOED when accepted — also declares what must still be said about it, so a cell
+   * cannot pass by the plugin having gone silent.
    */
-  const SENTINEL_URLS: Array<{ where: string; value: string; siteUrl: 'rejected' | 'warned' }> = [
-    { where: 'URL userinfo', value: `http://bot:${SENTINEL}@zulip.example.com`, siteUrl: 'rejected' },
-    { where: 'a query value', value: `http://zulip.example.com/?token=${SENTINEL}`, siteUrl: 'rejected' },
-    { where: 'a fragment', value: `http://zulip.example.com/#${SENTINEL}`, siteUrl: 'rejected' },
-    { where: 'an unparseable URL', value: `http://bot:${SENTINEL}@`, siteUrl: 'rejected' },
-    { where: 'a path segment', value: `http://zulip.example.com/bot:${SENTINEL}/`, siteUrl: 'warned' },
-  ];
+  const SENTINEL_CARRIERS: Array<{ where: string; value: string; siteUrl: 'rejected' | 'warned' }> =
+    [
+      { where: 'the bare value', value: SENTINEL, siteUrl: 'rejected' },
+      { where: 'a whitespace-padded value', value: `  ${SENTINEL}  `, siteUrl: 'rejected' },
+      { where: 'a JSON-quoted value', value: `"${SENTINEL}"`, siteUrl: 'rejected' },
+      { where: 'a scheme-less host and path', value: `zulip.example.com/${SENTINEL}`, siteUrl: 'rejected' },
+      { where: 'a scheme-less authority', value: `//bot:${SENTINEL}@zulip.example.com`, siteUrl: 'rejected' },
+      { where: 'the scheme position', value: `${SENTINEL}:${SENTINEL}@zulip.example.com`, siteUrl: 'rejected' },
+      { where: 'URL userinfo', value: `http://bot:${SENTINEL}@zulip.example.com`, siteUrl: 'rejected' },
+      { where: 'a query value', value: `http://zulip.example.com/?token=${SENTINEL}`, siteUrl: 'rejected' },
+      { where: 'a fragment', value: `http://zulip.example.com/#${SENTINEL}`, siteUrl: 'rejected' },
+      { where: 'an unparseable URL', value: `http://bot:${SENTINEL}@`, siteUrl: 'rejected' },
+      { where: 'a path segment', value: `http://zulip.example.com/bot:${SENTINEL}/`, siteUrl: 'warned' },
+    ];
 
-  for (const hiding of SENTINEL_URLS) {
-    it(`a secret hidden in ${hiding.where} of any key reaches nothing readable`, async () => {
+  for (const hiding of SENTINEL_CARRIERS) {
+    it(`a secret carried in ${hiding.where} of any key reaches nothing readable`, async () => {
       for (const key of CONFIG_KEYS) {
         const outcome = await attempt(key, hiding.value);
         expect(outcome.readable, `${key} = ${hiding.where}`).not.toContain(SENTINEL);
@@ -136,6 +146,17 @@ describe('a rejected config value never discloses a secret', () => {
       }
     });
   }
+
+  /**
+   * The carrier table grades what must NOT be said; this grades that something still is. A rejection
+   * reporting nothing but the key name is indistinguishable from one reporting the value, so the
+   * shape — the one part of a mis-paste that is safe to print — has to survive the redaction.
+   */
+  it('a rejected site_url still reports its shape, so redaction did not silence the diagnostic', async () => {
+    const outcome = await attempt('site_url', SENTINEL);
+    expect(outcome.readable).toContain(`a ${SENTINEL.length}-character string`);
+    expect((await attempt('site_url', 42)).readable).toContain('a number');
+  });
 
   it('a rejected credential still reports enough to debug: its type and its length', async () => {
     const outcome = await attempt('api_key', NUMERIC_SENTINEL);

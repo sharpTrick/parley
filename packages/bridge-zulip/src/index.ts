@@ -18,7 +18,6 @@ import {
   DEFAULT_DEADLINE_MS,
   delay,
   fetchWithRetry,
-  isLoopbackHost,
   plaintextRemoteOrigin,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
@@ -255,7 +254,7 @@ export class ZulipPlugin implements BackendPlugin {
     const baseUrl = requireHttpUrl(orDefault(cfg.site_url, 'http://127.0.0.1:9991'));
     const email = requireNonEmpty('email', orDefault(cfg.email, 'parley-bot@localhost'));
     const apiKey = requireNonEmpty('api_key', orDefault(cfg.api_key, 'parley-api-key'), true);
-    const stream = requireNonEmpty('stream', orDefault(cfg.stream, 'parley'));
+    const stream = requireStreamName(orDefault(cfg.stream, 'parley'));
     const eventsTimeoutMs = requireEventsTimeout(cfg.events_timeout_ms);
     if (this.connected) await this.disconnect();
     this.baseUrl = baseUrl;
@@ -1251,15 +1250,17 @@ function assertKnownKeys(cfg: object): void {
   }
 }
 
-/** A `//user:password@` authority — the one part of a URL that is a credential by construction. */
-const URL_USERINFO = /\/\/[^/?#\s]*@/;
-
 /**
  * `site_url` must be usable as a base URL now, not at first request — and must be a base URL and
  * nothing else. A credential in it is REFUSED rather than carried: Zulip authenticates from
  * `email`/`api_key`, secret hygiene keys on the config key NAME (`site_url` is not a secret one),
- * and the value is echoed by the plaintext warning and by every diagnostic that names the site.
- * A query or fragment is refused for the same fail-fast reason it would break every request path.
+ * and an accepted value's origin is echoed by the plaintext warning. A query or fragment is refused
+ * for the same fail-fast reason it would break every request path.
+ *
+ * Keep every rejection here reported by SHAPE, so that no part of a mis-pasted credential reaches
+ * stderr and model context: the requirement plus the key name is the whole diagnostic for a URL,
+ * while a bare secret is an unparseable URL and one carrying a `:` is a URL whose SCHEME is the
+ * secret's first token.
  */
 function requireHttpUrl(raw: unknown): string {
   const trimmed = typeof raw === 'string' ? raw.trim().replace(/\/+$/, '') : '';
@@ -1267,14 +1268,14 @@ function requireHttpUrl(raw: unknown): string {
   try {
     parsed = new URL(trimmed);
   } catch {
-    const shown = typeof raw === 'string' ? raw.replace(URL_USERINFO, '//<redacted>@') : raw;
     throw new Error(
-      `backend_config.site_url must be an absolute http(s) URL (got ${describeRejected(shown, 'string')})`,
+      `backend_config.site_url must be an absolute http(s) URL (got ${describeShape(raw)})`,
     );
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(
-      `backend_config.site_url must use http: or https: (got ${JSON.stringify(parsed.protocol)})`,
+      `backend_config.site_url must use http: or https: (got ${describeShape(raw)} carrying ` +
+        'some other scheme)',
     );
   }
   if (parsed.username !== '' || parsed.password !== '') {
@@ -1304,6 +1305,46 @@ function requireNonEmpty(key: string, value: unknown, secret = false): string {
     throw new Error(`backend_config.${key} must be a non-empty string (got ${got})`);
   }
   return value;
+}
+
+/**
+ * What Zulip's `to` would address instead of the stream NAMED by this value, or `undefined` when it
+ * addresses that stream. `zerver/lib/recipient_parsing.py::extract_stream_indicator` decodes `to` as
+ * JSON first and only falls back to a raw name, so a digits-only name is a stream ID and a quoted or
+ * single-element-list name is the name inside it — while the read and register narrows send the same
+ * string as a NAME either way. Reported by KIND rather than by value: a name that happens to be
+ * valid JSON is exactly the shape a mis-pasted numeric credential arrives in.
+ */
+function streamIndicatorTarget(stream: string): string | undefined {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(stream);
+  } catch {
+    return undefined;
+  }
+  if (typeof decoded === 'number') return 'a stream ID';
+  if (typeof decoded === 'string') return 'a differently quoted stream name';
+  if (Array.isArray(decoded)) return 'a stream name wrapped in a JSON list';
+  return 'a JSON literal Zulip refuses as a send target';
+}
+
+/**
+ * A stream name the server will not re-interpret, or a throw naming what it would do with it — the
+ * same arm {@link wireTopic} and {@link requireSendableBody} take, applied to the wire field the
+ * CONFIG supplies: a write that addresses a different stream from the read narrow reports a durable
+ * message id for a message no `fetchRecent` on that topic can ever return.
+ */
+function requireStreamName(value: unknown): string {
+  const stream = requireNonEmpty('stream', value);
+  const target = streamIndicatorTarget(stream);
+  if (target !== undefined) {
+    throw new Error(
+      'backend_config.stream must be a plain stream name: Zulip decodes the send target as a ' +
+        `stream indicator, so this one would address ${target} on every write while every read ` +
+        'narrows on the literal name. Rename the stream.',
+    );
+  }
+  return stream;
 }
 
 /**

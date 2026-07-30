@@ -7,6 +7,7 @@
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { type FakeMember, type FakeZulip, SERVER_CONSTRAINTS } from './fake-zulip.js';
+import { ZulipPlugin } from '../src/index.js';
 import { rand, SENDER, useZulip } from './harness.js';
 
 const boot = useZulip();
@@ -346,10 +347,147 @@ describe('zulip post never lets the server rewrite a write', () => {
   it('every modelled server constraint is claimed by a write row or declared a read constraint', () => {
     const claimed = new Set<string>([
       ...WRITE_REWRITES.flatMap((r) => r.constraints),
+      ...STREAM_INDICATORS.flatMap((r) => r.constraints),
       ...Object.keys(NON_WRITE_CONSTRAINTS),
     ]);
     expect(Object.keys(SERVER_CONSTRAINTS).filter((key) => !claimed.has(key))).toEqual([]);
   });
+});
+
+/**
+ * The same class as the table above, one dimension wider: a write's wire fields are not only the
+ * message's — `backend_config` supplies one too. Zulip's `to` is a stream INDICATOR that is
+ * JSON-decoded before it is read as a name, while the read and register narrows send the same string
+ * as a name with no decoding, so a stream whose name the decoder reinterprets is a `post` that
+ * reports a durable id for a message no `fetchRecent` on that topic can return — the write-only
+ * topic `wireTopic` exists to prevent, arriving through the config instead of through the topic.
+ */
+const STREAM_INDICATORS: Array<{
+  constraints: Array<keyof typeof SERVER_CONSTRAINTS>;
+  name: string;
+  stream: string;
+  /** Absent = a name the decoder leaves alone, which must round-trip through the seam. */
+  refuses?: RegExp;
+}> = [
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a digits-only name, which the decoder reads as a stream ID',
+    stream: '2024',
+    refuses: /stream ID/,
+  },
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a JSON-quoted name',
+    stream: '"parley"',
+    refuses: /quoted/,
+  },
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a name wrapped in a JSON list',
+    stream: '["parley"]',
+    refuses: /JSON list/,
+  },
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a JSON boolean',
+    stream: 'true',
+    refuses: /JSON literal/,
+  },
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a JSON null',
+    stream: 'null',
+    refuses: /JSON literal/,
+  },
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a name with digits in it that is not valid JSON',
+    stream: 'parley-2024',
+  },
+  {
+    constraints: ['parsesStreamIndicator'],
+    name: 'a plain name',
+    stream: 'parley',
+  },
+];
+
+describe('zulip refuses a stream name the server would read as something other than that name', () => {
+  for (const row of STREAM_INDICATORS) {
+    const verdict = row.refuses === undefined ? 'round-trips a post' : 'is refused by connect()';
+    it(`${row.name} ${verdict}`, async () => {
+      const { fake } = await boot();
+      const plugin = new ZulipPlugin();
+      const connecting = plugin.connect({ site_url: fake.url, stream: row.stream });
+      if (row.refuses !== undefined) {
+        await expect(connecting).rejects.toThrow(row.refuses);
+        await expect(plugin.connect({ site_url: fake.url, stream: row.stream })).rejects.toThrow(
+          'backend_config.stream',
+        );
+        return;
+      }
+      await connecting;
+      try {
+        const topic = asTopic(`ind-${rand()}`);
+        await plugin.post(topic, SENDER, 'x');
+        const { messages } = await plugin.fetchRecent({ topic });
+        expect(messages.map((m) => m.content)).toEqual(['x']);
+      } finally {
+        await plugin.disconnect();
+      }
+    });
+  }
+
+  /**
+   * The plugin now refuses every name the decoder reinterprets, which puts the fake's model out of
+   * reach of any call the plugin can make — so, exactly as with the body rewrites above, the model is
+   * graded on the wire. Without this the fake could go back to storing `to` verbatim and the rows
+   * above would be grading a constraint nothing enforces.
+   */
+  const rawSend = async (fake: FakeZulip, to: string, topic: string): Promise<Response> =>
+    fetch(`${fake.url}/api/v1/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ type: 'stream', to, topic, content: 'x' }).toString(),
+    });
+
+  const readsBack = async (fake: FakeZulip, stream: string, topic: string): Promise<number> => {
+    const query = new URLSearchParams({
+      narrow: JSON.stringify([
+        { operator: 'stream', operand: stream },
+        { operator: 'topic', operand: topic },
+      ]),
+      anchor: 'newest',
+      num_before: '10',
+      num_after: '0',
+      apply_markdown: 'false',
+    });
+    const res = await fetch(`${fake.url}/api/v1/messages?${query}`, {
+      headers: {
+        Authorization: `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`,
+      },
+    });
+    return ((await res.json()) as { messages: unknown[] }).messages.length;
+  };
+
+  const DECODED: Array<{ name: string; to: string; narrow: string; status: number; reads: number }> = [
+    { name: 'a bare name is the stream named by it', to: 'plain', narrow: 'plain', status: 200, reads: 1 },
+    { name: 'digits address a stream ID, not the stream named by those digits', to: '2024', narrow: '2024', status: 200, reads: 0 },
+    { name: 'a JSON-quoted name is the name inside the quotes', to: '"plain"', narrow: '"plain"', status: 200, reads: 0 },
+    { name: 'a one-element list is the name inside the list', to: '["plain"]', narrow: '["plain"]', status: 200, reads: 0 },
+    { name: 'a JSON literal is refused outright', to: 'true', narrow: 'true', status: 400, reads: 0 },
+  ];
+
+  for (const row of DECODED) {
+    it(`the fake decodes \`to\` as Zulip does: ${row.name}`, async () => {
+      const { fake } = await boot();
+      const topic = `ind-${rand()}`;
+      expect((await rawSend(fake, row.to, topic)).status).toBe(row.status);
+      expect(await readsBack(fake, row.narrow, topic)).toBe(row.reads);
+    });
+  }
 });
 
 /**

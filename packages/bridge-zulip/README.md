@@ -82,7 +82,7 @@ stream with only bots posting, this never happens on its own.
 | `site_url`          | `http://127.0.0.1:9991`  | Zulip server base URL (docker-zulip dev default port). **Use `https://` for anything but loopback** — the bot `email:api_key` goes out as an HTTP Basic header on every request; a plaintext non-loopback URL is warned about at `connect`. |
 | `email`             | `parley-bot@localhost`   | Bot email for HTTP Basic auth. |
 | `api_key`           | `parley-api-key`         | Bot API key for HTTP Basic auth. |
-| `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. |
+| `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. It reaches the wire three ways — `post`'s `to`, the read narrow, and the event-queue narrow — and only the first is decoded: Zulip reads a send's `to` as a stream *indicator*, JSON first. So a name that is valid JSON (`2024`, `true`, `"parley"`, `["parley"]`) would address a stream **ID**, or a differently spelled name, on writes while every read narrowed on the literal name — a post reporting a durable id for a message no `fetchRecent` can return. Such a name is a `connect()` error. |
 | `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). Clamped to `[250, 600000]` ms, so no value can make the loop spin uncapped. **Sizing it is a rate decision, not a latency one:** every cap spends `2` requests per subscribed topic — the parked poll, then the `dont_block=true` probe that tells a healthy idle cap from a black-holed server — so one topic costs `2 × 60000 / events_timeout_ms` requests a minute (≈5/min at the default; 480/min at the `250` floor) and N topics cost N times that. Zulip bills those against a per-**user** budget whose documented default is `200` requests/minute, so keep `topics × 2 × 60000 / events_timeout_ms` under your server's limit. The floor stops a runaway loop; it does not make every value above it affordable. |
 
 A key `backend_config` does not declare is a **load error** naming it and the accepted set — a
@@ -91,11 +91,18 @@ built-in default key. Every declared key is validated at `connect()`, which thro
 offending key: `site_url` must be a
 bare absolute `http(s)` base URL — no `user:password@` (Zulip authenticates from `email`/`api_key`,
 and a credential in the URL would be echoed by every diagnostic that names the site) and no query or
-fragment — `email`/`api_key`/`stream` must be non-empty, and `events_timeout_ms` must be a positive,
-finite number (`0` is an error, not "no cap"). A key that is present but empty (a bare `site_url:`
-in YAML) is reported rather than silently replaced by its default. A rejection echoes the offending
-value only when its type is the one the key declares; any other type is reported by shape, so a
-credential pasted into the wrong key is not disclosed.
+fragment — `email`/`api_key`/`stream` must be non-empty, `stream` must additionally be a name the
+server's stream-indicator decoder leaves alone (see the table above), and `events_timeout_ms` must be
+a positive, finite number (`0` is an error, not "no cap"). A key that is present but empty (a bare
+`site_url:` in YAML) is reported rather than silently replaced by its default.
+
+A rejection echoes the offending value only when its type is the one the key declares; any other type
+is reported by shape, so a credential pasted into the wrong key is not disclosed. `site_url` never
+echoes its value at all: a URL's content is not the diagnostic — the requirement and the key name are
+— and every shape a mis-pasted secret arrives in is a `site_url` rejection, whether as an unparseable
+URL or as a URL whose *scheme* is the secret's first `:`-separated token. A `stream` the indicator
+decoder would reinterpret is likewise reported by what the server would address instead, not by the
+name, because a name that is valid JSON is exactly the shape a numeric credential arrives in.
 
 Secrets live in `backend_config` / `.env`, never in code.
 

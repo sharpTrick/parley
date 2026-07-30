@@ -318,6 +318,31 @@ describe('zulip backend_config fails at the time the README says it does', () =>
   });
 });
 
+/**
+ * CLASS: a declared key graded only for VALIDATION. Every table above asks whether a value is
+ * accepted or refused; none of them asks whether an accepted value changes anything, and a key that
+ * reaches the wire in more than one place can be honoured in some of them and defaulted in the rest
+ * while every validation row stays green — `stream` was, in all three (`post`'s `to`, the read
+ * narrow, the register narrow), and a subscribe loop registered on the default stream receives
+ * nothing forever without ever erroring. So each declared key is claimed here by where its EFFECT is
+ * graded, the same way `server-constraints.test.ts` forces every modelled server constraint to be
+ * claimed — a key added to `ZulipBackendConfig` fails this until someone says where it is exercised.
+ */
+const CONFIG_EFFECTS: Record<string, string> = {
+  site_url: 'every fixture connects against the fake\'s own URL, and creds-warning.test.ts classifies the configured host',
+  email: 'presence-attribution.test.ts authenticates distinct bots and reads the sender each one stamps',
+  api_key: 'the same rows, plus the 401 case in server-constraints.test.ts',
+  stream: 'stream-scoping.test.ts: post, fetchRecent and subscribe against a configured and a foreign stream',
+  events_timeout_ms: 'the idle push-loop rate table above, which counts polls per cap',
+};
+
+describe('every declared backend_config key is graded for effect, not only for validation', () => {
+  it('claims exactly the declared keys, each with where its effect is exercised', () => {
+    expect(Object.keys(CONFIG_EFFECTS).sort()).toEqual([...DECLARED_CONFIG_KEYS].sort());
+    expect(Object.entries(CONFIG_EFFECTS).filter(([, where]) => where.trim() === '')).toEqual([]);
+  });
+});
+
 describe('zulip backend_config defaults', () => {
   it('an omitted backend_config connects and works against the default-shaped server', async () => {
     const { plugin } = await boot(undefined, { events_timeout_ms: undefined });

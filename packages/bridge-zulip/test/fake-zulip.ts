@@ -31,6 +31,13 @@ export const SERVER_CONSTRAINTS = {
   rejectsNulInBody: true,
   /** `zerver/lib/topic.py` `Q(subject__iexact=…)` — topics (and streams) compare case-folded. */
   foldsTopicCase: true,
+  /**
+   * `zerver/lib/recipient_parsing.py::extract_stream_indicator` — a send's `to` is an INDICATOR, not
+   * a name: it is JSON-decoded first, so an integer addresses a stream BY ID and only a bare or
+   * JSON-quoted string addresses one by name. A narrow's `stream` operand has no such decoding, so a
+   * name the decoder reinterprets is a write and a read addressing two different streams.
+   */
+  parsesStreamIndicator: true,
   /** Every endpoint requires HTTP Basic credentials that match a real bot account. */
   requiresValidCredentials: true,
   /**
@@ -448,8 +455,13 @@ export async function startFakeZulip(opts?: {
           json(res, 400, { result: 'error', code: 'BAD_REQUEST', msg: body.msg });
           return;
         }
+        const to = extractStreamIndicator(form.get('to') ?? ''); // `to` is decoded, not taken as a name
+        if (typeof to !== 'string') {
+          json(res, 400, { result: 'error', code: 'BAD_REQUEST', msg: to.msg });
+          return;
+        }
         const id = append({
-          display_recipient: form.get('to') ?? '',
+          display_recipient: to,
           subject: truncateTopic(form.get('topic') ?? ''), // the server rewrites over-long topics
           content: body,
           sender_email: auth.email,
@@ -695,6 +707,28 @@ function normalizeBody(body: string): string | { msg: string } {
   if (chars.length <= SERVER_CONSTRAINTS.maxMessageLength) return stripped;
   const suffix = SERVER_CONSTRAINTS.bodyTruncationSuffix;
   return chars.slice(0, SERVER_CONSTRAINTS.maxMessageLength - [...suffix].length).join('') + suffix;
+}
+
+/**
+ * `zerver/lib/recipient_parsing.py::extract_stream_indicator` — the stream a send addresses, or the
+ * error the decoder raises. A stream addressed BY ID gets a name no narrow can spell, so the fake
+ * models the SILENT divergence (the write lands in a stream the reader never narrows on) rather than
+ * the 400 a real server gives only when that id happens not to exist.
+ */
+function extractStreamIndicator(raw: string): string | { msg: string } {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    return raw; // no JSON encoding — a raw stream name
+  }
+  if (Array.isArray(decoded)) {
+    if (decoded.length !== 1) return { msg: 'Invalid data type for channel' };
+    decoded = decoded[0];
+  }
+  if (typeof decoded === 'string') return decoded;
+  if (typeof decoded === 'number' && Number.isInteger(decoded)) return `#id:${decoded}`;
+  return { msg: 'Invalid data type for channel' };
 }
 
 /** Zulip stores at most 60 characters of subject, replacing the tail with an ellipsis. */
