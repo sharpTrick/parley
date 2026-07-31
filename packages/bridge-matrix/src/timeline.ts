@@ -36,6 +36,8 @@ const MAX_BACKFILL_PAGES = 50;
  */
 const MESSAGES_ONLY_FILTER = encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
 
+type MessagesPage = { chunk: MatrixEvent[]; start?: string; end?: string };
+
 /**
  * Every read of a room's timeline: the `/messages` pagination that answers a catch-up, and the
  * dedicated bounded `/sync` a blocking read drives when no subscribe loop covers its room.
@@ -131,7 +133,7 @@ export abstract class MatrixTimeline extends MatrixSession {
           : undefined,
       );
       if (!fwdRes.ok) return this.recentWindow(roomId, topic, limit, generation, sinceCursor);
-      const { chunk, end } = (await fwdRes.json()) as { chunk: MatrixEvent[]; end?: string };
+      const { chunk, end } = (await fwdRes.json()) as MessagesPage;
       if (chunk.length === 0) break; // genuine end of timeline.
       // Keep the `since` event both DROPPED and out of the page-fullness count, so that a
       // homeserver whose `/context` `end` token re-includes it can neither re-deliver it nor make
@@ -186,21 +188,14 @@ export abstract class MatrixTimeline extends MatrixSession {
         'GET',
         `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?${fromParam}dir=b&limit=${limit}&filter=${MESSAGES_ONLY_FILTER}`,
       );
-      const { chunk, start, end } = (await res.json()) as {
-        chunk: MatrixEvent[];
-        start?: string;
-        end?: string;
-      };
+      const { chunk, start, end } = (await res.json()) as MessagesPage;
       tailToken ??= start;
       if (chunk.length === 0) break;
       for (const e of chunk) if (this.belongs(e, topic)) collected.push(e);
       if (end === undefined) break;
       from = end;
     }
-    const messages = collected
-      .slice(0, limit)
-      .reverse()
-      .map((e) => eventToMessage(topic, e));
+    const messages = collected.slice(0, limit).reverse().map((e) => eventToMessage(topic, e));
     const nextCursor =
       messages.at(-1)?.cursor ??
       emptyWindowCursor(tailToken, sinceCursor, this.isStale(generation));
@@ -227,7 +222,7 @@ export abstract class MatrixTimeline extends MatrixSession {
         'GET',
         `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(from)}&dir=b&limit=${INCREMENTAL_TIMELINE_LIMIT}`,
       );
-      const { chunk, end } = (await res.json()) as { chunk: MatrixEvent[]; end?: string };
+      const { chunk, end } = (await res.json()) as MessagesPage;
       if (chunk.length === 0) break;
       let reachedBoundary = false;
       for (const e of chunk) {

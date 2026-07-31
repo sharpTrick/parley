@@ -5,11 +5,7 @@ import { MatrixPlugin } from './index.js';
 // IMPORTANT: this is an MCP stdio server — stdout is the JSON-RPC channel. All diagnostics go
 // to stderr; never write to stdout here.
 
-interface CliArgs {
-  config: string;
-}
-
-function parseArgs(argv: string[]): CliArgs {
+function configPath(argv: string[]): string {
   let config = process.env.PARLEY_CONFIG ?? 'parley.config.yaml';
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -23,12 +19,11 @@ function parseArgs(argv: string[]): CliArgs {
       config = arg.slice('--config='.length);
     }
   }
-  return { config };
+  return config;
 }
 
 async function main(): Promise<void> {
-  const { config } = parseArgs(process.argv.slice(2));
-  const cfg: ParleyConfig = loadConfig(config);
+  const cfg: ParleyConfig = loadConfig(configPath(process.argv.slice(2)));
   const plugin = new MatrixPlugin();
   const bridge = await createStdioBridge(plugin, cfg);
   process.stderr.write(

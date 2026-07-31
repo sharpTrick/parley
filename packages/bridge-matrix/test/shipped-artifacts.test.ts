@@ -1,5 +1,6 @@
 import { loadConfig } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ROOM_PRESETS, type MatrixBackendConfig } from '../src/index.js';
@@ -202,7 +203,25 @@ const CORE_SOURCES: Record<string, string> = {
     'utf8',
   ),
 };
-const PLUGIN_SRC = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
+/**
+ * EVERY source file this package ships, concatenated — never one named file. A claim about what the
+ * plugin never does is a claim about the plugin, and a scan pinned to `src/index.ts` keeps passing
+ * the day the code it was written about moves into a sibling module: the assertion stays green while
+ * grading a file that no longer holds the thing it forbids.
+ */
+const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url));
+const SRC_FILES = readdirSync(SRC_DIR, { recursive: true })
+  .map(String)
+  .filter((f) => f.endsWith('.ts'));
+const PLUGIN_SRC = SRC_FILES.map((f) => readFileSync(join(SRC_DIR, f), 'utf8')).join('\n');
+
+describe('the plugin-source scans below grade the whole package', () => {
+  it('finds every module the package ships, not just its entrypoint', () => {
+    expect(SRC_FILES).toContain('index.ts');
+    expect(SRC_FILES.length).toBeGreaterThan(1);
+    expect(PLUGIN_SRC).toContain('class MatrixPlugin');
+  });
+});
 
 interface CoreOwnedClaim {
   /** The string core ships, and where. */

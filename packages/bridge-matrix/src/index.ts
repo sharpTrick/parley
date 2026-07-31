@@ -1,6 +1,6 @@
 import {
   asBackendMsgId, type BackendConfig, type BackendIdentity, type BackendMsgId,
-  type BackendPlugin, type Cursor, type FetchRecentArgs, type FetchRecentResult,
+  type BackendPlugin, type FetchRecentArgs, type FetchRecentResult,
   type Handle, type MessageHandler, type Topic,
 } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
@@ -10,9 +10,8 @@ import {
 } from './config.js';
 import { emptyWindowCursor } from './cursor.js';
 import { reportLoopCrash, reportSyncFailure, syncRetryDelayMs } from './diagnostics.js';
-import {
-  INCREMENTAL_TIMELINE_LIMIT, MatrixTimeline, returnedTooFast, SYNC_IDLE_PACE_MS,
-} from './timeline.js';
+import { liveKey, MatrixParking } from './park.js';
+import { INCREMENTAL_TIMELINE_LIMIT, returnedTooFast, SYNC_IDLE_PACE_MS } from './timeline.js';
 import {
   eventToMessage, type MessageEvent, nextBatchOf,
   syncFilterParam, type SyncResponse, timelineTipOf, TOPIC_KEY,
@@ -23,19 +22,6 @@ export { readRetryAfter } from './wire.js';
 export {
   MAX_SYNC_TIMEOUT_MS, type MatrixBackendConfig, ROOM_PRESETS, type RoomPreset, syncDeadlineMs,
 } from './config.js';
-
-/**
- * A pending native long-poll parked on a room. `topic` is the logical topic it is caught up to (its
- * exclusive `since` floor); `wake` fires EXACTLY once — on a belonging live event, at the `blockMs`
- * timeout, or on `disconnect()` — and tears down its own timer, registration and dedicated `/sync`.
- */
-interface Waiter {
-  topic: Topic;
-  wake: () => void;
-}
-
-/** Live-coverage key: a subscribe loop covers exactly the (room, topic) pair it delivers. */
-const liveKey = (roomId: string, topic: Topic): string => `${roomId}\u0000${String(topic)}`;
 
 /**
  * Matrix (Synapse) backend (DESIGN §6/§9), over the raw Client-Server HTTP API (no SDK; unencrypted
@@ -49,21 +35,8 @@ const liveKey = (roomId: string, topic: Topic): string => `${roomId}\u0000${Stri
  * isolating them by an `app.parley.topic` content tag — the only practical way to run the suite
  * under Synapse's strict per-user room-creation rate limit without an appservice.
  */
-export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
+export class MatrixPlugin extends MatrixParking implements BackendPlugin {
   private txnCounter = 0;
-  /**
-   * room_id → the {@link Waiter}s parked on it, populated only while a `fetchRecent({ blockMs })`
-   * blocks. Independent of `subscribe` — a blocking fetch needs no active route.
-   */
-  private readonly waiters = new Map<string, Set<Waiter>>();
-  /**
-   * (room_id, topic) pairs with a live `subscribe` `/sync` loop running AND already positioned. A
-   * blocking `fetchRecent` hooks that loop's delivery (no second `/sync`) only when its OWN pair is
-   * here. Keep both halves — the loop wakes waiters for the one topic it delivers, so a room-only
-   * key would let `subscribe(A)` starve a waiter on topic B in `shared_room` mode, and registering
-   * before the positioning sync resolves would let a message landing in that window reach neither.
-   */
-  private readonly liveTopics = new Set<string>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as MatrixBackendConfig;
@@ -71,12 +44,10 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
     // connection running instead of tearing it down on the way to a load error.
     validateConfig(cfg);
     this.generation++;
-    this.standDown();
     // Keep the credential cleared BEFORE `baseUrl` moves, so that homeserver A's bearer token can
     // never reach homeserver B — neither on the login request nor on the seam calls that follow a
     // login which failed.
-    this.token = undefined;
-    this.userId = undefined;
+    this.standDown();
     this.baseUrl = (cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL).replace(/\/+$/, '');
     this.serverName = cfg.server_name ?? 'parley.local';
     this.user = cfg.user ?? 'parley';
@@ -109,28 +80,6 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
   async disconnect(): Promise<void> {
     this.stopped = true;
     this.standDown();
-    this.token = undefined;
-    this.userId = undefined;
-  }
-
-  /**
-   * End the current generation's background work and empty every registry describing it. Keep BOTH
-   * lifecycle entry points on this, so that a bare `connect()` — a reconnect with no preceding
-   * `disconnect()` — ends the previous generation's parks at once rather than one park slice later,
-   * which at the documented `sync_timeout_ms` is 25 seconds of a caller's `blockMs` spent on a
-   * generation that is already gone.
-   */
-  private standDown(): void {
-    for (const c of this.controllers) c.abort();
-    this.controllers.clear();
-    this.liveTopics.clear();
-    this.rooms.clear();
-    // Wake every blocked long-poll so its `fetchRecent` returns at once (each wake() clears its timer
-    // and registration). Snapshot first — wake() mutates `waiters` — then clear so nothing outlives
-    // the teardown; the in-flight `/sync` each drives (if any) was already aborted above.
-    const pending = [...this.waiters.values()].flatMap((set) => [...set]);
-    this.waiters.clear();
-    for (const w of pending) w.wake();
   }
 
   async post(
@@ -198,112 +147,6 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
   }
 
   /**
-   * Park until a belonging live event lands in `roomId`, `blockMs` elapses, or `disconnect()` drains
-   * us — then re-run the exclusive `/messages` query so the ids and cursor stay canonical.
-   *
-   * Every empty exit reports `best` — the most advanced cursor the canonical query has produced,
-   * seeded from the pre-block one. Keep it threaded rather than reporting `sinceCursor`, so that a
-   * blocking call reports the position a non-blocking one would: a cursor pinned at `since` cannot
-   * cross a page-sized block of foreign-topic traffic, and everything beyond the forward-page bound
-   * is then unreachable for as long as the caller keeps passing `blockMs`.
-   */
-  private async blockingFetch(
-    roomId: string,
-    topic: Topic,
-    sinceCursor: Cursor,
-    limit: number,
-    blockMs: number,
-    bestCursor: Cursor,
-    generation: number,
-  ): Promise<FetchRecentResult> {
-    const deadline = Date.now() + blockMs;
-    let best = bestCursor;
-    // Wait in a loop so a SPURIOUS wake does not end the call early. The dedicated `/sync` can
-    // re-deliver an event at/before `sinceCursor`, waking the waiter even though the exclusive
-    // re-query is still empty. On such an empty re-query with budget left we re-arm and keep
-    // waiting, so the plugin holds the full `blockMs` like the other native backends.
-    for (;;) {
-      const remaining = deadline - Date.now();
-      if (this.isStale(generation) || remaining <= 0) {
-        return { messages: [], nextCursor: best };
-      }
-
-      let done = false;
-      let timer: ReturnType<typeof setTimeout>;
-      let syncController: AbortController | undefined;
-      let resolveParked!: () => void;
-      const parked = new Promise<void>((resolve) => {
-        resolveParked = resolve;
-      });
-      const waiter: Waiter = {
-        topic,
-        wake: () => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          const set = this.waiters.get(roomId);
-          if (set !== undefined) {
-            set.delete(waiter);
-            if (set.size === 0) this.waiters.delete(roomId);
-          }
-          if (syncController !== undefined) {
-            this.controllers.delete(syncController);
-            syncController.abort();
-          }
-          resolveParked();
-        },
-      };
-      // Keep the park sliced rather than spanning the whole budget, so that a wake source that stops
-      // observing — a subscribe loop in retry backoff, a loop stalled mid-backfill, a dedicated
-      // `/sync` that failed to position — costs one slice of latency and not the entire blockMs.
-      const slice = this.parkSlice(remaining);
-      // Keep the registration ahead of everything below, so that a delivery cannot land while this
-      // waiter is invisible.
-      timer = setTimeout(waiter.wake, slice);
-      const set = this.waiters.get(roomId) ?? new Set<Waiter>();
-      set.add(waiter);
-      this.waiters.set(roomId, set);
-
-      // Keep every exit from here on inside the finally, so that a throw from `fetchSince` cannot
-      // strand this waiter's timer, registration and dedicated `/sync` for the rest of `blockMs`.
-      try {
-        if (this.isStale(generation)) return { messages: [], nextCursor: best };
-
-        if (!this.liveTopics.has(liveKey(roomId, topic))) {
-          syncController = new AbortController();
-          this.controllers.add(syncController);
-          const positioned = this.driveBoundedSync(
-            roomId,
-            topic,
-            slice,
-            syncController,
-            waiter.wake,
-          );
-          // Keep this await ahead of the re-query below, so that a message landing in the
-          // positioning window is seen by the re-query when the sync's `next_batch` already skipped
-          // it. `parked` bounds the wait by the deadline.
-          await Promise.race([positioned, parked]);
-        }
-
-        if (this.isStale(generation)) return { messages: [], nextCursor: best };
-        const recheck = await this.fetchSince(roomId, topic, sinceCursor, limit, generation);
-        if (recheck.messages.length > 0) return recheck;
-        best = recheck.nextCursor;
-
-        await parked;
-        if (this.isStale(generation)) return { messages: [], nextCursor: best };
-        const after = await this.fetchSince(roomId, topic, sinceCursor, limit, generation);
-        if (after.messages.length > 0) return after;
-        best = after.nextCursor;
-        // Empty ⇒ the deadline timer fired or the wake was spurious. Loop: the top re-checks the
-        // deadline and returns the empty page once the budget is spent, else re-arms.
-      } finally {
-        waiter.wake();
-      }
-    }
-  }
-
-  /**
    * A filtered `/sync` long-poll loop (DESIGN §9 — genuine events, not a poll timer). The initial
    * sync yields a `next_batch` that SKIPS history; the loop then delivers every `m.room.message` for
    * this topic appended after it — INCLUDING our own sends — in timeline order.
@@ -366,8 +209,8 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
           // are reachable only by paging `prev_batch` backwards. Recover and deliver them ASCENDING
           // before the new batch so no burst larger than the per-sync cap is silently dropped (the
           // "handler fires once per inbound message" seam contract).
+          let recovered: MessageEvent[] = [];
           if (timeline?.limited === true && timeline.prev_batch !== undefined) {
-            let recovered: MessageEvent[] = [];
             try {
               recovered = await this.backfill(
                 roomId,
@@ -379,13 +222,8 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
             } catch {
               /* backfill is best-effort; anything missed stays reachable via fetchRecent catch-up */
             }
-            for (const e of recovered) {
-              lastDelivered = e.event_id;
-              this.deliver(roomId, topic, e, handler);
-            }
           }
-          for (const e of events) {
-            if (!this.belongs(e, topic)) continue;
+          for (const e of [...recovered, ...events.filter((e) => this.belongs(e, topic))]) {
             lastDelivered = e.event_id;
             this.deliver(roomId, topic, e, handler);
           }
