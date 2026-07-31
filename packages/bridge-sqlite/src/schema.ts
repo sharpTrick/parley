@@ -26,7 +26,6 @@ CREATE TABLE IF NOT EXISTS parley_meta (
 /** `parley_meta` key holding this store's identity — the prefix every cursor carries. */
 export const STORE_ID_KEY = 'store_id';
 
-/** A row as the read paths return it. */
 export interface MessageRow {
   id: number;
   topic: string;

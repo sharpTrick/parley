@@ -1,10 +1,9 @@
-import { chmodSync, closeSync, openSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { precreate, restrictMode } from './at-rest.js';
 import { classifyDbError, errMessage } from './classify.js';
 
-// Lazy CJS require so the native module (better-sqlite3) or the built-in (node:sqlite)
-// is only loaded on demand — and the experimental warning for node:sqlite only appears
-// if we actually fall back to it.
+// Keep this a lazy CJS require rather than a static import, so that node:sqlite's experimental
+// warning reaches an operator only when the fallback is the driver actually in use.
 const require = createRequire(import.meta.url);
 
 export type SqlParam = string | number | bigint | null;
@@ -37,7 +36,6 @@ export interface OpenOptions {
   busyTimeoutMs?: number;
 }
 
-// Minimal structural shapes (we use createRequire, so we don't import the modules' types).
 interface RawStmt {
   run(...p: SqlParam[]): RunResult;
   get(...p: SqlParam[]): unknown;
@@ -95,8 +93,7 @@ function loadBetterSqlite(): (new (p: string) => RawDb) | null {
  * Open a SQLite database with WAL + busy_timeout. Prefers the mature native driver
  * (better-sqlite3); falls back to Node's built-in `node:sqlite` ONLY if the native module fails
  * to *load* (e.g. no prebuilt for this ABI and no toolchain) — an *open* failure (bad path,
- * permissions, corrupt file) surfaces better-sqlite3's own precise message instead. The plugin
- * code above is driver-agnostic.
+ * permissions, corrupt file) surfaces better-sqlite3's own precise message instead.
  */
 export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   const onDisk = path !== ':memory:' && !path.startsWith('file::memory:');
@@ -116,9 +113,7 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   // group/world-readable, and neither driver exposes a mode option. Narrow anything wider, and
   // say so — including when it cannot be done, which is what a second bridge running as a
   // different UID hits.
-  if (onDisk) {
-    for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
-  }
+  if (onDisk) for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
   return driver;
 }
 
@@ -198,42 +193,4 @@ function applyPragmas(driver: SqlDriver, busyTimeoutMs: number): void {
     }
   }
   driver.exec('PRAGMA synchronous = NORMAL');
-}
-
-/**
- * Claim the path at 0600 before anything else can create it. Stay silent on failure, so that a
- * bad path or a permissions problem surfaces the driver's own precise open error below rather
- * than this one.
- */
-function precreate(path: string): void {
-  try {
-    closeSync(openSync(path, 'a', 0o600));
-  } catch {
-    /* the open below reports it */
-  }
-}
-
-/** Narrow a file that is readable beyond its owner, reporting both the change and any failure. */
-function restrictMode(path: string): void {
-  let current: number;
-  try {
-    current = statSync(path).mode & 0o777;
-  } catch {
-    return; // sidecar not created yet
-  }
-  if ((current & 0o077) === 0) return;
-  const target = current & 0o700;
-  try {
-    chmodSync(path, target);
-    process.stderr.write(
-      `parley-sqlite: tightened ${path} from 0${current.toString(8)} to 0${target.toString(8)} ` +
-        `(the message store must not be readable by other accounts)\n`,
-    );
-  } catch (e) {
-    process.stderr.write(
-      `parley-sqlite: cannot restrict ${path} (mode 0${current.toString(8)}, ` +
-        `${e instanceof Error ? e.message : String(e)}) — the message store is readable by other ` +
-        `accounts on this host\n`,
-    );
-  }
 }

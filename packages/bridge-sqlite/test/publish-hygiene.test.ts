@@ -56,20 +56,31 @@ describe('published tarball hygiene', () => {
     expect(existsSync(join(pkgDir, 'LICENSE'))).toBe(true);
   });
 
+  const shippedSources = sourcesUnder('src').filter(
+    (f) => f.endsWith('.ts') && !/\.(test|spec)\.ts$/.test(f),
+  );
+  const readSource = (f: string): string => readFileSync(join(pkgDir, 'src', f), 'utf8');
+
   /**
-   * `driver.ts` is the whole of this package's degraded-mode story: every third-party module it
-   * loads is one it is willing to run WITHOUT, falling back to the `node:` builtin. A hard
-   * `dependencies` entry makes that fallback unreachable through the manifest — npm treats a
+   * A lazy `require()` is this package's whole degraded-mode story: every third-party module
+   * reached that way is one it is willing to run WITHOUT, falling back to the `node:` builtin. A
+   * hard `dependencies` entry makes that fallback unreachable through the manifest — npm treats a
    * failing install script on a non-optional dependency as fatal, so an install with no prebuilt
    * binary and no toolchain aborts before a line of plugin code runs, and the README's graceful
    * path is a promise only an already-working install can keep.
+   *
+   * Scanned across every shipped source rather than the one file that happens to hold the loader
+   * today, so that moving or adding a lazy `require()` cannot carry the check away with it.
    */
-  const driverSource = readFileSync(join(pkgDir, 'src', 'driver.ts'), 'utf8');
-  const FALLBACK_FROM = [...driverSource.matchAll(/\brequire\(\s*'([^']+)'\s*\)/g)]
-    .map((m) => m[1] as string)
-    .filter((id) => !id.startsWith('node:'));
+  const FALLBACK_FROM = [
+    ...new Set(
+      shippedSources.flatMap((f) =>
+        [...readSource(f).matchAll(/\brequire\(\s*'([^']+)'\s*\)/g)].map((m) => m[1] as string),
+      ),
+    ),
+  ].filter((id) => !id.startsWith('node:'));
 
-  it('the driver loads at least one module it can fall back from', () => {
+  it('the package loads at least one module it can fall back from', () => {
     expect(FALLBACK_FROM.length).toBeGreaterThan(0);
   });
 
@@ -101,15 +112,10 @@ describe('published tarball hygiene', () => {
     'node:url': '0.0.0',
   };
 
-  const shippedSources = sourcesUnder('src').filter(
-    (f) => f.endsWith('.ts') && !/\.(test|spec)\.ts$/.test(f),
-  );
   const BUILTINS_USED = [
     ...new Set(
       shippedSources.flatMap((f) =>
-        [
-          ...readFileSync(join(pkgDir, 'src', f), 'utf8').matchAll(/['"](node:[a-z_/]+)['"]/g),
-        ].map((m) => m[1] as string),
+        [...readSource(f).matchAll(/['"](node:[a-z_/]+)['"]/g)].map((m) => m[1] as string),
       ),
     ),
   ].sort();
