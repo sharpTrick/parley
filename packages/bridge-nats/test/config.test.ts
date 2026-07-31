@@ -10,7 +10,7 @@ import {
   type ConnectionOptions,
 } from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { captures, NatsPlugin, plaintextRemoteServer } from '../src/index.js';
+import { captures, NatsPlugin, plaintextRemoteServer, redactUserinfo } from '../src/index.js';
 import { fakeJetStream, injectFake } from './fake-jetstream.js';
 import { declaredConfigKeys, legalStreamName, legalSubject } from './helpers.js';
 
@@ -615,6 +615,13 @@ describe('nats transport safety — a credential on an unencrypted remote link w
     for (const line of warned) expect(line).not.toContain(SECRET);
   });
 
+  it('the warning names the server with any userinfo redacted', () => {
+    expect(plaintextRemoteServer('nats://alice:hunter2@remote.example:4222')).toBe(
+      'nats://<redacted>@remote.example:4222',
+    );
+    expect(plaintextRemoteServer('nats://alice:hunter2@127.0.0.1:4222')).toBeUndefined();
+  });
+
   it('warns once per offending entry when servers is a list', async () => {
     const warned = await warningsFrom({
       servers: ['nats://127.0.0.1:4222', 'nats://a.example.com:4222', 'tls://b.example.com:4222', 'nats://c.example.com:4222'],
@@ -627,6 +634,124 @@ describe('nats transport safety — a credential on an unencrypted remote link w
       'nats://c.example.com:4222',
     ]);
   });
+});
+
+// Class: a credential the operator supplied must never come back OUT of the plugin — not in a
+// warning, not in an error, not in a stack — and a credential the driver will not use must not be
+// accepted in silence. `nats://user:pass@host` is the standard NATS spelling, and nats.js keeps only
+// `url.host` of it (`servers.js` `hostPort()`), so the link is opened anonymously; meanwhile the
+// warning above interpolated the entry verbatim and printed the password. Every axis that selects a
+// different diagnostic path is crossed — the scheme's encryption, the host's class, `tls`, and
+// whether a credential FIELD is set as well — because the leak is a property of the path, not of the
+// address. One representative host per class: the lookalike-host rows of the table above cannot flip
+// anything on this axis.
+describe('nats transport safety — a credential in the servers URL is refused, never echoed', () => {
+  const URL_SECRET = 'url-p4ssw0rd';
+
+  const diagnosticsFrom = async (
+    config: Record<string, unknown>,
+  ): Promise<{ warnings: string[]; error: string }> => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const plugin = new NatsPlugin();
+      const err = await plugin.connect(config).then(() => undefined, (e: unknown) => e);
+      if (err === undefined) await plugin.disconnect();
+      return {
+        warnings: warn.mock.calls.map((c) => String(c[0])),
+        error: err === undefined ? '' : `${String(err)}\n${(err as Error).stack ?? ''}`,
+      };
+    } finally {
+      warn.mockRestore();
+    }
+  };
+
+  const userinfos = [
+    { name: 'no userinfo', prefix: '' },
+    { name: 'a user', prefix: 'alice@' },
+    { name: 'a user and password', prefix: `alice:${URL_SECRET}@` },
+    // Userinfo ends at the LAST `@` — a split on the first one leaves the tail of the password in
+    // whatever the diagnostic prints.
+    { name: 'a password holding an @', prefix: `alice:pa@${URL_SECRET}@` },
+  ];
+  const REMOTE = 'nats.example.com:4222';
+  const addresses = [
+    { scheme: 'nats://', host: REMOTE, plaintext: true, loopback: false },
+    { scheme: 'tls://', host: REMOTE, plaintext: false, loopback: false },
+    { scheme: 'nats://', host: '127.0.0.1:4222', plaintext: true, loopback: true },
+    { scheme: '', host: REMOTE, plaintext: true, loopback: false },
+  ];
+
+  beforeEach(() => {
+    vi.mocked(connect).mockClear();
+  });
+
+  for (const userinfo of userinfos) {
+    for (const address of addresses) {
+      for (const field of [true, false]) {
+        for (const tls of [true, false]) {
+          const server = `${address.scheme}${userinfo.prefix}${address.host}`;
+          const refused = userinfo.prefix !== '';
+          const warns = !refused && address.plaintext && !address.loopback && field && !tls;
+
+          it(`servers ${server} (credential field ${field}, tls ${tls}) ${refused ? 'is refused at connect()' : `warns ${warns ? 'once' : 'not at all'}`}`, async () => {
+            const { warnings, error } = await diagnosticsFrom({
+              servers: server,
+              ...(field ? { token: SECRET } : {}),
+              ...(tls ? { tls: { ca_file: '/tmp/ca.pem' } } : {}),
+            });
+
+            // The property that holds on EVERY row: nothing the config supplied comes back out.
+            for (const line of [...warnings, error]) {
+              expect(line).not.toContain(SECRET);
+              expect(line).not.toContain(URL_SECRET);
+            }
+
+            if (refused) {
+              expect(error).toContain('backend_config.servers');
+              expect(error).toContain(`${address.scheme}<redacted>@${address.host}`);
+              expect(warnings).toEqual([]);
+              expect(vi.mocked(connect)).not.toHaveBeenCalled();
+              return;
+            }
+            expect(error).toBe('');
+            expect(warnings).toHaveLength(warns ? 1 : 0);
+          });
+        }
+      }
+    }
+  }
+
+  it('refuses a list whose OTHER entry carries the credential', async () => {
+    const { error, warnings } = await diagnosticsFrom({
+      servers: ['nats://127.0.0.1:4222', `nats://bob:${URL_SECRET}@b.example.com:4222`],
+      token: SECRET,
+    });
+
+    expect(error).toContain('backend_config.servers');
+    expect(error).not.toContain(URL_SECRET);
+    for (const line of warnings) expect(line).not.toContain(URL_SECRET);
+    expect(vi.mocked(connect)).not.toHaveBeenCalled();
+  });
+
+  // The redaction is what both diagnostics name a server through, so it is graded on the spellings
+  // an address can actually take rather than only on the one the refusal above happens to use.
+  const redactions: { server: string; redacted: string }[] = [
+    { server: 'nats://alice:hunter2@example.com:4222', redacted: 'nats://<redacted>@example.com:4222' },
+    { server: 'alice:hunter2@example.com:4222', redacted: '<redacted>@example.com:4222' },
+    { server: 'nats://alice@example.com:4222', redacted: 'nats://<redacted>@example.com:4222' },
+    // A password may itself hold an `@`: userinfo ends at the LAST one, so a first-`@` split leaks.
+    { server: 'nats://alice:hun@ter2@example.com:4222', redacted: 'nats://<redacted>@example.com:4222' },
+    { server: 'ws://alice:hunter2@[::1]:4222/nats', redacted: 'ws://<redacted>@[::1]:4222/nats' },
+    { server: 'nats://example.com:4222', redacted: 'nats://example.com:4222' },
+    { server: 'example.com:4222', redacted: 'example.com:4222' },
+    { server: '  nats://example.com:4222  ', redacted: 'nats://example.com:4222' },
+  ];
+
+  for (const row of redactions) {
+    it(`redacts ${JSON.stringify(row.server)}`, () => {
+      expect(redactUserinfo(row.server)).toBe(row.redacted);
+    });
+  }
 });
 
 // Class: a decision function reachable only through a rarely-configured path. `captures` is what

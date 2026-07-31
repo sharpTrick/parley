@@ -140,4 +140,34 @@ suite('nats reads see their own subject only, on a stream wider than the topic',
       }
     }, 60_000);
   }
+
+  // The same arena read for its BUDGET rather than its contents. A topic with no message of its own
+  // is the shape where every stream-wide counter says there is a window to read and the filtered
+  // pull answers with nothing — so `block_ms` is kept only if an empty PAGE waits, not merely an
+  // empty predicted window. The rows above cannot see it: each posts before it polls.
+  it('a long-poll on a topic with nothing of its own waits its budget, and wakes on its first message', async () => {
+    const at = await arena();
+    const topic = asTopic(at.topic);
+    const plugin = new NatsPlugin();
+    await plugin.connect(at.cfg);
+    try {
+      await at.publish(at.subject(neighbours[0] as Neighbour), 'outsider-1');
+
+      const started = Date.now();
+      const empty = await plugin.fetchRecent({ topic, blockMs: 2000 });
+      const waited = Date.now() - started;
+      expect(empty.messages).toEqual([]);
+      expect(waited).toBeGreaterThanOrEqual(1500);
+      expect(waited).toBeLessThan(4000);
+
+      const polled = plugin.fetchRecent({ topic, blockMs: 10_000 });
+      await new Promise((r) => setTimeout(r, 300));
+      await plugin.post(topic, asHandle('sys'), 'own-1');
+
+      expect((await polled).messages.map((m) => m.content)).toEqual(['own-1']);
+    } finally {
+      await plugin.disconnect();
+      await at.done();
+    }
+  }, 60_000);
 });

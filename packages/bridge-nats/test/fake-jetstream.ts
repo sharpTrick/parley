@@ -46,7 +46,11 @@ export interface FakeState {
   subject: string;
   /** How many messages ONE fetch yields before ending — the expiry/slow-link fault. */
   yieldLimit: number;
-  /** `streams.info` reports this as `last_seq` (models a message landing after the snapshot). */
+  /**
+   * What `streams.info` reports as `last_seq`, above the newest surviving record: a deleted tail, or
+   * a message on another subject. It moves no per-subject read — `last_by_subj` answers out of the
+   * surviving records either way, which is what the real 2.10 server does.
+   */
   visibleTail?: number;
   /**
    * What one round trip over this link costs: every manager/client call pays it, and so does each
@@ -247,14 +251,9 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
           throw new Error('no message found');
         }
         const subj = req.last_by_subj;
-        const own = state.records.filter((r) => subj !== undefined && subjectMatches(subj, subjectOf(r))).at(-1);
-        // NATS 2.10 answers LAST_BY_SUBJ out of the subject's newest RECORDED sequence, so once
-        // that message is deleted the read 404s rather than naming the surviving one below it.
-        const ownTailDeleted =
-          state.visibleTail !== undefined && own !== undefined && state.visibleTail > own.seq;
         const found =
           req.seq === undefined
-            ? (ownTailDeleted ? undefined : own)
+            ? state.records.filter((r) => subj !== undefined && subjectMatches(subj, subjectOf(r))).at(-1)
             : state.records.find((r) => r.seq === req.seq);
         if (found === undefined) throw new Error('no message found');
         return { seq: found.seq, data: enc.encode(found.data) };
@@ -276,7 +275,6 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         state.deleted.push(name);
         return true;
       },
-      list: () => ({ [Symbol.asyncIterator]: async function* () {} }),
     },
   };
 
@@ -376,7 +374,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
         state.publishMissing -= 1;
         throw new Error('503 no responders — stream not found');
       }
-      const seq = (state.records.at(-1)?.seq ?? 0) + 1;
+      // Keep `visibleTail` in the high-water mark: a sequence a delete left behind is spent, and a
+      // fake that hands it out again models a server that reuses sequence numbers — which is the one
+      // thing this plugin's cursor and dedup key are built on never happening.
+      const seq = Math.max(state.records.at(-1)?.seq ?? 0, state.visibleTail ?? 0) + 1;
       state.records.push({ seq, data: new TextDecoder().decode(data), subject });
       return { seq };
     },

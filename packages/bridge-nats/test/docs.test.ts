@@ -1,9 +1,10 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { asTopic, type Topic } from '@sharptrick/parley-core';
+import { asTopic, type Topic, DEFAULT_HASH_LEN } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
+import { AGREEMENT_ROWS } from './jetstream-agreement.js';
 
 // Class: a public claim must be mechanically tied to the code. README/npm text drifts silently —
 // a reader who believes the wrong claim builds on semantics the plugin does not have — so the
@@ -33,20 +34,27 @@ const names = (topic: Topic): { subject: string; stream: string } => {
 // Exactly the rows of the README's "Topic → subject / stream names" table.
 const documented = [
   { topic: 'deploys', subject: 'parley.deploys', stream: 'PARLEY_deploys' },
-  { topic: 'team.chat', subject: 'parley.team_chat-<sha1-10>', stream: 'PARLEY_team_chat-<sha1-10>' },
-  { topic: 'ops/oncall', subject: 'parley.ops/oncall', stream: 'PARLEY_ops_oncall-<sha1-10>' },
-  { topic: 'red team', subject: 'parley.red_team-<sha1-10>', stream: 'PARLEY_red_team-<sha1-10>' },
+  { topic: 'team.chat', subject: 'parley.team_chat-<sha1>', stream: 'PARLEY_team_chat-<sha1>' },
+  { topic: 'ops/oncall', subject: 'parley.ops/oncall', stream: 'PARLEY_ops_oncall-<sha1>' },
+  { topic: 'red team', subject: 'parley.red_team-<sha1>', stream: 'PARLEY_red_team-<sha1>' },
 ];
+
+// The README spells the suffix width out, so read it at the width core actually mints — a change to
+// DEFAULT_HASH_LEN then fails here as doc drift instead of passing against a stale literal.
+const atDocumentedWidth = (name: string): string =>
+  name.replace('<sha1>', `<sha1-${DEFAULT_HASH_LEN}>`);
 
 const asPattern = (documentedName: string): RegExp =>
   new RegExp(
-    `^${documentedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('<sha1-10>', '[0-9a-f]{10}')}$`,
+    `^${documentedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('<sha1>', `[0-9a-f]{${DEFAULT_HASH_LEN}}`)}$`,
   );
 
 describe('nats docs conformance', () => {
   for (const row of documented) {
     it(`README documents the real subject/stream names for \`${row.topic}\``, () => {
-      expect(readme).toContain(`| \`${row.topic}\` | \`${row.subject}\` | \`${row.stream}\` |`);
+      expect(readme).toContain(
+        `| \`${row.topic}\` | \`${atDocumentedWidth(row.subject)}\` | \`${atDocumentedWidth(row.stream)}\` |`,
+      );
       const actual = names(asTopic(row.topic));
       expect(actual.subject).toMatch(asPattern(row.subject));
       expect(actual.stream).toMatch(asPattern(row.stream));
@@ -97,6 +105,101 @@ describe('nats docs conformance', () => {
     expect(assertions('the range is **not** dense', 'dense')).toEqual([]);
     expect(assertions('sequences are never contiguous', 'contiguous')).toEqual([]);
   });
+
+  // Class: prose that asserts a concrete SERVER behaviour. A banned word list cannot reach these —
+  // the two that shipped ("2.10 answers `last_by_subj` with 404 once the subject's newest has been
+  // deleted", "asking below `first_seq` stalls the pull for its whole expiry") used no banned word
+  // and were simply false, and each was load-bearing: one justified a fall back the server almost
+  // never selects, the other justified a clamp for a reason the clamp does not have. So every prose
+  // line naming a JetStream primitive must be registered here against a row of
+  // `jetstream-agreement.ts`, which is asserted against a real server. A new claim arrives
+  // unregistered and fails this test rather than shipping unverified.
+  const JETSTREAM_PRIMITIVES = ['last_by_subj', 'opt_start_seq', 'first_seq'];
+
+  /** Comment lines in source; README text outside a fenced block. Code is not a claim. */
+  const proseLines = (surface: { name: string; text: string }): string[] => {
+    const markdown = surface.name.endsWith('.md');
+    const out: string[] = [];
+    let fenced = false;
+    for (const line of surface.text.split('\n')) {
+      if (markdown) {
+        if (/^\s*```/.test(line)) fenced = !fenced;
+        else if (!fenced) out.push(line);
+        continue;
+      }
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) out.push(line);
+    }
+    return out;
+  };
+
+  const serverClaims: { surface: string; text: string; verifiedBy: string }[] = [
+    {
+      surface: 'README.md',
+      text: 'ephemeral consumer from `opt_start_seq = since+1` (exclusive)',
+      verifiedBy: 'a pull sees only its filter_subject, from its opt_start_seq',
+    },
+    {
+      surface: 'src/index.ts',
+      text: '`fetchRecent` = an ephemeral consumer from `opt_start_seq`',
+      verifiedBy: 'a pull sees only its filter_subject, from its opt_start_seq',
+    },
+    {
+      surface: 'src/index.ts',
+      text: 'the one shape `last_by_subj` answers with a 404',
+      verifiedBy: 'last_by_subj on a subject that never had a message is not found',
+    },
+    {
+      surface: 'src/index.ts',
+      text: 'a pull below `first_seq` starts at the',
+      verifiedBy: 'a pull below first_seq starts at the first surviving sequence instead of stalling',
+    },
+  ];
+
+  const claimSurfaces = [
+    { name: 'README.md', text: readme },
+    ...sources.map((f) => ({ name: `src/${f.name}`, text: f.text })),
+  ];
+
+  it('finds the prose it is meant to police', () => {
+    const marked = claimSurfaces.flatMap((s) =>
+      proseLines(s).filter((l) => JETSTREAM_PRIMITIVES.some((p) => l.includes(p))),
+    );
+    expect(marked.length).toBeGreaterThanOrEqual(serverClaims.length);
+    expect(proseLines({ name: 'x.ts', text: '  const a = first_seq;' })).toEqual([]);
+  });
+
+  for (const claim of serverClaims) {
+    it(`the claim "${claim.text}" is in ${claim.surface} and is probed live`, () => {
+      const surface = claimSurfaces.find((s) => s.name === claim.surface);
+      expect(surface?.text).toContain(claim.text);
+      expect(AGREEMENT_ROWS.map((r) => r.name)).toContain(claim.verifiedBy);
+    });
+  }
+
+  for (const surface of claimSurfaces) {
+    it(`every ${surface.name} claim naming a JetStream primitive is registered`, () => {
+      const unregistered = proseLines(surface)
+        .filter((line) => JETSTREAM_PRIMITIVES.some((p) => line.includes(p)))
+        .filter((line) => !serverClaims.some((c) => line.includes(c.text)))
+        .map((line) => line.trim());
+
+      expect(unregistered).toEqual([]);
+    });
+  }
+
+  // The two false ones, retired from every surface that could carry them again.
+  const retiredClaims = [
+    "once the subject's newest has been deleted",
+    'sequences the server no longer has',
+    'no sequence check can recognise',
+  ];
+  for (const surface of claimSurfaces) {
+    for (const claim of retiredClaims) {
+      it(`${surface.name} no longer claims "${claim}"`, () => {
+        expect(surface.text.replace(/\s+/g, ' ')).not.toContain(claim);
+      });
+    }
+  }
 
   // An absolute claim over a code path that swallows its own failure is a claim the plugin does not
   // keep. The post-ack incarnation read is best-effort by design, so the README states the window

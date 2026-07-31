@@ -20,9 +20,11 @@ One stream per topic keeps the sequence a clean per-topic monotonic integer, whi
 cursor orders by. Core never compares cursor values — NATS delivers in seq order. The sequence range
 is **not** dense: `max_age` retention prunes the front and message deletes punch holes, so `last_seq
 - since` is an upper bound on what a page can return, never a count. A page therefore also ends when
-the pull falls quiet, not only when that bound is reached: a hole at `last_seq` itself is a position
-no sequence check can recognise, and waiting for it costs every read on the topic the pull's whole
-expiry. A page with no `since` — core's cold start — walks backwards from the topic's tail in
+the pull falls quiet, not only when that bound is reached: a window's top is a *sequence*, not a
+message, so the backwards walk's intermediate windows — and a topic with no message of its own
+inside a wider stream, where the tail can only be the stream's — end above anything the topic will
+be shown, and a pull sized in sequences would wait out its whole expiry on every read. A page with
+no `since` — core's cold start — walks backwards from the topic's tail in
 growing windows and stops as soon as it holds `limit` messages, so a deep hole above the topic's own
 history costs work proportional to the hole rather than to the history under it.
 
@@ -71,15 +73,15 @@ NATS subject tokens may not contain `.`, `*`, `>`, whitespace or a control chara
 names also bar `/` and `\`. A topic is named by a *caller* — `post_topics` is a regex over names an
 untrusted inbound message can choose — so all of those fold to `_` here rather than reaching the
 server inside a name it cannot parse. Because that fold is many-to-one, a folded name also carries
-a `-<sha1-10>` suffix over the raw topic so two distinct topics can never collide onto one stream.
+a `-<sha1-16>` suffix over the raw topic so two distinct topics can never collide onto one stream.
 Topics that are already legal are used verbatim:
 
 | topic | subject (default prefix) | stream (default prefix) |
 |---|---|---|
 | `deploys` | `parley.deploys` | `PARLEY_deploys` |
-| `team.chat` | `parley.team_chat-<sha1-10>` | `PARLEY_team_chat-<sha1-10>` |
-| `ops/oncall` | `parley.ops/oncall` | `PARLEY_ops_oncall-<sha1-10>` |
-| `red team` | `parley.red_team-<sha1-10>` | `PARLEY_red_team-<sha1-10>` |
+| `team.chat` | `parley.team_chat-<sha1-16>` | `PARLEY_team_chat-<sha1-16>` |
+| `ops/oncall` | `parley.ops/oncall` | `PARLEY_ops_oncall-<sha1-16>` |
+| `red team` | `parley.red_team-<sha1-16>` | `PARLEY_red_team-<sha1-16>` |
 
 So `nats stream ls` shows the bare name only for already-legal topics; anything folded carries the
 hash suffix.

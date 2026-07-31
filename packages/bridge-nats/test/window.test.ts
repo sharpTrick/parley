@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 import { fakeJetStream, injectFake, payload, type FakeRecord } from './fake-jetstream.js';
 import { seqOf } from './helpers.js';
+import { AGREEMENT_ROWS, fakeArena, fakePrimitives, PRIMITIVES } from './jetstream-agreement.js';
 
 // Class: the sequence range of a stream is NOT dense. `max_age` retention prunes the front,
 // per-subject limits and message deletes punch holes, so `last_seq - since` over-counts what the
@@ -131,20 +132,37 @@ describe('nats fetch window — a sparse range must not burn the pull expiry', (
     }
   }
 
-  it('an empty read from a long-dead cursor resumes at the retained window, not inside the gap', async () => {
-    const fake = fakeJetStream({ records: stream([11, 12, 13]), yieldLimit: 0 });
-    const plugin = new NatsPlugin();
-    injectFake(plugin, fake, TOPIC);
+  // Class: an EMPTY read of a window whose front has been pruned must resume ABOVE the gap. That
+  // page's cursor is the only thing that moves a reader past sequences the server will never hold
+  // again — one equal to the `since` it was handed re-reads the same dead range on every poll, and
+  // the reader never reaches the retained window at all. Crossed with the position of `since`
+  // relative to `first_seq`, because only the rows BELOW it can tell the two cursors apart.
+  const prunedResumes: { name: string; seqs: number[]; since: string; cursor: number }[] = [
+    { name: 'far below first_seq', seqs: [11, 12, 13], since: '2', cursor: 10 },
+    { name: 'just below first_seq', seqs: [11, 12, 13], since: '5', cursor: 10 },
+    { name: 'at first_seq', seqs: [11, 12, 13], since: '11', cursor: 11 },
+    { name: 'inside the retained window', seqs: [11, 12, 13], since: '12', cursor: 12 },
+    { name: 'below a deep first_seq', seqs: [500, 501], since: '3', cursor: 499 },
+  ];
 
-    const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('2') });
+  for (const row of prunedResumes) {
+    it(`an empty read from a cursor ${row.name} resumes above the gap, losing nothing`, async () => {
+      const fake = fakeJetStream({ records: stream(row.seqs), yieldLimit: 0 });
+      const plugin = new NatsPlugin();
+      injectFake(plugin, fake, TOPIC);
 
-    expect(page.messages).toHaveLength(0);
-    expect(seqOf(page.nextCursor)).toBe(10);
+      const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor(row.since) });
 
-    fake.state.yieldLimit = Number.POSITIVE_INFINITY;
-    const resumed = await plugin.fetchRecent({ topic: TOPIC, since: page.nextCursor });
-    expect(resumed.messages.map((m) => m.content)).toEqual(['m11', 'm12', 'm13']);
-  });
+      expect(page.messages).toHaveLength(0);
+      expect(seqOf(page.nextCursor)).toBe(row.cursor);
+
+      fake.state.yieldLimit = Number.POSITIVE_INFINITY;
+      const resumed = await plugin.fetchRecent({ topic: TOPIC, since: page.nextCursor });
+      expect(resumed.messages.map((m) => m.content)).toEqual(
+        row.seqs.filter((s) => s > row.cursor).map((s) => `m${s}`),
+      );
+    });
+  }
 
   it('draining a pruned stream from a long-dead cursor still yields every retained message', async () => {
     const fake = fakeJetStream({ records: stream([11, 12, 15, 16, 20]), expiryMs: EXPIRY_MS });
@@ -243,6 +261,32 @@ describe('nats fetch window — a stream-wide counter never stands in for the to
     }
   }
 
+  // The shape that has no per-subject anchor at all: `last_by_subj` 404s only when the topic has
+  // never had a message, so this is the one read the widening walk — and the fall back to the
+  // stream's own tail — actually serves. Without a row here that path is graded by nothing.
+  it('a topic with nothing of its own inside a deep foreign stream costs the widening, not the stream', async () => {
+    const fake = fakeJetStream({
+      records: Array.from({ length: 5000 }, (_, i) => ({
+        seq: i + 1,
+        data: payload(`foreign${i + 1}`),
+        subject: FOREIGN_SUBJECT,
+      })),
+      subjects: ['parley.>'],
+      expiryMs: EXPIRY_MS,
+    });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake, TOPIC);
+
+    const page = await plugin.fetchRecent({ topic: TOPIC, limit: 5 });
+
+    expect(page.messages).toEqual([]);
+    expect(seqOf(page.nextCursor)).toBe(0);
+    expect(fake.state.yielded).toBe(0);
+    // The walk really covers the stream — and does it in windows that grow, not one pull per page.
+    expect(fake.state.created.length).toBeGreaterThanOrEqual(4);
+    expect(fake.state.created.length).toBeLessThanOrEqual(8);
+  }, 30_000);
+
   it('reports a foreign tail the way JetStream does: nothing deleted, the stream longer than the topic', async () => {
     const fake = fakeJetStream({ records: withForeignTail([1, 4, 7], 400) });
     const jsm = fake.jsm as {
@@ -304,10 +348,11 @@ describe('nats pull fake fidelity — closing a pull loses what it had not deliv
     expect(seen.length).toBeLessThan(held.length);
   }, 10_000);
 
-  // The other half of the same fidelity: the per-subject tail read the window arithmetic prefers is
-  // NOT always available. A fake that answers it from the surviving records grades an anchor the
-  // server refuses to supply, and the widening the server actually leaves this read to goes ungraded.
-  it('answers last_by_subj the way NATS 2.10 does — a deleted newest message is not found', async () => {
+  // The other half of the same fidelity: the per-subject tail read is what the window arithmetic
+  // anchors on, so a fake that withholds it grades the widening fall back on every shape the server
+  // actually answers precisely. `jetstream-agreement-live.test.ts` is what pins these rows to the
+  // real server; here they only have to hold for the fake.
+  it('answers last_by_subj out of the surviving records, whatever last_seq says', async () => {
     const streams = (records: FakeRecord[], visibleTail?: number): {
       getMessage: (s: string, r: { last_by_subj?: string }) => Promise<{ seq: number }>;
     } =>
@@ -317,13 +362,13 @@ describe('nats pull fake fidelity — closing a pull loses what it had not deliv
         }
       ).streams;
 
-    await expect(streams(stream(held)).getMessage(STREAM, { last_by_subj: OWN })).resolves.toMatchObject({
-      seq: 5,
-    });
-    await expect(streams(stream(held), 5).getMessage(STREAM, { last_by_subj: OWN })).resolves.toMatchObject({
-      seq: 5,
-    });
-    await expect(streams(stream(held), 9).getMessage(STREAM, { last_by_subj: OWN })).rejects.toThrow(
+    for (const tail of [undefined, 5, 9]) {
+      await expect(streams(stream(held), tail).getMessage(STREAM, { last_by_subj: OWN })).resolves.toMatchObject({
+        seq: 5,
+      });
+    }
+    // A subject with no surviving record is the one shape that 404s…
+    await expect(streams(stream([1, 2]), 9).getMessage(STREAM, { last_by_subj: FOREIGN_SUBJECT })).rejects.toThrow(
       /no message found/,
     );
     // …and it answers from the SUBJECT it was handed, not from whatever the stream holds.
@@ -374,6 +419,30 @@ describe('nats pull fake fidelity — closing a pull loses what it had not deliv
       it(row.name, async () => {
         expect(await pullWith(row.cfg, row.max)).toEqual(row.seqs);
       });
+    }
+  });
+
+  // Class: the fake models a server semantic the server does not have, and the suite certifies the
+  // model. `jetstream-agreement.ts` states each semantic ONCE, as an expected literal; these rows
+  // run it against the fake and `jetstream-agreement-live.test.ts` runs the same literal against a
+  // real server, so the two can no longer diverge silently. The coverage row is what keeps it
+  // honest: a primitive added to the fake with no agreement row fails here by default.
+  describe('the fake answers every JetStream primitive it models the way the server does', () => {
+    it('has an agreement row for every primitive the fake models', () => {
+      expect(fakePrimitives()).toEqual([...PRIMITIVES].sort());
+      const covered = [...new Set(AGREEMENT_ROWS.flatMap((row) => row.covers))].sort();
+      expect(covered).toEqual([...PRIMITIVES].sort());
+    });
+
+    for (const row of AGREEMENT_ROWS) {
+      it(row.name, async () => {
+        const arena = fakeArena();
+        try {
+          expect(await row.run(arena)).toEqual(row.expected);
+        } finally {
+          await arena.close();
+        }
+      }, 20_000);
     }
   });
 

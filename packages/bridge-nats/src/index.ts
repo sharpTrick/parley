@@ -186,8 +186,10 @@ export class NatsPlugin implements BackendPlugin {
       MAX_STREAM_NAME_BYTES,
     );
     const retentionDays = validateRetentionDays(cfg.retention_days);
+    assertNoServerCredentials(cfg);
     // Report on stderr, NEVER stdout, so that cli.ts's JSON-RPC channel stays parseable.
     for (const risk of plaintextCredentialRisks(cfg)) console.warn(`[parley-nats] SECURITY: ${risk}`);
+    const epoch = this.epoch;
     this.connecting = true;
     let nc: NatsConnection;
     let jsm: JetStreamManager;
@@ -201,6 +203,16 @@ export class NatsPlugin implements BackendPlugin {
       }
     } finally {
       this.connecting = false;
+    }
+    // Keep the epoch check: `disconnect()` that landed inside this connect() found no handles to
+    // tear down, so publishing these ones now hands a caller that already awaited teardown a live
+    // plugin — and drops a socket whose unbounded reconnect loop nobody can reach.
+    if (this.epoch !== epoch) {
+      await nc.close().catch(() => undefined);
+      throw new Error(
+        'parley-nats: disconnect() landed inside this connect() — the new connection was closed ' +
+          'instead of published. Call connect() again if the plugin is meant to be live.',
+      );
     }
     this.subjectPrefix = subjectPrefix;
     this.streamPrefix = streamPrefix;
@@ -403,25 +415,36 @@ export class NatsPlugin implements BackendPlugin {
       blockMs > 0
         ? this.blockingFetch(stream, args.topic, startSeq, limit, deadline, emptyCursor)
         : { messages: [], nextCursor: emptyCursor };
+    // Keep the wait keyed on an EMPTY PAGE rather than on the pre-check that predicted one: every
+    // counter the pre-check reads is stream-wide, so on a stream wider than the topic it computes a
+    // window the filtered pull then answers with nothing — and a caller's `block_ms` would buy a
+    // server-side consumer create-and-delete instead of the wait it asked for.
+    const pageOrWait = async (messages: Message[], startSeq: number): Promise<FetchRecentResult> => {
+      const nextCursor = this.shortReadCursor(stream, messages, startSeq);
+      return messages.length === 0 && blockMs > 0
+        ? this.blockingFetch(stream, args.topic, startSeq, limit, deadline, nextCursor)
+        : { messages, nextCursor };
+    };
 
     if (info.state.messages === 0) return waitOrNothing(Math.max(lastSeq + 1, 1));
 
     // Every counter in `state` is STREAM-wide, and `last_seq` is a SEQUENCE where `limit` is a
     // COUNT: it moves for a message this topic deleted and for a message on a subject this topic
     // does not own, so a window sized down from it can hold nothing at all. Anchor on the last
-    // message the topic itself has — and keep the fall back to `last_seq`, so that a server which
-    // will not name that message (2.10 answers `last_by_subj` with 404 once the subject's newest
-    // has been deleted) is still served by the widening below.
+    // message the topic itself has — and keep the fall back to `last_seq`, so that a topic with no
+    // message of its own inside a wider stream (the one shape `last_by_subj` answers with a 404) is
+    // still served by the widening below.
     const tailSeq = (await this.tailSequence(stream, args.topic)) ?? lastSeq;
 
     if (since !== undefined && !restarted) {
-      // JetStream prunes from the front (`max_age`), so a `since` older than the retained window
-      // must start at `first_seq`: the gap is gone either way, and asking below it stalls the pull
-      // for its whole expiry waiting on sequences the server no longer has.
+      // JetStream prunes from the front (`max_age`), and a pull below `first_seq` starts at the
+      // first surviving sequence rather than stalling. Keep the clamp anyway, so that an empty read
+      // of a pruned window resumes ABOVE the gap: without it the cursor of that page is the `since`
+      // it was handed, and catch-up re-reads a range the server will never fill again.
       const startSeq = Math.max(since.seq + 1, firstSeq, 1);
       if (startSeq > tailSeq) return waitOrNothing(startSeq);
       const read = await this.pull(stream, args.topic, startSeq, Math.min(limit, tailSeq - startSeq + 1), tailSeq);
-      return { messages: read, nextCursor: this.shortReadCursor(stream, read, startSeq) };
+      return pageOrWait(read, startSeq);
     }
 
     // The since-less page is the NEWEST `limit` messages, and the window above `tailSeq` may hold
@@ -438,7 +461,7 @@ export class NatsPlugin implements BackendPlugin {
       if (startSeq <= firstSeq) break;
       top = startSeq - 1;
     }
-    return { messages: newest, nextCursor: this.shortReadCursor(stream, newest, startSeq) };
+    return pageOrWait(newest, startSeq);
   }
 
   /** Sequence of the topic's own last message, when the server will name it. */
@@ -1101,14 +1124,37 @@ function isStreamMissing(err: unknown): boolean {
 const PLAINTEXT_SCHEMES = ['nats:', 'ws:'];
 /** Where nats.js connects when `backend_config.servers` is unset. */
 const DEFAULT_SERVERS = '127.0.0.1:4222';
+/** What stands in for a URL's userinfo everywhere a server address is named. */
+const REDACTED_USERINFO = '<redacted>';
+
+/** The scheme's `xxx://`, as written, or `''` — a bare `host:port` carries none. */
+const schemePrefix = (server: string): string =>
+  /^[a-z][a-z0-9+.-]*:\/\//i.exec(server)?.[0] ?? '';
+
+/** Where an authority's userinfo ends: the LAST `@`, since a password may hold one. */
+const userinfoEnd = (authority: string): number =>
+  (/^[^/?#]*/.exec(authority)?.[0] ?? '').lastIndexOf('@');
 
 /**
- * The server as written when it would carry the CONNECT frame's credential in the clear, else
- * undefined. nats.js upgrades a `nats://`/`ws://` link only when `backend_config.tls` asks it to or
- * the server refuses to go on without it, and it sends `token`/`user`/`pass` in the first frame
- * either way — so a plaintext scheme to a host we cannot PROVE is loopback is a credential on the
- * wire. Keep an unparseable server on the warned side, so that an address this cannot classify is
- * reported rather than excused.
+ * `server` with any URL userinfo replaced. Keep every diagnostic that names a server routed through
+ * this, so that a password written into the address — `nats://user:pass@host`, the standard NATS
+ * spelling — cannot reach a log line.
+ */
+export function redactUserinfo(server: string): string {
+  const text = server.trim();
+  const prefix = schemePrefix(text);
+  const authority = text.slice(prefix.length);
+  const at = userinfoEnd(authority);
+  return at < 0 ? text : `${prefix}${REDACTED_USERINFO}@${authority.slice(at + 1)}`;
+}
+
+/**
+ * The server as written — userinfo redacted — when it would carry the CONNECT frame's credential in
+ * the clear, else undefined. nats.js upgrades a `nats://`/`ws://` link only when
+ * `backend_config.tls` asks it to or the server refuses to go on without it, and it sends
+ * `token`/`user`/`pass` in the first frame either way — so a plaintext scheme to a host we cannot
+ * PROVE is loopback is a credential on the wire. Keep an unparseable server on the warned side, so
+ * that an address this cannot classify is reported rather than excused.
  */
 export function plaintextRemoteServer(server: string): string | undefined {
   const text = server.trim();
@@ -1119,11 +1165,30 @@ export function plaintextRemoteServer(server: string): string | undefined {
   // for `nats:`, which would excuse under one scheme exactly what it warns about under the other.
   const authority = scheme === undefined ? text : text.slice(scheme.length + 2);
   const host = (/^([^/?#]*)/.exec(authority)?.[1] ?? '')
-    .replace(/^[^@]*@/, '')
+    .slice(userinfoEnd(authority) + 1)
     .replace(/^(\[[^\]]*]):\d+$/, '$1')
     .replace(/^([^:[]*):\d+$/, '$1')
     .toLowerCase();
-  return host !== '' && isLoopbackHost(host) ? undefined : text;
+  return host !== '' && isLoopbackHost(host) ? undefined : redactUserinfo(text);
+}
+
+/**
+ * nats.js builds its server list from the address's HOST alone (`servers.js` `hostPort()` keeps
+ * `url.host`), so a credential written into a `servers` URL never reaches the CONNECT frame and the
+ * link is opened anonymously. Refuse at connect(), naming the field and never the value, rather than
+ * leaving an operator believing a cluster is authenticated.
+ */
+function assertNoServerCredentials(cfg: NatsBackendConfig): void {
+  for (const server of [cfg.servers ?? DEFAULT_SERVERS].flat()) {
+    const text = String(server).trim();
+    const redacted = redactUserinfo(text);
+    if (redacted === text) continue;
+    throw new Error(
+      `parley-nats: backend_config.servers ${JSON.stringify(redacted)} carries a credential in the ` +
+        'URL, which nats.js drops before it connects — the link would be opened anonymously. Put ' +
+        'it in backend_config.user/pass, token, creds_file or nkey_seed instead.',
+    );
+  }
 }
 
 /** Which `backend_config` fields would cross the link, named — never their values. */
