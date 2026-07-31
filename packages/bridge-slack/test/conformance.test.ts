@@ -1,5 +1,12 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
-import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import {
+  asCursor,
+  asHandle,
+  asTopic,
+  type BackendMsgId,
+  type Message,
+  type Topic,
+} from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
@@ -82,6 +89,90 @@ describe('slack socket mode discipline', () => {
       await ctx.cleanup();
     }
   });
+});
+
+/**
+ * CLASS: a successful write must be readable back through the seam, or be refused. `post` is the
+ * seam's ONE durable write path, and the `backendMsgId` it returns is what core hands the model as
+ * proof — so an optional write flag that files the message outside this backend's own read window
+ * turns a reported success into silent loss. Slack's `thread_ts` was exactly that costume: a plain
+ * thread reply is invisible to `conversations.history` AND deliberately dropped on the live path, so
+ * both read paths agreed the message did not exist while `post` reported an id for it.
+ *
+ * Every write shape is crossed with every read path, because a shape that is reachable through one
+ * of them is not lost — and a shape reachable through NONE is the defect, whatever the flag is
+ * called next time.
+ */
+type Ctx = Awaited<ReturnType<typeof makeContext>>;
+
+const READ_PATHS: Array<{
+  name: string;
+  observe: (
+    ctx: Ctx,
+    topic: Topic,
+    write: () => Promise<BackendMsgId>,
+  ) => Promise<{ id: BackendMsgId; seen: BackendMsgId[] }>;
+}> = [
+  {
+    name: 'fetchRecent with no since',
+    observe: async (ctx, topic, write) => {
+      const id = await write();
+      const { messages } = await ctx.plugin.fetchRecent({ topic });
+      return { id, seen: messages.map((m) => m.backendMsgId) };
+    },
+  },
+  {
+    name: 'fetchRecent from the tail cursor',
+    observe: async (ctx, topic, write) => {
+      const { nextCursor } = await ctx.plugin.fetchRecent({ topic });
+      const id = await write();
+      const { messages } = await ctx.plugin.fetchRecent({ topic, since: nextCursor });
+      return { id, seen: messages.map((m) => m.backendMsgId) };
+    },
+  },
+  {
+    name: 'subscribe',
+    observe: async (ctx, topic, write) => {
+      const live: Message[] = [];
+      await ctx.plugin.subscribe(topic, (m) => live.push(m));
+      const id = await write();
+      await vi
+        .waitFor(() => expect(live.map((m) => m.backendMsgId)).toContain(id), {
+          timeout: 3000,
+          interval: 10,
+        })
+        .catch(() => undefined);
+      return { id, seen: live.map((m) => m.backendMsgId) };
+    },
+  },
+];
+
+const WRITES: Array<{ name: string; write: (ctx: Ctx, topic: Topic) => Promise<BackendMsgId> }> = [
+  { name: 'a plain post', write: (ctx, topic) => ctx.plugin.post(topic, asHandle('writer'), 'body') },
+  {
+    name: 'a post({inReplyTo})',
+    write: async (ctx, topic) => {
+      const parent = await ctx.plugin.post(topic, asHandle('writer'), 'question');
+      return ctx.plugin.post(topic, asHandle('writer'), 'answer', { inReplyTo: parent });
+    },
+  },
+];
+
+describe('slack durable writes are reachable through the seam that made them', () => {
+  for (const write of WRITES) {
+    for (const path of READ_PATHS) {
+      it(`${write.name} is observable via ${path.name}`, async () => {
+        const ctx = await makeContext();
+        try {
+          const topic = ctx.freshTopic();
+          const { id, seen } = await path.observe(ctx, topic, () => write.write(ctx, topic));
+          expect(seen).toContain(id);
+        } finally {
+          await ctx.cleanup();
+        }
+      });
+    }
+  }
 });
 
 describe('slack identity fidelity', () => {

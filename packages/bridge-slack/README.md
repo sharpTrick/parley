@@ -14,7 +14,7 @@ than the retention window silently gets fewer messages back on catch-up.
 | Seam | Slack |
 |---|---|
 | topic | a channel id, via `channel_map`; an unmapped topic is used as a channel-id literal |
-| `post` | `chat.postMessage {channel, text, thread_ts?}` |
+| `post` | `chat.postMessage {channel, text, thread_ts?, reply_broadcast?}` |
 | cursor / backendMsgId | the per-channel message `ts` (e.g. `1234567890.123456`) — unique and strictly increasing per channel; compared integer-wise (seconds, then suffix), **never** lexically or as a float |
 | `fetchRecent({since})` | `conversations.history {oldest: since}` — `oldest` is EXCLUSIVE (we never set `inclusive`); pages arrive newest-first and are re-assembled ascending |
 | `subscribe` | **Socket Mode**: one shared websocket per plugin instance (`apps.connections.open` → single-use `wss://` URL) — real Events API pushes, not a poll timer |
@@ -44,12 +44,14 @@ Parley as an internal app, or get the app listed, if catch-up over a real backlo
 never assumes it got what it asked for: every window and trim decision counts what a page actually
 contained.)
 
-Threading is an approximation: `inReplyTo` becomes `thread_ts`. A plain thread reply does not
-surface at channel level — `conversations.history` does not return it, and the live path **drops**
-it for the same reason, so the two paths agree and nothing is delivered that a later catch-up could
-not replay. It is durable but only visible inside the thread; a reply the author broadcasts to the
-channel arrives as a `thread_broadcast` entry with its own `ts` and **is** surfaced — that is the
-return path for replies to a threaded `post`.
+Threading is an approximation: `inReplyTo` becomes `thread_ts` **and `reply_broadcast`**, so the
+reply is filed in the thread *and* broadcast to the channel as a `thread_broadcast` entry under the
+same `ts`. The broadcast is not decoration — it is what makes the write readable back. A *plain*
+thread reply does not surface at channel level (`conversations.history` does not return one, and the
+live path **drops** it for the same reason, so the two paths agree and nothing is delivered that a
+later catch-up could not replay), which would leave `post` returning a `backendMsgId` for a message
+no Parley reader could ever see. So a threaded `post` is visible in the channel, not only inside the
+thread.
 
 **Mentions.** Slack never puts `@handle` on the wire; it serializes a mention as `<@U0ABC>`,
 `<@U0ABC|label>`, `<!subteam^S0DEV|@team>` or `<!here>`. The plugin rewrites all four into the
@@ -148,6 +150,13 @@ thing it cannot express. Both fail at `connect`, naming the key. A plaintext `ht
 pointed at a **non-loopback** host is a legitimate fixture choice and is accepted, but it **warns**
 at `connect`: every Web API call carries the `xoxb-` bot token across the network in the clear, and
 `apps.connections.open` carries the `xapp-` app token the same way.
+
+The websocket URL is **not** config — `apps.connections.open` hands it back — so it is held to the
+same rule rather than trusted: a `ws://` URL to a non-loopback host is **refused** whenever `api_url`
+is not itself plaintext-remote, because it would move the single-use Socket Mode ticket and every
+workspace message onto the wire in the clear, to a host the operator never configured. Under a
+plaintext `api_url` (the loopback fixture, or the recording proxy the warning above is about) a
+`ws://` stream is no weaker than what is already configured, and is accepted.
 
 ## App provisioning (pointers only — follow Slack's docs)
 

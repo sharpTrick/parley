@@ -25,7 +25,8 @@ import {
   MAX_TIMER_MS,
   TIMER_CONFIG_KEYS,
 } from '../src/index.js';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
@@ -301,5 +302,42 @@ describe('slack catch-up docs track the figures the source sends', () => {
     expect(text).toMatch(/15 objects per request/);
     expect(text).toMatch(/one request per\s+minute/);
     expect(text).toMatch(/internal,? customer-built app/i);
+  });
+});
+
+/**
+ * The import list is a claim about the module too: it tells a reader which pieces the code below is
+ * composed of. `isLoopbackHost` sat in this one telling a reader the plaintext check had two halves
+ * when one of them was never called — and it reached the published `dist/` as a real import, because
+ * the repo ships no linter and `tsconfig.base.json` enables neither `noUnusedLocals` nor
+ * `noUnusedParameters`, so nothing in CI can fail on it. Parameterized over `src/`, so a module
+ * added later is covered the moment it lands.
+ */
+describe('slack source imports are all used', () => {
+  const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+  const modules = readdirSync(srcDir).filter((f) => f.endsWith('.ts'));
+
+  it('finds source modules to check (guards against a broken walk)', () => {
+    expect(modules.length).toBeGreaterThan(1);
+  });
+
+  it.each(modules)('%s imports nothing it does not reference', (file) => {
+    const text = readFileSync(join(srcDir, file), 'utf8');
+    const imported: string[] = [];
+    for (const statement of text.matchAll(/^import\s+([\s\S]*?)\s+from\s+'[^']+';$/gm)) {
+      const clause = statement[1] as string;
+      const braced = /\{([\s\S]*)\}/.exec(clause)?.[1] ?? '';
+      for (const spec of braced.split(',')) {
+        const name = /(?:\bas\s+)?(\w+)\s*$/.exec(spec.trim())?.[1];
+        if (name !== undefined) imported.push(name);
+      }
+      const bare = /^(\w+)\s*(?:,|$)/.exec(clause)?.[1];
+      if (bare !== undefined) imported.push(bare);
+    }
+    // Guard the extractor: a pattern that stopped matching would make the check vacuous.
+    expect(imported.length).toBeGreaterThan(0);
+
+    const body = text.replace(/^import\s+[\s\S]*?\s+from\s+'[^']+';$/gm, '');
+    expect(imported.filter((name) => !new RegExp(`\\b${name}\\b`).test(body))).toEqual([]);
   });
 });

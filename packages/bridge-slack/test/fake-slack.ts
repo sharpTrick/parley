@@ -7,6 +7,9 @@
  *   - `conversations.history` returns NEWEST-first with `oldest` EXCLUSIVE (unless `inclusive`),
  *     and pages via `response_metadata.next_cursor` at a size the server picks and the caller cannot
  *     raise (50 by default, so the 100-message conformance case forces real multi-page assembly).
+ *   - `chat.postMessage` files a `thread_ts` post inside that thread, where `conversations.history`
+ *     cannot see it, unless `reply_broadcast` also asks for the channel-level `thread_broadcast`
+ *     copy — the pair of request fields that decides whether a post is readable back at all.
  *   - A channel id that was never created answers `{ok:false, error:'channel_not_found'}` — an
  *     EXISTING but empty channel is the only thing that answers `ok:true, messages:[]`. Fabricating
  *     success for unknown ids would green the seam's absent-topic contract without testing it.
@@ -115,11 +118,12 @@ export class FakeSlack {
   /** method → requests served, counted BEFORE any injected failure (did it reach the wire?). */
   readonly requests = new Map<string, number>();
   /**
-   * Every `conversations.history` request body as it arrived on the wire, in order. The plugin's
-   * page size, `oldest` floor and page `cursor` are only real if they are ON the request; asserting
-   * them against the source constant instead grades a number no request carries.
+   * method → every decoded request body it received, in order. A field the plugin believes it sets
+   * is only real if it is ON the request, so keep this recorder per-METHOD rather than for the one
+   * method a test happened to need: a `chat.postMessage` argument the fixture never looked at is how
+   * `thread_ts` reached neither the wire assertions nor the stored record.
    */
-  readonly historyRequests: Array<Record<string, unknown>> = [];
+  private readonly bodies = new Map<string, Array<Record<string, unknown>>>();
   /** method → requests that arrived with NO `Authorization` header (answered `not_authed`). */
   readonly unauthenticated = new Map<string, number>();
   private greet: GreetMode = 'greet';
@@ -221,6 +225,11 @@ export class FakeSlack {
   /** How many of {@link hits} arrived with no bearer token at all. */
   unauthedHits(method: string): number {
     return this.unauthenticated.get(method) ?? 0;
+  }
+
+  /** Every decoded request body `method` received, in wire order — see {@link bodies}. */
+  requestBodies(method: string): Array<Record<string, unknown>> {
+    return this.bodies.get(method) ?? [];
   }
 
   /** Sockets currently connected — must be 0 once a plugin has disconnected. */
@@ -386,6 +395,7 @@ export class FakeSlack {
     // Keep the counter AHEAD of the auth check, so that a storm of token-less calls cannot score
     // zero against every `hits()` ceiling in the suite — the counter's meaning is "reached the wire".
     this.requests.set(method, this.hits(method) + 1);
+    this.bodies.set(method, [...this.requestBodies(method), body]);
     if (req.headers.authorization === undefined) {
       this.unauthenticated.set(method, this.unauthedHits(method) + 1);
       reply({ ok: false, error: 'not_authed' });
@@ -444,6 +454,17 @@ export class FakeSlack {
     // backwards and the global counter suffix strictly increases (integer-wise, not lexically).
     const ts = this.mintTs();
     const msg: StoredMessage = { type: 'message', ts, text, user: 'U0PARLEY', bot_id: 'B0PARLEY' };
+    // `thread_ts` files the post under a thread, and `reply_broadcast` makes Slack ALSO file a
+    // channel-level `thread_broadcast` copy — the two request fields that decide whether the id
+    // `chat.postMessage` returns is reachable through `conversations.history` at all. A fake that
+    // stored every post at channel level graded threading against a contract slack.com does not
+    // have, and `seed()` was then the only writer that could produce a threaded row.
+    if (typeof body.thread_ts === 'string') {
+      msg.thread_ts = body.thread_ts;
+      if (body.reply_broadcast === 'true' || body.reply_broadcast === true) {
+        msg.subtype = 'thread_broadcast';
+      }
+    }
     const list = this.channels.get(channel) ?? [];
     list.push(msg);
     this.channels.set(channel, list);
@@ -473,7 +494,6 @@ export class FakeSlack {
   }
 
   private history(body: Record<string, unknown>): Record<string, unknown> {
-    this.historyRequests.push(body);
     const channel = body.channel;
     if (typeof channel !== 'string') return { ok: false, error: 'invalid_arguments' };
     if (!this.known.has(channel)) return { ok: false, error: 'channel_not_found' };

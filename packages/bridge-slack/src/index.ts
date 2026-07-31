@@ -19,7 +19,6 @@ import {
 import {
   delay,
   fetchWithRetry,
-  isLoopbackHost,
   plaintextRemoteOrigin,
   sanitizeBody,
 } from '@sharptrick/parley-net-util';
@@ -340,8 +339,11 @@ export class SlackPlugin implements BackendPlugin {
 
   /**
    * `chat.postMessage`. Threading is an approximation: `inReplyTo` becomes `thread_ts`, filing the
-   * message under that thread. A plain thread reply is only visible when reading the thread; a
-   * reply broadcast to the channel comes back as a `thread_broadcast` entry, which we surface.
+   * message under that thread, plus `reply_broadcast` so Slack ALSO files a channel-level
+   * `thread_broadcast` entry under the same `ts`. Keep the broadcast, so that the id this returns
+   * names a message both seam read paths can reach: `conversations.history` never returns a plain
+   * thread reply, and {@link isChannelLevel} drops the live copy for that very reason, so without it
+   * a successful write is unreadable through the seam that made it.
    * `identity` is the logical sender only — Slack stamps our bot user as the wire sender.
    */
   async post(
@@ -355,7 +357,10 @@ export class SlackPlugin implements BackendPlugin {
       channel: this.channelFor(topic),
       text: escapeSlackText(content),
     };
-    if (opts?.inReplyTo !== undefined) body.thread_ts = opts.inReplyTo;
+    if (opts?.inReplyTo !== undefined) {
+      body.thread_ts = opts.inReplyTo;
+      body.reply_broadcast = true;
+    }
     const resp = await this.api<{ ok: boolean; ts?: string }>('chat.postMessage', body).catch(
       (e: unknown) => {
         throw asSeamError(e, topic, ABSENT_ON_WRITE);
@@ -379,13 +384,17 @@ export class SlackPlugin implements BackendPlugin {
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
+    // Captured BEFORE the first read, so that the session a blocked call belongs to is the one it
+    // was CALLED in: the read below can straddle a `disconnect()` + `connect()`, and a session read
+    // after it would be the new one's — leaving the block below with nothing to notice.
+    const session = this.session;
     const first = await this.runFetch(args);
 
     const blockMs = args.blockMs ?? 0;
     if (blockMs <= 0 || args.since === undefined || first.messages.length > 0) {
       return first;
     }
-    return this.blockForMessage(args, first.nextCursor, Date.now() + blockMs);
+    return this.blockForMessage(args, first.nextCursor, Date.now() + blockMs, session);
   }
 
   /**
@@ -403,7 +412,14 @@ export class SlackPlugin implements BackendPlugin {
     args: FetchRecentArgs,
     since: Cursor,
     deadlineAt: number,
+    session: number,
   ): Promise<FetchRecentResult> {
+    // A later `connect()` clears `stopped`, so keep every rung gated on the SESSION too: this loop
+    // owns a waiter registration and a `conversations.history` re-read per rung, and a call retired
+    // mid-rung would otherwise resume against the next session's configuration and spend the rest of
+    // its budget there — for a caller that has already been torn down.
+    const retired = (): boolean => this.stopped || this.session !== session;
+    if (retired()) return { messages: [], nextCursor: since };
     const channel = this.channelFor(args.topic);
     const startedAt = Date.now();
     // The floor the NEXT rung resumes from. Every re-query that surfaces nothing has still walked
@@ -412,7 +428,7 @@ export class SlackPlugin implements BackendPlugin {
     // cursor into one walk plus N-1 single-page reads, instead of N full walks.
     let floor = since;
     const aborted = (): FetchRecentResult => ({ messages: [], nextCursor: floor });
-    while (!this.stopped) {
+    while (!retired()) {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) break;
       // The handshake is bounded by `handshake_timeout_ms`, which may be far longer than one ladder
@@ -424,7 +440,7 @@ export class SlackPlugin implements BackendPlugin {
       ).catch(() => undefined);
       // A teardown that landed while the handshake ran leaves nothing to wait on, and `runFetch`
       // below would reject on the disconnected plugin; the caller gets its empty page instead.
-      if (this.stopped) return aborted();
+      if (retired()) return aborted();
       // Keep the waiter armed BEFORE the re-query, so that a push landing while that query is in
       // flight is caught rather than lost — a lost wakeup here blocks for the whole budget. A rung
       // waiter is a waiter rather than a bare timer, so that `disconnect()` drains it.
@@ -441,7 +457,7 @@ export class SlackPlugin implements BackendPlugin {
       floor = requeried.nextCursor;
       await wait;
     }
-    if (this.stopped) return aborted();
+    if (retired()) return aborted();
     return this.runFetch({ ...args, since: floor });
   }
 
@@ -532,7 +548,8 @@ export class SlackPlugin implements BackendPlugin {
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
     const channel = this.channelFor(topic);
-    this.routes.set(channel, { topic, handler });
+    const registration = { topic, handler };
+    this.routes.set(channel, registration);
     try {
       await this.ensureSocket();
       // Socket Mode says nothing about whether this channel exists or is readable, so a typo'd
@@ -546,8 +563,11 @@ export class SlackPlugin implements BackendPlugin {
       );
     } catch (e: unknown) {
       // A rejected subscribe is not subscribed: leaving the route would feed a handler core has
-      // already given up on, on a topic it logged as skipped.
-      this.routes.delete(channel);
+      // already given up on, on a topic it logged as skipped. Keep the delete conditional on the
+      // route still being THIS call's, so that a rejection arriving after a `disconnect()` +
+      // `connect()` — the probe outlives both — cannot silently unsubscribe the channel the NEW
+      // session registered, leaving a `subscribe` that resolved and delivers nothing.
+      if (this.routes.get(channel) === registration) this.routes.delete(channel);
       throw e;
     }
   }
@@ -610,10 +630,18 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   private authTest(): Promise<AuthTestResponse> {
-    this.authTestPromise ??= this.api<AuthTestResponse>('auth.test', {}).catch((err: unknown) => {
-      this.authTestPromise = undefined; // don't memoize failure
-      throw err;
-    });
+    if (this.authTestPromise === undefined) {
+      const attempt: Promise<AuthTestResponse> = this.api<AuthTestResponse>('auth.test', {}).catch(
+        (err: unknown) => {
+          // Don't memoize failure — and clear only OUR OWN entry, so that a rejection landing after
+          // a `disconnect()` + `connect()` cannot evict the new session's answer and re-issue
+          // `auth.test` for a token that already has one.
+          if (this.authTestPromise === attempt) this.authTestPromise = undefined;
+          throw err;
+        },
+      );
+      this.authTestPromise = attempt;
+    }
     return this.authTestPromise;
   }
 
@@ -631,17 +659,23 @@ export class SlackPlugin implements BackendPlugin {
       );
     }
     if (this.wsReady === undefined) {
+      const session = this.session;
       const attempt = this.openSocket();
       this.wsReady = attempt;
       // Memoize the connection, never the FAILURE: a cached rejection is replayed by every later
       // subscribe/blocking fetch without touching the network, so one transient
       // `apps.connections.open` error would disable live push for the process lifetime.
+      // Keep both settlements scoped to the session that dialled, so that a dial outliving a
+      // `disconnect()` cannot hand the NEXT session either a cooldown it never earned or a reset of
+      // the one it did.
       attempt.then(
         () => {
+          if (this.session !== session) return;
           this.dialCooldownUntil = 0;
           this.dialBackoffMs = DIAL_BACKOFF_MS;
         },
         () => {
+          if (this.session !== session) return;
           if (this.wsReady === attempt) this.wsReady = undefined;
           this.dialCooldownUntil = Date.now() + this.dialBackoffMs;
           this.dialBackoffMs = Math.min(this.dialBackoffMs * 2, MAX_DIAL_BACKOFF_MS);
@@ -719,15 +753,18 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   private async openSocket(): Promise<void> {
+    const session = this.session;
     // Socket Mode handshake uses the APP token; everything else uses the bot token.
     const open = await this.api<{ ok: boolean; url?: unknown }>('apps.connections.open', {}, 'app');
-    // Keep this abort, so that a disconnect landing during the round trip cannot leave a live
-    // socket nothing will ever close, burning one of the ~10 connections per app token.
-    if (this.stopped) throw new Error('Slack Socket Mode connect aborted — plugin disconnected');
-    const url = open.url;
-    if (typeof url !== 'string' || !/^wss?:\/\//.test(url)) {
-      throw new SlackShapeError('apps.connections.open', 'returned no usable websocket url');
+    // Keep this abort scoped to the SESSION as well as to `stopped` — which the next `connect()`
+    // clears — so that a dial in flight across `disconnect()` + `connect()` cannot open a socket on
+    // the retired app_token for a session that subscribed to nothing: it would burn one of the ~10
+    // connections per app token, and feed a second event source into one channel for the life of
+    // the session, which is what the ascending-`ts` handler guarantee rests on not happening.
+    if (this.stopped || this.session !== session) {
+      throw new Error('Slack Socket Mode connect aborted — plugin disconnected');
     }
+    const url = requireUsableSocketUrl(this.apiUrl, open.url);
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url);
       this.ws = ws;
@@ -1076,6 +1113,29 @@ function requireUsableChannelMap(map: Record<string, string>): Record<string, st
   return ownEntriesOnly(map);
 }
 
+/**
+ * The websocket URL `apps.connections.open` handed us, or a named refusal. A vendor response is
+ * untrusted input, not an authorization: this URL carries the single-use Socket Mode ticket, every
+ * workspace message and every ack, so it is held to no weaker a transport guarantee than the one the
+ * operator configured for the Web API. `ws:` therefore passes only where a plaintext `api_url` would
+ * — a loopback fixture, or an endpoint {@link configRisks} has already warned about — and never
+ * silently downgrades an `https:` workspace to cleartext toward a host nobody configured.
+ */
+export function requireUsableSocketUrl(apiUrl: string, url: unknown): string {
+  if (typeof url !== 'string' || !/^wss?:\/\//.test(url)) {
+    throw new SlackShapeError('apps.connections.open', 'returned no usable websocket url');
+  }
+  const insecure = plaintextRemoteOrigin(url);
+  if (insecure !== undefined && plaintextRemoteOrigin(apiUrl) === undefined) {
+    throw new SlackShapeError(
+      'apps.connections.open',
+      `returned ${insecure}, a plaintext websocket to a non-loopback host, while ` +
+        `backend_config.api_url ${apiUrl} is not — refusing to downgrade the live stream`,
+    );
+  }
+  return url;
+}
+
 const isHttpUrl = (s: string): boolean => {
   try {
     const { protocol } = new URL(s);
@@ -1129,8 +1189,6 @@ function configRisks(cfg: SlackBackendConfig): string[] {
       'way. Use https:// for any remote endpoint.',
   ];
 }
-
-
 
 /**
  * The poster's Slack user/bot id, before `mention_map` resolves it to a Parley handle. A workflow- or

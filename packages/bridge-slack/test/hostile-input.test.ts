@@ -15,9 +15,16 @@ import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { compareTs, MAX_TIMER_MS, SlackPlugin, TIMER_CONFIG_KEYS, TS_RE } from '../src/index.js';
+import {
+  compareTs,
+  MAX_TIMER_MS,
+  requireUsableSocketUrl,
+  SlackPlugin,
+  TIMER_CONFIG_KEYS,
+  TS_RE,
+} from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
-import { capture } from './harness.js';
+import { capture, settleWithin, sleep, startSlack } from './harness.js';
 
 const COLLIDING: Array<{ name: string; map: Record<string, string>; topics: [string, string] }> = [
   {
@@ -389,6 +396,95 @@ describe('slack api_url: rejected when unusable, warned when it would leak the t
       }
     });
   }
+});
+
+/**
+ * CLASS: a URL a VENDOR RESPONSE hands us. `configRisks` grades the endpoint the operator wrote
+ * down, but `apps.connections.open` answers with a second one — and that one carries the single-use
+ * Socket Mode ticket, every workspace message and every ack. Held to no rule, an `ok:true` body from
+ * a captive portal, a compromised proxy or a vendor change moves the whole live stream to cleartext
+ * toward a host nobody configured, with no load error and nothing on stderr. The rule is
+ * comparative, so both axes are rows: what the vendor handed out, and what the operator configured.
+ * It will recur for any other endpoint a response hands over — a webhook callback, a media URL.
+ */
+const SECURE_API = 'https://slack.com/api';
+const PLAINTEXT_API = 'http://recorder.internal.example/api';
+const LOOPBACK_API = 'http://127.0.0.1:8080/api';
+
+const VENDOR_URLS: Array<{
+  apiUrl: string;
+  url: unknown;
+  outcome: 'accepted' | 'downgrade' | 'unusable';
+}> = [
+  { apiUrl: SECURE_API, url: 'wss://wss-primary.slack.com/link/?ticket=t', outcome: 'accepted' },
+  { apiUrl: SECURE_API, url: 'ws://attacker.example/socket?ticket=t', outcome: 'downgrade' },
+  { apiUrl: SECURE_API, url: 'ws://10.0.0.5:3000/socket', outcome: 'downgrade' },
+  // Shaped like loopback, resolved like any other name — the prefix-match excuse.
+  { apiUrl: SECURE_API, url: 'ws://127.0.0.1.example.com/socket', outcome: 'downgrade' },
+  { apiUrl: SECURE_API, url: 'ws://127.0.0.1:8080/socket', outcome: 'accepted' },
+  { apiUrl: SECURE_API, url: 'ws://localhost:8080/socket', outcome: 'accepted' },
+  { apiUrl: SECURE_API, url: 'ws://[::1]:8080/socket', outcome: 'accepted' },
+  // A loopback fixture and a recording proxy are the two configurations that legitimately run in
+  // the clear; a `ws://` stream is no weaker than the `api_url` already alongside it.
+  { apiUrl: LOOPBACK_API, url: 'ws://127.0.0.1:8080/socket', outcome: 'accepted' },
+  { apiUrl: PLAINTEXT_API, url: 'ws://recorder.internal.example/socket', outcome: 'accepted' },
+  { apiUrl: PLAINTEXT_API, url: 'ws://attacker.example/socket', outcome: 'accepted' },
+  { apiUrl: SECURE_API, url: 'https://attacker.example/socket', outcome: 'unusable' },
+  { apiUrl: SECURE_API, url: 'wsss://attacker.example/socket', outcome: 'unusable' },
+  { apiUrl: SECURE_API, url: '', outcome: 'unusable' },
+  { apiUrl: SECURE_API, url: 42, outcome: 'unusable' },
+  { apiUrl: SECURE_API, url: null, outcome: 'unusable' },
+  { apiUrl: SECURE_API, url: undefined, outcome: 'unusable' },
+  { apiUrl: SECURE_API, url: { url: 'wss://ok.example/socket' }, outcome: 'unusable' },
+];
+
+describe('slack holds the websocket url a vendor response hands out to the configured transport', () => {
+  for (const row of VENDOR_URLS) {
+    it(`${JSON.stringify(row.url)} under ${row.apiUrl} is ${row.outcome}`, () => {
+      if (row.outcome === 'accepted') {
+        expect(requireUsableSocketUrl(row.apiUrl, row.url)).toBe(row.url);
+        return;
+      }
+      const thrown = ((): Error => {
+        try {
+          requireUsableSocketUrl(row.apiUrl, row.url);
+        } catch (e: unknown) {
+          return e as Error;
+        }
+        throw new Error('requireUsableSocketUrl accepted it');
+      })();
+      expect(thrown.name).toBe('SlackShapeError');
+      expect(thrown.message).toContain('apps.connections.open');
+      if (row.outcome === 'unusable') {
+        expect(thrown.message).toContain('no usable websocket url');
+        return;
+      }
+      // An operator can only act on a refusal that names the origin it refused and the reason.
+      expect(thrown.message).toContain(new URL(String(row.url)).origin);
+      expect(thrown.message).toContain(row.apiUrl);
+      expect(thrown.message).toContain('downgrade');
+      // Never the ticket: a Socket Mode URL is a credential, and a message quoting it in full is
+      // the leak the refusal exists to prevent.
+      expect(thrown.message).not.toContain('ticket');
+    });
+  }
+
+  it('the refusal is wired into the dial: a downgraded url never becomes a socket', async () => {
+    const { fake, plugin, cleanup } = await startSlack({ channels: ['C0DOWN'] });
+    try {
+      fake.setWsUrl('ws://attacker.example/socket?ticket=secret');
+      const outcome = await settleWithin(
+        capture(plugin.subscribe(asTopic('C0DOWN'), () => undefined)),
+        4000,
+      );
+      expect(outcome.status).toBe('rejected');
+      expect(String((outcome as { reason: unknown }).reason)).toMatch(/downgrade the live stream/);
+      await sleep(200);
+      expect(fake.liveSockets, 'a refused url still opened a socket').toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
 });
 
 /**

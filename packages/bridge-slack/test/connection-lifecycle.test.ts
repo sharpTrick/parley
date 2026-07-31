@@ -613,6 +613,182 @@ describe('slack connect is a session boundary, not a partial reset', () => {
     });
   }
 
+  /**
+   * CLASS: an async path RESUMING after the boundary. Every row above lets the previous session
+   * SETTLE before `connect`, so none of them can fail on a call still in flight across it — and
+   * `stopped`, the flag each post-await checkpoint reads, is cleared by the next `connect()`, so a
+   * checkpoint written against it alone reads a retired call as live. The resumed call then acts on
+   * the NEW session's state: it opens a Socket Mode connection on the retired `app_token` that
+   * nothing subscribed for (a second event source into one channel, which is what the ascending-`ts`
+   * handler guarantee rests on not existing), or its failure path deletes the route the new session
+   * has just registered, leaving a `subscribe` that resolved and delivers nothing.
+   *
+   * Each row arms latency on ONE Web API method a seam entry point awaits, starts that entry point,
+   * and lands `disconnect(); connect(configB)` inside the round trip — then the new session
+   * subscribes to the SAME channel while the retired call is still out, so a late mutation has
+   * something of the new session's to damage.
+   */
+  const IN_FLIGHT: Array<{
+    name: string;
+    method: string;
+    /** Some paths only mutate on FAILURE; those rows fail the retired call's method exactly once. */
+    failWith?: string;
+    latencyMs: number;
+    start: (plugin: SlackPlugin, onStale: (content: string) => void) => Promise<unknown>;
+  }> = [
+    {
+      name: 'subscribe awaiting apps.connections.open',
+      method: 'apps.connections.open',
+      latencyMs: 250,
+      start: (plugin, onStale) => plugin.subscribe(asTopic(STALE_TOPIC), (m) => onStale(m.content)),
+    },
+    {
+      name: "subscribe awaiting its conversations.history probe, which then fails",
+      method: 'conversations.history',
+      failWith: 'not_in_channel',
+      latencyMs: 300,
+      start: (plugin, onStale) => plugin.subscribe(asTopic(STALE_TOPIC), (m) => onStale(m.content)),
+    },
+    {
+      name: 'blocking fetchRecent awaiting apps.connections.open',
+      method: 'apps.connections.open',
+      latencyMs: 250,
+      start: (plugin) =>
+        plugin.fetchRecent({ topic: asTopic(STALE_TOPIC), since: asCursor('0'), blockMs: 3000 }),
+    },
+    {
+      name: 'blocking fetchRecent awaiting conversations.history',
+      method: 'conversations.history',
+      latencyMs: 250,
+      start: (plugin) =>
+        plugin.fetchRecent({ topic: asTopic(STALE_TOPIC), since: asCursor('0'), blockMs: 3000 }),
+    },
+    {
+      name: 'resolveIdentity awaiting auth.test',
+      method: 'auth.test',
+      latencyMs: 250,
+      start: (plugin) => plugin.resolveIdentity(asHandle('parley-bot')),
+    },
+  ];
+
+  for (const row of IN_FLIGHT) {
+    it(`a ${row.name} across the boundary touches nothing in the new session`, async () => {
+      const fake = await FakeSlack.start();
+      const plugin = new SlackPlugin();
+      const stale: string[] = [];
+      const fresh: string[] = [];
+      fake.createChannel(STALE_TOPIC);
+      try {
+        await plugin.connect(sessionConfig(fake, 'xoxb-a'));
+        fake.setLatency(row.method, row.latencyMs);
+        if (row.failWith !== undefined) fake.failMethod(row.method, row.failWith, 1);
+        const inFlight = capture(row.start(plugin, (content) => stale.push(content)));
+
+        await sleep(60);
+        await plugin.disconnect();
+        await plugin.connect(sessionConfig(fake, 'xoxb-b'));
+        const dialsAtConnect = fake.hits('apps.connections.open');
+        const authsAtConnect = fake.hits('auth.test');
+
+        // The new session subscribes while the retired call is STILL OUT — the only ordering in
+        // which a late mutation can reach state the new session owns.
+        await plugin.subscribe(asTopic(STALE_TOPIC), (m) => fresh.push(m.content));
+        // A retired call has no caller left to serve, so it must settle on the teardown rather than
+        // run its own budget out inside the new session — the rung loop re-reads history and arms a
+        // waiter per rung, all of it against a configuration it was never given.
+        const settled = await settleWithin(inFlight, 900);
+        expect(settled.status, 'the retired call ran on into the new session').not.toBe('pending');
+        await sleep(500);
+
+        // (a) Exactly the one socket the new session's own subscribe opened, from its own one dial.
+        expect(fake.liveSockets, 'sockets held after the retired call landed').toBe(1);
+        expect(fake.hits('apps.connections.open'), 'dials').toBe(dialsAtConnect + 1);
+
+        // (b) The retired session's handler is not on the new session's stream.
+        // (c) …and the new session's subscribe still delivers, so nothing retired unsubscribed it.
+        await plugin.post(asTopic(STALE_TOPIC), asHandle('writer'), 'live in the new session');
+        await vi.waitFor(() => expect(fresh).toEqual(['live in the new session']), {
+          timeout: 4000,
+          interval: 10,
+        });
+        expect(stale, 'a retired handler fired').toEqual([]);
+
+        // (d) The retired session's memoized identity is not answered for the new bot_token, and a
+        // retired `auth.test` settling late does not evict the answer the new one memoized.
+        await plugin.resolveIdentity(asHandle('parley-bot'));
+        await plugin.resolveIdentity(asHandle('parley-bot'));
+        expect(fake.hits('auth.test'), 'auth.test issued once for the new token').toBe(
+          authsAtConnect + 1,
+        );
+      } finally {
+        await plugin.disconnect();
+        await fake.close();
+      }
+    });
+  }
+
+  it('a retired dial failing late does not put the new session into a cooldown it never earned', async () => {
+    const fake = await FakeSlack.start();
+    const plugin = new SlackPlugin();
+    fake.createChannel(STALE_TOPIC);
+    try {
+      await plugin.connect(sessionConfig(fake, 'xoxb-a'));
+      fake.setLatency('apps.connections.open', 300);
+      fake.failMethod('apps.connections.open', 'internal_error', 1);
+      const inFlight = capture(plugin.subscribe(asTopic(STALE_TOPIC), () => undefined));
+
+      await sleep(60);
+      await plugin.disconnect();
+      await plugin.connect(sessionConfig(fake, 'xoxb-b'));
+      fake.setLatency('apps.connections.open', 0);
+      expect((await inFlight).status).toBe('rejected');
+      await sleep(50);
+
+      // The dial cooldown is what stops core's 250 ms re-drive becoming a storm against Slack's
+      // tightest-limit endpoint — so a cooldown one session's failure imposes on the NEXT one
+      // silently disables its live push for as long as the ladder rung lasts.
+      const dialsBefore = fake.hits('apps.connections.open');
+      await plugin.fetchRecent({
+        topic: asTopic(STALE_TOPIC),
+        since: asCursor('0'),
+        blockMs: 100,
+      });
+      expect(fake.hits('apps.connections.open'), 'the new session dialled').toBe(dialsBefore + 1);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
+  it('a retired auth.test failing late does not evict the new session identity memo', async () => {
+    const fake = await FakeSlack.start();
+    const plugin = new SlackPlugin();
+    try {
+      await plugin.connect(sessionConfig(fake, 'xoxb-a'));
+      fake.setLatency('auth.test', 300);
+      const inFlight = capture(plugin.resolveIdentity(asHandle('parley-bot')));
+
+      await sleep(60);
+      await plugin.disconnect();
+      await plugin.connect(sessionConfig(fake, 'xoxb-b'));
+
+      fake.setLatency('auth.test', 0);
+      await plugin.resolveIdentity(asHandle('parley-bot'));
+      const authsAfterB = fake.hits('auth.test');
+      // Armed only now, so the RETIRED call is the one it answers: the failure path is the only
+      // place the memo is cleared, and it must clear nobody's entry but its own.
+      fake.failMethod('auth.test', 'internal_error', 1);
+      expect((await inFlight).status).toBe('rejected');
+      await sleep(100);
+
+      await plugin.resolveIdentity(asHandle('parley-bot'));
+      expect(fake.hits('auth.test'), 'the new session re-asked').toBe(authsAfterB);
+    } finally {
+      await plugin.disconnect();
+      await fake.close();
+    }
+  });
+
   it('a handler registered before a disconnect never fires on the next connection', async () => {
     const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0STALE', 'C0FRESH'] });
     const stale = asTopic('C0STALE');
