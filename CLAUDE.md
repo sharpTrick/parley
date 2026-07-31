@@ -135,17 +135,16 @@ never as a comment, a doc paragraph, or defensive prose aimed at the next review
 
 ### Architectural tests: assert the invariant, not the layout
 
-A test that asserts **what the code does** is untouchable. A test that asserts **where the code
-lives** is not, and must be written so it cannot cement the structure it happens to observe.
+A test that asserts **where the code lives** must be written so it cannot cement the structure it
+happens to observe. **Never let one drive a structural choice.** If a ratchet is what stands
+between the code and a better shape, the ratchet is what is wrong — every agent is free to move or
+replace it.
 
 Prefer, always: a glob over `src/**` rather than one file path; the invariant a field protects
 rather than the field's type; an `import` of a symbol rather than a regex that finds it in a
 particular file; a behaviour reachable through the public surface rather than a private member
-reached through a cast.
-
-When one blocks a change, **re-anchor it by default.** Delete it only if you can NAME the test that
-already covers its invariant behaviourally and SHOW that test failing against the defect the
-deleted one protected against. *"It blocked my change"* is never a reason on its own.
+reached through a cast. What replaces one should grade the same invariant from a place the next
+move cannot invalidate.
 
 This is a standing rule because these assertions fail in ways that are individually invisible and
 collectively decisive. Eleven packages were decomposed under it, and every one hit at least one of

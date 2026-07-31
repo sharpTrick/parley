@@ -64,7 +64,7 @@ landed at -3 and shared at -5 where the non-import deltas were -36 and -13. Meas
 non-import source lines.
 
 **Architectural tests are fair game, under the standing rule in `CLAUDE.md` §"Architectural tests:
-assert the invariant, not the layout" — RE-ANCHOR by default, delete only with a named replacement.**
+assert the invariant, not the layout" — never let one drive a structural choice; move or replace it.**
 That rule is not scoped to decomposition rounds; it governs every change to this repository, and
 `CLAUDE.md` is its authority. Round 11 is where it came from: six ways a path- or shape-coupled
 assertion had cemented the monoliths — a split blocked, a guard hollowed out while staying green, a recorded security debt made
