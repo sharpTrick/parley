@@ -6,6 +6,7 @@
  * the axis a given file exercises is visible next to the rows that exercise it.
  */
 import { asTopic, type Topic } from '@sharptrick/parley-core';
+import { expect } from 'vitest';
 import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
 
@@ -89,8 +90,25 @@ export function deliver(fake: FakeSlack, topic: Topic | string, text: string): v
  * with the suite green.
  */
 export function parkedWaiters(plugin: SlackPlugin): number {
-  const { waiters } = plugin as unknown as { waiters: Map<string, Set<unknown>> };
+  const { waiters } = internals(plugin);
+  expect(waiters, 'the waiter registry moved; re-anchor parkedWaiters on it').toBeInstanceOf(Map);
   return [...waiters.values()].reduce((total, set) => total + set.size, 0);
+}
+
+/**
+ * The registry and the reconnect loop, wherever the plugin composes them. Both are read by name
+ * because the seam exposes neither, so keep the lookup FAILING LOUDLY when a name moves — a probe
+ * that silently reads `undefined` grades nothing while staying green.
+ */
+export function internals(plugin: SlackPlugin): {
+  waiters: Map<string, Set<unknown>>;
+  reconnect: () => Promise<void>;
+} {
+  const { link } = plugin as unknown as {
+    link: { waiters: Map<string, Set<unknown>>; reconnect: () => Promise<void> };
+  };
+  expect(link, 'SlackPlugin no longer composes a link; re-anchor the internals probe').toBeDefined();
+  return link;
 }
 
 export type Settled<T> =

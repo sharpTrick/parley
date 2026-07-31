@@ -12,7 +12,8 @@
  *     because the cursor never advances past the record that caused it.
  */
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -345,11 +346,19 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
  * validation row fails HERE rather than reaching `setTimeout` unchecked.
  */
 describe('slack backend_config knobs that reach a timer fail at load', () => {
-  /** The `?: number` keys `SlackBackendConfig` declares, read out of the source that declares them. */
+  /**
+   * The `?: number` keys `SlackBackendConfig` declares, read out of the source that declares them —
+   * found by scanning `src/`, so that the interface moving between modules cannot make this
+   * vacuous. A declaration this cannot find is a loud failure, never an empty list.
+   */
   function numericConfigKeysInSource(): string[] {
-    const src = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
+    const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+    const src = readdirSync(srcDir)
+      .filter((f) => f.endsWith('.ts'))
+      .map((f) => readFileSync(join(srcDir, f), 'utf8'))
+      .join('\n');
     const body = /export interface SlackBackendConfig \{([\s\S]*?)\n\}/.exec(src);
-    expect(body, 'SlackBackendConfig interface not found in src/index.ts').not.toBeNull();
+    expect(body, 'SlackBackendConfig interface not found under src/').not.toBeNull();
     return [...body![1]!.matchAll(/^ {2}(\w+)\?: number;$/gm)].map((m) => m[1]!);
   }
 

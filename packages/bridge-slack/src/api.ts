@@ -1,6 +1,6 @@
 import { NoSuchTopicError, type Topic } from '@sharptrick/parley-core';
-
-export const DEFAULT_API_URL = 'https://slack.com/api';
+import { fetchWithRetry, sanitizeBody } from '@sharptrick/parley-net-util';
+import type { SlackSettings } from './config.js';
 
 /**
  * Objects asked for per `conversations.history` page. Slack caps this per rate-limit tier — 1000 for
@@ -69,3 +69,63 @@ export const asSeamError =
       ? new NoSuchTopicError(topic)
       : e;
   };
+
+/** One Web API call. Held as a field named `api` by everything that makes one. */
+export type SlackApiCall = <T extends { ok: boolean }>(
+  method: string,
+  body: Record<string, unknown>,
+  auth?: 'bot' | 'app',
+) => Promise<T>;
+
+/**
+ * Single Web API entry point: `POST <api_url>/<method>`, `Authorization: Bearer <token>`, body
+ * `application/x-www-form-urlencoded`. Keep every method form-encoded, so that read methods
+ * receive their args at all — slack.com silently ignores a JSON body for those. `ok:false` is
+ * interpreted here rather than in the shared HTTP helper, which owns the 429 retry loop, the
+ * `Retry-After` header and the backoff clamp.
+ */
+export function slackApiCall(host: {
+  settings: () => SlackSettings;
+  stopped: () => boolean;
+}): SlackApiCall {
+  return async <T extends { ok: boolean }>(
+    method: string,
+    body: Record<string, unknown>,
+    auth: 'bot' | 'app' = 'bot',
+  ): Promise<T> => {
+    const { apiUrl, botToken, appToken } = host.settings();
+    const token = auth === 'app' ? appToken : botToken;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    };
+    if (token !== undefined) headers.Authorization = `Bearer ${token}`;
+    const url = `${apiUrl}/${method}`;
+
+    const form = new URLSearchParams();
+    for (const [k, v] of Object.entries(body)) {
+      if (v === undefined) continue;
+      form.set(k, typeof v === 'string' ? v : JSON.stringify(v));
+    }
+
+    const res = await fetchWithRetry(
+      url,
+      { method: 'POST', headers, body: form.toString() },
+      {
+        label: `Slack ${method}`,
+        isStopped: host.stopped,
+      },
+    );
+    const text = await res.text();
+    let json: T & { error?: string };
+    try {
+      json = JSON.parse(text) as T & { error?: string };
+    } catch {
+      throw new SlackShapeError(method, `non-JSON body: ${sanitizeBody(text)}`);
+    }
+    if (typeof json !== 'object' || json === null) {
+      throw new SlackShapeError(method, `non-object body: ${sanitizeBody(text)}`);
+    }
+    if (!json.ok) throw new SlackApiError(method, json.error ?? 'unknown_error');
+    return json;
+  };
+}

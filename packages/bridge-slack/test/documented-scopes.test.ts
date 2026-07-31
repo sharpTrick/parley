@@ -37,6 +37,19 @@ import { rungStarts } from './harness.js';
 const read = (rel: string): string =>
   readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
+const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+
+/**
+ * Every module under `src/`. The plugin composes its Web API calls out of several of them, so keep
+ * every scan below reading the TREE rather than one path, so that moving a call site between
+ * modules cannot leave a parity check grading an empty set.
+ */
+function sourceModules(): string[] {
+  const files = readdirSync(srcDir).filter((f) => f.endsWith('.ts'));
+  expect(files.length, 'no source modules found under src/').toBeGreaterThan(1);
+  return files.map((f) => readFileSync(join(srcDir, f), 'utf8'));
+}
+
 /**
  * Every `this.api(…)` call site in a source, as its literal method name.
  *
@@ -59,7 +72,8 @@ function methodsCalledIn(src: string): Set<string> {
   return found;
 }
 
-const methodsCalledInSource = (): Set<string> => methodsCalledIn(read('../src/index.ts'));
+const methodsCalledInSource = (): Set<string> =>
+  new Set(sourceModules().flatMap((text) => [...methodsCalledIn(text)]));
 
 /** One documented row: the scope cell, and the seam methods the 'Used by' cell names. */
 interface ScopeRow {
@@ -79,11 +93,22 @@ function scopeTable(): Map<string, ScopeRow> {
   );
 }
 
-/** The body of `SlackPlugin`, where every seam method and every helper it reaches lives. */
-function pluginClassBody(src: string): string {
-  const found = /\nexport class SlackPlugin implements BackendPlugin \{\n([\s\S]*?)\n\}\n/.exec(src);
-  expect(found, 'src/index.ts has no SlackPlugin class body').not.toBeNull();
-  return found![1]!;
+/** Every exported class body in a source — the seam's own, and each piece it composes. */
+const classBodies = (src: string): string[] =>
+  [...src.matchAll(/\nexport class \w+[^{]*\{\n([\s\S]*?)\n\}\n/g)].map((m) => m[1]!);
+
+/**
+ * The body of the seam class, found by the interface it implements rather than by the file it sits
+ * in: "a seam method" means a public method of THAT class, and no other.
+ */
+function seamClassBody(): string {
+  const bodies = sourceModules().flatMap((src) =>
+    [...src.matchAll(/\nexport class \w+ implements BackendPlugin \{\n([\s\S]*?)\n\}\n/g)].map(
+      (m) => m[1]!,
+    ),
+  );
+  expect(bodies, 'src/ has exactly one class implementing BackendPlugin').toHaveLength(1);
+  return bodies[0]!;
 }
 
 interface SourceMethod {
@@ -114,22 +139,40 @@ function methodsOf(classBody: string): Map<string, SourceMethod> {
 }
 
 /**
- * The Web API methods reachable from `entry` — its own `this.api('…')` call sites plus everything
- * the `this.<method>(…)` calls in its body reach, transitively. TRANSITIVE is the point: every
- * interesting call site sits behind a private helper (`runFetch`, `openSocket`, `authTest`), so a
- * one-level scan would say no seam method calls anything at all. The `seen` set makes the mutual
- * recursion in the socket lifecycle (`openSocket` → `reconnect` → `ensureSocket` → `openSocket`) a
- * walk rather than a hang.
+ * The methods of several classes in ONE table, keyed by name alone — a name declared by two classes
+ * keeps both bodies, so a walk over this table over-approximates rather than losing a call site.
  */
-function apiMethodsReachedFrom(methods: Map<string, SourceMethod>, entry: string): Set<string> {
+function tableOf(bodies: string[]): Map<string, SourceMethod[]> {
+  const out = new Map<string, SourceMethod[]>();
+  for (const body of bodies) {
+    for (const [name, method] of methodsOf(body)) out.set(name, [...(out.get(name) ?? []), method]);
+  }
+  return out;
+}
+
+/** Every method of every class under `src/`, as the walk below needs to see them. */
+const methodsInSource = (): Map<string, SourceMethod[]> =>
+  tableOf(sourceModules().flatMap(classBodies));
+
+/**
+ * The Web API methods reachable from `entry` — its own `this.api('…')` call sites plus everything
+ * the `this.<method>(…)` and `this.<field>.<method>(…)` calls in its body reach, transitively.
+ * TRANSITIVE is the point: every interesting call site sits behind a private helper (`runFetch`,
+ * `openSocket`, `authTest`) and several sit in a class the plugin COMPOSES rather than in the
+ * plugin, so a one-level scan — or one that stops at the field holding the collaborator — would say
+ * no seam method calls anything at all. The `seen` set makes the mutual recursion in the socket
+ * lifecycle (`openSocket` → `reconnect` → `ensureSocket` → `openSocket`) a walk rather than a hang.
+ */
+function apiMethodsReachedFrom(methods: Map<string, SourceMethod[]>, entry: string): Set<string> {
   const found = new Set<string>();
   const seen = new Set<string>();
   const walk = (name: string): void => {
-    const method = methods.get(name);
-    if (method === undefined || seen.has(name)) return;
+    if (seen.has(name)) return;
     seen.add(name);
-    for (const called of methodsCalledIn(method.body)) found.add(called);
-    for (const ref of method.body.matchAll(/this\.(\w+)\s*[(<]/g)) walk(ref[1]!);
+    for (const method of methods.get(name) ?? []) {
+      for (const called of methodsCalledIn(method.body)) found.add(called);
+      for (const ref of method.body.matchAll(/this\.(?:\w+\.)*(\w+)\s*[(<]/g)) walk(ref[1]!);
+    }
   };
   walk(entry);
   return found;
@@ -182,13 +225,15 @@ describe('slack provisioning docs', () => {
    * inside any seam method fails here rather than in an operator's `missing_scope`.
    */
   it("each row's 'Used by' cell is exactly the seam methods whose code path reaches that call", () => {
-    const methods = methodsOf(pluginClassBody(read('../src/index.ts')));
-    const seam = [...methods].filter(([, m]) => m.isPublic).map(([name]) => name);
+    const seam = [...methodsOf(seamClassBody())]
+      .filter(([, m]) => m.isPublic)
+      .map(([name]) => name);
     // The walk found the class, not an empty string that would agree with an empty README.
     expect(seam.sort()).toEqual(
       ['connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe'].sort(),
     );
 
+    const methods = methodsInSource();
     const table = scopeTable();
     expect(table.size).toBeGreaterThan(0);
     for (const [method, row] of table) {
@@ -198,11 +243,12 @@ describe('slack provisioning docs', () => {
     }
   });
 
-  // CLASS: the source-scanning guard again — this walk has three ways to go blind (miss a method,
-  // stop following `this.<method>` calls, or hang on the socket lifecycle's mutual recursion), and
-  // all three would leave the parity check above comparing two empty sets.
-  it('the reachability walk reads method bodies, follows this.<method> calls, and survives a cycle', () => {
-    const fixture = [
+  // CLASS: the source-scanning guard again — this walk has four ways to go blind (miss a method,
+  // stop following `this.<method>` calls, stop at the field holding a collaborator, or hang on the
+  // socket lifecycle's mutual recursion), and all four would leave the parity check above comparing
+  // two empty sets.
+  it('the reachability walk reads method bodies, follows this.<method> and this.<field>.<method> calls, and survives a cycle', () => {
+    const seamLike = [
       '  async alpha(): Promise<void> {',
       '    await this.beta();',
       '  }',
@@ -216,15 +262,51 @@ describe('slack provisioning docs', () => {
       "    this.api('shallow.method', {});",
       '  }',
       '',
+      '  public delta(): void {',
+      '    void this.collaborator.reached();',
+      '  }',
+      '',
       '  private readonly notAMethod = new Map<string, string>();',
     ].join('\n');
+    const collaborator = [
+      '  reached(): void {',
+      "    this.api('composed.method', {});",
+      '  }',
+    ].join('\n');
 
-    const methods = methodsOf(fixture);
-    expect([...methods.keys()]).toEqual(['alpha', 'beta', 'gamma']);
-    expect([...methods].filter(([, m]) => m.isPublic).map(([n]) => n)).toEqual(['alpha', 'gamma']);
-    expect(apiMethodsReachedFrom(methods, 'alpha')).toEqual(new Set(['deep.method']));
-    expect(apiMethodsReachedFrom(methods, 'gamma')).toEqual(new Set(['shallow.method']));
-    expect(apiMethodsReachedFrom(methods, 'nosuch')).toEqual(new Set());
+    const methods = methodsOf(seamLike);
+    expect([...methods.keys()]).toEqual(['alpha', 'beta', 'gamma', 'delta']);
+    expect([...methods].filter(([, m]) => m.isPublic).map(([n]) => n)).toEqual([
+      'alpha',
+      'gamma',
+      'delta',
+    ]);
+
+    const table = tableOf([seamLike, collaborator]);
+    expect(apiMethodsReachedFrom(table, 'alpha')).toEqual(new Set(['deep.method']));
+    expect(apiMethodsReachedFrom(table, 'gamma')).toEqual(new Set(['shallow.method']));
+    // The hop the plugin's own layout depends on: a call through a field into another class.
+    expect(apiMethodsReachedFrom(table, 'delta')).toEqual(new Set(['composed.method']));
+    expect(apiMethodsReachedFrom(table, 'nosuch')).toEqual(new Set());
+  });
+
+  // CLASS: an extractor that reads one file where the code now spans several. Both source-driven
+  // scans are anchored on `src/` rather than on a path, so a module added later is covered the
+  // moment it lands — and a class body it cannot read fails here rather than silently narrowing.
+  it('the class-body extractor finds every exported class in a module', () => {
+    const module = [
+      '',
+      'export class One implements BackendPlugin {',
+      '  a(): void {}',
+      '}',
+      '',
+      'export class Two {',
+      '  b(): void {}',
+      '}',
+      '',
+    ].join('\n');
+    expect(classBodies(module)).toEqual(['  a(): void {}', '  b(): void {}']);
+    expect([...tableOf(classBodies(module)).keys()]).toEqual(['a', 'b']);
   });
 });
 

@@ -1,6 +1,45 @@
 import { plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
-import { DEFAULT_API_URL } from './api.js';
-import type { SlackBackendConfig } from './index.js';
+import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
+
+export const DEFAULT_API_URL = 'https://slack.com/api';
+
+/** Plugin-specific backend_config. */
+export interface SlackBackendConfig {
+  /** Bot token (`xoxb-…`) — Web API calls: `chat.postMessage`, `conversations.history`, …. */
+  bot_token?: string;
+  /** App-level token (`xapp-…`) with `connections:write` — Socket Mode (`apps.connections.open`). */
+  app_token?: string;
+  /** Web API base URL. Default `https://slack.com/api` (tests point this at an in-process fake). */
+  api_url?: string;
+  /**
+   * Parley topic → Slack channel id (e.g. `{"ctx-payments": "C0123456789"}`). A topic with no
+   * entry is used as a channel-id literal, so topics that already ARE channel ids need no map.
+   */
+  channel_map?: Record<string, string>;
+  /**
+   * Slack user/usergroup id → Parley handle (e.g. `{"U0PARLEY": "ctx-payments"}`), applied when
+   * rewriting `<@U…>` mention markup into the `@handle` form core's mention filter reads.
+   */
+  mention_map?: Record<string, string>;
+  /** Milliseconds a Socket Mode connection may stay silent after opening before `hello`. */
+  handshake_timeout_ms?: number;
+  /** Milliseconds a rotated-out Socket Mode connection may stay open after its replacement is up. */
+  rotation_grace_ms?: number;
+}
+
+/**
+ * A {@link SlackBackendConfig} that has been through {@link resolveConfig}. Keep the plugin and
+ * everything it composes reading THIS, so that no module re-applies a default the load path owns.
+ */
+export interface SlackSettings {
+  apiUrl: string;
+  botToken?: string;
+  appToken?: string;
+  channelMap: Record<string, string>;
+  mentionMap: Record<string, string>;
+  handshakeTimeoutMs: number;
+  rotationGraceMs: number;
+}
 
 /** Largest delay Node's timers accept; past it every one of them silently becomes 1ms. */
 export const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -14,17 +53,6 @@ export const TIMER_CONFIG_KEYS = ['handshake_timeout_ms', 'rotation_grace_ms'] a
 
 /** Every `backend_config` key spent as an `Authorization: Bearer` credential. */
 export const TOKEN_CONFIG_KEYS = ['bot_token', 'app_token'] as const;
-
-/**
- * A config lookup table with NO prototype chain. Keep both config maps built this way, so that a
- * key like `__proto__` or `toString` — legal in core's `topics` and reachable straight from
- * untrusted inbound mention markup — cannot answer with an `Object.prototype` member.
- */
-export function ownEntriesOnly<T>(map: Record<string, T>): Record<string, T> {
-  const out = Object.create(null) as Record<string, T>;
-  for (const [key, value] of Object.entries(map)) out[key] = value;
-  return out;
-}
 
 /**
  * Reject a `backend_config` lookup table that is not one, or whose values cannot be used as ones.
@@ -48,6 +76,10 @@ export function requireUsableMap(
         `expected an object mapping each key to ${what}`,
     );
   }
+  // Keep both config maps rebuilt with NO prototype chain, so that a key like `__proto__` or
+  // `toString` — legal in core's `topics` and reachable straight from untrusted inbound mention
+  // markup — cannot answer with an `Object.prototype` member.
+  const checked = Object.create(null) as Record<string, string>;
   for (const [key, value] of Object.entries(map)) {
     if (typeof value !== 'string' || value.length === 0) {
       throw new Error(
@@ -55,8 +87,9 @@ export function requireUsableMap(
           `which is not ${what}`,
       );
     }
+    checked[key] = value;
   }
-  return ownEntriesOnly(map as Record<string, string>);
+  return checked;
 }
 
 /**
@@ -96,7 +129,7 @@ const isHttpUrl = (s: string): boolean => {
  * rather than a coercion, so that a timing knob outside Node's timer range fails instead of
  * silently clamping to 1ms — which disables the very bound the knob exists to set.
  */
-export function validateConfig(cfg: SlackBackendConfig): void {
+function validateConfig(cfg: SlackBackendConfig): void {
   const reject = (key: keyof SlackBackendConfig, expected: string): never => {
     const raw = cfg[key];
     throw new Error(
@@ -118,6 +151,29 @@ export function validateConfig(cfg: SlackBackendConfig): void {
     const value = cfg[key];
     if (value !== undefined && typeof value !== 'string') reject(key, 'a string');
   }
+}
+
+/**
+ * Every rejection a `backend_config` can earn, in one pass that changes nothing — so that a caller
+ * can refuse a config before standing down the connection the refused one would have replaced.
+ */
+export function resolveConfig(cfg: SlackBackendConfig): SlackSettings {
+  validateConfig(cfg);
+  return {
+    apiUrl: (cfg.api_url ?? DEFAULT_API_URL).replace(/\/+$/, ''),
+    botToken: cfg.bot_token,
+    appToken: cfg.app_token,
+    // `=== undefined`, never `??`: a null map is a value the declared type does not allow, and
+    // defaulting it here would accept it as "no map configured" instead of failing at load.
+    channelMap: requireUsableChannelMap(cfg.channel_map === undefined ? {} : cfg.channel_map),
+    mentionMap: requireUsableMap(
+      'mention_map',
+      'a handle',
+      cfg.mention_map === undefined ? {} : cfg.mention_map,
+    ),
+    handshakeTimeoutMs: cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
+    rotationGraceMs: cfg.rotation_grace_ms ?? DEFAULT_ROTATION_GRACE_MS,
+  };
 }
 
 /**

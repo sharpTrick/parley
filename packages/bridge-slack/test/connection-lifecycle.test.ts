@@ -32,6 +32,7 @@ import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.
 import { FakeSlack, type GreetMode } from './fake-slack.js';
 import {
   capture,
+  internals,
   settleWithin,
   sleep,
   startSlack,
@@ -70,8 +71,7 @@ const OUTAGES: Array<{ name: string; arm: (fake: FakeSlack) => void }> = [
   },
 ];
 
-const spyReconnect = (plugin: SlackPlugin) =>
-  vi.spyOn(plugin as unknown as { reconnect: () => Promise<void> }, 'reconnect');
+const spyReconnect = (plugin: SlackPlugin) => vi.spyOn(internals(plugin), 'reconnect');
 
 describe('slack reconnect ownership under a sustained outage', () => {
   for (const outage of OUTAGES) {
