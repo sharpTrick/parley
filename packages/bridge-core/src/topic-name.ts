@@ -11,12 +11,20 @@ import { createHash } from 'node:crypto';
 import type { Topic } from './message.js';
 
 /**
- * Shortest disambiguating suffix {@link safeName} will mint, and its default. Injectivity is
- * PROBABILISTIC, not proven: the suffix is a truncated digest, so a second preimage for a chosen
- * target name costs about `2^(4 × hashLen)` hashes over an attacker-chosen topic. Raising `hashLen`
- * is the safe direction; a caller asking for less is refused rather than quietly served, because a
- * short suffix is brute-forceable in seconds and a collision routes one topic's traffic into
- * another's backend channel.
+ * Shortest disambiguating suffix {@link safeName} will mint, and its DEFAULT — so this is the width
+ * every caller that omits `hashLen` runs on, and it is a security parameter rather than a formatting
+ * choice. Injectivity is PROBABILISTIC, not proven: the suffix is a truncated digest, so landing on
+ * a chosen target name costs about `2^(4 × hashLen)` hashes — 40 bits at the default, which is
+ * minutes of commodity GPU time. What actually bounds the search is the FOLD, not the digest: the
+ * attacker needs a raw topic with the same sanitized form as the victim's, so a fold that replaces
+ * illegal characters one-for-one offers only `|illegal alphabet|^(lossy positions)` candidates to
+ * hash. A deployment whose `post_topics` lets a caller name arbitrary topics, over a fold that is
+ * lossy in several positions, should pass a wider `hashLen`. Raising it is the safe direction; a
+ * caller asking for less is refused rather than quietly served, because a collision routes one
+ * topic's traffic into another's backend channel.
+ *
+ * Keep the default where it is unless a rename is the intent, so that every channel an already
+ * running deployment created stays addressable — the suffix is part of the backend name.
  */
 export const MIN_HASH_LEN = 10;
 

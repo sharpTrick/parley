@@ -55,7 +55,13 @@ const BOUNDS: StatedBound[] = [
     legal: 'at-or-below',
     probe: (len) => {
       const handle = 'a'.repeat(len - 1);
-      return matchGlob(`${handle}*`, handle) ? 'accepted' : 'refused';
+      try {
+        return matchGlob(`${handle}*`, handle) ? 'accepted' : 'refused';
+      } catch (e) {
+        expect(e).toBeInstanceOf(RangeError);
+        expect((e as Error).message).toMatch(new RegExp(`at most ${MAX_GLOB_LEN} are matched`));
+        return 'refused';
+      }
     },
   },
   {
@@ -241,8 +247,13 @@ const CAPACITIES: Capacity[] = [
     name: 'MIN_HASH_LEN',
     actual: MIN_HASH_LEN,
     expected: 10,
-    realistic: "safeName's default suffix is wide enough to be collision-resistant",
-    accepts: () => /-[0-9a-f]{10,}$/.test(safeName(asTopic('a b'), sanitizeAlias)),
+    // The floor is also the DEFAULT, so grade the width safeName mints when `hashLen` is omitted —
+    // exactly, not `{10,}`, which leaves the security parameter free to move under a green suite.
+    realistic: 'the suffix minted when hashLen is omitted is exactly this many hex digits',
+    accepts: () => {
+      const minted = safeName(asTopic('a b'), sanitizeAlias).split('-').pop()!;
+      return minted.length === MIN_HASH_LEN && /^[0-9a-f]+$/.test(minted);
+    },
   },
   {
     name: 'MAX_HASH_LEN',

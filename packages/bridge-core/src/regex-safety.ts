@@ -72,8 +72,13 @@ function repetitionCost(min: number, max: number): number {
  * A source the scan cannot follow to the end — an unterminated class, an unbalanced group, a
  * trailing escape — is refused rather than accepted: losing track of the grammar means the
  * remainder was never screened. So is one the scan does follow but V8 rejects: a quantifier with
- * nothing to repeat (`*a`, `a**`, `\b?`, `^*`) or a `{n,m}` whose min exceeds its max. So
- * everything the screen accepts also compiles on its own.
+ * nothing to repeat (`*a`, `a**`, `\b?`, `^*`) or a `{n,m}` whose min exceeds its max.
+ *
+ * Those refusals keep the SCAN honest; they do not make this a syntax validator. A source can be
+ * screenable and still be refused by V8 — a reversed character-class range (`[b-a]`), a duplicate
+ * named group, a quantified lookbehind, a backreference to a name that does not exist. So a caller
+ * MUST compile the source itself, inside a `try`/`catch` or an explicit assertion, and must never
+ * read a `true` from here as "this compiles".
  */
 export function isRedosSafeSource(src: string): boolean {
   let budget = 1;

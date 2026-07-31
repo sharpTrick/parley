@@ -1,6 +1,15 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { allowlistFor } from './allowlist.js';
-import { instanceIdOf, MAX_BLOCK_MS, parseConfig, type ParleyConfig } from './config.js';
+import {
+  instanceIdOf,
+  loadConfig,
+  MAX_BLOCK_MS,
+  parseConfig,
+  type ParleyConfig,
+} from './config.js';
 import {
   decodePresence,
   encodePresence,
@@ -803,4 +812,66 @@ describe('a config list carried by the presence beat is capped where it is decla
       expect(await roundTrip(list, MAX_RECORD_TOPICS + 1)).not.toBe('truncated on the wire');
     },
   );
+});
+
+// `loadConfig` is what every shipped backend CLI calls, so its failure message is the first thing a
+// stuck operator reads. Grade the CLASS "every way a config FILE can fail names the file and the
+// kind of failure" rather than the empty-document instance: one row per way a whole file goes wrong,
+// each asserting the path appears and that no raw zod dump leaked through. The positive control is
+// what keeps the rows honest — without it, `loadConfig = () => { throw new Error(path) }` passes
+// every row.
+describe('loadConfig names the file and the failure kind', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-config-'));
+  const write = (name: string, text: string): string => {
+    const path = join(dir, name);
+    writeFileSync(path, text);
+    return path;
+  };
+
+  const VALID = [
+    'identity:',
+    '  handle: ctx-payments',
+    'topics:',
+    '  - ctx-payments',
+    '',
+  ].join('\n');
+
+  const FILE_FAILURES: readonly (readonly [label: string, path: () => string, expect: RegExp])[] = [
+    ['a file that does not exist', () => join(dir, 'absent.yaml'), /cannot read config .*ENOENT/],
+    ['a directory in place of a file', () => dir, /cannot read config .*EISDIR/],
+    ['an empty file', () => write('empty.yaml', ''), /is empty \(or holds only comments\)/],
+    ['a comment-only file', () => write('comments.yaml', '# nothing here\n'), /is empty \(or holds only comments\)/],
+    ['a top-level scalar', () => write('scalar.yaml', 'just-a-string\n'), /is a bare string/],
+    ['a top-level sequence', () => write('seq.yaml', '- ctx\n- ctx2\n'), /is a YAML sequence/],
+    ['a YAML syntax error', () => write('syntax.yaml', 'identity:\n   handle: a: b\n'), /is not valid YAML/],
+    ['a missing required field', () => write('nofields.yaml', 'topics:\n  - ctx\n'), /identity: .*required/i],
+    ['an unknown top-level key', () => write('unknown.yaml', `${VALID}presense: {}\n`), /presense/],
+    ['a field-level rule violation', () => write('badttl.yaml', `${VALID}presence:\n  heartbeat_ms: 60000\n  ttl_ms: 1000\n`), /presence\.ttl_ms: .*heartbeat_ms/],
+    ['a legacy backend key', () => write('backend.yaml', `${VALID}backend: local-sqlite\n`), /`backend` is not a supported field/],
+  ] as const;
+
+  it('a valid file still loads (positive control: the rows cannot pass by throwing always)', () => {
+    const cfg = loadConfig(write('good.yaml', VALID));
+    expect(cfg.identity.handle).toBe('ctx-payments');
+    expect(cfg.topics).toEqual(['ctx-payments']);
+  });
+
+  it.each(FILE_FAILURES)('%s', (_label, path, matcher) => {
+    const file = path();
+    let thrown: unknown;
+    try {
+      loadConfig(file);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown, 'the file was accepted').toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message, 'the failure must name the file').toContain(file);
+    expect(message).toMatch(matcher);
+    // A serialized zod error names neither the file nor the shape expected; it is the regression
+    // this whole table exists to keep out.
+    expect(message).not.toContain('ZodError');
+    expect(message).not.toContain('"code":');
+    expect(message).not.toContain('invalid_type');
+  });
 });

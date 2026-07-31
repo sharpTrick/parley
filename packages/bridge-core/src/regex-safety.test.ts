@@ -74,10 +74,26 @@ function compiles(src: string): boolean {
   }
 }
 
-/** Every character that can change how the hand-rolled scan parses what follows it. */
+/** V8's own words for why it refused a source, with the echoed pattern stripped off. */
+function syntaxError(src: string): string | null {
+  try {
+    new RegExp(src);
+    return null;
+  } catch (e) {
+    return (e as Error).message.replace(/^Invalid regular expression: \/.*\/[a-z]*: /, '');
+  }
+}
+
+/**
+ * Every character that can change how the hand-rolled scan parses what follows it. `-`, `<` and `>`
+ * earn their place the same way the rest do: without them no enumerated source can spell a
+ * character-class range, a named group or a lookbehind, so every V8 rule built out of those shapes
+ * sits outside the alphabet and a leak filter over the set comes back clean while the class is wide
+ * open.
+ */
 const META = [
   'a', '.', '*', '+', '?', '|', '(', ')', '[', ']', '{', '}', ',', '1', '2', '\\', '^', '$', 'b',
-  ':', '=', '!',
+  ':', '=', '!', '-', '<', '>', 'k',
 ];
 
 /** Every source of length 1…maxLen over {@link META}. */
@@ -120,6 +136,16 @@ function sampleSources(count: number, minLen: number, maxLen: number): string[] 
   }
   return out;
 }
+
+/** Every generated source the accept/refuse rules below are graded over. */
+const ALL_CANDIDATES: string[] = [
+  ...CORPUS,
+  ...TRUNCATIONS,
+  ...CLASS_PREFIXES.map((p) => p + '.*'),
+  ...enumerateSources(3),
+  ...quantifierShapes(),
+  ...sampleSources(30_000, 4, 8),
+];
 
 /** Inputs drawn from the pattern's own literal alphabet, at every length up to the caller clamp. */
 function inputsFor(src: string): string[] {
@@ -169,26 +195,197 @@ describe('isRedosSafeSource', () => {
     expect(leaked).toEqual([]);
   });
 
-  // The screen's doc promises everything it accepts also compiles on its own, and that promise is
-  // the argument a future reader would use to delete allowlist.ts's assertCompilesAlone. A
-  // hand-picked candidate list cannot reach the shapes that break it — a quantifier with nothing to
-  // repeat (`*a`, `a**`, `^?`) or a reversed `{n,m}` — so enumerate the metacharacter alphabet.
-  it('never accepts a source that does not compile on its own', () => {
-    const candidates = [
-      ...CORPUS,
-      ...TRUNCATIONS,
-      ...CLASS_PREFIXES.map((p) => p + '.*'),
-      ...enumerateSources(3),
-      ...quantifierShapes(),
-      ...sampleSources(30_000, 4, 8),
+  it('the enumerated set is wide enough to grade the region V8 refuses', () => {
+    expect(ALL_CANDIDATES.length).toBeGreaterThan(40_000);
+    expect(ALL_CANDIDATES.filter((src) => !compiles(src)).length).toBeGreaterThan(2_000);
+  });
+});
+
+// The screen is a ReDoS screen, not a syntax validator: it refuses what its own scan cannot follow,
+// and is blind to the rest of V8's grammar. Which side of that line each rule falls on is the whole
+// contract — a screen that quietly starts enforcing a caller rule has changed its documented
+// promise, and one that stops enforcing a scan rule has gone blind to everything after the shape it
+// mis-parsed. Sources are GENERATED per rule from templates and each rule carries a positive control
+// that its family really reaches it, so a rule that has drifted out of the generator's reach fails
+// as a missing exemplar rather than as a clean run.
+describe('the boundary between what the screen enforces and what a caller must', () => {
+  const SLOTS: Record<string, string[]> = {
+    A: ['a', 'b', 'z', '0', '9', '=', '-', '<', '>'],
+    Q: ['*', '+', '?', '{2}', '{2,}', '{2,3}'],
+    N: ['n', 'm'],
+    D: ['0', '1', '2', '3'],
+    X: ['', 'x', '>', '^'],
+  };
+
+  function expand(template: string): string[] {
+    const slot = /<([A-Z])>/.exec(template);
+    if (slot === null) return [template];
+    return SLOTS[slot[1]!]!.flatMap((value) => expand(template.replace(slot[0], value)));
+  }
+
+  interface SyntaxRule {
+    rule: string;
+    v8: RegExp;
+    /** `screen` — refused here; `caller` — accepted here, so a caller must compile it itself. */
+    enforcedBy: 'screen' | 'caller';
+    templates: string[];
+  }
+
+  const SYNTAX_RULES: SyntaxRule[] = [
+    {
+      rule: 'reversed character-class range',
+      v8: /Range out of order in character class/,
+      enforcedBy: 'caller',
+      templates: ['[<A>-<A>]', '[^<A>-<A>]', '<X>[<A>-<A>]<X>', '[<A><A>-<A>]'],
+    },
+    {
+      rule: 'duplicate named capture group',
+      v8: /Duplicate capture group name/,
+      enforcedBy: 'caller',
+      templates: ['(?<<N>>x)(?<<N>>y)', '(?<<N>><A>)(?<<N>><A>)'],
+    },
+    {
+      rule: 'quantified lookbehind',
+      v8: /Invalid quantifier/,
+      enforcedBy: 'caller',
+      templates: ['(?<=<A>)<Q>b', '(?<!<A>)<Q>b'],
+    },
+    {
+      rule: 'backreference to a capture name that does not exist',
+      v8: /Invalid named capture referenced/,
+      enforcedBy: 'caller',
+      templates: ['(?<<N>>x)\\k<<N>>', '(?<<N>>x)\\k<z>'],
+    },
+    {
+      rule: 'quantifier with nothing to repeat',
+      v8: /Nothing to repeat/,
+      enforcedBy: 'screen',
+      templates: ['<Q>a', 'a<Q><Q>', '^<Q>b', '\\b<Q>b', '(?:a)<Q><Q>'],
+    },
+    {
+      rule: 'reversed {n,m} bounds',
+      v8: /numbers out of order in \{\} quantifier/,
+      enforcedBy: 'screen',
+      templates: ['a{<D>,<D>}', '(?:ab){<D>,<D>}', '[ab]{<D>,<D>}x'],
+    },
+    {
+      rule: 'unterminated character class',
+      v8: /Unterminated character class/,
+      enforcedBy: 'screen',
+      templates: ['[<A><A>', '<X>[^<A>', '(a)[<A>'],
+    },
+    {
+      rule: 'unterminated group',
+      v8: /Unterminated group/,
+      enforcedBy: 'screen',
+      templates: ['(<A>', '(?:<A>', '(?<<N>><A>', '(?=<A>'],
+    },
+    {
+      rule: 'trailing escape',
+      v8: /\\ at end of pattern/,
+      enforcedBy: 'screen',
+      templates: ['<A>\\', '[<A>]\\', '(<A>)\\'],
+    },
+    {
+      rule: "unmatched ')'",
+      v8: /Unmatched '\)'/,
+      enforcedBy: 'screen',
+      templates: ['<A>)<A>', ')<A>', '(a))<A>'],
+    },
+  ];
+
+  const familyOf = (rule: SyntaxRule): string[] => rule.templates.flatMap(expand);
+
+  /** The members of a family V8 actually refuses FOR THAT RULE — the only ones the row grades. */
+  const refusedFor = (rule: SyntaxRule): string[] =>
+    familyOf(rule).filter((src) => rule.v8.test(syntaxError(src) ?? ''));
+
+  const CALLER_RULES = SYNTAX_RULES.filter((r) => r.enforcedBy === 'caller');
+
+  it('grades both directions, and every rule message is distinct', () => {
+    expect(new Set(SYNTAX_RULES.map((r) => r.enforcedBy))).toEqual(new Set(['screen', 'caller']));
+    expect(new Set(SYNTAX_RULES.map((r) => r.v8.source)).size).toBe(SYNTAX_RULES.length);
+    // Two rules sharing one V8 message would let a regression on the screen side hide behind the
+    // caller side's exemption in the leak filter below.
+    for (const rule of SYNTAX_RULES) {
+      const others = SYNTAX_RULES.filter((r) => r !== rule);
+      for (const src of refusedFor(rule))
+        expect(others.filter((o) => o.v8.test(syntaxError(src)!)), src).toEqual([]);
+    }
+  });
+
+  it.each(SYNTAX_RULES.map((r) => [r.rule, r] as const))(
+    'the generated family for %s reaches the rule at all',
+    (_label, rule) => {
+      expect(familyOf(rule).length).toBeGreaterThan(2);
+      expect(refusedFor(rule).length, `no generated source trips ${rule.v8.source}`).toBeGreaterThan(
+        0,
+      );
+    },
+  );
+
+  it.each(SYNTAX_RULES.filter((r) => r.enforcedBy === 'screen').map((r) => [r.rule, r] as const))(
+    'the screen refuses every source that trips %s',
+    (_label, rule) => {
+      const accepted = refusedFor(rule).filter((src) => isRedosSafeSource(src));
+      expect(accepted.slice(0, 10), `${accepted.length} accepted despite ${rule.rule}`).toEqual([]);
+    },
+  );
+
+  it.each(CALLER_RULES.map((r) => [r.rule, r] as const))(
+    'the screen is blind to %s, so the doc must keep saying a caller compiles for itself',
+    (_label, rule) => {
+      expect(refusedFor(rule).filter((src) => isRedosSafeSource(src)).length).toBeGreaterThan(0);
+    },
+  );
+
+  // Whatever the screen lets through must fail for a reason this table already names. A NEW leak
+  // class reddens here and forces the rule table — and with it the module doc — to grow.
+  it('no accepted source is uncompilable for a reason outside the table', () => {
+    const candidates = [...ALL_CANDIDATES, ...SYNTAX_RULES.flatMap(familyOf)];
+    const unexplained = [
+      ...new Set(
+        candidates.filter((src) => {
+          if (!isRedosSafeSource(src)) return false;
+          const why = syntaxError(src);
+          return why !== null && !CALLER_RULES.some((r) => r.v8.test(why));
+        }),
+      ),
     ];
-    const uncompilable = candidates.filter((src) => !compiles(src));
-    // Floors, so that a shrunken or mis-seeded generator cannot pass by enumerating only sources
-    // that trivially compile: the interesting region is the one V8 refuses.
-    expect(candidates.length).toBeGreaterThan(40_000);
-    expect(uncompilable.length).toBeGreaterThan(2_000);
-    const leaked = [...new Set(candidates.filter((src) => isRedosSafeSource(src) && !compiles(src)))];
-    expect(leaked.slice(0, 20), `${leaked.length} accepted source(s) do not compile`).toEqual([]);
+    expect(
+      unexplained.slice(0, 20).map((src) => `${JSON.stringify(src)}: ${syntaxError(src)}`),
+      `${unexplained.length} accepted source(s) fail for an unlisted syntax rule`,
+    ).toEqual([]);
+  });
+
+  // The screen's blindness is only contained because every entry point that compiles an unauthored
+  // source does so defensively. Feed each blind spot to both, so that dropping either guard turns a
+  // located refusal back into a raw SyntaxError from wherever the pattern first gets compiled.
+  const BLIND_SPOTS = CALLER_RULES.map(
+    (r) => [r.rule, refusedFor(r).find((src) => isRedosSafeSource(src))!] as const,
+  );
+
+  it('has one blind-spot exemplar per caller rule', () => {
+    expect(BLIND_SPOTS.map(([rule]) => rule)).toEqual(CALLER_RULES.map((r) => r.rule));
+    for (const [rule, src] of BLIND_SPOTS) {
+      expect(src, rule).toBeTypeOf('string');
+      expect(isRedosSafeSource(src), rule).toBe(true);
+      expect(compiles(src), rule).toBe(false);
+    }
+  });
+
+  it.each(BLIND_SPOTS)('Allowlist refuses a post pattern with %s (%j)', (_rule, src) => {
+    expect(() => new Allowlist(['ctx'], { postPatterns: [src] })).toThrow(SyntaxError);
+  });
+
+  it.each(BLIND_SPOTS)('the config loader locates a post_topics pattern with %s (%j)', (_r, src) => {
+    let issuePaths: unknown[][] = [];
+    try {
+      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], post_topics: [src] });
+    } catch (e) {
+      issuePaths = (e as { issues?: { path: unknown[] }[] }).issues?.map((i) => i.path) ?? [];
+    }
+    expect(issuePaths).toContainEqual(['post_topics', 0]);
   });
 });
 

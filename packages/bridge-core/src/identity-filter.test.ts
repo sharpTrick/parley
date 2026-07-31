@@ -87,6 +87,12 @@ describe('matchGlob agrees with an exhaustive reference matcher', () => {
   });
 });
 
+// A roster-shaping input has exactly three honest answers: keep everyone (no filter), narrow to
+// what the glob names, or REFUSE. The fourth behaviour — quietly returning nothing for an input the
+// layer considers illegal — is the one a caller cannot tell apart from "nobody is reachable", so no
+// illegal input may be answered at all. `''` is what a client that serialises an unset field sends
+// and the tool schema accepts it (`.max` with no `.min`), so it is a legal spelling of "unset";
+// anything over MAX_GLOB_LEN the schema rejects outright, and this layer must agree by throwing.
 describe('filterHandles', () => {
   const items = [
     { handle: asHandle('claude-a') },
@@ -94,27 +100,62 @@ describe('filterHandles', () => {
     { handle: asHandle('human-x') },
   ];
 
-  it('applies the glob', () => {
-    expect(filterHandles(items, 'claude-*').map((i) => i.handle)).toEqual(['claude-a', 'claude-b']);
+  interface RosterInput {
+    label: string;
+    filter: string | undefined;
+    verdict: 'keep-all' | 'narrowed' | 'refused';
+    kept: string[];
+  }
+
+  const ALL = ['claude-a', 'claude-b', 'human-x'];
+
+  const ROSTER_INPUTS: RosterInput[] = [
+    { label: 'omitted', filter: undefined, verdict: 'keep-all', kept: ALL },
+    { label: 'the empty string', filter: '', verdict: 'keep-all', kept: ALL },
+    { label: 'a glob naming a prefix', filter: 'claude-*', verdict: 'narrowed', kept: ALL.slice(0, 2) },
+    { label: 'a glob naming one handle', filter: 'human-*', verdict: 'narrowed', kept: ['human-x'] },
+    { label: 'a legal glob nobody matches', filter: 'nobody-*', verdict: 'narrowed', kept: [] },
+    { label: 'a star flood AT the cap', filter: '*'.repeat(MAX_GLOB_LEN), verdict: 'narrowed', kept: ALL },
+    { label: 'a literal AT the cap', filter: 'a'.repeat(MAX_GLOB_LEN), verdict: 'narrowed', kept: [] },
+    { label: 'one character past the cap', filter: 'a'.repeat(MAX_GLOB_LEN + 1), verdict: 'refused', kept: [] },
+    { label: 'a star flood past the cap', filter: '*'.repeat(MAX_GLOB_LEN + 50), verdict: 'refused', kept: [] },
+    { label: 'ten thousand characters', filter: 'a'.repeat(10_000), verdict: 'refused', kept: [] },
+  ];
+
+  it('covers all three verdicts, and pairs the empty ANSWER with the empty REFUSAL', () => {
+    expect([...new Set(ROSTER_INPUTS.map((r) => r.verdict))].sort()).toEqual([
+      'keep-all',
+      'narrowed',
+      'refused',
+    ]);
+    // Both rows must exist together: one proves `[]` is a true answer for a legal filter, the other
+    // proves an illegal filter never gets to borrow it.
+    expect(ROSTER_INPUTS.some((r) => r.verdict === 'narrowed' && r.kept.length === 0)).toBe(true);
+    expect(ROSTER_INPUTS.some((r) => r.verdict === 'refused')).toBe(true);
   });
 
-  // An optional string has exactly two legal readings — absent, or a value that narrows. The third
-  // behaviour, silently returning nothing, is the one a caller cannot tell apart from "nobody is
-  // reachable", and `''` is what a client that serialises an unset field sends. The tool schema
-  // accepts it (`.max` with no `.min`), so every spelling of "unset" must land on the same answer.
-  const OMITTED = [
-    ['omitted', undefined],
-    ['empty string', ''],
-  ] as const;
-
-  it.each(OMITTED)('keeps every handle when the filter is %s', (_label, filter) => {
-    expect(filterHandles(items, filter)).toEqual(items);
+  it.each(ROSTER_INPUTS)('filterHandles: $label is $verdict', ({ filter, verdict, kept }) => {
+    if (verdict === 'refused') {
+      expect(() => filterHandles(items, filter)).toThrow(RangeError);
+      expect(() => filterHandles(items, filter)).toThrow(new RegExp(`${MAX_GLOB_LEN}`));
+      return;
+    }
+    const out = filterHandles(items, filter);
+    expect(out.map((i) => i.handle)).toEqual(kept);
+    expect(out === items).toBe(verdict === 'keep-all');
   });
 
-  it('still narrows for a filter that names something, so "keep all" is not the only answer', () => {
-    expect(filterHandles(items, 'human-*')).toEqual([{ handle: asHandle('human-x') }]);
-    expect(filterHandles(items, 'nobody-*')).toEqual([]);
-  });
+  // The matcher primitive is a second door onto the same policy, so it owes the same verdicts.
+  it.each(ROSTER_INPUTS.filter((r) => r.filter !== undefined && r.filter !== ''))(
+    'matchGlob: $label is $verdict',
+    ({ filter, verdict }) => {
+      if (verdict === 'refused') {
+        expect(() => matchGlob(filter!, 'claude-a')).toThrow(RangeError);
+        return;
+      }
+      expect(typeof matchGlob(filter!, 'claude-a')).toBe('boolean');
+    },
+  );
 });
 
 // A `filter` is caller-supplied and matched against caller-influenced handles, so every pattern
@@ -135,11 +176,11 @@ describe('glob filtering is bounded for hostile patterns', () => {
     expect(performance.now() - started).toBeLessThan(100);
   });
 
-  it('refuses an over-long filter (safe-empty) and returns fast', () => {
-    const filter = '*'.repeat(MAX_GLOB_LEN + 50);
+  it('a filter AT the cap still resolves promptly', () => {
+    const filter = '*a'.repeat(MAX_GLOB_LEN / 2);
+    expect(filter).toHaveLength(MAX_GLOB_LEN);
     const started = performance.now();
-    expect(filterHandles([{ handle: asHandle('anything') }], filter)).toEqual([]);
-    expect(matchGlob(filter, 'anything')).toBe(false);
+    expect(filterHandles([{ handle: asHandle('a'.repeat(60)) }], filter)).toEqual([]);
     expect(performance.now() - started).toBeLessThan(100);
   });
 });

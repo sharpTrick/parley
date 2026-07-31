@@ -345,10 +345,54 @@ export function parseConfig(raw: unknown): ParleyConfig {
   return ConfigSchema.parse(raw);
 }
 
-/** Load + validate a YAML config file. */
+const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/**
+ * Render a validation failure as `<field path>: <message>` lines. A zod error stringifies as a JSON
+ * dump of its issues, which names neither the file nor the shape expected — and the whole-file
+ * failure is the first one an operator hits.
+ */
+function issueLines(err: unknown): string {
+  const issues = (err as { issues?: { path: (string | number)[]; message: string }[] }).issues;
+  if (!Array.isArray(issues) || issues.length === 0) return `  ${messageOf(err)}`;
+  return issues
+    .map((i) => `  ${i.path.length === 0 ? '(document)' : i.path.join('.')}: ${i.message}`)
+    .join('\n');
+}
+
+function describeDocument(data: unknown): string {
+  if (data === null || data === undefined) return 'empty (or holds only comments)';
+  if (Array.isArray(data)) return 'a YAML sequence';
+  return `a bare ${typeof data}`;
+}
+
+/**
+ * Load + validate a YAML config file. Every failure names the file and what kind of failure it was;
+ * {@link parseConfig} stays the entry point for an embedder that wants the structured zod issues.
+ */
 export function loadConfig(path: string): ParleyConfig {
-  const data: unknown = parseYaml(readFileSync(path, 'utf8'));
-  return parseConfig(data);
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (err) {
+    throw new Error(`cannot read config ${path}: ${messageOf(err)}`, { cause: err });
+  }
+  let data: unknown;
+  try {
+    data = parseYaml(text);
+  } catch (err) {
+    throw new Error(`${path} is not valid YAML: ${messageOf(err)}`, { cause: err });
+  }
+  if (typeof data !== 'object' || data === null || Array.isArray(data))
+    throw new Error(
+      `${path} is ${describeDocument(data)}; a Parley config is a top-level YAML mapping — ` +
+        '`identity:`, `topics:` and the rest at the left margin.',
+    );
+  try {
+    return parseConfig(data);
+  } catch (err) {
+    throw new Error(`${path} is not a valid Parley config:\n${issueLines(err)}`, { cause: err });
+  }
 }
 
 /** The instance id used to namespace per-instance read-state (defaults to the handle). */

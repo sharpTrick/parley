@@ -5,10 +5,20 @@
 import type { Handle } from './message.js';
 
 /**
- * Longest glob `filter` we will evaluate; a longer pattern matches nothing. Mirrored by a `.max()`
- * on the `parley_list_users` `filter` schema, which rejects an over-long filter before it gets here.
+ * Longest glob `filter` we will evaluate. A longer one is REFUSED — never answered — because the
+ * only answer it could otherwise carry is an empty roster, which a caller cannot tell apart from
+ * "no peer is reachable". Mirrored by a `.max()` on the `parley_list_users` `filter` schema, which
+ * rejects an over-long filter before it gets here.
  */
 export const MAX_GLOB_LEN = 256;
+
+function assertGlobLength(pattern: string): void {
+  if (pattern.length > MAX_GLOB_LEN)
+    throw new RangeError(
+      `glob filter is ${pattern.length} characters; at most ${MAX_GLOB_LEN} are matched. ` +
+        'Shorten it — an over-long filter is refused, not answered with an empty roster.',
+    );
+}
 
 /**
  * Full-anchored glob match: `*` = any run (including empty), `?` = exactly one char, every other
@@ -20,7 +30,6 @@ export const MAX_GLOB_LEN = 256;
  * in catastrophic backtracking.
  */
 function globMatch(pattern: string, value: string): boolean {
-  if (pattern.length > MAX_GLOB_LEN) return false;
   const P = pattern.length;
   const S = value.length;
   let p = 0;
@@ -49,17 +58,23 @@ function globMatch(pattern: string, value: string): boolean {
   return p === P;
 }
 
-/** The matcher primitive behind {@link filterHandles}; exported for its own unit tests. */
+/**
+ * The matcher primitive behind {@link filterHandles}; exported for its own unit tests. Throws
+ * `RangeError` for a pattern over {@link MAX_GLOB_LEN}.
+ */
 export function matchGlob(pattern: string, value: string): boolean {
+  assertGlobLength(pattern);
   return globMatch(pattern, value);
 }
 
 /**
- * Keep the handles matching `filter`; an absent filter keeps them all. A client that serialises an
- * unset filter as `''` means "no filter", so treat it as absent, so that the one answer a caller
- * cannot tell apart from a real outage — an empty roster — is never how an omitted filter reads.
+ * Keep the handles matching `filter`; an absent filter keeps them all, and one over
+ * {@link MAX_GLOB_LEN} throws `RangeError`. A client that serialises an unset filter as `''` means
+ * "no filter", so treat it as absent, so that the one answer a caller cannot tell apart from a real
+ * outage — an empty roster — is never how an omitted or an illegal filter reads.
  */
 export function filterHandles<T extends { handle: Handle }>(items: T[], filter?: string): T[] {
   if (filter === undefined || filter === '') return items;
+  assertGlobLength(filter);
   return items.filter((i) => globMatch(filter, i.handle));
 }
