@@ -1,5 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
+
+const SRC = new URL('../src/', import.meta.url);
 
 /**
  * The suite's own source, and the parser two files read it with. Both `suite-shape` (does every case
@@ -7,11 +9,25 @@ import { CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
  * have to know which case branches on which flag, and a parser restated in each is drift waiting to
  * happen — the multi-line `it.each` head that was invisible to every check in this package was one
  * parser bug, not two.
+ *
+ * EVERY module under `src/`, not one path: the graded cases live in `src/cases/*.ts` and a check
+ * anchored on a single file grades only the cases that file happens to hold — the rest run against
+ * every certified backend with no clause, no README bullet and no negative control.
  */
-export const suiteSource = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+export const suiteSources: string[] = readdirSync(SRC, { recursive: true })
+  .map(String)
+  .filter((f) => f.endsWith('.ts'))
+  .sort()
+  .map((f) => readFileSync(new URL(f, SRC), 'utf8'));
 
-/** Where the graded cases begin. Text before it registers nothing against a backend. */
-const ENTRY = 'export function runConformanceSuite';
+export const suiteSource = suiteSources.join('\n');
+
+/**
+ * Where a module's graded cases begin. Cases are registered by the exported function the suite
+ * calls, so text before the first one registers nothing against a backend — matched as the SHAPE
+ * rather than as `runConformanceSuite` by name, which now only wires the case modules together.
+ */
+const ENTRY = /^export (?:async )?function /m;
 
 /**
  * Every `it(...)` body in the suite, split on the case boundary. Keyed on the case's OPENING only —
@@ -24,7 +40,7 @@ const ENTRY = 'export function runConformanceSuite';
  * and no negative control while running against every certified backend.
  */
 export function casesIn(source: string): { title: string; body: string }[] {
-  const at = source.indexOf(ENTRY);
+  const at = source.search(ENTRY);
   const region = at < 0 ? source : source.slice(at);
   const out: { title: string; body: string }[] = [];
   const starts = [...region.matchAll(/^[ \t]*it(?:\.\w+)?\(/gm)];
@@ -39,7 +55,8 @@ export function casesIn(source: string): { title: string; body: string }[] {
   return out;
 }
 
-export const cases = (): { title: string; body: string }[] => casesIn(suiteSource);
+export const cases = (): { title: string; body: string }[] =>
+  suiteSources.flatMap((source) => casesIn(source));
 
 /** The capability fields a case could branch on to buy itself out of asserting. */
 export const CAPABILITY_FIELDS = Object.keys(CONTEXT_FIELDS).filter(
