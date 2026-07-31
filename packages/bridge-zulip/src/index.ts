@@ -5,7 +5,6 @@ import {
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
-  buildMessage,
   type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
@@ -14,13 +13,15 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay, fetchWithRetry, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { resolveConfig, type ZulipConfig } from './config.js';
 import {
-  DEFAULT_DEADLINE_MS,
-  delay,
-  fetchWithRetry,
-  plaintextRemoteOrigin,
-  retryAfterFromHeader,
-} from '@sharptrick/parley-net-util';
+  blockedFetchPause, budgetedDeadlineMs, longPollDeadlineMs, loopBackoffMs, reportsLoopFailure,
+} from './pacing.js';
+import {
+  asArray, type EventsResponse, MAX_MESSAGES_PER_FETCH, pageAnchor, type RealmMember,
+  readRetryAfter, requireSendableBody, requireWireTopic, type ZulipMessage, zulipToMessage,
+} from './wire.js';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -35,40 +36,10 @@ export interface ZulipBackendConfig {
   /**
    * Client-side cap (ms) on each `/api/v1/events` long-poll before it is aborted and reissued —
    * the loop re-checks shutdown each interval. Un-acked events survive the abort. Default 25000,
-   * clamped to [{@link MIN_EVENTS_TIMEOUT_MS}, {@link MAX_EVENTS_TIMEOUT_MS}]; a non-positive or
-   * non-numeric value is a `connect()` error.
+   * clamped to the bounds the README's config table publishes; a non-positive or non-numeric value
+   * is a `connect()` error.
    */
   events_timeout_ms?: number;
-}
-
-/** The subset of a `GET /api/v1/users` member we read; `full_name` is set by that member. */
-interface RealmMember {
-  user_id: number;
-  email: string;
-  full_name: string;
-  is_active?: boolean;
-}
-
-/** The subset of a Zulip message object we read (wire format). */
-interface ZulipMessage {
-  id: number;
-  content?: string;
-  sender_email?: string;
-  /** Unix seconds. */
-  timestamp?: number;
-}
-
-/** One entry from `GET /api/v1/events`. Non-`message` types (heartbeat, …) only advance the ack. */
-interface ZulipEvent {
-  id: number;
-  type: string;
-  message?: ZulipMessage;
-}
-
-interface EventsResponse {
-  result?: string;
-  code?: string;
-  events?: ZulipEvent[];
 }
 
 interface QueueState {
@@ -87,11 +58,6 @@ interface ReadOpts {
   deadline?: number;
 }
 
-/**
- * Wake callbacks for blocking `fetchRecent` calls piggybacking on a topic's live `subscribe`
- * loop(s); `healthy` counts the loops on the topic whose event queue is actually live — a loop in
- * failure backoff wakes nobody, so it does not count.
- */
 interface TopicWaiters {
   readonly wakes: Set<() => void>;
   healthy: number;
@@ -106,78 +72,8 @@ interface Wake {
   readonly release: () => void;
 }
 
-/** `zerver/views/message_fetch.py`: `num_before + num_after > 5000` is a 400. */
-const MAX_MESSAGES_PER_FETCH = 5000;
-
-/** `zerver/lib/message.py` `MAX_TOPIC_NAME_LENGTH`: longer subjects are truncated on send. */
-const MAX_TOPIC_NAME_LENGTH = 60;
-
-/**
- * The edge whitespace a send loses: `zerver/lib/typed_endpoint.py`'s `OptionalTopic` is a pydantic
- * `StringConstraints(strip_whitespace=True)` field, whose strip is the Unicode White_Space set. Keep
- * it off `String#trim`, so that U+FEFF — which JS trims and the server keeps — is not refused as a
- * rewrite the server never makes.
- */
-const SERVER_STRIPPED_TOPIC_EDGE = /^\p{White_Space}+|\p{White_Space}+$/gu;
-
-/** `settings.MAX_MESSAGE_LENGTH`: `normalize_body` truncates a longer body on send. */
-const MAX_MESSAGE_LENGTH = 10_000;
-
 /** Milliseconds a best-effort teardown request may take before it is abandoned. */
 const TEARDOWN_TIMEOUT_MS = 2000;
-
-/** Backoff bounds for a failing push loop, and how often a persistent failure is reported. */
-const LOOP_BACKOFF_MIN_MS = 200;
-const LOOP_BACKOFF_MAX_MS = 5000;
-const LOOP_FAILURES_BEFORE_REPORT = 3;
-const LOOP_FAILURE_REPORT_INTERVAL = 20;
-
-/**
- * Bounds on the effective long-poll cap. Keep the floor, so that no `events_timeout_ms` a config can
- * carry leaves the push loop polling with no cap at all. What it bounds is the SHAPE of the idle
- * load and not its affordability: a cap is spent twice over — parked poll, then liveness probe — for
- * each subscribed topic, which puts the floor an order of magnitude above the request budget a
- * default Zulip gives a bot. The README's config table carries that arithmetic for the operator.
- */
-const MIN_EVENTS_TIMEOUT_MS = 250;
-const MAX_EVENTS_TIMEOUT_MS = 600_000;
-const DEFAULT_EVENTS_TIMEOUT_MS = 25_000;
-
-/**
- * Pace of a blocked `fetchRecent`'s retries while no live wake primitive is available, escalating
- * per failed attempt the way the push loop's backoff does. Keep the escalation, so that a server
- * answering every wake attempt at once — rejecting the queue, refusing to park — cannot turn one
- * caller's budget into hundreds of registrations against a backend already in trouble.
- */
-const BLOCKED_FETCH_RETRY_MS = 400;
-const BLOCKED_FETCH_RETRY_MAX_MS = 5000;
-
-const blockedFetchPause = (attempt: number): number =>
-  Math.min(BLOCKED_FETCH_RETRY_MS * 2 ** attempt, BLOCKED_FETCH_RETRY_MAX_MS);
-
-/**
- * Wall-clock budget for a request the PUSH LOOP asks the server to park for. Keep the loop's
- * parking requests on this, so that the shared {@link DEFAULT_DEADLINE_MS} never severs a healthy
- * idle long-poll: an aborted-but-uncapped poll reads to the loop as a backend failure, and the whole
- * documented `events_timeout_ms` range above 30s would degrade into escalating backoff instead.
- */
-const longPollDeadlineMs = (blockMs: number): number => Math.max(0, blockMs) + DEFAULT_DEADLINE_MS;
-
-/** Wall-clock one request issued at the very end of a spent budget still gets to answer in. */
-const REQUEST_ANSWER_MS = 500;
-
-/**
- * Wall-clock budget for a request made inside a caller's `blockMs`: what the caller has left, plus
- * enough for the last request of a spent budget to still be issued and answered. Keep every request
- * under a caller's budget on this, so that a rate-limit hint reaching past that budget is refused
- * outright — the 429 backoff races only `isStopped()`, so no deadline signal can interrupt it and
- * a routine `Retry-After: 8` would otherwise spend eight seconds of a 300ms `fetchRecent`.
- */
-const budgetedDeadlineMs = (deadline: number): number =>
-  Math.max(0, deadline - Date.now()) + REQUEST_ANSWER_MS;
-
-/** Largest offset `Date` can represent; past it `toISOString()` throws a RangeError. */
-const MAX_TIMESTAMP_MS = 8.64e15;
 
 /**
  * Messages a single gap-fill history read asks for. Exported so a test's dead-window sizes stay
@@ -205,23 +101,11 @@ export const TAIL_PROBE_PAGE = 100;
  * `subscribe` = a registered per-topic event queue driven by a `GET /api/v1/events` long-poll —
  * genuine push, not a poll timer. Zulip DOES deliver our own sends back to our own queue.
  *
- * TOPIC NAMESPACE: Zulip matches topics case-INsensitively (`subject__iexact` on reads, a
- * lower-cased compare on event-queue narrows) but rewrites what it stores — a send's topic is
- * whitespace-stripped where the request is parsed and then truncated to 60 characters — so a Parley
- * topic is mapped onto the wire by {@link ZulipPlugin.wireTopic}: case-folded (making Parley's
- * namespace 1:1 with Zulip's) and rejected outright when it cannot survive the round trip — two
- * Parley topics differing only in case, a name over 60 characters, or one padded with whitespace
- * would otherwise share or silently rewrite a history.
- *
  * Topic isolation is only as strong as the server's message-move policy — see README, "The one
  * inexactness: topics are mutable".
  */
 export class ZulipPlugin implements BackendPlugin {
-  private baseUrl = 'http://127.0.0.1:9991';
-  private email = 'parley-bot@localhost';
-  private apiKey = 'parley-api-key';
-  private stream = 'parley';
-  private eventsTimeoutMs = DEFAULT_EVENTS_TIMEOUT_MS;
+  private cfg: ZulipConfig = resolveConfig({});
   private connected = false;
   private stopped = false;
   /**
@@ -240,8 +124,8 @@ export class ZulipPlugin implements BackendPlugin {
   private readonly queues = new Set<QueueState>();
   /**
    * Topics with a live `subscribe` loop → its wake callbacks for blocking `fetchRecent` calls
-   * piggybacking on that loop's already-registered event queue. Its `healthy` count stands only
-   * while a loop can still deliver, so a blocked fetch can never park behind a subscription that
+   * piggybacking on that loop's already-registered event queue. `healthy` counts only the loops on
+   * the topic that can still deliver, so a blocked fetch can never park behind a subscription that
    * will not wake it; the loop fires the callbacks on a delivery so a blocked fetch re-queries
    * WITHOUT opening a second event queue for the topic. A loop can only end by the connection
    * ending, so it is `disconnect()` that empties this and releases whoever is parked here.
@@ -266,44 +150,29 @@ export class ZulipPlugin implements BackendPlugin {
   private readonly pendingDeletes = new Set<Promise<void>>();
 
   /**
-   * Zulip auth is per-request HTTP Basic (`email:api_key`) — there is no session or token to
-   * establish, so `connect` only validates and captures config. Every value that could otherwise
-   * fail late (an unusable `site_url`, an empty `stream`) or fail silently (an `events_timeout_ms`
-   * that makes the push loop hot) is rejected here, naming the offending key.
-   *
    * A `connect()` over a live connection tears that one down FIRST, against the config it was made
    * with. Keep the teardown here and the validation ahead of it, so that no per-connection registry
    * — subscribe loops, event queues, blocking-fetch waiters — can address the new connection with
    * the old one's state, and a rejected config leaves the live connection running.
    */
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as ZulipBackendConfig;
-    assertKnownKeys(cfg);
-    const baseUrl = requireHttpUrl(orDefault(cfg.site_url, 'http://127.0.0.1:9991'));
-    const email = requireNonEmpty('email', orDefault(cfg.email, 'parley-bot@localhost'));
-    const apiKey = requireNonEmpty('api_key', orDefault(cfg.api_key, 'parley-api-key'), true);
-    const stream = requireStreamName(orDefault(cfg.stream, 'parley'));
-    const eventsTimeoutMs = requireEventsTimeout(cfg.events_timeout_ms);
+    const cfg = resolveConfig(config);
     if (this.connected) await this.disconnect();
-    this.baseUrl = baseUrl;
-    this.email = email;
-    this.apiKey = apiKey;
-    this.stream = stream;
-    this.eventsTimeoutMs = eventsTimeoutMs;
+    this.cfg = cfg;
     this.claimedWireTopics.clear();
     this.generation++;
     this.teardown = new AbortController();
     this.stopped = false;
     this.connected = true;
 
-    if (cfg.api_key === undefined || this.apiKey === 'parley-api-key') {
+    if (cfg.usesDefaultApiKey) {
       console.warn(
         '[parley-zulip] SECURITY: connecting with the built-in default API key ' +
           "('parley-api-key'). Set backend_config.api_key to a real secret; a network-reachable " +
           'Zulip bot provisioned with this key is world-readable/injectable.',
       );
     }
-    const plaintext = plaintextRemoteOrigin(this.baseUrl);
+    const plaintext = plaintextRemoteOrigin(cfg.baseUrl);
     if (plaintext !== undefined) {
       console.warn(
         `[parley-zulip] SECURITY: site_url ${plaintext} is plaintext http:// to a non-loopback ` +
@@ -386,10 +255,6 @@ export class ZulipPlugin implements BackendPlugin {
    * `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) → the new message `id`.
    * `identity` is informational only: Zulip stamps the sender from the authenticated bot account
    * (see README "Multiple concurrent sessions"). `opts.inReplyTo` is ignored: Zulip threads by topic.
-   *
-   * A body the server would REWRITE is refused rather than sent ({@link requireSendableBody}), the
-   * same arm {@link wireTopic} takes: a hand-off stored altered reports success and is read back as
-   * something else.
    */
   async post(
     topic: Topic,
@@ -401,7 +266,7 @@ export class ZulipPlugin implements BackendPlugin {
     const generation = this.generation;
     const body = requireSendableBody(content);
     const res = await this.http('POST', '/api/v1/messages', {
-      form: { type: 'stream', to: this.stream, topic: this.claimWireTopic(topic), content: body },
+      form: { type: 'stream', to: this.cfg.stream, topic: this.claimWireTopic(topic), content: body },
     });
     const id = ((await res.json()) as { id?: number } | null)?.id;
     this.assertGeneration(generation);
@@ -428,7 +293,7 @@ export class ZulipPlugin implements BackendPlugin {
     const limit = args.limit ?? 100;
     const blockMs = args.blockMs ?? 0;
     const deadline = blockMs > 0 ? Date.now() + blockMs : undefined;
-    let messages = await this.fetchMessages(args.topic, args.since, limit, { generation, deadline });
+    let { messages } = await this.readWindow(args.topic, args.since, limit, { generation, deadline });
     if (messages.length === 0 && args.since !== undefined && deadline !== undefined) {
       messages = await this.blockingFetch(args.topic, args.since, limit, deadline, generation);
     }
@@ -454,7 +319,7 @@ export class ZulipPlugin implements BackendPlugin {
     generation: number,
   ): Promise<Message[]> {
     const read = async (): Promise<Message[]> =>
-      this.fetchMessages(topic, since, limit, { generation, deadline });
+      (await this.readWindow(topic, since, limit, { generation, deadline })).messages;
     for (let attempt = 0; !this.stopped && Date.now() < deadline; attempt++) {
       const wake = await this.armWake(topic, deadline, blockedFetchPause(attempt), generation);
       try {
@@ -529,7 +394,6 @@ export class ZulipPlugin implements BackendPlugin {
    * so the caller's next history read still lands inside its budget instead of at the end of it.
    */
   private async armDedicatedQueue(topic: Topic, deadline: number, pauseMs: number): Promise<Wake> {
-    const noop = { release: () => undefined };
     let reg: { queue_id: string; last_event_id: number };
     // Bound the registration by the caller's deadline too: a slow or black-holed register is
     // otherwise a wait the caller never asked for, ahead of the wait it did.
@@ -537,7 +401,7 @@ export class ZulipPlugin implements BackendPlugin {
     try {
       reg = await this.register(this.wireTopic(topic), bound.signal, budgetedDeadlineMs(deadline));
     } catch {
-      return { waited: this.pause(deadline, pauseMs), ...noop };
+      return { waited: this.pause(deadline, pauseMs), release: () => undefined };
     } finally {
       bound.done();
     }
@@ -627,26 +491,13 @@ export class ZulipPlugin implements BackendPlugin {
    * expectation.
    *
    * The delivery watermark is probed BEFORE register and the handshake window is then closed by an
-   * armed gap-fill: anything landing between the probe and the queue's birth reaches no queue, and
-   * anything landing after it is deduped against the watermark, so every message newer than the
-   * probe is delivered EXACTLY once. A probe that cannot establish a tail at all ({@link probeTail})
-   * arms no gap-fill: with no watermark to replay FROM, the only honest window is the queue's own.
+   * armed gap-fill, so every message newer than the probe is delivered EXACTLY once. A probe that
+   * cannot establish a tail at all ({@link probeTail}) arms no gap-fill: with no watermark to replay
+   * FROM, the only honest window is the queue's own.
    *
-   * Queue GC: Zulip garbage-collects queues after ~10 min idle; the server then answers
-   * `BAD_EVENT_QUEUE_ID`. Recovery: drop the superseded queue, re-register (new tail) and ARM a
-   * pending gap (`needsGapFillFrom`); the top of the loop then GAP-FILLS — replays every message
-   * with id > the last delivered id through the catch-up path — RETRYING until it succeeds before
-   * polling the fresh queue, so a transient gap-fill failure (a network blip / non-2xx history
-   * read) can no longer punch a permanent hole in the push stream. Register failures and gap-fill
-   * failures retry independently. Gap-fill advances the delivered watermark PER PAGE, so a
-   * mid-pagination throw keeps its partial progress and a retry does not re-deliver already-
-   * delivered pages. `lastDeliveredId` also dedupes the overlap when a gap-filled message's event
-   * later arrives on the fresh queue.
-   *
-   * Recovery is only "recovered" once the FRESH queue answers a poll: a queue rejected before it
-   * ever did is counted as a failure and paced by the same escalating backoff, so a server that
-   * rejects every queue it mints (a poll reaching a shard that does not own the queue) sees a
-   * backing-off, reported retry rather than a register/poll/gap-fill flood.
+   * Queue GC: Zulip garbage-collects queues after ~10 min idle and then answers
+   * `BAD_EVENT_QUEUE_ID`; recovery re-registers and arms the same gap-fill, which `lastDeliveredId`
+   * dedupes against the events the fresh queue then delivers.
    *
    * The loop is bound to the connection GENERATION it was born in: `disconnect()` bumps it, so a
    * loop parked anywhere — a long-poll, a backoff, a gap-fill — stops rather than resuming against
@@ -709,31 +560,16 @@ export class ZulipPlugin implements BackendPlugin {
       degraded = false;
       entry.healthy++;
     };
-    /**
-     * Keep the failure-escalation reset here and NOT in `promote`, so that a recovery step that
-     * always succeeds — a gap-fill read, a re-register — cannot cancel the backoff protecting the
-     * server from a cycle that fails at the step after it.
-     */
-    const recovered = (): void => {
-      consecutiveFailures = 0;
-      promote();
-    };
-    /** Escalating retry wait, so that a permanently dead push path is neither hot nor silent. */
     const backoff = async (reason: string): Promise<void> => {
       degrade();
       consecutiveFailures++;
-      if (
-        consecutiveFailures === LOOP_FAILURES_BEFORE_REPORT ||
-        consecutiveFailures % LOOP_FAILURE_REPORT_INTERVAL === 0
-      ) {
+      if (reportsLoopFailure(consecutiveFailures)) {
         console.error(
           `[parley-zulip] push loop for topic ${JSON.stringify(topic)} has failed ` +
             `${consecutiveFailures}× in a row (${reason}); still retrying, backing off`,
         );
       }
-      await this.interruptibleDelay(
-        Math.min(LOOP_BACKOFF_MIN_MS * 2 ** (consecutiveFailures - 1), LOOP_BACKOFF_MAX_MS),
-      );
+      await this.interruptibleDelay(loopBackoffMs(consecutiveFailures));
     };
 
     /** One pass of the push loop; `false` ends it. */
@@ -769,7 +605,7 @@ export class ZulipPlugin implements BackendPlugin {
       const timer = setTimeout(() => {
         capped = true;
         controller.abort();
-      }, this.eventsTimeoutMs);
+      }, this.cfg.eventsTimeoutMs);
       const parked = parking;
       let json: EventsResponse;
       try {
@@ -781,7 +617,7 @@ export class ZulipPlugin implements BackendPlugin {
           },
           signal: controller.signal,
           allowStatuses: [400],
-          deadlineMs: longPollDeadlineMs(this.eventsTimeoutMs),
+          deadlineMs: longPollDeadlineMs(this.cfg.eventsTimeoutMs),
         });
         json = ((await res.json()) as EventsResponse | null) ?? {};
       } catch {
@@ -858,7 +694,11 @@ export class ZulipPlugin implements BackendPlugin {
         await backoff('an events poll that asked to park answered without advancing the queue');
         return true;
       }
-      recovered();
+      // Keep the failure-escalation reset here and NOT in `promote`, so that a recovery step that
+      // always succeeds — a gap-fill read, a re-register — cannot cancel the backoff protecting the
+      // server from a cycle that fails at the step after it.
+      consecutiveFailures = 0;
+      promote();
       return true;
     };
 
@@ -888,9 +728,7 @@ export class ZulipPlugin implements BackendPlugin {
    * consulted when no active member carries the handle as an email. Both branches resolve only on
    * exactly ONE active match: a tie or a deactivated-only match degrades to the string convention
    * rather than letting whoever the server happens to list first answer for the handle, and any
-   * error degrades the same way. The uniqueness test defends against ties and nothing more — a lone
-   * realm member who sets their display name to another participant's handle IS an unambiguous
-   * match and wins the lookup, which is what "self-service" costs.
+   * error degrades the same way.
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     this.require();
@@ -914,34 +752,12 @@ export class ZulipPlugin implements BackendPlugin {
   }
 
   /**
-   * The Zulip topic a Parley topic addresses, used by post, the read narrow and register alike.
-   * Case-folded because Zulip compares topics case-insensitively; edge-padded, over-long and
-   * case-colliding names are rejected rather than sent, because Zulip would silently strip the
-   * first and truncate the second to 60 characters — each making the topic write-only, since posts
-   * land under a name no read narrow and no event-queue narrow ever matches — and would silently
-   * merge the third into one shared history.
-   *
-   * The rewrites are checked in the order the server applies them: the topic is stripped where the
-   * request is parsed, and only what survives that reaches the length the send truncates.
+   * {@link requireWireTopic}, plus the collision two Parley topics differing only in case would
+   * otherwise share: Zulip matches topics case-insensitively, so the second one to claim a wire
+   * name would silently be reading and writing the first one's history.
    */
   private wireTopic(topic: Topic): string {
-    const wire = topic.toLowerCase();
-    const stripped = wire.replace(SERVER_STRIPPED_TOPIC_EDGE, '');
-    if (stripped !== wire) {
-      throw new Error(
-        `Zulip strips whitespace off a topic on send, so topic ${JSON.stringify(topic)} would be ` +
-          `stored as ${JSON.stringify(stripped)} while every read narrow and every event queue ` +
-          'matches the name as sent — nothing posted there could ever be read back. Trim the ' +
-          'Parley topic name.',
-      );
-    }
-    if ([...wire].length > MAX_TOPIC_NAME_LENGTH) {
-      throw new Error(
-        `Zulip topic too long: ${[...wire].length} characters, max ${MAX_TOPIC_NAME_LENGTH} ` +
-          `(Zulip truncates longer subjects on send, making topic ${JSON.stringify(topic)} ` +
-          'unreadable). Shorten the Parley topic name.',
-      );
-    }
+    const wire = requireWireTopic(topic);
     const claimed = this.claimedWireTopics.get(wire);
     if (claimed !== undefined && claimed !== topic) {
       throw new Error(
@@ -980,22 +796,11 @@ export class ZulipPlugin implements BackendPlugin {
   }
 
   /**
-   * Shared narrowed read used by fetchRecent AND the gap-fill after a queue GC. Paginates so the
-   * seam's `limit` stays honest: Zulip rejects `num_before + num_after > 5000` outright, so a
-   * larger caller limit is served as successive pages rather than propagated as a 400.
-   */
-  private async fetchMessages(
-    topic: Topic,
-    since: Cursor | undefined,
-    limit: number,
-    opts: ReadOpts,
-  ): Promise<Message[]> {
-    return (await this.readWindow(topic, since, limit, opts)).messages;
-  }
-
-  /**
-   * {@link fetchMessages}, also reporting whether the server showed any record AT ALL — which an
-   * empty message list cannot tell you, because every record it showed may have been unusable.
+   * The one narrowed read, used by fetchRecent, the tail probe AND the gap-fill after a queue GC.
+   * Paginates so the seam's `limit` stays honest: Zulip rejects `num_before + num_after > 5000`
+   * outright, so a larger caller limit is served as successive pages rather than propagated as a
+   * 400. `sawRecords` reports whether the server showed any record AT ALL — which an empty message
+   * list cannot tell you, because every record it showed may have been unusable.
    */
   private async readWindow(
     topic: Topic,
@@ -1006,7 +811,7 @@ export class ZulipPlugin implements BackendPlugin {
     const signal = opts.signal;
     const deadlineMs = opts.deadline === undefined ? undefined : budgetedDeadlineMs(opts.deadline);
     const narrow = JSON.stringify([
-      { operator: 'stream', operand: this.stream },
+      { operator: 'stream', operand: this.cfg.stream },
       { operator: 'topic', operand: this.wireTopic(topic) },
     ]);
     const out: Message[] = [];
@@ -1065,7 +870,7 @@ export class ZulipPlugin implements BackendPlugin {
       form: {
         event_types: JSON.stringify(['message']),
         narrow: JSON.stringify([
-          ['stream', this.stream],
+          ['stream', this.cfg.stream],
           ['topic', wireTopic],
         ]),
         apply_markdown: 'false',
@@ -1100,7 +905,7 @@ export class ZulipPlugin implements BackendPlugin {
     let cursor = asCursor(String(sinceId));
     for (;;) {
       // May throw (non-2xx / network blip / teardown) → the caller retries from `onProgress`.
-      const messages = await this.fetchMessages(topic, cursor, page, opts);
+      const { messages } = await this.readWindow(topic, cursor, page, opts);
       for (const m of messages) deliver(m);
       const last = messages.at(-1);
       if (last === undefined) return Number(cursor);
@@ -1111,9 +916,7 @@ export class ZulipPlugin implements BackendPlugin {
   }
 
   private require(): void {
-    if (!this.connected) {
-      throw new Error('ZulipPlugin not connected — call connect() first');
-    }
+    if (!this.connected) throw new Error('ZulipPlugin not connected — call connect() first');
   }
 
   /**
@@ -1150,9 +953,9 @@ export class ZulipPlugin implements BackendPlugin {
     },
   ): Promise<Response> {
     const qs = opts?.query !== undefined ? `?${new URLSearchParams(opts.query)}` : '';
-    const url = `${this.baseUrl}${path}${qs}`;
+    const url = `${this.cfg.baseUrl}${path}${qs}`;
     const headers: Record<string, string> = {
-      Authorization: `Basic ${Buffer.from(`${this.email}:${this.apiKey}`).toString('base64')}`,
+      Authorization: `Basic ${Buffer.from(`${this.cfg.email}:${this.cfg.apiKey}`).toString('base64')}`,
     };
     if (opts?.form !== undefined) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
@@ -1176,272 +979,4 @@ export class ZulipPlugin implements BackendPlugin {
       },
     );
   }
-}
-
-/**
- * The anchor that walks past the page just read, taken from the RAW edge record so that a page whose
- * every record was unusable still advances. `undefined` when the edge carries no id that moves the
- * anchor in the direction of travel — keep that guard, so that a server answering with an unmoving
- * id cannot spin the read on one page forever.
- */
-function pageAnchor(
-  edge: ZulipMessage | undefined,
-  from: string,
-  backwards: boolean,
-): string | undefined {
-  const id = edge?.id;
-  if (typeof id !== 'number' || !Number.isFinite(id)) return undefined;
-  const current = Number(from);
-  if (Number.isFinite(current) && (backwards ? id >= current : id <= current)) return undefined;
-  return String(id);
-}
-
-
-/**
- * Normalize one server-controlled record into a {@link Message}, or `undefined` when its `id` — the
- * dedup key AND the cursor — is not a usable Zulip message id. Every other field is coerced rather
- * than trusted: a non-string `content` reaches core's mention parser and a non-numeric `timestamp`
- * reaches `Date#toISOString`, either of which throws, and a throw here escapes `fetchRecent` and
- * bricks catch-up on every subsequent start.
- */
-function zulipToMessage(topic: Topic, m: ZulipMessage | undefined | null): Message | undefined {
-  if (m === undefined || m === null) return undefined;
-  const { id } = m;
-  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return undefined;
-  return buildMessage({
-    topic,
-    sender: typeof m.sender_email === 'string' ? m.sender_email : '',
-    content: typeof m.content === 'string' ? m.content : '',
-    timestamp: isoTimestamp(m.timestamp),
-    id: String(id),
-  });
-}
-
-/** Zulip timestamps are Unix SECONDS; an out-of-range or non-numeric one falls back to the epoch. */
-function isoTimestamp(seconds: unknown): string {
-  const ms = typeof seconds === 'number' ? seconds * 1000 : Number.NaN;
-  return new Date(Number.isFinite(ms) && Math.abs(ms) <= MAX_TIMESTAMP_MS ? ms : 0).toISOString();
-}
-
-function asArray<T>(value: T[] | undefined): T[] {
-  return Array.isArray(value) ? value : [];
-}
-
-/**
- * Zulip 429s carry `Retry-After` (header) and `retry-after` (JSON body), both in SECONDS. Returns
- * undefined when neither is usable, so the shared default and the shared ceiling stay in
- * `clampBackoff` rather than being re-implemented — and re-tuned — per backend.
- */
-async function readRetryAfter(res: Response): Promise<number | undefined> {
-  const header = retryAfterFromHeader(res);
-  if (header !== undefined) return header;
-  try {
-    const json = (await res.clone().json()) as { 'retry-after'?: number };
-    const field = json['retry-after'];
-    if (typeof field === 'number' && field > 0) return field * 1000;
-  } catch {
-    /* no usable body hint */
-  }
-  return undefined;
-}
-
-/**
- * Keep this narrower than `??`, so that a key present in the config but EMPTY (a bare `site_url:`
- * in YAML is `null`) is reported rather than silently replaced by the built-in default.
- */
-function orDefault<T>(value: T | undefined, fallback: T): T | undefined {
-  return value === undefined ? fallback : value;
-}
-
-/**
- * The body as Zulip would store it, or a throw. `zerver/lib/message.py::normalize_body` right-strips
- * the body, drops its leading newlines, refuses an empty or NUL-carrying one, and TRUNCATES past
- * `MAX_MESSAGE_LENGTH` — every one of those a silent rewrite of a payload `post` already reported as
- * durable, so each is refused here naming what the server would have done, exactly as an unusable
- * topic is. Measured in code points, which is what Python's `len` counts.
- */
-function requireSendableBody(content: string): string {
-  const rewritten = content.replace(/\s+$/u, '').replace(/^\n+/, '');
-  if (rewritten === '') {
-    throw new Error(
-      'Zulip rejects an empty message body (Zulip strips trailing whitespace and leading newlines ' +
-        `before storing, and ${JSON.stringify(content)} normalizes to nothing).`,
-    );
-  }
-  if (rewritten.includes('\u0000')) {
-    throw new Error('Zulip rejects a message body containing a NUL (U+0000). Remove it.');
-  }
-  if (rewritten !== content) {
-    const edge = content.replace(/\s+$/u, '') === content ? 'leading newlines' : 'trailing whitespace';
-    throw new Error(
-      `Zulip rewrites a message body on send: it strips ${edge}, so this message would be stored ` +
-        'altered and read back as something else. Trim it before posting.',
-    );
-  }
-  const length = [...content].length;
-  if (length > MAX_MESSAGE_LENGTH) {
-    throw new Error(
-      `Zulip message too long: ${length} characters, max ${MAX_MESSAGE_LENGTH} (Zulip truncates a ` +
-        'longer body on send, so the message would be stored altered). Shorten it or split it.',
-    );
-  }
-  return content;
-}
-
-/**
- * Every key {@link ZulipBackendConfig} declares. Keep the `satisfies` on it, so that a key added to
- * the interface without being listed here is a compile error rather than a key `connect()` rejects.
- */
-const CONFIG_KEYS = Object.keys({
-  site_url: 0,
-  email: 0,
-  api_key: 0,
-  stream: 0,
-  events_timeout_ms: 0,
-} satisfies Record<keyof Required<ZulipBackendConfig>, 0>);
-
-/**
- * Reject a key `backend_config` does not declare, before any value is read. Keep it a load error,
- * so that a mistyped `api_kye` cannot fall through to the built-in default credential, nor a
- * mistyped `events_timeout` leave the poll cap at a value the operator believes they replaced.
- */
-function assertKnownKeys(cfg: object): void {
-  for (const key of Object.keys(cfg)) {
-    if (!CONFIG_KEYS.includes(key)) {
-      throw new Error(
-        `backend_config: unknown key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
-      );
-    }
-  }
-}
-
-/**
- * `site_url` must be usable as a base URL now, not at first request — and must be a base URL and
- * nothing else. A credential in it is REFUSED rather than carried: Zulip authenticates from
- * `email`/`api_key`, secret hygiene keys on the config key NAME (`site_url` is not a secret one),
- * and an accepted value's origin is echoed by the plaintext warning. A query or fragment is refused
- * for the same fail-fast reason it would break every request path.
- *
- * Keep every rejection here reported by SHAPE, so that no part of a mis-pasted credential reaches
- * stderr and model context: the requirement plus the key name is the whole diagnostic for a URL,
- * while a bare secret is an unparseable URL and one carrying a `:` is a URL whose SCHEME is the
- * secret's first token.
- */
-function requireHttpUrl(raw: unknown): string {
-  const trimmed = typeof raw === 'string' ? raw.trim().replace(/\/+$/, '') : '';
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    throw new Error(
-      `backend_config.site_url must be an absolute http(s) URL (got ${describeShape(raw)})`,
-    );
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error(
-      `backend_config.site_url must use http: or https: (got ${describeShape(raw)} carrying ` +
-        'some other scheme)',
-    );
-  }
-  if (parsed.username !== '' || parsed.password !== '') {
-    throw new Error(
-      'backend_config.site_url must not carry a username or password: Zulip authenticates from ' +
-        'backend_config.email/api_key, and a credential in the URL is disclosed by every ' +
-        'diagnostic that names the site. Remove the userinfo from site_url.',
-    );
-  }
-  if (parsed.search !== '' || parsed.hash !== '') {
-    throw new Error(
-      'backend_config.site_url must be a bare base URL: a query or fragment is appended to every ' +
-        'request path and can hide a credential in a key hygiene treats as non-secret.',
-    );
-  }
-  return trimmed;
-}
-
-/**
- * `secret: true` reports the offending SHAPE instead of the value. Keep it on for every credential,
- * so that a mistyped `api_key` (a bare number in YAML) is not echoed into stderr and the tool
- * result core hands the model.
- */
-function requireNonEmpty(key: string, value: unknown, secret = false): string {
-  if (typeof value !== 'string' || value.trim() === '') {
-    const got = secret ? describeShape(value) : describeRejected(value, 'string');
-    throw new Error(`backend_config.${key} must be a non-empty string (got ${got})`);
-  }
-  return value;
-}
-
-/**
- * What Zulip's `to` would address instead of the stream NAMED by this value, or `undefined` when it
- * addresses that stream. `zerver/lib/recipient_parsing.py::extract_stream_indicator` decodes `to` as
- * JSON first and only falls back to a raw name, so a digits-only name is a stream ID and a quoted or
- * single-element-list name is the name inside it — while the read and register narrows send the same
- * string as a NAME either way. Reported by KIND rather than by value: a name that happens to be
- * valid JSON is exactly the shape a mis-pasted numeric credential arrives in.
- */
-function streamIndicatorTarget(stream: string): string | undefined {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(stream);
-  } catch {
-    return undefined;
-  }
-  if (typeof decoded === 'number') return 'a stream ID';
-  if (typeof decoded === 'string') return 'a differently quoted stream name';
-  if (Array.isArray(decoded)) return 'a stream name wrapped in a JSON list';
-  return 'a JSON literal Zulip refuses as a send target';
-}
-
-/**
- * A stream name the server will not re-interpret, or a throw naming what it would do with it — the
- * same arm {@link wireTopic} and {@link requireSendableBody} take, applied to the wire field the
- * CONFIG supplies: a write that addresses a different stream from the read narrow reports a durable
- * message id for a message no `fetchRecent` on that topic can ever return.
- */
-function requireStreamName(value: unknown): string {
-  const stream = requireNonEmpty('stream', value);
-  const target = streamIndicatorTarget(stream);
-  if (target !== undefined) {
-    throw new Error(
-      'backend_config.stream must be a plain stream name: Zulip decodes the send target as a ' +
-        `stream indicator, so this one would address ${target} on every write while every read ` +
-        'narrows on the literal name. Rename the stream.',
-    );
-  }
-  return stream;
-}
-
-/**
- * The rejected value itself, or its SHAPE when its type is not the one the key declares. A value of
- * the wrong type is a mis-paste and its type is the whole diagnostic, so echoing the content only
- * discloses whatever was pasted — which is how a credential ends up in a key whose NAME secret
- * hygiene classifies as harmless. A value of the RIGHT type is echoed: there the content is the bug.
- */
-function describeRejected(value: unknown, declared: 'string' | 'number'): string {
-  return typeof value === declared ? JSON.stringify(value) : describeShape(value);
-}
-
-/** Enough of a value to debug the wrong shape, never enough to disclose it. */
-function describeShape(value: unknown): string {
-  if (value === null) return 'null';
-  if (Array.isArray(value)) return `an array of ${value.length}`;
-  if (typeof value === 'string') return `a ${value.length}-character string`;
-  return `a ${typeof value}`;
-}
-
-/**
- * The effective long-poll cap. A non-positive or non-numeric value is rejected outright; a usable
- * one is clamped, so that neither a sub-millisecond value nor one past the timer's 32-bit range can
- * make each poll return instantly and turn the loop into a silent request flood.
- */
-function requireEventsTimeout(value: unknown): number {
-  if (value === undefined) return DEFAULT_EVENTS_TIMEOUT_MS;
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    throw new Error(
-      'backend_config.events_timeout_ms must be a positive, finite number of milliseconds ' +
-        `(got ${describeRejected(value, 'number')})`,
-    );
-  }
-  return Math.min(Math.max(value, MIN_EVENTS_TIMEOUT_MS), MAX_EVENTS_TIMEOUT_MS);
 }
