@@ -1,5 +1,6 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { asCursor, asTopic, type Cursor } from '../message.js';
@@ -206,6 +207,49 @@ describe('ReadStateStore', () => {
       const s = new ReadStateStore(path);
       s.set(asTopic('ctx'), asCursor('1'));
       expect(new ReadStateStore(path).get(asTopic('ctx'))).toBe('1');
+    });
+
+    /**
+     * The shipped README sizes this hazard for the operator deciding whether two sessions may run
+     * at once, and it described a blast radius the implementation had already narrowed — a whole
+     * session's catch-up position clobbered, rather than one contended topic. Prose and code drift
+     * because nothing connects them, so the sentence and the behaviour are graded together: state
+     * the claim as a phrase the README must carry, and as the test that would fail if the guarantee
+     * ever widened back.
+     */
+    describe('a shared instance_id races per topic, not per session', () => {
+      const CLAIM = 'the loser re-reads or skips messages on the contended topic only';
+
+      it(`the README says exactly that: "${CLAIM}"`, () => {
+        const readme = readFileSync(fileURLToPath(new URL('../../README.md', import.meta.url)), 'utf8');
+        const paragraph = /`instance_id`[\s\S]*?\n\n/.exec(readme)?.[0] ?? '';
+        expect(paragraph.replace(/\s+/g, ' ')).toContain(CLAIM);
+      });
+
+      it('positions on topics a session advanced ALONE all survive', () => {
+        const path = tmpFile();
+        const a = new ReadStateStore(path);
+        const b = new ReadStateStore(path);
+        a.set(asTopic('a1'), asCursor('1'));
+        b.set(asTopic('b1'), asCursor('2'));
+        a.set(asTopic('a2'), asCursor('3'));
+        b.set(asTopic('b2'), asCursor('4'));
+        expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ a1: '1', b1: '2', a2: '3', b2: '4' });
+      });
+
+      it('a contended topic keeps one of the two cursors, in a file that is still valid JSON', () => {
+        const path = tmpFile();
+        const a = new ReadStateStore(path);
+        const b = new ReadStateStore(path);
+        a.set(asTopic('solo-a'), asCursor('9'));
+        a.set(asTopic('c'), asCursor('10'));
+        b.set(asTopic('c'), asCursor('20'));
+        b.set(asTopic('solo-b'), asCursor('8'));
+        const onDisk = JSON.parse(readFileSync(path, 'utf8')) as Record<string, string>;
+        expect(['10', '20']).toContain(onDisk['c']);
+        expect(onDisk['solo-a']).toBe('9'); // the contended topic costs nothing outside itself
+        expect(onDisk['solo-b']).toBe('8');
+      });
     });
   });
 

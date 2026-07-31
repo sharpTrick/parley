@@ -88,14 +88,9 @@ describe('catch-up driver', () => {
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(0);
   });
 
-  it('paginates when limit < total', async () => {
-    const p = await seeded(10);
-    const readState = new ReadStateStore(rsPath());
-    const seen = new SeenSet();
-    const n = await catchUpTopic({ plugin: p, topic: T, limit: 3, readState, seen });
-    expect(n).toBe(10);
-    expect(readState.get(T)).toBe('10');
-  });
+  // Keep cold-start out of any case named for pagination, so that a since-less drain is never
+  // asserted to reach the whole history: with no stored cursor the driver reads the newest `limit`
+  // window and adopts its tail. Both arms are pinned by the stored-cursor × page-size grid below.
 
   describe('resume-from-disk failures carry an actionable hint', () => {
     const rejectingPlugin = (message: string) =>
@@ -293,34 +288,11 @@ describe('catch-up driver', () => {
   /**
    * How much a cold start actually drains is a function of BOTH inputs — stored cursor and page
    * size — and the loop silently reads only the newest window when there is no cursor. Pin the
-   * exact drained count and final read-state per cell against a fake with conformant since-less
-   * semantics (newest window), which FakePlugin does not have.
+   * exact drained count and final read-state per cell, against the SHARED fake: a bespoke
+   * conformant-window plugin here would leave the shared one free to keep answering a since-less
+   * read backwards, which is how this grid came to be the only place the clause was visible.
    */
   describe('drained window depends on stored-cursor × page-size', () => {
-    class RecentWindowPlugin implements Partial<BackendPlugin> {
-      constructor(private readonly total: number) {}
-      async fetchRecent(a: FetchRecentArgs): Promise<FetchRecentResult> {
-        const limit = a.limit ?? 100;
-        const all = Array.from({ length: this.total }, (_, i) => i + 1);
-        // No `since` ⇒ the backend's DEFAULT RECENT WINDOW: the newest `limit` rows (seam.ts §6).
-        const rows =
-          a.since === undefined ? all.slice(-limit) : all.filter((n) => n > Number(a.since)).slice(0, limit);
-        const messages = rows.map(
-          (n) =>
-            ({
-              topic: a.topic,
-              senderHandle: asHandle('w'),
-              content: `m${n}`,
-              timestamp: '1970-01-01T00:00:00.000Z',
-              backendMsgId: asBackendMsgId(String(n)),
-              cursor: asCursor(String(n)),
-              mentions: [],
-            }) as Message,
-        );
-        return { messages, nextCursor: messages.at(-1)?.cursor ?? a.since ?? asCursor('0') };
-      }
-    }
-
     it.each([
       // stored cursor | total | limit | drained | final read-state
       [undefined, 2, 3, 2, '2'],
@@ -337,7 +309,7 @@ describe('catch-up driver', () => {
         const readState = new ReadStateStore(rsPath());
         if (stored !== undefined) readState.set(T, asCursor(stored));
         const n = await catchUpTopic({
-          plugin: new RecentWindowPlugin(total) as unknown as BackendPlugin,
+          plugin: await seeded(total),
           topic: T,
           limit,
           readState,

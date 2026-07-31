@@ -1,12 +1,9 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
-import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
@@ -14,8 +11,8 @@ import { NoSuchTopicError, type BackendPlugin } from '../seam.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { memoryReadState } from '../testing/nonconformant.js';
+import { toolClient } from '../testing/tool-harness.js';
 import { startPushLoop } from './push-loop.js';
-import { registerTools } from './tools.js';
 
 /**
  * Every plugin depends on `@sharptrick/parley-core` as an ordinary dependency, so two installs in
@@ -71,26 +68,11 @@ async function settled(work: Promise<unknown>): Promise<Outcome> {
   );
 }
 
-/** A reactive tool client over a plugin whose `fetchRecent` fails. */
-async function toolClient(fail: () => never): Promise<Client> {
-  const server = new McpServer({ name: 'parley', version: '0.0.0' }, { capabilities: { tools: {} } });
-  registerTools(server, {
-    plugin: failingOn('fetchRecent', fail),
-    identity: asHandle('alice'),
-    allow: new Allowlist(['ctx'], { reserved: [DEFAULT_PRESENCE_TOPIC] }),
-    presenceTopic: asTopic(DEFAULT_PRESENCE_TOPIC),
-    presenceTtlMs: 90_000,
-    blockMaxMs: 60_000,
-    blockPollIntervalMs: 20,
-  });
-  const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
-  await Promise.all([server.connect(serverT), client.connect(clientT)]);
-  return client;
-}
-
 async function toolOutcome(tool: string, args: Record<string, unknown>, fail: () => never): Promise<Outcome> {
-  const client = await toolClient(fail);
+  const { client } = await toolClient({
+    plugin: failingOn('fetchRecent', fail),
+    topics: ['ctx'],
+  });
   const res = (await client.callTool({ name: tool, arguments: args })) as { isError?: boolean };
   return res.isError === true ? 'propagated' : 'degraded';
 }

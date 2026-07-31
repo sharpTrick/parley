@@ -244,17 +244,25 @@ export function createRemoteHttpApp(
           starting = false;
           reject(err);
         };
-        const s = app.listen(port, host, (err?: Error) => {
-          if (err) {
-            failed(err);
-            return;
-          }
-          s.off('error', failed);
-          announce();
-          resolve(s);
-        });
-        s.once('error', failed);
-        httpServer = s;
+        // Keep the bind inside this try, so that EVERY way it can fail lowers the latch. Node has
+        // three channels for one bind failure — a synchronous throw (ERR_SOCKET_BAD_PORT on a port
+        // out of range), the callback's error argument, and an 'error' event — and a latch released
+        // on only some of them leaves a retryable failure poisoning the server until close().
+        try {
+          const s = app.listen(port, host, (err?: Error) => {
+            if (err) {
+              failed(err);
+              return;
+            }
+            s.off('error', failed);
+            announce();
+            resolve(s);
+          });
+          s.once('error', failed);
+          httpServer = s;
+        } catch (err) {
+          failed(err as Error);
+        }
       });
       // Keep this recorded for close(), so that a teardown arriving mid-bind can WAIT for the bind
       // instead of reading `s.listening === false` and walking away from a socket and a presence

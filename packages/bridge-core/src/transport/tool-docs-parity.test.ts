@@ -1,15 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { describe, expect, it } from 'vitest';
-import { Allowlist } from '../allowlist.js';
-import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
-import { SeenSet } from '../engine/seen-set.js';
-import { asHandle, asTopic } from '../message.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { registerTools } from './tools.js';
+import { toolClient } from '../testing/tool-harness.js';
 
 /**
  * The package README's tool table is the surface an operator reads before wiring an agent, and it
@@ -24,24 +17,8 @@ const PATTERN = 'ops-.*';
 const WIDENED = 'ops-eu'; // matches `post_topics`, listed in neither `topics` nor the enum
 const STRANGER = 'not-mine';
 
-async function harness() {
-  const plugin = new FakePlugin();
-  await plugin.connect({});
-  const server = new McpServer({ name: 'parley', version: '0.1.0' }, { capabilities: { tools: {} } });
-  registerTools(server, {
-    plugin,
-    identity: asHandle('alice'),
-    allow: new Allowlist(LISTED, { postPatterns: [PATTERN], reserved: [DEFAULT_PRESENCE_TOPIC] }),
-    seen: new SeenSet(),
-    presenceTopic: asTopic(DEFAULT_PRESENCE_TOPIC),
-    presenceTtlMs: 90_000,
-    blockMaxMs: 60_000,
-    blockPollIntervalMs: 20,
-  });
-  const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
-  await Promise.all([server.connect(serverT), client.connect(clientT)]);
-  return client;
+async function harness(): Promise<Client> {
+  return (await toolClient({ topics: LISTED, postPatterns: [PATTERN] })).client;
 }
 
 /** Every `| \`parley_x\` | role | effect |` row, mapped to the input names its first `{…}` span lists. */

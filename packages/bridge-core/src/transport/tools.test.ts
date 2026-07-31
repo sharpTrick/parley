@@ -1,8 +1,5 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { Allowlist } from '../allowlist.js';
 import {
   DEFAULT_PRESENCE_TOPIC,
   encodePresence,
@@ -17,11 +14,11 @@ import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../me
 import { NoSuchTopicError, type FetchRecentArgs, type FetchRecentResult } from '../seam.js';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
+import { toolClient, type ToolHarnessOptions } from '../testing/tool-harness.js';
 import {
   DEFAULT_ROSTER_LIMIT,
   MAX_FETCH_LIMIT,
   PRESENCE_FETCH_LIMIT,
-  registerTools,
   toolDepsFor,
 } from './tools.js';
 
@@ -33,37 +30,14 @@ const parse = (r: unknown): unknown => JSON.parse((r as ToolText).content[0]!.te
 
 const PRESENCE_TOPIC = asTopic(DEFAULT_PRESENCE_TOPIC);
 
-async function harness(opts?: {
-  now?: () => number;
-  presenceTtlMs?: number;
-  topics?: string[];
-  postPatterns?: string[];
-  blockMaxMs?: number;
-  blockPollIntervalMs?: number;
-}) {
-  const plugin = new FakePlugin();
-  await plugin.connect({});
-  const server = new McpServer(
-    { name: 'parley', version: '0.1.0' },
-    { capabilities: { tools: {} } },
-  );
-  registerTools(server, {
-    plugin,
-    identity: asHandle('alice'),
-    allow: new Allowlist(opts?.topics ?? ['ctx', 'ctx-reviews'], {
-      postPatterns: opts?.postPatterns,
-      reserved: [DEFAULT_PRESENCE_TOPIC],
-    }),
-    seen: new SeenSet(),
-    presenceTopic: PRESENCE_TOPIC,
-    presenceTtlMs: opts?.presenceTtlMs ?? 90_000,
-    blockMaxMs: opts?.blockMaxMs ?? 60_000,
-    blockPollIntervalMs: opts?.blockPollIntervalMs ?? 20,
-    now: opts?.now,
-  });
-  const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
-  await Promise.all([server.connect(serverT), client.connect(clientT)]);
+/**
+ * Only the overrides a case actually names reach the shared harness. Keep the undefined-stripping,
+ * so that an option this file leaves unset keeps the harness default instead of opting OUT of the
+ * dependency — the harness reads an explicitly-undefined key as "this test wants it absent".
+ */
+async function harness(opts: ToolHarnessOptions = {}) {
+  const named = Object.fromEntries(Object.entries(opts).filter(([, v]) => v !== undefined));
+  const { plugin, client } = await toolClient(named);
   return { plugin, client };
 }
 
@@ -392,6 +366,28 @@ describe('parley_list_users (presence-derived reachability roster)', () => {
     const out = parse(
       await client.callTool({ name: 'parley_list_users', arguments: {} }),
     ) as RosterResult;
+    expect(out.truncated).toBe(true);
+  });
+
+  /**
+   * The roster reads the presence topic with NO cursor, so on a bus carrying more beats than one
+   * page it is built from whichever END of history the backend's default window returns. Newest is
+   * the only answer that serves the roster's purpose and the one every shipped backend gives — and
+   * a fake returning the oldest instead makes this whole tool grade backwards while staying green.
+   * So pin the direction where the TOOL is, not only at the seam.
+   */
+  it('builds the roster from the NEWEST presence page when history overflows it', async () => {
+    const total = PRESENCE_FETCH_LIMIT + 5;
+    const { client, plugin } = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: ['ctx'] });
+    for (let i = 0; i < total; i++) {
+      await postBeat(plugin, `peer-${i}`, ['ctx'], 'heartbeat', NOW - (total - i) * 10);
+    }
+    const out = parse(
+      await client.callTool({ name: 'parley_list_users', arguments: {} }),
+    ) as RosterResult;
+    const handles = out.users.map((u) => u.handle);
+    expect(handles[0]).toBe(`peer-${total - 1}`); // the freshest beat leads
+    expect(handles).not.toContain('peer-0'); // the stalest never reached the page
     expect(out.truncated).toBe(true);
   });
 

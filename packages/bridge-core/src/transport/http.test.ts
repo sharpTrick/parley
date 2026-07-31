@@ -4,6 +4,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { RequestHandler } from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as allowlistMod from '../allowlist.js';
 import { parseConfig } from '../config.js';
@@ -16,7 +17,7 @@ import {
   type PostBehaviour,
 } from '../testing/failure-shapes.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { createRemoteHttpApp, type RemoteHttpServer } from './http.js';
+import { createRemoteHttpApp, type RemoteHttpOptions, type RemoteHttpServer } from './http.js';
 import { GOODBYE_TIMEOUT_MS } from './presence-loop.js';
 import { buildBridge } from './stdio-bridge.js';
 
@@ -85,7 +86,17 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
   });
 });
 
-describe('remote HTTP: listen() rejects on a bind error', () => {
+/**
+ * Node reports ONE bind failure through three different channels — a synchronous throw out of
+ * `app.listen` (any port outside the u16 range), the listen callback's error argument, and an
+ * `'error'` event — and `listen` raises a start latch before any of them can fire. A latch lowered
+ * on only some channels leaves a REJECTED listen poisoning the server: the next attempt fails with
+ * "already listening" naming a socket that was never bound, which is exactly what a composition
+ * root doing `try listen(cfgPort) catch listen(0)` port fallback hits. So table the SHAPES, not one
+ * port, and require of every one of them: reject with the UNDERLYING error, and stay retryable with
+ * NO intervening close().
+ */
+describe('remote HTTP: a failed listen rejects with the real error and stays retryable', () => {
   async function appOn() {
     const p = new FakePlugin();
     await p.connect({});
@@ -97,15 +108,29 @@ describe('remote HTTP: listen() rejects on a bind error', () => {
     return { p, app: createRemoteHttpApp(p, cfg, { insecureNoAuth: true }) };
   }
 
-  it('rejects with EADDRINUSE when the port is already bound (does not resolve a null-address server)', async () => {
-    // Bind a plain http server on an ephemeral port to occupy it.
+  type Attempt = (ctx: { takenPort: number }) => [port: number, host?: string];
+  const SHAPES: Array<[name: string, code: string, attempt: Attempt]> = [
+    ['synchronous throw: port above the u16 range', 'ERR_SOCKET_BAD_PORT', () => [70_000]],
+    ['synchronous throw: negative port', 'ERR_SOCKET_BAD_PORT', () => [-1]],
+    ['synchronous throw: non-integer port', 'ERR_SOCKET_BAD_PORT', () => [1.5]],
+    ['synchronous throw: NaN port', 'ERR_SOCKET_BAD_PORT', () => [Number.NaN]],
+    ['async error: the port is already bound', 'EADDRINUSE', ({ takenPort }) => [takenPort]],
+    ['async error: the host is not one of ours', 'EADDRNOTAVAIL', () => [0, '203.0.113.1']],
+  ];
+
+  it.each(SHAPES)('%s', async (_name, code, attempt) => {
     const blocker = createHttpServer();
     await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
-    const port = (blocker.address() as AddressInfo).port;
+    const takenPort = (blocker.address() as AddressInfo).port;
     const { p, app } = await appOn();
     try {
-      // The whole point: this must REJECT, not resolve a server whose address() is null.
-      await expect(app.listen(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      const [port, host] = attempt({ takenPort });
+      // The UNDERLYING failure, never a resolved server whose address() is null and never the
+      // latch's "already listening".
+      await expect(app.listen(port, host)).rejects.toMatchObject({ code });
+      // Retryable on the spot: no close() in between.
+      const s = await app.listen(0);
+      expect(s.address()).not.toBeNull();
     } finally {
       await app.close();
       await p.disconnect();
@@ -113,19 +138,23 @@ describe('remote HTTP: listen() rejects on a bind error', () => {
     }
   });
 
-  it('a bind failure leaves the app retryable — a later listen(0) still succeeds', async () => {
-    const blocker = createHttpServer();
-    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
-    const taken = (blocker.address() as AddressInfo).port;
+  // EACCES is the third distinct bind-failure cause, and it is a PRIVILEGE fact, not a code fact —
+  // root binds port 1. Assert that fact rather than skipping on an unchecked guess, so the row
+  // cannot quietly stop testing anything on a machine where it would have applied.
+  it('async error: a privileged port is refused (root binds it instead)', async () => {
     const { p, app } = await appOn();
     try {
-      await expect(app.listen(taken)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      if (process.getuid?.() === 0) {
+        const s = await app.listen(1);
+        expect((s.address() as AddressInfo).port).toBe(1);
+        return;
+      }
+      await expect(app.listen(1)).rejects.toMatchObject({ code: 'EACCES' });
       const s = await app.listen(0);
       expect(s.address()).not.toBeNull();
     } finally {
       await app.close();
       await p.disconnect();
-      await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
   });
 
@@ -399,14 +428,62 @@ describe('reactive HTTP: fail closed by default', () => {
     }
   });
 
-  it('serves /mcp (200) once insecureNoAuth: true is set explicitly', async () => {
-    const { port, teardown } = await appOn({ insecureNoAuth: true });
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers: HEADERS, body: INIT });
-      expect(res.status).toBe(200);
-    } finally {
-      await teardown();
-    }
+  /**
+   * A middleware chain verified on ONE route and assumed on its siblings is a route away from
+   * shipping unauthenticated: dropping `protect` from the GET wiring turns an unauthenticated probe
+   * from 401 into a 405 that confirms the endpoint exists, and nothing in a POST-only auth test
+   * moves. So grade the whole METHOD × auth-config grid, with the method list DERIVED from the
+   * routes the app registers — a new route joins the grid instead of quietly sitting outside it.
+   */
+  describe('every mounted method is gated, on every auth config', () => {
+    const mountedMethods = (): string[] => {
+      const p = new FakePlugin();
+      const cfg = parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'], presence: { enabled: false } });
+      const { app } = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
+      const layers = (app as unknown as { router: { stack: Array<{ route?: { path: string; methods: Record<string, boolean> } }> } })
+        .router.stack;
+      return layers
+        .filter((l) => l.route?.path === '/mcp')
+        .flatMap((l) => Object.keys(l.route!.methods))
+        .map((m) => m.toUpperCase())
+        .sort();
+    };
+
+    // Pin membership by value: a generated grid cannot see a route that was never registered, and
+    // "the auth test covers every method" is only true while this list is the whole surface.
+    it('mounts exactly POST, GET and DELETE on /mcp', () => {
+      expect(mountedMethods()).toEqual(['DELETE', 'GET', 'POST']);
+    });
+
+    const teapot: RequestHandler = (_req, res) => {
+      res.status(418).end();
+    };
+    const waveThrough: RequestHandler = (_req, _res, next) => next();
+
+    // status per (auth config × method); PUT is UNMOUNTED, so its 404 proves the grid is reading
+    // the routing table and not just echoing one middleware's answer.
+    const GRID: Array<[name: string, opts: RemoteHttpOptions, byMethod: Record<string, number>]> = [
+      ['fail-closed default', {}, { POST: 401, GET: 401, DELETE: 401, PUT: 404 }],
+      ['insecureNoAuth: true', { insecureNoAuth: true }, { POST: 200, GET: 405, DELETE: 405, PUT: 404 }],
+      ['protect rejects', { protect: teapot }, { POST: 418, GET: 418, DELETE: 418, PUT: 404 }],
+      ['protect accepts', { protect: waveThrough }, { POST: 200, GET: 405, DELETE: 405, PUT: 404 }],
+    ];
+
+    it.each(GRID)('%s', async (_name, opts, byMethod) => {
+      expect(Object.keys(byMethod).filter((m) => m !== 'PUT').sort()).toEqual(mountedMethods());
+      const { port, teardown } = await appOn(opts);
+      try {
+        for (const [method, status] of Object.entries(byMethod)) {
+          const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+            method,
+            ...(method === 'POST' ? { headers: HEADERS, body: INIT } : {}),
+          });
+          expect(`${method} ${res.status}`).toBe(`${method} ${status}`);
+        }
+      } finally {
+        await teardown();
+      }
+    });
   });
 });
 
@@ -686,15 +763,8 @@ describe('reactive HTTP is stateless: no session id, no GET/DELETE', () => {
     }
   });
 
-  it.each(['GET', 'DELETE'])('%s /mcp is 405 — there is no session to resume or terminate', async (method) => {
-    const { port, teardown } = await appOn();
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method });
-      expect(res.status).toBe(405);
-    } finally {
-      await teardown();
-    }
-  });
+  // Keep GET/DELETE's 405 in the METHOD × auth grid above rather than here, so that a case asserting
+  // it cannot pass on a route that has silently lost its auth middleware.
 });
 
 /**

@@ -65,9 +65,12 @@ backend_config:                 # opaque to core; passed verbatim to the plugin'
 
 `backend_config` is the only backend-specific part of this file — see the plugin's own README for
 its shape. Two concurrent sessions must never share an `instance_id` (or default handle) — each
-owns its own read-state file, and a clash silently clobbers the other's catch-up position. Cursors
-are backend-specific too, so an instance repointed at a different backend needs a fresh
-`instance_id` (or its old read-state deleted); catch-up fails with a message saying exactly that.
+owns its own read-state file. A clash is a PER-TOPIC race, not a lost session: every flush re-reads
+the file and writes back only the topics that session advanced, so the loser re-reads or skips
+messages on the contended topic only, positions on topics it advanced alone survive, and the file
+is never left half-written. Cursors are backend-specific too, so an instance repointed at a
+different backend needs a fresh `instance_id` (or its old read-state deleted); catch-up fails with
+a message saying exactly that.
 
 `presence.enabled` defaults to **true** and writes hello/heartbeat/goodbye to the shared
 `presence.topic` on your backend — on a real Matrix or Zulip account that is a room or stream
