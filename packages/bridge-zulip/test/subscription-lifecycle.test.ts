@@ -5,10 +5,17 @@
  * The table parks the loop at every await and asserts the loop is dead, not merely that
  * `disconnect()` returned.
  */
-import { asTopic, type Message } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { FAULTS } from './fake-zulip.js';
-import { rand, SENDER, sleep, useZulip, type ZulipPair } from './harness.js';
+import {
+  CONNECTION_ENDINGS,
+  rand,
+  SENDER,
+  sleep,
+  useZulip,
+  type ZulipPair,
+} from './harness.js';
 
 const boot = useZulip();
 
@@ -119,6 +126,13 @@ describe('zulip push loop dies with its subscription, whatever it is parked in',
   }
 });
 
+/** Both ways a connection can be REPLACED, and both servers the replacement can point at. */
+const ENTRIES = CONNECTION_ENDINGS.filter((e) => e.reconnects);
+const TARGETS = [
+  { name: 'the same server', elsewhere: false },
+  { name: 'a different server', elsewhere: true },
+];
+
 /**
  * CLASS: every per-connection registry starts a connection EMPTY, on every entry path. `connect()`
  * is reachable without a `disconnect()` before it, and a registry cleared in only one of those paths
@@ -129,14 +143,6 @@ describe('zulip push loop dies with its subscription, whatever it is parked in',
  * another. The park points are shared with the table above, so a state added there is graded here.
  */
 describe('zulip starts every connection from clean per-connection state', () => {
-  const ENTRIES = [
-    { name: 'disconnect then connect', disconnectFirst: true },
-    { name: 'connect with no disconnect', disconnectFirst: false },
-  ];
-  const TARGETS = [
-    { name: 'the same server', elsewhere: false },
-    { name: 'a different server', elsewhere: true },
-  ];
   const WAKE_BLOCK_MS = 4000;
   /** A wake that lands inside this is a wake; anything slower is the caller's budget expiring. */
   const WAKE_WITHIN_MS = 1500;
@@ -155,8 +161,7 @@ describe('zulip starts every connection from clean per-connection state', () => 
           point.repair?.(pair);
 
           const next = target.elsewhere ? (await boot()).fake : fake;
-          if (entry.disconnectFirst) await plugin.disconnect();
-          await plugin.connect({ site_url: next.url, events_timeout_ms: 500 });
+          await entry.end(plugin, next.url);
 
           // Taken now, so the queues the new connection opens on the same server cannot flatter it.
           const releasedOnOld = fake.requestCount(DELETE_QUEUE);
@@ -178,6 +183,122 @@ describe('zulip starts every connection from clean per-connection state', () => 
           expect(releasedOnOld).toBeGreaterThanOrEqual(mintedOnOld);
         }, 30_000);
       }
+    }
+  }
+});
+
+/**
+ * CLASS: no seam call outlives the connection that ISSUED it. The push loop is bound to the
+ * connection generation and so cannot be resurrected by the next `connect()`; nothing that talks to
+ * the server on a caller's thread was, and `connect()` clears the `stopped` flag those paths
+ * re-checked — so a call parked in an HTTP await across a reconnect finished against whatever server
+ * was current when its response landed, answering a cursor minted in one id space out of another's
+ * history. Each row parks the call in the one route it must touch, replaces the connection while it
+ * is parked, and asserts it never answers from the new one.
+ */
+describe('zulip: no seam call answers from a connection it did not address', () => {
+  /** Long enough that the reconnect lands well inside the parked request. */
+  const HOLD_MS = 800;
+
+  interface SeamCall {
+    name: string;
+    /** The route the call must be parked in for a reconnect to land mid-flight. */
+    route: string;
+    issue: (pair: ZulipPair, topic: string, since: string) => Promise<unknown>;
+  }
+
+  const SEAM_CALLS: SeamCall[] = [
+    {
+      name: 'fetchRecent',
+      route: 'GET /api/v1/messages',
+      issue: async ({ plugin }, topic) => plugin.fetchRecent({ topic: asTopic(topic) }),
+    },
+    {
+      name: 'fetchRecent with blockMs, parked in its first history read',
+      route: 'GET /api/v1/messages',
+      issue: async ({ plugin }, topic, since) =>
+        plugin.fetchRecent({ topic: asTopic(topic), since: asCursor(since), blockMs: 4000 }),
+    },
+    {
+      name: 'post',
+      route: 'POST /api/v1/messages',
+      issue: async ({ plugin }, topic) => plugin.post(asTopic(topic), SENDER, 'in-flight'),
+    },
+    {
+      name: 'resolveIdentity',
+      route: 'GET /api/v1/users',
+      issue: async ({ plugin }) => plugin.resolveIdentity(asHandle('pat@example.com')),
+    },
+  ];
+
+  for (const call of SEAM_CALLS) {
+    for (const entry of ENTRIES) {
+      for (const target of TARGETS) {
+        it(`${call.name} rejects when ${entry.name} against ${target.name} lands mid-flight`, async () => {
+          const pair = await boot();
+          const { plugin, fake } = pair;
+          const topic = `hop-${rand()}`;
+          for (let i = 0; i < 5; i++) await plugin.post(asTopic(topic), SENDER, `a${i}`);
+          const tail = (await plugin.fetchRecent({ topic: asTopic(topic) })).nextCursor;
+
+          const elsewhere = target.elsewhere ? await boot() : pair;
+          if (target.elsewhere) {
+            // History of its own on the SAME topic, so answering out of it would be visible as
+            // messages, and as a cursor in the other server's id space.
+            for (let i = 0; i < 4; i++) {
+              await elsewhere.plugin.post(asTopic(topic), SENDER, `b${i}`);
+            }
+          }
+          const next = elsewhere.fake;
+          const servedByNext = next.requestCount(call.route);
+
+          fake.holdResponse(call.route, HOLD_MS);
+          const pending = call.issue(pair, topic, tail);
+          await sleep(HOLD_MS / 4);
+          await entry.end(plugin, next.url);
+
+          await expect(pending).rejects.toThrow(/connection was replaced/i);
+          // Only a different server can show the other half — that the call did not RE-ISSUE
+          // itself against the connection that replaced the one it addressed.
+          if (target.elsewhere) expect(next.requestCount(call.route)).toBe(servedByNext);
+        }, 20_000);
+      }
+    }
+  }
+
+  /**
+   * The other shape the same call can be parked in: the WAIT rather than a request. A wait ends on
+   * teardown by design, so the honest answer there is the caller's own cursor and an empty window —
+   * never the new server's messages, and never a cursor in its id space.
+   */
+  for (const entry of ENTRIES) {
+    for (const target of TARGETS) {
+      it(`a blocking fetchRecent parked in its wait returns its own cursor across ${entry.name} against ${target.name}`, async () => {
+        const pair = await boot();
+        const { plugin } = pair;
+        const topic = asTopic(`park-${rand()}`);
+        for (let i = 0; i < 5; i++) await plugin.post(topic, SENDER, `a${i}`);
+        const tail = (await plugin.fetchRecent({ topic })).nextCursor;
+
+        const elsewhere = target.elsewhere ? await boot() : pair;
+        if (target.elsewhere) {
+          for (let i = 0; i < 4; i++) await elsewhere.plugin.post(topic, SENDER, `b${i}`);
+        }
+
+        const pending = plugin.fetchRecent({ topic, since: tail, blockMs: 4000 });
+        await sleep(200);
+        await entry.end(plugin, elsewhere.fake.url);
+
+        const settled = await pending.then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+        if ('error' in settled) {
+          expect(String(settled.error)).toMatch(/connection was replaced/i);
+          return;
+        }
+        expect(settled.value).toEqual({ messages: [], nextCursor: tail });
+      }, 20_000);
     }
   }
 });

@@ -50,6 +50,11 @@ Zulip's topic namespace is not quite Parley's, so the plugin maps between them e
 - **60 characters, hard.** Zulip truncates longer subjects on send, which would make the topic
   write-only — posts land under a name the read narrow never matches. The plugin refuses such a
   topic with a clear error at `post`/`fetchRecent`/`subscribe` instead.
+- **No whitespace on the ends.** Zulip removes leading and trailing whitespace from a send's
+  `topic` while decoding the request; reads (`subject__iexact`) and event-queue narrows compare the
+  operand exactly as it arrived. So `ops ` is write-only for the same reason an over-long name is —
+  and it silently shares `ops`'s history. Refused at the same three calls. What Zulip removes is
+  Unicode `White_Space`, not quite JavaScript's `trim()`: U+0085 goes, U+FEFF stays.
 
 ## Message bodies: 10 000 characters, no ragged edges
 

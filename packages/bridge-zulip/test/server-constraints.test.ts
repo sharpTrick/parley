@@ -102,6 +102,108 @@ describe('zulip topic length vs the server truncation, counted in code points', 
 });
 
 /**
+ * Characters a topic can be padded with, split by whether the SEND strips them. Each stripped one is
+ * a distinct hazard because the sets disagree: `String#trim` would take U+FEFF the server keeps and
+ * leave U+0085 the server takes, so a plugin that reached for `trim` refuses a name that round-trips
+ * and accepts one that cannot. The kept rows are asserted as hard as the stripped ones — an
+ * over-eager strip check turns a usable topic into a permanent `post` error.
+ */
+const TOPIC_PADDINGS: Array<{ name: string; pad: string; stripped: boolean }> = [
+  { name: 'an ASCII space', pad: ' ', stripped: true },
+  { name: 'a tab', pad: '\t', stripped: true },
+  { name: 'a newline', pad: '\n', stripped: true },
+  { name: 'U+00A0 no-break space', pad: ' ', stripped: true },
+  { name: 'U+2003 em space', pad: ' ', stripped: true },
+  { name: 'U+3000 ideographic space', pad: '　', stripped: true },
+  { name: 'U+0085 next line, which String#trim does NOT take', pad: '', stripped: true },
+  { name: 'U+FEFF, which String#trim takes and the server does not', pad: '﻿', stripped: false },
+];
+
+/** Which edge carries the padding — a right-strip-only guard passes one placement and fails another. */
+const PLACEMENTS: Array<{ name: string; pad: (p: string, t: string) => string }> = [
+  { name: 'leading', pad: (p, t) => `${p}${t}` },
+  { name: 'trailing', pad: (p, t) => `${t}${p}` },
+  { name: 'both ends', pad: (p, t) => `${p}${t}${p}` },
+];
+
+/**
+ * CLASS: a topic the SEND would rewrite is write-only, because no read rewrites it the same way —
+ * `topic_match_q` is `subject__iexact` and an event queue's narrow a bare `lower()` compare, both of
+ * the operand exactly as sent. The truncation above is one such rewrite and had rows; the strip is
+ * the other and had none, so a hand-off posted to `ctx-handoff ` reported a durable id and then read
+ * back as an empty topic forever, while the collision registry — keyed on the name as SENT — never
+ * saw that `ctx-handoff ` and `ctx-handoff` had become one Zulip history.
+ */
+describe('zulip topic padding vs the whitespace the server strips on send', () => {
+  for (const padding of TOPIC_PADDINGS) {
+    for (const placement of PLACEMENTS) {
+      const verdict = padding.stripped
+        ? 'is refused, naming the rewrite'
+        : 'round-trips as its own topic';
+      it(`${placement.name} ${padding.name} ${verdict}`, async () => {
+        const { plugin } = await boot();
+        const bare = asTopic(`pad-${rand()}`);
+        const topic = asTopic(placement.pad(padding.pad, bare));
+
+        if (padding.stripped) {
+          for (const call of [
+            plugin.post(topic, SENDER, 'x'),
+            plugin.fetchRecent({ topic }),
+            plugin.subscribe(topic, () => undefined),
+          ]) {
+            await expect(call).rejects.toThrow(/strips whitespace/i);
+          }
+          // The bare name must stay usable: the padded one claimed no wire topic on its way out.
+          await plugin.post(bare, SENDER, 'bare');
+          expect((await plugin.fetchRecent({ topic: bare })).messages.map((m) => m.content)).toEqual(
+            ['bare'],
+          );
+          return;
+        }
+        await plugin.post(topic, SENDER, 'padded');
+        await plugin.post(bare, SENDER, 'bare');
+        expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+          'padded',
+        ]);
+        expect((await plugin.fetchRecent({ topic: bare })).messages.map((m) => m.content)).toEqual([
+          'bare',
+        ]);
+      });
+    }
+  }
+
+  it('a topic that is nothing but whitespace is refused rather than posted to the empty one', async () => {
+    const { plugin } = await boot();
+    const topic = asTopic('  \t ');
+    await expect(plugin.post(topic, SENDER, 'x')).rejects.toThrow(/strips whitespace/i);
+    await expect(plugin.fetchRecent({ topic })).rejects.toThrow(/strips whitespace/i);
+  });
+
+  it('a padded topic and its bare form never merge into one history', async () => {
+    const { plugin } = await boot();
+    const bare = asTopic(`merge-${rand()}`);
+    await plugin.post(bare, SENDER, 'ours');
+    await expect(plugin.post(asTopic(`${bare} `), SENDER, 'theirs')).rejects.toThrow(/whitespace/i);
+    expect((await plugin.fetchRecent({ topic: bare })).messages.map((m) => m.content)).toEqual([
+      'ours',
+    ]);
+  });
+
+  /**
+   * The server strips where the request is parsed and truncates in the view, so a name only the
+   * padding pushes past the cap is a name the server stores whole. Reporting the length there would
+   * name a truncation that never happens and hide the rewrite that does.
+   */
+  it('a name only its padding pushes past the cap is reported as the strip, not the truncation', async () => {
+    const { plugin } = await boot();
+    const atTheCap = 't'.repeat(SERVER_CONSTRAINTS.maxTopicNameLength);
+    await expect(plugin.post(asTopic(`${atTheCap} `), SENDER, 'x')).rejects.toThrow(
+      /strips whitespace/i,
+    );
+  });
+});
+
+/**
  * Case pairs in scripts where JS folding and the server's folding could disagree. The pairs that do
  * NOT collide matter as much as the ones that do: `İ`/`i` and `ß`/`SS` look like case variants and
  * are not, so treating them as one topic would merge two histories that the server keeps apart.
@@ -255,6 +357,13 @@ const WRITE_REWRITES: WriteRewrite[] = [
     refuses: /collision/i,
   },
   {
+    constraints: ['stripsTopicEdges'],
+    name: 'a topic carrying whitespace the send would strip off it',
+    topic: (base) => asTopic(`${base} `),
+    content: 'x',
+    refuses: /strips whitespace/i,
+  },
+  {
     constraints: ['maxMessageLength', 'bodyTruncationSuffix'],
     name: 'a body one code point past the cap',
     content: 'x'.repeat(MAX_BODY + 1),
@@ -317,6 +426,49 @@ const WRITE_REWRITES: WriteRewrite[] = [
     refuses: /NUL/,
   },
 ];
+
+const BOT_AUTH = `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`;
+
+/**
+ * A send that goes around the plugin. Every rewrite the plugin refuses is a rewrite no plugin call
+ * can reach any more, so the fake's model of it is graded here instead — on the wire, where a fake
+ * that quietly went back to echoing what it was sent is visible.
+ */
+const rawSend = async (
+  fake: FakeZulip,
+  opts: { topic: string; to?: string; content?: string },
+): Promise<Response> =>
+  fetch(`${fake.url}/api/v1/messages`, {
+    method: 'POST',
+    headers: { Authorization: BOT_AUTH, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      type: 'stream',
+      to: opts.to ?? 'parley',
+      topic: opts.topic,
+      content: opts.content ?? 'x',
+    }).toString(),
+  });
+
+/** How many records the server shows for a narrow the plugin would refuse to spell. */
+const rawReadCount = async (
+  fake: FakeZulip,
+  opts: { topic: string; stream?: string },
+): Promise<number> => {
+  const query = new URLSearchParams({
+    narrow: JSON.stringify([
+      { operator: 'stream', operand: opts.stream ?? 'parley' },
+      { operator: 'topic', operand: opts.topic },
+    ]),
+    anchor: 'newest',
+    num_before: '10',
+    num_after: '0',
+    apply_markdown: 'false',
+  });
+  const res = await fetch(`${fake.url}/api/v1/messages?${query}`, {
+    headers: { Authorization: BOT_AUTH },
+  });
+  return ((await res.json()) as { messages: unknown[] }).messages.length;
+};
 
 /** Constraints that govern a READ or the transport rather than a write, and where each is graded. */
 const NON_WRITE_CONSTRAINTS: Record<string, string> = {
@@ -443,35 +595,6 @@ describe('zulip refuses a stream name the server would read as something other t
    * graded on the wire. Without this the fake could go back to storing `to` verbatim and the rows
    * above would be grading a constraint nothing enforces.
    */
-  const rawSend = async (fake: FakeZulip, to: string, topic: string): Promise<Response> =>
-    fetch(`${fake.url}/api/v1/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({ type: 'stream', to, topic, content: 'x' }).toString(),
-    });
-
-  const readsBack = async (fake: FakeZulip, stream: string, topic: string): Promise<number> => {
-    const query = new URLSearchParams({
-      narrow: JSON.stringify([
-        { operator: 'stream', operand: stream },
-        { operator: 'topic', operand: topic },
-      ]),
-      anchor: 'newest',
-      num_before: '10',
-      num_after: '0',
-      apply_markdown: 'false',
-    });
-    const res = await fetch(`${fake.url}/api/v1/messages?${query}`, {
-      headers: {
-        Authorization: `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`,
-      },
-    });
-    return ((await res.json()) as { messages: unknown[] }).messages.length;
-  };
-
   const DECODED: Array<{ name: string; to: string; narrow: string; status: number; reads: number }> = [
     { name: 'a bare name is the stream named by it', to: 'plain', narrow: 'plain', status: 200, reads: 1 },
     { name: 'digits address a stream ID, not the stream named by those digits', to: '2024', narrow: '2024', status: 200, reads: 0 },
@@ -484,8 +607,8 @@ describe('zulip refuses a stream name the server would read as something other t
     it(`the fake decodes \`to\` as Zulip does: ${row.name}`, async () => {
       const { fake } = await boot();
       const topic = `ind-${rand()}`;
-      expect((await rawSend(fake, row.to, topic)).status).toBe(row.status);
-      expect(await readsBack(fake, row.narrow, topic)).toBe(row.reads);
+      expect((await rawSend(fake, { to: row.to, topic })).status).toBe(row.status);
+      expect(await rawReadCount(fake, { stream: row.narrow, topic })).toBe(row.reads);
     });
   }
 });
@@ -497,16 +620,6 @@ describe('zulip refuses a stream name the server would read as something other t
  * conformance suite grades against this backend would be graded against an echo.
  */
 describe('the fake rewrites a body exactly as Zulip documents', () => {
-  const rawPost = async (fake: FakeZulip, topic: string, content: string): Promise<Response> =>
-    fetch(`${fake.url}/api/v1/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({ type: 'stream', to: 'parley', topic, content }).toString(),
-    });
-
   const STORED: Array<{ name: string; sent: string; stored: string }> = [
     { name: 'strips trailing whitespace', sent: 'hand-off \t\n ', stored: 'hand-off' },
     { name: 'strips leading newlines', sent: '\n\nhand-off', stored: 'hand-off' },
@@ -524,7 +637,7 @@ describe('the fake rewrites a body exactly as Zulip documents', () => {
     it(row.name, async () => {
       const { plugin, fake } = await boot();
       const topic = `fake-${rand()}`;
-      expect((await rawPost(fake, topic, row.sent)).status).toBe(200);
+      expect((await rawSend(fake, { topic, content: row.sent })).status).toBe(200);
       const { messages } = await plugin.fetchRecent({ topic: asTopic(topic) });
       expect(messages.map((m) => m.content)).toEqual([row.stored]);
     });
@@ -540,10 +653,41 @@ describe('the fake rewrites a body exactly as Zulip documents', () => {
     it(`refuses ${row.name}`, async () => {
       const { plugin, fake } = await boot();
       const topic = `fake-${rand()}`;
-      expect((await rawPost(fake, topic, row.sent)).status).toBe(400);
+      expect((await rawSend(fake, { topic, content: row.sent })).status).toBe(400);
       expect((await plugin.fetchRecent({ topic: asTopic(topic) })).messages).toEqual([]);
     });
   }
+});
+
+/**
+ * The topic half of the same wire grading. The plugin refuses every padded name, so only a raw send
+ * can still reach the strip — and the strip is what makes the plugin's refusal necessary, so a fake
+ * that stopped modelling it would turn the whole padding table above into a test of nothing.
+ */
+describe('the fake rewrites a topic exactly as Zulip documents', () => {
+  const SUBJECTS: Array<{ name: string; pad: string; stored: boolean }> = TOPIC_PADDINGS.map(
+    (row) => ({ name: row.name, pad: row.pad, stored: !row.stripped }),
+  );
+
+  for (const row of SUBJECTS) {
+    const verdict = row.stored ? 'keeps' : 'strips';
+    it(`${verdict} ${row.name} on both edges of a subject`, async () => {
+      const { fake } = await boot();
+      const bare = `fake-topic-${rand()}`;
+      const padded = `${row.pad}${bare}${row.pad}`;
+      expect((await rawSend(fake, { topic: padded })).status).toBe(200);
+
+      expect(await rawReadCount(fake, { topic: bare })).toBe(row.stored ? 0 : 1);
+      expect(await rawReadCount(fake, { topic: padded })).toBe(row.stored ? 1 : 0);
+    });
+  }
+
+  it('strips before it truncates, so a name only its padding overruns is stored whole', async () => {
+    const { fake } = await boot();
+    const atTheCap = `x${rand()}`.padEnd(SERVER_CONSTRAINTS.maxTopicNameLength, 'y');
+    expect((await rawSend(fake, { topic: ` ${atTheCap} ` })).status).toBe(200);
+    expect(await rawReadCount(fake, { topic: atTheCap })).toBe(1);
+  });
 });
 
 describe('zulip credentials', () => {
@@ -570,6 +714,10 @@ const DIRECTORY: FakeMember[] = [
   { user_id: 46, email: 'shared@example.com', full_name: 'Shared Live' },
   { user_id: 48, email: 'ghost@example.com', full_name: 'Twin Name', is_active: false },
   { user_id: 49, email: 'twin@example.com', full_name: 'Twin Name' },
+  // `full_name` is set by the account carrying it, so these two are what a member can do to another
+  // participant's handle: 50 claims a handle that is nobody's account, 51 shadows a real email.
+  { user_id: 50, email: 'mallory@example.com', full_name: 'ctx-payments' },
+  { user_id: 51, email: 'shadow@example.com', full_name: 'pat@example.com' },
 ];
 
 /**
@@ -614,9 +762,44 @@ const RESOLUTIONS = HAZARDS.flatMap((row) => [
   { branch: 'full_name', hazard: row.hazard, ...row.fullName },
 ]);
 
+/**
+ * CLASS: what an identity lookup does with a SELF-SETTABLE field is pinned by a case that can fail,
+ * including the outcome the prose is uncomfortable about. `resolveIdentity`'s uniqueness test
+ * defends against ties and nothing more, so a lone member who puts another participant's handle in
+ * their display name is an unambiguous match and answers for it — which is exactly what its JSDoc
+ * now says, and what these rows hold it to. Change one without the other and this fails.
+ */
+const DISPLAY_NAME_CLAIMS: Array<{ name: string; handle: string; expected: string }> = [
+  {
+    name: 'an email beats a display name that shadows it — the email branch is consulted first',
+    handle: 'pat@example.com',
+    expected: '11',
+  },
+  {
+    name: 'two members sharing a display name is a tie, so it degrades to the string convention',
+    handle: 'Pat Sharp',
+    expected: 'Pat Sharp',
+  },
+  {
+    name: 'a lone display name claiming a handle nobody owns as an email DOES answer for it',
+    handle: 'ctx-payments',
+    expected: '50',
+  },
+];
+
 describe('zulip resolveIdentity never picks among ambiguous or stale candidates', () => {
   for (const row of RESOLUTIONS) {
     it(`a handle that is ${row.branch} ${row.hazard} → ${row.expected}`, async () => {
+      const { plugin } = await boot({ members: DIRECTORY });
+      expect(await plugin.resolveIdentity(asHandle(row.handle))).toEqual({
+        handle: row.handle,
+        backendRef: row.expected,
+      });
+    });
+  }
+
+  for (const row of DISPLAY_NAME_CLAIMS) {
+    it(row.name, async () => {
       const { plugin } = await boot({ members: DIRECTORY });
       expect(await plugin.resolveIdentity(asHandle(row.handle))).toEqual({
         handle: row.handle,

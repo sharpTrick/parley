@@ -10,7 +10,7 @@
 import { asTopic, type Cursor } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { FAULTS, type FakeZulip } from './fake-zulip.js';
-import { rand, SENDER, sleep, useZulip, type ZulipPair } from './harness.js';
+import { CONNECTION_ENDINGS, rand, SENDER, sleep, useZulip, type ZulipPair } from './harness.js';
 
 const boot = useZulip();
 
@@ -170,28 +170,37 @@ describe('zulip blocking fetchRecent wakes promptly whatever state the subscribe
     expect(Date.now() - started).toBeLessThan(1500);
   });
 
-  const DISCONNECT_MODES = [
+  /**
+   * CLASS: a registry that advertises a live capability is emptied — and everyone parked on it
+   * released — on EVERY path that ends that capability. A subscribe loop ends only when its
+   * connection does, so `disconnect()` is what empties the waiter registry; the rows cross both wake
+   * primitives with every ending, so a waiter left behind on one path cannot hide behind the other
+   * and a new ending is graded the day {@link CONNECTION_ENDINGS} declares it.
+   */
+  const WAKE_SOURCES = [
     { name: 'piggybacking on a live loop', subscribe: true },
     { name: 'on its own dedicated queue', subscribe: false },
   ];
-  for (const mode of DISCONNECT_MODES) {
-    it(`releases a blocked fetch ${mode.name} when disconnect lands mid-wait`, async () => {
-      const { plugin } = await boot();
-      const topic = asTopic(`cut-${rand()}`);
-      await plugin.post(topic, SENDER, 'old');
-      const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
-      if (mode.subscribe) await plugin.subscribe(topic, () => undefined);
+  for (const source of WAKE_SOURCES) {
+    for (const ending of CONNECTION_ENDINGS) {
+      it(`releases a blocked fetch ${source.name} when ${ending.name} lands mid-wait`, async () => {
+        const { plugin, fake } = await boot();
+        const topic = asTopic(`cut-${rand()}`);
+        await plugin.post(topic, SENDER, 'old');
+        const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
+        if (source.subscribe) await plugin.subscribe(topic, () => undefined);
 
-      const started = Date.now();
-      const pending = plugin.fetchRecent({ topic, since: tail, blockMs: BLOCK_MS });
-      await sleep(150);
-      await plugin.disconnect();
-      const res = await pending;
+        const started = Date.now();
+        const pending = plugin.fetchRecent({ topic, since: tail, blockMs: BLOCK_MS });
+        await sleep(150);
+        await ending.end(plugin, fake.url);
+        const res = await pending;
 
-      expect(res.messages).toEqual([]);
-      expect(res.nextCursor).toBe(tail);
-      expect(Date.now() - started).toBeLessThan(PROMPT_MS);
-    });
+        expect(res.messages).toEqual([]);
+        expect(res.nextCursor).toBe(tail);
+        expect(Date.now() - started).toBeLessThan(PROMPT_MS);
+      });
+    }
   }
 
   /**

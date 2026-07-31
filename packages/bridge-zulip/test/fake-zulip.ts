@@ -19,6 +19,13 @@ export const SERVER_CONSTRAINTS = {
   maxTopicNameLength: 60,
   /** `zerver/actions/message_send.py` TOPIC_TRUNCATION_MESSAGE. */
   topicTruncationSuffix: '...',
+  /**
+   * `zerver/lib/typed_endpoint.py` `OptionalTopic` — a send's topic is a pydantic
+   * `StringConstraints(strip_whitespace=True)` field, so the SEND strips its edges while
+   * `topic_match_q` (`subject__iexact`) and `build_narrow_predicate`'s bare `lower()` compare match
+   * the operand exactly as sent. The strip is Unicode White_Space, which is not `String#trim`'s set.
+   */
+  stripsTopicEdges: true,
   /** `settings.MAX_MESSAGE_LENGTH` — `normalize_body` truncates a longer body on send. */
   maxMessageLength: 10_000,
   /** `zerver/lib/message.py` `truncate_body` marker, appended to a body that is truncated. */
@@ -462,7 +469,7 @@ export async function startFakeZulip(opts?: {
         }
         const id = append({
           display_recipient: to,
-          subject: truncateTopic(form.get('topic') ?? ''), // the server rewrites over-long topics
+          subject: normalizeTopic(form.get('topic') ?? ''), // the server rewrites topics too
           content: body,
           sender_email: auth.email,
           sender_full_name: 'Parley Bot',
@@ -658,7 +665,7 @@ export async function startFakeZulip(opts?: {
     injectMessage: ({ topic, content, stream, sender }) =>
       append({
         display_recipient: stream ?? 'parley',
-        subject: truncateTopic(topic),
+        subject: normalizeTopic(topic),
         content,
         sender_email: sender ?? 'someone@example.com',
         sender_full_name: 'Someone Else',
@@ -667,7 +674,7 @@ export async function startFakeZulip(opts?: {
       append(
         {
           display_recipient: stream ?? 'parley',
-          subject: truncateTopic(topic),
+          subject: normalizeTopic(topic),
           content: 'well-formed',
           sender_email: 'someone@example.com',
           sender_full_name: 'Someone Else',
@@ -729,6 +736,20 @@ function extractStreamIndicator(raw: string): string | { msg: string } {
   if (typeof decoded === 'string') return decoded;
   if (typeof decoded === 'number' && Number.isInteger(decoded)) return `#id:${decoded}`;
   return { msg: 'Invalid data type for channel' };
+}
+
+/**
+ * The subject a send actually stores: the request parser strips the topic's edges before the view
+ * ever sees it, and the view then truncates what is left. Both rewrites are invisible to a client
+ * that only reads its own writes back by the name it sent.
+ */
+function normalizeTopic(topic: string): string {
+  return truncateTopic(stripTopicEdges(topic));
+}
+
+/** pydantic's `strip_whitespace`, which is Unicode White_Space — NOT `String#trim`'s set. */
+function stripTopicEdges(topic: string): string {
+  return String(topic).replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
 }
 
 /** Zulip stores at most 60 characters of subject, replacing the tail with an ellipsis. */

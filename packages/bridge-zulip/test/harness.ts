@@ -67,6 +67,36 @@ export function useZulip(): Boot {
   };
 }
 
+/**
+ * Every way a live connection ends — which is every way a subscribe loop can end, because the loop
+ * is bound to the connection generation and `connect()` over a live connection tears the old one
+ * down itself. Shared so a table crossing this dimension grades a new ending the day it is declared,
+ * rather than the day someone remembers to add a row for it in each file.
+ */
+export interface ConnectionEnding {
+  name: string;
+  /** Whether a NEW connection is left behind; tables that need one filter on this. */
+  reconnects: boolean;
+  end: (plugin: ZulipPlugin, url: string) => Promise<void>;
+}
+
+export const CONNECTION_ENDINGS: ConnectionEnding[] = [
+  { name: 'disconnect', reconnects: false, end: async (plugin) => plugin.disconnect() },
+  {
+    name: 'disconnect then connect',
+    reconnects: true,
+    end: async (plugin, url) => {
+      await plugin.disconnect();
+      await plugin.connect({ site_url: url, events_timeout_ms: 500 });
+    },
+  },
+  {
+    name: 'connect with no disconnect',
+    reconnects: true,
+    end: async (plugin, url) => plugin.connect({ site_url: url, events_timeout_ms: 500 }),
+  },
+];
+
 let contextSeq = 0;
 
 /**
