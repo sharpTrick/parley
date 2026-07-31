@@ -1,10 +1,12 @@
 /**
- * CLASS: prose that restates something the code owns must be checked against the code.
+ * CLASS: prose that restates something the code owns must be checked against the code — EVERY
+ * column of it, not the columns that were easy to grade.
  *
  * (1) The documented required scopes must equal the scopes the code actually exercises. A scope in
  *     the provisioning list that no call needs is not free — operators grant it, and it widens what
  *     a leaked `xoxb-` token can do (DESIGN §14). A call whose scope is undocumented is worse: the
- *     bridge fails at runtime with a `missing_scope` nobody can map back.
+ *     bridge fails at runtime with a `missing_scope` nobody can map back. The table's third column
+ *     — which seam method sends the call — is graded on the same footing, by reachability.
  *
  * (2) The rate-limit paragraph restates a policy that lives in `@sharptrick/parley-net-util`, which
  *     has already changed under it once — the README kept claiming a server-stated `Retry-After` was
@@ -59,11 +61,78 @@ function methodsCalledIn(src: string): Set<string> {
 
 const methodsCalledInSource = (): Set<string> => methodsCalledIn(read('../src/index.ts'));
 
-/** The README's scope table, as method → the scope cell next to it. */
-function scopeTable(): Map<string, string> {
+/** One documented row: the scope cell, and the seam methods the 'Used by' cell names. */
+interface ScopeRow {
+  scope: string;
+  usedBy: string[];
+}
+
+/** The README's scope table, as method → its row. */
+function scopeTable(): Map<string, ScopeRow> {
   const readme = read('../README.md');
-  const rows = readme.matchAll(/^\s*\|\s*`([a-z]+\.[a-zA-Z.]+)`\s*\|([^|]*)\|/gm);
-  return new Map([...rows].map((m) => [m[1]!, m[2]!.trim()]));
+  const rows = readme.matchAll(/^\s*\|\s*`([a-z]+\.[a-zA-Z.]+)`\s*\|([^|]*)\|([^|]*)\|/gm);
+  return new Map(
+    [...rows].map((m) => [
+      m[1]!,
+      { scope: m[2]!.trim(), usedBy: [...m[3]!.matchAll(/`(\w+)`/g)].map((c) => c[1]!) },
+    ]),
+  );
+}
+
+/** The body of `SlackPlugin`, where every seam method and every helper it reaches lives. */
+function pluginClassBody(src: string): string {
+  const found = /\nexport class SlackPlugin implements BackendPlugin \{\n([\s\S]*?)\n\}\n/.exec(src);
+  expect(found, 'src/index.ts has no SlackPlugin class body').not.toBeNull();
+  return found![1]!;
+}
+
+interface SourceMethod {
+  /** Absent in the source means public — which is exactly what "a seam method" means here. */
+  isPublic: boolean;
+  body: string;
+}
+
+/**
+ * Every method of a class body, as name → { isPublic, body }, where a body runs to the next method
+ * declaration. Deliberately anchored on two-space indentation: a class member is the only thing at
+ * that depth, and a shape this cannot read shows up as a missing method rather than as a wrong one —
+ * which is why the caller asserts the seam methods it expects to find.
+ */
+function methodsOf(classBody: string): Map<string, SourceMethod> {
+  const starts = [
+    ...classBody.matchAll(/^ {2}(?:(private|protected|public) )?(?:async )?(\w+)\s*\(/gm),
+  ];
+  const out = new Map<string, SourceMethod>();
+  starts.forEach((start, i) => {
+    const end = i + 1 < starts.length ? starts[i + 1]!.index! : classBody.length;
+    out.set(start[2]!, {
+      isPublic: start[1] === undefined || start[1] === 'public',
+      body: classBody.slice(start.index!, end),
+    });
+  });
+  return out;
+}
+
+/**
+ * The Web API methods reachable from `entry` — its own `this.api('…')` call sites plus everything
+ * the `this.<method>(…)` calls in its body reach, transitively. TRANSITIVE is the point: every
+ * interesting call site sits behind a private helper (`runFetch`, `openSocket`, `authTest`), so a
+ * one-level scan would say no seam method calls anything at all. The `seen` set makes the mutual
+ * recursion in the socket lifecycle (`openSocket` → `reconnect` → `ensureSocket` → `openSocket`) a
+ * walk rather than a hang.
+ */
+function apiMethodsReachedFrom(methods: Map<string, SourceMethod>, entry: string): Set<string> {
+  const found = new Set<string>();
+  const seen = new Set<string>();
+  const walk = (name: string): void => {
+    const method = methods.get(name);
+    if (method === undefined || seen.has(name)) return;
+    seen.add(name);
+    for (const called of methodsCalledIn(method.body)) found.add(called);
+    for (const ref of method.body.matchAll(/this\.(\w+)\s*[(<]/g)) walk(ref[1]!);
+  };
+  walk(entry);
+  return found;
 }
 
 describe('slack provisioning docs', () => {
@@ -98,10 +167,64 @@ describe('slack provisioning docs', () => {
 
   it('asks for no listing/discovery scope, because no listing method is called', () => {
     // `channels:read` grants workspace-wide channel enumeration; topics are mapped by config.
-    for (const [method, scope] of scopeTable()) {
+    for (const [method, row] of scopeTable()) {
       expect(method).not.toMatch(/\.list$/);
-      expect(scope).not.toMatch(/channels:read/);
+      expect(row.scope).not.toMatch(/channels:read/);
     }
+  });
+
+  /**
+   * CLASS: a documented table COLUMN that no parity test reads. The two tests above grade columns 1
+   * and 2, so the third — the one an operator debugging a `missing_scope` follows to find which seam
+   * call needs the grant — was the only one free to be wrong, and it was: `subscribe` probes
+   * `conversations.history` and a blocking `fetchRecent` dials `apps.connections.open`, neither of
+   * which the cell named. Graded by REACHABILITY rather than by a hand-kept list, so a new call site
+   * inside any seam method fails here rather than in an operator's `missing_scope`.
+   */
+  it("each row's 'Used by' cell is exactly the seam methods whose code path reaches that call", () => {
+    const methods = methodsOf(pluginClassBody(read('../src/index.ts')));
+    const seam = [...methods].filter(([, m]) => m.isPublic).map(([name]) => name);
+    // The walk found the class, not an empty string that would agree with an empty README.
+    expect(seam.sort()).toEqual(
+      ['connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe'].sort(),
+    );
+
+    const table = scopeTable();
+    expect(table.size).toBeGreaterThan(0);
+    for (const [method, row] of table) {
+      const reachedBy = seam.filter((entry) => apiMethodsReachedFrom(methods, entry).has(method));
+      expect(reachedBy.length, `nothing in the seam reaches ${method}`).toBeGreaterThan(0);
+      expect([...row.usedBy].sort(), `README 'Used by' for ${method}`).toEqual([...reachedBy].sort());
+    }
+  });
+
+  // CLASS: the source-scanning guard again — this walk has three ways to go blind (miss a method,
+  // stop following `this.<method>` calls, or hang on the socket lifecycle's mutual recursion), and
+  // all three would leave the parity check above comparing two empty sets.
+  it('the reachability walk reads method bodies, follows this.<method> calls, and survives a cycle', () => {
+    const fixture = [
+      '  async alpha(): Promise<void> {',
+      '    await this.beta();',
+      '  }',
+      '',
+      '  private async beta(): Promise<void> {',
+      "    await this.api<{ ok: boolean }>('deep.method', {});",
+      '    void this.alpha();',
+      '  }',
+      '',
+      '  public gamma(): void {',
+      "    this.api('shallow.method', {});",
+      '  }',
+      '',
+      '  private readonly notAMethod = new Map<string, string>();',
+    ].join('\n');
+
+    const methods = methodsOf(fixture);
+    expect([...methods.keys()]).toEqual(['alpha', 'beta', 'gamma']);
+    expect([...methods].filter(([, m]) => m.isPublic).map(([n]) => n)).toEqual(['alpha', 'gamma']);
+    expect(apiMethodsReachedFrom(methods, 'alpha')).toEqual(new Set(['deep.method']));
+    expect(apiMethodsReachedFrom(methods, 'gamma')).toEqual(new Set(['shallow.method']));
+    expect(apiMethodsReachedFrom(methods, 'nosuch')).toEqual(new Set());
   });
 });
 

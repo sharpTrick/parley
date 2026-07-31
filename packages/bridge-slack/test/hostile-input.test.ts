@@ -21,10 +21,15 @@ import {
   requireUsableSocketUrl,
   SlackPlugin,
   TIMER_CONFIG_KEYS,
+  TOKEN_CONFIG_KEYS,
   TS_RE,
 } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 import { capture, settleWithin, sleep, startSlack } from './harness.js';
+
+/** A row label for a value `JSON.stringify` renders as `undefined` (a function) or not at all. */
+const shapeOf = (v: unknown): string =>
+  typeof v === 'function' ? 'a function' : (JSON.stringify(v) ?? String(v));
 
 const COLLIDING: Array<{ name: string; map: Record<string, string>; topics: [string, string] }> = [
   {
@@ -265,13 +270,66 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
     }
   }
 
-  it('accepts both maps when every value is a usable string', async () => {
+  /**
+   * CLASS: the CONTAINER shape of a `backend_config` value, which the declared TypeScript type
+   * cannot enforce at run time either. The table above varies a map's VALUES, so it can never look
+   * at the map itself — and `Object.entries` destructures a string or an array as happily as an
+   * object, so `channel_map: "C0123"` becomes `{"0":"C","1":"0",…}`: every configured topic then
+   * falls through to the channel-id-literal branch, resolves to a channel that does not exist, and
+   * comes back as `NoSuchTopicError` — which core reads as "topic not present yet" and logs and
+   * skips. The bridge comes up reporting success, wired to nothing.
+   *
+   * `null` is a row because the declared type does not admit it either: defaulting it to an empty
+   * map would be a coercion, which is the thing this whole describe block exists to refuse.
+   */
+  const UNUSABLE_CONTAINERS: unknown[] = ['C0123', ['C1', 'C2'], 42, true, null, () => 1];
+
+  for (const map of CONFIG_MAPS) {
+    for (const bad of UNUSABLE_CONTAINERS) {
+      it(`rejects a ${map.key} that is ${shapeOf(bad)}, naming the key`, async () => {
+        const plugin = new SlackPlugin();
+        await expect(
+          plugin.connect({
+            api_url: 'http://127.0.0.1:1/api',
+            [map.key]: bad,
+          } as unknown as Record<string, unknown>),
+        ).rejects.toThrow(new RegExp(`${map.key}[\\s\\S]*not accepted`));
+      });
+    }
+  }
+
+  /**
+   * The same class one field along: a token is spent as an `Authorization: Bearer` header, so a
+   * number reaches slack.com as `Bearer 12345` and comes back as a vendor auth error naming nothing
+   * the operator can act on. Driven off the source's own key list, so a credential added without a
+   * validation row fails HERE rather than on the wire.
+   */
+  for (const key of TOKEN_CONFIG_KEYS) {
+    for (const bad of [42, true, null, {}, ['xoxb-test']] as unknown[]) {
+      it(`rejects ${key} of ${shapeOf(bad)}, naming the key`, async () => {
+        const plugin = new SlackPlugin();
+        await expect(
+          plugin.connect({ api_url: 'http://127.0.0.1:1/api', [key]: bad } as unknown as Record<
+            string,
+            unknown
+          >),
+        ).rejects.toThrow(new RegExp(`${key}[\\s\\S]*not accepted[\\s\\S]*a string`));
+      });
+    }
+  }
+
+  it('accepts both maps when every value is a usable string, and omitted maps and string tokens', async () => {
     const plugin = new SlackPlugin();
     await plugin.connect({
       api_url: 'http://127.0.0.1:1/api',
+      bot_token: 'xoxb-test',
+      app_token: 'xapp-test',
       channel_map: { alpha: 'C0AAA' },
       mention_map: { U0PARLEY: 'alpha' },
     });
+    await plugin.disconnect();
+    // …and the empty config the accept rows above have to be measured against.
+    await plugin.connect({ api_url: 'http://127.0.0.1:1/api' });
     await plugin.disconnect();
   });
 });

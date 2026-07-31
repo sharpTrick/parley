@@ -226,6 +226,28 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
 const BOUNDED_METHODS = ['apps.connections.open', 'conversations.history'] as const;
 
 /**
+ * The two reads a blocked call spends outside the ladder: the entry query `fetchRecent` makes before
+ * it decides to block at all, and the final one once the budget has run out.
+ */
+const ENTRY_AND_FINAL_READS = 2;
+
+/**
+ * The `conversations.history` reads one blocked call may spend: one per ladder rung, its own two,
+ * and one for each ESTABLISHED socket the edge took away — a lost socket releases the parked caller
+ * onto the history ladder at once ('a socket lost mid-park releases the caller on the loss', below),
+ * which is a read the rung timer had not yet permitted.
+ *
+ * That last term is read off the FIXTURE rather than folded into a hand-tuned slack, so that this
+ * stays a measurement: with a literal, a regression of one extra read per call is indistinguishable
+ * from an edge that happened to flap once more, and the bound fails on green source under load
+ * instead of on the defect it names. It is only a BOUND because every row that can lose a socket
+ * also bounds `apps.connections.open` by wall clock, and a socket cannot be lost twice without being
+ * dialled again — so pair the two, never assert this one alone.
+ */
+const readCeiling = (fake: FakeSlack, blockMs: number): number =>
+  rungStarts(blockMs).length + ENTRY_AND_FINAL_READS + fake.establishedClosed;
+
+/**
  * When a message durable in history at `landedAt` must have been DELIVERED by: the first ladder rung
  * at or after it, and never later than the deadline (the final re-query). This is the assertion that
  * "park until the deadline and do nothing" cannot satisfy.
@@ -242,10 +264,13 @@ const SLACK_MS = 400;
  * states who is allowed to redial, because a socket that was ESTABLISHED and then lost hands the
  * redial to the reconnect owner, on its own backoff rather than on the caller's ladder.
  *
- * The last four rows are the axis a handshake-centric table cannot see: the handshake SUCCEEDS and
- * the stream still does not deliver. That is not an exotic edge — an app whose Event Subscriptions
- * lack `message.channels`, or whose `app_token` is shared with a second process (Socket Mode routes
- * each payload to exactly ONE of an app's connections), greets and then pushes nothing at all.
+ * The rows from 'greets and then pushes no event' on are the axis a handshake-centric table cannot
+ * see: the handshake SUCCEEDS and the stream still does not deliver. That is not an exotic edge — an
+ * app whose Event Subscriptions lack `message.channels`, or whose `app_token` is shared with a
+ * second process (Socket Mode routes each payload to exactly ONE of an app's connections), greets
+ * and then pushes nothing at all; and an edge that greets and then DROPS does it once per round
+ * trip, which is the shape that makes every ceiling below a statement about wall clock rather than
+ * about how often the vendor happened to fail.
  */
 const DEGRADATIONS: Array<{
   name: string;
@@ -303,6 +328,23 @@ const DEGRADATIONS: Array<{
       setTimeout(() => fake.dropSockets(), 300);
     },
   },
+  // The two rows above lose ONE socket, so neither can see a per-loss cost repeating: an edge that
+  // accepts, greets and drops answers every `apps.connections.open` with `ok:true`, so nothing on
+  // the failure ladder paces it and each loss both redials and releases the parked caller. The
+  // intervals straddle the ladder's first rung, so one row flaps far faster than the ladder and one
+  // at about its pace.
+  {
+    name: 'an edge that greets and drops every 50ms for the whole budget',
+    appToken: 'xapp-test',
+    dials: 'reconnect',
+    arm: (fake) => fake.flap(50),
+  },
+  {
+    name: 'an edge that greets and drops every 400ms for the whole budget',
+    appToken: 'xapp-test',
+    dials: 'reconnect',
+    arm: (fake) => fake.flap(400),
+  },
 ];
 
 const DEGRADED_BLOCK_MS = 4000;
@@ -343,15 +385,16 @@ describe('slack blocking fetch: a degraded event source must not withhold durabl
             landing - SLACK_MS,
           );
           // And it stays cheap: the ladder caps history re-reads by wall clock, not by iterations.
-          const ladderCeiling = rungStarts(DEGRADED_BLOCK_MS).length + 2;
           expect(fake.hits('conversations.history'), 'history reads').toBeLessThanOrEqual(
-            ladderCeiling,
+            readCeiling(fake, DEGRADED_BLOCK_MS),
           );
           // Dials are bounded by whoever owns them: nobody without an app_token, the caller's ladder
-          // while nothing was ever established, the reconnect owner's own backoff after a loss.
+          // while nothing was ever established, the reconnect owner's own backoff after a loss —
+          // which is wall clock either way, including when every dial SUCCEEDS and the connection it
+          // opens is taken away immediately.
           const dialCeiling = {
             none: 0,
-            ladder: ladderCeiling,
+            ladder: rungStarts(DEGRADED_BLOCK_MS).length + ENTRY_AND_FINAL_READS,
             reconnect: Math.ceil(elapsed / DIAL_BACKOFF_MS) + 1,
           }[degradation.dials];
           expect(fake.hits('apps.connections.open'), 'dials').toBeLessThanOrEqual(dialCeiling);
@@ -450,8 +493,9 @@ describe('slack blocking fetch: an unsurfaced backlog costs one walk, not one pe
         );
         // One walk over the backlog, then one page per rung: additive, never multiplicative.
         const walkPages = Math.max(1, Math.ceil(unsurfaced / pageSize));
-        const rungs = rungStarts(BACKLOG_BLOCK_MS).length;
-        expect(reads, `${unsurfaced} unsurfaced records`).toBeLessThanOrEqual(walkPages + rungs + 2);
+        expect(reads, `${unsurfaced} unsurfaced records`).toBeLessThanOrEqual(
+          walkPages + readCeiling(fake, BACKLOG_BLOCK_MS),
+        );
         expect(reads, 'history re-read floor').toBeGreaterThanOrEqual(walkPages);
       });
     });
@@ -478,7 +522,9 @@ describe('slack blocking fetch: poll storm bound', () => {
         // over the method name, so a path that trades one method's storm for another cannot pass.
         const rungs = rungStarts(blockMs).length;
         for (const method of BOUNDED_METHODS) {
-          expect(fake.hits(method), `${method} ceiling`).toBeLessThanOrEqual(rungs + 2);
+          expect(fake.hits(method), `${method} ceiling`).toBeLessThanOrEqual(
+            readCeiling(fake, blockMs),
+          );
         }
         // …paired with a FLOOR, so that holding the budget and re-reading NOTHING — which passes
         // every ceiling above with room to spare — fails here instead.

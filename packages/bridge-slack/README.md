@@ -104,7 +104,14 @@ ladder reaches its cap: raising `catchup.block_max_ms` to core's ceiling of five
 minutes costs ~64 of each per blocked call. Both methods are separately rate-limited, and `conversations.history` is the tighter of the two.
 Only the loss of an **established** connection starts a reconnect loop, and
 only one such loop runs at a time; a handshake that never completed belongs to the caller that asked
-for it, so a failure cannot fan out into parallel redial loops.
+for it, so a failure cannot fan out into parallel redial loops. That loop redials on the same ladder,
+paced by how long the connection it lost actually **served**, not by whether the dial succeeded: a
+connection that lasted less than `DIAL_BACKOFF_MS` advances the rung, and only one that outlived it
+resets. An edge that accepts, greets and drops at once — a draining load balancer, an `app_token` at
+its connection quota — answers every `apps.connections.open` with `ok:true` and so never touches a
+failure ladder at all; without that rule it would be redialled at its own round-trip rate against
+Slack's tightest-limit endpoint. The cost is that live push takes up to `MAX_DIAL_BACKOFF_MS` to come
+back after such a spell; catch-up covers the gap.
 
 **Bounded waits.** A Socket Mode connection that opens and then says nothing is given
 `handshake_timeout_ms` (default 10 s) to send `hello` before the attempt is abandoned, and a
@@ -169,10 +176,17 @@ Create an app at [api.slack.com/apps](https://api.slack.com/apps), then:
   | Web API method | Scope it needs | Used by |
   |---|---|---|
   | `chat.postMessage` | `chat:write` | `post` |
-  | `conversations.history` | `channels:history` | `fetchRecent` |
+  | `conversations.history` | `channels:history` | `fetchRecent`, `subscribe` |
   | `users.lookupByEmail` | `users:read.email` (Slack grants it alongside `users:read`) | `resolveIdentity` |
   | `auth.test` | none (any token) | `resolveIdentity` |
-  | `apps.connections.open` | app-level `connections:write` (the `xapp-…` token, not the bot token) | `subscribe` |
+  | `apps.connections.open` | app-level `connections:write` (the `xapp-…` token, not the bot token) | `subscribe`, `fetchRecent` |
+
+  "Used by" is every seam method whose code path reaches the call, not the obvious one: `subscribe`
+  probes `conversations.history` before it resolves (a channel the bot was never invited to would
+  otherwise subscribe successfully and deliver nothing forever, so it fails closed on
+  `channel_not_found`/`not_in_channel`), and a **blocking** `fetchRecent` dials
+  `apps.connections.open` on its own ladder. So a missing scope surfaces on more seam methods than
+  the method's name suggests.
 
   The plugin lists nothing — no `conversations.list`, so **no `channels:read`**; topics are mapped
   to channel ids by config, not discovered.

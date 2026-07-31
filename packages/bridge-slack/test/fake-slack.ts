@@ -102,11 +102,21 @@ export class FakeSlack {
   connectionsOpened = 0;
   /** Count of `hello` envelopes sent (only when greeting) — marks a settled Socket Mode connection. */
   helloSent = 0;
+  /**
+   * Greeted connections that have since closed. Each one is a drain on the plugin side — it releases
+   * every long-poll parked on that stream — so a per-call request ceiling that a lost socket
+   * legitimately widens can be stated over THIS instead of over a hand-tuned constant.
+   */
+  establishedClosed = 0;
 
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly pageSize: number;
   private readonly sockets = new Set<WebSocket>();
+  /** Sockets this fake has greeted — the ones whose close the plugin reads as a lost stream. */
+  private readonly greeted = new WeakSet<WebSocket>();
+  /** Timer behind {@link flap}. */
+  private flapping?: ReturnType<typeof setInterval>;
   /** Channels that EXIST. Anything else answers `channel_not_found`, like slack.com. */
   private readonly known = new Set<string>();
   /** method → the `ok:false` code to answer with, and how many more times. */
@@ -164,7 +174,10 @@ export class FakeSlack {
     });
     wss.on('connection', (ws) => {
       fake.sockets.add(ws);
-      ws.on('close', () => fake.sockets.delete(ws));
+      ws.on('close', () => {
+        fake.sockets.delete(ws);
+        if (fake.greeted.has(ws)) fake.establishedClosed++;
+      });
       ws.on('message', (data) => {
         try {
           const { envelope_id } = JSON.parse(String(data)) as { envelope_id?: string };
@@ -176,6 +189,7 @@ export class FakeSlack {
       if (fake.greet === 'greet') {
         // Socket Mode greets with hello once the connection is ready (no envelope_id, no ack).
         fake.helloSent++;
+        fake.greeted.add(ws);
         ws.send(JSON.stringify({ type: 'hello', num_connections: fake.sockets.size }));
       } else if (fake.greet === 'pre-hello-close') {
         // Accept the socket then immediately close it WITHOUT a hello, so the plugin's pre-`hello`
@@ -333,6 +347,23 @@ export class FakeSlack {
   }
 
   /**
+   * Drop whatever socket is open, every `everyMs`, until {@link stopFlap} or {@link close}. The edge
+   * that ACCEPTS, greets and then closes — a draining load balancer, a flapping proxy, an app token
+   * at its connection quota being reaped. `setGreet('pre-hello-close')` cannot express it: there the
+   * handshake FAILS, which is the one shape a dial-failure ladder already paces. Here every
+   * `apps.connections.open` succeeds and every handshake completes.
+   */
+  flap(everyMs: number): void {
+    this.stopFlap();
+    this.flapping = setInterval(() => this.dropSockets(), everyMs);
+  }
+
+  stopFlap(): void {
+    if (this.flapping !== undefined) clearInterval(this.flapping);
+    this.flapping = undefined;
+  }
+
+  /**
    * Bulk-seed a channel directly (bypassing `chat.postMessage`/the socket push) so pagination and
    * subtype-filter tests can stage large / system-subtype-heavy histories the live path can't cheaply
    * produce. `ts` is minted the same way `postMessage` does (unique, strictly increasing), so entries
@@ -358,6 +389,7 @@ export class FakeSlack {
   }
 
   async close(): Promise<void> {
+    this.stopFlap();
     for (const ws of this.sockets) ws.terminate();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.server.close(() => resolve()));

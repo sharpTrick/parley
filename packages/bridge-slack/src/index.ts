@@ -138,6 +138,9 @@ export const MAX_TIMER_MS = 2 ** 31 - 1;
  */
 export const TIMER_CONFIG_KEYS = ['handshake_timeout_ms', 'rotation_grace_ms'] as const;
 
+/** Every `backend_config` key spent as an `Authorization: Bearer` credential. */
+export const TOKEN_CONFIG_KEYS = ['bot_token', 'app_token'] as const;
+
 /**
  * Objects asked for per `conversations.history` page. Slack caps this per rate-limit tier — 1000 for
  * an internal customer-built app, 15 for a commercially distributed non-Marketplace one — and serves
@@ -273,9 +276,11 @@ export class SlackPlugin implements BackendPlugin {
   private readonly waiters = new Map<string, Set<Waiter>>();
   /** Memoized `auth.test` (our own bot identity) for {@link resolveIdentity}. */
   private authTestPromise?: Promise<AuthTestResponse>;
-  /** Earliest wall clock at which a poll-driven handshake may dial — see {@link ensurePollSocket}. */
+  /** Earliest wall clock at which an automatic dial may go out — see {@link ensurePollSocket}. */
   private dialCooldownUntil = 0;
   private dialBackoffMs = DIAL_BACKOFF_MS;
+  /** When the current connection saw `hello`, or 0 — the pacer's "has it served yet?" clock. */
+  private servingSince = 0;
   /** Whether a {@link reconnect} loop already owns re-establishing the shared socket. */
   private reconnecting = false;
   /** Bumped by every {@link disconnect}; a loop from a retired session must not act on wake. */
@@ -288,8 +293,14 @@ export class SlackPlugin implements BackendPlugin {
     // Keep every rejection ahead of the stand-down, so that a refused config leaves a working
     // connection running instead of tearing it down on the way to a load error.
     validateConfig(cfg);
-    const channelMap = requireUsableChannelMap(cfg.channel_map ?? {});
-    const mentionMap = requireUsableMap('mention_map', 'a handle', cfg.mention_map ?? {});
+    // `=== undefined`, never `??`: a null map is a value the declared type does not allow, and
+    // defaulting it here would accept it as "no map configured" instead of failing at load.
+    const channelMap = requireUsableChannelMap(cfg.channel_map === undefined ? {} : cfg.channel_map);
+    const mentionMap = requireUsableMap(
+      'mention_map',
+      'a handle',
+      cfg.mention_map === undefined ? {} : cfg.mention_map,
+    );
     // A second connect() inherits nothing: the previous session's routes, sockets and memoized
     // `auth.test` answer belong to its tokens, and leaving them would feed a handler the new
     // configuration never registered off a socket it never opened.
@@ -313,6 +324,7 @@ export class SlackPlugin implements BackendPlugin {
     this.connected = true;
     this.dialCooldownUntil = 0;
     this.dialBackoffMs = DIAL_BACKOFF_MS;
+    this.servingSince = 0;
   }
 
   async disconnect(): Promise<void> {
@@ -665,36 +677,54 @@ export class SlackPlugin implements BackendPlugin {
       // Memoize the connection, never the FAILURE: a cached rejection is replayed by every later
       // subscribe/blocking fetch without touching the network, so one transient
       // `apps.connections.open` error would disable live push for the process lifetime.
-      // Keep both settlements scoped to the session that dialled, so that a dial outliving a
-      // `disconnect()` cannot hand the NEXT session either a cooldown it never earned or a reset of
-      // the one it did.
-      attempt.then(
-        () => {
-          if (this.session !== session) return;
-          this.dialCooldownUntil = 0;
-          this.dialBackoffMs = DIAL_BACKOFF_MS;
-        },
-        () => {
-          if (this.session !== session) return;
-          if (this.wsReady === attempt) this.wsReady = undefined;
-          this.dialCooldownUntil = Date.now() + this.dialBackoffMs;
-          this.dialBackoffMs = Math.min(this.dialBackoffMs * 2, MAX_DIAL_BACKOFF_MS);
-        },
-      );
+      // Keep this scoped to the session that dialled, so that a dial outliving a `disconnect()`
+      // cannot hand the NEXT session a cooldown it never earned.
+      attempt.catch(() => {
+        if (this.session !== session) return;
+        if (this.wsReady === attempt) this.wsReady = undefined;
+        this.backOffDialling();
+      });
     }
     return this.wsReady;
+  }
+
+  /** Space the next automatic dial one rung further out, then widen the rung. */
+  private backOffDialling(): void {
+    this.dialCooldownUntil = Date.now() + this.dialBackoffMs;
+    this.dialBackoffMs = Math.min(this.dialBackoffMs * 2, MAX_DIAL_BACKOFF_MS);
+  }
+
+  /**
+   * Account for the current connection ending: a rung back if it SERVED for at least one, another
+   * rung of backoff if it did not. Keep the ladder keyed on time served rather than on a completed
+   * handshake, so that an edge which accepts, greets and drops — a draining load balancer, an
+   * `app_token` at its ~10-connection quota being reaped — cannot redial at its own round-trip rate:
+   * every one of its dials SUCCEEDS, so a ladder only failures advance is one it never climbs, and
+   * every dial is `apps.connections.open`, Slack's tightest-limit endpoint.
+   */
+  private noteConnectionEnded(): void {
+    const servedFor = this.servingSince === 0 ? 0 : Date.now() - this.servingSince;
+    this.servingSince = 0;
+    if (servedFor < DIAL_BACKOFF_MS) {
+      this.backOffDialling();
+      return;
+    }
+    this.dialCooldownUntil = 0;
+    this.dialBackoffMs = DIAL_BACKOFF_MS;
   }
 
   /**
    * The long-poll's view of the shared socket. Core re-drives `fetchRecent` every
    * `block_poll_interval_ms` (250 ms) for the whole `block_max_ms` budget, so keep the cooldown
-   * after a failed handshake, so that one unavailable Socket Mode cannot turn a single
-   * `fetch_recent` into hundreds of `apps.connections.open` calls — Slack's tightest rate limit.
+   * between dials, so that one unavailable Socket Mode cannot turn a single `fetch_recent` into
+   * hundreds of `apps.connections.open` calls — Slack's tightest rate limit. "Unavailable" includes
+   * an edge that keeps ACCEPTING: {@link noteConnectionEnded} advances the same cooldown for a
+   * connection that greeted and then died before it served.
    */
   private ensurePollSocket(): Promise<void> {
     if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
       return Promise.reject(
-        new Error('Slack Socket Mode handshake backing off after a failed apps.connections.open'),
+        new Error('Slack Socket Mode dialling is backing off; apps.connections.open not attempted'),
       );
     }
     return this.ensureSocket();
@@ -792,6 +822,7 @@ export class SlackPlugin implements BackendPlugin {
       ws.on('message', (data: RawData) => {
         this.onEnvelope(ws, data, () => {
           helloSeen = true;
+          if (this.ws === ws) this.servingSince = Date.now();
           settle();
         });
       });
@@ -812,6 +843,7 @@ export class SlackPlugin implements BackendPlugin {
         // handshake timeout or a websocket `error` — both of which settle it BEFORE the close they
         // cause — cannot be read as a live connection dropping and be handed a reconnect owner.
         if (!helloSeen) return;
+        this.noteConnectionEnded();
         this.drainWaiters();
         void this.reconnect();
       });
@@ -830,24 +862,33 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   /**
-   * Re-establish the shared socket with capped exponential backoff until stopped. Keep this
-   * single-owner, so that a close arriving while a loop is already retrying cannot start a second
-   * loop: every loop dials `apps.connections.open` — Slack's tightest-limit endpoint — and their
-   * failures compound instead of backing off.
+   * Re-establish the shared socket on the shared dial pacer until stopped. Keep this single-owner,
+   * so that a close arriving while a loop is already retrying cannot start a second loop: every loop
+   * dials `apps.connections.open` — Slack's tightest-limit endpoint — and their failures compound
+   * instead of backing off.
+   *
+   * The pacer this waits on is advanced by {@link noteConnectionEnded} as well as by a failed dial,
+   * so that an edge whose dials all SUCCEED and whose connections all die at once is spaced by the
+   * same ladder as one that refuses them.
    */
   private async reconnect(): Promise<void> {
     if (this.reconnecting) return;
     this.reconnecting = true;
     const session = this.session;
     try {
-      let backoffMs = 200;
       while (!this.stopped && this.session === session) {
+        const cooling = this.dialCooldownUntil - Date.now();
+        if (cooling > 0) {
+          await delay(cooling);
+          continue;
+        }
         try {
           await this.ensureSocket();
           return;
         } catch {
-          await delay(backoffMs);
-          backoffMs = Math.min(backoffMs * 2, 5000);
+          // Keep a floor of our own here, so that a rejection which never reaches the failure arm
+          // above — a token withdrawn under a running session — cannot spin this loop hot.
+          if (this.dialCooldownUntil <= Date.now()) this.backOffDialling();
         }
       }
     } finally {
@@ -1070,17 +1111,25 @@ function ownEntriesOnly<T>(map: Record<string, T>): Record<string, T> {
 }
 
 /**
- * Reject a `backend_config` lookup table whose values cannot be used as ones. `backend_config` is
- * opaque to core, so this is the only layer that sees these values, and every one of them reaches
- * either the wire (`channel_map`) or a `Message` field (`mention_map`). Keep this fail-fast at load
- * for BOTH maps, so that a blank or non-string value cannot reach the wire as `"undefined"` or a
- * JSON blob, nor cross the seam as a `senderHandle` that is empty or is not a string at all.
+ * Reject a `backend_config` lookup table that is not one, or whose values cannot be used as ones.
+ * `backend_config` is opaque to core, so this is the only layer that sees these values, and every
+ * one of them reaches either the wire (`channel_map`) or a `Message` field (`mention_map`). Keep
+ * this fail-fast at load for BOTH maps, so that a blank or non-string value cannot reach the wire as
+ * `"undefined"` or a JSON blob, nor cross the seam as a `senderHandle` that is empty or is not a
+ * string at all.
+ *
+ * The CONTAINER is checked first, and as a load error rather than a coercion: `Object.entries`
+ * destructures a string or an array as happily as an object, so `channel_map: "C0123"` would become
+ * `{"0":"C","1":"0",…}` and every configured topic would then fall through to the
+ * channel-id-literal branch — a bridge that comes up reporting success and is wired to nothing.
  */
-function requireUsableMap(
-  configKey: string,
-  what: string,
-  map: Record<string, string>,
-): Record<string, string> {
+function requireUsableMap(configKey: string, what: string, map: unknown): Record<string, string> {
+  if (typeof map !== 'object' || map === null || Array.isArray(map)) {
+    throw new Error(
+      `Slack backend_config.${configKey} = ${JSON.stringify(map) ?? String(map)} is not accepted: ` +
+        `expected an object mapping each key to ${what}`,
+    );
+  }
   for (const [key, value] of Object.entries(map)) {
     if (typeof value !== 'string' || value.length === 0) {
       throw new Error(
@@ -1089,7 +1138,7 @@ function requireUsableMap(
       );
     }
   }
-  return ownEntriesOnly(map);
+  return ownEntriesOnly(map as Record<string, string>);
 }
 
 /**
@@ -1097,7 +1146,7 @@ function requireUsableMap(
  * silently displace each other's route and relabel one topic's traffic as the other's, crossing into
  * a different topic's dedup and allowlist namespace.
  */
-function requireUsableChannelMap(map: Record<string, string>): Record<string, string> {
+function requireUsableChannelMap(map: unknown): Record<string, string> {
   const checked = requireUsableMap('channel_map', 'a channel id', map);
   const owner = new Map<string, string>();
   for (const [topic, channel] of Object.entries(checked)) {
@@ -1110,7 +1159,7 @@ function requireUsableChannelMap(map: Record<string, string>): Record<string, st
     }
     owner.set(channel, topic);
   }
-  return ownEntriesOnly(map);
+  return checked;
 }
 
 /**
@@ -1170,6 +1219,10 @@ function validateConfig(cfg: SlackBackendConfig): void {
     if (value !== undefined && !(Number.isInteger(value) && value > 0 && value <= MAX_TIMER_MS)) {
       reject(key, `a positive whole number of milliseconds, at most ${MAX_TIMER_MS}`);
     }
+  }
+  for (const key of TOKEN_CONFIG_KEYS) {
+    const value = cfg[key];
+    if (value !== undefined && typeof value !== 'string') reject(key, 'a string');
   }
 }
 

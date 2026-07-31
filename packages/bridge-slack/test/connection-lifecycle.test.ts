@@ -28,7 +28,7 @@
  */
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
+import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
 import {
   capture,
@@ -124,6 +124,57 @@ describe('slack reconnect ownership under a sustained outage', () => {
         await cleanup();
       }
     });
+  }
+
+  /**
+   * CLASS: the retry rate must be bounded by WALL CLOCK under every failure mode — including the
+   * ones where the retried call SUCCEEDS. Every row of the OUTAGES table above makes the dial or the
+   * handshake fail, which is the one path a dial-failure ladder already paces; an edge that accepts,
+   * greets and then closes answers every `apps.connections.open` with `ok:true`, so a ladder only
+   * failures advance never leaves its first rung and the loop redials at the edge's round-trip rate
+   * against Slack's tightest-limit endpoint (Tier 1, ~1 request/minute).
+   *
+   * The intervals straddle the ladder: below the first rung, between rungs, and above it — the last
+   * row is the control, where each connection SERVES for longer than a rung and the ladder must
+   * therefore reset rather than climb. Both entry points are graded, because a blocked `fetchRecent`
+   * reaches the same loop by its own route, and both a ceiling AND a floor are asserted: never
+   * redialling at all satisfies every ceiling here perfectly.
+   */
+  const FLAP_WINDOW_MS = 3000;
+  const FLAP_INTERVALS = [10, 100, 700, 2500];
+
+  for (const everyMs of FLAP_INTERVALS) {
+    for (const entry of ['subscribe', 'blocking-fetch'] as const) {
+      it(`an edge that greets and drops every ${everyMs}ms, held open by ${entry}, redials O(wall clock)`, async () => {
+        const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0FLAP'] });
+        const topic = asTopic('C0FLAP');
+        try {
+          await plugin.subscribe(topic, () => undefined);
+          const dialsBefore = fake.hits('apps.connections.open');
+          const t0 = Date.now();
+          fake.flap(everyMs);
+          if (entry === 'subscribe') {
+            await sleep(FLAP_WINDOW_MS);
+          } else {
+            await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: FLAP_WINDOW_MS });
+          }
+          fake.stopFlap();
+          const elapsed = Date.now() - t0;
+          const dials = fake.hits('apps.connections.open') - dialsBefore;
+
+          expect(dials, 'dials vs wall clock').toBeLessThanOrEqual(dialBound(elapsed));
+          // …and the pacing is not a stall: every row loses at least one established socket, so at
+          // least one redial is owed, and the slow row must be back on a live stream at the end.
+          expect(fake.establishedClosed, 'sockets actually dropped').toBeGreaterThanOrEqual(1);
+          expect(dials, 'redial floor').toBeGreaterThanOrEqual(1);
+          if (everyMs > MAX_DIAL_BACKOFF_MS / 2) {
+            await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 8000, interval: 20 });
+          }
+        } finally {
+          await cleanup();
+        }
+      });
+    }
   }
 
   it('one reconnect owner survives the whole outage and resumes live delivery on recovery', async () => {
