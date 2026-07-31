@@ -70,7 +70,11 @@ covered too. Long means **longer than 8 characters**: at or under that lies the 
 backend puts in a query string — Matrix's `timeout=30000`, Zulip's `dont_block=false` and
 `anchor=newest` — and striking those out would gut the body that explains itself with them.
 Userinfo takes neither exemption: it is credential-by-construction, so a short password is redacted
-too. The method-name exemption is bounded at **24 characters**: a longer run of letters and
+too — a one-character password strikes that character out of the body wherever it appears, which is
+the trade a credential that short buys. A query value is also read in the spelling that is on the
+**wire**, not only the one the URL parser hands back: `URLSearchParams` decodes `+` to a space and
+`%2F` to `/`, so a standard-base64 key is redacted in its raw form as well as its decoded one.
+The method-name exemption is bounded at **24 characters**: a longer run of letters and
 dots is a JWT or an alphabetic token, not a word, and is redacted like any other opaque segment.
 A bare `host/path` with no scheme is not treated as a URL, so keep credentials out of the host, out
 of a path segment or query value short enough to pass for `api` or `v1`, and out of one
@@ -83,7 +87,9 @@ TLS failure into an unenveloped one just by racing it.
 
 ## Helpers
 
-- **`delay(ms)`** — a `setTimeout` promise (the single copy that replaces the per-plugin duplicates).
+- **`delay(ms)`** — a `setTimeout` promise: the copy the backends that wait are meant to share. A
+  consumer that still defines its own duplicate instead of importing this one is recorded by name in
+  this package's tests, so no *new* copy of any export here can appear unrecorded.
 - **`clampBackoff(ms)`** — normalize a backoff **a plugin chose itself** (a reconnect ladder, a poll
   interval) into `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]` — a figure under the floor comes back AS the
   floor, so a ladder built on a misparsed hint cannot hot-spin. `fetchWithRetry` never calls it: a
@@ -115,7 +121,12 @@ TLS failure into an unenveloped one just by racing it.
   answers `undefined`.
 
 These live here so the backends that warn about the same thing share one classifier: a security
-predicate copied per backend is a predicate fixed in one place and left wrong in the others.
+predicate copied per backend is a predicate fixed in one place and left wrong in the others. One
+fork is outstanding rather than hypothetical: `bridge-discord` needs the scheme to recommend as
+well as the origin to name, which a `string | undefined` return cannot carry, so it classifies with
+a local copy that fails the other way (it warns only about schemes it knows). Widening the return
+here is what retires that copy; until it lands, this package's tests fail on the day a *second*
+fork appears.
 
 ## Constants
 

@@ -52,6 +52,64 @@ describe('README', () => {
     expect(readme).toContain(clause);
   });
 
+  /**
+   * The other direction, which is the one that decays silently. A clause could be RETIRED — case,
+   * `CLAUSES` row and `BROKEN_VARIANTS` entry removed together, every check here still green — with
+   * the README still advertising to npm consumers a guarantee eleven certified backends are no
+   * longer graded on. That is precisely what the `CLAUSES` table was introduced to prevent, run only
+   * one way.
+   *
+   * Not asserted as set EQUALITY: a bullet legitimately carries more than one clause ("catch-up
+   * since a cursor … and since at the tail …"), so equality would force the prose to be one bullet
+   * per clause. What holds is that every bullet is claimed by something.
+   */
+  describe('the clause list advertises nothing the suite has stopped grading', () => {
+    /** Bullets that state something the suite is bound to — anything else is recorded below. */
+    const NOT_A_CLAUSE: Record<string, string> = {
+      'every delivered `Message` is well-formed':
+        'an assertion made INSIDE several clauses (expectWellFormedMessage), not a case of its own',
+      'a backend that declares `carriesSenderIdentity: false`':
+        'the weaker arm of the "not collapsed onto one another" clause, not a separate case',
+    };
+
+    const clauseBullets = (): string[] => {
+      const from = readme.indexOf('checks the clauses below');
+      expect(from, 'the README no longer introduces a clause list').toBeGreaterThan(0);
+      return readme
+        .slice(from, readme.indexOf('\n## ', from))
+        .split(/\n(?=- )/)
+        .slice(1)
+        .map((bullet) => bullet.trim());
+    };
+
+    const claimed = (bullet: string): boolean =>
+      CLAUSES.some((clause) => bullet.includes(clause)) ||
+      Object.keys(NOT_A_CLAUSE).some((detail) => bullet.includes(detail));
+
+    it('finds the clause list, so the rows below are not reading an empty block', () => {
+      expect(clauseBullets().length).toBeGreaterThan(15);
+    });
+
+    it.each(clauseBullets().map((bullet) => [`${bullet.slice(2, 60)}…`, bullet] as const))(
+      'the bullet "%s" is still a clause the suite grades',
+      (_label, bullet) => {
+        expect(
+          claimed(bullet),
+          'this bullet names no entry in CLAUSES — either the clause was retired and the bullet ' +
+            'must go with it, or the bullet describes an assertion inside a clause and belongs in ' +
+            'NOT_A_CLAUSE with the reason',
+        ).toBe(true);
+      },
+    );
+
+    it('records no detail bullet that has since been rewritten away', () => {
+      const stale = Object.keys(NOT_A_CLAUSE).filter(
+        (detail) => !clauseBullets().some((bullet) => bullet.includes(detail)),
+      );
+      expect(stale, 'NOT_A_CLAUSE names a bullet the README no longer has').toEqual([]);
+    });
+  });
+
   it("documents the 'unsupported' sentinel rather than an optional concurrentPost", () => {
     expect(readme).toContain("'unsupported'");
     expect(readme).not.toMatch(/concurrentPost\?/);

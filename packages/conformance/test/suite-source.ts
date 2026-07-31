@@ -10,24 +10,36 @@ import { CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
  */
 export const suiteSource = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 
+/** Where the graded cases begin. Text before it registers nothing against a backend. */
+const ENTRY = 'export function runConformanceSuite';
+
 /**
- * Every `it(...)` body in the suite, split on the top-level case boundary. Keyed on the case's
- * OPENING only — an earlier version tried to match the whole `it.each(...)` head, so a case whose
- * table spanned several lines was invisible to every check built on this.
+ * Every `it(...)` body in the suite, split on the case boundary. Keyed on the case's OPENING only —
+ * an earlier version tried to match the whole `it.each(...)` head, so a case whose table spanned
+ * several lines was invisible to every check built on this.
+ *
+ * Scanned at ANY indentation inside {@link ENTRY}'s body, and over any `it.<modifier>`: a fixed
+ * four-space prefix made a case nested one level deeper — inside a `describe` within the suite —
+ * invisible to every meta-check in this package at once, so it needed no clause, no README bullet
+ * and no negative control while running against every certified backend.
  */
-export function cases(): { title: string; body: string }[] {
+export function casesIn(source: string): { title: string; body: string }[] {
+  const at = source.indexOf(ENTRY);
+  const region = at < 0 ? source : source.slice(at);
   const out: { title: string; body: string }[] = [];
-  const starts = [...suiteSource.matchAll(/^ {4}it(?:\.each)?\(/gm)];
+  const starts = [...region.matchAll(/^[ \t]*it(?:\.\w+)?\(/gm)];
   for (const [i, m] of starts.entries()) {
     const from = m.index;
-    const to = i + 1 < starts.length ? starts[i + 1]!.index : suiteSource.length;
-    const body = suiteSource.slice(from, to);
+    const to = i + 1 < starts.length ? starts[i + 1]!.index : region.length;
+    const body = region.slice(from, to);
     // The title is the string literal the callback follows, not the first one in the body: an
     // `it.each` table's own cells come first and are not titles.
     out.push({ title: /\('([^']+)',\s*(?:async\b|\()/.exec(body)?.[1] ?? `case ${i}`, body });
   }
   return out;
 }
+
+export const cases = (): { title: string; body: string }[] => casesIn(suiteSource);
 
 /** The capability fields a case could branch on to buy itself out of asserting. */
 export const CAPABILITY_FIELDS = Object.keys(CONTEXT_FIELDS).filter(

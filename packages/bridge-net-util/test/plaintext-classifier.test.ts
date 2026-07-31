@@ -1,4 +1,6 @@
+import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import * as api from '@sharptrick/parley-net-util';
 import { isLoopbackHost, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 
 /**
@@ -97,5 +99,107 @@ describe('isLoopbackHost', () => {
     ['', false],
   ])('classifies the literal %s as loopback: %s', (host, loopback) => {
     expect(isLoopbackHost(host)).toBe(loopback);
+  });
+});
+
+/**
+ * The claim the README makes about this whole section: the backends that warn about the same thing
+ * share ONE classifier, because a security predicate copied per backend is a predicate fixed in one
+ * place and left wrong in the others. That is a claim about the repo, and only a scan of the repo
+ * can hold it — `bridge-discord` imports `isLoopbackHost` from here and re-implements
+ * `plaintextRemoteOrigin` with the opposite fail direction, which no test in either package could
+ * see. Every fork that exists today is recorded BY NAME below, so the next one fails here.
+ */
+describe('no consumer re-implements an export of this package', () => {
+  const packagesDir = new URL('../../', import.meta.url);
+  const SELF = '@sharptrick/parley-net-util';
+
+  /**
+   * The forks in the repo as it stands, each with why it is not simply an import. A row here is a
+   * debt this package has accepted, not a licence: adding one is a deliberate edit to this table.
+   */
+  const KNOWN_FORKS: Record<string, string> = {
+    'bridge-discord/src/index.ts:plaintextRemoteOrigin':
+      'it needs the scheme to recommend as well as the origin to name, which a ' +
+      '`string | undefined` return cannot carry — widening the return is what retires it',
+    'bridge-nats/src/index.ts:delay':
+      'a duplicate with no obstruction at all: importing `delay` from here is a one-line change ' +
+      'in that package, which owns it',
+    'bridge-redis/src/index.ts:delay':
+      'a duplicate with no obstruction at all: importing `delay` from here is a one-line change ' +
+      'in that package, which owns it',
+  };
+
+  /** Source files of packages that consume this one, with comments stripped. */
+  const consumerSources = (): { path: string; code: string }[] => {
+    const out: { path: string; code: string }[] = [];
+    for (const dir of readdirSync(packagesDir)) {
+      if (dir === 'bridge-net-util') continue;
+      let names: string[] = [];
+      try {
+        names = readdirSync(new URL(`${dir}/src/`, packagesDir));
+      } catch {
+        continue;
+      }
+      for (const name of names.filter((n) => n.endsWith('.ts'))) {
+        const path = `${dir}/src/${name}`;
+        const text = readFileSync(new URL(path, packagesDir), 'utf8');
+        if (!text.includes(SELF)) continue;
+        out.push({
+          path,
+          code: text.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, ''),
+        });
+      }
+    }
+    return out;
+  };
+
+  /**
+   * `<file>:<name>` for every MODULE-LEVEL declaration whose name collides with an export of this
+   * module. Anchored at column zero: a block-scoped `const delay = stanza.getChild('delay', …)` is a
+   * local binding that happens to share a word, not a second implementation of a shared helper.
+   */
+  const forks = (): string[] => {
+    const exported = new Set(Object.keys(api));
+    const out: string[] = [];
+    for (const { path, code } of consumerSources()) {
+      for (const m of code.matchAll(
+        /^(?:export )?(?:async )?(?:function|const|class) (\w+)/gm,
+      )) {
+        if (exported.has(m[1] as string)) out.push(`${path}:${m[1] as string}`);
+      }
+    }
+    return [...new Set(out)];
+  };
+
+  it('reads consumers and exports at all, so the rows below are not scanning nothing', () => {
+    expect(consumerSources().length).toBeGreaterThan(5);
+    expect(Object.keys(api).length).toBeGreaterThan(5);
+  });
+
+  it('every local copy of a shared name is one this package has recorded', () => {
+    expect(
+      forks().filter((fork) => !(fork in KNOWN_FORKS)),
+      'a consumer defines its own copy of a name this package exports — import the shared one, or ' +
+        'record here why it cannot be imported',
+    ).toEqual([]);
+  });
+
+  it('every recorded fork still exists, so the table cannot outlive the debt', () => {
+    expect(Object.keys(KNOWN_FORKS).filter((fork) => !forks().includes(fork))).toEqual([]);
+  });
+
+  // The README names one of these forks in prose, which rots the day it is retired. Pinned to the
+  // table rather than left as a claim nothing reads: a package the prose calls a fork must be one.
+  it('the README names no fork this table does not record', () => {
+    const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+    const paragraph = readme.split(/\n\s*\n/).find((p) => p.includes('fork'));
+    expect(paragraph, 'the README no longer says anything about forks').toBeDefined();
+    const named = [...(paragraph as string).matchAll(/`(bridge-[\w-]+)`/g)].map(
+      (m) => m[1] as string,
+    );
+    const recorded = new Set(Object.keys(KNOWN_FORKS).map((fork) => fork.split('/')[0] as string));
+    expect(named).not.toEqual([]);
+    expect(named.filter((pkg) => !recorded.has(pkg))).toEqual([]);
   });
 });

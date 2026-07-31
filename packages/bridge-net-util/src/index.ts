@@ -195,7 +195,13 @@ function spellings(part: string): string[] {
  * routine parameter is not struck out of the untrusted body everywhere it appears — including
  * inside longer words, which is what turns "you have 100 messages and no permission" into
  * "you have <redacted>0 messages and <redacted> permission". Userinfo takes no such exemption: it
- * is credential-by-construction, and a short password is still a password.
+ * is credential-by-construction, so it is kept at every length above zero — an empty one would
+ * split the body between every character.
+ *
+ * Query values are taken from the RAW query text as well as from `searchParams`, so that a
+ * credential is removed in the spelling that is actually ON THE WIRE. `URLSearchParams` decodes
+ * before it hands a value over — `+` comes back as a space, `%2F` as `/` — so a standard-base64
+ * API key read off the parser is a string the transport and the body never contained.
  */
 function credentialParts(url: string): string[] {
   let parsed: URL;
@@ -204,14 +210,20 @@ function credentialParts(url: string): string[] {
   } catch {
     return [];
   }
-  const { pathname, username, password, searchParams } = parsed;
-  const parts = [
+  const { pathname, username, password, search, searchParams } = parsed;
+  const rawQueryValues = search
+    .slice(1)
+    .split('&')
+    .filter((pair) => pair.includes('='))
+    .map((pair) => pair.slice(pair.indexOf('=') + 1));
+  const shaped = [
     ...[pathname, ...pathname.split('/')].filter(carriesSecret),
-    username,
-    password,
-    ...[...searchParams.values()].filter(carriesSecret),
-  ];
-  return [...new Set(parts.flatMap(spellings))].filter((part) => part.length > 1);
+    ...[...searchParams.values(), ...rawQueryValues].filter(carriesSecret),
+  ]
+    .flatMap(spellings)
+    .filter((part) => part.length > 1);
+  const userinfo = [username, password].flatMap(spellings).filter((part) => part.length > 0);
+  return [...new Set([...shaped, ...userinfo])];
 }
 
 /**
@@ -567,15 +579,18 @@ export async function fetchWithRetry(
       res.ok || (opts.allowStatuses?.includes(res.status) ?? false),
   };
 
+  let received: number | undefined;
   for (let attempt = 1; ; attempt++) {
     const budget = deadlineMs - (now() - started);
     if (budget <= 0) {
-      throw new Error(
+      throw new LabelledError(
         `${opts.label} → deadline: exceeded ${deadlineMs}ms before attempt ${attempt}`,
+        received,
       );
     }
 
     const res = await fetchOnce(url, init, budget, attemptOpts);
+    received = res.status;
     if (opts.allowStatuses?.includes(res.status) ?? false) return res;
     if (res.status !== 429) {
       if (res.ok) return res;

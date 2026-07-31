@@ -1,7 +1,13 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { delay, fetchWithRetry, MAX_ERROR_BODY, statusOf } from '@sharptrick/parley-net-util';
+import {
+  delay,
+  fetchWithRetry,
+  MAX_ERROR_BODY,
+  MAX_RESPONSE_BYTES,
+  statusOf,
+} from '@sharptrick/parley-net-util';
 
 /**
  * A REAL server, not a `Response` stub. Every stub in this package hands back a fully-buffered
@@ -230,6 +236,38 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
       expect(run.outcome.kind).toBe('resolved');
       expect((run.outcome as { text: string }).text).toHaveLength(65_536);
       expect(run.tookBytes).toBe(65_536);
+    });
+
+    /**
+     * The DEFAULT ceiling — the one every consumer actually runs, since no shipped backend passes
+     * `maxBodyBytes`. Every row above states its own, so cutting `MAX_RESPONSE_BYTES` to 1 KB left
+     * this package green while failing 262 cases across 26 others: an ordinary Matrix `/sync` or
+     * Slack `conversations.history` page stopped fitting. The volumes are ABSOLUTE — a plausible
+     * catch-up page, and a body no page could be — so the default moving in either direction reddens
+     * a row here instead of downstream.
+     */
+    const PLAUSIBLE_PAGE = 2 * MB;
+    const PAST_ANY_PAGE = 24 * MB;
+
+    it('the default straddles the two volumes below, so both of them grade it', () => {
+      expect(PLAUSIBLE_PAGE).toBeLessThan(MAX_RESPONSE_BYTES);
+      expect(PAST_ANY_PAGE).toBeGreaterThan(MAX_RESPONSE_BYTES);
+    });
+
+    it('hands back a plausible catch-up page in full with no maxBodyBytes set', async () => {
+      const run = await fetchBody(`status=200&bytes=${PLAUSIBLE_PAGE}`, { deadlineMs: 10_000 });
+      expect(run.outcome.kind).toBe('resolved');
+      expect((run.outcome as { text: string }).text).toHaveLength(PLAUSIBLE_PAGE);
+    });
+
+    it('fails a body past the default maxBodyBytes under the label', async () => {
+      const run = await fetchBody(`status=200&bytes=${PAST_ANY_PAGE}&then=stall`, {
+        deadlineMs: 10_000,
+      });
+      expect(run.outcome.kind).toBe('rejected');
+      expect((run.outcome as { error: Error }).error.message).toBe(
+        `${LABEL} → body: response body exceeded ${MAX_RESPONSE_BYTES} bytes`,
+      );
     });
 
     it.each([4 * MB, 64 * MB])('fails a 2xx body of %i bytes past maxBodyBytes under the label', async (bytes) => {

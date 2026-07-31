@@ -1,14 +1,25 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  ASSERTED_PROPERTIES,
   CLAUSES,
   CONTEXT_FIELDS,
+  EARLY_RETURN_FRACTION,
+  IDLE_BLOCK_FLOOR_MS,
+  IDLE_BLOCK_MS,
   PAGING_VOLUME,
   pageLimitsFor,
+  PARK_FRACTION,
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
 } from '@sharptrick/parley-conformance';
-import { cases, deferredPromises, guardedRegions, suiteSource as source } from './suite-source.js';
+import {
+  cases,
+  casesIn,
+  deferredPromises,
+  guardedRegions,
+  suiteSource as source,
+} from './suite-source.js';
 
 const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
 
@@ -65,6 +76,48 @@ describe('the suite grades every backend it certifies', () => {
     const found = cases().filter((c) => c.title.includes(clause));
     expect(found, `no case titled like "${clause}"`).toHaveLength(1);
     expect(found[0]!.body).toContain('expect(');
+  });
+
+  /**
+   * The parser against the shapes it has to see, which the rows above cannot grade: a case nested
+   * inside an inner `describe` does not exist in the suite today, and the day one does it must not
+   * be invisible — that is a case with no clause, no README bullet and no negative control, running
+   * against every certified backend and asserting whatever it likes.
+   */
+  const suiteAround = (body: string): string =>
+    `export function runConformanceSuite(name, factory) {\n  describe('x', () => {\n${body}\n  });\n}\n`;
+
+  it.each([
+    ['a case at the suite depth', "    it('at the suite depth', async () => { expect(1).toBe(1); });", ['at the suite depth']],
+    [
+      'a case nested inside an inner describe',
+      "    describe('a group', () => {\n      it('inside a describe', async () => { expect(1).toBe(1); });\n    });",
+      ['inside a describe'],
+    ],
+    [
+      'a case indented deeper for no reason',
+      "      it('deeper by accident', async () => { expect(1).toBe(1); });",
+      ['deeper by accident'],
+    ],
+    [
+      'an it.each whose table spans lines',
+      "    it.each([\n      ['a', 1],\n      ['b', 2],\n    ])('a table case %s', async (l, n) => { expect(n).toBe(n); });",
+      ['a table case %s'],
+    ],
+    [
+      'a modifier the parser has not met',
+      "    it.concurrent('a concurrent case', async () => { expect(1).toBe(1); });",
+      ['a concurrent case'],
+    ],
+  ])('sees %s', (_label, body, titles) => {
+    expect(casesIn(suiteAround(body)).map((c) => c.title)).toEqual(titles);
+  });
+
+  // The other side of the same boundary: a helper OUTSIDE the suite function registers nothing
+  // against a backend, so counting it as a case would make the clause↔case count meaningless.
+  it('ignores an it() outside the suite function', () => {
+    const source = `it('a self-test of this package', () => {});\n${suiteAround("    it('graded', async () => { expect(1).toBe(1); });")}`;
+    expect(casesIn(source).map((c) => c.title)).toEqual(['graded']);
   });
 
   // A deleted or renamed clause used to cost nothing: the count was a `> 10` floor and one title was
@@ -205,7 +258,12 @@ describe('the suite grades every backend it certifies', () => {
    * forbids the degenerate bound, the control forbids a merely lenient one.
    */
   describe('no elapsed-time bound is the budget that produced it', () => {
-    const EXPORTED: Record<string, number> = { SINCELESS_BLOCK_MS, SINCELESS_RETURN_MS };
+    const EXPORTED: Record<string, number> = {
+      IDLE_BLOCK_FLOOR_MS,
+      IDLE_BLOCK_MS,
+      SINCELESS_BLOCK_MS,
+      SINCELESS_RETURN_MS,
+    };
     const figure = (token: string): number =>
       EXPORTED[token] ?? Number(token.replaceAll('_', ''));
 
@@ -286,6 +344,47 @@ describe('the suite grades every backend it certifies', () => {
     ])('sees %s', (_label, snippet, names, allHandled) => {
       expect(deferredPromises(snippet).map((d) => d.name)).toEqual(names);
       expect(deferredPromises(snippet).every((d) => d.handled)).toBe(allHandled);
+    });
+  });
+
+  /**
+   * A bound on ELAPSED TIME is the one kind of assertion neither registry above can name: it is not a
+   * `Message` field and not a seam call, so `BROKEN_VARIANTS` had no way to be required to cover one.
+   * The idle arm's floor arrived that way and could be deleted — with the negative control included —
+   * while a plugin that returns instantly on a native `blockMs` kept being certified. Each timing
+   * bound now names a property in `ASSERTED_PROPERTIES`, which the negative control does require a
+   * variant for, so the next one cannot arrive uncontrolled.
+   */
+  describe('every elapsed-time bound names a property the negative control covers', () => {
+    const timingBounds = (body: string): number =>
+      [...body.matchAll(/expect\(\s*Date\.now\(\) - \w+/g)].length;
+    const namedProperties = (body: string): string[] =>
+      ASSERTED_PROPERTIES.filter((property) => body.includes(property));
+    const timed = (): { title: string; body: string }[] =>
+      cases().filter((c) => timingBounds(c.body) > 0);
+
+    it('finds elapsed-time bounds, so the rows below are not an empty table', () => {
+      expect(timed().reduce((n, c) => n + timingBounds(c.body), 0)).toBeGreaterThan(3);
+    });
+
+    it.each(timed().map((c) => [c.title, c.body] as const))(
+      '"%s" names one property per elapsed-time bound it asserts',
+      (title, body) => {
+        expect(
+          namedProperties(body).length,
+          `"${title}" asserts on elapsed time ${timingBounds(body)} time(s) but names ` +
+            `${namedProperties(body).length} of ASSERTED_PROPERTIES — a timing bound no property ` +
+            `names is one no BROKEN_VARIANTS entry has to fail`,
+        ).toBeGreaterThanOrEqual(timingBounds(body));
+      },
+    );
+
+    // The two parking controls exist to fail a bound each; a fraction drifting to the wrong side of
+    // one turns the control into a plugin that passes, which reads in the report as coverage.
+    it('each control still lands on the failing side of the bound it exists to fail', () => {
+      expect(SINCELESS_BLOCK_MS * PARK_FRACTION).toBeGreaterThan(SINCELESS_RETURN_MS);
+      expect(IDLE_BLOCK_MS * EARLY_RETURN_FRACTION).toBeLessThan(IDLE_BLOCK_FLOOR_MS);
+      expect(EARLY_RETURN_FRACTION).toBeGreaterThan(0);
     });
   });
 

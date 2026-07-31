@@ -58,6 +58,25 @@ export const SINCELESS_RETURN_MS = SINCELESS_BLOCK_MS * (2 / 3);
  */
 export const PARK_FRACTION = 0.9;
 
+/** Budget offered to the idle blocking read on the native arm — the one allowed to expire empty. */
+export const IDLE_BLOCK_MS = 300;
+
+/**
+ * How much of that budget a plugin declaring NATIVE `blockMs` support must actually spend before it
+ * reports "still nothing". A blocking read that answers at once is a long-poll core turns into a hot
+ * loop against the backend, and it is the one native-blocking defect every other assertion in the
+ * clause is blind to. Generous slack for slow CI: the control that fails this bound gives up at
+ * {@link EARLY_RETURN_FRACTION} of the budget, an order of magnitude sooner rather than a hair.
+ */
+export const IDLE_BLOCK_FLOOR_MS = 150;
+
+/**
+ * The share of an idle budget the early-return control spends. Keep it well under
+ * `IDLE_BLOCK_FLOOR_MS / IDLE_BLOCK_MS`, so that the control still fails the bound it exists to
+ * fail — and above zero, so that it still wakes on a message like a conformant plugin.
+ */
+export const EARLY_RETURN_FRACTION = 0.1;
+
 /** The volume the paging clause is graded over. Exported so its row generator can be self-tested. */
 export const PAGING_VOLUME: readonly string[] = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6'];
 
@@ -178,6 +197,21 @@ export const CLAUSES: readonly string[] = [
  *   spells the two differently — a composite key built one way on the write path and another on the
  *   read path — re-delivers its own messages on every catch-up. The uniqueness assertions cannot see
  *   it: a re-spelled id is still unique and still stable.
+ *
+ * The four below are ELAPSED TIME, which is neither a field nor a call and so had no way into either
+ * registry. Every assertion over `Date.now() - <start>` names one of them in its own failure message,
+ * and `suite-shape` requires that of any new one — an uncontrolled timing bound is invisible to
+ * every other check here, and `native-block-actually-waits` was in exactly that state.
+ *
+ * - `sinceless-block-returns-promptly`: a read carrying a block budget and NO cursor returns its
+ *   default window at once. That is the first iteration of core's long-poll wrapper, i.e. every
+ *   `parley_fetch_recent` an agent makes before it holds a cursor.
+ * - `ignored-block-returns-promptly`: a backend that declares no native support ignores `blockMs`
+ *   promptly rather than parking on it. The hint is optional; hanging on it is not.
+ * - `native-block-wakes-on-the-message`: a native blocker returns when the message lands, not when
+ *   the budget expires.
+ * - `native-block-actually-waits`: and it waits for it — a native `blockMs` that returns instantly
+ *   with nothing to report turns core's long-poll into a hot loop against the backend.
  */
 export const ASSERTED_PROPERTIES: readonly string[] = [
   'nextCursor-agreement',
@@ -185,6 +219,10 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'limit-honoured',
   'disconnect-stops-live-delivery',
   'post-id-agreement',
+  'sinceless-block-returns-promptly',
+  'ignored-block-returns-promptly',
+  'native-block-wakes-on-the-message',
+  'native-block-actually-waits',
 ];
 
 /**
@@ -568,7 +606,11 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       const opening = await ctx.plugin.fetchRecent({ topic: t, blockMs: SINCELESS_BLOCK_MS });
       const tail = opening.nextCursor;
       expect(opening.messages.map((m) => m.content)).toEqual(['old']);
-      expect(Date.now() - openedAt).toBeLessThan(SINCELESS_RETURN_MS);
+      expect(
+        Date.now() - openedAt,
+        'sinceless-block-returns-promptly: a cursor-less read with a block budget parked instead ' +
+          'of returning the default window it already had',
+      ).toBeLessThan(SINCELESS_RETURN_MS);
 
       if (!ctx.supportsBlockingFetch) {
         // The hint is OPTIONAL; hanging on it is not. This is the only case in the suite that ever
@@ -578,7 +620,11 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
         const ignored = await ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 });
         expect(ignored.messages).toEqual([]);
         expect(ignored.nextCursor).toBe(tail);
-        expect(Date.now() - startedIgnoring).toBeLessThan(1000);
+        expect(
+          Date.now() - startedIgnoring,
+          'ignored-block-returns-promptly: a plugin that declares no native blockMs support ' +
+            'parked on the hint instead of ignoring it',
+        ).toBeLessThan(1000);
         return;
       }
 
@@ -593,17 +639,26 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       const [woke] = await Promise.all([pending, posted]);
       expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
       expect(woke.nextCursor).not.toBe(tail); // cursor advanced
-      // It woke on the message, not on the budget expiring.
-      expect(Date.now() - started).toBeLessThan(4000);
+      expect(
+        Date.now() - started,
+        'native-block-wakes-on-the-message: it returned the message only once the budget expired',
+      ).toBeLessThan(4000);
 
       // (b) With nothing new, a blocked fetch returns an empty page with a stable cursor at timeout.
       const newTail = woke.nextCursor;
       const idleStarted = Date.now();
-      const timedOut = await ctx.plugin.fetchRecent({ topic: t, since: newTail, blockMs: 300 });
+      const timedOut = await ctx.plugin.fetchRecent({
+        topic: t,
+        since: newTail,
+        blockMs: IDLE_BLOCK_MS,
+      });
       expect(timedOut.messages).toEqual([]);
       expect(timedOut.nextCursor).toBe(newTail);
-      // It actually waited (did not return instantly) — allow generous slack for slow CI.
-      expect(Date.now() - idleStarted).toBeGreaterThanOrEqual(150);
+      expect(
+        Date.now() - idleStarted,
+        'native-block-actually-waits: a plugin declaring native blockMs support gave up on the ' +
+          'budget at once, which makes core long-poll it in a hot loop',
+      ).toBeGreaterThanOrEqual(IDLE_BLOCK_FLOOR_MS);
     });
 
     // The window between a blocking `fetchRecent` issuing its read and registering its waiter. A

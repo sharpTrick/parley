@@ -16,7 +16,11 @@ import {
   NoSuchTopicError,
   type Topic,
 } from '@sharptrick/parley-core';
-import { type ConformanceContext, PARK_FRACTION } from '@sharptrick/parley-conformance';
+import {
+  type ConformanceContext,
+  EARLY_RETURN_FRACTION,
+  PARK_FRACTION,
+} from '@sharptrick/parley-conformance';
 
 /**
  * The backing store a family of {@link ReferencePlugin} instances share, so that several
@@ -526,7 +530,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a fetch that parks forever on blockMs',
-    mutates: 'fetchRecent',
+    mutates: 'ignored-block-returns-promptly',
     mustFail: 'blockMs is honoured natively or ignored promptly',
     make: () =>
       wrap((inner) => ({
@@ -549,7 +553,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // that phrasing looking like a working guard; this one is only caught by a bound that is a real
     // fraction, which is the property the clause claims to grade.
     name: 'a fetch that parks on a since-less blockMs',
-    mutates: 'fetchRecent',
+    mutates: 'sinceless-block-returns-promptly',
     mustFail: 'blockMs is honoured natively or ignored promptly',
     make: () =>
       wrap((inner) => ({
@@ -863,11 +867,34 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       })),
   },
   {
+    // The idle arm's FLOOR, which nothing could fail: of the three native-blocking variants, two
+    // fail arm (a) before reaching it and the third fails on the cursor, so a plugin that declares
+    // native `blockMs` support and answers "still nothing" the instant it is asked was certified —
+    // and the assertion could be deleted with this package, negative control included, staying
+    // green. This plugin is conformant on every other axis; it just gives its budget up early,
+    // which is what core turns into a hot poll loop against the backend.
+    name: 'a native blocking read that gives up long before the budget',
+    mutates: 'native-block-actually-waits',
+    mustFail: 'blockMs is honoured natively or ignored promptly',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: (args) =>
+            inner.fetchRecent(
+              args.blockMs === undefined
+                ? args
+                : { ...args, blockMs: Math.ceil(args.blockMs * EARLY_RETURN_FRACTION) },
+            ),
+        }),
+        { supportsBlockingFetch: true },
+      ),
+  },
+  {
     // The blocking arm's TIMING assertion — "it woke on the message, not on the budget expiring" —
     // which every fixture in this package used to be on the wrong side of the flag to reach. This
     // plugin returns the right messages under the right cursor; all it does is ignore the wake.
     name: 'a native blocking read that returns at the budget instead of on the message',
-    mutates: 'fetchRecent',
+    mutates: 'native-block-wakes-on-the-message',
     mustFail: 'blockMs is honoured natively or ignored promptly',
     make: () =>
       wrap(

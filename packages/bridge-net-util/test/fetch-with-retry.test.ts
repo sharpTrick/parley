@@ -332,6 +332,31 @@ describe('fetchWithRetry', () => {
     expect(state.calls).toBeLessThanOrEqual(4);
   });
 
+  // The attempt cap a caller gets by NOT passing one. Every row around this states its own
+  // `maxAttempts`, so the shipped default was a figure nothing here graded — and it decides how many
+  // requests every consuming backend spends against a rate limiter before giving up. The figure is
+  // read off the README rather than off the export, so that MOVING the export is what fails: a row
+  // comparing the constant with itself passes at any value, which is how the default got here.
+  const documentedAttemptCap = (): number =>
+    documentedFigure(/`DEFAULT_MAX_ATTEMPTS` \((\d+)\)/, 'the default attempt cap');
+
+  it('spends the documented default number of attempts when the caller sets no cap', async () => {
+    const state = stubForever(() => res(429, '', { 'retry-after': '0.001' }));
+    captureWaits();
+    let clock = 0;
+    const err = await rejects(
+      fetchWithRetry(
+        'https://x/y',
+        {},
+        { label: 'L', isStopped: () => false, now: () => (clock += 1) },
+      ),
+    );
+    expect(state.calls).toBe(documentedAttemptCap());
+    expect(err.message).toMatch(
+      new RegExp(`still rate limited after ${documentedAttemptCap()} attempts`),
+    );
+  });
+
   it('gives up on the wall-clock deadline before reaching the attempt cap', async () => {
     const state = stubForever(() => res(429));
     captureWaits();
@@ -582,23 +607,79 @@ describe('fetchWithRetry', () => {
   // The one status this module is built around was the one `statusOf` could not report: the
   // exhaustion rejection was a plain Error, so a caller branching on the field saw undefined and
   // fell back to re-parsing the prose the field exists to replace.
-  it.each([
-    ['the attempt cap', { maxAttempts: 2, deadlineMs: 30_000 }, /still rate limited after 2 attempts/],
-    ['a wait past the deadline', { maxAttempts: 8, deadlineMs: 1_000 }, /past this call's 1000ms deadline/],
-  ])('reports 429 through statusOf when the loop gives up on %s', async (_label, bounds, shape) => {
-    stubForever(() => res(429, '', { 'retry-after': '10' }));
-    captureWaits();
+  //
+  // A row per exit the LOOP itself takes — not only the ones that fail while READING, which the
+  // envelope table covers. The wall-clock exit reached BETWEEN attempts was the last one still
+  // reporting nothing: a stated wait that fits the deadline, a sleep that overshoots it, and the
+  // next iteration threw a bare `Error`, so a 429 ladder stopped firing on the rejection a
+  // permanently rate-limited upstream produces most.
+  const ticking = (step: number): (() => number) => {
     let clock = 0;
-    const err = await rejects(
-      fetchWithRetry(
-        'https://x/y',
-        {},
-        { label: 'L', isStopped: () => false, ...bounds, now: () => (clock += 1) },
-      ),
-    );
-    expect(api.statusOf(err)).toBe(429);
-    expect(err.message).toMatch(shape);
-    expect(err.message.startsWith('L → 429: ')).toBe(true);
+    return () => (clock += step);
+  };
+
+  /**
+   * A clock read off a fixed list — `started`, the first budget check, the elapsed reading, then a
+   * jump past the deadline. The budget-exhausted exit is otherwise reachable only through a
+   * ~1ms timer overshoot, which is a race to depend on rather than a row.
+   */
+  const readings = (values: number[]): (() => number) => {
+    let at = 0;
+    return () => values[Math.min(at++, values.length - 1)] as number;
+  };
+
+  it.each([
+    ['the attempt cap', '10', { maxAttempts: 2, deadlineMs: 30_000 }, ticking(1), 'L → 429: ', /still rate limited after 2 attempts/],
+    ['a wait past the deadline', '10', { maxAttempts: 8, deadlineMs: 1_000 }, ticking(1), 'L → 429: ', /past this call's 1000ms deadline/],
+    [
+      'the budget exhausted before the next attempt',
+      '0.001',
+      { maxAttempts: 8, deadlineMs: 100 },
+      readings([0, 0, 0, 200]),
+      'L → deadline: ',
+      /exceeded 100ms before attempt 2/,
+    ],
+  ])(
+    'reports 429 through statusOf when the loop gives up on %s',
+    async (_label, retryAfter, bounds, now, prefix, shape) => {
+      stubForever(() => res(429, '', { 'retry-after': retryAfter }));
+      captureWaits();
+      const err = await rejects(
+        fetchWithRetry('https://x/y', {}, { label: 'L', isStopped: () => false, ...bounds, now }),
+      );
+      expect(api.statusOf(err)).toBe(429);
+      expect(err.message).toMatch(shape);
+      expect(err.message.startsWith(prefix)).toBe(true);
+    },
+  );
+
+  /**
+   * The class the rows above pin three exits of. Every `throw` in the loop happens where a response
+   * may already have arrived, so none of them may be a type that cannot carry the status: `statusOf`
+   * reads a FIELD, and a bare `Error` reports `undefined` for a rejection whose status is known.
+   * Derived from the source, so the next exit added to the loop is graded before it ships.
+   */
+  describe('every exit the loop takes throws a type that can carry a status', () => {
+    const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+    const STATUS_CARRYING = ['LabelledError', 'HttpStatusError'];
+
+    const loopBody = (): string => {
+      const from = src.indexOf('export async function fetchWithRetry');
+      const to = src.indexOf('\n}', from);
+      return src.slice(from, to);
+    };
+
+    const thrown = (): string[] =>
+      [...loopBody().matchAll(/throw new (\w+)\(/g)].map((m) => m[1] as string);
+
+    it('finds the loop and its throws, so the row below is not reading an empty string', () => {
+      expect(loopBody()).toContain('for (let attempt = 1;');
+      expect(thrown().length).toBeGreaterThan(2);
+    });
+
+    it('throws nothing that drops the status', () => {
+      expect(thrown().filter((name) => !STATUS_CARRYING.includes(name))).toEqual([]);
+    });
   });
 
   // The same class one exit further along: a teardown ends the retry AFTER the 429 arrived, so the
@@ -1041,6 +1122,12 @@ describe('fetchWithRetry', () => {
   };
 
   const ALPHABETS: [string, (n: number) => string][] = [
+    // The two alphabets whose spelling the URL parser CHANGES. Every row above them is `+`- and
+    // `%`-free, which is why sixty green cells missed a standard-base64 key: `URLSearchParams`
+    // hands back a space where the wire carried a `+`, so redaction derived from the parser's view
+    // alone removes a string the body never contained.
+    ['standard base64', (n) => cycle('QWERTY+uiop/asdFGH12345jkl=ZXCVbnm', n)],
+    ['percent-escaped', (n) => cycle('%2FQWERTY%3Auiop%20asdFGH12345', n)],
     ['base64url', (n) => cycle('QWERTYuiop-_asdFGH12345jklZXCVbnm', n)],
     ['base62 alphanumeric', (n) => cycle('QWERTYuiopasdFGH12345jklZXCVbnm', n)],
     ['all-lowercase alphabetic', (n) => cycle('qwertyuiopasdfghjklzxcvbnm', n)],
@@ -1082,17 +1169,47 @@ describe('fetchWithRetry', () => {
    * Components whose rule CONSULTS what they carry — the per-segment and per-query-value rules, both
    * of which weigh length against the method-name exemption. Only these can grade a value axis, so
    * only these are crossed with one.
+   *
+   * Each builder reports the fragment the URL ACTUALLY carries, read back off `new URL(...)`, not
+   * the value the row wrote. The parser normalizes on the way in, and a table that echoes what it
+   * wrote grades a spelling no transport and no body ever produces — which is exactly how a
+   * `+`-bearing credential passed every cell while reaching model context verbatim.
    */
   const SHAPED_LOCATIONS: [string, (v: string) => { url: string; fragment: string }][] = [
     [
       'a path segment echoed on its own',
-      (v) => ({ url: `https://api.example.test/api/webhooks/12345/${v}`, fragment: v }),
+      (v) => {
+        const url = `https://api.example.test/api/webhooks/12345/${v}`;
+        return { url, fragment: new URL(url).pathname.split('/').at(-1) as string };
+      },
     ],
     [
       'a query value echoed on its own',
-      (v) => ({ url: `https://api.example.test/v1/x?access_token=${v}`, fragment: v }),
+      (v) => {
+        const url = `https://api.example.test/v1/x?access_token=${v}`;
+        const query = new URL(url).search.slice(1);
+        return { url, fragment: query.slice(query.indexOf('=') + 1) };
+      },
     ],
   ];
+
+  /**
+   * The table's own premise: a fragment long enough for the length rule to have to decide, and at
+   * least one shape the parser does NOT hand back as written. Without the second row the two
+   * normalizing alphabets could be deleted and every cell above would stay green.
+   */
+  it('echoes fragments the rule must decide on, including one the parser respells', () => {
+    const cells = SHAPED_LOCATIONS.flatMap(([location, build]) =>
+      SHAPES().map(([shape, secret]) => ({ label: `${location}, ${shape}`, ...build(secret) })),
+    );
+    const tooShort = cells.filter((c) => c.fragment.length <= routeWordBound());
+    expect(tooShort.map((c) => c.label)).toEqual([]);
+    const respelled = cells.filter(
+      (c) => new URL(c.url).searchParams.get('access_token') !== null &&
+        new URL(c.url).searchParams.get('access_token') !== c.fragment,
+    );
+    expect(respelled.map((c) => c.label)).not.toEqual([]);
+  });
 
   /**
    * Components claimed WHATEVER they carry: the whole pathname (claimed on the `/12345/` inside it)
@@ -1123,18 +1240,17 @@ describe('fetchWithRetry', () => {
     SHAPED_LOCATIONS.flatMap(([location, build]) =>
       SHAPES().flatMap(([shape, secret]) =>
         VECTORS.map(
-          ([vector, make]) =>
-            [`${location}, ${shape}, ${vector}`, build(secret), secret, make] as const,
+          ([vector, make]) => [`${location}, ${shape}, ${vector}`, build(secret), make] as const,
         ),
       ),
     ),
-  )('never leaks a credential carried in %s, echoed alone', async (_label, target, secret, make) => {
+  )('never leaks a credential carried in %s, echoed alone', async (_label, target, make) => {
     vi.stubGlobal('fetch', make(target.fragment));
     const err = await rejects(
       fetchWithRetry(target.url, {}, { label: 'L', isStopped: () => false }),
     );
     expect(err.message).toContain('L → ');
-    expect(err.message).not.toContain(secret);
+    expect(err.message).not.toContain(target.fragment);
   });
 
   it.each(
@@ -1150,6 +1266,43 @@ describe('fetchWithRetry', () => {
     );
     expect(err.message).toContain('L → ');
     expect(err.message).not.toContain(CANARY);
+  });
+
+  /**
+   * The one claim in the README that only a LENGTH axis can grade: userinfo takes neither exemption,
+   * "so a short password is redacted too". The whole-part filter dropped every candidate of one
+   * character, so the shortest password — the only one the sentence is about — survived verbatim
+   * while `bot123:<CANARY>` passed the row above. Zero is the other side of the same bound: an empty
+   * userinfo may not become a redaction target, or splitting on it puts `<redacted>` between every
+   * character of the body.
+   */
+  const PASSWORD_LENGTHS = [1, 2, 8, 24, 68];
+
+  it.each(PASSWORD_LENGTHS)('redacts a %i-character password out of the body', async (n) => {
+    const password = cycle('qwrtypsdfghjklzxvbnm', n);
+    vi.stubGlobal('fetch', () =>
+      Promise.resolve(res(401, `bad creds ${password} for user`)),
+    );
+    const err = await rejects(
+      fetchWithRetry(`https://user:${password}@api.example.test/v1/x`, {}, {
+        label: 'L',
+        isStopped: () => false,
+      }),
+    );
+    expect(err.message.startsWith('L → 401: ')).toBe(true);
+    expect(err.message).not.toContain(password);
+  });
+
+  it('leaves the body alone when the URL carries no userinfo at all', async () => {
+    const body = 'the parameter anchor is not enabled for this workspace';
+    vi.stubGlobal('fetch', () => Promise.resolve(res(409, body)));
+    const err = await rejects(
+      fetchWithRetry('https://api.example.test/v1/x?anchor=newest', {}, {
+        label: 'L',
+        isStopped: () => false,
+      }),
+    );
+    expect(err.message).toBe(`L → 409: ${body}`);
   });
 
   it.each(UNCONDITIONAL_LOCATIONS)(
@@ -1782,6 +1935,76 @@ describe('README', () => {
         .filter((n) => pkg.description.toLowerCase().includes(n));
       expect(named).toEqual([]);
     });
+  });
+});
+
+/**
+ * A default is what a consumer gets by NOT passing the option, so a suite that always passes the
+ * option grades a figure nobody ships with. `MAX_RESPONSE_BYTES` was in exactly that state: cutting
+ * it from 16 MiB to 1 KB left every case in this package green and broke 262 across 26 others — the
+ * package that owns the constant could not name the regression it caused. Derived from the exported
+ * numbers rather than a list, so the next default arrives classified or fails here.
+ */
+describe('every shipped default is graded on the path it governs', () => {
+  const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+
+  /** Each exported default, and the option a caller overrides it with (`none`: it cannot be). */
+  const GOVERNED_OPTIONS: Record<string, string> = {
+    DEFAULT_MAX_ATTEMPTS: 'maxAttempts',
+    DEFAULT_DEADLINE_MS: 'deadlineMs',
+    MAX_RESPONSE_BYTES: 'maxBodyBytes',
+    DEFAULT_BACKOFF_MS: 'none',
+    MAX_BACKOFF_MS: 'none',
+    MAX_ERROR_BODY: 'none',
+    STOP_POLL_MS: 'none',
+  };
+
+  const exportedDefaults = (): string[] =>
+    Object.entries(api)
+      .filter(([name, value]) => typeof value === 'number' && /^[A-Z][A-Z0-9_]*$/.test(name))
+      .map(([name]) => name);
+
+  /** The options `fetchWithRetry` actually takes, read off the declaration. */
+  const declaredOptions = (): string[] => {
+    const from = src.indexOf('export interface FetchWithRetryOptions {');
+    const block = src.slice(from, src.indexOf('\n}', from));
+    return [...block.matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1] as string);
+  };
+
+  /**
+   * The figure the README states beside each constant. A default is graded in two places — what the
+   * code does with it, and what the published page promises it is — and the second was pinned
+   * nowhere, so a constant could move with the npm page still quoting the old number.
+   */
+  const documentedFigures = (): [string, number][] =>
+    [...README.matchAll(/`([A-Z][A-Z0-9_]*)` \(([\d_]+)( MiB)?/g)].map(([, name, digits, mib]) => [
+      name as string,
+      Number((digits as string).replaceAll('_', '')) * (mib === undefined ? 1 : 1024 * 1024),
+    ]);
+
+  it('finds the defaults, the options and the figures, so the rows below grade something', () => {
+    expect(exportedDefaults().length).toBeGreaterThan(4);
+    expect(declaredOptions()).toContain('label');
+    expect(documentedFigures().length).toBeGreaterThan(4);
+  });
+
+  it.each(exportedDefaults())('`%s` is classified as governing an option, or not', (name) => {
+    expect(
+      Object.keys(GOVERNED_OPTIONS),
+      `\`${name}\` is a shipped default nothing here classifies — name the option it governs, or ` +
+        `\`none\` if a caller cannot override it`,
+    ).toContain(name);
+  });
+
+  it.each(Object.entries(GOVERNED_OPTIONS).filter(([, option]) => option !== 'none'))(
+    '`%s` governs the real option `%s`',
+    (_name, option) => {
+      expect(declaredOptions()).toContain(option);
+    },
+  );
+
+  it.each(documentedFigures())('the README states %s as %i, which is what it is', (name, figure) => {
+    expect((api as unknown as Record<string, unknown>)[name]).toBe(figure);
   });
 });
 
