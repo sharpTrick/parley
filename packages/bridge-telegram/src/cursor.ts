@@ -2,12 +2,10 @@ import { buildMessage, type Cursor, type Message, type Topic } from '@sharptrick
 import { keyOf, type ObservedStore, type StoredRecord } from './store.js';
 
 /**
- * The observation sequence `since` names, or a loud failure. A cursor is `<store epoch>.<seq>`:
- * the sequence is minted per store FILE and restarts at 1, so the file's identity is what makes a
- * cursor from a store this one did not inherit refusable however far this store's own sequence
- * has since climbed. Without it the guard is only a high-water compare — it stops firing the
- * moment a replacement store refills past the held cursor, and catch-up then answers a
- * permanently short page that no Bot API call can ever complete.
+ * The observation sequence `since` names, or a loud failure. Keep the store identity in the
+ * compare, so that a cursor from a store file this one did not inherit stays refusable: without it
+ * the guard is only a high-water compare, which stops firing the moment a replacement store refills
+ * past the held cursor, and catch-up then answers a permanently short page nothing can complete.
  *
  * `'0'` is accepted bare and unqualified: it sits below every sequence any store can stamp, so it
  * can only ever mean "from the beginning of what is retained".

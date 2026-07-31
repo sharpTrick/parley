@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
@@ -6,6 +5,7 @@ import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
 import {
   captureStderr,
   connectTo,
+  packageSource,
   registerCleanup,
   startFake,
   startRig,
@@ -461,7 +461,7 @@ describe('telegram non-conforming message objects', () => {
    * a row here.
    */
   it('grades every field the plugin reads for a record value', () => {
-    const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+    const source = packageSource();
     const bodyFields = /const BODY_FIELDS = \[([^\]]*)\]/.exec(source)?.[1] ?? '';
     const read = [...bodyFields.matchAll(/'([^']+)'/g)].map((m) => m[1] as string);
     const senderOf = /function senderOf\([\s\S]*?\n\}/.exec(source)?.[0] ?? '';

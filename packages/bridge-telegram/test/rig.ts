@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, expect, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { type FakeTelegram, startFakeTelegram } from './fake-telegram.js';
@@ -40,6 +41,20 @@ afterEach(async () => {
   await runCleanups();
   vi.restoreAllMocks();
 });
+
+/**
+ * Every module of this package's source, concatenated. Structural lints read declarations out of
+ * the source text; anchoring them on the TREE rather than on one path is what lets a module be
+ * split without a lint that has no opinion about layout going red — and what makes a symbol moved
+ * into a new file still count as declared.
+ */
+export function packageSource(): string {
+  const dir = fileURLToPath(new URL('../src/', import.meta.url));
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => readFileSync(join(dir, f), 'utf8'))
+    .join('\n');
+}
 
 /** Register teardown for something a test built itself, in the rig's own LIFO order. */
 export function registerCleanup(fn: () => Promise<void> | void): void {

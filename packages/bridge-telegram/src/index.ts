@@ -13,85 +13,29 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay, statusOf } from '@sharptrick/parley-net-util';
 import { BotApi } from './api.js';
-import { defaultStorePath, requireNumericKnobs } from './config.js';
+import { ChatResolver } from './chats.js';
+import {
+  DEFAULT_API_URL,
+  defaultStorePath,
+  requireNumericKnobs,
+  type TelegramBackendConfig,
+} from './config.js';
 import { recordToMessage, requireLimit, requireOwnCursor } from './cursor.js';
 import { describe, Diagnostics, plaintextWarning } from './diagnostics.js';
+import { pollUpdates } from './poll.js';
 import { keyOf, type ObservedRecord, ObservedStore } from './store.js';
+import { Waiters } from './waiters.js';
 import {
   canonicalChatKey,
-  NUMERIC_CHAT_ID,
+  contentOf,
   parseCompositeMid,
+  requireMessage,
+  senderOf,
   type TgMessage,
-  type TgUpdate,
 } from './wire.js';
 
-/** Plugin-specific backend_config (DESIGN §11). */
-export interface TelegramBackendConfig {
-  /** Bot token from @BotFather. A secret — lives in `backend_config`/`.env`, never in code. */
-  token?: string;
-  /**
-   * Bot API base URL. Default {@link DEFAULT_API_URL} (override for tests / local servers). A
-   * plaintext `http://` base pointed at a non-loopback host is warned about on `connect`: this API
-   * carries the token in the URL PATH, so every request line then puts it on the wire in the clear.
-   */
-  api_url?: string;
-  /**
-   * Path of the observed-message JSONL store. Default {@link defaultStorePath} — an ABSOLUTE
-   * path under the same state directory core keeps its read-state (cursors) in, so the two share
-   * a lifetime. A store file that goes missing while a saved cursor survives invalidates that
-   * cursor: sequences restart at 1 and the messages below the old cursor are unreachable, which
-   * `fetchRecent` reports rather than serving a short page (see {@link ObservedStore.epoch}).
-   */
-  store_path?: string;
-  /**
-   * `getUpdates` long-poll timeout (SECONDS — Telegram's unit). Default 25, accepted range
-   * `[1, 50]`. `0` is Telegram's "short polling", which would turn the single ingestion loop into
-   * a request flood against the bot token, so it is a load error rather than a knob.
-   */
-  poll_timeout_s?: number;
-  /**
-   * Parley topic → Telegram chat id. A topic missing from the map is used as the chat id
-   * literal (numeric id string or `@channelusername`), so the map is optional sugar for
-   * giving chats friendly topic names.
-   */
-  chat_map?: Record<string, string>;
-  /**
-   * Max observed records retained PER CHAT in the local JSONL store — per chat, not per topic:
-   * `chat_map` can give one chat two topic names. The newest N are kept on load AND on every
-   * append, so a long-lived bridge on a busy chat can't grow the store/RAM without limit or
-   * degrade `connect`. Default 10000.
-   */
-  observed_retention_per_chat?: number;
-  /** Deprecated spelling of {@link observed_retention_per_chat}, which wins when both are set. */
-  observed_retention_per_topic?: number;
-  /**
-   * Max UNSERVED chats retained in the local JSONL store. Anyone who can add the bot to a
-   * group can drive writes into `store_path`, so that traffic is bounded; chats a configured topic
-   * or a seam call resolves to are always retained, on top of this cap, and an unserved chat past
-   * it displaces the least recently active unserved one. Default 1000.
-   */
-  observed_max_chats?: number;
-}
-
-/** A live subscription: deliver everything ingested after it was registered. */
-interface Subscription {
-  handler: MessageHandler;
-  /** The Parley topic this subscriber named the chat by — stamped on what it receives. */
-  topic: Topic;
-}
-
-/**
- * A `fetchRecent` long-poll parked on a chat, resolved by the SHARED ingest path when a message
- * above `sinceSeq` lands, or on `blockMs` timeout, or on disconnect.
- */
-interface Waiter {
-  /** Wake only for a message whose observation sequence is strictly greater than this. */
-  sinceSeq: number;
-  /** Idempotently unpark (message arrived, timeout, or disconnect) — self-cleans the waiter. */
-  wake: () => void;
-}
+export type { TelegramBackendConfig } from './config.js';
 
 /**
  * Telegram Bot API backend (DESIGN §6/§9) — spoken to via the raw HTTP API with the global
@@ -99,38 +43,25 @@ interface Waiter {
  * there is no server of ours to configure, only a bot token from @BotFather.
  *
  * **Fit-contract strain — the one structural caveat of this backend.** The Bot API exposes NO
- * history endpoint, so this plugin keeps a small local persisted store ({@link ObservedStore},
- * append-only JSONL) of messages it has OBSERVED — its own sends (recorded from the
- * `sendMessage` response, because own posts never arrive via `getUpdates`) plus everything
- * delivered by `getUpdates`. `fetchRecent` can only replay what this bridge has seen —
- * **history from before the bot joined a chat, or from before this store file existed, cannot
- * be backfilled**. This strains the "durable, replayable history" line of the seam contract
- * (DESIGN §6); within the observed window the contract holds fully.
+ * history endpoint, so this plugin keeps a local persisted store ({@link ObservedStore}) of
+ * messages it has OBSERVED, and `fetchRecent` can only replay those. That strains the "durable,
+ * replayable history" line of the seam contract (DESIGN §6); within the observed window the
+ * contract holds fully. See "History limitations" in README.md.
  *
  * IDs: `backendMsgId = '<chat_id>:<message_id>'` (composite — Telegram's `message_id` is only
- * unique PER CHAT) and `cursor = '<store identity>.<seq>'`, where `seq` is the store's local
- * OBSERVATION sequence and the identity is the store FILE's ({@link ObservedStore.epoch}).
- * Telegram's own `message_id` is minted when the sender's message is accepted, not when this
- * bridge sees it, so a foreign message minted before our post can be delivered after it and would
- * sit forever below a cursor already handed out; observation order is monotonic by construction
- * and cannot.
+ * unique PER CHAT) and `cursor = '<store identity>.<seq>'`, over the store's own OBSERVATION
+ * sequence ({@link StoredRecord.seq}) and the store FILE's identity ({@link ObservedStore.epoch}).
  *
  * Everything internal — the observed store, live subscriptions, long-poll waiters — is keyed by
- * the CANONICAL NUMERIC CHAT ID a topic resolves to, never by the topic string. `chat_map`, an
- * `@channelusername` literal and a numeric literal are three names for one chat, and inbound
- * updates carry only the numeric id; keying on it is what makes ingestion independent of which
- * seam call ran first, or of whether any topic had been named yet when the message arrived.
+ * the CANONICAL NUMERIC CHAT ID a topic resolves to ({@link ChatResolver}), never by the topic
+ * string; see {@link StoredRecord} for why.
  *
- * Ingestion is ONE shared background `getUpdates` long-poll loop per plugin instance:
- * Telegram allows exactly ONE `getUpdates` consumer per bot token (a second gets HTTP 409),
- * so subscriptions share the loop rather than each opening their own. Run exactly one
+ * Ingestion is ONE shared background {@link pollUpdates} loop per plugin instance. Run exactly one
  * Telegram bridge per bot token — see README.md, "Multiple concurrent sessions".
  */
 export class TelegramPlugin implements BackendPlugin {
   private api = new BotApi(DEFAULT_API_URL, '');
-  private pollTimeoutS = 25;
-  /** topic → chat id (unmapped topics fall through to the topic string itself). */
-  private chatMap: Record<string, string> = {};
+  private chats?: ChatResolver;
   private store?: ObservedStore;
   private storePath = '';
   /**
@@ -142,14 +73,12 @@ export class TelegramPlugin implements BackendPlugin {
   private generation = 0;
   /** A `connect` has claimed the instance but has not yet published (or failed). */
   private connecting = false;
-  /** Live subscriptions per CHAT ID, fed by the shared getUpdates loop and by post(). */
-  private readonly subs = new Map<string, Subscription[]>();
-  /** Native long-poll waiters per CHAT ID, resolved by ingest / timeout / disconnect. */
-  private readonly waiters = new Map<string, Set<Waiter>>();
-  /** Memoized `@channelusername` → numeric-id-string resolutions (one getChat per distinct name). */
-  private canonicalById = new Map<string, Promise<string>>();
-  /** Memoized topic → canonical numeric chat id (chat_map or literal, `@name` resolved). */
-  private chatIdByTopic = new Map<string, Promise<string>>();
+  /**
+   * Live subscriptions per CHAT ID, fed by the shared getUpdates loop and by post(). Each carries
+   * the Parley topic its subscriber named the chat by — stamped on what that subscriber receives.
+   */
+  private readonly subs = new Map<string, { handler: MessageHandler; topic: Topic }[]>();
+  private readonly waiters = new Waiters();
   private readonly diagnostics = new Diagnostics((text) => this.api.redact(text));
 
   async connect(config: BackendConfig): Promise<void> {
@@ -170,10 +99,11 @@ export class TelegramPlugin implements BackendPlugin {
       this.api = api;
       const warning = plaintextWarning(apiUrl);
       if (warning !== undefined) this.diagnostics.report(warning);
-      this.pollTimeoutS = cfg.poll_timeout_s ?? 25;
-      this.canonicalById = new Map();
-      this.chatIdByTopic = new Map();
-      this.chatMap = cfg.chat_map ?? {};
+      const timeoutS = cfg.poll_timeout_s ?? 25;
+      const chats = new ChatResolver(api, cfg.chat_map ?? {}, this.diagnostics, (chatId) => {
+        if (generation === this.generation) this.store?.serve(chatId);
+      });
+      this.chats = chats;
       if (token === '') {
         throw new Error(
           'TelegramPlugin: backend_config.token is required (bot token from @BotFather)',
@@ -187,8 +117,8 @@ export class TelegramPlugin implements BackendPlugin {
       // load time, or its chat cap evicts the operator's own chat in favour of a chat anyone who
       // added the bot to a group created — history the Bot API can never backfill.
       const served: string[] = [];
-      for (const topic of Object.keys(this.chatMap)) {
-        served.push(await this.chatIdFor(asTopic(topic)));
+      for (const topic of Object.keys(cfg.chat_map ?? {})) {
+        served.push(await chats.chatIdFor(asTopic(topic)));
         this.stillCurrent(generation);
       }
       // Load the observed-message store up front — fetchRecent is a pure in-memory query.
@@ -200,8 +130,15 @@ export class TelegramPlugin implements BackendPlugin {
         served,
       );
       this.store = store;
-      // ONE shared ingestion loop per instance (one getUpdates consumer per token — see class doc).
-      void this.pollLoop(generation, store, api).catch((err: unknown) => {
+      void pollUpdates({
+        api,
+        timeoutS,
+        diagnostics: this.diagnostics,
+        isCurrent: () => this.generation === generation,
+        deliver: (chatId, msg) => {
+          this.ingest(store, chatId, msg);
+        },
+      }).catch((err: unknown) => {
         this.diagnostics.report(`getUpdates loop stopped: ${describe(err)}`);
       });
     } finally {
@@ -221,15 +158,10 @@ export class TelegramPlugin implements BackendPlugin {
     this.connecting = false;
     this.api.stop();
     this.subs.clear();
-    this.chatIdByTopic = new Map();
-    // Unpark every native long-poll waiter so no blocked fetchRecent hangs past
-    // teardown. Snapshot first: wake() mutates `waiters`. Each resumes, re-queries the (now
-    // closed) store, and returns an empty page — returning early/empty is always safe.
-    for (const set of [...this.waiters.values()]) for (const w of [...set]) w.wake();
-    this.waiters.clear();
+    this.chats = undefined;
+    this.waiters.wakeAll();
     this.store?.close();
     this.store = undefined;
-    this.canonicalById = new Map();
   }
 
   /**
@@ -245,8 +177,7 @@ export class TelegramPlugin implements BackendPlugin {
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     const store = this.require(this.store);
-    void identity; // sender is the bot account; see JSDoc above.
-    const chatId = await this.chatIdFor(topic);
+    const chatId = await this.require(this.chats).chatIdFor(topic);
     this.stillServing(store);
     const body: Record<string, unknown> = { chat_id: chatId, text: content };
     // Reply threading: only for a composite `<chat>:<mid>` naming THIS chat — a message id from
@@ -304,10 +235,8 @@ export class TelegramPlugin implements BackendPlugin {
 
   /**
    * Durable catch-up = a query over the observed-message store: no history endpoint is ever
-   * called, because the Bot API has none. The one network cost is resolving an `@channelusername`
-   * topic to its numeric id — one memoized `getChat`, already paid during `connect` for every
-   * `chat_map` entry — so a topic named only by an `@name` literal can fail its FIRST catch-up if
-   * Telegram is unreachable. Exclusive `since` is a NUMERIC compare, ascending, sliced to `limit`.
+   * called, because the Bot API has none. Exclusive `since` is a NUMERIC compare, ascending,
+   * sliced to `limit`.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const store = this.require(this.store);
@@ -316,7 +245,7 @@ export class TelegramPlugin implements BackendPlugin {
         ? undefined
         : requireOwnCursor(store, this.storePath, args.since, args.topic);
     const limit = requireLimit(args.limit);
-    const chatId = await this.chatIdFor(args.topic);
+    const chatId = await this.require(this.chats).chatIdFor(args.topic);
     this.stillServing(store);
     const query = (): Message[] => {
       const all = store.entries(chatId);
@@ -340,7 +269,7 @@ export class TelegramPlugin implements BackendPlugin {
       args.blockMs > 0 &&
       !store.entries(chatId).some((r) => r.seq > sinceSeq)
     ) {
-      await this.waitForMessage(chatId, sinceSeq, args.blockMs);
+      await this.waiters.park(chatId, sinceSeq, args.blockMs);
       messages = query();
     }
     const last = messages.at(-1);
@@ -356,64 +285,21 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Park until the SHARED ingest path delivers a message in `chatId` whose observation sequence
-   * is strictly above `sinceSeq`, or `blockMs` elapses, or {@link disconnect} fires. No second
-   * getUpdates consumer: the one shared loop and own posts both flow through {@link ingest},
-   * which wakes the waiter. The waiter always self-cleans (timer cleared, removed from the set),
-   * so a timed-out or resolved long-poll never leaks.
-   */
-  private waitForMessage(chatId: string, sinceSeq: number, blockMs: number): Promise<void> {
-    let set = this.waiters.get(chatId);
-    if (set === undefined) {
-      set = new Set<Waiter>();
-      this.waiters.set(chatId, set);
-    }
-    const waiters = set;
-    return new Promise<void>((resolve) => {
-      let done = false;
-      const wake = (): void => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        waiters.delete(waiter);
-        if (waiters.size === 0) this.waiters.delete(chatId);
-        resolve();
-      };
-      const timer = setTimeout(wake, blockMs);
-      const waiter: Waiter = { sinceSeq, wake };
-      waiters.add(waiter);
-    });
-  }
-
-  /** Wake any native long-poll waiter on the chat whose `since` now trails `seq`. */
-  private wakeWaiters(chatId: string, seq: number): void {
-    const set = this.waiters.get(chatId);
-    if (set === undefined) return;
-    // Snapshot: wake() removes the waiter from the set (and may drop the key).
-    for (const w of [...set]) if (seq > w.sinceSeq) w.wake();
-  }
-
-  /**
    * Live path: register on the shared `getUpdates` loop. Registration is synchronous once the chat
-   * resolves, and {@link ingest} runs only for a record `store.append` has just stamped, so a post
-   * racing a fresh subscribe can never be missed and nothing already in the store can replay here:
-   * history is owned by catch-up, not push.
+   * resolves, and {@link ingest} runs only for a freshly stamped record, so a post racing a fresh
+   * subscribe can never be missed and nothing already in the store can replay here.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const store = this.require(this.store);
-    const chatId = await this.chatIdFor(topic);
+    const chatId = await this.require(this.chats).chatIdFor(topic);
     this.stillServing(store);
-    const sub: Subscription = { handler, topic };
+    const sub = { handler, topic };
     const list = this.subs.get(chatId);
     if (list === undefined) this.subs.set(chatId, [sub]);
     else list.push(sub);
   }
 
-  /**
-   * The bot's own username resolves to its numeric Telegram id (via memoized `getMe`); any
-   * other handle passes through as a name convention — the Bot API cannot look up arbitrary
-   * users by username (DESIGN §4).
-   */
+  /** Any handle but the bot's own passes through: the Bot API cannot look up users (DESIGN §4). */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     const store = this.require(this.store);
     const me = await this.api.getMe();
@@ -425,80 +311,7 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Topic → the canonical NUMERIC chat id it names (`chat_map` value or the topic used as a
-   * chat id literal), memoized per topic. Every seam method resolves through here, so which
-   * one ran first cannot affect what is stored or retrievable. Registers the chat as
-   * one this bridge serves, so the store's chat cap never drops it.
-   */
-  private chatIdFor(topic: Topic): Promise<string> {
-    const t = topic as string;
-    const cached = this.chatIdByTopic.get(t);
-    if (cached !== undefined) return cached;
-    const generation = this.generation;
-    const pending = this.canonicalChatId(this.chatMap[t] ?? t)
-      .then((chatId) => {
-        if (generation === this.generation) this.store?.serve(chatId);
-        return chatId;
-      })
-      .catch((err: unknown) => {
-        // Don't poison the memo on transient failure — let the next call retry.
-        if (generation === this.generation) this.chatIdByTopic.delete(t);
-        // Report it here: core's presence loop swallows the rejection by design, so an
-        // unresolvable presence topic is otherwise a bridge that beats to nobody, in silence.
-        this.diagnostics.report(`topic '${t}' resolves to no Telegram chat: ${describe(err)}`, `unresolved-topic:${t}`);
-        throw err;
-      });
-    this.chatIdByTopic.set(t, pending);
-    return pending;
-  }
-
-  /**
-   * A chat id in canonical NUMERIC-string form. `@channelusername` values are resolved to their
-   * numeric id via `getChat` (once per distinct name — memoized like `getMe`); a numeric id is
-   * normalized NUMERICALLY with no network call. Keeps every index (and `StoredRecord.chat_id`)
-   * keyed by the numeric id Telegram always stamps on inbound `Update.chat.id`.
-   *
-   * Normalize through `BigInt`, so that a spelling which is numerically but not textually
-   * canonical (`-0012345`) collapses to the one key inbound updates carry rather than becoming a
-   * topic whose posts land under a key nothing will ever match — and so that a chat id past
-   * `Number.MAX_SAFE_INTEGER` is not rounded on the way through. A reference that is neither form
-   * names no chat Telegram could ever serve, so it is rejected here rather than becoming a topic
-   * that silently stays empty forever.
-   */
-  private canonicalChatId(chat: string): Promise<string> {
-    if (NUMERIC_CHAT_ID.test(chat)) return Promise.resolve(BigInt(chat).toString());
-    if (!/^@[A-Za-z][A-Za-z0-9_]{3,31}$/.test(chat)) {
-      return Promise.reject(
-        new Error(
-          `TelegramPlugin: '${chat}' is not a Telegram chat id — use a numeric id or ` +
-            `'@channelusername', or map the topic via backend_config.chat_map`,
-        ),
-      );
-    }
-    const cached = this.canonicalById.get(chat);
-    if (cached !== undefined) return cached;
-    const pending = this.api
-      .call('GET', `/getChat?chat_id=${encodeURIComponent(chat)}`)
-      .then((result) => {
-        const id = (result as { id?: unknown }).id;
-        if (typeof id !== 'number' && typeof id !== 'string') {
-          throw new Error('Telegram GET /getChat → result: chat carries no id');
-        }
-        return canonicalChatKey('Telegram GET /getChat → result', id);
-      })
-      .catch((err: unknown) => {
-        // Don't poison the memo on transient failure — let the next call retry.
-        this.canonicalById.delete(chat);
-        throw err;
-      });
-    this.canonicalById.set(chat, pending);
-    return pending;
-  }
-
-  /**
-   * The single ingestion point for an observed message (own send or getUpdates delivery):
-   * dedup on the composite id, persist to the store under a fresh observation sequence, then
-   * deliver to any live subscriber.
+   * The single ingestion point for an observed message — own send or getUpdates delivery.
    *
    * The store is a PARAMETER, not `this.store`: both callers have already established that the
    * generation they started on is still current, and neither awaits between that check and this
@@ -534,90 +347,12 @@ export class TelegramPlugin implements BackendPlugin {
     }
     // Native long-poll: a genuinely-new message wakes any parked fetchRecent on this
     // chat. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
-    this.wakeWaiters(chatId, rec.seq);
+    this.waiters.wake(chatId, rec.seq);
     for (const sub of this.subs.get(chatId) ?? []) {
       try {
         sub.handler(recordToMessage(rec, sub.topic, store.epoch()));
       } catch {
         /* handler is best-effort; never break the loop (DESIGN §6) */
-      }
-    }
-  }
-
-  /**
-   * The ONE shared `getUpdates` long-poll loop (see class doc: one consumer per token).
-   * `offset` = last confirmed `update_id + 1` — Telegram's acknowledgement protocol. Each
-   * connect starts at offset 0, replaying whatever backlog Telegram retained (~24h); the
-   * store's dedup makes that replay harmless and doubles as offline catch-up. Accepts BOTH
-   * `update.message` (groups/DMs) and `update.channel_post` (channels).
-   */
-  private async pollLoop(generation: number, store: ObservedStore, api: BotApi): Promise<void> {
-    let offset = 0;
-    while (this.generation === generation) {
-      let updates: TgUpdate[];
-      const startedAt = Date.now();
-      try {
-        // Budget = the long poll plus 40% slack, at least 2s. Keep a ceiling on it, so that a
-        // connection accepted and never answered (idle NAT drop, hung proxy) cannot park the
-        // single ingestion loop for the lifetime of the process.
-        const budgetMs = this.pollTimeoutS * 1000 + Math.max(2_000, this.pollTimeoutS * 400);
-        const result = await api.call(
-          'GET',
-          `/getUpdates?timeout=${this.pollTimeoutS}&offset=${offset}`,
-          { budgetMs, abortOnDisconnect: true },
-        );
-        if (!Array.isArray(result)) {
-          throw new Error('Telegram GET /getUpdates → result: not an array of updates');
-        }
-        updates = result as TgUpdate[];
-      } catch (err) {
-        if (this.generation !== generation) break;
-        const status = statusOf(err);
-        // A rejected token or a wrong api_url never heals by retrying — surface it and stop,
-        // so that the bridge is a loud failure instead of a silent black hole hammering the API.
-        if (status !== undefined && FATAL_POLL_STATUSES.includes(status)) {
-          this.diagnostics.report(`getUpdates failed fatally, ingestion stopped: ${describe(err)}`);
-          return;
-        }
-        // 409 Conflict = getUpdates is unavailable for this token: either another poller holds
-        // it (Telegram allows exactly one) or a webhook is registered (call deleteWebhook).
-        // Telegram's own description says which — it rides along in the error text.
-        const conflict = status === 409;
-        this.diagnostics.report(`getUpdates failed, retrying: ${describe(err)}`, 'poll-failure');
-        await delay(conflict ? 3000 : 500);
-        continue;
-      }
-      if (this.generation !== generation) break;
-      const ackedBefore = offset;
-      for (const u of updates) {
-        // Acknowledge only an update stating an id in the domain this arithmetic is defined on.
-        // `Math.max(offset, NaN)` is NaN, which is below nothing, so one id-less update from a
-        // non-conforming upstream would poison the offset for the life of the loop and re-serve
-        // the whole backlog forever; an id outside the safe-integer range poisons it the other
-        // way, acknowledging updates that never arrived and going deaf to every later one.
-        if (typeof u?.update_id === 'number' && Number.isSafeInteger(u.update_id)) {
-          offset = Math.max(offset, u.update_id + 1);
-        }
-        const msg = u?.message ?? u?.channel_post;
-        if (msg === undefined) continue; // an update kind we don't carry (edits, reactions, …)
-        const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
-        try {
-          const message = requireMessage(label, msg);
-          this.ingest(store, canonicalChatKey(label, message.chat.id), message);
-        } catch (err) {
-          // Keep the loop alive across a failing store write (ENOSPC/EIO): losing one message is
-          // recoverable, losing the only getUpdates consumer takes live push down for good.
-          this.diagnostics.report(`dropped update ${u.update_id}: ${describe(err)}`, 'ingest');
-        }
-      }
-      // Keep a floor under an iteration that made NO PROGRESS, so that an upstream ignoring
-      // `timeout` OR ignoring `offset` (a proxy, a local Bot API server) cannot turn the single
-      // ingestion path into a request flood against the operator's bot token. Keying this on the
-      // acknowledgement rather than on the answer being empty, so that a batch re-served forever is
-      // throttled too — every record in it dedups, so nothing else would ever make it visible.
-      if (offset === ackedBefore) {
-        const idle = Date.now() - startedAt;
-        if (idle < MIN_IDLE_POLL_MS) await delay(MIN_IDLE_POLL_MS - idle);
       }
     }
   }
@@ -643,100 +378,3 @@ export class TelegramPlugin implements BackendPlugin {
     }
   }
 }
-
-/** The optional fields {@link contentOf} takes the record's body from, in its own precedence order. */
-const BODY_FIELDS = ['text', 'caption'] as const;
-
-/**
- * Telegram payload kinds that carry no `text`/`caption`. An agent handed an empty turn cannot
- * tell "someone sent a photo" from "someone sent nothing", so each becomes an explicit
- * placeholder (see the README seam-mapping table).
- */
-const MEDIA_KINDS = [
-  'photo', 'video', 'animation', 'audio', 'voice', 'video_note', 'document',
-  'sticker', 'location', 'venue', 'contact', 'poll', 'dice', 'game',
-] as const;
-
-/**
- * Every field {@link contentOf} and {@link senderOf} read for a VALUE, checked for its DOMAIN as
- * well as its type where the object arrives rather than where each one is dereferenced.
- *
- * Keep every one of those checks here, so that a non-conforming upstream cannot drive a record the
- * store PERSISTS and reloads: a field that survives to `store.append` is written to the JSONL file,
- * and a `content` that is not a string then throws inside `buildMessage` on every later
- * `fetchRecent` for that chat, across restarts, with no Bot API call that could ever refill the
- * topic.
- */
-function requireMessage(label: string, value: unknown): TgMessage {
-  const msg = value as TgMessage | null;
-  if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
-    throw new Error(`${label}: not a message object`);
-  }
-  if (typeof msg.message_id !== 'number' || !Number.isFinite(msg.message_id)) {
-    throw new Error(`${label}: message carries no numeric message_id`);
-  }
-  const id = (msg.chat as { id?: unknown } | undefined)?.id;
-  if (typeof id !== 'number' && typeof id !== 'string') {
-    throw new Error(`${label}: message carries no chat id`);
-  }
-  if (typeof msg.date !== 'number' || !Number.isFinite(msg.date)) {
-    throw new Error(`${label}: message carries no numeric date`);
-  }
-  if (Number.isNaN(new Date(msg.date * 1000).getTime())) {
-    throw new Error(`${label}: message carries an out-of-range date (${String(msg.date)})`);
-  }
-  const fields = msg as unknown as Record<string, unknown>;
-  for (const field of BODY_FIELDS) {
-    if (fields[field] !== undefined && typeof fields[field] !== 'string') {
-      throw new Error(`${label}: message carries a non-string ${field}`);
-    }
-  }
-  const from = fields.from;
-  if (from !== undefined) {
-    if (from === null || typeof from !== 'object' || Array.isArray(from)) {
-      throw new Error(`${label}: message carries a from that is not a user object`);
-    }
-    const user = from as Record<string, unknown>;
-    if (typeof user.id !== 'number' || !Number.isFinite(user.id)) {
-      throw new Error(`${label}: message carries no numeric from.id`);
-    }
-    if (user.username !== undefined && typeof user.username !== 'string') {
-      throw new Error(`${label}: message carries a non-string from.username`);
-    }
-  }
-  return msg;
-}
-
-/**
- * The message body to record: `text`, else a media `caption` (never dropped), else a
- * `[kind]` placeholder. `undefined` for an update carrying none of these (service messages
- * like joins/leaves) — those are not ingested at all rather than stored as blank lines.
- */
-function contentOf(msg: TgMessage): string | undefined {
-  const fields = msg as unknown as Record<string, unknown>;
-  for (const field of BODY_FIELDS) {
-    const body = fields[field];
-    if (typeof body === 'string') return body;
-  }
-  const kind = MEDIA_KINDS.find((k) => fields[k] !== undefined);
-  return kind === undefined ? undefined : `[${kind}]`;
-}
-
-/**
- * Sender handle for an observed message: `from.username ?? String(from.id)` — usernames are
- * optional on Telegram, the numeric user id is the stable fallback. Channel posts carry no
- * `from` at all; the chat id stands in as the sender.
- */
-function senderOf(msg: TgMessage): string {
-  if (msg.from !== undefined) return msg.from.username ?? String(msg.from.id);
-  return String(msg.chat.id);
-}
-
-/** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see {@link plaintextWarning}. */
-const DEFAULT_API_URL = 'https://api.telegram.org';
-
-/** Statuses that mean the token/URL itself is wrong — retrying can only make it worse. */
-const FATAL_POLL_STATUSES = [401, 403, 404];
-
-/** Floor on how fast {@link TelegramPlugin.pollLoop} may re-poll after an answer that acked nothing. */
-const MIN_IDLE_POLL_MS = 250;

@@ -36,9 +36,8 @@ export class BotApi {
   }
 
   /**
-   * Memoized `getMe` — one network call per connect, shared by concurrent resolvers. Only
-   * `connect` can populate this memo with a rejection, and each connect builds a fresh client,
-   * so a failure never has to be evicted here.
+   * Memoized `getMe` — one network call per connect. Only `connect` can populate this memo with a
+   * rejection, and each connect builds a fresh client, so a failure never has to be evicted here.
    */
   getMe(): Promise<{ id: number; username?: string }> {
     const existing = this.identity;
@@ -55,10 +54,9 @@ export class BotApi {
   }
 
   /**
-   * Single HTTP entry point (`<api_url>/bot<token><path>`) → the envelope's `result`. Transparently
-   * retries on 429 honoring Telegram's `parameters.retry_after` (SECONDS); retries stop the
-   * moment we disconnect. Throws on any other non-2xx as an `HttpStatusError` carrying the
-   * status as a field (the poll loop reads it with `statusOf`).
+   * Single HTTP entry point (`<api_url>/bot<token><path>`) → the envelope's `result`. Retries on
+   * 429 honoring Telegram's `parameters.retry_after` (SECONDS) until {@link stop}; throws any
+   * other non-2xx as an `HttpStatusError` carrying the status the poll loop branches on.
    *
    * `budgetMs` is the ONE wall-clock ceiling on the call, passed to net-util as its deadline
    * rather than armed locally as well: a per-call budget the plugin computes and does not forward

@@ -1,13 +1,8 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { captureStderr, registerCleanup, startFake, storePath } from './rig.js';
+import { captureStderr, packageSource, registerCleanup, startFake, storePath } from './rig.js';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const source = readFileSync(join(here, '..', 'src', 'index.ts'), 'utf8');
-const shippedDefault = /const DEFAULT_API_URL = '([^']+)'/.exec(source)?.[1] ?? '';
+const shippedDefault = /const DEFAULT_API_URL = '([^']+)'/.exec(packageSource())?.[1] ?? '';
 
 /**
  * `api_url` is a documented override (a local Bot API server), and on THIS API the credential rides

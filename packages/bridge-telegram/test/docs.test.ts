@@ -10,6 +10,7 @@ import {
   captureStderr,
   connectTo,
   openRig,
+  packageSource,
   type Rig,
   registerCleanup,
   runCleanups,
@@ -21,7 +22,7 @@ import {
 
 const SENDER = asHandle('me');
 const here = fileURLToPath(new URL('.', import.meta.url));
-const source = readFileSync(join(here, '..', 'src', 'index.ts'), 'utf8');
+const source = packageSource();
 const readme = readFileSync(join(here, '..', 'README.md'), 'utf8');
 const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as {
   description: string;
@@ -260,9 +261,7 @@ describe('telegram chat-cap claims are executed, not just written', () => {
  */
 describe('telegram source imports are all used', () => {
   const modules = readdirSync(join(here, '..', 'src')).filter((f) => f.endsWith('.ts'));
-
-  it.each(modules)('%s imports nothing it does not reference', (file) => {
-    const text = readFileSync(join(here, '..', 'src', file), 'utf8');
+  const specifiersOf = (text: string): string[] => {
     const imported: string[] = [];
     for (const statement of text.matchAll(/^import\s+([\s\S]*?)\s+from\s+'[^']+';$/gm)) {
       const clause = statement[1] as string;
@@ -274,11 +273,21 @@ describe('telegram source imports are all used', () => {
       const bare = /^(\w+)\s*(?:,|$)/.exec(clause)?.[1];
       if (bare !== undefined) imported.push(bare);
     }
-    // Guard the extractor: a pattern that stopped matching would make the check vacuous.
-    expect(imported.length).toBeGreaterThan(0);
+    return imported;
+  };
 
+  it('extracts the import specifiers this lint reads', () => {
+    // Guard the extractor: a pattern that stopped matching would make every case below vacuous.
+    // Asked of the PACKAGE and not of each module, so that a module with no dependencies is not
+    // made to grow one to satisfy a lint that is about UNUSED imports.
+    const all = modules.flatMap((f) => specifiersOf(readFileSync(join(here, '..', 'src', f), 'utf8')));
+    expect(all.length).toBeGreaterThan(0);
+  });
+
+  it.each(modules)('%s imports nothing it does not reference', (file) => {
+    const text = readFileSync(join(here, '..', 'src', file), 'utf8');
     const body = text.replace(/^import\s+[\s\S]*?\s+from\s+'[^']+';$/gm, '');
-    expect(imported.filter((name) => !new RegExp(`\\b${name}\\b`).test(body))).toEqual([]);
+    expect(specifiersOf(text).filter((name) => !new RegExp(`\\b${name}\\b`).test(body))).toEqual([]);
   });
 });
 

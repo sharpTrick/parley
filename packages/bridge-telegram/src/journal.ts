@@ -1,5 +1,41 @@
 import { randomBytes } from 'node:crypto';
-import type { ObservedRecord, StoredRecord } from './store.js';
+
+/**
+ * One observed Telegram message, as persisted to the JSONL store — everything needed to
+ * reconstruct a seam `Message` later.
+ *
+ * Records are indexed by `chat_id`, never by the Parley topic: a topic is a local naming
+ * choice (`chat_map`, an `@channelusername` literal or a numeric literal can all name the
+ * same chat) while the chat id is what Telegram stamps on every inbound update. Keying on
+ * the chat id is what makes ingestion independent of which seam call ran first, and of
+ * whether any topic had been named at all when the message arrived.
+ */
+export interface StoredRecord {
+  /** Telegram chat id (stringified, numeric form) — half of the composite backendMsgId. */
+  chat_id: string;
+  /** Telegram per-chat message_id — the other half of the composite backendMsgId. */
+  message_id: number;
+  /**
+   * Local observation sequence, stamped by `ObservedStore.append` in the order this bridge SAW
+   * the message — the topic cursor. Keep the cursor on observation order rather than on
+   * `message_id`, so that a message minted before our own post but delivered by `getUpdates`
+   * after it still lands above every cursor already handed out.
+   */
+  seq: number;
+  /** Sender handle (`from.username ?? String(from.id)`; see wire.ts). */
+  sender: string;
+  /** Message body. */
+  content: string;
+  /** ISO 8601, informational only — never used for ordering or dedup (DESIGN §5). */
+  ts: string;
+}
+
+/** A message as observed, before the store stamps its observation sequence. */
+export type ObservedRecord = Omit<StoredRecord, 'seq'>;
+
+/** The composite dedup key for a record — mirrors the plugin's backendMsgId. */
+export const keyOf = (rec: Pick<StoredRecord, 'chat_id' | 'message_id'>): string =>
+  `${rec.chat_id}:${rec.message_id}`;
 
 /**
  * Marks the line carrying the store FILE's identity, minted once when it is created. Every `#` line
@@ -65,10 +101,9 @@ export function requireWatermarks(raw: string): [number, number] {
 }
 
 /**
- * A loaded record line, holding every field to the type {@link StoredRecord} declares. A line
- * failing any of them is garbled — the loader's try/catch drops it. Keep it a drop rather than a
- * fresh stamp, so that a damaged line cannot be handed a sequence an agent's cursor already sits
- * above and become permanently unreachable.
+ * A loaded record line, holding every field to the type {@link StoredRecord} declares. Keep a
+ * failing line a DROP rather than a fresh stamp, so that a damaged line cannot be handed a
+ * sequence an agent's cursor already sits above and become permanently unreachable.
  *
  * Keep the field types checked HERE as well as at the seam, so that a file already carrying a
  * record of the wrong shape heals on load instead of bricking its chat: a non-string `content`
