@@ -132,24 +132,21 @@ describe('nats docs conformance', () => {
     return out;
   };
 
-  const serverClaims: { surface: string; text: string; verifiedBy: string }[] = [
+  const serverClaims: { readme?: true; text: string; verifiedBy: string }[] = [
     {
-      surface: 'README.md',
+      readme: true,
       text: 'ephemeral consumer from `opt_start_seq = since+1` (exclusive)',
       verifiedBy: 'a pull sees only its filter_subject, from its opt_start_seq',
     },
     {
-      surface: 'src/index.ts',
       text: '`fetchRecent` = an ephemeral consumer from `opt_start_seq`',
       verifiedBy: 'a pull sees only its filter_subject, from its opt_start_seq',
     },
     {
-      surface: 'src/index.ts',
       text: 'the one shape `last_by_subj` answers with a 404',
       verifiedBy: 'last_by_subj on a subject that never had a message is not found',
     },
     {
-      surface: 'src/index.ts',
       text: 'a pull below `first_seq` starts at the',
       verifiedBy: 'a pull below first_seq starts at the first surviving sequence instead of stalling',
     },
@@ -169,9 +166,11 @@ describe('nats docs conformance', () => {
   });
 
   for (const claim of serverClaims) {
-    it(`the claim "${claim.text}" is in ${claim.surface} and is probed live`, () => {
-      const surface = claimSurfaces.find((s) => s.name === claim.surface);
-      expect(surface?.text).toContain(claim.text);
+    const where = claim.readme === true ? 'README' : 'a documented surface';
+    it(`the claim "${claim.text}" is carried by ${where} and is probed live`, () => {
+      const carriers = claimSurfaces.filter((s) => s.text.includes(claim.text)).map((s) => s.name);
+      if (claim.readme === true) expect(carriers).toContain('README.md');
+      else expect(carriers).not.toEqual([]);
       expect(AGREEMENT_ROWS.map((r) => r.name)).toContain(claim.verifiedBy);
     });
   }
@@ -328,7 +327,7 @@ describe('nats docs conformance', () => {
 
   const declaredKeys = [
     ...(/export interface NatsBackendConfig \{([\s\S]*?)\n\}/
-      .exec(sources.find((f) => f.name === 'index.ts')?.text ?? '')?.[1] ?? '')
+      .exec(sources.map((f) => f.text).join('\n'))?.[1] ?? '')
       .matchAll(/^ {2}([a-z_]+)\??:/gm),
   ].map((m) => m[1] as string);
 

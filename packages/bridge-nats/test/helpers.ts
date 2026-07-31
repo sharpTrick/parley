@@ -1,6 +1,15 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'nats';
+
+const allSource = (): string => {
+  const dir = fileURLToPath(new URL('../src', import.meta.url));
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => readFileSync(join(dir, f), 'utf8'))
+    .join('\n');
+};
 
 export const SERVERS = process.env.PARLEY_NATS_SERVERS ?? '127.0.0.1:4222';
 
@@ -9,8 +18,7 @@ export const SERVERS = process.env.PARLEY_NATS_SERVERS ?? '127.0.0.1:4222';
  * so that a field added later is policed by default instead of by someone remembering to add a row.
  */
 export const declaredConfigKeys = (): string[] => {
-  const source = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8');
-  const body = /export interface NatsBackendConfig \{([\s\S]*?)\n\}/.exec(source)?.[1] ?? '';
+  const body = /export interface NatsBackendConfig \{([\s\S]*?)\n\}/.exec(allSource())?.[1] ?? '';
   return [...body.matchAll(/^ {2}([a-z_]+)\??:/gm)].map((m) => m[1] as string);
 };
 

@@ -97,18 +97,14 @@ export async function closeOnConsumerLoss(iter: ConsumerMessages): Promise<void>
   }
 }
 
+const reports = (err: unknown, code: string, wording: RegExp): boolean =>
+  (err as { code?: unknown }).code === code ||
+  wording.test(err instanceof Error ? err.message : String(err));
+
 /** JetStream's answer when a sequence holds nothing, as opposed to a read that could not be made. */
-export function isMessageMissing(err: unknown): boolean {
-  const code = (err as { code?: unknown }).code;
-  if (code === '404') return true;
-  const msg = err instanceof Error ? err.message : String(err);
-  return /no message found|message not found|404/i.test(msg);
-}
+export const isMessageMissing = (err: unknown): boolean =>
+  reports(err, '404', /no message found|message not found|404/i);
 
 /** A stream that vanished out-of-band: JetStream 404s the manager and 503s the publish. */
-export function isStreamMissing(err: unknown): boolean {
-  const code = (err as { code?: unknown }).code;
-  if (code === '503') return true;
-  const msg = err instanceof Error ? err.message : String(err);
-  return /stream not found|no responders|503/i.test(msg);
-}
+export const isStreamMissing = (err: unknown): boolean =>
+  reports(err, '503', /stream not found|no responders|503/i);

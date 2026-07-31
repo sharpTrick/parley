@@ -2,7 +2,34 @@ import type { BackendConfig } from '@sharptrick/parley-core';
 import { isLoopbackHost } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { credsAuthenticator, nkeyAuthenticator, type ConnectionOptions } from 'nats';
-import type { NatsBackendConfig } from './index.js';
+
+/** Plugin-specific backend_config. */
+export interface NatsBackendConfig {
+  /** Server(s). Default `127.0.0.1:4222`. */
+  servers?: string | string[];
+  /** Subject prefix. Default `parley.`. Each topic → subject `<prefix><token>`. */
+  subject_prefix?: string;
+  /** JetStream stream-name prefix. Default `PARLEY_`. One stream per topic. */
+  stream_prefix?: string;
+  /**
+   * Optional retention window in days, set as the stream's `max_age` at creation time. Omit for
+   * the default — keep every message forever. Applies only when THIS plugin creates the stream
+   * (`ensureStream`'s first caller); changing it later does not retroactively update an
+   * already-existing stream — edit or recreate the stream out-of-band for that.
+   */
+  retention_days?: number;
+  /** Token auth (`-auth`/`authorization.token`). Secret — `backend_config`/`.env` only. */
+  token?: string;
+  /** User/password auth. Secret — `backend_config`/`.env` only. */
+  user?: string;
+  pass?: string;
+  /** Path to a NATS `.creds` file (JWT + nkey seed) — NGS and any JWT-secured cluster. */
+  creds_file?: string;
+  /** Raw nkey seed (`SU…`); prefer `creds_file`. Secret — `backend_config`/`.env` only. */
+  nkey_seed?: string;
+  /** TLS material, as file paths. */
+  tls?: { ca_file?: string; cert_file?: string; key_file?: string };
+}
 
 const RECONNECT_WAIT_MS = 1000;
 const RECONNECT_JITTER_MS = 500;
@@ -166,19 +193,16 @@ export function assertNoServerCredentials(cfg: NatsBackendConfig): void {
   }
 }
 
-/** Which `backend_config` fields would cross the link, named — never their values. */
-const credentialFields = (cfg: NatsBackendConfig): string[] =>
-  (['token', 'user', 'pass', 'creds_file', 'nkey_seed'] as const).filter(
-    (field) => cfg[field] !== undefined,
-  );
-
 /**
  * One warning per `servers` entry that would put a configured credential on an unencrypted remote
  * link. A warning rather than a load error: a cluster fronted by a TLS-terminating sidecar, and a
  * loopback fixture, are both legitimate — but neither is a reason for the mistake to be silent.
+ * The offending fields are named — never their values.
  */
 export function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
-  const fields = credentialFields(cfg);
+  const fields = (['token', 'user', 'pass', 'creds_file', 'nkey_seed'] as const).filter(
+    (field) => cfg[field] !== undefined,
+  );
   if (fields.length === 0 || cfg.tls !== undefined) return [];
   const servers = [cfg.servers ?? DEFAULT_SERVERS].flat();
   return servers.flatMap((server) => {
