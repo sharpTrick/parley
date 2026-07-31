@@ -1,11 +1,11 @@
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Cursor } from '@sharptrick/parley-core';
 import {
   DEFAULT_BACKOFF_MS,
   DEFAULT_DEADLINE_MS,
   MAX_BACKOFF_MS,
 } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 
@@ -130,6 +130,84 @@ describe('bridge-discord README — the gateway-failure prose is the observed be
   it('names the terminal close codes the plugin actually treats as terminal', () => {
     expect(SUBSCRIBE_ROW).toContain('4004/4010–4014');
   });
+});
+
+// CLASS: a budget knob that silently bounds something the prose describes as unbounded. The
+// seam-mapping row promised the window "is never silently truncated to 100" while `block_ms` — a
+// model-chosen number, clamped from above and never floored — is the WHOLE call's budget, page walk
+// included. A short page and "the topic has nothing older" are indistinguishable to the caller, so
+// the claim and the clock have to be pinned together: the prose is asserted here AND driven.
+describe('bridge-discord README — block_ms bounds the page walk, and says so', () => {
+  // The ROW, not the section: the section also contains the long-poll paragraph below, so slicing
+  // to it would let one sentence satisfy both of the prose cells.
+  const NO_SINCE_ROW = README.slice(
+    README.indexOf('| `fetchRecent` (no `since`)'),
+    README.indexOf('| absent topic'),
+  );
+  const LONG_POLL = README.slice(
+    README.indexOf('**`fetch_recent` long-poll'),
+    README.indexOf('## Config'),
+  );
+  const COUPLING = /`block_ms` bounds the whole call, the page walk included/;
+
+  const SEEDED = 250;
+  const PAGE = 100;
+  const topic = asTopic('740000000000000021');
+
+  let fake: FakeDiscord;
+  let plugin: DiscordPlugin;
+
+  beforeAll(async () => {
+    fake = await startFakeDiscord();
+    fake.createChannel(topic as string);
+    plugin = new DiscordPlugin();
+    await plugin.connect({ token: 'fake-token', api_url: fake.apiUrl, gateway_url: fake.gatewayUrl });
+    for (let i = 0; i < SEEDED; i++) await plugin.post(topic, asHandle('writer'), `m${i}`);
+  }, 60_000);
+  afterAll(async () => {
+    await plugin.disconnect();
+    await fake.close();
+  });
+
+  it('states the coupling on the seam-mapping row that used to deny it', () => {
+    expect(NO_SINCE_ROW).toMatch(COUPLING);
+  });
+
+  it('states the coupling where block_ms is introduced', () => {
+    expect(LONG_POLL).toMatch(COUPLING);
+  });
+
+  it('no longer promises the window is never truncated', () => {
+    expect(README).not.toMatch(/never silently truncated/);
+  });
+
+  /** What the README's prose says to expect: the full window, or the one page the budget bought. */
+  const BUDGETS: Array<[string, number | undefined, (limit: number) => number]> = [
+    ['no block_ms at all', undefined, (limit) => Math.min(limit, SEEDED)],
+    ['a block_ms sized for the walk', 60_000, (limit) => Math.min(limit, SEEDED)],
+    ['a block_ms of 1', 1, (limit) => Math.min(limit, PAGE)],
+  ];
+  const LIMITS = [PAGE, SEEDED];
+  const POSITIONS: Array<[string, Cursor | undefined]> = [
+    ['no since', undefined],
+    ['since', asCursor('0')],
+  ];
+
+  for (const [position, since] of POSITIONS) {
+    for (const limit of LIMITS) {
+      for (const [budgetLabel, blockMs, expected] of BUDGETS) {
+        it(`${position}, limit ${limit}, ${budgetLabel} → ${expected(limit)} messages`, async () => {
+          const { messages } = await plugin.fetchRecent({
+            topic,
+            limit,
+            ...(since !== undefined ? { since } : {}),
+            ...(blockMs !== undefined ? { blockMs } : {}),
+          });
+          expect(messages).toHaveLength(expected(limit));
+        });
+      }
+    }
+  }
 });
 
 describe('bridge-discord 429 behaviour matches what the README promises', () => {

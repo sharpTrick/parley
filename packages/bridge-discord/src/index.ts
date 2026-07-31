@@ -390,7 +390,13 @@ export class DiscordPlugin implements BackendPlugin {
           opts?.inReplyTo !== undefined ? { message_id: opts.inReplyTo } : undefined,
       },
     });
-    const json = (await res.json()) as DiscordMessage;
+    const json: unknown = await res.json();
+    if (!hasUsableId(json)) {
+      throw new Error(
+        'Discord POST /channels/<id>/messages answered 200 with no usable message id; the post ' +
+          'may or may not have landed, and there is no backendMsgId to dedup or reply to',
+      );
+    }
     return asBackendMsgId(json.id);
   }
 
@@ -535,6 +541,8 @@ export class DiscordPlugin implements BackendPlugin {
    * {@link NoSuchTopicError} to "topic not present yet" (an empty roster for `parley_list_users`),
    * while every other non-2xx — including a 404 that is not Unknown Channel, and `50001 Missing
    * Access`, which means the channel exists but this bot is misconfigured — stays a real failure.
+   * A 200 whose shape is not a page of id-carrying records is a real failure too ({@link
+   * pageRecords}), symmetrically with the gateway path's {@link dispatchedMessage}.
    */
   private async getMessages(
     topic: Topic,
@@ -548,7 +556,7 @@ export class DiscordPlugin implements BackendPlugin {
       if (errorCode(raw) === UNKNOWN_CHANNEL) throw new NoSuchTopicError(topic as string);
       throw new Error(`Discord GET ${path} → 404: ${sanitizeBody(raw)}`);
     }
-    return (await res.json()) as DiscordMessage[];
+    return pageRecords(path, await res.json());
   }
 
   /**
@@ -798,7 +806,7 @@ export class DiscordPlugin implements BackendPlugin {
   private async openGateway(): Promise<void> {
     const epoch = this.sessionEpoch;
     try {
-      await this.dial();
+      await this.dial(epoch);
     } catch (err) {
       if (err instanceof TerminalGatewayCloseError) this.chargeDialAttempt();
       else this.scheduleReconnect(epoch);
@@ -810,9 +818,9 @@ export class DiscordPlugin implements BackendPlugin {
    * Resolve the gateway wss URL (config override for tests/fakes; else `GET /gateway/bot`) and open
    * the socket. Re-resolved per attempt: Discord does not promise the url survives an outage.
    */
-  private async dial(): Promise<void> {
+  private async dial(epoch: number): Promise<void> {
     const base = this.gatewayUrlOverride ?? (await this.resolveGatewayUrl());
-    await this.openSocket(gatewayDialUrl(base));
+    await this.openSocket(gatewayDialUrl(base), epoch);
   }
 
   private async resolveGatewayUrl(): Promise<string> {
@@ -832,9 +840,17 @@ export class DiscordPlugin implements BackendPlugin {
    * path is best-effort and cursor catch-up (`fetchRecent` since the last persisted cursor)
    * reconciles anything missed (DESIGN §6).
    */
-  private openSocket(url: string): Promise<void> {
+  private openSocket(url: string, epoch: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const epoch = this.sessionEpoch;
+      // Keep this immediately before the socket exists, so that ANY await the dial path runs first
+      // — today the `GET /gateway/bot` lookup — cannot land a socket in a session that is already
+      // gone: teardown ran before this socket existed, so nothing it releases can reach it, and it
+      // would spend an IDENTIFY against the 1000/24h quota, install itself as `this.ws`, and arm a
+      // heartbeat interval no later teardown will ever clear. `disconnect()` leaves the epoch alone
+      // and `connect()` leaves `stopped` false, so both halves are load-bearing.
+      if (this.stopped || epoch !== this.sessionEpoch) {
+        throw new Error('Discord gateway dial abandoned: its session was retired mid-dial');
+      }
       const ws = new WebSocket(url);
       this.ws = ws;
       let ready = false;
@@ -1042,7 +1058,7 @@ export class DiscordPlugin implements BackendPlugin {
       // Dial through the memo every other caller awaits, so that a re-entrant caller (core's 250 ms
       // long-poll fallback) cannot open a second socket alongside this one and double the IDENTIFY
       // rate the ladder is pacing.
-      const attempt = this.dial().catch((err: unknown) => {
+      const attempt = this.dial(epoch).catch((err: unknown) => {
         if (epoch === this.sessionEpoch) this.gatewayReady = undefined;
         if (!(err instanceof TerminalGatewayCloseError)) this.scheduleReconnect(epoch);
         throw err;
@@ -1180,16 +1196,46 @@ function heartbeatIntervalOf(d: unknown): number | undefined {
 }
 
 /**
- * A MESSAGE_CREATE payload, or undefined when it carries no usable routing key or id. `id` becomes
- * both `backendMsgId` and `cursor`, so a frame without one would cross the seam carrying `undefined`
- * into core's dedup set and into the cursor it persists for the topic.
+ * True when a provider record carries an id this plugin can put across the seam. `id` becomes BOTH
+ * `backendMsgId` (core's dedup key) and `cursor` (the order key), so a record without one crosses as
+ * `undefined` in both — every such message collapsing onto one dedup key and pinning the topic's
+ * persisted position. An EMPTY string is refused for the same reason: it is one shared dedup key,
+ * and a cursor ordered before every real snowflake.
+ */
+function hasUsableId(record: unknown): record is { id: string } {
+  if (typeof record !== 'object' || record === null) return false;
+  const { id } = record as { id?: unknown };
+  return typeof id === 'string' && id !== '';
+}
+
+/**
+ * The message records of a `GET .../messages` 200. REFUSE the whole page rather than filtering it,
+ * so that a page whose newest record is usable and whose older one is not cannot advance the cursor
+ * PAST the record it dropped — core resumes strictly after that cursor, so the gap is one it can
+ * never come back for.
+ */
+function pageRecords(path: string, body: unknown): DiscordMessage[] {
+  if (!Array.isArray(body)) {
+    throw new Error(`Discord GET ${path} answered ${shapeOf(body)}, not a page of messages`);
+  }
+  const unusable = body.filter((record) => !hasUsableId(record)).length;
+  if (unusable > 0) {
+    throw new Error(
+      `Discord GET ${path} answered ${body.length} record(s), ${unusable} of them carrying no ` +
+        'usable message id (the seam needs it as both the dedup key and the cursor)',
+    );
+  }
+  return body as DiscordMessage[];
+}
+
+/**
+ * A MESSAGE_CREATE payload, or undefined when it carries no usable routing key or id — see
+ * {@link hasUsableId}.
  */
 function dispatchedMessage(d: unknown): DiscordMessage | undefined {
-  if (typeof d !== 'object' || d === null) return undefined;
-  const { channel_id: channel, id } = d as { channel_id?: unknown; id?: unknown };
-  return typeof channel === 'string' && typeof id === 'string'
-    ? (d as unknown as DiscordMessage)
-    : undefined;
+  if (!hasUsableId(d)) return undefined;
+  const { channel_id: channel } = d as { channel_id?: unknown };
+  return typeof channel === 'string' && channel !== '' ? (d as unknown as DiscordMessage) : undefined;
 }
 
 /** Discord's numeric error code from a JSON error body, or undefined when the body is not one. */

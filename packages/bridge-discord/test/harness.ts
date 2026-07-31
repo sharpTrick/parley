@@ -72,6 +72,17 @@ export interface GatewayUrlFault {
   transport?: boolean;
 }
 
+/**
+ * WHERE the gateway url comes from. A configured `gateway_url` is the fixture default across this
+ * package, and it skips `GET /gateway/bot` — i.e. it skips the await the PRODUCTION dial runs
+ * between "this session is alive" and "a socket exists". Keep the axis here rather than per table,
+ * so that a suite about session lifetime can cross it without restating the connect dance.
+ */
+export const URL_SOURCES = [
+  { label: 'a configured gateway_url', configured: true },
+  { label: 'a url resolved per attempt', configured: false },
+] as const;
+
 export interface FetchStub {
   /** The page every `GET …/messages` answers, newest-first as Discord returns it. */
   page: unknown[];
@@ -83,9 +94,14 @@ export interface FetchStub {
   count(pathIncludes?: string): number;
   /** Park the NEXT `…/messages` query until {@link release}, to pin a phase of the long-poll. */
   holdNextPage(): void;
-  /** Queries parked by {@link holdNextPage} and not yet released. */
+  /**
+   * Park the NEXT `GET /gateway/bot` until {@link release}, to pin a dial between resolving its url
+   * and opening its socket — the window a configured `gateway_url` does not have.
+   */
+  holdNextGatewayUrl(): void;
+  /** Requests parked by {@link holdNextPage} or {@link holdNextGatewayUrl}, not yet released. */
   parked(): number;
-  /** Answer every parked query with the page it read at REQUEST time. */
+  /** Answer every parked request with the body it read at REQUEST time. */
   release(): void;
 }
 
@@ -106,6 +122,7 @@ export function stubFetch(): FetchStub {
   const seen: string[] = [];
   const parked: Array<() => void> = [];
   let holdNext = false;
+  let holdNextLookup = false;
 
   const stub: FetchStub = {
     page: [],
@@ -118,11 +135,17 @@ export function stubFetch(): FetchStub {
     holdNextPage: () => {
       holdNext = true;
     },
+    holdNextGatewayUrl: () => {
+      holdNextLookup = true;
+    },
     parked: () => parked.length,
     release: () => {
       for (const answer of parked.splice(0)) answer();
     },
   };
+
+  const park = (answer: Response): Promise<Response> =>
+    new Promise<Response>((resolve) => parked.push(() => resolve(answer)));
 
   vi.stubGlobal('fetch', (input: unknown, init?: { method?: string }) => {
     const url = String(input);
@@ -130,7 +153,12 @@ export function stubFetch(): FetchStub {
 
     if (url.includes('/gateway/bot')) {
       const fault = stub.gatewayFault;
-      if (fault === undefined) return Promise.resolve(jsonResponse(200, { url: stub.gatewayUrl }));
+      if (fault === undefined) {
+        const answer = jsonResponse(200, { url: stub.gatewayUrl });
+        if (!holdNextLookup) return Promise.resolve(answer);
+        holdNextLookup = false;
+        return park(answer);
+      }
       if (fault.transport === true) {
         return Promise.reject(new Error('connect ECONNREFUSED 127.0.0.1:443'));
       }
@@ -147,7 +175,7 @@ export function stubFetch(): FetchStub {
       const answer = jsonResponse(200, stub.page);
       if (!holdNext) return Promise.resolve(answer);
       holdNext = false;
-      return new Promise<Response>((resolve) => parked.push(() => resolve(answer)));
+      return park(answer);
     }
 
     return Promise.resolve(jsonResponse(200, { id: '1', type: 0 }));

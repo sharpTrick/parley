@@ -28,6 +28,7 @@ import {
   openedSocket,
   reachReady,
   stubFetch,
+  URL_SOURCES,
   type FetchStub,
 } from './harness.js';
 import { dialCeiling, dialPump } from './ladder.js';
@@ -533,11 +534,6 @@ describe('Discord gateway recovery, whenever the failure lands', () => {
       headers: { 'retry-after': '60' },
     }),
     resolveFailure('a transport error on GET /gateway/bot', { transport: true }),
-  ];
-
-  const URL_SOURCES = [
-    { label: 'a configured gateway_url', configured: true },
-    { label: 'a url resolved per attempt', configured: false },
   ];
 
   let rest: FetchStub;

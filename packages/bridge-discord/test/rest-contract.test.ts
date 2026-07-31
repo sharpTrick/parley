@@ -7,6 +7,7 @@ import {
   SeenSet,
   startPushLoop,
   type BackendPlugin,
+  type Cursor,
   type Topic,
 } from '@sharptrick/parley-core';
 import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY, sanitizeBody } from '@sharptrick/parley-net-util';
@@ -294,6 +295,160 @@ describe('Discord REST contract', () => {
           await p.disconnect();
           diag.mockRestore();
         }
+      });
+    }
+  });
+
+  describe('a malformed 200 from the provider', () => {
+    // CLASS: an untrusted provider SUCCESS body. The hostile-body table above covers ERROR bodies
+    // only, and a 200 is the one answer nothing re-checked. `id` becomes BOTH `backendMsgId` (core's
+    // dedup key) and `cursor` (the order key), so a record without a usable one crosses the seam as
+    // `undefined` in both: every such message collapses onto ONE dedup key, and on the no-`since`
+    // path the empty-window fallback then mints '0' WITH messages present — a cursor that regresses
+    // the topic to the beginning of history on every restart. The gateway path guards exactly this
+    // (`dispatchedMessage`); the REST path is the same seam boundary and gets the same table.
+    //
+    // Asserted as INVARIANTS rather than literals — refuse the page, or return only records that can
+    // carry a dedup key and a cursor — so the table still holds if the refusal ever becomes a filter.
+    const record = (id: unknown, content: string, channelId: string): Record<string, unknown> => ({
+      ...(id === undefined ? {} : { id }),
+      channel_id: channelId,
+      content,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      author: { id: '5', username: 'human' },
+    });
+
+    const BAD_IDS: Array<[string, unknown]> = [
+      ['no id at all', undefined],
+      ['a null id', null],
+      ['a numeric id', 123],
+      ['an empty-string id', ''],
+      ['an array id', ['1']],
+    ];
+
+    /** A well-formed newer record ahead of the bad one: Discord answers a page NEWEST-FIRST. */
+    const NEWER_ID = '300000000000000002';
+
+    const BODIES: Array<[string, (channelId: string) => unknown]> = [
+      ...BAD_IDS.map(
+        ([label, id]): [string, (channelId: string) => unknown] => [
+          `a page whose only record has ${label}`,
+          (channelId) => [record(id, 'hi', channelId)],
+        ],
+      ),
+      // The record the walk would SKIP: dropping it silently advances the cursor past a message
+      // core resumes strictly after, so the gap is one it can never come back for.
+      ...BAD_IDS.map(
+        ([label, id]): [string, (channelId: string) => unknown] => [
+          `a page whose OLDER record has ${label}`,
+          (channelId) => [record(NEWER_ID, 'newer', channelId), record(id, 'older', channelId)],
+        ],
+      ),
+      ['a page that is an object, not an array', () => ({ messages: [] })],
+      ['a page that is a bare string', () => 'not a page'],
+      ['a page that is null', () => null],
+    ];
+
+    const SINCE = asCursor('1');
+
+    const READS: Array<[string, Cursor | undefined, (p: DiscordPlugin, t: Topic) => Promise<unknown>]> =
+      [
+        ['fetchRecent (no since)', undefined, (p, t) => p.fetchRecent({ topic: t, limit: 250 })],
+        ['fetchRecent (since)', SINCE, (p, t) => p.fetchRecent({ topic: t, since: SINCE, limit: 250 })],
+        [
+          'fetchRecent (blocking)',
+          SINCE,
+          (p, t) => p.fetchRecent({ topic: t, since: SINCE, limit: 250, blockMs: BLOCK_MS }),
+        ],
+      ];
+
+    const expectSeamSafe = (result: unknown, since: Cursor | undefined): void => {
+      const { messages, nextCursor } = result as {
+        messages: Array<{ backendMsgId: string; cursor: string }>;
+        nextCursor: string;
+      };
+      for (const m of messages) {
+        expect(typeof m.backendMsgId, 'a message crossed the seam with no dedup key').toBe('string');
+        expect(m.backendMsgId).not.toBe('');
+        expect(typeof m.cursor, 'a message crossed the seam with no cursor').toBe('string');
+        expect(m.cursor).not.toBe('');
+      }
+      expect(typeof nextCursor).toBe('string');
+      // A minted '0' alongside returned messages is a cursor REGRESSION, not an empty window.
+      if (messages.length > 0) expect(nextCursor).toBe(messages.at(-1)!.cursor);
+      if (since !== undefined) {
+        expect(BigInt(nextCursor), 'nextCursor is ordered before the since it was given')
+          .toBeGreaterThanOrEqual(BigInt(since as string));
+      }
+    };
+
+    for (const [bodyLabel, build] of BODIES) {
+      for (const [readLabel, since, run] of READS) {
+        it(`${readLabel} on ${bodyLabel} keeps the seam's keys usable`, async () => {
+          const t = liveTopic();
+          fake.injectFault({
+            status: 200,
+            body: build(t as string),
+            path: `/channels/${t as string}/messages`,
+            times: 4,
+          });
+          const outcome = await run(plugin, t).then(
+            (value) => ({ value }),
+            (err: unknown) => ({ err }),
+          );
+          if ('err' in outcome) {
+            // Refusing is the other legal answer — but it must be a real failure, not the seam's
+            // absent-topic classification, which core reads as "this topic does not exist yet",
+            // and it must name the call: the message becomes an `isError` tool result in a model's
+            // context, where a bare `body.filter is not a function` is unactionable.
+            expect(outcome.err).toBeInstanceOf(Error);
+            expect(outcome.err).not.toBeInstanceOf(NoSuchTopicError);
+            expect(String(outcome.err)).toContain('Discord');
+            return;
+          }
+          expectSeamSafe(outcome.value, since);
+        });
+      }
+    }
+
+    // A CONTROL: the same table's machinery on a WELL-FORMED page must still deliver, so no cell
+    // above can pass by a plugin that refuses every 200 it is handed.
+    it('a well-formed page still crosses the seam', async () => {
+      const t = liveTopic();
+      fake.injectFault({
+        status: 200,
+        body: [record(NEWER_ID, 'newer', t as string)],
+        path: `/channels/${t as string}/messages`,
+        times: 4,
+      });
+      const result = await plugin.fetchRecent({ topic: t, since: SINCE, limit: 250 });
+      expect(result.messages.map((m) => m.content)).toEqual(['newer']);
+      expectSeamSafe(result, SINCE);
+    });
+
+    const BAD_POST_BODIES: Array<[string, unknown]> = [
+      ['no id at all', {}],
+      ['a null id', { id: null }],
+      ['a numeric id', { id: 123 }],
+      ['an empty-string id', { id: '' }],
+      ['a body that is an array', []],
+      ['a body that is null', null],
+    ];
+
+    for (const [label, body] of BAD_POST_BODIES) {
+      it(`post rejects a 200 with ${label} rather than resolving one`, async () => {
+        const t = liveTopic();
+        fake.injectFault({ status: 200, body, path: `/channels/${t as string}/messages` });
+        const outcome = await plugin
+          .post(t, SENDER, 'hi')
+          .then((value) => ({ value }), (err: unknown) => ({ err }));
+        if ('err' in outcome) {
+          expect(outcome.err).toBeInstanceOf(Error);
+          return;
+        }
+        // A BackendMsgId that is not a usable string is what core dedups and replies on.
+        expect(typeof outcome.value, 'post resolved a BackendMsgId core cannot use').toBe('string');
+        expect(outcome.value as string).not.toBe('');
       });
     }
   });

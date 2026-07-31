@@ -17,7 +17,14 @@ import {
   state,
   totalIdentifies,
 } from './fake-gateway.js';
-import { dialedBase, HUGE_HB, NO_HANDSHAKE_TIMEOUT, reachReady, stubFetch } from './harness.js';
+import {
+  dialedBase,
+  HUGE_HB,
+  NO_HANDSHAKE_TIMEOUT,
+  reachReady,
+  stubFetch,
+  type FetchStub,
+} from './harness.js';
 import { dialCeiling, ladderDelays } from './ladder.js';
 
 const HOUR_MS = 3_600_000;
@@ -325,10 +332,14 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
   const OLD_URL = 'ws://old';
   const NEW_URL = 'ws://new';
   const LATE_TOPIC = asTopic('880002');
+  /** Comfortably past the ladder's first rung (1s) plus its full jitter spread (1s). */
+  const LADDER_STEP_MS = 2100;
+
+  let rest: FetchStub;
 
   beforeEach(() => {
     resetGateway();
-    stubFetch();
+    rest = stubFetch();
     vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     vi.useFakeTimers();
   });
@@ -466,6 +477,107 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
           expect(vi.getTimerCount()).toBe(0); // no interval, watchdog or reconnect outlives teardown
         });
       }
+    }
+  }
+
+  // Every cell ABOVE pins `gateway_url`, which skips `GET /gateway/bot` — and with it the await the
+  // PRODUCTION dial runs between "this session is alive" and "a socket exists". Nothing in this
+  // package reached that window, so a dial released after its session was torn down could open a
+  // real gateway session, spend an IDENTIFY against the 1000/24h per-token quota, install itself as
+  // the plugin's socket and register a heartbeat interval no teardown would ever clear — with the
+  // suite fully green. This table is that window.
+  //
+  // Crossed with WHICH CALL SITE started the dial, because the first dial and the reconnect ladder
+  // reach it independently, and with WHAT ENDED the session, because `disconnect()` leaves the epoch
+  // alone while `connect()` leaves `stopped` false — a guard that reads only one of the two passes
+  // exactly half of this table. The url source cannot vary here: a configured `gateway_url` has no
+  // lookup to park, which is precisely the blind spot.
+  const PARKED_DIALS: Array<{ label: string; park: (plugin: DiscordPlugin) => Promise<void> }> = [
+    {
+      label: 'the first dial',
+      park: async (plugin) => {
+        rest.holdNextGatewayUrl();
+        void plugin.subscribe(TOPIC, () => undefined).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(5);
+      },
+    },
+    {
+      label: 'a reconnect-ladder dial',
+      park: async (plugin) => {
+        const ws0 = await reachReady(plugin, TOPIC);
+        rest.holdNextGatewayUrl();
+        ws0.serverClose(1006);
+        await vi.advanceTimersByTimeAsync(LADDER_STEP_MS);
+      },
+    },
+  ];
+
+  const RETIREMENTS: Array<{
+    label: string;
+    retire: (p: DiscordPlugin) => Promise<void>;
+    reopened: boolean;
+  }> = [
+    { label: 'disconnect()', retire: (p) => p.disconnect(), reopened: false },
+    {
+      label: 'disconnect() then connect()',
+      retire: async (p) => {
+        await p.disconnect();
+        await openTo(p, NEW_URL);
+      },
+      reopened: true,
+    },
+    { label: 'connect() alone', retire: (p) => openTo(p, NEW_URL), reopened: true },
+  ];
+
+  for (const dial of PARKED_DIALS) {
+    for (const retirement of RETIREMENTS) {
+      it(`${dial.label}, parked in GET /gateway/bot, cannot outlive ${retirement.label}`, async () => {
+        rest.gatewayUrl = OLD_URL;
+        const plugin = new DiscordPlugin();
+        await plugin.connect({ token: 't', handshake_timeout_ms: HANDSHAKE_MS });
+        await dial.park(plugin);
+        expect(rest.parked(), 'no dial is parked, so this cell measures nothing').toBe(1);
+
+        const socketsAtRetire = instances.length;
+        const identifiesAtRetire = totalIdentifies();
+        const lookupsAtRetire = rest.count('/gateway/bot');
+        await retirement.retire(plugin);
+
+        rest.release();
+        await vi.advanceTimersByTimeAsync(300_000);
+
+        expect(
+          instances.length,
+          'the retired session opened a gateway socket after its teardown',
+        ).toBe(socketsAtRetire);
+        expect(
+          rest.count('/gateway/bot') - lookupsAtRetire,
+          'the retired session kept resolving gateway urls after its teardown',
+        ).toBe(0);
+        expect(
+          totalIdentifies(),
+          'the retired session spent an IDENTIFY after its teardown',
+        ).toBe(identifiesAtRetire);
+        expect(
+          openSockets().filter((ws) => dialedBase(ws.url) === OLD_URL),
+          'a socket from the retired session is still open',
+        ).toHaveLength(0);
+
+        // Usable, not merely un-dialed: a guard that refused every later dial would satisfy the
+        // counts above and leave the NEXT session with no live push at all.
+        if (retirement.reopened) {
+          const sink: string[] = [];
+          const ws1 = await subscribed(plugin, LATE_TOPIC, sink);
+          expect(dialedBase(ws1.url)).toBe(NEW_URL);
+          ws1.serverSend(messageCreate(LATE_TOPIC, 'to-the-live-session'));
+          expect(sink).toEqual(['to-the-live-session']);
+        }
+
+        await plugin.disconnect();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(openSockets()).toHaveLength(0);
+        expect(vi.getTimerCount(), 'a timer outlived teardown').toBe(0);
+      });
     }
   }
 

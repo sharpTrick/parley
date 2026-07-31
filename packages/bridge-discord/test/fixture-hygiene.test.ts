@@ -12,7 +12,16 @@ import { describe, expect, it } from 'vitest';
 const TEST_DIR = fileURLToPath(new URL('./', import.meta.url));
 
 /** Declaring one of these locally means a copy of the shared harness, not a new fixture. */
-const OWNED_BY_HARNESS = ['reachReady', 'stubFetch', 'HUGE_HB', 'NO_HANDSHAKE_TIMEOUT'];
+const OWNED_BY_HARNESS = [
+  'reachReady',
+  'stubFetch',
+  'HUGE_HB',
+  'NO_HANDSHAKE_TIMEOUT',
+  // The url source is a FIXTURE AXIS, not a per-table choice: pinning `gateway_url` skips the
+  // production dial's `GET /gateway/bot` await, and a table that pins it silently cannot reach
+  // anything that happens across that await.
+  'URL_SOURCES',
+];
 
 const declaration = (name: string): RegExp =>
   new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var|function|async function)\\s+${name}\\b`, 'm');
