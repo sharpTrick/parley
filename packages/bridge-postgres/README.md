@@ -51,14 +51,15 @@ backend_config:
 ```
 
 `table_name` is capped at 52 bytes because every other relation is derived from it by suffixing
-(`<table_name>_senders`, `_topic_seq`, `_ts`, `_notify`, `_notify_trg`) and PostgreSQL truncates
+(`<table_name>_senders`, `_topic_seq`, `_created_at`, `_notify`, `_notify_trg`) and PostgreSQL truncates
 identifiers at 63 bytes — a longer stem would silently make two of those the same relation. The
 name is lower-cased and double-quoted everywhere it reaches SQL, so a reserved word (`user`,
 `order`, `table`) is a working table name rather than a bare PostgreSQL parse error. Every
 `table_name` rejection is formatted like the other knobs': `parley-postgres: invalid
 backend_config.table_name — …`.
 
-`retention_days` (greater than `0` and at most `18250`, about 50 years) deletes rows older than
+`retention_days` (at least 1 minute — `1/1440` of a day — and at most `18250`, about 50 years)
+deletes rows older than
 the window on connect and hourly thereafter, in batches of 5000 rows per statement: the first prune after
 enabling retention on a large table is many short transactions rather than one whose WAL volume,
 and whose vacuum-blocking snapshot, grow with the whole backlog. It does not hold `post()` up
@@ -67,13 +68,24 @@ never reused, so a cursor minted before a prune stays valid: a stale reader just
 back, never a wrong or duplicate one. The sender registry is not pruned — it is bounded by the
 number of distinct handles, not by message volume.
 
+**Which rows go is decided by the database, not by any bridge's clock.** Every row carries a
+`created_at TIMESTAMPTZ` the server stamps at insert, and the cutoff is subtracted from the
+server's own `now()`, so the answer is the same whichever process prunes and whatever its host
+clock says. The `ts` column is the poster's wall clock and is informational only — a bridge running
+ten days slow does not lose the messages it just wrote, and one running ten days fast does not
+accumulate rows retention can never remove. A table bootstrapped by an older version gains the
+column on the next `connect()`; rows already in it are stamped at that moment, so the first window
+after the upgrade keeps them slightly longer rather than removing them early.
+
 `connect()` rejects if the plugin is already connected: call `disconnect()` first. A second
 `connect()` would otherwise strand the previous pool and prune timer with no way to reclaim them.
 
 Every key is validated before the pool is opened, and `connect()` rejects — naming the key — on an
 unrecognised key (a typo would otherwise silently disable the feature), a `pool_size` that is not
-an integer in `1..1000`, or a `retention_days` that is not a finite number in `(0, 18250]`. Both
-ends of that range are refused rather than clamped: `0` or a negative window keeps nothing, and a
+an integer in `1..1000`, or a `retention_days` that is not a finite number in `[1/1440, 18250]`.
+Both ends of that range are refused rather than clamped: a window shorter than a minute — `0`, a
+negative, `1e-9`, or a unit slip that meant milliseconds — empties the entire shared table on the
+prune `connect()` runs immediately, and a
 window past 18250 days puts the cutoff before any message this backend could have written, which
 would leave pruning silently never running while this page says rows are removed hourly.
 
@@ -118,6 +130,13 @@ A cursor from this backend is a decimal `seq` — the `BIGSERIAL` primary key re
 `parley-postgres: invalid cursor …` error naming the value, before any SQL is issued: a cursor
 minted by a different backend, or invented by an agent, is a bad request rather than a query, and
 the caller gets a message it can act on instead of a PostgreSQL one.
+
+A `topic`, `content`, handle or `in_reply_to` carrying a NUL byte (`U+0000`) is refused the same
+way, before any SQL is issued: `parley-postgres: invalid content — a NUL byte (U+0000) at index
+5 …`. A NUL is a legal JSON string character, so an agent can send one, and PostgreSQL's `TEXT`
+cannot hold it; left to the server, the caller would get `invalid byte sequence for encoding
+"UTF8": 0x00`, which names neither this plugin, nor the field, nor the fact that nothing was
+written.
 
 ## Run Postgres
 

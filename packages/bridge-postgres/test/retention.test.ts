@@ -1,7 +1,14 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { PostgresPlugin, PRUNE_BATCH } from '../src/index.js';
+import { MIN_RETENTION_DAYS, PostgresPlugin, PRUNE_BATCH } from '../src/index.js';
 import { dropTable, isUp, PG_URL, rand, sleep, withAdmin } from './pg-harness.js';
+
+/** Push every stored row outside the window, where only the store's own clock can be asked. */
+async function ageEveryRow(table: string): Promise<void> {
+  await withAdmin(async (admin) => {
+    await admin.query(`UPDATE "${table}" SET created_at = now() - interval '2 days'`);
+  });
+}
 
 // Postgres creates and wholly owns its message table, so DESIGN §11 puts the retention knob on it
 // alongside sqlite/redis/nats. A config key that a sibling backend honours must never be silently
@@ -10,7 +17,7 @@ import { dropTable, isUp, PG_URL, rand, sleep, withAdmin } from './pg-harness.js
 if (await isUp(PG_URL)) {
   describe('retention_days (DESIGN §11)', () => {
     it.each([
-      ['prunes older rows when set to a real window', 1 / 86_400_000, 0],
+      ['prunes older rows when set to a real window', MIN_RETENTION_DAYS, 0],
       ['keeps every row when omitted', undefined, 3],
     ])('%s', async (_label, retentionDays, expectedSurvivors) => {
       const table = `parley_ret_${rand()}`;
@@ -22,6 +29,7 @@ if (await isUp(PG_URL)) {
       } finally {
         await seeder.disconnect();
       }
+      await ageEveryRow(table);
 
       const plugin = new PostgresPlugin();
       await plugin.connect(
@@ -60,14 +68,15 @@ if (await isUp(PG_URL)) {
 
       await withAdmin(async (admin) => {
         await admin.query(
-          `INSERT INTO "${table}" (topic, sender, content, ts, in_reply_to)
-           SELECT $1, 'u', 'm' || g, $2, NULL FROM generate_series(1, $3::int) g`,
+          `INSERT INTO "${table}" (topic, sender, content, ts, created_at, in_reply_to)
+           SELECT $1, 'u', 'm' || g, $2, now() - interval '2 days', NULL
+           FROM generate_series(1, $3::int) g`,
           [topic, new Date(Date.now() - 86_400_000).toISOString(), backlog],
         );
       });
 
       const plugin = new PostgresPlugin();
-      await plugin.connect({ url: PG_URL, table_name: table, retention_days: 1 / 86_400_000 });
+      await plugin.connect({ url: PG_URL, table_name: table, retention_days: 1 });
       try {
         const deadline = Date.now() + 20000;
         let left = 1;
@@ -110,8 +119,9 @@ if (await isUp(PG_URL)) {
       await seeder.disconnect();
       await withAdmin(async (admin) => {
         await admin.query(
-          `INSERT INTO "${table}" (topic, sender, content, ts, in_reply_to)
-           SELECT $1, 'u', 'm' || g, $2, NULL FROM generate_series(1, $3::int) g`,
+          `INSERT INTO "${table}" (topic, sender, content, ts, created_at, in_reply_to)
+           SELECT $1, 'u', 'm' || g, $2, now() - interval '2 days', NULL
+           FROM generate_series(1, $3::int) g`,
           [old, new Date(Date.now() - 2 * 86_400_000).toISOString(), backlog],
         );
       });

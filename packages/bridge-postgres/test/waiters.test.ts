@@ -2,6 +2,7 @@ import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { channelFor } from '../src/schema.js';
+import { sleep } from './pg-harness.js';
 
 // A blocking fetchRecent parks on the topic's NOTIFY channel, and several may park on the SAME
 // channel at once. The hazard is a readiness flag that means "someone intends to LISTEN" instead of
@@ -49,7 +50,6 @@ interface MockClientShape {
   emit: (event: string, arg?: unknown) => boolean;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** What the CONNECTION is still registered for: every LISTEN that no UNLISTEN has undone. */
 function observedChannels(): string[] {

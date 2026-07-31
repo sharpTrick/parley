@@ -2,6 +2,7 @@ import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { channelFor } from '../src/schema.js';
+import { sleep } from './pg-harness.js';
 
 // `disconnect()` drops every subscription synchronously, but a drain read is already at the server
 // when it does — and `pool.end()` waits for that read, so it comes back with rows AFTER the
@@ -53,7 +54,6 @@ vi.mock('pg', async () => {
 });
 
 const URL = 'postgres://app:s3cret@db.example.com:5432/prod';
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** Whatever `drain()` batches at once — the row counts either side of it are the interesting ones. */
 const DRAIN_BATCH = 512;

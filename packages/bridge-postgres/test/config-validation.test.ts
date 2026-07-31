@@ -1,8 +1,13 @@
 import { asHandle, asTopic, type BackendConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { MAX_RETENTION_DAYS, PostgresPlugin, validateBackendConfig } from '../src/index.js';
+import {
+  MAX_RETENTION_DAYS,
+  MIN_RETENTION_DAYS,
+  PostgresPlugin,
+  validateBackendConfig,
+} from '../src/index.js';
 import { assertTableName } from '../src/schema.js';
-import { dropTable, isUp, PG_URL, rand, settleWithin } from './pg-harness.js';
+import { dropTable, isUp, PG_URL, rand, settleWithin, sleep, withAdmin } from './pg-harness.js';
 
 /**
  * `backend_config` is untyped YAML from an operator. Every knob is validated before the pool is
@@ -133,11 +138,12 @@ describe('backend_config validation rejects every unusable value', () => {
 
 // A knob validated only for sign is still accepted at magnitudes where it does nothing, or the
 // opposite of what its own rejection message claims to prevent: `retention_days: 1e-9` deletes the
-// entire history, and a large enough value makes the cutoff an un-renderable Date, which prune's
-// deliberately-broad catch swallows — so pruning silently never runs while the README says rows are
-// deleted hourly. So every numeric knob is walked over BOTH ends of its range, and each value has
-// to be refused by name or produce an effect an operator could have predicted. Never accepted and
-// inert.
+// entire history, and a large enough value puts the cutoff before any row this backend could have
+// written, which makes pruning a permanent no-op while the README says rows are deleted hourly. So
+// every numeric knob is walked over BOTH ends of its range, and each value has to be refused by
+// name or produce an effect an operator could have predicted. Never accepted and inert — and never
+// accepted and destructive, which is the arm a floor-less knob passes by doing exactly the damage
+// its own rejection message says `0` was refused for.
 
 interface NumericKnob {
   key: 'pool_size' | 'retention_days';
@@ -147,13 +153,14 @@ interface NumericKnob {
 
 const NUMERIC_KNOBS: NumericKnob[] = [
   { key: 'pool_size', floor: 1, ceiling: 1000 },
-  { key: 'retention_days', floor: 0, ceiling: MAX_RETENTION_DAYS },
+  { key: 'retention_days', floor: MIN_RETENTION_DAYS, ceiling: MAX_RETENTION_DAYS },
 ];
 
 function boundaryValues({ floor, ceiling }: NumericKnob): [label: string, value: number][] {
   return [
     ['far below the floor', floor - 1000],
     ['just below the floor', floor - 1],
+    ['a hair below the floor', floor * 0.999],
     ['the floor', floor],
     ['just above the floor', floor + 1],
     ['nominal', Math.min(ceiling, Math.max(floor + 1, 5))],
@@ -170,6 +177,13 @@ function boundaryValues({ floor, ceiling }: NumericKnob): [label: string, value:
 const REFUSED = 'refused by name';
 const PREDICTABLE = 'accepted, and its effect is one an operator could predict';
 
+/**
+ * How recently a message can have been posted and still be one an operator would expect to keep.
+ * `connect()` prunes immediately, so a window narrower than this empties the shared table rather
+ * than capping its growth.
+ */
+const RECENTLY_POSTED_MS = 1000;
+
 /** What the plugin would actually DO with a value it accepted, in the operator's terms. */
 function acceptedEffect(key: NumericKnob['key'], value: number): string {
   if (key === 'pool_size') {
@@ -177,7 +191,16 @@ function acceptedEffect(key: NumericKnob['key'], value: number): string {
       ? PREDICTABLE
       : `accepted outside the documented 1..1000 range: ${value}`;
   }
-  const cutoff = new Date(Date.now() - value * 86_400_000);
+  const windowMs = value * 86_400_000;
+  // The destructive arm. A cutoff newer than a message posted a second ago removes everything every
+  // topic and every bridge sharing the table has — the outcome 0 and negatives are refused for.
+  if (windowMs <= RECENTLY_POSTED_MS) {
+    return (
+      `accepted, but the cutoff for ${value} days is newer than a message posted ` +
+      `${RECENTLY_POSTED_MS}ms ago — the prune connect() runs immediately empties the whole table`
+    );
+  }
+  const cutoff = new Date(Date.now() - windowMs);
   if (!Number.isFinite(cutoff.getTime())) {
     return (
       `accepted, but the cutoff for ${value} days is not a date prune can render — it throws ` +
@@ -222,7 +245,7 @@ if (await isUp(PG_URL)) {
   describe('an accepted retention_days does to a real table exactly what it says', () => {
     it.each([
       ['the widest accepted window keeps everything', MAX_RETENTION_DAYS, 3],
-      ['a nanoscale window keeps nothing', 1e-9, 0],
+      ['the narrowest accepted window removes what is older than it', MIN_RETENTION_DAYS, 0],
     ])('%s', async (_label, retentionDays, survivors) => {
       const table = `parley_bnd_${rand()}`;
       const topic = asTopic(`bnd-${rand()}`);
@@ -233,17 +256,66 @@ if (await isUp(PG_URL)) {
       } finally {
         await seeder.disconnect();
       }
+      // Age them where the store can see it: the narrow end of the range is a minute, and a case
+      // that waited a minute is a case that gets skipped.
+      await withAdmin(async (admin) => {
+        await admin.query(`UPDATE "${table}" SET created_at = now() - interval '2 minutes'`);
+      });
 
       const plugin = new PostgresPlugin();
       await plugin.connect({ url: PG_URL, table_name: table, retention_days: retentionDays });
       try {
-        await new Promise((r) => setTimeout(r, 500));
+        await sleep(500);
         const { messages } = await plugin.fetchRecent({ topic });
         expect(messages.length, 'retention did something other than what it promised').toBe(
           survivors,
         );
       } finally {
         await plugin.disconnect();
+        await dropTable(table);
+      }
+    }, 30000);
+
+    // The floor is the half of the range that is destructive rather than inert, so it is graded on
+    // what is still in the table afterwards and not only on the rejection.
+    it.each([
+      ['zero', 0],
+      ['a nanoscale window', 1e-9],
+      ['the smallest denormal', Number.MIN_VALUE],
+      ['a hair under a minute', MIN_RETENTION_DAYS * 0.999],
+      ['milliseconds mistaken for days', 1 / 86_400_000],
+    ])('a window below the floor (%s) is refused and destroys nothing', async (_label, days) => {
+      const table = `parley_flr_${rand()}`;
+      const topic = asTopic(`flr-${rand()}`);
+      const seeder = new PostgresPlugin();
+      await seeder.connect({ url: PG_URL, table_name: table });
+      try {
+        for (let i = 0; i < 3; i++) await seeder.post(topic, asHandle('u'), `m${i}`);
+      } finally {
+        await seeder.disconnect();
+      }
+
+      const plugin = new PostgresPlugin();
+      const outcome = await settleWithin(
+        plugin.connect({ url: PG_URL, table_name: table, retention_days: days }),
+        SETTLE_MS,
+      );
+      await plugin.disconnect();
+      expect(outcome).toMatch(
+        /^rejected: parley-postgres: invalid backend_config\.retention_days — /,
+      );
+
+      const reader = new PostgresPlugin();
+      await reader.connect({ url: PG_URL, table_name: table });
+      try {
+        const { messages } = await reader.fetchRecent({ topic });
+        expect(messages.map((m) => m.content), 'the history was destroyed anyway').toEqual([
+          'm0',
+          'm1',
+          'm2',
+        ]);
+      } finally {
+        await reader.disconnect();
         await dropTable(table);
       }
     }, 30000);

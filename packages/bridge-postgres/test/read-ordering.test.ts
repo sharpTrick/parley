@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { channelFor } from '../src/schema.js';
 import { servePool } from './fake-pg.js';
+import { sleep } from './pg-harness.js';
 
 // Every read in this plugin projects `seq::text AS seq` and sorts by `<table>.seq`. Drop the table
 // qualification and PostgreSQL binds `ORDER BY seq` to that OUTPUT alias instead of the bigint
@@ -41,7 +42,6 @@ vi.mock('pg', async () => {
 });
 
 const URL = 'postgres://app:s3cret@db.example.com:5432/prod';
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 function seed(topic: Topic, seqs: readonly number[]): void {
   state.rows = seqs.map((seq) => ({

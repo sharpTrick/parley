@@ -1,6 +1,7 @@
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { sleep } from './pg-harness.js';
 
 // `subscribe` looks up the topic's existing registration and then, several awaits later, installs a
 // new one. If that check-then-act is separated by an await, k concurrent subscribes to one topic all
@@ -40,7 +41,6 @@ interface MockClientShape {
   emit: (event: string, arg?: unknown) => boolean;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 vi.mock('pg', async () => {
   const { FakeEmitter, fakePool, servePool } = await import('./fake-pg.js');

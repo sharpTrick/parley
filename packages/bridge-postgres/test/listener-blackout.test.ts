@@ -2,6 +2,7 @@ import { asCursor, asTopic, type FetchRecentResult, type Message } from '@sharpt
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { channelFor } from '../src/schema.js';
+import { sleep } from './pg-harness.js';
 
 // A dropped listener connection starts a backoff reconnect, and every seam call issued in that
 // window has to be answered from the reconnect rather than from the socket that just closed. Two
@@ -70,7 +71,6 @@ vi.mock('pg', async () => {
 });
 
 const URL = 'postgres://app:s3cret@db.example.com:5432/prod';
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 /** The plugin's own backoff between listener reconnect attempts. */
 const RECONNECT_DELAY_MS = 500;
 const BLOCK_MS = 200;

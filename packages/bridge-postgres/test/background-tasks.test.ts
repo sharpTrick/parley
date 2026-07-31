@@ -3,6 +3,7 @@ import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { fakePool } from './fake-pg.js';
+import { sleep } from './pg-harness.js';
 
 // Every fire-and-forget chore in this plugin (the prune tick, the drain loop, the listener
 // reconnect, a waiter's snapshot re-check) is best-effort by design: its failure must cost latency
@@ -54,7 +55,6 @@ vi.mock('pg', async () => {
 });
 
 const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 let rejections: unknown[] = [];
 const record = (err: unknown): void => {

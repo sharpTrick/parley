@@ -6,6 +6,11 @@ import { createHash } from 'node:crypto';
  * a subsequence of a globally increasing sequence is itself increasing, so one column satisfies
  * both roles. Ordering and dedup NEVER use the timestamp (§5/§6).
  *
+ * `ts` is the poster's wall clock and is informational only (§5); `created_at` is stamped by the
+ * DATABASE. Keep retention deciding on `created_at`, so that no bridge's clock — and this backend
+ * is the multi-machine one, so there are many — can destroy a row another bridge just wrote, or
+ * write a row retention can never remove.
+ *
  * One caveat SQLite's rowid doesn't have: BIGSERIAL values are assigned at INSERT time, not
  * COMMIT time, so under concurrent writers rows can become VISIBLE out of seq order — a reader
  * could observe seq 42, advance its cursor past the still-uncommitted 41, and skip 41 forever.
@@ -30,7 +35,7 @@ export const MAX_IDENTIFIER_BYTES = 63;
 const DERIVED_SUFFIXES = [
   '',
   '_topic_seq',
-  '_ts',
+  '_created_at',
   '_senders',
   '_notify',
   '_notify_trg',
@@ -85,7 +90,7 @@ export function assertTableName(name: string): string {
 export interface SchemaNames {
   messages: string;
   topicSeqIndex: string;
-  tsIndex: string;
+  createdAtIndex: string;
   senders: string;
   notifyFn: string;
   notifyTrigger: string;
@@ -96,7 +101,7 @@ export function schemaNames(table: string): SchemaNames {
   return {
     messages: t,
     topicSeqIndex: `${t}_topic_seq`,
-    tsIndex: `${t}_ts`,
+    createdAtIndex: `${t}_created_at`,
     senders: `${t}_senders`,
     notifyFn: `${t}_notify`,
     notifyTrigger: `${t}_notify_trg`,
@@ -129,23 +134,27 @@ export function channelFor(topic: string): string {
  * transaction under an advisory lock (index.ts `connect`) so concurrent bridge processes
  * bootstrapping the same table don't race the CREATEs.
  *
- * The indexes and the trigger are created only when missing, so that an ordinary process start on an
- * already-bootstrapped table takes no table-level lock and cannot stall every other bridge process's
- * `post()`: `CREATE INDEX` holds SHARE and `CREATE TRIGGER` SHARE ROW EXCLUSIVE, and both conflict
- * with the ROW EXCLUSIVE an INSERT holds — the `IF NOT EXISTS` spelling still takes the lock. Keep
+ * The indexes, the trigger and the `created_at` column are touched only when they are missing — or,
+ * for the superseded `_ts` index, present — so that an ordinary process start on an
+ * already-bootstrapped table takes no table-level lock and cannot stall every other bridge
+ * process's `post()`: `CREATE INDEX` holds SHARE, `CREATE TRIGGER` SHARE ROW EXCLUSIVE, and
+ * `ALTER TABLE`/`DROP INDEX` ACCESS EXCLUSIVE — all conflicting
+ * with the ROW EXCLUSIVE an INSERT holds — and the `IF NOT EXISTS` spelling still takes the lock. Keep
  * every behavioural change to the doorbell in the trigger FUNCTION (replaced unconditionally), so
  * that skipping the re-create cannot ship a stale one.
  */
 export function buildSchema(table: string): string {
   const n = quotedNames(table);
   const raw = schemaNames(table);
+  const legacyTsIndex = `"${raw.messages}_ts"`;
   return `
 CREATE TABLE IF NOT EXISTS ${n.messages} (
   seq         BIGSERIAL PRIMARY KEY,
   topic       TEXT NOT NULL,
   sender      TEXT NOT NULL,
   content     TEXT NOT NULL,
-  ts          TEXT NOT NULL,           -- ISO 8601, informational only
+  ts          TEXT NOT NULL,           -- ISO 8601 from the poster's clock, informational only
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- server-stamped; retention decides on this
   in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
 );
 CREATE TABLE IF NOT EXISTS ${n.senders} (
@@ -160,11 +169,22 @@ END;
 $PARLEY$ LANGUAGE plpgsql;
 DO $PARLEY_BOOTSTRAP$
 BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = '${n.messages}'::regclass AND attname = 'created_at' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE ${n.messages} ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+  END IF;
   IF to_regclass('${n.topicSeqIndex}') IS NULL THEN
     CREATE INDEX ${n.topicSeqIndex} ON ${n.messages} (topic, seq);
   END IF;
-  IF to_regclass('${n.tsIndex}') IS NULL THEN
-    CREATE INDEX ${n.tsIndex} ON ${n.messages} (ts);
+  IF to_regclass('${n.createdAtIndex}') IS NULL THEN
+    CREATE INDEX ${n.createdAtIndex} ON ${n.messages} (created_at);
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM pg_class WHERE oid = to_regclass('${legacyTsIndex}') AND relkind = 'i'
+  ) THEN
+    DROP INDEX ${legacyTsIndex};
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger

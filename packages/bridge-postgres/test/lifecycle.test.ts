@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { sleep } from './pg-harness.js';
 
 // Deterministic listener-lifecycle tests: a disconnect() racing a reconnect must leak no live
 // Client, a failed LISTEN must leave no registration, and a repeat subscribe must fan out.
@@ -20,7 +21,6 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // Shared mock state, hoisted so the vi.mock factory can close over it.
 const state = vi.hoisted(() => ({

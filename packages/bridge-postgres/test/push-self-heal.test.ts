@@ -2,6 +2,7 @@ import { asCursor, asTopic, type Message } from '@sharptrick/parley-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { channelFor } from '../src/schema.js';
+import { sleep } from './pg-harness.js';
 
 // NOTIFY is EDGE-triggered: a row already committed reaches a live handler only because some drain
 // reads past `lastSeen` and finds it. So every place the live path swallows a failed read is a
@@ -78,7 +79,6 @@ vi.mock('pg', async () => {
 });
 
 const URL = 'postgres://app:s3cret@db.example.com:5432/prod';
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** How long a cell gives the plugin to converge on its own — well past the backoff it needs. */
 const CONVERGE_MS = 4000;

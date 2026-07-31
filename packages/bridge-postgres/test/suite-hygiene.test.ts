@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import * as harness from './pg-harness.js';
 
 // This package's real-server harness — the DSN, the reachability gate, the admin connection, the
 // table cleanup, the backend-leak count — used to be copied into eight files, and the copies drifted:
@@ -26,9 +27,16 @@ function testFiles(): string[] {
  * What a test file must take from the harness, READ OUT of the harness rather than listed here: a
  * hand-kept list drifts into naming something the harness does not export, and an entry that has to
  * be exempted to pass grades nothing at all.
+ *
+ * Every declaration form the harness uses has to be in this alternation. It once read `function`
+ * only, so the three `export const` helpers — including `sleep`, the most restated one in the
+ * package — were invisible to the rule written to stop exactly that, and it reported green while
+ * nine files carried their own copy.
  */
 const SHARED_HELPERS = [
-  ...readFileSync(join(HERE, HARNESS), 'utf8').matchAll(/export\s+(?:async\s+)?function\s+(\w+)/g),
+  ...readFileSync(join(HERE, HARNESS), 'utf8').matchAll(
+    /export\s+(?:const|let|async\s+function|function)\s+(\w+)/g,
+  ),
 ]
   .map((m) => m[1] as string)
   .sort();
@@ -38,14 +46,25 @@ describe('the real-server harness is shared, not restated', () => {
   // otherwise shrink the rule above to whatever is left, silently.
   it('the harness still owns every real-server helper this rule enforces', () => {
     expect(SHARED_HELPERS).toEqual([
+      'PG_URL',
       'backendCount',
       'dropTable',
       'isUp',
+      'rand',
       'settleWithin',
       'settledBackendCount',
+      'sleep',
       'terminateBackends',
       'withAdmin',
     ]);
+  });
+
+  // The set above is read out of the harness's TEXT, so a declaration form the regex does not know
+  // about shrinks the rule to whatever it happens to recognise — silently, and in the direction of
+  // passing. Grade it against the MODULE instead: whatever the harness really exports at runtime is
+  // what the rule below must govern.
+  it('the rule governs every helper the harness actually exports', () => {
+    expect(SHARED_HELPERS).toEqual(Object.keys(harness).sort());
   });
 
   it.each(testFiles())('%s declares no harness helper of its own', (file) => {

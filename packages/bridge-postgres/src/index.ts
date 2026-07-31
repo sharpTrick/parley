@@ -43,8 +43,8 @@ export interface PostgresBackendConfig {
   /** Max pooled connections for queries/writes (the LISTEN connection is separate). Default 5. */
   pool_size?: number;
   /**
-   * Optional retention window in days, greater than 0 and at most {@link MAX_RETENTION_DAYS}: rows
-   * older than it are pruned on a background timer.
+   * Optional retention window in days, between {@link MIN_RETENTION_DAYS} and
+   * {@link MAX_RETENTION_DAYS}: rows older than it are pruned on a background timer.
    * Omit for the default — keep every message forever. Safe to enable at any time: `seq` is a
    * BIGSERIAL and never reused, so a cursor/backendMsgId minted before a prune stays valid (a
    * stale reader just gets fewer rows back, never a wrong or duplicate one).
@@ -64,10 +64,18 @@ export const MAX_POOL_SIZE = 1000;
  * Widest retention window this backend accepts, in days (50 years). Keep a ceiling here, so that
  * every accepted window still has a cutoff a stored row could fall on: past it the cutoff first
  * predates any message this system wrote — pruning is then a permanent no-op the operator was
- * told was running hourly — and further still it leaves the range a `Date` renders at all, which
- * throws inside the best-effort prune and is swallowed there.
+ * told was running hourly — and further still the window overflows the `interval` the server
+ * subtracts, which throws inside the best-effort prune and is swallowed there.
  */
 export const MAX_RETENTION_DAYS = 18_250;
+/**
+ * Narrowest retention window this backend accepts, in days: one minute. `connect()` prunes
+ * immediately, so a window too short to hold a conversation empties the whole shared table — for
+ * every topic and every bridge process sharing it — the moment it is accepted. That is the outcome
+ * `0` and negatives are refused for, reached just as well by `Number.MIN_VALUE`, `1e-9`, or a unit
+ * slip that meant milliseconds. Matches bridge-sqlite's floor for the identical key.
+ */
+export const MIN_RETENTION_DAYS = 1 / 1440;
 /** How many rows one drain query pulls at most before re-querying. */
 const DRAIN_BATCH = 512;
 /** First gap before a failed drain is retried; doubles per consecutive failure. */
@@ -148,16 +156,18 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
     retention !== undefined &&
     (typeof retention !== 'number' ||
       !Number.isFinite(retention) ||
-      !(retention > 0) ||
+      !(retention >= MIN_RETENTION_DAYS) ||
       retention > MAX_RETENTION_DAYS)
   ) {
     throw badConfig(
       'retention_days',
-      `expected a finite number of days in (0, ${MAX_RETENTION_DAYS}], got ` +
-        `${describeValue(retention)} — a window of 0 or less keeps nothing, and a window past ` +
-        `${MAX_RETENTION_DAYS} days puts the cutoff before any message this backend could have ` +
-        'written, so pruning would silently never run at all; omit the key to keep every message ' +
-        'forever',
+      `expected a finite number of days between ${MIN_RETENTION_DAYS} (one minute) and ` +
+        `${MAX_RETENTION_DAYS}, got ` +
+        `${describeValue(retention)} — a window shorter than a minute empties the whole shared ` +
+        'table on the prune connect() runs immediately, which is what 0 and negatives were ' +
+        `already refused for, and a window past ${MAX_RETENTION_DAYS} days puts the cutoff ` +
+        'before any message this backend could have written, so pruning would silently never run ' +
+        'at all; omit the key to keep every message forever',
     );
   }
 
@@ -204,6 +214,25 @@ function assertCursor(since: string): void {
         '`nextCursor`, or omit `since` to get the newest page.',
     );
   }
+}
+
+/**
+ * Refuse a seam argument PostgreSQL's TEXT type cannot hold, before it reaches the driver.
+ *
+ * Every one of these is agent- or human-supplied and untrusted (DESIGN §5): core's `parley_post`
+ * takes a bare `z.string()` for `content`, and a topic reaches here from anything a `post_topics`
+ * pattern admits. A NUL byte is legal in a JSON string and legal in a JS string, and PostgreSQL
+ * answers it with `invalid byte sequence for encoding "UTF8": 0x00` — a bare driver string naming
+ * neither this plugin, nor the field, nor the fact that nothing was written, which core then
+ * renders into agent context. This is the same contract `assertCursor` states for reads.
+ */
+function assertStorable(field: string, value: string): void {
+  const at = value.indexOf('\u0000');
+  if (at < 0) return;
+  throw new Error(
+    `parley-postgres: invalid ${field} — a NUL byte (U+0000) at index ${at} cannot be stored in ` +
+      "PostgreSQL's TEXT type. Nothing was written; strip it and retry.",
+  );
 }
 
 /**
@@ -426,19 +455,28 @@ export class PostgresPlugin implements BackendPlugin {
    * table in the database for as long as it runs. Best-effort — a transient failure retries next
    * tick. Keep the whole body inside the try, so that no arithmetic on an operator-supplied window
    * can escape this un-awaited call as an unhandled rejection and take the process down.
+   *
+   * Keep both sides of the comparison server-side — `created_at` is stamped by the database and the
+   * cutoff is subtracted from the database's `now()` — so that no bridge's wall clock takes part.
+   * `ts` is written by whichever process called `post()`, and this is the multi-machine backend: a
+   * writer running ten days slow would otherwise have every message it durably acknowledged deleted
+   * by the next correct-clock pruner, and one running fast would write rows retention can never
+   * remove.
    */
   private async prune(): Promise<void> {
     if (this.retentionDays === undefined || this.pool === undefined) return;
     const epoch = this.epoch;
+    const windowSecs = this.retentionDays * 86_400;
     try {
-      const cutoff = new Date(Date.now() - this.retentionDays * 86_400_000).toISOString();
       for (;;) {
         if (this.stopped || this.pool === undefined || epoch !== this.epoch) return;
         const res = await this.pool.query(
           `DELETE FROM ${this.names.messages} WHERE seq IN (
-             SELECT seq FROM ${this.names.messages} WHERE ts < $1 ORDER BY seq LIMIT ${PRUNE_BATCH}
+             SELECT seq FROM ${this.names.messages}
+             WHERE created_at < now() - make_interval(secs := $1::double precision)
+             ORDER BY seq LIMIT ${PRUNE_BATCH}
            )`,
-          [cutoff],
+          [windowSecs],
         );
         if ((res.rowCount ?? 0) < PRUNE_BATCH) return;
       }
@@ -485,6 +523,10 @@ export class PostgresPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
+    assertStorable('topic', topic);
+    assertStorable('handle', identity);
+    assertStorable('content', content);
+    if (opts?.inReplyTo !== undefined) assertStorable('inReplyTo', opts.inReplyTo);
     const client = await this.require().connect();
     try {
       // Keep the registry upsert OUTSIDE the transaction below, so that it cannot lengthen the
@@ -515,6 +557,7 @@ export class PostgresPlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertStorable('topic', args.topic);
     const limit = args.limit ?? 100;
     // NB: ORDER BY is table-qualified everywhere — a bare `ORDER BY seq` would bind to the
     // `seq::text AS seq` OUTPUT alias and sort lexicographically ('9' > '10'), not numerically.
@@ -644,6 +687,7 @@ export class PostgresPlugin implements BackendPlugin {
    * cancelling all subscriptions.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    assertStorable('topic', topic);
     const pool = this.require();
     const channel = channelFor(topic);
 
@@ -720,6 +764,7 @@ export class PostgresPlugin implements BackendPlugin {
    * `backendRef === handle`.
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
+    assertStorable('handle', handle);
     const res = await this.require().query(
       `SELECT backend_ref FROM ${this.names.senders} WHERE handle = $1`,
       [handle],
@@ -881,10 +926,21 @@ export class PostgresPlugin implements BackendPlugin {
           }
           // Re-LISTEN every channel a subscription OR an in-flight blocking waiter needs, so a
           // reconnect mid-wait still delivers the doorbell.
+          const listened: string[] = [];
           for (const channel of this.listens.keys()) {
             await client.query(`LISTEN "${channel}"`);
+            listened.push(channel);
           }
           await this.adoptListener(client, epoch);
+          // The loop above awaits, and a waiter's blockMs can expire inside it: that release has
+          // already dropped the channel with no live connection to send its UNLISTEN to. Keep this
+          // reconciliation, so that the replacement is not left registered for a channel no
+          // participant needs — every future post to that topic would wake the process forever.
+          for (const channel of listened) {
+            if (!this.listens.has(channel)) {
+              void client.query(`UNLISTEN "${channel}"`).catch(() => undefined);
+            }
+          }
           landed(client);
           adopted = true;
           for (const sub of this.subs.values()) this.drain(sub);

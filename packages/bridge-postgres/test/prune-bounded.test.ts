@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { sleep } from './pg-harness.js';
 
 // Retention is enabled on a table that already exists — typically one that has been accumulating
 // forever, because "keep every message" is the default. The first prune after an operator sets
@@ -35,7 +36,6 @@ vi.mock('pg', async () => {
 });
 
 const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 beforeEach(() => {
   state.remaining = 0;

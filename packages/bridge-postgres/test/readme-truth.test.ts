@@ -8,6 +8,7 @@ import {
   MAX_POOL_SIZE,
   MAX_RETENTION_DAYS,
   MIN_POOL_SIZE,
+  MIN_RETENTION_DAYS,
   PRUNE_BATCH,
 } from '../src/index.js';
 import { MAX_IDENTIFIER_BYTES, MAX_TABLE_NAME_BYTES } from '../src/schema.js';
@@ -59,8 +60,18 @@ const CLAIMS: Claim[] = [
   },
   {
     what: 'the retention range',
-    pattern: /\(0, (\d+)\]/g,
+    pattern: /`\[1\/\d+, (\d+)\]`/g,
     expected: MAX_RETENTION_DAYS,
+  },
+  {
+    what: 'the narrowest retention window, stated in minutes',
+    pattern: /at least (\d+) minute/g,
+    expected: Math.round(MIN_RETENTION_DAYS * 1440),
+  },
+  {
+    what: 'the narrowest retention window, stated as a fraction of a day',
+    pattern: /1\/(\d+)/g,
+    expected: Math.round(1 / MIN_RETENTION_DAYS),
   },
   {
     what: 'the retention window a config is refused past',
