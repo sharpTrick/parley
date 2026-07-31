@@ -94,17 +94,13 @@ export async function createOidcRemoteApp(
     ...(oidc.required_role !== undefined ? { requiredRole: oidc.required_role } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
-  const bearer = requireBearerAuth({
-    verifier,
-    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource),
-  });
+  const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resource);
+  const bearer = requireBearerAuth({ verifier, resourceMetadataUrl });
 
   const remote = createRemoteHttpApp(plugin, cfg, {
     mcpPath,
     protect: bearer,
     configureApp: (app) => {
-      // Protected Resource Metadata (authorization_servers → the external issuer) + a mirror of
-      // the IdP's AS metadata at this origin. No AS endpoints are mounted here.
       app.use(
         mcpAuthMetadataRouter({
           // OIDC discovery metadata is a superset of the RFC 8414 shape the router mirrors.

@@ -8,7 +8,8 @@ import rateLimit, { MemoryStore } from 'express-rate-limit';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
-import { escapeHtml } from './html.js';
+import { renderConsentRefusal } from './consent-page.js';
+import { DEFAULT_SCOPES_SUPPORTED } from './grant-params.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
 import { hardenErrorSurface } from './error-surface.js';
 import { assertPublicBaseUrl, assertTrustProxy, canonicalResourceId } from './invariants.js';
@@ -22,14 +23,11 @@ export interface OAuthRemoteOptions {
   mcpPath?: string;
   scopesSupported?: string[];
   /**
-   * Express `trust proxy` value. Every endpoint below is rate-limited per client address, so this
-   * must describe the real deployment: the default `false` is correct only when the socket peer IS
-   * the client. Behind the TLS terminator of examples/self-host-remote, pass `'loopback'` (or the
-   * hop count) — otherwise every caller shares the proxy's address in a single bucket and an
-   * anonymous attacker can exhaust it to lock the owner out of the only path that authorizes the
-   * bridge. Anything that trusts the whole address space is refused — `true`, and equally a proxy
-   * list whose CIDRs cover an entire address family: either hands the limiter's key to the caller
-   * and removes the protection entirely.
+   * Express `trust proxy` value, describing the real deployment: the default `false` is correct
+   * only when the socket peer IS the client, and behind the TLS terminator of
+   * examples/self-host-remote it is `'loopback'` (or the hop count). Every endpoint below is
+   * rate-limited on the `req.ip` this decides, so anything that trusts the whole address space is
+   * refused at boot with a message naming the value and the exposure.
    */
   trustProxy?: boolean | number | string | string[];
   /** Injectable clock for tests. */
@@ -66,9 +64,7 @@ export function createOAuthRemoteApp(
   assertPublicBaseUrl(oauth.issuerUrl, 'issuerUrl');
   assertTrustProxy(oauth.trustProxy, 'trustProxy');
   const resource = canonicalResourceId(oauth.issuerUrl, mcpPath, 'mcpPath');
-  // One array reaches both the metadata document and the provider's /authorize check, so what this
-  // AS advertises and what it will actually issue cannot drift apart.
-  const scopesSupported = oauth.scopesSupported ?? ['mcp'];
+  const scopesSupported = oauth.scopesSupported ?? DEFAULT_SCOPES_SUPPORTED;
 
   const provider = new ParleyOAuthProvider({
     resource,
@@ -103,7 +99,6 @@ export function createOAuthRemoteApp(
     configureApp: (app) => {
       app.set('trust proxy', oauth.trustProxy ?? false);
 
-      // OAuth AS endpoints + AS metadata + Protected Resource Metadata, mounted at the root.
       // (Do NOT add json/urlencoded parsers in front — these handlers install their own.)
       app.use(
         mcpAuthRouter({
@@ -120,8 +115,6 @@ export function createOAuthRemoteApp(
         }),
       );
 
-      // Owner-consent submit (browser-driven). The /authorize handler renders a consent page that
-      // POSTs here; on the correct owner passphrase we mint the code and redirect back to Claude.
       app.post(CONSENT_PATH, consentLimiter, express.urlencoded({ extended: false }), async (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
         const body = (req.body ?? {}) as Record<string, unknown>;
@@ -132,10 +125,7 @@ export function createOAuthRemoteApp(
           res.redirect(302, redirectUrl);
         } catch (err) {
           if (err instanceof ConsentError) {
-            res.status(403).type('html').send(
-              `<!doctype html><meta charset="utf-8"><body style="font:16px system-ui;max-width:32rem;margin:3rem auto">` +
-                `<h1>Not authorized</h1><p>${escapeHtml(err.message)}.</p><p><a href="javascript:history.back()">Go back</a></p></body>`,
-            );
+            res.status(403).type('html').send(renderConsentRefusal(err.message));
             return;
           }
           throw err;

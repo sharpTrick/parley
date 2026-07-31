@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { Response } from 'express';
 import type { AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
@@ -1348,24 +1348,31 @@ describe('ParleyOAuthProvider — every value the consent page interpolates arri
 /**
  * A behavioural row can only reach a site a request can reach, and `consent_id` is server-minted —
  * so its escape, and the escape at whatever site someone adds next, is pinned by nothing above.
- * Read the interpolations out of the template itself and require every one to pass through the
- * shared escaper.
+ * Read the interpolations out of every HTML document this layer ships, wherever it is written, and
+ * require each one to pass through the shared escaper.
  */
-describe('ParleyOAuthProvider — the consent template escapes at every interpolation, reachable or not', () => {
-  const source = readFileSync(fileURLToPath(new URL('oauth-provider.ts', import.meta.url)), 'utf8');
-  const start = source.indexOf('private consentPage(');
-  const template = source.slice(start, source.indexOf('\n  }\n', start));
-  const bound = new Map(
-    [...template.matchAll(/const (\w+) = (.+);$/gm)].map((m): [string, string] => [m[1]!, m[2]!]),
-  );
-  const interpolations = [...new Set([...template.matchAll(/\$\{([^}]*)\}/g)].map((m) => m[1]!.trim()))];
+describe('the auth layer escapes at every interpolation of every page it renders, reachable or not', () => {
+  const DIR = fileURLToPath(new URL('.', import.meta.url));
+  const pages = readdirSync(DIR)
+    .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+    .map((f) => [f, readFileSync(`${DIR}${f}`, 'utf8')] as const)
+    .flatMap(([file, source]) => {
+      const bound = new Map(
+        [...source.matchAll(/const (\w+) = (.+);$/gm)].map((m): [string, string] => [m[1]!, m[2]!]),
+      );
+      return [...source.matchAll(/`(?:[^`\\]|\\.)*`/g)]
+        .map((m) => m[0])
+        .filter((t) => /<!doctype|<\/[a-z]+>/i.test(t))
+        .flatMap((t) => [...new Set([...t.matchAll(/\$\{([^}]*)\}/g)].map((m) => m[1]!.trim()))])
+        .map((expr): [string, string, Map<string, string>] => [file, expr, bound]);
+    });
 
   it('finds the interpolations to check', () => {
-    expect(start).toBeGreaterThan(0);
-    expect(interpolations.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(pages.map(([file]) => file)).size).toBeGreaterThan(0);
+    expect(pages.length).toBeGreaterThanOrEqual(5);
   });
 
-  it.each(interpolations.map((expr) => [expr]))('${%s} is escaped', (expr: string) => {
+  it.each(pages)('%s: ${%s} is escaped', (_file: string, expr: string, bound: Map<string, string>) => {
     const escapedInPlace = expr.includes('escapeHtml');
     const escapedWhereBound = bound.get(expr)?.includes('escapeHtml') ?? false;
     expect(escapedInPlace || escapedWhereBound).toBe(true);

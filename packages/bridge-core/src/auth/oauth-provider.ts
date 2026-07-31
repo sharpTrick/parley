@@ -8,7 +8,6 @@ import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/serv
 import {
   InvalidGrantError,
   InvalidScopeError,
-  InvalidTargetError,
   InvalidTokenError,
   TemporarilyUnavailableError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
@@ -18,15 +17,26 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { escapeHtml } from './html.js';
+import { renderConsentPage } from './consent-page.js';
+import {
+  type ClientState,
+  MAX_CLIENTS,
+  MAX_PENDING,
+  evictionCandidate,
+  shedOldest,
+} from './eviction.js';
+import {
+  assertResource,
+  assertScopes,
+  namedScopes,
+  redirectUriWasSupplied,
+} from './grant-params.js';
 
 const ACCESS_TTL_SEC = 60 * 60; // 1 hour
 const REFRESH_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 const CODE_TTL_MS = 60_000; // 1 minute, single-use
 const CONSENT_TTL_MS = 5 * 60_000; // 5 minutes to approve
 const SWEEP_INTERVAL_MS = 60_000;
-const MAX_CLIENTS = 100;
-const MAX_PENDING = 100;
 
 interface CodeRecord {
   clientId: string;
@@ -54,34 +64,6 @@ interface PendingConsent {
   redirectUriSupplied: boolean;
   expiresAtMs: number;
 }
-interface ClientState {
-  clientId: string;
-  expiresAtMs: number;
-  /** Whether reaching this state cost the owner's passphrase, or any anonymous caller can create it. */
-  ownerApproved: boolean;
-}
-
-/**
- * Whether the client itself wrote `redirect_uri` on the authorization request. The SDK's handler
- * defaults `params.redirectUri` to the client's single registered URI when it was absent, so by the
- * time the provider sees the params the two cases are indistinguishable — and RFC 6749 §4.1.3 makes
- * the parameter REQUIRED at /token only in the first of them. Reading both containers keeps the
- * answer "supplied" whenever it might have been, which is the strict side.
- */
-function redirectUriWasSupplied(res: Response): boolean {
-  const req = (res as { req?: { body?: unknown; query?: unknown } }).req;
-  if (req === undefined) return true;
-  const body = req.body as Record<string, unknown> | undefined;
-  const query = req.query as Record<string, unknown> | undefined;
-  return (body?.redirect_uri ?? query?.redirect_uri) !== undefined;
-}
-
-// Keep this filter, so that `scope=` or a doubled space cannot be refused as an unsupported scope
-// whose name is the empty string — an error_description naming nothing, on a flow the client cannot
-// recover from. RFC 6749 §3.3 spells a scope token `1*NQCHAR`: an empty one never names one.
-function namedScopes(scopes: string[]): string[] {
-  return scopes.filter((s) => s.length > 0);
-}
 
 export interface ParleyOAuthProviderOptions {
   /** Canonical resource (RS) identifier = the public /mcp URL (no trailing slash). Audience for tokens. */
@@ -99,8 +81,6 @@ export interface ParleyOAuthProviderOptions {
   /** Clock injectable for tests; defaults to Date.now. */
   now?: () => number;
 }
-
-const DEFAULT_SCOPES_SUPPORTED = ['mcp'];
 
 /**
  * Single-tenant OAuth 2.1 + PKCE provider (DESIGN §10/§14). It is the authorization server for
@@ -172,30 +152,6 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     }
   }
 
-  private hasLiveState(clientId: string, accept: (state: ClientState) => boolean): boolean {
-    const nowMs = this.now();
-    for (const state of this.clientStates()) {
-      if (state.clientId === clientId && state.expiresAtMs >= nowMs && accept(state)) return true;
-    }
-    return false;
-  }
-
-  /**
-   * Who to shed when the map is full, in order of what the owner has invested: an idle registration
-   * first, then one holding nothing but a consent nobody has approved yet. A pending consent is
-   * state any anonymous caller can create by calling /authorize, so counting it as "in use" would
-   * let registration spam pin every slot and refuse the owner's connector outright — the very
-   * lock-out the cap exists to prevent. Only owner-approved state, which costs the passphrase, is
-   * unevictable.
-   */
-  private evictionCandidate(): string | undefined {
-    const ids = [...this.clients.keys()];
-    return (
-      ids.find((id) => !this.hasLiveState(id, () => true)) ??
-      ids.find((id) => !this.hasLiveState(id, (state) => state.ownerApproved))
-    );
-  }
-
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
       getClient: (id) => this.clients.get(id),
@@ -203,7 +159,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       registerClient: (client) => {
         const full = client as OAuthClientInformationFull;
         if (!this.clients.has(full.client_id) && this.clients.size >= MAX_CLIENTS) {
-          const evictable = this.evictionCandidate();
+          const evictable = evictionCandidate(this.clients.keys(), this.clientStates(), this.now());
           if (evictable === undefined) {
             throw new TemporarilyUnavailableError('client registration capacity reached');
           }
@@ -215,24 +171,6 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  private assertScopes(scopes: string[] | undefined): void {
-    const supported = this.opts.scopesSupported ?? DEFAULT_SCOPES_SUPPORTED;
-    const unsupported = (scopes ?? []).filter((s) => !supported.includes(s));
-    if (unsupported.length > 0) {
-      throw new InvalidScopeError(
-        `this server does not issue the scope(s) ${unsupported.join(' ')}; it supports ${supported.join(' ')}`,
-      );
-    }
-  }
-
-  private assertResource(resource: URL | undefined): void {
-    if (resource !== undefined && resource.href !== this.opts.resource.href) {
-      throw new InvalidTargetError(
-        `this server only issues tokens for ${this.opts.resource.href}`,
-      );
-    }
-  }
-
   /**
    * Owner-consent gate. Instead of redirecting straight back, render a consent page; the owner
    * approves with their secret, and {@link completeConsent} issues the code + redirect.
@@ -242,10 +180,10 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    this.assertResource(params.resource);
+    assertResource(params.resource, this.opts.resource);
     const consented =
       params.scopes === undefined ? params : { ...params, scopes: namedScopes(params.scopes) };
-    this.assertScopes(consented.scopes);
+    assertScopes(consented.scopes, this.opts.scopesSupported);
     const consentId = randomUUID();
     this.pending.set(consentId, {
       client,
@@ -253,23 +191,9 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       redirectUriSupplied: redirectUriWasSupplied(res),
       expiresAtMs: this.now() + CONSENT_TTL_MS,
     });
-    this.capPending();
-    res.status(200).type('html').send(this.consentPage(consentId, client, consented));
-  }
-
-  /**
-   * The 60s sweeper and the 5-minute TTL are a rate, not a bound, and every entry here is state an
-   * anonymous caller created by calling /authorize — so shed the oldest once the map is full, the
-   * same honest ordering {@link evictionCandidate} sheds registrations by. Refusing instead would
-   * hand the same anonymous caller a way to lock the owner out of the only path that authorizes
-   * the bridge.
-   */
-  private capPending(): void {
-    while (this.pending.size > MAX_PENDING) {
-      const oldest = this.pending.keys().next().value;
-      if (oldest === undefined) return;
-      this.pending.delete(oldest);
-    }
+    shedOldest(this.pending, MAX_PENDING);
+    const page = renderConsentPage(consentId, client, consented, this.opts.consentPath);
+    res.status(200).type('html').send(page);
   }
 
   /**
@@ -346,7 +270,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     if ((rec.redirectUriSupplied || redirectUri !== undefined) && redirectUri !== rec.redirectUri) {
       throw new InvalidGrantError('authorization grant is invalid or expired');
     }
-    this.assertResource(resource);
+    assertResource(resource, this.opts.resource);
     return this.issue(client.client_id, rec.scopes, resource?.href ?? rec.resource);
   }
 
@@ -366,7 +290,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     if (requested !== undefined && !requested.every((s) => rec.scopes.includes(s))) {
       throw new InvalidScopeError('requested scope exceeds the original grant');
     }
-    this.assertResource(resource);
+    assertResource(resource, this.opts.resource);
     // Rotation is revocation plus re-issue under the same grant: the presented refresh token and
     // the access token it minted both die here.
     this.revokeGrant(rec.grantId);
@@ -452,49 +376,6 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       refresh_token: refreshToken,
       scope: scopes.join(' '),
     };
-  }
-
-  private consentPage(
-    consentId: string,
-    client: OAuthClientInformationFull,
-    params: AuthorizationParams,
-  ): string {
-    const name = escapeHtml(client.client_name ?? client.client_id);
-    const scopeList = (params.scopes ?? []).map(escapeHtml).join(', ') || '(none requested)';
-    const redirect = escapeHtml(identifyingRedirect(params.redirectUri));
-    return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Parley — authorize</title>
-<style>body{font:16px system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#111}
-.box{border:1px solid #ddd;border-radius:12px;padding:1.5rem}label{display:block;margin:1rem 0 .25rem}
-input[type=password]{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:8px;font-size:1rem}
-button{margin-top:1.25rem;padding:.6rem 1.25rem;border:0;border-radius:8px;background:#111;color:#fff;font-size:1rem;cursor:pointer}
-.muted{color:#666;font-size:.9rem}</style></head>
-<body><div class="box"><h1>Authorize access to Parley</h1>
-<p>A client at <strong>${redirect}</strong> wants to connect to your Parley bridge.</p>
-<p class="muted">Client-supplied name: ${name}<br>Scopes: ${scopeList}</p>
-<p>Enter your owner passphrase to approve. This is the only party that can authorize this bridge.</p>
-<form method="POST" action="${escapeHtml(this.opts.consentPath)}">
-<input type="hidden" name="consent_id" value="${escapeHtml(consentId)}">
-<label for="passphrase">Owner passphrase</label>
-<input id="passphrase" name="passphrase" type="password" autocomplete="off" autofocus required>
-<button type="submit">Approve</button></form></div></body></html>`;
-  }
-}
-
-/**
- * The consent page leads with the redirect target because it is the one thing on the page the
- * client cannot choose freely. `URL.origin` is the opaque string `'null'` for every non-special
- * scheme (`myapp://cb`), so taking it unconditionally would print a literal `null` as the client's
- * identity and leave the attacker-supplied `client_name` as the only thing the owner can read. Fall
- * back to the whole URI, which at least names the scheme and host the code would be handed to.
- */
-function identifyingRedirect(redirectUri: string): string {
-  try {
-    const { origin } = new URL(redirectUri);
-    return origin === 'null' ? redirectUri : origin;
-  } catch {
-    return redirectUri;
   }
 }
 
