@@ -27,8 +27,9 @@ export interface OAuthRemoteOptions {
    * the client. Behind the TLS terminator of examples/self-host-remote, pass `'loopback'` (or the
    * hop count) — otherwise every caller shares the proxy's address in a single bucket and an
    * anonymous attacker can exhaust it to lock the owner out of the only path that authorizes the
-   * bridge. `true` is refused: it trusts an unbounded number of hops, which hands the limiter's
-   * key to the caller and removes the protection entirely.
+   * bridge. Anything that trusts the whole address space is refused — `true`, and equally a proxy
+   * list whose CIDRs cover an entire address family: either hands the limiter's key to the caller
+   * and removes the protection entirely.
    */
   trustProxy?: boolean | number | string | string[];
   /** Injectable clock for tests. */

@@ -28,9 +28,10 @@ function commentLines(source: string): Array<{ line: number; text: string }> {
 }
 
 /**
- * Comments that narrate history, cite review tickets, or argue with a future reviewer belong in the
- * commit message: they rot against the code and cannot be verified by anything. Each row is a shape
- * that has actually appeared in this package.
+ * A REGRESSION guard, not an enforcement of CLAUDE.md's comment discipline — that rule is about
+ * what a comment is FOR, which no regex decides. Each row is one phrasing that actually appeared in
+ * this package and was removed, so it cannot come back unnoticed; a comment narrating history in
+ * any other words walks straight past all six, and a human reader is what catches that.
  */
 const BANNED_COMMENT_SHAPES: Array<[string, RegExp]> = [
   ['a review/bug ticket reference', /\b(?:SEC|BUG|CX|D)-\d+\b/],
@@ -41,7 +42,7 @@ const BANNED_COMMENT_SHAPES: Array<[string, RegExp]> = [
   ['an unresolved marker', /\b(?:TODO|FIXME|XXX|HACK)\b/],
 ];
 
-describe('auth-layer comment discipline', () => {
+describe('auth-layer comments never regain a phrasing this package has already removed', () => {
   const files = tsFiles(AUTH_DIR);
 
   it('finds the auth sources to scan', () => {
@@ -56,6 +57,24 @@ describe('auth-layer comment discipline', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  // Every row is a pattern nothing in the package matches, which is also what a pattern matching
+  // NOTHING AT ALL looks like: a row whose regex has quietly stopped compiling to what it reads as
+  // would pass forever. Prove each one still fires on the phrasing it names.
+  const SAMPLE_OFFENDERS: Array<[string, string]> = [
+    ['a review/bug ticket reference', '// see SEC-123 for the discussion'],
+    ['a "Residual:" caveat aimed at a reviewer', '// Residual: the reviewer wanted a second pass'],
+    ['a "Latent ..." justification', '// Latent risk, accepted for now'],
+    ['a "We deliberately ..." defence of a past choice', '// We deliberately kept the old path'],
+    ['a bare "Note:" preamble', '// Note: this is the interesting bit'],
+    ['an unresolved marker', '// TODO: come back to this'],
+  ];
+
+  it.each(BANNED_COMMENT_SHAPES)('%s is a pattern that still matches its own shape', (label: string, pattern: RegExp) => {
+    const sample = SAMPLE_OFFENDERS.find(([l]) => l === label)?.[1];
+    expect(sample, `no sample offender written for "${label}"`).toBeDefined();
+    expect(pattern.test(sample!)).toBe(true);
   });
 });
 
@@ -114,22 +133,29 @@ describe('every public auth entry point is driven by the offline suite', () => {
  * A suite that decides whether to run from a runtime reachability probe reports a green,
  * named, meaningless test when the dependency is merely slow or briefly down — in the same CI
  * job that claims to verify it. Opting out must be explicit.
+ *
+ * The selection happens when the TABLE is built, not inside the test body: a row that returns
+ * before asserting is green for a reason nothing records, and thirty-nine such rows made one real
+ * check look like forty.
  */
+const SELECTS_A_SKIP = /describe\.skip|describe\.skipIf|it\.skip/;
+
 describe('no suite may skip itself into green', () => {
   const files = tsFiles(CORE_SRC, true).filter((f) => f.endsWith('.test.ts'));
+  const skipping = files.filter((f) => SELECTS_A_SKIP.test(readFileSync(f, 'utf8')));
 
-  it('finds the core test files to scan', () => {
+  it('finds the core test files to scan, and at least one that selects a skip', () => {
     expect(files.length).toBeGreaterThan(5);
+    expect(skipping.length).toBeGreaterThan(0);
   });
 
-  it.each(files.map((f) => [f.slice(CORE_SRC.length), f]))(
-    '%s gates any skip on an explicit env opt-out, not on a probe',
+  it.each(skipping.map((f) => [f.slice(CORE_SRC.length), f]))(
+    '%s gates its skip on an explicit env opt-out, not on a probe',
     (_name: string, file: string) => {
-      const source = readFileSync(file, 'utf8');
-      if (!/describe\.skip|describe\.skipIf|it\.skip/.test(source)) return;
-      expect(source, `${file} selects a skip without an explicit env opt-out`).toMatch(
-        /process\.env\./,
-      );
+      expect(
+        readFileSync(file, 'utf8'),
+        `${file} selects a skip without an explicit env opt-out`,
+      ).toMatch(/process\.env\./);
     },
   );
 });
@@ -184,14 +210,20 @@ describe('no doc describes an e2e gate the suite does not implement', () => {
     );
   });
 
-  it('finds at least one doc paragraph naming an e2e suite', () => {
+  // The claim is about paragraphs that talk about SKIPPING, so that is what the table holds — a row
+  // that returns before asserting because its paragraph never mentioned a skip counts a paragraph
+  // naming a suite, which is a different and much larger set.
+  const CLAIMING_A_SKIP = REFERENCES.filter(([, , paragraph]) => /\bskip/i.test(paragraph));
+
+  it('finds at least one doc paragraph naming an e2e suite, and one claiming a skip', () => {
     expect(REFERENCES.length).toBeGreaterThan(0);
+    expect(CLAIMING_A_SKIP.length).toBeGreaterThan(0);
   });
 
-  it.each(REFERENCES)(
-    '%s names every env switch it gates on, if it claims a skip at all',
+  it.each(CLAIMING_A_SKIP)(
+    '%s names every env switch its suite gates on',
     (_name: string, switches: string[], paragraph: string) => {
-      if (!/\bskip/i.test(paragraph)) return;
+      expect(switches.length).toBeGreaterThan(0);
       for (const name of switches) {
         expect(paragraph, `claims a skip without naming ${name}`).toContain(name);
       }

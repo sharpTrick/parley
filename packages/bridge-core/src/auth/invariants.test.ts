@@ -1,12 +1,14 @@
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { parseConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
 import { createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
-import { assertPublicBaseUrl, LOOPBACK_HOSTS } from './invariants.js';
+import { assertPublicBaseUrl, assertTrustProxy, LOOPBACK_HOSTS } from './invariants.js';
 import { createOidcRemoteApp } from './oidc-remote.js';
 import { createRemoteAuthApp, type RemoteAuthServer } from './remote-auth.js';
 import { createOAuthRemoteApp } from './remote.js';
@@ -245,43 +247,160 @@ describe('a factory check that mirrors a schema rule must mirror all of it', () 
  * only its own mode's. Silently discarding the other mode's is worst for `trustProxy`: it is what
  * keys the rate limiters, so a caller who sets it and is ignored believes they are protected from a
  * flood that can lock the owner out of the only path that authorizes the bridge.
+ *
+ * Each row states BOTH halves, because an option that reaches two consumers and is asserted at one
+ * of them is a deletion no test can see: `scopesSupported` reaches the metadata document AND the
+ * provider's /authorize check, and while only the document was read, dropping it from the provider
+ * left an AS advertising a scope it answers `invalid_scope` to — with the whole suite green.
  */
+interface Recorder {
+  called: string[];
+}
+
 interface ModeOption {
   key: string;
   mode: 'builtin' | 'oidc';
-  value: (recorder: { called: string[] }) => unknown;
-  /** What proves the value reached the server it was forwarded to. */
-  observe: (server: RemoteAuthServer, recorder: { called: string[] }) => Promise<void>;
+  value: (recorder: Recorder) => unknown;
+  /** What the object graph or the advertised document says about the option. */
+  observeDeclared: (server: RemoteAuthServer, recorder: Recorder) => Promise<void>;
+  /** What the RUNNING server does with it, over HTTP. */
+  observeEnforced: (server: RemoteAuthServer, recorder: Recorder) => Promise<void>;
+}
+
+const OWNER_PASS = 'correct horse battery staple';
+const CLIENT_REDIRECT = 'http://127.0.0.1:9999/callback';
+const S256_CHALLENGE = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+
+const form = (o: Record<string, string>): string => new URLSearchParams(o).toString();
+
+async function listening(server: RemoteAuthServer): Promise<string> {
+  await server.listen(Number(server.resource.port));
+  return server.resource.origin;
+}
+
+async function registerClient(origin: string): Promise<string> {
+  const res = await fetch(`${origin}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      redirect_uris: [CLIENT_REDIRECT],
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code'],
+      response_types: ['code'],
+    }),
+  });
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { client_id: string }).client_id;
+}
+
+function authorizeUrl(origin: string, clientId: string, scope?: string): string {
+  return `${origin}/authorize?${form({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: CLIENT_REDIRECT,
+    code_challenge: S256_CHALLENGE,
+    code_challenge_method: 'S256',
+    ...(scope !== undefined ? { scope } : {}),
+  })}`;
+}
+
+async function consentIdFrom(origin: string, clientId: string): Promise<string> {
+  const page = await (await fetch(authorizeUrl(origin, clientId))).text();
+  const consentId = /name="consent_id" value="([^"]+)"/.exec(page)?.[1];
+  expect(consentId, 'the /authorize response is not a consent page').toBeTruthy();
+  return consentId!;
+}
+
+function submitConsent(origin: string, consentId: string, passphrase: string): Promise<Response> {
+  return fetch(`${origin}/parley/consent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: form({ consent_id: consentId, passphrase }),
+    redirect: 'manual',
+  });
 }
 
 const MODE_OPTIONS: ModeOption[] = [
   {
     key: 'verifyOwner',
     mode: 'builtin',
-    value: () => async () => true,
-    observe: async (server) => {
+    value: () => async (pass: string) => pass === OWNER_PASS,
+    observeDeclared: async (server) => {
       expect(server).toHaveProperty('provider');
+    },
+    observeEnforced: async (server) => {
+      const origin = await listening(server);
+      const clientId = await registerClient(origin);
+      const wrong = await submitConsent(
+        origin,
+        await consentIdFrom(origin, clientId),
+        `not ${OWNER_PASS}`,
+      );
+      expect(wrong.status).toBe(403);
+      const right = await submitConsent(origin, await consentIdFrom(origin, clientId), OWNER_PASS);
+      expect(right.status).toBe(302);
+      expect(new URL(right.headers.get('location')!).searchParams.get('code')).toBeTruthy();
     },
   },
   {
     key: 'trustProxy',
     mode: 'builtin',
     value: () => 'loopback',
-    observe: async (server) => {
+    observeDeclared: async (server) => {
       expect(server.app.get('trust proxy')).toBe('loopback');
+    },
+    observeEnforced: async (server) => {
+      const origin = await listening(server);
+      const hit = (xff: string): Promise<Response> =>
+        fetch(`${origin}/parley/consent`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': xff },
+          body: form({ consent_id: 'none', passphrase: 'none' }),
+          redirect: 'manual',
+        });
+      const remaining = (res: Response): number => Number(res.headers.get('ratelimit-remaining'));
+      // One declared hop: the request arrives over loopback, so only the RIGHTMOST element is the
+      // proxy's word and the leftmost is the caller's own — it must not mint a fresh bucket.
+      const first = remaining(await hit('9.9.9.1, 198.51.100.4'));
+      const second = remaining(await hit('9.9.9.2, 198.51.100.4'));
+      expect(first).toBeGreaterThan(0);
+      expect(second).toBe(first - 1);
     },
   },
   {
     key: 'scopesSupported',
     mode: 'builtin',
     value: () => ['mcp', 'parley:admin'],
-    observe: async (server) => {
-      const port = Number(server.resource.port);
-      await server.listen(port);
+    observeDeclared: async (server) => {
+      const origin = await listening(server);
       const as = (await (
-        await fetch(`${server.resource.origin}/.well-known/oauth-authorization-server`)
+        await fetch(`${origin}/.well-known/oauth-authorization-server`)
       ).json()) as Record<string, unknown>;
       expect(as.scopes_supported).toEqual(['mcp', 'parley:admin']);
+    },
+    observeEnforced: async (server) => {
+      const origin = await listening(server);
+      const as = (await (
+        await fetch(`${origin}/.well-known/oauth-authorization-server`)
+      ).json()) as { scopes_supported: string[] };
+      expect(as.scopes_supported.length).toBeGreaterThan(0);
+      const clientId = await registerClient(origin);
+      // Driven off the document the server just served, not off the row's literal: whatever this
+      // AS advertises, it must also ACCEPT — one at a time and all together.
+      for (const scope of [...as.scopes_supported, as.scopes_supported.join(' ')]) {
+        const res = await fetch(authorizeUrl(origin, clientId, scope), { redirect: 'manual' });
+        expect(res.status, `advertised scope ${JSON.stringify(scope)}`).toBe(200);
+        expect(await res.text()).toContain('name="consent_id"');
+      }
+      const unadvertised = 'parley:not-advertised';
+      expect(as.scopes_supported).not.toContain(unadvertised);
+      const refused = await fetch(authorizeUrl(origin, clientId, unadvertised), {
+        redirect: 'manual',
+      });
+      expect(refused.status).toBe(302);
+      expect(new URL(refused.headers.get('location')!).searchParams.get('error')).toBe(
+        'invalid_scope',
+      );
     },
   },
   {
@@ -289,14 +408,41 @@ const MODE_OPTIONS: ModeOption[] = [
     mode: 'oidc',
     value: (recorder) => (async (input: unknown, init?: RequestInit) => {
       recorder.called.push(String(input));
-      return fetch(String(input), init);
+      const doc = (await (await fetch(String(input), init)).json()) as Record<string, unknown>;
+      // Same origin as the issuer, so the discovery-origin check still passes, but not the real
+      // JWKS — the enforced half then has something only THIS document can explain.
+      return Response.json({ ...doc, jwks_uri: new URL('/not-the-jwks', String(doc.issuer)).href });
     }) as unknown as typeof fetch,
-    observe: async (_server, recorder) => {
+    observeDeclared: async (_server, recorder) => {
       expect(recorder.called).toHaveLength(1);
       expect(recorder.called[0]).toContain('/.well-known/openid-configuration');
     },
+    observeEnforced: async (server) => {
+      const origin = await listening(server);
+      const res = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${await idp.mint({ aud: server.resource.href })}`,
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+      expect(res.status).toBe(401);
+    },
   },
 ];
+
+/**
+ * The row set is checked against the selector's own table rather than eyeballed, so a mode-scoped
+ * option added tomorrow arrives with no observation and fails the day it lands.
+ */
+function modeOnlyOptionsFromSource(): string[] {
+  const src = readFileSync(fileURLToPath(new URL('./remote-auth.ts', import.meta.url)), 'utf8');
+  const table = /const MODE_ONLY_OPTIONS[^=]*=\s*\[([\s\S]*?)\n\];/.exec(src)?.[1];
+  if (table === undefined) throw new Error('MODE_ONLY_OPTIONS not found in remote-auth.ts');
+  return [...table.matchAll(/\['(\w+)',\s*'(\w+)'\]/g)].map((m) => `${m[1]}:${m[2]}`);
+}
 
 async function buildInMode(
   mode: 'builtin' | 'oidc',
@@ -319,24 +465,47 @@ async function buildInMode(
 }
 
 describe('the front-door selector never silently discards an option belonging to the other mode', () => {
+  it('covers every mode-scoped option the selector names, and no other', () => {
+    const declared = modeOnlyOptionsFromSource();
+    expect(declared.length).toBeGreaterThan(0);
+    expect(MODE_OPTIONS.map((o) => `${o.key}:${o.mode}`).sort()).toEqual([...declared].sort());
+  });
+
   it.each(MODE_OPTIONS.map((o): [string, ModeOption] => [`${o.key} (${o.mode} only)`, o]))(
     '%s is refused by name in the other mode',
     async (_name: string, option: ModeOption) => {
       const other = option.mode === 'builtin' ? 'oidc' : 'builtin';
-      const recorder = { called: [] as string[] };
+      const recorder: Recorder = { called: [] };
       await expect(
         buildInMode(other, { [option.key]: option.value(recorder) }),
       ).rejects.toThrow(new RegExp(option.key));
     },
   );
 
-  it.each(MODE_OPTIONS.map((o): [string, ModeOption] => [`${o.key} (${o.mode} only)`, o]))(
-    '%s is observable on the server it belongs to',
-    async (_name: string, option: ModeOption) => {
-      const recorder = { called: [] as string[] };
+  const SIDES: Array<[string, (o: ModeOption) => ModeOption['observeDeclared']]> = [
+    ['what the server declares', (o) => o.observeDeclared],
+    ['what the server enforces', (o) => o.observeEnforced],
+  ];
+
+  const OBSERVATIONS = MODE_OPTIONS.flatMap((o) =>
+    SIDES.map((side): [string, ModeOption, (typeof SIDES)[number][1]] => [
+      `${o.key} (${o.mode} only) reaches ${side[0]}`,
+      o,
+      side[1],
+    ]),
+  );
+
+  it.each(OBSERVATIONS)(
+    '%s',
+    async (
+      _name: string,
+      option: ModeOption,
+      side: (o: ModeOption) => ModeOption['observeDeclared'],
+    ) => {
+      const recorder: Recorder = { called: [] };
       const server = await buildInMode(option.mode, { [option.key]: option.value(recorder) });
       opened.push(server);
-      await option.observe(server, recorder);
+      await side(option)(server, recorder);
     },
   );
 
@@ -345,6 +514,30 @@ describe('the front-door selector never silently discards an option belonging to
       buildInMode('oidc', { trustProxy: 'loopback', scopesSupported: ['mcp'] });
     await expect(build()).rejects.toThrow(/trustProxy/);
     await expect(build()).rejects.toThrow(/scopesSupported/);
+  });
+});
+
+/**
+ * `assertTrustProxy` refuses a value that trusts the WHOLE address space, however it is spelled —
+ * the behavioural half of that lives in remote.test.ts, where a forged X-Forwarded-For is shown not
+ * to mint its own rate-limit bucket. This is the other half, and the one a coverage check gets
+ * wrong: a real deployment behind a CDN names PUBLIC ranges, so a guard that refuses "any routable
+ * address is trusted" would refuse the topology it exists to serve. Every row here is a proxy list
+ * an operator legitimately writes.
+ */
+const LEGITIMATE_PROXY_LISTS: Array<[string, string | string[]]> = [
+  ['the reverse proxy in examples/self-host-remote', 'loopback'],
+  ['a single public proxy by address', '8.8.8.8'],
+  ['a CDN’s published IPv4 and IPv6 ranges', ['1.2.3.0/24', '2606:4700::/32']],
+  ['several public ranges in one comma-separated string', '203.0.113.0/24, 198.51.100.0/24'],
+  ['a private proxy tier', ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']],
+  ['every IPv4 half but one', ['0.0.0.0/1']],
+  ['express’s own named presets', 'loopback, linklocal, uniquelocal'],
+];
+
+describe('the trust-proxy guard refuses covering the address space, not naming a public one', () => {
+  it.each(LEGITIMATE_PROXY_LISTS)('accepts %s', (_name: string, value: string | string[]) => {
+    expect(() => assertTrustProxy(value, 'trustProxy')).not.toThrow();
   });
 });
 

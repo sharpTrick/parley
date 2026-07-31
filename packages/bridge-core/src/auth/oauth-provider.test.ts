@@ -13,7 +13,7 @@ import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { escapeHtml } from './html.js';
-import { ParleyOAuthProvider, type ParleyOAuthProviderOptions } from './oauth-provider.js';
+import { ConsentError, ParleyOAuthProvider, type ParleyOAuthProviderOptions } from './oauth-provider.js';
 
 const RESOURCE = new URL('https://bridge.example/mcp');
 const REDIRECT = 'https://app.example/cb';
@@ -301,19 +301,6 @@ describe('ParleyOAuthProvider — expired state is swept, not left to accumulate
     }
   });
 
-  it('caps the DCR clients map at MAX_CLIENTS by evicting the oldest registration', () => {
-    const p = makeProvider(() => 1);
-    const store = p.clientsStore;
-    const register = store.registerClient;
-    if (register === undefined) throw new Error('registerClient not implemented');
-    for (let i = 0; i < 150; i++) {
-      register({ client_id: `c-${i}`, redirect_uris: [REDIRECT] } as OAuthClientInformationFull);
-    }
-    expect(peek(p).clients.size).toBeLessThanOrEqual(100);
-    expect(store.getClient('c-0')).toBeUndefined(); // oldest evicted
-    expect(store.getClient('c-149')).toBeDefined(); // newest retained
-  });
-
   it('stop() clears the background sweep interval (no dangling timer)', () => {
     const spy = vi.spyOn(globalThis, 'clearInterval');
     const p = new ParleyOAuthProvider({
@@ -324,6 +311,102 @@ describe('ParleyOAuthProvider — expired state is swept, not left to accumulate
     });
     p.stop();
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The TTL sweeper is a RATE, not a bound: on a single-process, unpersisted server whose README
+ * tells the operator to give the one process more room rather than adding replicas, a store an
+ * unauthenticated caller can grow is a memory-exhaustion primitive with no ceiling. Which stores
+ * those are is not a judgement made here — it is the classification `clientStates()` already
+ * makes (`ownerApproved`), and the row set is checked against the live instance, so a Map added to
+ * the provider tomorrow arrives unclassified and fails.
+ */
+type StoreName = keyof Pick<
+  Internals,
+  'clients' | 'codes' | 'redeeming' | 'access' | 'refresh' | 'pending'
+>;
+
+interface ProviderStore {
+  store: StoreName;
+  /** 'anonymous' = reachable without the owner passphrase. */
+  writer: 'anonymous' | 'owner';
+  /** Anonymous stores only: the ceiling, and one more entry through the public entry point. */
+  cap?: number;
+  add?: (p: ParleyOAuthProvider, i: number) => Promise<string>;
+}
+
+const PROVIDER_STORES: ProviderStore[] = [
+  {
+    store: 'clients',
+    writer: 'anonymous',
+    cap: 100,
+    add: async (p, i) => {
+      const client = makeClient(`c-${i}`);
+      p.clientsStore.registerClient?.(client);
+      return client.client_id;
+    },
+  },
+  {
+    store: 'pending',
+    writer: 'anonymous',
+    cap: 100,
+    add: async (p, i) => {
+      const client = makeClient(`c-${i}`);
+      peek(p).clients.set(client.client_id, client);
+      await p.authorize(client, makeParams(), fakeRes());
+      return [...peek(p).pending.keys()].at(-1)!;
+    },
+  },
+  { store: 'codes', writer: 'owner' },
+  { store: 'redeeming', writer: 'owner' },
+  { store: 'access', writer: 'owner' },
+  { store: 'refresh', writer: 'owner' },
+];
+
+describe('ParleyOAuthProvider — no anonymous caller can grow a store without a ceiling', () => {
+  it('classifies every Map the provider actually keeps', () => {
+    const p = makeProvider(() => 1);
+    const maps = Object.entries(p as unknown as Record<string, unknown>)
+      .filter(([, v]) => v instanceof Map)
+      .map(([k]) => k);
+    expect(maps.length).toBeGreaterThan(0);
+    expect(PROVIDER_STORES.map((s) => s.store).sort()).toEqual([...maps].sort());
+  });
+
+  const ANONYMOUS = PROVIDER_STORES.filter((s) => s.writer === 'anonymous');
+
+  it('finds anonymous-writable stores to drive', () => {
+    expect(ANONYMOUS.length).toBeGreaterThan(0);
+  });
+
+  it.each(ANONYMOUS.map((s): [string, ProviderStore] => [s.store, s]))(
+    '%s stays bounded when driven past its cap, shedding oldest-first',
+    async (_name: string, s: ProviderStore) => {
+      const cap = s.cap!;
+      const p = makeProvider(() => 1);
+      const keys: string[] = [];
+      for (let i = 0; i < cap * 2; i++) keys.push(await s.add!(p, i));
+      expect(peek(p)[s.store].size).toBeLessThanOrEqual(cap);
+      expect(peek(p)[s.store].has(keys[0]!)).toBe(false);
+      expect(peek(p)[s.store].has(keys.at(-1)!)).toBe(true);
+    },
+  );
+
+  // The classification above is only as good as its 'owner' half: everything an unauthenticated
+  // caller can reach is DCR plus /authorize, and every store outside that pair must stay empty.
+  it('leaves every owner-writable store empty after an anonymous caller does all it can', async () => {
+    const p = makeProvider(() => 1);
+    const client = makeClient();
+    p.clientsStore.registerClient?.(client);
+    await p.authorize(client, makeParams(), fakeRes());
+    const consentId = [...peek(p).pending.keys()].at(-1)!;
+    await expect(p.completeConsent(consentId, 'not the passphrase')).rejects.toBeInstanceOf(
+      ConsentError,
+    );
+    for (const { store } of PROVIDER_STORES.filter((s) => s.writer === 'owner')) {
+      expect(peek(p)[store].size, `${store} grew without the owner passphrase`).toBe(0);
+    }
   });
 });
 

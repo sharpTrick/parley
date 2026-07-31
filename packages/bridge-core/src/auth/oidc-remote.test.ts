@@ -322,6 +322,65 @@ describe('remote OIDC front door (delegated resource server)', () => {
 });
 
 /**
+ * docs/keycloak-integration.md promises that "every 401 this server emits carries the same error
+ * message — an unauthorized caller learns nothing about which check failed or what the gate policy
+ * is", and oidc-verifier.ts chooses 401 over 403 for the identity gate for that reason. That is a
+ * property of the SET of responses, which no test comparing one rejection to an expected status can
+ * see: a distinct gate message told any realm user that their signature, iss, aud and exp all
+ * passed and only the policy stopped them. Widen this generator with a new rejection reason and it
+ * either shares the surface or fails.
+ */
+const ALL_GATES = {
+  allowed_subjects: ['owner-sub'],
+  allowed_usernames: ['alice'],
+  required_role: 'parley-owner',
+};
+
+const GOOD_CLAIMS = (): FakeOidcClaims => ({
+  aud: `${origin}/mcp`,
+  sub: 'owner-sub',
+  preferred_username: 'alice',
+  realm_access: { roles: ['parley-owner'] },
+});
+
+/** Each row is the accepted token with exactly ONE thing wrong, so no row can pass on a second
+ *  defect it did not mean to introduce. */
+const REJECTIONS: Array<[string, () => FakeOidcClaims | string]> = [
+  ['a rogue signature', () => ({ ...GOOD_CLAIMS(), signWithRogueKey: true })],
+  ['a wrong issuer', () => ({ ...GOOD_CLAIMS(), issuerOverride: 'http://evil.example' })],
+  ['a wrong audience', () => ({ ...GOOD_CLAIMS(), aud: 'someone-else' })],
+  ['an expired token', () => ({ ...GOOD_CLAIMS(), expiresInS: -600 })],
+  ['a not-yet-valid token', () => ({ ...GOOD_CLAIMS(), notBeforeInS: 600 })],
+  ['a subject outside allowed_subjects', () => ({ ...GOOD_CLAIMS(), sub: 'stranger-sub' })],
+  ['a username outside allowed_usernames', () => ({ ...GOOD_CLAIMS(), preferred_username: 'mallory' })],
+  ['a token without required_role', () => ({ ...GOOD_CLAIMS(), realm_access: { roles: ['user'] } })],
+  ['a token that is not a JWT at all', () => 'not-a-jwt'],
+];
+
+describe('a 401 either tells an unauthorized caller which check failed, or tells them nothing', () => {
+  it('emits one and only one response surface across every rejection reason', async () => {
+    await boot(ALL_GATES);
+    // The rows are one claim away from a token this server ACCEPTS, so each isolates its own check.
+    expect((await postMcp({ Authorization: `Bearer ${await idp.mint(GOOD_CLAIMS())}` })).status).toBe(200);
+
+    const surfaces = new Map<string, string[]>();
+    for (const [name, claims] of REJECTIONS) {
+      const bad = claims();
+      const token = typeof bad === 'string' ? bad : await idp.mint(bad);
+      const res = await postMcp({ Authorization: `Bearer ${token}` });
+      expect(res.status, name).toBe(401);
+      const surface = JSON.stringify([
+        res.status,
+        res.headers.get('www-authenticate'),
+        await res.text(),
+      ]);
+      surfaces.set(surface, [...(surfaces.get(surface) ?? []), name]);
+    }
+    expect(surfaces.size, `distinguishable 401s: ${JSON.stringify([...surfaces.values()])}`).toBe(1);
+  });
+});
+
+/**
  * A policy knob is only real where a caller can observe it. `clock_skew_s` is applied inside the
  * verifier, but the SDK's requireBearerAuth re-checks `AuthInfo.expiresAt` against wall-clock with
  * no tolerance of its own — so a verifier-only assertion pins a property no HTTP caller ever sees,

@@ -73,6 +73,15 @@ const ID_TOKEN_ONLY_CLAIMS = ['nonce', 'at_hash', 'c_hash'];
 
 const DEFAULT_CLOCK_SKEW_S = 30;
 
+/**
+ * Keep every 401 on this ONE string, so that a caller cannot tell which check refused it: the SDK
+ * echoes it verbatim into `WWW-Authenticate: error_description` and the JSON body, and a distinct
+ * message for the identity gate tells any realm user that their signature, `iss`, `aud` and `exp`
+ * all passed and only the gate policy stopped them. Keep it ASCII, so that it survives the Latin1-
+ * only WWW-Authenticate header.
+ */
+const REJECTION_MESSAGE = 'invalid or expired access token';
+
 /** Keycloak-style realm-roles claim. */
 interface RealmAccessClaim {
   roles?: unknown;
@@ -111,12 +120,11 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
         ...(opts.now !== undefined ? { currentDate: new Date(opts.now()) } : {}),
       }));
     } catch {
-      // Never leak which check failed (sig vs iss vs exp vs aud).
-      throw new InvalidTokenError('invalid or expired access token');
+      throw new InvalidTokenError(REJECTION_MESSAGE);
     }
 
     if (!isAccessToken(header, payload)) {
-      throw new InvalidTokenError('invalid or expired access token');
+      throw new InvalidTokenError(REJECTION_MESSAGE);
     }
 
     const scopes = typeof payload.scope === 'string' ? payload.scope.split(' ').filter(Boolean) : [];
@@ -125,8 +133,7 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
     }
 
     if (!this.passesIdentityGates(payload)) {
-      // ASCII only: the message ends up in the WWW-Authenticate header, which rejects non-Latin1.
-      throw new InvalidTokenError('token does not satisfy this server access policy');
+      throw new InvalidTokenError(REJECTION_MESSAGE);
     }
 
     const clientId =

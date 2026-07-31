@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   InsufficientScopeError,
   InvalidTokenError,
@@ -202,6 +204,25 @@ describe('OidcTokenVerifier — an identity gate is an exact match, not a resemb
       );
     },
   );
+});
+
+/**
+ * The HTTP-level cardinality check in oidc-remote.test.ts can only reach rejection reasons the
+ * shared fake IdP can mint — the ID-token/`typ` branch is not one of them. Reading the source
+ * covers every branch there is, including one added tomorrow to a check nothing here can drive.
+ */
+describe('OidcTokenVerifier — no rejection branch may invent its own message', () => {
+  const source = readFileSync(fileURLToPath(new URL('./oidc-verifier.ts', import.meta.url)), 'utf8');
+
+  it('throws InvalidTokenError from more than one place', () => {
+    expect([...source.matchAll(/new InvalidTokenError\(/g)].length).toBeGreaterThan(1);
+  });
+
+  it('constructs every InvalidTokenError from the single shared message constant', () => {
+    const args = [...source.matchAll(/new InvalidTokenError\(([^)]*)\)/g)].map((m) => m[1]!.trim());
+    expect(args.length).toBeGreaterThan(0);
+    expect([...new Set(args)]).toEqual(['REJECTION_MESSAGE']);
+  });
 });
 
 describe('OidcTokenVerifier — scope + identity gates', () => {

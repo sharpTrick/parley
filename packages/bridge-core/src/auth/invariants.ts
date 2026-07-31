@@ -1,3 +1,4 @@
+import express from 'express';
 import type { OidcAuthConfig } from '../config.js';
 
 /**
@@ -154,19 +155,48 @@ export function assertTrustRootUrl(url: string, field: string): void {
 
 const UNBOUNDED_TRUST = new Set<unknown>([true, 'true']);
 
-/**
- * Keep this refusal, so that `req.ip` can never be a value the caller wrote: Express resolves it
- * from the `trust proxy` setting, and every rate limiter on a front door keys on it — including the
- * brute-force gate on the owner passphrase, the single secret that authorizes the whole bridge.
- */
-export function assertTrustProxy(value: unknown, field: string): void {
-  if (!UNBOUNDED_TRUST.has(value)) return;
-  throw new Error(
-    `${field} must not be ${JSON.stringify(value)}. It trusts every hop of X-Forwarded-For, so ` +
+/** One address per IPv4 /8 and per IPv6 top nibble: a proxy list that trusts every one of these
+ *  leaves no address it would refuse, whatever the CIDRs spelling it are. */
+const ADDRESS_SPACE: Array<[string, string[]]> = [
+  ['IPv4', Array.from({ length: 256 }, (_, i) => `${i}.128.0.1`)],
+  ['IPv6', Array.from({ length: 16 }, (_, i) => `${i.toString(16)}000::1`)],
+];
+
+function unboundedTrust(field: string, value: unknown, because: string): Error {
+  return new Error(
+    `${field} must not be ${JSON.stringify(value)}. ${because}, so ` +
       `req.ip becomes a header the caller writes and every per-address rate limit on this front ` +
       `door is defeated by rotating it — an anonymous attacker gets unlimited guesses at the ` +
       `owner passphrase. Name the real topology instead: "loopback" for the reverse proxy in ` +
       `examples/self-host-remote, the number of proxy hops as a number, or the proxies' CIDR.`,
+  );
+}
+
+/**
+ * Keep this refusal, so that `req.ip` can never be a value the caller wrote: Express resolves it
+ * from the `trust proxy` setting, and every rate limiter on a front door keys on it — including the
+ * brute-force gate on the owner passphrase, the single secret that authorizes the whole bridge.
+ *
+ * The refusal is a property of what the value TRUSTS, not of how it is written: a proxy list whose
+ * CIDRs cover a whole address family is `true` under another name. Express's own compiled predicate
+ * answers that question, so a list naming real public proxies — a CDN's ranges, say — is unaffected.
+ * A hop count is exempt: its predicate ignores the address entirely, and how many hops the real
+ * chain has is not knowable here.
+ */
+export function assertTrustProxy(value: unknown, field: string): void {
+  if (UNBOUNDED_TRUST.has(value)) {
+    throw unboundedTrust(field, value, 'It trusts every hop of X-Forwarded-For');
+  }
+  if (typeof value !== 'string' && !Array.isArray(value)) return;
+  const probe = express();
+  probe.set('trust proxy', value);
+  const trusted = probe.get('trust proxy fn') as (addr: string, hop: number) => boolean;
+  const covered = ADDRESS_SPACE.filter(([, samples]) => samples.every((addr) => trusted(addr, 0)));
+  if (covered.length === 0) return;
+  throw unboundedTrust(
+    field,
+    value,
+    `It trusts every ${covered.map(([family]) => family).join(' and ')} address there is`,
   );
 }
 

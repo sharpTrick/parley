@@ -26,6 +26,7 @@ const CODE_TTL_MS = 60_000; // 1 minute, single-use
 const CONSENT_TTL_MS = 5 * 60_000; // 5 minutes to approve
 const SWEEP_INTERVAL_MS = 60_000;
 const MAX_CLIENTS = 100;
+const MAX_PENDING = 100;
 
 interface CodeRecord {
   clientId: string;
@@ -252,7 +253,23 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       redirectUriSupplied: redirectUriWasSupplied(res),
       expiresAtMs: this.now() + CONSENT_TTL_MS,
     });
+    this.capPending();
     res.status(200).type('html').send(this.consentPage(consentId, client, consented));
+  }
+
+  /**
+   * The 60s sweeper and the 5-minute TTL are a rate, not a bound, and every entry here is state an
+   * anonymous caller created by calling /authorize — so shed the oldest once the map is full, the
+   * same honest ordering {@link evictionCandidate} sheds registrations by. Refusing instead would
+   * hand the same anonymous caller a way to lock the owner out of the only path that authorizes
+   * the bridge.
+   */
+  private capPending(): void {
+    while (this.pending.size > MAX_PENDING) {
+      const oldest = this.pending.keys().next().value;
+      if (oldest === undefined) return;
+      this.pending.delete(oldest);
+    }
   }
 
   /**

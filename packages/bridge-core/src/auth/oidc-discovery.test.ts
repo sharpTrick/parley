@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { fetchOidcDiscovery } from './oidc-discovery.js';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterAll, describe, expect, it } from 'vitest';
+import { DISCOVERY_TIMEOUT_MS, fetchOidcDiscovery } from './oidc-discovery.js';
 
 const ISSUER = 'https://kc.example.com/realms/parley';
 const EVIL = 'https://evil.example/realms/parley';
@@ -162,6 +164,77 @@ describe('fetchOidcDiscovery — every rejection branch of the boot-time trust-r
       expect(documentIssuer).not.toBe(ISSUER);
       expect(new URL(documentIssuer).origin).toBe(new URL(ISSUER).origin);
     }
+  });
+});
+
+/**
+ * Every row above answers instantly, which is the one failure mode a boot-time network call does
+ * not have: `createOidcRemoteApp` awaits this before anything listens, so an issuer that accepts
+ * the connection and then says nothing leaves a process that prints nothing, binds no port, and
+ * fails its health check indistinguishably from a hung backend. A deadline is a property of the
+ * CALL, not of any one misbehaviour, so each row here is a different way to answer slowly and all
+ * of them must land inside the same wall-clock budget with the URL named.
+ */
+interface SlowIssuer {
+  name: string;
+  /** Left deliberately unanswered / unfinished — the server is torn down at the end of the file. */
+  handle: (res: import('node:http').ServerResponse) => void;
+}
+
+const SLOW_ISSUERS: SlowIssuer[] = [
+  { name: 'accepts the connection and never responds', handle: () => {} },
+  {
+    name: 'sends headers and then dribbles the body forever',
+    handle: (res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"issuer":"https://kc.example.com/rea');
+    },
+  },
+];
+
+describe('fetchOidcDiscovery — a boot-time fetch that cannot finish must not hang the boot', () => {
+  const servers: Server[] = [];
+  const DEADLINE_MS = 250;
+  const BUDGET_MS = 5_000;
+
+  afterAll(async () => {
+    await Promise.all(
+      servers.map((s) => {
+        // These sockets are deliberately mid-request, so a plain close() waits them out.
+        s.closeAllConnections();
+        return new Promise<void>((r) => s.close(() => r()));
+      }),
+    );
+  });
+
+  async function issuerThat(handle: SlowIssuer['handle']): Promise<string> {
+    const server = createServer((_req, res) => handle(res));
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    return `http://127.0.0.1:${(server.address() as AddressInfo).port}/realms/parley`;
+  }
+
+  it.each(SLOW_ISSUERS.map((s) => [s.name, s]))(
+    'an issuer that %s is refused, with the URL named',
+    async (_name: string, slow: SlowIssuer) => {
+      const issuer = await issuerThat(slow.handle);
+      const started = Date.now();
+      await expect(fetchOidcDiscovery(issuer, fetch, DEADLINE_MS)).rejects.toThrow(
+        new RegExp(`cannot reach ${issuer}/\\.well-known/openid-configuration`),
+      );
+      expect(Date.now() - started).toBeLessThan(BUDGET_MS);
+    },
+  );
+
+  // The deadline is only real if the default carries it: every caller but this suite omits it.
+  it('applies a bounded default deadline when the caller names none', async () => {
+    expect(DISCOVERY_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(DISCOVERY_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
+    const { fetchFn, calls } = recording(() => json(metadataFor(ISSUER)));
+    await fetchOidcDiscovery(ISSUER, fetchFn);
+    const { signal } = calls[0]!.init ?? {};
+    expect(signal, 'the discovery fetch was issued with no AbortSignal').toBeInstanceOf(AbortSignal);
+    expect(signal!.aborted).toBe(false);
   });
 });
 

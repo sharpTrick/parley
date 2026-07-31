@@ -986,11 +986,12 @@ const LIMITED_ROUTES: LimitedRoute[] = [
  */
 type KeyedOn = 'socket' | 'client' | 'forged';
 
+type TrustProxy = boolean | number | string | string[];
+
 interface Topology {
   name: string;
-  trustProxy: boolean | number | string;
-  /** Refused rows say who refuses: our own guard by name, or Express's proxy-addr parser. */
-  outcome: { keyedOn: KeyedOn } | { refusedBy: 'parley' | 'express' };
+  trustProxy: TrustProxy;
+  outcome: { keyedOn: KeyedOn };
 }
 
 const TOPOLOGIES: Topology[] = [
@@ -999,14 +1000,64 @@ const TOPOLOGIES: Topology[] = [
   { name: 'behind one reverse-proxy hop', trustProxy: 'loopback', outcome: { keyedOn: 'client' } },
   { name: 'behind one hop given as a count', trustProxy: 1, outcome: { keyedOn: 'client' } },
   { name: 'proxies named by CIDR', trustProxy: '203.0.113.0/24', outcome: { keyedOn: 'socket' } },
+  // A proxy list may legitimately name PUBLIC addresses — a CDN's ranges are the common case — so
+  // the refusal below must key on covering the space, not on the addresses being routable. The
+  // other spellings of a legitimate public proxy are driven against the guard itself, in
+  // invariants.test.ts, where they cost no port.
+  { name: 'a public proxy named by address', trustProxy: '8.8.8.8', outcome: { keyedOn: 'socket' } },
   // A hop count LARGER than the real chain trusts one forged element. The guard bounds how far
   // trust can reach; it cannot check the operator's arithmetic — and this row is what proves the
   // probe below can see a forged-keyed bucket at all, so the rows above are not vacuous.
   { name: 'a hop count larger than the real chain', trustProxy: 2, outcome: { keyedOn: 'forged' } },
-  { name: 'every hop trusted', trustProxy: true, outcome: { refusedBy: 'parley' } },
-  { name: 'every hop trusted, spelled as an env var', trustProxy: 'true', outcome: { refusedBy: 'parley' } },
-  { name: 'a wildcard', trustProxy: '*', outcome: { refusedBy: 'express' } },
-  { name: 'a CIDR covering the whole address space', trustProxy: '0.0.0.0/0', outcome: { refusedBy: 'express' } },
+];
+
+/**
+ * A guard that enumerates SPELLINGS is a guard the next spelling walks past: `'0.0.0.0/0'` was the
+ * only whole-space CIDR listed here, express's parser happens to reject a /0 prefix, and the class
+ * therefore sat behind a locked tuple while `['0.0.0.0/1','128.0.0.0/1']` — identical in meaning to
+ * `true` — booted and handed every forged X-Forwarded-For its own fresh 10-per-15-min bucket at the
+ * owner passphrase. So each row states only the VALUE, and the assertion is behavioural: refuse at
+ * the factory, or key the limiter on something the caller did not write. `message` is set only for
+ * the ones Parley refuses by name; the rest may be refused by express's parser instead.
+ *
+ * Hop counts are deliberately absent: express compiles a count to a predicate that ignores the
+ * address entirely, and how many hops the real chain has is not knowable at boot — that residue is
+ * the `keyedOn: 'forged'` row above, stated rather than hidden.
+ */
+interface WholeSpaceSpelling {
+  name: string;
+  trustProxy: TrustProxy;
+  message?: RegExp;
+}
+
+const WHOLE_SPACE_SPELLINGS: WholeSpaceSpelling[] = [
+  { name: 'the boolean', trustProxy: true, message: /trustProxy must not be/ },
+  { name: 'the boolean spelled as an env var', trustProxy: 'true', message: /trustProxy must not be/ },
+  { name: 'a wildcard', trustProxy: '*' },
+  { name: 'a /0 CIDR', trustProxy: '0.0.0.0/0' },
+  { name: 'an IPv6 /0 CIDR', trustProxy: ['::/0'] },
+  {
+    name: 'two IPv4 halves',
+    trustProxy: ['0.0.0.0/1', '128.0.0.0/1'],
+    message: /trusts every IPv4 address/,
+  },
+  {
+    name: 'two IPv4 halves in one comma-separated string',
+    trustProxy: '0.0.0.0/1, 128.0.0.0/1',
+    message: /trusts every IPv4 address/,
+  },
+  {
+    name: 'two IPv6 halves, which cover the IPv4-mapped space too',
+    trustProxy: ['::/1', '8000::/1'],
+    message: /trusts every IPv4 and IPv6 address/,
+  },
+  // proxy-addr compares an IPv4 peer as ::ffff:a.b.c.d, whose top bit is 0 — so ONE IPv6 half is
+  // already the whole IPv4 space, and this is the spelling that looks the least like `true`.
+  {
+    name: 'the lower IPv6 half alone, which is all of the IPv4-mapped space',
+    trustProxy: ['::/1'],
+    message: /trusts every IPv4 address/,
+  },
 ];
 
 const ATTACKER = '203.0.113.9';
@@ -1026,7 +1077,7 @@ describe('a rate limiter must key on the client the operator actually deploys be
   let app: OAuthRemoteServer | undefined;
   let base: string;
 
-  async function boot(trustProxy?: boolean | number | string): Promise<void> {
+  async function boot(trustProxy?: TrustProxy): Promise<void> {
     const port = await freePort();
     base = `http://127.0.0.1:${port}`;
     app = createOAuthRemoteApp(plugin, parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] }), {
@@ -1046,8 +1097,30 @@ describe('a rate limiter must key on the client the operator actually deploys be
   const remaining = (res: Response): number => Number(res.headers.get('ratelimit-remaining'));
   const limitOf = (res: Response): number => Number(res.headers.get('ratelimit-limit'));
 
-  const ACCEPTED = TOPOLOGIES.filter((t) => 'keyedOn' in t.outcome);
-  const ROWS = ACCEPTED.flatMap((t) =>
+  /** Drive the three probes and read back WHICH address the limiter counted them under. */
+  async function observedKeying(route: LimitedRoute): Promise<KeyedOn> {
+    const spent: number[] = [];
+    let limit = 0;
+    for (const [forged, client] of PROBES) {
+      const res = await route.hit(base, `${forged}, ${client}`);
+      if (limit === 0) limit = limitOf(res);
+      expect(limit).toBeGreaterThan(0);
+      spent.push(limit - remaining(res));
+    }
+    for (const keyedOn of ['socket', 'client', 'forged'] as KeyedOn[]) {
+      const counts = new Map<string, number>();
+      const expected = PROBES.map(([forged, client]) => {
+        const key = bucketOf(keyedOn, forged, client);
+        const n = (counts.get(key) ?? 0) + 1;
+        counts.set(key, n);
+        return n;
+      });
+      if (expected.every((n, i) => n === spent[i])) return keyedOn;
+    }
+    throw new Error(`bucketing matches no topology: spent ${spent.join(',')} of ${limit}`);
+  }
+
+  const ROWS = TOPOLOGIES.flatMap((t) =>
     LIMITED_ROUTES.map((r): [string, Topology, LimitedRoute] => [
       `${r.name} when ${t.name}`,
       t,
@@ -1056,32 +1129,29 @@ describe('a rate limiter must key on the client the operator actually deploys be
   );
 
   it.each(ROWS)('%s', async (_name: string, t: Topology, route: LimitedRoute) => {
-    if (!('keyedOn' in t.outcome)) throw new Error('accepted rows only');
     await boot(t.trustProxy);
-    const spent = new Map<string, number>();
-    let limit: number | undefined;
-    for (const [forged, client] of PROBES) {
-      const res = await route.hit(base, `${forged}, ${client}`);
-      limit ??= limitOf(res);
-      expect(limit).toBeGreaterThan(0);
-      const key = bucketOf(t.outcome.keyedOn, forged, client);
-      const n = (spent.get(key) ?? 0) + 1;
-      spent.set(key, n);
-      expect(remaining(res)).toBe(limit - n);
-    }
+    expect(await observedKeying(route)).toBe(t.outcome.keyedOn);
   });
 
-  const REFUSED = TOPOLOGIES.filter((t) => 'refusedBy' in t.outcome).map(
-    (t): [string, Topology] => [t.name, t],
+  const WHOLE_SPACE_ROWS = WHOLE_SPACE_SPELLINGS.map(
+    (s): [string, WholeSpaceSpelling] => [s.name, s],
   );
 
-  it.each(REFUSED)('refuses %s at the factory', async (_name: string, t: Topology) => {
-    if (!('refusedBy' in t.outcome)) throw new Error('refused rows only');
-    const booting = boot(t.trustProxy);
-    await (t.outcome.refusedBy === 'parley'
-      ? expect(booting).rejects.toThrow(/trustProxy must not be/)
-      : expect(booting).rejects.toThrow());
-  });
+  it.each(WHOLE_SPACE_ROWS)(
+    'trusting the whole address space spelled as %s never keys the limiter on the header',
+    async (_name: string, s: WholeSpaceSpelling) => {
+      const booted = await boot(s.trustProxy).then(
+        () => undefined,
+        (err: unknown) => err as Error,
+      );
+      if (booted !== undefined) {
+        if (s.message !== undefined) expect(booted.message).toMatch(s.message);
+        return;
+      }
+      // It got past the factory, so the only remaining question is behavioural.
+      expect(await observedKeying(LIMITED_ROUTES[0]!)).not.toBe('forged');
+    },
+  );
 
   // An operator who never names a topology gets the safe one: an app that took the header on
   // trust by default would be exploitable in exactly the deployment that never configured it.
