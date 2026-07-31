@@ -1,7 +1,5 @@
-import { randomBytes } from 'node:crypto';
 import {
   appendFileSync,
-  chmodSync,
   closeSync,
   fsyncSync,
   lstatSync,
@@ -9,17 +7,27 @@ import {
   openSync,
   readFileSync,
   renameSync,
-  statSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
+import { describe, Diagnostics } from './diagnostics.js';
+import {
+  EPOCH_LINE,
+  EVICTED_ID_LINE,
+  mintEpoch,
+  parseIds,
+  parseRecord,
+  requireEpoch,
+  requireWatermarks,
+  SEQ_LINE,
+  SERVED_ID_LINE,
+} from './journal.js';
+import { OWNER_ONLY_DIR, OWNER_ONLY_FILE, restrictMode, StoreLock } from './store-file.js';
 
 /**
- * One observed Telegram message, as persisted to the JSONL store. Everything needed to
- * reconstruct a seam `Message` later: the composite dedup key is derived as
- * `<chat_id>:<message_id>` and the per-topic cursor as `String(seq)`.
+ * One observed Telegram message, as persisted to the JSONL store — everything needed to
+ * reconstruct a seam `Message` later.
  *
  * Records are indexed by `chat_id`, never by the Parley topic: a topic is a local naming
  * choice (`chat_map`, an `@channelusername` literal or a numeric literal can all name the
@@ -39,7 +47,7 @@ export interface StoredRecord {
    * `getUpdates` after it still lands above every cursor already handed out.
    */
   seq: number;
-  /** Sender handle (`from.username ?? String(from.id)`; see index.ts). */
+  /** Sender handle (`from.username ?? String(from.id)`; see wire.ts). */
   sender: string;
   /** Message body. */
   content: string;
@@ -49,9 +57,6 @@ export interface StoredRecord {
 
 /** A message as observed, before the store stamps its observation sequence. */
 export type ObservedRecord = Omit<StoredRecord, 'seq'>;
-
-/** The {@link StoredRecord} fields a loaded line must carry as strings — see {@link ObservedStore.stamp}. */
-const RECORD_STRING_FIELDS = ['chat_id', 'sender', 'content', 'ts'] as const;
 
 /** The composite dedup key for a record — mirrors the plugin's backendMsgId. */
 export const keyOf = (rec: Pick<StoredRecord, 'chat_id' | 'message_id'>): string =>
@@ -64,135 +69,11 @@ const DEFAULT_MAX_CHATS = 1_000;
 /**
  * How many EVICTED composite ids stay refusable after their records are gone — store-wide, and
  * deliberately independent of every retention bound. What Telegram can redeliver after this bridge
- * has already observed it is one unacknowledged `getUpdates` batch (at most 100 updates, since the
- * offset only advances on the NEXT poll), so keep this memory sized on THAT window rather than on
- * the operator's retention knob: narrowing retention must not narrow the once-only guarantee with
- * it. Own posts are never redelivered at all.
+ * has already observed it is one unacknowledged `getUpdates` batch, so keep this memory sized on
+ * THAT window rather than on the operator's retention knob: narrowing retention must not narrow
+ * the once-only guarantee with it.
  */
 const EVICTED_ID_MEMORY = 1_000;
-/**
- * Marks the line a compaction writes to carry {@link ObservedStore.evicted} across a restart.
- * Keep it INVALID JSON, so that a reader which predates it drops the line as garbled rather than
- * indexing it as a record.
- */
-const EVICTED_ID_LINE = '#evicted ';
-/**
- * Marks the line carrying {@link ObservedStore.epoch} — the identity of this store FILE, minted
- * once when it is created. Invalid JSON, for the reason {@link EVICTED_ID_LINE} gives.
- */
-const EPOCH_LINE = '#epoch ';
-/**
- * Marks a line carrying {@link ObservedStore.served} chat ids across a restart. Invalid JSON, for
- * the reason {@link EVICTED_ID_LINE} gives.
- */
-const SERVED_ID_LINE = '#served ';
-/**
- * Marks a line carrying the two sequence watermarks, `#seq <issued> <intact>`: the highest sequence
- * this store has STAMPED, and the highest one whose record was written BELOW this line. The record
- * lines alone cannot carry either — losing them lowers the reconstructed high-water back under
- * cursors already handed out, and the store then re-mints those exact sequences under an identity it
- * kept. Invalid JSON, for the reason {@link EVICTED_ID_LINE} gives.
- */
-const SEQ_LINE = '#seq ';
-/** Sibling path claiming {@link ObservedStore.path} for one process — see {@link ObservedStore.claim}. */
-const LOCK_SUFFIX = '.lock';
-/** Shape of a store-file identity: 16 hex digits, so a cursor carrying one is unmistakable. */
-const EPOCH_PATTERN = /^[0-9a-f]{16}$/;
-/** Mode for everything this store creates — the plaintext of every message the bridge has seen. */
-const OWNER_ONLY_FILE = 0o600;
-/** Mode for a directory this store creates for {@link ObservedStore.path}. */
-const OWNER_ONLY_DIR = 0o700;
-
-/**
- * Narrow a store file readable beyond its owner, reporting the change. An `openSync` mode applies
- * only to a file it CREATES, so an upgrade onto a store written by an earlier version — or a
- * compaction output a broken umask widened — is otherwise left silently world-readable.
- *
- * Only files this store owns are touched: a pre-existing DIRECTORY can be the operator's working
- * directory or a shared state root, and narrowing that on their behalf is a bigger surprise than
- * the one it prevents.
- */
-function restrictMode(path: string): void {
-  let current: number;
-  try {
-    current = statSync(path).mode & 0o777;
-  } catch {
-    return;
-  }
-  if ((current & 0o077) === 0) return;
-  const target = current & 0o700;
-  try {
-    chmodSync(path, target);
-    process.stderr.write(
-      `parley-telegram: tightened ${path} from 0${current.toString(8)} to 0${target.toString(8)} ` +
-        `(the observed-message store must not be readable by other accounts)\n`,
-    );
-  } catch (err) {
-    process.stderr.write(
-      `parley-telegram: cannot restrict ${path} (mode 0${current.toString(8)}, ` +
-        `${err instanceof Error ? err.message : String(err)}) — the observed-message store is ` +
-        `readable by other accounts on this host\n`,
-    );
-  }
-}
-
-/** The string ids a `#`-prefixed bookkeeping line carries, or none when it is garbled. */
-function parseIds(line: string, prefix: string): string[] {
-  const ids = JSON.parse(line.slice(prefix.length)) as unknown;
-  if (!Array.isArray(ids)) return [];
-  return ids.filter((id): id is string => typeof id === 'string');
-}
-
-/**
- * A store-file identity read off disk. Anything else is a damaged line: the loader drops it and the
- * store mints a fresh identity, which invalidates the outstanding cursors LOUDLY rather than
- * adopting a name that may not be the one that stamped the sequences in this file.
- */
-function requireEpoch(raw: string): string {
-  const epoch = raw.trim();
-  if (!EPOCH_PATTERN.test(epoch)) throw new Error('ObservedStore: unreadable store identity');
-  return epoch;
-}
-
-/**
- * The `<issued, intact>` pair a {@link SEQ_LINE} carries. Anything else is a damaged line: the
- * loader drops it and counts the drop as record loss, because a watermark that cannot be read is
- * exactly the state under which a sequence gets re-issued.
- */
-function requireWatermarks(raw: string): [number, number] {
-  const [issued, intact, ...rest] = raw.trim().split(' ').map(Number);
-  const ok =
-    rest.length === 0 &&
-    [issued, intact].every((n) => n !== undefined && Number.isInteger(n) && n >= 0);
-  if (!ok || (intact as number) > (issued as number)) {
-    throw new Error('ObservedStore: unreadable sequence watermark');
-  }
-  return [issued as number, intact as number];
-}
-
-/** The pid a lock sibling names, or `undefined` when it carries nothing readable. */
-function lockHolder(path: string): number | undefined {
-  try {
-    const pid = Number(readFileSync(path, 'utf8').trim());
-    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** True while `pid` names a live process — EPERM is a process we may not signal, not a dead one. */
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * A retention bound is a promise about disk and memory. Keep it a hard failure rather than a
@@ -221,9 +102,6 @@ function requirePositiveInt(name: string, value: number): number {
  * chat this bridge {@link serve}s is retained on top of that cap and never evicted to make room.
  * That protection is persisted with the file, so it holds across a restart for every chat the
  * store still carries records for, not only for the ones the caller re-declares at construction.
- * The on-disk file is compacted once evictions since the last rewrite exceed the retained
- * record count, so the file stays within a constant factor of the in-memory bound instead of
- * growing forever.
  *
  * The file carries an {@link epoch}: a random identity minted when it is created, which the plugin
  * qualifies every cursor with. The observation sequence is per-FILE and restarts at 1, so without
@@ -237,16 +115,12 @@ function requirePositiveInt(name: string, value: number): number {
  * already served — which would hand the same `backendMsgId` out twice at two different cursors,
  * the second above a cursor the agent already holds.
  *
- * Everything it creates is owner-only (0600 file, 0700 directory it had to make): this file is the
- * full plaintext of every message the bridge has observed, in every chat the bot is in.
- *
- * ONE bridge process per store file AND per bot token, and the first half is ENFORCED: construction
- * claims `<path>.lock` exclusively and a second store on the same path fails naming the holder
- * ({@link claim}). A single process's appends are atomic enough for JSONL, but two processes
+ * Everything it creates is owner-only (see store-file.ts): this file is the full plaintext of
+ * every message the bridge has observed, in every chat the bot is in. ONE bridge process per store
+ * file AND per bot token, and the first half is ENFORCED by {@link StoreLock} — two processes
  * interleaving appends mint colliding cursors for different messages and each one's compaction
- * renames its own view over the other's history; two `getUpdates` pollers racing on one token are
- * refused by Telegram itself with HTTP 409. See the "Multiple concurrent sessions" section in
- * README.md.
+ * renames its own view over the other's history. See the "Multiple concurrent sessions" section
+ * in README.md.
  */
 export class ObservedStore {
   /** chat id → records ascending by `seq`; key order is least-recently-active first. */
@@ -259,10 +133,7 @@ export class ObservedStore {
   private readonly served = new Set<string>();
   /** Identity of the store FILE — see the class doc; every cursor the plugin issues carries it. */
   private readonly epochId: string;
-  /** The sibling this store claimed for the life of the process — see {@link claim}. */
-  private readonly lockPath: string;
-  /** Set once {@link claim} succeeded, so {@link release} can never unlink another process's claim. */
-  private holdsLock = false;
+  private readonly lock: StoreLock;
   /** Newest-N-per-chat retention bound. */
   private readonly maxPerChat: number;
   /** Max UNSERVED chats retained — the bot's chat membership is not ours to control. */
@@ -282,8 +153,7 @@ export class ObservedStore {
    * already returned as durable, alongside the fragment.
    */
   private tornTail = false;
-  /** Wall-clock of the last diagnostic PER KIND, so one failure can't silence an unrelated one. */
-  private readonly lastReportAt = new Map<string, number>();
+  private readonly diagnostics = new Diagnostics();
 
   constructor(
     private readonly path: string,
@@ -295,23 +165,22 @@ export class ObservedStore {
     this.maxChats = requirePositiveInt('maxChats', maxChats);
     for (const chatId of served) this.served.add(chatId);
     mkdirSync(dirname(path), { recursive: true, mode: OWNER_ONLY_DIR });
-    this.lockPath = `${path}${LOCK_SUFFIX}`;
-    this.claim();
+    this.lock = new StoreLock(path);
+    this.lock.claim();
     try {
       this.epochId = this.load();
     } catch (err) {
-      this.release();
+      this.lock.release();
       throw err;
     }
   }
 
   /**
    * Read the file into the index and return the identity to serve under. A FRESH identity is minted
-   * — invalidating every outstanding cursor through the plugin's `foreignCursor` path — whenever the
-   * file did not load whole: any dropped line, or a record missing below the `intact` watermark the
-   * file itself carries. Both mean a sequence this store stamped is gone while its identity
-   * survived, and serving on would answer a held cursor out of a sequence space that has been
-   * re-minted underneath it.
+   * — invalidating every outstanding cursor — whenever the file did not load whole: any dropped
+   * line, or a record missing below the `intact` watermark the file itself carries. Both mean a
+   * sequence this store stamped is gone while its identity survived, and serving on would answer a
+   * held cursor out of a sequence space re-minted underneath it.
    */
   private load(): string {
     let raw = '';
@@ -346,7 +215,8 @@ export class ObservedStore {
         } else if (line.startsWith(EVICTED_ID_LINE)) {
           this.rememberEvicted(parseIds(line, EVICTED_ID_LINE));
         } else {
-          const rec = this.stamp(JSON.parse(line) as Partial<StoredRecord> & ObservedRecord);
+          const rec = parseRecord(JSON.parse(line) as Partial<StoredRecord> & ObservedRecord);
+          if (rec.seq >= this.nextSeq) this.nextSeq = rec.seq + 1;
           onDisk = Math.max(onDisk, rec.seq);
           this.index(rec);
         }
@@ -356,7 +226,7 @@ export class ObservedStore {
     }
     if (issued >= this.nextSeq) this.nextSeq = issued + 1;
     const lost = dropped || intact > onDisk;
-    const epochId = loadedEpoch === '' || lost ? randomBytes(8).toString('hex') : loadedEpoch;
+    const epochId = loadedEpoch === '' || lost ? mintEpoch() : loadedEpoch;
     const cappedChats = this.applyChatCap();
     const trimmed = this.applyRetention() || cappedChats;
     // Compact the on-disk file when we dropped a torn fragment or over-retention records, or when
@@ -377,74 +247,22 @@ export class ObservedStore {
         intact > onDisk
           ? `it recorded observing through sequence ${intact} and its records reach ${onDisk}`
           : `a damaged or torn line could not be loaded`;
-      process.stderr.write(
-        `parley-telegram: ${this.path} did not load whole — ${cause}. Minted a fresh store identity ` +
+      this.diagnostics.report(
+        `${this.path} did not load whole — ${cause}. Minted a fresh store identity ` +
           `${epochId}, so every cursor the previous one issued is refused instead of being answered ` +
-          `out of a sequence this store would otherwise stamp twice.\n`,
+          `out of a sequence this store would otherwise stamp twice.`,
       );
     }
     return epochId;
   }
 
   /**
-   * Claim `<path>.lock` for this process, exclusively. Two bridges on one observed-message store
-   * hand the SAME cursor to two different messages and each one's compaction renames its own view
-   * over the other's history — silently, and with no Bot API history endpoint to rebuild from — so
-   * the second one must fail to start rather than corrupt. A claim naming a process that is gone is
-   * a crashed bridge's leftover and is replaced.
-   */
-  private claim(): void {
-    if (this.tryClaim()) return;
-    const holder = lockHolder(this.lockPath);
-    if (holder === undefined || !processExists(holder)) {
-      try {
-        unlinkSync(this.lockPath);
-      } catch {
-        // Another starter cleared the same stale claim; the retry below decides who holds it.
-      }
-      if (this.tryClaim()) return;
-    }
-    throw new Error(
-      `ObservedStore: '${this.path}' is already claimed by process ` +
-        `${holder === undefined ? 'unknown' : String(holder)} through '${this.lockPath}'. Two ` +
-        `bridges on one observed-message store mint colliding cursors and each compaction discards ` +
-        `the other's history, so give this one its own backend_config.store_path. If no such ` +
-        `process is running, remove '${this.lockPath}'.`,
-    );
-  }
-
-  /** Create the claim, or report that one is already there. Any other failure is the caller's. */
-  private tryClaim(): boolean {
-    try {
-      writeFileSync(this.lockPath, `${process.pid}\n`, { flag: 'wx', mode: OWNER_ONLY_FILE });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
-      throw err;
-    }
-    this.holdsLock = true;
-    return true;
-  }
-
-  /** Drop this process's claim on the store file. Never touches one it does not hold. */
-  private release(): void {
-    if (!this.holdsLock) return;
-    this.holdsLock = false;
-    try {
-      unlinkSync(this.lockPath);
-    } catch {
-      // Already gone — the claim is released either way.
-    }
-  }
-
-  /**
    * Mark `chatId` as one this bridge serves: a configured topic resolves to it, so it is
-   * admitted past {@link maxChats} and never evicted to make room. Keep this, so that a flood
-   * of unconfigured group chats cannot crowd out the operator's own topics.
-   *
-   * The mark is written to the file as well as held in memory. `chat_map` is re-resolved on every
-   * connect, but a topic named only by a seam call is not — so a protection that lived only in
-   * memory would lapse at the next restart and the load-time chat cap would evict the operator's
-   * own history, which the Bot API can never backfill.
+   * admitted past {@link maxChats} and never evicted to make room — a flood of unconfigured group
+   * chats cannot crowd out the operator's own topics. The mark is written to the file as well as
+   * held in memory: `chat_map` is re-resolved on every connect but a topic named only by a seam
+   * call is not, so a memory-only protection would lapse at the next restart and the load-time
+   * chat cap would evict history the Bot API can never backfill.
    */
   serve(chatId: string): void {
     if (this.served.has(chatId)) return;
@@ -472,10 +290,10 @@ export class ObservedStore {
     try {
       this.writeLine(fd, line);
     } catch (err) {
-      this.report(
-        'bookkeeping-line',
+      this.diagnostics.report(
         `could not record '${line.split(' ')[0] ?? ''}' in ${this.path} (${describe(err)}) — this ` +
           `run is unaffected and the next restart loses what the line carried`,
+        'bookkeeping-line',
       );
     }
   }
@@ -483,11 +301,10 @@ export class ObservedStore {
   /**
    * Persist + index one record under a fresh observation sequence, holding both retention
    * bounds. Returns the stored record, or `undefined` (writing nothing) when the record is
-   * refused: its composite id was already observed — dedup holds when the same message arrives
-   * twice, e.g. a `getUpdates` backlog replayed after a restart, whether or not retention has
-   * since evicted the record — or every retained chat is served and this one is not, or no append
-   * descriptor can be opened ({@link isOpen}). A refusal is silent here and LOUD at the seam: the
-   * plugin reports a dropped inbound update and rejects a `post` Telegram has already accepted.
+   * refused: its composite id was already observed (whether or not retention has since evicted the
+   * record), or every retained chat is served and this one is not, or no append descriptor can be
+   * opened ({@link isOpen}). A refusal is silent here and LOUD at the seam: the plugin reports a
+   * dropped inbound update and rejects a `post` Telegram has already accepted.
    */
   append(observed: ObservedRecord): StoredRecord | undefined {
     if (this.has(keyOf(observed))) return undefined;
@@ -508,10 +325,10 @@ export class ObservedStore {
     try {
       this.compactIfDue();
     } catch (err) {
-      this.report(
-        'compaction',
+      this.diagnostics.report(
         `could not compact ${this.path} (${describe(err)}) — every record is retained and the ` +
           `rewrite is retried on a later append`,
+        'compaction',
       );
     }
     return rec;
@@ -530,18 +347,6 @@ export class ObservedStore {
       this.tornTail = true;
       throw err;
     }
-  }
-
-  /**
-   * A failure that keeps failing fails on every append. Throttle the diagnostic per `kind` to one
-   * line a minute — the same class throttle index.ts uses — so that a squatted temp path or a full
-   * disk cannot bury the store's other diagnostics under one line per message.
-   */
-  private report(kind: string, message: string): void {
-    const now = Date.now();
-    if (now - (this.lastReportAt.get(kind) ?? 0) < 60_000) return;
-    this.lastReportAt.set(kind, now);
-    process.stderr.write(`parley-telegram: ${message}\n`);
   }
 
   /**
@@ -585,7 +390,7 @@ export class ObservedStore {
   /**
    * Max observation sequence across every RETAINED record (0 when none) — the `intact` watermark
    * {@link rewrite} persists. Below {@link highWater} exactly when eviction has taken the newest
-   * record of the busiest chat, which is a record leaving on purpose rather than one going missing.
+   * record of the busiest chat: a record leaving on purpose, not one going missing.
    */
   private retainedHighWater(): number {
     let max = 0;
@@ -626,7 +431,7 @@ export class ObservedStore {
       closeSync(this.fd);
       this.fd = undefined;
     }
-    this.release();
+    this.lock.release();
   }
 
   /**
@@ -698,8 +503,8 @@ export class ObservedStore {
   }
 
   /**
-   * Compact once the dead lines on disk have grown to the live record count: the file then
-   * stays within ~2x the in-memory bound while rewrites stay amortized O(1) per append.
+   * Compact once the dead lines on disk have grown to the live record count: the file then stays
+   * within ~2x the in-memory bound while rewrites stay amortized O(1) per append.
    */
   private compactIfDue(): void {
     if (this.fd === undefined) return;
@@ -723,14 +528,13 @@ export class ObservedStore {
    * A compaction is where the evicted records' LINES leave the file, so it carries the eviction
    * memory out with them ({@link EVICTED_ID_LINE}) — otherwise dedup would reach back only as far
    * as the file, and a restart right after a compaction would re-admit a redelivered message the
-   * bridge had already served. The file's {@link epoch}, its {@link SEQ_LINE} watermarks and its
-   * {@link served} marks ride out the same way, and for the same reason. The two watermarks part
-   * company here and only here: eviction is how a record legitimately leaves the file, so `intact`
-   * drops to what is retained while `issued` keeps every sequence already handed out.
+   * bridge had already served. The {@link epoch}, the watermarks and the {@link served} marks ride
+   * out the same way. The two watermarks part company here and only here: eviction is how a record
+   * legitimately leaves the file, so `intact` drops to what is retained while `issued` keeps every
+   * sequence already handed out.
    *
-   * Only served chats this store still holds records for are carried: a chat with nothing to lose
-   * needs no protection, and that is what keeps the mark list bounded by the retained chat count
-   * instead of accumulating every chat ever named across every run.
+   * Only served chats this store still holds records for are carried, which keeps the mark list
+   * bounded by the retained chat count instead of accumulating every chat ever named.
    */
   private rewrite(epochId: string = this.epochId): void {
     const lines: string[] = [
@@ -786,32 +590,6 @@ export class ObservedStore {
     }
     unlinkSync(tmp);
     return openSync(tmp, 'wx', OWNER_ONLY_FILE);
-  }
-
-  /**
-   * Adopt a loaded record's observation sequence, and hold every other field to the type
-   * {@link StoredRecord} declares. A line failing either is garbled — the loader's try/catch drops
-   * it. Keep it a drop rather than a fresh stamp, so that a damaged line cannot be handed a
-   * sequence an agent's cursor already sits above and become permanently unreachable.
-   *
-   * Keep the field types checked HERE as well as at the seam, so that a file already carrying a
-   * record of the wrong shape heals on load instead of bricking its chat: a non-string `content`
-   * reaches `buildMessage` and throws on EVERY later `fetchRecent` for that chat, and no Bot API
-   * call can refill the topic once the store is the only copy.
-   */
-  private stamp(raw: Partial<StoredRecord> & ObservedRecord): StoredRecord {
-    const { seq } = raw;
-    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq <= 0) {
-      throw new Error('record carries no observation sequence');
-    }
-    for (const field of RECORD_STRING_FIELDS) {
-      if (typeof raw[field] !== 'string') throw new Error(`record carries a non-string ${field}`);
-    }
-    if (typeof raw.message_id !== 'number' || !Number.isFinite(raw.message_id)) {
-      throw new Error('record carries no numeric message_id');
-    }
-    if (seq >= this.nextSeq) this.nextSeq = seq + 1;
-    return { ...raw, seq };
   }
 
   /**
