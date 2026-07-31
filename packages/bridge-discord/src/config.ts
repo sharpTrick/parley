@@ -1,5 +1,5 @@
 import type { Topic } from '@sharptrick/parley-core';
-import { RECONNECT_CAP_MS } from './gateway.js';
+import { RECONNECT_CAP_MS } from './ladder.js';
 
 /** Plugin-specific backend_config. */
 export interface DiscordBackendConfig {

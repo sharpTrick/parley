@@ -14,46 +14,42 @@ const MIN_QUERY_BUDGET_MS = 250;
  * 100-per-page cap, so that a larger limit is not answered with a truncated head whose cursor
  * already sits past everything older than it.
  */
-export async function newestWindow(
-  page: PageFn,
-  limit: number,
-  deadline: number,
-): Promise<DiscordMessage[]> {
-  const newestFirst: DiscordMessage[] = [];
-  for (let n = 0; newestFirst.length < limit; n++) {
-    const size = Math.min(limit - newestFirst.length, PAGE_LIMIT);
-    const before = newestFirst.at(-1)?.id;
-    const query = before === undefined ? `limit=${size}` : `limit=${size}&before=${before}`;
-    const chunk = await pageWithin(page, query, deadline, n);
-    if (chunk === undefined || chunk.length === 0) break;
-    newestFirst.push(...chunk);
-    if (chunk.length < size) break;
-  }
-  return newestFirst.reverse();
-}
+export const newestWindow = (page: PageFn, limit: number, deadline: number) =>
+  walk(page, limit, deadline, false, (size, before) =>
+    before === undefined ? `limit=${size}` : `limit=${size}&before=${before}`,
+  );
 
 /**
  * One exclusive-`since` walk, oldest-first. `?after=` is exclusive server-side and each page comes
  * back newest-first; past 100 it pages forward on the largest id seen until filled, a short page
  * says the tail is reached, or the call's shared `deadline` runs out.
  */
-export async function windowSince(
+export const windowSince = (page: PageFn, since: string, limit: number, deadline: number) =>
+  walk(page, limit, deadline, true, (size, last) =>
+    `after=${encodeURIComponent(last ?? since)}&limit=${size}`,
+  );
+
+/**
+ * One bounded page walk, anchored each time on the last record it kept. `forward` says which end of
+ * the timeline it advances towards, and with it both orientations: Discord answers every page
+ * newest-first, so a forward walk reverses each page and a backward walk reverses the whole result.
+ */
+async function walk(
   page: PageFn,
-  since: string,
   limit: number,
   deadline: number,
+  forward: boolean,
+  query: (size: number, anchor: string | undefined) => string,
 ): Promise<DiscordMessage[]> {
-  const messages: DiscordMessage[] = [];
-  for (let n = 0; messages.length < limit; n++) {
-    const size = Math.min(limit - messages.length, PAGE_LIMIT);
-    const after = messages.at(-1)?.id ?? since;
-    const query = `after=${encodeURIComponent(after)}&limit=${size}`;
-    const chunk = await pageWithin(page, query, deadline, n);
+  const walked: DiscordMessage[] = [];
+  for (let n = 0; walked.length < limit; n++) {
+    const size = Math.min(limit - walked.length, PAGE_LIMIT);
+    const chunk = await pageWithin(page, query(size, walked.at(-1)?.id), deadline, n);
     if (chunk === undefined || chunk.length === 0) break;
-    messages.push(...chunk.reverse());
+    walked.push(...(forward ? chunk.reverse() : chunk));
     if (chunk.length < size) break;
   }
-  return messages;
+  return forward ? walked : walked.reverse();
 }
 
 /**
