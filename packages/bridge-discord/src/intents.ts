@@ -1,11 +1,8 @@
 /**
- * Gateway intents this plugin cannot work without. MESSAGE_CONTENT is a PRIVILEGED intent that
- * must also be toggled on in the developer portal; without it every `MESSAGE_CREATE` arrives with
- * empty `content`.
- *
- * Keep this module free of imports, so that the test fakes can enforce the bits without pulling
- * `ws` in through the plugin — the `vi.mock('ws')` factory awaits the fakes, and a cycle through it
- * deadlocks the whole suite.
+ * Gateway intents this plugin cannot work without. MESSAGE_CONTENT is PRIVILEGED and must also be
+ * toggled on in the developer portal; without it every `MESSAGE_CREATE` arrives with empty
+ * `content`. Keep this module free of IMPORTS, so that the test fakes can enforce the bits without
+ * pulling `ws` in through the plugin — `vi.mock('ws')` awaits the fakes, and a cycle deadlocks.
  */
 export const REQUIRED_INTENTS = {
   GUILDS: 1 << 0,
