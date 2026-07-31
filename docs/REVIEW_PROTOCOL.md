@@ -35,6 +35,43 @@ full surface with fresh contexts, ratcheting each fix into the suite, until revi
    **zero CONFIRMED findings**. Clearing an anchor frees a reviewer to find the next layer, so a
    clean round only counts *after* the last round that changed code.
 
+## Simplify first (from round 11)
+
+Rounds 1–10 were purely accretive. Source roughly doubled per backend — redis 307 → 826 lines,
+xmpp 674 → 1325 — and almost none of it went into new files: nine of ten backends still carried a
+single `index.ts` over 900 lines, matrix's at 1499. The one package that had been split, `bridge-sqlite`
+(11 files, biggest 632), recorded **4 blocking findings across rounds 6–10 against a mean of 9.6** for
+the monoliths, on an unremarkable total finding count. Same volume of findings, far less of it serious
+— the shape you would expect if a monolith hides interaction defects while a decomposed package has
+only local ones left. n=1 and sqlite is also the simplest backend, so it is suggestive, not proof.
+
+Round 11 is therefore a **decomposition round** and rounds 12–20 carry a standing simplify-first rule.
+This is a deliberate regime boundary, recorded so the two halves can be compared: rounds 1–10 are the
+protocol against monoliths, rounds 12–20 the same protocol against decomposed code. If the hypothesis
+holds, blocking findings per package should fall.
+
+**The rule: a round must be net-negative on SOURCE lines.** Source is `packages/*/src/**` excluding
+tests. It deliberately does NOT cover tests — every confirmed finding must be ratcheted into the
+suite, so a total-lines quota would either stop the ratchet or push agents to delete tests to buy
+headroom. Test growth is governed instead by the test-hygiene lens, which asks for instances collapsed
+into parameterized classes: `bridge-telegram` did exactly that in round 9, going 527 → 523 tests while
+coverage rose from 4 fields to 9 and from 15 breakage cells to 37.
+
+**Appeals are allowed and must carry data.** An agent that cannot land net-negative may appeal in its
+report with a specific argument — the measurement that shows the added lines close a defect class no
+smaller change reaches, or the deletion that would lose functionality worth keeping. "It needed more
+code" is not an appeal. The orchestrator adjudicates and records the outcome in the commit message.
+
+**Decomposition is behaviour-preserving, and the suite proves it.** A split lands only if the existing
+tests pass **unmodified**. If a test has to change, the move was not behaviour-preserving — that is a
+finding, not a merge conflict to resolve. A pure-move refactor is precisely where a silent behaviour
+change hides, which is why the unmodified-suite rule is the whole guarantee.
+
+**One measurement consequence, stated up front.** `git blame` attributes a moved line to the commit
+that moved it, so the iatrogenesis oracle will read rounds 12+ as near-100% self-induced unless it
+blames through moves (`-C -M`). The oracle is re-anchored for that; where it cannot be, the
+discontinuity is reported rather than smoothed.
+
 ## Quiescence (a Careening addition)
 
 A reviewer that returns zero CONFIRMED findings **quiesces** and sits out later rounds. It wakes
