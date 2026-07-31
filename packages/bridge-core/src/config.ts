@@ -1,94 +1,18 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import { AuthSchema } from './config-auth.js';
+import {
+  assertNoBackendKey,
+  describeDocument,
+  issueLines,
+  messageOf,
+} from './config-diagnostics.js';
 import { DEFAULT_PRESENCE_TOPIC, MAX_RECORD_TOPICS } from './engine/presence.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 
-/**
- * Remote-mode auth via an external OIDC IdP (e.g. Keycloak) — the delegated resource-server
- * variant of DESIGN §10. Parley hosts no /authorize,/token,/register in this mode; it publishes
- * Protected Resource Metadata pointing at the issuer and validates inbound Bearer JWTs locally.
- * Nothing in this block is a secret (issuer/audience/claim policy are public-side config).
- */
-export const OidcAuthSchema = z
-  .object({
-    /** OIDC issuer, e.g. https://kc.example.com/realms/myrealm. Discovery is fetched from
-     *  `<issuer>/.well-known/openid-configuration` at startup. Must be https — the JWKS trust
-     *  root depends on TLS — except on loopback, where test/dev fakes serve over http. */
-    issuer: z
-      .string()
-      .url()
-      .refine(
-        (u) => {
-          const url = new URL(u);
-          return (
-            url.protocol === 'https:' || url.hostname === '127.0.0.1' || url.hostname === 'localhost'
-          );
-        },
-        { message: 'auth.oidc.issuer must use https (the JWKS trust root depends on TLS)' },
-      ),
-    /** Expected `aud` value. Default: the canonical resource id (public URL + mcpPath). Keycloak
-     *  ignores RFC 8707 `resource`, so an audience mapper must emit this exact string — see
-     *  docs/keycloak-integration.md. */
-    audience: z.string().min(1).optional(),
-    /** Override the JWKS URI (default: `jwks_uri` from discovery). */
-    jwks_uri: z.string().url().optional(),
-    /** If set, the token's `scope` (space-separated) must include this value. */
-    required_scope: z.string().min(1).optional(),
-    /** Identity gates preserving the single-tenant posture: any that are set must ALL pass.
-     *  Issuer + audience validation is always mandatory regardless. */
-    allowed_subjects: z.array(z.string().min(1)).nonempty().optional(),
-    /** Matched against the `preferred_username` claim. */
-    allowed_usernames: z.array(z.string().min(1)).nonempty().optional(),
-    /** Required realm role (Keycloak `realm_access.roles`). */
-    required_role: z.string().min(1).optional(),
-    /** exp/nbf tolerance in seconds. */
-    clock_skew_s: z.number().int().min(0).max(300).default(30),
-  })
-  .strict();
-
-export type OidcAuthConfig = z.infer<typeof OidcAuthSchema>;
-
-/** Remote-mode auth selection: the built-in single-tenant OAuth AS (default) or external OIDC. */
-export const AuthSchema = z
-  .object({
-    mode: z.enum(['builtin', 'oidc']).default('builtin'),
-    oidc: OidcAuthSchema.optional(),
-  })
-  .strict()
-  .superRefine((a, ctx) => {
-    if (a.mode === 'oidc' && a.oidc === undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['oidc'],
-        message: 'auth.mode "oidc" requires an auth.oidc block',
-      });
-      return;
-    }
-    if (a.mode === 'oidc' && a.oidc !== undefined) {
-      // Delegated OIDC has no owner-consent step, so an identity gate is the ONLY thing that
-      // keeps a shared/corporate realm from authorizing every realm user. Require at least one.
-      // `required_scope` alone is insufficient (Claude's connector may request no scopes).
-      const { allowed_subjects, allowed_usernames, required_role } = a.oidc;
-      if (
-        allowed_subjects === undefined &&
-        allowed_usernames === undefined &&
-        required_role === undefined
-      ) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['oidc'],
-          message:
-            'auth.mode "oidc" requires an identity gate: set at least one of ' +
-            'allowed_subjects / allowed_usernames / required_role to preserve the single-tenant ' +
-            'posture (required_scope alone is not sufficient). See docs/keycloak-integration.md.',
-        });
-      }
-    }
-  });
-
-export type AuthConfig = z.infer<typeof AuthSchema>;
+export * from './config-auth.js';
 
 /**
  * Most `post_topics` patterns one config may carry. {@link isRedosSafeSource} bounds what ONE source
@@ -226,11 +150,9 @@ const ConfigObject = z.object({
 const StrictConfigObject = ConfigObject.strict();
 
 /**
- * The load-time config schema. Wraps {@link ConfigObject} with cross-field validation:
- *  - every `post_topics` pattern must be a compilable regex;
- *  - the reserved presence topic must not appear in the explicit `topics` list.
- * (A `post_topics` pattern that *could* match the presence topic is allowed — a broad `.*` is
- * legitimate — because the reserved guard in {@link Allowlist} blocks that at runtime.)
+ * The load-time config schema: {@link ConfigObject} plus the checks that need the whole object.
+ * A `post_topics` pattern that *could* match the presence topic is allowed — a broad `.*` is
+ * legitimate — because the reserved guard in `Allowlist` blocks that at runtime.
  */
 export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
   cfg.post_topics.forEach((src, i) => {
@@ -240,7 +162,7 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['post_topics', i],
-        message: `invalid regex: ${err instanceof Error ? err.message : String(err)}`,
+        message: `invalid regex: ${messageOf(err)}`,
       });
       return;
     }
@@ -265,9 +187,8 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
       message: `${JSON.stringify(cfg.presence.topic)} is reserved for presence (presence.topic); rename the topic or change presence.topic`,
     });
   }
-  // `ttl_ms` is populated by the dependent-default transform before superRefine runs (default 3×, or
-  // the pinned value), so it is always a number here. A ttl below the heartbeat cadence would make
-  // every genuinely running instance read as offline in computeRoster between beats.
+  // A ttl below the heartbeat cadence would make every genuinely running instance read as offline
+  // between beats. The dependent-default transform runs first, so `ttl_ms` is always a number here.
   if (cfg.presence.ttl_ms < cfg.presence.heartbeat_ms) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -314,56 +235,10 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
 
 export type ParleyConfig = z.infer<typeof ConfigSchema>;
 
-/**
- * A config value is only interpolated into the `parley-<name>` suggestion when it is a bare package
- * suffix. Keep this narrow, so that a generated or third-party config file cannot put its own text
- * inside a command the operator is being told to run.
- */
-const BACKEND_NAME = /^[a-z][a-z0-9-]{0,31}$/;
-
-/**
- * Reject a legacy `backend:` key rather than letting zod strip it, so that a config naming one
- * backend can never run a different one silently.
- */
-function assertNoBackendKey(raw: unknown): void {
-  if (typeof raw !== 'object' || raw === null || !('backend' in raw)) return;
-  const value = (raw as { backend: unknown }).backend;
-  const named = typeof value === 'string' ? value.replace(/^local-/, '') : '';
-  const suggestion = BACKEND_NAME.test(named)
-    ? `parley-${named}`
-    : 'parley-sqlite, parley-matrix, parley-redis, …';
-  throw new Error(
-    'config: `backend` is not a supported field. The backend is selected by which binary you run, ' +
-      `not by config — run \`${suggestion}\` (each backend package ships its own bin). ` +
-      'Remove `backend:` from the config file.',
-  );
-}
-
 /** Validate + default a raw config object (already parsed from YAML/JSON). */
 export function parseConfig(raw: unknown): ParleyConfig {
   assertNoBackendKey(raw);
   return ConfigSchema.parse(raw);
-}
-
-const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-
-/**
- * Render a validation failure as `<field path>: <message>` lines. A zod error stringifies as a JSON
- * dump of its issues, which names neither the file nor the shape expected — and the whole-file
- * failure is the first one an operator hits.
- */
-function issueLines(err: unknown): string {
-  const issues = (err as { issues?: { path: (string | number)[]; message: string }[] }).issues;
-  if (!Array.isArray(issues) || issues.length === 0) return `  ${messageOf(err)}`;
-  return issues
-    .map((i) => `  ${i.path.length === 0 ? '(document)' : i.path.join('.')}: ${i.message}`)
-    .join('\n');
-}
-
-function describeDocument(data: unknown): string {
-  if (data === null || data === undefined) return 'empty (or holds only comments)';
-  if (Array.isArray(data)) return 'a YAML sequence';
-  return `a bare ${typeof data}`;
 }
 
 /**
