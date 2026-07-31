@@ -1,0 +1,109 @@
+{
+  "round": 12,
+  "kind": "decomposition",
+  "base": "78c8282",
+  "head": "5de0825",
+  "scope": "source files only; behavioural tests untouched by rule, architectural tests fair game",
+  "agents": 12,
+  "note": "Round 11 decomposed eleven packages but left twelve source files over 400 lines. Round 12 is the second, stronger pass: every package with a file over that bar, plus the three core files outside auth/. The initial fan-out was eight targets and was scoped too narrowly — sqlite (632), discord (498), matrix (434) and core's presence/tools/config (446/406/401) were all still over it and were launched mid-round.",
+
+  "measurement": {
+    "method": "git ls-tree over packages/**/src/**/*.ts excluding *.test.ts at both revisions; single- and multi-line import statements stripped; everything else counted",
+    "nonImportSourceLines": { "base": 20571, "head": 20556, "net": -15 },
+    "sourceFiles": { "base": 125, "head": 177, "net": 52 },
+    "rawLineChurn": { "insertions": 7118, "deletions": 6909, "net": 209 },
+    "testChurn": { "insertions": 389, "deletions": 138, "net": 251, "files": 19 },
+    "agentSelfReportedSum": -25,
+    "discrepancyNote": "The agents' summed self-reports (-25) disagree with the measured figure (-15). Both are defensible; the difference is counting conventions for `export … from` re-export lines and for blank-line separation in new files. The measured number is the one recorded, because it is reproducible from the two revisions without trusting twelve separate hand-counts."
+  },
+
+  "largestSourceFile": {
+    "base": { "zulip": 982, "slack": 846, "postgres": 792, "nats": 746, "telegram": 742, "conformance": 634, "sqlite": 632, "core-auth": 507, "discord": 498, "core-presence": 446, "matrix": 434, "core-tools": 406, "core-config": 401 },
+    "head": { "telegram": 418, "core-auth": 388, "slack": 386, "postgres": 353, "redis": 342, "matrix": 315, "xmpp": 307, "discord": 283, "nats": 246, "zulip": 230, "sqlite": 196, "net-util": 179, "conformance": 151 },
+    "stillOver400": ["bridge-telegram/src/store.ts (418)"]
+  },
+
+  "perTarget": [
+    { "target": "core-auth", "biggest": [507, 388], "netNonImport": -13, "newFiles": 3, "archTestsReanchored": 1, "archTestsDeleted": 0, "appeal": false },
+    { "target": "xmpp", "biggest": [1014, 307], "netNonImport": -5, "newFiles": 4, "archTestsReanchored": 0, "archTestsDeleted": 0, "appeal": false, "note": "both structural guards were already location-independent" },
+    { "target": "nats", "biggest": [746, 246], "netNonImport": -10, "newFiles": 6, "archTestsReanchored": 3, "archTestsDeleted": 0, "appeal": false, "brokeImportCycle": true },
+    { "target": "conformance", "biggest": [634, 151], "netNonImport": 24, "newFiles": 7, "archTestsReanchored": 2, "archTestsDeleted": 0, "appeal": true, "appealGranted": true },
+    { "target": "zulip", "biggest": [982, 230], "netNonImport": -6, "newFiles": 5, "archTestsReanchored": 4, "archTestsDeleted": 0, "appeal": false, "brokeImportCycle": true },
+    { "target": "telegram", "biggest": [742, 418], "netNonImport": -4, "newFiles": 3, "archTestsReanchored": 4, "archTestsDeleted": 0, "appeal": false, "brokeImportCycle": true },
+    { "target": "postgres", "biggest": [792, 353], "netNonImport": -5, "newFiles": 4, "archTestsReanchored": 2, "archTestsDeleted": 0, "appeal": false, "reworked": "first attempt widened 15 private fields to public; sent back for a protected chain" },
+    { "target": "matrix", "biggest": [434, 315], "netNonImport": -21, "newFiles": 1, "archTestsReanchored": 1, "archTestsDeleted": 0, "appeal": false },
+    { "target": "discord", "biggest": [498, 283], "netNonImport": -17, "newFiles": 4, "archTestsReanchored": 0, "archTestsDeleted": 0, "appeal": false, "brokeImportCycle": true },
+    { "target": "sqlite", "biggest": [632, 196], "netNonImport": -13, "newFiles": 7, "archTestsReanchored": 1, "archTestsDeleted": 0, "appeal": false },
+    { "target": "slack", "biggest": [846, 386], "netNonImport": 86, "newFiles": 2, "archTestsReanchored": 5, "archTestsDeleted": 0, "appeal": true, "appealGranted": true, "brokeImportCycle": true },
+    { "target": "core-non-auth", "biggest": [446, 276], "netNonImport": -41, "newFiles": 6, "archTestsReanchored": 0, "archTestsDeleted": 0, "appeal": false, "note": "three path-coupled tests designed around rather than re-anchored; two live in other packages" }
+  ],
+
+  "architecturalTests": {
+    "reanchored": 23,
+    "deleted": 0,
+    "designedAround": 3,
+    "ruleAtRoundStart": "re-anchor by default; delete only with a NAMED behavioural replacement shown failing",
+    "ruleNarrowedMidRound": "The rule opened by declaring behavioural tests untouchable, which is too strong outside a decomposition round, and gated deletion twice as hard as writing a test. Narrowed to its actual subject: never let an architectural ratchet drive a structural choice; any agent may move or replace one. The NAME-and-SHOW gate was dropped because 'a new test does not count until you have watched it fail' already covers a replacement. Running agents were not interrupted: their brief already permitted unrestricted re-anchoring, and the round's own scoping independently forbade touching behavioural tests.",
+    "zeroDeletionsNote": "No agent deleted an architectural test in either decomposition round. The escape valve every one of them used was re-anchoring, which suggests the deletion gate was never the binding constraint — consistent with narrowing it."
+  },
+
+  "failureModesObservedAgain": [
+    {
+      "mode": "guard hollowed out",
+      "package": "bridge-matrix",
+      "detail": "shipped-artifacts.test.ts asserted that this plugin never raises NoSuchTopicError and never leaves a room, reading src/index.ts by path. Adding a leaveRoom to park.ts that both throws NoSuchTopicError and POSTs .../leave leaves the old test at 29/29 GREEN. Demonstrated, not hypothesised."
+    },
+    {
+      "mode": "guard made invisible",
+      "package": "bridge-sqlite",
+      "detail": "publish-hygiene scanned src/driver.ts for require() calls and drove a per-module case off the result. Moving loadBetterSqlite to a new file drops the run from 13 tests to 12 — the 'better-sqlite3 is an optionalDependency' case stops EXISTING, because the loop iterates an empty array."
+    },
+    {
+      "mode": "lint with a hole",
+      "package": "bridge-zulip",
+      "detail": "export-surface's NAMED_EXPORT pattern never matched `export async function`, so readRetryAfter was invisible to it for eleven rounds. Confirmed by planting an unused `export async function` and watching the fixed scan fail."
+    },
+    {
+      "mode": "recorded security debt made invisible",
+      "package": "bridge-discord",
+      "detail": "A risk clause instructed keeping plaintextCredentialRisks in THAT FILE because net-util's fork registry keys by path. Round 11 had already re-anchored the registry to key by package:name, making the clause stale — a comment enforcing a constraint that no longer existed."
+    },
+    {
+      "mode": "cross-package path coupling",
+      "package": "bridge-core",
+      "detail": "bridge-slack regexes a PRIVATE function's body out of bridge-core/src/engine/presence.ts; bridge-matrix greps four literals out of core's transport/tools.ts and config.ts. A behaviour-preserving move inside core reddens two backend packages, with a message claiming core 'reworded' something it did not. On record since round 9; it shaped this round's cuts rather than being fixed by them."
+    },
+    {
+      "mode": "tautology risk introduced BY the re-anchor",
+      "package": "bridge-matrix",
+      "detail": "Replacing a path read with a glob can turn `expect(text).not.toMatch(...)` into `expect('').not.toMatch(...)` if the glob is empty or mis-rooted. The agent added a guard asserting the file list is non-trivial and contains the plugin class. This is the first round where an agent anticipated the failure mode rather than hitting it."
+    }
+  ],
+
+  "verification": {
+    "fullSuite": { "files": 267, "passed": 12201, "skipped": 4, "services": ["synapse", "prosody", "postgres", "nats", "redis", "keycloak"] },
+    "behaviouralTestsModified": 0,
+    "seamFrozen": { "seam.ts": "396e7f03a8b94f2074f068f54e2fd3fb7e6b7989", "message.ts": "8aaca7cf6aa08dc7759b7d6744bc1f39d820b927", "identicalToBase": true },
+    "publicSurfaceVerified": "per package, from built dist rather than asserted"
+  },
+
+  "orchestratorErrors": [
+    {
+      "error": "git checkout -- on an applied-but-uncommitted decomposition",
+      "detail": "Restoring a mutation in the main repo took bridge-postgres/src/index.ts back to the round base, discarding a 792->353 split while its new sibling files survived untracked and typechecked against the old one. Nothing failed loudly. Recovered via `git show :<path>` from the source worktree. This hazard was ALREADY recorded in the protocol after three round-8 agents hit it; knowing it did not prevent hitting it, so the note now names mutation-and-restore as where it lives and extends it to the orchestrator."
+    },
+    {
+      "error": "attributed 31 test failures to code before checking the machine",
+      "detail": "A matrix rerun showed 31 conformance timeouts against 1 on the previous run. Load average was 47 with kswapd0 at 20% — nine concurrent agents plus test runs had driven the box into swap. All six containers were healthy throughout. On an idle machine the same tree passed 611/611. Two agents independently reported single unreproducible failures in the same window, which is the same cause."
+    }
+  ],
+
+  "openForRound13": [
+    "bridge-telegram/src/store.ts is still 418 lines — the one file over the bar.",
+    "Test files are now decisively the largest in the repo and are scheduled for their own round; bridge-core's five biggest are all test files.",
+    "The capacity scan in stated-bounds.test.ts is path-keyed and already missed eleven exported caps before this round; four more files are now out of its scope.",
+    "cli.ts is byte-identical across ten packages but for a class name and two log prefixes, and matrix's copy has now diverged.",
+    "Five of thirteen packages have no tsconfig.test.json, so their test trees are never typechecked while CI's comment claims otherwise. Building one for discord surfaces 12 pre-existing errors in 4 test files and zero in src/.",
+    "index.test.ts asserts that the trimmed internal buildToolDefs is not re-exported — a symbol that no longer exists anywhere in the repo, i.e. a dead row in a guard whose purpose is noticing dead surface."
+  ]
+}
