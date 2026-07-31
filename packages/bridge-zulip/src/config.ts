@@ -1,5 +1,23 @@
 import type { BackendConfig } from '@sharptrick/parley-core';
-import type { ZulipBackendConfig } from './index.js';
+
+/** Plugin-specific backend_config. */
+export interface ZulipBackendConfig {
+  /** Zulip server base URL. Default `http://127.0.0.1:9991` (docker-zulip dev default). */
+  site_url?: string;
+  /** Bot email for HTTP Basic auth. Default `parley-bot@localhost`. */
+  email?: string;
+  /** Bot API key for HTTP Basic auth. Default `parley-api-key`. */
+  api_key?: string;
+  /** The ONE Zulip stream (channel) carrying all Parley traffic. Default `parley`. */
+  stream?: string;
+  /**
+   * Client-side cap (ms) on each `/api/v1/events` long-poll before it is aborted and reissued —
+   * the loop re-checks shutdown each interval. Un-acked events survive the abort. Default 25000,
+   * clamped to the bounds the README's config table publishes; a non-positive or non-numeric value
+   * is a `connect()` error.
+   */
+  events_timeout_ms?: number;
+}
 
 const DEFAULT_SITE_URL = 'http://127.0.0.1:9991';
 const DEFAULT_EMAIL = 'parley-bot@localhost';
