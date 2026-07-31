@@ -1,5 +1,5 @@
 import { fork } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,105 +43,10 @@ afterEach(async () => {
 });
 
 /**
- * Every pragma the driver sets buys a property and costs one. A pragma listed under
- * "cross-process safety" whose cost goes unstated reads as free — `synchronous = NORMAL` is the
- * live example: a committed post can be lost on power loss, in the store DESIGN calls the durable
- * source of truth. Each entry therefore carries the consequence its README line has to state. The
- * read-back itself is graded once, in test/driver-parity.test.ts, which runs it for both drivers.
+ * Every pragma the driver sets buys a property, and what the README has to say about each is graded
+ * in test/readme-claims.test.ts. What is graded here is the consequence itself, observable on disk.
  */
-const PRAGMAS = [
-  { name: 'journal_mode', consequence: /readers never block the writer/i },
-  { name: 'busy_timeout', consequence: /retries instead of erroring/i },
-  { name: 'synchronous', consequence: /lost on power loss/i },
-];
-
-const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
-
 describe('driver pragmas are observable, not just set', () => {
-  for (const p of PRAGMAS) {
-    it(`${p.name} is documented with its consequence, not just its name`, () => {
-      expect(README).toContain(p.name);
-      expect(README).toMatch(p.consequence);
-    });
-  }
-
-  /**
-   * A README sentence naming a test file is an instruction to go read that file. Naming the wrong
-   * one certifies a property against a file that does not grade it, and keeps reading true after
-   * the file that does is deleted — so each claim is pinned to the file holding its evidence, and
-   * to no other named file.
-   */
-  const ATTRIBUTIONS: Array<{ what: string; claim: RegExp; file: string; evidence: RegExp }> = [
-    {
-      what: 'the pragma read-back',
-      claim: /read-back|read back/i,
-      file: 'test/driver-parity.test.ts',
-      evidence: /PRAGMA \$\{p\.name\}/,
-    },
-    {
-      what: 'the -wal sidecar appearing on disk',
-      claim: /-wal.{0,3} sidecar/i,
-      file: 'test/multi-process.test.ts',
-      evidence: /\$\{path\}-wal/,
-    },
-  ];
-
-  const NAMED = [...new Set(ATTRIBUTIONS.map((a) => a.file))];
-  const sentencesNaming = (file: string): string[] =>
-    README.replace(/\s+/g, ' ')
-      .split(/(?<=\.)\s/)
-      .filter((s) => s.includes(file));
-
-  for (const a of ATTRIBUTIONS) {
-    it(`the README credits ${a.what} to ${a.file}, and that file holds the evidence`, () => {
-      const own = sentencesNaming(a.file);
-      expect(own.length).toBeGreaterThan(0);
-      expect(own.filter((s) => a.claim.test(s)).length).toBeGreaterThan(0);
-      expect(
-        readFileSync(fileURLToPath(new URL(`../${a.file}`, import.meta.url)), 'utf8'),
-      ).toMatch(a.evidence);
-      for (const other of NAMED.filter((f) => f !== a.file)) {
-        expect(sentencesNaming(other).filter((s) => a.claim.test(s))).toEqual([]);
-      }
-    });
-  }
-
-  /**
-   * A relative link carrying an `#anchor` is a claim about ANOTHER file's headings, and nothing
-   * re-checks it when that file is edited. GitHub and npm render a missing anchor as the top of the
-   * target document, so the reader lands hundreds of lines from the section they were sent to, with
-   * no error anywhere — which is how this package's one "wire it into Claude Code" pointer came to
-   * name a heading the root README had renamed.
-   */
-  describe('every README link resolves, anchor included', () => {
-    const LINKS = [...README.matchAll(/\]\((\.[^)\s]+)\)/g)].map((m) => m[1] as string);
-    /** GitHub's heading slug: lowercased, punctuation dropped, spaces hyphenated. */
-    const slug = (heading: string): string =>
-      heading
-        .toLowerCase()
-        .replace(/[^\w\- ]+/g, '')
-        .trim()
-        .replace(/ +/g, '-');
-    const headingsOf = (markdown: string): string[] =>
-      [...markdown.replace(/^```[\s\S]*?^```/gm, '').matchAll(/^#{1,6} +(.+?)\s*$/gm)].map((m) =>
-        slug(m[1] as string),
-      );
-
-    it('the README carries relative links to grade', () => {
-      expect(LINKS.filter((l) => l.includes('#')).length).toBeGreaterThan(0);
-    });
-
-    for (const link of LINKS) {
-      it(`${link} resolves`, () => {
-        const [rel, anchor] = link.split('#');
-        const target = fileURLToPath(new URL(`../${rel as string}`, import.meta.url));
-        expect(existsSync(target), `${target} does not exist`).toBe(true);
-        if (anchor === undefined) return;
-        expect(headingsOf(readFileSync(target, 'utf8'))).toContain(anchor);
-      });
-    }
-  });
-
   it('WAL is live on disk: a write materializes the -wal sidecar', () => {
     const path = join(dir(), 'p.db');
     const d = openDriver(path);

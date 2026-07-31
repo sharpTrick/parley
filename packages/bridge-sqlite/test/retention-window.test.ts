@@ -1,7 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import type { SqlDriver } from '../src/driver.js';
@@ -17,7 +16,6 @@ import { retentionCutoff, SqlitePlugin } from '../src/index.js';
 const T = asTopic('ctx');
 const me = asHandle('alice');
 const DAY_MS = 86_400_000;
-const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
 
 const dirs: string[] = [];
 function dbFile(): string {
@@ -82,7 +80,8 @@ describe('retentionCutoff resolves a window to a boundary in the past', () => {
  * retention and the cursor disagree by construction, and the disagreement is observable: a skewed
  * peer's row is deleted while rows above AND below it in cursor order survive. Graded here because
  * it is a documented loss model, not an accident — pruning by a rowid watermark instead would turn
- * these red, which is exactly when the README paragraph below would need rewriting.
+ * these red, which is exactly when the README paragraph in test/readme-claims.test.ts would need
+ * rewriting.
  */
 describe('retention judges a row by the poster’s clock, not by its cursor position', () => {
   const WINDOW_DAYS = 1 / 24;
@@ -133,26 +132,6 @@ describe('retention judges a row by the poster’s clock, not by its cursor posi
         expect(Math.min(...rowids)).toBeLessThan(2);
         expect(Math.max(...rowids)).toBeGreaterThan(2);
       }
-    });
-  }
-
-  /**
-   * The behaviour above is a LOSS MODEL, and the README is where an operator sizing
-   * `retention_days` reads it. Stated in terms of reader downtime alone it reads as "offline less
-   * than the window ⇒ nothing lost", which is false the moment two hosts' clocks disagree.
-   */
-  const README_CLAIMS = [
-    { what: 'that the cutoff is judged against the poster’s clock', pattern: /poster'?’?s wall clock/i },
-    { what: 'that clock skew between hosts shifts which rows survive', pattern: /clock skew/i },
-    {
-      what: 'that a row can go before a reader’s cursor reaches it',
-      pattern: /reader'?’?s cursor has reached it/i,
-    },
-  ];
-
-  for (const claim of README_CLAIMS) {
-    it(`the README states ${claim.what}`, () => {
-      expect(README.replace(/\s+/g, ' ')).toMatch(claim.pattern);
     });
   }
 });

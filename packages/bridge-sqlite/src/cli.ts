@@ -4,13 +4,13 @@ import { parseArgs, USAGE } from './args.js';
 import { SqlitePlugin } from './index.js';
 import { installShutdown } from './shutdown.js';
 
-// IMPORTANT: this is an MCP stdio server — stdout is the JSON-RPC channel. All diagnostics go
-// to stderr; never write to stdout here.
+// IMPORTANT: once this process serves MCP, stdout is the JSON-RPC channel — keep every diagnostic
+// below on stderr. Only a branch that exits BEFORE the transport exists may write to stdout.
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.kind === 'print') {
-    process.stderr.write(`${args.text}\n`);
+    process.stdout.write(`${args.text}\n`);
     process.exit(0);
   }
   if (args.kind === 'error') {

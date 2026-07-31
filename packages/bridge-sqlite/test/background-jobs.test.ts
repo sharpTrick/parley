@@ -133,7 +133,7 @@ describe('poll loop error-class matrix', () => {
       }
     });
 
-    it(`${c.name}: a persistent failure is ${c.quiet ? 'silent' : 'diagnosed'} on stderr`, async () => {
+    it(`${c.name}: a persistent failure is ${c.quiet ? 'silent' : 'diagnosed'} on stderr and ${c.healable ? 'degraded' : 'stopped'} in health`, async () => {
       const p = await plugin();
       const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       let lines: string[] = [];
@@ -142,9 +142,9 @@ describe('poll loop error-class matrix', () => {
         breakSelect(p, Number.POSITIVE_INFINITY, c.make());
         await vi.waitFor(
           () => {
-            lines = spy.mock.calls.map(([l]) => String(l));
-            expect(c.quiet ? true : lines.some((l) => /poll error/.test(l))).toBe(true);
-            expect(p.subscriptionHealth(T)[0]).toBeDefined();
+            expect(p.subscriptionHealth(T)[0]?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(
+              ESCALATE_AFTER,
+            );
           },
           { timeout: 3000, interval: 5 },
         );
@@ -157,22 +157,20 @@ describe('poll loop error-class matrix', () => {
       const diags = lines.filter((l) => /poll error|poll loop/.test(l));
       if (c.quiet) {
         expect(diags).toEqual([]);
-        expectHealth(p.subscriptionHealth(T), [
-          { topic: T, state: 'live', consecutiveFailures: 0 },
-        ]);
       } else {
         expect(diags.length).toBeGreaterThan(0);
         // Rate-limited: a persistent failure must not write one line per poll interval.
         expect(diags.length).toBeLessThanOrEqual(3);
-        expectHealth(p.subscriptionHealth(T), [
-          {
-            topic: T,
-            state: c.healable ? 'degraded' : 'stopped',
-            consecutiveFailures: { atLeast: ESCALATE_AFTER },
-            lastError: new RegExp(escapeRegExp(c.make().message)),
-          },
-        ]);
       }
+      // Silent is not healthy: whatever the class, a run of ticks that read nothing escalates.
+      expectHealth(p.subscriptionHealth(T), [
+        {
+          topic: T,
+          state: c.healable ? 'degraded' : 'stopped',
+          consecutiveFailures: { atLeast: ESCALATE_AFTER },
+          lastError: new RegExp(escapeRegExp(c.make().message)),
+        },
+      ]);
     });
   }
 });
@@ -503,6 +501,49 @@ describe('the retention prune re-runs on its cadence, not only at connect', () =
       }
     });
   }
+});
+
+/**
+ * A background job that outlives `disconnect()` runs against a closed driver: it deletes from a
+ * store the host has already torn the bridge down over, or writes a failure line naming a plugin
+ * that is gone. Both jobs must therefore be dead in every order teardown can reach them in — the
+ * poll loop's orders are graded in test/lifecycle.test.ts, and the prune's are here. Each row
+ * asserts the same observable pair: the store stops changing, and nothing more is written.
+ */
+describe('the retention prune stops with the plugin', () => {
+  async function remaining(path: string): Promise<string[]> {
+    const reader = new SqlitePlugin();
+    await reader.connect({ db_path: path, poll_interval_ms: MIN_POLL_INTERVAL_MS });
+    const { messages } = await reader.fetchRecent({ topic: T, limit: 10_000 });
+    await reader.disconnect();
+    return messages.map((m) => m.content);
+  }
+
+  it('a prune re-entered after disconnect touches neither the store nor stderr', async () => {
+    const path = dbFile();
+    const seed = new SqlitePlugin();
+    await seed.connect({ db_path: path, poll_interval_ms: MIN_POLL_INTERVAL_MS });
+    const insert = (seed as unknown as { insertStmt: Stmt }).insertStmt;
+    insert.run(T, me, 'aged-out', new Date(Date.now() - 10 * 86_400_000).toISOString(), null);
+    insert.run(T, me, 'inside-window', new Date().toISOString(), null);
+    await seed.disconnect();
+
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let lines: string[] = [];
+    try {
+      const p = new SqlitePlugin();
+      await p.connect({ db_path: path, poll_interval_ms: MIN_POLL_INTERVAL_MS, retention_days: 1 });
+      await p.disconnect();
+      spy.mockClear();
+      (p as unknown as { prune(): void }).prune();
+      lines = spy.mock.calls.map(([l]) => String(l));
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(await remaining(path)).toEqual(['inside-window']);
+    expect(lines).toEqual([]);
+  });
 });
 
 /**

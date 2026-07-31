@@ -93,17 +93,52 @@ describe('CLI argument parsing refuses what it cannot honour', () => {
     expect(parseArgs(['--config', 'cli.yaml'], env)).toEqual({ kind: 'run', config: 'cli.yaml' });
   });
 
-  it('the shipped binary exits non-zero on a mistyped flag instead of starting a bridge', async () => {
-    const dir = tmp();
-    const cfgPath = writeConfig(dir);
-    const child = spawn(process.execPath, [CLI, '--confg', cfgPath], { stdio: ['pipe', 'pipe', 'pipe'] });
-    let stderr = '';
-    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
-    const code = await new Promise<number | null>((resolve) => child.on('exit', resolve));
-    expect(code).toBe(2);
-    expect(stderr).toMatch(/unrecognised argument '--confg'/);
-    expect(stderr).not.toMatch(/bridge up/);
-  });
+});
+
+/**
+ * Which stream an argv outcome lands on is part of the CLI's contract, and the two informational
+ * flags are the ones a script consumes: `V=$(parley-sqlite --version)` and `parley-sqlite --help |
+ * less` are empty and blank if they answer on stderr, silently and with a success exit code. Both
+ * exit before the MCP transport exists, so the stdout-is-JSON-RPC rule does not reach them; a
+ * refusal still belongs on stderr with a non-zero exit. Each row asserts the OTHER stream is empty,
+ * so a future flag cannot be routed to the wrong one.
+ */
+describe('every pre-server argv outcome answers on the right stream (e2e)', () => {
+  interface Outcome {
+    argv: string[];
+    stream: 'stdout' | 'stderr';
+    exit: number;
+    says: string;
+  }
+
+  const OUTCOMES: Outcome[] = [
+    { argv: ['--version'], stream: 'stdout', exit: 0, says: SQLITE_VERSION },
+    { argv: ['-V'], stream: 'stdout', exit: 0, says: SQLITE_VERSION },
+    { argv: ['--help'], stream: 'stdout', exit: 0, says: 'usage: parley-sqlite' },
+    { argv: ['-h'], stream: 'stdout', exit: 0, says: 'usage: parley-sqlite' },
+    { argv: ['--confg', 'a.yaml'], stream: 'stderr', exit: 2, says: "unrecognised argument '--confg'" },
+    { argv: ['--config'], stream: 'stderr', exit: 2, says: '--config requires a path' },
+  ];
+
+  async function runCli(argv: string[]): Promise<{ code: number | null; out: Record<string, string> }> {
+    const child = spawn(process.execPath, [CLI, ...argv], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const out: Record<string, string> = { stdout: '', stderr: '' };
+    child.stdout.on('data', (d: Buffer) => (out['stdout'] += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (out['stderr'] += d.toString()));
+    const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
+    return { code, out };
+  }
+
+  for (const o of OUTCOMES) {
+    it(`${o.argv.join(' ')} answers on ${o.stream} and exits ${o.exit}`, async () => {
+      const { code, out } = await runCli(o.argv);
+      const other = o.stream === 'stdout' ? 'stderr' : 'stdout';
+      expect(code).toBe(o.exit);
+      expect(out[o.stream]).toContain(o.says);
+      expect(out[other]).toBe('');
+      expect(`${out['stdout']}${out['stderr']}`).not.toMatch(/bridge up/);
+    });
+  }
 });
 
 function writeConfig(

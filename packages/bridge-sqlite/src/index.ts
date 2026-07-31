@@ -93,7 +93,7 @@ export const MAX_POLL_INTERVAL_MS = 2_147_483_647;
  * samples the current tail, exactly as a topic catch-up never read does.
  */
 export const CATCHUP_LEDGER_MAX = 1024;
-/** Consecutive non-lock poll failures before the loop escalates (backs off, or stops if fatal). */
+/** Consecutive failing poll ticks before the loop escalates (backs off, or stops if fatal). */
 export const ESCALATE_AFTER = 10;
 /** Ceiling on the degraded poll interval, so a down DB is re-probed forever but cheaply. */
 const BACKOFF_CEILING_MS = 30_000;
@@ -318,6 +318,7 @@ export class SqlitePlugin implements BackendPlugin {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let lastDiag = 0;
+    let diagnosedSinceRead = false;
     const health: SubscriptionHealth = { topic, state: 'live', consecutiveFailures: 0 };
     this.health.push(health);
 
@@ -347,45 +348,42 @@ export class SqlitePlugin implements BackendPlugin {
         // rather than capping throughput at one batch per poll interval.
         if (rows.length === POLL_BATCH) delay = 0;
         failures = 0;
+        diagnosedSinceRead = false;
         health.state = 'live';
         health.consecutiveFailures = 0;
         health.lastError = undefined;
       } catch (e) {
         const cls = classifyDbError(e);
-        if (cls === 'lock') {
-          // WAL + busy_timeout handle contention; retry next tick, quietly, without escalating.
-          failures = 0;
-          health.state = 'live';
-          health.consecutiveFailures = 0;
-          health.lastError = undefined;
-        } else {
-          failures++;
-          health.consecutiveFailures = failures;
-          health.lastError = errMessage(e);
+        // Keep a lock-classed tick counted like every other failure — quiet only on stderr — so
+        // that a loop failing 100% of its reads on contention cannot report `live` forever: WAL +
+        // busy_timeout make lock the one class not worth a line, not a tick that read anything.
+        failures++;
+        health.consecutiveFailures = failures;
+        health.lastError = errMessage(e);
+        if (cls !== 'lock') {
           const now = Date.now();
-          // Rate-limited so a persistent failure doesn't flood stderr every poll_interval_ms —
-          // but the very first hit is loud so the failure is never invisible.
-          if (now - lastDiag > DIAG_INTERVAL_MS || failures === 1) {
+          if (!diagnosedSinceRead || now - lastDiag > DIAG_INTERVAL_MS) {
             lastDiag = now;
+            diagnosedSinceRead = true;
             process.stderr.write(
               `parley-sqlite: poll error on topic "${topic}" (#${failures}): ${errMessage(e)}\n`,
             );
           }
-          if (failures >= ESCALATE_AFTER) {
-            if (cls === 'fatal') {
-              health.state = 'stopped';
-              process.stderr.write(
-                `parley-sqlite: poll loop for topic "${topic}" stopped after ${failures} ` +
-                  `consecutive unrecoverable failures; live push is down for this topic\n`,
-              );
-              return; // do NOT reschedule
-            }
-            // Keep probing here, however long it takes: subscribe()'s promise has already
-            // resolved and core has no other signal, so stopping is silent, permanent loss of
-            // live push for a topic whose DB was only temporarily unreachable.
-            health.state = 'degraded';
-            delay = backoffMs(this.pollIntervalMs, failures);
+        }
+        if (failures >= ESCALATE_AFTER) {
+          if (cls === 'fatal') {
+            health.state = 'stopped';
+            process.stderr.write(
+              `parley-sqlite: poll loop for topic "${topic}" stopped after ${failures} ` +
+                `consecutive unrecoverable failures; live push is down for this topic\n`,
+            );
+            return; // do NOT reschedule
           }
+          // Keep probing here, however long it takes: subscribe()'s promise has already
+          // resolved and core has no other signal, so stopping is silent, permanent loss of
+          // live push for a topic whose DB was only temporarily unreachable.
+          health.state = 'degraded';
+          delay = backoffMs(this.pollIntervalMs, failures);
         }
       }
       if (!this.stopped) timer = setTimeout(tick, delay);
@@ -423,7 +421,7 @@ export class SqlitePlugin implements BackendPlugin {
    * reported, so a retention policy the process cannot enforce is never silent.
    */
   private prune(): void {
-    if (this.retentionDays === undefined || this.driver === undefined || this.stopped) return;
+    if (this.retentionDays === undefined || this.tornDown()) return;
     try {
       const cutoff = retentionCutoff(this.retentionDays);
       const info = this.require(this.pruneStmt).run(cutoff, PRUNE_BATCH);

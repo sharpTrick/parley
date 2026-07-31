@@ -264,39 +264,69 @@ describe.skipIf(BetterCtor === null)('openDriver surfaces the real open error', 
  * The fallback is only reachable now that better-sqlite3 is an OPTIONAL dependency, so a skipped
  * install silently lands an operator on the slower experimental driver. Grade the announcement,
  * not just the substitution: without a line on stderr the only symptom is the performance.
+ *
+ * Graded from BOTH sides of the code allowlist, because a code table exercised only on the codes it
+ * admits is vacuous — deleting the check keeps every positive row green. An installed-but-broken
+ * better-sqlite3 (a SyntaxError in its JS wrapper, EACCES on the `.node`, ERR_REQUIRE_ESM after a
+ * packaging change) is not an absent one: swallowed, it is memoized as absent for the whole process
+ * lifetime and the deployment runs on the experimental builtin with one generic line to say so.
  */
-describe('the node:sqlite fallback announces itself', () => {
-  it.each([
-    ['MODULE_NOT_FOUND', 'MODULE_NOT_FOUND'],
-    ['ERR_DLOPEN_FAILED', 'ERR_DLOPEN_FAILED'],
-  ])('says so on stderr when better-sqlite3 fails to load with %s', async (_label, code) => {
-    const mod = await import('node:module');
-    const loader = mod.default as unknown as {
-      _load(req: string, ...rest: unknown[]): unknown;
-    };
-    const original = loader._load;
-    loader._load = function (req: string, ...rest: unknown[]): unknown {
-      if (req === 'better-sqlite3') {
-        const e = new Error(`stubbed ${code}`) as NodeJS.ErrnoException;
-        e.code = code;
-        throw e;
-      }
-      return original.call(this, req, ...rest);
-    };
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    vi.resetModules();
-    try {
-      const { openDriver: fresh } = await import('./driver.js');
-      const driver = fresh(':memory:');
-      expect(driver.kind).toBe('node:sqlite');
-      const said = spy.mock.calls.map((c) => String(c[0])).join('');
-      expect(said).toMatch(/better-sqlite3 unavailable/);
-      expect(said).toMatch(/node:sqlite/);
-      driver.close();
-    } finally {
-      loader._load = original;
-      spy.mockRestore();
+describe('a better-sqlite3 load failure falls back only for the codes that mean absent', () => {
+  const LOAD_FAILURES: Array<{
+    name: string;
+    code?: string;
+    message: string;
+    outcome: 'fallback' | 'propagate';
+  }> = [
+    { name: 'MODULE_NOT_FOUND', code: 'MODULE_NOT_FOUND', message: 'Cannot find module', outcome: 'fallback' },
+    { name: 'ERR_DLOPEN_FAILED', code: 'ERR_DLOPEN_FAILED', message: 'wrong ELF class', outcome: 'fallback' },
+    { name: 'ERR_REQUIRE_ESM', code: 'ERR_REQUIRE_ESM', message: 'require() of an ES Module', outcome: 'propagate' },
+    { name: 'EACCES', code: 'EACCES', message: 'permission denied, open better_sqlite3.node', outcome: 'propagate' },
+    { name: 'a code-less SyntaxError', message: 'Unexpected token in better-sqlite3 wrapper', outcome: 'propagate' },
+  ];
+
+  for (const f of LOAD_FAILURES) {
+    it(`${f.name} ${f.outcome === 'fallback' ? 'falls back, saying so on stderr' : 'propagates untouched'}`, async () => {
+      const mod = await import('node:module');
+      const loader = mod.default as unknown as { _load(req: string, ...rest: unknown[]): unknown };
+      const original = loader._load;
+      loader._load = function (req: string, ...rest: unknown[]): unknown {
+        if (req === 'better-sqlite3') {
+          const e = new Error(f.message) as NodeJS.ErrnoException;
+          if (f.code !== undefined) e.code = f.code;
+          throw e;
+        }
+        return original.call(this, req, ...rest);
+      };
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       vi.resetModules();
-    }
-  });
+      try {
+        const { openDriver: fresh } = await import('./driver.js');
+        let driver: ReturnType<typeof openDriver> | undefined;
+        let threw: unknown;
+        try {
+          driver = fresh(':memory:');
+        } catch (e) {
+          threw = e;
+        }
+        const said = spy.mock.calls.map((c) => String(c[0])).join('');
+
+        if (f.outcome === 'fallback') {
+          expect(threw).toBeUndefined();
+          expect(driver?.kind).toBe('node:sqlite');
+          expect(said).toMatch(/better-sqlite3 unavailable/);
+          expect(said).toMatch(/node:sqlite/);
+          driver?.close();
+          return;
+        }
+        expect(driver).toBeUndefined();
+        expect((threw as Error | undefined)?.message).toBe(f.message);
+        expect(said).not.toMatch(/better-sqlite3 unavailable/);
+      } finally {
+        loader._load = original;
+        spy.mockRestore();
+        vi.resetModules();
+      }
+    });
+  }
 });

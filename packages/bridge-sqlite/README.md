@@ -68,11 +68,18 @@ generation's ids `1..N` would otherwise be mistaken for the old generation's and
 ### When the database goes away under a live subscription
 
 A poll tick that fails is classified, not blanket-retried. Lock contention (`SQLITE_BUSY`/
-`SQLITE_LOCKED`) retries silently. Anything that can heal — I/O errors, a read-only remount, a
-full disk, a file briefly unopenable while a backup swaps it — is logged, then the loop **backs
-off exponentially (to 30 s) and keeps probing**, so the topic resumes delivering by itself. Only
-unrecoverable damage (a corrupt file, a dropped table) stops the loop. An **embedder** — code that
-constructs `SqlitePlugin` itself — can read that state programmatically:
+`SQLITE_LOCKED`) retries **without a stderr line** — WAL and `busy_timeout` are what resolve it, so
+it is the one class not worth reporting. Anything that can heal — I/O errors, a read-only remount, a
+full disk, a file briefly unopenable while a backup swaps it — is logged instead, rate-limited to
+about one line a minute per topic, with the first hit after a successful read always loud. Only
+unrecoverable damage (a corrupt file, a dropped table) stops the loop.
+
+Being quiet is not being healthy: a tick that read nothing delivered nothing, contention included,
+so every failing tick raises `consecutiveFailures` whatever its class, only a successful read clears
+it, and a run of them past the threshold **backs the loop off exponentially (to 30 s) while it keeps
+probing**, so the topic resumes delivering by itself. A subscription failing every read can
+therefore never report `live` with zero failures. An **embedder** — code that constructs
+`SqlitePlugin` itself — can read that state programmatically:
 
 ```ts
 plugin.subscriptionHealth();
@@ -211,11 +218,14 @@ parley-sqlite --help      # also --version
 ```
 
 `--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
-`--config` whose value the shell ate — **exits 2 with a usage message** instead of falling back to
-the default `parley.config.yaml`, since that default names a different deployment's store, handle
-and topic allowlist.
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's store,
+handle and topic allowlist. `--help`/`--version` answer on **stdout** and exit 0, so
+`V=$(parley-sqlite --version)` and `parley-sqlite --help | less` work; both exit before any server
+starts.
 
-It's a stdio MCP server — stdout is the JSON-RPC channel, all diagnostics go to stderr. See the
+It's a stdio MCP server — once it is serving, stdout is the JSON-RPC channel and all diagnostics go
+to stderr. See the
 [root README quickstart](../../README.md#quickstart-a-the-local-taste-5-min-zero-infra) for wiring it
 up as a Claude Code channel, and
 [`examples/fakechat-loopback`](../../examples/fakechat-loopback/MANUAL-CHECKLIST.md) for a full
