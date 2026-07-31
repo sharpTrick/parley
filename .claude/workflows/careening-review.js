@@ -35,6 +35,24 @@ const TARGETS = [
   { key: 'slack', dirs: ['bridge-slack'], path: 'packages/bridge-slack' },
   { key: 'telegram', dirs: ['bridge-telegram'], path: 'packages/bridge-telegram' },
   { key: 'shared', dirs: ['bridge-net-util', 'conformance'], path: 'packages/bridge-net-util and packages/conformance' },
+  {
+    key: 'repo',
+    dirs: [],
+    path: 'the repository AS A WHOLE',
+    brief: [
+      'You own what is true of the REPOSITORY and invisible to every package-scoped critic. Fourteen other critics are reviewing one package each, in parallel, right now. Their job is to find defects INSIDE a package. Yours is not, and duplicating it wastes the round.',
+      'OUT OF SCOPE, hand it back: the correctness, concurrency, security or protocol conformance of any single package\'s logic. If you find a bug in one package and it is only in that package, DO NOT report it — its own critic is looking straight at it. The only reason to mention package-local code is as an INSTANCE of a repo-scale pattern, and then the pattern is the finding and the instances are its evidence.',
+      'IN SCOPE, and nobody else can see any of it:',
+      '(1) CROSS-PACKAGE DUPLICATION. The same logic written N times. Measure it — name every copy and diff them, because the interesting part is usually that the copies have DRIFTED. A known live example to verify and extend rather than rediscover: packages/*/src/cli.ts is ~545 lines across ten packages with ten distinct hashes, differing only by a class name and a REWORDED copy of the same risk comment, and bridge-sqlite alone extracted args.ts and shutdown.ts from it.',
+      '(2) COVERAGE ASYMMETRY OF A REPO-WIDE INVARIANT. A guard that ought to hold everywhere but was ratcheted into whichever package happened to find it. Build the matrix — invariant on one axis, package on the other — and report the holes as one finding per invariant, not per cell. This is "ratchet the class, not the instance" at repo scale, and the loop has filed a version of it in four separate rounds without fixing it.',
+      '(3) LOCKSTEP DRIFT. Things that must agree and do not: a fix applied to one package and not its nine siblings, package.json fields that should match across workspaces, versions, engines, exports/files/bin wiring, tsconfig and tsconfig.test.json presence, the lockfile against the manifests.',
+      '(4) BUILD, CI AND RELEASE PLUMBING. What the workflows CLAIM they verify versus what they run; a suite that can skip itself into a green run; the publish preflight; anything in .github/ or scripts/. Read the workflow files and check the claim against the step.',
+      '(5) ROOT-LEVEL TRUTH-IN-DOCS. README.md, DESIGN.md, CLAUDE.md, TASKS.md, CONTRIBUTING.md, CHANGELOG.md — claims about the repo as a whole, checked against the repo as a whole. A package README is its own critic\'s business.',
+      '(6) CROSS-PACKAGE COUPLING IN TESTS. A test in package A that asserts on package B\'s source by file path or by regex. It reddens on a behaviour-preserving move in B and reports it as B "rewording" something. Find every one.',
+      'Carry the lenses that operate at this scale: design-principles (duplication, DRY, YAGNI), test-integrity, test-hygiene, truth-in-docs, operability-and-release, maintainability, and seam-integrity. Security only where it is repo-scale — committed secrets, workflow token scope, publish configuration. Tag each finding with the lens that produced it.',
+      'Prefer MEASUREMENT to impression throughout. You are the only critic with the whole tree in view, so counts, hashes, matrices and diffs are your instrument: "this helper is byte-identical in six files, here they are" beats "there is some duplication". A finding of yours should be one nobody could have reached by reading a single package.',
+    ].join(' '),
+  },
 ]
 
 const HTTP_BACKENDS = ['matrix', 'zulip', 'discord', 'slack', 'telegram']
@@ -49,6 +67,9 @@ function wakeSet(changedPaths) {
   for (const t of TARGETS) {
     if (t.dirs.some((d) => changedPaths.some((p) => p.startsWith(`packages/${d}/`)))) woken.add(t.key)
   }
+  // The repo critic owns cross-package invariants, so ANY change can break one — including a change
+  // to a file no package-scoped target claims (a workflow, a root doc, the lockfile).
+  if (changedPaths.length > 0) woken.add('repo')
   if (touched('packages/bridge-core/')) for (const t of TARGETS) woken.add(t.key)
   if (touched('packages/bridge-net-util/')) for (const k of HTTP_BACKENDS) woken.add(k)
   if (touched('packages/conformance/')) for (const k of BACKENDS) woken.add(k)
@@ -104,6 +125,19 @@ const SCHEMA = {
 const WORKTREES = '/tmp/careening/worktrees'
 
 function prompt(target) {
+  if (target.brief) {
+    return [
+      `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
+      target.brief,
+      `Review the tree AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round."`,
+      `Read CLAUDE.md and DESIGN.md first for the invariants.`,
+      `VERIFY each issue against the tree before reporting — run the count, take the hashes, read both sides of the claimed drift. Mark CONFIRMED only when traced or reproduced; otherwise PLAUSIBLE.`,
+      `The suite's GREEN STATE IS GIVEN: it was verified before this round. Do NOT re-run it to confirm it passes. Run or mutate tests only as an instrument — to prove a guard is vacuous, or that an invariant genuinely is unguarded in the packages your matrix says are uncovered.`,
+      `Do NOT start containers. Nothing at this scale needs one, and the shared parley-dev-* set belongs to the orchestrator while other critics are using it.`,
+      `Return the structured schema. For each finding give the concrete failure — what breaks, or what silently is not checked, and where — a remediation, and a testUpgrade that guards the CLASS across the whole repo rather than patching the instances one at a time.`,
+      `If a genuine attempt found nothing at repo scale, set nothingFound=true and describe specifically which invariants you built a matrix for and what you diffed — a clean result retires you from later rounds, so it must be auditable.`,
+    ].join(' ')
+  }
   return [
     `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
     `Full-surface adversarial review of the Parley package at: ${target.path}.`,

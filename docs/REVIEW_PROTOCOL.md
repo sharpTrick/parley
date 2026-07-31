@@ -97,6 +97,38 @@ that moved it, so the iatrogenesis oracle will read rounds 12+ as near-100% self
 blames through moves (`-C -M`). The oracle is re-anchored for that; where it cannot be, the
 discontinuity is reported rather than smoothed.
 
+## The `repo` target (added at round 13 — a partition change, recorded as one)
+
+Rounds 1–12 ran a 14-target partition, every target scoped to one package or two. Round 13 adds a
+fifteenth, `repo`, owning what is true of the repository and structurally invisible to a
+package-scoped critic: cross-package duplication, the coverage matrix of a repo-wide invariant,
+lockstep drift between sibling packages, build/CI/release plumbing, root-level doc claims, and tests
+in one package that assert on another's source by path.
+
+**This changes the experiment's main variable mid-run, and that cost is real.** Per-round finding
+counts are no longer strictly comparable across the round-12/13 boundary, and the writeup must
+report the discontinuity rather than smooth it. Two things justify paying it. First, the loop
+itself filed this theme in rounds 3, 3, 4 and 5 — `identical-helper-restated-per-test-file`,
+`per-file-copies-of-the-liveness-probe-and-fixtures`, `per-file-restated-harness-and-duplicate-case`,
+`per-file-rig-duplication` — and never closed it, because a critic that owns one package can see an
+instance but never the class. A fifteenth package-scoped round would not have surfaced it a fifth
+time either. Second, the theme is measurable rather than aesthetic: ten `cli.ts` copies at ~545
+lines with ten distinct hashes and already-drifted comments, one helper byte-identical in six files,
+and nine repo-wide invariants covering 32 of 104 package-cells.
+
+**Scope discipline is the point, and it is in the brief.** The `repo` critic is told that fourteen
+others are reading one package each in parallel and that a defect confined to one package is theirs,
+not its — package-local code is admissible only as *evidence* for a repo-scale pattern, where the
+pattern is the finding. It carries the lenses that operate at that scale (design-principles,
+test-integrity, test-hygiene, truth-in-docs, operability-and-release, maintainability,
+seam-integrity, and security only where repo-scale) rather than all eleven, and it does not start
+containers. It wakes on any change, since any change can break a cross-package invariant — including
+a change to a file no package target claims.
+
+**Report its yield separately.** A finding only this target could reach is the measurement that says
+whether partition-by-package was leaving a whole class unreachable; folding its findings into the
+per-package series would hide exactly that.
+
 ## Quiescence (a Careening addition)
 
 A reviewer that returns zero CONFIRMED findings **quiesces** and sits out later rounds. It wakes
