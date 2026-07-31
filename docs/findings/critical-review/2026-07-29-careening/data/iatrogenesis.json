@@ -88,6 +88,16 @@
       "preExisting": 26,
       "unresolvable": 0,
       "selfInducedPct": 63
+    },
+    {
+      "round": 10,
+      "base": "ee7f157",
+      "findings": 75,
+      "graded": 75,
+      "selfInduced": 56,
+      "preExisting": 19,
+      "unresolvable": 0,
+      "selfInducedPct": 75
     }
   ],
   "comparison": {
@@ -156,9 +166,16 @@
         "selfInduced": 17,
         "preExisting": 11,
         "selfInducedPct": 61
+      },
+      {
+        "round": 10,
+        "blocking": 29,
+        "selfInduced": 21,
+        "preExisting": 8,
+        "selfInducedPct": 72
       }
     ],
-    "reading": "Pre-existing BLOCKING findings: 36, 25, 20, 11, 5, then 10, 9, 11 across rounds 7-9. The fall through round 6 did not continue; the series has been flat near 10 for three rounds while blocking self-induction sits in the 57-62% band. Overall self-induction: 26, 39, 57, 60, 80, 66, 56, 63 - round 6's 80% is an outlier, not a trend. Total findings are flattening (90, 79, 73, 71) with the original-defect yield roughly steady, which is NOT ouroboros's described regime of a loop consuming its own output at rising cost per finding."
+    "reading": "Ten rounds. Overall self-induction: 26, 39, 57, 60, 80, 66, 56, 63, 75. Blocking self-induction: 27, 34, 56, 72, 81, 57, 62, 61, 72. Pre-existing BLOCKING findings: 36, 25, 20, 11, 5, 10, 9, 11, 8. Neither series is monotone and neither has converged; both oscillate in a band (self-induction 56-80%, pre-existing blocking 5-11) that has been stable since round 5. The loop is in a STEADY STATE, not a decay: it keeps finding ~8-11 original blocking defects per round in a codebase nine prior full-surface rounds have swept, while roughly two thirds of its blocking output is against its own prior work. That steady state is the experiment's central quantitative result and it is NOT what ouroboros described."
   },
   "inertRemediations": {
     "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
@@ -226,5 +243,19 @@
       }
     ],
     "reading": "Both core targets now need ~50 mutations to surface a handful of survivors, where earlier rounds found vacuous guards by inspection. The instrument's cost per finding is rising on the packages that have been worked hardest, which is the ouroboros knee arriving per-package rather than run-wide."
+  },
+  "halfwayReading": {
+    "atRound": 10,
+    "totals": {
+      "findings": 941,
+      "confirmed": 899,
+      "blocking": 353,
+      "suiteTests": 10968,
+      "suiteAtStart": 460
+    },
+    "whatReplicated": "Ouroboros's finding that a full-surface adversarial loop keeps producing indefinitely. Ten rounds, zero converged, no target has ever quiesced.",
+    "whatDidNot": "Ouroboros's two-regime split with a knee after which the loop reviews only its own output. Careening shows no knee at the run level. Pre-existing blocking findings fell 36 -> 5 through round 6 and then RECOVERED to a stable 8-11 band for four rounds.",
+    "whyPlausibly": "The per-package partition means a target that runs dry is one of fourteen, not one of four; and a deep surface (eleven network backends, OAuth, concurrency) keeps offering new ground. Saturation, where it appears, is package-local: core-auth needed 27 mutations in round 8 to establish it had no vacuous tests and 52 in round 9 to surface two survivors.",
+    "theInstrumentResult": "Round 9 measured a sharp asymmetry: critics are reliable at FINDING (68/71 confirmed) and unreliable at PRESCRIBING - five remediations that round would have introduced or blessed a defect if implemented as written. Separating review from remediation, each with its own verification, is what caught them."
   }
 }
