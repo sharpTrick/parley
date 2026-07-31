@@ -1,7 +1,7 @@
-import { readFileSync } from 'node:fs';
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { SOURCE } from './sources.js';
 
 // core's push loop rethrows anything `subscribe` rejects with that is not a `NoSuchTopicError`, so
 // a raw driver string — 'Client has encountered a connection error and is not queryable',
@@ -70,11 +70,9 @@ vi.mock('pg', async () => {
 
 const PG_DSN = 'postgres://app:s3cret@db.example.com:5432/prod';
 
-const SOURCE = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
-
 /** Every awaited call in `startSubscription`, read out of the source rather than listed here. */
 function awaitedCalls(): string[] {
-  const body = /private async startSubscription\([\s\S]*?\n  \}\n/.exec(SOURCE);
+  const body = /(?<![.\w])startSubscription\([\s\S]*?\n {0,2}\}\n/.exec(SOURCE);
   return [...(body?.[0] ?? '').matchAll(/await ([\w.]+)\(/g)].map((m) => m[1] as string);
 }
 

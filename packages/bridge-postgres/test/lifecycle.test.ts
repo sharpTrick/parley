@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs';
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { sleep } from './pg-harness.js';
+import { SOURCE } from './sources.js';
 
 // Deterministic listener-lifecycle tests: a disconnect() racing a reconnect must leak no live
 // Client, a failed LISTEN must leave no registration, and a repeat subscribe must fan out.
@@ -194,8 +194,6 @@ const CHORES: Chore[] = [
  * parked at the boundary) or in push-self-heal.test.ts (which owns the drain's re-drain timer).
  */
 const EPOCH_GUARD_SITES = 11;
-
-const SOURCE = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 
 const CROSS_CELLS = CHORES.flatMap((chore) =>
   (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),

@@ -10,8 +10,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay } from '@sharptrick/parley-net-util';
-import { Client, Pool, type PoolClient } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import {
   DEFAULT_POOL_SIZE,
   DEFAULT_TABLE_NAME,
@@ -27,142 +26,34 @@ import {
   lockWaitAbandoned,
   subscribeFailed,
 } from './errors.js';
-import { messagesSince, newestMessages, pageResult, rowToMessage } from './read.js';
-import {
-  assertTableName,
-  buildSchema,
-  channelFor,
-  type MessageRow,
-  quotedNames,
-  type SchemaNames,
-} from './schema.js';
+import { PostgresListen } from './listen.js';
+import { LISTENER_WAIT_MS } from './listener.js';
+import type { TopicSubscription } from './push.js';
+import { newestMessages, pageResult } from './read.js';
+import { assertTableName, buildSchema, channelFor, quotedNames } from './schema.js';
 
 export { MAX_POOL_SIZE, MAX_RETENTION_DAYS, MIN_POOL_SIZE, MIN_RETENTION_DAYS } from './config.js';
 export { DEFAULT_POOL_SIZE, LOCK_WAIT_MS, type PostgresBackendConfig, usesDefaultCredentials };
-export { validateBackendConfig };
+export { LISTENER_WAIT_MS, validateBackendConfig };
 
-/** How many rows one drain query pulls at most before re-querying. */
-const DRAIN_BATCH = 512;
-/** First gap before a failed drain is retried; doubles per consecutive failure. */
-const DRAIN_RETRY_BASE_MS = 50;
-/**
- * Ceiling on the re-drain gap, so a database that stays down is re-probed forever but cheaply.
- * Keep the retry unbounded in COUNT, so that push converges the way catch-up does: NOTIFY is
- * edge-triggered, and a drain that gave up holds `lastSeen` behind a durably stored row.
- */
-const DRAIN_RETRY_CEILING_MS = 30_000;
-/** Backoff between listener reconnect attempts after the connection drops. */
-const RECONNECT_DELAY_MS = 500;
-/**
- * How long a seam call waits for the shared LISTEN connection — a first connect, or the backoff
- * reconnect after a drop — before giving up. Bounded for the same reason as {@link LOCK_WAIT_MS}.
- */
-export const LISTENER_WAIT_MS = 5000;
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the pool size. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 /** Rows one prune statement may delete, so retention never issues one unbounded table-wide DELETE. */
 export const PRUNE_BATCH = 5000;
 
-/** Reject with `onTimeout()` if `p` has not settled within `budgetMs`; never leaves a timer behind. */
-async function withDeadline<T>(
-  p: Promise<T>,
-  budgetMs: number,
-  onTimeout: () => Error,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      p,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(onTimeout()), budgetMs);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-/** Per-channel LISTEN state shared by subscriptions and blocking waiters. */
-interface ListenState {
-  /** Resolves only once the LISTEN is ESTABLISHED — never merely intended. */
-  ready: Promise<void>;
-  /** Participants (subscriptions + in-flight waiters) that still need this channel LISTENed. */
-  refs: number;
-}
-
-/** Live-path bookkeeping for one subscribed topic (keyed by NOTIFY channel). */
-interface TopicSubscription {
-  topic: Topic;
-  /**
-   * Every handler subscribed to this NOTIFY channel; a repeat `subscribe(topic, …)` appends, so a
-   * second subscribe doesn't silently replace the first. The channel is drained once per
-   * notification and fanned out, so the `lastSeen`/coalescing bookkeeping stays shared per channel.
-   */
-  handlers: MessageHandler[];
-  /** Highest seq already delivered (as text — BIGINT round-trips as a string). */
-  lastSeen: string;
-  /** In-flight guard: at most one drain loop per topic at a time. */
-  draining: boolean;
-  /** A notification arrived mid-drain — run the drain once more before going idle. */
-  pending: boolean;
-  /** Armed backoff re-drain after a failed drain read; cleared once one succeeds. */
-  retryTimer?: ReturnType<typeof setTimeout>;
-  /** Gap the next re-drain will use — doubles per consecutive failure, reset by a success. */
-  retryDelayMs?: number;
-}
-
 /**
  * The PostgreSQL backend (DESIGN §9). A NOTIFY is only a doorbell: keep every subscriber and
  * blocking waiter re-querying strictly after its last-seen `seq`, so that a coalesced, dropped or
  * mis-addressed notification costs latency and never a message (DESIGN §6).
  */
-export class PostgresPlugin implements BackendPlugin {
-  private pool?: Pool;
+export class PostgresPlugin extends PostgresListen implements BackendPlugin {
   /**
    * Armed synchronously by `connect()` before its first await, so that two concurrent `connect()`s
    * cannot both pass a `pool === undefined` guard — `this.pool` is only published after the awaited
    * bootstrap, and the loser's pool and prune timer would be stranded with no caller reference.
    */
   private connecting = false;
-  private url = DEFAULT_URL;
-  private table = DEFAULT_TABLE_NAME;
-  /** Relation names already double-quoted — the only spelling that may reach SQL text. */
-  private names: SchemaNames = quotedNames(DEFAULT_TABLE_NAME);
-  private retentionDays?: number;
-  private pruneTimer?: ReturnType<typeof setInterval>;
-  private stopped = false;
-  /**
-   * Bumped by every `disconnect()`. Compare it, not `stopped`, after any await in a chore that
-   * mutates shared state — `connect()` sets `stopped` back to false, so a chore that slept across
-   * a whole teardown/restart sees `stopped === false` and would publish into the NEW lifecycle.
-   */
-  private epoch = 0;
-
-  /** Dedicated non-pool LISTEN connection, shared by all topics; lazy on first subscribe. */
-  private listener?: Client;
-  private listenerPromise?: Promise<Client>;
-  private reconnecting = false;
-  private readonly subs = new Map<string, TopicSubscription>();
-  /**
-   * Channels whose first `subscribe` is still mid-flight, so a concurrent `subscribe` to the same
-   * topic joins that one instead of building a second {@link TopicSubscription} that overwrites it.
-   */
-  private readonly subscribing = new Map<string, Promise<TopicSubscription>>();
-
-  /**
-   * Blocking `fetchRecent` waiters keyed by NOTIFY channel, parked on the SAME doorbell `subscribe`
-   * waits on. The notification handler fans a NOTIFY out to every registered wake.
-   */
-  private readonly waiters = new Map<string, Set<() => void>>();
-  /** Established (or in-flight) LISTENs by channel — see {@link acquireListen}. */
-  private readonly listens = new Map<string, ListenState>();
-  /**
-   * Every in-flight blocking-fetch wait's release callback, fired on `disconnect()` so a blocked
-   * `fetchRecent` returns immediately with no leaked timer — the same teardown discipline the
-   * listener connection gets.
-   */
-  private readonly pendingAborts = new Set<() => void>();
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = validateBackendConfig(config);
@@ -183,8 +74,8 @@ export class PostgresPlugin implements BackendPlugin {
 
   private async open(cfg: PostgresBackendConfig): Promise<void> {
     this.url = cfg.url ?? DEFAULT_URL;
-    this.table = assertTableName(cfg.table_name ?? DEFAULT_TABLE_NAME);
-    this.names = quotedNames(this.table);
+    const table = assertTableName(cfg.table_name ?? DEFAULT_TABLE_NAME);
+    this.names = quotedNames(table);
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
     const epoch = this.epoch;
@@ -208,14 +99,14 @@ export class PostgresPlugin implements BackendPlugin {
     try {
       await client.query('BEGIN');
       await client.query(`SET LOCAL lock_timeout = ${LOCK_WAIT_MS}`);
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [this.table]);
-      await client.query(buildSchema(this.table));
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [table]);
+      await client.query(buildSchema(table));
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();
       await pool.end().catch(() => undefined);
-      throw lockWaitAbandoned(`bootstrap lock on table '${this.table}'`, err);
+      throw lockWaitAbandoned(`bootstrap lock on table '${table}'`, err);
     }
     client.release();
     // Same hazard the listener has, one resource up: a disconnect() can complete while the
@@ -228,9 +119,7 @@ export class PostgresPlugin implements BackendPlugin {
     this.pool = pool;
 
     if (this.retentionDays !== undefined) {
-      const tick = (): void => {
-        void this.prune().catch(() => undefined);
-      };
+      const tick = (): void => void this.prune().catch(() => undefined);
       tick();
       // Keep the unref, so a leaked-but-never-disconnect()ed plugin cannot by itself pin the
       // event loop — pruning is a best-effort cost knob, not a reason to keep the process alive.
@@ -356,74 +245,6 @@ export class PostgresPlugin implements BackendPlugin {
     return pageResult(rows, args.since);
   }
 
-  private readSince(topic: Topic, since: string, limit: number): Promise<MessageRow[]> {
-    return messagesSince(this.require(), this.names, topic, since, limit);
-  }
-
-  /**
-   * Park up to `blockMs` waiting for a NOTIFY on `topic`'s channel, then return so the caller can
-   * re-run the exclusive `since` query. The doorbell is the one `subscribe` waits on, piggybacking
-   * a live subscription's LISTEN through {@link acquireListen} when there is one. Any wake, the
-   * `blockMs` timer, or `disconnect()` releases the wait, and the timer is always cleared.
-   */
-  private async waitForNotify(
-    topic: Topic,
-    since: string,
-    limit: number,
-    blockMs: number,
-  ): Promise<void> {
-    const epoch = this.epoch;
-    let listener: Client;
-    try {
-      listener = await this.ensureListener(Math.min(blockMs, LISTENER_WAIT_MS));
-    } catch {
-      return; // listener unavailable → skip the native wait; core polls the remaining budget
-    }
-    if (this.stopped || epoch !== this.epoch) return;
-    const channel = channelFor(topic);
-
-    let listen: ListenState;
-    try {
-      listen = await this.acquireListen(listener, channel);
-    } catch {
-      return; // LISTEN failed → skip the native wait; core polls the remaining budget
-    }
-    let waiters = this.waiters.get(channel);
-    if (waiters === undefined) {
-      waiters = new Set();
-      this.waiters.set(channel, waiters);
-    }
-    const set = waiters;
-    await new Promise<void>((resolve) => {
-      let done = false;
-      const finish = (): void => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        this.pendingAborts.delete(finish);
-        set.delete(finish);
-        if (set.size === 0) this.waiters.delete(channel);
-        this.releaseListen(channel, listen);
-        resolve();
-      };
-      const timer = setTimeout(finish, blockMs);
-      this.pendingAborts.add(finish);
-      set.add(finish);
-      if (this.stopped || epoch !== this.epoch) {
-        finish(); // disconnect may have raced registration
-        return;
-      }
-      // Snapshot-window re-check: catch a row that landed between the caller's empty read and the
-      // LISTEN above, which sent no NOTIFY we'd hear. If it's there, wake now (caller re-queries);
-      // otherwise stay parked. A failed re-check is harmless — the NOTIFY/timer still resolve us.
-      void this.readSince(topic, since, limit)
-        .then((recheck) => {
-          if (recheck.length > 0) finish();
-        })
-        .catch(() => undefined);
-    });
-  }
-
   /**
    * Live path = LISTEN/NOTIFY (DESIGN §9 — genuine events, not a poll timer). One dedicated
    * non-pool listener connection is shared by every topic; the AFTER INSERT trigger rings channel
@@ -464,7 +285,6 @@ export class PostgresPlugin implements BackendPlugin {
     }
   }
 
-  /** Tail read → LISTEN → register, for a channel nothing is subscribed to yet. */
   private async startSubscription(
     pool: Pool,
     topic: Topic,
@@ -529,264 +349,5 @@ export class PostgresPlugin implements BackendPlugin {
        VALUES ($1, $1) ON CONFLICT (handle) DO NOTHING`,
       [handle],
     );
-  }
-
-  /**
-   * Take a reference on the channel's LISTEN, resolving only once that LISTEN is ESTABLISHED —
-   * publishing "someone intends to LISTEN" as if it were "the channel is LISTENed" strands every
-   * piggybacking waiter on a doorbell that may never be installed. Rejects (having taken no
-   * reference) if the LISTEN failed, so the caller can fall back.
-   */
-  private async acquireListen(listener: Client, channel: string): Promise<ListenState> {
-    const existing = this.listens.get(channel);
-    if (existing !== undefined) {
-      existing.refs++;
-      try {
-        await existing.ready;
-      } catch (err) {
-        this.releaseListen(channel, existing);
-        throw err;
-      }
-      return existing;
-    }
-    const entry: ListenState = {
-      ready: listener.query(`LISTEN "${channel}"`).then(() => undefined),
-      refs: 1,
-    };
-    this.listens.set(channel, entry);
-    try {
-      await entry.ready;
-    } catch (err) {
-      if (this.listens.get(channel) === entry) this.listens.delete(channel);
-      throw err;
-    }
-    return entry;
-  }
-
-  /** Drop one reference; UNLISTEN once no subscription or waiter needs the channel. */
-  private releaseListen(channel: string, entry: ListenState): void {
-    if (this.listens.get(channel) !== entry) return;
-    entry.refs--;
-    if (entry.refs > 0) return;
-    this.listens.delete(channel);
-    if (!this.stopped && this.listener !== undefined) {
-      void this.listener.query(`UNLISTEN "${channel}"`).catch(() => undefined);
-    }
-  }
-
-  /**
-   * The shared LISTEN connection: created lazily on first subscribe, and REPLACED by the backoff
-   * reconnect after a drop. Keep the memo pointing at the reconnect that is in flight rather than
-   * at the client whose socket just closed, so that a `subscribe` issued during the blackout waits
-   * for the replacement and then succeeds — handed the dead client it is guaranteed to fail, and
-   * core's push loop rethrows that, so the whole bridge fails to come up. The wait is bounded, so
-   * an outage that outlasts `budgetMs` is a named error rather than a call that never settles.
-   */
-  private ensureListener(budgetMs = LISTENER_WAIT_MS): Promise<Client> {
-    if (this.listenerPromise === undefined) {
-      const attempt: Promise<Client> = this.createListener().catch((err: unknown) => {
-        if (this.listenerPromise === attempt) this.listenerPromise = undefined;
-        throw err;
-      });
-      this.listenerPromise = attempt;
-    }
-    return withDeadline(
-      this.listenerPromise,
-      budgetMs,
-      () => new Error(`the listener connection did not come up within ${budgetMs}ms`),
-    );
-  }
-
-  private async createListener(): Promise<Client> {
-    const epoch = this.epoch;
-    const client = new Client({ connectionString: this.url });
-    this.wireListener(client);
-    await client.connect();
-    return this.adoptListener(client, epoch);
-  }
-
-  /**
-   * The one place a freshly connected candidate becomes `this.listener`. Keep EVERY path that
-   * opens a listener socket going through here, so that a `disconnect()` which completed while the
-   * connect was in flight cannot leave a live pg connection attached to a stopped plugin — an
-   * orphan pins the Node event loop and holds a server backend slot for the life of the process.
-   */
-  private async adoptListener(client: Client, epoch: number): Promise<Client> {
-    if (this.stopped || epoch !== this.epoch) {
-      await client.end().catch(() => undefined);
-      throw new Error('parley-postgres: disconnected while the listener connection was in flight');
-    }
-    this.listener = client;
-    return client;
-  }
-
-  /** Attach notification + failure handlers to a (candidate) listener connection. */
-  private wireListener(client: Client): void {
-    client.on('error', () => {
-      /* Keep this swallow, so that a socket error cannot kill the process; 'end' follows it and
-         drives the reconnect. */
-    });
-    client.on('notification', (n) => {
-      const sub = this.subs.get(n.channel);
-      // Payload is a hint only (size limits + best-effort delivery) — always re-query.
-      if (sub !== undefined) this.drain(sub);
-      // Wake any blocking fetchRecent parked on this channel; each re-runs its own
-      // exclusive `since` query. A spurious wake only ends a wait early — safe, core re-polls.
-      const set = this.waiters.get(n.channel);
-      if (set !== undefined) for (const wake of [...set]) wake();
-    });
-    client.on('end', () => {
-      if (!this.stopped && this.listener === client) {
-        void this.reconnectListener().catch(() => undefined);
-      }
-    });
-  }
-
-  /**
-   * Backoff loop: new connection, re-LISTEN every channel, then re-drain every topic from its
-   * `lastSeen` — anything posted while we were dark is picked up by the drain, so a lost
-   * notification window costs latency, never a message.
-   */
-  private async reconnectListener(): Promise<void> {
-    if (this.reconnecting) return;
-    this.reconnecting = true;
-    const epoch = this.epoch;
-    let landed!: (client: Client) => void;
-    let abandoned!: (err: unknown) => void;
-    const replacement = new Promise<Client>((resolve, reject) => {
-      landed = resolve;
-      abandoned = reject;
-    });
-    // Keep this handler, so that a reconnect abandoned with no seam call waiting on it is not an
-    // unhandled rejection that takes the process down.
-    replacement.catch(() => undefined);
-    this.listenerPromise = replacement;
-    let adopted = false;
-    try {
-      while (!this.stopped && epoch === this.epoch) {
-        await delay(RECONNECT_DELAY_MS);
-        if (this.stopped || epoch !== this.epoch) return;
-        const client = new Client({ connectionString: this.url });
-        this.wireListener(client);
-        try {
-          await client.connect();
-          if (this.stopped || epoch !== this.epoch) {
-            await client.end().catch(() => undefined);
-            return;
-          }
-          // Re-LISTEN every channel a subscription OR an in-flight blocking waiter needs, so a
-          // reconnect mid-wait still delivers the doorbell.
-          const listened: string[] = [];
-          for (const channel of this.listens.keys()) {
-            await client.query(`LISTEN "${channel}"`);
-            listened.push(channel);
-          }
-          await this.adoptListener(client, epoch);
-          // The loop above awaits, and a waiter's blockMs can expire inside it: that release has
-          // already dropped the channel with no live connection to send its UNLISTEN to. Keep this
-          // reconciliation, so that the replacement is not left registered for a channel no
-          // participant needs — every future post to that topic would wake the process forever.
-          for (const channel of listened) {
-            if (!this.listens.has(channel)) {
-              void client.query(`UNLISTEN "${channel}"`).catch(() => undefined);
-            }
-          }
-          landed(client);
-          adopted = true;
-          for (const sub of this.subs.values()) this.drain(sub);
-          return;
-        } catch {
-          await client.end().catch(() => undefined);
-          // server still unreachable — back off and try again
-        }
-      }
-    } finally {
-      // A loop that gave up must settle the memo every waiting seam call is parked on, and clear
-      // it, so that a later subscribe starts a fresh listener instead of awaiting a dead promise.
-      if (!adopted) {
-        abandoned(new Error('the listener reconnect was abandoned by disconnect()'));
-        if (this.listenerPromise === replacement) this.listenerPromise = undefined;
-      }
-      // Keep the flag owned by the lifecycle that set it, so that this loop exiting after a
-      // disconnect() cannot clear a successor lifecycle's reconnect and let two run at once.
-      if (epoch === this.epoch) this.reconnecting = false;
-    }
-  }
-
-  /**
-   * Drain everything after `lastSeen` for one topic, in ascending seq order. At most one drain
-   * runs per topic (`draining` flag); a notification landing mid-drain sets `pending` so the
-   * loop runs once more instead of racing a second drain past the first.
-   */
-  private drain(sub: TopicSubscription): void {
-    if (sub.draining) {
-      sub.pending = true;
-      return;
-    }
-    sub.draining = true;
-    this.clearRedrain(sub);
-    const epoch = this.epoch;
-    void (async () => {
-      try {
-        do {
-          sub.pending = false;
-          for (;;) {
-            if (this.stopped || epoch !== this.epoch) return;
-            const rows = await this.readSince(sub.topic, sub.lastSeen, DRAIN_BATCH);
-            // `pool.end()` waits for this read, so a teardown that began while it was in flight is
-            // only observable HERE. Keep the re-check, so that a subscription `disconnect()` has
-            // already dropped cannot deliver one last batch into a handler on its way out.
-            if (this.stopped || epoch !== this.epoch) return;
-            if (rows.length === 0) break;
-            for (const row of rows) {
-              sub.lastSeen = String(row.seq);
-              const msg = rowToMessage(row);
-              // Keep each handler in its own try/catch, so that one throwing handler cannot starve
-              // the others on this channel (DESIGN §6).
-              for (const handler of sub.handlers) {
-                try {
-                  handler(msg);
-                } catch {}
-              }
-            }
-          }
-        } while (sub.pending && !this.stopped && epoch === this.epoch);
-        sub.retryDelayMs = undefined;
-      } catch {
-        this.scheduleRedrain(sub, epoch);
-      } finally {
-        sub.draining = false;
-      }
-    })();
-  }
-
-  /**
-   * Re-arm a failed drain on a doubling backoff. A NOTIFY is an EDGE: the drain that swallowed the
-   * failure leaves `lastSeen` behind a durably stored row with nothing guaranteed to ring the
-   * doorbell again. Keep the arming epoch-guarded, so that a drain read rejecting after
-   * `disconnect()` cannot install a timer that outlives the lifecycle.
-   */
-  private scheduleRedrain(sub: TopicSubscription, epoch: number): void {
-    if (this.stopped || epoch !== this.epoch || sub.retryTimer !== undefined) return;
-    const delayMs = sub.retryDelayMs ?? DRAIN_RETRY_BASE_MS;
-    sub.retryDelayMs = Math.min(delayMs * 2, DRAIN_RETRY_CEILING_MS);
-    // Keep the unref, so a database that stays down cannot by itself pin the event loop — push is
-    // best-effort over a durable cursor, not a reason to keep the process alive.
-    sub.retryTimer = setTimeout(() => {
-      sub.retryTimer = undefined;
-      this.drain(sub);
-    }, delayMs).unref();
-  }
-
-  private clearRedrain(sub: TopicSubscription): void {
-    if (sub.retryTimer !== undefined) clearTimeout(sub.retryTimer);
-    sub.retryTimer = undefined;
-  }
-
-  private require(): Pool {
-    if (this.pool === undefined) {
-      throw new Error('PostgresPlugin not connected — call connect() first');
-    }
-    return this.pool;
   }
 }
