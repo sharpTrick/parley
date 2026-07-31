@@ -64,22 +64,30 @@ const MODES = [
 ] as const;
 
 /**
- * How topic A is observed. Each row establishes its observation point, calls `land` (which posts one
- * more message to A and one to B), and returns what it saw.
+ * How topic A is observed. Each row establishes its observation point, calls `land` (which puts one
+ * more message in A's room and one in B's), and returns what it saw. `expected` is a function of
+ * whether the landed message is one this mode delivers, so the same row grades both outcomes.
  */
 const OBSERVATIONS: Record<
   string,
-  { expected: string[]; observe: (p: MatrixPlugin, land: () => Promise<void>) => Promise<string[]> }
+  {
+    expected: (delivered: boolean) => string[];
+    observe: (
+      p: MatrixPlugin,
+      land: () => Promise<void>,
+      expected: string[],
+    ) => Promise<string[]>;
+  }
 > = {
   'fetchRecent (no since)': {
-    expected: ['a0', 'a1'],
+    expected: (delivered) => (delivered ? ['a0', 'a1'] : ['a0']),
     observe: async (p, land) => {
       await land();
       return contents(await p.fetchRecent({ topic: A, limit: 10 }));
     },
   },
   'fetchRecent (since)': {
-    expected: ['a1'],
+    expected: (delivered) => (delivered ? ['a1'] : []),
     observe: async (p, land) => {
       const since = (await p.fetchRecent({ topic: A, limit: 10 })).nextCursor;
       await land();
@@ -87,17 +95,46 @@ const OBSERVATIONS: Record<
     },
   },
   subscribe: {
-    expected: ['a1'],
-    observe: async (p, land) => {
+    expected: (delivered) => (delivered ? ['a1'] : []),
+    observe: async (p, land, expected) => {
       const got: string[] = [];
       await p.subscribe(A, (m) => got.push(m.content));
       await land();
-      await vi.waitFor(() => expect(got.length).toBeGreaterThan(0), { timeout: 4000, interval: 5 });
-      // Keep this settle, so that a MISROUTED sibling message has time to arrive and fail the row
-      // rather than being read before the loop could deliver it.
+      await vi.waitFor(() => expect(got.length).toBeGreaterThanOrEqual(expected.length), {
+        timeout: 4000,
+        interval: 5,
+      });
+      // Keep this settle, so that a MISROUTED sibling message — or one this mode must drop — has
+      // time to arrive and fail the row rather than being read before the loop could deliver it.
       await settle(150);
       return got;
     },
+  },
+};
+
+/**
+ * WHO wrote the message that lands during the observation. `delivered` states the mode in which it
+ * reaches topic A, and that is the whole per-topic/`shared_room` contract: the room is the boundary
+ * in per-topic mode (the tag is ignored, so a native client's untagged message IS topic A's), while
+ * in `shared_room` mode the tag is the boundary and an untagged message belongs to no topic.
+ */
+const WRITERS: Record<
+  string,
+  { land: (p: MatrixPlugin, alias: (t: Topic) => string) => Promise<void>; delivered: (shared: boolean) => boolean }
+> = {
+  'through Parley (tagged)': {
+    land: async (p) => {
+      await p.post(A, WRITER, 'a1');
+      await p.post(B, WRITER, 'b1');
+    },
+    delivered: () => true,
+  },
+  'from a native Matrix client (untagged)': {
+    land: async (_p, alias) => {
+      fake.addUntagged('a1', alias(A));
+      fake.addUntagged('b1', alias(B));
+    },
+    delivered: (shared) => !shared,
   },
 };
 
@@ -128,21 +165,22 @@ describe('a topic is read out of its own room only', () => {
     });
 
     for (const [name, row] of Object.entries(OBSERVATIONS)) {
-      it(`${mode.name}: ${name} returns only topic A, out of topic A's room`, async () => {
-        const p = await connectFake({ shared: mode.shared });
-        await p.post(A, WRITER, 'a0');
-        await p.post(B, WRITER, 'b0');
-        fake.requestUrls.length = 0;
+      for (const [writerName, writer] of Object.entries(WRITERS)) {
+        const delivered = writer.delivered(mode.shared);
+        it(`${mode.name}: ${name} ${delivered ? 'returns' : 'drops'} a message written ${writerName}, out of topic A's room`, async () => {
+          const p = await connectFake({ shared: mode.shared });
+          await p.post(A, WRITER, 'a0');
+          await p.post(B, WRITER, 'b0');
+          fake.requestUrls.length = 0;
 
-        const seen = await row.observe(p, async () => {
-          await p.post(A, WRITER, 'a1');
-          await p.post(B, WRITER, 'b1');
+          const expected = row.expected(delivered);
+          const seen = await row.observe(p, () => writer.land(p, alias), expected);
+
+          expect(seen).toEqual(expected);
+          expect(roomsRead()).toEqual([fake.roomIdFor(alias(A))]);
+          await p.disconnect();
         });
-
-        expect(seen).toEqual(row.expected);
-        expect(roomsRead()).toEqual([fake.roomIdFor(alias(A))]);
-        await p.disconnect();
-      });
+      }
     }
   }
 });
@@ -158,15 +196,15 @@ const ALIAS_LEGAL = /^#[A-Za-z0-9._-]+:[^:]+$/;
 
 const FOLDS: { topic: string; localpart: string }[] = [
   { topic: 'alpha', localpart: 'parley_alpha' },
-  { topic: 'ops:prod', localpart: 'parley_ops_prod-1608f4e357' },
-  { topic: 'team/frontend', localpart: 'parley_team_frontend-222ee3741b' },
-  { topic: 'pay ments', localpart: 'parley_pay_ments-48bb595de9' },
-  { topic: '#hash', localpart: 'parley__hash-c6e1f364ad' },
-  { topic: '@at', localpart: 'parley__at-2c333a3a1e' },
-  { topic: 'ünïcode', localpart: 'parley__n_code-979fe33b70' },
-  { topic: 'tab\there', localpart: 'parley_tab_here-6db31cce25' },
+  { topic: 'ops:prod', localpart: 'parley_ops_prod-1608f4e357676264' },
+  { topic: 'team/frontend', localpart: 'parley_team_frontend-222ee3741b0781e7' },
+  { topic: 'pay ments', localpart: 'parley_pay_ments-48bb595de96958ca' },
+  { topic: '#hash', localpart: 'parley__hash-c6e1f364ad5ec08b' },
+  { topic: '@at', localpart: 'parley__at-2c333a3a1e0609ca' },
+  { topic: 'ünïcode', localpart: 'parley__n_code-979fe33b70c7bba4' },
+  { topic: 'tab\there', localpart: 'parley_tab_here-6db31cce25cd1c3f' },
   // The injectivity pair: one lossy fold and the legal name it would otherwise collide with.
-  { topic: 'a/b', localpart: 'parley_a_b-3ec69c85a4' },
+  { topic: 'a/b', localpart: 'parley_a_b-3ec69c85a4ff9683' },
   { topic: 'a_b', localpart: 'parley_a_b' },
 ];
 

@@ -8,8 +8,11 @@ import {
   B,
   HOMESERVER,
   isMatrixUp,
+  joinAs,
   mxid,
   retireRoom,
+  roomIdOf,
+  sendRawMessage,
   SERVER_NAME,
   tokenFor,
 } from './live-gate.js';
@@ -72,6 +75,41 @@ describe.skipIf(!bothAccounts)('live per-topic rooms, two accounts', () => {
       await retireRoom(aliasForTopic(String(topic)), tokens);
       await a.disconnect();
       await b.disconnect();
+    }
+  }, 60_000);
+
+  /**
+   * The room, not the tag, is the boundary in per-topic mode — so a message written by a client that
+   * has never heard of Parley is topic traffic, on both the catch-up and the live path. This is the
+   * humans-and-agents-in-one-room case DESIGN §16 names as Parley's reason to exist, and no seam call
+   * can produce the event: every write this plugin makes stamps `app.parley.topic`.
+   */
+  it('an untagged message from a native Matrix client is delivered like any other', async () => {
+    const a = new MatrixPlugin();
+    const topic = freshTopic('per-topic-untagged');
+    try {
+      await a.connect(configFor(A, [mxid(B.user)]));
+      await a.post(topic, asHandle('a'), 'from-a');
+
+      const live: string[] = [];
+      await a.subscribe(topic, (m) => live.push(m.content));
+
+      const roomId = await roomIdOf(tokens[1]!, aliasForTopic(String(topic)));
+      expect(roomId).toBeDefined();
+      expect(await joinAs(tokens[1]!, roomId!)).toBe(true);
+      const sent = await sendRawMessage(tokens[1]!, roomId!, {
+        msgtype: 'm.text',
+        body: 'from-element',
+      });
+      expect(sent).toBeDefined();
+
+      await expect.poll(() => live, { timeout: 15_000, interval: 100 }).toEqual(['from-element']);
+      const read = await a.fetchRecent({ topic, limit: 10 });
+      expect(read.messages.map((m) => m.content)).toEqual(['from-a', 'from-element']);
+      expect(read.messages.map((m) => String(m.backendMsgId))).toContain(sent);
+    } finally {
+      await retireRoom(aliasForTopic(String(topic)), tokens);
+      await a.disconnect();
     }
   }, 60_000);
 

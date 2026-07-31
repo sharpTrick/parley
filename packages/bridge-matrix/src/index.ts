@@ -20,7 +20,6 @@ import {
   DEFAULT_DEADLINE_MS,
   delay,
   fetchWithRetry,
-  isLoopbackHost,
   plaintextRemoteOrigin,
   retryAfterFromHeader,
 } from '@sharptrick/parley-net-util';
@@ -327,6 +326,13 @@ export class MatrixPlugin implements BackendPlugin {
   private userId?: string;
   private stopped = false;
   /**
+   * True only while {@link connect}'s login is in flight — the one window in which holding no token
+   * is normal rather than a failed connect. Keep it, so that a PREVIOUS generation's seam call
+   * resuming inside that window still stands down on its own staleness gate and reports the
+   * caller's cursor back, instead of rejecting with the failed-connect diagnostic.
+   */
+  private loggingIn = false;
+  /**
    * Bumped by every {@link connect}. Background work captures it and stands down when it no longer
    * matches — keep it, so that a loop parked in a retry backoff across a `disconnect()` cannot be
    * resurrected by the next `connect()` clearing {@link stopped}, and run on against a stale token,
@@ -362,6 +368,11 @@ export class MatrixPlugin implements BackendPlugin {
     validateConfig(cfg);
     this.generation++;
     this.standDown();
+    // Keep the credential cleared BEFORE `baseUrl` moves, so that homeserver A's bearer token can
+    // never reach homeserver B — neither on the login request nor on the seam calls that follow a
+    // login which failed.
+    this.token = undefined;
+    this.userId = undefined;
     this.baseUrl = (cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL).replace(/\/+$/, '');
     this.serverName = cfg.server_name ?? 'parley.local';
     this.user = cfg.user ?? 'parley';
@@ -374,16 +385,21 @@ export class MatrixPlugin implements BackendPlugin {
 
     for (const risk of configRisks(cfg)) console.warn(`[parley-matrix] SECURITY: ${risk}`);
 
-    const res = await this.http('POST', '/_matrix/client/v3/login', {
-      body: {
-        type: 'm.login.password',
-        identifier: { type: 'm.id.user', user: this.user },
-        password: this.password,
-      },
-    });
-    const json = (await res.json()) as { access_token: string; user_id: string };
-    this.token = json.access_token;
-    this.userId = json.user_id;
+    this.loggingIn = true;
+    try {
+      const res = await this.http('POST', '/_matrix/client/v3/login', {
+        body: {
+          type: 'm.login.password',
+          identifier: { type: 'm.id.user', user: this.user },
+          password: this.password,
+        },
+      });
+      const json = (await res.json()) as { access_token: string; user_id: string };
+      this.token = json.access_token;
+      this.userId = json.user_id;
+    } finally {
+      this.loggingIn = false;
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -928,7 +944,6 @@ export class MatrixPlugin implements BackendPlugin {
             this.controllers.delete(controller);
           }
           if (this.isStale(generation)) break;
-          consecutiveFailures = 0;
           nextBatch = nextBatchOf(json.next_batch, nextBatch);
           const timeline = json.rooms?.join?.[roomId]?.timeline;
           const events = timeline?.events ?? [];
@@ -959,6 +974,11 @@ export class MatrixPlugin implements BackendPlugin {
             lastDelivered = e.event_id;
             this.deliver(roomId, topic, e, handler);
           }
+          // Keep the reset here rather than beside the response, so that a `/sync` the loop THROWS
+          // on while reading — a malformed-but-parseable body — still counts as a consecutive
+          // failure: reset early it stays pinned at 1, and a homeserver answering that shape forever
+          // gets a stderr line and a re-request every 200ms with no throttle and no backoff.
+          consecutiveFailures = 0;
         } catch (err) {
           if (this.isStale(generation)) break;
           consecutiveFailures++;
@@ -978,6 +998,15 @@ export class MatrixPlugin implements BackendPlugin {
   /** True once work started under `generation` must stand down: we disconnected, or reconnected. */
   private isStale(generation: number): boolean {
     return this.stopped || this.generation !== generation;
+  }
+
+  /**
+   * True while the plugin considers itself connected but holds no credential — the state a
+   * `connect()` whose login rejected leaves behind. A torn-down plugin and a login still in flight
+   * are both excluded, so that work already under way at either still drains.
+   */
+  private get loginIncomplete(): boolean {
+    return this.token === undefined && !this.stopped && !this.loggingIn;
   }
 
   /** Wake every native long-poll waiter parked on `roomId` for `topic` (idempotent per waiter). */
@@ -1241,6 +1270,10 @@ export class MatrixPlugin implements BackendPlugin {
    * (`M_LIMIT_EXCEEDED`) honoring `retry_after_ms`. Retries stop the moment we disconnect, so an
    * aborted test never leaves a loop hammering the homeserver. Throws on unexpected non-2xx unless
    * the caller marks the status as expected via `allowStatuses`.
+   *
+   * Keep a call made while {@link loginIncomplete} a THROW, so that a plugin whose `connect()`
+   * rejected fails naming the cause rather than issuing anonymous requests to the newly configured
+   * homeserver and serving whatever a permissive one answers as though it were connected.
    */
   private async http(
     method: string,
@@ -1255,6 +1288,13 @@ export class MatrixPlugin implements BackendPlugin {
     const generation = this.generation;
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {};
+    if (this.loginIncomplete) {
+      throw new Error(
+        `[parley-matrix] refusing ${method} ${path}: no access token for ${this.baseUrl}, because ` +
+          'the last connect() did not complete its login. Call connect() again and let it resolve ' +
+          'before using this plugin.',
+      );
+    }
     if (this.token !== undefined) headers.Authorization = `Bearer ${this.token}`;
     if (opts?.body !== undefined) headers['Content-Type'] = 'application/json';
 

@@ -106,20 +106,33 @@ describe('subscribe loop does not silently hot-retry a permanent /sync failure',
  */
 const FRESH = 'after-the-garbage';
 
-/** Shapes a homeserver, a proxy, or a captive portal can put on the wire that still parse as JSON. */
-const MALFORMED: Record<string, (roomId: string) => unknown> = {
-  'JSON null': () => null,
-  'an array': () => [],
-  'a bare string': () => 'ok',
-  'a number': () => 123,
-  'rooms: null': () => ({ next_batch: 'p0', rooms: null }),
-  'rooms.join is not a map': () => ({ next_batch: 'p0', rooms: { join: 'x' } }),
-  'next_batch is not a token': () => ({ next_batch: 42 }),
-  'timeline.events is not a list': (roomId) => ({
-    next_batch: 'p0',
-    rooms: { join: { [roomId]: { timeline: { events: 42, limited: false } } } },
-  }),
-};
+/**
+ * Shapes a homeserver, a proxy, or a captive portal can put on the wire that still parse as JSON,
+ * each with what a PERSISTENT occurrence of it must degrade to. `reported` = the loop throws on it,
+ * so it owes the operator a stderr line and a backoff; `paced` = the loop cannot tell it from an
+ * empty sync, so it owes no diagnostic but must still not hot-spin. Keep the degradation on the row,
+ * so that widening this table cannot add a shape nobody grades past survival.
+ */
+const MALFORMED: Record<string, { body: (roomId: string) => unknown; degrades: 'reported' | 'paced' }> =
+  {
+    'JSON null': { body: () => null, degrades: 'reported' },
+    'an array': { body: () => [], degrades: 'paced' },
+    'a bare string': { body: () => 'ok', degrades: 'paced' },
+    'a number': { body: () => 123, degrades: 'paced' },
+    'rooms: null': { body: () => ({ next_batch: 'p0', rooms: null }), degrades: 'paced' },
+    'rooms.join is not a map': {
+      body: () => ({ next_batch: 'p0', rooms: { join: 'x' } }),
+      degrades: 'paced',
+    },
+    'next_batch is not a token': { body: () => ({ next_batch: 42 }), degrades: 'reported' },
+    'timeline.events is not a list': {
+      body: (roomId) => ({
+        next_batch: 'p0',
+        rooms: { join: { [roomId]: { timeline: { events: 42, limited: false } } } },
+      }),
+      degrades: 'reported',
+    },
+  };
 
 /** Each driver arms the body, lands one well-formed message behind it, and reports what arrived. */
 const DRIVERS: Record<string, (arm: () => void) => Promise<string[]>> = {
@@ -152,7 +165,7 @@ const DRIVERS: Record<string, (arm: () => void) => Promise<string[]>> = {
 };
 
 describe('a malformed but parseable /sync body never escapes a background loop', () => {
-  for (const [bodyName, body] of Object.entries(MALFORMED)) {
+  for (const [bodyName, shape] of Object.entries(MALFORMED)) {
     for (const [driverName, drive] of Object.entries(DRIVERS)) {
       it(`${bodyName} / ${driverName}: reported and retried, never an unhandled rejection`, async () => {
         vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -161,7 +174,7 @@ describe('a malformed but parseable /sync body never escapes a background loop',
         process.on('unhandledRejection', onEscape);
         let got: string[] = [];
         try {
-          got = await drive(() => void fake.syncBodyOverrides.push(body));
+          got = await drive(() => void fake.syncBodyOverrides.push(shape.body));
           await new Promise((r) => setTimeout(r, 50)); // let a rejection reach the event loop.
         } finally {
           process.off('unhandledRejection', onEscape);
@@ -209,4 +222,74 @@ describe('a malformed but parseable /sync body never escapes a background loop',
 
     expect(escaped.map(String)).toEqual([]);
   }, 20_000);
+});
+
+/**
+ * CLASS: a malformed-upstream row must grade the DEGRADATION, not just survival. The table above
+ * arms each shape ONCE and asserts only that a later well-formed message arrives — which a variant
+ * that adopts the bad token, ignores it silently, or re-issues `/sync` as fast as the socket allows
+ * satisfies just as well. What separates them is what a PERSISTENT occurrence costs the deployment:
+ * a shape the loop throws on owes the operator a stderr line and an exponential backoff, and one it
+ * cannot tell from an empty sync owes no diagnostic but must still be paced. Without this, a
+ * homeserver or proxy answering one bad shape forever presents as a dead live path, no operator
+ * signal, and roughly a thousandfold the request rate.
+ *
+ * Graded on the subscribe loop alone: it is the only `/sync` driver that reports or backs off — the
+ * dedicated one behind a blocking `fetchRecent` is bounded by the caller's own `blockMs`.
+ */
+
+/** Arm a shape that RE-ARMS itself, so every `/sync` for the rest of the case answers with it. */
+const armForever = (body: (roomId: string) => unknown): void => {
+  const again = (roomId: string): unknown => {
+    fake.syncBodyOverrides.push(again);
+    return body(roomId);
+  };
+  fake.syncBodyOverrides.push(again);
+};
+
+/** Long enough for the paced arm to run many `/sync` rounds, short enough to keep the file quick. */
+const PACING_WINDOW_MS = 600;
+/**
+ * Attempts a PACED loop can fit in that window. The pace floor is 25ms, so a conforming loop lands
+ * near 24; an unpaced one is bounded only by the fake's 1ms round-trip and lands in the hundreds.
+ */
+const PACED_ATTEMPT_CEILING = 100;
+
+describe('a malformed /sync body that never stops is reported and slowed, not hot-retried', () => {
+  for (const [bodyName, shape] of Object.entries(MALFORMED)) {
+    it(`${bodyName}: degrades ${shape.degrades}`, async () => {
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const p = await connectFake({});
+      // Arm BEFORE subscribe, so that every incremental `/sync` of the run is the shape under test
+      // and the attempt timestamps below are consecutive occurrences of it.
+      armForever(shape.body);
+      await p.subscribe(asTopic('doomed'), () => undefined);
+
+      if (shape.degrades === 'paced') {
+        await new Promise((r) => setTimeout(r, PACING_WINDOW_MS));
+        const attempts = fake.syncAttempts.length;
+        await p.disconnect();
+
+        expect(reportedFailureCounts(errors.mock.calls)).toEqual([]);
+        expect(attempts).toBeGreaterThan(1);
+        expect(attempts).toBeLessThan(PACED_ATTEMPT_CEILING);
+        return;
+      }
+
+      await vi.waitFor(() => expect(fake.syncAttempts.length).toBeGreaterThanOrEqual(4), {
+        timeout: 8000,
+        interval: 20,
+      });
+      const [a0, a1, a2, a3] = fake.syncAttempts as [number, number, number, number];
+      await p.disconnect();
+
+      // The same two assertions the 401/403/500/network table makes: the gap between retries GROWS…
+      expect(a3 - a2).toBeGreaterThan((a1 - a0) * 2);
+      // …and the operator hears about it, at exactly the powers of two, each reported once.
+      const reported = reportedFailureCounts(errors.mock.calls);
+      expect(reported).toEqual([...new Set(reported)]);
+      for (const n of reported) expect(n & (n - 1)).toBe(0);
+      expect(reported.slice(0, 3)).toEqual([1, 2, 4]);
+    }, 20_000);
+  }
 });

@@ -140,3 +140,60 @@ describe('no rationale is restated across comment blocks', () => {
     });
   }
 });
+
+/**
+ * CLASS: a dead symbol must fail a check, not a reviewer's grep. An import nothing references
+ * survives every gate this repo has — `tsconfig.base.json` sets neither `noUnusedLocals` nor
+ * `noUnusedParameters`, and no ESLint/Biome is configured — while reading as a live dependency of
+ * the code beside it, which invites a second, divergent implementation of what the real one already
+ * owns. Scoped to this package's `src/`; the compiler flags would cover the monorepo at once.
+ */
+
+/** Every `import … from '…'` clause in a file, and the whole span each one occupies. */
+const importClauses = (source: string): { clause: string; span: string }[] => {
+  const out: { clause: string; span: string }[] = [];
+  const re = /import\s+([\s\S]*?)\s+from\s+['"][^'"]*['"]/g;
+  for (let m = re.exec(source); m !== null; m = re.exec(source)) {
+    out.push({ clause: m[1]!, span: m[0] });
+  }
+  return out;
+};
+
+/** The local identifiers an import clause binds — aliases, defaults and namespaces included. */
+function boundNames(clause: string): string[] {
+  const named = /\{([\s\S]*)\}/.exec(clause);
+  const outside = clause.replace(/\{[\s\S]*\}/, '').replace(/^type\s+/, '');
+  const names = [
+    ...(named?.[1] ?? '').split(','),
+    ...outside.split(',').map((t) => t.replace(/^\s*\*\s+as\s+/, '')),
+  ];
+  return names
+    .map((n) => n.trim().replace(/^type\s+/, ''))
+    .map((n) => (/\s+as\s+/.test(n) ? n.split(/\s+as\s+/)[1]!.trim() : n))
+    .filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));
+}
+
+/** Imported bindings whose identifier appears nowhere else in the file. */
+function unusedImports(source: string): string[] {
+  const clauses = importClauses(source);
+  const body = clauses.reduce((acc, { span }) => acc.replace(span, ''), source);
+  return clauses
+    .flatMap(({ clause }) => boundNames(clause))
+    .filter((name) => !new RegExp(`\\b${name}\\b`).test(body));
+}
+
+describe('no import is dead', () => {
+  it('tells a dead import from a used one', () => {
+    const src = "import { used, dead, other as alias } from 'x';\nconst a = used(alias);\n";
+    expect(unusedImports(src)).toEqual(['dead']);
+    expect(unusedImports("import type { T } from 'x';\nlet a: T;\n")).toEqual([]);
+    expect(unusedImports("import * as ns from 'x';\nns.f();\n")).toEqual([]);
+    expect(unusedImports("import * as ns from 'x';\n")).toEqual(['ns']);
+  });
+
+  for (const file of sources) {
+    it(`${file} references every name it imports`, () => {
+      expect(unusedImports(readFileSync(join(SRC, file), 'utf8'))).toEqual([]);
+    });
+  }
+});

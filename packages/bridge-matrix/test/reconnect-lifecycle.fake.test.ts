@@ -1,7 +1,15 @@
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MatrixPlugin } from '../src/index.js';
-import { aliasForTopic, connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
+import { MatrixPlugin } from '../src/index.js';
+import {
+  aliasForTopic,
+  bearerFor,
+  connectFake,
+  fakeConfig,
+  FakeSynapse,
+  HOMESERVER_URL,
+  OTHER_HOMESERVER_URL,
+} from './fake-synapse.js';
 
 /**
  * CLASS: no background loop may outlive the `disconnect()` that stopped it — including across a
@@ -348,6 +356,82 @@ describe('a parked blocking fetchRecent does not outlive the lifecycle call that
         expect(settledAfter).toBeLessThan(SLOW_SYNC_MS / 4);
         await p.disconnect();
       }, 30_000);
+    }
+  }
+});
+
+/**
+ * CLASS: a lifecycle transition must reset every piece of state it owns — the ACCESS TOKEN included.
+ * `connect()` may move the homeserver, so a credential the previous one minted is state that
+ * transition owns: left in place it rides the new host's login request, and when that login fails it
+ * rides every seam call after it, to a host that never issued it. Parameterized over what the plugin
+ * was doing when the reconnect landed, whether the homeserver actually changed, and how the login
+ * answered, because the leak and the still-serving halves are reachable from different cells.
+ */
+const PRIOR_STATE: Record<string, (p: MatrixPlugin) => Promise<void>> = {
+  fresh: async () => undefined,
+  connected: async (p) => {
+    await p.connect(fakeConfig());
+  },
+  'connected + subscribed': async (p) => {
+    await p.connect(fakeConfig());
+    await p.subscribe(TOPIC, () => undefined);
+  },
+};
+
+const TARGETS: Record<string, string> = {
+  'the same homeserver': HOMESERVER_URL,
+  'a different homeserver': OTHER_HOMESERVER_URL,
+};
+
+const LOGIN_OUTCOMES = [200, 401, 403, 'network'] as const;
+
+/** Every `Authorization` a `POST /v3/login` carried — the credential-crossing evidence. */
+const loginAuthorizations = (): (string | undefined)[] =>
+  fake.requestAuth.filter((_a, i) => fake.requestUrls[i]!.pathname.endsWith('/v3/login'));
+
+describe('connect() resets the credential it is replacing', () => {
+  for (const [priorName, prior] of Object.entries(PRIOR_STATE)) {
+    for (const [targetName, url] of Object.entries(TARGETS)) {
+      for (const outcome of LOGIN_OUTCOMES) {
+        const verdict =
+          outcome === 200
+            ? 'every later request carries only the new token'
+            : 'the rejected connect serves nothing';
+        it(`prior: ${priorName} / to ${targetName} / login ${outcome}: no login carries a token, and ${verdict}`, async () => {
+          const p = new MatrixPlugin();
+          await prior(p);
+
+          fake.loginOutcome = outcome;
+          const reconnecting = p.connect(fakeConfig({ homeserverUrl: url }));
+          if (outcome === 200) await reconnecting;
+          else await expect(reconnecting).rejects.toThrow();
+
+          expect(loginAuthorizations().filter((a) => a !== undefined)).toEqual([]);
+          expect(loginAuthorizations().length).toBeGreaterThan(0);
+
+          await settle(50); // let a request already on the wire at the reconnect be recorded.
+          const mark = fake.requestAuth.length;
+
+          if (outcome === 200) {
+            await p.post(TOPIC, WRITER, 'work');
+            await p.fetchRecent({ topic: TOPIC, limit: 10 });
+            expect([...new Set(fake.requestAuth.slice(mark))]).toEqual([
+              bearerFor(new URL(url).host),
+            ]);
+          } else {
+            // A failed login leaves no credential, so every seam call must say so rather than talk
+            // to the new homeserver anonymously and serve whatever a permissive one answers.
+            await expect(p.post(TOPIC, WRITER, 'secret work')).rejects.toThrow(/parley-matrix/);
+            await expect(p.fetchRecent({ topic: TOPIC, limit: 10 })).rejects.toThrow(
+              /parley-matrix/,
+            );
+            await expect(p.subscribe(TOPIC, () => undefined)).rejects.toThrow(/parley-matrix/);
+            expect(fake.requestAuth.slice(mark)).toEqual([]);
+          }
+          await p.disconnect();
+        }, 30_000);
+      }
     }
   }
 });

@@ -71,6 +71,18 @@ export class FakeSynapse {
   readonly messagesRequests: URL[] = [];
   /** Every request URL, in order — the evidence for which rooms a run actually touched. */
   readonly requestUrls: URL[] = [];
+  /**
+   * The `Authorization` header of each request, index-aligned with {@link requestUrls}. Keep the
+   * credential observable, so that WHICH token went to WHICH homeserver is gradeable: a plugin that
+   * carries one login's bearer token to another host is indistinguishable from a healthy one on the
+   * URL alone.
+   */
+  readonly requestAuth: (string | undefined)[] = [];
+  /**
+   * How `POST /v3/login` answers: 200, an HTTP status, or a rejected fetch. Keep a failing login
+   * expressible, so that the state a REJECTED `connect()` leaves behind is gradeable at all.
+   */
+  loginOutcome: number | 'network' = 200;
   /** How many events an incremental /sync will return before it truncates with `limited:true`. */
   syncCap = 100;
   /** Number of `limited:true` incremental syncs emitted — proves the backfill path was exercised. */
@@ -101,6 +113,17 @@ export class FakeSynapse {
   joinStatus = 200;
   /** Every `PUT .../send/m.room.message/<txn>` body, in order. */
   readonly sentBodies: Record<string, unknown>[] = [];
+  /** Remaining `PUT .../send/m.room.message/<txn>` calls to refuse with 429. */
+  sendLimited = 0;
+  sendRetryAfterMs = 60;
+  /**
+   * `<access token>|<txn id>` → the `event_id` that transaction already produced. Matrix makes a
+   * `PUT .../send/<txnId>` IDEMPOTENT per access token, which is the entire reason the plugin mints a
+   * fresh txn id per `post` and the entire reason `fetchWithRetry` may re-send one on a 429. Keep the
+   * map, so that both directions are reachable offline: a fake that appends on every PUT certifies a
+   * fixed txn id (total write loss against Synapse) and grades no retry as duplicate-free.
+   */
+  private readonly transactions = new Map<string, unknown>();
   /** Remaining incremental-`/sync` calls to fail (`Infinity` = a permanent failure). */
   syncFailures = 0;
   /**
@@ -220,6 +243,16 @@ export class FakeSynapse {
     );
   }
 
+  /**
+   * Inject an `m.room.message` carrying NO `app.parley.topic` tag — what a human in Element, or any
+   * other native Matrix client, actually sends. Keep it distinct from {@link addMessage}, so that the
+   * per-topic mode's delivery predicate (the room is the boundary; the tag is ignored) is gradeable:
+   * every other injector tags its events, and a tagged event is delivered in BOTH modes.
+   */
+  addUntagged(body: string, alias?: string): Ev {
+    return this.ev('m.room.message', { msgtype: 'm.text', body }, this.target(alias));
+  }
+
   /** Inject a non-`m.room.message` event (reaction / membership churn). */
   addRaw(type: string, alias?: string): Ev {
     return this.ev(type, {}, this.target(alias));
@@ -246,10 +279,20 @@ export class FakeSynapse {
     const url = new URL(typeof input === 'string' ? input : ((input as Request).url ?? String(input)));
     const method = (init?.method ?? 'GET').toUpperCase();
     const path = url.pathname;
+    const auth = new Headers(init?.headers).get('authorization') ?? undefined;
     this.requestUrls.push(url);
+    this.requestAuth.push(auth);
     this.onRequest(method, path);
 
-    if (path.endsWith('/v3/login')) return jsonRes({ access_token: 'tok', user_id: '@parley:fake' });
+    if (path.endsWith('/v3/login')) {
+      if (this.loginOutcome === 'network') throw new Error('fake network reset');
+      if (this.loginOutcome !== 200) {
+        return jsonRes({ errcode: 'M_FORBIDDEN', error: 'injected' }, this.loginOutcome);
+      }
+      // Mint the token from the HOST, so that a credential arriving at the wrong homeserver names
+      // the one it was minted by instead of being indistinguishable from that host's own.
+      return jsonRes({ access_token: tokenFor(url.host), user_id: '@parley:fake' });
+    }
 
     const dirMatch = path.match(/\/v3\/directory\/room\/([^/]+)$/);
     if (dirMatch) {
@@ -300,8 +343,19 @@ export class FakeSynapse {
       return jsonRes({ room_id: inRoom.roomId });
     }
 
-    if (method === 'PUT' && /\/rooms\/[^/]+\/send\/m\.room\.message\//.test(path)) {
+    const send = /\/rooms\/[^/]+\/send\/m\.room\.message\/([^/]+)$/.exec(path);
+    if (method === 'PUT' && send !== null) {
+      if (this.sendLimited > 0) {
+        this.sendLimited--;
+        return jsonRes(
+          { errcode: 'M_LIMIT_EXCEEDED', error: 'Too many requests', retry_after_ms: this.sendRetryAfterMs },
+          429,
+        );
+      }
       if (inRoom === undefined) return notFound('room');
+      const txnKey = `${auth ?? ''}|${decodeURIComponent(send[1]!)}`;
+      const replayed = this.transactions.get(txnKey);
+      if (replayed !== undefined) return jsonRes({ event_id: replayed });
       const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
       this.sentBodies.push(body);
       const e = this.ev(
@@ -314,6 +368,7 @@ export class FakeSynapse {
         },
         inRoom,
       );
+      this.transactions.set(txnKey, e.event_id);
       return jsonRes({ event_id: e.event_id });
     }
 
@@ -455,17 +510,29 @@ export class FakeSynapse {
 
 const tokenPos = (t: string): number => Number(t.slice(1));
 
+/** The access token this fake mints for `host` — what a request bearing it names as its issuer. */
+export const tokenFor = (host: string): string => `tok-${host}`;
+
+/** The `Authorization` header value a request authenticated against `host` must carry. */
+export const bearerFor = (host: string): string => `Bearer ${tokenFor(host)}`;
+
+/** The homeserver every fixture points at unless a case names another one. */
+export const HOMESERVER_URL = 'https://synapse.fake';
+/** A SECOND homeserver, for cases about what one host's credential may reach on another. */
+export const OTHER_HOMESERVER_URL = 'https://other.fake';
+
 export interface ConnectOptions {
   shared?: boolean;
   roomPreset?: RoomPreset;
   invite?: string[];
   syncTimeoutMs?: number;
+  homeserverUrl?: string;
 }
 
 export const fakeConfig = (opts: ConnectOptions = {}): Record<string, unknown> => ({
   // https, so the fake fixture is not itself a config `connect()` must warn about: a SECURITY line
   // every case emits is one no case can grade, and it buries the ones a case arms deliberately.
-  homeserver_url: 'https://synapse.fake',
+  homeserver_url: opts.homeserverUrl ?? HOMESERVER_URL,
   server_name: SERVER_NAME,
   user: 'parley',
   password: 'a-real-test-secret',

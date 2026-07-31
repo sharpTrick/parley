@@ -106,6 +106,34 @@ const api = async (
   }
 };
 
+/** Join `roomId` as `token` — how an invited peer gets into a room this plugin did not create. */
+export async function joinAs(token: string, roomId: string): Promise<boolean> {
+  const res = await api(token, 'POST', `/rooms/${encodeURIComponent(roomId)}/join`, {});
+  return res !== undefined && res.ok;
+}
+
+/**
+ * Send an `m.room.message` VERBATIM through the raw Client-Server API — what a human in Element
+ * sends, and the only way to produce an event carrying no `app.parley.topic` tag: every write this
+ * plugin makes stamps one, so a suite driven only through the seam cannot reach the per-topic
+ * delivery predicate at all.
+ */
+export async function sendRawMessage(
+  token: string,
+  roomId: string,
+  content: Record<string, unknown>,
+): Promise<string | undefined> {
+  const txn = `live-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const res = await api(
+    token,
+    'PUT',
+    `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txn)}`,
+    content,
+  );
+  if (res === undefined || !res.ok) return undefined;
+  return ((await res.json()) as { event_id?: string }).event_id;
+}
+
 export async function roomIdOf(token: string, alias: string): Promise<string | undefined> {
   const res = await api(token, 'GET', `/directory/room/${encodeURIComponent(alias)}`);
   if (res === undefined || !res.ok) return undefined;

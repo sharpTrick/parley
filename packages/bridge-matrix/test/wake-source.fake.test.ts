@@ -307,3 +307,66 @@ describe('a blocking fetchRecent stays prompt when its wake source stops observi
     }
   }
 });
+
+/**
+ * CLASS: a callback the plugin declares best-effort must be proven best-effort on EVERY path that
+ * invokes it. `deliver` wakes the room's waiters only after the handler returns, so a handler that
+ * throws — core's push handler on a closed channel pipe, a serialization fault — takes the rest of
+ * the `/sync` batch and the wake with it, while `next_batch` has already advanced past those events:
+ * they are gone from the live path for good and the parked `fetchRecent` sleeps out its whole budget
+ * (`catchup.block_max_ms`, 60s in production) despite the loop having seen the message.
+ *
+ * WHICH delivery throws is the axis that matters, because the wake sits after the LAST one.
+ */
+const HANDLER_FAULTS: Record<string, (call: number, total: number) => boolean> = {
+  'every delivery throws': () => true,
+  'only the first delivery throws': (call) => call === 1,
+  'only the last delivery of the batch throws': (call, total) => call === total,
+};
+
+/** Belonging messages landed in one tick — more than the `limited` rows' cap, so they truncate. */
+const BURST = 3;
+const BURST_CONTENTS = Array.from({ length: BURST }, (_v, i) => `fresh${i}`);
+
+describe('a faulting subscribe handler breaks neither the batch nor the waiter parked on its room', () => {
+  for (const [pathName, shape] of Object.entries(DELIVERY_PATHS)) {
+    for (const [faultName, faults] of Object.entries(HANDLER_FAULTS)) {
+      it(`${pathName} / ${faultName}: the rest of the batch still lands and the parked fetchRecent still wakes`, async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const p = await connectFake({ shared: true, syncTimeoutMs: NO_SAFETY_NET_MS });
+        const blocked = asTopic('topic-A');
+        await p.post(blocked, WRITER, 'old');
+        const tail = (await p.fetchRecent({ topic: blocked, limit: 10 })).nextCursor;
+
+        const seen: string[] = [];
+        await p.subscribe(blocked, (m) => {
+          seen.push(m.content);
+          if (faults(seen.length, BURST)) throw new Error('handler fault');
+        });
+        fake.syncCap = shape.syncCap;
+
+        const started = Date.now();
+        const pending = p.fetchRecent({ topic: blocked, since: tail, blockMs: BLOCK_MS });
+        timers.push(
+          setTimeout(() => {
+            for (const body of BURST_CONTENTS) fake.addMessage(String(blocked), body);
+            for (let i = 0; i < shape.foreignAfter; i++) fake.addMessage('other-topic', `f${i}`);
+          }, 150),
+        );
+
+        const woke = await pending;
+        const elapsed = Date.now() - started;
+
+        expect(seen).toEqual(BURST_CONTENTS);
+        expect(woke.messages.map((m) => m.content)).toEqual(BURST_CONTENTS);
+        expect(elapsed).toBeLessThan(PROMPT_MS);
+        // A handler fault is the caller's, not the homeserver's: reporting it as a `/sync` failure
+        // is what backs the loop off and hides the real cause from the operator.
+        expect(errors.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('/sync'))).toEqual(
+          [],
+        );
+        await p.disconnect();
+      });
+    }
+  }
+});
