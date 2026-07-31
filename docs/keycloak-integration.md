@@ -183,9 +183,10 @@ dispatches on `cfg.auth.mode`; the OIDC composition is also available directly a
 - **Issuer + audience validation is not optional** and cannot be configured off. Audience
   binding is what stops a token minted for some other service in the same realm from reaching
   your bridge (token-passthrough/confused-deputy).
-- **Claim-gate failures return 401, not 403**, and all validation failures share one error
-  message — an unauthorized caller learns nothing about which check failed or what the gate
-  policy is.
+- **Identity-gate failures return 401, not 403**, and every 401 this server emits carries the
+  same error message — an unauthorized caller learns nothing about which check failed or what the
+  gate policy is. `required_scope` is the one deliberate exception, as RFC 6750 requires: an
+  otherwise-valid token that lacks the scope gets 403 `insufficient_scope`.
 - **Configure at least one identity gate.** Without one, every user in the realm who can log
   in can drive your bridge; `allowed_subjects` is the recommended default (`required_role` can
   silently 401 under `fullScopeAllowed=false` — see §3).
