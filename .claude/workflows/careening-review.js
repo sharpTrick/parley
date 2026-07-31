@@ -21,7 +21,7 @@ export const meta = {
 
 // `dirs` must list EVERY package a target reviews, so that a change in any of them wakes it.
 const TARGETS = [
-  { key: 'core-seam', dirs: ['bridge-core'], path: 'packages/bridge-core/src (seam.ts, message.ts, config.ts, allowlist.ts, identity-filter.ts, mentions.ts, topic-name.ts and their tests — NOT auth/, engine/ or transport/)' },
+  { key: 'core-seam', dirs: ['bridge-core'], path: 'packages/bridge-core/src — EVERY file directly in src/ plus src/testing/, and their tests. This is defined by exclusion, so that a file added or split out later is reviewed by default: it is all of src/ EXCEPT the auth/, engine/ and transport/ subdirectories, which other targets own.' },
   { key: 'core-engine', dirs: ['bridge-core'], path: 'packages/bridge-core/src/engine and packages/bridge-core/src/transport' },
   { key: 'core-auth', dirs: ['bridge-core'], path: 'packages/bridge-core/src/auth' },
   { key: 'sqlite', dirs: ['bridge-sqlite'], path: 'packages/bridge-sqlite' },

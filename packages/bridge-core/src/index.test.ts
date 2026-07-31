@@ -12,12 +12,16 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from './index.js';
 
+const SRC = readdirSync(fileURLToPath(new URL('.', import.meta.url)), { recursive: true })
+  .map(String)
+  .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+  .map((f) => readFileSync(fileURLToPath(new URL(f, import.meta.url)), 'utf8'));
+
 describe('public barrel surface', () => {
   // The consumer-free internals kept out of the barrel. These stay defined in their own
   // modules (engine/presence.ts, identity-filter.ts, transport/tools.ts) for in-package callers,
   // reached via relative imports — but must never be reachable through the public entry.
   const trimmed = [
-    'buildToolDefs',
     'matchGlob',
     'filterHandles',
     'MAX_RECORD_TOPICS',
@@ -54,6 +58,14 @@ describe('public barrel surface', () => {
     'catchUpTopic',
     'catchUpAll',
   ] as const;
+
+  it.each(trimmed)('still defines the trimmed internal %s somewhere in src', (name) => {
+    expect(
+      SRC.some((text) => new RegExp(`\\b(?:function|const|class|interface|type)\\s+${name}\\b`).test(text)),
+      `${name} is asserted absent from the barrel but no longer exists in src — a row that grades ` +
+        'nothing while reading as coverage. Delete it, or fix the name it drifted from.',
+    ).toBe(true);
+  });
 
   it.each(trimmed)('does not re-export the trimmed internal %s', (name) => {
     expect(name in api).toBe(false);
