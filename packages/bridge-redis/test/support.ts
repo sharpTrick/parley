@@ -34,6 +34,25 @@ export async function freeEndpoint(): Promise<string> {
 export const FAST_MS = 800;
 
 /**
+ * Every kind of handle this process is holding open, counted.
+ *
+ * Keep the whole histogram rather than a socket filter, so that a bounded operation which releases
+ * its socket and keeps the TIMER it armed to bound it is still visible: `withDeadline` arms one per
+ * connect and per reader, so dropping its `clearTimeout` leaves a live timer per subscribe and per
+ * long-poll holding the event loop open — invisible to any probe that filters to `TCPSocketWrap`.
+ */
+export function activeHandles(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const kind of process.getActiveResourcesInfo()) out[kind] = (out[kind] ?? 0) + 1;
+  return out;
+}
+
+/** How many more handles of `kind` are held now than in `before`. */
+export function handleGrowth(before: Record<string, number>, kind: string): number {
+  return (activeHandles()[kind] ?? 0) - (before[kind] ?? 0);
+}
+
+/**
  * Probe with the PLUGIN's own client builder, so that the harness can never be configured more
  * defensively than the code under test: a probe with private fail-fast options would make the
  * suite skip cleanly while the shipped plugin hangs forever against the same endpoint.

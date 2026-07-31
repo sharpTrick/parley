@@ -653,3 +653,109 @@ describe('redis subscribe hardening — reader lifecycle + generation gating', (
     await plugin.disconnect();
   });
 });
+
+// CLASS: a background loop a lifecycle call tore down still issues work, or still holds a timer.
+// The generation gate is the only thing that ends the read loop, and NOTHING graded that it does:
+// both of its checks on the failure path can be deleted with the whole suite green. The mutant is
+// not benign — after `disconnect()` the reader socket is destroyed, `xRead` rejects with a
+// `ClientClosedError` that is (correctly) classified transient, and the loop then retries a doomed
+// read on the 100ms→2s ladder for the life of the process, holding the event loop open at shutdown.
+//
+// Two axes: HOW the loop was left when the lifecycle call landed — each leaves it at a different
+// continuation, and the checks are per-continuation — and WHICH lifecycle call did it, since
+// `connect()` re-baselines the generation through the same `tearDown` that `disconnect()` uses.
+// Both halves are graded: no further reads, and no timer left armed. The existing 'superseded
+// reader' and 'does not revive a prior loop' cases grade only DELIVERY, which a loop spinning
+// forever against a dead socket never produces.
+describe('redis subscribe hardening — a torn-down read loop issues no further work', () => {
+  const entry = (id: string): XReadResult => [
+    { name: 'parley:ops', messages: [{ id, message: { sender: 'bob', content: 'live', ts: '' } }] },
+  ];
+
+  /** How the loop is left when the lifecycle call lands — one per continuation the gate guards. */
+  const leftAs: Array<[string, () => FakeReader['xRead']]> = [
+    [
+      'a read that keeps succeeding',
+      () => {
+        let seq = 0;
+        return vi.fn(
+          (): Promise<XReadResult> =>
+            new Promise((resolve) => setTimeout(() => resolve(entry(`${++seq}-0`)), 20)),
+        );
+      },
+    ],
+    ['a read that keeps timing out', () => makeReader().xRead],
+    [
+      'a read that keeps failing transiently',
+      () =>
+        vi.fn(
+          (): Promise<XReadResult> =>
+            new Promise((_r, reject) =>
+              setTimeout(() => reject(new Error('ClientClosedError')), 20),
+            ),
+        ),
+    ],
+    [
+      'a read that failed permanently',
+      () =>
+        vi.fn(
+          (): Promise<XReadResult> =>
+            Promise.reject(new Error('NOPERM this user has no permissions to run the xread command')),
+        ),
+    ],
+  ];
+
+  const lifecycles: Array<[string, (p: RedisPlugin) => Promise<void>]> = [
+    ['disconnect()', (p) => p.disconnect()],
+    ['connect() re-baselining the generation', (p) => p.connect({ url: 'redis://mock' })],
+  ];
+
+  const rows = leftAs.flatMap(([leftLabel, mint]) =>
+    lifecycles.map(
+      ([lifecycleLabel, run]) =>
+        [`${lifecycleLabel} after ${leftLabel}`, mint, run] as [
+          string,
+          () => FakeReader['xRead'],
+          (p: RedisPlugin) => Promise<void>,
+        ],
+    ),
+  );
+
+  it.each(rows)('%s', async (_label, mint, lifecycle) => {
+    vi.useFakeTimers();
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const plugin = new RedisPlugin();
+    await plugin.connect({ url: 'redis://mock', block_ms: 50 });
+    const reader = makeReader({ xRead: mint() });
+    queue(reader);
+
+    try {
+      await plugin.subscribe(asTopic('ops'), () => undefined);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(
+        reader.xRead.mock.calls.length,
+        'the loop never issued a read, so this row grades nothing',
+      ).toBeGreaterThan(0);
+
+      await lifecycle(plugin);
+      await vi.advanceTimersByTimeAsync(100); // let the in-flight iteration settle
+      const frozen = reader.xRead.mock.calls.length;
+
+      // Many times `block_ms`, and past the whole 100ms→2s retry ladder several times over — long
+      // enough that a loop merely sleeping out its backoff has woken, re-checked and exited.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(
+        reader.xRead.mock.calls.length,
+        'the torn-down loop kept issuing reads on a reader nothing can ever close',
+      ).toBe(frozen);
+      expect(
+        vi.getTimerCount(),
+        'the torn-down loop still holds a timer, so it keeps the event loop open at shutdown',
+      ).toBe(0);
+    } finally {
+      stderr.mockRestore();
+      await plugin.disconnect();
+      vi.useRealTimers();
+    }
+  });
+});

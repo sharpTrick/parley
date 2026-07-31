@@ -1,7 +1,13 @@
 import net from 'node:net';
 import { asBackendMsgId, asHandle, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { CONFIG_KEYS, createRedisClient, DEFAULT_URL, RedisPlugin } from '../src/index.js';
+import {
+  CONFIG_KEYS,
+  createRedisClient,
+  DEFAULT_URL,
+  MAX_BLOCKING_READERS,
+  RedisPlugin,
+} from '../src/index.js';
 import { label, rejectedByKnob } from './config-fixtures.js';
 import {
   endpointOf,
@@ -1286,6 +1292,121 @@ describe.skipIf(!redisUp)('redis failure modes — lifecycle must not leak conne
       }
     },
   );
+});
+
+// -------------------------------------------------------------------------------------------
+// CLASS: a seam call that allocates a backend connection must allocate a BOUNDED number of them.
+// `XREAD BLOCK` holds its connection for the whole wait, core imposes no concurrency limit on
+// `fetch_recent`, and its wrapper ABANDONS an aborted long-poll rather than cancelling the plugin
+// call — so without a cap one plugin instance parks one socket per in-flight call, for the whole
+// granted budget, against the Redis every peer session shares. Every long-poll row elsewhere in
+// this package and in the conformance suite issues exactly ONE blocking fetch at a time, which
+// makes fan-out structurally unobservable there.
+//
+// Three axes: the CONCURRENCY (the bound must hold at, below and far above it), whether the caller
+// still AWAITS the calls (an abandoned one is the shape that exhausts a server), and — the row that
+// keeps the fix honest — `subscribe`, which is one reader per subscribed topic and must NOT be
+// capped. Counted on the proxy, an external observation of live sockets, because the in-process
+// `readers` array stays clean either way.
+// -------------------------------------------------------------------------------------------
+
+describe.skipIf(!redisUp)('redis failure modes — a blocking fetch opens a bounded number of readers', () => {
+  const concurrency = [1, MAX_BLOCKING_READERS, 8 * MAX_BLOCKING_READERS];
+  const dispositions = ['awaited', 'abandoned'] as const;
+
+  const rows = concurrency.flatMap((n) =>
+    dispositions.map(
+      (how) =>
+        [`${n} concurrent, ${how}`, n, how] as [string, number, (typeof dispositions)[number]],
+    ),
+  );
+
+  it.each(rows)('%s', async (_label, n, how) => {
+    const proxy = await startProxy();
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    const t = freshTopic();
+    const budget = 1500;
+    try {
+      await plugin.connect({ url: proxy.url, key_prefix: prefix });
+      // A cursor AT the tail is what makes every call reach the long poll: below it XRANGE answers
+      // at once, past it the stale-cursor heal does.
+      await plugin.post(t, asHandle('w'), 'seed');
+      const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
+      const baseline = proxy.live();
+      const openedBefore = proxy.accepted();
+
+      const peak = { sockets: 0 };
+      const watch = setInterval(() => {
+        peak.sockets = Math.max(peak.sockets, proxy.live());
+      }, 5);
+      const calls = Array.from({ length: n }, () =>
+        plugin.fetchRecent({ topic: t, since, blockMs: budget }),
+      );
+      try {
+        if (how === 'awaited') {
+          await Promise.all(calls);
+        } else {
+          for (const call of calls) void call.catch(() => undefined);
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        // Whether anyone is still holding the promises or not, the sockets come back on the
+        // plugin's own budget — the abandoned arm is what core's cancel path actually does.
+        await expect
+          .poll(() => proxy.live(), { timeout: budget + 5000, interval: 25 })
+          .toBe(baseline);
+      } finally {
+        clearInterval(watch);
+      }
+
+      const opened = proxy.accepted() - openedBefore;
+      expect(opened, 'no reader was opened at all, so this row grades nothing').toBeGreaterThan(0);
+      expect(
+        opened,
+        `${n} concurrent long-polls opened ${opened} readers; a call past the cap must be served ` +
+          `the empty page it can always be handed, not a socket of its own`,
+      ).toBeLessThanOrEqual(Math.min(n, MAX_BLOCKING_READERS));
+      expect(
+        peak.sockets - baseline,
+        `${n} concurrent long-polls held ${peak.sockets - baseline} sockets at once against a ` +
+          `shared Redis, past the declared MAX_BLOCKING_READERS of ${MAX_BLOCKING_READERS}`,
+      ).toBeLessThanOrEqual(MAX_BLOCKING_READERS);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      proxy.close();
+      await wipe(prefix);
+    }
+  });
+
+  // The inverse arm, and the one a cap applied to the wrong place breaks: `subscribe` readers are
+  // one per subscribed topic, live for the session, and are NOT long-polls — capping them silently
+  // kills live push for every topic past the cap behind a `subscribe()` that resolved.
+  it('subscribe is not capped — every subscribed topic keeps a reader of its own', async () => {
+    const topics = 2 * MAX_BLOCKING_READERS;
+    const proxy = await startProxy();
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    try {
+      await plugin.connect({ url: proxy.url, key_prefix: prefix });
+      const baseline = proxy.live();
+      const subscribed = Array.from({ length: topics }, () => freshTopic());
+      const live: string[] = [];
+      for (const t of subscribed) await plugin.subscribe(t, (m) => live.push(m.content));
+      expect(
+        proxy.live() - baseline,
+        `${topics} subscriptions hold ${proxy.live() - baseline} readers; a cap meant for the ` +
+          `long poll was applied to live push`,
+      ).toBe(topics);
+      // …and the last one — the one a cap would have dropped — really delivers.
+      const last = subscribed.at(-1) as Topic;
+      await plugin.post(last, asHandle('w'), 'pushed');
+      await expect.poll(() => live, { timeout: 5000, interval: 50 }).toEqual(['pushed']);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      proxy.close();
+      await wipe(prefix);
+    }
+  });
 });
 
 /**

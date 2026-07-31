@@ -58,6 +58,17 @@ const RETRY_MAX_MS = 2000;
  * completely silent behind a `subscribe()` that resolved.
  */
 const DEGRADED_AFTER_FAILURES = 5;
+/**
+ * How many long-polling `fetchRecent` calls may hold a dedicated reader connection at once.
+ *
+ * Keep the cap, so that concurrent long-polls cannot open one socket per call against a Redis every
+ * peer session shares: `XREAD BLOCK` holds its connection for the whole wait, core imposes no
+ * concurrency limit on `fetch_recent` and abandons — rather than cancels — an aborted one, so a
+ * fire-and-cancel caller parks a connection per call for the whole granted budget and a few hundred
+ * a second exhaust the server's `maxclients` for everyone. `subscribe` readers are deliberately NOT
+ * counted here: those are one per subscribed topic and bounded by the config.
+ */
+export const MAX_BLOCKING_READERS = 8;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -421,6 +432,8 @@ export class RedisPlugin implements BackendPlugin {
    * closes it on the next generation check instead.
    */
   private readonly connecting = new Set<RedisClient>();
+  /** Long-polls currently holding a reader, held under {@link MAX_BLOCKING_READERS}. */
+  private blockingReaders = 0;
   /**
    * Serializes `connect`/`disconnect`. Keep it, so that two overlapping lifecycle calls cannot both
    * open a command client: each reads `this.client` before the other assigns it, and the loser's
@@ -449,7 +462,7 @@ export class RedisPlugin implements BackendPlugin {
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('parley-redis:')) throw err;
       const text = fromServer(this.url, errorText(err));
-      throw new Error(`parley-redis: ${text} (topic ${topic}, key '${key}')`);
+      throw new Error(`parley-redis: ${text} (topic '${topic}', key '${key}')`);
     }
   }
 
@@ -640,8 +653,9 @@ export class RedisPlugin implements BackendPlugin {
    * The reader is registered in `this.readers` BEFORE the blocking call so a concurrent
    * `disconnect()` finds and tears it down (breaking the blocking read), and the loop is gated on
    * the connect generation so a disconnect/reconnect racing this window can never revive it. On a
-   * timeout, a teardown or a transient socket fault we return `[]`, which is safe: the empty page
-   * carries `nextCursor === since` and core polls the remaining budget on the MCP path.
+   * timeout, a teardown, a transient socket fault or a call past {@link MAX_BLOCKING_READERS} we
+   * return `[]`, which is safe: the empty page carries `nextCursor === since` and core polls the
+   * remaining budget on the MCP path.
    *
    * Keep `readWindow`'s floor as the only floor, so that `XREAD BLOCK 0` — which blocks FOREVER —
    * can never be issued; `blockMs` arrives here already whole and positive.
@@ -652,8 +666,10 @@ export class RedisPlugin implements BackendPlugin {
     blockMs: number,
     limit: number,
   ): Promise<Array<{ id: string; message: Record<string, string> }>> {
+    if (this.blockingReaders >= MAX_BLOCKING_READERS) return [];
     const gen = this.generation;
     const reader = this.newReader();
+    this.blockingReaders++;
     // Register BEFORE connecting so a disconnect() racing this window can always find and close the
     // reader (mirrors the subscribe() pattern); registering after connect leaks a fresh duplicate.
     this.readers.push(reader);
@@ -673,6 +689,7 @@ export class RedisPlugin implements BackendPlugin {
       if (gen === this.generation && serverRefusal(err) !== undefined) throw err;
       return [];
     } finally {
+      this.blockingReaders--;
       this.dropReader(reader);
       await reader.disconnect().catch(() => undefined);
     }

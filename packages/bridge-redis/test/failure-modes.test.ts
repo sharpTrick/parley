@@ -1,19 +1,27 @@
 import { readdirSync } from 'node:fs';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { loadConfig } from '@sharptrick/parley-core';
+import { asCursor, asTopic, loadConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { CONFIG_KEYS, RedisPlugin } from '../src/index.js';
+import { CONFIG_KEYS, createRedisClient, RedisPlugin } from '../src/index.js';
 import { rejectedByKnob, rejectedRows } from './config-fixtures.js';
 import {
   commandOf,
+  DEFAULT_REPLIES,
   expectSafeError,
   respEndpoint,
   respError,
   SECRET,
   withArgs,
 } from './resp-server.js';
-import { endpointOf, FAST_MS as FAST, freeEndpoint } from './support.js';
+import {
+  activeHandles,
+  endpointOf,
+  FAST_MS as FAST,
+  freeEndpoint,
+  handleGrowth,
+  isRedisUp,
+} from './support.js';
 
 // The failure surface the seam-conformance suite structurally cannot reach: it only ever runs
 // against a reachable server, with cursors this backend just minted and a default retention.
@@ -326,8 +334,7 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
   ];
 
   /** TCP client sockets this process is holding open — the half no remote server can observe. */
-  const activeTcpHandles = (): number =>
-    process.getActiveResourcesInfo().filter((r) => r === 'TCPSocketWrap').length;
+  const activeTcpHandles = (): number => activeHandles().TCPSocketWrap ?? 0;
 
   const leakRows = brokenServers.flatMap(([label, reply]) =>
     [1, 3].map(
@@ -396,6 +403,235 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
       for (const spelling of new Set([password, inTheUrl])) {
         expectSafeError('connect()', failure, spelling);
       }
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      endpoint.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// CLASS: a bare `connect()` on the EXPORTED client builder SETTLES — it never retries forever.
+// `createRedisClient` is this package's public builder, and `support.ts` calls it with no deadline
+// of its own (`isRedisUp`, `withWriter`, `wipe`), so the pre-handshake `Error` return in its
+// reconnect strategy is the only thing between a direct consumer and a promise that never settles.
+// Every `connect() must fail fast` row above enters through `RedisPlugin.connect()`, which is
+// separately bounded by `withDeadline` and therefore passes with the strategy deleted.
+//
+// Two axes — the endpoint shape (each fails at a different layer) and the entry point — plus the
+// POST-handshake arm, so that a "fix" returning an `Error` unconditionally, which would stop a live
+// connection riding out a restart, fails here instead of passing.
+// ---------------------------------------------------------------------------------------------
+
+describe('redis failure modes — the exported client builder never retries forever', () => {
+  const endpoints: Array<[string, () => Promise<{ url: string; close: () => void }>]> = [
+    ['a closed port (RST)', async () => ({ url: await freeEndpoint(), close: () => undefined })],
+    [
+      'a blackholed ip (SYN dropped)',
+      async () => ({ url: 'redis://10.255.255.1:6379', close: () => undefined }),
+    ],
+    [
+      'an unresolvable host',
+      async () => ({ url: 'redis://parley-no-such-host.invalid:6379', close: () => undefined }),
+    ],
+  ];
+
+  const entries: Array<[string, (url: string) => Promise<unknown>]> = [
+    [
+      'createRedisClient(...).connect() with no deadline',
+      async (url) => {
+        const client = createRedisClient(url, FAST);
+        try {
+          await client.connect();
+        } finally {
+          await client.disconnect().catch(() => undefined);
+        }
+      },
+    ],
+    ['isRedisUp()', (url) => isRedisUp(url)],
+  ];
+
+  const rows = endpoints.flatMap(([shape, make]) =>
+    entries.map(
+      ([entry, run]) =>
+        [`${entry} against ${shape}`, make, run] as [
+          string,
+          () => Promise<{ url: string; close: () => void }>,
+          (url: string) => Promise<unknown>,
+        ],
+    ),
+  );
+
+  it.each(rows)('settles within its own connect budget: %s', async (_label, make, run) => {
+    const endpoint = await make();
+    try {
+      // 4x the budget: generous enough that a slow RST/DNS is not flaky, tight enough that
+      // "retries forever" (the defect) can never pass.
+      const outcome = await Promise.race([
+        run(endpoint.url).then(
+          () => 'settled',
+          () => 'settled',
+        ),
+        new Promise<string>((r) => setTimeout(() => r('hung'), FAST * 4)),
+      ]);
+      expect(
+        outcome,
+        'the builder retried past its own connect_timeout_ms instead of failing',
+      ).toBe('settled');
+    } finally {
+      endpoint.close();
+    }
+  });
+
+  // The boundary those rows stop at, pinned so the builder's guarantee cannot be over-claimed:
+  // node-redis' `connectTimeout` covers socket ESTABLISHMENT only, so an endpoint that accepts TCP
+  // and then never speaks RESP never reaches the reconnect strategy at all and the bare builder
+  // waits forever. `withDeadline` inside `RedisPlugin.connect()` is what bounds that shape — which
+  // is why the fail-fast row for it above passes — and this is the case that says so.
+  it('does not bound a handshake that never completes — withDeadline does', async () => {
+    const endpoint = await silentEndpoint();
+    const client = createRedisClient(endpoint.url, FAST);
+    const connecting = client.connect().catch(() => undefined);
+    try {
+      const outcome = await Promise.race([
+        connecting.then(() => 'settled'),
+        new Promise<string>((r) => setTimeout(() => r('still waiting'), FAST * 4)),
+      ]);
+      expect(
+        outcome,
+        'the builder now bounds a stalled handshake, so withDeadline is dead weight — delete one ' +
+          'of the two rather than leaving the plugin bounded twice',
+      ).toBe('still waiting');
+    } finally {
+      endpoint.close();
+      await connecting;
+      await client.disconnect().catch(() => undefined);
+    }
+  });
+
+  // The inverse arm, and the one an over-eager fix breaks: once the handshake has completed the
+  // same strategy must switch to bounded backoff, so a connection that was live rides out a
+  // restart instead of dying on the first dropped socket.
+  it('a connection that completed its handshake is NOT fail-fast', async () => {
+    const endpoint = await respEndpoint((argv) => DEFAULT_REPLIES[commandOf(argv)] ?? '+OK\r\n');
+    const client = createRedisClient(endpoint.url, FAST);
+    try {
+      await client.connect();
+      expect(client.isOpen, 'the handshake never completed, so this row grades nothing').toBe(true);
+      endpoint.close(); // every socket destroyed, the way a server restart does it
+      await new Promise((r) => setTimeout(r, FAST));
+      expect(
+        client.isOpen,
+        'a connection that was live gave up on the first dropped socket instead of reconnecting',
+      ).toBe(true);
+    } finally {
+      await client.disconnect().catch(() => undefined);
+      endpoint.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// CLASS: a bounded operation releases every handle it ARMED — on success as well as on failure.
+// The leak rows above count `TCPSocketWrap` alone and every one of them exercises a connect that
+// FAILED, where the deadline timer has already fired; so `withDeadline`'s `clearTimeout` — one
+// timer per `connect()`, per `subscribe` and per long-poll — is graded by nothing at all, and
+// deleting it arms a live timer for the whole `connect_timeout_ms` past the work it was guarding.
+//
+// The histogram is the whole handle table, not a socket filter, and the budget on the rows whose
+// connect SETTLES is deliberately long, so a timer that was armed and not cleared is still there
+// when the table is read. Repeated, so one leak per call clears the runner's own timer noise.
+// ---------------------------------------------------------------------------------------------
+
+describe('redis failure modes — every handle a bounded operation arms is released', () => {
+  const HANDLE_TOPIC = asTopic('handles');
+  /** Enough repeats that one leak per call cannot be mistaken for the runner's own timers. */
+  const REPEATS = 4;
+  /** Long enough that a timer armed and never cleared is still live when the table is read. */
+  const PATIENT_MS = 30_000;
+
+  interface Outcome {
+    reply: (argv: string[]) => string | undefined;
+    budget: number;
+    connects: boolean;
+  }
+
+  const outcomes: Array<[string, Outcome]> = [
+    [
+      'connect ok',
+      {
+        // `exists` answers 1, so a blocking fetchRecent reaches XREAD instead of the stale-cursor
+        // heal, and `subscribe` reaches its read loop.
+        reply: (argv) =>
+          commandOf(argv) === 'exists' ? ':1\r\n' : (DEFAULT_REPLIES[commandOf(argv)] ?? '+OK\r\n'),
+        budget: PATIENT_MS,
+        connects: true,
+      },
+    ],
+    [
+      'connect refused',
+      {
+        reply: (argv) =>
+          commandOf(argv) === 'ping'
+            ? respError('NOAUTH', 'Authentication required.')
+            : '+OK\r\n',
+        budget: PATIENT_MS,
+        connects: false,
+      },
+    ],
+    ['connect times out', { reply: () => undefined, budget: FAST, connects: false }],
+  ];
+
+  const operations: Array<[string, (p: RedisPlugin) => Promise<unknown>]> = [
+    ['nothing further', () => Promise.resolve()],
+    ['subscribe', (p) => p.subscribe(HANDLE_TOPIC, () => undefined)],
+    [
+      'blocking fetchRecent',
+      (p) => p.fetchRecent({ topic: HANDLE_TOPIC, since: asCursor('1-0'), blockMs: 200 }),
+    ],
+    ['plain fetchRecent', (p) => p.fetchRecent({ topic: HANDLE_TOPIC })],
+  ];
+
+  const rows = outcomes.flatMap(([outcomeLabel, outcome]) =>
+    operations.map(
+      ([opLabel, run]) =>
+        [`${outcomeLabel}, then ${opLabel}`, outcome, run] as [
+          string,
+          Outcome,
+          (p: RedisPlugin) => Promise<unknown>,
+        ],
+    ),
+  );
+
+  it.each(rows)('the handle table returns to where it started: %s', async (_label, outcome, run) => {
+    const endpoint = await respEndpoint(outcome.reply);
+    const before = activeHandles();
+    const plugin = new RedisPlugin();
+    try {
+      for (let i = 0; i < REPEATS; i++) {
+        const connected = await plugin
+          .connect({ url: endpoint.url, connect_timeout_ms: outcome.budget })
+          .then(
+            () => true,
+            () => false,
+          );
+        expect(
+          connected,
+          `connect() did not ${outcome.connects ? 'succeed' : 'fail'}, so this row grades nothing`,
+        ).toBe(outcome.connects);
+        await run(plugin).catch(() => undefined);
+      }
+      await plugin.disconnect();
+      await expect
+        .poll(() => handleGrowth(before, 'TCPSocketWrap'), { timeout: 5000, interval: 50 })
+        .toBeLessThan(REPEATS);
+      // Read ONCE rather than polled: `expect.poll` retries until the assertion passes, which on a
+      // timer would wait out the very budget the leaked timer was armed for and call it clean.
+      expect(
+        handleGrowth(before, 'Timeout'),
+        `${REPEATS} operations left ${handleGrowth(before, 'Timeout')} timers armed, each holding ` +
+          `the event loop open for connect_timeout_ms past the work it was guarding`,
+      ).toBeLessThan(REPEATS);
     } finally {
       await plugin.disconnect().catch(() => undefined);
       endpoint.close();
