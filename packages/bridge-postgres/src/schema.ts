@@ -1,29 +1,5 @@
 import { createHash } from 'node:crypto';
-
-/**
- * The message store (DESIGN §6). `seq BIGSERIAL PRIMARY KEY` is the free, monotonic sequence
- * that serves as BOTH the dedup key (`backendMsgId`) and the per-topic order key (`cursor`) —
- * a subsequence of a globally increasing sequence is itself increasing, so one column satisfies
- * both roles. Ordering and dedup NEVER use the timestamp (§5/§6).
- *
- * `ts` is the poster's wall clock and is informational only (§5); `created_at` is stamped by the
- * DATABASE. Keep retention deciding on `created_at`, so that no bridge's clock — and this backend
- * is the multi-machine one, so there are many — can destroy a row another bridge just wrote, or
- * write a row retention can never remove.
- *
- * One caveat SQLite's rowid doesn't have: BIGSERIAL values are assigned at INSERT time, not
- * COMMIT time, so under concurrent writers rows can become VISIBLE out of seq order — a reader
- * could observe seq 42, advance its cursor past the still-uncommitted 41, and skip 41 forever.
- * `post()` closes that hole by serializing same-topic writes with a transaction-scoped advisory
- * lock (see index.ts) so commit order == seq order per topic.
- *
- * The AFTER INSERT trigger turns every write into a `pg_notify` on channel
- * `'parley_' || md5(convert_to(topic, 'UTF8'))` — fixed-length, so it dodges both PostgreSQL's
- * 63-byte identifier truncation and channel-name injection from arbitrary topic strings. The
- * payload (the new seq) is a HINT only: NOTIFY payloads are size-limited and delivery is
- * best-effort across reconnects, so subscribers always re-query from their last-seen cursor
- * instead of trusting the payload (DESIGN §6).
- */
+import { badConfig } from './errors.js';
 
 /** PostgreSQL truncates identifiers past this many BYTES, silently merging two derived names. */
 export const MAX_IDENTIFIER_BYTES = 63;
@@ -47,16 +23,6 @@ const LONGEST_SUFFIX_BYTES = Math.max(
 
 /** The longest `table_name` whose every derived relation still fits in 63 bytes. */
 export const MAX_TABLE_NAME_BYTES = MAX_IDENTIFIER_BYTES - LONGEST_SUFFIX_BYTES;
-
-export function badConfig(key: string, reason: string): Error {
-  return new Error(`parley-postgres: invalid backend_config.${key} — ${reason}`);
-}
-
-export function unknownConfigKey(key: string, allowed: readonly string[]): Error {
-  return new Error(
-    `parley-postgres: unknown backend_config key '${key}' — expected one of ${allowed.join(', ')}`,
-  );
-}
 
 /**
  * Validate and canonicalise `table_name`. Table names are interpolated into DDL/SQL text (they
@@ -133,6 +99,10 @@ export function channelFor(topic: string): string {
  * Idempotent DDL: the message table, the sender registry, and the NOTIFY trigger. Run inside a
  * transaction under an advisory lock (index.ts `connect`) so concurrent bridge processes
  * bootstrapping the same table don't race the CREATEs.
+ *
+ * `seq BIGSERIAL PRIMARY KEY` is both the dedup key (`backendMsgId`) and the per-topic order key
+ * (`cursor`) — a subsequence of a globally increasing sequence is itself increasing, so one column
+ * satisfies both roles and neither ever uses the timestamp (DESIGN §5/§6).
  *
  * The indexes, the trigger and the `created_at` column are touched only when they are missing — or,
  * for the superseded `_ts` index, present — so that an ordinary process start on an
