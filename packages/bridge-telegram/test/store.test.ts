@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -568,6 +568,7 @@ describe('telegram ObservedStore durability', () => {
   ];
 
   it.each(IDENTITY_DAMAGE)('mints a fresh identity when the file carries $name', ({ line }) => {
+    captureStderr();
     const store = new ObservedStore(path, 10, 10);
     const identity = store.epoch();
     expect(store.append(record('-1', 1, 'a'))).toBeDefined();
@@ -586,6 +587,53 @@ describe('telegram ObservedStore durability', () => {
     expect(reloaded.entries('-1').map((r) => r.content)).toEqual(['a']);
     reloaded.close();
   });
+
+  /**
+   * The identity is minted afresh only when the file did not load WHOLE, and a record leaving
+   * through retention or the chat cap is a record leaving on purpose. Every cell puts the store's
+   * HIGHEST sequence in the records that go, which is the shape a loss detector reading the record
+   * lines alone cannot tell from corruption — and it is graded across TWO reloads, because the
+   * first is where the store rewrites what it now holds and the second is where a detector that
+   * wrote the wrong high-water down fires on its own output. A store that churned its identity here
+   * would refuse every cursor an agent holds on the first reload of any busy bridge.
+   */
+  const LEGITIMATE_EVICTIONS = [
+    // Per-chat eviction takes the OLDEST of a chat, so the store's newest record always survives it:
+    // this row grades the plain claim that eviction is not loss.
+    { name: 'the per-chat bound, over several chats', maxPerChat: 2, maxChats: 10, chats: 3, each: 5 },
+    // The chat cap can take the newest record along with the chat holding it, which is the one shape
+    // where what a file retains sits BELOW what it has issued — and the only one that can tell a
+    // store persisting both watermarks from one persisting the high-water twice.
+    { name: 'the chat cap, taking the most recently active chat', maxPerChat: 10, maxChats: 1, chats: 4, each: 1 },
+  ];
+
+  it.each(LEGITIMATE_EVICTIONS)(
+    'keeps its identity when $name evicts the newest record it holds',
+    ({ maxPerChat, maxChats, chats, each }) => {
+      const stderr = captureStderr();
+      const SERVED = '-70';
+      const chatIds = Array.from({ length: chats }, (_, c) => String(-1000 - c));
+      const writer = new ObservedStore(path, 100, 100, [SERVED]);
+      const identity = writer.epoch();
+      writer.append(record(SERVED, 1, 'mine'));
+      let mid = 1;
+      for (let i = 0; i < each; i++) {
+        for (const chatId of chatIds) writer.append(record(chatId, ++mid, `m${mid}`));
+      }
+      const issued = writer.highWater();
+      writer.close();
+
+      for (const pass of [1, 2]) {
+        const reloaded = new ObservedStore(path, maxPerChat, maxChats, [SERVED]);
+        expect({ pass, epoch: reloaded.epoch() }).toEqual({ pass, epoch: identity });
+        // And the sequence space never regresses: a record appended after the eviction still sorts
+        // above every cursor the writer handed out.
+        expect(reloaded.highWater()).toBeGreaterThanOrEqual(issued);
+        reloaded.close();
+      }
+      expect(stderr.join('')).not.toMatch(/did not load whole/);
+    },
+  );
 
   /**
    * The cursor is the store's own observation sequence, not Telegram's `message_id`: it must be
@@ -609,6 +657,107 @@ describe('telegram ObservedStore durability', () => {
     expect(next?.seq).toBeGreaterThan(seqs.at(-1) as number);
     expect(reloaded.entries('-1').at(-1)?.content).toBe('later');
     reloaded.close();
+  });
+});
+
+/**
+ * Two writers on ONE store file is the shape the class doc calls structurally unsupported, and it
+ * used to be unsupported without being refused: both loaded the same identity and the same
+ * sequence, so two different messages carried the identical cursor, and then either one's
+ * compaction renamed its own view of history over the other's — silently, with no Bot API endpoint
+ * that could ever rebuild what it discarded. The claim has to be on a SIBLING rather than on the
+ * store's own descriptor, which is what the compacting phase below grades: a compaction replaces
+ * the store file wholesale, so a claim living on it goes with the file it replaced.
+ */
+describe('telegram ObservedStore single-writer claim', () => {
+  /** What the first writer is doing when the second one tries to open the same file. */
+  const PHASES = [
+    { name: 'idle-open', drive: () => undefined },
+    { name: 'appending', drive: (s: ObservedStore) => void s.append(record('-1', 1, 'a')) },
+    {
+      name: 'compacting',
+      drive: (s: ObservedStore) => {
+        for (let i = 1; i <= 8; i++) s.append(record('-1', i, `m${i}`));
+      },
+    },
+  ];
+
+  it.each(PHASES)('refuses a second in-process writer while the first is $name', ({ drive }) => {
+    const first = new ObservedStore(path, 2, 10);
+    drive(first);
+    expect(() => new ObservedStore(path, 2, 10)).toThrow(
+      new RegExp(`already claimed by process ${process.pid}`),
+    );
+    expect(() => new ObservedStore(path, 2, 10)).toThrow(path);
+    // The refusal is the claim's, not the file's: closing the first hands it over.
+    first.close();
+    const second = new ObservedStore(path, 2, 10);
+    expect(second.append(record('-2', 1, 'after'))).toBeDefined();
+    second.close();
+  });
+
+  /**
+   * The half no second instance in THIS process can reach: a claim left by another process. It is
+   * honoured while that process lives and replaced once it is gone — a crashed bridge must not
+   * leave a store file that can never be opened again, and a live one must not be joined.
+   */
+  const FOREIGN_CLAIMS = [
+    { name: 'a live process', pid: () => String(spawnedPid), admitted: false },
+    { name: 'a process that is gone', pid: () => String(deadPid), admitted: true },
+    { name: 'nothing readable', pid: () => 'not-a-pid', admitted: true },
+    { name: 'an empty claim', pid: () => '', admitted: true },
+  ];
+
+  let spawnedPid = 0;
+  let deadPid = 0;
+  beforeEach(() => {
+    const live = spawn('sleep', ['30'], { stdio: 'ignore' });
+    live.unref();
+    spawnedPid = live.pid ?? 0;
+    const gone = spawnSync('true');
+    deadPid = gone.pid ?? 0;
+    expect(spawnedPid).toBeGreaterThan(0);
+    expect(deadPid).toBeGreaterThan(0);
+    return () => {
+      live.kill('SIGKILL');
+    };
+  });
+
+  it.each(FOREIGN_CLAIMS)('a claim naming $name is honoured: $admitted', ({ pid, admitted }) => {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(`${path}.lock`, `${pid()}\n`);
+    if (!admitted) {
+      expect(() => new ObservedStore(path, 2, 10)).toThrow(/already claimed by process/);
+      return;
+    }
+    const store = new ObservedStore(path, 2, 10);
+    expect(store.append(record('-1', 1, 'a'))).toBeDefined();
+    store.close();
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  });
+
+  /**
+   * The negative control: the guard has to be about SHARING a file, not about a second store
+   * existing. Two writers on two paths both keep everything they wrote, across a cold reload of
+   * each — which is exactly what the shared-path cells above lose.
+   */
+  it('keeps every record when two writers hold two different store files', () => {
+    const other = join(dir, 'other.jsonl');
+    const a = new ObservedStore(path, 10, 10);
+    const b = new ObservedStore(other, 10, 10);
+    for (let i = 1; i <= 4; i++) {
+      expect(a.append(record('-1', i, `a${i}`))).toBeDefined();
+      expect(b.append(record('-1', i, `b${i}`))).toBeDefined();
+    }
+    expect(a.epoch()).not.toBe(b.epoch());
+    a.close();
+    b.close();
+
+    for (const [file, tag] of [[path, 'a'], [other, 'b']] as const) {
+      const reloaded = new ObservedStore(file, 10, 10);
+      expect(reloaded.entries('-1').map((r) => r.content)).toEqual([1, 2, 3, 4].map((i) => `${tag}${i}`));
+      reloaded.close();
+    }
   });
 });
 

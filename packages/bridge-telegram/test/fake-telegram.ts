@@ -10,7 +10,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *    per-topic numeric cursor are exercised for real), `update_id` a global one.
  *  - `chat.id` is a NUMBER on both `sendMessage` responses and injected updates (mirroring real
  *    Telegram), and `@channelusername` references resolve to a stable numeric id via `getChat` —
- *    exactly the shape topic-to-chat routing needs (a string echo would mask it).
+ *    exactly the shape topic-to-chat routing needs (a string echo would mask it). The spelling is
+ *    overridable ({@link FakeTelegram.spellChatId}) because it is the one key the client cannot
+ *    choose, and a fake that can only echo the canonical number makes every disagreement between
+ *    the id a topic resolved to and the id an upstream stamped unreachable from the suite.
  *  - a `chat_id` that is neither numeric nor `@channelusername` is REJECTED with 400 ("chat not
  *    found"), and an unknown token with 401, as the real API does. Keep both, so that the
  *    conformance suite cannot pass on topics real Telegram would refuse.
@@ -100,6 +103,15 @@ export interface FakeTelegram {
    * or no JSON at all, which no status-level failure can reproduce.
    */
   malformMethod(method: string, body: string | undefined): void;
+  /**
+   * Stamp `chat.id` with `spell(id)` instead of the canonical number, on every object this fake
+   * builds a chat for — `sendMessage` responses, injected updates and `getChat`. The chat id is the
+   * key every index in the plugin is built on and the ONE field the client cannot choose the
+   * spelling of, so a fake that can only echo the canonical number leaves the whole
+   * key-agreement class (a numeric string, a leading zero, a redirect, an id JSON rounds past
+   * `MAX_SAFE_INTEGER`) unreachable from the suite. `undefined` restores the canonical number.
+   */
+  spellChatId(spell: ((id: number) => number | string) | undefined): void;
   /** How many requests this fake has served for `method` — the poll loop's retry cadence. */
   callCount(method: string): number;
   /**
@@ -148,7 +160,7 @@ export type StallMode = 'never-answer' | 'half-body' | 'close-mid-body';
 interface TgMessage {
   message_id: number;
   date: number;
-  chat: { id: number; type: string; username?: string };
+  chat: { id: number | string; type: string; username?: string };
   from?: { id: number; is_bot: boolean; username?: string; first_name: string };
   text?: string;
   reply_to_message?: { message_id: number };
@@ -206,9 +218,14 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     return id;
   };
 
+  /** How `chat.id` is spelled on the wire — see {@link FakeTelegram.spellChatId}. */
+  let spellChatId: ((id: number) => number | string) | undefined;
+
   /** The `chat` object real Telegram would stamp for `raw` (channels carry a `username`). */
-  const buildChat = (raw: string, id: number): TgMessage['chat'] =>
-    raw.startsWith('@') ? { id, type: 'channel', username: raw.slice(1) } : { id, type: 'group' };
+  const buildChat = (raw: string, canonical: number): TgMessage['chat'] => {
+    const id = spellChatId === undefined ? canonical : spellChatId(canonical);
+    return raw.startsWith('@') ? { id, type: 'channel', username: raw.slice(1) } : { id, type: 'group' };
+  };
   /** Global update_id counter. */
   let updateSeq = 1;
   /** Every update ever produced; `offset` filtering serves the acknowledged tail. */
@@ -522,6 +539,10 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     malformMethod(method: string, body: string | undefined): void {
       if (body === undefined) malformed.delete(method);
       else malformed.set(method, body);
+    },
+
+    spellChatId(spell: ((id: number) => number | string) | undefined): void {
+      spellChatId = spell;
     },
 
     callCount(method: string): number {

@@ -5,6 +5,7 @@ import { TelegramPlugin } from '../src/index.js';
 import {
   captureStderr,
   connectTo as connectPlugin,
+  registerCleanup,
   seqOf,
   startFake,
   startRig,
@@ -636,6 +637,36 @@ describe('telegram lifecycle', () => {
     const spent = fake.callCount('getUpdates') - before;
     expect(spent).toBeGreaterThan(0);
     expect(spent).toBeLessThanOrEqual(4);
+  }, 20_000);
+
+  /**
+   * The README's "one file per process, and this is enforced", at the seam that enforces it. Two
+   * bridges on one store file is the shape nothing downstream can detect — they hand the same
+   * cursor to two different messages and each compaction renames its own view over the other's
+   * history — so the second one has to fail `connect` rather than come up. It must also leave the
+   * FIRST one untouched, and take the file over once that one disconnects.
+   */
+  it('refuses to connect a second bridge onto a store file another one holds', async () => {
+    const fake = await startFake();
+    const path = storePath();
+    const config = { token: fake.token, api_url: fake.url, store_path: path, poll_timeout_s: 1 };
+    const first = await connectPlugin(fake, path);
+    const topic = asTopic('-1009100004');
+    await first.post(topic, SENDER, 'mine');
+
+    const second = new TelegramPlugin();
+    await expect(second.connect(config)).rejects.toThrow(
+      new RegExp(`already claimed by process ${process.pid}`),
+    );
+    await expect(second.connect(config)).rejects.toThrow(path);
+    // The holder is unharmed, and the refused bridge answers as unconnected rather than half-up.
+    expect((await first.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual(['mine']);
+    await expect(second.fetchRecent({ topic })).rejects.toThrow(/not connected/);
+
+    await first.disconnect();
+    await second.connect(config);
+    registerCleanup(() => second.disconnect());
+    expect((await second.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual(['mine']);
   }, 20_000);
 
   it('disconnects idempotently and reconnects onto the same store', async () => {

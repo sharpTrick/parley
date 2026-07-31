@@ -152,7 +152,97 @@ describe('telegram chat-id canonicalization', () => {
       expect(await contentsOf(await restart(rig), topic)).toEqual(['own', 'foreign']);
     },
   );
+
+  /**
+   * The other half of the same key, and the half the client does not choose: how the UPSTREAM
+   * spells `chat.id`. `post` resolves its topic through one normalization and then indexed, woke
+   * and fanned out under `String(sent.chat.id)` from the response, which is a different one — so a
+   * spelling the two disagree on filed the record in a bucket the topic never queries while every
+   * seam call reported success, and `store.has(...)`, the guard whose whole job is to catch exactly
+   * that, passed vacuously because it asked under the same wrong key.
+   *
+   * The invariant per cell is one line: the message is reachable through the topic that addressed
+   * it, or the call REJECTS naming both ids. Never a topic that swallows posts and stays empty.
+   */
+  const ECHOED_CHAT_IDS = [
+    { name: 'the canonical number', chat: '-1009400001', spell: (id: number) => id, reaches: true },
+    {
+      name: 'a numeric string with leading zeros',
+      chat: '-1009400002',
+      spell: (id: number) => `-00${String(-id)}`,
+      reaches: true,
+    },
+    {
+      name: 'a different chat than the one addressed',
+      chat: '-1009400003',
+      spell: (id: number) => id - 1,
+      reaches: false,
+    },
+    {
+      // No spelling of its own: JSON's double rounds this id on the way back, which is what
+      // `canonicalChatId` normalizes through BigInt to avoid and what the response echo undid.
+      name: 'an id rounded past MAX_SAFE_INTEGER',
+      chat: '9007199254740993',
+      spell: (id: number) => id,
+      reaches: false,
+    },
+  ] as const;
+
+  const INGEST_PATHS = ['a sendMessage response', 'a getUpdates update'] as const;
+
+  const KEY_CELLS = ECHOED_CHAT_IDS.flatMap((echo) =>
+    INGEST_PATHS.map((path) => ({ ...echo, path })),
+  );
+
+  it.each(KEY_CELLS)(
+    'chat.id echoed as $name on $path reaches the addressed topic: $reaches',
+    async ({ chat, spell, reaches, path }) => {
+      captureStderr();
+      const rig = await startRig();
+      const topic = asTopic(chat);
+      const addressed = BigInt(chat).toString();
+      const stamped = BigInt(String(spell(Number(chat)))).toString();
+      // Guard the row: a cell whose spelling collapses to the addressed id cannot grade a mismatch.
+      expect(stamped === addressed).toBe(reaches);
+      rig.fake.spellChatId(spell);
+
+      const live: Message[] = [];
+      await rig.plugin.subscribe(topic, (m) => live.push(m));
+
+      if (path === 'a sendMessage response') {
+        const posted = await rig.plugin.post(topic, SENDER, 'hello').then(
+          (id) => id as string,
+          (err: unknown) => err as Error,
+        );
+        if (reaches) expect(posted).toBe(`${addressed}:1`);
+        else {
+          expect((posted as Error).message).toContain(addressed);
+          expect((posted as Error).message).toContain(stamped);
+        }
+      } else {
+        rig.fake.injectUserMessage(chat, 'alice', 'hello');
+        // A sentinel in a chat this cell never touches pins the point the update was consumed, so
+        // an unreachable cell is graded on ingestion having happened, not on losing a race.
+        rig.fake.spellChatId(undefined);
+        rig.fake.injectUserMessage(SENTINEL_CHAT, 'alice', 'sentinel');
+        await vi.waitFor(
+          async () => expect(await contentsOf(rig.plugin, asTopic(SENTINEL_CHAT))).toContain('sentinel'),
+          { timeout: 5000, interval: 20 },
+        );
+      }
+
+      const expected = reaches ? ['hello'] : [];
+      expect(await contentsOf(rig.plugin, topic)).toEqual(expected);
+      expect(live.map((m) => m.content)).toEqual(expected);
+      // And the verdict survives a restart, which is where a misfiled record becomes permanent.
+      expect(await contentsOf(await restart(rig), topic)).toEqual(expected);
+    },
+    20_000,
+  );
 });
+
+/** A chat no key-agreement cell addresses — its traffic marks the ingestion loop's progress. */
+const SENTINEL_CHAT = '-1009409999';
 
 /**
  * Telegram carries text in `text` OR `caption`, and carries plenty of messages with neither.

@@ -33,12 +33,48 @@ describe('telegram cursor across the store lifecycle', () => {
     return page.nextCursor;
   };
 
+  const linesOf = (path: string): string[] => readFileSync(path, 'utf8').trimEnd().split('\n');
+  const rewriteWith = (path: string, lines: string[]): void =>
+    writeFileSync(path, `${lines.join('\n')}\n`);
+  /** Keep every bookkeeping line and drop the last `k` RECORD lines — a stale or rolled-back copy. */
+  const dropRecords = (path: string, k: number): void => {
+    const lines = linesOf(path);
+    const records = lines.filter((l) => !isHeader(l));
+    rewriteWith(path, [...lines.filter(isHeader), ...records.slice(0, Math.max(0, records.length - k))]);
+  };
+
   const DAMAGE = [
     {
       name: 'a clean restart onto the same file keeps the cursor usable',
       damage: () => undefined,
       outcome: 'serves' as const,
       why: /^$/,
+    },
+    ...[1, 2, 3].map((k) => ({
+      name: `a store file missing its last ${k} record line(s) invalidates the cursor loudly`,
+      damage: (path: string) => dropRecords(path, k),
+      outcome: 'throws' as const,
+      why: /issued by a different observed-message store/,
+    })),
+    {
+      name: 'a store file with a record line corrupted in place invalidates the cursor loudly',
+      damage: (path: string) => {
+        const lines = linesOf(path);
+        const at = lines.findIndex((l) => !isHeader(l));
+        lines[at] = `${(lines[at] as string).slice(0, 20)}\u0000not json`;
+        rewriteWith(path, lines);
+      },
+      outcome: 'throws' as const,
+      why: /issued by a different observed-message store/,
+    },
+    {
+      name: 'a store file whose tail was cut mid-line invalidates the cursor loudly',
+      damage: (path: string) => {
+        const raw = readFileSync(path, 'utf8');
+        writeFileSync(path, raw.slice(0, raw.length - 8));
+      },
+      outcome: 'throws' as const,
+      why: /issued by a different observed-message store/,
     },
     {
       name: 'a deleted store file invalidates the cursor loudly',
@@ -86,14 +122,16 @@ describe('telegram cursor across the store lifecycle', () => {
   ];
 
   /**
-   * The second axis, and the one the table used to be missing: how many messages the REPLACEMENT
-   * store observes before the cursor is presented to it. A guard that is only a high-water compare
-   * stops firing the moment the new sequence climbs back past the held cursor, so a table that
-   * always checks at refill 0 cannot tell a permanent guard from a temporary one — which is how a
-   * silent short page (`since` 3 answered with the replacement's 4th message onward, the first
-   * three unreachable forever) shipped green. Every depth straddling the held cursor is graded, and
-   * the invariant per cell is the one this file's header states: every message observed after the
-   * cursor, exactly once, or a loud failure. Never a short page.
+   * The second axis: how many messages the REPLACEMENT store observes before the cursor is
+   * presented to it. A guard that is only a high-water compare stops firing the moment the new
+   * sequence climbs back past the held cursor, so a table that always checks at refill 0 cannot tell
+   * a permanent guard from a temporary one — which is how a silent short page (`since` 3 answered
+   * with the replacement's 4th message onward, the first three unreachable forever) shipped green,
+   * TWICE: once for a store file replaced wholesale, and once for one that merely lost record lines
+   * while keeping its identity. Both damage shapes are rows above for that reason, and every depth
+   * straddling the held cursor is graded. The invariant per cell is the one this file's header
+   * states: every message observed after the cursor, exactly once, or a loud failure. Never a short
+   * page.
    */
   const REFILLS = [0, 1, HELD.length - 1, HELD.length, HELD.length + 5];
 
@@ -135,52 +173,34 @@ describe('telegram cursor across the store lifecycle', () => {
   );
 
   /**
-   * The boundary of the staleness check, one line at a time. Every case above damages the file by
-   * two or more sequences, so an off-by-one in the comparison is invisible: the likeliest real
-   * corruption is a stale backup or a lost compaction rename that costs exactly ONE record.
-   * Truncating the store line by line puts the surviving high-water at, above and below the held
-   * cursor, and the rule is a single inequality — serve when the store still reaches the cursor,
-   * throw the moment it does not.
+   * The high-water inequality, which the identity check above now stands in front of for every file
+   * this build has written: the watermark a damaged file keeps is what turns a lost record into a
+   * refused identity, so the plain `since`-above-everything compare is only reachable for a store
+   * file written BEFORE the watermark existed. That is the upgrade path, and it is graded at refill
+   * 0 only — deliberately, because a file carrying no watermark carries no claim about what it once
+   * held, so nothing on disk can tell a truncated legacy file from a short one once new traffic has
+   * climbed past the cursor. The rows above are what closes that for every file written since.
    */
-  const TRUNCATIONS = [-1, 0, 1, 2];
+  it('refuses a cursor above everything a store file predating the watermark holds', async () => {
+    const rig = await startRig();
+    const topic = asTopic('-1009800904');
+    for (const c of ['a', 'b', 'c', 'd']) await rig.plugin.post(topic, SENDER, c);
+    const page = await rig.plugin.fetchRecent({ topic, limit: 100 });
+    const cursor = page.messages[2]?.cursor as Cursor;
+    expect(seqOf(cursor)).toBe(3);
 
-  it.each(TRUNCATIONS)(
-    'a store whose high-water sits %i below the held cursor serves or throws accordingly',
-    async (below) => {
-      const rig = await startRig();
-      const topic = asTopic('-1009800904');
-      for (const c of ['a', 'b', 'c', 'd']) await rig.plugin.post(topic, SENDER, c);
-      const page = await rig.plugin.fetchRecent({ topic, limit: 100 });
-      // Hold the third message's cursor, so the file can be truncated to either side of it.
-      const cursor = page.messages[2]?.cursor as Cursor;
-      expect(seqOf(cursor)).toBe(3);
+    await rig.plugin.disconnect();
+    // The pre-watermark on-disk format: identity and records, nothing that states a high-water.
+    const lines = readFileSync(rig.storePath, 'utf8').trimEnd().split('\n');
+    const legacy = lines.filter((l) => !l.startsWith('#seq'));
+    const kept = [...legacy.filter(isHeader), ...legacy.filter((l) => !isHeader(l)).slice(0, 2)];
+    writeFileSync(rig.storePath, `${kept.join('\n')}\n`);
 
-      await rig.plugin.disconnect();
-      const lines = readFileSync(rig.storePath, 'utf8').trimEnd().split('\n');
-      // Keep the bookkeeping lines: dropping the identity line makes this a DIFFERENT store file,
-      // which the case above already grades — here the file must stay the same one, so that what
-      // is under test is the high-water inequality and not the identity check standing in for it.
-      const headers = lines.filter(isHeader);
-      const keep = Number(seqOf(cursor)) - below;
-      const kept = [...headers, ...lines.filter((l) => !isHeader(l)).slice(0, keep)];
-      writeFileSync(rig.storePath, `${kept.join('\n')}\n`);
-      const restarted = await rig.restart();
-
-      if (below >= 1) {
-        await expect(restarted.fetchRecent({ topic, since: cursor })).rejects.toThrow(
-          /ahead of every message this store has observed/,
-        );
-        return;
-      }
-      const caughtUp = await restarted.fetchRecent({ topic, since: cursor, limit: 100 });
-      expect(caughtUp.messages.map((m) => m.content)).toEqual(keep > 3 ? ['d'] : []);
-      await restarted.post(topic, SENDER, 'e');
-      const after = await restarted.fetchRecent({ topic, since: cursor, limit: 100 });
-      expect(after.messages.map((m) => m.content)).toContain('e');
-      expect(seqOf(after.nextCursor)).toBeGreaterThan(seqOf(cursor));
-    },
-    20_000,
-  );
+    const restarted = await rig.restart();
+    await expect(restarted.fetchRecent({ topic, since: cursor })).rejects.toThrow(
+      /ahead of every message this store has observed/,
+    );
+  }, 20_000);
 
   /**
    * Retention evicting the record a cursor names is NOT a broken cursor — the sequence space is

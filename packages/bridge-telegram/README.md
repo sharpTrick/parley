@@ -99,9 +99,14 @@ everything delivered by `getUpdates`. Consequences:
   cursor. Restore the original `store_path`, or clear the saved cursor for the topic. This is why
   `store_path` defaults to an **absolute** path under the same state directory rather than to the
   working directory the MCP client happened to pick.
-  The residual: a file **partially** rolled back — same identity, records missing from the tail —
-  is caught only while its sequence has not yet been re-issued past the cursor you hold ("ahead of
-  every message this store has observed"). Restore a store file whole, or not at all.
+  A file **partially** rolled back — same identity, records missing — is caught the same way: the
+  store writes its sequence high-water into the file alongside the records, so a load that finds
+  fewer records than the file says it observed (or any line it cannot read) mints a **fresh**
+  identity and says so on stderr, rather than re-issuing sequences it has already handed out. The
+  residual: a store file written before that watermark existed carries no claim about what it once
+  held, so a truncated one is caught only while its sequence has not yet climbed back past the
+  cursor you hold ("ahead of every message this store has observed"). Restore a store file whole,
+  or not at all.
 - Within the observed window the seam contract holds fully: stable ids, monotonic exclusive
   cursors, dedup across `getUpdates` backlog replays, cold-restart replay.
 
@@ -157,9 +162,14 @@ point several Telegram bridges at the same bot token**:
 - A token or `api_url` the API rejects outright (401/403/404) fails `connect`, and the same
   statuses from the poll loop stop ingestion with a diagnostic on stderr rather than looping
   silently forever.
-- The observed-message store is **one file per process** — `appendFileSync` interleaving from
-  two processes is not supported, and each process's store would be missing the other's
-  observations anyway.
+- The observed-message store is **one file per process, and this is enforced**: opening it claims
+  `<store_path>.lock` exclusively, and a second bridge on the same file fails `connect` naming the
+  path and the holding pid instead of corrupting it. Two writers would hand the same cursor to two
+  different messages and each one's compaction would rename its own view of history over the
+  other's — with no Bot API endpoint that could ever rebuild what it discarded. `store_path`
+  defaults to ONE fixed path, so a second bridge on this host (a second bot for a second session)
+  needs its own `store_path` in `backend_config`. A claim naming a process that is gone is a
+  crashed bridge's leftover and is replaced automatically.
 
 This is why the conformance suite's multi-process-writes case is deliberately **skipped** for
 this backend (`concurrentPost` is not provided — the scenario is structurally

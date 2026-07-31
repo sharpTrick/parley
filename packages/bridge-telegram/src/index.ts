@@ -293,8 +293,20 @@ export class TelegramPlugin implements BackendPlugin {
     const replyMid = parseCompositeMid(opts?.inReplyTo, chatId);
     if (replyMid !== undefined) body.reply_to_message_id = replyMid;
     const sent = requireSentMessage(await this.call('POST', '/sendMessage', { body }));
-    const sentChatId = String(sent.chat.id);
-    const sentId = keyOf({ chat_id: sentChatId, message_id: sent.message_id });
+    // Index under the chat the TOPIC resolved to, and only once the response agrees it is the chat
+    // Telegram put the message in. Everything internal is keyed by that id, so a response naming a
+    // different one (a redirect, a migration, an id rounded through JSON's double) would file the
+    // record where the topic never looks — reachable by nothing, reported as success.
+    const echoed = canonicalChatKey('Telegram POST /sendMessage → result', sent.chat.id);
+    if (echoed !== chatId) {
+      throw new Error(
+        `TelegramPlugin: topic '${topic as string}' resolves to chat ${chatId} and Telegram put the ` +
+          `message in chat ${echoed} (message_id ${sent.message_id}), so it exists there and is not ` +
+          `reachable through this topic — it was not recorded in the observed-message store at ` +
+          `'${this.storePath}'.`,
+      );
+    }
+    const sentId = keyOf({ chat_id: chatId, message_id: sent.message_id });
     // Re-assert AFTER the send too: a teardown landing here leaves a message Telegram has already
     // accepted and no store to record it in, and own posts never come back via `getUpdates`, so
     // reconnecting cannot recover it. Name the id, so that the caller knows what exists upstream.
@@ -307,7 +319,7 @@ export class TelegramPlugin implements BackendPlugin {
     }
     let refusal: unknown;
     try {
-      this.ingest(store, sentChatId, sent);
+      this.ingest(store, chatId, sent);
     } catch (err) {
       refusal = err;
     }
@@ -561,7 +573,7 @@ export class TelegramPlugin implements BackendPlugin {
    * empty forever.
    */
   private canonicalChatId(chat: string): Promise<string> {
-    if (/^-?\d+$/.test(chat)) return Promise.resolve(BigInt(chat).toString());
+    if (NUMERIC_CHAT_ID.test(chat)) return Promise.resolve(BigInt(chat).toString());
     if (!/^@[A-Za-z][A-Za-z0-9_]{3,31}$/.test(chat)) {
       return Promise.reject(
         new Error(
@@ -578,7 +590,7 @@ export class TelegramPlugin implements BackendPlugin {
         if (typeof id !== 'number' && typeof id !== 'string') {
           throw new Error('Telegram GET /getChat → result: chat carries no id');
         }
-        return String(id);
+        return canonicalChatKey('Telegram GET /getChat → result', id);
       })
       .catch((err: unknown) => {
         // Don't poison the memo on transient failure — let the next call retry.
@@ -693,12 +705,10 @@ export class TelegramPlugin implements BackendPlugin {
         }
         const msg = u?.message ?? u?.channel_post;
         if (msg === undefined) continue; // an update kind we don't carry (edits, reactions, …)
+        const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
         try {
-          const message = requireMessage(
-            `Telegram GET /getUpdates → update ${String(u.update_id)}`,
-            msg,
-          );
-          this.ingest(store, String(message.chat.id), message);
+          const message = requireMessage(label, msg);
+          this.ingest(store, canonicalChatKey(label, message.chat.id), message);
         } catch (err) {
           // Keep the loop alive across a failing store write (ENOSPC/EIO): losing one message is
           // recoverable, losing the only getUpdates consumer takes live push down for good.
@@ -947,6 +957,28 @@ function requireMessage(label: string, value: unknown): TgMessage {
 
 /** The optional fields {@link contentOf} takes the record's body from, in its own precedence order. */
 const BODY_FIELDS = ['text', 'caption'] as const;
+
+/** A chat id as Telegram spells it on the wire: an integer, with or without a leading `-`. */
+const NUMERIC_CHAT_ID = /^-?\d+$/;
+
+/**
+ * A chat id an UPSTREAM stamped, in the one canonical form every index in this plugin is keyed by —
+ * the same normalization {@link TelegramPlugin.canonicalChatId} puts a configured topic through.
+ * `chat.id` arrives as a JSON number or a string depending on the endpoint and the server, and
+ * `-0012345`, `-12345` and the string `"-12345"` all name one chat; keying on the spelling rather
+ * than on the value files a record under something no other call will ever look up, which on this
+ * backend is a permanent black hole (no history endpoint can refill the topic).
+ *
+ * A spelling that is not an integer at all names no chat Telegram could serve, so it is a labelled
+ * rejection here rather than a bucket nothing reads.
+ */
+function canonicalChatKey(label: string, id: number | string): string {
+  const raw = typeof id === 'number' ? String(id) : id.trim();
+  if (!NUMERIC_CHAT_ID.test(raw)) {
+    throw new Error(`${label}: chat id '${raw}' is not a Telegram numeric chat id`);
+  }
+  return BigInt(raw).toString();
+}
 
 /**
  * The page size {@link TelegramPlugin.fetchRecent} slices with: one normalization both its branches

@@ -28,8 +28,16 @@ export interface Rig {
 
 const cleanups: (() => Promise<void> | void)[] = [];
 
-afterEach(async () => {
+/**
+ * Run every registered teardown, newest-first, and forget them. Exported so a test whose subject IS
+ * the teardown can drive it and then assert; the `afterEach` below finds nothing left to do.
+ */
+export async function runCleanups(): Promise<void> {
   for (const c of cleanups.splice(0).reverse()) await c();
+}
+
+afterEach(async () => {
+  await runCleanups();
   vi.restoreAllMocks();
 });
 
@@ -97,14 +105,21 @@ export async function openRig(
   const fake = await startFakeTelegram();
   const dir = mkdtempSync(join(tmpdir(), 'parley-tg-'));
   const path = join(dir, 'store.jsonl');
-  const plugin = await connect(fake, path, config);
+  // Every plugin this rig connects, so `close` releases all of them newest-first — the same LIFO
+  // contract `startRig` gets from the module-level cleanups. A `close` that only knew about the
+  // FIRST one left a restart's poll loop and store descriptor running past the test that made it.
+  const connected: TelegramPlugin[] = [await connect(fake, path, config)];
   return {
     fake,
-    plugin,
+    plugin: connected[0] as TelegramPlugin,
     storePath: path,
-    restart: () => connect(fake, path, config),
+    restart: async () => {
+      const plugin = await connect(fake, path, config);
+      connected.push(plugin);
+      return plugin;
+    },
     close: async () => {
-      await plugin.disconnect();
+      for (const plugin of [...connected].reverse()) await plugin.disconnect();
       await fake.close();
       rmSync(dir, { recursive: true, force: true });
     },

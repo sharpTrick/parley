@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,8 +9,10 @@ import { KNOWN_CHANNEL } from './fake-telegram.js';
 import {
   captureStderr,
   connectTo,
+  openRig,
   type Rig,
   registerCleanup,
+  runCleanups,
   seqOf,
   startFake,
   startRig,
@@ -364,6 +366,61 @@ describe('telegram test suite hygiene', () => {
     // A rule nothing exercises is not a rule: at least one field carries a note naming it.
     expect(checked).toBeGreaterThan(0);
   });
+
+  /**
+   * The lint above keeps ONE rig per shape; this keeps the two rigs' LIFETIMES the same. They share
+   * a method name and a doc and differ only in who runs teardown — so a `restart()` that registered
+   * its plugin in one and not in the other gave the same call opposite contracts, and the first test
+   * to take the unregistered route would inherit a stray getUpdates loop and an unclosed store
+   * descriptor outliving its own case. Graded on descriptors rather than on plugin behaviour: an fd
+   * on the store file is what a plugin still running actually holds.
+   */
+  const openFdsFor = (target: string): number => {
+    let held = 0;
+    for (const fd of readdirSync('/proc/self/fd')) {
+      try {
+        // A teardown that removed the tmpdir leaves the link spelled '<path> (deleted)', and a
+        // probe that missed that would read every leak as zero.
+        const link = readlinkSync(join('/proc/self/fd', fd));
+        if (link === target || link === `${target} (deleted)`) held++;
+      } catch {
+        // The descriptor closed while this scan walked past it.
+      }
+    }
+    return held;
+  };
+
+  const RIGS = [
+    {
+      what: 'startRig',
+      open: async (): Promise<{ rig: Rig; teardown: () => Promise<void> }> => ({
+        rig: await startRig(),
+        teardown: runCleanups,
+      }),
+    },
+    {
+      what: 'openRig',
+      open: async (): Promise<{ rig: Rig; teardown: () => Promise<void> }> => {
+        const rig = await openRig();
+        return { rig, teardown: rig.close };
+      },
+    },
+  ];
+
+  it.each(RIGS)('$what releases every plugin its restart() connected', async ({ open }) => {
+    const { rig, teardown } = await open();
+    let plugin = rig.plugin;
+    for (const _ of [1, 2]) {
+      await plugin.disconnect();
+      plugin = await rig.restart();
+    }
+    // Positive control for the probe: with one plugin live the store file has exactly one holder,
+    // so the assertion after teardown cannot pass by measuring nothing.
+    expect(openFdsFor(rig.storePath)).toBe(1);
+
+    await teardown();
+    expect(openFdsFor(rig.storePath)).toBe(0);
+  }, 20_000);
 
   it.each(RIG_SHAPES)('leaves $what to rig.ts alone', ({ matches }) => {
     // rig.ts is the positive control: patterns that stop matching there make the list below vacuous.
