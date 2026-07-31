@@ -153,6 +153,15 @@ a per-target copy of the fixed file and `cp` it back. This paragraph previously 
 "is a git checkout, so `git checkout --` restores it", which is the reasoning that produced all
 three losses.
 
+**This bites the ORCHESTRATOR in the main repo too, and knowing the rule is not enough.** In round
+12, verifying a re-anchored assertion meant mutating an applied-but-uncommitted decomposition and
+restoring it — and `git checkout -- <file>` took `index.ts` back to the round base, discarding a
+792→353 split, while the new sibling files survived untracked and typechecked against the old one.
+The recovery is `git show :<path>` from the source worktree, whose index still holds the staged
+version. The habit that prevents it: `cp` the file aside before mutating, `cp` it back after, and
+never reach for `git checkout --` while anything in the tree is uncommitted. Mutation-and-restore
+is the single most common thing done to uncommitted code here, so it is where this hazard lives.
+
 **Staged work in a worktree is not durable — extract and commit it the moment an agent reports.**
 The worktrees live under `/tmp`, so a container restart takes every uncommitted patch with it. In
 round 9 one agent finished, staged 13 files, and died before reporting; the restart then rolled the
