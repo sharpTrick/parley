@@ -1,5 +1,7 @@
-// @xmpp/* packages ship no type declarations and there is no @types package. The plugin uses
-// their runtime API (client/xml) untyped; declare the modules so the build is clean.
+/**
+ * `@xmpp/*` ships no type declarations and there is no `@types` package, so the plugin uses their
+ * runtime API (`client`/`xml`) untyped and declares the modules here to keep the build clean.
+ */
 declare module '@xmpp/client';
 declare module '@xmpp/xml';
 declare module '@xmpp/jid';

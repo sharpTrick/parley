@@ -177,32 +177,49 @@ describe('XMPP reports the identity it collapses onto its one occupant nick', ()
 // other than that handle. The table crosses every provenance the occupant nick has with the handle
 // being resolved, and grades `backendRef` against an OBSERVED `senderHandle` rather than a string
 // literal, so it survives a change to the fold.
+//
+// Occupancy is PER ROOM, so the grading room is a dimension of its own: a table that only ever posts
+// to a room entered after the nick moved cannot fail on a nick the connection asked for but was
+// never admitted under (a nick-locking service, XEP-0045 status 210) nor on a room that kept the
+// sender it entered with. Each row therefore posts to a room entered BEFORE the move as well as one
+// entered after, and declares which of the two `backendRef` is entitled to describe.
 
 const ADOPTED = 'alice';
 const OTHER = 'carol';
+const EARLY = asTopic('t-ref-early');
 
 interface NickProvenance {
   name: string;
   cfg: Partial<XmppBackendConfig>;
-  reach(plugin: XmppPlugin, fake: FakeXmpp): Promise<void>;
+  /** The server's own behaviour, applied before `connect` (a nick lock is not a client choice). */
+  server?(fake: FakeXmpp): void;
+  /** Whatever moves this connection's nick, driven AFTER the early room has been entered. */
+  move?(plugin: XmppPlugin, fake: FakeXmpp): Promise<void>;
+  /**
+   * Whether the early room keeps a sender `backendRef` no longer names. True only where the nick
+   * moved without the already-entered rooms following it — the README says so for a conflict revert.
+   */
+  earlyRoomDiverges: boolean;
 }
 const provenances: NickProvenance[] = [
-  { name: 'unset, nothing posted yet', cfg: {}, reach: async () => undefined },
-  { name: 'pinned by backend_config.nick', cfg: { nick: 'session-a' }, reach: async () => undefined },
+  { name: "taken from the first post's handle", cfg: {}, earlyRoomDiverges: false },
+  { name: 'pinned by backend_config.nick', cfg: { nick: 'session-a' }, earlyRoomDiverges: false },
   {
-    name: "adopted from an earlier post's handle",
+    name: 'rewritten by a nick-locking service (status 210)',
     cfg: {},
-    reach: async (plugin) => {
-      await plugin.post(asTopic('t-ref-seed'), asHandle(ADOPTED), 'seed');
+    server: (fake) => {
+      fake.assignNick = 'locked-by-service';
     },
+    earlyRoomDiverges: false,
   },
   {
-    name: 'reverted to the provisional nick after a conflict',
+    name: 'reverted to the provisional nick after a conflict in a later room',
     cfg: {},
-    reach: async (plugin, fake) => {
+    move: async (plugin, fake) => {
       fake.conflictNicks.add(ADOPTED);
-      await plugin.post(asTopic('t-ref-seed'), asHandle(ADOPTED), 'seed');
+      await plugin.post(asTopic('t-ref-mover'), asHandle(ADOPTED), 'mover');
     },
+    earlyRoomDiverges: true,
   },
 ];
 
@@ -210,21 +227,44 @@ const refCells = provenances.flatMap((provenance) =>
   [ADOPTED, OTHER].map((handle) => ({ provenance, handle })),
 );
 
+const senderIn = async (plugin: XmppPlugin, topic: ReturnType<typeof asTopic>): Promise<string> => {
+  const { messages } = await plugin.fetchRecent({ topic, limit: 5 });
+  return String(messages.at(-1)?.senderHandle);
+};
+
 describe('XMPP resolveIdentity answers the nick a handle is read back under', () => {
   it.each(refCells)('$provenance.name -> $handle', async ({ provenance, handle }) => {
     const fake = new FakeXmpp();
+    provenance.server?.(fake);
     mockState.client = fake;
     const plugin = new XmppPlugin();
     await plugin.connect({ password: PASSWORD, ...provenance.cfg });
     try {
-      await provenance.reach(plugin, fake);
+      await plugin.post(EARLY, asHandle(ADOPTED), 'early');
+      await provenance.move?.(plugin, fake);
 
       const { backendRef } = await plugin.resolveIdentity(asHandle(handle));
-      const topic = asTopic(`t-ref-${handle}`);
-      await plugin.post(topic, asHandle(handle), 'x');
-      const { messages } = await plugin.fetchRecent({ topic, limit: 5 });
+      const late = asTopic(`t-ref-late-${handle}`);
+      await plugin.post(late, asHandle(handle), 'late');
 
-      expect(messages.map((m) => String(m.senderHandle))).toEqual([backendRef]);
+      // What `backendRef` claims: the sender of a post made now, in a room entered now.
+      expect(await senderIn(plugin, late)).toBe(backendRef);
+      expect((await senderIn(plugin, EARLY)) !== backendRef).toBe(provenance.earlyRoomDiverges);
+    } finally {
+      await plugin.disconnect();
+      mockState.client = undefined;
+    }
+  });
+
+  it('before the first post it is the fold that post would apply to this handle', async () => {
+    mockState.client = new FakeXmpp();
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: PASSWORD });
+    try {
+      const { backendRef } = await plugin.resolveIdentity(asHandle(ADOPTED));
+      const topic = asTopic('t-ref-unsettled');
+      await plugin.post(topic, asHandle(ADOPTED), 'x');
+      expect(await senderIn(plugin, topic)).toBe(backendRef);
     } finally {
       await plugin.disconnect();
       mockState.client = undefined;

@@ -20,9 +20,9 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive); no `since` → empty `<before/>` = last page; pages forward up to `limit` |
 | `subscribe` | every reflected groupchat `<message>` carrying a room `<stanza-id>` → `handler` (incl. own posts), in archive order |
 | admission | a stanza with **no `<body>`** — a subject change, a correction, a retraction, a chat state — is not a message on either path; an *empty* body is |
-| `resolveIdentity` | name convention: `backendRef` is the MUC nick this connection posts under, so it matches the `senderHandle` that handle reads back as. Once the nick is settled — pinned by `nick`, taken from the first `post`, or reverted after a `conflict` — **every** handle resolves to it, because one occupant is one sender; before the first `post` it is the fold `post` would apply to this handle (`alice@corp.com` → `alice_corp.com-<hash>`) |
+| `resolveIdentity` | name convention: `backendRef` is the MUC nick this connection was last **admitted** under — which is not always the one it asked for, since a nick-locking service rewrites it (status 210) and it is the rewritten name the archive carries. It matches the `senderHandle` of a post made **now, to a room entered under that nick**. Once the nick is settled — pinned by `nick`, taken from the first `post`, or reverted after a `conflict` — **every** handle resolves to it, because one occupant is one sender; before the first `post` it is the fold `post` would apply to this handle (`alice@corp.com` → `alice_corp.com-<hash>`). Occupancy is per room, so a room entered *before* a `conflict` revert keeps the sender it entered under and `backendRef` does not describe it (see "One nick per logical identity") |
 | sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
-| timestamp | the `<delay stamp>` the SERVER attested — MAM's `<forwarded>` envelope, or on the live path a `<delay>` the room itself added — else now. A `<delay>` naming any other entity is an occupant's own and is ignored, so a co-occupant cannot choose it (informational only) |
+| timestamp | the `<delay stamp>` the SERVER attested — MAM's `<forwarded>` envelope, or on the live path a `<delay from='room'>` the room itself added — else now. A `<delay>` naming any other entity, **or naming none at all** (XEP-0203's `from` is a SHOULD, so an omitted one attests nothing and a real MUC does reflect an occupant's un-attributed `<delay>` verbatim), is an occupant's own and is ignored, so a co-occupant cannot choose it (informational only) |
 
 Archive ids are not lexically comparable, but core never compares cursors — the server's RSM
 `<after>` defines "strictly after" and the MAM archive defines order.
@@ -72,7 +72,9 @@ strictly after it when it is not.
   archive back. This plugin therefore asks for a **persistent** room in the config submit of the
   rooms it creates itself, which is what makes history survive a reconnect. Two cases it cannot
   cover: a room that already exists as non-persistent, and a MUC service that refuses the field
-  (the plugin falls back to a plain "instant room" submit so the room still unlocks). For those,
+  (the plugin falls back to a plain "instant room" submit so the room still unlocks, and **logs a
+  loud stderr error naming the room and the consequence** — the fallback is a degradation, not a
+  success). For those,
   configure the MUC service to default rooms **persistent**, or pre-create persistent rooms for
   your topics. After a reconnect the plugin re-sends the join presence for every room it had
   entered — subscribed or catch-up-only — so push and post recover without waiting for a timeout.

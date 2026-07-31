@@ -42,7 +42,7 @@ export interface XmppBackendConfig {
   mam_page?: number;
 }
 
-// XML namespaces (XEP-0045 MUC, XEP-0313 MAM, XEP-0359 SID, XEP-0297 forward, XEP-0203 delay, RSM).
+/** XML namespaces: XEP-0045 MUC, XEP-0313 MAM, XEP-0359 SID, XEP-0297 forward, XEP-0203 delay, RSM. */
 const NS_MUC = 'http://jabber.org/protocol/muc';
 const NS_MUC_USER = 'http://jabber.org/protocol/muc#user';
 const NS_MAM = 'urn:xmpp:mam:2';
@@ -92,6 +92,12 @@ const NOT_AN_OCCUPANT_CONDITIONS = [
 ];
 /** XEP-0045 §7.6: our own occupant going unavailable to take a NEW nick, not to leave. */
 const STATUS_NICK_CHANGE = '303';
+/** XEP-0045 §7.2.2: this presence is about the recipient's own occupant. */
+const STATUS_SELF_PRESENCE = '110';
+/** XEP-0045 §7.2.3: the service admitted this occupant under a nick of its OWN choosing. */
+const STATUS_SERVICE_ASSIGNED_NICK = '210';
+/** XEP-0045 §10.1.1: this join CREATED the room, which stays locked until its owner configures it. */
+const STATUS_ROOM_CREATED = '201';
 /** XEP-0045 status codes that explain why our occupancy ended (kick, ban, affiliation, shutdown). */
 const OCCUPANCY_END_STATUS: Record<string, string> = {
   '301': 'banned',
@@ -128,15 +134,24 @@ const senderOf = (from: string, fallback: string): string => {
 /**
  * The `<delay>` stamp on a live stanza, and only the room's own: XEP-0203 §4 puts the entity that
  * added the delay in `from`, and a MUC reflects an occupant's `<delay>` to the room verbatim. Keep
- * this check, so that a co-occupant cannot choose the timestamp core shows the agent — the catch-up
- * path reads the server-built `<forwarded>` envelope, and the two paths have to agree.
+ * the attribution REQUIRED rather than assumed — XEP-0203 makes `from` a SHOULD, so a delay without
+ * it is unattested by construction — so that a co-occupant cannot choose the timestamp core shows
+ * the agent; the catch-up path reads the server-built `<forwarded>` envelope, and the two paths
+ * have to agree.
  */
 const roomStamp = (stanza: El, room: string): string | undefined => {
   const delay = stanza.getChild('delay', NS_DELAY);
   if (delay === undefined) return undefined;
-  const addedBy = delay.attrs.from;
-  return addedBy === undefined || addedBy === room ? delay.attrs.stamp : undefined;
+  return delay.attrs.from === room ? delay.attrs.stamp : undefined;
 };
+
+/**
+ * The archive position this ROOM stamped on a stanza: XEP-0359 `<stanza-id>`, whose id is the
+ * XEP-0313 MAM id. Keep the `by` filter, so that a `<stanza-id>` an occupant put on its own message
+ * — which the MUC reflects verbatim — is never read as a position in the archive.
+ */
+const roomStanzaId = (stanza: El, room: string): string | undefined =>
+  stanza.getChildren('stanza-id', NS_SID).find((e) => e.attrs.by === room)?.attrs.id;
 
 /** The first codepoint of `s` outside XML 1.0's `Char` production, or `undefined` if all are legal. */
 const xmlIllegalCodepoint = (s: string): number | undefined => {
@@ -422,6 +437,12 @@ export class XmppPlugin implements BackendPlugin {
   private nickAdoption?: Promise<void>;
   /** The nick taken from the FIRST post's identity; `undefined` when config pinned one instead. */
   private adoptedNick?: string;
+  /**
+   * The nick a room last ADMITTED this connection under, which is not always the one it asked for:
+   * a nick-locking service rewrites it (XEP-0045 status 210). {@link resolveIdentity} answers this
+   * rather than {@link nick}, so `backendRef` names the sender the archive actually carries.
+   */
+  private admittedNick?: string;
   private identityCollapseReported = false;
   /** Memoized disco#info probe for the one prerequisite this backend cannot work without. */
   private mamCheck?: Promise<void>;
@@ -475,6 +496,7 @@ export class XmppPlugin implements BackendPlugin {
     this.stopped = false;
     this.nickAdoption = cfg.nick === undefined ? undefined : Promise.resolve();
     this.adoptedNick = undefined;
+    this.admittedNick = undefined;
     this.identityCollapseReported = false;
     this.mamCheck = undefined;
 
@@ -643,7 +665,7 @@ export class XmppPlugin implements BackendPlugin {
     limit: number,
   ): Promise<ReadWindow> {
     if (since === undefined) {
-      const page = await this.mamQuery(topic, { before: true, max: limit });
+      const page = await this.mamQuery(topic, { lastPage: true, max: limit });
       return { items: page.items.filter(hasBody), tail: page.items.at(-1)?.archId };
     }
     return this.exclusiveMam(topic, since, limit);
@@ -664,7 +686,7 @@ export class XmppPlugin implements BackendPlugin {
    */
   private async exclusiveMam(topic: Topic, since: string, limit: number): Promise<ReadWindow> {
     const items: BodiedItem[] = [];
-    let cursor = since; // may be '' on the first iteration → no <after/> emitted
+    let cursor = since;
     let tail: string | undefined;
     while (items.length < limit) {
       const page = await this.mamQuery(topic, {
@@ -799,13 +821,16 @@ export class XmppPlugin implements BackendPlugin {
    * handle's posts, and answering the per-handle {@link nickFor} fold instead would name someone no
    * message in any room carries. Before the first post the nick is still open, and the fold is what
    * this handle would take (lossy for a handle a JID resource cannot spell, `alice@corp.com`).
+   *
+   * The answer is the nick a room last ADMITTED, not the one this connection asked for, because a
+   * nick-locking service rewrites it (XEP-0045 status 210) and it is the rewritten name the archive
+   * carries. Occupancy is per room, so this describes the rooms entered under the CURRENT nick; a
+   * room entered before a `conflict` revert keeps the sender it entered under (README).
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     const settled = this.nickAdoption !== undefined;
-    return { handle, backendRef: settled ? this.nick : nickFor(handle) };
+    return { handle, backendRef: settled ? (this.admittedNick ?? this.nick) : nickFor(handle) };
   }
-
-  // ---- internals -----------------------------------------------------------
 
   private reportStreamError(err: unknown): void {
     const now = Date.now();
@@ -824,7 +849,6 @@ export class XmppPlugin implements BackendPlugin {
     }
     if (!stanza.is('message')) return;
 
-    // MAM streamed result? (outer stanza is a normal message addressed to us)
     const result = stanza.getChild('result', NS_MAM);
     if (result !== undefined) {
       this.onMamResult(result, bareOf(stanza.attrs.from ?? ''));
@@ -847,9 +871,16 @@ export class XmppPlugin implements BackendPlugin {
    * A bounce that carries an id identifies exactly one post: it settles that post or nothing at
    * all. Keep it from falling through to the room's join, so that a late bounce for an already
    * cleared post cannot reject an unrelated operation with another operation's condition.
+   *
+   * A service bounce always comes from the BARE room JID (RFC 6120 §8.3: the error's `from` is the
+   * `to` this connection addressed, and it only ever addresses the room). Keep the occupant-resource
+   * check, so that a co-occupant — whose `<message type='error'>` to our occupant JID the MUC routes
+   * on with `from='room/attacker'` — cannot fail our in-flight joins and posts at will.
    */
   private onErrorMessage(stanza: El): void {
-    const room = bareOf(stanza.attrs.from ?? '');
+    const from = stanza.attrs.from ?? '';
+    if (resourceOf(from) !== '') return;
+    const room = bareOf(from);
     const err = stanzaError(stanza);
     const originId = stanza.getChild('origin-id', NS_SID)?.attrs.id ?? stanza.attrs.id ?? '';
     if (originId !== '') {
@@ -871,8 +902,8 @@ export class XmppPlugin implements BackendPlugin {
     const resource = resourceOf(from);
     const x = stanza.getChild('x', NS_MUC_USER);
     const statuses = (x?.getChildren('status') ?? []).map((s) => s.attrs.code ?? '');
-    // Self-presence: our own nick echoed back, or status code 110.
-    const isSelf = resource === this.occupantNick(room) || statuses.includes('110');
+    const isSelf =
+      resource === this.occupantNick(room) || statuses.includes(STATUS_SELF_PRESENCE);
 
     if (stanza.attrs.type === 'unavailable') {
       if (isSelf && !statuses.includes(STATUS_NICK_CHANGE)) {
@@ -899,9 +930,10 @@ export class XmppPlugin implements BackendPlugin {
     // (XEP-0045 status 210), so that a join is never settled for a nick this connection does not
     // hold — after which its own reflections fail the provenance check and every post stalls to
     // POST_TIMEOUT_MS.
-    const assignedByService = statuses.includes('210');
+    const assignedByService = statuses.includes(STATUS_SERVICE_ASSIGNED_NICK);
     const addressed = pending?.nick ?? this.occupantNick(room);
     if (resource !== '' && resource !== addressed && !assignedByService) return;
+    if (resource !== '') this.admittedNick = resource;
     if (resource !== '' && resource !== this.occupantNick(room)) {
       if (assignedByService) {
         console.error(
@@ -912,8 +944,7 @@ export class XmppPlugin implements BackendPlugin {
       this.roomNicks.set(room, resource);
     }
     if (pending === undefined) return;
-    // Status 201 = we just CREATED the room; it stays locked until its owner submits a config.
-    if (statuses.includes('201')) {
+    if (statuses.includes(STATUS_ROOM_CREATED)) {
       const unlocked = (): void => pending.resolve();
       void this.configureRoom(room).then(unlocked, unlocked);
     } else {
@@ -997,23 +1028,36 @@ export class XmppPlugin implements BackendPlugin {
           xml('x', { xmlns: NS_XDATA, type: 'submit' }, ...(fields as never[])),
         ),
       );
-    await conn.iqCaller
-      .request(
+    try {
+      await conn.iqCaller.request(
         submit([
           xml('field', { var: 'FORM_TYPE', type: 'hidden' }, xml('value', {}, NS_ROOMCONFIG)),
           xml('field', { var: 'muc#roomconfig_persistentroom' }, xml('value', {}, '1')),
         ]),
         MAM_TIMEOUT_MS,
-      )
-      .catch(async () => {
-        await conn.iqCaller.request(submit([]), MAM_TIMEOUT_MS).catch(() => undefined);
+      );
+    } catch (err) {
+      console.error(
+        `[parley-xmpp] ${room} refused the persistent-room config (${conditionOf(err)}), so it was ` +
+          'created NON-PERSISTENT: this room and its MAM archive are destroyed when the last ' +
+          'occupant leaves — which every stream drop causes — and catch-up then returns an empty ' +
+          'history. Configure the MUC service to default rooms persistent, or pre-create the room.',
+      );
+      await conn.iqCaller.request(submit([]), MAM_TIMEOUT_MS).catch((err2: unknown) => {
+        console.error(
+          `[parley-xmpp] ${room} also refused the bare instant-room config (${conditionOf(err2)}), ` +
+            'so it stays LOCKED: nobody else can enter it and this bridge is its only occupant, ' +
+            'so the room and its archive die with this connection.',
+        );
       });
+    }
   }
 
   private onMamResult(result: El, fromBare: string): void {
     const collector = this.mamCollectors.get(result.attrs.queryid ?? '');
     if (collector === undefined) return;
-    // XEP-0313 security: only accept archive results from the room we queried.
+    // Keep the XEP-0313 room check, so that a `<result>` routed from anywhere else cannot be
+    // collected as this room's history.
     if (fromBare !== collector.room) return;
     const forwarded = result.getChild('forwarded', NS_FORWARD);
     const inner = forwarded?.getChild('message');
@@ -1030,10 +1074,7 @@ export class XmppPlugin implements BackendPlugin {
   private onGroupchat(stanza: El): void {
     const from = stanza.attrs.from ?? '';
     const room = bareOf(from);
-    // The MUC adds <stanza-id by='room' id='ARCHIVE_ID'>; pick the one stamped by this room.
-    const archId = stanza
-      .getChildren('stanza-id', NS_SID)
-      .find((e) => e.attrs.by === room)?.attrs.id;
+    const archId = roomStanzaId(stanza, room);
 
     // The origin-id is public to every occupant, so keep the occupant-JID check, so that a
     // co-occupant echoing it cannot resolve our post with THEIR archive position — which core
@@ -1056,7 +1097,6 @@ export class XmppPlugin implements BackendPlugin {
       }
     }
 
-    // Live delivery: every reflected message carrying a room stanza-id (incl. our own).
     if (archId === undefined) return;
     this.fireWaiters(room);
     const sub = this.subscriptions.get(room);
@@ -1076,7 +1116,7 @@ export class XmppPlugin implements BackendPlugin {
   /** Run one MAM page; the streamed `<result>` items are gathered by `queryid`. */
   private async mamQuery(
     topic: Topic,
-    opts: { after?: string; before?: boolean; max: number },
+    opts: { after?: string; lastPage?: boolean; max: number },
   ): Promise<{ items: MamItem[]; complete: boolean }> {
     const room = this.roomJid(topic);
     const rsm: unknown[] = [];
@@ -1088,7 +1128,7 @@ export class XmppPlugin implements BackendPlugin {
       rsm.push(xml('after', {}, opts.after));
     }
     rsm.push(xml('max', {}, String(opts.max)));
-    if (opts.before === true) rsm.push(xml('before', {})); // empty <before/> => last page
+    if (opts.lastPage === true) rsm.push(xml('before', {}));
 
     const queryid = randomUUID();
     const collector: MamItem[] = [];

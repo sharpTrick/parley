@@ -1,4 +1,4 @@
-import { asTopic } from '@sharptrick/parley-core';
+import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Class: diagnostics discarded on the failure path. A bridge whose stream is flapping, whose
@@ -64,5 +64,70 @@ describe('XMPP failure-path diagnostics', () => {
     expect(logged).toContain(room);
     expect(logged).toContain('forbidden'); // the condition, not a flattened 'error'
     await plugin.disconnect();
+  });
+});
+
+// Class: a fallback that degrades a documented durability property without a signal. A room this
+// plugin creates is configured PERSISTENT because a non-persistent MUC and its entire MAM archive
+// are destroyed when the last occupant leaves — which every stream drop causes — so a service that
+// refuses the field silently converts "history survives a reconnect" into "catch-up returns an empty
+// page after the next blip". The join resolves either way, so nothing downstream can tell; the only
+// place the operator can learn it is stderr. The table walks every way the config submit can fail,
+// with the accepting service as the negative control so a green row is not a dead assertion.
+
+interface DurabilityRow {
+  name: string;
+  ownerConfig: FakeXmpp['ownerConfig'];
+  /** How many stderr lines the room earns: one per submit that failed. */
+  lines: number;
+  /** Phrases the operator needs: what was refused, and what it costs them. */
+  reports: RegExp[];
+}
+const durabilityRows: DurabilityRow[] = [
+  {
+    name: 'the persistent-room submit is refused',
+    ownerConfig: 'refuses-persistent',
+    lines: 1,
+    reports: [/NON-PERSISTENT/, /destroyed when the last occupant leaves/],
+  },
+  {
+    name: 'the bare instant-room fallback is refused too',
+    ownerConfig: 'refuses-everything',
+    lines: 2,
+    reports: [/NON-PERSISTENT/, /stays LOCKED/],
+  },
+  {
+    name: 'the owner IQ is never answered',
+    ownerConfig: 'times-out',
+    lines: 2,
+    reports: [/NON-PERSISTENT/, /stays LOCKED/],
+  },
+  { name: 'the service accepts it (negative control)', ownerConfig: 'accepts', lines: 0, reports: [] },
+];
+
+describe('XMPP reports a room it could not make durable', () => {
+  it.each(durabilityRows)('$name', async (row) => {
+    const fake = new FakeXmpp();
+    fake.announceCreation = true; // status 201: this join CREATED the room, so it configures it
+    fake.ownerConfig = row.ownerConfig;
+    mockState.client = fake;
+    const errors: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((m) => {
+      errors.push(String(m));
+    });
+
+    const plugin = new XmppPlugin();
+    await plugin.connect(CONFIG);
+    const topic = asTopic(`t-durable-${row.ownerConfig}`);
+    const room = priv(plugin).roomJid(topic);
+    try {
+      // The join still succeeds — the point is that it stops being SILENT, not that it starts failing.
+      await expect(plugin.post(topic, asHandle('a'), 'hello')).resolves.toBeDefined();
+      const durability = errors.filter((m) => m.includes(room));
+      expect(durability).toHaveLength(row.lines);
+      for (const phrase of row.reports) expect(durability.join('\n')).toMatch(phrase);
+    } finally {
+      await plugin.disconnect();
+    }
   });
 });

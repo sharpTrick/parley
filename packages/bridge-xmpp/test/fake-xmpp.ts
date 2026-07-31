@@ -12,6 +12,7 @@ const NS_FORWARD = 'urn:xmpp:forward:0';
 const NS_RSM = 'http://jabber.org/protocol/rsm';
 const NS_STANZAS = 'urn:ietf:params:xml:ns:xmpp-stanzas';
 const NS_DISCO_INFO = 'http://jabber.org/protocol/disco#info';
+const NS_MUC_OWNER = 'http://jabber.org/protocol/muc#owner';
 
 export interface El {
   name: string;
@@ -68,7 +69,7 @@ export interface XmppPrivate {
   armWaiter(room: string): { park(ms: number): Promise<string>; cancel(): void };
   mamQuery(
     topic: Topic,
-    opts: { after?: string; before?: boolean; max: number },
+    opts: { after?: string; lastPage?: boolean; max: number },
   ): Promise<{ items: ArchiveItem[]; complete: boolean }>;
 }
 export const priv = (p: XmppPlugin): XmppPrivate => p as unknown as XmppPrivate;
@@ -163,6 +164,17 @@ export class FakeXmpp {
   discoUnknownRoom: 'result' | 'item-not-found' = 'result';
   /** Whether a join that CREATES the room says so (status 201), which is what unlocks + configures it. */
   announceCreation = false;
+  /**
+   * How this service answers the owner config submit that unlocks a freshly created room
+   * (XEP-0045 §10.1.2). A MUC whose policy does not allow `muc#roomconfig_persistentroom` rejects
+   * the whole form — the room is then created NON-persistent, and its MAM archive dies with the
+   * last occupant — and one that rejects the bare fallback too leaves the room LOCKED. `'times-out'`
+   * is the IQ that is never answered, which `iqCaller` surfaces as a rejection on its own timer.
+   * Without this knob {@link onIq} answers every non-disco, non-MAM IQ `<iq type='result'/>`, so the
+   * plugin's whole fallback arm is unreachable from a test.
+   */
+  ownerConfig: 'accepts' | 'refuses-persistent' | 'refuses-everything' | 'times-out' = 'accepts';
+  ownerConfigCondition = 'not-allowed';
 
   /** Whether a room's disco#info advertises `urn:xmpp:mam:2` (i.e. muc_mam is loaded). */
   discoMam = true;
@@ -310,11 +322,29 @@ export class FakeXmpp {
         'message',
         { from: item.from, type: 'groupchat' },
         ...(this.itemChildren(item) as never[]),
-        ...((shape.injected ?? []) as never[]),
+        ...(this.reflectable(room, shape.injected ?? []) as never[]),
+        ...(item.stamp === undefined
+          ? []
+          : [xml('delay', { xmlns: NS_DELAY, from: room, stamp: item.stamp })]),
         xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
       ),
     );
     return item;
+  }
+
+  /**
+   * What survives an occupant's stanza on the way through the MUC. XEP-0359 §3 makes a routing
+   * entity strip a child attributed to ITSELF before forwarding, and a live Prosody does exactly
+   * that for `<stanza-id by='room'>` and `<delay from='room'>` — so a fixture that reflected them
+   * would hand the plugin a forgery no server can deliver, and grade the room-attested arm of the
+   * provenance check against the wrong entity. Keep the strip, so that "the room said it" is only
+   * ever something the ROOM adds here.
+   */
+  private reflectable(room: string, injected: unknown[]): unknown[] {
+    return injected.filter((child) => {
+      const attrs = (child as El).attrs;
+      return attrs.by !== room && attrs.from !== room;
+    });
   }
 
   /** Archive `body` WITHOUT reflecting it (models MAM committing before the live copy lands). */
@@ -477,7 +507,11 @@ export class FakeXmpp {
           { from: item.from, type: 'groupchat' },
           ...(this.itemChildren(item) as never[]),
           xml('stanza-id', { xmlns: NS_SID, by: room, id: item.archId }),
-          xml('delay', { xmlns: NS_DELAY, stamp: item.stamp ?? new Date().toISOString() }),
+          xml('delay', {
+            xmlns: NS_DELAY,
+            from: room,
+            stamp: item.stamp ?? new Date().toISOString(),
+          }),
         ),
       );
     }
@@ -535,6 +569,8 @@ export class FakeXmpp {
         ),
       );
     }
+    const owner = iq.getChild('query', NS_MUC_OWNER);
+    if (owner !== undefined) return this.answerOwnerConfig(owner);
     const query = iq.getChild('query', NS_MAM);
     if (query === undefined) return xml('iq', { type: 'result' });
     if (this.mamIqError !== undefined) throw stanzaError(this.mamIqError);
@@ -580,6 +616,22 @@ export class FakeXmpp {
       { type: 'result' },
       xml('fin', { xmlns: NS_MAM, complete: String(complete) }),
     );
+  }
+
+  private answerOwnerConfig(owner: El): Promise<unknown> {
+    const asksPersistent = String(owner).includes('muc#roomconfig_persistentroom');
+    switch (this.ownerConfig) {
+      case 'times-out':
+        return Promise.reject(new Error('timeout'));
+      case 'refuses-everything':
+        return Promise.reject(stanzaError(this.ownerConfigCondition));
+      case 'refuses-persistent':
+        return asksPersistent
+          ? Promise.reject(stanzaError(this.ownerConfigCondition))
+          : Promise.resolve(xml('iq', { type: 'result' }));
+      default:
+        return Promise.resolve(xml('iq', { type: 'result' }));
+    }
   }
 
   /** One streamed `<result>` of a MAM page — the shape every archived stanza comes back in. */
