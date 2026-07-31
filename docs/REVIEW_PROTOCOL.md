@@ -57,6 +57,29 @@ headroom. Test growth is governed instead by the test-hygiene lens, which asks f
 into parameterized classes: `bridge-telegram` did exactly that in round 9, going 527 → 523 tests while
 coverage rose from 4 fields to 9 and from 15 breakage cells to 37.
 
+**Imports do not count against the net.** A multi-file split pays roughly 30-70 lines of import
+ceremony per package (measured: 459 lines across the eleven decomposed packages, 3% of source).
+That is real but it is not logic, and counting it made round 11's margins misleadingly thin — xmpp
+landed at -3 and shared at -5 where the non-import deltas were -36 and -13. Measure the net over
+non-import source lines.
+
+**Architectural tests are fair game, under one rule: RE-ANCHOR by default, delete only with a named
+replacement.** Round 11 found six ways a path- or shape-coupled assertion had cemented the
+monoliths — a split blocked, a guard hollowed out while staying green, a recorded security debt made
+invisible, a private field's TYPE asserted, a lint with a hole, and a probe a refactor turns into
+`expect(undefined).toBeUndefined()`. Every one was individually justified when written.
+
+So a structural assertion may be rewritten to be location-independent: glob `src/**` instead of one
+path, assert the invariant instead of the field's shape. It may be DELETED only if the agent NAMES
+where that invariant is already covered behaviourally, and shows that named test failing against the
+defect it is supposed to catch. "It blocked the split" is not a reason. `bridge-redis`'s reader
+accounting is the model of a legitimate delete: the invariant it guards — no live socket survives
+teardown — is already asserted externally through the proxy in `live-failure-modes.test.ts`.
+
+**Do not move source and behavioural tests in the same round.** The unmodified-suite rule is the
+whole proof that a decomposition preserved behaviour, and it only means something if the suite is
+held still. Architectural tests are the sole exception, and only under the rule above.
+
 **Appeals are allowed and must carry data.** An agent that cannot land net-negative may appeal in its
 report with a specific argument — the measurement that shows the added lines close a defect class no
 smaller change reaches, or the deletion that would lose functionality worth keeping. "It needed more
