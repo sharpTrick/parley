@@ -1,20 +1,14 @@
-import {
-  asHandle,
-  type BackendPlugin,
-  type Message,
-  parseMentions,
-  type Topic,
-} from '@sharptrick/parley-core';
+import { asHandle, type Message, parseMentions } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DRAIN_PAGE, drainAll, expectWellFormedMessage } from './assertions.js';
 import { type BackendFactory, type ConformanceContext, openContext } from './factory.js';
 
+export { ASSERTED_PROPERTIES, CLAUSES } from './clauses.js';
 export type { BackendFactory, ConformanceContext } from './factory.js';
 export { assertConformanceContext, CONTEXT_FIELDS, openContext } from './factory.js';
 
 const SENDER = asHandle('writer');
 const OTHER = asHandle('second-writer');
-
-const DRAIN_PAGE = 500;
 
 /**
  * Wall-clock budget for the interleaved reader's give-up diagnostic. Keep it well UNDER the
@@ -84,146 +78,10 @@ export const PAGING_VOLUME: readonly string[] = ['m0', 'm1', 'm2', 'm3', 'm4', '
  * Page sizes that page DIFFERENTLY over `remaining` messages: one at a time, two exact divisions at
  * different depths, an uneven truncation, and exactly the remainder. Derived from the volume rather
  * than hard-coded, so that changing the message list cannot silently collapse several rows onto one
- * behaviour — `[1, 2, 4, 5, 6]` over 4 remaining ran the same single-page case three times and never
- * ran the uneven truncation at all, which is where a page-boundary off-by-one lives.
+ * behaviour and drop the uneven truncation, which is where a page-boundary off-by-one lives.
  */
 export const pageLimitsFor = (remaining: number): number[] =>
   [...new Set([1, 2, 3, remaining - 1, remaining])].filter((n) => n >= 1).sort((a, b) => a - b);
-
-/**
- * Read every message in `topic` by PAGING to exhaustion. It must not read one oversized page: a
- * backend with a server-side page cap below the request would silently return a prefix, and the
- * assertions built on it would grade a partial view.
- *
- * The FIRST page has no `since`, which the suite itself pins as the NEWEST `limit` messages — so a
- * full first page means the oldest messages are outside the window and paging forward can never
- * reach them. Keep the guard, so that a caller raising a volume past {@link DRAIN_PAGE} gets an
- * error naming the helper instead of a passing assertion over a silently truncated suffix.
- */
-async function drainAll(plugin: BackendPlugin, topic: Topic): Promise<Message[]> {
-  const out: Message[] = [];
-  let since: string | undefined;
-  for (let page = 0; page < 200; page++) {
-    const res = await plugin.fetchRecent({ topic, since: since as never, limit: DRAIN_PAGE });
-    if (since === undefined && res.messages.length >= DRAIN_PAGE) {
-      throw new Error(
-        `drainAll(${topic}): the since-less first page returned ${res.messages.length} messages, ` +
-          `filling the ${DRAIN_PAGE} limit — anything older is unreachable from here. Raise ` +
-          `DRAIN_PAGE or lower the volume; do not grade a partial view.`,
-      );
-    }
-    out.push(...res.messages);
-    if (res.messages.length === 0 || res.nextCursor === since) return out;
-    since = res.nextCursor;
-  }
-  throw new Error(`drainAll did not terminate for ${topic}`);
-}
-
-/**
- * Every field of the normalized Message (DESIGN §5) a plugin is responsible for populating.
- * Asserting only `content` lets a plugin return a constant `topic` — which collapses core's dedup
- * namespace across topics — or a constant `senderHandle`, and still pass in full.
- */
-function expectWellFormedMessage(
-  m: Message,
-  expected: { topic: Topic; content: string; sender?: string },
-): void {
-  expect(m.topic).toBe(expected.topic);
-  expect(m.content).toBe(expected.content);
-  expect(typeof m.backendMsgId).toBe('string');
-  expect(m.backendMsgId.length).toBeGreaterThan(0);
-  expect(typeof m.cursor).toBe('string');
-  expect(m.cursor.length).toBeGreaterThan(0);
-  expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
-  // `senderHandle` is asserted on every backend, not only the ones that round-trip `identity`:
-  // whoever the sender turns out to be, core routes and displays it.
-  expect(typeof m.senderHandle).toBe('string');
-  expect(m.senderHandle.length).toBeGreaterThan(0);
-  // `mentions` is what core's push loop filters on (transport/push-loop.ts) — a backend that
-  // drops it delivers NOTHING once mention filtering is on. Compared against the content the
-  // BACKEND returned, so a transport that rewrites mention syntax is still graded honestly.
-  expect(m.mentions).toEqual(parseMentions(m.content));
-  if (expected.sender !== undefined) expect(m.senderHandle).toBe(expected.sender);
-}
-
-/**
- * Every clause this suite grades, as a phrase that must appear in the title of a case it registers.
- *
- * A conformance clause could previously be deleted with nothing anywhere going red — the suite's own
- * self-tests pinned a case count and one title — and eleven backends would keep being certified
- * against the weakened suite while the README kept advertising the clause. This table is what makes
- * a deletion or a rename a failure in THIS package. Adding a case means adding its clause here.
- */
-export const CLAUSES: readonly string[] = [
-  'in order, with unique ids and distinct cursors',
-  'the same content posted twice',
-  'only newer messages (exclusive)',
-  'paging from a cursor with limit',
-  'returns the NEWEST messages',
-  'since at the tail',
-  'never-posted topic',
-  'via live push and via catch-up',
-  'either round-trips',
-  'post accepts inReplyTo',
-  'exactly the post-subscribe tail',
-  'written by an independent client',
-  'topics are isolated',
-  'on the live path too',
-  'disconnect is idempotent',
-  'resolveIdentity answers',
-  'not collapsed onto one another',
-  'blockMs is honoured natively or ignored promptly',
-  'blocking fetch is not missed',
-  'interleaved with concurrent writers',
-  'multi-process writes',
-];
-
-/**
- * What the suite asserts that is neither a `Message` FIELD nor a seam CALL. The clause↔variant and
- * field↔variant mappings both stop above these, which is how five cursor and limit assertions could
- * be deleted at once — negative control included — with this package staying green. Each term owns a
- * `BROKEN_VARIANTS` entry, exactly as every `Message` field does.
- *
- * - `nextCursor-agreement`: a page's `nextCursor` is the cursor of the last row IT returned, never
- *   the topic's tail — reporting the tail on a truncated page drops everything in between.
- * - `nextCursor-stability`: an empty page's cursor does not move, so a drained catch-up loop stays
- *   drained instead of re-reading the window forever.
- * - `limit-honoured`: a page never carries more rows than `limit`.
- * - `disconnect-stops-live-delivery`: nothing reaches a handler after `disconnect()` — the loop or
- *   socket that goes round once more decides whether core keeps emitting `<channel>` events for a
- *   backend it believes is gone, and whether the MCP process can exit.
- * - `post-id-agreement`: the id `post` RETURNS is the id the read paths report for that message.
- *   Core stores what `post` returned as the dedup key without reading it back, so a plugin that
- *   spells the two differently — a composite key built one way on the write path and another on the
- *   read path — re-delivers its own messages on every catch-up. The uniqueness assertions cannot see
- *   it: a re-spelled id is still unique and still stable.
- *
- * The four below are ELAPSED TIME, which is neither a field nor a call and so had no way into either
- * registry. Every assertion over `Date.now() - <start>` names one of them in its own failure message,
- * and `suite-shape` requires that of any new one — an uncontrolled timing bound is invisible to
- * every other check here, and `native-block-actually-waits` was in exactly that state.
- *
- * - `sinceless-block-returns-promptly`: a read carrying a block budget and NO cursor returns its
- *   default window at once. That is the first iteration of core's long-poll wrapper, i.e. every
- *   `parley_fetch_recent` an agent makes before it holds a cursor.
- * - `ignored-block-returns-promptly`: a backend that declares no native support ignores `blockMs`
- *   promptly rather than parking on it. The hint is optional; hanging on it is not.
- * - `native-block-wakes-on-the-message`: a native blocker returns when the message lands, not when
- *   the budget expires.
- * - `native-block-actually-waits`: and it waits for it — a native `blockMs` that returns instantly
- *   with nothing to report turns core's long-poll into a hot loop against the backend.
- */
-export const ASSERTED_PROPERTIES: readonly string[] = [
-  'nextCursor-agreement',
-  'nextCursor-stability',
-  'limit-honoured',
-  'disconnect-stops-live-delivery',
-  'post-id-agreement',
-  'sinceless-block-returns-promptly',
-  'ignored-block-returns-promptly',
-  'native-block-wakes-on-the-message',
-  'native-block-actually-waits',
-];
 
 /**
  * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend
@@ -294,11 +152,10 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     // instead of the last RETURNED message silently drops everything in between, with no error.
     it.each(pageLimitsFor(PAGING_VOLUME.length - 1))('paging from a cursor with limit %i is lossless', async (limit) => {
       const t = ctx.freshTopic();
-      const posted = PAGING_VOLUME;
-      for (const c of posted) await ctx.plugin.post(t, SENDER, c);
+      for (const c of PAGING_VOLUME) await ctx.plugin.post(t, SENDER, c);
 
       const all = await drainAll(ctx.plugin, t);
-      expect(all.map((m) => m.content)).toEqual(posted);
+      expect(all.map((m) => m.content)).toEqual(PAGING_VOLUME);
       const from = all[0]!.cursor; // page forward from the first message
 
       const seen: string[] = [];
@@ -313,13 +170,11 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
         if (res.messages.length === 0 || res.nextCursor === since) break;
         since = res.nextCursor;
       }
-      expect(seen).toEqual(posted.slice(1)); // everything after m0, once, in order
+      expect(seen).toEqual(PAGING_VOLUME.slice(1)); // everything after m0, once, in order
     });
 
     // `since`-less means "the backend's default window" (seam.ts), and every shipped backend reads
-    // that as the NEWEST `limit` messages. `parley_list_users` depends on it, yet nothing pinned
-    // the direction — and core's own FakePlugin returns the OLDEST, so roster tests grade
-    // semantics no backend implements.
+    // that as the NEWEST `limit` messages, which `parley_list_users` depends on.
     it('a since-less fetch returns the NEWEST messages, not the oldest', async () => {
       const t = ctx.freshTopic();
       const posted = ['w0', 'w1', 'w2', 'w3', 'w4'];
@@ -339,11 +194,9 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(drained.nextCursor).toBe(tail);
     });
 
-    // seam.ts permits TWO answers for a topic with no backend representation, and pinning one of
-    // them made the suite narrower than the seam it is written against — a plugin taking the
-    // documented alternative failed conformance, while core's NoSuchTopicError mapping had no
-    // producer anywhere to grade it. A backend states which arm it takes; the default is the
-    // stricter one, so this cannot become a way to weaken the grade.
+    // seam.ts permits TWO answers for a topic with no backend representation, so pinning one makes
+    // the suite narrower than the seam it is written against. A backend states which arm it takes;
+    // the default is the stricter one, so this cannot become a way to weaken the grade.
     it('fetchRecent on a never-posted topic returns an empty page with a replayable cursor', async () => {
       const t = ctx.freshTopic(); // no posts
       if ((ctx.absentTopicBehaviour ?? 'empty-page') === 'throws') {
@@ -389,18 +242,13 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(viaCatchUp!.mentions).toContain(OTHER);
     });
 
-    // `post`'s `opts.inReplyTo` is part of the seam and core's post tool passes it
-    // (transport/tools.ts), but no case ever supplied it — a plugin that 400s on a threaded reply,
-    // or takes a different endpoint for one, was certified conformant. The seam surfaces no reply
-    // field on Message, so the contract is exactly "accepted, and durable in order".
-    // Every other case posts short ASCII ('a', 'same', 'm0'), so nothing certified that `post`
-    // round-trips content AT ALL. Carriage return is not a row YET: an XMPP body is XML character
-    // data, whose parser normalizes CR to LF before any plugin sees it, so no plugin can round-trip
-    // one — but refusing it is the arm this clause already permits, and bridge-xmpp accepts a CR and
-    // stores an LF. Add the row when that plugin refuses; adding it first only reddens the backend.
-    // The same `parley_post` could behave four different ways across
-    // certified backends, and a backend that silently rewrote or truncated a payload would pass in
-    // full. Refusing a payload is a visible, legitimate answer; altering it silently is not.
+    // Every other case posts short ASCII ('a', 'same', 'm0'), so nothing else certifies that `post`
+    // round-trips content at all: the same `parley_post` could behave four different ways across
+    // certified backends. Refusing a payload is a visible, legitimate answer; altering it silently
+    // is not. Carriage return is not a row YET: an XMPP body is XML character data, whose parser
+    // normalizes CR to LF before any plugin sees it, so no plugin can round-trip one — but refusing
+    // it is the arm this clause already permits, and bridge-xmpp accepts a CR and stores an LF. Add
+    // the row when that plugin refuses; adding it first only reddens the backend.
     it.each([
       ['a newline', 'fidelity\nsecond line'],
       ['leading and trailing spaces', '  fidelity  '],
@@ -423,6 +271,9 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       expect(messages[0]!.mentions).toEqual(parseMentions(content));
     });
 
+    // `post`'s `opts.inReplyTo` is part of the seam and core's post tool passes it
+    // (transport/tools.ts). The seam surfaces no reply field on Message, so the contract is exactly
+    // "accepted, and durable in order" — a plugin that 400s on a threaded reply does not conform.
     it('post accepts inReplyTo and the reply is durable, in order', async () => {
       const t = ctx.freshTopic();
       const parent = await ctx.plugin.post(t, SENDER, 'question');
@@ -464,12 +315,11 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       );
     });
 
-    // Every other subscribe case posts through the SAME client that registered the handler, so a
-    // plugin whose live path merely echoes its own writes — a loopback that registers no
-    // server-side listener at all — passed conformance in full. That is precisely the case Parley
-    // exists for: a human posts in chat, an agent must receive it. `concurrentPost` is the
-    // independent writer the context can already hand out; two of them, because SQLite's fixture
-    // counts `ctx.plugin` as one of the contending writers.
+    // Every other subscribe case posts through the SAME client that registered the handler, so only
+    // this one can see a plugin whose live path merely echoes its own writes — a loopback with no
+    // server-side listener at all, which is precisely the case Parley exists for: a human posts in
+    // chat, an agent must receive it. Two writers, because SQLite's fixture counts `ctx.plugin` as
+    // one of the contending writers.
     it('subscribe delivers a message written by an independent client', async (testCtx) => {
       if (ctx.concurrentPost === 'unsupported') {
         testCtx.skip();
@@ -539,16 +389,13 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       for (const m of inB) expect(m.topic).toBe(b);
     });
 
-
-    // `disconnect()` is declared to tear down the connection AND all subscriptions, but the suite
-    // only ever called it from `cleanup()` and asserted nothing about it — so a plugin that leaves
-    // its poll loop or socket running, or that keeps serving `post` afterwards, was certified.
-    // The live half is graded by WATCHING the handler across a settle window: re-reading `live` the
-    // instant teardown returns cannot fail, because nothing in between could have delivered. What
-    // the window catches is the loop or socket that outlived `disconnect()` and went round once
-    // more. Grading it with a fresh WRITE instead is still out of reach — a fixture may legitimately
-    // count `ctx.plugin` as one of the contending writers `concurrentPost` drives, as
-    // bridge-sqlite's deliberately does, so there is no client here that survives the teardown.
+    // `disconnect()` tears down the connection AND all subscriptions, and keeps serving nothing
+    // afterwards. The live half is graded by WATCHING the handler across a settle window: re-reading
+    // `live` the instant teardown returns cannot fail, because nothing in between could have
+    // delivered. What the window catches is the loop or socket that outlived `disconnect()` and went
+    // round once more. Grading it with a fresh WRITE instead is out of reach — a fixture may
+    // legitimately count `ctx.plugin` as one of the contending writers `concurrentPost` drives, as
+    // bridge-sqlite's deliberately does, so no client here survives the teardown.
     it('disconnect is idempotent and stops the plugin serving', async () => {
       const t = ctx.freshTopic();
       const live: Message[] = [];
@@ -595,13 +442,11 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
       const t = ctx.freshTopic();
       await ctx.plugin.post(t, SENDER, 'old');
 
-      // The since-LESS arm, graded on BOTH capability arms and carried by the fetch this case
-      // already had to make. Core's long-poll wrapper issues its first iteration with the caller's
-      // own `since` — undefined whenever the agent holds no cursor yet — so this is the hot path
-      // for every `parley_fetch_recent` that carries a block budget and no cursor. seam.ts and
-      // engine/blocking-fetch.ts agree here: a default window that HAS messages returns at once.
-      // Every other case in this suite passes a `since`, so nothing else can see a plugin that
-      // parks instead and holds the tool open for its whole budget.
+      // The since-LESS arm, graded on BOTH capability arms. Core's long-poll wrapper issues its
+      // first iteration with the caller's own `since` — undefined whenever the agent holds no cursor
+      // yet — so this is the hot path for every `parley_fetch_recent` that carries a block budget and
+      // no cursor. seam.ts and engine/blocking-fetch.ts agree: a default window that HAS messages
+      // returns at once, and no other case here passes a `blockMs` without a `since`.
       const openedAt = Date.now();
       const opening = await ctx.plugin.fetchRecent({ topic: t, blockMs: SINCELESS_BLOCK_MS });
       const tail = opening.nextCursor;
@@ -614,8 +459,8 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
 
       if (!ctx.supportsBlockingFetch) {
         // The hint is OPTIONAL; hanging on it is not. This is the only case in the suite that ever
-        // passes `blockMs`, so a plugin that parks forever on it — the worst behaviour available,
-        // stalling `parley_fetch_recent` for its whole timeout — used to be certified by the skip.
+        // passes `blockMs`, so nothing else can see a plugin that parks forever on it and stalls
+        // `parley_fetch_recent` for its whole timeout.
         const startedIgnoring = Date.now();
         const ignored = await ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 });
         expect(ignored.messages).toEqual([]);

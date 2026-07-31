@@ -119,18 +119,23 @@ describe('no consumer re-implements an export of this package', () => {
    * debt this package has accepted, not a licence: adding one is a deliberate edit to this table.
    */
   const KNOWN_FORKS: Record<string, string> = {
-    'bridge-discord/src/index.ts:plaintextRemoteOrigin':
+    'bridge-discord:plaintextRemoteOrigin':
       'it needs the scheme to recommend as well as the origin to name, which a ' +
       '`string | undefined` return cannot carry — widening the return is what retires it',
-    'bridge-nats/src/index.ts:delay':
+    'bridge-nats:delay':
       'a duplicate with no obstruction at all: importing `delay` from here is a one-line change ' +
       'in that package, which owns it',
-    'bridge-redis/src/index.ts:delay':
+    'bridge-redis:delay':
       'a duplicate with no obstruction at all: importing `delay` from here is a one-line change ' +
       'in that package, which owns it',
   };
 
-  /** Source files of packages that consume this one, with comments stripped. */
+  /**
+   * Source files of packages that consume this one, with comments stripped. Every `src/` file of a
+   * consuming package is read, not only the files that name the import: a fork is a debt the
+   * PACKAGE owes, and splitting one file into several moves the copy away from the import without
+   * retiring anything. Scanning only the importing file let a decomposition hide a fork outright.
+   */
   const consumerSources = (): { path: string; code: string }[] => {
     const out: { path: string; code: string }[] = [];
     for (const dir of readdirSync(packagesDir)) {
@@ -141,10 +146,14 @@ describe('no consumer re-implements an export of this package', () => {
       } catch {
         continue;
       }
-      for (const name of names.filter((n) => n.endsWith('.ts'))) {
-        const path = `${dir}/src/${name}`;
-        const text = readFileSync(new URL(path, packagesDir), 'utf8');
-        if (!text.includes(SELF)) continue;
+      const sources = names
+        .filter((n) => n.endsWith('.ts'))
+        .map((name) => ({
+          path: `${dir}/src/${name}`,
+          text: readFileSync(new URL(`${dir}/src/${name}`, packagesDir), 'utf8'),
+        }));
+      if (!sources.some((s) => s.text.includes(SELF))) continue;
+      for (const { path, text } of sources) {
         out.push({
           path,
           code: text.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, ''),
@@ -155,7 +164,7 @@ describe('no consumer re-implements an export of this package', () => {
   };
 
   /**
-   * `<file>:<name>` for every MODULE-LEVEL declaration whose name collides with an export of this
+   * `<package>:<name>` for every MODULE-LEVEL declaration whose name collides with an export of this
    * module. Anchored at column zero: a block-scoped `const delay = stanza.getChild('delay', …)` is a
    * local binding that happens to share a word, not a second implementation of a shared helper.
    */
@@ -166,7 +175,8 @@ describe('no consumer re-implements an export of this package', () => {
       for (const m of code.matchAll(
         /^(?:export )?(?:async )?(?:function|const|class) (\w+)/gm,
       )) {
-        if (exported.has(m[1] as string)) out.push(`${path}:${m[1] as string}`);
+        if (exported.has(m[1] as string))
+          out.push(`${path.split('/')[0] as string}:${m[1] as string}`);
       }
     }
     return [...new Set(out)];
@@ -198,7 +208,7 @@ describe('no consumer re-implements an export of this package', () => {
     const named = [...(paragraph as string).matchAll(/`(bridge-[\w-]+)`/g)].map(
       (m) => m[1] as string,
     );
-    const recorded = new Set(Object.keys(KNOWN_FORKS).map((fork) => fork.split('/')[0] as string));
+    const recorded = new Set(Object.keys(KNOWN_FORKS).map((fork) => fork.split(':')[0] as string));
     expect(named).not.toEqual([]);
     expect(named.filter((pkg) => !recorded.has(pkg))).toEqual([]);
   });
