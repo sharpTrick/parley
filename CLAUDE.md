@@ -133,6 +133,32 @@ never as a comment, a doc paragraph, or defensive prose aimed at the next review
   to stand up throwaway instances; do not author production infra recipes (point READMEs at
   upstream canonical Docker setups — `DESIGN.md` §15).
 
+### Architectural tests: assert the invariant, not the layout
+
+A test that asserts **what the code does** is untouchable. A test that asserts **where the code
+lives** is not, and must be written so it cannot cement the structure it happens to observe.
+
+Prefer, always: a glob over `src/**` rather than one file path; the invariant a field protects
+rather than the field's type; an `import` of a symbol rather than a regex that finds it in a
+particular file; a behaviour reachable through the public surface rather than a private member
+reached through a cast.
+
+When one blocks a change, **re-anchor it by default.** Delete it only if you can NAME the test that
+already covers its invariant behaviourally and SHOW that test failing against the defect the
+deleted one protected against. *"It blocked my change"* is never a reason on its own.
+
+This is a standing rule because these assertions fail in ways that are individually invisible and
+collectively decisive. Eleven packages were decomposed under it, and every one hit at least one of
+six failure modes: a split **blocked**; a guard **hollowed out** — still green, now grading a file
+that no longer holds the code it was written about; a recorded security debt made **invisible**,
+because the registry keyed by file path and scanned only importing files; a **shape lock**, where a
+private field is asserted to be an `Array`; a lint with a **hole** (`export async function` escaping
+an export scan); and worst, a probe turned **tautology**, where a moved field made an assertion pass
+as `expect(undefined).toBeUndefined()`.
+
+Ten rounds of adversarial review added such assertions faster than anything removed them, and
+nothing in the process noticed until a decomposition round ran into all six at once.
+
 ---
 
 ## Working style for this autonomous run
