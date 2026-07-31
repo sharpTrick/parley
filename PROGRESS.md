@@ -6,8 +6,8 @@
 
 ## Status
 
-- **Phase (adversarial review — the Careening experiment):** rounds 1–8 complete and pushed on
-  `claude/next-steps-q1540r`. Full suite **9706 tests, 4 skipped, green**, against real Redis, NATS,
+- **Phase (adversarial review — the Careening experiment):** rounds 1–9 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **10968 tests, 4 skipped, green**, against real Redis, NATS,
   Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
 
   Findings per round (14 targets each, 0 errored every round):
@@ -22,6 +22,7 @@
   | 6 | 90 | 86 | 26 | 80% | 81% |
   | 7 | 79 | 75 | 23 | 66% | 57% |
   | 8 | 73 | 71 | 25 | 56% | 62% |
+  | 9 | 71 | 68 | 28 | 63% | 61% |
 
   Round 6 was the first round where every count fell at once — findings 129→90, CONFIRMED 117→86,
   blocking 39→26 — while self-induction rose to 80%, and I read that as the loop running out of
@@ -35,7 +36,26 @@
   60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
   measured, it was not saturation.
 
-  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706**.
+  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706 → 10968**.
+  Note the series stops being a clean proxy at round 9: telegram's count FELL 527 → 523 while its
+  coverage rose (per-field cells collapsed from one-case-per-breakage to one-case-per-field looping
+  its breakages — 4 fields to 9, 15 breakage cells to 37, each gaining a cold-restart post-condition).
+
+  **Round 9's dominant theme: the proposed remediation was itself defective, five times.** xmpp's
+  empty-page fix would have violated a frozen conformance clause the suite cannot currently exercise;
+  xmpp's `<delay>` guard was told to compare the room's BARE JID, which an occupant's full JID
+  satisfies, admitting exactly the forgery it was written to stop; redis's socket-leak finding
+  measured its own probe server (a paused readable never sees EOF — `s.resume()` and the leak is
+  zero); telegram's proposed lint would have PASSED on the saturating assertion that motivated it;
+  and slack's session-scope fix, written as specified, captures the NEW session because the first
+  fetch is what straddles the boundary. Critics are now reliable at finding defects and unreliable at
+  prescribing fixes — which is an argument for keeping remediation a separate reasoning pass rather
+  than folding it into review.
+
+  **Two agents subtracted rather than added.** nats reverted a defence-in-depth guard it had already
+  written when the mutation survived; core-engine withheld four barrel exports the finding asked it
+  to add, because an earlier round had deliberately trimmed them. Mutation discipline used to shrink
+  the diff, not just to justify it.
 
   **Round 8 changed the frozen seam for the first time**, on Patrick's adjudication. `seam.ts` said
   `blockMs` engages "only relative to a `since`"; core's long-poll wrapper, the `parley_fetch_recent`
