@@ -6,8 +6,8 @@
 
 ## Status
 
-- **Phase (adversarial review — the Careening experiment):** rounds 1–10 complete and pushed on
-  `claude/next-steps-q1540r`. Full suite **11836 tests, 4 skipped, green**, against real Redis, NATS,
+- **Phase (adversarial review — the Careening experiment):** rounds 1–11 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **12173 tests, 4 skipped, green**, against real Redis, NATS,
   Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
 
   Findings per round (14 targets each, 0 errored every round):
@@ -37,7 +37,31 @@
   60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
   measured, it was not saturation.
 
-  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706 → 10968 → 11836**.
+  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706 → 10968 → 11836 → 12173**.
+
+  **Round 11 was a DECOMPOSITION round, not a review round** — a deliberate regime boundary, on
+  Patrick's call after observing that source had doubled per backend while the file count had not.
+  Eleven targets, all net-negative on source, every suite passing UNMODIFIED. Biggest source file
+  **1499 → 1014**; packages carrying a >900-line file **9 of 10 → 2**; 24 files → 78.
+
+  **The finding is that our own ratchet had been cementing the monoliths, in five distinct ways:**
+  a split BLOCKED (postgres counts a regex over `src/index.ts`; slack requires every `api()` call
+  site in it; nats pins two prose strings into it); a guard SILENTLY HOLLOWED (matrix's negative
+  assertions still pass but now grade a file that no longer holds the code they were written
+  about); a debt made INVISIBLE (net-util's fork registry keyed by file path and scanned only
+  importing files, so a split could retire a recorded security debt with the suite green); a SHAPE
+  lock (redis's test asserts a private field is an Array, so the `ReaderPool` the scope asked for
+  failed 20 tests on shape, not behaviour); and a lint with a HOLE (zulip's export-surface regex
+  misses `export async function`, proven by a real export it failed to flag).
+
+  Ten rounds of ratcheting made the code harder to simplify, and nothing in the protocol noticed.
+  Re-anchoring those assertions from one path to a glob over `src/**` is the highest-value change
+  still available — and it touches TESTS, which the net-negative-on-source rule deliberately frees.
+
+  Honest caveat: margins were thin (xmpp −3, shared −5). A multi-file split costs 30–50 lines of
+  irreducible import ceremony, and the reductions came mostly from duplication the split REVEALED —
+  four copies of one `ws.close()`, two throttled reporters, one hazard comment stated three times —
+  not from the move itself.
 
   **Halfway reading (round 10).** Neither series has converged and neither is monotone.
   Pre-existing BLOCKING findings ran 36 → 25 → 20 → 11 → 5 through round 6, then RECOVERED to

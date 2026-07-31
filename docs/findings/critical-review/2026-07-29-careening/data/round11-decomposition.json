@@ -1,0 +1,85 @@
+{
+  "round": 11,
+  "kind": "decomposition",
+  "base": "ce23b00",
+  "targets": 11,
+  "errored": 0,
+  "rule": "net-negative on SOURCE lines; existing suite must pass UNMODIFIED",
+  "result": {
+    "allNetNegative": true,
+    "testFilesEdited": 0,
+    "testFilesAdded": 1,
+    "suiteBefore": 11836,
+    "suiteAfter": 12173,
+    "biggestFileBefore": 1499,
+    "biggestFileAfter": 1014,
+    "packagesOver900Before": 9,
+    "packagesOver900After": 2,
+    "totalSrcAfter": 14509,
+    "totalFilesAfter": 78
+  },
+  "perTarget": {
+    "bridge-matrix": {
+      "srcLoc": 1532,
+      "files": 9,
+      "biggest": 434
+    },
+    "bridge-xmpp": {
+      "srcLoc": 1543,
+      "files": 6,
+      "biggest": 1014
+    },
+    "bridge-zulip": {
+      "srcLoc": 1485,
+      "files": 5,
+      "biggest": 982
+    },
+    "bridge-discord": {
+      "srcLoc": 1405,
+      "files": 9,
+      "biggest": 498
+    },
+    "bridge-slack": {
+      "srcLoc": 1372,
+      "files": 7,
+      "biggest": 846
+    },
+    "bridge-nats": {
+      "srcLoc": 1291,
+      "files": 7,
+      "biggest": 746
+    },
+    "bridge-redis": {
+      "srcLoc": 961,
+      "files": 8,
+      "biggest": 342
+    },
+    "bridge-postgres": {
+      "srcLoc": 1309,
+      "files": 6,
+      "biggest": 792
+    },
+    "bridge-telegram": {
+      "srcLoc": 2046,
+      "files": 10,
+      "biggest": 742
+    },
+    "bridge-net-util": {
+      "srcLoc": 684,
+      "files": 7,
+      "biggest": 179
+    },
+    "conformance": {
+      "srcLoc": 881,
+      "files": 4,
+      "biggest": 634
+    }
+  },
+  "finding": "Path- and shape-coupled test assertions had been cementing the monoliths. Five distinct failure modes were found: (1) a split BLOCKED - postgres counts a regex over src/index.ts, slack requires every api() call site in it, nats pins prose into it; (2) a guard SILENTLY HOLLOWED - matrix's negative assertions on src/index.ts still pass but now grade a file that no longer contains the code they were written about; (3) a debt made INVISIBLE - net-util's fork registry keyed by file path and scanned only importing files, so a split could retire a recorded security debt with the suite green; (4) a shape lock - redis's test asserts a private field is an Array, so a ReaderPool failed 20 tests on shape not behaviour; (5) a lint with a hole - zulip's export-surface regex misses `export async function`, proven by a real export it failed to flag.",
+  "caveat": "Margins are thin (xmpp -3, shared -5) because a multi-file split costs 30-50 lines of irreducible import ceremony. The reductions came mostly from duplication the split REVEALED, not from the move.",
+  "agentsThatDiedBeforeReporting": {
+    "count": 1,
+    "target": "discord",
+    "note": "Work was complete, staged, typechecking and suite-green; verified and landed from the artifact alone. The unmodified-suite rule means behaviour preservation is established by the suite rather than by the agent's account, so the decomposition stayed reviewable. What was lost is the prose report - the defects found and left alone, and the structural constraints hit."
+  }
+}
