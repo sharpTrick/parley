@@ -6,8 +6,8 @@
 
 ## Status
 
-- **Phase (adversarial review — the Careening experiment):** rounds 1–9 complete and pushed on
-  `claude/next-steps-q1540r`. Full suite **10968 tests, 4 skipped, green**, against real Redis, NATS,
+- **Phase (adversarial review — the Careening experiment):** rounds 1–10 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **11836 tests, 4 skipped, green**, against real Redis, NATS,
   Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
 
   Findings per round (14 targets each, 0 errored every round):
@@ -23,6 +23,7 @@
   | 7 | 79 | 75 | 23 | 66% | 57% |
   | 8 | 73 | 71 | 25 | 56% | 62% |
   | 9 | 71 | 68 | 28 | 63% | 61% |
+  | 10 | 75 | 72 | 29 | 75% | 72% |
 
   Round 6 was the first round where every count fell at once — findings 129→90, CONFIRMED 117→86,
   blocking 39→26 — while self-induction rose to 80%, and I read that as the loop running out of
@@ -36,7 +37,32 @@
   60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
   measured, it was not saturation.
 
-  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706 → 10968**.
+  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706 → 10968 → 11836**.
+
+  **Halfway reading (round 10).** Neither series has converged and neither is monotone.
+  Pre-existing BLOCKING findings ran 36 → 25 → 20 → 11 → 5 through round 6, then RECOVERED to
+  10, 9, 11, 8 and have sat in that band for four rounds. This is a STEADY STATE, not the
+  two-regime decay ouroboros described: ten rounds in, on a codebase nine prior full-surface
+  sweeps have covered, the loop still finds 8–11 original blocking defects per round while about
+  two thirds of its blocking output is against its own prior work. Where saturation appears it is
+  package-local and shows up as MUTATION COST rather than finding count — core-auth needed 27
+  mutations in round 8 to establish it had no vacuous tests and 52 in round 9 to surface two.
+
+  **Round 10's theme: critics find well and prescribe badly, and the separation is what catches
+  it.** Five remediations in round 9 and five more here would have introduced or blessed a defect
+  if implemented as written. zulip was told to use `topic.trim()` — the wrong Unicode set in both
+  directions (JS `trim` excludes U+0085 and includes U+FEFF; pydantic's is the reverse). nats was
+  told to delete a clamp whose comment was wrong but whose code was load-bearing for a different
+  reason. slack's finding 2 would have returned a parked caller at the deadline in exactly the
+  case an existing test pins as returning on the loss. xmpp's test upgrade asked for a row a real
+  Prosody refutes — it strips the stanza the row would have injected. And a proposed comment lint
+  did not fire on the five instances it was written for.
+
+  **Three agents used mutation testing to SUBTRACT**, in three consecutive rounds: matrix built
+  the `noAuth` flag its finding specified, watched the mutation survive, and deleted it; slack
+  implemented a read floor, measured it working, could not state an invariant it satisfied that
+  the ladder did not, and reverted it; postgres implemented a listener clear, mutated it away
+  alone, saw every cell pass, and left it out.
   Note the series stops being a clean proxy at round 9: telegram's count FELL 527 → 523 while its
   coverage rose (per-field cells collapsed from one-case-per-breakage to one-case-per-field looping
   its breakages — 4 fields to 9, 15 breakage cells to 37, each gaining a cold-restart post-condition).
