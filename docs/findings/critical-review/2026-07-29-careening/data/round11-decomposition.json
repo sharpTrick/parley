@@ -75,11 +75,12 @@
       "biggest": 634
     }
   },
-  "finding": "Path- and shape-coupled test assertions had been cementing the monoliths. Five distinct failure modes were found: (1) a split BLOCKED - postgres counts a regex over src/index.ts, slack requires every api() call site in it, nats pins prose into it; (2) a guard SILENTLY HOLLOWED - matrix's negative assertions on src/index.ts still pass but now grade a file that no longer contains the code they were written about; (3) a debt made INVISIBLE - net-util's fork registry keyed by file path and scanned only importing files, so a split could retire a recorded security debt with the suite green; (4) a shape lock - redis's test asserts a private field is an Array, so a ReaderPool failed 20 tests on shape not behaviour; (5) a lint with a hole - zulip's export-surface regex misses `export async function`, proven by a real export it failed to flag.",
+  "finding": "Path- and shape-coupled test assertions had been cementing the monoliths. Five distinct failure modes were found: (1) a split BLOCKED - postgres counts a regex over src/index.ts, slack requires every api() call site in it, nats pins prose into it; (2) a guard SILENTLY HOLLOWED - matrix's negative assertions on src/index.ts still pass but now grade a file that no longer contains the code they were written about; (3) a debt made INVISIBLE - net-util's fork registry keyed by file path and scanned only importing files, so a split could retire a recorded security debt with the suite green; (4) a shape lock - redis's test asserts a private field is an Array, so a ReaderPool failed 20 tests on shape not behaviour; (5) a lint with a hole - zulip's export-surface regex misses `export async function`, proven by a real export it failed to flag. (6) a probe turned TAUTOLOGY - discord's suite reads three plugin-private fields by name; after the split two would fail outright but the third would have passed vacuously as expect(undefined).toBeUndefined(), so a decomposition can silently disarm a white-box test rather than break it.",
   "caveat": "Margins are thin (xmpp -3, shared -5) because a multi-file split costs 30-50 lines of irreducible import ceremony. The reductions came mostly from duplication the split REVEALED, not from the move.",
   "agentsThatDiedBeforeReporting": {
-    "count": 1,
-    "target": "discord",
-    "note": "Work was complete, staged, typechecking and suite-green; verified and landed from the artifact alone. The unmodified-suite rule means behaviour preservation is established by the suite rather than by the agent's account, so the decomposition stayed reviewable. What was lost is the prose report - the defects found and left alone, and the structural constraints hit."
-  }
+    "count": 0,
+    "correction": "An earlier commit message (refactor(discord)) states that the discord agent died before reporting. That is FALSE and is corrected here rather than left standing. The agent took 58 minutes and reported after its work had already been extracted and landed from the artifact. The landing was still sound - tsc clean, 771 tests passing unmodified - but the stated reason for landing it that way was wrong.",
+    "whatWasActuallyTrue": "Extraction from the artifact alone worked, and that remains the useful finding: the unmodified-suite rule establishes behaviour preservation without the agent's account. But it was exercised by impatience, not by an agent death."
+  },
+  "failureModes": {}
 }
