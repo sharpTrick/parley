@@ -6,7 +6,7 @@ import { MAX_BLOCK_MS, MAX_POST_TOPICS, parseConfig } from './config.js';
 import { matchGlob, MAX_GLOB_LEN } from './identity-filter.js';
 import { asTopic } from './message.js';
 import { isRedosSafeSource, MAX_AMBIGUITY, MAX_MATCH_INPUT } from './regex-safety.js';
-import { MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
+import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 
 // Every limit below is documented as INCLUSIVE — "at most 64 characters", "must be >= the
 // heartbeat", "an integer in [10, 40]" — and each is stated in an error message the operator reads.
@@ -247,12 +247,25 @@ const CAPACITIES: Capacity[] = [
     name: 'MIN_HASH_LEN',
     actual: MIN_HASH_LEN,
     expected: 10,
-    // The floor is also the DEFAULT, so grade the width safeName mints when `hashLen` is omitted —
-    // exactly, not `{10,}`, which leaves the security parameter free to move under a green suite.
+    realistic: 'a caller may ask for the floor explicitly, and gets exactly it',
+    accepts: () => {
+      const minted = safeName(asTopic('a b'), sanitizeAlias, { hashLen: MIN_HASH_LEN })
+        .split('-')
+        .pop()!;
+      return minted.length === MIN_HASH_LEN && /^[0-9a-f]+$/.test(minted);
+    },
+  },
+  {
+    name: 'DEFAULT_HASH_LEN',
+    actual: DEFAULT_HASH_LEN,
+    expected: 16,
+    // Grade the width safeName mints when `hashLen` is omitted — exactly, not `{16,}`, which would
+    // leave the security parameter free to move under a green suite. Every shipped backend omits it,
+    // so this is the width a deployment runs on, and changing it renames every channel.
     realistic: 'the suffix minted when hashLen is omitted is exactly this many hex digits',
     accepts: () => {
       const minted = safeName(asTopic('a b'), sanitizeAlias).split('-').pop()!;
-      return minted.length === MIN_HASH_LEN && /^[0-9a-f]+$/.test(minted);
+      return minted.length === DEFAULT_HASH_LEN && /^[0-9a-f]+$/.test(minted);
     },
   },
   {
@@ -269,7 +282,7 @@ describe('every documented capacity is pinned to a value, not only to itself', (
     const declared = CAPACITY_MODULES.flatMap((m) =>
       [
         ...readFileSync(fileURLToPath(new URL(m, import.meta.url)), 'utf8').matchAll(
-          /^export const ((?:MAX|MIN)_[A-Z0-9_]+)\b/gm,
+          /^export const ((?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)\b/gm,
         ),
       ].map((match) => match[1]!),
     );

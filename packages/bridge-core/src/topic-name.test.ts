@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
 import { asTopic } from './message.js';
-import { MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
+import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 
 // Representative copies of each backend's legal-charset fold (byte-for-byte the plugins' own
 // module-private regexes). safeName must make each of them injective; asserting against these
@@ -112,7 +112,7 @@ describe('safeName', () => {
 
   it('appends a lowercase-hex suffix only when the fold was lossy', () => {
     const out = safeName(asTopic('team.frontend'), sanitizeName);
-    expect(out).toMatch(new RegExp(`^team_frontend-[0-9a-f]{${MIN_HASH_LEN}}$`));
+    expect(out).toMatch(new RegExp(`^team_frontend-[0-9a-f]{${DEFAULT_HASH_LEN}}$`));
   });
 
   it('is deterministic and idempotent-safe (same raw topic → same name)', () => {
@@ -209,7 +209,7 @@ describe('safeName output is a fixed point of the fold it was given', () => {
   it('throws when the fold charset excludes the separator', () => {
     const noDash = (s: string): string => s.replace(/[- ]/g, '_');
     expect(() => safeName(asTopic('a b'), noDash)).toThrow(/Topics would collide/);
-    expect(safeName(asTopic('a b'), noDash, { sep: '_' })).toMatch(/^a_b_[0-9a-f]{10}$/);
+    expect(safeName(asTopic('a b'), noDash, { sep: '_' })).toMatch(/^a_b_[0-9a-f]{16}$/);
   });
 });
 
@@ -246,7 +246,7 @@ describe('safeName injectivity (generated, closed under its own output)', () => 
     const emptied = SEEDS.filter((s) => sanitizeDelete(s) === '');
     expect(emptied.length).toBeGreaterThanOrEqual(3);
     const minted = emptied.map((s) => safeName(asTopic(s), sanitizeDelete));
-    expect(minted.every((n) => n.length === 1 + MIN_HASH_LEN)).toBe(true);
+    expect(minted.every((n) => n.length === 1 + DEFAULT_HASH_LEN)).toBe(true);
     expect(new Set(minted).size).toBe(emptied.length);
   });
 
@@ -281,22 +281,31 @@ describe('safeName injectivity (generated, closed under its own output)', () => 
 // A minted name is not an internal value: it becomes the Matrix room alias, the NATS stream and the
 // XMPP MUC an operator's history already lives in. Changing the digest, its truncation or the suffix
 // layout renames every existing channel — a silent data loss no shape assertion can see, because
-// `/^team_frontend-[0-9a-f]{10}$/` matches the old name and the new one alike. So pin the VALUE, in
+// `/^team_frontend-[0-9a-f]{16}$/` matches the old name and the new one alike. So pin the VALUE, in
 // the package that owns the function, one vector per fold and one per branch.
 describe('safeName is pinned to the exact names backends already carry', () => {
   const GOLDEN: [string, (s: string) => string, string, { hashLen?: number; sep?: string }, string][] =
     [
-      ['NATS subject', sanitizeToken, 'team.frontend', {}, 'team_frontend-08edf065f7'],
+      ['NATS subject', sanitizeToken, 'team.frontend', {}, 'team_frontend-08edf065f713aae7'],
       ['NATS subject', sanitizeToken, 'ctx-payments', {}, 'ctx-payments'],
-      ['NATS stream', sanitizeName, 'team/frontend', {}, 'team_frontend-222ee3741b'],
-      ['Matrix alias', sanitizeAlias, 'a b', {}, 'a_b-7dbde93504'],
-      ['Matrix alias', sanitizeAlias, 'a/b', {}, 'a_b-3ec69c85a4'],
+      ['NATS stream', sanitizeName, 'team/frontend', {}, 'team_frontend-222ee3741b0781e7'],
+      ['Matrix alias', sanitizeAlias, 'a b', {}, 'a_b-7dbde93504122a70'],
+      ['Matrix alias', sanitizeAlias, 'a/b', {}, 'a_b-3ec69c85a4ff9683'],
       ['Matrix alias', sanitizeAlias, 't-1-abcd', {}, 't-1-abcd'],
-      ['Matrix alias', sanitizeAlias, 'a-0123456789', {}, 'a-0123456789-3ad74c5e61'],
-      ['XMPP localpart', sanitizeLocal, 'Ops', {}, 'ops-907a54c2b2'],
+      // A 10-hex tail is no longer a shape safeName can mint, so it is NOT already-disambiguated
+      // and passes through; a 16-hex tail is, and gets disambiguated so a caller cannot name it.
+      ['Matrix alias', sanitizeAlias, 'a-0123456789', {}, 'a-0123456789'],
+      [
+        'Matrix alias',
+        sanitizeAlias,
+        'a-0123456789abcdef',
+        {},
+        'a-0123456789abcdef-93c694cfb27491be',
+      ],
+      ['XMPP localpart', sanitizeLocal, 'Ops', {}, 'ops-907a54c2b2789a37'],
       ['XMPP localpart', sanitizeLocal, DEFAULT_PRESENCE_TOPIC, {}, 'parley-presence'],
-      ['deleting fold', sanitizeDelete, '!!!', {}, '-9a7b006d20'],
-      ['lowercasing deleting fold', sanitizeLowerDelete, 'Ops!', {}, 'ops-c2acb669c8'],
+      ['deleting fold', sanitizeDelete, '!!!', {}, '-9a7b006d203b362c'],
+      ['lowercasing deleting fold', sanitizeLowerDelete, 'Ops!', {}, 'ops-c2acb669c886c412'],
       ['Matrix alias', sanitizeAlias, 'a b', { hashLen: 16, sep: '.' }, 'a_b.7dbde93504122a70'],
       [
         'Matrix alias',

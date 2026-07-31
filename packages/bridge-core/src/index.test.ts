@@ -38,6 +38,7 @@ describe('public barrel surface', () => {
     'asCursor',
     'safeName',
     'MIN_HASH_LEN',
+    'DEFAULT_HASH_LEN',
     'MAX_HASH_LEN',
     'MAX_BLOCK_MS',
     'NoSuchTopicError',
