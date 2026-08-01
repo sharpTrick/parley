@@ -41,9 +41,15 @@ if [ "$branch" != "HEAD" ] && git remote get-url origin >/dev/null 2>&1; then
       # Tracked modifications only: `git reset --hard` never removes untracked files, so counting
       # them here would refuse the recovery over a stray build artifact that is not at risk.
       if [ -z "$(git status --porcelain --untracked-files=no)" ]; then
-        git reset --hard "$remote_head" >/dev/null 2>&1 &&
-          say "  working tree was clean; reset to ${remote_head:0:7}. Nothing lost." ||
+        if git reset --hard "$remote_head" >/dev/null 2>&1; then
+          # dist/ is gitignored, so the reset does not touch it and `tsc -b` never deletes an
+          # output its config stopped emitting. Keep this drop, so that a rollback cannot leave
+          # stale compiled artifacts that the packaging guard then reports as shipped test code.
+          rm -rf packages/*/dist
+          say "  working tree was clean; reset to ${remote_head:0:7} and dropped stale dist/. Nothing lost."
+        else
           say "  RESET FAILED — do not trust this tree; recover manually."
+        fi
       else
         # Keep the reset OFF the dirty path, so that a rollback recovery can never be the thing
         # that discards real uncommitted work.
