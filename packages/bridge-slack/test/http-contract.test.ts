@@ -308,9 +308,16 @@ const PAGERS: Pager[] = [
   },
 ];
 
+/**
+ * The `ts` suffix this server counts DOWN from. Keep the whole walk descending, like
+ * `conversations.history`, so that these rows reach the termination guard they are about instead of
+ * being answered by the ordering guard on page one.
+ */
+const PAGING_TS_START = 999_999;
+
 function pagingServer(pager: Pager, onHit?: (hit: number) => void): Server {
   let hit = 0;
-  let minted = 0;
+  let minted = PAGING_TS_START;
   return createServer((req, res) => {
     void (async () => {
       const arrived = new URLSearchParams(await readBody(req)).get('cursor') ?? undefined;
@@ -318,8 +325,8 @@ function pagingServer(pager: Pager, onHit?: (hit: number) => void): Server {
       onHit?.(hit);
       const messages = Array.from({ length: pager.messagesPerPage }, () => ({
         type: 'message',
-        ts: `1700000000.${String(++minted).padStart(6, '0')}`,
-        text: `m${minted}`,
+        ts: `1700000000.${String(minted).padStart(6, '0')}`,
+        text: `m${minted--}`,
         user: 'U0X',
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });

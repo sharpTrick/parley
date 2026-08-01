@@ -45,6 +45,29 @@ interface StoredMessage {
 export type GreetMode = 'greet' | 'pre-hello-close' | 'silent';
 
 /**
+ * How `conversations.history` orders what it serves. `newest-first` is what Slack documents and what
+ * every other fixture here runs on; the rest are a vendor that broke that contract — a reversed
+ * walk, a reversed page, an unordered page — which the plugin must refuse rather than answer from.
+ */
+export type HistoryOrder = 'newest-first' | 'oldest-first' | 'page-reversed' | 'shuffled';
+
+/**
+ * A deterministic permutation of `page` that is not sorted by `ts` — seeded off the page's own first
+ * `ts` so a failing row replays exactly. Keep it deterministic, so that an ordering the plugin
+ * accepts wrongly cannot pass on one run and fail on the next.
+ */
+const shuffleDeterministically = <T>(page: T[], seed: number): T[] => {
+  const out = [...page];
+  let state = seed || 1;
+  for (let i = out.length - 1; i > 0; i--) {
+    state = (state * 1103515245 + 12345) % 2147483648;
+    const j = state % (i + 1);
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+};
+
+/**
  * A plain thread reply is invisible to `conversations.history` on real Slack while its `message`
  * event still arrives on the channel stream. Keep this rule HERE and in the plugin's classifier
  * only, so both delivery paths are graded against one statement of it.
@@ -137,6 +160,7 @@ export class FakeSlack {
   /** method → requests that arrived with NO `Authorization` header (answered `not_authed`). */
   readonly unauthenticated = new Map<string, number>();
   private greet: GreetMode = 'greet';
+  private historyOrder: HistoryOrder = 'newest-first';
   /** The URL `apps.connections.open` hands out — see {@link setWsUrl}. */
   private handedOutWsUrl?: string;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
@@ -204,6 +228,11 @@ export class FakeSlack {
   /** How new Socket Mode connections behave — see {@link GreetMode}. */
   setGreet(mode: GreetMode): void {
     this.greet = mode;
+  }
+
+  /** How `conversations.history` orders what it serves — see {@link HistoryOrder}. */
+  setHistoryOrder(order: HistoryOrder): void {
+    this.historyOrder = order;
   }
 
   /**
@@ -544,9 +573,14 @@ export class FakeSlack {
       );
     }
     msgs.sort((a, b) => compareTs(orderOf(b), orderOf(a))); // NEWEST first, like Slack
+    if (this.historyOrder === 'oldest-first') msgs.reverse();
     const offset = typeof body.cursor === 'string' ? Number(body.cursor) : 0;
     const size = this.pageLength(body);
-    const page = msgs.slice(offset, offset + size);
+    let page = msgs.slice(offset, offset + size);
+    if (this.historyOrder === 'page-reversed') page = [...page].reverse();
+    if (this.historyOrder === 'shuffled') {
+      page = shuffleDeterministically(page, Number(String(page[0]?.ts ?? '1').split('.')[1] ?? 1));
+    }
     const hasMore = offset + size < msgs.length;
     return {
       ok: true,

@@ -52,6 +52,7 @@ export class SlackHistory {
     // filters to nothing — an empty page whose `nextCursor` is `since` livelocks the caller.
     const collected: SlackMessage[] = [];
     let newestSeenTs: string | undefined;
+    let previousTs: string | undefined;
     let pageCursor: string | undefined;
     const walked = new Set<string>();
     let pages = 0;
@@ -67,6 +68,17 @@ export class SlackHistory {
       }
       const page = (resp.messages as unknown[]).filter(hasUsableTs);
       for (const m of page) {
+        // Keep this a THROW rather than a re-sort, so that a walk which cannot trust position as age
+        // refuses instead of answering: the early break and the O(limit) trim below both DISCARD on
+        // position, so a mis-ordered walk publishes a `nextCursor` above history it never surfaced —
+        // and that span sits below the cursor, where no later catch-up returns for it.
+        if (previousTs !== undefined && compareTs(m.ts, previousTs) > 0) {
+          throw new SlackShapeError(
+            'conversations.history',
+            `returned ${m.ts} after ${previousTs}; entries are not newest-first`,
+          );
+        }
+        previousTs = m.ts;
         if (newestSeenTs === undefined || compareTs(m.ts, newestSeenTs) > 0) newestSeenTs = m.ts;
       }
       collected.push(...page.filter(isPlainMessage));
@@ -76,8 +88,9 @@ export class SlackHistory {
         if (collected.length >= limit) break;
       } else {
         // Keep the resume-after-`since` walk running to cursor exhaustion, so that `nextCursor` can
-        // never come to rest above unfetched older history. Pages arrive newest-first, so retaining
-        // only the oldest ~`limit + page_size` keeps memory at O(limit) while the walk runs.
+        // never come to rest above unfetched older history. Entries arrive newest-first — CHECKED
+        // above, not assumed — so retaining only the oldest ~`limit + page_size` keeps memory at
+        // O(limit) while the walk runs.
         const retain = limit + HISTORY_PAGE_LIMIT;
         if (collected.length > retain) collected.splice(0, collected.length - retain);
       }
