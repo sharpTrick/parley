@@ -32,6 +32,10 @@ export { REJOIN_MAX_WAIT_MS } from './rooms.js';
 
 const POST_TIMEOUT_MS = 15_000;
 
+const SUPERSEDED_BY_DISCONNECT =
+  'parley-xmpp: disconnect() was called while this connect() was still bringing the stream up, so ' +
+  'the stream was stopped and this plugin is NOT connected — call connect() again if you want one.';
+
 /**
  * XMPP MUC backend (DESIGN §6/§9). A topic maps to a MUC room; the per-message XEP-0359 stanza-id
  * (== XEP-0313 MAM archive id) is a stable, server-assigned, per-room-monotonic value used as BOTH
@@ -45,10 +49,10 @@ const POST_TIMEOUT_MS = 15_000;
  */
 export class XmppPlugin extends XmppInbound implements BackendPlugin {
   async connect(config: BackendConfig): Promise<void> {
-    if (this.xmpp !== undefined) {
+    if (this.xmpp !== undefined || this.starting !== undefined) {
       throw new Error(
-        'parley-xmpp: already connected — call disconnect() before connect() again. Taking the ' +
-          'second client would abandon the first, which goes on redialling with ' +
+        'parley-xmpp: already connected (or still connecting) — call disconnect() before connect() ' +
+          'again. Taking the second client would abandon the first, which goes on redialling with ' +
           'backend_config.password while its stanza handlers still drive this plugin.',
       );
     }
@@ -89,12 +93,19 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
     // `@xmpp/reconnect` is listening from the moment the client is constructed, so keep the stop on
     // the failure path: a client this call abandons goes on redialling — re-presenting `password`
     // to a server the caller believes it never reached — with nothing left holding a handle on it.
+    // Keep the client published in `starting` BEFORE the await, and keep the check that it is still
+    // this call's after it, so that a disconnect() landing inside this window has something to stop
+    // and cannot be overtaken by a connect() that adopts a stream it already tore down.
+    this.starting = xmpp;
     try {
       await xmpp.start();
+      if (this.starting !== xmpp) throw new Error(SUPERSEDED_BY_DISCONNECT);
     } catch (err) {
+      if (this.starting === xmpp) this.starting = undefined;
       await xmpp.stop().catch(() => undefined);
       throw err;
     }
+    this.starting = undefined;
     this.xmpp = xmpp;
   }
 
@@ -114,10 +125,12 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
     for (const state of this.rejoins.values()) clearTimeout(state.timer);
     this.rejoins.clear();
     this.mamCheck = undefined;
-    if (this.xmpp !== undefined) {
-      await this.xmpp.stop().catch(() => undefined);
-      this.xmpp = undefined;
-    }
+    // Drop the fields BEFORE awaiting the stop, so that a connect() still bringing `starting` up
+    // resumes to find it taken and stops its own client instead of adopting one this call ended.
+    const live = this.xmpp ?? this.starting;
+    this.xmpp = undefined;
+    this.starting = undefined;
+    if (live !== undefined) await live.stop().catch(() => undefined);
   }
 
   /**

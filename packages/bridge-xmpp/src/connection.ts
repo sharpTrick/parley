@@ -13,6 +13,13 @@ export const rand = (): string => randomBytes(8).toString('hex');
 
 export class XmppConnection {
   protected xmpp?: wire.XmppClient;
+  /**
+   * The client a `connect()` is bringing up but has not adopted yet. It is live from construction
+   * (`@xmpp/reconnect` dials on its own), so it is published here rather than left on `connect`'s
+   * stack: this is the ONLY handle a `disconnect()` racing that call has on the stream it must stop,
+   * and clearing it is how that `disconnect()` tells the racing `connect()` it lost.
+   */
+  protected starting?: wire.XmppClient;
   protected mucService = 'muc.parley.local';
   protected handle = 'parley';
   protected nick = `parley-${rand()}`;

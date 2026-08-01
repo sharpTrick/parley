@@ -221,6 +221,12 @@ export class FakeXmpp {
   /** When set, `start()` rejects with it: a stream that never came up (refused socket, bad SASL). */
   startError?: string;
   /**
+   * When set, `start()` waits on it before settling: a stream still COMING UP, which is the window
+   * another lifecycle call interleaves with. A `stop()` landing inside it is recorded and the stream
+   * still comes up — the arm in which an abandoned client is live rather than merely redialling.
+   */
+  startGate?: Promise<void>;
+  /**
    * How many times this client was stopped. `@xmpp/reconnect` listens from construction, so a
    * client the plugin abandons without stopping goes on redialling and delivering stanzas — this
    * counter and {@link feed}'s stopped check are what make such an orphan observable at all.
@@ -264,6 +270,7 @@ export class FakeXmpp {
     for (const cb of this.handlers[event] ?? []) cb(arg);
   }
   async start(): Promise<void> {
+    if (this.startGate !== undefined) await this.startGate;
     if (this.startError !== undefined) throw new Error(this.startError);
     this.streamStopped = false;
   }
