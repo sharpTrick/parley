@@ -144,9 +144,12 @@ describe('telegram getUpdates error handling', () => {
   });
 
   /**
-   * The throttle is per failure CLASS. A dropped or refused record is permanent message loss —
-   * the update is acknowledged to Telegram before the store sees it — so an unrelated failure
-   * chattering in the same minute must not be able to swallow its only diagnostic.
+   * The throttle is per failure CLASS, and these two classes are fixed by different operator
+   * actions: a record the store REFUSED is permanent loss on the one backend with no history
+   * endpoint, while a write that failed is held back unacknowledged and clears when the disk does.
+   * An unrelated failure chattering in the same minute must not be able to swallow either
+   * diagnostic — the refusal's, because it is the only notice of a lost message, and the hold's,
+   * because it is the only notice that ingestion has stopped making progress.
    */
   it('throttles each failure kind independently', async () => {
     const fake = await startFake();
@@ -163,7 +166,7 @@ describe('telegram getUpdates error handling', () => {
       throw new Error('ENOSPC: no space left on device');
     });
     fake.injectUserMessage('-1009400001', 'alice', 'boom');
-    await vi.waitFor(() => expect(stderr.join('')).toMatch(/dropped update/), {
+    await vi.waitFor(() => expect(stderr.join('')).toMatch(/holding update/), {
       timeout: 5000,
       interval: 20,
     });

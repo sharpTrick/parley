@@ -1,4 +1,5 @@
-import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   asHandle,
   asTopic,
@@ -14,6 +15,16 @@ const SENDER = asHandle('me');
 
 /** The store's bookkeeping lines (identity, served marks, dedup memory) — never records. */
 const isHeader = (line: string): boolean => line.startsWith('#');
+
+/**
+ * Everything the store keeps BESIDE its file, found by name rather than listed. A fixture that has
+ * to stand for state an older version wrote must drop whatever this one keeps out of the file, and
+ * a list would go on describing an older shape of that state while silently standing for nothing.
+ */
+const siblingsOf = (path: string): string[] =>
+  readdirSync(dirname(path))
+    .filter((f) => f.startsWith(`${basename(path)}.`))
+    .map((f) => join(dirname(path), f));
 
 /**
  * The cursor is a sequence this PLUGIN generates, so its meaning is only as durable as the store
@@ -42,6 +53,18 @@ describe('telegram cursor across the store lifecycle', () => {
     const records = lines.filter((l) => !isHeader(l));
     rewriteWith(path, [...lines.filter(isHeader), ...records.slice(0, Math.max(0, records.length - k))]);
   };
+  /**
+   * Cut the file `k` LINES from the end — a copy of it restored from an earlier one, which is what
+   * every ordinary backup, snapshot or rsync of a live store file produces. Swept over every k
+   * rather than over named cut points, so that a cut landing between a record and the watermark
+   * naming it, ON a record boundary, or several records back, are all rows: only the first of those
+   * leaves anything IN the file that disagrees with itself, and a table that hand-picked cut points
+   * had rows only for that one.
+   */
+  const rollBackTail = (path: string, k: number): void => {
+    const lines = linesOf(path);
+    rewriteWith(path, lines.slice(0, Math.max(0, lines.length - k)));
+  };
 
   const DAMAGE = [
     {
@@ -53,6 +76,12 @@ describe('telegram cursor across the store lifecycle', () => {
     ...[1, 2, 3].map((k) => ({
       name: `a store file missing its last ${k} record line(s) invalidates the cursor loudly`,
       damage: (path: string) => dropRecords(path, k),
+      outcome: 'throws' as const,
+      why: /issued by a different observed-message store/,
+    })),
+    ...[1, 2, 3, 4, 5].map((k) => ({
+      name: `a store file rolled back to a copy ${k} line(s) shorter invalidates the cursor loudly`,
+      damage: (path: string) => rollBackTail(path, k),
       outcome: 'throws' as const,
       why: /issued by a different observed-message store/,
     })),
@@ -190,11 +219,13 @@ describe('telegram cursor across the store lifecycle', () => {
     expect(seqOf(cursor)).toBe(3);
 
     await rig.plugin.disconnect();
-    // The pre-watermark on-disk format: identity and records, nothing that states a high-water.
+    // The pre-watermark on-disk state: identity and records, and nothing anywhere — in the file or
+    // beside it — that states a high-water.
     const lines = readFileSync(rig.storePath, 'utf8').trimEnd().split('\n');
     const legacy = lines.filter((l) => !l.startsWith('#seq'));
     const kept = [...legacy.filter(isHeader), ...legacy.filter((l) => !isHeader(l)).slice(0, 2)];
     writeFileSync(rig.storePath, `${kept.join('\n')}\n`);
+    for (const sibling of siblingsOf(rig.storePath)) unlinkSync(sibling);
 
     const restarted = await rig.restart();
     await expect(restarted.fetchRecent({ topic, since: cursor })).rejects.toThrow(

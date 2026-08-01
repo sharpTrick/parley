@@ -17,13 +17,18 @@ const MIN_IDLE_POLL_MS = 250;
  * that replay harmless and doubles as offline catch-up. Accepts BOTH `update.message`
  * (groups/DMs) and `update.channel_post` (channels). Runs until `isCurrent()` goes false — the
  * connection it was started for was torn down — or a status arrives that retrying cannot heal.
+ *
+ * `deliver` answers whether the update was taken durably, or refused for a reason that can never
+ * clear. Anything else — a `false`, or a throw out of the store write — ends the batch with
+ * `offset` still BELOW that update, so Telegram redelivers it: the retained backlog is the only
+ * redelivery this backend has, and the store is the only history it can ever produce.
  */
 export async function pollUpdates(opts: {
   api: BotApi;
   timeoutS: number;
   diagnostics: Diagnostics;
   isCurrent: () => boolean;
-  deliver: (chatId: string, msg: TgMessage) => void;
+  deliver: (chatId: string, msg: TgMessage) => boolean;
 }): Promise<void> {
   const { api, timeoutS, diagnostics, isCurrent, deliver } = opts;
   let offset = 0;
@@ -63,6 +68,35 @@ export async function pollUpdates(opts: {
     if (!isCurrent()) break;
     const ackedBefore = offset;
     for (const u of updates) {
+      const msg = u?.message ?? u?.channel_post;
+      const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
+      let carried: { chatId: string; message: TgMessage } | undefined;
+      if (msg !== undefined) {
+        try {
+          const message = requireMessage(label, msg);
+          carried = { chatId: canonicalChatKey(label, message.chat.id), message };
+        } catch (err) {
+          // An update this bridge can never READ is dropped and acknowledged: holding one back
+          // would stall the loop forever on a batch nothing downstream can ever be given.
+          diagnostics.report(`dropped update ${u.update_id}: ${describe(err)}`, 'ingest');
+        }
+      }
+      if (carried !== undefined) {
+        let held: string | undefined;
+        try {
+          if (!deliver(carried.chatId, carried.message)) {
+            held = 'the observed-message store has no append descriptor';
+          }
+        } catch (err) {
+          held = describe(err);
+        }
+        if (held !== undefined) {
+          // Keep the loop alive across a failing store write (ENOSPC/EIO) AND keep the update
+          // unacknowledged, so that Telegram serves it again once the store can take it.
+          diagnostics.report(`holding update ${u.update_id} unacknowledged: ${held}`, 'ingest-hold');
+          break;
+        }
+      }
       // Acknowledge only an update stating an id in the domain this arithmetic is defined on.
       // `Math.max(offset, NaN)` is NaN, which is below nothing, so one id-less update from a
       // non-conforming upstream would poison the offset for the life of the loop and re-serve
@@ -70,17 +104,6 @@ export async function pollUpdates(opts: {
       // way, acknowledging updates that never arrived and going deaf to every later one.
       if (typeof u?.update_id === 'number' && Number.isSafeInteger(u.update_id)) {
         offset = Math.max(offset, u.update_id + 1);
-      }
-      const msg = u?.message ?? u?.channel_post;
-      if (msg === undefined) continue; // an update kind we don't carry (edits, reactions, …)
-      const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
-      try {
-        const message = requireMessage(label, msg);
-        deliver(canonicalChatKey(label, message.chat.id), message);
-      } catch (err) {
-        // Keep the loop alive across a failing store write (ENOSPC/EIO): losing one message is
-        // recoverable, losing the only getUpdates consumer takes live push down for good.
-        diagnostics.report(`dropped update ${u.update_id}: ${describe(err)}`, 'ingest');
       }
     }
     // Keep a floor under an iteration that made NO PROGRESS, so that an upstream ignoring

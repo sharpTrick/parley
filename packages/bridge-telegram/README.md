@@ -100,13 +100,16 @@ everything delivered by `getUpdates`. Consequences:
   `store_path` defaults to an **absolute** path under the same state directory rather than to the
   working directory the MCP client happened to pick.
   A file **partially** rolled back — same identity, records missing — is caught the same way: the
-  store writes its sequence high-water into the file alongside the records, so a load that finds
-  fewer records than the file says it observed (or any line it cannot read) mints a **fresh**
-  identity and says so on stderr, rather than re-issuing sequences it has already handed out. The
-  residual: a store file written before that watermark existed carries no claim about what it once
-  held, so a truncated one is caught only while its sequence has not yet climbed back past the
-  cursor you hold ("ahead of every message this store has observed"). Restore a store file whole,
-  or not at all.
+  store writes its sequence high-water into the file alongside the records **and into a
+  `<store_path>.hw` sibling**, so a load that finds fewer records than either of them says it
+  observed (or any line it cannot read) mints a **fresh** identity and says so on stderr, rather
+  than re-issuing sequences it has already handed out. The sibling is what catches a tail rolled
+  back to an earlier copy of the file — an ordinary backup, snapshot or `rsync` restore — where the
+  newest records and the watermark lines naming them go away *together*, leaving a file whose every
+  claim about itself agrees. The residual: a store file written before those watermarks existed, or
+  one restored together with its sibling, carries no claim about what it once held, so a truncated
+  one is caught only while its sequence has not yet climbed back past the cursor you hold ("ahead of
+  every message this store has observed"). Restore a store file whole, or not at all.
 - Within the observed window the seam contract holds fully: stable ids, monotonic exclusive
   cursors, dedup across `getUpdates` backlog replays, cold-restart replay.
 
@@ -169,7 +172,9 @@ point several Telegram bridges at the same bot token**:
   other's — with no Bot API endpoint that could ever rebuild what it discarded. `store_path`
   defaults to ONE fixed path, so a second bridge on this host (a second bot for a second session)
   needs its own `store_path` in `backend_config`. A claim naming a process that is gone is a
-  crashed bridge's leftover and is replaced automatically.
+  crashed bridge's leftover and is replaced automatically — under a `<store_path>.lock.break`
+  sibling held for the length of the take-over, so that two bridges starting at once on the same
+  leftover cannot each clear the other's fresh claim and both end up holding the file.
 
 This is why the conformance suite's multi-process-writes case is deliberately **skipped** for
 this backend (`concurrentPost` is not provided — the scenario is structurally

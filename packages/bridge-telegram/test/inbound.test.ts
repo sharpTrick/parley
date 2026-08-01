@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { ObservedStore } from '../src/store.js';
+import { type ObservedRecord, ObservedStore, type StoredRecord } from '../src/store.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
 import { captureStderr, registerCleanup, type Rig, seqOf, startRig } from './rig.js';
 
@@ -645,18 +645,33 @@ describe('telegram poll-loop fault isolation', () => {
  * Each cell fails one step on one ingest path and grades the invariant in BOTH directions: a record
  * `fetchRecent` can see also reached every subscriber and woke every waiter, or it is absent
  * everywhere and the caller was told so.
+ *
+ * Whether the record ends up present is NOT the same question as whether the failing step ran after
+ * it was durable, so the two are separate axes here. An inbound update whose write failed is not
+ * acknowledged to Telegram, so the retained backlog serves it again and the record arrives late; an
+ * own post has no redelivery at all — `sendMessage` is the only time this bridge ever sees it — so
+ * the same failure is permanent and the caller is told. A table that folded the two would grade
+ * "absent everywhere" as the right answer for an update that is merely in flight.
  */
 describe('telegram store visibility and delivery', () => {
   const FAILING_STEPS = [
-    { name: 'the record write', durable: false },
-    { name: 'the compaction after the write', durable: true },
+    { name: 'the record write', persists: false },
+    { name: 'the compaction after the write', persists: true },
   ];
-  const INGEST_PATHS = ['an inbound update', 'an own post'] as const;
+  const INGEST_PATHS = [
+    { name: 'an inbound update', redelivers: true },
+    { name: 'an own post', redelivers: false },
+  ];
   const AGREEMENT_CELLS = FAILING_STEPS.flatMap((step) =>
-    INGEST_PATHS.map((path) => ({ ...step, path })),
+    INGEST_PATHS.map(({ name, redelivers }) => ({
+      step: step.name,
+      persists: step.persists,
+      path: name,
+      durable: step.persists || redelivers,
+    })),
   );
 
-  it.each(AGREEMENT_CELLS)('never disagree when $name fails on $path', async ({ durable, path }) => {
+  it.each(AGREEMENT_CELLS)('never disagree when $step fails on $path', async ({ durable, persists, path }) => {
     const stderr = captureStderr();
     // Newest-1, so the very next append evicts and arms the amortized rewrite.
     const rig = await startRig({ observed_retention_per_chat: 1 });
@@ -668,7 +683,7 @@ describe('telegram store visibility and delivery', () => {
     await rig.plugin.subscribe(topic, (m) => live.push(m));
     const parked = rig.plugin.fetchRecent({ topic, since: tail, blockMs: 1500 });
 
-    if (durable) {
+    if (persists) {
       // A directory at the temp path: every compaction fails, and none of them can touch a record.
       mkdirSync(`${rig.storePath}.tmp`);
     } else {
@@ -686,19 +701,20 @@ describe('telegram store visibility and delivery', () => {
     } else {
       rig.fake.injectUserMessage(chat, 'alice', 'subject');
     }
+    // Settle on the OUTCOME — visible, or the caller told it did not land — never on a diagnostic
+    // naming an intermediate decision: an update the loop is holding back for redelivery is still
+    // in flight, and a wait that stopped there would grade the in-flight state as the final one.
     await vi.waitFor(
       async () =>
         expect(
-          (await contentsOf(rig.plugin, topic)).includes('subject') ||
-            /dropped update/.test(stderr.join('')) ||
-            postError !== undefined,
+          (await contentsOf(rig.plugin, topic)).includes('subject') || postError !== undefined,
         ).toBe(true),
       { timeout: 5000, interval: 20 },
     );
 
     // The step under test really failed — a cell whose obstruction never bit would grade nothing.
     const reported = `${stderr.join('')}${postError?.message ?? ''}`;
-    expect(reported).toMatch(durable ? /could not compact/ : /ENOSPC/);
+    expect(reported).toMatch(persists ? /could not compact/ : /ENOSPC/);
     const woke = (await parked).messages.map((m) => m.content).includes('subject');
     expect({
       visible: (await contentsOf(rig.plugin, topic)).includes('subject'),
@@ -708,6 +724,101 @@ describe('telegram store visibility and delivery', () => {
     // A post whose record never landed is never a resolved post.
     if (path === 'an own post') expect(postError === undefined).toBe(durable);
   }, 20_000);
+});
+
+/**
+ * `offset` is an ACKNOWLEDGEMENT: Telegram deletes every update below it, and the ~24h retained
+ * backlog is the only redelivery this backend has — on the one backend whose observed store is the
+ * only history it can ever produce, with no endpoint that could backfill what the offset walked
+ * past. So the acknowledgement must not outrun durability: it may never move past an update the
+ * store did not take for a reason that can still clear, and it MUST move past one refused for a
+ * reason that cannot, or ingestion wedges on a batch nothing downstream can ever be given.
+ *
+ * The row is the obstruction and how long it lasts, and each is graded on both halves at once —
+ * closing either alone produces the other's bug. Grading only that an obstructed message is absent
+ * everywhere is exactly what let a lost one look correct.
+ */
+describe('telegram ingest obstruction and redelivery', () => {
+  const OBSTRUCTIONS = [
+    {
+      name: 'a store write that throws',
+      clears: true,
+      refuse: (): StoredRecord | undefined => {
+        throw new Error('ENOSPC: no space left on device');
+      },
+    },
+    {
+      name: 'a store with no append descriptor',
+      clears: true,
+      open: false,
+      refuse: (): StoredRecord | undefined => undefined,
+    },
+    {
+      name: 'a chat cap that refuses the record',
+      clears: false,
+      open: true,
+      refuse: (): StoredRecord | undefined => undefined,
+    },
+  ];
+  const RUNS = [
+    { run: 'one attempt', attempts: 1 },
+    { run: 'a run of attempts', attempts: 3 },
+  ];
+  const CELLS = OBSTRUCTIONS.flatMap((o) => RUNS.map((r) => ({ ...o, ...r })));
+
+  it.each(CELLS)('acknowledges nothing past $name lasting $run', async ({ clears, open, refuse, attempts }) => {
+    captureStderr();
+    const rig = await startRig();
+    const chat = '-1006500001';
+    const topic = asTopic(chat);
+    const live: Message[] = [];
+    await rig.plugin.subscribe(topic, (m) => live.push(m));
+
+    const realAppend = ObservedStore.prototype.append;
+    let attempted = 0;
+    let obstructed = true;
+    vi.spyOn(ObservedStore.prototype, 'isOpen').mockImplementation(function (this: ObservedStore) {
+      return !obstructed || open !== false;
+    });
+    vi.spyOn(ObservedStore.prototype, 'append').mockImplementation(function (
+      this: ObservedStore,
+      observed: ObservedRecord,
+    ) {
+      if (!obstructed || observed.content !== 'subject') return realAppend.call(this, observed);
+      attempted++;
+      return refuse();
+    });
+
+    rig.fake.injectUserMessage(chat, 'alice', 'subject');
+    if (clears) {
+      await vi.waitFor(() => expect(attempted).toBeGreaterThanOrEqual(attempts), {
+        timeout: 8000,
+        interval: 10,
+      });
+      // Still in Telegram's backlog while the store cannot take it — asked WHILE the obstruction
+      // holds, so it cannot pass by sampling after the retry that finally succeeded.
+      expect(rig.fake.retainedUpdates()).toBe(1);
+    } else {
+      await vi.waitFor(() => expect(rig.fake.retainedUpdates()).toBe(0), {
+        timeout: 8000,
+        interval: 10,
+      });
+      // A refusal that can never clear is acknowledged once and never re-attempted.
+      expect(attempted).toBe(1);
+    }
+
+    obstructed = false;
+    rig.fake.injectUserMessage(chat, 'alice', 'later');
+    // The loop kept consuming either way: an obstruction must never cost the only ingestion path.
+    await vi.waitFor(async () => expect(await contentsOf(rig.plugin, topic)).toContain('later'), {
+      timeout: 8000,
+      interval: 20,
+    });
+    expect({
+      visible: (await contentsOf(rig.plugin, topic)).includes('subject'),
+      pushed: live.map((m) => m.content).includes('subject'),
+    }).toEqual({ visible: clears, pushed: clears });
+  }, 30_000);
 });
 
 /**

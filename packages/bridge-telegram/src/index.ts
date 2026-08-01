@@ -135,9 +135,7 @@ export class TelegramPlugin implements BackendPlugin {
         timeoutS,
         diagnostics: this.diagnostics,
         isCurrent: () => this.generation === generation,
-        deliver: (chatId, msg) => {
-          this.ingest(store, chatId, msg);
-        },
+        deliver: (chatId, msg) => this.ingest(store, chatId, msg),
       }).catch((err: unknown) => {
         this.diagnostics.report(`getUpdates loop stopped: ${describe(err)}`);
       });
@@ -321,10 +319,14 @@ export class TelegramPlugin implements BackendPlugin {
    * proves this message was never observed, and carries a sequence above every one stamped before
    * it. That is also what keeps history off the push path: this runs for freshly appended records
    * only, never for anything a subscriber could have caught up to.
+   *
+   * Returns whether the message was taken durably or refused for a reason that can never clear.
+   * False means only that the store has no descriptor to write through, which its next compaction
+   * may restore — the caller that can have the message served again must not acknowledge it.
    */
-  private ingest(store: ObservedStore, chatId: string, msg: TgMessage): void {
+  private ingest(store: ObservedStore, chatId: string, msg: TgMessage): boolean {
     const content = contentOf(msg);
-    if (content === undefined) return; // an update carrying nothing an agent could read.
+    if (content === undefined) return true; // an update carrying nothing an agent could read.
     const observed: ObservedRecord = {
       chat_id: chatId,
       message_id: msg.message_id,
@@ -334,16 +336,16 @@ export class TelegramPlugin implements BackendPlugin {
     };
     const rec = store.append(observed);
     if (rec === undefined) {
-      if (!store.has(keyOf(observed))) {
-        this.diagnostics.report(
-          store.isOpen()
-            ? `dropped a message for chat ${chatId}: the observed store holds its maximum number of chats`
-            : `dropped a message for chat ${chatId}: the observed store has no append descriptor — ` +
-              `its last compaction could not reopen '${this.storePath}'`,
-          store.isOpen() ? 'store-refused' : 'store-unwritable',
-        );
-      }
-      return; // already observed, or past the store's bounds (DESIGN §6).
+      if (store.has(keyOf(observed))) return true; // already observed (DESIGN §6) — durable.
+      this.diagnostics.report(
+        store.isOpen()
+          ? `dropped a message for chat ${chatId}: the observed store holds its maximum number of chats`
+          : `dropped a message for chat ${chatId}: the observed store has no append descriptor — ` +
+            `its last compaction could not reopen '${this.storePath}'`,
+        store.isOpen() ? 'store-refused' : 'store-unwritable',
+      );
+      // The chat cap will not clear on its own; a lost append descriptor a later compaction may.
+      return store.isOpen();
     }
     // Native long-poll: a genuinely-new message wakes any parked fetchRecent on this
     // chat. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
@@ -355,6 +357,7 @@ export class TelegramPlugin implements BackendPlugin {
         /* handler is best-effort; never break the loop (DESIGN §6) */
       }
     }
+    return true;
   }
 
   private require<T>(value: T | undefined): T {

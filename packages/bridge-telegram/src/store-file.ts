@@ -23,6 +23,10 @@ export const OWNER_ONLY_DIR = 0o700;
 
 /** Sibling path claiming a store file for one process — see {@link StoreLock}. */
 const LOCK_SUFFIX = '.lock';
+/** Sibling held for the duration of a stale-claim take-over — see {@link StoreLock.replaceStale}. */
+const BREAK_SUFFIX = '.lock.break';
+/** Sibling carrying the sequence high-water — see {@link StoreFile.readMark}. */
+const MARK_SUFFIX = '.hw';
 
 /**
  * Narrow a store file readable beyond its owner, reporting the change. An `openSync` mode applies
@@ -83,24 +87,19 @@ function processExists(pid: number): boolean {
  */
 export class StoreLock {
   readonly path: string;
+  private readonly breakPath: string;
   /** Set once {@link claim} succeeded, so {@link release} can never unlink another process's claim. */
   private held = false;
 
   constructor(private readonly storePath: string) {
     this.path = `${storePath}${LOCK_SUFFIX}`;
+    this.breakPath = `${storePath}${BREAK_SUFFIX}`;
   }
 
   claim(): void {
     if (this.tryClaim()) return;
     const holder = lockHolder(this.path);
-    if (holder === undefined || !processExists(holder)) {
-      try {
-        unlinkSync(this.path);
-      } catch {
-        // Another starter cleared the same stale claim; the retry below decides who holds it.
-      }
-      if (this.tryClaim()) return;
-    }
+    if ((holder === undefined || !processExists(holder)) && this.replaceStale()) return;
     throw new Error(
       `ObservedStore: '${this.storePath}' is already claimed by process ` +
         `${holder === undefined ? 'unknown' : String(holder)} through '${this.path}'. Two ` +
@@ -118,6 +117,38 @@ export class StoreLock {
       unlinkSync(this.path);
     } catch {
       // Already gone — the claim is released either way.
+    }
+  }
+
+  /**
+   * Take over a claim whose process is gone. Every removal of the claim path happens under a
+   * second sibling taken exclusively, the liveness question is re-asked beneath it, and the
+   * take-over publishes by RENAME rather than by unlink-then-create — so that two starters which
+   * both saw the same dead pid cannot each drop the other's fresh claim and both hold the store.
+   */
+  private replaceStale(): boolean {
+    try {
+      writeFileSync(this.breakPath, `${process.pid}\n`, { flag: 'wx', mode: OWNER_ONLY_FILE });
+    } catch {
+      return false;
+    }
+    let renamed = false;
+    try {
+      if (this.tryClaim()) return true;
+      const holder = lockHolder(this.path);
+      if (holder !== undefined && processExists(holder)) return false;
+      renameSync(this.breakPath, this.path);
+      renamed = true;
+      this.held = true;
+      return true;
+    } finally {
+      if (!renamed) {
+        try {
+          unlinkSync(this.breakPath);
+        } catch {
+          // Never created, or already consumed by the rename; the take-over decided either way.
+        }
+      }
     }
   }
 
@@ -154,11 +185,45 @@ export class StoreFile {
    */
   private tornTail = false;
   private readonly diagnostics = new Diagnostics();
+  private readonly markPath: string;
 
   constructor(readonly path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: OWNER_ONLY_DIR });
+    this.markPath = `${path}${MARK_SUFFIX}`;
     this.lock = new StoreLock(path);
     this.lock.claim();
+  }
+
+  /**
+   * The sequence high-water recorded BESIDE the file, or 0 when there is none. Keep it out of the
+   * append-only file, so that a tail rolled back to an earlier copy of it — which takes the newest
+   * records and the watermark lines naming them away together, leaving a file whose every internal
+   * claim agrees with itself — is still distinguishable from one that legitimately holds fewer.
+   */
+  readMark(): number {
+    try {
+      const mark = Number(readFileSync(this.markPath, 'utf8').trim());
+      return Number.isInteger(mark) && mark >= 0 ? mark : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Record `seq` beside the file. Write it AFTER the line it names, so that a crash between the two
+   * leaves a mark BELOW the file rather than above it — above is what the loader reads as records
+   * gone missing, and a mark that ran ahead would re-mint the store's identity after every crash.
+   */
+  mark(seq: number): void {
+    try {
+      writeFileSync(this.markPath, `${seq}\n`, { mode: OWNER_ONLY_FILE });
+    } catch (err) {
+      this.diagnostics.report(
+        `could not record the sequence high-water beside ${this.path} (${describe(err)}) — a tail ` +
+          `rolled back to an earlier copy of the store file would not be detected`,
+        'high-water-mark',
+      );
+    }
   }
 
   /** The file's bytes, or `''` when there is none yet — a first run against this path. */

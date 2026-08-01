@@ -71,7 +71,10 @@ describe('telegram store survives a write that failed part-way', () => {
         );
       } else {
         rig.fake.injectUserMessage(CHAT, 'alice', 'subject');
-        await vi.waitFor(() => expect(stderr.join('')).toMatch(/dropped update/), {
+        // Waited on the FAILURE itself rather than on what the poll loop decided to do about it, so
+        // that changing whether a failed write is dropped or held back for redelivery cannot make
+        // this cell wait out its budget and grade nothing.
+        await vi.waitFor(() => expect(stderr.join('')).toMatch(/ENOSPC/), {
           timeout: 5000,
           interval: 20,
         });

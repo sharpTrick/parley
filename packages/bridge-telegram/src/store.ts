@@ -97,11 +97,13 @@ export class ObservedStore {
 
   /**
    * Read the file into the index and return the identity to serve under. Mint a FRESH one —
-   * invalidating every outstanding cursor — whenever the file did not load whole (a dropped line,
-   * or a record missing below the `intact` watermark it carries), so that a held cursor is never
-   * answered out of a sequence space re-minted underneath it.
+   * invalidating every outstanding cursor — whenever the file did not load whole (a dropped line, a
+   * record missing below the `intact` watermark it carries, or a sequence below the high-water
+   * recorded beside it), so that a held cursor is never answered out of a sequence space re-minted
+   * underneath it.
    */
   private load(): string {
+    const marked = this.file.readMark();
     let raw = this.file.read();
     // Drop a crash-torn tail fragment (a final line with no trailing '\n') BEFORE any append,
     // so that the next record can't glue onto it. The repaired file is rewritten below.
@@ -139,7 +141,7 @@ export class ObservedStore {
       }
     }
     if (issued >= this.nextSeq) this.nextSeq = issued + 1;
-    const lost = dropped || intact > onDisk;
+    const lost = dropped || intact > onDisk || marked > issued;
     const epochId = loadedEpoch === '' || lost ? mintEpoch() : loadedEpoch;
     const cappedChats = this.applyChatCap();
     const trimmed = this.applyRetention() || cappedChats;
@@ -158,11 +160,16 @@ export class ObservedStore {
     // `<path>.tmp`, so making it the price of opening a store would turn a squatted temp path into a
     // bridge that cannot start at all.
     if (epochId !== loadedEpoch && !rewritten) this.file.note(`${EPOCH_LINE}${epochId}`);
+    // Re-baseline the mark onto what survived, so that a file this load already re-identified does
+    // not read as rolled back on every later one.
+    this.file.mark(this.highWater());
     if (lost) {
       const cause =
-        intact > onDisk
-          ? `it recorded observing through sequence ${intact} and its records reach ${onDisk}`
-          : `a damaged or torn line could not be loaded`;
+        marked > issued
+          ? `the high-water recorded beside it is ${marked} and the sequences it states reach ${issued}`
+          : intact > onDisk
+            ? `it recorded observing through sequence ${intact} and its records reach ${onDisk}`
+            : `a damaged or torn line could not be loaded`;
       this.diagnostics.report(
         `${this.file.path} did not load whole — ${cause}. Minted a fresh store identity ` +
           `${epochId}, so every cursor the previous one issued is refused instead of being answered ` +
@@ -214,6 +221,7 @@ export class ObservedStore {
     // into a refused identity. Written after the record instead, it goes with every truncation the
     // record goes with, and the store re-mints the sequences it lost along with them.
     this.file.write(`${SEQ_LINE}${rec.seq} ${rec.seq}\n${JSON.stringify(rec)}`);
+    this.file.mark(rec.seq);
     this.index(rec);
     this.applyRetention();
     // Compaction is amortization, not durability: the record is already on disk and indexed here,
