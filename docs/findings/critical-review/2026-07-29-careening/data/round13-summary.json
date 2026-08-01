@@ -1,0 +1,139 @@
+{
+  "round": 13,
+  "converged": false,
+  "blockingClean": false,
+  "wakeAll": true,
+  "partition": "15 targets (14 package-scoped + the new repo target)",
+  "counts": {
+    "confirmed": 82,
+    "blocking": 33,
+    "plausible": 2,
+    "total": 84
+  },
+  "ranTargets": [
+    "core-seam",
+    "core-engine",
+    "core-auth",
+    "sqlite",
+    "redis",
+    "postgres",
+    "matrix",
+    "xmpp",
+    "nats",
+    "zulip",
+    "discord",
+    "slack",
+    "telegram",
+    "shared",
+    "repo"
+  ],
+  "quiescedTargets": [],
+  "nextQuiesced": [],
+  "perTarget": [
+    {
+      "target": "core-*",
+      "findings": 7,
+      "blocking": 2,
+      "nothingFound": false,
+      "checked": "Worktree /tmp/careening/worktrees/core-seam @ b5cd4b8, `npm ci` installed locally. Read every file in scope: allowlist.ts, config.ts, config-auth.ts, config-diagnostics.ts, identity-filter.ts, index.ts, mentions.ts, message.ts, no-such-topic.ts, regex-safety.ts, seam.ts, topic-name.ts, version.ts, testing/{fake-plugin,fake-oidc,nonconformant,failure-shapes,tool-harness,regex-corpus,anchoring-corpu"
+    },
+    {
+      "target": "core-*",
+      "findings": 6,
+      "blocking": 3,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "core-*",
+      "findings": 4,
+      "blocking": 2,
+      "nothingFound": false,
+      "checked": "Worktree /tmp/careening/worktrees/core-engine @ b5cd4b8, `npm ci` installed, full-surface read of every file under packages/bridge-core/src/engine (blocking-fetch, catchup, seen-set, read-state, presence, presence-beat, presence-reach) and packages/bridge-core/src/transport (http, tools, tool-schema, tool-deps, list-users-tool, push-loop, presence-loop, channel-emit, stdio-bridge) plus their 16 te"
+    },
+    {
+      "target": "sqlite",
+      "findings": 6,
+      "blocking": 1,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "redis",
+      "findings": 4,
+      "blocking": 2,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "postgres",
+      "findings": 8,
+      "blocking": 3,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "matrix",
+      "findings": 4,
+      "blocking": 2,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "xmpp",
+      "findings": 3,
+      "blocking": 1,
+      "nothingFound": false,
+      "checked": "Read every source file (index.ts, archive.ts, rooms.ts, inbound.ts, connection.ts, stanzas.ts, jid.ts, config.ts, cli.ts, xmpp.d.ts) and all 34 test files plus fake-xmpp.ts, README.md and package.json. Seam integrity checked mechanically: `grep -rn xmpp packages/bridge-core/src` finds only a keyword string in source-hygiene.test.ts \u2014 core imports nothing from this plugin. Protocol conformance runs"
+    },
+    {
+      "target": "zulip",
+      "findings": 4,
+      "blocking": 1,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "nats",
+      "findings": 4,
+      "blocking": 2,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "slack",
+      "findings": 5,
+      "blocking": 1,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "discord",
+      "findings": 8,
+      "blocking": 1,
+      "nothingFound": false,
+      "checked": "Worktree /tmp/careening/worktrees/discord @ b5cd4b8. Read CLAUDE.md, DESIGN.md, docs/REVIEW_PROTOCOL.md, and every file under packages/bridge-discord (13 src, 20 test).\n\nMECHANICAL CHECKS: seam integrity \u2014 `grep -rn 'parley-discord|bridge-discord' packages/bridge-core/src packages/conformance/src` returns nothing (only the string \"discord\" in a keywords array and two prose comments); manifest deps"
+    },
+    {
+      "target": "telegram",
+      "findings": 6,
+      "blocking": 3,
+      "nothingFound": false,
+      "checked": ""
+    },
+    {
+      "target": "repo",
+      "findings": 7,
+      "blocking": 4,
+      "nothingFound": false,
+      "checked": "Read every source and test file under packages/bridge-net-util (attempt.ts, errors.ts, index.ts, plaintext.ts, redact.ts, retry-after.ts, timing.ts + 3 test files, 682 tests) and packages/conformance (assertions, budgets, clauses, factory, handles, index, cases/{blocking,catch-up,concurrency,live,post} + 8 test files incl. reference-plugin.ts). Checked seam integrity mechanically: net-util declare"
+    },
+    {
+      "target": "repo",
+      "findings": 8,
+      "blocking": 5,
+      "nothingFound": false,
+      "checked": "Worked in /tmp/careening/worktrees/repo (base b5cd4b8), tracked files only (I confirmed via `git ls-files` that the five `tsconfig.tmpcheck.json` files present on disk are UNTRACKED worktree contamination and excluded them from every conclusion). Matrices built, invariant x package: (1) tsconfig coverage of test sources \u2014 `git ls-files 'packages/*/tsconfig*.json'` x `scripts` in each manifest; (2)"
+    }
+  ]
+}
