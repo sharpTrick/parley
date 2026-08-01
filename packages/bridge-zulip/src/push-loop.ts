@@ -25,13 +25,19 @@ export async function startPushLoop(
   const signal = conn.teardown.signal;
   const alive = (): boolean => !conn.stopped && conn.generation === generation;
   const wire = conn.claimWireTopic(topic);
+  // Keep the queue's own transport pinned here, so that abandoning it drops it on the server that
+  // minted it rather than offering its id to whatever connection replaced this one.
+  const rest = conn.rest;
   let lastDeliveredId = await probeTail(conn, topic, generation);
-  const reg = await conn.rest.register(wire);
-  const state: QueueState = { queueId: reg.queue_id };
+  const reg = await rest.register(wire);
   if (!alive()) {
-    await conn.rest.deleteQueue(reg.queue_id);
-    return;
+    await rest.deleteQueue(reg.queue_id);
+    throw new Error(
+      'Zulip connection was replaced while subscribe() was registering its event queue, so no ' +
+        'subscription exists on the connection this call addressed. Reissue it.',
+    );
   }
+  const state: QueueState = { queueId: reg.queue_id };
   conn.queues.add(state);
   // Advertise the topic as piggyback-able only now that every await is behind us and the loop is
   // about to run — a waiter set with no live loop behind it parks a blocking fetchRecent.
@@ -122,7 +128,7 @@ export async function startPushLoop(
     const parked = parking;
     let json: EventsResponse;
     try {
-      const res = await conn.rest.poll(state.queueId, lastEventId, parked, {
+      const res = await rest.poll(state.queueId, lastEventId, parked, {
         signal: controller.signal,
         deadlineMs: longPollDeadlineMs(conn.cfg.eventsTimeoutMs),
       });
@@ -152,8 +158,8 @@ export async function startPushLoop(
         // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
         try {
           const superseded = state.queueId;
-          const fresh = await conn.rest.register(wire, signal);
-          conn.deleteQueueDetached(superseded);
+          const fresh = await rest.register(wire, signal);
+          conn.deleteQueueDetached(rest, superseded);
           state.queueId = fresh.queue_id;
           lastEventId = fresh.last_event_id;
           needsGapFillFrom = lastDeliveredId;

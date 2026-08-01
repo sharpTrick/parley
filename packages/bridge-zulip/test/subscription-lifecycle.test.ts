@@ -7,8 +7,9 @@
  */
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { FAULTS } from './fake-zulip.js';
+import { ANY_ROUTE, FAULTS } from './fake-zulip.js';
 import {
+  type ConnectionEnding,
   CONNECTION_ENDINGS,
   rand,
   SENDER,
@@ -188,80 +189,125 @@ describe('zulip starts every connection from clean per-connection state', () => 
 });
 
 /**
- * CLASS: no seam call outlives the connection that ISSUED it. The push loop is bound to the
- * connection generation and so cannot be resurrected by the next `connect()`; nothing that talks to
- * the server on a caller's thread was, and `connect()` clears the `stopped` flag those paths
- * re-checked — so a call parked in an HTTP await across a reconnect finished against whatever server
- * was current when its response landed, answering a cursor minted in one id space out of another's
- * history. Each row parks the call in the one route it must touch, replaces the connection while it
- * is parked, and asserts it never answers from the new one.
+ * CLASS: no seam call outlives the connection that ISSUED it, and none of them resolves as though it
+ * had been answered by one. The push loop is bound to the connection generation and so cannot be
+ * resurrected by the next `connect()`; nothing that talks to the server on a caller's thread was, and
+ * `connect()` clears the `stopped` flag those paths re-checked — so a call parked in an HTTP await
+ * across a reconnect finished against whatever server was current when its response landed,
+ * answering a cursor minted in one id space out of another's history, or — worst of all, for
+ * `subscribe` — reporting success while leaving no subscription anywhere.
+ *
+ * A call is a SEQUENCE of round trips and every one of them is such a window, so the rows walk the
+ * call's own round trips by INDEX rather than naming the route each happens to address: a call that
+ * grows a round trip is graded on it the day it is added, and one whose endpoints are renamed or
+ * reordered is graded unchanged. `ANY_ROUTE` parks whichever endpoint the Nth round trip turns out
+ * to be, and the walk stops when the call settles before an Nth request was ever issued.
  */
 describe('zulip: no seam call answers from a connection it did not address', () => {
   /** Long enough that the reconnect lands well inside the parked request. */
-  const HOLD_MS = 800;
+  const HOLD_MS = 500;
+  /**
+   * How deep into a call's round trips the walk goes. Bounds a blocking `fetchRecent`, whose
+   * re-read/re-arm cycle keeps issuing them until its budget runs out.
+   */
+  const MAX_ROUND_TRIPS = 3;
 
   interface SeamCall {
     name: string;
-    /** The route the call must be parked in for a reconnect to land mid-flight. */
-    route: string;
     issue: (pair: ZulipPair, topic: string, since: string) => Promise<unknown>;
   }
 
   const SEAM_CALLS: SeamCall[] = [
     {
       name: 'fetchRecent',
-      route: 'GET /api/v1/messages',
       issue: async ({ plugin }, topic) => plugin.fetchRecent({ topic: asTopic(topic) }),
     },
     {
-      name: 'fetchRecent with blockMs, parked in its first history read',
-      route: 'GET /api/v1/messages',
+      name: 'fetchRecent with blockMs',
       issue: async ({ plugin }, topic, since) =>
         plugin.fetchRecent({ topic: asTopic(topic), since: asCursor(since), blockMs: 4000 }),
     },
     {
       name: 'post',
-      route: 'POST /api/v1/messages',
       issue: async ({ plugin }, topic) => plugin.post(asTopic(topic), SENDER, 'in-flight'),
     },
     {
+      name: 'subscribe',
+      issue: async ({ plugin }, topic) => plugin.subscribe(asTopic(topic), () => undefined),
+    },
+    {
       name: 'resolveIdentity',
-      route: 'GET /api/v1/users',
       issue: async ({ plugin }) => plugin.resolveIdentity(asHandle('pat@example.com')),
     },
   ];
 
+  /**
+   * Replace the connection while `call`'s `nth` round trip is parked in the fake, and grade the
+   * answer. Reports whether that round trip existed at all — the call settling before an `nth`
+   * request reached the server ends the walk.
+   */
+  async function gradeParkedAt(
+    call: SeamCall, entry: ConnectionEnding, elsewhereTarget: boolean, nth: number,
+  ): Promise<boolean> {
+    const pair = await boot();
+    const { plugin, fake } = pair;
+    const topic = `hop-${rand()}`;
+    for (let i = 0; i < 5; i++) await plugin.post(asTopic(topic), SENDER, `a${i}`);
+    const tail = (await plugin.fetchRecent({ topic: asTopic(topic) })).nextCursor;
+
+    const elsewhere = elsewhereTarget ? await boot() : pair;
+    if (elsewhereTarget) {
+      // History of its own on the SAME topic, so answering out of it would be visible as
+      // messages, and as a cursor in the other server's id space.
+      for (let i = 0; i < 4; i++) await elsewhere.plugin.post(asTopic(topic), SENDER, `b${i}`);
+    }
+    const next = elsewhere.fake;
+
+    fake.holdResponse(ANY_ROUTE, HOLD_MS);
+    const issuedBefore = fake.requestCount();
+    let settled = false;
+    const outcome = call.issue(pair, topic, tail).then(
+      (value) => {
+        settled = true;
+        return { value };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { error };
+      },
+    );
+    while (!settled && fake.requestCount() <= issuedBefore + nth) await sleep(5);
+    if (settled) {
+      await outcome;
+      return false;
+    }
+
+    const servedByNext = next.requestCount();
+    await entry.end(plugin, next.url);
+    const answer = await outcome;
+
+    expect(answer).not.toHaveProperty('value');
+    expect(String((answer as { error: unknown }).error)).toMatch(/connection was replaced/i);
+    // Drain the DETACHED cleanup the abandoned call leaves behind before counting, so that a
+    // teardown request aimed at the wrong server cannot pass merely by landing after the read.
+    await plugin.disconnect();
+    // Only a different server can show the other half — that neither the call nor anything it
+    // left behind addressed the connection that replaced the one it was issued against.
+    if (elsewhereTarget) expect(next.requestCount()).toBe(servedByNext);
+    return true;
+  }
+
   for (const call of SEAM_CALLS) {
     for (const entry of ENTRIES) {
       for (const target of TARGETS) {
-        it(`${call.name} rejects when ${entry.name} against ${target.name} lands mid-flight`, async () => {
-          const pair = await boot();
-          const { plugin, fake } = pair;
-          const topic = `hop-${rand()}`;
-          for (let i = 0; i < 5; i++) await plugin.post(asTopic(topic), SENDER, `a${i}`);
-          const tail = (await plugin.fetchRecent({ topic: asTopic(topic) })).nextCursor;
-
-          const elsewhere = target.elsewhere ? await boot() : pair;
-          if (target.elsewhere) {
-            // History of its own on the SAME topic, so answering out of it would be visible as
-            // messages, and as a cursor in the other server's id space.
-            for (let i = 0; i < 4; i++) {
-              await elsewhere.plugin.post(asTopic(topic), SENDER, `b${i}`);
-            }
+        it(`${call.name} rejects when ${entry.name} against ${target.name} lands mid-flight, whichever round trip it is parked in`, async () => {
+          let graded = 0;
+          for (let nth = 0; nth < MAX_ROUND_TRIPS; nth++) {
+            if (!(await gradeParkedAt(call, entry, target.elsewhere, nth))) break;
+            graded++;
           }
-          const next = elsewhere.fake;
-          const servedByNext = next.requestCount(call.route);
-
-          fake.holdResponse(call.route, HOLD_MS);
-          const pending = call.issue(pair, topic, tail);
-          await sleep(HOLD_MS / 4);
-          await entry.end(plugin, next.url);
-
-          await expect(pending).rejects.toThrow(/connection was replaced/i);
-          // Only a different server can show the other half — that the call did not RE-ISSUE
-          // itself against the connection that replaced the one it addressed.
-          if (target.elsewhere) expect(next.requestCount(call.route)).toBe(servedByNext);
-        }, 20_000);
+          expect(graded).toBeGreaterThan(0);
+        }, 60_000);
       }
     }
   }

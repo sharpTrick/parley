@@ -252,6 +252,9 @@ const eventsFaultRows = (persistent: boolean): EventsFaultRow[] =>
 export const TRANSIENT_EVENTS_FAULTS: EventsFaultRow[] = eventsFaultRows(false);
 export const PERSISTENT_EVENTS_FAULTS: EventsFaultRow[] = eventsFaultRows(true);
 
+/** Stands for every endpoint at once wherever a route name is taken. */
+export const ANY_ROUTE = '*';
+
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
   url: string;
@@ -287,9 +290,11 @@ export interface FakeZulip {
   /** Answer the next `times` requests on `route` with a 429 carrying the given retry hint(s). */
   rateLimit(route: string, limit: RateLimit): void;
   /**
-   * Hold every answer on `route` for `ms` before writing it. The body is snapshotted when the
-   * request is handled, so a message injected during the hold is NOT in that response — which is
-   * what turns a handshake window into one a test can inject into deterministically.
+   * Hold every answer on `route` — or on every route at once, for {@link ANY_ROUTE} — for `ms`
+   * before writing it. The body is snapshotted when the request is handled, so a message injected
+   * during the hold is NOT in that response, which is what turns a handshake window into one a test
+   * can inject into deterministically. `ANY_ROUTE` is what lets a test park a call in its Nth round
+   * trip without naming which endpoint that round trip happens to address.
    */
   holdResponse(route: string, ms: number): void;
   clearRouteFailures(): void;
@@ -398,7 +403,7 @@ export async function startFakeZulip(opts?: {
   const server = createServer((req, res) => {
     const route = `${req.method} ${new URL(req.url ?? '/', 'http://fake').pathname}`;
     requestCounts.set(route, (requestCounts.get(route) ?? 0) + 1);
-    const held = routeDelays.get(route);
+    const held = routeDelays.get(route) ?? routeDelays.get(ANY_ROUTE);
     if (held !== undefined) holdWrites(res, held);
     void handle(req, res)
       .catch(() => {

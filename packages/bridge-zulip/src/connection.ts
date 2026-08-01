@@ -110,10 +110,12 @@ export class ZulipConnection {
   /**
    * Drop a queue the plugin has stopped using without making anyone wait for the round trip. Keep
    * it off every caller's path, so that a slow or black-holed server cannot spend a `fetchRecent`'s
-   * `blockMs` — or a push loop's recovery latency — on cleanup.
+   * `blockMs` — or a push loop's recovery latency — on cleanup. Keep `rest` the caller's rather than
+   * this connection's, so that a delete racing a reconnect drops the queue on the server that minted
+   * it instead of offering its id to whatever replaced that connection.
    */
-  deleteQueueDetached(queueId: string): void {
-    const done = this.rest.deleteQueue(queueId);
+  deleteQueueDetached(rest: ZulipHttp, queueId: string): void {
+    const done = rest.deleteQueue(queueId);
     this.pendingDeletes.add(done);
     void done.finally(() => this.pendingDeletes.delete(done));
   }

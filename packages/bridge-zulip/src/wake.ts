@@ -1,6 +1,7 @@
 import type { Cursor, Message, Topic } from '@sharptrick/parley-core';
 import type { QueueState, Wake, ZulipConnection } from './connection.js';
 import { readWindow } from './history.js';
+import type { ZulipHttp } from './http.js';
 import { blockedFetchPause, budgetedDeadlineMs } from './pacing.js';
 import { asArray, type EventsResponse } from './wire.js';
 
@@ -68,11 +69,14 @@ async function armDedicatedQueue(
   conn: ZulipConnection, topic: Topic, deadline: number, pauseMs: number,
 ): Promise<Wake> {
   let reg: { queue_id: string; last_event_id: number };
+  // Keep this queue's whole life — poll and delete — on the transport that minted it, so that a
+  // reconnect racing the wait cannot offer one server's queue id to another.
+  const rest = conn.rest;
   // Bound the registration by the caller's deadline too: a slow or black-holed register is
   // otherwise a wait the caller never asked for, ahead of the wait it did.
   const bound = conn.deadlineAbort(deadline);
   try {
-    reg = await conn.rest.register(conn.wireTopic(topic), bound.signal, budgetedDeadlineMs(deadline));
+    reg = await rest.register(conn.wireTopic(topic), bound.signal, budgetedDeadlineMs(deadline));
   } catch {
     return { waited: pause(conn, deadline, pauseMs), release: () => undefined };
   } finally {
@@ -81,10 +85,10 @@ async function armDedicatedQueue(
   const state: QueueState = { queueId: reg.queue_id };
   conn.queues.add(state);
   return {
-    waited: pollForWake(conn, reg, deadline, pauseMs),
+    waited: pollForWake(conn, rest, reg, deadline, pauseMs),
     release: () => {
       conn.queues.delete(state);
-      conn.deleteQueueDetached(reg.queue_id);
+      conn.deleteQueueDetached(rest, reg.queue_id);
     },
   };
 }
@@ -99,13 +103,13 @@ async function armDedicatedQueue(
  * that never came, and each pass mints and drops a fresh event queue.
  */
 async function pollForWake(
-  conn: ZulipConnection, reg: { queue_id: string; last_event_id: number },
+  conn: ZulipConnection, rest: ZulipHttp, reg: { queue_id: string; last_event_id: number },
   deadline: number, pauseMs: number,
 ): Promise<void> {
   if (conn.stopped || deadline - Date.now() <= 0) return;
   const bound = conn.deadlineAbort(deadline);
   try {
-    const res = await conn.rest.poll(reg.queue_id, reg.last_event_id, true, {
+    const res = await rest.poll(reg.queue_id, reg.last_event_id, true, {
       signal: bound.signal,
       deadlineMs: budgetedDeadlineMs(deadline),
     });
