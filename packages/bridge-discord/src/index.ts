@@ -19,6 +19,7 @@ import { TerminalGatewayCloseError } from './ladder.js';
 import { DiscordSession } from './session.js';
 import { arm } from './waiters.js';
 import {
+  botAccount,
   CONTENT_LIMIT,
   countCharacters,
   errorCode,
@@ -236,8 +237,8 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
       }
       throw new Error(`Discord GET ${path} → ${res.status}: ${sanitizeBody(raw)}`);
     }
-    const { type } = (await res.json()) as { type?: number };
-    return unpushableChannelReason(type);
+    const body = (await res.json()) as { type?: unknown } | null;
+    return unpushableChannelReason(body?.type);
   }
 
   /**
@@ -249,7 +250,7 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
     this.require();
     this.me ??= this.rest
       .request('GET', '/users/@me')
-      .then(async (res) => (await res.json()) as { id: string; username: string })
+      .then(async (res) => botAccount(await res.json()))
       .catch((err: unknown) => {
         this.me = undefined; // don't cache a transient failure
         throw err;

@@ -55,8 +55,8 @@ const CHANNEL_TYPE_NAMES = new Map([
   [16, 'a media container (its threads carry the messages)'],
 ]);
 
-export function unpushableChannelReason(type: number | undefined): string | undefined {
-  if (type === undefined || PUSHABLE_CHANNEL_TYPES.has(type)) return undefined;
+export function unpushableChannelReason(type: unknown): string | undefined {
+  if (typeof type !== 'number' || PUSHABLE_CHANNEL_TYPES.has(type)) return undefined;
   const named = CHANNEL_TYPE_NAMES.get(type) ?? 'a channel type that carries no guild messages';
   return (
     `is ${named} (type ${type}); the intent set is GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT ` +
@@ -86,6 +86,22 @@ export function hasUsableId(record: unknown): record is { id: string } {
   if (typeof record !== 'object' || record === null) return false;
   const { id } = record as { id?: unknown };
   return typeof id === 'string' && id !== '';
+}
+
+/**
+ * The bot's own account out of a `GET /users/@me` 200. Keep a body the cast is not true of a THROW
+ * rather than a partial account, so that it takes the caller's memo-clearing path: a value returned
+ * from here is remembered for the life of the process and answered to every later resolveIdentity.
+ */
+export function botAccount(body: unknown): { id: string; username: string } {
+  const { username } = (body ?? {}) as { username?: unknown };
+  if (hasUsableId(body) && typeof username === 'string' && username !== '') {
+    return { id: body.id, username };
+  }
+  throw new Error(
+    `Discord GET /users/@me answered ${shapeOf(body)} carrying no usable account id and username; ` +
+      'this bot cannot tell its own handle from any other',
+  );
 }
 
 /**

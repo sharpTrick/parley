@@ -1056,6 +1056,158 @@ describe('Discord REST contract', () => {
     }
   });
 
+  describe('a malformed 200 the plugin might remember', () => {
+    // CLASS: an unvalidated vendor SUCCESS body, and WHAT SURVIVES IT. Every REST call this package
+    // makes decodes its 200 through a cast, and one of them — `GET /users/@me` — is MEMOIZED, so a
+    // body the cast is not true of is served for the life of the process: the memo clears on a
+    // REJECTION, and a body that decodes but is the wrong shape never rejects. So the axis is
+    // (REST call × a body no cast can be true of) rather than one path's known-bad answer, and each
+    // cell grades BOTH halves — refusing is legal and believing it is not, and NOTHING the bad
+    // answer produced may still be there when the provider is healthy again.
+    //
+    // The last row is a CONTROL: a body that is not JSON at all rejects at `res.json()`, which is
+    // the one failure every path already recovers from — so no cell here can pass merely because
+    // the recovery assertion is unreachable.
+    const MALFORMED: Array<[string, string]> = [
+      ['null', 'null'],
+      ['a bare string', `"${BOT_USER.username}"`],
+      ['a number', '7'],
+      ['an array', '[]'],
+      ['an object carrying none of the fields', '{}'],
+      ['the expected fields at the wrong types', '{"id":5,"username":7,"url":9,"type":"0"}'],
+      ['a body that is not JSON at all', '<html>502 Bad Gateway</html>'],
+    ];
+
+    interface RestCall {
+      label: string;
+      /** Where the malformed 200 is served for this call. */
+      path: (channelId: string) => string;
+      /** A plugin configured to make it — the shared fixture unless the call needs another. */
+      open?: () => Promise<DiscordPlugin>;
+      /** The call that meets the malformed body. */
+      meet: (p: DiscordPlugin, t: Topic, pushed: string[]) => Promise<unknown>;
+      /** Rejecting costs every other topic its push and its catch-up, so these may never reject. */
+      mustResolve?: true;
+      /** Refusing is legal; when it RESOLVES, nothing untrue may have crossed the seam. */
+      trusted?: (value: unknown) => void;
+      /** The provider is healthy again — asserted on the SAME plugin instance. */
+      recover: (p: DiscordPlugin, t: Topic, pushed: string[]) => Promise<void>;
+    }
+
+    const REST_CALLS: RestCall[] = [
+      {
+        label: 'GET /users/@me (resolveIdentity)',
+        path: () => '/users/@me',
+        meet: (p) => p.resolveIdentity(asHandle(BOT_USER.username)),
+        trusted: (value) => {
+          const { backendRef } = value as { backendRef: unknown };
+          expect(typeof backendRef, 'resolveIdentity answered a backendRef core cannot use')
+            .toBe('string');
+        },
+        recover: async (p) => {
+          const me = await p.resolveIdentity(asHandle(BOT_USER.username));
+          expect(me.backendRef, 'the bot never resolved to its own id again').toBe(BOT_USER.id);
+        },
+      },
+      {
+        label: 'GET /channels/:id/messages (fetchRecent)',
+        path: (id) => `/channels/${id}/messages`,
+        meet: (p, t) => p.fetchRecent({ topic: t }),
+        trusted: (value) => {
+          const { messages } = value as { messages: Array<{ backendMsgId: unknown }> };
+          for (const m of messages) {
+            expect(typeof m.backendMsgId, 'a message crossed the seam with no dedup key')
+              .toBe('string');
+          }
+        },
+        recover: async (p, t) => {
+          await p.post(t, SENDER, 'after');
+          const { messages } = await p.fetchRecent({ topic: t });
+          expect(messages.map((m) => m.content)).toContain('after');
+        },
+      },
+      {
+        label: 'POST /channels/:id/messages (post)',
+        path: (id) => `/channels/${id}/messages`,
+        meet: (p, t) => p.post(t, SENDER, 'meet'),
+        trusted: (value) => {
+          expect(typeof value, 'post resolved a BackendMsgId core cannot use').toBe('string');
+          expect(value as string).not.toBe('');
+        },
+        recover: async (p, t) => {
+          expect(typeof (await p.post(t, SENDER, 'after'))).toBe('string');
+          const { messages } = await p.fetchRecent({ topic: t });
+          expect(messages.map((m) => m.content)).toContain('after');
+        },
+      },
+      {
+        label: 'GET /channels/:id (the subscribe channel check)',
+        path: (id) => `/channels/${id}`,
+        mustResolve: true,
+        meet: (p, t, pushed) => p.subscribe(t, (m) => pushed.push(m.content)),
+        recover: async (p, t, pushed) => {
+          await p.post(t, SENDER, 'after');
+          await expect
+            .poll(() => pushed, { timeout: 8000 })
+            .toEqual(['after']); // a body that says nothing usable must not cost the topic its push
+        },
+      },
+      {
+        label: 'GET /gateway/bot (the gateway url lookup)',
+        path: () => '/gateway/bot',
+        open: () => connect({ gateway_url: undefined }), // production shape: resolve the url per dial
+        mustResolve: true,
+        meet: (p, t, pushed) => p.subscribe(t, (m) => pushed.push(m.content)),
+        // A message posted while the socket is down is legitimately missed — cursor catch-up
+        // reconciles that gap (DESIGN §6) — so what must come back is live push itself, not this
+        // post. Re-post each tick: the ladder decides WHEN the socket returns, and asserting on one
+        // post would grade the backoff's timing instead of whether the dial recovered at all.
+        recover: async (p, t, pushed) => {
+          await expect
+            .poll(
+              async () => {
+                await p.post(t, SENDER, 'after');
+                return pushed.length;
+              },
+              { timeout: 8000, interval: 250 },
+            )
+            .toBeGreaterThan(0);
+        },
+      },
+    ];
+
+    for (const call of REST_CALLS) {
+      for (const [bodyLabel, rawBody] of MALFORMED) {
+        it(`${call.label} on ${bodyLabel} keeps nothing`, async () => {
+          vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+          const topic = liveTopic();
+          const p = call.open === undefined ? plugin : await call.open();
+          try {
+            fake.injectFault({ status: 200, rawBody, path: call.path(topic as string) });
+            const pushed: string[] = [];
+            const outcome = await call
+              .meet(p, topic, pushed)
+              .then((value) => ({ value }), (err: unknown) => ({ err }));
+
+            if ('err' in outcome) {
+              expect(call.mustResolve, `${call.label} rejected, which costs every other topic`)
+                .toBeUndefined();
+              expect(outcome.err).toBeInstanceOf(Error);
+              // A malformed body is not a topic that does not exist yet; core would skip the topic.
+              expect(outcome.err).not.toBeInstanceOf(NoSuchTopicError);
+            } else {
+              call.trusted?.(outcome.value);
+            }
+
+            await call.recover(p, topic, pushed);
+          } finally {
+            if (p !== plugin) await p.disconnect();
+          }
+        });
+      }
+    }
+  });
+
   describe('a memoized lookup is not poisoned by a transient failure', () => {
     it('resolveIdentity recovers on the call after a 500', async () => {
       fake.injectFault({ status: 500, body: { message: 'oops' }, path: '/users/' });
