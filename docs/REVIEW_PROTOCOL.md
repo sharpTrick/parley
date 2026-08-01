@@ -194,6 +194,30 @@ version. The habit that prevents it: `cp` the file aside before mutating, `cp` i
 never reach for `git checkout --` while anything in the tree is uncommitted. Mutation-and-restore
 is the single most common thing done to uncommitted code here, so it is where this hazard lives.
 
+**Symlink each worktree's `node_modules` at the main checkout; never `npm install` per worktree.**
+Fifteen worktrees each installing the same tree cost **1.7 GB against 148 MB** — the same dependency
+set copied fifteen times, all of it reconstructible from `package-lock.json`. Verified equivalent
+rather than assumed: `bridge-net-util`'s 682 tests pass unchanged through the symlink. Do it at
+worktree-creation time:
+
+```sh
+git worktree add --detach -q /tmp/careening/worktrees/<key> "$BASE"
+ln -s /home/user/parley/node_modules /tmp/careening/worktrees/<key>/node_modules
+```
+
+**What is actually known about the container dying, as opposed to guessed.** It has restarted three
+times mid-run. `uptime` is the instrument that settles it — it read `up 5 min` against `up 3:45`
+earlier the same day, so the container is being **reprovisioned**, not corrupted and not rolled back
+in place. Measured at the time: 23 GB of disk free (not exhausted), no single oversized file, **no
+swap configured**, 4 cores, and 16 GB of RAM. Two of the three deaths followed a fan-out launched
+with the Agent tool directly, which is **uncapped** — nine concurrent agents drove load average to
+47 with `kswapd0` at 20%, and with no swap that pressure has nowhere to go. `Workflow` is not the
+same risk: it caps concurrency at `min(16, cores - 2)`, which on this host is **2**.
+
+So prefer `Workflow` over a hand-rolled parallel Agent fan-out for anything package-wide, and when
+launching agents directly, launch a few at a time. The rest is not preventable from inside the
+container, which is why the recovery discipline below is what actually protects the work.
+
 **Staged work in a worktree is not durable — extract and commit it the moment an agent reports.**
 The worktrees live under `/tmp`, so a container restart takes every uncommitted patch with it. In
 round 9 one agent finished, staged 13 files, and died before reporting; the restart then rolled the
