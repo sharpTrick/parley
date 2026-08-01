@@ -2,25 +2,27 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSyn
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
 import {
   captureStderr,
+  coldRestart,
   connectTo,
+  contentsOf,
   openRig,
   packageSource,
   type Rig,
   registerCleanup,
   runCleanups,
+  SENDER,
   seqOf,
   startFake,
   startRig,
   storePath,
 } from './rig.js';
 
-const SENDER = asHandle('me');
 const here = fileURLToPath(new URL('.', import.meta.url));
 const source = packageSource();
 const readme = readFileSync(join(here, '..', 'README.md'), 'utf8');
@@ -199,9 +201,6 @@ describe('telegram chat-cap claims are executed, not just written', () => {
   const OPS_CHATS = ['-1009880001', '-1009880002'];
   const FLOOD_CHATS = Array.from({ length: 6 }, (_, i) => `-99880${i}`);
 
-  const contents = async (plugin: TelegramPlugin, chat: string): Promise<string[]> =>
-    (await plugin.fetchRecent({ topic: asTopic(chat), limit: 100 })).messages.map((m) => m.content);
-
   /**
    * Park until the ingestion loop has consumed everything injected so far, WITHOUT naming any chat
    * under test — asking after a chat is itself a seam call that serves it, which is the protection
@@ -209,7 +208,7 @@ describe('telegram chat-cap claims are executed, not just written', () => {
    */
   const drain = async (rig: Rig, marker: string): Promise<void> => {
     rig.fake.injectUserMessage(SENTINEL, 'ops', marker);
-    await vi.waitFor(async () => expect(await contents(rig.plugin, 'sentinel')).toContain(marker), {
+    await vi.waitFor(async () => expect(await contentsOf(rig.plugin, asTopic('sentinel'))).toContain(marker), {
       timeout: 8000,
       interval: 20,
     });
@@ -220,12 +219,11 @@ describe('telegram chat-cap claims are executed, not just written', () => {
     for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `flood-${c}`);
     await drain(rig, 'settled');
 
-    await rig.plugin.disconnect();
-    const restarted = await rig.restart();
+    const restarted = await coldRestart(rig);
     // Measured last, and only once: asking after a chat names it, which would protect it.
     const kept: string[] = [];
     for (const c of FLOOD_CHATS) {
-      if ((await contents(restarted, c)).length > 0) kept.push(c);
+      if ((await contentsOf(restarted, asTopic(c))).length > 0) kept.push(c);
     }
     expect(kept.length).toBeLessThanOrEqual(CAP);
     expect(kept.length).toBeGreaterThan(0);
@@ -241,9 +239,8 @@ describe('telegram chat-cap claims are executed, not just written', () => {
     for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `more-${c}`);
     await drain(rig, 'after');
 
-    await rig.plugin.disconnect();
-    const restarted = await rig.restart();
-    for (const c of OPS_CHATS) expect(await contents(restarted, c)).toContain('mine');
+    const restarted = await coldRestart(rig);
+    for (const c of OPS_CHATS) expect(await contentsOf(restarted, asTopic(c))).toContain('mine');
   }, 30_000);
 });
 

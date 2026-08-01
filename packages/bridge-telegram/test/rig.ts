@@ -2,8 +2,10 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { asHandle, type Topic } from '@sharptrick/parley-core';
 import { afterEach, expect, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
+import type { StoredRecord } from '../src/store.js';
 import { type FakeTelegram, startFakeTelegram } from './fake-telegram.js';
 
 /**
@@ -102,6 +104,14 @@ export async function connectTo(
   return plugin;
 }
 
+/** Connect a plugin to `fake` against a store of its own, for a test that never names the file. */
+export function connectFresh(
+  fake: FakeTelegram,
+  config: Record<string, unknown> = {},
+): Promise<TelegramPlugin> {
+  return connectTo(fake, storePath(), config);
+}
+
 /** A fake + a store path + a connected plugin, with `restart()` for the cold-restart route. */
 export async function startRig(config: Record<string, unknown> = {}): Promise<Rig> {
   const fake = await startFake();
@@ -140,6 +150,41 @@ export async function openRig(
     },
   };
 }
+
+/** The handle this package's tests post under. */
+export const SENDER = asHandle('me');
+
+/** A topic's retained window, oldest first — what an agent catching up on it would be given. */
+export async function contentsOf(plugin: TelegramPlugin, topic: Topic): Promise<string[]> {
+  return (await plugin.fetchRecent({ topic, limit: 100 })).messages.map((m) => m.content);
+}
+
+/** Cold restart: a fresh plugin instance on the same fake and the same store file. */
+export async function coldRestart(rig: Rig): Promise<TelegramPlugin> {
+  await rig.plugin.disconnect();
+  return rig.restart();
+}
+
+/** A stored record of the shape `ObservedStore` admits, for a test that drives the store directly. */
+export const record = (
+  chatId: string,
+  messageId: number,
+  content: string,
+  seq = messageId,
+): StoredRecord => ({
+  chat_id: chatId,
+  message_id: messageId,
+  seq,
+  sender: 's',
+  content,
+  ts: new Date().toISOString(),
+});
+
+/** Record lines on disk — the dedup memory a compaction persists is not a record. */
+export const lineCount = (path: string): number =>
+  readFileSync(path, 'utf8')
+    .split('\n')
+    .filter((l) => l !== '' && !l.startsWith('#')).length;
 
 /** Matches a cursor this plugin issues: the store file's identity, then its observation sequence. */
 export const QUALIFIED_CURSOR = /^[0-9a-f]{16}\.\d+$/;

@@ -1,7 +1,7 @@
-import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import type { TelegramPlugin } from '../src/index.js';
-import { captureStderr, type Rig, startRig } from './rig.js';
+import { captureStderr, type Rig, SENDER, startRig } from './rig.js';
 
 /**
  * The failure the next `appendFileSync` in this process will suffer. `undefined` = write normally.
@@ -38,7 +38,6 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-const SENDER = asHandle('me');
 const CHAT = '-1006200001';
 
 const contentsOf = async (plugin: TelegramPlugin, topic: Topic): Promise<string[]> =>

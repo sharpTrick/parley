@@ -1,10 +1,16 @@
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
-import { captureStderr, connectTo, registerCleanup, startFake, storePath } from './rig.js';
+import {
+  captureStderr,
+  connectTo,
+  registerCleanup,
+  SENDER,
+  startFake,
+  storePath,
+} from './rig.js';
 
-const SENDER = asHandle('me');
 /** A word only the upstream's own body can supply — the positive control for "the body was quoted". */
 const ECHO = 'UPSTREAM-ECHO';
 const POST_CHAT = '-1009630001';

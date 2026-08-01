@@ -1,4 +1,4 @@
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
@@ -7,12 +7,11 @@ import {
   connectTo,
   packageSource,
   registerCleanup,
+  SENDER,
   startFake,
   startRig,
   storePath,
 } from './rig.js';
-
-const SENDER = asHandle('me');
 
 /**
  * On the Bot API a 2xx says nothing about success — `ok` does. A middlebox, a captive portal or a
@@ -263,7 +262,7 @@ interface MessageField {
   /**
    * Whether the field being ABSENT is itself a refusal. `text`, `caption` and `from` are optional on
    * the wire — a photo carries no text and a channel post carries no sender — and their accepted
-   * shapes are graded in `inbound.test.ts`; every other field the plugin reads must be there.
+   * shapes are graded in `message-mapping.test.ts`; every other field the plugin reads must be there.
    */
   requiredWhenPresent: boolean;
   /**

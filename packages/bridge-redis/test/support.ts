@@ -109,13 +109,14 @@ export async function withPlugin<T>(
   }
 }
 
+/** An independent client, the kind `withWriter` hands over. */
+export type Writer = ReturnType<typeof createRedisClient>;
+
 /**
  * An INDEPENDENT connection to the same server, closed however `body` ends — what a case uses to
  * write or read a stream without going through the code under test.
  */
-export async function withWriter<T>(
-  body: (writer: ReturnType<typeof createRedisClient>) => Promise<T>,
-): Promise<T> {
+export async function withWriter<T>(body: (writer: Writer) => Promise<T>): Promise<T> {
   const writer = createRedisClient(REDIS_URL, FAST_MS);
   try {
     await writer.connect();

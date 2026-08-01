@@ -1,9 +1,7 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { BOT_IDENTITY } from './fake-telegram.js';
-import { startRig } from './rig.js';
-
-const SENDER = asHandle('me');
+import { SENDER, startRig } from './rig.js';
 
 /**
  * Behaviour this package states as a guarantee in its JSDoc and its README seam-mapping table but

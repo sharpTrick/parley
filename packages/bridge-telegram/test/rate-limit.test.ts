@@ -1,8 +1,7 @@
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { startRig } from './rig.js';
+import { SENDER, startRig } from './rig.js';
 
-const SENDER = asHandle('me');
 const TOPIC = asTopic('-1009600001');
 
 /**

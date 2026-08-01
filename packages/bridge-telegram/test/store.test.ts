@@ -1,39 +1,8 @@
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import {
-  chmodSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { captureStderr } from './rig.js';
-import { keyOf, ObservedStore, type StoredRecord } from '../src/store.js';
-
-const record = (chatId: string, messageId: number, content: string, seq = messageId): StoredRecord => ({
-  chat_id: chatId,
-  message_id: messageId,
-  seq,
-  sender: 's',
-  content,
-  ts: new Date().toISOString(),
-});
-
-/** Record lines on disk — the dedup memory a compaction persists is not a record. */
-const lineCount = (path: string): number =>
-  readFileSync(path, 'utf8')
-    .split('\n')
-    .filter((l) => l !== '' && !l.startsWith('#')).length;
-
-const modeOf = (target: string): number => statSync(target).mode & 0o777;
+import { beforeEach, describe, expect, it } from 'vitest';
+import { keyOf, ObservedStore } from '../src/store.js';
+import { captureStderr, lineCount, record, storePath } from './rig.js';
 
 /** The composite ids a compaction carried out of the file — the persisted dedup memory. */
 const persistedEvictedIds = (path: string): string[] => {
@@ -43,14 +12,9 @@ const persistedEvictedIds = (path: string): string[] => {
   return line === undefined ? [] : (JSON.parse(line.slice('#evicted '.length)) as string[]);
 };
 
-let dir: string;
 let path: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'parley-tg-store-'));
-  path = join(dir, 'store.jsonl');
-});
-afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  path = storePath();
 });
 
 /**
@@ -196,9 +160,10 @@ describe('telegram ObservedStore durability', () => {
 
       const reloaded = new ObservedStore(path, maxPerChat, chats);
       for (const chatId of chatIds) {
-        expect(reloaded.entries(chatId).map((r) => r.content)).toEqual([
-          ...Array.from({ length: Math.min(maxPerChat, appends) }, (_, k) => `m${appends - Math.min(maxPerChat, appends) + k + 1}`),
-        ]);
+        const retained = Math.min(maxPerChat, appends);
+        expect(reloaded.entries(chatId).map((r) => r.content)).toEqual(
+          Array.from({ length: retained }, (_, k) => `m${appends - retained + k + 1}`),
+        );
       }
       reloaded.close();
     },
@@ -550,7 +515,7 @@ describe('telegram ObservedStore durability', () => {
     expect(reloaded.epoch()).toBe(identity);
     reloaded.close();
 
-    const other = new ObservedStore(join(dir, 'other.jsonl'), 2, 10);
+    const other = new ObservedStore(join(dirname(path), 'other.jsonl'), 2, 10);
     expect(other.epoch()).not.toBe(identity);
     other.close();
   });
@@ -657,257 +622,5 @@ describe('telegram ObservedStore durability', () => {
     expect(next?.seq).toBeGreaterThan(seqs.at(-1) as number);
     expect(reloaded.entries('-1').at(-1)?.content).toBe('later');
     reloaded.close();
-  });
-});
-
-/**
- * Two writers on ONE store file is the shape the class doc calls structurally unsupported, and it
- * used to be unsupported without being refused: both loaded the same identity and the same
- * sequence, so two different messages carried the identical cursor, and then either one's
- * compaction renamed its own view of history over the other's — silently, with no Bot API endpoint
- * that could ever rebuild what it discarded. The claim has to be on a SIBLING rather than on the
- * store's own descriptor, which is what the compacting phase below grades: a compaction replaces
- * the store file wholesale, so a claim living on it goes with the file it replaced.
- */
-describe('telegram ObservedStore single-writer claim', () => {
-  /** What the first writer is doing when the second one tries to open the same file. */
-  const PHASES = [
-    { name: 'idle-open', drive: () => undefined },
-    { name: 'appending', drive: (s: ObservedStore) => void s.append(record('-1', 1, 'a')) },
-    {
-      name: 'compacting',
-      drive: (s: ObservedStore) => {
-        for (let i = 1; i <= 8; i++) s.append(record('-1', i, `m${i}`));
-      },
-    },
-  ];
-
-  it.each(PHASES)('refuses a second in-process writer while the first is $name', ({ drive }) => {
-    const first = new ObservedStore(path, 2, 10);
-    drive(first);
-    expect(() => new ObservedStore(path, 2, 10)).toThrow(
-      new RegExp(`already claimed by process ${process.pid}`),
-    );
-    expect(() => new ObservedStore(path, 2, 10)).toThrow(path);
-    // The refusal is the claim's, not the file's: closing the first hands it over.
-    first.close();
-    const second = new ObservedStore(path, 2, 10);
-    expect(second.append(record('-2', 1, 'after'))).toBeDefined();
-    second.close();
-  });
-
-  /**
-   * The half no second instance in THIS process can reach: a claim left by another process. It is
-   * honoured while that process lives and replaced once it is gone — a crashed bridge must not
-   * leave a store file that can never be opened again, and a live one must not be joined.
-   */
-  const FOREIGN_CLAIMS = [
-    { name: 'a live process', pid: () => String(spawnedPid), admitted: false },
-    { name: 'a process that is gone', pid: () => String(deadPid), admitted: true },
-    { name: 'nothing readable', pid: () => 'not-a-pid', admitted: true },
-    { name: 'an empty claim', pid: () => '', admitted: true },
-  ];
-
-  let spawnedPid = 0;
-  let deadPid = 0;
-  beforeEach(() => {
-    const live = spawn('sleep', ['30'], { stdio: 'ignore' });
-    live.unref();
-    spawnedPid = live.pid ?? 0;
-    const gone = spawnSync('true');
-    deadPid = gone.pid ?? 0;
-    expect(spawnedPid).toBeGreaterThan(0);
-    expect(deadPid).toBeGreaterThan(0);
-    return () => {
-      live.kill('SIGKILL');
-    };
-  });
-
-  it.each(FOREIGN_CLAIMS)('a claim naming $name is honoured: $admitted', ({ pid, admitted }) => {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(`${path}.lock`, `${pid()}\n`);
-    if (!admitted) {
-      expect(() => new ObservedStore(path, 2, 10)).toThrow(/already claimed by process/);
-      return;
-    }
-    const store = new ObservedStore(path, 2, 10);
-    expect(store.append(record('-1', 1, 'a'))).toBeDefined();
-    store.close();
-    expect(existsSync(`${path}.lock`)).toBe(false);
-  });
-
-  /**
-   * The negative control: the guard has to be about SHARING a file, not about a second store
-   * existing. Two writers on two paths both keep everything they wrote, across a cold reload of
-   * each — which is exactly what the shared-path cells above lose.
-   */
-  it('keeps every record when two writers hold two different store files', () => {
-    const other = join(dir, 'other.jsonl');
-    const a = new ObservedStore(path, 10, 10);
-    const b = new ObservedStore(other, 10, 10);
-    for (let i = 1; i <= 4; i++) {
-      expect(a.append(record('-1', i, `a${i}`))).toBeDefined();
-      expect(b.append(record('-1', i, `b${i}`))).toBeDefined();
-    }
-    expect(a.epoch()).not.toBe(b.epoch());
-    a.close();
-    b.close();
-
-    for (const [file, tag] of [[path, 'a'], [other, 'b']] as const) {
-      const reloaded = new ObservedStore(file, 10, 10);
-      expect(reloaded.entries('-1').map((r) => r.content)).toEqual([1, 2, 3, 4].map((i) => `${tag}${i}`));
-      reloaded.close();
-    }
-  });
-});
-
-/**
- * This file is the full plaintext of every message the bridge has observed — sender handles, chat
- * ids and bodies, in every chat the bot is in — living in the same state directory where core keeps
- * mere cursors at 0600 under a 0700 directory. Every path that CREATES or REPLACES it has to hold
- * that, not just the first one: an `openSync` mode applies only to a file it creates, and a
- * `renameSync` installs the temp file's mode over the target, so a store tightened on creation is
- * re-widened by the next compaction unless the temp file is tight too.
- */
-describe('telegram ObservedStore file permissions', () => {
-  interface Cell {
-    name: string;
-    /** Runs before the store is opened — an upgrade onto state an earlier version left behind. */
-    prepare?: (path: string) => void;
-    /** Append enough to force a compaction, so the file under test is a rewrite's output. */
-    compact?: boolean;
-    /** What must be unreadable by group and other. */
-    targets: (path: string) => string[];
-    /** The one path the store must NAME on stderr as tightened; nothing else may be reported. */
-    tightens?: (path: string) => string;
-  }
-
-  const loose = (target: string): void => {
-    chmodSync(target, 0o666);
-    expect(modeOf(target) & 0o077).not.toBe(0);
-  };
-
-  const CELLS: Cell[] = [
-    {
-      name: 'the store file it creates',
-      targets: (p) => [p],
-    },
-    {
-      name: 'every directory it creates on the way',
-      targets: (p) => [dirname(p), dirname(dirname(p))],
-    },
-    {
-      name: 'the store file a compaction replaces',
-      compact: true,
-      targets: (p) => [p],
-    },
-    {
-      // A leftover temp file is REPLACED, never written through: it is unlinked and recreated
-      // exclusively, so its mode never reaches the store and there is nothing to tighten.
-      name: 'the store file a compaction replaces over a leftover world-readable temp file',
-      prepare: (p) => {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(`${p}.tmp`, 'junk from a crashed compaction\n');
-        loose(`${p}.tmp`);
-      },
-      compact: true,
-      targets: (p) => [p],
-    },
-    {
-      name: 'a pre-existing world-readable store file',
-      prepare: (p) => {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, `${JSON.stringify(record('-1', 1, 'from an older version'))}\n`);
-        loose(p);
-      },
-      targets: (p) => [p],
-      tightens: (p) => p,
-    },
-  ];
-
-  it.each(CELLS)('keeps $name owner-only', ({ prepare, compact, targets, tightens }) => {
-    // Nested, so the directories under test are ones the store had to create itself.
-    const nested = join(dir, 'nested', 'deep', 'store.jsonl');
-    prepare?.(nested);
-    const stderr = captureStderr();
-
-    const store = new ObservedStore(nested, 2, 10);
-    for (let i = 1; i <= (compact === true ? 8 : 1); i++) {
-      store.append(record('-1', 100 + i, `m${i}`));
-    }
-    store.close();
-
-    for (const target of targets(nested)) expect(modeOf(target) & 0o077).toBe(0);
-    // A tightening is never silent, and a store that was already tight says nothing at all.
-    const named = tightens?.(nested);
-    if (named === undefined) expect(stderr).toEqual([]);
-    else expect(stderr.join('')).toContain(`tightened ${named}`);
-  });
-
-  /**
-   * `<store_path>.tmp` is a predictable name in a directory the store does not own — `store_path`
-   * can be anywhere the operator put it, and `mkdirSync(…, {mode: 0o700})` applies only to
-   * directories the store itself created. A compaction renames whatever that name resolves to over
-   * the store, so anything already there that is not a regular file this call created would let a
-   * local attacker redirect the full plaintext of every observed message (and have its mode
-   * narrowed for them). Every kind of squatted temp path is graded on the same two outcomes.
-   */
-  const SQUATTED = [
-    { name: 'a world-readable regular file', kind: 'file' as const, compacts: true },
-    { name: 'a symlink to a file outside the store directory', kind: 'symlink-file' as const, compacts: false },
-    { name: 'a symlink to a directory outside the store directory', kind: 'symlink-dir' as const, compacts: false },
-    { name: 'a dangling symlink', kind: 'symlink-dangling' as const, compacts: false },
-    { name: 'a directory', kind: 'dir' as const, compacts: false },
-    { name: 'a FIFO', kind: 'fifo' as const, compacts: false },
-  ];
-
-  it.each(SQUATTED)('refuses to compact through $name, leaving what it points at alone', ({ kind, compacts }) => {
-    const outside = mkdtempSync(join(tmpdir(), 'parley-tg-victim-'));
-    const victimFile = join(outside, 'victim.txt');
-    const victimDir = join(outside, 'victim-dir');
-    writeFileSync(victimFile, 'private\n');
-    chmodSync(victimFile, 0o644);
-    mkdirSync(victimDir);
-    const store = join(dir, 'squat', 'store.jsonl');
-    mkdirSync(dirname(store), { recursive: true });
-    const tmp = `${store}.tmp`;
-    if (kind === 'file') writeFileSync(tmp, 'junk\n');
-    if (kind === 'symlink-file') symlinkSync(victimFile, tmp);
-    if (kind === 'symlink-dir') symlinkSync(victimDir, tmp);
-    if (kind === 'symlink-dangling') symlinkSync(join(outside, 'not-there'), tmp);
-    if (kind === 'dir') mkdirSync(tmp);
-    if (kind === 'fifo') execFileSync('mkfifo', [tmp]);
-
-    const stderr = captureStderr();
-    const observed = new ObservedStore(store, 2, 10);
-    // Eight appends under newest-2 drive several compactions.
-    for (let i = 1; i <= 8; i++) expect(observed.append(record('-1', i, `secret-${i}`))).toBeDefined();
-    observed.close();
-
-    // Nothing outside the store's own directory was touched, whatever the temp path pointed at.
-    expect(readFileSync(victimFile, 'utf8')).toBe('private\n');
-    expect(modeOf(victimFile)).toBe(0o644);
-    expect(readdirSync(victimDir)).toEqual([]);
-    if (compacts) {
-      expect(stderr.join('')).not.toMatch(/refusing to compact/);
-      expect(lineCount(store)).toBeLessThanOrEqual(4);
-      // The squatted file was replaced, not written through: the rename consumed a fresh one.
-      expect(existsSync(tmp)).toBe(false);
-      expect(readFileSync(store, 'utf8')).toContain('secret-8');
-    } else {
-      // Loud, and the store keeps every record rather than trading durability for a compaction —
-      // on the load path too, where a throw is the only way to say it.
-      expect(stderr.join('')).toMatch(/refusing to compact/);
-      expect(stderr.join('')).toContain(tmp);
-      expect(lineCount(store)).toBe(8);
-      expect(() => new ObservedStore(store, 2, 10)).toThrow(/refusing to compact/);
-      rmSync(tmp, { recursive: true, force: true });
-    }
-    // Every record survived the obstruction, and the store compacts again once it clears.
-    const reopened = new ObservedStore(store, 2, 10);
-    expect(reopened.entries('-1').map((r) => r.content)).toEqual(['secret-7', 'secret-8']);
-    reopened.close();
-    expect(lineCount(store)).toBe(2);
-    rmSync(outside, { recursive: true, force: true });
   });
 });

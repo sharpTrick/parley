@@ -1,11 +1,10 @@
 import { readdirSync, readlinkSync } from 'node:fs';
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
-import { captureStderr, registerCleanup, startFake, storePath } from './rig.js';
+import { captureStderr, registerCleanup, SENDER, startFake, storePath } from './rig.js';
 
-const SENDER = asHandle('me');
 const TOPIC = asTopic('-1009500001');
 
 /** Descriptors this process currently holds on `path` — the store's append fd, if any leaked. */

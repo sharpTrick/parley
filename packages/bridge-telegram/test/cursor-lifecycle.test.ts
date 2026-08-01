@@ -1,7 +1,6 @@
 import { readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
-  asHandle,
   asTopic,
   type Cursor,
   type FetchRecentResult,
@@ -9,9 +8,7 @@ import {
 } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { seqOf, startRig } from './rig.js';
-
-const SENDER = asHandle('me');
+import { SENDER, seqOf, startRig } from './rig.js';
 
 /** The store's bookkeeping lines (identity, served marks, dedup memory) — never records. */
 const isHeader = (line: string): boolean => line.startsWith('#');

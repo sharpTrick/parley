@@ -24,7 +24,8 @@ const msg = (over: Partial<Message> = {}): Message => ({
  * method renders no `<channel>` event at all — live push silently does nothing while catch-up keeps
  * working — and the suite stays green. Every externally visible protocol string core emits is pinned
  * here against a hard-coded literal instead. (The meta KEYS are pinned the same way below, and the
- * `experimental` capability's presence/absence by the loopback example and http.test.ts.)
+ * `experimental` capability's presence/absence by the loopback example and
+ * http-request-path.test.ts.)
  */
 describe('the wire strings are literals, taken from the channels reference', () => {
   it('the channel notification method', () => {
