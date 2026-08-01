@@ -1,6 +1,7 @@
 import { asBackendMsgId, asHandle, asTopic } from '@sharptrick/parley-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { CORPUS, FIELDS, type Field, REFUSED, ROUND_TRIPS } from './storable-corpus.js';
 
 // `since` is not the only agent-supplied string this plugin hands the driver. `content` arrives as a
 // bare `z.string()` from core's `parley_post`, the topic is whatever a `post_topics` pattern admits,
@@ -11,9 +12,14 @@ import { PostgresPlugin } from '../src/index.js';
 // context.
 //
 // The class is therefore wider than cursors: NO agent-supplied field may render a raw driver or
-// SQLSTATE string. So every seam call is crossed with every string argument it takes and with a
-// corpus of storage-hostile values, and each row declares which arm it expects — a value that
-// starts being refused, or one that stops, fails here instead of quietly changing the contract.
+// SQLSTATE string. So every seam call is crossed with every string argument it takes and with the
+// shared storage-hostile corpus.
+//
+// This file is MOCKED, so it grades only what a fake can decide: whether a call was refused by name
+// before any SQL reached the driver. The other half of a ROUND_TRIPS row — that the value comes
+// back byte-identical — is a property only the SERVER decides, and grading it here is what let a
+// value the driver silently rewrote to U+FFFD pass as "accepted, and reaches the database". That
+// half lives in storable-roundtrip.test.ts, against a real server.
 
 const state = vi.hoisted(() => ({ queries: [] as string[] }));
 
@@ -46,33 +52,9 @@ vi.mock('pg', async () => {
 
 const URL = 'postgres://app:s3cret@db.example.com:5432/prod';
 
-const REFUSED = 'refused by name, before any SQL';
-const ACCEPTED = 'accepted, and reaches the database';
-
-/**
- * One row per distinct STORAGE hazard, not one per string someone thought of. The NUL rows are the
- * ones PostgreSQL cannot hold at all; the rest are values that merely LOOK hostile and must keep
- * working, so the rule cannot degenerate into "refuse anything unusual".
- */
-const CORPUS: [label: string, value: string, arm: string][] = [
-  ['a NUL at the start', '\u0000abc', REFUSED],
-  ['a NUL in the middle', 'hello\u0000world', REFUSED],
-  ['a NUL at the end', 'abc\u0000', REFUSED],
-  ['nothing but a NUL', '\u0000', REFUSED],
-  ['a lone high surrogate', 'lone\uD800surrogate', ACCEPTED],
-  ['a lone low surrogate', 'lone\uDC00surrogate', ACCEPTED],
-  ['an astral plane character', 'family 👨‍👩‍👧‍👦 emoji', ACCEPTED],
-  ['a megabyte of text', 'x'.repeat(1024 * 1024), ACCEPTED],
-  ['SQL punctuation', `'; DROP TABLE "parley_messages"; --`, ACCEPTED],
-  ['a backslash and a newline', 'a\\b\nc', ACCEPTED],
-  ['other C0 control characters', 'a\u0001b\u001fc', ACCEPTED],
-];
-
-type Field = 'content' | 'topic' | 'handle' | 'inReplyTo';
-
 /** Every seam call, and the agent-supplied string arguments it puts into SQL. */
 const CALLS: [call: string, fields: Field[]][] = [
-  ['post', ['content', 'topic', 'handle', 'inReplyTo']],
+  ['post', FIELDS],
   ['fetchRecent', ['topic']],
   ['subscribe', ['topic']],
   ['resolveIdentity', ['handle']],
@@ -111,6 +93,10 @@ beforeEach(() => {
 });
 
 describe('no agent-supplied field renders a raw driver string into agent context', () => {
+  it('the corpus declares both arms, so neither branch below is unreachable', () => {
+    expect([...new Set(CORPUS.map(([, , arm]) => arm))].sort()).toEqual([REFUSED, ROUND_TRIPS].sort());
+  });
+
   it.each(CELLS)('%s', async (_label, call, field, value, arm) => {
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: URL, table_name: 'parley_hi' });
@@ -121,7 +107,7 @@ describe('no agent-supplied field renders a raw driver string into agent context
         rejection = err as Error;
       });
 
-      if (arm === ACCEPTED) {
+      if (arm === ROUND_TRIPS) {
         expect(rejection?.message, 'a value this backend can store was refused').toBeUndefined();
         expect(state.queries.length, 'an accepted value never reached the database').toBeGreaterThan(
           0,
@@ -129,7 +115,7 @@ describe('no agent-supplied field renders a raw driver string into agent context
         return;
       }
 
-      expect(rejection, 'a value PostgreSQL cannot store was accepted').toBeDefined();
+      expect(rejection, 'a value this backend cannot store as given was accepted').toBeDefined();
       const message = String(rejection?.message);
       expect(message).toMatch(new RegExp(`^parley-postgres: invalid ${field} — `));
       expect(message, 'the refusal must say nothing was written').toMatch(/[Nn]othing was written/);

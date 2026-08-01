@@ -187,21 +187,49 @@ const CHORES: Chore[] = [
 ];
 
 /**
+ * A guard is any comparison of a captured epoch against `this.epoch`, in either operand order and
+ * whichever way round the test is written. The census below counted `epoch !== this.epoch` alone,
+ * so the three guards already written as `epoch === this.epoch` were invisible to it and a new
+ * teardown-crossing await in that spelling shipped with the file still green.
+ */
+const EPOCH_GUARD = /(?:\w+\s*[!=]==?\s*this\.epoch|this\.epoch\s*[!=]==?\s*\w+)/g;
+
+/**
+ * Every form the rule has to recognise, each with a sample it must find. Keep this table beside the
+ * pattern, so that a guard written in a shape the regex cannot see fails here rather than silently
+ * shrinking the census to whatever spelling it happens to match.
+ */
+const EPOCH_GUARD_FORMS: [what: string, sample: string][] = [
+  ['an inequality guard', 'if (this.stopped || epoch !== this.epoch) return;'],
+  ['a while condition in the equality form', 'while (!this.stopped && epoch === this.epoch) {'],
+  ['a do…while condition in the equality form', '} while (sub.pending && epoch === this.epoch);'],
+  ['a bare statement guard', 'if (epoch === this.epoch) this.reconnecting = false;'],
+  ['the comparison written with this.epoch first', 'if (this.epoch !== guardEpoch) return;'],
+  ['a loose comparison', 'if (epoch != this.epoch) return;'],
+];
+
+/**
  * Every await in this plugin that a `disconnect()` can land in re-checks the epoch afterwards, and
  * the table below drives one row per chore into that window. Pinned by VALUE so a guard site added
  * later is a missing row rather than silence: a new one means a new await that can cross a
  * teardown, and it needs its own row here, in teardown-delivery.test.ts (which owns a drain read
  * parked at the boundary) or in push-self-heal.test.ts (which owns the drain's re-drain timer).
  */
-const EPOCH_GUARD_SITES = 11;
+const EPOCH_GUARD_SITES = 14;
 
 const CROSS_CELLS = CHORES.flatMap((chore) =>
   (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),
 );
 
 describe('a chore in flight when disconnect lands never touches the next lifecycle', () => {
+  it.each(EPOCH_GUARD_FORMS)('the census sees a guard written as %s', (_what, sample) => {
+    expect(sample.match(EPOCH_GUARD), 'this guard form is invisible to the census below').toHaveLength(
+      1,
+    );
+  });
+
   it('every teardown/epoch guard in the source is represented by a row above', () => {
-    const sites = [...SOURCE.matchAll(/epoch !== this\.epoch/g)].length;
+    const sites = [...SOURCE.matchAll(EPOCH_GUARD)].length;
     expect(sites, 'a guard site was added or removed — give the new await a row').toBe(
       EPOCH_GUARD_SITES,
     );

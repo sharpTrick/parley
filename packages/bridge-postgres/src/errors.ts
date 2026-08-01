@@ -29,13 +29,30 @@ export function assertCursor(since: string): void {
   }
 }
 
+/** Locates the offending code unit for the message below; the refusal itself is decided by UTF-8. */
+const UNPAIRED_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 /**
- * Refuse a seam argument PostgreSQL's TEXT type cannot hold, before it reaches the driver. Every
- * one of these is agent- or human-supplied and untrusted (DESIGN §5); a NUL byte is legal in a JSON
- * string and in a JS string, and PostgreSQL answers it with a bare driver string naming neither
- * this plugin, nor the field, nor the fact that nothing was written.
+ * Refuse a seam argument this backend cannot store as given, before it reaches the driver. Every
+ * one of these is agent- or human-supplied and untrusted (DESIGN §5), and both hazards below are
+ * ordinary characters to JSON and to JavaScript. A NUL byte PostgreSQL answers with a bare driver
+ * string naming neither this plugin, nor the field, nor the fact that nothing was written. An
+ * unpaired surrogate is worse, because nothing fails at all: the driver encodes it as U+FFFD, so
+ * two topics a `post_topics` pattern admits as distinct silently share one history, two handles
+ * collapse onto one `_senders` row, and `content` is read back altered.
+ *
+ * Keep the second rule stated as "does this survive a UTF-8 round trip", so that the next shape
+ * UTF-8 cannot carry is refused without anyone having to think of it first.
  */
 export function assertStorable(field: string, value: string): void {
+  if (Buffer.from(value, 'utf8').toString('utf8') !== value) {
+    throw new Error(
+      `parley-postgres: invalid ${field} — an unpaired surrogate at index ` +
+        `${value.search(UNPAIRED_SURROGATE)} has no UTF-8 encoding, so PostgreSQL would store ` +
+        'U+FFFD in its place and this value would not be the one read back. Nothing was written; ' +
+        'repair or strip it and retry.',
+    );
+  }
   const at = value.indexOf('\u0000');
   if (at < 0) return;
   throw new Error(

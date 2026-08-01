@@ -138,6 +138,13 @@ cannot hold it; left to the server, the caller would get `invalid byte sequence 
 "UTF8": 0x00`, which names neither this plugin, nor the field, nor the fact that nothing was
 written.
 
+An unpaired surrogate — a `U+D800`–`U+DFFF` code unit with no partner, which is what a `slice()`
+through an emoji leaves behind — is refused the same way, and for a worse reason: nothing fails
+without the check. The value has no UTF-8 encoding, so the driver sends `U+FFFD` instead, and the
+row is stored under a value that is not the one posted. Two topics an anchored `post_topics`
+pattern admits as distinct would silently share one history, two handles would collapse onto one
+`_senders` row, and `content` would read back altered.
+
 ## Run Postgres
 
 Use the **official `postgres` Docker image** (not authored here):
