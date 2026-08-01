@@ -9,7 +9,7 @@ import {
   respError,
   SECRET,
 } from './resp-server.js';
-import { FAST_MS as FAST } from './support.js';
+import { FAST_MS as FAST, freeEndpoint } from './support.js';
 
 // CLASS: a string the SERVER wrote reaches an operator's log or an MCP tool result unchanged. A
 // thrown seam error is rendered by core as an `isError` result — model context — and the live-push
@@ -17,10 +17,14 @@ import { FAST_MS as FAST } from './support.js';
 // server puts in a RESP error has to be bounded, stripped of the characters that forge line
 // structure, and swept of this connection's own credential before it lands in either.
 //
-// Two axes, because a fix applied at one site is not a fix:
+// Three axes, because a fix applied at one site is not a fix:
 //   * HOSTILE TEXT. Length, ANSI, C1 controls, NEL/LS line forgery, bidi reordering, and the
 //     credential itself — including a credential AHEAD of an over-long body, so that truncation
 //     cannot be what hides it.
+//   * IMPERSONATION. The same, behind one of THIS PLUGIN's own diagnostic wordings at offset 0 of
+//     the RESP line — the position a provenance test made of the message itself reads as "already
+//     mine, pass it through". The credential and the over-long tail ride behind the impersonated
+//     opening, so a guard that trusts what the server called itself hands back both.
 //   * SURFACE. Every path that embeds server text: connect's refusal, `labelled()` on post, on both
 //     fetchRecent windows and on the blocking long-poll, on subscribe, and the STOPPED stderr line.
 //
@@ -31,18 +35,65 @@ const TOPIC = asTopic('hostile');
 /** Prefixed to every hostile reply: if it does not survive, the row graded a swallowed error. */
 const MARK = 'from-the-server';
 
-const hostile: Array<[string, (secret: string) => string]> = [
-  ['an over-long body', () => 'A'.repeat(5000)],
-  ['an ANSI colour escape', () => 'red\u001B[31m text'],
-  ['a C1 control', () => 'csi\u009B31m text'],
-  ['a NEL line break', () => 'forged\u0085parley-redis: all clear'],
-  ['a line separator', () => 'forged\u2028parley-redis: all clear'],
-  ['a paragraph separator', () => 'forged\u2029parley-redis: all clear'],
-  ['a bidi override', () => 'flip\u202Ereversed'],
-  ['a NUL byte', () => 'split\u0000here'],
-  ['the credential', (secret) => `your password is ${secret}`],
-  ['the credential ahead of an over-long body', (secret) => `${secret} ${'A'.repeat(5000)}`],
+/** One hostile RESP error line, as its `<code>` and the text that follows it. */
+type Reply = (secret: string, code: string) => [code: string, text: string];
+
+const body =
+  (mint: (secret: string) => string): Reply =>
+  (secret, code) => [code, `${MARK} ${mint(secret)}`];
+
+const hostile: Array<[string, Reply]> = [
+  ['an over-long body', body(() => 'A'.repeat(5000))],
+  ['an ANSI colour escape', body(() => 'red\u001B[31m text')],
+  ['a C1 control', body(() => 'csi\u009B31m text')],
+  ['a NEL line break', body(() => 'forged\u0085parley-redis: all clear')],
+  ['a line separator', body(() => 'forged\u2028parley-redis: all clear')],
+  ['a paragraph separator', body(() => 'forged\u2029parley-redis: all clear')],
+  ['a bidi override', body(() => 'flip\u202Ereversed')],
+  ['a NUL byte', body(() => 'split\u0000here')],
+  ['the credential', body((secret) => `your password is ${secret}`)],
+  ['the credential ahead of an over-long body', body((secret) => `${secret} ${'A'.repeat(5000)}`)],
 ];
+
+/**
+ * The impersonated opening, followed by everything the plugin is supposed to strip. The RESP code
+ * is the FIRST WORD of the diagnostic, so the plugin's own wording lands at offset 0 of the message
+ * node-redis builds — the only position from which it can be mistaken for the plugin's own.
+ */
+const impersonating =
+  (own: string): Reply =>
+  (secret) => {
+    const [code = '', ...rest] = own.split(' ');
+    return [code, `${rest.join(' ')} ${MARK} password ${secret}\u2028${'A'.repeat(5000)}`];
+  };
+
+/**
+ * This plugin's own diagnostic wordings, MINTED BY THE PLUGIN rather than restated here. A literal
+ * copy stops impersonating anything the day a message is reworded — and goes on passing while it
+ * does; driving the real code for them means a rename cannot quietly empty this axis.
+ */
+async function ownDiagnostics(): Promise<string[]> {
+  const said = (work: Promise<unknown>): Promise<string> =>
+    work.then(
+      () => '',
+      (err: Error) => err.message,
+    );
+  const endpoint = await respEndpoint((argv) => DEFAULT_REPLIES[commandOf(argv)] ?? '+OK\r\n');
+  const reachable = new RedisPlugin();
+  const unreachable = new RedisPlugin();
+  try {
+    await connect(reachable, endpoint.url);
+    return [
+      await said(new RedisPlugin().connect({ retention_days: 0 })),
+      await said(unreachable.connect({ url: await freeEndpoint(), connect_timeout_ms: 1 })),
+      await said(reachable.fetchRecent({ topic: TOPIC, since: asCursor('not-an-entry-id') })),
+    ];
+  } finally {
+    await reachable.disconnect().catch(() => undefined);
+    await unreachable.disconnect().catch(() => undefined);
+    endpoint.close();
+  }
+}
 
 interface Observed {
   /** What the plugin composed out of the server's text — every invariant applies. */
@@ -62,6 +113,13 @@ interface Surface {
   code?: string;
   /** Replies that get the plugin as far as that command, over {@link DEFAULT_REPLIES}. */
   replies?: Record<string, string>;
+  /**
+   * True when the RESP code is not the reply's to choose. `serverRefusal` admits only a PERMANENT
+   * code onto this path, so a server cannot reach it with text of its own at offset 0 — which is
+   * what the impersonation axis needs, and why that axis skips this surface rather than grading a
+   * reply the code under test could never see.
+   */
+  fixedCode?: true;
   observe: (plugin: RedisPlugin, url: string) => Promise<Observed>;
 }
 
@@ -144,6 +202,7 @@ const surfaces: Array<[string, Surface]> = [
       // The cursor has to be LIVE (below the stream's last generated id) or the self-heal answers
       // before the long-poll is ever reached, and this row would grade the heal instead.
       replies: { exists: ':1\r\n' },
+      fixedCode: true,
       observe: (plugin, url) =>
         after(plugin, url, (p) =>
           p.fetchRecent({ topic: TOPIC, since: asCursor('1-0'), blockMs: 500 }),
@@ -157,26 +216,27 @@ const surfaces: Array<[string, Surface]> = [
       observe: (plugin, url) => after(plugin, url, (p) => p.subscribe(TOPIC, () => undefined)),
     },
   ],
-  ['the live-delivery STOPPED log line', { refuses: 'xread', observe: stoppedLine }],
+  ['the live-delivery STOPPED log line', { refuses: 'xread', fixedCode: true, observe: stoppedLine }],
 ];
 
+const impersonations: Array<[string, Reply]> = (await ownDiagnostics()).map((own) => {
+  expect(own, 'a wording this axis impersonates was never produced').toMatch(/^parley-redis: /);
+  return [`this plugin's own '${own.slice(0, 44)}…' at offset 0`, impersonating(own)];
+});
+
 const rows = surfaces.flatMap(([surfaceLabel, surface]) =>
-  hostile.map(
-    ([textLabel, mint]) =>
-      [`${surfaceLabel} answered with ${textLabel}`, surface, mint] as [
-        string,
-        Surface,
-        (secret: string) => string,
-      ],
+  [...hostile, ...(surface.fixedCode === true ? [] : impersonations)].map(
+    ([textLabel, reply]) =>
+      [`${surfaceLabel} answered with ${textLabel}`, surface, reply] as [string, Surface, Reply],
   ),
 );
 
 describe('redis failure modes — server-supplied text never lands raw in a log or a tool result', () => {
-  it.each(rows)('%s', async (_label, surface, mint) => {
-    const body = `${MARK} ${mint(SECRET)}`;
+  it.each(rows)('%s', async (_label, surface, reply) => {
+    const [code, text] = reply(SECRET, surface.code ?? 'WRONGTYPE');
     const endpoint = await respEndpoint((argv) => {
       const command = commandOf(argv);
-      if (command === surface.refuses) return respError(surface.code ?? 'WRONGTYPE', body);
+      if (command === surface.refuses) return respError(code, text);
       return surface.replies?.[command] ?? DEFAULT_REPLIES[command] ?? '+OK\r\n';
     });
     const plugin = new RedisPlugin();

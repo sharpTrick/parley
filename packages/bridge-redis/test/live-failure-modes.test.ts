@@ -1295,6 +1295,92 @@ describe.skipIf(!redisUp)('redis failure modes — lifecycle must not leak conne
 });
 
 // -------------------------------------------------------------------------------------------
+// CLASS: a HANDLER's failure ending the live path. `subscribe()` has already resolved, core keeps
+// advertising this instance as subscribed, catch-up goes on working and nothing writes a line — so
+// a topic whose push loop died looks exactly like a quiet one, and the dedicated reader it parked
+// is never returned. Nothing in this package or in the shared conformance suite passed a handler
+// that misbehaves at all, so the guarantee was carried by a comment.
+//
+// Two axes: HOW the handler fails (the shapes a `(msg) => void` seam type does not forbid — one bad
+// message, every message, a non-Error, and an `async` handler whose rejection the loop never sees),
+// and WHAT must survive it (later messages still delivered, in order, and the reader still held and
+// still returned by disconnect()). Reader accounting is read off the proxy — an external count of
+// live sockets — because the in-process `readers` array stays clean either way.
+// -------------------------------------------------------------------------------------------
+
+describe.skipIf(!redisUp)('redis failure modes — a misbehaving handler never disables live push', () => {
+  const misbehaviours: Array<[string, (nth: number) => unknown]> = [
+    [
+      'throws on the first message',
+      (nth) => {
+        if (nth === 0) throw new Error('handler blew up');
+      },
+    ],
+    [
+      'throws on every message',
+      () => {
+        throw new Error('handler blew up');
+      },
+    ],
+    [
+      'throws something that is not an Error',
+      () => {
+        throw 'handler blew up';
+      },
+    ],
+    ['rejects asynchronously', () => Promise.reject(new Error('handler blew up'))],
+  ];
+
+  it.each(misbehaviours)('%s', async (_label, misbehave) => {
+    const proxy = await startProxy();
+    const prefix = freshPrefix();
+    const plugin = new RedisPlugin();
+    const t = freshTopic();
+    // A rejection the loop never attached to reaches the process, where Node's default ends the
+    // whole bridge. Collected here rather than left to the runner's global error accounting, so the
+    // row that produced it is the row that fails.
+    const escaped: unknown[] = [];
+    const collect = (reason: unknown): void => {
+      escaped.push(reason);
+    };
+    process.on('unhandledRejection', collect);
+    try {
+      await plugin.connect({ url: proxy.url, key_prefix: prefix, block_ms: 100 });
+      const baseline = proxy.live();
+      const seen: string[] = [];
+      let nth = 0;
+      // Whatever the handler produces is RETURNED, so a rejected promise reaches the loop rather
+      // than being swallowed by this fixture — which is the only way the async row grades anything.
+      await plugin.subscribe(t, (m) => {
+        seen.push(m.content);
+        return misbehave(nth++);
+      });
+      const held = proxy.live() - baseline;
+      expect(held, 'subscribe() parked no reader, so the leak arm below grades nothing').toBe(1);
+
+      const sent = ['first', 'second', 'third'];
+      for (const c of sent) await plugin.post(t, asHandle('w'), c);
+      await expect
+        .poll(() => seen, { timeout: 5000, interval: 25 })
+        .toEqual(sent); // every message after the failure, in order
+
+      await plugin.disconnect();
+      await expect.poll(() => proxy.live(), { timeout: 5000, interval: 50 }).toBe(0);
+      expect(
+        escaped,
+        'a handler failure escaped the read loop as an unhandled rejection, which ends the whole ' +
+          'bridge process on Node\'s default --unhandled-rejections=throw',
+      ).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', collect);
+      await plugin.disconnect().catch(() => undefined);
+      proxy.close();
+      await wipe(prefix);
+    }
+  });
+});
+
+// -------------------------------------------------------------------------------------------
 // CLASS: a seam call that allocates a backend connection must allocate a BOUNDED number of them.
 // `XREAD BLOCK` holds its connection for the whole wait, core imposes no concurrency limit on
 // `fetch_recent`, and its wrapper ABANDONS an aborted long-poll rather than cancelling the plugin

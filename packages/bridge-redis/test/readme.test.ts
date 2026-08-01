@@ -279,6 +279,10 @@ const documentedBehaviours: Array<[string, RegExp]> = [
   ['…and subscribe is not the thing being capped', /`subscribe` is not capped/],
   ['a permanent refusal fails the long poll instead of emptying it', /rather than\s+being reported as an empty long poll/],
   ['retention trims approximately, and only on write', /approximate/],
+  [
+    'a credential bound for a cleartext remote link is reported at connect()',
+    /carries a credential to a non-loopback host is\s+reported/,
+  ],
 ];
 
 describe('bridge-redis README — every behaviour the suite pins is described here', () => {

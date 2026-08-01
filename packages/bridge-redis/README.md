@@ -115,7 +115,10 @@ messages under any `sender` — which the bridge then feeds into a live Claude C
   `url: "redis://:${REDIS_PASSWORD}@127.0.0.1:6379"`. Keep the value in `.env` / your secret
   store — never in a committed config file.
 - Use `rediss://` (TLS) whenever the server is not on localhost; the URL carries the password in
-  cleartext otherwise.
+  cleartext otherwise. A `redis://` URL that carries a credential to a non-loopback host is
+  reported at `connect()` on stderr — `parley-redis: SECURITY: backend_config.url redis://<host>:<port>
+  carries a credential over plaintext …` — naming the origin and never the value. It is a warning,
+  not a load error: a dev proxy or a tunnel endpoint is a legitimate reason to keep going.
 - For the remote/chat deployment (DESIGN §10), reach the server over a private network, a
   WireGuard/Tailscale link or an SSH tunnel. Do not publish 6379 to the internet.
 

@@ -143,6 +143,23 @@ const producers: Producer[] = [
       ),
   },
   {
+    matches: /^parley-redis: SECURITY: backend_config.url/,
+    produce: async () => {
+      const plugin = new RedisPlugin();
+      const url = (await freeEndpoint()).replace('//127.0.0.1', '//parley:s3cret@bus.example.test');
+      try {
+        return {
+          line: await stderrLine(/SECURITY/, async () => {
+            await plugin.connect({ url, connect_timeout_ms: FAST }).catch(() => undefined);
+          }),
+          placeholders: { '<host>:<port>': new URL(url).host },
+        };
+      } finally {
+        await plugin.disconnect().catch(() => undefined);
+      }
+    },
+  },
+  {
     matches: /^parley-redis: live delivery STOPPED/,
     produce: () =>
       withFake(

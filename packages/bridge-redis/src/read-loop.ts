@@ -1,4 +1,4 @@
-import type { MessageHandler, Topic } from '@sharptrick/parley-core';
+import type { Message, MessageHandler, Topic } from '@sharptrick/parley-core';
 import { type RedisClient, serverRefusal } from './client.js';
 import {
   errorText,
@@ -19,6 +19,22 @@ const RETRY_MAX_MS = 2000;
 const DEGRADED_AFTER_FAILURES = 5;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Hand one message to the handler, absorbing BOTH ways it can fail. Keep the throw arm, so that one
+ * message a handler chokes on does not end live delivery for the topic behind a `subscribe()` that
+ * already resolved — silently, since catch-up keeps working and nothing writes a line. Keep the
+ * REJECTION arm too, so that an `async` handler — which the seam's `=> void` return type does not
+ * forbid, and which core is free to pass — cannot take the whole bridge down with an unhandled
+ * rejection on Node's default `--unhandled-rejections=throw`.
+ */
+function deliver(handler: MessageHandler, message: Message): void {
+  try {
+    void Promise.resolve(handler(message)).catch(() => undefined);
+  } catch {
+    /* the handler's failure is never the loop's */
+  }
+}
 
 export interface ReadLoop {
   reader: RedisClient;
@@ -73,11 +89,7 @@ export async function runReadLoop(
     for (const stream of res) {
       for (const entry of stream.messages) {
         lastId = entry.id;
-        try {
-          handler(rowToMessage(topic, entry.id, entry.message));
-        } catch {
-          /* handler is best-effort; never break the loop (DESIGN §6) */
-        }
+        deliver(handler, rowToMessage(topic, entry.id, entry.message));
       }
     }
   }

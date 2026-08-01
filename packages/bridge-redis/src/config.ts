@@ -1,3 +1,5 @@
+import { pluginError } from './diagnostics.js';
+
 /** The endpoint `url` falls back to when omitted (or `null`). Exported so a test can name it
  * without hard-coding an endpoint of its own. */
 export const DEFAULT_URL = 'redis://127.0.0.1:6379';
@@ -79,7 +81,7 @@ function describeValue(value: unknown): string {
 function assertKnownKeys(cfg: Record<string, unknown>): void {
   for (const key of Object.keys(cfg)) {
     if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
-      throw new Error(
+      throw pluginError(
         `parley-redis: unknown backend_config key '${key}' — expected one of ` +
           `${CONFIG_KEYS.join(', ')}`,
       );
@@ -96,7 +98,7 @@ function assertKnownKeys(cfg: Record<string, unknown>): void {
 function normalizeString(key: string, value: unknown, fallback: string): string {
   if (value === undefined || value === null) return fallback;
   if (typeof value !== 'string' || value === '') {
-    throw new Error(
+    throw pluginError(
       `parley-redis: ${key} must be a non-empty string (got ${describeValue(value)}); ` +
         `omit it for the default '${fallback}'`,
     );
@@ -116,7 +118,7 @@ function normalizeString(key: string, value: unknown, fallback: string): string 
 function normalizeUrl(value: unknown, fallback: string): string {
   const url = normalizeString('url', value, fallback);
   const reject = (why: string): never => {
-    throw new Error(`parley-redis: url must ${why}; omit it for the default '${fallback}'`);
+    throw pluginError(`parley-redis: url must ${why}; omit it for the default '${fallback}'`);
   };
   let parsed: URL;
   try {
@@ -140,7 +142,7 @@ function normalizeUrl(value: unknown, fallback: string): string {
 function normalizeMillis(key: string, value: unknown, fallback: number): number {
   if (value === undefined || value === null) return fallback;
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(
+    throw pluginError(
       `parley-redis: ${key} must be a positive whole number of milliseconds ` +
         `(got ${describeValue(value)}); omit it for the default ${fallback}`,
     );
@@ -158,7 +160,7 @@ function normalizeRetentionDays(value: number | null | undefined): number | unde
   if (value === undefined || value === null) return undefined;
   const maxDays = Math.floor(Date.now() / 86_400_000);
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > maxDays) {
-    throw new Error(
+    throw pluginError(
       `parley-redis: retention_days must be a positive number of days no greater than ${maxDays} ` +
         `(got ${describeValue(value)}); omit it (or set null) to keep every entry forever`,
     );

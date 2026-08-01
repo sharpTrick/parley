@@ -20,7 +20,13 @@ import {
   withDeadline,
 } from './client.js';
 import { type RedisBackendConfig, resolveConfig, type ResolvedConfig } from './config.js';
-import { errorText, fromServer } from './diagnostics.js';
+import {
+  errorText,
+  fromServer,
+  isPluginError,
+  pluginError,
+  reportPlaintextCredential,
+} from './diagnostics.js';
 import { type Entry, rowToMessage } from './entry.js';
 import { assertMintedCursor, compareIds, MAX_ENTRY_ID, streamTail } from './entry-id.js';
 import { runReadLoop } from './read-loop.js';
@@ -92,9 +98,9 @@ export class RedisPlugin implements BackendPlugin {
     try {
       return await work();
     } catch (err) {
-      if (err instanceof Error && err.message.startsWith('parley-redis:')) throw err;
+      if (isPluginError(err)) throw err;
       const text = fromServer(this.cfg.url, errorText(err));
-      throw new Error(`parley-redis: ${text} (topic '${topic}', key '${key}')`);
+      throw pluginError(`parley-redis: ${text} (topic '${topic}', key '${key}')`);
     }
   }
 
@@ -106,6 +112,7 @@ export class RedisPlugin implements BackendPlugin {
 
   private async open(cfg: RedisBackendConfig): Promise<void> {
     const resolved = resolveConfig(cfg);
+    reportPlaintextCredential(resolved.url);
     // Tear the previous connection down first, so that a re-connect cannot orphan a live socket per
     // call until Redis hits maxclients. It also re-baselines the generation, killing prior loops.
     await this.tearDown();

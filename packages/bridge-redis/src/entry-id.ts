@@ -1,5 +1,6 @@
 import type { Topic } from '@sharptrick/parley-core';
 import type { RedisClient } from './client.js';
+import { pluginError } from './diagnostics.js';
 
 /** A Redis Stream entry id — `<ms>` or `<ms>-<seq>`. Cursors and backendMsgIds are exactly this. */
 const CURSOR_PATTERN = /^\d+(-\d+)?$/;
@@ -18,7 +19,7 @@ export function assertMintedCursor(topic: Topic, since: string): void {
   const wellFormed =
     CURSOR_PATTERN.test(since) && since.split('-').every((part) => BigInt(part) <= MAX_ID_COMPONENT);
   if (!wellFormed) {
-    throw new Error(
+    throw pluginError(
       `parley-redis: malformed cursor '${since}' for topic ${topic} — ` +
         `expected a Redis Stream entry id ('<ms>' or '<ms>-<seq>') minted by this backend`,
     );

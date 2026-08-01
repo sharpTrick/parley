@@ -1,5 +1,5 @@
 import type { Topic } from '@sharptrick/parley-core';
-import { sanitizeBody } from '@sharptrick/parley-net-util';
+import { isLoopbackHost, sanitizeBody } from '@sharptrick/parley-net-util';
 
 // Every line this file writes goes to stderr: stdout is the MCP JSON-RPC channel.
 
@@ -15,6 +15,25 @@ export function endpointOf(url: string): string {
 
 export const errorText = (err: unknown): string =>
   err instanceof Error ? err.message : String(err);
+
+const MINTED_HERE = Symbol('parley-redis');
+
+/**
+ * An error this plugin composed, marked as one.
+ *
+ * Keep the mark OFF the message, so that a server whose RESP error opens with `parley-redis:`
+ * cannot pass its own text off as already sanitized: a provenance test the SERVER can spell hands
+ * back an unbounded, unredacted, line-structure-forging reply verbatim, straight into an operator's
+ * log and into the model context core renders a thrown seam error into.
+ */
+export function pluginError(message: string): Error {
+  return Object.assign(new Error(message), { [MINTED_HERE]: true });
+}
+
+/** True only of an error {@link pluginError} minted — never of one whose text merely claims to be. */
+export function isPluginError(err: unknown): err is Error {
+  return err instanceof Error && MINTED_HERE in err;
+}
 
 /**
  * Every spelling this connection's password can be echoed back in: the one the URL carries, which
@@ -52,6 +71,34 @@ export function fromServer(url: string, text: string): string {
     redacted = redacted.split(spelling).join('<redacted>');
   }
   return sanitizeBody(redacted);
+}
+
+/** The one scheme node-redis dials over TLS; `redis:` puts the AUTH it sends on the wire as text. */
+const TLS_SCHEME = 'rediss:';
+
+/**
+ * Keep this line, so that an operator who put a password in `backend_config.url` and pointed it at a
+ * shared deployment — which both the README quickstart and `examples/multi-session` invite — learns
+ * that every host on the path can read it and post as this bridge. Loopback is silent, and so is a
+ * URL with no credential to lose; the ORIGIN is named and never the value.
+ */
+export function reportPlaintextCredential(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  const carriesCredential = parsed.username !== '' || parsed.password !== '';
+  if (parsed.protocol === TLS_SCHEME || !carriesCredential || isLoopbackHost(parsed.hostname)) {
+    return;
+  }
+  process.stderr.write(
+    `parley-redis: SECURITY: backend_config.url ${parsed.protocol}//${parsed.host} carries a ` +
+      `credential over plaintext ${parsed.protocol}// to a non-loopback host, so the AUTH this ` +
+      `bridge sends — and every message body after it — crosses the network in the clear. Use ` +
+      `rediss:// for any remote server.\n`,
+  );
 }
 
 /**

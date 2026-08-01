@@ -1,5 +1,5 @@
 import { createClient } from 'redis';
-import { endpointOf, errorText, fromServer } from './diagnostics.js';
+import { endpointOf, errorText, fromServer, pluginError } from './diagnostics.js';
 
 export type RedisClient = ReturnType<typeof createClient>;
 
@@ -38,7 +38,7 @@ export function createRedisClient(url: string, connectTimeoutMs: number): RedisC
       reconnectStrategy: (retries: number) =>
         handshakeComplete
           ? Math.min(50 * 2 ** retries, 2000)
-          : new Error(unreachable(url, connectTimeoutMs)),
+          : pluginError(unreachable(url, connectTimeoutMs)),
     },
   });
   client.on('ready', () => {
@@ -78,7 +78,7 @@ export async function withDeadline<T>(work: Promise<T>, ms: number, message: str
     return await Promise.race([
       work,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), ms);
+        timer = setTimeout(() => reject(pluginError(message)), ms);
       }),
     ]);
   } finally {
@@ -109,7 +109,7 @@ export async function openCommandClient(
   } catch (err) {
     const respError = serverRefusal(err) ?? serverRefusal(lastEmittedError.get(client));
     await client.disconnect().catch(() => undefined);
-    throw new Error(
+    throw pluginError(
       respError !== undefined
         ? `parley-redis: connected to ${endpointOf(url)} but the server refused a command: ` +
           fromServer(url, respError)
