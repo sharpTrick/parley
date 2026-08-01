@@ -6,11 +6,12 @@ import {
   asHandle,
   asTopic,
   catchUpTopic,
+  type Cursor,
   ReadStateStore,
   SeenSet,
 } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SqlitePlugin } from '../src/index.js';
+import { MAX_PAGE, POLL_BATCH, SqlitePlugin } from '../src/index.js';
 
 /**
  * Core runs catch-up to completion and only arms `subscribe` later (`catchUpAll` in buildBridge,
@@ -227,4 +228,134 @@ describe('a message committed between catch-up and subscribe is still delivered 
       interval: 10,
     });
   });
+});
+
+/**
+ * The hand-off point names what the last read RETURNED — the row its `nextCursor` carries — never
+ * the topic's tail and never the caller's `since`. Those three coincide whenever a read drains the
+ * topic, which is why the block above cannot tell them apart: every case there reaches the tail.
+ * The cases below stop reads SHORT of it, and grade the seam's promise rather than the arithmetic:
+ * `subscribe` delivers exactly the messages a `fetchRecent` resuming from the caller's persisted
+ * cursor would have returned, and nothing else. Recording the tail drops the rows in between;
+ * recording the request replays the ones already served.
+ */
+interface ReadPlan {
+  name: string;
+  /** Reads on `reader`, returning the cursor those reads leave as the caller's read position. */
+  read(reader: SqlitePlugin, limit: number): Promise<Cursor>;
+  /** How many of the topic's `rows` those reads accounted for. */
+  servedThrough(rows: number, limit: number): number;
+}
+
+const fromTheStart = (limit: number) => ({ topic: T, since: asCursor('0'), limit });
+
+const READ_PLANS: ReadPlan[] = [
+  {
+    name: 'catch-up drains the topic',
+    async read(reader, limit) {
+      const readState = new ReadStateStore(join(dir(), 'state.json'));
+      await catchUpTopic({ plugin: reader, topic: T, limit, readState, seen: new SeenSet() });
+      const cursor = readState.get(T);
+      expect(cursor).toBeDefined();
+      return cursor as Cursor;
+    },
+    servedThrough: (rows) => rows,
+  },
+  {
+    name: 'one page stops short of the tail',
+    async read(reader, limit) {
+      return (await reader.fetchRecent(fromTheStart(limit))).nextCursor;
+    },
+    servedThrough: (rows, limit) => Math.min(limit, rows),
+  },
+  {
+    name: 'two pages stop short of the tail',
+    async read(reader, limit) {
+      const first = await reader.fetchRecent(fromTheStart(limit));
+      return (await reader.fetchRecent({ topic: T, since: first.nextCursor, limit })).nextCursor;
+    },
+    servedThrough: (rows, limit) => Math.min(2 * limit, rows),
+  },
+  {
+    name: 'a page stopping short, then a re-read of an older one',
+    async read(reader, limit) {
+      const page = await reader.fetchRecent(fromTheStart(limit));
+      await reader.fetchRecent({ topic: T, since: asCursor('0'), limit: 1 });
+      return page.nextCursor;
+    },
+    servedThrough: (rows, limit) => Math.min(limit, rows),
+  },
+];
+
+const SHAPES = [
+  { rows: 0, limit: 1 },
+  { rows: 1, limit: 1 },
+  { rows: 5, limit: 1 },
+  { rows: 5, limit: 2 },
+  { rows: 5, limit: 4 },
+  { rows: 5, limit: 5 },
+  { rows: 5, limit: 6 },
+];
+const WINDOW_SIZES_AFTER_A_SHORT_READ = [0, 2];
+
+/**
+ * One case of the matrix: read, commit `window` rows, arm the live loop, commit one more. The
+ * expectation is derived twice — from the cursor the read handed back (a peer resuming from it)
+ * and from how many rows the plan accounted for — so a cell cannot pass by expecting nothing.
+ */
+async function expectLiveResumesWhereTheReadStopped(
+  plan: ReadPlan,
+  shape: { rows: number; limit: number },
+  window: number,
+): Promise<void> {
+  const path = join(dir(), 'p.db');
+  const reader = await connected(path);
+  const peer = await connected(path);
+  const history = numbered('history', shape.rows);
+  await fill(peer, history);
+
+  const handoff = await plan.read(reader, shape.limit);
+
+  const windowed = numbered('in-the-window', window);
+  await fill(peer, windowed);
+
+  const unserved = [...history, ...windowed].slice(plan.servedThrough(shape.rows, shape.limit));
+  const fromTheCursor = await peer.fetchRecent({ topic: T, since: handoff, limit: MAX_PAGE });
+  expect(fromTheCursor.messages.map((m) => m.content)).toEqual(unserved);
+
+  const pushed: string[] = [];
+  await reader.subscribe(T, (m) => pushed.push(m.content));
+  await fill(peer, ['after-subscribe']);
+
+  await vi.waitFor(() => expect(pushed).toEqual([...unserved, 'after-subscribe']), {
+    timeout: 5000,
+    interval: 10,
+  });
+}
+
+describe('the live loop resumes at what the last read returned, not at the topic tail', () => {
+  for (const plan of READ_PLANS) {
+    for (const shape of SHAPES) {
+      for (const window of WINDOW_SIZES_AFTER_A_SHORT_READ) {
+        it(`${plan.name}: ${shape.rows} row(s), limit ${shape.limit}, ${window} in the window`, () =>
+          expectLiveResumesWhereTheReadStopped(plan, shape, window));
+      }
+    }
+  }
+
+  it('at least one case leaves the hand-off point below the topic tail', () => {
+    const diverging = READ_PLANS.flatMap((plan) =>
+      SHAPES.filter((shape) => plan.servedThrough(shape.rows, shape.limit) < shape.rows).map(
+        (shape) => `${plan.name} @ ${shape.rows}/${shape.limit}`,
+      ),
+    );
+    expect(diverging.length).toBeGreaterThan(0);
+  });
+
+  it('a backlog larger than one poll batch still hands off at the row the read returned', () =>
+    expectLiveResumesWhereTheReadStopped(
+      READ_PLANS[1] as ReadPlan,
+      { rows: POLL_BATCH + 1, limit: 2 },
+      1,
+    ));
 });
