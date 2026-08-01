@@ -101,7 +101,7 @@ describe('nats cursor integrity — a short read must not skip what it did not r
     fake.state.yieldLimit = 2;
     const page = await plugin.fetchRecent({ topic: TOPIC });
     expect(page.messages.map((m) => m.content)).toEqual(['a', 'b']);
-    expect(page.nextCursor).toBe(page.messages[1].cursor);
+    expect(page.nextCursor).toBe(page.messages[1]!.cursor);
   });
 
   // The same class from the ARGUMENT side. A `limit` below 1 (or one that is not an integer) makes

@@ -3,7 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 import { fakeJetStream, injectFake, payload, type FakeRecord } from './fake-jetstream.js';
 import { seqOf } from './helpers.js';
-import { AGREEMENT_ROWS, fakeArena, fakePrimitives, PRIMITIVES } from './jetstream-agreement.js';
+import {
+  AGREEMENT_ROWS,
+  fakeArena,
+  fakePrimitives,
+  GROWTH_PROBES,
+  PRIMITIVES,
+  primitivesOf,
+} from './jetstream-agreement.js';
 
 // Class: the sequence range of a stream is NOT dense. `max_age` retention prunes the front,
 // per-subject limits and message deletes punch holes, so `last_seq - since` over-counts what the
@@ -428,11 +435,28 @@ describe('nats pull fake fidelity — closing a pull loses what it had not deliv
   // real server, so the two can no longer diverge silently. The coverage row is what keeps it
   // honest: a primitive added to the fake with no agreement row fails here by default.
   describe('the fake answers every JetStream primitive it models the way the server does', () => {
-    it('has an agreement row for every primitive the fake models', () => {
-      expect(fakePrimitives()).toEqual([...PRIMITIVES].sort());
+    it('has an agreement row for every primitive the fake models', async () => {
+      expect(await fakePrimitives()).toEqual([...PRIMITIVES].sort());
       const covered = [...new Set(AGREEMENT_ROWS.flatMap((row) => row.covers))].sort();
       expect(covered).toEqual([...PRIMITIVES].sort());
     });
+
+    // Class: a completeness gate whose enumeration is partly hand-written cannot see what it does
+    // not already list — and the surface it skips is exactly where an unverified semantic hides.
+    // One probe per surface the fake exposes, INCLUDING the objects its calls return: each grows a
+    // method there and demands the enumeration report it, so a level that stops being derived is a
+    // failure here rather than a quiet exemption.
+    for (const probe of GROWTH_PROBES) {
+      it(`counts a method the fake grows on ${probe.surface}`, async () => {
+        const grown = fakeJetStream();
+        probe.grow(grown);
+
+        const listed = await primitivesOf(grown);
+
+        expect(listed).toContain(probe.primitive);
+        expect(listed).not.toEqual([...PRIMITIVES].sort());
+      });
+    }
 
     for (const row of AGREEMENT_ROWS) {
       it(row.name, async () => {

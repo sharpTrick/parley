@@ -68,11 +68,11 @@ suite('nats untrusted payloads — hostile bytes must not break the seam', () =>
         expect(page.messages).toHaveLength(3);
         for (const m of page.messages) assertAllStrings(m);
         // The poison record must not swallow its neighbours either.
-        expect(page.messages[0].content).toBe('good-before');
-        expect(page.messages[2].content).toBe('good-after');
+        expect(page.messages[0]!.content).toBe('good-before');
+        expect(page.messages[2]!.content).toBe('good-after');
 
         // Catch-up across the same record is equally fatal if it throws.
-        const tail = await plugin.fetchRecent({ topic, since: page.messages[0].cursor });
+        const tail = await plugin.fetchRecent({ topic, since: page.messages[0]!.cursor });
         expect(tail.messages).toHaveLength(2);
         for (const m of tail.messages) assertAllStrings(m);
       } finally {

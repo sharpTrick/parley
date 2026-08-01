@@ -6,6 +6,7 @@
  * instead of timing-dependent.
  */
 import type { Topic } from '@sharptrick/parley-core';
+import { ConsumerDebugEvents } from 'nats';
 
 const enc = new TextEncoder();
 
@@ -295,28 +296,42 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
             const swallowed = generation === state.swallowGeneration ? state.swallowed : [];
             let delivery = 0;
             let closed = false;
+            let tornDown = (): void => undefined;
+            const teardown = new Promise<void>((resolve) => {
+              tornDown = () => resolve();
+            });
             return {
               close: async () => {
                 closed = true;
               },
-              status: async () => ({ [Symbol.asyncIterator]: async function* () {} }),
+              status: async () => ({
+                [Symbol.asyncIterator]: async function* () {
+                  yield { type: ConsumerDebugEvents.Next };
+                  await teardown;
+                },
+              }),
               [Symbol.asyncIterator]: async function* () {
-                if (silent) return; // EOF with no status event — a dropped link, not a deletion
-                let next = start;
-                while (!closed) {
-                  const due = state.records.filter((r) => r.seq >= next && visible(r));
-                  for (const r of due) {
-                    next = r.seq + 1;
-                    delivery += 1;
-                    if (swallowed.includes(r.seq)) continue;
-                    yield {
-                      seq: r.seq,
-                      data: enc.encode(r.data),
-                      info: { deliverySequence: delivery },
-                    };
+                if (!silent) {
+                  let next = start;
+                  while (!closed) {
+                    const due = state.records.filter((r) => r.seq >= next && visible(r));
+                    for (const r of due) {
+                      next = r.seq + 1;
+                      delivery += 1;
+                      if (swallowed.includes(r.seq)) continue;
+                      yield {
+                        seq: r.seq,
+                        data: enc.encode(r.data),
+                        info: { deliverySequence: delivery },
+                      };
+                    }
+                    await new Promise((r) => setTimeout(r, 10));
                   }
-                  await new Promise((r) => setTimeout(r, 10));
                 }
+                // Keep this OUT of a `finally`, so that an ABANDONED iterator leaves the status
+                // stream open the way nats.js does — its teardown is queued behind the messages, so
+                // only a reader that drains to the end ever reaches it.
+                tornDown();
               },
             };
           },
