@@ -14,6 +14,7 @@ import {
   sanitizeBody,
   STOP_POLL_MS,
 } from '@sharptrick/parley-net-util';
+import { importingFiles } from './consumers.js';
 
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
 
@@ -1592,22 +1593,107 @@ describe('retryAfterFromHeader', () => {
       }),
     );
 
-  it.each([
+  const HTTP_DATE_SPELLINGS: [label: string, spelling: string, at: number][] = [
     ['IMF-fixdate', 'Fri, 06 Nov 2099 08:49:37 GMT', Date.UTC(2099, 10, 6, 8, 49, 37)],
     ['obsolete RFC 850', 'Saturday, 06-Nov-32 08:49:37 GMT', Date.UTC(2032, 10, 6, 8, 49, 37)],
     ['asctime', 'Fri Nov  6 08:49:37 2099', Date.UTC(2099, 10, 6, 8, 49, 37)],
-  ])('reads the %s spelling of an HTTP-date', (_label, spelling, at) => {
-    expect(from(spelling, at)).toBe(60_000);
-  });
+  ];
 
-  it.each([
+  const NOT_HTTP_DATES: [label: string, spelling: string][] = [
     ['an ISO date', '2099-01-01'],
     ['an RFC 3339 timestamp', '2099-11-06T08:49:37Z'],
     ['a slashed date', '01/01/3600'],
     ['a date with no day-of-week', '06 Nov 2099 08:49:37 GMT'],
     ['a day name followed by an ISO date', 'Fri 2099-11-06'],
-  ])('does not invent a wait out of %s', (_label, spelling) => {
-    expect(from(spelling, Date.UTC(2099, 10, 6, 8, 49, 37))).toBeUndefined();
+    // The pinned asctime shape with a field outside its range: `Date.UTC` rolls these forward into
+    // an instant hours or months away, which is a wait no deadline covers rather than no hint.
+    ['an asctime with a 32nd day', 'Fri Nov 32 08:49:37 2099'],
+    ['an asctime with a 25th hour', 'Fri Nov  6 25:49:37 2099'],
+    ['an asctime with a 69th minute', 'Fri Nov  6 08:69:37 2099'],
+    ['an asctime with a 61st second', 'Fri Nov  6 08:49:61 2099'],
+    ['an asctime naming no month', 'Fri Xyz  6 08:49:37 2099'],
+  ];
+
+  /**
+   * Every assertion above is an ABSOLUTE instant, and an HTTP-date is GMT by definition (RFC 9110
+   * §5.6.7) — so any of them reading differently under a different `TZ` is a parser consulting the
+   * host's clock for a value that does not depend on it. asctime, the one spelling with no zone
+   * token, was doing exactly that: `Date.parse` read it locally, which east of Greenwich turned a
+   * stated 120 s wait into no hint at all and west of it into one past the call's deadline.
+   *
+   * Zones rather than one pinned `TZ`: pinning `TZ=UTC` in the vitest config would have made this
+   * suite green everywhere while the parser stayed wrong for every non-UTC deployment.
+   */
+  const ZONES = ['UTC', 'Asia/Tokyo', 'America/New_York', 'Pacific/Kiritimati', 'Australia/Lord_Howe'];
+
+  const inZone = <T>(zone: string, fn: () => T): T => {
+    const before = process.env.TZ;
+    process.env.TZ = zone;
+    try {
+      return fn();
+    } finally {
+      if (before === undefined) delete process.env.TZ;
+      else process.env.TZ = before;
+    }
+  };
+
+  it('crosses zones that actually differ, so the rows below are not five spellings of UTC', () => {
+    const offsets = new Set(
+      ZONES.map((zone) => inZone(zone, () => new Date(Date.UTC(2099, 10, 6)).getHours())),
+    );
+    expect(offsets.size).toBe(ZONES.length);
+  });
+
+  it('re-enters the parser under the zone it is given, so the rows below grade the zone', () => {
+    expect(inZone('Asia/Tokyo', () => new Date(0).getHours())).not.toBe(
+      inZone('America/New_York', () => new Date(0).getHours()),
+    );
+  });
+
+  describe.each(ZONES)('with TZ=%s', (zone) => {
+    it.each(HTTP_DATE_SPELLINGS)(
+      'reads the %s spelling of an HTTP-date',
+      (_label, spelling, at) => {
+        expect(inZone(zone, () => from(spelling, at))).toBe(60_000);
+      },
+    );
+
+    it.each(NOT_HTTP_DATES)('does not invent a wait out of %s', (_label, spelling) => {
+      expect(
+        inZone(zone, () => from(spelling, Date.UTC(2099, 10, 6, 8, 49, 37))),
+      ).toBeUndefined();
+    });
+  });
+
+  /**
+   * The invariant itself rather than the two tables that state it today: every clock-shaped literal
+   * in THIS FILE, wherever it is written, must read identically under every zone. A spelling added
+   * to a third table is graded here without anyone remembering to cross it with `ZONES`.
+   */
+  const clockShapedLiterals = (): string[] => [
+    ...new Set(
+      [
+        ...readFileSync(new URL(import.meta.url), 'utf8').matchAll(
+          /'([^'\n]*\d\d:\d\d:\d\d[^'\n]*)'/g,
+        ),
+      ].map((m) => m[1] as string),
+    ),
+  ];
+
+  it('sees every clock-shaped spelling the tables above name, so the sweep is not empty', () => {
+    const tabled = [
+      ...HTTP_DATE_SPELLINGS.map(([, spelling]) => spelling),
+      ...NOT_HTTP_DATES.map(([, spelling]) => spelling),
+    ].filter((spelling) => /\d\d:\d\d:\d\d/.test(spelling));
+    expect(tabled.length).toBeGreaterThan(5);
+    expect(clockShapedLiterals()).toEqual(expect.arrayContaining(tabled));
+  });
+
+  it.each(clockShapedLiterals())('reads `%s` the same under every zone', (literal) => {
+    const readings = ZONES.map((zone) =>
+      inZone(zone, () => from(literal, Date.UTC(2099, 10, 6, 8, 49, 37))),
+    );
+    expect(new Set(readings).size).toBe(1);
   });
 
   // An HTTP-date states a point on the SERVER's clock, so subtracting OUR clock reads a real
@@ -2016,9 +2102,6 @@ describe('every shipped default is graded on the path it governs', () => {
  * shipping by default — and keeping one is a decision that has to be written down.
  */
 describe('every export earns its place', () => {
-  const packagesDir = new URL('../../', import.meta.url);
-  const SELF = '@sharptrick/parley-net-util';
-
   const INTENTIONALLY_UNCONSUMED: Record<string, string> = {
     clampBackoff:
       'the applier of MAX_BACKOFF_MS, which three backends read and two document by name',
@@ -2027,42 +2110,13 @@ describe('every export earns its place', () => {
     STOP_POLL_MS: 'the documented bound on how long disconnect waits on a backoff',
   };
 
-  /**
-   * Comments stripped, so that a name mentioned only in prose does not read as a consumer — which
-   * is precisely how the dead export looked consumed.
-   */
-  const consumerFiles = (): { path: string; code: string }[] => {
-    const out: { path: string; code: string }[] = [];
-    for (const dir of readdirSync(packagesDir)) {
-      if (dir === 'bridge-net-util') continue;
-      for (const sub of ['src', 'test']) {
-        let names: string[] = [];
-        try {
-          names = readdirSync(new URL(`${dir}/${sub}/`, packagesDir));
-        } catch {
-          continue;
-        }
-        for (const name of names.filter((n) => n.endsWith('.ts'))) {
-          const path = `${dir}/${sub}/${name}`;
-          const text = readFileSync(new URL(path, packagesDir), 'utf8');
-          if (!text.includes(SELF)) continue;
-          out.push({
-            path,
-            code: text.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, ''),
-          });
-        }
-      }
-    }
-    return out;
-  };
-
   const consumers = (name: string): string[] =>
-    consumerFiles()
+    importingFiles()
       .filter(({ code }) => new RegExp(`\\b${name}\\b`).test(code))
       .map(({ path }) => path);
 
   it('finds consumers at all, so the rows below are not reading an empty set', () => {
-    expect(consumerFiles().length).toBeGreaterThan(5);
+    expect(importingFiles().length).toBeGreaterThan(5);
     expect(consumers('fetchWithRetry').length).toBeGreaterThan(3);
     expect(Object.keys(api).length).toBeGreaterThan(5);
   });

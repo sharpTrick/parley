@@ -1,7 +1,17 @@
 import { asTopic } from '@sharptrick/parley-core';
 import type { AddressInfo } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from 'vitest';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { DiscordPlugin } from '../src/index.js';
 import { FAKE_TOKEN, startFakeDiscord, type FakeDiscord } from './fake-discord.js';
@@ -116,7 +126,7 @@ describe('a malformed gateway frame never escapes the message listener', () => {
   let fake: FakeDiscord;
   let gateway: HostileGateway;
   let crashes: unknown[] = [];
-  let diag: ReturnType<typeof vi.spyOn>;
+  let diag: MockInstance;
   const record = (err: unknown): void => {
     crashes.push(err);
   };

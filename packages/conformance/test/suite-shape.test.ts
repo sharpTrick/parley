@@ -18,7 +18,9 @@ import {
   casesIn,
   deferredPromises,
   guardedRegions,
+  promiseExecutors,
   suiteSource as source,
+  suiteSources,
 } from './suite-source.js';
 
 const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
@@ -344,6 +346,99 @@ describe('the suite grades every backend it certifies', () => {
     ])('sees %s', (_label, snippet, names, allHandled) => {
       expect(deferredPromises(snippet).map((d) => d.name)).toEqual(names);
       expect(deferredPromises(snippet).every((d) => d.handled)).toBe(allHandled);
+    });
+  });
+
+  /**
+   * The same failure one layer out. The block above grades bindings inside a CASE; a suite helper
+   * lives above the first `it(` and is invisible to `casesIn`, so the suite's `postAfter` — a
+   * `new Promise` that resolved inside a `.then()` and bound no rejection path — turned a plugin's
+   * `post` rejection into a case that hung for its whole timeout AND an unhandled rejection
+   * attributed to some other case. Graded over the whole module, wherever the executor is written.
+   */
+  describe('every promise the suite builds by hand can settle on failure', () => {
+    const risky = (): [string, string][] =>
+      suiteSources.flatMap((module) =>
+        promiseExecutors(module)
+          .filter(({ drivesAPromise }) => drivesAPromise)
+          .map(
+            ({ executor, settlesOnRejection }) =>
+              [
+                executor.replaceAll(/\s+/g, ' ').slice(0, 90),
+                settlesOnRejection ? 'settles' : 'hangs',
+              ] as [string, string],
+          ),
+      );
+
+    it('finds a hand-built promise that drives another, so the row below is not an empty table', () => {
+      expect(risky().length).toBeGreaterThan(0);
+    });
+
+    it.each(risky())('`%s` %s on a rejection', (_executor, verdict) => {
+      expect(
+        verdict,
+        'this executor drives another promise and binds only `resolve`, so a rejection inside it ' +
+          'leaves the promise pending forever and reaches the process unhandled — bind `reject`',
+      ).toBe('settles');
+    });
+
+    // The detector against the shapes it has to tell apart, so it cannot regress to finding nothing.
+    it.each([
+      [
+        'a helper that resolves inside a then() with no rejection path',
+        'const h = (x) => new Promise((r) => { setTimeout(() => { void p(x).then(() => r()); }); });',
+        true,
+        false,
+      ],
+      [
+        'the same helper with both settle paths bound',
+        'const h = (x) => new Promise((r, bad) => { setTimeout(() => { void p(x).then(() => r(), bad); }); });',
+        true,
+        true,
+      ],
+      [
+        'a rejection path bound as a declared-but-unused parameter',
+        'const h = (x) => new Promise((r, bad) => { setTimeout(() => { void p(x).then(() => r()); }); });',
+        true,
+        false,
+      ],
+      [
+        'a catch that routes to the rejection path',
+        'new Promise((r, bad) => { void p().then(r).catch(bad); })',
+        true,
+        true,
+      ],
+      ['a bare timer that drives no promise', 'await new Promise((r) => setTimeout(r, 5));', false, false],
+      [
+        'an executor written as a function expression',
+        'new Promise(function (r) { void p().then(() => r()); })',
+        true,
+        false,
+      ],
+      [
+        'an executor whose promise type is written out',
+        'new Promise<void>((r) => { void p().then(() => r()); })',
+        true,
+        false,
+      ],
+    ])('sees %s', (_label, snippet, drives, settles) => {
+      const found = promiseExecutors(snippet);
+      expect(found).toHaveLength(1);
+      expect(found[0]!.drivesAPromise).toBe(drives);
+      expect(found[0]!.settlesOnRejection).toBe(settles);
+    });
+
+    // The hole this block exists to close: the case parser starts at the first `it(`, so a helper
+    // above it is in no case body at all. Pinned as the reason the scan is over the MODULE.
+    it('grades a helper the case parser cannot see', () => {
+      const module =
+        "export function someCases(ctx) {\n" +
+        "  const h = (x) => new Promise((r) => { void ctx.post(x).then(() => r()); });\n" +
+        "  it('a case', async () => { await h(1); });\n" +
+        '}\n';
+      expect(cases().length).toBeGreaterThan(0);
+      expect(casesIn(module).flatMap((c) => promiseExecutors(c.body))).toEqual([]);
+      expect(promiseExecutors(module)).toHaveLength(1);
     });
   });
 

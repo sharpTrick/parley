@@ -1,6 +1,12 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { CLAUSES, CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
+import {
+  type BackendFactory,
+  CLAUSES,
+  type ConformanceContext,
+  CONTEXT_FIELDS,
+  openContext,
+} from '@sharptrick/parley-conformance';
 
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 const packagesDir = new URL('../../', import.meta.url);
@@ -122,29 +128,20 @@ describe('README', () => {
   });
 
   /**
-   * The README justifies the runtime validator by a fact about the repo, and both the sentence and
-   * this check have pinned an ABSOLUTE that decays as the repo improves: first "no tsconfig covers
-   * test/**" (false the day this package got one), then "no backend typechecks its own test sources"
-   * (false the day a backend added a `tsconfig.test.json` — and it found a real type error doing it).
-   * A deficiency is the wrong thing to hold invariant. What keeps the validator NECESSARY is that at
-   * least one consumer's fixture is still never seen by a compiler, so that is what is asserted, and
-   * the count reaching zero turns retiring the validator into a question instead of a silent lie.
+   * The README justified the runtime validator by a fact about the repo three times running, and each
+   * spelling pinned an ABSOLUTE that decayed as the repo improved: "no tsconfig covers test/**" (false
+   * the day this package got one), "no backend typechecks its own test sources" (false the day a
+   * backend added a `tsconfig.test.json`), then "at least one consumer's fixture is never seen by a
+   * compiler" (false the day every workspace's fixtures came inside one — and every step of that
+   * found real type errors). A deficiency is the wrong thing to hold invariant, and the third attempt
+   * proved that holding a SHRINKING deficiency invariant is the same mistake at one remove.
+   *
+   * What keeps the validator necessary is a property of the PUBLISHED surface, which no amount of
+   * typechecking in this repo can retire: the fixture crosses a package boundary as a value, so the
+   * compiler that would have caught a missing field is on the consumer's side of it — or absent.
+   * That is what the rows below assert, and it cannot decay.
    */
   describe('the claim behind the runtime context validator', () => {
-    const typechecksTests = (dir: string): boolean => {
-      for (const name of ['tsconfig.json', 'tsconfig.test.json']) {
-        let raw: string;
-        try {
-          raw = readFileSync(new URL(`${dir}/${name}`, packagesDir), 'utf8');
-        } catch {
-          continue;
-        }
-        const cfg = JSON.parse(raw) as { include?: string[] };
-        if ((cfg.include ?? []).some((g) => g.startsWith('test/'))) return true;
-      }
-      return false;
-    };
-
     const workspaceDirs = (): string[] =>
       readdirSync(packagesDir).filter((dir) => {
         try {
@@ -155,18 +152,36 @@ describe('README', () => {
         }
       });
 
-    it('is not vacuous: some package does typecheck its test sources', () => {
-      expect(workspaceDirs().filter(typechecksTests)).not.toEqual([]);
+    it('is not vacuous: this package has suite consumers at all', () => {
       expect(consumers().length).toBeGreaterThan(5);
     });
 
-    it('the validator is still load-bearing — a suite consumer does not typecheck its fixture', () => {
-      expect(
-        consumers().filter((dir) => !typechecksTests(dir)),
-        'every suite consumer now typechecks its own fixture, so a missing context field would ' +
-          'lose a build on its own — decide deliberately whether assertConformanceContext still ' +
-          'earns its place instead of leaving this row to rot',
-      ).not.toEqual([]);
+    /**
+     * What keeps the validator necessary, graded through the PUBLISHED surface rather than off the
+     * repo's tsconfig coverage: `openContext` takes the factory's result as a value, not as the type
+     * the factory declares. A well-typed factory whose context is assembled at runtime — from config,
+     * through a cast, or in a JavaScript consumer with no compiler at all — reaches the suite exactly
+     * like this one, and the compiler that would have caught the missing field is on the other side
+     * of a package boundary.
+     */
+    it('the validator is load-bearing: a well-typed factory can still deliver a bad context', async () => {
+      let tornDown = false;
+      const factory: BackendFactory = () =>
+        Promise.resolve({
+          plugin: {},
+          freshTopic: () => 't',
+          cleanup: () => {
+            tornDown = true;
+            return Promise.resolve();
+          },
+          concurrentPost: 'unsupported',
+          carriesSenderIdentity: true,
+        } as unknown as ConformanceContext);
+
+      await expect(openContext('a runtime-built context', factory)).rejects.toThrow(
+        /has an invalid `supportsBlockingFetch`/,
+      );
+      expect(tornDown, 'a rejected fixture must still be torn down').toBe(true);
     });
 
     /**
@@ -189,6 +204,10 @@ describe('README', () => {
       ['no tsconfig in the repo covers test/**', /no\s+tsconfig[^.]*includes?\s+`?test/i],
       ['no backend typechecks its own test sources', /\bno\s+backend[^.]*typecheck/i],
       ['only two named packages have a test tsconfig', /only\s+this\s+package\s+and/i],
+      // Retired the day every workspace's fixtures came inside a tsconfig: a justification that
+      // rests on a deficiency stops being true the moment the deficiency is fixed.
+      ['a fixture is never seen by a compiler', /never\s+has\s+its\s+fixture\s+seen/i],
+      ['some package still lacks a tsconfig.test.json', /with\s+no\s+`?tsconfig\.test\.json`?/i],
     ])('does not restate the decayed absolute "%s"', (_label, shape) => {
       expect(readme.replaceAll(/\s+/g, ' ')).not.toMatch(shape);
     });

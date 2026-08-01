@@ -360,7 +360,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       if (failure.retryAfterBody !== undefined) {
         body.parameters = { retry_after: failure.retryAfterBody };
       }
-      const headers =
+      const headers: Record<string, string> =
         failure.retryAfterHeader === undefined
           ? {}
           : { 'Retry-After': String(failure.retryAfterHeader) };
@@ -455,7 +455,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     first_name: from,
   });
 
-  return {
+  const fake: FakeTelegram = {
     url: `http://127.0.0.1:${addr.port}`,
     token: TOKEN,
     sent,
@@ -576,6 +576,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       });
     },
   };
+  return fake;
 }
 
 /** Collect and JSON-parse a request body (empty object for GETs / empty bodies). */

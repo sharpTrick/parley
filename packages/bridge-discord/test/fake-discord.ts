@@ -302,9 +302,9 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
     sockets.set(ws, state);
     ws.on('close', () => sockets.delete(ws));
     ws.on('message', (data) => {
-      let payload: { op?: number };
+      let payload: { op?: number; d?: unknown };
       try {
-        payload = JSON.parse(String(data)) as { op?: number };
+        payload = JSON.parse(String(data)) as { op?: number; d?: unknown };
       } catch {
         return;
       }

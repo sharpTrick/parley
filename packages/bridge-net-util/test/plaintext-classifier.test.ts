@@ -1,7 +1,11 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
 import { isLoopbackHost, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { consumerPackageSources, importingFiles, SELF } from './consumers.js';
 
 /**
  * A security predicate whose negative answer means "no plaintext-credential risk" may not answer it
@@ -111,9 +115,6 @@ describe('isLoopbackHost', () => {
  * see. Every fork that exists today is recorded BY NAME below, so the next one fails here.
  */
 describe('no consumer re-implements an export of this package', () => {
-  const packagesDir = new URL('../../', import.meta.url);
-  const SELF = '@sharptrick/parley-net-util';
-
   /**
    * The forks in the repo as it stands, each with why it is not simply an import. A row here is a
    * debt this package has accepted, not a licence: adding one is a deliberate edit to this table.
@@ -131,60 +132,95 @@ describe('no consumer re-implements an export of this package', () => {
   };
 
   /**
-   * Source files of packages that consume this one, with comments stripped. Every `src/` file of a
-   * consuming package is read, not only the files that name the import: a fork is a debt the
-   * PACKAGE owes, and splitting one file into several moves the copy away from the import without
-   * retiring anything. Scanning only the importing file let a decomposition hide a fork outright.
-   */
-  const consumerSources = (): { path: string; code: string }[] => {
-    const out: { path: string; code: string }[] = [];
-    for (const dir of readdirSync(packagesDir)) {
-      if (dir === 'bridge-net-util') continue;
-      let names: string[] = [];
-      try {
-        names = readdirSync(new URL(`${dir}/src/`, packagesDir));
-      } catch {
-        continue;
-      }
-      const sources = names
-        .filter((n) => n.endsWith('.ts'))
-        .map((name) => ({
-          path: `${dir}/src/${name}`,
-          text: readFileSync(new URL(`${dir}/src/${name}`, packagesDir), 'utf8'),
-        }));
-      if (!sources.some((s) => s.text.includes(SELF))) continue;
-      for (const { path, text } of sources) {
-        out.push({
-          path,
-          code: text.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, ''),
-        });
-      }
-    }
-    return out;
-  };
-
-  /**
    * `<package>:<name>` for every MODULE-LEVEL declaration whose name collides with an export of this
    * module. Anchored at column zero: a block-scoped `const delay = stanza.getChild('delay', …)` is a
    * local binding that happens to share a word, not a second implementation of a shared helper.
    */
-  const forks = (): string[] => {
+  const forks = (root?: URL, selfDir?: string): string[] => {
     const exported = new Set(Object.keys(api));
     const out: string[] = [];
-    for (const { path, code } of consumerSources()) {
+    for (const { pkg, code } of consumerPackageSources(root, selfDir)) {
       for (const m of code.matchAll(
         /^(?:export )?(?:async )?(?:function|const|class) (\w+)/gm,
       )) {
-        if (exported.has(m[1] as string))
-          out.push(`${path.split('/')[0] as string}:${m[1] as string}`);
+        if (exported.has(m[1] as string)) out.push(`${pkg}:${m[1] as string}`);
       }
     }
     return [...new Set(out)];
   };
 
   it('reads consumers and exports at all, so the rows below are not scanning nothing', () => {
-    expect(consumerSources().length).toBeGreaterThan(5);
+    expect(consumerPackageSources().length).toBeGreaterThan(5);
     expect(Object.keys(api).length).toBeGreaterThan(5);
+  });
+
+  /**
+   * The scan against the tree shape it has to survive, on a SYNTHETIC root rather than on
+   * `packages/` — the repo's own layout is what a check like this comes to depend on silently, and a
+   * flat listing graded green here for as long as no consumer nested a file. Both directions are
+   * graded: a fork one level down must be REPORTED, and a package whose only import of this one
+   * lives in a subdirectory must still be scanned at all.
+   */
+  describe('the scan reaches a nested file', () => {
+    const plant = (files: Record<string, string>): URL => {
+      const root = pathToFileURL(`${mkdtempSync(join(tmpdir(), 'net-util-scan-'))}/`);
+      for (const [path, body] of Object.entries(files)) {
+        mkdirSync(new URL(`./${dirname(path)}/`, root), { recursive: true });
+        writeFileSync(new URL(`./${path}`, root), body);
+      }
+      return root;
+    };
+
+    const IMPORTS_SELF = `import { isLoopbackHost } from '${SELF}';\nvoid isLoopbackHost;\n`;
+    const A_FORK = 'export const plaintextRemoteOrigin = (u: string) => u;\n';
+    const NO_SELF_DIR = 'nothing-here';
+
+    it('reports a fork nested below src/', () => {
+      const root = plant({
+        'fake-consumer/src/index.ts': IMPORTS_SELF,
+        'fake-consumer/src/deep/inner/dup.ts': A_FORK,
+      });
+      expect(forks(root, NO_SELF_DIR)).toContain('fake-consumer:plaintextRemoteOrigin');
+    });
+
+    it('counts a package whose only import of this one is nested', () => {
+      const root = plant({
+        'fake-consumer/src/deep/uses.ts': IMPORTS_SELF,
+        'fake-consumer/src/dup.ts': A_FORK,
+      });
+      expect(forks(root, NO_SELF_DIR)).toContain('fake-consumer:plaintextRemoteOrigin');
+    });
+
+    it('reports nothing for a package that does not import this one', () => {
+      const root = plant({ 'stranger/src/deep/dup.ts': A_FORK });
+      expect(forks(root, NO_SELF_DIR)).toEqual([]);
+    });
+
+    // A package may name this one in a table of packages it must NOT depend on. Reading that as an
+    // import turns every same-named local helper it owns into a fork of an export it is forbidden
+    // to import — which is what `bridge-core`'s licence-gap list did the moment the scan recursed.
+    it('reports nothing for a package that only lists this one by name', () => {
+      const root = plant({
+        'lister/src/table.ts': `const FORBIDDEN = [\n  '${SELF}',\n];\nvoid FORBIDDEN;\n`,
+        'lister/src/deep/dup.ts': A_FORK,
+      });
+      expect(forks(root, NO_SELF_DIR)).toEqual([]);
+    });
+
+    // The other scan built on the same listing: the dead-export check reads `src/` AND `test/`, and
+    // a live import it cannot see reads as an export nothing consumes.
+    it('finds an importer nested below src/ or test/', () => {
+      const root = plant({
+        'fake-consumer/src/deep/uses.ts': IMPORTS_SELF,
+        'fake-consumer/test/deep/also.ts': IMPORTS_SELF,
+        'fake-consumer/src/quiet.ts': 'export const nothing = 1;\n',
+      });
+      expect(
+        importingFiles(root, NO_SELF_DIR)
+          .map(({ path }) => path)
+          .sort(),
+      ).toEqual(['fake-consumer/src/deep/uses.ts', 'fake-consumer/test/deep/also.ts']);
+    });
   });
 
   it('every local copy of a shared name is one this package has recorded', () => {

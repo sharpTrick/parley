@@ -127,6 +127,54 @@ export function deferredPromises(body: string): { name: string; handled: boolean
   return out;
 }
 
+/** The text inside the parentheses opening at {@link open}, paired to its closer. */
+function parenthesized(text: string, open: number): string {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')' && --depth === 0) return text.slice(open + 1, i);
+  }
+  return text.slice(open + 1);
+}
+
+const EXECUTOR_HEAD =
+  /^\s*(?:async\s+)?(?:\((?<parens>[^)]*)\)|(?<bare>\w+))\s*=>|^\s*(?:async\s+)?function\s*\w*\s*\((?<fn>[^)]*)\)/;
+
+/**
+ * Every `new Promise` executor in the suite, and whether it can settle the promise when the work
+ * inside it FAILS. An executor that drives another promise and binds only `resolve` converts that
+ * promise's rejection into two failures at once: the returned promise never settles, so the case
+ * burns its whole timeout and reports a bare "Test timed out" naming no clause, and the rejection
+ * reaches the process unhandled and is attributed to whichever unrelated case happened to be running.
+ *
+ * Scanned over the WHOLE module rather than over case bodies, so that a helper defined above the
+ * first `it(` — which is where the suite's `postAfter` lived, invisible to every check keyed on
+ * {@link casesIn} — is graded like anything else.
+ */
+export function promiseExecutors(
+  source: string,
+): { executor: string; drivesAPromise: boolean; settlesOnRejection: boolean }[] {
+  const out: { executor: string; drivesAPromise: boolean; settlesOnRejection: boolean }[] = [];
+  for (const m of source.matchAll(/\bnew\s+Promise\s*(?:<[^<>]*>)?\s*\(/g)) {
+    const executor = parenthesized(source, (m.index as number) + m[0].length - 1);
+    const head = EXECUTOR_HEAD.exec(executor);
+    const params = (head?.groups?.parens ?? head?.groups?.bare ?? head?.groups?.fn ?? '')
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p !== '');
+    const body = executor.slice(head?.[0].length ?? 0);
+    const rejectParam = params[1];
+    out.push({
+      executor,
+      drivesAPromise: /\.then\(|\.catch\(|\.finally\(|\bawait\b/.test(body),
+      settlesOnRejection:
+        /\.catch\(/.test(body) ||
+        (rejectParam !== undefined && new RegExp(`\\b${rejectParam}\\b`).test(body)),
+    });
+  }
+  return out;
+}
+
 export function guardedBlock(text: string, open: number): string {
   let depth = 0;
   for (let i = open; i < text.length; i++) {

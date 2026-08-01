@@ -7,20 +7,46 @@
 const DELAY_SECONDS = /^\d+(?:\.\d+)?$/;
 
 /**
- * The three `HTTP-date` spellings RFC 9110 §5.6.7 defines: IMF-fixdate, obsolete RFC 850, asctime.
- * Keep this PINNED for the same reason `delay-seconds` is, so that `Date.parse`'s laxity cannot
- * invent a date out of something that is not one — `Headers.get` joins a gateway's `Retry-After`
- * and an origin's into `"3600, 5"`, which V8 reads as May of the year 3600 and which then dominates
- * the max below by twelve orders of magnitude, ending the call with a wait no deadline can cover.
+ * Two of the three `HTTP-date` spellings RFC 9110 §5.6.7 defines — IMF-fixdate and obsolete RFC 850,
+ * the two that carry an explicit `GMT`. Keep these PINNED for the same reason `delay-seconds` is, so
+ * that `Date.parse`'s laxity cannot invent a date out of something that is not one — `Headers.get`
+ * joins a gateway's `Retry-After` and an origin's into `"3600, 5"`, which V8 reads as May of the year
+ * 3600 and which then dominates the max below by twelve orders of magnitude, ending the call with a
+ * wait no deadline can cover.
  */
-const HTTP_DATE_SPELLINGS = [
+const GMT_SPELLINGS = [
   /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/,
   /^[A-Za-z]{6,9}, \d{2}-[A-Za-z]{3}-\d{2} \d{2}:\d{2}:\d{2} GMT$/,
-  /^[A-Za-z]{3} [A-Za-z]{3} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/,
 ];
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * The third spelling. asctime states no zone, RFC 9110 §5.6.7 says every HTTP-date is GMT, and
+ * `Date.parse` reads a zone-less date on the HOST's clock — so keep the instant built here from the
+ * captured fields with `Date.UTC`, so that a stated wait is not shifted by the deployment's UTC
+ * offset. East of Greenwich the shift turns a real wait negative, i.e. into no hint at all and a
+ * retry at the fixed default; west of it the same wait inflates past the call's deadline.
+ *
+ * Each field is range-checked because the pinned shape admits `Nov 32` and `08:69:37`, which
+ * `Date.UTC` would roll forward into a plausible instant hours or months away rather than reject.
+ */
+const ASCTIME = /^[A-Za-z]{3} ([A-Za-z]{3}) ([ \d]\d) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+
+function asctimeMs(text: string): number | undefined {
+  const m = ASCTIME.exec(text);
+  if (m === null) return undefined;
+  const month = MONTHS.indexOf(m[1] as string);
+  const day = Number(m[2]);
+  const hh = Number(m[3]);
+  const mm = Number(m[4]);
+  const ss = Number(m[5]);
+  if (month < 0 || day < 1 || day > 31 || hh > 23 || mm > 59 || ss > 60) return undefined;
+  return Date.UTC(Number(m[6]), month, day, hh, mm, ss);
+}
+
 function httpDateMs(text: string): number | undefined {
-  if (!HTTP_DATE_SPELLINGS.some((spelling) => spelling.test(text))) return undefined;
+  if (!GMT_SPELLINGS.some((spelling) => spelling.test(text))) return asctimeMs(text);
   const at = Date.parse(text);
   return Number.isNaN(at) ? undefined : at;
 }

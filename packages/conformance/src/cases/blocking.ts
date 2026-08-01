@@ -12,11 +12,13 @@ import { SENDER } from '../handles.js';
 /** The `blockMs` contract: honoured natively, or ignored promptly, and never a lost wakeup. */
 export function blockingCases(ctx: ConformanceContext): void {
   // Resolves only once the write has LANDED, so a case cannot conclude on a message the backend has
-  // not accepted yet.
+  // not accepted yet. Keep BOTH settle paths bound, so that a `post` rejecting mid-case — a flood
+  // wait, a revoked token — fails this case by name instead of leaving it pending for the whole
+  // timeout while raising a process-level unhandled rejection against whichever case is running.
   const postAfter = (topic: Topic, delayMs: number, content: string): Promise<void> =>
-    new Promise((resolve) => {
+    new Promise((resolve, reject) => {
       setTimeout(() => {
-        void ctx.plugin.post(topic, SENDER, content).then(() => resolve());
+        void ctx.plugin.post(topic, SENDER, content).then(() => resolve(), reject);
       }, delayMs);
     });
 

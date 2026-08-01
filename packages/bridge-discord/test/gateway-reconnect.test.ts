@@ -1,5 +1,5 @@
 import { asCursor, asTopic, type MessageHandler, type Topic } from '@sharptrick/parley-core';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 
 // The reconnect storm that resets the bot token and the undetected half-dead socket both live in
 // the gateway-socket machinery. They're driven here against an in-process FAKE gateway
@@ -36,7 +36,7 @@ import { dialCeiling, dialPump } from './ladder.js';
 const gw = { instances, state, FakeWs };
 
 /** Backoff delays only: the per-socket handshake watchdog is not a reconnect step. */
-const setTimeoutDelays = (spy: ReturnType<typeof vi.spyOn>): number[] =>
+const setTimeoutDelays = (spy: MockInstance): number[] =>
   spy.mock.calls.map((c) => c[1] as number).filter((d) => d !== NO_HANDSHAKE_TIMEOUT);
 
 describe('Discord gateway reconnect & liveness', () => {
@@ -537,7 +537,7 @@ describe('Discord gateway recovery, whenever the failure lands', () => {
   ];
 
   let rest: FetchStub;
-  let diag: ReturnType<typeof vi.spyOn>;
+  let diag: MockInstance;
 
   beforeEach(() => {
     resetGateway();
@@ -565,7 +565,9 @@ describe('Discord gateway recovery, whenever the failure lands', () => {
             handshake_timeout_ms: HANDSHAKE,
           });
           const got: string[] = [];
-          const handler = (m: { content: string }): void => got.push(m.content);
+          const handler = (m: { content: string }): void => {
+            got.push(m.content);
+          };
 
           if (phase === 'the first dial') {
             failure.fail(rest);

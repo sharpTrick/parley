@@ -99,7 +99,9 @@ describe('zulip test fixtures are shared, not restated', () => {
         return [...source.matchAll(/FAULTS\.(\w+)/g)].map((m) => m[1] as string);
       }),
     );
-    const graded = new Set([...TRANSIENT_EVENTS_FAULTS, ...PERSISTENT_EVENTS_FAULTS].map((r) => r.key));
+    const graded = new Set<string>(
+      [...TRANSIENT_EVENTS_FAULTS, ...PERSISTENT_EVENTS_FAULTS].map((r) => r.key),
+    );
     expect(Object.keys(FAULTS).filter((name) => !named.has(name) && !graded.has(name))).toEqual([]);
   });
 });

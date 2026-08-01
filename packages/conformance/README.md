@@ -110,13 +110,13 @@ export type BackendFactory = () => Promise<ConformanceContext>;
 ```
 
 `runConformanceSuite` validates that shape at runtime (`assertConformanceContext`) and fails
-naming the backend and the offending field. That runtime check is what enforces "required": vitest
-transpiles test sources without typechecking them, so a plugin package with no `tsconfig.test.json`
-never has its fixture seen by a compiler at all — its context literal is checked only when the suite
-runs, and a missing field would silently delete the cases that read it instead of losing a build.
-Packages are adopting `tsconfig.test.json` one at a time, so this claim is not a fixed list: this
-package's own tests recompute how many suite consumers still lack one and assert the validator is
-still doing work, so that the day none do, retiring it becomes a question asked rather than assumed.
+naming the backend and the offending field. That runtime check is what enforces "required", and no
+amount of typechecking retires it: the fixture crosses a published package boundary, so the suite
+receives whatever the factory actually returns rather than what its declared return type promises.
+A consumer written in JavaScript has no compiler at all; one that builds its context from config, or
+reaches its plugin through a cast, has a compiler that cannot see the value. A field missing at that
+point does not lose a build — it silently deletes the cases that read it, and the backend is
+certified on the strength of a suite that never ran them.
 
 Then, in the plugin package's own test file:
 

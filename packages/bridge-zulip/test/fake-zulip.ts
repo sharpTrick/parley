@@ -415,7 +415,7 @@ export async function startFakeZulip(opts?: {
 
     // Every real Zulip endpoint requires Basic auth for a REAL account; the sender is stamped from it.
     const auth = parseBasicAuth(req);
-    if (!accounts.some((a) => a.email === auth?.email && a.apiKey === auth.apiKey)) {
+    if (auth === undefined || !accounts.some((a) => a.email === auth.email && a.apiKey === auth.apiKey)) {
       json(res, 401, { result: 'error', msg: 'Invalid API key' });
       return;
     }
