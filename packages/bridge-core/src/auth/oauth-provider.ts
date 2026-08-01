@@ -23,7 +23,7 @@ import {
   MAX_CLIENTS,
   MAX_PENDING,
   evictionCandidate,
-  shedOldest,
+  shedCrowdedest,
 } from './eviction.js';
 import {
   assertResource,
@@ -191,7 +191,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       redirectUriSupplied: redirectUriWasSupplied(res),
       expiresAtMs: this.now() + CONSENT_TTL_MS,
     });
-    shedOldest(this.pending, MAX_PENDING);
+    shedCrowdedest(this.pending, MAX_PENDING, (p) => p.client.client_id);
     const page = renderConsentPage(consentId, client, consented, this.opts.consentPath);
     res.status(200).type('html').send(page);
   }

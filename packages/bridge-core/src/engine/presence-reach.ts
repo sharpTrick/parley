@@ -15,14 +15,39 @@ import type { RosterEntry } from './presence.js';
 const MAX_PEER_PATTERN_LEN = 512;
 
 /**
- * Whole-call ceiling (ms) on the untrusted peer-pattern work ONE {@link filterReachable} spends.
+ * Whole-call ceiling (ms) on the regex work ONE {@link filterReachable} spends in EACH direction.
  * {@link isRedosSafeSource} bounds what a single screened match costs — per source, leaving the
- * caller to bound how many it holds. Here the count is `entries × their advertised patterns × the
- * caller's own topics`, and the first two factors are chosen by whoever writes the beats, so the
- * per-source bound alone multiplies out to seconds of synchronous CPU on a page of legal beats. Node
- * is single-threaded: that time is the whole bridge, long-polls and heartbeats included.
+ * caller to bound how many it holds. Both directions here multiply an untrusted count by a screened
+ * pattern bank: outbound it is `entries × their advertised topics` against the caller's own
+ * `post_topics`, inbound `entries × their advertised patterns` against the caller's topics. The
+ * untrusted factor is chosen by whoever writes the beats, so the per-source bound alone multiplies
+ * out to tens of seconds of synchronous CPU on a page of legal beats. Node is single-threaded: that
+ * time is the whole bridge, long-polls and heartbeats included.
+ *
+ * Keep the two allowances SEPARATE and self-measured, so that a page engineered to exhaust one
+ * direction cannot switch the other off — a deadline shared with, or merely armed at the same
+ * instant as, the other direction makes every match there report false, and legitimate peers vanish
+ * from the roster with no error.
  */
-const PEER_PATTERN_BUDGET_MS = 50;
+const PATTERN_BUDGET_MS = 50;
+
+/**
+ * One direction's CPU allowance for ONE {@link filterReachable} call. It MEASURES the work it
+ * authorises rather than reading a clock started at call time, so that what the other direction
+ * spends cannot exhaust it. `undefined` means the allowance is gone.
+ */
+function budget(): <T>(work: () => T) => T | undefined {
+  let spentMs = 0;
+  return (work) => {
+    if (spentMs >= PATTERN_BUDGET_MS) return undefined;
+    const started = performance.now();
+    try {
+      return work();
+    } finally {
+      spentMs += performance.now() - started;
+    }
+  };
+}
 
 /**
  * The peer-pattern matcher for ONE {@link filterReachable} call. Keep the compile full-match
@@ -33,7 +58,7 @@ const PEER_PATTERN_BUDGET_MS = 50;
  * never safety.
  */
 function peerReach(): (sources: readonly string[], input: string) => boolean {
-  const deadline = Date.now() + PEER_PATTERN_BUDGET_MS;
+  const spend = budget();
   const compiled = new Map<string, RegExp | null>();
   const compile = (src: string): RegExp | null => {
     const cached = compiled.get(src);
@@ -52,12 +77,24 @@ function peerReach(): (sources: readonly string[], input: string) => boolean {
   return (sources, input) => {
     const bounded = input.length > MAX_MATCH_INPUT ? input.slice(0, MAX_MATCH_INPUT) : input;
     for (const src of sources) {
-      if (Date.now() >= deadline) return false;
-      const re = compile(src);
-      if (re !== null && re.test(bounded)) return true;
+      const hit = spend(() => {
+        const re = compile(src);
+        return re !== null && re.test(bounded);
+      });
+      if (hit === undefined) return false;
+      if (hit) return true;
     }
     return false;
   };
+}
+
+/**
+ * Wrap a topic predicate in its own allowance. Past it the caller is simply reported as unable to
+ * post there — the degradation drops reach, never safety, exactly as {@link peerReach}'s does.
+ */
+function budgeted(canPostTo: (topic: string) => boolean): (topic: string) => boolean {
+  const spend = budget();
+  return (topic) => spend(() => canPostTo(topic)) === true;
 }
 
 /**
@@ -84,11 +121,12 @@ export function filterReachable(
   },
 ): RosterEntry[] {
   const reaches = peerReach();
+  const canPostTo = budgeted(opts.canPostTo);
   return roster.filter((e) => {
     if (opts.scope !== undefined) {
       return e.topics.includes(opts.scope) || reaches(e.postTopics, opts.scope);
     }
-    if (e.topics.some((t) => opts.canPostTo(t))) return true;
+    if (e.topics.some((t) => canPostTo(t))) return true;
     return opts.mySubscribedTopics.some((mt) => reaches(e.postTopics, mt));
   });
 }

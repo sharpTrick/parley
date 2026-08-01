@@ -51,6 +51,7 @@ const WIRING_CASES: WiringCase[] = [
     expected: {
       audience: AUD,
       algorithms: ACCEPTED_SIGNING_ALGORITHMS,
+      requiredClaims: ['exp'],
       clockTolerance: 30,
     },
   },
@@ -60,6 +61,7 @@ const WIRING_CASES: WiringCase[] = [
     expected: {
       audience: AUD,
       algorithms: ACCEPTED_SIGNING_ALGORITHMS,
+      requiredClaims: ['exp'],
       clockTolerance: 120,
       currentDate: new Date(FIXED_NOW_MS),
     },

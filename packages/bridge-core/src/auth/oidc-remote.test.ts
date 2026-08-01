@@ -164,19 +164,43 @@ describe('remote OIDC front door (delegated resource server)', () => {
     }
   });
 
-  it('rejects expired / wrong-aud / wrong-iss / rogue-signature tokens over HTTP (401)', async () => {
+  /**
+   * A 401 is only half the promise: the SDK echoes `error_description` verbatim into the header and
+   * the body, so a refusal that carries its own wording tells the caller how far up the chain it
+   * got — that its signature, `iss`, `aud` and the identity gate all passed, and only the last check
+   * stopped it. That is a differential oracle over the gate policy. So sweep every deficient bearer
+   * the fake can mint, INCLUDING the ones that merely OMIT a claim (a check jose runs only when the
+   * claim is present is a check an omission skips, and the 401 then comes from a different layer
+   * with a different message), and assert every one of them is refused in exactly the same words.
+   */
+  it('every rejected bearer gets the same 401 and the same error_description', async () => {
     await boot();
-    const bad: FakeOidcClaims[] = [
-      { aud: `${origin}/mcp`, expiresInS: -120 },
-      { aud: 'someone-else' },
-      { aud: `${origin}/mcp`, issuerOverride: 'http://evil.example' },
-      { aud: `${origin}/mcp`, signWithRogueKey: true },
+    const aud = `${origin}/mcp`;
+    const bad: Array<[string, FakeOidcClaims | string]> = [
+      ['expired past the skew', { aud, expiresInS: -120 }],
+      ['not yet valid', { aud, notBeforeInS: 600 }],
+      ['wrong audience', { aud: 'someone-else' }],
+      ['wrong issuer', { aud, issuerOverride: 'http://evil.example' }],
+      ['a rogue signature', { aud, signWithRogueKey: true }],
+      ['a subject outside the gate', { aud, sub: 'stranger' }],
+      ['no exp', { aud, omit: ['exp'] }],
+      ['no iat', { aud, omit: ['iat'], sub: 'stranger' }],
+      ['no aud', { aud, omit: ['aud'] }],
+      ['no iss', { aud, omit: ['iss'] }],
+      ['no sub', { aud, omit: ['sub'] }],
+      ['not a JWT at all', 'garbage'],
     ];
-    for (const claims of bad) {
-      const res = await postMcp({ Authorization: `Bearer ${await idp.mint(claims)}` });
-      expect(res.status).toBe(401);
+
+    const descriptions = new Set<string>();
+    for (const [label, claims] of bad) {
+      const bearer = typeof claims === 'string' ? claims : await idp.mint(claims);
+      const res = await postMcp({ Authorization: `Bearer ${bearer}` });
+      expect(res.status, `${label} was not refused`).toBe(401);
+      const www = res.headers.get('www-authenticate') ?? '';
+      descriptions.add(/error_description="([^"]*)"/.exec(www)?.[1] ?? www);
     }
-    expect((await postMcp({ Authorization: 'Bearer garbage' })).status).toBe(401);
+    expect(bad.length).toBeGreaterThan(8);
+    expect([...descriptions]).toHaveLength(1);
   });
 
   it('enforces required_role end to end (401 without the realm role)', async () => {

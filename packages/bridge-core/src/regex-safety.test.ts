@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { Allowlist, allowlistFor } from './allowlist.js';
 import { MAX_POST_TOPICS, parseConfig } from './config.js';
-import { isRedosSafeSource, MAX_AMBIGUITY, MAX_MATCH_INPUT } from './regex-safety.js';
+import {
+  isRedosSafeSource,
+  MAX_AMBIGUITY,
+  MAX_MATCH_INPUT,
+  MIN_COMPOUNDING_REPEAT,
+} from './regex-safety.js';
 import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
 
 // The screen's only real contract: whatever it accepts must MATCH in bounded time, for every input
@@ -198,6 +203,46 @@ describe('isRedosSafeSource', () => {
   it('the enumerated set is wide enough to grade the region V8 refuses', () => {
     expect(ALL_CANDIDATES.length).toBeGreaterThan(40_000);
     expect(ALL_CANDIDATES.filter((src) => !compiles(src)).length).toBeGreaterThan(2_000);
+  });
+});
+
+// The exponential-signature test is an INEQUALITY on the repeat count, and an inequality is graded
+// only at its boundary: every enumerated blowup uses a large count, so `>= n` and `> n` are
+// indistinguishable to all of them — a screen mutated to the latter stays green and then accepts
+// `(?:[a-z]*[a-z]*[a-z]*[a-z]*){2}`, which blocks the event loop for seconds on a 41-char topic.
+// Generate the axis instead: the same ambiguous bodies at counts either side of the pivot, with the
+// pivot taken from the screen's own constant, so widening the rule re-grades here.
+describe('the repeat count at which an ambiguous body compounds is graded at its pivot', () => {
+  const AMBIGUOUS_BODIES: readonly (readonly [label: string, body: string])[] = [
+    ['an alternation whose branches overlap', 'a|aa'],
+    ['a chain of unbounded quantifiers', '[a-z]*[a-z]*[a-z]*[a-z]*'],
+    ['an optional atom', 'a?'],
+    ['a nested unbounded quantifier', '[a-z]+'],
+  ] as const;
+
+  const COUNTS = [
+    0,
+    MIN_COMPOUNDING_REPEAT - 1,
+    MIN_COMPOUNDING_REPEAT,
+    MIN_COMPOUNDING_REPEAT + 1,
+    8,
+    250,
+  ];
+
+  const CELLS = AMBIGUOUS_BODIES.flatMap(([label, body]) =>
+    COUNTS.map((n) => [`${label}, repeated {${n}}`, body, n] as const),
+  );
+
+  it('the sweep straddles the pivot, and each body really is ambiguous on its own', () => {
+    expect(COUNTS.filter((n) => n < MIN_COMPOUNDING_REPEAT).length).toBeGreaterThan(0);
+    expect(COUNTS.filter((n) => n > MIN_COMPOUNDING_REPEAT).length).toBeGreaterThan(0);
+    for (const [label, body] of AMBIGUOUS_BODIES) {
+      expect(isRedosSafeSource(`(?:${body})*`), `${label} is not treated as ambiguous`).toBe(false);
+    }
+  });
+
+  it.each(CELLS)('%s', (_label, body, n) => {
+    expect(isRedosSafeSource(`(?:${body}){${n}}`)).toBe(n < MIN_COMPOUNDING_REPEAT);
   });
 });
 

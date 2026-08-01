@@ -22,6 +22,13 @@ export const MAX_MATCH_INPUT = 64;
  */
 export const MAX_AMBIGUITY = 65_536;
 
+/**
+ * Fewest repetitions of an ambiguous group body that compound into exponential backtracking. V8
+ * unrolls `{n}`/`{n,m}` into sequential copies of the body, so a bounded count at or above this is as
+ * catastrophic as an unbounded one; only a bound below it cannot compound.
+ */
+export const MIN_COMPOUNDING_REPEAT = 2;
+
 /** Paths charged to one unbounded quantifier (`*`, `+`, `{n,}`) over a {@link MAX_MATCH_INPUT} input. */
 const UNBOUNDED_COST = 16;
 
@@ -56,9 +63,8 @@ function repetitionCost(min: number, max: number): number {
  * either:
  *
  *  - a group whose body is itself ambiguous (it contains a quantifier or an alternation) can repeat
- *    two or more times — the exponential signature (`(x+)+`, `(a|a)*`, `(x*){15}`, `(x?){250}`). V8
- *    unrolls `{n}`/`{n,m}` into sequential copies of the body, so a bounded count `>= 2` is as
- *    catastrophic as an unbounded one; only a bound of `<= 1` cannot compound. Or:
+ *    {@link MIN_COMPOUNDING_REPEAT} or more times — the exponential signature (`(x+)+`, `(a|a)*`,
+ *    `(x*){15}`, `(x?){250}`). Or:
  *  - its ambiguity budget — the product of every independent choice the engine can backtrack over:
  *    alternation branches, optional/bounded repetitions, and {@link UNBOUNDED_COST} per unbounded
  *    quantifier — exceeds {@link MAX_AMBIGUITY}. This is what catches a quantifier-free blowup such as
@@ -149,7 +155,7 @@ export function isRedosSafeSource(src: string): boolean {
         }
       }
       if (quantified && src[i] === '?') i++;
-      if (body && quantMax >= 2) return false;
+      if (body && quantMax >= MIN_COMPOUNDING_REPEAT) return false;
       charge(branchCount);
       if (quantified) charge(repetitionCost(quantMin, quantMax));
       if (body || quantified) markAmbiguous();

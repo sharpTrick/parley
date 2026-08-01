@@ -5,7 +5,12 @@ import { Allowlist, TopicNotAllowedError } from './allowlist.js';
 import { MAX_BLOCK_MS, MAX_POST_TOPICS, parseConfig } from './config.js';
 import { matchGlob, MAX_GLOB_LEN } from './identity-filter.js';
 import { asTopic } from './message.js';
-import { isRedosSafeSource, MAX_AMBIGUITY, MAX_MATCH_INPUT } from './regex-safety.js';
+import {
+  isRedosSafeSource,
+  MAX_AMBIGUITY,
+  MAX_MATCH_INPUT,
+  MIN_COMPOUNDING_REPEAT,
+} from './regex-safety.js';
 import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 
 // Every limit below is documented as INCLUSIVE — "at most 64 characters", "must be >= the
@@ -242,6 +247,13 @@ const CAPACITIES: Capacity[] = [
     expected: 65_536,
     realistic: 'ctx-(?:payments|billing|search)-[a-z0-9-]{1,32}',
     accepts: () => isRedosSafeSource('ctx-(?:payments|billing|search)-[a-z0-9-]{1,32}'),
+  },
+  {
+    name: 'MIN_COMPOUNDING_REPEAT',
+    actual: MIN_COMPOUNDING_REPEAT,
+    expected: 2,
+    realistic: 'ctx-(?:payments|billing){1} — a bound too small to compound stays postable',
+    accepts: () => isRedosSafeSource('ctx-(?:payments|billing){1}'),
   },
   {
     name: 'MIN_HASH_LEN',

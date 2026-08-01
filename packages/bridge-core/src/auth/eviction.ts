@@ -33,11 +33,32 @@ export function evictionCandidate(
   return ids.find((id) => !anyState.has(id)) ?? ids.find((id) => !approved.has(id));
 }
 
-/** Drop entries until the map is within `max`; a Map iterates in insertion order, so oldest first. */
-export function shedOldest<V>(map: Map<string, V>, max: number): void {
+/**
+ * Drop entries until the map is within `max`, always taking the OLDEST entry of whichever client
+ * holds the MOST, and falling back to plain oldest-first among clients holding equally many. Keep
+ * the per-client tier, so that one caller filling the map with its own entries can never displace an
+ * entry belonging to a different client — for `pending`, undifferentiated FIFO shedding IS the
+ * lockout the shed-don't-refuse policy above exists to prevent. A Map iterates in insertion order,
+ * so the first key seen for a client is its oldest, and a strict `>` keeps ties on that order.
+ */
+export function shedCrowdedest<V>(
+  map: Map<string, V>,
+  max: number,
+  clientOf: (value: V) => string,
+): void {
   while (map.size > max) {
-    const oldest = map.keys().next().value;
-    if (oldest === undefined) return;
-    map.delete(oldest);
+    const oldestOf = new Map<string, string>();
+    const held = new Map<string, number>();
+    let crowdedest = '';
+    for (const [key, value] of map) {
+      const client = clientOf(value);
+      if (!oldestOf.has(client)) oldestOf.set(client, key);
+      const n = (held.get(client) ?? 0) + 1;
+      held.set(client, n);
+      if (n > (held.get(crowdedest) ?? 0)) crowdedest = client;
+    }
+    const victim = oldestOf.get(crowdedest);
+    if (victim === undefined) return;
+    map.delete(victim);
   }
 }

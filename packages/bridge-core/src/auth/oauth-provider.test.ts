@@ -12,6 +12,7 @@ import {
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as eviction from './eviction.js';
 import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider, type ParleyOAuthProviderOptions } from './oauth-provider.js';
 
@@ -1376,5 +1377,103 @@ describe('the auth layer escapes at every interpolation of every page it renders
     const escapedInPlace = expr.includes('escapeHtml');
     const escapedWhereBound = bound.get(expr)?.includes('escapeHtml') ?? false;
     expect(escapedInPlace || escapedWhereBound).toBe(true);
+  });
+});
+
+/**
+ * Both caps SHED rather than refuse, so that an anonymous caller filling a map cannot lock the owner
+ * out of the only path that authorizes the bridge. A shed policy that ignores WHO owns an entry just
+ * moves the lockout one level down: the flood displaces the state the owner is mid-way through
+ * creating, and the passphrase they are about to spend buys nothing. Grade every capped store the
+ * provider keeps — rows derived from eviction.ts's own cap constants, so a third cap arrives as a
+ * missing row — crossed with whether the owner got there before or after the flood, and assert the
+ * owner's entry is not merely present afterwards but still USABLE.
+ */
+describe('an anonymous flood never displaces state the owner is mid-way through creating', () => {
+  interface CappedStore {
+    /** The exported constant that bounds it — the row set is derived from these. */
+    cap: string;
+    size: number;
+    store: 'clients' | 'pending';
+    /** Seed the owner's entry; returns the check that it is still there AND still works. */
+    seedOwner: (p: ParleyOAuthProvider) => Promise<() => Promise<void>>;
+    /** One entry an anonymous caller can create for itself, spending nothing. */
+    flood: (p: ParleyOAuthProvider, i: number) => Promise<void>;
+  }
+
+  const registerOn = (p: ParleyOAuthProvider): ((c: OAuthClientInformationFull) => unknown) => {
+    const register = p.clientsStore.registerClient;
+    if (register === undefined) throw new Error('registerClient not implemented');
+    return register;
+  };
+
+  const CAPPED_STORES: CappedStore[] = [
+    {
+      cap: 'MAX_CLIENTS',
+      size: eviction.MAX_CLIENTS,
+      store: 'clients',
+      seedOwner: async (p) => {
+        const owner = makeClient('owner-claude');
+        registerOn(p)(owner);
+        const code = await mintCode(p, owner, makeParams());
+        return async () => {
+          expect(p.clientsStore.getClient('owner-claude')).toBeDefined();
+          await expect(
+            p.exchangeAuthorizationCode(owner, code, undefined, REDIRECT),
+          ).resolves.toBeTruthy();
+        };
+      },
+      // Every DCR registration is necessarily its own client_id, so this is the only flood shape.
+      flood: async (p, i) => {
+        registerOn(p)(makeClient(`spam-${i}`));
+      },
+    },
+    {
+      cap: 'MAX_PENDING',
+      size: eviction.MAX_PENDING,
+      store: 'pending',
+      seedOwner: async (p) => {
+        await p.authorize(makeClient('owner-claude'), makeParams(), fakeRes());
+        const consentId = [...peek(p).pending.keys()].at(-1)!;
+        return async () => {
+          expect(peek(p).pending.has(consentId)).toBe(true);
+          const { redirectUrl } = await p.completeConsent(consentId, GOOD_PASS);
+          expect(new URL(redirectUrl).searchParams.get('code')).toBeTruthy();
+        };
+      },
+      // One registration is enough: /authorize is per-address rate limited, not per client_id.
+      flood: async (p) => {
+        await p.authorize(makeClient('spam-client'), makeParams(), fakeRes());
+      },
+    },
+  ];
+
+  it('has a row for every cap the eviction policy declares', () => {
+    const declared = Object.entries(eviction)
+      .filter(([name, value]) => name.startsWith('MAX_') && typeof value === 'number')
+      .map(([name]) => name);
+    expect(declared.length).toBeGreaterThan(1);
+    expect(CAPPED_STORES.map((s) => s.cap).sort()).toEqual(declared.sort());
+  });
+
+  const ARRIVALS = ['before', 'after'] as const;
+
+  const CELLS = CAPPED_STORES.flatMap((s) =>
+    ARRIVALS.map((arrival) => [`${s.store}, owner arrives ${arrival} the flood`, s, arrival] as const),
+  );
+
+  it.each(CELLS)('%s', async (_label, capped, arrival) => {
+    const p = makeProvider(() => 4_000_000);
+    const flood = async (): Promise<void> => {
+      for (let i = 0; i < capped.size; i++) await capped.flood(p, i);
+    };
+
+    if (arrival === 'after') await flood();
+    const ownerStillWorks = await capped.seedOwner(p);
+    if (arrival === 'before') await flood();
+
+    // The cap must still bind — an owner surviving because nothing was shed proves nothing.
+    expect(peek(p)[capped.store].size).toBe(capped.size);
+    await ownerStillWorks();
   });
 });

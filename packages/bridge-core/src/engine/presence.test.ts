@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { Allowlist } from '../allowlist.js';
+import { MAX_POST_TOPICS } from '../config.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
-import { isRedosSafeSource, MAX_MATCH_INPUT } from '../regex-safety.js';
+import { isRedosSafeSource, MAX_AMBIGUITY, MAX_MATCH_INPUT } from '../regex-safety.js';
 import { SAFE_PATTERNS } from '../testing/regex-corpus.js';
 import {
   computeRoster,
@@ -551,13 +553,19 @@ describe('the per-record budget survives aggregation across instances', () => {
  * Every cap above bounds ONE record or ONE handle, and each is multiplied by a factor none of them
  * touches: how many ENTRIES the roster carries. A beat's `handle` is self-reported, so one
  * credential mints as many peers as it has beats, and each of those peers advertises its own legal
- * 64 patterns that `filterReachable` compiles and tests against every topic the caller subscribes
- * to. `regex-safety.ts` states the ambiguity bound is per SOURCE and that the caller must also bound
- * HOW MANY it holds; this is the case that pays for it. Sweep the multiplying dimensions one at a
- * time — a cap restored on only one of them must not pass — take the costliest source the screen
- * ACCEPTS from the shared corpus by MEASUREMENT rather than by name (a hard-coded one lets the
- * corpus widen past the test), and grade the two things the caller actually pays: synchronous CPU
- * and the bytes that land in the agent's context.
+ * 64 topics AND 64 patterns. `filterReachable` runs a screened regex bank across BOTH: the peer's
+ * patterns against every topic I subscribe to, and — through the caller's own `post_topics` — my
+ * patterns against every topic the peer advertises. `regex-safety.ts` states the ambiguity bound is
+ * per SOURCE and that the caller must also bound HOW MANY it holds; this is the case that pays for
+ * it, in both directions.
+ *
+ * So the collaborator is the REAL one. A budget table that stubs `canPostTo` cannot observe the
+ * dominant term at all — `canPostTo: () => false` is free, and the cell that costs 49 s in
+ * production was the cell the table could not express. Sweep the multiplying dimensions one at a
+ * time — a bound restored on only one of them must not pass — take the costliest source the screen
+ * ACCEPTS from its own ambiguity constant rather than by name, and grade the three things the caller
+ * actually pays: synchronous CPU in each direction, the bytes that land in the agent's context, and
+ * that neither direction can be starved by the other.
  */
 describe('untrusted presence history cannot exceed a CPU or byte budget', () => {
   const now = 1_000_000;
@@ -570,34 +578,58 @@ describe('untrusted presence history cannot exceed a CPU or byte budget', () => 
   const ENTRY_BYTES = 2 * MAX_RECORD_TOPICS * (MAX_TOPIC_LEN + 8) + 256;
   const ROSTER_BUDGET_BYTES = MAX_ROSTER_ENTRIES * ENTRY_BYTES;
 
-  const worstAcceptedSource = (): string => {
-    const input = 'a'.repeat(MAX_MATCH_INPUT);
-    let worst = '';
-    let worstMs = -1;
-    for (const [, src] of SAFE_PATTERNS) {
-      if (!isRedosSafeSource(src)) continue;
-      const re = new RegExp(`^(?:${src})$`);
-      const t0 = performance.now();
-      for (let rep = 0; rep < 3; rep++) re.test(input);
-      const ms = performance.now() - t0;
-      if (ms > worstMs) {
-        worstMs = ms;
-        worst = src;
-      }
-    }
-    return worst;
+  /**
+   * A topic an attacker picks to be expensive: the whole match clamp of `a` to backtrack over, one
+   * varying character so a page of them cannot be deduplicated, and a trailing `!` that no
+   * legitimate topic pattern can match — a topic that MATCHES stops the scan and costs nothing.
+   */
+  const TAGS = 'bcdefghijklmnopqrstuvwyz0123456789';
+  const worstTopic = (tag: number): string =>
+    `${'a'.repeat(MAX_MATCH_INPUT - 2)}${TAGS[tag % TAGS.length]!}!`;
+
+  /** Cost of one full-match attempt of `src` against the topic shape this table actually feeds it. */
+  const matchCost = (src: string): number => {
+    const re = new RegExp(`^(?:${src})$`);
+    const t0 = performance.now();
+    for (let rep = 0; rep < 5; rep++) re.test(worstTopic(rep));
+    return performance.now() - t0;
   };
-  const WORST = worstAcceptedSource();
 
-  /** Pad to the per-string cap so each cell is worst case in bytes as well as in backtracking. */
-  const padded = (head: string): string =>
-    head.length >= MAX_TOPIC_LEN ? head.slice(0, MAX_TOPIC_LEN) : head + 'y'.repeat(MAX_TOPIC_LEN - head.length);
+  /**
+   * Each `[ab]?` doubles the paths the engine may explore, so log2(MAX_AMBIGUITY) of them is the
+   * last source the screen accepts — derived from the constant rather than written out.
+   */
+  const AT_THE_BOUND = `${'[ab]?'.repeat(Math.log2(MAX_AMBIGUITY))}${'a'.repeat(16)}z`;
 
-  function hostilePage(handles: number, instances: number, patterns: number): Message[] {
+  /**
+   * The costliest source the screen ACCEPTS, chosen by measurement over the shared corpus plus the
+   * ambiguity-bound construction. Naming one instead lets the corpus grow past the table.
+   */
+  const WORST = [...SAFE_PATTERNS.map(([, src]) => src), AT_THE_BOUND]
+    .filter((src) => isRedosSafeSource(src))
+    .reduce((a, b) => (matchCost(b) > matchCost(a) ? b : a));
+
+  /** Pad to the per-string cap so a byte-maximal cell is worst case in bytes as well. */
+  const padded = (head: string, len: number): string =>
+    head.length >= len ? head.slice(0, len) : head + 'y'.repeat(len - head.length);
+
+  interface Shape {
+    handles: number;
+    instances: number;
+    /** `postTopics` per beat — the INBOUND direction's untrusted factor. */
+    patterns: number;
+    /** `topics` per beat — the OUTBOUND direction's untrusted factor. */
+    topics: number;
+    topicLen: number;
+    callerTopics: number;
+    callerPatterns: number;
+  }
+
+  function hostilePage(s: Shape): Message[] {
     const page: Message[] = [];
     let seq = 0;
-    for (let h = 0; h < handles; h++) {
-      for (let i = 0; i < instances; i++) {
+    for (let h = 0; h < s.handles; h++) {
+      for (let i = 0; i < s.instances; i++) {
         seq++;
         page.push({
           topic: asTopic('parley-presence'),
@@ -608,8 +640,12 @@ describe('untrusted presence history cannot exceed a CPU or byte budget', () => 
             kind: 'heartbeat',
             at: now - 1_000,
             handle: `peer-${h}`,
-            topics: [padded(`t-${h}-${i}-`)],
-            postTopics: Array.from({ length: patterns }, (_u, j) => padded(`${WORST}${h}-${i}-${j}-`)),
+            topics: Array.from({ length: s.topics }, (_u, j) =>
+              padded(worstTopic(h + i + j), s.topicLen),
+            ),
+            postTopics: Array.from({ length: s.patterns }, (_u, j) =>
+              padded(`${WORST}${h}-${i}-${j}-`, MAX_TOPIC_LEN),
+            ),
             instanceId: `inst-${i}`,
           }),
           timestamp: new Date(seq * 1000).toISOString(),
@@ -622,40 +658,109 @@ describe('untrusted presence history cannot exceed a CPU or byte budget', () => 
     return page;
   }
 
-  it('the corpus yields a source the screen accepts, at full length', () => {
+  /** The production wiring: `parley_list_users` passes `allow.has` and `allow.topics()` verbatim. */
+  function callerReach(s: Shape): {
+    canPostTo: (topic: string) => boolean;
+    mySubscribedTopics: string[];
+    calls: () => number;
+  } {
+    const mine = Array.from({ length: s.callerTopics }, (_u, i) =>
+      `mine-${i}`.padEnd(MAX_MATCH_INPUT, 'a'),
+    );
+    const allow = new Allowlist(mine, {
+      postPatterns: Array.from({ length: s.callerPatterns }, () => WORST),
+    });
+    let calls = 0;
+    return {
+      canPostTo: (topic) => {
+        calls++;
+        return allow.has(topic);
+      },
+      mySubscribedTopics: mine,
+      calls: () => calls,
+    };
+  }
+
+  it('the worst source is accepted, at full length, and really is the costliest one', () => {
+    expect(Number.isInteger(Math.log2(MAX_AMBIGUITY))).toBe(true);
+    expect(isRedosSafeSource(AT_THE_BOUND)).toBe(true);
+    expect(isRedosSafeSource(`[ab]?${AT_THE_BOUND}`)).toBe(false);
     expect(isRedosSafeSource(WORST)).toBe(true);
-    expect(isRedosSafeSource(padded(`${WORST}0-0-0-`))).toBe(true);
+    expect(isRedosSafeSource(padded(`${WORST}0-0-0-`, MAX_TOPIC_LEN))).toBe(true);
+    // A topic the caller's own patterns MATCH short-circuits the scan, so the table would measure
+    // nothing; and a WORST no costlier than a literal would measure nothing either.
+    expect(new RegExp(`^(?:${WORST})$`).test(worstTopic(0))).toBe(false);
+    expect(matchCost(WORST)).toBeGreaterThan(matchCost('ctx-literal'));
+    expect(MAX_POST_TOPICS).toBeGreaterThan(1);
   });
 
-  it.each([
-    ['nothing multiplied (control)', 1, 1, 1, 1],
-    ['handles alone', PAGE, 1, 1, 1],
-    ['instances alone', 1, PAGE, 1, 1],
-    ['patterns per beat alone', 1, 1, MAX_RECORD_TOPICS, 1],
-    ['caller topics alone', 1, 1, MAX_RECORD_TOPICS, CALLER_TOPICS],
-    ['handles × patterns', PAGE, 1, MAX_RECORD_TOPICS, 1],
-    ['handles × patterns × caller topics', PAGE, 1, MAX_RECORD_TOPICS, CALLER_TOPICS],
-    [
-      'the same page split across instances',
-      PAGE / MAX_HANDLE_INSTANCES,
-      MAX_HANDLE_INSTANCES,
-      MAX_RECORD_TOPICS,
-      CALLER_TOPICS,
-    ],
-  ])('%s', (_name, handles, instances, patterns, callerTopics) => {
-    const roster = computeRoster(hostilePage(handles, instances, patterns), now, opts);
+  const CELLS: ReadonlyArray<readonly [string, Shape]> = [
+    ['nothing multiplied (control)', { handles: 1, instances: 1, patterns: 1, topics: 1, topicLen: MAX_MATCH_INPUT, callerTopics: 1, callerPatterns: 1 }],
+    ['handles alone', { handles: PAGE, instances: 1, patterns: 1, topics: 1, topicLen: MAX_MATCH_INPUT, callerTopics: 1, callerPatterns: 1 }],
+    ['instances alone', { handles: 1, instances: PAGE, patterns: 1, topics: 1, topicLen: MAX_MATCH_INPUT, callerTopics: 1, callerPatterns: 1 }],
+    ['peer patterns × caller topics (inbound)', { handles: PAGE, instances: 1, patterns: MAX_RECORD_TOPICS, topics: 1, topicLen: MAX_MATCH_INPUT, callerTopics: CALLER_TOPICS, callerPatterns: 0 }],
+    ['peer topics × caller patterns (outbound)', { handles: PAGE, instances: 1, patterns: 0, topics: MAX_RECORD_TOPICS, topicLen: MAX_MATCH_INPUT, callerTopics: 1, callerPatterns: MAX_POST_TOPICS }],
+    ['both directions at once', { handles: PAGE, instances: 1, patterns: MAX_RECORD_TOPICS, topics: MAX_RECORD_TOPICS, topicLen: MAX_MATCH_INPUT, callerTopics: CALLER_TOPICS, callerPatterns: MAX_POST_TOPICS }],
+    ['both directions, byte-maximal strings', { handles: PAGE, instances: 1, patterns: MAX_RECORD_TOPICS, topics: MAX_RECORD_TOPICS, topicLen: MAX_TOPIC_LEN, callerTopics: CALLER_TOPICS, callerPatterns: MAX_POST_TOPICS }],
+    ['the same page split across instances', { handles: PAGE / MAX_HANDLE_INSTANCES, instances: MAX_HANDLE_INSTANCES, patterns: MAX_RECORD_TOPICS, topics: MAX_RECORD_TOPICS, topicLen: MAX_MATCH_INPUT, callerTopics: CALLER_TOPICS, callerPatterns: MAX_POST_TOPICS }],
+  ] as const;
+
+  it('every multiplying dimension is swept, and each reaches its documented cap somewhere', () => {
+    const shapes = CELLS.map(([, shape]) => shape);
+    for (const axis of ['handles', 'instances', 'patterns', 'topics', 'callerTopics', 'callerPatterns'] as const) {
+      expect(new Set(shapes.map((s) => s[axis])).size, axis).toBeGreaterThan(1);
+    }
+    expect(shapes.some((s) => s.callerPatterns === MAX_POST_TOPICS)).toBe(true);
+    expect(shapes.some((s) => s.topics === MAX_RECORD_TOPICS)).toBe(true);
+    expect(shapes.some((s) => s.topicLen === MAX_TOPIC_LEN)).toBe(true);
+  });
+
+  it.each(CELLS)('%s', (_name, shape) => {
+    const roster = computeRoster(hostilePage(shape), now, opts);
     expect(roster.length).toBeGreaterThan(0); // bounded, never emptied
     expect(roster.length).toBeLessThanOrEqual(MAX_ROSTER_ENTRIES);
     expect(JSON.stringify(roster).length).toBeLessThan(ROSTER_BUDGET_BYTES);
 
-    const mine = Array.from({ length: callerTopics }, (_u, i) => `mine-${i}`.padEnd(MAX_MATCH_INPUT, 'a'));
+    const unscoped = callerReach(shape);
+    // A peer on a topic the caller explicitly subscribes to, evaluated FIRST so the verdict is the
+    // predicate's and not the budget's. A stubbed `canPostTo` measures no cost and cannot pass this,
+    // which is how this table used to be green while the real wiring took 49 s.
+    const partner: RosterEntry = {
+      handle: asHandle('partner'),
+      online: true,
+      topics: [unscoped.mySubscribedTopics[0]!],
+      postTopics: [],
+      lastSeenMs: now,
+    };
     const unscopedT0 = performance.now();
-    filterReachable(roster, { scope: undefined, canPostTo: () => false, mySubscribedTopics: mine });
+    const users = filterReachable([partner, ...roster], { scope: undefined, ...unscoped });
     expect(performance.now() - unscopedT0).toBeLessThan(CPU_BUDGET_MS);
+    expect(users.map((e) => e.handle)).toContain('partner');
+    expect(unscoped.calls()).toBeGreaterThan(0);
 
+    const scoped = callerReach(shape);
     const scopedT0 = performance.now();
-    filterReachable(roster, { scope: mine[0]!, canPostTo: () => false, mySubscribedTopics: [] });
+    filterReachable(roster, { scope: scoped.mySubscribedTopics[0]!, canPostTo: scoped.canPostTo, mySubscribedTopics: [] });
     expect(performance.now() - scopedT0).toBeLessThan(CPU_BUDGET_MS);
+  });
+
+  /**
+   * Two directions sharing one deadline is the same defect wearing the other hat: the hostile page
+   * spends the whole budget in the direction it can inflate, and every match in the OTHER direction
+   * then reports false — legitimate peers silently vanish from the roster with no error. The benign
+   * peer goes LAST, where a spent budget would already have stopped the matching.
+   */
+  it('a hostile page cannot starve the other direction of its budget', () => {
+    const shape: Shape = { handles: PAGE, instances: 1, patterns: 0, topics: MAX_RECORD_TOPICS, topicLen: MAX_MATCH_INPUT, callerTopics: 1, callerPatterns: MAX_POST_TOPICS };
+    const caller = callerReach(shape);
+    const mine = caller.mySubscribedTopics[0]!;
+    const roster = [
+      ...computeRoster(hostilePage(shape), now, opts),
+      { handle: asHandle('benign'), online: true, topics: ['their-own'], postTopics: [`${mine.slice(0, 6)}.*`], lastSeenMs: now - 5_000 },
+    ];
+
+    const reachable = filterReachable(roster, { scope: undefined, canPostTo: caller.canPostTo, mySubscribedTopics: [mine] });
+    expect(reachable.map((e) => e.handle)).toContain('benign');
   });
 });
 

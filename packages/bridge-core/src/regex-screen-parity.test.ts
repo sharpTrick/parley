@@ -56,8 +56,8 @@ describe('every regex screening entry point grades the same corpus', () => {
   // by value: the chain shapes below are the ones a quantifier-counting screen cannot see, and the
   // ones whose absence from the config copy was the defect.
   it('pins the corpus membership', () => {
-    expect(HOSTILE_PATTERNS.length).toBe(18);
-    expect(SAFE_PATTERNS.length).toBe(13);
+    expect(HOSTILE_PATTERNS.length).toBe(20);
+    expect(SAFE_PATTERNS.length).toBe(15);
     expect(HOSTILE_PATTERNS.map(([label]) => label)).toEqual(
       expect.arrayContaining([
         'ambiguous alternation chain',
@@ -65,6 +65,14 @@ describe('every regex screening entry point grades the same corpus', () => {
         'optional-atom chain',
         'optional-class chain',
         'bounded-repeat chain',
+        'ambiguous alternation at the smallest compounding repeat',
+        'risky body at the smallest compounding repeat',
+      ]),
+    );
+    expect(SAFE_PATTERNS.map(([label]) => label)).toEqual(
+      expect.arrayContaining([
+        'ambiguous alternation at the non-compounding bound',
+        'ambiguous alternation made merely optional',
       ]),
     );
     expect(ENTRY_POINTS.length).toBe(3);

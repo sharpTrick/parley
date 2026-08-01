@@ -207,6 +207,87 @@ describe('OidcTokenVerifier — an identity gate is an exact match, not a resemb
 });
 
 /**
+ * A claim this class's contract says it enforces, ABSENT from the token, is a check that never runs:
+ * jose validates `exp`/`nbf`/`iss`/`aud` only when the claim is present, so an omission is a
+ * different code path from a wrong value and no wrong-value row can reach it. Grade every registered
+ * claim the fake can stamp — the row set is DERIVED from a minted token, so a claim the fake starts
+ * carrying arrives as a missing row rather than as silence — and then grade the second half of the
+ * defect: whatever refuses must refuse with the ONE message, or the refusal tells a caller how far
+ * up the chain it got.
+ */
+describe('OidcTokenVerifier — a claim that is absent is still a claim that is checked', () => {
+  /** RFC 7519's registered claim names — the ones a token carries as protocol, not as payload. */
+  const REGISTERED = ['iss', 'sub', 'aud', 'exp', 'nbf', 'iat', 'jti'] as const;
+  /** What the shared fake can be told to leave out. A registered claim it stamps but cannot omit
+   *  fails the coverage row below, which is the signal to widen the knob rather than to skip it. */
+  type Omittable = NonNullable<FakeOidcClaims['omit']>[number];
+
+  /** The single-tenant posture the delegated mode is documented for: an identity gate is configured. */
+  const GATED: Partial<OidcVerifierOptions> = { allowedSubjects: ['owner-sub'] };
+  /** Every registered claim the fake stamps, so `nbf` is present and can be omitted from something. */
+  const FULL: FakeOidcClaims = { aud: AUD, notBeforeInS: -60 };
+
+  const ABSENT: ReadonlyArray<readonly [Omittable, 'accepted' | 'refused']> = [
+    ['iss', 'refused'],
+    ['sub', 'refused'],
+    ['aud', 'refused'],
+    ['exp', 'refused'],
+    ['nbf', 'accepted'],
+    ['iat', 'accepted'],
+  ] as const;
+
+  const claimsOf = (jwt: string): string[] =>
+    Object.keys(
+      JSON.parse(Buffer.from(jwt.split('.')[1]!, 'base64url').toString('utf8')) as object,
+    );
+
+  it('has a row for every registered claim a full token carries', async () => {
+    const carried = claimsOf(await idp.mint(FULL)).filter((c) =>
+      (REGISTERED as readonly string[]).includes(c),
+    );
+    expect(carried.length).toBeGreaterThan(3);
+    expect(ABSENT.map(([claim]) => claim).sort()).toEqual(carried.sort());
+  });
+
+  it.each(ABSENT.map(([claim, verdict]) => [claim, verdict] as const))(
+    'a token carrying no %s is %s',
+    async (claim: Omittable, verdict: string) => {
+      const token = await idp.mint({ ...FULL, omit: [claim] });
+      expect(claimsOf(token)).not.toContain(claim);
+      const attempt = verifier(GATED).verifyAccessToken(token);
+      if (verdict === 'accepted') await expect(attempt).resolves.toBeTruthy();
+      else await expect(attempt).rejects.toBeInstanceOf(InvalidTokenError);
+    },
+  );
+
+  it('every refusal — absent claim, wrong value or garbage — is byte-identical', async () => {
+    const deficient: ReadonlyArray<readonly [string, () => Promise<string>]> = [
+      ...ABSENT.filter(([, verdict]) => verdict === 'refused').map(
+        ([claim]) => [`no ${claim}`, () => idp.mint({ ...FULL, omit: [claim] })] as const,
+      ),
+      ['expired past the skew', () => idp.mint({ aud: AUD, expiresInS: -120 })],
+      ['not yet valid', () => idp.mint({ aud: AUD, notBeforeInS: 120 })],
+      ['wrong audience', () => idp.mint({ aud: 'someone-else' })],
+      ['wrong issuer', () => idp.mint({ aud: AUD, issuerOverride: 'http://evil.example' })],
+      ['a rogue signature', () => idp.mint({ aud: AUD, signWithRogueKey: true })],
+      ['a subject outside the gate', () => idp.mint({ aud: AUD, sub: 'stranger' })],
+      ['not a JWT at all', () => Promise.resolve('garbage')],
+    ] as const;
+
+    const messages = new Set<string>();
+    for (const [label, mint] of deficient) {
+      const err: unknown = await verifier(GATED)
+        .verifyAccessToken(await mint())
+        .then(() => null, (e: unknown) => e);
+      expect(err, `${label} was accepted`).toBeInstanceOf(InvalidTokenError);
+      messages.add((err as Error).message);
+    }
+    expect(deficient.length).toBeGreaterThan(6);
+    expect([...messages]).toHaveLength(1);
+  });
+});
+
+/**
  * The HTTP-level cardinality check in oidc-remote.test.ts can only reach rejection reasons the
  * shared fake IdP can mint — the ID-token/`typ` branch is not one of them. Reading the source
  * covers every branch there is, including one added tomorrow to a check nothing here can drive.

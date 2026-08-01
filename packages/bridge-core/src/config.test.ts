@@ -13,7 +13,9 @@ import {
 import {
   decodePresence,
   encodePresence,
+  MAX_HANDLE_LEN,
   MAX_RECORD_TOPICS,
+  MAX_TOPIC_LEN,
   type PresenceRecord,
 } from './engine/presence.js';
 import { asHandle, asTopic } from './message.js';
@@ -715,35 +717,80 @@ describe('no config value reaches a runnable suggestion', () => {
   });
 });
 
-// A config list that rides the presence beat is read back through a decoder that CAPS it, and the
-// decoder is on the peer's side: a list longer than the cap loads cleanly here and then advertises
-// this bridge on only its first MAX_RECORD_TOPICS entries, on every peer, forever — no error, no log,
-// no way for the operator to see it. The load is the only place that can say so, so grade every list
-// the beat carries: at the cap it must load AND survive the round trip, past the cap it must be
-// refused at load OR carried whole — never silently truncated. The beat is built by the real emitter,
-// so a list field added to it later is graded the moment it appears.
-describe('a config list carried by the presence beat is capped where it is declared', () => {
-  type Verdict = 'refused at load' | 'carried in full' | 'truncated on the wire';
+// A config VALUE that rides the presence beat is read back through a decoder that CAPS it, and the
+// decoder is on the peer's side: a value past a cap loads cleanly here and is then truncated out of —
+// or drops — every peer's copy, forever, with no error, no log and no way for the operator to see it.
+// The load is the only place that can say so. So grade every value the beat carries, on every axis
+// the decoder caps: at the cap it must load AND survive the round trip whole, past the cap it must be
+// refused at load. The carried set and the axes are DERIVED — from a marker round trip through the
+// real emitter, and from the shape of what the beat carries — so a new field, or a new axis on an
+// existing one, fails as a missing row rather than passing silently.
+describe('a config value carried by the presence beat is capped where it is declared', () => {
+  type Verdict = 'refused at load' | 'carried in full' | 'truncated on the wire' | 'record dropped';
 
-  interface WireList {
-    /** The `PresenceRecord` field the beat carries it in. */
-    beatField: 'topics' | 'postTopics';
-    configKey: 'topics' | 'post_topics';
-    element: (i: number) => string;
+  interface Axis {
+    label: 'length' | 'count' | 'element length';
+    cap: number;
+    /** The config value sitting at `n` on this axis. */
+    at: (n: number) => string | string[];
   }
 
-  const WIRE_LISTS: WireList[] = [
-    { beatField: 'topics', configKey: 'topics', element: (i) => `ctx-${i}` },
-    { beatField: 'postTopics', configKey: 'post_topics', element: (i) => `ctx-${i}-.*` },
+  interface WireValue {
+    /** The `PresenceRecord` field the beat carries it in. */
+    beatField: 'handle' | 'topics' | 'postTopics';
+    /** Where in the config document the emitter reads it from. */
+    configPath: readonly string[];
+    /** A value that marks this field in a beat, for the coverage derivation below. */
+    marker: string | string[];
+    axes: Axis[];
+  }
+
+  const listAxes = (element: (i: number) => string, long: (n: number) => string): Axis[] => [
+    { label: 'count', cap: MAX_RECORD_TOPICS, at: (n) => Array.from({ length: n }, (_u, i) => element(i)) },
+    { label: 'element length', cap: MAX_TOPIC_LEN, at: (n) => [long(n)] },
   ];
 
-  function configWith(list: WireList, n: number): Record<string, unknown> {
-    const entries = Array.from({ length: n }, (_unused, i) => list.element(i));
-    return { identity: { handle: 'h' }, topics: ['ctx'], [list.configKey]: entries };
+  const WIRE_VALUES: WireValue[] = [
+    {
+      beatField: 'handle',
+      configPath: ['identity', 'handle'],
+      marker: 'mk-handle',
+      axes: [{ label: 'length', cap: MAX_HANDLE_LEN, at: (n) => 'h'.repeat(n) }],
+    },
+    {
+      beatField: 'topics',
+      configPath: ['topics'],
+      marker: ['mk-topic'],
+      axes: listAxes((i) => `ctx-${i}`, (n) => 't'.repeat(n)),
+    },
+    {
+      beatField: 'postTopics',
+      configPath: ['post_topics'],
+      marker: ['mk-post-.*'],
+      axes: listAxes((i) => `ctx-${i}-.*`, (n) => 'a'.repeat(n)),
+    },
+  ];
+
+  /** Which axes a value of this shape can be capped on — the whole set, so none can go ungraded. */
+  const AXES_FOR_SHAPE: Record<'string' | 'string[]', string[]> = {
+    string: ['length'],
+    'string[]': ['count', 'element length'],
+  };
+
+  const CELLS = WIRE_VALUES.flatMap((w) =>
+    w.axes.map((axis) => [`${w.configPath.join('.')} ${axis.label}`, w, axis] as const),
+  );
+
+  function configWith(path: readonly string[], value: unknown): Record<string, unknown> {
+    const doc: Record<string, unknown> = { identity: { handle: 'h' }, topics: ['ctx'] };
+    let node = doc;
+    for (const key of path.slice(0, -1)) node = node[key] as Record<string, unknown>;
+    node[path.at(-1)!] = value;
+    return doc;
   }
 
   /** The `hello` beat the real emitter posts for `cfg`, decoded exactly as a peer decodes it. */
-  async function beatFrom(cfg: ParleyConfig): Promise<PresenceRecord> {
+  async function beatFrom(cfg: ParleyConfig): Promise<PresenceRecord | null> {
     const plugin = new FakePlugin();
     await plugin.connect({});
     const topic = asTopic(cfg.presence.topic);
@@ -753,65 +800,85 @@ describe('a config list carried by the presence beat is capped where it is decla
     });
     await loop.stop();
     const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
-    const beat = decodePresence(messages[0]!.content);
-    expect(beat?.kind).toBe('hello');
-    return beat!;
+    expect(messages.length).toBeGreaterThan(0);
+    return decodePresence(messages[0]!.content);
   }
 
-  async function roundTrip(list: WireList, n: number): Promise<Verdict> {
+  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+  /** What a peer ends up holding for `value`, going through the loader and the real emitter. */
+  async function roundTrip(w: WireValue, value: string | string[]): Promise<Verdict> {
     let cfg: ParleyConfig;
     try {
-      cfg = parseConfig(configWith(list, n));
+      cfg = parseConfig(configWith(w.configPath, value));
     } catch {
       return 'refused at load';
     }
-    const carried = (await beatFrom(cfg))[list.beatField];
-    const declared = Array.from({ length: n }, (_unused, i) => list.element(i));
-    return carried.length === n && carried.every((v, i) => v === declared[i])
-      ? 'carried in full'
-      : 'truncated on the wire';
+    const beat = await beatFrom(cfg);
+    if (beat === null) return 'record dropped';
+    return same(beat[w.beatField], value) ? 'carried in full' : 'truncated on the wire';
   }
 
-  it('covers every list field the beat carries', async () => {
-    const cfg = parseConfig(configWith(WIRE_LISTS[0]!, 2));
-    const beat = await beatFrom(cfg);
-    const carriedLists = Object.entries(beat)
-      .filter(([, value]) => Array.isArray(value))
+  /** The same verdict for a beat built BY HAND — what the decoder does, with no loader in front. */
+  function onTheWire(w: WireValue, value: string | string[]): Verdict {
+    const base: PresenceRecord = {
+      v: 2,
+      kind: 'hello',
+      at: 0,
+      handle: 'h',
+      topics: ['ctx'],
+      postTopics: [],
+      instanceId: 'i',
+    };
+    const decoded = decodePresence(
+      encodePresence({ ...base, [w.beatField]: value } as unknown as PresenceRecord),
+    );
+    if (decoded === null) return 'record dropped';
+    return same(decoded[w.beatField], value) ? 'carried in full' : 'truncated on the wire';
+  }
+
+  it('covers every beat field fed from the config, and every axis its shape can be capped on', async () => {
+    const doc: Record<string, unknown> = { identity: { handle: 'h' }, topics: ['ctx'] };
+    for (const w of WIRE_VALUES) {
+      let node = doc;
+      for (const key of w.configPath.slice(0, -1)) node = node[key] as Record<string, unknown>;
+      node[w.configPath.at(-1)!] = w.marker;
+    }
+    const beat = await beatFrom(parseConfig(doc));
+    expect(beat?.kind).toBe('hello');
+    const fromConfig = Object.entries(beat!)
+      .filter(([, value]) => JSON.stringify(value).includes('mk-'))
       .map(([key]) => key)
       .sort();
-    expect(carriedLists).toEqual(WIRE_LISTS.map((w) => w.beatField).sort());
+    expect(fromConfig).toEqual(WIRE_VALUES.map((w) => w.beatField).sort());
+
+    for (const w of WIRE_VALUES) {
+      const shape = Array.isArray(beat![w.beatField]) ? 'string[]' : 'string';
+      expect(w.axes.map((a) => a.label).sort(), w.beatField).toEqual(AXES_FOR_SHAPE[shape].sort());
+    }
   });
 
-  it('the round trip can SEE a truncation (positive control for the verdict)', () => {
+  it('the round trip can SEE both ways a peer loses a value (positive control for the verdict)', () => {
     const over = Array.from({ length: MAX_RECORD_TOPICS + 1 }, (_unused, i) => `ctx-${i}`);
-    const beat = decodePresence(
-      encodePresence({
-        v: 2,
-        kind: 'hello',
-        at: 0,
-        handle: 'h',
-        topics: over,
-        postTopics: over,
-        instanceId: 'i',
-      }),
-    );
-    expect(beat?.topics).toHaveLength(MAX_RECORD_TOPICS);
-    expect(beat?.postTopics).toHaveLength(MAX_RECORD_TOPICS);
+    expect(onTheWire(WIRE_VALUES[1]!, over)).toBe('truncated on the wire');
+    expect(onTheWire(WIRE_VALUES[0]!, 'h'.repeat(MAX_HANDLE_LEN + 1))).toBe('record dropped');
   });
 
-  it.each(WIRE_LISTS.map((w) => [w.configKey, w] as const))(
-    '%s at the wire cap loads and reaches a peer whole',
-    async (_label, list) => {
-      expect(await roundTrip(list, MAX_RECORD_TOPICS)).toBe('carried in full');
-    },
-  );
+  it.each(CELLS)('%s: the decoder carries a value AT the declared cap', (_label, w, axis) => {
+    expect(onTheWire(w, axis.at(axis.cap))).toBe('carried in full');
+  });
 
-  it.each(WIRE_LISTS.map((w) => [w.configKey, w] as const))(
-    '%s past the wire cap is refused at load, not truncated behind the operator',
-    async (_label, list) => {
-      expect(await roundTrip(list, MAX_RECORD_TOPICS + 1)).not.toBe('truncated on the wire');
-    },
-  );
+  it.each(CELLS)('%s: the decoder is what makes the cap real — one past it is lost', (_l, w, axis) => {
+    expect(onTheWire(w, axis.at(axis.cap + 1))).not.toBe('carried in full');
+  });
+
+  it.each(CELLS)('%s at the cap loads and reaches a peer whole', async (_label, w, axis) => {
+    expect(await roundTrip(w, axis.at(axis.cap))).toBe('carried in full');
+  });
+
+  it.each(CELLS)('%s past the cap is refused at load, not lost behind the operator', async (_l, w, axis) => {
+    expect(await roundTrip(w, axis.at(axis.cap + 1))).toBe('refused at load');
+  });
 });
 
 // `loadConfig` is what every shipped backend CLI calls, so its failure message is the first thing a

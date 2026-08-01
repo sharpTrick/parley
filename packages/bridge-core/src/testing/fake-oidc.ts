@@ -19,6 +19,12 @@ export interface FakeOidcClaims {
   issuerOverride?: string;
   /** Sign with a keypair NOT in the published JWKS (bad-signature case). */
   signWithRogueKey?: boolean;
+  /**
+   * Registered claims to leave OFF the token entirely. A claim a verifier only checks WHEN PRESENT
+   * is a check that does not run at all for a token that omits it, and no other knob here can mint
+   * that token.
+   */
+  omit?: readonly ('iss' | 'sub' | 'aud' | 'exp' | 'nbf' | 'iat')[];
 }
 
 export interface FakeOidc {
@@ -75,6 +81,7 @@ export async function startFakeOidc(): Promise<FakeOidc> {
     async mint(claims: FakeOidcClaims = {}): Promise<string> {
       const nowS = Math.floor(Date.now() / 1000);
       const key = claims.signWithRogueKey === true ? rogue.privateKey : signing.privateKey;
+      const omitted = new Set<string>(claims.omit ?? []);
       const jwt = new SignJWT({
         ...(claims.scope !== undefined ? { scope: claims.scope } : {}),
         ...(claims.preferred_username !== undefined
@@ -82,14 +89,15 @@ export async function startFakeOidc(): Promise<FakeOidc> {
           : {}),
         ...(claims.realm_access !== undefined ? { realm_access: claims.realm_access } : {}),
         azp: claims.azp ?? 'fake-client',
-      })
-        .setProtectedHeader({ alg: 'RS256', kid })
-        .setIssuer(claims.issuerOverride ?? issuer)
-        .setSubject(claims.sub ?? 'owner-sub')
-        .setAudience(claims.aud ?? 'parley-mcp')
-        .setIssuedAt(nowS)
-        .setExpirationTime(nowS + (claims.expiresInS ?? 300));
-      if (claims.notBeforeInS !== undefined) jwt.setNotBefore(nowS + claims.notBeforeInS);
+      }).setProtectedHeader({ alg: 'RS256', kid });
+      if (!omitted.has('iss')) jwt.setIssuer(claims.issuerOverride ?? issuer);
+      if (!omitted.has('sub')) jwt.setSubject(claims.sub ?? 'owner-sub');
+      if (!omitted.has('aud')) jwt.setAudience(claims.aud ?? 'parley-mcp');
+      if (!omitted.has('iat')) jwt.setIssuedAt(nowS);
+      if (!omitted.has('exp')) jwt.setExpirationTime(nowS + (claims.expiresInS ?? 300));
+      if (claims.notBeforeInS !== undefined && !omitted.has('nbf')) {
+        jwt.setNotBefore(nowS + claims.notBeforeInS);
+      }
       return jwt.sign(key);
     },
     close(): Promise<void> {

@@ -137,12 +137,97 @@ describe('every public auth entry point is driven by the offline suite', () => {
  * The selection happens when the TABLE is built, not inside the test body: a row that returns
  * before asserting is green for a reason nothing records, and thirty-nine such rows made one real
  * check look like forty.
+ *
+ * What is graded is the EXPRESSION each skip is gated on, resolved through the named flag it is
+ * nearly always written as — never "the file mentions process.env somewhere", which every e2e file
+ * satisfies with its host override and which therefore says nothing about the skip at all.
  */
-const SELECTS_A_SKIP = /describe\.skip|describe\.skipIf|it\.skip/;
+
+/**
+ * Blank out the BODY of every string, template and comment, length-preserving, so that a skip
+ * written inside one — a synthetic fixture, a doc example — is not read as code, and so that no
+ * source has to be excused from the scan by name.
+ */
+function codeOnly(source: string): string {
+  // One pass, so that the earliest opener wins: scanning for comments first turns the `//` inside
+  // 'http://host' into a line comment and unbalances every quote after it.
+  const TOKEN = /\/\*[\s\S]*?\*\/|\/\/[^\n]*|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+  return source.replace(TOKEN, (tok) =>
+    tok.startsWith('/') ? ' '.repeat(tok.length) : tok[0]! + ' '.repeat(tok.length - 2) + tok.at(-1)!,
+  );
+}
+
+/** The contents of the parenthesised group opening at `open`, or '' if it never closes. */
+function balanced(source: string, open: number, [lhs, rhs] = ['(', ')']): string {
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === lhs) depth++;
+    else if (source[i] === rhs && --depth === 0) return source.slice(open + 1, i);
+  }
+  return source.slice(open + 1);
+}
+
+/** `const NAME = <expr>;` bindings, so a gate written as a named flag is graded on what it holds. */
+function constBindings(source: string): Map<string, string> {
+  return new Map(
+    [...source.matchAll(/\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+);/g)].map((m) => [m[1]!, m[2]!]),
+  );
+}
+
+function resolveGate(gate: string, bindings: Map<string, string>): string {
+  let text = gate;
+  for (let step = 0; step < 4; step++) {
+    const expanded = text.replace(/[A-Za-z_$][\w$]*/g, (id) => bindings.get(id) ?? id);
+    if (expanded === text) break;
+    text = expanded;
+  }
+  return text;
+}
+
+/** The condition of the innermost `if (…)` whose body encloses `at`, or '' when there is none. */
+function enclosingIf(source: string, at: number): string {
+  let found = '';
+  for (const m of source.matchAll(/\bif\s*\(/g)) {
+    const open = (m.index ?? 0) + m[0].length - 1;
+    if (open >= at) break;
+    const cond = balanced(source, open);
+    const rest = source.slice(open + cond.length + 2);
+    const bodyStart = open + cond.length + 2 + (/\S/.exec(rest)?.index ?? 0);
+    const bodyEnd =
+      source[bodyStart] === '{' ? bodyStart + balanced(source, bodyStart, ['{', '}']).length + 1 : source.indexOf(';', bodyStart);
+    if (bodyStart <= at && (bodyEnd === -1 ? source.length : bodyEnd) > at) found = cond;
+  }
+  return found;
+}
+
+/** Anything that makes a gate depend on whether a dependency happened to answer. */
+const RUNTIME_PROBE = /\bfetch\s*\(|\bawait\b|\.then\s*\(|\bconnect\b|\bping\b|createConnection|new Socket/;
+
+/** One line per skip whose gate is not an explicit env opt-out. */
+function skipViolations(raw: string): string[] {
+  const source = codeOnly(raw);
+  const bindings = constBindings(source);
+  const out: string[] = [];
+  for (const m of source.matchAll(/\b(?:describe|it)\.skip(If)?\b/g)) {
+    const at = m.index ?? 0;
+    const gate =
+      m[1] === 'If' ? balanced(source, source.indexOf('(', at + m[0].length)) : enclosingIf(source, at);
+    const resolved = resolveGate(gate, bindings);
+    const why = !/process\.env\.\w+/.test(resolved)
+      ? 'is gated on no explicit env opt-out'
+      : RUNTIME_PROBE.test(resolved)
+        ? 'is gated on a runtime probe'
+        : '';
+    if (why !== '') out.push(`${m[0]} ${why}: ${JSON.stringify(gate.trim())}`);
+  }
+  return out;
+}
 
 describe('no suite may skip itself into green', () => {
   const files = tsFiles(CORE_SRC, true).filter((f) => f.endsWith('.test.ts'));
-  const skipping = files.filter((f) => SELECTS_A_SKIP.test(readFileSync(f, 'utf8')));
+  const skipping = files.filter((f) =>
+    /\b(?:describe|it)\.skip(If)?\b/.test(codeOnly(readFileSync(f, 'utf8'))),
+  );
 
   it('finds the core test files to scan, and at least one that selects a skip', () => {
     expect(files.length).toBeGreaterThan(5);
@@ -152,10 +237,58 @@ describe('no suite may skip itself into green', () => {
   it.each(skipping.map((f) => [f.slice(CORE_SRC.length), f]))(
     '%s gates its skip on an explicit env opt-out, not on a probe',
     (_name: string, file: string) => {
-      expect(
-        readFileSync(file, 'utf8'),
-        `${file} selects a skip without an explicit env opt-out`,
-      ).toMatch(/process\.env\./);
+      expect(skipViolations(readFileSync(file, 'utf8'))).toEqual([]);
+    },
+  );
+
+  /**
+   * A structural rule that only ever runs against sources which already satisfy it is a rule nobody
+   * has watched fail — and this one WAS vacuous, satisfied by a `process.env.` anywhere in the file
+   * while the skip itself rode a reachability probe. Drive it against synthetic sources in both
+   * directions, so the rule is graded rather than merely exercised.
+   */
+  const SYNTHETIC: ReadonlyArray<readonly [label: string, source: string, offends: boolean]> = [
+    [
+      'an explicit env opt-out behind a named flag (the shape the real suites use)',
+      "const OPTED_OUT = process.env.PARLEY_E2E === '0';\nif (OPTED_OUT) {\n  describe.skip('x', () => {});\n}\n",
+      false,
+    ],
+    [
+      'a skipIf reading the env directly',
+      "describe.skipIf(process.env.PARLEY_E2E === '0')('x', () => {});\n",
+      false,
+    ],
+    [
+      'a reachability probe, in a file that names an env var elsewhere',
+      "const KC = process.env.PARLEY_KEYCLOAK_URL ?? 'http://x';\n" +
+        'const OPTED_OUT = await fetch(KC).then(() => false).catch(() => true);\n' +
+        "if (OPTED_OUT) {\n  describe.skip('x', () => {});\n}\n",
+      true,
+    ],
+    ['a skipIf on a probe', "const up = await probe();\ndescribe.skipIf(!up)('x', () => {});\n", true],
+    ['a skip gated on nothing at all', "describe.skip('x', () => {});\n", true],
+    [
+      'an it.skip inside a probe-gated branch',
+      "const reachable = await ping(HOST);\nif (!reachable) {\n  it.skip('x', () => {});\n}\n",
+      true,
+    ],
+    [
+      'an env opt-out combined with a probe',
+      "const OPTED_OUT = process.env.PARLEY_E2E === '0' || !(await reach());\n" +
+        "if (OPTED_OUT) {\n  describe.skip('x', () => {});\n}\n",
+      true,
+    ],
+  ] as const;
+
+  it('the rule reaches both verdicts, so neither column is empty', () => {
+    expect(SYNTHETIC.filter(([, , offends]) => offends).length).toBeGreaterThan(2);
+    expect(SYNTHETIC.filter(([, , offends]) => !offends).length).toBeGreaterThan(1);
+  });
+
+  it.each(SYNTHETIC.map(([label, source, offends]) => [label, source, offends] as const))(
+    'the rule %s',
+    (_label: string, source: string, offends: boolean) => {
+      expect(skipViolations(source).length > 0).toBe(offends);
     },
   );
 });

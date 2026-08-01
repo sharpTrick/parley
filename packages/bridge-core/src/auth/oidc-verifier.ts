@@ -89,11 +89,12 @@ interface RealmAccessClaim {
 
 /**
  * Resource-server token verification against an external OIDC IdP (DESIGN §10, delegated
- * variant): JWKS signature, `iss`, `exp`/`nbf` ± skew, and `aud` are always enforced; scope and
- * identity gates apply on top when configured. Plugs into the SDK's `requireBearerAuth`, so it
- * must only ever throw the SDK's OAuth error classes: `InvalidTokenError` → 401 (+ discovery
- * challenge), `InsufficientScopeError` → 403. Identity-gate failures are deliberately 401, not
- * 403, so the gate policy itself is not leaked to unauthorized callers.
+ * variant): JWKS signature, `iss`, `aud` and an `exp` in the future ± skew are always enforced, and
+ * `nbf` ± skew when the token carries one; scope and identity gates apply on top when configured.
+ * Plugs into the SDK's `requireBearerAuth`, so it must only ever throw the SDK's OAuth error
+ * classes: `InvalidTokenError` → 401 (+ discovery challenge), `InsufficientScopeError` → 403.
+ * Identity-gate failures are deliberately 401, not 403, so the gate policy itself is not leaked to
+ * unauthorized callers.
  */
 export class OidcTokenVerifier implements OAuthTokenVerifier {
   private readonly opts: OidcVerifierOptions;
@@ -111,15 +112,22 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
     let header: JWTHeaderParameters;
     try {
       // One call covers signature (kid-selected key, auto-refetch on unknown kid), iss, exp,
-      // nbf (± clockTolerance), and aud-contains-audience.
+      // nbf (± clockTolerance), and aud-contains-audience. Keep `exp` in requiredClaims — jose
+      // validates a claim only when it is PRESENT — so that an exp-less token is refused HERE and
+      // not downstream by requireBearerAuth, whose own wording says which check let it get that far.
       ({ payload, protectedHeader: header } = await jwtVerify(token, this.jwks, {
         issuer: opts.issuer,
         audience: opts.audience,
         algorithms: ACCEPTED_SIGNING_ALGORITHMS,
+        requiredClaims: ['exp'],
         clockTolerance: skewS,
         ...(opts.now !== undefined ? { currentDate: new Date(opts.now()) } : {}),
       }));
     } catch {
+      throw new InvalidTokenError(REJECTION_MESSAGE);
+    }
+
+    if (typeof payload.exp !== 'number') {
       throw new InvalidTokenError(REJECTION_MESSAGE);
     }
 
@@ -148,7 +156,7 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
       // Report the expiry INCLUDING the tolerance, so that requireBearerAuth — which re-checks this
       // field against wall-clock with no tolerance of its own — cannot 401 a token this verifier
       // just accepted, silently undoing the configured skew.
-      ...(typeof payload.exp === 'number' ? { expiresAt: payload.exp + skewS } : {}),
+      expiresAt: payload.exp + skewS,
       // AuthInfo.resource must be a URL; with a fixed-string Keycloak audience (e.g.
       // "parley-mcp") there is no URL to report, so it is set only when the audience parses.
       ...(asUrl(opts.audience) !== undefined ? { resource: asUrl(opts.audience) } : {}),

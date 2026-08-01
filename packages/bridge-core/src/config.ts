@@ -8,7 +8,12 @@ import {
   issueLines,
   messageOf,
 } from './config-diagnostics.js';
-import { DEFAULT_PRESENCE_TOPIC, MAX_RECORD_TOPICS } from './engine/presence.js';
+import {
+  DEFAULT_PRESENCE_TOPIC,
+  MAX_HANDLE_LEN,
+  MAX_RECORD_TOPICS,
+  MAX_TOPIC_LEN,
+} from './engine/presence.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 
@@ -33,6 +38,15 @@ export const MAX_POST_TOPICS = 64;
 export const MAX_BLOCK_MS = 300_000;
 
 /**
+ * A string a presence beat carries verbatim. Capped where it is DECLARED, because every reader drops
+ * a longer one out of the decoded record: a longer value loads cleanly and then leaves this bridge
+ * silently unadvertised on it forever, with no error anywhere.
+ */
+const beatString = z.string().min(1).max(MAX_TOPIC_LEN, {
+  message: `at most ${MAX_TOPIC_LEN} characters: a presence beat carries this string verbatim and every reader drops a longer one, so it would be silently unreachable for hand-off`,
+});
+
+/**
  * The single config object that drives a bridge (DESIGN §11). Sane defaults everywhere.
  * `backend_config` is opaque to core and passed verbatim to the plugin's `connect()`.
  *
@@ -49,7 +63,9 @@ const ConfigObject = z.object({
   state_path: z.string().min(1).optional(),
   identity: z
     .object({
-      handle: z.string().min(1),
+      handle: z.string().min(1).max(MAX_HANDLE_LEN, {
+        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: every presence beat carries it and a reader drops the WHOLE beat past that length, so this bridge would never appear in any peer's parley_list_users`,
+      }),
     })
     .strict(),
   /**
@@ -59,7 +75,7 @@ const ConfigObject = z.object({
    * on its trailing topics forever — no peer would ever see it as a hand-off partner there.
    */
   topics: z
-    .array(z.string().min(1))
+    .array(beatString)
     .min(1)
     .max(MAX_RECORD_TOPICS, {
       message: `topics accepts at most ${MAX_RECORD_TOPICS} entries: a presence beat carries the whole list and every reader keeps only the first ${MAX_RECORD_TOPICS}, so the rest would be silently unreachable for hand-off`,
@@ -73,7 +89,7 @@ const ConfigObject = z.object({
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
    * one of them, so the count is the other half of that bound.
    */
-  post_topics: z.array(z.string().min(1)).max(MAX_POST_TOPICS).default([]),
+  post_topics: z.array(beatString).max(MAX_POST_TOPICS).default([]),
   catchup: z
     .object({
       on_start: z.boolean().default(true),
