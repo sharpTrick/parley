@@ -135,5 +135,15 @@
       "nothingFound": false,
       "checked": "Worked in /tmp/careening/worktrees/repo (base b5cd4b8), tracked files only (I confirmed via `git ls-files` that the five `tsconfig.tmpcheck.json` files present on disk are UNTRACKED worktree contamination and excluded them from every conclusion). Matrices built, invariant x package: (1) tsconfig coverage of test sources \u2014 `git ls-files 'packages/*/tsconfig*.json'` x `scripts` in each manifest; (2)"
     }
-  ]
+  ],
+  "interpretation": {
+    "headline": "Blocking findings per package went 29 (round 10) -> 28 (round 13), like-for-like excluding the new repo target.",
+    "notApplesToApples": "This is NOT a clean test of the decomposition hypothesis, and an earlier draft of this record called it a negative result, which was wrong. A flat count is consistent with at least two opposite readings: decomposition did not reduce the defect population, OR decomposition made defects EASIER to find, so the loop is now surfacing a larger fraction of a smaller population. A single round cannot separate them, because the round measures findings, not defects.",
+    "confounds": [
+      "Rounds 11 and 12 changed a large amount of code, so an unknown share of round 13 findings are iatrogenic to the decomposition itself rather than pre-existing. The git-blame oracle has to split these before the number means anything.",
+      "The partition changed at round 13 (14 -> 15 targets). The repo target is excluded above to keep the comparison like-for-like, but the fourteen package critics also now review smaller surfaces.",
+      "Per-target attribution in this file is INFERRED from finding file paths; the journal does not record it."
+    ],
+    "whatWouldSettleIt": "The trend across rounds 14-16 against a tree that is no longer being restructured, with iatrogenic findings separated out by git blame. If blocking falls once the code stops moving, the decomposition helped; if it holds near 28-29 with the pre-existing share flat, it did not."
+  }
 }
