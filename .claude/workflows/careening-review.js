@@ -93,14 +93,13 @@ const SCHEMA = {
     coverage: {
       type: 'object',
       additionalProperties: false,
-      description: 'Stage 6 self-audit, reported so the search itself can be graded — not only its findings.',
       properties: {
-        passes: { type: 'number', description: 'how many times you ran stage 3 (1 if you never looped back)' },
-        foundOnLaterPass: { type: 'string', description: 'what a second or later pass found that the first missed, or "nothing"' },
-        inventoryCount: { type: 'number', description: 'how many items stage 1 enumerated' },
-        unexaminedItems: { type: 'string', description: 'inventoried items you never actually examined, by name, or "none"' },
+        passes: { type: 'number', description: 'times you ran stage 3 (1 if you never looped back)' },
+        foundOnLaterPass: { type: 'string', description: 'what a later pass found that the first missed, or "nothing"' },
+        inventoryCount: { type: 'number', description: 'items stage 1 enumerated' },
+        unexaminedItems: { type: 'string', description: 'inventoried items never examined, by name, or "none"' },
         lensesWithoutAttempt: { type: 'string', description: 'lenses that returned nothing and cannot name what was tried, or "none"' },
-        untestedReliances: { type: 'string', description: 'tests you relied on but never mutated, by name, or "none"' },
+        untestedReliances: { type: 'string', description: 'tests relied on but never mutated, by name, or "none"' },
       },
       required: ['passes', 'foundOnLaterPass', 'inventoryCount', 'unexaminedItems', 'lensesWithoutAttempt', 'untestedReliances'],
     },
@@ -134,51 +133,15 @@ const SCHEMA = {
             type: 'object',
             additionalProperties: false,
             properties: {
-              reliesOn: {
-                type: 'string',
-                description:
-                  'Existing code your fix calls into, and the SPECIFIC branch or constant you depend on — quote it. Say "nothing" if it stands alone. (A round-13 remediation told bridge-redis to call plaintextRemoteOrigin, whose SECURE_SCHEMES lacks rediss:, so it would have warned on every correctly-configured TLS deployment.)',
-              },
-              newlyAccepts: {
-                type: 'string',
-                description:
-                  'One concrete input your fix ACCEPTS that today\'s code rejects, or "none". (A round-13 remediation proposed building an HTTP-date with Date.UTC; V8 returns NaN for "Nov 32" where Date.UTC rolls it into a plausible instant — the fix LOOSENED the parser.)',
-              },
-              newlyRejects: {
-                type: 'string',
-                description:
-                  'One concrete input your fix REJECTS that today\'s code accepts, or "none". Name who legitimately sends it.',
-              },
-              testsThatWouldFail: {
-                type: 'string',
-                description:
-                  'Currently-passing tests your fix breaks, BY NAME, or "none found — and I looked, here is where". (A round-13 remediation\'s tie-break broke an existing test driving 200 client ids.)',
-              },
-              hidesOrFixes: {
-                type: 'string',
-                description:
-                  'If your fix were applied and the underlying defect REMAINED, what would still be visibly broken? If the honest answer is "nothing", you are proposing to hide the symptom. (A round-13 remediation proposed pinning TZ, which turns "red for every non-UTC user" into "green for everyone including the broken".)',
-              },
-              interleavings: {
-                type: 'string',
-                description:
-                  'CONCURRENCY FIXES ONLY, else "n/a". Walk the orderings, including two callers both taking your new path. (A round-13 remediation for a lock TOCTOU was itself a TOCTOU: A unlinks, claims, re-reads, then B unlinks A\'s fresh claim, and both proceed.)',
-              },
-              confidence: {
-                enum: ['traced', 'plausible', 'untested'],
-                description:
-                  'traced = you followed your fix through the real code or ran it. untested = you have not. Be accurate rather than generous; "untested" is useful data and costs you nothing, while a wrong "traced" is what the remediating agent will trust.',
-              },
+              reliesOn: { type: 'string', description: 'existing code your fix calls, and the branch you depend on; quote it, or "nothing"' },
+              newlyAccepts: { type: 'string', description: 'one input your fix accepts that today rejects, or "none"' },
+              newlyRejects: { type: 'string', description: 'one input your fix rejects that today accepts, or "none"' },
+              testsThatWouldFail: { type: 'string', description: 'passing tests your fix breaks, by name, or "none found — and here is where I looked"' },
+              hidesOrFixes: { type: 'string', description: 'what stays broken if applied while the bug remains; "nothing" means it hides the symptom' },
+              interleavings: { type: 'string', description: 'concurrency fixes only: the orderings, incl. two callers on your new path; else "n/a"' },
+              confidence: { enum: ['traced', 'plausible', 'untested'] },
             },
-            required: [
-              'reliesOn',
-              'newlyAccepts',
-              'newlyRejects',
-              'testsThatWouldFail',
-              'hidesOrFixes',
-              'interleavings',
-              'confidence',
-            ],
+            required: ['reliesOn', 'newlyAccepts', 'newlyRejects', 'testsThatWouldFail', 'hidesOrFixes', 'interleavings', 'confidence'],
           },
           testUpgrade: { type: 'string', description: 'parameterized/fuzz test guarding the CLASS' },
         },
@@ -258,13 +221,21 @@ const results = await parallel(
       agentType: 'critic-package',
       schema: SCHEMA,
     })
-      .then((r) => ({
-        target: t.key,
-        dirs: t.dirs,
-        nothingFound: !!(r && r.nothingFound),
-        checked: (r && r.checked) || '',
-        findings: (r && r.findings) || [],
-      }))
+      // agent() answers NULL when a subagent dies on a terminal error — it does not reject, so the
+      // .catch below never sees it. Keep this branch, so that a critic which never ran can never be
+      // read as a critic that ran and found nothing: round 15 had all fifteen blocked before they
+      // started and the round declared CONVERGENCE on zero evidence, then quiesced every target.
+      .then((r) =>
+        r === null || r === undefined
+          ? { target: t.key, dirs: t.dirs, nothingFound: false, checked: '', findings: [], errored: true }
+          : {
+              target: t.key,
+              dirs: t.dirs,
+              nothingFound: !!r.nothingFound,
+              checked: r.checked || '',
+              findings: r.findings || [],
+            },
+      )
       .catch(() => ({ target: t.key, dirs: t.dirs, nothingFound: false, checked: '', findings: [], errored: true })),
   ),
 )
