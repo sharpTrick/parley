@@ -1,6 +1,9 @@
-import { asHandle, asTopic, type FetchRecentResult, type Topic } from '@sharptrick/parley-core';
+import {
+  asHandle, asTopic, type FetchRecentResult, safeName, type Topic,
+} from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MatrixPlugin } from '../src/index.js';
+import { boundedLocalpart } from '../src/alias.js';
+import { MatrixPlugin, sanitizeAlias } from '../src/index.js';
 import {
   aliasForTopic,
   connectFake,
@@ -308,4 +311,118 @@ describe('a topic longer than the alias limit still folds to a legal, injective 
     );
     await p.disconnect();
   });
+});
+
+/**
+ * CLASS: the fold is injective across EVERY branch, including the one it grew for itself. Two
+ * hand-picked pairs grade the two branches `safeName` owns; the length cap adds a third that mints a
+ * name of its own — and any name this fold publishes is a topic somebody can ask for, because a room
+ * alias is public. So each seed contributes the names the fold produced FOR it, re-fed as topics and
+ * folded again, closed over two rounds: a branch reachable from another branch's output collides
+ * here rather than in a shared room. Swept over an alphabet the fold leaves alone and two it
+ * rewrites, over lengths straddling the truncation boundary, and over `server_name` lengths — the
+ * budget, and with it the truncation point, moves with the server name.
+ */
+const FOLD_ALPHABETS: Record<string, string> = {
+  'legal ascii': 'x',
+  'lossy ascii': '/',
+  'multi-byte': 'é',
+};
+
+const FOLD_SERVER_NAMES = [
+  SERVER_NAME,
+  'parley.local',
+  `${'a.'.repeat(60)}example.com`,
+  // Long enough that the truncation branch keeps barely more of the topic than the digest costs.
+  's'.repeat(200),
+];
+
+/** Every topic reachable from `seeds` by re-feeding the fold its own output, `rounds` deep. */
+function foldClosure(seeds: string[], serverName: string, rounds: number): string[] {
+  const topics = new Set(seeds);
+  for (let round = 0; round < rounds; round++) {
+    for (const topic of [...topics]) {
+      topics.add(boundedLocalpart(asTopic(topic), serverName).slice('parley_'.length));
+      topics.add(safeName(asTopic(topic), sanitizeAlias));
+    }
+  }
+  return [...topics];
+}
+
+/** Names more than one topic folds onto, with the topics that share each — `[]` when injective. */
+function collisions(topics: string[], fold: (topic: string) => string): string[][] {
+  const byName = new Map<string, string[]>();
+  for (const topic of new Set(topics)) {
+    const name = fold(topic);
+    byName.set(name, [...(byName.get(name) ?? []), topic]);
+  }
+  return [...byName.values()].filter((sharing) => sharing.length > 1);
+}
+
+const foldFor =
+  (serverName: string) =>
+  (topic: string): string =>
+    boundedLocalpart(asTopic(topic), serverName);
+
+describe('no two topics fold onto one alias localpart', () => {
+  it('recognizes a collision when it sees one', () => {
+    const truncating = (t: string): string => t.slice(0, 3);
+    expect(collisions(['abcd', 'abce'], truncating)).toEqual([['abcd', 'abce']]);
+    expect(collisions(['abcd', 'abcd'], truncating)).toEqual([]); // one topic, listed twice
+    expect(collisions(['abcd', 'zbcd'], truncating)).toEqual([]);
+  });
+
+  for (const serverName of FOLD_SERVER_NAMES) {
+    const budget = 255 - Buffer.byteLength(`#:${serverName}`, 'utf8');
+    const exactFit = budget - 'parley_'.length;
+    const lengths = [1, 8, exactFit - 1, exactFit, exactFit + 1, 4 * exactFit];
+
+    for (const [alphabet, ch] of Object.entries(FOLD_ALPHABETS)) {
+      it(`server_name of ${serverName.length} chars / ${alphabet}: injective over its own output`, () => {
+        const seeds = lengths.map((n) => ch.repeat(n));
+        const topics = foldClosure(seeds, serverName, 2);
+
+        expect(topics.length).toBeGreaterThan(seeds.length); // the closure actually grew
+        expect(collisions(topics, foldFor(serverName))).toEqual([]);
+      });
+    }
+  }
+});
+
+/**
+ * The same class through the seam: a topic spelled like a name this fold PUBLISHED must not read or
+ * write the room that name addresses. Parameterized over each name a topic's alias exposes, so a
+ * branch that starts publishing a constructible name is graded end to end rather than in arithmetic.
+ */
+const CONSTRUCTED_FROM: Record<string, { victim: string; construct: (topic: string) => string }> = {
+  'a truncated localpart': {
+    victim: 'x'.repeat(4 * (255 - `#:${SERVER_NAME}`.length)),
+    construct: (t) => boundedLocalpart(asTopic(t), SERVER_NAME).slice('parley_'.length),
+  },
+  'a disambiguated safeName': {
+    victim: 'ops:prod',
+    construct: (t) => safeName(asTopic(t), sanitizeAlias),
+  },
+};
+
+describe('a topic spelled like another topic’s published alias gets its own room', () => {
+  for (const [name, { victim, construct }] of Object.entries(CONSTRUCTED_FROM)) {
+    it(`a topic built from ${name} cross-delivers neither way`, async () => {
+      const attacker = construct(victim);
+      expect(attacker).not.toBe(victim);
+      const p = await connectFake({});
+
+      await p.post(asTopic(victim), WRITER, 'victim');
+      await p.post(asTopic(attacker), WRITER, 'attacker');
+
+      expect(fake.rooms).toHaveLength(2);
+      expect(contents(await p.fetchRecent({ topic: asTopic(victim), limit: 10 }))).toEqual([
+        'victim',
+      ]);
+      expect(contents(await p.fetchRecent({ topic: asTopic(attacker), limit: 10 }))).toEqual([
+        'attacker',
+      ]);
+      await p.disconnect();
+    });
+  }
 });

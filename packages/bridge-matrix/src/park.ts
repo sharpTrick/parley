@@ -41,8 +41,10 @@ export abstract class MatrixParking extends MatrixTimeline {
     this.controllers.clear();
     this.liveTopics.clear();
     this.rooms.clear();
+    // Keep `userId` — the credential alone is what authorizes anything, and an in-flight room
+    // resolve that outlives this teardown decides whether it TRUSTS the room by comparing its
+    // creator against that MXID: erased, the account stops recognising rooms it made itself.
     this.token = undefined;
-    this.userId = undefined;
     // Wake every blocked long-poll so its `fetchRecent` returns at once (each wake() clears its timer
     // and registration). Snapshot first — wake() mutates `waiters` — then clear so nothing outlives
     // the teardown; the in-flight `/sync` each drives (if any) was already aborted above.

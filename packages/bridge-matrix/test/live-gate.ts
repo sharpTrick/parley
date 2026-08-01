@@ -106,6 +106,25 @@ const api = async (
   }
 };
 
+/**
+ * Claim `localpart` as `token`, the way any account on this homeserver can. Keep it a raw call and
+ * not a second plugin instance, so that a room the plugin would never PROVISION — one somebody else
+ * created, under a join rule of their choosing — can be put in front of it.
+ */
+export async function createRoomAs(
+  token: string,
+  localpart: string,
+  preset: string,
+): Promise<string | undefined> {
+  const res = await api(token, 'POST', '/createRoom', {
+    room_alias_name: localpart,
+    preset,
+    visibility: 'private',
+  });
+  if (res === undefined || !res.ok) return undefined;
+  return ((await res.json()) as { room_id?: string }).room_id;
+}
+
 /** Join `roomId` as `token` — how an invited peer gets into a room this plugin did not create. */
 export async function joinAs(token: string, roomId: string): Promise<boolean> {
   const res = await api(token, 'POST', `/rooms/${encodeURIComponent(roomId)}/join`, {});
@@ -132,6 +151,24 @@ export async function sendRawMessage(
   );
   if (res === undefined || !res.ok) return undefined;
   return ((await res.json()) as { event_id?: string }).event_id;
+}
+
+/** The `m.room.message` bodies in `alias` as one of its members sees them — `[]` when it has none. */
+export async function roomMessages(token: string, alias: string): Promise<string[]> {
+  const roomId = await roomIdOf(token, alias);
+  if (roomId === undefined) return [];
+  const res = await api(
+    token,
+    'GET',
+    `/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=50`,
+  );
+  if (res === undefined || !res.ok) return [];
+  const { chunk } = (await res.json()) as {
+    chunk?: { type?: string; content?: { body?: string } }[];
+  };
+  return (chunk ?? [])
+    .filter((e) => e.type === 'm.room.message')
+    .map((e) => e.content?.body ?? '');
 }
 
 export async function roomIdOf(token: string, alias: string): Promise<string | undefined> {

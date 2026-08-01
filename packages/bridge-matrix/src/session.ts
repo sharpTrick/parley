@@ -141,7 +141,7 @@ export abstract class MatrixSession {
     // neither talk to the homeserver with a cleared token nor repopulate {@link rooms} for the next
     // generation.
     if (roomId === undefined || this.isStale(generation)) return undefined;
-    await this.joinRoom(roomId, alias);
+    await this.adoptRoom(roomId, alias);
     if (this.isStale(generation)) return undefined;
     this.rooms.set(key, Promise.resolve(roomId));
     return roomId;
@@ -173,7 +173,7 @@ export abstract class MatrixSession {
     const alias = this.aliasOf(localpart);
     const existing = await this.lookupAlias(alias);
     if (existing !== undefined) {
-      await this.joinRoom(existing, alias);
+      await this.adoptRoom(existing, alias);
       return existing;
     }
     // Create. If we lost the race (another instance created it first), resolve the alias instead.
@@ -195,7 +195,7 @@ export abstract class MatrixSession {
     // M_ROOM_IN_USE (or alias taken) → resolve the now-existing alias.
     const raced = await this.lookupAlias(alias);
     if (raced !== undefined) {
-      await this.joinRoom(raced, alias);
+      await this.adoptRoom(raced, alias);
       return raced;
     }
     const body = await res.text();
@@ -211,6 +211,75 @@ export abstract class MatrixSession {
     if (!res.ok) return undefined;
     const json = (await res.json()) as { room_id: string };
     return json.room_id;
+  }
+
+  /** Join rules an adopted room may carry: those the `preset` this config asks for would produce. */
+  private get acceptedJoinRules(): string[] {
+    return this.roomPreset === 'public_chat' ? ['invite', 'public'] : ['invite'];
+  }
+
+  /** Accounts whose room this config is willing to use: this one, and the peers it invites. */
+  private get trustedCreators(): string[] {
+    return [...(this.userId === undefined ? [] : [this.userId]), ...this.invite];
+  }
+
+  /**
+   * Take over a room the alias resolved to rather than one this call created, holding it to the same
+   * trust bar `createRoom` would have given it. Keep the check ahead of every use of the room, so
+   * that an account which claimed the topic's guessable alias first cannot have this session's
+   * output posted into its room, nor its own messages delivered into the agent as `<channel>`
+   * events. The join comes first because a non-member cannot read room state.
+   */
+  private async adoptRoom(roomId: string, alias: string): Promise<void> {
+    await this.joinRoom(roomId, alias);
+    const { creator, joinRule } = await this.roomProvenance(roomId);
+    if (creator === undefined || !this.trustedCreators.includes(creator)) {
+      throw new Error(
+        `[parley-matrix] refusing the existing room ${alias} (${roomId}): it was created by ` +
+          `${creator ?? 'an account the homeserver would not name'}, which is neither ` +
+          `${this.userId ?? this.user} nor ` +
+          'any MXID in backend_config.invite. The alias is deterministic, so any account can claim ' +
+          'it before this bridge does. Add that MXID to backend_config.invite if it is a peer of ' +
+          'yours; otherwise retire the room or use a different topic.',
+      );
+    }
+    if (joinRule === undefined || !this.acceptedJoinRules.includes(joinRule)) {
+      throw new Error(
+        `[parley-matrix] refusing the existing room ${alias} (${roomId}): its join rule is ` +
+          `${joinRule ?? 'unreadable'}, and backend_config.room_preset ${this.roomPreset} accepts ` +
+          `only ${this.acceptedJoinRules.join(', ')}. Anyone who can join reads this topic's ` +
+          'history and writes into the agent session. Fix the room, or set room_preset to the one ' +
+          'that matches it.',
+      );
+    }
+  }
+
+  /**
+   * Read `m.room.create` and `m.room.join_rules` off the whole state, so that the creator comes from
+   * the event's SENDER: the per-event `/state/<type>` endpoint returns content alone, and
+   * `m.room.create`'s `creator` field is both absent from newer room versions and unconstrained by
+   * the auth rules, so a hostile homeserver can name anyone it likes in it.
+   */
+  private async roomProvenance(
+    roomId: string,
+  ): Promise<{ creator?: string; joinRule?: string }> {
+    const res = await this.http(
+      'GET',
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`,
+    );
+    const body = (await res.json()) as unknown;
+    const events: Record<string, unknown>[] = Array.isArray(body)
+      ? body.filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
+      : [];
+    const stateOf = (type: string): Record<string, unknown> | undefined =>
+      events.find((e) => e.type === type && e.state_key === '');
+    const creator = stateOf('m.room.create')?.sender;
+    const joinRule = (stateOf('m.room.join_rules')?.content as { join_rule?: unknown } | undefined)
+      ?.join_rule;
+    return {
+      creator: typeof creator === 'string' ? creator : undefined,
+      joinRule: typeof joinRule === 'string' ? joinRule : undefined,
+    };
   }
 
   /**

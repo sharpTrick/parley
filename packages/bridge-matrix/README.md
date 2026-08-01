@@ -92,8 +92,17 @@ topic's history, and cannot post messages that core would deliver into a live Cl
 the presence roster.
 
 Bring the accounts you *do* want in via `invite`. Set `room_preset: public_chat` only when you
-deliberately want a room anyone on the homeserver can join. Rooms that already exist are joined as
-they are — this setting applies to rooms this plugin **creates**.
+deliberately want a room anyone on the homeserver can join.
+
+That is the guarantee for rooms this plugin **creates**. A room it merely **finds** — one whose
+alias already resolves — gets no preset from you, and a homeserver's default alias rules let any
+account claim `#parley_<topic>:<server_name>` before your bridge first posts to it. So an existing
+room is checked before it is used: the sender of its `m.room.create` must be **this account or an
+MXID listed in `invite`**, and its join rule must be one your `room_preset` would itself have
+produced (`invite`, plus `public` once you set `public_chat`). Anything else is refused loudly,
+naming the alias, the creator and the join rule — a room somebody else provisioned never receives
+this session's output and never feeds the agent its own. Add the MXID to `invite` when it is a peer
+of yours; otherwise retire the room or pick another topic.
 
 Matrix's third preset, `trusted_private_chat`, is deliberately **not accepted**: it gives every
 invitee power level 100, so any of them could set `m.room.join_rules` to `public` and undo the

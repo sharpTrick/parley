@@ -1,10 +1,11 @@
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MatrixPlugin, ROOM_PRESETS } from '../src/index.js';
+import { MatrixPlugin, ROOM_PRESETS, type RoomPreset } from '../src/index.js';
 import {
   aliasForTopic as fakeAliasForTopic,
   connectFake,
   FakeSynapse,
+  SELF_MXID,
 } from './fake-synapse.js';
 import {
   A,
@@ -186,6 +187,126 @@ describe('only a write provisions, and never into a world-joinable room', () => 
     expect(fake.createRoomBodies).toHaveLength(0);
     await p.disconnect();
   });
+});
+
+/**
+ * CLASS: a room the plugin ADOPTS is held to the bar it would have PROVISIONED. Only the create path
+ * chooses a preset; every other path takes whatever room a deterministic — therefore guessable —
+ * alias resolves to, and a homeserver lets any local account (or, under federation, a remote one)
+ * claim an alias first. Adopting such a room posts this session's output into its creator's room and
+ * delivers that creator's messages into a live agent session as `<channel>` events. So the trust set
+ * is the one already in config: `invite` names the accounts whose rooms may be used, `room_preset`
+ * the join rules those rooms may carry. Graded at EVERY entry point, because a check on the write
+ * path alone still hands a model-named topic to `fetchRecent`.
+ */
+const PEER = '@ally:parley.local';
+const STRANGER = '@squatter:parley.local';
+const ADOPTED = asTopic('ctx-payments');
+const ADOPTED_ALIAS = /#parley_ctx-payments:fake/;
+
+const ADOPTION: Record<
+  string,
+  {
+    creator: string;
+    joinRule: string;
+    invite?: string[];
+    preset?: RoomPreset;
+    /** Undefined → the room is adopted; otherwise what the refusal has to name. */
+    refusesNaming?: RegExp;
+  }
+> = {
+  'this account created it, invite-only': { creator: SELF_MXID, joinRule: 'invite' },
+  'an invited peer created it, invite-only': { creator: PEER, joinRule: 'invite', invite: [PEER] },
+  'a stranger created it, invite-only': {
+    creator: STRANGER,
+    joinRule: 'invite',
+    refusesNaming: /#parley_ctx-payments:fake[\s\S]*@squatter:parley\.local[\s\S]*invite/,
+  },
+  'a stranger created it, world-joinable': {
+    creator: STRANGER,
+    joinRule: 'public',
+    refusesNaming: /#parley_ctx-payments:fake[\s\S]*@squatter:parley\.local/,
+  },
+  'a peer this config does not list created it': {
+    creator: PEER,
+    joinRule: 'invite',
+    invite: [STRANGER],
+    refusesNaming: /#parley_ctx-payments:fake[\s\S]*@ally:parley\.local/,
+  },
+  'this account created it, but it is world-joinable': {
+    creator: SELF_MXID,
+    joinRule: 'public',
+    refusesNaming: /#parley_ctx-payments:fake[\s\S]*join rule is public[\s\S]*room_preset/,
+  },
+  'this account created it, world-joinable, and room_preset says so': {
+    creator: SELF_MXID,
+    joinRule: 'public',
+    preset: 'public_chat',
+  },
+  'an invited peer created it under a join rule neither preset produces': {
+    creator: PEER,
+    joinRule: 'knock',
+    invite: [PEER],
+    refusesNaming: /#parley_ctx-payments:fake[\s\S]*join rule is knock/,
+  },
+};
+
+describe('a room the plugin did not create is adopted only on its stated trust bar', () => {
+  for (const [name, row] of Object.entries(ADOPTION)) {
+    for (const [entryName, entry] of Object.entries(ENTRY_POINTS)) {
+      it(`${name} / ${entryName}`, async () => {
+        fake.aliasExists = true;
+        fake.existingRoomCreator = row.creator;
+        fake.existingRoomJoinRule = row.joinRule;
+        const p = await connectFake({ invite: row.invite, roomPreset: row.preset });
+
+        if (row.refusesNaming === undefined) {
+          await entry.drive(p, ADOPTED);
+        } else {
+          await expect(entry.drive(p, ADOPTED)).rejects.toThrow(row.refusesNaming);
+          // Nothing of this session reached the room, and no live route feeds it into the agent.
+          expect(fake.sentBodies).toEqual([]);
+          expect([...(p as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
+        }
+        await p.disconnect();
+      });
+    }
+  }
+
+  /**
+   * CLASS: a trust decision taken on a provenance nobody could read. `res.json()` accepts every shape
+   * below, so no status check catches one — and a plugin that reads an absent `m.room.create` as "no
+   * objection" adopts exactly the room the table above exists to refuse.
+   */
+  const UNREADABLE_STATE: Record<string, unknown> = {
+    'not a list': { error: 'nope' },
+    'an empty state': [],
+    'no m.room.create': [
+      { type: 'm.room.join_rules', state_key: '', sender: SELF_MXID, content: { join_rule: 'invite' } },
+    ],
+    'a create event with no sender': [
+      { type: 'm.room.create', state_key: '', content: { creator: SELF_MXID } },
+      { type: 'm.room.join_rules', state_key: '', sender: SELF_MXID, content: { join_rule: 'invite' } },
+    ],
+    'a create event that is not the room-wide one': [
+      { type: 'm.room.create', state_key: 'x', sender: SELF_MXID, content: {} },
+      { type: 'm.room.join_rules', state_key: '', sender: SELF_MXID, content: { join_rule: 'invite' } },
+    ],
+    'no m.room.join_rules': [{ type: 'm.room.create', state_key: '', sender: SELF_MXID, content: {} }],
+    'scalars where the events should be': [1, 'two', null],
+  };
+
+  for (const [name, body] of Object.entries(UNREADABLE_STATE)) {
+    it(`room state the plugin cannot read (${name}) is refused, not adopted`, async () => {
+      fake.aliasExists = true;
+      fake.stateBodyOverrides.push(body);
+      const p = await connectFake({});
+
+      await expect(p.post(ADOPTED, WRITER, 'hello')).rejects.toThrow(ADOPTED_ALIAS);
+      expect(fake.sentBodies).toEqual([]);
+      await p.disconnect();
+    });
+  }
 });
 
 /**
@@ -420,12 +541,22 @@ const WRITE_SHAPES: [RegExp, string][] = [
   [/\/send\/m\.room\.message\//, 'PUT /send'],
 ];
 
-/** Every state-changing request a driver issued, named — an unclassified one names itself and fails. */
+/**
+ * The reads that decide whether a room may be used at all, listed with the writes and in wire order.
+ * Keep them declared here rather than filtered out with every other GET, so that a path which starts
+ * ADOPTING a room without asking who made it fails in this table too, not only where its outcome is
+ * graded — the sequence is the invariant: the probe precedes the first use of the room.
+ */
+const PROBE_SHAPES: [RegExp, string][] = [[/\/v3\/rooms\/[^/]+\/state$/, 'GET /state']];
+
+/** Every declared request a driver issued, named — an unclassified write names itself and fails. */
 const recordWrites = (fake: FakeSynapse): (() => string[]) => {
   const writes: string[] = [];
   fake.onRequest = (method, path) => {
-    if (method === 'GET' || path.endsWith('/v3/login')) return;
-    writes.push(WRITE_SHAPES.find(([re]) => re.test(path))?.[1] ?? `${method} ${path}`);
+    if (path.endsWith('/v3/login')) return;
+    const declared = [...WRITE_SHAPES, ...PROBE_SHAPES].find(([re]) => re.test(path))?.[1];
+    if (declared !== undefined) writes.push(declared);
+    else if (method !== 'GET') writes.push(`${method} ${path}`);
   };
   return () => writes;
 };
@@ -436,12 +567,12 @@ const SIDE_EFFECTS: Record<
 > = {
   'fetchRecent (no since) on a room that exists': {
     aliasExists: true,
-    effects: ['POST /join'],
+    effects: ['POST /join', 'GET /state'],
     drive: (p, t) => p.fetchRecent({ topic: t, limit: 5 }),
   },
   'fetchRecent (no since) with block_ms on a room that exists': {
     aliasExists: true,
-    effects: ['POST /join'],
+    effects: ['POST /join', 'GET /state'],
     drive: (p, t) => p.fetchRecent({ topic: t, limit: 5, blockMs: 300 }),
   },
   'fetchRecent (since) with block_ms on a topic with no room': {
@@ -451,7 +582,7 @@ const SIDE_EFFECTS: Record<
   },
   'post to a room that exists': {
     aliasExists: true,
-    effects: ['POST /join', 'PUT /send'],
+    effects: ['POST /join', 'GET /state', 'PUT /send'],
     drive: (p, t) => p.post(t, WRITER, 'x'),
   },
   'post to a topic with no room': {
@@ -461,7 +592,7 @@ const SIDE_EFFECTS: Record<
   },
   'subscribe to a room that exists': {
     aliasExists: true,
-    effects: ['POST /join'],
+    effects: ['POST /join', 'GET /state'],
     drive: (p, t) => p.subscribe(t, () => undefined),
   },
   'subscribe to a topic with no room': {
@@ -495,7 +626,7 @@ describe('every seam call issues exactly the state changes it is declared to', (
 
     // Unbounded in the number of topics a model can name, and permanent — which is why the README
     // has to say so, and why `topics`/`post_topics` are the operator's only lever.
-    expect(writes()).toEqual(topics.map(() => 'POST /join'));
+    expect(writes()).toEqual(topics.flatMap(() => ['POST /join', 'GET /state']));
     expect(fake.rooms).toHaveLength(topics.length);
     await p.disconnect();
   }, 20_000);

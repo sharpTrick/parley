@@ -1,4 +1,4 @@
-import { MIN_HASH_LEN, safeName, type Topic } from '@sharptrick/parley-core';
+import { DEFAULT_HASH_LEN, safeName, type Topic } from '@sharptrick/parley-core';
 import { createHash } from 'node:crypto';
 
 /**
@@ -14,29 +14,36 @@ const MAX_ALIAS_BYTES = 255;
 
 const ALIAS_PREFIX = 'parley_';
 
+/** Separator between the readable half of a truncated localpart and its digest. */
+const HASH_SEP = '-';
+
 /**
  * Bounded so `#<localpart>:<server_name>` stays inside {@link MAX_ALIAS_BYTES}. Past that the
  * homeserver refuses `createRoom` with a 400 naming neither the topic nor this plugin, while every
  * read of the topic returns the empty page a never-written one returns — so it silently never
- * works. An over-long name keeps a {@link MIN_HASH_LEN}-wide digest of the whole raw topic and
- * truncates only the readable half, so the fold stays injective.
+ * works. An over-long name truncates its readable half and appends a digest of the whole raw topic.
+ *
+ * Keep that digest exactly {@link DEFAULT_HASH_LEN} wide, so that `safeName` reads the result back
+ * as an already-disambiguated name: at any other width a short topic spelled like a truncated
+ * localpart passes through `safeName` untouched and lands in the over-long topic's room.
  */
 export function boundedLocalpart(topic: Topic, serverName: string): string {
   const budget = MAX_ALIAS_BYTES - Buffer.byteLength(`#:${serverName}`, 'utf8');
   const name = `${ALIAS_PREFIX}${safeName(topic, sanitizeAlias)}`;
   if (name.length <= budget) return name;
-  const keep = budget - ALIAS_PREFIX.length - 1 - MIN_HASH_LEN;
+  const keep = budget - ALIAS_PREFIX.length - HASH_SEP.length - DEFAULT_HASH_LEN;
   if (keep < 1) {
     throw new Error(
       `[parley-matrix] backend_config.server_name ${JSON.stringify(serverName)} leaves no room ` +
         `for a distinct alias localpart: #<localpart>:<server_name> must fit ${MAX_ALIAS_BYTES} ` +
         `bytes, and topic ${JSON.stringify(String(topic))} needs at least ` +
-        `${ALIAS_PREFIX.length + 1 + MIN_HASH_LEN + 1} of them. Use a shorter server_name.`,
+        `${ALIAS_PREFIX.length + HASH_SEP.length + DEFAULT_HASH_LEN + 1} of them. ` +
+        'Use a shorter server_name.',
     );
   }
   const digest = createHash('sha1')
     .update(String(topic), 'utf8')
     .digest('hex')
-    .slice(0, MIN_HASH_LEN);
-  return `${ALIAS_PREFIX}${sanitizeAlias(String(topic)).slice(0, keep)}-${digest}`;
+    .slice(0, DEFAULT_HASH_LEN);
+  return `${ALIAS_PREFIX}${sanitizeAlias(String(topic)).slice(0, keep)}${HASH_SEP}${digest}`;
 }

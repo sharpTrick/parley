@@ -50,7 +50,17 @@ export interface FakeRoom {
   roomId: string;
   alias: string;
   timeline: Ev[];
+  /** `sender` of this room's `m.room.create` — who a plugin adopting the alias would be trusting. */
+  creator: string;
+  /** `content.join_rule` of this room's `m.room.join_rules` — who else may get in behind it. */
+  joinRule: string;
 }
+
+/** The MXID {@link FakeSynapse} stamps on every login, and so the creator of a room this run made. */
+export const SELF_MXID = '@parley:fake';
+
+/** What `preset` a `POST /createRoom` asked for means once the room exists. */
+const JOIN_RULE_OF: Record<string, string> = { private_chat: 'invite', public_chat: 'public' };
 
 const jsonRes = (obj: unknown, status = 200): Response =>
   new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
@@ -95,6 +105,21 @@ export class FakeSynapse {
   prevBatchOverlap = 0;
   /** False → `/directory/room/<alias>` 404s, forcing `POST /createRoom` (provisioning path). */
   aliasExists = true;
+  /**
+   * `m.room.create` sender and join rule of a room that was ALREADY there when this run resolved its
+   * alias. Keep them settable, so that a room the plugin adopts can have a provenance it did not
+   * choose: the alias is deterministic, so on a real homeserver any account can create it first, and
+   * a fake whose rooms are always self-made certifies a plugin that adopts a stranger's room.
+   */
+  existingRoomCreator = SELF_MXID;
+  existingRoomJoinRule = 'invite';
+  /**
+   * Bodies the next `GET /rooms/<id>/state` calls answer with VERBATIM, one per call, in order —
+   * the malformed-but-parseable shapes a homeserver, a proxy or a captive portal can put on the
+   * wire. Keep them expressible, so that a provenance the plugin cannot READ is graded as its own
+   * outcome rather than sharing a branch with a provenance it read and disliked.
+   */
+  readonly stateBodyOverrides: unknown[] = [];
   /** Every `POST /createRoom` body, in order — an ATTEMPT is recorded even when it is refused. */
   readonly createRoomBodies: Record<string, unknown>[] = [];
   /** Remaining `POST /createRoom` calls to refuse with 429 — the per-user creation budget, spent. */
@@ -194,13 +219,16 @@ export class FakeSynapse {
     return this.byAlias.get(alias)?.timeline ?? [];
   }
 
-  private room(alias: string): FakeRoom {
+  private room(alias: string, provenance?: Partial<FakeRoom>): FakeRoom {
     const existing = this.byAlias.get(alias);
     if (existing !== undefined) return existing;
     const room: FakeRoom = {
       roomId: `!room${this.roomCounter++}:${SERVER_NAME}`,
       alias,
       timeline: [],
+      creator: this.existingRoomCreator,
+      joinRule: this.existingRoomJoinRule,
+      ...provenance,
     };
     this.byAlias.set(alias, room);
     this.byId.set(room.roomId, room);
@@ -326,13 +354,41 @@ export class FakeSynapse {
       }
       this.aliasExists = true;
       this.lastAlias = alias;
-      return jsonRes({ room_id: this.room(alias).roomId });
+      const joinRule = JOIN_RULE_OF[String(body.preset)] ?? 'invite';
+      return jsonRes({ room_id: this.room(alias, { creator: SELF_MXID, joinRule }).roomId });
     }
 
     const inRoom = ((): FakeRoom | undefined => {
       const m = path.match(/\/v3\/rooms\/([^/]+)/);
       return m === null ? undefined : this.byId.get(decodeURIComponent(m[1]!));
     })();
+
+    if (/\/v3\/rooms\/[^/]+\/state$/.test(path)) {
+      if (this.stateBodyOverrides.length > 0) return jsonRes(this.stateBodyOverrides.shift());
+      if (inRoom === undefined) return notFound('room');
+      // Full state events, not the per-type endpoint's bare content: `sender` is the only field that
+      // says who made the room in every room version.
+      return jsonRes([
+        {
+          type: 'm.room.create',
+          state_key: '',
+          sender: inRoom.creator,
+          content: { creator: inRoom.creator, room_version: '10' },
+        },
+        {
+          type: 'm.room.join_rules',
+          state_key: '',
+          sender: inRoom.creator,
+          content: { join_rule: inRoom.joinRule },
+        },
+        {
+          type: 'm.room.member',
+          state_key: inRoom.creator,
+          sender: inRoom.creator,
+          content: { membership: 'join' },
+        },
+      ]);
+    }
 
     if (path.endsWith('/join')) {
       if (this.joinStatus !== 200) {

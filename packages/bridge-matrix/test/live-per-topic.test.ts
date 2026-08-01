@@ -6,12 +6,14 @@ import {
   type Account,
   aliasForTopic,
   B,
+  createRoomAs,
   HOMESERVER,
   isMatrixUp,
   joinAs,
   mxid,
   retireRoom,
   roomIdOf,
+  roomMessages,
   sendRawMessage,
   SERVER_NAME,
   tokenFor,
@@ -109,6 +111,37 @@ describe.skipIf(!bothAccounts)('live per-topic rooms, two accounts', () => {
       expect(read.messages.map((m) => String(m.backendMsgId))).toContain(sent);
     } finally {
       await retireRoom(aliasForTopic(String(topic)), tokens);
+      await a.disconnect();
+    }
+  }, 60_000);
+
+  /**
+   * The premise the adoption check exists for, on the real homeserver: Synapse's default alias rules
+   * let ANY account claim `#parley_<topic>:<server_name>` — the fake can only assert that the plugin
+   * refuses such a room, never that a stranger can put one there. A `public_chat` room, so that the
+   * bridge's join succeeds and nothing but the provenance check stands between the agent session and
+   * a room its operator never made.
+   */
+  it('a stranger claims the topic’s alias first; every seam call refuses, naming the stranger', async () => {
+    const a = new MatrixPlugin();
+    const topic = freshTopic('per-topic-squatted');
+    const alias = aliasForTopic(String(topic));
+    const localpart = alias.slice(1, alias.lastIndexOf(':'));
+    try {
+      expect(await createRoomAs(tokens[1]!, localpart, 'public_chat')).toBeDefined();
+      await a.connect(configFor(A, []));
+
+      const named = new RegExp(
+        `${escapeRe(alias)}[\\s\\S]*${escapeRe(mxid(B.user))}`,
+      );
+      await expect(a.post(topic, asHandle('a'), 'from-a')).rejects.toThrow(named);
+      await expect(a.fetchRecent({ topic, limit: 10 })).rejects.toThrow(named);
+      await expect(a.subscribe(topic, () => undefined)).rejects.toThrow(named);
+      expect([...(a as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
+      // …and the stranger's room is still empty: nothing of this session was written into it.
+      expect(await roomMessages(tokens[1]!, alias)).toEqual([]);
+    } finally {
+      await retireRoom(alias, [tokens[1]!, tokens[0]!]);
       await a.disconnect();
     }
   }, 60_000);
