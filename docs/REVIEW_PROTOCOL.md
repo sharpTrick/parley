@@ -194,16 +194,20 @@ version. The habit that prevents it: `cp` the file aside before mutating, `cp` i
 never reach for `git checkout --` while anything in the tree is uncommitted. Mutation-and-restore
 is the single most common thing done to uncommitted code here, so it is where this hazard lives.
 
-**Symlink each worktree's `node_modules` at the main checkout; never `npm install` per worktree.**
+**Create worktrees with `scripts/careening-worktree.sh <dir> <base>`; never `npm install` per
+worktree, and never plain-symlink `node_modules` either.**
 Fifteen worktrees each installing the same tree cost **1.7 GB against 148 MB** — the same dependency
 set copied fifteen times, all of it reconstructible from `package-lock.json`. Verified equivalent
-rather than assumed: `bridge-net-util`'s 682 tests pass unchanged through the symlink. Do it at
-worktree-creation time:
+rather than assumed: `bridge-net-util`'s 682 tests pass unchanged through the symlink. The naive fix — symlinking `node_modules` at the main
+checkout — is wrong in a way that stays SILENT, and shipping it cost a round-13 agent real work.
+npm workspaces put ABSOLUTE symlinks at `node_modules/@sharptrick/*`, so a symlinked worktree
+resolves every sibling package to `/home/user/parley/packages/*`: an agent editing two packages sees
+only one of its own edits, and `tsc -b` reports errors belonging to a tree it is not working in.
+That is precisely how one agent came to report a repo-wide typecheck failure that did not exist.
 
-```sh
-git worktree add --detach -q /tmp/careening/worktrees/<key> "$BASE"
-ln -s /home/user/parley/node_modules /tmp/careening/worktrees/<key>/node_modules
-```
+The script hard-links instead (files share inodes, so the disk cost stays nil) and then RE-POINTS
+every workspace link at the worktree, which makes it hermetic. Verified: a repo-wide `tsc -b` passes
+inside one, and `@sharptrick/parley-net-util` resolves to the worktree's own `packages/`.
 
 **What is actually known about the container dying, as opposed to guessed.** It has restarted three
 times mid-run. `uptime` is the instrument that settles it — it read `up 5 min` against `up 3:45`
