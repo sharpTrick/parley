@@ -113,6 +113,59 @@ const SCHEMA = {
           summary: { type: 'string' },
           failure: { type: 'string', description: 'concrete input -> wrong output / hang' },
           remediation: { type: 'string' },
+          // Round 13: all 33 blocking findings were real, and EIGHT of the remediations were wrong —
+          // several would have shipped a defect. These fields are the specific checks that would
+          // have caught each one. Answer them about YOUR OWN fix, from the code, not from intent.
+          remediationCheck: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              reliesOn: {
+                type: 'string',
+                description:
+                  'Existing code your fix calls into, and the SPECIFIC branch or constant you depend on — quote it. Say "nothing" if it stands alone. (A round-13 remediation told bridge-redis to call plaintextRemoteOrigin, whose SECURE_SCHEMES lacks rediss:, so it would have warned on every correctly-configured TLS deployment.)',
+              },
+              newlyAccepts: {
+                type: 'string',
+                description:
+                  'One concrete input your fix ACCEPTS that today\'s code rejects, or "none". (A round-13 remediation proposed building an HTTP-date with Date.UTC; V8 returns NaN for "Nov 32" where Date.UTC rolls it into a plausible instant — the fix LOOSENED the parser.)',
+              },
+              newlyRejects: {
+                type: 'string',
+                description:
+                  'One concrete input your fix REJECTS that today\'s code accepts, or "none". Name who legitimately sends it.',
+              },
+              testsThatWouldFail: {
+                type: 'string',
+                description:
+                  'Currently-passing tests your fix breaks, BY NAME, or "none found — and I looked, here is where". (A round-13 remediation\'s tie-break broke an existing test driving 200 client ids.)',
+              },
+              hidesOrFixes: {
+                type: 'string',
+                description:
+                  'If your fix were applied and the underlying defect REMAINED, what would still be visibly broken? If the honest answer is "nothing", you are proposing to hide the symptom. (A round-13 remediation proposed pinning TZ, which turns "red for every non-UTC user" into "green for everyone including the broken".)',
+              },
+              interleavings: {
+                type: 'string',
+                description:
+                  'CONCURRENCY FIXES ONLY, else "n/a". Walk the orderings, including two callers both taking your new path. (A round-13 remediation for a lock TOCTOU was itself a TOCTOU: A unlinks, claims, re-reads, then B unlinks A\'s fresh claim, and both proceed.)',
+              },
+              confidence: {
+                enum: ['traced', 'plausible', 'untested'],
+                description:
+                  'traced = you followed your fix through the real code or ran it. untested = you have not. Be accurate rather than generous; "untested" is useful data and costs you nothing, while a wrong "traced" is what the remediating agent will trust.',
+              },
+            },
+            required: [
+              'reliesOn',
+              'newlyAccepts',
+              'newlyRejects',
+              'testsThatWouldFail',
+              'hidesOrFixes',
+              'interleavings',
+              'confidence',
+            ],
+          },
           testUpgrade: { type: 'string', description: 'parameterized/fuzz test guarding the CLASS' },
         },
         required: ['severity', 'verdict', 'lens', 'theme', 'class', 'file', 'summary', 'failure', 'remediation'],
@@ -149,6 +202,7 @@ function prompt(target) {
     `You may start throwaway containers ONLY for the backend you own, with a distinct name and port, and you must tear them down. Never touch a container you did not create — the shared parley-dev-* set belongs to the orchestrator and other agents are using it. Copy the image and flags from examples/dev-compose/docker-compose.yml.`,
     `Several lenses are mechanically checkable; CHECK them rather than reasoning about them: seam integrity via the import graph and \`git diff --stat packages/bridge-core\`, protocol conformance against packages/conformance, truth-in-docs by reading each claim and then the code behind it.`,
     `Return the structured schema. For each finding give the concrete failing input -> wrong output or hang, a remediation, and a testUpgrade that guards the CLASS (a parameterized or widened generator case), not just the one input.`,
+    `FILL IN remediationCheck HONESTLY — it is the highest-value thing you produce after the finding itself. In round 13 every one of 33 blocking findings was real and EIGHT of the remediations were wrong, several of which would have shipped a defect worse than the one they closed. Your finding is probably right; your fix is the part that is probably wrong. Do NOT write a persuasive argument for your fix, and do NOT write a rhetorical passage attacking it either — both are cheap to fake and neither is checkable. Answer the specific questions from the CODE: read what you call into, name what your fix newly accepts and newly rejects, name the passing tests it breaks, and say what would still be broken if it were applied and the bug remained. If you did not trace it, mark it untested — a separate agent re-derives every fix from scratch, so an honest "untested" costs nothing and a confident wrong answer costs that agent a wasted investigation.`,
     `If a genuine attempt to break it found nothing, set nothingFound=true and describe specifically what you examined and what you tried — a clean result retires you from later rounds until your package or a dependency changes, so it must be auditable.`,
   ].join(' ')
 }
