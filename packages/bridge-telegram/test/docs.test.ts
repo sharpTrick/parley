@@ -242,6 +242,39 @@ describe('telegram chat-cap claims are executed, not just written', () => {
     const restarted = await coldRestart(rig);
     for (const c of OPS_CHATS) expect(await contentsOf(restarted, asTopic(c))).toContain('mine');
   }, 30_000);
+
+  /**
+   * The same bullet for the chat that has NOTHING but the mark. The case above posts into every
+   * chat it names, so each one is also a chat the store is retaining records for — and a mark list
+   * derived from those records carries it for that reason rather than because it was served. A
+   * topic a seam call merely READ has no records, no `chat_map` entry and no traffic yet, which is
+   * exactly the state the bullet's "before any seam call in the new process could have named it
+   * again" describes; the store file is rewritten wholesale on every compaction, so the mark has to
+   * survive one.
+   */
+  it('keeps a chat a seam call only read, across the rewrite that compacts the store file', async () => {
+    const quiet = '-1009882222';
+    const rig = await startRig({
+      observed_max_chats: 2,
+      observed_retention_per_chat: 1,
+      chat_map: { sentinel: SENTINEL },
+    });
+    // A read is a seam call: it names the chat, and it is all this chat will ever have.
+    expect(await contentsOf(rig.plugin, asTopic(quiet))).toEqual([]);
+    // Evicted records are what arm the store's amortized rewrite; a retention of 1 evicts on every
+    // drain, so the file is compacted well before the restart.
+    for (let round = 0; round < 4; round++) await drain(rig, `settled-${round}`);
+
+    const restarted = await coldRestart(rig);
+    const after: Rig = { ...rig, plugin: restarted };
+    rig.fake.injectUserMessage(quiet, 'ops', 'first traffic');
+    await drain(after, 'the quiet chat spoke');
+    for (const c of FLOOD_CHATS) rig.fake.injectUserMessage(c, 'mallory', `displacing-${c}`);
+    await drain(after, 'flooded');
+
+    // Measured last: asking after the chat is itself what would have protected it.
+    expect(await contentsOf(restarted, asTopic(quiet))).toContain('first traffic');
+  }, 30_000);
 });
 
 /**

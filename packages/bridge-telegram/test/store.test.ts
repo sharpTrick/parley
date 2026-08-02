@@ -497,6 +497,80 @@ describe('telegram ObservedStore durability', () => {
   );
 
   /**
+   * The axis the table above cannot reach: HOW MANY RECORDS the served chat holds. Every cell of it
+   * appends one immediately after `serve()`, so the mark is always attached to a chat the store is
+   * retaining — and the mark a rewrite must carry hardest is the one on a chat with NO records,
+   * because a topic a seam call merely named has nothing else to declare it and `chat_map` cannot
+   * stand in for it. Crossed with every way the file is REWRITTEN, since a rewrite is where a
+   * derived mark list silently drops what it was not derived from.
+   *
+   * Graded through what the mark BUYS — the chat survives a flood at the cap in the next process —
+   * rather than by reading the file, so the check outlives any change to how the mark is spelled.
+   */
+  const REWRITES = ['none', 'compaction', 'load-repair'] as const;
+  const SERVED_MARK_CASES = [0, 1, 2].flatMap((records) =>
+    REWRITES.map((rewrite) => ({ records, rewrite })),
+  );
+
+  it.each(SERVED_MARK_CASES)(
+    'a chat served with $records records of its own stays protected across a $rewrite rewrite',
+    ({ records, rewrite }) => {
+      const maxChats = 2;
+      const mine = '-700';
+      const writer = new ObservedStore(path, 4, maxChats);
+      writer.serve(mine);
+      for (let i = 1; i <= records; i++) {
+        expect(writer.append(record(mine, i, `mine-${i}`))).toBeDefined();
+      }
+      // Evictions in a chat nobody serves are what arm the store's amortized rewrite.
+      if (rewrite === 'compaction') {
+        for (let i = 1; i <= 40; i++) writer.append(record('-1', i, `filler-${i}`));
+      }
+      writer.close();
+      if (rewrite === 'load-repair') writeFileSync(path, `${readFileSync(path, 'utf8')}{"torn`);
+
+      // Reload declaring NOTHING served: the FILE is the only thing left that can protect it.
+      let reloaded = new ObservedStore(path, 4, maxChats);
+      if (rewrite === 'load-repair') {
+        // The repair rewrote the file — the mark has to survive THAT, not merely one read of it.
+        reloaded.close();
+        reloaded = new ObservedStore(path, 4, maxChats);
+      }
+      expect(reloaded.append(record(mine, 99, 'after the restart'))).toBeDefined();
+      for (let i = 0; i < maxChats + 3; i++) {
+        reloaded.append(record(`-80${i}`, 1, `flood-${i}`));
+      }
+
+      const kept = reloaded.entries(mine).map((r) => r.content);
+      expect(kept).toContain('after the restart');
+      for (let i = 1; i <= records; i++) expect(kept).toContain(`mine-${i}`);
+      reloaded.close();
+    },
+  );
+
+  /**
+   * The other edge of the same bound: the mark list is what a flood of SEAM-NAMED topics grows, and
+   * a list carried without one grows with every id the store has ever served, forever, across every
+   * later load that reads it back. Bounded, and bounded on the marks rather than on the records, so
+   * that the recordless mark above is not the thing the bound is paid for with.
+   */
+  it('bounds the served marks a compaction carries however many chats were named', () => {
+    const writer = new ObservedStore(path, 1, 2);
+    for (let i = 0; i < 4_000; i++) writer.serve(`-9${i}`);
+    for (let i = 1; i <= 40; i++) writer.append(record('-1', i, `filler-${i}`));
+    writer.close();
+
+    const marks = readFileSync(path, 'utf8')
+      .split('\n')
+      .filter((l) => l.startsWith('#served '))
+      .flatMap((l) => JSON.parse(l.slice('#served '.length)) as string[]);
+    expect(marks.length).toBeGreaterThan(0);
+    expect(marks.length).toBeLessThanOrEqual(2_000);
+    // The newest-named survive: the oldest is what a bound may drop, never the most recent one.
+    expect(marks).toContain('-93999');
+  });
+
+  /**
    * The identity of the store FILE, which is what makes a cursor from a store this one did not
    * inherit refusable however far this store's own sequence has since climbed. It must be stable
    * across reloads and across the compaction that rewrites every other line, and two files must

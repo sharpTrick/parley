@@ -28,6 +28,13 @@ const DEFAULT_MAX_CHATS = 1_000;
  * narrowing retention must not narrow the once-only guarantee with it.
  */
 const EVICTED_ID_MEMORY = 1_000;
+/**
+ * How many SERVED chat ids the file carries, newest-served last — store-wide, and sized on the
+ * marks themselves rather than on what the store happens to retain. A chat a seam call named but
+ * that has no traffic yet holds no records, and is precisely the case a persisted mark exists for,
+ * so a bound derived from the retained records drops the one protection nothing can rebuild.
+ */
+const SERVED_ID_MEMORY = 1_000;
 
 /**
  * Keep an out-of-domain retention bound a hard failure rather than a substituted default, so that
@@ -376,14 +383,17 @@ export class ObservedStore {
    * legitimately leaves the file, so `intact` drops to what is retained while `issued` keeps every
    * sequence already handed out.
    *
-   * Only served chats it still holds records for are carried, so the mark list stays bounded.
+   * The mark list is bounded by {@link SERVED_ID_MEMORY} and NOT by the records retained: a chat a
+   * seam call named before any traffic reached it holds none, and that is the one chat whose mark
+   * nothing in the next process can rebuild — `chat_map` is re-declared on every connect, a
+   * seam-named topic is not.
    */
   private journalText(epochId: string = this.epochId): string {
     const lines: string[] = [
       `${EPOCH_LINE}${epochId}`,
       `${SEQ_LINE}${this.highWater()} ${this.retainedHighWater()}`,
     ];
-    const served = [...this.served].filter((id) => this.byChat.has(id));
+    const served = [...this.served].slice(-SERVED_ID_MEMORY);
     if (served.length > 0) lines.push(`${SERVED_ID_LINE}${JSON.stringify(served)}`);
     if (this.evicted.size > 0) {
       lines.push(`${EVICTED_ID_LINE}${JSON.stringify([...this.evicted])}`);

@@ -33,7 +33,7 @@ export async function pollUpdates(opts: {
   const { api, timeoutS, diagnostics, isCurrent, deliver } = opts;
   let offset = 0;
   while (isCurrent()) {
-    let updates: TgUpdate[];
+    let updates: unknown[];
     const startedAt = Date.now();
     try {
       // Budget = the long poll plus 40% slack, at least 2s. Keep a ceiling on it, so that a
@@ -47,7 +47,7 @@ export async function pollUpdates(opts: {
       if (!Array.isArray(result)) {
         throw new Error('Telegram GET /getUpdates → result: not an array of updates');
       }
-      updates = result as TgUpdate[];
+      updates = result;
     } catch (err) {
       if (!isCurrent()) break;
       const status = statusOf(err);
@@ -67,8 +67,16 @@ export async function pollUpdates(opts: {
     }
     if (!isCurrent()) break;
     const ackedBefore = offset;
-    for (const u of updates) {
-      const msg = u?.message ?? u?.channel_post;
+    for (const element of updates) {
+      // Screen the ELEMENT before anything reads a field off it, so that one non-object in an
+      // otherwise well-formed array cannot throw out of this loop: nothing restarts it, so the
+      // bridge would keep answering post/fetchRecent while never ingesting another message.
+      if (element === null || typeof element !== 'object') {
+        diagnostics.report('dropped a non-object update from getUpdates', 'ingest-shape');
+        continue;
+      }
+      const u = element as TgUpdate;
+      const msg = u.message ?? u.channel_post;
       const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
       let carried: { chatId: string; message: TgMessage } | undefined;
       if (msg !== undefined) {
@@ -102,7 +110,7 @@ export async function pollUpdates(opts: {
       // non-conforming upstream would poison the offset for the life of the loop and re-serve
       // the whole backlog forever; an id outside the safe-integer range poisons it the other
       // way, acknowledging updates that never arrived and going deaf to every later one.
-      if (typeof u?.update_id === 'number' && Number.isSafeInteger(u.update_id)) {
+      if (typeof u.update_id === 'number' && Number.isSafeInteger(u.update_id)) {
         offset = Math.max(offset, u.update_id + 1);
       }
     }

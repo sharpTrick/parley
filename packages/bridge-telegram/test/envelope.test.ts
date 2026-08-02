@@ -5,6 +5,7 @@ import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
 import {
   captureStderr,
   connectTo,
+  contentsOf,
   packageSource,
   registerCleanup,
   SENDER,
@@ -531,4 +532,88 @@ describe('telegram non-conforming message objects', () => {
     // The loop advanced its offset past the injected update rather than re-reading it forever.
     await vi.waitFor(() => expect(fake.retainedUpdates()).toBe(0), { timeout: 8000, interval: 20 });
   }, 20_000);
+});
+
+/**
+ * One level between the two tables above: the ARRAY ELEMENT. `MALFORMED` only ever varies the whole
+ * BODY and `MESSAGE_FIELDS` only ever varies a field of a well-formed update, so no cell of either
+ * ever puts a hostile value where an element of `result` goes — and every element is dereferenced
+ * before anything has established it is an object. `{"ok":true,"result":[null]}` therefore threw a
+ * `TypeError` out of the ONE getUpdates consumer, which nothing restarts: `post` and `fetchRecent`
+ * kept answering while the bridge never ingested another message for the life of the connection.
+ *
+ * So: every JSON shape an element can be, inside an otherwise well-formed array, each graded on the
+ * two things a dead loop takes away — that it is STILL POLLING, and that a real message sent once
+ * the upstream heals is served. Two cells put the hostile element beside a conforming update in the
+ * SAME batch, because a screen that ends the batch instead of skipping the element loses those too.
+ */
+const conformingElement = (text: string): Record<string, unknown> => ({
+  // Keep the acknowledgement at the bottom of the range, so that a healed upstream's first real
+  // update is not confirmed away by an offset this cell advanced past it.
+  update_id: 0,
+  message: { ...conformingMessage(), text },
+});
+
+const HOSTILE_ELEMENTS = [
+  { name: 'null', result: [null] },
+  { name: 'a number', result: [0] },
+  { name: 'a string', result: ['update'] },
+  { name: 'an array', result: [[]] },
+  { name: 'a boolean', result: [true] },
+  { name: 'an empty object', result: [{}] },
+  { name: 'an update whose message is null', result: [{ update_id: 0, message: null }] },
+  {
+    name: 'an update whose update_id is null',
+    result: [{ update_id: null, message: conformingMessage() }],
+  },
+  {
+    name: 'null before a conforming update',
+    result: [null, conformingElement('behind the hostile element')],
+    carries: 'behind the hostile element',
+  },
+  {
+    name: 'null after a conforming update',
+    result: [conformingElement('ahead of the hostile element'), null],
+    carries: 'ahead of the hostile element',
+  },
+];
+
+describe('telegram non-conforming getUpdates elements', () => {
+  it.each(HOSTILE_ELEMENTS)(
+    'the ingestion loop survives $name as an element of the result array',
+    async ({ result, carries }) => {
+      const stderr = captureStderr();
+      const fake = await startFake();
+      fake.malformMethod('getUpdates', JSON.stringify({ ok: true, result }));
+      const plugin = await connectTo(fake, storePath());
+      const topic = asTopic(MESSAGE_CHAT);
+
+      // Still polling, repeatedly — a loop that died answers exactly one getUpdates and stops.
+      const before = fake.callCount('getUpdates');
+      await vi.waitFor(() => expect(fake.callCount('getUpdates')).toBeGreaterThan(before + 2), {
+        timeout: 8000,
+        interval: 20,
+      });
+      expect(stderr.join('')).not.toMatch(/loop stopped/);
+      expect(stderr.join('')).not.toMatch(UNLABELLED);
+
+      // A conforming update in the same batch is still consumed.
+      if (carries !== undefined) {
+        await vi.waitFor(async () => expect(await contentsOf(plugin, topic)).toContain(carries), {
+          timeout: 8000,
+          interval: 20,
+        });
+      }
+
+      // And ingestion really resumes once the upstream heals.
+      fake.malformMethod('getUpdates', undefined);
+      await plugin.subscribe(topic, () => undefined);
+      fake.injectUserMessage(MESSAGE_CHAT, 'alice', 'after the hostile element');
+      await vi.waitFor(
+        async () => expect(await contentsOf(plugin, topic)).toContain('after the hostile element'),
+        { timeout: 8000, interval: 20 },
+      );
+    },
+    20_000,
+  );
 });
