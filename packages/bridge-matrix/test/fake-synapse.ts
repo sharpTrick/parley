@@ -159,6 +159,17 @@ export class FakeSynapse {
    * an HTTP status or a network reject never reaches it.
    */
   readonly syncBodyOverrides: ((roomId: string) => unknown)[] = [];
+  /**
+   * The same, for the POSITIONING (`since`-less) `/sync` — a separate phase with its own reads, and
+   * the one that decides where a subscription resumes from. Each override is handed the well-formed
+   * body the fake would otherwise have answered with; keep them DERIVED from it rather than written
+   * out, so that a case breaking one field cannot silently move the resume token or the timeline tip
+   * it did not mean to touch, and pass as though the plugin had survived the field under test.
+   */
+  readonly positioningBodyOverrides: ((
+    body: Record<string, unknown>,
+    roomId: string,
+  ) => unknown)[] = [];
   /** How an injected `/sync` failure presents: an HTTP status, or a rejected fetch. */
   syncFailureMode: 'status' | 'network' = 'status';
   syncFailureStatus = 500;
@@ -499,7 +510,7 @@ export class FakeSynapse {
           await new Promise((r) => setTimeout(r, this.stallPositioningMs));
         }
         const at = timeline.length;
-        const res = joined({
+        const wellFormed = {
           next_batch: `p${at}`,
           rooms: {
             join: {
@@ -511,7 +522,12 @@ export class FakeSynapse {
               },
             },
           },
-        });
+        };
+        const mangle = this.positioningBodyOverrides.shift();
+        const res =
+          mangle === undefined
+            ? joined(wellFormed)
+            : jsonRes(mangle(wellFormed, syncRoom?.roomId ?? ''));
         this.afterPositioningSync(ordinal);
         return res;
       }

@@ -52,13 +52,27 @@ export const syncFilterParam = (roomId: string, timelineLimit: number): string =
     }),
   );
 
+/** A subscription position with provably no room history behind it — see {@link positionBoundaryOf}. */
+export const ROOM_START = Symbol('room-start');
+
 /**
- * The newest event a positioning `/sync` snapshot carries, of ANY type — a state event is a valid
- * boundary since `backfill` matches by id, not by topic/type.
+ * Where a `limited` burst's backward recovery must stop: the newest event a positioning `/sync`
+ * snapshot carries, of ANY type (a state event is a valid boundary since `backfill` matches by id,
+ * not by topic/type), or {@link ROOM_START} when that snapshot showed the room's whole timeline and
+ * it was empty. `undefined` — the room missing from the join block, an unreadable timeline — means
+ * the read established NO boundary, which a backward walk must treat as a refusal rather than as
+ * licence to page to the beginning of the room.
  */
-export const timelineTipOf = (sync: SyncResponse, roomId: string): string | undefined => {
-  const tip = sync.rooms?.join?.[roomId]?.timeline?.events?.at(-1)?.event_id;
-  return typeof tip === 'string' ? tip : undefined;
+export type Boundary = string | typeof ROOM_START;
+
+export const positionBoundaryOf = (sync: SyncResponse, roomId: string): Boundary | undefined => {
+  const timeline = sync.rooms?.join?.[roomId]?.timeline;
+  if (timeline === undefined) return undefined;
+  const events = Array.isArray(timeline.events) ? timeline.events : undefined;
+  if (events === undefined) return undefined;
+  const tip = events.at(-1)?.event_id;
+  if (typeof tip === 'string') return tip;
+  return events.length === 0 && timeline.limited !== true ? ROOM_START : undefined;
 };
 
 /**
@@ -71,6 +85,22 @@ export const nextBatchOf = (raw: unknown, current: string): string => {
   if (raw === undefined) return current;
   if (typeof raw !== 'string') {
     throw new Error(`/sync answered with a ${typeof raw} next_batch where a token was required`);
+  }
+  return raw;
+};
+
+/**
+ * {@link nextBatchOf} for a POSITIONING `/sync`, which has no previous token to fall back on. Keep an
+ * absent or empty one a THROW too, so that no caller can resume from `?since=` — which a homeserver
+ * reads as an INITIAL sync, making the loop's first "incremental" answer the room's existing history,
+ * delivered to a subscribe handler as live events.
+ */
+export const positioningBatchOf = (raw: unknown): string => {
+  if (typeof raw !== 'string' || raw === '') {
+    throw new Error(
+      `/sync positioning answered with next_batch ${JSON.stringify(raw)} where a resume token was ` +
+        'required',
+    );
   }
   return raw;
 };

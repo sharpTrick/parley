@@ -293,3 +293,138 @@ describe('a malformed /sync body that never stops is reported and slowed, not ho
     }, 20_000);
   }
 });
+
+/**
+ * CLASS: the POSITIONING `/sync` is a phase of its own, and every field the plugin reads off it is
+ * exactly as untrusted as the incremental one's. Both tables above arm incremental bodies only — yet
+ * the positioning read is what decides WHERE a subscription resumes from and how far back a
+ * `limited` burst may be recovered, so a shape it mishandles does not merely degrade the live path:
+ * it feeds the room's existing history into the agent session as though it had just arrived.
+ *
+ * Two fields, two ways that happens. The resume TOKEN — defaulted to `''` when absent or mistyped,
+ * it asks for `?since=`, which a homeserver reads as an initial sync. And the BOUNDARY the burst
+ * recovery walks back to — with none, it pages to the beginning of the room. Both are graded by one
+ * assertion, because both produce the same observable: a message that already existed when
+ * `subscribe()` was called arriving on the live path.
+ */
+const POSITIONING_FAULTS: Record<
+  string,
+  (body: Record<string, unknown>, roomId: string) => unknown
+> = {
+  'next_batch is absent': ({ next_batch: _token, ...rest }) => rest,
+  'next_batch is null': (b) => ({ ...b, next_batch: null }),
+  'next_batch is a number': (b) => ({ ...b, next_batch: 0 }),
+  'next_batch is the empty string': (b) => ({ ...b, next_batch: '' }),
+  'the body is JSON null': () => null,
+  'the body is an array': () => [],
+  'the body is a scalar': () => 'ok',
+  'the room is missing from rooms.join': (b) => ({ ...b, rooms: { join: {} } }),
+  'the room carries no timeline': (b, roomId) => ({ ...b, rooms: { join: { [roomId]: {} } } }),
+  'timeline.events is not a list': (b, roomId) => ({
+    ...b,
+    rooms: { join: { [roomId]: { timeline: { events: 42, limited: false } } } },
+  }),
+};
+
+/** Messages already in the room when `subscribe()` is called — none may arrive as a live event. */
+const PRE_SUBSCRIPTION = ['pre1', 'pre2', 'pre3'];
+/** Messages landing after it, larger than the `limited` cap the rows arm, so recovery is exercised. */
+const POST_SUBSCRIPTION = ['live1', 'live2', 'live3'];
+
+/** Arm a positioning shape that RE-ARMS itself: a parked read re-positions more than once. */
+const armPositioningForever = (
+  mangle: (body: Record<string, unknown>, roomId: string) => unknown,
+): void => {
+  const again = (body: Record<string, unknown>, roomId: string): unknown => {
+    fake.positioningBodyOverrides.push(again);
+    return mangle(body, roomId);
+  };
+  fake.positioningBodyOverrides.push(again);
+};
+
+/**
+ * The pagination-token grammar {@link FakeSynapse} mints. A `since` outside it is one no homeserver
+ * handed the plugin — `''` and the string `'undefined'` are the two a defaulted token produces, and
+ * the first of them is read as a request for an initial sync.
+ */
+const MINTED_TOKEN = /^p\d+$/;
+
+const sinceParamsSince = (from: number): (string | null)[] =>
+  fake.requestUrls
+    .slice(from)
+    .filter((u) => u.pathname.endsWith('/v3/sync'))
+    .map((u) => u.searchParams.get('since'));
+
+describe('a positioning /sync the plugin cannot resume from never replays the room as live events', () => {
+  for (const [faultName, mangle] of Object.entries(POSITIONING_FAULTS)) {
+    it(`${faultName} / the subscribe loop: nothing that predates subscribe() is delivered`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const escaped: unknown[] = [];
+      const onEscape = (reason: unknown): void => void escaped.push(reason);
+      process.on('unhandledRejection', onEscape);
+      const p = await connectFake({});
+      const t = asTopic('positioned');
+      for (const c of PRE_SUBSCRIPTION) await p.post(t, asHandle('writer'), c);
+      const from = fake.requestUrls.length;
+
+      const seen: string[] = [];
+      armPositioningForever(mangle);
+      const resolved = await p.subscribe(t, (m) => void seen.push(m.content)).then(
+        () => true,
+        () => false,
+      );
+      // Truncate the burst, so that the boundary half of the class is exercised too: with no
+      // boundary the recovery walk is what reaches back past the subscription into history.
+      fake.syncCap = 1;
+      for (const c of POST_SUBSCRIPTION) fake.addMessage(String(t), c);
+      await new Promise((r) => setTimeout(r, 400));
+      process.off('unhandledRejection', onEscape);
+      await p.disconnect();
+
+      expect(
+        seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
+        'history that was already in the room arrived as a live <channel> event',
+      ).toEqual([]);
+      expect(escaped.map(String)).toEqual([]);
+      for (const since of sinceParamsSince(from)) {
+        if (since !== null) expect(since).toMatch(MINTED_TOKEN);
+      }
+      if (resolved) {
+        expect(seen, 'subscribe() resolved, so what landed after it still owes delivery').toContain(
+          POST_SUBSCRIPTION.at(-1),
+        );
+      }
+    }, 20_000);
+
+    it(`${faultName} / the dedicated /sync behind a blocking fetchRecent: it resumes from a real token`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const escaped: unknown[] = [];
+      const onEscape = (reason: unknown): void => void escaped.push(reason);
+      process.on('unhandledRejection', onEscape);
+      const p = await connectFake({});
+      const t = asTopic('positioned');
+      for (const c of PRE_SUBSCRIPTION) await p.post(t, asHandle('writer'), c);
+      const tail = (await p.fetchRecent({ topic: t, limit: 10 })).nextCursor;
+      const from = fake.requestUrls.length;
+
+      armPositioningForever(mangle);
+      const page = await p
+        .fetchRecent({ topic: t, since: tail, blockMs: 400, limit: 10 })
+        .catch((err: unknown) => err as Error);
+      await new Promise((r) => setTimeout(r, 50));
+      process.off('unhandledRejection', onEscape);
+      await p.disconnect();
+
+      expect(escaped.map(String)).toEqual([]);
+      for (const since of sinceParamsSince(from)) {
+        if (since !== null) expect(since).toMatch(MINTED_TOKEN);
+      }
+      if (!(page instanceof Error)) {
+        expect(
+          page.messages.map((m) => m.content),
+          'a blocking read answered with messages at or before the cursor it was given',
+        ).toEqual([]);
+      }
+    }, 20_000);
+  }
+});

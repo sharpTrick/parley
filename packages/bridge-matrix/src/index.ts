@@ -13,8 +13,8 @@ import { reportLoopCrash, reportSyncFailure, syncRetryDelayMs } from './diagnost
 import { liveKey, MatrixParking } from './park.js';
 import { INCREMENTAL_TIMELINE_LIMIT, returnedTooFast, SYNC_IDLE_PACE_MS } from './timeline.js';
 import {
-  eventToMessage, type MessageEvent, nextBatchOf,
-  syncFilterParam, type SyncResponse, timelineTipOf, TOPIC_KEY,
+  type Boundary, eventToMessage, type MessageEvent, nextBatchOf, positionBoundaryOf,
+  positioningBatchOf, ROOM_START, syncFilterParam, type SyncResponse, TOPIC_KEY,
 } from './wire.js';
 
 export { sanitizeAlias } from './alias.js';
@@ -167,12 +167,12 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
       deadlineMs: syncDeadlineMs(0),
     });
     const positioned = (await initial.json()) as SyncResponse;
-    let nextBatch = positioned.next_batch ?? '';
+    let nextBatch = positioningBatchOf(positioned.next_batch);
     // Keep this boundary read from the SAME response as `nextBatch`, so that a `limited`-burst
     // {@link backfill} stops EXACTLY at the subscription position: a boundary read one round-trip
     // later swallows everything that landed in between, and one read earlier pages back past the
     // position into PRE-subscription history and leaks it as live events.
-    let lastDelivered: string | undefined = timelineTipOf(positioned, roomId);
+    let boundary: Boundary | undefined = positionBoundaryOf(positioned, roomId);
     // Keep this registration after positioning AND behind the staleness gate, so that a concurrent
     // blocking `fetchRecent` only ever hooks a wake source that is both able to observe its message
     // and still running — a key added by a loop that has already stood down is a permanent phantom.
@@ -210,13 +210,17 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
           // before the new batch so no burst larger than the per-sync cap is silently dropped (the
           // "handler fires once per inbound message" seam contract).
           let recovered: MessageEvent[] = [];
-          if (timeline?.limited === true && timeline.prev_batch !== undefined) {
+          if (
+            timeline?.limited === true &&
+            timeline.prev_batch !== undefined &&
+            boundary !== undefined
+          ) {
             try {
               recovered = await this.backfill(
                 roomId,
                 topic,
                 timeline.prev_batch,
-                lastDelivered,
+                boundary === ROOM_START ? undefined : boundary,
                 new Set(events.map((e) => e.event_id)),
               );
             } catch {
@@ -224,7 +228,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
             }
           }
           for (const e of [...recovered, ...events.filter((e) => this.belongs(e, topic))]) {
-            lastDelivered = e.event_id;
+            boundary = e.event_id;
             this.deliver(roomId, topic, e, handler);
           }
           // Keep the reset here rather than beside the response, so that a `/sync` the loop THROWS
@@ -255,7 +259,10 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
   private deliver(roomId: string, topic: Topic, e: MessageEvent, handler: MessageHandler): void {
     const message = eventToMessage(topic, e);
     try {
-      handler(message);
+      // Keep the returned value attached rather than awaited, so that an `async` handler — which the
+      // seam's `=> void` return type does not forbid — can neither end the bridge process with an
+      // unhandled rejection nor serialise this loop behind one that never settles.
+      void Promise.resolve(handler(message)).catch(() => undefined);
     } catch {
       /* handler is best-effort; never break the loop (DESIGN §6) */
     }

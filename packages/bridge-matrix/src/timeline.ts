@@ -5,7 +5,7 @@ import { cursorPastForeignBlock, emptyWindowCursor, STREAM_CURSOR_PREFIX } from 
 import { MatrixSession } from './session.js';
 import {
   eventToMessage, isMessageEvent, type MatrixEvent, type MessageEvent,
-  nextBatchOf, syncFilterParam, type SyncResponse,
+  nextBatchOf, positioningBatchOf, syncFilterParam, type SyncResponse,
 } from './wire.js';
 
 /** Real per-sync timeline cap for the incremental `/sync` filter and the backfill page size. */
@@ -31,7 +31,7 @@ const MAX_FORWARD_PAGES = 50;
 const MAX_BACKFILL_PAGES = 50;
 /**
  * Server-side filter for the catch-up paths, so reactions, edits and membership churn cost no
- * client page budget. Keep it OFF the `backfill`/`timelineTip` pair — those match a boundary
+ * client page budget. Keep it OFF the `backfill`/`positionBoundary` pair — those match a boundary
  * `event_id` that may itself be a state event, which a filtered page would hide.
  */
 const MESSAGES_ONLY_FILTER = encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
@@ -178,6 +178,7 @@ export abstract class MatrixTimeline extends MatrixSession {
     const collected: MessageEvent[] = [];
     let from: string | undefined;
     let tailToken: string | undefined;
+    let exhaustedTheTimeline = false;
     for (
       let page = 0;
       page < MAX_BACKFILL_PAGES && collected.length < limit && !this.isStale(generation);
@@ -190,15 +191,31 @@ export abstract class MatrixTimeline extends MatrixSession {
       );
       const { chunk, start, end } = (await res.json()) as MessagesPage;
       tailToken ??= start;
-      if (chunk.length === 0) break;
+      if (chunk.length === 0) {
+        exhaustedTheTimeline = true;
+        break;
+      }
       for (const e of chunk) if (this.belongs(e, topic)) collected.push(e);
-      if (end === undefined) break;
+      if (end === undefined) {
+        exhaustedTheTimeline = true;
+        break;
+      }
       from = end;
+    }
+    // Keep a position claimable only when the walk stopped for a reason OF ITS OWN — it filled the
+    // window, or it ran out of timeline. One a teardown or the page bound cut short has not read the
+    // history it would be claiming to have walked past, whether it collected part of a window or
+    // none of it, and core persists whatever cursor it is handed; hand back nothing and leave the
+    // caller on its own position instead, so that history is re-read rather than skipped.
+    if (collected.length < limit && !exhaustedTheTimeline) {
+      return {
+        messages: [],
+        nextCursor: emptyWindowCursor(undefined, sinceCursor, this.isStale(generation)),
+      };
     }
     const messages = collected.slice(0, limit).reverse().map((e) => eventToMessage(topic, e));
     const nextCursor =
-      messages.at(-1)?.cursor ??
-      emptyWindowCursor(tailToken, sinceCursor, this.isStale(generation));
+      messages.at(-1)?.cursor ?? emptyWindowCursor(tailToken, sinceCursor, this.isStale(generation));
     return { messages, nextCursor };
   }
 
@@ -262,7 +279,7 @@ export abstract class MatrixTimeline extends MatrixSession {
         `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`,
         { signal: controller.signal, deadlineMs: syncDeadlineMs(0) },
       );
-      nextBatch = ((await initial.json()) as { next_batch: string }).next_batch;
+      nextBatch = positioningBatchOf(((await initial.json()) as SyncResponse).next_batch);
     } catch {
       return;
     }

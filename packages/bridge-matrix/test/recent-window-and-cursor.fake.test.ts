@@ -334,6 +334,23 @@ describe('cursor contract: a minted cursor replays to everything after it, never
  */
 const HISTORY = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7'];
 
+/**
+ * Traffic NEWER than the topic's own history, of both kinds a read pages past — another topic's
+ * messages and non-`m.room.message` events. The depths span every way the backward walk's FIRST page
+ * can land: full of belonging messages, part-full, and holding none. Keep the ones past zero, so that
+ * the last two are generated rather than hoped for — against the homogeneous history every row here
+ * had before, page one always fills and the walk stops because it is finished, so the short circuit
+ * is never what ended it and the position reported is never one the walk failed to reach.
+ */
+const TAIL_NOISE_DEPTHS = [0, LIMIT - 1, LIMIT, LIMIT * 3];
+
+const addTailNoise = (f: FakeSynapse, depth: number): void => {
+  for (let i = 0; i < depth; i++) {
+    if (i % 2 === 0) f.addMessage(FOREIGN, `tail${i}`);
+    else f.addRaw('m.reaction');
+  }
+};
+
 /** How the read under test is prevented from completing normally. */
 const SHORT_CIRCUITS: Record<
   string,
@@ -409,37 +426,44 @@ const SINCE_FORMS: Record<string, (p: MatrixPlugin, t: Topic) => Promise<Cursor 
 describe('a read that never completed reports the caller position, never one behind it', () => {
   for (const [sinceName, mintSince] of Object.entries(SINCE_FORMS)) {
     for (const [circuitName, circuit] of Object.entries(SHORT_CIRCUITS)) {
-      it(`${sinceName} / ${circuitName}: the cursor it reports replays nothing already delivered`, async () => {
-        const p = await connectFake({ shared: true });
-        const t = asTopic('ctx-payments');
-        for (const c of HISTORY) await p.post(t, WRITER, c);
-        const since = await mintSince(p, t);
+      for (const depth of TAIL_NOISE_DEPTHS) {
+        it(`${sinceName} / ${circuitName} / tail noise x${depth}: the cursor it reports replays nothing already delivered`, async () => {
+          const p = await connectFake({ shared: true });
+          const t = asTopic('ctx-payments');
+          for (const c of HISTORY) await p.post(t, WRITER, c);
+          const since = await mintSince(p, t);
+          addTailNoise(fake, depth);
 
-        const outcome = await circuit
-          .run(p, () => p.fetchRecent({ topic: t, since, limit: LIMIT }))
-          .catch((err: unknown) => err as Error);
+          const outcome = await circuit
+            .run(p, () => p.fetchRecent({ topic: t, since, limit: LIMIT }))
+            .catch((err: unknown) => err as Error);
 
-        if (since !== undefined && !circuit.faults) {
-          expect(
-            outcome,
-            'a teardown that was handed a caller position can always report it back',
-          ).not.toBeInstanceOf(Error);
-        }
-        if (outcome instanceof Error) return; // no cursor reported at all cannot regress one.
+          if (since !== undefined && !circuit.faults) {
+            expect(
+              outcome,
+              'a teardown that was handed a caller position can always report it back',
+            ).not.toBeInstanceOf(Error);
+          }
+          if (outcome instanceof Error) return; // no cursor reported at all cannot regress one.
 
-        const q = await connectFake({ shared: true });
-        // What the caller could still legitimately be shown: everything its OWN position replays to,
-        // less whatever this call just handed it. A since-less caller has no position, and the
-        // seam's recent window is the newest messages — so having been handed them, it is at the tail.
-        const delivered = outcome.messages.map((m) => m.content);
-        const reachable =
-          since === undefined ? [] : (await drainFrom(q, t, since, LIMIT)).contents;
-        const owed = reachable.filter((c) => !delivered.includes(c));
+          const q = await connectFake({ shared: true });
+          // What the caller could still legitimately be shown: everything its OWN position replays to,
+          // less whatever this call just handed it. A since-less caller's position IS the seam's
+          // recent window, so it sits at the tail only once that window has actually reached it —
+          // taking the entitlement from what was delivered instead lets a read that delivered nothing
+          // claim to owe nothing.
+          const delivered = outcome.messages.map((m) => m.content);
+          const reachable =
+            since === undefined
+              ? (await q.fetchRecent({ topic: t, limit: LIMIT })).messages.map((m) => m.content)
+              : (await drainFrom(q, t, since, LIMIT)).contents;
+          const owed = reachable.filter((c) => !delivered.includes(c));
 
-        expect((await drainFrom(q, t, outcome.nextCursor, LIMIT)).contents).toEqual(owed);
-        await q.disconnect();
-        await p.disconnect();
-      });
+          expect((await drainFrom(q, t, outcome.nextCursor, LIMIT)).contents).toEqual(owed);
+          await q.disconnect();
+          await p.disconnect();
+        });
+      }
     }
   }
 });
