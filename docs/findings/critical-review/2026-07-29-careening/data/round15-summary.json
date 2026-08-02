@@ -1,0 +1,184 @@
+{
+  "round": 15,
+  "converged": false,
+  "blockingClean": false,
+  "wakeAll": true,
+  "instrument": "first round under staged review (named-gap repeat) + remediationCheck",
+  "counts": {
+    "confirmed": 109,
+    "blocking": 35,
+    "plausible": 2,
+    "total": 111
+  },
+  "tokens": 3201902,
+  "toolCalls": 909,
+  "wallMs": 10257957,
+  "stagedReview": {
+    "criticsRunningMoreThanOnePass": 15,
+    "passesPerCritic": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3
+    ],
+    "criticsFindingSomethingOnALaterPass": 15,
+    "verdict": "Every one of 15 critics looped back; every one found something on the later pass. The mechanism is not ceremony.",
+    "residualGapsHonestlyReported": {
+      "unexaminedItems": 9,
+      "lensesWithoutAttempt": 10,
+      "untestedReliances": 15
+    }
+  },
+  "remediationConfidence": {
+    "traced": 93,
+    "plausible": 14,
+    "untested": 4
+  },
+  "byLens": {
+    "test-integrity": 20,
+    "truth-in-docs": 14,
+    "test-hygiene": 14,
+    "design-principles": 13,
+    "correctness": 12,
+    "security": 10,
+    "concurrency-and-failure": 10,
+    "operability-and-release": 8,
+    "maintainability": 7,
+    "protocol-conformance": 2,
+    "seam-integrity": 1
+  },
+  "coverage": [
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 2 found the duplicate-anchoring-table question (and, by mutating presence-reach.ts, disproved my stronger version of it \u2014 the shared corpus does catch a dropped non-capturing group, so I downgraded it from a security hole to a hygiene suggestion), the dist/testing shipping issue (found only by actually running tsc -b rather than reasoning about tsconfig), and the confirmation that CI builds before testing, which retired a candidate finding that packaging.test.ts's dist scan is vacuous.",
+      "inventoryCount": 24,
+      "unexaminedItems": "none \u2014 all 24 source items and all 13 test files were read in full. Attack depth was uneven: testing/http-app.ts, testing/tool-cases.ts and testing/failure-shapes.ts were read and reasoned about (nonconformant.ts's page/verdict arithmetic was hand-traced) but not mutated.",
+      "lensesWithoutAttempt": "none. Named attempts for the lenses that produced nothing: seam-integrity \u2014 grepped every import in src/ for backend packages and relative escapes and read package.json dependencies; concurrency-and-failure \u2014 mutated the shared fake's delivery from synchronous to deferred and ran the whole bridge-core suite; design-principles \u2014 checked filterHandles('')-as-absent, Allowlist.assert's over-long message, and the localhost/127.0.0.1 (but not [::1]) OIDC loopback asymmetry, none of which rose above taste; maintainability \u2014 the duplicated marker-recognition idiom in no-such-topic.ts and blocking-fetch.ts is the only candidate and it is deliberate and documented, so I did not file it.",
+      "untestedReliances": "regex-safety.test.ts's PER_MATCH_BUDGET_MS timing rows and identity-filter.test.ts's exhaustive reference-matcher comparison were both relied on to conclude those modules are sound and were not mutated \u2014 instead I ran independent fuzzing against the same properties (60k generated sources; the reference matcher is itself an independent oracle). config.test.ts's fixture-walking suites (unknown keys, empty strings, degenerate numbers) were relied on for config.ts's soundness and never mutated."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "The first pass produced the http/allowedHosts collapse and the fetch_recent result-side over-delivery, both from reading source. The second pass \u2014 triggered by stage 6 naming 'anchoring-parity.test.ts, unhandled-rejection.test.ts and absent-topic-sites.test.ts examined only by test name, and list-users/catchup/presence-loop never mutated' \u2014 produced the three highest-value findings: the MAX_MATCH_INPUT vs MAX_TOPIC_LEN parity divergence (visible only after reading the corpus and noticing every input is under 64 chars), the surviving roster-cap truncation mutation, and the non-recursive fire-and-forget scan (visible only after reading the recursive walker two files away). The stage structure paid for itself here: pass 1 anchored on http.ts and would have stopped there.",
+      "inventoryCount": 37,
+      "unexaminedItems": "none \u2014 all 16 source files and all 21 test files under engine/ and transport/ were read in full.",
+      "lensesWithoutAttempt": "none. concurrency-and-failure returned no finding but the named attempts are: 23 lifecycle/ordering mutations (abort-before-fetch, since-advance, presence serialization, goodbye bound, both teardown latches, close-awaits-bind, close grace cutoff), plus traced analysis of attach/shutdown interleaving, double releaseAll, the untilAborted listener lifetime and the beat backlog under a hung post. seam-integrity returned no finding: the import enumeration shows no backend edge and git diff --stat is empty. operability-and-release returned no finding at this scope: index.ts re-exports were checked against transport/engine public symbols and the vitest zz- exclusion was verified; bin/files/exports live in the manifest, outside these two directories.",
+      "untestedReliances": "packages/bridge-core/src/transport/tool-docs-parity.test.ts (its README-table scan was read but never mutated \u2014 I did not check whether a broken regex would silently pass its own guard case) and packages/bridge-core/src/transport/http-request-path.test.ts (relied on for the stateless/no-session claim, never mutated). packages/conformance was never run against the trial remediation for the over-delivery finding."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 2 was triggered by a named gap from the stage-6 self-audit: five source files (at-rest.ts, args.ts, cursor.ts, schema.ts, shutdown.ts) had produced no finding and had never been mutated, so I was relying on their tests without evidence those tests could fail. All five mutations went red, which retired the gap rather than producing a finding \u2014 the useful signal being that this package's at-rest, argv, store-identity, index and shutdown coverage is genuinely load-bearing, so the classify.ts hole found in pass 1 is a specific gap rather than a symptom of a weak suite. Pass 1 had also left `backoffMs` half-examined (I had read it but not compared it against the accepted poll_interval_ms range); re-reading it in pass 2 against MAX_POLL_INTERVAL_MS is what turned it from 'looks fine' into the back-ON finding.",
+      "inventoryCount": 39,
+      "unexaminedItems": "none \u2014 all 15 src entries, 20 test files, package.json, README.md, LICENSE and both tsconfigs were read; LICENSE was only checked for existence-vs-manifest (MIT), which is all publish-hygiene.test.ts grades of it.",
+      "lensesWithoutAttempt": "none. The three lenses that produced no finding each have a named attempt: seam-integrity (grepped bridge-core/src for sqlite imports and ran git diff --stat over packages/bridge-core \u2014 no import, no implied change); protocol-conformance (read packages/conformance/src/factory.ts + clauses and checked sqlite's capability declaration against the code, including that the omitted absentTopicBehaviour defaults to the stricter arm and that concurrentPost really forks OS processes with the shipped post() contending); security (probed at-rest modes across umasks and pre-existing states, traced precreate's window and restrictMode's mask arithmetic, and confirmed no secret, credential or config value is written to stderr except operator-authored paths and topics).",
+      "untestedReliances": "Three test files I relied on but never mutated: test/publish-hygiene.test.ts, test/readme-claims.test.ts and test/typecheck-coverage.test.ts. All three are meta-tests that read files rather than exercise behaviour, so a mutation would have to be to the manifest/README/tsconfig rather than to source \u2014 I judged the cost above the yield and am naming it rather than claiming coverage. I also did not mutate test/conformance.test.ts directly, but it ran green under the classify.ts mutation as part of the full-package run, which is the evidence that matters for the finding that cites it."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 2 closed two named gaps: keycloak.e2e.test.ts had never been examined (the mutation battery cannot grade it, since it is env-gated off here) and the operability-and-release lens had no named attempt. Reading the e2e confirmed its skip gate is explicit and loud, and confirmed that even the live tier never asserts the mirrored AS-metadata body \u2014 which upgraded the lossy-mirror finding from 'untested offline' to 'untested at every tier'. The operability pass verified doc-referenced paths (examples/self-host-remote/test/oidc-smoke.test.ts) and the package files/exports wiring, and found nothing.",
+      "inventoryCount": 28,
+      "unexaminedItems": "none",
+      "lensesWithoutAttempt": "none \u2014 concurrency-and-failure: traced every await boundary in ParleyOAuthProvider (completeConsent consumes `pending` before awaiting verifyOwner; every other entry point mutates its maps synchronously, so Node's single thread makes them atomic), the close()/listen() latch and the close-racing-bind path in transport/http.ts, and the sweeper's unref; no lost-wakeup or orphan shape found. protocol-conformance: packages/conformance grades backend cursor/dedup and does not reach this package, so I graded RFC conformance instead \u2014 PKCE S256 literal, RFC 8707 exact-match resource plus audience binding on verify, RFC 6749 \u00a74.1.3 redirect_uri binding, RFC 7009 silent no-op \u2014 and found the RFC 8414 mirror defect reported below. maintainability: reported the LOOPBACK_HOSTS name collision; also checked comment discipline against CLAUDE.md and found the comments uniformly in 'keep X so that Y' form.",
+      "untestedReliances": "keycloak.e2e.test.ts \u2014 env-gated off in this worktree and I did not stand up Keycloak, so no mutation was run against it. hygiene.test.ts's own rules were not mutated, but that file grades itself against a two-column synthetic corpus that I read and that provably reaches both verdicts."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 2 produced the connect-\u2225-subscribe race probe (which cleared the concurrency lens rather than finding a bug), the 'core never compares cursors' contradiction against core's own seam.ts, and the stale test-file cross-references. Pass 1 produced the CLI silent-arg defect and both mutation findings.",
+      "inventoryCount": 27,
+      "unexaminedItems": "none",
+      "lensesWithoutAttempt": "none",
+      "untestedReliances": "subscribe-hardening.test.ts's generation-gate rows and live-connections.test.ts's reader-leak rows were relied on to conclude the lifecycle paths are safe, and I did not mutate the generation checks themselves (I mutated the cap constant those same rows derive their bound from, which is finding 2). live-stream.test.ts's foreign-entry timestamp table was relied on for the entry.ts clamp without a mutation."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "The vacuous `waiters` axis in lifecycle.test.ts's RECONNECT_CELLS (finding #2) \u2014 I had read only the first 200 of 576 lines on pass 1, and the reconnect matrix lives at line ~499. It is the direct explanation for why finding #1 shipped green, so the second pass turned a bare defect into a defect plus its coverage gap. Pass 2 also produced findings #4 and #5 (the btree limit), from re-reading storable-corpus.ts after the first pass had only skimmed it as 'a corpus'.",
+      "inventoryCount": 56,
+      "unexaminedItems": "none",
+      "lensesWithoutAttempt": "none",
+      "untestedReliances": "I relied on but did not mutate: hostile-input.test.ts and hostile-cursor.test.ts (I read their assertions and confirmed they assert `state.queries` stayed empty, but did not weaken assertStorable/assertCursor and watch); creds-warning.test.ts (I did not flip usesDefaultCredentials to see the generated carrier matrix fail); packaging.test.ts and suite-hygiene.test.ts (both carry their own non-vacuity probes, which is why I spent the mutation budget elsewhere); the conformance catch-up and post cases (I mutated only the concurrency guarantee via the advisory lock); bootstrap-lock.test.ts and lock-wait.test.ts (real-server, expensive, and each already contains a control cell that must take the opposite arm)."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "The second pass was aimed deliberately at the tails of the long files, and produced the positioning-/sync findings: `subscribe`'s `positioned.next_batch ?? ''` and `timelineTipOf` (index.ts:170/175, the last quarter of that method) and `driveBoundedSync`'s bare `next_batch` cast (timeline.ts:265, the final third of that file), plus the paired fake-synapse blind spot that makes the malformed-body table unable to reach either phase. Pass 1 had anchored on the cursor/park surface and found only the recentWindow teardown bug.",
+      "inventoryCount": 30,
+      "unexaminedItems": "none \u2014 all 10 src files and all 20 test/helper files were read in full; cli.ts, alias.ts, diagnostics.ts and config.ts were the lowest-yield and produced no finding but were each traced against their tests (config-validation, creds-warning, room-isolation's fold tables, subscribe-resilience's throttle cardinality).",
+      "lensesWithoutAttempt": "none \u2014 seam-integrity was checked mechanically (`git status --porcelain packages/bridge-core` clean; grep of packages/bridge-core/src finds no import of the plugin, only diagnostic strings and a packaging-test name); protocol-conformance was checked against packages/conformance's contract and the catchup page-boundary sweep and held except as folded into finding 1; operability-and-release was checked (bin/exports/files, shebang, tsconfig rootDir/outDir, typecheck:test) and held; maintainability held because the package's own dead-import and dead-reference lints run over src/.",
+      "untestedReliances": "none of the tests I leaned on to call something safe went unmutated: park.ts's pre-park query was removed and wake-source went 13/47 red (teeth confirmed, reverted); comment-hygiene was probed with a nested violating file and stayed green (hole confirmed, removed); the fake's positioning /sync was corrupted three ways and history replayed each time. The one reliance I could not mutate from here is the LIVE conformance run and live-per-topic.test.ts \u2014 no Synapse was started, so both are describe.skip in this worktree and every claim about real Synapse semantics (empty ?since= treated as an initial sync; an initial sync always carrying next_batch and the room's timeline) is reasoned from the spec and reproduced only against the fake."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 1 produced the status-110 attribution asymmetry, the missing-archive-id zero cursor and the row-window default read. Stage 6 then named two gaps: (a) read-path-creation.test.ts only ever drives `discoUnknownRoom: 'item-not-found'`, so the rest of `roomExists`'s branch space was never examined, and (b) I had read `configureRoom` but never traced its timeout against the join's. Going back to stage 3 for exactly those two produced the two best-verified findings of the review \u2014 the read-path fail-open (reproduced for three probe-failure shapes) and the nested 15 s budgets that time out a creating join. Both sit in the last third of their files, which is where the brief said findings under-cluster.",
+      "inventoryCount": 51,
+      "unexaminedItems": "content-fidelity.test.ts, live-reconnect-durability.test.ts, multi-session-doc.test.ts and reconnect-rejoin.test.ts were read only as headers + describe/it titles, not line by line \u2014 all four are live-server suites whose behaviour I observed indirectly by watching them run green against the reachable Prosody. cli.ts's argv parser was read but not attacked (`--config` with a missing operand, repeated flags) because it is byte-identical in shape to the other plugins' CLIs and is core's contract, not this package's. Everything else in the inventory was read in full.",
+      "lensesWithoutAttempt": "none. Named attempts for the lenses that produced nothing: seam-integrity \u2014 `git diff --stat packages/bridge-core` empty and the import graph enumerated, no backend edge in either direction, and the only core mention of this package is a name string in packaging.test.ts, not an import; design-principles \u2014 checked for gratuitous indirection (the five-deep chain XmppConnection->Archive->Rooms->Inbound->Plugin is one concern per layer with no single-variant abstraction), fail-fast on unknown config keys, and least astonishment on resolveIdentity's cross-room answer, which is documented in three places and behaves as documented; maintainability \u2014 looked for dead code and stale names, found `MAM_TIMEOUT_MS` reused as the owner-config IQ budget (folded into the nesting finding rather than filed twice) and five test-only exports on the published API (CONFIG_KEYS/JID_SIZED_KEYS/JID_PART_MAX_BYTES/isPlaintextRemote/REJOIN_MAX_WAIT_MS), which is the repo-wide pattern and not this package's to change; operability-and-release \u2014 `files`/`bin`/`exports`/engines/keywords/description all consistent, cli.ts carries its shebang, publish-preflight covers the package, and CI's dev-infra + no-file-skipped gate means the live suite genuinely runs; test-integrity \u2014 two mutations run to completion (below).",
+      "untestedReliances": "none of the tests I relied on to clear something went unmutated. The two guards I concluded were SAFE and mutated: `onPresence`'s unavailable arm (hardened to require a nick match \u2014 1350 green, proving the 110 disjunct is graded by nothing and that the fix breaks nothing) and `archivedItem`'s id coercion (changed to drop id-less results \u2014 1350 green, proving the same). I did not mutate the long-poll suite because I was not relying on it to clear anything: I traced blockingMam's arm-before-requery ordering directly and its four-stage table already injects a message at every stage. I did not mutate the conformance suite because it is frozen and shared."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 2 was triggered by the stage-6 gap 'relied on untrusted-payload.test.ts to conclude zulipToMessage's id guard is safe, never mutated it'. Closing it produced no new finding \u2014 relaxing the guard from isSafeInteger&&>0 to isFinite went red on 18 cases \u2014 but it converted an assumption into a measurement, which is the point. Pass 1's stage 3 had also stopped at 'the fake models the server constraints' as a premise; pass 2's mutation of src/wire.ts's body regex is what turned that premise into finding 3, the highest-value item here. The stage structure paid for itself specifically on the tail of wire.ts (lines 120-184), which pass 1 had read and judged correct because it read the JSDoc's citation of upstream Python rather than checking the character class against it.",
+      "inventoryCount": 36,
+      "unexaminedItems": "none \u2014 all 10 src files, all 22 test files, both test helpers, README.md, package.json and both tsconfigs were read end to end.",
+      "lensesWithoutAttempt": "none \u2014 all eleven ran with a named attempt; see `checked` for what each tried. The three that returned nothing (security, seam-integrity, protocol-conformance) name their attempts there: security drove the resolveIdentity display-name shadowing (already adjudicated and pinned by DISPLAY_NAME_CLAIMS), the site_url userinfo/query/fragment refusals, describeShape redaction across every SENTINEL_CARRIER, and the URLSearchParams encoding of every wire field; seam-integrity was checked mechanically via the import graph and an empty `git diff --stat packages/bridge-core`; protocol-conformance was checked mechanically against packages/conformance's CONTEXT_FIELDS and the absent-topic contract.",
+      "untestedReliances": "none remaining. Four mutations were run and each was grep-verified as applied before the result was trusted: push-loop's waiter-registration ordering (red, 3), history's post-request assertGeneration (red, 7), wire's message-id guard (red, 18), and wire's body whitespace class (GREEN at 227 \u2014 finding 3). The one reliance I could not close by mutation is finding 4's remediation, which I reproduced but did not fix-and-rerun; it is marked plausible and its interleavings list names the four orderings I reasoned about without executing."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 1 anchored on the read/window arithmetic and the security classifier and produced the tls:// finding plus the two mutation survivors. Pass 2, driven by the stage-6 gap list, went after the items pass 1 had only skimmed and found three more: the retention_days composed-value overflow (config.ts's tail, which pass 1 had read but not probed against a server), the long-poll's per-tick streams.find cost (read.ts's streamForRead, which pass 1 judged correct and never measured), and the 150-of-200 short-circuited cells in config.test.ts (a file pass 1 had read only the transport-safety half of). The uncaptured outage flake also surfaced on pass 2, from re-running the full suite rather than the targeted files.",
+      "inventoryCount": 36,
+      "unexaminedItems": "none \u2014 all 12 source files and all 24 test/helper files were opened. Four test files were graded only by their test names plus a mutation aimed at them rather than read line by line: names.test.ts and names-live.test.ts (covered instead by a live probe of ten exotic topic names), subject-live.test.ts (covered by the filter_subject mutation, which reddens the class it owns), and jetstream-agreement-live.test.ts (a 27-line driver over AGREEMENT_ROWS, whose harness jetstream-agreement.ts I did read).",
+      "lensesWithoutAttempt": "none. seam-integrity, maintainability and protocol-conformance returned no finding but each has a named attempt in `checked`: the import graph plus an empty `git diff --stat packages/bridge-core` for the seam; the dead `incarnations.clear()` and the masked isStreamMissing regex for maintainability (both judged too weak to file); and nine mutations against cursor arithmetic, exclusivity, ordering and dedup for protocol-conformance.",
+      "untestedReliances": "none of the tests I relied on to call something safe went unmutated. Fourteen mutations were run and each was verified as APPLIED (the helper asserts the pattern matched before writing, and two attempts that failed to match were caught and reworked rather than being read as a green). Twelve reddened; the two that survived \u2014 absentTopicPage's cursor echo and payload.ts's asString \u2014 were re-run against the FULL 1548-test suite to confirm the gap is package-wide and not an artefact of the targeted file selection. Two further survivors were investigated and dismissed as benign rather than filed: session.ts's incarnations.clear() and the narrowed isStreamMissing regex."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 2 examined gateway-fault-isolation.test.ts, native-mentions.test.ts and wire-contract.test.ts (untouched in pass 1) -- all three held under inspection -- and added a per-file timing run, which is what produced the test-hygiene finding (disconnect-quiescence: 7 tests / 9.6s, ~9.1s of it fixed sleeping). Pass 1 had no test-hygiene finding at all, only a named attempt.",
+      "inventoryCount": 32,
+      "unexaminedItems": "none",
+      "lensesWithoutAttempt": "none",
+      "untestedReliances": "readme.test.ts and creds-warning.test.ts were read and reasoned about but never mutated -- I relied on them only for truth-in-docs claims I then re-derived from the source myself (RECONNECT_CAP_MS arithmetic, TERMINAL_CLOSE membership, PUSHABLE_CHANNEL_TYPES, net-util's DEFAULT_BACKOFF_MS/MAX_BACKOFF_MS/DEFAULT_DEADLINE_MS), so no conclusion here rests on an unmutated one. rest-contract.test.ts's 346 cells were mutation-covered indirectly by the wire.ts/config.ts battery rather than by mutating its own assertions."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 1 (source-reading + doc-reading) produced the mention_map grammar gap, the bot_token fail-fast gap and the README comparator mismatch. Pass 2 \u2014 driven by the stage-6 gap list, which named 'no mutation run yet' and 'six test files read by name only' \u2014 produced four more: the mid-block waiter leak (found by asking what withBlocking's four enumerated exits omit, then reproducing it), the vacuous conformance ack test (found by mutating ack ordering and watching WHICH file went red), the unguarded auth.test read (found by reading identity-resolution.test.ts and http-contract.test.ts bodies and noticing auth.test is the one Web API method absent from hostile-input's OK_TRUE_READERS table), and the missing LICENSE (found by running core's packaging.test allowlist against this package). Pass 2 also retired three pass-1 hypotheses that mutation disproved: I expected ack-first to be ungraded (it is graded, by envelope-robustness), I expected the parkedWaiters probe to be a shape-lock (it fails loudly and 51 rows depend on it), and I expected limit=Infinity to blow up the resume-path trim (core caps limit at z.number().int().positive(), so it is unreachable).",
+      "inventoryCount": 30,
+      "unexaminedItems": "none \u2014 all 9 src files, README.md, package.json and both tsconfigs were read in full. Of the 19 test files, 11 were read in full and 8 (connection-lifecycle, fixture-fidelity, history-order, catchup-window, http-contract, vendor-markup, documented-scopes, multi-session-push) were read partially: full header comments, every describe/it name, and the specific tables I relied on. connection-lifecycle.test.ts (870 lines) is the one where I read only headers and case names; its 23 cases cover reconnect ownership, memoized-singleton poisoning, teardown-racing-connect and the connect-as-session-boundary matrix, and I did not mutate against it \u2014 that is the residual gap, and closing it would mean mutating the session-guard lines in index.ts/link.ts, which is possible from here but was displaced by higher-yield targets.",
+      "lensesWithoutAttempt": "none \u2014 every one of the eleven has either a finding or a named attempt recorded in `checked`. The two with no finding are correctness (attempted: compareTs padding and digit bounds against the Date range, both slice directions, the retain=limit+HISTORY_PAGE_LIMIT trim against newest-first page order, emptyCursor's newestSeenTs, the page-cursor-repeat and MAX_HISTORY_PAGES guards, limit flooring \u2014 each traced and sound) and seam-integrity (attempted mechanically: empty `git diff --stat HEAD packages/bridge-core`, slack's bare imports limited to core/net-util/ws, no core source importing slack).",
+      "untestedReliances": "none of the three tests I leaned on went unmutated: withBlocking's parkedWaiters assertion (mutated armWaiter's registry cleanup -> 51/53 red, proving it live), envelope-robustness's ack-ordering journal rows (mutated onEnvelope's ack position -> 4 red, proving them live), and conformance.test.ts's ack test (same mutation -> stayed green, which is the finding). The reliance I did NOT mutate is the blocking-fetch STAGES table's 'during the gap-closing re-query' row, which I cite as evidence that the arm-before-requery ordering is guarded; I traced the ordering in source instead of moving armWaiter below runFetch and re-running."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Pass 1 anchored on poll.ts and store.ts and produced only the null-element ingestion death and the served-mark loss. Pass 2 \u2014 driven by the stage-6 gap list (store-file.ts's tail, README claims not covered by docs.test.ts, and test files I had read but not audited for duplication) \u2014 added the orphaned .lock.break disabling automatic stale-claim take-over, the README's false 'concurrentPost is not provided' claim, the duplicated-and-drifted openFdsFor probe, the config-bound prose gap, the ungraded cli.ts, and the missing LICENSE. Six of the eight findings came from the second pass, and all three of the second pass's CONFIRMED-by-reproduction items sit in the last third of their files (store-file.ts:131, README's final sections, lifecycle.test.ts's helper) \u2014 the tail the brief predicted would be under-attacked.",
+      "inventoryCount": 40,
+      "unexaminedItems": "none",
+      "lensesWithoutAttempt": "none",
+      "untestedReliances": "chats.ts \u2014 I relied on chat-resolution.test.ts's MEMO_CELLS to conclude the resolver never remembers a failure, and did not mutate chats.ts to prove those cells bite. journal.ts \u2014 I relied on store.test.ts's DAMAGED and IDENTITY_DAMAGE rows for parseRecord/requireEpoch/requireWatermarks and mutated neither. waiters.ts \u2014 I proved the park/wake window non-vacuous by mutating its CALLER (index.ts, M3b: 8 failures) but never mutated Waiters itself, so the self-cleaning claims (timer cleared, waiter dropped, emptied set dropped from the map) rest on reading rather than on a watched red."
+    },
+    {
+      "passes": 2,
+      "foundOnLaterPass": "Both the binary-body corruption and the hollow budget scanner came from the second pass. The first pass was a read-plus-mutate sweep of the two packages and produced only doc-level candidates; stage 6 named three gaps (tsconfigs never opened, the suite-shape budget row relied on but never mutated, and the buffered-Response path exercised only through text stubs), and going back to stage 3 for exactly those three turned two of them into confirmed findings. The tsconfig gap closed clean.",
+      "inventoryCount": 45,
+      "unexaminedItems": "none",
+      "lensesWithoutAttempt": "none \u2014 concurrency-and-failure: attacked sleepUnlessStopped's arm-order (mutated STOP_POLL_MS, and the poll/timer ordering is pinned by the teardown timer ledger), the abort composition and listener removal (mutated isCallerAbort, and residueLeftBy(200) pins the caller-signal registrations at zero), and the ReferencePlugin's read-then-arm-waiter window, which holds because nextWrite's executor runs synchronously with no await between it and read(). seam-integrity: checked mechanically via the manifests and the import graph, nothing found. protocol-conformance: checked CLAUSES against DESIGN's seam contract and mutated four nextCursor-agreement assertions; the property is controlled. security: 6 redaction/classifier mutations, all caught; the only hole found is the empty-needle split.",
+      "untestedReliances": "packages/conformance/test/repo-contract.test.ts and packages/conformance/test/readme.test.ts \u2014 both carry their own planted-synthetic-tree negative controls, which I read but did not mutate; packages/bridge-net-util/test/package-contract.test.ts's consumer-set derivation, relied on for the README truth-in-docs claim but not mutated."
+    },
+    {
+      "passes": 3,
+      "foundOnLaterPass": "Pass 1 found the cli.ts/args.ts duplication and the hygiene-lint asymmetry. Pass 2 (after reading packages/conformance/test/repo-contract.test.ts) found that the typecheck-coverage/packaging guards duplicated in four packages are already subsumed by one central guard, and that the central guard reads only ci.yml \u2014 which led to the release.yml gate-parity gap. Pass 3 mutated the license ratchet and found it enforces the defect rather than the invariant, and measured the 5-of-16-host disagreement between the plaintext-credential classifiers.",
+      "inventoryCount": 34,
+      "unexaminedItems": "skills/chat-handoff, docs/journal/*, docs/findings/*, docs/CONVENTIONS.md, docs/keycloak-integration.md, docs/1.0-readiness.md, .claude/workflows/careening-review.js, scripts/careening-*.mjs and careening-worktree.sh, scripts/verify-fresh.sh, examples/multi-session/* config trees, examples/dev-compose/dev-infra.sh internals, PROGRESS.md",
+      "lensesWithoutAttempt": "none",
+      "untestedReliances": "packages/conformance/test/repo-contract.test.ts (relied on to conclude the tsconfig/CI-compile invariant is centrally guarded \u2014 read its own negative controls but did not mutate it); the ci.yml/release.yml 'Assert no test file skipped entirely' node gate (relied on to conclude self-skipping is caught; statically verified every conditional suite has a placeholder `it` fallback so no file registers zero assertions, but did not run it with services down)"
+    }
+  ],
+  "comparability": "NOT directly comparable to round 13 (82 confirmed / 33 blocking). The instrument changed: staged review with a gap-triggered repeat. Findings rising 82 -> 109 is what a more thorough search looks like, not evidence the code got worse \u2014 the same ambiguity recorded for round 13, in the other direction."
+}
