@@ -283,6 +283,10 @@ const documentedBehaviours: Array<[string, RegExp]> = [
     'a credential bound for a cleartext remote link is reported at connect()',
     /carries a credential to a non-loopback host is\s+reported/,
   ],
+  [
+    'an argv the CLI cannot honour stops it instead of loading the default config',
+    /exits 2 with a usage message/,
+  ],
 ];
 
 describe('bridge-redis README — every behaviour the suite pins is described here', () => {

@@ -1,6 +1,7 @@
 import { asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RedisPlugin } from '../src/index.js';
+import { PERMANENT_REFUSALS, TRANSIENT_REFUSALS } from './refusal-codes.js';
 
 // White-box tests for RedisPlugin.subscribe() hardening. These
 // mock the `redis` module so connect()/disconnect()/subscribe() run with NO live server; the live
@@ -230,17 +231,28 @@ describe('redis subscribe hardening — xInfoStream catch must not replay histor
 // same refusals — but a caller of either has already been told the call succeeded, so a fault no
 // retry can clear must reach the operator on BOTH, while one that heals must be ridden out on both.
 // The axes that matter are the path and the reason, never the retry count.
-const reasons: Array<[string, string, 'permanent' | 'transient']> = [
-  ['a bad BLOCK argument', 'ERR timeout is not an integer or out of range', 'permanent'],
-  ['an unauthenticated connection', 'NOAUTH Authentication required.', 'permanent'],
-  ['an ACL revoked mid-session', 'NOPERM this user has no permissions to run the xread command', 'permanent'],
-  ['a wrong password after failover', 'WRONGPASS invalid username-password pair', 'permanent'],
-  ['the key repurposed', 'WRONGTYPE Operation against a key holding the wrong kind of value', 'permanent'],
+//
+// Both halves are generated from the declared code lists rather than named here, so a code the
+// classifier gains — or one that moves from ridden-out to retired-on — is graded on both paths the
+// day it moves. Only the faults that carry no RESP code at all are listed by hand.
+
+/** How a read loop meets a code in practice, where that differs from the code's generic sample. */
+const XREAD_TEXT: Record<string, string> = {
+  ERR: 'ERR timeout is not an integer or out of range',
+  NOPERM: 'NOPERM this user has no permissions to run the xread command',
+  WRONGPASS: 'WRONGPASS invalid username-password pair',
+};
+
+type Reason = [label: string, message: string, kind: 'permanent' | 'transient'];
+
+const reasons: Reason[] = [
+  ...PERMANENT_REFUSALS.map(
+    ([code, text]): Reason => [code, XREAD_TEXT[code] ?? `${code} ${text}`, 'permanent'],
+  ),
   ['a closed client', 'ClientClosedError', 'transient'],
   ['a reset socket', 'read ECONNRESET', 'transient'],
   ['an unexpectedly closed socket', 'Socket closed unexpectedly', 'transient'],
-  ['a server still loading its dataset', 'LOADING Redis is loading the dataset in memory', 'transient'],
-  ['a failover redirect', 'MOVED 3999 127.0.0.1:6381', 'transient'],
+  ...TRANSIENT_REFUSALS.map(([code, message]): Reason => [code, message, 'transient']),
 ];
 
 describe('redis hardening — a refusal is diagnosed on every XREAD path', () => {

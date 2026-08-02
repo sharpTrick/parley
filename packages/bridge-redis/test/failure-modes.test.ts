@@ -3,8 +3,16 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { asCursor, asTopic, loadConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
+import { PERMANENT_CODES, serverRefusal } from '../src/client.js';
 import { CONFIG_KEYS, createRedisClient, RedisPlugin } from '../src/index.js';
 import { rejectedByKnob, rejectedRows } from './config-fixtures.js';
+import {
+  CONTRADICTED,
+  PERMANENT_REFUSALS,
+  TRANSIENT_REFUSALS,
+  UNDECLARED_PERMANENT,
+  UNSHIPPED_PERMANENT,
+} from './refusal-codes.js';
 import {
   commandOf,
   DEFAULT_REPLIES,
@@ -196,13 +204,52 @@ describe('bridge-redis shipped example configs — every one still loads', () =>
 });
 
 // ---------------------------------------------------------------------------------------------
+// CLASS: a code reaching the classifier with no declared verdict. `serverRefusal` is what decides
+// whether live delivery STOPS or is ridden out, and every table downstream of it is driven from the
+// two lists below — so a code that moves between them is red here before it is a read loop that
+// retired for the life of the process on a fault a replica failover would have healed.
+// ---------------------------------------------------------------------------------------------
+
+describe('redis failure modes — every refusal code has a declared verdict', () => {
+  it('both lists have rows, and no code is declared both ways', () => {
+    expect(PERMANENT_REFUSALS.length).toBeGreaterThan(0);
+    expect(TRANSIENT_REFUSALS.length).toBeGreaterThan(0);
+    expect(UNDECLARED_PERMANENT, 'the classifier lists a code no row grades').toEqual([]);
+    expect(UNSHIPPED_PERMANENT, 'the classifier dropped a code declared permanent').toEqual([]);
+    expect(CONTRADICTED, 'a code is declared permanent and transient at once').toEqual([]);
+  });
+
+  it.each(PERMANENT_REFUSALS)('%s is a refusal only an operator can clear', (code, text) => {
+    expect(serverRefusal(new Error(`${code} ${text}`))).toBe(`${code} ${text}`);
+  });
+
+  it.each(TRANSIENT_REFUSALS)('%s is ridden out rather than retired on', (_code, message) => {
+    expect(
+      serverRefusal(new Error(message)),
+      'live delivery stops for the life of the process on a fault a retry clears',
+    ).toBeUndefined();
+  });
+
+  // The pattern is assembled from the list, so anchoring is the part a rebuild of it can lose: a
+  // code merely CONTAINED in a message would retire a reader on a server's prose.
+  const nearMisses = PERMANENT_CODES.flatMap((code) => [
+    `X${code} not this one`,
+    `${code}ISH not this one`,
+    `the server answered ${code} not this one`,
+  ]);
+
+  it.each(nearMisses)('%s is not a refusal', (message) => {
+    expect(serverRefusal(new Error(message))).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // CLASS: connect() reports success against an endpoint that cannot serve the seam. Every row is
 // REACHABLE — the handshake completes — so the fail-fast table above cannot see any of them.
 //
 // Three axes, because each one hides a different failure from a hand-listed table:
-//   * CODE. `PERMANENT_SERVER_ERROR` lists seven refusal codes; a table that names four grades the
-//     three it left out not at all. Generated from the shipped list, so a code added later has a
-//     row before it has a bug.
+//   * CODE. Generated from the classifier's own exported list, so a code added to it has a row
+//     before it has a bug — a hand-listed copy grades the codes it left out not at all.
 //   * ARRIVAL. A refusal that lands on the HANDSHAKE survives only as an emitted `error` event
 //     (node-redis reports the connect itself as the reconnect strategy's generic failure); one that
 //     lands on the first COMMAND arrives as the thrown rejection. Those are two different reads.
@@ -213,16 +260,7 @@ describe('bridge-redis shipped example configs — every one still loads', () =>
 // ---------------------------------------------------------------------------------------------
 
 describe('redis failure modes — a reachable server that cannot serve the seam', () => {
-  /** Every code `PERMANENT_SERVER_ERROR` treats as "only an operator can clear this". */
-  const refusals: Array<[string, string]> = [
-    ['ERR', "unknown command 'PING'"],
-    ['NOAUTH', 'Authentication required.'],
-    ['WRONGPASS', 'invalid username-password pair or user is disabled.'],
-    ['NOPERM', "this user has no permissions to run the 'ping' command"],
-    ['WRONGTYPE', 'Operation against a key holding the wrong kind of value'],
-    ['NOPROTO', 'unsupported protocol version'],
-    ['EXECABORT', 'Transaction discarded because of previous errors.'],
-  ];
+  const refusals = PERMANENT_REFUSALS;
 
   /** Where the refusal lands — which decides which of the two reads has to find it. */
   const arrivals: Array<[string, (argv: string[]) => boolean]> = [

@@ -6,9 +6,21 @@ export type RedisClient = ReturnType<typeof createClient>;
 /**
  * RESP error codes the server returns when it UNDERSTOOD a command and refused it — a bad argument,
  * a revoked ACL, a repurposed key. No retry clears one without an operator; everything else (socket
- * faults, `LOADING`, failover redirects) heals on its own and is retried.
+ * faults, `LOADING`, failover redirects) heals on its own and is retried. Exported so the suite
+ * grades the whole list rather than a copy of it.
  */
-const PERMANENT_SERVER_ERROR = /^(ERR|NOAUTH|WRONGPASS|NOPERM|WRONGTYPE|NOPROTO|EXECABORT)\b/;
+export const PERMANENT_CODES = [
+  'ERR',
+  'NOAUTH',
+  'WRONGPASS',
+  'NOPERM',
+  'WRONGTYPE',
+  'NOPROTO',
+  'EXECABORT',
+] as const;
+
+/** Anchored and word-bounded, so that `NOPERMISSION` or a code quoted mid-message is not one. */
+const PERMANENT_SERVER_ERROR = new RegExp(`^(${PERMANENT_CODES.join('|')})\\b`);
 
 /**
  * The most recent `error` event per client. A handshake the SERVER rejected (`WRONGPASS`, a
