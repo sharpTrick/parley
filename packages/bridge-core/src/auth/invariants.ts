@@ -241,6 +241,17 @@ export function assertOidcPolicy(oidc: OidcAuthConfig): void {
         '(required_scope alone is not sufficient). See docs/keycloak-integration.md.',
     );
   }
+  // A scope TOKEN is `1*NQCHAR` (RFC 6749 §3.3) and the verifier compares against
+  // `scope.split(' ')`, so a value that is blank or carries a space can never equal one: the
+  // resource server boots healthy, publishes it in `scopes_supported`, and 403s every valid token.
+  if (oidc.required_scope !== undefined && !/^\S+$/.test(oidc.required_scope)) {
+    throw new Error(
+      `auth.oidc.required_scope must be a single non-blank scope token (got ` +
+        `${JSON.stringify(oidc.required_scope)}). A token's \`scope\` claim is split on spaces and ` +
+        'matched exactly, so a blank value — or one containing a space — matches no token at all ' +
+        'and would reject every caller the scope was written to admit.',
+    );
+  }
   if (oidc.audience !== undefined && !isNonBlank(oidc.audience)) {
     throw new Error(
       `auth.oidc.audience must not be blank (got ${JSON.stringify(oidc.audience)}). Every token ` +

@@ -1028,16 +1028,23 @@ describe('filterReachable (pure reachability predicate)', () => {
       });
     }
 
-    // The clamp compares a PREFIX, so a pattern that matches inside the first MAX_MATCH_INPUT
-    // characters still reports reachable. That is the semantic cost of the bound, pinned here so it
-    // is not "fixed" later by silently refusing long topics instead.
-    it('still matches on the bounded prefix of an over-long topic', () => {
+    // The bound REFUSES an over-long topic rather than matching its prefix, because `Allowlist.has`
+    // does: a prefix match reports the peer as reachable on a topic no post pattern at either end
+    // will match, and the hand-off lands nowhere. The peer still surfaces on a topic it explicitly
+    // advertises, so what the bound costs is reach, never safety.
+    it('refuses an over-long topic rather than matching its prefix, as the allowlist does', () => {
       const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
       const topic = `team-${'a'.repeat(5_000)}`;
+      expect(new Allowlist([], { postPatterns: ['team-.*'] }).has(topic)).toBe(false);
       expect(
-        filterReachable(roster, { scope: topic, canPostTo: NEVER, mySubscribedTopics: [] }).map(
-          (e) => e.handle,
-        ),
+        filterReachable(roster, { scope: topic, canPostTo: NEVER, mySubscribedTopics: [] }),
+      ).toEqual([]);
+      expect(
+        filterReachable([entry('peer', [topic], ['team-.*'])], {
+          scope: topic,
+          canPostTo: NEVER,
+          mySubscribedTopics: [],
+        }).map((e) => e.handle),
       ).toEqual(['peer']);
     });
   });

@@ -30,8 +30,15 @@ export const OidcAuthSchema = z
     audience: z.string().min(1).optional(),
     /** Override the JWKS URI (default: `jwks_uri` from discovery). */
     jwks_uri: z.string().url().optional(),
-    /** If set, the token's `scope` (space-separated) must include this value. */
-    required_scope: z.string().min(1).optional(),
+    /** If set, the token's `scope` (space-separated) must include this value. A single scope token:
+     *  the claim is split on spaces, so a blank value or one containing a space matches nothing. */
+    required_scope: z
+      .string()
+      .regex(/^\S+$/, {
+        message:
+          'auth.oidc.required_scope must be a single non-blank scope token: the token `scope` claim is split on spaces and matched exactly, so a blank value — or one containing a space — would reject every caller',
+      })
+      .optional(),
     /** Identity gates preserving the single-tenant posture: any that are set must ALL pass.
      *  Issuer + audience validation is always mandatory regardless. */
     allowed_subjects: z.array(z.string().min(1)).nonempty().optional(),

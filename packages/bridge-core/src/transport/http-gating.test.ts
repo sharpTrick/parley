@@ -1,4 +1,5 @@
 import { request } from 'node:http';
+import { connect } from 'node:net';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { RequestHandler } from 'express';
 import { describe, expect, it, vi } from 'vitest';
@@ -208,6 +209,81 @@ describe('the insecure-no-auth endpoint answers only to the hosts it was configu
     try {
       expect(await statusFor(port, 'parley.internal')).toBe(ALLOWED);
       expect(await statusFor(port, `127.0.0.1:${port}`)).toBe(REFUSED);
+    } finally {
+      await teardown();
+    }
+  });
+
+  /**
+   * The CONFIGURED side of the gate, which the grid above never varies. Every entry is read by one
+   * parser, and a parse that silently maps an entry to something no request can match locks the
+   * operator out of the deployment the entry was written to admit; one that maps it to the EMPTY
+   * string additionally admits a request carrying no `Host` at all, because that is what an absent
+   * header looks up. So grade each entry on both properties instead of on one status code:
+   *
+   *   - an entry the constructor ACCEPTS must admit the host it names;
+   *   - an entry it cannot parse must be refused where the operator can see it, not kept;
+   *   - and NO configuration may admit a request with no Host — the property that catches a value
+   *     collapsing into the allow set however it got there.
+   */
+  const cfgFor = (): ReturnType<typeof parseConfig> =>
+    parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'], presence: { enabled: false } });
+
+  /** A request carrying no Host header at all — legal in HTTP/1.0, and its own gate input. */
+  function statusWithoutHost(port: number): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.end(
+          `POST /mcp HTTP/1.0\r\ncontent-type: ${MCP_HEADERS['content-type']}\r\n` +
+            `accept: ${MCP_HEADERS.accept}\r\ncontent-length: ${Buffer.byteLength(INITIALIZE)}\r\n\r\n${INITIALIZE}`,
+        );
+      });
+      let received = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk: string) => {
+        received += chunk;
+      });
+      socket.on('error', reject);
+      socket.on('end', () => resolve(Number(/^HTTP\/1\.\d (\d{3})/.exec(received)?.[1] ?? 0)));
+    });
+  }
+
+  // `admits` is the Host an accepted entry must answer to; `null` marks an entry no request could
+  // ever match, which the constructor must refuse rather than keep.
+  const ENTRIES: Array<[label: string, entry: string, admits: string | null]> = [
+    ['a bare hostname', 'parley.internal', 'parley.internal'],
+    ['a hostname with a port', 'parley.internal:8443', 'parley.internal:9000'],
+    ['a scheme, mixed case and a port', 'HTTPS://Parley.Example:8443', 'parley.example'],
+    ['an IPv4 address', '127.0.0.1', '127.0.0.1:1'],
+    ['a bracketed IPv6 literal', '[::1]', '[::1]'],
+    ['a bracketed IPv6 literal with a port', '[::1]:8443', '[::1]:9000'],
+    ['an unbracketed IPv6 literal', '::1', null],
+    ['an IPv6 literal with a zone id', 'fe80::1%eth0', null],
+    ['the empty string', '', null],
+    ['a bare port', ':8080', null],
+    ['a value carrying a path', 'http://parley.example/mcp', null],
+  ];
+
+  it.each(ENTRIES)('allowedHosts: %s', async (_label, entry, admits) => {
+    if (admits === null) {
+      expect(() =>
+        createRemoteHttpApp(new FakePlugin(), cfgFor(), { insecureNoAuth: true, allowedHosts: [entry] }),
+      ).toThrow(RangeError);
+      return;
+    }
+    const { port, teardown } = await served({ insecureNoAuth: true, allowedHosts: [entry] });
+    try {
+      expect(await statusFor(port, admits)).toBe(ALLOWED);
+      expect(await statusWithoutHost(port)).toBe(REFUSED);
+    } finally {
+      await teardown();
+    }
+  });
+
+  it('the built-in loopback default refuses a request with no Host too', async () => {
+    const { port, teardown } = await served({ insecureNoAuth: true });
+    try {
+      expect(await statusWithoutHost(port)).toBe(REFUSED);
     } finally {
       await teardown();
     }

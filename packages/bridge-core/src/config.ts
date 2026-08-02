@@ -70,7 +70,7 @@ const ConfigObject = z.object({
     .strict(),
   /**
    * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped at
-   * {@link MAX_RECORD_TOPICS}: every presence beat advertises this whole list and every reader caps
+   * `MAX_RECORD_TOPICS`: every presence beat advertises this whole list and every reader caps
    * a record at that count, so a longer list would load cleanly and then under-advertise this bridge
    * on its trailing topics forever — no peer would ever see it as a hand-off partner there.
    */
@@ -85,7 +85,7 @@ const ConfigObject = z.object({
    * `^(?:…)$` at compile time). Lets a chat instance post to ad-hoc topics without listing each
    * one. These are NEVER subscribed / caught up on / announced in presence — that stays the
    * explicit `topics` list. The presence topic can never be matched (it is reserved). Invalid
-   * regexes are rejected at load (DESIGN §14). Capped at {@link MAX_POST_TOPICS}: the ReDoS screen
+   * regexes are rejected at load (DESIGN §14). Capped at `MAX_POST_TOPICS`: the ReDoS screen
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
    * one of them, so the count is the other half of that bound.
    */

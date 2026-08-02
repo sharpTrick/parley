@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { asHandle } from '../message.js';
-import { ANCHORING_CASES } from '../testing/anchoring-corpus.js';
+import { ANCHORING_CASES, ANCHORING_LENGTH_CASES } from '../testing/anchoring-corpus.js';
 import { filterReachable, type RosterEntry } from './presence.js';
 
 /**
@@ -48,16 +48,35 @@ describe('every site that compiles an untrusted pattern anchors it the same way'
   it('pins the corpus membership', () => {
     expect(ANCHORING_CASES.length).toBe(12);
     expect(ANCHORING_CASES.filter(([, , , full]) => !full).length).toBe(7);
+    // The length axis has to straddle the bound in both directions, or it grades one side twice.
+    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => full).length).toBeGreaterThan(0);
+    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => !full).length).toBeGreaterThan(0);
   });
+
+  const CASES = [...ANCHORING_CASES, ...ANCHORING_LENGTH_CASES];
 
   it.each(
     SITES.flatMap(([site, matches]) =>
-      ANCHORING_CASES.map(
+      CASES.map(
         ([label, source, input, fullMatch]) =>
           [`${site} × ${label}`, matches, source, input, fullMatch] as const,
       ),
     ),
   )('%s', (_name, matches, source, input, fullMatch) => {
     expect(matches(source, input)).toBe(fullMatch);
+  });
+
+  /**
+   * The rows above pin each site against an expectation written down here; this pins the sites
+   * against EACH OTHER, so a cell where they diverge fails even when the corpus's own expectation
+   * has gone stale. That is the failure this file exists for: one rule, two implementations, graded
+   * only where they happen to agree.
+   */
+  it('every site returns the same verdict in every cell', () => {
+    const disagreements = CASES.filter(([, source, input]) => {
+      const verdicts = SITES.map(([, matches]) => matches(source, input));
+      return verdicts.some((v) => v !== verdicts[0]);
+    }).map(([label, source, input]) => `${label}: ${JSON.stringify({ source, length: input.length })}`);
+    expect(disagreements).toEqual([]);
   });
 });

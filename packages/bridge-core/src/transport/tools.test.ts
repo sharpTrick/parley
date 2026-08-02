@@ -3,9 +3,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asHandle, asTopic } from '../message.js';
+import { asBackendMsgId, asHandle, asTopic } from '../message.js';
 import type { FetchRecentArgs } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
+import { NONCONFORMANT_SHAPES, NONCONFORMANT_SHAPE_NAMES } from '../testing/nonconformant.js';
 import {
   harness,
   parse,
@@ -286,6 +287,68 @@ describe('every numeric tool argument is bounded before it reaches the backend',
     // The roster's cost is fixed by the presence page, whatever the caller asks for.
     for (const call of seen) expect(call.limit).toBe(PRESENCE_FETCH_LIMIT);
     expect(out.users.length).toBeLessThanOrEqual(Math.min(value, PRESENCE_FETCH_LIMIT));
+  });
+});
+
+/**
+ * `limit` bounds what core ASKS a plugin for; it does not bound what comes back. The seam is
+ * explicit that a longer page is legal — testing/nonconformant.ts ships it as a shape core must
+ * survive — and the returned page is the number that decides how much untrusted text enters the
+ * agent's context and how many ids are written into a per-topic dedup window of SEEN_MAX_PER_TOPIC
+ * entries. `parley_list_users` already folds at most one page; `parley_fetch_recent` forwarded
+ * whatever it was handed, so a 5000-message answer to `limit: 1` both filled the context and flushed
+ * the topic's dedup window, after which the push loop re-delivered what had just been pulled.
+ *
+ * Drive it from the shared shapes rather than from a hand-written over-deliverer, and DERIVE which
+ * of them over-deliver instead of naming them, so a shape added there is graded here the day it lands.
+ */
+describe('a result-returning tool bounds the page it hands back, not only the one it asks for', () => {
+  const T = asTopic('ctx');
+  const overDelivering = NONCONFORMANT_SHAPE_NAMES.filter(
+    (name) => NONCONFORMANT_SHAPES[name]!.serve({ topic: T, limit: 3 }, 0).messages.length > 3,
+  );
+
+  it('finds over-delivering shapes to check (guards against a table that grades nothing)', () => {
+    expect(overDelivering.length).toBeGreaterThan(1);
+  });
+
+  // Pin the tools whose result carries a caller-visible list: a third one joins this table rather
+  // than shipping with its page unbounded.
+  it('pins the tools that return a list', async () => {
+    const { client } = await harness();
+    const { tools } = await client.listTools();
+    expect(
+      tools
+        .filter((t) => /Returns \{ (?:messages|users)/.test(t.description ?? ''))
+        .map((t) => t.name)
+        .sort(),
+    ).toEqual(['parley_fetch_recent', 'parley_list_users']);
+  });
+
+  it.each(
+    overDelivering.flatMap((shape) =>
+      [undefined, 1, MAX_FETCH_LIMIT * 2].map((limit) => [shape, limit] as const),
+    ),
+  )('parley_fetch_recent × %s × limit=%s', async (shape, limit) => {
+    const { client, plugin, deps } = await harness();
+    const { serve } = NONCONFORMANT_SHAPES[shape]!;
+    let call = 0;
+    plugin.fetchRecent = (args) => Promise.resolve(serve(args, call++));
+
+    const out = parse(
+      await client.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', ...(limit === undefined ? {} : { limit }) },
+      }),
+    ) as { messages: Array<{ backendMsgId: string; cursor: string }>; nextCursor?: string };
+
+    const cap = Math.min(limit ?? MAX_FETCH_LIMIT, MAX_FETCH_LIMIT);
+    expect(out.messages.length).toBeLessThanOrEqual(cap);
+    // The cursor has to name what was DELIVERED, or the truncated remainder is skipped forever.
+    const served = serve({ topic: T, limit: cap }, 0).messages;
+    if (out.messages.length < served.length) expect(out.nextCursor).toBe(out.messages.at(-1)!.cursor);
+    // The dedup window still holds the FIRST id of the page: an oversized warm-up evicts it.
+    expect(deps.seen!.has(T, asBackendMsgId(out.messages[0]!.backendMsgId))).toBe(true);
   });
 });
 

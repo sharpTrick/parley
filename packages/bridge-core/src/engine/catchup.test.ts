@@ -367,6 +367,32 @@ describe('catch-up driver', () => {
       expect(calls.length).toBeLessThan(5);
       expect(new ReadStateStore(path).get(T)).toBe('stuck');
     });
+
+    /**
+     * What the seam's byte-stability requirement BUYS, graded as the difference between two plugins
+     * standing at the same position. The brake is `nextCursor === since`, so a plugin that re-mints
+     * a semantically identical cursor per call (re-serialised object, re-rendered timestamp) buys
+     * itself the page ceiling instead of one wasted round-trip. A doc that tells a plugin author
+     * core "never compares" a cursor is describing the left-hand column and shipping the right one.
+     */
+    const pagesUntilStop = async (shape: string): Promise<number> => {
+      const { plugin, calls } = pagingProbe(NONCONFORMANT_SHAPES[shape]!.serve);
+      await catchUpTopic({
+        plugin,
+        topic: T,
+        limit: 1_000,
+        readState: memoryReadState() as unknown as ReadStateStore,
+        seen: new SeenSet(),
+      });
+      return calls.length;
+    };
+
+    it('brakes on a no-progress cursor only while the plugin spells it the same way twice', async () => {
+      expect(await pagesUntilStop('a full page whose cursor never advances')).toBeLessThan(5);
+      expect(
+        await pagesUntilStop('a full page whose cursor names one position but is spelled differently each call'),
+      ).toBe(MAX_CATCHUP_PAGES);
+    });
   });
 
   it('catchUpAll loops over every configured topic', async () => {

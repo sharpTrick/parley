@@ -113,8 +113,17 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         // they were, and omitting it (no `since` given) reads the recent window.
         return textResult({ messages: [], nextCursor: args.since, topicAbsent: true });
       }
-      for (const m of result.messages) deps.seen?.markSeen(t, m.backendMsgId);
-      return textResult({ messages: result.messages, nextCursor: result.nextCursor });
+      // Bound the PAGE, not only the request. The seam lets a plugin hand back more than `limit`
+      // asked for (testing/nonconformant.ts ships that shape), and everything past the cap is both
+      // agent-facing context and one more write into a per-topic dedup window small enough that a
+      // single oversized page flushes it — after which the push loop re-delivers what was just
+      // pulled. Re-derive the cursor from the last message KEPT, so that the remainder is paged on
+      // the next call rather than skipped forever.
+      const cap = Math.min(limit ?? MAX_FETCH_LIMIT, MAX_FETCH_LIMIT);
+      const kept = result.messages.length > cap ? result.messages.slice(0, cap) : result.messages;
+      const nextCursor = kept.length < result.messages.length ? kept.at(-1)!.cursor : result.nextCursor;
+      for (const m of kept) deps.seen?.markSeen(t, m.backendMsgId);
+      return textResult({ messages: kept, nextCursor });
     },
   );
 

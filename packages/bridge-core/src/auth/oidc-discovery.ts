@@ -1,7 +1,25 @@
 import {
+  OAuthMetadataSchema,
   OpenIdProviderDiscoveryMetadataSchema,
   type OpenIdProviderDiscoveryMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+
+/**
+ * The IdP's discovery document, keeping the RFC 8414 fields the OIDC schema alone drops.
+ *
+ * `OpenIdProviderDiscoveryMetadataSchema` is a strict `z.object`, so parsing through it STRIPS every
+ * key it does not name — including `revocation_endpoint` and `introspection_endpoint`, which a stock
+ * Keycloak realm publishes. In delegated mode this parsed document is what the AS-metadata mirror on
+ * Parley's origin is built from, so a client that discovers the IdP through Parley had no revocation
+ * endpoint to call and no way to tell truncation from absence.
+ *
+ * Derive the added keys from the two schemas rather than listing them, so an RFC 8414 field the SDK
+ * learns about later is mirrored without an edit here. Keep the OIDC shape WINNING on shared keys,
+ * so that widening the mirror cannot tighten what a legitimate IdP is allowed to publish.
+ */
+const DiscoveryDocumentSchema = OpenIdProviderDiscoveryMetadataSchema.extend(
+  OAuthMetadataSchema.shape,
+).extend(OpenIdProviderDiscoveryMetadataSchema.shape);
 
 /**
  * How long the whole exchange — connect, headers, body — may take. `createOidcRemoteApp` awaits
@@ -59,7 +77,7 @@ export async function fetchOidcDiscovery(
 
   let metadata: OpenIdProviderDiscoveryMetadata;
   try {
-    metadata = OpenIdProviderDiscoveryMetadataSchema.parse(await res.json());
+    metadata = DiscoveryDocumentSchema.parse(await res.json());
   } catch (err) {
     if (isDeadline(err)) throw unreachable(url, timeoutMs, err);
     throw new Error(

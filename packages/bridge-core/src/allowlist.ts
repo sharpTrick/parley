@@ -45,7 +45,7 @@ export interface AllowlistOptions {
   /**
    * Regex sources additionally allowed for `post`/`fetch_recent` (NOT subscribe/catch-up).
    * Each is compiled full-match anchored (`^(?:src)$`) and screened for catastrophic backtracking,
-   * and the collection is capped at {@link MAX_POST_TOPICS} — the screen bounds what ONE source can
+   * and the collection is capped at `MAX_POST_TOPICS` — the screen bounds what ONE source can
    * spend, and {@link has} runs every one of them against the same caller-supplied topic. Config
    * validation rejects all three classes first; the constructor throws if one reaches here —
    * `SyntaxError` for an uncompilable source, {@link UnsafePatternError} for an unsafe one, and a

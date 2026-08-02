@@ -62,6 +62,30 @@ function hostnameOf(value: string): string {
   return hostname.toLowerCase();
 }
 
+/**
+ * An `allowedHosts` entry: an optional scheme, a bracketed IPv6 literal or a reg-name/IPv4, an
+ * optional port, and nothing else.
+ */
+const HOST_ENTRY = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::\d+)?$/;
+
+/**
+ * Refuse a gate entry {@link hostnameOf} cannot turn into the host it names. That parser splits an
+ * unbracketed value on `:`, so `::1` collapses to the empty string and `fe80::1%eth0` to `fe80` —
+ * and a collapsed entry moves BOTH halves of the gate the wrong way: the operator's own client is
+ * 403'd forever, while an entry that collapses to nothing joins the allow set, where a request
+ * carrying no `Host` header at all matches it. Refusing at construction is the only place either
+ * half is visible; at request time both look like an ordinary decision.
+ */
+function assertNamesAHost(entry: string): void {
+  if (!HOST_ENTRY.test(entry))
+    throw new RangeError(
+      `allowedHosts entry ${JSON.stringify(entry)} does not name a host. Write a hostname or ` +
+        'address with an optional scheme and port, and put an IPv6 literal in brackets ' +
+        '(e.g. "parley.internal", "parley.internal:8443", "[::1]") — anything else is parsed ' +
+        'into a value no request can match, which locks out the host it was meant to admit.',
+    );
+}
+
 export interface RemoteHttpOptions {
   /** Middleware protecting the /mcp route (e.g. requireBearerAuth). Default: FAIL CLOSED (401). */
   protect?: RequestHandler;
@@ -121,6 +145,7 @@ export function createRemoteHttpApp(
   const allowedHosts =
     opts.allowedHosts ?? (opts.insecureNoAuth === true && opts.protect === undefined ? LOOPBACK_HOSTS : undefined);
   if (allowedHosts !== undefined) {
+    for (const entry of allowedHosts) assertNamesAHost(entry);
     const allowed = new Set(allowedHosts.map((h) => hostnameOf(h)));
     // Keep this ahead of configureApp, so that the OAuth consent/authorize routes are covered too.
     app.use((req, res, next) => {

@@ -16,8 +16,14 @@ export interface ClientState {
 }
 
 /**
- * An idle registration first, then one holding nothing but a consent nobody has approved yet. Only
- * owner-approved state is unevictable, and `undefined` means every registration holds some.
+ * An idle registration first, then the MOST RECENT one holding nothing but a consent nobody has
+ * approved yet. Only owner-approved state is unevictable, and `undefined` means every registration
+ * holds some.
+ *
+ * Keep the second pass reading from the NEWEST end, so that a flood leaving every registration
+ * holding anonymous-tier state cannot take the owner's: a pending consent is `ownerApproved: false`
+ * by design, so a first-match scan returns the owner's registration — necessarily the oldest — and
+ * deleting it invalidates the consent page they are looking at while they type the passphrase.
  */
 export function evictionCandidate(
   clientIds: Iterable<string>,
@@ -30,16 +36,22 @@ export function evictionCandidate(
   const anyState = holders(() => true);
   const approved = holders((state) => state.ownerApproved);
   const ids = [...clientIds];
-  return ids.find((id) => !anyState.has(id)) ?? ids.find((id) => !approved.has(id));
+  return ids.find((id) => !anyState.has(id)) ?? [...ids].reverse().find((id) => !approved.has(id));
 }
 
 /**
  * Drop entries until the map is within `max`, always taking the OLDEST entry of whichever client
- * holds the MOST, and falling back to plain oldest-first among clients holding equally many. Keep
- * the per-client tier, so that one caller filling the map with its own entries can never displace an
+ * holds the MOST, and breaking a tie toward the client whose entries are the MOST RECENT. Keep the
+ * per-client tier, so that one caller filling the map with its own entries can never displace an
  * entry belonging to a different client — for `pending`, undifferentiated FIFO shedding IS the
- * lockout the shed-don't-refuse policy above exists to prevent. A Map iterates in insertion order,
- * so the first key seen for a client is its oldest, and a strict `>` keeps ties on that order.
+ * lockout the shed-don't-refuse policy above exists to prevent.
+ *
+ * A Map iterates in insertion order, so the first key seen for a client is its oldest. Keep the tie
+ * break pointing at the NEWEST client, so that a flood spending one fresh client_id per entry — which
+ * leaves nobody crowdedest and collapses the tier — cannot degenerate into plain oldest-first and
+ * take the owner's entry, which is always the oldest one there is. `>=` against a count read live
+ * gives that: the last client to reach the maximum wins. The caller must shed BEFORE inserting, so
+ * that the arriving entry is never the victim chosen to make room for it.
  */
 export function shedCrowdedest<V>(
   map: Map<string, V>,
@@ -55,7 +67,7 @@ export function shedCrowdedest<V>(
       if (!oldestOf.has(client)) oldestOf.set(client, key);
       const n = (held.get(client) ?? 0) + 1;
       held.set(client, n);
-      if (n > (held.get(crowdedest) ?? 0)) crowdedest = client;
+      if (n >= (held.get(crowdedest) ?? 0)) crowdedest = client;
     }
     const victim = oldestOf.get(crowdedest);
     if (victim === undefined) return;

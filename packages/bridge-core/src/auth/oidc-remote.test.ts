@@ -2,6 +2,7 @@ import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { OAuthMetadataSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig, type OidcAuthConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -118,6 +119,33 @@ describe('remote OIDC front door (delegated resource server)', () => {
     const as = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
     expect(as.issuer).toBe(idp.issuer);
     expect(as.token_endpoint).toBe(`${idp.issuer}/token`);
+  });
+
+  /**
+   * A mirror is only useful if it is complete for what it claims to mirror. Parsing the IdP's
+   * document through a strict schema STRIPPED `revocation_endpoint` and `introspection_endpoint`
+   * before the mirror was built, so a pre-RFC-9728 client discovering the AS through Parley's
+   * origin had no revocation endpoint to call — and no way to tell truncation from absence, which
+   * is what makes a lossy mirror worse than none.
+   *
+   * Grade it by SET DIFFERENCE over the RFC 8414 field names, read out of the SDK's own schema, so
+   * the assertion covers every field the standard defines rather than the two a spot check names.
+   */
+  it('mirrors every RFC 8414 field the IdP publishes, not the subset one schema names', async () => {
+    await boot();
+    const published = await jget(await fetch(`${idp.issuer}/.well-known/openid-configuration`));
+    const mirrored = await jget(await fetch(`${origin}/.well-known/oauth-authorization-server`));
+
+    const rfc8414 = Object.keys(OAuthMetadataSchema.shape);
+    const expected = rfc8414.filter((key) => published[key] !== undefined);
+    // The fake IdP has to publish more than the required minimum, or this grades nothing.
+    expect(expected).toContain('revocation_endpoint');
+    expect(expected).toContain('introspection_endpoint');
+    expect(expected.length).toBeGreaterThan(8);
+
+    const dropped = expected.filter((key) => mirrored[key] === undefined);
+    expect(dropped, 'fields the IdP advertises that Parley silently drops from its mirror').toEqual([]);
+    for (const key of expected) expect([key, mirrored[key]]).toEqual([key, published[key]]);
   });
 
   it('hosts no local AS endpoints (/register and /authorize are 404)', async () => {

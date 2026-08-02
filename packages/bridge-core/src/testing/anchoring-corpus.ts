@@ -1,3 +1,6 @@
+import { MAX_TOPIC_LEN } from '../engine/presence-beat.js';
+import { MAX_MATCH_INPUT } from '../regex-safety.js';
+
 /**
  * The ONE corpus of (pattern source, candidate topic, is-a-full-match) rows every site that compiles
  * a regex source it did not author is graded against.
@@ -30,3 +33,34 @@ export const ANCHORING_CASES: readonly (readonly [
   ['an empty alternation branch does not match arbitrary text', 'a|', 'zz', false],
   ['match-everything really does match everything', '.*', 'anything-at-all', true],
 ] as const;
+
+/**
+ * The INPUT-LENGTH axis of the same rule, kept separate so the membership pin above still grades
+ * the hand-written rows by value.
+ *
+ * Every row above is comfortably under {@link MAX_MATCH_INPUT}, so the sites were graded only
+ * inside the region they happened to agree in: one refused an over-long topic outright while the
+ * other matched its 64-character PREFIX, and `parley_list_users` reported peers as reachable on
+ * topics they could not post to. The config schema accepts a topic far longer than that, so the
+ * disagreeing region is reachable by an ordinary deployment, not only by an attacker.
+ *
+ * Every source here matches its input at EVERY length listed, so the verdict is decided by the
+ * length rule alone: a site that clamps instead of refusing answers the boundary differently rather
+ * than answering a case nobody sampled.
+ */
+export const ANCHORING_LENGTH_CASES: readonly (readonly [
+  label: string,
+  source: string,
+  input: string,
+  fullMatch: boolean,
+])[] = ['.*', 'ops-.*', '[a-z0-9-]+'].flatMap((source) =>
+  [4, MAX_MATCH_INPUT - 1, MAX_MATCH_INPUT, MAX_MATCH_INPUT + 1, MAX_TOPIC_LEN].map(
+    (length) =>
+      [
+        `${source} against a ${length}-character topic`,
+        source,
+        `ops-${'a'.repeat(length - 4)}`,
+        length <= MAX_MATCH_INPUT,
+      ] as const,
+  ),
+);

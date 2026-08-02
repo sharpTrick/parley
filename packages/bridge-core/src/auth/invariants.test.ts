@@ -3,6 +3,7 @@ import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
+import { OidcAuthSchema } from '../config-auth.js';
 import { parseConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
@@ -193,9 +194,47 @@ const OIDC_VALUE_ROWS: OidcValueRow[] = [
   ),
   { key: 'clock_skew_s', value: 0, outcome: 'boots' },
   { key: 'clock_skew_s', value: 300, outcome: 'boots' },
+  ...['', ' ', '\t', 'a b'].map(
+    (value): OidcValueRow => ({
+      key: 'required_scope',
+      value,
+      outcome: { refuses: /required_scope must be a single non-blank scope token/ },
+    }),
+  ),
+  { key: 'required_scope', value: 'mcp', outcome: 'boots' },
+  ...['', '   ', 'not-a-url'].map(
+    (value): OidcValueRow => ({
+      key: 'issuer',
+      value,
+      outcome: { refuses: /issuer must be an absolute URL/ },
+    }),
+  ),
+  ...['', '   '].map(
+    (value): OidcValueRow => ({
+      key: 'jwks_uri',
+      value,
+      outcome: { refuses: /jwks_uri must be an absolute URL/ },
+    }),
+  ),
 ];
 
 describe('a factory check that mirrors a schema rule must mirror all of it', () => {
+  /**
+   * Derive the key set from the schema rather than hand-enumerating it. Five of the block's eight
+   * keys had rows and three did not, and `required_scope` was the one whose schema rule (`min(1)`)
+   * accepts a value — whitespace — that the verifier can never match: the resource server booted
+   * healthy, advertised the blank scope in its metadata, and 403'd every valid token. A key with no
+   * degenerate-value row is a hole that reads as coverage, so make it a red row instead.
+   */
+  it('has a degenerate-value row for every key the oidc schema declares', () => {
+    const declared = Object.keys(OidcAuthSchema.shape);
+    expect(declared.length).toBeGreaterThan(5);
+    // A key present only through a value that BOOTS is a key nobody grades: `required_scope` would
+    // have satisfied a membership-only check with its one working value while whitespace shipped.
+    const refuted = OIDC_VALUE_ROWS.filter((r) => r.outcome !== 'boots').map((r) => r.key);
+    expect([...new Set(refuted)].sort()).toEqual([...declared].sort());
+  });
+
   it.each(
     OIDC_VALUE_ROWS.map((row): [string, OidcValueRow] => [
       `${row.key}: ${typeof row.value === 'number' ? String(row.value) : JSON.stringify(row.value)} ${

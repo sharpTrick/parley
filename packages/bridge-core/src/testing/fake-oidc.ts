@@ -51,17 +51,30 @@ export async function startFakeOidc(): Promise<FakeOidc> {
 
   const app = express();
   let issuer = ''; // known once listening
+  // The stock-Keycloak field set, not the minimum the SDK schema demands: the AS-metadata mirror
+  // Parley republishes is only as good as what survives parsing, and a document carrying nothing
+  // beyond the required fields cannot show a field being dropped.
   app.get('/.well-known/openid-configuration', (_req, res) => {
     res.json({
       issuer,
       authorization_endpoint: `${issuer}/authorize`,
       token_endpoint: `${issuer}/token`,
       jwks_uri: `${issuer}/jwks`,
+      userinfo_endpoint: `${issuer}/userinfo`,
+      registration_endpoint: `${issuer}/clients-registrations/openid-connect`,
+      revocation_endpoint: `${issuer}/revoke`,
+      revocation_endpoint_auth_methods_supported: ['client_secret_basic', 'none'],
+      introspection_endpoint: `${issuer}/token/introspect`,
+      introspection_endpoint_auth_methods_supported: ['client_secret_basic'],
+      end_session_endpoint: `${issuer}/logout`,
       response_types_supported: ['code'],
+      response_modes_supported: ['query', 'fragment'],
       subject_types_supported: ['public'],
       id_token_signing_alg_values_supported: ['RS256'],
+      token_endpoint_auth_methods_supported: ['client_secret_basic', 'none'],
       code_challenge_methods_supported: ['S256'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
+      scopes_supported: ['openid', 'profile', 'email', 'mcp'],
     });
   });
   app.get('/jwks', (_req, res) => {

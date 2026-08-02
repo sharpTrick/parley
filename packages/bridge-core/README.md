@@ -29,8 +29,10 @@ A conforming backend guarantees two things (checked by `@sharptrick/parley-confo
 2. **monotonic, in-order, exclusive-`since` cursor delivery** — `fetchRecent` returns messages
    pre-sorted ascending and `subscribe`'s handler fires in ascending order per topic.
 
-`cursor` and `backendMsgId` are opaque strings — core never parses or compares them. `timestamp`
-is informational only; ordering and dedup never use it.
+`cursor` and `backendMsgId` are opaque strings — core never parses one and never orders by one. It
+does compare two for byte equality: `backendMsgId` is the dedup key, and two cursors are compared
+as the no-progress brake in `catchUpTopic`. A cursor naming a position must therefore be
+byte-stable across calls. `timestamp` is informational only; ordering and dedup never use it.
 
 ## What this package builds
 

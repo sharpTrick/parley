@@ -199,6 +199,34 @@ describe('config loader', () => {
     ).toThrow();
   });
 
+  /**
+   * The schema is the earlier, better-located half of the same rule the factory restates. A scope
+   * TOKEN is `1*NQCHAR` and the verifier matches it against `scope.split(' ')`, so `min(1)` let a
+   * whitespace value load cleanly and then 403 every valid token; grade both directions of the
+   * value space, not only the one that reads as a mistake.
+   */
+  it.each([
+    ['', false],
+    [' ', false],
+    ['\t', false],
+    ['mcp ', false],
+    ['read write', false],
+    ['mcp', true],
+    ['parley:read', true],
+  ])('auth.oidc.required_scope %j is accepted: %s', (required_scope, accepted) => {
+    const build = (): unknown =>
+      parseConfig({
+        identity: { handle: 'h' },
+        topics: ['a'],
+        auth: {
+          mode: 'oidc',
+          oidc: { issuer: 'https://kc.example.com/realms/x', allowed_subjects: ['s'], required_scope },
+        },
+      });
+    if (accepted) expect(build).not.toThrow();
+    else expect(build).toThrow(/required_scope must be a single non-blank scope token/);
+  });
+
   it('rejects an oidc block with no identity gate (fail-closed)', () => {
     const base = { identity: { handle: 'h' }, topics: ['a'] };
     const issuer = 'https://kc.example.com/realms/x';

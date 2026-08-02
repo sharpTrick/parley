@@ -3,9 +3,10 @@ import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.
 
 /**
  * Backend shapes the seam does NOT forbid but a conformant plugin never produces: a cursor that
- * stands still or walks backwards, a page longer than the requested `limit`, an empty page carrying
- * a brand-new cursor, and a history API that caps its page below the `limit` it was asked for
- * (Discord's 100-message ceiling, Telegram, Matrix `/messages`).
+ * stands still or walks backwards, a cursor re-serialised differently each call, a page longer than
+ * the requested `limit`, an empty page carrying a brand-new cursor, and a history API that caps its
+ * page below the `limit` it was asked for (Discord's 100-message ceiling, Telegram, Matrix
+ * `/messages`).
  *
  * Core's page-driven loops are the only thing standing between these and a bridge that never
  * finishes starting up, so every driver that pages must be run against ALL of them, not against the
@@ -52,6 +53,14 @@ export const NONCONFORMANT_SHAPES: Record<string, NonconformantShape> = {
   'a full page whose cursor never advances': {
     serve: (a) => ({ messages: [row(a.topic, 1), row(a.topic, 2)], nextCursor: asCursor('stuck') }),
   },
+  'a full page whose cursor names one position but is spelled differently each call': {
+    serve: (a, call) => ({
+      messages: [row(a.topic, 1), row(a.topic, 2)],
+      nextCursor: asCursor(
+        JSON.stringify(call % 2 === 0 ? { seq: 2, topic: a.topic } : { topic: a.topic, seq: 2 }),
+      ),
+    }),
+  },
   'a cursor that walks backwards, then forwards again': {
     serve: (a, call) => ({
       messages: [row(a.topic, 1), row(a.topic, 2)],
@@ -61,6 +70,12 @@ export const NONCONFORMANT_SHAPES: Record<string, NonconformantShape> = {
   'a page LONGER than the requested limit': {
     serve: (a) => window(a, (a.limit ?? 100) + 5, 12),
     drains: 12,
+  },
+  // Sized past every server-side cap core applies to a page (the fetch limit, the per-topic dedup
+  // window), so that a shape meant to probe them can actually reach them.
+  'a page longer than every server-side cap': {
+    serve: (a) => window(a, 6_000, 6_000),
+    drains: 6_000,
   },
   'an empty page carrying a fresh cursor every call': {
     serve: (a, call) => ({ messages: [], nextCursor: asCursor(`fresh-${call}`) }),

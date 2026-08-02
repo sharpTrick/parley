@@ -185,13 +185,16 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       params.scopes === undefined ? params : { ...params, scopes: namedScopes(params.scopes) };
     assertScopes(consented.scopes, this.opts.scopesSupported);
     const consentId = randomUUID();
+    // Make room BEFORE inserting, so that the arriving consent is never the entry shed to fit it:
+    // once every client holds one, the shed's tie break points at the newest, and that would be
+    // this one — a consent page rendered against an id that has already been dropped.
+    shedCrowdedest(this.pending, MAX_PENDING - 1, (p) => p.client.client_id);
     this.pending.set(consentId, {
       client,
       params: consented,
       redirectUriSupplied: redirectUriWasSupplied(res),
       expiresAtMs: this.now() + CONSENT_TTL_MS,
     });
-    shedCrowdedest(this.pending, MAX_PENDING, (p) => p.client.client_id);
     const page = renderConsentPage(consentId, client, consented, this.opts.consentPath);
     res.status(200).type('html').send(page);
   }

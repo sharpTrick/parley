@@ -476,6 +476,105 @@ describe('parley_list_users bounds the roster it hands the agent', () => {
 });
 
 /**
+ * `truncated` is a disjunction of three independent causes the tool description names, and the
+ * cases above happen to drive two of them: the roster-entry cap was set by nothing at all, so
+ * deleting that clause — or making it the dead `> MAX_ROSTER_ENTRIES`, since computeRoster slices to
+ * exactly that length — left the whole suite green while 127 handles were dropped and the agent was
+ * told the roster was complete.
+ *
+ * So table the flag BY CAUSE, one row per cause plus a control, each constructed so exactly one is
+ * active — and assert the two inactive ones really are inactive, or a row where two coincide passes
+ * for the wrong reason. The description is graded off the same table, so a fourth cause added to the
+ * sentence without a row here fails rather than reading as coverage.
+ */
+describe('every cause of a truncated roster is disclosed, and only when it applies', () => {
+  const NOW = 3_000_000;
+
+  interface Cause {
+    /** The phrase the tool description uses for this cause. */
+    phrase: string;
+    beats: number;
+    distinctHandles: number;
+    limit?: number;
+    truncated: boolean;
+  }
+
+  const CAUSES: Record<string, Cause> = {
+    'the scanned presence history was full': {
+      phrase: 'the scanned presence history was full',
+      beats: PRESENCE_FETCH_LIMIT,
+      distinctHandles: 3,
+      truncated: true,
+    },
+    'the roster hit its entry cap': {
+      phrase: 'the roster hit its entry cap',
+      beats: MAX_ROSTER_ENTRIES + 2,
+      distinctHandles: MAX_ROSTER_ENTRIES + 2,
+      truncated: true,
+    },
+    '`limit` trimmed it': {
+      phrase: '`limit` trimmed it',
+      beats: 3,
+      distinctHandles: 3,
+      limit: 2,
+      truncated: true,
+    },
+    'none of them': { phrase: '', beats: 3, distinctHandles: 3, truncated: false },
+  };
+
+  /**
+   * `beats` presence messages from `distinctHandles` handles, of which only the first three sit on
+   * a topic this bridge shares — so the roster fills while the reachable answer stays small, and
+   * `limit` cannot be what cut it. Reachable peers beat LAST so the roster-cap slice keeps them.
+   */
+  async function serveBeats(plugin: FakePlugin, cause: Cause): Promise<void> {
+    const reachable = Math.min(3, cause.distinctHandles);
+    for (let i = 0; i < cause.beats; i++) {
+      const handle = `peer-${i % cause.distinctHandles}`;
+      const shared = i % cause.distinctHandles < reachable;
+      await postBeat(
+        plugin,
+        handle,
+        [shared ? 'ctx' : 'their-own-topic'],
+        'heartbeat',
+        NOW - (cause.beats - i),
+        [],
+        `inst-${i % cause.distinctHandles}`,
+      );
+    }
+  }
+
+  it.each(Object.entries(CAUSES))('%s', async (_label, cause) => {
+    const { client, plugin } = await harness({ topics: ['ctx'], now: () => NOW });
+    await serveBeats(plugin, cause);
+    const out = parse(
+      await client.callTool({
+        name: 'parley_list_users',
+        arguments: cause.limit === undefined ? {} : { limit: cause.limit },
+      }),
+    ) as RosterResult;
+
+    // Exactly one cause is live in this row — assert the other two are not, so a coincidence
+    // cannot stand in for the clause the row is here to grade.
+    expect(cause.beats >= PRESENCE_FETCH_LIMIT).toBe(cause.phrase === 'the scanned presence history was full');
+    expect(cause.distinctHandles >= MAX_ROSTER_ENTRIES).toBe(cause.phrase === 'the roster hit its entry cap');
+    expect(out.users.length === (cause.limit ?? DEFAULT_ROSTER_LIMIT)).toBe(cause.phrase === '`limit` trimmed it');
+    expect(out.users.length).toBeGreaterThan(0);
+    expect(out.truncated).toBe(cause.truncated);
+  });
+
+  it('the description names these causes and no others', async () => {
+    const { client } = await harness();
+    const { tools } = await client.listTools();
+    const description = tools.find((t) => t.name === 'parley_list_users')!.description!;
+    const named = /truncated=true \(?when the answer was cut — (.*?) — so peers may be missing/
+      .exec(description)?.[1]
+      ?.split(/,\s*(?:or\s+)?/);
+    expect(named).toEqual(Object.values(CAUSES).map((c) => c.phrase).filter((p) => p !== ''));
+  });
+});
+
+/**
  * `limit` is a maximum the seam only ASKS for — a plugin may hand back more, and
  * `testing/nonconformant.ts` models exactly that shape. The roster's own caps bound what the AGENT
  * sees, so an over-long page costs nothing visible: it is paid entirely in decode work, one

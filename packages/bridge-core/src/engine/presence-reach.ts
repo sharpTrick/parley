@@ -52,10 +52,11 @@ function budget(): <T>(work: () => T) => T | undefined {
 /**
  * The peer-pattern matcher for ONE {@link filterReachable} call. Keep the compile full-match
  * anchored (`^(?:src)$`, mirroring the Allowlist), so that a peer advertising `ops` cannot reach
- * `my-ops-secret`. Input is clamped to a bounded prefix because our topic names are short, which
- * keeps even a screened, low-degree match cheap. Past the deadline a peer is simply not matched BY
- * PATTERN — it still surfaces on a topic it explicitly advertises, so the degradation drops reach,
- * never safety.
+ * `my-ops-secret`. Keep an over-long input REFUSED rather than truncated, mirroring
+ * `Allowlist.has`, so that one rule answered two ways cannot report a peer as reachable on a topic
+ * the allowlist at either end will not pattern-match — the agent would hand off into silence. Past
+ * the deadline a peer is simply not matched BY PATTERN — it still surfaces on a topic it explicitly
+ * advertises, so the degradation drops reach, never safety.
  */
 function peerReach(): (sources: readonly string[], input: string) => boolean {
   const spend = budget();
@@ -75,11 +76,11 @@ function peerReach(): (sources: readonly string[], input: string) => boolean {
     return re;
   };
   return (sources, input) => {
-    const bounded = input.length > MAX_MATCH_INPUT ? input.slice(0, MAX_MATCH_INPUT) : input;
+    if (input.length > MAX_MATCH_INPUT) return false;
     for (const src of sources) {
       const hit = spend(() => {
         const re = compile(src);
-        return re !== null && re.test(bounded);
+        return re !== null && re.test(input);
       });
       if (hit === undefined) return false;
       if (hit) return true;
