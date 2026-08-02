@@ -216,3 +216,120 @@ export function guardedRegions(body: string): { field: string; region: string }[
   }
   return out;
 }
+
+/** A wall-clock budget the suite sets for itself; `ms` is null when its initializer names no figure. */
+export interface SelfImposedBudget {
+  what: string;
+  initializer: string;
+  ms: number | null;
+  declaration: boolean;
+}
+
+/** An arithmetic expression starting at {@link from}, to the first character that cannot be part of one. */
+function expressionAt(text: string, from: number): string {
+  let depth = 0;
+  let i = from;
+  for (; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (ch === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) break;
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0 && !/[\w$.\s*/+-]/.test(ch)) break;
+  }
+  return text.slice(from, i).trim();
+}
+
+/**
+ * What an initializer resolves to, or null when it is not arithmetic over {@link known} — never a
+ * prefix of it. A scanner that reads the first literal of `90 * 1000` reports 90, so a budget four
+ * times the harness timeout passes the row that exists to forbid one, and the diagnostic the budget
+ * pays for is dead code.
+ */
+function evaluate(expr: string, known: Record<string, number>): number | null {
+  const tokens = expr.match(/[A-Za-z_$][\w$]*|\d[\d_]*(?:\.\d+)?|[-+*/()]/g) ?? [];
+  if (tokens.join('') !== expr.replace(/\s+/g, '')) return null;
+  let at = 0;
+  function primary(): number | null {
+    const token = tokens[at++];
+    if (token === undefined) return null;
+    if (token === '(') {
+      const inner = sum();
+      return tokens[at++] === ')' ? inner : null;
+    }
+    if (token === '-') {
+      const operand = primary();
+      return operand === null ? null : -operand;
+    }
+    if (/^\d/.test(token)) return Number(token.replaceAll('_', ''));
+    return known[token] ?? null;
+  }
+  function product(): number | null {
+    let value = primary();
+    while (value !== null && (tokens[at] === '*' || tokens[at] === '/')) {
+      const operator = tokens[at++];
+      const operand = primary();
+      if (operand === null) return null;
+      value = operator === '*' ? value * operand : value / operand;
+    }
+    return value;
+  }
+  function sum(): number | null {
+    let value = product();
+    while (value !== null && (tokens[at] === '+' || tokens[at] === '-')) {
+      const operator = tokens[at++];
+      const operand = product();
+      if (operand === null) return null;
+      value = operator === '+' ? value + operand : value - operand;
+    }
+    return value;
+  }
+  const value = sum();
+  return at === tokens.length && value !== null && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Every numeric binding the source declares, so a budget written as a name resolves to the figure
+ * that name holds. Iterated, because a budget defined from another one is only resolvable once its
+ * dependency is; a name declared twice with different figures is dropped rather than guessed at.
+ */
+function numericBindings(source: string, seed: Record<string, number>): Record<string, number> {
+  const declared = [...source.matchAll(/\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=(?!=)\s*/g)].map(
+    (m) => [m[1] as string, expressionAt(source, m.index + m[0].length)] as const,
+  );
+  const env: Record<string, number> = {};
+  const conflicting = new Set<string>();
+  for (let pass = 0; pass < declared.length && pass < 8; pass++) {
+    for (const [name, init] of declared) {
+      const value = evaluate(init, { ...env, ...seed });
+      if (value === null) continue;
+      if (env[name] !== undefined && env[name] !== value) conflicting.add(name);
+      env[name] = value;
+    }
+  }
+  for (const name of conflicting) delete env[name];
+  return { ...env, ...seed };
+}
+
+const BUDGET_SITE =
+  /(?:\b[A-Za-z_$][\w$]*_MS\s*=(?!=)|(?:timeout|blockMs):|Date\.now\(\)\s*\+)\s*/g;
+
+/**
+ * Every wall-clock budget the source sets for itself, with the figure it actually resolves to. A
+ * budget ABOVE the harness's `testTimeout` can never be reached — vitest kills the case first — so
+ * the figure, not a leading literal, is what has to be compared against it.
+ */
+export function budgetsIn(source: string, known: Record<string, number> = {}): SelfImposedBudget[] {
+  const env = numericBindings(source, known);
+  return [...source.matchAll(BUDGET_SITE)].map((m) => {
+    const site = m[0].trim();
+    const initializer = expressionAt(source, m.index + m[0].length);
+    return {
+      what: `${site} ${initializer}`,
+      initializer,
+      ms: evaluate(initializer, env),
+      declaration: site.endsWith('='),
+    };
+  });
+}

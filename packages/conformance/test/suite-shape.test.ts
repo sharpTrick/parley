@@ -14,11 +14,13 @@ import {
   SINCELESS_RETURN_MS,
 } from '@sharptrick/parley-conformance';
 import {
+  budgetsIn,
   cases,
   casesIn,
   deferredPromises,
   guardedRegions,
   promiseExecutors,
+  type SelfImposedBudget,
   suiteSource as source,
   suiteSources,
 } from './suite-source.js';
@@ -31,25 +33,28 @@ function testTimeoutMs(): number {
   return Number((found ?? '').replaceAll('_', ''));
 }
 
+/** The budgets exported as figures, so a budget written as a name grades as the figure it holds. */
+const EXPORTED_BUDGETS: Record<string, number> = {
+  IDLE_BLOCK_FLOOR_MS,
+  IDLE_BLOCK_MS,
+  SINCELESS_BLOCK_MS,
+  SINCELESS_RETURN_MS,
+};
+
 /**
- * Every wall-clock budget the suite sets for itself, as `[what, ms]`. A budget ABOVE the harness's
- * `testTimeout` can never be reached: vitest kills the case first, so the carefully-worded
- * diagnostic the budget exists to produce is dead code and the operator gets a generic timeout.
+ * Every wall-clock budget the suite sets for itself. A budget ABOVE the harness's `testTimeout` can
+ * never be reached: vitest kills the case first, so the carefully-worded diagnostic the budget
+ * exists to produce is dead code and the operator gets a generic timeout.
  */
-function selfImposedBudgets(): [string, number][] {
-  const out: [string, number][] = [];
-  const patterns = [
-    /(?:timeout|blockMs):\s*([\d_]+)/g,
-    /_MS\s*=\s*([\d_]+)/g,
-    /Date\.now\(\)\s*\+\s*([\d_]+)/g,
-  ];
-  for (const pattern of patterns) {
-    for (const m of source.matchAll(pattern)) {
-      out.push([m[0] as string, Number((m[1] as string).replaceAll('_', ''))]);
-    }
-  }
-  return out;
-}
+const selfImposedBudgets = (): SelfImposedBudget[] => budgetsIn(source, EXPORTED_BUDGETS);
+
+/**
+ * A budget handed in from elsewhere — a parameter, graded where the figure is declared. A
+ * DECLARATION is never that: its initializer is the whole story, so one that names no figure is a
+ * budget nothing grades rather than one graded somewhere else.
+ */
+const isForwarded = (b: SelfImposedBudget): boolean =>
+  !b.declaration && /^[A-Za-z_$][\w$]*$/.test(b.initializer);
 
 const SKIP_SPELLINGS = [
   /\btestCtx\.skip\(\)/,
@@ -260,14 +265,8 @@ describe('the suite grades every backend it certifies', () => {
    * forbids the degenerate bound, the control forbids a merely lenient one.
    */
   describe('no elapsed-time bound is the budget that produced it', () => {
-    const EXPORTED: Record<string, number> = {
-      IDLE_BLOCK_FLOOR_MS,
-      IDLE_BLOCK_MS,
-      SINCELESS_BLOCK_MS,
-      SINCELESS_RETURN_MS,
-    };
     const figure = (token: string): number =>
-      EXPORTED[token] ?? Number(token.replaceAll('_', ''));
+      EXPORTED_BUDGETS[token] ?? Number(token.replaceAll('_', ''));
 
     const budgetsOf = (body: string): string[] =>
       [...body.matchAll(/blockMs:\s*([A-Za-z_][\w]*|[\d_]+)/g)].map((m) => m[1] as string);
@@ -486,11 +485,58 @@ describe('the suite grades every backend it certifies', () => {
   it('reads a testTimeout out of the harness config, so the budget rows below grade something', () => {
     expect(testTimeoutMs()).toBeGreaterThan(0);
     expect(selfImposedBudgets().length).toBeGreaterThan(3);
+    expect(
+      selfImposedBudgets()
+        .filter((b) => b.ms === null && !isForwarded(b))
+        .map((b) => b.what),
+      'a budget whose initializer resolves to no figure is graded by no row below',
+    ).toEqual([]);
   });
 
-  it.each(selfImposedBudgets())('keeps the budget `%s` under the harness timeout', (_what, ms) => {
-    expect(ms).toBeLessThan(testTimeoutMs());
+  /**
+   * The scanner's own figures, against the spellings a budget can take. Reading only the leading
+   * literal of an initializer graded `90 * 1000` as 90 — under the 20 s timeout, so a budget 4.5x
+   * it passed the row that exists to forbid exactly that — and made a budget written as a name no
+   * row at all. Each row asserts the FIGURE, so a scanner that reports *something* is not enough.
+   */
+  it.each([
+    ['a bare literal', 'const A_MS = 15_000;', [15_000]],
+    ['a literal without separators', 'const A_MS = 90000;', [90_000]],
+    ['a product', 'const A_MS = 90 * 1000;', [90_000]],
+    ['a sum', 'const A_MS = 20_000 + 500;', [20_500]],
+    [
+      'a fraction of an exported budget',
+      'const A_MS = SINCELESS_BLOCK_MS * (2 / 3);',
+      [SINCELESS_BLOCK_MS * (2 / 3)],
+    ],
+    ['a budget defined from its neighbour', 'const A_MS = 4_000;\nconst B_MS = A_MS * 3;', [4_000, 12_000]],
+    ['an inline literal budget', 'p.fetchRecent({ topic: t, blockMs: 5_000 });', [5_000]],
+    ['an inline budget written as a name', 'p.fetchRecent({ topic: t, blockMs: IDLE_BLOCK_MS });', [IDLE_BLOCK_MS]],
+    ['a deadline computed from a budget', 'const end = Date.now() + SINCELESS_BLOCK_MS;', [SINCELESS_BLOCK_MS]],
+    ['a budget it cannot resolve, as no figure rather than a prefix', 'const A_MS = fromEnv() * 1000;', [null]],
+  ])('reads %s', (_label, planted, figures) => {
+    expect(budgetsIn(planted, EXPORTED_BUDGETS).map((b) => b.ms)).toEqual(figures);
   });
+
+  // A declaration naming no figure must not borrow the exemption a handed-in one has.
+  it('exempts a budget handed in from elsewhere, never a declaration that names no figure', () => {
+    const [handedIn] = budgetsIn('p.fetchRecent({ topic: t, blockMs: within });');
+    const [declared] = budgetsIn('const A_MS = whateverTheEnvSays;');
+    expect([(handedIn as SelfImposedBudget).ms, (declared as SelfImposedBudget).ms]).toEqual([null, null]);
+    expect(isForwarded(handedIn as SelfImposedBudget)).toBe(true);
+    expect(isForwarded(declared as SelfImposedBudget)).toBe(false);
+  });
+
+  it.each(
+    selfImposedBudgets()
+      .filter((b) => b.ms !== null || !isForwarded(b))
+      .map((b) => [b.what, b.ms] as const),
+  )(
+    'keeps the budget `%s` under the harness timeout',
+    (_what, ms) => {
+      expect(ms ?? Number.POSITIVE_INFINITY).toBeLessThan(testTimeoutMs());
+    },
+  );
 
   // The teardown must not dereference the binding the CASES use: that binding is assigned only
   // after validation, so an `await ctx.cleanup()` in `afterEach` throws a TypeError on exactly the

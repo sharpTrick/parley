@@ -347,3 +347,136 @@ describe('every test source in the repo is inside a tsconfig some CI step compil
     });
   });
 });
+
+const WORKFLOWS = fileURLToPath(new URL('../../../.github/workflows/', import.meta.url));
+
+/** A workflow's `on:` block, without the top-level keys that follow it. */
+function triggersOf(workflow: string): string {
+  const at = workflow.search(/^on:/m);
+  if (at < 0) return '';
+  const rest = workflow.slice(at + 'on:'.length);
+  const end = rest.search(/^[a-z]/m);
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
+/** A workflow's jobs as `[name, body]`, split on the keys one level under `jobs:`. */
+function jobsOf(workflow: string): [string, string][] {
+  const at = workflow.search(/^jobs:/m);
+  if (at < 0) return [];
+  const body = workflow.slice(at);
+  const heads = [...body.matchAll(/^ {2}([\w-]+):$/gm)];
+  return heads.map((m, i) => [
+    m[1] as string,
+    body.slice(m.index, i + 1 < heads.length ? (heads[i + 1] as RegExpMatchArray).index : body.length),
+  ]);
+}
+
+/**
+ * What a job runs, as its single-line `run:` commands AND its step names — both, so that a step
+ * whose command is a block scalar (the no-skip assertion is one) is still something to compare.
+ */
+const stepsOf = (job: string): string[] => [
+  ...[...job.matchAll(/^[ \t]*-?[ \t]*run:[ \t]*(?!\|)(\S.*)$/gm)].map((m) => (m[1] as string).trim()),
+  ...[...job.matchAll(/^[ \t]*-[ \t]*name:[ \t]*(\S.*)$/gm)].map((m) => (m[1] as string).trim()),
+];
+
+/** The gate a workflow applies: the steps of whichever job runs the suite. */
+function testGateOf(workflow: string): string[] {
+  const job = jobsOf(workflow).find(([, body]) => /^[ \t]*-?[ \t]*run:[ \t]*npm test\b/m.test(body));
+  return job === undefined ? [] : stepsOf(job[1]);
+}
+
+/** Read off the steps a job RUNS, so that a workflow merely naming the release is not one. */
+const publishes = (workflow: string): boolean =>
+  jobsOf(workflow).some(([, body]) =>
+    stepsOf(body).some((step) => /semantic-release|npm publish\b|publish-workspaces/.test(step)),
+  );
+
+/** Fires without a human asking — as opposed to a `workflow_dispatch`-only escape hatch. */
+const firesAutomatically = (workflow: string): boolean =>
+  /^ {2}(?:push|schedule|release):/m.test(triggersOf(workflow));
+
+const missingFrom = (reference: string, candidate: string): string[] =>
+  testGateOf(reference).filter((step) => !testGateOf(candidate).includes(step));
+
+/**
+ * A workflow that publishes on its own trigger must run every step the pull-request gate runs.
+ * release.yml claimed in a comment to mirror ci.yml and did not: it omitted both typecheck steps,
+ * so the ~23k lines of test source no compiler sees during `npm test` were graded on the PR and by
+ * nothing on the path that actually publishes — and main is reached by a squash-merge commit ci.yml
+ * never ran against. Nothing in the suite read release.yml, so the divergence was invisible.
+ *
+ * Derived from the workflows themselves rather than from a list here: which workflow is the gate,
+ * which ones publish, and what either runs are all read off disk, so a fourth workflow is a row the
+ * day it lands and neither file's current wording is what is asserted.
+ */
+describe('no workflow publishes on a gate weaker than the pull-request gate', () => {
+  const files = (): string[] => readdirSync(WORKFLOWS).filter((f) => /\.ya?ml$/.test(f)).sort();
+  const read = (file: string): string => readFileSync(join(WORKFLOWS, file), 'utf8');
+
+  const gates = (): string[] =>
+    files().filter((f) => /^ {2}pull_request:?/m.test(triggersOf(read(f))) && testGateOf(read(f)).length > 0);
+  const autoPublishers = (): string[] =>
+    files().filter((f) => publishes(read(f)) && firesAutomatically(read(f)));
+
+  it('finds one pull-request gate and a workflow that publishes unasked, so the rows below grade something', () => {
+    expect(files().length).toBeGreaterThan(2);
+    expect(gates()).toHaveLength(1);
+    const gate = testGateOf(read(gates()[0] as string));
+    expect(gate.length).toBeGreaterThan(4);
+    expect(gate.some((s) => s.startsWith('npm test'))).toBe(true);
+    expect(autoPublishers().length).toBeGreaterThan(0);
+  });
+
+  it.each(autoPublishers().map((f) => [f]))('%s runs every step the pull-request gate runs', (file) => {
+    expect(
+      missingFrom(read(gates()[0] as string), read(file)),
+      `${file} publishes without these steps the pull-request gate runs`,
+    ).toEqual([]);
+  });
+
+  const GATE = [
+    '    steps:',
+    '      - run: npm ci',
+    '      - run: npm run typecheck --workspaces --if-present',
+    '      - name: Assert no test file skipped entirely',
+    '        run: |',
+    '          node -e "1"',
+    '      - run: npm test -- --reporter=default',
+  ];
+  const plantWorkflow = (on: string[], steps: string[]): string =>
+    ['on:', ...on, 'jobs:', '  a-job:', ...steps].join('\n');
+
+  const reference = plantWorkflow(['  pull_request:'], GATE);
+  const weakened = GATE.filter((s) => !s.includes('typecheck'));
+  const onPush = ['  push:', '    branches: [main]'];
+
+  it.each([
+    ['a publisher running every step of it', plantWorkflow(onPush, [...GATE, '      - run: npx semantic-release']), []],
+    [
+      'a publisher missing one',
+      plantWorkflow(onPush, [...weakened, '      - run: npx semantic-release']),
+      ['npm run typecheck --workspaces --if-present'],
+    ],
+    [
+      'a publisher with no gate job at all',
+      plantWorkflow(onPush, ['    steps:', '      - run: npx semantic-release']),
+      testGateOf(reference),
+    ],
+  ])('reports what %s omits', (_label, candidate, missing) => {
+    expect(missingFrom(reference, candidate)).toEqual(missing);
+  });
+
+  // The classification is what selects the rows above, so it is graded rather than assumed: a
+  // dispatch-only escape hatch publishes deliberately and is exempt; the gate itself is not a
+  // publisher and must not be asked to be a superset of itself.
+  it('separates an unasked publisher from the manual escape hatch and from the gate', () => {
+    const manual = plantWorkflow(['  workflow_dispatch:'], [...weakened, '      - run: npx semantic-release']);
+    expect(publishes(manual)).toBe(true);
+    expect(firesAutomatically(manual)).toBe(false);
+    expect(publishes(reference)).toBe(false);
+    expect(firesAutomatically(plantWorkflow(onPush, GATE))).toBe(true);
+    // A workflow that only NAMES the release in a comment does not publish.
+    expect(publishes(`# semantic-release picks the bump\n${reference}`)).toBe(false);
+  });
+});
