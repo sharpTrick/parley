@@ -69,6 +69,7 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
     this.admittedNick = undefined;
     this.identityCollapseReported = false;
     this.mamCheck = undefined;
+    this.unprobedRoomsReported.clear();
 
     const service = cfg.service ?? DEFAULT_SERVICE;
     warnInsecureConfig(service, cfg.password);
@@ -125,6 +126,7 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
     for (const state of this.rejoins.values()) clearTimeout(state.timer);
     this.rejoins.clear();
     this.mamCheck = undefined;
+    this.unprobedRoomsReported.clear();
     // Drop the fields BEFORE awaiting the stop, so that a connect() still bringing `starting` up
     // resumes to find it taken and stops its own client instead of adopting one this call ended.
     const live = this.xmpp ?? this.starting;

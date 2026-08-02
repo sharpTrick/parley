@@ -39,6 +39,8 @@ interface PendingJoin {
 export class XmppRooms extends XmppArchive {
   /** Memoized disco#info probe for the one prerequisite this backend cannot work without. */
   protected mamCheck?: Promise<void>;
+  /** Rooms whose existence probe already failed inconclusively and was reported once. */
+  protected readonly unprobedRoomsReported = new Set<string>();
 
   /** roomJid -> consecutive remote occupancy losses and the deferred re-entry they scheduled. */
   protected readonly rejoins = new Map<
@@ -199,17 +201,42 @@ export class XmppRooms extends XmppArchive {
    * Whether the topic's MUC room already exists. Joining a room auto-CREATES it and then makes it
    * persistent, so keep the READ path behind this check: a wildcard allowlist pattern would otherwise
    * let a caller-supplied topic mint unbounded persistent rooms and archives that nothing reclaims.
-   * An answer other than `item-not-found` is no evidence of absence, so keep that path permissive.
+   *
+   * Only an `<iq type='result'>` is evidence the room is there. Keep every other answer — an IQ that
+   * timed out, `service-unavailable` from a busy MUC, `remote-server-timeout` from an s2s hiccup —
+   * reading as ABSENT, so that a probe this connection could not complete cannot provision the room
+   * it was asking about. The cost is a read that returns an empty page while the probe keeps
+   * failing, which is why {@link reportUnprobedRoom} says so on stderr rather than stalling in
+   * silence.
    */
   protected async roomExists(topic: Topic): Promise<boolean> {
     const room = this.roomJid(topic);
     if (this.joined.has(room)) return true;
+    // Resolve the connection OUTSIDE the catch, so that a read on a plugin that was never connected
+    // still surfaces that as an error rather than being folded into "the room is not there" and
+    // answered with an empty page.
+    const conn = this.require();
     try {
-      await this.require().iqCaller.request(wire.discoInfoIq(room), DISCO_TIMEOUT_MS);
+      await conn.iqCaller.request(wire.discoInfoIq(room), DISCO_TIMEOUT_MS);
       return true;
     } catch (err) {
-      return wire.conditionOf(err) !== 'item-not-found';
+      const condition = wire.conditionOf(err);
+      if (condition !== 'item-not-found') this.reportUnprobedRoom(room, condition);
+      return false;
     }
+  }
+
+  /** Once per room per connection, like {@link XmppConnection.reportStreamError}'s floor: a read is
+   * polled, and one line per poll is a flood rather than a diagnostic. */
+  private reportUnprobedRoom(room: string, condition: string): void {
+    if (this.unprobedRoomsReported.has(room)) return;
+    this.unprobedRoomsReported.add(room);
+    console.error(
+      `[parley-xmpp] could not establish whether ${room} exists (${condition}), so this read ` +
+        'returned an empty page and did NOT enter the room — entering one that is absent creates ' +
+        'it. Catch-up on this topic stays empty until the disco#info probe answers; a post or a ' +
+        'subscribe still enters (and creates) the room.',
+    );
   }
 
   protected ensureJoinedRoom(room: string): Promise<void> {

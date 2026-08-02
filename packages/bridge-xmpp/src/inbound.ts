@@ -71,15 +71,19 @@ export class XmppInbound extends XmppRooms {
     const resource = jid.resourceOf(from);
     const x = stanza.getChild('x', wire.NS_MUC_USER);
     const statuses = (x?.getChildren('status') ?? []).map((s) => s.attrs.code ?? '');
-    const isSelf = resource === this.occupantNick(room) || statuses.includes(wire.STATUS_SELF_PRESENCE);
 
     if (stanza.attrs.type === 'unavailable') {
-      if (isSelf && !statuses.includes(wire.STATUS_NICK_CHANGE)) {
+      // A status code corroborates a presence, it never attributes one: keep occupancy ending only
+      // for a departure NAMING the nick this connection holds in the room, so that a 110 on any
+      // other occupant's cannot end this connection's — after which live push is dead until the
+      // re-join ladder runs out and gives up on the topic entirely.
+      if (resource === this.occupantNick(room) && !statuses.includes(wire.STATUS_NICK_CHANGE)) {
         this.onOccupancyLost(room, wire.occupancyEndReason(statuses, x));
       }
       return;
     }
 
+    const isSelf = resource === this.occupantNick(room) || statuses.includes(wire.STATUS_SELF_PRESENCE);
     const pending = this.pendingJoins.get(room);
     if (stanza.attrs.type === 'error') {
       // Keep an error presence attributed by the nick it names, as the self-presence arm below is,

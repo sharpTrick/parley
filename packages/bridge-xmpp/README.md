@@ -17,7 +17,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | join | `<presence to='room/nick'>` with `<history maxstanzas='0'/>` — no replay; tracked + ensured before post/fetch/subscribe |
 | `post` | `<message type='groupchat'><body/><origin-id id='<uuid>'/></message>`; resolves on the MUC's **reflection**, returning its `<stanza-id by='room' id='…'>` |
 | cursor / backendMsgId | the `<stanza-id>` / MAM archive id (XEP-0359 / XEP-0313) — identical via live push and via catch-up |
-| `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive); no `since` → empty `<before/>` = last page; pages forward up to `limit` |
+| `fetchRecent({since})` | MAM query (`urn:xmpp:mam:2`) with RSM `<after>since</after>` (exclusive), paging forward up to `limit`; no `since` → the most recent `limit`, paging **backwards** with RSM `<before>` from the archive tail. Either way `limit` counts messages the seam carries, not archive rows — a tail made of subject changes or retractions does not shrink the window |
 | `subscribe` | every reflected groupchat `<message>` carrying a room `<stanza-id>` → `handler` (incl. own posts), in archive order |
 | admission | a stanza with **no `<body>`** — a subject change, a correction, a retraction, a chat state — is not a message on either path; an *empty* body is |
 | `resolveIdentity` | name convention: `backendRef` is the MUC nick this connection was last **admitted** under — which is not always the one it asked for, since a nick-locking service rewrites it (status 210) and it is the rewritten name the archive carries. It matches the `senderHandle` of a post made **now, to a room entered under that nick**. Once the nick is settled — pinned by `nick`, taken from the first `post`, or reverted after a `conflict` — **every** handle resolves to it, because one occupant is one sender; before the first `post` it is the fold `post` would apply to this handle (`alice@corp.com` → `alice_corp.com-<hash>`). Occupancy is per room, so a room entered *before* a `conflict` revert keeps the sender it entered under and `backendRef` does not describe it (see "One nick per logical identity") |
@@ -79,9 +79,12 @@ strictly after it when it is not.
   your topics. After a reconnect the plugin re-sends the join presence for every room it had
   entered — subscribed or catch-up-only — so push and post recover without waiting for a timeout.
 - **A read never creates a room.** `post` and `subscribe` join, which auto-creates the room and asks
-  for it to be persistent. `fetch_recent` does not: it probes the room's `disco#info` first and, if the
-  server answers `item-not-found`, returns an **empty page with the caller's own cursor** instead of
-  provisioning anything. Without that, a `post_topics` pattern with a wildcard in it would let an
+  for it to be persistent. `fetch_recent` does not: it probes the room's `disco#info` first and enters
+  the room only if the server positively answers it. `item-not-found` — and equally an answer that
+  settles nothing, such as `service-unavailable`, `remote-server-timeout` or an IQ that never comes
+  back — returns an **empty page with the caller's own cursor** instead of provisioning anything, and
+  says so once per room on stderr. A probe this bridge could not get an answer to is not permission to
+  create the room it was asking about, so catch-up on that topic stays empty until the probe answers. Without that, a `post_topics` pattern with a wildcard in it would let an
   agent mint an unbounded number of persistent rooms and MAM archives on a shared server just by
   reading topic names that do not exist — and nothing here ever destroys one. Operators sharing a MUC
   service with other users should also set `restrict_room_creation` (Prosody) and pre-create the rooms

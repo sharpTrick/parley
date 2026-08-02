@@ -187,7 +187,7 @@ export const discoInfoIq = (room: string): unknown =>
 export const mamQueryIq = (
   room: string,
   queryid: string,
-  opts: { after?: string; lastPage?: boolean; max: number },
+  opts: { after?: string; before?: string; lastPage?: boolean; max: number },
 ): unknown => {
   const rsm: unknown[] = [];
   // Keep the zero cursor '' omitting <after/> entirely, so that "from the beginning" never
@@ -198,7 +198,14 @@ export const mamQueryIq = (
     rsm.push(xml('after', {}, opts.after));
   }
   rsm.push(xml('max', {}, String(opts.max)));
-  if (opts.lastPage === true) rsm.push(xml('before', {}));
+  // An empty <before/> asks for the archive TAIL and <before>id</before> for the page ending just
+  // before `id`. Keep both behind `lastPage`, so that a backwards cursor cannot be serialised into
+  // a forward query, where a server would read it as no window bound at all.
+  if (opts.lastPage === true) {
+    const before = opts.before ?? '';
+    if (before !== '') assertXmlSafe(before, 'catch-up cursor');
+    rsm.push(before === '' ? xml('before', {}) : xml('before', {}, before));
+  }
   return xml(
     'iq',
     { type: 'set', to: room },

@@ -100,37 +100,49 @@ describe('XMPP admits the same archived stanzas via live push and via catch-up',
   });
 });
 
-// Class: a window whose ADMITTED set is empty reporting a cursor that precedes what this plugin has
-// already read from the topic. `''` is the zero cursor — "this room's archive from message one" —
-// so a since-less window made entirely of stanzas the seam drops used to rewind past every message
-// it had issued, and the next call replayed the whole room. The two axes are the `since` arm and
-// what the tail of the archive is made of; the filter runs on one of them and the rewind on the
-// other, which is why driving only the `since`-given arm (above) left this half unguarded.
+// Class: `limit` counted in BACKEND ROWS rather than in the messages the seam carries, and a window
+// whose admitted set is empty then reporting a cursor that precedes what this plugin has already
+// read. Both arms of `since` face both halves, and each got one wrong in its own way: the
+// `since`-given arm pages until it holds `limit` MESSAGES, while the since-less arm read a single
+// page of `limit` ARCHIVE ROWS and filtered afterwards — so a room whose recent history is subject
+// changes, corrections or moderation tombstones answered with fewer messages than it holds, or with
+// none at all, and `''` (the zero cursor — "this room's archive from message one") then replayed
+// the whole room on the next call. Both expectations are therefore derived from the ADMITTED
+// messages rather than from a fixed row window, so that no arm can satisfy the table by counting
+// rows, and a tail made of anything the seam drops cannot decide how much of a room a reader sees.
 
 type Arm = 'no cursor' | 'the zero cursor' | 'a real archive id';
 type Tail =
   | 'all bodied'
   | 'a bodiless last row'
   | 'a wholly bodiless tail'
+  | 'a bodiless run longer than the window'
   | 'a wholly bodiless archive';
 
 const bodies: Record<Tail, Array<string | null>> = {
   'all bodied': ['b1', 'b2', 'b3', 'b4'],
   'a bodiless last row': ['b1', 'b2', 'b3', null],
   'a wholly bodiless tail': ['b1', 'b2', null, null],
+  // A bodiless run LONGER than the window is the only shape that tells "read one page of `limit`
+  // rows" apart from "page until `limit` messages": nothing the first reads is admitted at all.
+  'a bodiless run longer than the window': ['b1', 'b2', null, null, null, null, null],
   'a wholly bodiless archive': [null, null, null, null],
 };
 
 /** `limit` small enough that the since-LESS window is the archive tail, and only it. */
 const TAIL_WINDOW = 2;
 
-/** The rows each arm's read covers — derived, so a change to either axis moves the expectation. */
-const windowOf = (archive: ArchiveItem[], arm: Arm): ArchiveItem[] =>
-  arm === 'no cursor'
-    ? archive.slice(-TAIL_WINDOW)
-    : arm === 'the zero cursor'
-      ? archive
-      : archive.slice(1);
+/**
+ * The rows each arm's read covers — derived, so a change to either axis moves the expectation. The
+ * since-less arm walks BACKWARDS from the tail until it holds TAIL_WINDOW admitted messages, so its
+ * window starts at the oldest row it had to reach and not at a fixed offset from the end.
+ */
+const windowOf = (archive: ArchiveItem[], arm: Arm): ArchiveItem[] => {
+  if (arm === 'the zero cursor') return archive;
+  if (arm === 'a real archive id') return archive.slice(1);
+  const bodied = archive.flatMap((it, i) => (it.body === null ? [] : [i]));
+  return archive.slice(bodied.length > TAIL_WINDOW ? bodied[bodied.length - TAIL_WINDOW]! : 0);
+};
 
 const cursorRows = (Object.keys(bodies) as Tail[]).flatMap((tail) =>
   (['no cursor', 'the zero cursor', 'a real archive id'] as Arm[]).map((arm) => ({ arm, tail })),

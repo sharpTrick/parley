@@ -91,6 +91,9 @@ export const expectNoLeaks = (plugin: XmppPlugin): void => {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** `Array#findIndex`'s -1, folded to a caller-chosen default. */
+const indexOrElse = (found: number, fallback: number): number => (found === -1 ? fallback : found);
+
 /**
  * First codepoint outside XML 1.0's `Char` production, derived independently of the plugin's own
  * check so that a bug in that check cannot make this fixture agree with it.
@@ -162,6 +165,15 @@ export class FakeXmpp {
    */
   readonly rooms = new Set<string>();
   discoUnknownRoom: 'result' | 'item-not-found' = 'result';
+  /**
+   * How this server answers the disco#info EXISTENCE probe, whatever the room. `'answers'` lets
+   * {@link discoUnknownRoom} decide; the rest are the ways a probe fails to answer the question at
+   * all — a busy MUC, an s2s hiccup, a component that never replies. Without this axis the whole
+   * inconclusive-probe branch is unreachable from a test, and a read that provisions a room because
+   * its probe timed out is graded by nothing.
+   */
+  discoProbe: 'answers' | 'service-unavailable' | 'remote-server-timeout' | 'forbidden' | 'no-answer' =
+    'answers';
   /** Whether a join that CREATES the room says so (status 201), which is what unlocks + configures it. */
   announceCreation = false;
   /**
@@ -562,6 +574,12 @@ export class FakeXmpp {
   private async onIq(iq: El): Promise<unknown> {
     if (iq.getChild('query', NS_DISCO_INFO) !== undefined) {
       const room = iq.attrs.to ?? '';
+      // A never-answered IQ reaches the plugin as the rejection `@xmpp/iq` raises on its OWN timer,
+      // which carries no `condition` at all — keep it shaped that way here, so that the fixture
+      // grades `conditionOf`'s fall-back-to-the-message arm instead of a tidier error no client
+      // produces.
+      if (this.discoProbe === 'no-answer') throw new Error('TimeoutError');
+      if (this.discoProbe !== 'answers') throw stanzaError(this.discoProbe);
       if (this.discoUnknownRoom === 'item-not-found' && !this.rooms.has(room)) {
         throw stanzaError('item-not-found');
       }
@@ -603,17 +621,31 @@ export class FakeXmpp {
 
     const set = query.getChild('set', NS_RSM);
     const after = set?.getChildText('after');
+    const before = set?.getChildText('before');
     const max = Number(set?.getChildText('max') ?? '50');
     const all = this.archives.get(room) ?? [];
     let start: number;
+    let window: ArchiveItem[];
+    let complete: boolean;
     if (set?.getChild('before') !== undefined) {
-      start = Math.max(0, all.length - max);
+      // XEP-0059 §2.5 backwards paging, as a live Prosody answers it: an empty <before/> is the
+      // archive TAIL, <before>id</before> the page ending strictly before `id`, and `complete` is
+      // set only once the page reaches the START of the archive — never merely its end. A fixture
+      // that flagged every last-page answer complete would stop a backwards paging loop after one
+      // round trip and make an unpaged read look paged.
+      const end =
+        before !== null && before !== undefined && before !== ''
+          ? indexOrElse(all.findIndex((i) => i.archId === before), all.length)
+          : all.length;
+      start = Math.max(0, end - max);
+      window = all.slice(start, end);
+      complete = start === 0;
     } else {
       // An <after> the archive does not hold replays from the start — Prosody's actual behaviour.
       start = after !== null && after !== undefined ? all.findIndex((i) => i.archId === after) + 1 : 0;
+      window = all.slice(start, start + max);
+      complete = start + window.length >= all.length;
     }
-    const window = all.slice(start, start + max);
-    const complete = start + window.length >= all.length;
 
     await this.onMamInFlight?.(room);
     if (this.mamLatencyMs > 0) await sleep(this.mamLatencyMs);

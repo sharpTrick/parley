@@ -36,20 +36,59 @@ export class XmppArchive extends XmppConnection {
   protected readonly waiters = new Map<string, Set<(reason: WakeReason) => void>>();
 
   /**
-   * The window `args` asks for: the most recent `limit` (RSM "last page" via an empty `<before/>`)
-   * when no cursor was given, otherwise everything strictly after it. `blockMs` re-reads THIS, so
-   * that the argument changes when a fetch returns and never which window it returns.
+   * The window `args` asks for: the most recent `limit` messages when no cursor was given,
+   * otherwise everything strictly after it. `blockMs` re-reads THIS, so that the argument changes
+   * when a fetch returns and never which window it returns.
    */
   protected async readWindow(
     topic: Topic,
     since: string | undefined,
     limit: number,
   ): Promise<ReadWindow> {
-    if (since === undefined) {
-      const page = await this.mamQuery(topic, { lastPage: true, max: limit });
-      return { items: page.items.filter(wire.hasBody), tail: page.items.at(-1)?.archId };
-    }
+    if (since === undefined) return this.lastPageMam(topic, limit);
     return this.exclusiveMam(topic, since, limit);
+  }
+
+  /**
+   * The most recent `limit` messages the seam CARRIES, paged backwards from the archive tail with
+   * RSM `<before>` (XEP-0059 §2.5) — an empty `<before/>` for the tail itself, then the id each
+   * page starts at.
+   *
+   * `limit` counts seam messages, not archive rows. A MUC archives subject changes, corrections,
+   * retractions and moderation tombstones, none of which carry a `<body>`, so one page of `limit`
+   * rows yields fewer messages than asked for — or none at all, on a room whose recent history
+   * happens to be made of them, which is also the window core builds its `parley_list_users` roster
+   * from. Keep the fill-to-limit loop, so that what the tail of the archive is made of cannot decide
+   * how much of the room a reader gets to see.
+   *
+   * Keep the FIRST page's last row as the window tail, so that a window admitting nothing still
+   * reports the newest row it SAW; any older row rewinds the caller's cursor back over history it
+   * has already read. Keep the strict-advance check for the reason {@link exclusiveMam} has one.
+   */
+  private async lastPageMam(topic: Topic, limit: number): Promise<ReadWindow> {
+    const items: wire.BodiedItem[] = [];
+    let before: string | undefined;
+    let tail: string | undefined;
+    while (items.length < limit) {
+      const page = await this.mamQuery(topic, {
+        lastPage: true,
+        before,
+        max: Math.min(this.mamPage, limit - items.length),
+      });
+      tail ??= page.items.at(-1)?.archId;
+      items.unshift(...page.items.filter(wire.hasBody));
+      const head = page.items[0]?.archId;
+      if (page.complete || head === undefined) break;
+      if (head === before) {
+        throw new Error(
+          `MAM paging on ${this.roomJid(topic)} did not advance: the page before '${before}' ` +
+            'starts at that same archive id and is not marked complete, so the most recent window ' +
+            'cannot be read',
+        );
+      }
+      before = head;
+    }
+    return { items, tail };
   }
 
   /**
@@ -177,7 +216,7 @@ export class XmppArchive extends XmppConnection {
   /** Run one MAM page; the streamed `<result>` items are gathered by `queryid`. */
   protected async mamQuery(
     topic: Topic,
-    opts: { after?: string; lastPage?: boolean; max: number },
+    opts: { after?: string; before?: string; lastPage?: boolean; max: number },
   ): Promise<{ items: wire.MamItem[]; complete: boolean }> {
     const room = this.roomJid(topic);
     const queryid = randomUUID();

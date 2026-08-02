@@ -143,6 +143,92 @@ describe('XMPP settles a join only for a presence it can attribute', () => {
   });
 });
 
+/**
+ * The same rule on the arm that ENDS occupancy. XEP-0045 sends a departure for every occupant, and
+ * status 110 marks the copy about US — but it is corroboration, never attribution: a presence that
+ * carries it while naming some other occupant's nick is not this connection leaving. Acting on the
+ * code alone drops `joined`/`roomNicks` for a room this bridge still occupies, so live push is dead
+ * with no error anywhere, and repeating it inside REJOIN_WINDOW_MS exhausts the ladder and gives up
+ * on the topic for good. The nick this connection HOLDS is itself an axis, because a nick-locking
+ * service (status 210) admits it under a name it never asked for and the departure names THAT one.
+ */
+const HELD_NICKS = [
+  { label: 'joined under the nick it asked for', assigned: false, held: REQUESTED },
+  { label: 'joined under a nick the service assigned', assigned: true, held: 'service-picked' },
+];
+
+/** The nick a departure names, relative to the one this connection holds in the room. */
+const DEPARTING = NICKS.map(({ label, nick }) => ({
+  label: nick === REQUESTED ? 'the nick this connection holds' : label,
+  of: (held: string): string => (nick === REQUESTED ? held : nick),
+}));
+
+/** 303 is the one code that changes the ANSWER: XEP-0045 §7.6 makes it a rename, not a departure. */
+const DEPARTURE_STATUS_SETS = [
+  ...STATUS_SETS,
+  { label: 'status 110+307 (kicked)', statuses: ['110', '307'] },
+  { label: 'status 307 with no 110', statuses: ['307'] },
+  { label: 'status 110+303 (nick change, not a departure)', statuses: ['110', '303'] },
+];
+
+const departures = HELD_NICKS.flatMap((room) =>
+  DEPARTING.flatMap((departing) =>
+    DEPARTURE_STATUS_SETS.map(({ label: statusLabel, statuses }) => {
+      const nick = departing.of(room.held);
+      return {
+        room,
+        departing,
+        statuses,
+        nick,
+        name: `${room.label}, ${departing.label}, ${statusLabel}`,
+        ends: nick === room.held && !statuses.includes('303'),
+      };
+    }),
+  ),
+);
+
+const unavailable = (room: string, nick: string, statuses: string[]): unknown =>
+  xml(
+    'presence',
+    { from: jidOf(room, nick), type: 'unavailable' },
+    xml('x', { xmlns: NS_MUC_USER }, ...statuses.map((code) => xml('status', { code }))),
+  );
+
+describe('XMPP ends occupancy only for a departure it can attribute', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(departures)('$name -> ends occupancy: $ends', async ({ room: held, statuses, nick, ends }) => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const plugin = new XmppPlugin();
+    const fake = new FakeXmpp();
+    if (held.assigned) fake.assignNick = held.held;
+    const p = attach(plugin, fake);
+    p.nick = REQUESTED;
+    const room = p.roomJid(asTopic('t-departure'));
+
+    // Enter the room through the real handshake, so the nick under test is the one the PLUGIN
+    // tracked from the admission — not one this fixture asserted into it.
+    await p.joinOnce(room);
+    p.joined.set(room, Promise.resolve());
+    expect(p.roomNicks.get(room) ?? p.nick).toBe(held.held);
+
+    p.onStanza(unavailable(room, nick, statuses));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(p.joined.has(room)).toBe(!ends);
+
+    // Negative control: a departure naming the held nick still ends it — so an ignored row is the
+    // attribution rule and not a stanza the router failed to parse.
+    if (!ends) {
+      p.onStanza(unavailable(room, held.held, ['110', '307']));
+      await new Promise((r) => setTimeout(r, 5));
+      expect(p.joined.has(room)).toBe(false);
+    }
+    await plugin.disconnect();
+  });
+});
+
 describe('XMPP against a nick-locking service (XEP-0045 status 210)', () => {
   afterEach(() => {
     mockState.client = undefined;

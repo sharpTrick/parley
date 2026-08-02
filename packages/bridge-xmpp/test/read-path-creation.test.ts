@@ -1,14 +1,19 @@
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Class: a READ that provisions durable backend state. Joining a MUC room auto-creates it and the
-// creator then submits a config making it PERSISTENT — deliberately, because a non-persistent room
-// and its whole MAM archive die with the last occupant. But `fetchRecent` also joined, and its topic
-// comes from the caller through nothing but an allowlist pattern, so `parley_fetch_recent` on a
-// wildcard pattern minted an unbounded number of persistent rooms and archives that nothing in this
-// plugin ever reclaims — while returning an empty page, so the caller had no signal it had just
-// provisioned anything. The table crosses every seam call with the room's existence and pins which
-// cells may create, observed as the creation handshake (status 201) and the owner config submit.
+// Class: a READ that provisions durable backend state, and an existence probe that FAILS OPEN into
+// doing it. Joining a MUC room auto-creates it and the creator then submits a config making it
+// PERSISTENT — deliberately, because a non-persistent room and its whole MAM archive die with the
+// last occupant. But `fetchRecent` also joined, and its topic comes from the caller through nothing
+// but an allowlist pattern, so `parley_fetch_recent` on a wildcard pattern minted an unbounded
+// number of persistent rooms and archives that nothing in this plugin ever reclaims — while
+// returning an empty page, so the caller had no signal it had just provisioned anything. Gating that
+// on a disco#info probe is only half the guard: the probe can fail to ANSWER — a busy MUC, an s2s
+// hiccup, an IQ nothing replies to — and treating "not item-not-found" as "the room is there" put
+// every one of those straight back on the creating path. So the third axis is how the probe answers,
+// and every read cell must leave the server untouched whatever it says: a question this connection
+// could not get an answer to is not permission to provision. The observables are the creation
+// handshake (status 201) and the owner config submit.
 
 const mockState = vi.hoisted(() => ({ client: undefined as unknown }));
 vi.mock('@xmpp/client', async () => {
@@ -63,21 +68,38 @@ const existences = [
   { name: 'the room does not exist', exists: false },
 ];
 
-const cells = calls.flatMap((call) => existences.map((existence) => ({ call, existence })));
+/**
+ * How the disco#info existence probe answers. `answers` is the server telling the truth; the rest
+ * are the ways it declines to, and none of them is evidence the room is there. A read may only join
+ * a room a probe positively CONFIRMED, so `joinable` is true for exactly one of them.
+ */
+const probes = [
+  { name: 'the probe answers', probe: 'answers' as const, joinable: true },
+  { name: 'the probe answers service-unavailable', probe: 'service-unavailable' as const, joinable: false },
+  { name: 'the probe answers remote-server-timeout', probe: 'remote-server-timeout' as const, joinable: false },
+  { name: 'the probe answers forbidden', probe: 'forbidden' as const, joinable: false },
+  { name: 'the probe never answers', probe: 'no-answer' as const, joinable: false },
+];
+
+const cells = calls.flatMap((call) =>
+  existences.flatMap((existence) => probes.map((probe) => ({ call, existence, probe }))),
+);
 
 describe('XMPP creates a MUC room from the write and push paths only', () => {
   afterEach(() => {
     mockState.client = undefined;
   });
 
-  it.each(cells)('$call.name when $existence.name', async ({ call, existence }) => {
+  it.each(cells)('$call.name when $existence.name and $probe.name', async ({ call, existence, probe }) => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const fake = new FakeXmpp();
     fake.announceCreation = true; // only the creator's self-presence carries status 201
     fake.discoUnknownRoom = 'item-not-found'; // what a server answers about a room nobody created
+    fake.discoProbe = probe.probe;
     mockState.client = fake;
     const plugin = new XmppPlugin();
     await plugin.connect({ password: 'a-real-secret', nick: 'reader' });
-    const label = call.name.replace(/\W+/g, '-');
+    const label = `${call.name}-${probe.probe}`.replace(/\W+/g, '-');
     const topic = asTopic(`t-create-${label}-${String(existence.exists)}`);
     const room = priv(plugin).roomJid(topic);
     if (existence.exists) fake.rooms.add(room);
@@ -93,7 +115,21 @@ describe('XMPP creates a MUC room from the write and push paths only', () => {
       (iq) => iq.getChild('query', NS_MUC_OWNER) !== undefined,
     ).length;
 
-    if (existence.exists) {
+    // The write and push paths do not consult the probe at all — their topics are not
+    // caller-supplied — so only a READ's outcome moves with it.
+    const reads = !call.mayCreate;
+    if (reads && !probe.joinable) {
+      // A probe that did not answer the question is not permission to act on it: nothing entered
+      // the room, whether or not it was there, and the operator is told why the page came back empty.
+      expect({ joins, configSubmits, created: fake.rooms.has(room) && !existence.exists }).toEqual({
+        joins: 0,
+        configSubmits: 0,
+        created: false,
+      });
+      expect(priv(plugin).joined.size).toBe(0);
+      expect(String(errors.mock.calls.at(-1)?.[0])).toContain(room);
+      expect(elapsed).toBeLessThan(250);
+    } else if (existence.exists) {
       // Every call joins a room that is already there, and none of them reconfigures it.
       expect(joins).toBe(1);
       expect(configSubmits).toBe(0);
@@ -111,6 +147,7 @@ describe('XMPP creates a MUC room from the write and push paths only', () => {
       expect(elapsed).toBeLessThan(250);
     }
     await plugin.disconnect();
+    vi.restoreAllMocks();
   }, 15_000);
 });
 
