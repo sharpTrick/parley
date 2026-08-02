@@ -2,6 +2,7 @@ import type { Topic } from '@sharptrick/parley-core';
 import type { Client } from 'pg';
 import { LISTENER_WAIT_MS, PostgresListener } from './listener.js';
 import { channelFor } from './schema.js';
+import type { ParkedWaiter } from './state.js';
 
 export interface ListenState {
   /** Resolves only once the LISTEN is ESTABLISHED — never merely intended. */
@@ -82,7 +83,7 @@ export abstract class PostgresListen extends PostgresListener {
     } catch {
       return; // LISTEN failed → skip the native wait; core polls the remaining budget
     }
-    const set = this.waiters.get(channel) ?? new Set<() => void>();
+    const set = this.waiters.get(channel) ?? new Set<ParkedWaiter>();
     this.waiters.set(channel, set);
     await new Promise<void>((resolve) => {
       let done = false;
@@ -91,26 +92,28 @@ export abstract class PostgresListen extends PostgresListener {
         done = true;
         clearTimeout(timer);
         this.pendingAborts.delete(finish);
-        set.delete(finish);
+        set.delete(parked);
         if (set.size === 0) this.waiters.delete(channel);
         this.releaseListen(channel, listen);
         resolve();
       };
+      // Wake only if the row is really there, for every window that starves this wait without a
+      // NOTIFY behind it to prove one landed: the snapshot between the caller's empty read and the
+      // LISTEN below, and every later blackout the reconnect recovers from.
+      const recheck = (): void => {
+        void (async () => {
+          if ((await this.readSince(topic, since, limit)).length > 0) finish();
+        })().catch(() => undefined);
+      };
+      const parked: ParkedWaiter = { wake: finish, recheck };
       const timer = setTimeout(finish, blockMs);
       this.pendingAborts.add(finish);
-      set.add(finish);
+      set.add(parked);
       if (this.stopped || epoch !== this.epoch) {
         finish(); // disconnect may have raced registration
         return;
       }
-      // Snapshot-window re-check: catch a row that landed between the caller's empty read and the
-      // LISTEN above, which sent no NOTIFY we'd hear. If it's there, wake now (caller re-queries);
-      // otherwise stay parked. A failed re-check is harmless — the NOTIFY/timer still resolve us.
-      void this.readSince(topic, since, limit)
-        .then((recheck) => {
-          if (recheck.length > 0) finish();
-        })
-        .catch(() => undefined);
+      recheck();
     });
   }
 }

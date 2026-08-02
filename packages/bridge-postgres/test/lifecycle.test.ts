@@ -25,6 +25,8 @@ function deferred(): Deferred {
 // Shared mock state, hoisted so the vi.mock factory can close over it.
 const state = vi.hoisted(() => ({
   clients: [] as MockClientShape[],
+  /** How many further `connect()`s on a replacement listener must fail before one lands. */
+  connectFailures: 0,
   // When set, the next `new Client().connect()` parks on this deferred (used to hold a reconnect
   // candidate mid-connect while a disconnect() races it).
   connectGate: null as Deferred | null,
@@ -66,6 +68,10 @@ vi.mock('pg', async () => {
       if (gate !== null) {
         state.connectGate = null;
         await gate.promise;
+      }
+      if (state.connectFailures > 0) {
+        state.connectFailures--;
+        throw new Error('connect ECONNREFUSED 127.0.0.1:5432');
       }
     }
     async query(sql: string): Promise<{ rows: unknown[] }> {
@@ -119,6 +125,7 @@ const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
 
 beforeEach(() => {
   state.clients.length = 0;
+  state.connectFailures = 0;
   state.connectGate = null;
   state.listenGate = null;
   state.listenAttempts.length = 0;
@@ -187,51 +194,60 @@ const CHORES: Chore[] = [
 ];
 
 /**
- * A guard is any comparison of a captured epoch against `this.epoch`, in either operand order and
- * whichever way round the test is written. The census below counted `epoch !== this.epoch` alone,
- * so the three guards already written as `epoch === this.epoch` were invisible to it and a new
- * teardown-crossing await in that spelling shipped with the file still green.
+ * A teardown guard is how a call that parked across an await asks whether it is still the live
+ * lifecycle's: a comparison of a captured epoch against `this.epoch`, in either operand order and
+ * whichever way round the test is written, OR a claim on the `starting` slot the call published its
+ * unadopted resource into. The census below counted `epoch !== this.epoch` alone, so the three
+ * guards already written as `epoch === this.epoch` were invisible to it and a new teardown-crossing
+ * await in that spelling shipped with the file still green; it then counted epoch comparisons alone,
+ * so `connect()`'s bootstrap await went uncounted the moment its guard changed spelling.
  */
-const EPOCH_GUARD = /(?:\w+\s*[!=]==?\s*this\.epoch|this\.epoch\s*[!=]==?\s*\w+)/g;
+const TEARDOWN_GUARD =
+  /(?:\w+\s*[!=]==?\s*this\.epoch|this\.epoch\s*[!=]==?\s*\w+|this\.starting\.delete\()/g;
 
 /**
  * Every form the rule has to recognise, each with a sample it must find. Keep this table beside the
  * pattern, so that a guard written in a shape the regex cannot see fails here rather than silently
  * shrinking the census to whatever spelling it happens to match.
  */
-const EPOCH_GUARD_FORMS: [what: string, sample: string][] = [
+const TEARDOWN_GUARD_FORMS: [what: string, sample: string][] = [
   ['an inequality guard', 'if (this.stopped || epoch !== this.epoch) return;'],
   ['a while condition in the equality form', 'while (!this.stopped && epoch === this.epoch) {'],
   ['a do…while condition in the equality form', '} while (sub.pending && epoch === this.epoch);'],
   ['a bare statement guard', 'if (epoch === this.epoch) this.reconnecting = false;'],
   ['the comparison written with this.epoch first', 'if (this.epoch !== guardEpoch) return;'],
   ['a loose comparison', 'if (epoch != this.epoch) return;'],
+  ['a claim on the in-flight slot', 'if (!this.starting.delete(pool)) throw disconnected();'],
+  ['the in-flight slot released on a failure path', 'this.starting.delete(client);'],
 ];
 
 /**
- * Every await in this plugin that a `disconnect()` can land in re-checks the epoch afterwards, and
- * the table below drives one row per chore into that window. Pinned by VALUE so a guard site added
- * later is a missing row rather than silence: a new one means a new await that can cross a
- * teardown, and it needs its own row here, in teardown-delivery.test.ts (which owns a drain read
- * parked at the boundary) or in push-self-heal.test.ts (which owns the drain's re-drain timer).
+ * Every await in this plugin that a `disconnect()` can land in re-checks afterwards whether it is
+ * still the live lifecycle's, and the table below drives one row per chore into that window. Pinned
+ * by VALUE so a guard site added later is a missing row rather than silence: a new one means a new
+ * await that can cross a teardown, and it needs its own row here, in teardown-races-setup.test.ts
+ * (which owns the setup calls, parameterized over the await each is held at), in
+ * teardown-delivery.test.ts (which owns a drain read parked at the boundary) or in
+ * push-self-heal.test.ts (which owns the drain's re-drain timer).
  */
-const EPOCH_GUARD_SITES = 14;
+const TEARDOWN_GUARD_SITES = 18;
 
 const CROSS_CELLS = CHORES.flatMap((chore) =>
   (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),
 );
 
 describe('a chore in flight when disconnect lands never touches the next lifecycle', () => {
-  it.each(EPOCH_GUARD_FORMS)('the census sees a guard written as %s', (_what, sample) => {
-    expect(sample.match(EPOCH_GUARD), 'this guard form is invisible to the census below').toHaveLength(
-      1,
-    );
+  it.each(TEARDOWN_GUARD_FORMS)('the census sees a guard written as %s', (_what, sample) => {
+    expect(
+      sample.match(TEARDOWN_GUARD),
+      'this guard form is invisible to the census below',
+    ).toHaveLength(1);
   });
 
-  it('every teardown/epoch guard in the source is represented by a row above', () => {
-    const sites = [...SOURCE.matchAll(EPOCH_GUARD)].length;
+  it('every teardown guard in the source is represented by a row above', () => {
+    const sites = [...SOURCE.matchAll(TEARDOWN_GUARD)].length;
     expect(sites, 'a guard site was added or removed — give the new await a row').toBe(
-      EPOCH_GUARD_SITES,
+      TEARDOWN_GUARD_SITES,
     );
   });
 
@@ -479,24 +495,50 @@ describe('Postgres subscribe registration', () => {
   });
 });
 
-// The reconnect loop exists to make a notification blackout cost latency and not a message: it
-// must re-LISTEN every channel a subscription or an in-flight blocking fetch still needs, and
-// re-drain every topic from its cursor. Asserting only that it must NOT resurrect a listener after
-// disconnect leaves the delivery guarantee itself unguarded, so this matrix pins it directly.
+// The reconnect loop exists to make a notification blackout cost latency and not a message. The
+// class it keeps getting wrong is asymmetric recovery: a NOTIFY rung while the connection was down
+// reached NOBODY and nothing rings it again, so the reconnect owes a re-drive to EVERY participant
+// registry it re-LISTENed a channel for — the subscriptions AND the blocking `fetchRecent` waiters
+// parked on the same doorbell. Re-driving one and not the other is invisible to a test that only
+// asks whether the channel came back: subscriptions recover in one backoff while a waiter sleeps
+// out its whole block budget (core passes `catchup.block_max_ms`, default 60s) and answers empty
+// with the row durably visible.
+//
+// So both participant kinds are seeded with rows landing DURING the blackout, and both are graded
+// on delivery, against a bound far below the block budget — "it came back when its own timer
+// expired" is the defect, not a pass.
 
 const DRAIN_BATCH = 512;
+/** The waiter's block budget; a recovery that costs this much is the defect, not the fix. */
+const BLOCK_MS = 4000;
+/** The plugin's own backoff between listener reconnect attempts. */
+const RECONNECT_DELAY_MS = 500;
 
 interface ReconnectCell {
   topics: number;
   waiters: number;
   rows: number;
+  /** Which reconnect attempt is allowed to land — a blackout the first try does not end. */
+  attempt: number;
 }
 
 const RECONNECT_CELLS: ReconnectCell[] = [0, 1, 2].flatMap((topics) =>
   [0, 1].flatMap((waiters) =>
-    [0, 1, DRAIN_BATCH + 1].map((rows) => ({ topics, waiters, rows })),
+    [0, 1, DRAIN_BATCH + 1].map((rows) => ({ topics, waiters, rows, attempt: 1 })),
   ),
 );
+
+/**
+ * The same class one layer out: the re-drive has to be tied to the attempt that ACTUALLY landed,
+ * not to entering the loop. One row per participant kind, because a fan-out written into the wrong
+ * place strands whichever registry it was not written beside.
+ */
+const RETRY_CELLS: ReconnectCell[] = (['subscription', 'waiter'] as const).map((who) => ({
+  topics: who === 'subscription' ? 1 : 0,
+  waiters: who === 'waiter' ? 1 : 0,
+  rows: 1,
+  attempt: 3,
+}));
 
 function blackoutRows(topic: string, count: number): Record<string, unknown>[] {
   return Array.from({ length: count }, (_, i) => ({
@@ -509,68 +551,122 @@ function blackoutRows(topic: string, count: number): Record<string, unknown>[] {
   }));
 }
 
-describe('Postgres listener reconnect delivers what the blackout missed', () => {
-  it.each(
-    RECONNECT_CELLS.map(
-      (c) =>
-        [`${c.topics} subscription(s), ${c.waiters} blocking waiter(s), ${c.rows} row(s)`, c] as const,
-    ),
-  )('%s', async (_label, cell) => {
-    const plugin = new PostgresPlugin();
-    await plugin.connect({ url: REAL_URL });
+const reconnectLabel = (c: ReconnectCell): string =>
+  `${c.topics} subscription(s), ${c.waiters} blocking waiter(s), ${c.rows} row(s), ` +
+  `reconnect lands on attempt ${c.attempt}`;
 
-    const seen = new Map<string, Message[]>();
-    const subTopics = Array.from({ length: cell.topics }, (_, i) => `sub${i}`);
-    for (const t of subTopics) {
-      seen.set(t, []);
-      await plugin.subscribe(asTopic(t), (m) => {
-        seen.get(t)?.push(m);
-      });
-    }
+interface ParkedFetch {
+  topic: string;
+  settled?: { afterMs: number; contents: string[] };
+  done: Promise<void>;
+}
 
-    const waitTopic = 'waiting';
-    const waits: Promise<unknown>[] = [];
-    if (cell.waiters > 0) {
-      waits.push(
-        plugin.fetchRecent({ topic: asTopic(waitTopic), since: asCursor('0'), blockMs: 4000 }),
-      );
-      await sleep(20);
-    }
+async function reconnectCase(cell: ReconnectCell): Promise<void> {
+  const plugin = new PostgresPlugin();
+  await plugin.connect({ url: REAL_URL });
 
-    const channelsNeeded = [...(plugin as unknown as { listens: Map<string, unknown> }).listens.keys()];
+  const seen = new Map<string, Message[]>();
+  const subTopics = Array.from({ length: cell.topics }, (_, i) => `sub${i}`);
+  for (const t of subTopics) {
+    seen.set(t, []);
+    await plugin.subscribe(asTopic(t), (m) => {
+      seen.get(t)?.push(m);
+    });
+  }
 
-    // Queue the blackout rows, then drop the listener connection.
-    for (const t of subTopics) state.rows.set(t, blackoutRows(t, cell.rows));
-    const listener = state.clients[0];
-    if (listener === undefined) {
-      // Nothing subscribed and nothing waiting: the listener connection is lazy, so there is no
-      // blackout to recover from.
-      expect(channelsNeeded).toEqual([]);
-      await plugin.disconnect();
-      return;
-    }
-    listener.emit('end');
+  const waitTopics = Array.from({ length: cell.waiters }, (_, i) => `waiting${i}`);
+  const waits: ParkedFetch[] = waitTopics.map((t) => {
+    const startedAt = Date.now();
+    const parked: ParkedFetch = {
+      topic: t,
+      done: plugin
+        .fetchRecent({ topic: asTopic(t), since: asCursor('0'), blockMs: BLOCK_MS })
+        .then((page) => {
+          parked.settled = {
+            afterMs: Date.now() - startedAt,
+            contents: page.messages.map((m) => m.content),
+          };
+        }),
+    };
+    return parked;
+  });
+  // Let every waiter park before anything becomes visible: a row seeded earlier is caught by the
+  // plugin's own post-registration re-check, and the cell would never exercise the blackout at all.
+  if (waits.length > 0) await sleep(20);
 
-    // Past the reconnect backoff, the replacement client must be live.
-    await sleep(900);
-    const replacement = state.clients.at(-1);
-    expect(replacement).toBeDefined();
-    expect(replacement).not.toBe(listener);
-    for (const channel of channelsNeeded) {
-      expect(replacement?.listened, `re-LISTEN missing for ${channel}`).toContain(channel);
-    }
+  const channelsNeeded = [...(plugin as unknown as { listens: Map<string, unknown> }).listens.keys()];
 
-    // No NOTIFY is emitted: the reconnect's own re-drain is what must deliver these.
-    await sleep(100);
-    for (const t of subTopics) {
-      const got = seen.get(t) ?? [];
-      expect(got.map((m) => m.content)).toEqual(
-        Array.from({ length: cell.rows }, (_, i) => `m${i}`),
-      );
-      expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
-    }
-
+  const listener = state.clients[0];
+  if (listener === undefined) {
+    // Nothing subscribed and nothing waiting: the listener connection is lazy, so there is no
+    // blackout to recover from.
+    expect(channelsNeeded).toEqual([]);
+    expect(cell.topics + cell.waiters, 'a participant registered no LISTEN at all').toBe(0);
     await plugin.disconnect();
-    await Promise.all(waits);
-  }, 15000);
+    return;
+  }
+  state.connectFailures = cell.attempt - 1;
+  listener.emit('end');
+  // The rows land DURING the blackout: their NOTIFY reaches nobody, and nothing rings it again.
+  for (const t of [...subTopics, ...waitTopics]) state.rows.set(t, blackoutRows(t, cell.rows));
+
+  // Past the backoff of every attempt this cell burns, the replacement client must be live.
+  await sleep(RECONNECT_DELAY_MS * cell.attempt + 400);
+  const replacement = state.clients.at(-1);
+  expect(replacement).toBeDefined();
+  expect(replacement).not.toBe(listener);
+  for (const channel of channelsNeeded) {
+    expect(replacement?.listened, `re-LISTEN missing for ${channel}`).toContain(channel);
+  }
+
+  // No NOTIFY is emitted: the reconnect's own re-drive is what must serve both registries.
+  await sleep(100);
+  const want = Array.from({ length: cell.rows }, (_, i) => `m${i}`);
+  for (const t of subTopics) {
+    const got = seen.get(t) ?? [];
+    expect(got.map((m) => m.content), `the subscription on ${t} was not re-driven`).toEqual(want);
+    expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
+  }
+  for (const parked of waits) {
+    // With nothing to deliver a wake is allowed but not owed, so only the seeded cells grade one.
+    if (cell.rows === 0) continue;
+    const settled = parked.settled;
+    expect(
+      settled,
+      `the blocking fetch on ${parked.topic} was still parked a whole reconnect after the row landed`,
+    ).toBeDefined();
+    expect(
+      (settled as { contents: string[] }).contents,
+      `the blocking fetch on ${parked.topic} came back empty`,
+    ).toEqual(want.slice(0, (settled as { contents: string[] }).contents.length));
+    expect(
+      (settled as { contents: string[] }).contents.length,
+      `the blocking fetch on ${parked.topic} came back empty`,
+    ).toBeGreaterThan(0);
+    expect(
+      (settled as { afterMs: number }).afterMs,
+      `the blocking fetch on ${parked.topic} slept out its block budget instead of being re-driven`,
+    ).toBeLessThan(BLOCK_MS / 2);
+  }
+
+  await plugin.disconnect();
+  await Promise.all(waits.map((w) => w.done));
+}
+
+describe('Postgres listener reconnect re-drives every participant the blackout starved', () => {
+  it.each(RECONNECT_CELLS.map((c) => [reconnectLabel(c), c] as const))(
+    '%s',
+    async (_label, cell) => {
+      await reconnectCase(cell);
+    },
+    15000,
+  );
+
+  it.each(RETRY_CELLS.map((c) => [reconnectLabel(c), c] as const))(
+    '%s',
+    async (_label, cell) => {
+      await reconnectCase(cell);
+    },
+    15000,
+  );
 });

@@ -52,23 +52,46 @@ export abstract class PostgresListener extends PostgresPush {
     const epoch = this.epoch;
     const client = new Client({ connectionString: this.url });
     this.wireListener(client);
+    this.starting.add(client);
     await client.connect();
     return this.adoptListener(client, epoch);
   }
 
   /**
-   * The one place a freshly connected candidate becomes `this.listener`. Keep EVERY path that
-   * opens a listener socket going through here, so that a `disconnect()` which completed while the
-   * connect was in flight cannot leave a live pg connection attached to a stopped plugin — an
-   * orphan pins the Node event loop and holds a server backend slot for the life of the process.
+   * The one place a freshly connected candidate becomes `this.listener`. Keep EVERY path that opens
+   * a listener socket publishing the candidate into {@link PluginState.starting} before it dials
+   * and going through here afterwards, so that a `disconnect()` which completed while the connect
+   * was in flight cannot have RETURNED leaving a live pg connection attached to a stopped plugin —
+   * an orphan pins the Node event loop and holds a server backend slot for the life of the process.
    */
   private async adoptListener(client: Client, epoch: number): Promise<Client> {
-    if (this.stopped || epoch !== this.epoch) {
+    if (!this.starting.delete(client) || this.stopped || epoch !== this.epoch) {
       await client.end().catch(() => undefined);
       throw new Error('parley-postgres: disconnected while the listener connection was in flight');
     }
     this.listener = client;
     return client;
+  }
+
+  /**
+   * Re-drive every participant registered on these channels — the subscription re-queries from
+   * `lastSeen`, and the parked blocking waiters are served according to `doorbell`. Keep EVERY
+   * participant registry reachable from this ONE call, so that a recovery path cannot re-drive some
+   * of them and leave the rest asleep on a doorbell that is never going to ring again.
+   *
+   * `'rang'` is a NOTIFY that really fired, so each waiter ends its wait and its caller re-runs the
+   * exclusive `since` query. `'silent'` is a recovery with nothing behind it, so each waiter
+   * re-reads first: waking one that has nothing to return ends a native long-poll early and drops
+   * the LISTEN reference its topic still needs.
+   */
+  protected redrive(channels: Iterable<string>, doorbell: 'rang' | 'silent'): void {
+    for (const channel of channels) {
+      const sub = this.subs.get(channel);
+      if (sub !== undefined) this.drain(sub);
+      const set = this.waiters.get(channel);
+      if (set === undefined) continue;
+      for (const waiter of [...set]) (doorbell === 'rang' ? waiter.wake : waiter.recheck)();
+    }
   }
 
   private wireListener(client: Client): void {
@@ -77,13 +100,8 @@ export abstract class PostgresListener extends PostgresPush {
          drives the reconnect. */
     });
     client.on('notification', (n) => {
-      const sub = this.subs.get(n.channel);
       // Payload is a hint only (size limits + best-effort delivery) — always re-query.
-      if (sub !== undefined) this.drain(sub);
-      // Wake any blocking fetchRecent parked on this channel; each re-runs its own
-      // exclusive `since` query. A spurious wake only ends a wait early — safe, core re-polls.
-      const set = this.waiters.get(n.channel);
-      if (set !== undefined) for (const wake of [...set]) wake();
+      this.redrive([n.channel], 'rang');
     });
     client.on('end', () => {
       if (!this.stopped && this.listener === client) {
@@ -93,8 +111,8 @@ export abstract class PostgresListener extends PostgresPush {
   }
 
   /**
-   * Backoff loop: new connection, re-LISTEN every channel, then re-drain every topic from its
-   * `lastSeen` — anything posted while we were dark is picked up by the drain, so a lost
+   * Backoff loop: new connection, re-LISTEN every channel, then {@link redrive} every participant —
+   * anything posted while we were dark rang a NOTIFY nobody heard and nothing rings again, so a lost
    * notification window costs latency, never a message.
    */
   private async reconnectListener(): Promise<void> {
@@ -118,9 +136,11 @@ export abstract class PostgresListener extends PostgresPush {
         if (this.stopped || epoch !== this.epoch) return;
         const client = new Client({ connectionString: this.url });
         this.wireListener(client);
+        this.starting.add(client);
         try {
           await client.connect();
           if (this.stopped || epoch !== this.epoch) {
+            this.starting.delete(client);
             await client.end().catch(() => undefined);
             return;
           }
@@ -143,9 +163,10 @@ export abstract class PostgresListener extends PostgresPush {
           }
           landed(client);
           adopted = true;
-          for (const sub of this.subs.values()) this.drain(sub);
+          this.redrive(new Set([...this.subs.keys(), ...this.waiters.keys()]), 'silent');
           return;
         } catch {
+          this.starting.delete(client);
           await client.end().catch(() => undefined);
           // server still unreachable — back off and try again
         }

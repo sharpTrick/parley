@@ -6,6 +6,14 @@ import type { TopicSubscription } from './push.js';
 import { messagesSince } from './read.js';
 import { type MessageRow, quotedNames, type SchemaNames } from './schema.js';
 
+/** One parked blocking `fetchRecent`, as the paths that have to serve it see it. */
+export interface ParkedWaiter {
+  /** End the wait now; the caller re-runs its own exclusive `since` query. */
+  wake: () => void;
+  /** Re-run that query here and wake only if it finds something — for a wake nothing rang for. */
+  recheck: () => void;
+}
+
 /** The state one connected plugin carries; the layers above it add the behaviour. */
 export abstract class PluginState {
   protected pool?: Pool;
@@ -22,6 +30,14 @@ export abstract class PluginState {
    */
   protected epoch = 0;
 
+  /**
+   * Resources a setup call has built but not yet published — the bootstrap pool, a listener socket
+   * still coming up. Publish into this BEFORE the await that brings one up, so that a
+   * `disconnect()` landing inside that window has something to end and the call it raced finds its
+   * slot taken; a `delete` that returns false is that call's proof it was superseded.
+   */
+  protected readonly starting = new Set<{ end: () => Promise<void> }>();
+
   /** Dedicated non-pool LISTEN connection, shared by all topics; lazy on first subscribe. */
   protected listener?: Client;
   protected listenerPromise?: Promise<Client>;
@@ -35,9 +51,9 @@ export abstract class PluginState {
 
   /**
    * Blocking `fetchRecent` waiters keyed by NOTIFY channel, parked on the SAME doorbell `subscribe`
-   * waits on. The notification handler fans a NOTIFY out to every registered wake.
+   * waits on. The notification handler fans a NOTIFY out to every registered waiter.
    */
-  protected readonly waiters = new Map<string, Set<() => void>>();
+  protected readonly waiters = new Map<string, Set<ParkedWaiter>>();
   /** Established (or in-flight) LISTENs by channel — see {@link acquireListen}. */
   protected readonly listens = new Map<string, ListenState>();
   /**

@@ -78,7 +78,6 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     this.names = quotedNames(table);
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
-    const epoch = this.epoch;
 
     if (usesDefaultCredentials(this.url)) {
       console.warn(
@@ -95,6 +94,7 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
 
     // Idempotent bootstrap, serialized under an advisory lock: concurrent bridge processes
     // connecting to the same table would otherwise race the CREATEs.
+    this.starting.add(pool);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -105,15 +105,16 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();
+      this.starting.delete(pool);
       await pool.end().catch(() => undefined);
       throw lockWaitAbandoned(`bootstrap lock on table '${table}'`, err);
     }
     client.release();
     // Same hazard the listener has, one resource up: a disconnect() can complete while the
-    // bootstrap is in flight. Publishing the pool after that leaves a live pool — and, below, a
-    // prune timer — attached to a plugin the caller has already shut down.
-    if (this.stopped || epoch !== this.epoch) {
-      await pool.end().catch(() => undefined);
+    // bootstrap is in flight, and it is the one that ends the pool it took out of `starting` —
+    // publishing here after that leaves a live pool, a checked-out connection still holding the
+    // bootstrap advisory lock, and below a prune timer, on a plugin the caller has already shut down.
+    if (!this.starting.delete(pool)) {
       throw new Error('parley-postgres: disconnected while connect() was in flight');
     }
     this.pool = pool;
@@ -175,6 +176,12 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     for (const sub of this.subs.values()) this.clearRedrain(sub);
     this.subs.clear();
     this.subscribing.clear();
+    // Claim what a setup call has built but not published yet BEFORE awaiting anything, so that a
+    // disconnect() landing inside connect()'s bootstrap or the listener's dial does not return
+    // while a live pool still holds a connection and the bootstrap advisory lock, and so the call
+    // it raced finds its slot gone and refuses to adopt a resource this teardown already ended.
+    const inFlight = [...this.starting];
+    this.starting.clear();
     const listener = this.listener;
     this.listener = undefined;
     this.listenerPromise = undefined;
@@ -182,6 +189,7 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     const pool = this.pool;
     this.pool = undefined;
     if (pool !== undefined) await pool.end().catch(() => undefined);
+    await Promise.all(inFlight.map((resource) => resource.end().catch(() => undefined)));
   }
 
   /**

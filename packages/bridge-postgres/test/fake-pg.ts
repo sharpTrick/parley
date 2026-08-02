@@ -123,25 +123,56 @@ export class FakeEmitter extends EventEmitter {}
 
 /** `pg.Pool` reduced to the surface this plugin drives, on those same event semantics. */
 export class FakePool extends FakeEmitter {
+  ended = false;
+  /** Checkouts this pool is committed to: requested, and not yet released. */
+  outstanding = 0;
+  private readonly endWaiters: (() => void)[] = [];
+
   constructor(
     private readonly onQuery: FakePoolQuery = async () => ({ rows: [] }),
-    private readonly checkout: () => FakePooledClient = bootstrapClient,
+    private readonly checkout: () => FakePooledClient | Promise<FakePooledClient> = bootstrapClient,
   ) {
     super();
   }
 
   async connect(): Promise<FakePooledClient> {
-    return this.checkout();
+    // Count the checkout from the moment it is REQUESTED, the way pg-pool does — a connection the
+    // pool is already dialling is one `end()` has to wait for, and counting only the resolved ones
+    // makes this fake kinder than the server about exactly the window a teardown races.
+    this.outstanding++;
+    const client = await this.checkout();
+    return {
+      query: (sql, values) => client.query(sql, values),
+      release: () => {
+        client.release();
+        this.outstanding--;
+        if (this.ended && this.outstanding === 0) {
+          for (const done of this.endWaiters.splice(0)) done();
+        }
+      },
+    };
   }
 
   async query(sql: string, values?: readonly unknown[]): Promise<FakeQueryResult> {
     return this.onQuery(sql, values ?? []);
   }
 
-  async end(): Promise<void> {}
+  /**
+   * pg-pool's own semantics: `end()` settles only once every checked-out client has been released.
+   * Keep it, so that "the teardown returned" cannot be recorded here while a connection this pool
+   * handed out is still open on the server.
+   */
+  async end(): Promise<void> {
+    this.ended = true;
+    if (this.outstanding === 0) return;
+    await new Promise<void>((done) => this.endWaiters.push(done));
+  }
 }
 
-export function fakePool(onQuery?: FakePoolQuery, checkout?: () => FakePooledClient): FakePool {
+export function fakePool(
+  onQuery?: FakePoolQuery,
+  checkout?: () => FakePooledClient | Promise<FakePooledClient>,
+): FakePool {
   return new FakePool(onQuery, checkout);
 }
 
