@@ -531,20 +531,24 @@ describe('nats transport safety — a credential on an unencrypted remote link w
     }
   };
 
-  const PLAINTEXT_SCHEMES = ['nats://', 'ws://', ''];
-  const ENCRYPTED_SCHEMES = ['tls://', 'wss://'];
+  // Every spelling an operator might write, including schemes no NATS client defines. nats.js
+  // strips the scheme in `hostPort()` before it dials and decides encryption from `tls` and the
+  // server's INFO alone, so none of these selects a transport and none may move the answer. The
+  // unknown ones are listed because an allowlist of "encrypted" schemes silently excused them —
+  // `tls://` bought no encryption and suppressed the warning that said so.
+  const SCHEMES = ['nats://', 'ws://', '', 'tls://', 'wss://', 'nats+tls://', 'http://', 'gopher://'];
   const LOOPBACK_HOSTS = ['127.0.0.1:4222', 'localhost:4222', '[::1]:4222', '127.0.0.44'];
   // Hosts that read as loopback to a prefix or substring match but are ordinary registrable names
   // their owner points wherever they like, plus two integer spellings of 127.0.0.1.
   const LOOKALIKE_HOSTS = ['127.0.0.1.evil.com', 'localhost.evil.com', '2130706433', '0177.0.0.1'];
   const REMOTE_HOSTS = ['nats.example.com:4222', '203.0.113.9:4222', ...LOOKALIKE_HOSTS];
 
-  it('the plaintext scheme set is exactly nats://, ws:// and a bare host:port', () => {
-    for (const scheme of PLAINTEXT_SCHEMES) {
+  // The invariant, stated without a scheme term: the answer is a function of the HOST alone. An
+  // allowlist keyed on the scheme cannot satisfy this no matter which schemes it lists.
+  it('the scheme never moves the answer — the driver discards it before dialling', () => {
+    for (const scheme of SCHEMES) {
       expect(plaintextRemoteServer(`${scheme}remote.example:4222`)).toBeDefined();
-    }
-    for (const scheme of ENCRYPTED_SCHEMES) {
-      expect(plaintextRemoteServer(`${scheme}remote.example:4222`)).toBeUndefined();
+      expect(plaintextRemoteServer(`${scheme}127.0.0.1:4222`)).toBeUndefined();
     }
   });
 
@@ -553,25 +557,20 @@ describe('nats transport safety — a credential on an unencrypted remote link w
   });
 
   const cells: { server: string; secret: boolean; tls: boolean; warns: boolean }[] = [];
-  for (const [schemes, plaintext] of [
-    [PLAINTEXT_SCHEMES, true],
-    [ENCRYPTED_SCHEMES, false],
-  ] as const) {
-    for (const scheme of schemes) {
-      for (const [hosts, loopback] of [
-        [LOOPBACK_HOSTS, true],
-        [REMOTE_HOSTS, false],
-      ] as const) {
-        for (const host of hosts) {
-          for (const secret of [true, false]) {
-            for (const tls of [true, false]) {
-              cells.push({
-                server: `${scheme}${host}`,
-                secret,
-                tls,
-                warns: plaintext && !loopback && secret && !tls,
-              });
-            }
+  for (const scheme of SCHEMES) {
+    for (const [hosts, loopback] of [
+      [LOOPBACK_HOSTS, true],
+      [REMOTE_HOSTS, false],
+    ] as const) {
+      for (const host of hosts) {
+        for (const secret of [true, false]) {
+          for (const tls of [true, false]) {
+            cells.push({
+              server: `${scheme}${host}`,
+              secret,
+              tls,
+              warns: !loopback && secret && !tls,
+            });
           }
         }
       }
@@ -622,15 +621,17 @@ describe('nats transport safety — a credential on an unencrypted remote link w
     expect(plaintextRemoteServer('nats://alice:hunter2@127.0.0.1:4222')).toBeUndefined();
   });
 
+  // The `tls://` entry warns like the rest: it is a remote host, and the scheme buys it nothing.
   it('warns once per offending entry when servers is a list', async () => {
     const warned = await warningsFrom({
       servers: ['nats://127.0.0.1:4222', 'nats://a.example.com:4222', 'tls://b.example.com:4222', 'nats://c.example.com:4222'],
       token: SECRET,
     });
 
-    expect(warned).toHaveLength(2);
+    expect(warned).toHaveLength(3);
     expect(warned.map((l) => (/servers "([^"]+)"/.exec(l) ?? [])[1])).toEqual([
       'nats://a.example.com:4222',
+      'tls://b.example.com:4222',
       'nats://c.example.com:4222',
     ]);
   });
@@ -641,10 +642,11 @@ describe('nats transport safety — a credential on an unencrypted remote link w
 // accepted in silence. `nats://user:pass@host` is the standard NATS spelling, and nats.js keeps only
 // `url.host` of it (`servers.js` `hostPort()`), so the link is opened anonymously; meanwhile the
 // warning above interpolated the entry verbatim and printed the password. Every axis that selects a
-// different diagnostic path is crossed — the scheme's encryption, the host's class, `tls`, and
-// whether a credential FIELD is set as well — because the leak is a property of the path, not of the
-// address. One representative host per class: the lookalike-host rows of the table above cannot flip
-// anything on this axis.
+// different diagnostic path is crossed — the scheme, the host's class, `tls`, and whether a
+// credential FIELD is set as well — because the leak is a property of the path, not of the address.
+// The scheme is crossed to prove it selects NOTHING: nats.js discards it, so it may not move either
+// the refusal or the warning. One representative host per class: the lookalike-host rows of the
+// table above cannot flip anything on this axis.
 describe('nats transport safety — a credential in the servers URL is refused, never echoed', () => {
   const URL_SECRET = 'url-p4ssw0rd';
 
@@ -675,10 +677,10 @@ describe('nats transport safety — a credential in the servers URL is refused, 
   ];
   const REMOTE = 'nats.example.com:4222';
   const addresses = [
-    { scheme: 'nats://', host: REMOTE, plaintext: true, loopback: false },
-    { scheme: 'tls://', host: REMOTE, plaintext: false, loopback: false },
-    { scheme: 'nats://', host: '127.0.0.1:4222', plaintext: true, loopback: true },
-    { scheme: '', host: REMOTE, plaintext: true, loopback: false },
+    { scheme: 'nats://', host: REMOTE, loopback: false },
+    { scheme: 'tls://', host: REMOTE, loopback: false },
+    { scheme: 'nats://', host: '127.0.0.1:4222', loopback: true },
+    { scheme: '', host: REMOTE, loopback: false },
   ];
 
   beforeEach(() => {
@@ -691,7 +693,7 @@ describe('nats transport safety — a credential in the servers URL is refused, 
         for (const tls of [true, false]) {
           const server = `${address.scheme}${userinfo.prefix}${address.host}`;
           const refused = userinfo.prefix !== '';
-          const warns = !refused && address.plaintext && !address.loopback && field && !tls;
+          const warns = !refused && !address.loopback && field && !tls;
 
           it(`servers ${server} (credential field ${field}, tls ${tls}) ${refused ? 'is refused at connect()' : `warns ${warns ? 'once' : 'not at all'}`}`, async () => {
             const { warnings, error } = await diagnosticsFrom({

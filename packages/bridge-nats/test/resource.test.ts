@@ -193,3 +193,61 @@ describe('nats provisioning — only a write may create the topic’s stream', (
     expect(fake.state.addCalls).toBe(0);
   });
 });
+
+// Class: a page that read NOTHING must hand back the cursor it was given, on every arm that can
+// produce one. An absent-topic page has no message to mint a cursor from, so the caller's own
+// `since` is the only answer that keeps fetchRecent monotonic: answer with anything lower and core
+// persists it, and the next catch-up replays from the bottom of the re-provisioned stream —
+// a cursor that went BACKWARDS, which the protocol forbids.
+//
+// Crossed over every cursor SHAPE, because the regression is invisible whenever `since` happens to
+// equal the bare `0` an absent page would mint anyway: that collision is exactly why the existing
+// 'answers with an empty page and a cursor that replays' case could not see it. The `since` values
+// below are therefore all distinguishable from `0`.
+const ABSENT_SINCES = [
+  { name: 'no since', since: undefined, expected: '0' },
+  { name: 'a bare-decimal since', since: asCursor('500'), expected: '500' },
+  {
+    name: 'an incarnation-qualified since',
+    since: asCursor('20260101T000000000000000Z-500'),
+    expected: '20260101T000000000000000Z-500',
+  },
+  { name: 'a since far above any tail', since: asCursor('999999'), expected: '999999' },
+];
+
+describe('nats reads — an absent topic replays the cursor it was handed', () => {
+  for (const shape of ABSENT_SINCES) {
+    it(`a read of a topic with no stream and ${shape.name} answers with that cursor`, async () => {
+      const fake = fakeJetStream({ records: [], streamAbsent: true });
+      const plugin = new NatsPlugin();
+      injectFake(plugin, fake);
+
+      const page = await plugin.fetchRecent({ topic: PROBE, ...(shape.since ? { since: shape.since } : {}) });
+
+      expect(page.messages).toEqual([]);
+      expect(String(page.nextCursor)).toBe(shape.expected);
+      expect(fake.state.addCalls).toBe(0);
+    });
+  }
+
+  // The other arm into the same page: the stream was there at entry and was removed out-of-band
+  // before the read finished. `since` sits below the tail on purpose, so the read genuinely reaches
+  // each faulting point instead of short-circuiting on an empty window and never producing the
+  // absent-topic page at all.
+  for (const missingOn of ['consumers.add', 'consumers.get', 'fetch'] as const) {
+    it(`a stream that vanishes at ${missingOn} mid-read still replays the caller's cursor`, async () => {
+      const fake = fakeJetStream({
+        records: [{ seq: 1, data: payload('a') }, { seq: 2, data: payload('b') }, { seq: 3, data: payload('c') }],
+        streamMissingOn: missingOn,
+      });
+      const plugin = new NatsPlugin();
+      injectFake(plugin, fake, TOPIC);
+
+      const since = asCursor('20260101T000000000000000Z-1');
+      const page = await plugin.fetchRecent({ topic: TOPIC, since });
+
+      expect(page.messages).toEqual([]);
+      expect(String(page.nextCursor)).toBe(String(since));
+    });
+  }
+});

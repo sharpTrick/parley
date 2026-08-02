@@ -118,11 +118,13 @@ backend_config:
 `creds_file` wins over `nkey_seed` when both are set. See "Topic → subject / stream names" above for
 how a topic is folded onto a subject and a stream.
 
-A NATS credential travels in the CONNECT frame of the very first round trip, and `nats://` (or a
-bare `host:port`, which means the same thing) is an unencrypted link. So a credential pointed at a
-non-loopback host with no `tls:` block is on the wire in the clear: `connect()` warns on stderr,
-naming the server and which field it would expose — never its value. Use `tls://`/`wss://`, or set
-`tls:`. A loopback server is not warned about.
+A NATS credential travels in the CONNECT frame of the very first round trip, and nats.js **discards
+the URL scheme** before it dials — it decides encryption from `tls:` and the server's INFO alone, so
+`tls://` and `wss://` select nothing and every scheme dials the same plain TCP socket. A credential
+pointed at a non-loopback host with no `tls:` block is therefore on the wire in the clear unless the
+server itself offers TLS: `connect()` warns on stderr, naming the server and which field it would
+expose — never its value. Set `tls:` to make encryption a fail-fast guarantee rather than something
+the server may or may not offer. A loopback server is not warned about.
 
 ## Retention (optional)
 

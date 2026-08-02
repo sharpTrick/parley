@@ -121,8 +121,6 @@ export function validateRetentionDays(days: number | undefined): number | undefi
   return days;
 }
 
-/** The schemes nats.js opens unencrypted. A bare `host:port` is one of them — it reads as `nats:`. */
-const PLAINTEXT_SCHEMES = ['nats:', 'ws:'];
 /** Where nats.js connects when `backend_config.servers` is unset. */
 const DEFAULT_SERVERS = '127.0.0.1:4222';
 /** What stands in for a URL's userinfo everywhere a server address is named. */
@@ -151,17 +149,16 @@ export function redactUserinfo(server: string): string {
 }
 
 /**
- * The server as written — userinfo redacted — when it would carry the CONNECT frame's credential in
- * the clear, else undefined. nats.js upgrades a `nats://`/`ws://` link only when
- * `backend_config.tls` asks it to or the server refuses to go on without it, and it sends
- * `token`/`user`/`pass` in the first frame either way — so a plaintext scheme to a host we cannot
- * PROVE is loopback is a credential on the wire. Keep an unparseable server on the warned side, so
- * that an address this cannot classify is reported rather than excused.
+ * The server as written — userinfo redacted — when it names a host we cannot PROVE is loopback, else
+ * undefined. nats.js strips the scheme before it dials (`servers.js` `hostPort()`) and decides
+ * encryption from `backend_config.tls` and the server's INFO alone, so `tls://` and `wss://` select
+ * nothing: every scheme reaches this server over the same plain TCP socket, carrying
+ * `token`/`user`/`pass` in the CONNECT frame. Keep the scheme out of this judgement, so that an
+ * address cannot be excused by a prefix the driver never reads.
  */
 export function plaintextRemoteServer(server: string): string | undefined {
   const text = server.trim();
   const prefix = schemePrefix(text);
-  if (prefix !== '' && !PLAINTEXT_SCHEMES.includes(prefix.slice(0, -2).toLowerCase())) return undefined;
   // Keep the authority split by hand rather than through `URL`, so that every scheme is classified
   // by the same rules: `URL` canonicalizes an integer-form IPv4 host for `ws:` and leaves it alone
   // for `nats:`, which would excuse under one scheme exactly what it warns about under the other.
@@ -194,9 +191,11 @@ export function assertNoServerCredentials(cfg: NatsBackendConfig): void {
 }
 
 /**
- * One warning per `servers` entry that would put a configured credential on an unencrypted remote
- * link. A warning rather than a load error: a cluster fronted by a TLS-terminating sidecar, and a
- * loopback fixture, are both legitimate — but neither is a reason for the mistake to be silent.
+ * One warning per `servers` entry that would put a configured credential on a remote link nothing
+ * in this config forces to be encrypted. A warning rather than a load error: a TLS-terminating
+ * sidecar, a loopback fixture, and a server whose INFO offers TLS (which nats.js then upgrades to
+ * on its own) are all legitimate — but none is a reason for the mistake to be silent. Setting
+ * `backend_config.tls` is what turns that opportunistic upgrade into a fail-fast guarantee.
  * The offending fields are named — never their values.
  */
 export function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
@@ -210,10 +209,10 @@ export function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
     return plaintext === undefined
       ? []
       : [
-          `backend_config.servers ${JSON.stringify(plaintext)} is an unencrypted NATS scheme to a ` +
-            'non-loopback host and backend_config.tls is unset, so the CONNECT frame carries ' +
-            `backend_config.${fields.join('/')} across the network in the clear. Use tls:// (or ` +
-            'wss://), or set backend_config.tls.',
+          `backend_config.servers ${JSON.stringify(plaintext)} is a non-loopback host and ` +
+            'backend_config.tls is unset, so nothing here forces encryption and the CONNECT frame ' +
+            `may carry backend_config.${fields.join('/')} across the network in the clear. Set ` +
+            'backend_config.tls — nats.js discards the URL scheme, so tls:// does not encrypt.',
         ];
   });
 }
