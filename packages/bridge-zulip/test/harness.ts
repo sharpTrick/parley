@@ -9,7 +9,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
-import { type FakeZulip, startFakeZulip } from './fake-zulip.js';
+import { type FakeZulip, SERVER_CONSTRAINTS, startFakeZulip } from './fake-zulip.js';
 
 /**
  * The declared type of every `backend_config` key, parsed from the source's own
@@ -35,6 +35,47 @@ export const DECLARED_CONFIG_KEYS = Object.keys(DECLARED_CONFIG_TYPES);
 export const rand = (): string => Math.random().toString(36).slice(2, 8);
 export const SENDER = asHandle('writer');
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Every character any plausible spelling of "whitespace" strips off an edge: both sets the SERVER
+ * uses ({@link SERVER_CONSTRAINTS}, which are NOT the same set as each other) plus everything
+ * JavaScript's own `\s` and `String#trim` add on top, enumerated by scanning the whole code space
+ * rather than hand-listed.
+ *
+ * Keep it generated from the divergence itself, so that a table built on it fails on the FIRST code
+ * point where a guard's character class disagrees with the server's — the four sets disagree in both
+ * directions, so a hand-picked row list cannot be trusted to contain the divergence, and the two
+ * that shipped (U+0085 and U+001C-U+001F on a body) were exactly the ones nobody listed.
+ */
+export const CANDIDATE_PADDINGS: string[] = ((): string[] => {
+  const found = new Set([
+    ...SERVER_CONSTRAINTS.stripsBodyEdges,
+    ...SERVER_CONSTRAINTS.stripsTopicEdges,
+  ]);
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const c = String.fromCodePoint(cp);
+    if (/\s/u.test(c) || c.trim() === '') found.add(c);
+  }
+  return [...found].sort();
+})();
+
+export const padName = (pad: string): string =>
+  `U+${(pad.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}`;
+
+/** Where the padding sits — a right-strip-only guard passes one placement and fails another. */
+export const PLACEMENTS: Array<{ name: string; pad: (p: string, core: string) => string }> = [
+  { name: 'leading', pad: (p, core) => `${p}${core}` },
+  { name: 'trailing', pad: (p, core) => `${core}${p}` },
+  { name: 'both ends', pad: (p, core) => `${p}${core}${p}` },
+];
+
+/** The placements above plus the two only a pure call can afford: no edge at all, and no core. */
+export const ALL_PLACEMENTS: typeof PLACEMENTS = [
+  ...PLACEMENTS,
+  { name: 'interior only', pad: (p, core) => `${core}${p}${core}` },
+  { name: 'alone', pad: (p) => p },
+];
 
 export interface ZulipPair {
   plugin: ZulipPlugin;

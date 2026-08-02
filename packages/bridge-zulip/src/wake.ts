@@ -56,7 +56,7 @@ async function armWake(
   if (live !== undefined && live.healthy > 0) {
     return conn.timedWait(Math.max(0, deadline - Date.now()), live.wakes);
   }
-  return armDedicatedQueue(conn, topic, deadline, pauseMs);
+  return armDedicatedQueue(conn, topic, deadline, pauseMs, generation);
 }
 
 /**
@@ -66,7 +66,7 @@ async function armWake(
  * so the caller's next history read still lands inside its budget instead of at the end of it.
  */
 async function armDedicatedQueue(
-  conn: ZulipConnection, topic: Topic, deadline: number, pauseMs: number,
+  conn: ZulipConnection, topic: Topic, deadline: number, pauseMs: number, generation: number,
 ): Promise<Wake> {
   let reg: { queue_id: string; last_event_id: number };
   // Keep this queue's whole life — poll and delete — on the transport that minted it, so that a
@@ -81,6 +81,13 @@ async function armDedicatedQueue(
     return { waited: pause(conn, deadline, pauseMs), release: () => undefined };
   } finally {
     bound.done();
+  }
+  // Keep this re-check between the register and the registry, so that a queue whose connection was
+  // replaced while it was being minted is dropped on the server that minted it rather than joining
+  // the NEXT connection's registry, where its teardown would address the wrong server entirely.
+  if (conn.stopped || conn.generation !== generation) {
+    conn.deleteQueueDetached(rest, reg.queue_id);
+    return { waited: Promise.resolve(), release: () => undefined };
   }
   const state: QueueState = { queueId: reg.queue_id };
   conn.queues.add(state);

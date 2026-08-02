@@ -23,15 +23,26 @@ export const SERVER_CONSTRAINTS = {
    * `zerver/lib/typed_endpoint.py` `OptionalTopic` — a send's topic is a pydantic
    * `StringConstraints(strip_whitespace=True)` field, so the SEND strips its edges while
    * `topic_match_q` (`subject__iexact`) and `build_narrow_predicate`'s bare `lower()` compare match
-   * the operand exactly as sent. The strip is Unicode White_Space, which is not `String#trim`'s set.
+   * the operand exactly as sent.
+   *
+   * The strip is pydantic-core's Rust `trim()`, i.e. exactly Unicode White_Space — NOT
+   * `String#trim`'s set (which adds U+FEFF and drops U+0085) and NOT Python's `str.strip()` (which
+   * adds U+001C-U+001F, and so is a WIDER set than this one). Enumerated rather than written as a
+   * character class, so that a plugin graded against it is graded against the server's set instead
+   * of against a second spelling of the plugin's own regex.
    */
-  stripsTopicEdges: true,
+  stripsTopicEdges: '\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000',
   /** `settings.MAX_MESSAGE_LENGTH` — `normalize_body` truncates a longer body on send. */
   maxMessageLength: 10_000,
   /** `zerver/lib/message.py` `truncate_body` marker, appended to a body that is truncated. */
   bodyTruncationSuffix: '\n[message truncated]',
-  /** `zerver/lib/message.py::normalize_body`: `body.rstrip().lstrip('\n')` before the body is stored. */
-  stripsBodyEdges: true,
+  /**
+   * `zerver/lib/message.py::normalize_body`: `body.rstrip().lstrip('\n')` before the body is stored.
+   * `rstrip()` takes Python's `str.isspace()` set — White_Space PLUS U+001C-U+001F — so this is a
+   * strictly WIDER set than {@link SERVER_CONSTRAINTS.stripsTopicEdges}, and neither is JavaScript's
+   * `\s`. Enumerated for the same reason the topic set is.
+   */
+  stripsBodyEdges: '\u0009\u000a\u000b\u000c\u000d\u001c\u001d\u001e\u001f\u0020\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000',
   /** `normalize_body` rejects a body that normalizes to empty. */
   rejectsEmptyBody: true,
   /** `normalize_body` rejects a body carrying a NUL. */
@@ -711,8 +722,8 @@ function flagIsTrue(raw: string | null, flag: keyof typeof SERVER_CONSTRAINTS.re
  * is right-stripped and its leading newlines removed, an empty or NUL-carrying result is refused,
  * and a longer one is truncated to `maxMessageLength` code points with the truncation marker.
  */
-function normalizeBody(body: string): string | { msg: string } {
-  const stripped = body.replace(/\s+$/u, '').replace(/^\n+/, '');
+export function normalizeBody(body: string): string | { msg: string } {
+  const stripped = rstrip(body, SERVER_CONSTRAINTS.stripsBodyEdges).replace(/^\n+/, '');
   if (stripped === '') return { msg: 'Message must not be empty' };
   if (stripped.includes('\u0000')) return { msg: 'Message must not contain null bytes' };
   const chars = [...stripped];
@@ -748,13 +759,33 @@ function extractStreamIndicator(raw: string): string | { msg: string } {
  * ever sees it, and the view then truncates what is left. Both rewrites are invisible to a client
  * that only reads its own writes back by the name it sent.
  */
-function normalizeTopic(topic: string): string {
+export function normalizeTopic(topic: string): string {
   return truncateTopic(stripTopicEdges(topic));
 }
 
-/** pydantic's `strip_whitespace`, which is Unicode White_Space — NOT `String#trim`'s set. */
+/** pydantic's `strip_whitespace`, taken off BOTH edges by the set the constraint enumerates. */
 function stripTopicEdges(topic: string): string {
-  return String(topic).replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+  const set = SERVER_CONSTRAINTS.stripsTopicEdges;
+  return lstrip(rstrip(String(topic), set), set);
+}
+
+/**
+ * Python `str.rstrip()`/`str.lstrip()` over an explicit set of characters. Keep the model on the
+ * enumerated constraint rather than on a character class, so that this fake cannot silently agree
+ * with a plugin that spelled the server's set wrong.
+ */
+function rstrip(value: string, set: string): string {
+  const chars = [...value];
+  let end = chars.length;
+  while (end > 0 && set.includes(chars[end - 1] as string)) end--;
+  return chars.slice(0, end).join('');
+}
+
+function lstrip(value: string, set: string): string {
+  const chars = [...value];
+  let start = 0;
+  while (start < chars.length && set.includes(chars[start] as string)) start++;
+  return chars.slice(start).join('');
 }
 
 /** Zulip stores at most 60 characters of subject, replacing the tail with an ellipsis. */

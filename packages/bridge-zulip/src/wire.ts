@@ -45,6 +45,15 @@ const MAX_TOPIC_NAME_LENGTH = 60;
  */
 const SERVER_STRIPPED_TOPIC_EDGE = /^\p{White_Space}+|\p{White_Space}+$/gu;
 
+/**
+ * The trailing whitespace a send loses off a BODY, which is a DIFFERENT set: `normalize_body` calls
+ * Python's `str.rstrip()`, whose set is `str.isspace()` — White_Space plus U+001C–U+001F. Keep it
+ * distinct from {@link SERVER_STRIPPED_TOPIC_EDGE} and off JavaScript's `\s`, so that neither the
+ * four separators, nor U+0085 (which this strip takes and `\s` does not), nor U+FEFF (which `\s`
+ * takes and no server strip does) is graded against the wrong rewrite.
+ */
+const SERVER_STRIPPED_BODY_TAIL = /[\p{White_Space}\u001c-\u001f]+$/u;
+
 /** `settings.MAX_MESSAGE_LENGTH`: `normalize_body` truncates a longer body on send. */
 const MAX_MESSAGE_LENGTH = 10_000;
 
@@ -125,7 +134,7 @@ export async function readRetryAfter(res: Response): Promise<number | undefined>
  * topic is. Measured in code points, which is what Python's `len` counts.
  */
 export function requireSendableBody(content: string): string {
-  const rewritten = content.replace(/\s+$/u, '').replace(/^\n+/, '');
+  const rewritten = content.replace(SERVER_STRIPPED_BODY_TAIL, '').replace(/^\n+/, '');
   if (rewritten === '') {
     throw new Error(
       'Zulip rejects an empty message body (Zulip strips trailing whitespace and leading newlines ' +
@@ -136,7 +145,10 @@ export function requireSendableBody(content: string): string {
     throw new Error('Zulip rejects a message body containing a NUL (U+0000). Remove it.');
   }
   if (rewritten !== content) {
-    const edge = content.replace(/\s+$/u, '') === content ? 'leading newlines' : 'trailing whitespace';
+    const edge =
+      content.replace(SERVER_STRIPPED_BODY_TAIL, '') === content
+        ? 'leading newlines'
+        : 'trailing whitespace';
     throw new Error(
       `Zulip rewrites a message body on send: it strips ${edge}, so this message would be stored ` +
         'altered and read back as something else. Trim it before posting.',

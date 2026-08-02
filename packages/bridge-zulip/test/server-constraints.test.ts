@@ -6,9 +6,14 @@
  */
 import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { type FakeMember, type FakeZulip, SERVER_CONSTRAINTS } from './fake-zulip.js';
+import {
+  type FakeMember,
+  type FakeZulip,
+  normalizeBody,
+  SERVER_CONSTRAINTS,
+} from './fake-zulip.js';
 import { ZulipPlugin } from '../src/index.js';
-import { rand, SENDER, useZulip } from './harness.js';
+import { CANDIDATE_PADDINGS, padName, PLACEMENTS, rand, SENDER, useZulip } from './harness.js';
 
 const boot = useZulip();
 
@@ -102,29 +107,20 @@ describe('zulip topic length vs the server truncation, counted in code points', 
 });
 
 /**
- * Characters a topic can be padded with, split by whether the SEND strips them. Each stripped one is
- * a distinct hazard because the sets disagree: `String#trim` would take U+FEFF the server keeps and
- * leave U+0085 the server takes, so a plugin that reached for `trim` refuses a name that round-trips
- * and accepts one that cannot. The kept rows are asserted as hard as the stripped ones — an
- * over-eager strip check turns a usable topic into a permanent `post` error.
+ * Characters a topic can be padded with, generated over the WHOLE whitespace code space
+ * ({@link CANDIDATE_PADDINGS}) and split by whether the SEND strips them — each verdict read off the
+ * server's own enumerated set rather than decided per row by hand. Every stripped one is a distinct
+ * hazard because the candidate sets disagree in both directions: `String#trim` takes U+FEFF the
+ * server keeps and leaves U+0085 the server takes, and Python's `str.strip()` takes U+001C-U+001F
+ * this parser keeps. The kept rows are asserted as hard as the stripped ones — an over-eager strip
+ * check turns a usable topic into a permanent `post` error.
  */
-const TOPIC_PADDINGS: Array<{ name: string; pad: string; stripped: boolean }> = [
-  { name: 'an ASCII space', pad: ' ', stripped: true },
-  { name: 'a tab', pad: '\t', stripped: true },
-  { name: 'a newline', pad: '\n', stripped: true },
-  { name: 'U+00A0 no-break space', pad: ' ', stripped: true },
-  { name: 'U+2003 em space', pad: ' ', stripped: true },
-  { name: 'U+3000 ideographic space', pad: '　', stripped: true },
-  { name: 'U+0085 next line, which String#trim does NOT take', pad: '', stripped: true },
-  { name: 'U+FEFF, which String#trim takes and the server does not', pad: '﻿', stripped: false },
-];
-
-/** Which edge carries the padding — a right-strip-only guard passes one placement and fails another. */
-const PLACEMENTS: Array<{ name: string; pad: (p: string, t: string) => string }> = [
-  { name: 'leading', pad: (p, t) => `${p}${t}` },
-  { name: 'trailing', pad: (p, t) => `${t}${p}` },
-  { name: 'both ends', pad: (p, t) => `${p}${t}${p}` },
-];
+const TOPIC_PADDINGS: Array<{ name: string; pad: string; stripped: boolean }> =
+  CANDIDATE_PADDINGS.map((pad) => ({
+    name: padName(pad),
+    pad,
+    stripped: SERVER_CONSTRAINTS.stripsTopicEdges.includes(pad),
+  }));
 
 /**
  * CLASS: a topic the SEND would rewrite is write-only, because no read rewrites it the same way —
@@ -656,6 +652,54 @@ describe('the fake rewrites a body exactly as Zulip documents', () => {
       expect((await rawSend(fake, { topic, content: row.sent })).status).toBe(400);
       expect((await plugin.fetchRecent({ topic: asTopic(topic) })).messages).toEqual([]);
     });
+  }
+});
+
+/**
+ * CLASS: the BODY strip is graded over the WHOLE whitespace code space, on both sides of the seam at
+ * once — the padding table the topic half already had, which the body half never did. The two server
+ * strips are DIFFERENT sets (this one is Python `str.rstrip()`, the topic's is pydantic-core's Rust
+ * `trim()`) and neither is JavaScript's `\s`, so a body guard written with the wrong one both accepts
+ * payloads the server silently rewrites and refuses ones it stores verbatim. Every row grades the
+ * plugin's verdict AND, on the wire where the plugin's refusal can no longer reach, what the fake
+ * actually stored — so the plugin and the model are each held to the enumerated server set instead
+ * of to each other.
+ */
+describe('zulip post never lets the server rewrite a body, over the whole code space', () => {
+  for (const pad of CANDIDATE_PADDINGS) {
+    for (const placement of PLACEMENTS) {
+      const content = placement.pad(pad, 'hand-off');
+      const stored = normalizeBody(content);
+      const verdict =
+        typeof stored !== 'string'
+          ? 'is refused as empty, and the server refuses it too'
+          : stored === content
+            ? 'round-trips exactly, through the plugin and on the wire'
+            : 'is refused, and the server would have stored it rewritten';
+
+      it(`a body ${placement.name} ${padName(pad)} ${verdict}`, async () => {
+        const { plugin, fake } = await boot();
+        const topic = `body-${rand()}`;
+
+        if (typeof stored !== 'string') {
+          await expect(plugin.post(asTopic(topic), SENDER, content)).rejects.toThrow(/empty/i);
+          expect((await rawSend(fake, { topic, content })).status).toBe(400);
+          return;
+        }
+        if (stored === content) {
+          await plugin.post(asTopic(topic), SENDER, content);
+          const { messages } = await plugin.fetchRecent({ topic: asTopic(topic) });
+          expect(messages.map((m) => m.content)).toEqual([content]);
+          return;
+        }
+        await expect(plugin.post(asTopic(topic), SENDER, content)).rejects.toThrow(
+          /rewrites a message body/,
+        );
+        expect((await rawSend(fake, { topic, content })).status).toBe(200);
+        const { messages } = await plugin.fetchRecent({ topic: asTopic(topic) });
+        expect(messages.map((m) => m.content)).toEqual([stored]);
+      });
+    }
   }
 });
 

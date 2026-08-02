@@ -7,6 +7,8 @@
  */
 import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
+import { normalizeBody, normalizeTopic, SERVER_CONSTRAINTS } from './fake-zulip.js';
+import { ALL_PLACEMENTS, CANDIDATE_PADDINGS, padName } from './harness.js';
 import { resolveConfig, type ZulipConfig } from '../src/config.js';
 import {
   blockedFetchPause,
@@ -76,6 +78,73 @@ describe('a message body is refused unless Zulip would store it verbatim', () =>
       }
       expect(requireSendableBody(row.body)).toBe(row.body);
     });
+  }
+});
+
+/**
+ * CLASS: every server rewrite this plugin refuses is graded against the SERVER's character set,
+ * enumerated over the whole code space, rather than against whichever characters a row list
+ * happened to name. Four sets are in play and no two are equal — the body strip is Python
+ * `str.rstrip()` (White_Space + U+001C-U+001F), the topic strip is pydantic-core's Rust `trim()`
+ * (White_Space exactly), and JavaScript's `\s` and `String#trim` are a third spelling that drops
+ * U+0085 and adds U+FEFF. A guard written with the wrong one of the four therefore fails in BOTH
+ * directions at once: it accepts a payload the server silently rewrites (a `post` that reports a
+ * durable id for something no read returns as sent) and refuses one the server stores verbatim (a
+ * hand-off that can never be posted at all).
+ *
+ * Both verdicts come from {@link normalizeBody}/{@link normalizeTopic} — the fake's model of the
+ * server, built from the enumerated constraint — so the plugin is graded against the server rather
+ * than against a second copy of its own regex, and the two sets cannot be collapsed into one
+ * without a row failing.
+ */
+describe('every server rewrite is graded against the whole whitespace code space', () => {
+  const tailIsStripped = (content: string): boolean => {
+    const last = [...content].at(-1);
+    return last !== undefined && SERVER_CONSTRAINTS.stripsBodyEdges.includes(last);
+  };
+
+  it('the generated table actually spans the divergence it exists to catch', () => {
+    const bodyOnly = [...SERVER_CONSTRAINTS.stripsBodyEdges].filter(
+      (c) => !SERVER_CONSTRAINTS.stripsTopicEdges.includes(c),
+    );
+    const jsOnly = CANDIDATE_PADDINGS.filter(
+      (c) =>
+        !SERVER_CONSTRAINTS.stripsBodyEdges.includes(c) &&
+        !SERVER_CONSTRAINTS.stripsTopicEdges.includes(c),
+    );
+    expect(bodyOnly.map(padName)).toEqual(['U+001C', 'U+001D', 'U+001E', 'U+001F']);
+    expect(jsOnly.map(padName)).toEqual(['U+FEFF']);
+    expect(CANDIDATE_PADDINGS.map(padName)).toContain('U+0085');
+  });
+
+  for (const pad of CANDIDATE_PADDINGS) {
+    for (const placement of ALL_PLACEMENTS) {
+      it(`a body ${placement.name} ${padName(pad)} matches what normalize_body would store`, () => {
+        const content = placement.pad(pad, 'hand-off');
+        const stored = normalizeBody(content);
+        if (typeof stored !== 'string') {
+          expect(() => requireSendableBody(content)).toThrow(/empty message body/);
+          return;
+        }
+        if (stored !== content) {
+          expect(() => requireSendableBody(content)).toThrow(
+            tailIsStripped(content) ? /trailing whitespace/ : /leading newlines/,
+          );
+          return;
+        }
+        expect(requireSendableBody(content)).toBe(content);
+      });
+
+      it(`a topic ${placement.name} ${padName(pad)} matches what the request parser would store`, () => {
+        const topic = placement.pad(pad, 'core');
+        const wire = topic.toLowerCase();
+        if (normalizeTopic(wire) !== wire) {
+          expect(() => requireWireTopic(asTopic(topic))).toThrow(/strips whitespace/);
+          return;
+        }
+        expect(requireWireTopic(asTopic(topic))).toBe(wire);
+      });
+    }
   }
 });
 
