@@ -11,7 +11,7 @@
  *     that carries it, and a rejection that repeats on every catch-up wedges the topic forever,
  *     because the cursor never advances past the record that caused it.
  */
-import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, parseMentions, type Topic } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +26,7 @@ import {
   TS_RE,
 } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
-import { capture, settleWithin, sleep, startSlack } from './harness.js';
+import { capture, settleWithin, sleep, startSlack, withSlack } from './harness.js';
 
 /** A row label for a value `JSON.stringify` renders as `undefined` (a function) or not at all. */
 const shapeOf = (v: unknown): string =>
@@ -270,6 +270,115 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
       });
     }
   }
+
+  /**
+   * CLASS: a `backend_config` map value whose DESTINATION re-parses it, rather than merely carrying
+   * it. The table above varies a value's TYPE; a type check cannot see a GRAMMAR, and a value that
+   * passes one and fails the other is accepted at load and then silently inert. `mention_map` values
+   * are spliced into content as `@value` and read back by core's `parseMentions`, so a value that
+   * does not survive that round trip yields NO mention at all — and a bridge running
+   * `live_push.mention_filter` on that handle then drops every message addressed to it, in silence,
+   * which is the exact failure the mention rewrite exists to prevent.
+   *
+   * The oracle is core's EXPORTED parser, never the plugin's own predicate, so a plugin check that
+   * drifts from the grammar it exists to agree with fails HERE instead of agreeing with itself. Both
+   * directions are graded from one rule, so a fix cannot pass by refusing everything: a value the
+   * parser round-trips must be accepted AND reach both `mentions` and `senderHandle` intact.
+   */
+  const GRAMMAR_MAPS = [
+    {
+      key: 'mention_map',
+      what: 'a handle',
+      roundTrips: (value: string): boolean => parseMentions(`@${value}`).map(String)[0] === value,
+    },
+  ] as const;
+
+  /**
+   * Handle-SHAPED strings — every one of them a non-empty string the type check admits, so no row
+   * here can be answered by the table above. The boundary assertion below keeps the corpus honest:
+   * a corpus that drifted to all-good or all-bad rows would leave one arm of the rule ungraded while
+   * staying green.
+   */
+  const HANDLE_SHAPED = [
+    'ctx-payments',
+    'bob',
+    'B0t',
+    'a.b',
+    'a_b_c',
+    'x'.repeat(64),
+    '@ctx-payments',
+    'the boss',
+    '_ops',
+    '-ops',
+    '.ops',
+    'bob.',
+    'bob-',
+    'bob_',
+    'a/b',
+    'a:b',
+    'a@b',
+    'алиса',
+    'bot@example.com',
+    'two\nlines',
+    '#general',
+    '@',
+  ];
+
+  it('the candidate corpus straddles the grammar boundary in both directions', () => {
+    for (const map of GRAMMAR_MAPS) {
+      const good = HANDLE_SHAPED.filter((v) => map.roundTrips(v));
+      expect(good.length, `${map.key}: no row exercises the ACCEPT arm`).toBeGreaterThan(2);
+      expect(
+        HANDLE_SHAPED.length - good.length,
+        `${map.key}: no row exercises the REFUSE arm`,
+      ).toBeGreaterThan(7);
+    }
+  });
+
+  for (const map of GRAMMAR_MAPS) {
+    for (const value of HANDLE_SHAPED) {
+      it(`a ${map.key} value of ${JSON.stringify(value)} is refused at load or accepted for use`, async () => {
+        const plugin = new SlackPlugin();
+        const load = await capture(
+          plugin.connect({
+            api_url: 'http://127.0.0.1:1/api',
+            [map.key]: { U0BOSS: value },
+          } as unknown as Record<string, unknown>),
+        );
+        if (!map.roundTrips(value)) {
+          expect(load.status, 'accepted a value the parser cannot round-trip').toBe('rejected');
+          const said = String((load as { reason?: unknown }).reason);
+          expect(said).toMatch(new RegExp(`${map.key}[\\s\\S]*U0BOSS[\\s\\S]*not ${map.what}`));
+          return;
+        }
+        expect(load.status, 'refused a value the parser round-trips').toBe('fulfilled');
+        await plugin.disconnect();
+      });
+    }
+  }
+
+  // The other half of the same rule, on ONE workspace: what load ACCEPTS must survive the whole way
+  // to the fields a mention filter and a roster read. A fix that passed the rows above by refusing
+  // everything would leave this one grading an empty map, so it states the count it expects.
+  it('every mention_map value that load accepts reaches mentions and senderHandle intact', async () => {
+    const accepted = HANDLE_SHAPED.filter((v) => parseMentions(`@${v}`).map(String)[0] === v);
+    const ids = accepted.map((_v, i) => `U0GOOD${i}`);
+    const mentionMap = Object.fromEntries(accepted.map((v, i) => [ids[i]!, v]));
+
+    await withSlack({ mentionMap }, async (fake, plugin) => {
+      const topic = asTopic('C0GRAMMAR');
+      fake.seedRaw(
+        topic,
+        ids.map((id) => ({ type: 'message', ts: fake.mintTs(), user: id, text: `ping <@${id}>` })),
+      );
+      const { messages } = await plugin.fetchRecent({ topic, limit: 100 });
+      expect(messages).toHaveLength(accepted.length);
+      for (const [i, value] of accepted.entries()) {
+        expect(messages[i]!.mentions.map(String), `${value}: mention_filter would never match`).toEqual([value]);
+        expect(String(messages[i]!.senderHandle), `${value}: senderHandle`).toBe(value);
+      }
+    });
+  });
 
   /**
    * CLASS: the CONTAINER shape of a `backend_config` value, which the declared TypeScript type

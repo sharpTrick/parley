@@ -61,6 +61,13 @@ the fallback, and an unmapped, unlabelled id surfaces as the bare id — visible
 a configured handle. Non-mention markup (`<!date^…>`, `<https://…|link>`, `<#C0…|general>`) is left
 verbatim.
 
+A `mention_map` **value** must be a handle core's mention parser can produce — alphanumeric at both
+ends, interior `.`, `_` and `-` only — and one that is not fails at `connect`, naming the key. Write
+`ctx-payments`, not `@ctx-payments`, `the boss` or `_ops`: those are spliced into content as
+`@@ctx-payments` / `@the boss` / `@_ops`, parse back as something else or as nothing at all, and a
+bridge running `live_push.mention_filter` on that handle would then drop every message addressed to
+it, in silence.
+
 **Escaping, and why `post` cannot mention anyone.** Slack's `text` field is markup, and the sender
 owns the escaping of `&`, `<` and `>`. Everything Parley relays is untrusted — an inbound Matrix or
 Discord message, a prompt-injected agent turn — so `post` escapes all three: content carrying

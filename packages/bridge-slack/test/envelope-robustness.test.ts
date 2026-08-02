@@ -15,7 +15,14 @@
  *     a redeliver/disconnect loop. The ack assertion therefore runs over dropped envelopes, not
  *     just surfaced ones.
  */
-import { asCursor, asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
+import {
+  asCursor,
+  asHandle,
+  asTopic,
+  type Message,
+  type MessageHandler,
+  type Topic,
+} from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { SlackPlugin } from '../src/index.js';
@@ -326,6 +333,137 @@ describe('slack socket mode: the ack precedes any handler processing', () => {
         await vi.waitFor(() => expect(h.fake.acked).toContain(id!), { timeout: 3000, interval: 5 });
       } finally {
         stop();
+        await h.cleanup();
+      }
+    });
+  }
+});
+
+/**
+ * CLASS: a subscribe handler's FAILURE, in every shape the seam's `(msg: Message) => void` admits.
+ *
+ * That return type does not forbid an `async` handler, and core is free to pass one, so a `try {
+ * handler(m) } catch {}` around the call sees a synchronous throw and nothing else: a rejected
+ * promise walks straight past it and, on Node's default `--unhandled-rejections=throw`, ends the
+ * bridge process — a live-push backend killed by whatever the agent-side handler did with one
+ * message. The containment must therefore be graded from the FAILURE SHAPE, not from whether the
+ * plugin happens to call the handler synchronously today.
+ *
+ * The `never settles` row is the other half, and the reason the rejection arm must not be awaited:
+ * awaiting it would serialise delivery behind a handler that never resolves, trading a crash for a
+ * silent stall. Every row asserts the same three things — the later messages still arrive, still in
+ * ascending order, and nothing reached the process.
+ */
+const FAILING_HANDLERS: Array<{ name: string; make: (seen: string[]) => MessageHandler }> = [
+  {
+    name: 'throws on the first message only',
+    make: (seen) => {
+      let first = true;
+      return (m) => {
+        seen.push(m.content);
+        if (!first) return;
+        first = false;
+        throw new Error('handler exploded');
+      };
+    },
+  },
+  {
+    name: 'throws on every message',
+    make: (seen) => (m) => {
+      seen.push(m.content);
+      throw new Error('handler exploded');
+    },
+  },
+  {
+    name: 'throws a non-Error',
+    make: (seen) => (m) => {
+      seen.push(m.content);
+      throw 'handler exploded';
+    },
+  },
+  {
+    name: 'rejects on the first message only',
+    make: (seen) => {
+      let first = true;
+      const handler = async (m: Message): Promise<void> => {
+        seen.push(m.content);
+        if (!first) return;
+        first = false;
+        throw new Error('handler rejected');
+      };
+      return handler;
+    },
+  },
+  {
+    name: 'rejects on every message',
+    make: (seen) => {
+      const handler = async (m: Message): Promise<void> => {
+        seen.push(m.content);
+        throw new Error('handler rejected');
+      };
+      return handler;
+    },
+  },
+  {
+    name: 'rejects with a non-Error',
+    make: (seen) => {
+      const handler = async (m: Message): Promise<void> => {
+        seen.push(m.content);
+        throw 'handler rejected';
+      };
+      return handler;
+    },
+  },
+  {
+    name: 'rejects asynchronously, a turn after it returned',
+    make: (seen) => {
+      const handler = async (m: Message): Promise<void> => {
+        seen.push(m.content);
+        await new Promise((r) => setTimeout(r, 5));
+        throw new Error('handler rejected late');
+      };
+      return handler;
+    },
+  },
+  {
+    name: 'never settles',
+    make: (seen) => {
+      const handler = (m: Message): Promise<void> => {
+        seen.push(m.content);
+        return new Promise<void>(() => undefined);
+      };
+      return handler;
+    },
+  },
+];
+
+const FAILING_PUSHES = 5;
+
+describe("slack socket mode: a handler's failure never leaves the handler", () => {
+  for (const behaviour of FAILING_HANDLERS) {
+    it(`a handler that ${behaviour.name}: later events still arrive in order, nothing escapes`, async () => {
+      const h = await harness();
+      const watch = watchForCrashes();
+      try {
+        const seen: string[] = [];
+        await h.plugin.subscribe(h.topic, behaviour.make(seen));
+
+        const before = new Set(h.fake.pushed);
+        const texts = Array.from({ length: FAILING_PUSHES }, (_u, i) => `m${i}`);
+        for (const text of texts) {
+          h.fake.pushEvent(h.topic, { ts: h.fake.mintTs(), text, user: 'U0X' });
+        }
+        await vi.waitFor(() => expect(seen).toEqual(texts), { timeout: 3000, interval: 10 });
+
+        // An escaped rejection is reported a turn of the loop later than the throw that caused it.
+        await new Promise((r) => setTimeout(r, 100));
+        expect(watch.crashes, "the handler's failure reached the process").toEqual([]);
+
+        const ids = [...h.fake.pushed].filter((p) => !before.has(p));
+        expect(ids).toHaveLength(FAILING_PUSHES);
+        for (const id of ids) expect(h.fake.acked, `unacked: ${id}`).toContain(id);
+      } finally {
+        watch.stop();
         await h.cleanup();
       }
     });

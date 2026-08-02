@@ -378,7 +378,13 @@ export class SocketModeLink {
     const route = this.routes.get(event.channel);
     if (route === undefined) return;
     try {
-      route.handler(slackToMessage(route.topic, event, this.host.settings().mentionMap));
+      // Keep the rejection arm attached and NOT awaited, so that an `async` handler — which the
+      // seam's `=> void` return type does not forbid, and which core is free to pass — can neither
+      // end the process on Node's default `--unhandled-rejections=throw` nor, by never resolving,
+      // hold up every later event on this socket.
+      void Promise.resolve(
+        route.handler(slackToMessage(route.topic, event, this.host.settings().mentionMap)),
+      ).catch(() => undefined);
     } catch {
       /* handler is best-effort; never break the loop (DESIGN §6) */
     }

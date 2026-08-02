@@ -1,3 +1,4 @@
+import { parseMentions } from '@sharptrick/parley-core';
 import { plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
@@ -55,6 +56,33 @@ export const TIMER_CONFIG_KEYS = ['handshake_timeout_ms', 'rotation_grace_ms'] a
 export const TOKEN_CONFIG_KEYS = ['bot_token', 'app_token'] as const;
 
 /**
+ * The grammar a map's DESTINATION imposes on a value, beyond "a non-empty string". A destination
+ * that re-parses the value — rather than just carrying it — has one, and a value the type check
+ * admits but the grammar cannot round-trip is accepted at load and then silently inert.
+ */
+export interface MapValueGrammar {
+  accepts: (value: string) => boolean;
+  /** What the operator has to change, phrased for stderr. */
+  requirement: string;
+}
+
+/**
+ * `mention_map` values are spliced into content as `@${value}` and read back by core's
+ * {@link parseMentions}, so a value that does not survive that round trip produces NO mention at
+ * all — and `live_push.mention_filter` armed on it then drops every message addressed to it, in
+ * silence. Derive the predicate from the exported parser rather than restating its character class,
+ * so that the check cannot drift from the grammar it exists to agree with. (Core's own
+ * `isMentionableHandle` is the same predicate but is not on its public export surface — a seam gap,
+ * not a licence to reach into core's source tree.)
+ */
+export const MENTIONABLE_HANDLE: MapValueGrammar = {
+  accepts: (value) => parseMentions(`@${value}`)[0] === value,
+  requirement:
+    'an @-mention of it must parse back to exactly it (alphanumeric at both ends; interior ' +
+    '"." "_" "-" only), or core\'s mention filter can never match it',
+};
+
+/**
  * Reject a `backend_config` lookup table that is not one, or whose values cannot be used as ones.
  * Every value reaches either the wire (`channel_map`) or a `Message` field (`mention_map`), so keep
  * this fail-fast at load, so that a blank or non-string value cannot reach the wire as `"undefined"`
@@ -64,11 +92,15 @@ export const TOKEN_CONFIG_KEYS = ['bot_token', 'app_token'] as const;
  * destructures a string as happily as an object, so `channel_map: "C0123"` would become
  * `{"0":"C","1":"0",…}` and every configured topic would fall through to the channel-id-literal
  * branch — a bridge that comes up reporting success and is wired to nothing.
+ *
+ * Keep the type check AHEAD of `grammar`, so that a non-string value is still refused by the shape
+ * it failed rather than by a predicate that was never written to read one.
  */
 export function requireUsableMap(
   configKey: string,
   what: string,
   map: unknown,
+  grammar?: MapValueGrammar,
 ): Record<string, string> {
   if (typeof map !== 'object' || map === null || Array.isArray(map)) {
     throw new Error(
@@ -85,6 +117,12 @@ export function requireUsableMap(
       throw new Error(
         `Slack ${configKey} maps ${JSON.stringify(key)} to ${JSON.stringify(value)}, ` +
           `which is not ${what}`,
+      );
+    }
+    if (grammar !== undefined && !grammar.accepts(value)) {
+      throw new Error(
+        `Slack ${configKey} maps ${JSON.stringify(key)} to ${JSON.stringify(value)}, ` +
+          `which is not ${what}: ${grammar.requirement}`,
       );
     }
     checked[key] = value;
@@ -170,6 +208,7 @@ export function resolveConfig(cfg: SlackBackendConfig): SlackSettings {
       'mention_map',
       'a handle',
       cfg.mention_map === undefined ? {} : cfg.mention_map,
+      MENTIONABLE_HANDLE,
     ),
     handshakeTimeoutMs: cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
     rotationGraceMs: cfg.rotation_grace_ms ?? DEFAULT_ROTATION_GRACE_MS,

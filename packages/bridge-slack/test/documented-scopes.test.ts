@@ -411,7 +411,7 @@ describe('slack config docs track what connect() actually enforces', () => {
 });
 
 /**
- * CLASS: a README consequence about CORE behaviour, asserted against core rather than narrated.
+ * CLASS: a README consequence about CORE behaviour, asserted where the fact LIVES.
  *
  * The "give every session its own bot" warning used to justify itself with a roster collapse —
  * "their presence heartbeats all arrive as the same `senderHandle`, the roster collapses them into
@@ -419,26 +419,15 @@ describe('slack config docs track what connect() actually enforces', () => {
  * that way: `computeRoster` keys on the presence RECORD's self-reported `handle` and scopes liveness
  * per per-process `instanceId`, precisely so bot-token backends do not collapse. The prose outlived
  * the mechanism, and an operator reading it provisions a second Slack app to avoid a failure that
- * does not occur. `computeRoster` is not exported from `@sharptrick/parley-core`, so the mechanism is
- * pinned from its source: if core goes back to keying on `senderHandle`, this fails and the README
- * has to move with it.
+ * does not occur.
+ *
+ * Only the PROSE is graded here. The mechanism belongs to core and is graded there behaviourally —
+ * `packages/bridge-core/src/engine/presence.test.ts`, "the roster keys on the emitting bridge, not
+ * on the backend sender", which tables both attributions and requires N bridges to be N peers. This
+ * file used to pin it by regexing core's source for a private function's name, so a rename or a file
+ * move inside core reddened Slack's suite and reported the failure against the wrong package.
  */
 describe('slack multi-session docs track the roster mechanism in core', () => {
-  const presenceSource = (): string => read('../../bridge-core/src/engine/presence.ts');
-
-  const emitterOfBody = (): string => {
-    const found = /function emitterOf\([^)]*\): Handle \{([\s\S]*?)\n\}/.exec(presenceSource());
-    expect(found, 'bridge-core presence.ts has no emitterOf(rec, m) function').not.toBeNull();
-    return found![1]!;
-  };
-
-  it('core keys the roster on the record handle, with senderHandle only as the fallback', () => {
-    const body = emitterOfBody();
-    // The record's handle leads; `senderHandle` may appear only as the undefined-fallback arm.
-    expect(body).toMatch(/rec\.handle === undefined \?[\s\S]*m\.senderHandle[\s\S]*rec\.handle/);
-    expect(presenceSource(), 'liveness is scoped per instance').toContain('rec.instanceId');
-  });
-
   /** The section with its line wrapping collapsed, so a claim is matched as prose, not as layout. */
   const multiSession = (): string => {
     const readme = read('../README.md');
