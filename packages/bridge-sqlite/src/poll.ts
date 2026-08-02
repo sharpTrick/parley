@@ -5,7 +5,11 @@ import { rowToMessage } from './cursor.js';
 import { SqliteRetention } from './retention.js';
 import type { MessageRow } from './schema.js';
 
-/** Ceiling on the degraded poll interval, so a down DB is re-probed forever but cheaply. */
+/**
+ * Ceiling on the degraded poll interval, so a down DB is re-probed forever but cheaply. It bounds
+ * recovery latency only for intervals below it; keep it from lowering the delay past the configured
+ * interval, so that escalation cannot read a failing store MORE often than a healthy one.
+ */
 const BACKOFF_CEILING_MS = 30_000;
 
 /**
@@ -128,10 +132,13 @@ export abstract class SqlitePoller extends SqliteRetention {
 
 /**
  * Degraded poll delay after `failures` consecutive non-lock failures: exponential from the
- * configured interval, capped at {@link BACKOFF_CEILING_MS}. The cap is the README's promise that
- * a topic whose store was briefly unreachable resumes live push within 30 s, not within days.
+ * configured interval, capped at {@link BACKOFF_CEILING_MS} or that interval, whichever is longer.
+ * The cap is the README's promise that a topic whose store was briefly unreachable resumes live
+ * push within 30 s, not within days — a promise that only means anything below the ceiling, since
+ * an operator who configured a slower poll than 30 s already chose a longer dark window than the
+ * cap could deliver. Backing off can only ever slow the loop down.
  */
 export function backoffMs(pollIntervalMs: number, failures: number): number {
   const doublings = Math.min(failures - ESCALATE_AFTER + 1, 30);
-  return Math.min(pollIntervalMs * 2 ** doublings, BACKOFF_CEILING_MS);
+  return Math.max(pollIntervalMs, Math.min(pollIntervalMs * 2 ** doublings, BACKOFF_CEILING_MS));
 }

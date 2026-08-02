@@ -30,30 +30,62 @@ const T = asTopic('ctx');
 const me = asHandle('alice');
 const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-bg-')), 'p.db');
 
-interface ErrorCase {
+interface ErrorSpec {
   name: string;
-  make: () => Error;
+  /** The message SQLite itself puts on this condition, whichever driver surfaces it. */
+  message: string;
+  /** better-sqlite3's per-condition code; `undefined` for an error carrying no code at all. */
+  code: string | undefined;
   /** Whether a burst of this error must leave the loop able to deliver again by itself. */
   healable: boolean;
   /** Lock-classed errors are the sanctioned silent case; everything else must be diagnosed. */
   quiet: boolean;
 }
 
-const ERROR_CASES: ErrorCase[] = [
-  { name: 'SQLITE_BUSY', make: () => err('database is locked', 'SQLITE_BUSY'), healable: true, quiet: true },
-  { name: 'SQLITE_LOCKED', make: () => err('database table is locked', 'SQLITE_LOCKED'), healable: true, quiet: true },
-  { name: 'SQLITE_IOERR', make: () => err('disk I/O error', 'SQLITE_IOERR'), healable: true, quiet: false },
-  { name: 'SQLITE_CANTOPEN', make: () => err('unable to open database file', 'SQLITE_CANTOPEN'), healable: true, quiet: false },
-  { name: 'SQLITE_READONLY', make: () => err('attempt to write a readonly database', 'SQLITE_READONLY'), healable: true, quiet: false },
-  { name: 'SQLITE_FULL', make: () => err('database or disk is full', 'SQLITE_FULL'), healable: true, quiet: false },
-  { name: 'unclassified', make: () => new Error('something nobody anticipated'), healable: true, quiet: false },
-  { name: 'SQLITE_CORRUPT', make: () => err('database disk image is malformed', 'SQLITE_CORRUPT'), healable: false, quiet: false },
-  { name: 'no such table', make: () => err('no such table: messages', 'SQLITE_ERROR'), healable: false, quiet: false },
+interface ErrorCase {
+  name: string;
+  make: () => Error;
+  healable: boolean;
+  quiet: boolean;
+}
+
+const ERROR_SPECS: ErrorSpec[] = [
+  { name: 'SQLITE_BUSY', message: 'database is locked', code: 'SQLITE_BUSY', healable: true, quiet: true },
+  { name: 'SQLITE_LOCKED', message: 'database table is locked', code: 'SQLITE_LOCKED', healable: true, quiet: true },
+  { name: 'SQLITE_IOERR', message: 'disk I/O error', code: 'SQLITE_IOERR', healable: true, quiet: false },
+  { name: 'SQLITE_CANTOPEN', message: 'unable to open database file', code: 'SQLITE_CANTOPEN', healable: true, quiet: false },
+  { name: 'SQLITE_READONLY', message: 'attempt to write a readonly database', code: 'SQLITE_READONLY', healable: true, quiet: false },
+  { name: 'SQLITE_FULL', message: 'database or disk is full', code: 'SQLITE_FULL', healable: true, quiet: false },
+  { name: 'unclassified', message: 'something nobody anticipated', code: undefined, healable: true, quiet: false },
+  { name: 'SQLITE_CORRUPT', message: 'database disk image is malformed', code: 'SQLITE_CORRUPT', healable: false, quiet: false },
+  { name: 'no such table', message: 'no such table: messages', code: 'SQLITE_ERROR', healable: false, quiet: false },
 ];
 
-function err(message: string, code: string): Error {
-  return Object.assign(new Error(message), { code });
-}
+/**
+ * The two shapes a driver error actually reaches these loops in. better-sqlite3 puts the condition
+ * in `code`; node:sqlite — which this package ships and falls back to whenever there is no prebuilt
+ * native module — stamps `ERR_SQLITE_ERROR` on every class alike and leaves the message as the only
+ * signal. Built in the first shape only, every row hands the classifier the code its own arm
+ * matches, so the message arms it depends on for the whole fallback driver decide nothing here and
+ * could be deleted without turning this matrix red.
+ */
+const ERROR_SHAPES: Record<string, (s: ErrorSpec) => Error> = {
+  'better-sqlite3': (s) =>
+    s.code === undefined
+      ? new Error(s.message)
+      : Object.assign(new Error(s.message), { code: s.code }),
+  'node:sqlite': (s) =>
+    Object.assign(new Error(s.message), { code: 'ERR_SQLITE_ERROR', errstr: s.message }),
+};
+
+const ERROR_CASES: ErrorCase[] = Object.entries(ERROR_SHAPES).flatMap(([shape, build]) =>
+  ERROR_SPECS.map((s) => ({
+    name: `${s.name} (${shape} shape)`,
+    make: () => build(s),
+    healable: s.healable,
+    quiet: s.quiet,
+  })),
+);
 
 let open: SqlitePlugin[] = [];
 async function plugin(): Promise<SqlitePlugin> {
@@ -228,6 +260,11 @@ describe('a throwing handler is a consumer fault, not a store outage', () => {
  * is a literal rather than a re-derivation from the constant, so raising or removing the ceiling —
  * which the error-class matrix above cannot see, since a 13-failure burst never reaches it — turns
  * this table red instead of shipping a multi-day recovery.
+ *
+ * The ceiling bounds recovery latency only for intervals BELOW it. Above it, capping is what would
+ * do damage: an interval of 60 s capped to 30 s makes escalation read a store that is already
+ * failing twice as often as a healthy one, which is why the rows past the ceiling expect the
+ * configured interval back rather than the cap.
  */
 describe('the degraded poll delay is bounded by the documented ceiling', () => {
   const CEILING_MS = 30_000;
@@ -240,8 +277,11 @@ describe('the degraded poll delay is bounded by the documented ceiling', () => {
     { pollIntervalMs: 1000, failures: 14, expected: CEILING_MS },
     { pollIntervalMs: 1000, failures: 40, expected: CEILING_MS },
     { pollIntervalMs: 1000, failures: 1000, expected: CEILING_MS },
-    { pollIntervalMs: 60_000, failures: 10, expected: CEILING_MS },
-    { pollIntervalMs: MAX_POLL_INTERVAL_MS, failures: 11, expected: CEILING_MS },
+    { pollIntervalMs: CEILING_MS, failures: 10, expected: CEILING_MS },
+    { pollIntervalMs: CEILING_MS, failures: 1000, expected: CEILING_MS },
+    { pollIntervalMs: 60_000, failures: 10, expected: 60_000 },
+    { pollIntervalMs: 60_000, failures: 1000, expected: 60_000 },
+    { pollIntervalMs: MAX_POLL_INTERVAL_MS, failures: 11, expected: MAX_POLL_INTERVAL_MS },
   ];
 
   for (const { pollIntervalMs, failures, expected } of DELAYS) {
@@ -250,11 +290,29 @@ describe('the degraded poll delay is bounded by the documented ceiling', () => {
     });
   }
 
-  it('never decreases as failures accumulate, and never exceeds the ceiling', () => {
-    for (const pollIntervalMs of [MIN_POLL_INTERVAL_MS, 250, 1000, MAX_POLL_INTERVAL_MS]) {
+  /**
+   * The class: a cadence transform that can move AGAINST its configured base. Asserting only the
+   * upper bound leaves "backoff" free to become a speed-up for any interval above the ceiling —
+   * more read pressure on a store that is already failing, forever, which is the opposite of what
+   * backing off is for. The lower bound is the half that catches it, and it is asserted per point
+   * rather than over the series so the report names the interval that broke it.
+   */
+  it('never polls more often than the configured interval, however many failures accumulate', () => {
+    for (const pollIntervalMs of [MIN_POLL_INTERVAL_MS, 250, 1000, CEILING_MS, 60_000, MAX_POLL_INTERVAL_MS]) {
+      for (let failures = ESCALATE_AFTER - 1; failures <= 5 * ESCALATE_AFTER; failures++) {
+        expect(
+          backoffMs(pollIntervalMs, failures),
+          `backoffMs(${pollIntervalMs}, ${failures}) polls faster than the configured interval`,
+        ).toBeGreaterThanOrEqual(pollIntervalMs);
+      }
+    }
+  });
+
+  it('never decreases as failures accumulate, and never exceeds the ceiling or the interval', () => {
+    for (const pollIntervalMs of [MIN_POLL_INTERVAL_MS, 250, 1000, CEILING_MS, 60_000, MAX_POLL_INTERVAL_MS]) {
       const series = Array.from({ length: 60 }, (_u, i) => backoffMs(pollIntervalMs, i + 10));
       expect(series).toEqual([...series].sort((a, b) => a - b));
-      expect(Math.max(...series)).toBeLessThanOrEqual(CEILING_MS);
+      expect(Math.max(...series)).toBeLessThanOrEqual(Math.max(CEILING_MS, pollIntervalMs));
       expect(Math.min(...series)).toBeGreaterThan(0);
     }
   });

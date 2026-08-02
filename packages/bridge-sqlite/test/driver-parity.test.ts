@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { classifyDbError, type DbErrorClass } from '../src/classify.js';
 import { NODE_SQLITE_MIN, type openDriver as OpenDriver, type SqlDriver } from '../src/driver.js';
 import type { SqlitePlugin as SqlitePluginClass } from '../src/index.js';
 import { SCHEMA } from '../src/schema.js';
@@ -114,6 +115,81 @@ it('with neither driver available, the failure names the Node version node:sqlit
   }
 });
 
+/**
+ * `classifyDbError` decides whether a failing background tick is silent, backed off, or fatal, and
+ * it reaches that decision from an error's `code` OR its message. Only the message arms ever fire on
+ * node:sqlite, which stamps `ERR_SQLITE_ERROR` on every class it raises — so a decision table built
+ * from hand-written better-sqlite3-shaped errors grades the incumbent twice and leaves the
+ * fallback's only working arm untested. Deleting both message arms is invisible to such a table and
+ * costs a node:sqlite install every classification it has: contention becomes a stderr line per
+ * topic per minute, and corruption stops looking fatal.
+ *
+ * So the driver is a DIMENSION here, as it already is for the seam in conformance.test.ts, and
+ * every error below is raised BY the driver under test rather than constructed to match an arm.
+ */
+interface Provocation {
+  name: string;
+  expected: DbErrorClass;
+  /** Do something that makes the driver throw. Push every driver opened onto `opened`. */
+  raise(openDriver: typeof OpenDriver, path: string, opened: SqlDriver[]): void;
+}
+
+const INSERT = 'INSERT INTO messages (topic, sender, content, ts, in_reply_to) VALUES (?,?,?,?,?)';
+const insert = (d: SqlDriver): void => {
+  d.prepare(INSERT).run('ctx', 'alice', 'x', new Date().toISOString(), null);
+};
+
+const PROVOCATIONS: Provocation[] = [
+  {
+    name: 'a write held off by another connection’s write lock',
+    expected: 'lock',
+    raise: (openDriver, path, opened) => {
+      const holder = openDriver(path);
+      opened.push(holder);
+      holder.exec(SCHEMA);
+      holder.exec('BEGIN IMMEDIATE');
+      insert(holder);
+      // busy_timeout 0, so the contender reports the lock instead of waiting out the default 5 s.
+      const contender = openDriver(path, { busyTimeoutMs: 0 });
+      opened.push(contender);
+      contender.exec('BEGIN IMMEDIATE');
+      insert(contender);
+    },
+  },
+  {
+    name: 'a store whose bytes are not a database',
+    expected: 'fatal',
+    raise: (openDriver, path, opened) => {
+      writeFileSync(path, Buffer.from('this is not a SQLite file and never was'));
+      const d = openDriver(path);
+      opened.push(d);
+      d.prepare('SELECT count(*) FROM sqlite_master').get();
+    },
+  },
+  {
+    name: 'a query against a table that is not there',
+    expected: 'fatal',
+    raise: (openDriver, path, opened) => {
+      const d = openDriver(path);
+      opened.push(d);
+      d.prepare('SELECT id FROM messages').all();
+    },
+  },
+  {
+    name: 'a write to a store the connection may not write',
+    expected: 'unavailable',
+    raise: (openDriver, path, opened) => {
+      const d = openDriver(path);
+      opened.push(d);
+      d.exec(SCHEMA);
+      // `query_only` reproduces the README's read-only remount from inside the process, so the case
+      // grades the same SQLITE_READONLY a root-owned test run could never provoke with chmod.
+      d.exec('PRAGMA query_only = true');
+      insert(d);
+    },
+  },
+];
+
 describe.each(KINDS)('driver parity: %s', (kind) => {
   it('is the driver openDriver selects', async () => {
     const { openDriver } = await load(kind);
@@ -195,6 +271,37 @@ describe.each(KINDS)('driver parity: %s', (kind) => {
     ]);
     d.close();
   });
+
+  for (const p of PROVOCATIONS) {
+    it(`classifies ${p.name} as ${p.expected}, from an error this driver raised`, async () => {
+      const { openDriver } = await load(kind);
+      const opened: SqlDriver[] = [];
+      let caught: unknown;
+      try {
+        p.raise(openDriver, join(dir(), 'p.db'), opened);
+      } catch (e) {
+        caught = e;
+      } finally {
+        for (const d of opened) {
+          try {
+            d.close();
+          } catch {
+            // A driver already closed by the failure path is not what this case grades.
+          }
+        }
+      }
+      // Without this the case can pass by provoking nothing: `classifyDbError(undefined)` is a
+      // total function that answers 'unavailable' for anything it does not recognise.
+      expect(caught, `${p.name} raised nothing on ${kind} — the case grades no error at all`).toBeInstanceOf(Error);
+      // And without this it can pass on an error the DRIVER never produced — an fs ENOENT from the
+      // pre-create step classifies 'unavailable' just as convincingly as a real SQLITE_READONLY.
+      expect(
+        (caught as { code?: unknown }).code,
+        `${p.name} on ${kind} raised a non-SQLite error; the driver's own shape is the point`,
+      ).toMatch(/^(SQLITE_|ERR_SQLITE_)/);
+      expect(classifyDbError(caught)).toBe(p.expected);
+    });
+  }
 
   it('carries the whole seam round-trip: post, fetchRecent, subscribe, disconnect', async () => {
     const { SqlitePlugin } = await load(kind);

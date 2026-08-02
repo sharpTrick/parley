@@ -76,10 +76,11 @@ unrecoverable damage (a corrupt file, a dropped table) stops the loop.
 
 Being quiet is not being healthy: a tick that read nothing delivered nothing, contention included,
 so every failing tick raises `consecutiveFailures` whatever its class, only a successful read clears
-it, and a run of them past the threshold **backs the loop off exponentially (to 30 s) while it keeps
-probing**, so the topic resumes delivering by itself. A subscription failing every read can
-therefore never report `live` with zero failures. An **embedder** — code that constructs
-`SqlitePlugin` itself — can read that state programmatically:
+it, and a run of them past the threshold **backs the loop off exponentially (to 30 s, or to
+`poll_interval_ms` when that is longer) while it keeps probing**, so the topic resumes delivering by
+itself — backing off never polls a failing store more often than a healthy one. A subscription
+failing every read can therefore never report `live` with zero failures. An **embedder** — code that
+constructs `SqlitePlugin` itself — can read that state programmatically:
 
 ```ts
 plugin.subscriptionHealth();

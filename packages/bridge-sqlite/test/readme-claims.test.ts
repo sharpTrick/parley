@@ -43,6 +43,13 @@ const CLAIMS: Claim[] = [
   { what: 'that clock skew between hosts shifts which rows survive', patterns: [/clock skew/i] },
   { what: 'that a row can go before a reader’s cursor reaches it', patterns: [/reader'?’?s cursor has reached it/i] },
   { what: 'that a lock-classed poll failure is quiet but still counted', patterns: [/without a stderr line/i, /every failing tick raises `consecutiveFailures`/i] },
+  {
+    what: 'that the degraded backoff is floored at the configured interval, not merely capped',
+    patterns: [
+      /to 30 s, or to `poll_interval_ms` when that is longer/i,
+      /never polls a failing store more often than a healthy one/i,
+    ],
+  },
   { what: 'that --help and --version answer on stdout', patterns: [/`--help`\/`--version` answer on \*\*stdout\*\*/] },
   {
     what: 'the pragma read-back',
