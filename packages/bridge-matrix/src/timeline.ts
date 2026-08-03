@@ -28,7 +28,7 @@ export const returnedTooFast = (startedAt: number, timeoutMs: number): boolean =
 /** Bound on forward catch-up pagination so an all-foreign timeline terminates instead of spinning. */
 const MAX_FORWARD_PAGES = 50;
 /** Bound on backward `limited`-burst recovery and recent-window pagination so both terminate. */
-export const MAX_BACKFILL_PAGES = 50;
+const MAX_BACKFILL_PAGES = 50;
 /**
  * Server-side filter for the catch-up paths, so reactions, edits and membership churn cost no
  * client page budget. Keep it OFF the `backfill`/`positionBoundary` pair — those match a boundary

@@ -9,7 +9,6 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
-import { MAX_BACKFILL_PAGES } from '../src/timeline.js';
 import { SHAPES } from './cursor-shapes.js';
 import { aliasForTopic, connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
 
@@ -353,14 +352,63 @@ const addTailNoise = (f: FakeSynapse, depth: number): void => {
 };
 
 /**
- * Tail noise deep enough that the backward walk spends its whole page budget before it reaches the
- * oldest of {@link HISTORY} — derived from the bound, so raising or lowering that bound moves the
- * case with it rather than leaving a literal behind that no longer buries anything. Sized to leave
- * `LIMIT - 1` of the topic still within reach, so the walk ends holding PART of a window: the cell
- * where "it filled the window" and "it ran out of timeline" are both false and only the bound is
- * left.
+ * A count no bounded walk could reach, so a walk that lost its bound is a failed probe rather than a
+ * hung run.
  */
-const PAGE_BOUND_NOISE = MAX_BACKFILL_PAGES * LIMIT - (LIMIT - 1);
+const RUNAWAY_PAGES = 10_000;
+
+/**
+ * How many backward pages a since-less read will fetch before it gives up — OBSERVED, by serving one
+ * a timeline that never runs out and counting what it asks for. Keep it observed rather than
+ * imported: the number is the walk's own, so a fixture sized from it cannot quietly stop burying
+ * anything the day it moves, and grading it costs this package no widened surface. It also grades
+ * the bound's EXISTENCE, because an unbounded walk never returns a count at all.
+ */
+async function observeBackwardPageBound(): Promise<number> {
+  const homeserver = new FakeSynapse();
+  const restore = globalThis.fetch;
+  let pages = 0;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(typeof input === 'string' ? input : String((input as Request).url ?? input));
+    if (!/\/rooms\/[^/]+\/messages$/.test(url.pathname) || url.searchParams.get('dir') !== 'b') {
+      return homeserver.fetch(input, init);
+    }
+    pages++;
+    if (pages > RUNAWAY_PAGES) throw new Error('the backward walk paged past every plausible bound');
+    // A page that is always full, never the end of the timeline, and holds nothing the read can
+    // collect — so the ONLY thing that can stop the walk is its own page budget.
+    const width = Number(url.searchParams.get('limit') ?? '1');
+    const chunk = Array.from({ length: width }, (_, i) => ({
+      type: 'm.reaction',
+      event_id: `$endless${pages}-${i}:fake`,
+      sender: '@someone:fake',
+      origin_server_ts: 1,
+      content: {},
+    }));
+    return new Response(JSON.stringify({ chunk, start: 'p1', end: 'p0' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof globalThis.fetch;
+  try {
+    const p = await connectFake({});
+    await p.fetchRecent({ topic: asTopic('page-bound-probe'), limit: LIMIT });
+    await p.disconnect();
+  } finally {
+    globalThis.fetch = restore;
+  }
+  return pages;
+}
+
+const OBSERVED_PAGE_BOUND = await observeBackwardPageBound();
+
+/**
+ * Tail noise deep enough that the backward walk spends its whole page budget before it reaches the
+ * oldest of {@link HISTORY}. Sized to leave `LIMIT - 1` of the topic still within reach, so the walk
+ * ends holding PART of a window: the cell where "it filled the window" and "it ran out of timeline"
+ * are both false and only the bound is left.
+ */
+const PAGE_BOUND_NOISE = OBSERVED_PAGE_BOUND * LIMIT - (LIMIT - 1);
 
 /** How the read under test is prevented from completing normally. */
 const SHORT_CIRCUITS: Record<
@@ -447,7 +495,11 @@ const SINCE_FORMS: Record<string, (p: MatrixPlugin, t: Topic) => Promise<Cursor 
 
 describe('a read that never completed reports the caller position, never one behind it', () => {
   it('the page-bound row leaves part of a window in reach and the rest out of it', () => {
-    const stillInReach = MAX_BACKFILL_PAGES * LIMIT - PAGE_BOUND_NOISE;
+    // The probe answered at all, so the walk is bounded — and by something it chose, not by a
+    // timeline that ran out or a page it could not ask for.
+    expect(OBSERVED_PAGE_BOUND).toBeGreaterThan(1);
+    expect(OBSERVED_PAGE_BOUND).toBeLessThan(RUNAWAY_PAGES);
+    const stillInReach = OBSERVED_PAGE_BOUND * LIMIT - PAGE_BOUND_NOISE;
     expect(stillInReach).toBeGreaterThan(0);
     expect(stillInReach).toBeLessThan(LIMIT);
     expect(HISTORY.length).toBeGreaterThan(stillInReach);
