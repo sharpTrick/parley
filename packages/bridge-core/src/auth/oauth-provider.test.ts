@@ -1566,24 +1566,65 @@ describe('an anonymous flood never displaces state the owner is mid-way through 
    */
   it('a refused passphrase does not re-admit the evicted registration behind the consent', async () => {
     const p = makeProvider(() => 4_000_000);
+    const consentOf = new Map<string, string>();
     for (let i = 0; i < eviction.MAX_CLIENTS; i++) {
       const spam = makeClient(`spam-${i}`);
       registerOn(p)(spam);
       await p.authorize(spam, makeParams(), fakeRes());
+      consentOf.set(spam.client_id, [...peek(p).pending.keys()].at(-1)!);
     }
-    const victim = makeClient('victim');
-    registerOn(p)(victim);
-    await p.authorize(victim, makeParams(), fakeRes());
-    const consentId = [...peek(p).pending.keys()].at(-1)!;
     registerOn(p)(makeClient('spam-evictor'));
-    expect(p.clientsStore.getClient('victim'), 'the setup never evicted it').toBeUndefined();
+    // Whichever end the scan reads from, one registration lost its slot while still holding the
+    // consent it was rendered for — that is the one the passphrase would re-admit.
+    const evicted = [...consentOf].find(
+      ([id, consentId]) =>
+        p.clientsStore.getClient(id) === undefined && peek(p).pending.has(consentId),
+    );
+    expect(evicted, 'the setup never evicted a registration still holding its consent').toBeDefined();
+    const [victimId, consentId] = evicted!;
 
     await expect(p.completeConsent(consentId, `not ${GOOD_PASS}`)).rejects.toThrow(ConsentError);
 
     expect(
-      p.clientsStore.getClient('victim'),
+      p.clientsStore.getClient(victimId),
       'a wrong guess re-admitted the registration',
     ).toBeUndefined();
+    expect(peek(p).clients.size).toBe(eviction.MAX_CLIENTS);
+  });
+
+  /**
+   * What the eviction ORDER buys, now that no ordering has to protect the owner. A registration
+   * holding an unapproved consent is evictable by design, so the only question left is WHOSE gets
+   * recycled under sustained pressure — and the answer must be the flood's own recent slots, not the
+   * registrations that were there before it started. Reverse that and a flood no longer costs itself
+   * anything: every arrival cashes in a settled connector instead.
+   *
+   * Every registration below holds an unapproved consent, so the stateless pass has nothing to take
+   * and this grades the second pass rather than the first.
+   */
+  it('sustained registration pressure recycles the flood, not the registrations that predate it', async () => {
+    const p = makeProvider(() => 4_000_000);
+    const settled = ['settled-a', 'settled-b', 'settled-c'];
+    const arrive = async (id: string): Promise<void> => {
+      const client = makeClient(id);
+      registerOn(p)(client);
+      await p.authorize(client, makeParams(), fakeRes());
+    };
+
+    for (const id of settled) await arrive(id);
+    for (let i = settled.length; i < eviction.MAX_CLIENTS; i++) await arrive(`filler-${i}`);
+    expect(peek(p).clients.size).toBe(eviction.MAX_CLIENTS);
+
+    const pressure = Array.from({ length: 25 }, (_, i) => `flood-${i}`);
+    for (const id of pressure) await arrive(id);
+
+    for (const id of settled) {
+      expect(p.clientsStore.getClient(id), `${id} was recycled by a later flood`).toBeDefined();
+    }
+    const survivingFlood = pressure.filter((id) => p.clientsStore.getClient(id) !== undefined);
+    expect(survivingFlood.length, 'the flood kept slots it took from earlier arrivals').toBeLessThan(
+      2,
+    );
     expect(peek(p).clients.size).toBe(eviction.MAX_CLIENTS);
   });
 });
