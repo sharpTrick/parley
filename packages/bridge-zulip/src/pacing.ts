@@ -40,11 +40,27 @@ export const longPollDeadlineMs = (blockMs: number): number =>
 const REQUEST_ANSWER_MS = 500;
 
 /**
- * Wall-clock budget for a request made inside a caller's `blockMs`: what the caller has left, plus
- * enough for the last request of a spent budget to still be issued and answered. Keep every request
- * under a caller's budget on this, so that a rate-limit hint reaching past that budget is refused
- * outright — the 429 backoff races only `isStopped()`, so no deadline signal can interrupt it and
- * a routine `Retry-After: 8` would otherwise spend eight seconds of a 300ms `fetchRecent`.
+ * Ceiling on a 429 backoff taken inside a caller's `blockMs`: what the caller has left, plus enough
+ * for the last request of a spent budget to still be issued and answered. Keep the requests whose
+ * own transport bound is an abort signal — the queue registration and the wake poll, both wrapped in
+ * `deadlineAbort` — on this, so that a rate-limit hint reaching past that budget is refused outright:
+ * the 429 backoff races only `isStopped()`, so no deadline signal can interrupt it and a routine
+ * `Retry-After: 8` would otherwise spend eight seconds of a 300ms `fetchRecent`.
  */
 export const budgetedDeadlineMs = (deadline: number): number =>
   Math.max(0, deadline - Date.now()) + REQUEST_ANSWER_MS;
+
+/**
+ * Wall-clock ONE history read gets to answer in. A caller's `blockMs` says how long it will wait for
+ * a message to ARRIVE and says nothing about how long this server takes to answer a query, so it is
+ * a floor under the read's transport deadline rather than the deadline itself — a
+ * `fetchRecent(blockMs: 100)` against a Zulip whose `GET /api/v1/messages` takes 700ms must return
+ * the empty page the seam requires at timeout, not reject at 600ms having never waited.
+ *
+ * Keep it SMALL: no abort signal bounds a history read (the mandatory first one has nothing to
+ * abandon), so this is also the most a call can overrun the ceiling its caller set.
+ */
+export const REQUEST_DEADLINE_MS = 2000;
+
+export const readDeadlineMs = (deadline: number): number =>
+  Math.max(REQUEST_DEADLINE_MS, budgetedDeadlineMs(deadline));

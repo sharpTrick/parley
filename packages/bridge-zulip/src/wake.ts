@@ -23,14 +23,19 @@ export async function blockingFetch(
     (await readWindow(conn, topic, since, limit, { generation, deadline })).messages;
   for (let attempt = 0; !conn.stopped && Date.now() < deadline; attempt++) {
     const wake = await armWake(conn, topic, deadline, blockedFetchPause(attempt), generation);
+    let waited = false;
     try {
       const raced = conn.stopped ? [] : await read();
       if (raced.length > 0) return raced;
+      waited = Date.now() < deadline;
       await wake.waited;
     } finally {
       wake.release();
     }
-    if (conn.stopped) return [];
+    // Keep the re-read out of a pass whose first read already outlived the deadline: there was no
+    // wait for it to cover, so that a server slower than the budget cannot charge the caller a
+    // second request budget past the ceiling it set.
+    if (conn.stopped || !waited) return [];
     const got = await read();
     if (got.length > 0) return got;
   }

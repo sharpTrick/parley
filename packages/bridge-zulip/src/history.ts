@@ -2,7 +2,7 @@ import {
   asCursor, type Cursor, type Message, type MessageHandler, type Topic,
 } from '@sharptrick/parley-core';
 import type { ZulipConnection } from './connection.js';
-import { budgetedDeadlineMs } from './pacing.js';
+import { readDeadlineMs } from './pacing.js';
 import {
   asArray, MAX_MESSAGES_PER_FETCH, pageAnchor, type ZulipMessage, zulipToMessage,
 } from './wire.js';
@@ -44,7 +44,7 @@ export async function readWindow(
   conn: ZulipConnection, topic: Topic, since: Cursor | undefined, limit: number, opts: ReadOpts,
 ): Promise<{ messages: Message[]; sawRecords: boolean }> {
   const signal = opts.signal;
-  const deadlineMs = opts.deadline === undefined ? undefined : budgetedDeadlineMs(opts.deadline);
+  const deadlineMs = opts.deadline === undefined ? undefined : readDeadlineMs(opts.deadline);
   const narrow = JSON.stringify([
     { operator: 'stream', operand: conn.cfg.stream },
     { operator: 'topic', operand: conn.wireTopic(topic) },

@@ -15,6 +15,8 @@ import {
   budgetedDeadlineMs,
   longPollDeadlineMs,
   loopBackoffMs,
+  readDeadlineMs,
+  REQUEST_DEADLINE_MS,
   reportsLoopFailure,
 } from '../src/pacing.js';
 import {
@@ -351,11 +353,22 @@ describe('every wait the plugin takes is bounded and escalates', () => {
     expect(longPollDeadlineMs(-1)).toBe(longPollDeadlineMs(0));
   });
 
-  it("a request inside a caller's budget gets what is left of it, plus one answer", () => {
+  it("a 429 backoff inside a caller's budget is capped at what is left of it, plus one answer", () => {
     const now = Date.now();
     expect(budgetedDeadlineMs(now + 1000)).toBeGreaterThan(1000);
     expect(budgetedDeadlineMs(now + 1000)).toBeLessThanOrEqual(1500);
-    // A spent budget still buys the last request an answer, rather than a deadline of zero.
+    // A spent budget still refuses a stated wait rather than admitting an unbounded one.
     expect(budgetedDeadlineMs(now - 10_000)).toBe(500);
+  });
+
+  // A caller's `blockMs` says how long it will wait for a message to ARRIVE, and nothing about how
+  // long this server takes to answer a query. A read whose transport deadline is the RESIDUAL wait
+  // budget therefore rejects on latency the wait was never about, where the seam requires an empty
+  // page — so what is left of the wait may only ever lengthen a read's budget, never shorten it.
+  it('a history read gets a whole request budget however little of the wait is left', () => {
+    const now = Date.now();
+    const budgets = [-10_000, -1, 0, 1, 100, 500, 1000].map((left) => readDeadlineMs(now + left));
+    expect(budgets.filter((ms) => ms < REQUEST_DEADLINE_MS)).toEqual([]);
+    expect(readDeadlineMs(now + 10_000)).toBeGreaterThan(10_000);
   });
 });
