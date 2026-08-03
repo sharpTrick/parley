@@ -226,11 +226,12 @@ const TEARDOWN_GUARD_FORMS: [what: string, sample: string][] = [
  * still the live lifecycle's, and the table below drives one row per chore into that window. Pinned
  * by VALUE so a guard site added later is a missing row rather than silence: a new one means a new
  * await that can cross a teardown, and it needs its own row here, in teardown-races-setup.test.ts
- * (which owns the setup calls, parameterized over the await each is held at), in
- * teardown-delivery.test.ts (which owns a drain read parked at the boundary) or in
- * push-self-heal.test.ts (which owns the drain's re-drain timer).
+ * (which owns the setup calls, parameterized over the await each is held at, on the arm where the
+ * held await SUCCEEDS), in silent-peer.test.ts (which owns the arm where it never answers, so the
+ * call releases its own unadopted resource), in teardown-delivery.test.ts (which owns a drain read
+ * parked at the boundary) or in push-self-heal.test.ts (which owns the drain's re-drain timer).
  */
-const TEARDOWN_GUARD_SITES = 18;
+const TEARDOWN_GUARD_SITES = 20;
 
 const CROSS_CELLS = CHORES.flatMap((chore) =>
   (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),

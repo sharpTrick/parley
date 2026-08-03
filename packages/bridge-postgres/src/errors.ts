@@ -77,12 +77,43 @@ export function subscribeFailed(topic: Topic, err: unknown): Error {
 }
 
 /**
+ * Name a dial this plugin abandoned. A peer that completes the TCP handshake and then never speaks
+ * — a firewalled port, a stalled pooler, a primary mid-failover — is the one failure that reaches
+ * an operator as nothing at all: `connect()` is the first call any bridge makes, so the MCP host
+ * sees a server that never initialises and no diagnostic anywhere.
+ */
+export function dialAbandoned(what: string, budgetMs: number): Error {
+  return new Error(
+    `parley-postgres: gave up on ${what} after ${budgetMs}ms — the connection was accepted but ` +
+      'the server never answered. Nothing was created or written; check that backend_config.url ' +
+      'points at a reachable PostgreSQL rather than a firewalled port or a stalled pooler.',
+  );
+}
+
+/**
  * How long a statement waits for a server-side lock before giving up, in ms. Every lock this
  * plugin takes is held for one INSERT or one idempotent bootstrap, so reaching this means another
  * session is sitting on it. Keep a bound here, so that a wedged lock cannot pin a pooled
  * connection forever and starve every other seam call of pool capacity.
  */
 export const LOCK_WAIT_MS = 5000;
+
+/** pg's message when `query_timeout` fires — the driver's only spelling for it. */
+const QUERY_READ_TIMEOUT = 'Query read timeout';
+
+/**
+ * Name a statement this plugin gave up on because the ANSWER never came back — a half-open socket,
+ * a black-holing pooler. Without the rename it reaches agent context as the driver's bare 'Query
+ * read timeout', naming neither the plugin, the operation, nor the fact that nothing was written.
+ */
+export function answerAbandoned(what: string, budgetMs: number, err: unknown): Error {
+  if ((err as { message?: string } | undefined)?.message !== QUERY_READ_TIMEOUT) return err as Error;
+  return new Error(
+    `parley-postgres: gave up on ${what} after ${budgetMs}ms — the connection is open but the ` +
+      'server stopped answering. Nothing was written; that connection has been discarded and a ' +
+      'retry opens a new one.',
+  );
+}
 
 /** PostgreSQL's SQLSTATE for a statement that gave up waiting on a lock (`lock_timeout`). */
 const LOCK_NOT_AVAILABLE = '55P03';

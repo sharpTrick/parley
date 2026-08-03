@@ -1,5 +1,6 @@
 import { delay } from '@sharptrick/parley-net-util';
 import { Client } from 'pg';
+import { endWithin, SOCKET_BOUNDS, TEARDOWN_WAIT_MS } from './connection.js';
 import { PostgresPush } from './push.js';
 
 /** Backoff between listener reconnect attempts after the connection drops. */
@@ -9,6 +10,9 @@ const RECONNECT_DELAY_MS = 500;
  * reconnect after a drop — before giving up. Bounded for the same reason as {@link LOCK_WAIT_MS}.
  */
 export const LISTENER_WAIT_MS = 5000;
+
+const dialTimedOut = (): Error =>
+  new Error(`the listener connection did not come up within ${LISTENER_WAIT_MS}ms`);
 
 /** Reject with `onTimeout()` if `p` has not settled within `budgetMs`; never leaves a timer behind. */
 async function withDeadline<T>(p: Promise<T>, budgetMs: number, onTimeout: () => Error): Promise<T> {
@@ -48,12 +52,28 @@ export abstract class PostgresListener extends PostgresPush {
     return withDeadline(this.listenerPromise, budgetMs, late);
   }
 
+  /**
+   * Keep the DIAL bounded here rather than at the caller, so that no attempt can stay memoised in
+   * `listenerPromise` for longer than {@link LISTENER_WAIT_MS}: a caller's deadline rejects the
+   * caller and leaves the memo, and every later `subscribe` then awaits the same dead promise and
+   * is told to retry something that cannot work. Bounding it here also keeps a `waitForNotify` with
+   * a few-millisecond budget from abandoning a healthy dial a concurrent `subscribe` is waiting on.
+   */
   private async createListener(): Promise<Client> {
     const epoch = this.epoch;
-    const client = new Client({ connectionString: this.url });
+    const client = new Client({ connectionString: this.url, ...SOCKET_BOUNDS });
     this.wireListener(client);
     this.starting.add(client);
-    await client.connect();
+    try {
+      await withDeadline(client.connect(), LISTENER_WAIT_MS, dialTimedOut);
+    } catch (err) {
+      // End the candidate this attempt is walking away from, so that a dial which lands after its
+      // memo was cleared cannot publish a second listener over the one its successor adopted — but
+      // do NOT wait on it, so that a socket which refuses to close gracefully cannot keep the memo
+      // alive past the deadline that is the whole point of this bound.
+      if (this.starting.delete(client)) void endWithin(client, TEARDOWN_WAIT_MS);
+      throw err;
+    }
     return this.adoptListener(client, epoch);
   }
 
@@ -66,7 +86,7 @@ export abstract class PostgresListener extends PostgresPush {
    */
   private async adoptListener(client: Client, epoch: number): Promise<Client> {
     if (!this.starting.delete(client) || this.stopped || epoch !== this.epoch) {
-      await client.end().catch(() => undefined);
+      await endWithin(client, TEARDOWN_WAIT_MS);
       throw new Error('parley-postgres: disconnected while the listener connection was in flight');
     }
     this.listener = client;
@@ -134,14 +154,14 @@ export abstract class PostgresListener extends PostgresPush {
       while (!this.stopped && epoch === this.epoch) {
         await delay(RECONNECT_DELAY_MS);
         if (this.stopped || epoch !== this.epoch) return;
-        const client = new Client({ connectionString: this.url });
+        const client = new Client({ connectionString: this.url, ...SOCKET_BOUNDS });
         this.wireListener(client);
         this.starting.add(client);
         try {
-          await client.connect();
+          await withDeadline(client.connect(), LISTENER_WAIT_MS, dialTimedOut);
           if (this.stopped || epoch !== this.epoch) {
             this.starting.delete(client);
-            await client.end().catch(() => undefined);
+            await endWithin(client, TEARDOWN_WAIT_MS);
             return;
           }
           // Re-LISTEN every channel a subscription OR an in-flight blocking waiter needs, so a
@@ -166,8 +186,10 @@ export abstract class PostgresListener extends PostgresPush {
           this.redrive(new Set([...this.subs.keys(), ...this.waiters.keys()]), 'silent');
           return;
         } catch {
+          // Bounded and not awaited, so that a peer which accepts the socket and then says nothing
+          // can park neither this attempt nor the ladder's next rung.
           this.starting.delete(client);
-          await client.end().catch(() => undefined);
+          void endWithin(client, TEARDOWN_WAIT_MS);
           // server still unreachable — back off and try again
         }
       }

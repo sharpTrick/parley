@@ -123,6 +123,22 @@ lock_timeout = 5000`, so a session sitting on the key (an abandoned transaction,
 5000ms waiting for …` naming the topic or the table, and nothing is written. An unbounded wait
 would instead hold a pooled connection forever and take the instance's reads down with it.
 
+A lock is not the only thing that can wait forever. A peer that completes the TCP handshake and
+then never speaks — a firewalled port, a stalled pooler, a primary mid-failover — looks to the
+driver exactly like a server that is merely slow, and pg's default is to wait indefinitely. So
+every socket this backend opens carries a client-side ceiling instead:
+
+- the first connection gives up after `5000ms`, with a `parley-postgres: gave up on …` naming what
+  to check rather than a bare driver string;
+- a pooled checkout after `15000ms` — deliberately wider than the lock wait, because pg applies
+  that ceiling to the queue behind a busy pool as well as to the dial, and a reader waiting its
+  turn behind a contended `post()` must wait rather than fail;
+- any single statement after `15000ms`, client-side, because what goes missing is the server's
+  reply and no `statement_timeout` can notice that;
+- `disconnect()` returns within `5000ms` whatever the socket does, destroying a connection that
+  will not close rather than waiting on a FIN that is not coming — so a bridge whose database has
+  gone quiet still exits on SIGTERM instead of needing SIGKILL.
+
 ## Cursors
 
 A cursor from this backend is a decimal `seq` — the `BIGSERIAL` primary key rendered as text — and

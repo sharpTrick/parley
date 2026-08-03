@@ -12,6 +12,13 @@ import {
 } from '@sharptrick/parley-core';
 import { Pool, type PoolClient } from 'pg';
 import {
+  DIAL_WAIT_MS,
+  endWithin,
+  QUERY_WAIT_MS,
+  SOCKET_BOUNDS,
+  TEARDOWN_WAIT_MS,
+} from './connection.js';
+import {
   DEFAULT_POOL_SIZE,
   DEFAULT_TABLE_NAME,
   DEFAULT_URL,
@@ -20,8 +27,10 @@ import {
   validateBackendConfig,
 } from './config.js';
 import {
+  answerAbandoned,
   assertCursor,
   assertStorable,
+  dialAbandoned,
   LOCK_WAIT_MS,
   lockWaitAbandoned,
   subscribeFailed,
@@ -32,6 +41,13 @@ import type { TopicSubscription } from './push.js';
 import { newestMessages, pageResult } from './read.js';
 import { assertTableName, buildSchema, channelFor, quotedNames } from './schema.js';
 
+export {
+  CONNECT_WAIT_MS,
+  DIAL_WAIT_MS,
+  KEEPALIVE_DELAY_MS,
+  QUERY_WAIT_MS,
+  TEARDOWN_WAIT_MS,
+} from './connection.js';
 export { MAX_POOL_SIZE, MAX_RETENTION_DAYS, MIN_POOL_SIZE, MIN_RETENTION_DAYS } from './config.js';
 export { DEFAULT_POOL_SIZE, LOCK_WAIT_MS, type PostgresBackendConfig, usesDefaultCredentials };
 export { LISTENER_WAIT_MS, validateBackendConfig };
@@ -87,15 +103,24 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
       );
     }
 
-    const pool = new Pool({ connectionString: this.url, max: cfg.pool_size ?? DEFAULT_POOL_SIZE });
+    const pool = new Pool({
+      connectionString: this.url,
+      max: cfg.pool_size ?? DEFAULT_POOL_SIZE,
+      ...SOCKET_BOUNDS,
+    });
     // Keep this no-op handler, so that an idle-client error (server restart) stays a rejected
     // command instead of an unhandled 'error' event that kills the process.
     pool.on('error', () => undefined);
+    // And keep this one, so that the same is true while a client is CHECKED OUT: pg-pool detaches
+    // its own listener for the length of a checkout and routes nothing to the pool, so an RST
+    // arriving mid-post() is an 'error' event with nothing listening — which Node turns into an
+    // uncaughtException, not a rejected command.
+    pool.on('connect', (client) => client.on('error', () => undefined));
 
     // Idempotent bootstrap, serialized under an advisory lock: concurrent bridge processes
     // connecting to the same table would otherwise race the CREATEs.
     this.starting.add(pool);
-    const client = await pool.connect();
+    const client = await this.bootstrapCheckout(pool);
     try {
       await client.query('BEGIN');
       await client.query(`SET LOCAL lock_timeout = ${LOCK_WAIT_MS}`);
@@ -103,11 +128,14 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
       await client.query(buildSchema(table));
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      client.release();
+      // Keep the abandoned connection out of the pool rather than ROLLBACK-ing it back in: a
+      // statement that failed because the answer never arrived leaves a ROLLBACK with nothing to
+      // answer it either, and this pool is being ended anyway.
+      client.release(true);
       this.starting.delete(pool);
-      await pool.end().catch(() => undefined);
-      throw lockWaitAbandoned(`bootstrap lock on table '${table}'`, err);
+      await endWithin(pool, TEARDOWN_WAIT_MS);
+      const named = lockWaitAbandoned(`bootstrap lock on table '${table}'`, err);
+      throw answerAbandoned(`the bootstrap of table '${table}'`, QUERY_WAIT_MS, named);
     }
     client.release();
     // Same hazard the listener has, one resource up: a disconnect() can complete while the
@@ -125,6 +153,39 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
       // Keep the unref, so a leaked-but-never-disconnect()ed plugin cannot by itself pin the
       // event loop — pruning is a best-effort cost knob, not a reason to keep the process alive.
       this.pruneTimer = setInterval(tick, PRUNE_INTERVAL_MS).unref();
+    }
+  }
+
+  /**
+   * The bridge's very first checkout, on a pool nothing else holds a connection in — so it cannot
+   * be queueing, and a wait here is a peer that is not answering. Bound it at {@link DIAL_WAIT_MS}
+   * rather than leaving it to the pool's own (deliberately generous) acquire ceiling, so that an
+   * unreachable database is a named failure in seconds instead of the one wait in this plugin that
+   * a bridge's caller experiences as a server which never finishes starting.
+   */
+  private async bootstrapCheckout(pool: Pool): Promise<PoolClient> {
+    const checkout = pool.connect();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        checkout,
+        new Promise<never>((_, reject) => {
+          const late = (): void => reject(dialAbandoned('the first connection', DIAL_WAIT_MS));
+          timer = setTimeout(late, DIAL_WAIT_MS);
+        }),
+      ]);
+    } catch (err) {
+      // Hand back a checkout that lands after the deadline, so that the `end()` below is not left
+      // waiting on a connection this call has already stopped referencing.
+      void checkout.then(
+        (late) => late.release(true),
+        () => undefined,
+      );
+      this.starting.delete(pool);
+      await endWithin(pool, TEARDOWN_WAIT_MS);
+      throw err;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -161,7 +222,15 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     } catch {}
   }
 
+  /**
+   * Keep every close under ONE wall-clock deadline (DESIGN §7 — teardown is not allowed to be the
+   * unbounded wait). A pg `end()` on a peer that stopped answering without closing the socket never
+   * settles, and `cli.ts` wires SIGINT/SIGTERM to this: unbounded, the bridge ignores SIGTERM and
+   * only SIGKILL removes it.
+   */
   async disconnect(): Promise<void> {
+    const deadline = Date.now() + TEARDOWN_WAIT_MS;
+    const remaining = (): number => Math.max(0, deadline - Date.now());
     this.stopped = true;
     this.epoch++;
     this.reconnecting = false;
@@ -185,11 +254,11 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     const listener = this.listener;
     this.listener = undefined;
     this.listenerPromise = undefined;
-    if (listener !== undefined) await listener.end().catch(() => undefined);
+    if (listener !== undefined) await endWithin(listener, remaining());
     const pool = this.pool;
     this.pool = undefined;
-    if (pool !== undefined) await pool.end().catch(() => undefined);
-    await Promise.all(inFlight.map((resource) => resource.end().catch(() => undefined)));
+    if (pool !== undefined) await endWithin(pool, remaining());
+    await Promise.all(inFlight.map((resource) => endWithin(resource, remaining())));
   }
 
   /**
@@ -224,12 +293,17 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
         [topic, identity, content, new Date().toISOString(), opts?.inReplyTo ?? null],
       );
       await client.query('COMMIT');
-      return asBackendMsgId(String((res.rows[0] as { seq: string }).seq));
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw lockWaitAbandoned(`write lock on topic '${topic}'`, err);
-    } finally {
+      const seq = asBackendMsgId(String((res.rows[0] as { seq: string }).seq));
       client.release();
+      return seq;
+    } catch (err) {
+      // Discard the connection instead of ROLLBACK-ing it back into the pool, so that a write that
+      // failed because the answer never arrived does not hand the next post() a client wedged
+      // behind a statement nothing will ever answer — and so that a ROLLBACK which fails the same
+      // way cannot leave one carrying this call's open transaction and `SET LOCAL`.
+      client.release(true);
+      const named = lockWaitAbandoned(`write lock on topic '${topic}'`, err);
+      throw answerAbandoned(`the write to topic '${topic}'`, QUERY_WAIT_MS, named);
     }
   }
 

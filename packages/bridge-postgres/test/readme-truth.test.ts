@@ -3,13 +3,17 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  CONNECT_WAIT_MS,
   DEFAULT_POOL_SIZE,
+  DIAL_WAIT_MS,
   LOCK_WAIT_MS,
   MAX_POOL_SIZE,
   MAX_RETENTION_DAYS,
   MIN_POOL_SIZE,
   MIN_RETENTION_DAYS,
   PRUNE_BATCH,
+  QUERY_WAIT_MS,
+  TEARDOWN_WAIT_MS,
 } from '../src/index.js';
 import { MAX_IDENTIFIER_BYTES, MAX_TABLE_NAME_BYTES } from '../src/schema.js';
 
@@ -88,6 +92,26 @@ const CLAIMS: Claim[] = [
   { what: 'the default pool size', pattern: /pool_size: (\d+)/g, expected: DEFAULT_POOL_SIZE },
   { what: 'the smallest pool', pattern: /integer in `(\d+)\.\./g, expected: MIN_POOL_SIZE },
   { what: 'the largest pool', pattern: /integer in `\d+\.\.(\d+)`/g, expected: MAX_POOL_SIZE },
+  {
+    what: 'the ceiling on the first connection',
+    pattern: /first connection gives up after `(\d+)ms`/g,
+    expected: DIAL_WAIT_MS,
+  },
+  {
+    what: 'the ceiling on a pooled checkout',
+    pattern: /pooled checkout after `(\d+)ms`/g,
+    expected: CONNECT_WAIT_MS,
+  },
+  {
+    what: 'the ceiling on one statement',
+    pattern: /single statement after `(\d+)ms`/g,
+    expected: QUERY_WAIT_MS,
+  },
+  {
+    what: 'the ceiling on the whole teardown',
+    pattern: /returns within `(\d+)ms`/g,
+    expected: TEARDOWN_WAIT_MS,
+  },
 ];
 
 describe('the published README restates no constant the code derives', () => {
