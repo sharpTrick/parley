@@ -343,6 +343,16 @@ const respelledPostId = ([label, spell]: [
     })),
 });
 
+/**
+ * The mark each broken variant's suite is registered under. Keep it in one place, so that the
+ * negative control recovers a variant's name from a report row by an EXACT comparison rather than by
+ * searching for one name inside another — one name here is a prefix of another, so a containment
+ * match reads the sibling's failures as this variant's.
+ */
+export const BROKEN_SUITE_MARK = 'broken/';
+
+export const brokenSuiteName = (name: string): string => `${BROKEN_SUITE_MARK}${name}`;
+
 export const BROKEN_VARIANTS: BrokenVariant[] = [
   ...POST_ID_RESPELLINGS.map(respelledPostId),
   {

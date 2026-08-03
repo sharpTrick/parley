@@ -326,3 +326,122 @@ describe('every export earns its place', () => {
     ).toBeDefined();
   });
 });
+
+/**
+ * A bound on elapsed time stated in terms of the figure that governs the wait discriminates nothing:
+ * raise the figure and the bound rises with it, so the wait it promises to cap can grow without a
+ * row going red. Keep every such bound an absolute figure, and pin the constant on its own terms.
+ *
+ * Graded over `test/**` rather than at the sites that have it today, so the next bound written
+ * against `DEFAULT_BACKOFF_MS`, `DEFAULT_DEADLINE_MS` or a case's own `deadlineMs` lands red instead
+ * of certifying whatever the figure becomes.
+ */
+describe('no elapsed-time bound is stated in terms of the figure it grades', () => {
+  const ELAPSED_SUBJECT = /Date\.now\(\)\s*-|elapsed/i;
+  const ORDER_MATCHERS = new Set([
+    'toBeLessThan',
+    'toBeLessThanOrEqual',
+    'toBeGreaterThan',
+    'toBeGreaterThanOrEqual',
+  ]);
+
+  /** The balanced argument opening at `open`, so a subject like `Date.now() - t` is read whole. */
+  const argAt = (code: string, open: number): { text: string; end: number } => {
+    let depth = 0;
+    for (let i = open; i < code.length; i++) {
+      if (code[i] === '(') depth++;
+      else if (code[i] === ')' && --depth === 0) return { text: code.slice(open + 1, i), end: i };
+    }
+    return { text: '', end: code.length };
+  };
+
+  const elapsedBounds = (code: string): string[] => {
+    const out: string[] = [];
+    for (const at of code.matchAll(/\bexpect\(/g)) {
+      const subject = argAt(code, (at.index as number) + 'expect'.length);
+      if (!ELAPSED_SUBJECT.test(subject.text)) continue;
+      const call = /^(?:\s*\.(?:not|resolves|rejects))*\s*\.(\w+)\(/.exec(code.slice(subject.end + 1));
+      if (call === null || !ORDER_MATCHERS.has(call[1] as string)) continue;
+      out.push(argAt(code, subject.end + call[0].length).text);
+    }
+    return out;
+  };
+
+  const namesIn = (expression: string): string[] =>
+    [...expression.matchAll(/(?<![\w$])[A-Za-z_$][\w$]*/g)].map((m) => m[0]);
+
+  /**
+   * A file's code, with comments and string literals removed. An assertion QUOTED in a string is
+   * data — the reader's own self-test feeds it its subject matter that way — and a bound narrated
+   * in a comment is prose.
+   */
+  const codeOf = (text: string): string =>
+    text
+      .replaceAll(/\/\*[\s\S]*?\*\//g, '')
+      .replaceAll(/^\s*\/\/.*$/gm, '')
+      .replaceAll(/'(?:[^'\\\n]|\\.)*'/g, "''")
+      .replaceAll(/"(?:[^"\\\n]|\\.)*"/g, '""')
+      .replaceAll(/`(?:[^`\\]|\\.)*`/g, '``');
+
+  /** Figures a bound may not name: what the package ships, and what a case hands the loop. */
+  const exportedFigures = (): string[] =>
+    Object.entries(api)
+      .filter(([, value]) => typeof value === 'number')
+      .map(([name]) => name);
+
+  const budgetNames = (code: string): string[] =>
+    [
+      ...code.matchAll(/\b(?:deadlineMs|blockMs|timeoutMs|retryAfterMs):\s*([A-Za-z_$][\w$]*)/g),
+    ].map((m) => m[1] as string);
+
+  const testSources = (): [string, string][] =>
+    readdirSync(new URL('../test/', import.meta.url), { recursive: true })
+      .map(String)
+      .filter((name) => name.endsWith('.ts'))
+      .sort()
+      .map((name) => [name, codeOf(readFileSync(new URL(`../test/${name}`, import.meta.url), 'utf8'))]);
+
+  const graded = (): [string, string][] =>
+    testSources().filter(([, code]) => elapsedBounds(code).length > 0);
+
+  it('finds elapsed bounds and a vocabulary to grade them against', () => {
+    expect(graded().flatMap(([, code]) => elapsedBounds(code)).length).toBeGreaterThan(4);
+    expect(graded().length).toBeGreaterThan(2);
+    expect(exportedFigures().length).toBeGreaterThan(4);
+    expect(testSources().flatMap(([, code]) => budgetNames(code))).not.toEqual([]);
+    // The forbidden vocabulary has to be within reach, or the rows below forbid nothing.
+    const named = testSources().flatMap(([, code]) =>
+      exportedFigures().filter((figure) => namesIn(code).includes(figure)),
+    );
+    expect(named).not.toEqual([]);
+  });
+
+  // The reader against the spellings it has to tell apart, so it cannot regress to finding nothing
+  // — which would leave every row below grading an empty list.
+  it.each([
+    ['a captured elapsed local', 'expect(elapsed).toBeLessThan(stopAtMs + STOP_POLL_MS + 150);', ['stopAtMs', 'STOP_POLL_MS']],
+    ['an inline clock read', 'expect(Date.now() - started).toBeLessThan(DEADLINE_MS);', ['DEADLINE_MS']],
+    ['a field off a probe', 'expect(run.elapsedMs).toBeLessThanOrEqual(BUDGET);', ['BUDGET']],
+    ['a floor', 'expect(elapsed).toBeGreaterThanOrEqual(FLOOR);', ['FLOOR']],
+    ['a negated bound', 'expect(elapsed).not.toBeLessThan(FLOOR);', ['FLOOR']],
+    ['a bound behind a message', "expect(elapsed, 'too slow').toBeLessThan(BUDGET);", ['BUDGET']],
+    ['an absolute figure', 'expect(elapsed).toBeLessThan(2_000);', []],
+    ['an assertion about something else', 'expect(state.calls).toBe(DEADLINE_MS);', []],
+    ['a non-ordering matcher', 'expect(elapsed).toBe(DEADLINE_MS);', []],
+  ])('reads %s', (_label, snippet, names) => {
+    expect(elapsedBounds(snippet).flatMap(namesIn)).toEqual(names);
+  });
+
+  it.each(graded())('%s states its elapsed bounds in figures', (_path, code) => {
+    const forbidden = new Set([...exportedFigures(), ...budgetNames(code)]);
+    const offenders = elapsedBounds(code).filter((bound) =>
+      namesIn(bound).some((name) => forbidden.has(name)),
+    );
+    expect(
+      offenders,
+      'an elapsed-time bound naming the figure that governs the wait it grades — widening the ' +
+        'figure widens the bound with it, so the wait can grow without a row going red. State the ' +
+        'bound as a figure, and pin the constant on its own terms beside it',
+    ).toEqual([]);
+  });
+});

@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { asTopic, buildMessage } from '@sharptrick/parley-core';
 import { ASSERTED_PROPERTIES, CLAUSES } from '@sharptrick/parley-conformance';
-import { BROKEN_VARIANTS, ReferencePlugin } from './reference-plugin.js';
+import { BROKEN_SUITE_MARK, BROKEN_VARIANTS, ReferencePlugin } from './reference-plugin.js';
 import { BOOLEAN_CAPABILITIES, cases } from './suite-source.js';
 
 /**
@@ -20,8 +20,14 @@ import { BOOLEAN_CAPABILITIES, cases } from './suite-source.js';
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const TARGET = 'packages/conformance/test/broken-variants.test.ts';
 
+interface Row {
+  fullName: string;
+  status: string;
+  ancestorTitles: string[];
+}
+
 interface JsonReport {
-  testResults: { assertionResults: { fullName: string; status: string }[] }[];
+  testResults: { assertionResults: Row[] }[];
 }
 
 let report: JsonReport;
@@ -47,8 +53,23 @@ beforeAll(async () => {
   }
 }, 300_000);
 
-const results = (): { fullName: string; status: string }[] =>
-  report.testResults.flatMap((f) => f.assertionResults);
+const results = (): Row[] => report.testResults.flatMap((f) => f.assertionResults);
+
+/**
+ * Which variant a report row belongs to, recovered from the SUITE title alone. Keep the comparison
+ * exact, so that a variant whose name contains another's is not scored on its sibling's failures:
+ * every check below attributes failures by name, and an inherited failure only ever makes a row
+ * pass — which is how a control that has stopped failing reads as coverage.
+ */
+const variantOf = (row: Row): string | undefined => {
+  const suite = row.ancestorTitles[0] ?? '';
+  const at = suite.indexOf(BROKEN_SUITE_MARK);
+  return at < 0 ? undefined : suite.slice(at + BROKEN_SUITE_MARK.length);
+};
+
+const claims = (name: string, row: Row): boolean => variantOf(row) === name;
+
+const rowsOf = (name: string): Row[] => results().filter((row) => claims(name, row));
 
 /**
  * The one-to-one-ness, made mechanical. A clause with no variant is a clause whose assertions can be
@@ -194,15 +215,37 @@ describe('the suite rejects a non-conformant plugin', () => {
     expect(report, stdout.slice(-4_000)).toBeDefined();
     expect(results().length).toBeGreaterThan(BROKEN_VARIANTS.length);
     for (const variant of BROKEN_VARIANTS) {
-      expect(results().some((r) => r.fullName.includes(`broken/${variant.name}`))).toBe(true);
+      expect(rowsOf(variant.name).length, `no rows collected for "${variant.name}"`).toBeGreaterThan(
+        0,
+      );
     }
+  });
+
+  /**
+   * The attribution itself, graded as a partition rather than as a fact about these names. Every row
+   * the child produced comes from exactly one broken suite, so a matcher that lets a row count for
+   * two variants — or for none — is visible here whatever produced it: a rename, a name that becomes
+   * a prefix of another, or a containment match reintroduced. A per-variant row cannot see it,
+   * because the extra failures it inherits only ever make it pass.
+   */
+  it('each result row is claimed by exactly one variant', () => {
+    const claimants = results().map((r) => ({
+      row: r.fullName,
+      by: BROKEN_VARIANTS.filter((v) => claims(v.name, r)).map((v) => v.name),
+    }));
+    expect(claimants.length).toBeGreaterThan(BROKEN_VARIANTS.length);
+    expect(
+      claimants.filter((c) => c.by.length !== 1),
+      'a report row that no variant claims, or that more than one claims — every check in this ' +
+        'file scores a variant by the rows it matches, so a many-to-one match certifies a control ' +
+        'that has stopped failing',
+    ).toEqual([]);
   });
 
   it.each(BROKEN_VARIANTS.map((v) => [v.name, v.mustFail] as const))(
     'fails a plugin with %s',
     (name, mustFail) => {
-      const mine = results().filter((r) => r.fullName.includes(`broken/${name}`));
-      const failed = mine.filter((r) => r.status === 'failed');
+      const failed = rowsOf(name).filter((r) => r.status === 'failed');
       expect(failed.length, `no case failed for "${name}"`).toBeGreaterThan(0);
       expect(
         failed.map((r) => r.fullName).join('\n'),

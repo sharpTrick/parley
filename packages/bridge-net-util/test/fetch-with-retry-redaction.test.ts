@@ -339,6 +339,72 @@ describe('fetchWithRetry', () => {
   );
 
   /**
+   * The third axis on the same locations: not where the credential sits and not what it is made of,
+   * but WHICH SIDE of the percent-encoding boundary it is echoed on. `URL` hands userinfo back
+   * encoded and a query value back decoded, so the fragment a component's getter reports is only one
+   * of the two spellings a transport or a hostile body can carry, and redaction removes every part
+   * in both. Keep both directions echoed by a row, so that neither half of that pair can be deleted
+   * with every redaction case green — the encoded half is all that stands between model context and
+   * a proxy's 502 quoting the percent-encoded path segment.
+   *
+   * One vector, not three: the spelling changes only the string handed to `redactUrls`, which is the
+   * same reason the table above crosses the vectors alone.
+   */
+  const RESPELLINGS: [string, (fragment: string) => string][] = [
+    ['as the parser hands it back', (f) => f],
+    ['percent-encoded', (f) => encodeURIComponent(f)],
+    [
+      'percent-decoded',
+      // Keep the catch, so that a generated alphabet cut mid-escape is a row and not a thrown table.
+      (f) => {
+        try {
+          return decodeURIComponent(f);
+        } catch {
+          return f;
+        }
+      },
+    ],
+  ];
+
+  const RESPELT_CELLS = (): { label: string; url: string; fragment: string; secret: string }[] => [
+    ...SHAPED_LOCATIONS.flatMap(([location, build]) =>
+      SHAPES().map(([shape, value]) => {
+        const target = build(value);
+        return { label: `${location}, ${shape}`, ...target, secret: target.fragment };
+      }),
+    ),
+    ...UNCONDITIONAL_LOCATIONS.map(([location, build]) => ({
+      label: location,
+      ...build(`bot123:${CANARY}`),
+      secret: CANARY,
+    })),
+  ];
+
+  /**
+   * The premise of the axis, per transform: a column whose every cell reads the same as the identity
+   * column grades nothing. Keep at least one shape the parser respells, so that dropping the
+   * alphabets carrying `+`, `/` and `%` collapses this row rather than quietly emptying the axis.
+   */
+  it.each(RESPELLINGS.slice(1))('the %s spelling reaches strings the identity does not', (_label, spell) => {
+    const respelt = RESPELT_CELLS().filter((cell) => spell(cell.fragment) !== cell.fragment);
+    expect(RESPELT_CELLS().length).toBeGreaterThan(10);
+    expect(respelt.map((cell) => cell.label)).not.toEqual([]);
+  });
+
+  it.each(
+    RESPELT_CELLS().flatMap((cell) =>
+      RESPELLINGS.map(([spelling, spell]) => [`${cell.label}, ${spelling}`, cell, spell] as const),
+    ),
+  )('never leaks a credential echoed in another spelling of itself (%s)', async (_label, cell, spell) => {
+    const echoed = spell(cell.fragment);
+    const message = await envelopeFor(cell.url, () =>
+      Promise.resolve(res(502, `no route for ${echoed}`)),
+    );
+    expect(message).toContain('L → ');
+    expect(message).not.toContain(spell(cell.secret));
+  });
+
+  /**
    * The one claim in the README that only a LENGTH axis can grade: userinfo takes neither exemption,
    * "so a short password is redacted too". The whole-part filter dropped every candidate of one
    * character, so the shortest password — the only one the sentence is about — survived verbatim

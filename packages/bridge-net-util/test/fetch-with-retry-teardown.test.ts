@@ -203,11 +203,23 @@ describe('fetchWithRetry', () => {
       const elapsed = Date.now() - started;
 
       expect(err?.message).toBe('L → 429 (disconnected)');
-      expect(elapsed).toBeLessThan(stopAtMs + STOP_POLL_MS + 150);
+      // Keep this bound an absolute figure, so that widening `STOP_POLL_MS` fails the row below
+      // rather than widening the bound with it.
+      expect(elapsed).toBeLessThan(stopAtMs + 200);
       expect(state.calls).toBe(1); // it never spent a request after the teardown
       expect(leaked).toEqual([]);
     },
   );
+
+  /**
+   * What the row above cannot say, because it grades an OBSERVED elapsed time and a poll a few times
+   * slower still lands inside the slack any real-timer bound has to carry. The README sells this
+   * figure as "the longest a disconnect waits on one", and that promise is the figure itself.
+   */
+  it('polls often enough for that bound to be the promise the README makes', () => {
+    expect(STOP_POLL_MS).toBeLessThanOrEqual(50);
+    expect(STOP_POLL_MS).toBeGreaterThan(0);
+  });
 
   // The class, not the one row: EVERY path that abandons a call must leave nothing armed. Each row
   // is an abandonment shape the loop has — a leak on any of them pins the event loop just as hard.
