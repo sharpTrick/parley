@@ -4,16 +4,18 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   CONNECT_WAIT_MS,
-  DEFAULT_POOL_SIZE,
   DIAL_WAIT_MS,
+  QUERY_WAIT_MS,
+  TEARDOWN_WAIT_MS,
+} from '../src/connection.js';
+import {
+  DEFAULT_POOL_SIZE,
   LOCK_WAIT_MS,
   MAX_POOL_SIZE,
   MAX_RETENTION_DAYS,
   MIN_POOL_SIZE,
   MIN_RETENTION_DAYS,
   PRUNE_BATCH,
-  QUERY_WAIT_MS,
-  TEARDOWN_WAIT_MS,
 } from '../src/index.js';
 import { MAX_IDENTIFIER_BYTES, MAX_TABLE_NAME_BYTES } from '../src/schema.js';
 

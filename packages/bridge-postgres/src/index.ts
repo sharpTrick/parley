@@ -28,6 +28,7 @@ import {
 } from './config.js';
 import {
   answerAbandoned,
+  answerNeverCame,
   assertCursor,
   assertStorable,
   dialAbandoned,
@@ -41,13 +42,6 @@ import type { TopicSubscription } from './push.js';
 import { newestMessages, pageResult } from './read.js';
 import { assertTableName, buildSchema, channelFor, quotedNames } from './schema.js';
 
-export {
-  CONNECT_WAIT_MS,
-  DIAL_WAIT_MS,
-  KEEPALIVE_DELAY_MS,
-  QUERY_WAIT_MS,
-  TEARDOWN_WAIT_MS,
-} from './connection.js';
 export { MAX_POOL_SIZE, MAX_RETENTION_DAYS, MIN_POOL_SIZE, MIN_RETENTION_DAYS } from './config.js';
 export { DEFAULT_POOL_SIZE, LOCK_WAIT_MS, type PostgresBackendConfig, usesDefaultCredentials };
 export { LISTENER_WAIT_MS, validateBackendConfig };
@@ -297,11 +291,16 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
       client.release();
       return seq;
     } catch (err) {
-      // Discard the connection instead of ROLLBACK-ing it back into the pool, so that a write that
-      // failed because the answer never arrived does not hand the next post() a client wedged
-      // behind a statement nothing will ever answer — and so that a ROLLBACK which fails the same
-      // way cannot leave one carrying this call's open transaction and `SET LOCAL`.
-      client.release(true);
+      if (answerNeverCame(err)) {
+        // Discard rather than ROLLBACK, so that a client wedged behind a statement nothing will
+        // ever answer does not go back in the pool — and because a ROLLBACK issued on it cannot
+        // come back either. Only this arm: a lock timeout is documented contention on a healthy
+        // connection, and destroying that one costs a handshake per refused write.
+        client.release(true);
+      } else {
+        await client.query('ROLLBACK').catch(() => undefined);
+        client.release();
+      }
       const named = lockWaitAbandoned(`write lock on topic '${topic}'`, err);
       throw answerAbandoned(`the write to topic '${topic}'`, QUERY_WAIT_MS, named);
     }

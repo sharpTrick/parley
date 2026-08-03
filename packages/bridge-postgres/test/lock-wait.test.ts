@@ -1,7 +1,16 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { LOCK_WAIT_MS, PostgresPlugin } from '../src/index.js';
-import { dropTable, isUp, PG_URL, rand, settleWithin, sleep, withAdmin } from './pg-harness.js';
+import {
+  backendCount,
+  dropTable,
+  isUp,
+  PG_URL,
+  rand,
+  settleWithin,
+  sleep,
+  withAdmin,
+} from './pg-harness.js';
 
 // Both server-side locks this plugin takes are acquired with a POOLED connection already checked
 // out and held for the length of the wait: post()'s per-topic write lock, and connect()'s bootstrap
@@ -107,6 +116,68 @@ if (await isUp(PG_URL)) {
       },
       120000,
     );
+
+    // The capacity has to come back as the SAME connection, not as a fresh handshake. `post()` has
+    // two refusals and they are not the same failure: a refusal because the ANSWER never came back
+    // leaves the connection wedged behind a statement nothing will ever complete, so it must be
+    // discarded rather than pooled — but a lock timeout is the server saying no on a connection
+    // that is perfectly healthy, and it is the refusal this whole file is about and the one the
+    // README tells operators to retry. Destroying that one turns documented contention into a
+    // TCP+auth handshake per rejected write, for as long as the contention lasts.
+    //
+    // Graded against the SERVER's backend count, because a connection the pool dropped is a backend
+    // the server closes, and because nothing above the seam can see the pool otherwise. The
+    // opposite arm — a refusal on a dead answer must NOT be pooled — is graded where a peer can be
+    // made to stop answering, by driving a write through the recovered connection afterwards.
+    it('a post() refused by lock contention gives back the connection, not a handshake', async () => {
+      const appName = `parley_hold_${rand()}`;
+      const table = `parley_hold_${rand()}`;
+      const topic = asTopic(`hold-${rand()}`);
+      const plugin = new PostgresPlugin();
+      try {
+        await plugin.connect({
+          url: `${PG_URL}?application_name=${appName}`,
+          table_name: table,
+          pool_size: 1,
+        });
+        await plugin.post(topic, asHandle('u'), 'warm the pool');
+        const before = await backendCount(appName);
+        expect(before, 'the pool never opened a connection, so there is nothing to grade').toBe(1);
+
+        await withAdmin(async (admin) => {
+          await admin.query('SELECT pg_advisory_lock(hashtext($1))', [topic]);
+          try {
+            const outcome = await settleWithin(
+              plugin.post(topic, asHandle('u'), 'contended'),
+              LOCK_WAIT_MS + 10000,
+            );
+            expect(outcome, 'this row needs the lock-timeout refusal, not another one').toMatch(
+              /^rejected: parley-postgres: gave up after/,
+            );
+          } finally {
+            await admin.query('SELECT pg_advisory_unlock(hashtext($1))', [topic]);
+          }
+        });
+
+        // A dropped connection's backend is gone within a round trip of the release.
+        await sleep(500);
+        expect(
+          await backendCount(appName),
+          'documented lock contention now costs a new connection per refused write',
+        ).toBe(before);
+
+        // And what came back has to be USABLE: a connection kept without rolling its transaction
+        // back is worse than a discarded one, because the next writer inherits the open one.
+        await plugin.post(topic, asHandle('u'), 'after the contention');
+        expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual([
+          'warm the pool',
+          'after the contention',
+        ]);
+      } finally {
+        await plugin.disconnect().catch(() => undefined);
+        await dropTable(table);
+      }
+    }, 60000);
 
     // The same shape one resource up: connect()'s idempotent bootstrap takes an advisory lock on
     // the TABLE with a pooled client held across the wait, so a session sitting on that key would

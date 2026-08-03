@@ -102,12 +102,21 @@ export const LOCK_WAIT_MS = 5000;
 const QUERY_READ_TIMEOUT = 'Query read timeout';
 
 /**
- * Name a statement this plugin gave up on because the ANSWER never came back — a half-open socket,
- * a black-holing pooler. Without the rename it reaches agent context as the driver's bare 'Query
- * read timeout', naming neither the plugin, the operation, nor the fact that nothing was written.
+ * Did this statement fail because the ANSWER never came back — a half-open socket, a black-holing
+ * pooler — rather than because the server said no? The two demand opposite handling of the
+ * connection underneath, so keep the question asked in one place.
+ */
+export function answerNeverCame(err: unknown): boolean {
+  return (err as { message?: string } | undefined)?.message === QUERY_READ_TIMEOUT;
+}
+
+/**
+ * Name a statement this plugin gave up on for that reason. Without the rename it reaches agent
+ * context as the driver's bare 'Query read timeout', naming neither the plugin, the operation, nor
+ * the fact that nothing was written.
  */
 export function answerAbandoned(what: string, budgetMs: number, err: unknown): Error {
-  if ((err as { message?: string } | undefined)?.message !== QUERY_READ_TIMEOUT) return err as Error;
+  if (!answerNeverCame(err)) return err as Error;
   return new Error(
     `parley-postgres: gave up on ${what} after ${budgetMs}ms — the connection is open but the ` +
       'server stopped answering. Nothing was written; that connection has been discarded and a ' +
