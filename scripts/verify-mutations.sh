@@ -13,8 +13,12 @@
 # is the step a human doing it by hand skips.
 #
 # Manifest: [{ "file": "...", "find": "...", "replace": "...", "test": "packages/x/test/y.test.ts",
-#              "expectFail": "a name fragment, optional" }]
+#              "expectFail": "a name fragment, optional", "only": "a -t name filter, optional" }]
 # `find` must be a literal that appears EXACTLY ONCE. Multiple matches are an error, not a guess.
+#
+# A red is only counted when `expectFail` appears in the output. A mutation that reddens by TIMEOUT
+# rather than by an assertion will not match one, and that is deliberate: a timeout is
+# indistinguishable from CPU contention, which has produced false reds on this repo more than once.
 #
 # Exit 0 = every mutation applied and reddened its test. Exit 1 = at least one did not.
 set -uo pipefail
@@ -34,13 +38,13 @@ count=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))))" "$
 
 for i in $(seq 0 $((count - 1))); do
   total=$((total + 1))
-  read -r file test expectFail < <(python3 - "$manifest" "$i" <<'PY'
+  IFS=$'\t' read -r file test expectFail only < <(python3 - "$manifest" "$i" <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))[int(sys.argv[2])]
-print(m['file'], m['test'], m.get('expectFail','') or '-')
+print('\t'.join([m['file'], m['test'], m.get('expectFail','') or '-', m.get('only','') or '-']))
 PY
 )
-  echo "── [$((i+1))/$count] $file  ->  $test"
+  echo "── [$((i+1))/$count] $file  ->  $test${only:+  -t $only}"
 
   # Apply by literal replacement, and REQUIRE exactly one occurrence. A find string that matches
   # nothing is the silent-no-op this script exists to catch; one that matches twice is ambiguous.
@@ -61,7 +65,11 @@ PY
     bad=$((bad + 1)); continue
   fi
 
-  if npx vitest run "$test" >/tmp/mutrun.log 2>&1; then
+  # `only` narrows the run to matching test names. It exists because a mutation can make the REST of
+  # a file hang rather than fail — restoring bridge-telegram's blocking store open leaves a squatted
+  # FIFO cell blocked forever in readFileSync, which is the defect, not a flake. Keep the narrowing
+  # OPT-IN and named, so that a manifest cannot quietly shrink what a mutation is graded against.
+  if npx vitest run "$test" ${only:+-t "$only"} >/tmp/mutrun.log 2>&1; then
     echo "   FAIL — the suite stayed GREEN under the mutation. This test does not grade the defect."
     bad=$((bad + 1))
   else
