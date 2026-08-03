@@ -27,6 +27,12 @@ export interface Rig {
   storePath: string;
   /** Connect a NEW plugin instance against the same fake and store file (cold restart). */
   restart(): Promise<TelegramPlugin>;
+  /**
+   * Connect the SAME plugin instance again, as a client that disconnected and came back does. The
+   * per-instance registries a `disconnect` has to clear — live subscriptions — survive on the
+   * object, so a new instance from {@link restart} cannot reach them.
+   */
+  reconnect(): Promise<void>;
 }
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -77,12 +83,12 @@ export async function startFake(): Promise<FakeTelegram> {
   return fake;
 }
 
-async function connect(
+async function connectPlugin(
+  plugin: TelegramPlugin,
   fake: FakeTelegram,
   path: string,
   config: Record<string, unknown>,
-): Promise<TelegramPlugin> {
-  const plugin = new TelegramPlugin();
+): Promise<void> {
   await plugin.connect({
     token: fake.token,
     api_url: fake.url,
@@ -90,6 +96,15 @@ async function connect(
     poll_timeout_s: 1,
     ...config,
   });
+}
+
+async function connect(
+  fake: FakeTelegram,
+  path: string,
+  config: Record<string, unknown>,
+): Promise<TelegramPlugin> {
+  const plugin = new TelegramPlugin();
+  await connectPlugin(plugin, fake, path, config);
   return plugin;
 }
 
@@ -116,8 +131,15 @@ export function connectFresh(
 export async function startRig(config: Record<string, unknown> = {}): Promise<Rig> {
   const fake = await startFake();
   const path = storePath();
-  const reconnect = (): Promise<TelegramPlugin> => connectTo(fake, path, config);
-  return { fake, storePath: path, plugin: await reconnect(), restart: reconnect };
+  const restart = (): Promise<TelegramPlugin> => connectTo(fake, path, config);
+  const plugin = await restart();
+  return {
+    fake,
+    storePath: path,
+    plugin,
+    restart,
+    reconnect: () => connectPlugin(plugin, fake, path, config),
+  };
 }
 
 /**
@@ -143,6 +165,7 @@ export async function openRig(
       connected.push(plugin);
       return plugin;
     },
+    reconnect: () => connectPlugin(connected[0] as TelegramPlugin, fake, path, config),
     close: async () => {
       for (const plugin of [...connected].reverse()) await plugin.disconnect();
       await fake.close();

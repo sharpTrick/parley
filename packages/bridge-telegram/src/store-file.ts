@@ -1,14 +1,15 @@
 import {
   appendFileSync,
-  chmodSync,
   closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -21,31 +22,121 @@ export const OWNER_ONLY_FILE = 0o600;
 /** Mode for a directory the store creates for its path. */
 export const OWNER_ONLY_DIR = 0o700;
 
-/** Sibling path claiming a store file for one process — see {@link StoreLock}. */
-const LOCK_SUFFIX = '.lock';
-/** Sibling held for the duration of a stale-claim take-over — see {@link StoreLock.replaceStale}. */
-const BREAK_SUFFIX = '.lock.break';
-/** Sibling carrying the sequence high-water — see {@link StoreFile.readMark}. */
-const MARK_SUFFIX = '.hw';
+/**
+ * Every path the store writes BESIDE its file: the claim on it ({@link StoreLock}), the sibling held
+ * across a stale-claim take-over ({@link StoreLock.replaceStale}), the sequence high-water
+ * ({@link StoreFile.readMark}) and a compaction's rewrite target ({@link StoreFile.replace}).
+ *
+ * Derived in ONE place, so that a sibling a later change adds is one the suite grading a squat on
+ * each of them inherits rather than falls behind: every one is a predictable name in a directory the
+ * store does not own.
+ */
+export function siblingPaths(storePath: string): {
+  lock: string;
+  break: string;
+  mark: string;
+  tmp: string;
+} {
+  return {
+    lock: `${storePath}.lock`,
+    break: `${storePath}.lock.break`,
+    mark: `${storePath}.hw`,
+    tmp: `${storePath}.tmp`,
+  };
+}
+
+/**
+ * Flags every open of a store path carries on top of what the caller asked for. `store_path` can be
+ * anywhere the operator put it and each sibling below is a predictable name beside it, so anyone who
+ * can create a file in that directory chooses what these opens resolve to.
+ *
+ * Keep the refusal IN the open. `O_NOFOLLOW` makes the kernel reject a final component that is a
+ * symlink as part of the same syscall, so there is no interval an attacker can win; an
+ * `lstat`-then-open would hand them exactly that interval. `O_NONBLOCK`, so that a squatted FIFO
+ * fails the open instead of parking the whole bridge inside it — a read of one blocks forever, and
+ * `openSync`/`readFileSync` block the event loop with it.
+ */
+const GUARDED = constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+/**
+ * Open one of the store's own paths, refusing anything but a regular file. The `fstat` reads the
+ * DESCRIPTOR rather than the name, so what it grades is the file this call is already holding.
+ */
+function openOwn(path: string, flags: number): number {
+  let fd: number;
+  try {
+    fd = openSync(path, flags | GUARDED, OWNER_ONLY_FILE);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ELOOP') throw err;
+    throw new Error(
+      `ObservedStore: refusing to open '${path}' — it is a symlink. This file and its siblings ` +
+        `carry the plaintext of every message the bridge has observed, so following one would ` +
+        `write that wherever the link points and narrow that target's mode. Name a real file.`,
+    );
+  }
+  let regular: boolean;
+  try {
+    regular = fstatSync(fd).isFile();
+  } catch (err) {
+    closeSync(fd);
+    throw err;
+  }
+  if (!regular) {
+    closeSync(fd);
+    throw new Error(
+      `ObservedStore: refusing to use '${path}' — it exists and is not a regular file, so the ` +
+        `observed-message store would be written somewhere nothing can read it back from.`,
+    );
+  }
+  return fd;
+}
+
+/** The bytes at one of the store's own paths, or `''` when it is not a readable regular file. */
+function readOwn(path: string): string {
+  let fd: number;
+  try {
+    fd = openOwn(path, constants.O_RDONLY);
+  } catch {
+    return '';
+  }
+  try {
+    return readFileSync(fd, 'utf8');
+  } catch {
+    return '';
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Replace one of the store's own paths with `text`, refusing a squatted target as {@link openOwn}. */
+function writeOwn(path: string, text: string): void {
+  const fd = openOwn(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
+  try {
+    writeSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /**
  * Narrow a store file readable beyond its owner, reporting the change. An `openSync` mode applies
  * only to a file it CREATES, so an upgrade onto a store written by an earlier version — or a
- * compaction output a broken umask widened — is otherwise left silently world-readable. Keep this
- * to files the store owns, so that a pre-existing DIRECTORY — an operator's working directory, a
- * shared state root — is never narrowed on their behalf.
+ * compaction output a broken umask widened — is otherwise left silently world-readable. Take the
+ * DESCRIPTOR and not the name, so that the mode change lands on the file this process opened and can
+ * never be redirected onto a symlink's target, or onto a pre-existing DIRECTORY — an operator's
+ * working directory, a shared state root — that is not ours to narrow.
  */
-export function restrictMode(path: string): void {
+export function restrictMode(fd: number, path: string): void {
   let current: number;
   try {
-    current = statSync(path).mode & 0o777;
+    current = fstatSync(fd).mode & 0o777;
   } catch {
     return;
   }
   if ((current & 0o077) === 0) return;
   const target = current & 0o700;
   try {
-    chmodSync(path, target);
+    fchmodSync(fd, target);
     note(
       `tightened ${path} from 0${current.toString(8)} to 0${target.toString(8)} ` +
         `(the observed-message store must not be readable by other accounts)`,
@@ -60,12 +151,8 @@ export function restrictMode(path: string): void {
 
 /** The pid a lock sibling names, or `undefined` when it carries nothing readable. */
 function lockHolder(path: string): number | undefined {
-  try {
-    const pid = Number(readFileSync(path, 'utf8').trim());
-    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
-  } catch {
-    return undefined;
-  }
+  const pid = Number(readOwn(path).trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 /** True while `pid` names a live process — EPERM is a process we may not signal, not a dead one. */
@@ -92,8 +179,9 @@ export class StoreLock {
   private held = false;
 
   constructor(private readonly storePath: string) {
-    this.path = `${storePath}${LOCK_SUFFIX}`;
-    this.breakPath = `${storePath}${BREAK_SUFFIX}`;
+    const siblings = siblingPaths(storePath);
+    this.path = siblings.lock;
+    this.breakPath = siblings.break;
   }
 
   claim(): void {
@@ -137,7 +225,11 @@ export class StoreLock {
       if (this.tryClaim()) return true;
       const holder = lockHolder(this.path);
       if (holder !== undefined && processExists(holder)) return false;
-      renameSync(this.breakPath, this.path);
+      try {
+        renameSync(this.breakPath, this.path);
+      } catch {
+        return false;
+      }
       renamed = true;
       this.held = true;
       return true;
@@ -186,10 +278,13 @@ export class StoreFile {
   private tornTail = false;
   private readonly diagnostics = new Diagnostics();
   private readonly markPath: string;
+  private readonly tmpPath: string;
 
   constructor(readonly path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: OWNER_ONLY_DIR });
-    this.markPath = `${path}${MARK_SUFFIX}`;
+    const siblings = siblingPaths(path);
+    this.markPath = siblings.mark;
+    this.tmpPath = siblings.tmp;
     this.lock = new StoreLock(path);
     this.lock.claim();
   }
@@ -201,12 +296,8 @@ export class StoreFile {
    * claim agrees with itself — is still distinguishable from one that legitimately holds fewer.
    */
   readMark(): number {
-    try {
-      const mark = Number(readFileSync(this.markPath, 'utf8').trim());
-      return Number.isInteger(mark) && mark >= 0 ? mark : 0;
-    } catch {
-      return 0;
-    }
+    const mark = Number(readOwn(this.markPath).trim());
+    return Number.isInteger(mark) && mark >= 0 ? mark : 0;
   }
 
   /**
@@ -216,7 +307,7 @@ export class StoreFile {
    */
   mark(seq: number): void {
     try {
-      writeFileSync(this.markPath, `${seq}\n`, { mode: OWNER_ONLY_FILE });
+      writeOwn(this.markPath, `${seq}\n`);
     } catch (err) {
       this.diagnostics.report(
         `could not record the sequence high-water beside ${this.path} (${describe(err)}) — a tail ` +
@@ -228,17 +319,14 @@ export class StoreFile {
 
   /** The file's bytes, or `''` when there is none yet — a first run against this path. */
   read(): string {
-    try {
-      return readFileSync(this.path, 'utf8');
-    } catch {
-      return '';
-    }
+    return readOwn(this.path);
   }
 
   /** Take the append descriptor, narrowing a mode an earlier version or a broad umask left open. */
   open(): void {
-    this.fd = openSync(this.path, 'a', OWNER_ONLY_FILE);
-    restrictMode(this.path);
+    const fd = this.openAppend();
+    this.fd = fd;
+    restrictMode(fd, this.path);
   }
 
   /** True while the append descriptor is held — false after {@link close}, or if a reopen failed. */
@@ -292,7 +380,7 @@ export class StoreFile {
    * can ever produce.
    */
   replace(text: string): void {
-    const tmp = `${this.path}.tmp`;
+    const tmp = this.tmpPath;
     const fd = this.openTemp(tmp);
     try {
       writeSync(fd, text);
@@ -322,7 +410,7 @@ export class StoreFile {
     try {
       this.replace(text);
     } finally {
-      this.fd = openSync(this.path, 'a', OWNER_ONLY_FILE);
+      this.fd = this.openAppend();
     }
   }
 
@@ -346,11 +434,16 @@ export class StoreFile {
     if (this.fd !== undefined) return this.fd;
     if (this.closed) return undefined;
     try {
-      this.fd = openSync(this.path, 'a', OWNER_ONLY_FILE);
+      this.fd = this.openAppend();
     } catch {
       return undefined;
     }
     return this.fd;
+  }
+
+  /** The append descriptor on the store file itself, under {@link openOwn}'s refusals. */
+  private openAppend(): number {
+    return openOwn(this.path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND);
   }
 
   /**

@@ -259,3 +259,97 @@ describe('telegram observes each message once', () => {
     20_000,
   );
 });
+
+/**
+ * The live-subscription REGISTRY itself. It is a list per chat, deliberately — `chat_map` can give
+ * one chat two topic names, and each subscriber has to be stamped with the topic IT named the chat
+ * by — so the registry has a fan-out and a teardown, and neither was graded anywhere: deleting the
+ * push into the per-chat list, and deleting the clear that `disconnect` does, each left the whole
+ * suite green. A registry that silently collapses to one slot, or that carries a torn-down
+ * connection's handlers into the next one, is exactly what "live push" means here.
+ *
+ * Graded through the public seam only, over the registry SHAPES rather than one of them, with the
+ * subscriber COUNT as an axis so that a collapse to a single slot fails on N>1 instead of being
+ * invisible to one hand-picked case.
+ */
+describe('telegram live subscription registry', () => {
+  const CHAT = '-1009444001';
+  const COUNTS = [1, 2, 3];
+
+  /** N topic names `chat_map` all points at the one chat. */
+  const aliases = (n: number): string[] => Array.from({ length: n }, (_, i) => `alias-${i}`);
+  const chatMap = (names: string[]): Record<string, string> =>
+    Object.fromEntries(names.map((name) => [name, CHAT]));
+  const box = (n: number): Message[][] => Array.from({ length: n }, () => []);
+  const settle = async (got: Message[], contents: string[]): Promise<void> => {
+    await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(contents), {
+      timeout: 5000,
+      interval: 10,
+    });
+  };
+
+  it.each(COUNTS)('fans one chat out to %i topics, each subscriber stamped with its own', async (n) => {
+    const names = aliases(n);
+    const rig = await startRig({ chat_map: chatMap(names) });
+    const received = new Map<string, Message[]>();
+    for (const name of names) {
+      const got: Message[] = [];
+      received.set(name, got);
+      await rig.plugin.subscribe(asTopic(name), (m) => got.push(m));
+    }
+    // Both ingestion routes: a foreign message off the shared poll loop, and our own send.
+    rig.fake.injectUserMessage(CHAT, 'bob', 'foreign');
+    await rig.plugin.post(asTopic(names[0] as string), SENDER, 'own');
+
+    for (const name of names) {
+      const got = received.get(name) ?? [];
+      await vi.waitFor(() => expect(got.map((m) => m.content).sort()).toEqual(['foreign', 'own']), {
+        timeout: 5000,
+        interval: 10,
+      });
+      // The topic a subscriber is handed is the one IT named the chat by — the whole reason the
+      // registry holds a {handler, topic} pair and not a bare handler.
+      expect([...new Set(got.map((m) => m.topic as string))]).toEqual([name]);
+    }
+  }, 20_000);
+
+  it.each(COUNTS)('delivers to all %i subscribers that named the same topic', async (n) => {
+    const rig = await startRig();
+    const boxes = box(n);
+    for (const got of boxes) await rig.plugin.subscribe(asTopic(CHAT), (m) => got.push(m));
+    rig.fake.injectUserMessage(CHAT, 'bob', 'one');
+    for (const got of boxes) await settle(got, ['one']);
+  }, 20_000);
+
+  it.each(COUNTS)('keeps delivering to %i siblings of a handler that throws', async (n) => {
+    const rig = await startRig();
+    let raised = 0;
+    await rig.plugin.subscribe(asTopic(CHAT), () => {
+      raised++;
+      throw new Error('subscriber exploded');
+    });
+    const boxes = box(n);
+    for (const got of boxes) await rig.plugin.subscribe(asTopic(CHAT), (m) => got.push(m));
+    rig.fake.injectUserMessage(CHAT, 'bob', 'through');
+    for (const got of boxes) await settle(got, ['through']);
+    expect(raised).toBe(1);
+  }, 20_000);
+
+  it.each(COUNTS)('drops %i subscriptions at disconnect rather than into the next connection', async (n) => {
+    const rig = await startRig();
+    const stale = box(n);
+    for (const got of stale) await rig.plugin.subscribe(asTopic(CHAT), (m) => got.push(m));
+    rig.fake.injectUserMessage(CHAT, 'bob', 'before');
+    for (const got of stale) await settle(got, ['before']);
+
+    await rig.plugin.disconnect();
+    await rig.reconnect();
+    const fresh: Message[] = [];
+    await rig.plugin.subscribe(asTopic(CHAT), (m) => fresh.push(m));
+    rig.fake.injectUserMessage(CHAT, 'bob', 'after');
+    await settle(fresh, ['after']);
+    // The torn-down connection's subscribers saw nothing the new one served — a handler stamped
+    // with the old connection's topic receiving live pushes is a subscription nobody can cancel.
+    for (const got of stale) expect(got.map((m) => m.content)).toEqual(['before']);
+  }, 20_000);
+});

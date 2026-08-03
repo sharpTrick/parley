@@ -81,7 +81,29 @@ export class TelegramPlugin implements BackendPlugin {
   private readonly waiters = new Waiters();
   private readonly diagnostics = new Diagnostics((text) => this.api.redact(text));
 
+  /**
+   * The redaction boundary for everything this plugin rejects with. `BotApi.call` redacts what its
+   * own HTTP call threw, which leaves every diagnostic composed AFTER that call — out of a field the
+   * upstream chose, on an envelope that was well-formed — carrying the credential this API puts in
+   * the URL path. Keep the boundary at the SEAM rather than at the call, so that a new diagnostic
+   * anywhere behind one of these methods cannot put the bot token into model context or the
+   * operator's logs. Rewrite the message in place rather than rethrowing, so that `HttpStatusError`
+   * and the `status` the poll loop branches on survive.
+   */
+  private async redacting<T>(run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (err) {
+      if (err instanceof Error) err.message = this.api.redact(err.message);
+      throw err;
+    }
+  }
+
   async connect(config: BackendConfig): Promise<void> {
+    return this.redacting(async () => this.openConnection(config));
+  }
+
+  private async openConnection(config: BackendConfig): Promise<void> {
     if (this.store !== undefined || this.connecting) {
       throw new Error('TelegramPlugin: already connected — call disconnect() first');
     }
@@ -92,11 +114,13 @@ export class TelegramPlugin implements BackendPlugin {
     const generation = ++this.generation;
     try {
       const cfg = config as TelegramBackendConfig;
-      requireNumericKnobs(cfg);
       const apiUrl = (cfg.api_url ?? DEFAULT_API_URL).replace(/\/+$/, '');
       const token = cfg.token ?? '';
       const api = new BotApi(apiUrl, token);
+      // Publish the client before anything can throw, so that everything this method rejects with
+      // is redacted against THIS connection's token rather than the previous connection's.
       this.api = api;
+      requireNumericKnobs(cfg);
       const warning = plaintextWarning(apiUrl);
       if (warning !== undefined) this.diagnostics.report(warning);
       const timeoutS = cfg.poll_timeout_s ?? 25;
@@ -152,6 +176,10 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   async disconnect(): Promise<void> {
+    return this.redacting(async () => this.closeConnection());
+  }
+
+  private closeConnection(): void {
     this.generation++;
     this.connecting = false;
     this.api.stop();
@@ -174,6 +202,14 @@ export class TelegramPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
+    return this.redacting(async () => this.send(topic, content, opts?.inReplyTo));
+  }
+
+  private async send(
+    topic: Topic,
+    content: string,
+    inReplyTo: BackendMsgId | undefined,
+  ): Promise<BackendMsgId> {
     const store = this.require(this.store);
     const chatId = await this.require(this.chats).chatIdFor(topic);
     this.stillServing(store);
@@ -181,7 +217,7 @@ export class TelegramPlugin implements BackendPlugin {
     // Reply threading: only for a composite `<chat>:<mid>` naming THIS chat — a message id from
     // another chat is meaningless here (Telegram's message_id is per-chat) and would either 400
     // or thread onto an unrelated message that happens to share the number.
-    const replyMid = parseCompositeMid(opts?.inReplyTo, chatId);
+    const replyMid = parseCompositeMid(inReplyTo, chatId);
     if (replyMid !== undefined) body.reply_to_message_id = replyMid;
     const sent = requireMessage(
       'Telegram POST /sendMessage → result',
@@ -237,6 +273,10 @@ export class TelegramPlugin implements BackendPlugin {
    * sliced to `limit`.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    return this.redacting(async () => this.query(args));
+  }
+
+  private async query(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const store = this.require(this.store);
     const sinceSeq =
       args.since === undefined
@@ -288,6 +328,10 @@ export class TelegramPlugin implements BackendPlugin {
    * subscribe can never be missed and nothing already in the store can replay here.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    return this.redacting(async () => this.register(topic, handler));
+  }
+
+  private async register(topic: Topic, handler: MessageHandler): Promise<void> {
     const store = this.require(this.store);
     const chatId = await this.require(this.chats).chatIdFor(topic);
     this.stillServing(store);
@@ -299,6 +343,10 @@ export class TelegramPlugin implements BackendPlugin {
 
   /** Any handle but the bot's own passes through: the Bot API cannot look up users (DESIGN §4). */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
+    return this.redacting(async () => this.identify(handle));
+  }
+
+  private async identify(handle: Handle): Promise<BackendIdentity> {
     const store = this.require(this.store);
     const me = await this.api.getMe();
     this.stillServing(store);

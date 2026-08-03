@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -14,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { siblingPaths } from '../src/store-file.js';
 import { ObservedStore } from '../src/store.js';
 import { captureStderr, lineCount, record, storePath } from './rig.js';
 
@@ -118,28 +120,61 @@ describe('telegram ObservedStore file permissions', () => {
   const SQUATTED = [
     { name: 'a world-readable regular file', kind: 'file' as const, compacts: true },
     { name: 'a symlink to a file outside the store directory', kind: 'symlink-file' as const, compacts: false },
+    // An EMPTY target loads clean, so nothing downstream re-mints an identity and rewrites the file
+    // — which is the one shape under which a followed symlink at the store path survives the whole
+    // run and every observed message goes through it. A non-empty one is broken by the first
+    // compaction's rename, and would hide the disclosure behind a repair.
+    { name: 'a symlink to an empty file outside the store directory', kind: 'symlink-empty' as const, compacts: false },
     { name: 'a symlink to a directory outside the store directory', kind: 'symlink-dir' as const, compacts: false },
     { name: 'a dangling symlink', kind: 'symlink-dangling' as const, compacts: false },
     { name: 'a directory', kind: 'dir' as const, compacts: false },
     { name: 'a FIFO', kind: 'fifo' as const, compacts: false },
   ];
 
+  /** A bystander's file and directory, outside the store's own directory entirely. */
+  interface Victim {
+    root: string;
+    file: string;
+    empty: string;
+    dir: string;
+  }
+
+  const layVictim = (): Victim => {
+    const root = mkdtempSync(join(tmpdir(), 'parley-tg-victim-'));
+    const victim = {
+      root,
+      file: join(root, 'victim.txt'),
+      empty: join(root, 'empty.txt'),
+      dir: join(root, 'victim-dir'),
+    };
+    writeFileSync(victim.file, 'private\n');
+    chmodSync(victim.file, 0o644);
+    writeFileSync(victim.empty, '');
+    chmodSync(victim.empty, 0o644);
+    mkdirSync(victim.dir);
+    return victim;
+  };
+
+  /** Squat `at` with one kind of thing an attacker who can write the store's directory can put there. */
+  const squat = (kind: (typeof SQUATTED)[number]['kind'], at: string, victim: Victim): void => {
+    if (kind === 'file') writeFileSync(at, 'junk\n');
+    if (kind === 'symlink-file') symlinkSync(victim.file, at);
+    if (kind === 'symlink-empty') symlinkSync(victim.empty, at);
+    if (kind === 'symlink-dir') symlinkSync(victim.dir, at);
+    if (kind === 'symlink-dangling') symlinkSync(join(victim.root, 'not-there'), at);
+    if (kind === 'dir') mkdirSync(at);
+    if (kind === 'fifo') execFileSync('mkfifo', [at]);
+  };
+
   it.each(SQUATTED)('refuses to compact through $name, leaving what it points at alone', ({ kind, compacts }) => {
-    const outside = mkdtempSync(join(tmpdir(), 'parley-tg-victim-'));
-    const victimFile = join(outside, 'victim.txt');
-    const victimDir = join(outside, 'victim-dir');
-    writeFileSync(victimFile, 'private\n');
-    chmodSync(victimFile, 0o644);
-    mkdirSync(victimDir);
+    const victim = layVictim();
+    const victimFile = victim.file;
+    const victimDir = victim.dir;
+    const outside = victim.root;
     const store = join(dir, 'squat', 'store.jsonl');
     mkdirSync(dirname(store), { recursive: true });
     const tmp = `${store}.tmp`;
-    if (kind === 'file') writeFileSync(tmp, 'junk\n');
-    if (kind === 'symlink-file') symlinkSync(victimFile, tmp);
-    if (kind === 'symlink-dir') symlinkSync(victimDir, tmp);
-    if (kind === 'symlink-dangling') symlinkSync(join(outside, 'not-there'), tmp);
-    if (kind === 'dir') mkdirSync(tmp);
-    if (kind === 'fifo') execFileSync('mkfifo', [tmp]);
+    squat(kind, tmp, victim);
 
     const stderr = captureStderr();
     const observed = new ObservedStore(store, 2, 10);
@@ -172,5 +207,69 @@ describe('telegram ObservedStore file permissions', () => {
     reopened.close();
     expect(lineCount(store)).toBe(2);
     rmSync(outside, { recursive: true, force: true });
+  });
+
+  /**
+   * `<store_path>.tmp` was never the only predictable name beside the store. The store FILE itself,
+   * the `<store_path>.hw` high-water and the two lock siblings are equally choosable by anyone who
+   * can create a file in the directory `store_path` names, and each was opened by a call that
+   * follows a symlink: the plaintext of every observed message went through a squatted store path,
+   * and a squatted `.hw` truncated whatever it pointed at.
+   *
+   * The path axis is read out of `siblingPaths`, so a sibling a later change adds is swept here
+   * without anyone remembering to. What is graded is the property, not any refusal's spelling:
+   * nothing outside the store's own directory is written through, truncated, re-moded or added to,
+   * and the store either refuses naming a path or serves every record out of a regular file of its
+   * own. A squat that made the store BLOCK would fail this too — a `readFileSync` on a squatted FIFO
+   * parks the whole process, which no assertion about the outcome could ever reach.
+   */
+  const SQUATTABLE = ['store', ...Object.keys(siblingPaths(''))];
+  const pathOf = (store: string, which: string): string =>
+    which === 'store' ? store : (siblingPaths(store) as Record<string, string>)[which] ?? store;
+
+  const FAMILY = SQUATTED.flatMap(({ kind }) => SQUATTABLE.map((which) => ({ kind, which })));
+
+  /** Every file under `root`, recursively — what a leak would have to show up in. */
+  const filesUnder = (root: string): string[] =>
+    readdirSync(root, { withFileTypes: true }).flatMap((e) => {
+      const full = join(root, e.name);
+      return e.isDirectory() ? filesUnder(full) : [full];
+    });
+
+  it.each(FAMILY)('reaches nothing outside its own directory when $which is squatted with a $kind', ({ kind, which }) => {
+    const victim = layVictim();
+    const store = join(dir, 'family', 'store.jsonl');
+    mkdirSync(dirname(store), { recursive: true });
+    const target = pathOf(store, which);
+    squat(kind, target, victim);
+
+    captureStderr();
+    let refusal: Error | undefined;
+    try {
+      const observed = new ObservedStore(store, 2, 10);
+      for (let i = 1; i <= 8; i++) observed.append(record('-1', i, `secret-${i}`));
+      expect(observed.entries('-1').map((r) => r.content)).toEqual(['secret-7', 'secret-8']);
+      observed.close();
+    } catch (err) {
+      refusal = err as Error;
+    }
+
+    expect(readFileSync(victim.file, 'utf8')).toBe('private\n');
+    expect(readFileSync(victim.empty, 'utf8')).toBe('');
+    expect(modeOf(victim.file)).toBe(0o644);
+    expect(modeOf(victim.empty)).toBe(0o644);
+    expect(readdirSync(victim.dir)).toEqual([]);
+    expect(filesUnder(victim.root).sort()).toEqual([victim.empty, victim.file].sort());
+    for (const leaked of filesUnder(victim.root)) {
+      expect(readFileSync(leaked, 'utf8')).not.toContain('secret-');
+    }
+
+    if (refusal === undefined) {
+      expect(lstatSync(store).isFile()).toBe(true);
+      expect(modeOf(store) & 0o077).toBe(0);
+    } else {
+      expect(refusal.message).toContain(target);
+    }
+    rmSync(victim.root, { recursive: true, force: true });
   });
 });

@@ -62,11 +62,15 @@ export function unwrapEnvelope(label: string, text: string): unknown {
  * keying on the spelling would file a record under something no other call looks up — on this
  * backend a permanent black hole, since no history endpoint can refill the topic. A spelling that
  * is not an integer at all names no chat Telegram could serve, so it is a labelled rejection here.
+ *
+ * The spelling is the UPSTREAM's and the rejection becomes model context, so quote it through
+ * `sanitizeBody` like every other quoted body — unbounded and unflattened it is an attacker-chosen
+ * string with forged line structure in it.
  */
 export function canonicalChatKey(label: string, id: number | string): string {
   const raw = typeof id === 'number' ? String(id) : id.trim();
   if (!NUMERIC_CHAT_ID.test(raw)) {
-    throw new Error(`${label}: chat id '${raw}' is not a Telegram numeric chat id`);
+    throw new Error(`${label}: chat id '${sanitizeBody(raw)}' is not a Telegram numeric chat id`);
   }
   return BigInt(raw).toString();
 }

@@ -1,4 +1,5 @@
 import { asTopic } from '@sharptrick/parley-core';
+import { MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { type FakeTelegram, KNOWN_CHANNEL } from './fake-telegram.js';
@@ -154,4 +155,77 @@ describe('telegram diagnostics never carry the bot token', () => {
     const fake = await startFake();
     expect(encodeURIComponent(fake.token)).not.toBe(fake.token);
   });
+});
+
+/**
+ * Every row above breaks the ENVELOPE, so every one is thrown INSIDE `BotApi.call` and redacted by
+ * the single `catch` there — which leaves the discriminating case ungraded. A WELL-FORMED `ok:true`
+ * answer returns from that call normally, and the plugin then composes its own diagnostics out of
+ * the RESULT FIELDS: the chat id an upstream stamped, which it quotes when that id is not one
+ * Telegram could serve. Those messages are built after the HTTP call has returned, so what has to
+ * redact them is the SEAM, not the call. This is the row that tells "the HTTP call redacts" apart
+ * from "the plugin redacts".
+ *
+ * The upstream poisons EVERY string-valued field of the result rather than the one field today's
+ * rejection happens to quote, so a diagnostic that later quotes a different one is graded by the
+ * same cells. The echo carries forged line structure and is longer than `MAX_ERROR_BODY` too,
+ * because a quoted upstream value is untrusted twice over: it must not carry the credential, and it
+ * must not reach model context unbounded or unflattened.
+ */
+describe('telegram diagnostics on a well-formed answer', () => {
+  /** ECHO first, so that the credential survives the truncation the padding after it forces. */
+  const echoOf = (url: string): string => `${ECHO}\n${url}${'A'.repeat(MAX_ERROR_BODY * 2)}`;
+
+  /** A well-formed `ok:true` answer for `method` whose every string-valued result field is `echo`. */
+  const answer = (method: string, echo: string): string => {
+    const chat = { id: echo, type: echo, username: echo };
+    const message = {
+      message_id: 1,
+      date: 1_700_000_000,
+      chat,
+      from: { id: 5, is_bot: false, username: echo, first_name: echo },
+      text: echo,
+    };
+    const result =
+      method === 'getChat' ? chat : method === 'getUpdates' ? [{ update_id: 1, message }] : message;
+    return JSON.stringify({ ok: true, result });
+  };
+
+  /** The seam calls that quote a field off a SUCCESSFUL answer, and the endpoint each reads. */
+  const QUOTING = [
+    { name: 'post', method: 'sendMessage' },
+    { name: 'fetchRecent', method: 'getChat' },
+    { name: 'subscribe', method: 'getChat' },
+    { name: 'the ingestion loop', method: 'getUpdates' },
+  ] as const;
+
+  it.each(QUOTING)('$name quotes the $method result without the token', async ({ name, method }) => {
+    const stderr = captureStderr();
+    const fake = await startFake();
+    const plugin = await connectTo(fake, storePath());
+    fake.malformMethod(method, answer(method, echoOf(`${fake.url}/bot${fake.token}/${method}`)));
+
+    let diagnostic = '';
+    if (name === 'the ingestion loop') {
+      await vi.waitFor(() => expect(stderr.join('')).toContain(ECHO), { timeout: 8000, interval: 20 });
+      diagnostic = (stderr.find((l) => l.includes(ECHO)) ?? '').trimEnd();
+    } else if (name === 'post') {
+      diagnostic = await said(plugin.post(asTopic(POST_CHAT), SENDER, 'x'));
+    } else if (name === 'fetchRecent') {
+      diagnostic = await said(plugin.fetchRecent({ topic: asTopic(KNOWN_CHANNEL.username) }));
+    } else {
+      diagnostic = await said(plugin.subscribe(asTopic(KNOWN_CHANNEL.username), () => undefined));
+    }
+
+    // The cell really produced a diagnostic and really quoted the field that carried the credential.
+    expect(diagnostic).not.toBe('');
+    expect(diagnostic).toContain(ECHO);
+    for (const spelling of [fake.token, encodeURIComponent(fake.token)]) {
+      expect(diagnostic).not.toContain(spelling);
+      for (const line of stderr) expect(line).not.toContain(spelling);
+    }
+    // Bounded and flattened, like every other untrusted body this plugin quotes.
+    expect(diagnostic).not.toContain('\n');
+    expect(diagnostic.length).toBeLessThan(MAX_ERROR_BODY + 512);
+  }, 20_000);
 });
