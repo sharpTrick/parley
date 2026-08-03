@@ -41,7 +41,10 @@ for i in $(seq 0 $((count - 1))); do
   IFS=$'\t' read -r file test expectFail only < <(python3 - "$manifest" "$i" <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))[int(sys.argv[2])]
-print('\t'.join([m['file'], m['test'], m.get('expectFail','') or '-', m.get('only','') or '-']))
+# An absent optional field is emitted EMPTY, never as a sentinel, so that `${only:+...}` cannot
+# expand it. A `-` placeholder here silently ran every unfiltered mutation as `-t -`, grading
+# whatever test names happened to contain a hyphen.
+print('\t'.join([m['file'], m['test'], m.get('expectFail',''), m.get('only','')]))
 PY
 )
   echo "── [$((i+1))/$count] $file  ->  $test${only:+  -t $only}"
@@ -73,7 +76,7 @@ PY
     echo "   FAIL — the suite stayed GREEN under the mutation. This test does not grade the defect."
     bad=$((bad + 1))
   else
-    if [ "$expectFail" != "-" ] && ! grep -qF "$expectFail" /tmp/mutrun.log; then
+    if [ -n "$expectFail" ] && ! grep -qF "$expectFail" /tmp/mutrun.log; then
       echo "   FAIL — it went red, but not on '$expectFail'. Something else broke; the named guard is unproven."
       bad=$((bad + 1))
     else
