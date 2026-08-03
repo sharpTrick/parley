@@ -15,7 +15,7 @@
 import { asCursor, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { compareTs, SlackPlugin } from '../src/index.js';
-import { startSlack } from './harness.js';
+import { capture, rungStarts, settleWithin, startSlack } from './harness.js';
 
 interface Run {
   n: number;
@@ -188,6 +188,61 @@ describe('slack fetchRecent floors a non-positive limit', () => {
           await cleanup();
         }
       });
+    }
+  }
+});
+
+/**
+ * The same CLASS, one field wider. `limit` is only one of the numbers the seam hands this plugin
+ * with no bound: `blockMs` reaches DEADLINE arithmetic, where a non-finite value is neither `> 0`
+ * nor `<= 0`, so every comparison on the blocking ladder answers false — the call spins on
+ * `conversations.history` (`NaN`) or parks forever (`Infinity`). Neither shows up in a returned
+ * page, so the rows below grade the two things only a budget can break: whether the call SETTLES,
+ * and how many tiered reads it spent getting there. `since='tail'` is the mode that engages the
+ * ladder at all (an empty exclusive window is what makes the plugin block), so a table that varies
+ * `blockMs` without it grades nothing.
+ */
+const BLOCK_ROWS = [-1, 0, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 50];
+const ARG_LIMITS = [-5, 0, 1, Number.NaN, Number.POSITIVE_INFINITY, undefined];
+const SETTLE_MS = 3000;
+
+describe('slack fetchRecent settles on every numeric seam argument, at bounded request cost', () => {
+  for (const blockMs of BLOCK_ROWS) {
+    for (const limit of ARG_LIMITS) {
+      for (const sinceMode of ['none', 'zero', 'tail'] as const) {
+        it(`blockMs=${String(blockMs)} / limit=${String(limit)} / since=${sinceMode}`, async () => {
+          const { fake, plugin, cleanup } = await startSlack({ appToken: null });
+          try {
+            const topic = asTopic('C0ARGS');
+            const seeded = fake.seed(
+              topic,
+              Array.from({ length: 5 }, (_, i) => ({ text: `m${i}` })),
+            );
+            const since = { none: undefined, zero: '0', tail: seeded.at(-1)!.ts }[sinceMode];
+            const args = {
+              topic,
+              blockMs,
+              ...(limit === undefined ? {} : { limit }),
+              ...(since === undefined ? {} : { since: asCursor(since) }),
+            };
+
+            const before = fake.hits('conversations.history');
+            const settled = await settleWithin(capture(plugin.fetchRecent(args)), SETTLE_MS);
+            const reads = fake.hits('conversations.history') - before;
+
+            expect(settled.status, `never settled inside ${SETTLE_MS}ms`).toBe('fulfilled');
+            // One entry walk (this fixture is a single page), one re-query per ladder rung the
+            // budget actually reaches, and the post-deadline read. A budget the plugin cannot
+            // reason about spends this without limit.
+            const budget = Number.isFinite(blockMs) ? Math.max(0, blockMs) : 0;
+            expect(reads, 'tiered reads for one call').toBeLessThanOrEqual(
+              rungStarts(budget).length + 2,
+            );
+          } finally {
+            await cleanup();
+          }
+        });
+      }
     }
   }
 });

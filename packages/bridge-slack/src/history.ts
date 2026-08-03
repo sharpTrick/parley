@@ -154,7 +154,10 @@ export class SlackHistory {
     const aborted = (): FetchRecentResult => ({ messages: [], nextCursor: floor });
     while (!retired()) {
       const remaining = deadlineAt - Date.now();
-      if (remaining <= 0) break;
+      // The seam declares `blockMs?: number` with no bound and this ladder is where it lands, so
+      // keep the finiteness arm, so that a non-finite budget — neither `> 0` nor `<= 0`, so every
+      // comparison here answers false — ends the wait instead of spinning it on a tiered method.
+      if (!Number.isFinite(remaining) || remaining <= 0) break;
       // `handshake_timeout_ms` may be far longer than one ladder rung, so bound the wait for it by
       // the rung too, so that a socket which accepts and then says nothing cannot hold the caller
       // past the next history re-query.

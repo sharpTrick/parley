@@ -13,10 +13,12 @@
  *
  * (2) WAKE ELIGIBILITY. A parked long-poll must wake only on an event STRICTLY above its own floor,
  *     on its OWN channel. `since` is a caller argument, so two concurrent blocked fetches on one
- *     channel legitimately sit at different floors; a waiter woken below its floor re-queries, finds
- *     nothing, and returns an empty page at once — turning `block_ms` back into the busy-return loop
- *     it exists to remove. Timing is the only observable: every row here returns an empty page either
- *     way, so what separates them is whether the call held its budget.
+ *     channel legitimately sit at different floors. What the floor buys is REQUEST COST, not the
+ *     page and not the budget: a waiter woken below its floor re-queries, surfaces nothing, carries
+ *     the same floor forward and re-arms — so it still holds its whole budget and still returns an
+ *     empty page, and every below-floor event on the channel has cost one tiered
+ *     `conversations.history` read. Grading elapsed time therefore grades nothing here, which is why
+ *     each ineligible row lands its event REPEATEDLY and bounds the reads the call spent.
  *
  * (3) POLL STORM. Core re-drives `fetchRecent` every `block_poll_interval_ms` for the whole
  *     `block_max_ms` budget. Per-iteration network work must therefore be bounded by WALL CLOCK, not
@@ -126,71 +128,95 @@ describe('slack blocking fetch: the lost-wakeup window', () => {
 const BLOCK_MS = 1200;
 
 /**
- * Where a live event sits relative to the parked waiter. `deliver` returns the text the fetch must
- * come back with, or `undefined` when the row must hold its whole budget and return nothing.
+ * How many times an INELIGIBLE event is landed, and how far apart. One landing costs one spurious
+ * re-query, which the ladder's own re-reads hide; repeating it across the park is what lifts the
+ * cost of an ignored floor clear of {@link readCeiling}, whatever the ladder happened to do.
  */
-const ELIGIBILITY: Array<{
-  name: string;
-  wakes: boolean;
-  /** Land the event, given the channel the fetch is parked on and its exclusive floor. */
-  land: (fake: FakeSlack, parked: Topic, floor: string) => void;
-}> = [
-  {
-    name: 'an event strictly above the floor',
-    wakes: true,
-    land: (fake, parked) => deliver(fake, parked, 'live'),
-  },
-  {
-    name: 'an event exactly at the floor',
-    wakes: false,
-    land: (fake, parked, floor) => fake.pushEvent(parked, { ts: floor, text: 'at', user: 'U0X' }),
-  },
-  {
-    name: 'an event below the floor',
-    wakes: false,
-    land: (fake, parked, floor) =>
-      fake.pushEvent(parked, {
-        ts: `${Number(floor.split('.')[0]) - 60}.000001`,
-        text: 'below',
-        user: 'U0X',
-      }),
-  },
-  {
-    name: 'an above-floor event on a different channel',
-    wakes: false,
-    land: (fake) => deliver(fake, asTopic('C0OTHER'), 'elsewhere'),
-  },
+const SPURIOUS_LANDINGS = 8;
+const FIRST_LANDING_MS = 150;
+const LANDING_SPACING_MS = 100;
+
+/** The two reads no ladder rung can be blamed for: the entry query and the post-deadline one. */
+const MIN_BLOCKED_READS = 2;
+
+/**
+ * Where a live event sits relative to the parked waiter's exclusive floor, expressed as the `ts` it
+ * lands at. `floor`, `tickBelow` and `tickAbove` are minted consecutively, so the two tick rows are
+ * the SMALLEST steps the backend's own cursor can express either side of the floor — `tickAbove`
+ * fails a comparison that needs a coarser gap, and `atFloor` is the row that separates `>` from `>=`.
+ */
+interface Floors {
+  tickBelow: string;
+  floor: string;
+  tickAbove: string;
+}
+
+const OFFSETS: Array<{ name: string; wakes: boolean; ts: (f: Floors) => string }> = [
+  { name: '60s below the floor', wakes: false, ts: (f) => `${seconds(f.floor) - 60}.000001` },
+  { name: 'one suffix tick below the floor', wakes: false, ts: (f) => f.tickBelow },
+  { name: 'exactly at the floor', wakes: false, ts: (f) => f.floor },
+  { name: 'one suffix tick above the floor', wakes: true, ts: (f) => f.tickAbove },
+  { name: '60s above the floor', wakes: true, ts: (f) => `${seconds(f.floor) + 60}.000001` },
 ];
 
+const seconds = (ts: string): number => Number(ts.split('.')[0]);
+
 describe('slack blocking fetch: only an above-floor event on its own channel wakes a waiter', () => {
-  for (const row of ELIGIBILITY) {
-    it(`${row.wakes ? 'wakes on' : 'stays parked through'} ${row.name}`, async () => {
-      const topic = asTopic('C0FLOOR');
-      await withBlocking({ channels: [topic, 'C0OTHER'] }, async (fake, plugin) => {
-        // The floor is a real `ts` above everything in history, so the first query is empty and the
-        // call parks; nothing the rows land is fetchable below it either, so EVERY row's page is
-        // empty and elapsed time is the only thing that separates a wake from a budget burn.
-        const floor = fake.mintTs();
-        setTimeout(() => row.land(fake, topic, floor), 150);
+  for (const offset of OFFSETS) {
+    for (const channel of ['its own channel', 'a different channel'] as const) {
+      const own = channel === 'its own channel';
+      const wakes = offset.wakes && own;
+      it(`${wakes ? 'wakes on' : 'stays parked through'} an event ${offset.name} on ${channel}`, async () => {
+        const parked = asTopic('C0FLOOR');
+        const other = asTopic('C0OTHER');
+        await withBlocking({ channels: [parked, other] }, async (fake, plugin) => {
+          // Three consecutive `ts` above everything in history: the first query is empty, so the
+          // call parks, and nothing below the floor is fetchable — every ineligible row's page is
+          // empty whether or not its floor was honoured.
+          const floors: Floors = {
+            tickBelow: fake.mintTs(),
+            floor: fake.mintTs(),
+            tickAbove: fake.mintTs(),
+          };
+          const at = offset.ts(floors);
+          const landOn = own ? parked : other;
+          const event = { ts: at, text: 'landed', user: 'U0X' };
+          // A waking row must be READABLE too — a push the re-query cannot confirm returns an empty
+          // page and the row would grade the floor against nothing.
+          if (wakes) fake.seedRaw(landOn, [{ type: 'message', ...event }]);
+          for (let i = 0; i < (wakes ? 1 : SPURIOUS_LANDINGS); i++) {
+            setTimeout(() => fake.pushEvent(landOn, event), FIRST_LANDING_MS + i * LANDING_SPACING_MS);
+          }
 
-        const t0 = Date.now();
-        const result = await plugin.fetchRecent({
-          topic,
-          since: asCursor(floor),
-          blockMs: BLOCK_MS,
-        });
-        const elapsed = Date.now() - t0;
+          const before = fake.hits('conversations.history');
+          const t0 = Date.now();
+          const result = await plugin.fetchRecent({
+            topic: parked,
+            since: asCursor(floors.floor),
+            blockMs: BLOCK_MS,
+          });
+          const elapsed = Date.now() - t0;
+          const reads = fake.hits('conversations.history') - before;
 
-        if (row.wakes) {
-          expect(result.messages.map((m) => m.content)).toEqual(['live']);
-          expect(elapsed).toBeLessThan(BLOCK_MS / 2);
-        } else {
+          if (wakes) {
+            expect(result.messages.map((m) => m.content)).toEqual(['landed']);
+            expect(elapsed, 'woken natively').toBeLessThan(BLOCK_MS / 2);
+            return;
+          }
           expect(result.messages).toEqual([]);
-          expect(String(result.nextCursor)).toBe(floor);
-          expect(elapsed).toBeGreaterThanOrEqual(BLOCK_MS * 0.8);
-        }
+          expect(String(result.nextCursor)).toBe(floors.floor);
+          expect(elapsed, 'held its budget').toBeGreaterThanOrEqual(BLOCK_MS * 0.8);
+          // The class: an ignored floor is invisible in the page and in the clock, and shows up
+          // ONLY as one tiered read per ineligible event.
+          expect(reads, `${SPURIOUS_LANDINGS} ineligible events cost reads`).toBeLessThanOrEqual(
+            readCeiling(fake, BLOCK_MS),
+          );
+          // …paired with a floor, so that a park which stopped re-reading history — which satisfies
+          // the ceiling perfectly — fails here instead.
+          expect(reads, 'history re-read floor').toBeGreaterThanOrEqual(MIN_BLOCKED_READS);
+        });
       });
-    });
+    }
   }
 
   it('two waiters at different floors on one channel: only the eligible one wakes', async () => {
@@ -199,25 +225,34 @@ describe('slack blocking fetch: only an above-floor event on its own channel wak
       const lowFloor = fake.mintTs();
       const between = fake.mintTs();
       const highFloor = fake.mintTs();
+      const event = { ts: between, text: 'mid', user: 'U0X' };
 
-      setTimeout(() => {
-        fake.seedRaw(topic, [{ type: 'message', ts: between, text: 'mid', user: 'U0X' }]);
-        fake.pushEvent(topic, { ts: between, text: 'mid', user: 'U0X' });
-      }, 150);
+      fake.seedRaw(topic, [{ type: 'message', ...event }]);
+      // Above the low floor and below the high one, landed repeatedly: eligible for one waiter and
+      // ineligible for the other, so the high waiter's cost is what the per-waiter floor buys.
+      for (let i = 0; i < SPURIOUS_LANDINGS; i++) {
+        setTimeout(() => fake.pushEvent(topic, event), FIRST_LANDING_MS + i * LANDING_SPACING_MS);
+      }
 
+      const before = fake.hits('conversations.history');
       const t0 = Date.now();
       const [low, high] = await Promise.all([
         plugin.fetchRecent({ topic, since: asCursor(lowFloor), blockMs: BLOCK_MS }),
         plugin.fetchRecent({ topic, since: asCursor(highFloor), blockMs: BLOCK_MS }),
       ]);
       const elapsed = Date.now() - t0;
+      const reads = fake.hits('conversations.history') - before;
 
       expect(low.messages.map((m) => m.content)).toEqual(['mid']);
-      // The high waiter shares the channel's waiter set, so a wake that ignores the per-waiter floor
-      // returns it an empty page immediately instead of holding its budget.
       expect(high.messages).toEqual([]);
       expect(String(high.nextCursor)).toBe(highFloor);
       expect(elapsed).toBeGreaterThanOrEqual(BLOCK_MS * 0.8);
+      // The high waiter shares the channel's waiter set: a wake that consults the set but not the
+      // waiter's own floor re-queries it once per landing, for a page it can never carry.
+      expect(reads, 'two calls, one of them ineligible for every landing').toBeLessThanOrEqual(
+        2 * readCeiling(fake, BLOCK_MS),
+      );
+      expect(reads, 'history re-read floor').toBeGreaterThanOrEqual(2 * MIN_BLOCKED_READS);
     });
   });
 });
