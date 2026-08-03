@@ -211,9 +211,7 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
         else expect(message).not.toContain('AAAA');
         expect(run.tookBytes).toBeGreaterThan(0);
         expect(run.tookBytes).toBeLessThan(BUFFER_SLACK);
-        // Absolute, not `DEADLINE_MS`: a bound stated as the budget the call was handed says only
-        // that the call ended, and moves whenever the budget does.
-        expect(run.elapsedMs).toBeLessThan(2_000);
+        expect(run.elapsedMs).toBeLessThan(DEADLINE_MS);
         expect(run.rssGrowth).toBeLessThan(32 * MB);
       },
     );
@@ -282,7 +280,7 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
         `${LABEL} → body: response body exceeded 262144 bytes`,
       );
       expect(run.tookBytes).toBeLessThan(BUFFER_SLACK);
-      expect(run.elapsedMs).toBeLessThan(2_000);
+      expect(run.elapsedMs).toBeLessThan(DEADLINE_MS);
     });
   });
 

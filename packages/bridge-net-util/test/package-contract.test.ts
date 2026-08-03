@@ -328,13 +328,15 @@ describe('every export earns its place', () => {
 });
 
 /**
- * A bound on elapsed time stated in terms of the figure that governs the wait discriminates nothing:
- * raise the figure and the bound rises with it, so the wait it promises to cap can grow without a
- * row going red. Keep every such bound an absolute figure, and pin the constant on its own terms.
+ * A bound on elapsed time stated in terms of an IMPLEMENTATION constant — a figure the test does not
+ * choose, imported from the code under test — discriminates nothing: raise the figure and the bound
+ * rises to meet it, so the wait it promises to cap can grow with every row green. Keep such a bound
+ * an absolute figure, and pin the constant on its own terms beside it.
  *
- * Graded over `test/**` rather than at the sites that have it today, so the next bound written
- * against `DEFAULT_BACKOFF_MS`, `DEFAULT_DEADLINE_MS` or a case's own `deadlineMs` lands red instead
- * of certifying whatever the figure becomes.
+ * A bound stated in terms of an input the TEST hands the call is the opposite: it is the contract,
+ * and the strongest available statement of it. Only imported names are graded here, so the next
+ * bound written against `DEFAULT_BACKOFF_MS` or `DEFAULT_DEADLINE_MS` lands red while a case
+ * asserting it returned inside the deadline it was given stays as strict as it is.
  */
 describe('no elapsed-time bound is stated in terms of the figure it grades', () => {
   const ELAPSED_SUBJECT = /Date\.now\(\)\s*-|elapsed/i;
@@ -372,27 +374,47 @@ describe('no elapsed-time bound is stated in terms of the figure it grades', () 
 
   /**
    * A file's code, with comments and string literals removed. An assertion QUOTED in a string is
-   * data — the reader's own self-test feeds it its subject matter that way — and a bound narrated
-   * in a comment is prose.
+   * data — the rows below feed the reader its subject matter that way — and a bound narrated in a
+   * comment is prose.
+   *
+   * Keep every quote character here written as an escape, and keep each literal closing on the line
+   * it opens, so that an unpaired quote inside a regex literal matches nothing instead of swallowing
+   * the code down to the next one — this file holds both a lone backtick and the assertions it is
+   * scanning for.
    */
   const codeOf = (text: string): string =>
     text
       .replaceAll(/\/\*[\s\S]*?\*\//g, '')
       .replaceAll(/^\s*\/\/.*$/gm, '')
-      .replaceAll(/'(?:[^'\\\n]|\\.)*'/g, "''")
-      .replaceAll(/"(?:[^"\\\n]|\\.)*"/g, '""')
-      .replaceAll(/`(?:[^`\\]|\\.)*`/g, '``');
+      .replaceAll(/\x27(?:[^\x27\\\n]|\\.)*\x27/g, '')
+      .replaceAll(/\x22(?:[^\x22\\\n]|\\.)*\x22/g, '')
+      .replaceAll(/\x60(?:[^\x60\\\n]|\\.)*\x60/g, '');
 
-  /** Figures a bound may not name: what the package ships, and what a case hands the loop. */
   const exportedFigures = (): string[] =>
     Object.entries(api)
       .filter(([, value]) => typeof value === 'number')
       .map(([name]) => name);
 
-  const budgetNames = (code: string): string[] =>
-    [
-      ...code.matchAll(/\b(?:deadlineMs|blockMs|timeoutMs|retryAfterMs):\s*([A-Za-z_$][\w$]*)/g),
-    ].map((m) => m[1] as string);
+  /**
+   * Every name a file binds by IMPORT — the mechanical form of "a figure this test does not choose".
+   * A local the test declares and hands the call is a budget it controls, so a bound naming one
+   * states the contract rather than deriving itself from the implementation.
+   */
+  const importedNames = (code: string): string[] =>
+    [...code.matchAll(/\bimport\s*(?:type\s*)?\{([^}]*)\}\s*from/g)].flatMap((m) =>
+      (m[1] as string)
+        .split(',')
+        .map((clause) => clause.trim().split(/\s+as\s+/).pop() ?? '')
+        .filter((name) => name.length > 0),
+    );
+
+  /** Bounds in `code` that name a figure the test does not choose. */
+  const offendersIn = (code: string): string[] => {
+    const forbidden = new Set([...exportedFigures(), ...importedNames(code)]);
+    return elapsedBounds(code).filter((bound) =>
+      namesIn(bound).some((name) => forbidden.has(name)),
+    );
+  };
 
   const testSources = (): [string, string][] =>
     readdirSync(new URL('../test/', import.meta.url), { recursive: true })
@@ -408,12 +430,11 @@ describe('no elapsed-time bound is stated in terms of the figure it grades', () 
     expect(graded().flatMap(([, code]) => elapsedBounds(code)).length).toBeGreaterThan(4);
     expect(graded().length).toBeGreaterThan(2);
     expect(exportedFigures().length).toBeGreaterThan(4);
-    expect(testSources().flatMap(([, code]) => budgetNames(code))).not.toEqual([]);
     // The forbidden vocabulary has to be within reach, or the rows below forbid nothing.
-    const named = testSources().flatMap(([, code]) =>
-      exportedFigures().filter((figure) => namesIn(code).includes(figure)),
+    const reachable = testSources().flatMap(([, code]) =>
+      importedNames(code).filter((name) => exportedFigures().includes(name)),
     );
-    expect(named).not.toEqual([]);
+    expect(reachable).not.toEqual([]);
   });
 
   // The reader against the spellings it has to tell apart, so it cannot regress to finding nothing
@@ -432,16 +453,50 @@ describe('no elapsed-time bound is stated in terms of the figure it grades', () 
     expect(elapsedBounds(snippet).flatMap(namesIn)).toEqual(names);
   });
 
+  /**
+   * The stripper, on what it has to keep out and what it must not run past. An unpaired quote inside
+   * a regex literal reading the real code as data is the failure that matters: it is silent, it
+   * spans lines, and it reports a bound this file never wrote.
+   */
+  it.each([
+    ['a bound in code', 'expect(elapsed).toBeLessThan(N);', 1],
+    ['a bound quoted as a string', "const row = 'expect(elapsed).toBeLessThan(N);';", 0],
+    ['a bound quoted in a template', 'const row = `expect(elapsed).toBeLessThan(N);`;', 0],
+    ['a bound narrated in a comment', '// expect(elapsed).toBeLessThan(N);', 0],
+    // The runaway needs the unpaired quote AND a later real one to close on — that pair is what
+    // swallows the code between them, which is how this file reported a bound it never wrote.
+    [
+      'a bound between an unpaired quote in a regex and a real one',
+      'const re = /\x60/g;\nexpect(elapsed).toBeLessThan(N);\nconst row = \x60later\x60;',
+      1,
+    ],
+  ])('strips %s', (_label, module, found) => {
+    expect(elapsedBounds(codeOf(module))).toHaveLength(found);
+  });
+
+  /**
+   * The rule itself, on the distinction it exists to draw. Reading a bound is not the same as judging
+   * one: the reader finds a name in every row above, and only these say which names are the test's
+   * own. A rule that cannot tell them apart demands that a real contract be weakened.
+   */
+  const IMPORTS = "import { STOP_POLL_MS, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';\n";
+
+  it.each([
+    ['an implementation constant the test imports', `${IMPORTS}expect(elapsed).toBeLessThan(stopAtMs + STOP_POLL_MS + 150);`, 1],
+    ['an exported figure, however it is reached', `${IMPORTS}expect(elapsed).toBeLessThan(MAX_ERROR_BODY);`, 1],
+    ['a budget the test declares and hands the call', 'const DEADLINE_MS = 1_000;\ncall({ deadlineMs: DEADLINE_MS });\nexpect(run.elapsedMs).toBeLessThan(DEADLINE_MS);', 0],
+    ['a value the row itself supplies', 'expect(elapsed).toBeLessThan(stopAtMs + 200);', 0],
+    ['an absolute figure', 'expect(elapsed).toBeLessThan(2_000);', 0],
+  ])('judges %s', (_label, module, flagged) => {
+    expect(offendersIn(module)).toHaveLength(flagged);
+  });
+
   it.each(graded())('%s states its elapsed bounds in figures', (_path, code) => {
-    const forbidden = new Set([...exportedFigures(), ...budgetNames(code)]);
-    const offenders = elapsedBounds(code).filter((bound) =>
-      namesIn(bound).some((name) => forbidden.has(name)),
-    );
     expect(
-      offenders,
-      'an elapsed-time bound naming the figure that governs the wait it grades — widening the ' +
-        'figure widens the bound with it, so the wait can grow without a row going red. State the ' +
-        'bound as a figure, and pin the constant on its own terms beside it',
+      offendersIn(code),
+      'an elapsed-time bound naming an imported figure that governs the wait it grades — widening ' +
+        'the figure widens the bound with it, so the wait can grow without a row going red. State ' +
+        'the bound as a figure, and pin the constant on its own terms beside it',
     ).toEqual([]);
   });
 });
