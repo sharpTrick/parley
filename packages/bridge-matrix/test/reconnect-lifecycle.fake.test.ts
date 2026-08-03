@@ -56,6 +56,121 @@ const PARKED_IN = {
   },
 } as const;
 
+/**
+ * CLASS: no sleep on a background path may outlive the teardown that ended it. `disconnect()`
+ * reaches a wait built on an {@link AbortController} it registered and reaches nothing else, so a
+ * bare `setTimeout` keeps the Node event loop alive for the whole of its delay after the plugin is
+ * gone — `cli.ts` hides that behind `process.exit(0)`, an embedder that awaits `shutdown()` and lets
+ * Node drain does not. Graded by instrumenting the timer itself rather than by watching for further
+ * REQUESTS, which an armed-but-idle timer satisfies. Every row proves it slept before the teardown
+ * lands, so a park nobody armed fails instead of passing on an empty set.
+ */
+
+/** Above this, a surviving timer is a park of the plugin's own rather than a poll or a round-trip. */
+const LONG_SLEEP_MS = 100;
+
+type TimerId = ReturnType<typeof setTimeout>;
+
+interface SleepTracker {
+  /** Delays of the long timers armed since installation that have neither fired nor been cleared. */
+  armed: () => number[];
+  /** A wait of the test's own, on the real timer, so it never appears in {@link armed}. */
+  wait: (ms: number) => Promise<void>;
+  restore: () => void;
+}
+
+const trackLongSleeps = (): SleepTracker => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const live = new Map<TimerId, number>();
+  const arm = realSetTimeout as unknown as (
+    fn: (...a: unknown[]) => void,
+    ms: number,
+    ...args: unknown[]
+  ) => TimerId;
+  const patched = (handler: (...a: unknown[]) => void, ms = 0, ...args: unknown[]): TimerId => {
+    let id: TimerId | undefined;
+    const fire = (...fired: unknown[]): void => {
+      if (id !== undefined) live.delete(id);
+      handler(...fired);
+    };
+    id = arm(fire, ms, ...args);
+    if (ms > LONG_SLEEP_MS) live.set(id, ms);
+    return id;
+  };
+  globalThis.setTimeout = patched as unknown as typeof globalThis.setTimeout;
+  globalThis.clearTimeout = ((id: TimerId): void => {
+    live.delete(id);
+    realClearTimeout(id);
+  }) as unknown as typeof globalThis.clearTimeout;
+  return {
+    armed: () => [...live.values()],
+    wait: (ms) => new Promise((r) => realSetTimeout(r, ms)),
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    },
+  };
+};
+
+/**
+ * Every park in this package that SLEEPS, and how to leave the plugin sitting in it. Each returns
+ * the still-running call in a wrapper, so awaiting the arm cannot accidentally await the park.
+ */
+const SLEEPING_PARKS: Record<string, (p: MatrixPlugin) => Promise<{ inFlight: Promise<unknown> }>> =
+  {
+    // The ladder the subscribe loop climbs while the homeserver refuses every /sync.
+    'the subscribe retry backoff': async (p) => {
+      fake.syncFailures = Number.POSITIVE_INFINITY;
+      await p.subscribe(TOPIC, () => undefined);
+      return { inFlight: Promise.resolve() };
+    },
+    // The provisioning poll a blocking read drives while the topic still has no room.
+    'the room-provisioning poll of a blocking read': async (p) => {
+      fake.aliasExists = false;
+      const inFlight = p.fetchRecent({
+        topic: TOPIC,
+        since: asCursor(''),
+        blockMs: 30_000,
+        limit: 5,
+      });
+      void inFlight.catch(() => undefined);
+      return { inFlight };
+    },
+    // The park slice a blocking read waits out between canonical re-queries.
+    'the park slice of a blocking read at the tail': async (p) => {
+      await p.post(TOPIC, WRITER, 'seed');
+      const tail = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
+      const inFlight = p.fetchRecent({ topic: TOPIC, since: tail, blockMs: 30_000, limit: 5 });
+      void inFlight.catch(() => undefined);
+      return { inFlight };
+    },
+  };
+
+describe('no background sleep outlives the disconnect that ended it', () => {
+  for (const [name, park] of Object.entries(SLEEPING_PARKS)) {
+    it(`${name}: the timer is gone the moment disconnect() resolves`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const p = await connectFake({});
+      const tracker = trackLongSleeps();
+      try {
+        const { inFlight } = await park(p);
+        for (let i = 0; i < 200 && tracker.armed().length === 0; i++) await tracker.wait(25);
+        expect(tracker.armed(), 'this park armed no long sleep, so it grades nothing').not.toEqual(
+          [],
+        );
+
+        await p.disconnect();
+
+        expect(tracker.armed()).toEqual([]);
+        await inFlight.catch(() => undefined);
+      } finally {
+        tracker.restore();
+      }
+    }, 30_000);
+  }
+});
+
 describe('a subscribe loop does not survive disconnect + connect', () => {
   for (const [name, park] of Object.entries(PARKED_IN)) {
     it(`parked in ${name}: the pre-disconnect handler goes quiet and issues no more requests`, async () => {

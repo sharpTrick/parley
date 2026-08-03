@@ -76,7 +76,7 @@ export abstract class MatrixSession {
   }
 
   /** Sleep, but no longer than the next `disconnect()` (which aborts every registered controller). */
-  private async interruptibleDelay(ms: number): Promise<void> {
+  protected async interruptibleDelay(ms: number): Promise<void> {
     const controller = new AbortController();
     this.controllers.add(controller);
     try {

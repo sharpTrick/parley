@@ -9,6 +9,7 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
+import { MAX_BACKFILL_PAGES } from '../src/timeline.js';
 import { SHAPES } from './cursor-shapes.js';
 import { aliasForTopic, connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
 
@@ -351,12 +352,24 @@ const addTailNoise = (f: FakeSynapse, depth: number): void => {
   }
 };
 
+/**
+ * Tail noise deep enough that the backward walk spends its whole page budget before it reaches the
+ * oldest of {@link HISTORY} — derived from the bound, so raising or lowering that bound moves the
+ * case with it rather than leaving a literal behind that no longer buries anything. Sized to leave
+ * `LIMIT - 1` of the topic still within reach, so the walk ends holding PART of a window: the cell
+ * where "it filled the window" and "it ran out of timeline" are both false and only the bound is
+ * left.
+ */
+const PAGE_BOUND_NOISE = MAX_BACKFILL_PAGES * LIMIT - (LIMIT - 1);
+
 /** How the read under test is prevented from completing normally. */
 const SHORT_CIRCUITS: Record<
   string,
   {
     /** A transport FAULT, for which rejecting is the honest answer; a teardown is not one. */
     faults: boolean;
+    /** Set where only one tail depth can produce the stop reason this row names. */
+    depths?: number[];
     run: (p: MatrixPlugin, drive: () => Promise<FetchRecentResult>) => Promise<FetchRecentResult>;
   }
 > = {
@@ -412,6 +425,15 @@ const SHORT_CIRCUITS: Record<
       return pending;
     },
   },
+  // Nothing interferes with this one: the walk's OWN page bound is what ends it. A bound is not a
+  // teardown — every later call hits the same one — so this row is the control that separates
+  // "stopped early and has no position" from "stopped early and must still report the position it
+  // reached", which the rows above cannot tell apart.
+  'the walk spends its page budget': {
+    faults: false,
+    depths: [PAGE_BOUND_NOISE],
+    run: async (_p, drive) => drive(),
+  },
 };
 
 /** Every cursor form a caller can arrive with, including the two this plugin mints itself. */
@@ -424,9 +446,16 @@ const SINCE_FORMS: Record<string, (p: MatrixPlugin, t: Topic) => Promise<Cursor 
 };
 
 describe('a read that never completed reports the caller position, never one behind it', () => {
+  it('the page-bound row leaves part of a window in reach and the rest out of it', () => {
+    const stillInReach = MAX_BACKFILL_PAGES * LIMIT - PAGE_BOUND_NOISE;
+    expect(stillInReach).toBeGreaterThan(0);
+    expect(stillInReach).toBeLessThan(LIMIT);
+    expect(HISTORY.length).toBeGreaterThan(stillInReach);
+  });
+
   for (const [sinceName, mintSince] of Object.entries(SINCE_FORMS)) {
     for (const [circuitName, circuit] of Object.entries(SHORT_CIRCUITS)) {
-      for (const depth of TAIL_NOISE_DEPTHS) {
+      for (const depth of circuit.depths ?? TAIL_NOISE_DEPTHS) {
         it(`${sinceName} / ${circuitName} / tail noise x${depth}: the cursor it reports replays nothing already delivered`, async () => {
           const p = await connectFake({ shared: true });
           const t = asTopic('ctx-payments');
@@ -446,6 +475,11 @@ describe('a read that never completed reports the caller position, never one beh
           }
           if (outcome instanceof Error) return; // no cursor reported at all cannot regress one.
 
+          // Every row here reads a room that exists and holds history, so the tokenless stream form
+          // — "the first visible event in the room" — names a position no walk in this block ever
+          // reached, whichever way the read was cut short.
+          expect(String(outcome.nextCursor)).not.toBe('@parley-stream:');
+
           const q = await connectFake({ shared: true });
           // What the caller could still legitimately be shown: everything its OWN position replays to,
           // less whatever this call just handed it. A since-less caller's position IS the seam's
@@ -460,6 +494,15 @@ describe('a read that never completed reports the caller position, never one beh
           const owed = reachable.filter((c) => !delivered.includes(c));
 
           expect((await drainFrom(q, t, outcome.nextCursor, LIMIT)).contents).toEqual(owed);
+
+          // …and the position it reported is one the stream can still MOVE from. `owed` is computed
+          // the same way the read under test computes its own answer, so a cursor that reports
+          // nothing and advances nowhere satisfies it vacuously; what such a cursor cannot do is
+          // deliver the next message to land.
+          await q.post(t, WRITER, 'after-the-read');
+          expect((await drainFrom(q, t, outcome.nextCursor, LIMIT)).contents.at(-1)).toBe(
+            'after-the-read',
+          );
           await q.disconnect();
           await p.disconnect();
         });

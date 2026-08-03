@@ -162,29 +162,75 @@ describe('a foreign block moves this topic cursor only when it fills a page', ()
     }
   }
 
-  it('a blocking read reports the identical cursor a non-blocking one does', async () => {
-    install();
-    const p = await connect(true);
-    const A = asTopic('topic-A');
-    const B = asTopic('topic-B');
-    const writer = asHandle('w');
+  /**
+   * WHEN the foreign traffic lands is an axis of the blocking answer, not a detail of the fixture.
+   * A block staged BEFORE the call is already crossed by the pre-block query whose cursor seeds the
+   * wait, so every such row grades the seed and none of them grades the carry that advances it
+   * across each empty re-query — a distinction worth one page of foreign traffic per long-poll
+   * window, compounding until the topic sits past the forward-page bound and wedges. Each row
+   * proves its traffic landed, so one that armed nothing fails instead of re-grading the seed.
+   */
+  const BLOCK_MS = 900;
+  /** More than one `limit`-sized forward page, so a cursor that fails to carry cannot cross it. */
+  const FOREIGN_DEPTH = 9;
+  const BLOCK_LIMIT = 3;
 
-    const idA0 = await p.post(A, writer, 'a0');
-    for (let i = 0; i < 20; i++) await p.post(B, writer, `b${i}`);
+  const FOREIGN_BLOCK_LANDS: Record<
+    string,
+    (f: FakeSynapse, land: () => void) => { fired: () => boolean; cancel: () => void }
+  > = {
+    'before the call': (_f, land) => {
+      land();
+      return { fired: () => true, cancel: () => undefined };
+    },
+    'inside the dedicated /sync positioning window': (f, land) => {
+      let fired = false;
+      f.stallPositioningMs = 60;
+      f.stallPositioning = (ordinal) => ordinal === 1;
+      f.duringPositioningStall = (ordinal) => {
+        if (ordinal !== 1 || fired) return;
+        fired = true;
+        land();
+      };
+      return { fired: () => fired, cancel: () => undefined };
+    },
+    'mid-block, after the first empty re-query': (_f, land) => {
+      let fired = false;
+      const timer = setTimeout(() => {
+        fired = true;
+        land();
+      }, 120);
+      return { fired: () => fired, cancel: () => clearTimeout(timer) };
+    },
+  };
 
-    const plain = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5 });
-    const blocked = await p.fetchRecent({
-      topic: A,
-      since: asCursor(String(idA0)),
-      limit: 5,
-      blockMs: 150,
-    });
+  for (const [whenName, place] of Object.entries(FOREIGN_BLOCK_LANDS)) {
+    it(`a foreign block landing ${whenName}: the blocking cursor is the one a plain read reports`, async () => {
+      const f = install();
+      const p = await connect(true);
+      const A = asTopic('topic-A');
+      const B = asTopic('topic-B');
+      const writer = asHandle('w');
 
-    expect(blocked.messages).toEqual([]);
-    expect(String(blocked.nextCursor)).toBe(String(plain.nextCursor));
-    expect(String(blocked.nextCursor)).not.toBe(String(idA0));
-    await p.disconnect();
-  });
+      const idA0 = await p.post(A, writer, 'a0');
+      const since = asCursor(String(idA0));
+      const armed = place(f, () => {
+        for (let i = 0; i < FOREIGN_DEPTH; i++) f.addMessage(String(B), `b${i}`);
+      });
+
+      const blocked = await p.fetchRecent({ topic: A, since, limit: BLOCK_LIMIT, blockMs: BLOCK_MS });
+      armed.cancel();
+      const plain = await p.fetchRecent({ topic: A, since, limit: BLOCK_LIMIT });
+
+      expect(armed.fired(), 'no foreign traffic landed, so this row grades the seed cursor').toBe(
+        true,
+      );
+      expect(blocked.messages).toEqual([]);
+      expect(String(blocked.nextCursor)).toBe(String(plain.nextCursor));
+      expect(String(blocked.nextCursor)).not.toBe(String(idA0));
+      await p.disconnect();
+    }, 30_000);
+  }
 
   /**
    * The bound on forward pagination (MAX_FORWARD_PAGES * limit) is only survivable because each

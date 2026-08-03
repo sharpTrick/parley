@@ -307,10 +307,18 @@ describe('a malformed /sync body that never stops is reported and slowed, not ho
  * assertion, because both produce the same observable: a message that already existed when
  * `subscribe()` was called arriving on the live path.
  */
-const POSITIONING_FAULTS: Record<
-  string,
-  (body: Record<string, unknown>, roomId: string) => unknown
-> = {
+interface PositioningFault {
+  mangle: (body: Record<string, unknown>, roomId: string) => unknown;
+  /**
+   * Set where the shape is the homeserver's PROMISE that nothing precedes this position: a
+   * `timeline.limit: 1` filter answering with no event and not claiming it truncated. Paging back
+   * past the subscription is exactly what that promise buys, so those cells are graded from the
+   * other side — the recovery must actually reach back — rather than on the no-history invariant.
+   */
+  licensesRoomStart?: true;
+}
+
+const BODY_FAULTS: Record<string, PositioningFault['mangle']> = {
   'next_batch is absent': ({ next_batch: _token, ...rest }) => rest,
   'next_batch is null': (b) => ({ ...b, next_batch: null }),
   'next_batch is a number': (b) => ({ ...b, next_batch: 0 }),
@@ -320,10 +328,61 @@ const POSITIONING_FAULTS: Record<
   'the body is a scalar': () => 'ok',
   'the room is missing from rooms.join': (b) => ({ ...b, rooms: { join: {} } }),
   'the room carries no timeline': (b, roomId) => ({ ...b, rooms: { join: { [roomId]: {} } } }),
-  'timeline.events is not a list': (b, roomId) => ({
-    ...b,
-    rooms: { join: { [roomId]: { timeline: { events: 42, limited: false } } } },
+};
+
+/**
+ * The boundary read is a PREDICATE, so it owes a cell per input it can branch on rather than a row
+ * per field somebody thought of — a clause reading a field no row varies is born untested and stays
+ * that way. Generated as the product of the two fields it reads, sweeping `limited` against every
+ * `events` shape and not only the one it discriminates today, because which pair a clause separates
+ * is the predicate's business and not this table's.
+ */
+const EVENTS_SHAPES: Record<string, (tip: unknown[]) => Record<string, unknown>> = {
+  'events absent': () => ({}),
+  'events is not a list': () => ({ events: 42 }),
+  'events is empty': () => ({ events: [] }),
+  'events holds the tip the position was read at': (tip) => ({ events: tip }),
+  'events holds an event carrying no id': () => ({
+    events: [{ type: 'm.room.message', content: { body: 'x' } }],
   }),
+};
+
+const LIMITED_SHAPES: Record<string, Record<string, unknown>> = {
+  'limited true': { limited: true },
+  'limited false': { limited: false },
+  'limited absent': {},
+};
+
+const tipOf = (body: Record<string, unknown>, roomId: string): unknown[] => {
+  const join = (body.rooms as { join?: Record<string, { timeline?: { events?: unknown[] } }> }).join;
+  return join?.[roomId]?.timeline?.events ?? [];
+};
+
+const TIMELINE_FAULTS: Record<string, PositioningFault> = Object.fromEntries(
+  Object.entries(EVENTS_SHAPES).flatMap(([eventsName, shape]) =>
+    Object.entries(LIMITED_SHAPES).map(([limitedName, limited]): [string, PositioningFault] => [
+      `${eventsName} / ${limitedName}`,
+      {
+        mangle: (body, roomId) => ({
+          ...body,
+          rooms: { join: { [roomId]: { timeline: { ...shape(tipOf(body, roomId)), ...limited } } } },
+        }),
+        ...(eventsName === 'events is empty' && limitedName !== 'limited true'
+          ? { licensesRoomStart: true as const }
+          : {}),
+      },
+    ]),
+  ),
+);
+
+const POSITIONING_FAULTS: Record<string, PositioningFault> = {
+  ...Object.fromEntries(
+    Object.entries(BODY_FAULTS).map(([name, mangle]): [string, PositioningFault] => [
+      name,
+      { mangle },
+    ]),
+  ),
+  ...TIMELINE_FAULTS,
 };
 
 /** Messages already in the room when `subscribe()` is called — none may arrive as a live event. */
@@ -356,7 +415,8 @@ const sinceParamsSince = (from: number): (string | null)[] =>
     .map((u) => u.searchParams.get('since'));
 
 describe('a positioning /sync the plugin cannot resume from never replays the room as live events', () => {
-  for (const [faultName, mangle] of Object.entries(POSITIONING_FAULTS)) {
+  for (const [faultName, fault] of Object.entries(POSITIONING_FAULTS)) {
+    const { mangle, licensesRoomStart } = fault;
     it(`${faultName} / the subscribe loop: nothing that predates subscribe() is delivered`, async () => {
       vi.spyOn(console, 'error').mockImplementation(() => undefined);
       const escaped: unknown[] = [];
@@ -381,10 +441,19 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
       process.off('unhandledRejection', onEscape);
       await p.disconnect();
 
-      expect(
-        seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
-        'history that was already in the room arrived as a live <channel> event',
-      ).toEqual([]);
+      if (licensesRoomStart === true) {
+        // The other side of the same predicate: a shape that DOES establish a room-start boundary
+        // must be honoured, or a cell could pass by refusing every shape indiscriminately.
+        expect(
+          seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
+          'the position was promised to have no history behind it, so the recovery owes that history',
+        ).not.toEqual([]);
+      } else {
+        expect(
+          seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
+          'history that was already in the room arrived as a live <channel> event',
+        ).toEqual([]);
+      }
       expect(escaped.map(String)).toEqual([]);
       for (const since of sinceParamsSince(from)) {
         if (since !== null) expect(since).toMatch(MINTED_TOKEN);
@@ -393,6 +462,10 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
         expect(seen, 'subscribe() resolved, so what landed after it still owes delivery').toContain(
           POST_SUBSCRIPTION.at(-1),
         );
+        expect(
+          fake.limitedEmitted,
+          'the burst was never truncated, so no row here reached the recovery walk at all',
+        ).toBeGreaterThan(0);
       }
     }, 20_000);
 

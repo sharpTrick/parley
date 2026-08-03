@@ -240,7 +240,10 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
           if (this.isStale(generation)) break;
           consecutiveFailures++;
           reportSyncFailure(topic, consecutiveFailures, err);
-          await delay(syncRetryDelayMs(consecutiveFailures));
+          // Keep the ladder on the INTERRUPTIBLE sleep, so that a `disconnect()` landing in a
+          // backoff ends it at the abort: a plain timer of up to SYNC_RETRY_MAX_MS survives the
+          // teardown per subscribed topic and pins the event loop for the rest of its delay.
+          await this.interruptibleDelay(syncRetryDelayMs(consecutiveFailures));
           continue;
         }
         if (returnedTooFast(started, this.syncTimeoutMs)) await delay(SYNC_IDLE_PACE_MS);

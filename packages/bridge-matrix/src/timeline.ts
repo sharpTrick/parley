@@ -27,8 +27,8 @@ export const returnedTooFast = (startedAt: number, timeoutMs: number): boolean =
 
 /** Bound on forward catch-up pagination so an all-foreign timeline terminates instead of spinning. */
 const MAX_FORWARD_PAGES = 50;
-/** Bound on backward `limited`-burst recovery pagination so it always terminates. */
-const MAX_BACKFILL_PAGES = 50;
+/** Bound on backward `limited`-burst recovery and recent-window pagination so both terminate. */
+export const MAX_BACKFILL_PAGES = 50;
 /**
  * Server-side filter for the catch-up paths, so reactions, edits and membership churn cost no
  * client page budget. Keep it OFF the `backfill`/`positionBoundary` pair — those match a boundary
@@ -202,20 +202,20 @@ export abstract class MatrixTimeline extends MatrixSession {
       }
       from = end;
     }
-    // Keep a position claimable only when the walk stopped for a reason OF ITS OWN — it filled the
-    // window, or it ran out of timeline. One a teardown or the page bound cut short has not read the
-    // history it would be claiming to have walked past, whether it collected part of a window or
-    // none of it, and core persists whatever cursor it is handed; hand back nothing and leave the
-    // caller on its own position instead, so that history is re-read rather than skipped.
-    if (collected.length < limit && !exhaustedTheTimeline) {
-      return {
-        messages: [],
-        nextCursor: emptyWindowCursor(undefined, sinceCursor, this.isStale(generation)),
-      };
+    const stale = this.isStale(generation);
+    // Keep a position claimable only when the walk reached one of its OWN stopping conditions — it
+    // filled the window, it ran out of timeline, or it spent {@link MAX_BACKFILL_PAGES}. A TEARDOWN
+    // has read none of the history it would be claiming to have walked past, and core persists
+    // whatever cursor it is handed; hand back nothing and leave the caller on its own position
+    // instead, so that history is re-read rather than skipped. Keep the page bound OFF that list —
+    // every later call hits the same bound, so nothing a bound-cut walk withholds is ever re-read,
+    // while reporting no position mints `@parley-stream:` ("the first visible event in the room")
+    // for a since-less read and wedges a since-having one on a cursor already refused once.
+    if (collected.length < limit && !exhaustedTheTimeline && stale) {
+      return { messages: [], nextCursor: emptyWindowCursor(undefined, sinceCursor, true) };
     }
     const messages = collected.slice(0, limit).reverse().map((e) => eventToMessage(topic, e));
-    const nextCursor =
-      messages.at(-1)?.cursor ?? emptyWindowCursor(tailToken, sinceCursor, this.isStale(generation));
+    const nextCursor = messages.at(-1)?.cursor ?? emptyWindowCursor(tailToken, sinceCursor, stale);
     return { messages, nextCursor };
   }
 
