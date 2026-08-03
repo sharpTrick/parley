@@ -142,6 +142,7 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 13 | 15 / 15 | 84 | 82 | 33 | 2 | 0 | no |
 | 14 | *decomposition round — no review* | | | | | | — |
 | 15 | 15 / 15 | 111 | 109 | 35 | 2 | 0 | no |
+| 16 | 15 / 15 | 103 | 99 | 39 | 4 | 0 | no |
 
 Three rounds ran no critics. Rounds 11, 12 and 14 are **decomposition rounds** — the simplify-first
 rule described in `docs/REVIEW_PROTOCOL.md`, splitting single-file packages after `bridge-sqlite`
@@ -347,6 +348,7 @@ same agent that wrote the fixes being judged.
 | 10 | 75 | 56 | 19 | **75%** |
 | 13 | 84 | 69 | 14 | **83%** |
 | 15 | 111 | 86 | 20 | **81%** |
+| 16 | 103 | 76 | 27 | **74%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
@@ -364,20 +366,26 @@ matter in the original codebase, or only in its own output?*
 
 | round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | **6** | **6** |
+| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | **10** |
 
 Round 6's fall to 5 looked like the knee ouroboros reported. It was not: rounds 7–10 recovered to a
 stable 8–11 band, which is what the halfway reading recorded as *"no knee at the run level."*
 
-Rounds 13 and 15 are the first two consecutive rounds below that band — and they land on the **same
-value from very different total finding counts** (84 and 111), under two different instruments, on a
-substrate that had just been restructured. That is the strongest exhaustion signal this run has
-produced.
+**Rounds 13 and 15 sat at 6 twice and this document called that the strongest exhaustion signal in
+the dataset. Round 16 says it was not a signal at all.** Both 6s carried a stated caveat — rounds 11,
+12 and 14 relocated large amounts of code, `git blame` charges the mover, so both were floors — and
+the entry named what would settle it: a scored round against a tree nobody is restructuring. Round 16
+is that round, and it returns **10**, straight back into the band.
 
-It is also two points, and both are **floors**. Rounds 11, 12 and 14 relocated large amounts of code;
-`git blame` reports the last touch, so a line a split merely moved is charged to the experiment. The
-self-induced share is inflated by an unknown amount and the pre-existing counts can only be too low.
-What would settle it is round 16 onward, against a tree nobody is restructuring.
+The dip was the artifact. Rounds 7, 8, 9, 10 and 16 read **10, 9, 11, 8, 10** — a five-round plateau
+with no decay, across roughly 12M review tokens, spanning a decomposition of eleven packages and an
+instrument change. The loop has been finding pre-existing blocking defects at a flat rate for nine
+rounds.
+
+What would change *this* reading: three or more consecutive scored rounds below 8 against a stable
+tree. One round below the band is not enough — that is precisely the error this paragraph corrects.
 
 The trend is the result, and by round 4 it is unambiguous: **the share of findings the loop created
 for itself is rising** — 26% → 39% → **57%** — while the absolute count of pre-existing findings

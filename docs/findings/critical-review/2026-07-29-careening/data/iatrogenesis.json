@@ -121,6 +121,17 @@
    "unresolvable": 5,
    "selfInducedPct": 81,
    "note": "First round under staged review. Findings rose 84 -> 111 while pre-existing rose only 14 -> 20, i.e. the extra thoroughness mostly surfaced more of the experiment's own output."
+  },
+  {
+   "round": 16,
+   "base": "a540855",
+   "findings": 103,
+   "graded": 103,
+   "selfInduced": 76,
+   "preExisting": 27,
+   "unresolvable": 0,
+   "selfInducedPct": 74,
+   "note": "The first scored round against a tree nobody restructured, and the test named in round 15's entry. Pre-existing findings 20 -> 27 and pre-existing BLOCKING 6 -> 10, back into the rounds 7-10 band."
   }
  ],
  "comparison": {
@@ -210,9 +221,17 @@
     "selfInduced": 28,
     "preExisting": 6,
     "selfInducedPct": 82
+   },
+   {
+    "round": 16,
+    "blocking": 39,
+    "selfInduced": 29,
+    "preExisting": 10,
+    "selfInducedPct": 74
    }
   ],
-  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6 and 6. The recovery from round 6's 5 to the 8-11 band of rounds 7-10 was real and is what defeated a run-level knee at the halfway mark. Rounds 13 and 15 are the first two consecutive rounds below that band, and they sit at the same value from very different total finding counts (84 and 111) and under two different instruments. That is the strongest exhaustion signal in the dataset so far, and it is still only two points -- and two points whose blame is inflated by the decomposition, meaning the true pre-existing share is at least 6 and possibly higher."
+  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, and 10. The round 13/15 dip to 6 was read at the time as the strongest exhaustion signal in the dataset, with the caveat that both numbers were floors inflated by decomposition-relocation blame. Round 16 -- the first scored round against a tree nobody restructured, named in that entry as what would settle it -- returns 10. The dip was the artifact, not a knee. Rounds 7, 8, 9, 10 and 16 now read 10, 9, 11, 8, 10: a five-round plateau with no decay across roughly 12M review tokens, spanning a decomposition of eleven packages and an instrument change.",
+  "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects."
  },
  "inertRemediations": {
   "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
@@ -294,7 +313,7 @@
   "whatDidNot": "Ouroboros's two-regime split with a knee after which the loop reviews only its own output. Careening shows no knee at the run level. Pre-existing blocking findings fell 36 -> 5 through round 6 and then RECOVERED to a stable 8-11 band for four rounds.",
   "whyPlausibly": "The per-package partition means a target that runs dry is one of fourteen, not one of four; and a deep surface (eleven network backends, OAuth, concurrency) keeps offering new ground. Saturation, where it appears, is package-local: core-auth needed 27 mutations in round 8 to establish it had no vacuous tests and 52 in round 9 to surface two survivors.",
   "theInstrumentResult": "Round 9 measured a sharp asymmetry: critics are reliable at FINDING (68/71 confirmed) and unreliable at PRESCRIBING - five remediations that round would have introduced or blessed a defect if implemented as written. Separating review from remediation, each with its own verification, is what caught them.",
-  "supersededBy": "See blockingOnly.reading \u2014 rounds 13 and 15 are the first evidence for the knee this section reported as absent at round 10."
+  "supersededBy": "Round 16 restores this section rather than superseding it: the run-level knee it reported as absent at round 10 is still absent at round 16."
  },
  "oracle": "scripts/iatrogenesis.mjs \u2014 committed at round 16. It reproduces the rounds 2-10 numbers below exactly, which were computed ad hoc before it existed; that reproduction is the only reason they and the new rows can sit in one table."
 }

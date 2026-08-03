@@ -1,0 +1,111 @@
+{
+ "round": 16,
+ "converged": false,
+ "blockingClean": false,
+ "wakeAll": true,
+ "counts": {
+  "confirmed": 99,
+  "blocking": 39,
+  "plausible": 4,
+  "total": 103
+ },
+ "ranTargets": [
+  "core-seam",
+  "core-engine",
+  "core-auth",
+  "sqlite",
+  "redis",
+  "postgres",
+  "matrix",
+  "xmpp",
+  "nats",
+  "zulip",
+  "discord",
+  "slack",
+  "telegram",
+  "shared",
+  "repo"
+ ],
+ "quiescedTargets": [],
+ "nextQuiesced": [],
+ "byLens": {
+  "truth-in-docs": {
+   "total": 11,
+   "confirmed": 9,
+   "blocking": 1
+  },
+  "test-integrity": {
+   "total": 27,
+   "confirmed": 27,
+   "blocking": 15
+  },
+  "operability-and-release": {
+   "total": 9,
+   "confirmed": 9,
+   "blocking": 2
+  },
+  "security": {
+   "total": 7,
+   "confirmed": 7,
+   "blocking": 5
+  },
+  "test-hygiene": {
+   "total": 9,
+   "confirmed": 9,
+   "blocking": 1
+  },
+  "design-principles": {
+   "total": 13,
+   "confirmed": 11,
+   "blocking": 3
+  },
+  "maintainability": {
+   "total": 6,
+   "confirmed": 6,
+   "blocking": 0
+  },
+  "protocol-conformance": {
+   "total": 2,
+   "confirmed": 2,
+   "blocking": 0
+  },
+  "concurrency-and-failure": {
+   "total": 8,
+   "confirmed": 8,
+   "blocking": 5
+  },
+  "correctness": {
+   "total": 9,
+   "confirmed": 9,
+   "blocking": 6
+  },
+  "seam-integrity": {
+   "total": 2,
+   "confirmed": 2,
+   "blocking": 1
+  }
+ },
+ "base": "a540855",
+ "byTarget": {
+  "core-seam": 7,
+  "core-engine": 8,
+  "core-auth": 8,
+  "sqlite": 6,
+  "redis": 4,
+  "postgres": 8,
+  "matrix": 8,
+  "xmpp": 6,
+  "nats": 9,
+  "zulip": 3,
+  "discord": 7,
+  "slack": 8,
+  "telegram": 5,
+  "shared": 6,
+  "repo": 10
+ },
+ "errored": [],
+ "tokens": 3129481,
+ "toolCalls": 903,
+ "wallMs": 13948422,
+ "instrument": "second round under staged review; remediation-diff-guard added for the remediation phase (not yet exercised at review time)"
+}
