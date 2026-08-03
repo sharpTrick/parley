@@ -23,21 +23,35 @@ export interface RemoteAuthOptions {
 
 export type RemoteAuthServer = OAuthRemoteServer | OidcRemoteServer;
 
+export type OptionScope = 'builtin' | 'oidc' | 'shared';
+
 /**
  * Which mode each option reaches. An option the selected mode never forwards is a silent no-op, and
  * `trustProxy` is the one standing between an anonymous flood and the owner's only way in — so a
  * caller who sets it in the wrong mode has to hear about it at boot, not from a rate limiter that
  * was never keyed the way they asked.
+ *
+ * Keep the `Record<keyof RemoteAuthOptions, …>` annotation, so that an option added to the interface
+ * cannot ship unclassified: the compiler demands a scope for it here, which is what lets the suite
+ * grade this table INSTEAD of the interface — the two can no longer disagree.
  */
-const MODE_ONLY_OPTIONS: Array<[keyof RemoteAuthOptions, 'builtin' | 'oidc']> = [
-  ['verifyOwner', 'builtin'],
-  ['scopesSupported', 'builtin'],
-  ['trustProxy', 'builtin'],
-  ['fetchFn', 'oidc'],
-];
+export const OPTION_SCOPES: Record<keyof RemoteAuthOptions, OptionScope> = {
+  publicUrl: 'shared',
+  mcpPath: 'shared',
+  now: 'shared',
+  verifyOwner: 'builtin',
+  scopesSupported: 'builtin',
+  trustProxy: 'builtin',
+  fetchFn: 'oidc',
+};
+
+const scopedOptions = (): Array<[keyof RemoteAuthOptions, OptionScope]> =>
+  Object.entries(OPTION_SCOPES) as Array<[keyof RemoteAuthOptions, OptionScope]>;
 
 function assertOptionsMatchMode(mode: 'builtin' | 'oidc', opts: RemoteAuthOptions): void {
-  const stray = MODE_ONLY_OPTIONS.filter(([key, only]) => only !== mode && opts[key] !== undefined);
+  const stray = scopedOptions().filter(
+    ([key, only]) => only !== 'shared' && only !== mode && opts[key] !== undefined,
+  );
   if (stray.length === 0) return;
   throw new Error(
     `auth.mode "${mode}" does not use ${stray.map(([key]) => key).join(', ')} — ` +

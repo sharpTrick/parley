@@ -20,10 +20,11 @@ export interface ClientState {
  * approved yet. Only owner-approved state is unevictable, and `undefined` means every registration
  * holds some.
  *
- * Keep the second pass reading from the NEWEST end, so that a flood leaving every registration
- * holding anonymous-tier state cannot take the owner's: a pending consent is `ownerApproved: false`
- * by design, so a first-match scan returns the owner's registration — necessarily the oldest — and
- * deleting it invalidates the consent page they are looking at while they type the passphrase.
+ * No ordering here can spare the registration the owner is mid-consent on — before the passphrase
+ * arrives their connector is one more anonymous registration, and a flood can be arranged to put it
+ * at either end. That is why the approval path re-admits it (ParleyOAuthProvider.rememberClient)
+ * rather than this scan trying to protect it. Reading from the NEWEST end costs nothing there and
+ * makes a flood churn the slots it has just taken instead of the long-lived registrations below it.
  */
 export function evictionCandidate(
   clientIds: Iterable<string>,

@@ -217,6 +217,7 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
       throw new ConsentError('incorrect owner passphrase');
     }
 
+    this.rememberClient(pend.client);
     const code = randomUUID();
     this.codes.set(code, {
       clientId: pend.client.client_id,
@@ -336,6 +337,27 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
     const rec = this.access.get(request.token) ?? this.refresh.get(request.token);
     if (rec === undefined || rec.clientId !== client.client_id) return;
     this.revokeGrant(rec.grantId);
+  }
+
+  /**
+   * Re-admit the registration a consent was rendered against. Keep this on the approval path, so
+   * that a registration evicted while the owner was reading the consent page cannot turn the
+   * passphrase they just spent into a code /token answers `invalid_client` to: no eviction order can
+   * spare that registration, because before the passphrase arrives the owner's connector is
+   * indistinguishable from the flood that evicts it.
+   *
+   * Keep the fall back to the oldest entry, so that a map full of owner-approved registrations
+   * cannot make a FRESH owner approval the one that fails.
+   */
+  private rememberClient(client: OAuthClientInformationFull): void {
+    if (this.clients.has(client.client_id)) return;
+    if (this.clients.size >= MAX_CLIENTS) {
+      const evictable =
+        evictionCandidate(this.clients.keys(), this.clientStates(), this.now()) ??
+        this.clients.keys().next().value;
+      if (evictable !== undefined) this.clients.delete(evictable);
+    }
+    this.clients.set(client.client_id, client);
   }
 
   private forgetCode(code: string): void {

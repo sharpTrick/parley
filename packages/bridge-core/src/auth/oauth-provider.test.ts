@@ -1390,8 +1390,14 @@ describe('the auth layer escapes at every interpolation of every page it renders
  * moves the lockout one level down: the flood displaces the state the owner is mid-way through
  * creating, and the passphrase they are about to spend buys nothing. Grade every capped store the
  * provider keeps — rows derived from eviction.ts's own cap constants, so a third cap arrives as a
- * missing row — crossed with whether the owner got there before or after the flood, and assert the
- * owner's entry is not merely present afterwards but still USABLE.
+ * missing row — crossed with when the flood runs relative to the owner's whole consent TRANSACTION,
+ * and assert the owner's entry is not merely present afterwards but still USABLE.
+ *
+ * `during` is the arrival no ordering can win: the flood keeps arriving while the owner types, and
+ * until the passphrase lands their connector is one more anonymous registration, placeable at either
+ * end of any scan. What must hold there is the guarantee that outlives the ordering — the owner is
+ * never left having SPENT the passphrase for nothing. Either the whole flow completes, or it is
+ * refused honestly with no code minted.
  */
 describe('an anonymous flood never displaces state the owner is mid-way through creating', () => {
   interface CappedStore {
@@ -1405,15 +1411,17 @@ describe('an anonymous flood never displaces state the owner is mid-way through 
      * false` by design (an anonymous caller can create it), so it is the only window in which the
      * owner's own entries are evictable, and it is the window the passphrase is spent in.
      */
-    seedOwner: (p: ParleyOAuthProvider) => Promise<() => Promise<void>>;
+    seedOwner: (p: ParleyOAuthProvider) => Promise<OwnerCheck>;
     /**
      * What one anonymous entry costs the flooder, per SHAPE. Shape is an axis because the lockout is
      * a property of it: the per-client tier fires only when some client is crowdedest, so a flood
      * spending a fresh client_id per entry collapses the tier and leaves the tie break deciding —
-     * and a tie break pointing at the first-iterated entry points at the owner's, which is always
-     * the oldest. For `clients` the axis is instead whether the flood's registrations HOLD state:
-     * a stateless one is taken by the first eviction pass and can never reach the second, which is
-     * the pass that could take the owner's.
+     * and a tie break pointing at either end of the scan points at the owner's for one of the
+     * arrivals below. For `clients` the axis is instead whether the flood's registrations HOLD
+     * state: a stateless one is taken by the first eviction pass and can never reach the second,
+     * which is the pass that could take the owner's. The two halves of a `during` flood take their
+     * shapes independently, so that a shape which destroys the owner's consent cannot MASK the loss
+     * of the registration behind it.
      */
     shapes: Record<string, (p: ParleyOAuthProvider, i: number) => Promise<void>>;
   }
@@ -1424,21 +1432,33 @@ describe('an anonymous flood never displaces state the owner is mid-way through 
     return register;
   };
 
+  /**
+   * Spend the passphrase and grade the outcome. `mustSurvive` says the flood had no window
+   * overlapping the owner's transaction, so nothing may have been lost at all.
+   */
+  type OwnerCheck = (mustSurvive: boolean) => Promise<void>;
+
   /** Register `handle` and leave it at the consent page; the check finishes the flow. */
-  async function seedMidConsent(
-    p: ParleyOAuthProvider,
-    handle: string,
-  ): Promise<() => Promise<void>> {
+  async function seedMidConsent(p: ParleyOAuthProvider, handle: string): Promise<OwnerCheck> {
     const owner = makeClient(handle);
     registerOn(p)(owner);
     await p.authorize(owner, makeParams(), fakeRes());
     const consentId = [...peek(p).pending.keys()].at(-1)!;
-    return async () => {
-      expect(p.clientsStore.getClient(handle), 'the owner registration was evicted').toBeDefined();
-      expect(peek(p).pending.has(consentId), 'the owner consent was shed').toBe(true);
+    return async (mustSurvive) => {
+      if (!peek(p).pending.has(consentId)) {
+        expect(mustSurvive, 'the owner consent was shed').toBe(false);
+        // Nothing minted, nothing to redeem: the owner is told to start over, which is the only
+        // outcome other than success that does not cost them the passphrase for a dead grant.
+        await expect(p.completeConsent(consentId, GOOD_PASS)).rejects.toThrow(ConsentError);
+        return;
+      }
       const { redirectUrl } = await p.completeConsent(consentId, GOOD_PASS);
       const code = new URL(redirectUrl).searchParams.get('code');
       expect(code).toBeTruthy();
+      expect(
+        p.clientsStore.getClient(handle),
+        'the passphrase bought a code no registration backs',
+      ).toBeDefined();
       await expect(p.exchangeAuthorizationCode(owner, code!, undefined, REDIRECT)).resolves.toBeTruthy();
     };
   }
@@ -1489,29 +1509,81 @@ describe('an anonymous flood never displaces state the owner is mid-way through 
     for (const s of CAPPED_STORES) expect(Object.keys(s.shapes).length, s.store).toBeGreaterThan(1);
   });
 
-  const ARRIVALS = ['before', 'after'] as const;
+  type Flood = (p: ParleyOAuthProvider, i: number) => Promise<void>;
+  /** Extra arrivals after the owner is mid-consent; 1 catches a cap that binds only at the boundary. */
+  const EXTRA = [1, 5];
 
   const CELLS = CAPPED_STORES.flatMap((s) =>
-    ARRIVALS.flatMap((arrival) =>
-      Object.entries(s.shapes).map(
-        ([shape, flood]) =>
-          [`${s.store}, owner arrives ${arrival} a flood of ${shape}`, s, arrival, flood] as const,
+    Object.entries(s.shapes).flatMap(([shape, flood]) => [
+      ...(['before', 'after'] as const).map(
+        (arrival) =>
+          [
+            `${s.store}, owner arrives ${arrival} a flood of ${shape}`,
+            s,
+            arrival,
+            flood,
+            undefined as Flood | undefined,
+            0,
+          ] as const,
       ),
-    ),
+      ...Object.entries(s.shapes).flatMap(([more, keepFlooding]) =>
+        EXTRA.map(
+          (k) =>
+            [
+              `${s.store}, owner mid-consent between a flood of ${shape} and ${k} more of ${more}`,
+              s,
+              'during' as const,
+              flood,
+              keepFlooding as Flood | undefined,
+              k,
+            ] as const,
+        ),
+      ),
+    ]),
   );
 
-  it.each(CELLS)('%s', async (_label, capped, arrival, flood) => {
+  it.each(CELLS)('%s', async (_label, capped, arrival, flood, keepFlooding, extra) => {
     const p = makeProvider(() => 4_000_000);
-    const runFlood = async (): Promise<void> => {
-      for (let i = 0; i < capped.size; i++) await flood(p, i);
+    const runFlood = async (shape: Flood, from: number, n: number): Promise<void> => {
+      for (let i = from; i < from + n; i++) await shape(p, i);
     };
 
-    if (arrival === 'after') await runFlood();
+    if (arrival !== 'before') await runFlood(flood, 0, capped.size);
     const ownerStillWorks = await capped.seedOwner(p);
-    if (arrival === 'before') await runFlood();
+    if (arrival === 'before') await runFlood(flood, 0, capped.size);
+    if (keepFlooding !== undefined) await runFlood(keepFlooding, capped.size, extra);
 
     // The cap must still bind — an owner surviving because nothing was shed proves nothing.
     expect(peek(p)[capped.store].size).toBe(capped.size);
-    await ownerStillWorks();
+    await ownerStillWorks(arrival !== 'during');
+  });
+
+  /**
+   * Re-admitting the registration a consent was rendered against is what makes the eviction order
+   * above harmless, and it is reachable by anyone who can open a consent page. It must cost the
+   * owner's secret: a caller who could re-admit without it would hold a registration slot against
+   * the cap indefinitely, one failed guess at a time.
+   */
+  it('a refused passphrase does not re-admit the evicted registration behind the consent', async () => {
+    const p = makeProvider(() => 4_000_000);
+    for (let i = 0; i < eviction.MAX_CLIENTS; i++) {
+      const spam = makeClient(`spam-${i}`);
+      registerOn(p)(spam);
+      await p.authorize(spam, makeParams(), fakeRes());
+    }
+    const victim = makeClient('victim');
+    registerOn(p)(victim);
+    await p.authorize(victim, makeParams(), fakeRes());
+    const consentId = [...peek(p).pending.keys()].at(-1)!;
+    registerOn(p)(makeClient('spam-evictor'));
+    expect(p.clientsStore.getClient('victim'), 'the setup never evicted it').toBeUndefined();
+
+    await expect(p.completeConsent(consentId, `not ${GOOD_PASS}`)).rejects.toThrow(ConsentError);
+
+    expect(
+      p.clientsStore.getClient('victim'),
+      'a wrong guess re-admitted the registration',
+    ).toBeUndefined();
+    expect(peek(p).clients.size).toBe(eviction.MAX_CLIENTS);
   });
 });

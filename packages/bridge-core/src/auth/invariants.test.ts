@@ -1,7 +1,5 @@
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
-import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { OidcAuthSchema } from '../config-auth.js';
 import { parseConfig, type ParleyConfig } from '../config.js';
@@ -11,7 +9,12 @@ import { createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/route
 import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import { assertPublicBaseUrl, assertTrustProxy, LOOPBACK_HOSTS } from './invariants.js';
 import { createOidcRemoteApp } from './oidc-remote.js';
-import { createRemoteAuthApp, type RemoteAuthServer } from './remote-auth.js';
+import {
+  createRemoteAuthApp,
+  OPTION_SCOPES,
+  type RemoteAuthOptions,
+  type RemoteAuthServer,
+} from './remote-auth.js';
 import { createOAuthRemoteApp } from './remote.js';
 
 function freePort(): Promise<number> {
@@ -294,7 +297,11 @@ describe('a factory check that mirrors a schema rule must mirror all of it', () 
  */
 interface Recorder {
   called: string[];
+  /** Backing store for an injected clock, so an observation can move it under a running server. */
+  clockMs: number;
 }
+
+const newRecorder = (): Recorder => ({ called: [], clockMs: Date.now() + 60 * 60_000 });
 
 interface ModeOption {
   key: string;
@@ -473,21 +480,91 @@ const MODE_OPTIONS: ModeOption[] = [
 ];
 
 /**
- * The row set is checked against the selector's own table rather than eyeballed, so a mode-scoped
- * option added tomorrow arrives with no observation and fails the day it lands.
+ * Every option the selector accepts, in BOTH modes — not just the mode-only ones. `shared` is the
+ * classification with nothing behind it otherwise: an option forwarded by one branch and dropped by
+ * the other is a silent no-op that neither the refusal above nor a mode-only row would ever see.
  */
-function modeOnlyOptionsFromSource(): string[] {
-  const src = readFileSync(fileURLToPath(new URL('./remote-auth.ts', import.meta.url)), 'utf8');
-  const table = /const MODE_ONLY_OPTIONS[^=]*=\s*\[([\s\S]*?)\n\];/.exec(src)?.[1];
-  if (table === undefined) throw new Error('MODE_ONLY_OPTIONS not found in remote-auth.ts');
-  return [...table.matchAll(/\['(\w+)',\s*'(\w+)'\]/g)].map((m) => `${m[1]}:${m[2]}`);
+interface SharedOption {
+  key: keyof RemoteAuthOptions;
+  value: (recorder: Recorder, origin: string) => unknown;
+  /** Run against a server of EACH mode, built with the option set. */
+  observe: (server: RemoteAuthServer, recorder: Recorder, mode: 'builtin' | 'oidc') => Promise<void>;
 }
+
+const MCP_PATH = '/bridge';
+
+const SHARED_OPTIONS: SharedOption[] = [
+  {
+    key: 'publicUrl',
+    value: (_recorder, origin) => new URL(origin),
+    observe: async (server) => {
+      const origin = await listening(server);
+      const prm = (await (
+        await fetch(`${origin}/.well-known/oauth-protected-resource${server.resource.pathname}`)
+      ).json()) as { resource: string };
+      expect(prm.resource).toBe(server.resource.href);
+      expect(new URL(prm.resource).origin).toBe(origin);
+    },
+  },
+  {
+    key: 'mcpPath',
+    value: () => MCP_PATH,
+    observe: async (server) => {
+      expect(server.resource.pathname).toBe(MCP_PATH);
+      const origin = await listening(server);
+      const post = (path: string): Promise<Response> =>
+        fetch(`${origin}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+        });
+      // The endpoint moved: the default path is gone, and the requested one answers the bearer gate.
+      expect((await post(MCP_PATH)).status).toBe(401);
+      expect((await post('/mcp')).status).toBe(404);
+    },
+  },
+  {
+    key: 'now',
+    value: (recorder) => () => recorder.clockMs,
+    observe: async (server, recorder, mode) => {
+      const origin = await listening(server);
+      if (mode === 'builtin') {
+        const clientId = await registerClient(origin);
+        const inTime = await submitConsent(origin, await consentIdFrom(origin, clientId), OWNER_PASS);
+        expect(inTime.status, 'the clock alone must decide the next assertion').toBe(302);
+        const consentId = await consentIdFrom(origin, clientId);
+        recorder.clockMs += 6 * 60_000; // > CONSENT_TTL_MS
+        const late = await submitConsent(origin, consentId, OWNER_PASS);
+        expect(late.status).toBe(403);
+        return;
+      }
+      const call = (token: string): Promise<Response> =>
+        fetch(`${origin}${server.resource.pathname}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+        });
+      const aud = server.resource.href;
+      // The injected clock is an hour ahead of the IdP's, so only a token minted to outlive that
+      // gap is live at it — a token valid by the wall clock is not.
+      expect((await call(await idp.mint({ aud, sub: 'owner-sub' }))).status).toBe(401);
+      expect(
+        (await call(await idp.mint({ aud, sub: 'owner-sub', expiresInS: 2 * 60 * 60 }))).status,
+      ).toBe(200);
+    },
+  },
+];
 
 async function buildInMode(
   mode: 'builtin' | 'oidc',
-  extra: Record<string, unknown>,
+  makeExtra: (origin: string) => Record<string, unknown>,
 ): Promise<RemoteAuthServer> {
   const origin = `http://127.0.0.1:${await freePort()}`;
+  const extra = makeExtra(origin);
   const cfg =
     mode === 'oidc'
       ? parseConfig({
@@ -504,22 +581,57 @@ async function buildInMode(
 }
 
 describe('the front-door selector never silently discards an option belonging to the other mode', () => {
-  it('covers every mode-scoped option the selector names, and no other', () => {
-    const declared = modeOnlyOptionsFromSource();
-    expect(declared.length).toBeGreaterThan(0);
-    expect(MODE_OPTIONS.map((o) => `${o.key}:${o.mode}`).sort()).toEqual([...declared].sort());
+  /**
+   * The subject list is `OPTION_SCOPES`, imported — and the compiler will not let that table hold a
+   * key `RemoteAuthOptions` lacks, or lack one it holds. Deriving it from the selector's SOURCE is
+   * what left `RemoteAuthOptions` graded by nothing: an option added to the interface and forwarded
+   * by one branch was invisible to a regex reading the table it was never added to.
+   */
+  it('covers every option the interface declares, in the scope the selector gives it', () => {
+    const scoped = Object.entries(OPTION_SCOPES);
+    expect(scoped.length).toBeGreaterThan(0);
+    const covered = [
+      ...MODE_OPTIONS.map((o) => [o.key, o.mode] as const),
+      ...SHARED_OPTIONS.map((o) => [o.key, 'shared'] as const),
+    ];
+    expect(covered.map(([k, s]) => `${k}:${s}`).sort()).toEqual(
+      scoped.map(([k, s]) => `${k}:${s}`).sort(),
+    );
   });
 
   it.each(MODE_OPTIONS.map((o): [string, ModeOption] => [`${o.key} (${o.mode} only)`, o]))(
     '%s is refused by name in the other mode',
     async (_name: string, option: ModeOption) => {
       const other = option.mode === 'builtin' ? 'oidc' : 'builtin';
-      const recorder: Recorder = { called: [] };
+      const recorder = newRecorder();
       await expect(
-        buildInMode(other, { [option.key]: option.value(recorder) }),
+        buildInMode(other, () => ({ [option.key]: option.value(recorder) })),
       ).rejects.toThrow(new RegExp(option.key));
     },
   );
+
+  const SHARED_OBSERVATIONS = SHARED_OPTIONS.flatMap((o) =>
+    (['builtin', 'oidc'] as const).map(
+      (mode): [string, SharedOption, 'builtin' | 'oidc'] => [
+        `${o.key} (shared) reaches ${mode} mode`,
+        o,
+        mode,
+      ],
+    ),
+  );
+
+  it.each(SHARED_OBSERVATIONS)(
+    '%s',
+    async (_name: string, option: SharedOption, mode: 'builtin' | 'oidc') => {
+      const recorder = newRecorder();
+      const server = await buildInMode(mode, (origin) => ({
+        [option.key]: option.value(recorder, origin),
+      }));
+      opened.push(server);
+      await option.observe(server, recorder, mode);
+    },
+  );
+
 
   const SIDES: Array<[string, (o: ModeOption) => ModeOption['observeDeclared']]> = [
     ['what the server declares', (o) => o.observeDeclared],
@@ -541,8 +653,10 @@ describe('the front-door selector never silently discards an option belonging to
       option: ModeOption,
       side: (o: ModeOption) => ModeOption['observeDeclared'],
     ) => {
-      const recorder: Recorder = { called: [] };
-      const server = await buildInMode(option.mode, { [option.key]: option.value(recorder) });
+      const recorder = newRecorder();
+      const server = await buildInMode(option.mode, () => ({
+        [option.key]: option.value(recorder),
+      }));
       opened.push(server);
       await side(option)(server, recorder);
     },
@@ -550,7 +664,7 @@ describe('the front-door selector never silently discards an option belonging to
 
   it('names every option it refuses, not just the first', async () => {
     const build = (): Promise<RemoteAuthServer> =>
-      buildInMode('oidc', { trustProxy: 'loopback', scopesSupported: ['mcp'] });
+      buildInMode('oidc', () => ({ trustProxy: 'loopback', scopesSupported: ['mcp'] }));
     await expect(build()).rejects.toThrow(/trustProxy/);
     await expect(build()).rejects.toThrow(/scopesSupported/);
   });
