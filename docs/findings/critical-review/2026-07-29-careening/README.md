@@ -133,6 +133,29 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 4 | 14 / 14 | 120 | 113 | 45 | 7 | 0 | no |
 | 5 | 14 / 14 | 129 | 117 | 39 | 12 | 0 | no |
 | 6 | 14 / 14 | 90 | 86 | 26 | 4 | 0 | no |
+| 7 | 14 / 14 | 79 | 75 | 23 | 4 | 0 | no |
+| 8 | 14 / 14 | 73 | 71 | 25 | 2 | 0 | no |
+| 9 | 14 / 14 | 71 | 68 | 28 | 3 | 0 | no |
+| 10 | 14 / 14 | 75 | 72 | 29 | 3 | 0 | no |
+| 11 | *decomposition round — no review* | | | | | | — |
+| 12 | *decomposition round — no review* | | | | | | — |
+| 13 | 15 / 15 | 84 | 82 | 33 | 2 | 0 | no |
+| 14 | *decomposition round — no review* | | | | | | — |
+| 15 | 15 / 15 | 111 | 109 | 35 | 2 | 0 | no |
+
+Three rounds ran no critics. Rounds 11, 12 and 14 are **decomposition rounds** — the simplify-first
+rule described in `docs/REVIEW_PROTOCOL.md`, splitting single-file packages after `bridge-sqlite`
+(the one already-decomposed package) recorded 4 blocking findings across rounds 6–10 against a mean
+of 9.6 for the monoliths. They change the substrate rather than measuring it, so they carry no
+findings row and they break the round-to-round comparison on either side of themselves.
+
+**Round 13 and round 15 are not comparable to each other, or to round 10, in the direction one would
+want.** Round 13 followed two decomposition rounds; round 15 was the first round under the staged
+review (a critic loops back when it can *name* a gap in its own coverage). Blocking went 29 → 33 →
+35 while total findings went 75 → 84 → 111. A rising count is exactly what a more thorough search
+looks like and exactly what a worsening codebase looks like, and a single round cannot separate them.
+The instrument changed under both; that ambiguity is recorded in each round's summary rather than
+resolved by picking the flattering reading.
 
 **Round 5 is degraded and its numbers should carry an asterisk.** The docker daemon died during the
 round, so the six service-backed targets (redis, postgres, matrix, xmpp, nats, core-auth) reviewed
@@ -252,8 +275,43 @@ same agent that wrote the fixes being judged.
 | 4 | 120 | 68 | 52 | **57%** |
 | 5 | 129 | 77 | 51 | **60%** |
 | 6 | 90 | 72 | 18 | **80%** |
+| 7 | 79 | 52 | 27 | **66%** |
+| 8 | 73 | 40 | 32 | **56%** |
+| 9 | 71 | 45 | 26 | **63%** |
+| 10 | 75 | 56 | 19 | **75%** |
+| 13 | 84 | 69 | 14 | **83%** |
+| 15 | 111 | 86 | 20 | **81%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
+
+The oracle is `scripts/iatrogenesis.mjs`, committed at round 16. It had been an ad-hoc computation
+until then — an unreproducible instrument measuring reproducibility — and it was committed only
+after it reproduced rounds 2–10 exactly, including the blocking-only split below. Findings whose
+`file:line` does not exist at the base commit are reported as unresolvable rather than guessed: one
+in round 13, five in round 15.
+
+### The number that actually moved: pre-existing **blocking** findings
+
+Total iatrogenesis mixes suggestions with the findings that gate the stop rule. Restricting the same
+oracle to CONFIRMED-and-blocking asks the sharper question — *is the loop still finding things that
+matter in the original codebase, or only in its own output?*
+
+| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | **6** | **6** |
+
+Round 6's fall to 5 looked like the knee ouroboros reported. It was not: rounds 7–10 recovered to a
+stable 8–11 band, which is what the halfway reading recorded as *"no knee at the run level."*
+
+Rounds 13 and 15 are the first two consecutive rounds below that band — and they land on the **same
+value from very different total finding counts** (84 and 111), under two different instruments, on a
+substrate that had just been restructured. That is the strongest exhaustion signal this run has
+produced.
+
+It is also two points, and both are **floors**. Rounds 11, 12 and 14 relocated large amounts of code;
+`git blame` reports the last touch, so a line a split merely moved is charged to the experiment. The
+self-induced share is inflated by an unknown amount and the pre-existing counts can only be too low.
+What would settle it is round 16 onward, against a tree nobody is restructuring.
 
 The trend is the result, and by round 4 it is unambiguous: **the share of findings the loop created
 for itself is rising** — 26% → 39% → **57%** — while the absolute count of pre-existing findings
