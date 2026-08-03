@@ -288,6 +288,25 @@ watching the frozen conformance suite stay green through all six — including a
 already bitten a shipped backend. Ask of any test you rely on: *what mutation would keep this
 green?*
 
+## The remediation diff guard (added at round 16)
+
+Three mechanical checks stand between a remediation and the commit: the suite, the typecheck, and
+`scripts/verify-mutations.sh` replaying the fixer's own claimed mutations. All three grade
+*behaviour*, and there is a class of regression none of them can see: a fix that is behaviourally
+right and structurally worse. Round 12's postgres agent made fifteen private fields public in order
+to test them — green suite, clean typecheck, mutations red on cue, and the encapsulation gone.
+
+`.claude/agents/remediation-diff-guard.md` reads one remediation diff for exactly three things:
+**surface widening, weakened assertions, scope creep**. It is deliberately not a reviewer. It does
+not read the package for defects, does not propose a better fix, does not run tests, and does not
+propose a ratchet — the next round does all of that over the whole surface with every lens, and
+paying for it twice buys nothing. Its expected result is silence; it reports a `hunksRead` count so
+a silent result is distinguishable from an unread diff.
+
+It is wired in at round 16 **so that its yield can be measured against what the replay and the next
+round find anyway**. If it catches nothing across several rounds that those two do not, it is
+overhead and comes back out.
+
 ## Anti-patterns — proven failure modes, do NOT do these
 
 - ❌ **Diff-scoping a follow-up round** to "only what changed since last round." A narrow round
