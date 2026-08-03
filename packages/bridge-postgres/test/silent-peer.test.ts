@@ -242,11 +242,22 @@ if (await isUp(PG_URL)) {
       const table = `parley_quiet_${rand()}`;
       const topic = asTopic(`quiet-${rand()}`);
       try {
+        // Keep `pool_size: 1`, so that the refused write cannot escape onto a FRESH connection:
+        // with room to dial, the connect ceiling ends it instead and this row silently stops
+        // grading the statement ceiling that is its whole subject.
         await plugin.connect({ url: proxy.url, table_name: table, pool_size: 1 });
         await plugin.post(topic, asHandle('u'), 'before the peer went quiet');
 
         proxy.blackhole();
-        await plugin.post(topic, asHandle('u'), 'lost').catch(() => undefined);
+        // Bounded like every other wait in this file, so that a write which never comes back at
+        // all fails HERE, naming what did not return, instead of running the row out of its
+        // vitest timeout — a timeout is indistinguishable from a loaded machine, so it attributes
+        // nothing and costs a re-run to tell the two apart.
+        const refused = await settleWithin(
+          plugin.post(topic, asHandle('u'), 'lost').catch(() => undefined),
+          SETTLE_CEILING_MS,
+        );
+        expect(refused, 'the write on the quiet peer never came back at all').not.toBe('hung');
         proxy.heal();
 
         const after = await settleWithin(
@@ -254,8 +265,13 @@ if (await isUp(PG_URL)) {
           SETTLE_CEILING_MS,
         );
         expect(after, 'the next write inherited the failed one’s connection').toBe('resolved');
+        const read = plugin.fetchRecent({ topic });
         expect(
-          (await plugin.fetchRecent({ topic })).messages.map((m) => m.content),
+          await settleWithin(read, SETTLE_CEILING_MS),
+          'the read after the recovered write never came back',
+        ).toBe('resolved');
+        expect(
+          (await read).messages.map((m) => m.content),
           'the recovered write is not in the table',
         ).toContain('after the peer came back');
       } finally {
