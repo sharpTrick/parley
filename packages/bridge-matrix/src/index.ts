@@ -105,13 +105,20 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const generation = this.generation;
-    const deadline = Date.now() + (args.blockMs ?? 0);
+    // `blockMs` is declared on the seam with no bound, and BOTH parks below — the one waiting for a
+    // peer to provision the room and the one waiting for an event in it — end only by comparing
+    // against this deadline. Keep the finiteness arm, so that a budget which is neither `> 0` nor
+    // `<= 0` cannot leave every one of those comparisons false: `Infinity` never lets a park stop,
+    // and `NaN` also collapses its slice to a bare tick, turning the wait into a request storm.
+    const asked = args.blockMs ?? 0;
+    const budgetMs = Number.isFinite(asked) ? asked : 0;
+    const deadline = Date.now() + budgetMs;
     // Park for the room only when the answer would otherwise be an EMPTY page: the seam blocks on an
     // empty window, not on provisioning, so a topic whose room already exists must not spend the
     // budget re-resolving it.
     const roomId =
       (await this.existingRoom(args.topic, generation)) ??
-      ((args.blockMs ?? 0) > 0 ? await this.roomForRead(args.topic, deadline, generation) : undefined);
+      (budgetMs > 0 ? await this.roomForRead(args.topic, deadline, generation) : undefined);
     const limit = args.limit ?? 100;
     // A topic nobody has posted to has no room yet, and a read never provisions one; the empty page
     // an absent room answers with carries a cursor that replays from the room's first visible event.

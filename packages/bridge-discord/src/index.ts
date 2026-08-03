@@ -86,7 +86,13 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const limit = args.limit ?? 100;
-    const blockMs = args.blockMs ?? 0;
+    // The seam declares `blockMs?: number` with no bound, and every wait this call runs — the
+    // connect race, the waiter, each page's own budget — is derived here. Keep the finiteness arm,
+    // so that a budget which is neither `> 0` nor `<= 0` can neither reach a timer as `Infinity`,
+    // where it is a RangeError thrown out of the seam, nor hold the caller on the unbounded default
+    // it asked for none of.
+    const asked = args.blockMs ?? 0;
+    const blockMs = Number.isFinite(asked) ? asked : 0;
     const deadline = Date.now() + (blockMs > 0 ? blockMs : DEFAULT_DEADLINE_MS);
 
     if (args.since === undefined) {
