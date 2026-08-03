@@ -48,17 +48,63 @@ const CONFIG_KEYS = [
   'tls',
 ] as const satisfies readonly (keyof NatsBackendConfig)[];
 
+/** Members of a config value that is itself an object — the level a top-level key check cannot see. */
+const NESTED_CONFIG_KEYS = {
+  tls: ['ca_file', 'cert_file', 'key_file'],
+} as const satisfies Partial<Record<keyof NatsBackendConfig, readonly string[]>>;
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** What a value IS, for a diagnostic that must never carry what a value HOLDS. */
+const typeName = (value: unknown): string =>
+  Array.isArray(value) ? 'an array' : value === null ? 'null' : `a ${typeof value}`;
+
+function assertKnownMembers(
+  container: Record<string, unknown>,
+  prefix: string,
+  allowed: readonly string[],
+): void {
+  for (const key of Object.keys(container)) {
+    if (allowed.includes(key)) continue;
+    throw new Error(
+      `parley-nats: unknown backend_config key '${prefix}${key}' — expected one of ${allowed
+        .map((known) => `${prefix}${known}`)
+        .join(', ')}`,
+    );
+  }
+}
+
 /**
  * A key this plugin does not read is a key it silently drops, and every field here is either a
  * credential or an addressing decision: a misspelled `token` connects anonymously, a misspelled
  * `subject_prefix` addresses a different stream than the sibling instance the operator meant to
  * share with. Refuse at connect(), naming the offender, rather than honouring the default.
+ * Keep the walk one level INTO every declared object, so that `tls.ca_flie` is refused rather than
+ * dropped — a dropped `ca_file` verifies the link against the system trust store instead of the
+ * pinned CA, and a dropped `cert_file` presents no client certificate at all, both silently.
  */
 export function assertKnownConfigKeys(config: BackendConfig): void {
-  for (const key of Object.keys(config)) {
-    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+  const cfg = config as Record<string, unknown>;
+  assertKnownMembers(cfg, '', CONFIG_KEYS);
+  for (const [key, members] of Object.entries(NESTED_CONFIG_KEYS) as [
+    string,
+    readonly string[],
+  ][]) {
+    const value = cfg[key];
+    if (value === undefined) continue;
+    if (!isPlainObject(value)) {
       throw new Error(
-        `parley-nats: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
+        `parley-nats: invalid backend_config.${key} — expected an object holding ${members
+          .map((member) => `${key}.${member}`)
+          .join(', ')}, not ${typeName(value)}`,
+      );
+    }
+    assertKnownMembers(value, `${key}.`, members);
+    for (const [member, held] of Object.entries(value)) {
+      if (held === undefined || typeof held === 'string') continue;
+      throw new Error(
+        `parley-nats: invalid backend_config.${key}.${member} — expected a string, not ${typeName(held)}`,
       );
     }
   }
@@ -106,19 +152,30 @@ export function validatePrefix(
   return value;
 }
 
+const NS_PER_DAY = 86_400_000_000_000;
+
 /**
- * JetStream reads `max_age: 0` as UNLIMITED, so `retention_days: 0` would mean the exact opposite
- * of what an operator wrote, and a negative value fails later with an unrelated driver error.
- * Reject both at connect, before a stream is created with a window that is then locked in.
+ * The stream's `max_age`, in the nanoseconds JetStream takes, or undefined for unlimited.
+ * JetStream reads `max_age: 0` as UNLIMITED, so a window that composes zero would mean the exact
+ * opposite of what an operator wrote, and a negative value fails later with an unrelated driver
+ * error. Judge the NANOSECONDS the days compose rather than the days, so that a positive number of
+ * days too small to round to one nanosecond cannot slip past into a stream whose retention is then
+ * locked in at creation.
  */
-export function validateRetentionDays(days: number | undefined): number | undefined {
+export function validateRetentionMaxAgeNs(days: number | undefined): number | undefined {
   if (days === undefined) return undefined;
   if (typeof days !== 'number' || !Number.isFinite(days) || days <= 0) {
     throw new Error(
       `invalid retention_days ${JSON.stringify(days)} — expected a positive number of days, or omit it for unlimited retention`,
     );
   }
-  return days;
+  const maxAgeNs = Math.round(days * NS_PER_DAY);
+  if (maxAgeNs < 1) {
+    throw new Error(
+      `invalid retention_days ${JSON.stringify(days)} — it composes a max_age of ${maxAgeNs}ns, which JetStream reads as UNLIMITED retention, the opposite of a retention window`,
+    );
+  }
+  return maxAgeNs;
 }
 
 /** Where nats.js connects when `backend_config.servers` is unset. */

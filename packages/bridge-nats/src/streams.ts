@@ -7,8 +7,6 @@ import { assertCaptures, streamNameFor, subjectFor } from './naming.js';
 import { dec, rowToMessage } from './payload.js';
 import { NatsSession } from './session.js';
 
-const NS_PER_DAY = 86_400_000_000_000;
-
 /** The topic → stream mapping: what a topic is called, whether it exists, and which incarnation. */
 export abstract class NatsStreams extends NatsSession {
   protected subject(topic: Topic): string {
@@ -65,9 +63,7 @@ export abstract class NatsStreams extends NatsSession {
         const subject = this.subject(topic);
         try {
           const config: Partial<StreamConfig> = { name, subjects: [subject] };
-          if (this.retentionDays !== undefined) {
-            config.max_age = Math.round(this.retentionDays * NS_PER_DAY);
-          }
+          if (this.retentionMaxAgeNs !== undefined) config.max_age = this.retentionMaxAgeNs;
           this.noteIncarnation(name, await this.requireJsm().streams.add(config));
         } catch (err) {
           // Keep this swallow narrow to "already exists", so that a real add failure still surfaces

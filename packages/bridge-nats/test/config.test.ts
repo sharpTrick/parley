@@ -12,7 +12,12 @@ import {
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { captures, NatsPlugin, plaintextRemoteServer, redactUserinfo } from '../src/index.js';
 import { fakeJetStream, injectFake } from './fake-jetstream.js';
-import { declaredConfigKeys, legalStreamName, legalSubject } from './helpers.js';
+import {
+  declaredConfigKeys,
+  declaredConfigPaths,
+  legalStreamName,
+  legalSubject,
+} from './helpers.js';
 
 // Class 1: every backend_config field the docs promise is actually honoured by the driver, and no
 // secret value is echoed back out. A credential the plugin silently drops means the operator
@@ -158,6 +163,62 @@ describe('nats backend_config — documented connection fields reach the driver'
       await plugin.disconnect();
     });
   }
+
+  // Class: a value judged in the OPERATOR's unit and applied in the BACKEND's unit, where the
+  // conversion can carry an accepted value back into the region the validator refuses. The rows
+  // above sit at operator scale — the smallest is twelve orders of magnitude above the boundary —
+  // so they cannot see it. These are generated across the conversion itself, and the verdict is not
+  // stated per row: whichever side of the boundary a row lands on, a stream that gets created must
+  // never carry the `max_age: 0` JetStream reads as unlimited, which is the one outcome the whole
+  // validator exists to prevent and the one that is locked in at creation.
+  const boundaryDays = [
+    1e-15,
+    5e-15,
+    1e-12,
+    1e-9,
+    1e-6,
+    0.2 / NS_PER_DAY,
+    0.5 / NS_PER_DAY,
+    1 / NS_PER_DAY,
+    2 / NS_PER_DAY,
+    1000 / NS_PER_DAY,
+  ];
+
+  const composedMaxAge = async (days: number): Promise<number | 'refused'> => {
+    const plugin = new NatsPlugin();
+    const err = await plugin
+      .connect({ retention_days: days })
+      .then(() => undefined, (e: unknown) => e);
+    if (err !== undefined) {
+      expect(String(err)).toContain('retention_days');
+      return 'refused';
+    }
+    const fake = fakeJetStream();
+    injectFake(plugin, fake);
+    await plugin.post(asTopic('retention'), asHandle('sys'), 'x');
+    await plugin.disconnect();
+    return fake.state.added?.max_age ?? Number.NaN;
+  };
+
+  const composedBoundary = async (): Promise<{ days: number; maxAge: number | 'refused' }[]> => {
+    const out: { days: number; maxAge: number | 'refused' }[] = [];
+    for (const days of boundaryDays) out.push({ days, maxAge: await composedMaxAge(days) });
+    return out;
+  };
+
+  it('no accepted retention_days composes the max_age JetStream reads as unlimited', async () => {
+    const composed = await composedBoundary();
+    const unlimited = composed.filter((r) => r.maxAge !== 'refused' && !(r.maxAge >= 1));
+    expect(unlimited).toEqual([]);
+  });
+
+  // A generator is worth what it emits: rows that were all refused, or all accepted, would grade
+  // the invariant above against nothing.
+  it('the boundary rows straddle the conversion — some refused, some accepted', async () => {
+    const composed = await composedBoundary();
+    expect(composed.filter((r) => r.maxAge === 'refused').length).toBeGreaterThan(0);
+    expect(composed.filter((r) => r.maxAge !== 'refused').length).toBeGreaterThan(0);
+  });
 
 
   const prefixes: { field: 'subject_prefix' | 'stream_prefix'; value: unknown; accepted?: true }[] = [
@@ -386,12 +447,19 @@ describe('nats backend_config — documented connection fields reach the driver'
 // meant to share with. The near misses are generated off the declared interface rather than listed,
 // so a field added later is policed by default. The `cases` table above is the neighbouring test
 // that cannot reach this: every row spells its key correctly.
+// The generator walks the declared shape to its LEAVES, because a check that policed only the
+// outermost level is exactly how `tls: { ca_flie: … }` shipped: accepted, dropped, and the link
+// verified against the system trust store instead of the pinned CA with nothing said. The three
+// ways a declared value can be wrong are crossed as dimensions — a typo at the leaf, a leaf holding
+// something other than what it is declared to hold, and a container that is not an object at all —
+// so a nested field added later is graded on all three by default.
 describe('nats backend_config — an unrecognised key is refused, not dropped', () => {
   beforeEach(() => {
     vi.mocked(connect).mockClear();
   });
 
   const declared = declaredConfigKeys();
+  const paths = declaredConfigPaths();
   const nearMisses = (key: string): string[] => [
     key.slice(0, -1),
     `${key.slice(0, -2)}${key.at(-1) ?? ''}${key.at(-2) ?? ''}`,
@@ -399,12 +467,48 @@ describe('nats backend_config — an unrecognised key is refused, not dropped', 
     key.toUpperCase(),
   ];
 
-  const typos = [...new Set(declared.flatMap(nearMisses))].filter((t) => !declared.includes(t));
+  /** Names declared alongside `path` at ITS level — a near miss that spells one of them is not one. */
+  const siblingsOf = (path: string): string[] => {
+    const cut = path.lastIndexOf('.');
+    if (cut < 0) return declared;
+    const parent = path.slice(0, cut + 1);
+    return paths.filter((p) => p.startsWith(parent)).map((p) => p.slice(parent.length));
+  };
 
-  it('generates a near miss for every declared key', () => {
+  const typos = [
+    ...new Set(
+      paths.flatMap((path) => {
+        const cut = path.lastIndexOf('.');
+        const parent = path.slice(0, cut + 1);
+        const known = siblingsOf(path);
+        return nearMisses(path.slice(cut + 1))
+          .filter((t) => !known.includes(t))
+          .map((t) => `${parent}${t}`);
+      }),
+    ),
+  ];
+
+  /** `{ tls: { ca_flie: v } }` from `'tls.ca_flie'` — the config an operator would actually write. */
+  const configAt = (path: string, value: unknown): Record<string, unknown> => {
+    const cut = path.indexOf('.');
+    return cut < 0
+      ? { [path]: value }
+      : { [path.slice(0, cut)]: { [path.slice(cut + 1)]: value } };
+  };
+
+  const containers = [
+    ...new Set(paths.filter((p) => p.includes('.')).map((p) => p.slice(0, p.indexOf('.')))),
+  ];
+
+  it('generates a near miss for every declared path, nested members included', () => {
     expect(declared).toContain('nkey_seed');
+    expect(paths).toContain('nkey_seed');
+    expect(paths).toContain('tls.ca_file');
+    expect(containers.length).toBeGreaterThan(0);
     expect(typos).toContain('tokens');
-    expect(typos.length).toBeGreaterThanOrEqual(declared.length * 3);
+    expect(typos).toContain('tls.ca_files');
+    expect(typos.filter((t) => t.includes('.')).length).toBeGreaterThanOrEqual(9);
+    expect(typos.length).toBeGreaterThanOrEqual(paths.length * 3);
   });
 
   for (const typo of typos) {
@@ -412,11 +516,60 @@ describe('nats backend_config — an unrecognised key is refused, not dropped', 
       const plugin = new NatsPlugin();
 
       const err = await plugin
-        .connect({ servers: '127.0.0.1:4222', [typo]: 'x' })
+        .connect({ servers: '127.0.0.1:4222', ...configAt(typo, 'x') })
         .then(() => undefined, (e: unknown) => e);
 
       expect(String(err)).toContain(typo);
       expect(vi.mocked(connect)).not.toHaveBeenCalled();
+    });
+  }
+
+  const NOT_A_STRING: unknown[] = [true, 42, null, [], {}, ['/tmp/ca.pem']];
+
+  for (const path of paths.filter((p) => p.includes('.'))) {
+    for (const value of NOT_A_STRING) {
+      it(`refuses backend_config.${path} holding ${JSON.stringify(value)}, naming the key`, async () => {
+        const plugin = new NatsPlugin();
+
+        const err = await plugin
+          .connect(configAt(path, value))
+          .then(() => undefined, (e: unknown) => e);
+
+        expect(String(err)).toContain(path);
+        expect(vi.mocked(connect)).not.toHaveBeenCalled();
+      });
+    }
+  }
+
+  // `tls: true` is the sharpest of these: it supplies no material at all, and merely being defined
+  // is what `plaintextCredentialRisks` reads as proof the link will be encrypted.
+  const NOT_AN_OBJECT: unknown[] = [true, false, 'yes', '/tmp/ca.pem', 42, null, [], ['/tmp/ca.pem']];
+
+  for (const container of containers) {
+    for (const value of NOT_AN_OBJECT) {
+      it(`refuses backend_config.${container} holding ${JSON.stringify(value)} instead of an object`, async () => {
+        const plugin = new NatsPlugin();
+
+        const err = await plugin
+          .connect({ [container]: value, token: SECRET })
+          .then(() => undefined, (e: unknown) => e);
+
+        expect(String(err)).toContain(`backend_config.${container}`);
+        expect(String(err)).not.toContain(SECRET);
+        expect(vi.mocked(connect)).not.toHaveBeenCalled();
+      });
+    }
+  }
+
+  // The rule is "no UNKNOWN member", never "at least one known member": an empty `tls` is how an
+  // operator asks for encryption with the material left to the system trust store, and it is what
+  // the live transport-agreement fixture connects with.
+  for (const container of containers) {
+    it(`accepts an empty backend_config.${container}`, async () => {
+      const plugin = new NatsPlugin();
+      await plugin.connect({ [container]: {} });
+      await plugin.disconnect();
+      expect(vi.mocked(connect)).toHaveBeenCalledTimes(1);
     });
   }
 

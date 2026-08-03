@@ -8,7 +8,7 @@ import {
   type NatsBackendConfig,
   plaintextCredentialRisks,
   validatePrefix,
-  validateRetentionDays,
+  validateRetentionMaxAgeNs,
 } from './config.js';
 import { delay, DRAIN_TIMEOUT_MS, type Closeable } from './jetstream.js';
 import { MAX_STREAM_NAME_BYTES } from './naming.js';
@@ -20,7 +20,7 @@ export abstract class NatsSession {
   private jsm?: JetStreamManager;
   protected subjectPrefix = 'parley.';
   protected streamPrefix = 'PARLEY_';
-  protected retentionDays?: number;
+  protected retentionMaxAgeNs?: number;
   private connecting = false;
   protected stopped = false;
   protected epoch = 0;
@@ -40,7 +40,7 @@ export abstract class NatsSession {
     const cfg = config as NatsBackendConfig;
     const subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/);
     const streamPrefix = validatePrefix('stream_prefix', cfg.stream_prefix, 'PARLEY_', /[.*>/\\\s]/, MAX_STREAM_NAME_BYTES);
-    const retentionDays = validateRetentionDays(cfg.retention_days);
+    const retentionMaxAgeNs = validateRetentionMaxAgeNs(cfg.retention_days);
     assertNoServerCredentials(cfg);
     // Report on stderr, NEVER stdout, so that cli.ts's JSON-RPC channel stays parseable.
     for (const risk of plaintextCredentialRisks(cfg)) console.warn(`[parley-nats] SECURITY: ${risk}`);
@@ -71,7 +71,7 @@ export abstract class NatsSession {
     }
     this.subjectPrefix = subjectPrefix;
     this.streamPrefix = streamPrefix;
-    this.retentionDays = retentionDays;
+    this.retentionMaxAgeNs = retentionMaxAgeNs;
     this.stopped = false;
     this.epoch += 1;
     this.ensured.clear();

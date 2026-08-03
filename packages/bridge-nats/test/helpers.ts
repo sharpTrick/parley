@@ -23,6 +23,22 @@ export const declaredConfigKeys = (): string[] => {
 };
 
 /**
+ * Every LEAF path of the declared `NatsBackendConfig` — `tls.ca_file` as well as `token` — read off
+ * the source rather than listed. A key check that policed only the outermost level dropped a typo
+ * inside `tls` in silence, so keep the derivation nested, so that a member added inside any declared
+ * object is policed by default rather than by someone remembering to add a row.
+ */
+export const declaredConfigPaths = (): string[] => {
+  const body = /export interface NatsBackendConfig \{([\s\S]*?)\n\}/.exec(allSource())?.[1] ?? '';
+  return [...body.matchAll(/^ {2}([a-z_]+)\??:(.*)$/gm)].flatMap((m) => {
+    const key = m[1] as string;
+    const members = /\{([^}]*)\}/.exec(m[2] ?? '')?.[1];
+    if (members === undefined) return [key];
+    return [...members.matchAll(/([a-z_]+)\??:/g)].map((inner) => `${key}.${inner[1] as string}`);
+  });
+};
+
+/**
  * Host/port of `SERVERS`, for anything that has to reach the server other than through the plugin
  * (the outage proxy). Keep everything pointed at this, so that PARLEY_NATS_SERVERS can move the
  * whole suite onto a private instance instead of contending on the shared one.
