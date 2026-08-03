@@ -1,0 +1,74 @@
+{
+  "round": 15,
+  "phase": "remediation",
+  "base": "68960a7",
+  "blockingFindings": 35,
+  "closed": 35,
+  "agents": 12,
+  "waves": 3,
+
+  "instrumentChangesUnderTest": [
+    "staged review with a named-gap repeat (proposed by the operator)",
+    "remediationCheck — the critic grades its own fix and states a confidence",
+    "scripts/verify-mutations.sh — a fixer's mutation claims replayed mechanically"
+  ],
+
+  "remediationCheckCalibration": {
+    "note": "The headline result. Findings were reliably real; the FIXES attached to them were not. Every wrong one was caught by a separate agent re-deriving the fix, never by the suite.",
+    "confidenceDistribution": { "traced": 30, "plausible": 5 },
+    "confidenceIsNotFindingQuality": "Both xmpp findings marked `plausible` held up in FULL, while their remediations were wrong twice. The label tracks the critic's confidence in its fix, not in its finding — which is what it should do, but is the opposite of how it reads.",
+    "wrongInSomeWay": "at least 14 of 35 this round; 29 across rounds 9-15",
+    "failureModes": [
+      { "mode": "the dependency was never read", "case": "postgres: testsThatWouldFail said 'None found' and LISTED the three files it checked — none was the one file whose entire subject is what a reconnect leaves LISTENed, and 12 of whose 18 cells its own remediation breaks." },
+      { "mode": "the proposed check cannot fail", "cases": ["redis: generate the expectations from the same array that drives the behaviour, so adding a bad value generates a row blessing it", "sqlite: provoke read-only with chmod 0444, which does nothing when the suite runs as root", "telegram: generalise the element generator to two calls that return no array and already pass explicit screens — a table with no reachable failing input"] },
+      { "mode": "only the near side of a cross-system claim was traced", "case": "zulip: asserted pydantic's StringConstraints calls Python str.strip(). It strips in Rust. All three reliesOn fields were traced against the plugin, never against the upstream the finding cites." },
+      { "mode": "the fix converts an error into a silent wrong answer", "case": "xmpp: folding a require() throw into `false` made fetchRecent on a never-connected plugin RESOLVE WITH AN EMPTY PAGE instead of rejecting." },
+      { "mode": "the proposed property is false against correct code", "cases": ["nats: a global cursor-monotonicity property, which read.ts deliberately violates when a cursor is judged restarted", "conformance: fail any non-literal budget initializer, which makes a forwarded parameter a permanent red", "discord: 'no comment says only ever' is false in eight packages, all correct risk prose"] },
+      { "mode": "testsThatWouldFail: none because the fix is UNGRADED, not safe", "case": "core F8: 'I applied findLast and ran the whole auth suite: 948 tests all pass' was TRUE — and the fix was completely ungraded, because the fixture seeded the owner with a minted code so the eviction pass could never reach it." },
+      { "mode": "the remediation is redundant", "case": "slack: proposed moving an invariant into bridge-core as a new test; core already owns it, better, and mutating the function reddens three core tests. The correct fix was pure deletion." },
+      { "mode": "the remediation is insufficient rather than wrong", "case": "telegram: 'carry ids served in this run plus ids holding records' still drops the mark on the load-repair path, because load() runs journalText from inside the constructor." }
+    ]
+  },
+
+  "defectsFoundLargerThanFiled": [
+    "matrix: the finding's own interleavings note claimed a partial collection 'is safe today and stays safe'. Measured false — at tail-noise depth limit-1 the reported cursor silently drops four messages, failing both before and after the narrow fix implied.",
+    "postgres: the teardown race was not only the pool — the listener socket has the identical shape in two more places, both dialling before publishing.",
+    "discord: the ratchet surfaced a sibling the finding never mentioned — a channel `type` destructure that crashes on null and accepts the string '0', silently unwiring a good channel forever.",
+    "nats: wss:// checked as a possible false positive and found not to be one, because connect.js wires only NodeTransport."
+  ],
+
+  "fixtureInfidelity": {
+    "note": "A recurring cause of invisibility: the fake is kinder than the server, so the guard cannot express the failure.",
+    "cases": [
+      "postgres: FakePool.end settled without waiting for checked-out clients — it would have let disconnect() 'return clean' with a connection still out.",
+      "xmpp: FakeXmpp flagged EVERY last page complete, which would have stopped the new paging loop after one page and made an unpaged read look paged.",
+      "matrix: an absent timeline tip is illegitimate on real Synapse but legitimate in the fake, so the obvious fix would have broken every fresh-room subscribe for a fixture artefact."
+    ]
+  },
+
+  "newRatchetShapes": [
+    "discord M2 and postgres M3 grade THE WRONG FIX rather than the defect — awaiting the handler, and the blind wake-all. Given that critics prescribe badly, a test that catches the attractive wrong answer is worth more than one catching only the original bug.",
+    "nats made the TRANSPORT the oracle instead of a table: a restored scheme allowlist fails even if the allowlist and a literal test agree with each other.",
+    "telegram graded what the fix BUYS (a flood cannot evict the chat) rather than how it is spelled, so the ratchet survives any change to the mark's format.",
+    "conformance compares two workflows against EACH OTHER rather than asserting either file's wording."
+  ],
+
+  "agentSelfCorrection": [
+    "nats: refused to proceed when its findings file was missing, diagnosed the cause, and declined to fall back on stale round-5 findings — reasoning that inventing them would produce exactly the ungraded-fix failure the round exists to catch.",
+    "slack: told a wall-clock file was a known flake, declined to accept it; ran a HEAD control clean 3/3, established the file contains zero subscribe calls so its fix could not be the cause, and found the real cause was its own new tests raising contention.",
+    "xmpp: caught a tautology in its own test — counting redials could not discriminate, because destroying the socket is what makes start() reject, so the UNFIXED code's failure path passed the test.",
+    "core: watched its own anti-stub ratchet PASS under a stub that still increments the counter, and replaced it."
+  ],
+
+  "operatorErrors": [
+    "Twice a mutation regex silently failed to match, so a suite passed against unmutated code and was nearly accepted as proof. This is what scripts/verify-mutations.sh now prevents by requiring exactly one match and asserting the file changed.",
+    "A false convergence: all 15 critics were blocked by a schema I had enlarged, agent() returned null rather than rejecting, and the runner mapped null to a clean result — so the round declared converged with 0 tokens spent and quiesced every target."
+  ],
+
+  "verification": {
+    "mutationReplaysRun": 16,
+    "mutationReplaysRed": 16,
+    "behaviouralTestsInverted": 5,
+    "behaviouralTestsInvertedReason": "each encoded the defect as a requirement — an over-long topic matching on its bounded prefix, an OAuth store shedding the entry that must be protected, backoff expected to speed up above the ceiling"
+  }
+}
