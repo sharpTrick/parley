@@ -241,10 +241,41 @@ Three movements are worth naming now rather than at the end:
   a backend) holds and was checked mechanically every round; what these findings show is a subtler
   leak in the other direction — core relying on behaviour the seam never promised.
 
-### What the first two rounds say about the pre-registered expectations
+### Per-lens yield over ten scored rounds
 
-Two rounds is far too few to settle any of these. Recorded now so the reading is not
-retrofitted later.
+Rounds 1–10 are the clean comparison window — one partition (14 targets), one instrument, no
+decomposition in between. `total` findings and `blocking` of them, summed:
+
+| lens | findings | blocking | rate |
+| --- | ---: | ---: | ---: |
+| concurrency-and-failure | 145 | 92 | **63%** |
+| security | 118 | 61 | **52%** |
+| correctness | 113 | 55 | 49% |
+| protocol-conformance | 61 | 27 | 44% |
+| test-integrity | 225 | 91 | 40% |
+| seam-integrity | 13 | 4 | 31% |
+| design-principles | 94 | 16 | 17% |
+| truth-in-docs | 111 | 13 | 12% |
+| operability-and-release | 50 | 4 | 8% |
+| test-hygiene | 55 | 0 | **0%** |
+| maintainability | 46 | 0 | **0%** |
+
+**Two of eleven lenses filed 101 findings across ten rounds and produced not one blocking finding
+between them.** Maintainability replicates ouroboros exactly on the half that mattered. Test-hygiene
+— a lens this run invented — did the same thing, which is the more useful result, because it was
+added on the theory that vacuous and duplicated tests were a live risk on this substrate. They were.
+The lens simply was not how to reach them: the same concern handed to the *fixer* as an instruction
+changed behaviour in a single round (round 4, where agents deleted tests for the first time — nats
+shed 29 rows while covering strictly more). A property worth having is not automatically a lens worth
+running, and the cost of finding that out was a lens-round every round for the whole run.
+
+**concurrency-and-failure is the highest-yield lens on this surface at 63% blocking**, ahead of
+security. That ordering is the substrate talking: eleven backends with reconnect, paging and
+multi-process paths give it more to work with than any other lens has.
+
+### What the pre-registered expectations look like after fifteen rounds
+
+The round-2 reading is kept below it, unedited, so the two can be compared.
 
 - **E1 (security stays productive).** Holding so far — 9 blocking findings in each of the first two
   rounds, no sign of the extinction ouroboros saw. This is the expectation the deep surface was
@@ -259,6 +290,41 @@ retrofitted later.
 - **E5 (blocking-gated rule fires earlier).** No signal yet; both rounds are far from either stop
   rule.
 - **E3, E4.** Not yet measurable — no round has quiesced, and cost-per-finding needs more points.
+
+#### The same five, scored against rounds 1–15
+
+- **E1 (security stays productive) — CONFIRMED.** Ouroboros's security lens went silent from R11 to
+  R21. Here it filed 4–6 blocking findings in *every* round through 10 and 10 findings in round 15,
+  at a 52% blocking rate over the window. The deep-surface hypothesis is the one pre-registered
+  expectation that came out cleanly.
+- **E2 (maintainability files the most, blocks the least) — HALF CONFIRMED, and the half that failed
+  is informative.** Zero blocking findings in ten rounds, exactly as predicted. But it filed 46
+  findings, 5% of the total, against ouroboros's 43%. The per-lens partition is the likely cause: a
+  critic with only maintainability to report reports maintainability, whereas an all-lens critic that
+  has just found a lost wakeup files that instead. If that is right, ouroboros's *"convergence was
+  gated by maintainability running out of nits"* is substantially an artifact of partitioning by
+  lens, and this run's partition is what exposes it.
+- **E3 (cost per confirmed finding rises) — CONFIRMED, on the denominator that matters.** Per
+  *confirmed* finding it is flat (~30–38K tokens, rounds 7–15) because the loop keeps finding its own
+  output. Per **pre-existing** finding it rises: 88K, 83K, 99K, 133K (rounds 7–10) and 160K at round
+  15. Per pre-existing *blocking* finding: 238K, 295K, 234K, 315K, **534K**. The decay is real and it
+  is invisible in the headline count.
+- **E4 (quiescence cuts tail cost and loses recall) — UNTESTABLE, and that is the result.**
+  Quiescence has **never fired in fifteen rounds**. Every target returned confirmed findings every
+  round, so nothing was ever eligible to sleep. The pre-registered question was *can a review loop
+  safely stop looking at what it has already cleared?* On a surface this deep, nothing ever gets
+  cleared. The efficiency mechanism is inert and its recall risk is moot — a more useful answer than
+  a tuned threshold, and it stays clean only because the threshold was never tuned.
+- **E5 (the blocking-gated rule fires earlier) — CONTRADICTED, and this is the sharpest answer this
+  run gives to ouroboros's open question.** Ouroboros asked whether a severity-gated stop rule
+  *under-stops*, having noted it would have fired at R12 against its acting rule's R21. Here it
+  **would not have fired at all**: blocking findings never reached zero in any of eleven scored
+  rounds, and the band 23–35 is if anything rising. The two rules have not separated because neither
+  is close. On a deep surface, severity-gating buys nothing, because blocking findings are what the
+  loop does not run out of.
+
+Four of five pre-registered expectations resolved; the fifth resolved by refusing to be testable.
+None of them was retrofitted — the wordings above answer the wordings written before round 1.
 
 ### Iatrogenesis, measured rather than estimated
 
