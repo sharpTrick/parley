@@ -2,7 +2,7 @@ import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { xml } from '@xmpp/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
-import { attach, expectNoLeaks, FakeXmpp, priv } from './fake-xmpp.js';
+import { attach, errorEl, expectNoLeaks, FakeXmpp, priv, type XmppPrivate } from './fake-xmpp.js';
 
 // Class: a timeout/callback registered in a KEYED registry tearing down a SUCCESSOR's registration.
 // Every correlation map here is single-slot per key (or a set per key), and every entry arms a
@@ -161,6 +161,114 @@ describe('XMPP keyed correlation registries (a superseded entry never unregister
     expect(longFired).toBe('message'); // still woken by its own event
     expectNoLeaks(plugin);
   });
+});
+
+// Class: a superseded entry settled through a route that is NOT its own timer. The table above only
+// ever walks the `own timeout` column, and for pendingJoins that column cannot fail: `settleFrom`
+// disarms the loser's timer the moment a successor registers, so the loser's own timeout can never
+// reach the delete. The identity guard on that delete therefore had no case that could fail against
+// it — replacing it with an unconditional `delete(room)` left the whole suite green, while in
+// production it drops the SUCCESSOR's registration, its self-presence is ignored, and the room is
+// silently unjoined: live push for the topic dead and every post to it bouncing.
+//
+// Each row supersedes an in-flight join and then settles one of the two entries by a route that is
+// not a timer, demanding the same shape of every one: both callers settle, the registry ends empty,
+// and — where the route left the successor registered — the successor still completes on its own
+// self-presence. A new route is a row, not a new test.
+
+/** Bounded wait: a registration a route destroyed never completes, and must not cost the timeout. */
+const settleWithin = async (p: Promise<unknown>, ms: number): Promise<string> =>
+  Promise.race([
+    p.then(
+      () => 'settled',
+      (e: Error) => `settled: ${e.message}`,
+    ),
+    new Promise<string>((r) => setTimeout(() => r('still pending'), ms)),
+  ]);
+
+interface Route {
+  name: string;
+  /** Settle one of the two entries. `failLoserSend` rejects the loser's own in-flight `send`. */
+  fire(ctx: {
+    plugin: XmppPlugin;
+    p: XmppPrivate;
+    room: string;
+    failLoserSend: (err: Error) => void;
+  }): Promise<void> | void;
+  /** Whether the successor is still registered afterwards, waiting for its own self-presence. */
+  successorSurvives: boolean;
+}
+
+const routes: Route[] = [
+  {
+    // The one route that actually reaches the loser: its own transport failing late. It is the
+    // reason the delete has to be identity-guarded, and nothing exercised it.
+    name: "the loser's own send rejecting after the successor registered",
+    fire: ({ failLoserSend }) => {
+      failLoserSend(new Error('stream closed'));
+    },
+    successorSurvives: true,
+  },
+  {
+    name: 'an error presence naming the nick both joins asked for',
+    fire: ({ p, room }) => {
+      p.onStanza(
+        xml('presence', { from: `${room}/${p.nick}`, type: 'error' }, errorEl('forbidden')),
+      );
+    },
+    successorSurvives: false,
+  },
+  {
+    name: 'a disconnect while both are outstanding',
+    fire: async ({ plugin }) => {
+      await plugin.disconnect();
+    },
+    successorSurvives: false,
+  },
+];
+
+describe('XMPP a superseded join settled off its timer leaves the successor registered', () => {
+  it.each(routes)('$name', async (route) => {
+    const plugin = new XmppPlugin();
+    const fake = new FakeXmpp();
+    fake.joinReply = 'silent'; // neither join is answered until this case says so
+    const p = attach(plugin, fake);
+    const room = p.roomJid(TOPIC);
+
+    let failLoserSend!: (err: Error) => void;
+    const pass = fake.send.bind(fake);
+    let sends = 0;
+    fake.send = async (el: unknown) => {
+      await pass(el);
+      if (++sends > 1) return;
+      // The loser's send is left in flight, so that its LATE failure — the only path that reaches
+      // a superseded entry — is a thing this case can schedule rather than race.
+      await new Promise<void>((_resolve, reject) => {
+        failLoserSend = reject;
+      });
+    };
+
+    const loser = p.joinOnce(room);
+    const loserOutcome = settleWithin(loser, 500);
+    await Promise.resolve();
+    const successor = p.joinOnce(room);
+    const successorOutcome = settleWithin(successor, 500);
+    expect(p.pendingJoins.size).toBe(1);
+
+    await route.fire({ plugin, p, room, failLoserSend });
+    await Promise.resolve();
+
+    if (route.successorSurvives) {
+      expect(p.pendingJoins.size, 'the successor was unregistered by the loser').toBe(1);
+      p.onStanza(selfPresence(room, p.nick));
+      expect(await successorOutcome).toBe('settled');
+    } else {
+      expect(await successorOutcome).toMatch(/^settled/);
+    }
+    expect(await loserOutcome).toMatch(/^settled/);
+    expect(p.pendingJoins.size).toBe(0);
+    expectNoLeaks(plugin);
+  }, 15_000);
 });
 
 // Class: an operation that registers a keyed correlator and arms a timer BEFORE the step that can

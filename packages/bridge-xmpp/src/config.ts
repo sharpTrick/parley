@@ -1,7 +1,7 @@
 import type { BackendConfig } from '@sharptrick/parley-core';
 
 import { JID_PART_MAX_BYTES } from './jid.js';
-import { assertXmlSafe } from './stanzas.js';
+import { assertXmlSafe, attributeNormalizedCodepoint, codepointLabel } from './stanzas.js';
 
 /** Plugin-specific backend_config. */
 export interface XmppBackendConfig {
@@ -133,6 +133,17 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
       'nick',
       `${describeValue(nick)} contains '/' — the nick is the JID resource, so this connection could ` +
         'not recognise its own presence back from the room',
+    );
+  }
+  const rewritten = typeof nick === 'string' ? attributeNormalizedCodepoint(nick) : undefined;
+  if (rewritten !== undefined) {
+    throw bad(
+      'nick',
+      `contains ${codepointLabel(rewritten)}, which XML attribute-value normalization rewrites to ` +
+        'a space in transit — the nick is the JID resource of the presence this bridge addresses ' +
+        'to the room, so the room would admit it under a name it never asked for and this ' +
+        'connection could not recognise its own presence back from the room. A plain space is ' +
+        'fine; these three are not',
     );
   }
   const page = cfg['mam_page'];

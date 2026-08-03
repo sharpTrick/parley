@@ -57,6 +57,25 @@ export const occupancyEndReason = (statuses: string[], x: El | undefined): strin
   return named.length > 0 ? named.join(', ') : 'left the room';
 };
 
+/** Renders a codepoint the way every diagnostic that names one does. */
+export const codepointLabel = (cp: number): string =>
+  `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+
+/**
+ * The first codepoint of `s` that XML 1.0 §3.3.3 attribute-value normalization rewrites to a space,
+ * or `undefined` if none. These three are LEGAL XML, so {@link assertXmlSafe} admits them and the
+ * serializer emits them raw: a value carrying one leaves this process as written and arrives at the
+ * server as something else. Keep any value destined for an ATTRIBUTE behind this as well, so that a
+ * caller cannot address a stanza to a JID the peer will never agree it named.
+ */
+export const attributeNormalizedCodepoint = (s: string): number | undefined => {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) as number;
+    if (cp === 0x9 || cp === 0xa || cp === 0xd) return cp;
+  }
+  return undefined;
+};
+
 /** The first codepoint of `s` outside XML 1.0's `Char` production, or `undefined` if all are legal. */
 const xmlIllegalCodepoint = (s: string): number | undefined => {
   for (const ch of s) {
@@ -76,7 +95,7 @@ export const assertXmlSafe = (value: string, what: string): void => {
   const cp = xmlIllegalCodepoint(value);
   if (cp !== undefined) {
     throw new Error(
-      `${what} contains U+${cp.toString(16).toUpperCase().padStart(4, '0')}, which XML forbids — ` +
+      `${what} contains ${codepointLabel(cp)}, which XML forbids — ` +
         'refusing to send it (the server would abort the stream and every MUC room this ' +
         'connection occupies with it)',
     );
