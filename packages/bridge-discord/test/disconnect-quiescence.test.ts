@@ -2,6 +2,7 @@ import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
+import { settleOf, type Settlement } from './harness.js';
 
 // CLASS: a disconnect-quiescence guard whose deletion is invisible. Two of them exist here — the
 // `isStopped` predicate net-util polls while it honours a 429, and the post-wake `stopped` check on
@@ -27,9 +28,18 @@ const freshChannelId = (): string =>
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * What teardown owes this entry point. A WRITE or a lookup cannot answer a value it never got, so it
+ * must REJECT; a bounded read holding a replayable position may answer the empty page core resumes
+ * from. Keep it per cell, so that a call quietly swapping one for the other is a failure and not
+ * just a different green.
+ */
+type Owed = 'a rejection' | 'the empty replayable page' | 'a quiet return';
+
 interface ParkedCall {
   entry: string;
   park: string;
+  owed: Owed;
   /** Path substring that is made to stall, and whose request count must freeze at teardown. */
   watched: (channelId: string) => string;
   /**
@@ -42,17 +52,43 @@ interface ParkedCall {
     topic: Topic,
     channelId: string,
     fake: FakeDiscord,
-  ) => Promise<{ settled: Promise<unknown> }>;
+  ) => Promise<{ settled: Promise<Settlement> }>;
+}
+
+const PARKED_SINCE = asCursor('1');
+
+function expectOwed(outcome: Settlement, owed: Owed): void {
+  if (owed === 'a rejection') {
+    if (outcome.status === 'resolved') {
+      return expect.fail(
+        `teardown answered ${JSON.stringify(outcome.value)} for a call that never completed`,
+      );
+    }
+    expect(outcome.error).toBeInstanceOf(Error);
+    return;
+  }
+  if (outcome.status === 'rejected') {
+    return expect.fail(`teardown rejected where the seam owes ${owed}: ${String(outcome.error)}`);
+  }
+  if (owed === 'a quiet return') {
+    expect(outcome.value).toBeUndefined();
+    return;
+  }
+  const { messages, nextCursor } = outcome.value as { messages: unknown[]; nextCursor: string };
+  expect(messages, 'a torn-down read invented messages').toEqual([]);
+  expect(nextCursor, 'the cursor moved off the position the caller must replay').toBe(PARKED_SINCE);
 }
 
 /** Every entry point reaches the same retry loop, so a 429 parks all five the same way. */
 const rateLimited = (
   entry: string,
+  owed: Owed,
   watched: (channelId: string) => string,
   run: (p: DiscordPlugin, topic: Topic) => Promise<unknown>,
 ): ParkedCall => ({
   entry,
   park: 'a 429 backoff',
+  owed,
   watched,
   start: async (p, topic, channelId, fake) => {
     fake.injectFault({
@@ -61,10 +97,7 @@ const rateLimited = (
       path: watched(channelId),
       times: 6,
     });
-    const settled = run(p, topic).then(
-      () => 'resolved',
-      () => 'rejected',
-    );
+    const settled = settleOf(run(p, topic));
     await vi.waitFor(() => expect(fake.requestCount(watched(channelId))).toBeGreaterThan(0), {
       timeout: 3000,
     });
@@ -75,32 +108,37 @@ const rateLimited = (
 const messagesOf = (channelId: string): string => `/channels/${channelId}/messages`;
 
 const PARKED: ParkedCall[] = [
-  rateLimited('post', messagesOf, (p, t) => p.post(t, SENDER, 'hi')),
-  rateLimited('fetchRecent (default window)', messagesOf, (p, t) => p.fetchRecent({ topic: t })),
-  rateLimited('fetchRecent (since)', messagesOf, (p, t) =>
-    p.fetchRecent({ topic: t, since: asCursor('1') }),
+  rateLimited('post', 'a rejection', messagesOf, (p, t) => p.post(t, SENDER, 'hi')),
+  // A since-less read has no replayable position — cursor '0' would rewind the topic to the start
+  // of history — so it is the one read that must fail loudly rather than answer an empty page.
+  rateLimited('fetchRecent (default window)', 'a rejection', messagesOf, (p, t) =>
+    p.fetchRecent({ topic: t }),
+  ),
+  rateLimited('fetchRecent (since)', 'a rejection', messagesOf, (p, t) =>
+    p.fetchRecent({ topic: t, since: PARKED_SINCE }),
   ),
   // A budget wide enough to hold the stated wait, so this cell measures the guard and not the
   // blocking path's own deadline.
-  rateLimited('fetchRecent (blockMs)', messagesOf, (p, t) =>
-    p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 60_000 }),
+  rateLimited('fetchRecent (blockMs)', 'the empty replayable page', messagesOf, (p, t) =>
+    p.fetchRecent({ topic: t, since: PARKED_SINCE, blockMs: 60_000 }),
   ),
-  rateLimited('resolveIdentity', () => '/users/@me', (p) => p.resolveIdentity(asHandle('someone'))),
+  rateLimited('resolveIdentity', 'a rejection', () => '/users/@me', (p) =>
+    p.resolveIdentity(asHandle('someone')),
+  ),
   rateLimited(
     'subscribe',
+    'a quiet return',
     (channelId) => `/channels/${channelId}`,
     (p, t) => p.subscribe(t, () => undefined),
   ),
   {
     entry: 'fetchRecent (blockMs)',
     park: 'a long-poll wait',
+    owed: 'the empty replayable page',
     watched: messagesOf,
     start: async (p, topic, channelId, fake) => {
       await p.subscribe(topic, () => undefined);
-      const settled = p.fetchRecent({ topic, since: asCursor('1'), blockMs: 60_000 }).then(
-        () => 'resolved',
-        () => 'rejected',
-      );
+      const settled = settleOf(p.fetchRecent({ topic, since: PARKED_SINCE, blockMs: 60_000 }));
       // The waiter is armed only after the first (empty) query has come back.
       await vi.waitFor(() => expect(fake.requestCount(messagesOf(channelId))).toBeGreaterThan(0), {
         timeout: 3000,
@@ -139,7 +177,7 @@ describe('disconnect() quiesces a call parked in', () => {
 
       const started = Date.now();
       await plugin.disconnect();
-      await settled;
+      expectOwed(await settled, parked.owed);
       expect(Date.now() - started, 'the parked call outlived disconnect()').toBeLessThan(SETTLE_MS);
 
       await delay(WATCH_MS);

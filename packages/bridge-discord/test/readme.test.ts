@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
+import { settleOf } from './harness.js';
 
 // CLASS: a README paragraph describing a DEPENDENCY's behaviour, with nothing binding it to that
 // dependency. The retry rule lives in net-util and has already changed once underneath this file;
@@ -109,9 +110,8 @@ describe('bridge-discord README — the gateway-failure prose is the observed be
         handshake_timeout_ms: 150,
         ...(failure.resolveUrl === true ? {} : { gateway_url: fake.gatewayUrl }),
       });
-      const attach = await plugin
-        .subscribe(topic, () => undefined)
-        .then(() => 'resolves' as const, () => 'rejects' as const);
+      const settled = await settleOf(plugin.subscribe(topic, () => undefined));
+      const attach = settled.status === 'rejected' ? 'rejects' : 'resolves';
 
       expect(attach).toBe(failure.outcome);
       for (const sentence of OUTCOMES[failure.outcome]) {

@@ -14,6 +14,7 @@ import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY, sanitizeBody } from '@sharptrick/pa
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
+import { settleOf } from './harness.js';
 import {
   BOT_USER,
   CONTENT_LIMIT,
@@ -308,8 +309,11 @@ describe('Discord REST contract', () => {
     // the topic to the beginning of history on every restart. The gateway path guards exactly this
     // (`dispatchedMessage`); the REST path is the same seam boundary and gets the same table.
     //
-    // Asserted as INVARIANTS rather than literals — refuse the page, or return only records that can
-    // carry a dedup key and a cursor — so the table still holds if the refusal ever becomes a filter.
+    // Asserted as INVARIANTS rather than literals — refuse the page, or return only records that
+    // can carry a dedup key and a cursor — so no cell pins one particular wording or status. But
+    // "every record returned is usable" is satisfied by a FILTER, which is the one outcome
+    // `pageRecords` exists to prevent: it drops a record and then hands back a cursor past where it
+    // sat. So the cells also grade what did NOT come back — see `expectNoAdvance`.
     const record = (id: unknown, content: string, channelId: string): Record<string, unknown> => ({
       ...(id === undefined ? {} : { id }),
       channel_id: channelId,
@@ -326,27 +330,44 @@ describe('Discord REST contract', () => {
       ['an array id', ['1']],
     ];
 
-    /** A well-formed newer record ahead of the bad one: Discord answers a page NEWEST-FIRST. */
+    /** Well-formed records around the bad one; Discord answers a page NEWEST-FIRST. */
+    const NEWEST_ID = '300000000000000003';
     const NEWER_ID = '300000000000000002';
+    const OLDER_ID = '300000000000000001';
 
-    const BODIES: Array<[string, (channelId: string) => unknown]> = [
-      ...BAD_IDS.map(
-        ([label, id]): [string, (channelId: string) => unknown] => [
-          `a page whose only record has ${label}`,
-          (channelId) => [record(id, 'hi', channelId)],
-        ],
+    /**
+     * WHERE on the page the unkeyable record sits. A filter drops it wherever it is, but only the
+     * positions with a usable record NEWER than it can advance the cursor past it — so the axis is
+     * the position, and every one of them is asserted against the same losslessness invariant.
+     */
+    const POSITIONS: Array<[string, (bad: Record<string, unknown>, channelId: string) => unknown[]]> = [
+      ['whose only record has', (bad) => [bad]],
+      ['whose NEWEST record has', (bad, c) => [bad, record(OLDER_ID, 'older', c)]],
+      ['whose OLDEST record has', (bad, c) => [record(NEWER_ID, 'newer', c), bad]],
+      [
+        'whose MIDDLE record has',
+        (bad, c) => [record(NEWEST_ID, 'newest', c), bad, record(OLDER_ID, 'oldest', c)],
+      ],
+    ];
+
+    interface Body {
+      label: string;
+      build: (channelId: string) => unknown;
+      /** The page carries a record whose position no cursor this plugin can mint would name. */
+      holed: boolean;
+    }
+
+    const BODIES: Body[] = [
+      ...POSITIONS.flatMap(([where, lay]) =>
+        BAD_IDS.map(([idLabel, id]): Body => ({
+          label: `a page ${where} ${idLabel}`,
+          build: (channelId) => lay(record(id, 'unkeyable', channelId), channelId),
+          holed: true,
+        })),
       ),
-      // The record the walk would SKIP: dropping it silently advances the cursor past a message
-      // core resumes strictly after, so the gap is one it can never come back for.
-      ...BAD_IDS.map(
-        ([label, id]): [string, (channelId: string) => unknown] => [
-          `a page whose OLDER record has ${label}`,
-          (channelId) => [record(NEWER_ID, 'newer', channelId), record(id, 'older', channelId)],
-        ],
-      ),
-      ['a page that is an object, not an array', () => ({ messages: [] })],
-      ['a page that is a bare string', () => 'not a page'],
-      ['a page that is null', () => null],
+      { label: 'a page that is an object, not an array', build: () => ({ messages: [] }), holed: false },
+      { label: 'a page that is a bare string', build: () => 'not a page', holed: false },
+      { label: 'a page that is null', build: () => null, holed: false },
     ];
 
     const SINCE = asCursor('1');
@@ -362,11 +383,11 @@ describe('Discord REST contract', () => {
         ],
       ];
 
+    const seamPage = (value: unknown): { messages: Array<{ backendMsgId: string; cursor: string }>; nextCursor: string } =>
+      value as { messages: Array<{ backendMsgId: string; cursor: string }>; nextCursor: string };
+
     const expectSeamSafe = (result: unknown, since: Cursor | undefined): void => {
-      const { messages, nextCursor } = result as {
-        messages: Array<{ backendMsgId: string; cursor: string }>;
-        nextCursor: string;
-      };
+      const { messages, nextCursor } = seamPage(result);
       for (const m of messages) {
         expect(typeof m.backendMsgId, 'a message crossed the seam with no dedup key').toBe('string');
         expect(m.backendMsgId).not.toBe('');
@@ -382,37 +403,53 @@ describe('Discord REST contract', () => {
       }
     };
 
-    for (const [bodyLabel, build] of BODIES) {
+    /**
+     * Losslessness, stated where no reshaping of the page reader can dodge it: a read that met a
+     * record it could not key must leave the cursor exactly where the caller had it. The dropped
+     * record's position is unknowable — that is what "no usable id" means — so any cursor past the
+     * caller's own is one core resumes STRICTLY AFTER, and the record behind it is unreachable for
+     * good. Every assertion in `expectSeamSafe` is about what came back; this one is about what did
+     * not, which is the whole reason the page is refused rather than filtered.
+     */
+    const expectNoAdvance = (result: unknown, since: Cursor | undefined): void => {
+      const { messages, nextCursor } = seamPage(result);
+      expect(
+        nextCursor,
+        `the read kept ${messages.length} message(s) and moved the cursor past a record it could ` +
+          'not key; core resumes after it and can never come back',
+      ).toBe(since === undefined ? '0' : (since as string));
+    };
+
+    for (const body of BODIES) {
       for (const [readLabel, since, run] of READS) {
-        it(`${readLabel} on ${bodyLabel} keeps the seam's keys usable`, async () => {
+        it(`${readLabel} on ${body.label} keeps the seam's keys usable`, async () => {
           const t = liveTopic();
           fake.injectFault({
             status: 200,
-            body: build(t as string),
+            body: body.build(t as string),
             path: `/channels/${t as string}/messages`,
             times: 4,
           });
-          const outcome = await run(plugin, t).then(
-            (value) => ({ value }),
-            (err: unknown) => ({ err }),
-          );
-          if ('err' in outcome) {
+          const outcome = await settleOf(run(plugin, t));
+          if (outcome.status === 'rejected') {
             // Refusing is the other legal answer — but it must be a real failure, not the seam's
             // absent-topic classification, which core reads as "this topic does not exist yet",
             // and it must name the call: the message becomes an `isError` tool result in a model's
             // context, where a bare `body.filter is not a function` is unactionable.
-            expect(outcome.err).toBeInstanceOf(Error);
-            expect(outcome.err).not.toBeInstanceOf(NoSuchTopicError);
-            expect(String(outcome.err)).toContain('Discord');
+            expect(outcome.error).toBeInstanceOf(Error);
+            expect(outcome.error).not.toBeInstanceOf(NoSuchTopicError);
+            expect(String(outcome.error)).toContain('Discord');
             return;
           }
           expectSeamSafe(outcome.value, since);
+          if (body.holed) expectNoAdvance(outcome.value, since);
         });
       }
     }
 
     // A CONTROL: the same table's machinery on a WELL-FORMED page must still deliver, so no cell
-    // above can pass by a plugin that refuses every 200 it is handed.
+    // above can pass by a plugin that refuses every 200 it is handed — and `expectNoAdvance` is
+    // deliberately NOT applied here, so a plugin that never advances any cursor still loses this.
     it('a well-formed page still crosses the seam', async () => {
       const t = liveTopic();
       fake.injectFault({
@@ -423,6 +460,7 @@ describe('Discord REST contract', () => {
       });
       const result = await plugin.fetchRecent({ topic: t, since: SINCE, limit: 250 });
       expect(result.messages.map((m) => m.content)).toEqual(['newer']);
+      expect(result.nextCursor as string).toBe(NEWER_ID);
       expectSeamSafe(result, SINCE);
     });
 
@@ -439,11 +477,9 @@ describe('Discord REST contract', () => {
       it(`post rejects a 200 with ${label} rather than resolving one`, async () => {
         const t = liveTopic();
         fake.injectFault({ status: 200, body, path: `/channels/${t as string}/messages` });
-        const outcome = await plugin
-          .post(t, SENDER, 'hi')
-          .then((value) => ({ value }), (err: unknown) => ({ err }));
-        if ('err' in outcome) {
-          expect(outcome.err).toBeInstanceOf(Error);
+        const outcome = await settleOf(plugin.post(t, SENDER, 'hi'));
+        if (outcome.status === 'rejected') {
+          expect(outcome.error).toBeInstanceOf(Error);
           return;
         }
         // A BackendMsgId that is not a usable string is what core dedups and replies on.
@@ -726,7 +762,8 @@ describe('Discord REST contract', () => {
             const { p, topic } = await arrange(id);
             const before = fake.requests().length;
             try {
-              const err = await run(p, topic).then(() => undefined, (e: unknown) => e);
+              const settled = await settleOf(run(p, topic));
+              const err = settled.status === 'rejected' ? settled.error : undefined;
               expectStayedOnRoute(fake.requests().slice(before), id, escapes === true, err);
             } finally {
               if (p !== plugin) await p.disconnect();
@@ -1185,16 +1222,14 @@ describe('Discord REST contract', () => {
           try {
             fake.injectFault({ status: 200, rawBody, path: call.path(topic as string) });
             const pushed: string[] = [];
-            const outcome = await call
-              .meet(p, topic, pushed)
-              .then((value) => ({ value }), (err: unknown) => ({ err }));
+            const outcome = await settleOf(call.meet(p, topic, pushed));
 
-            if ('err' in outcome) {
+            if (outcome.status === 'rejected') {
               expect(call.mustResolve, `${call.label} rejected, which costs every other topic`)
                 .toBeUndefined();
-              expect(outcome.err).toBeInstanceOf(Error);
+              expect(outcome.error).toBeInstanceOf(Error);
               // A malformed body is not a topic that does not exist yet; core would skip the topic.
-              expect(outcome.err).not.toBeInstanceOf(NoSuchTopicError);
+              expect(outcome.error).not.toBeInstanceOf(NoSuchTopicError);
             } else {
               call.trusted?.(outcome.value);
             }

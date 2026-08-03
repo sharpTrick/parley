@@ -13,7 +13,7 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { DEFAULT_DEADLINE_MS, sanitizeBody } from '@sharptrick/parley-net-util';
-import { newestWindow, windowSince, type PageFn } from './catchup.js';
+import { newestWindow, outOfBudget, windowSince, type PageFn } from './catchup.js';
 import { reasonOf, warn } from './diagnostics.js';
 import { TerminalGatewayCloseError } from './ladder.js';
 import { DiscordSession } from './session.js';
@@ -126,17 +126,21 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
   }
 
   /**
-   * One catch-up walk bounded by the long-poll's own `deadline`: a budget spent while a query was
-   * in flight answers the empty replayable page. Keep the swallow behind an EXPIRED clock and let
-   * an ABSENT TOPIC through it whatever the clock says, so that bounding this leg can hide neither
-   * a real 404 or 500 nor a seam classification the caller has to act on.
+   * One catch-up walk bounded by the long-poll's own `deadline`: a budget spent, or refused, while
+   * a query was in flight answers the empty replayable page. Keep the swallow behind
+   * {@link outOfBudget} and let an ABSENT TOPIC through it whatever the budget says, so that
+   * bounding this leg can hide neither a real 404 or 500 nor a seam classification the caller has
+   * to act on.
    */
   private async fetchWithin(walk: Catchup): Promise<FetchRecentResult> {
     try {
       return await this.fetchSince(walk);
     } catch (err) {
       if (err instanceof NoSuchTopicError) throw err;
-      if (Date.now() >= walk.deadline) return { messages: [], nextCursor: walk.since };
+      const named = JSON.stringify(walk.topic as string);
+      if (outOfBudget(err, walk.deadline, `catch-up on topic ${named}`)) {
+        return { messages: [], nextCursor: walk.since };
+      }
       throw err;
     }
   }

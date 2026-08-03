@@ -1,7 +1,21 @@
 import { NoSuchTopicError } from '@sharptrick/parley-core';
+import { statusOf } from '@sharptrick/parley-net-util';
+import { reasonOf, warn } from './diagnostics.js';
 import { PAGE_LIMIT, type DiscordMessage } from './wire.js';
 
 export type PageFn = (query: string, budgetMs: number) => Promise<DiscordMessage[]>;
+
+/**
+ * True when a bounded read may answer with what it has instead of failing: its clock is spent, or
+ * the provider refused a wait the budget could not hold. Keep the rate limit in it, so that ONE
+ * routine 429 — which net-util refuses the instant the stated wait outgrows what is left, long
+ * before the clock runs out — cannot end a whole long-poll as an agent-facing tool error.
+ */
+export function outOfBudget(err: unknown, deadline: number, what: string): boolean {
+  if (statusOf(err) !== 429) return Date.now() >= deadline;
+  warn(`${what} is rate limited (${reasonOf(err)}); answering the page it has, to resume from`);
+  return true;
+}
 
 /**
  * The floor under the FIRST query's budget. Keep it above zero, so that whether an absent channel
@@ -56,7 +70,7 @@ async function walk(
  * The `n`th page of a walk sharing ONE absolute `deadline`, or undefined once that deadline has
  * ended the walk. Re-read the clock PER PAGE, so that a limit spanning N pages cannot spend N times
  * the budget the caller set. Page ZERO runs even on a spent budget, so that no call answers an
- * empty window without asking; a later page failing past the deadline ends the walk instead of
+ * empty window without asking; a later page the budget cannot pay for ends the walk instead of
  * failing it, so a bounded call still answers with what it gathered and a cursor to resume from.
  */
 async function pageWithin(
@@ -71,7 +85,8 @@ async function pageWithin(
   try {
     return await page(query, budget);
   } catch (err) {
-    if (n === 0 || err instanceof NoSuchTopicError || Date.now() < deadline) throw err;
+    if (n === 0 || err instanceof NoSuchTopicError) throw err;
+    if (!outOfBudget(err, deadline, `the walk at ${query}`)) throw err;
     return undefined;
   }
 }

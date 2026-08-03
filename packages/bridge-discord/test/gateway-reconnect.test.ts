@@ -27,6 +27,7 @@ import {
   NO_HANDSHAKE_TIMEOUT,
   openedSocket,
   reachReady,
+  settleOf,
   stubFetch,
   URL_SOURCES,
   type FetchStub,
@@ -339,15 +340,10 @@ describe('a socket that ends releases its own heartbeat, before any disconnect()
 /** Observe a promise's settlement without awaiting it (fake timers drive the clock). */
 function track<T>(p: Promise<T>): { settled: boolean; error?: unknown } {
   const state: { settled: boolean; error?: unknown } = { settled: false };
-  p.then(
-    () => {
-      state.settled = true;
-    },
-    (e: unknown) => {
-      state.settled = true;
-      state.error = e;
-    },
-  );
+  void settleOf(p).then((outcome) => {
+    state.settled = true;
+    if (outcome.status === 'rejected') state.error = outcome.error;
+  });
   return state;
 }
 

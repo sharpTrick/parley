@@ -9,6 +9,23 @@ import { vi } from 'vitest';
 import type { DiscordPlugin } from '../src/index.js';
 import { instances, REQUIRED_GATEWAY_QUERY, type FakeWs } from './fake-gateway.js';
 
+/**
+ * A settled promise, kept AS a settlement. Keep the union DISCRIMINATED, so that no case can read a
+ * value or an error without first naming which settlement it expected: a helper that folds both
+ * arms into one value lets a table grade latency, or a request count, while the call under it
+ * rejects — and every such cell stays green whatever the plugin does.
+ */
+export type Settlement =
+  | { status: 'resolved'; value: unknown }
+  | { status: 'rejected'; error: unknown };
+
+/** The ONE way this package observes a settlement; `fixture-hygiene.test.ts` refuses a second. */
+export const settleOf = (call: Promise<unknown>): Promise<Settlement> =>
+  call.then(
+    (value): Settlement => ({ status: 'resolved', value }),
+    (error: unknown): Settlement => ({ status: 'rejected', error }),
+  );
+
 /** Large enough that a socket's heartbeat interval never fires inside a case. */
 export const HUGE_HB = 1_000_000;
 /**
