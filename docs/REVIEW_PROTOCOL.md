@@ -252,6 +252,14 @@ So an agent **may stand up its own throwaway containers**, under three rules:
 - **Never touch a container it did not create.** The shared `parley-dev-*` set belongs to the
   orchestrator. Use a distinct name and a distinct published port, so nothing collides with the
   shared instance or with a sibling agent.
+
+  *"Touch" means administer, not address.* Connecting to a shared service the way this repo's own
+  live suites connect — a client session on a fresh, randomly-named topic or room — is exactly what
+  those suites do and is expected. Restarting it, reconfiguring it, changing its data at rest, or
+  driving a shared **stable** room is not: round 2 lost four conformance results to foreign traffic
+  legitimately advancing the Matrix cursor in the shared `parley_conformance` room, which the
+  stability assertion cannot distinguish from a defect. If two agents could collide on one name,
+  that name has to be random or the container has to be yours.
 - **Tear down what you start,** and say in your report what you started and that it is gone.
 
 Reuse the image and flags from `examples/dev-compose/docker-compose.yml` rather than inventing a
