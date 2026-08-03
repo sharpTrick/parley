@@ -305,11 +305,17 @@ The round-2 reading is kept below it, unedited, so the two can be compared.
   has just found a lost wakeup files that instead. If that is right, ouroboros's *"convergence was
   gated by maintainability running out of nits"* is substantially an artifact of partitioning by
   lens, and this run's partition is what exposes it.
-- **E3 (cost per confirmed finding rises) — CONFIRMED, on the denominator that matters.** Per
-  *confirmed* finding it is flat (~30–38K tokens, rounds 7–15) because the loop keeps finding its own
-  output. Per **pre-existing** finding it rises: 88K, 83K, 99K, 133K (rounds 7–10) and 160K at round
-  15. Per pre-existing *blocking* finding: 238K, 295K, 234K, 315K, **534K**. The decay is real and it
-  is invisible in the headline count.
+- **E3 (cost per confirmed finding rises monotonically-ish) — CONTRADICTED after an early rise.**
+  Per *confirmed* finding it is flat (~30–38K tokens, rounds 7–16), because the loop keeps finding its
+  own output. On the denominator that matters — tokens per **pre-existing blocking** finding — the
+  series is **106K (R4), 238K, 295K, 234K, 315K (R7–10), 313K (R16)**. Cost roughly tripled between
+  round 4 and round 7 and has then held flat for **nine rounds**.
+
+  *An earlier version of this entry called E3 confirmed and cited a rise to 534K at round 15. That
+  number divided by the same inflated denominator corrected above; with round 16's it is 313K, in
+  line with rounds 7–10.* The honest shape is an early rise to a plateau, not a decay — and the
+  plateau is the more interesting result, because it says the loop keeps returning roughly ten
+  pre-existing blocking defects per round at ~300K tokens each with no sign of the rate degrading.
 - **E4 (quiescence cuts tail cost and loses recall) — UNTESTABLE, and that is the result.**
   Quiescence has **never fired in fifteen rounds**. Every target returned confirmed findings every
   round, so nothing was ever eligible to sleep. The pre-registered question was *can a review loop

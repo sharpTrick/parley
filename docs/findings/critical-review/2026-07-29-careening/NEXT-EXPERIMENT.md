@@ -29,13 +29,17 @@ separate, because blocking findings are exactly what does not run out. A next ex
 spend a variable on stop-rule design; it should spend it on a **budget**, which is the only stop
 condition the data supports.
 
-**3. Cost per pre-existing blocking defect is the number, and it rises.** 238K, 295K, 234K, 315K
-tokens (rounds 7–10), **534K** at round 15. Cost per *confirmed* finding is flat — because the loop
-keeps finding its own output — so the headline count actively conceals the decay. By round 13 and 15,
-81–83% of all findings are lines the experiment itself last touched.
+**3. Cost per pre-existing blocking defect rose early and has been flat for nine rounds.** Tokens per
+pre-existing blocking finding: **106K (R4), 238K, 295K, 234K, 315K (R7–10), 313K (R16)**. Cost per
+*confirmed* finding is flat too (~30–38K), because the loop keeps finding its own output — by rounds
+13–16, 74–83% of all findings are lines the experiment itself last touched.
 
-Anyone budgeting an automated review pipeline should budget in pre-existing blocking defects per
-megatoken, and should expect that rate to halve every few rounds.
+*This section previously read "and it rises", citing 534K at round 15. That figure divided by a
+denominator inflated by decomposition-relocation blame; round 16 puts it at 313K.* The corrected
+shape matters for the recommendation: an automated pipeline on a surface like this does **not** face
+a rate that degrades round over round. It faces a **flat rate** — roughly ten pre-existing blocking
+defects per round at ~300K tokens each, sustained across nine rounds, a decomposition of eleven
+packages, and an instrument change. Budget in defects per megatoken, and expect the rate to hold.
 
 **4. Critics find well and prescribe badly, and only another agent catches it.** Findings were
 reliably real — round 13's 33 blocking findings all reproduced, none spurious. The *remediations*
@@ -130,6 +134,7 @@ the failures nobody has hit yet.
   except the four oracles.
 - **The same session authored the substrate these critics reviewed.** Fresh contexts per critic
   mitigate; they do not eliminate.
-- **Rounds 16–20 are not in.** In particular, the pre-existing-blocking series sitting at 6 twice is
-  the only evidence for exhaustion in the whole run, it rests on two points, and both are floors
-  inflated by decomposition-relocation blame.
+- **Rounds 17–20 are not in.** Round 16 has already corrected two claims in this document within
+  hours of its being written — the exhaustion signal and the cost trend — both in the direction the
+  stated caveats predicted. That is the process working, and it is also a warning about how much
+  weight any two-point trend here can carry.
