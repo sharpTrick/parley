@@ -19,6 +19,43 @@ export { DEFAULT_ROSTER_LIMIT, PRESENCE_FETCH_LIMIT } from './list-users-tool.js
  */
 export const MAX_FETCH_LIMIT = 1_000;
 
+/**
+ * The prose core ships to the model, for each tool and for each argument that carries one — the
+ * whole of it except the per-deployment allowlist sentence appended at registration.
+ *
+ * Exported as a VALUE because a backend README that adds sentences of its own about a core-owned
+ * tool (`block_ms`, the `since` convention, the absent-topic answer) has to be gradable against
+ * what core actually sends. The alternative a plugin's suite reached for was a regex over
+ * `bridge-core/src/transport/tools.ts` read by relative path, which reddens that plugin when this
+ * file moves and reports the failure against the wrong package.
+ */
+export const TOOL_TEXT = {
+  fetch_recent:
+    'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
+    'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor } — ' +
+    'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
+    'does not exist yet, or the long-poll was cancelled); re-issue without `since` in that case. ' +
+    'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
+    'long-poll: if the queried window is empty — whether or not you passed `since` — the call ' +
+    'holds until a message arrives or the timeout elapses (capped server-side), so a polling ' +
+    'agent burns tokens per message, not per tick. A topic that does not exist on the backend ' +
+    'yet returns an empty page with `topicAbsent: true` rather than an error.',
+  fetch_recent_since:
+    'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
+  fetch_recent_block_ms:
+    'Long-poll budget in ms. If the queried window is empty — whether or not you passed ' +
+    '`since` — hold up to this long for a new message before returning (possibly empty). ' +
+    'Clamped server-side. 0 / omit = return the window at once, empty or not.',
+  post:
+    'Publish a message into a topic on the durable backend so humans and other instances see it. ' +
+    'Use this for handoffs and output. Returns { backendMsgId }.',
+  reply:
+    'Reply into the topic a <channel> message arrived from. Pass the same `topic`. The reply is ' +
+    'written durably to the backend so it survives restart and appears in the next catch-up — the ' +
+    'live channel is only the fast inbound hop, replies always write to the backend. Returns ' +
+    '{ backendMsgId }.',
+} as const;
+
 /** Shared durable write path for both `parley_post` and `parley_reply`. */
 async function doPost(
   deps: ToolDeps,
@@ -50,25 +87,13 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
   server.registerTool(
     'parley_fetch_recent',
     {
-      description:
-        'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
-        'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor } — ' +
-        'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
-        'does not exist yet, or the long-poll was cancelled); re-issue without `since` in that case. ' +
-        'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
-        'long-poll: if the queried window is empty — whether or not you passed `since` — the call ' +
-        'holds until a message arrives or the timeout elapses (capped server-side), so a polling ' +
-        'agent burns tokens per message, not per tick. A topic that does not exist on the backend ' +
-        'yet returns an empty page with `topicAbsent: true` rather than an error.' +
-        describeAllowed(allow),
+      description: TOOL_TEXT.fetch_recent + describeAllowed(allow),
       inputSchema: {
         topic: topicSchema(allow, 'Topic to read (must be on the allowlist).'),
         since: z
           .string()
           .optional()
-          .describe(
-            'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
-          ),
+          .describe(TOOL_TEXT.fetch_recent_since),
         limit: z
           .number()
           .int()
@@ -80,11 +105,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
           .int()
           .nonnegative()
           .optional()
-          .describe(
-            'Long-poll budget in ms. If the queried window is empty — whether or not you passed ' +
-              '`since` — hold up to this long for a new message before returning (possibly empty). ' +
-              'Clamped server-side. 0 / omit = return the window at once, empty or not.',
-          ),
+          .describe(TOOL_TEXT.fetch_recent_block_ms),
       },
     },
     async ({ topic, since, limit, block_ms }, extra) => {
@@ -130,10 +151,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
   server.registerTool(
     'parley_post',
     {
-      description:
-        'Publish a message into a topic on the durable backend so humans and other instances see it. ' +
-        'Use this for handoffs and output. Returns { backendMsgId }.' +
-        describeAllowed(allow),
+      description: TOOL_TEXT.post + describeAllowed(allow),
       inputSchema: {
         topic: topicSchema(allow, 'Topic to post into (must be on the allowlist).'),
         content: z.string().describe('Message body.'),
@@ -152,11 +170,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
   server.registerTool(
     'parley_reply',
     {
-      description:
-        'Reply into the topic a <channel> message arrived from. Pass the same `topic`. The reply is ' +
-        'written durably to the backend so it survives restart and appears in the next catch-up — the ' +
-        'live channel is only the fast inbound hop, replies always write to the backend. Returns ' +
-        `{ backendMsgId }. Subscribed topics: ${topicList(allow)}.`,
+      description: `${TOOL_TEXT.reply} Subscribed topics: ${topicList(allow)}.`,
       inputSchema: {
         // No enum: a reply targets whatever topic the inbound <channel> arrived from. Runtime
         // membership is still enforced by `allow.assert` in doPost.

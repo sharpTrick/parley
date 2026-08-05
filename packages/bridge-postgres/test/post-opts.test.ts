@@ -1,8 +1,9 @@
-import { readFileSync } from 'node:fs';
 import {
+  asBackendMsgId,
   asHandle,
   asTopic,
   type BackendMsgId,
+  type BackendPlugin,
   type Handle,
   type Topic,
 } from '@sharptrick/parley-core';
@@ -17,23 +18,16 @@ import { dropTable, isUp, PG_URL, rand, withAdmin } from './pg-harness.js';
 // the only place the stored value is observable — and the key set is read out of the seam, so an
 // argument added there cannot be accepted by this plugin and silently discarded.
 
-const SEAM = readFileSync(new URL('../../bridge-core/src/seam.ts', import.meta.url), 'utf8');
+type PostOpts = NonNullable<Parameters<BackendPlugin['post']>[3]>;
 
-const POST_OPTS = [
-  ...(/\bpost\(\s*topic: Topic,[\s\S]*?opts\?: \{([^}]*)\}/.exec(SEAM)?.[1] ?? '').matchAll(
-    /(\w+)\??\s*:/g,
-  ),
-]
-  .map((m) => m[1] as string)
-  .sort();
-
-describe('the seam pins which post() arguments this file has to grade', () => {
-  it('post() takes exactly the opts keys graded below', () => {
-    expect(POST_OPTS, 'a new post() opts key needs a persistence cell in this file').toEqual([
-      'inReplyTo',
-    ]);
-  });
-});
+/**
+ * Where each `post()` opts key lands in this backend's table. Keyed off the seam TYPE — imported,
+ * never read out of `bridge-core/src/seam.ts` as text: a regex over a sibling package's source
+ * reddens THIS package when core renames a parameter, and reports the failure against the wrong
+ * one. `satisfies` grades both directions at compile time: a key added to the seam with no column
+ * here does not build, and a column for a key the seam never declared does not either.
+ */
+const PERSISTED_COLUMN = { inReplyTo: 'in_reply_to' } satisfies Record<keyof PostOpts, string>;
 
 interface Anchors {
   sameTopic: BackendMsgId;
@@ -71,13 +65,31 @@ const TABLES = ['an ordinary name', 'a reserved word'] as const;
 
 /** The stored column, per row of `topic`, in cursor order — invisible to every seam read path. */
 async function storedReplies(table: string, topic: Topic): Promise<(string | null)[]> {
+  const column = PERSISTED_COLUMN.inReplyTo;
   return withAdmin(async (admin) => {
-    const res = await admin.query(`SELECT in_reply_to FROM "${table}" WHERE topic = $1 ORDER BY seq`, [
-      topic,
-    ]);
-    return (res.rows as { in_reply_to: string | null }[]).map((r) => r.in_reply_to);
+    const res = await admin.query(
+      `SELECT "${column}" AS stored FROM "${table}" WHERE topic = $1 ORDER BY seq`,
+      [topic],
+    );
+    return (res.rows as { stored: string | null }[]).map((r) => r.stored);
   });
 }
+
+describe('the seam pins which post() arguments this file has to grade', () => {
+  const SAMPLE: Anchors = {
+    sameTopic: asBackendMsgId('1'),
+    otherTopic: asBackendMsgId('2'),
+  };
+
+  it('every opts key the seam declares is passed by a threading row and read back from a column', () => {
+    const exercised = [
+      ...new Set(THREADINGS.flatMap((t) => Object.keys(t.opts(SAMPLE) ?? {}))),
+    ].sort();
+    expect(exercised, 'a new post() opts key needs a persistence cell in this file').toEqual(
+      Object.keys(PERSISTED_COLUMN).sort(),
+    );
+  });
+});
 
 const CELLS = TABLES.flatMap((table) => THREADINGS.map((threading) => ({ table, threading })));
 

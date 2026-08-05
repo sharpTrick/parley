@@ -3,8 +3,7 @@ import { createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-// Vitest runs against package sources, so the internal test helper is importable here.
-import { startFakeOidc, type FakeOidc } from '../../../packages/bridge-core/src/testing/fake-oidc.js';
+import { startFakeOidc, type FakeOidc } from '@sharptrick/parley-core';
 import { startRemoteServer, type RemoteServerHandle } from '../server.js';
 
 function freePort(): Promise<number> {

@@ -61,7 +61,19 @@ export {
 export { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
-export { registerTools, toolDepsFor, type ToolDeps } from './transport/tools.js';
+export { registerTools, toolDepsFor, TOOL_TEXT, type ToolDeps } from './transport/tools.js';
+// The one entrypoint every backend `bin` runs: argv, config, bridge, teardown. The plugin arrives
+// as an argument, so nothing here depends on a backend.
+export {
+  installShutdown,
+  parseArgs,
+  runBackendCli,
+  usageFor,
+  type BackendCliOptions,
+  type ParseArgsOptions,
+  type ParsedArgs,
+  type ShutdownHost,
+} from './cli/backend-cli.js';
 export {
   emitChannel,
   channelMeta,
@@ -112,3 +124,9 @@ export {
   type RemoteAuthOptions,
   type RemoteAuthServer,
 } from './auth/remote-auth.js';
+
+// A fake OIDC issuer, for wiring an external-IdP deployment up in a test without one. It ships in
+// the tarball either way (`src/testing` is compiled, only `*.test.ts` is excluded); named here so
+// that reaching it does not mean a relative path into this package's `src/`, which pins a consumer
+// to core's internal layout.
+export { startFakeOidc, type FakeOidc, type FakeOidcClaims } from './testing/fake-oidc.js';
