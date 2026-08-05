@@ -1,19 +1,24 @@
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 /**
- * CLASS: source comments must not narrate tracker history. A `BUG-nn` / `SEC-nn` / `issue #nn` tag
- * is unresolvable from the published package, and the paragraph attached to it is rationale that
- * CLAUDE.md routes to the commit message — where it cannot rot against the code it describes. The
- * same text living in a comment, a README and a JSDoc block is three copies that can disagree.
+ * Rules about this package's source that are STRICTER than the repo-wide ones. Tracker tags are
+ * graded for every package by `bridge-core/src/source-hygiene.test.ts`; a copy here would be a
+ * second implementation of one rule, with its own universe to fall behind in.
  */
 
-const SRC = fileURLToPath(new URL('../src', import.meta.url));
-const TRACKER_TAG = /\b(BUG|SEC|CX|ISSUE)[-\s#]*\d+/i;
+/** Every `.ts` under `dir` at ANY depth, so a new subdirectory is a linted row the day it appears. */
+const sourcesUnder = (dir: string): string[] =>
+  readdirSync(dir, { recursive: true })
+    .map(String)
+    .map((f) => f.split(sep).join('/'))
+    .filter((f) => f.endsWith('.ts'));
 
-const sources = readdirSync(SRC).filter((f) => f.endsWith('.ts'));
+const SRC = fileURLToPath(new URL('../src', import.meta.url));
+const sources = sourcesUnder(SRC);
 
 /** Every comment block in a file: consecutive `//` lines are one block, as is each `/** … *\/`. */
 function commentBlocks(source: string): string[] {
@@ -77,21 +82,10 @@ function restatedSpans(source: string): string[] {
   return [...repeated];
 }
 
-describe('source comments carry no tracker history', () => {
+describe('the lint sees the package source', () => {
   it('finds the source files it is meant to scan', () => {
     expect(sources.length).toBeGreaterThan(0);
   });
-
-  for (const file of sources) {
-    it(`${file} names no tracker id`, () => {
-      const offenders = readFileSync(join(SRC, file), 'utf8')
-        .split('\n')
-        .map((line, i) => ({ line, n: i + 1 }))
-        .filter(({ line }) => TRACKER_TAG.test(line));
-
-      expect(offenders.map(({ n, line }) => `${file}:${n}: ${line.trim()}`)).toEqual([]);
-    });
-  }
 });
 
 /**
@@ -196,4 +190,22 @@ describe('no import is dead', () => {
       expect(unusedImports(readFileSync(join(SRC, file), 'utf8'))).toEqual([]);
     });
   }
+});
+
+/**
+ * The walk against a tree built to defeat a flat one — run through the SAME function the lint runs
+ * through, never a second listing typed out here. A `readdirSync(SRC)` that does not recurse keeps
+ * passing the day this package grows an `src/` subdirectory, and a `files.length > 0` guard cannot
+ * tell that from a full scan.
+ */
+describe('the lint sees every source file, at every depth', () => {
+  it('descends into subdirectories', () => {
+    const root = mkdtempSync(join(tmpdir(), 'matrix-lint-'));
+    mkdirSync(join(root, 'a', 'b'), { recursive: true });
+    writeFileSync(join(root, 'a', 'b', 'deep.ts'), 'export const x = 1;\n');
+    writeFileSync(join(root, 'shallow.ts'), 'export const y = 1;\n');
+    writeFileSync(join(root, 'notes.md'), 'not a source\n');
+    expect(sourcesUnder(root).sort()).toEqual(['a/b/deep.ts', 'shallow.ts']);
+    rmSync(root, { recursive: true, force: true });
+  });
 });

@@ -1,7 +1,9 @@
 /**
- * CLAUDE.md puts review history, tracker IDs and alternatives-considered prose in the COMMIT
- * message: a comment that argues a case or cites a finding rots against the code and cannot be read
- * where a reader looks for history. A comment earns its place only by warning about a risk.
+ * CLAUDE.md puts review history and alternatives-considered prose in the COMMIT message: a comment
+ * that argues a case rots against the code and cannot be read where a reader looks for history. A
+ * comment earns its place only by warning about a risk. Tracker tags and quoted measurements are
+ * graded for every package by `bridge-core/src/source-hygiene.test.ts` — a copy here would be a
+ * second implementation of one rule, with its own universe to fall behind in.
  *
  * Two things make a lint like this decay into a green no-op, and both are graded here rather than
  * assumed. Its UNIVERSE: a walk that reads only the top level of `src/` keeps passing the day the
@@ -38,25 +40,6 @@ interface Rule {
 }
 
 const RULES: Rule[] = [
-  {
-    name: 'a tracker or finding ID',
-    re: /\b(BUG|SEC|ISSUE|FINDING|TICKET)[-\s]?\d+\b/i,
-    fires: [
-      '// TICKET-4 asked for this clamp.',
-      '// FINDING 12 says otherwise.',
-      '// BUG-9 is back.',
-    ],
-    passes: ['// a bug in the decoder, not the encoder.', '// section 4 of the design.'],
-  },
-  {
-    name: 'an issue reference',
-    re: /\bissues?\s*#\d+\b/i,
-    fires: ['// tracked in issues #12 and #13.', '// see issue #42.'],
-    passes: [
-      '// one issue with snowflakes: they are not lexically comparable.',
-      '// posted to the #discord channel.',
-    ],
-  },
   {
     name: 'a rejected alternative',
     re: /\b(instead would|would have been|we chose|rather than doing)\b/i,
@@ -100,15 +83,6 @@ const RULES: Rule[] = [
       '// The instance id used to namespace per-instance read state.',
       '// `server_name`, used to build room aliases.',
       '// the cursor used to page the channel is opaque to core.',
-    ],
-  },
-  {
-    name: 'a measurement',
-    re: /\b(was measured at|benchmarked at|measured \d+\s*(ms|s)\b)/i,
-    fires: ['// was measured at 4ms against the fixture.', '// benchmarked at 12k frames a second.'],
-    passes: [
-      '// The budget is 4ms, so that a slow page cannot outlive the poll it serves.',
-      '// Measure the page before trusting the cap.',
     ],
   },
 ];

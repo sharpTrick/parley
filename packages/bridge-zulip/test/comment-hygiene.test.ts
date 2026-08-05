@@ -1,24 +1,31 @@
 /**
- * CLAUDE.md puts review history, tracker IDs and alternatives-considered prose in the COMMIT
- * message: a comment that argues with a reviewer or cites a finding rots against the code and
- * cannot be read where a reader looks for history. A comment earns its place only by warning about
- * a risk. This lints the package's own source so the class cannot creep back in one line at a time.
+ * CLAUDE.md puts review history and alternatives-considered prose in the COMMIT message: a comment
+ * that argues with a reviewer rots against the code and cannot be read where a reader looks for
+ * history. A comment earns its place only by warning about a risk.
  *
- * Two shapes beyond the phrase blacklist, because the blacklist could not see either: prose that
- * ARGUES a choice is safe rather than warning about a risk, and prose DUPLICATED from the README,
- * where the copy rots independently of the original.
+ * Only what is STRICTER than the repo-wide lint is here. Tracker and issue tags are graded for
+ * every package by `bridge-core/src/source-hygiene.test.ts`; what remains is prose that ARGUES a
+ * choice is safe rather than warning about a risk, and prose DUPLICATED from the README, where the
+ * copy rots independently of the original.
  */
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+
+/** Every `.ts` under `dir` at ANY depth, so a new subdirectory is a linted row the day it appears. */
+const sourcesUnder = (dir: string): string[] =>
+  readdirSync(dir, { recursive: true })
+    .map(String)
+    .map((f) => f.split(sep).join('/'))
+    .filter((f) => f.endsWith('.ts'));
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
 const README = fileURLToPath(new URL('../README.md', import.meta.url));
 
 /** Each pattern is a shape of comment that belongs in a commit message instead. */
 const BANNED = [
-  { name: 'a tracker or finding ID', re: /\b(BUG|SEC|ISSUE|FINDING|TICKET)[-\s]?\d+\b/i },
-  { name: 'an issue reference', re: /\bissues?\s*#\d+\b/i },
   { name: 'a rejected alternative', re: /\b(instead would|would have been|we chose|rather than doing)\b/i },
   { name: 'a note addressed to a reviewer', re: /\b(reviewer|as (?:discussed|requested)|per review)\b/i },
   {
@@ -68,7 +75,7 @@ function commentLines(source: string): Array<{ line: number; text: string }> {
 }
 
 describe('zulip source comments carry risks, not history', () => {
-  const files = readdirSync(SRC).filter((f) => f.endsWith('.ts'));
+  const files = sourcesUnder(SRC);
 
   it('finds the package source to lint', () => {
     expect(files.length).toBeGreaterThan(0);
@@ -95,4 +102,22 @@ describe('zulip source comments carry risks, not history', () => {
       expect(shared).toEqual([]);
     });
   }
+});
+
+/**
+ * The walk against a tree built to defeat a flat one — run through the SAME function the lint runs
+ * through, never a second listing typed out here. A `readdirSync(SRC)` that does not recurse keeps
+ * passing the day this package grows an `src/` subdirectory, and a `files.length > 0` guard cannot
+ * tell that from a full scan.
+ */
+describe('the lint sees every source file, at every depth', () => {
+  it('descends into subdirectories', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zulip-lint-'));
+    mkdirSync(join(root, 'a', 'b'), { recursive: true });
+    writeFileSync(join(root, 'a', 'b', 'deep.ts'), 'export const x = 1;\n');
+    writeFileSync(join(root, 'shallow.ts'), 'export const y = 1;\n');
+    writeFileSync(join(root, 'notes.md'), 'not a source\n');
+    expect(sourcesUnder(root).sort()).toEqual(['a/b/deep.ts', 'shallow.ts']);
+    rmSync(root, { recursive: true, force: true });
+  });
 });

@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -61,7 +62,8 @@ describe('source hygiene', () => {
    *
    * `docs/findings/` is exempt, so that archived findings records can quote code as it stood.
    */
-  const TRACKER = /\b(?:BUG|SEC|CX|D)-\d+\b|\bissue #\d+/;
+  const TRACKER =
+    /\b(?:BUG|SEC|CX|D|FIX|ISSUE|FINDING|TICKET)[-#]\d+\b|\b(?:BUG|FIX|FINDING|TICKET)\s\d+\b|\bissues?\s*#\d+\b/i;
   const codeFiles = files.filter(
     (f) =>
       ['.ts', '.js', '.mjs', '.cjs'].includes(extname(f)) &&
@@ -71,6 +73,50 @@ describe('source hygiene', () => {
 
   it('finds code files to check (guards against a broken filter)', () => {
     expect(codeFiles.length).toBeGreaterThan(50);
+  });
+
+  /**
+   * The UNIVERSE, which is the half of a lint like this that decays in silence. The same rule was
+   * re-implemented in five packages, three of them over a flat `readdirSync(src)` — a walk that
+   * keeps passing the day the package grows a subdirectory, and that a `files.length > 0` guard
+   * cannot tell from a full scan. Eight of thirteen packages had no such lint at all.
+   *
+   * So assert what the rules below are actually applied to: EVERY workspace package, and a file
+   * nested more than one directory down. Both derived — the package set from `workspaces`, the
+   * depth from the tree — so neither can be satisfied by the layout happening to be flat today.
+   */
+  it('reaches every workspace package, at every depth', () => {
+    const areas = [
+      ...new Set(
+        (
+          JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as { workspaces?: string[] }
+        ).workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [],
+      ),
+    ];
+    expect(areas.length).toBeGreaterThan(1);
+    const packages = areas.flatMap((area) =>
+      readdirSync(join(REPO, area))
+        .map((d) => join(REPO, area, d))
+        .filter((d) => existsSync(join(d, 'package.json'))),
+    );
+    expect(packages.length).toBeGreaterThan(10);
+    const unlinted = packages.filter((dir) => !codeFiles.some((f) => f.startsWith(`${dir}/`)));
+    expect(unlinted.map((d) => d.slice(REPO.length)), 'this package is graded by no rule here').toEqual([]);
+    const deepest = Math.max(...codeFiles.map((f) => f.slice(REPO.length).split('/').length));
+    expect(deepest, 'the walk never left a package root — it is not recursing').toBeGreaterThan(4);
+  });
+
+  // The walk itself against a tree built to defeat a flat one, so the depth above cannot become a
+  // fact about how `packages/` happens to be arranged.
+  it('walks into a nested directory (positive control)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'source-hygiene-'));
+    mkdirSync(join(root, 'pkg', 'src', 'a', 'b'), { recursive: true });
+    writeFileSync(join(root, 'pkg', 'src', 'a', 'b', 'deep.ts'), 'export const x = 1;\n');
+    writeFileSync(join(root, 'pkg', 'src', 'shallow.ts'), 'export const y = 1;\n');
+    expect(sourceFiles(root).map((f) => f.slice(root.length + 1)).sort()).toEqual([
+      'pkg/src/a/b/deep.ts',
+      'pkg/src/shallow.ts',
+    ]);
   });
 
   /**
@@ -186,6 +232,13 @@ describe('source hygiene', () => {
     /unchanged from today|as of (?:today|now|this writing)|at the time of writing|\bin round \d|\bthe reviewer\b|\bas things stand\b|\bfor the time being\b/i;
 
   /**
+   * The same class again, one number wide. CLAUDE.md routes "what a number was measured at" to the
+   * commit message: a latency quoted in a comment is a claim about a machine nobody else has, and
+   * the code above it stays correct while the number silently stops being true.
+   */
+  const MEASUREMENT = /\b(?:was measured at|benchmarked at|measured \d+\s*m?s\b)/i;
+
+  /**
    * The prime directive as a prose rule. `bridge-core` must never depend on a backend plugin, and a
    * comment that explains core's behaviour by pointing AT one is that dependency in the only form
    * the import graph cannot catch. It also rots invisibly: the instance that prompted this rule said
@@ -259,8 +312,46 @@ describe('source hygiene', () => {
       pattern: TRACKER,
       files: codeFiles,
       advice: 'cite the behaviour, not the ticket',
-      fires: ['fixed by BUG-12', 'SEC-3 tracks this', 'CX-9 again', 'D-1 covers it', 'closes issue #42'],
-      passes: ['a bug in the decoder', 'SECTION-3 of the design', 'D-day', 'issue 42 is stale'],
+      fires: [
+        'fixed by BUG-12',
+        'SEC-3 tracks this',
+        'CX-9 again',
+        'D-1 covers it',
+        'closes issue #42',
+        'tracked in issues #12 and #13',
+        'TICKET-4 asked for this clamp',
+        'FINDING 12 says otherwise',
+        'issue 4 is filed as ISSUE-4',
+        'BUG 12 is back',
+        'see SEC#3',
+        'FIX-7 landed',
+        'TICKET 9 again',
+      ],
+      passes: [
+        'a bug in the decoder',
+        'SECTION-3 of the design',
+        'D-day',
+        'issue 42 is stale',
+        'posted to the #discord channel',
+        '(d2) a bounded quantifier',
+        'one issue with snowflakes: they are not lexically comparable',
+      ],
+    },
+    {
+      label: 'quotes a measurement',
+      pattern: MEASUREMENT,
+      files: codeFiles,
+      advice: 'state the bound the code relies on, not the number a machine once produced',
+      fires: [
+        'this was measured at 40ms',
+        'benchmarked at 12 ms on the CI box',
+        'measured 900ms before the fix',
+      ],
+      passes: [
+        'the budget is 40ms',
+        'a page is measured in messages, not bytes',
+        'capped at 60s server-side',
+      ],
     },
     {
       label: 'dates itself',
@@ -291,6 +382,7 @@ describe('source hygiene', () => {
     expect(LINTS.map((l) => l.label)).toEqual([
       'in bridge-core, names a backend plugin package',
       'cites an issue tracker',
+      'quotes a measurement',
       'dates itself',
     ]);
     for (const lint of LINTS) {
