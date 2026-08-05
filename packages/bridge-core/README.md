@@ -57,7 +57,8 @@ byte-stable across calls. `timestamp` is informational only; ordering and dedup 
 instance_id: agent-main         # read-state namespace; DISTINCT per concurrent session sharing a handle
 identity: { handle: "agent" }
 topics: ["ctx-demo"]            # THE allowlist — no wildcard default
-post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to any fully-matching topic (not subscribed)
+post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to any fully-matching topic (not subscribed,
+                                # but the pattern source IS published on every presence beat)
 catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
 presence: { enabled: true, topic: "parley-presence", heartbeat_ms: 600000 }

@@ -2,8 +2,10 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { allowlistFor } from './allowlist.js';
 import {
+  ConfigSchema,
   instanceIdOf,
   loadConfig,
   MAX_BLOCK_MS,
@@ -320,20 +322,180 @@ function parentOf(root: Record<string, unknown>, path: string[]): Record<string,
   return node;
 }
 
+/** Every key path a config document carries, objects included. */
+function keyPaths(node: unknown, prefix: string[] = []): string[][] {
+  if (typeof node !== 'object' || node === null || Array.isArray(node)) return [];
+  return Object.entries(node).flatMap(([k, v]) => [[...prefix, k], ...keyPaths(v, [...prefix, k])]);
+}
+
+type LeafKind = 'string' | 'number' | 'boolean' | 'enum' | 'string[]' | 'opaque';
+
+interface SchemaLeaf {
+  label: string;
+  path: string[];
+  kind: LeafKind;
+  /** The alternatives an `enum` leaf accepts — the only leaf kind whose second legal value is not
+   *  derivable from the first. */
+  options: readonly string[];
+}
+
+interface SchemaWalk {
+  paths: string[][];
+  leaves: SchemaLeaf[];
+}
+
+/** The `_def` fields this walk reads. zod types them per node class, not discriminably. */
+interface ZodDefLike {
+  typeName: string;
+  schema?: z.ZodTypeAny;
+  innerType?: z.ZodTypeAny;
+  type?: z.ZodTypeAny;
+  values?: readonly string[];
+}
+
+const defOf = (node: z.ZodTypeAny): ZodDefLike => node._def as unknown as ZodDefLike;
+const shapeOf = (node: z.ZodTypeAny): Record<string, z.ZodTypeAny> =>
+  (node as z.ZodObject<z.ZodRawShape>).shape;
+
+/**
+ * Enumerate the config surface from `ConfigSchema` ITSELF. Every registry below grades the schema
+ * through the `FULL` fixture, and nothing proved the fixture complete: a knob added to the schema
+ * alone had no row in any walker and no ceiling entry, so it loaded ungraded and the walkers stayed
+ * green. Keep an unrecognised node kind a THROW rather than an empty subtree, so that a future zod
+ * construct (a union, a lazy, a branded leaf) cannot silently shrink what the fixture is measured
+ * against — that is the failure being ratcheted, one level up.
+ */
+function walkSchema(node: z.ZodTypeAny, prefix: string[] = []): SchemaWalk {
+  const def = defOf(node);
+  switch (def.typeName) {
+    case 'ZodEffects':
+      return walkSchema(def.schema!, prefix);
+    case 'ZodDefault':
+    case 'ZodOptional':
+    case 'ZodNullable':
+      return walkSchema(def.innerType!, prefix);
+    default:
+      break;
+  }
+  const leaf = (kind: LeafKind, options: readonly string[] = []): SchemaWalk => ({
+    paths: [],
+    leaves: [{ label: prefix.join('.'), path: prefix, kind, options }],
+  });
+  switch (def.typeName) {
+    case 'ZodObject': {
+      const out: SchemaWalk = { paths: [], leaves: [] };
+      for (const [key, child] of Object.entries(shapeOf(node))) {
+        const path = [...prefix, key];
+        out.paths.push(path);
+        const sub = walkSchema(child, path);
+        out.paths.push(...sub.paths);
+        out.leaves.push(...sub.leaves);
+      }
+      return out;
+    }
+    case 'ZodString':
+      return leaf('string');
+    case 'ZodNumber':
+      return leaf('number');
+    case 'ZodBoolean':
+      return leaf('boolean');
+    case 'ZodEnum':
+      return leaf('enum', def.values ?? []);
+    case 'ZodRecord':
+      return leaf('opaque');
+    case 'ZodArray': {
+      const element = walkSchema(def.type!, prefix);
+      const kind = element.leaves[0]?.kind;
+      if (kind !== 'string') throw new Error(`${prefix.join('.')}: array of ${String(kind)}`);
+      return leaf('string[]');
+    }
+    default:
+      throw new Error(`${prefix.join('.') || '<root>'}: unhandled schema node ${String(def.typeName)}`);
+  }
+}
+
+const SCHEMA = walkSchema(ConfigSchema);
+/** `backend_config` is opaque to core (DESIGN §11); its interior is deliberately unmodelled. */
+const CORE_PATH = (path: readonly string[]): boolean => path[0] !== 'backend_config';
+const SCHEMA_LEAVES = SCHEMA.leaves.filter((l) => CORE_PATH(l.path));
+
+describe('the fixture the config walkers run on is the whole schema', () => {
+  it('FULL carries exactly the paths ConfigSchema declares', () => {
+    expect(SCHEMA.paths.filter(CORE_PATH).map((p) => p.join('.')).sort()).toEqual(
+      keyPaths(FULL).filter(CORE_PATH).map((p) => p.join('.')).sort(),
+    );
+  });
+
+  it('models every leaf the walkers have to perturb (nothing lands as opaque but backend_config)', () => {
+    expect(SCHEMA_LEAVES.filter((l) => l.kind === 'opaque')).toEqual([]);
+    expect(SCHEMA_LEAVES.length).toBeGreaterThan(15);
+  });
+
+  /**
+   * The positive control for the walk, on a schema built here rather than on `ConfigSchema` — the
+   * artifact it audits cannot also be what proves it sees. One row per wrapper the real schema
+   * uses; a wrapper the walk cannot see through would drop its whole subtree and let the
+   * completeness case above pass while grading less.
+   */
+  it('sees a leaf through every wrapper, and reports a path a fixture would lack', () => {
+    const probe = z
+      .object({
+        plain: z.string(),
+        defaulted: z.number().default(1),
+        optional: z.string().optional(),
+        listed: z.array(z.string()).nonempty(),
+        flag: z.boolean(),
+        picked: z.enum(['p', 'q']),
+        nested: z.object({ inner: z.number() }).strict().default({ inner: 0 }),
+        transformed: z
+          .object({ t: z.string() })
+          .strict()
+          .transform((v) => v),
+      })
+      .strict()
+      .superRefine(() => {});
+    const walk = walkSchema(probe);
+    expect(walk.paths.map((p) => p.join('.')).sort()).toEqual([
+      'defaulted',
+      'flag',
+      'listed',
+      'nested',
+      'nested.inner',
+      'optional',
+      'picked',
+      'plain',
+      'transformed',
+      'transformed.t',
+    ]);
+    expect(walk.leaves.map((l) => `${l.label}:${l.kind}`).sort()).toEqual([
+      'defaulted:number',
+      'flag:boolean',
+      'listed:string[]',
+      'nested.inner:number',
+      'optional:string',
+      'picked:enum',
+      'plain:string',
+      'transformed.t:string',
+    ]);
+    const fixture = { plain: 'a', defaulted: 1 };
+    expect(
+      walk.paths.map((p) => p.join('.')).filter((l) => !keyPaths(fixture).some((f) => f.join('.') === l)),
+    ).toContain('nested.inner');
+  });
+
+  it('refuses to walk a node kind it does not model', () => {
+    expect(() => walkSchema(z.object({ mystery: z.union([z.string(), z.number()]) }))).toThrow(
+      /mystery: unhandled schema node ZodUnion/,
+    );
+  });
+});
+
 // A key the schema does not know is a LOAD ERROR, not a silent strip: an operator typo must not
 // produce a bridge that quietly does nothing.
 describe('config rejects unknown keys', () => {
   it('accepts the fully-populated fixture', () => {
     expect(() => parseConfig(structuredClone(FULL))).not.toThrow();
   });
-
-  function keyPaths(node: unknown, prefix: string[] = []): string[][] {
-    if (typeof node !== 'object' || node === null || Array.isArray(node)) return [];
-    return Object.entries(node).flatMap(([k, v]) => [
-      [...prefix, k],
-      ...keyPaths(v, [...prefix, k]),
-    ]);
-  }
 
   // `backend_config` is opaque to core (DESIGN §11), so its interior is deliberately open.
   const paths = keyPaths(FULL).filter((p) => p[0] !== 'backend_config');
@@ -497,6 +659,16 @@ describe('config rejects a degenerate number in any numeric field', () => {
     ['presence.heartbeat_ms', null],
     ['presence.ttl_ms', null],
   ]);
+
+  // Both registries above are keyed by label, so a renamed or removed knob leaves a row that grades
+  // nothing while still reading as coverage. Key them off the schema in the other direction too.
+  it('carries no registry row for a numeric field the schema no longer has', () => {
+    const numeric = SCHEMA_LEAVES.filter((l) => l.kind === 'number').map((l) => l.label);
+    expect([...CEILINGS.keys()].filter((label) => !numeric.includes(label))).toEqual([]);
+    expect([...ZERO_IS_LEGAL].filter((label) => !numeric.includes(label))).toEqual([]);
+    expect(numeric.filter((label) => !CEILINGS.has(label))).toEqual([]);
+    expect(leaves.map((l) => l.label).sort()).toEqual(numeric.sort());
+  });
 
   const FAR_ABOVE_ANY_PLAUSIBLE_CAP = 86_400_000;
 
@@ -907,6 +1079,127 @@ describe('a config value carried by the presence beat is capped where it is decl
   it.each(CELLS)('%s past the cap is refused at load, not lost behind the operator', async (_l, w, axis) => {
     expect(await roundTrip(w, axis.at(axis.cap + 1))).toBe('refused at load');
   });
+});
+
+/**
+ * WHICH config values leave this process on the shared presence topic. `post_topics`' own field doc
+ * claimed its pattern sources were "NEVER ... announced in presence" while the emitter had been
+ * advertising them verbatim since the beat gained `postTopics` — a locality promise an operator
+ * reads before deciding what a pattern may name, contradicted by the wire, with nothing grading the
+ * disagreement. Prose cannot be compiled, so pin the fact the prose is about instead: one declared
+ * verdict per schema leaf, each one MEASURED against a beat the real emitter posts. A field
+ * documented as local while the beat carries it now has to be declared `broadcast` first.
+ */
+describe('what a presence beat discloses from the config', () => {
+  type Visibility = 'broadcast' | 'local' | 'no second legal value';
+
+  const WIRE_VISIBILITY = new Map<string, Visibility>([
+    ['instance_id', 'local'],
+    ['state_path', 'local'],
+    ['identity.handle', 'broadcast'],
+    ['topics', 'broadcast'],
+    ['post_topics', 'broadcast'],
+    ['catchup.on_start', 'local'],
+    ['catchup.limit', 'local'],
+    ['catchup.block_max_ms', 'local'],
+    ['catchup.block_poll_interval_ms', 'local'],
+    ['live_push.enabled', 'local'],
+    ['live_push.mention_filter', 'local'],
+    ['presence.enabled', 'local'],
+    ['presence.topic', 'local'],
+    ['presence.heartbeat_ms', 'local'],
+    ['presence.ttl_ms', 'local'],
+    ['permissions.skip_permissions', 'no second legal value'],
+    ['auth.mode', 'local'],
+    ['auth.oidc.issuer', 'local'],
+    ['auth.oidc.audience', 'local'],
+    ['auth.oidc.jwks_uri', 'local'],
+    ['auth.oidc.required_scope', 'local'],
+    ['auth.oidc.allowed_subjects', 'local'],
+    ['auth.oidc.allowed_usernames', 'local'],
+    ['auth.oidc.required_role', 'local'],
+    ['auth.oidc.clock_skew_s', 'local'],
+  ]);
+
+  /** A second legal value for a leaf, shaped so the schema still accepts it. */
+  function otherValue(leaf: SchemaLeaf, current: unknown): unknown {
+    if (leaf.kind === 'enum') return leaf.options.find((o) => o !== current) ?? current;
+    if (typeof current === 'string') return `${current}-alt`;
+    if (typeof current === 'number') return current * 2;
+    if (typeof current === 'boolean') return !current;
+    if (Array.isArray(current)) return current.map((e) => `${String(e)}-alt`);
+    throw new Error(`${leaf.label}: no second value for ${typeof current}`);
+  }
+
+  /** The raw JSON a peer reads off the presence topic — not `decodePresence`, which caps and drops,
+   *  so a value the decoder would trim is still counted as disclosed. */
+  async function beatContent(cfg: ParleyConfig): Promise<Record<string, unknown>> {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    const topic = asTopic(cfg.presence.topic);
+    const loop = startPresenceLoop(plugin, asHandle(cfg.identity.handle), allowlistFor(cfg), {
+      presenceTopic: topic,
+      heartbeatMs: cfg.presence.heartbeat_ms,
+      now: () => 1,
+    });
+    await loop.stop();
+    const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
+    expect(messages.length).toBeGreaterThan(0);
+    return JSON.parse(messages[0]!.content) as Record<string, unknown>;
+  }
+
+  /**
+   * Which beat fields differ between two beats emitted from the SAME config — measured, not listed.
+   * Keep it measured, so that the comparison cannot be written to ignore a field a future wiring
+   * starts feeding from the config: the moment a field becomes config-derived it stops varying
+   * run-to-run, so it stops being excluded here and starts being graded below.
+   */
+  async function volatileFields(cfg: ParleyConfig): Promise<Set<string>> {
+    const [a, b] = [await beatContent(cfg), await beatContent(cfg)];
+    return new Set(
+      Object.keys({ ...a, ...b }).filter((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k])),
+    );
+  }
+
+  const stable = (beat: Record<string, unknown>, volatile: ReadonlySet<string>): string =>
+    JSON.stringify(
+      Object.entries(beat)
+        .filter(([k]) => !volatile.has(k))
+        .sort(([x], [y]) => x.localeCompare(y)),
+    );
+
+  const base = (): ParleyConfig => parseConfig(structuredClone(FULL));
+
+  it('excludes only the per-process instance token from the comparison', async () => {
+    expect([...(await volatileFields(base()))]).toEqual(['instanceId']);
+  });
+
+  it('declares a verdict for every leaf the schema has, and none it does not', () => {
+    expect([...WIRE_VISIBILITY.keys()].sort()).toEqual(SCHEMA_LEAVES.map((l) => l.label).sort());
+  });
+
+  it.each(SCHEMA_LEAVES.map((l) => [l.label, l] as const))(
+    '%s: what the beat carries matches the declared verdict',
+    async (label, leaf) => {
+      const declared = WIRE_VISIBILITY.get(label);
+      expect(declared, `${label} has no row: declare what a presence beat does with it`).toBeDefined();
+      const mutated = structuredClone(FULL) as Record<string, unknown>;
+      const holder = parentOf(mutated, leaf.path);
+      const key = leaf.path.at(-1)!;
+      holder[key] = otherValue(leaf, holder[key]);
+      let cfg: ParleyConfig;
+      try {
+        cfg = parseConfig(mutated);
+      } catch {
+        expect(declared, `${label} has a second legal value after all`).toBe('no second legal value');
+        return;
+      }
+      expect(declared, `${label} has a second legal value`).not.toBe('no second legal value');
+      const volatile = await volatileFields(base());
+      const carried = stable(await beatContent(cfg), volatile) !== stable(await beatContent(base()), volatile);
+      expect(carried ? 'broadcast' : 'local').toBe(declared);
+    },
+  );
 });
 
 // `loadConfig` is what every shipped backend CLI calls, so its failure message is the first thing a

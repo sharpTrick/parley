@@ -83,8 +83,12 @@ const ConfigObject = z.object({
   /**
    * Extra topics allowed for `post`/`fetch_recent` ONLY, as full-match regex sources (anchored
    * `^(?:…)$` at compile time). Lets a chat instance post to ad-hoc topics without listing each
-   * one. These are NEVER subscribed / caught up on / announced in presence — that stays the
-   * explicit `topics` list. The presence topic can never be matched (it is reserved). Invalid
+   * one. These are never subscribed to and never caught up on — that stays the explicit `topics`
+   * list — but every presence beat DOES advertise them, as the record's `postTopics`: a peer
+   * matches its own topics against these sources to decide whether this bridge is reachable for
+   * hand-off (DESIGN §7). That topic is shared and readable by every participant on the backend,
+   * so a pattern source must not encode anything confidential — it is published verbatim on every
+   * beat. A pattern can never match the presence topic itself (it is reserved). Invalid
    * regexes are rejected at load (DESIGN §14). Capped at `MAX_POST_TOPICS`: the ReDoS screen
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
    * one of them, so the count is the other half of that bound.
