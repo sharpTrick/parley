@@ -14,7 +14,8 @@
 // which is what makes the isolation real rather than cosmetic.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
 const ROOT = '/home/user/parley';
@@ -35,6 +36,7 @@ export const TARGETS = [
   'slack',
   'telegram',
   'shared',
+  'repo',
 ];
 
 const sh = (cmd, args, cwd = ROOT) =>
@@ -77,7 +79,12 @@ function teardown() {
   process.stdout.write('worktrees removed\n');
 }
 
-const [, , cmd, arg] = process.argv;
-if (cmd === 'setup') setup(arg);
-else if (cmd === 'teardown') teardown();
-else throw new Error('usage: careening-worktrees.mjs <setup <sha>|teardown>');
+// Keep the CLI behind a main-module check, so that TARGETS can be imported without running a
+// command — the harness cross-check in packages/conformance reads it, and an unguarded entrypoint
+// threw `usage:` at import time.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const [, , cmd, arg] = process.argv;
+  if (cmd === 'setup') setup(arg);
+  else if (cmd === 'teardown') teardown();
+  else throw new Error('usage: careening-worktrees.mjs <setup <sha>|teardown>');
+}

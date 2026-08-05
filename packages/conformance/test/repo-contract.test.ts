@@ -627,3 +627,29 @@ describe('the skip gate CI runs', () => {
     expect(runGate({}).code).toBe(1);
   });
 });
+
+describe('the careening harness agrees with itself about its targets', () => {
+  // Two lists name the review targets: the runner's TARGETS drives which critics run, and
+  // careening-worktrees.mjs drives which worktrees exist. The runner is a workflow script — it
+  // cannot be imported, because loading it executes the round — so the lists cannot be one
+  // constant. They can still be held to agreeing.
+  //
+  // Keep this comparing the two AGAINST EACH OTHER rather than pinning either one's contents, so
+  // that adding a sixteenth target needs no edit here. The `repo` target was added to the runner at
+  // round 13 and never to the worktree script, so for four rounds a worktree the runner sent a
+  // critic into was whatever a previous round had left there.
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+  it('creates a worktree for every target the runner reviews', async () => {
+    const runner = readFileSync(join(repoRoot, '.claude/workflows/careening-review.js'), 'utf8');
+    const declared = [...runner.matchAll(/^\s*\{\s*key:\s*'([a-z-]+)'/gm)].map((m) => m[1]);
+    const withBrief = [...runner.matchAll(/^\s*key:\s*'([a-z-]+)',$/gm)].map((m) => m[1]);
+    const runnerTargets = [...new Set([...declared, ...withBrief])];
+
+    const { TARGETS } = await import(join(repoRoot, 'scripts/careening-worktrees.mjs'));
+
+    expect(runnerTargets.length, 'the runner declares no targets — this scan has stopped working').
+      toBeGreaterThan(10);
+    expect([...TARGETS].sort()).toEqual([...runnerTargets].sort());
+  });
+});

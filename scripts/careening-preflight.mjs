@@ -10,7 +10,16 @@
 // Exit 0 = every service answered. Exit 1 = at least one did not; the round must not start.
 
 import { execFileSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
 import { connect } from 'node:net';
+
+const run = (cmd, argv) => {
+  try {
+    return execFileSync(cmd, argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return null;
+  }
+};
 
 const SERVICES = [
   { name: 'redis', port: 6379 },
@@ -48,19 +57,44 @@ const daemon = daemonAlive();
 const services = [];
 for (const s of SERVICES) services.push({ ...s, up: daemon ? await reachable(s.port) : false });
 
+// A worktree left at a previous round's base is the most expensive failure this harness can have,
+// and the quietest: the runner only tells a critic to `cd` into one, so fifteen critics will review
+// a stale tree and return a full round of findings that look exactly like a valid round. Round 17
+// spent 3.12M tokens reviewing a commit four rounds old before anyone noticed.
+const WORKTREES = '/tmp/careening/worktrees';
+const head = run('git', ['rev-parse', 'HEAD']);
+const stale = [];
+let worktrees = [];
+try {
+  worktrees = readdirSync(WORKTREES);
+} catch {
+  worktrees = [];
+}
+for (const name of worktrees) {
+  const at = run('git', ['-C', `${WORKTREES}/${name}`, 'rev-parse', 'HEAD']);
+  if (at !== head) stale.push({ name, at: (at ?? 'unreadable').slice(0, 7) });
+}
+
 const down = services.filter((s) => !s.up).map((s) => s.name);
-const ok = daemon && down.length === 0;
+const ok = daemon && down.length === 0 && stale.length === 0;
 
 if (json) {
-  console.log(JSON.stringify({ ok, daemon, services }, null, 2));
+  console.log(JSON.stringify({ ok, daemon, services, head, stale }, null, 2));
 } else if (ok) {
-  console.log(`careening preflight OK — daemon up, ${services.length} services answering`);
+  console.log(
+    `careening preflight OK — daemon up, ${services.length} services answering` +
+      `, ${worktrees.length} worktrees at ${head.slice(0, 7)}`,
+  );
 } else if (!daemon) {
   console.error('careening preflight FAILED — docker daemon is not reachable.');
   console.error('  start it, then: ./examples/dev-compose/dev-infra.sh up all');
-} else {
+} else if (down.length) {
   console.error(`careening preflight FAILED — not answering: ${down.join(', ')}`);
   console.error('  ./examples/dev-compose/dev-infra.sh up all');
+} else {
+  console.error(`careening preflight FAILED — ${stale.length} worktree(s) not at HEAD ${head.slice(0, 7)}:`);
+  for (const s of stale) console.error(`  ${s.name} @ ${s.at}`);
+  console.error('  node scripts/careening-worktrees.mjs setup $(git rev-parse HEAD)');
 }
 
 process.exit(ok ? 0 : 1);

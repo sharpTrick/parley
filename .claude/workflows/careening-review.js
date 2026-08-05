@@ -154,9 +154,22 @@ const SCHEMA = {
 
 const WORKTREES = '/tmp/careening/worktrees'
 
+// The runner cannot create or inspect worktrees — a workflow script has no filesystem access — so it
+// can only tell a critic which one to use. That makes a worktree left at a PREVIOUS round's base the
+// quietest failure this harness has: fifteen critics review a stale tree and return a full round of
+// findings indistinguishable from a valid one. Round 17 spent 3.12M tokens on a commit four rounds
+// old. `scripts/careening-preflight.mjs` now refuses to pass when any worktree is off HEAD; this is
+// the second half of that guard, so a critic that somehow starts anyway errors LOUDLY instead of
+// reviewing the wrong code.
+const baseCheck = (key, base) =>
+  base
+    ? `FIRST, before reading anything: run \`git -C ${WORKTREES}/${key} rev-parse HEAD\`. It MUST print ${base}. If it prints anything else your worktree is stale and every finding you could produce would be against the wrong tree — STOP, review nothing, and return errored=true with the sha you actually saw. Do not try to fix it yourself.`
+    : ''
+
 function prompt(target) {
   if (target.brief) {
     return [
+      baseCheck(target.key, base),
       `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
       target.brief,
       `Review the tree AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round."`,
@@ -166,9 +179,10 @@ function prompt(target) {
       `Do NOT start containers. Nothing at this scale needs one, and the shared parley-dev-* set belongs to the orchestrator while other critics are using it.`,
       `Return the structured schema. For each finding give the concrete failure — what breaks, or what silently is not checked, and where — a remediation, and a testUpgrade that guards the CLASS across the whole repo rather than patching the instances one at a time.`,
       `If a genuine attempt found nothing at repo scale, set nothingFound=true and describe specifically which invariants you built a matrix for and what you diffed — a clean result retires you from later rounds, so it must be auditable.`,
-    ].join(' ')
+    ].filter(Boolean).join(' ')
   }
   return [
+    baseCheck(target.key, base),
     `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
     `Full-surface adversarial review of the Parley package at: ${target.path}.`,
     `Review the WHOLE target AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round." A diff-scoped review hides everything the current anchors sit on top of.`,
@@ -189,7 +203,7 @@ function prompt(target) {
     `Return the structured schema. For each finding give the concrete failing input -> wrong output or hang, a remediation, and a testUpgrade that guards the CLASS (a parameterized or widened generator case), not just the one input.`,
     `FILL IN remediationCheck HONESTLY — it is the highest-value thing you produce after the finding itself. In round 13 every one of 33 blocking findings was real and EIGHT of the remediations were wrong, several of which would have shipped a defect worse than the one they closed. Your finding is probably right; your fix is the part that is probably wrong. Do NOT write a persuasive argument for your fix, and do NOT write a rhetorical passage attacking it either — both are cheap to fake and neither is checkable. Answer the specific questions from the CODE: read what you call into, name what your fix newly accepts and newly rejects, name the passing tests it breaks, and say what would still be broken if it were applied and the bug remained. If you did not trace it, mark it untested — a separate agent re-derives every fix from scratch, so an honest "untested" costs nothing and a confident wrong answer costs that agent a wasted investigation.`,
     `If a genuine attempt to break it found nothing, set nothingFound=true and describe specifically what you examined and what you tried — a clean result retires you from later rounds until your package or a dependency changes, so it must be auditable.`,
-  ].join(' ')
+  ].filter(Boolean).join(' ')
 }
 
 // --- run ---------------------------------------------------------------------------------------
@@ -201,6 +215,7 @@ const round = (rawArgs && rawArgs.round) || 1
 const quiesced = new Set((rawArgs && rawArgs.quiesced) || [])
 const changed = (rawArgs && rawArgs.changed) || []
 const wakeAll = !!(rawArgs && rawArgs.wakeAll)
+const base = (rawArgs && rawArgs.base) || ''
 
 const woken = wakeAll ? new Set(TARGETS.map((t) => t.key)) : wakeSet(changed)
 const active = TARGETS.filter((t) => wakeAll || !quiesced.has(t.key) || woken.has(t.key))
