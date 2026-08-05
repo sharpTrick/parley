@@ -1,95 +1,192 @@
 {
-  "round": 16,
-  "phase": "remediation",
-  "base": "a540855",
-  "blockingFindings": 39,
-  "status": "in progress — 35 closed, sqlite (1) running, repo (6) to follow",
-
-  "instrumentChangesUnderTest": [
-    "remediation-diff-guard — a narrowly-scoped reviewer for surface widening, weakened assertions and scope creep ONLY, added this round to measure whether it catches anything the mutation replay and the next round do not",
-    "scripts/verify-mutations.sh gained an `only` name filter, and a header note that a red counted only when expectFail matches — a mutation that reddens by TIMEOUT is not proof"
+ "round": 16,
+ "phase": "remediation",
+ "base": "a540855",
+ "blockingFindings": 39,
+ "status": "COMPLETE \u2014 39/39 blocking findings closed, every landed diff mutation-replayed",
+ "instrumentChangesUnderTest": [
+  "remediation-diff-guard \u2014 a narrowly-scoped reviewer for surface widening, weakened assertions and scope creep ONLY, added this round to measure whether it catches anything the mutation replay and the next round do not",
+  "scripts/verify-mutations.sh gained an `only` name filter, and a header note that a red counted only when expectFail matches \u2014 a mutation that reddens by TIMEOUT is not proof"
+ ],
+ "diffGuardLedger": {
+  "note": "The headline instrument result. Seven runs on landed work, ~400K tokens. Every confirmed defect had ALREADY passed a second agent's re-derivation, a full suite, a typecheck, and a mutation replay \u2014 the three gates the round already had.",
+  "runs": [
+   {
+    "target": "xmpp",
+    "hunksRead": 11,
+    "findings": 0,
+    "tokens": 44083
+   },
+   {
+    "target": "matrix",
+    "hunksRead": 17,
+    "findings": 2,
+    "tokens": 53664,
+    "confirmed": 1,
+    "adjudicated": 1
+   },
+   {
+    "target": "discord",
+    "hunksRead": 78,
+    "findings": 2,
+    "tokens": 65527,
+    "confirmed": 0,
+    "adjudicated": 2
+   },
+   {
+    "target": "slack",
+    "hunksRead": 9,
+    "findings": 0,
+    "tokens": 64976
+   },
+   {
+    "target": "postgres",
+    "hunksRead": 27,
+    "findings": 3,
+    "tokens": 67526,
+    "confirmed": 2,
+    "adjudicated": 1
+   },
+   {
+    "target": "shared",
+    "hunksRead": 22,
+    "findings": 1,
+    "tokens": 51000,
+    "confirmed": 1
+   },
+   {
+    "target": "core-auth",
+    "hunksRead": 15,
+    "findings": 1,
+    "tokens": 52697,
+    "confirmed": 1
+   }
   ],
-
-  "diffGuardLedger": {
-    "note": "The headline instrument result. Seven runs on landed work, ~400K tokens. Every confirmed defect had ALREADY passed a second agent's re-derivation, a full suite, a typecheck, and a mutation replay — the three gates the round already had.",
-    "runs": [
-      { "target": "xmpp", "hunksRead": 11, "findings": 0, "tokens": 44083 },
-      { "target": "matrix", "hunksRead": 17, "findings": 2, "tokens": 53664, "confirmed": 1, "adjudicated": 1 },
-      { "target": "discord", "hunksRead": 78, "findings": 2, "tokens": 65527, "confirmed": 0, "adjudicated": 2 },
-      { "target": "slack", "hunksRead": 9, "findings": 0, "tokens": 64976 },
-      { "target": "postgres", "hunksRead": 27, "findings": 3, "tokens": 67526, "confirmed": 2, "adjudicated": 1 },
-      { "target": "shared", "hunksRead": 22, "findings": 1, "tokens": 51000, "confirmed": 1 },
-      { "target": "core-auth", "hunksRead": 15, "findings": 1, "tokens": 52697, "confirmed": 1 }
-    ],
-    "confirmedDefects": [
-      "matrix: a module-private constant exported so a test could read it — the class round 16 filed twice elsewhere, plus net-util's elapsed-bound-derived-from-the-constant-it-grades. The loop was landing in matrix the defect it was closing in net-util, in the same round.",
-      "postgres: five constants re-exported onto the published dist/index.d.ts, four read only by an in-package test that did not need the entry point and one read by nothing.",
-      "postgres: `client.release(true)` unconditional in post()'s catch, so the DOCUMENTED 55P03 lock-contention path destroyed a pooled connection per refused write. The finding's own remediationCheck had adjudicated that path as safe to keep.",
-      "shared: two real assertions weakened to satisfy a lint the same agent had just written — `elapsedMs < DEADLINE_MS` replaced by an absolute, letting a call handed a 1000ms budget run to 1999ms green.",
-      "core-auth: the assertion replacing the removed pre-consent check is satisfied by CONSTRUCTION — rememberClient's last statement sets the client and completeConsent calls it three statements before the read. It reads as grading 'eviction did not take the owner' and grades 'the fix is present'."
-    ],
-    "falseAlarms": 0,
-    "deliberateNonReports": [
-      "discord: flagged that fixture-hygiene imports `typescript` while the package declares it nowhere, explicitly saying it was not one of its three. Checked — only packages/conformance declares test tooling, and only because it is published; every other package takes vitest and typescript from the root by hoisting. Convention, not a defect.",
-      "slack: found a candidate weakened assertion and declined to file it, because the same mutation reddens all of catchup-window and history-order, so the invariant never lost a grader."
-    ],
-    "reading": "Refusing to file what it was not asked to look for, while still surfacing it, is what keeps this from becoming a second critic. Its findings came from five different packages written by five different agents, so it is not one agent's tic."
-  },
-
-  "wrongPrescriptions": {
-    "note": "Round 16 alone produced nine, in eight distinct modes. NONE was caught by a test suite; every one was caught by a separate agent re-deriving the fix.",
-    "runningTotal": "38 across rounds 9-16",
-    "cases": [
-      { "target": "matrix", "mode": "the fix preserves the defect on a second path", "detail": "keeping the short-circuit whenever the call carries a `since` leaves an expired-cursor read returning empty plus the dead cursor forever, and buildBridge awaits catchUpAll, so the topic is unreadable from every restart." },
-      { "target": "matrix", "mode": "the proposed assertion is false against correct code", "detail": "`events: []` with `limited: false` is the homeserver promising nothing lies behind the position, so a conforming plugin SHOULD backfill to room start." },
-      { "target": "discord", "mode": "the proposed check cannot fail", "detail": "assert messages.length equals the usable-record count — on the two-record [good, bad] page that is 1 === 1, green under the very mutation it was written for." },
-      { "target": "xmpp", "mode": "the named route does not exist", "detail": "an error presence cannot reach a superseded registry entry; onPresence reads pendingJoins.get(room), which returns the successor." },
-      { "target": "telegram", "mode": "the fix introduces a new hang", "detail": "O_NOFOLLOW without O_NONBLOCK still blocks in the open on a squatted FIFO." },
-      { "target": "telegram", "mode": "the prescribed test matrix has a green cell for the disclosure", "detail": "with only symlink-file and no symlink-empty, the store-path cell PASSES under the reintroduced defect, because compaction's rename repairs the link first." },
-      { "target": "zulip", "mode": "the fix is worse than the defect", "detail": "passing DEFAULT_DEADLINE_MS (30s) would hang a blockMs:200 call for thirty seconds on a black hole. The record's repro list contained only answerable latency." },
-      { "target": "postgres", "mode": "the critic noticed the refuting fact and drew the opposite conclusion", "detail": "the prescribed memo fix would let a 10ms fetchRecent end the socket of a healthy dial a concurrent subscribe was waiting on." },
-      { "target": "core-auth", "mode": "the fix is the same defect one level down", "detail": "a sub-budget shed newest-first IS an ordering: with the flood plus the owner in the anonymous tier, the owner is newest and is taken first." },
-      { "target": "slack", "mode": "the prescription creates a guard that cannot be graded", "detail": "an entry clamp AND a loop guard are each independently sufficient, so no single mutation reddens and either can later be deleted with the suite green." },
-      { "target": "shared", "mode": "the finding's DIAGNOSIS is wrong while the defect is real", "detail": "it claimed the true arm had 'no working control' and that the fix would turn the row RED. The control existed and passes; only attribution was missing. Believing it would have sent the agent hunting for something already there." }
-    ]
-  },
-
-  "lintsShippedWithHoles": {
-    "note": "Four this round, one of them the operator's. Every tool written to detect vacuous tests was itself initially vacuous, in a different way each time.",
-    "cases": [
-      "discord: a text scanner blinded by an apostrophe in a comment and a quote inside a regex, silently missing two of the files it was written to catch. Ships as an AST walk with both breaking shapes as controls.",
-      "shared: the stripper's own template-literal pattern held a bare backtick that paired with one twenty lines later, swallowing the code between and reporting two bounds the file never wrote.",
-      "shared: the row written to grade that stripper was a DUD — a lone backtick passes under the broken stripper too, because a runaway needs a pair. Caught only by mutating it.",
-      "operator: verify-mutations.sh emitted '-' as the sentinel for an absent field and then passed it to vitest as a name filter, so five telegram mutations were graded against zero tests and reported as failures. The agent's claims were sound; the instrument was not."
-    ]
-  },
-
-  "redsThatWereNotReds": [
-    "Two vitest runs killed under CPU contention, reported as red by a script that had not yet learned a timeout is not proof.",
-    "postgres: an unbounded await in a finally timed the test out and suppressed the assertion it was there to make.",
-    "core-seam: a mutation reddened three rows by TIMING NOISE and the control row it was aimed at passed by luck. The agent discarded it and substituted a deterministic one rather than report a clean sweep."
+  "confirmedDefects": [
+   "matrix: a module-private constant exported so a test could read it \u2014 the class round 16 filed twice elsewhere, plus net-util's elapsed-bound-derived-from-the-constant-it-grades. The loop was landing in matrix the defect it was closing in net-util, in the same round.",
+   "postgres: five constants re-exported onto the published dist/index.d.ts, four read only by an in-package test that did not need the entry point and one read by nothing.",
+   "postgres: `client.release(true)` unconditional in post()'s catch, so the DOCUMENTED 55P03 lock-contention path destroyed a pooled connection per refused write. The finding's own remediationCheck had adjudicated that path as safe to keep.",
+   "shared: two real assertions weakened to satisfy a lint the same agent had just written \u2014 `elapsedMs < DEADLINE_MS` replaced by an absolute, letting a call handed a 1000ms budget run to 1999ms green.",
+   "core-auth: the assertion replacing the removed pre-consent check is satisfied by CONSTRUCTION \u2014 rememberClient's last statement sets the client and completeConsent calls it three statements before the read. It reads as grading 'eviction did not take the owner' and grades 'the fix is present'."
   ],
-
-  "guardScopeMeasurements": {
-    "note": "New this round, and the most transferable discipline it produced: 'I watched it fail' is weaker than it sounds unless you count WHICH rows failed.",
-    "cases": [
-      "postgres: under the query_timeout mutation exactly ONE of eleven rows fails. The others run at pool_size 5, so the pool dials another connection and connectionTimeoutMillis ends the call — the statement ceiling is never reached. pool_size: 1 was load-bearing while looking incidental.",
-      "core-auth: mutating the eviction order reddened TWO tests, and the second failed in its SETUP, not its subject — it hard-coded 'the newest registration is evicted' to construct its victim. A future ordering change would have produced a second red that misdirects a bisect.",
-      "core-engine: under the leak-detector mutation, 185 matrix rows stay green and only the negative control reddens — which is the entire argument for having the control."
-    ]
-  },
-
-  "declaredSurvivors": [
-    "core-engine: a front door named `buildProbeDoor` is invisible to the run-time name walk and caught only by the typechecker. The agent OMITTED it from the manifest on purpose, stating that replayed through vitest it would report as a survivor because its detector is tsc. The first time in this run an agent refused to let a mechanical check produce a misleading number in the favourable direction."
+  "falseAlarms": 0,
+  "deliberateNonReports": [
+   "discord: flagged that fixture-hygiene imports `typescript` while the package declares it nowhere, explicitly saying it was not one of its three. Checked \u2014 only packages/conformance declares test tooling, and only because it is published; every other package takes vitest and typescript from the root by hoisting. Convention, not a defect.",
+   "slack: found a candidate weakened assertion and declined to file it, because the same mutation reddens all of catchup-window and history-order, so the invariant never lost a grader."
   ],
-
-  "carriedToRound17": [
-    {
-      "item": "packages/bridge-core/src/engine/presence.test.ts asserts a 500ms WALL-CLOCK CPU budget in a suite that runs in parallel. Two round-16 agents independently reproduced it failing AT THE PRISTINE BASE with their own changes stashed (501.02ms vs 500), on a 4-core box at load ~12; it passes 125/125 in isolation.",
-      "why not fixed here": "No round-16 finding covers src/engine's presence budget, and converting an absolute CPU bound into something load-tolerant risks weakening a ReDoS guard. It needs an agent under the full contract, not an operator edit mid-round.",
-      "note": "The file already carries a matchCost() calibration helper, so a ratio against a measured baseline is available without inventing one."
-    },
-    "The shared-CLI promotion across ten packages, the five comment-lint implementations, and eight packages declaring MIT with no LICENSE — all three are the `repo` target's blocking findings, deliberately run last and alone because they touch every package.",
-    "core-seam declined to grade the TEXT of a doc; a future author can still write a false sentence beside a correct WIRE_VISIBILITY row. Closing it needs disclosures moved into .describe() so they become values, not a keyword regex over source."
+  "reading": "Refusing to file what it was not asked to look for, while still surfacing it, is what keeps this from becoming a second critic. Its findings came from five different packages written by five different agents, so it is not one agent's tic."
+ },
+ "wrongPrescriptions": {
+  "note": "Round 16 alone produced nine, in eight distinct modes. NONE was caught by a test suite; every one was caught by a separate agent re-deriving the fix.",
+  "runningTotal": "43 across rounds 9-16",
+  "cases": [
+   {
+    "target": "matrix",
+    "mode": "the fix preserves the defect on a second path",
+    "detail": "keeping the short-circuit whenever the call carries a `since` leaves an expired-cursor read returning empty plus the dead cursor forever, and buildBridge awaits catchUpAll, so the topic is unreadable from every restart."
+   },
+   {
+    "target": "matrix",
+    "mode": "the proposed assertion is false against correct code",
+    "detail": "`events: []` with `limited: false` is the homeserver promising nothing lies behind the position, so a conforming plugin SHOULD backfill to room start."
+   },
+   {
+    "target": "discord",
+    "mode": "the proposed check cannot fail",
+    "detail": "assert messages.length equals the usable-record count \u2014 on the two-record [good, bad] page that is 1 === 1, green under the very mutation it was written for."
+   },
+   {
+    "target": "xmpp",
+    "mode": "the named route does not exist",
+    "detail": "an error presence cannot reach a superseded registry entry; onPresence reads pendingJoins.get(room), which returns the successor."
+   },
+   {
+    "target": "telegram",
+    "mode": "the fix introduces a new hang",
+    "detail": "O_NOFOLLOW without O_NONBLOCK still blocks in the open on a squatted FIFO."
+   },
+   {
+    "target": "telegram",
+    "mode": "the prescribed test matrix has a green cell for the disclosure",
+    "detail": "with only symlink-file and no symlink-empty, the store-path cell PASSES under the reintroduced defect, because compaction's rename repairs the link first."
+   },
+   {
+    "target": "zulip",
+    "mode": "the fix is worse than the defect",
+    "detail": "passing DEFAULT_DEADLINE_MS (30s) would hang a blockMs:200 call for thirty seconds on a black hole. The record's repro list contained only answerable latency."
+   },
+   {
+    "target": "postgres",
+    "mode": "the critic noticed the refuting fact and drew the opposite conclusion",
+    "detail": "the prescribed memo fix would let a 10ms fetchRecent end the socket of a healthy dial a concurrent subscribe was waiting on."
+   },
+   {
+    "target": "core-auth",
+    "mode": "the fix is the same defect one level down",
+    "detail": "a sub-budget shed newest-first IS an ordering: with the flood plus the owner in the anonymous tier, the owner is newest and is taken first."
+   },
+   {
+    "target": "slack",
+    "mode": "the prescription creates a guard that cannot be graded",
+    "detail": "an entry clamp AND a loop guard are each independently sufficient, so no single mutation reddens and either can later be deleted with the suite green."
+   },
+   {
+    "target": "shared",
+    "mode": "the finding's DIAGNOSIS is wrong while the defect is real",
+    "detail": "it claimed the true arm had 'no working control' and that the fix would turn the row RED. The control existed and passes; only attribution was missing. Believing it would have sent the agent hunting for something already there."
+   }
   ]
+ },
+ "lintsShippedWithHoles": {
+  "note": "Four this round, one of them the operator's. Every tool written to detect vacuous tests was itself initially vacuous, in a different way each time.",
+  "cases": [
+   "discord: a text scanner blinded by an apostrophe in a comment and a quote inside a regex, silently missing two of the files it was written to catch. Ships as an AST walk with both breaking shapes as controls.",
+   "shared: the stripper's own template-literal pattern held a bare backtick that paired with one twenty lines later, swallowing the code between and reporting two bounds the file never wrote.",
+   "shared: the row written to grade that stripper was a DUD \u2014 a lone backtick passes under the broken stripper too, because a runaway needs a pair. Caught only by mutating it.",
+   "operator: verify-mutations.sh emitted '-' as the sentinel for an absent field and then passed it to vitest as a name filter, so five telegram mutations were graded against zero tests and reported as failures. The agent's claims were sound; the instrument was not."
+  ]
+ },
+ "redsThatWereNotReds": [
+  "Two vitest runs killed under CPU contention, reported as red by a script that had not yet learned a timeout is not proof.",
+  "postgres: an unbounded await in a finally timed the test out and suppressed the assertion it was there to make.",
+  "core-seam: a mutation reddened three rows by TIMING NOISE and the control row it was aimed at passed by luck. The agent discarded it and substituted a deterministic one rather than report a clean sweep."
+ ],
+ "guardScopeMeasurements": {
+  "note": "New this round, and the most transferable discipline it produced: 'I watched it fail' is weaker than it sounds unless you count WHICH rows failed.",
+  "cases": [
+   "postgres: under the query_timeout mutation exactly ONE of eleven rows fails. The others run at pool_size 5, so the pool dials another connection and connectionTimeoutMillis ends the call \u2014 the statement ceiling is never reached. pool_size: 1 was load-bearing while looking incidental.",
+   "core-auth: mutating the eviction order reddened TWO tests, and the second failed in its SETUP, not its subject \u2014 it hard-coded 'the newest registration is evicted' to construct its victim. A future ordering change would have produced a second red that misdirects a bisect.",
+   "core-engine: under the leak-detector mutation, 185 matrix rows stay green and only the negative control reddens \u2014 which is the entire argument for having the control."
+  ]
+ },
+ "declaredSurvivors": [
+  "core-engine: a front door named `buildProbeDoor` is invisible to the run-time name walk and caught only by the typechecker. The agent OMITTED it from the manifest on purpose, stating that replayed through vitest it would report as a survivor because its detector is tsc. The first time in this run an agent refused to let a mechanical check produce a misleading number in the favourable direction."
+ ],
+ "carriedToRound17": [
+  {
+   "item": "packages/bridge-core/src/engine/presence.test.ts asserts a 500ms WALL-CLOCK CPU budget in a suite that runs in parallel. Two round-16 agents independently reproduced it failing AT THE PRISTINE BASE with their own changes stashed (501.02ms vs 500), on a 4-core box at load ~12; it passes 125/125 in isolation.",
+   "why not fixed here": "No round-16 finding covers src/engine's presence budget, and converting an absolute CPU bound into something load-tolerant risks weakening a ReDoS guard. It needs an agent under the full contract, not an operator edit mid-round.",
+   "note": "The file already carries a matchCost() calibration helper, so a ratio against a measured baseline is available without inventing one."
+  },
+  "The shared-CLI promotion across ten packages, the five comment-lint implementations, and eight packages declaring MIT with no LICENSE \u2014 all three are the `repo` target's blocking findings, deliberately run last and alone because they touch every package.",
+  "core-seam declined to grade the TEXT of a doc; a future author can still write a false sentence beside a correct WIRE_VISIBILITY row. Closing it needs disclosures moved into .describe() so they become values, not a keyword regex over source."
+ ],
+ "netSourceLines": "-936 across the repo target alone, so the round satisfies the standing simplify-first rule while closing every finding",
+ "repoTargetAdjudications": {
+  "note": "The repo target produced three adjudications that are better results than fixes, because each is a MEASUREMENT that contradicted the prescription.",
+  "cases": [
+   "The prescribed any-skip CI gate cannot ship: 3 of 5 baseline skips are testCtx.skip() calls conformance makes because telegram declares concurrentPost unsupported \u2014 a capability stated in the repo, not an absent dependency. It would redden CI permanently. The gate judges each describe GROUP instead.",
+   "The prescribed comment-lint promotion would have forced 233 edits: the risk-connective rule flags 157 repo-wide lines, 'argues it's safe' 55, 'earlier revision' 21 \u2014 and most are correct prose. Only the two rules measuring ZERO offenders were promoted. A rule that flags 157 correct lines is not a repo-wide rule.",
+   "The boundary rule as filed is wrong: 'no path may leave my directory' trips 18 files, 15 legitimately. The invariant is LANDING INSIDE another package; restated that way it reports exactly the 3 real violations with no exception list.",
+   "The finding was wrong about nats \u2014 it forks the authority parse, deliberately and documented (URL canonicalizes an integer-form IPv4 host for ws: but not nats:), not the security predicate.",
+   "The prescribed xmpp fix was a regression: plaintextRemoteOrigin answers undefined on a parse failure, so the schemeless DNS-SRV form host:5222 \u2014 which xmpp treats as unknown transport and therefore unsafe \u2014 would have gone silent."
+  ]
+ },
+ "instrumentDefectsFound": [
+  "scripts/verify-mutations.sh dropped a mutated file's MODE on restore, so an executable came back 0644 and the dirty-tree check reported a restored mutation as un-restored.",
+  "scripts/verify-mutations.sh left dist/ POISONED: tsc -b calls a project up to date when inputs predate outputs, and the backup's timestamp predates the build the mutated source produced, so an entry executing a built artifact graded the PREVIOUS entry's defect. The obvious repair for the mode bug (copy2) makes this one worse by preserving the old mtime.",
+  "A build guard's mtime-based dist-staleness check is a false positive against tsc, which keys on content: restoring a file byte-for-byte leaves src newer than a dist tsc will not rewrite, and the suite skips itself away. It had silently skipped 81 assertions on a current build.",
+  "The BEL-byte class recurred twice more: once in a telegram fixture landed by an earlier round-16 remediation, and once in the operator's own commit message describing the fix for it, refused by the tool that checks commit text. Five occurrences now, every one a copy rather than a decision."
+ ],
+ "blastRadius": "The two earlier replays that spawned built binaries (xmpp, slack) hold. The harness counts a red only when expectFail matches the NAMED assertion, and a poisoned-dist failure surfaces as a staleness error or a different assertion. That requirement was added earlier for an unrelated reason \u2014 a timeout is not proof \u2014 so two independently motivated guards covered each other's blind spots."
 }
