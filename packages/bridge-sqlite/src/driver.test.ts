@@ -48,46 +48,119 @@ describe('openDriver file permissions', () => {
   });
 });
 
-// A fresh-file delete→WAL conversion racing another opener must NOT crash connect(). SQLite does
-// not consult the busy handler for a journal-mode change, so openDriver sets busy_timeout first,
-// bounded-retries the WAL pragma, and degrades to the default journal mode rather than throwing
-// "database is locked".
-describe.skipIf(BetterCtor === null)('openDriver concurrent first-boot WAL race', () => {
-  it('retries then degrades to a usable driver instead of throwing when WAL conversion is blocked', () => {
-    const Ctor = BetterCtor as new (p: string) => RawConn;
-    const dir = mkdtempSync(join(tmpdir(), 'parley-sqlite-wal-'));
-    const dbPath = join(dir, 'p.db');
+/**
+ * `synchronous = NORMAL` is a WAL-mode bargain: under WAL a power loss costs recent transactions,
+ * under a rollback journal it risks the file itself. So what has to hold is the PAIRING, on every
+ * way an open can end — including the ones that never reach WAL — rather than either value alone
+ * on the one path where both happen to be right.
+ *
+ * The rows below are how an open ends, not where the code lives: a fresh file, a first-boot
+ * conversion a peer holds the write lock through for the whole (synchronous) call, and a store no
+ * journal mode can be applied to. Each carries the precondition it claims, so a fixture that stops
+ * provoking its own case fails instead of grading nothing.
+ */
+describe.skipIf(BetterCtor === null)('what an open leaves the journal mode and the sync level at', () => {
+  const FULL = 2;
+  const BUSY_TIMEOUT_MS = 200;
 
-    // Connection A: a fresh delete-mode file holding an IMMEDIATE write lock, so the delete→WAL
-    // conversion openDriver runs cannot acquire its exclusive lock — the exact first-boot race.
-    const a = new Ctor(dbPath);
-    a.exec('PRAGMA busy_timeout = 0');
-    a.exec('CREATE TABLE t (x)');
-    a.exec('BEGIN IMMEDIATE');
-    a.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+  const scratch = (name: string): string => join(mkdtempSync(join(tmpdir(), 'parley-sqlite-wal-')), name);
+  const read = (d: ReturnType<typeof openDriver>, name: string): unknown =>
+    Object.values(d.prepare(`PRAGMA ${name}`).get() as Record<string, unknown>)[0];
 
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    let d: ReturnType<typeof openDriver> | undefined;
-    try {
-      // Pre-fix openDriver ran `PRAGMA journal_mode = WAL` FIRST (0 ms window) and threw
-      // "database is locked". Post-fix: busy_timeout first, bounded WAL retry, then degrade →
-      // a usable driver with no throw out of connect().
-      expect(() => {
-        d = openDriver(dbPath, { busyTimeoutMs: 200 });
-      }).not.toThrow();
-      expect(d).toBeDefined();
-      // It degraded loudly (WAL never converted while A held the lock the whole time).
-      const warned = spy.mock.calls.some(([c]) => /WAL conversion still busy/.test(String(c)));
-      expect(warned).toBe(true);
-    } finally {
-      spy.mockRestore();
-    }
+  const OPENS: Array<{
+    name: string;
+    onDisk: boolean;
+    walReachable: boolean;
+    arrange(): { path: string; release(): void };
+  }> = [
+    {
+      name: 'a fresh store nothing is contending for',
+      onDisk: true,
+      walReachable: true,
+      arrange: () => ({ path: scratch('p.db'), release: () => {} }),
+    },
+    {
+      name: 'a first-boot conversion a peer holds the write lock through',
+      onDisk: true,
+      walReachable: false,
+      arrange: () => {
+        const path = scratch('p.db');
+        // A fresh delete-mode file under an IMMEDIATE write lock: the delete→WAL conversion cannot
+        // take its exclusive lock, and the lock is held across the whole synchronous open, so no
+        // retry budget can reach WAL here. SQLite-level locking, so this provokes as root too.
+        const a = new (BetterCtor as new (p: string) => RawConn)(path);
+        a.exec('PRAGMA busy_timeout = 0');
+        a.exec('CREATE TABLE t (x)');
+        a.exec('BEGIN IMMEDIATE');
+        a.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+        return {
+          path,
+          release: () => {
+            a.exec('COMMIT');
+            a.close();
+          },
+        };
+      },
+    },
+    {
+      name: 'an in-memory store no journal mode applies to',
+      onDisk: false,
+      walReachable: false,
+      arrange: () => ({ path: ':memory:', release: () => {} }),
+    },
+  ];
 
-    a.exec('COMMIT');
-    expect(() => (d as ReturnType<typeof openDriver>).exec('SELECT 1')).not.toThrow();
-    (d as ReturnType<typeof openDriver>).close();
-    a.close();
-  });
+  for (const c of OPENS) {
+    it(`${c.name}: never leaves the sync level below FULL outside WAL`, () => {
+      const { path, release } = c.arrange();
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let d: ReturnType<typeof openDriver> | undefined;
+      let threw: Error | undefined;
+      try {
+        d = openDriver(path, { busyTimeoutMs: BUSY_TIMEOUT_MS });
+      } catch (e) {
+        threw = e as Error;
+      } finally {
+        spy.mockRestore();
+      }
+
+      try {
+        const mode = d === undefined ? undefined : String(read(d, 'journal_mode')).toLowerCase();
+        const sync = d === undefined ? undefined : Number(read(d, 'synchronous'));
+
+        expect(
+          d !== undefined && mode === 'wal',
+          `${c.name}: the fixture no longer decides whether WAL is reached — the row grades nothing`,
+        ).toBe(c.walReachable);
+
+        if (sync !== undefined && sync < FULL) {
+          expect(
+            mode,
+            `synchronous=${sync} outside WAL risks the store itself, not just its last transactions`,
+          ).toBe('wal');
+        }
+
+        if (c.onDisk) {
+          expect(
+            mode === 'wal' || threw !== undefined,
+            'a connection that never reached WAL was handed out anyway: peers lose the concurrent ' +
+              'read/write property for this process’s whole lifetime, on one line of stderr',
+          ).toBe(true);
+          if (threw !== undefined) expect(threw.message).toMatch(/WAL/);
+        } else {
+          expect(
+            threw,
+            'a store with no journal to keep has no WAL to reach: refusing one is not the fix',
+          ).toBeUndefined();
+        }
+
+        if (d !== undefined) expect(Number(read(d, 'busy_timeout'))).toBe(BUSY_TIMEOUT_MS);
+      } finally {
+        d?.close();
+        release();
+      }
+    });
+  }
 });
 
 /**
@@ -100,21 +173,41 @@ describe.skipIf(BetterCtor === null)('openDriver concurrent first-boot WAL race'
  */
 describe('the WAL conversion retries contention and nothing else', () => {
   const walSql = /journal_mode/;
-  const stub = { fail: undefined as Error | undefined, walAttempts: 0, closes: 0 };
+  const stub = {
+    fail: undefined as Error | undefined,
+    /** What a `PRAGMA journal_mode` read-back reports, whatever the conversion claimed. */
+    mode: 'delete',
+    walAttempts: 0,
+    closes: 0,
+    sql: [] as string[],
+  };
 
   class StubDb {
     exec(sql: string): void {
+      stub.sql.push(sql);
       if (!walSql.test(sql)) return;
       stub.walAttempts++;
       if (stub.fail !== undefined) throw stub.fail;
     }
-    prepare(): { run: () => unknown; get: () => unknown; all: () => unknown[] } {
-      return { run: () => ({ lastInsertRowid: 0, changes: 0 }), get: () => undefined, all: () => [] };
+    prepare(sql: string): { run: () => unknown; get: () => unknown; all: () => unknown[] } {
+      return {
+        run: () => ({ lastInsertRowid: 0, changes: 0 }),
+        get: () => (walSql.test(sql) ? { journal_mode: stub.mode } : undefined),
+        all: () => [],
+      };
     }
     close(): void {
       stub.closes++;
     }
   }
+
+  const reset = (fail: Error | undefined, mode: string): void => {
+    stub.fail = fail;
+    stub.mode = mode;
+    stub.walAttempts = 0;
+    stub.closes = 0;
+    stub.sql = [];
+  };
 
   /** Load driver.ts against a stub native module, so the pragma can fail with any class on demand. */
   async function loadWithStub(): Promise<typeof import('./driver.js')> {
@@ -175,11 +268,9 @@ describe('the WAL conversion retries contention and nothing else', () => {
   ];
 
   for (const c of CLASSES) {
-    it(`${c.name} ${c.waitsItOut ? 'is retried then degraded' : 'propagates on the first attempt'}`, async () => {
+    it(`${c.name} ${c.waitsItOut ? 'is retried, then fails naming contention' : 'propagates on the first attempt'}`, async () => {
       const { openDriver: open, WAL_RETRIES: retries } = await loadWithStub();
-      stub.fail = c.make();
-      stub.walAttempts = 0;
-      stub.closes = 0;
+      reset(c.make(), 'delete');
       const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       let threw: string | undefined;
       let lines: string[] = [];
@@ -196,20 +287,61 @@ describe('the WAL conversion retries contention and nothing else', () => {
       } finally {
         spy.mockRestore();
       }
-      const stillBusy = lines.filter((l) => /WAL conversion still busy/.test(l));
+      // The outcome is the raised error, not a line: a degrade announced on stderr and then served
+      // anyway is what an MCP stdio host discards.
+      expect(lines).toEqual([]);
 
       if (c.waitsItOut) {
-        expect(threw).toBeUndefined();
+        expect(threw).toMatch(new RegExp(`WAL conversion still busy after ${retries} retries`));
+        expect(threw).toContain(c.make().message);
         expect(stub.walAttempts).toBe(retries + 1);
-        expect(stillBusy).toHaveLength(1);
-        expect(stillBusy[0]).toContain(c.make().message);
         expect(elapsed).toBeLessThan(2000);
+        expect(stub.closes).toBe(1);
         return;
       }
       expect(threw).toBe(c.make().message);
       expect(stub.walAttempts).toBe(1);
-      expect(stillBusy).toEqual([]);
+      expect(threw).not.toMatch(/WAL conversion still busy/);
       expect(elapsed).toBeLessThan(150);
+      expect(stub.closes).toBe(1);
+    });
+  }
+
+  /**
+   * The other half of the same class, and the half no exception announces: SQLite answers a
+   * journal-mode change it cannot honour — the documented case is a filesystem with no shared
+   * memory — with the mode it kept rather than with an error. So "the pragma did not throw" is not
+   * evidence the precondition holds, and the sync level must be decided on the mode read back.
+   */
+  const READBACKS: Array<{ name: string; mode: string; converted: boolean }> = [
+    { name: 'a conversion the read-back confirms', mode: 'wal', converted: true },
+    { name: 'a conversion the store quietly refused, raising nothing', mode: 'delete', converted: false },
+  ];
+
+  for (const r of READBACKS) {
+    it(`${r.name}: the sync level follows the mode read back`, async () => {
+      const { openDriver: open } = await loadWithStub();
+      reset(undefined, r.mode);
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let threw: string | undefined;
+      try {
+        open(join(mkdtempSync(join(tmpdir(), 'parley-wal-')), 'p.db')).close();
+      } catch (e) {
+        threw = e instanceof Error ? e.message : String(e);
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(stub.walAttempts).toBe(1);
+      expect(
+        stub.sql.some((s) => /synchronous\s*=\s*NORMAL/i.test(s)),
+        `journal_mode read back as "${r.mode}": lowering the sync level here trades the store, not its last transactions`,
+      ).toBe(r.converted);
+      if (r.converted) {
+        expect(threw).toBeUndefined();
+        return;
+      }
+      expect(threw).toMatch(/reported no error but left journal_mode=delete/);
       expect(stub.closes).toBe(1);
     });
   }

@@ -183,6 +183,15 @@ Every connection opens with `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = 
 `post` from another bridge instance retries instead of erroring. This is what makes multiple
 bridge processes writing the same file (or the conformance suite's `concurrentPost` check) safe.
 
+"Every connection" is enforced, not assumed. The WAL conversion is the one pragma with a
+precondition — SQLite refuses a journal-mode change under a peer's write lock, and does not consult
+`busy_timeout` for it — so a first-boot race (two bridges opening a brand-new file at once) is
+bounded-retried and the resulting mode is then read back. A connection that did not reach WAL is
+**refused, not served**: `connect()` fails naming the contention rather than running the store in a
+rollback journal, where readers block the writer and `synchronous = NORMAL` is no longer
+corruption-safe. WAL is persistent, so the race exists only until the file is first converted —
+retrying the connect resolves it.
+
 `synchronous = NORMAL` buys that throughput at a stated price: in WAL mode a transaction that has
 already committed **can be lost on power loss or an OS crash** before the next checkpoint (the file
 itself is never corrupted — this is a durability trade, not an integrity one). So a `post()` can

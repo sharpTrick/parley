@@ -16,8 +16,9 @@ function openDb(path) {
     const { DatabaseSync } = require('node:sqlite');
     db = new DatabaseSync(path);
   }
-  // Keep the same pragma order as driver.ts — busy_timeout first, then a bounded-retried WAL
-  // conversion — so that a first-boot race against another opener degrades instead of crashing.
+  // Keep the same pragma order AND the same WAL precondition as driver.ts — busy_timeout first,
+  // a bounded-retried conversion, then synchronous only once WAL has been read back — so that this
+  // writer cannot put the shared file in a mode the plugin refuses to serve it in.
   db.exec('PRAGMA busy_timeout = 5000');
   for (let i = 0; ; i++) {
     try {
@@ -25,17 +26,17 @@ function openDb(path) {
       break;
     } catch (e) {
       if (i >= 20) {
-        // Degrade to the default journal mode rather than crash the writer.
-        process.stderr.write(
-          `concurrent-writer: WAL conversion still busy after ${i} retries; ` +
-            `continuing in default journal mode: ${e instanceof Error ? e.message : String(e)}\n`,
+        throw new Error(
+          `concurrent-writer: WAL conversion still busy after ${i} retries: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
         );
-        break;
       }
       const sab = new Int32Array(new SharedArrayBuffer(4));
       Atomics.wait(sab, 0, 0, 5 + i);
     }
   }
+  const mode = String(Object.values(db.prepare('PRAGMA journal_mode').get())[0]).toLowerCase();
+  if (mode !== 'wal') throw new Error(`concurrent-writer: journal_mode is ${mode}, not wal`);
   db.exec('PRAGMA synchronous = NORMAL');
   return db;
 }

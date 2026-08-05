@@ -102,7 +102,7 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   if (onDisk) precreate(path);
   const driver = openConnection(path);
   try {
-    applyPragmas(driver, opts.busyTimeoutMs ?? 5000);
+    applyPragmas(driver, opts.busyTimeoutMs ?? 5000, onDisk);
   } catch (e) {
     // Keep the close on the failure path, so that a caller retrying a permanently-failing open —
     // a supervisor restarting a bridge against a typo'd path — cannot leak a handle per attempt.
@@ -159,15 +159,35 @@ function versionHint(e: unknown): string {
   );
 }
 
-/** How many times a lock-classed WAL conversion is retried before the driver degrades. */
+/** How many times a lock-classed WAL conversion is retried before the open fails. */
 export const WAL_RETRIES = 20;
 
-function applyPragmas(driver: SqlDriver, busyTimeoutMs: number): void {
+function journalMode(driver: SqlDriver): string {
+  const row = driver.prepare('PRAGMA journal_mode').get() as Record<string, unknown> | undefined;
+  return String(Object.values(row ?? {})[0] ?? '').toLowerCase();
+}
+
+function walUnreachable(mode: string, contention: unknown): Error {
+  const why =
+    contention === undefined
+      ? `reported no error but left journal_mode=${mode}`
+      : `still busy after ${WAL_RETRIES} retries, leaving journal_mode=${mode}: ${errMessage(contention)}`;
+  return new Error(
+    `parley-sqlite: WAL conversion ${why}. Refusing the connection rather than serving the store ` +
+      'in a rollback journal: WAL is what lets peer bridges read and write one file concurrently, ' +
+      'and it is the only journal mode `synchronous = NORMAL` is corruption-safe in. WAL is ' +
+      'persistent, so a first-boot race resolves itself — retry once the peer holding the write ' +
+      'lock commits.',
+  );
+}
+
+function applyPragmas(driver: SqlDriver, busyTimeoutMs: number, onDisk: boolean): void {
   // Keep busy_timeout first AND the WAL conversion bounded-retried, so that a fresh-file
-  // delete→WAL conversion racing another opener cannot crash connect(): SQLite does NOT consult
-  // the busy handler for a journal-mode change, so it returns SQLITE_BUSY immediately even with
-  // a timeout set.
+  // delete→WAL conversion racing another opener is waited out rather than failing connect() on
+  // the first attempt: SQLite does NOT consult the busy handler for a journal-mode change, so it
+  // returns SQLITE_BUSY immediately even with a timeout set.
   driver.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  let contention: unknown;
   for (let i = 0; ; i++) {
     try {
       // WAL: readers don't block the single writer; multiple processes can post concurrently.
@@ -179,12 +199,7 @@ function applyPragmas(driver: SqlDriver, busyTimeoutMs: number): void {
       // its own error instead of ~300 ms of blocking spin and a line blaming a peer's write lock.
       if (classifyDbError(e) !== 'lock') throw e;
       if (i >= WAL_RETRIES) {
-        // WAL is persistent; the conversion race only exists until the file is first converted.
-        // Degrade rather than crash connect(): the default journal mode is still correct.
-        process.stderr.write(
-          `parley-sqlite: WAL conversion still busy after ${i} retries; ` +
-            `continuing in default journal mode: ${errMessage(e)}\n`,
-        );
+        contention = e;
         break;
       }
       // Synchronous few-ms backoff (openDriver is sync): Atomics.wait on a throwaway buffer.
@@ -192,5 +207,13 @@ function applyPragmas(driver: SqlDriver, busyTimeoutMs: number): void {
       Atomics.wait(sab, 0, 0, 5 + i); // ~5–25 ms, monotonically backing off
     }
   }
+  // A memory store has no journal to keep and no disk to lose; neither pragma below applies.
+  if (!onDisk) return;
+  // Keep the read-back as the gate — not which branch left the loop, and not the absence of an
+  // exception (SQLite answers a journal-mode change it cannot honour with the mode it kept) — so
+  // that `synchronous = NORMAL`, a WAL-mode bargain, is never left on a connection running a
+  // rollback journal, where it trades the store's integrity rather than its last transactions.
+  const mode = journalMode(driver);
+  if (mode !== 'wal') throw walUnreachable(mode, contention);
   driver.exec('PRAGMA synchronous = NORMAL');
 }
