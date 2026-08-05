@@ -143,6 +143,22 @@ just carried in the token. `channel_map` must agree across configs that share to
 > Instances that never open a gateway socket — no `subscribe`, no `block_ms` long-poll — cost
 > nothing against it and need not be counted.
 
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-discord --config parley.config.yaml
+# or: node packages/bridge-discord/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-discord
+parley-discord --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another bot token, `channel_map`, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
+
 ## Tests
 
 ```

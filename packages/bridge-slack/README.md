@@ -229,6 +229,22 @@ server — all pointed at the same workspace:
   configs silently splits history in two. Keep the map identical everywhere.
 - **`api_url`** — leave defaulted in production; it exists for tests.
 
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-slack --config parley.config.yaml
+# or: node packages/bridge-slack/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-slack
+parley-slack --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another workspace's `bot_token` and `app_token`, its own `channel_map`, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
+
 ## Conformance
 
 ```bash

@@ -183,6 +183,22 @@ upstream-Zulip gotchas — see
   configured `EXTERNAL_HOST`; in Docker, a network alias for that hostname is the simplest fix.
   Configure `EXTERNAL_HOST` rather than hand-widening host validation in custom settings.
 
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-zulip --config parley.config.yaml
+# or: node packages/bridge-zulip/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-zulip
+parley-zulip --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another site url, bot email and api key, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
+
 ## Tests
 
 ```

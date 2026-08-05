@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
-import { installShutdown, type ShutdownHost } from './shutdown.js';
+import { installShutdown, type ShutdownHost } from './backend-cli.js';
 
 /**
  * The bridge's teardown runs once, from four independent triggers. Grade the shipped wiring, not a

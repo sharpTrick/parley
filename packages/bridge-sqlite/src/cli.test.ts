@@ -1,10 +1,9 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { parseArgs, SQLITE_VERSION, USAGE } from './args.js';
 import { MAX_PAGE } from './index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -13,37 +12,21 @@ const repoRoot = join(pkgDir, '..', '..');
 // The built CLI (dist/cli.js) — the real orphaning drive runs the compiled entrypoint as a child.
 const CLI = join(pkgDir, 'dist', 'cli.js');
 
-/** Newest mtime among the sources tsc actually emits — test files are excluded from the build. */
-function newestSourceMtime(dir: string): number {
-  return readdirSync(dir, { withFileTypes: true }).reduce((newest, e) => {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) return Math.max(newest, newestSourceMtime(p));
-    if (!e.name.endsWith('.ts') || e.name.endsWith('.test.ts')) return newest;
-    return Math.max(newest, statSync(p).mtimeMs);
-  }, 0);
-}
-
 /**
- * A test that executes `dist/` grades whatever the last build left behind, so build it here
- * rather than assuming a prior `npm run build` — an edit to `src/cli.ts` must not pass against a
- * stale artifact, and a missing one must not surface as an opaque spawn error.
+ * A test that executes `dist/` grades whatever the last build left behind, so build it here rather
+ * than assuming a prior `npm run build`. `tsc -b` decides whether the artifact matches `src/`;
+ * `--force` is only for the case it gets wrong, a deleted `dist/` under a tsbuildinfo that still
+ * reports the project up to date.
  */
 beforeAll(() => {
-  const stale = (): boolean => {
-    try {
-      return statSync(CLI).mtimeMs < newestSourceMtime(join(pkgDir, 'src'));
-    } catch {
-      return true;
-    }
-  };
-  if (!stale()) return;
-  // --force, so that a deleted dist rebuilds: tsbuildinfo sits outside dist and otherwise reports
-  // the project up to date while the artifact this test executes is gone.
-  execFileSync('npx', ['tsc', '-b', 'packages/bridge-sqlite', '--force'], {
-    cwd: repoRoot,
-    stdio: 'pipe',
-  });
-  expect(stale(), `run \`npm run build\`: ${CLI} is missing or older than src/`).toBe(false);
+  execFileSync('npx', ['tsc', '-b', 'packages/bridge-sqlite'], { cwd: repoRoot, stdio: 'pipe' });
+  if (!existsSync(CLI)) {
+    execFileSync('npx', ['tsc', '-b', 'packages/bridge-sqlite', '--force'], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+    });
+  }
+  expect(existsSync(CLI), `run \`npm run build\`: ${CLI} is missing`).toBe(true);
 }, 180_000);
 
 const tmpDirs: string[] = [];
@@ -57,89 +40,12 @@ afterAll(() => {
 });
 
 /**
- * The default config names a whole other deployment — its own db_path, handle and topic allowlist.
- * Falling back to it because an argument was mistyped, or because the shell ate `--config`'s value,
- * starts a bridge against the wrong conversation store with nothing but a discarded stderr line to
- * say so. Every argument this CLI cannot honour has to stop it.
+ * The argv table this file used to carry lives in `@sharptrick/parley-core`'s CLI module, where the
+ * one parser all ten bins run is graded once, and the spawned half — every bin, `--help`,
+ * `--version` and a refusal naming the flag — is a row per manifest in
+ * `@sharptrick/parley-conformance`. What stays here is what is about SQLITE: a config value this
+ * plugin constrains, a stale persisted cursor against this store, and the orphan drive.
  */
-describe('CLI argument parsing refuses what it cannot honour', () => {
-  const ENV = { PARLEY_CONFIG: undefined } as unknown as NodeJS.ProcessEnv;
-
-  const CASES: Array<{ argv: string[]; expect: (r: ReturnType<typeof parseArgs>) => void }> = [
-    { argv: [], expect: (r) => expect(r).toEqual({ kind: 'run', config: 'parley.config.yaml' }) },
-    { argv: ['--config', 'a.yaml'], expect: (r) => expect(r).toEqual({ kind: 'run', config: 'a.yaml' }) },
-    { argv: ['-c', 'a.yaml'], expect: (r) => expect(r).toEqual({ kind: 'run', config: 'a.yaml' }) },
-    { argv: ['--config=a.yaml'], expect: (r) => expect(r).toEqual({ kind: 'run', config: 'a.yaml' }) },
-    { argv: ['--config'], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['-c'], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['--config='], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['--config', '--verbose'], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['--confg', 'a.yaml'], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['extra'], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['--config', 'a.yaml', 'extra'], expect: (r) => expect(r.kind).toBe('error') },
-    { argv: ['--help'], expect: (r) => expect(r).toEqual({ kind: 'print', text: USAGE }) },
-    { argv: ['--version'], expect: (r) => expect(r).toEqual({ kind: 'print', text: SQLITE_VERSION }) },
-  ];
-
-  for (const c of CASES) {
-    it(`${JSON.stringify(c.argv)}`, () => {
-      c.expect(parseArgs(c.argv, ENV));
-    });
-  }
-
-  it('PARLEY_CONFIG supplies the default, and --config still wins', () => {
-    const env = { PARLEY_CONFIG: 'from-env.yaml' } as unknown as NodeJS.ProcessEnv;
-    expect(parseArgs([], env)).toEqual({ kind: 'run', config: 'from-env.yaml' });
-    expect(parseArgs(['--config', 'cli.yaml'], env)).toEqual({ kind: 'run', config: 'cli.yaml' });
-  });
-
-});
-
-/**
- * Which stream an argv outcome lands on is part of the CLI's contract, and the two informational
- * flags are the ones a script consumes: `V=$(parley-sqlite --version)` and `parley-sqlite --help |
- * less` are empty and blank if they answer on stderr, silently and with a success exit code. Both
- * exit before the MCP transport exists, so the stdout-is-JSON-RPC rule does not reach them; a
- * refusal still belongs on stderr with a non-zero exit. Each row asserts the OTHER stream is empty,
- * so a future flag cannot be routed to the wrong one.
- */
-describe('every pre-server argv outcome answers on the right stream (e2e)', () => {
-  interface Outcome {
-    argv: string[];
-    stream: 'stdout' | 'stderr';
-    exit: number;
-    says: string;
-  }
-
-  const OUTCOMES: Outcome[] = [
-    { argv: ['--version'], stream: 'stdout', exit: 0, says: SQLITE_VERSION },
-    { argv: ['-V'], stream: 'stdout', exit: 0, says: SQLITE_VERSION },
-    { argv: ['--help'], stream: 'stdout', exit: 0, says: 'usage: parley-sqlite' },
-    { argv: ['-h'], stream: 'stdout', exit: 0, says: 'usage: parley-sqlite' },
-    { argv: ['--confg', 'a.yaml'], stream: 'stderr', exit: 2, says: "unrecognised argument '--confg'" },
-    { argv: ['--config'], stream: 'stderr', exit: 2, says: '--config requires a path' },
-  ];
-
-  async function runCli(argv: string[]): Promise<{ code: number | null; out: Record<string, string> }> {
-    const child = spawn(process.execPath, [CLI, ...argv], { stdio: ['pipe', 'pipe', 'pipe'] });
-    const out: Record<string, string> = { stdout: '', stderr: '' };
-    child.stdout.on('data', (d: Buffer) => (out['stdout'] += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (out['stderr'] += d.toString()));
-    const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
-    return { code, out };
-  }
-
-  for (const o of OUTCOMES) {
-    it(`${o.argv.join(' ')} answers on ${o.stream} and exits ${o.exit}`, async () => {
-      const { code, out } = await runCli(o.argv);
-      const other = o.stream === 'stdout' ? 'stderr' : 'stdout';
-      expect(code).toBe(o.exit);
-      expect(out[o.stream]).toContain(o.says);
-      expect(out[other]).toBe('');
-      expect(`${out['stdout']}${out['stderr']}`).not.toMatch(/bridge up/);
-    });
-  }
-});
 
 function writeConfig(
   dir: string,

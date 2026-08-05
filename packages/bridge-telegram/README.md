@@ -182,6 +182,22 @@ unrepresentable). Run **exactly one telegram bridge per bot token**; for multipl
 sessions, provision one bot per session (which also restores per-session sender attribution)
 or fan sessions out over a self-hosted backend and bridge Telegram once.
 
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-telegram --config parley.config.yaml
+# or: node packages/bridge-telegram/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-telegram
+parley-telegram --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another bot token, `chat_map`, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
+
 ## Tests
 
 ```
