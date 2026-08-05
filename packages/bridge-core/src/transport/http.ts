@@ -2,6 +2,7 @@ import type { Server as NodeHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type RequestHandler } from 'express';
+import { hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
@@ -237,6 +238,11 @@ export function createRemoteHttpApp(
   app.post(mcpPath, protect, express.json(), handlePost);
   app.get(mcpPath, protect, methodNotAllowed);
   app.delete(mcpPath, protect, methodNotAllowed);
+
+  // Keep this LAST, and here rather than in each caller, so that a failure raised by the framework
+  // itself — an oversized or unparseable body, an unsupported charset — reaches it instead of
+  // Express's default handler, which renders err.stack into the response body.
+  hardenErrorSurface(app);
 
   let httpServer: NodeHttpServer | undefined;
   let starting = false;

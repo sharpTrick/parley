@@ -3,14 +3,19 @@ import type { AddressInfo } from 'node:net';
 import { STATUS_CODES } from 'node:http';
 import express, { type Response as ExpressResponse } from 'express';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { parseConfig, type ParleyConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
+import {
+  BOOT_ENVS,
+  FRONT_DOORS,
+  TRIGGERS,
+  appFor,
+  closeFrontDoors,
+  internalsLeaked,
+  triggerNamed,
+  type BootEnv,
+  type FrontDoor,
+  type Trigger,
+} from '../testing/front-doors.js';
 import { hardenErrorSurface } from './error-surface.js';
-import { createOidcRemoteApp } from './oidc-remote.js';
-import { ownerVerifierFromPassphrase } from './owner.js';
-import { createOAuthRemoteApp } from './remote.js';
-import type { RemoteAuthServer } from './remote-auth.js';
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -22,163 +27,10 @@ function freePort(): Promise<number> {
   });
 }
 
-let plugin: FakePlugin;
-let idp: FakeOidc;
-
-beforeAll(async () => {
-  plugin = new FakePlugin();
-  await plugin.connect({});
-  idp = await startFakeOidc();
-});
-afterAll(async () => {
-  await plugin.disconnect();
-  await idp.close();
-});
-
-function baseCfg(): ParleyConfig {
-  return parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] });
-}
-
-/**
- * Express picks its stack-rendering branch from the app's `env`, which it seeds from NODE_ENV at
- * construction, so the boot environment is an axis of this matrix rather than a fixture: the
- * shipped run command in examples/self-host-remote/README.md sets neither.
- */
-const BOOT_ENVS = ['unset', 'development', 'production'] as const;
-type BootEnv = (typeof BOOT_ENVS)[number];
-
-interface Booted {
-  server: RemoteAuthServer;
-  base: string;
-  authorization: string;
-}
-
-/**
- * Every front door hardenErrorSurface is applied to. A control applied in one factory and forgotten
- * in the next is invisible unless the matrix is driven from this list — each door supplies the
- * routes it actually mounts and a bearer for its own /mcp, so that a framework failure reaches the
- * body parser instead of stopping at a 401 and proving nothing.
- */
-interface FrontDoor {
-  name: string;
-  routes: readonly string[];
-  /** Route + trigger whose failure really does reach the terminal handler on this door. */
-  terminal: { route: string; trigger: string; status: number };
-  boot: (port: number) => Promise<Booted>;
-}
-
-const FRONT_DOORS: FrontDoor[] = [
-  {
-    name: 'built-in OAuth',
-    routes: ['/mcp', '/authorize', '/token', '/register', '/revoke', '/parley/consent'],
-    terminal: { route: '/parley/consent', trigger: 'body over the 100 KB parser limit (urlencoded)', status: 413 },
-    boot: async (port) => {
-      const base = `http://127.0.0.1:${port}`;
-      const server = createOAuthRemoteApp(plugin, baseCfg(), {
-        issuerUrl: new URL(base),
-        verifyOwner: ownerVerifierFromPassphrase('open sesame'),
-      });
-      const minted = (
-        server.provider as unknown as {
-          issue(clientId: string, scopes: string[], resource: string): { access_token: string };
-        }
-      ).issue('error-surface-probe', ['mcp'], server.resource.href);
-      return { server, base, authorization: `Bearer ${minted.access_token}` };
-    },
-  },
-  {
-    name: 'delegated OIDC',
-    routes: ['/mcp'],
-    terminal: { route: '/mcp', trigger: 'body over the 100 KB parser limit (json)', status: 413 },
-    boot: async (port) => {
-      const base = `http://127.0.0.1:${port}`;
-      const server = await createOidcRemoteApp(plugin, baseCfg(), {
-        publicUrl: new URL(base),
-        oidc: { issuer: idp.issuer, allowed_subjects: ['owner-sub'] } as never,
-      });
-      const token = await idp.mint({ aud: server.resource.href });
-      return { server, base, authorization: `Bearer ${token}` };
-    },
-  },
-];
-
-const apps = new Map<string, Booted>();
-
-async function appFor(door: FrontDoor, env: BootEnv): Promise<Booted> {
-  const key = `${door.name}|${env}`;
-  const existing = apps.get(key);
-  if (existing !== undefined) return existing;
-  const before = process.env.NODE_ENV;
-  if (env === 'unset') delete process.env.NODE_ENV;
-  else process.env.NODE_ENV = env;
-  try {
-    const port = await freePort();
-    const booted = await door.boot(port);
-    await booted.server.listen(port);
-    apps.set(key, booted);
-    return booted;
-  } finally {
-    if (before === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = before;
-  }
-}
-
-afterAll(async () => {
-  for (const { server } of apps.values()) await server.close();
-  apps.clear();
-});
-
-/**
- * Failures raised by the framework itself, before any Parley handler runs — the ones no route's own
- * try/catch can see, which is exactly why they reach Express's default handler.
- */
-interface Trigger {
-  name: string;
-  headers: Record<string, string>;
-  body: string;
-}
-
-const TRIGGERS: Trigger[] = [
-  {
-    name: 'body over the 100 KB parser limit (urlencoded)',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: `passphrase=${'a'.repeat(200_000)}`,
-  },
-  {
-    name: 'body over the 100 KB parser limit (json)',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: ['x'.repeat(200_000)] }),
-  },
-  {
-    name: 'unparseable body for the declared type',
-    headers: { 'content-type': 'application/json' },
-    body: '{"redirect_uris":',
-  },
-  {
-    name: 'unsupported charset',
-    headers: { 'content-type': 'application/json; charset=utf-7' },
-    body: '{}',
-  },
-  {
-    name: 'content-encoding that does not match the body',
-    headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
-    body: 'not gzip at all',
-  },
-];
-
-const triggerNamed = (name: string): Trigger => {
-  const found = TRIGGERS.find((t) => t.name === name);
-  if (found === undefined) throw new Error(`no trigger named ${name}`);
-  return found;
-};
-
-const CWD = process.cwd();
-const STACK_FRAME = /\bat \S+ \(/;
+afterAll(closeFrontDoors);
 
 function expectNoInternals(body: string): void {
-  expect(body).not.toContain('node_modules');
-  expect(body).not.toContain(CWD);
-  expect(body).not.toMatch(STACK_FRAME);
+  expect(internalsLeaked(body), body).toEqual([]);
 }
 
 const MATRIX = FRONT_DOORS.flatMap((door) =>
