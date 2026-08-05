@@ -112,7 +112,15 @@ describe('isLoopbackHost', () => {
  * place and left wrong in the others. That is a claim about the repo, and only a scan of the repo
  * can hold it — `bridge-discord` imports `isLoopbackHost` from here and re-implements
  * `plaintextRemoteOrigin` with the opposite fail direction, which no test in either package could
- * see. Every fork that exists today is recorded BY NAME below, so the next one fails here.
+ * see.
+ *
+ * Two scans, because one of them was keyed on NAME COLLISION with an export of this module and a
+ * fork that picks a different identifier is invisible to it. `bridge-xmpp` had one: an
+ * `isPlaintextRemote` carrying its own `/^127(\.\d{1,3}){3}$/`, which read the registrable
+ * hostnames `127.999.999.999` and `127.00.0.1` as loopback and silenced the only warning on a path
+ * where SASL PLAIN is registered unconditionally. So the second scan asks what a declaration DOES:
+ * a module-level function that decides something about a loopback address, and does not ask this
+ * module, is a fork whatever it is called.
  */
 describe('no consumer re-implements an export of this package', () => {
   /**
@@ -144,6 +152,47 @@ describe('no consumer re-implements an export of this package', () => {
         /^(?:export )?(?:async )?(?:function|const|class) (\w+)/gm,
       )) {
         if (exported.has(m[1] as string)) out.push(`${pkg}:${m[1] as string}`);
+      }
+    }
+    return [...new Set(out)];
+  };
+
+  /**
+   * A loopback literal in a decision. Anchored on what the classification is MADE of rather than on
+   * what the function is called: `isPlaintextRemote`, `plaintextRemoteServer` and `isLoopbackHost`
+   * are three names for one question, and only the third collides with an export here.
+   */
+  const LOOPBACK_LITERAL = /'localhost'|"localhost"|`localhost`|\b127\.\d|::1/;
+  const DELEGATES = /\b(?:isLoopbackHost|plaintextRemoteOrigin)\s*\(/;
+
+  /** A module-level declaration and the source down to the next one — its body, near enough. */
+  const declarations = (code: string): { name: string; body: string }[] => {
+    const heads = [
+      ...code.matchAll(/^(?:export\s+)?(?:async\s+)?(?:function|const|class|let)\s+([\w$]+)/gm),
+    ];
+    return heads.map((m, i) => ({
+      name: m[1] as string,
+      body: code.slice(
+        m.index as number,
+        i + 1 < heads.length ? (heads[i + 1] as RegExpMatchArray).index : code.length,
+      ),
+    }));
+  };
+
+  /** Whether the declaration is a function at all — a default `'xmpp://127.0.0.1'` decides nothing. */
+  const isFunction = (body: string): boolean =>
+    /^(?:export\s+)?(?:async\s+)?function\s/.test(body) ||
+    /=\s*(?:async\s+)?function\b/.test(body) ||
+    /=\s*(?:async\s*)?\(?[\w$,\s:]*\)?\s*(?::[^=]*)?=>/.test(body);
+
+  /** `<package>:<name>` for every function that classifies a loopback host without asking here. */
+  const classifiers = (root?: URL, selfDir?: string): string[] => {
+    const out: string[] = [];
+    for (const { pkg, code } of consumerPackageSources(root, selfDir)) {
+      for (const { name, body } of declarations(code)) {
+        if (isFunction(body) && LOOPBACK_LITERAL.test(body) && !DELEGATES.test(body)) {
+          out.push(`${pkg}:${name}`);
+        }
       }
     }
     return [...new Set(out)];
@@ -220,6 +269,55 @@ describe('no consumer re-implements an export of this package', () => {
           .map(({ path }) => path)
           .sort(),
       ).toEqual(['fake-consumer/src/deep/uses.ts', 'fake-consumer/test/deep/also.ts']);
+    });
+  });
+
+  it('no consumer decides a loopback host without asking this module', () => {
+    expect(
+      classifiers().filter((fork) => !(fork in KNOWN_FORKS)),
+      'this function classifies a loopback address on its own — call isLoopbackHost, or record ' +
+        'here why it cannot',
+    ).toEqual([]);
+  });
+
+  /**
+   * The scan that matters most is the one with nothing left to find, so it is run against a tree
+   * built to contain the shape. Both directions: a differently-named fork must be REPORTED, and a
+   * function that delegates, or a constant that merely spells an address, must not.
+   */
+  describe('a fork under a name this module does not export', () => {
+    const plantConsumer = (body: string): URL => {
+      const root = pathToFileURL(`${mkdtempSync(join(tmpdir(), 'net-util-fork-'))}/`);
+      mkdirSync(new URL('./fake-consumer/src/', root), { recursive: true });
+      writeFileSync(
+        new URL('./fake-consumer/src/index.ts', root),
+        `import { fetchWithRetry } from '${SELF}';\nvoid fetchWithRetry;\n`,
+      );
+      writeFileSync(new URL('./fake-consumer/src/config.ts', root), body);
+      return root;
+    };
+
+    it.each([
+      [
+        'a differently-named loopback classifier',
+        "export function isPlaintextRemote(h: string): boolean {\n  return !(h === 'localhost' || /^127\\./.test(h));\n}\n",
+        true,
+      ],
+      [
+        'an arrow function deciding the same thing',
+        "const safe = (h: string): boolean => h === 'localhost' || h === '::1';\n",
+        true,
+      ],
+      [
+        'a function that asks this module instead',
+        "export function isPlaintextRemote(h: string): boolean {\n  // 127.0.0.1 is the default\n  return !isLoopbackHost(h);\n}\n",
+        false,
+      ],
+      ['a default value that spells an address', "export const DEFAULT = 'xmpp://127.0.0.1:5222';\n", false],
+      ['a function with no loopback literal in it', 'export function f(x: string): string {\n  return x;\n}\n', false],
+    ])('%s is reported: %s', (_label, body, reported) => {
+      const found = classifiers(plantConsumer(body), 'nothing-here');
+      expect(found.length > 0).toBe(reported);
     });
   });
 

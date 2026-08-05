@@ -126,7 +126,9 @@ fork is outstanding rather than hypothetical: `bridge-discord` needs the scheme 
 well as the origin to name, which a `string | undefined` return cannot carry, so it classifies with
 a local copy that fails the other way (it warns only about schemes it knows). Widening the return
 here is what retires that copy; until it lands, this package's tests fail on the day a *second*
-fork appears.
+fork appears — by name where one collides with an export here, and by BEHAVIOUR otherwise: a
+module-level function that decides something about a loopback address without asking this package
+is a fork whatever it is called.
 
 ## Constants
 

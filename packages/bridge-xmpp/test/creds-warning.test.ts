@@ -19,6 +19,7 @@ vi.mock('@xmpp/client', async () => {
   return { ...actual, client: () => mockState.client };
 });
 
+import { isLoopbackHost } from '@sharptrick/parley-net-util';
 import { isPlaintextRemote, XmppPlugin } from '../src/index.js';
 import { FakeXmpp } from './fake-xmpp.js';
 
@@ -72,7 +73,17 @@ const forms: Form[] = [
   { name: 'no scheme (DNS-SRV)', service: (h) => h, encrypted: false },
   { name: 'scheme-relative', service: (h) => `//${h}`, encrypted: false },
 ];
-const LOOPBACK = ['127.0.0.1:5222', 'localhost:5222', '[::1]:5222', '::1', '127.0.0.44'];
+const LOOPBACK = [
+  '127.0.0.1:5222',
+  'localhost:5222',
+  '[::1]:5222',
+  '::1',
+  '127.0.0.44',
+  // The fully-written spelling of ::1. A second classifier in this package read it as remote and
+  // warned about a dev homeserver, while every other backend stayed silent on the same address.
+  '[0:0:0:0:0:0:0:1]:5222',
+  '0:0:0:0:0:0:0:1',
+];
 // Hosts that read as loopback to a PREFIX or substring match but are ordinary registrable names
 // their owner points wherever they like, plus two integer spellings of 127.0.0.1 that are not
 // dotted quads. Every LOOPBACK entry is also probed with a domain suffixed onto it, so a loopback
@@ -84,6 +95,10 @@ const LOOKALIKE = [
   'localhost.evil.com',
   '0177.0.0.1',
   '2130706433',
+  // Legal registrable DNS names — all-numeric labels are permitted, and neither is a valid IPv4
+  // literal. A dotted-quad REGEX read both as loopback and silenced the transport warning here.
+  '127.999.999.999',
+  '127.00.0.1',
 ];
 const REMOTE = [
   'xmpp.example.com:5222',
@@ -133,6 +148,25 @@ describe('XMPP transport safety', () => {
       expect(isPlaintextRemote(form.service(host))).toBe(true);
     }
   });
+
+  /**
+   * The loopback half of this backend's answer is the SHARED one, asserted as agreement rather than
+   * as a second table of expectations: a predicate copied per backend is a predicate fixed once and
+   * left wrong everywhere else, and this package's copy disagreed with the shared one in both
+   * directions on hosts no table here listed.
+   */
+  it.each([...LOOPBACK, ...REMOTE].map((host) => [host] as const))(
+    '%s is classified exactly as the shared predicate classifies it',
+    (host) => {
+      const bare = host
+        .replace(/^(\[[^\]]*]):\d+$/, '$1')
+        .replace(/^\[(.*)]$/, '$1')
+        .replace(/^([^:]*):\d+$/, '$1');
+      for (const form of forms.filter((f) => !f.encrypted)) {
+        expect(isPlaintextRemote(form.service(host))).toBe(!isLoopbackHost(bare));
+      }
+    },
+  );
 
   it.each(cells)('$service (password $password) warns as documented', async (cell) => {
     const warned = await connect({

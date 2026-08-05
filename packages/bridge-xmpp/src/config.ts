@@ -1,4 +1,5 @@
 import type { BackendConfig } from '@sharptrick/parley-core';
+import { isLoopbackHost } from '@sharptrick/parley-net-util';
 
 import { JID_PART_MAX_BYTES } from './jid.js';
 import { assertXmlSafe, attributeNormalizedCodepoint, codepointLabel } from './stanzas.js';
@@ -51,18 +52,16 @@ export const DEFAULT_PASSWORD = 'parleypass';
  */
 const ENCRYPTED_SCHEMES = ['xmpps:', 'wss:'];
 /**
- * The whole 127.0.0.0/8 block as an ADDRESS. Keep it anchored at both ends, so that a registrable
- * hostname beginning `127.` cannot be classified loopback and silence the only warning on the
- * cleartext-credential path.
- */
-const LOOPBACK_V4 = /^127(\.\d{1,3}){3}$/;
-
-/**
  * Whether `service` may put the SASL password on the network in the clear. `@xmpp/starttls` upgrades
  * only when the peer ADVERTISES the feature and `@xmpp/client` registers SASL PLAIN unconditionally,
  * so an on-path attacker that strips `<starttls/>` from the stream features is handed the credential.
  * A service carrying no scheme is UNKNOWN transport, not safe transport: `@xmpp/resolve` routes it
  * through DNS-SRV, whose candidate list always ends at a cleartext `xmpp://<addr>:5222`.
+ *
+ * The host is split by hand rather than through `URL`, so that the schemeless DNS-SRV form is
+ * classified at all — but the loopback question is `isLoopbackHost`'s, so that this backend and
+ * every other one answer it identically. A second answer here read `127.999.999.999` and
+ * `127.00.0.1` as loopback, silencing this warning on two registrable hostnames.
  */
 export function isPlaintextRemote(service: string): boolean {
   const trimmed = service.trim();
@@ -74,9 +73,8 @@ export function isPlaintextRemote(service: string): boolean {
     .replace(/^[^@]*@/, '')
     .replace(/^(\[[^\]]*]):\d+$/, '$1')
     .replace(/^\[(.*)]$/, '$1')
-    .replace(/^([^:]*):\d+$/, '$1')
-    .toLowerCase();
-  return !(host === 'localhost' || host === '::1' || LOOPBACK_V4.test(host) || host === '');
+    .replace(/^([^:]*):\d+$/, '$1');
+  return host !== '' && !isLoopbackHost(host);
 }
 
 const describeValue = (v: unknown): string => (typeof v === 'string' ? `'${v}'` : String(v));
