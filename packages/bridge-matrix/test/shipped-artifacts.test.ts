@@ -1,4 +1,4 @@
-import { loadConfig } from '@sharptrick/parley-core';
+import { loadConfig, parseConfig, TOOL_TEXT } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -193,14 +193,12 @@ describe('CI type-checks this package’s test sources rather than skipping it',
  * Each row pins BOTH sides: the string core ships (so a reworded core description fails here rather
  * than diverging in one package unnoticed) and what this README must, and must not, say about it.
  */
-const CORE_SOURCES: Record<string, string> = {
-  'transport/tools.ts': readFileSync(
-    fileURLToPath(new URL('../../bridge-core/src/transport/tools.ts', import.meta.url)),
-    'utf8',
-  ),
-  'config.ts': readFileSync(
-    fileURLToPath(new URL('../../bridge-core/src/config.ts', import.meta.url)),
-    'utf8',
+const CORE_SHIPS: Record<string, string> = {
+  'the parley_fetch_recent description': TOOL_TEXT.fetch_recent,
+  "the block_ms argument's description": TOOL_TEXT.fetch_recent_block_ms,
+  "the since argument's description": TOOL_TEXT.fetch_recent_since,
+  'the catchup defaults a config with none gets': JSON.stringify(
+    parseConfig({ identity: { handle: 'probe' }, topics: ['ops'] }).catchup,
   ),
 };
 /**
@@ -224,8 +222,8 @@ describe('the plugin-source scans below grade the whole package', () => {
 });
 
 interface CoreOwnedClaim {
-  /** The string core ships, and where. */
-  core: { file: keyof typeof CORE_SOURCES; pattern: RegExp };
+  /** The text core ships, named by what it is — imported from core, never read out of its files. */
+  core: { ships: keyof typeof CORE_SHIPS; pattern: RegExp };
   /** What this README must say about it. */
   readme: RegExp;
   /** What it must NOT say: the contradiction this class exists to catch. */
@@ -236,22 +234,22 @@ interface CoreOwnedClaim {
 
 const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
   'block_ms holds an EMPTY window, with or without a since': {
-    core: { file: 'transport/tools.ts', pattern: /If the queried window is empty — whether or not/ },
+    core: { ships: "the block_ms argument's description", pattern: /If the queried window is empty — whether or not/ },
     readme: /Blocking engages on an \*\*empty window, `since` or not\*\*/,
     // The tool routes ANY block_ms > 0 through fetchRecentBlocking, which re-enters with the cursor
     // the first page reported — so a since-less call on an empty topic holds the whole budget.
     forbidden: /returns at once, even on a topic\s+whose room does not exist yet/,
   },
   'the block_ms clamp defaults to 60s': {
-    core: { file: 'config.ts', pattern: /block_max_ms: z[\s\S]{0,400}?\.default\(60_000\)/ },
+    core: { ships: 'the catchup defaults a config with none gets', pattern: /"block_max_ms":60000/ },
     readme: /`catchup\.block_max_ms` \(default 60s\)/,
   },
   'an omitted since means the recent window': {
-    core: { file: 'transport/tools.ts', pattern: /Omit for the recent window/ },
+    core: { ships: "the since argument's description", pattern: /Omit for the recent window/ },
     readme: /`fetchRecent` \(no `since`\)/,
   },
   'an absent topic is an empty page here, never the topicAbsent answer': {
-    core: { file: 'transport/tools.ts', pattern: /topicAbsent: true/ },
+    core: { ships: 'the parley_fetch_recent description', pattern: /topicAbsent: true/ },
     readme: /reads as an empty page/,
     // `topicAbsent` is core's rendering of NoSuchTopicError; this plugin never raises it, which is
     // what makes the README's "empty page" true rather than a second name for the same thing.
@@ -262,8 +260,8 @@ const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
 describe('the README does not contradict the tool semantics core ships', () => {
   it.each(Object.entries(CORE_OWNED_CLAIMS))('%s', (_name, claim) => {
     expect(
-      CORE_SOURCES[claim.core.file],
-      `core reworded ${claim.core.file}: re-read it and re-state the README claim`,
+      CORE_SHIPS[claim.core.ships],
+      `core reworded ${claim.core.ships}: re-read it and re-state the README claim`,
     ).toMatch(claim.core.pattern);
     expect(README).toMatch(claim.readme);
     if (claim.forbidden !== undefined) expect(README).not.toMatch(claim.forbidden);

@@ -7,16 +7,16 @@ import { describe, expect, it } from 'vitest';
 /**
  * What the release actually ships, for EVERY public workspace.
  *
- * Four packages each carry their own copy of this check, and all four are packages that already
- * satisfy it — an invariant asserted only where it already holds is an invariant nobody is
+ * Four packages each carried their own copy of this check, and all four were packages that already
+ * satisfied it — an invariant asserted only where it already holds is an invariant nobody is
  * enforcing. `@sharptrick/parley-core` had no copy, tests live under its `src/`, and its tsconfig
  * had no `exclude`, so 176 compiled test files were 47% of its tarball, every one of them importing
- * `vitest` — a devDependency that cannot resolve in a consumer's install. Nine of thirteen packages
- * declare MIT and ship no LICENSE text.
+ * `vitest` — a devDependency that cannot resolve in a consumer's install.
  *
  * So drive the rows off `scripts/lib/workspaces.mjs`'s `publicWorkspaces()` — the same set the
  * release publishes, read out of the release's own module rather than restated — and a package added
- * tomorrow is graded the day it lands.
+ * tomorrow is graded the day it lands. Grade the TARBALL as well as the checkout: `files` decides
+ * what npm uploads, so a rule read off the working tree can pass on bytes the registry never gets.
  */
 
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
@@ -92,21 +92,36 @@ function bareImports(js: string): string[] {
 const IS_TEST_SOURCE = /\.(?:test|spec)\.[cm]?tsx?$/;
 const IS_TEST_ARTIFACT = /\.(?:test|spec)\./;
 
+/** The tarball npm would upload for every public workspace, as npm itself lists it. */
+function packedFiles(): Record<string, string[]> {
+  const json = execFileSync('npm', ['pack', '--dry-run', '--json', '--workspaces'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const packs = JSON.parse(json) as { name: string; files: { path: string }[] }[];
+  return Object.fromEntries(packs.map((p) => [p.name, p.files.map((f) => f.path)]));
+}
+
 /**
- * Packages that declare a license and ship no LICENSE text. Pinned EXACTLY, so closing one forces
- * its removal here and a new package that repeats the mistake fails as an unexpected entry — the
- * `if (license === undefined) return` escape hatch the per-package copies use never fires at all.
+ * A module-level array of workspace NAMES is the shape this file fell into: a repo-wide invariant
+ * recorded as the list of packages that break it. Nine tarballs claimed MIT and carried no licence
+ * text under a green suite, because the assertion compared the gap against a register of the gap.
+ * A register like that goes green by growing, and the next package to repeat the mistake is one
+ * line from being excused — so the shape itself is what is banned here.
  */
-const LICENSE_GAPS = [
-  '@sharptrick/parley-conformance',
-  '@sharptrick/parley-matrix',
-  '@sharptrick/parley-nats',
-  '@sharptrick/parley-net-util',
-  '@sharptrick/parley-slack',
-  '@sharptrick/parley-telegram',
-  '@sharptrick/parley-xmpp',
-  '@sharptrick/parley-zulip',
-];
+const registriesOfWorkspaceNames = (source: string): string[] =>
+  [...source.matchAll(/^const (\w+)(?::[^=]*)? = \[([\s\S]*?)^\];/gm)]
+    .map(([, name, body]) => ({
+      name: name as string,
+      entries: [...(body as string).matchAll(/'([^']+)'/g)].map((m) => m[1] as string),
+    }))
+    .filter(
+      ({ entries }) =>
+        entries.length > 0 && entries.every((e) => WORKSPACES.some((w) => w.name === e)),
+    )
+    .map(({ name }) => name);
 
 describe('every public workspace ships only what a consumer can run', () => {
   it('reads the release set from the release, and it is the whole repo', () => {
@@ -168,7 +183,7 @@ describe('every public workspace ships only what a consumer can run', () => {
     expect(bareImports("import { readFileSync } from 'node:fs';")).toEqual([]);
   });
 
-  it('a declared license ships its text with the package, everywhere it already does', () => {
+  it('a declared license ships its text with the package', () => {
     const declaring = WORKSPACES.filter(
       (w) => typeof readJson(join(REPO_ROOT, w.dir, 'package.json')).license === 'string',
     );
@@ -176,6 +191,44 @@ describe('every public workspace ships only what a consumer can run', () => {
     const missing = declaring
       .filter((w) => !existsSync(join(REPO_ROOT, w.dir, 'LICENSE')))
       .map((w) => w.name);
-    expect(missing.sort()).toEqual([...LICENSE_GAPS].sort());
+    expect(
+      missing.sort(),
+      '`files: ["dist"]` packs LICENSE only from the package directory — the repo-root one is not ' +
+        'in a workspace tarball. `cp LICENSE` into the package',
+    ).toEqual([]);
+  });
+
+  /**
+   * The working tree is not the tarball: `files` decides what npm uploads, and the two answers
+   * differed for every package here. Graded through `npm pack` itself, so the rule is what the
+   * registry would receive rather than what the checkout happens to hold.
+   */
+  describe('what npm would upload', () => {
+    const PACKED = packedFiles();
+
+    it('lists every public workspace, so the rows below are not an empty table', () => {
+      expect(WORKSPACES.map((w) => w.name).filter((n) => PACKED[n] === undefined)).toEqual([]);
+    });
+
+    it.each(WORKSPACES.map((w) => [w.name] as const))('%s packs its LICENSE and README', (name) => {
+      expect(PACKED[name]).toContain('LICENSE');
+      expect(PACKED[name]).toContain('README.md');
+    });
+  });
+
+  it('records no package as excused from a rule this file grades', () => {
+    const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    expect(
+      registriesOfWorkspaceNames(source),
+      'close the gap rather than registering it: a list of the packages that fail a rule is how ' +
+        'this file went green about eight tarballs with no licence text',
+    ).toEqual([]);
+  });
+
+  it('would see such a register if one came back (positive control)', () => {
+    const planted = `const GAPS = [\n  '${WORKSPACES[0]?.name ?? ''}',\n];\n`;
+    expect(registriesOfWorkspaceNames(planted)).toEqual(['GAPS']);
+    expect(registriesOfWorkspaceNames(`const GAPS = [\n];\n`)).toEqual([]);
+    expect(registriesOfWorkspaceNames(`const WORDS = [\n  'not-a-workspace',\n];\n`)).toEqual([]);
   });
 });

@@ -51,11 +51,6 @@ describe('published tarball hygiene', () => {
     expect(emitted.length).toBeGreaterThan(0);
   });
 
-  it('a declared license ships with the package', () => {
-    if (manifest.license === undefined) return;
-    expect(existsSync(join(pkgDir, 'LICENSE'))).toBe(true);
-  });
-
   const shippedSources = sourcesUnder('src').filter(
     (f) => f.endsWith('.ts') && !/\.(test|spec)\.ts$/.test(f),
   );

@@ -130,14 +130,6 @@ describe('the published tarball carries everything the manifest promises', () =>
     expect(PROMISED.length).toBeGreaterThan(0);
   });
 
-  // npm packs these two only from the PACKAGE directory; the repo-root copies are not in the tarball,
-  // so a consumer running a licence scanner over it sees an unlicensed artifact.
-  it.each(['LICENSE', 'README.md'])('%s sits beside package.json', (name) => {
-    expect(existsSync(join(PKG, name)), `npm packs ${name} only from the package directory`).toBe(
-      true,
-    );
-  });
-
   it.each(PROMISED)('%s is inside the "files" list', (path) => {
     expect(packed(path), `add a "files" entry covering ${path}, or the tarball cannot resolve it`).toBe(
       true,

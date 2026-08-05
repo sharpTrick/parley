@@ -47,11 +47,6 @@ describe('published tarball hygiene', () => {
     expect(emitted.length).toBeGreaterThan(0);
   });
 
-  it('a declared license ships with the package', () => {
-    if (manifest.license === undefined) return;
-    expect(existsSync(join(pkgDir, 'LICENSE'))).toBe(true);
-  });
-
   it('every already-built artifact in dist is publishable', () => {
     if (!existsSync(join(pkgDir, 'dist'))) return;
     const built = sourcesUnder('dist');
