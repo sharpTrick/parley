@@ -52,13 +52,18 @@ PY
   # Apply by literal replacement, and REQUIRE exactly one occurrence. A find string that matches
   # nothing is the silent-no-op this script exists to catch; one that matches twice is ambiguous.
   applied=$(python3 - "$manifest" "$i" <<'PY'
-import json,sys,pathlib
+import json,os,sys,pathlib
 m=json.load(open(sys.argv[1]))[int(sys.argv[2])]
 p=pathlib.Path(m['file']); t=p.read_text()
 n=t.count(m['find'])
 if n != 1:
     print(f"NOMATCH:{n}"); raise SystemExit(0)
-pathlib.Path(str(p)+'.mutbak').write_text(t)
+backup=pathlib.Path(str(p)+'.mutbak')
+backup.write_text(t)
+# The backup is what gets moved back, so it has to carry the MODE. A fresh 644 backup mv-ed over an
+# executable drops the +x bit, and the dirty-tree check then reports a restored mutation as
+# un-restored because only the mode moved.
+os.chmod(backup, p.stat().st_mode)
 p.write_text(t.replace(m['find'], m['replace'], 1))
 print("OK")
 PY
@@ -84,7 +89,12 @@ PY
     fi
   fi
 
+  # Restore, then make it NEWER than anything built from the mutation. `tsc -b` calls a project up
+  # to date when its inputs predate its outputs, and the backup's timestamp predates the build the
+  # mutated source produced — so without this a restored `src/` leaves `dist/` poisoned, and the
+  # next entry that executes a built artifact grades the previous entry's defect.
   mv "$file.mutbak" "$file"
+  touch "$file"
 done
 
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
