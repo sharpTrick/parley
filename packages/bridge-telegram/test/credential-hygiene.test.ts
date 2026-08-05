@@ -174,7 +174,7 @@ describe('telegram diagnostics never carry the bot token', () => {
  */
 describe('telegram diagnostics on a well-formed answer', () => {
   /** ECHO first, so that the credential survives the truncation the padding after it forces. */
-  const echoOf = (url: string): string => `${ECHO}\n${url}${'A'.repeat(MAX_ERROR_BODY * 2)}`;
+  const echoOf = (url: string): string => `${ECHO}\n${url}\u0007${'A'.repeat(MAX_ERROR_BODY * 2)}`;
 
   /** A well-formed `ok:true` answer for `method` whose every string-valued result field is `echo`. */
   const answer = (method: string, echo: string): string => {
