@@ -55,20 +55,8 @@ jobs:
       - run: npm test -- --reporter=default --reporter=json --outputFile=/tmp/vitest.json
 
       # Publishing on a green-because-it-skipped run is the failure this guards against.
-      - name: Assert no test file skipped entirely
-        run: |
-          node -e '
-            const r = require("/tmp/vitest.json");
-            const dead = r.testResults.filter(
-              (f) => f.assertionResults.length > 0 && f.assertionResults.every((a) => a.status === "skipped"),
-            );
-            if (dead.length) {
-              console.error("refusing to release — these test files skipped ENTIRELY:");
-              for (const f of dead) console.error("  " + f.name);
-              process.exit(1);
-            }
-            console.log(`ok: 0 of ${r.testResults.length} test files skipped entirely`);
-          '
+      - name: Assert no test skipped itself
+        run: node scripts/assert-no-skipped-tests.mjs /tmp/vitest.json
 
       - name: Server logs on failure
         if: failure()

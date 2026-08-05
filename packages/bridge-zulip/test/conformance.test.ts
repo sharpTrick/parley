@@ -244,8 +244,7 @@ if (gate.kind === 'run') {
       expect.fail(gate.reason);
     });
   });
-} else {
-  describe.skip(`seam conformance: zulip (real) — ${gate.reason}`, () => {
-    it('not requested', () => undefined);
-  });
 }
+// A `skip` decision registers nothing at all. Keep it absent rather than a skipped placeholder, so
+// that CI's gate can read every skipped group as coverage something took away: this pass runs by
+// hand against a hosted Zulip, and no CI run was ever going to hold those credentials.

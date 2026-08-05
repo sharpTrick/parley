@@ -1,18 +1,20 @@
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-// Class 1: coverage that removes itself when its dependency is absent. CI's gate only fails a test
-// file where EVERY assertion skipped, so a file that mixes always-running fake-backed tests with a
-// server-gated block loses the gated half — the highest-value tests in the package — under a green
-// tick. Server-gated tests therefore live in files that hold nothing else.
-// Class 2: a comment that narrates history instead of warning about a risk. CLAUDE.md: rationale
-// and tracker IDs belong in the commit message, where they cannot rot against the code.
-// Class 3: a shared fixture module exists and a file bypasses it. The gate and the stream cleanup
+// Class: a shared fixture module exists and a file bypasses it. The gate and the stream cleanup
 // are the fixtures most often re-typed, and they are exactly the ones whose drift is invisible: a
 // gate tightened in one copy leaves the other files admitting a server the suite can no longer
 // use, under a green tick. Checked against whatever helpers.ts exports today, not a fixed list.
+/** Every `.ts` under `dir` at ANY depth, so a new subdirectory is a linted row the day it appears. */
+const sourcesUnder = (dir: string): string[] =>
+  readdirSync(dir, { recursive: true })
+    .map(String)
+    .map((f) => f.split(sep).join('/'))
+    .filter((f) => f.endsWith('.ts'));
+
 const here = fileURLToPath(new URL('.', import.meta.url));
 const srcDir = join(here, '..', 'src');
 
@@ -32,11 +34,12 @@ const testFiles = readdirSync(here)
   .filter((f) => f.endsWith('.test.ts') && f !== POLICY_FILE)
   .map((f) => ({ name: f, source: readFileSync(join(here, f), 'utf8') }));
 
-const srcFiles = readdirSync(srcDir)
-  .filter((f) => f.endsWith('.ts'))
-  .map((f) => ({ name: f, source: readFileSync(join(srcDir, f), 'utf8') }));
+const srcFiles = sourcesUnder(srcDir).map((f) => ({
+  name: f,
+  source: readFileSync(join(srcDir, f), 'utf8'),
+}));
 
-describe('nats test hygiene — a gated file must not carry ungated coverage', () => {
+describe('nats test hygiene — one shared fixture, not a copy per file', () => {
   it('finds the test files it is meant to police', () => {
     expect(testFiles.length).toBeGreaterThan(5);
     expect(testFiles.some((f) => /isNatsUp/.test(f.source))).toBe(true);
@@ -61,19 +64,8 @@ describe('nats test hygiene — a gated file must not carry ungated coverage', (
       expect({ file: file.name, redeclared }).toEqual({ file: file.name, redeclared: [] });
     });
   }
-
-  for (const file of testFiles) {
-    it(`${file.name} either gates every test or gates none`, () => {
-      const gated = /isNatsUp|describe\.skip|it\.skip|test\.skip|skipIf/.test(file.source);
-      const topLevel = file.source.match(/^(describe|it|test)(\.each)?\(/gm) ?? [];
-      const ungated = gated ? topLevel : [];
-
-      expect({ file: file.name, ungated }).toEqual({ file: file.name, ungated: [] });
-    });
-  }
 });
 
-const trackerIds = /\b(BUG|SEC|CX|FIX)-\d+\b|\bissues?\s*#\d+/i;
 const stringLiterals = /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g;
 
 /** Every comment in `source`, trailing ones included — a tail on a code line is the usual shape. */
@@ -99,16 +91,30 @@ function comments(source: string): { line: number; text: string }[] {
   return found;
 }
 
+// Tracker IDs are graded for every package by `bridge-core/src/source-hygiene.test.ts`; what is
+// kept here is the evidence that this package HAS the commentary that rule is applied to.
 describe('nats comment discipline — comments warn, they do not narrate history', () => {
   it('finds the comments it is meant to police', () => {
     const all = srcFiles.flatMap((f) => comments(f.source));
     expect(all.length).toBeGreaterThan(20);
     expect(all.some((c) => c.text.includes('so that'))).toBe(true);
   });
+});
 
-  for (const file of srcFiles) {
-    it(`${file.name} cites no tracker ID in a comment`, () => {
-      expect(comments(file.source).filter((c) => trackerIds.test(c.text))).toEqual([]);
-    });
-  }
+/**
+ * The walk against a tree built to defeat a flat one — run through the SAME function the lint runs
+ * through, never a second listing typed out here. A `readdirSync(SRC)` that does not recurse keeps
+ * passing the day this package grows an `src/` subdirectory, and a `files.length > 0` guard cannot
+ * tell that from a full scan.
+ */
+describe('the lint sees every source file, at every depth', () => {
+  it('descends into subdirectories', () => {
+    const root = mkdtempSync(join(tmpdir(), 'nats-lint-'));
+    mkdirSync(join(root, 'a', 'b'), { recursive: true });
+    writeFileSync(join(root, 'a', 'b', 'deep.ts'), 'export const x = 1;\n');
+    writeFileSync(join(root, 'shallow.ts'), 'export const y = 1;\n');
+    writeFileSync(join(root, 'notes.md'), 'not a source\n');
+    expect(sourcesUnder(root).sort()).toEqual(['a/b/deep.ts', 'shallow.ts']);
+    rmSync(root, { recursive: true, force: true });
+  });
 });

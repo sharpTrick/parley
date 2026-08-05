@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import {
   mkdirSync,
   mkdtempSync,
@@ -478,5 +479,151 @@ describe('no workflow publishes on a gate weaker than the pull-request gate', ()
     expect(firesAutomatically(plantWorkflow(onPush, GATE))).toBe(true);
     // A workflow that only NAMES the release in a comment does not publish.
     expect(publishes(`# semantic-release picks the bump\n${reference}`)).toBe(false);
+  });
+});
+
+/**
+ * The gate that stops a self-skipping suite from reading as a passing one — graded by RUNNING it,
+ * not by reading the workflow that calls it.
+ *
+ * It used to be a `node -e` script pasted into both workflows, and it failed only a test file whose
+ * EVERY assertion skipped. Fourteen files across seven packages mix a server-gated block with
+ * ungated ones, so the gated half could vanish — `bridge-xmpp`'s MAM paging is that backend's whole
+ * catch-up mechanism — while the file still reported passes and the gate printed "0 of N skipped".
+ *
+ * Rows below are the shapes that distinction turns on, run through the shipped script over planted
+ * reports, so neither the rule nor the exit code can drift from what CI executes.
+ */
+describe('the skip gate CI runs', () => {
+  const REPO_DIR = fileURLToPath(new URL('../../../', import.meta.url));
+
+  /** Every `node scripts/*.mjs` step of a workflow's test-gate job — the shape this gate is run as. */
+  const scriptSteps = (workflow: string): string[] =>
+    testGateOf(workflow).filter((step) => /^node\s+scripts\/\S+\.mjs\b/.test(step));
+
+  const workflowFiles = (): string[] =>
+    readdirSync(WORKFLOWS)
+      .filter((f) => /\.ya?ml$/.test(f))
+      .sort();
+
+  const gating = (): string[] =>
+    workflowFiles().filter(
+      (f) => testGateOf(readFileSync(join(WORKFLOWS, f), 'utf8')).length > 0,
+    );
+
+  const gateSteps = (): string[] =>
+    gating().flatMap((f) => scriptSteps(readFileSync(join(WORKFLOWS, f), 'utf8')));
+
+  it('is one script, spelled the same way by every workflow that gates on the suite', () => {
+    expect(gating().length).toBeGreaterThan(1);
+    expect(gateSteps().length).toBe(gating().length);
+    expect(new Set(gateSteps()).size, 'two workflows run different gates').toBe(1);
+  });
+
+  /** The script the workflows name, so the rows below cannot grade a different implementation. */
+  const GATE_SCRIPT = ((): string => {
+    const named = /^node\s+(scripts\/\S+\.mjs)\b/.exec(gateSteps()[0] ?? '')?.[1] ?? '';
+    return join(REPO_DIR, named);
+  })();
+
+  it('names a script that exists', () => {
+    expect(GATE_SCRIPT).toMatch(/\.mjs$/);
+    expect(statSync(GATE_SCRIPT).isFile()).toBe(true);
+  });
+
+  const CASE = (title: string, status: string, ancestorTitles: string[] = []) => ({
+    title,
+    fullName: [...ancestorTitles, title].join(' '),
+    ancestorTitles,
+    status,
+  });
+
+  const runGate = (report: unknown): { code: number; err: string } => {
+    const dir = mkdtempSync(join(tmpdir(), 'skip-gate-'));
+    const path = join(dir, 'report.json');
+    writeFileSync(path, JSON.stringify(report));
+    const run = spawnSync(process.execPath, [GATE_SCRIPT, path], { encoding: 'utf8' });
+    return { code: run.status ?? -1, err: `${run.stderr}${run.stdout}` };
+  };
+
+  const file = (name: string, assertions: unknown[]): unknown => ({
+    name,
+    assertionResults: assertions,
+  });
+
+  const GATED = 'reads the most-recent window off a real MAM archive';
+
+  it.each([
+    [
+      'a file whose gated describe vanished beside two ungated ones',
+      [
+        file('mam-paging.test.ts', [
+          CASE('pages forward', 'passed', ['MAM paging returns each message once']),
+          CASE('settles', 'passed', ['MAM paging settles instead of spinning']),
+          CASE('reads the window', 'skipped', [GATED]),
+          CASE('reads it again', 'skipped', [GATED]),
+        ]),
+      ],
+      true,
+    ],
+    [
+      'a file whose every assertion skipped',
+      [file('conformance.test.ts', [CASE('a', 'skipped'), CASE('b', 'skipped')])],
+      true,
+    ],
+    [
+      'an inner describe that vanished inside a running outer one',
+      [
+        file('driver.test.ts', [
+          CASE('a', 'passed', ['what an open leaves behind']),
+          CASE('b', 'skipped', ['what an open leaves behind', 'with better-sqlite3']),
+        ]),
+      ],
+      true,
+    ],
+    [
+      'a status this gate has never met',
+      [file('thing.test.ts', [CASE('a', 'passed'), CASE('b', 'todo', ['a group'])])],
+      true,
+    ],
+    // The half that must NOT fire: the conformance suite skips its concurrency cases for a backend
+    // whose context declares one writer. That is a capability stated in the repo, beside siblings
+    // that ran — not a dependency that failed to come up.
+    [
+      'cases the plugin declared unsupported, beside running siblings',
+      [
+        file('conformance.test.ts', [
+          CASE('post round-trips', 'passed', ['seam conformance: telegram']),
+          CASE('concurrent writers', 'skipped', ['seam conformance: telegram']),
+          CASE('multi-process writes', 'skipped', ['seam conformance: telegram']),
+        ]),
+      ],
+      false,
+    ],
+    ['a run in which everything ran', [file('a.test.ts', [CASE('a', 'passed')])], false],
+    ['a run in which something failed', [file('a.test.ts', [CASE('a', 'failed')])], false],
+  ])('refuses %s: %s', (_label, testResults, refused) => {
+    const { code } = runGate({ testResults });
+    expect(code).toBe(refused ? 1 : 0);
+  });
+
+  it('names the group it refuses, so the operator knows which server did not come up', () => {
+    const { err } = runGate({
+      testResults: [
+        file('mam-paging.test.ts', [
+          CASE('pages forward', 'passed', ['ungated']),
+          CASE('reads the window', 'skipped', [GATED]),
+        ]),
+      ],
+    });
+    expect(err).toContain(GATED);
+    expect(err).toContain('mam-paging.test.ts');
+    expect(err).not.toContain('ungated');
+  });
+
+  // A gate handed nothing has nothing to disagree with, and every report shape above would pass it.
+  it('refuses a report with no test files at all', () => {
+    expect(runGate({ testResults: [] }).code).toBe(1);
+    expect(runGate({}).code).toBe(1);
   });
 });

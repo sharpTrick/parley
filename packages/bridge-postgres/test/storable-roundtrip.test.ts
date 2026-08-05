@@ -94,7 +94,3 @@ describe.skipIf(!up)(`a value this backend accepts is read back byte-identical (
     ).toEqual([]);
   });
 });
-
-describe.skipIf(up)('a value this backend accepts is read back byte-identical', () => {
-  it(`skipped — start postgres (examples/dev-compose) at ${PG_URL} to run`, () => undefined);
-});

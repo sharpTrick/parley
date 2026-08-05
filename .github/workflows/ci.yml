@@ -49,23 +49,12 @@ jobs:
       # One run, two reporters: the readable log for humans and JSON for the skip gate below.
       - run: npm test -- --reporter=default --reporter=json --outputFile=/tmp/vitest.json
 
-      # A self-skipping suite is indistinguishable from a passing one in the summary line, so
-      # assert the property this job exists to provide: on CI, no file skips. Any backend whose
-      # server failed to come up silently removes its own coverage and still reports success.
-      - name: Assert no test file skipped entirely
-        run: |
-          node -e '
-            const r = require("/tmp/vitest.json");
-            const dead = r.testResults.filter(
-              (f) => f.assertionResults.length > 0 && f.assertionResults.every((a) => a.status === "skipped"),
-            );
-            if (dead.length) {
-              console.error("these test files skipped ENTIRELY — their server was unreachable:");
-              for (const f of dead) console.error("  " + f.name);
-              process.exit(1);
-            }
-            console.log(`ok: 0 of ${r.testResults.length} test files skipped entirely`);
-          '
+      # A self-skipping suite is indistinguishable from a passing one in the summary line, so assert
+      # the property this job exists to provide. One script, run by every workflow that gates on the
+      # suite — a second copy of this rule is a second rule to strengthen, and the copy that was here
+      # only saw a test file whose EVERY assertion skipped, which no mixed file ever is.
+      - name: Assert no test skipped itself
+        run: node scripts/assert-no-skipped-tests.mjs /tmp/vitest.json
 
       - name: Server logs on failure
         if: failure()
