@@ -1,0 +1,704 @@
+[
+ {
+  "target": "core-seam",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "concurrency-and-failure",
+  "theme": "lifecycle-teardown",
+  "class": "listener-armed-after-the-event",
+  "file": "packages/bridge-core/src/cli/backend-cli.ts",
+  "line": 129,
+  "summary": "`runBackendCli` installs the stdin-EOF shutdown listeners AFTER `createStdioBridge` has already put `process.stdin` into flowing mode, so an EOF that arrives during attach is emitted with nobody listening and is never re-delivered. This is the exact orphan `installShutdown`'s own doc says the stdin events exist to catch: \"an orphaned bridge (parent crashed or SIGKILLed) gets EOF and no signal, so without them it heart-beats a ghost peer into every peer's roster\".",
+  "failure": "Launch any backend bin whose parent is already gone (or simply `parley-redis --config x.yaml < /dev/null`) with the README's recommended `live_push: { enabled: true }`. Ordering: `createStdioBridge` \u2192 `bridge.attach` \u2192 `server.connect(transport)` \u2192 SDK `StdioServerTransport.start()` attaches `stdin.on('data')` (flowing mode; the SDK never listens for 'end' or 'close' \u2014 node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js:30-31) \u2192 `await startPushLoop(...)` awaits `plugin.subscribe()`, which is real network I/O for every network backend (bridge-redis/src/index.ts:265 `await this.connectReader(reader)`) \u2192 only then does `runBackendCli` call `installShutdown`. Reproduced standalone: with one macrotask in that window `process.stdin.readableEnded === true` and neither the 'end' nor the 'close' listener ever fires (`fired=[]`); with the listeners registered before the await, `fired=[\"end\"]`. Wrong output: `bridge.shutdown()` never runs \u2014 no presence `goodbye`, no `plugin.disconnect()`, no `server.close()`; for a socket-holding backend the process never exits and heartbeats a ghost peer into every peer's `parley_list_users` roster.",
+  "remediation": "Arm the guard against the state, not only the event: after registering the listeners in `installShutdown`, synchronously check whether EOF has already happened. Widen `ShutdownHost['stdin']` to `{ on(...): unknown; readableEnded?: boolean }` and append `if (host.stdin.readableEnded === true) shutdown();` after the two `stdin.on` calls. The existing `shuttingDown` latch makes the check idempotent against a later real 'end'. (Re-ordering `installShutdown` before `createStdioBridge` is not sufficient on its own and is awkward, because the teardown closure needs a bridge that does not exist yet.)",
+  "testUpgrade": "Guard the CLASS \"a lifecycle listener armed after its event can still be missed\", not this one call site. Replace `cli/shutdown.test.ts`'s stub-host table (which by construction can never observe ordering \u2014 every trigger fires after `installShutdown` returns) with a parameterized case over a REAL `Readable`: for each of {already ended before install, ends during install, ends after install} \u00d7 {0, 1, 2 macrotasks of delay between putting the stream in flowing mode and calling `installShutdown`}, assert `onShutdown` ran exactly once. Add a matching row for a stream `destroy()`ed without an 'end'. The existing `SEQUENCES` table is too narrow to have caught this because it fires every trigger through an EventEmitter the test itself controls, after registration.",
+  "remediationCheck": {
+   "reliesOn": "Node's `stream.Readable.prototype.readableEnded`, true once 'end' has been emitted \u2014 verified in the repro (`readableEnded= true fired= []`). Also relies on the existing branch `if (shuttingDown) return;` in `installShutdown`, so the added call cannot double-tear-down when a real 'end' follows.",
+   "newlyAccepts": "none \u2014 no argv or config that is rejected today becomes accepted.",
+   "newlyRejects": "A bridge started with stdin already at EOF now tears down immediately instead of serving. `parley-sqlite --config x.yaml < /dev/null`, which today runs indefinitely, would exit at once. That is the intended semantics for a stdio MCP server (no parent, no client) but it IS a visible behaviour change for anyone smoke-testing a bin that way.",
+   "testsThatWouldFail": "none found. I applied the patch to the real tree and ran `npx vitest run packages/bridge-core packages/conformance`: 62 files / 3784 tests passed. I looked specifically at `cli/shutdown.test.ts` (its `wire()` passes a bare `EventEmitter` as `stdin`, so `readableEnded` is `undefined` and the strict `=== true` never fires \u2014 all 12 sequences unaffected), `transport/root-lifecycle.test.ts` and `transport/root-teardown-bounds.test.ts` (neither goes through `installShutdown`).",
+   "hidesOrFixes": "It fixes the reported case rather than hiding it: the whole defect is that EOF already happened, and `readableEnded` is precisely that state. What would still be broken: a stdin `destroy()`ed without ever emitting 'end' leaves `readableEnded === false`, so that path stays uncovered; adding `|| host.stdin.destroyed === true` would cover it but risks firing on an unrelated destroy, so it needs its own decision.",
+   "interleavings": "Two orderings matter. (a) EOF before `installShutdown`: listeners are registered, then the synchronous `readableEnded` check fires `shutdown()` once; the latch is set, so nothing else can run it. (b) EOF after `installShutdown`: the check sees `false`, the 'end' listener fires later and runs `shutdown()` once. Two callers on the new path: a SIGTERM racing the synchronous check \u2014 there is no await between registration and the check, so a signal handler cannot interleave before it; whichever lands first sets `shuttingDown` and the other returns immediately. No new suspension point is introduced.",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-seam",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "capability-promise-vs-enforcement",
+  "class": "documented-widening-silently-clamped",
+  "file": "packages/bridge-core/src/config.ts",
+  "line": 96,
+  "summary": "Both the operator-facing README and the `post_topics` field doc promise that a pattern widens post/fetch to any FULLY-MATCHING topic, with no mention of the 64-character `MAX_MATCH_INPUT` ceiling `Allowlist.has` actually enforces. The config loader accepts topics up to 512 characters (`beatString`), so the disagreeing region is reachable by an ordinary deployment. `MAX_MATCH_INPUT` is not exported from the barrel either, so a consumer has no way to name the limit the docs omit.",
+  "failure": "`parseConfig({ identity: { handle: 'h' }, topics: ['ctx-demo'], post_topics: ['ops-.*'] })` loads clean. `allowlistFor(cfg).has('ops-' + 'a'.repeat(61))` (a 65-character topic that fully matches `ops-.*`) returns `false`, and `assert` throws `topic not allowed: \"ops-aaa\u2026\" \u2014 post_topics patterns are only matched against topics of at most 64 characters (this one is 65); list it in `topics` instead`. The same 65-character string is accepted verbatim in `topics:` by the loader. README lines 62-63 (`post_topics: [\"ops-.*\"]  # optional: WIDENS post/fetch to any fully-matching topic`) and README's \"Every topic argument goes through the topic `Allowlist`, which accepts a topic listed in `config.topics` **or** one fully matching a `post_topics` pattern\" are both false in that region, as is `Allowlist`'s own class doc (\"the EXPLICIT list PLUS any `post_topics` pattern match\") and `AllowlistOptions.postPatterns`'s doc, which names the count cap and the ReDoS screen but not the input clamp.",
+  "remediation": "State the ceiling everywhere the widening is promised: the `post_topics` field doc in config.ts, the `Allowlist` class doc and `AllowlistOptions.postPatterns` in allowlist.ts, and the README's `post_topics` comment and Allowlist paragraph \u2014 'a pattern is only matched against topics of at most 64 characters; list a longer topic in `topics`'. Export `MAX_MATCH_INPUT` from index.ts so the number a consumer must respect is nameable rather than hardcoded. Do not raise the clamp: mutating it away made the suite hang in catastrophic backtracking, so it is load-bearing.",
+  "testUpgrade": "Guard the CLASS \"every capability the core README promises is executed against the code\", which is the gap that let this ship: `bridge-sqlite`, `bridge-redis` and `bridge-postgres` each ship a readme-truth suite and `@sharptrick/parley-core` \u2014 the package whose README IS the public API doc \u2014 ships none. Add `packages/bridge-core/src/readme-truth.test.ts` that extracts the README's config sample and its Allowlist paragraph and executes them, parameterized over topic lengths derived from `MAX_MATCH_INPUT` ({4, MAX-1, MAX, MAX+1, MAX_TOPIC_LEN}) crossed with the README's own `post_topics` example, asserting the README states whichever verdict the code gives at each length. `allowlist.test.ts`'s MATCH_ROWS already grades the clamp correctly but derives its expectation from `MAX_MATCH_INPUT`, so it can never notice that no prose anywhere mentions it.",
+  "remediationCheck": {
+   "reliesOn": "`Allowlist.has`'s `if (topic.length > MAX_MATCH_INPUT) return false;` (allowlist.ts:119) and `assert`'s `overLong` branch, which already produce the correct runtime message; the fix touches only prose plus one added `export` in index.ts.",
+   "newlyAccepts": "none \u2014 the doc fix changes no behaviour. Exporting `MAX_MATCH_INPUT` adds a symbol to the public surface (a `feat:`-level, non-breaking addition).",
+   "newlyRejects": "none.",
+   "testsThatWouldFail": "none found. `index.test.ts`'s `trimmed` list does not contain `MAX_MATCH_INPUT`, so adding the export breaks no 'does not re-export the trimmed internal' row; its `kept` list only asserts presence, so a new export adds no row. `stated-bounds.test.ts` reads `MAX_MATCH_INPUT` from `./regex-safety.js` directly and is unaffected by the barrel. I did not run the patched tree for this one \u2014 the change is prose plus an export line.",
+   "hidesOrFixes": "If the docs are corrected and the clamp remains, an operator with a topic longer than 64 characters still cannot reach it through a pattern \u2014 they must list it in `topics`. That is the intended trade (the clamp is what bounds the ReDoS screen); the point of the fix is that the operator learns it at read time instead of at post time. Nothing is hidden: the runtime error already names the limit.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-seam",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "hand-listed-universe",
+  "class": "scan-over-a-literal-file-list",
+  "file": "packages/bridge-core/src/stated-bounds.test.ts",
+  "line": 607,
+  "summary": "`stated-bounds.test.ts` derives its capacity rows by scanning `CAPACITY_MODULES`, a hard-coded array of four filenames. Its own doc says \"The modules are scanned, so a capacity added to any of them needs a row here rather than arriving unpinned\" \u2014 but 'any of them' is a literal list, so a capacity declared anywhere else in `src/` is never pinned. CLAUDE.md names this shape explicitly: \"Prefer, always: a glob over `src/**` rather than one file path.\"",
+  "failure": "Add `export const MAX_MENTION_LEN = 99;` to `packages/bridge-core/src/mentions.ts` (a src module not in `CAPACITY_MODULES`). Wrong output: `npx vitest run packages/bridge-core packages/conformance` \u2192 62 files / 3784 tests PASS. The 'has a row for every capacity the governed modules export' case never sees it, so a new operator-facing capacity \u2014 or an existing one relocated into a new file during a split \u2014 ships with its VALUE unpinned, which is exactly the failure the surrounding comment (\"with every probe built as `'a'.repeat(bound - 1)`, `MAX_GLOB_LEN = 8` keeps the whole suite green\") exists to prevent.",
+  "remediation": "Replace `CAPACITY_MODULES` with a recursive walk of `src/**/*.ts` excluding `*.test.ts`, keeping the same `^export const ((?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)\\b` extraction. That also brings `engine/presence-beat.ts`'s `MAX_RECORD_TOPICS` / `MAX_INSTANCE_ID_LEN` / `MAX_HANDLE_LEN` / `MAX_TOPIC_LEN` and `transport/`'s limits into the pinned set \u2014 capacities `config.ts` already imports and caps against. Add a `declared.length` floor derived from the walk (as `source-hygiene.test.ts` does with its 'reaches every workspace package, at every depth' case) so a broken walk cannot go green by finding nothing.",
+  "testUpgrade": "Guard the CLASS \"a lint whose UNIVERSE is a literal list\". Parameterize the discovery: assert the walk reaches every directory under `src/` that contains a non-test `.ts` file (derived from the tree, not listed), and add a positive control that plants a temp file exporting a `MAX_*` constant in a scratch tree and asserts the extractor reports it. Do the same for `index.test.ts`'s `kept`/`trimmed` arrays and `regex-corpus.ts`'s membership pins \u2014 all three are hand-written universes over derived rows.",
+  "remediationCheck": {
+   "reliesOn": "`readFileSync` + the existing `/^export const ((?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)\\b/gm` regex, and `readdirSync(..., { recursive: true })` as `index.test.ts:15` already uses within this same package.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "The `declared.sort()` toEqual `CAPACITIES` assertion goes red immediately, because widening the walk pulls in at least `DEFAULT_PRESENCE_TOPIC`, `MAX_RECORD_TOPICS`, `MAX_INSTANCE_ID_LEN`, `MAX_HANDLE_LEN`, `MAX_TOPIC_LEN` and the transport limits. Each needs a `Capacity` row with a literal `expected` and a realistic input before the suite is green again \u2014 that work IS the fix, but it is not a one-line change. Note `DEFAULT_PRESENCE_TOPIC` is a string, so `Capacity.actual`/`expected: number` must widen to `string | number` or the extractor must skip non-numeric declarations.",
+   "testsThatWouldFail": "'has a row for every capacity the governed modules export' fails until every newly-discovered constant gets a row \u2014 by design. I did not apply this remediation, only the mutation that proves the gap; the widening's blast radius above is read off the source, not run.",
+   "hidesOrFixes": "If applied while the habit remains, it fixes this file only \u2014 `index.test.ts`'s `kept` list and `regex-corpus.ts`'s `expect(HOSTILE_PATTERNS.length).toBe(20)` are the same shape and stay open (the CORE_VERSION finding is the `kept` list's instance of it).",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-seam",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "hand-listed-universe",
+  "class": "published-symbol-outside-the-pinned-slice",
+  "file": "packages/bridge-core/src/version.ts",
+  "line": 11,
+  "summary": "`CORE_VERSION` is published API and is what `serverInfo.version` reports to every MCP client (transport/stdio-bridge.ts:46, transport/http.ts:20), and NOTHING grades it. Its value is never compared to the manifest \u2014 despite its own doc claiming that reading `package.json` at runtime is what \"keeps it accurate\" against `scripts/stamp-version.mjs` \u2014 and its presence in the barrel is not in `index.test.ts`'s hand-written `kept` list, so removing a published export from a package that publishes in lockstep is invisible.",
+  "failure": "Two mutations, each run against the whole `packages/bridge-core` + `packages/conformance` suite: (a) `CORE_VERSION = (...).version + '-mut'` \u2192 62 files / 3784 tests PASS; (b) delete `export { CORE_VERSION } from './version.js';` from index.ts \u2192 62 files / 3784 tests PASS. So a refactor to a hardcoded literal \u2014 precisely the drift version.ts's doc warns about \u2014 ships silently reporting a stale version to every connected client, and a removed public export ships as a non-breaking release. `transport/channel-emit.test.ts:46` asserts `client.getServerVersion()?.name` and stops short of `.version`; `conformance/test/published-bins.test.ts` grades each plugin bin's `--version` (which goes through `backend-cli.ts`'s `versionOf`, a different reader) and never core's.",
+  "remediation": "Add a case that reads `packages/bridge-core/package.json` and asserts `CORE_VERSION === manifest.version`, and extend `transport/channel-emit.test.ts`'s server-info assertion from `.name` to `{ name, version }` with the version taken from `CORE_VERSION`. Separately, replace `index.test.ts`'s hand-written `kept` array with a derived pin: read the barrel's own export clauses (the file already does this at line 109 for the `{@link}` rule) and snapshot the full name set, so any removal is a failing row.",
+  "testUpgrade": "Guard the CLASS \"a published symbol outside the hand-written slice can change or vanish unseen\", not the one constant. Derive the barrel's full export set from `index.ts`'s clauses plus `Object.keys(api)` and pin it as a sorted list; then parameterize one assertion per symbol that it is defined AND, for every symbol whose value is a string or number, that the value is derived rather than free (for `CORE_VERSION` specifically: equal to the manifest). `index.test.ts`'s current `kept` list is too narrow to have caught this \u2014 it is 23 names described in its own comment as \"a representative slice\", and `CORE_VERSION` is not among them.",
+  "remediationCheck": {
+   "reliesOn": "`readFileSync(new URL('../package.json', import.meta.url))` \u2014 the exact resolution `version.ts:12` already performs and which is correct from both `src/` (vitest) and `dist/` (published), and `index.test.ts`'s existing barrel-clause scan at lines 109-113.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "A future `CORE_VERSION` that is not literally the manifest's `version` string \u2014 e.g. one appending build metadata. That is the point, but it makes the constant non-negotiable, so a deliberate change needs the test edited alongside.",
+   "testsThatWouldFail": "none found \u2014 the new assertions are additive. Deriving the `kept` list, however, would break `index.test.ts`'s 'still re-exports the kept symbol %s' rows the moment the derived set is snapshotted, since it must be regenerated; and it interacts with the `trimmed` list, which asserts absence. I did not apply either remediation; both were reasoned from the source, only the two mutations proving the gap were run.",
+   "hidesOrFixes": "Applied while the habit remains, it closes `CORE_VERSION` and leaves every other hand-listed universe in the package open \u2014 `stated-bounds.test.ts`'s `CAPACITY_MODULES` is filed separately under the same theme.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-seam",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "concurrency-and-failure",
+  "theme": "lifecycle-teardown",
+  "class": "partial-failure-abandons-the-rest-of-teardown",
+  "file": "packages/bridge-core/src/testing/front-doors.ts",
+  "line": 267,
+  "summary": "The shared front-door fixture's teardown abandons every remaining resource on the first failure \u2014 the exact shape `buildBridge`'s `releaseAll` was hardened against (\"Keep every step ATTEMPTED even after an earlier one rejects, so a backend whose close handshake fails cannot leave the transport connected and the process unable to exit\"). The fixture that grades the doors does not follow the rule the doors follow.",
+  "failure": "`closeFrontDoors()` is `for (const { server } of booted.values()) await server.close();` then `booted.clear()`, `const fx = await fixtures`, `await fx.idp.close()`, `await fx.plugin.disconnect()`. If the first of the four cached servers rejects on close (an in-flight request, a hung keep-alive socket), the other three stay listening, `booted` is never cleared, the FakeOidc express server is never closed and the FakePlugin is never disconnected. `auth/error-surface.test.ts` registers it as `afterAll(closeFrontDoors)`, so the outcome is a vitest worker with four live listeners and open handles \u2014 a hang or a forced teardown rather than one clear red assertion. The same class again in `appFor`: if `door.boot(port, fx)` or `app.server.listen(port)` rejects, the partially-booted server is never cached and never closed, so its socket leaks with no reference left to close it; and `fixturesUp`'s `fixtures ??= (async () => \u2026)()` caches a REJECTED promise permanently, after which both every `appFor` and `closeFrontDoors` itself reject on `await fixtures` before closing anything.",
+  "remediation": "Mirror `stdio-bridge.ts`'s `releaseAll`: in `closeFrontDoors`, wrap each `server.close()`, `idp.close()` and `plugin.disconnect()` in a try that collects failures, clear `booted` and reset `fixtures` in a `finally`, and rethrow an `AggregateError` at the end so a real close failure still reddens. In `appFor`, close the server in a catch before rethrowing. In `fixturesUp`, clear `fixtures` on rejection so a transient IdP-bind failure does not poison every later call.",
+  "testUpgrade": "Guard the CLASS \"teardown stops at the first failure\" wherever this package composes a release. Parameterize a case over the release points (`buildBridge.releaseAll`, `closeFrontDoors`, `remoteHttpApp.teardown` in testing/http-app.ts) \u00d7 the position of the failing step (first, middle, last), injecting a rejecting close and asserting every OTHER step still ran and the failure surfaced. `transport/root-teardown-bounds.test.ts` grades the bridge's release under a hostile `post` but nothing grades the fixture's own, and a fixture that leaks turns a red into a hang, which is strictly worse to diagnose.",
+  "remediationCheck": {
+   "reliesOn": "The already-shipped pattern in `packages/bridge-core/src/transport/stdio-bridge.ts:97-112` (`const attempt = async (step) => { try { await step(); } catch (e) { failures.push(e); } }` plus the `AggregateError` rethrow) \u2014 copied rather than invented.",
+   "newlyAccepts": "A `closeFrontDoors()` in which some steps failed now still completes the rest before throwing, so a suite whose teardown previously hung can now finish and report.",
+   "newlyRejects": "An `AggregateError` instead of the single underlying error, so any caller matching on the error's message or type would need updating. No current caller does \u2014 `afterAll(closeFrontDoors)` just awaits it.",
+   "testsThatWouldFail": "none found \u2014 I grepped every importer of `front-doors.js` (`auth/error-surface.test.ts` and `transport/front-doors.test.ts`); neither asserts on what `closeFrontDoors` throws, and `transport/front-doors.test.ts` does not call it at all. I did not apply this remediation, so this is read off the call sites rather than run.",
+   "hidesOrFixes": "If applied while the surrounding habit remains, it fixes the fixture's own teardown but not the general rule \u2014 `testing/http-app.ts`'s `teardown` has the same shape (`await app.close(); await plugin.disconnect();`) and would still drop the plugin disconnect if the app close rejects. That is why the testUpgrade parameterizes over all three release points rather than pinning this one.",
+   "interleavings": "The orderings that matter are step-position: failure at the first, a middle and the last resource, each of which must leave the others released. Two callers on the new path: `closeFrontDoors` is registered once per file as `afterAll`, but `booted`/`fixtures` are module-level, so two test files in the same worker could both invoke it \u2014 the `finally` that clears `booted` and resets `fixtures` makes the second call a no-op rather than a double-close, which the current code (clearing only on the success path) does not guarantee.",
+   "confidence": "plausible"
+  }
+ },
+ {
+  "target": "core-seam",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "operability-and-release",
+  "theme": "published-surface",
+  "class": "test-scaffolding-in-the-tarball",
+  "file": "packages/bridge-core/src/index.ts",
+  "line": 128,
+  "summary": "`tsconfig.json` excludes only `src/**/*.test.ts`, so all eleven `src/testing/` modules compile into `dist/testing/` and ship in every consumer's install. Only `startFakeOidc` is reachable (via the barrel); the other ten \u2014 including `tool-harness.ts`, which pulls the MCP SDK's test-only `inMemory.js` entry, and `front-doors.ts`, which re-imports the whole barrel \u2014 are unreachable through `exports` (which exposes only `.` and `./package.json`) and are dead bytes. index.ts's comment frames this as unavoidable (\"It ships in the tarball either way (`src/testing` is compiled, only `*.test.ts` is excluded)\"), which is a statement about the current tsconfig, not a constraint.",
+  "failure": "`npm pack --dry-run @sharptrick/parley-core` ships `dist/testing/tool-harness.js`, `dist/testing/front-doors.js`, `dist/testing/nonconformant.js`, `dist/testing/failure-shapes.js`, `dist/testing/http-app.js`, `dist/testing/tool-cases.js`, `dist/testing/handle-corpus.js`, `dist/testing/regex-corpus.js`, `dist/testing/anchoring-corpus.js` and their `.d.ts` \u2014 none of which any consumer can import through `exports`, and none of which any core-internal `src/` module outside a `*.test.ts` imports. `packaging.test.ts`'s 'no already-built artifact a consumer could not resolve' rule passes them because every specifier they name (`@modelcontextprotocol/sdk`, `express`, `jose`) happens to be a declared runtime dependency \u2014 so the check that exists to keep test scaffolding out of the tarball is satisfied by scaffolding that imports only declared deps.",
+  "remediation": "Move `fake-oidc.ts` out of `src/testing/` (it is the one shipped fixture, e.g. `src/fake-oidc.ts`) and add `src/testing/**` to `tsconfig.json`'s `exclude`. Delete the paragraph in index.ts that explains the tarball inclusion, since it stops being true. If any other fixture is genuinely wanted by out-of-tree plugin authors, give it a `./testing` subpath in `exports` so it is a deliberate published surface rather than an accident of the compile.",
+  "testUpgrade": "Guard the CLASS \"the tarball carries a module no consumer can reach\", widening `packaging.test.ts`'s existing `IS_TEST_ARTIFACT` rule which only matches `.test.`/`.spec.`. Add a parameterized case over every public workspace: resolve the reachability closure from each `exports` entry through relative imports, and assert `packedFiles()[name]` contains no `.js` outside that closure. That also catches the next fixture directory, and a `bin`-only file orphaned by an `exports` edit \u2014 inputs no filename-pattern rule can see.",
+  "remediationCheck": {
+   "reliesOn": "`tsconfig.json`'s `exclude: [\"src/**/*.test.ts\"]` (widening it is a one-line edit) and `packages/bridge-core/package.json`'s `exports` map, which today lists only `.` and `./package.json`.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "Any in-tree `*.test.ts` importing a moved fixture by its old path \u2014 vitest transpiles from `src/`, so `../testing/fake-oidc.js` specifiers in `auth/*.test.ts` and `transport/*.test.ts` would need updating in the same commit. Excluding `src/testing/**` from tsconfig also removes it from `tsc -b`'s type-checking of the src project, so those fixtures would be type-checked only by `tsconfig.test.json` \u2014 verify that project still includes them, or the exclude silently drops them from CI's type gate.",
+   "testsThatWouldFail": "`packaging.test.ts`'s '%s compiles no test source into its published output' asserts `emitted.length > 0` and that no emitted file matches `IS_TEST_SOURCE` (`.test.ts`) \u2014 excluding `src/testing/**` keeps both true. `index.test.ts` imports `startFakeOidc` only through `./index.js`, so moving the file is transparent there. I did not apply this remediation; the import-site list above is from grep, not from a run.",
+   "hidesOrFixes": "If applied while the habit remains, it removes today's ten dead modules but nothing stops the next fixture directory from landing in the tarball \u2014 that is what the derived reachability testUpgrade above is for, and it is the half that matters.",
+   "interleavings": "n/a",
+   "confidence": "plausible"
+  }
+ },
+ {
+  "target": "core-engine",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "untrusted-input-degrades-a-shared-answer",
+  "class": "silent-budget-exhaustion-not-disclosed",
+  "file": "packages/bridge-core/src/engine/presence-reach.ts",
+  "line": 126,
+  "summary": "An attacker-controlled presence page can exhaust filterReachable's 50 ms per-direction pattern allowance, after which every remaining peer is reported unreachable \u2014 and parley_list_users still answers `truncated: false`, so the agent is told an empty or gutted roster is the whole bus.",
+  "failure": "Post 120 presence beats (handles hostile-0..119, each with 64 DISTINCT screen-safe sources of the shape `('[a-z]?' x16) + 'Z<n>'`, all fresher than the victim), plus one legitimate beat from `colleague` with `postTopics: ['ctx-.*']`, while the caller subscribes to a 60-char `ctx-aaa\u2026` topic. Reproduced in-tree: `filterReachable(roster, {canPostTo: () => false, mySubscribedTopics: [MINE]})` spent 50.7 ms and returned `[]` \u2014 `colleague` is genuinely reachable (its pattern full-matches my subscribed topic) but is dropped because `budget()` returned undefined for every entry after the allowance ran out. list-users-tool.ts:132 then computes `truncated = (121 >= 500) || (121 >= 128) || (0 < 0)` = false, so the tool answers `{ users: [], truncated: false }` \u2014 indistinguishable from \"nobody is on the bus\". The suite's nearest case, presence.test.ts:753 'a hostile page cannot starve the other direction of its budget', builds the hostile page with `patterns: 0`, so it only exercises CROSS-direction starvation; and presence.test.ts:736 deliberately places the benign `partner` FIRST 'so the verdict is the predicate's and not the budget's'. Same-direction exhaustion is untested.",
+  "remediation": "Make the exhaustion observable instead of silent. Add an optional `onAllowanceSpent?: () => void` to `filterReachable`'s opts, have `budget()` invoke it the first time it returns undefined (both the peerReach allowance and the budgeted(canPostTo) one), and OR the resulting flag into list-users-tool.ts's `truncated`. That discloses, but does not restore reach; the durable fix is to stop letting an attacker-chosen ENTRY COUNT consume a whole-call allowance \u2014 give each roster entry its own small allowance so one hostile entry cannot spend a later entry's, or evaluate patterns only for entries not already admitted by an explicit topic.",
+  "testUpgrade": "Class: \"an untrusted count silently switches a caller-facing predicate off, and the answer does not say so.\" Add a parameterized table over (which direction the hostile page inflates: peer-postTopics-inbound | peer-topics-outbound | both) x (where the benign peer sits in recency order: first | middle | LAST) x (how it is reachable: explicit shared topic | pattern-only), asserting for every cell that the benign peer is either still returned OR the result is flagged truncated \u2014 never dropped silently. The existing presence.test.ts:753 case is exactly one cell of that table (inflate outbound, benign last, pattern-only) and cannot see the same-direction diagonal. Pair it with a generator that emits N distinct screen-safe-but-costly sources so widening PATTERN_BUDGET_MS or MAX_RECORD_TOPICS re-derives the pressure rather than hard-coding it.",
+  "remediationCheck": {
+   "reliesOn": "`budget()`'s `if (spentMs >= PATTERN_BUDGET_MS) return undefined;` branch in presence-reach.ts:42 \u2014 the single place exhaustion is currently detectable \u2014 and list-users-tool.ts:132 `truncated: truncated || roster.length >= MAX_ROSTER_ENTRIES || capped.length < users.length`, which I would extend with a fourth disjunct.",
+   "newlyAccepts": "none \u2014 the callback changes no filtering decision, so every input filtered today is filtered identically.",
+   "newlyRejects": "none.",
+   "testsThatWouldFail": "none found. I checked the four rows of list-users-tool.test.ts 'every cause of a truncated roster is disclosed, and only when it applies' (the scanned presence history was full / the roster hit its entry cap / `limit` trimmed it / none of them): none of those pages carry costly patterns, so the new flag stays false and the 'only when it applies' row still passes. An OPTIONAL opts field keeps the signature and return type, so anchoring-parity.test.ts's three SITES rows (which call `.length === 1`) and presence.test.ts's callers compile unchanged \u2014 a `{entries, exhausted}` return shape would have broken all of them, which is why I did not propose it.",
+   "hidesOrFixes": "If applied while the underlying bound stays whole-call, the reach loss remains: `colleague` is still absent from the roster and the agent still cannot hand off to it. The agent is merely told the answer was cut. So the disclosure half is a mitigation, not a fix \u2014 the per-entry allowance is the part that actually keeps a legitimate peer visible, and I have not measured whether a per-entry allowance small enough to bound 128 entries is still large enough for one legitimate 64-pattern peer.",
+   "interleavings": "n/a \u2014 filterReachable is synchronous and single-call; no new async path.",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-engine",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "guard-scoped-to-a-file-list-it-cannot-outgrow",
+  "class": "capacity-registry-blind-to-a-subdirectory",
+  "file": "packages/bridge-core/src/engine/presence-beat.ts",
+  "line": 58,
+  "summary": "MAX_CLOCK_SKEW_MS \u2014 the control the code itself says stops a far-future beat reading as \"permanently live\" and pinning a phantom peer at the top of the roster \u2014 is graded only by probes derived from its own value, so its value is free to move in the dangerous direction under a fully green suite.",
+  "failure": "Change `export const MAX_CLOCK_SKEW_MS = 5 * 60_000;` to `100_000_000_000` (~3.17 years) and the WHOLE bridge-core suite passes: 53 test files, 3154/3154 tests green (verified, mutation confirmed applied by diff). A hostile beat with `at = now + 2 years` is then accepted by decodePresence, `nowMs - at` is hugely negative so `nowMs - at < ttlMs` holds forever, the peer is `online: true` immune to `online_only` and `since_ms`, and `lastSeenMs` sorts it first in every roster for two years. The two tests that look like they guard this \u2014 presence.test.ts:370-371 'exactly at the skew tolerance' / 'one ms beyond' \u2014 probe at `MAX_CLOCK_SKEW_MS` and `MAX_CLOCK_SKEW_MS + 1`, both derived from the constant, so they move with it. stated-bounds.test.ts is the file that exists to stop exactly this ('with every probe built as `'a'.repeat(bound - 1)`, `MAX_GLOB_LEN = 8` keeps the whole suite green'), and its own comment claims 'The modules are scanned, so a capacity added to any of them needs a row here rather than arriving unpinned' \u2014 but CAPACITY_MODULES at stated-bounds.test.ts:186 is the hardcoded list ['config.ts','identity-filter.ts','regex-safety.ts','topic-name.ts'], resolved relative to src/, which cannot see src/engine/ or src/transport/ at all. Thirteen capacities live there unregistered. I probed five of the others (MAX_ROSTER_ENTRIES, DEFAULT_ROSTER_LIMIT, MAX_RECORD_TOPICS, MAX_HANDLE_INSTANCES, MAX_FETCH_LIMIT) and each happened to be caught incidentally by a byte-budget or count assertion; MAX_CLOCK_SKEW_MS is the one with no such accident, because time has no byte cost.",
+  "remediation": "Replace CAPACITY_MODULES' hardcoded file list with a recursive walk of `src/**/*.ts` excluding `*.test.ts` and `testing/`, and add a CAPACITIES row for every capacity the widened scan turns up \u2014 starting with MAX_CLOCK_SKEW_MS pinned to the literal 300_000 and paired with a realistic accepted input (a beat 30 s in the future decodes; one 6 min in the future does not).",
+  "testUpgrade": "Class: \"a registry that decides what to grade from a hand-written path list silently exempts whatever moves outside it.\" The registry's subject set must be derived from the same tree the code lives in \u2014 a glob over src/**, never a file-name array \u2014 and the derivation itself must be graded (`expect(declared.length).toBeGreaterThan(N)` where N is the count at the time of writing, so a glob that stops matching fails loudly instead of grading an empty set). Pair each capacity row with BOTH a literal pin and a LOOSENING probe: an input that must still be REFUSED at bound+1, so widening the constant reds the suite even where narrowing it would not.",
+  "remediationCheck": {
+   "reliesOn": "stated-bounds.test.ts:296's existing regex `/^export const ((?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)\\b/gm` and the assertion `expect(declared.sort()).toEqual(CAPACITIES.map((c) => c.name).sort())` at line 302 \u2014 that equality is what turns a widened scan into a merge gate.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "any future `export const MAX_*/MIN_*/DEFAULT_*` added anywhere under src/ without a CAPACITIES row \u2014 which is the point, but is also the cost.",
+   "testsThatWouldFail": "'has a row for every capacity the governed modules export' goes red immediately and stays red until rows exist for at least SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, MAX_CATCHUP_PAGES, MAX_RECORD_TOPICS, MAX_INSTANCE_ID_LEN, MAX_HANDLE_LEN, MAX_TOPIC_LEN, MAX_CLOCK_SKEW_MS, MAX_HANDLE_INSTANCES, MAX_ROSTER_ENTRIES, MAX_FETCH_LIMIT, DEFAULT_ROSTER_LIMIT, PRESENCE_FETCH_LIMIT. I did NOT enumerate what a src/** glob pulls out of src/auth/ and src/cli/, and that is the honest risk in this remediation: the widened scan is likely to surface a further batch of auth capacities whose 'realistic accepted input' is much harder to write than a presence one, and an implementer who narrows the glob back to src/engine+src/transport to make it tractable has rebuilt the same hole one directory wider.",
+   "hidesOrFixes": "Nothing is currently broken in shipped behaviour \u2014 MAX_CLOCK_SKEW_MS is 300_000, which is correct. What stays broken if the registry is not widened is the detection: the next agent that widens the tolerance to \"tolerate a peer with a bad NTP config\" ships a permanently-live phantom-peer channel with a green suite, which is precisely the failure the constant's own JSDoc describes.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-engine",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "env-var-contract-stated-as-shell-semantics-implemented-as-js",
+  "class": "nullish-coalescing-for-a-colon-dash-default",
+  "file": "packages/bridge-core/src/engine/read-state.ts",
+  "line": 118,
+  "summary": "defaultReadStatePath documents its default as `${XDG_STATE_HOME:-~/.local/state}` \u2014 shell `:-`, which means \"unset OR EMPTY\" and is also what the XDG spec mandates \u2014 but implements it with `??`, which only covers unset. An empty XDG_STATE_HOME yields a RELATIVE state path under the process's cwd.",
+  "failure": "With `XDG_STATE_HOME=` in the environment (an ordinary artifact of `export XDG_STATE_HOME=\"$SOMETHING_UNSET\"` in a shell profile), `defaultReadStatePath('agent')` returns `parley/agent/read-state.json` \u2014 verified by running the same expression in node: `base = \"\"`, `join(\"\", \"parley\", \"agent\", \"read-state.json\") === \"parley/agent/read-state.json\"`. ReadStateStore.flush then does `mkdirSync(dirname(...), {recursive: true, mode: 0o700})`, creating a `parley/` directory in whatever cwd Claude Code happened to spawn the bridge from. Consequence: the bridge started from a different directory finds no cursor, `catchUpTopic` takes the COLD START branch, and on-start catch-up re-drains and re-warms from the recent window instead of resuming \u2014 silently, with no error and no log. read-state.test.ts:123 and :192 set XDG_STATE_HOME to a mkdtemp path and the surrounding restore at :112-115 only distinguishes undefined; no case sets it to ''.",
+  "remediation": "`const raw = process.env.XDG_STATE_HOME; const base = raw !== undefined && raw.length > 0 ? raw : join(homedir(), '.local', 'state');` \u2014 matching the documented `:-` and the XDG basedir spec. Consider additionally refusing a base that `isAbsolute()` says is relative, since the spec requires an absolute path and a relative one reintroduces the cwd coupling by another route.",
+  "testUpgrade": "Class: \"an env-var default documented with shell `:-` semantics but implemented with `??`.\" Parameterize a table over env values ('' | '   ' | undefined | a relative path | an absolute path) x every env-derived default path in the repo (defaultReadStatePath here; packages/bridge-telegram/src/config.ts:86 has the identical `??` shape for store_path), asserting the returned path is absolute and equals the documented default for every non-absolute-value cell. Derive the site list by scanning src/** for `process.env.` followed by `??` rather than listing the two known ones.",
+  "remediationCheck": {
+   "reliesOn": "`join(base, 'parley', sanitize(instanceId), 'read-state.json')` at read-state.ts:119 and ReadStateStore.flush's `mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 })` at line 84, which is what silently materialises the relative directory today.",
+   "newlyAccepts": "none \u2014 an empty XDG_STATE_HOME now resolves to the same path as an unset one, which is what the doc already promised.",
+   "newlyRejects": "none as written. If the optional isAbsolute() guard is added it newly rejects `XDG_STATE_HOME=./state`, which today silently works; that arm should be weighed separately rather than bundled in, because it turns a start-up quirk into a start-up failure.",
+   "testsThatWouldFail": "none found. read-state.test.ts's XDG cases (lines 112-115, 123, 192) only ever assign a mkdtemp absolute path or delete the variable, and its save/restore at 114-115 preserves undefined-vs-string, so an empty value never enters any assertion. config.test.ts references the default only in a doc string. I grepped the whole repo for XDG_STATE_HOME and found no test that sets it to ''.",
+   "hidesOrFixes": "If the fix is applied and someone separately reintroduces a relative base (e.g. by honouring a relative XDG_STATE_HOME), the same cwd-coupled cold restart returns \u2014 the empty-string arm is only one way in. The `??`-vs-`:-` correction alone does not make the path absolute; it only makes the empty case take the documented branch.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "guard-enumerates-spellings",
+  "class": "trust-proxy-function-form-bypasses-unbounded-trust-guard",
+  "file": "packages/bridge-core/src/auth/invariants.ts",
+  "line": 190,
+  "summary": "`assertTrustProxy` early-returns for every value that is neither a string nor an array, so Express's *function* form of `trust proxy` \u2014 which Express fully supports and which `() => true` spells identically to the boolean `true` the guard refuses by name \u2014 passes the guard untouched. The guard's own JSDoc claims the opposite: \"The refusal is a property of what the value TRUSTS, not of how it is written.\"",
+  "failure": "`createOAuthRemoteApp(plugin, cfg, { issuerUrl, verifyOwner, trustProxy: () => true })` boots healthy. Reproduced: `assertTrustProxy(() => true, 'trustProxy')` returns without throwing, while `assertTrustProxy(true, ...)` and `assertTrustProxy(['0.0.0.0/1','128.0.0.0/1'], ...)` both throw. Express then compiles that function straight into `trust proxy fn`, so `req.ip` is the leftmost `X-Forwarded-For` element the caller wrote, and every `/parley/consent` bucket (10 per 15 min) is minted fresh per forged header value \u2014 unlimited anonymous guesses at the owner passphrase, which is the exact exposure the guard exists to close.",
+  "remediation": "Include functions in the probed set: `if (typeof value !== 'string' && !Array.isArray(value) && typeof value !== 'function') return;`. Express's `compileTrust` returns a function value verbatim as `trust proxy fn`, so the existing ADDRESS_SPACE probe grades it unchanged \u2014 verified: `()=>true` is flagged, `(ip)=>ip.startsWith('10.')` is accepted. One extra edit is required: `unboundedTrust` renders the value with `JSON.stringify`, which yields `undefined` for a function, producing the message \"trustProxy must not be undefined\"; render with `String(value)` (or a `typeof`-aware label) so the operator sees what they wrote.",
+  "testUpgrade": "The class is \"a value that trusts the whole address space, in a spelling the table's TYPE cannot hold\". `WHOLE_SPACE_SPELLINGS` in remote.test.ts and `LEGITIMATE_PROXY_LISTS` in invariants.test.ts both declare `trustProxy: boolean | number | string | string[]`, which structurally excludes the function form \u2014 widen both to `unknown` (the guard's own parameter type) and add rows for `() => true`, `(ip: string) => ip.startsWith('10.')` (must be ACCEPTED), `new String('true')`, and `Object.assign(() => true, {})`. Better still, drive the refusal table from a generator over every form Express's `compileTrust` accepts (boolean, number, string, string[], function) so a spelling Express learns about later is graded the day it lands.",
+  "remediationCheck": {
+   "reliesOn": "Express 5 `application.js`: `this.set('trust proxy', val)` sets `'trust proxy fn'` to `compileTrust(val)`, and `compileTrust` returns `val` unchanged when `typeof val === 'function'`. I traced this by running `express().set('trust proxy', ()=>true); app.get('trust proxy fn')('1.2.3.4', 0)` and observing `true`, and the discriminating case `(ip)=>ip.startsWith('10.')` observing `false`.",
+   "newlyAccepts": "none \u2014 no value accepted today becomes accepted that was not already",
+   "newlyRejects": "`trustProxy: () => true` (and any function whose predicate returns true for all 256 IPv4 and 16 IPv6 probe addresses). A function that names real proxies, e.g. `(ip) => ip.startsWith('10.')`, is still accepted.",
+   "testsThatWouldFail": "none found. I applied the one-line fix and ran the full auth suite: 15 files / 1057 tests, all green. I looked for callers passing a function in packages/, examples/ and docs/ (grep for `trustProxy`) \u2014 every call site passes a string, number, boolean or string[].",
+   "hidesOrFixes": "It closes the function spelling only. Two acknowledged residues remain and are unaffected: a hop COUNT larger than the real chain (`trustProxy: 2`) still lets the caller write `req.ip` \u2014 remote.test.ts states this as `keyedOn: 'forged'` \u2014 and a partial cover such as `['0.0.0.0/1']` is still accepted by design (invariants.test.ts lists it as legitimate).",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "protocol-conformance",
+  "theme": "degenerate-scope-token",
+  "class": "empty-scope-string-in-token-response",
+  "file": "packages/bridge-core/src/auth/oauth-provider.ts",
+  "line": 402,
+  "summary": "`issue()` emits `scope: scopes.join(' ')` unconditionally, so a grant with no scopes produces `\"scope\": \"\"` in the RFC 6749 \u00a75.1 token response. RFC 6749's ABNF is `scope = scope-token *( SP scope-token )` with `scope-token = 1*NQCHAR`; the empty string is not a valid `scope` value. The package already states this rule against itself in grant-params.ts:9-11 (\"RFC 6749 \u00a73.3 spells a scope token `1*NQCHAR`: an empty one never names one\") and filters empty tokens out of the REQUEST, then re-introduces one in the RESPONSE.",
+  "failure": "Reproduced end to end through the provider's public API: `authorize(client, { redirectUri, codeChallenge })` with no `scopes`, then `completeConsent`, then `exchangeAuthorizationCode` returns `{\"access_token\":\"\u2026\",\"token_type\":\"bearer\",\"expires_in\":3600,\"refresh_token\":\"\u2026\",\"scope\":\"\"}`. `exchangeRefreshToken` on that token returns `\"scope\": \"\"` too. Claude's connector requests no scopes, so this is the default response shape a strict client sees.",
+  "remediation": "In `issue()`, spread the field conditionally: `...(scopes.length > 0 ? { scope: scopes.join(' ') } : {})`. RFC 6749 \u00a75.1 makes `scope` OPTIONAL when it is identical to what the client requested \u2014 with nothing requested and nothing granted, omission is the conformant answer.",
+  "testUpgrade": "The class is \"a degenerate scope token crosses the wire in either direction\". remote.test.ts's `SCOPE_REQUESTS` table already parameterizes the request side; extend each row with an `expectedResponseScope: string | undefined` column and assert the RAW `tokens.scope` against it rather than through `scopeSet()`, which normalizes `''`, `undefined` and `'mcp  mcp'` into the same set and therefore cannot see the response spelling at all. Add a row asserting that when `granted` is empty the field is ABSENT, and reuse the same column at both /authorize and the refresh grant so the two paths cannot drift.",
+  "remediationCheck": {
+   "reliesOn": "`OAuthTokens` in @modelcontextprotocol/sdk/shared/auth.js declares `scope: z.string().optional()`, so omitting the key still parses; the SDK's token handler serializes whatever object the provider returns.",
+   "newlyAccepts": "none \u2014 this is a response-shaping change, no input validation moves",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "remote.test.ts \"a degenerate scope token is dropped\u2026\" rows `an empty scope parameter` and `a lone space`, at BOTH /authorize and the refresh grant (4 cases). Their helper is `scopeSet = (s) => new Set(String(s).split(' ').filter(Boolean))`; with the field omitted, `String(undefined)` is `'undefined'`, so the set becomes `{'undefined'}` and no longer equals `new Set([])`. The helper must be fixed to handle absence (`s === undefined ? new Set() : \u2026`) as part of the change. I verified this by mutating `issue()` to drop the field entirely, which turned 24 tests red across 2 files \u2014 that mutation is broader than the fix, but those 4 rows are among them.",
+   "hidesOrFixes": "Nothing stays broken; the scope-narrowing logic on the refresh grant is untouched, since it reads `rec.scopes` (the array), never the serialized string.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "maintainability",
+  "theme": "redundant-hardening-call",
+  "class": "dead-duplicate-error-handler-registration",
+  "file": "packages/bridge-core/src/auth/remote.ts",
+  "line": 137,
+  "summary": "`hardenErrorSurface(remote.app)` is called again by both front-door factories (remote.ts:137, oidc-remote.ts:116) after `createRemoteHttpApp` has already called it as its own final statement (transport/http.ts:245) \u2014 and the comment there says explicitly \"Keep this LAST, and here rather than in each caller\". The second call re-sets `env` (idempotent) and registers a second terminal error handler that can never run, because the first one terminates the response without calling `next`.",
+  "failure": "Mutating either call to a no-op (`void hardenErrorSurface;`) leaves the full auth suite green: 15 files / 1057 tests pass with remote.ts:137 disabled, and again with oidc-remote.ts:116 disabled. Since `opts.configureApp` runs at transport/http.ts:163 \u2014 before the /mcp routes and before http.ts's own `hardenErrorSurface` \u2014 there is no route the caller-side handler sits behind that the transport-side one does not already cover.",
+  "remediation": "Delete both calls and the two `hardenErrorSurface` imports in auth/. While there, move `error-surface.ts` out of `src/auth/` \u2014 it is generic Express hardening with no auth content, and its current home creates the module cycle `auth/remote.ts -> transport/http.ts -> auth/error-surface.ts`, which is what made a caller-side call look necessary in the first place.",
+  "testUpgrade": "The class is \"a hardening step applied twice because two layers each believe they own it\". Add a table-driven test over every remote factory (`createRemoteHttpApp`, `createOAuthRemoteApp`, `createOidcRemoteApp`) asserting that the built app's router stack contains exactly ONE 4-arity error handler and that `app.get('env') === 'production'` \u2014 driven off a factory list, so a new front door is covered the day it lands. error-surface.test.ts today only exercises `hardenErrorSurface` against a hand-built app, which cannot see a duplicate in a composed one.",
+  "remediationCheck": {
+   "reliesOn": "transport/http.ts:245 `hardenErrorSurface(app);` runs after `opts.configureApp?.(app)` (line 163) and after `app.post/get/delete(mcpPath, \u2026)`, so it is already the last layer; and error-surface.ts's `terminalErrorHandler` calls `next(err)` only when `res.headersSent`, which the first handler never leaves true on its own path.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none found \u2014 I ran the mutation for each call site independently and both stayed fully green. I also grepped for tests asserting handler-stack length or a doubled `[parley] request failed:` log line; there are none.",
+   "hidesOrFixes": "Nothing functional changes. If a future refactor moves `hardenErrorSurface` OUT of `createRemoteHttpApp`, deleting these calls would leave the front doors unhardened \u2014 which is precisely why the fix should be paired with the router-stack assertion in testUpgrade rather than done alone.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "documented-branch-never-graded",
+  "class": "eviction-fallback-branch-uncovered",
+  "file": "packages/bridge-core/src/auth/oauth-provider.ts",
+  "line": 356,
+  "summary": "`rememberClient`'s `?? this.clients.keys().next().value` fallback carries a load-bearing JSDoc claim \u2014 \"Keep the fall back to the oldest entry, so that a map full of owner-approved registrations cannot make a FRESH owner approval the one that fails\" \u2014 and no test grades it.",
+  "failure": "Deleting the `?? this.clients.keys().next().value` clause leaves the auth suite fully green (15 files / 1057 tests). With it deleted, `evictable` is `undefined`, the `if (evictable !== undefined)` guard skips the delete, and `this.clients.set(...)` runs anyway \u2014 so the MAX_CLIENTS=100 bound silently stops holding on the approval path. Either the documented lockout or the unbounded-growth regression can be introduced without the suite noticing.",
+  "remediation": "No code change needed \u2014 the branch is correct. Add coverage that reaches it: fill `clients` to MAX_CLIENTS with registrations that ALL hold live owner-approved state (a live access or refresh record each), then run a fresh consent to completion and assert (a) the new client is registered, (b) `clients.size === MAX_CLIENTS`, and (c) the evicted entry is the oldest.",
+  "testUpgrade": "The class is \"a capacity path whose only escape hatch is a `??` fallback nothing reaches\". Parameterize one table over the two capacity entry points \u2014 `clientsStore.registerClient` (must throw `TemporarilyUnavailableError`) and `completeConsent`/`rememberClient` (must succeed by shedding the oldest) \u2014 crossed with the saturation states {all-anonymous-pending, all-owner-approved, mixed}. That grades both the `evictionCandidate` result and the fallback in one shape, and would also cover a third capacity path added later.",
+  "remediationCheck": {
+   "reliesOn": "`evictionCandidate` returns `undefined` only when every id in `clientIds` appears in the `approved` set, which `clientStates()` populates from `access`/`refresh`/`codes`/`redeeming` \u2014 so saturating with 100 live access records is the state that reaches the fallback.",
+   "newlyAccepts": "none \u2014 this is a test-only change",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none \u2014 adding a case cannot break existing ones. I confirmed the branch is genuinely unreached today by deleting it and observing 1057/1057 still passing.",
+   "hidesOrFixes": "The bug being guarded against does not exist today; this closes a blind spot, not a defect. If the fallback were silently dropped in a future refactor the suite would still be green without this case.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "documented-branch-never-graded",
+  "class": "schema-precedence-invariant-ungraded",
+  "file": "packages/bridge-core/src/auth/oidc-discovery.ts",
+  "line": 22,
+  "summary": "`DiscoveryDocumentSchema`'s trailing `.extend(OpenIdProviderDiscoveryMetadataSchema.shape)` exists to satisfy a stated invariant \u2014 \"Keep the OIDC shape WINNING on shared keys, so that widening the mirror cannot tighten what a legitimate IdP is allowed to publish\" \u2014 and nothing grades it.",
+  "failure": "Deleting the trailing `.extend(...)` leaves the suite fully green (15/15 files, 1057/1057 tests). I checked why: the two SDK schemas share 13 keys and, at @modelcontextprotocol/sdk's current version, none of them differ in optionality, so the precedence has no observable effect today. The day the SDK tightens one shared key on the OAuth side, a legitimate Keycloak realm would fail discovery at boot and the suite would still be green \u2014 and a refactor reordering the extends would land unnoticed.",
+  "remediation": "No code change needed. Add a property assertion driven off the two SDK schemas rather than a fixture: for every key in `OpenIdProviderDiscoveryMetadataSchema.shape`, assert that `DiscoveryDocumentSchema.shape[key]` is the same schema object (reference equality is enough, and it fails loudly if the extends are reordered). Pair it with a round-trip: any document `OpenIdProviderDiscoveryMetadataSchema.parse` accepts, `DiscoveryDocumentSchema.parse` must also accept.",
+  "testUpgrade": "The class is \"a schema composed from a dependency's shapes, whose precedence rule is invisible while the shapes happen to agree\". Write the guard against the DEPENDENCY, not a fixture: iterate `Object.keys(OpenIdProviderDiscoveryMetadataSchema.shape)` and assert both (a) precedence by identity and (b) that the RFC 8414-only keys `revocation_endpoint` and `introspection_endpoint` survive a parse. Driven off the shapes, it keeps grading when the SDK adds or changes fields; a fixture document would lock the current tuple and go quiet.",
+  "remediationCheck": {
+   "reliesOn": "zod's `.extend(shape)` overwrites earlier keys with later ones and returns a new object schema whose `.shape` holds the field references \u2014 so identity comparison on `.shape[key]` is a faithful test of which extend won. I confirmed the 13-key overlap and the absence of any optionality difference by enumerating both `.shape` objects and calling `.isOptional()` on each field.",
+   "newlyAccepts": "none \u2014 test-only change",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none. oidc-discovery.test.ts already asserts that `revocation_endpoint`/`introspection_endpoint` survive (dropping the OAuth extend turns 1 test red), so the added assertion complements rather than contradicts it.",
+   "hidesOrFixes": "No defect exists today; this makes a currently-invisible invariant observable. If the SDK never diverges, the assertion never fires \u2014 that is the point.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-hygiene",
+  "theme": "ratchet-locked-to-a-tuple",
+  "class": "table-type-excludes-the-next-spelling",
+  "file": "packages/bridge-core/src/auth/remote.test.ts",
+  "line": 989,
+  "summary": "`WHOLE_SPACE_SPELLINGS` opens with the right lesson \u2014 \"A guard that enumerates SPELLINGS is a guard the next spelling walks past\" \u2014 and then types its own subject field `type TrustProxy = boolean | number | string | string[]`, which structurally cannot hold the next spelling. `LEGITIMATE_PROXY_LISTS` in invariants.test.ts is narrower still (`string | string[]`). The guard under test takes `value: unknown`; the tables cannot reach the part of that domain where the hole actually is.",
+  "failure": "The function form `() => true` is a legal Express `trust proxy` value and is accepted by `assertTrustProxy` (finding 1). No row in either table can express it, and no row can be added without a TypeScript error \u2014 so the class the table was written to hold open is locked to the four forms TypeScript happened to permit when it was written. The tables also cannot express `new String('true')` or a wrapper object.",
+  "remediation": "Type both tables' subject field as `unknown` \u2014 matching `assertTrustProxy`'s own signature \u2014 and merge the two tables into one parameterized set with an `expect: 'accepted' | 'refused'` column, so the accept side and the refuse side cannot drift apart across two files. Add the function rows from finding 1's testUpgrade.",
+  "testUpgrade": "Generate rather than enumerate: build the refusal cases from a small combinator over Express's accepted forms \u2014 boolean, number, comma-string, string[], and function \u2014 crossed with {covers-all-IPv4, covers-all-IPv6, covers-both, covers-a-real-range}, and assert the verdict from the cross rather than from a hand-written literal. That reaches spellings nobody typed, which is exactly what the existing table's own header says it is trying to do.",
+  "remediationCheck": {
+   "reliesOn": "`assertTrustProxy(value: unknown, field: string)` in invariants.ts \u2014 the parameter is already `unknown`, so widening the test tables requires no production signature change.",
+   "newlyAccepts": "none \u2014 test-only change",
+   "newlyRejects": "none in production; in the suite, the widened table would newly FAIL on `() => true` until finding 1 is fixed (which is the intended sequencing: watch it fail first)",
+   "testsThatWouldFail": "With finding 1 unfixed, the new `() => true` row fails \u2014 deliberately. No currently-passing row changes verdict: I re-ran the suite with finding 1's production fix applied and all 1057 tests stayed green, so every existing row keeps its answer under the widened guard.",
+   "hidesOrFixes": "Widening the table alone changes no behaviour; the guard still accepts `() => true` until invariants.ts:190 is fixed. Applied without finding 1, this yields a red suite that names the real hole \u2014 which is the correct outcome, not a hidden one.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "at-rest-protection",
+  "class": "path-classification-bypasses-hardening",
+  "file": "packages/bridge-sqlite/src/driver.ts",
+  "line": 99,
+  "summary": "openDriver's `onDisk` heuristic exempts any path starting with `file::memory:` from the 0600 pre-creation and the -wal/-shm narrowing, but neither shipped driver enables SQLITE_OPEN_URI - so such a path is a literal filename and a real, world-readable on-disk store.",
+  "failure": "backend_config `db_path: \"file::memory:?cache=shared\"` (the SQLite-documented shared in-memory URI) with umask 022. Reproduced: the cwd gains `file::memory:?cache=shared`, `...-wal` and `...-shm`, every one at mode 0644 - the whole conversation store and its WAL readable by every account on the host, with no stderr line. `precreate` and `restrictMode` are both skipped because `onDisk` is false; `synchronous = NORMAL` and the WAL read-back gate are skipped for the same reason, so the connection is also served without the mode check the README says is enforced.",
+  "remediation": "Delete the `&& !path.startsWith('file::memory:')` term - neither better-sqlite3 nor node:sqlite honours URI filenames, so every path other than the exact string ':memory:' is on disk and must be hardened. Additionally reject a `db_path` beginning with `file:` in validateBackendConfig, so an operator who meant a URI gets a startup error naming the key rather than a file literally named after their URI.",
+  "testUpgrade": "Parameterize the at-rest matrix in test/at-rest-mode.test.ts over a PATHS dimension rather than the single 'p.db' literal: ['p.db', 'file::memory:?cache=shared', 'file::memory:', 'file:p.db?mode=ro', 'p.db?x=1']. The invariant is 'if openDriver caused a file to appear at this path, that file and its sidecars are 0600' - derive the expectation from `existsSync` after the open, not from a hand-listed on-disk/in-memory split, so any future path form the heuristic mis-classifies is graded by construction. The existing matrix cannot catch this class because it hard-codes one filename.",
+  "remediationCheck": {
+   "reliesOn": "`precreate` in at-rest.ts (`closeSync(openSync(path, 'a', 0o600))`, whose catch is silent so a genuinely-unopenable path still surfaces the driver's own error) and `restrictMode`'s `catch { return; }` for a sidecar that does not exist yet. It also relies on applyPragmas' `if (!onDisk) return;` branch no longer being taken for these paths, which means `journal_mode` must read back 'wal' - my probe printed `journal_mode {\"journal_mode\":\"wal\"}` for exactly this path, so the newly-reached gate passes.",
+   "newlyAccepts": "none",
+   "newlyRejects": "with the config guard, `db_path: \"file:...\"` now fails connect() instead of silently creating a file with that name. With the onDisk change alone, a `file::memory:*` path on a filesystem where the WAL conversion cannot be honoured is now refused rather than served - the same treatment every other on-disk path already gets.",
+   "testsThatWouldFail": "none found - I grepped src/ and test/ and README.md for `file::memory`, and it occurs on exactly one line, driver.ts:99. The `:memory:` cases in src/driver.test.ts ('skips :memory: without throwing', and the `onDisk:false` row of the OPENS table) use the bare `:memory:` string, which this fix leaves on the not-on-disk arm.",
+   "hidesOrFixes": "If only the config guard is added and the heuristic is left alone, any future or near-miss URI form (`file::memory`, a `file:` path the config guard is later relaxed for) still lands on the unhardened arm - the heuristic itself is the bug, and the guard only narrows the inputs that reach it.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "concurrency-and-failure",
+  "theme": "lifecycle-teardown",
+  "class": "reentrant-reconnect-revives-an-orphaned-loop",
+  "file": "packages/bridge-sqlite/src/poll.ts",
+  "line": 55,
+  "summary": "The poll loop's teardown test re-reads mutable plugin state (`this.stopped`, `this.driver`), so a `connect()` re-entered from inside a handler re-satisfies it mid-tick and the loop resumes against the NEW store carrying the OLD store's lastSeen and storeId - invisible in subscriptionHealth() and absent from `cancellers`.",
+  "failure": "An embedder does exactly what the README prescribes (\"re-pointing an embedded plugin means disconnect() first\") from inside a subscribe handler: `void p.disconnect(); void p.connect({db_path: B})`. Reproduced against store A (rowids 1-6) then store B: store B's rows b0..b5 are silently never delivered because the loop resumed at rowid 6 from store A; rows b6..b9 ARE delivered, carrying cursors `0fb147203501c37c.7`..`.10` while store B's own id is `14ba7544b74667fa` - cursors store B's own resumeAfter will classify as foreign and replay. Meanwhile `subscriptionHealth()` returns `[]` and `cancellers.length` is 0, so a supervisor sees no loop at all and nothing can stop it until the next disconnect(). The very comments in index.ts (\"a second connect() would orphan every running poll loop\", \"a reconnect onto a different or reset store cannot resume a live loop at a rowid belonging to the previous one\") name this outcome as the thing being prevented.",
+  "remediation": "Add a generation counter owned by the lifecycle: increment it in both `connect()` and `disconnect()`, capture it in `subscribe()` alongside `storeId`, and return from `tick` whenever it differs from the current one. That makes the loop's identity, not the plugin's current state, decide whether the tick belongs.",
+  "testUpgrade": "Extend test/lifecycle.test.ts's 'a teardown started from inside a handler' block into a table over the re-entrant ACTION rather than only `disconnect`: ['disconnect', 'disconnect twice', 'disconnect then connect to the same store', 'disconnect then connect to another store', 'connect without disconnect']. Assert the same observable pair for every row - after the batch, no further content reaches the handler, and every cursor the handler ever received carries the store id of the store that was connected when subscribe() ran. Keying on the cursor PREFIX (not just delivery count) is what makes a resumed cross-store loop visible; the existing rows only count rows and so cannot see it.",
+  "remediationCheck": {
+   "reliesOn": "`SqliteStore.tornDown()` (`return this.stopped || this.driver === undefined;`) - the fix adds a per-loop generation check beside it rather than replacing it, so the existing teardown behaviour is untouched; and `index.ts` connect()'s `this.stopped = false` / `this.health.length = 0` block, which is where the counter must be bumped for the new check to fire.",
+   "newlyAccepts": "none",
+   "newlyRejects": "a poll tick belonging to a previous connect() generation, which today is accepted and reschedules itself.",
+   "testsThatWouldFail": "none found - I read test/lifecycle.test.ts's ORDERS table (its 'connect, subscribe, disconnect, connect again' row already declares loopDelivers:false) and its 'a reconnect reports nothing from the previous generation until it subscribes again' case, and test/catchup-live-handoff.test.ts's 'every reconnect cycle re-closes the window' (each cycle calls subscribe() again after connect(), so its loops are always current-generation). No test in the package expects a loop armed before a reconnect to keep delivering after it.",
+   "hidesOrFixes": "Making connect() throw when `health.length > 0`, or clearing cancellers more aggressively, hides the symptom while the bug remains: the tick already in flight still finishes its in-memory batch against the new store's statements and still mints cursors under the old store id, because nothing in either change is read by the running tick.",
+   "interleavings": "The only interleaving is synchronous re-entry - connect() and disconnect() have no await before their state writes - so the ordering is tick -> handler -> disconnect -> connect -> tick resumes. Two callers on the new path: (a) an embedder calling disconnect()/connect() from outside, between two ticks: the generation is bumped with no tick in flight, and the loop's timer was already cleared by disconnect(), so behaviour is unchanged; (b) a handler doing it re-entrantly: the loop returns at its next per-row check and never reschedules. Neither leaves a pending timer, because disconnect() clears the canceller list before connect() re-arms.",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "absolute-claim-with-an-unstated-carve-out",
+  "class": "every-connection-claim-false-for-a-supported-config",
+  "file": "packages/bridge-sqlite/README.md",
+  "line": 148,
+  "summary": "The 'Cross-process safety' section claims every connection opens with WAL + busy_timeout + synchronous=NORMAL and that a connection which did not reach WAL is refused rather than served. For `db_path: \":memory:\"` - a configuration the README's own config table documents as supported - none of that holds.",
+  "failure": "`openDriver(':memory:')`, measured: journal_mode = `memory`, synchronous = `2` (FULL, not NORMAL), busy_timeout = 5000, and the connection is served, not refused. An operator reading 'A connection that did not reach WAL is refused, not served' and configuring `:memory:` for a single-session deployment is told the process would have failed; it did not.",
+  "remediation": "Carve the in-memory case out in that paragraph: an in-memory store has no journal to keep and no peers to share with, so the WAL precondition does not apply to it and the connection is served as-is. src/driver.ts already says exactly this in a comment; the README does not.",
+  "testUpgrade": "Give test/readme-claims.test.ts an evidence dimension for absolute quantifiers: for each claim whose prose contains 'every connection' / 'always' / 'never', require an `evidence` entry naming a test that enumerates the paths the quantifier ranges over. Here that is src/driver.test.ts's OPENS table, whose rows already carry an `onDisk` flag - so the README row must be pinned to a claim that matches all three rows, not just the two on-disk ones. As written, the CLAIMS table greps prose only and cannot fail on a claim that is false.",
+  "remediationCheck": {
+   "reliesOn": "src/driver.test.ts's OPENS row 'an in-memory store no journal mode applies to' (onDisk:false, walReachable:false, expects `threw` to be undefined) - which is the code-side evidence that serving :memory: without WAL is deliberate rather than an oversight.",
+   "newlyAccepts": "none - this is a documentation change only.",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none found - test/readme-claims.test.ts's rows for this section match on /journal_mode/, /readers never block the writer/i, /busy_timeout/, /retries instead of erroring/i and /lost on power loss/i, none of which a carve-out sentence removes.",
+   "hidesOrFixes": "Nothing stays broken - the code is right and the prose is wrong. Changing the code to refuse :memory: instead would be the harmful inversion.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "one-of-two-shipped-configurations-graded",
+  "class": "driver-dimension-applied-to-only-two-files",
+  "file": "packages/bridge-sqlite/test/catchup-live-handoff.test.ts",
+  "line": 37,
+  "summary": "This package ships two drivers and says so in its own docblocks ('the driver is a DIMENSION of this file rather than an ambient fact'), but only test/conformance.test.ts and test/driver-parity.test.ts apply it. The other 15 test files construct SqlitePlugin directly and therefore grade better-sqlite3 twice.",
+  "failure": "The catch-up-to-live hand-off is the concrete instance: `caughtUpThrough` stores a `bigint`, and `subscribe` binds it straight into `selectAfter` as a SQL parameter. No conformance case does fetchRecent-then-subscribe on the same topic, so that bigint bind is exercised only by catchup-live-handoff.test.ts / bounded-state.test.ts / cursor-replay.test.ts - all better-sqlite3-only. A node:sqlite install that rejected or widened a bigint parameter would break every reconnect's hand-off window with a green suite. Same exposure for `highWater()`'s sqlite_sequence read, the retention prune's `changes` typing, and the poll loop's escalation ladder. I verified by hand that node:sqlite binds it correctly today, so this is an ungraded surface rather than a live defect.",
+  "remediation": "Hoist the 'load the plugin with better-sqlite3 made absent' fixture into a shared test helper (next to test/health.ts) that exposes `forEachDriver(fn)`, and wrap the hand-off, cursor-replay and retention suites in it - the same shape conformance.test.ts already uses, including its guard that the resolved driver.kind actually matches the requested kind.",
+  "testUpgrade": "Add a suite-shape assertion in this package, in the spirit of conformance's CLAUSES table: enumerate the test files that construct SqlitePlugin and require each to be listed either in a DUAL_DRIVER set or in an explicitly-justified INCUMBENT_ONLY set, with the set membership asserted so that a new file defaults to failing rather than to single-driver. That guards the class - 'a behaviour graded on one of two shipped configurations' - rather than the bigint bind instance.",
+  "remediationCheck": {
+   "reliesOn": "test/conformance.test.ts:88-95, which after connecting reads `(plugin as {driver}).driver.kind` and throws if it does not match the requested kind - the shared helper must keep that check, or a fallback that silently resolves the incumbent certifies better-sqlite3 twice, which is the exact failure the dimension exists to end.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none - it adds cases rather than changing behaviour.",
+   "testsThatWouldFail": "none found - the change is additive. The risk is runtime: vi.resetModules() per driver arm roughly doubles these files' wall clock, and catchup-live-handoff.test.ts alone already runs 72 cases in ~47s.",
+   "hidesOrFixes": "If the shared helper is added but the existing files are not wrapped in it, the surface stays ungraded and the helper is dead code that reads as coverage.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-hygiene",
+  "theme": "fixture-restated-per-file",
+  "class": "module-mock-copied-four-ways",
+  "file": "packages/bridge-sqlite/test/driver-parity.test.ts",
+  "line": 39,
+  "summary": "The 'intercept createRequire so better-sqlite3 looks absent/stubbed/recorded' fixture is written out four separate times, in four near-identical ~25-line blocks that differ only in the error code and what they do with the resolved module.",
+  "failure": "test/conformance.test.ts:51-79 (loadFallbackPlugin), test/driver-parity.test.ts:39-77 (loadWithout), test/at-rest-mode.test.ts:62-96 (loadRecordingDriver) and src/driver.test.ts:210-230 (loadWithStub) all reimplement the same vi.doMock('node:module') + Object.assign(fn, inner) dance. A reviewer cannot tell at a glance whether the four agree, and a change to how driver.ts memoizes its constructor has to be tracked into four places - three of which will keep passing while grading the wrong thing. The same shape repeats smaller: escapeRegExp in background-jobs.test.ts and subscription-health.test.ts, `interface Stmt` in those same two, `interface RawConn` in multi-process.test.ts and src/driver.test.ts, and a private `dbFile()` in nine files.",
+  "remediation": "Collapse the four into one parameterized helper in a shared test module - test/health.ts already establishes that pattern in this package - taking the set of missing specifiers, the error code to raise, and an optional construct-time observer, and returning the freshly-imported driver and plugin. Hoist escapeRegExp, Stmt, RawConn and dbFile alongside it.",
+  "testUpgrade": "Rather than adding a test, merge: the four load helpers become one `loadDriver({ missing, code, onConstruct })` and each call site becomes one line. Then a single case can assert the helper's own precondition - that the loaded module's driver.kind is the one requested - which today is asserted in conformance.test.ts only, so the other three copies can silently resolve the incumbent and grade nothing.",
+  "remediationCheck": {
+   "reliesOn": "vi.resetModules() + vi.doMock ordering, which every copy already depends on and which the merged helper must preserve exactly; and the afterEach doUnmock('node:module') each file already performs - the shared helper must not assume it owns teardown, or a file that forgets it leaks the mock into the next file's imports.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none if the merge is behaviour-preserving; the hazard is that at-rest-mode.test.ts's copy uses a construct-time Proxy while the others do not, so a helper that drops the observer would turn its 'nothing was recorded: the native constructor never ran' guard into a vacuous pass. That guard must survive the merge.",
+   "hidesOrFixes": "Extracting the helper without deleting the four originals leaves the duplication in place and adds a fifth copy.",
+   "interleavings": "n/a",
+   "confidence": "plausible"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "maintainability",
+  "theme": "manifest-drift",
+  "class": "unused-and-version-skewed-dev-dependency",
+  "file": "packages/bridge-sqlite/package.json",
+  "line": 55,
+  "summary": "`@types/better-sqlite3: ^7` is declared as a devDependency but nothing in the package references it - driver.ts deliberately hand-rolls `RawDb`/`RawStmt`, and every test hand-rolls `RawConn`. It is also skewed against the runtime `better-sqlite3: ^12`.",
+  "failure": "A maintainer adding a call to the native driver types imports `better-sqlite3` and silently gets v7's shape against a v12 runtime - `lastInsertRowid` and `RunResult` typings have moved across that range. Meanwhile every install of this workspace pays to fetch a package no file resolves. `grep -rn \"@types/better-sqlite3\\|from 'better-sqlite3'\" src test` returns nothing, and neither tsconfig.json nor tsconfig.test.json names a `types` array that would pull it in ambiently.",
+  "remediation": "Drop the devDependency. If the hand-rolled RawDb interface is ever replaced by the real types, add it back pinned to the major the optionalDependency declares.",
+  "testUpgrade": "Extend test/publish-hygiene.test.ts, which already derives FALLBACK_FROM by scanning shipped sources for `require('...')`: add a row asserting that every non-@sharptrick entry in `dependencies`/`devDependencies` is either resolved by an import/require somewhere under src or test, or listed in an explicit ALLOWED_UNREFERENCED table with a reason. That guards the class - a manifest entry no code reaches - rather than this one package name.",
+  "remediationCheck": {
+   "reliesOn": "nothing in src or test - which is precisely the claim, verified by grep across both trees and by the absence of a `types` array in either tsconfig.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none found - test/publish-hygiene.test.ts reads `dependencies` and `optionalDependencies` only, never `devDependencies`, and test/typecheck-coverage.test.ts type-checks src+test, neither of which mentions the module.",
+   "hidesOrFixes": "Bumping the types to ^12 instead of removing them keeps an unreferenced entry in the manifest and leaves the class open.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "redis",
+  "dirs": [
+   "bridge-redis"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "correctness",
+  "theme": "message-normalisation",
+  "class": "range-clamp-swallows-valid-negative",
+  "file": "packages/bridge-redis/src/entry.ts",
+  "line": 45,
+  "summary": "entryTimestamp's range clamp is `ms >= 0 && ms <= MAX_DATE_MS`, but the RangeError it exists to prevent only occurs at |ms| > 8.64e15. Every representable PRE-EPOCH instant a foreign writer puts in `ts` is silently rewritten to 1970-01-01T00:00:00.000Z. The JSDoc directly above claims \"The entry's own `ts` when it is a real date\" \u2014 1969-07-20T20:17:40.000Z is a real date, and the code does not honour it.",
+  "failure": "Reproduced against a live Redis: `XADD parley:moon * sender nasa content 'eagle has landed' ts 1969-07-20T20:17:40.000Z`, then `fetchRecent({topic:'moon'})` -> Message.timestamp === '1970-01-01T00:00:00.000Z' instead of '1969-07-20T20:17:40.000Z'. Same on the subscribe path, since both go through rowToMessage. The whole package suite (798 tests) stays green.",
+  "remediation": "Widen the lower bound to the symmetric one the ECMAScript Date range actually has: `new Date(ms >= -MAX_DATE_MS && ms <= MAX_DATE_MS ? ms : 0).toISOString()`. The upper bound stays as-is; the id-derived branch (`Number(id.split('-')[0])`) is non-negative by construction and is unaffected.",
+  "testUpgrade": "The class is \"a clamp whose accepted range is narrower than the range it is protecting\". live-stream.test.ts's foreignEntries table is the right home, but every one of its from-ts rows is post-epoch, so it cannot see this. Widen it into a generated axis over Date's OWN bounds rather than hand-picked instants: derive rows from [-MAX_DATE_MS, -MAX_DATE_MS+1, -1, 0, 1, MAX_DATE_MS-1, MAX_DATE_MS] plus [-MAX_DATE_MS-1, MAX_DATE_MS+1] (the two that must fall back), each asserted as new Date(ms).toISOString() for the in-range ones and as the fallback for the out-of-range ones \u2014 so the boundary is graded from both sides and a future clamp change cannot narrow the range invisibly. The same generator should be applied to the id-derived branch, whose ms component is a uint64.",
+  "remediationCheck": {
+   "reliesOn": "`new Date(ms).toISOString()` in entry.ts, which is well-defined for the whole closed interval [-8.64e15, 8.64e15] and throws RangeError only outside it; and MAX_DATE_MS = 8_640_000_000_000_000, which is already the exact bound.",
+   "newlyAccepts": "An entry written with ts '1969-07-20T20:17:40.000Z' now normalizes to '1969-07-20T20:17:40.000Z' instead of '1970-01-01T00:00:00.000Z'.",
+   "newlyRejects": "none \u2014 the out-of-range fallback to new Date(0) is unchanged for anything past |8.64e15|.",
+   "testsThatWouldFail": "none found. I applied this exact edit and re-ran the whole bridge-redis suite against a live server: 798/798 still pass. I looked specifically at live-stream.test.ts's foreignEntries (WELL_KNOWN_TS 2020-05-06, '2020-05-06T07:08:09+02:00', '2020-05-06', 'Tue, 05 Nov 2024', 'Mon Jan 01 2020', '12/25/2021', '2020') and at idRows (all ids derived from 2n**53n / LAST_DATE_MS / ID_CEILING, all non-negative) \u2014 every row is at or after the epoch, so none of them is on this branch.",
+   "hidesOrFixes": "Fixes. If it were applied and the bug somehow remained, the only thing still broken would be the same silent rewrite; nothing is hidden, because the clamp's fallback path is still reachable and still asserted for the out-of-range ids.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "redis",
+  "dirs": [
+   "bridge-redis"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "untrusted-input-bounds",
+  "class": "unbounded-caller-string-into-superlinear-parser",
+  "file": "packages/bridge-redis/src/entry-id.ts",
+  "line": 22,
+  "summary": "assertMintedCursor runs BigInt(part) on a cursor of arbitrary length. `since` is caller-supplied through parley_fetch_recent (packages/bridge-core/src/transport/tools.ts:93 declares it as a bare z.string() with no .max()), and BigInt's decimal parse is superlinear, so one tool call blocks the single-threaded MCP process \u2014 including every other session's push loop and every in-flight long poll \u2014 for as long as the caller cares to pay for.",
+  "failure": "Measured through the real plugin against a live Redis: fetchRecent({topic, since: '9'.repeat(4_000_000)}) -> 782ms of synchronous event-loop stall before the (correct) malformed-cursor rejection. Scaling is superlinear: 1e5 digits 8ms, 1e6 142ms, 4e6 782ms, so a ~40MB `since` costs roughly 10-15s of full-process stall for one request. The regex /^\\d+(-\\d+)?$/ runs first and is linear, so the cost is entirely the BigInt.",
+  "remediation": "Refuse an over-long cursor before parsing it: in assertMintedCursor, treat `since.length > MAX_CURSOR_CHARS` as malformed and throw the existing labelled error. A stream entry id is at most 20+1+20 = 41 characters, so any generous constant (say 128) is far above anything Redis can mint while cutting the parse cost to O(1).",
+  "testUpgrade": "The class is \"an untrusted, caller-controlled string reaching a superlinear parser with no length bound\". Add a parameterized bound case to live-stream.test.ts's cursor-provenance table rather than a single row: generate `since` at lengths [41, MAX_CURSOR_CHARS, MAX_CURSOR_CHARS+1, 1e4, 1e6] in both the all-digit and the <ms>-<seq> shapes, assert every over-bound one rejects with the labelled malformed-cursor error, and assert wall-clock cost stays under a fixed ceiling (e.g. 50ms) for the largest \u2014 a bound with no timing assertion is satisfied by a slow implementation. The same generator should be run against every other backend's cursor validator, since `since` is caller-supplied at the same core tool for all of them.",
+  "remediationCheck": {
+   "reliesOn": "The existing pluginError(...) throw inside assertMintedCursor and its message text, which live-stream.test.ts's `foreign` table matches with new RegExp('parley-redis: malformed cursor .* for topic ' + t) \u2014 a length-rejected cursor must take that same throw, not a new one, or those rows break.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "A cursor longer than the bound that today parses to a small number \u2014 concretely '0'.repeat(200) + '1-0', which BigInt reads as 1-0 and the plugin currently accepts as a live cursor. This is a real behaviour change and it is the sharp edge of this fix: live-stream.test.ts deliberately grades a leading-zero SPELLING axis (respell(id, 3, 3)), so the bound must be comfortably above 47 characters or that whole axis goes red. 128 clears it; anything at or near 41 does not.",
+   "testsThatWouldFail": "none at a bound of 128 \u2014 I checked live-stream.test.ts's spellings array (max padding 3 zeros per component, so max 47 chars) and its foreign table (longest row is '18446744073709551616-18446744073709551616', 41 chars), and subscribe-hardening's long-poll cursors ('500-0','1-0','123','999999998-4'). I did NOT apply and re-run this one.",
+   "hidesOrFixes": "Fixes the stall for this backend only. If applied while core's z.string() stays unbounded, the same megabyte still crosses the JSON-RPC boundary and is still allocated and regex-scanned \u2014 the residual cost is linear, not superlinear, and every other backend's cursor validator remains exposed on its own terms.",
+   "interleavings": "n/a",
+   "confidence": "plausible"
+  }
+ },
+ {
+  "target": "redis",
+  "dirs": [
+   "bridge-redis"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "seam-integrity",
+  "theme": "contract-arm-declared-nowhere",
+  "class": "backend-behaviour-outside-the-seam-and-outside-conformance",
+  "file": "packages/bridge-redis/src/index.ts",
+  "line": 196,
+  "summary": "The beyond-high-water self-heal returns messages strictly OLDER than `since` and a nextCursor BELOW `since`. seam.ts:116 states the opposite without qualification (\"Returns messages strictly after `since`\"), and the frozen conformance suite has no clause for it \u2014 packages/conformance/src/clauses.ts lists 21 clauses and none covers a stale cursor. At least four shipped backends (redis, sqlite, nats, telegram) implement this same heal privately, each graded only by its own package's table, so the shared suite certifies a backend that omits the heal (wedging a topic forever) exactly as readily as one that has it.",
+  "failure": "fetchRecent({topic:'t', since:'<tail+1h>-0'}) on a topic whose stream holds ['one','two'] returns {messages:[one,two], nextCursor:<cursor of two>} \u2014 two messages strictly BEFORE the `since` the caller asked to read after, and a nextCursor lower than the one they passed in. A core (or an embedder) written against seam.ts's stated contract has no reason to expect either. The seam and the conformance suite are silent, so no cross-backend grade exists.",
+  "remediation": "This is not a bridge-redis change \u2014 the seam is what is wrong, and per CLAUDE.md prime directive 2 it must be surfaced rather than absorbed. Declare the arm in seam.ts's fetchRecent doc the way the absent-topic arm is already declared, add a staleCursorBehaviour: 'replays-recent-window' | 'echoes' capability to ConformanceContext (required, with the stricter value as the default, matching the existing absentTopicBehaviour pattern), and add one conformance case + one CLAUSES entry: mint a cursor past what the backend can ever have minted, assert the page is never both empty AND nextCursor === since.",
+  "testUpgrade": "The class is \"a behaviour every backend must share, graded only by each backend's private table\". The durable guard is the conformance clause above, driven off a context-supplied staleCursor(topic) minter so each backend expresses \"a cursor past my high-water mark\" in its own id space (redis: tail ms + 1h; sqlite: max rowid + 1; nats: seq + 1). Grade the invariant, not the outcome: messages.length > 0 || nextCursor !== since, plus \"the returned cursor is live\" (post once more, re-fetch from it, get exactly the new message). bridge-redis's own live-stream.test.ts table is already written this way and is the model \u2014 it is just not shared.",
+  "remediationCheck": {
+   "reliesOn": "packages/conformance/src/factory.ts's CONTEXT_FIELDS runtime validator, which is what makes a capability field REQUIRED (vitest transpiles without typechecking, so a missing field would otherwise silently delete cases), and clauses.ts's CLAUSES membership check, which is what makes deleting the new clause a failure.",
+   "newlyAccepts": "Nothing at runtime in bridge-redis; the plugin's behaviour is unchanged. It newly accepts, as CONFORMANT, a backend that declares staleCursorBehaviour: 'echoes' and is then graded on the echo arm instead of the replay arm.",
+   "newlyRejects": "Every backend whose conformance context omits the new field fails assertConformanceContext at fixture time \u2014 that is the intended failure, but it means the change cannot land in bridge-redis alone; all 11 backends' factories must be updated in the same commit or their suites go red.",
+   "testsThatWouldFail": "packages/conformance's own suite-shape/CLAUSES membership tests, which pin CLAUSES.length and CONTEXT_FIELDS keys by value \u2014 they must be updated with the new clause and field. Every backend's conformance.test.ts makeContext() would fail the field validator until updated. I did not run this; it is derived from reading factory.ts and clauses.ts.",
+   "hidesOrFixes": "Fixes the grading gap only. If applied while a backend's heal is still wrong, the new clause is what catches it \u2014 but nothing here changes redis's behaviour, and a core or embedder that assumed monotonic nextCursor still has to be audited separately (core's catchUpTopic at engine/catchup.ts:71 already tolerates a lower cursor, because it stops on messages.length === 0 || nextCursor === since rather than on a comparison).",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "redis",
+  "dirs": [
+   "bridge-redis"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "design-principles",
+  "theme": "silent-loss-of-a-capability",
+  "class": "reconnect-drops-subscriptions-with-no-diagnostic",
+  "file": "packages/bridge-redis/src/index.ts",
+  "line": 113,
+  "summary": "open() calls tearDown(), which bumps the generation and kills every subscribe read loop. The plugin never re-establishes those subscriptions and writes nothing to stderr. Every other way live delivery dies is announced \u2014 a permanent refusal writes STOPPED, a sustained transient fault writes DEGRADED, and diagnostics.ts justifies both with \"a live path which can no longer deliver does not look identical to a quiet topic\". A second connect() produces exactly that state and is the one path that says nothing.",
+  "failure": "await p.connect(cfg); await p.subscribe(t, h); await p.connect(cfg); \u2014 from here on h is never called again for any message posted to t, subscribe() long since resolved, post/fetchRecent keep working, and no line is written anywhere. subscribe-hardening.test.ts's 'connect() re-baselining the generation' rows cement this silence (they assert only that no further reads are issued and no timer is armed). README.md documents STOPPED and DEGRADED and never mentions reconnect at all.",
+  "remediation": "Make the loss loud rather than silent. Either (a) have tearDown() report, when it is being called from open() rather than from disconnect() and at least one subscribe reader was live, one line naming the topics whose live delivery ended; or (b) fail fast \u2014 have connect() reject when the plugin is already connected and holds live subscriptions, since core (transport/stdio-bridge.ts:67) connects exactly once and nothing in this repo needs a hot reconnect. (b) is the smaller change and is more in keeping with \"no silent no-ops\".",
+  "testUpgrade": "The class is \"a lifecycle call that silently ends a capability the plugin announces the end of on every other path\". Parameterize a table over (way live delivery ends) x (what must be observable): rows = [permanent refusal, sustained transient fault, disconnect(), connect() re-baseline, handler that throws], and assert for each row whether a diagnostic line is owed and whether the handler stops. disconnect() is the negative control (silence is correct there); today the connect() row is the only one that is both silent and unexpected. Written this way, a future lifecycle path added to tearDown's callers is pulled into the table rather than escaping it.",
+  "remediationCheck": {
+   "reliesOn": "this.readers and the generation counter in index.ts. Note tearDown() does NOT currently know which readers are subscribe readers vs long-poll readers \u2014 the readers array holds both and blockingReaders is only a count \u2014 so option (a) needs a per-reader tag that does not exist today.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "Under option (b): a second connect() on a plugin that already holds subscriptions now rejects. That is a behaviour change an embedder could be relying on for hot config reload.",
+   "testsThatWouldFail": "Option (b) would break, by name: live-connections.test.ts 'connect\u00b7subscribe\u00b7connect\u00b7disconnect returns every socket', 'connect \u2225 subscribe' and 'connect\u00b7(connect \u2225 fetchRecent(blocking))', and subscribe-hardening.test.ts's four 'connect() re-baselining the generation after ...' rows plus 'does not revive a prior loop after disconnect()/connect()'. That is a substantial ratchet to move, and those rows encode a real invariant (no orphaned sockets across a re-connect) that must survive whatever replaces them. Option (a) breaks none of them that I can see \u2014 subscribe-hardening's stderr spy rows assert diagnosed === (kind==='permanent') before their finally calls disconnect(), and the re-baseline rows assert only read counts and timer counts \u2014 but I did not apply and run either option.",
+   "hidesOrFixes": "Option (a) fixes the observability and leaves the capability lost \u2014 an operator learns about it, live push still needs a restart. Option (b) fixes it by refusing to enter the state at all. Neither restores the subscriptions; re-subscribing across a reconnect would be a third, larger change and would need the topic->handler map the plugin deliberately does not keep.",
+   "interleavings": "n/a",
+   "confidence": "plausible"
+  }
+ },
+ {
+  "target": "redis",
+  "dirs": [
+   "bridge-redis"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "stale-cross-reference",
+  "class": "comment-names-a-file-that-does-not-exist",
+  "file": "packages/bridge-redis/test/config-fixtures.ts",
+  "line": 2,
+  "summary": "Three comments direct a reader to test files that are not in the package. config-fixtures.ts:2 and failure-modes.test.ts:40 and :348 all name live-failure-modes.test.ts; support.ts:13 names endpoint-hygiene.test.ts. Neither file exists anywhere in the repo (grep across packages/ finds only these four mentions). Each is load-bearing prose: config-fixtures.ts claims the missing file is what asserts \"a rejected row never tears a live connection down\", and support.ts cites the missing file as the enforcement behind its endpoint-minting rule.",
+  "failure": "A maintainer following config-fixtures.ts's instruction \u2014 \"Keep one copy, so that the two files cannot drift and leave a knob rejected in one and unguarded in the other\" \u2014 goes looking for live-failure-modes.test.ts to check the second consumer, finds nothing, and concludes the second guard was deleted. It was not: the assertion lives in live-config.test.ts's 'a rejected connect() must not destroy a live one' block, and the endpoint rule lives in test-hygiene.test.ts. The comment sends the reader to the wrong conclusion in both directions.",
+  "remediation": "Per CLAUDE.md's comment discipline the better fix is deletion, not renaming: a comment whose job is to name a sibling file rots against every split and is exactly the kind that narrates rather than warning off a risky action. Delete the three sentences; if the cross-file coupling must be enforced, enforce it \u2014 test-hygiene.test.ts is already the place that does this by construction (it globs the directory rather than naming files).",
+  "testUpgrade": "The class is \"prose in this package that names a file which no longer exists\". test-hygiene.test.ts already globs test/*.ts and already owns rules-about-this-package's-tests; add one generated rule there: for every source and doc file under the package, extract each backticked or quoted *.test.ts / *.ts filename mentioned in a comment and assert it resolves on disk. Generated over the directory, so a reference added later is pulled in rather than escaping, and it also covers src/ comments and README.md \u2014 which is where the same class recurs when a file is renamed during a decomposition.",
+  "remediationCheck": {
+   "reliesOn": "Nothing in src \u2014 these are comments only.",
+   "newlyAccepts": "none.",
+   "newlyRejects": "none.",
+   "testsThatWouldFail": "none \u2014 the strings are inside // comments, and the only test that reads test-file text is test-hygiene.test.ts, whose two regexes (BORROWED_ENDPOINT and GATED_BLOCK/UNGATED_BLOCK) do not match these lines. I did not run this.",
+   "hidesOrFixes": "Fixes. If the comments were deleted and the underlying coupling were genuinely broken (i.e. rejectedByKnob really did have only one consumer), nothing would be hidden \u2014 live-config.test.ts:321's expect(rows.length, \"no rejection rows are declared for ...\").toBeGreaterThan(0) is what actually keeps the second consumer honest, and it is code, not prose.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "sqlite",
+  "dirs": [
+   "bridge-sqlite"
+  ],
+  "severity": "suggestion",
+  "verdict": "PLAUSIBLE",
+  "lens": "design-principles",
+  "theme": "lifecycle-ownership",
+  "class": "shared-mutable-protected-state-across-a-single-variant-chain",
+  "file": "packages/bridge-sqlite/src/store.ts",
+  "line": 31,
+  "summary": "SqliteStore -> SqliteCatchUp -> SqliteRetention -> SqlitePoller -> SqlitePlugin is a five-deep chain in which every intermediate class is `abstract` with no abstract members and exactly one subclass, and all five share mutable `protected` fields. Inheritance is being used as a file-splitting device, and it leaves the connect/disconnect invariant with no owner.",
+  "failure": "`tornDown()` - the whole teardown contract - lives in store.ts; the loop that consults it lives in poll.ts; the code that can invalidate it mid-tick (`this.stopped = false`, `this.driver = driver`) lives in index.ts. No class owns the pairing, which is how finding 2 (a reconnect re-satisfying an in-flight loop's teardown test) exists in code whose comments explicitly claim to prevent it: three of the five classes have to agree, and nothing makes them. The same shape means finding 2's generation-token fix has to be threaded through three of the five files.",
+  "remediation": "Give the lifecycle an owner rather than a level: a small `Lifecycle` value the plugin composes, holding {driver, storeId, statements, generation}, replaced wholesale by connect() and cleared by disconnect(), with `subscribe` capturing the object and comparing identity. That collapses the protected-field surface and makes 'is this loop still mine?' a single expression rather than an agreement between three files. This is a composition change, not a re-monolithing - the file split stays.",
+  "testUpgrade": "Not another test - the guard here is finding 2's parameterized re-entrancy table, which grades the invariant (a loop never outlives the connection that armed it) through the public surface, from any lifecycle order, and therefore stays valid however the classes are later rearranged. Do not add a structural assertion about the class chain; per CLAUDE.md that would cement the shape rather than the invariant.",
+  "remediationCheck": {
+   "reliesOn": "prepareAll(driver) in store.ts, which already builds the statement set as one object from the SQL map and is assigned wholesale via Object.assign in connect() - the composition refactor keeps that object instead of spreading it onto `this`.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none intended - it is meant to be behaviour-preserving apart from finding 2's fix.",
+   "testsThatWouldFail": "test/bounded-state.test.ts would likely fail as written: it walks `Object.entries(plugin)` for Array/Map/Set-valued own properties and asserts the collection NAMES include 'cancellers' and 'health'. Moving state behind a composed object hides those names from the walk, and the test's own guard `expect(collections.length).toBeGreaterThan(0)` plus the arrayContaining check would red. That is the ratchet doing its job and is exactly the situation CLAUDE.md's 'assert the invariant, not the layout' rule covers - the walk should recurse into composed state, not require the fields to sit on the plugin.",
+   "hidesOrFixes": "Applying this without finding 2's generation check fixes nothing about the orphaned loop; identity comparison on the composed object is what actually closes it, and the refactor is only what makes that comparison a single expression.",
+   "interleavings": "n/a",
+   "confidence": "untested"
+  }
+ }
+]
