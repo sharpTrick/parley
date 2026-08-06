@@ -143,6 +143,7 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 14 | *decomposition round — no review* | | | | | | — |
 | 15 | 15 / 15 | 111 | 109 | 35 | 2 | 0 | no |
 | 16 | 15 / 15 | 103 | 99 | 39 | 4 | 0 | no |
+| 17 | 15 / 15 | 89 | 87 | 30 | 2 | 0 | no |
 
 Three rounds ran no critics. Rounds 11, 12 and 14 are **decomposition rounds** — the simplify-first
 rule described in `docs/REVIEW_PROTOCOL.md`, splitting single-file packages after `bridge-sqlite`
@@ -355,6 +356,7 @@ same agent that wrote the fixes being judged.
 | 13 | 84 | 69 | 14 | **83%** |
 | 15 | 111 | 86 | 20 | **81%** |
 | 16 | 103 | 76 | 27 | **74%** |
+| 17 | 89 | 75 | 12 | **86%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
@@ -372,9 +374,9 @@ matter in the original codebase, or only in its own output?*
 
 | round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | **10** |
+| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 | 17 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | 10 | **4** |
 
 Round 6's fall to 5 looked like the knee ouroboros reported. It was not: rounds 7–10 recovered to a
 stable 8–11 band, which is what the halfway reading recorded as *"no knee at the run level."*

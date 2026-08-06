@@ -132,6 +132,17 @@
    "unresolvable": 0,
    "selfInducedPct": 74,
    "note": "The first scored round against a tree nobody restructured, and the test named in round 15's entry. Pre-existing findings 20 -> 27 and pre-existing BLOCKING 6 -> 10, back into the rounds 7-10 band."
+  },
+  {
+   "round": 17,
+   "base": "8e8d22e",
+   "findings": 89,
+   "graded": 87,
+   "selfInduced": 75,
+   "preExisting": 12,
+   "unresolvable": 2,
+   "selfInducedPct": 86,
+   "note": "Run in three batches of five targets after twelve container reprovisions killed three all-or-nothing attempts. Same base for all three."
   }
  ],
  "comparison": {
@@ -228,9 +239,16 @@
     "selfInduced": 29,
     "preExisting": 10,
     "selfInducedPct": 74
+   },
+   {
+    "round": 17,
+    "blocking": 30,
+    "selfInduced": 26,
+    "preExisting": 4,
+    "selfInducedPct": 87
    }
   ],
-  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, and 10. The round 13/15 dip to 6 was read at the time as the strongest exhaustion signal in the dataset, with the caveat that both numbers were floors inflated by decomposition-relocation blame. Round 16 -- the first scored round against a tree nobody restructured, named in that entry as what would settle it -- returns 10. The dip was the artifact, not a knee. Rounds 7, 8, 9, 10 and 16 now read 10, 9, 11, 8, 10: a five-round plateau with no decay across roughly 12M review tokens, spanning a decomposition of eleven packages and an instrument change.",
+  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, 10 and 4. Round 16's 10 was the value that overturned the round 13/15 dip as a decomposition-blame artifact. Round 17 returns 4 -- the lowest since round 6 -- but it is a floor for the same reason those were: round 16's remediation moved a very large amount of code (the repo target alone was 55 files and -936 lines), and blame charges the mover. The pre-registered threshold is unchanged and NOT met: three or more consecutive scored rounds below 8 against a tree nobody is restructuring. Round 16 was 10 and round 17 is the first below 8 since then, so at most one of the three is in hand, and round 17's tree had just absorbed 39 fixes across every package.",
   "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects."
  },
  "inertRemediations": {
