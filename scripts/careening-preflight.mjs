@@ -62,7 +62,13 @@ for (const s of SERVICES) services.push({ ...s, up: daemon ? await reachable(s.p
 // a stale tree and return a full round of findings that look exactly like a valid round. Round 17
 // spent 3.12M tokens reviewing a commit four rounds old before anyone noticed.
 const WORKTREES = '/tmp/careening/worktrees';
-const head = run('git', ['rev-parse', 'HEAD']);
+// Default to HEAD, so that starting a fresh round on a stale tree is refused. But a round that runs
+// in BATCHES must keep every batch on the round's own base — committing this round's findings moves
+// HEAD, and rebasing the worktrees mid-round would mean later batches reviewed a different tree than
+// earlier ones. `--base <sha>` is how a mid-round check says which tree it means.
+const baseFlag = process.argv.indexOf('--base');
+const wantRaw = baseFlag === -1 ? 'HEAD' : process.argv[baseFlag + 1];
+const head = run('git', ['rev-parse', wantRaw]);
 const stale = [];
 let worktrees = [];
 try {
