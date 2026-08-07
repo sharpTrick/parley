@@ -1,7 +1,12 @@
 import type { Topic } from '@sharptrick/parley-core';
 import { fetchWithRetry } from '@sharptrick/parley-net-util';
-import { boundedLocalpart } from './alias.js';
-import { DEFAULT_HOMESERVER_URL, DEFAULT_PASSWORD, type RoomPreset } from './config.js';
+import { aliasOf, boundedLocalpart } from './alias.js';
+import {
+  DEFAULT_HOMESERVER_URL,
+  DEFAULT_PASSWORD,
+  DEFAULT_SERVER_NAME,
+  type RoomPreset,
+} from './config.js';
 import {
   contentOf,
   isMessageEvent,
@@ -21,7 +26,7 @@ const MIN_PARK_SLICE_MS = 250;
 /** The settings a `connect()` installs, the calls that carry them, and alias → room_id resolution. */
 export abstract class MatrixSession {
   protected baseUrl = DEFAULT_HOMESERVER_URL;
-  protected serverName = 'parley.local';
+  protected serverName = DEFAULT_SERVER_NAME;
   protected user = 'parley';
   protected password = DEFAULT_PASSWORD;
   protected syncTimeoutMs = 25_000;
@@ -32,12 +37,6 @@ export abstract class MatrixSession {
   protected token?: string;
   protected userId?: string;
   protected stopped = false;
-  /**
-   * The one window in which holding no token is normal rather than a failed connect. Keep it, so
-   * that a PREVIOUS generation's seam call resuming inside that window still stands down on its own
-   * staleness gate and reports the caller's cursor back, not the failed-connect diagnostic.
-   */
-  protected loggingIn = false;
   /**
    * Bumped by every `connect()`; background work captures it and stands down once it no longer
    * matches. Keep it, so that a loop parked in a retry backoff across a `disconnect()` cannot be
@@ -52,15 +51,6 @@ export abstract class MatrixSession {
   /** True once work started under `generation` must stand down: we disconnected, or reconnected. */
   protected isStale(generation: number): boolean {
     return this.stopped || this.generation !== generation;
-  }
-
-  /**
-   * True while the plugin considers itself connected but holds no credential — the state a
-   * `connect()` whose login rejected leaves behind. A torn-down plugin and a login still in flight
-   * are both excluded, so that work already under way at either still drains.
-   */
-  private get loginIncomplete(): boolean {
-    return this.token === undefined && !this.stopped && !this.loggingIn;
   }
 
   /** Tag-gated in shared mode, where the tag is forgeable — see `backend_config.shared_room`. */
@@ -107,10 +97,6 @@ export abstract class MatrixSession {
     return this.sharedLocalpart ?? boundedLocalpart(topic, this.serverName);
   }
 
-  private aliasOf(localpart: string): string {
-    return `#${localpart}:${this.serverName}`;
-  }
-
   /** Resolve (or create) the room for `topic`, memoized so concurrent first-posts don't double-create. */
   protected ensureRoom(topic: Topic): Promise<string> {
     const key = this.roomKey(topic);
@@ -135,13 +121,22 @@ export abstract class MatrixSession {
     const cached = this.rooms.get(key);
     if (cached !== undefined) return cached;
     if (this.isStale(generation)) return undefined;
-    const alias = this.aliasOf(this.roomLocalpart(topic));
+    const alias = aliasOf(this.roomLocalpart(topic), this.serverName);
     const roomId = await this.lookupAlias(alias);
     // Keep a gate on BOTH sides of the join, so that a teardown landing mid-resolve or mid-JOIN can
     // neither talk to the homeserver with a cleared token nor repopulate {@link rooms} for the next
     // generation.
     if (roomId === undefined || this.isStale(generation)) return undefined;
-    await this.adoptRoom(roomId, alias);
+    try {
+      await this.adoptRoom(roomId, alias);
+    } catch (err) {
+      // A teardown landing inside the join or the state read leaves this resolve without the
+      // credential those calls need. Keep it reported as "no room", so that the READ above it still
+      // answers with the position its caller handed it instead of surfacing our own shutdown as a
+      // read failure. Anything that failed under a LIVE generation is still the caller's to see.
+      if (this.isStale(generation)) return undefined;
+      throw err;
+    }
     if (this.isStale(generation)) return undefined;
     this.rooms.set(key, Promise.resolve(roomId));
     return roomId;
@@ -170,7 +165,7 @@ export abstract class MatrixSession {
   }
 
   private async resolveOrCreateRoom(localpart: string): Promise<string> {
-    const alias = this.aliasOf(localpart);
+    const alias = aliasOf(localpart, this.serverName);
     const existing = await this.lookupAlias(alias);
     if (existing !== undefined) {
       await this.adoptRoom(existing, alias);
@@ -307,9 +302,11 @@ export abstract class MatrixSession {
    * Adds auth, JSON encodes, retries 429 (`M_LIMIT_EXCEEDED`) honoring `retry_after_ms`, and throws
    * on any other non-2xx the caller did not list in `allowStatuses`.
    *
-   * Keep a call made while {@link loginIncomplete} a THROW, so that a plugin whose `connect()`
-   * rejected fails naming the cause rather than issuing anonymous requests to the newly configured
-   * homeserver and serving whatever a permissive one answers as though it were connected.
+   * Keep a credential-less call a THROW unless it declared `unauthenticated`, so that no request
+   * this plugin makes can reach a homeserver anonymously — not after a `connect()` whose login
+   * rejected, not after the `disconnect()` that dropped the token, and not from work still in flight
+   * across either. A permissive homeserver, a guest-access deployment or a captive portal answers
+   * such a request, and the plugin would serve that answer as though it were connected.
    */
   protected async http(
     method: string,
@@ -319,16 +316,18 @@ export abstract class MatrixSession {
       signal?: AbortSignal;
       allowStatuses?: number[];
       deadlineMs?: number;
+      /** The ONE call that legitimately holds no credential: the login that mints one. */
+      unauthenticated?: boolean;
     },
   ): Promise<Response> {
     const generation = this.generation;
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {};
-    if (this.loginIncomplete) {
+    if (this.token === undefined && opts?.unauthenticated !== true) {
       throw new Error(
-        `[parley-matrix] refusing ${method} ${path}: no access token for ${this.baseUrl}, because ` +
-          'the last connect() did not complete its login. Call connect() again and let it resolve ' +
-          'before using this plugin.',
+        `[parley-matrix] refusing ${method} ${path}: this plugin holds no access token for ` +
+          `${this.baseUrl} — it is disconnected, or its last connect() did not complete its ` +
+          'login. Call connect() and let it resolve before using this plugin.',
       );
     }
     if (this.token !== undefined) headers.Authorization = `Bearer ${this.token}`;

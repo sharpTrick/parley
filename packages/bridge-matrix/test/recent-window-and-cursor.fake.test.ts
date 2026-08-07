@@ -2,7 +2,6 @@ import {
   asCursor,
   asHandle,
   asTopic,
-  type BackendPlugin,
   type Cursor,
   type FetchRecentResult,
   type Topic,
@@ -10,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MatrixPlugin } from '../src/index.js';
 import { SHAPES } from './cursor-shapes.js';
+import { drainFrom } from './drain.js';
 import { aliasForTopic, connectFake, fakeConfig, FakeSynapse } from './fake-synapse.js';
 
 /**
@@ -45,25 +45,6 @@ const NOISE = {
 } as const;
 
 const NOISE_DEPTHS = [LIMIT - 1, LIMIT, LIMIT * 3];
-
-/** Replay `cursor` to exhaustion exactly as core's catch-up driver does, collecting contents. */
-async function drainFrom(
-  plugin: BackendPlugin,
-  topic: Topic,
-  cursor: Cursor,
-  limit: number,
-): Promise<{ contents: string[]; finalCursor: Cursor }> {
-  let since = cursor;
-  const contents: string[] = [];
-  for (;;) {
-    const page = await plugin.fetchRecent({ topic, since, limit });
-    contents.push(...page.messages.map((m) => m.content));
-    const stop = page.messages.length < limit || page.nextCursor === since;
-    since = page.nextCursor;
-    if (stop) break;
-  }
-  return { contents, finalCursor: since };
-}
 
 describe('recent window: a raw page cap must not hide a topic behind noise', () => {
   for (const shared of [true, false]) {

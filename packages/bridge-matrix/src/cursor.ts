@@ -1,4 +1,28 @@
-import { asCursor, type Cursor, type Message } from '@sharptrick/parley-core';
+import { asCursor, type Cursor, type Message, type Topic } from '@sharptrick/parley-core';
+
+/** Page size a read with no `limit` of its own asks for — the default core's own config carries. */
+const DEFAULT_PAGE = 100;
+
+/**
+ * Both paging loops here are guarded by `collected.length < limit`, so a limit below 1 — or one that
+ * is not a whole number at all — leaves that guard false on entry and the walk executes NO page.
+ * Keep this a REFUSAL taken before any page is read, so that a walk which observed nothing can never
+ * reach {@link emptyWindowCursor} with no token and mint `@parley-stream:`: that names the first
+ * visible event in the room, and core persists whatever cursor it is handed. Refuse rather than
+ * substitute {@link DEFAULT_PAGE}, so that a caller asking for a page size this backend cannot read
+ * hears about it instead of being served a different one.
+ */
+export function requireLimit(limit: number | undefined, topic: Topic): number {
+  if (limit === undefined) return DEFAULT_PAGE;
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(
+      `[parley-matrix] fetchRecent limit ${String(limit)} for topic ` +
+        `${JSON.stringify(String(topic))} is not a page size this backend can read: expected a ` +
+        'positive whole number (core bounds its own catchup.limit the same way).',
+    );
+  }
+  return limit;
+}
 
 /**
  * Marks an opaque `/messages` pagination token — the position an empty window was read AT, so

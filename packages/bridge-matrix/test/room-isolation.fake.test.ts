@@ -3,6 +3,12 @@ import {
 } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { boundedLocalpart } from '../src/alias.js';
+import {
+  ALIAS_LEGAL,
+  aliasIsLegal,
+  HOSTILE_LOCALPARTS,
+  MAX_ALIAS_BYTES,
+} from './alias-legality.js';
 import { MatrixPlugin, sanitizeAlias } from '../src/index.js';
 import {
   aliasForTopic,
@@ -195,8 +201,6 @@ describe('a topic is read out of its own room only', () => {
  * cross-delivery the table above exists to prevent. The expected localparts are LITERALS, so a fold
  * that stops folding (or a suffix that stops being appended) cannot be mirrored into a pass.
  */
-const ALIAS_LEGAL = /^#[A-Za-z0-9._-]+:[^:]+$/;
-
 const FOLDS: { topic: string; localpart: string }[] = [
   { topic: 'alpha', localpart: 'parley_alpha' },
   { topic: 'ops:prod', localpart: 'parley_ops_prod-1608f4e357676264' },
@@ -222,7 +226,7 @@ describe('an alias-hostile topic name folds to a legal, injective localpart', ()
       const alias = `#${localpart}:fake`;
       expect(fake.directoryLookups).toEqual([alias]);
       expect(alias).toMatch(ALIAS_LEGAL);
-      expect(Buffer.byteLength(alias, 'utf8')).toBeLessThanOrEqual(255);
+      expect(Buffer.byteLength(alias, 'utf8')).toBeLessThanOrEqual(MAX_ALIAS_BYTES);
       await p.disconnect();
     });
   }
@@ -250,7 +254,7 @@ describe('an alias-hostile topic name folds to a legal, injective localpart', ()
  * the boundary the fixture's `server_name` puts it, including a multi-byte row where the topic's
  * character count and its byte count diverge.
  */
-const LOCALPART_BUDGET = 255 - `#:${SERVER_NAME}`.length;
+const LOCALPART_BUDGET = MAX_ALIAS_BYTES - `#:${SERVER_NAME}`.length;
 /** Longest topic that still folds to an alias byte-for-byte, i.e. with no suffix and no truncation. */
 const EXACT_FIT = LOCALPART_BUDGET - 'parley_'.length;
 
@@ -275,7 +279,7 @@ describe('a topic longer than the alias limit still folds to a legal, injective 
       const alias = `#${localpart}:${SERVER_NAME}`;
       expect(fake.directoryLookups).toEqual([alias]);
       expect(alias).toMatch(ALIAS_LEGAL);
-      expect(Buffer.byteLength(alias, 'utf8')).toBeLessThanOrEqual(255);
+      expect(Buffer.byteLength(alias, 'utf8')).toBeLessThanOrEqual(MAX_ALIAS_BYTES);
       // …and the topic actually works: the same fold resolves it on the way back out.
       expect(contents(await p.fetchRecent({ topic: asTopic(topic), limit: 10 }))).toEqual(['hello']);
       await p.disconnect();
@@ -373,7 +377,7 @@ describe('no two topics fold onto one alias localpart', () => {
   });
 
   for (const serverName of FOLD_SERVER_NAMES) {
-    const budget = 255 - Buffer.byteLength(`#:${serverName}`, 'utf8');
+    const budget = MAX_ALIAS_BYTES - Buffer.byteLength(`#:${serverName}`, 'utf8');
     const exactFit = budget - 'parley_'.length;
     const lengths = [1, 8, exactFit - 1, exactFit, exactFit + 1, 4 * exactFit];
 
@@ -396,7 +400,7 @@ describe('no two topics fold onto one alias localpart', () => {
  */
 const CONSTRUCTED_FROM: Record<string, { victim: string; construct: (topic: string) => string }> = {
   'a truncated localpart': {
-    victim: 'x'.repeat(4 * (255 - `#:${SERVER_NAME}`.length)),
+    victim: 'x'.repeat(4 * (MAX_ALIAS_BYTES - `#:${SERVER_NAME}`.length)),
     construct: (t) => boundedLocalpart(asTopic(t), SERVER_NAME).slice('parley_'.length),
   },
   'a disambiguated safeName': {
@@ -423,6 +427,76 @@ describe('a topic spelled like another topic’s published alias gets its own ro
         'attacker',
       ]);
       await p.disconnect();
+    });
+  }
+});
+
+/**
+ * CLASS: the legality of a name this plugin addresses a room by does not depend on WHO chose it.
+ * Every table above grades localparts DERIVED from a topic, which reach the wire only through
+ * `sanitizeAlias` (charset) and `boundedLocalpart` (byte budget). `backend_config.shared_room`
+ * reaches the same wire with neither: it is used verbatim as the localpart of every topic's alias.
+ * So the two halves are driven from ONE predicate here, applied to the alias that actually went out
+ * — an operator-supplied name is either refused at load with nothing sent, or legal on the wire.
+ *
+ * `a:b` is why this is a load error rather than a warning: Matrix splits an alias on its FIRST
+ * colon, so `#a:b:fake` addresses the server `b:fake`, which `backend_config.server_name` never
+ * named — and an over-long one is refused by `createRoom` while every read of it returns the empty
+ * page an unwritten topic returns, so the deployment silently never works.
+ */
+describe('an alias reaches the wire legal however its localpart was chosen', () => {
+  const load = async (localpart: string): Promise<Error | undefined> => {
+    const p = new MatrixPlugin();
+    const err = await p
+      .connect({ ...fakeConfig(), shared_room: localpart })
+      .then(() => undefined, (e: unknown) => e as Error);
+    if (err === undefined) {
+      await p.post(A, WRITER, 'hello').catch(() => undefined);
+      await p.fetchRecent({ topic: A, limit: 10 }).catch(() => undefined);
+    }
+    await p.disconnect();
+    return err;
+  };
+
+  it('the fixture localpart every shared-mode case uses is one the predicate accepts', () => {
+    expect(aliasIsLegal(aliasForTopic(String(A), true))).toBe(true);
+  });
+
+  for (const [why, localpart] of Object.entries(HOSTILE_LOCALPARTS)) {
+    it(`shared_room with ${why}: refused at load, nothing addressed`, async () => {
+      const err = await load(localpart);
+
+      expect(err, 'this localpart cannot reach the wire legally, so it must not load').toBeInstanceOf(
+        Error,
+      );
+      expect(String(err)).toMatch(/backend_config\.shared_room/);
+      expect(fake.directoryLookups).toEqual([]);
+      expect(fake.createRoomBodies).toEqual([]);
+    });
+  }
+
+  /**
+   * The generator half: whatever the guard accepts, the wire must be able to carry. Swept over the
+   * alphabets the fold treats differently and over lengths straddling the budget, so a charset or a
+   * bound that moves is graded at its new boundary rather than at the one these rows were written
+   * against.
+   */
+  const BUDGET = MAX_ALIAS_BYTES - `#:${SERVER_NAME}`.length;
+  const CANDIDATES = ['x', 'é', '.', '-', '_', ':', '/', ' ', '\u{1F600}'].flatMap((ch) =>
+    [1, 8, BUDGET - 1, BUDGET, BUDGET + 1].map((n) => ch.repeat(n)),
+  );
+
+  for (const localpart of CANDIDATES) {
+    const label = `${JSON.stringify(localpart.slice(0, 4))} x${localpart.length}`;
+    it(`shared_room ${label}: loads only if the alias it builds is legal`, async () => {
+      const alias = `#${localpart}:${SERVER_NAME}`;
+      const err = await load(localpart);
+
+      expect(err === undefined, `accepted at load must agree with ${alias.slice(0, 20)}… being legal`)
+        .toBe(aliasIsLegal(alias));
+      for (const asked of fake.directoryLookups) expect(asked).toMatch(ALIAS_LEGAL);
+      for (const asked of fake.directoryLookups)
+        expect(Buffer.byteLength(asked, 'utf8')).toBeLessThanOrEqual(MAX_ALIAS_BYTES);
     });
   }
 });

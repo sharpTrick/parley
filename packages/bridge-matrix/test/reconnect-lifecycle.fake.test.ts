@@ -219,7 +219,9 @@ const LIFECYCLES: Record<string, (p: MatrixPlugin) => Promise<void>> = {
   'a disconnect racing an in-flight subscribe': async (p) => {
     const subscribing = p.subscribe(TOPIC, () => undefined);
     await p.disconnect();
-    await subscribing;
+    // The teardown dropped the credential mid-resolve, so the establishment cannot finish. It owes
+    // the caller that fact rather than completing its join and its state read anonymously.
+    await expect(subscribing).rejects.toThrow(/\[parley-matrix\]/);
   },
 };
 
@@ -309,23 +311,26 @@ const TEARDOWN_DRIVERS: Record<
   {
     setup?: (p: MatrixPlugin) => Promise<unknown>;
     drive: (p: MatrixPlugin, ctx: unknown) => Promise<unknown>;
-    /** True only for `post`: the caller's own WRITE finishes rather than standing down. */
-    writes: boolean;
+    /** Writes the driver lands when NOTHING tears it down — the control below grades this. */
+    writesUntorn: number;
   }
 > = {
   'a since-less fetchRecent': {
-    writes: false,
+    writesUntorn: 0,
     drive: (p) => p.fetchRecent({ topic: TOPIC, limit: PAGE_LIMIT }),
   },
-  'a post': { writes: true, drive: (p) => p.post(TOPIC, WRITER, 'x') },
-  'a subscribe': { writes: false, drive: (p) => p.subscribe(TOPIC, () => undefined) },
+  'a post': { writesUntorn: 1, drive: (p) => p.post(TOPIC, WRITER, 'x') },
+  'a subscribe': {
+    writesUntorn: 0,
+    drive: (p) => p.subscribe(TOPIC, () => undefined),
+  },
   'a blocking fetchRecent from the empty sentinel': {
-    writes: false,
+    writesUntorn: 0,
     drive: (p) =>
       p.fetchRecent({ topic: TOPIC, since: asCursor(''), blockMs: 1500, limit: PAGE_LIMIT }),
   },
   'a blocking fetchRecent parked at the tail': {
-    writes: false,
+    writesUntorn: 0,
     setup: async (p) => {
       await p.post(TOPIC, WRITER, 'seed');
       return (await p.fetchRecent({ topic: TOPIC, limit: PAGE_LIMIT })).nextCursor;
@@ -334,6 +339,28 @@ const TEARDOWN_DRIVERS: Record<
       p.fetchRecent({ topic: TOPIC, since: since as never, blockMs: 1500, limit: PAGE_LIMIT }),
   },
 };
+
+/**
+ * The control the teardown table needs to mean anything: with nothing torn down, every driver in it
+ * reaches the homeserver and does its work. Without this a table whose every assertion is "nothing
+ * happened after the teardown" is satisfied by a plugin that does nothing at all.
+ */
+describe('every teardown driver does its work when nothing tears it down', () => {
+  for (const [driverName, driver] of Object.entries(TEARDOWN_DRIVERS)) {
+    it(`${driverName}: reaches the homeserver and lands ${driver.writesUntorn} write(s)`, async () => {
+      const p = await connectFake({});
+      const ctx = await driver.setup?.(p);
+      const sentBefore = fake.sentBodies.length;
+      const requestsBefore = fake.requestUrls.length;
+
+      await expect(driver.drive(p, ctx)).resolves.not.toThrow();
+
+      expect(fake.requestUrls.length).toBeGreaterThan(requestsBefore);
+      expect(fake.sentBodies.length - sentBefore).toBe(driver.writesUntorn);
+      await p.disconnect();
+    }, 30_000);
+  }
+});
 
 /**
  * Each phase names the drivers that actually reach it, so no row can arm a request nobody issues,
@@ -390,20 +417,26 @@ describe('a disconnect landing inside a round-trip leaves nothing behind', () =>
           const sentBefore = fake.sentBodies.length;
           const armed = disconnectDuring(p, phase.matches);
 
-          await driver.drive(p, ctx).catch(() => undefined);
+          const outcome = await driver
+            .drive(p, ctx)
+            .then(() => undefined, (err: unknown) => err as Error);
           const settled = armed.since().length;
           await settle(300);
 
           expect(armed.fired()).toBe(true);
+          // A call the teardown caught mid-resolve either answers, or names the plugin that refused
+          // it. WHICH one depends on the phase — a read holding a caller position can report it
+          // back, one that has none cannot — but a call that quietly resolves having finished its
+          // round-trips without a credential is neither, and that is the shape under test.
+          if (outcome !== undefined) expect(String(outcome)).toMatch(/\[parley-matrix\]/);
           // Nothing the teardown cleared came back…
           expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
           // …no long-poll or catch-up read ran against the cleared token (an in-flight room resolve
           // may still finish — it is bounded, idempotent and hands its result to nobody)…
           expect(armed.since().filter((r) => POST_TEARDOWN_FORBIDDEN.test(r))).toEqual([]);
           expect(armed.since().slice(settled)).toEqual([]);
-          // …and the caller's own write is graded the other way, so no row can pass by standing
-          // everything down indiscriminately.
-          expect(fake.sentBodies.length - sentBefore).toBe(driver.writes ? 1 : 0);
+          // …and nothing was written by a call that no longer holds the credential to write with.
+          expect(fake.sentBodies.length - sentBefore).toBe(0);
           await p.disconnect();
         }, 30_000);
       }
@@ -547,6 +580,104 @@ describe('connect() resets the credential it is replacing', () => {
           await p.disconnect();
         }, 30_000);
       }
+    }
+  }
+});
+
+/**
+ * CLASS: a request this plugin puts on the wire WITHOUT the credential of the generation that made
+ * it. `disconnect()` drops the token and a rejected `connect()` never obtains one, but the seam is
+ * still callable in both states — and a call that merely omits its `Authorization` header is served
+ * by any homeserver with guest access, any unauthenticated-read proxy, and any captive portal, whose
+ * answers the plugin would then hand back as though it were connected. So no entry point may reach
+ * the homeserver from a state that holds no credential: it either answers without touching the wire
+ * (a read reporting the position its caller handed it) or refuses naming the plugin.
+ *
+ * Driven over EVERY seam call rather than the two that were found leaking, and over every state that
+ * holds no credential, because each entry point resolves its room by a different route and only some
+ * of them consult the staleness gate on the way. The live row is what stops the whole table passing
+ * on a plugin that refuses unconditionally.
+ */
+
+/** Requests the fake served that carried no credential of its own host — the login excepted. */
+const unauthenticatedRequests = (): string[] =>
+  fake.requestUrls
+    .map((u, i) => ({ u, auth: fake.requestAuth[i] }))
+    .filter(({ u, auth }) => !u.pathname.endsWith('/v3/login') && auth !== bearerFor(u.host))
+    .map(({ u, auth }) => `${u.pathname} auth=${String(auth)}`);
+
+const SEAM_CALLS: Record<string, (p: MatrixPlugin) => Promise<unknown>> = {
+  post: (p) => p.post(TOPIC, WRITER, 'work'),
+  subscribe: (p) => p.subscribe(TOPIC, () => undefined),
+  'fetchRecent (no since)': (p) => p.fetchRecent({ topic: TOPIC, limit: 5 }),
+  'fetchRecent (since)': (p) => p.fetchRecent({ topic: TOPIC, since: asCursor(''), limit: 5 }),
+  resolveIdentity: (p) => p.resolveIdentity(WRITER),
+};
+
+/** How the plugin came to hold no credential — plus the one state where it holds a live one. */
+const CREDENTIAL_STATES: Record<string, { live: boolean; reach: (p: MatrixPlugin) => Promise<void> }> =
+  {
+    'never connected': { live: false, reach: async () => undefined },
+    'after disconnect()': {
+      live: false,
+      reach: async (p) => {
+        await p.connect(fakeConfig());
+        await p.post(TOPIC, WRITER, 'before');
+        await p.disconnect();
+      },
+    },
+    'after a second, idempotent disconnect()': {
+      live: false,
+      reach: async (p) => {
+        await p.connect(fakeConfig());
+        await p.disconnect();
+        await p.disconnect();
+      },
+    },
+    'after a connect() whose login was refused': {
+      live: false,
+      reach: async (p) => {
+        fake.loginOutcome = 401;
+        await expect(p.connect(fakeConfig())).rejects.toThrow();
+        fake.loginOutcome = 200;
+      },
+    },
+    'after disconnect() then a fresh connect()': {
+      live: true,
+      reach: async (p) => {
+        await p.connect(fakeConfig());
+        await p.disconnect();
+        await p.connect(fakeConfig());
+      },
+    },
+  };
+
+describe('no seam call reaches the homeserver without the credential of its own generation', () => {
+  for (const [stateName, state] of Object.entries(CREDENTIAL_STATES)) {
+    for (const [callName, call] of Object.entries(SEAM_CALLS)) {
+      it(`${callName} / ${stateName}: ${state.live ? 'serves' : 'serves nothing'}`, async () => {
+        const p = new MatrixPlugin();
+        await state.reach(p);
+        await settle(50); // let a request already on the wire at the transition be recorded.
+        const mark = fake.requestUrls.length;
+        const sentBefore = fake.sentBodies.length;
+
+        const outcome = await call(p).then(
+          () => undefined,
+          (err: unknown) => err as Error,
+        );
+        await settle(100); // …and let any background work the call started show itself.
+
+        if (state.live) {
+          expect(outcome, 'a connected plugin owes this call an answer').toBeUndefined();
+        } else {
+          expect(fake.requestUrls.slice(mark).map((u) => u.pathname)).toEqual([]);
+          expect(fake.sentBodies.length - sentBefore).toBe(0);
+          if (outcome !== undefined) expect(String(outcome)).toMatch(/\[parley-matrix\]/);
+        }
+        expect(unauthenticatedRequests()).toEqual([]);
+        await p.disconnect();
+      }, 30_000);
     }
   }
 });

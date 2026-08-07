@@ -54,6 +54,10 @@ export abstract class MatrixTimeline extends MatrixSession {
     limit: number,
     generation: number,
   ): Promise<FetchRecentResult> {
+    // Keep this gate ahead of the `/context` round-trip, so that a read reached after its own
+    // generation ended reports the caller's position back rather than asking the homeserver to
+    // locate a cursor with a credential the teardown has already dropped.
+    if (this.isStale(generation)) return { messages: [], nextCursor: sinceCursor };
     const since = String(sinceCursor);
     if (since.startsWith(STREAM_CURSOR_PREFIX)) {
       const token = since.slice(STREAM_CURSOR_PREFIX.length);

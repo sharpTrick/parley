@@ -5,10 +5,10 @@ import {
 } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import {
-  configRisks, DEFAULT_HOMESERVER_URL, DEFAULT_PASSWORD,
+  configRisks, DEFAULT_HOMESERVER_URL, DEFAULT_PASSWORD, DEFAULT_SERVER_NAME,
   type MatrixBackendConfig, syncDeadlineMs, validateConfig,
 } from './config.js';
-import { emptyWindowCursor } from './cursor.js';
+import { emptyWindowCursor, requireLimit } from './cursor.js';
 import { reportLoopCrash, reportSyncFailure, syncRetryDelayMs } from './diagnostics.js';
 import { liveKey, MatrixParking } from './park.js';
 import { INCREMENTAL_TIMELINE_LIMIT, returnedTooFast, SYNC_IDLE_PACE_MS } from './timeline.js';
@@ -49,7 +49,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
     // login which failed.
     this.standDown();
     this.baseUrl = (cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL).replace(/\/+$/, '');
-    this.serverName = cfg.server_name ?? 'parley.local';
+    this.serverName = cfg.server_name ?? DEFAULT_SERVER_NAME;
     this.user = cfg.user ?? 'parley';
     this.password = cfg.password ?? DEFAULT_PASSWORD;
     this.syncTimeoutMs = cfg.sync_timeout_ms ?? 25_000;
@@ -60,21 +60,17 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
 
     for (const risk of configRisks(cfg)) console.warn(`[parley-matrix] SECURITY: ${risk}`);
 
-    this.loggingIn = true;
-    try {
-      const res = await this.http('POST', '/_matrix/client/v3/login', {
-        body: {
-          type: 'm.login.password',
-          identifier: { type: 'm.id.user', user: this.user },
-          password: this.password,
-        },
-      });
-      const json = (await res.json()) as { access_token: string; user_id: string };
-      this.token = json.access_token;
-      this.userId = json.user_id;
-    } finally {
-      this.loggingIn = false;
-    }
+    const res = await this.http('POST', '/_matrix/client/v3/login', {
+      unauthenticated: true,
+      body: {
+        type: 'm.login.password',
+        identifier: { type: 'm.id.user', user: this.user },
+        password: this.password,
+      },
+    });
+    const json = (await res.json()) as { access_token: string; user_id: string };
+    this.token = json.access_token;
+    this.userId = json.user_id;
   }
 
   async disconnect(): Promise<void> {
@@ -105,6 +101,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const generation = this.generation;
+    const limit = requireLimit(args.limit, args.topic);
     // `blockMs` is declared on the seam with no bound, and BOTH parks below — the one waiting for a
     // peer to provision the room and the one waiting for an event in it — end only by comparing
     // against this deadline. Keep the finiteness arm, so that a budget which is neither `> 0` nor
@@ -119,7 +116,6 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
     const roomId =
       (await this.existingRoom(args.topic, generation)) ??
       (budgetMs > 0 ? await this.roomForRead(args.topic, deadline, generation) : undefined);
-    const limit = args.limit ?? 100;
     // A topic nobody has posted to has no room yet, and a read never provisions one; the empty page
     // an absent room answers with carries a cursor that replays from the room's first visible event.
     if (roomId === undefined) {

@@ -10,7 +10,18 @@ import { createHash } from 'node:crypto';
 export const sanitizeAlias = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, '_');
 
 /** Bytes Matrix allows in a room alias, `#` and `:<server_name>` included. */
-const MAX_ALIAS_BYTES = 255;
+export const MAX_ALIAS_BYTES = 255;
+
+/**
+ * The localparts {@link sanitizeAlias} can produce, and so the only ones this plugin may address a
+ * room by. Matrix splits an alias on its FIRST colon, so a localpart carrying one re-parses as a
+ * name on a server this config never configured.
+ */
+export const LEGAL_LOCALPART = /^[A-Za-z0-9._-]+$/;
+
+/** The canonical alias `localpart` addresses on `serverName`. */
+export const aliasOf = (localpart: string, serverName: string): string =>
+  `#${localpart}:${serverName}`;
 
 const ALIAS_PREFIX = 'parley_';
 
@@ -28,7 +39,7 @@ const HASH_SEP = '-';
  * localpart passes through `safeName` untouched and lands in the over-long topic's room.
  */
 export function boundedLocalpart(topic: Topic, serverName: string): string {
-  const budget = MAX_ALIAS_BYTES - Buffer.byteLength(`#:${serverName}`, 'utf8');
+  const budget = MAX_ALIAS_BYTES - Buffer.byteLength(aliasOf('', serverName), 'utf8');
   const name = `${ALIAS_PREFIX}${safeName(topic, sanitizeAlias)}`;
   if (name.length <= budget) return name;
   const keep = budget - ALIAS_PREFIX.length - HASH_SEP.length - DEFAULT_HASH_LEN;

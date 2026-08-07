@@ -1,4 +1,5 @@
 import { DEFAULT_DEADLINE_MS, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
 import { TOPIC_KEY } from './wire.js';
 
 /** Every `preset` a config may ask for. Each member is graded and documented in the README table. */
@@ -56,6 +57,9 @@ export interface MatrixBackendConfig {
 
 export const DEFAULT_HOMESERVER_URL = 'http://127.0.0.1:8008';
 
+/** `server_name` every alias is built for when the config names none. */
+export const DEFAULT_SERVER_NAME = 'parley.local';
+
 /** Repo-public login password every dev fixture ships with; never a secret. */
 export const DEFAULT_PASSWORD = 'parleypass';
 
@@ -110,6 +114,25 @@ export function validateConfig(cfg: MatrixBackendConfig): void {
   }
   if (cfg.homeserver_url !== undefined && !isHttpUrl(cfg.homeserver_url)) {
     reject('homeserver_url', 'an http(s) URL');
+  }
+  // The derived path folds a topic through `sanitizeAlias` and bounds it with `boundedLocalpart`;
+  // an operator-supplied localpart is used VERBATIM, so it must clear both here or the deployment
+  // addresses a room name the homeserver reads as something else — or refuses outright.
+  const shared = cfg.shared_room;
+  if (shared !== undefined) {
+    const alias = aliasOf(shared, cfg.server_name ?? DEFAULT_SERVER_NAME);
+    if (!LEGAL_LOCALPART.test(shared) || Buffer.byteLength(alias, 'utf8') > MAX_ALIAS_BYTES) {
+      reject(
+        'shared_room',
+        `a room alias localpart of ${LEGAL_LOCALPART.source} whose alias ` +
+          `#<shared_room>:<server_name> fits ${MAX_ALIAS_BYTES} bytes`,
+        ` It is used verbatim: ${JSON.stringify(alias)} is ${Buffer.byteLength(alias, 'utf8')} ` +
+          'bytes, and Matrix splits an alias on its FIRST colon — so a localpart carrying one ' +
+          'names a different server than backend_config.server_name, and an over-long one is ' +
+          'refused by createRoom while every read of it returns the empty page an unwritten topic ' +
+          'returns.',
+      );
+    }
   }
   const timeout = cfg.sync_timeout_ms;
   if (

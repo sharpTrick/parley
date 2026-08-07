@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MAX_SYNC_TIMEOUT_MS, MatrixPlugin, ROOM_PRESETS, syncDeadlineMs } from '../src/index.js';
+import { aliasIsLegal, HOSTILE_LOCALPARTS } from './alias-legality.js';
 
 /**
  * CLASS: a `backend_config` value whose only guard is the TypeScript type. Core loads
@@ -50,9 +51,18 @@ const FIELDS: Record<string, { accepted: unknown[]; rejected: Record<string, unk
     accepted: ['fake', 'parley.local'],
     rejected: { 'the wrong JS type': ['fake'], 'an empty string': '' },
   },
+  // Used VERBATIM as the localpart of every topic's alias, so it clears neither guard the derived
+  // path has: no `sanitizeAlias` charset fold and no `boundedLocalpart` byte budget. The hostile set
+  // is shared with `room-isolation.fake.test.ts`, which grades the same predicate on the wire.
   shared_room: {
-    accepted: ['parley_conformance'],
-    rejected: { 'the wrong JS type': true, 'an empty string': '' },
+    accepted: ['parley_conformance', 'a', 'A.b-c_d'],
+    rejected: {
+      'the wrong JS type': true,
+      'an empty string': '',
+      ...Object.fromEntries(
+        Object.entries(HOSTILE_LOCALPARTS).map(([why, value]) => [`${why} — illegal in an alias`, value]),
+      ),
+    },
   },
   sync_timeout_ms: {
     accepted: [1, 25_000, 60_000, MAX_SYNC_TIMEOUT_MS],
@@ -167,5 +177,25 @@ describe('connect refuses a backend_config value the type system cannot enforce'
    */
   it('ROOM_PRESETS is exactly the two presets the README grades', () => {
     expect([...ROOM_PRESETS]).toEqual(['private_chat', 'public_chat']);
+  });
+
+  /**
+   * The accepted/rejected split above is a list; this states the RULE it is a sample of, so a value
+   * nobody thought to list is graded too. `server_name` is swept alongside because the budget an
+   * operator-supplied localpart has to fit inside is the one that server name leaves it.
+   */
+  it('a shared_room loads exactly when the alias it builds is one Matrix can carry', async () => {
+    const serverNames = ['fake', 'parley.local', `${'a.'.repeat(60)}example.com`];
+    for (const server_name of serverNames) {
+      for (const localpart of [...Object.values(HOSTILE_LOCALPARTS), 'ok', 'o.k-_2', 'x'.repeat(200)]) {
+        const legal = aliasIsLegal(`#${localpart}:${server_name}`);
+        const outcome = await new MatrixPlugin()
+          .connect({ ...BASE, server_name, shared_room: localpart })
+          .then(() => 'loaded', () => 'refused');
+        expect(outcome, `#${localpart.slice(0, 12)}…:${server_name} legal=${legal}`).toBe(
+          legal ? 'loaded' : 'refused',
+        );
+      }
+    }
   });
 });

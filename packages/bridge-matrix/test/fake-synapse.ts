@@ -333,6 +333,18 @@ export class FakeSynapse {
       return jsonRes({ access_token: tokenFor(url.host), user_id: '@parley:fake' });
     }
 
+    // Every endpoint but `/login` is AUTHENTICATED on a real homeserver. Keep the refusal, so that
+    // the whole surface is graded on the credential instead of the two paths a case asserts by hand:
+    // a fake that answers an anonymous request certifies a plugin that issues one, and the
+    // deployments that WOULD answer it — guest access, an unauthenticated-read proxy, a captive
+    // portal — are exactly the ones a torn-down or failed-login plugin must not serve from.
+    if (auth !== bearerFor(url.host)) {
+      return jsonRes(
+        { errcode: 'M_UNKNOWN_TOKEN', error: `${url.host} got ${String(auth)}` },
+        401,
+      );
+    }
+
     const dirMatch = path.match(/\/v3\/directory\/room\/([^/]+)$/);
     if (dirMatch) {
       const alias = decodeURIComponent(dirMatch[1]!);
