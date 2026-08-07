@@ -91,7 +91,10 @@ const ConfigObject = z.object({
    * beat. A pattern can never match the presence topic itself (it is reserved). Invalid
    * regexes are rejected at load (DESIGN §14). Capped at `MAX_POST_TOPICS`: the ReDoS screen
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
-   * one of them, so the count is the other half of that bound.
+   * one of them, so the count is the other half of that bound. That bound clamps the INPUT too: a
+   * pattern here widens post/fetch only to topics of at most 64 characters (`MAX_MATCH_INPUT`),
+   * while this field and `topics` both accept a string of up to 512. A longer topic is refused
+   * however well a pattern matches it, and has to be listed in `topics` to be reachable at all.
    */
   post_topics: z.array(beatString).max(MAX_POST_TOPICS).default([]),
   catchup: z

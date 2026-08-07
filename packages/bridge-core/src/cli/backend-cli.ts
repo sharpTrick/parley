@@ -65,7 +65,11 @@ export function parseArgs(argv: string[], opts: ParseArgsOptions): ParsedArgs {
 /** The subset of `process` the shutdown wiring touches. */
 export interface ShutdownHost {
   on(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
-  stdin: { on(event: 'end' | 'close', listener: () => void): unknown };
+  stdin: {
+    on(event: 'end' | 'close', listener: () => void): unknown;
+    readableEnded?: boolean;
+    destroyed?: boolean;
+  };
 }
 
 /**
@@ -73,6 +77,11 @@ export interface ShutdownHost {
  * AND the once-only guard: an orphaned bridge (parent crashed or SIGKILLed) gets EOF and no signal,
  * so without them it heart-beats a ghost peer into every peer's roster — and 'end' followed by
  * 'close', or a signal racing EOF, would otherwise tear the bridge down twice.
+ *
+ * Keep the two state checks alongside those listeners, so that an EOF which arrived while the
+ * bridge was still attaching is still torn down: the MCP stdio transport puts `process.stdin` into
+ * flowing mode before `subscribe()` is awaited, so 'end'/'close' can both be emitted — and never
+ * re-delivered — before anything here is listening.
  */
 export function installShutdown(host: ShutdownHost, onShutdown: () => void): void {
   let shuttingDown = false;
@@ -85,6 +94,8 @@ export function installShutdown(host: ShutdownHost, onShutdown: () => void): voi
   host.on('SIGTERM', shutdown);
   host.stdin.on('end', shutdown);
   host.stdin.on('close', shutdown);
+  if (host.stdin.readableEnded === true) shutdown();
+  if (host.stdin.destroyed === true) shutdown();
 }
 
 export interface BackendCliOptions {

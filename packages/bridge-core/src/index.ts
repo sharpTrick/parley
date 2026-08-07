@@ -44,6 +44,9 @@ export {
   UnsafePatternError,
   type AllowlistOptions,
 } from './allowlist.js';
+// The length past which a `post_topics` pattern stops widening post/fetch — a documented capacity an
+// operator has to design topic names around, so it ships nameable rather than as a hardcoded 64.
+export { MAX_MATCH_INPUT } from './regex-safety.js';
 
 // Engine: dedup / ordering / catch-up / read-state (DESIGN §6/§7).
 export { SeenSet } from './engine/seen-set.js';

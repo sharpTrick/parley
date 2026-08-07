@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { installShutdown, type ShutdownHost } from './backend-cli.js';
 
@@ -50,5 +51,69 @@ describe('installShutdown runs teardown exactly once, from every trigger', () =>
       for (const t of sequence) w.fire(t);
       expect(w.calls()).toBe(1);
     });
+  }
+});
+
+/**
+ * A lifecycle event is one-shot and is never re-delivered, so a listener armed AFTER it can still
+ * be missed — and the wiring above is armed late by construction: the MCP stdio transport puts
+ * stdin into flowing mode as soon as the server connects, while the bridge is still awaiting
+ * `subscribe()`. The table above cannot see that, because every trigger it fires goes through an
+ * EventEmitter it owns, always after registration. So drive a REAL `Readable` into each terminal
+ * state a chosen number of macrotasks either side of the wiring, and require teardown exactly once
+ * in every cell — the state check and the listener are then each the only thing standing between a
+ * column of cells and a bridge that heart-beats a ghost peer forever.
+ */
+
+/** Mirrors `process.stdin`: flowing, and `autoDestroy: false`, so EOF emits 'end' and never 'close'. */
+function flowingStdin(): Readable {
+  const stream = new Readable({ read() {}, autoDestroy: false });
+  stream.on('data', () => {});
+  return stream;
+}
+
+function wireReal(stdin: Readable): () => number {
+  const signals = new EventEmitter();
+  let calls = 0;
+  installShutdown({ on: signals.on.bind(signals), stdin } as unknown as ShutdownHost, () => {
+    calls++;
+  });
+  return () => calls;
+}
+
+const macrotasks = async (n: number): Promise<void> => {
+  for (let i = 0; i < n; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+const TERMINALS = [
+  { label: 'EOF', enter: (s: Readable) => void s.push(null) },
+  { label: 'destroy without EOF', enter: (s: Readable) => void s.destroy() },
+] as const;
+
+/** Macrotasks between the terminal state and the wiring — the window `subscribe()` opens. */
+const WINDOWS = [0, 1, 2] as const;
+
+describe('teardown runs exactly once however the stream terminates around the wiring', () => {
+  for (const terminal of TERMINALS) {
+    for (const window of WINDOWS) {
+      it(`${terminal.label} ${window} macrotasks BEFORE installShutdown`, async () => {
+        const stdin = flowingStdin();
+        terminal.enter(stdin);
+        await macrotasks(window);
+        const calls = wireReal(stdin);
+        await macrotasks(3);
+        expect(calls()).toBe(1);
+      });
+
+      it(`${terminal.label} ${window} macrotasks AFTER installShutdown`, async () => {
+        const stdin = flowingStdin();
+        const calls = wireReal(stdin);
+        await macrotasks(window);
+        expect(calls(), 'a stream that has not terminated is not a torn-down one').toBe(0);
+        terminal.enter(stdin);
+        await macrotasks(3);
+        expect(calls()).toBe(1);
+      });
+    }
   }
 });

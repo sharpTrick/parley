@@ -7,7 +7,11 @@
 
 /**
  * Longest input a screened pattern is ever matched against. Callers MUST clamp or refuse longer
- * input, so that {@link MAX_AMBIGUITY} keeps meaning what it was calibrated to mean.
+ * input, so that the per-source `MAX_AMBIGUITY` budget keeps meaning what it was calibrated to mean.
+ *
+ * Public because it is an operator-facing capacity as well as a bound on work: `Allowlist` refuses a
+ * longer topic rather than pattern-matching it, so `post_topics` widens post/fetch only to topics of
+ * at most 64 characters, and a longer topic reaches a bridge only by being listed in `config.topics`.
  */
 export const MAX_MATCH_INPUT = 64;
 

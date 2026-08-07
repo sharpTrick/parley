@@ -49,7 +49,9 @@ export interface AllowlistOptions {
    * spend, and {@link has} runs every one of them against the same caller-supplied topic. Config
    * validation rejects all three classes first; the constructor throws if one reaches here —
    * `SyntaxError` for an uncompilable source, {@link UnsafePatternError} for an unsafe one, and a
-   * `RangeError` for too many.
+   * `RangeError` for too many. The last part of that bound is the INPUT: {@link has} matches these
+   * against topics of at most 64 characters ({@link MAX_MATCH_INPUT}) and refuses anything longer
+   * unmatched, so a pattern never widens post/fetch past that length.
    */
   postPatterns?: readonly string[];
   /** Topics never allowed via ANY path, even if matched by a pattern (the presence topic). */
@@ -63,6 +65,11 @@ export interface AllowlistOptions {
  *    peer must reach for us to count it INBOUND-reachable; exposed via {@link topics};
  *  - the POST/FETCH set — the explicit list PLUS any `post_topics` pattern match; gates
  *    `post`/`reply`/`fetch_recent` and a scoped `parley_list_users` via {@link has}/{@link assert}.
+ *
+ * The pattern dimension is matched only against topics of at most 64 characters
+ * ({@link MAX_MATCH_INPUT}) — the config loader accepts a topic string four times that long, so a
+ * longer topic is refused however well a pattern matches it and reaches this bridge only by being
+ * listed in `topics`. The EXPLICIT dimension carries no such clamp.
  *
  * An unscoped `parley_list_users` is the UNION of the two: a peer counts when we can post to a topic
  * it subscribes to (POST/FETCH, pattern matches included) or it can post to one of ours (EXPLICIT).
