@@ -53,7 +53,7 @@ export abstract class SqlitePoller extends SqliteRetention {
     this.health.push(health);
 
     const tick = (): void => {
-      if (this.orphaned(generation)) return;
+      if (this.tornDown()) return;
       let delay = this.pollIntervalMs;
       try {
         const stmt = this.require(this.selectAfterStmt);
@@ -70,6 +70,11 @@ export abstract class SqlitePoller extends SqliteRetention {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }
         }
+        // Keep this check, so that a loop torn down on the batch's final row neither reports
+        // itself live below nor re-arms: `disconnect()` has already emptied the canceller list,
+        // so a timer installed past this point answers to nothing and holds the event loop open
+        // for a whole poll interval. It is the only guard on the reschedule — nothing between
+        // here and there can re-enter the lifecycle.
         if (this.orphaned(generation)) return;
         // Keep the immediate reschedule on a full batch, so that POLL_BATCH bounds per-tick work
         // rather than capping throughput at one batch per poll interval.
@@ -112,7 +117,7 @@ export abstract class SqlitePoller extends SqliteRetention {
           delay = backoffMs(this.pollIntervalMs, failures);
         }
       }
-      if (!this.orphaned(generation)) timer = setTimeout(tick, delay);
+      timer = setTimeout(tick, delay);
     };
 
     this.cancellers.push(() => {

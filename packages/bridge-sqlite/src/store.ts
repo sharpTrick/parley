@@ -37,7 +37,9 @@ export abstract class SqliteStore {
    * Whether a loop armed in `generation` still belongs to this plugin. The flags {@link tornDown}
    * reads cannot answer that on their own: a `disconnect()`/`connect()` pair re-entered from inside
    * a handler restores every one of them mid-tick, and the loop would resume against the new store
-   * carrying the previous one's read position and store id.
+   * carrying the previous one's read position and store id. `disconnect()` alone needs no counter —
+   * that is what `stopped` is — so the counter advances once per accepted `connect()`, and a loop
+   * belongs to exactly the one that armed it.
    */
   protected orphaned(generation: number): boolean {
     return this.tornDown() || this.generation !== generation;

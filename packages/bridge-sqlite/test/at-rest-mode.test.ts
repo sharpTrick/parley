@@ -113,11 +113,17 @@ describe('the store is claimed at 0600 before the driver can create it', () => {
  * better-sqlite3 opens a file literally named after one — so any classification of the string alone
  * exempts some form from a hardening it never looked at, and does so silently, on a real store.
  *
- * Each row below states only the path. Both expectations are read back from the directory
- * afterwards, so a form nobody has thought of yet is graded the moment somebody adds it, and a
- * driver that starts or stops putting one on disk moves the grading with it rather than going
- * vacuous. `:memory:` is in the table for the other direction: the one path that must NOT be forced
- * onto the on-disk arm, where the WAL gate would refuse it.
+ * Each row states only the path and what was lying at it beforehand. Every expectation is read back
+ * from the directory afterwards, so a form nobody has thought of yet is graded the moment somebody
+ * adds it, and a driver that starts or stops putting one on disk moves the grading with it rather
+ * than going vacuous. `:memory:` is in the table for the other direction: the one path that must
+ * NOT be forced onto the on-disk arm, where the WAL gate would refuse it.
+ *
+ * A file the open never touched is not this package's to narrow — planting one at `:memory:` proves
+ * nothing about `:memory:` — so which files are graded is derived too: a file is the store's if the
+ * open created it or wrote to it, never if it was left where it lay. Without the pre-existing arm
+ * the whole table can pass on the pre-creation alone, since SQLite takes the sidecars' mode from
+ * the database file it already found at 0600, and the repair path is graded by nothing.
  */
 const PATHS = [
   ':memory:',
@@ -140,49 +146,80 @@ afterEach(() => {
   previousCwd = undefined;
 });
 
+const FOUND: Array<{ name: string; planted?: number }> = [
+  { name: 'nothing there yet' },
+  { name: 'left 0644 by an older build', planted: 0o644 },
+  { name: 'left 0666 by an older build', planted: 0o666 },
+];
+
 describe.each(UMASKS.map(oct))('every path form is hardened by what it put on disk (umask %s)', (label) => {
   const umask = Number.parseInt(label, 8);
   for (const spec of PATHS) {
-    it(`${JSON.stringify(spec)}: nothing this open created is readable beyond its owner`, async () => {
-      withUmask(umask);
-      inScratchDir();
-      const here = process.cwd();
-      const { openDriver: recording, atOpen, opens } = await loadRecordingDriver();
-      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-      let left: Array<[string, string]> = [];
-      let claimedBeforeOpen: { existed: boolean; mode?: number } | undefined;
-      let store: ReturnType<typeof openDriver> | undefined;
-      try {
-        try {
-          store = recording(spec);
-          store.exec('CREATE TABLE t (x)');
-          store.prepare('INSERT INTO t (x) VALUES (?)').run(1);
-        } catch {
-          // A form the driver refuses still has to leave nothing exposed behind it.
+    for (const found of FOUND) {
+      it(`${JSON.stringify(spec)}, ${found.name}: nothing this open touched is readable beyond its owner`, async () => {
+        withUmask(umask);
+        inScratchDir();
+        const here = process.cwd();
+        if (found.planted !== undefined) {
+          writeFileSync(spec, '');
+          chmodSync(spec, found.planted);
         }
-        // Read the directory before close(): the checkpoint on close removes the sidecars.
-        left = readdirSync(here)
-          .sort()
-          .map((f) => [f, oct(mode(join(here, f)))]);
-        claimedBeforeOpen = existsSync(spec) ? atOpen() : undefined;
-      } finally {
-        store?.close();
-        spy.mockRestore();
-      }
+        const preExisted = existsSync(spec);
+        const before = new Map(
+          readdirSync(here).map((f) => [f, statSync(join(here, f)).size] as const),
+        );
+        const { openDriver: recording, atOpen, opens } = await loadRecordingDriver();
+        const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        let touched: Array<[string, string]> = [];
+        let lines: string[] = [];
+        let storeGrew = false;
+        let store: ReturnType<typeof openDriver> | undefined;
+        try {
+          try {
+            store = recording(spec);
+            store.exec('CREATE TABLE t (x)');
+            store.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+          } catch {
+            // A form the driver refuses still has to leave nothing exposed behind it.
+          }
+          // Read the directory before close(): the checkpoint on close removes the sidecars.
+          touched = readdirSync(here)
+            .sort()
+            .filter((f) => statSync(join(here, f)).size !== before.get(f))
+            .map((f) => [f, oct(mode(join(here, f)))]);
+          storeGrew = existsSync(spec) && statSync(spec).size > 0;
+          lines = spy.mock.calls.map(([l]) => String(l));
+        } finally {
+          store?.close();
+          spy.mockRestore();
+        }
 
-      expect(opens(), 'the driver constructor never ran: this row graded no open at all').toBe(1);
-      expect(
-        left.filter(([, m]) => (Number.parseInt(m, 8) & 0o077) !== 0),
-        `openDriver(${JSON.stringify(spec)}) left part of the store readable by other accounts`,
-      ).toEqual([]);
-      if (claimedBeforeOpen !== undefined) {
+        expect(opens(), 'the driver constructor never ran: this row graded no open at all').toBe(1);
         expect(
-          claimedBeforeOpen,
-          `openDriver(${JSON.stringify(spec)}) put a file on disk that the driver, not the ` +
-            `pre-creation, created: it was world-readable for the width of the open`,
-        ).toEqual({ existed: true, mode: 0o600 });
-      }
-    });
+          touched.filter(([, m]) => (Number.parseInt(m, 8) & 0o077) !== 0),
+          `openDriver(${JSON.stringify(spec)}) left part of the store readable by other accounts`,
+        ).toEqual([]);
+
+        if (!preExisted && existsSync(spec)) {
+          expect(
+            atOpen(),
+            `openDriver(${JSON.stringify(spec)}) put a file on disk that the driver, not the ` +
+              `pre-creation, created: it was world-readable for the width of the open`,
+          ).toEqual({ existed: true, mode: 0o600 });
+        }
+
+        // Pre-creation cannot narrow a file it did not create — SQLite copies the sidecars' mode
+        // from the database file it found — so a store adopted from an older build is repaired by
+        // the chmod path or not at all, and only the report proves that path ran.
+        if (preExisted && storeGrew) {
+          expect(
+            lines.filter((l) => /tightened/.test(l)).join(''),
+            `openDriver(${JSON.stringify(spec)}) adopted a 0${(found.planted ?? 0).toString(8)} ` +
+              `store without narrowing it`,
+          ).toMatch(/tightened/);
+        }
+      });
+    }
   }
 });
 

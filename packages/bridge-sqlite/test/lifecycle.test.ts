@@ -464,6 +464,16 @@ describe('a lifecycle call re-entered from inside a handler decides that loop\u2
               ).toMatch(r.refused);
             }
             expect(got.map((g) => g.content)).toEqual(armed(r.survives ? pending : at));
+            // A loop that stops delivering but keeps re-arming is invisible in content and in
+            // health — `connect()` empties the health list and `disconnect()` empties the cancellers
+            // — so the armed timer is the only thing left that can see it. It is also the whole
+            // harm: nothing can stop it, and it holds the event loop for a poll interval that may
+            // be configured in days.
+            expect(
+              vi.getTimerCount(),
+              'a loop that is no longer this plugin\u2019s left a timer armed, and disconnect() has ' +
+                'already emptied the canceller list that could have stopped it',
+            ).toBe(r.survives ? 1 : 0);
 
             // The loop must be gone — or still be this plugin's — rather than merely out of rows,
             // and it must not have been adopted by whichever store the re-entrant call left

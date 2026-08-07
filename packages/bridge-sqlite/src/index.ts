@@ -73,7 +73,6 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
-    this.generation++;
     if (this.pruneTimer !== undefined) clearInterval(this.pruneTimer);
     this.pruneTimer = undefined;
     if (this.pruneBatchTimer !== undefined) clearTimeout(this.pruneBatchTimer);
