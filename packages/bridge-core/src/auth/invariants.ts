@@ -162,9 +162,19 @@ const ADDRESS_SPACE: Array<[string, string[]]> = [
   ['IPv6', Array.from({ length: 16 }, (_, i) => `${i.toString(16)}000::1`)],
 ];
 
+/** Deeper than any forwarded chain a real proxy tier appends to. Keep the probe here rather than at
+ *  hop 0, so that a hop count — whose trust runs out — is exempt without naming its type. */
+const BEYOND_ANY_CHAIN = Number.MAX_SAFE_INTEGER;
+
+/** `JSON.stringify` answers `undefined` for a function, which would render the very spelling this
+ *  guard exists to name as if the operator had written nothing. */
+function render(value: unknown): string {
+  return JSON.stringify(value) ?? String(value);
+}
+
 function unboundedTrust(field: string, value: unknown, because: string): Error {
   return new Error(
-    `${field} must not be ${JSON.stringify(value)}. ${because}, so ` +
+    `${field} must not be ${render(value)}. ${because}, so ` +
       `req.ip becomes a header the caller writes and every per-address rate limit on this front ` +
       `door is defeated by rotating it — an anonymous attacker gets unlimited guesses at the ` +
       `owner passphrase. Name the real topology instead: "loopback" for the reverse proxy in ` +
@@ -177,21 +187,26 @@ function unboundedTrust(field: string, value: unknown, because: string): Error {
  * from the `trust proxy` setting, and every rate limiter on a front door keys on it — including the
  * brute-force gate on the owner passphrase, the single secret that authorizes the whole bridge.
  *
- * The refusal is a property of what the value TRUSTS, not of how it is written: a proxy list whose
- * CIDRs cover a whole address family is `true` under another name. Express's own compiled predicate
- * answers that question, so a list naming real public proxies — a CDN's ranges, say — is unaffected.
- * A hop count is exempt: its predicate ignores the address entirely, and how many hops the real
- * chain has is not knowable here.
+ * The refusal is a property of what the value TRUSTS, not of how it is written, so nothing here may
+ * turn on the value's type: express compiles a boolean, a hop count, a comma-string, a list and a
+ * *function* into one predicate, and every spelling this guard declined to compile walked past it —
+ * `() => true` says `true` in a form no enumeration of the other four can hold. Ask express's own
+ * compiled predicate instead, at a hop depth no real chain reaches: what is refused is trust that
+ * covers a whole address family and never runs out. A list naming real public proxies — a CDN's
+ * ranges, say — is unaffected, and a hop count is exempt because its trust expires, which is also
+ * true of the function that spells one. A value express itself cannot compile throws from here
+ * rather than from the `app.set` a few lines later; either way the front door does not boot.
  */
 export function assertTrustProxy(value: unknown, field: string): void {
   if (UNBOUNDED_TRUST.has(value)) {
     throw unboundedTrust(field, value, 'It trusts every hop of X-Forwarded-For');
   }
-  if (typeof value !== 'string' && !Array.isArray(value)) return;
   const probe = express();
   probe.set('trust proxy', value);
   const trusted = probe.get('trust proxy fn') as (addr: string, hop: number) => boolean;
-  const covered = ADDRESS_SPACE.filter(([, samples]) => samples.every((addr) => trusted(addr, 0)));
+  const covered = ADDRESS_SPACE.filter(([, samples]) =>
+    samples.every((addr) => trusted(addr, BEYOND_ANY_CHAIN)),
+  );
   if (covered.length === 0) return;
   throw unboundedTrust(
     field,

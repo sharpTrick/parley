@@ -8,7 +8,11 @@ import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { ConsentError } from './oauth-provider.js';
 import { ownerVerifierFromPassphrase } from './owner.js';
-import { createOAuthRemoteApp, type OAuthRemoteServer } from './remote.js';
+import {
+  createOAuthRemoteApp,
+  type OAuthRemoteOptions,
+  type OAuthRemoteServer,
+} from './remote.js';
 
 const OWNER_PASS = 'correct horse battery staple';
 const CLIENT_REDIRECT = 'http://127.0.0.1:9999/callback';
@@ -986,7 +990,9 @@ const LIMITED_ROUTES: LimitedRoute[] = [
  */
 type KeyedOn = 'socket' | 'client' | 'forged';
 
-type TrustProxy = boolean | number | string | string[];
+/** `assertTrustProxy`'s own parameter type. A narrower one here cannot express the spelling the
+ *  guard misses next — it could not express the function form, which is the one it missed. */
+type TrustProxy = unknown;
 
 interface Topology {
   name: string;
@@ -1058,6 +1064,13 @@ const WHOLE_SPACE_SPELLINGS: WholeSpaceSpelling[] = [
     trustProxy: ['::/1'],
     message: /trusts every IPv4 address/,
   },
+  // Express compiles a FUNCTION straight through as `trust proxy fn`, so this is `true` written in
+  // a form none of the rows above can hold — which is why the subject field is `unknown`.
+  {
+    name: 'a predicate that trusts every address',
+    trustProxy: () => true,
+    message: /trustProxy must not be/,
+  },
 ];
 
 const ATTACKER = '203.0.113.9';
@@ -1083,7 +1096,11 @@ describe('a rate limiter must key on the client the operator actually deploys be
     app = createOAuthRemoteApp(plugin, parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] }), {
       issuerUrl: new URL(base),
       verifyOwner: ownerVerifierFromPassphrase(OWNER_PASS),
-      ...(trustProxy !== undefined ? { trustProxy } : {}),
+      // Keep the cast, so that this table can drive spellings the declared option type cannot
+      // hold: the factory is a public export an untyped caller reaches with all of express's.
+      ...(trustProxy !== undefined
+        ? { trustProxy: trustProxy as OAuthRemoteOptions['trustProxy'] }
+        : {}),
     });
     await app.listen(port);
   }

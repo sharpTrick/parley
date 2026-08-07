@@ -675,23 +675,187 @@ describe('the front-door selector never silently discards an option belonging to
  * the behavioural half of that lives in remote.test.ts, where a forged X-Forwarded-For is shown not
  * to mint its own rate-limit bucket. This is the other half, and the one a coverage check gets
  * wrong: a real deployment behind a CDN names PUBLIC ranges, so a guard that refuses "any routable
- * address is trusted" would refuse the topology it exists to serve. Every row here is a proxy list
- * an operator legitimately writes.
+ * address is trusted" would refuse the topology it exists to serve.
+ *
+ * The subject list was `Array<string | string[]>`, and the hole was a spelling that type cannot
+ * hold: express's `compileTrust` also accepts a FUNCTION, the guard probed only the two types it
+ * had enumerated, and `() => true` — `true` in a form no row here could express — booted a front
+ * door whose every rate limit keys on a header the caller writes. So the subject is `unknown`, the
+ * guard's own parameter type, and rows are grouped by the branch of `compileTrust` that compiles
+ * them rather than by the TypeScript type that happens to spell them.
  */
-const LEGITIMATE_PROXY_LISTS: Array<[string, string | string[]]> = [
-  ['the reverse proxy in examples/self-host-remote', 'loopback'],
-  ['a single public proxy by address', '8.8.8.8'],
-  ['a CDN’s published IPv4 and IPv6 ranges', ['1.2.3.0/24', '2606:4700::/32']],
-  ['several public ranges in one comma-separated string', '203.0.113.0/24, 198.51.100.0/24'],
-  ['a private proxy tier', ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']],
-  ['every IPv4 half but one', ['0.0.0.0/1']],
-  ['express’s own named presets', 'loopback, linklocal, uniquelocal'],
-];
+type TrustProxyVerdict = 'accepted' | 'refused';
+
+/** One per branch of express's `compileTrust` (express/lib/utils.js), plus the absent value. */
+type CompileTrustBranch =
+  | 'function'
+  | 'boolean'
+  | 'hopCount'
+  | 'commaString'
+  | 'list'
+  | 'uncompilable'
+  | 'unset';
+
+interface TrustProxyCase {
+  name: string;
+  value: unknown;
+  verdict: TrustProxyVerdict;
+  /** Set only where Parley owns the wording; elsewhere express's own parser may refuse first. */
+  message?: RegExp;
+}
+
+/**
+ * What each branch is obliged to contain. Keep `'both'` meaning BOTH, so that a branch cannot be
+ * signed off with only comfortable rows: an accept-only branch hides a hole — the function branch
+ * had no rows at all — and a refuse-only branch hides a guard that has swallowed a topology
+ * operators legitimately deploy.
+ */
+type BranchObligation = 'both' | TrustProxyVerdict;
+
+const BRANCH_OBLIGATIONS: Record<CompileTrustBranch, BranchObligation> = {
+  function: 'both',
+  boolean: 'both',
+  hopCount: 'accepted',
+  commaString: 'both',
+  list: 'both',
+  uncompilable: 'refused',
+  unset: 'accepted',
+};
+
+/**
+ * Keep the `Record<CompileTrustBranch, …>` annotation, so that a branch express grows cannot ship
+ * ungraded: the compiler demands rows for it here before the suite will build.
+ */
+const TRUST_PROXY_FORMS: Record<CompileTrustBranch, TrustProxyCase[]> = {
+  function: [
+    {
+      name: 'a predicate that trusts every address',
+      value: () => true,
+      verdict: 'refused',
+      message: /trusts every IPv4 and IPv6 address/,
+    },
+    {
+      name: 'a predicate naming a private proxy tier',
+      value: (addr: string) => addr.startsWith('10.'),
+      verdict: 'accepted',
+    },
+    {
+      name: 'a predicate spelling a hop count, whose trust runs out',
+      value: (_addr: string, hop: number) => hop < 2,
+      verdict: 'accepted',
+    },
+  ],
+  boolean: [
+    { name: 'true', value: true, verdict: 'refused', message: /every hop of X-Forwarded-For/ },
+    { name: 'false', value: false, verdict: 'accepted' },
+  ],
+  hopCount: [
+    { name: 'one hop', value: 1, verdict: 'accepted' },
+    { name: 'more hops than the real chain', value: 2, verdict: 'accepted' },
+  ],
+  commaString: [
+    { name: 'the reverse proxy in examples/self-host-remote', value: 'loopback', verdict: 'accepted' },
+    { name: 'a single public proxy by address', value: '8.8.8.8', verdict: 'accepted' },
+    {
+      name: 'several public ranges in one comma-separated string',
+      value: '203.0.113.0/24, 198.51.100.0/24',
+      verdict: 'accepted',
+    },
+    {
+      name: 'express’s own named presets',
+      value: 'loopback, linklocal, uniquelocal',
+      verdict: 'accepted',
+    },
+    {
+      name: 'the boolean spelled as an env var',
+      value: 'true',
+      verdict: 'refused',
+      message: /every hop of X-Forwarded-For/,
+    },
+    {
+      name: 'two IPv4 halves in one comma-separated string',
+      value: '0.0.0.0/1, 128.0.0.0/1',
+      verdict: 'refused',
+      message: /trusts every IPv4 address/,
+    },
+  ],
+  list: [
+    {
+      name: 'a CDN’s published IPv4 and IPv6 ranges',
+      value: ['1.2.3.0/24', '2606:4700::/32'],
+      verdict: 'accepted',
+    },
+    {
+      name: 'a private proxy tier',
+      value: ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'],
+      verdict: 'accepted',
+    },
+    { name: 'every IPv4 half but one', value: ['0.0.0.0/1'], verdict: 'accepted' },
+    {
+      name: 'two IPv4 halves',
+      value: ['0.0.0.0/1', '128.0.0.0/1'],
+      verdict: 'refused',
+      message: /trusts every IPv4 address/,
+    },
+    {
+      name: 'the lower IPv6 half alone, which is all of the IPv4-mapped space',
+      value: ['::/1'],
+      verdict: 'refused',
+      message: /trusts every IPv4 address/,
+    },
+  ],
+  uncompilable: [
+    { name: 'a boxed string', value: new String('true'), verdict: 'refused' },
+    { name: 'a bare object', value: {}, verdict: 'refused' },
+  ],
+  unset: [{ name: 'unset', value: undefined, verdict: 'accepted' }],
+};
+
+const TRUST_PROXY_ROWS = Object.entries(TRUST_PROXY_FORMS).flatMap(([branch, cases]) =>
+  cases.map((c): [string, TrustProxyCase] => [`${branch}: ${c.name}`, c]),
+);
+
+function refusalOf(value: unknown): Error | undefined {
+  try {
+    assertTrustProxy(value, 'trustProxy');
+    return undefined;
+  } catch (err) {
+    return err as Error;
+  }
+}
 
 describe('the trust-proxy guard refuses covering the address space, not naming a public one', () => {
-  it.each(LEGITIMATE_PROXY_LISTS)('accepts %s', (_name: string, value: string | string[]) => {
-    expect(() => assertTrustProxy(value, 'trustProxy')).not.toThrow();
+  it.each(TRUST_PROXY_ROWS)('%s', (_name: string, c: TrustProxyCase) => {
+    const thrown = refusalOf(c.value);
+    if (c.verdict === 'accepted') {
+      expect(thrown?.message).toBeUndefined();
+      return;
+    }
+    expect(thrown?.message ?? '').toMatch(c.message ?? /./);
   });
+
+  /**
+   * A refusal that cannot name what it refused sends the operator hunting for a value they never
+   * wrote: `JSON.stringify` answers `undefined` for a function, which is exactly the spelling that
+   * used to walk past this guard, so the message would blame an unset option for a set one.
+   */
+  const NAMED = TRUST_PROXY_ROWS.filter(
+    ([, c]) => c.verdict === 'refused' && c.value !== undefined,
+  );
+
+  it.each(NAMED)('%s is refused in words that name the value written', (_n: string, c: TrustProxyCase) => {
+    expect(refusalOf(c.value)?.message).not.toMatch(/must not be undefined/);
+  });
+
+  it.each(Object.entries(BRANCH_OBLIGATIONS))(
+    'the %s branch carries the rows its obligation demands',
+    (branch: string, obligation: BranchObligation) => {
+      const verdicts = TRUST_PROXY_FORMS[branch as CompileTrustBranch].map((c) => c.verdict);
+      const required: TrustProxyVerdict[] =
+        obligation === 'both' ? ['accepted', 'refused'] : [obligation];
+      expect([...new Set(verdicts)].sort()).toEqual([...required].sort());
+    },
+  );
 });
 
 /**
