@@ -23,21 +23,52 @@ beforeEach(() => {
  * never restarts.
  */
 describe('telegram ObservedStore durability', () => {
-  it('repairs a crash-torn tail so a later append survives a cold reload', () => {
-    // One complete record, then a crash-torn fragment of a second (NO trailing newline).
-    writeFileSync(path, `${JSON.stringify(record('1', 1, 'first'))}\n{"chat_id":"1","mess`);
+  /**
+   * WHAT the crash cut through. A tail that does not PARSE is repaired by the line loop's generic
+   * `catch` whichever way the load-time torn-tail branch behaves, so a suite whose only torn
+   * fixtures are unparseable grades that branch with nothing: deleting it left all 691 tests green.
+   * A crash lands on a byte and not on a token, and the byte it most often lands on is the newline
+   * — leaving a tail that is COMPLETE and parses, which only the torn branch can see. Such a file
+   * loads its last line, is not rewritten, and the next append is glued straight onto it; the
+   * following restart then loses that record AND whatever bookkeeping line the glue swallowed,
+   * re-minting the identity and refusing every outstanding cursor.
+   *
+   * The last row is a file that was never torn at all: the repair must not fire on one, and a table
+   * gone uniformly red is visible as such.
+   */
+  const TORN_TAILS = [
+    { name: 'an unparseable record fragment', tail: '{"chat_id":"1","mess' },
+    { name: 'a complete record', tail: JSON.stringify(record('1', 2, 'second')) },
+    { name: 'a complete watermark the rest of the file agrees with', tail: '#seq 1 1' },
+    { name: 'a complete served mark', tail: '#served ["1"]' },
+    { name: 'nothing — the file already ends where a line ends', tail: '' },
+  ];
 
-    const store = new ObservedStore(path);
-    const recC = record('1', 3, 'third');
-    expect(store.append(recC)).toBeDefined();
-    store.close();
+  it.each(TORN_TAILS)(
+    'repairs a crash-torn tail of $name so a later append survives a cold reload',
+    ({ tail }) => {
+      // Carrying an identity of its own, so that the row is graded on the REPAIR: a file with none
+      // has one appended on load, and that append would supply the missing terminator for free.
+      const head = `#epoch ${'a'.repeat(16)}\n#seq 1 1\n`;
+      writeFileSync(path, `${head}${JSON.stringify(record('1', 1, 'first'))}\n${tail}`);
 
-    const reloaded = new ObservedStore(path);
-    // The complete record survives, the fragment is dropped, and the append is NOT glued/lost.
-    expect(reloaded.entries('1').map((r) => r.content)).toEqual(['first', 'third']);
-    expect(reloaded.has(keyOf(recC))).toBe(true);
-    reloaded.close();
-  });
+      const store = new ObservedStore(path);
+      const loaded = store.entries('1').map((r) => r.content);
+      // The next line is appended to whatever the load left behind, so it must leave a boundary.
+      expect(readFileSync(path, 'utf8').endsWith('\n')).toBe(true);
+      const recC = record('1', 3, 'third');
+      expect(store.append(recC)).toBeDefined();
+      store.close();
+
+      const reloaded = new ObservedStore(path);
+      // Nothing the store served in one process may go missing in the next, and the appended
+      // record is neither glued onto the fragment nor lost with it.
+      expect(reloaded.entries('1').map((r) => r.content)).toEqual([...loaded, 'third']);
+      expect(loaded).toContain('first');
+      expect(reloaded.has(keyOf(recC))).toBe(true);
+      reloaded.close();
+    },
+  );
 
   /**
    * A line with no observation sequence is a damaged line, not an older format: the sequence IS the

@@ -321,6 +321,40 @@ describe('telegram source imports are all used', () => {
   });
 });
 
+/**
+ * `fs.writeSync` performs ONE `write(2)` and REPORTS how much of the buffer the kernel took;
+ * `appendFileSync`/`writeFileSync` loop until there is none left, and this package leans on that
+ * elsewhere. Nothing in the type system separates the two kinds, so a call whose returned count is
+ * dropped on the floor is a short write that reports success — and this store's rewrite renames its
+ * output over the ONLY copy of a backend's history, with no Bot API endpoint that could rebuild a
+ * truncated one. Read over `src/` as a whole rather than at named call sites, so that a writer
+ * added beside a sibling this store grows later inherits the rule.
+ */
+describe('telegram single-write primitives never discard their byte count', () => {
+  /** A call in statement position — nothing to the left of it that could be reading the count. */
+  const DISCARDED = /(?:^|[;{}])\s*(?:void\s+)?(?:[\w$]+\.)?(writeSync|writevSync|readSync|readvSync)\s*\(/g;
+  const discardedIn = (text: string): string[] =>
+    [...text.matchAll(DISCARDED)].map((m) => m[1] as string);
+
+  /**
+   * Graded against SAMPLES rather than against the package, so that the guard cannot rot into a
+   * pattern matching nothing — and so that it never becomes a reason this package must go on
+   * calling these primitives at all.
+   */
+  it('tells a discarded byte count from a consumed one', () => {
+    expect(discardedIn('  writeSync(fd, text);\n')).toEqual(['writeSync']);
+    expect(discardedIn('  fs.writeSync(fd, text);\n')).toEqual(['writeSync']);
+    expect(discardedIn('{ readSync(fd, buf); }')).toEqual(['readSync']);
+    expect(discardedIn('  const n = writeSync(fd, b, 0, 1);\n')).toEqual([]);
+    expect(discardedIn('  while (n < len) n += writeSync(fd, b, n, len - n);\n')).toEqual([]);
+    expect(discardedIn('    const n =\n      fs.writeSync(fd, b);\n')).toEqual([]);
+  });
+
+  it('reads every count the package asks for', () => {
+    expect(discardedIn(source)).toEqual([]);
+  });
+});
+
 describe('telegram test suite hygiene', () => {
   it('declares no case title in two files', () => {
     const owners = new Map<string, string[]>();

@@ -108,11 +108,33 @@ function readOwn(path: string): string {
   }
 }
 
+/**
+ * Write every byte of `text` to `fd`, or fail. `writeSync` performs ONE `write(2)` and returns the
+ * count the kernel took — it does NOT loop, unlike the `appendFileSync`/`writeFileSync` this module
+ * relies on elsewhere. Keep the loop and the refusal, so that a filesystem which accepts a partial
+ * write (ENOSPC after part of it, EFBIG under a size rlimit) cannot have a truncated prefix
+ * published over the only copy of this backend's history as though it were whole.
+ */
+function writeAll(fd: number, path: string, text: string): void {
+  const bytes = Buffer.from(text, 'utf8');
+  let written = 0;
+  while (written < bytes.byteLength) {
+    const took = writeSync(fd, bytes, written, bytes.byteLength - written);
+    if (took <= 0) {
+      throw new Error(
+        `ObservedStore: '${path}' took ${written} of ${bytes.byteLength} bytes and then stopped ` +
+          `accepting any — refusing to publish a truncated observed-message store.`,
+      );
+    }
+    written += took;
+  }
+}
+
 /** Replace one of the store's own paths with `text`, refusing a squatted target as {@link openOwn}. */
 function writeOwn(path: string, text: string): void {
   const fd = openOwn(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
   try {
-    writeSync(fd, text);
+    writeAll(fd, path, text);
   } finally {
     closeSync(fd);
   }
@@ -383,7 +405,7 @@ export class StoreFile {
     const tmp = this.tmpPath;
     const fd = this.openTemp(tmp);
     try {
-      writeSync(fd, text);
+      writeAll(fd, tmp, text);
       fsyncSync(fd);
     } catch (err) {
       closeSync(fd);

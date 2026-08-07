@@ -103,6 +103,20 @@ describe('telegram cursor across the store lifecycle', () => {
       why: /issued by a different observed-message store/,
     },
     {
+      // The cut above lands inside a record, so the line loop's generic `catch` reaches the same
+      // verdict on its own and the load-time torn-tail repair is never what decides this row. A
+      // crash lands on a byte, and the newline is the likeliest byte of all: cut there and the last
+      // line is COMPLETE, every watermark in the file agrees with what it holds, and only the
+      // repair can tell that a record's terminator went missing with the crash.
+      name: 'a store file cut exactly at its last line boundary invalidates the cursor loudly',
+      damage: (path: string) => {
+        const raw = readFileSync(path, 'utf8');
+        writeFileSync(path, raw.slice(0, raw.length - 1));
+      },
+      outcome: 'throws' as const,
+      why: /issued by a different observed-message store/,
+    },
+    {
       name: 'a deleted store file invalidates the cursor loudly',
       damage: (path: string) => unlinkSync(path),
       outcome: 'throws' as const,

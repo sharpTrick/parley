@@ -151,42 +151,71 @@ describe('telegram cursor grammar', () => {
  * catch-up back to the beginning of the retained window, replaying everything.
  */
 describe('telegram fetchRecent limit normalization', () => {
-  const LIMITS = [0, 1, 2, -5, 1.5, 1000, undefined];
-  const POSTED = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const LIMITS = [0, 1, 2, -1, -5, 1.5, 1000, undefined];
 
-  it.each(LIMITS)('limit %s means the same with and without `since`', async (limit) => {
-    const fake = await startFake();
-    const plugin = await connectFresh(fake);
-    const empty = asTopic('-1009900002');
-    const topic = asTopic('-1009900001');
-    // An empty topic has no tail to report, on any limit.
-    expect(seqOf((await plugin.fetchRecent({ topic: empty, limit })).nextCursor)).toBe(0);
-    for (const c of POSTED) await plugin.post(topic, SENDER, c);
+  /**
+   * Past which point a POSITIVE limit stops being run at its own magnitude. A thousand posts would
+   * say what the rows below say, and the coincidence this straddle exists for is not reachable
+   * from above zero.
+   */
+  const DEPTH_CAP = 8;
 
-    const cap = (n: number): number =>
-      limit === undefined ? n : Math.max(0, Math.min(Math.floor(limit), n));
-    const head = await plugin.fetchRecent({ topic, limit });
-    expect(head.messages).toHaveLength(cap(POSTED.length));
-    // Default window = the most recent `limit`, ascending.
-    expect(head.messages.map((m) => m.content)).toEqual(
-      POSTED.slice(POSTED.length - cap(POSTED.length)),
-    );
+  /**
+   * How many messages sit ABOVE `since`, per limit — below its magnitude, at it, and past it.
+   *
+   * One fixed volume is how the clamp in `requireLimit` came to be graded by nothing: `slice(0, -k)`
+   * on exactly k rows is `[]`, which is the same page the clamp produces, so `limit: -5` measured
+   * against 5 remaining messages agrees with the un-normalized answer by arithmetic alone. Deleting
+   * the clamp left the whole suite green while `limit: -5` on a deeper topic served the FIRST two
+   * messages and set `nextCursor` to the second — reinterpreting a published seam argument as "drop
+   * the last five" and skipping the rest of the topic forever. No single volume can be chosen that
+   * a magnitude cannot coincide with, so each limit brings its own; a negative one is never capped,
+   * because that is the half the coincidence lives in.
+   */
+  const volumesFor = (limit: number | undefined): number[] => {
+    const k = Math.floor(limit ?? 100);
+    const depth = k < 0 ? -k : Math.min(k, DEPTH_CAP);
+    return [...new Set([Math.max(1, depth - 1), Math.max(1, depth), depth + 3])];
+  };
 
-    const all = (await plugin.fetchRecent({ topic })).messages;
-    const since = all[0]!.cursor;
-    const topicTail = all.at(-1)!.cursor;
-    // The since-less branch always reports the topic's tail: it has already returned the newest
-    // messages there are, so nothing below the tail is left for a later catch-up to find.
-    expect(head.nextCursor).toBe(topicTail);
+  const CELLS = LIMITS.flatMap((limit) => volumesFor(limit).map((above) => ({ limit, above })));
 
-    const tail = await plugin.fetchRecent({ topic, since, limit });
-    expect(tail.messages).toHaveLength(cap(POSTED.length - 1));
-    expect(tail.messages.map((m) => m.content)).toEqual(
-      POSTED.slice(1, 1 + cap(POSTED.length - 1)),
-    );
-    // The cursor never regresses, whatever the limit.
-    expect(seqOf(tail.nextCursor)).toBeGreaterThanOrEqual(seqOf(since));
-  });
+  it.each(CELLS)(
+    'limit $limit means the same with and without `since`, $above above it',
+    async ({ limit, above }) => {
+      const fake = await startFake();
+      const plugin = await connectFresh(fake);
+      const empty = asTopic('-1009900002');
+      const topic = asTopic('-1009900001');
+      // An empty topic has no tail to report, on any limit.
+      expect(seqOf((await plugin.fetchRecent({ topic: empty, limit })).nextCursor)).toBe(0);
+      const POSTED = Array.from({ length: above + 1 }, (_, i) => `m${i}`);
+      for (const c of POSTED) await plugin.post(topic, SENDER, c);
+
+      const cap = (n: number): number =>
+        limit === undefined ? n : Math.max(0, Math.min(Math.floor(limit), n));
+      const head = await plugin.fetchRecent({ topic, limit });
+      expect(head.messages).toHaveLength(cap(POSTED.length));
+      // Default window = the most recent `limit`, ascending.
+      expect(head.messages.map((m) => m.content)).toEqual(
+        POSTED.slice(POSTED.length - cap(POSTED.length)),
+      );
+
+      const all = (await plugin.fetchRecent({ topic })).messages;
+      const since = all[0]!.cursor;
+      const topicTail = all.at(-1)!.cursor;
+      // The since-less branch always reports the topic's tail: it has already returned the newest
+      // messages there are, so nothing below the tail is left for a later catch-up to find.
+      expect(head.nextCursor).toBe(topicTail);
+
+      const tail = await plugin.fetchRecent({ topic, since, limit });
+      expect(tail.messages).toHaveLength(cap(above));
+      expect(tail.messages.map((m) => m.content)).toEqual(POSTED.slice(1, 1 + cap(above)));
+      // The cursor never regresses, whatever the limit.
+      expect(seqOf(tail.nextCursor)).toBeGreaterThanOrEqual(seqOf(since));
+    },
+    20_000,
+  );
 
   /**
    * `limit` and `blockMs` are independent knobs, and the decision to PARK belongs to the second one
