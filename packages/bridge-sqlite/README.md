@@ -124,7 +124,7 @@ fast with the offending key in the message rather than being absorbed:
 
 | Field | Accepted | Rejected |
 |---|---|---|
-| `db_path` | any non-empty string | `""`, non-strings |
+| `db_path` | any non-empty filesystem path; `":memory:"` for a single-process store | `""`, non-strings, and anything starting with `file:` — the two drivers read a SQLite URI differently (`node:sqlite` resolves it; `better-sqlite3` opens a file literally named after it), so which store it names would depend on which driver is installed |
 | `poll_interval_ms` | integer `10` … `2147483647` | `0` (a hot loop), negatives, fractions, values above the `setTimeout` ceiling (Node silently clamps those to 1 ms) |
 | `retention_days` | any number `>= 1/1440` (one minute) whose cutoff is a representable date | `0`, negatives, and any window shorter than a minute — **not** "disabled"; each deletes the entire history on the prune `connect()` runs immediately, so `1e-9` is refused for the same reason `0` is. Omit the key for "keep forever". Also rejected: values so large the cutoff falls outside the representable date range, which would be accepted and then silently never enforced |
 

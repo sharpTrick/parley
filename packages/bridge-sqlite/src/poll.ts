@@ -44,6 +44,7 @@ export abstract class SqlitePoller extends SqliteRetention {
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const storeId = this.require(this.storeId);
+    const generation = this.generation;
     let lastSeen: number | bigint = this.caughtUpThrough.get(topic) ?? this.maxId(topic);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
@@ -52,7 +53,7 @@ export abstract class SqlitePoller extends SqliteRetention {
     this.health.push(health);
 
     const tick = (): void => {
-      if (this.tornDown()) return;
+      if (this.orphaned(generation)) return;
       let delay = this.pollIntervalMs;
       try {
         const stmt = this.require(this.selectAfterStmt);
@@ -61,7 +62,7 @@ export abstract class SqlitePoller extends SqliteRetention {
           // Keep these re-checks around EVERY handler call, so that a handler which tears the
           // plugin down re-entrantly stops the loop at that row: the rest of the batch is already
           // in memory, and the bookkeeping below would report a torn-down loop as live.
-          if (this.tornDown()) return;
+          if (this.orphaned(generation)) return;
           lastSeen = row.id;
           try {
             handler(rowToMessage(row, storeId));
@@ -69,7 +70,7 @@ export abstract class SqlitePoller extends SqliteRetention {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }
         }
-        if (this.tornDown()) return;
+        if (this.orphaned(generation)) return;
         // Keep the immediate reschedule on a full batch, so that POLL_BATCH bounds per-tick work
         // rather than capping throughput at one batch per poll interval.
         if (rows.length === POLL_BATCH) delay = 0;
@@ -111,7 +112,7 @@ export abstract class SqlitePoller extends SqliteRetention {
           delay = backoffMs(this.pollIntervalMs, failures);
         }
       }
-      if (!this.stopped) timer = setTimeout(tick, delay);
+      if (!this.orphaned(generation)) timer = setTimeout(tick, delay);
     };
 
     this.cancellers.push(() => {

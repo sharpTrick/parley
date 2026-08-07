@@ -51,6 +51,10 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
     this.retentionDays = cfg.retention_days;
     this.stopped = false;
+    // Keep the bump below every throw above it, so that a connect() that is refused — already
+    // connected, or a store that failed after opening — cannot stop the loops an earlier connect()
+    // armed and left healthy.
+    this.generation++;
     this.health.length = 0;
     this.pruneFailures = 0;
     this.lastPruneDiag = 0;
@@ -69,6 +73,7 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    this.generation++;
     if (this.pruneTimer !== undefined) clearInterval(this.pruneTimer);
     this.pruneTimer = undefined;
     if (this.pruneBatchTimer !== undefined) clearTimeout(this.pruneBatchTimer);

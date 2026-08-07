@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -56,6 +56,7 @@ afterEach(() => {
 async function loadRecordingDriver(): Promise<{
   openDriver: typeof OpenDriver;
   atOpen: () => { existed: boolean; mode?: number };
+  opens: () => number;
 }> {
   const seen: Array<{ existed: boolean; mode?: number }> = [];
   vi.resetModules();
@@ -84,7 +85,11 @@ async function loadRecordingDriver(): Promise<{
     };
   });
   const driver = await import('../src/driver.js');
-  return { openDriver: driver.openDriver, atOpen: () => seen[0] ?? { existed: false } };
+  return {
+    openDriver: driver.openDriver,
+    atOpen: () => seen[0] ?? { existed: false },
+    opens: () => seen.length,
+  };
 }
 
 describe('the store is claimed at 0600 before the driver can create it', () => {
@@ -98,6 +103,85 @@ describe('the store is claimed at 0600 before the driver can create it', () => {
         atOpen(),
         'nothing was recorded: the native constructor never ran, so this graded no window at all',
       ).toEqual({ existed: true, mode: 0o600 });
+    });
+  }
+});
+
+/**
+ * Whether a path names a file is a question about what the OPEN did, never about the shape of the
+ * string: the two drivers disagree about what a path means — node:sqlite resolves SQLite URIs,
+ * better-sqlite3 opens a file literally named after one — so any classification of the string alone
+ * exempts some form from a hardening it never looked at, and does so silently, on a real store.
+ *
+ * Each row below states only the path. Both expectations are read back from the directory
+ * afterwards, so a form nobody has thought of yet is graded the moment somebody adds it, and a
+ * driver that starts or stops putting one on disk moves the grading with it rather than going
+ * vacuous. `:memory:` is in the table for the other direction: the one path that must NOT be forced
+ * onto the on-disk arm, where the WAL gate would refuse it.
+ */
+const PATHS = [
+  ':memory:',
+  'p.db',
+  './p.db',
+  'p.db?x=1',
+  'file::memory:',
+  'file::memory:?cache=shared',
+  'file:p.db',
+  'file:p.db?mode=ro',
+];
+
+let previousCwd: string | undefined;
+function inScratchDir(): void {
+  previousCwd ??= process.cwd();
+  process.chdir(dir());
+}
+afterEach(() => {
+  if (previousCwd !== undefined) process.chdir(previousCwd);
+  previousCwd = undefined;
+});
+
+describe.each(UMASKS.map(oct))('every path form is hardened by what it put on disk (umask %s)', (label) => {
+  const umask = Number.parseInt(label, 8);
+  for (const spec of PATHS) {
+    it(`${JSON.stringify(spec)}: nothing this open created is readable beyond its owner`, async () => {
+      withUmask(umask);
+      inScratchDir();
+      const here = process.cwd();
+      const { openDriver: recording, atOpen, opens } = await loadRecordingDriver();
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let left: Array<[string, string]> = [];
+      let claimedBeforeOpen: { existed: boolean; mode?: number } | undefined;
+      let store: ReturnType<typeof openDriver> | undefined;
+      try {
+        try {
+          store = recording(spec);
+          store.exec('CREATE TABLE t (x)');
+          store.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+        } catch {
+          // A form the driver refuses still has to leave nothing exposed behind it.
+        }
+        // Read the directory before close(): the checkpoint on close removes the sidecars.
+        left = readdirSync(here)
+          .sort()
+          .map((f) => [f, oct(mode(join(here, f)))]);
+        claimedBeforeOpen = existsSync(spec) ? atOpen() : undefined;
+      } finally {
+        store?.close();
+        spy.mockRestore();
+      }
+
+      expect(opens(), 'the driver constructor never ran: this row graded no open at all').toBe(1);
+      expect(
+        left.filter(([, m]) => (Number.parseInt(m, 8) & 0o077) !== 0),
+        `openDriver(${JSON.stringify(spec)}) left part of the store readable by other accounts`,
+      ).toEqual([]);
+      if (claimedBeforeOpen !== undefined) {
+        expect(
+          claimedBeforeOpen,
+          `openDriver(${JSON.stringify(spec)}) put a file on disk that the driver, not the ` +
+            `pre-creation, created: it was world-readable for the width of the open`,
+        ).toEqual({ existed: true, mode: 0o600 });
+      }
     });
   }
 });

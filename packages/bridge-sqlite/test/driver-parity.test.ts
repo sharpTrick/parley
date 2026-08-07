@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -246,6 +246,59 @@ describe.each(KINDS)('driver parity: %s', (kind) => {
     expect(modes).toEqual([0o600, 0o600, 0o600]);
     expect(lines.some((l) => /tightened/.test(l) && l.includes(path))).toBe(true);
   });
+
+  /**
+   * At-rest hardening is graded in test/at-rest-mode.test.ts against whichever driver resolves —
+   * but both drivers are reached by the same `db_path`, and they do not agree on what one means:
+   * node:sqlite resolves SQLite URIs, better-sqlite3 opens a file literally named after one. So the
+   * file that has to be narrowed is a DIFFERENT file per driver, and any rule written over the
+   * string protects at most one of them. Read the expectation off the directory instead — whatever
+   * this driver put there is this driver's store, whichever name it went in under.
+   */
+  const PATH_FORMS = [
+    ':memory:',
+    'p.db',
+    'p.db?x=1',
+    'file::memory:',
+    'file::memory:?cache=shared',
+    'file:p.db',
+  ];
+
+  for (const spec of PATH_FORMS) {
+    it(`${JSON.stringify(spec)}: leaves nothing on disk readable beyond its owner`, async () => {
+      const { openDriver } = await load(kind);
+      const here = dir();
+      const previousCwd = process.cwd();
+      const previousUmask = process.umask(0o022);
+      process.chdir(here);
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let left: Array<[string, number]> = [];
+      let d: SqlDriver | undefined;
+      try {
+        try {
+          d = openDriver(spec);
+          expect(d.kind).toBe(kind);
+          d.exec('CREATE TABLE t (x)');
+          d.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+        } catch {
+          // A form this driver refuses still has to leave nothing exposed behind it.
+        }
+        // Read the directory before close(): the checkpoint on close removes the sidecars.
+        left = readdirSync(here)
+          .sort()
+          .map((f) => [f, mode(join(here, f))]);
+      } finally {
+        d?.close();
+        spy.mockRestore();
+        process.chdir(previousCwd);
+        process.umask(previousUmask);
+      }
+      expect(
+        left.filter(([, m]) => (m & 0o077) !== 0),
+        `${kind} left part of the store at ${JSON.stringify(spec)} readable by other accounts`,
+      ).toEqual([]);
+    });
+  }
 
   it('reports an insert through the same RunResult shape', async () => {
     const { openDriver } = await load(kind);

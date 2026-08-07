@@ -20,6 +20,7 @@ export abstract class SqliteStore {
   protected driver?: SqlDriver;
   protected pollIntervalMs = 1000;
   protected stopped = false;
+  protected generation = 0;
   protected storeId?: string;
   protected insertStmt?: SqlStatement;
   protected selectAfterStmt?: SqlStatement;
@@ -30,6 +31,16 @@ export abstract class SqliteStore {
 
   protected tornDown(): boolean {
     return this.stopped || this.driver === undefined;
+  }
+
+  /**
+   * Whether a loop armed in `generation` still belongs to this plugin. The flags {@link tornDown}
+   * reads cannot answer that on their own: a `disconnect()`/`connect()` pair re-entered from inside
+   * a handler restores every one of them mid-tick, and the loop would resume against the new store
+   * carrying the previous one's read position and store id.
+   */
+  protected orphaned(generation: number): boolean {
+    return this.tornDown() || this.generation !== generation;
   }
 
   protected require<T>(value: T | undefined): T {

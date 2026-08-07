@@ -354,51 +354,149 @@ describe('a connect() that fails after opening the store leaves nothing behind',
 });
 
 /**
- * A handler runs synchronously inside the poll tick, so a consumer that shuts the bridge down on an
- * inbound control message re-enters the plugin while a batch of rows is already in memory. Nothing
- * may reach the handler from that point on — the conformance clause `disconnect-stops-live-delivery`
- * is what core's `<channel>` emission rests on, and it is graded there only from OUTSIDE the
- * handler, where no row can be pending when the flag flips.
+ * A handler runs synchronously inside the poll tick, so a consumer that re-enters the lifecycle on
+ * an inbound control message does so while a batch of rows is already in memory. The conformance
+ * clause `disconnect-stops-live-delivery` is what core's `<channel>` emission rests on, and it is
+ * graded there only from OUTSIDE the handler, where no row can be pending when the flags flip.
+ *
+ * A re-entrant lifecycle call is a FAMILY, not one action, and what decides whether the loop may go
+ * on is which connect() armed it — never whether the plugin currently looks connected, which a
+ * `disconnect()`/`connect()` pair restores mid-tick and mid-batch. So the row here is the re-entrant
+ * action, and each grades the same pair: the loop delivers exactly what its OWN store held for it,
+ * and not one row of a store it was never armed against. Content names the store it was written to,
+ * which is what makes a resumed cross-store loop visible — a delivery count cannot see one, and
+ * neither can the cursor, which carries the id captured at subscribe() whatever store the row
+ * actually came from.
  *
  * Fake timers make the batch explicit rather than raced: every row posted between two ticks arrives
- * in one, so the teardown row is a POSITION in a known batch.
+ * in one, so the re-entry row is a POSITION in a known batch.
  */
-describe('a teardown started from inside a handler stops delivery at that row', () => {
-  const teardownPositions = (pending: number): number[] =>
+describe('a lifecycle call re-entered from inside a handler decides that loop\u2019s fate', () => {
+  interface Reentry {
+    name: string;
+    /** Run from inside the handler, on the chosen row. */
+    act: (p: SqlitePlugin, a: string, b: string, refusals: string[]) => void;
+    /** What the re-entrant call must be refused with, or null if it must be accepted. */
+    refused: RegExp | null;
+    /** Whether the loop is still this plugin's afterwards — a refused call changes nothing. */
+    survives: boolean;
+  }
+
+  const REENTRIES: Reentry[] = [
+    {
+      name: 'disconnects',
+      refused: null,
+      survives: false,
+      act: (p) => {
+        void p.disconnect();
+      },
+    },
+    {
+      name: 'disconnects twice',
+      refused: null,
+      survives: false,
+      act: (p) => {
+        void p.disconnect();
+        void p.disconnect();
+      },
+    },
+    {
+      name: 'disconnects then reconnects to the same store',
+      refused: null,
+      survives: false,
+      act: (p, a, _b, refusals) => {
+        void p.disconnect();
+        void p.connect(cfg(a)).catch((e: unknown) => refusals.push(String(e)));
+      },
+    },
+    {
+      name: 'disconnects then connects to another store',
+      refused: null,
+      survives: false,
+      act: (p, _a, b, refusals) => {
+        void p.disconnect();
+        void p.connect(cfg(b)).catch((e: unknown) => refusals.push(String(e)));
+      },
+    },
+    {
+      name: 'connects to another store without disconnecting',
+      refused: /already connected/,
+      survives: true,
+      act: (p, _a, b, refusals) => {
+        void p.connect(cfg(b)).catch((e: unknown) => refusals.push(String(e)));
+      },
+    },
+  ];
+
+  const reentryPositions = (pending: number): number[] =>
     [...new Set([1, Math.ceil(pending / 2), pending])];
 
+  const storeIdIn = (cursor: string): string => cursor.split('.')[0] ?? '';
+
   for (const pending of [1, 2, POLL_BATCH]) {
-    for (const at of teardownPositions(pending)) {
-      for (const twice of [false, true]) {
-        it(`${pending} row(s) in the batch, handler disconnects ${twice ? 'twice ' : ''}on row ${at}`, async () => {
-          const path = dbFile();
+    for (const at of reentryPositions(pending)) {
+      for (const r of REENTRIES) {
+        it(`${pending} row(s) in the batch, handler ${r.name} on row ${at}`, async () => {
+          const a = dbFile();
+          const b = dbFile();
           const p = tracked();
-          await p.connect(cfg(path));
-          const got: string[] = [];
+          await p.connect(cfg(a));
+          const got: Array<{ content: string; cursor: string }> = [];
+          const refusals: string[] = [];
+          const armed = (n: number): string[] => Array.from({ length: n }, (_u, i) => `a${i}`);
 
           vi.useFakeTimers();
           try {
             await p.subscribe(T, (m) => {
-              got.push(m.content);
+              got.push({ content: m.content, cursor: m.cursor });
               if (got.length !== at) return;
-              void p.disconnect();
-              if (twice) void p.disconnect();
+              r.act(p, a, b, refusals);
             });
-            for (let i = 0; i < pending; i++) await p.post(T, me, `m${i}`);
+            for (let i = 0; i < pending; i++) await p.post(T, me, `a${i}`);
             await vi.advanceTimersByTimeAsync(1000);
 
-            expect(got).toEqual(Array.from({ length: at }, (_unused, i) => `m${i}`));
-            expectHealth(p.subscriptionHealth(), [
-              { topic: T, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
-            ]);
+            if (r.refused === null) {
+              expect(refusals).toEqual([]);
+            } else {
+              expect(
+                refusals.join('|'),
+                'the re-entrant call is accepted now, so this row no longer provokes the case it names',
+              ).toMatch(r.refused);
+            }
+            expect(got.map((g) => g.content)).toEqual(armed(r.survives ? pending : at));
 
-            // The loop must be gone, not merely out of rows: a second client keeps writing to the
-            // same file while the timers run on.
-            const peer = tracked();
-            await peer.connect(cfg(path));
-            for (let i = 0; i < 3; i++) await peer.post(T, me, `after-${i}`);
+            // The loop must be gone — or still be this plugin's — rather than merely out of rows,
+            // and it must not have been adopted by whichever store the re-entrant call left
+            // connected. Both stores keep being written to past the read position the loop reached
+            // while the timers run on, so a loop resumed against either one shows as a delivery.
+            const peerA = tracked();
+            await peerA.connect(cfg(a));
+            const peerB = tracked();
+            await peerB.connect(cfg(b));
+            for (let i = 0; i < pending + 8; i++) {
+              await peerA.post(T, me, `a-later-${i}`);
+              await peerB.post(T, me, `b${i}`);
+            }
             await vi.advanceTimersByTimeAsync(1000);
-            expect(got).toEqual(Array.from({ length: at }, (_unused, i) => `m${i}`));
+
+            const contents = got.map((g) => g.content);
+            expect(
+              contents.filter((c) => c.startsWith('b')),
+              'the loop delivered rows out of a store it was never armed against',
+            ).toEqual([]);
+
+            const armedStore = storeIdIn(
+              (await peerA.fetchRecent({ topic: T })).messages[0]?.cursor ?? '',
+            );
+            expect(armedStore).not.toBe('');
+            expect([...new Set(got.map((g) => storeIdIn(g.cursor)))]).toEqual([armedStore]);
+
+            if (r.survives) {
+              expect(contents.length).toBeGreaterThan(pending);
+            } else {
+              expect(contents).toEqual(armed(at));
+            }
+            expect(p.subscriptionHealth().some((h) => h.state === 'live')).toBe(r.survives);
           } finally {
             vi.useRealTimers();
           }

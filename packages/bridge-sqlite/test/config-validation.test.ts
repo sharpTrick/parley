@@ -137,6 +137,50 @@ describe('connect() rejects every bad backend_config value', () => {
 });
 
 /**
+ * `db_path` is handed to two drivers that do not agree on what a string means: node:sqlite resolves
+ * SQLite URIs, better-sqlite3 opens a file literally named after one. A value they read differently
+ * therefore names a DIFFERENT store per install, with neither driver raising anything — so it is
+ * refused at the config, before a file can be created under either reading. Each row grades the
+ * refusal and that the cwd is untouched: a guard that fired after the open would leave behind the
+ * very file it exists to prevent, and the message alone cannot tell those apart.
+ */
+describe('a db_path the two drivers would read differently is refused before anything opens', () => {
+  const AMBIGUOUS = [
+    'file::memory:',
+    'file::memory:?cache=shared',
+    'file:p.db',
+    'file:p.db?mode=ro',
+    'file:./p.db?cache=private',
+  ];
+
+  for (const value of AMBIGUOUS) {
+    it(`${JSON.stringify(value)} is refused, naming the key, and creates nothing`, async () => {
+      await inScratchCwd(async () => {
+        const here = process.cwd();
+        const p = new SqlitePlugin();
+        await expect(p.connect({ db_path: value })).rejects.toThrow(
+          /parley-sqlite: invalid backend_config\.db_path/,
+        );
+        expect(readdirSync(here), `a store was created under one driver'"'"'s reading of ${value}`).toEqual([]);
+      });
+    });
+  }
+
+  // The other side of the same guard: a path is not ambiguous merely for containing a colon, and a
+  // table that rejects everything grades nothing.
+  for (const value of ['p.db', 'not-a-file:uri.db', './sub-dir-free.db', ':memory:']) {
+    it(`${JSON.stringify(value)} is still accepted`, async () => {
+      await inScratchCwd(async () => {
+        const p = new SqlitePlugin();
+        open.push(p);
+        await expect(p.connect({ db_path: value })).resolves.toBeUndefined();
+        await expect(p.post(T, me, 'operable')).resolves.toBeDefined();
+      });
+    });
+  }
+});
+
+/**
  * `BAD_VALUES` only ever probes a bound from far outside it (`1e308`), which any ceiling at all
  * rejects — so a bound could be re-tuned to a value that breaks what it exists to prevent and
  * nothing above would notice. These edges are READ FROM the exported constants rather than

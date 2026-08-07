@@ -103,6 +103,15 @@ export function validateBackendConfig(config: BackendConfig): SqliteBackendConfi
   if (dbPath !== undefined && (typeof dbPath !== 'string' || dbPath === '')) {
     throw bad('db_path', `expected a non-empty string, got ${describe(dbPath)}`);
   }
+  if (typeof dbPath === 'string' && dbPath.startsWith('file:')) {
+    throw bad(
+      'db_path',
+      `expected a filesystem path, got the SQLite URI ${describe(dbPath)} — the two drivers read ` +
+        `it differently (node:sqlite resolves URIs; better-sqlite3 opens a file literally named ` +
+        `'${dbPath}'), so which store this names would depend on which of them is installed; ` +
+        `use the plain path, or ':memory:' for a single-process store`,
+    );
+  }
 
   const poll = cfg['poll_interval_ms'];
   if (poll !== undefined && !integerBetween(poll, MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS)) {

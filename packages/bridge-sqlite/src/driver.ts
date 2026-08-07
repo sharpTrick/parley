@@ -96,13 +96,16 @@ function loadBetterSqlite(): (new (p: string) => RawDb) | null {
  * permissions, corrupt file) surfaces better-sqlite3's own precise message instead.
  */
 export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
-  const onDisk = path !== ':memory:' && !path.startsWith('file::memory:');
-  // Keep this ahead of the driver open, so that there is no window in which the driver creates
-  // the whole conversation store at the umask default and it is briefly world-readable.
-  if (onDisk) precreate(path);
+  // Keep this ahead of the driver open for every path but the one literal that names no file under
+  // either driver, so that there is no window in which the driver creates the whole conversation
+  // store at the umask default and it is briefly world-readable. Whether a path really names a
+  // file is a question only the open below can answer, and by then the window has passed.
+  if (path !== ':memory:') precreate(path);
   const driver = openConnection(path);
+  let files: string[];
   try {
-    applyPragmas(driver, opts.busyTimeoutMs ?? 5000, onDisk);
+    files = storeFiles(driver, path);
+    applyPragmas(driver, opts.busyTimeoutMs ?? 5000, files.length > 0);
   } catch (e) {
     // Keep the close on the failure path, so that a caller retrying a permanently-failing open —
     // a supervisor restarting a bridge against a typo'd path — cannot leak a handle per attempt.
@@ -113,8 +116,33 @@ export function openDriver(path: string, opts: OpenOptions = {}): SqlDriver {
   // group/world-readable, and neither driver exposes a mode option. Narrow anything wider, and
   // say so — including when it cannot be done, which is what a second bridge running as a
   // different UID hits.
-  if (onDisk) for (const f of [path, `${path}-wal`, `${path}-shm`]) restrictMode(f);
+  for (const f of files) for (const suffix of ['', '-wal', '-shm']) restrictMode(`${f}${suffix}`);
   return driver;
+}
+
+/**
+ * Every name the store SQLite actually opened can be reached by, or none if it opened no file at
+ * all. Ask the connection rather than classify the path: the drivers disagree about what a path
+ * means — node:sqlite resolves SQLite URIs, better-sqlite3 opens a file literally named after one —
+ * so a heuristic over the string decides at-rest hardening for a file it has never looked at. The
+ * path as given is kept beside the resolved answer because a symlink or a relative path leaves the
+ * same file under two names, and the one an operator configured is the one worth naming on stderr.
+ */
+function storeFiles(driver: SqlDriver, path: string): string[] {
+  let resolved: unknown;
+  try {
+    const rows = driver.prepare('PRAGMA database_list').all() as Array<Record<string, unknown>>;
+    const main = rows.find((r) => r['name'] === 'main');
+    // Keep an unanswered question on the file side, so that a driver which will not say is
+    // hardened and WAL-gated anyway: narrowing a file that turns out not to exist costs nothing,
+    // and serving an unhardened store costs the whole conversation.
+    if (main === undefined) return [path];
+    resolved = main['file'];
+  } catch {
+    return [path];
+  }
+  if (typeof resolved !== 'string' || resolved === '') return [];
+  return resolved === path ? [path] : [path, resolved];
 }
 
 function openConnection(path: string): SqlDriver {
