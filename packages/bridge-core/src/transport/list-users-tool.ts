@@ -53,7 +53,8 @@ export function registerListUsersTool(server: McpServer, deps: ToolDeps): void {
         '"claude-*"). A human using a plain chat client appears only once they send a message. Returns ' +
         '{ users: [{ handle, online, topics, postTopics, lastSeenMs }], truncated } (truncated=true ' +
         'when the answer was cut — the scanned presence history was full, the roster hit its entry ' +
-        'cap, or `limit` trimmed it — so peers may be missing; a peer that beats far ' +
+        'cap, `limit` trimmed it, or matching peers’ advertised patterns hit its CPU allowance and ' +
+        'left some peers unmatched — so peers may be missing; a peer that beats far ' +
         'more often than the rest can fill that history on its own and hide quieter ones, so treat a ' +
         'truncated roster as incomplete rather than as the whole bus). Configured ' +
         `topics: ${topicList(deps.allow)}.`,
@@ -118,10 +119,17 @@ export function registerListUsersTool(server: McpServer, deps: ToolDeps): void {
           : page.messages;
 
       const roster = computeRoster(beats, now(), { ttlMs: deps.presenceTtlMs, sinceMs });
+      // A peer dropped because the reach allowance ran out is a CUT answer, not an absent peer, and
+      // the allowance is spent by an attacker-chosen entry count — so disclose it with every other
+      // cause, or an emptied roster reads as "nobody is on the bus".
+      let reachClipped = false;
       let users = filterReachable(roster, {
         scope,
         canPostTo: (t) => deps.allow.has(t),
         mySubscribedTopics: deps.allow.topics(),
+        onReachClipped: () => {
+          reachClipped = true;
+        },
       });
       if (online_only === true) users = users.filter((e) => e.online);
       // computeRoster already sorts most-recently-seen first; filter/slice preserve that order.
@@ -129,7 +137,11 @@ export function registerListUsersTool(server: McpServer, deps: ToolDeps): void {
       const capped = users.slice(0, limit ?? DEFAULT_ROSTER_LIMIT);
       return textResult({
         users: capped,
-        truncated: truncated || roster.length >= MAX_ROSTER_ENTRIES || capped.length < users.length,
+        truncated:
+          truncated ||
+          reachClipped ||
+          roster.length >= MAX_ROSTER_ENTRIES ||
+          capped.length < users.length,
       });
     },
   );

@@ -35,17 +35,33 @@ const PATTERN_BUDGET_MS = 50;
  * One direction's CPU allowance for ONE {@link filterReachable} call. It MEASURES the work it
  * authorises rather than reading a clock started at call time, so that what the other direction
  * spends cannot exhaust it. `undefined` means the allowance is gone.
+ *
+ * Keep the allowance shared FAIRLY across the remaining entries rather than first-come, so that a
+ * page engineered to spend the whole thing cannot decide the verdict for the entries behind it. The
+ * entry COUNT is attacker-chosen and so is its position in the recency sort, so a whole-call
+ * allowance spent front-to-back reports every later peer unreachable — 120 hostile beats ahead of
+ * one legitimate colleague returned an EMPTY roster. Unspent share rolls forward, so a benign page
+ * still lets one expensive peer use nearly all of it.
  */
-function budget(): <T>(work: () => T) => T | undefined {
+function budget(onClipped: () => void): (remainingEntries: number) => <T>(work: () => T) => T | undefined {
   let spentMs = 0;
-  return (work) => {
-    if (spentMs >= PATTERN_BUDGET_MS) return undefined;
-    const started = performance.now();
-    try {
-      return work();
-    } finally {
-      spentMs += performance.now() - started;
-    }
+  return (remainingEntries) => {
+    const share = (PATTERN_BUDGET_MS - spentMs) / Math.max(remainingEntries, 1);
+    let entryMs = 0;
+    return (work) => {
+      if (entryMs >= share) {
+        onClipped();
+        return undefined;
+      }
+      const started = performance.now();
+      try {
+        return work();
+      } finally {
+        const costMs = performance.now() - started;
+        entryMs += costMs;
+        spentMs += costMs;
+      }
+    };
   };
 }
 
@@ -55,11 +71,14 @@ function budget(): <T>(work: () => T) => T | undefined {
  * `my-ops-secret`. Keep an over-long input REFUSED rather than truncated, mirroring
  * `Allowlist.has`, so that one rule answered two ways cannot report a peer as reachable on a topic
  * the allowlist at either end will not pattern-match — the agent would hand off into silence. Past
- * the deadline a peer is simply not matched BY PATTERN — it still surfaces on a topic it explicitly
- * advertises, so the degradation drops reach, never safety.
+ * its share a peer is simply not matched BY PATTERN — it still surfaces on a topic it explicitly
+ * advertises, so the degradation drops reach, never safety — and `onClipped` fires, so the
+ * degradation is DISCLOSED rather than answered as an absence.
  */
-function peerReach(): (sources: readonly string[], input: string) => boolean {
-  const spend = budget();
+function peerReach(
+  onClipped: () => void,
+): (remainingEntries: number) => (sources: readonly string[], input: string) => boolean {
+  const spendFor = budget(onClipped);
   const compiled = new Map<string, RegExp | null>();
   const compile = (src: string): RegExp | null => {
     const cached = compiled.get(src);
@@ -75,17 +94,20 @@ function peerReach(): (sources: readonly string[], input: string) => boolean {
     compiled.set(src, re);
     return re;
   };
-  return (sources, input) => {
-    if (input.length > MAX_MATCH_INPUT) return false;
-    for (const src of sources) {
-      const hit = spend(() => {
-        const re = compile(src);
-        return re !== null && re.test(input);
-      });
-      if (hit === undefined) return false;
-      if (hit) return true;
-    }
-    return false;
+  return (remainingEntries) => {
+    const spend = spendFor(remainingEntries);
+    return (sources, input) => {
+      if (input.length > MAX_MATCH_INPUT) return false;
+      for (const src of sources) {
+        const hit = spend(() => {
+          const re = compile(src);
+          return re !== null && re.test(input);
+        });
+        if (hit === undefined) return false;
+        if (hit) return true;
+      }
+      return false;
+    };
   };
 }
 
@@ -93,9 +115,15 @@ function peerReach(): (sources: readonly string[], input: string) => boolean {
  * Wrap a topic predicate in its own allowance. Past it the caller is simply reported as unable to
  * post there — the degradation drops reach, never safety, exactly as {@link peerReach}'s does.
  */
-function budgeted(canPostTo: (topic: string) => boolean): (topic: string) => boolean {
-  const spend = budget();
-  return (topic) => spend(() => canPostTo(topic)) === true;
+function budgeted(
+  canPostTo: (topic: string) => boolean,
+  onClipped: () => void,
+): (remainingEntries: number) => (topic: string) => boolean {
+  const spendFor = budget(onClipped);
+  return (remainingEntries) => {
+    const spend = spendFor(remainingEntries);
+    return (topic) => spend(() => canPostTo(topic)) === true;
+  };
 }
 
 /**
@@ -119,15 +147,32 @@ export function filterReachable(
     canPostTo: (topic: string) => boolean;
     /** The caller's own subscribed topics — pass `allow.topics()`. */
     mySubscribedTopics: readonly string[];
+    /**
+     * Called once per peer that the ALLOWANCE, not the predicate, excluded. Required rather than
+     * optional: a caller that forgets it hands the agent a gutted roster described as complete, and
+     * an empty one is indistinguishable from "nobody is on the bus".
+     */
+    onReachClipped: () => void;
   },
 ): RosterEntry[] {
-  const reaches = peerReach();
-  const canPostTo = budgeted(opts.canPostTo);
-  return roster.filter((e) => {
-    if (opts.scope !== undefined) {
-      return e.topics.includes(opts.scope) || reaches(e.postTopics, opts.scope);
-    }
-    if (e.topics.some((t) => canPostTo(t))) return true;
-    return opts.mySubscribedTopics.some((mt) => reaches(e.postTopics, mt));
+  let clipped = false;
+  const note = (): void => {
+    clipped = true;
+  };
+  const reachesFor = peerReach(note);
+  const canPostToFor = budgeted(opts.canPostTo, note);
+  const kept: RosterEntry[] = [];
+  roster.forEach((e, i) => {
+    clipped = false;
+    const reaches = reachesFor(roster.length - i);
+    const canPostTo = canPostToFor(roster.length - i);
+    const included =
+      opts.scope !== undefined
+        ? e.topics.includes(opts.scope) || reaches(e.postTopics, opts.scope)
+        : e.topics.some((t) => canPostTo(t)) ||
+          opts.mySubscribedTopics.some((mt) => reaches(e.postTopics, mt));
+    if (included) kept.push(e);
+    else if (clipped) opts.onReachClipped();
   });
+  return kept;
 }

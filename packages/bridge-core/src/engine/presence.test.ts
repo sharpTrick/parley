@@ -42,6 +42,13 @@ function beat(
   };
 }
 
+/**
+ * These cases grade the CPU BOUND on untrusted pattern work. That the bound's degradation is
+ * DISCLOSED to the caller is a different property, graded through the tool answer in
+ * transport/list-users-tool.test.ts, so it is deliberately ignored here.
+ */
+const noteClip = (): void => {};
+
 describe('encode/decode presence', () => {
   it('round-trips a record, including postTopics and instanceId', () => {
     const rec: PresenceRecord = {
@@ -463,7 +470,7 @@ describe('the per-record budget survives aggregation across instances', () => {
     expect(JSON.stringify(entry).length).toBeLessThan(ENTRY_BUDGET_BYTES);
 
     const t0 = performance.now();
-    filterReachable(roster, { scope: undefined, canPostTo: () => false, mySubscribedTopics: ['ctx'] });
+    filterReachable(roster, { onReachClipped: noteClip, scope: undefined, canPostTo: () => false, mySubscribedTopics: ['ctx'] });
     expect(performance.now() - t0).toBeLessThan(COMPILE_BOUND_MS);
   });
 
@@ -733,14 +740,14 @@ describe('untrusted presence history cannot exceed a CPU or byte budget', () => 
       lastSeenMs: now,
     };
     const unscopedT0 = performance.now();
-    const users = filterReachable([partner, ...roster], { scope: undefined, ...unscoped });
+    const users = filterReachable([partner, ...roster], { onReachClipped: noteClip, scope: undefined, ...unscoped });
     expect(performance.now() - unscopedT0).toBeLessThan(CPU_BUDGET_MS);
     expect(users.map((e) => e.handle)).toContain('partner');
     expect(unscoped.calls()).toBeGreaterThan(0);
 
     const scoped = callerReach(shape);
     const scopedT0 = performance.now();
-    filterReachable(roster, { scope: scoped.mySubscribedTopics[0]!, canPostTo: scoped.canPostTo, mySubscribedTopics: [] });
+    filterReachable(roster, { onReachClipped: noteClip, scope: scoped.mySubscribedTopics[0]!, canPostTo: scoped.canPostTo, mySubscribedTopics: [] });
     expect(performance.now() - scopedT0).toBeLessThan(CPU_BUDGET_MS);
   });
 
@@ -759,7 +766,7 @@ describe('untrusted presence history cannot exceed a CPU or byte budget', () => 
       { handle: asHandle('benign'), online: true, topics: ['their-own'], postTopics: [`${mine.slice(0, 6)}.*`], lastSeenMs: now - 5_000 },
     ];
 
-    const reachable = filterReachable(roster, { scope: undefined, canPostTo: caller.canPostTo, mySubscribedTopics: [mine] });
+    const reachable = filterReachable(roster, { onReachClipped: noteClip, scope: undefined, canPostTo: caller.canPostTo, mySubscribedTopics: [mine] });
     expect(reachable.map((e) => e.handle)).toContain('benign');
   });
 });
@@ -913,7 +920,7 @@ describe('filterReachable (pure reachability predicate)', () => {
       entry('poster', ['elsewhere'], ['ctx-.*']), // only its post-pattern covers the scope
       entry('stranger', ['other'], ['unrelated-.*']), // neither subscribes nor matches
     ];
-    const got = filterReachable(roster, { scope: 'ctx-adhoc', canPostTo: NEVER, mySubscribedTopics: [] });
+    const got = filterReachable(roster, { onReachClipped: noteClip, scope: 'ctx-adhoc', canPostTo: NEVER, mySubscribedTopics: [] });
     expect(got.map((e) => e.handle)).toEqual(['subber', 'poster']);
   });
 
@@ -923,7 +930,7 @@ describe('filterReachable (pure reachability predicate)', () => {
       entry('can-post-to-me', ['elsewhere'], ['mine-.*']), // its post-pattern covers a topic I subscribe to
       entry('unrelated', ['nowhere'], ['no-.*']), // no channel in either direction
     ];
-    const got = filterReachable(roster, {
+    const got = filterReachable(roster, { onReachClipped: noteClip,
       scope: undefined,
       canPostTo: (t) => t === 'their-topic', // stands in for `allow.has`
       mySubscribedTopics: ['mine-1'], // stands in for `allow.topics()`
@@ -933,9 +940,9 @@ describe('filterReachable (pure reachability predicate)', () => {
 
   it('(c) silently ignores a hostile un-compilable / over-long postTopics source (never throws), scoped or unscoped', () => {
     const roster = [entry('hostile', ['other'], ['(', 'x'.repeat(10_000)])];
-    const scoped = () => filterReachable(roster, { scope: 'ctx', canPostTo: NEVER, mySubscribedTopics: [] });
+    const scoped = () => filterReachable(roster, { onReachClipped: noteClip, scope: 'ctx', canPostTo: NEVER, mySubscribedTopics: [] });
     const unscoped = () =>
-      filterReachable(roster, { scope: undefined, canPostTo: NEVER, mySubscribedTopics: ['ctx'] });
+      filterReachable(roster, { onReachClipped: noteClip, scope: undefined, canPostTo: NEVER, mySubscribedTopics: ['ctx'] });
     expect(scoped).not.toThrow();
     expect(unscoped).not.toThrow();
     expect(scoped()).toEqual([]); // broken/huge patterns compile to nothing ⇒ no false match
@@ -950,7 +957,7 @@ describe('filterReachable (pure reachability predicate)', () => {
     const evil = '((([a-z-]+)+)+)+[0-9]'; // 20 source chars, catastrophic on Node's engine
     const roster = [entry('attacker', ['some-other-ctx'], Array<string>(64).fill(evil))];
     const scopedT0 = performance.now();
-    const scoped = filterReachable(roster, {
+    const scoped = filterReachable(roster, { onReachClipped: noteClip,
       scope: 'team-eng-alerts', // a short, ordinary 15-char topic the unfixed matcher hangs on
       canPostTo: NEVER,
       mySubscribedTopics: [],
@@ -959,7 +966,7 @@ describe('filterReachable (pure reachability predicate)', () => {
     expect(scoped).toEqual([]);
 
     const unscopedT0 = performance.now();
-    const unscoped = filterReachable(roster, {
+    const unscoped = filterReachable(roster, { onReachClipped: noteClip,
       scope: undefined,
       canPostTo: NEVER,
       mySubscribedTopics: ['team-eng-alerts'],
@@ -978,7 +985,7 @@ describe('filterReachable (pure reachability predicate)', () => {
     const evil = '([a-z-]*){40}[0-9]';
     const roster = [entry('attacker', ['some-other-ctx'], Array<string>(64).fill(evil))];
     const scopedT0 = performance.now();
-    const scoped = filterReachable(roster, {
+    const scoped = filterReachable(roster, { onReachClipped: noteClip,
       scope: 'team-eng-alerts', // a short, ordinary 15-char topic the unfixed matcher hangs on
       canPostTo: NEVER,
       mySubscribedTopics: [],
@@ -987,7 +994,7 @@ describe('filterReachable (pure reachability predicate)', () => {
     expect(scoped).toEqual([]);
 
     const unscopedT0 = performance.now();
-    const unscoped = filterReachable(roster, {
+    const unscoped = filterReachable(roster, { onReachClipped: noteClip,
       scope: undefined,
       canPostTo: NEVER,
       mySubscribedTopics: ['team-eng-alerts'],
@@ -1019,11 +1026,11 @@ describe('filterReachable (pure reachability predicate)', () => {
         const topic = `team-${'a'.repeat(length - 5)}`;
 
         const scopedT0 = performance.now();
-        filterReachable(roster, { scope: topic, canPostTo: NEVER, mySubscribedTopics: [] });
+        filterReachable(roster, { onReachClipped: noteClip, scope: topic, canPostTo: NEVER, mySubscribedTopics: [] });
         expect(performance.now() - scopedT0).toBeLessThan(BOUND_MS);
 
         const unscopedT0 = performance.now();
-        filterReachable(roster, { scope: undefined, canPostTo: NEVER, mySubscribedTopics: [topic] });
+        filterReachable(roster, { onReachClipped: noteClip, scope: undefined, canPostTo: NEVER, mySubscribedTopics: [topic] });
         expect(performance.now() - unscopedT0).toBeLessThan(BOUND_MS);
       });
     }
@@ -1037,10 +1044,10 @@ describe('filterReachable (pure reachability predicate)', () => {
       const topic = `team-${'a'.repeat(5_000)}`;
       expect(new Allowlist([], { postPatterns: ['team-.*'] }).has(topic)).toBe(false);
       expect(
-        filterReachable(roster, { scope: topic, canPostTo: NEVER, mySubscribedTopics: [] }),
+        filterReachable(roster, { onReachClipped: noteClip, scope: topic, canPostTo: NEVER, mySubscribedTopics: [] }),
       ).toEqual([]);
       expect(
-        filterReachable([entry('peer', [topic], ['team-.*'])], {
+        filterReachable([entry('peer', [topic], ['team-.*'])], { onReachClipped: noteClip,
           scope: topic,
           canPostTo: NEVER,
           mySubscribedTopics: [],
@@ -1053,13 +1060,13 @@ describe('filterReachable (pure reachability predicate)', () => {
     const roster = [entry('peer', ['elsewhere'], ['team-.*'])];
     // scoped: the peer's `team-.*` covers the scope.
     expect(
-      filterReachable(roster, { scope: 'team-eng-alerts', canPostTo: NEVER, mySubscribedTopics: [] }).map(
+      filterReachable(roster, { onReachClipped: noteClip, scope: 'team-eng-alerts', canPostTo: NEVER, mySubscribedTopics: [] }).map(
         (e) => e.handle,
       ),
     ).toEqual(['peer']);
     // unscoped: the peer can post to a topic I subscribe to.
     expect(
-      filterReachable(roster, {
+      filterReachable(roster, { onReachClipped: noteClip,
         scope: undefined,
         canPostTo: NEVER,
         mySubscribedTopics: ['team-eng-alerts'],

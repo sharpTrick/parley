@@ -27,7 +27,7 @@ describe('every site that compiles an untrusted pattern anchors it the same way'
     [
       'filterReachable (a peer\'s advertised postTopics)',
       (source, input) =>
-        filterReachable([peer([source])], {
+        filterReachable([peer([source])], { onReachClipped: () => {},
           canPostTo: () => false,
           mySubscribedTopics: [input],
         }).length === 1,
@@ -35,7 +35,7 @@ describe('every site that compiles an untrusted pattern anchors it the same way'
     [
       'filterReachable, scoped to one topic',
       (source, input) =>
-        filterReachable([peer([source])], {
+        filterReachable([peer([source])], { onReachClipped: () => {},
           scope: input,
           canPostTo: () => false,
           mySubscribedTopics: [],

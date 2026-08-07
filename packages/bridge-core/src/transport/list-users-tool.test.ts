@@ -1,5 +1,6 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { describe, expect, it, vi } from 'vitest';
+import { MAX_POST_TOPICS } from '../config.js';
 import {
   DEFAULT_PRESENCE_TOPIC,
   encodePresence,
@@ -8,6 +9,7 @@ import {
   MAX_TOPIC_LEN,
   type PresenceKind,
 } from '../engine/presence.js';
+import { MAX_AMBIGUITY } from '../regex-safety.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
 import { NoSuchTopicError, type FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -20,6 +22,13 @@ import {
   type ToolText,
 } from '../testing/tool-cases.js';
 import { DEFAULT_ROSTER_LIMIT, PRESENCE_FETCH_LIMIT } from './tools.js';
+
+/** Each `[a-z]?` doubles the paths a screened source may explore, so this sits AT the screen's cap. */
+const OPTIONAL_ATOMS = Math.log2(MAX_AMBIGUITY);
+const costlySource = (n: number): string => `${'[a-z]?'.repeat(OPTIONAL_ATOMS)}Z${n}`;
+/** A full record's worth of distinct screened-but-costly sources — legal on any beat. */
+const costlyBank = (seed: number): string[] =>
+  Array.from({ length: MAX_RECORD_TOPICS }, (_, i) => costlySource(seed * MAX_RECORD_TOPICS + i));
 
 /**
  * One subject: `parley_list_users` — the reachability roster core derives from the presence topic.
@@ -496,6 +505,8 @@ describe('every cause of a truncated roster is disclosed, and only when it appli
     beats: number;
     distinctHandles: number;
     limit?: number;
+    /** Unreachable peers advertise a full bank of screened-but-costly sources. */
+    costlyPatterns?: boolean;
     truncated: boolean;
   }
 
@@ -519,6 +530,14 @@ describe('every cause of a truncated roster is disclosed, and only when it appli
       limit: 2,
       truncated: true,
     },
+    'matching peers’ advertised patterns hit its CPU allowance and left some peers unmatched': {
+      phrase: 'matching peers’ advertised patterns hit its CPU allowance and left some peers unmatched',
+      // Under every other cause's threshold, so this row grades its own clause and no neighbour's.
+      beats: MAX_ROSTER_ENTRIES - 8,
+      distinctHandles: MAX_ROSTER_ENTRIES - 8,
+      costlyPatterns: true,
+      truncated: true,
+    },
     'none of them': { phrase: '', beats: 3, distinctHandles: 3, truncated: false },
   };
 
@@ -538,7 +557,7 @@ describe('every cause of a truncated roster is disclosed, and only when it appli
         [shared ? 'ctx' : 'their-own-topic'],
         'heartbeat',
         NOW - (cause.beats - i),
-        [],
+        cause.costlyPatterns === true && !shared ? costlyBank(i) : [],
         `inst-${i % cause.distinctHandles}`,
       );
     }
@@ -559,6 +578,7 @@ describe('every cause of a truncated roster is disclosed, and only when it appli
     expect(cause.beats >= PRESENCE_FETCH_LIMIT).toBe(cause.phrase === 'the scanned presence history was full');
     expect(cause.distinctHandles >= MAX_ROSTER_ENTRIES).toBe(cause.phrase === 'the roster hit its entry cap');
     expect(out.users.length === (cause.limit ?? DEFAULT_ROSTER_LIMIT)).toBe(cause.phrase === '`limit` trimmed it');
+    expect(cause.costlyPatterns === true).toBe(cause.phrase.startsWith('matching peers'));
     expect(out.users.length).toBeGreaterThan(0);
     expect(out.truncated).toBe(cause.truncated);
   });
@@ -632,5 +652,137 @@ describe('parley_list_users bounds the decode work an over-serving plugin can im
     const out = parse(res) as RosterResult;
     expect(out.users[0]!.handle).toBe(`peer-${pageSize - 1}`);
     expect(out.users.map((u) => u.handle)).not.toContain('peer-0');
+  });
+});
+
+/**
+ * A budget is a caller-facing predicate an untrusted COUNT can switch off. `filterReachable` spends
+ * a per-call CPU allowance matching untrusted peer patterns; the entry count and every entry's
+ * position in the recency sort are chosen by whoever writes the beats, so a page of legal-but-costly
+ * beats could spend the whole allowance and every peer behind it was reported unreachable — while
+ * `truncated` still answered `false`, which an agent reads as "that is the whole bus".
+ *
+ * Grade the CLASS: a peer that IS reachable is either returned or the answer says it was cut. Never
+ * silently dropped. The pressure is DERIVED from the caps that create it, so widening
+ * MAX_RECORD_TOPICS or MAX_AMBIGUITY re-derives a hostile page rather than leaving a hard-coded one
+ * that no longer costs anything.
+ */
+describe('a hostile presence page cannot silently delete a reachable peer', () => {
+  const NOW = 2_000_000;
+  const TTL = 90_000;
+  /** A long subscribed topic: matching cost is per input character, and this is what peers match. */
+  const MINE = `ctx-${'a'.repeat(56)}`;
+  /** Enough hostile entries to outspend the allowance, sized off the roster cap that admits them. */
+  const HOSTILE_ENTRIES = Math.floor(MAX_ROSTER_ENTRIES / 4);
+
+  type Direction = 'inbound' | 'outbound' | 'both';
+  type Position = 'first' | 'middle' | 'last';
+  type Reach = 'explicit shared topic' | 'pattern-only';
+
+  const DIRECTIONS: Direction[] = ['inbound', 'outbound', 'both'];
+  const POSITIONS: Position[] = ['first', 'middle', 'last'];
+  const REACHES: Reach[] = ['explicit shared topic', 'pattern-only'];
+
+  const CELLS = DIRECTIONS.flatMap((direction) =>
+    POSITIONS.flatMap((position) => REACHES.map((reach) => ({ direction, position, reach }))),
+  );
+
+  it.each(CELLS.map((c) => [`${c.direction} inflated, benign ${c.position}, ${c.reach}`, c] as const))(
+    '%s',
+    async (_label, cell) => {
+      // My own post_topics are what an OUTBOUND-inflated page makes me spend, so they have to be
+      // the same shape of screened-but-costly source a real operator may legally configure.
+      const h = await harness({
+        now: () => NOW,
+        presenceTtlMs: TTL,
+        topics: [MINE],
+        postPatterns: costlyBank(9_000).slice(0, MAX_POST_TOPICS),
+      });
+
+      const benignIndex =
+        cell.position === 'first' ? 0 : cell.position === 'last' ? HOSTILE_ENTRIES : HOSTILE_ENTRIES >> 1;
+
+      // Freshest beats sort first, so `ago` decides where the benign peer lands in the scan.
+      let slot = 0;
+      const at = (): number => NOW - 1_000 - slot++ * 10;
+      for (let i = 0; i <= HOSTILE_ENTRIES; i++) {
+        if (i === benignIndex) {
+          const topics = cell.reach === 'explicit shared topic' ? [MINE] : ['their-own-ctx'];
+          const patterns = cell.reach === 'pattern-only' ? ['ctx-.*'] : [];
+          await postBeat(h.plugin, 'colleague', topics, 'hello', at(), patterns);
+          continue;
+        }
+        const topics = cell.direction === 'inbound' ? ['their-own-ctx'] : costlyBank(i);
+        const patterns = cell.direction === 'outbound' ? [] : costlyBank(1_000 + i);
+        await postBeat(h.plugin, `hostile-${i}`, topics, 'hello', at(), patterns);
+      }
+
+      const out = parse(
+        await h.client.callTool({ name: 'parley_list_users', arguments: { limit: MAX_ROSTER_ENTRIES } }),
+      ) as RosterResult;
+      const returned = out.users.some((u) => u.handle === 'colleague');
+      expect(
+        returned || out.truncated,
+        'colleague is reachable, yet the roster neither carries it nor admits it was cut',
+      ).toBe(true);
+    },
+  );
+
+  // Fair share bounds what a SUBSET can spend; a page that fills the roster leaves nothing for
+  // anyone, and then the only thing standing between the agent and "nobody is on the bus" is the
+  // answer saying it was cut. Sized under every OTHER cause of `truncated` — below the roster entry
+  // cap, below the presence page limit, and under the requested `limit` — so only the allowance can
+  // set it.
+  it('a page that saturates the allowance says the roster was cut, not that the bus is empty', async () => {
+    const entries = MAX_ROSTER_ENTRIES - 8;
+    const h = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: [MINE] });
+    for (let i = 0; i < entries; i++) {
+      await postBeat(h.plugin, `hostile-${i}`, ['their-own-ctx'], 'hello', NOW - 1_000 - i * 10, costlyBank(i));
+    }
+    await postBeat(h.plugin, 'colleague', ['their-own-ctx'], 'hello', NOW - 90_000 + 1, ['ctx-.*']);
+    const out = parse(
+      await h.client.callTool({ name: 'parley_list_users', arguments: { limit: MAX_ROSTER_ENTRIES } }),
+    ) as RosterResult;
+    expect(out.users.length, 'another cause of truncation would mask the one under test').toBeLessThan(
+      MAX_ROSTER_ENTRIES,
+    );
+    expect(
+      out.users.some((u) => u.handle === 'colleague') || out.truncated,
+      'colleague is reachable, yet the roster neither carries it nor admits it was cut',
+    ).toBe(true);
+  });
+
+  // Disclosure alone would satisfy the table above while every legitimate peer still vanished. The
+  // allowance is therefore shared across the entries REMAINING, so a hostile subset spends its own
+  // slice and no more: a peer behind it keeps enough allowance to be matched, and stays visible.
+  it('a hostile subset spends only its share, so the peer behind it is RETURNED', async () => {
+    // ONE entry's full bank of costly sources already outspends the allowance several times over,
+    // so a handful is a saturating prefix — and a handful is all the overrun a slow machine can
+    // add, which keeps this a statement about the sharing rule rather than about the clock.
+    const prefix = 4;
+    const h = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: [MINE] });
+    for (let i = 0; i < prefix; i++) {
+      await postBeat(h.plugin, `hostile-${i}`, ['their-own-ctx'], 'hello', NOW - 1_000 - i * 10, costlyBank(i));
+    }
+    await postBeat(h.plugin, 'colleague', ['their-own-ctx'], 'hello', NOW - 90_000 + 1, ['ctx-.*']);
+    const out = parse(
+      await h.client.callTool({ name: 'parley_list_users', arguments: { limit: MAX_ROSTER_ENTRIES } }),
+    ) as RosterResult;
+    expect(
+      out.users.map((u) => u.handle),
+      'the hostile prefix spent the allowance the peer behind it needed',
+    ).toContain('colleague');
+  });
+
+  it('a benign page of the same size is neither clipped nor reported truncated', async () => {
+    const h = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: [MINE] });
+    for (let i = 0; i <= HOSTILE_ENTRIES; i++) {
+      await postBeat(h.plugin, `peer-${i}`, ['their-own-ctx'], 'hello', NOW - 1_000 - i * 10, ['ctx-.*']);
+    }
+    const out = parse(
+      await h.client.callTool({ name: 'parley_list_users', arguments: { limit: MAX_ROSTER_ENTRIES } }),
+    ) as RosterResult;
+    expect(out.users).toHaveLength(HOSTILE_ENTRIES + 1);
+    expect(out.truncated, 'nothing was cut, so nothing should say it was').toBe(false);
   });
 });
