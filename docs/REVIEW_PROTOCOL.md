@@ -177,6 +177,29 @@ stashed to measure a baseline; a sibling pushed between one agent's push and its
 restored the *other's* work into the wrong worktree. Both recovered from dangling stash commits, but
 a run that did not notice would have committed one package's implementation into another.
 
+**A mutation is ONE literal edit, and a bundled one proves nothing about its members.** A mutation
+that changes four lines and reddens tells you the *bundle* matters. It does not tell you that any
+particular line does, and the difference is not academic: round 17's sqlite manifest bundled four
+edits, and isolating the fourth found it completely ungraded — chasing that then found two further
+guards nothing could grade, and a fifth mutation that had been surviving unnoticed. Write one pair
+per manifest entry. If a change genuinely needs two coordinated edits to be meaningful, say so and
+have it hand-verified rather than letting it look uniform with the rest.
+
+**A guard that survives its own mutation is exactly one of three things — unreachable, redundant, or
+deliberate defence-in-depth — and which one must be stated.** The third is indistinguishable from
+the first two from outside, so "kept for safety" is only an answer when it comes with "and it is
+ungraded, deliberately, because X". Where a guard is unreachable while a neighbour holds, they are
+*mutually masking*: no single mutation reddens either, and a later editor can delete whichever one
+was load-bearing with the suite green. Delete one so the survivor is gradeable. Round 16 hit this in
+`bridge-slack` (an entry clamp and a loop guard, each independently sufficient) and round 17 hit it
+three times in `bridge-sqlite`.
+
+**Never use the empty string as a mutation's replacement.** The revert then searches for `""`, which
+matches once per character, and is refused. A round-17 agent discarded that output, so the failure
+was silent and three subsequent measurements ran against a file still carrying the mutation —
+producing a plausible wrong number that was caught only by tracing state at runtime when the
+explanation would not close.
+
 **And `git checkout -- <file>` is a mutation restorer only for a file you have not otherwise
 edited.** Three round-8 agents used it to undo a mutation and wiped their own in-progress fix along
 with it, because it restores from the index or HEAD — which, in a worktree pinned to the round base,
