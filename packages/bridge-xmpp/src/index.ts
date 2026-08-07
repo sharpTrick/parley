@@ -211,14 +211,33 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
     return { messages, nextCursor };
   }
 
+  /**
+   * Register the interest BEFORE the join, so that an occupancy loss delivered inside the join —
+   * the disco#info window between the self-presence and this call returning is wide enough to hold
+   * a kick — is seen by `onOccupancyLost` as a subscribed room and arms the re-entry ladder. A room
+   * classified as catch-up-only there is only ever re-entered by an unrelated later post or fetch,
+   * which for a subscribe-only topic may be never: live push stays dead in silence.
+   *
+   * The rollback splices THIS handler by identity and drops the room only once it is the last one,
+   * so that a concurrent subscribe() awaiting the same cached join is not unsubscribed by this one's
+   * failure.
+   */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const room = this.roomJid(topic);
-    await this.ensureJoinedRoom(room);
     const existing = this.subscriptions.get(room);
     if (existing !== undefined) {
       existing.handlers.push(handler);
     } else {
       this.subscriptions.set(room, { topic, handlers: [handler] });
+    }
+    try {
+      await this.ensureJoinedRoom(room);
+    } catch (err) {
+      const sub = this.subscriptions.get(room);
+      const at = sub?.handlers.indexOf(handler) ?? -1;
+      if (sub !== undefined && at !== -1) sub.handlers.splice(at, 1);
+      if (sub !== undefined && sub.handlers.length === 0) this.subscriptions.delete(room);
+      throw err;
     }
   }
 

@@ -1,7 +1,7 @@
 import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
-import { attach, expectNoLeaks, FakeXmpp } from './fake-xmpp.js';
+import { attach, expectNoLeaks, FakeXmpp, seedJoined } from './fake-xmpp.js';
 
 // Class: a lost wakeup caused by arming the wake source AFTER the state snapshot it races.
 // `fetchRecent({blockMs})` is MAM-query + live-wait; if the waiter is armed only once a query has
@@ -38,7 +38,7 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
       const fake = new FakeXmpp();
       const p = attach(plugin, fake);
       const room = p.roomJid(TOPIC);
-      p.joined.set(room, Promise.resolve());
+      seedJoined(p, fake, room);
       const seed = fake.archiveOnly(room, 'old');
 
       let delivered = false;
@@ -85,7 +85,7 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
     const fake = new FakeXmpp();
     const p = attach(plugin, fake);
     const room = p.roomJid(TOPIC);
-    p.joined.set(room, Promise.resolve());
+    seedJoined(p, fake, room);
     const seed = fake.archiveOnly(room, 'old');
 
     const started = Date.now();
@@ -108,7 +108,7 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
     const fake = new FakeXmpp();
     const p = attach(plugin, fake);
     const room = p.roomJid(TOPIC);
-    p.joined.set(room, Promise.resolve());
+    seedJoined(p, fake, room);
     const seed = fake.archiveOnly(room, 'old');
 
     const started = Date.now();
@@ -154,7 +154,7 @@ describe('XMPP disconnect settles a long-poll that is still parked', () => {
     const fake = new FakeXmpp();
     const p = attach(plugin, fake);
     const room = p.roomJid(TOPIC);
-    p.joined.set(room, Promise.resolve());
+    seedJoined(p, fake, room);
     const seed = fake.archiveOnly(room, 'old');
     fake.mamLatencyMs = 50;
 
@@ -222,7 +222,7 @@ describe('XMPP long-poll returns on archival lag, bounded by the lag and never b
       const fake = new FakeXmpp();
       const p = attach(plugin, fake);
       const room = p.roomJid(TOPIC);
-      p.joined.set(room, Promise.resolve());
+      seedJoined(p, fake, room);
       const seed = fake.archiveOnly(room, 'old');
 
       const started = Date.now();
@@ -305,7 +305,7 @@ describe('XMPP honours blockMs on every arm of fetchRecent', () => {
     const fake = new FakeXmpp();
     const p = attach(plugin, fake, undefined);
     const room = p.roomJid(TOPIC);
-    p.joined.set(room, Promise.resolve());
+    seedJoined(p, fake, room);
     if (history.seeded) fake.archiveOnly(room, 'old');
 
     // The window is empty unless the archive holds something the cursor does not already cover.

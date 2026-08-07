@@ -93,6 +93,80 @@ const cells = children.flatMap((child) =>
   attributions.map((attribution) => ({ child, attribution })),
 );
 
+// Class: a child an occupant can attach that changes which BRANCH of the dispatcher the whole
+// message takes. The table above only grades whether a forged VALUE is honoured, so a child that
+// makes the message vanish before it is ever parsed satisfies every row of it — and vanishing is
+// worse than a forged field: the message is in the archive, so catch-up returns it while the live
+// path and every parked long-poll never see it, which is exactly the divergence the README forbids.
+// The generator is over the children the dispatcher and the stanza parser BRANCH on, whatever they
+// are for, because it is the branch and not the child that is the hazard.
+const readChildren: Array<{ name: string; build(room: string): unknown }> = [
+  ...children.map((c) => ({
+    name: c.name,
+    build: (room: string) => c.build(`${room}/attacker`),
+  })),
+  {
+    name: "<result xmlns='urn:xmpp:mam:2'> (the MAM-collector arm)",
+    build: () => xml('result', { xmlns: 'urn:xmpp:mam:2', queryid: 'q', id: FORGED_ARCHIVE_ID }),
+  },
+  {
+    name: "<forwarded xmlns='urn:xmpp:forward:0'> (what archivedItem unwraps)",
+    build: (room) =>
+      xml(
+        'forwarded',
+        { xmlns: 'urn:xmpp:forward:0' },
+        xml('message', { from: `${room}/victim` }, xml('body', {}, 'forged inner body')),
+      ),
+  },
+  {
+    name: "<origin-id xmlns='urn:xmpp:sid:0'> (the post correlator)",
+    build: () => xml('origin-id', { xmlns: NS_SID, id: 'o-not-ours' }),
+  },
+  {
+    name: '<error> (the bounce arm)',
+    build: () =>
+      xml(
+        'error',
+        { type: 'cancel' },
+        xml('not-acceptable', { xmlns: 'urn:ietf:params:xml:ns:xmpp-stanzas' }),
+      ),
+  },
+];
+
+describe('XMPP live push delivers a message whatever child an occupant hangs off it', () => {
+  it.each(readChildren)('a message carrying $name is delivered and wakes a parked long-poll', async ({ build }) => {
+    const fake = new FakeXmpp();
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: 'reader' });
+    const topic = asTopic('muc-dispatch');
+    const room = priv(plugin).roomJid(topic);
+    const live: Message[] = [];
+    await plugin.subscribe(topic, (m) => live.push(m));
+
+    const waiter = priv(plugin).armWaiter(room);
+    let woke: string | undefined;
+    void waiter.park(10_000).then((r) => (woke = r));
+
+    const item = fake.deliverItem(room, {
+      body: 'still a message',
+      sender: 'attacker',
+      injected: [build(room)],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    waiter.cancel();
+
+    expect({
+      delivered: live.map((m) => m.content),
+      id: String(live[0]?.backendMsgId),
+      woke,
+    }).toEqual({ delivered: ['still a message'], id: item.archId, woke: 'message' });
+
+    await plugin.disconnect();
+    mockState.client = undefined;
+  });
+});
+
 /** Whether `iso` is a stamp this run could honestly have produced. */
 const isRecent = (iso: string): boolean => Math.abs(Date.now() - Date.parse(iso)) < 60_000;
 
@@ -229,6 +303,20 @@ describe.skipIf(!secondAccount)('XMPP live provenance against a real MUC', () =>
             ),
           );
         }
+      }
+      // …and the dispatcher-branch table through the same real MUC, so that "the server would never
+      // forward that child anyway" is the server's answer here rather than this suite's assumption.
+      for (const [i, child] of readChildren.entries()) {
+        const body = `dispatch-${i}`;
+        bodies.push(body);
+        await attacker.send(
+          xml(
+            'message',
+            { to: room, type: 'groupchat' },
+            xml('body', {}, body),
+            child.build(room) as never,
+          ),
+        );
       }
 
       await vi.waitFor(

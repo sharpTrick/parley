@@ -166,6 +166,101 @@ describe('the FakeXmpp stand-in models MUC occupancy per room', () => {
   });
 });
 
+// Class: the fixture answering a question the SERVER answers differently — the same class that made
+// this file's per-room nick necessary, and that made a `<delay>` with no `from` at all read as
+// legitimate in live-field-provenance.test.ts. A MUC routes a room's traffic to that room's
+// OCCUPANTS. A fixture that fed room stanzas unconditionally could not express "live push went
+// silent because we are not in the room" — the entire state the occupancy-recovery feature exists
+// to leave — so every membership assertion in this package was reduced to grading a proxy (a join
+// presence went out, the joined-cache entry changed identity) that a plugin which re-joins but
+// never recovers DELIVERY satisfies in full. The table is over the routes by which room traffic
+// reaches the stream, so a new one cannot be added on an ungated path without a row here to notice.
+describe('the FakeXmpp stand-in routes a room traffic only to occupants of that room', () => {
+  const ROOM = 'room-occ@muc.parley.local';
+
+  const routes: Array<{ name: string; drive(fake: FakeXmpp): void }> = [
+    { name: 'deliver', drive: (fake) => void fake.deliver(ROOM, 'said') },
+    {
+      name: 'deliverItem',
+      drive: (fake) => void fake.deliverItem(ROOM, { body: 'said', sender: 'eve' }),
+    },
+    { name: 'reflectOnly', drive: (fake) => fake.reflectOnly(ROOM, 'said') },
+  ];
+
+  const occupancies: Array<{ name: string; seat(fake: FakeXmpp): void; delivers: boolean }> = [
+    { name: 'an occupant', seat: (fake) => fake.enterRoom(ROOM, 'alice'), delivers: true },
+    { name: 'never joined', seat: () => undefined, delivers: false },
+    {
+      name: 'kicked out',
+      seat: (fake) => {
+        fake.enterRoom(ROOM, 'alice');
+        fake.endOccupancy(ROOM, { statuses: ['307'] });
+      },
+      delivers: false,
+    },
+    {
+      name: 'silently forgotten',
+      seat: (fake) => {
+        fake.enterRoom(ROOM, 'alice');
+        fake.forgetOccupancySilently(ROOM);
+      },
+      delivers: false,
+    },
+  ];
+
+  const cells = routes.flatMap((route) => occupancies.map((occupancy) => ({ route, occupancy })));
+
+  it.each(cells)(
+    '$route.name to $occupancy.name delivers: $occupancy.delivers',
+    ({ route, occupancy }) => {
+      const fake = new FakeXmpp();
+      const bodies: string[] = [];
+      fake.on('stanza', (s) => {
+        const el = s as { is(n: string): boolean; getChildText(n: string): string | null };
+        const body = el.is('message') ? el.getChildText('body') : null;
+        if (body !== null) bodies.push(body);
+      });
+      occupancy.seat(fake);
+      const before = bodies.length;
+
+      route.drive(fake);
+
+      expect(bodies.length > before).toBe(occupancy.delivers);
+    },
+  );
+
+  // The other side of the same gate: the join is what SEATS this connection, so the history a MUC
+  // pushes back on entry must still arrive. A gate that swallowed it would make every re-entry look
+  // like a room with no past, and the join-hint suite next door would grade nothing.
+  it('replays history to the joiner the same join just seated', async () => {
+    const fake = new FakeXmpp();
+    const bodies: string[] = [];
+    fake.on('stanza', (s) => {
+      const el = s as { is(n: string): boolean; getChildText(n: string): string | null };
+      const body = el.is('message') ? el.getChildText('body') : null;
+      if (body !== null) bodies.push(body);
+    });
+    fake.archiveOnly(ROOM, 'said-before-we-arrived');
+
+    await fake.send(xml('presence', { to: `${ROOM}/alice` }, xml('x', { xmlns: NS_MUC })));
+
+    expect(bodies).toEqual(['said-before-we-arrived']);
+  });
+
+  it('keeps archiving what other occupants say while this connection is outside the room', () => {
+    const fake = new FakeXmpp();
+    const fed: unknown[] = [];
+    fake.on('stanza', (s) => fed.push(s));
+
+    fake.deliverItem(ROOM, { body: 'said-while-out', sender: 'eve' });
+
+    expect({ fed: fed.length, archived: fake.archives.get(ROOM)?.map((i) => i.body) }).toEqual({
+      fed: 0,
+      archived: ['said-while-out'],
+    });
+  });
+});
+
 describe('XMPP tracks the occupant nick it actually holds per room', () => {
   afterEach(() => {
     mockState.client = undefined;

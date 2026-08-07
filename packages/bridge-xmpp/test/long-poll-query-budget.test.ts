@@ -1,7 +1,7 @@
 import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
-import { attach, expectNoLeaks, FakeXmpp } from './fake-xmpp.js';
+import { attach, expectNoLeaks, FakeXmpp, seedJoined } from './fake-xmpp.js';
 
 // Class: a wake that latches a POLL CADENCE for the rest of a long-poll. `fetchRecent({blockMs})`
 // is a live wait, not a poll: its cost must be a function of how many messages arrived, never of
@@ -36,7 +36,7 @@ describe('XMPP long-poll query budget scales with wakes, never with blockMs', ()
       const fake = new FakeXmpp();
       const p = attach(plugin, fake);
       const room = p.roomJid(TOPIC);
-      p.joined.set(room, Promise.resolve());
+      seedJoined(p, fake, room);
       const seed = fake.archiveOnly(room, 'old');
 
       let queries = 0;
@@ -86,7 +86,7 @@ describe('XMPP long-poll query budget scales with wakes, never with blockMs', ()
     const fake = new FakeXmpp();
     const p = attach(plugin, fake);
     const room = p.roomJid(TOPIC);
-    p.joined.set(room, Promise.resolve());
+    seedJoined(p, fake, room);
     const seed = fake.archiveOnly(room, 'old');
 
     const LATENCY_MS = 200;

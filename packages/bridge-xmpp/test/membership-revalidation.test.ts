@@ -18,7 +18,7 @@ vi.mock('@xmpp/client', async () => {
   return { ...actual, client: () => mockState.client };
 });
 
-import { XmppPlugin } from '../src/index.js';
+import { REJOIN_MAX_WAIT_MS, XmppPlugin } from '../src/index.js';
 import { attach, FakeXmpp, priv, type XmppPrivate } from './fake-xmpp.js';
 
 const TOPIC = asTopic('t-membership');
@@ -180,6 +180,135 @@ describe('XMPP re-enters a room after occupancy ends, however it ended', () => {
 
     expect(p.joined.get(room)).toBe(cachedJoin);
     expect(joinPresences(fake, room)).toBe(joinsBefore);
+    await plugin.disconnect();
+  });
+});
+
+// Class: a room-state event that arrives while the seam call REGISTERING interest in that room is
+// still in flight. Every row above loses occupancy after subscribe() has returned, so none of them
+// can reach the window inside it — and the recovery ladder is gated on `subscriptions.has(room)`,
+// so interest written after the join means a loss delivered anywhere inside that join is classified
+// as a catch-up-only room: one stderr line, no timer, the call resolving successfully and live push
+// dead for a topic that may never see another post or fetch. The generator is over WHERE in the
+// call the loss lands, and every cell asserts the same seam-observable end state — another
+// occupant's message reaches this subscriber again — rather than a proxy for it.
+const arrivals: Array<{ when: string; lose(bridge: SubBridge): void }> = [
+  {
+    when: 'before the call is made at all',
+    lose: ({ fake, room }) => fake.endOccupancy(room, { statuses: ['307'] }),
+  },
+  {
+    when: 'while the join presence is still unanswered',
+    lose: ({ fake, room }) => {
+      fake.joinLatencyMs = 80;
+      setTimeout(() => fake.endOccupancy(room, { statuses: ['307'] }), 30);
+    },
+  },
+  {
+    when: 'after the self-presence, during the disco#info probe',
+    lose: ({ fake, room }) => {
+      let fired = false;
+      fake.onDiscoRequest = () => {
+        if (fired) return;
+        fired = true;
+        fake.endOccupancy(room, { statuses: ['307'] });
+      };
+      fake.discoLatencyMs = 20;
+    },
+  },
+  { when: 'after the call returned', lose: () => undefined },
+];
+
+interface SubBridge {
+  plugin: XmppPlugin;
+  fake: FakeXmpp;
+  p: XmppPrivate;
+  room: string;
+  delivered: string[];
+}
+
+describe('XMPP recovers live push when occupancy ends inside subscribe()', () => {
+  it.each(arrivals)('the loss lands $when', async ({ when, lose }) => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fake = new FakeXmpp();
+    fake.enforceOccupancy = true;
+    fake.nick = NICK;
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: NICK });
+    const p = priv(plugin);
+    const room = p.roomJid(TOPIC);
+    const delivered: string[] = [];
+    const bridge: SubBridge = { plugin, fake, p, room, delivered };
+
+    lose(bridge);
+    await plugin.subscribe(TOPIC, (m: Message) => delivered.push(String(m.content)));
+    if (when === 'after the call returned') fake.endOccupancy(room, { statuses: ['307'] });
+
+    // The fixture routes a room's traffic to its OCCUPANTS only, so this is dead until the plugin
+    // is back in the room — no ladder, no delivery, whatever the join cache happens to say.
+    await vi.waitFor(
+      () => {
+        fake.deliver(room, 'live-after-the-window');
+        expect(delivered).toContain('live-after-the-window');
+      },
+      { timeout: REJOIN_MAX_WAIT_MS + 3_000, interval: 50 },
+    );
+
+    await plugin.disconnect();
+    vi.restoreAllMocks();
+  }, 30_000);
+
+  // The rollback's own hazard: two callers share one cached join, so a failed subscribe that
+  // deletes the ROOM entry rather than splicing its OWN handler silently unsubscribes the other —
+  // a worse defect than the one the early registration fixes, and invisible in the cache.
+  it('a subscribe whose join fails does not unsubscribe the caller already listening', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const bridge = await build();
+    const { plugin, fake, p, room, delivered } = bridge;
+    await plugin.post(TOPIC, asHandle('a'), 'before');
+
+    fake.forgetOccupancySilently(room);
+    fake.joinReply = 'error';
+    fake.joinErrorCondition = 'forbidden';
+    await expect(plugin.post(TOPIC, asHandle('a'), 'lost')).rejects.toThrow('not-acceptable');
+
+    const second: string[] = [];
+    await expect(plugin.subscribe(TOPIC, (m: Message) => second.push(String(m.content)))).rejects.toThrow(
+      'forbidden',
+    );
+    fake.joinReply = 'self';
+    await vi.waitFor(
+      () => {
+        fake.deliver(room, 'still-listening');
+        expect(delivered).toContain('still-listening');
+      },
+      { timeout: REJOIN_MAX_WAIT_MS + 3_000, interval: 50 },
+    );
+    expect(second).toEqual([]);
+    expect(p.subscriptions.get(room)?.handlers).toHaveLength(1);
+
+    await plugin.disconnect();
+    vi.restoreAllMocks();
+  }, 30_000);
+
+  it('a subscribe whose join fails leaves no interest behind at all', async () => {
+    const fake = new FakeXmpp();
+    fake.joinReply = 'error';
+    fake.joinErrorCondition = 'forbidden';
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: NICK });
+    const p = priv(plugin);
+    const room = p.roomJid(TOPIC);
+
+    const both = await Promise.allSettled([
+      plugin.subscribe(TOPIC, () => undefined),
+      plugin.subscribe(TOPIC, () => undefined),
+    ]);
+
+    expect(both.map((r) => r.status)).toEqual(['rejected', 'rejected']);
+    expect(p.subscriptions.has(room)).toBe(false);
     await plugin.disconnect();
   });
 });

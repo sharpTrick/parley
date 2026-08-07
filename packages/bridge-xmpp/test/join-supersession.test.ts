@@ -101,7 +101,14 @@ const triggers: Trigger[] = [
     name: 'an occupancy-loss presence',
     fire: (plugin, fake, topic) => {
       const room = priv(plugin).roomJid(topic);
-      priv(plugin).subscriptions.set(room, { topic, handlers: [() => undefined] });
+      // Add rather than replace: subscribe() registers its interest BEFORE its join, so a set()
+      // here would unsubscribe the caller under test and grade this fixture's handler instead.
+      const sub = priv(plugin).subscriptions.get(room);
+      if (sub === undefined) {
+        priv(plugin).subscriptions.set(room, { topic, handlers: [() => undefined] });
+      } else {
+        sub.handlers.push(() => undefined);
+      }
       fake.endOccupancy(room, { statuses: ['307'] });
     },
     // A loss announced while the join is still open is the join's own business: the deferred

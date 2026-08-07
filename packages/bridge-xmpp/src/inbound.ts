@@ -24,14 +24,22 @@ export class XmppInbound extends XmppRooms {
     }
     if (!stanza.is('message')) return;
 
-    const result = stanza.getChild('result', wire.NS_MAM);
-    if (result !== undefined) {
-      this.onMamResult(result, jid.bareOf(stanza.attrs.from ?? ''));
+    // Keep the delivery arms FIRST, so that a `<result>` is only ever looked for on a stanza that is
+    // not delivered content. A MUC reflects an occupant's own unknown children verbatim, so a
+    // co-occupant can hang one off its groupchat message: dispatching on the child instead would
+    // take that message out of the room's live path and away from its long-poll waiters while
+    // leaving it in the archive — the live-versus-catch-up divergence this seam forbids.
+    if (stanza.attrs.type === 'error') {
+      this.onErrorMessage(stanza);
+      return;
+    }
+    if (stanza.attrs.type === 'groupchat') {
+      this.onGroupchat(stanza);
       return;
     }
 
-    if (stanza.attrs.type === 'error') this.onErrorMessage(stanza);
-    else if (stanza.attrs.type === 'groupchat') this.onGroupchat(stanza);
+    const result = stanza.getChild('result', wire.NS_MAM);
+    if (result !== undefined) this.onMamResult(result, stanza.attrs.from ?? '');
   }
 
   /**
@@ -123,12 +131,14 @@ export class XmppInbound extends XmppRooms {
     }
   }
 
-  private onMamResult(result: wire.El, fromBare: string): void {
+  private onMamResult(result: wire.El, from: string): void {
     const collector = this.mamCollectors.get(result.attrs.queryid ?? '');
     if (collector === undefined) return;
-    // Keep the XEP-0313 room check, so that a `<result>` routed from anywhere else cannot be
-    // collected as this room's history.
-    if (fromBare !== collector.room) return;
+    // An archive is served by the room, and a service stanza always comes from the BARE room JID
+    // (RFC 6120 §8.3) — as onErrorMessage next door requires. Keep BOTH halves of the check, so that
+    // neither a `<result>` routed from elsewhere nor one from a co-occupant of this very room
+    // (room@svc/eve) can be collected as this room's history and paged from as its cursor.
+    if (jid.resourceOf(from) !== '' || jid.bareOf(from) !== collector.room) return;
     const item = wire.archivedItem(result);
     if (item !== undefined) collector.items.push(item);
   }

@@ -174,6 +174,14 @@ export class FakeXmpp {
    */
   discoProbe: 'answers' | 'service-unavailable' | 'remote-server-timeout' | 'forbidden' | 'no-answer' =
     'answers';
+  /**
+   * Latency before a disco#info IQ is answered. That round trip is the window between a join's
+   * self-presence and the seam call that drove it returning; without a knob for it the whole
+   * "a room-state event landed while the call was still in flight" class is unreachable from a test.
+   */
+  discoLatencyMs = 0;
+  /** Fires when a disco#info IQ arrives, BEFORE it is answered — i.e. inside that window. */
+  onDiscoRequest?: (room: string) => void | Promise<void>;
   /** Whether a join that CREATES the room says so (status 201), which is what unlocks + configures it. */
   announceCreation = false;
   /**
@@ -248,7 +256,13 @@ export class FakeXmpp {
   /** Whether `stop()` has taken this client down; `start()` brings it back, as the real one does. */
   private streamStopped = false;
   private readonly handlers: Record<string, Array<(a?: unknown) => void>> = {};
-  private readonly occupied = new Set<string>();
+  /**
+   * The rooms this connection is currently an occupant of. A MUC routes a room's traffic to its
+   * OCCUPANTS and to nobody else, so this is what decides whether {@link feedRoom} delivers — the
+   * fixture must not answer "the message arrived" for a room it has just kicked this connection out
+   * of, which is the one state the whole occupancy-recovery feature exists for.
+   */
+  readonly occupied = new Set<string>();
   private seq = 0;
   private dead = false;
 
@@ -297,6 +311,17 @@ export class FakeXmpp {
     this.emit('stanza', el);
   }
 
+  /**
+   * {@link feed} for a stanza the ROOM routes to its occupants. A non-occupant receives none of it,
+   * so a plugin that lost occupancy and did not recover it sees silence here — the state a fixture
+   * that fed unconditionally could not express, which left every membership suite grading a proxy
+   * (a join presence was sent) instead of the thing the feature is for (messages arrive again).
+   */
+  private feedRoom(room: string, el: unknown): void {
+    if (!this.occupied.has(room)) return;
+    this.feed(el);
+  }
+
   async send(el: unknown): Promise<void> {
     if (this.dead) throw new Error('stream closed');
     const stanza = el as El;
@@ -336,7 +361,8 @@ export class FakeXmpp {
    */
   deliverItem(room: string, shape: StanzaShape): ArchiveItem {
     const item = this.archiveItem(room, shape);
-    this.feed(
+    this.feedRoom(
+      room,
       xml(
         'message',
         { from: item.from, type: 'groupchat' },
@@ -429,6 +455,17 @@ export class FakeXmpp {
     );
   }
 
+  /**
+   * Seed this connection into `room` without driving the handshake — the SERVER-side half of a test
+   * that asserts `joined` into the plugin directly. Without it the fixture holds this connection to
+   * be a non-occupant and routes the room nothing, which is what a real MUC would do.
+   */
+  enterRoom(room: string, nick = this.nick): void {
+    this.rooms.add(room);
+    this.occupied.add(room);
+    this.occupantNicks.set(room, nick);
+  }
+
   /** Drop occupancy with NO presence at all, the way a restarted MUC component forgets it. */
   forgetOccupancySilently(room: string): void {
     this.occupied.delete(room);
@@ -437,7 +474,8 @@ export class FakeXmpp {
 
   /** Reflect a live message that is NOT (yet) in the archive — a spurious long-poll wake. */
   reflectOnly(room: string, body: string, sender = 'someone'): void {
-    this.feed(
+    this.feedRoom(
+      room,
       xml(
         'message',
         { from: `${room}/${sender}`, type: 'groupchat' },
@@ -520,7 +558,8 @@ export class FakeXmpp {
     if (requested?.attrs.maxstanzas === '0') return;
     const max = Number(requested?.attrs.maxstanzas ?? '20');
     for (const item of (this.archives.get(room) ?? []).slice(-max)) {
-      this.feed(
+      this.feedRoom(
+        room,
         xml(
           'message',
           { from: item.from, type: 'groupchat' },
@@ -574,6 +613,8 @@ export class FakeXmpp {
   private async onIq(iq: El): Promise<unknown> {
     if (iq.getChild('query', NS_DISCO_INFO) !== undefined) {
       const room = iq.attrs.to ?? '';
+      await this.onDiscoRequest?.(room);
+      if (this.discoLatencyMs > 0) await sleep(this.discoLatencyMs);
       // A never-answered IQ reaches the plugin as the rejection `@xmpp/iq` raises on its OWN timer,
       // which carries no `condition` at all — keep it shaped that way here, so that the fixture
       // grades `conditionOf`'s fall-back-to-the-message arm instead of a tidier error no client
@@ -721,9 +762,17 @@ export const attach = (plugin: XmppPlugin, fake: FakeXmpp, room?: string): XmppP
   p.nickAdoption = Promise.resolve();
   fake.on('stanza', (stanza) => p.onStanza(stanza)); // the wiring connect() does
   if (room !== undefined) {
-    p.joined.set(room, Promise.resolve());
-    fake.rooms.add(room);
-    fake.occupantNicks.set(room, fake.nick);
+    seedJoined(p, fake, room);
   }
   return p;
+};
+
+/**
+ * Both halves of "this connection is in `room`": the join the PLUGIN caches, and the occupancy the
+ * SERVER holds. Keep them set together, so that a suite cannot assert one and be answered as though
+ * it had asserted the other.
+ */
+export const seedJoined = (p: XmppPrivate, fake: FakeXmpp, room: string): void => {
+  p.joined.set(room, Promise.resolve());
+  fake.enterRoom(room);
 };
