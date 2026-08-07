@@ -15,6 +15,7 @@ import {
 import { WebSocketServer, type WebSocket } from 'ws';
 import { DiscordPlugin } from '../src/index.js';
 import { FAKE_TOKEN, startFakeDiscord, type FakeDiscord } from './fake-discord.js';
+import { probe } from './harness.js';
 
 // CLASS: a gateway frame the provider should never have sent, arriving on the ONE `ws` `message`
 // listener. A throw inside an emitter callback is an uncaughtException, not a rejected promise: it
@@ -324,7 +325,7 @@ describe('a malformed gateway frame never escapes the message listener', () => {
     await gateway.socket();
 
     let raised = false;
-    const waiters = (plugin as unknown as { waiters: Map<string, Set<() => void>> }).waiters;
+    const waiters = probe<Map<string, Set<() => void>>>(plugin, 'waiters');
     waiters.set(
       CHANNEL,
       new Set([

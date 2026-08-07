@@ -26,11 +26,13 @@ import {
   HUGE_HB,
   NO_HANDSHAKE_TIMEOUT,
   openedSocket,
+  probe,
   reachReady,
   settleOf,
   stubFetch,
   URL_SOURCES,
   type FetchStub,
+  type Settlement,
 } from './harness.js';
 import { dialCeiling, dialPump } from './ladder.js';
 
@@ -52,7 +54,8 @@ describe('Discord gateway reconnect & liveness', () => {
     vi.restoreAllMocks();
   });
 
-  it('a terminal close (4014) stops the reconnect storm — gatewayReady cleared, no re-IDENTIFY flood', async () => {
+  it('a terminal close (4014) stops the reconnect storm and every later caller with it', async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const plugin = new DiscordPlugin();
     await plugin.connect({
       token: 't',
@@ -79,8 +82,28 @@ describe('Discord gateway reconnect & liveness', () => {
 
     // At most ONE post-READY IDENTIFY (the single reconnect that hit 4014), then the loop halts.
     expect(totalIdentifies()).toBeLessThanOrEqual(2);
-    // Readiness is cleared so a DELIBERATE later subscribe can retry.
-    expect((plugin as unknown as { gatewayReady?: unknown }).gatewayReady).toBeUndefined();
+
+    // Graded through the PUBLIC surface: the readiness memo the terminal close dropped exists so
+    // that no later caller parks on a resolved promise for a socket that is gone. Asserting the
+    // memo itself, through a cast, passes just as well when the member is not there at all — and
+    // "no caller wedges, no socket reopens" is the behaviour, not the field holding `undefined`.
+    const sockets = gw.instances.length;
+    let later: Settlement | undefined;
+    void settleOf(plugin.subscribe(asTopic('124'), () => undefined)).then((s) => {
+      later = s;
+    });
+    // Keep the clock — and any socket a NON-failing build opens — running UNDER the call, so that
+    // such a build answers something this case can grade rather than parking it on a timeout, which
+    // no assertion is named for and which CPU contention produces just as well.
+    for (let i = 0; i < 10 && later === undefined; i++) {
+      await vi.advanceTimersByTimeAsync(70_000);
+      const ws = gw.instances.at(-1)!;
+      if (ws.readyState === gw.FakeWs.OPEN) ws.hello(HUGE_HB);
+    }
+    expect(later?.status, 'a call after a terminal close did not fail fast').toBe('rejected');
+    expect(String(later?.status === 'rejected' ? later.error : '')).toContain('4014');
+    expect(gw.instances.length, 'a later call reopened a socket after a terminal close')
+      .toBe(sockets);
 
     await plugin.disconnect();
   });
@@ -251,8 +274,7 @@ describe('a socket that ends releases its own heartbeat, before any disconnect()
   const HB = 10_000;
   const TOPIC = asTopic('c11');
 
-  const heartbeatsOf = (plugin: DiscordPlugin): Set<unknown> =>
-    (plugin as unknown as { heartbeats: Set<unknown> }).heartbeats;
+  const heartbeatsOf = (plugin: DiscordPlugin): Set<unknown> => probe(plugin, 'heartbeats');
 
   /** How one socket ends, and whether the ladder is expected to bring another one back. */
   const ENDINGS: Array<{ label: string; end: (ws: FakeWs) => Promise<void>; retries: boolean }> = [

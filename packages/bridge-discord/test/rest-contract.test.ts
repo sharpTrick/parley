@@ -14,7 +14,7 @@ import { DEFAULT_BACKOFF_MS, MAX_ERROR_BODY, sanitizeBody } from '@sharptrick/pa
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin } from '../src/index.js';
-import { settleOf } from './harness.js';
+import { probe, settleOf } from './harness.js';
 import {
   BOT_USER,
   CONTENT_LIMIT,
@@ -684,94 +684,181 @@ describe('Discord REST contract', () => {
     });
   });
 
-  describe('a topic that tries to reshape the provider request', () => {
-    // CLASS: a caller-supplied topic changing the SHAPE of the request, not just its target. An
-    // unmapped topic IS the channel-id path segment (the documented zero-config path), core's
-    // Allowlist puts no character restriction on a topic string, and an anchored `post_topics`
-    // pattern like `ctx-.*` still admits an arbitrary caller-chosen suffix — so the id reaching the
-    // URL is model-influenced text. Every cell asserts the same invariant on the paths the provider
-    // actually saw: one channel route, whose single segment decodes back to the id the call named.
+  describe('text the plugin did not choose reaching the provider request', () => {
+    // CLASS: a string from OUTSIDE the plugin changing the SHAPE of the request, not just its
+    // target. Three sinks carry such a string today and each has a different source of it:
+    //   * the channel-id PATH SEGMENT — an unmapped topic IS the id (the documented zero-config
+    //     path), core's Allowlist puts no character restriction on a topic string, and an anchored
+    //     `post_topics` pattern like `ctx-.*` still admits an arbitrary caller-chosen suffix;
+    //   * `after=` — the cursor, which core hands straight back from whatever it persisted and an
+    //     agent can pass through `parley_fetch_recent`;
+    //   * `before=` — a message id read out of the PROVIDER's own response body, on a page walk.
+    // One generator drives all three, so a sink added later (an `around=`, a `message_reference`)
+    // is covered the day it is wired in rather than the day someone remembers this table.
+    //
+    // The assertion is a PARSE, not a match: a route regex ending `(\?[^#]*)?$` accepts any query
+    // string at all, so it cannot see a smuggled parameter. Every cell instead requires exactly the
+    // keys the plugin meant, each appearing exactly once, each decoding back to the value it meant.
     // The prototype-pollution table above is the nearest neighbour and every id in it is URL-safe,
     // so it cannot see any of this.
-    // `escapes` marks an id that cannot be carried as a path segment at all: `encodeURIComponent`
-    // leaves `.` and `..` alone and the URL parser then REMOVES them, so the only way such an id
-    // stays on the route is to be refused before a request is built.
-    const HOSTILE_IDS: Array<{ id: string; escapes?: true }> = [
-      { id: 'a/b' },
-      { id: 'x/../../users/@me' },
-      { id: 'x?limit=1' },
-      { id: 'x#frag' },
-      { id: 'x%2F' },
-      { id: 'x&after=0' },
-      { id: 'has space' },
-      { id: 'naïve' },
-      { id: '.', escapes: true },
-      { id: '..', escapes: true },
+    //
+    // `escapesPath` marks a string that cannot be carried as a path segment at all:
+    // `encodeURIComponent` leaves `.` and `..` alone and the URL parser then REMOVES them, so the
+    // only way such an id stays on the route is to be refused before a request is built. As a query
+    // VALUE the same string is ordinary text, which is why the flag is per-sink and not per-string.
+    const HOSTILE_STRINGS: Array<{ text: string; escapesPath?: true }> = [
+      { text: 'a/b' },
+      { text: 'x/../../users/@me' },
+      { text: 'x?limit=1' },
+      { text: 'x#frag' },
+      { text: 'x%2F' },
+      { text: 'x&after=0' },
+      { text: 'x&limit=1' },
+      { text: 'has space' },
+      { text: 'naïve' },
+      { text: '.', escapesPath: true },
+      { text: '..', escapesPath: true },
     ];
 
-    const CHANNEL_ROUTE = /^\/api\/v10\/channels\/([^/?#]+)(\/messages)?(\?[^#]*)?$/;
+    const CHANNEL_ROUTE = /^\/api\/v10\/channels\/([^/?#]+)(\/messages)?(\?.*)?$/;
 
-    const expectStayedOnRoute = (
-      paths: string[],
-      channelId: string,
-      escapes: boolean,
-      err: unknown,
-    ): void => {
-      for (const path of paths) {
+    interface Route { path: string; channelId: string; params: URLSearchParams }
+
+    /** Every request the provider saw, refusing outright one that left the channel route. */
+    const routesOf = (paths: string[]): Route[] =>
+      paths.map((path) => {
         const route = CHANNEL_ROUTE.exec(path);
-        expect(route, `the topic steered the call to ${path}`).not.toBeNull();
-        expect(decodeURIComponent(route![1]!), `the channel segment of ${path}`).toBe(channelId);
+        expect(route, `the call was steered off the channel route to ${path}`).not.toBeNull();
+        return {
+          path,
+          channelId: decodeURIComponent(route![1]!),
+          params: new URLSearchParams(route![3] ?? ''),
+        };
+      });
+
+    const expectQuery = (route: Route, expected: Record<string, string>): void => {
+      expect([...route.params.keys()].sort(), `the query keys of ${route.path}`).toEqual(
+        Object.keys(expected).sort(),
+      );
+      for (const [key, value] of Object.entries(expected)) {
+        expect(route.params.getAll(key), `the ${key} of ${route.path}`).toEqual([value]);
       }
-      if (!escapes) {
-        expect(paths.length, 'the entry point issued no request at all').toBeGreaterThan(0);
-        return;
-      }
-      // Refusing it is the ONLY way to stay on the route, and the refusal has to name the id —
-      // silently dropping the call would satisfy the path assertion above just as well.
-      expect(paths, 'an id that cannot be a path segment reached the provider').toEqual([]);
-      expect(String(err)).toContain(JSON.stringify(channelId));
     };
 
-    const ENTRIES: Array<[string, (p: DiscordPlugin, t: Topic) => Promise<unknown>]> = [
-      ['post', (p, t) => p.post(t, SENDER, 'hi')],
-      ['fetchRecent (default window)', (p, t) => p.fetchRecent({ topic: t })],
-      ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
-      [
-        'fetchRecent (blocking)',
-        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 50 }),
-      ],
-      ['subscribe', (p, t) => p.subscribe(t, () => undefined)],
-    ];
+    describe('as the channel-id path segment', () => {
+      const ENTRIES: Array<{
+        label: string;
+        run: (p: DiscordPlugin, t: Topic) => Promise<unknown>;
+        /** The query the plugin means to send on EVERY channel-route request this entry makes. */
+        query: Record<string, string>;
+      }> = [
+        { label: 'post', run: (p, t) => p.post(t, SENDER, 'hi'), query: {} },
+        {
+          label: 'fetchRecent (default window)',
+          run: (p, t) => p.fetchRecent({ topic: t }),
+          query: { limit: '100' },
+        },
+        {
+          label: 'fetchRecent (since)',
+          run: (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') }),
+          query: { after: '1', limit: '100' },
+        },
+        {
+          label: 'fetchRecent (blocking)',
+          run: (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 50 }),
+          query: { after: '1', limit: '100' },
+        },
+        { label: 'subscribe', run: (p, t) => p.subscribe(t, () => undefined), query: {} },
+      ];
 
-    // A `channel_map` VALUE is operator-supplied rather than model-supplied, but it lands in the
-    // same interpolation — so both sources run the same table rather than trusting one of them.
-    const SOURCES: Array<[string, (id: string) => Promise<{ p: DiscordPlugin; topic: Topic }>]> = [
-      ['a topic used as a channel id literal', async (id) => ({ p: plugin, topic: asTopic(id) })],
-      [
-        'a channel_map value',
-        async (id) => ({ p: await connect({ channel_map: { 'ctx-1': id } }), topic: asTopic('ctx-1') }),
-      ],
-    ];
+      // A `channel_map` VALUE is operator-supplied rather than model-supplied, but it lands in the
+      // same interpolation — so both sources run the same table rather than trusting one of them.
+      const SOURCES: Array<[string, (id: string) => Promise<{ p: DiscordPlugin; topic: Topic }>]> = [
+        ['a topic used as a channel id literal', async (id) => ({ p: plugin, topic: asTopic(id) })],
+        [
+          'a channel_map value',
+          async (id) => ({ p: await connect({ channel_map: { 'ctx-1': id } }), topic: asTopic('ctx-1') }),
+        ],
+      ];
 
-    for (const { id, escapes } of HOSTILE_IDS) {
-      for (const [sourceLabel, arrange] of SOURCES) {
-        for (const [entryLabel, run] of ENTRIES) {
-          it(`${entryLabel} keeps ${JSON.stringify(id)} inside one channel route (${sourceLabel})`, async () => {
-            vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-            fake.createChannel(id);
-            const { p, topic } = await arrange(id);
-            const before = fake.requests().length;
-            try {
-              const settled = await settleOf(run(p, topic));
-              const err = settled.status === 'rejected' ? settled.error : undefined;
-              expectStayedOnRoute(fake.requests().slice(before), id, escapes === true, err);
-            } finally {
-              if (p !== plugin) await p.disconnect();
-            }
-          });
+      for (const { text, escapesPath } of HOSTILE_STRINGS) {
+        for (const [sourceLabel, arrange] of SOURCES) {
+          for (const entry of ENTRIES) {
+            it(`${entry.label} keeps ${JSON.stringify(text)} inside one channel route (${sourceLabel})`, async () => {
+              vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+              fake.createChannel(text);
+              const { p, topic } = await arrange(text);
+              const before = fake.requests().length;
+              try {
+                const settled = await settleOf(entry.run(p, topic));
+                const paths = fake.requests().slice(before);
+                if (escapesPath === true) {
+                  // Refusing it is the ONLY way to stay on the route, and the refusal has to name
+                  // the id — silently dropping the call satisfies a path assertion just as well.
+                  expect(paths, 'an id that cannot be a path segment reached the provider').toEqual([]);
+                  const err = settled.status === 'rejected' ? settled.error : undefined;
+                  expect(String(err)).toContain(JSON.stringify(text));
+                  return;
+                }
+                expect(paths.length, 'the entry point issued no request at all').toBeGreaterThan(0);
+                for (const route of routesOf(paths)) {
+                  expect(route.channelId, `the channel segment of ${route.path}`).toBe(text);
+                  expectQuery(route, entry.query);
+                }
+              } finally {
+                if (p !== plugin) await p.disconnect();
+              }
+            });
+          }
         }
       }
-    }
+    });
+
+    describe('as the `since` cursor', () => {
+      for (const { text } of HOSTILE_STRINGS) {
+        it(`a cursor of ${JSON.stringify(text)} reaches the provider as one after= value`, async () => {
+          const topic = liveTopic();
+          const before = fake.requests().length;
+          await settleOf(plugin.fetchRecent({ topic, since: asCursor(text) }));
+          const routes = routesOf(fake.requests().slice(before));
+          expect(routes.length, 'the read issued no request at all').toBeGreaterThan(0);
+          for (const route of routes) {
+            expect(route.channelId).toBe(topic as string);
+            expectQuery(route, { after: text, limit: '100' });
+          }
+        });
+      }
+    });
+
+    describe('as a message id the provider returned mid-walk', () => {
+      // A walk past the 100-per-page cap anchors its next page on `walked.at(-1).id` — a string
+      // straight out of the provider's response body, which `hasUsableId` constrains only to
+      // "non-empty". So page 0 is scripted with a full page whose OLDEST record carries the
+      // hostile id, and page 1 is the request that id got to build.
+      const page = (oldestId: string): string =>
+        JSON.stringify(
+          Array.from({ length: PAGE_LIMIT }, (_, i) => ({
+            id: i === PAGE_LIMIT - 1 ? oldestId : String(900_000_000_000_000_000n - BigInt(i)),
+            channel_id: '1',
+            content: `m${i}`,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            author: BOT_USER,
+          })),
+        );
+
+      for (const { text } of HOSTILE_STRINGS) {
+        it(`a returned id of ${JSON.stringify(text)} reaches the provider as one before= value`, async () => {
+          const topic = liveTopic();
+          fake.injectFault({ status: 200, rawBody: page(text), path: '/messages' });
+          const before = fake.requests().length;
+          await settleOf(plugin.fetchRecent({ topic, limit: PAGE_LIMIT + 50 }));
+          const routes = routesOf(fake.requests().slice(before));
+          expect(routes.length, 'the walk never asked for a second page').toBeGreaterThan(1);
+          expectQuery(routes[0]!, { limit: String(PAGE_LIMIT) });
+          for (const route of routes.slice(1)) expectQuery(route, { limit: '50', before: text });
+        });
+      }
+    });
   });
 
   describe('the headers Discord requires are on every request', () => {
@@ -983,7 +1070,7 @@ describe('Discord REST contract', () => {
         expect(written, 'an unpushable channel was accepted in silence').toContain(id);
         expect(written).toContain(`type ${type}`);
         // Registry rolled back: a subscription whose check failed must not sit in the dispatch map.
-        const subs = (plugin as unknown as { subs: Map<string, unknown> }).subs;
+        const subs = probe<Map<string, unknown>>(plugin, 'subs');
         expect(subs.has(id), 'the dispatch registry kept an unpushable subscription').toBe(false);
       });
     }

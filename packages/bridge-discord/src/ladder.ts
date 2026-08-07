@@ -96,6 +96,13 @@ export abstract class GatewayLadder {
       if (wait > 0) {
         throw new Error(`Discord gateway dial refused: backing off for another ${wait}ms`);
       }
+      // Keep the OWNERSHIP check as well as the clock, so that the lateness every event loop hands
+      // a timer — `nextDialAt` passes, the ladder's `setTimeout` has not run yet — cannot let a
+      // re-entrant caller spend a rung the ladder has already charged for and then have the ladder
+      // spend it again, doubling the IDENTIFY rate its whole point is to ration.
+      if (this.reconnectTimer !== undefined) {
+        throw new Error('Discord gateway dial refused: the reconnect ladder owns the next dial');
+      }
       const epoch = this.epoch;
       this.ready = this.dial(epoch).catch((err: unknown) => {
         if (epoch === this.epoch) this.ready = undefined;
@@ -132,9 +139,9 @@ export abstract class GatewayLadder {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.host.isStopped() || epoch !== this.epoch) return;
-      // Dial through the memo every other caller awaits, so that a re-entrant caller (core's 250 ms
-      // long-poll fallback) cannot open a second socket alongside this one and double the IDENTIFY
-      // rate the ladder is pacing.
+      // Keep the memo assigned on the SAME tick as the dial, so that a re-entrant caller (core's
+      // 250 ms long-poll fallback) landing after this fired joins this socket instead of opening a
+      // second one; one landing before it is refused by ensureUp against `reconnectTimer`.
       const attempt = this.dial(epoch).catch((err: unknown) => {
         if (epoch === this.epoch) this.ready = undefined;
         if (!(err instanceof TerminalGatewayCloseError)) this.scheduleReconnect(epoch);

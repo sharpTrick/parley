@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
-import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
+import { BACKOFF_BASE_MS, DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import {
   FakeWs,
   instances,
@@ -21,6 +21,7 @@ import {
   dialedBase,
   HUGE_HB,
   NO_HANDSHAKE_TIMEOUT,
+  probe,
   reachReady,
   stubFetch,
   type FetchStub,
@@ -43,6 +44,9 @@ const connectPlugin = async (): Promise<DiscordPlugin> => {
   return plugin;
 };
 
+/** Ladder charges so far: {@link chargeDialAttempt} bumps this on every dial it paces. */
+const chargesOf = (plugin: DiscordPlugin): number => probe(plugin, 'reconnectAttempts');
+
 /**
  * Advance `totalMs` of simulated time, applying `drive` once to every socket the plugin opens.
  * Fine-grained while core's 250 ms long-poll fallback is at its busiest, coarser afterwards.
@@ -60,6 +64,126 @@ async function pump(totalMs: number, drive: (ws: FakeWs) => void): Promise<void>
     }
   }
 }
+
+// CLASS: a socket opened outside the ONE budget, because the caller read the budget's clock rather
+// than its ownership. `chargeDialAttempt` sets `nextDialAt = now + wait` and the ladder's own
+// `setTimeout(…, wait)` is armed a moment later and may fire later still, so between `nextDialAt`
+// passing and that timer running the ladder holds a dial it has already paid for while `ensureUp`
+// reads "the backoff is over". Every table above drives time with `advanceTimersByTimeAsync`, which
+// fires the reconnect timer at exactly `nextDialAt` and therefore cannot open that window at all —
+// so the clock has to move INDEPENDENTLY of the timer queue (`vi.setSystemTime`).
+//
+// The assertion is a BALANCE, not a bound: sockets opened must equal the rungs the ladder charged
+// for, plus the one dial that started the ladder. A cell that merely stayed under a ceiling is
+// satisfied by a cell that never dialed.
+describe('one rung of the ladder buys exactly one dial', () => {
+  /** Where the re-entrant call lands relative to `nextDialAt`; only `-1` is still backing off. */
+  const OFFSETS_MS = [-1, 0, 1, 50];
+
+  const INITIATORS: Array<{ label: string; start: (p: DiscordPlugin, t: Topic) => void }> = [
+    {
+      label: 'subscribe',
+      start: (p, t) => {
+        void p.subscribe(t, () => undefined).catch(() => undefined);
+      },
+    },
+    {
+      label: 'a native blocking fetchRecent',
+      start: (p, t) => {
+        void p
+          .fetchRecent({ topic: t, since: asCursor('1'), blockMs: HOUR_MS })
+          .catch(() => undefined);
+      },
+    },
+    {
+      label: "core's 250ms long-poll fallback",
+      start: (p, t) => {
+        void fetchRecentBlocking(
+          p,
+          { topic: t, since: asCursor('1') },
+          { blockMs: HOUR_MS, pollIntervalMs: 250 },
+        ).catch(() => undefined);
+      },
+    },
+  ];
+
+  /**
+   * How the ladder came to own a dial. Both arms leave a reconnect armed; they differ in whether
+   * the readiness memo is still holding a RESOLVED promise from the socket that dropped, which is
+   * what decides whether `ensureUp` even reaches the budget.
+   */
+  const PRIORS: Array<{ label: string; arrange: (p: DiscordPlugin) => Promise<void> }> = [
+    {
+      label: 'a dial that never reached READY',
+      arrange: async (plugin) => {
+        state.onIdentify = (ws: FakeWs) => ws.serverClose(1006);
+        void plugin.subscribe(TOPIC, () => undefined).catch(() => undefined);
+        instances[0]!.hello(HUGE_HB);
+        await vi.advanceTimersByTimeAsync(0);
+        state.onIdentify = () => undefined;
+      },
+    },
+    {
+      label: 'a socket that reached READY and dropped',
+      arrange: async (plugin) => {
+        const ws = await reachReady(plugin, TOPIC);
+        state.onIdentify = () => undefined;
+        ws.serverClose(1006);
+        await vi.advanceTimersByTimeAsync(0);
+      },
+    },
+  ];
+
+  beforeEach(() => {
+    resetGateway();
+    stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0); // no jitter: nextDialAt is exactly one base rung
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (const prior of PRIORS) {
+    for (const offset of OFFSETS_MS) {
+      for (const initiator of INITIATORS) {
+        const when = offset < 0 ? `${-offset}ms before` : `${offset}ms after`;
+        it(`${initiator.label} ${when} nextDialAt, after ${prior.label}`, async () => {
+          const plugin = await connectPlugin();
+          await prior.arrange(plugin);
+
+          const charged = chargesOf(plugin);
+          expect(charged, 'no rung was charged, so this cell has no budget to overspend').toBe(1);
+          const dialsBefore = instances.length;
+
+          // The clock alone — the ladder's timer keeps its full remaining delay, which is the
+          // lateness a real event loop hands it for free.
+          vi.setSystemTime(Date.now() + BACKOFF_BASE_MS + offset);
+          initiator.start(plugin, TOPIC);
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(
+            instances.length,
+            'a caller dialed while the ladder still owned the rung it had already charged for',
+          ).toBe(dialsBefore);
+
+          await vi.advanceTimersByTimeAsync(BACKOFF_BASE_MS);
+          expect(instances.length, 'the ladder never spent the rung it charged for').toBe(
+            dialsBefore + 1,
+          );
+          expect(instances.length, 'sockets opened outran the rungs the ladder paid for').toBe(
+            chargesOf(plugin) + 1,
+          );
+
+          await plugin.disconnect();
+        });
+      }
+    }
+  }
+});
 
 describe('Discord IDENTIFY budget, whoever dials', () => {
   const FAILURES: Array<{ label: string; onIdentify: (ws: FakeWs) => void; drive: (ws: FakeWs) => void }> = [
@@ -177,15 +301,8 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
       { label: 'an unknown op', frame: (n) => ({ op: 42, s: n, d: {} }), survives: true },
     ];
 
-    /** Ladder charges so far: {@link chargeDialAttempt} bumps this on every dial it paces. */
-    const chargesOf = (plugin: DiscordPlugin): number =>
-      (plugin as unknown as { reconnectAttempts: number }).reconnectAttempts;
-
     const framesSent = (): number => instances.reduce((n, ws) => n + ws.sent.length, 0);
 
-    // Crossed with WHEN the close lands, because a socket the plugin has closed keeps receiving:
-    // real `ws` finishes the close handshake a tick later and delivers whatever is already queued,
-    // so under async delivery the peer keeps reaching a listener that has nothing left to do.
     // Crossed with WHEN the close lands, because a socket the plugin has closed keeps receiving:
     // real `ws` finishes the close handshake a tick later and delivers whatever is already queued,
     // so under async delivery the peer keeps reaching a listener that has nothing left to do.
@@ -357,7 +474,7 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
     reachReady(plugin, topic, { handler: (m) => sink.push(m.content) });
 
   const waitersOf = (plugin: DiscordPlugin): Map<string, Set<() => void>> =>
-    (plugin as unknown as { waiters: Map<string, Set<() => void>> }).waiters;
+    probe(plugin, 'waiters');
 
   // WHICH call retires the first session. `connect()` is documented as starting the NEXT session, so
   // it owes the same teardown `disconnect()` does — a socket left dispatching while `live` reads

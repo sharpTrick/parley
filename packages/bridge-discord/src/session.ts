@@ -109,19 +109,11 @@ export abstract class DiscordSession {
     if (!this.connected) throw new Error('DiscordPlugin not connected — call connect() first');
   }
 
-  /**
-   * The ladder state, forwarded under the names the gateway suites read off the PLUGIN. Keep them,
-   * so that a reader who deletes them as unused turns the IDENTIFY-budget, heartbeat-leak and
-   * terminal-close tables into assertions against `undefined` — each of those tables guards a
-   * bot-token RESET or a leaked interval that stops the process exiting.
-   */
+  /** The ladder state, forwarded under the names the gateway suites read off the PLUGIN. */
   private get reconnectAttempts(): number {
     return this.gateway.reconnectAttempts;
   }
   private get heartbeats(): ReadonlySet<NodeJS.Timeout> {
     return this.gateway.heartbeats;
-  }
-  private get gatewayReady(): Promise<void> | undefined {
-    return this.gateway.ready;
   }
 }

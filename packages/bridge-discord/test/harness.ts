@@ -26,6 +26,24 @@ export const settleOf = (call: Promise<unknown>): Promise<Settlement> =>
     (error: unknown): Settlement => ({ status: 'rejected', error }),
   );
 
+/**
+ * The ONE way this package reads a member the plugin does not export. Keep the presence check
+ * AHEAD of the read, so that a probe whose target moved or was renamed is a named red rather than
+ * a green assertion about `undefined` — `expect(probe(p, 'gatewayReady')).toBeUndefined()` passes
+ * just as well when there is no such member at all, and takes the guard it stood for with it.
+ */
+export function probe<T>(target: object, key: string): T {
+  let holder: object | null = target;
+  while (holder !== null && !Object.hasOwn(holder, key)) holder = Object.getPrototypeOf(holder);
+  if (holder === null) {
+    throw new Error(
+      `test probe reached for ${JSON.stringify(key)} on ${target.constructor.name}, which has no ` +
+        'such member — the assertion under it grades nothing; re-point it or delete it',
+    );
+  }
+  return (target as Record<string, unknown>)[key] as T;
+}
+
 /** Large enough that a socket's heartbeat interval never fires inside a case. */
 export const HUGE_HB = 1_000_000;
 /**

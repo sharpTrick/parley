@@ -24,13 +24,23 @@ export function outOfBudget(err: unknown, deadline: number, what: string): boole
 const MIN_QUERY_BUDGET_MS = 250;
 
 /**
+ * The query of ONE page. Keep every anchor going through the encoder here rather than through an
+ * interpolation per walk, so that neither a cursor core handed back nor a message id read out of
+ * the provider's own response body can add, duplicate or re-target a parameter the plugin chose:
+ * both are untrusted text, and one arm encoding while its sibling does not is exactly how that hole
+ * opened the first time.
+ */
+const query = (params: Record<string, string>): string =>
+  new URLSearchParams(params).toString();
+
+/**
  * The newest `limit` messages, oldest-first. Keep paging BACKWARDS with `before` past the API's
  * 100-per-page cap, so that a larger limit is not answered with a truncated head whose cursor
  * already sits past everything older than it.
  */
 export const newestWindow = (page: PageFn, limit: number, deadline: number) =>
   walk(page, limit, deadline, false, (size, before) =>
-    before === undefined ? `limit=${size}` : `limit=${size}&before=${before}`,
+    query({ limit: String(size), ...(before === undefined ? {} : { before }) }),
   );
 
 /**
@@ -40,7 +50,7 @@ export const newestWindow = (page: PageFn, limit: number, deadline: number) =>
  */
 export const windowSince = (page: PageFn, since: string, limit: number, deadline: number) =>
   walk(page, limit, deadline, true, (size, last) =>
-    `after=${encodeURIComponent(last ?? since)}&limit=${size}`,
+    query({ after: last ?? since, limit: String(size) }),
   );
 
 /**

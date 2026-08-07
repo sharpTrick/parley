@@ -1,4 +1,4 @@
-import { asCursor, asTopic, fetchRecentBlocking } from '@sharptrick/parley-core';
+import { asCursor, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // CLASS: a plugin-level table whose assertions are satisfied by a core-level fallback. Every cell
@@ -11,7 +11,7 @@ vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs
 
 import { DiscordPlugin } from '../src/index.js';
 import { FakeWs, instances, resetGateway, state } from './fake-gateway.js';
-import { HUGE_HB, reachReady, stubFetch, type FetchStub } from './harness.js';
+import { HUGE_HB, probe, reachReady, stubFetch, type FetchStub } from './harness.js';
 
 const TOPIC = asTopic('770001');
 const SINCE = asCursor('1');
@@ -42,7 +42,7 @@ const connect = async (): Promise<DiscordPlugin> => {
 
 /** The waiters the plugin has armed — a cell that armed none proves nothing about releasing one. */
 const armedWaiters = (plugin: DiscordPlugin): number =>
-  (plugin as unknown as { waiters: Map<string, unknown> }).waiters.size;
+  probe<Map<string, unknown>>(plugin, 'waiters').size;
 
 describe('a native blocking fetchRecent on a gateway that cannot wake it', () => {
   // A `block_ms` fetch may only WAIT while a LIVE socket can deliver MESSAGE_CREATE. In every other
@@ -493,6 +493,124 @@ describe('the REST cost of a long-poll is its wakeups, not its budget', () => {
     expect((await pending).messages).toEqual([]);
     expect(queries(), 'a torn-down plugin queried the provider again').toBe(1);
   });
+});
+
+describe('a wakeup reaches only the channels it names', () => {
+  // CLASS: a fan-out keyed by an identifier, graded only on a single-key fixture. `dispatch` wakes
+  // `waiters` for the channel the MESSAGE_CREATE named and `onSocketGone` wakes every channel —
+  // two DIFFERENT fan-outs that a one-topic fixture cannot tell apart, and `armedWaiters` reads
+  // `waiters.size`, which says how many channels have waiters and never which one fired. The table
+  // above is exactly that fixture: every cell blocks on one topic, so `wake(waiters, id)` and
+  // `wake(waiters)` are the same function to it. What the routing buys is that a busy guild does
+  // not turn one MESSAGE_CREATE into one extra REST re-query per blocked topic, against a bot
+  // token whose 429 budget this package documents at length — so the assertion is a per-channel
+  // query VECTOR, and the axis is how many topics are blocked at once.
+  const CHANNELS = ['770001', '770002', '770003'];
+  let rest: FetchStub;
+
+  beforeEach(() => {
+    resetGateway();
+    rest = stubFetch();
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  let seq = 0;
+  const messageOn = (channelId: string): Record<string, unknown> => ({
+    op: 0,
+    t: 'MESSAGE_CREATE',
+    s: ++seq,
+    d: {
+      id: String(900_000_000_000_000_000n + BigInt(seq)),
+      channel_id: channelId,
+      content: `to-${channelId}`,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      author: { id: '5', username: 'human' },
+    },
+  });
+
+  /** `woken` and `dispatched` are indices into the fixture's channel list. */
+  const WAKEUPS: Array<{
+    label: string;
+    fire: (ws: FakeWs, channels: string[]) => void;
+    woken: (n: number) => number[];
+    dispatched: (n: number) => number[];
+  }> = [
+    {
+      label: 'a MESSAGE_CREATE on the first channel',
+      fire: (ws, channels) => ws.serverSend(messageOn(channels[0]!)),
+      woken: () => [0],
+      dispatched: () => [0],
+    },
+    {
+      label: 'a MESSAGE_CREATE on the last channel',
+      fire: (ws, channels) => ws.serverSend(messageOn(channels.at(-1)!)),
+      woken: (n) => [n - 1],
+      dispatched: (n) => [n - 1],
+    },
+    {
+      label: 'the socket going away',
+      fire: (ws) => {
+        state.onIdentify = () => undefined;
+        ws.serverClose(1006);
+      },
+      woken: (n) => [...Array(n).keys()],
+      dispatched: () => [],
+    },
+    {
+      label: 'nothing at all',
+      fire: () => undefined,
+      woken: () => [],
+      dispatched: () => [],
+    },
+  ];
+
+  for (const n of [1, 3]) {
+    for (const wakeup of WAKEUPS) {
+      it(`${wakeup.label}, with ${n} topic(s) blocked`, async () => {
+        const plugin = await connect();
+        const channels = CHANNELS.slice(0, n);
+        const heard: string[] = [];
+        const handler = (m: { topic: Topic; content: string }): void => {
+          heard.push(`${m.topic as string}:${m.content}`);
+        };
+        const ws = await reachReady(plugin, asTopic(channels[0]!), { handler });
+        for (const channelId of channels.slice(1)) {
+          const subscribed = plugin.subscribe(asTopic(channelId), handler);
+          await vi.advanceTimersByTimeAsync(0);
+          await subscribed;
+        }
+
+        const pending = channels.map((channelId) =>
+          plugin.fetchRecent({ topic: asTopic(channelId), since: SINCE, blockMs: BLOCK_MS }),
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        expect(armedWaiters(plugin), 'not every topic armed, so the vector below proves nothing')
+          .toBe(n);
+
+        wakeup.fire(ws, channels);
+        await vi.advanceTimersByTimeAsync(10);
+
+        const woken = new Set(wakeup.woken(n));
+        expect(
+          channels.map((channelId) => rest.count(`/channels/${channelId}/messages`)),
+          'a topic the wakeup did not name re-read the provider anyway',
+        ).toEqual(channels.map((_, i) => (woken.has(i) ? 2 : 1)));
+        expect(heard, 'a MESSAGE_CREATE reached a channel it did not name').toEqual(
+          wakeup.dispatched(n).map((i) => `${channels[i]!}:to-${channels[i]!}`),
+        );
+
+        await plugin.disconnect();
+        await Promise.all(pending);
+      });
+    }
+  }
 });
 
 describe('the plugin composes with core’s poll fallback', () => {
