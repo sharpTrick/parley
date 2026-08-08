@@ -133,6 +133,17 @@ export async function fetchWithRetry(
   let received: number | undefined;
   for (let attempt = 1; ; attempt++) {
     const budget = deadlineMs - (now() - started);
+    // `deadlineMs` and `now` are both caller knobs, and the budget they assemble is what arms this
+    // call's abort signal. Refuse a non-finite one HERE, so that `Infinity`/`NaN` — the two figures
+    // a caller most plausibly writes to mean "no deadline" — leave through the label rather than as
+    // the raw `RangeError` the timer would throw from outside this envelope.
+    if (!Number.isFinite(budget)) {
+      throw new LabelledError(
+        `${opts.label} → deadline: deadlineMs ${deadlineMs} against this clock is not a finite ` +
+          `budget of milliseconds`,
+        received,
+      );
+    }
     if (budget <= 0) {
       throw new LabelledError(
         `${opts.label} → deadline: exceeded ${deadlineMs}ms before attempt ${attempt}`,

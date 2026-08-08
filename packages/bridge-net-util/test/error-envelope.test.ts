@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   delay,
+  type FetchWithRetryOptions,
   fetchWithRetry,
   MAX_ERROR_BODY,
   MAX_RESPONSE_BYTES,
@@ -321,6 +322,123 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
       expect(err, 'expected a rejection').toBeDefined();
       expect((err as Error).message.startsWith(`${LABEL} → `)).toBe(true);
       expect(statusOf(err)).toBe(status);
+    });
+  });
+
+  /**
+   * The class the rows above only cover the SERVER's half of: a figure the CALLER states can leave
+   * this module too. `deadlineMs` and `now` assemble the budget that arms the abort signal, and
+   * `AbortSignal.timeout` validates its argument itself — so a fractional, non-finite or oversized
+   * one threw a raw `RangeError` from above the try, with no label, no redaction and no status. The
+   * obvious high-resolution reading of `now` (`() => performance.now()`) made every call fail that
+   * way on its first attempt.
+   *
+   * Widened by the option TYPE rather than by a list: `satisfies Record<NumericKnob, …>` is a
+   * compile error until every numerically-valued option the interface declares has rows here, so the
+   * next such knob arrives graded instead of ungraded.
+   */
+  describe('a caller-stated figure cannot leave the envelope either', () => {
+    type NumericKnob = {
+      [K in keyof FetchWithRetryOptions]-?: NonNullable<FetchWithRetryOptions[K]> extends
+        | number
+        | (() => number)
+        ? K
+        : never;
+    }[keyof FetchWithRetryOptions];
+
+    const FIGURES: readonly (readonly [string, number])[] = [
+      ['a fraction', 100.5],
+      ['less than a millisecond', 0.5],
+      ['NaN', Number.NaN],
+      ['Infinity', Number.POSITIVE_INFINITY],
+      ['-Infinity', Number.NEGATIVE_INFINITY],
+      ['a negative figure', -1],
+      ['zero', 0],
+      ['one past a signed 32-bit timer', 2 ** 31],
+      ['one past an unsigned 32-bit timer', 2 ** 32 + 1],
+      ['the largest safe integer', Number.MAX_SAFE_INTEGER],
+    ];
+
+    // A clock is a knob as much as a figure is, and the one the options document only as "for
+    // tests": every reading below is one a real caller could plausibly hand this call.
+    const CLOCKS: readonly (readonly [string, () => number])[] = [
+      ['a high-resolution clock', () => performance.now()],
+      ['a sub-millisecond clock', () => 0.5],
+      ['a stopped clock', () => 0],
+      ['a clock reading past a 32-bit timer', () => 2 ** 32],
+      ['a clock that reads NaN', () => Number.NaN],
+    ];
+
+    const KNOBS = {
+      maxAttempts: FIGURES,
+      deadlineMs: FIGURES,
+      maxBodyBytes: FIGURES,
+      now: CLOCKS,
+    } satisfies Record<NumericKnob, readonly (readonly [string, unknown])[]>;
+
+    // A status the loop hands back and one it turns into an error, so both exits are crossed with
+    // every knob. 429 is left out on purpose: it is the one status that retries, and a hostile
+    // `maxAttempts` against it spends the whole deadline per row.
+    const STATUSES = [200, 500];
+
+    const rows = Object.entries(KNOBS).flatMap(([knob, values]) =>
+      values.flatMap(([what, value]) =>
+        STATUSES.map((status) => [knob, what, status, { [knob]: value }] as const),
+      ),
+    );
+
+    // A floor, so that a derivation which stops finding knobs — or a table that loses its values —
+    // cannot report itself as coverage by grading nothing.
+    it('grades every knob against every reading, so the rows below are not an empty set', () => {
+      expect(Object.keys(KNOBS).length).toBeGreaterThanOrEqual(4);
+      expect(FIGURES.length).toBeGreaterThanOrEqual(8);
+      expect(CLOCKS.length).toBeGreaterThanOrEqual(4);
+      expect(rows.length).toBeGreaterThanOrEqual(70);
+    });
+
+    it.each(rows)('%s stated as %s, on a %i', async (_knob, _what, status, patch) => {
+      const opts = {
+        label: LABEL,
+        isStopped: () => false,
+        maxAttempts: 2,
+        deadlineMs: 2_000,
+        ...patch,
+      } as FetchWithRetryOptions;
+      const outcome = await fetchWithRetry(`${origin}/x?status=${status}&body=complete`, {}, opts)
+        .then<Outcome, Outcome>(
+          async (res) => ({ kind: 'resolved', text: await res.text() }),
+          (error: Error) => ({ kind: 'rejected', error }),
+        );
+      if (outcome.kind === 'rejected') {
+        expect(outcome.error.message.startsWith(`${LABEL} → `)).toBe(true);
+        expect(outcome.error.message).not.toContain(host);
+        expect(outcome.error.message).not.toContain('127.0.0.1');
+      } else {
+        expect(status).toBe(200);
+        expect(outcome.text).toBe('body-for-200');
+      }
+    });
+
+    /**
+     * The other half of the same normalization, which no row above can see: between 2**31 and
+     * 2**32 Node takes the delay without complaint and then WRAPS it, firing the timer one
+     * millisecond in. The call still fails under the label, so the envelope cannot tell the
+     * difference — what distinguishes it is WHOSE abort ends the call. Held open by a stalling body
+     * and ended by the caller's own controller, so an unclamped budget takes it away first.
+     */
+    it('a deadline past the 32-bit timer does not abort the request a millisecond in', async () => {
+      const caller = new AbortController();
+      const stop = setTimeout(() => caller.abort(new Error('the caller stopped it')), 150);
+      const err = await fetchWithRetry(
+        `${origin}/x?status=200&body=stalls`,
+        { signal: caller.signal },
+        { label: LABEL, isStopped: () => false, maxAttempts: 1, deadlineMs: 3_000_000_000 },
+      ).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      clearTimeout(stop);
+      expect(err?.message).toBe('the caller stopped it');
     });
   });
 

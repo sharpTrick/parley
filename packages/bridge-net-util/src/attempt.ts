@@ -79,6 +79,18 @@ function isCallerAbort(err: unknown, signal: AbortSignal): boolean {
   return err === (signal.reason as unknown) || (err instanceof Error && err.name === 'AbortError');
 }
 
+/** Longest delay a Node timer holds. Past it the delay wraps and the timer fires at 1ms instead. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * `ms` as Node's timer will take it. `AbortSignal.timeout` demands an integer inside the 32-bit
+ * range and throws a raw `RangeError` outside it — a rejection carrying none of this module's
+ * label, redaction or status. Truncate, so that a caller's own high-resolution clock cannot make
+ * every budget fractional and so every call fail; cap, so that a budget past the timer's range is
+ * not wrapped into an abort one millisecond in.
+ */
+const armableDelay = (ms: number): number => Math.min(Math.trunc(ms), MAX_TIMER_MS);
+
 /**
  * One attempt, bounded by `budgetMs`. Without this an unanswered request outlives every bound the
  * options declare — `isStopped` is never consulted while a request is in flight, so a stalled API
@@ -91,7 +103,8 @@ export async function fetchOnce(
   opts: { label: string; maxBytes: number; keeps: (res: Response) => boolean },
 ): Promise<Response> {
   const { label } = opts;
-  const deadline = AbortSignal.timeout(budgetMs);
+  const armedMs = armableDelay(budgetMs);
+  const deadline = AbortSignal.timeout(armedMs);
   const caller = init.signal ?? undefined;
   const controller = new AbortController();
   // Compose by a listener this call REMOVES rather than by `AbortSignal.any`, so that a caller
@@ -114,7 +127,7 @@ export async function fetchOnce(
   } catch (err) {
     if (caller !== undefined && isCallerAbort(err, caller)) throw caller.reason;
     if (deadline.aborted) {
-      throw new LabelledError(`${label} → deadline: no response within ${budgetMs}ms`, received);
+      throw new LabelledError(`${label} → deadline: no response within ${armedMs}ms`, received);
     }
     if (err instanceof BodyTooLargeError) {
       throw new LabelledError(`${label} → body: ${err.message}`, received);

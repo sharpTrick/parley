@@ -297,8 +297,33 @@ export interface BrokenVariant {
    * suite can stop asserting on for free.
    */
   mutates: string;
+  /**
+   * How many of the suite's cases this variant may fail. A control is only evidence for the case it
+   * names when the rest of the suite still PASSES for it: one that fails most of the suite proves
+   * its target assertion is alive no better than a plugin that answers nothing at all, and the
+   * negative control — which bounded the count only from below — could not tell the two apart.
+   * Declared per variant rather than inferred, so a mutation that starts breaking more than it was
+   * built to break reddens here instead of reading as coverage. Default {@link NARROW_BLAST_RADIUS}.
+   */
+  blastRadius?: number;
   make: () => Promise<ConformanceContext>;
 }
+
+/**
+ * What a variant may fail without saying so: its own case, plus the handful that read through the
+ * same field. Deliberately small — a variant needing more has to state the figure, which is the
+ * moment to ask whether it is still aimed at anything.
+ */
+const NARROW_BLAST_RADIUS = 4;
+
+/**
+ * The widest any control may be declared, whatever it corrupts. `since` is threaded through most of
+ * the suite, so the one variant that re-delivers at a cursor legitimately reaches half of it — but
+ * past half a control has stopped discriminating, and no figure recorded here can buy that back.
+ */
+export const MAX_BLAST_RADIUS = 16;
+
+export const blastRadiusOf = (v: BrokenVariant): number => v.blastRadius ?? NARROW_BLAST_RADIUS;
 
 /**
  * The inner plugin is built to MATCH the capabilities the fixture declares — a variant that declares
@@ -357,6 +382,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   ...POST_ID_RESPELLINGS.map(respelledPostId),
   {
     name: 'inclusive since',
+    blastRadius: 16,
     mutates: 'fetchRecent',
     mustFail: 'only newer messages (exclusive)',
     make: () =>
@@ -387,6 +413,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a constant backendMsgId',
+    blastRadius: 6,
     mutates: 'backendMsgId',
     mustFail: 'unique ids and distinct cursors',
     make: () =>
@@ -490,16 +517,22 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       })),
   },
   {
-    name: 'an unreplayable cursor on an absent topic',
+    // Drifts on a re-read of a topic that has never held a message, and nowhere else — which is
+    // exactly the assertion the clause turns on. Its predecessor returned an empty page for EVERY
+    // read: it failed 29 of the suite's 32 cases, so it could no more show that this assertion was
+    // alive than a plugin that answers nothing at all could.
+    name: 'a drifting cursor on a re-read of an empty topic',
     mutates: 'cursor',
     mustFail: 'never-posted topic',
     make: () =>
-      wrap(() => ({
-        fetchRecent: () =>
-          Promise.resolve({
-            messages: [],
-            nextCursor: asCursor(`drifting-${Math.random().toString(36).slice(2)}`),
-          }),
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined || page.messages.length > 0) return page;
+          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+          if (all.messages.length > 0) return page;
+          return { ...page, nextCursor: asCursor(`${String(page.nextCursor)}-drift`) };
+        },
       })),
   },
   {
@@ -513,6 +546,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // row itself, exactly as a BIGSERIAL reader sees seq 42 committed while 41 is not. Only a reader
     // placed INSIDE the write window can see it.
     name: 'a cursor that advances past a row it did not return',
+    blastRadius: 7,
     mutates: 'cursor',
     mustFail: 'interleaved with concurrent writers',
     make: () =>
@@ -597,6 +631,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // A cursor at the tail that re-serves the newest message: the catch-up loop then replays the
     // last message on every poll forever, because `since` never gets past it.
     name: 'a tail cursor that re-delivers the newest message',
+    blastRadius: 15,
     mutates: 'cursor',
     mustFail: 'since at the tail',
     make: () =>
@@ -683,6 +718,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // Each writer numbering from its own sequence — the cursor namespace a backend gets when the
     // ordering key is per-connection rather than per-topic. Cursors then collide across writers.
     name: 'a cursor namespace that restarts per writer',
+    blastRadius: 8,
     mutates: 'cursor',
     mustFail: 'multi-process writes',
     make: () =>
@@ -748,6 +784,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // Blank ONE cursor, not all of them: blanking every cursor also collapses the distinct-cursor
     // assertion, and a control that trips two assertions cannot tell which one is still alive.
     name: 'an empty cursor on the oldest message of a page',
+    blastRadius: 8,
     mutates: 'cursor',
     mustFail: 'in order, with unique ids and distinct cursors',
     make: () =>
@@ -866,6 +903,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // produced an over-long page, so `limit` could stop being honoured entirely — and a caller
     // paging with a bounded window would silently read past it.
     name: 'a page one row longer than the limit it was given',
+    blastRadius: 5,
     mutates: 'limit-honoured',
     mustFail: 'paging from a cursor with limit',
     make: () =>
@@ -946,6 +984,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // shape on a polling backend; with every fixture declaring the polling arm, the true arm of the
     // 0-3 ms case had no control at all and could be deleted with this package green.
     name: 'a native blocking read that parks from now instead of at the caller cursor',
+    blastRadius: 5,
     mutates: 'fetchRecent',
     mustFail: 'blocking fetch is not missed',
     make: () =>

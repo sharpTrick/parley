@@ -7,7 +7,13 @@ import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { asTopic, buildMessage } from '@sharptrick/parley-core';
 import { ASSERTED_PROPERTIES, CLAUSES } from '@sharptrick/parley-conformance';
-import { BROKEN_SUITE_MARK, BROKEN_VARIANTS, ReferencePlugin } from './reference-plugin.js';
+import {
+  blastRadiusOf,
+  BROKEN_SUITE_MARK,
+  BROKEN_VARIANTS,
+  MAX_BLAST_RADIUS,
+  ReferencePlugin,
+} from './reference-plugin.js';
 import { BOOLEAN_CAPABILITIES, cases } from './suite-source.js';
 
 /**
@@ -242,15 +248,65 @@ describe('the suite rejects a non-conformant plugin', () => {
     ).toEqual([]);
   });
 
-  it.each(BROKEN_VARIANTS.map((v) => [v.name, v.mustFail] as const))(
-    'fails a plugin with %s',
-    (name, mustFail) => {
-      const failed = rowsOf(name).filter((r) => r.status === 'failed');
-      expect(failed.length, `no case failed for "${name}"`).toBeGreaterThan(0);
+  /**
+   * The denominator the bound below is a fraction OF. Every variant runs the same registered suite,
+   * so a per-variant failure count is only readable against a case count that is the same for all of
+   * them and is not zero — an upper bound over rows nobody collected passes by finding nothing.
+   * The floor is an absolute figure rather than a count read back off the suite, so a report that
+   * collapses to a handful of rows cannot lower the standard it is graded by.
+   */
+  const MIN_SUITE_CASES = 20;
+
+  const suiteCases = (): number => rowsOf(BROKEN_VARIANTS[0]!.name).length;
+
+  it('every variant ran the same whole suite, so a failure count is a fraction of something known', () => {
+    const collected = BROKEN_VARIANTS.map((v) => [v.name, rowsOf(v.name).length] as const);
+    expect(
+      collected.filter(([, n]) => n !== suiteCases()),
+      'a variant that did not run the same set of cases as the others — a bound on how many it ' +
+        'fails cannot be compared against one that ran a different suite',
+    ).toEqual([]);
+    expect(suiteCases()).toBeGreaterThanOrEqual(MIN_SUITE_CASES);
+    // The ceiling below is only a bound if it is well under the whole suite: a figure at or past
+    // the case count would admit a plugin that fails everything as a control for each case in turn.
+    expect(MAX_BLAST_RADIUS * 2).toBeLessThanOrEqual(suiteCases());
+  });
+
+  /**
+   * The declared radii, against the ceiling no control may be declared past. A number recorded
+   * beside a variant is a promise that it still discriminates; past half the suite it does not,
+   * whatever figure is written there — so raising one that far is refused rather than recorded.
+   */
+  it.each(BROKEN_VARIANTS.map((v) => [v.name, blastRadiusOf(v)] as const))(
+    'declares a blast radius for %s that a control could have',
+    (name, radius) => {
       expect(
-        failed.map((r) => r.fullName).join('\n'),
-        `"${name}" failed, but not the case it is built to break`,
-      ).toContain(mustFail);
+        radius,
+        `"${name}" is declared to fail ${radius} of ${suiteCases()} cases — a control that breaks ` +
+          `more than half the suite demonstrates nothing about the one case it names. Narrow the ` +
+          `mutation until it is aimed at that case`,
+      ).toBeLessThanOrEqual(MAX_BLAST_RADIUS);
+    },
+  );
+
+  it.each(BROKEN_VARIANTS.map((v) => [v.name, v.mustFail, blastRadiusOf(v)] as const))(
+    'fails a plugin with %s',
+    (name, mustFail, radius) => {
+      const failed = rowsOf(name).filter((r) => r.status === 'failed');
+      const titles = failed.map((r) => r.fullName).join('\n');
+      expect(failed.length, `no case failed for "${name}"`).toBeGreaterThan(0);
+      expect(titles, `"${name}" failed, but not the case it is built to break`).toContain(mustFail);
+      // The other side of the same bound. A control that fails MORE than it was built to fail is
+      // indistinguishable from one that has stopped failing the case it is registered for: the
+      // extra failures only ever make the two assertions above pass, which is how a control that
+      // had degenerated into failing 29 of 32 cases still read as coverage for one of them.
+      expect(
+        failed.length,
+        `"${name}" may fail at most ${radius} of ${suiteCases()} cases and failed ` +
+          `${failed.length}. Either the mutation now breaks more than it is aimed at — in which ` +
+          `case it no longer shows "${mustFail}" is alive — or its blastRadius needs raising:\n` +
+          titles,
+      ).toBeLessThanOrEqual(radius);
     },
   );
 });
