@@ -19,6 +19,8 @@ const state = vi.hoisted(() => ({
   /** How `LISTEN` behaves on the listener connection for this cell. */
   listenMode: 'fast' as 'fast' | 'slow' | 'reject-slow',
   listenDelayMs: 100,
+  /** How long the listener SOCKET takes to come up — the other step a wait is armed behind. */
+  dialDelayMs: 0,
   /** Channels whose LISTEN actually succeeded. */
   established: [] as string[],
   /** Channels an UNLISTEN actually reached the connection for. */
@@ -67,7 +69,9 @@ vi.mock('pg', async () => {
       super();
       state.clients.push(this);
     }
-    async connect(): Promise<void> {}
+    async connect(): Promise<void> {
+      if (state.dialDelayMs > 0) await sleep(state.dialDelayMs);
+    }
     async query(sql: string): Promise<{ rows: unknown[] }> {
       const unlisten = /^UNLISTEN "(.+)"$/.exec(sql);
       if (unlisten !== null) {
@@ -145,6 +149,7 @@ beforeEach(() => {
   state.attempted.length = 0;
   state.listenMode = 'fast';
   state.listenDelayMs = 100;
+  state.dialDelayMs = 0;
   state.onListenAttempt = null;
   state.rowVisible = false;
   state.recheck.initial = 0;
@@ -275,20 +280,50 @@ describe('blocking fetchRecent waiters on a shared NOTIFY channel', () => {
 // parameterized over how many waits are parked, on how many channels, how long they asked for, and
 // whether teardown lands before or after the LISTEN they are waiting on is established.
 
+// A wait is not only the timer. Before it is armed the caller is blocked on the listener DIAL and
+// then on the LISTEN, and neither of those is the wait's own timer: a matrix whose arming steps all
+// finish well inside the release budget grades the timer and nothing else. So the arming step is an
+// axis, and it is drawn from BOTH sides of the budget — a step that outlasts it is the only shape
+// in which "disconnect() released the wait" and "the wait happened to be short" can be told apart.
+
+interface ArmingStep {
+  label: string;
+  listenMode: 'fast' | 'slow';
+  listenDelayMs: number;
+  dialDelayMs: number;
+}
+
 interface TeardownCell {
   waiters: number;
   topics: number;
   blockMs: number;
-  duringListen: boolean;
+  armedBehind: ArmingStep;
 }
 
 /** Every wait must settle inside this once disconnect() lands, whatever budget it asked for. */
 const RELEASE_BUDGET_MS = 500;
 
+const ARMING_STEPS: ArmingStep[] = [
+  { label: 'already armed', listenMode: 'fast', listenDelayMs: 0, dialDelayMs: 0 },
+  { label: 'a brief LISTEN', listenMode: 'slow', listenDelayMs: 150, dialDelayMs: 0 },
+  {
+    label: 'a LISTEN outlasting the release budget',
+    listenMode: 'slow',
+    listenDelayMs: 1500,
+    dialDelayMs: 0,
+  },
+  {
+    label: 'a dial outlasting the release budget',
+    listenMode: 'fast',
+    listenDelayMs: 0,
+    dialDelayMs: 1500,
+  },
+];
+
 const TEARDOWN_CELLS: TeardownCell[] = [1, 3].flatMap((waiters) =>
   [1, 2].flatMap((topics) =>
     [1000, 4000].flatMap((blockMs) =>
-      [false, true].map((duringListen) => ({ waiters, topics, blockMs, duringListen })),
+      ARMING_STEPS.map((armedBehind) => ({ waiters, topics, blockMs, armedBehind })),
     ),
   ),
 );
@@ -298,15 +333,14 @@ describe('disconnect() releases every in-flight blocking wait', () => {
     TEARDOWN_CELLS.map(
       (c) =>
         [
-          `${c.waiters} waiter(s) on ${c.topics} topic(s), blockMs ${c.blockMs}, teardown ${
-            c.duringListen ? 'during LISTEN' : 'after LISTEN'
-          }`,
+          `${c.waiters} waiter(s) on ${c.topics} topic(s), blockMs ${c.blockMs}, behind ${c.armedBehind.label}`,
           c,
         ] as const,
     ),
   )('%s', async (_label, cell) => {
-    state.listenMode = cell.duringListen ? 'slow' : 'fast';
-    state.listenDelayMs = 150;
+    state.listenMode = cell.armedBehind.listenMode;
+    state.listenDelayMs = cell.armedBehind.listenDelayMs;
+    state.dialDelayMs = cell.armedBehind.dialDelayMs;
 
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: REAL_URL });
@@ -336,6 +370,89 @@ describe('disconnect() releases every in-flight blocking wait', () => {
       );
     }
   }, 15000);
+});
+
+// `blockMs` is a BUDGET, not a hint applied to whichever step happens to be last. Everything a
+// native long-poll does before arming its timer — bringing the shared listener socket up, then
+// issuing the LISTEN on it — is time the caller is blocked, and the shared listener connection
+// serialises queries, so a LISTEN queued behind a reconnect's re-LISTEN of N channels or behind
+// another topic's slow one inherits the whole wait. Unbudgeted, the only ceiling left is the
+// driver's `query_timeout`, and a 100ms `fetchRecent` returns tens of times late.
+//
+// So each cell makes ONE arming step far outlast the budget and grades the seam call against the
+// budget it was given. Returning empty is the documented fallback — core naps and retries — so the
+// page must also be empty and carry the caller's own cursor, never a guess.
+
+interface BudgetCell {
+  step: 'the listener dial' | 'the LISTEN';
+  /**
+   * How long that step takes. Drawn from BOTH sides of the budget: a step that outruns it must not
+   * be waited for at all, and a step that lands inside it must have SPENT what it took — a timer
+   * armed from the full `blockMs` after the arming is a budget that resets itself.
+   */
+  stepMs: number;
+  blockMs: number;
+}
+
+/** How far past `blockMs` a settle may land before the budget was not a budget. */
+const BUDGET_MARGIN_MS = 300;
+
+const BUDGET_CELLS: BudgetCell[] = (
+  ['the listener dial', 'the LISTEN'] as BudgetCell['step'][]
+).flatMap((step) => [
+  { step, stepMs: 3000, blockMs: 100 },
+  { step, stepMs: 3000, blockMs: 400 },
+  { step, stepMs: 800, blockMs: 1000 },
+]);
+
+describe('every step a blocking fetchRecent is armed behind is inside its budget', () => {
+  it.each(BUDGET_CELLS.map((c) => [`${c.step} takes ${c.stepMs}ms, blockMs ${c.blockMs}`, c] as const))(
+    '%s',
+    async (_label, cell) => {
+      if (cell.step === 'the listener dial') {
+        state.dialDelayMs = cell.stepMs;
+      } else {
+        state.listenMode = 'slow';
+        state.listenDelayMs = cell.stepMs;
+      }
+
+      const plugin = new PostgresPlugin();
+      await plugin.connect({ url: REAL_URL });
+      // Per-cell topic: a slow arming step from an earlier cell can still land on the shared
+      // connection log after this one's `beforeEach`, so nothing here may be graded channel-blind.
+      const topic = asTopic(
+        `budget_${cell.step === 'the LISTEN' ? 'listen' : 'dial'}_${cell.stepMs}_${cell.blockMs}`,
+      );
+      const channel = channelFor(topic);
+
+      const started = Date.now();
+      const page = await plugin.fetchRecent({
+        topic,
+        since: asCursor('9'),
+        blockMs: cell.blockMs,
+      });
+      const took = Date.now() - started;
+
+      expect(took, 'the wait ran past the budget the caller gave it').toBeLessThan(
+        cell.blockMs + BUDGET_MARGIN_MS,
+      );
+      expect(page.messages, 'a wait that ran out invented a page').toEqual([]);
+      expect(page.nextCursor, 'a wait that ran out moved the caller off its own cursor').toBe('9');
+
+      // A step this wait walked away from still completes, and whatever it hands back must leave
+      // nothing held: an abandoned arming that keeps the reference it already took leaves the
+      // server ringing a channel no participant needs, for the life of the connection.
+      await sleep(cell.stepMs);
+      expect(
+        (plugin as unknown as { listens: Map<string, unknown> }).listens.size,
+        'the abandoned arming kept its LISTEN reference',
+      ).toBe(0);
+      expect(observedChannels(), 'channel left LISTENed on the connection').not.toContain(channel);
+
+      await plugin.disconnect();
+    },
+    15000,
+  );
 });
 
 // waitForNotify arms the doorbell and only THEN re-reads. A row that commits between the caller's

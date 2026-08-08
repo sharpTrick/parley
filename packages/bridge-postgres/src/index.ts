@@ -308,6 +308,7 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     assertStorable('topic', args.topic);
+    const epoch = this.epoch;
     const limit = args.limit ?? 100;
     if (args.since === undefined) {
       // Default window: the newest `limit` messages. With no cursor to advance past there is
@@ -321,7 +322,12 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     // remaining budget — so the native wait only ever SHORTENS latency, never extends it.
     if (rows.length === 0 && (args.blockMs ?? 0) > 0 && !this.stopped) {
       await this.waitForNotify(args.topic, args.since, limit, args.blockMs as number);
-      if (!this.stopped) rows = await this.readSince(args.topic, args.since, limit);
+      // `epoch`, not `stopped` alone: a connect() sets `stopped` back to false, so a wait that slept
+      // across a whole teardown/restart would re-resolve the pool and read the SUCCESSOR's table —
+      // and hand this caller a `nextCursor` from a sequence its topic has never been read on.
+      if (!this.stopped && epoch === this.epoch) {
+        rows = await this.readSince(args.topic, args.since, limit);
+      }
     }
     return pageResult(rows, args.since);
   }

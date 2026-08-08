@@ -42,9 +42,20 @@ const state = vi.hoisted(() => ({
   deleteGate: null as Deferred | null,
   /** Every DELETE the prune loop issued, in order. */
   deletes: [] as string[],
+  // When set, the next pooled cursor read takes its snapshot and then parks on this deferred — the
+  // window in which a whole disconnect()/connect() lands inside ONE seam call.
+  readGate: null as Deferred | null,
+  /** Every table a cursor read was issued against, in order. */
+  cursorReads: [] as string[],
   // The table, per topic. Rows STAY here: what a query returns is decided by the SQL's cursor
   // predicate and ORDER BY, exactly as the server decides it.
   rows: new Map<string, Record<string, unknown>[]>(),
+  /**
+   * Rows per TABLE, then per topic — what one lifecycle's own table holds. Seeding a successor here
+   * is the only way to tell WHICH lifecycle answered a call: a page is not graded by arriving, it is
+   * graded by whose rows and whose sequence it carries.
+   */
+  tableRows: new Map<string, Map<string, Record<string, unknown>[]>>(),
 }));
 
 interface MockClientShape {
@@ -110,7 +121,19 @@ vi.mock('pg', async () => {
       const limit = /LIMIT (\d+)/.exec(sql);
       return { rows: [], rowCount: state.deletes.length <= 3 ? Number(limit?.[1] ?? 0) : 0 };
     }
-    const served = servePool(state.rows.get(String(values[0])) ?? [], sql, values);
+    const table = /FROM "([^"]+)"/.exec(sql)?.[1] ?? '';
+    const topic = String(values[0]);
+    const all = state.tableRows.get(table)?.get(topic) ?? state.rows.get(topic) ?? [];
+    const served = servePool(all, sql, values);
+    if (!/seq > \$\d+::bigint/.test(sql)) return { rows: served ?? [] };
+    state.cursorReads.push(table);
+    const gate = state.readGate;
+    if (gate !== null) {
+      state.readGate = null;
+      // `served` was computed BEFORE the park, so a row committed while this statement is in flight
+      // is legitimately absent from its result — the snapshot semantics the server really has.
+      await gate.promise;
+    }
     return { rows: served ?? [] };
   };
 
@@ -132,7 +155,10 @@ beforeEach(() => {
   state.listenRejects = false;
   state.deleteGate = null;
   state.deletes.length = 0;
+  state.readGate = null;
+  state.cursorReads.length = 0;
   state.rows.clear();
+  state.tableRows.clear();
 });
 
 afterEach(() => {
@@ -229,9 +255,12 @@ const TEARDOWN_GUARD_FORMS: [what: string, sample: string][] = [
  * (which owns the setup calls, parameterized over the await each is held at, on the arm where the
  * held await SUCCEEDS), in silent-peer.test.ts (which owns the arm where it never answers, so the
  * call releases its own unadopted resource), in teardown-delivery.test.ts (which owns a drain read
- * parked at the boundary) or in push-self-heal.test.ts (which owns the drain's re-drain timer).
+ * parked at the boundary), in push-self-heal.test.ts (which owns the drain's re-drain timer) or —
+ * when the guarded await is inside a call that RETURNS something — in the value-graded table
+ * further down this file, because a census counts the guards that exist and can never see the one
+ * that is missing.
  */
-const TEARDOWN_GUARD_SITES = 20;
+const TEARDOWN_GUARD_SITES = 21;
 
 const CROSS_CELLS = CHORES.flatMap((chore) =>
   (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),
@@ -391,6 +420,95 @@ describe('a chore in flight when disconnect lands never touches the next lifecyc
     },
     15000,
   );
+});
+
+// The matrix above grades that a parked chore comes BACK. It cannot see what it came back WITH.
+// A seam call that slept across a whole disconnect()/connect() finds `stopped` false again, and if
+// it decides with `stopped` it re-resolves the plugin's pool and table and answers out of the
+// SUCCESSOR lifecycle: rows from a table the caller never asked for, and a `nextCursor` from a
+// foreign sequence that core persists as this topic's read state — every message at or below it
+// skipped forever, with no error anywhere. So these cells seed the successor's table with a row the
+// caller's cursor WOULD return, and grade the VALUE: an empty page carrying the caller's own
+// `since`. Parameterized over where the call is parked when the teardown lands and over what the
+// successor is, because a guard that is right for one parking point is not thereby right for the
+// others.
+
+type ParkedAt = 'the opening read' | 'the LISTEN';
+type Successor = 'nothing' | 'the same table' | 'a different table';
+
+const TABLE_A = 'lifecycle_tbl_a';
+const TABLE_B = 'lifecycle_tbl_b';
+/** The caller's own cursor. The successor's row sits above it, so a foreign read is visible. */
+const CALLER_SINCE = '5';
+
+const VALUE_CELLS = (['the opening read', 'the LISTEN'] as ParkedAt[]).flatMap((parkedAt) =>
+  (['nothing', 'the same table', 'a different table'] as Successor[]).map((next) => ({
+    parkedAt,
+    next,
+  })),
+);
+
+function seed(table: string, topic: string, content: string, seq: string): void {
+  const byTopic = state.tableRows.get(table) ?? new Map<string, Record<string, unknown>[]>();
+  state.tableRows.set(table, byTopic);
+  byTopic.set(topic, [
+    {
+      seq,
+      topic,
+      sender: asHandle('u'),
+      content,
+      ts: new Date().toISOString(),
+      in_reply_to: null,
+    },
+  ]);
+}
+
+describe('a seam call that spanned a teardown answers for the lifecycle that was asked', () => {
+  it.each(
+    VALUE_CELLS.map(
+      (c) => [`parked on ${c.parkedAt}, then disconnect + ${c.next}`, c] as const,
+    ),
+  )('%s', async (_label, cell) => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL, table_name: TABLE_A });
+    const topic = asTopic('t');
+
+    const gate = deferred();
+    if (cell.parkedAt === 'the opening read') state.readGate = gate;
+    else state.listenGate = gate;
+
+    const parked = plugin.fetchRecent({
+      topic,
+      since: asCursor(CALLER_SINCE),
+      blockMs: 4000,
+    });
+    await until(() =>
+      cell.parkedAt === 'the opening read'
+        ? state.cursorReads.length > 0
+        : state.listenAttempts.length > 0,
+    );
+
+    await plugin.disconnect();
+    if (cell.next !== 'nothing') {
+      const successor = cell.next === 'a different table' ? TABLE_B : TABLE_A;
+      seed(successor, 't', 'from-lifecycle-B', '7');
+      await plugin.connect({ url: REAL_URL, table_name: successor });
+    }
+
+    gate.resolve();
+    const page = await parked;
+
+    expect(
+      page.messages.map((m) => m.content),
+      "the parked call answered out of the successor lifecycle's table",
+    ).toEqual([]);
+    expect(
+      page.nextCursor,
+      "the parked call advanced the caller's read state onto a foreign sequence",
+    ).toBe(CALLER_SINCE);
+
+    await plugin.disconnect();
+  }, 15000);
 });
 
 describe('Postgres subscribe registration', () => {

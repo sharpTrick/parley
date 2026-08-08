@@ -56,10 +56,37 @@ export abstract class PostgresListen extends PostgresListener {
   }
 
   /**
+   * Await `work` under the wait's REMAINING budget and under `disconnect()`, resolving `undefined`
+   * when it expired, was torn down, or failed — the caller's action is the same for all three.
+   * Every step a native long-poll is armed behind is time its caller is blocked and a wait a
+   * teardown must be able to end, and neither is true of a step awaited bare.
+   *
+   * Keep this abandoning the WAIT and never the resource: the dial and the LISTEN are shared, so a
+   * few-millisecond budget ending one would take out a concurrent `subscribe` parked on the same
+   * one.
+   */
+  private armWithin<T>(work: Promise<T>, budgetMs: number): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let release!: () => void;
+    const abandoned = new Promise<undefined>((resolve) => {
+      release = (): void => resolve(undefined);
+      timer = setTimeout(release, budgetMs);
+    });
+    this.pendingAborts.add(release);
+    return Promise.race([work.catch(() => undefined), abandoned]).finally(() => {
+      clearTimeout(timer);
+      this.pendingAborts.delete(release);
+    });
+  }
+
+  /**
    * Park up to `blockMs` waiting for a NOTIFY on `topic`'s channel, then return so the caller can
    * re-run the exclusive `since` query. The doorbell is the one `subscribe` waits on, piggybacking
    * a live subscription's LISTEN through {@link acquireListen} when there is one. Any wake, the
    * `blockMs` timer, or `disconnect()` releases the wait, and the timer is always cleared.
+   *
+   * `blockMs` is the budget for the WHOLE call — the listener dial and the LISTEN included, both of
+   * which queue behind whatever else the shared connection is doing.
    */
   protected async waitForNotify(
     topic: Topic,
@@ -68,20 +95,27 @@ export abstract class PostgresListen extends PostgresListener {
     blockMs: number,
   ): Promise<void> {
     const epoch = this.epoch;
-    let listener: Client;
-    try {
-      listener = await this.ensureListener(Math.min(blockMs, LISTENER_WAIT_MS));
-    } catch {
-      return; // listener unavailable → skip the native wait; core polls the remaining budget
-    }
+    const deadline = Date.now() + blockMs;
+    const remaining = (): number => Math.max(0, deadline - Date.now());
+
+    const listener = await this.armWithin(
+      this.ensureListener(Math.min(blockMs, LISTENER_WAIT_MS)),
+      remaining(),
+    );
+    if (listener === undefined) return; // no listener in budget → core polls what is left
     if (this.stopped || epoch !== this.epoch) return;
     const channel = channelFor(topic);
 
-    let listen: ListenState;
-    try {
-      listen = await this.acquireListen(listener, channel);
-    } catch {
-      return; // LISTEN failed → skip the native wait; core polls the remaining budget
+    const acquiring = this.acquireListen(listener, channel);
+    const listen = await this.armWithin(acquiring, remaining());
+    if (listen === undefined) {
+      // `acquireListen` took the reference synchronously, so hand it back if the LISTEN lands after
+      // this wait gave up — otherwise the channel is refcounted forever and never UNLISTENed.
+      void acquiring.then(
+        (late) => this.releaseListen(channel, late),
+        () => undefined,
+      );
+      return; // no LISTEN in budget → core polls what is left
     }
     const set = this.waiters.get(channel) ?? new Set<ParkedWaiter>();
     this.waiters.set(channel, set);
@@ -106,7 +140,7 @@ export abstract class PostgresListen extends PostgresListener {
         })().catch(() => undefined);
       };
       const parked: ParkedWaiter = { wake: finish, recheck };
-      const timer = setTimeout(finish, blockMs);
+      const timer = setTimeout(finish, remaining());
       this.pendingAborts.add(finish);
       set.add(parked);
       if (this.stopped || epoch !== this.epoch) {
