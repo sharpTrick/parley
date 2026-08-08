@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
