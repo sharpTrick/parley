@@ -7,7 +7,8 @@
  */
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { ANY_ROUTE, FAULTS } from './fake-zulip.js';
+import { ANY_ROUTE, FAULTS, startFakeZulip } from './fake-zulip.js';
+import { ZulipPlugin } from '../src/index.js';
 import {
   type ConnectionEnding,
   CONNECTION_ENDINGS,
@@ -350,6 +351,43 @@ describe('zulip: no seam call answers from a connection it did not address', () 
 });
 
 /**
+ * CLASS: a request issued on a CALLER's path is not registered with teardown, so `disconnect()`
+ * cannot cut it and returns while that request is still in flight. Every other table in this file
+ * grades a `subscribe()` that has already RESOLVED, or a loop that is already running; the rows
+ * below grade the handshake window before either exists, which is the one place a request answers
+ * to nobody once teardown has passed — `runBackendCli` calls `process.exit(0)` the moment
+ * `shutdown()` resolves, so a `register` still in flight then is killed without its queue ever
+ * being read back, let alone released.
+ *
+ * Every round trip of the handshake is such a window, so the routes are DERIVED from a clean
+ * `subscribe()` rather than hand-listed — a handshake that grows a third request is graded the day
+ * it appears. A black hole is the fault that isolates teardown from every other bound: the server
+ * accepts the request and answers nothing, so only an abort can end it, and the transport deadline
+ * that would eventually end it anyway is far past the window these rows allow.
+ */
+const HANDSHAKE_ROUTES: string[] = await (async (): Promise<string[]> => {
+  const fake = await startFakeZulip({ heartbeatMs: 200 });
+  const plugin = new ZulipPlugin();
+  await plugin.connect({ site_url: fake.url, events_timeout_ms: 500 });
+  try {
+    const topic = asTopic(`hs-${rand()}`);
+    await plugin.post(topic, SENDER, 'old');
+    const seen = new Set<string>();
+    let handshaking = true;
+    fake.setResponseHook((route) => {
+      if (handshaking) seen.add(route);
+    });
+    await plugin.subscribe(topic, () => undefined);
+    handshaking = false;
+    fake.setResponseHook(undefined);
+    return [...seen].sort();
+  } finally {
+    await plugin.disconnect();
+    await fake.close();
+  }
+})();
+
+/**
  * Every event queue the plugin opens is a server-side resource against the bot's queue budget, and
  * only the plugin knows the id. The ledger below is the class: whatever path minted a queue —
  * subscribe, a re-register after a GC, a blocking fetch's dedicated queue — the plugin must have
@@ -378,5 +416,56 @@ describe('zulip releases every event queue it opens', () => {
       expect(fake.requestCount(REGISTER)).toBe(recoveries + 1);
       expect(fake.requestCount(DELETE_QUEUE)).toBeGreaterThanOrEqual(fake.requestCount(REGISTER));
     });
+  }
+
+  it('the handshake routes are the ones subscribe() issues, and include the one that mints a queue', () => {
+    expect(HANDSHAKE_ROUTES.length).toBeGreaterThan(1);
+    expect(HANDSHAKE_ROUTES).toContain(REGISTER);
+  });
+
+  for (const route of HANDSHAKE_ROUTES) {
+    for (const entry of CONNECTION_ENDINGS) {
+      it(`${entry.name} cuts a subscribe() handshake black-holed at ${route}`, async () => {
+        const { plugin, fake } = await boot();
+        const topic = asTopic(`hang-${rand()}`);
+        await plugin.post(topic, SENDER, 'old');
+
+        fake.hangRoute(route);
+        let settled = false;
+        const outcome = plugin.subscribe(topic, () => undefined).then(
+          (value) => {
+            settled = true;
+            return { value };
+          },
+          (error: unknown) => {
+            settled = true;
+            return { error };
+          },
+        );
+        // Park in the handshake: the hung route must have been REACHED, or the row grades a
+        // subscribe that never got that far.
+        await vi.waitFor(() => expect(fake.requestCount(route)).toBeGreaterThan(0), {
+          timeout: 5000,
+          interval: 5,
+        });
+        expect(settled).toBe(false);
+
+        await entry.end(plugin, fake.url);
+        // Bounded, so that a handshake teardown cannot cut answers by TIMING OUT the row: the
+        // transport deadline settles it eventually either way, and only a settle inside this window
+        // is teardown doing the cutting.
+        const answer = await Promise.race([
+          outcome,
+          sleep(SETTLE_MS).then(() => 'still in flight' as const),
+        ]);
+
+        expect(answer).not.toEqual('still in flight');
+        expect(answer).not.toHaveProperty('value');
+        expect(String((answer as { error: unknown }).error)).toMatch(/connection was replaced/i);
+        // The queue ledger is deliberately NOT asserted here: a black-holed route never reaches the
+        // fake's queue-minting code, so no queue exists to release and `DELETE >= REGISTER` would
+        // grade nothing. The resolved-subscribe table above is what grades the ledger.
+      }, 30_000);
+    }
   }
 });

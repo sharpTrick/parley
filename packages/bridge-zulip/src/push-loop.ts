@@ -18,6 +18,12 @@ import { asArray, type EventsResponse, zulipToMessage } from './wire.js';
  * `BAD_EVENT_QUEUE_ID`; recovery re-registers and arms the same gap-fill, which `lastDeliveredId`
  * dedupes against the events the fresh queue then delivers.
  */
+const replacedDuringHandshake = (): Error =>
+  new Error(
+    'Zulip connection was replaced while subscribe() was registering its event queue, so no ' +
+      'subscription exists on the connection this call addressed. Reissue it.',
+  );
+
 export async function startPushLoop(
   conn: ZulipConnection, topic: Topic, handler: MessageHandler,
 ): Promise<void> {
@@ -28,14 +34,25 @@ export async function startPushLoop(
   // Keep the queue's own transport pinned here, so that abandoning it drops it on the server that
   // minted it rather than offering its id to whatever connection replaced this one.
   const rest = conn.rest;
-  let lastDeliveredId = await probeTail(conn, topic, generation);
-  const reg = await rest.register(wire);
+  // Keep BOTH handshake round trips on the teardown signal, so that a `disconnect()` landing while
+  // a server answers neither cuts them instead of returning with them still in flight — the CLI
+  // calls `process.exit(0)` the moment shutdown resolves, so whatever is still in flight then is
+  // killed mid-request rather than finished.
+  let lastDeliveredId: number | undefined;
+  let reg: Awaited<ReturnType<typeof rest.register>>;
+  try {
+    lastDeliveredId = await probeTail(conn, topic, { generation, signal });
+    reg = await rest.register(wire, signal);
+  } catch (err) {
+    if (alive()) throw err;
+    throw replacedDuringHandshake();
+  }
   if (!alive()) {
+    // Keep this delete, so that a register that answered just before teardown does not leave its
+    // queue behind: this is the only arm that ever learns the id, since an aborted one never reads
+    // the response that carries it.
     await rest.deleteQueue(reg.queue_id);
-    throw new Error(
-      'Zulip connection was replaced while subscribe() was registering its event queue, so no ' +
-        'subscription exists on the connection this call addressed. Reissue it.',
-    );
+    throw replacedDuringHandshake();
   }
   const state: QueueState = { queueId: reg.queue_id };
   conn.queues.add(state);

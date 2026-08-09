@@ -103,11 +103,9 @@ export async function readWindow(
  * no usable id — a tail that cannot be established, and so one nothing may be replayed from.
  */
 export async function probeTail(
-  conn: ZulipConnection, topic: Topic, generation: number,
+  conn: ZulipConnection, topic: Topic, opts: ReadOpts,
 ): Promise<number | undefined> {
-  const { messages, sawRecords } = await readWindow(conn, topic, undefined, TAIL_PROBE_PAGE, {
-    generation,
-  });
+  const { messages, sawRecords } = await readWindow(conn, topic, undefined, TAIL_PROBE_PAGE, opts);
   const newest = messages.at(-1);
   if (newest !== undefined) return Number(newest.backendMsgId);
   return sawRecords ? undefined : 0;
