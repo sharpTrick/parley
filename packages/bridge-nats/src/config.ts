@@ -155,12 +155,22 @@ export function validatePrefix(
 const NS_PER_DAY = 86_400_000_000_000;
 
 /**
+ * One past the largest `max_age` JetStream's int64 can hold. Every double below this is a legal
+ * int64; `2**63` itself and everything above it — including `Infinity` — is not.
+ */
+const MAX_AGE_NS_LIMIT = 2 ** 63;
+
+/**
  * The stream's `max_age`, in the nanoseconds JetStream takes, or undefined for unlimited.
  * JetStream reads `max_age: 0` as UNLIMITED, so a window that composes zero would mean the exact
  * opposite of what an operator wrote, and a negative value fails later with an unrelated driver
- * error. Judge the NANOSECONDS the days compose rather than the days, so that a positive number of
- * days too small to round to one nanosecond cannot slip past into a stream whose retention is then
- * locked in at creation.
+ * error. Judge the NANOSECONDS the days compose rather than the days, and bound them from BOTH
+ * sides, so that neither a positive number of days too small to round to one nanosecond nor one
+ * large enough to leave int64 can slip past into a stream whose retention is then locked in at
+ * creation. Over int64 the two failures differ but neither is survivable: up to the double's own
+ * range the server refuses the stream with `invalid json` on every post, and past it the composed
+ * value is `Infinity`, which serializes to `null` and which the server stores as `max_age: 0` —
+ * unlimited, silently, exactly what the low guard exists to prevent.
  */
 export function validateRetentionMaxAgeNs(days: number | undefined): number | undefined {
   if (days === undefined) return undefined;
@@ -173,6 +183,11 @@ export function validateRetentionMaxAgeNs(days: number | undefined): number | un
   if (maxAgeNs < 1) {
     throw new Error(
       `invalid retention_days ${JSON.stringify(days)} — it composes a max_age of ${maxAgeNs}ns, which JetStream reads as UNLIMITED retention, the opposite of a retention window`,
+    );
+  }
+  if (maxAgeNs >= MAX_AGE_NS_LIMIT) {
+    throw new Error(
+      `invalid retention_days ${JSON.stringify(days)} — it composes a max_age of ${maxAgeNs}ns, past the 2^63-1 nanoseconds JetStream's int64 can hold, so the stream would either be refused on every post or be created with UNLIMITED retention`,
     );
   }
   return maxAgeNs;

@@ -165,59 +165,107 @@ describe('nats backend_config — documented connection fields reach the driver'
   }
 
   // Class: a value judged in the OPERATOR's unit and applied in the BACKEND's unit, where the
-  // conversion can carry an accepted value back into the region the validator refuses. The rows
-  // above sit at operator scale — the smallest is twelve orders of magnitude above the boundary —
-  // so they cannot see it. These are generated across the conversion itself, and the verdict is not
-  // stated per row: whichever side of the boundary a row lands on, a stream that gets created must
-  // never carry the `max_age: 0` JetStream reads as unlimited, which is the one outcome the whole
-  // validator exists to prevent and the one that is locked in at creation.
-  const boundaryDays = [
-    1e-15,
-    5e-15,
-    1e-12,
-    1e-9,
-    1e-6,
-    0.2 / NS_PER_DAY,
-    0.5 / NS_PER_DAY,
-    1 / NS_PER_DAY,
-    2 / NS_PER_DAY,
-    1000 / NS_PER_DAY,
+  // conversion can carry an accepted value OUT of the range the backend can represent — at EITHER
+  // end. The rows above sit at operator scale — the smallest is twelve orders of magnitude above
+  // the low boundary and the largest fifteen below the high one — so they cannot see either. These
+  // are generated across the conversion itself, and the verdict is not stated per row: whichever
+  // side of a boundary a row lands on, a stream that gets created must carry a max_age JetStream
+  // can actually hold, because whatever it carries is locked in at creation.
+  //
+  // JetStream's max_age is an int64 nanosecond count and it reads 0 as UNLIMITED, so the only
+  // values that mean what an operator wrote are the finite numbers in [1, 2^63). Both edges are the
+  // SERVER's, measured against nats:2.10-alpine: max_age 9223372036854774784 (the largest double
+  // below 2^63) is stored verbatim, 2^63 is refused with `invalid json`, and Infinity — which
+  // JSON.stringify writes as `null` — is ACCEPTED and stored as max_age 0, i.e. unlimited.
+  const MAX_AGE_NS_LIMIT = 2 ** 63;
+  const holdable = (maxAge: number): boolean =>
+    Number.isFinite(maxAge) && maxAge >= 1 && maxAge < MAX_AGE_NS_LIMIT;
+
+  const boundaryDays: { days: number; end: 'low' | 'high' }[] = [
+    { days: 1e-15, end: 'low' },
+    { days: 5e-15, end: 'low' },
+    { days: 1e-12, end: 'low' },
+    { days: 1e-9, end: 'low' },
+    { days: 1e-6, end: 'low' },
+    { days: 0.2 / NS_PER_DAY, end: 'low' },
+    { days: 0.5 / NS_PER_DAY, end: 'low' },
+    { days: 1 / NS_PER_DAY, end: 'low' },
+    { days: 2 / NS_PER_DAY, end: 'low' },
+    { days: 1000 / NS_PER_DAY, end: 'low' },
+    { days: 1e4, end: 'high' },
+    { days: 1.06e5, end: 'high' },
+    { days: 1.07e5, end: 'high' },
+    { days: 1e6, end: 'high' },
+    { days: 1e18, end: 'high' },
+    { days: 1e294, end: 'high' },
+    { days: 1e300, end: 'high' },
+    { days: Number.MAX_VALUE, end: 'high' },
   ];
 
-  const composedMaxAge = async (days: number): Promise<number | 'refused'> => {
+  interface BoundaryRow {
+    days: number;
+    end: 'low' | 'high';
+    maxAge: number | 'refused';
+    /** What `max_age` survives as once the config is serialized — `Infinity` does not. */
+    onTheWire: unknown;
+  }
+
+  const composedMaxAge = async (days: number): Promise<Omit<BoundaryRow, 'days' | 'end'>> => {
     const plugin = new NatsPlugin();
     const err = await plugin
       .connect({ retention_days: days })
       .then(() => undefined, (e: unknown) => e);
     if (err !== undefined) {
       expect(String(err)).toContain('retention_days');
-      return 'refused';
+      return { maxAge: 'refused', onTheWire: 'refused' };
     }
     const fake = fakeJetStream();
     injectFake(plugin, fake);
     await plugin.post(asTopic('retention'), asHandle('sys'), 'x');
     await plugin.disconnect();
-    return fake.state.added?.max_age ?? Number.NaN;
+    const added = fake.state.added ?? {};
+    const wire = JSON.parse(JSON.stringify(added)) as { max_age?: unknown };
+    return { maxAge: added.max_age ?? Number.NaN, onTheWire: wire.max_age };
   };
 
-  const composedBoundary = async (): Promise<{ days: number; maxAge: number | 'refused' }[]> => {
-    const out: { days: number; maxAge: number | 'refused' }[] = [];
-    for (const days of boundaryDays) out.push({ days, maxAge: await composedMaxAge(days) });
+  const composedBoundary = async (): Promise<BoundaryRow[]> => {
+    const out: BoundaryRow[] = [];
+    for (const row of boundaryDays) out.push({ ...row, ...(await composedMaxAge(row.days)) });
     return out;
   };
 
-  it('no accepted retention_days composes the max_age JetStream reads as unlimited', async () => {
+  it('no accepted retention_days composes a max_age JetStream cannot hold', async () => {
     const composed = await composedBoundary();
-    const unlimited = composed.filter((r) => r.maxAge !== 'refused' && !(r.maxAge >= 1));
-    expect(unlimited).toEqual([]);
+    const unholdable = composed.filter((r) => r.maxAge !== 'refused' && !holdable(r.maxAge));
+    expect(unholdable).toEqual([]);
+  });
+
+  // The clause no numeric range assertion on the JS value can see: a max_age that means one thing
+  // in the process and another once it is serialized. Infinity becomes null, which the server
+  // stores as 0 — unlimited.
+  it('every accepted retention_days composes a max_age that survives serialization', async () => {
+    const composed = await composedBoundary();
+    const lost = composed.filter((r) => r.maxAge !== 'refused' && r.onTheWire !== r.maxAge);
+    expect(lost).toEqual([]);
   });
 
   // A generator is worth what it emits: rows that were all refused, or all accepted, would grade
-  // the invariant above against nothing.
-  it('the boundary rows straddle the conversion — some refused, some accepted', async () => {
+  // the invariants above against nothing — and one that straddles only ONE boundary grades only
+  // that end, which is how the high end shipped unguarded.
+  it('the boundary rows straddle the conversion at both ends — some refused, some accepted', async () => {
     const composed = await composedBoundary();
-    expect(composed.filter((r) => r.maxAge === 'refused').length).toBeGreaterThan(0);
-    expect(composed.filter((r) => r.maxAge !== 'refused').length).toBeGreaterThan(0);
+    const straddle = (['low', 'high'] as const).map((end) => {
+      const rows = composed.filter((r) => r.end === end);
+      return {
+        end,
+        refused: rows.some((r) => r.maxAge === 'refused'),
+        accepted: rows.some((r) => r.maxAge !== 'refused'),
+      };
+    });
+    expect(straddle).toEqual([
+      { end: 'low', refused: true, accepted: true },
+      { end: 'high', refused: true, accepted: true },
+    ]);
   });
 
 

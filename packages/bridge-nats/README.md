@@ -131,9 +131,17 @@ the server may or may not offer. A loopback server is not warned about.
 `retention_days` sets the per-topic stream's native `max_age` at creation time — JetStream's own
 built-in retention (this plugin just supplies the value), so no separate pruning code runs here.
 It's off by default — `max_age` is unset and JetStream keeps every message forever unless you opt
-in. It must be a positive number of days: `0` is rejected at `connect()` rather than passed
-through, because JetStream reads `max_age: 0` as *unlimited* — the opposite of what it reads as.
-Omit the field for that, don't write `0`. **It only applies when this plugin is the one that creates the stream** (the first `post`
+in. It must be a positive number of days that composes a `max_age` JetStream's int64 nanosecond
+field can hold — from about `6e-15` days (the smallest window that rounds up to one nanosecond) to
+about `106751.99` days (~292 years, the largest that fits int64). Values outside that range are
+rejected at `connect()` rather than passed through, because outside it the composed `max_age` stops
+meaning what you wrote:
+below the low end it rounds to `0`, which JetStream reads as *unlimited* — the opposite of what it
+reads as — and above the high end it either overflows int64, so the server refuses the stream on
+every `post`, or overflows the double to `Infinity`, which serializes to `null` and which the
+server stores as `max_age: 0`, unlimited again and locked in at creation. Omit the field for
+unlimited, don't write `0`.
+**It only applies when this plugin is the one that creates the stream** (the first `post`
 or `subscribe` on a fresh topic — a `fetchRecent` never creates one) — changing `retention_days` later does not
 retroactively update an already-existing stream; use `nats stream edit` (or recreate it) for that.
 As with the other backends, catch-up after the retention window just returns less history, with no
