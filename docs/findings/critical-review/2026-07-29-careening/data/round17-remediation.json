@@ -1,0 +1,83 @@
+{
+ "round": 17,
+ "phase": "remediation",
+ "base": "8e8d22e",
+ "blockingFindings": 30,
+ "status": "IN PROGRESS \u2014 25/30 closed at time of writing",
+ "runShape": "Review ran in three batches of five targets after twelve container reprovisions killed three all-or-nothing attempts. Remediation ran in waves of four, then two, for the same reason.",
+ "instrumentRulesAdded": [
+  "A mutation is ONE literal edit. A bundled mutation's red is unattributable \u2014 it proves the bundle matters, not any member. sqlite's manifest bundled four edits; isolating the fourth found that line completely ungraded, and chasing it found two more mutually-masking guards and a fifth mutation that had been surviving unnoticed.",
+  "A guard that survives its own mutation is unreachable, redundant, deliberate defence-in-depth, or graded some other way \u2014 and which one must be stated. telegram supplied the fourth case: its no-progress refusal is reachable and directly asserted, but its only available mutation manifests as a LIVELOCK rather than a failing assertion, so it is graded by a positive assertion and a hang was correctly not counted as a red.",
+  "Never use the empty string as a mutation's replacement. The revert then searches for '' , matches once per character, and is refused; a discarded error made three subsequent sqlite measurements run against a still-mutated file and produce a plausible wrong number.",
+  "Check WHICH gate you ran. An agent reported 'tsc -b clean' and was right \u2014 tsc -b does not cover tsconfig.test.json, and CI runs typecheck:test separately, which the change had broken."
+ ],
+ "wrongPrescriptions": {
+  "note": "Round 17 produced ten more, none caught by any test suite. The running total across rounds 9-17 is 53.",
+  "cases": [
+   {
+    "target": "xmpp",
+    "mode": "the prescribed guard is UNFALSIFIABLE",
+    "detail": "The agent BUILT the prescribed `type === undefined` MAM guard, mutated it, and watched the mutation survive the whole suite \u2014 the downstream resource check already rejected the only reachable input. First wrong prescription in the run caught at implementation time by the fixer's own mutation step rather than by a later reviewer. It was also a portability hazard: a server stamping type='normal' would have silently lost all catch-up."
+   },
+   {
+    "target": "sqlite",
+    "mode": "the fix RELOCATES the bug",
+    "detail": "Deleting the file::memory: term keeps the syntactic classification, so `file:store.db` still leaves 0644 \u2014 measured. And `file::memory:?cache=shared` becomes a startup failure, because it forces a genuinely in-memory database onto the on-disk arm."
+   },
+   {
+    "target": "sqlite",
+    "mode": "the finding's own premise is false",
+    "detail": "It states neither shipped driver enables SQLITE_OPEN_URI. node:sqlite on Node 22.22.2 does, so the same config names a DIFFERENT STORE depending on which driver is installed."
+   },
+   {
+    "target": "core-engine",
+    "mode": "the fix is arithmetically impossible",
+    "detail": "A per-entry allowance cannot exist: 50ms over 128 roster entries is 0.39ms each, while one screened match at the ambiguity cap costs 0.4ms."
+   },
+   {
+    "target": "core-auth",
+    "mode": "the fix REFUSES a legitimate value",
+    "detail": "Adding 'function' to the type enumeration leaves the probe at hop 0, where Express compiles a hop count to (a,i) => i < val \u2014 true for every address. So `trustProxy: (ip,i) => i < 2`, a legal hop count in function form, would have been newly refused at boot."
+   },
+   {
+    "target": "matrix",
+    "mode": "the stated reason is false on its own terms",
+    "detail": "'The seam has no error channel' \u2014 sqlite and nats both refuse a non-positive limit, telegram records the adjudication explicitly, and core bounds catchup.limit with int().positive()."
+   },
+   {
+    "target": "telegram",
+    "mode": "the prescribed assertion is false by construction",
+    "detail": "An extra row asserting the three interruption invariants for a short write that does not error: once the writer loops, the compaction SUCCEEDS, so 'pre-compaction records all readable' is false."
+   },
+   {
+    "target": "telegram",
+    "mode": "the fix RELOCATES the coincidence",
+    "detail": "Making the fixture longer than the largest negative magnitude is reinstated by any later row with a bigger magnitude."
+   },
+   {
+    "target": "postgres",
+    "mode": "the named helper does not exist and is the wrong shape",
+    "detail": "'Reuse the withDeadline helper listener.ts already exports' \u2014 it does not export it, and it REJECTS, which would turn a give-up into a throw, and it does not touch pendingAborts, leaving the wait unreleasable, which is half the filed defect."
+   },
+   {
+    "target": "shared",
+    "mode": "the guard is placed on the wrong knob",
+    "detail": "Validating opts.deadlineMs up front leaves `now: () => NaN` producing a non-finite budget from a finite deadline, still throwing raw."
+   }
+  ]
+ },
+ "mutuallyMaskingGuards": {
+  "note": "The shape a single-edit mutation exists to expose. Neither member reddens alone, so a later editor deletes whichever was load-bearing with the suite green.",
+  "found": [
+   "sqlite: reschedule guard vs the three tick checkpoints (deleted)",
+   "sqlite: top-of-tick vs post-loop check (one kept)",
+   "sqlite: generation bump in connect() vs disconnect() (one kept)",
+   "postgres: the agent DECLINED to add an entry guard preemptively, because it would have made the post-wait guard unmutatable"
+  ]
+ },
+ "operatorErrors": [
+  "Landed a capacity registry using import.meta.glob without running typecheck:test; tsc -b passes and CI's separate typecheck step does not. Found by a cross-package agent with no stake in the file.",
+  "A 10-minute limit killed a mutation replay mid-run, leaving the file mutated; restored from the .mutbak snapshot rather than git checkout.",
+  "An expectFail fragment I guessed did not match the assertion's real text, so the harness refused to count a genuine red. Isolating the mutation showed it grading correctly."
+ ]
+}
