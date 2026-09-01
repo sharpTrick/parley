@@ -23,7 +23,20 @@ rm -rf "$dir"
 git worktree prune
 git worktree add --detach -q "$dir" "$base"
 
-cp -al "$root/node_modules" "$dir/node_modules"
+# Hard links cannot cross filesystems. /tmp is tmpfs on a normal desktop while the checkout is on
+# the home volume, so a worktree base under /tmp fails here with EXDEV even though it worked on the
+# single-filesystem cloud container this was written on. Say so, rather than leaving the operator to
+# read `cp: Invalid cross-device link` and guess.
+if ! cp -al "$root/node_modules" "$dir/node_modules" 2>/dev/null; then
+  rm -rf "$dir/node_modules"
+  echo "REFUSING: cannot hard-link node_modules from $root into $dir." >&2
+  echo "  They are on different filesystems ($(df -P "$root" | awk 'NR==2{print $1}') vs $(df -P "$(dirname "$dir")" | awk 'NR==2{print $1}'))." >&2
+  echo "  Hard links are what make a worktree cost no disk; copying fifteen dependency trees is not the fallback." >&2
+  echo "  Set CAREENING_WORKTREES to a path on the same filesystem as the checkout, e.g.:" >&2
+  echo "    export CAREENING_WORKTREES=\"$(dirname "$root")/.careening/worktrees\"" >&2
+  git worktree remove --force "$dir" 2>/dev/null || rm -rf "$dir"
+  exit 1
+fi
 
 # Re-point every workspace link at THIS worktree, so that a cross-package edit is visible to the
 # typecheck that is supposed to catch it.

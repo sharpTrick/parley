@@ -61,7 +61,9 @@ for (const s of SERVICES) services.push({ ...s, up: daemon ? await reachable(s.p
 // and the quietest: the runner only tells a critic to `cd` into one, so fifteen critics will review
 // a stale tree and return a full round of findings that look exactly like a valid round. Round 17
 // spent 3.12M tokens reviewing a commit four rounds old before anyone noticed.
-const WORKTREES = '/tmp/careening/worktrees';
+const repoRoot = run('git', ['rev-parse', '--show-toplevel']) ?? '.';
+const WORKTREES =
+  process.env.CAREENING_WORKTREES ?? `${repoRoot}/../.careening/worktrees`;
 // Default to HEAD, so that starting a fresh round on a stale tree is refused. But a round that runs
 // in BATCHES must keep every batch on the round's own base — committing this round's findings moves
 // HEAD, and rebasing the worktrees mid-round would mean later batches reviewed a different tree than

@@ -18,8 +18,15 @@ import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
-const ROOT = '/home/user/parley';
-const BASE = '/tmp/careening/worktrees';
+// Derive the checkout from git, not from a literal. This said '/home/user/parley' — the path on the
+// cloud container it was written on — so every worktree it made on any other machine would have
+// pointed at a directory that does not exist.
+const ROOT = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+// Default beside the checkout, NOT under /tmp: hard-linking node_modules is what makes a worktree
+// cost no disk, and /tmp is a different filesystem from the repo on any normal desktop. Override
+// with CAREENING_WORKTREES when a same-device scratch path is wanted elsewhere.
+const BASE =
+  process.env.CAREENING_WORKTREES ?? join(ROOT, '..', '.careening', 'worktrees');
 
 export const TARGETS = [
   'core-seam',
