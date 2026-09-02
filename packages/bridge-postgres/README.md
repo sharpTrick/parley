@@ -170,6 +170,13 @@ and hold megabytes — and PostgreSQL will not take an index row past 2704 bytes
 screen is blind to compression, so a long repetitive topic the server would have squeezed into an
 index is refused too: whether a topic is usable should not depend on how well it compresses.
 
+A refusal this backend does not anticipate — a permission the role lost, a filled disk, a relation
+dropped out from under a live pool — comes back as `parley-postgres: the write to topic 'x' failed
+— the database refused it (42P01). …`: the operation, the server's own code for the condition, and
+nothing else the server wrote. PostgreSQL's message quotes your deployment — its relation names,
+and for a dial failure the host and port it could not reach — and a rejected seam call is rendered
+into the model's context, so the driver's full text goes to stderr for the operator instead.
+
 ## Run Postgres
 
 Use the **official `postgres` Docker image** (not authored here):

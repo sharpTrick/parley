@@ -1,3 +1,4 @@
+import { Pool, type PoolClient } from 'pg';
 import { LOCK_WAIT_MS } from './errors.js';
 
 /**
@@ -50,6 +51,64 @@ export interface Closeable {
   end: () => Promise<unknown>;
 }
 
+/**
+ * A driver's socket, reached through as many optional hops as it puts in the way. Keep every hop
+ * optional, so that a driver that renames one leaves {@link endWithin} bounded by its deadline
+ * instead of throwing inside `disconnect()`.
+ */
+interface Stream {
+  destroyed?: boolean;
+  destroy?: () => void;
+  once?: (event: string, listener: () => void) => void;
+}
+
+/**
+ * Every client a pool has dialled and not finished closing. pg-pool empties its own client array
+ * SYNCHRONOUSLY when `end()` starts and only afterwards calls `end()` on each client, so a pool
+ * whose peer stopped answering RESOLVES its `end()` with every socket it opened still live and
+ * nothing left on the pool to reach them through. Keep this fed from the pool's own documented
+ * events, so that a teardown can.
+ */
+const poolClients = new WeakMap<object, Set<PoolClient>>();
+
+/**
+ * The one place this plugin opens a pool. Keep it here with {@link SOCKET_BOUNDS}, so that a pool
+ * added by a later path cannot be the one whose sockets a teardown has no way to close.
+ */
+export function openPool(url: string, max: number): Pool {
+  const pool = new Pool({ connectionString: url, max, ...SOCKET_BOUNDS });
+  const live = new Set<PoolClient>();
+  poolClients.set(pool, live);
+  pool.on('connect', (client) => live.add(client));
+  pool.on('remove', (client) => live.delete(client));
+  return pool;
+}
+
+/** The sockets `resource` is still holding: a pool's, through the clients it owns, or its own. */
+function streamsOf(resource: Closeable): Stream[] {
+  const clients = poolClients.get(resource);
+  const holders: unknown[] = clients === undefined ? [resource] : [...clients];
+  return holders
+    .map((holder) => (holder as { connection?: { stream?: Stream } }).connection?.stream)
+    .filter((stream): stream is Stream => stream !== undefined && stream !== null);
+}
+
+/**
+ * Resolves once every socket `resource` holds right now is gone. A driver `end()` that has resolved
+ * is not that: pg-pool's resolves as soon as it has let go of its clients, whether or not their
+ * sockets ever closed.
+ */
+function socketsClosed(resource: Closeable): Promise<void> {
+  const gone = streamsOf(resource).map(
+    (stream) =>
+      new Promise<void>((resolve) => {
+        if (stream.destroyed === true || stream.once === undefined) resolve();
+        else stream.once('close', resolve);
+      }),
+  );
+  return Promise.all(gone).then(() => undefined);
+}
+
 async function settledWithin(work: Promise<unknown>, budgetMs: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -65,13 +124,11 @@ async function settledWithin(work: Promise<unknown>, budgetMs: number): Promise<
 }
 
 /**
- * pg offers no supported force-close, and this is the socket `pg-pool` destroys itself when its own
- * connection timeout fires. Keep every hop optional, so that a driver that renames the field leaves
- * {@link endWithin} bounded by its deadline instead of throwing inside `disconnect()`.
+ * pg offers no supported force-close, and these are the sockets `pg-pool` destroys itself when its
+ * own connection timeout fires.
  */
 function destroySocket(resource: Closeable): void {
-  const socket = resource as { connection?: { stream?: { destroy?: () => void } } };
-  socket.connection?.stream?.destroy?.();
+  for (const stream of streamsOf(resource)) stream.destroy?.();
 }
 
 /**
@@ -86,7 +143,8 @@ export async function endWithin(resource: Closeable, budgetMs: number): Promise<
     () => undefined,
     () => undefined,
   );
-  if (await settledWithin(ended, budgetMs)) return;
+  const closed = Promise.all([ended, socketsClosed(resource)]).then(() => undefined);
+  if (await settledWithin(closed, budgetMs)) return;
   destroySocket(resource);
-  await settledWithin(ended, DESTROY_GRACE_MS);
+  await settledWithin(closed, DESTROY_GRACE_MS);
 }

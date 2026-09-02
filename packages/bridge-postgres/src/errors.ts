@@ -184,18 +184,45 @@ export function lockWaitAbandoned(what: string, err: unknown): Error {
 }
 
 /**
+ * The driver's own text, to the OPERATOR. PostgreSQL's message quotes the deployment — its relation
+ * names, and for a dial failure the host and port it could not reach — and a rejected seam call is
+ * rendered into the model's context by core's tools.ts, so an untrusted conversation would carry
+ * the schema and the network topology behind the bridge. Keep the text going SOMEWHERE, so that
+ * removing it from the answer does not leave a permission error or a filled disk reaching nobody at
+ * all: this plugin logs nothing else.
+ */
+function toOperator(what: string, detail: string): void {
+  console.error(`[parley-postgres] ${what} failed — ${detail}`);
+}
+
+/**
+ * The server's own classification of a refusal, and the only part of an error this plugin hands
+ * back verbatim. A SQLSTATE ('42P01') or a Node dial code ('ECONNREFUSED') is a fixed vocabulary an
+ * operator can look up; every other field the driver fills in is written from the deployment.
+ */
+function codeOf(err: unknown): string {
+  const code = (err as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && code !== '' ? ` (${code})` : '';
+}
+
+/**
  * Name a server refusal this plugin never anticipated. {@link answerAbandoned} and
  * {@link lockWaitAbandoned} each rename ONE shape and hand everything else back untouched, so every
  * other SQLSTATE — a permission the role does not have, a filled disk, a relation dropped under a
  * live pool, an index key the server would not take — reaches agent context as a bare PostgreSQL
- * string naming neither this plugin nor the operation, and disclosing the deployment's own relation
- * names. Keep this OUTSIDE the two renames above, so that adding a third cannot leave a gap.
+ * string naming neither this plugin nor the operation. Keep this OUTSIDE the two renames above, so
+ * that adding a third cannot leave a gap.
+ *
+ * Keep the answer built from a CODE rather than from the driver's message, so that what the caller
+ * gets cannot depend on which identifiers PostgreSQL happened to quote in the shape it hit.
  */
 export function serverRefused(what: string, err: unknown): Error {
   const detail = err instanceof Error ? err.message : String(err);
   if (detail === NOT_CONNECTED || detail.startsWith('parley-postgres:')) return err as Error;
+  toOperator(what, detail);
   return new Error(
-    `parley-postgres: ${what} failed — ${detail}. Nothing was written; the statement was refused ` +
-      'by the database, and a retry succeeds once the condition it names is cleared.',
+    `parley-postgres: ${what} failed — the database refused it${codeOf(err)}. Nothing was ` +
+      "written; the driver's own text is on this process's stderr for the operator, and a retry " +
+      'succeeds once the condition it names is cleared.',
   );
 }

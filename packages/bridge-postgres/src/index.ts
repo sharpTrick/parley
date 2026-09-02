@@ -10,14 +10,8 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { Pool, type PoolClient } from 'pg';
-import {
-  DIAL_WAIT_MS,
-  endWithin,
-  QUERY_WAIT_MS,
-  SOCKET_BOUNDS,
-  TEARDOWN_WAIT_MS,
-} from './connection.js';
+import type { Pool, PoolClient } from 'pg';
+import { DIAL_WAIT_MS, endWithin, openPool, QUERY_WAIT_MS, TEARDOWN_WAIT_MS } from './connection.js';
 import {
   DEFAULT_POOL_SIZE,
   DEFAULT_TABLE_NAME,
@@ -98,11 +92,7 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
       );
     }
 
-    const pool = new Pool({
-      connectionString: this.url,
-      max: cfg.pool_size ?? DEFAULT_POOL_SIZE,
-      ...SOCKET_BOUNDS,
-    });
+    const pool = openPool(this.url, cfg.pool_size ?? DEFAULT_POOL_SIZE);
     // Keep this no-op handler, so that an idle-client error (server restart) stays a rejected
     // command instead of an unhandled 'error' event that kills the process.
     pool.on('error', () => undefined);

@@ -179,9 +179,20 @@ describe('a transient read failure on the push path is recovered from, not dropp
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: URL });
     state.failReads = 1;
+    const logged: string[] = [];
+    const stderr = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => void logged.push(args.map(String).join(' ')));
     await expect(
       plugin.fetchRecent({ topic: asTopic('t'), since: asCursor('0') }),
-    ).rejects.toThrow(/administrator command/);
+    ).rejects.toThrow(/^parley-postgres: /);
+    stderr.mockRestore();
+    // The driver's own text goes to the operator rather than to the caller, so THAT is where this
+    // control has to look: a rejection naming this plugin is one any failure produces, and the
+    // point here is that the failure below is the one this fake injected.
+    expect(logged.join('\n'), 'the fake did not reject the windowed read at all').toMatch(
+      /administrator command/,
+    );
     await plugin.disconnect();
   });
 

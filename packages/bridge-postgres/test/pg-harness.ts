@@ -7,7 +7,7 @@
  * actually asserting without a reviewer seeing it. `test/suite-hygiene.test.ts` keeps them here.
  */
 
-import { createServer, connect as tcpConnect, type Server, type Socket } from 'node:net';
+import { createServer, connect as tcpConnect, type Server, Socket } from 'node:net';
 import { Client } from 'pg';
 
 export const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
@@ -205,6 +205,61 @@ export async function faultyProxy(url = PG_URL): Promise<FaultyProxy> {
     },
     close: shutdown(server, held),
   };
+}
+
+/** A live census of the sockets this process has dialled — see {@link watchSockets}. */
+export interface SocketWatch {
+  /** Sockets dialled at `port` that nobody has destroyed yet. */
+  openTo: (port: number) => number;
+  stop: () => void;
+}
+
+function dialledPort(args: readonly unknown[]): number {
+  const first = args[0];
+  if (typeof first === 'number') return first;
+  if (typeof first === 'object' && first !== null) return Number((first as { port?: unknown }).port);
+  return Number.NaN;
+}
+
+/**
+ * Watch every socket this process dials from here until {@link SocketWatch.stop}. The census a
+ * bounded teardown is actually about: `disconnect()` returning and the connections it was closing
+ * being GONE are different claims, and a settle order, a duration or a server-side backend count is
+ * satisfied by a teardown that hit its deadline and walked away from a live one.
+ *
+ * Kept as a record of what this process dialled, read through the documented `destroyed`, rather
+ * than taken from a fault in front of the database: a peer cannot tell a socket that was destroyed
+ * from one that merely half-closed, because pg's `end()` writes Terminate and a FIN and then waits,
+ * so a give-up path replaced by a no-op still looks like a closing connection from out there.
+ */
+export function watchSockets(): SocketWatch {
+  const dialled: { socket: Socket; port: number }[] = [];
+  const original = Socket.prototype.connect;
+  Socket.prototype.connect = function patched(this: Socket, ...args: unknown[]) {
+    dialled.push({ socket: this, port: dialledPort(args) });
+    return (original as (...a: unknown[]) => Socket).apply(this, args);
+  } as typeof Socket.prototype.connect;
+  return {
+    openTo: (port) => dialled.filter((d) => d.port === port && !d.socket.destroyed).length,
+    stop: () => {
+      Socket.prototype.connect = original;
+    },
+  };
+}
+
+/** Poll until nothing dialled at `port` is left open, so a socket mid-unwind is not read as a leak. */
+export async function settledSockets(
+  watch: SocketWatch,
+  port: number,
+  budgetMs = 2000,
+): Promise<number> {
+  const deadline = Date.now() + budgetMs;
+  let n = watch.openTo(port);
+  while (n > 0 && Date.now() < deadline) {
+    await sleep(50);
+    n = watch.openTo(port);
+  }
+  return n;
 }
 
 /** Poll until this plugin's backends are gone, so a slow FIN is not reported as a leak. */

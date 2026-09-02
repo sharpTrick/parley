@@ -34,6 +34,15 @@ const SETTLE_CEILING_MS = 30_000;
  */
 const CLEANUP_BUDGET_MS = 10_000;
 
+/**
+ * The figure past which a shutdown has stopped looking like one. Like the ceiling above it is a
+ * number an operator would pick, not one read out of the plugin's own teardown budget — a guard
+ * that takes its bound from the code it grades passes for any bound, including one a later change
+ * makes useless — and it sits well under the statement ceiling a parked call is sitting out, which
+ * is the wait the rows below exist to prove a teardown does not adopt.
+ */
+const TEARDOWN_CEILING_MS = 10_000;
+
 // Every row also grades the teardown, because the teardown is where a socket that will not close
 // gracefully is actually held: `pool.end()` and `Client.end()` both wait for a FIN that a black
 // hole never sends. A row that only checked its own call would leave that half ungraded.
@@ -151,10 +160,12 @@ if (await isUp(PG_URL)) {
 
     // `pool.end()` resolves only once every checked-out client is released, so a teardown that
     // simply awaits it inherits the wait of whatever seam call is still parked on the quiet peer.
-    // Graded as an ORDER rather than a duration: the property is that teardown does not adopt
-    // someone else's ceiling, and a number here would only restate whichever one the code picked.
+    // Teardown does not wait: it destroys the socket that call is parked on, which ENDS the call —
+    // so the two settle in the same breath and their order alone no longer separates a teardown
+    // that gave up from one that sat out the statement ceiling. Both halves are graded: the parked
+    // call is over by the time disconnect returns, and disconnect returned in a shutdown's time.
     it.each(PARKED_ON_A_STATEMENT)(
-      'disconnect() returns without waiting for a parked %s',
+      'disconnect() ends a parked %s rather than waiting it out',
       async (call) => {
         const proxy = await faultyProxy();
         const plugin = new PostgresPlugin();
@@ -172,12 +183,20 @@ if (await isUp(PG_URL)) {
             .finally(() => order.push(call));
           await sleep(250);
 
+          const started = Date.now();
           const teardown = await settleWithin(
             plugin.disconnect().then(() => order.push('disconnect')),
             SETTLE_CEILING_MS,
           );
+          const elapsed = Date.now() - started;
           expect(teardown, 'disconnect() never came back while a call was parked').toBe('resolved');
-          expect(order[0], `disconnect() waited out the parked ${call}`).toBe('disconnect');
+          expect(order, `disconnect() returned with the parked ${call} still stuck`).toEqual([
+            call,
+            'disconnect',
+          ]);
+          expect(elapsed, `disconnect() sat out the parked ${call}'s statement ceiling`).toBeLessThan(
+            TEARDOWN_CEILING_MS,
+          );
         } finally {
           await settleWithin(plugin.disconnect().catch(() => undefined), CLEANUP_BUDGET_MS);
           await proxy.close();

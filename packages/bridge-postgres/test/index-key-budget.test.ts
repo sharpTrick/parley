@@ -1,5 +1,5 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { INDEXED_FIELDS, MAX_INDEXED_BYTES } from '../src/errors.js';
 import { PostgresPlugin } from '../src/index.js';
 import { buildSchema } from '../src/schema.js';
@@ -245,8 +245,40 @@ describe.skipIf(!up)(`a refusal this plugin never anticipated is still named (${
     });
   }, 30000);
 
+  // What the SERVER says about a relation that is not there — the disclosure this plugin is between
+  // the agent and, and the classification it is allowed to pass on. Read off the server rather than
+  // written down here: a hand-written expectation of PostgreSQL's wording is the thing that makes
+  // the rows below pass on a deployment whose driver never named the relation in the first place.
+  const absent = `parley_absent_${rand()}`;
+  let discloses = { message: '', code: '' };
+
+  // Taken in setup rather than in the case below, so that running one row on its own still has it.
+  beforeAll(async () => {
+    discloses = await withAdmin(async (admin) => {
+      const failed = await admin.query(`SELECT 1 FROM "${absent}"`).then(
+        () => undefined,
+        (e: unknown) => e as { message: string; code: string },
+      );
+      return { message: failed?.message ?? '', code: failed?.code ?? '' };
+    });
+  });
+
+  it('the driver really does name the relation, so the rows below are not vacuous', () => {
+    expect(discloses.message, 'the server did not quote the relation it could not find').toContain(
+      absent,
+    );
+    expect(discloses.code, 'the server refused it with no code to hand on').not.toBe('');
+  });
+
+  // The class: no rejection `serverRefused` builds quotes the deployment. One row per seam call that
+  // reaches it, each against a relation name this run minted — a generated name cannot be satisfied
+  // by accident, the way a regex written against one remembered message can.
+  //
+  // `subscribe` is NOT here, and it leaks: its own wrapper hands a driver refusal through verbatim,
+  // and subscribe-errors.test.ts requires that of it by name. Closing that is a change to what that
+  // file asserts, not to this one.
   it.each(['post', 'fetchRecent', 'resolveIdentity'])(
-    '%s names this plugin when the relation is gone from under it',
+    '%s names this plugin, and not the deployment, when the relation is gone from under it',
     async (call) => {
       const gone = `parley_gone_${rand()}`;
       const solo = new PostgresPlugin();
@@ -257,6 +289,13 @@ describe.skipIf(!up)(`a refusal this plugin never anticipated is still named (${
           await admin.query(`DROP TABLE "${gone}_senders" CASCADE`);
         });
         const topic = asTopic(`gone-${rand()}`);
+        // Taking the detail out of the answer is only half of it: an operator whose role lost a
+        // permission, or whose disk filled, has to still learn of it somewhere, and this plugin
+        // logs nothing else at all.
+        const logged: string[] = [];
+        const stderr = vi
+          .spyOn(console, 'error')
+          .mockImplementation((...args: unknown[]) => void logged.push(args.map(String).join(' ')));
         const attempt =
           call === 'post'
             ? solo.post(topic, asHandle('u'), 'hi')
@@ -267,13 +306,22 @@ describe.skipIf(!up)(`a refusal this plugin never anticipated is still named (${
           () => 'RESOLVED',
           (e: unknown) => (e as Error).message,
         );
+        stderr.mockRestore();
         expect(message, 'the relation is gone — this must not read as a success').not.toBe(
           'RESOLVED',
         );
         expect(message).toMatch(/^parley-postgres: /);
-        expect(message, 'a bare driver string reached agent context').not.toMatch(
-          /^relation |does not exist$/,
+        expect(message, "the deployment's own relation name reached agent context").not.toContain(
+          gone,
         );
+        expect(
+          message,
+          'the refusal carries nothing the operator can look the condition up by',
+        ).toContain(discloses.code);
+        expect(
+          logged.join('\n'),
+          "the driver's text reached neither the caller nor the operator",
+        ).toContain(gone);
       } finally {
         await solo.disconnect().catch(() => undefined);
         await dropTable(gone);

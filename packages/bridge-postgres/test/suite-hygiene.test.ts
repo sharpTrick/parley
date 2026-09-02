@@ -54,9 +54,11 @@ describe('the real-server harness is shared, not restated', () => {
       'rand',
       'settleWithin',
       'settledBackendCount',
+      'settledSockets',
       'silentPeer',
       'sleep',
       'terminateBackends',
+      'watchSockets',
       'withAdmin',
     ]);
   });
