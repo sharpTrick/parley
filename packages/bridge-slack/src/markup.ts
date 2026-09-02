@@ -49,6 +49,14 @@ function renderMentions(text: string, mentionMap: Record<string, string>): strin
 }
 
 /**
+ * The entry's body. `text` is declared `string` by the vendor and enforced by nothing, so keep this
+ * a TYPE narrowing rather than a `?? ''` default, so that a non-string cannot reach
+ * `String.prototype.replace` — on the read path that TypeError escapes `fetchRecent`, and the entry
+ * sits at or above the caller's cursor, so every later catch-up throws on it again.
+ */
+const textOf = (m: SlackMessage): string => (typeof m.text === 'string' ? m.text : '');
+
+/**
  * The poster's Slack user/bot id, before `mention_map` resolves it to a Parley handle. A workflow-
  * or app-authored entry can carry neither field, and an EMPTY `senderHandle` breaks the seam's
  * well-formedness rule and lands in core's roster as a blank peer, so fall back to a stable name.
@@ -69,7 +77,7 @@ export function slackToMessage(
   return buildMessage({
     topic,
     sender: mentionMap[id] ?? id,
-    content: unescapeSlackText(renderMentions(m.text ?? '', mentionMap)),
+    content: unescapeSlackText(renderMentions(textOf(m), mentionMap)),
     // Informational only (DESIGN §5) — derived from the ts seconds, never used for ordering.
     timestamp: new Date(Number(m.ts.split('.')[0]) * 1000).toISOString(),
     id: m.ts,
