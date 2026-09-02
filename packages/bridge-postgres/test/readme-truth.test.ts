@@ -17,6 +17,7 @@ import {
   MIN_RETENTION_DAYS,
   PRUNE_BATCH,
 } from '../src/index.js';
+import { BTREE_MAX_ITEM_BYTES, MAX_INDEXED_BYTES } from '../src/errors.js';
 import { MAX_IDENTIFIER_BYTES, MAX_TABLE_NAME_BYTES } from '../src/schema.js';
 
 // The README is the surface that ships to npm, and it is the one place in this package where a
@@ -44,6 +45,16 @@ interface Claim {
 
 const CLAIMS: Claim[] = [
   { what: 'the table_name byte budget', pattern: /max (\d+) bytes/g, expected: MAX_TABLE_NAME_BYTES },
+  {
+    what: 'the index-key byte budget',
+    pattern: /over \*\*(\d+) bytes\*\* of UTF-8/g,
+    expected: MAX_INDEXED_BYTES,
+  },
+  {
+    what: "PostgreSQL's btree item limit",
+    pattern: /index row past (\d+) bytes/g,
+    expected: BTREE_MAX_ITEM_BYTES,
+  },
   {
     what: 'the table_name byte budget, restated',
     pattern: /capped at (\d+) bytes/g,

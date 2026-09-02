@@ -1,6 +1,7 @@
 import type { Topic } from '@sharptrick/parley-core';
 import type { Client, Pool } from 'pg';
 import { DEFAULT_TABLE_NAME, DEFAULT_URL } from './config.js';
+import { NOT_CONNECTED } from './errors.js';
 import type { ListenState } from './listen.js';
 import type { TopicSubscription } from './push.js';
 import { messagesSince } from './read.js';
@@ -65,7 +66,7 @@ export abstract class PluginState {
 
   protected require(): Pool {
     if (this.pool !== undefined) return this.pool;
-    throw new Error('PostgresPlugin not connected — call connect() first');
+    throw new Error(NOT_CONNECTED);
   }
 
   protected readSince(topic: Topic, since: string, limit: number): Promise<MessageRow[]> {

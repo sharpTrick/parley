@@ -5,9 +5,10 @@ import { dropTable, isUp, PG_URL, rand, withAdmin } from './pg-harness.js';
 import {
   CORPUS,
   type Field,
-  indexableFields,
+  fieldsThatHold,
   ROUND_TRIP_VALUES,
   ROUND_TRIPS,
+  TOO_LONG_TO_INDEX,
 } from './storable-corpus.js';
 
 // A corpus row claiming a value is stored and read back unchanged is claiming something about the
@@ -26,8 +27,10 @@ const table = `parley_rt_${rand()}`;
 /** Values proven against the server, filled in by the cells below and audited by the last case. */
 const proven = new Set<string>();
 
-const CELLS = CORPUS.filter(([, , arm]) => arm === ROUND_TRIPS).flatMap(([label, value]) =>
-  indexableFields(value).map((field) => [`${field} carrying ${label}`, field, value] as const),
+const CELLS = CORPUS.filter(
+  ([, , arm]) => arm === ROUND_TRIPS || arm === TOO_LONG_TO_INDEX,
+).flatMap(([label, value]) =>
+  fieldsThatHold(value).map((field) => [`${field} carrying ${label}`, field, value] as const),
 );
 
 let plugin: PostgresPlugin;

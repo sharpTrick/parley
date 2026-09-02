@@ -7,8 +7,18 @@
  * green under a row claiming it was fine.
  */
 
+import { INDEXED_FIELDS, MAX_INDEXED_BYTES } from '../src/errors.js';
+
 export const REFUSED = 'refused by name, before any SQL';
 export const ROUND_TRIPS = 'stored, and read back byte-identical';
+/**
+ * The one arm whose verdict depends on WHICH field carries the value: too long for a btree key, so
+ * refused for the fields this backend indexes and stored for the fields it does not. A row declared
+ * flatly REFUSED here would demand that `content` reject a 4 KiB string, which the server holds
+ * happily; a row declared flatly ROUND_TRIPS would drive it into `topic`, where the server answers
+ * SQLSTATE 54000.
+ */
+export const TOO_LONG_TO_INDEX = 'refused for an indexed field, stored for the rest';
 
 export type Field = 'content' | 'topic' | 'handle' | 'inReplyTo';
 
@@ -39,6 +49,40 @@ const UNPAIRED: [label: string, value: string][] = [
 ];
 
 /**
+ * Printable ASCII a compressor cannot shrink, from a fixed seed so every run measures the same
+ * bytes. The generator matters as much as the length: PostgreSQL compresses an index key before it
+ * measures it, so `'x'.repeat(n)` fits in a btree at any n and grades nothing about the ceiling.
+ */
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{};:,.<>?';
+
+export function incompressible(bytes: number, seed = 12345): string {
+  let state = seed >>> 0;
+  let out = '';
+  for (let i = 0; i < bytes; i++) {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    out += ALPHABET[(state >>> 8) % ALPHABET.length] as string;
+  }
+  return out;
+}
+
+/**
+ * Both sides of the btree ceiling, anchored to the plugin's own budget so a limit that moves moves
+ * WHICH row fires instead of silencing the rule. Every one of these is generated, so the corpus can
+ * straddle a boundary no hand-typed value would land on.
+ */
+const BOUNDARY: [label: string, value: string, arm: string][] = [
+  ['a value comfortably inside the index-key budget', incompressible(2600, 1), ROUND_TRIPS],
+  ['a value exactly at the index-key budget', incompressible(MAX_INDEXED_BYTES, 2), ROUND_TRIPS],
+  [
+    'a value one byte past the index-key budget',
+    incompressible(MAX_INDEXED_BYTES + 1, 3),
+    TOO_LONG_TO_INDEX,
+  ],
+  ['a value at four kibibytes', incompressible(4096, 4), TOO_LONG_TO_INDEX],
+  ['a value at eight kibibytes', incompressible(8192, 5), TOO_LONG_TO_INDEX],
+];
+
+/**
  * One row per distinct STORAGE hazard, not one per string someone thought of. The NUL and unpaired
  * surrogate rows are the ones this backend cannot store as given; the rest merely LOOK hostile and
  * must keep working, so the rule cannot degenerate into "refuse anything unusual".
@@ -50,7 +94,7 @@ export const CORPUS: [label: string, value: string, arm: string][] = [
   ['nothing but a NUL', NUL, REFUSED],
   ...UNPAIRED.map(([label, value]): [string, string, string] => [label, value, REFUSED]),
   ['an astral plane character', 'family 👨‍👩‍👧‍👦 emoji', ROUND_TRIPS],
-  ['a megabyte of text', 'x'.repeat(1024 * 1024), ROUND_TRIPS],
+  ['a megabyte of text', 'x'.repeat(1024 * 1024), TOO_LONG_TO_INDEX],
   ['SQL punctuation', `'; DROP TABLE "parley_messages"; --`, ROUND_TRIPS],
   ['a backslash and a newline', 'a\\b\nc', ROUND_TRIPS],
   [
@@ -60,20 +104,28 @@ export const CORPUS: [label: string, value: string, arm: string][] = [
   ],
   ['a combining sequence left decomposed', 'école'.normalize('NFD'), ROUND_TRIPS],
   ['leading and trailing whitespace', ' padded ', ROUND_TRIPS],
+  ...BOUNDARY,
 ];
 
-export const ROUND_TRIP_VALUES: string[] = CORPUS.filter(([, , arm]) => arm === ROUND_TRIPS).map(
-  ([, value]) => value,
-);
+/** Which arm this value takes in this field — see {@link TOO_LONG_TO_INDEX}. */
+export function armFor(arm: string, field: Field): string {
+  if (arm !== TOO_LONG_TO_INDEX) return arm;
+  return INDEXED_FIELDS.has(field) ? REFUSED : ROUND_TRIPS;
+}
 
 /**
- * PostgreSQL refuses a btree index row over 8191 bytes, and `topic`, `sender` and `in_reply_to` are
- * all index keys in this schema while `content` is not. Derive the split from the value's own
- * encoded length, so that a corpus row added later lands in the cells the server can actually hold
- * it in without anyone marking it up by hand.
+ * The fields a real server will hold this value in, derived from the value's own encoded length and
+ * from the plugin's own budget rather than from a number restated here. A constant copied into this
+ * file is a server fact nobody re-measures: the one that used to sit here claimed 8191 bytes and
+ * claimed `sender` and `in_reply_to` were index keys, and both were false for four rounds because
+ * no corpus row landed in the window where it mattered. The real ceiling is measured against a live
+ * server elsewhere in this suite; nothing here restates it.
  */
-export const INDEX_KEY_MAX_BYTES = 8191;
-
-export function indexableFields(value: string): Field[] {
-  return Buffer.byteLength(value, 'utf8') <= INDEX_KEY_MAX_BYTES ? FIELDS : ['content'];
+export function fieldsThatHold(value: string): Field[] {
+  const oversized = Buffer.byteLength(value, 'utf8') > MAX_INDEXED_BYTES;
+  return FIELDS.filter((field) => !(oversized && INDEXED_FIELDS.has(field)));
 }
+
+export const ROUND_TRIP_VALUES: string[] = CORPUS.filter(
+  ([, , arm]) => arm === ROUND_TRIPS || arm === TOO_LONG_TO_INDEX,
+).map(([, value]) => value);

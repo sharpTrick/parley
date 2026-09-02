@@ -161,6 +161,15 @@ row is stored under a value that is not the one posted. Two topics an anchored `
 pattern admits as distinct would silently share one history, two handles would collapse onto one
 `_senders` row, and `content` would read back altered.
 
+A `topic` or a handle over **2684 bytes** of UTF-8 is refused the same way. Those two are the only
+fields this backend puts into a btree index key — `content` and `in_reply_to` are indexed by nothing
+and hold megabytes — and PostgreSQL will not take an index row past 2704 bytes. Left to the server,
+`post()` comes back with `index row size 3024 exceeds btree version 4 maximum 2704 for index
+"<your table>_topic_seq"`, which names your deployment's relations rather than this plugin, while
+`subscribe()` on the same topic succeeds and registers a live path no `post()` can ever land in. The
+screen is blind to compression, so a long repetitive topic the server would have squeezed into an
+index is refused too: whether a topic is usable should not depend on how well it compresses.
+
 ## Run Postgres
 
 Use the **official `postgres` Docker image** (not authored here):

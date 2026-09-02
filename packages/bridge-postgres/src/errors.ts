@@ -1,5 +1,12 @@
 import type { Topic } from '@sharptrick/parley-core';
 
+/**
+ * The one error this package raises that is not an answer from a server. Keep it named here rather
+ * than spelled at the throw site, so that {@link serverRefused} can tell a caller's own mistake
+ * apart from a statement the database refused.
+ */
+export const NOT_CONNECTED = 'PostgresPlugin not connected — call connect() first';
+
 export function badConfig(key: string, reason: string): Error {
   return new Error(`parley-postgres: invalid backend_config.${key} — ${reason}`);
 }
@@ -23,22 +30,64 @@ export function assertCursor(since: string): void {
   }
 }
 
+/**
+ * `BTMaxItemSize` on PostgreSQL's default 8 KiB page: the largest index row a btree will take.
+ * Keep this measured against a live server rather than read off a manual, so that a deployment
+ * whose real ceiling differs is caught here instead of by an agent holding a bare SQLSTATE 54000.
+ */
+export const BTREE_MAX_ITEM_BYTES = 2704;
+
+/**
+ * What a btree index row spends on everything that is not the value: the `IndexTupleData` header
+ * (8), the varlena header a long TEXT key carries (4), and the trailing `seq` key of the
+ * `(topic, seq)` index (8). Budgeted for the WIDEST of this schema's indexes, so that one number
+ * is safe for every field below.
+ */
+const INDEX_TUPLE_OVERHEAD_BYTES = 20;
+
+/** The longest a value this backend puts in a btree key may be, in UTF-8 bytes. */
+export const MAX_INDEXED_BYTES = BTREE_MAX_ITEM_BYTES - INDEX_TUPLE_OVERHEAD_BYTES;
+
+/**
+ * The seam fields this backend stores in a btree key — `topic` through `<table>_topic_seq`, `handle`
+ * through `<table>_senders`'s primary key. `content`, `sender` and `in_reply_to` are indexed by
+ * nothing and the server holds megabytes of any of them. Keep this set derived from `buildSchema`
+ * by the suite rather than agreed by hand, so that an index added to another column narrows the
+ * screen with it.
+ */
+export const INDEXED_FIELDS: ReadonlySet<string> = new Set(['topic', 'handle']);
+
 /** Locates the offending code unit for the message below; the refusal itself is decided by UTF-8. */
 const UNPAIRED_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 /**
  * Refuse a seam argument this backend cannot store as given, before it reaches the driver. Every
- * one of these is agent- or human-supplied and untrusted (DESIGN §5), and both hazards below are
- * ordinary characters to JSON and to JavaScript. A NUL byte PostgreSQL answers with a bare driver
- * string naming neither this plugin, nor the field, nor the fact that nothing was written. An
- * unpaired surrogate is worse, because nothing fails at all: the driver encodes it as U+FFFD, so
+ * one of these is agent- or human-supplied and untrusted (DESIGN §5), and every hazard below looks
+ * ordinary to JSON and to JavaScript. A NUL byte PostgreSQL answers with a bare driver string
+ * naming neither this plugin, nor the field, nor the fact that nothing was written. An oversized
+ * `topic` or `handle` is answered the same way, and worse across calls: `subscribe()` never touches
+ * a btree key, so without this screen it registers a live path for a topic every `post()` refuses.
+ * An unpaired surrogate is worst, because nothing fails at all: the driver encodes it as U+FFFD, so
  * two topics a `post_topics` pattern admits as distinct silently share one history, two handles
  * collapse onto one `_senders` row, and `content` is read back altered.
+ *
+ * The size screen is deliberately blind to compression: PostgreSQL compresses an index key before
+ * measuring it, so a long repetitive topic the server would have taken is refused here. Keep it
+ * blind, so that whether a topic is usable is a property of the topic and not of how well it
+ * happened to compress — and so post, fetchRecent and subscribe never disagree about one.
  *
  * Keep the second rule stated as "does this survive a UTF-8 round trip", so that the next shape
  * UTF-8 cannot carry is refused without anyone having to think of it first.
  */
 export function assertStorable(field: string, value: string): void {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (INDEXED_FIELDS.has(field) && bytes > MAX_INDEXED_BYTES) {
+    throw new Error(
+      `parley-postgres: invalid ${field} — ${bytes} bytes exceeds the ${MAX_INDEXED_BYTES}-byte ` +
+        `budget for a value this backend carries in a btree index key. Nothing was written; ` +
+        'shorten it and retry.',
+    );
+  }
   if (Buffer.from(value, 'utf8').toString('utf8') !== value) {
     throw new Error(
       `parley-postgres: invalid ${field} — an unpaired surrogate at index ` +
@@ -131,5 +180,22 @@ export function lockWaitAbandoned(what: string, err: unknown): Error {
   return new Error(
     `parley-postgres: gave up after ${LOCK_WAIT_MS}ms waiting for the ${what} — another session is ` +
       'holding it. Nothing was written; retry once that session commits or is terminated.',
+  );
+}
+
+/**
+ * Name a server refusal this plugin never anticipated. {@link answerAbandoned} and
+ * {@link lockWaitAbandoned} each rename ONE shape and hand everything else back untouched, so every
+ * other SQLSTATE — a permission the role does not have, a filled disk, a relation dropped under a
+ * live pool, an index key the server would not take — reaches agent context as a bare PostgreSQL
+ * string naming neither this plugin nor the operation, and disclosing the deployment's own relation
+ * names. Keep this OUTSIDE the two renames above, so that adding a third cannot leave a gap.
+ */
+export function serverRefused(what: string, err: unknown): Error {
+  const detail = err instanceof Error ? err.message : String(err);
+  if (detail === NOT_CONNECTED || detail.startsWith('parley-postgres:')) return err as Error;
+  return new Error(
+    `parley-postgres: ${what} failed — ${detail}. Nothing was written; the statement was refused ` +
+      'by the database, and a retry succeeds once the condition it names is cleared.',
   );
 }

@@ -1,7 +1,15 @@
 import { asBackendMsgId, asHandle, asTopic } from '@sharptrick/parley-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
-import { CORPUS, FIELDS, type Field, REFUSED, ROUND_TRIPS } from './storable-corpus.js';
+import {
+  armFor,
+  CORPUS,
+  FIELDS,
+  type Field,
+  REFUSED,
+  ROUND_TRIPS,
+  TOO_LONG_TO_INDEX,
+} from './storable-corpus.js';
 
 // `since` is not the only agent-supplied string this plugin hands the driver. `content` arrives as a
 // bare `z.string()` from core's `parley_post`, the topic is whatever a `post_topics` pattern admits,
@@ -82,9 +90,10 @@ function invoke(plugin: PostgresPlugin, call: string, field: Field, value: strin
 
 const CELLS = CALLS.flatMap(([call, fields]) =>
   fields.flatMap((field) =>
-    CORPUS.map(
-      ([label, value, arm]) => [`${call}(${field}) with ${label} — ${arm}`, call, field, value, arm] as const,
-    ),
+    CORPUS.map(([label, value, arm]) => {
+      const resolved = armFor(arm, field);
+      return [`${call}(${field}) with ${label} — ${resolved}`, call, field, value, resolved] as const;
+    }),
   ),
 );
 
@@ -93,8 +102,14 @@ beforeEach(() => {
 });
 
 describe('no agent-supplied field renders a raw driver string into agent context', () => {
-  it('the corpus declares both arms, so neither branch below is unreachable', () => {
-    expect([...new Set(CORPUS.map(([, , arm]) => arm))].sort()).toEqual([REFUSED, ROUND_TRIPS].sort());
+  it('the corpus declares every arm, so no branch below is unreachable', () => {
+    expect([...new Set(CORPUS.map(([, , arm]) => arm))].sort()).toEqual(
+      [REFUSED, ROUND_TRIPS, TOO_LONG_TO_INDEX].sort(),
+    );
+    expect(
+      [...new Set(CELLS.map(([, , , , arm]) => arm))].sort(),
+      'a value the arm resolver never routes to one of the two verdicts',
+    ).toEqual([REFUSED, ROUND_TRIPS].sort());
   });
 
   it.each(CELLS)('%s', async (_label, call, field, value, arm) => {

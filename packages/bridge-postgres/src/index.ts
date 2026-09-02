@@ -34,6 +34,7 @@ import {
   dialAbandoned,
   LOCK_WAIT_MS,
   lockWaitAbandoned,
+  serverRefused,
   subscribeFailed,
 } from './errors.js';
 import { PostgresListen } from './listen.js';
@@ -302,12 +303,21 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
         client.release();
       }
       const named = lockWaitAbandoned(`write lock on topic '${topic}'`, err);
-      throw answerAbandoned(`the write to topic '${topic}'`, QUERY_WAIT_MS, named);
+      const abandoned = answerAbandoned(`the write to topic '${topic}'`, QUERY_WAIT_MS, named);
+      throw serverRefused(`the write to topic '${topic}'`, abandoned);
     }
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     assertStorable('topic', args.topic);
+    try {
+      return await this.readPage(args);
+    } catch (err) {
+      throw serverRefused(`the fetch from topic '${args.topic}'`, err);
+    }
+  }
+
+  private async readPage(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const epoch = this.epoch;
     const limit = args.limit ?? 100;
     if (args.since === undefined) {
@@ -416,14 +426,18 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     assertStorable('handle', handle);
-    const res = await this.require().query(
-      `SELECT backend_ref FROM ${this.names.senders} WHERE handle = $1`,
-      [handle],
-    );
-    const row = res.rows[0] as { backend_ref: string } | undefined;
-    if (row !== undefined) return { handle, backendRef: row.backend_ref };
-    await this.registerSender(this.require(), handle);
-    return { handle, backendRef: handle };
+    try {
+      const res = await this.require().query(
+        `SELECT backend_ref FROM ${this.names.senders} WHERE handle = $1`,
+        [handle],
+      );
+      const row = res.rows[0] as { backend_ref: string } | undefined;
+      if (row !== undefined) return { handle, backendRef: row.backend_ref };
+      await this.registerSender(this.require(), handle);
+      return { handle, backendRef: handle };
+    } catch (err) {
+      throw serverRefused(`the identity lookup for handle '${handle}'`, err);
+    }
   }
 
   /**
