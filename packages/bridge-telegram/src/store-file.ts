@@ -5,6 +5,7 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -23,9 +24,10 @@ export const OWNER_ONLY_FILE = 0o600;
 export const OWNER_ONLY_DIR = 0o700;
 
 /**
- * Every path the store writes BESIDE its file: the claim on it ({@link StoreLock}), the sibling held
- * across a stale-claim take-over ({@link StoreLock.replaceStale}), the sequence high-water
- * ({@link StoreFile.readMark}) and a compaction's rewrite target ({@link StoreFile.replace}).
+ * Every path the store writes BESIDE its file: the claim on it ({@link StoreLock}), the token held
+ * across a stale-claim take-over ({@link StoreLock.replaceStale}), the private name that token is
+ * moved to while a leftover one is adjudicated, the sequence high-water ({@link
+ * StoreFile.readMark}) and a compaction's rewrite target ({@link StoreFile.replace}).
  *
  * Derived in ONE place, so that a sibling a later change adds is one the suite grading a squat on
  * each of them inherits rather than falls behind: every one is a predictable name in a directory the
@@ -34,12 +36,14 @@ export const OWNER_ONLY_DIR = 0o700;
 export function siblingPaths(storePath: string): {
   lock: string;
   break: string;
+  steal: string;
   mark: string;
   tmp: string;
 } {
   return {
     lock: `${storePath}.lock`,
     break: `${storePath}.lock.break`,
+    steal: `${storePath}.lock.break.${process.pid}`,
     mark: `${storePath}.hw`,
     tmp: `${storePath}.tmp`,
   };
@@ -197,6 +201,7 @@ function processExists(pid: number): boolean {
 export class StoreLock {
   readonly path: string;
   private readonly breakPath: string;
+  private readonly stealPath: string;
   /** Set once {@link claim} succeeded, so {@link release} can never unlink another process's claim. */
   private held = false;
 
@@ -204,6 +209,7 @@ export class StoreLock {
     const siblings = siblingPaths(storePath);
     this.path = siblings.lock;
     this.breakPath = siblings.break;
+    this.stealPath = siblings.steal;
   }
 
   claim(): void {
@@ -215,7 +221,7 @@ export class StoreLock {
         `${holder === undefined ? 'unknown' : String(holder)} through '${this.path}'. Two ` +
         `bridges on one observed-message store mint colliding cursors and each compaction discards ` +
         `the other's history, so give this one its own backend_config.store_path. If no such ` +
-        `process is running, remove '${this.path}'.`,
+        `process is running, remove '${this.path}' and '${this.breakPath}'.`,
     );
   }
 
@@ -232,21 +238,21 @@ export class StoreLock {
 
   /**
    * Take over a claim whose process is gone. Every removal of the claim path happens under a
-   * second sibling taken exclusively, the liveness question is re-asked beneath it, and the
+   * take-over token taken exclusively, the liveness question is re-asked beneath it, and the
    * take-over publishes by RENAME rather than by unlink-then-create — so that two starters which
    * both saw the same dead pid cannot each drop the other's fresh claim and both hold the store.
    */
   private replaceStale(): boolean {
-    try {
-      writeFileSync(this.breakPath, `${process.pid}\n`, { flag: 'wx', mode: OWNER_ONLY_FILE });
-    } catch {
-      return false;
-    }
+    if (!this.takeBreak()) return false;
     let renamed = false;
     try {
       if (this.tryClaim()) return true;
       const holder = lockHolder(this.path);
       if (holder !== undefined && processExists(holder)) return false;
+      // Publish only the token THIS process wrote. Renaming a sibling's token would install a pid
+      // that holds nothing over the claim, so that the store would read as held by a live process
+      // forever and no later start could ever take it over.
+      if (lockHolder(this.breakPath) !== process.pid) return false;
       try {
         renameSync(this.breakPath, this.path);
       } catch {
@@ -256,13 +262,71 @@ export class StoreLock {
       this.held = true;
       return true;
     } finally {
-      if (!renamed) {
-        try {
-          unlinkSync(this.breakPath);
-        } catch {
-          // Never created, or already consumed by the rename; the take-over decided either way.
-        }
+      if (!renamed) this.dropBreak();
+    }
+  }
+
+  /**
+   * Hold the take-over token, replacing one a bridge killed mid-take-over left behind. Without the
+   * replacement the leftover is permanent — nothing else ever removes it — and the crashed-bridge
+   * recovery this class exists for stops working from the first crash onwards.
+   *
+   * Take the leftover off the SHARED name with a rename and adjudicate it under a name only this
+   * process uses: rename removes the source in one syscall, so exactly one starter can win it, and
+   * two that both read the same dead pid can never each drop the other's fresh token.
+   */
+  private takeBreak(): boolean {
+    if (this.createBreak()) return true;
+    const holder = lockHolder(this.breakPath);
+    if (holder !== undefined && processExists(holder)) return false;
+    try {
+      renameSync(this.breakPath, this.stealPath);
+    } catch {
+      return false;
+    }
+    const stolen = lockHolder(this.stealPath);
+    if (stolen !== undefined && processExists(stolen)) {
+      // It was replaced between the read and the rename. Put the SAME file back under the shared
+      // name and stand down, so that a live take-over is not cut off by one that came to bury a
+      // corpse.
+      try {
+        linkSync(this.stealPath, this.breakPath);
+      } catch {
+        // The shared name was taken again while we looked; the starter that took it decides.
       }
+      this.discardSteal();
+      return false;
+    }
+    this.discardSteal();
+    return this.createBreak();
+  }
+
+  /** Create the take-over token. Any failure means no take-over, never a quieter one. */
+  private createBreak(): boolean {
+    try {
+      writeFileSync(this.breakPath, `${process.pid}\n`, { flag: 'wx', mode: OWNER_ONLY_FILE });
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  /** Give up the take-over token, and only ever the one this process wrote. */
+  private dropBreak(): void {
+    if (lockHolder(this.breakPath) !== process.pid) return;
+    try {
+      unlinkSync(this.breakPath);
+    } catch {
+      // Already consumed by the rename; the take-over decided either way.
+    }
+  }
+
+  /** Drop the private name a leftover token was adjudicated under. */
+  private discardSteal(): void {
+    try {
+      unlinkSync(this.stealPath);
+    } catch {
+      // Never created, or already linked back under the shared name.
     }
   }
 

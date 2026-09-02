@@ -63,14 +63,18 @@ everything delivered by `getUpdates`. Consequences:
   *unserved* chats **plus** the chats this bridge serves (below). Anything older is dropped and the
   file is compacted, so raise `observed_retention_per_chat` if you need `fetchRecent` to replay a
   deeper window. Size disk and RAM from `observed_retention_per_chat × (observed_max_chats +
-  the number of topics you point at this bridge)`: `observed_max_chats` alone is **not** a bound on
-  the total, because the served chats are exactly the ones it must not evict.
+  your `chat_map` entries + 1000)`: `observed_max_chats` alone is **not** a bound on the total,
+  because the served chats are exactly the ones it must not evict — and the topics a seam call can
+  name are chosen by the caller, so the marks they leave are held to a store-wide **1000**, newest
+  named last.
 - The chat cap **never evicts a chat this bridge serves** — one a `chat_map` entry resolves to,
-  or one a seam call has named — on load or at runtime. A new unserved chat displaces the least
-  recently active *unserved* chat instead, so a bot added to a flood of groups cannot crowd out
-  your own topics or starve them of admission. That protection is **written into the store file**,
-  so a chat a seam call named in one run is still protected at the next load, before any seam call
-  in the new process could have named it again. The one gap: a topic used as a **chat-id literal**
+  or one of the **1000 most recently** named by a seam call — on load or at runtime. A new unserved
+  chat displaces the least recently active *unserved* chat instead, so a bot added to a flood of
+  groups cannot crowd out your own topics or starve them of admission. That protection is **written
+  into the store file**, so a chat a seam call named in one run is still protected at the next load,
+  before any seam call in the new process could have named it again. Your `chat_map` chats are
+  outside that 1000 and are never aged out of it: a caller that names topic after topic spends its
+  own marks, never yours. The one gap: a topic used as a **chat-id literal**
   is not known to the bridge until some seam call names it *for the first time ever*, so a flood
   arriving in that window can still displace it. **List the topics you care about in `chat_map`** —
   `connect` resolves those before the store is even opened, which closes the window entirely.
@@ -124,12 +128,12 @@ store's dedup makes the replay harmless.
 | ---------------- | -------------------------- | ------- |
 | `token`          | _(none)_                   | Bot token from @BotFather. A **secret** — `.env`/`backend_config` only, never committed. |
 | `api_url`        | `https://api.telegram.org` | Bot API base URL (override for tests or a [local Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server)). **Keep it `https://` for anything but loopback:** this API carries the bot token in the URL **path**, so a plaintext `http://` base puts the token in every request line and in the logs of every proxy between here and there. `connect` writes one `SECURITY` line to stderr naming the origin when it sees that, and comes up anyway — a plaintext loopback server is a legitimate local setup. |
-| `store_path`     | `$XDG_STATE_HOME/parley/telegram/observed.jsonl` (else `~/.local/state/…`) | Observed-message store (append-only JSONL). One file per bridge process; **absolute by default**, because a store file that goes missing invalidates every cursor issued from it (see **History limitations**). Must name a **real file, not a symlink**: this file and its `.hw`/`.lock`/`.lock.break`/`.tmp` siblings are opened `O_NOFOLLOW`, so a symlinked `store_path` fails `connect` naming the path rather than writing the plaintext of every observed message through a link this process does not control. Keep it in a directory only this account can write: a symlink is refused, but a plain file someone else pre-created at that name is not distinguishable from one of ours. |
+| `store_path`     | `$XDG_STATE_HOME/parley/telegram/observed.jsonl` (else `~/.local/state/…`) | Observed-message store (append-only JSONL). One file per bridge process; **absolute by default**, because a store file that goes missing invalidates every cursor issued from it (see **History limitations**). Must name a **real file, not a symlink**: this file and its `.hw`/`.lock`/`.lock.break`/`.lock.break.<pid>`/`.tmp` siblings are opened `O_NOFOLLOW`, so a symlinked `store_path` fails `connect` naming the path rather than writing the plaintext of every observed message through a link this process does not control. Keep it in a directory only this account can write: a symlink is refused, but a plain file someone else pre-created at that name is not distinguishable from one of ours. |
 | `poll_timeout_s` | `25`                       | `getUpdates` long-poll timeout, in **seconds** (Telegram's unit). Latency/cost knob only; must be an integer in `[1, 50]`. `0` is Telegram's "short polling" and would flood your bot token, so it is a **load error**, not a setting. |
 | `chat_map`       | _(empty)_                  | Parley topic → chat id (numeric or `@channelusername`). Unmapped topics are used as the chat id literal. |
 | `observed_retention_per_chat` | `10000`       | Newest-N observed records kept **per chat**, enforced on load *and* on every append; the file is compacted when records are evicted. Bounds how deep `fetchRecent` can replay — see **History limitations**. A positive integer: an out-of-domain value is a load error rather than a silent fall back to the default. |
 | `observed_retention_per_topic` | _(unset)_   | Deprecated spelling of `observed_retention_per_chat` — the bound is per chat, and `chat_map` can give one chat two topic names. Still honoured; the new key wins when both are set. |
-| `observed_max_chats` | `1000`                 | Max **unserved** chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or a topic a seam call has named — a mark that is persisted with the store) are never evicted and are retained *on top of* this cap, so it bounds the chats anyone-can-add-the-bot traffic creates, not the store's total. Unserved chats displace each other least-recently-active first once the cap is reached. |
+| `observed_max_chats` | `1000`                 | Max **unserved** chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or one of the 1000 most recently named by a seam call — a mark that is persisted with the store) are never evicted and are retained *on top of* this cap, so it bounds the chats anyone-can-add-the-bot traffic creates, not the store's total. Unserved chats displace each other least-recently-active first once the cap is reached. |
 
 > **Presence needs a real chat id.** Core enables presence by default (`presence.enabled: true`,
 > `presence.topic: parley-presence`), and on Telegram a topic string **is a chat id** — so the
@@ -178,7 +182,10 @@ point several Telegram bridges at the same bot token**:
   needs its own `store_path` in `backend_config`. A claim naming a process that is gone is a
   crashed bridge's leftover and is replaced automatically — under a `<store_path>.lock.break`
   sibling held for the length of the take-over, so that two bridges starting at once on the same
-  leftover cannot each clear the other's fresh claim and both end up holding the file.
+  leftover cannot each clear the other's fresh claim and both end up holding the file. A
+  `.lock.break` a bridge killed *inside* a take-over left behind is replaced the same way, so a
+  crash cannot leave the store permanently unopenable; the refusal names both paths when it does
+  give up, and a take-over only ever publishes the token it wrote itself.
 
 This is why the conformance suite's multi-process-writes case is deliberately **skipped** for
 this backend (`concurrentPost` is not provided — the scenario is structurally

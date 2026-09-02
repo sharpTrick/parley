@@ -29,12 +29,20 @@ const DEFAULT_MAX_CHATS = 1_000;
  */
 const EVICTED_ID_MEMORY = 1_000;
 /**
- * How many SERVED chat ids the file carries, newest-served last — store-wide, and sized on the
- * marks themselves rather than on what the store happens to retain. A chat a seam call named but
- * that has no traffic yet holds no records, and is precisely the case a persisted mark exists for,
- * so a bound derived from the retained records drops the one protection nothing can rebuild.
+ * How many chats a SEAM CALL has named stay marked as served, newest-marked last — store-wide, and
+ * sized on the marks themselves rather than on what the store happens to retain. A chat a seam call
+ * named but that has no traffic yet holds no records, and is precisely the case a persisted mark
+ * exists for, so a bound derived from the retained records drops the one protection nothing can
+ * rebuild.
+ *
+ * Enforced where the set GROWS and not only where the file is written: the topic a seam call names
+ * is chosen by the caller — core's allowlist admits `post_topics` regex patterns, so the topic space
+ * is model-chosen rather than operator-sized — and a mark is both a durable append and a permanent
+ * exemption from {@link ObservedStore.maxChats}. Bounded only on the way out to disk, a run of
+ * reads on fresh topics grows the in-memory exemption set without limit and the cap stops bounding
+ * anything. Chats an operator DECLARED ({@link ObservedStore.pinned}) are outside this bound.
  */
-const SERVED_ID_MEMORY = 1_000;
+export const SERVED_ID_MEMORY = 1_000;
 
 /**
  * Keep an out-of-domain retention bound a hard failure rather than a substituted default, so that
@@ -57,7 +65,9 @@ function requirePositiveInt(name: string, value: number): number {
  * Two bounds hold at ALL times — on load AND on every {@link append} — because both axes are
  * attacker-influenced: anyone who can post in a chat the bot is in drives records ({@link
  * applyRetention}), and anyone who can add the bot to a group drives chats ({@link applyChatCap}).
- * A chat this bridge {@link serve}s is exempt from the second, across restarts.
+ * A chat this bridge {@link serve}s is exempt from the second, across restarts — and the marks are
+ * themselves bounded ({@link SERVED_ID_MEMORY}), because the topic a seam call names is chosen by
+ * the caller and an unbounded exemption is the cap's own defeat.
  *
  * ONE bridge process per store file AND per bot token; the first half is ENFORCED by the
  * {@link StoreFile} claim, and see "Multiple concurrent sessions" in README.md for the second.
@@ -69,7 +79,9 @@ export class ObservedStore {
   private readonly seen = new Set<string>();
   /** Composite ids of evicted records, newest last — dedup memory past retention (bounded). */
   private readonly evicted = new Set<string>();
-  /** Chats this bridge serves (a configured topic resolves to them) — never evicted or refused. */
+  /** Chats an operator declared through `chat_map` — never evicted, never refused, never trimmed. */
+  private readonly pinned = new Set<string>();
+  /** Chats a SEAM CALL named, newest last — served like {@link pinned} but bounded (caller-driven). */
   private readonly served = new Set<string>();
   /** Identity of the store FILE ({@link epoch}) — every cursor the plugin issues carries it. */
   private readonly epochId: string;
@@ -82,6 +94,13 @@ export class ObservedStore {
   private nextSeq = 1;
   /** Records evicted since the last on-disk compaction — drives the amortized rewrite. */
   private evictedSinceRewrite = 0;
+  /**
+   * Served marks appended since the last on-disk compaction. Counted INTO the rewrite threshold, so
+   * that a store whose records never churn still reclaims them: a seam call on a fresh topic
+   * appends a line, and a rewrite armed only by record eviction never runs on a store that is being
+   * read rather than written.
+   */
+  private markedSinceRewrite = 0;
   private readonly diagnostics = new Diagnostics();
 
   constructor(
@@ -92,7 +111,7 @@ export class ObservedStore {
   ) {
     this.maxPerChat = requirePositiveInt('maxPerChat', maxPerChat);
     this.maxChats = requirePositiveInt('maxChats', maxChats);
-    for (const chatId of served) this.served.add(chatId);
+    for (const chatId of served) this.pinned.add(chatId);
     this.file = new StoreFile(path);
     try {
       this.epochId = this.load();
@@ -134,7 +153,7 @@ export class ObservedStore {
           issued = Math.max(issued, stamped);
           intact = Math.max(intact, present);
         } else if (line.startsWith(SERVED_ID_LINE)) {
-          for (const id of parseIds(line, SERVED_ID_LINE)) this.served.add(id);
+          this.rememberServed(parseIds(line, SERVED_ID_LINE));
         } else if (line.startsWith(EVICTED_ID_LINE)) {
           this.rememberEvicted(parseIds(line, EVICTED_ID_LINE));
         } else {
@@ -161,6 +180,7 @@ export class ObservedStore {
     if (rewritten) {
       this.file.replace(this.journalText(epochId));
       this.evictedSinceRewrite = 0;
+      this.markedSinceRewrite = 0;
     }
     this.file.open();
     // Append rather than rewrite a file that carries no identity yet: a rewrite is a rename through
@@ -194,9 +214,21 @@ export class ObservedStore {
    * lapse at the next restart and the chat cap would evict history nothing can backfill.
    */
   serve(chatId: string): void {
-    if (this.served.has(chatId)) return;
-    this.served.add(chatId);
+    if (this.isServed(chatId)) return;
+    this.rememberServed([chatId]);
     this.file.note(`${SERVED_ID_LINE}${JSON.stringify([chatId])}`);
+    this.markedSinceRewrite += 1;
+    // A mark is not a record: the seam call that triggered one has nothing to retry and its own
+    // result does not depend on the rewrite, so a failing compaction is reported, never thrown.
+    try {
+      this.compactIfDue();
+    } catch (err) {
+      this.diagnostics.report(
+        `could not compact ${this.file.path} (${describe(err)}) — the served marks are all ` +
+          `retained and the rewrite is retried on a later seam call`,
+        'compaction',
+      );
+    }
   }
 
   /**
@@ -290,6 +322,7 @@ export class ObservedStore {
     this.seen.clear();
     this.evicted.clear();
     this.served.clear();
+    this.pinned.clear();
     this.file.close();
   }
 
@@ -299,7 +332,7 @@ export class ObservedStore {
    * evicted. False only when every retained chat is served.
    */
   private admit(chatId: string): boolean {
-    if (this.byChat.has(chatId) || this.served.has(chatId)) return true;
+    if (this.byChat.has(chatId) || this.isServed(chatId)) return true;
     if (this.byChat.size < this.maxChats) return true;
     return this.evictLeastRecentUnserved();
   }
@@ -307,7 +340,7 @@ export class ObservedStore {
   /** Drop the least recently active unserved chat entirely. False when there is none. */
   private evictLeastRecentUnserved(): boolean {
     for (const chatId of this.byChat.keys()) {
-      if (this.served.has(chatId)) continue;
+      if (this.isServed(chatId)) continue;
       this.evict(this.byChat.get(chatId) ?? []);
       this.byChat.delete(chatId);
       return true;
@@ -348,6 +381,28 @@ export class ObservedStore {
     return records.length;
   }
 
+  /** True while `chatId` is exempt from the chat cap — declared by the operator, or seam-named. */
+  private isServed(chatId: string): boolean {
+    return this.pinned.has(chatId) || this.served.has(chatId);
+  }
+
+  /**
+   * Hold the newest {@link SERVED_ID_MEMORY} seam-named marks, newest last (Set iterates in order).
+   * A chat the operator declared is already exempt and is left out, so that a run of seam calls on
+   * fresh topics can never push the operator's own chats out of the protection they configured.
+   */
+  private rememberServed(ids: readonly string[]): void {
+    for (const id of ids) {
+      if (this.pinned.has(id)) continue;
+      this.served.delete(id);
+      this.served.add(id);
+    }
+    for (const oldest of this.served) {
+      if (this.served.size <= SERVED_ID_MEMORY) break;
+      this.served.delete(oldest);
+    }
+  }
+
   /** Hold the newest {@link EVICTED_ID_MEMORY} evicted ids, newest last (Set iterates in order). */
   private rememberEvicted(ids: readonly string[]): void {
     for (const id of ids) {
@@ -361,14 +416,24 @@ export class ObservedStore {
   }
 
   /**
-   * Compact once the dead lines on disk have grown to the live record count: the file then stays
-   * within ~2x the in-memory bound while rewrites stay amortized O(1) per append.
+   * Compact once the dead lines on disk have grown to the live line count: the file then stays
+   * within ~2x the in-memory bound while rewrites stay amortized O(1) per line appended.
+   *
+   * Each bound arms its own rewrite against the memory bound it is held to. Marks armed by the
+   * RECORD budget alone leave a store that is only ever read — no record churn, so nothing to
+   * evict — appending marks that nothing ever reclaims, for as long as a caller keeps naming fresh
+   * topics.
    */
   private compactIfDue(): void {
     if (!this.file.isOpen()) return;
-    if (this.evictedSinceRewrite < Math.max(this.maxPerChat, this.size())) return;
+    const live = this.size();
+    const due =
+      this.evictedSinceRewrite >= Math.max(this.maxPerChat, live) ||
+      this.markedSinceRewrite >= Math.max(SERVED_ID_MEMORY, live);
+    if (!due) return;
     this.file.compact(this.journalText());
     this.evictedSinceRewrite = 0;
+    this.markedSinceRewrite = 0;
   }
 
   /**
@@ -386,14 +451,15 @@ export class ObservedStore {
    * The mark list is bounded by {@link SERVED_ID_MEMORY} and NOT by the records retained: a chat a
    * seam call named before any traffic reached it holds none, and that is the one chat whose mark
    * nothing in the next process can rebuild — `chat_map` is re-declared on every connect, a
-   * seam-named topic is not.
+   * seam-named topic is not. The declared chats ride out first, so that a file reloaded by a
+   * process which no longer declares them is the one that ages them out.
    */
   private journalText(epochId: string = this.epochId): string {
     const lines: string[] = [
       `${EPOCH_LINE}${epochId}`,
       `${SEQ_LINE}${this.highWater()} ${this.retainedHighWater()}`,
     ];
-    const served = [...this.served].slice(-SERVED_ID_MEMORY);
+    const served = [...this.pinned, ...this.served];
     if (served.length > 0) lines.push(`${SERVED_ID_LINE}${JSON.stringify(served)}`);
     if (this.evicted.size > 0) {
       lines.push(`${EVICTED_ID_LINE}${JSON.stringify([...this.evicted])}`);

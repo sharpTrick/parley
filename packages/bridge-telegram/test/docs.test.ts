@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
+import { SERVED_ID_MEMORY } from '../src/store.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
 import {
   captureStderr,
@@ -194,6 +195,22 @@ describe('telegram chat-cap claims are executed, not just written', () => {
     expect(text).not.toBe('');
     expect(text).toMatch(requires);
     if (forbids !== null) expect(text).not.toMatch(forbids);
+  });
+
+  /**
+   * The absolute above is limited by a NUMBER, and a number in prose is the one claim that rots
+   * silently: the marks a caller can leave are bounded store-wide, and a README that names a
+   * different figure than the store holds has an operator sizing disk — and trusting a protection —
+   * against a bound that does not exist. Read out of both places the figure appears, so neither can
+   * drift alone.
+   */
+  it.each([
+    { what: 'the never-evict bullet', claim: () => neverEvicts },
+    { what: 'the observed_max_chats row', claim: () => capRow },
+  ])('$what names the served-mark bound the store actually holds', ({ claim }) => {
+    const stated = /([\d,_]+) most recently/.exec(claim())?.[1];
+    expect(stated).toBeDefined();
+    expect(Number((stated as string).replace(/[,_]/g, ''))).toBe(SERVED_ID_MEMORY);
   });
 
   const CAP = 2;
