@@ -446,6 +446,69 @@ cut per-round cost. **Both pre-registered mechanisms were kept unchanged:**
 
 The fan-out (14 targets) was likewise left alone.
 
+### What remediation measures that review does not
+
+Every confirmed finding is handed to a fixer with a *prescription* — the critic's own account of what
+is wrong and what to do about it. Grading those prescriptions against the code turns out to be a
+sharper instrument than the findings themselves, because a critic writing a prescription has to
+commit to a causal claim, and a causal claim can be refuted.
+
+**89 wrong prescriptions across rounds 9–19, none caught by any test suite.** The failure modes have
+shifted decisively over the run. Early rounds produced *"this fix is weak."* Rounds 18 and 19 produce
+*"this fix is impossible, would make things worse, or rests on a fact about the code that is false."*
+Round 19's nineteen include four that were disproved by measurement in the fixer's own session:
+
+- A prescription refuted from the **vendor's own source**. Zulip's `include_anchor` finding claimed a
+  fixture defect; `zerver/lib/narrow.py` shows `newest` is a sentinel that skips the id filter
+  entirely, so the flag is a provable no-op on that read and the fixture was faithful. Following the
+  prescription would have made the fake *diverge* from the server it models.
+- A prescription whose **mechanism cannot work**: `pg-pool` empties `_clients` synchronously before
+  the per-client `end()`s finish, so the prescribed walk finds an empty array — and the same fact
+  disproves the finding's own timing claim.
+- A prescription **measurably worse than no fix** on its own axis: the prescribed LRU was implemented
+  literally and reported `expected 2500 to be less than or equal to 257`, because evicting a throttle
+  entry unbounds the log it exists to bound.
+- A prescription whose **load-bearing premise is false**: gating core's fake does *not* restore the
+  suite's ability to see the class it was filed about. With the gate in, the finding's own mutation
+  left all 3386 tests green.
+
+**Round 19's defining shape was guards that grade the repo and exempt themselves.** Three of the five
+`repo` findings were of this kind, two arriving with mutations the critic had already run and watched
+pass green: a repo-wide lint keyed to a hand-written roster whose only control was generated from
+that roster; a cross-package boundary scan whose three regexes see only fully-literal spellings, so
+four ways of writing the same reach escape it; and a packaging rule that simulated the tarball rather
+than reading `npm pack` — under which *nothing in the repo had ever imported a built entrypoint*, so
+a `dist/index.js` that exists and throws shipped green. The same shape appeared in the shared suite:
+the conformance harness **never reconnects**, so no clause can observe a cursor crossing a connection
+boundary, and a plugin whose cursor namespace is per-connection is certified in full.
+
+The class-level fix for all of them was the same, and it is now the default rather than a preference:
+**prefer running the thing to scanning for it.** The consumer-typecheck rule is a real `tsc` against a
+pruned install; the timer ceiling is measured by arming a real `setTimeout`; the roster derivation is
+executed against a planted tree; the `skip_permissions` guard runs every yaml block in every root
+document through the real loader and asks the loader which keys to grade.
+
+That last one found what a prose scan could not: **DESIGN.md's §11 block — the repo's only complete
+config example — does not load.** Two refusals, and a cross-reference to a section that does not
+exist.
+
+One more result belongs here because it is the strongest single argument for grading prescriptions.
+`shipped-d-ts-type-imports-a-devdependency` was filed as one instance. Built as a real compile against
+a pruned install and run over all 13 workspaces *before* any manifest edit, **12 failed on three
+independent root causes** — every published `.d.ts` in the repo except one package's was importing a
+type package no consumer install would carry. The reason the repo could not see it is the lesson in
+miniature: the prune must **copy** each workspace, not symlink it, because a symlink realpaths back
+into the repo, walks up to the hoisted `node_modules`, and resolves the exact types the rule exists to
+withhold.
+
+Round 19 is also the first round to **close a confirmed blocking finding by escalating it rather than
+fixing it**. Two were surfaced with costed plans instead: grading cursor durability across a reconnect
+would add a required `ConformanceContext` field and fail eleven backend packages until each supplied
+it, and a shared `normalizeRetentionDays` in `bridge-core` would put one `backend_config` key's
+*meaning* into a module that documents its own limit as *"core is handed the NAMES and never their
+meanings."* Both are recorded in `data/round19-remediation.json` with the shape a later round should
+take.
+
 ### Instrument observations
 
 - **`theme` is not being used as designed.** 136 findings carried **100 distinct themes**. The field
