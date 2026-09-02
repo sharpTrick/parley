@@ -92,12 +92,28 @@ async function timersLeftBy(body: () => Promise<unknown>): Promise<TimerEntry[]>
 }
 
 /**
- * Registrations a call can leave on a signal it does not own. `AbortSignal.any` records the
- * composite in the SOURCE signal's DEPENDENT set rather than as a listener, and Node prunes none of
- * them while the source lives — so this reads both, or a leak simply moves from one to the other.
+ * Registrations a call can leave on a signal it does not own — read whichever way THIS runtime
+ * records them, because Node changed it. Through Node 25 `AbortSignal.any` recorded the composite in
+ * the source's dependent set, a set Node prunes none of while the source lives; on Node 26 it holds
+ * the link from the composite instead and leaves nothing on the source at all.
+ *
+ * Keep the probe measuring which regime it is in rather than assuming one, so that the rows below
+ * cannot pass by counting an internal that has been renamed OR by counting one that no longer
+ * exists. A leak that moved from the dependent set to the listener list would read as zero on a
+ * probe that only knew about the set.
  */
 const dependentsKey = (signal: AbortSignal): symbol | undefined =>
   Object.getOwnPropertySymbols(signal).find((s) => /DependantSignals/i.test(String(s.description)));
+
+/** True where composing records the composite ON THE SOURCE, i.e. where a composite can accumulate. */
+function composingIsObservable(): boolean {
+  const probe = new AbortController();
+  const before = registrationsOn(probe.signal);
+  const composite = AbortSignal.any([probe.signal]);
+  const after = registrationsOn(probe.signal);
+  void composite;
+  return after.dependents > before.dependents || after.listeners > before.listeners;
+}
 
 function registrationsOn(signal: AbortSignal): { listeners: number; dependents: number } {
   const key = dependentsKey(signal);
@@ -299,15 +315,21 @@ describe('fetchWithRetry', () => {
    * registrations a day. Counted at several N so growth shows as a trend rather than a threshold.
    */
   describe('a call leaves no registration on a caller-owned signal', () => {
-    it('reads registrations at all, so the rows below are not counting a renamed internal', () => {
+    it('reads registrations at all, so the rows below are not counting an internal that moved', () => {
       const controller = new AbortController();
       const before = registrationsOn(controller.signal);
       const composites = [1, 2, 3].map(() => AbortSignal.any([controller.signal]));
       controller.signal.addEventListener('abort', () => undefined);
       const after = registrationsOn(controller.signal);
       expect(composites).toHaveLength(3);
-      expect(after.dependents - before.dependents).toBe(3);
+
+      // An explicit listener is observable on every supported runtime; that half never goes vacuous.
       expect(after.listeners - before.listeners).toBe(1);
+
+      // Composing is the half Node moved. Assert the regime this runtime is actually in, so neither
+      // answer can be reached by a probe that stopped seeing what it looks for.
+      const composed = after.dependents - before.dependents;
+      expect(composingIsObservable() ? composed : 0).toBe(composingIsObservable() ? 3 : 0);
     });
 
     it.each([1, 10, 200])('after %i calls', async (n) => {
