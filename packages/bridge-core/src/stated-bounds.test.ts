@@ -33,6 +33,7 @@ import {
 } from './regex-safety.js';
 import { FakePlugin } from './testing/fake-plugin.js';
 import { harness, parse, postBeat, type RosterResult } from './testing/tool-cases.js';
+import { MAX_TIMER_MS } from './timer-bounds.js';
 import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 import { GOODBYE_TIMEOUT_MS, startPresenceLoop } from './transport/presence-loop.js';
 import { DEFAULT_ROSTER_LIMIT, MAX_FETCH_LIMIT, PRESENCE_FETCH_LIMIT } from './transport/tools.js';
@@ -146,6 +147,48 @@ const BOUNDS: StatedBound[] = [
     },
   },
   {
+    label: 'catchup.block_poll_interval_ms ceiling (MAX_TIMER_MS)',
+    bound: MAX_TIMER_MS,
+    legal: 'at-or-below',
+    probe: (block_poll_interval_ms) => {
+      try {
+        const cfg = parseConfig({
+          identity: { handle: 'h' },
+          topics: ['ctx'],
+          catchup: { block_poll_interval_ms },
+        });
+        expect(cfg.catchup.block_poll_interval_ms).toBe(block_poll_interval_ms);
+        return 'accepted';
+      } catch (e) {
+        expect((e as Error).message).toMatch(
+          new RegExp(`block_poll_interval_ms must be <= ${MAX_TIMER_MS}`),
+        );
+        return 'refused';
+      }
+    },
+  },
+  {
+    label: 'presence.heartbeat_ms ceiling (MAX_TIMER_MS)',
+    bound: MAX_TIMER_MS,
+    legal: 'at-or-below',
+    probe: (heartbeat_ms) => {
+      try {
+        const cfg = parseConfig({
+          identity: { handle: 'h' },
+          topics: ['ctx'],
+          presence: { heartbeat_ms, ttl_ms: heartbeat_ms },
+        });
+        expect(cfg.presence.heartbeat_ms).toBe(heartbeat_ms);
+        return 'accepted';
+      } catch (e) {
+        expect((e as Error).message).toMatch(
+          new RegExp(`heartbeat_ms must be <= ${MAX_TIMER_MS}`),
+        );
+        return 'refused';
+      }
+    },
+  },
+  {
     label: 'regex screen ambiguity budget (MAX_AMBIGUITY)',
     bound: Math.log2(MAX_AMBIGUITY),
     legal: 'at-or-below',
@@ -179,6 +222,8 @@ describe('every documented inclusive bound is graded AT the bound', () => {
       'safeName hash suffix ceiling (MAX_HASH_LEN)',
       'presence.ttl_ms floor (presence.heartbeat_ms)',
       'catchup.block_max_ms ceiling (MAX_BLOCK_MS)',
+      'catchup.block_poll_interval_ms ceiling (MAX_TIMER_MS)',
+      'presence.heartbeat_ms ceiling (MAX_TIMER_MS)',
       'regex screen ambiguity budget (MAX_AMBIGUITY)',
     ]);
     for (const b of BOUNDS) expect(Number.isInteger(b.bound), b.label).toBe(true);
@@ -358,6 +403,28 @@ const CAPACITIES: Capacity[] = [
     refusesPast: () =>
       refused(() =>
         parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], catchup: { block_max_ms: 300_001 } }),
+      ),
+  },
+  {
+    name: 'MAX_TIMER_MS',
+    actual: MAX_TIMER_MS,
+    expected: 2_147_483_647,
+    realistic: 'a ten-minute presence heartbeat',
+    accepts: () => {
+      const cfg = parseConfig({
+        identity: { handle: 'h' },
+        topics: ['ctx'],
+        presence: { heartbeat_ms: 600_000 },
+      });
+      return cfg.presence.heartbeat_ms === 600_000;
+    },
+    refusesPast: () =>
+      refused(() =>
+        parseConfig({
+          identity: { handle: 'h' },
+          topics: ['ctx'],
+          presence: { heartbeat_ms: MAX_TIMER_MS + 1, ttl_ms: MAX_TIMER_MS + 1 },
+        }),
       ),
   },
   {

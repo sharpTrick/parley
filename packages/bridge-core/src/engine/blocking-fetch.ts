@@ -1,15 +1,17 @@
 import type { Cursor } from '../message.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
+import { isArmableDelay, MAX_TIMER_MS } from '../timer-bounds.js';
 
 /** Options for {@link fetchRecentBlocking}. `now`/`sleep` are injectable for deterministic tests. */
 export interface BlockingFetchOptions {
   /** Total long-poll budget in ms. Already clamped to the server cap by the caller. */
   blockMs: number;
   /**
-   * Poll cadence for the generic fallback (used only when a plugin returns early/empty). Must be
-   * `> 0`: a non-positive cadence is REJECTED, not clamped, because silently degrading it turns a
-   * long poll into a single fetch — the opposite of what this function is for. Core's own config
-   * schema already guarantees a positive value.
+   * Poll cadence for the generic fallback (used only when a plugin returns early/empty). Must be in
+   * `[1, MAX_TIMER_MS]`: a cadence outside that is REJECTED, not clamped, because silently degrading
+   * it turns a long poll into a single fetch — the opposite of what this function is for — and every
+   * value off either end arms the nap at ~1 ms, which is a spin against the backend rather than a
+   * poll. Core's own config schema already guarantees a value inside it.
    */
   pollIntervalMs: number;
   /** Monotonic clock in ms. Default `Date.now`. */
@@ -84,7 +86,9 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
  *   - Each iteration calls `plugin.fetchRecent({ ...args, since, blockMs: remaining })`.
  *     A native plugin blocks up to `remaining` inside that one call; a non-native plugin ignores
  *     the field and returns immediately.
- *   - Non-empty result → return at once.
+ *   - A page carrying the REQUESTED topic → return at once. A page carrying only other topics (a
+ *     backend whose delivery is coarser than a topic) is not arrival: `since` advances past it and
+ *     the wait continues.
  *   - Deadline reached (or aborted) → return the latest (empty) page with a STABLE, replayable
  *     `nextCursor`.
  *   - Otherwise sleep `min(pollIntervalMs, remaining)` and retry, advancing `since` to the last
@@ -101,8 +105,10 @@ export async function fetchRecentBlocking(
   args: FetchRecentArgs,
   opts: BlockingFetchOptions,
 ): Promise<FetchRecentResult> {
-  if (!(opts.pollIntervalMs > 0)) {
-    throw new RangeError(`pollIntervalMs must be > 0 (got ${opts.pollIntervalMs})`);
+  if (!isArmableDelay(opts.pollIntervalMs)) {
+    throw new RangeError(
+      `pollIntervalMs must be in [1, ${MAX_TIMER_MS}] (got ${opts.pollIntervalMs})`,
+    );
   }
   // A non-finite budget is neither `> 0` nor `<= 0`, so every deadline comparison below answers false
   // and the loop naps forever — refuse it here rather than hanging the caller's request.
@@ -125,7 +131,11 @@ export async function fetchRecentBlocking(
       opts.signal,
     );
     if (result === ABORTED) return abandoned(since);
-    if (result.messages.length > 0) return result;
+    // Decide arrival on the topic that was ASKED for. A backend whose history read is coarser than a
+    // topic answers a query for `ctx` with a page of somebody else's traffic, and taking that as
+    // arrival ends the long poll on a page the caller's own filter then empties — so a busy shared
+    // room collapses every long poll into a single fetch.
+    if (result.messages.some((m) => m.topic === args.topic)) return result;
 
     // Advance so the next wait is exclusive of everything we've already seen (incl. the tail).
     since = result.nextCursor;

@@ -16,6 +16,7 @@ import {
 } from './engine/presence.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
+import { MAX_TIMER_MS } from './timer-bounds.js';
 
 export * from './config-auth.js';
 
@@ -119,7 +120,14 @@ const ConfigObject = z.object({
        * Poll cadence (ms) for core's generic long-poll fallback — how often it re-queries when a
        * backend does not block natively. No correctness impact; latency/cost knob only.
        */
-      block_poll_interval_ms: z.number().int().positive().default(250),
+      block_poll_interval_ms: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_TIMER_MS, {
+          message: `catchup.block_poll_interval_ms must be <= ${MAX_TIMER_MS} (ms): the nap arms a Node timer, and a delay past that wraps to ~1 ms — the long poll becomes a spin against the backend instead of a slower poll`,
+        })
+        .default(250),
     })
     .strict()
     .default({}),
@@ -142,7 +150,14 @@ const ConfigObject = z.object({
     .object({
       enabled: z.boolean().default(true),
       topic: z.string().min(1).default(DEFAULT_PRESENCE_TOPIC),
-      heartbeat_ms: z.number().int().positive().default(600_000),
+      heartbeat_ms: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_TIMER_MS, {
+          message: `presence.heartbeat_ms must be <= ${MAX_TIMER_MS} (ms): the beat arms a Node timer, and a cadence past that wraps to ~1 ms — every peer's parley_list_users then reads a presence topic under a post storm`,
+        })
+        .default(600_000),
       ttl_ms: z.number().int().positive().optional(),
     })
     .strict()

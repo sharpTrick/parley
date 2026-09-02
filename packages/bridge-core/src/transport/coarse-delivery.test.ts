@@ -7,6 +7,7 @@ import { catchUpTopic } from '../engine/catchup.js';
 import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
+import { fetchRecentBlocking } from '../engine/blocking-fetch.js';
 import { asBackendMsgId, asHandle, asTopic, type Message } from '../message.js';
 import { coarseDelivery, FOREIGN_TOPIC_KINDS, memoryReadState } from '../testing/nonconformant.js';
 import { registerTools, type ToolDeps } from './tools.js';
@@ -104,6 +105,17 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
         const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
         try {
           return await toolTopics('parley_fetch_recent', { topic: SUBSCRIBED });
+        } finally {
+          errors.mockRestore();
+        }
+      },
+    ],
+    [
+      'parley_fetch_recent holding a long poll',
+      async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          return await toolTopics('parley_fetch_recent', { topic: SUBSCRIBED, block_ms: 100 });
         } finally {
           errors.mockRestore();
         }
@@ -234,5 +246,48 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
         'a foreign message id was already burned into this topic’s dedup window',
       ).toBe(true);
     }
+  });
+
+  /**
+   * The long poll decides ARRIVAL from the same page. A page of purely foreign traffic is what the
+   * caller's filter then empties, so counting it as arrival hands the agent an empty answer one
+   * millisecond in and turns `block_ms` back into a single fetch — the token burn the field exists
+   * to prevent, once per message anybody posts to the shared room.
+   *
+   * Driven on an injected clock, so the row grades the number of polls rather than a wall clock.
+   */
+  const BUDGET_MS = 1_000;
+  const CADENCE_MS = 250;
+
+  function virtualClock(): { now: () => number; sleep: (ms: number) => Promise<void> } {
+    let t = 0;
+    return {
+      now: () => t,
+      sleep: (ms) => {
+        t += ms;
+        return Promise.resolve();
+      },
+    };
+  }
+
+  it.each([
+    ['a page carrying the requested topic', true, 1],
+    ['a page carrying only other topics', false, BUDGET_MS / CADENCE_MS + 1],
+  ])('%s is arrival only when it carries that topic', async (_name, carryOwn, expectedPolls) => {
+    const { plugin } = coarseDelivery([], { carryOwn });
+    let polls = 0;
+    const inner = plugin.fetchRecent.bind(plugin);
+    plugin.fetchRecent = async (a) => {
+      polls++;
+      return inner(a);
+    };
+    const { now, sleep } = virtualClock();
+    const page = await fetchRecentBlocking(
+      plugin,
+      { topic: asTopic(SUBSCRIBED) },
+      { blockMs: BUDGET_MS, pollIntervalMs: CADENCE_MS, now, sleep },
+    );
+    expect(polls, 'the long poll was ended by traffic that is not the caller’s').toBe(expectedPolls);
+    expect(page.messages.some((m) => m.topic === asTopic(SUBSCRIBED))).toBe(carryOwn);
   });
 });

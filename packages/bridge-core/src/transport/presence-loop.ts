@@ -15,14 +15,16 @@ import type { Allowlist } from '../allowlist.js';
 import type { Handle, Topic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
 import { encodePresence, type PresenceKind } from '../engine/presence.js';
+import { isArmableDelay, MAX_TIMER_MS } from '../timer-bounds.js';
 
 export interface PresenceLoopOptions {
   /** The shared presence topic to announce on (`presence.topic`). */
   presenceTopic: Topic;
   /**
-   * Heartbeat cadence (ms). Must be `>= 1`: anything below that is REJECTED, not clamped, because
-   * `setInterval` floors it to ~1 ms and the loop becomes a post storm against the presence topic.
-   * Core's own config schema already guarantees a positive integer.
+   * Heartbeat cadence (ms). Must be in `[1, MAX_TIMER_MS]`: anything outside that is REJECTED, not
+   * clamped, because `setInterval` floors a smaller delay to ~1 ms and WRAPS a larger one to the
+   * same 1 ms, and the loop becomes a post storm against the presence topic either way. Core's own
+   * config schema already guarantees a positive integer inside the range.
    */
   heartbeatMs: number;
   /** Clock source; injectable for deterministic tests. Default `Date.now`. */
@@ -35,7 +37,8 @@ export interface PresenceLoopOptions {
   instanceId?: string;
   /**
    * How long {@link PresenceLoop.stop} waits for the goodbye to reach the backend before giving up.
-   * Default 2 s.
+   * Same range as {@link PresenceLoopOptions.heartbeatMs}, and for the same reason — it arms a
+   * `setTimeout`. Default 2 s.
    */
   goodbyeTimeoutMs?: number;
 }
@@ -66,10 +69,19 @@ export function startPresenceLoop(
   allow: Allowlist,
   opts: PresenceLoopOptions,
 ): PresenceLoop {
-  // `setInterval` floors any delay below 1 ms to ~1 ms — a non-positive one, and a fractional one
-  // alike — so every such shape becomes a post storm against the topic every peer reads.
-  if (!Number.isFinite(opts.heartbeatMs) || opts.heartbeatMs < 1) {
-    throw new RangeError(`presence heartbeatMs must be a finite number >= 1 (got ${opts.heartbeatMs})`);
+  // A `setInterval` delay outside [1, MAX_TIMER_MS] fires at ~1 ms whichever end it falls off — a
+  // non-positive or fractional one is floored there, a larger one wraps there — so every such shape
+  // becomes a post storm against the topic every peer reads.
+  if (!isArmableDelay(opts.heartbeatMs)) {
+    throw new RangeError(
+      `presence heartbeatMs must be in [1, ${MAX_TIMER_MS}] (got ${opts.heartbeatMs})`,
+    );
+  }
+  const goodbyeTimeoutMs = opts.goodbyeTimeoutMs ?? GOODBYE_TIMEOUT_MS;
+  if (!isArmableDelay(goodbyeTimeoutMs)) {
+    throw new RangeError(
+      `presence goodbyeTimeoutMs must be in [1, ${MAX_TIMER_MS}] (got ${goodbyeTimeoutMs})`,
+    );
   }
   const now = opts.now ?? Date.now;
   // Subscribed topics and post_topics reach are both static config — capture once and advertise
@@ -118,7 +130,7 @@ export function startPresenceLoop(
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
-      await bounded(enqueue('goodbye'), opts.goodbyeTimeoutMs ?? GOODBYE_TIMEOUT_MS);
+      await bounded(enqueue('goodbye'), goodbyeTimeoutMs);
     },
   };
 }

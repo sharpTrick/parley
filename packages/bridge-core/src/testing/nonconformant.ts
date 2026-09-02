@@ -119,7 +119,16 @@ export const FOREIGN_TOPIC_KINDS: Array<[name: string, topic: string]> = [
  * wildcard subscription or a shared room produces — so every driver that reads pages must be run
  * against it, not only against fixtures that pre-filter by topic.
  */
-export function coarseDelivery(alsoCarry: readonly string[] = []): {
+export function coarseDelivery(
+  alsoCarry: readonly string[] = [],
+  opts: {
+    /**
+     * Whether a page for topic X carries any message ON X. `false` is the shared room that is busy
+     * with everyone else's traffic — the page a reader has to treat as "nothing arrived for me".
+     */
+    carryOwn?: boolean;
+  } = {},
+): {
   plugin: BackendPlugin;
   /** Push one message on `topic` to every live subscriber, whatever topic they subscribed to. */
   push(topic: string, n: number): void;
@@ -138,8 +147,12 @@ export function coarseDelivery(alsoCarry: readonly string[] = []): {
       const foreign = [...FOREIGN_TOPIC_KINDS.map(([, t]) => t), ...alsoCarry].filter(
         (t) => t !== args.topic,
       );
-      const messages = [row(args.topic, 1), ...foreign.map((t, i) => row(asTopic(t), i + 2))];
-      return Promise.resolve({ messages, nextCursor: asCursor(String(messages.length)) });
+      const own = opts.carryOwn === false ? [] : [row(args.topic, 1)];
+      const messages = [...own, ...foreign.map((t, i) => row(asTopic(t), i + 2))];
+      return Promise.resolve({
+        messages,
+        nextCursor: messages.at(-1)?.cursor ?? args.since ?? asCursor('0'),
+      });
     },
   } as unknown as BackendPlugin;
   return {
