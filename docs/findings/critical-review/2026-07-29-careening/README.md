@@ -146,6 +146,7 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 17 | 15 / 15 | 89 | 87 | 30 | 2 | 0 | no |
 | 18 | 15 / 15 | 103 | 102 | 31 | 1 | 0 | no |
 | 19 | 15 / 15 | 89 | 88 | 32 | 1 | 0 | no |
+| 20 | 15 / 15 | 101 | 99 | 26 | 2 | 0 | no |
 
 Three rounds ran no critics. Rounds 11, 12 and 14 are **decomposition rounds** — the simplify-first
 rule described in `docs/REVIEW_PROTOCOL.md`, splitting single-file packages after `bridge-sqlite`
@@ -361,6 +362,7 @@ same agent that wrote the fixes being judged.
 | 17 | 89 | 75 | 12 | **86%** |
 | 18 | 103 | 86 | 11 | **89%** |
 | 19 | 89 | 75 | 14 | **84%** |
+| 20 | 101 | 79 | 16 | **83%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
@@ -378,9 +380,9 @@ matter in the original codebase, or only in its own output?*
 
 | round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 | 17 | 18 | 19 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | 10 | 4 | 1 | **8** |
+| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | 10 | 4 | 1 | 8 | **6** |
 
 Round 6's fall to 5 looked like the knee ouroboros reported. It was not: rounds 7–10 recovered to a
 stable 8–11 band, which is what the halfway reading recorded as *"no knee at the run level."*
@@ -445,6 +447,48 @@ cut per-round cost. **Both pre-registered mechanisms were kept unchanged:**
   threshold was not tuned.
 
 The fan-out (14 targets) was likewise left alone.
+
+### Round 20 closes the pre-registered budget, and the series is the result
+
+Round 20 ran all fifteen critics against `c34eab5` and returned **101 findings, 99 confirmed, 26
+blocking, 0 errored**. It did not converge, and no round in the budget did.
+
+The headline is not that number — it is the shape of nineteen scored rounds taken together.
+Pre-existing blocking findings, rounds 2–20:
+
+**36, 25, 20, 11, 5, 10, 9, 11, 8, 6, 6, 10, 4, 1, 8, 6**
+
+It falls steeply through round 6 and then **oscillates in a band rather than decaying toward zero**.
+Since round 6 it has never left 1–11, and every excursion to the bottom of that band has been
+followed by a return. Round 19 refuted the pre-registered exhaustion threshold — three consecutive
+below 8 against an unrestructured tree — by returning 8 after 4 and 1; round 20's 6 goes back below
+without re-establishing it.
+
+The reason the threshold cannot be evaluated is itself the finding. **Every dip followed a large
+remediation, and `git blame` charges the mover.** The dip tracks *how much the previous round
+rewrote*, not how much of the original codebase remains. Round 20 followed the largest remediation
+of the run — 32 blocking findings across 18 commits touching every package — so its 6 is a floor by
+the same argument that made rounds 13 and 15 floors. The stop rule was designed for *a codebase
+under review*. What was actually built is *a codebase under continuous reconstruction*, and the
+instrument cannot measure exhaustion in a tree it will not hold still.
+
+That is the honest answer to the question this experiment was run to settle. The loop does not run
+out of things to say. It reaches a steady state in which each round's remediation opens roughly as
+much new surface as it closes — 83% of round 20's findings are attributable to the experiment's own
+prior output, and that share has sat between 74% and 89% for eight consecutive rounds.
+
+Two operator defects in this round are recorded rather than argued away, because convergence is
+computed and not judged. **`wakeAll` was not passed on the invocation.** Every critic did run and
+none was skipped — `quiescedTargets` is empty, 15 done, 0 errored, which is the condition the flag
+exists to guarantee — but the round is *recorded* as not convergence-eligible. With 99 confirmed
+findings it changes no verdict; in a clean round it would have invalidated the declaration. And the
+blame oracle reported **6 unresolvable findings**, the first of the run: anchors past the end of a
+file at the round's base. They are excluded from the graded denominator and named in the data rather
+than dropped.
+
+One condition changed between rounds 19 and 20 and any cross-round claim about matrix has to say so:
+round 20 reviewed against a Synapse reset immediately beforehand, after the round-19 gate
+investigation found one room holding 84% of the server's events.
 
 ### What remediation measures that review does not
 

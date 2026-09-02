@@ -165,6 +165,17 @@
    "unresolvable": 0,
    "selfInducedPct": 84,
    "note": "The decisive point for the pre-registered exhaustion threshold."
+  },
+  {
+   "round": 20,
+   "base": "c34eab5",
+   "findings": 101,
+   "graded": 95,
+   "selfInduced": 79,
+   "preExisting": 16,
+   "unresolvable": 6,
+   "selfInducedPct": 83,
+   "note": "First round with unresolvable entries (6): findings anchored at line numbers past the end of the file at the round's base — a critic citing a line in a file it had mutated, or a stale anchor. Recorded rather than silently dropped; they are excluded from the graded denominator."
   }
  ],
  "comparison": {
@@ -175,7 +186,7 @@
   }
  },
  "blockingOnly": {
-  "method": "Same git-blame oracle, restricted to CONFIRMED findings of severity=blocking \u2014 the ones that gate the stop rule and represent real risk.",
+  "method": "Same git-blame oracle, restricted to CONFIRMED findings of severity=blocking — the ones that gate the stop rule and represent real risk.",
   "why": "Overall iatrogenesis mixes suggestions and blocking findings. The blocking split is what says whether the loop is still finding things that MATTER in the original codebase, or is now mostly finding and fixing its own.",
   "rounds": [
    {
@@ -282,12 +293,19 @@
     "selfInduced": 24,
     "preExisting": 8,
     "selfInducedPct": 75
+   },
+   {
+    "round": 20,
+    "blocking": 25,
+    "selfInduced": 19,
+    "preExisting": 6,
+    "selfInducedPct": 76
    }
   ],
-  "reading": "RESULT: the exhaustion threshold is NOT met, and the earlier dip is refuted. Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, 10, 4, 1 and 8. The pre-registered rule was three or more consecutive scored rounds below 8 against a tree nobody is restructuring. Rounds 17 and 18 gave 4 and 1; round 19 gives 8, which is not below 8 and sits squarely back in the 8-11 band that rounds 7-10 and 16 occupied. Two consecutive, then a return to the band. No exhaustion result.",
+  "reading": "Pre-existing blocking, rounds 2-20: 36, 25, 20, 11, 5, 10, 9, 11, 8, 6, 6, 10, 4, 1, 8, 6. Round 19 refuted the pre-registered exhaustion threshold (three consecutive below 8 against an unrestructured tree) by returning 8 after 4 and 1. Round 20 returns 6 — below 8 again, but the series as a whole is now the result: across nineteen scored rounds the count OSCILLATES IN A BAND rather than decaying toward zero. Since round 6 it has never left 1-11, and every excursion to the bottom of that band has been followed by a return. The instrument is not converging; it is in a steady state where each round's remediation creates roughly as much new surface as it closes.",
   "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects.",
   "whyTheRefutationIsStrongerThanItLooks": "Blame inflation biases this number DOWNWARD, not upward. When remediation rewrites or moves a line, git blame attributes it to the experiment, so a finding on that line counts as self-induced and the pre-existing count falls. Round 18's remediation was the largest of the run -- 31 blocking findings across eleven packages plus the repo-wide layer -- so round 19 read a tree carrying maximum inflation against it. It still surfaced 8. The true pre-existing rate is therefore AT LEAST 8 and plausibly higher.",
-  "whatThisSaysAboutTheDips": "Rounds 13, 15, 17 and 18 all dipped below the band, and every one of them followed a remediation that moved a large amount of code: 13 and 15 followed the decomposition rounds, 17 followed round 16's 39 fixes, 18 followed round 17's 30. The dip tracks how much the PREVIOUS round rewrote, not how much of the original codebase is left. That is an artefact of the measurement, and it is the single most important caveat this run produces for anyone using git blame as an iatrogenesis oracle."
+  "whatThisSaysAboutTheDips": "Every dip (13, 15, 17, 18, 20) followed a large remediation, and blame charges the mover. The dip tracks HOW MUCH THE PREVIOUS ROUND REWROTE, not how much of the original codebase remains. Round 20 followed the largest remediation of the run — 32 blocking findings across 18 commits touching every package — so its 6 is a floor by the same argument that made rounds 13 and 15 floors. The pre-registered threshold cannot be evaluated against a tree the experiment keeps rewriting, which is itself the finding: the stop rule was designed for a codebase under review, and what was actually built was a codebase under continuous reconstruction."
  },
  "inertRemediations": {
   "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
@@ -371,5 +389,5 @@
   "theInstrumentResult": "Round 9 measured a sharp asymmetry: critics are reliable at FINDING (68/71 confirmed) and unreliable at PRESCRIBING - five remediations that round would have introduced or blessed a defect if implemented as written. Separating review from remediation, each with its own verification, is what caught them.",
   "supersededBy": "Round 16 restores this section rather than superseding it: the run-level knee it reported as absent at round 10 is still absent at round 16."
  },
- "oracle": "scripts/iatrogenesis.mjs \u2014 committed at round 16. It reproduces the rounds 2-10 numbers below exactly, which were computed ad hoc before it existed; that reproduction is the only reason they and the new rows can sit in one table."
+ "oracle": "scripts/iatrogenesis.mjs — committed at round 16. It reproduces the rounds 2-10 numbers below exactly, which were computed ad hoc before it existed; that reproduction is the only reason they and the new rows can sit in one table."
 }
