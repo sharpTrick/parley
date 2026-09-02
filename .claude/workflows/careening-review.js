@@ -152,7 +152,13 @@ const SCHEMA = {
   required: ['nothingFound', 'findings'],
 }
 
-const WORKTREES = '/tmp/careening/worktrees'
+const rawArgs = typeof args === 'string' ? JSON.parse(args) : args
+// Taken from args, because this literal was '/tmp/careening/worktrees' — the path on the cloud
+// container. On a desktop /tmp is a different filesystem from the checkout, so the worktrees live
+// beside the repo instead, and round 18 sent fifteen critics to a directory that did not exist.
+// Fourteen adapted and said so; ONE obeyed the stop rule and reviewed nothing, which is correct
+// behaviour and cost a target its round.
+const WORKTREES = (rawArgs && rawArgs.worktrees) || '/tmp/careening/worktrees'
 
 // The runner cannot create or inspect worktrees — a workflow script has no filesystem access — so it
 // can only tell a critic which one to use. That makes a worktree left at a PREVIOUS round's base the
@@ -170,7 +176,7 @@ function prompt(target) {
   if (target.brief) {
     return [
       baseCheck(target.key, base),
-      `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
+      `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write the orchestrator's own checkout.`,
       target.brief,
       `Review the tree AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round."`,
       `Read CLAUDE.md and DESIGN.md first for the invariants.`,
@@ -183,7 +189,7 @@ function prompt(target) {
   }
   return [
     baseCheck(target.key, base),
-    `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write /home/user/parley.`,
+    `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write the orchestrator's own checkout.`,
     `Full-surface adversarial review of the Parley package at: ${target.path}.`,
     `Review the WHOLE target AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round." A diff-scoped review hides everything the current anchors sit on top of.`,
     `Carry ALL ELEVEN lenses yourself (docs/REVIEW_PROTOCOL.md): correctness, concurrency-and-failure, security, seam-integrity, design-principles, protocol-conformance, test-integrity, truth-in-docs, operability-and-release, maintainability, test-hygiene. Tag every finding with the lens that produced it — that tag is a measurement.`,
@@ -210,7 +216,6 @@ function prompt(target) {
 // `args` arrives as a JSON STRING when the caller passes an object literal, which silently
 // defaulted round to 1 and wakeAll to false in round 2 — and wakeAll false makes a round
 // convergence-INELIGIBLE, so a clean round could never have stopped the loop. Parse both shapes.
-const rawArgs = typeof args === 'string' ? JSON.parse(args) : args
 const round = (rawArgs && rawArgs.round) || 1
 const quiesced = new Set((rawArgs && rawArgs.quiesced) || [])
 const changed = (rawArgs && rawArgs.changed) || []
@@ -272,7 +277,19 @@ const blockingClean = blocking.length === 0 && errored.length === 0 && wakeAll
 // `nextQuiesced` is the FULL set for the next round — pass it back verbatim, so that already-asleep
 // targets are not silently re-woken.
 const ranClean = results
-  .filter((r) => !r.errored && r.findings.every((f) => f.verdict !== 'CONFIRMED'))
+  // Quiesce only on POSITIVE evidence that a review happened. "No confirmed findings" is also what a
+  // critic that never ran returns: round 18's core-auth found its worktree missing, correctly refused
+  // to review, set nothingFound=false — and was still queued for retirement, because this filter only
+  // asked whether findings were absent. `nothingFound` is the field the protocol makes a critic assert
+  // deliberately, and `checked` is the audit trail it owes for a clean result; require both.
+  .filter(
+    (r) =>
+      !r.errored &&
+      r.nothingFound === true &&
+      typeof r.checked === 'string' &&
+      r.checked.trim().length > 0 &&
+      r.findings.every((f) => f.verdict !== 'CONFIRMED'),
+  )
   .map((r) => r.target)
 const nextQuiesced = [...new Set([...ranClean, ...asleep.map((t) => t.key)])]
 
