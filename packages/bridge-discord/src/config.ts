@@ -46,21 +46,101 @@ export interface AllowedMentions {
 
 export const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
 
+/** Longest delay a Node timer holds. Past it the delay wraps and the timer fires at 1ms instead. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /**
- * Every name `backend_config` declares. Keep the `satisfies` on each object, so that a key added to
- * {@link DiscordBackendConfig} or {@link AllowedMentions} without being listed here is a compile
- * error rather than a key `connect()` rejects.
+ * Most dialers whose share of the reconnect ceiling still ARMS: {@link RECONNECT_CAP_MS} is
+ * multiplied by this knob and the product is a `setTimeout` delay, so a larger fleet would wrap
+ * that ceiling to 1ms — a ladder that re-IDENTIFYs as fast as the socket closes, which is the
+ * bot-token reset the ceiling exists to prevent.
  */
+export const MAX_DIALERS = Math.floor(MAX_TIMER_MS / RECONNECT_CAP_MS);
+
+/**
+ * What a declared `backend_config` value must BE. Core parses `backend_config` as an unchecked
+ * record, so every value arrives as whatever the YAML held: each one below reaches a URL a
+ * credentialed call is sent to, a `setTimeout` delay, or the channel id a topic is routed to.
+ */
+export type ConfigShape = 'text' | 'channel map' | 'timer ms' | 'dialer count' | 'nested object';
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** What a value IS. Keep a refusal off what a value HOLDS, so that it cannot print a bot token. */
+const typeName = (value: unknown): string => {
+  if (Array.isArray(value)) return 'an array';
+  if (value === null) return 'null';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+};
+
+/** A figure names itself; anything else is described by type only, for the same reason. */
+const figure = (value: unknown): string =>
+  typeof value === 'number' ? String(value) : typeName(value);
+
+const wholeIn = (value: unknown, from: number, to: number): boolean =>
+  typeof value === 'number' && Number.isInteger(value) && value >= from && value <= to;
+
+/**
+ * Why each {@link ConfigShape} refuses a value, or `undefined` for one it accepts. `nested object`
+ * is the one shape with no check of its own: {@link assertKnownConfigKeys} already refuses a
+ * non-object and an undeclared member for every key it is handed under `nested`.
+ */
+const SHAPE_REFUSALS: Record<ConfigShape, (value: unknown) => string | undefined> = {
+  text: (value) =>
+    typeof value === 'string' ? undefined : `expected a string, got ${typeName(value)}`,
+
+  'channel map': (value) => {
+    if (!isPlainObject(value)) {
+      return `expected an object of topic → channel id, got ${typeName(value)}`;
+    }
+    for (const [topic, channel] of Object.entries(value)) {
+      if (typeof channel !== 'string') {
+        return (
+          `the channel id for topic ${JSON.stringify(topic)} is ${typeName(channel)}, not a ` +
+          "string; a Discord channel id is 17-19 digits and exceeds JavaScript's exact integer " +
+          'range, so quote it'
+        );
+      }
+      if (channel === '') return `the channel id for topic ${JSON.stringify(topic)} is empty`;
+    }
+    return undefined;
+  },
+
+  'timer ms': (value) =>
+    wholeIn(value, 1, MAX_TIMER_MS)
+      ? undefined
+      : `expected a whole number of milliseconds from 1 to ${MAX_TIMER_MS} (Node's timer range; ` +
+        `a fractional, zero, negative or larger delay fires at 1ms instead), got ${figure(value)}`,
+
+  'dialer count': (value) =>
+    wholeIn(value, 1, MAX_DIALERS)
+      ? undefined
+      : `expected an integer from 1 to ${MAX_DIALERS} (how many instances share this bot token ` +
+        `and open a gateway socket; it multiplies the ${RECONNECT_CAP_MS}ms reconnect ceiling, ` +
+        `which has to stay inside Node's timer range), got ${figure(value)}`,
+
+  'nested object': () => undefined,
+};
+
+/**
+ * Every name `backend_config` declares, and the shape its VALUE must have. Keep the `satisfies` on
+ * each object, so that a key added to {@link DiscordBackendConfig} or {@link AllowedMentions}
+ * without being listed here is a compile error rather than a key `connect()` rejects — and, for
+ * this one, a key that reaches a URL, a timer or a route with no declared shape at all.
+ */
+export const CONFIG_SHAPES = {
+  token: 'text',
+  api_url: 'text',
+  gateway_url: 'text',
+  channel_map: 'channel map',
+  handshake_timeout_ms: 'timer ms',
+  gateway_dialers: 'dialer count',
+  allowed_mentions: 'nested object',
+} satisfies Record<keyof Required<DiscordBackendConfig>, ConfigShape>;
+
 const CONFIG_KEYS: BackendConfigKeys = {
-  keys: Object.keys({
-    token: 0,
-    api_url: 0,
-    gateway_url: 0,
-    channel_map: 0,
-    handshake_timeout_ms: 0,
-    gateway_dialers: 0,
-    allowed_mentions: 0,
-  } satisfies Record<keyof Required<DiscordBackendConfig>, 0>),
+  keys: Object.keys(CONFIG_SHAPES),
   nested: {
     allowed_mentions: Object.keys({
       parse: 0,
@@ -72,13 +152,22 @@ const CONFIG_KEYS: BackendConfigKeys = {
 };
 
 /**
- * Refuse a `backend_config` key this plugin does not implement, ahead of every other check. A
- * misspelled `channel_map` uses every topic string as a literal channel id, and a misspelled
- * `allowed_mentions` leaves the mention blast radius at {@link DEFAULT_ALLOWED_MENTIONS} while the
- * operator believes they narrowed it — both silently.
+ * Refuse a `backend_config` key this plugin does not implement, and a value it cannot use, ahead of
+ * every other check. A misspelled `channel_map` uses every topic string as a literal channel id,
+ * and a misspelled `allowed_mentions` leaves the mention blast radius at
+ * {@link DEFAULT_ALLOWED_MENTIONS} while the operator believes they narrowed it — both silently.
  */
 export function assertKnownBackendConfig(config: BackendConfig): void {
   assertKnownConfigKeys('discord', config, CONFIG_KEYS);
+  const cfg = config as Record<string, unknown>;
+  for (const [key, shape] of Object.entries(CONFIG_SHAPES)) {
+    const value = cfg[key];
+    if (value === undefined) continue;
+    const refusal = SHAPE_REFUSALS[shape](value);
+    if (refusal !== undefined) {
+      throw new Error(`Discord backend_config.${key} is not accepted: ${refusal}`);
+    }
+  }
 }
 
 /**
@@ -102,17 +191,11 @@ export function requireDistinctChannels(map: Map<string, string>): Map<string, s
 }
 
 /**
- * Reject a `gateway_dialers` that is not an integer ≥ 1, and return the reconnect ceiling it buys.
- * It divides ONE token's IDENTIFY quota, so a zero or fractional value would silently SHRINK that
- * ceiling instead of widening it, and overrunning the quota resets the token.
+ * The reconnect ceiling a validated `gateway_dialers` buys. It divides ONE token's IDENTIFY quota,
+ * so the {@link SHAPE_REFUSALS} entry that bounds it is what keeps this product both a real
+ * widening and a delay a timer can hold.
  */
-export function requireReconnectCap(value: number | undefined): number {
-  if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
-    throw new Error(
-      `Discord gateway_dialers must be an integer >= 1 (how many instances share this bot ` +
-        `token and open a gateway socket); got ${JSON.stringify(value)}`,
-    );
-  }
+export function reconnectCapFor(value: number | undefined): number {
   return RECONNECT_CAP_MS * (value ?? 1);
 }
 

@@ -57,9 +57,9 @@ gives the walk the default 30000 ms per-call deadline instead.
 | `token`       | _(unset)_                     | Bot token (secret — `.env`, never committed). |
 | `api_url`     | `https://discord.com/api/v10` | REST base URL. Tests point this at an in-process fake. A plaintext `http://` URL to a non-loopback host is **warned about on stderr** (not refused): it puts the bot token on the wire in the clear. |
 | `gateway_url` | _(unset)_                     | Gateway websocket URL override (tests/fakes). Default: resolved live via `GET /gateway/bot`. Either way the socket is dialed with Discord's required `?v=10&encoding=json` — the url `GET /gateway/bot` returns carries neither, and an unversioned connect is closed `4012`. A plaintext `ws://` URL to a non-loopback host is warned about like `api_url`. |
-| `channel_map` | `{}`                          | Parley topic → channel id. Unmapped topics are used as channel ids directly. Targets must be **distinct** — two topics folding onto one channel is rejected at `connect()`, because one of them would otherwise lose its subscription silently. A topic used as a literal channel id that another topic already maps to is refused the same way, on every call that resolves it. |
-| `handshake_timeout_ms` | `10000` | How long HELLO → IDENTIFY → READY may take before the socket is terminated and the attempt fails (the reconnect loop then retries with backoff). |
-| `gateway_dialers` | `1` | How many bridge instances **share this bot token and open a gateway socket**. The 1000-IDENTIFY/24h quota is per **bot token**, not per process, so the reconnect ceiling is `120s × gateway_dialers` — see "Multiple concurrent sessions". |
+| `channel_map` | `{}`                          | Parley topic → channel id, as an object of **quoted** strings. Unmapped topics are used as channel ids directly. Targets must be **distinct** — two topics folding onto one channel is rejected at `connect()`, because one of them would otherwise lose its subscription silently. A topic used as a literal channel id that another topic already maps to is refused the same way, on every call that resolves it. **Quote every channel id:** a Discord channel id is 17–19 digits, past JavaScript's exact integer range, so an unquoted YAML id both loses precision and is not a string — either is a load error here. |
+| `handshake_timeout_ms` | `10000` | How long HELLO → IDENTIFY → READY may take before the socket is terminated and the attempt fails (the reconnect loop then retries with backoff). A whole number of milliseconds from 1 to 2147483647 — Node fires a delay outside that range at 1 ms instead, which would fail every dial forever. |
+| `gateway_dialers` | `1` | How many bridge instances **share this bot token and open a gateway socket**. The 1000-IDENTIFY/24h quota is per **bot token**, not per process, so the reconnect ceiling is `120s × gateway_dialers` — see "Multiple concurrent sessions". An integer from 1 to 17895; past that the ceiling itself outruns Node's timer range and would fire at 1 ms. |
 | `allowed_mentions` | `{ parse: ["users"], replied_user: false }` | Mention scope of every `post`. The default lets a `<@id>` user mention ping and refuses `@everyone`/`@here`/role pings, because `post` content can be untrusted inbound text an agent relayed. Widen it (e.g. add `"roles"` or `"everyone"` to `parse`) only deliberately. |
 
 > **Presence needs a real channel.** Core enables presence by default (`presence.enabled: true`,
@@ -72,10 +72,16 @@ gives the walk the default 30000 ms per-call deadline instead.
 > classifies a channel id that is not a snowflake — this package does not pin that, so treat the
 > default presence topic as unconfigured rather than as a supported empty state.
 
-Every key is checked before anything is dialled, and an **unknown key is a load error** naming
-the accepted set — a misspelled `chanel_map` would otherwise be dropped in silence, leaving
+Every key **and value** is checked before anything is dialled. An **unknown key is a load error**
+naming the accepted set — a misspelled `chanel_map` would otherwise be dropped in silence, leaving
 every topic used as a literal channel id, and a misspelled `allowed_mentions` leaving the
-mention blast radius at the built-in default.
+mention blast radius at the built-in default. A value of the wrong **type** is a load error too,
+naming the key and what the value is (never what it holds, so a refusal cannot print the token):
+`token`, `api_url` and `gateway_url` are strings, `channel_map` is an object of topic → non-empty
+channel id string, and the two figures above are whole numbers inside the ranges their rows give.
+Each of those would otherwise be a bridge that comes up reporting success and is wired to nothing —
+an unquoted channel id keys live dispatch under a number Discord never sends, and a duration
+spelled `10s` reaches `setTimeout` as `NaN`.
 
 ## Rate limits (429)
 

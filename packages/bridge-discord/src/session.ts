@@ -2,8 +2,8 @@ import type { BackendConfig, MessageHandler, Topic } from '@sharptrick/parley-co
 import {
   assertKnownBackendConfig,
   DEFAULT_ALLOWED_MENTIONS,
+  reconnectCapFor,
   requireDistinctChannels,
-  requireReconnectCap,
   requireRoutableChannel,
   type AllowedMentions,
   type DiscordBackendConfig,
@@ -43,7 +43,7 @@ export abstract class DiscordSession {
     const cfg = config as DiscordBackendConfig;
     const channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
     const channelOwner = requireDistinctChannels(channelMap);
-    const reconnectCapMs = requireReconnectCap(cfg.gateway_dialers);
+    const reconnectCapMs = reconnectCapFor(cfg.gateway_dialers);
 
     // Retire the previous session BEFORE installing the new config, so that a re-entrant connect()
     // cannot leave the old socket dispatching into a plugin whose `live` flag says there is none —
