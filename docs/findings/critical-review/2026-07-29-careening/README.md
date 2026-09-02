@@ -529,6 +529,25 @@ take.
 
 Recorded because the meta-goal is what the *next* experiment should be.
 
+- **A live-service gate degraded monotonically for fifteen hours while every per-round control said
+  "not this change."** Matrix conformance failed 5, then 17, then 25 of 32 under load; a control on
+  the *untouched base tree* failed 12 of 32, which correctly established that round 19's remediation
+  was not the cause. That control was then read as CPU contention — and the re-gate on a quiet
+  machine, with nothing else running, failed 10 of 32. Contention was refuted. The Synapse access log
+  showed repeated backward `/messages` pagination on **one room** at ~0.87s per 500-event page, and
+  the database gave the number: **one room held 14,881 of the server's 17,789 events — 84% — while
+  every other room held exactly 14.** The shared-room alias is deterministic, so every run adopted the
+  same room instead of a fresh one; 14,881 events is ~26s against a 20s timeout. After wiping the
+  throwaway volume and re-bootstrapping through the repo's own `dev-infra.sh`: **32/32 in 10.95s**,
+  against 361s with 10 failures immediately before.
+
+  The instrument lesson is the useful part. The control that was run — base tree versus changed tree
+  — was the *right* control for the question asked ("did the remediation break it") and useless for
+  the question that mattered ("is the gate still measuring the code"). **A round that reuses a
+  stateful service needs a control against a FRESH service, not only against an unchanged tree.**
+  Accumulated state gets worse every round; contention does not. Left unfixed, this would have
+  corrupted round 20's measurements silently, and every round after it.
+
 - **The runner received `args` as a JSON string**, so `round` silently defaulted to 1 and `wakeAll`
   to false. Since `wakeAll` is a precondition for declaring convergence, round 2 was
   convergence-INELIGIBLE and a clean round could not have stopped the loop. Fixed in `128ce60` and

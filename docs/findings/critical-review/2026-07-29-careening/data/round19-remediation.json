@@ -6,7 +6,6 @@
   "closed": 32,
   "status": "COMPLETE — every landed diff mutation-replayed",
   "runShape": "Second round at full fan-out, and the first where the fan-out was total: eight agents covering all thirteen package-scoped targets dispatched concurrently, then the repo target last and alone. The repo agent was based on the POST-remediation tree rather than the round's base, so its cross-package guards graded the twelve sibling commits rather than a tree that no longer existed.",
-
   "wrongPrescriptions": {
     "note": "Round 19 produced nineteen more, none caught by any test suite. Running total across rounds 9-19 is 89. Two new modes appeared this round, and both are sharper than 'this fix is weak': a prescription whose DIAGNOSIS is refutable from the vendor's own source, and a prescription that would have made a fixture DIVERGE from the server it models. The dominant mode is now a critic being right about the measurement and wrong about the cause.",
     "cases": [
@@ -107,7 +106,6 @@
       }
     ]
   },
-
   "guardsCorrectInFormWrongAboutTheirSubject": {
     "note": "Round 19's defining shape, and the reason the repo target was the sharpest set of the run: three of its five findings were guards that grade the whole repo and exempt themselves. Two came with mutations the critic had already run and watched pass green.",
     "cases": [
@@ -133,22 +131,33 @@
       }
     ]
   },
-
   "scannersReplacedByExecutions": {
     "note": "Every class-level ratchet added this round that could have been a scan was written as a run instead. This is now the default rather than a preference, and it was added to the shared contract as 'prefer running the thing to scanning for it' before the round began.",
     "cases": [
-      { "target": "core-seam", "detail": "The consumer-typecheck rule is a real tsc against a pruned install rather than a regex over dist/**/*.d.ts, because a scanner goes blind on import() types, triple-slash references, and anything a .d.ts pulls in transitively. Cost measured at 1.7-2.2s per workspace, ~24s for the file." },
-      { "target": "core-engine", "detail": "The degenerate timer vector is MEASURED: a case arms a real setTimeout with each too-large value and asserts it fires within 50 ms despite naming >= 24 days, with MAX_TIMER_MS itself as the control that does not fire. And `timerBacked` is DERIVED by wrapping global setTimeout/setInterval and comparing the set of knobs that armed a timer with their own value against the set marked." },
-      { "target": "repo", "detail": "The skip_permissions guard runs every yaml block in every root document through the real parseConfig, and derives WHICH keys to grade by asking the loader which boolean it refuses at that key's own path with a not-implemented reason." },
-      { "target": "repo", "detail": "The backend-roster derivation is executed against a planted tree holding a new backend beside bridge-core and bridge-net-util; the rule built from it must name the first and neither of the others." },
-      { "target": "shared", "detail": "The negative-control registry requires every diagnosed assertion to appear in some broken variant's failureMessages in the child report — a registry can be satisfied by declaring a mapping; this can only be satisfied by a plugin that really reaches the line." }
+      {
+        "target": "core-seam",
+        "detail": "The consumer-typecheck rule is a real tsc against a pruned install rather than a regex over dist/**/*.d.ts, because a scanner goes blind on import() types, triple-slash references, and anything a .d.ts pulls in transitively. Cost measured at 1.7-2.2s per workspace, ~24s for the file."
+      },
+      {
+        "target": "core-engine",
+        "detail": "The degenerate timer vector is MEASURED: a case arms a real setTimeout with each too-large value and asserts it fires within 50 ms despite naming >= 24 days, with MAX_TIMER_MS itself as the control that does not fire. And `timerBacked` is DERIVED by wrapping global setTimeout/setInterval and comparing the set of knobs that armed a timer with their own value against the set marked."
+      },
+      {
+        "target": "repo",
+        "detail": "The skip_permissions guard runs every yaml block in every root document through the real parseConfig, and derives WHICH keys to grade by asking the loader which boolean it refuses at that key's own path with a not-implemented reason."
+      },
+      {
+        "target": "repo",
+        "detail": "The backend-roster derivation is executed against a planted tree holding a new backend beside bridge-core and bridge-net-util; the rule built from it must name the first and neither of the others."
+      },
+      {
+        "target": "shared",
+        "detail": "The negative-control registry requires every diagnosed assertion to appear in some broken variant's failureMessages in the child report — a registry can be satisfied by declaring a mapping; this can only be satisfied by a plugin that really reaches the line."
+      }
     ]
   },
-
   "regressionIntroducedAndCaught": "Two, both by the independent diff guard, both real, both measured before being accepted. In repo, the first boundary regex `(?<![\\w@/-])` silently WEAKENED the lint versus the `\\b` it replaced — packages/bridge-redis/src/schema.ts, ../../bridge-nats/src/config.js and my-bridge-redis all fired at base and were green under it; all three forms were measured side by side and replaced with a strictly stronger one. In core-engine, Number.isInteger was shipped, flagged as unpaid narrowing, and withdrawn on re-measurement — a fraction INSIDE the range merely truncates (1500.5 -> 1500 ms); only the two ends collapse to ~1 ms. The same guard also caught MAX_TIMER_MS on the public barrel, against this same round's own published-exports-kept-for-nobody finding.",
-
   "theThirdFiling": "shipped-d-ts-type-imports-a-devdependency was filed twice, once as the guard that misses it and once as the manifest that causes it. Built as a real compile against a pruned install and run over all 13 workspaces BEFORE any manifest edit, 12 failed on THREE independent root causes: @types/express in bridge-core (propagating to all 11 dependents), @types/pg in bridge-postgres, @types/ws in bridge-slack. Only bridge-net-util was clean. Every published .d.ts in the repo except one package's was importing a type package no consumer install would carry. The reason the repo could not see it is itself the lesson: the prune must COPY each workspace, not symlink it — a symlink realpaths back into the repo, walks up to the hoisted node_modules, and resolves the exact types the rule exists to withhold.",
-
   "declinedAndEscalated": {
     "note": "Two changes were confirmed and deliberately NOT landed, both under the standing rule that a change to what conformance asserts about the seam is escalated rather than absorbed. This is the first round where a confirmed blocking finding was closed by surfacing it with a costed plan instead of by fixing it.",
     "cases": [
@@ -164,6 +173,19 @@
       }
     ]
   },
-
-  "fixtureFirstOrdering": "Round 18's xmpp lesson held a second and third time, and this round it was tested deliberately rather than discovered. In zulip the fixture was checked FIRST and that was decisive: finding 1's own reproduction case measured GREEN because the fake never served the bad record, and measured RED once the fake was fixed. Fixing the plugin first would have made a real fix indistinguishable from a no-op. In slack the fixture defect did not mask its sibling, but the fixture could not EXPRESS any vendor reading other than the documented one, so fixing it is what made the sibling's ratchet writable at all. In discord the two were genuinely disjoint, which was established by measurement rather than assumed."
+  "fixtureFirstOrdering": "Round 18's xmpp lesson held a second and third time, and this round it was tested deliberately rather than discovered. In zulip the fixture was checked FIRST and that was decisive: finding 1's own reproduction case measured GREEN because the fake never served the bad record, and measured RED once the fake was fixed. Fixing the plugin first would have made a real fix indistinguishable from a no-op. In slack the fixture defect did not mask its sibling, but the fixture could not EXPRESS any vendor reading other than the documented one, so fixing it is what made the sibling's ratchet writable at all. In discord the two were genuinely disjoint, which was established by measurement rather than assumed.",
+  "environmentalDefectFoundAtTheGate": {
+    "note": "The one gate round 19 deliberately did not claim — matrix live conformance — turned out to be measuring the test environment rather than the code, and the first explanation for it was wrong. Recorded because it would have corrupted round 20 silently: accumulated server state gets worse every round, where contention does not.",
+    "sequence": [
+      "Under load, matrix conformance failed 5, then 17, then 25 of 32. A control on the UNTOUCHED base tree failed 12 of 32, which correctly established that the round-19 remediation was not the cause.",
+      "That control was read as CPU/service contention. The attribution was wrong.",
+      "The re-gate on a quiet machine, nothing else running, failed 10 of 32 — barely different from 12 under full load. Contention was refuted.",
+      "The Synapse access log showed the shape: repeated backward /messages pagination on ONE room, 500 events per page at ~0.87s per page, walking t3809 -> t3572 -> t3328 -> ... and ending in 'already disconnected'.",
+      "The database gave the number: one room held 14,881 of the server's 17,789 events — 84% — while every other room held exactly 14.",
+      "Cause: the shared-room-mode alias is deterministic, so every conformance run for 15 hours adopted the SAME room instead of a fresh one. 14,881 events at ~500/page and ~0.87s/page is ~26s against a 20s timeout. The arithmetic matches the failure exactly.",
+      "After wiping the throwaway Synapse volume and re-bootstrapping through the repo's own dev-infra.sh: 32/32 passed in 10.95s, against 361s with 10 failures immediately before. A 33x speedup and full green."
+    ],
+    "lessonForTheInstrument": "A live-service gate can degrade monotonically across rounds while every per-round control still says 'not this change'. The control that was run — base tree versus changed tree — was the right control for the question asked (did the remediation break it) and useless for the question that mattered (is the gate still measuring the code). A round that reuses a stateful service needs a control against a FRESH service, not only against an unchanged tree.",
+    "notFiled": "A production shared-room deployment would hit the same wall: the room grows without bound and catch-up walks it. Deliberately NOT filed by the operator mid-remediation — round 20's critics review this surface full-scope, and finding it independently is a stronger result than planting it."
+  }
 }
