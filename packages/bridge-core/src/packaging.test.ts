@@ -216,6 +216,84 @@ describe('every public workspace ships only what a consumer can run', () => {
     });
   });
 
+  /**
+   * Every path a manifest promises a consumer — every `bin` target and every `exports` condition —
+   * must be inside the tarball and must have a source that builds it. This rule existed as two
+   * near-identical copies held by two of thirteen workspaces, both of which already satisfied it,
+   * so the eight other packages shipping a `bin` were graded by nothing: narrowing one of their
+   * `files` lists to the index alone passed every guard in this repo, `npm pack` included, and
+   * would have published a CLI that ENOENTs and an import that resolves to no types.
+   */
+  const promisedPaths = (node: unknown, out: string[] = []): string[] => {
+    if (typeof node === 'string' && node.startsWith('./')) out.push(node);
+    else if (Array.isArray(node)) for (const v of node) promisedPaths(v, out);
+    else if (node !== null && typeof node === 'object') {
+      for (const v of Object.values(node)) promisedPaths(v, out);
+    }
+    return out;
+  };
+
+  const promisesOf = (manifest: Record<string, unknown>): string[] => [
+    ...new Set([...promisedPaths(manifest.exports), ...promisedPaths(manifest.bin)]),
+  ];
+
+  /** Would `files` put this path in the tarball? npm packs the manifest itself whatever it says. */
+  const packedBy = (files: unknown, path: string): boolean => {
+    const p = path.replace(/^\.\//, '');
+    if (p === 'package.json') return true;
+    return ((files as string[] | undefined) ?? []).some(
+      (f) =>
+        p === f.replace(/^\.\//, '') || p.startsWith(`${f.replace(/^\.\//, '').replace(/\/$/, '')}/`),
+    );
+  };
+
+  /** The source a `dist/` artifact is built from, so a promise nothing can build is caught unbuilt. */
+  const builtFrom = (path: string): string =>
+    path
+      .replace(/^\.\//, '')
+      .replace(/^dist\//, 'src/')
+      .replace(/\.d\.ts$|\.js$/, '.ts');
+
+  it.each(WORKSPACES.map((w) => [w.name, w] as const))(
+    '%s packs every path its manifest promises',
+    (_name, w) => {
+      const manifest = readJson(join(REPO_ROOT, w.dir, 'package.json'));
+      const promised = promisesOf(manifest);
+      expect(promised.length, 'this manifest promises nothing, so the row grades nothing').toBeGreaterThan(0);
+      expect(
+        promised.filter((p) => !packedBy(manifest.files, p)),
+        'add a "files" entry covering it, or the tarball cannot resolve what the manifest advertises',
+      ).toEqual([]);
+    },
+  );
+
+  it.each(WORKSPACES.map((w) => [w.name, w] as const))(
+    '%s has a source for every path its manifest promises',
+    (_name, w) => {
+      const promised = promisesOf(readJson(join(REPO_ROOT, w.dir, 'package.json')));
+      expect(
+        promised.filter((p) => !existsSync(join(REPO_ROOT, w.dir, builtFrom(p)))),
+        'nothing in this package builds it',
+      ).toEqual([]);
+    },
+  );
+
+  it('sees an unpacked promise and an unbuildable one (positive control)', () => {
+    expect(
+      promisesOf({
+        exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+        bin: { 'parley-x': './dist/cli.js' },
+      }),
+    ).toEqual(['./dist/index.d.ts', './dist/index.js', './dist/cli.js']);
+    expect(promisesOf({ bin: './dist/cli.js' })).toEqual(['./dist/cli.js']);
+    expect(packedBy(['dist'], './dist/cli.js')).toBe(true);
+    expect(packedBy(['dist/index.js'], './dist/cli.js')).toBe(false);
+    expect(packedBy(undefined, './dist/index.js')).toBe(false);
+    expect(packedBy(['dist'], './package.json')).toBe(true);
+    expect(builtFrom('./dist/cli.js')).toBe('src/cli.ts');
+    expect(builtFrom('./dist/index.d.ts')).toBe('src/index.ts');
+  });
+
   it('records no package as excused from a rule this file grades', () => {
     const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
     expect(
