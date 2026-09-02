@@ -1,8 +1,9 @@
 /**
  * Gateway intents this plugin cannot work without. MESSAGE_CONTENT is PRIVILEGED and must also be
  * toggled on in the developer portal; without it every `MESSAGE_CREATE` arrives with empty
- * `content`. Keep this module free of IMPORTS, so that the test fakes can enforce the bits without
- * pulling `ws` in through the plugin — `vi.mock('ws')` awaits the fakes, and a cycle deadlocks.
+ * `content`. Keep this list matching `test/discord-intents.ts`, which restates Discord's bits by
+ * value and is what the fakes demand, so that dropping one here is a refused handshake in the
+ * suite rather than a bridge that reaches READY and is never dispatched a message.
  */
 export const REQUIRED_INTENTS = {
   GUILDS: 1 << 0,

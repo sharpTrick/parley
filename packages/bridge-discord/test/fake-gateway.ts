@@ -12,10 +12,12 @@
  * Like the real gateway, it REFUSES an IDENTIFY that does not carry the expected bot token (4004)
  * or that is missing a required intent bit (4014), a CONNECT url missing Discord's required
  * `v`/`encoding` query params (4012, before any HELLO), and a socket that does not answer a
- * server-initiated op 1 (4009) — keep those checks ahead of {@link state.onIdentify}, so that a
- * plugin change which stops sending one cannot be scripted past them.
+ * server-initiated op 1 (4009) — keep those checks ahead of {@link state.onIdentify}, and keep the
+ * bits they demand coming from `discord-intents.ts` rather than from the plugin's own list, so that
+ * neither a call site that stops sending one nor a deletion from that list can be scripted past
+ * them.
  */
-import { REQUIRED_INTENTS } from '../src/intents.js';
+import { REQUIRED_INTENT_BITS } from './discord-intents.js';
 
 /** The CONNECT-url query Discord requires; a socket dialed without it never reaches HELLO. */
 export const REQUIRED_GATEWAY_QUERY: Record<string, string> = { v: '10', encoding: 'json' };
@@ -164,7 +166,7 @@ export const state = {
   onIdentify: (ws: FakeWs) => ws.ready(),
   asyncClose: false,
   expectToken: FAKE_TOKEN as unknown,
-  requiredIntents: Object.values(REQUIRED_INTENTS) as number[],
+  requiredIntents: [...REQUIRED_INTENT_BITS],
 };
 
 export function resetGateway(): void {
@@ -172,7 +174,7 @@ export function resetGateway(): void {
   state.onIdentify = (ws: FakeWs) => ws.ready();
   state.asyncClose = false;
   state.expectToken = FAKE_TOKEN;
-  state.requiredIntents = Object.values(REQUIRED_INTENTS);
+  state.requiredIntents = [...REQUIRED_INTENT_BITS];
 }
 
 /** IDENTIFYs sent across ALL sockets — the quantity Discord's 1000/24h quota counts. */

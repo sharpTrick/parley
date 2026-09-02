@@ -32,7 +32,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { REQUIRED_INTENTS } from '../src/intents.js';
+import { REQUIRED_INTENT_BITS } from './discord-intents.js';
 import { gatewayQueryOk } from './fake-gateway.js';
 
 /** Discord's documented User-Agent shape; Cloudflare may block a request without one. */
@@ -315,7 +315,7 @@ export async function startFakeDiscord(opts?: { token?: string }): Promise<FakeD
           return;
         }
         const intents = typeof d.intents === 'number' ? d.intents : 0;
-        if (Object.values(REQUIRED_INTENTS).some((bit) => (intents & bit) === 0)) {
+        if (REQUIRED_INTENT_BITS.some((bit) => (intents & bit) === 0)) {
           ws.close(4014);
           return;
         }

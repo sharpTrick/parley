@@ -38,7 +38,13 @@ export { BACKOFF_BASE_MS, BACKOFF_JITTER_MS, INVALID_SESSION_MIN_WAIT_MS,
 export type { AllowedMentions, DiscordBackendConfig } from './config.js';
 
 /** One exclusive-`since` catch-up: where it resumes, how much it wants, and the budget it shares. */
-interface Catchup { topic: Topic; since: Cursor; limit: number; deadline: number }
+interface Catchup {
+  topic: Topic;
+  since: Cursor;
+  limit: number;
+  deadline: number;
+  generation: number;
+}
 
 /**
  * Discord backend (DESIGN §6/§9); the README carries the seam mapping and the hosted-SaaS
@@ -85,6 +91,7 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
+    const generation = this.generation;
     const limit = args.limit ?? 100;
     // The seam declares `blockMs?: number` with no bound, and every wait this call runs — the
     // connect race, the waiter, each page's own budget — is derived here. Keep the finiteness arm,
@@ -96,12 +103,12 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
     const deadline = Date.now() + (blockMs > 0 ? blockMs : DEFAULT_DEADLINE_MS);
 
     if (args.since === undefined) {
-      const records = await newestWindow(this.pager(args.topic), limit, deadline);
+      const records = await newestWindow(this.pager(args.topic, generation), limit, deadline);
       const messages = records.map((m) => toMessage(args.topic, m));
       return { messages, nextCursor: messages.at(-1)?.cursor ?? asCursor('0') };
     }
 
-    const walk: Catchup = { topic: args.topic, since: args.since, limit, deadline };
+    const walk: Catchup = { topic: args.topic, since: args.since, limit, deadline, generation };
     if (blockMs <= 0) return this.fetchSince(walk);
 
     // Native long-poll: wait on the SAME gateway MESSAGE_CREATE stream the live path uses, then
@@ -152,8 +159,10 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
   }
 
   /** Empty → `nextCursor` echoes `since` (stable, replayable). */
-  private async fetchSince({ topic, since, limit, deadline }: Catchup): Promise<FetchRecentResult> {
-    const records = await windowSince(this.pager(topic), String(since), limit, deadline);
+  private async fetchSince(walk: Catchup): Promise<FetchRecentResult> {
+    const { topic, since, limit, deadline, generation } = walk;
+    const pages = this.pager(topic, generation);
+    const records = await windowSince(pages, String(since), limit, deadline);
     const messages = records.map((m) => toMessage(topic, m));
     return { messages, nextCursor: messages.at(-1)?.cursor ?? since };
   }
@@ -162,10 +171,14 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
    * One `GET /channels/<id>/messages` page (newest-first) for `topic`. Keep ONLY `10003 Unknown
    * Channel` mapped to the seam's absent topic, so that a 404 that is not it, and `50001 Missing
    * Access` — the channel exists and this bot is misconfigured — stay real failures instead of
-   * reading to core as "topic not present yet".
+   * reading to core as "topic not present yet". Keep every page behind the `generation` its seam
+   * call captured, so that a walk parked on a waiter or between pages across a re-`connect()`
+   * resolves `topic` against the map the caller asked under and never carries the successor
+   * session's messages, or its cursor, back under that name.
    */
-  private pager(topic: Topic): PageFn {
+  private pager(topic: Topic, generation: number): PageFn {
     return async (query, budgetMs) => {
+      if (generation !== this.generation) return [];
       const path = `/channels/${encodeURIComponent(this.channelId(topic))}/messages?${query}`;
       const res = await this.rest.request('GET', path, {
         allowStatuses: [404],

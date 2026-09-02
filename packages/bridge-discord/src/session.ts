@@ -26,6 +26,13 @@ export abstract class DiscordSession {
   protected allowedMentions: AllowedMentions = DEFAULT_ALLOWED_MENTIONS;
   private connected = false;
   protected stopped = false;
+  /**
+   * Bumped by every `connect()` and captured by each seam call before its first await. Keep every
+   * query a call makes behind that capture, so that one parked across a re-`connect()` cannot
+   * resume against the NEW `channel_map` and hand its caller another channel's messages and cursor
+   * under the topic it asked about — `stopped` cannot say so, `connect()` sets it back to false.
+   */
+  protected generation = 0;
   protected readonly rest = new DiscordRest(() => this.stopped);
   protected readonly gateway = new DiscordGateway(this.rest, {
     isStopped: () => this.stopped,
@@ -49,6 +56,7 @@ export abstract class DiscordSession {
     // cannot leave the old socket dispatching into a plugin whose `live` flag says there is none —
     // which silently degrades every later native long-poll to an immediate return.
     this.stopped = true;
+    this.generation++;
     this.gateway.restart(cfg, reconnectCapMs);
     this.forgetTopics();
 

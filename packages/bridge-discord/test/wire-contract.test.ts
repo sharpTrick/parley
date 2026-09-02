@@ -10,8 +10,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
-import { DiscordPlugin } from '../src/index.js';
-import { REQUIRED_INTENTS } from '../src/intents.js';
+import { DiscordPlugin, REQUIRED_INTENTS } from '../src/index.js';
+import {
+  EXPECTED_INTENT_MASK,
+  GATEWAY_INTENT_BITS,
+  REQUIRED_INTENT_BITS,
+} from './discord-intents.js';
 import {
   FAKE_TOKEN,
   FakeWs,
@@ -56,21 +60,29 @@ describe('Discord IDENTIFY carries the credential and capability bits', () => {
     expect((await identify()).token).toBe(FAKE_TOKEN);
   });
 
-  // The table below is generated FROM the list, so it cannot notice a bit deleted from it. Pin the
-  // one whose absence is silent in production: without MESSAGE_CONTENT every MESSAGE_CREATE arrives
-  // with empty `content` and the bridge pushes blank bodies into the session.
-  it('declares MESSAGE_CONTENT as a required intent', () => {
-    expect(REQUIRED_INTENTS.MESSAGE_CONTENT).toBe(1 << 15);
-  });
-
-  // Parameterized from the exported list, so an intent added later joins this table by construction.
-  for (const [name, bit] of Object.entries(REQUIRED_INTENTS)) {
+  // Parameterized from `discord-intents.ts`, which restates Discord's documented bits by value: a
+  // table generated from the plugin's own `REQUIRED_INTENTS` loses a row the moment a bit is
+  // deleted from it, which is the one change whose whole consequence is on the provider's side.
+  for (const [name, bit] of Object.entries(GATEWAY_INTENT_BITS)) {
     it(`sets the ${name} intent bit (${bit})`, async () => {
       const { intents } = await identify();
       expect(typeof intents).toBe('number');
       expect((intents as number) & bit).toBe(bit);
     });
   }
+
+  // The bits above and NOTHING ELSE: an intent nobody asked for is a 4014 close on any bot whose
+  // portal has it switched off, and the fakes — which refuse only a MISSING bit — cannot see one.
+  it('sets those bits and no others', async () => {
+    expect(await identify().then((frame) => frame.intents)).toBe(EXPECTED_INTENT_MASK);
+  });
+
+  // `REQUIRED_INTENTS` is a PUBLISHED export, and the frame above is packed from its values alone:
+  // renaming a member, or moving a bit between members, leaves the wire byte-identical and breaks
+  // every consumer that reads one by name.
+  it('publishes those bits under Discord\'s own names', () => {
+    expect({ ...REQUIRED_INTENTS }).toEqual(GATEWAY_INTENT_BITS);
+  });
 });
 
 describe('the fake gateway refuses an IDENTIFY the real one would refuse', () => {
@@ -100,7 +112,7 @@ describe('the fake gateway refuses an IDENTIFY the real one would refuse', () =>
     {
       label: 'an intent bit the plugin does not request',
       demand: () => {
-        state.requiredIntents = [...Object.values(REQUIRED_INTENTS), 1 << 20];
+        state.requiredIntents = [...REQUIRED_INTENT_BITS, 1 << 20];
       },
       code: 4014,
     },

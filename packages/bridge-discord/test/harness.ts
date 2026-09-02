@@ -121,6 +121,12 @@ export const URL_SOURCES = [
 export interface FetchStub {
   /** The page every `GET …/messages` answers, newest-first as Discord returns it. */
   page: unknown[];
+  /**
+   * Per-channel-id pages, consulted before {@link page}. Keep a case that is about WHICH channel a
+   * query reached answering from this, so that a query sent to the wrong channel is graded by the
+   * records it brings back and not only by a url counted after the fact.
+   */
+  pages: Record<string, unknown[]>;
   /** The url `GET /gateway/bot` hands out while {@link gatewayFault} is unset. */
   gatewayUrl: string;
   /** When set, `GET /gateway/bot` fails this way instead of answering a url. */
@@ -161,6 +167,7 @@ export function stubFetch(): FetchStub {
 
   const stub: FetchStub = {
     page: [],
+    pages: {},
     gatewayUrl: 'ws://fake',
     gatewayFault: undefined,
     count: (pathIncludes) =>
@@ -207,7 +214,8 @@ export function stubFetch(): FetchStub {
         return Promise.resolve(jsonResponse(200, { id: '1', channel_id: '1' }));
       }
       // Snapshot at REQUEST time: a parked query answers the page it read, not one taken later.
-      const answer = jsonResponse(200, stub.page);
+      const channel = /\/channels\/([^/]+)\/messages/.exec(url)?.[1] ?? '';
+      const answer = jsonResponse(200, stub.pages[channel] ?? stub.page);
       if (!holdNext) return Promise.resolve(answer);
       holdNext = false;
       return park(answer);
