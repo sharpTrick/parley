@@ -69,7 +69,11 @@ export function concurrencyCases(ctx: ConformanceContext): void {
     expect(stored).toHaveLength(WRITERS * PER_WRITER);
     const missed = stored.filter((id) => !seen.includes(id));
     expect(missed, 'the reader advanced past a row it can never fetch again').toEqual([]);
-    expect(seen, 'the reader saw a message twice or out of order').toEqual(stored);
+    expect(
+      seen,
+      'interleaved-reader-sees-each-row-once-in-order: the reader saw a row twice, or out of ' +
+        'cursor order, while the writers were still in flight',
+    ).toEqual(stored);
   });
 
   it('multi-process writes do not corrupt or error; cursor stays monotonic', async (testCtx) => {
@@ -83,13 +87,19 @@ export function concurrencyCases(ctx: ConformanceContext): void {
     const all = await drainAll(ctx.plugin, t);
     expect(all).toHaveLength(WRITERS * PER_WRITER);
     expect(new Set(all.map((m) => m.backendMsgId)).size).toBe(WRITERS * PER_WRITER);
-    expect(new Set(all.map((m) => m.cursor)).size).toBe(WRITERS * PER_WRITER);
+    expect(
+      new Set(all.map((m) => m.cursor)).size,
+      'two rows written concurrently share a cursor, so a reader resuming at one of them cannot ' +
+        'say which it has already had',
+    ).toBe(WRITERS * PER_WRITER);
 
     // Cursor ordering is real: since the k-th message returns exactly the messages after it.
     const k = Math.floor(all.length / 2);
     const rest = await ctx.plugin.fetchRecent({ topic: t, since: all[k]!.cursor, limit: 10_000 });
-    expect(rest.messages.map((m) => m.backendMsgId)).toEqual(
-      all.slice(k + 1).map((m) => m.backendMsgId),
-    );
+    expect(
+      rest.messages.map((m) => m.backendMsgId),
+      'a cursor from the middle of a concurrently-written topic did not name exactly the rows ' +
+        'after it',
+    ).toEqual(all.slice(k + 1).map((m) => m.backendMsgId));
   });
 }

@@ -48,6 +48,12 @@ export const CLAUSES: readonly string[] = [
  *   read path — re-delivers its own messages on every catch-up. The uniqueness assertions cannot see
  *   it: a re-spelled id is still unique and still stable.
  *
+ * - `interleaved-reader-sees-each-row-once-in-order`: a reader paging a topic WHILE it is being
+ *   written sees every row exactly once, in cursor order. Neither the field registry nor the clause
+ *   registry can require a control for it: the clause's own control fails through the assertion
+ *   BESIDE it (a row the reader never saw at all), so the re-delivery and re-ordering half could be
+ *   deleted with this package — negative control included — staying green.
+ *
  * The four below are ELAPSED TIME, which is neither a field nor a call. Every assertion over
  * `Date.now() - <start>` names one of them in its own failure message, and `suite-shape` requires
  * that of any new one — an uncontrolled timing bound is invisible to every other check here.
@@ -68,6 +74,7 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'limit-honoured',
   'disconnect-stops-live-delivery',
   'post-id-agreement',
+  'interleaved-reader-sees-each-row-once-in-order',
   'sinceless-block-returns-promptly',
   'ignored-block-returns-promptly',
   'native-block-wakes-on-the-message',

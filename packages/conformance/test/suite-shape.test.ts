@@ -18,6 +18,7 @@ import {
   cases,
   casesIn,
   deferredPromises,
+  diagnosedAssertions,
   guardedRegions,
   promiseExecutors,
   type SelfImposedBudget,
@@ -438,6 +439,47 @@ describe('the suite grades every backend it certifies', () => {
       expect(cases().length).toBeGreaterThan(0);
       expect(casesIn(module).flatMap((c) => promiseExecutors(c.body))).toEqual([]);
       expect(promiseExecutors(module)).toHaveLength(1);
+    });
+  });
+
+  /**
+   * The scan behind the negative control's assertion-level registry, self-tested over synthetic
+   * snippets. Kept here rather than there: that file grades what the scan FINDS, so a scan that
+   * found nothing would satisfy it by having nothing left to require. Both verdicts, so it cannot
+   * pass by matching everything or by matching nothing.
+   */
+  /**
+   * The scan behind the negative control's assertion-level registry, self-tested over synthetic
+   * snippets. Kept here rather than there: that file grades what the scan FINDS, so a scan that
+   * found nothing would satisfy it by having nothing left to require. Both verdicts, so it cannot
+   * pass by matching everything or by matching nothing.
+   */
+  describe('the diagnostic scan reads an assertion the way the runner prints it', () => {
+    it.each([
+      [
+        'a diagnosed assertion',
+        "expect(seen, 'the reader saw a row twice').toEqual(stored);",
+        ['the reader saw a row twice'],
+      ],
+      [
+        'a diagnostic assembled from several literals',
+        "expect(x, 'first half ' + 'second half').toBe(1);",
+        ['first half '],
+      ],
+      [
+        'a diagnosed assertion whose subject carries commas and parens',
+        "expect(new Set(all.map((m) => m.cursor)).size, 'two rows share a cursor').toBe(4);",
+        ['two rows share a cursor'],
+      ],
+      ['an assertion with no diagnostic', 'expect(messages).toHaveLength(3);', []],
+      ['an assertion whose second argument is not a message', 'expect(a, b).toBe(1);', []],
+      [
+        'a diagnostic carrying an escaped quote',
+        "expect(x, 'the topic\\'s cursor moved').toBe(1);",
+        ["the topic's cursor moved"],
+      ],
+    ])('reads %s', (_label, snippet, found) => {
+      expect(diagnosedAssertions(snippet)).toEqual(found);
     });
   });
 

@@ -175,6 +175,39 @@ export function promiseExecutors(
   return out;
 }
 
+/** The text after the first TOP-LEVEL comma of an argument list, or undefined when there is none. */
+function afterFirstArgument(args: string): string | undefined {
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i] as string;
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    else if (ch === ',' && depth === 0) return args.slice(i + 1);
+  }
+  return undefined;
+}
+
+/**
+ * The first literal fragment of every DIAGNOSED assertion in the suite — `expect(actual, 'why this
+ * matters')`. The negative control requires each one to appear in some broken variant's failure
+ * output, which is the only check here that grades an assertion rather than a clause, a field or a
+ * capability arm: a clause keeps its control while an assertion INSIDE it has none, because the
+ * control fails through the assertion beside it, and the registries above cannot see the difference.
+ *
+ * The fragment rather than the whole message, so that a diagnostic assembled from several literals
+ * is still matched against what the runner prints.
+ */
+export function diagnosedAssertions(source: string): string[] {
+  const out: string[] = [];
+  for (const m of source.matchAll(/\bexpect\(/g)) {
+    const open = (m.index as number) + m[0].length - 1;
+    const rest = afterFirstArgument(parenthesized(source, open));
+    const literal = /^\s*'((?:\\.|[^'\\])*)'/.exec(rest ?? '');
+    if (literal !== null) out.push((literal[1] as string).replaceAll("\\'", "'"));
+  }
+  return out;
+}
+
 export function guardedBlock(text: string, open: number): string {
   let depth = 0;
   for (let i = open; i < text.length; i++) {

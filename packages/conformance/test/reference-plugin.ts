@@ -317,6 +317,13 @@ export interface BrokenVariant {
 const NARROW_BLAST_RADIUS = 4;
 
 /**
+ * Rows an imagined server-side batch holds. Two variants below misbehave only ABOVE it, which is
+ * what keeps them aimed: every clause but the two concurrency ones works on a handful of messages,
+ * so a defect conditioned on a topic this large reaches those two and nothing else.
+ */
+const SERVER_BATCH = 50;
+
+/**
  * The widest any control may be declared, whatever it corrupts. `since` is threaded through most of
  * the suite, so the one variant that re-delivers at a cursor legitimately reaches half of it — but
  * past half a control has stopped discriminating, and no figure recorded here can buy that back.
@@ -733,6 +740,54 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
               perSender.set(String(m.senderHandle), n);
               return { ...m, cursor: asCursor(String(n).padStart(12, '0')) };
             }),
+          };
+        },
+      })),
+  },
+  {
+    /**
+     * Re-delivery that only shows up under CONTENTION. A page stitched from two server-side batches
+     * repeats the boundary row, which a topic small enough for one batch never reveals — so every
+     * other clause reads clean and only the interleaved reader, paging a topic while it grows past
+     * a batch, sees a row twice. The row it never saw at all — the assertion beside this one — is
+     * untouched, so this control reaches that assertion and nothing else in its case.
+     */
+    name: 'a since page that repeats its first row once the topic outgrows one batch',
+    mutates: 'interleaved-reader-sees-each-row-once-in-order',
+    mustFail: 'interleaved with concurrent writers',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined || page.messages.length === 0) return page;
+          const whole = await inner.fetchRecent({ ...args, since: undefined, limit: 10_000 });
+          if (whole.messages.length <= SERVER_BATCH) return page;
+          return { ...page, messages: [page.messages[0]!, ...page.messages] };
+        },
+      })),
+  },
+  {
+    /**
+     * A cursor RENDERED non-uniquely while still resolving correctly — a coarse rendering (a
+     * second-resolution timestamp, a truncated offset) that two concurrent writes land inside.
+     * Every `since` in the suite still names the right position, so the ordering assertion beside
+     * it passes and only the distinctness assertion can see this.
+     */
+    name: 'two concurrent rows rendered under one cursor',
+    mutates: 'cursor',
+    mustFail: 'multi-process writes',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (page.messages.length <= SERVER_BATCH) return page;
+          // `nextCursor` keeps the REAL last cursor, so paging still terminates and the collision is
+          // visible only where the suite reads the rows' own cursors.
+          return {
+            messages: page.messages.map((m, i) =>
+              i === page.messages.length - 1 ? { ...m, cursor: page.messages[i - 1]!.cursor } : m,
+            ),
+            nextCursor: page.nextCursor,
           };
         },
       })),

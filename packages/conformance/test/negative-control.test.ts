@@ -14,7 +14,7 @@ import {
   MAX_BLAST_RADIUS,
   ReferencePlugin,
 } from './reference-plugin.js';
-import { BOOLEAN_CAPABILITIES, cases } from './suite-source.js';
+import { BOOLEAN_CAPABILITIES, cases, diagnosedAssertions, suiteSource } from './suite-source.js';
 
 /**
  * The suite's negative control. A suite that accepts every plugin certifies nothing, and an
@@ -30,6 +30,7 @@ interface Row {
   fullName: string;
   status: string;
   ancestorTitles: string[];
+  failureMessages?: string[];
 }
 
 interface JsonReport {
@@ -152,6 +153,41 @@ describe('every Message field the suite reads has a plugin that corrupts it', ()
     expect(
       BROKEN_VARIANTS.filter((v) => !vocabulary.has(v.mutates)).map((v) => `${v.name} → ${v.mutates}`),
     ).toEqual([]);
+  });
+});
+
+/**
+ * One level down from the FIELD, and the only check here that grades an ASSERTION. A clause keeps
+ * its control while one assertion inside it has none, because the control fails through the
+ * assertion beside it: `expect(missed, …)` catches the row the reader never saw, and every registry
+ * above is satisfied by that — while `expect(seen, …)`, which catches a row it saw TWICE or out of
+ * order, could be deleted with this whole package, negative control included, staying green. Three
+ * such assertions were in exactly that state.
+ *
+ * Read off what the broken variants actually PRINTED, not off a table: an assertion is alive iff
+ * some control made the runner emit its diagnostic. A registry could be satisfied by declaring a
+ * mapping; this can only be satisfied by a plugin that really reaches the line.
+ */
+describe('every assertion carrying its own diagnostic has a variant that reaches it', () => {
+  const diagnosed = [...new Set(diagnosedAssertions(suiteSource))];
+
+  it('finds diagnosed assertions to check (guards against a broken parser)', () => {
+    expect(
+      diagnosed.length,
+      'the diagnostic scan found fewer than it was written against',
+    ).toBeGreaterThanOrEqual(9);
+  });
+
+  it.each(diagnosed.map((d) => [d]))('%s', (message) => {
+    const reached = results().filter((row) =>
+      (row.failureMessages ?? []).some((failure) => failure.includes(message)),
+    );
+    expect(
+      reached.map((row) => row.fullName),
+      `no broken variant makes this assertion fail — it grades nothing, and deleting it would ` +
+        `change no result in this package. Add the plugin mutation only it can catch, or ` +
+        `establish that the assertion beside it already covers the property.`,
+    ).not.toEqual([]);
   });
 });
 
