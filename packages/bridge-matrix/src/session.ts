@@ -119,7 +119,17 @@ export abstract class MatrixSession {
   protected async existingRoom(topic: Topic, generation: number): Promise<string | undefined> {
     const key = this.roomKey(topic);
     const cached = this.rooms.get(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      // Keep a write path's rejection out of this read, so that a `fetchRecent` racing the
+      // `ensureRoom` that shares this cell answers with the empty page the contract promises
+      // rather than that write's refused `POST /createRoom`. A failure this read would have
+      // reached on its own is re-reached below and surfaces as this call's own.
+      const provisioned = await cached.then(
+        (roomId) => roomId,
+        () => undefined,
+      );
+      if (provisioned !== undefined) return provisioned;
+    }
     if (this.isStale(generation)) return undefined;
     const alias = aliasOf(this.roomLocalpart(topic), this.serverName);
     const roomId = await this.lookupAlias(alias);

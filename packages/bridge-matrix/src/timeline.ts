@@ -234,10 +234,10 @@ export abstract class MatrixTimeline extends MatrixSession {
     prevBatch: string,
     stopAfter: string | undefined,
     skip: Set<unknown>,
+    generation: number,
   ): Promise<MessageEvent[]> {
     const recovered: MessageEvent[] = [];
     let from = prevBatch;
-    const generation = this.generation;
     for (let page = 0; page < MAX_BACKFILL_PAGES && !this.isStale(generation); page++) {
       const res = await this.http(
         'GET',

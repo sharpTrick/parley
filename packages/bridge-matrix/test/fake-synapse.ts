@@ -228,6 +228,14 @@ export class FakeSynapse {
    * stall one specific read (the `limited`-burst backfill) without touching the others.
    */
   holdMessages: (url: URL, body: { chunk: Ev[] }) => number = () => 0;
+  /**
+   * Called with each INCREMENTAL `/sync` request BEFORE its body is computed; the returned ms hold
+   * the response in flight. The sibling of {@link holdMessages} and {@link stallPositioning} for the
+   * await a subscribe loop spends most of its life in. Keep it ahead of the body, so that a case can
+   * land the batch that very sync will carry from inside the hook instead of racing the loop's
+   * cadence — a seed written between polls is served by whichever sync happens to be on the wire.
+   */
+  holdSync: (url: URL) => number = () => 0;
 
   /** Rooms that exist, in creation order. */
   get rooms(): FakeRoom[] {
@@ -570,6 +578,8 @@ export class FakeSynapse {
         return res;
       }
       this.syncAttempts.push(Date.now());
+      const syncHold = this.holdSync(url);
+      if (syncHold > 0) await new Promise((r) => setTimeout(r, syncHold));
       if (this.syncFailures > 0) {
         this.syncFailures--;
         if (this.syncFailureMode === 'network') throw new Error('fake network reset');

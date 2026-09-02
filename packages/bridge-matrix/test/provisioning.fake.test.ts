@@ -660,3 +660,84 @@ describe('every seam call issues exactly the state changes it is declared to', (
     expect(roomMutationsOnTheWire(fake.requestUrls)).toEqual([]);
   }, 20_000);
 });
+
+/**
+ * CLASS: a documented read-only path that can fail with a write path's error because the two share
+ * a memoization cell. `existingRoom` exists so that a read never provisions, and `rooms` is keyed by
+ * topic and populated by `ensureRoom` with the IN-FLIGHT `resolveOrCreateRoom` promise — so a
+ * `fetchRecent` that arrives while a first `post` is still creating the room adopts that promise and
+ * inherits its rejection. Synapse rate-limits room creation to a ~2-room burst then ~1 per 45s, so a
+ * refused create is the ordinary case, and `buildBridge` awaits `catchUpAll`: the read that should
+ * have answered the empty page instead fails startup with `POST /createRoom → 429`.
+ *
+ * Graded as "a read's answer does not depend on whether a write is provisioning at the same time"
+ * rather than by naming the errors a read may not produce, so the invariant is stated once and both
+ * arms stay falsifiable: a fix that swallowed EVERY cached rejection would answer an empty page for
+ * the rows where the room exists and this account may not have it, and the solo run — which reaches
+ * that refusal on its own — is what catches that.
+ */
+
+const SHARED_CELL = asTopic('ctx-shared-cell');
+
+const WRITE_PATHS: Record<string, (p: MatrixPlugin) => Promise<unknown>> = {
+  'a first post': (p) => p.post(SHARED_CELL, WRITER, 'hello'),
+  'a first subscribe': (p) => p.subscribe(SHARED_CELL, () => undefined),
+};
+
+/** How the write path's room resolution fails, and whether a read could ever reach that failure. */
+const PROVISIONING_FAILURES: Record<string, (f: FakeSynapse) => void> = {
+  'createRoom is rate limited (429)': (f) => {
+    f.aliasExists = false;
+    f.createRoomLimited = 50;
+  },
+  'createRoom is refused and the alias still does not resolve': (f) => {
+    f.createRoomConflictStatus = 400;
+    winnerAlreadyCreated(f, fakeAliasForTopic(String(SHARED_CELL)), false);
+  },
+  'the room exists and the join is refused': (f) => {
+    f.aliasExists = true;
+    f.joinStatus = 403;
+  },
+  'the room exists and a stranger created it': (f) => {
+    f.aliasExists = true;
+    f.existingRoomCreator = STRANGER;
+  },
+};
+
+/** The read's answer, with the fake's per-run room ids folded out so two runs are comparable. */
+const answerOf = (read: Promise<unknown>): Promise<string> =>
+  read.then(
+    (r) => {
+      const page = r as { messages: unknown[]; nextCursor: unknown };
+      return `page ${page.messages.length} @ ${String(page.nextCursor)}`;
+    },
+    (err: unknown) => `refused: ${String(err).replace(/!room\d+:fake/g, '!room:fake')}`,
+  );
+
+describe('a read answers the same whether or not a write is provisioning beside it', () => {
+  for (const [failureName, failure] of Object.entries(PROVISIONING_FAILURES)) {
+    for (const [writeName, write] of Object.entries(WRITE_PATHS)) {
+      it(`${failureName} / racing ${writeName}`, async () => {
+        vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        failure(fake);
+        const alone = await connectFake({});
+        const solo = await answerOf(alone.fetchRecent({ topic: SHARED_CELL, limit: 5 }));
+        await alone.disconnect();
+
+        fake = new FakeSynapse();
+        vi.stubGlobal('fetch', fake.fetch);
+        failure(fake);
+        const p = await connectFake({});
+        // The write claims the shared cell synchronously, so the read below always finds it there.
+        const writing = write(p).then(() => 'resolved', (err: Error) => `refused: ${err.message}`);
+        const raced = await answerOf(p.fetchRecent({ topic: SHARED_CELL, limit: 5 }));
+
+        expect(await writing, 'this row armed no provisioning failure').toMatch(/^refused/);
+        expect(raced).not.toMatch(/createRoom/);
+        expect(raced).toEqual(solo);
+        await p.disconnect();
+      }, 30_000);
+    }
+  }
+});

@@ -241,11 +241,15 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
                 timeline.prev_batch,
                 boundary === ROOM_START ? undefined : boundary,
                 new Set(events.map((e) => e.event_id)),
+                generation,
               );
             } catch {
               /* backfill is best-effort; anything missed stays reachable via fetchRecent catch-up */
             }
           }
+          // Keep this gate between the backfill and the delivery below, so that a teardown landing
+          // inside that round-trip cannot hand the handler a batch after `disconnect()` resolved.
+          if (this.isStale(generation)) break;
           for (const e of [...recovered, ...events.filter((e) => this.belongs(e, topic))]) {
             boundary = e.event_id;
             this.deliver(roomId, topic, e, handler);

@@ -689,3 +689,185 @@ describe('no seam call reaches the homeserver without the credential of its own 
     }
   }
 });
+
+/**
+ * CLASS: a delivery path that awaits anything between its staleness gate and the call into the
+ * caller's handler. The subscribe loop gates on `isStale` once per iteration and then keeps
+ * awaiting — a `/messages` recovery of a `limited` burst is a whole HTTP exchange, and up to
+ * `MAX_BACKFILL_PAGES` of them — so a gate read before that await has been stale for the entire
+ * round-trip by the time the batch is in hand, and the handler fires after `disconnect()` has
+ * already resolved. Inbound Matrix events become agent context, so a batch delivered past the
+ * teardown is context injected into a session the operator believes is detached.
+ *
+ * Driven over EVERY await the loop makes with a batch pending delivery rather than the one that was
+ * found leaking, because each is a separate place a gate can be missing from, and over BOTH
+ * lifecycle calls that end a generation: `disconnect()` trips the `stopped` arm of `isStale`, a bare
+ * `connect()` only the generation arm, and a guard can hold one while missing the other. Each row
+ * declares what an UNTORN run delivers and the control below grades that, so a row whose park
+ * delivers nothing fails instead of satisfying "nothing arrived after the teardown" vacuously.
+ */
+
+const BATCH = ['a', 'b', 'c'];
+const seedBatch = (): void => {
+  for (const c of BATCH) fake.addMessage(String(TOPIC), c);
+};
+
+interface DeliveryAwait {
+  /** Install the hooks before `subscribe()` rather than after it — the positioning row's window. */
+  armsBeforeSubscribe?: boolean;
+  /** Leave the loop inside the named await with {@link BATCH} pending; `fire` ends the generation. */
+  park: (p: MatrixPlugin, fire: () => void) => Promise<void>;
+  /** Let the park proceed once the lifecycle call (or, in the control, nothing) has landed. */
+  release?: () => void;
+}
+
+const HELD_MS = 500;
+
+const DELIVERY_AWAITS: Record<string, DeliveryAwait> = {
+  'the positioning /sync': {
+    armsBeforeSubscribe: true,
+    park: async (_p, fire) => {
+      fake.stallPositioning = (ordinal) => ordinal === 1;
+      fake.stallPositioningMs = HELD_MS;
+      fake.duringPositioningStall = () => fire();
+      // Strictly newer than the position this sync is about to report, so an untorn loop owes it.
+      fake.afterPositioningSync = () => seedBatch();
+      await vi.waitFor(() => expect(fake.stalledPositioning).toEqual([1]), {
+        timeout: 6000,
+        interval: 5,
+      });
+    },
+  },
+  'the incremental /sync carrying the batch': {
+    park: async (_p, fire) => {
+      let held = 0;
+      fake.holdSync = () => {
+        if (held > 0) return 0;
+        held++;
+        seedBatch();
+        fire();
+        return HELD_MS;
+      };
+      await vi.waitFor(() => expect(held).toBe(1), { timeout: 6000, interval: 5 });
+    },
+  },
+  // The same await, but on a sync the loop must FOLLOW with a `/messages` recovery — a separate
+  // state, because the gate that stops the delivery and the gate that stops that recovery from
+  // being issued at all are different lines.
+  'the incremental /sync carrying a `limited` burst': {
+    park: async (_p, fire) => {
+      fake.syncCap = 1;
+      let held = 0;
+      fake.holdSync = () => {
+        if (held > 0) return 0;
+        held++;
+        seedBatch();
+        fire();
+        return HELD_MS;
+      };
+      await vi.waitFor(() => expect(held).toBe(1), { timeout: 6000, interval: 5 });
+    },
+  },
+  'the `limited`-burst backfill page': {
+    park: async (_p, fire) => {
+      fake.syncCap = 1; // 3 new events > the cap → `limited` + prev_batch → backfill
+      let pages = 0;
+      fake.holdMessages = (url) => {
+        if (url.searchParams.get('dir') !== 'b' || !url.searchParams.has('from')) return 0;
+        pages++;
+        if (pages > 1) return 0;
+        fire();
+        return HELD_MS;
+      };
+      seedBatch();
+      await vi.waitFor(() => expect(pages).toBeGreaterThan(0), { timeout: 6000, interval: 5 });
+    },
+  },
+  'the retry backoff after a failed /sync': {
+    park: async (_p, fire) => {
+      fake.syncFailures = Number.POSITIVE_INFINITY;
+      const failedBy = fake.syncAttempts.length + 3;
+      await vi.waitFor(() => expect(fake.syncAttempts.length).toBeGreaterThanOrEqual(failedBy), {
+        timeout: 8000,
+        interval: 5,
+      });
+      seedBatch();
+      fire();
+    },
+    release: () => {
+      fake.syncFailures = 0;
+    },
+  },
+};
+
+/** The lifecycle calls that end a generation, and therefore owe the same stand-down. */
+const ENDS_THE_GENERATION: Record<string, (p: MatrixPlugin) => Promise<void>> = {
+  'disconnect()': async (p) => {
+    await p.disconnect();
+  },
+  'connect() (a bare reconnect)': async (p) => {
+    await p.connect(fakeConfig());
+  },
+};
+
+const subscribedWithBatchPending = async (
+  p: MatrixPlugin,
+  row: DeliveryAwait,
+  fire: () => void,
+): Promise<{ content: string; at: number }[]> => {
+  const got: { content: string; at: number }[] = [];
+  const record = (m: { content: string }): void => void got.push({ content: m.content, at: Date.now() });
+  if (row.armsBeforeSubscribe === true) {
+    const subscribing = p.subscribe(TOPIC, record);
+    await row.park(p, fire);
+    await subscribing.catch((err: unknown) => expect(String(err)).toMatch(/\[parley-matrix\]/));
+  } else {
+    await p.subscribe(TOPIC, record);
+    await row.park(p, fire);
+  }
+  return got;
+};
+
+describe('nothing is delivered across an await the generation ended inside', () => {
+  for (const [awaitName, row] of Object.entries(DELIVERY_AWAITS)) {
+    it(`${awaitName}: an untorn loop delivers the whole batch`, async () => {
+      const p = await connectFake({});
+      const got = await subscribedWithBatchPending(p, row, () => undefined);
+      row.release?.();
+
+      await vi.waitFor(() => expect(got.map((e) => e.content)).toEqual(BATCH), {
+        timeout: 8000,
+        interval: 10,
+      });
+      await p.disconnect();
+    }, 30_000);
+
+    for (const [endName, end] of Object.entries(ENDS_THE_GENERATION)) {
+      it(`${awaitName} / ${endName}: no handler call and no read past it`, async () => {
+        const p = await connectFake({});
+        let ending: Promise<void> | undefined;
+        const got = await subscribedWithBatchPending(p, row, () => {
+          ending ??= end(p);
+        });
+
+        expect(ending, 'this row never entered the await it names').toBeDefined();
+        await ending;
+        const tornAt = Date.now();
+        const issuedAt = fake.requestUrls.length;
+        row.release?.();
+
+        await settle(HELD_MS + 800);
+
+        expect(got.filter((e) => e.at >= tornAt).map((e) => e.content)).toEqual([]);
+        expect(
+          fake.requestUrls
+            .slice(issuedAt)
+            .map((u) => u.pathname)
+            .filter((path) => POST_TEARDOWN_FORBIDDEN.test(path)),
+        ).toEqual([]);
+        expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
+        await p.disconnect();
+      }, 30_000);
+    }
+  }
+});
