@@ -174,7 +174,8 @@ writable by every local user and container on that host. See
 ## Run it (CLI)
 
 ```bash
-npm install && npm run build
+npm install
+npm run build
 parley-redis --config parley.config.yaml
 # or: node packages/bridge-redis/dist/cli.js --config parley.config.yaml
 # or: PARLEY_CONFIG=parley.config.yaml parley-redis
@@ -190,13 +191,13 @@ diagnostic goes to stderr.
 
 ## Conformance
 
-From this package's directory (`npm test` here runs only the `bridge-redis` suite; from the repo
-root the same command runs every package's):
+From the repo root — the suite runs against the whole workspace, so name this package to run only
+its own:
 
 ```bash
 docker run -d --name parley-redis -p 127.0.0.1:6379:6379 redis:7-alpine \
   redis-server --requirepass "$REDIS_PASSWORD"
-PARLEY_REDIS_URL="redis://:$REDIS_PASSWORD@127.0.0.1:6379" npm test
+PARLEY_REDIS_URL="redis://:$REDIS_PASSWORD@127.0.0.1:6379" npx vitest run packages/bridge-redis
 ```
 
 `PARLEY_REDIS_URL` overrides the URL; the suite skips itself if no server is reachable.

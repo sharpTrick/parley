@@ -27,7 +27,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "bin": {
     "parley-sqlite": "./dist/cli.js"
@@ -37,7 +38,7 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b tsconfig.test.json",
+    "typecheck:test": "tsc -b tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },

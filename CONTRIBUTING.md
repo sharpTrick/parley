@@ -100,15 +100,15 @@ convenient locally and **is not what CI accepts**: the skip gate below fails a b
   ```bash
   npm run build
   npm run typecheck:test --workspaces --if-present
-  npm run typecheck --workspaces --if-present
   ./examples/dev-compose/dev-infra.sh up all
   npm test -- --reporter=json --outputFile=/tmp/vitest.json
   node scripts/assert-no-skipped-tests.mjs /tmp/vitest.json
   ```
 
-  The two typecheck steps exist because each package's `tsconfig.json` covers `src/**` only and
-  vitest transpiles tests without typechecking them — without them no fixture in the repo is ever
-  seen by a compiler. The last line is the **skip gate**: a `describe` group in which nothing ran
+  The typecheck step exists because each package's `tsconfig.json` covers `src/**` only and
+  vitest transpiles tests without typechecking them — without it no fixture in the repo is ever
+  seen by a compiler. Every workspace declares it under that one name, so `--if-present` cannot
+  skip one silently. The last line is the **skip gate**: a `describe` group in which nothing ran
   fails the build, so a suite whose server was down reads as missing coverage rather than as a pass.
 - **Added a package, or changed packaging?** Run `npm run preflight:publish` (CI runs the same check
   on every PR). It flags any public package that isn't on npm yet — the automated release can't

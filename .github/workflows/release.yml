@@ -44,7 +44,6 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run typecheck:test --workspaces --if-present
-      - run: npm run typecheck --workspaces --if-present
 
       # Same one-command bring-up as ci.yml and as a maintainer's laptop — the recipes live in
       # examples/dev-compose/, never duplicated into workflow YAML. A release must not publish on
