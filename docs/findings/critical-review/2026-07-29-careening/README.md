@@ -378,8 +378,6 @@ Total iatrogenesis mixes suggestions with the findings that gate the stop rule. 
 oracle to CONFIRMED-and-blocking asks the sharper question — *is the loop still finding things that
 matter in the original codebase, or only in its own output?*
 
-| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | 10 | 4 | 1 | 8 | **6** |
@@ -453,7 +451,8 @@ The fan-out (14 targets) was likewise left alone.
 Round 20 ran all fifteen critics against `c34eab5` and returned **101 findings, 99 confirmed, 26
 blocking, 0 errored**. It did not converge, and no round in the budget did.
 
-The headline is not that number — it is the shape of nineteen scored rounds taken together.
+The headline is not that number — it is the shape of seventeen scored rounds taken together.
+Rounds 11, 12 and 14 ran no critics, so twenty rounds of budget bought seventeen rounds of review.
 Pre-existing blocking findings, rounds 2–20:
 
 **36, 25, 20, 11, 5, 10, 9, 11, 8, 6, 6, 10, 4, 1, 8, 6**
