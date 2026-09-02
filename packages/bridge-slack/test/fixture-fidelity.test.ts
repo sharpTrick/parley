@@ -215,6 +215,57 @@ const postRaw = async (
   return (await res.json()) as { ok: boolean; ts?: string };
 };
 
+/** `conversations.history` over raw HTTP, so a row states the vendor rule rather than the plugin. */
+const historyRaw = async (
+  fake: FakeSlack,
+  fields: Record<string, string>,
+): Promise<string[]> => {
+  const res = await fetch(`${fake.apiUrl}/conversations.history`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: 'Bearer xoxb-test',
+    },
+    body: new URLSearchParams({ channel: 'C0WINDOW', ...fields }).toString(),
+  });
+  const { messages } = (await res.json()) as { messages: Array<{ ts: string }> };
+  return messages.map((m) => m.ts);
+};
+
+/**
+ * The same half again for the READ side, and the sharpest form of it: a field the fake records and
+ * BRANCHES on, in a wire type it can never receive. `inclusive` arrives as the string `'true'` and
+ * was tested against the boolean `true`, so the branch was dead and the exclusive-`oldest` window —
+ * the cursor contract this whole backend rests on — was graded by the default path alone. Every row
+ * below states a verdict on BOTH sides: a branch asserted only where it must not fire passes just
+ * as well when it can never fire.
+ */
+describe('the fake acts on the conversations.history window fields it records', () => {
+  const WINDOWS: Array<{ name: string; fields: Record<string, string>; atOldest: boolean }> = [
+    { name: 'inclusive omitted', fields: {}, atOldest: false },
+    { name: "inclusive form-encoded 'false'", fields: { inclusive: 'false' }, atOldest: false },
+    { name: "inclusive form-encoded 'true'", fields: { inclusive: 'true' }, atOldest: true },
+  ];
+
+  for (const { name, fields, atOldest } of WINDOWS) {
+    it(`${name}: the entry AT \`oldest\` is returned: ${atOldest}`, async () => {
+      const fake = await FakeSlack.start();
+      try {
+        fake.createChannel('C0WINDOW');
+        const seeded = fake.seed(asTopic('C0WINDOW'), [{ text: 'first' }, { text: 'second' }]);
+        const boundary = seeded[0]!.ts;
+
+        const served = await historyRaw(fake, { oldest: boundary, ...fields });
+
+        expect(served.includes(boundary), 'the boundary entry').toBe(atOldest);
+        expect(served.includes(seeded[1]!.ts), 'the entry above the boundary').toBe(true);
+      } finally {
+        await fake.close();
+      }
+    });
+  }
+});
+
 describe('the fake acts on the chat.postMessage fields it records', () => {
   it.each([
     ['a channel-level post', {}, true],

@@ -112,6 +112,23 @@ const decodeFormValue = (raw: string): unknown => {
   return raw;
 };
 
+/**
+ * One form field read as a boolean. Every Web API argument arrives form-encoded, so a flag the
+ * plugin sets is the STRING `'true'` on the wire and never the JS `true`. Keep EVERY boolean field
+ * reading through this, so that a branch written against the decoded value cannot sit unreachable —
+ * a fake that can never take its own `inclusive` branch grades the exclusive-cursor contract from
+ * its default path alone, and a plugin that flipped that contract would pass.
+ */
+const boolOf = (raw: unknown): boolean => raw === true || raw === 'true';
+
+/**
+ * How this server treats the `oldest` window, so a case can grade the plugin against a reading of
+ * `conversations.history` that slack.com — hosted, unprobeable — may hold instead of the documented
+ * one: `as-asked` honours `oldest` with `inclusive` as the request set it, `inclusive` counts the
+ * boundary entry as inside whatever the request said, and `ignored` does not filter at all.
+ */
+export type OldestWindow = 'as-asked' | 'inclusive' | 'ignored';
+
 export class FakeSlack {
   /** Web API base, e.g. `http://127.0.0.1:PORT/api` — pass as the plugin's `api_url`. */
   readonly apiUrl: string;
@@ -163,6 +180,7 @@ export class FakeSlack {
   readonly unauthenticated = new Map<string, number>();
   private greet: GreetMode = 'greet';
   private historyOrder: HistoryOrder = 'newest-first';
+  private oldestWindow: OldestWindow = 'as-asked';
   /** The URL `apps.connections.open` hands out — see {@link setWsUrl}. */
   private handedOutWsUrl?: string;
   /** Global monotonic counter — the ts suffix. Node is single-threaded, so ts minting is atomic. */
@@ -252,6 +270,11 @@ export class FakeSlack {
   /** How `conversations.history` orders what it serves — see {@link HistoryOrder}. */
   setHistoryOrder(order: HistoryOrder): void {
     this.historyOrder = order;
+  }
+
+  /** Which reading of the `oldest` window this server holds — see {@link OldestWindow}. */
+  setOldestWindow(window: OldestWindow): void {
+    this.oldestWindow = window;
   }
 
   /**
@@ -543,7 +566,7 @@ export class FakeSlack {
     // have, and `seed()` was then the only writer that could produce a threaded row.
     if (typeof body.thread_ts === 'string') {
       msg.thread_ts = body.thread_ts;
-      if (body.reply_broadcast === 'true' || body.reply_broadcast === true) {
+      if (boolOf(body.reply_broadcast)) {
         msg.subtype = 'thread_broadcast';
       }
     }
@@ -584,14 +607,15 @@ export class FakeSlack {
       (m) => m === null || typeof m !== 'object' || isChannelLevel(m),
     );
     const oldest = body.oldest;
-    if (typeof oldest === 'string') {
-      // `oldest` is EXCLUSIVE unless the caller sets `inclusive` (the plugin never does). An entry
-      // with no orderable `ts` is never filtered out — those exist to reach the plugin, and a fake
-      // that quietly swallowed them would grade the plugin on input it never receives.
+    if (typeof oldest === 'string' && this.oldestWindow !== 'ignored') {
+      // `oldest` is EXCLUSIVE unless the caller sets `inclusive`, read here off the WIRE value. An
+      // entry with no orderable `ts` is never filtered out — those exist to reach the plugin, and a
+      // fake that quietly swallowed them would grade the plugin on input it never receives.
+      const inclusive = this.oldestWindow === 'inclusive' || boolOf(body.inclusive);
       msgs = msgs.filter(
         (m) =>
           !isOrderable(m) ||
-          (body.inclusive === true ? compareTs(m.ts, oldest) >= 0 : compareTs(m.ts, oldest) > 0),
+          (inclusive ? compareTs(m.ts, oldest) >= 0 : compareTs(m.ts, oldest) > 0),
       );
     }
     msgs.sort((a, b) => compareTs(orderOf(b), orderOf(a))); // NEWEST first, like Slack

@@ -47,6 +47,16 @@ export class SlackHistory {
     const limit = Number.isNaN(asked) ? 1 : Math.max(1, asked);
     const resumeAfterSince = args.since !== undefined;
 
+    // `since` is the seam's EXCLUSIVE floor, and `conversations.history {oldest}` is the only thing
+    // holding it: hosted SaaS, unprobeable, and the one contract in this walk taken on trust while
+    // every sibling is checked. Re-cut the window HERE with the plugin's own comparator, so that a
+    // server counting the boundary entry as inside it, or ignoring the parameter outright, cannot
+    // reach the trim and the slice below — both DISCARD on POSITION, so the page would come back as
+    // the OLDEST entries in the channel and `nextCursor` would come to rest at or below the cursor
+    // the caller handed in, which no later catch-up can move.
+    const aboveSince = (m: SlackMessage): boolean =>
+      args.since === undefined || compareTs(m.ts, args.since) > 0;
+
     // Keep every window decision below counting SURFACED messages, never raw entries, so that a
     // system-subtype-heavy stretch cannot end the walk early or survive the trim as a tail that
     // filters to nothing — an empty page whose `nextCursor` is `since` livelocks the caller.
@@ -66,7 +76,7 @@ export class SlackHistory {
       if (!Array.isArray(resp.messages)) {
         throw new SlackShapeError('conversations.history', 'returned no usable messages array');
       }
-      const page = (resp.messages as unknown[]).filter(hasUsableTs);
+      const page = (resp.messages as unknown[]).filter(hasUsableTs).filter(aboveSince);
       for (const m of page) {
         // Keep this a THROW rather than a re-sort, so that a walk which cannot trust position as age
         // refuses instead of answering: the early break and the O(limit) trim below both DISCARD on

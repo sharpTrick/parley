@@ -15,6 +15,7 @@
 import { asCursor, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { compareTs, SlackPlugin } from '../src/index.js';
+import type { OldestWindow } from './fake-slack.js';
 import { capture, rungStarts, settleWithin, startSlack } from './harness.js';
 
 interface Run {
@@ -138,6 +139,63 @@ describe('slack catch-up publishes the position an exhaustive walk reached', () 
         await cleanup();
       }
     });
+  }
+});
+
+/**
+ * CLASS: a vendor promise the plugin resolves entirely server-side and never checks. `since` is the
+ * seam's EXCLUSIVE floor, and the only thing enforcing it was `conversations.history {oldest}` —
+ * the one contract in the walk that is not verified, while its siblings (newest-first order, a
+ * repeated page cursor, the page ceiling, a usable `ts`) all throw. Slack is hosted SaaS and cannot
+ * be probed, so which reading it holds is not knowable from here; what IS knowable is that the
+ * plugin must answer the same seam contract under every reading. Each row below runs the drain core
+ * runs against a server that honours `oldest` as documented, one that counts the boundary entry as
+ * inside it, and one that ignores it outright — a page below the caller's cursor reaches a trim and
+ * a slice that both DISCARD on position, so the page comes back as the OLDEST entries in the
+ * channel and `nextCursor` comes to rest at or below the cursor it was handed: the catch-up then
+ * returns that same page forever and the newer history is never delivered.
+ */
+const WINDOW_READINGS: OldestWindow[] = ['as-asked', 'inclusive', 'ignored'];
+const WINDOW_LIMITS = [1, 4];
+
+describe('slack catch-up holds the exclusive window whatever the server does with `oldest`', () => {
+  for (const reading of WINDOW_READINGS) {
+    for (const limit of WINDOW_LIMITS) {
+      it(`drains past a server whose \`oldest\` is ${reading} (limit=${limit})`, async () => {
+        const { fake, plugin, cleanup } = await startSlack({
+          appToken: null,
+          arm: (f) => f.setOldestWindow(reading),
+        });
+        try {
+          const topic = asTopic('C0WINDOWREAD');
+          const seeded = fake.seed(
+            topic,
+            Array.from({ length: 12 }, (_, i) => ({ text: `m${i}` })),
+          );
+          // A floor INSIDE the channel, so a reading that widens the window has older history to
+          // hand back and a boundary entry to repeat.
+          const floor = seeded[3]!.ts;
+          const above = seeded.slice(4);
+
+          const { contents, cursors } = await drain(plugin, topic, asCursor(floor), limit);
+
+          expect(contents, 'the drain surfaced exactly the history above the floor').toEqual(
+            above.map((m) => m.text),
+          );
+          for (const cursor of cursors) {
+            expect(
+              compareTs(cursor, floor),
+              `published cursor ${cursor} is at or below the floor it was handed`,
+            ).toBeGreaterThan(0);
+          }
+          expect(cursors, 'the cursor never steps backwards').toEqual(
+            [...cursors].sort((a, b) => compareTs(a, b)),
+          );
+        } finally {
+          await cleanup();
+        }
+      });
+    }
   }
 });
 
