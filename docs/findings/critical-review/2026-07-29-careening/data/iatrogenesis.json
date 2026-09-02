@@ -154,6 +154,17 @@
    "unresolvable": 6,
    "selfInducedPct": 89,
    "note": "First round after a remediation that was fixes rather than decomposition, so blame inflation is far smaller than rounds 13/15/17 carried."
+  },
+  {
+   "round": 19,
+   "base": "27ab24e",
+   "findings": 89,
+   "graded": 89,
+   "selfInduced": 75,
+   "preExisting": 14,
+   "unresolvable": 0,
+   "selfInducedPct": 84,
+   "note": "The decisive point for the pre-registered exhaustion threshold."
   }
  ],
  "comparison": {
@@ -264,10 +275,19 @@
     "selfInduced": 28,
     "preExisting": 1,
     "selfInducedPct": 97
+   },
+   {
+    "round": 19,
+    "blocking": 32,
+    "selfInduced": 24,
+    "preExisting": 8,
+    "selfInducedPct": 75
    }
   ],
-  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, 10, 4 and 1. Round 18 is the lowest of the run by a wide margin: ONE pre-existing blocking finding out of 29, i.e. 97% of what the loop now finds is its own output. The pre-registered threshold is three or more consecutive scored rounds below 8 against a tree nobody is restructuring. Rounds 17 (4) and 18 (1) are the first two, and round 18's tree had absorbed fixes rather than a decomposition, so its blame inflation is much smaller than the rounds that preceded it. Round 19 is the third and decisive point. Stated before it runs: if round 19 comes in below 8 the threshold is met and the loop has demonstrably exhausted the pre-existing blocking population on this surface; if it returns to the 8-11 band the earlier dips were remediation artefacts and the run has NO exhaustion result.",
-  "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects."
+  "reading": "RESULT: the exhaustion threshold is NOT met, and the earlier dip is refuted. Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, 10, 4, 1 and 8. The pre-registered rule was three or more consecutive scored rounds below 8 against a tree nobody is restructuring. Rounds 17 and 18 gave 4 and 1; round 19 gives 8, which is not below 8 and sits squarely back in the 8-11 band that rounds 7-10 and 16 occupied. Two consecutive, then a return to the band. No exhaustion result.",
+  "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects.",
+  "whyTheRefutationIsStrongerThanItLooks": "Blame inflation biases this number DOWNWARD, not upward. When remediation rewrites or moves a line, git blame attributes it to the experiment, so a finding on that line counts as self-induced and the pre-existing count falls. Round 18's remediation was the largest of the run -- 31 blocking findings across eleven packages plus the repo-wide layer -- so round 19 read a tree carrying maximum inflation against it. It still surfaced 8. The true pre-existing rate is therefore AT LEAST 8 and plausibly higher.",
+  "whatThisSaysAboutTheDips": "Rounds 13, 15, 17 and 18 all dipped below the band, and every one of them followed a remediation that moved a large amount of code: 13 and 15 followed the decomposition rounds, 17 followed round 16's 39 fixes, 18 followed round 17's 30. The dip tracks how much the PREVIOUS round rewrote, not how much of the original codebase is left. That is an artefact of the measurement, and it is the single most important caveat this run produces for anyone using git blame as an iatrogenesis oracle."
  },
  "inertRemediations": {
   "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
