@@ -96,6 +96,13 @@ export interface FakeState {
   /** What `streams.find` names for the topic's subject; absent = no stream matches it. */
   rivalStream?: string;
   /**
+   * Parks the next `streams.info` until this settles, and fails it if this rejects — the in-flight
+   * round trip `disconnect()` lands INSIDE, closing the socket under a request already on the wire.
+   * Without it a test can only cut a read BETWEEN calls, and the interleaving where teardown breaks
+   * the request itself is unreachable: a guard that only re-checks before the next call passes.
+   */
+  holdInfo?: Promise<void>;
+  /**
    * Subjects `streams.info` reports for the stream. Defaults to `[subject]` — a real stream always
    * carries a subject list, and a fake that reports none certifies a read path that never checks
    * whether the stream it found is even the topic's. Set it to model a stream another config's
@@ -268,6 +275,11 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       },
       info: async () => {
         await hop();
+        if (state.holdInfo !== undefined) {
+          const held = state.holdInfo;
+          state.holdInfo = undefined;
+          await held;
+        }
         state.infoAttempts += 1;
         injected('streams.info');
         if (state.failOn === 'info') throw new Error('injected: streams.info failed');

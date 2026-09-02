@@ -80,16 +80,101 @@ describe('nats reads — a backend fault is a fault on every read shape', () => 
     },
   ];
 
-  for (const termination of swallowed) {
-    it(`a long-poll returns an empty page when ${termination.name}`, async () => {
-      const fake = fakeJetStream({ records: [], expiryMs: 10_000, throwOnClose: true });
+  // The read has TWO branches — the stream is there, or the long poll waits for the `post` that
+  // will make it — and each reaches the server through a different call. A swallow written for one
+  // is not a swallow for the other: the absent branch polls `streams.info`, which is exactly the
+  // handle `disconnect()` clears, so the same teardown that the present branch answers with an
+  // empty page came back out of it as `NatsPlugin not connected`. Cross the two axes, so that a
+  // termination this plugin caused itself is graded on every branch rather than on the one that
+  // happened to be tabled.
+  const streamStates: {
+    name: string;
+    init: Record<string, unknown>;
+    arm?: (fake: ReturnType<typeof fakeJetStream>) => void;
+  }[] = [
+    { name: 'the stream already exists', init: {} },
+    { name: 'the topic has no stream yet', init: { streamAbsent: true } },
+    {
+      name: 'the stream appears mid-wait',
+      init: { streamAbsent: true },
+      arm: (fake) => {
+        setTimeout(() => {
+          fake.state.streamAbsent = false;
+        }, 100).unref?.();
+      },
+    },
+  ];
+
+  /**
+   * The narrow half of the same guard, and the two shapes that keep it from becoming "answer every
+   * failure as a quiet topic": a read whose plugin was ALREADY stopped when it was issued must still
+   * be refused, and a read with no `block_ms` has no wait to swallow, so its failure is a fault on
+   * both branches rather than an empty page on one. Teardown is landed INSIDE the in-flight
+   * `streams.info` here — between calls it would be caught by a re-check alone.
+   */
+  const cutMidRequest = async (
+    args: { topic: Topic; since: Cursor; blockMs?: number },
+  ): Promise<string> => {
+    let cut!: (err: Error) => void;
+    const held = new Promise<void>((_resolve, reject) => {
+      cut = reject;
+    });
+    const fake = fakeJetStream({ records: [], streamAbsent: true, holdInfo: held });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake, TOPIC);
+    const pending = plugin.fetchRecent(args);
+    await new Promise((r) => setTimeout(r, 50));
+    await plugin.disconnect();
+    cut(new Error('connection closed while the request was on the wire'));
+    return pending.then(
+      (page) => JSON.stringify(page),
+      (err: Error) => `rejected: ${err.message}`,
+    );
+  };
+
+  it('a long-poll cut inside its in-flight stream lookup answers the empty page', async () => {
+    expect(await cutMidRequest({ topic: TOPIC, since: asCursor('0'), blockMs: 30_000 })).toBe(
+      JSON.stringify({ messages: [], nextCursor: '0' }),
+    );
+  }, 20_000);
+
+  it('a read with no block_ms reports the same cut as the fault it is', async () => {
+    expect(await cutMidRequest({ topic: TOPIC, since: asCursor('0') })).toMatch(/^rejected: /);
+  }, 20_000);
+
+  it.each([
+    ['a long-poll', { topic: TOPIC, since: asCursor('0'), blockMs: 30_000 }],
+    ['a plain read', { topic: TOPIC, since: asCursor('0') }],
+  ] as [string, { topic: Topic; since: Cursor; blockMs?: number }][])(
+    '%s issued after disconnect() is refused, never answered as a quiet topic',
+    async (_name, args) => {
+      const fake = fakeJetStream({ records: [], streamAbsent: true });
       const plugin = new NatsPlugin();
       injectFake(plugin, fake, TOPIC);
+      await plugin.disconnect();
+      await expect(plugin.fetchRecent(args)).rejects.toThrow(/not connected/);
+    },
+    20_000,
+  );
 
-      const page = await termination.run(plugin);
-      expect(page).toEqual({ messages: [], nextCursor: '0' });
-      expect(fake.state.deleted).toEqual(fake.state.created);
-    }, 20_000);
+  for (const termination of swallowed) {
+    for (const state of streamStates) {
+      it(`a long-poll returns an empty page when ${termination.name} and ${state.name}`, async () => {
+        const fake = fakeJetStream({
+          records: [],
+          expiryMs: 10_000,
+          throwOnClose: true,
+          ...state.init,
+        });
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake, TOPIC);
+        state.arm?.(fake);
+
+        const page = await termination.run(plugin);
+        expect(page).toEqual({ messages: [], nextCursor: '0' });
+        expect(fake.state.deleted).toEqual(fake.state.created);
+      }, 20_000);
+    }
   }
 });
 

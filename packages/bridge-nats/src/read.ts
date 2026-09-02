@@ -57,8 +57,20 @@ export abstract class NatsReads extends NatsPulls {
     deadline: number,
   ): Promise<StreamInfo | undefined> {
     const blocking = (args.blockMs ?? 0) > 0;
+    // Keep this read's own view of teardown: `disconnect()` sets `stopped` before it clears the
+    // handles every call in the loop needs, so a long poll parked here when teardown began must
+    // answer the empty page its stream-PRESENT sibling already answers instead of reporting the
+    // plugin's own shutdown as a backend fault. A read issued on an already-stopped plugin keeps
+    // failing fast, so a caller bug is never served as a quiet topic.
+    const startedBeforeTeardown = !this.stopped;
     for (;;) {
-      const info = await this.existingStream(args.topic);
+      let info: StreamInfo | undefined;
+      try {
+        info = await this.existingStream(args.topic);
+      } catch (err) {
+        if (!(blocking && startedBeforeTeardown && this.stopped)) throw err;
+        return undefined;
+      }
       if (info !== undefined) return info;
       const remaining = deadline - Date.now();
       if (!blocking || remaining <= 0 || this.stopped) return undefined;
