@@ -1,0 +1,53 @@
+{
+  "round": 18,
+  "phase": "remediation",
+  "base": "e54346b",
+  "blockingFindings": 31,
+  "closed": 31,
+  "status": "COMPLETE — every landed diff mutation-replayed",
+  "runShape": "First round run at full fan-out: one workflow invocation for all 15 review targets, then all 11 package-scoped remediation targets dispatched concurrently, with the repo target last and alone because its findings touch every package. Previous rounds used waves of 2-4, a habit carried over from the cloud container rather than a constraint of the work.",
+
+  "wrongPrescriptions": {
+    "note": "Round 18 produced fourteen more, none caught by any test suite. Running total across rounds 9-18 is 70. The modes have shifted decisively: most are no longer 'this fix is weak' but 'this fix is impossible, or would make things worse'.",
+    "cases": [
+      {"target": "repo", "mode": "the prescription asserts a fact about the code that is provably false", "detail": "It says the runner 'is a plain JS module the Workflow harness loads, so it can' import a shared paths module. The runner ends in a top-level return, which is illegal in an ES module — import() throws Illegal return statement — and it has no filesystem access. No shared module is possible in either direction."},
+      {"target": "nats", "mode": "the prescribed classifier would reject every genuine case", "detail": "A 404-only stream-absent test in the read path: measured against a live server, the PULL surface reports a removed stream as 503/no responders, identical to an outage. The prescription would have turned every real mid-read removal into a rejection and still could not tell the two apart."},
+      {"target": "discord", "mode": "the obvious predicate is measurably unsafe", "detail": "Finite-and-positive does not bound a Node timer: 3e9, 2**31, 0.5, 1.5, 0, -1, NaN and Infinity ALL fire at 1ms. Two of those pass the predicate and both mean a 1ms handshake, which is the defect."},
+      {"target": "telegram", "mode": "the fix moves the hazard rather than removing it", "detail": "Read-pid-then-unlink is a check, not atomic. Two starters reading the same corpse each unlink the other's fresh token, and the loser publishes a live pid holding nothing — the same permanent refusal, minted by the code meant to end it."},
+      {"target": "core-engine", "mode": "the prescription injects the wrong quantity", "detail": "Injecting the budget leaves the COST raced, and the cost is what evaporates: a tiny budget clips everyone, a large one depends on an unknown per-match cost. The meter had to be injected instead."},
+      {"target": "slack", "mode": "the prescribed guard cannot bound anything", "detail": "A page-cardinality ceiling in the pager: the transport already does res.text() then JSON.parse, so the whole body is materialised before that module sees an entry. It would refuse a page V8 survived while doing nothing about the page that exhausts the heap one layer up."},
+      {"target": "matrix", "mode": "the prescription omits where the fix goes, and the natural reading is half a fix", "detail": "Placed after the token advance, a membership-loss check reports once and then advances past it, returning to silent full-rate polling — measured at 26ms between retries where the ladder wants 406ms."},
+      {"target": "redis", "mode": "the prescribed sweep breaks the plugin's own output", "detail": "Sweeping the username unconditionally rewrites the plugin's own 'parley-redis:' prefix to '<redacted>-redis:' — measured as eleven red rows, seven of them pre-existing."},
+      {"target": "zulip", "mode": "the stricter alternative rejects legitimate input", "detail": "Comparing the raw value against a rebuild and throwing on difference rejects a capitalised hostname and an explicit default port, both of which work today."},
+      {"target": "sqlite", "mode": "the prescribed scanner could not have caught its own finding", "detail": "Its subject list (process.umask, process.env, process.cwd, process.platform) does not contain the offending subject, a statSync mode read. Widening it false-positives on a test that correctly BRANCHES on the ambient. A static rule cannot separate an assertion that owns its ambient from one that inherits it."},
+      {"target": "sqlite", "mode": "the prescribed narrowing creates a rarer instance of the same loss", "detail": "It would stop since-less reads refreshing the ledger's LRU, so a topic read only through the tool is evicted and its subscribe then samples the tail."},
+      {"target": "core-seam", "mode": "the prescription widens the public API to satisfy a doc phrasing", "detail": "Exporting two constants from a deliberately trimmed barrel — automated-semver surface — so a JSDoc may keep naming them."},
+      {"target": "postgres", "mode": "the corpus encoded a server limit that is wrong by 5,487 bytes", "detail": "8191 claimed; binary search against PostgreSQL 16.14 gives 2684 for a topic and 2692 for a handle, and the comment naming two other columns as index keys was wrong about both."},
+      {"target": "core-auth", "mode": "the widened selector is still a rule nobody has watched fail", "detail": "The prescribed widening was correct and verified a strict superset — but shipping it without a two-verdict self-test would have replaced one unfalsifiable guard with another."}
+    ]
+  },
+
+  "guardsCorrectInFormWrongAboutTheirSubject": {
+    "note": "The run's central pattern, and round 18 is where it became the dominant finding class rather than an occasional one. Six instances landed this round.",
+    "cases": [
+      "core-auth: a guard claiming to check 'every interpolation of every page it renders, reachable or not' scanned only whole-document template literals. A partial helper opening a tag in one literal and closing it in another was invisible — proven by planting one and watching 1495 tests stay green, on the page where the owner types the passphrase.",
+      "core-seam: a doc-reference guard scoped to one spelling; the reference it was written about had been reworded past it.",
+      "slack: four source scans anchored on one directory level while the build ships a tree.",
+      "nats: a doc-drift probe whose early return turned 'no readable claim' into an exemption, so a planted contradiction left 166 tests passing.",
+      "matrix: a leave-lever guard grading a spelling — a concatenated call survived 64 green tests where the template-literal form reddens.",
+      "repo: the runner's own worktree constant, correct on exactly one machine, and a wake-up rule naming five dependents where the manifests declare nine."
+    ]
+  },
+
+  "scannersReplacedByExecutions": {
+    "note": "The round's most transferable methodological result. Twice, a static rule was rejected in favour of running the thing.",
+    "cases": [
+      "sqlite: instead of scanning for ambient-state reads, the package's own suite re-runs under a hostile umask, timezone and locale and must give the same answer. Reintroducing an ambient-dependent control leaves the outer suite green — which is the point — and reddens only the probe.",
+      "repo: instead of regexing the runner's source for constants, the test compiles the runner into an async function and drives a real round with captured prompts, asserting where critics are actually sent. It runs on every npm test rather than only when a round runs."
+    ]
+  },
+
+  "regressionIntroducedAndCaught": "Round 18's nats commit added a module-level statusOf colliding with a bridge-net-util export. The fork registry caught it; the repo agent confirmed it was not its own by stashing its entire diff and re-running. Fixed by rename rather than a registry exemption — an exemption would have made that registry a list of names we have agreed to stop noticing.",
+
+  "theThirdFiling": "The cross-workspace metadata drift was filed near-verbatim in rounds 16, 17 and 18, and three of four drifts were still live. The reason is structural rather than neglect, and the agent named it: the drift is invisible to every package-scoped critic AND to every package-scoped test, so nothing ever went red, and each round it competed with fifteen package critics' blockers. An invariant that spans workspaces has no natural home, so it gets filed instead of fixed."
+}
