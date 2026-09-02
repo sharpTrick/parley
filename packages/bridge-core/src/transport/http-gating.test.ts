@@ -1,3 +1,4 @@
+import { format } from 'node:util';
 import { request } from 'node:http';
 import { connect } from 'node:net';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -109,11 +110,11 @@ describe('reactive HTTP: 500 path hides internal detail, logs it', () => {
       const body = (await res.json()) as { error: { message: string } };
       expect(body.error.message).toBe('internal error'); // generic, not err.message
       expect(JSON.stringify(body)).not.toContain('SECRET'); // no internal detail leaked to client
-      // … while the real error reached the operator via stderr.
-      const logged = errSpy.mock.calls.some((call) =>
-        call.some((arg) => arg instanceof Error && arg.message === SECRET),
-      );
-      expect(logged).toBe(true);
+      // … while the real error reached the operator via stderr. Read as console.error itself
+      // renders it, so that this grades what is WRITTEN rather than the shape of the argument —
+      // the handler passes a constructed digest now, and an Error before that.
+      const logged = errSpy.mock.calls.map((call) => format(...(call as unknown[])));
+      expect(logged.filter((line) => line.includes(SECRET))).toHaveLength(1);
     } finally {
       handleSpy.mockRestore();
       errSpy.mockRestore();

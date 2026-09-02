@@ -2,7 +2,7 @@ import type { Server as NodeHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type RequestHandler } from 'express';
-import { hardenErrorSurface } from '../auth/error-surface.js';
+import { errorDigest, hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
@@ -223,8 +223,8 @@ export function createRemoteHttpApp(
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
-      // Never echo internal error detail to the client; log it for the operator instead.
-      console.error('[parley] /mcp request failed:', err);
+      // Never echo internal error detail to the client; log a redacted digest for the operator.
+      console.error('[parley] /mcp request failed:', errorDigest(err));
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: '2.0',

@@ -80,31 +80,77 @@ export interface Trigger {
   body: string;
 }
 
+/**
+ * Distinct, searchable values planted in every trigger body, one per credential the shipped front
+ * doors really carry: `/parley/consent` takes `passphrase`, `/token` takes `refresh_token`,
+ * `code_verifier` and `client_secret`. A body-parser failure attaches the RAW body to the error it
+ * raises, so any sink that renders that error renders these — which makes them the thing to search
+ * for, in the response AND in the log, rather than trusting either to be the only sink.
+ */
+export const CANARIES = {
+  passphrase: 'PARLEY-CANARY-passphrase',
+  client_secret: 'PARLEY-CANARY-client-secret',
+  code_verifier: 'PARLEY-CANARY-code-verifier',
+  refresh_token: 'PARLEY-CANARY-refresh-token',
+  'raw body': 'PARLEY-CANARY-raw-body',
+} as const;
+
+/** What `text` gave away about the request that produced it. Empty is the only pass. */
+export function secretsLeaked(text: string): string[] {
+  return Object.entries(CANARIES)
+    .filter(([, value]) => text.includes(value))
+    .map(([field]) => `discloses the ${field} the caller sent`);
+}
+
+const CREDENTIAL_FIELDS = {
+  passphrase: CANARIES.passphrase,
+  client_secret: CANARIES.client_secret,
+  code_verifier: CANARIES.code_verifier,
+  refresh_token: CANARIES.refresh_token,
+  note: CANARIES['raw body'],
+};
+
+const CREDENTIAL_FORM = Object.entries(CREDENTIAL_FIELDS)
+  .map(([k, v]) => `${k}=${v}`)
+  .join('&');
+
+const CREDENTIAL_JSON = JSON.stringify(CREDENTIAL_FIELDS);
+
+/** More than body-parser's 1000-parameter ceiling, which it refuses with the whole body attached. */
+const TOO_MANY_PARAMS = Array.from({ length: 1200 }, (_unused, i) => `x${i}=1`).join('&');
+
 export const TRIGGERS: Trigger[] = [
   {
     name: 'body over the 100 KB parser limit (urlencoded)',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: `passphrase=${'a'.repeat(200_000)}`,
+    body: `${CREDENTIAL_FORM}&pad=${'a'.repeat(200_000)}`,
   },
   {
     name: 'body over the 100 KB parser limit (json)',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: ['x'.repeat(200_000)] }),
+    body: JSON.stringify({ ...CREDENTIAL_FIELDS, redirect_uris: ['x'.repeat(200_000)] }),
   },
   {
+    name: 'more parameters than the parser accepts',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: `${CREDENTIAL_FORM}&${TOO_MANY_PARAMS}`,
+  },
+  {
+    // Truncated mid-document, so V8's own SyntaxError message quotes the credentials back: the
+    // message is an input-derived string even where nothing attached the body.
     name: 'unparseable body for the declared type',
     headers: { 'content-type': 'application/json' },
-    body: '{"redirect_uris":',
+    body: CREDENTIAL_JSON.slice(0, -1),
   },
   {
     name: 'unsupported charset',
     headers: { 'content-type': 'application/json; charset=utf-7' },
-    body: '{}',
+    body: CREDENTIAL_JSON,
   },
   {
     name: 'content-encoding that does not match the body',
     headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
-    body: 'not gzip at all',
+    body: `not gzip at all ${CREDENTIAL_JSON}`,
   },
 ];
 
