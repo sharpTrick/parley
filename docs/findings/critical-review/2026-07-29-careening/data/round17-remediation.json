@@ -3,7 +3,7 @@
  "phase": "remediation",
  "base": "8e8d22e",
  "blockingFindings": 30,
- "status": "IN PROGRESS \u2014 25/30 closed at time of writing",
+ "status": "COMPLETE \u2014 30/30 blocking findings closed, every landed diff mutation-replayed",
  "runShape": "Review ran in three batches of five targets after twelve container reprovisions killed three all-or-nothing attempts. Remediation ran in waves of four, then two, for the same reason.",
  "instrumentRulesAdded": [
   "A mutation is ONE literal edit. A bundled mutation's red is unattributable \u2014 it proves the bundle matters, not any member. sqlite's manifest bundled four edits; isolating the fourth found that line completely ungraded, and chasing it found two more mutually-masking guards and a fifth mutation that had been surviving unnoticed.",
@@ -12,7 +12,7 @@
   "Check WHICH gate you ran. An agent reported 'tsc -b clean' and was right \u2014 tsc -b does not cover tsconfig.test.json, and CI runs typecheck:test separately, which the change had broken."
  ],
  "wrongPrescriptions": {
-  "note": "Round 17 produced ten more, none caught by any test suite. The running total across rounds 9-17 is 53.",
+  "note": "Round 17 produced thirteen, none caught by any test suite. Running total across rounds 9-17 is 56. The modes sharpened: three were not merely weak but would have made things WORSE \u2014 a fix that relocated the bug, one arithmetically impossible, and one that would have newly REFUSED a legitimate config value at boot.",
   "cases": [
    {
     "target": "xmpp",
@@ -63,6 +63,21 @@
     "target": "shared",
     "mode": "the guard is placed on the wrong knob",
     "detail": "Validating opts.deadlineMs up front leaves `now: () => NaN` producing a non-finite budget from a finite deadline, still throwing raw."
+   },
+   {
+    "target": "slack",
+    "mode": "the alternative fix converts a loud failure into silent loss",
+    "detail": "Guarding inside isPlainMessage would drop the record while newestSeenTs still advanced past it \u2014 a wedge the operator can see becomes data loss they cannot. Confirmed independently by the agent before rejecting it."
+   },
+   {
+    "target": "repo",
+    "mode": "two of the finding's premises are false",
+    "detail": "The unguarded packages are NOT the four hosted-SaaS backends (matrix is self-hostable and unguarded; zulip is SaaS-shaped and had the strictest list), and the README boilerplate it cites is about CLI arguments, not config keys \u2014 those READMEs were silent, not lying."
+   },
+   {
+    "target": "nats",
+    "mode": "a premise a PREVIOUS ROUND OF OURS recorded as settled is false",
+    "detail": "Round 16 deferred the upper bound because it 'fails loudly at streams.add'. Measured against a live server: above ~2.08e294 days the product overflows to Infinity, serialises as null, and the server ACCEPTS the stream storing max_age 0 = UNLIMITED \u2014 the exact inversion the validator exists to prevent, silent and locked in at creation."
    }
   ]
  },
@@ -79,5 +94,13 @@
   "Landed a capacity registry using import.meta.glob without running typecheck:test; tsc -b passes and CI's separate typecheck step does not. Found by a cross-package agent with no stake in the file.",
   "A 10-minute limit killed a mutation replay mid-run, leaving the file mutated; restored from the .mutbak snapshot rather than git checkout.",
   "An expectFail fragment I guessed did not match the assertion's real text, so the harness refused to count a genuine red. Isolating the mutation showed it grading correctly."
- ]
+ ],
+ "completedOn": "desktop (8 cores, 58GB) after teleport from the cloud container",
+ "portabilityDefectsFoundByMovingMachines": [
+  "careening-worktrees.mjs hardcoded ROOT as the cloud container's checkout path, so every worktree it made elsewhere pointed at a directory that does not exist.",
+  "The worktree base defaulted to /tmp, but hard-linking node_modules is what makes a worktree cost no disk and hard links cannot cross filesystems. careening-worktree.sh reported the failure as a bare cp error and carried on to leave a half-built worktree.",
+  "The preflight's stale-worktree guard read that same hardcoded base, so on any other machine it would have compared shas in a directory nothing writes to and PASSED.",
+  "bridge-net-util's registration probe looked for a DependantSignals symbol and read its absence as zero. Node 26 removed the mechanism entirely \u2014 AbortSignal.any records nothing on the source. The probe now asserts which regime the runtime is in; verified the rows still catch a real leak by dropping the removeEventListener, which reddens all three."
+ ],
+ "portabilityReading": "Two of the four are the same shape as the run's central finding, one layer down: a guard correct in FORM and wrong about its own SUBJECT. The preflight compared shas in a directory nothing wrote to; the probe read a removed internal as an absence. Neither could fail visibly, and neither was detectable without changing the environment underneath them."
 }
