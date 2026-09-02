@@ -35,7 +35,7 @@ export interface PresenceLoopOptions {
   instanceId?: string;
   /**
    * How long {@link PresenceLoop.stop} waits for the goodbye to reach the backend before giving up.
-   * Default `GOODBYE_TIMEOUT_MS`.
+   * Default 2 s.
    */
   goodbyeTimeoutMs?: number;
 }

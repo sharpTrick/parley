@@ -183,14 +183,42 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
     );
   }
 
-  const WITHHELD = /\{@link\s+([A-Za-z_$][\w$]*)/g;
+  /**
+   * Every adorned spelling a doc block can name a symbol in. This guard was written about
+   * `AllowlistOptions.postPatterns` naming the post-pattern cap, in `{@link}` form; the reference
+   * was later reworded to backticks and walked straight past a matcher scoped to the one syntax.
+   * A spelling is a ROW, so the next rewording is a missing row rather than a silent hole.
+   *
+   * Unadorned prose is deliberately not a spelling. Matched as a bare word, `parse` in
+   * backend-cli.ts's prose and `harness` in stdio-bridge.ts's collide with minted names and read as
+   * offenders — a reference is what renders as a link or a code span, and stating the VALUE in
+   * prose is the sanctioned fix for a cap the barrel withholds.
+   */
+  const REFERENCE_SPELLINGS: readonly (readonly [
+    label: string,
+    render: (name: string) => string,
+    find: RegExp,
+  ])[] = [
+    ['{@link X}', (n) => `{@link ${n}}`, /\{@link\s+([A-Za-z_$][\w$]*)/g],
+    ['{@linkcode X}', (n) => `{@linkcode ${n}}`, /\{@linkcode\s+([A-Za-z_$][\w$]*)/g],
+    ['{@linkplain X}', (n) => `{@linkplain ${n}}`, /\{@linkplain\s+([A-Za-z_$][\w$]*)/g],
+    ['a backticked identifier', (n) => `\`${n}\``, /`([A-Za-z_$][\w$]*)`/g],
+    ['a bracketed identifier', (n) => `[${n}]`, /\[([A-Za-z_$][\w$]*)\]/g],
+  ];
+
+  function referenced(doc: string): string[] {
+    return [
+      ...new Set(
+        REFERENCE_SPELLINGS.flatMap(([, , find]) => [...doc.matchAll(find)].map((m) => m[1]!)),
+      ),
+    ];
+  }
 
   function linkOffenders(scan: Scan, importable: ReadonlySet<string>, minted: ReadonlySet<string>): string[] {
     return shippedBlocks(scan, importable).flatMap((b) =>
-      [...b.doc.matchAll(WITHHELD)]
-        .map((m) => m[1]!)
+      referenced(b.doc)
         .filter((name) => minted.has(name) && !importable.has(name))
-        .map((name) => `${b.owner ?? '<file>'}'s doc links ${name}, which index.ts does not export`),
+        .map((name) => `${b.owner ?? '<file>'}'s doc names ${name}, which index.ts does not export`),
     );
   }
 
@@ -251,6 +279,26 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
     expect(linkOffenders(scanned, PUBLIC, MINTED)).toHaveLength(1);
   });
 
+  /**
+   * Grade the MATCHER the way the positions above grade the walk: one synthetic source per
+   * spelling, each required to reach both verdicts. A widened selector nobody has watched fail is
+   * the same rule this finding was about, one syntax further out.
+   */
+  it.each(REFERENCE_SPELLINGS)('reads a reference written as %s', (_label, render) => {
+    const source = `/** see ${render('Withheld')} */\nexport const Owner = 1;\n`;
+    expect(linkOffenders(scan(source), PUBLIC, MINTED)).toHaveLength(1);
+  });
+
+  it.each(REFERENCE_SPELLINGS)('does not fault %s naming a symbol the barrel ships', (_label, render) => {
+    const source = `/** see ${render('Shipped')} */\nexport const Owner = 1;\n`;
+    expect(linkOffenders(scan(source), PUBLIC, MINTED)).toEqual([]);
+  });
+
+  it('does not read an unadorned prose mention as a reference', () => {
+    const source = '/** capped at 64 entries; Withheld bounds it internally */\nexport const Owner = 1;\n';
+    expect(linkOffenders(scan(source), PUBLIC, MINTED)).toEqual([]);
+  });
+
   it('leaves a link alone when the symbol is importable, or the doc never ships', () => {
     expect(linkOffenders(scan('/** {@link Shipped} */\nexport const Owner = 1;\n'), PUBLIC, MINTED)).toEqual([]);
     expect(
@@ -258,13 +306,13 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
     ).toEqual([]);
   });
 
-  it('resolves every {@link} in a public doc comment to a public symbol', () => {
+  it('resolves every reference in a public doc comment to a public symbol', () => {
     const offenders = scans.flatMap(([file, s]) =>
       linkOffenders(s, exposed, values).map((row) => `${file}: ${row}`),
     );
     expect(
       offenders,
-      'export the linked symbol, or state it in prose — a consumer cannot follow a link to a symbol they cannot import',
+      'export the named symbol, or state its VALUE in prose — a consumer cannot import a name the barrel withholds',
     ).toEqual([]);
   });
 

@@ -69,10 +69,10 @@ const ConfigObject = z.object({
     })
     .strict(),
   /**
-   * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped at
-   * `MAX_RECORD_TOPICS`: every presence beat advertises this whole list and every reader caps
-   * a record at that count, so a longer list would load cleanly and then under-advertise this bridge
-   * on its trailing topics forever — no peer would ever see it as a hand-off partner there.
+   * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped at 64
+   * entries: every presence beat advertises this whole list and every reader keeps only that many,
+   * so a longer list would load cleanly and then under-advertise this bridge on its trailing topics
+   * forever — no peer would ever see it as a hand-off partner there.
    */
   topics: z
     .array(beatString)
@@ -89,7 +89,7 @@ const ConfigObject = z.object({
    * hand-off (DESIGN §7). That topic is shared and readable by every participant on the backend,
    * so a pattern source must not encode anything confidential — it is published verbatim on every
    * beat. A pattern can never match the presence topic itself (it is reserved). Invalid
-   * regexes are rejected at load (DESIGN §14). Capped at `MAX_POST_TOPICS`: the ReDoS screen
+   * regexes are rejected at load (DESIGN §14). Capped at 64 entries: the ReDoS screen
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
    * one of them, so the count is the other half of that bound. That bound clamps the INPUT too: a
    * pattern here widens post/fetch only to topics of at most 64 characters (`MAX_MATCH_INPUT`),

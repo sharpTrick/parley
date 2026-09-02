@@ -7,7 +7,7 @@
 
 /**
  * Longest input a screened pattern is ever matched against. Callers MUST clamp or refuse longer
- * input, so that the per-source `MAX_AMBIGUITY` budget keeps meaning what it was calibrated to mean.
+ * input, so that the per-source backtracking budget keeps meaning what it was calibrated to mean.
  *
  * Public because it is an operator-facing capacity as well as a bound on work: `Allowlist` refuses a
  * longer topic rather than pattern-matching it, so `post_topics` widens post/fetch only to topics of
