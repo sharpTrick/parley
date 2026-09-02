@@ -1,5 +1,6 @@
 import type { Topic } from '@sharptrick/parley-core';
 import { xml } from '@xmpp/client';
+import XMPPError from '@xmpp/error';
 import { expect } from 'vitest';
 import type { XmppPlugin } from '../src/index.js';
 
@@ -195,6 +196,17 @@ export class FakeXmpp {
    */
   ownerConfig: 'accepts' | 'refuses-persistent' | 'refuses-everything' | 'times-out' = 'accepts';
   ownerConfigCondition = 'not-allowed';
+  /** The `<text>` this service attaches to every stanza error it answers an IQ with; `''` for a
+   * server that attaches none. */
+  stanzaErrorText = STANZA_ERROR_TEXT;
+  /**
+   * Latency before the owner-config submit is answered. A join that CREATED the room holds its
+   * pending registration across this whole round trip, so without a knob for it the widest
+   * "a room-state event landed while the join was still in flight" window is unreachable.
+   */
+  ownerConfigLatencyMs = 0;
+  /** Fires when the owner-config IQ arrives, BEFORE it is answered — i.e. inside that window. */
+  onOwnerConfigRequest?: (room: string) => void | Promise<void>;
 
   /** Whether a room's disco#info advertises `urn:xmpp:mam:2` (i.e. muc_mam is loaded). */
   discoMam = true;
@@ -611,6 +623,13 @@ export class FakeXmpp {
   }
 
   private async onIq(iq: El): Promise<unknown> {
+    // Nothing a server does reaches a client on the client's OWN call stack: an answer, and any
+    // stanza the server sends around it, arrive from the socket. Keep this yield, so that a hook
+    // firing "while the IQ is in flight" lands where a real one would rather than re-entering the
+    // plugin part-way through the call that sent the IQ — a state no server can produce, and the
+    // one that silently made the widest in-flight window untestable. Keep it a MICROTASK: a timer
+    // here never fires under a suite that installed fake ones.
+    await Promise.resolve();
     if (iq.getChild('query', NS_DISCO_INFO) !== undefined) {
       const room = iq.attrs.to ?? '';
       await this.onDiscoRequest?.(room);
@@ -620,9 +639,9 @@ export class FakeXmpp {
       // grades `conditionOf`'s fall-back-to-the-message arm instead of a tidier error no client
       // produces.
       if (this.discoProbe === 'no-answer') throw new Error('TimeoutError');
-      if (this.discoProbe !== 'answers') throw stanzaError(this.discoProbe);
+      if (this.discoProbe !== 'answers') throw stanzaError(this.discoProbe, this.stanzaErrorText);
       if (this.discoUnknownRoom === 'item-not-found' && !this.rooms.has(room)) {
-        throw stanzaError('item-not-found');
+        throw stanzaError('item-not-found', this.stanzaErrorText);
       }
       return xml(
         'iq',
@@ -636,10 +655,14 @@ export class FakeXmpp {
       );
     }
     const owner = iq.getChild('query', NS_MUC_OWNER);
-    if (owner !== undefined) return this.answerOwnerConfig(owner);
+    if (owner !== undefined) {
+      await this.onOwnerConfigRequest?.(iq.attrs.to ?? '');
+      if (this.ownerConfigLatencyMs > 0) await sleep(this.ownerConfigLatencyMs);
+      return this.answerOwnerConfig(owner);
+    }
     const query = iq.getChild('query', NS_MAM);
     if (query === undefined) return xml('iq', { type: 'result' });
-    if (this.mamIqError !== undefined) throw stanzaError(this.mamIqError);
+    if (this.mamIqError !== undefined) throw stanzaError(this.mamIqError, this.stanzaErrorText);
     const room = iq.attrs.to ?? '';
     const queryid = query.attrs.queryid ?? '';
     await this.onMamRequest?.(room);
@@ -704,10 +727,10 @@ export class FakeXmpp {
       case 'times-out':
         return Promise.reject(new Error('timeout'));
       case 'refuses-everything':
-        return Promise.reject(stanzaError(this.ownerConfigCondition));
+        return Promise.reject(stanzaError(this.ownerConfigCondition, this.stanzaErrorText));
       case 'refuses-persistent':
         return asksPersistent
-          ? Promise.reject(stanzaError(this.ownerConfigCondition))
+          ? Promise.reject(stanzaError(this.ownerConfigCondition, this.stanzaErrorText))
           : Promise.resolve(xml('iq', { type: 'result' }));
       default:
         return Promise.resolve(xml('iq', { type: 'result' }));
@@ -737,9 +760,22 @@ export class FakeXmpp {
   }
 }
 
-/** What `@xmpp/iq`'s caller rejects an errored IQ with: an Error carrying the defined condition. */
-const stanzaError = (condition: string): Error =>
-  Object.assign(new Error(condition), { condition });
+/**
+ * The `<text>` a server attaches to a stanza error. Non-empty by DEFAULT, so that no fixture error
+ * has a `message` interchangeable with its `condition`: a stand-in narrower than the library the
+ * plugin parses grades every consumer of the condition vacuously, whichever field they read.
+ */
+export const STANZA_ERROR_TEXT = 'the service explained itself here';
+
+/**
+ * What `@xmpp/iq`'s caller rejects an errored IQ with — built by the LIBRARY out of the same
+ * `<error>` element this fixture hangs on a bounced message or presence, rather than imitated here.
+ * `@xmpp/middleware`'s `StanzaError` subclasses this and adds only the stanza `type`, which no code
+ * under test reads. Keep the construction on the library, so that a fixture cannot be kinder about
+ * `message` versus `condition` than the object a real server produces.
+ */
+export const stanzaError = (condition: string, text = STANZA_ERROR_TEXT): Error =>
+  (XMPPError as unknown as { fromElement(el: unknown): Error }).fromElement(errorEl(condition, text));
 
 export const errorEl = (condition: string, text = ''): unknown =>
   xml(

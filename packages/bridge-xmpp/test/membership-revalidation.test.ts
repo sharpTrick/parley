@@ -189,35 +189,69 @@ describe('XMPP re-enters a room after occupancy ends, however it ended', () => {
 // can reach the window inside it — and the recovery ladder is gated on `subscriptions.has(room)`,
 // so interest written after the join means a loss delivered anywhere inside that join is classified
 // as a catch-up-only room: one stderr line, no timer, the call resolving successfully and live push
-// dead for a topic that may never see another post or fetch. The generator is over WHERE in the
-// call the loss lands, and every cell asserts the same seam-observable end state — another
-// occupant's message reaches this subscriber again — rather than a proxy for it.
-const arrivals: Array<{ when: string; lose(bridge: SubBridge): void }> = [
-  {
-    when: 'before the call is made at all',
-    lose: ({ fake, room }) => fake.endOccupancy(room, { statuses: ['307'] }),
-  },
+// dead for a topic that may never see another post or fetch.
+//
+// The generator is over WHERE in the call the loss lands, crossed with how the server announced it.
+// The stage axis is what the plugin's own join registration spans, and it must be enumerated to the
+// WIDEST stage rather than to the first one a reader thinks of: a join that CREATED the room holds
+// that registration across the whole owner-config round trip, which is far past the self-presence
+// where the room is already this connection's — so a stage table that stops at the disco probe
+// grades only windows the plugin was already handling. Every cell asserts the same seam-observable
+// end state — another occupant's message reaches this subscriber again, which the fixture routes to
+// OCCUPANTS only — rather than a proxy such as "a join presence was sent".
+interface Stage {
+  when: string;
+  /** Arm the fixture so `end` fires at this stage of the subscribe() that follows; `undefined` for
+   * the stage that is only reachable once the call has already returned. */
+  arm?(bridge: SubBridge, end: () => void): void;
+}
+
+/** Run `fn` on the first call only — these fixture hooks fire again on every re-entry. */
+const once = (fn: () => void): (() => void) => {
+  let fired = false;
+  return () => {
+    if (fired) return;
+    fired = true;
+    fn();
+  };
+};
+
+const stages: Stage[] = [
+  { when: 'before the call is made at all', arm: (_b, end) => end() },
   {
     when: 'while the join presence is still unanswered',
-    lose: ({ fake, room }) => {
+    arm: ({ fake }, end) => {
       fake.joinLatencyMs = 80;
-      setTimeout(() => fake.endOccupancy(room, { statuses: ['307'] }), 30);
+      setTimeout(end, 30);
+    },
+  },
+  {
+    when: 'after the self-presence, while the owner-config for the room it created is in flight',
+    arm: ({ fake }, end) => {
+      fake.announceCreation = true;
+      fake.ownerConfigLatencyMs = 40;
+      fake.onOwnerConfigRequest = once(end);
     },
   },
   {
     when: 'after the self-presence, during the disco#info probe',
-    lose: ({ fake, room }) => {
-      let fired = false;
-      fake.onDiscoRequest = () => {
-        if (fired) return;
-        fired = true;
-        fake.endOccupancy(room, { statuses: ['307'] });
-      };
+    arm: ({ fake }, end) => {
       fake.discoLatencyMs = 20;
+      fake.onDiscoRequest = once(end);
     },
   },
-  { when: 'after the call returned', lose: () => undefined },
+  { when: 'after the call returned' },
 ];
+
+/** How the server announced it. A `<destroy/>` is read by a different branch of the reason map than
+ * a status code, and on a real MUC it means the room itself is gone — so re-entry has to hold for
+ * both at every stage, not just for the kick everyone writes the first row about. */
+const routes: Array<{ route: string; end: Repeat }> = [
+  { route: 'a kick', end: { statuses: ['307'] } },
+  { route: 'a room destroy', end: { destroy: true } },
+];
+
+const arrivals = stages.flatMap((stage) => routes.map((r) => ({ ...stage, ...r })));
 
 interface SubBridge {
   plugin: XmppPlugin;
@@ -228,7 +262,7 @@ interface SubBridge {
 }
 
 describe('XMPP recovers live push when occupancy ends inside subscribe()', () => {
-  it.each(arrivals)('the loss lands $when', async ({ when, lose }) => {
+  it.each(arrivals)('the loss lands $when, announced by $route', async ({ arm, end }) => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const fake = new FakeXmpp();
     fake.enforceOccupancy = true;
@@ -240,10 +274,11 @@ describe('XMPP recovers live push when occupancy ends inside subscribe()', () =>
     const room = p.roomJid(TOPIC);
     const delivered: string[] = [];
     const bridge: SubBridge = { plugin, fake, p, room, delivered };
+    const lose = (): void => fake.endOccupancy(room, end);
 
-    lose(bridge);
+    arm?.(bridge, lose);
     await plugin.subscribe(TOPIC, (m: Message) => delivered.push(String(m.content)));
-    if (when === 'after the call returned') fake.endOccupancy(room, { statuses: ['307'] });
+    if (arm === undefined) lose();
 
     // The fixture routes a room's traffic to its OCCUPANTS only, so this is dead until the plugin
     // is back in the room — no ladder, no delivery, whatever the join cache happens to say.
@@ -254,7 +289,67 @@ describe('XMPP recovers live push when occupancy ends inside subscribe()', () =>
       },
       { timeout: REJOIN_MAX_WAIT_MS + 3_000, interval: 50 },
     );
+    expect(fake.occupied.has(room)).toBe(true);
 
+    await plugin.disconnect();
+    vi.restoreAllMocks();
+  }, 30_000);
+
+  // A loss held across a join is one ROUND of trouble however many presences announce it: the
+  // backoff ladder is a rate limit on re-entry, and counting each presence in one window would walk
+  // it to "not re-entering it again" over a single incident.
+  it('two losses inside one join window are one round of trouble, reported by their first cause', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fake = new FakeXmpp();
+    fake.enforceOccupancy = true;
+    fake.nick = NICK;
+    fake.announceCreation = true;
+    fake.ownerConfigLatencyMs = 40;
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: NICK });
+    const p = priv(plugin);
+    const room = p.roomJid(TOPIC);
+
+    fake.onOwnerConfigRequest = once(() => {
+      fake.endOccupancy(room, { destroy: true });
+      fake.endOccupancy(room, { statuses: ['307'] });
+    });
+    await plugin.subscribe(TOPIC, () => undefined);
+    await vi.waitFor(() => expect(p.rejoins.get(room)?.losses).toBeDefined());
+
+    expect(p.rejoins.get(room)?.losses).toBe(1);
+    expect(errorsFor(errors).join('\n')).toContain(`occupancy in ${room} ended (room destroyed)`);
+    expect(errorsFor(errors).join('\n')).not.toContain('kicked');
+    await plugin.disconnect();
+    vi.restoreAllMocks();
+  }, 30_000);
+
+  // The other half of holding a loss across a join: a join that FAILED never entered the room, its
+  // caller was told so, and `ensureJoinedRoom` has already dropped the cache — so replaying the held
+  // loss there would arm a re-entry ladder behind a subscribe that threw and whose interest was
+  // rolled back, re-entering a room nothing is listening to.
+  it('a loss held across a join that fails is dropped with the join, not turned into a ladder', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fake = new FakeXmpp();
+    fake.enforceOccupancy = true;
+    fake.nick = NICK;
+    fake.joinLatencyMs = 80;
+    fake.joinReply = 'error';
+    fake.joinErrorCondition = 'forbidden';
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: NICK });
+    const p = priv(plugin);
+    const room = p.roomJid(TOPIC);
+
+    setTimeout(() => fake.endOccupancy(room, { statuses: ['307'] }), 30);
+    await expect(plugin.subscribe(TOPIC, () => undefined)).rejects.toThrow('forbidden');
+    await new Promise((r) => setTimeout(r, 500)); // longer than REJOIN_BASE_MS + its jitter
+
+    expect(p.rejoins.size).toBe(0);
+    expect(p.joined.has(room)).toBe(false);
+    expect(p.subscriptions.has(room)).toBe(false);
     await plugin.disconnect();
     vi.restoreAllMocks();
   }, 30_000);

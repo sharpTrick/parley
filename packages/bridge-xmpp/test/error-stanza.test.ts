@@ -2,7 +2,7 @@ import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { xml } from '@xmpp/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
-import { attach, errorEl, expectNoLeaks, FakeXmpp } from './fake-xmpp.js';
+import { attach, errorEl, expectNoLeaks, FakeXmpp, STANZA_ERROR_TEXT, stanzaError } from './fake-xmpp.js';
 
 // Class: a protocol ERROR response the stanza router silently discards, turning a fast, explained
 // failure into a timeout with no cause. A MUC answers `<message type='error'>` when the sender is
@@ -11,6 +11,8 @@ import { attach, errorEl, expectNoLeaks, FakeXmpp } from './fake-xmpp.js';
 // per post. Presence errors are the same story for joins, and flattening the condition to the
 // literal 'error' leaves an operator unable to tell `conflict` from `forbidden` from "room full".
 // The table walks realistic conditions on both stanza kinds and demands a prompt, named rejection.
+
+const NS_DISCO_INFO = 'http://jabber.org/protocol/disco#info';
 
 const POST_CONDITIONS = ['not-acceptable', 'forbidden', 'item-not-found', 'gone'];
 const JOIN_CONDITIONS = ['conflict', 'registration-required', 'service-unavailable', 'forbidden'];
@@ -74,6 +76,51 @@ describe('XMPP error stanzas fail the correlated operation promptly, with the co
     },
   );
 
+});
+
+// Class: a stand-in whose error shape is NARROWER than the library the code under test parses.
+// `@xmpp/iq` rejects an errored IQ with an `@xmpp/error`, whose `message` is `condition - text` and
+// whose `condition` is the bare defined-condition name — so the two fields coincide only for a
+// server that attached no `<text>`. A fixture that built its errors as `new Error(condition)` made
+// them coincide ALWAYS, and with it the plugin's entire condition-versus-message discrimination
+// could be deleted with the whole package suite still green: three consumers key real behaviour on
+// it (whether a read reports an unprobed room, whether a MAM failure earns the 'enable muc_mam'
+// hint, and what a durability diagnostic names). These rows pin the stand-in to the library rather
+// than to an imitation of it, and pin its DEFAULT to the shape that discriminates — every
+// condition-driven table elsewhere is graded vacuously the moment this default stops carrying text.
+
+describe('the fixture rejects an IQ with the shape the real library produces', () => {
+  it('carries a message the condition cannot be read off, by default', () => {
+    const err = stanzaError('item-not-found');
+    expect(err).toHaveProperty('condition', 'item-not-found');
+    expect(err).toHaveProperty('text', STANZA_ERROR_TEXT);
+    expect(err.message).not.toBe('item-not-found');
+    expect(err.message).toContain(STANZA_ERROR_TEXT);
+  });
+
+  it('carries the condition alone when the server attached no <text>', () => {
+    const err = stanzaError('item-not-found', '');
+    expect(err).toHaveProperty('condition', 'item-not-found');
+    expect(err.message).toBe('item-not-found');
+  });
+
+  // Through the stand-in's own wire surface rather than off the knob's name: what has to hold is
+  // that a server nobody configured answers an IQ the discriminating way, whatever the knob is
+  // called or whether it still exists.
+  it("a server nobody configured answers the discriminating way, so every table driving it is graded", async () => {
+    const fake = new FakeXmpp();
+    fake.discoProbe = 'service-unavailable';
+    const failure = await fake.iqCaller
+      .request(
+        xml('iq', { type: 'get', to: 'r@muc.parley.local' }, xml('query', { xmlns: NS_DISCO_INFO })),
+      )
+      .then(
+        () => undefined,
+        (e: Error) => e,
+      );
+    expect(failure).toHaveProperty('condition', 'service-unavailable');
+    expect(failure?.message).not.toBe('service-unavailable');
+  });
 });
 
 // Class: a correlator keyed on the BARE JID while the RESOURCE decides authority. A MUC bounce of

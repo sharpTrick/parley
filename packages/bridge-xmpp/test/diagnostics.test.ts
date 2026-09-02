@@ -82,6 +82,14 @@ interface DurabilityRow {
   lines: number;
   /** Phrases the operator needs: what was refused, and what it costs them. */
   reports: RegExp[];
+  /**
+   * What the report must name the refusal as, in full. The server attaches a `<text>` explaining
+   * itself and `@xmpp/error` folds that into the error's MESSAGE, so a report built from the
+   * message rather than from the defined condition reads `not-allowed - <prose>` here — which is
+   * the difference between a line an operator can match on and one that carries a server's free
+   * text into a diagnostic.
+   */
+  named: string;
 }
 const durabilityRows: DurabilityRow[] = [
   {
@@ -89,20 +97,29 @@ const durabilityRows: DurabilityRow[] = [
     ownerConfig: 'refuses-persistent',
     lines: 1,
     reports: [/NON-PERSISTENT/, /destroyed when the last occupant leaves/],
+    named: '(not-allowed)',
   },
   {
     name: 'the bare instant-room fallback is refused too',
     ownerConfig: 'refuses-everything',
     lines: 2,
     reports: [/NON-PERSISTENT/, /stays LOCKED/],
+    named: '(not-allowed)',
   },
   {
     name: 'the owner IQ is never answered',
     ownerConfig: 'times-out',
     lines: 2,
     reports: [/NON-PERSISTENT/, /stays LOCKED/],
+    named: '(timeout)',
   },
-  { name: 'the service accepts it (negative control)', ownerConfig: 'accepts', lines: 0, reports: [] },
+  {
+    name: 'the service accepts it (negative control)',
+    ownerConfig: 'accepts',
+    lines: 0,
+    reports: [],
+    named: '',
+  },
 ];
 
 describe('XMPP reports a room it could not make durable', () => {
@@ -126,6 +143,7 @@ describe('XMPP reports a room it could not make durable', () => {
       const durability = errors.filter((m) => m.includes(room));
       expect(durability).toHaveLength(row.lines);
       for (const phrase of row.reports) expect(durability.join('\n')).toMatch(phrase);
+      if (row.named !== '') expect(durability.join('\n')).toContain(row.named);
     } finally {
       await plugin.disconnect();
     }

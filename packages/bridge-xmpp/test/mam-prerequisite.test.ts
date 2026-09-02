@@ -16,7 +16,7 @@ vi.mock('@xmpp/client', async () => {
 });
 
 import { XmppPlugin } from '../src/index.js';
-import { FakeXmpp } from './fake-xmpp.js';
+import { FakeXmpp, STANZA_ERROR_TEXT } from './fake-xmpp.js';
 
 const TOPIC = asTopic('t-mam-prereq');
 /** Far below JOIN/POST/MAM_TIMEOUT_MS: a bare timeout can never pass for a fast failure. */
@@ -32,7 +32,7 @@ const call: Record<Entry, (p: XmppPlugin, topic?: Topic) => Promise<unknown>> = 
 
 /** The fault as a PATCH, so healing it is a mechanical restore rather than a second hand-written
  * list that can drift away from the one that broke the server. */
-type Fault = Partial<Pick<FakeXmpp, 'discoMam' | 'reflectStanzaId' | 'mamIqError'>>;
+type Fault = Partial<Pick<FakeXmpp, 'discoMam' | 'reflectStanzaId' | 'mamIqError' | 'stanzaErrorText'>>;
 
 interface Row {
   fault: string;
@@ -63,14 +63,27 @@ const rows: Row[] = [
     broken: { reflectStanzaId: false },
     namesMam: ['post'],
   },
+  // Both with and WITHOUT the `<text>` a server attaches: `@xmpp/error` folds one into the error's
+  // message and leaves `condition` alone, so a hint keyed off the message survives only the
+  // text-free rows — which is every row a fixture that omitted texts could write.
   {
-    fault: 'the MAM query is answered service-unavailable',
-    broken: { mamIqError: 'service-unavailable' },
+    fault: 'the MAM query is answered service-unavailable, with a server explanation',
+    broken: { mamIqError: 'service-unavailable', stanzaErrorText: STANZA_ERROR_TEXT },
     namesMam: ['fetchRecent'],
   },
   {
-    fault: 'the MAM query is answered feature-not-implemented',
-    broken: { mamIqError: 'feature-not-implemented' },
+    fault: 'the MAM query is answered service-unavailable, with no <text> at all',
+    broken: { mamIqError: 'service-unavailable', stanzaErrorText: '' },
+    namesMam: ['fetchRecent'],
+  },
+  {
+    fault: 'the MAM query is answered feature-not-implemented, with a server explanation',
+    broken: { mamIqError: 'feature-not-implemented', stanzaErrorText: STANZA_ERROR_TEXT },
+    namesMam: ['fetchRecent'],
+  },
+  {
+    fault: 'the MAM query is answered feature-not-implemented, with no <text> at all',
+    broken: { mamIqError: 'feature-not-implemented', stanzaErrorText: '' },
     namesMam: ['fetchRecent'],
   },
   {

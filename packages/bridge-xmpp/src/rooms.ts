@@ -30,6 +30,9 @@ interface PendingJoin {
   /** The nick this join's presence was addressed to; only a presence naming it (or one carrying
    * XEP-0045 status 210) can be attributed to it. */
   nick: string;
+  /** Why occupancy ended while this join was still in flight, replayed once it succeeds. Holds the
+   * FIRST reason only: one join window is one round of trouble, however many presences announce it. */
+  lostWhile?: string;
   resolve(): void;
   reject(err: Error): void;
   /** Hand this entry's outcome to a successor join for the same room ({@link XmppRooms.joinOnce}). */
@@ -54,7 +57,14 @@ export class XmppRooms extends XmppArchive {
    * Occupancy ended without the stream dropping — kicked, banned, room destroyed, MUC component
    * restarted, or a post bounced as "not an occupant". `joined` caches a RESOLVED promise, so without
    * this the plugin would never re-enter the room: push permanently dead in silence and every post
-   * bouncing forever. A join still in flight settles on its own.
+   * bouncing forever.
+   *
+   * A loss delivered while a join is still in flight is HELD on that join rather than dropped: the
+   * pending entry outlives the self-presence for a room this join created (`onPresence` defers its
+   * resolve behind the owner-config round trip), so dropping it caches a resolved join for a room
+   * this connection is not in — subscribe() answering success over a topic whose live push is dead
+   * for good. It is replayed only when the join SUCCEEDS; a join that fails has already dropped the
+   * cache and told its caller, so nothing is owed.
    *
    * The re-entry is remote-driven, so it is DEFERRED and backs off: a room that ends occupancy on
    * every join (a moderation bot, a members-only toggle, a MUC service shutting down) would
@@ -64,7 +74,12 @@ export class XmppRooms extends XmppArchive {
    */
   protected onOccupancyLost(room: string, why: string): void {
     if (this.stopped) return;
-    if (!this.joined.has(room) || this.pendingJoins.has(room)) return;
+    if (!this.joined.has(room)) return;
+    const inFlight = this.pendingJoins.get(room);
+    if (inFlight !== undefined) {
+      inFlight.lostWhile ??= why;
+      return;
+    }
     this.forgetRoom(room);
 
     const now = Date.now();
@@ -299,14 +314,20 @@ export class XmppRooms extends XmppArchive {
         if (this.pendingJoins.get(room) === entry) this.pendingJoins.delete(room);
         finish();
       };
+      // Replay AFTER the registration is cleared, so that the loss this join held reaches
+      // `onOccupancyLost` with no join in flight and takes the ordinary forget + ladder path.
+      const succeed = (): void => {
+        resolve();
+        if (entry.lostWhile !== undefined) this.onOccupancyLost(room, entry.lostWhile);
+      };
       const entry: PendingJoin = {
         nick: this.nick,
-        resolve: () => settle(resolve),
+        resolve: () => settle(succeed),
         reject: (err) => settle(() => reject(err)),
         settleFrom: (outcome) => {
           clearTimeout(timer);
           outcome.then(
-            () => settle(resolve),
+            () => settle(succeed),
             (err: unknown) => settle(() => reject(wire.asError(err))),
           );
         },

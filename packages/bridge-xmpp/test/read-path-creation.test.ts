@@ -22,7 +22,7 @@ vi.mock('@xmpp/client', async () => {
 });
 
 import { XmppPlugin } from '../src/index.js';
-import { FakeXmpp, priv } from './fake-xmpp.js';
+import { FakeXmpp, priv, STANZA_ERROR_TEXT } from './fake-xmpp.js';
 
 const NS_MUC_OWNER = 'http://jabber.org/protocol/muc#owner';
 
@@ -81,8 +81,21 @@ const probes = [
   { name: 'the probe never answers', probe: 'no-answer' as const, joinable: false },
 ];
 
+/**
+ * Whether the server attaches a `<text>` to the error it answers the probe with. It is an axis
+ * because `@xmpp/error` folds one into the error's MESSAGE and leaves its `condition` alone, so a
+ * consumer reading the wrong field agrees with the right one only when there is no text — which is
+ * the single case a fixture that omitted them could produce.
+ */
+const texts = [
+  { name: 'with a server explanation', text: STANZA_ERROR_TEXT },
+  { name: 'with no <text> at all', text: '' },
+];
+
 const cells = calls.flatMap((call) =>
-  existences.flatMap((existence) => probes.map((probe) => ({ call, existence, probe }))),
+  existences.flatMap((existence) =>
+    probes.flatMap((probe) => texts.map((text) => ({ call, existence, probe, text }))),
+  ),
 );
 
 describe('XMPP creates a MUC room from the write and push paths only', () => {
@@ -90,12 +103,15 @@ describe('XMPP creates a MUC room from the write and push paths only', () => {
     mockState.client = undefined;
   });
 
-  it.each(cells)('$call.name when $existence.name and $probe.name', async ({ call, existence, probe }) => {
+  it.each(cells)(
+    '$call.name when $existence.name and $probe.name $text.name',
+    async ({ call, existence, probe, text }) => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const fake = new FakeXmpp();
     fake.announceCreation = true; // only the creator's self-presence carries status 201
     fake.discoUnknownRoom = 'item-not-found'; // what a server answers about a room nobody created
     fake.discoProbe = probe.probe;
+    fake.stanzaErrorText = text.text;
     mockState.client = fake;
     const plugin = new XmppPlugin();
     await plugin.connect({ password: 'a-real-secret', nick: 'reader' });
@@ -145,10 +161,21 @@ describe('XMPP creates a MUC room from the write and push paths only', () => {
       expect(priv(plugin).joined.size).toBe(0);
       // And it does not park on a topic that cannot receive anything yet.
       expect(elapsed).toBeLessThan(250);
+      // The server ANSWERED this one: 'the room is not there' is a conclusive reading, so the
+      // operator is told nothing. Keep the absence assertion, so that the branch separating a
+      // conclusive item-not-found from a probe that failed is graded from BOTH sides — with only
+      // the reporting side asserted, a plugin reading the whole error message instead of its
+      // defined condition (`item-not-found - <the server's text>`) reports every absent room as
+      // unprobed and no row can see it.
+      expect(errors.mock.calls.map((c) => String(c[0])).join('\n')).not.toContain(
+        'could not establish whether',
+      );
     }
     await plugin.disconnect();
     vi.restoreAllMocks();
-  }, 15_000);
+    },
+    15_000,
+  );
 });
 
 describe('XMPP reads an absent topic as an empty, replayable page', () => {
