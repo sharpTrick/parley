@@ -143,6 +143,17 @@
    "unresolvable": 2,
    "selfInducedPct": 86,
    "note": "Run in three batches of five targets after twelve container reprovisions killed three all-or-nothing attempts. Same base for all three."
+  },
+  {
+   "round": 18,
+   "base": "e54346b",
+   "findings": 103,
+   "graded": 97,
+   "selfInduced": 86,
+   "preExisting": 11,
+   "unresolvable": 6,
+   "selfInducedPct": 89,
+   "note": "First round after a remediation that was fixes rather than decomposition, so blame inflation is far smaller than rounds 13/15/17 carried."
   }
  ],
  "comparison": {
@@ -246,9 +257,16 @@
     "selfInduced": 26,
     "preExisting": 4,
     "selfInducedPct": 87
+   },
+   {
+    "round": 18,
+    "blocking": 29,
+    "selfInduced": 28,
+    "preExisting": 1,
+    "selfInducedPct": 97
    }
   ],
-  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, 10 and 4. Round 16's 10 was the value that overturned the round 13/15 dip as a decomposition-blame artifact. Round 17 returns 4 -- the lowest since round 6 -- but it is a floor for the same reason those were: round 16's remediation moved a very large amount of code (the repo target alone was 55 files and -936 lines), and blame charges the mover. The pre-registered threshold is unchanged and NOT met: three or more consecutive scored rounds below 8 against a tree nobody is restructuring. Round 16 was 10 and round 17 is the first below 8 since then, so at most one of the three is in hand, and round 17's tree had just absorbed 39 fixes across every package.",
+  "reading": "Pre-existing BLOCKING findings per round: 36, 25, 20, 11, 5, 10, 9, 11, 8, then 6, 6, 10, 4 and 1. Round 18 is the lowest of the run by a wide margin: ONE pre-existing blocking finding out of 29, i.e. 97% of what the loop now finds is its own output. The pre-registered threshold is three or more consecutive scored rounds below 8 against a tree nobody is restructuring. Rounds 17 (4) and 18 (1) are the first two, and round 18's tree had absorbed fixes rather than a decomposition, so its blame inflation is much smaller than the rounds that preceded it. Round 19 is the third and decisive point. Stated before it runs: if round 19 comes in below 8 the threshold is met and the loop has demonstrably exhausted the pre-existing blocking population on this surface; if it returns to the 8-11 band the earlier dips were remediation artefacts and the run has NO exhaustion result.",
   "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects."
  },
  "inertRemediations": {

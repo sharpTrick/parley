@@ -1,0 +1,50 @@
+{
+ "round": 18,
+ "base": "e54346b",
+ "converged": false,
+ "blockingClean": false,
+ "wakeAll": true,
+ "wakeAllNote": "Run in two invocations: 15 targets, of which core-auth errored on a stale worktree PATH (the runner still carried the cloud container literal) and was re-dispatched against the same base. Every target reviewed exactly once at e54346b, so the round is wake-all as a whole.",
+ "counts": {
+  "total": 103,
+  "confirmed": 102,
+  "blocking": 31,
+  "plausible": 1
+ },
+ "byTarget": {
+  "core-seam": 7,
+  "core-engine": 3,
+  "sqlite": 6,
+  "redis": 10,
+  "postgres": 6,
+  "matrix": 7,
+  "xmpp": 8,
+  "nats": 6,
+  "zulip": 3,
+  "discord": 9,
+  "slack": 7,
+  "telegram": 6,
+  "shared": 7,
+  "repo": 10,
+  "core-auth": 8
+ },
+ "byLens": {
+  "test-integrity": 25,
+  "truth-in-docs": 18,
+  "security": 12,
+  "maintainability": 11,
+  "correctness": 9,
+  "design-principles": 8,
+  "concurrency-and-failure": 8,
+  "test-hygiene": 7,
+  "operability-and-release": 3,
+  "seam-integrity": 1,
+  "protocol-conformance": 1
+ },
+ "errored": [],
+ "tokens": 3237666,
+ "toolCalls": 985,
+ "wallMs": 8510730,
+ "quiescedTargets": [],
+ "nextQuiesced": []
+}

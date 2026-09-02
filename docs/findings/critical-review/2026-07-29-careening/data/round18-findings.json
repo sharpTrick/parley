@@ -2455,5 +2455,213 @@
    "interleavings": "Three orderings matter. (i) deadline fires, connect still pending, connect later succeeds \u2014 today: disconnect on a socketless client, then a live orphan; with the fix: the connect continuation closes it. (ii) deadline fires, connect later rejects \u2014 with the fix the continuation must tolerate a client that never opened, i.e. `.catch(() => undefined)` on the close. (iii) two callers on the new path: a `subscribe` and a `blockingRead` each hold their own reader and their own entry in `connecting`, and a `tearDown` between them must still skip both and leave each one's continuation to close it \u2014 this is the interleaving I did not exercise, and the reason this fix is untested.",
    "confidence": "untested"
   }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "architectural-guard-with-a-hole",
+  "class": "page-scanner-misses-partial-templates",
+  "file": "packages/bridge-core/src/auth/oauth-provider.test.ts",
+  "line": 1368,
+  "summary": "The guard that claims to check 'every interpolation of every page it renders, reachable or not' only scans template literals matching /<!doctype|<\\/[a-z]+>/i. A template that opens a tag and closes it in a different literal \u2014 the shape every row/partial helper takes \u2014 is invisible to it, so an unescaped attribute interpolation ships with the suite green.",
+  "failure": "Append to consent-page.ts:\n  const scopeRow = (s: string): string => `<li class=\"scope\" title=\"${s}\">`;\n  export function renderScopeList(scopes: string[]): string { return `<ul>` + scopes.map(scopeRow).join('') + `</ul>`; }\nThe `${s}` sits unescaped in a double-quoted attribute. Ran `npx vitest run packages/bridge-core/src/auth packages/bridge-core/src/transport`: 1495/1495 passed. A scope value of `\" onmouseover=alert(1) x=\"` would break out of the attribute on the page the owner types the passphrase into.",
+  "remediation": "In the `pages` builder, replace the `/<!doctype|<\\/[a-z]+>/i` document filter with: keep any template literal that contains a `<` AND at least one `${...}` interpolation. That is the property the guard is actually about (markup carrying interpolated data), and it does not depend on the literal being a whole document.",
+  "testUpgrade": "The class is 'an architectural guard whose subject list is derived by a heuristic that a legal refactor can fall outside of'. Guard it two ways at once: (1) widen the selector as above, and (2) add a self-test alongside it, in the shape hygiene.test.ts already uses for its skip rule \u2014 a SYNTHETIC table of source snippets with an `offends` column, including a partial-tag row (`` `<li title=\"${x}\">` ``), a whole-document row, a concatenated-render row, and a non-markup template row, asserting the selector reaches both verdicts. Without (2) the widened selector is itself a rule nobody has watched fail. Existing test too narrow: 'the auth layer escapes at every interpolation of every page it renders, reachable or not' \u2014 its `it('finds the interpolations to check')` floor only asserts >= 5 interpolations, which the three current whole-document literals already satisfy, so a new unscanned page never lowers it.",
+  "remediationCheck": {
+   "reliesOn": "The same `readdirSync(DIR)` + `[...source.matchAll(/`(?:[^`\\\\]|\\\\.)*`/g)]` scan already in the test; only the `.filter((t) => /<!doctype|<\\/[a-z]+>/i.test(t))` predicate changes. It also relies on the existing `bound` map from `/const (\\w+) = (.+);$/gm` to resolve a name to its escaping definition.",
+   "newlyAccepts": "none \u2014 the widened predicate is a strict superset of the current one for literals carrying interpolations",
+   "newlyRejects": "Any template literal in a non-test auth source that contains a `<` and an interpolation that does not pass through escapeHtml. I enumerated every such literal in the 13 sources: only three exist (the consent page, the refusal page, and the refusal body), all already scanned and all already escaped. The five other `<`-bearing literals (invariants.ts `/mcp<anything>`, oidc-discovery.ts `<issuer>/...` and `/realms/<realm>/...`, owner.ts `scrypt$N=..$<saltB64>$<hashB64>`, remote-auth.ts `Record<keyof RemoteAuthOptions, \u2026>`) are inside JSDoc and carry no `${}`, so the interpolation condition excludes them.",
+   "testsThatWouldFail": "none found \u2014 I enumerated every template literal in every non-test file under src/auth with a script and confirmed the widened rule changes no verdict on the current tree; and the widened rule still fails the 'consent-page.ts: ${consentId} is escaped' row when consent_id escaping is removed, which I verified as a killed mutation.",
+   "hidesOrFixes": "If applied while a partial-template render function already exists with an unescaped interpolation, the guard turns red and the escape must be added \u2014 it fixes the blind spot rather than hiding it. What stays broken is that the guard remains a source-regex: a page rendered from outside src/auth, or one built with String concatenation and no template literal at all, is still unseen.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "comment-declared-invariant-with-no-grader",
+  "class": "eviction-fallback-uncovered",
+  "file": "packages/bridge-core/src/auth/oauth-provider.ts",
+  "line": 355,
+  "summary": "rememberClient's `?? this.clients.keys().next().value` fallback carries a 'Keep the fall back...' comment but no test grades it. Deleting it leaves the whole suite green while the clients map silently grows past MAX_CLIENTS on the owner-approval path.",
+  "failure": "Mutate rememberClient to `const evictable = evictionCandidate(this.clients.keys(), this.clientStates(), this.now());` (drop the `?? this.clients.keys().next().value`). Ran the auth + transport + stated-bounds + config suites: 1898/1898 passed. With that mutation, a provider holding MAX_CLIENTS registrations that all carry live owner-approved state (100 completed consents, each with a 30-day refresh token) returns `undefined` from evictionCandidate, deletes nothing, and `this.clients.set(...)` grows the map to 101, 102, ... with no ceiling \u2014 the exact 'no anonymous caller can grow a store without a ceiling' property the suite asserts elsewhere, on a path it does not walk.",
+  "remediation": "Add a row to the 'ParleyOAuthProvider \u2014 the DCR cap never evicts a client that is in use' table that fills `clients` to MAX_CLIENTS with registrations each holding a live owner-approved credential, then completes one more consent for a fresh client_id, and asserts both that the new registration is present AND that `clients.size === MAX_CLIENTS`.",
+  "testUpgrade": "The class is 'a store-capping branch reachable only through an owner-authenticated path, so the anonymous-flood generator never walks it'. Parameterize over the two write paths into `clients` \u2014 clientsStore.registerClient (anonymous) and rememberClient (owner-approved) \u2014 crossed with the existing CLIENT_STATES shapes, and assert size <= MAX_CLIENTS after each. That widened generator would also catch a future third writer. Existing test too narrow: 'MAX_CLIENTS clients holding %s are refused a new registration rather than evicted' only drives registerClient, and 'a refused passphrase does not re-admit the evicted registration behind the consent' drives rememberClient only on the failure branch, where the fallback is never reached.",
+  "remediationCheck": {
+   "reliesOn": "The existing `peek(p).clients` accessor and `makeClient`/`makeParams`/`GOOD_PASS` helpers in oauth-provider.test.ts, and on `clientStates()` yielding `ownerApproved: true` for refresh records \u2014 the branch that makes evictionCandidate return undefined.",
+   "newlyAccepts": "none \u2014 test-only change, no production behaviour moves",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none found \u2014 I checked every row of the DCR-cap and anonymous-flood tables; none asserts clients.size after an owner approval into a fully-approved map, so adding the assertion cannot contradict an existing one.",
+   "hidesOrFixes": "Nothing is broken today: the fallback is present and the cap binds. This closes a coverage hole, so if a later change deletes the fallback the suite says so. It does not change the fact that the cap on `clients` is a shed-one-insert-one policy with no bound on how often the owner can churn it.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "inclusive-bound-left-ungraded",
+  "class": "ttl-equality-boundary-uncovered",
+  "file": "packages/bridge-core/src/auth/eviction.ts",
+  "line": 34,
+  "summary": "evictionCandidate's liveness test `state.expiresAtMs >= nowMs` sits at the exact equality tick that the repo's stated-bounds.test.ts exists to grade, and nothing grades it. Flipping it to `>` leaves the suite green and puts it out of step with the sweeper's `expiresAtMs < nowMs`, which keeps the same record.",
+  "failure": "Mutate eviction.ts line 34 to `state.expiresAtMs > nowMs`. Ran the auth + transport + stated-bounds + config suites: 1898/1898 passed. Under that mutation a client whose only credential expires at exactly `now` is classified as holding nothing and becomes a first-pass eviction candidate, while ParleyOAuthProvider.sweep and challengeForAuthorizationCode both still treat that record as live \u2014 the registration is evicted out from under a credential the rest of the provider will still honour for one tick.",
+  "remediation": "Add an eviction-liveness row to packages/bridge-core/src/stated-bounds.test.ts as a StatedBound with `legal: 'at-or-above'` and `bound: nowMs`, probing evictionCandidate directly at expiresAtMs = nowMs - 1, nowMs and nowMs + 1 with a single client state, and asserting the equality tick counts as live.",
+  "testUpgrade": "The class is 'a TTL comparison whose equality case decides whether two modules agree, tested only from the interior'. Generalise the stated-bounds table to carry the auth layer's four time comparisons as rows \u2014 evictionCandidate's `>=`, sweep's `<` on codes/redeeming/refresh/pending, sweep's `<` on access (seconds, not ms), and verifyAccessToken's `expiresAt < now/1000` \u2014 each probed at bound-1, bound, bound+1 and each asserting the same verdict at the equality tick. That widened generator also catches a unit mismatch (the access map is in seconds and the rest in milliseconds), which no current row would notice. Existing test too narrow: 'a client whose ... has expired becomes evictable again' drives an expiry far in the past, so it cannot see the boundary move by one.",
+  "remediationCheck": {
+   "reliesOn": "stated-bounds.test.ts's existing `StatedBound` interface and its three-cell (bound-1, bound, bound+1) driver; and on evictionCandidate being directly importable from ./auth/eviction.js, which stated-bounds.test.ts already does for MAX_CLIENTS/MAX_PENDING/shedCrowdedest.",
+   "newlyAccepts": "none \u2014 test-only change",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none found \u2014 I grepped every use of evictionCandidate and expiresAtMs in the auth tests; no existing row pins the equality tick in either direction, so a new row cannot contradict one.",
+   "hidesOrFixes": "Nothing is broken today: `>=` in eviction and `<` in the sweeper agree that a record expiring exactly now is still live. This makes that agreement a graded property rather than a coincidence. It does not address the underlying unit split (access records store seconds, every other store milliseconds), which remains a place a future edit can silently disagree with itself.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "absolute-claim-narrower-than-its-grader",
+  "class": "401-uniformity-overclaim",
+  "file": "docs/keycloak-integration.md",
+  "line": 196,
+  "summary": "'every 401 this server emits carries the same error message' is false: the SDK's requireBearerAuth answers a missing Authorization header with error_description=\"Missing Authorization header\" and a non-Bearer scheme with \"Invalid Authorization header format, expected 'Bearer TOKEN'\", both before OidcTokenVerifier runs. The test that names this sentence as the property it grades builds its table only from token-content defects, so it cannot fail on the two shapes that falsify it.",
+  "failure": "Against a booted OIDC front door: `POST /mcp` with no Authorization header returns 401 with `WWW-Authenticate: Bearer error=\"invalid_token\", error_description=\"Missing Authorization header\"`, while `POST /mcp` with `Authorization: Bearer <token signed by a rogue key>` returns 401 with `error_description=\"invalid or expired access token\"`. Two distinguishable 401 surfaces; the doc says there is one. Traced through node_modules/@modelcontextprotocol/sdk/dist/esm/server/auth/middleware/bearerAuth.js lines 13-19 and the REJECTIONS table at packages/bridge-core/src/auth/oidc-remote.test.ts:398-408, every row of which mints or names a token.",
+  "remediation": "Narrow the doc sentence to what the code delivers and what actually matters: 'every 401 this server emits about a PRESENTED TOKEN carries the same error message \u2014 an unauthorized caller who holds a token learns nothing about which check failed. A request with no Authorization header, or one that is not a Bearer credential, is answered by the SDK's own pre-verification 401 and is distinguishable, which reveals nothing the caller did not already know.'",
+  "testUpgrade": "The class is 'a doc sentence quantified over a set larger than the generator that grades it'. Extend the REJECTIONS generator in oidc-remote.test.ts to two labelled partitions rather than one list: a TOKEN_REJECTIONS partition (today's rows) asserted to collapse to exactly one surface, and a PRE_TOKEN_REJECTIONS partition (no header, `Authorization: Basic x`, `Authorization: Bearer` with no token, a lower-case `bearer` scheme) asserted only to be 401 and to leak no gate wording \u2014 plus an assertion that the doc paragraph's quantifier matches the partition the suite actually collapses. That last assertion is what stops the sentence and the table drifting apart again. Existing test too narrow: 'emits one and only one response surface across every rejection reason' says 'every rejection reason' in its own name while enumerating only token-content reasons.",
+  "remediationCheck": {
+   "reliesOn": "The SDK's bearerAuth catch block, which routes InvalidTokenError to `res.set('WWW-Authenticate', buildWwwAuthHeader(error.errorCode, error.message))` \u2014 the branch that echoes the message verbatim. Both pre-verifier throws are InvalidTokenError, so they take the same branch and differ only in text.",
+   "newlyAccepts": "none \u2014 doc + test change, no production behaviour moves",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none found \u2014 the existing 'emits one and only one response surface' row keeps passing verbatim because the new partition is asserted separately. I checked hygiene.test.ts's 'no doc describes an e2e gate the suite does not implement' rule: it only fires on paragraphs that name an *.e2e.test.ts path and mention a skip, so editing this Security-notes paragraph does not trip it.",
+   "hidesOrFixes": "If the doc is left as-is and only the test partition is added, the sentence stays false and an operator still reads a promise the server does not keep. Fixing the sentence is the load-bearing half; the test partition only stops it drifting again. Making the claim literally true instead \u2014 swallowing the SDK's pre-verifier messages \u2014 would mean wrapping requireBearerAuth and rewriting its WWW-Authenticate, which breaks the SDK's documented error contract for no security gain.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "id-token-accepted-as-access-token",
+  "class": "typless-idp-audience-trap-undocumented",
+  "file": "packages/bridge-core/src/auth/oidc-verifier.ts",
+  "line": 197,
+  "summary": "isAccessToken's last line accepts any token that stamps no `typ` and carries no nonce/at_hash/c_hash. That is a deliberate, tested decision, but it means the ID-token defence is inert for every IdP that does not stamp `typ` \u2014 and docs/keycloak-integration.md, which says 'any spec-compliant IdP works', never warns against the one config that turns it into a vulnerability: setting auth.oidc.audience to the connector's client_id.",
+  "failure": "Configure auth.oidc against a typ-less IdP (Auth0/Okta/Azure-style: JOSE header {alg, kid} with no typ, no `typ` claim) with `audience: \"<connector client_id>\"` and `allowed_subjects: [\"<user sub>\"]`. Present that user's ID token from the authorization-code flow \u2014 which per OIDC Core 3.1.3.6 need carry neither `nonce` (code flow) nor `at_hash` (OPTIONAL from the token endpoint) \u2014 as `Authorization: Bearer <id_token>`. isAccessToken returns true (declared = [], both `some` calls false, ID_TOKEN_ONLY_CLAIMS.every(...) true), aud matches, the subject gate passes, and the caller gets 200 and full MCP tool access from a login receipt. The repo already names this shape: packages/bridge-core/src/auth/keycloak.e2e.test.ts:260 calls audience==client_id 'exactly the vulnerable shape', but that test's defence is Keycloak's `typ: ID` claim, which a typ-less IdP does not emit.",
+  "remediation": "Two parts. (1) In docs/keycloak-integration.md's config reference, next to `audience:`, state plainly: never set this to your connector's client_id \u2014 an ID token's `aud` IS the client_id, and for an IdP that does not stamp `typ` on its tokens that makes a login receipt indistinguishable from an access token; use a dedicated audience string or the canonical resource URL. (2) Add an opt-in `auth.oidc.require_typed_access_token: true` that makes ACCESS_TOKEN_TYPES membership mandatory rather than merely decisive, for operators on an IdP that does stamp RFC 9068 `at+jwt`.",
+  "testUpgrade": "The class is 'a claim-shape heuristic whose defence is inert for a whole family of IdPs, with the residual visible only in a test comment'. Parameterize the KIND_MATRIX in oidc-token-kinds.test.ts over an ISSUER_STYLE axis \u2014 {stamps typ in the claim (Keycloak), stamps typ in the JOSE header only, stamps no typ at all} \u2014 crossed with the existing (nonce, at_hash, c_hash) shapes, and add an AUDIENCE axis {resource URL, dedicated string, the azp value}. The row (no typ, no id-only claims, aud === azp) is the one this finding is about; make it explicit and label it accepted-with-require_typed_access_token-off / refused-with-it-on, so the residual is a graded cell rather than a paragraph. Existing test too narrow: KIND_MATRIX's ['neither nonce nor at_hash', {}, [true, ...]] records the acceptance but says nothing about the audience configuration that makes it reachable.",
+  "remediationCheck": {
+   "reliesOn": "isAccessToken's existing three-step structure (deny-list, allow-list, claim-shape fallback) and ACCEPTED/NON_ACCESS_TOKEN_TYPES; the opt-in would short-circuit at step 2 by returning false when nothing positively declares an access token. It also relies on assertOidcPolicy already being the single boot-time gate for oidc config, which is where a new key's validation belongs.",
+   "newlyAccepts": "none",
+   "newlyRejects": "With require_typed_access_token off (the default), nothing changes. With it on, every token that stamps no typ at all is refused \u2014 including legitimate access tokens from IdPs that stamp nothing, which is why it must be opt-in and not the default. The doc half rejects nothing.",
+   "testsThatWouldFail": "none by default. Turning the flag on would break oidc-token-kinds.test.ts rows 'no typ at all carrying neither nonce nor at_hash' (expects accept) and every row of 'OidcTokenVerifier \u2014 signing-algorithm policy', whose mint() sets no typ \u2014 which is why the flag must default off and those rows must stay in the default-off partition of the new ISSUER_STYLE axis.",
+   "hidesOrFixes": "If only the doc half lands, the code still accepts an ID token from a typ-less IdP whenever the audience collides; the doc turns a silent trap into a documented one, which for a self-hosted single-tenant bridge is most of the value. If only the flag lands and nobody turns it on, nothing changes at all \u2014 the default cannot be flipped without breaking legitimate typ-less IdPs, so the doc is the load-bearing half and I am not claiming otherwise.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "design-principles",
+  "theme": "one-type-two-contracts",
+  "class": "union-with-mode-dependent-lifecycle",
+  "file": "packages/bridge-core/src/auth/remote-auth.ts",
+  "line": 24,
+  "summary": "createRemoteAuthApp returns RemoteAuthServer = OAuthRemoteServer | OidcRemoteServer, and the two halves have opposite close()/listen() contracts: builtin close() is terminal and a later listen() throws, oidc close() is idempotent and re-listenable. Which one a caller gets is decided by cfg.auth.mode, and nothing in the returned type says so.",
+  "failure": "const s = await createRemoteAuthApp(plugin, cfg, { publicUrl }); await s.listen(p); await s.close(); await s.listen(p2). With cfg.auth.mode 'oidc' this resolves and serves. With cfg.auth.mode 'builtin' it rejects with 'this remote auth app has been closed and cannot listen again'. Same call site, same static type, opposite outcome chosen by a YAML key. packages/bridge-core/src/auth/teardown.test.ts:60 encodes the divergence as expected via its `afterClose: 'terminal' | 're-listenable'` field, so the suite pins the astonishment rather than removing it.",
+  "remediation": "Make both front doors terminal. Give OidcRemoteServer the same `closed` guard remote.ts:141-150 already has, so that close() -> listen() throws in both modes, and state the contract once on RemoteAuthServer instead of on OAuthRemoteServer alone. A restart-after-close is not a use case either mode serves, and the OIDC door's close() already drops the transport's own state.",
+  "testUpgrade": "The class is 'a discriminated-union return whose members differ in a runtime contract the type does not discriminate'. Replace teardown.test.ts's per-factory `afterClose` field with a single invariant driven over FACTORIES: every remote-auth factory's close() is terminal, i.e. a second listen() rejects and arms no new interval. A new factory then inherits the assertion instead of being asked to declare which contract it picked \u2014 the `afterClose` field is exactly the ratchet that lets a divergence be recorded as intentional. Add a row for any future third mode automatically by deriving FACTORIES from the exported create*App surface, as testing/front-doors.ts already does for DoorName.",
+  "remediationCheck": {
+   "reliesOn": "remote.ts's existing pattern: a `let closed = false` captured by the Object.assign'd listen/close pair, wrapping `remote.listen.bind(remote)`. oidc-remote.ts already does `Object.assign(remote, {...})`, so the same three lines drop in without restructuring.",
+   "newlyAccepts": "none",
+   "newlyRejects": "A second listen() on an OIDC front door after close(), which today succeeds. I found no caller in the repo that does this outside teardown.test.ts \u2014 grepped the examples and the transport tests.",
+   "testsThatWouldFail": "packages/bridge-core/src/auth/teardown.test.ts, row \"createRemoteAuthApp (oidc)\" of \"a factory's close()/listen() contract matches the transport's\", which asserts the re-listenable branch (probe returns 200, rearmed.size > 0). That row must be changed to the terminal branch as part of the fix \u2014 it is the ratchet, not a witness.",
+   "hidesOrFixes": "If the code is left alone and only the doc is amended, the astonishment stays: a caller written against RemoteAuthServer still has to branch on cfg.auth.mode to know whether close() is recoverable. Note that the OIDC door's close() genuinely does release less than the builtin's (no provider sweeper, no rate-limiter stores), so making it terminal is a deliberate narrowing for uniformity, not a bug fix \u2014 I am not claiming it repairs a defect.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "comment-states-a-stronger-invariant-than-holds",
+  "class": "redirect-target-not-client-chosen",
+  "file": "packages/bridge-core/src/auth/consent-page.ts",
+  "line": 39,
+  "summary": "'The consent page leads with the redirect target because it is the one thing on the page the client cannot choose freely' \u2014 an anonymous DCR client chooses its own redirect_uris freely. The real property, which is what the design depends on, is that it cannot LIE about them: the code really does go where the page says.",
+  "failure": "POST /register with {\"redirect_uris\":[\"https://claude.ai.attacker.example/cb\"],\"client_name\":\"Claude\"} succeeds (201 \u2014 I confirmed DCR accepts arbitrary https redirect_uris; only the SDK's SafeUrlSchema blocks javascript:/data:). The consent page then leads with <strong>https://claude.ai.attacker.example</strong>, a string the client picked. A maintainer reading the comment concludes the leading line is server-controlled and may safely relax the escaping or the demotion of client_name; it is not.",
+  "remediation": "Restate the invariant as the one that holds, in both places it appears \u2014 consent-page.ts:39-43 and the REDIRECT_CORPUS preamble at packages/bridge-core/src/auth/remote.test.ts:825: 'The consent page leads with the redirect target because it is the one thing on the page the client cannot LIE about \u2014 the code really is sent there. The client picks it at registration, so it is still attacker-controlled text and is escaped like everything else.'",
+  "testUpgrade": "The class is 'a comment asserting a provenance (server-controlled vs client-controlled) that the escaping strategy is read against'. Rather than a new test, extend the existing INTERPOLATION_SITES table in oauth-provider.test.ts with a `provenance: 'client-supplied' | 'server-minted'` column and assert that every client-supplied site survives every HOSTILE_PAYLOAD \u2014 the redirect target is already a site there, so the column makes its provenance a graded fact next to the assertion instead of a claim in prose. A future site added with provenance 'server-minted' then has to justify itself against the table rather than against a paragraph.",
+  "remediationCheck": {
+   "reliesOn": "Nothing in the code path changes; the SDK's SafeUrlSchema at shared/auth.js:147 is what bounds which schemes reach the page, and the escaping in renderConsentPage is what bounds the rest.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none",
+   "testsThatWouldFail": "none \u2014 comment-only edit plus an optional table column. I checked hygiene.test.ts's BANNED_COMMENT_SHAPES: the replacement wording contains none of the six banned phrasings (no ticket ref, no 'Residual:', no 'Latent', no 'We deliberately', no leading 'Note:', no TODO/FIXME/XXX/HACK).",
+   "hidesOrFixes": "Nothing is broken in the code \u2014 the page is escaped and the demotion of client_name is correct. What stays broken if the comment is left alone is a future reader's model of who controls that line, which is the input to any decision to relax the escaping there.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
+ },
+ {
+  "target": "core-auth",
+  "dirs": [
+   "bridge-core"
+  ],
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-hygiene",
+  "theme": "fixture-restated-per-file",
+  "class": "freeport-duplicated-six-ways",
+  "file": "packages/bridge-core/src/auth/remote.test.ts",
+  "line": 1,
+  "summary": "Six byte-identical copies of `function freePort(): Promise<number>` live in src/auth (remote, oidc-remote, invariants, teardown, error-surface, keycloak.e2e), a seventh sits unexported in src/testing/front-doors.ts, and two more in examples/self-host-remote/test. The shared testing module that already owns fake-plugin, fake-oidc, front-doors and tool-cases already has the helper; it is just not exported.",
+  "failure": "Not a runtime failure \u2014 a review-cost failure. `grep -rln 'function freePort' packages examples` returns 9 files, 6 of them under src/auth. Every one opens a socket on port 0, reads AddressInfo, closes and resolves the port, with an identical TOCTOU window; a fix to that window (e.g. holding the socket until listen) has to be applied nine times or it is applied inconsistently, and a reviewer reading any one auth test file cannot tell whether this copy is the same as the others without diffing all six.",
+  "remediation": "Export `freePort` from packages/bridge-core/src/testing (the module that already holds front-doors.ts's private copy), and replace the six definitions under src/auth with an import. Leave the examples/ copies alone or point them at the same export, since src/testing is compiled into the tarball and already re-exported through the barrel for fake-oidc.",
+  "testUpgrade": "The class is 'a test fixture restated per file in a package that already ships a shared testing module'. Add a hygiene row alongside the existing auth-comment and skip-gate rules in packages/bridge-core/src/auth/hygiene.test.ts: scan every *.test.ts under src/** for a top-level `function <name>(` or `const <name> = ` whose body text is byte-identical (after whitespace normalisation) to a definition in another test file, and fail naming the duplicate pair. Driven off a glob rather than a list of known helper names, so the next helper to be copy-pasted \u2014 a `pkce()`, a `form()`, a `json()` \u2014 is caught the day it lands rather than after the sixth copy.",
+  "remediationCheck": {
+   "reliesOn": "src/testing being already compiled into dist (tsconfig excludes only src/**/*.test.ts) and already imported by auth tests \u2014 teardown.test.ts imports startFakeOidc from '../testing/fake-oidc.js' and error-surface.test.ts imports from '../testing/front-doors.js', so the import direction is established.",
+   "newlyAccepts": "none",
+   "newlyRejects": "none at runtime. The proposed hygiene rule would newly reject any future byte-identical helper pair across test files; I checked the current tree for other exact duplicates and freePort is the one that recurs six times, so the rule fires on exactly the thing it names and would need the six deletions landed first or it starts red.",
+   "testsThatWouldFail": "none from the extraction itself \u2014 the six bodies are byte-identical, so substituting one import changes no behaviour. The new hygiene rule WOULD fail on the current tree until the extraction lands; that ordering is the point (it must be watched failing against the duplication it is written about).",
+   "hidesOrFixes": "Nothing is functionally broken; six identical helpers behave identically today. What stays broken if this is skipped is that the auth directory's 1338- and 1630-line test files each carry their own boilerplate preamble, which is the cost that makes a human reviewer stop reading before the tail of the file \u2014 the decay this review's own staging exists to counter.",
+   "interleavings": "n/a",
+   "confidence": "traced"
+  }
  }
 ]
