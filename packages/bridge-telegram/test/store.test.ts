@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
+import * as journal from '../src/journal.js';
 import { keyOf, ObservedStore } from '../src/store.js';
 import { captureStderr, lineCount, record, storePath } from './rig.js';
 
@@ -727,5 +728,163 @@ describe('telegram ObservedStore durability', () => {
     expect(next?.seq).toBeGreaterThan(seqs.at(-1) as number);
     expect(reloaded.entries('-1').at(-1)?.content).toBe('later');
     reloaded.close();
+  });
+});
+
+
+/**
+ * WHICH damaged line costs the store its IDENTITY, and which costs only what the line remembered.
+ * Re-minting refuses every cursor an agent holds, on the one backend with no history endpoint that
+ * could re-derive them — so it has to be reserved for the damage that could otherwise make an
+ * observation sequence be stamped a second time. Only a record line, the identity line and the
+ * watermark line can do that; `#served`/`#evicted` carry neither a record nor a sequence.
+ *
+ * They were graded by whether `JSON.parse` happened to throw. `#served [not json` re-minted the
+ * identity and refused every outstanding cursor; `#served {"a":1}` — the same line, damaged the same
+ * way — was tolerated in silence. Neither verdict was chosen; both fell out of one unguarded
+ * `JSON.parse`, and no cell of any table in this file covered either line kind.
+ *
+ * So every kind states its verdict here, on both axes, and the coverage case below fails the day a
+ * `#`-prefixed line kind is declared without one.
+ */
+describe('telegram ObservedStore damage verdicts, per bookkeeping line kind', () => {
+  const EPOCH = 'a'.repeat(16);
+  const BASE = [
+    `#epoch ${EPOCH}`,
+    '#seq 2 2',
+    '#served ["-1000"]',
+    '#evicted ["-2000:7"]',
+    JSON.stringify(record('-1000', 1, 'a', 1)),
+    JSON.stringify(record('-1000', 2, 'b', 2)),
+  ];
+
+  interface Cell {
+    /** The line kind, spelled as its on-disk prefix; `''` is a record line. */
+    prefix: string;
+    name: string;
+    /** What the damaged line reads as, or `undefined` for a line that is simply gone. */
+    line: string | undefined;
+    /** Whether the store must mint a fresh identity — i.e. refuse every cursor in flight. */
+    remints: boolean;
+    /**
+     * Whether it must SAY the file did not load whole. Not the same as {@link remints}: a file
+     * carrying no identity at all is also a file that was never written, so that one mint is
+     * silent — the only cell where the two columns part company, and it is stated rather than
+     * derived so that a later divergence has to be written down.
+     */
+    announced: boolean;
+    /** Whether it must SAY the memory the line held is gone. A silent loss is the other defect. */
+    forgets: boolean;
+  }
+
+  const RECORD = JSON.stringify({ ...record('-1000', 2, 'b', 2), seq: '2' });
+
+  const BOOKKEEPING_DAMAGE: Cell[] = [
+    // A record line bears a sequence, so every way of damaging one is a re-mint.
+    { prefix: '', name: 'a record line removed', line: undefined, remints: true, announced: true, forgets: false },
+    { prefix: '', name: 'a truncated record line', line: '{"chat_id":"-1000","mess', remints: true, announced: true, forgets: false },
+    { prefix: '', name: 'a record line that is not JSON', line: 'not json at all', remints: true, announced: true, forgets: false },
+    { prefix: '', name: 'a record line of the wrong JSON type', line: '[1,2,3]', remints: true, announced: true, forgets: false },
+    { prefix: '', name: 'a record line with a field of the wrong type', line: RECORD, remints: true, announced: true, forgets: false },
+
+    // The identity line names the sequence space every cursor was minted against.
+    { prefix: '#epoch ', name: 'the identity line removed', line: undefined, remints: true, announced: false, forgets: false },
+    { prefix: '#epoch ', name: 'a truncated identity', line: '#epoch abc', remints: true, announced: true, forgets: false },
+    { prefix: '#epoch ', name: 'a non-hex identity', line: '#epoch zzzzzzzzzzzzzzzz', remints: true, announced: true, forgets: false },
+
+    // A watermark that cannot be READ is exactly the state under which a sequence is re-issued —
+    // but one that is simply absent from a file whose records are all present costs nothing.
+    { prefix: '#seq ', name: 'the watermark line removed', line: undefined, remints: true, announced: true, forgets: false },
+    { prefix: '#seq ', name: 'a non-numeric watermark', line: '#seq oops', remints: true, announced: true, forgets: false },
+    { prefix: '#seq ', name: 'a watermark of the wrong arity', line: '#seq 1 1 1', remints: true, announced: true, forgets: false },
+    { prefix: '#seq ', name: 'a watermark claiming more intact than issued', line: '#seq 1 5', remints: true, announced: true, forgets: false },
+
+    // Marks and dedup ids: memory, and no sequence. Damage costs the memory and says so.
+    { prefix: '#served ', name: 'the served marks removed', line: undefined, remints: false, announced: false, forgets: false },
+    { prefix: '#served ', name: 'a truncated served mark', line: '#served ["-1000"', remints: false, announced: false, forgets: true },
+    { prefix: '#served ', name: 'a served mark that is not JSON', line: '#served not json', remints: false, announced: false, forgets: true },
+    { prefix: '#served ', name: 'a served mark of the wrong JSON type', line: '#served {"a":1}', remints: false, announced: false, forgets: true },
+    { prefix: '#served ', name: 'a served mark holding something that is not an id', line: '#served ["-1000",5]', remints: false, announced: false, forgets: true },
+
+    { prefix: '#evicted ', name: 'the eviction memory removed', line: undefined, remints: false, announced: false, forgets: false },
+    { prefix: '#evicted ', name: 'a truncated eviction memory', line: '#evicted ["-2000:7"', remints: false, announced: false, forgets: true },
+    { prefix: '#evicted ', name: 'an eviction memory that is not JSON', line: '#evicted nope', remints: false, announced: false, forgets: true },
+    { prefix: '#evicted ', name: 'an eviction memory of the wrong JSON type', line: '#evicted 7', remints: false, announced: false, forgets: true },
+    { prefix: '#evicted ', name: 'an eviction memory holding something that is not an id', line: '#evicted [{"id":"x"}]', remints: false, announced: false, forgets: true },
+  ];
+
+  it.each(BOOKKEEPING_DAMAGE)(
+    'reloads a store carrying $name',
+    ({ prefix, line, remints, announced, forgets }) => {
+      const at = prefix === '' ? BASE.length - 1 : BASE.findIndex((l) => l.startsWith(prefix));
+      // Guard the fixture: a base file that stopped carrying this kind would grade nothing.
+      expect(at, 'the base file carries no line of this kind').toBeGreaterThanOrEqual(0);
+      const lines = [...BASE.slice(0, at), ...(line === undefined ? [] : [line]), ...BASE.slice(at + 1)];
+      writeFileSync(path, `${lines.join('\n')}\n`);
+      // The high-water sibling a real store keeps beside the file. Without it the watermark rows
+      // would be graded against a store that has no backstop, which is not the shape a bridge ever
+      // leaves behind — and the removed-watermark cell would read as harmless.
+      writeFileSync(`${path}.hw`, '2\n');
+
+      const stderr = captureStderr();
+      const store = new ObservedStore(path, 10, 10);
+      const said = stderr.join('');
+      expect({
+        remints: store.epoch() !== EPOCH,
+        announced: /did not load whole/.test(said),
+        forgets: /bookkeeping line that could not be read/.test(said),
+      }).toEqual({ remints, announced, forgets });
+      // Every cell but the record ones leaves the records themselves alone: the damage is to the
+      // bookkeeping, and a store that dropped history to repair a mark would be the worse failure.
+      if (prefix !== '') expect(store.entries('-1000').map((r) => r.content)).toEqual(['a', 'b']);
+      store.close();
+
+      // A damaged line the load reported must also LEAVE, or every later load repeats the report
+      // and the store never gets back to a file it can read whole.
+      stderr.length = 0;
+      const reloaded = new ObservedStore(path, 10, 10);
+      expect({
+        stable: reloaded.epoch() === store.epoch(),
+        repeats: /could not be read|did not load whole/.test(stderr.join('')),
+      }).toEqual({ stable: true, repeats: false });
+      reloaded.close();
+    },
+  );
+
+  /**
+   * The table above is only a table: a `#`-prefixed line kind added to the journal with no row here
+   * would inherit whichever verdict its parse failure happens to produce, which is the defect this
+   * describe exists about. Read off the DECLARATIONS rather than off the file they sit in, so that
+   * moving one cannot empty the check.
+   */
+  it('states a verdict for every bookkeeping line kind the journal declares', () => {
+    const declared = Object.entries(journal)
+      .filter(([name, value]) => name.endsWith('_LINE') && typeof value === 'string')
+      .map(([, value]) => value as string);
+    expect(declared.length).toBeGreaterThan(0);
+    const graded = new Set(BOOKKEEPING_DAMAGE.map((cell) => cell.prefix));
+    expect(declared.filter((prefix) => !graded.has(prefix))).toEqual([]);
+  });
+
+  /**
+   * And the loss the store now tolerates is a REAL loss, reported as one: the marks and the dedup
+   * ids the line carried are gone. What must not go with them is the cursor space — the whole point
+   * of separating the two verdicts.
+   */
+  it('keeps answering a cursor issued before a bookkeeping line was damaged', () => {
+    writeFileSync(path, `${BASE.join('\n')}\n`);
+    writeFileSync(`${path}.hw`, '2\n');
+    captureStderr();
+    const before = new ObservedStore(path, 10, 10);
+    const issued = `${before.epoch()}.${before.highWater()}`;
+    expect(before.has('-2000:7'), 'the fixture carries no eviction memory to lose').toBe(true);
+    before.close();
+
+    writeFileSync(path, `${BASE.map((l) => (l.startsWith('#evicted ') ? '#evicted [oops' : l)).join('\n')}\n`);
+    const after = new ObservedStore(path, 10, 10);
+    expect(`${after.epoch()}.${after.highWater()}`).toBe(issued);
+    // The dedup memory the line carried really is gone — the loss is reported, not pretended away.
+    expect(after.has('-2000:7')).toBe(false);
+    after.close();
   });
 });

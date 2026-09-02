@@ -66,11 +66,18 @@ export function mintEpoch(): string {
   return randomBytes(8).toString('hex');
 }
 
-/** The string ids a `#`-prefixed bookkeeping line carries, or none when it is garbled. */
+/**
+ * The string ids a `#`-prefixed bookkeeping line carries. Anything else is a damaged line — and it
+ * is damaged the same way whether the payload is not JSON at all, is JSON of the wrong type, or
+ * holds something that is not an id, so keep ONE verdict for all three: the loader forgets what the
+ * line held and says so, while the store's identity stands.
+ */
 export function parseIds(line: string, prefix: string): string[] {
   const ids = JSON.parse(line.slice(prefix.length)) as unknown;
-  if (!Array.isArray(ids)) return [];
-  return ids.filter((id): id is string => typeof id === 'string');
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) {
+    throw new Error('ObservedStore: unreadable bookkeeping line');
+  }
+  return ids as string[];
 }
 
 /**

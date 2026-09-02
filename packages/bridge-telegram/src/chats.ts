@@ -1,6 +1,6 @@
 import type { Topic } from '@sharptrick/parley-core';
 import type { BotApi } from './api.js';
-import { describe, type Diagnostics } from './diagnostics.js';
+import { describe, type Diagnostics, fromCaller } from './diagnostics.js';
 import { canonicalChatKey, NUMERIC_CHAT_ID } from './wire.js';
 
 /**
@@ -38,8 +38,9 @@ export class ChatResolver {
         // Report it here: core's presence loop swallows the rejection by design, so an
         // unresolvable presence topic is otherwise a bridge that beats to nobody, in silence.
         this.diagnostics.report(
-          `topic '${t}' resolves to no Telegram chat: ${describe(err)}`,
-          `unresolved-topic:${t}`,
+          `topic '${fromCaller(t)}' resolves to no Telegram chat: ${describe(err)}`,
+          'unresolved-topic',
+          t,
         );
         throw err;
       });
@@ -61,7 +62,7 @@ export class ChatResolver {
     if (!/^@[A-Za-z][A-Za-z0-9_]{3,31}$/.test(chat)) {
       return Promise.reject(
         new Error(
-          `TelegramPlugin: '${chat}' is not a Telegram chat id — use a numeric id or ` +
+          `TelegramPlugin: '${fromCaller(chat)}' is not a Telegram chat id — use a numeric id or ` +
             `'@channelusername', or map the topic via backend_config.chat_map`,
         ),
       );

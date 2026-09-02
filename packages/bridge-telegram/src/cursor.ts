@@ -1,4 +1,5 @@
 import { buildMessage, type Cursor, type Message, type Topic } from '@sharptrick/parley-core';
+import { fromCaller } from './diagnostics.js';
 import { keyOf, type ObservedStore, type StoredRecord } from './store.js';
 
 /**
@@ -17,7 +18,7 @@ export function requireOwnCursor(
   topic: Topic,
 ): number {
   const raw = since as string;
-  const named = `cursor '${raw}' for topic '${topic as string}'`;
+  const named = `cursor '${fromCaller(raw)}' for topic '${fromCaller(topic as string)}'`;
   if (/^\d+$/.test(raw)) {
     if (Number(raw) === 0) return 0;
     // A bare non-zero sequence carries no store identity, so nothing can say WHICH store's
@@ -33,7 +34,10 @@ export function requireOwnCursor(
   }
   const qualified = /^([0-9a-f]{16})\.(\d+)$/.exec(raw);
   if (qualified === null) {
-    throw new Error(`TelegramPlugin: malformed cursor '${raw}' for topic '${topic as string}'`);
+    throw new Error(
+      `TelegramPlugin: malformed cursor '${fromCaller(raw)}' for topic ` +
+        `'${fromCaller(topic as string)}'`,
+    );
   }
   if (qualified[1] !== store.epoch()) {
     throw new Error(
@@ -70,7 +74,7 @@ export function requireLimit(limit: number | undefined): number {
   if (limit === undefined) return 100;
   if (!Number.isFinite(limit)) {
     throw new Error(
-      `TelegramPlugin: fetchRecent limit must be a finite number — got ${String(limit)}`,
+      `TelegramPlugin: fetchRecent limit must be a finite number — got ${fromCaller(String(limit))}`,
     );
   }
   return Math.max(0, Math.floor(limit));

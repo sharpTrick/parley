@@ -1,4 +1,4 @@
-import { describe, Diagnostics } from './diagnostics.js';
+import { describe, Diagnostics, fromCaller } from './diagnostics.js';
 import {
   EPOCH_LINE,
   EVICTED_ID_LINE,
@@ -45,13 +45,25 @@ const EVICTED_ID_MEMORY = 1_000;
 export const SERVED_ID_MEMORY = 1_000;
 
 /**
+ * The bookkeeping lines that carry MEMORY and no observation sequence. Damage to one costs exactly
+ * what it remembered — a served mark, a dedup id — and is reported as that; keep it OFF the
+ * identity's re-mint path, so that a garbled duplicate-suppression line cannot refuse every cursor
+ * an agent holds, on the one backend whose history no endpoint can re-derive. Keep every other
+ * damaged line a re-mint, an unrecognized `#` line included, so that an unreadable watermark still
+ * refuses the cursors a re-stamped sequence would collide with.
+ */
+const MEMORY_ONLY_LINES: readonly string[] = [SERVED_ID_LINE, EVICTED_ID_LINE];
+
+/**
  * Keep an out-of-domain retention bound a hard failure rather than a substituted default, so that
  * an operator who asks for a narrow bound never silently gets the built-in wide one — a deep local
  * archive of every chat the bot is in, which is the opposite of what they configured.
  */
 function requirePositiveInt(name: string, value: number): number {
   if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`ObservedStore: ${name} must be a positive integer — got ${String(value)}`);
+    throw new Error(
+      `ObservedStore: ${name} must be a positive integer — got ${fromCaller(String(value))}`,
+    );
   }
   return value;
 }
@@ -144,6 +156,7 @@ export class ObservedStore {
     let intact = 0;
     let onDisk = 0;
     let dropped = torn;
+    let forgot = false;
     for (const line of raw.split('\n')) {
       if (line.trim() === '') continue;
       try {
@@ -163,7 +176,8 @@ export class ObservedStore {
           this.index(rec);
         }
       } catch {
-        dropped = true;
+        if (MEMORY_ONLY_LINES.some((prefix) => line.startsWith(prefix))) forgot = true;
+        else dropped = true;
       }
     }
     if (issued >= this.nextSeq) this.nextSeq = issued + 1;
@@ -176,7 +190,7 @@ export class ObservedStore {
     // watermarks match what it holds. Keep this after the torn-tail repair, so that the fragment is
     // never carried into the compacted output — and keep the replaced identity ON it, so that a
     // damaged file does not re-mint one on every later load.
-    const rewritten = torn || trimmed || lost;
+    const rewritten = torn || trimmed || lost || forgot;
     if (rewritten) {
       this.file.replace(this.journalText(epochId));
       this.evictedSinceRewrite = 0;
@@ -201,6 +215,15 @@ export class ObservedStore {
         `${this.file.path} did not load whole — ${cause}. Minted a fresh store identity ` +
           `${epochId}, so every cursor the previous one issued is refused instead of being answered ` +
           `out of a sequence this store would otherwise stamp twice.`,
+      );
+    }
+    if (forgot) {
+      this.diagnostics.report(
+        `${this.file.path} carried a bookkeeping line that could not be read — the served-chat ` +
+          `marks and the duplicate-suppression memory it held are gone, so a chat named only by an ` +
+          `earlier seam call can be evicted by the chat cap, and a message redelivered from before ` +
+          `this load can be served a second time. Every cursor this store issued still answers: ` +
+          `the line carried no observation sequence.`,
       );
     }
     return epochId;

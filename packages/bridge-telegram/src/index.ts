@@ -23,7 +23,7 @@ import {
   type TelegramBackendConfig,
 } from './config.js';
 import { recordToMessage, requireLimit, requireOwnCursor } from './cursor.js';
-import { describe, Diagnostics, plaintextWarning } from './diagnostics.js';
+import { describe, Diagnostics, fromCaller, plaintextWarning } from './diagnostics.js';
 import { pollUpdates } from './poll.js';
 import { keyOf, type ObservedRecord, ObservedStore } from './store.js';
 import { Waiters } from './waiters.js';
@@ -187,6 +187,7 @@ export class TelegramPlugin implements BackendPlugin {
     this.api.stop();
     this.subs.clear();
     this.chats = undefined;
+    this.diagnostics.forgetCallerKinds();
     this.waiters.wakeAll();
     this.store?.close();
     this.store = undefined;
@@ -232,10 +233,10 @@ export class TelegramPlugin implements BackendPlugin {
     const echoed = canonicalChatKey('Telegram POST /sendMessage → result', sent.chat.id);
     if (echoed !== chatId) {
       throw new Error(
-        `TelegramPlugin: topic '${topic as string}' resolves to chat ${chatId} and Telegram put the ` +
-          `message in chat ${echoed} (message_id ${sent.message_id}), so it exists there and is not ` +
-          `reachable through this topic — it was not recorded in the observed-message store at ` +
-          `'${this.storePath}'.`,
+        `TelegramPlugin: topic '${fromCaller(topic as string)}' resolves to chat ${chatId} and ` +
+          `Telegram put the message in chat ${echoed} (message_id ${sent.message_id}), so it ` +
+          `exists there and is not reachable through this topic — it was not recorded in the ` +
+          `observed-message store at '${this.storePath}'.`,
       );
     }
     const sentId = keyOf({ chat_id: chatId, message_id: sent.message_id });
