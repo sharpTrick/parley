@@ -36,7 +36,7 @@ off by default, so one created by a read would be permanent — and topic names 
 `post_topics`, which is a regex over names an untrusted inbound message can choose. A blocking read
 of a topic with no stream waits for one to appear rather than making it.
 
-`backendMsgId` is the sequence prefixed with the stream's incarnation, because a stream deleted and
+`backendMsgId` is an incarnation-qualified stream sequence, because a stream deleted and
 re-created out-of-band (`nats stream rm`, a storage reset) restarts its sequences at 1 — the bare
 sequence would hand core a dedup key it already holds, and core would drop the new stream's
 messages as duplicates. `post` reads that stamp back after its own ack, so a stream re-provisioned
@@ -47,7 +47,10 @@ read-back is deliberately best-effort — failing it must not tell a caller to s
 already landed — so one window remains: when the incarnation read itself fails, the id carries the
 last incarnation the plugin observed.
 
-The **cursor** carries the same incarnation, for the same reason on the read side: a persisted cursor
+The plugin mints ONE value and hands it back twice —
+an incarnation-qualified stream sequence as the cursor, and
+an incarnation-qualified stream sequence as the backendMsgId. The **cursor** carries that
+incarnation for the same reason the id does, on the read side: a persisted cursor
 naming a sequence of a stream that is gone is a position the new incarnation reaches again for
 entirely different messages. Catch-up compares the cursor's incarnation with the stream's, so a
 re-provisioned stream is recognised exactly — whether the new incarnation is shorter than the

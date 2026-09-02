@@ -2,7 +2,7 @@ import { asCursor } from '@sharptrick/parley-core';
 import type { Cursor, Message, Topic } from '@sharptrick/parley-core';
 import type { StreamConfig, StreamInfo } from 'nats';
 import { incarnationToken, UNKNOWN_INCARNATION } from './cursor.js';
-import { isStreamMissing } from './jetstream.js';
+import { isStreamAbsent, isStreamUnreachable } from './jetstream.js';
 import { assertCaptures, streamNameFor, subjectFor } from './naming.js';
 import { dec, rowToMessage } from './payload.js';
 import { NatsSession } from './session.js';
@@ -40,14 +40,16 @@ export abstract class NatsStreams extends NatsSession {
   /**
    * Run `op` against the topic's stream, re-provisioning the stream once if it vanished
    * out-of-band (`nats stream rm`, storage reset). `ensured` memoizes success, so without this a
-   * removed stream stays broken for the life of the process.
+   * removed stream stays broken for the life of the process. A 503 here may be an API outage rather
+   * than a removal, which is why the retry runs through `ensureStream`: under an outage its
+   * `streams.add` raises, so the outage reaches the caller instead of being answered.
    */
   protected async withStream<T>(topic: Topic, op: () => Promise<T>): Promise<T> {
     await this.ensureStream(topic);
     try {
       return await op();
     } catch (err) {
-      if (!isStreamMissing(err)) throw err;
+      if (!isStreamUnreachable(err)) throw err;
       this.ensured.delete(this.streamName(topic));
       await this.ensureStream(topic);
       return await op();
@@ -102,7 +104,7 @@ export abstract class NatsStreams extends NatsSession {
     try {
       info = await this.requireJsm().streams.info(name);
     } catch (err) {
-      if (!isStreamMissing(err)) throw err;
+      if (!isStreamAbsent(err)) throw err;
       await this.refuseRivalStream(name, subject);
       return undefined;
     }

@@ -239,14 +239,31 @@ describe('nats docs conformance', () => {
   });
 
   /**
-   * What a surface says a value IS, in the `<something> as the <role>` shape npm prose uses. The
-   * noun phrase stops at a conjunction, so a claim about one role cannot swallow the other's.
+   * What a surface says a value IS, in the two shapes this package's prose uses: `<phrase> as [the]
+   * <role>` and `<role> is <phrase>`. The noun phrase stops at a conjunction, so a claim about one
+   * role cannot swallow the other's. EVERY occurrence is returned, never the first: a surface that
+   * states the shape in one paragraph and contradicts it in the next is the drift this grades, and
+   * a check reading only the first claim reports the contradiction as agreement.
    */
-  const roleClaim = (text: string, role: string): string | undefined =>
-    new RegExp(`(?<![-\\w])((?:(?!\\b(?:as|and|or)\\b)[\\w-]+ ){0,6}[\\w-]+) as (?:the )?${role}\\b`, 'i')
-      .exec(text)?.[1]
-      ?.trim()
-      .toLowerCase();
+  const NOUN_PHRASE = '((?:(?!\\b(?:as|and|or|is)\\b)[\\w-]+ ){0,6}[\\w-]+)';
+  const roleClaims = (text: string, role: string): string[] =>
+    [
+      ...text.matchAll(new RegExp(`(?<![-\\w])${NOUN_PHRASE} as (?:the )?${role}\\b`, 'gi')),
+      ...text.matchAll(new RegExp(`${role}[^\\w]{0,3}\\bis (?!not\\b)${NOUN_PHRASE}`, 'gi')),
+    ].map((m) => (m[1] as string).trim().toLowerCase());
+
+  /**
+   * What a surface claims the two roles are. `no claim at all` is a VERDICT, not an exemption: a
+   * surface that stops using the graded phrasing has stopped being policed, and a check that
+   * returns early on it grades nothing while still counting as coverage — which is how the three
+   * rows below spent their whole life passing over three surfaces none of which they ever matched.
+   */
+  const describesOneValue = (text: string): 'one value' | 'two values' | 'no claim at all' => {
+    const cursorClaims = roleClaims(text, 'cursor');
+    const idClaims = roleClaims(text, 'backendMsgId');
+    if (cursorClaims.length === 0 || idClaims.length === 0) return 'no claim at all';
+    return new Set([...cursorClaims, ...idClaims]).size === 1 ? 'one value' : 'two values';
+  };
 
   const shapeSurfaces = [
     { name: 'README.md', text: readme },
@@ -262,10 +279,7 @@ describe('nats docs conformance', () => {
     });
 
     it(`${surface.name} does not describe the cursor and the backendMsgId as different values`, () => {
-      const cursorClaim = roleClaim(surface.text, 'cursor');
-      const idClaim = roleClaim(surface.text, 'backendMsgId');
-      if (cursorClaim === undefined || idClaim === undefined) return;
-      expect({ cursorClaim, idClaim }).toEqual({ cursorClaim, idClaim: cursorClaim });
+      expect(describesOneValue(surface.text)).toBe('one value');
     });
   }
 
@@ -274,18 +288,57 @@ describe('nats docs conformance', () => {
     expect(readme.match(new RegExp(`\`${shape}\``, 'g')) ?? []).toHaveLength(2);
   });
 
-  it('the differing-claim check reads a contrast and spares a shared one', () => {
-    const drifted =
-      'the per-topic stream sequence as the cursor and an incarnation-qualified sequence as the backendMsgId';
-    expect(roleClaim(drifted, 'cursor')).toBe('the per-topic stream sequence');
-    expect(roleClaim(drifted, 'backendMsgId')).toBe('an incarnation-qualified sequence');
-    expect(roleClaim(drifted, 'cursor')).not.toBe(roleClaim(drifted, 'backendMsgId'));
+  // Every way the drift can arrive, each stated as prose the check must NOT pass. The two that
+  // matter most are the last: a surface that says nothing in the graded shape, and one that names
+  // only one of the two roles — because those are the ones an early return used to wave through.
+  const roleFixtures: { name: string; text: string; verdict: string }[] = [
+    {
+      name: 'both roles carry the same phrase',
+      text: 'an incarnation-qualified sequence as the cursor, and an incarnation-qualified sequence as the backendMsgId',
+      verdict: 'one value',
+    },
+    {
+      name: 'a bare cursor against a qualified id',
+      text: 'the per-topic stream sequence as the cursor and an incarnation-qualified sequence as the backendMsgId',
+      verdict: 'two values',
+    },
+    {
+      name: 'a qualified cursor against a bare id',
+      text: 'an incarnation-qualified sequence as the cursor and the raw stream sequence as the backendMsgId',
+      verdict: 'two values',
+    },
+    {
+      name: 'prose naming both roles in no graded shape at all',
+      text: 'the cursor and the backendMsgId are both the stream sequence, incarnation and all',
+      verdict: 'no claim at all',
+    },
+    {
+      name: 'only the cursor named in the graded shape',
+      text: 'an incarnation-qualified sequence as the cursor, while the backendMsgId goes undescribed',
+      verdict: 'no claim at all',
+    },
+    {
+      name: 'a surface that agrees once and contradicts itself later',
+      text: 'an incarnation-qualified sequence as the cursor and an incarnation-qualified sequence as the backendMsgId. The cursor is the bare stream sequence and carries no incarnation.',
+      verdict: 'two values',
+    },
+    {
+      name: 'a role described in the `<role> is <phrase>` shape by both surfaces',
+      text: 'the cursor is an incarnation-qualified sequence, and the backendMsgId is an incarnation-qualified sequence',
+      verdict: 'one value',
+    },
+    {
+      name: 'a denial of the wrong shape, which the text is doing its job by stating',
+      text: 'an incarnation-qualified sequence as the cursor and an incarnation-qualified sequence as the backendMsgId. The cursor is not a bare sequence.',
+      verdict: 'one value',
+    },
+  ];
 
-    const shared =
-      'an incarnation-qualified sequence as the cursor, and an incarnation-qualified sequence as the backendMsgId';
-    expect(roleClaim(shared, 'cursor')).toBe('an incarnation-qualified sequence');
-    expect(roleClaim(shared, 'backendMsgId')).toBe(roleClaim(shared, 'cursor'));
-  });
+  for (const fixture of roleFixtures) {
+    it(`the differing-claim check calls ${fixture.name} "${fixture.verdict}"`, () => {
+      expect(describesOneValue(fixture.text)).toBe(fixture.verdict);
+    });
+  }
 
   // A stated SYMPTOM is a claim like any other, and the wrong symptom is worse than none: an operator
   // told a prefix mismatch splits history hunts for two halves of a conversation, while the bridge in
@@ -351,4 +404,57 @@ describe('nats docs conformance', () => {
     expect(documentsKey('  token: "…"', 'token')).toBe(true);
     expect(documentsKey('a token is passed through', 'token')).toBe(false);
   });
+
+  // Class: an extractor graded only on synthetic strings can be perfect and still match nothing any
+  // real surface says — the check above it then passes forever while asserting nothing, and counts
+  // as coverage for the claim it was written to police. Every extractor in this file is listed here
+  // against the surfaces it must actually reach; the `on` lists are derived from the surface lists
+  // above rather than retyped, so a surface added later is probed by default, and an extractor added
+  // later is graded the moment it is registered here.
+  const claimCarriers = claimSurfaces.filter((s) => serverClaims.some((c) => s.text.includes(c.text)));
+
+  const extractorProbes: {
+    name: string;
+    on: { name: string; text: string }[];
+    finds: (surface: { name: string; text: string }) => boolean;
+  }[] = [
+    {
+      name: 'roleClaims reads a cursor claim',
+      on: shapeSurfaces,
+      finds: (s) => roleClaims(s.text, 'cursor').length > 0,
+    },
+    {
+      name: 'roleClaims reads a backendMsgId claim',
+      on: shapeSurfaces,
+      finds: (s) => roleClaims(s.text, 'backendMsgId').length > 0,
+    },
+    {
+      name: 'proseLines reaches the registered claim its surface carries',
+      on: claimCarriers,
+      finds: (s) => proseLines(s).some((line) => serverClaims.some((c) => line.includes(c.text))),
+    },
+    {
+      name: 'assertions sees a banned claim planted in the surface itself',
+      on: surfaces,
+      finds: (s) => assertions(`${s.text}\nthe range is dense`, 'dense').length === 1,
+    },
+    {
+      name: 'configBlock reads a block holding every declared key',
+      on: [{ name: 'README.md', text: readme }],
+      finds: (s) => declaredKeys.every((key) => documentsKey(configBlock(s.text), key)),
+    },
+  ];
+
+  it('every extractor is probed against surfaces that exist', () => {
+    expect(claimCarriers.length).toBeGreaterThan(1);
+    expect(extractorProbes.filter((p) => p.on.length === 0).map((p) => p.name)).toEqual([]);
+  });
+
+  for (const probe of extractorProbes) {
+    for (const surface of probe.on) {
+      it(`${probe.name} — on ${surface.name}`, () => {
+        expect(probe.finds(surface)).toBe(true);
+      });
+    }
+  }
 });

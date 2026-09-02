@@ -173,6 +173,16 @@ describe('nats backendMsgId survives a stream re-provisioned under it', () => {
         fake.state.getMessageMissing = 1;
       },
     },
+    {
+      // The SAME 404 as the row above, worded stream-level: whatever held the acked sequence is
+      // gone, so the id is no more provable than if the sequence had been empty.
+      name: 'the read of the acked sequence finds the stream itself gone',
+      outcome: 'rejects',
+      arm: (fake) => {
+        reprovision(fake);
+        fake.state.getMessageStreamGone = 1;
+      },
+    },
   ];
 
   /**

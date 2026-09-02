@@ -13,6 +13,25 @@ const enc = new TextEncoder();
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * A JetStream failure as nats.js hands one over: the status `code` AND the server's wording. A fake
+ * that throws only the wording certifies a classifier that reads only the wording — and the two
+ * faults this plugin must tell apart share their wording far more often than their code.
+ */
+const jsError = (code: string, message: string): Error =>
+  Object.assign(new Error(message), { code });
+
+/**
+ * What each surface answers for a stream that is not there, measured against a 2.10 server:
+ * the manager 404s, the data plane has nobody to ask and 503s — the SAME 503 a JetStream API
+ * outage produces. `jetstream-agreement.ts` pins these against the real server.
+ */
+export const STREAM_GONE = {
+  manager: (): Error => jsError('404', 'stream not found'),
+  pull: (): Error => jsError('503', 'no responders'),
+  publish: (): Error => jsError('503', '503'),
+};
+
+/**
  * NATS subject interest, implemented here rather than imported from the plugin: this is the rule the
  * fake GRADES the plugin's reads against, and a matcher shared with the code under test agrees with
  * that code's own mistakes.
@@ -86,7 +105,13 @@ export interface FakeState {
   /** How `streams.add` fails: the name is taken, or another stream already captures the subject. */
   addFails?: 'name-in-use' | 'subject-overlap';
   /** Where the fault is injected on the read path. */
-  failOn: 'get' | 'fetch' | 'iterate' | null;
+  failOn: 'info' | 'get' | 'fetch' | 'iterate' | null;
+  /**
+   * An error of the caller's OWN shape, thrown at `at` instead of the answer. `failOn` fixes the
+   * wording; this axis fixes the `code`/wording PAIR a classifier actually reads, which is the only
+   * thing separating an absent stream from a JetStream API outage.
+   */
+  injectAt?: { at: 'streams.info' | 'consumers.add' | 'consumers.get' | 'fetch'; code?: string; message: string };
   /**
    * Make a pull that is CLOSED mid-wait throw, the way a real one closed under a disconnect does —
    * the termination a long-poll must swallow, and the only way to tell it apart from a fault.
@@ -115,6 +140,8 @@ export interface FakeState {
   swapRecordsTo?: (held: FakeRecord[]) => FakeRecord[];
   /** How many `streams.info` calls have been served — for arming `swapCreatedOnInfoCall` mid-run. */
   infoCalls: number;
+  /** How many `streams.info` calls were ATTEMPTED, faults included — what a poll loop spends. */
+  infoAttempts: number;
   /** How many `streams.info` calls fail outright — the post-ack incarnation read `post` swallows. */
   infoFailures: number;
   /**
@@ -126,6 +153,8 @@ export interface FakeState {
   streamMissingAfterMs: number;
   /** How many `streams.getMessage` calls report no message found. */
   getMessageMissing: number;
+  /** How many `streams.getMessage` calls report the STREAM gone — the other 404 the same call has. */
+  getMessageStreamGone: number;
   /** How many `publish` calls report the stream as gone — the out-of-band-removal path. */
   publishMissing: number;
   /** Every ephemeral consumer created / destroyed, for leak assertions. */
@@ -164,8 +193,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     swallowGeneration: 1,
     streamCreated: '2026-01-01T00:00:00.000000000Z',
     getMessageMissing: 0,
+    getMessageStreamGone: 0,
     publishMissing: 0,
     infoCalls: 0,
+    infoAttempts: 0,
     infoFailures: 0,
     streamMissingAfterMs: 0,
     created: [],
@@ -184,12 +215,25 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
     if (state.latencyMs > 0) await delay(state.latencyMs);
   };
 
-  /** Fire the one-shot removal if it is armed for `point`, then disarm it so the retry succeeds. */
+  /**
+   * Fire the armed removal if it is armed for `point`. The stream STAYS gone — a `nats stream rm`
+   * is not a blip — so every later call answers as {@link STREAM_GONE} says its surface does.
+   */
   const streamMissingAt = async (point: FakeState['streamMissingOn']): Promise<void> => {
     if (state.streamMissingOn !== point) return;
     state.streamMissingOn = undefined;
     await delay(state.streamMissingAfterMs);
-    throw new Error('stream not found');
+    state.streamAbsent = true;
+    throw point === 'fetch' ? STREAM_GONE.pull() : STREAM_GONE.manager();
+  };
+
+  /** Throw the caller's own error shape if `injectAt` is armed for `at`. */
+  const injected = (at: NonNullable<FakeState['injectAt']>['at']): void => {
+    const fault = state.injectAt;
+    if (fault?.at !== at) return;
+    const err = new Error(fault.message);
+    if (fault.code !== undefined) Object.assign(err, { code: fault.code });
+    throw err;
   };
 
   const subjectOf = (r: FakeRecord): string => r.subject ?? state.subject;
@@ -206,9 +250,11 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       add: async (cfg: { name?: string; max_age?: number; subjects?: string[] }) => {
         await hop();
         state.addCalls += 1;
-        if (state.addFails === 'name-in-use') throw new Error('stream name already in use');
+        if (state.addFails === 'name-in-use') {
+          throw jsError('400', 'stream name already in use with a different configuration');
+        }
         if (state.addFails === 'subject-overlap') {
-          throw new Error('subjects overlap with an existing stream');
+          throw jsError('400', 'subjects overlap with an existing stream');
         }
         state.added = cfg;
         state.streamAbsent = false;
@@ -222,7 +268,10 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       },
       info: async () => {
         await hop();
-        if (state.streamAbsent) throw new Error('stream not found');
+        state.infoAttempts += 1;
+        injected('streams.info');
+        if (state.failOn === 'info') throw new Error('injected: streams.info failed');
+        if (state.streamAbsent) throw STREAM_GONE.manager();
         if (state.infoFailures > 0) {
           state.infoFailures -= 1;
           throw new Error('injected: streams.info failed');
@@ -247,16 +296,23 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       },
       getMessage: async (_stream: string, req: { seq?: number; last_by_subj?: string }) => {
         await hop();
+        // A stream that is gone answers the SAME 404 as a sequence that holds nothing, with other
+        // wording — the pair a message-level classifier must not read as "that sequence is empty".
+        if (state.streamAbsent) throw STREAM_GONE.manager();
+        if (state.getMessageStreamGone > 0) {
+          state.getMessageStreamGone -= 1;
+          throw STREAM_GONE.manager();
+        }
         if (state.getMessageMissing > 0) {
           state.getMessageMissing -= 1;
-          throw new Error('no message found');
+          throw jsError('404', 'no message found');
         }
         const subj = req.last_by_subj;
         const found =
           req.seq === undefined
             ? state.records.filter((r) => subj !== undefined && subjectMatches(subj, subjectOf(r))).at(-1)
             : state.records.find((r) => r.seq === req.seq);
-        if (found === undefined) throw new Error('no message found');
+        if (found === undefined) throw jsError('404', 'no message found');
         return { seq: found.seq, data: enc.encode(found.data) };
       },
     },
@@ -264,6 +320,8 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       add: async (_stream: string, cfg: { opt_start_seq?: number; filter_subject?: string }) => {
         await hop();
         await streamMissingAt('consumers.add');
+        injected('consumers.add');
+        if (state.streamAbsent) throw STREAM_GONE.manager();
         const name = `c${++n}`;
         state.created.push(name);
         state.lastStart = cfg.opt_start_seq ?? 0;
@@ -284,6 +342,8 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       get: async () => {
         await hop();
         await streamMissingAt('consumers.get');
+        injected('consumers.get');
+        if (state.streamAbsent) throw STREAM_GONE.manager();
         if (state.failOn === 'get') throw new Error('injected: consumers.get failed');
         const start = state.lastStart;
         const filter = state.lastFilter;
@@ -337,6 +397,8 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
           },
           fetch: async ({ max_messages }: { max_messages: number }) => {
             await streamMissingAt('fetch');
+            injected('fetch');
+            if (state.streamAbsent) throw STREAM_GONE.pull();
             if (state.failOn === 'fetch') throw new Error('injected: fetch failed');
             state.maxMessages.push(max_messages);
             const window = state.records
@@ -387,8 +449,9 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
       await hop();
       if (state.publishMissing > 0) {
         state.publishMissing -= 1;
-        throw new Error('503 no responders — stream not found');
+        throw STREAM_GONE.publish();
       }
+      if (state.streamAbsent) throw STREAM_GONE.publish();
       // Keep `visibleTail` in the high-water mark: a sequence a delete left behind is spent, and a
       // fake that hands it out again models a server that reuses sequence numbers — which is the one
       // thing this plugin's cursor and dedup key are built on never happening.

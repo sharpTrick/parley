@@ -97,14 +97,36 @@ export async function closeOnConsumerLoss(iter: ConsumerMessages): Promise<void>
   }
 }
 
+const statusOf = (err: unknown): unknown => (err as { code?: unknown }).code;
+
+/**
+ * JetStream names a fault with a status CODE and its own wording, and only the PAIR identifies one:
+ * the API answers an absent stream 404 and an outage 503, while any message text may carry either
+ * number (a port, a byte count, a topic called `alerts-503`). Keep both halves, so that neither
+ * decides alone and an unrecognised shape reaches the caller instead of being sorted into the
+ * nearest bucket.
+ */
 const reports = (err: unknown, code: string, wording: RegExp): boolean =>
-  (err as { code?: unknown }).code === code ||
-  wording.test(err instanceof Error ? err.message : String(err));
+  statusOf(err) === code && wording.test(err instanceof Error ? err.message : String(err));
 
-/** JetStream's answer when a sequence holds nothing, as opposed to a read that could not be made. */
+/** The manager's answer when the stream is there and that sequence or subject holds nothing. */
 export const isMessageMissing = (err: unknown): boolean =>
-  reports(err, '404', /no message found|message not found|404/i);
+  reports(err, '404', /no message found|message not found/i);
 
-/** A stream that vanished out-of-band: JetStream 404s the manager and 503s the publish. */
-export const isStreamMissing = (err: unknown): boolean =>
-  reports(err, '503', /stream not found|no responders|503/i);
+/**
+ * The manager's answer when the STREAM is not there. Keep the 503 out of it: a JetStream API outage
+ * — meta-leader election, JS de-permissioned on the account, a partition — answers 503 on the same
+ * calls, and an outage read as an absent topic is a bridge that says "nothing new" for its duration.
+ */
+export const isStreamAbsent = (err: unknown): boolean => reports(err, '404', /stream not found/i);
+
+/**
+ * Nothing answered the JetStream request — the status alone says so, and nats.js words it both
+ * `503` and `no responders`. A removed stream and an API outage both produce it, on the publish and
+ * pull surfaces alike, so it narrows and never decides: only the manager tells them apart.
+ */
+export const isNoResponder = (err: unknown): boolean => statusOf(err) === '503';
+
+/** Either answer a call gets for a stream that is gone — with {@link isNoResponder}'s ambiguity. */
+export const isStreamUnreachable = (err: unknown): boolean =>
+  isStreamAbsent(err) || isNoResponder(err);

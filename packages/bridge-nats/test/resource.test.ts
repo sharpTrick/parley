@@ -16,7 +16,7 @@ import { fakeJetStream, injectFake, payload } from './fake-jetstream.js';
 // cannot be traded for silencing a real fault.
 const TOPIC = asTopic('leak');
 
-const faults: ('get' | 'fetch' | 'iterate')[] = ['get', 'fetch', 'iterate'];
+const faults: ('info' | 'get' | 'fetch' | 'iterate')[] = ['info', 'get', 'fetch', 'iterate'];
 
 const readShapes: {
   name: string;
@@ -54,8 +54,10 @@ describe('nats reads — a backend fault is a fault on every read shape', () => 
           failOn === null ? 'resolved' : 'rejected',
         );
 
-        // Class 1 rides along on every cell: whatever the outcome, nothing is left behind.
-        expect(fake.state.created.length).toBeGreaterThanOrEqual(1);
+        // Class 1 rides along on every cell: whatever the outcome, nothing is left behind. A fault
+        // at the stream gate is answered before any consumer exists; every other point is past it,
+        // so the equality below cannot be satisfied by two empty lists.
+        expect(fake.state.created.length > 0).toBe(failOn !== 'info');
         expect(fake.state.deleted).toEqual(fake.state.created);
       });
     }
@@ -89,6 +91,135 @@ describe('nats reads — a backend fault is a fault on every read shape', () => 
       expect(fake.state.deleted).toEqual(fake.state.created);
     }, 20_000);
   }
+});
+
+// Class: a read classifies a backend fault by what the server ACTUALLY answered — the status code
+// AND the wording, together — and returns an empty page for the one shape that means "this topic has
+// no stream". JetStream answers an absent stream 404 and an API outage 503 on the very same manager
+// calls, so a classifier reading either half alone turns an outage, a de-permissioned account or a
+// partition into a bridge that reports "nothing new" for as long as it lasts. Driven over the
+// injection POINT as well as the shape, because the manager and the pull do not report one removal
+// the same way: the manager 404s and the pull, having nobody to ask, 503s exactly as an outage does.
+const errorShapes: {
+  point: NonNullable<import('./fake-jetstream.js').FakeState['injectAt']>['at'];
+  code?: string;
+  message: string;
+  outcome: 'resolved' | 'rejected';
+  why: string;
+}[] = [
+  { point: 'streams.info', code: '404', message: 'stream not found', outcome: 'resolved', why: 'the absent topic' },
+  { point: 'streams.info', code: '404', message: 'stream not found (PARLEY_leak)', outcome: 'resolved', why: 'the absent topic, named' },
+  { point: 'streams.info', code: '503', message: '503', outcome: 'rejected', why: 'the JetStream API has no responder' },
+  { point: 'streams.info', code: '503', message: 'no responders', outcome: 'rejected', why: 'the same outage, worded' },
+  { point: 'streams.info', code: '503', message: 'stream not found', outcome: 'rejected', why: 'wording alone must not decide' },
+  { point: 'streams.info', code: '404', message: 'no message found', outcome: 'rejected', why: 'a message-level 404 is not an absent stream' },
+  { point: 'streams.info', message: 'stream not found', outcome: 'rejected', why: 'no status at all is not a status' },
+  { point: 'streams.info', message: 'connect ECONNREFUSED 10.0.0.1:5031', outcome: 'rejected', why: 'the link, not the stream' },
+  { point: 'streams.info', message: 'JetStream API 404 for topic alerts-503', outcome: 'rejected', why: 'digits in prose are not a code' },
+  { point: 'consumers.add', code: '404', message: 'stream not found', outcome: 'resolved', why: 'removed between the info and the consumer' },
+  { point: 'consumers.add', code: '503', message: '503', outcome: 'rejected', why: 'an outage between the info and the consumer' },
+  { point: 'consumers.get', code: '404', message: 'stream not found', outcome: 'resolved', why: 'removed before the consumer is opened' },
+  { point: 'consumers.get', code: '503', message: 'no responders', outcome: 'rejected', why: 'an outage before the consumer is opened' },
+  { point: 'fetch', code: '404', message: 'stream not found', outcome: 'resolved', why: 'removed at the pull' },
+  { point: 'fetch', code: '503', message: 'no responders', outcome: 'rejected', why: 'the pull cannot tell them apart, so the manager is asked' },
+  { point: 'fetch', code: '503', message: '503', outcome: 'rejected', why: 'the same, worded as the server sends it' },
+  { point: 'fetch', message: 'injected: fetch failed', outcome: 'rejected', why: 'an unrelated pull failure' },
+];
+
+describe('nats reads — an outage is not an absent topic, on every read shape', () => {
+  for (const shape of readShapes) {
+    for (const row of errorShapes) {
+      it(`${shape.name}: ${row.code ?? 'no code'}/"${row.message}" at ${row.point} ${row.outcome} — ${row.why}`, async () => {
+        const fake = fakeJetStream({
+          records: [
+            { seq: 1, data: payload('a') },
+            { seq: 2, data: payload('b') },
+            { seq: 3, data: payload('c') },
+          ],
+          injectAt: { at: row.point, ...(row.code === undefined ? {} : { code: row.code }), message: row.message },
+        });
+        const plugin = new NatsPlugin();
+        injectFake(plugin, fake, TOPIC);
+
+        const page = await plugin.fetchRecent(shape.args).then(
+          (p) => p,
+          () => undefined,
+        );
+
+        expect(page === undefined ? 'rejected' : 'resolved').toBe(row.outcome);
+        if (page !== undefined) {
+          expect(page.messages).toEqual([]);
+          expect(String(page.nextCursor)).toBe(String(shape.args.since ?? '0'));
+        }
+        expect(fake.state.deleted).toEqual(fake.state.created);
+      }, 20_000);
+    }
+  }
+
+  // The pull's 503 is the shape with no answer of its own: what settles it is the manager, and this
+  // pair is the only thing that keeps the settling honest — both rows inject the IDENTICAL error.
+  const managerSays: { name: string; removes: boolean; outcome: 'resolved' | 'rejected' }[] = [
+    { name: 'the stream is really gone', removes: true, outcome: 'resolved' },
+    { name: 'the stream is still there', removes: false, outcome: 'rejected' },
+  ];
+  for (const verdict of managerSays) {
+    it(`a 503 at the pull ${verdict.outcome} when ${verdict.name}`, async () => {
+      const records = [{ seq: 1, data: payload('a') }, { seq: 2, data: payload('b') }];
+      const fake = verdict.removes
+        ? fakeJetStream({ records, streamMissingOn: 'fetch' })
+        : fakeJetStream({ records, injectAt: { at: 'fetch', code: '503', message: 'no responders' } });
+      const plugin = new NatsPlugin();
+      injectFake(plugin, fake, TOPIC);
+      const since = asCursor('20260101T000000000000000Z-1');
+
+      const page = await plugin
+        .fetchRecent({ topic: TOPIC, since })
+        .then((p) => p, () => undefined);
+
+      expect(page === undefined ? 'rejected' : 'resolved').toBe(verdict.outcome);
+      if (page !== undefined) expect(String(page.nextCursor)).toBe(String(since));
+    });
+  }
+
+  // `withStream` retries on the manager's 404 as well as on the publish's 503: `streamInfo` is a
+  // MANAGER call, and only the publish surface ever reports a removal as 503.
+  it('a subscribe whose stream vanished before it read the tail re-provisions it', async () => {
+    const fake = fakeJetStream({ records: [], streamAbsent: true });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake, TOPIC);
+
+    await plugin.subscribe(TOPIC, () => undefined);
+
+    expect(fake.state.addCalls).toBe(1);
+    await plugin.disconnect();
+  });
+
+  // A long-poll must not spend its budget re-asking a question the server already answered with a
+  // fault: counted in calls rather than milliseconds, so ten agents on one box cannot grade it.
+  it('a blocking read stops asking after ONE outage answer instead of polling out its budget', async () => {
+    const fake = fakeJetStream({
+      records: [],
+      injectAt: { at: 'streams.info', code: '503', message: '503' },
+    });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake, TOPIC);
+
+    await expect(
+      plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: 2000 }),
+    ).rejects.toThrow();
+    expect(fake.state.infoAttempts).toBe(1);
+  });
+
+  it('a blocking read of a genuinely absent topic DOES poll for one to appear', async () => {
+    const fake = fakeJetStream({ records: [], streamAbsent: true });
+    const plugin = new NatsPlugin();
+    injectFake(plugin, fake, TOPIC);
+
+    const page = await plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: 1200 });
+
+    expect(page.messages).toEqual([]);
+    expect(fake.state.infoAttempts).toBeGreaterThan(1);
+  }, 20_000);
 });
 
 // Class 3: which seam methods may leave a DURABLE server-side object behind, stated as a table over

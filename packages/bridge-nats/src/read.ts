@@ -1,7 +1,7 @@
-import type { Cursor, FetchRecentArgs, FetchRecentResult, Message } from '@sharptrick/parley-core';
+import type { Cursor, FetchRecentArgs, FetchRecentResult, Message, Topic } from '@sharptrick/parley-core';
 import type { StreamInfo } from 'nats';
 import { absentTopicPage, normalizeLimit, parseCursor, type ParsedCursor } from './cursor.js';
-import { delay, isStreamMissing } from './jetstream.js';
+import { delay, isNoResponder, isStreamAbsent } from './jetstream.js';
 import { NatsPulls } from './pull.js';
 
 const WIDEN_FACTOR = 4;
@@ -23,8 +23,24 @@ export abstract class NatsReads extends NatsPulls {
     } catch (err) {
       // A stream that vanished mid-read is the absent topic again, and a read must not put it back:
       // re-provisioning here is what let a caller-named topic spend the cluster's stream budget.
-      if (!isStreamMissing(err)) throw err;
+      if (!(await this.streamVanished(err, args.topic))) throw err;
       return absentTopicPage(args);
+    }
+  }
+
+  /**
+   * Whether `err` proves the topic's stream is gone. The pull surface reports a removed stream and a
+   * JetStream API outage with the SAME 503, so keep the manager re-check: only its 404 is proof, and
+   * an outage answered as an absent topic is a bridge that reports "nothing new" for its duration.
+   */
+  private async streamVanished(err: unknown, topic: Topic): Promise<boolean> {
+    if (isStreamAbsent(err)) return true;
+    if (!isNoResponder(err)) return false;
+    try {
+      await this.requireJsm().streams.info(this.streamName(topic));
+      return false;
+    } catch (probe) {
+      return isStreamAbsent(probe);
     }
   }
 

@@ -39,6 +39,21 @@ const classify = (err: unknown): Outcome => {
 const attempt = async <T>(run: () => Promise<T>): Promise<T | Outcome> =>
   run().catch((err: unknown) => classify(err));
 
+/**
+ * The `code`/wording PAIR a failed call carries, reported verbatim. Keep it unclassified: the
+ * classifiers under test differ only in how they read this pair, so a row that ran it through one
+ * of their vocabularies could not see the fake and the server drifting apart inside a bucket.
+ */
+const shapeOf = async (run: () => Promise<unknown>): Promise<string> => {
+  try {
+    await run();
+    return 'no error';
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    return `${String(code)}: ${err instanceof Error ? err.message : String(err)}`;
+  }
+};
+
 export type PullEnd = 'ended-early' | 'waited-out-expires';
 
 /** A `consume()` iterator, in the terms both backings expose. */
@@ -105,6 +120,13 @@ export interface Arena {
   findStream: (token: string) => Promise<'the stream' | Outcome>;
   addAgain: (tokens: string[]) => Promise<'created' | Outcome>;
   removeStreamThenPublish: (token: string) => Promise<'created' | Outcome>;
+  /**
+   * What every surface answers for a stream that is NOT THERE, plus what the manager answers for a
+   * sequence that holds nothing while the stream is. The plugin tells an absent stream from a
+   * JetStream API outage, and a stream-level 404 from a message-level one, on nothing but these
+   * pairs — so a fake that models any of them wrongly certifies a classifier that is wrong too.
+   */
+  faultShapes: (token: string) => Promise<Record<string, string>>;
   close: () => Promise<void>;
 }
 
@@ -373,6 +395,27 @@ export const AGREEMENT_ROWS: AgreementRow[] = [
     expected: 'stream-missing',
     run: async (a) => a.removeStreamThenPublish('a'),
   },
+  {
+    name: 'a removed stream answers 404 on the manager and 503 on the data plane, and a missing sequence 404s with other wording',
+    covers: [
+      'js.publish',
+      'jsm.streams.info',
+      'jsm.streams.getMessage',
+      'jsm.consumers.add',
+      'js.consumers.get',
+      'consumer.fetch',
+    ],
+    expected: {
+      'getMessage, sequence absent': '404: no message found',
+      'streams.info, stream gone': '404: stream not found',
+      'getMessage, stream gone': '404: stream not found',
+      'consumers.add, stream gone': '404: stream not found',
+      'consumers.get, stream gone': '404: stream not found',
+      'fetch, stream gone': '503: no responders',
+      'publish, stream gone': '503: 503',
+    },
+    run: async (a) => a.faultShapes('a'),
+  },
 ];
 
 /** The fake, driven through the same operations — its `state` IS the server it models. */
@@ -486,11 +529,28 @@ export function fakeArena(): Arena {
     },
     removeStreamThenPublish: async (token) => {
       state.streamAbsent = true;
-      state.publishMissing = 1;
       return attempt(async () => {
         await js.publish(subject(token), enc.encode(payload('x')));
         return 'created' as const;
       });
+    },
+    faultShapes: async (token) => {
+      await js.publish(subject(token), enc.encode(payload('x')));
+      await addConsumer(token, 1);
+      const consumer = await js.consumers.get();
+      const sequenceAbsent = await shapeOf(() => jsm.streams.getMessage(STREAM, { seq: 999_999 }));
+      state.streamAbsent = true;
+      return {
+        'getMessage, sequence absent': sequenceAbsent,
+        'streams.info, stream gone': await shapeOf(() => jsm.streams.info()),
+        'getMessage, stream gone': await shapeOf(() => jsm.streams.getMessage(STREAM, { seq: 1 })),
+        'consumers.add, stream gone': await shapeOf(() => jsm.consumers.add(STREAM, {})),
+        'consumers.get, stream gone': await shapeOf(() => js.consumers.get()),
+        'fetch, stream gone': await shapeOf(async () => {
+          for await (const m of await consumer.fetch({ max_messages: 1 })) void m;
+        }),
+        'publish, stream gone': await shapeOf(() => js.publish(subject(token), enc.encode(payload('x')))),
+      };
     },
     close: async () => undefined,
   };
@@ -596,6 +656,28 @@ export async function liveArena(servers: string, tag: string): Promise<Arena> {
         await js.publish(subject(token), enc.encode(payload('x')));
         return 'created' as const;
       });
+    },
+    faultShapes: async (token) => {
+      await js.publish(subject(token), enc.encode(payload('x')));
+      const name = await addConsumer(token, 1);
+      // Keep the handle taken BEFORE the removal: the pull surface only answers a caller that
+      // already holds a consumer, and it is the one surface that cannot say 404.
+      const consumer = await js.consumers.get(stream, name);
+      const sequenceAbsent = await shapeOf(() => jsm.streams.getMessage(stream, { seq: 999_999 }));
+      await jsm.streams.delete(stream);
+      return {
+        'getMessage, sequence absent': sequenceAbsent,
+        'streams.info, stream gone': await shapeOf(() => jsm.streams.info(stream)),
+        'getMessage, stream gone': await shapeOf(() => jsm.streams.getMessage(stream, { seq: 1 })),
+        'consumers.add, stream gone': await shapeOf(() =>
+          jsm.consumers.add(stream, { ack_policy: 'none' as never }),
+        ),
+        'consumers.get, stream gone': await shapeOf(() => js.consumers.get(stream, name)),
+        'fetch, stream gone': await shapeOf(async () => {
+          for await (const m of await consumer.fetch({ max_messages: 1, expires: 2000 })) void m;
+        }),
+        'publish, stream gone': await shapeOf(() => js.publish(subject(token), enc.encode(payload('x')))),
+      };
     },
     close: async () => {
       await jsm.streams.delete(stream).catch(() => undefined);
