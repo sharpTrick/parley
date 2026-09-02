@@ -246,20 +246,58 @@ describe('source hygiene', () => {
    * diverged — truncated sha1 against full md5 — so the sentence was both a violation and false.
    *
    * This file is exempt, so that the rule can name the packages it bans.
+   *
+   * The roster is DERIVED, the way the rest of the repository derives it — a backend is a package
+   * that declares the shared conformance suite — so that a backend added or renamed after this rule
+   * was written is one the rule covers rather than one it silently exempts. Restating it here would
+   * make the rule's own coverage a thing nobody grades: the generated rows below are built from
+   * whatever the roster holds, so they agree with it however wrong it is.
    */
-  const BACKEND_PACKAGES = [
-    'sqlite',
-    'redis',
-    'postgres',
-    'matrix',
-    'xmpp',
-    'nats',
-    'zulip',
-    'discord',
-    'slack',
-    'telegram',
-  ];
-  const PLUGIN_REFERENCE = new RegExp(`\\bbridge-(?:${BACKEND_PACKAGES.join('|')})\\b`);
+  const SUITE = '@sharptrick/parley-conformance';
+
+  interface Manifest {
+    name?: string;
+    workspaces?: string[];
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  }
+
+  const manifestAt = (dir: string): Manifest =>
+    JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as Manifest;
+
+  function backendPackages(repo: string = REPO): { dir: string; name: string }[] {
+    const root = manifestAt(repo);
+    const areas = [...new Set(root.workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [])];
+    return areas
+      .flatMap((area) => {
+        const at = join(repo, area);
+        if (!existsSync(at)) return [];
+        return readdirSync(at)
+          .map((entry) => ({ dir: join(at, entry), entry }))
+          .filter(({ dir }) => statSync(dir).isDirectory() && existsSync(join(dir, 'package.json')));
+      })
+      .flatMap(({ dir, entry }) => {
+        const pkg = manifestAt(dir);
+        if (!(SUITE in { ...pkg.dependencies, ...pkg.devDependencies })) return [];
+        return [{ dir: entry, name: pkg.name ?? entry }];
+      })
+      .sort((a, b) => a.dir.localeCompare(b.dir));
+  }
+
+  const BACKEND_PACKAGES = backendPackages();
+  const escaped = (text: string): string => text.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  /**
+   * Both spellings core could name a backend by: the package directory and the published name.
+   * Keep the LEFT boundary a lookbehind rather than `\b`, so that a scoped name — which begins
+   * with a character no word boundary precedes — is matched rather than silently never found; and
+   * keep it at `\\w` alone, so that a name reached through a PATH (`packages/bridge-x/src`, or a
+   * relative import of one) still is.
+   */
+  const ruleFor = (packages: { dir: string; name: string }[]): RegExp =>
+    new RegExp(
+      `(?<!\\w)(?:${packages.flatMap((p) => [p.dir, p.name]).map(escaped).join('|')})\\b`,
+    );
+  const PLUGIN_REFERENCE = ruleFor(BACKEND_PACKAGES);
   const coreFiles = codeFiles.filter(
     (f) => f.includes('/packages/bridge-core/src/') && !f.endsWith('source-hygiene.test.ts'),
   );
@@ -296,9 +334,10 @@ describe('source hygiene', () => {
       files: coreFiles,
       advice:
         'core explains itself without naming a backend PACKAGE — dependencies point one way in prose too',
-      fires: BACKEND_PACKAGES.map((p) => `hashed exactly like bridge-${p} does`).concat([
-        'bridge-postgres',
-        '// see bridge-redis for the same shape',
+      fires: BACKEND_PACKAGES.flatMap((p) => [
+        `hashed exactly like ${p.dir} does`,
+        `re-exported from ${p.name}`,
+        `see packages/${p.dir}/src/schema.ts for the same shape`,
       ]),
       passes: [
         'bridge-core owns this',
@@ -390,7 +429,39 @@ describe('source hygiene', () => {
       expect(lint.passes.length, lint.label).toBeGreaterThan(0);
       expect(lint.files.length, lint.label).toBeGreaterThan(20);
     }
-    expect(LINTS[0]!.fires.length).toBeGreaterThan(BACKEND_PACKAGES.length);
+    expect(
+      BACKEND_PACKAGES.length,
+      'the backend roster derived from the manifests came back short — the scan, not the repo',
+    ).toBeGreaterThan(8);
+    expect(LINTS[0]!.fires.length).toBe(BACKEND_PACKAGES.length * 3);
+  });
+
+  /**
+   * The derivation on a planted tree, because the roster this rule covers is exactly the thing that
+   * used to be wrong here: a backend the repo gains must join the rule the day it lands, and a
+   * package that merely sits under the same prefix must not.
+   */
+  it('derives a backend added to a planted tree, and the rule it builds names it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'backends-'));
+    const plant = (path: string, body: string): void => {
+      mkdirSync(join(root, path.slice(0, path.lastIndexOf('/'))), { recursive: true });
+      writeFileSync(join(root, path), body);
+    };
+    const backend = (name: string): string =>
+      JSON.stringify({ name: `@x/${name}`, devDependencies: { [SUITE]: '^0.1.0' } });
+    plant('package.json', JSON.stringify({ workspaces: ['packages/*'] }));
+    plant('packages/bridge-signal/package.json', backend('bridge-signal'));
+    plant('packages/bridge-core/package.json', JSON.stringify({ name: '@x/bridge-core' }));
+    plant('packages/bridge-net-util/package.json', JSON.stringify({ name: '@x/bridge-net-util' }));
+
+    expect(backendPackages(root)).toEqual([{ dir: 'bridge-signal', name: '@x/bridge-signal' }]);
+    const rule = ruleFor(backendPackages(root));
+    expect(rule.test('hashed exactly like bridge-signal does')).toBe(true);
+    expect(rule.test('re-exported from @x/bridge-signal')).toBe(true);
+    expect(rule.test('see packages/bridge-signal/src/schema.ts for the same shape')).toBe(true);
+    expect(rule.test('bridge-core owns this')).toBe(false);
+    expect(rule.test('bridge-net-util shares the retry policy')).toBe(false);
+    expect(rule.test('bridge-signalling is a different word')).toBe(false);
   });
 
   it.each(LINTS.flatMap((l) => l.fires.map((text) => [l.label, text, l.pattern] as const)))(
