@@ -139,19 +139,33 @@ export const SAFE_LENGTH = MAX_ERROR_BODY + 512;
 const FORGES_LINE_STRUCTURE = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
 
 /**
- * The invariants that hold of anything this plugin builds out of server-supplied text, whatever the
- * server put in it: it never carries the connection's own credential, it is bounded, and it cannot
+ * The one invariant that holds of ANY text this plugin did not author, whoever supplied it — a
+ * server's RESP line, a caller's topic or cursor, a rejected `backend_config` value: it cannot
  * forge line structure in an operator's log or in an MCP tool result.
+ *
+ * Length is deliberately NOT graded here. A message that embeds one bounded field is held to
+ * {@link SAFE_LENGTH} by {@link expectSafeFromServer}; one that embeds several is held to
+ * growth-invariance at the call site instead, so that no row has to be loosened for it and none
+ * cements how many fields a message happens to carry.
+ */
+export function expectSafeText(what: string, text: string): void {
+  expect(
+    FORGES_LINE_STRUCTURE.test(text),
+    `${what} carries a control or format character`,
+  ).toBe(false);
+}
+
+/**
+ * The above, plus the one invariant that is a property of the CONNECTION rather than of the text:
+ * anything this plugin builds out of SERVER-supplied text never carries the credential the plugin
+ * itself put on the wire, and embeds exactly one bounded field, so the fixed ceiling applies.
  */
 export function expectSafeFromServer(what: string, text: string, secret: string): void {
   expect(text, `${what} carries the credential`).not.toContain(secret);
   expect(text.length, `${what} is unbounded (${text.length} chars)`).toBeLessThanOrEqual(
     SAFE_LENGTH,
   );
-  expect(
-    FORGES_LINE_STRUCTURE.test(text),
-    `${what} carries a control or format character`,
-  ).toBe(false);
+  expectSafeText(what, text);
 }
 
 /**

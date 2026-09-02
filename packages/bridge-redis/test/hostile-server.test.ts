@@ -1,23 +1,35 @@
 import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { RedisPlugin } from '../src/index.js';
+import { MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import {
+  reportLiveDeliveryDegraded,
+  reportLiveDeliveryResumed,
+  reportLiveDeliveryStopped,
+} from '../src/diagnostics.js';
+import { CONFIG_KEYS, DEFAULT_URL, RedisPlugin } from '../src/index.js';
 import {
   commandOf,
   DEFAULT_REPLIES,
   expectSafeFromServer,
+  expectSafeText,
   respEndpoint,
   respError,
   SECRET,
 } from './resp-server.js';
 import { FAST_MS as FAST, freeEndpoint } from './support.js';
 
-// CLASS: a string the SERVER wrote reaches an operator's log or an MCP tool result unchanged. A
-// thrown seam error is rendered by core as an `isError` result — model context — and the live-push
-// diagnostic is a line in the operator's terminal, so anything a hostile (or merely misconfigured)
-// server puts in a RESP error has to be bounded, stripped of the characters that forge line
-// structure, and swept of this connection's own credential before it lands in either.
+// CLASS: a string THIS PLUGIN DID NOT AUTHOR reaches an operator's log or an MCP tool result
+// unchanged. A thrown seam error is rendered by core as an `isError` result — model context — and
+// the live-push diagnostic is a line in the operator's terminal, so anything that lands in either
+// has to be bounded, stripped of the characters that forge line structure, and — where the plugin
+// itself holds the secret — swept of it.
 //
-// Three axes, because a fix applied at one site is not a fix:
+// The text arrives on more than one CHANNEL, and a fix applied to one is not a fix. The server's
+// RESP reply is graded by the first describe below; the caller's topic and cursor (bare
+// `z.string()` from an MCP client — the model, or a remote chat peer in the OAuth deployment) and a
+// rejected `backend_config` value are graded by the second, against the same hostile-text table.
+//
+// The server half has three axes:
 //   * HOSTILE TEXT. Length, ANSI, C1 controls, NEL/LS line forgery, bidi reordering, and the
 //     credential itself — including a credential AHEAD of an over-long body, so that truncation
 //     cannot be what hides it.
@@ -42,18 +54,26 @@ const body =
   (mint: (secret: string) => string): Reply =>
   (secret, code) => [code, `${MARK} ${mint(secret)}`];
 
-const hostile: Array<[string, Reply]> = [
-  ['an over-long body', body(() => 'A'.repeat(5000))],
-  ['an ANSI colour escape', body(() => 'red\u001B[31m text')],
-  ['a C1 control', body(() => 'csi\u009B31m text')],
-  ['a NEL line break', body(() => 'forged\u0085parley-redis: all clear')],
-  ['a line separator', body(() => 'forged\u2028parley-redis: all clear')],
-  ['a paragraph separator', body(() => 'forged\u2029parley-redis: all clear')],
-  ['a bidi override', body(() => 'flip\u202Ereversed')],
-  ['a NUL byte', body(() => 'split\u0000here')],
-  ['the credential', body((secret) => `your password is ${secret}`)],
-  ['the credential ahead of an over-long body', body((secret) => `${secret} ${'A'.repeat(5000)}`)],
+/**
+ * The hostile text itself, apart from the channel it arrives on. Shared, so that a channel added
+ * below inherits every shape at once rather than the subset its author thought of.
+ */
+const hostileText: Array<[string, (secret: string) => string]> = [
+  ['an over-long body', () => 'A'.repeat(5000)],
+  ['an ANSI colour escape', () => 'red\u001B[31m text'],
+  ['a C1 control', () => 'csi\u009B31m text'],
+  ['a NEL line break', () => 'forged\u0085parley-redis: all clear'],
+  ['a line separator', () => 'forged\u2028parley-redis: all clear'],
+  ['a paragraph separator', () => 'forged\u2029parley-redis: all clear'],
+  ['a bidi override', () => 'flip\u202Ereversed'],
+  ['a NUL byte', () => 'split\u0000here'],
+  ['a DEL', () => 'del\u007Fhere'],
+  ['a zero-width joiner', () => 'zwj\u200Dhere'],
+  ['the credential', (secret) => `your password is ${secret}`],
+  ['the credential ahead of an over-long body', (secret) => `${secret} ${'A'.repeat(5000)}`],
 ];
+
+const hostile: Array<[string, Reply]> = hostileText.map(([label, mint]) => [label, body(mint)]);
 
 /**
  * The impersonated opening, followed by everything the plugin is supposed to strip. The RESP code
@@ -144,7 +164,11 @@ const after = async (
 };
 
 /** The STOPPED line the read loop writes, captured off stderr rather than off a return value. */
-async function stoppedLine(plugin: RedisPlugin, url: string): Promise<Observed> {
+/**
+ * Everything `work` writes to stderr. Keep the restore in a `finally`, so that a row which throws
+ * cannot leave the hijack in place and silence every later row's diagnostics.
+ */
+async function capturingStderr(work: (written: string[]) => Promise<void> | void): Promise<string[]> {
   const written: string[] = [];
   const original = process.stderr.write.bind(process.stderr);
   process.stderr.write = ((chunk: string | Uint8Array): boolean => {
@@ -152,15 +176,22 @@ async function stoppedLine(plugin: RedisPlugin, url: string): Promise<Observed> 
     return true;
   }) as typeof process.stderr.write;
   try {
-    await connect(plugin, url);
-    await plugin.subscribe(TOPIC, () => undefined);
-    const deadline = Date.now() + 3000;
-    while (Date.now() < deadline && !written.some((line) => line.includes('STOPPED'))) {
-      await new Promise((r) => setTimeout(r, 20));
-    }
+    await work(written);
   } finally {
     process.stderr.write = original;
   }
+  return written;
+}
+
+async function stoppedLine(plugin: RedisPlugin, url: string, topic = TOPIC): Promise<Observed> {
+  const written = await capturingStderr(async (lines) => {
+    await connect(plugin, url);
+    await plugin.subscribe(topic, () => undefined);
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && !lines.some((line) => line.includes('STOPPED'))) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  });
   const line = written.find((l) => l.includes('STOPPED')) ?? '';
   expect(line, 'the read loop never reported that live delivery stopped').not.toBe('');
   expect(line.endsWith('\n'), 'the STOPPED line is not newline-terminated').toBe(true);
@@ -252,5 +283,188 @@ describe('redis failure modes — server-supplied text never lands raw in a log 
       await plugin.disconnect().catch(() => undefined);
       endpoint.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The CALLER's half of the same class. `topic` and `since` reach this plugin as bare `z.string()`
+// (bridge-core/src/transport/tools.ts), and a `backend_config` value can carry the operator's own
+// password — so all three are untrusted text on a second route into the identical sinks. Every
+// channel below is crossed with the same `hostileText` table the server half uses, so a shape added
+// there is graded on every channel at once.
+//
+// Boundedness is graded as GROWTH-INVARIANCE rather than against a fixed ceiling: `labelled()`
+// legitimately embeds three bounded fields (the server's text, the caller's topic, and the key
+// derived from it — 6,216 characters against a 50KB topic and a 40KB reply, measured), so a ceiling
+// written for one field would have to be loosened for it and would then stop grading the others,
+// and a ceiling written for three would cement how many fields a message happens to carry. Padding
+// both probes past the cap makes the check bite on every row, not just the long ones.
+// ---------------------------------------------------------------------------------------------
+
+/** Prefixed to every caller-supplied payload; if it does not survive, the row graded nothing. */
+const ECHOED = 'echoed-back-verbatim';
+
+interface CallerChannel {
+  /** Drive the plugin with `hostile` where a caller controls it; return what the plugin composed. */
+  observe: (hostile: string) => Promise<string>;
+  /** The plugin still names the fault, so a row cannot pass on a message that says nothing. */
+  names: RegExp;
+  /**
+   * False where the channel must echo NOTHING of the value — a rejected `url`, which can carry a
+   * password. The row then asserts {@link ECHOED} is ABSENT, so that a channel cannot pass by
+   * quietly having started to echo it.
+   */
+  echoes?: false;
+}
+
+const said = (work: Promise<unknown>): Promise<string> =>
+  work.then(
+    () => '',
+    (err: Error) => err.message,
+  );
+
+/** A refusal the plugin has to label, so the caller's topic and key reach `labelled()`'s message. */
+async function refusedFetch(topic: string): Promise<string> {
+  const endpoint = await respEndpoint((argv) =>
+    commandOf(argv) === 'xrevrange'
+      ? respError('WRONGTYPE', 'Operation against a key holding the wrong kind of value')
+      : (DEFAULT_REPLIES[commandOf(argv)] ?? '+OK\r\n'),
+  );
+  const plugin = new RedisPlugin();
+  try {
+    await connect(plugin, endpoint.url);
+    return await said(plugin.fetchRecent({ topic: asTopic(topic) }));
+  } finally {
+    await plugin.disconnect().catch(() => undefined);
+    endpoint.close();
+  }
+}
+
+/** The STOPPED stderr line for a hostile topic — the log sink, which no thrown error covers. */
+async function stoppedLineFor(topic: string): Promise<string> {
+  const endpoint = await respEndpoint((argv) =>
+    commandOf(argv) === 'xread'
+      ? respError('WRONGTYPE', 'Operation against a key holding the wrong kind of value')
+      : (DEFAULT_REPLIES[commandOf(argv)] ?? '+OK\r\n'),
+  );
+  const plugin = new RedisPlugin();
+  try {
+    const observed = await stoppedLine(plugin, endpoint.url, asTopic(topic));
+    return observed.text;
+  } finally {
+    await plugin.disconnect().catch(() => undefined);
+    endpoint.close();
+  }
+}
+
+/** One diagnostic line, captured off stderr with its terminator checked and then stripped. */
+async function loggedLine(write: () => void): Promise<string> {
+  const line = (await capturingStderr(() => write())).join('');
+  expect(line, 'nothing was written to stderr at all').not.toBe('');
+  expect(line.endsWith('\n'), 'the diagnostic line is not newline-terminated').toBe(true);
+  return line.slice(0, -1);
+}
+
+/** The plugin's own default endpoint — nothing here connects to it; the log lines only name it. */
+const BENIGN_URL = DEFAULT_URL;
+
+const callerChannels: Array<[string, CallerChannel]> = [
+  [
+    "the caller's cursor",
+    {
+      observe: (hostile) =>
+        said(new RedisPlugin().fetchRecent({ topic: TOPIC, since: asCursor(hostile) })),
+      names: /parley-redis: malformed cursor/,
+    },
+  ],
+  [
+    "the caller's topic, rejecting a cursor",
+    {
+      observe: (hostile) =>
+        said(
+          new RedisPlugin().fetchRecent({
+            topic: asTopic(hostile),
+            since: asCursor('not-an-entry-id'),
+          }),
+        ),
+      names: /parley-redis: malformed cursor/,
+    },
+  ],
+  [
+    "the caller's topic, labelling a server refusal",
+    { observe: refusedFetch, names: /parley-redis: WRONGTYPE/ },
+  ],
+  [
+    "the caller's topic, in the live-delivery STOPPED line",
+    { observe: stoppedLineFor, names: /live delivery STOPPED/ },
+  ],
+  [
+    "the caller's topic, in the STOPPED line as composed",
+    {
+      observe: (hostile) =>
+        loggedLine(() => reportLiveDeliveryStopped(BENIGN_URL, asTopic(hostile), 'ERR nope')),
+      names: /live delivery STOPPED/,
+    },
+  ],
+  [
+    "the caller's topic, in the DEGRADED line",
+    {
+      observe: (hostile) =>
+        loggedLine(() => reportLiveDeliveryDegraded(BENIGN_URL, asTopic(hostile), 3, 'socket gone')),
+      names: /live delivery DEGRADED/,
+    },
+  ],
+  [
+    "the caller's topic, in the RESUMED line",
+    {
+      observe: (hostile) =>
+        loggedLine(() => reportLiveDeliveryResumed(BENIGN_URL, asTopic(hostile), 3)),
+      names: /live delivery RESUMED/,
+    },
+  ],
+  ...CONFIG_KEYS.map(
+    (knob): [string, CallerChannel] => [
+      `a rejected backend_config.${knob}`,
+      {
+        observe: (hostile) => said(new RedisPlugin().connect({ [knob]: [hostile] })),
+        names: new RegExp(`parley-redis: ${knob} must`),
+        // A rejected `url` is the one value that can carry a password, so it is never echoed.
+        ...(knob === 'url' ? { echoes: false as const } : {}),
+      },
+    ],
+  ),
+];
+
+const callerRows = callerChannels.flatMap(([channelLabel, channel]) =>
+  hostileText.map(
+    ([textLabel, mint]) =>
+      [`${channelLabel} carrying ${textLabel}`, channel, mint] as [
+        string,
+        CallerChannel,
+        (secret: string) => string,
+      ],
+  ),
+);
+
+describe('redis failure modes — caller-supplied text never lands raw in a log or a tool result', () => {
+  it.each(callerRows)('%s', async (_label, channel, mint) => {
+    const payload = `${ECHOED} ${mint(SECRET)}`;
+    const plain = await channel.observe(payload);
+    expect(plain, 'the plugin did not name the fault at all').toMatch(channel.names);
+    if (channel.echoes === false) {
+      expect(plain, 'a value that must never be echoed was echoed').not.toContain(ECHOED);
+    } else {
+      expect(plain, 'the caller text never reached the message at all').toContain(ECHOED);
+    }
+    expectSafeText('the reported text', plain);
+
+    // Both probes are padded past the cap, so equal lengths mean CLAMPED rather than merely equal.
+    const padded = (times: number): string => `${payload}${'A'.repeat(MAX_ERROR_BODY * times)}`;
+    const small = await channel.observe(padded(2));
+    const large = await channel.observe(padded(20));
+    expectSafeText('the reported text, padded', small);
+    expect(large.length, 'the message grows with the length of the caller-supplied text').toBe(
+      small.length,
+    );
   });
 });

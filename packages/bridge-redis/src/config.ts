@@ -2,7 +2,7 @@ import {
   assertKnownConfigKeys,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { pluginError } from './diagnostics.js';
+import { fromCaller, pluginError } from './diagnostics.js';
 
 /** The endpoint `url` falls back to when omitted (or `null`). Exported so a test can name it
  * without hard-coding an endpoint of its own. */
@@ -79,9 +79,27 @@ export function resolveConfig(cfg: RedisBackendConfig): ResolvedConfig {
   };
 }
 
-/** Render a rejected config value for an operator; `JSON.stringify` alone turns NaN into `null`. */
-function describeValue(value: unknown): string {
-  return typeof value === 'number' ? String(value) : JSON.stringify(value) ?? String(value);
+/**
+ * Render a rejected config value for an operator; `JSON.stringify` alone turns NaN into `null`.
+ *
+ * Keep a `url` value out of it entirely, so that a password in a mistyped URL never reaches a log
+ * line — the invariant {@link normalizeUrl} keeps, which `normalizeString` runs ahead of and would
+ * otherwise break for every `url` that is not a string at all. Keep the rest bounded and flattened,
+ * so that a value nobody here authored cannot forge line structure in the error core renders into
+ * model context.
+ */
+function describeValue(key: string, value: unknown): string {
+  if (key === 'url') return shapeOf(value);
+  return fromCaller(
+    typeof value === 'number' ? String(value) : JSON.stringify(value) ?? String(value),
+  );
+}
+
+/** What a value IS, carrying nothing of what it holds. */
+function shapeOf(value: unknown): string {
+  if (value === '') return 'the empty string';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
 }
 
 /**
@@ -109,7 +127,7 @@ function normalizeString(key: string, value: unknown, fallback: string): string 
   if (value === undefined || value === null) return fallback;
   if (typeof value !== 'string' || value === '') {
     throw pluginError(
-      `parley-redis: ${key} must be a non-empty string (got ${describeValue(value)}); ` +
+      `parley-redis: ${key} must be a non-empty string (got ${describeValue(key, value)}); ` +
         `omit it for the default '${fallback}'`,
     );
   }
@@ -154,7 +172,7 @@ function normalizeMillis(key: string, value: unknown, fallback: number): number 
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     throw pluginError(
       `parley-redis: ${key} must be a positive whole number of milliseconds ` +
-        `(got ${describeValue(value)}); omit it for the default ${fallback}`,
+        `(got ${describeValue(key, value)}); omit it for the default ${fallback}`,
     );
   }
   return value;
@@ -172,7 +190,8 @@ function normalizeRetentionDays(value: number | null | undefined): number | unde
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > maxDays) {
     throw pluginError(
       `parley-redis: retention_days must be a positive number of days no greater than ${maxDays} ` +
-        `(got ${describeValue(value)}); omit it (or set null) to keep every entry forever`,
+        `(got ${describeValue('retention_days', value)}); omit it (or set null) to keep every ` +
+        `entry forever`,
     );
   }
   return value;

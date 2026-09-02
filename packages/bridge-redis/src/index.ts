@@ -22,6 +22,7 @@ import {
 import { type RedisBackendConfig, resolveConfig, type ResolvedConfig } from './config.js';
 import {
   errorText,
+  fromCaller,
   fromServer,
   isPluginError,
   pluginError,
@@ -100,7 +101,9 @@ export class RedisPlugin implements BackendPlugin {
     } catch (err) {
       if (isPluginError(err)) throw err;
       const text = fromServer(this.cfg.url, errorText(err));
-      throw pluginError(`parley-redis: ${text} (topic '${topic}', key '${key}')`);
+      throw pluginError(
+        `parley-redis: ${text} (topic '${fromCaller(topic)}', key '${fromCaller(key)}')`,
+      );
     }
   }
 

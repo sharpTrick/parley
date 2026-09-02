@@ -36,26 +36,41 @@ export function isPluginError(err: unknown): err is Error {
 }
 
 /**
- * Every spelling this connection's password can be echoed back in: the one the URL carries, which
+ * Every spelling this connection's credential can be echoed back in: the one the URL carries, which
  * `URL` hands back PERCENT-ENCODED, and the decoded one the client puts on the wire. A sweep that
  * knows a single spelling is half a sweep.
+ *
+ * Keep the credential read from the USERNAME only when there is no password, so that
+ * `redis://<user>:<secret>@host` cannot have its ACL name — which Redis itself spells `default` —
+ * struck out of every server message. A URL written without the colon puts the secret in the
+ * username position instead, and node-redis AUTHs with it either way.
  */
-function passwordSpellings(url: string): string[] {
-  let password: string;
+function credentialSpellings(url: string): string[] {
+  let parsed: URL;
   try {
-    password = new URL(url).password;
+    parsed = new URL(url);
   } catch {
     return [];
   }
-  if (password === '') return [];
-  const spellings = new Set([password]);
+  const credential = parsed.password === '' ? parsed.username : parsed.password;
+  if (credential === '') return [];
+  const spellings = new Set([credential]);
   try {
-    spellings.add(decodeURIComponent(password));
+    spellings.add(decodeURIComponent(credential));
   } catch {
     /* a stray '%' makes it no escape sequence at all; the spelling above is then the only one */
   }
   return [...spellings];
 }
+
+/**
+ * Text the CALLER supplied — a topic, an opaque cursor, a rejected `backend_config` value — made
+ * safe to put in an `Error` or a log line. Every one of those arrives over a bare `z.string()` from
+ * an MCP client, so they are the same untrusted text {@link fromServer} bounds and flattens, on a
+ * second channel into the identical sinks. Nothing is redacted here: the caller wrote the text, so
+ * there is no secret of ours in it to lose.
+ */
+export const fromCaller = (text: string): string => sanitizeBody(text);
 
 /**
  * Server-supplied text, made safe to put in an `Error` (which core renders into model context) or
@@ -67,7 +82,7 @@ function passwordSpellings(url: string): string[] {
  */
 export function fromServer(url: string, text: string): string {
   let redacted = text;
-  for (const spelling of passwordSpellings(url)) {
+  for (const spelling of credentialSpellings(url)) {
     redacted = redacted.split(spelling).join('<redacted>');
   }
   return sanitizeBody(redacted);
@@ -108,9 +123,9 @@ export function reportPlaintextCredential(url: string): void {
  */
 export function reportLiveDeliveryStopped(url: string, topic: Topic, respError: string): void {
   process.stderr.write(
-    `parley-redis: live delivery STOPPED for topic '${topic}' — the server refused the stream ` +
-      `read: ${fromServer(url, respError)}. Catch-up still works; fix the cause and restart the ` +
-      `bridge.\n`,
+    `parley-redis: live delivery STOPPED for topic '${fromCaller(topic)}' — the server refused ` +
+      `the stream read: ${fromServer(url, respError)}. Catch-up still works; fix the cause and ` +
+      `restart the bridge.\n`,
   );
 }
 
@@ -127,14 +142,15 @@ export function reportLiveDeliveryDegraded(
   error: string,
 ): void {
   process.stderr.write(
-    `parley-redis: live delivery DEGRADED for topic '${topic}' — ${failures} stream reads in a ` +
-      `row failed and it is still retrying: ${fromServer(url, error)}. Catch-up still works.\n`,
+    `parley-redis: live delivery DEGRADED for topic '${fromCaller(topic)}' — ${failures} stream ` +
+      `reads in a row failed and it is still retrying: ${fromServer(url, error)}. Catch-up still ` +
+      `works.\n`,
   );
 }
 
 export function reportLiveDeliveryResumed(url: string, topic: Topic, failures: number): void {
   process.stderr.write(
-    `parley-redis: live delivery RESUMED for topic '${topic}' at ${endpointOf(url)} after ` +
-      `${failures} failed stream reads.\n`,
+    `parley-redis: live delivery RESUMED for topic '${fromCaller(topic)}' at ` +
+      `${endpointOf(url)} after ${failures} failed stream reads.\n`,
   );
 }

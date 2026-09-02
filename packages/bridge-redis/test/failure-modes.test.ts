@@ -330,18 +330,43 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
     }
   });
 
-  // A password has TWO spellings and a server can echo either: the DECODED one the client puts on
+  // A credential has TWO spellings and a server can echo either: the DECODED one the client puts on
   // the wire (which comes back in `with args beginning with:`), and the PERCENT-ENCODED one the URL
   // carries (which comes back when anything quotes the connection string). A sweep that knows one
   // misses the other, so the fake below echoes both and every row asserts neither survives — and
   // asserts first that the fake really received the wire form, so a row cannot pass by never
   // exercising the echo at all.
-  const passwords: Array<[string, string]> = [
-    ['a plain password', SECRET],
-    ['a password with URL-unsafe characters', 'p@ss:w0rd/2'],
-    ['a password with a percent sign', '50%off'],
-    ['a non-ASCII password', 'pässwörd'],
+  //
+  // Crossed with the POSITION the credential occupies, because node-redis sends AUTH on a username
+  // OR a password and puts either on the wire, so a sweep that reads one field of the URL is half a
+  // sweep. The last row pins the OTHER direction: behind an ACL name the username is not a secret,
+  // and a sweep that struck it out would rewrite a word as ordinary as `default` — or this plugin's
+  // own `parley-` prefix — throughout every message it composes from a server's text.
+  const credentials: Array<[string, string]> = [
+    ['a plain credential', SECRET],
+    ['a credential with URL-unsafe characters', 'p@ss:w0rd/2'],
+    ['a credential with a percent sign', '50%off'],
+    ['a non-ASCII credential', 'pässwörd'],
   ];
+
+  /** Where the credential sits in the URL, and the ACL name (if any) that must SURVIVE the sweep. */
+  const positions: Array<[string, (encoded: string) => string, string | undefined]> = [
+    ['in the password position', (c) => `//:${c}@`, undefined],
+    ['in the username position, with no password', (c) => `//${c}@`, undefined],
+    ['in the password position, behind an ACL name', (c) => `//parley:${c}@`, 'parley'],
+  ];
+
+  const credentialRows = positions.flatMap(([where, authority, aclName]) =>
+    credentials.map(
+      ([label, credential]) =>
+        [`${label} ${where}`, credential, authority, aclName] as [
+          string,
+          string,
+          (encoded: string) => string,
+          string | undefined,
+        ],
+    ),
+  );
 
   // -------------------------------------------------------------------------------------------
   // CLASS: a lifecycle call that FAILS must return every socket it opened. The reader half of this
@@ -415,37 +440,50 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
     }
   });
 
-  it.each(passwords)('a server echoing AUTH never gets %s back', async (_label, password) => {
-    const inTheUrl = encodeURIComponent(password);
-    const seen: string[] = [];
-    const endpoint = await respEndpoint((argv) => {
-      if (commandOf(argv) === 'auth') seen.push(...argv.slice(1));
-      return respError(
-        'ERR',
-        `unknown command '${argv[0] ?? ''}'${withArgs(argv)} (userinfo '${inTheUrl}')`,
-      );
-    });
-    const plugin = new RedisPlugin();
-    try {
-      const url = endpoint.url.replace('//', `//:${inTheUrl}@`);
-      const failure = await plugin.connect({ url, connect_timeout_ms: FAST }).then(
-        () => undefined,
-        (err: Error) => err,
-      );
-      expect(seen, 'the fake never received the credential, so this row grades nothing').toContain(
-        password,
-      );
-      expect(failure?.message, 'nothing was redacted, so this row grades nothing').toContain(
-        '<redacted>',
-      );
-      for (const spelling of new Set([password, inTheUrl])) {
-        expectSafeError('connect()', failure, spelling);
+  it.each(credentialRows)(
+    'a server echoing AUTH never gets %s back',
+    async (_label, credential, authority, aclName) => {
+      const inTheUrl = encodeURIComponent(credential);
+      const seen: string[] = [];
+      const endpoint = await respEndpoint((argv) => {
+        if (commandOf(argv) === 'auth') seen.push(...argv.slice(1));
+        return respError(
+          'ERR',
+          `unknown command '${argv[0] ?? ''}'${withArgs(argv)} (userinfo '${inTheUrl}')`,
+        );
+      });
+      const plugin = new RedisPlugin();
+      try {
+        const url = endpoint.url.replace('//', authority(inTheUrl));
+        const failure = await plugin.connect({ url, connect_timeout_ms: FAST }).then(
+          () => undefined,
+          (err: Error) => err,
+        );
+        expect(seen, 'the fake never received the credential, so this row grades nothing').toContain(
+          credential,
+        );
+        expect(failure?.message, 'nothing was redacted, so this row grades nothing').toContain(
+          '<redacted>',
+        );
+        for (const spelling of new Set([credential, inTheUrl])) {
+          expectSafeError('connect()', failure, spelling);
+        }
+        if (aclName !== undefined) {
+          expect(
+            seen,
+            'the fake never received the ACL name, so the survival check grades nothing',
+          ).toContain(aclName);
+          expect(
+            failure?.message,
+            'the ACL name was redacted as if it were the credential',
+          ).toContain(aclName);
+        }
+      } finally {
+        await plugin.disconnect().catch(() => undefined);
+        endpoint.close();
       }
-    } finally {
-      await plugin.disconnect().catch(() => undefined);
-      endpoint.close();
-    }
-  });
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------------------------
