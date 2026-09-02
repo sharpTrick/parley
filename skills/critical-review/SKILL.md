@@ -14,15 +14,20 @@ wrong somewhere.
 
 ```
 Workflow({ scriptPath: "<repo>/.claude/workflows/careening-review.js",
-          args: { round: N, quiesced: [...], changed: [...], wakeAll: false } })
+          args: { round: N, quiesced: [...], changed: [...], wakeAll: false,
+                  worktrees: "...", base: "<sha>" } })
 ```
 
 - `round` — the round number, for labels and the record.
 - `quiesced` — pass back the previous round's `nextQuiesced` verbatim.
 - `changed` — `git diff --name-only <last-round-sha>..HEAD`. This drives wake-up.
 - `wakeAll` — **required for any round that may declare convergence.**
+- `worktrees` — **required.** The base directory `node scripts/careening-worktrees.mjs setup <sha>`
+  provisioned under, which it prints on its last line. There is no default: the runner refuses the
+  round rather than send fifteen critics somewhere it guessed.
+- `base` — the round's base sha. Each critic checks its own worktree against it before reading.
 
-Round 1: no args. Every critic runs, nothing is asleep yet.
+Round 1: still needs `worktrees` and `base`. Every critic runs, nothing is asleep yet.
 
 ## Read the result
 

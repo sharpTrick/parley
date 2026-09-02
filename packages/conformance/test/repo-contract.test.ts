@@ -24,6 +24,7 @@ interface Manifest {
   repository?: { directory?: string };
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
 }
 
 function manifests(): { dir: string; pkg: Manifest }[] {
@@ -56,6 +57,142 @@ describe('every published package carries the same discovery metadata', () => {
     expect((pkg.description ?? '').toLowerCase()).not.toMatch(/^(todo|internal)/);
     expect(pkg.repository?.directory).toBe(`packages/${dir}`);
     expect((pkg.files ?? []).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * CLASS: a package.json field that must agree across the thirteen workspaces one merge publishes in
+ * lockstep. The discovery-metadata rule above grades four such fields and stops, and the drifts
+ * outside it were filed in three consecutive review rounds without ever being graded: `engines.node`
+ * asserted only inside the one package that had raised its own floor, `exports["./package.json"]`
+ * declared by three of thirteen, and one package carrying a `test` script no sibling and no CI step
+ * had. The rows are (field x package) so that a fourth field is a row rather than a new file, and
+ * each comparator is exercised against synthetic input in both directions, because a comparator that
+ * has gone vacuous reads exactly like a repo that agrees with itself.
+ */
+describe('the fields that must agree across the lockstep-published workspaces', () => {
+  const ROOT_DIR = fileURLToPath(new URL('../../../', import.meta.url));
+  const rootManifest = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'package.json'), 'utf8'),
+  ) as Manifest & { engines?: { node?: string } };
+
+  const FLOOR = /^>=\s*(\d+\.\d+\.\d+)$/;
+  const rank = (v: string): number =>
+    v.split('.').reduce((acc, part) => acc * 1_000_000 + Number(part), 0);
+
+  /**
+   * Node versions that introduced a builtin this repo reaches for — a fact about Node, keyed by the
+   * MODULE rather than by the package, so that a second package importing one inherits the floor
+   * instead of needing a line here. bridge-sqlite's `>=22.5.0` is `node:sqlite`; the live risk is the
+   * mirror case, a package adopting a post-floor builtin and installing cleanly on a Node that
+   * throws at require time.
+   */
+  const BUILTIN_FLOOR: Record<string, string> = { 'node:sqlite': '22.5.0' };
+
+  const requiredFloor = (sources: string[], base: string): string =>
+    Object.entries(BUILTIN_FLOOR)
+      .filter(([mod]) => sources.some((src) => src.includes(`'${mod}'`) || src.includes(`"${mod}"`)))
+      .map(([, floor]) => floor)
+      .reduce((hi, floor) => (rank(floor) > rank(hi) ? floor : hi), base);
+
+  const shippedSources = (dir: string): string[] => {
+    const walk = (at: string): string[] => {
+      try {
+        return readdirSync(at, { withFileTypes: true }).flatMap((entry) =>
+          entry.isDirectory()
+            ? walk(join(at, entry.name))
+            : /\.(test|spec)\./.test(entry.name)
+              ? []
+              : [readFileSync(join(at, entry.name), 'utf8')],
+        );
+      } catch {
+        return [];
+      }
+    };
+    return walk(join(ROOT_DIR, 'packages', dir, 'src'));
+  };
+
+  /** Script names most of the family declares — the shape a sibling is expected to match. */
+  const commonNames = (declared: string[][]): string[] => {
+    const counts = new Map<string, number>();
+    for (const names of declared) for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+    return [...counts]
+      .filter(([, count]) => count > declared.length / 2)
+      .map(([name]) => name)
+      .sort();
+  };
+
+  const commonScripts = (): string[] =>
+    commonNames(published().map(({ pkg }) => Object.keys(pkg.scripts ?? {})));
+
+  it('has a root floor and a family to compare against, so the rows below are not vacuous', () => {
+    expect(FLOOR.exec(rootManifest.engines?.node ?? '')?.[1]).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(published().length).toBeGreaterThan(10);
+    expect(commonScripts().length).toBeGreaterThan(2);
+    expect(commonScripts()).toContain('build');
+  });
+
+  it.each(published().map(({ dir }) => dir))(
+    '%s declares exactly the Node floor its own sources require',
+    (dir) => {
+      const { pkg } = published().find((p) => p.dir === dir) as {
+        pkg: Manifest & { engines?: { node?: string } };
+      };
+      const declared = FLOOR.exec(pkg.engines?.node ?? '')?.[1];
+      expect(declared, `engines.node must be a plain ">=x.y.z" floor, not ${String(pkg.engines?.node)}`).toBeDefined();
+      expect(
+        declared,
+        'a floor above the family installs EBADENGINE for consumers on a Node that runs this fine; ' +
+          'a floor below the builtins it imports installs cleanly and throws at require time',
+      ).toBe(
+        requiredFloor(shippedSources(dir), FLOOR.exec(rootManifest.engines?.node ?? '')?.[1] as string),
+      );
+    },
+  );
+
+  it.each(published().map(({ dir }) => dir))(
+    '%s exports its own package.json and types every entry it declares',
+    (dir) => {
+      const { pkg } = published().find((p) => p.dir === dir) as {
+        pkg: Manifest & { exports?: Record<string, unknown> };
+      };
+      expect(
+        pkg.exports?.['./package.json'],
+        'a consumer or a tool reading the manifest through the package name gets ERR_PACKAGE_PATH_NOT_EXPORTED without it',
+      ).toBe('./package.json');
+      for (const [subpath, conditions] of Object.entries(pkg.exports ?? {})) {
+        if (typeof conditions === 'string') continue;
+        expect(
+          Object.keys(conditions as Record<string, unknown>),
+          `${subpath} must offer "types" before "default" — conditions resolve in declaration order`,
+        ).toEqual(['types', 'default']);
+      }
+    },
+  );
+
+  it.each(published().map(({ dir }) => dir))(
+    '%s declares the scripts its siblings declare, and no others',
+    (dir) => {
+      const { pkg } = published().find((p) => p.dir === dir) as { pkg: Manifest };
+      expect(
+        Object.keys(pkg.scripts ?? {}).sort(),
+        'a script no sibling has is reached by no CI step and no root script; one a sibling has and ' +
+          'this package lacks is a `--workspaces --if-present` step silently skipping it',
+      ).toEqual(commonScripts());
+    },
+  );
+
+  it('sees a floor left behind, a floor raised for nothing, and an odd script (positive control)', () => {
+    expect(requiredFloor(["const m = require('node:sqlite');"], '22.0.0')).toBe('22.5.0');
+    expect(requiredFloor(['import { DatabaseSync } from "node:sqlite";'], '22.0.0')).toBe('22.5.0');
+    expect(requiredFloor(["import { readFile } from 'node:fs';"], '22.0.0')).toBe('22.0.0');
+    expect(requiredFloor([], '22.0.0')).toBe('22.0.0');
+    expect(requiredFloor([], '22.5.0')).toBe('22.5.0');
+    expect(rank('22.5.0')).toBeGreaterThan(rank('22.0.0'));
+    expect(rank('22.0.0')).toBeGreaterThan(rank('9.99.99'));
+    expect(commonNames([['a', 'b'], ['a', 'b'], ['a', 'b'], ['a', 'c']])).toEqual(['a', 'b']);
+    expect(commonNames([['a'], ['a'], ['a']])).toEqual(['a']);
+    expect(commonNames([[], [], []])).toEqual([]);
   });
 });
 
@@ -737,28 +874,287 @@ describe('the skip gate CI runs', () => {
   });
 });
 
-describe('the careening harness agrees with itself about its targets', () => {
-  // Two lists name the review targets: the runner's TARGETS drives which critics run, and
-  // careening-worktrees.mjs drives which worktrees exist. The runner is a workflow script — it
-  // cannot be imported, because loading it executes the round — so the lists cannot be one
-  // constant. They can still be held to agreeing.
-  //
-  // Keep this comparing the two AGAINST EACH OTHER rather than pinning either one's contents, so
-  // that adding a sixteenth target needs no edit here. The `repo` target was added to the runner at
-  // round 13 and never to the worktree script, so for four rounds a worktree the runner sent a
-  // critic into was whatever a previous round had left there.
+describe('the careening harness agrees with itself and with the manifests', () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const RUNNER = join(repoRoot, '.claude/workflows/careening-review.js');
+
+  /**
+   * The runner is a workflow script, not a module: the harness wraps it in an async function, so it
+   * top-level `return`s and `import()` of it throws. Compile the same source into an async function
+   * whose parameters are the globals the harness injects, and the rules below grade what a round
+   * would actually DO — which critics start, and which directory each is sent to — instead of what a
+   * regex finds in the text. The previous guard here read `key:` matches out of the source and was
+   * therefore insensitive to every other constant in it, including the worktree root.
+   */
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor as new (
+    ...argsAndBody: string[]
+  ) => (...injected: unknown[]) => Promise<Record<string, unknown>>;
+
+  interface Round {
+    ranTargets: string[];
+    targets: { key: string; dirs: string[] }[];
+    packageDeps: Record<string, string[]>;
+    worktrees: string;
+  }
+
+  async function runRound(roundArgs: unknown): Promise<{ round: Round; sent: Map<string, string> }> {
+    const source = readFileSync(RUNNER, 'utf8').replace(/^export /gm, '');
+    const sent = new Map<string, string>();
+    const run = new AsyncFunction('args', 'log', 'phase', 'parallel', 'agent', source);
+    const record = (await run(
+      roundArgs,
+      () => {},
+      () => {},
+      (thunks: (() => Promise<unknown>)[]) => Promise.all(thunks.map((t) => t())),
+      (prompt: string, opts: { label?: string }) => {
+        sent.set((opts?.label ?? '').replace(/^critic:/, ''), prompt);
+        return Promise.resolve({ nothingFound: false, checked: '', findings: [] });
+      },
+    )) as unknown as Round;
+    return { round: record, sent };
+  }
+
+  const WORKTREES = '/provisioned/elsewhere';
+  const wholeRound = () =>
+    runRound({ round: 1, wakeAll: true, worktrees: WORKTREES, base: '0'.repeat(40) });
+
+  it('starts a critic for every target and sends each into the base it was handed', async () => {
+    const { round, sent } = await wholeRound();
+    expect(round.ranTargets.length).toBeGreaterThan(10);
+    expect(round.worktrees).toBe(WORKTREES);
+    for (const key of round.ranTargets) {
+      expect(sent.get(key), `no prompt reached ${key}`).toContain(`${WORKTREES}/${key}`);
+    }
+  });
+
+  /**
+   * The worktree root was a literal naming the cloud container this harness was written on, and a
+   * round sent fifteen critics to a directory that did not exist on the machine running it. A
+   * default that is right on one machine is worse than none, so the runner must refuse rather than
+   * guess — and no path a critic is handed may name a filesystem the operator did not choose.
+   */
+  it('refuses a round that did not say where the worktrees are', async () => {
+    await expect(runRound({ round: 1, wakeAll: true })).rejects.toThrow(/worktrees/);
+    await expect(runRound({ round: 1, wakeAll: true, worktrees: '' })).rejects.toThrow(/worktrees/);
+    await expect(
+      runRound({ round: 1, wakeAll: true, worktrees: 'careening/worktrees' }),
+    ).rejects.toThrow(/worktrees/);
+  });
+
+  it('names no machine of its own in anything it tells a critic', async () => {
+    const { sent } = await wholeRound();
+    const said = [...sent.values()].join('\n');
+    expect(said.length).toBeGreaterThan(1000);
+    expect(said.match(MACHINE_PATH) ?? []).toEqual([]);
+  });
 
   it('creates a worktree for every target the runner reviews', async () => {
-    const runner = readFileSync(join(repoRoot, '.claude/workflows/careening-review.js'), 'utf8');
-    const declared = [...runner.matchAll(/^\s*\{\s*key:\s*'([a-z-]+)'/gm)].map((m) => m[1]);
-    const withBrief = [...runner.matchAll(/^\s*key:\s*'([a-z-]+)',$/gm)].map((m) => m[1]);
-    const runnerTargets = [...new Set([...declared, ...withBrief])];
+    const { round } = await wholeRound();
+    const { TARGETS } = (await import(join(repoRoot, 'scripts/careening-worktrees.mjs'))) as {
+      TARGETS: string[];
+    };
+    expect([...TARGETS].sort()).toEqual([...round.targets.map((t) => t.key)].sort());
+  });
 
-    const { TARGETS } = await import(join(repoRoot, 'scripts/careening-worktrees.mjs'));
+  /**
+   * The wake-up rule is documented as mechanical — `docs/REVIEW_PROTOCOL.md` says the edges are
+   * "derived mechanically from package.json dependency edges … never from judgment" — but a workflow
+   * script has no filesystem access, so the runner can only carry a TRANSCRIPTION of them. Grade the
+   * transcription against every manifest, and then grade the behaviour it is supposed to produce, so
+   * that the eleventh backend is covered the day its package.json lands rather than the day someone
+   * remembers a list. Three hand-kept lists stood here before, and one of them named five net-util
+   * dependents where the manifests declare nine.
+   */
+  const internalDeps = (): Record<string, string[]> => {
+    const byName = new Map(manifests().map(({ dir, pkg }) => [pkg.name ?? dir, dir]));
+    return Object.fromEntries(
+      manifests().map(({ dir, pkg }) => [
+        dir,
+        [
+          ...new Set(
+            Object.keys({
+              ...pkg.dependencies,
+              ...pkg.devDependencies,
+              ...pkg.peerDependencies,
+            })
+              .map((name) => byName.get(name))
+              .filter((d): d is string => d !== undefined),
+          ),
+        ].sort(),
+      ]),
+    );
+  };
 
-    expect(runnerTargets.length, 'the runner declares no targets — this scan has stopped working').
-      toBeGreaterThan(10);
-    expect([...TARGETS].sort()).toEqual([...runnerTargets].sort());
+  const dependents = (dir: string): string[] => {
+    const edges = internalDeps();
+    const reaches = (from: string, seen = new Set<string>()): Set<string> => {
+      for (const dep of edges[from] ?? []) {
+        if (seen.has(dep)) continue;
+        seen.add(dep);
+        reaches(dep, seen);
+      }
+      return seen;
+    };
+    return Object.keys(edges).filter((d) => d === dir || reaches(d).has(dir));
+  };
+
+  it('transcribes every internal dependency edge the manifests declare', async () => {
+    const { round } = await wholeRound();
+    const transcribed = Object.fromEntries(
+      Object.entries(round.packageDeps).map(([dir, deps]) => [dir, [...deps].sort()]),
+    );
+    expect(Object.keys(transcribed).length).toBeGreaterThan(10);
+    expect(transcribed).toEqual(internalDeps());
+  });
+
+  it.each(readdirSync(packagesDir).sort())(
+    'a change under packages/%s wakes exactly the critics that depend on it',
+    async (dir) => {
+      const { round: shape } = await wholeRound();
+      const owners = new Set(
+        dependents(dir).flatMap((d) => shape.targets.filter((t) => t.dirs.includes(d))),
+      );
+      const { round } = await runRound({
+        round: 1,
+        wakeAll: false,
+        worktrees: WORKTREES,
+        base: '0'.repeat(40),
+        quiesced: shape.targets.map((t) => t.key),
+        changed: [`packages/${dir}/src/anything.ts`],
+      });
+      expect([...round.ranTargets].sort()).toEqual(
+        [...new Set([...[...owners].map((t) => t.key), 'repo'])].sort(),
+      );
+    },
+  );
+});
+
+/**
+ * CLASS: someone's own machine baked into a tool, where only running the tool somewhere else says
+ * so. Both halves of the review harness carried one — the worktree script's `/home/user/parley` and
+ * the runner's `/tmp/careening/worktrees` — and each was found by a round failing, never by the
+ * suite. Scanned over the STRING LITERALS of everything under scripts/ and .claude/, with comments
+ * excluded, so that a comment recording the mistake is not itself the violation.
+ *
+ * Only HOME roots, so that a scratch file under /tmp — correct on every machine — is not swept up
+ * with a checkout path that is correct on one. The other half of the pair, a tool that guesses a
+ * location it should have been told, is graded by running the runner above and watching it refuse.
+ */
+const MACHINE_PATH = /(?<![\w./])\/(?:home|Users|root|mnt|media)\//;
+
+type CommentStyle = 'c' | 'hash' | 'none';
+
+function stringLiterals(source: string, style: CommentStyle): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    if (style === 'c' && c === '/' && source[i + 1] === '/') {
+      while (i < source.length && source[i] !== '\n') i++;
+      continue;
+    }
+    if (style === 'c' && c === '/' && source[i + 1] === '*') {
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (style === 'hash' && c === '#') {
+      while (i < source.length && source[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      i++;
+      let value = '';
+      while (i < source.length && source[i] !== c) {
+        if (source[i] === '\\') {
+          value += source[i + 1] ?? '';
+          i += 2;
+          continue;
+        }
+        value += source[i];
+        i++;
+      }
+      i++;
+      out.push(value);
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+const COMMENT_STYLE: Record<string, CommentStyle> = {
+  '.js': 'c',
+  '.mjs': 'c',
+  '.cjs': 'c',
+  '.ts': 'c',
+  '.sh': 'hash',
+  '.yml': 'hash',
+  '.yaml': 'hash',
+  '.json': 'none',
+  '.md': 'none',
+};
+
+function toolFiles(root: string, prefix = ''): string[] {
+  return readdirSync(root, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory()
+      ? toolFiles(join(root, e.name), `${prefix}${e.name}/`)
+      : COMMENT_STYLE[(e.name.match(/\.[^.]+$/) ?? [''])[0] as string] === undefined
+        ? []
+        : [`${prefix}${e.name}`],
+  );
+}
+
+describe('no tool in this repo names the machine it was written on', () => {
+  const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const AREAS = ['scripts', '.claude'];
+  const files = AREAS.flatMap((area) =>
+    toolFiles(join(REPO_ROOT, area)).map((f) => `${area}/${f}`),
+  );
+
+  it('finds the tools to scan, so the rows below are not an empty table', () => {
+    expect(files.length).toBeGreaterThan(10);
+    expect(files).toContain('.claude/workflows/careening-review.js');
+    expect(files).toContain('scripts/careening-worktrees.mjs');
+  });
+
+  it.each(files)('%s hardcodes no path off this machine', (file) => {
+    const ext = (file.match(/\.[^.]+$/) ?? [''])[0] as string;
+    const offending = stringLiterals(
+      readFileSync(join(REPO_ROOT, file), 'utf8'),
+      COMMENT_STYLE[ext] as CommentStyle,
+    ).filter((literal) => MACHINE_PATH.test(literal));
+    expect(
+      offending,
+      `derive it — from \`git rev-parse --show-toplevel\`, from an env var, or from an argument. ` +
+        `A path that exists on one machine is a tool that only breaks on every other one`,
+    ).toEqual([]);
+  });
+
+  /**
+   * The scanner graded against synthetic snippets in BOTH directions, because a scanner that matches
+   * nothing passes every row and reads exactly like a clean repo.
+   */
+  it('reports a hardcoded path and spares a comment that merely mentions one (positive control)', () => {
+    const flag = (src: string, style: CommentStyle = 'c'): string[] =>
+      stringLiterals(src, style).filter((l) => MACHINE_PATH.test(l));
+    expect(flag("const W = '/home/user/parley/.careening'\n")).toEqual([
+      '/home/user/parley/.careening',
+    ]);
+    expect(flag('const R = "/home/user/parley"\n')).toEqual(['/home/user/parley']);
+    expect(flag("const log = '/tmp/parley-dev-infra.log'\n")).toEqual([]);
+    expect(flag('const R = `/Users/someone/src/${name}`\n')).toEqual([
+      '/Users/someone/src/${name}',
+    ]);
+    expect(flag("// this said '/home/user/parley', the path on the container\n")).toEqual([]);
+    expect(flag("/* was '/home/user/parley' once */\nconst ok = 'x'\n")).toEqual([]);
+    expect(flag('root=$(git rev-parse --show-toplevel)\n# was /home/user/parley\n', 'hash')).toEqual(
+      [],
+    );
+    expect(flag("dir='/home/user/parley'\n", 'hash')).toEqual(['/home/user/parley']);
+    expect(flag("const rel = './scripts/lib/workspaces.mjs'\n")).toEqual([]);
+    expect(flag("const url = 'https://example.invalid/home/x'\n")).toEqual([]);
+    expect(flag("const joined = join(ROOT, '..', '.careening', 'worktrees')\n")).toEqual([]);
   });
 });

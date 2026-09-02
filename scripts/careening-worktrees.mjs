@@ -68,6 +68,9 @@ function setup(sha) {
     process.stdout.write(`${t} -> ${path}\n`);
   }
   process.stdout.write(`\n${TARGETS.length} worktrees at ${resolved.slice(0, 7)}\n`);
+  // The runner takes this base as a required argument and refuses to guess it, so print the
+  // answer rather than leaving an operator to reconstruct it from the lines above.
+  process.stdout.write(`careening-review args.worktrees = ${BASE}\n`);
 }
 
 function teardown() {

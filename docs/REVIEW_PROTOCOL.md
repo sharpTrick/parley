@@ -136,9 +136,9 @@ when — all derived mechanically from `package.json` dependency edges and `git 
 never from judgment:
 
 - its own package changed;
-- a package it depends on changed (`@sharptrick/parley-core` wakes everything;
-  `@sharptrick/parley-net-util` wakes the five HTTP backends; `@sharptrick/parley-conformance` wakes
-  every backend);
+- a package it depends on changed, transitively — the runner walks `PACKAGE_DEPS`, a transcription
+  of the `packages/*/package.json` dependency edges that `packages/conformance/test/repo-contract.test.ts`
+  holds to those manifests, so no hand-kept wake list can drift from them again;
 - the seam or the shared theme registry changed.
 
 This targets ouroboros's clearest measured waste: its security critic returned "nothing found" for
@@ -361,8 +361,14 @@ per-package coverage, collects structured output, applies the wake rules, and co
 
 ```
 Workflow({ scriptPath: "<repo>/.claude/workflows/careening-review.js",
-          args: { round, quiesced, changed, wakeAll } })
+          args: { round, quiesced, changed, wakeAll, worktrees, base } })
 ```
+
+`worktrees` is **required** and has no default: it is the base directory
+`scripts/careening-worktrees.mjs setup` provisioned under, which that script prints. The runner
+refuses the round without it rather than guessing — the literal it used to guess with was the path
+on the container this harness was written on, and round 18 sent every critic to a directory that did
+not exist on the machine running it.
 
 **Invoke it by path, never by name.** A named workflow resolves to a copy registered when the
 session started, so edits to the runner do not reach a `name:` invocation. Round 3 ran the

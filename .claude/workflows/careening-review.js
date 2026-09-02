@@ -1,7 +1,7 @@
 // One round of the Careening adversarial review. Protocol: docs/REVIEW_PROTOCOL.md
 //
-//   Workflow({ scriptPath: "/home/user/parley/.claude/workflows/careening-review.js",
-//             args: { round, quiesced, changed, wakeAll } })
+//   Workflow({ scriptPath: "<repo>/.claude/workflows/careening-review.js",
+//             args: { round, quiesced, changed, wakeAll, worktrees, base } })
 //
 // Invoke by scriptPath, NOT by name. A named workflow resolves to a snapshot registered when
 // the session started, so edits to this file do not reach a `name:` invocation — round 3 ran
@@ -11,6 +11,9 @@
 //   quiesced  — previous round's `nextQuiesced`, verbatim
 //   changed   — `git diff --name-only <last-round-sha>..HEAD`; drives wake-up
 //   wakeAll   — run every critic. REQUIRED for any round that may declare convergence.
+//   worktrees — REQUIRED absolute base directory the critics' worktrees were provisioned under;
+//               whatever `scripts/careening-worktrees.mjs setup` printed.
+//   base      — the round's base sha, which each critic checks its worktree against.
 
 export const meta = {
   name: 'careening-review',
@@ -55,28 +58,54 @@ const TARGETS = [
   },
 ]
 
-const HTTP_BACKENDS = ['matrix', 'zulip', 'discord', 'slack', 'telegram']
-const BACKENDS = [
-  'sqlite', 'redis', 'postgres', 'matrix', 'xmpp', 'nats', 'zulip', 'discord', 'slack', 'telegram',
+// The internal dependency edges of packages/, transcribed from the manifests because a workflow
+// script has no filesystem access to read them. Keep it a transcription and nothing else, so that
+// packages/conformance/test/repo-contract.test.ts can hold it to `packages/*/package.json` exactly
+// — the three hand-curated wake lists this replaced named five net-util dependents where the
+// manifests declare nine, so nats, postgres, redis and xmpp slept through every net-util change.
+const PACKAGE_DEPS = {
+  'bridge-core': [],
+  'bridge-discord': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-matrix': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-nats': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-net-util': [],
+  'bridge-postgres': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-redis': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-slack': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-sqlite': ['bridge-core', 'conformance'],
+  'bridge-telegram': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-xmpp': ['bridge-core', 'bridge-net-util', 'conformance'],
+  'bridge-zulip': ['bridge-core', 'bridge-net-util', 'conformance'],
+  conformance: ['bridge-core'],
+}
+
+// Files whose meaning is repo-wide: they change what every critic is reviewing against.
+const ROOT_WIDE = [
+  'CLAUDE.md', 'DESIGN.md', 'docs/REVIEW_PROTOCOL.md', 'vitest.config.ts', 'tsconfig.base.json',
 ]
+
+function dependencyClosure(dir, seen = new Set()) {
+  for (const dep of PACKAGE_DEPS[dir] ?? []) {
+    if (seen.has(dep)) continue
+    seen.add(dep)
+    dependencyClosure(dep, seen)
+  }
+  return seen
+}
 
 function wakeSet(changedPaths) {
   const woken = new Set()
-  const touched = (frag) => changedPaths.some((p) => p.includes(frag))
+  const touched = (dir) => changedPaths.some((p) => p.startsWith(`packages/${dir}/`))
 
   for (const t of TARGETS) {
-    if (t.dirs.some((d) => changedPaths.some((p) => p.startsWith(`packages/${d}/`)))) woken.add(t.key)
+    const watched = new Set(t.dirs)
+    for (const d of t.dirs) for (const dep of dependencyClosure(d)) watched.add(dep)
+    if ([...watched].some(touched)) woken.add(t.key)
   }
   // The repo critic owns cross-package invariants, so ANY change can break one — including a change
   // to a file no package-scoped target claims (a workflow, a root doc, the lockfile).
   if (changedPaths.length > 0) woken.add('repo')
-  if (touched('packages/bridge-core/')) for (const t of TARGETS) woken.add(t.key)
-  if (touched('packages/bridge-net-util/')) for (const k of HTTP_BACKENDS) woken.add(k)
-  if (touched('packages/conformance/')) for (const k of BACKENDS) woken.add(k)
-  if (['CLAUDE.md', 'DESIGN.md', 'docs/REVIEW_PROTOCOL.md', 'vitest.config.ts', 'tsconfig.base.json']
-    .some((f) => changedPaths.includes(f))) {
-    for (const t of TARGETS) woken.add(t.key)
-  }
+  if (ROOT_WIDE.some((f) => changedPaths.includes(f))) for (const t of TARGETS) woken.add(t.key)
   return woken
 }
 
@@ -153,12 +182,20 @@ const SCHEMA = {
 }
 
 const rawArgs = typeof args === 'string' ? JSON.parse(args) : args
-// Taken from args, because this literal was '/tmp/careening/worktrees' — the path on the cloud
-// container. On a desktop /tmp is a different filesystem from the checkout, so the worktrees live
-// beside the repo instead, and round 18 sent fifteen critics to a directory that did not exist.
-// Fourteen adapted and said so; ONE obeyed the stop rule and reviewed nothing, which is correct
-// behaviour and cost a target its round.
-const WORKTREES = (rawArgs && rawArgs.worktrees) || '/tmp/careening/worktrees'
+// Required, with no fallback. This literal was '/tmp/careening/worktrees' — the path on the cloud
+// container it was written on — and on a desktop /tmp is a different filesystem from the checkout,
+// so the worktrees live beside the repo instead. Round 18 sent fifteen critics to a directory that
+// did not exist: fourteen adapted, ONE obeyed the stop rule and reviewed nothing, which is correct
+// behaviour and cost a target its round. A default that is right on one machine is worse than none,
+// so refuse the round rather than guess — scripts/careening-worktrees.mjs prints the base it used.
+const WORKTREES = (rawArgs && rawArgs.worktrees) || ''
+if (!WORKTREES.startsWith('/')) {
+  throw new Error(
+    'careening-review: args.worktrees must be the absolute base directory ' +
+      'scripts/careening-worktrees.mjs provisioned the worktrees under ' +
+      '($CAREENING_WORKTREES, else <repo>/../.careening/worktrees). Refusing to guess it.',
+  )
+}
 
 // The runner cannot create or inspect worktrees — a workflow script has no filesystem access — so it
 // can only tell a critic which one to use. That makes a worktree left at a PREVIOUS round's base the
@@ -319,6 +356,12 @@ return {
   },
   ranTargets: active.map((t) => t.key),
   quiescedTargets: asleep.map((t) => t.key),
+  // Reported, so that the wake-up rule is auditable from a round's own record rather than by
+  // reading this file: packages/conformance/test/repo-contract.test.ts grades both against the
+  // manifests and against which critics a given diff actually starts.
+  targets: TARGETS.map((t) => ({ key: t.key, dirs: t.dirs })),
+  packageDeps: PACKAGE_DEPS,
+  worktrees: WORKTREES,
   nextQuiesced,
   byTarget: results.map((r) => ({
     target: r.target,
