@@ -135,6 +135,8 @@ export class FakeSlack {
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly pageSize: number;
+  /** See {@link FakeSlack.start}'s `ignoreRequestedLimit`. */
+  private readonly ignoreRequestedLimit: boolean;
   private readonly sockets = new Set<WebSocket>();
   /** Sockets this fake has greeted — the ones whose close the plugin reads as a lost stream. */
   private readonly greeted = new WeakSet<WebSocket>();
@@ -169,10 +171,17 @@ export class FakeSlack {
   private nextSocket = 0;
   private readonly channels = new Map<string, StoredMessage[]>();
 
-  private constructor(server: Server, wss: WebSocketServer, port: number, pageSize: number) {
+  private constructor(
+    server: Server,
+    wss: WebSocketServer,
+    port: number,
+    pageSize: number,
+    ignoreRequestedLimit: boolean,
+  ) {
     this.server = server;
     this.wss = wss;
     this.pageSize = pageSize;
+    this.ignoreRequestedLimit = ignoreRequestedLimit;
     this.apiUrl = `http://127.0.0.1:${port}/api`;
     this.wsUrl = `ws://127.0.0.1:${port}/socket`;
   }
@@ -181,8 +190,17 @@ export class FakeSlack {
    * `pageSize` is how many objects `conversations.history` returns per page, whatever `limit` the
    * caller asked for — real Slack caps it per rate-limit tier (15 objects for a commercially
    * distributed non-Marketplace app, 1000 for an internal one) and silently serves fewer than asked.
+   *
+   * `ignoreRequestedLimit` drops the `min(asked, pageSize)` cap so a page can carry MORE objects
+   * than the plugin asked for. `ok:true` is a claim about the call, not about the body: nothing on
+   * the wire holds the vendor to the `limit` it was sent, and the size of that array is the only
+   * thing standing between the plugin and an argument-count or heap ceiling. Off by default, so
+   * that a request which dropped, renamed or mistyped `limit` still fails the fixtures that grade it.
    */
-  static async start(opts?: { pageSize?: number }): Promise<FakeSlack> {
+  static async start(opts?: {
+    pageSize?: number;
+    ignoreRequestedLimit?: boolean;
+  }): Promise<FakeSlack> {
     const server = createServer();
     const wss = new WebSocketServer({ server });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -191,6 +209,7 @@ export class FakeSlack {
       wss,
       (server.address() as AddressInfo).port,
       opts?.pageSize ?? DEFAULT_PAGE_SIZE,
+      opts?.ignoreRequestedLimit ?? false,
     );
 
     server.on('request', (req, res) => {
@@ -352,7 +371,9 @@ export class FakeSlack {
   seedRaw(channel: string, entries: unknown[]): void {
     this.createChannel(channel);
     const list = this.channels.get(channel) ?? [];
-    list.push(...(entries as StoredMessage[]));
+    // Keep this a LOOP rather than a spread, so that a fixture seeding a page large enough to reach
+    // the plugin's own argument-count ceiling fails in the plugin instead of in the fake.
+    for (const entry of entries) list.push(entry as StoredMessage);
     this.channels.set(channel, list);
   }
 
@@ -550,6 +571,7 @@ export class FakeSlack {
    * regardless would hide a request that dropped, renamed or mistyped the parameter.
    */
   private pageLength(body: Record<string, unknown>): number {
+    if (this.ignoreRequestedLimit) return this.pageSize;
     const asked = Number(body.limit);
     return Math.min(Number.isInteger(asked) && asked > 0 ? asked : 100, this.pageSize);
   }

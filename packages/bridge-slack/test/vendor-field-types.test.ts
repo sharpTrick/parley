@@ -15,25 +15,20 @@
  * `SlackMessage` without a row here fails the coverage case rather than slipping through ungraded.
  */
 import { asCursor, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { SlackPlugin } from '../src/index.js';
 import type { FakeSlack } from './fake-slack.js';
 import { capture, startSlack } from './harness.js';
+import { slackSourceText } from './source-tree.js';
 
 /**
- * The fields `SlackMessage` DECLARES, read out of the source that declares them — found by scanning
- * `src/`, so that the interface moving between modules cannot make this vacuous. A declaration this
- * cannot find is a loud failure, never an empty list.
+ * The fields `SlackMessage` DECLARES, read out of the source that declares them — found across
+ * every module the build compiles, so that the interface moving between modules, or down into a
+ * subdirectory, cannot make this vacuous. A declaration this cannot find is a loud failure, never
+ * an empty list.
  */
 function declaredFields(): string[] {
-  const srcDir = fileURLToPath(new URL('../src', import.meta.url));
-  const src = readdirSync(srcDir)
-    .filter((f) => f.endsWith('.ts'))
-    .map((f) => readFileSync(join(srcDir, f), 'utf8'))
-    .join('\n');
+  const src = slackSourceText();
   const body = /export interface SlackMessage \{([\s\S]*?)\n\}/.exec(src);
   expect(body, 'SlackMessage interface not found under src/').not.toBeNull();
   const fields = [...body![1]!.matchAll(/^ {2}(\w+)\??: /gm)].map((m) => m[1]!);

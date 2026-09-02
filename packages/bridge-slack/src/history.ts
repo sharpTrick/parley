@@ -81,7 +81,10 @@ export class SlackHistory {
         previousTs = m.ts;
         if (newestSeenTs === undefined || compareTs(m.ts, newestSeenTs) > 0) newestSeenTs = m.ts;
       }
-      collected.push(...page.filter(isPlainMessage));
+      // Keep this a LOOP rather than a spread, so that a page's cardinality — which the vendor
+      // chooses, not the `limit` we sent — cannot reach V8's argument-count ceiling and throw a
+      // RangeError naming neither the method nor the plugin, on this catch-up and every later one.
+      for (const m of page) if (isPlainMessage(m)) collected.push(m);
       pageCursor = resp.response_metadata?.next_cursor || undefined;
 
       if (!resumeAfterSince) {

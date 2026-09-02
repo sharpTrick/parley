@@ -12,9 +12,6 @@
  *     because the cursor never advances past the record that caused it.
  */
 import { asCursor, asHandle, asTopic, parseMentions, type Topic } from '@sharptrick/parley-core';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
   compareTs,
@@ -27,6 +24,7 @@ import {
 } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 import { capture, settleWithin, sleep, startSlack, withSlack } from './harness.js';
+import { slackSourceText } from './source-tree.js';
 
 /** A row label for a value `JSON.stringify` renders as `undefined` (a function) or not at all. */
 const shapeOf = (v: unknown): string =>
@@ -457,15 +455,12 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
 describe('slack backend_config knobs that reach a timer fail at load', () => {
   /**
    * The `?: number` keys `SlackBackendConfig` declares, read out of the source that declares them —
-   * found by scanning `src/`, so that the interface moving between modules cannot make this
-   * vacuous. A declaration this cannot find is a loud failure, never an empty list.
+   * found across every module the build compiles, so that the interface moving between modules, or
+   * down into a subdirectory, cannot make this vacuous. A declaration this cannot find is a loud
+   * failure, never an empty list.
    */
   function numericConfigKeysInSource(): string[] {
-    const srcDir = fileURLToPath(new URL('../src', import.meta.url));
-    const src = readdirSync(srcDir)
-      .filter((f) => f.endsWith('.ts'))
-      .map((f) => readFileSync(join(srcDir, f), 'utf8'))
-      .join('\n');
+    const src = slackSourceText();
     const body = /export interface SlackBackendConfig \{([\s\S]*?)\n\}/.exec(src);
     expect(body, 'SlackBackendConfig interface not found under src/').not.toBeNull();
     return [...body![1]!.matchAll(/^ {2}(\w+)\?: number;$/gm)].map((m) => m[1]!);
@@ -819,6 +814,79 @@ describe('slack history robustness: one hostile record must not wedge catch-up',
         await fake.close();
       }
     });
+  }
+});
+
+/**
+ * CLASS: a page whose CARDINALITY the vendor chose. The table above varies the shape of one entry and
+ * holds the page at fixture scale, so no row of it can reach a ceiling that is a function of how many
+ * entries arrive. `ok:true` is a claim about the call, not about the body: nothing on the wire holds
+ * Slack to the `limit` the plugin sent, and a page of ~125 000 surfaced entries used to reach
+ * `collected.push(...page)` and throw `RangeError: Maximum call stack size exceeded` — out of
+ * `fetchRecent`, naming neither the method nor the plugin, and again on every later catch-up, because
+ * the entries sit at or above the caller's cursor. Wedged, with no in-band recovery.
+ *
+ * Each row must therefore either answer with a well-formed window or fail with an error that NAMES
+ * `conversations.history` — never with an engine-level `RangeError` or `TypeError`.
+ */
+const PAGE_CARDINALITIES = [1, 200, 1_000, 200_000];
+
+/** `n` well-formed, channel-level, strictly increasing entries — the cheapest legitimate page. */
+const bulkPage = (n: number): unknown[] =>
+  Array.from({ length: n }, (_, i) => ({
+    type: 'message',
+    ts: `1700000000.${String(i).padStart(6, '0')}`,
+    text: `m${i}`,
+    user: 'U0BULK',
+  }));
+
+describe('slack history robustness: a page the vendor sized, not us', () => {
+  for (const cardinality of PAGE_CARDINALITIES) {
+    it(`answers a ${cardinality}-entry page without an engine-level error`, async () => {
+      // `ignoreRequestedLimit` is the whole point of the row: the plugin asks for
+      // `HISTORY_PAGE_LIMIT`, and this serves what the VENDOR chose instead.
+      const fake = await FakeSlack.start({ pageSize: cardinality, ignoreRequestedLimit: true });
+      const plugin = new SlackPlugin();
+      await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test' });
+      try {
+        const topic = asTopic(`C0BULK${cardinality}`);
+        fake.createChannel(topic);
+        fake.seedRaw(topic, bulkPage(cardinality));
+        const texts = Array.from({ length: cardinality }, (_, i) => `m${i}`);
+
+        for (const [label, args, expected] of [
+          ['no since', { topic, limit: 10 }, texts.slice(-10)],
+          ['since', { topic, since: asCursor('0'), limit: 10 }, texts.slice(0, 10)],
+        ] as const) {
+          const where = `${cardinality} entries, ${label}`;
+          const before = fake.requests.get('conversations.history') ?? 0;
+          const outcome = await capture(plugin.fetchRecent(args));
+          // ONE request: the row's whole point is a SINGLE page of that cardinality. A fixture that
+          // quietly paged instead would grade a walk and never reach an argument-count ceiling.
+          expect((fake.requests.get('conversations.history') ?? 0) - before, where).toBe(1);
+          if (outcome.status === 'fulfilled') {
+            const { messages, nextCursor } = outcome.value;
+            expect(messages.map((m) => m.content), where).toEqual(expected);
+            expect(String(nextCursor).length, where).toBeGreaterThan(0);
+            for (const m of messages) {
+              expect(String(m.backendMsgId).length, where).toBeGreaterThan(0);
+              expect(String(m.cursor).length, where).toBeGreaterThan(0);
+              expect(String(m.senderHandle).length, where).toBeGreaterThan(0);
+            }
+            continue;
+          }
+          // A refusal is allowed; an UNATTRIBUTABLE one is not — that is the defect itself.
+          expect(outcome.status, where).toBe('rejected');
+          const reason = outcome.status === 'rejected' ? outcome.reason : outcome.status;
+          expect(String(reason), where).toContain('conversations.history');
+          expect(reason, where).not.toBeInstanceOf(RangeError);
+          expect(reason, where).not.toBeInstanceOf(TypeError);
+        }
+      } finally {
+        await plugin.disconnect();
+        await fake.close();
+      }
+    }, 60_000);
   }
 });
 

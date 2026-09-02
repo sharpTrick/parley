@@ -27,28 +27,23 @@ import {
   MAX_TIMER_MS,
   TIMER_CONFIG_KEYS,
 } from '../src/index.js';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { rungStarts } from './harness.js';
+import { slackSourceModules } from './source-tree.js';
 
 const read = (rel: string): string =>
   readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
-const srcDir = fileURLToPath(new URL('../src', import.meta.url));
-
 /**
- * Every module under `src/`. The plugin composes its Web API calls out of several of them, so keep
- * every scan below reading the TREE rather than one path, so that moving a call site between
- * modules cannot leave a parity check grading an empty set.
+ * The text of every module the BUILD compiles, at whatever depth it sits — see
+ * {@link slackSourceModules}, which derives the set from `tsconfig.json` rather than by listing a
+ * directory, so that moving a call site between modules, or down into a subdirectory, cannot leave
+ * a parity check below grading a set the shipped `dist/` is larger than.
  */
-function sourceModules(): string[] {
-  const files = readdirSync(srcDir).filter((f) => f.endsWith('.ts'));
-  expect(files.length, 'no source modules found under src/').toBeGreaterThan(1);
-  return files.map((f) => readFileSync(join(srcDir, f), 'utf8'));
-}
+const sourceModules = (): string[] => slackSourceModules().map((m) => m.text);
 
 /**
  * Every `this.api(…)` call site in a source, as its literal method name.
@@ -504,19 +499,17 @@ describe('slack catch-up docs track the figures the source sends', () => {
  * composed of. `isLoopbackHost` sat in this one telling a reader the plaintext check had two halves
  * when one of them was never called — and it reached the published `dist/` as a real import, because
  * the repo ships no linter and `tsconfig.base.json` enables neither `noUnusedLocals` nor
- * `noUnusedParameters`, so nothing in CI can fail on it. Parameterized over `src/`, so a module
- * added later is covered the moment it lands.
+ * `noUnusedParameters`, so nothing in CI can fail on it. Parameterized over the modules the build
+ * compiles, so a module added later — at any depth — is covered the moment it lands.
  */
 describe('slack source imports are all used', () => {
-  const srcDir = fileURLToPath(new URL('../src', import.meta.url));
-  const modules = readdirSync(srcDir).filter((f) => f.endsWith('.ts'));
+  const modules = slackSourceModules().map((m) => [m.name, m.text] as const);
 
   it('finds source modules to check (guards against a broken walk)', () => {
     expect(modules.length).toBeGreaterThan(1);
   });
 
-  it.each(modules)('%s imports nothing it does not reference', (file) => {
-    const text = readFileSync(join(srcDir, file), 'utf8');
+  it.each(modules)('%s imports nothing it does not reference', (_name, text) => {
     const imported: string[] = [];
     for (const statement of text.matchAll(/^import\s+([\s\S]*?)\s+from\s+'[^']+';$/gm)) {
       const clause = statement[1] as string;
