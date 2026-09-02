@@ -5,7 +5,7 @@ import { asCursor, asTopic, loadConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { PERMANENT_CODES, serverRefusal } from '../src/client.js';
 import { CONFIG_KEYS, createRedisClient, RedisPlugin } from '../src/index.js';
-import { rejectedByKnob, rejectedRows } from './config-fixtures.js';
+import { RENDER_LEAK_SENTINEL, rejectedByKnob, rejectedRows } from './config-fixtures.js';
 import {
   CONTRADICTED,
   PERMANENT_REFUSALS,
@@ -128,9 +128,19 @@ const unknownKeys: Array<[string, string, unknown]> = [
 describe('redis failure modes — backend_config validation', () => {
   it.each(rejectedRows)('connect() rejects %s = %s, naming the key', async (knob, _label, value) => {
     const plugin = new RedisPlugin();
-    await expect(plugin.connect({ [knob]: value })).rejects.toThrow(
-      new RegExp(`parley-redis: ${knob}`),
+    const failure = await plugin.connect({ [knob]: value }).then(
+      () => undefined,
+      (err: Error) => err,
     );
+    // The refusal has to be THIS plugin's, and none of it the caller's. A value whose own
+    // rendering throws — a circular structure, a raising `toJSON` — otherwise escapes as a bare
+    // multi-line `TypeError`, or as the text the caller's own exception carried, naming neither the
+    // plugin nor the key in the operator's log or the model context core renders a seam error into.
+    expect(failure?.message ?? '<accepted>').toMatch(new RegExp(`^parley-redis: ${knob} `));
+    expect(
+      failure?.message ?? '',
+      'the refusal carries text the caller wrote, not this plugin',
+    ).not.toContain(RENDER_LEAK_SENTINEL);
     await plugin.disconnect().catch(() => undefined);
   });
 

@@ -90,9 +90,24 @@ export function resolveConfig(cfg: RedisBackendConfig): ResolvedConfig {
  */
 function describeValue(key: string, value: unknown): string {
   if (key === 'url') return shapeOf(value);
-  return fromCaller(
-    typeof value === 'number' ? String(value) : JSON.stringify(value) ?? String(value),
-  );
+  return fromCaller(render(value));
+}
+
+/**
+ * A caller's value as text, or {@link shapeOf} it when it has no text. Keep the whole render inside
+ * the catch, so that a value whose own rendering THROWS — a circular structure the YAML parser will
+ * build from an anchor, a bigint, a `toJSON`/`toString` that refuses or raises — is still refused by
+ * `connect()` as this plugin's own labelled error, rather than escaping as the bare multi-line
+ * `TypeError` (or the caller's own thrown message, unsanitised) that the guards around it exist to
+ * keep out of an operator's log and the model context core renders a seam error into.
+ */
+function render(value: unknown): string {
+  if (typeof value === 'number') return String(value);
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return shapeOf(value);
+  }
 }
 
 /** What a value IS, carrying nothing of what it holds. */
