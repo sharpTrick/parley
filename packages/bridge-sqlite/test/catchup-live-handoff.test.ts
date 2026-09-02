@@ -231,23 +231,37 @@ describe('a message committed between catch-up and subscribe is still delivered 
 });
 
 /**
- * The hand-off point names what the last read RETURNED — the row its `nextCursor` carries — never
- * the topic's tail and never the caller's `since`. Those three coincide whenever a read drains the
- * topic, which is why the block above cannot tell them apart: every case there reaches the tail.
- * The cases below stop reads SHORT of it, and grade the seam's promise rather than the arithmetic:
- * `subscribe` delivers exactly the messages a `fetchRecent` resuming from the caller's persisted
- * cursor would have returned, and nothing else. Recording the tail drops the rows in between;
- * recording the request replays the ones already served.
+ * One invariant, stated once and independently of how the topic was read: `subscribe` delivers
+ * exactly the contiguous run beginning at the FIRST row above the caller's persisted cursor that
+ * no read handed back. Recording the tail drops the rows in between; recording the request replays
+ * ones already served; and a read that serves the recent window while leaving older rows unread
+ * must not carry the hand-off point over them, because `fetchRecent` cannot see whether its caller
+ * persists the cursor it returns — the `parley_fetch_recent` tool does not.
+ *
+ * The block above cannot tell those apart: every case there reaches the tail, where all three
+ * coincide. The plans below stop reads SHORT of it, and cover both request shapes the seam offers
+ * — resuming from a `since`, and the since-less recent window — in both orders.
  */
 interface ReadPlan {
   name: string;
-  /** Reads on `reader`, returning the cursor those reads leave as the caller's read position. */
-  read(reader: SqlitePlugin, limit: number): Promise<Cursor>;
-  /** How many of the topic's `rows` those reads accounted for. */
+  /**
+   * Reads on `reader`. Returns the cursor those reads leave as the caller's persisted read
+   * position, and any rows they handed back that sit ABOVE it — a read the caller's cursor does
+   * not account for, which the live path may therefore skip.
+   */
+  read(
+    reader: SqlitePlugin,
+    limit: number,
+    peer: SqlitePlugin,
+  ): Promise<{ cursor: Cursor; servedAbove: string[] }>;
+  /** How many of the topic's `rows` the returned cursor accounts for. */
   servedThrough(rows: number, limit: number): number;
 }
 
 const fromTheStart = (limit: number) => ({ topic: T, since: asCursor('0'), limit });
+
+const contents = (page: { messages: readonly { content: string }[] }): string[] =>
+  page.messages.map((m) => m.content);
 
 const READ_PLANS: ReadPlan[] = [
   {
@@ -257,14 +271,14 @@ const READ_PLANS: ReadPlan[] = [
       await catchUpTopic({ plugin: reader, topic: T, limit, readState, seen: new SeenSet() });
       const cursor = readState.get(T);
       expect(cursor).toBeDefined();
-      return cursor as Cursor;
+      return { cursor: cursor as Cursor, servedAbove: [] };
     },
     servedThrough: (rows) => rows,
   },
   {
     name: 'one page stops short of the tail',
     async read(reader, limit) {
-      return (await reader.fetchRecent(fromTheStart(limit))).nextCursor;
+      return { cursor: (await reader.fetchRecent(fromTheStart(limit))).nextCursor, servedAbove: [] };
     },
     servedThrough: (rows, limit) => Math.min(limit, rows),
   },
@@ -272,7 +286,8 @@ const READ_PLANS: ReadPlan[] = [
     name: 'two pages stop short of the tail',
     async read(reader, limit) {
       const first = await reader.fetchRecent(fromTheStart(limit));
-      return (await reader.fetchRecent({ topic: T, since: first.nextCursor, limit })).nextCursor;
+      const second = await reader.fetchRecent({ topic: T, since: first.nextCursor, limit });
+      return { cursor: second.nextCursor, servedAbove: [] };
     },
     servedThrough: (rows, limit) => Math.min(2 * limit, rows),
   },
@@ -281,7 +296,34 @@ const READ_PLANS: ReadPlan[] = [
     async read(reader, limit) {
       const page = await reader.fetchRecent(fromTheStart(limit));
       await reader.fetchRecent({ topic: T, since: asCursor('0'), limit: 1 });
-      return page.nextCursor;
+      return { cursor: page.nextCursor, servedAbove: [] };
+    },
+    servedThrough: (rows, limit) => Math.min(limit, rows),
+  },
+  {
+    name: 'a since-less read of the recent window',
+    async read(reader, limit) {
+      return { cursor: (await reader.fetchRecent({ topic: T, limit })).nextCursor, servedAbove: [] };
+    },
+    servedThrough: (rows) => rows,
+  },
+  {
+    name: 'a page stopping short, then a since-less read of the newest row',
+    async read(reader, limit) {
+      const page = await reader.fetchRecent(fromTheStart(limit));
+      const newest = await reader.fetchRecent({ topic: T, limit: 1 });
+      const servedAbove = contents(newest).filter((c) => !contents(page).includes(c));
+      return { cursor: page.nextCursor, servedAbove };
+    },
+    servedThrough: (rows, limit) => Math.min(limit, rows),
+  },
+  {
+    name: 'a page stopping short, then one resuming from a cursor ahead of it',
+    async read(reader, limit, peer) {
+      const page = await reader.fetchRecent(fromTheStart(limit));
+      const tail = await peer.fetchRecent({ topic: T, limit: 1 });
+      const ahead = await reader.fetchRecent({ topic: T, since: tail.nextCursor, limit });
+      return { cursor: page.nextCursor, servedAbove: contents(ahead) };
     },
     servedThrough: (rows, limit) => Math.min(limit, rows),
   },
@@ -314,26 +356,34 @@ async function expectLiveResumesWhereTheReadStopped(
   const history = numbered('history', shape.rows);
   await fill(peer, history);
 
-  const handoff = await plan.read(reader, shape.limit);
+  const { cursor: handoff, servedAbove } = await plan.read(reader, shape.limit, peer);
 
   const windowed = numbered('in-the-window', window);
   await fill(peer, windowed);
 
-  const unserved = [...history, ...windowed].slice(plan.servedThrough(shape.rows, shape.limit));
+  const aboveTheCursor = [...history, ...windowed].slice(
+    plan.servedThrough(shape.rows, shape.limit),
+  );
   const fromTheCursor = await peer.fetchRecent({ topic: T, since: handoff, limit: MAX_PAGE });
-  expect(fromTheCursor.messages.map((m) => m.content)).toEqual(unserved);
+  expect(fromTheCursor.messages.map((m) => m.content)).toEqual(aboveTheCursor);
+
+  const firstOwed = aboveTheCursor.findIndex((c) => !servedAbove.includes(c));
+  const owed = firstOwed === -1 ? [] : aboveTheCursor.slice(firstOwed);
 
   const pushed: string[] = [];
   await reader.subscribe(T, (m) => pushed.push(m.content));
   await fill(peer, ['after-subscribe']);
 
-  await vi.waitFor(() => expect(pushed).toEqual([...unserved, 'after-subscribe']), {
+  // Wait on the LAST row and assert the whole run separately, so that a hand-off point that skipped
+  // rows fails on the mismatch it caused rather than timing out indistinguishably from a slow host.
+  await vi.waitFor(() => expect(pushed).toContain('after-subscribe'), {
     timeout: 5000,
     interval: 10,
   });
+  expect(pushed).toEqual([...owed, 'after-subscribe']);
 }
 
-describe('the live loop resumes at what the last read returned, not at the topic tail', () => {
+describe('the live loop resumes at the first row no read handed back, not at the topic tail', () => {
   for (const plan of READ_PLANS) {
     for (const shape of SHAPES) {
       for (const window of WINDOW_SIZES_AFTER_A_SHORT_READ) {
@@ -343,6 +393,20 @@ describe('the live loop resumes at what the last read returned, not at the topic
     }
   }
 
+  it('at least one plan serves rows the cursor it leaves does not account for', async () => {
+    const shape = { rows: 5, limit: 2 };
+    const diverging: string[] = [];
+    for (const plan of READ_PLANS) {
+      const path = join(dir(), 'p.db');
+      const reader = await connected(path);
+      const peer = await connected(path);
+      await fill(peer, numbered('history', shape.rows));
+      const { servedAbove } = await plan.read(reader, shape.limit, peer);
+      if (servedAbove.length > 0) diverging.push(plan.name);
+    }
+    expect(diverging).not.toEqual([]);
+  });
+
   it('at least one case leaves the hand-off point below the topic tail', () => {
     const diverging = READ_PLANS.flatMap((plan) =>
       SHAPES.filter((shape) => plan.servedThrough(shape.rows, shape.limit) < shape.rows).map(
@@ -350,6 +414,31 @@ describe('the live loop resumes at what the last read returned, not at the topic
       ),
     );
     expect(diverging.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * A read of a topic that has nothing in it yet still leaves a hand-off point, and the next read
+   * covers that topic from its very first row — the one with nothing under it. The mark has to move
+   * off the bottom of the store there, or the live loop replays every row the read just served.
+   */
+  it('a read of a topic that was empty at the time does not pin the hand-off at the store floor', async () => {
+    const path = join(dir(), 'p.db');
+    const reader = await connected(path);
+    const peer = await connected(path);
+    await reader.fetchRecent({ topic: T });
+
+    const history = numbered('history', 3);
+    await fill(peer, history);
+    expect(contents(await reader.fetchRecent({ topic: T }))).toEqual(history);
+
+    const pushed: string[] = [];
+    await reader.subscribe(T, (m) => pushed.push(m.content));
+    await fill(peer, ['after-subscribe']);
+    await vi.waitFor(() => expect(pushed).toContain('after-subscribe'), {
+      timeout: 5000,
+      interval: 10,
+    });
+    expect(pushed).toEqual(['after-subscribe']);
   });
 
   it('a backlog larger than one poll batch still hands off at the row the read returned', () =>

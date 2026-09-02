@@ -25,6 +25,7 @@ export abstract class SqliteStore {
   protected insertStmt?: SqlStatement;
   protected selectAfterStmt?: SqlStatement;
   protected selectRecentStmt?: SqlStatement;
+  protected predecessorStmt?: SqlStatement;
   protected maxIdStmt?: SqlStatement;
   protected pruneStmt?: SqlStatement;
   protected seqStmt?: SqlStatement;

@@ -307,7 +307,7 @@ describe('a connect() that fails after opening the store leaves nothing behind',
    * covered without a new row — and the count is pinned, so adding one past the end of this table
    * fails here rather than shipping ungraded.
    */
-  const FAULT_POSITIONS = Array.from({ length: 11 }, (_unused, i) => i + 1);
+  const FAULT_POSITIONS = Array.from({ length: 12 }, (_unused, i) => i + 1);
 
   it(`connect() makes exactly ${FAULT_POSITIONS.length} driver calls, one per row below`, async () => {
     const p = tracked();

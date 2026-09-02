@@ -1,4 +1,4 @@
-import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,20 +24,10 @@ const BetterCtor: (new (p: string) => RawConn) | null = (() => {
 
 /**
  * At-rest mode is graded once, over every pre-existing store state, in test/at-rest-mode.test.ts —
- * whose 'absent' row is this file's old 0600 case. What is left here is the control: if this
- * environment's umask already strips group/other, that matrix would pass trivially and prove
- * nothing, so say so rather than certifying a mode nothing narrowed.
+ * whose 'absent' row is this file's old 0600 case, and whose `withUmask` establishes the umask each
+ * row needs instead of reading whatever the host happened to supply.
  */
 describe('openDriver file permissions', () => {
-  it('has a umask loose enough for the at-rest matrix to mean something', () => {
-    const control = join(mkdtempSync(join(tmpdir(), 'parley-sqlite-mode-')), 'control');
-    writeFileSync(control, '');
-    expect(
-      statSync(control).mode & 0o077,
-      'umask already strips group/other: the 0600 assertions elsewhere are UNGRADED here',
-    ).not.toBe(0);
-  });
-
   it('skips :memory: without throwing', () => {
     const d = openDriver(':memory:');
     expect(() => {

@@ -371,6 +371,7 @@ describe('background jobs do bounded work per statement', () => {
   const PLANNED: Array<{ name: keyof typeof SQL; params: SqlParam[]; index: RegExp | null }> = [
     { name: 'selectAfter', params: [T, 0, POLL_BATCH], index: /idx_messages_topic_id/ },
     { name: 'selectRecent', params: [T, 100], index: /idx_messages_topic_id/ },
+    { name: 'predecessor', params: [T, 25], index: /idx_messages_topic_id/ },
     { name: 'maxId', params: [T], index: /idx_messages_topic_id/ },
     { name: 'prune', params: [new Date().toISOString(), PRUNE_BATCH], index: /idx_messages_ts/ },
     { name: 'seq', params: [], index: null },

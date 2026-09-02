@@ -38,8 +38,19 @@ const UMASKS = [0o000, 0o022, 0o077];
 const oct = (m: number): string => `0${m.toString(8).padStart(3, '0')}`;
 
 let previousUmask: number | undefined;
+const controls = dir();
+let controlsWritten = 0;
+/**
+ * Establish the umask this case needs, and prove it took — on a file the fixture creates fresh,
+ * never on one the host's own umask decides, so that a run under a hardened umask still grades the
+ * narrowing rather than reporting the host. Keep the name unique per call, so that re-opening an
+ * earlier case's file (which keeps the mode it was created with) cannot stand in for this one.
+ */
 function withUmask(mask: number): void {
   previousUmask ??= process.umask(mask);
+  const control = join(controls, `control-${controlsWritten++}`);
+  writeFileSync(control, '');
+  expect(mode(control), `umask ${oct(mask)} did not take effect`).toBe(0o666 & ~mask);
 }
 afterEach(() => {
   if (previousUmask !== undefined) process.umask(previousUmask);
