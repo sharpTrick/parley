@@ -18,6 +18,10 @@ export type {
 } from './seam.js';
 export { NoSuchTopicError } from './seam.js';
 export { isNoSuchTopicError } from './no-such-topic.js';
+export {
+  assertKnownConfigKeys,
+  type BackendConfigKeys,
+} from './backend-config-keys.js';
 
 // Shared helpers (used by plugins and core alike).
 export { parseMentions } from './mentions.js';

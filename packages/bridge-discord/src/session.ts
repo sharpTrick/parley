@@ -1,5 +1,6 @@
 import type { BackendConfig, MessageHandler, Topic } from '@sharptrick/parley-core';
 import {
+  assertKnownBackendConfig,
   DEFAULT_ALLOWED_MENTIONS,
   requireDistinctChannels,
   requireReconnectCap,
@@ -38,6 +39,7 @@ export abstract class DiscordSession {
   protected me?: Promise<{ id: string; username: string }>;
 
   async connect(config: BackendConfig): Promise<void> {
+    assertKnownBackendConfig(config);
     const cfg = config as DiscordBackendConfig;
     const channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
     const channelOwner = requireDistinctChannels(channelMap);

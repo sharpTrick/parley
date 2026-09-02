@@ -133,6 +133,10 @@ stderr from `connect()`, so an operator who copied a fixture config sees the ris
 this file. They are warnings, not load errors: each is a legitimate choice for a fixture or a
 rate-limited deployment.
 
+Every key is checked before anything is dialled, and an **unknown key is a load error** naming
+the accepted set — a misspelled `shared_rooom` would otherwise be dropped in silence, leaving
+a room per topic where the operator asked for one shared room.
+
 ## Multiple concurrent sessions (one `backend_config` per config file, same homeserver)
 
 A real deployment is several configs — one per Claude Code session plus one for the remote/chat

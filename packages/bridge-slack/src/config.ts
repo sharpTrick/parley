@@ -1,4 +1,8 @@
-import { parseMentions } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  parseMentions,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 import { plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
@@ -161,6 +165,23 @@ const isHttpUrl = (s: string): boolean => {
 };
 
 /**
+ * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to
+ * {@link SlackBackendConfig} without being listed here is a compile error rather than a key
+ * `connect()` rejects.
+ */
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    bot_token: 0,
+    app_token: 0,
+    api_url: 0,
+    channel_map: 0,
+    mention_map: 0,
+    handshake_timeout_ms: 0,
+    rotation_grace_ms: 0,
+  } satisfies Record<keyof Required<SlackBackendConfig>, 0>),
+};
+
+/**
  * Reject every `backend_config` value the declared type cannot enforce at run time. Core loads
  * `backend_config` as `z.record(z.unknown())`, so each value below arrives unchecked and reaches
  * either the URL every credentialed call is sent to or a `setTimeout` delay. Keep this a LOAD ERROR
@@ -168,6 +189,7 @@ const isHttpUrl = (s: string): boolean => {
  * silently clamping to 1ms — which disables the very bound the knob exists to set.
  */
 function validateConfig(cfg: SlackBackendConfig): void {
+  assertKnownConfigKeys('slack', cfg, CONFIG_KEYS);
   const reject = (key: keyof SlackBackendConfig, expected: string): never => {
     const raw = cfg[key];
     throw new Error(

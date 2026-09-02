@@ -1,5 +1,10 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 
 /** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see `plaintextWarning`. */
 export const DEFAULT_API_URL = 'https://api.telegram.org';
@@ -36,6 +41,33 @@ export interface TelegramBackendConfig {
    * is retained on top of this cap. Default 1000.
    */
   observed_max_chats?: number;
+}
+
+/**
+ * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to
+ * {@link TelegramBackendConfig} without being listed here is a compile error rather than a key
+ * `connect()` rejects.
+ */
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    token: 0,
+    api_url: 0,
+    store_path: 0,
+    poll_timeout_s: 0,
+    chat_map: 0,
+    observed_retention_per_chat: 0,
+    observed_retention_per_topic: 0,
+    observed_max_chats: 0,
+  } satisfies Record<keyof Required<TelegramBackendConfig>, 0>),
+};
+
+/**
+ * Refuse a `backend_config` key this plugin does not implement, ahead of the first request. A
+ * misspelled `chat_map` uses every topic string as a literal chat id, and a misspelled retention
+ * bound leaves the built-in default sizing state the operator believes they narrowed.
+ */
+export function assertKnownBackendConfig(config: BackendConfig): void {
+  assertKnownConfigKeys('telegram', config, CONFIG_KEYS);
 }
 
 /**

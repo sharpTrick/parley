@@ -72,6 +72,11 @@ gives the walk the default 30000 ms per-call deadline instead.
 > classifies a channel id that is not a snowflake — this package does not pin that, so treat the
 > default presence topic as unconfigured rather than as a supported empty state.
 
+Every key is checked before anything is dialled, and an **unknown key is a load error** naming
+the accepted set — a misspelled `chanel_map` would otherwise be dropped in silence, leaving
+every topic used as a literal channel id, and a misspelled `allowed_mentions` leaving the
+mention blast radius at the built-in default.
+
 ## Rate limits (429)
 
 The retry loop is `@sharptrick/parley-net-util`'s, shared by every HTTP backend, and one cap does

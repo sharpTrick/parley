@@ -1,6 +1,10 @@
-import type { BackendConfig } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 import { parse as parseDsn } from 'pg-connection-string';
-import { badConfig, unknownConfigKey } from './errors.js';
+import { badConfig } from './errors.js';
 
 /** Plugin-specific backend_config (DESIGN §11). */
 export interface PostgresBackendConfig {
@@ -43,7 +47,19 @@ export const MAX_RETENTION_DAYS = 18_250;
  */
 export const MIN_RETENTION_DAYS = 1 / 1440;
 
-const CONFIG_KEYS = ['url', 'table_name', 'pool_size', 'retention_days'] as const;
+/**
+ * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to
+ * {@link PostgresBackendConfig} without being listed here is a compile error rather than a key
+ * `connect()` rejects.
+ */
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    url: 0,
+    table_name: 0,
+    pool_size: 0,
+    retention_days: 0,
+  } satisfies Record<keyof Required<PostgresBackendConfig>, 0>),
+};
 
 function describeValue(v: unknown): string {
   return typeof v === 'string' ? `'${v}'` : String(v);
@@ -56,11 +72,7 @@ function describeValue(v: unknown): string {
  */
 export function validateBackendConfig(config: BackendConfig): PostgresBackendConfig {
   const cfg = config as Record<string, unknown>;
-  for (const key of Object.keys(cfg)) {
-    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
-      throw unknownConfigKey(key, CONFIG_KEYS);
-    }
-  }
+  assertKnownConfigKeys('postgres', config, CONFIG_KEYS);
 
   const url = cfg['url'];
   if (url !== undefined && (typeof url !== 'string' || url === '')) {

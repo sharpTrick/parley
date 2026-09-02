@@ -1,4 +1,9 @@
-import type { BackendConfig, Topic } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+  type Topic,
+} from '@sharptrick/parley-core';
 
 /** Plugin-specific backend_config (DESIGN §11). */
 export interface SqliteBackendConfig {
@@ -76,7 +81,18 @@ export const ESCALATE_AFTER = 10;
 /** Minimum gap between repeats of the same background-job diagnostic. */
 export const DIAG_INTERVAL_MS = 60_000;
 
-const CONFIG_KEYS = ['db_path', 'poll_interval_ms', 'retention_days'] as const;
+/**
+ * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to
+ * {@link SqliteBackendConfig} without being listed here is a compile error rather than a key
+ * `connect()` rejects.
+ */
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    db_path: 0,
+    poll_interval_ms: 0,
+    retention_days: 0,
+  } satisfies Record<keyof Required<SqliteBackendConfig>, 0>),
+};
 
 function bad(key: string, reason: string): Error {
   return new Error(`parley-sqlite: invalid backend_config.${key} — ${reason}`);
@@ -92,12 +108,7 @@ const integerBetween = (v: unknown, lo: number, hi: number): boolean =>
  */
 export function validateBackendConfig(config: BackendConfig): SqliteBackendConfig {
   const cfg = config as Record<string, unknown>;
-  const stray = Object.keys(cfg).find((k) => !(CONFIG_KEYS as readonly string[]).includes(k));
-  if (stray !== undefined) {
-    throw new Error(
-      `parley-sqlite: unknown backend_config key '${stray}' — expected one of ${CONFIG_KEYS.join(', ')}`,
-    );
-  }
+  assertKnownConfigKeys('sqlite', config, CONFIG_KEYS);
 
   const dbPath = cfg['db_path'];
   if (dbPath !== undefined && (typeof dbPath !== 'string' || dbPath === '')) {

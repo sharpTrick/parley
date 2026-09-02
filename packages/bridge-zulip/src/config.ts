@@ -1,4 +1,8 @@
-import type { BackendConfig } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -77,13 +81,15 @@ function orDefault<T>(value: T | undefined, fallback: T): T | undefined {
  * Every key {@link ZulipBackendConfig} declares. Keep the `satisfies` on it, so that a key added to
  * the interface without being listed here is a compile error rather than a key `connect()` rejects.
  */
-const CONFIG_KEYS = Object.keys({
-  site_url: 0,
-  email: 0,
-  api_key: 0,
-  stream: 0,
-  events_timeout_ms: 0,
-} satisfies Record<keyof Required<ZulipBackendConfig>, 0>);
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    site_url: 0,
+    email: 0,
+    api_key: 0,
+    stream: 0,
+    events_timeout_ms: 0,
+  } satisfies Record<keyof Required<ZulipBackendConfig>, 0>),
+};
 
 /**
  * Reject a key `backend_config` does not declare, before any value is read. Keep it a load error,
@@ -91,13 +97,7 @@ const CONFIG_KEYS = Object.keys({
  * mistyped `events_timeout` leave the poll cap at a value the operator believes they replaced.
  */
 function assertKnownKeys(cfg: object): void {
-  for (const key of Object.keys(cfg)) {
-    if (!CONFIG_KEYS.includes(key)) {
-      throw new Error(
-        `backend_config: unknown key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
-      );
-    }
-  }
+  assertKnownConfigKeys('zulip', cfg, CONFIG_KEYS);
 }
 
 /**

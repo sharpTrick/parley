@@ -1,4 +1,9 @@
-import type { Topic } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+  type Topic,
+} from '@sharptrick/parley-core';
 import { RECONNECT_CAP_MS } from './ladder.js';
 
 /** Plugin-specific backend_config. */
@@ -40,6 +45,41 @@ export interface AllowedMentions {
 }
 
 export const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
+
+/**
+ * Every name `backend_config` declares. Keep the `satisfies` on each object, so that a key added to
+ * {@link DiscordBackendConfig} or {@link AllowedMentions} without being listed here is a compile
+ * error rather than a key `connect()` rejects.
+ */
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    token: 0,
+    api_url: 0,
+    gateway_url: 0,
+    channel_map: 0,
+    handshake_timeout_ms: 0,
+    gateway_dialers: 0,
+    allowed_mentions: 0,
+  } satisfies Record<keyof Required<DiscordBackendConfig>, 0>),
+  nested: {
+    allowed_mentions: Object.keys({
+      parse: 0,
+      users: 0,
+      roles: 0,
+      replied_user: 0,
+    } satisfies Record<keyof Required<AllowedMentions>, 0>),
+  },
+};
+
+/**
+ * Refuse a `backend_config` key this plugin does not implement, ahead of every other check. A
+ * misspelled `channel_map` uses every topic string as a literal channel id, and a misspelled
+ * `allowed_mentions` leaves the mention blast radius at {@link DEFAULT_ALLOWED_MENTIONS} while the
+ * operator believes they narrowed it — both silently.
+ */
+export function assertKnownBackendConfig(config: BackendConfig): void {
+  assertKnownConfigKeys('discord', config, CONFIG_KEYS);
+}
 
 /**
  * Reject a `channel_map` whose targets are not distinct, and return the channel id → owning topic

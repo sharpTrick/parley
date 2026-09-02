@@ -1,4 +1,8 @@
-import type { BackendConfig } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 import { isLoopbackHost } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { credsAuthenticator, nkeyAuthenticator, type ConnectionOptions } from 'nats';
@@ -35,23 +39,32 @@ const RECONNECT_WAIT_MS = 1000;
 const RECONNECT_JITTER_MS = 500;
 const CONTROL_CHARS = new RegExp('[\\u0000-\\u001f\\u007f]');
 
-const CONFIG_KEYS = [
-  'servers',
-  'subject_prefix',
-  'stream_prefix',
-  'retention_days',
-  'token',
-  'user',
-  'pass',
-  'creds_file',
-  'nkey_seed',
-  'tls',
-] as const satisfies readonly (keyof NatsBackendConfig)[];
-
-/** Members of a config value that is itself an object — the level a top-level key check cannot see. */
-const NESTED_CONFIG_KEYS = {
-  tls: ['ca_file', 'cert_file', 'key_file'],
-} as const satisfies Partial<Record<keyof NatsBackendConfig, readonly string[]>>;
+/**
+ * Every name `backend_config` declares, including the members of `tls` — the level a top-level key
+ * check cannot see. Keep the `satisfies` on it, so that a key added to {@link NatsBackendConfig}
+ * without being listed here is a compile error rather than a key `connect()` rejects.
+ */
+const DECLARED: BackendConfigKeys = {
+  keys: Object.keys({
+    servers: 0,
+    subject_prefix: 0,
+    stream_prefix: 0,
+    retention_days: 0,
+    token: 0,
+    user: 0,
+    pass: 0,
+    creds_file: 0,
+    nkey_seed: 0,
+    tls: 0,
+  } satisfies Record<keyof Required<NatsBackendConfig>, 0>),
+  nested: {
+    tls: Object.keys({
+      ca_file: 0,
+      cert_file: 0,
+      key_file: 0,
+    } satisfies Record<keyof Required<NonNullable<NatsBackendConfig['tls']>>, 0>),
+  },
+};
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -59,21 +72,6 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
 /** What a value IS, for a diagnostic that must never carry what a value HOLDS. */
 const typeName = (value: unknown): string =>
   Array.isArray(value) ? 'an array' : value === null ? 'null' : `a ${typeof value}`;
-
-function assertKnownMembers(
-  container: Record<string, unknown>,
-  prefix: string,
-  allowed: readonly string[],
-): void {
-  for (const key of Object.keys(container)) {
-    if (allowed.includes(key)) continue;
-    throw new Error(
-      `parley-nats: unknown backend_config key '${prefix}${key}' — expected one of ${allowed
-        .map((known) => `${prefix}${known}`)
-        .join(', ')}`,
-    );
-  }
-}
 
 /**
  * A key this plugin does not read is a key it silently drops, and every field here is either a
@@ -84,23 +82,12 @@ function assertKnownMembers(
  * dropped — a dropped `ca_file` verifies the link against the system trust store instead of the
  * pinned CA, and a dropped `cert_file` presents no client certificate at all, both silently.
  */
-export function assertKnownConfigKeys(config: BackendConfig): void {
+export function assertKnownBackendConfig(config: BackendConfig): void {
+  assertKnownConfigKeys('nats', config, DECLARED);
   const cfg = config as Record<string, unknown>;
-  assertKnownMembers(cfg, '', CONFIG_KEYS);
-  for (const [key, members] of Object.entries(NESTED_CONFIG_KEYS) as [
-    string,
-    readonly string[],
-  ][]) {
+  for (const key of Object.keys(DECLARED.nested ?? {})) {
     const value = cfg[key];
-    if (value === undefined) continue;
-    if (!isPlainObject(value)) {
-      throw new Error(
-        `parley-nats: invalid backend_config.${key} — expected an object holding ${members
-          .map((member) => `${key}.${member}`)
-          .join(', ')}, not ${typeName(value)}`,
-      );
-    }
-    assertKnownMembers(value, `${key}.`, members);
+    if (!isPlainObject(value)) continue;
     for (const [member, held] of Object.entries(value)) {
       if (held === undefined || typeof held === 'string') continue;
       throw new Error(

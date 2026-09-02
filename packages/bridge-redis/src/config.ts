@@ -1,3 +1,7 @@
+import {
+  assertKnownConfigKeys,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 import { pluginError } from './diagnostics.js';
 
 /** The endpoint `url` falls back to when omitted (or `null`). Exported so a test can name it
@@ -7,14 +11,21 @@ const DEFAULT_KEY_PREFIX = 'parley:';
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_BLOCK_MS = 2000;
 
-/** Every key `backend_config` may carry; anything else is a typo and is rejected by `connect()`. */
-export const CONFIG_KEYS = [
-  'url',
-  'key_prefix',
-  'block_ms',
-  'connect_timeout_ms',
-  'retention_days',
-] as const;
+/**
+ * Every name `backend_config` declares; anything else is a typo and is rejected by `connect()`.
+ * Keep the `satisfies` on it, so that a key added to {@link RedisBackendConfig} without being
+ * listed here is a compile error rather than a key `connect()` rejects.
+ */
+const DECLARED: BackendConfigKeys = {
+  keys: Object.keys({
+    url: 0,
+    key_prefix: 0,
+    block_ms: 0,
+    connect_timeout_ms: 0,
+    retention_days: 0,
+  } satisfies Record<keyof Required<RedisBackendConfig>, 0>),
+};
+export const CONFIG_KEYS = DECLARED.keys as readonly (keyof RedisBackendConfig)[];
 
 export interface RedisBackendConfig {
   /** Connection URL. Default `redis://127.0.0.1:6379`. */
@@ -79,13 +90,12 @@ function describeValue(value: unknown): string {
  * session shares while every field still reads as consistent.
  */
 function assertKnownKeys(cfg: Record<string, unknown>): void {
-  for (const key of Object.keys(cfg)) {
-    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
-      throw pluginError(
-        `parley-redis: unknown backend_config key '${key}' — expected one of ` +
-          `${CONFIG_KEYS.join(', ')}`,
-      );
-    }
+  try {
+    assertKnownConfigKeys('redis', cfg, DECLARED);
+  } catch (err) {
+    // Keep the refusal minted here, so that `labelled` still recognises it as this plugin's own
+    // and cannot relabel it as a server response.
+    throw pluginError((err as Error).message);
   }
 }
 

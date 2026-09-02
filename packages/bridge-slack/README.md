@@ -172,6 +172,10 @@ workspace message onto the wire in the clear, to a host the operator never confi
 plaintext `api_url` (the loopback fixture, or the recording proxy the warning above is about) a
 `ws://` stream is no weaker than what is already configured, and is accepted.
 
+Every key is checked before anything is dialled, and an **unknown key is a load error** naming
+the accepted set — a misspelled `chanel_map` would otherwise be dropped in silence, leaving
+every topic used as a literal channel id.
+
 ## App provisioning (pointers only — follow Slack's docs)
 
 Create an app at [api.slack.com/apps](https://api.slack.com/apps), then:

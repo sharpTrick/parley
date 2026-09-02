@@ -16,6 +16,7 @@ import {
 import { BotApi } from './api.js';
 import { ChatResolver } from './chats.js';
 import {
+  assertKnownBackendConfig,
   DEFAULT_API_URL,
   defaultStorePath,
   requireNumericKnobs,
@@ -113,6 +114,7 @@ export class TelegramPlugin implements BackendPlugin {
     this.connecting = true;
     const generation = ++this.generation;
     try {
+      assertKnownBackendConfig(config);
       const cfg = config as TelegramBackendConfig;
       const apiUrl = (cfg.api_url ?? DEFAULT_API_URL).replace(/\/+$/, '');
       const token = cfg.token ?? '';

@@ -1,3 +1,4 @@
+import { assertKnownConfigKeys, type BackendConfigKeys } from '@sharptrick/parley-core';
 import { DEFAULT_DEADLINE_MS, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
 import { TOPIC_KEY } from './wire.js';
@@ -92,12 +93,31 @@ const isHttpUrl = (s: string): boolean => {
 };
 
 /**
+ * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to
+ * {@link MatrixBackendConfig} without being listed here is a compile error rather than a key
+ * `connect()` rejects.
+ */
+const CONFIG_KEYS: BackendConfigKeys = {
+  keys: Object.keys({
+    homeserver_url: 0,
+    user: 0,
+    password: 0,
+    server_name: 0,
+    sync_timeout_ms: 0,
+    shared_room: 0,
+    room_preset: 0,
+    invite: 0,
+  } satisfies Record<keyof Required<MatrixBackendConfig>, 0>),
+};
+
+/**
  * Core loads `backend_config` as `z.record(z.unknown())`, so each knob below arrives unchecked and
  * goes straight onto the `POST /createRoom` wire or into the park arithmetic. Keep this a LOAD
  * ERROR rather than a coercion or a warning, so that an unsupported privilege or timing knob fails
  * the way `skip_permissions: true` does instead of taking effect in a shape nothing expects.
  */
 export function validateConfig(cfg: MatrixBackendConfig): void {
+  assertKnownConfigKeys('matrix', cfg, CONFIG_KEYS);
   const reject = (key: keyof MatrixBackendConfig, expected: string, why = ''): never => {
     const raw = cfg[key];
     throw new Error(

@@ -2,7 +2,7 @@ import type { BackendConfig } from '@sharptrick/parley-core';
 import { connect } from 'nats';
 import type { JetStreamClient, JetStreamManager, NatsConnection } from 'nats';
 import {
-  assertKnownConfigKeys,
+  assertKnownBackendConfig,
   assertNoServerCredentials,
   connectionOptions,
   type NatsBackendConfig,
@@ -36,7 +36,7 @@ export abstract class NatsSession {
           'reconnect loop keeps its socket alive with no way for the caller to reclaim it',
       );
     }
-    assertKnownConfigKeys(config);
+    assertKnownBackendConfig(config);
     const cfg = config as NatsBackendConfig;
     const subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/);
     const streamPrefix = validatePrefix('stream_prefix', cfg.stream_prefix, 'PARLEY_', /[.*>/\\\s]/, MAX_STREAM_NAME_BYTES);

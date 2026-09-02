@@ -139,6 +139,10 @@ store's dedup makes the replay harmless.
 > design) and `parley_list_users` reports an empty roster; the plugin writes one throttled stderr
 > line per unresolvable topic so the failure is not completely silent.
 
+Every key is checked before anything is dialled, and an **unknown key is a load error** naming
+the accepted set — a misspelled `chat_maps` would otherwise be dropped in silence, leaving
+every topic used as a literal chat id.
+
 ## Provisioning a bot
 
 Talk to [@BotFather](https://core.telegram.org/bots#botfather): `/newbot` → name + username →

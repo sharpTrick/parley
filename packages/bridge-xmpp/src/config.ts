@@ -1,4 +1,8 @@
-import type { BackendConfig } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfig,
+  type BackendConfigKeys,
+} from '@sharptrick/parley-core';
 import { isLoopbackHost } from '@sharptrick/parley-net-util';
 
 import { JID_PART_MAX_BYTES } from './jid.js';
@@ -26,16 +30,23 @@ export interface XmppBackendConfig {
   mam_page?: number;
 }
 
-/** Every key `backend_config` may carry. Also the set README and DESIGN §11 are checked against. */
-export const CONFIG_KEYS = [
-  'service',
-  'domain',
-  'muc_service',
-  'username',
-  'password',
-  'nick',
-  'mam_page',
-] as const;
+/**
+ * Every name `backend_config` declares — also the set README and DESIGN §11 are checked against.
+ * Keep the `satisfies` on it, so that a key added to {@link XmppBackendConfig} without being listed
+ * here is a compile error rather than a key `connect()` rejects.
+ */
+const DECLARED: BackendConfigKeys = {
+  keys: Object.keys({
+    service: 0,
+    domain: 0,
+    muc_service: 0,
+    username: 0,
+    password: 0,
+    nick: 0,
+    mam_page: 0,
+  } satisfies Record<keyof Required<XmppBackendConfig>, 0>),
+};
+export const CONFIG_KEYS = DECLARED.keys as readonly (keyof XmppBackendConfig)[];
 /** Keys that end up as one part of a JID, where a separator would silently build a different JID. */
 const JID_PART_KEYS = ['domain', 'muc_service', 'username'] as const;
 /** Keys whose value becomes one part of a JID, and so inherits that part's byte ceiling. */
@@ -88,13 +99,7 @@ const bad = (key: string, reason: string): Error =>
  */
 export function validateBackendConfig(config: BackendConfig): XmppBackendConfig {
   const cfg = config as Record<string, unknown>;
-  for (const key of Object.keys(cfg)) {
-    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
-      throw new Error(
-        `parley-xmpp: unknown backend_config key '${key}' — expected one of ${CONFIG_KEYS.join(', ')}`,
-      );
-    }
-  }
+  assertKnownConfigKeys('xmpp', config, DECLARED);
   for (const key of CONFIG_KEYS) {
     if (key === 'mam_page') continue;
     const value = cfg[key];
