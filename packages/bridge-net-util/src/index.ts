@@ -67,7 +67,10 @@ export interface FetchWithRetryOptions {
   retryAfterOf?: (res: Response) => Promise<number | undefined> | number | undefined;
   /** Non-2xx statuses the caller treats as expected (returned, not thrown). Default: none. */
   allowStatuses?: number[];
-  /** Attempts before giving up. Default {@link DEFAULT_MAX_ATTEMPTS}. */
+  /**
+   * Attempts before giving up. Default {@link DEFAULT_MAX_ATTEMPTS}. A non-finite figure is refused
+   * rather than read as "unlimited": `NaN` and `Infinity` both turn the attempt bound off entirely.
+   */
   maxAttempts?: number;
   /**
    * Wall-clock budget for the whole call, INCLUDING the time a single request spends in flight.
@@ -79,7 +82,8 @@ export interface FetchWithRetryOptions {
    * Ceiling on the bytes ONE response the caller will read may put in memory. Default
    * {@link MAX_RESPONSE_BYTES}; past it the call fails with `<label> → body: …` rather than handing
    * back a truncated body a `res.json()` would misparse. A response that can only become an error
-   * message is bounded far tighter and never fails on size.
+   * message is bounded far tighter and never fails on size. A non-finite figure is refused rather
+   * than read as "no cap".
    */
   maxBodyBytes?: number;
   /** Injectable clock, for tests. */
@@ -121,11 +125,29 @@ export async function fetchWithRetry(
 ): Promise<Response> {
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  const maxBytes = opts.maxBodyBytes ?? MAX_RESPONSE_BYTES;
   const now = opts.now ?? Date.now;
+  // Every bound below is a comparison against a caller's figure, and `NaN` loses every comparison
+  // it takes part in while `Infinity` wins them all — so an unusable reading does not fail, it
+  // silently REMOVES the bound it was supposed to state. `Number(cfg.whatever)` on an absent key is
+  // NaN, so that reading arrives by accident. Refuse both here, so that a knob nobody can honour
+  // ends the call under this module's label instead of turning its bound off.
+  if (!Number.isFinite(maxBytes)) {
+    throw new LabelledError(
+      `${opts.label} → body: maxBodyBytes ${maxBytes} is not a finite number of bytes`,
+      undefined,
+    );
+  }
+  if (!Number.isFinite(maxAttempts)) {
+    throw new LabelledError(
+      `${opts.label} → attempts: maxAttempts ${maxAttempts} is not a finite count of attempts`,
+      undefined,
+    );
+  }
   const started = now();
   const attemptOpts = {
     label: opts.label,
-    maxBytes: opts.maxBodyBytes ?? MAX_RESPONSE_BYTES,
+    maxBytes,
     keeps: (res: Response): boolean =>
       res.ok || (opts.allowStatuses?.includes(res.status) ?? false),
   };

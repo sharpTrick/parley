@@ -29,7 +29,7 @@ that gains or drops the dependency moves them.
   status arrived reports it, including the ones that fail while reading the body (`→ body:`,
   `→ transport:`, `→ deadline:`), not only the `<label> → <status>: <body>` one.
 
-Three bounds are worth knowing before you call it:
+Four bounds are worth knowing before you call it:
 
 - `deadlineMs` (default `DEFAULT_DEADLINE_MS`) is a ceiling on the **whole call including the time
   one request spends in flight** — the helper aborts a request that outlives it. A caller whose
@@ -48,6 +48,11 @@ Three bounds are worth knowing before you call it:
   dropped, so a hostile upstream cannot spend your RSS producing a 2 KB message however many times
   it repeats the status. A 429 body is bounded by that same few kilobytes when your `retryAfterOf`
   reads it, which is ample for a JSON rate-limit envelope.
+- A numeric option that is **not finite** is refused, not obeyed. `NaN` loses every comparison and
+  `Infinity` wins them all, so `maxBodyBytes: NaN` (what `Number(cfg.max_body_bytes)` yields for an
+  absent key) or `maxAttempts: Infinity` would not fail — it would silently switch the bound off.
+  Each is refused before the first request, as `<label> → body: …` / `<label> → attempts: …`;
+  `deadlineMs` and `now` are screened together as the budget they assemble.
 
 The `Retry-After` header is a **floor**, and `retryAfterOf` is a source of an *additional* hint,
 never a ceiling: whichever is longer wins. Do not clamp what your parser returns — retrying

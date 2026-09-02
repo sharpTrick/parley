@@ -24,6 +24,8 @@ let host: string;
 
 /** Bytes FLUSHED to the socket per `tag` — i.e. roughly what the client actually took. */
 const served = new Map<string, number>();
+/** Requests the upstream actually RECEIVED per `tag` — what an attempt bound is measured in. */
+const requests = new Map<string, number>();
 const CHUNK = 64 * 1024;
 
 beforeAll(async () => {
@@ -33,6 +35,7 @@ beforeAll(async () => {
     const behaviour = (url.searchParams.get('body') ?? 'complete') as BodyBehaviour;
     const bytes = Number(url.searchParams.get('bytes') ?? '0');
     const tag = url.searchParams.get('tag') ?? '';
+    requests.set(tag, (requests.get(tag) ?? 0) + 1);
     res.writeHead(status, { 'content-type': 'text/plain' });
     if (bytes > 0) {
       // Backpressure-aware, so `served` tracks what the client CONSUMED (plus one socket buffer)
@@ -79,6 +82,18 @@ afterAll(async () => {
 });
 
 const LABEL = 'MyLabel GET /x';
+
+/**
+ * Every numerically-valued option, read off the interface rather than listed: two tables below are
+ * derived from it, so a knob added without rows is a compile error in both rather than a gap.
+ */
+type NumericKnob = {
+  [K in keyof FetchWithRetryOptions]-?: NonNullable<FetchWithRetryOptions[K]> extends
+    | number
+    | (() => number)
+    ? K
+    : never;
+}[keyof FetchWithRetryOptions];
 
 type Outcome = { kind: 'resolved'; text: string } | { kind: 'rejected'; error: Error };
 
@@ -338,14 +353,6 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
    * next such knob arrives graded instead of ungraded.
    */
   describe('a caller-stated figure cannot leave the envelope either', () => {
-    type NumericKnob = {
-      [K in keyof FetchWithRetryOptions]-?: NonNullable<FetchWithRetryOptions[K]> extends
-        | number
-        | (() => number)
-        ? K
-        : never;
-    }[keyof FetchWithRetryOptions];
-
     const FIGURES: readonly (readonly [string, number])[] = [
       ['a fraction', 100.5],
       ['less than a millisecond', 0.5],
@@ -439,6 +446,134 @@ describe('nothing leaves this module outside the label + redact + sanitize envel
       );
       clearTimeout(stop);
       expect(err?.message).toBe('the caller stopped it');
+    });
+  });
+
+  /**
+   * The half of the same class an ENVELOPE assertion is structurally blind to. Every bound in the
+   * loop is a comparison against a caller's figure: `NaN` loses every comparison and `Infinity`
+   * wins them all, so an unusable reading does not FAIL — it removes the bound and the call goes on
+   * looking healthy. `maxBodyBytes: NaN` (which is what `Number(cfg.max_body_bytes)` yields for an
+   * absent key) pulled all 64 MiB of a stalling body and ended only on the deadline; `maxAttempts:
+   * NaN` hit an always-429 upstream 404 times in one second instead of 8.
+   *
+   * Graded on the RESOURCE each knob bounds — bytes off the wire, requests the upstream received —
+   * because both cases rejected under a correct label the whole time. Crossed over the knobs
+   * derived from the option type and over both pressures, since a knob's bound is invisible to the
+   * pressure it does not govern: an attempt cap cannot be seen through a single 200, and a byte cap
+   * cannot be seen through a 429 whose body reaches nobody.
+   */
+  describe('an unusable reading of a knob is refused, never obeyed as "no bound"', () => {
+    const MB = 1024 * 1024;
+    const DEADLINE_MS = 1_000;
+    // Loopback plus the kernel send buffer absorb a few MB before the writer feels backpressure.
+    const BUFFER_SLACK = 8 * MB;
+    const BASE_ATTEMPTS = 3;
+    const BASE_BODY_BYTES = 256 * 1024;
+    let seq = 0;
+
+    const press = async (
+      pressure: 'a stalling body far past the cap' | 'an upstream that only rate limits',
+      patch: Partial<FetchWithRetryOptions>,
+    ): Promise<{ message: string | undefined; tookBytes: number; requests: number }> => {
+      const tag = `k${++seq}`;
+      served.set(tag, 0);
+      requests.set(tag, 0);
+      const query =
+        pressure === 'a stalling body far past the cap'
+          ? `status=200&bytes=${64 * MB}&then=stall`
+          : 'status=429&body=complete';
+      const message = await fetchWithRetry(`${origin}/x?${query}&tag=${tag}`, {}, {
+        label: LABEL,
+        isStopped: () => false,
+        maxAttempts: BASE_ATTEMPTS,
+        maxBodyBytes: BASE_BODY_BYTES,
+        deadlineMs: DEADLINE_MS,
+        retryAfterOf: () => 1,
+        ...patch,
+      } as FetchWithRetryOptions).then(
+        () => undefined,
+        (err: Error) => err.message,
+      );
+      return { message, tookBytes: served.get(tag) ?? 0, requests: requests.get(tag) ?? 0 };
+    };
+
+    /** A reading no bound can be honoured against, per knob. A clock is a knob as much as a figure. */
+    const UNUSABLE = {
+      maxAttempts: [
+        ['NaN', Number.NaN],
+        ['Infinity', Number.POSITIVE_INFINITY],
+        ['-Infinity', Number.NEGATIVE_INFINITY],
+      ],
+      deadlineMs: [
+        ['NaN', Number.NaN],
+        ['Infinity', Number.POSITIVE_INFINITY],
+        ['-Infinity', Number.NEGATIVE_INFINITY],
+      ],
+      maxBodyBytes: [
+        ['NaN', Number.NaN],
+        ['Infinity', Number.POSITIVE_INFINITY],
+        ['-Infinity', Number.NEGATIVE_INFINITY],
+      ],
+      now: [
+        ['a clock reading NaN', () => Number.NaN],
+        ['a clock reading Infinity', () => Number.POSITIVE_INFINITY],
+        ['a clock reading -Infinity', () => Number.NEGATIVE_INFINITY],
+      ],
+    } satisfies Record<NumericKnob, readonly (readonly [string, unknown])[]>;
+
+    const KNOB_NAMES = Object.keys(UNUSABLE);
+    const PRESSURES = [
+      'a stalling body far past the cap',
+      'an upstream that only rate limits',
+    ] as const;
+
+    const rows = Object.entries(UNUSABLE).flatMap(([knob, readings]) =>
+      readings.flatMap(([what, value]) =>
+        PRESSURES.map((pressure) => [knob, what, pressure, { [knob]: value }] as const),
+      ),
+    );
+
+    it('derives a knob set and a reading set, so the rows below are not an empty cross', () => {
+      expect(KNOB_NAMES.length).toBeGreaterThanOrEqual(4);
+      expect(rows.length).toBeGreaterThanOrEqual(KNOB_NAMES.length * 2 * 3);
+    });
+
+    it.each(rows)(
+      '%s read as %s, under %s',
+      async (_knob, _what, pressure, patch) => {
+        const run = await press(pressure, patch as Partial<FetchWithRetryOptions>);
+        expect(run.message, 'an unusable knob must not resolve').toBeDefined();
+        const message = run.message as string;
+        expect(message.startsWith(`${LABEL} → `)).toBe(true);
+        expect(message).not.toContain(host);
+        // A refusal that names no knob is the silent failure this whole table is about: the
+        // operator is told a deadline expired, not which figure they mistyped.
+        expect(
+          KNOB_NAMES.filter((knob) => message.includes(knob)),
+          `\`${message}\` names no knob the caller could fix`,
+        ).not.toHaveLength(0);
+        // The bounds themselves, measured where the knob acts rather than on the message.
+        expect(run.tookBytes).toBeLessThan(BUFFER_SLACK);
+        expect(run.requests).toBeLessThanOrEqual(BASE_ATTEMPTS);
+      },
+      20_000,
+    );
+
+    /**
+     * The other verdict, without which the rows above are satisfied by refusing everything: a
+     * USABLE reading of each knob is still obeyed, and obeyed as the figure it states.
+     */
+    it('a usable byte cap is still applied rather than refused', async () => {
+      const run = await press('a stalling body far past the cap', { maxBodyBytes: BASE_BODY_BYTES });
+      expect(run.message).toBe(`${LABEL} → body: response body exceeded ${BASE_BODY_BYTES} bytes`);
+      expect(run.tookBytes).toBeLessThan(BUFFER_SLACK);
+    });
+
+    it('a usable attempt cap is still obeyed exactly, not refused', async () => {
+      const run = await press('an upstream that only rate limits', { maxAttempts: BASE_ATTEMPTS });
+      expect(run.message).toContain(`still rate limited after ${BASE_ATTEMPTS} attempts`);
+      expect(run.requests).toBe(BASE_ATTEMPTS);
     });
   });
 
