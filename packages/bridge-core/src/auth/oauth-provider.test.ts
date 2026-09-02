@@ -1358,19 +1358,39 @@ describe('ParleyOAuthProvider — every value the consent page interpolates arri
  */
 describe('the auth layer escapes at every interpolation of every page it renders, reachable or not', () => {
   const DIR = fileURLToPath(new URL('.', import.meta.url));
+
+  /**
+   * Every `${…}` a template literal MARKS UP, paired with the definition its expression was bound
+   * to. The subject is markup carrying interpolated data — not a whole document. A helper that
+   * opens a tag in one literal and closes it in another is the shape every row/partial takes and
+   * the same attribute-injection site, and a `<!doctype|</tag>` filter cannot see one.
+   */
+  function interpolationsInMarkup(source: string): [expr: string, bound: Map<string, string>][] {
+    const bound = new Map(
+      [...source.matchAll(/const (\w+) = (.+);$/gm)].map((m): [string, string] => [m[1]!, m[2]!]),
+    );
+    return [...source.matchAll(/`(?:[^`\\]|\\.)*`/g)]
+      .map((m) => m[0])
+      .filter((t) => t.includes('<') && t.includes('${'))
+      .flatMap((t) => [...new Set([...t.matchAll(/\$\{([^}]*)\}/g)].map((m) => m[1]!.trim()))])
+      .map((expr): [string, Map<string, string>] => [expr, bound]);
+  }
+
+  const escapes = (expr: string, bound: Map<string, string>): boolean =>
+    expr.includes('escapeHtml') || (bound.get(expr)?.includes('escapeHtml') ?? false);
+
+  const unescapedInterpolations = (source: string): string[] =>
+    interpolationsInMarkup(source)
+      .filter(([expr, bound]) => !escapes(expr, bound))
+      .map(([expr]) => expr);
+
   const pages = readdirSync(DIR)
     .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
-    .map((f) => [f, readFileSync(`${DIR}${f}`, 'utf8')] as const)
-    .flatMap(([file, source]) => {
-      const bound = new Map(
-        [...source.matchAll(/const (\w+) = (.+);$/gm)].map((m): [string, string] => [m[1]!, m[2]!]),
-      );
-      return [...source.matchAll(/`(?:[^`\\]|\\.)*`/g)]
-        .map((m) => m[0])
-        .filter((t) => /<!doctype|<\/[a-z]+>/i.test(t))
-        .flatMap((t) => [...new Set([...t.matchAll(/\$\{([^}]*)\}/g)].map((m) => m[1]!.trim()))])
-        .map((expr): [string, string, Map<string, string>] => [file, expr, bound]);
-    });
+    .flatMap((file) =>
+      interpolationsInMarkup(readFileSync(`${DIR}${file}`, 'utf8')).map(
+        ([expr, bound]): [string, string, Map<string, string>] => [file, expr, bound],
+      ),
+    );
 
   it('finds the interpolations to check', () => {
     expect(new Set(pages.map(([file]) => file)).size).toBeGreaterThan(0);
@@ -1378,10 +1398,65 @@ describe('the auth layer escapes at every interpolation of every page it renders
   });
 
   it.each(pages)('%s: ${%s} is escaped', (_file: string, expr: string, bound: Map<string, string>) => {
-    const escapedInPlace = expr.includes('escapeHtml');
-    const escapedWhereBound = bound.get(expr)?.includes('escapeHtml') ?? false;
-    expect(escapedInPlace || escapedWhereBound).toBe(true);
+    expect(escapes(expr, bound)).toBe(true);
   });
+
+  /**
+   * The selector is the whole guard: what it does not select ships ungraded, and a floor on how
+   * many interpolations it found cannot notice a page it never selected. Drive it against synthetic
+   * sources in both directions — the partial-tag shape that was invisible, a whole document, a
+   * render concatenated from a helper, and templates that carry data or markup but not both — so
+   * the widened rule is graded rather than merely believed.
+   */
+  const SYNTHETIC: ReadonlyArray<readonly [label: string, source: string, offends: boolean]> = [
+    [
+      'a partial tag that opens in one literal and is closed in another',
+      'const row = (s: string): string => `<li class="scope" title="${s}">`;\n',
+      true,
+    ],
+    [
+      'that same partial tag with the value escaped',
+      'const row = (s: string): string => `<li class="scope" title="${escapeHtml(s)}">`;\n',
+      false,
+    ],
+    [
+      'a whole document with an unescaped interpolation',
+      'const page = `<!doctype html><body><p>${name}</p></body></html>`;\n',
+      true,
+    ],
+    [
+      'a whole document with every interpolation escaped',
+      'const page = `<!doctype html><body><p>${escapeHtml(name)}</p></body></html>`;\n',
+      false,
+    ],
+    [
+      'a render concatenated out of a partial helper',
+      'const cell = (s: string): string => `<td>${s}`;\n' +
+        'export function render(xs: string[]): string {\n' +
+        "  return `<tr>` + xs.map(cell).join('') + `</tr>`;\n" +
+        '}\n',
+      true,
+    ],
+    [
+      'an interpolation escaped where its name was bound',
+      'const safe = escapeHtml(raw);\nconst page = `<td>${safe}</td>`;\n',
+      false,
+    ],
+    ['a template carrying data but no markup', 'const redirect = `myapp:${payload}`;\n', false],
+    ['markup carrying no interpolation at all', 'const open = `<ul class="scopes">`;\n', false],
+  ] as const;
+
+  it('the rule reaches both verdicts, so neither column is empty', () => {
+    expect(SYNTHETIC.filter(([, , offends]) => offends).length).toBeGreaterThan(2);
+    expect(SYNTHETIC.filter(([, , offends]) => !offends).length).toBeGreaterThan(2);
+  });
+
+  it.each(SYNTHETIC)(
+    'the scan reads %s',
+    (_label: string, source: string, offends: boolean) => {
+      expect(unescapedInterpolations(source).length > 0).toBe(offends);
+    },
+  );
 });
 
 /**
