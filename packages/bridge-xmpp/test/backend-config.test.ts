@@ -149,11 +149,20 @@ describe('XMPP backend_config is validated before anything connects', () => {
 // backend_config unvalidated, following DESIGN silently authenticated as the default account. The
 // three now have to agree, so any of them drifting fails the build rather than an operator's deploy.
 
-const repoFile = (path: string): string =>
-  readFileSync(new URL(`../../../${path}`, import.meta.url), 'utf8');
+/**
+ * Keep every path here a literal the repo's boundary scan can read, so that a doc surface moved
+ * into another package cannot be reached through a variable the scan resolves to nothing.
+ */
+const README_URL = new URL('../README.md', import.meta.url);
+const DESIGN_URL = new URL('../../../DESIGN.md', import.meta.url);
+const EXAMPLE_README_URL = new URL('../../../examples/multi-session/README.md', import.meta.url);
+const exampleConfigUrl = (name: string): URL =>
+  new URL(`../../../examples/multi-session/xmpp/${name}.yaml`, import.meta.url);
+
+const repoFile = (url: URL): string => readFileSync(url, 'utf8');
 
 const readmeKeys = (): string[] => {
-  const readme = repoFile('packages/bridge-xmpp/README.md');
+  const readme = repoFile(README_URL);
   const block = /## Config \(`backend_config`\)\s*```yaml\n([\s\S]*?)```/.exec(readme);
   expect(block).not.toBeNull();
   return [...(block?.[1] as string).matchAll(/^\s*#?\s*([a-z_]+):/gm)]
@@ -162,7 +171,7 @@ const readmeKeys = (): string[] => {
 };
 
 const designKeys = (): string[] => {
-  const design = repoFile('DESIGN.md');
+  const design = repoFile(DESIGN_URL);
   const line = /^\s*#\s*xmpp:\s*\{([^}]*)\}/m.exec(design);
   expect(line).not.toBeNull();
   return (line?.[1] as string).split(',').map((key) => key.trim().replace(/\?$/, ''));
@@ -200,15 +209,15 @@ const section = (markdown: string, heading: RegExp): string => {
 };
 
 const surfaces = (): Array<{ name: string; text: string }> => [
-  { name: 'packages/bridge-xmpp/README.md', text: repoFile('packages/bridge-xmpp/README.md') },
+  { name: 'packages/bridge-xmpp/README.md', text: repoFile(README_URL) },
   {
     name: 'examples/multi-session/README.md (XMPP section)',
-    text: section(repoFile('examples/multi-session/README.md'), /^### XMPP\b/),
+    text: section(repoFile(EXAMPLE_README_URL), /^### XMPP\b/),
   },
   {
     name: 'examples/multi-session/xmpp/*.yaml',
     text: ['code-agent-a', 'code-agent-b', 'remote-chat']
-      .map((f) => repoFile(`examples/multi-session/xmpp/${f}.yaml`))
+      .map((f) => repoFile(exampleConfigUrl(f)))
       .join('\n'),
   },
 ];

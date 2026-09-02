@@ -56,25 +56,57 @@ function tsFilesUnder(dir: string, out: string[] = []): string[] {
 const withoutComments = (source: string): string =>
   source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
 
+/** What a path segment this scan cannot read stands for: anything, of any depth. */
+const UNKNOWN_SEGMENT = '*';
+
 /**
- * Every relative path a source names. Three spellings, because the escape that shipped used the
- * first and the one this file's own controls need uses the third: a quoted literal, an
- * uninterpolated template literal, and the SEGMENT form (`join(dir, '..', '..', 'other', 'src')`),
- * which a quoted-literal scan misses entirely.
+ * The arguments of a `join(...)`/`resolve(...)` call, as written. A comma inside a nested call
+ * splits one argument into fragments, and every fragment that is not a quoted literal becomes an
+ * {@link UNKNOWN_SEGMENT} — which is the safe direction: it widens what the path could be.
+ */
+const argumentsOf = (call: string): string[] =>
+  call.split(',').map((a) => a.trim()).filter((a) => a !== '');
+
+/**
+ * Every relative path a source names, with anything the scan cannot read as a literal standing in
+ * as {@link UNKNOWN_SEGMENT}. An interpolation is a WILDCARD rather than a stop: the escape that
+ * shipped was a quoted literal, but `../../${pkg}/src`, `'../../' + pkg` and a `join()` whose
+ * package segment is a variable all name a sibling package just as effectively, and a scan that
+ * reads only fully-literal spellings reports a repository with none of them as clean.
  */
 export function relativePathsNamed(source: string): string[] {
   const code = withoutComments(source);
+  const wildcarded = (body: string): string =>
+    body.replaceAll(/\$\{[^}]*\}/g, UNKNOWN_SEGMENT);
   return [
-    ...[...code.matchAll(/(['"])(\.\.?\/[^'"\n]*)\1/g)].map((m) => m[2] as string),
-    ...[...code.matchAll(/`(\.\.?\/[^`\n$]*)`/g)].map((m) => m[1] as string),
+    ...[...code.matchAll(/(['"])(\.\.?\/[^'"\n]*)\1(\s*\+)?/g)].map(
+      (m) => (m[2] as string) + (m[3] === undefined ? '' : UNKNOWN_SEGMENT),
+    ),
+    ...[...code.matchAll(/`(\.\.?\/[^`\n]*)`/g)].map((m) => wildcarded(m[1] as string)),
     ...[...code.matchAll(/\b(?:join|resolve)\(([^)]*)\)/g)]
-      .map((m) => [...(m[1] as string).matchAll(/'([^']*)'/g)].map((q) => q[1] as string))
-      .filter((segments) => segments[0]?.startsWith('..') === true)
-      .map((segments) => segments.join('/')),
+      .map((m) => argumentsOf(m[1] as string))
+      .map((args) => {
+        const first = args.findIndex((a) => /^'\.\.?(\/|')/.test(a));
+        return first === -1 ? [] : args.slice(first);
+      })
+      .filter((args) => args[0]?.startsWith("'..") === true)
+      .map((args) =>
+        args
+          .map((a) => (/^'[^']*'$/.test(a) ? a.slice(1, -1) : UNKNOWN_SEGMENT))
+          .join('/'),
+      ),
   ];
 }
 
-/** Which of `file`'s named paths land inside a package other than the one holding `file`. */
+/**
+ * Which of `file`'s named paths land inside a package other than the one holding `file`.
+ *
+ * A path carrying an {@link UNKNOWN_SEGMENT} is judged on the literal HEAD it resolves to, and any
+ * package under that head counts as reached: the segment the scan could not read may hold a
+ * package name, a path with slashes in it, or the caller's own variable, and a rule that assumed
+ * the harmless reading would be a rule with a hole rather than a rule. Resolving it against the
+ * values actually passed, or writing the path as a literal, is what clears it.
+ */
 export function reachesIntoAnotherPackage(
   file: string,
   source: string,
@@ -83,8 +115,16 @@ export function reachesIntoAnotherPackage(
 ): string[] {
   const inside = (abs: string, dir: string): boolean => abs === dir || abs.startsWith(`${dir}/`);
   return [...new Set(relativePathsNamed(source))].filter((p) => {
-    const abs = resolve(dirname(file), p);
-    return packages.some((dir) => dir !== own && inside(abs, dir));
+    const wildcard = p.indexOf(UNKNOWN_SEGMENT);
+    if (wildcard === -1) {
+      const abs = resolve(dirname(file), p);
+      return packages.some((dir) => dir !== own && inside(abs, dir));
+    }
+    // Cut at the last complete directory, so that a wildcard inside a segment (`../../beta-${x}`)
+    // is judged from the directory that segment lives in rather than from a prefix of its name.
+    const literal = p.slice(0, p.lastIndexOf('/', wildcard) + 1);
+    const head = resolve(dirname(file), literal === '' ? '.' : literal);
+    return packages.some((dir) => dir !== own && inside(dir, head));
   });
 }
 
@@ -130,6 +170,15 @@ describe('the boundary rule on a planted tree', () => {
     return root;
   };
 
+  /**
+   * The control bodies below name a path with a segment this scan cannot read, and this file is
+   * scanned by the rule it declares. Keep these prefixes out of the bodies as literals, so that
+   * this file's own controls are not read as this file reaching into every package in the repo.
+   */
+  const UP2 = '../' + '../';
+  const UP3 = '../' + '../' + '../';
+  const UP2_SEGMENTS = "'..', '..'";
+
   const TWO_PACKAGES = {
     'package.json': JSON.stringify({ workspaces: ['packages/*'] }),
     'DESIGN.md': 'the design\n',
@@ -159,6 +208,20 @@ describe('the boundary rule on a planted tree', () => {
     ['a template literal naming one', 'const p = `../../beta/src/seam.ts`;', true],
     ['the segment form', "const p = join(here, '..', '..', 'beta', 'src');", true],
     ['naming the sibling directory itself', "readdirSync('../../beta')", true],
+    ['a resolve() of a sibling source', "import.meta.resolve('../../beta/src/seam.js')", true],
+    // One row per SPELLING of the same reach, so the next way to write it is a row rather than a
+    // rediscovery.
+    ['an interpolated template', `const p = \`${UP2}\${which}/src/seam.ts\`;`, true],
+    ['a concatenation', `const p = '${UP2}' + which;`, true],
+    ['a URL built from a concatenation', `const p = new URL('${UP2}' + which + '/src', u);`, true],
+    ['a join() with a variable segment', `const p = join(here, ${UP2_SEGMENTS}, which, 'src');`, true],
+    ['an interpolated package name', `const p = \`${UP2}beta-\${flavour}/src\`;`, true],
+    // The mirror rows: an interpolation that cannot leave its own package, and one whose head is a
+    // repo directory holding no package, must both stay accepted or the rule is unusable.
+    ['an interpolated path inside its own package', `const p = \`./fixtures/\${name}.json\`;`, false],
+    ['an interpolated path under its own src', `const p = \`../src/\${name}.ts\`;`, false],
+    ['an interpolated path under a non-package directory', `const p = \`${UP3}docs/\${f}.md\`;`, false],
+    ['an interpolated sibling path named only in prose', `// see \`${UP2}\${p}/src\`\nconst a = 1;`, false],
     // The repo-level shapes a "never leave my directory" rule forbids and this one must not.
     ['the packages root', "const dir = new URL('../../', import.meta.url)", false],
     ['a repo-root document', "readFileSync('../../../DESIGN.md')", false],
