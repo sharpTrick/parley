@@ -23,6 +23,12 @@ export interface ReadWindow {
 /** Why a long-poll waiter woke: only `message` implies the archive may still be lagging. */
 export type WakeReason = 'message' | 'timeout' | 'cancel';
 
+/** A one-shot registered interest in a room's live traffic ({@link XmppArchive.armWaiter}). */
+export interface RoomWaiter {
+  park: (ms: number) => Promise<WakeReason>;
+  cancel: () => void;
+}
+
 export class XmppArchive extends XmppConnection {
   protected mamPage = MAM_PAGE;
 
@@ -129,11 +135,14 @@ export class XmppArchive extends XmppConnection {
   }
 
   /**
-   * Native long-poll: MUC-live-wait + MAM-reconcile. Each round REGISTERS the room waiter before
-   * re-reading {@link readWindow}, so that a message reflected during the query's round trip fires
-   * an already-registered waiter instead of firing into the void; its park timer only starts once
-   * the query is back, so the park is the interval asked for rather than what a slow server left of
-   * it. An empty return is safe: it carries the last window read, whose cursor never precedes `since`.
+   * Native long-poll: MUC-live-wait + MAM-reconcile. `armed` is the interest the CALLER registered
+   * before its first await, and every later round re-arms before its own read, so that a message
+   * reflected at any point between the call starting and this returning fires a waiter that is
+   * already in the room's set. A wake fired into an empty set is gone; if the archive then commits
+   * after the next read's snapshot there is nothing left to wake the loop, and the caller parks out
+   * the whole budget on a message the archive already holds. The park timer only starts once the
+   * query is back, so the park is the interval asked for rather than what a slow server left of it.
+   * An empty return is safe: it carries the last window read, whose cursor never precedes `since`.
    *
    * Once a live message has been seen the archive is known to be behind the stream, so the re-poll
    * interval DOUBLES from {@link MAM_LAG_POLL_MS} instead of expiring back to the whole remaining
@@ -144,30 +153,36 @@ export class XmppArchive extends XmppConnection {
     since: string | undefined,
     limit: number,
     blockMs: number,
-    firstRead: ReadWindow,
+    armed: RoomWaiter,
   ): Promise<ReadWindow> {
     const deadline = Date.now() + blockMs;
     const room = this.roomJid(topic);
-    let latest = firstRead;
+    let latest: ReadWindow = { items: [] };
     let lagPoll = 0;
-    for (;;) {
-      if (this.stopped || Date.now() >= deadline) return latest;
-      const waiter = this.armWaiter(room);
-      try {
-        latest = await this.readWindow(topic, since, limit);
-        if (latest.items.length > 0 || this.stopped) return latest;
-        const budget = deadline - Date.now();
-        const park = lagPoll > 0 ? Math.min(budget, lagPoll) : budget;
-        if (park <= 0) return latest;
-        const reason = await waiter.park(park);
-        if (reason === 'message') lagPoll = MAM_LAG_POLL_MS;
-        else if (reason === 'timeout' && lagPoll > 0) lagPoll *= 2;
-      } catch (err) {
-        if (this.stopped) return latest;
-        throw err;
-      } finally {
+    let waiter = armed;
+    try {
+      for (;;) {
+        if (this.stopped || Date.now() >= deadline) return latest;
+        try {
+          latest = await this.readWindow(topic, since, limit);
+          if (latest.items.length > 0 || this.stopped) return latest;
+          const budget = deadline - Date.now();
+          const park = lagPoll > 0 ? Math.min(budget, lagPoll) : budget;
+          if (park <= 0) return latest;
+          const reason = await waiter.park(park);
+          if (reason === 'message') lagPoll = MAM_LAG_POLL_MS;
+          else if (reason === 'timeout' && lagPoll > 0) lagPoll *= 2;
+        } catch (err) {
+          if (this.stopped) return latest;
+          throw err;
+        }
+        // Re-arm with no await in between, so that the room's set is never empty while this call is
+        // still running and a reflection cannot slip through the gap.
         waiter.cancel();
+        waiter = this.armWaiter(room);
       }
+    } finally {
+      waiter.cancel();
     }
   }
 
@@ -177,10 +192,7 @@ export class XmppArchive extends XmppConnection {
    * called after the waiter has already fired, and then arms no timer; `cancel()` — also the fire
    * path — is idempotent and clears the timer and the registration.
    */
-  protected armWaiter(room: string): {
-    park: (ms: number) => Promise<WakeReason>;
-    cancel: () => void;
-  } {
+  protected armWaiter(room: string): RoomWaiter {
     let resolveFired!: (reason: WakeReason) => void;
     const fired = new Promise<WakeReason>((r) => {
       resolveFired = r;

@@ -3,65 +3,108 @@ import { describe, expect, it } from 'vitest';
 import { XmppPlugin } from '../src/index.js';
 import { attach, expectNoLeaks, FakeXmpp, seedJoined } from './fake-xmpp.js';
 
-// Class: a lost wakeup caused by arming the wake source AFTER the state snapshot it races.
-// `fetchRecent({blockMs})` is MAM-query + live-wait; if the waiter is armed only once a query has
-// come back empty, a message that lands during that query's round trip fires into the void and the
-// caller waits out the whole budget (up to catchup.block_max_ms) for a message that already exists.
-// The table injects a realistic remote round trip and drops a message into EVERY stage of the
-// blocking path — before the query is snapshotted, inside the in-flight window, and after the
-// waiter is armed — asserting an upper bound on latency in each, not just "it eventually returned".
+// Class: a lost wakeup caused by arming the wake source AFTER a window a live message can land in.
+// `fetchRecent({blockMs})` is MAM-query + live-wait, and the wake is one-shot: a reflection that
+// fires when no waiter is registered is GONE. If the archive row then commits after the next read's
+// snapshot there is nothing left to wake the loop and the caller parks out the whole budget (core's
+// catchup.block_max_ms, 60 s by default) on a message the archive already holds.
+//
+// The property is therefore an INVARIANT, not a step: from the moment a blocking fetch starts until
+// it returns, the room's waiter set is never empty. Every cell below records `waiters.size` at the
+// instant the live copy is reflected and asserts it is non-zero, so the defect is graded where it
+// happens rather than only through its latency.
+//
+// The arrival axis names WINDOWS OF THE PATH, never query ordinals: an ordinal moves the moment the
+// fix changes how many reads happen, which is how the row this replaces came to deliver its message
+// nowhere at all. Each window is triggered off state the fixture or the plugin can actually observe
+// — the server holding this connection's occupancy, a query being in flight, the plugin having
+// re-armed. Crossed with the archival lag between the live copy and its archive row, and with the
+// MAM round-trip latency, and bounded by the LAG rather than by the budget.
 
 const TOPIC = asTopic('t-longpoll');
-const LATENCY_MS = 200;
-const BLOCK_MS = 4_000;
-/** Generous over one round trip, far under the budget: only a lost wake reaches the deadline. */
-const PROMPT_MS = 1_500;
+const BLOCK_MS = 8_000;
 
-type Stage =
-  | 'before-query-snapshot'
-  | 'in-flight-after-snapshot'
-  | 'in-flight-of-the-recheck'
-  | 'after-waiter-armed';
+type Arrival =
+  | 'inside the join'
+  | 'inside the first archive read'
+  | 'while parked after the first read'
+  | 'inside a later archive read';
 
-const stages: Array<{ stage: Stage; note: string }> = [
-  { stage: 'before-query-snapshot', note: 'the query itself must return it' },
-  { stage: 'in-flight-after-snapshot', note: 'invisible to the in-flight query; only a wake finds it' },
-  { stage: 'in-flight-of-the-recheck', note: 'lands during the blocking path own re-query' },
-  { stage: 'after-waiter-armed', note: 'delivered between arming and parking' },
+const arrivals: Array<{ arrival: Arrival; note: string }> = [
+  { arrival: 'inside the join', note: 'admitted to the room, before any read was issued' },
+  { arrival: 'inside the first archive read', note: "after that read's snapshot, in its round trip" },
+  { arrival: 'while parked after the first read', note: 'the park itself, with no query in flight' },
+  { arrival: 'inside a later archive read', note: "a re-poll's round trip, after an earlier wake" },
 ];
 
+/** Fixed cost the plugin pays whatever the lag: probe, join, MAM check, and the reads either side
+ * of the doubling re-poll's overshoot. Independent of `blockMs` — only a LOST wake reaches that. */
+const promptBound = (lagMs: number, mamLatencyMs: number): number => 2 * lagMs + 700 + 5 * mamLatencyMs;
+
+const wakeCells = arrivals.flatMap(({ arrival, note }) =>
+  [0, 50, 400, 1_000].flatMap((lagMs) =>
+    [0, 200].map((mamLatencyMs) => ({ arrival, note, lagMs, mamLatencyMs })),
+  ),
+);
+
 describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () => {
-  it.each(stages)(
-    'returns promptly when a message lands $stage ($note)',
-    async ({ stage }) => {
+  it.each(wakeCells)(
+    'a live copy arriving $arrival ($note), $lagMs ms archival lag, $mamLatencyMs ms round trip',
+    async ({ arrival, lagMs, mamLatencyMs }) => {
       const plugin = new XmppPlugin();
       const fake = new FakeXmpp();
       const p = attach(plugin, fake);
       const room = p.roomJid(TOPIC);
-      seedJoined(p, fake, room);
+      // NOT pre-joined: the probe and the join are windows of this call too, and a cell that seeds
+      // occupancy cannot see a wake lost in either of them.
+      fake.rooms.add(room);
       const seed = fake.archiveOnly(room, 'old');
+      fake.mamLatencyMs = mamLatencyMs;
 
-      let delivered = false;
-      const deliverOnce = (): void => {
-        if (delivered) return;
-        delivered = true;
-        fake.deliver(room, 'fresh');
+      const archiveTimers: Array<ReturnType<typeof setTimeout>> = [];
+      let waitersAtDelivery: number | undefined;
+      const deliverLive = (): void => {
+        if (waitersAtDelivery !== undefined) return;
+        waitersAtDelivery = p.waiters.get(room)?.size ?? 0;
+        fake.reflectOnly(room, 'fresh');
+        archiveTimers.push(setTimeout(() => fake.archiveOnly(room, 'fresh'), lagMs));
       };
-      fake.mamLatencyMs = LATENCY_MS;
-      if (stage === 'before-query-snapshot') fake.onMamRequest = deliverOnce;
-      if (stage === 'in-flight-after-snapshot') fake.onMamInFlight = deliverOnce;
-      if (stage === 'in-flight-of-the-recheck') {
-        let queries = 0;
-        fake.onMamInFlight = () => {
-          if (++queries > 1) deliverOnce();
+
+      let arms = 0;
+      const armWaiter = p.armWaiter.bind(plugin);
+      p.armWaiter = (r: string) => {
+        arms++;
+        return armWaiter(r);
+      };
+
+      if (arrival === 'inside the join') {
+        // The MAM-availability disco runs once the server holds this connection's occupancy and
+        // before ensureJoinedRoom resolves, so the room is live to us and no read exists yet.
+        fake.onDiscoRequest = () => {
+          if (fake.occupied.has(room)) deliverLive();
         };
       }
-      if (stage === 'after-waiter-armed') {
-        const armWaiter = p.armWaiter.bind(plugin);
-        p.armWaiter = (r: string) => {
-          const waiter = armWaiter(r);
-          deliverOnce();
-          return waiter;
+      if (arrival === 'inside the first archive read') fake.onMamInFlight = () => deliverLive();
+      if (arrival === 'while parked after the first read') {
+        // The park has no observable handle from the fixture, so land in it by the clock: the read
+        // is back one round trip after the query arrives, and the park then runs for seconds.
+        fake.onMamRequest = () => {
+          if (arms > 0 && waitersAtDelivery === undefined) {
+            archiveTimers.push(setTimeout(deliverLive, mamLatencyMs + 60));
+          }
+        };
+      }
+      if (arrival === 'inside a later archive read') {
+        // Wake the loop with a live stanza the archive never holds, then deliver the real copy in a
+        // round trip the plugin only reaches by having re-armed — never by a query count.
+        let spurious = false;
+        fake.onMamInFlight = () => {
+          if (!spurious) {
+            spurious = true;
+            fake.reflectOnly(room, 'not-archived');
+            return;
+          }
+          if (arms > 1) deliverLive();
         };
       }
 
@@ -72,12 +115,15 @@ describe('XMPP long-poll wakeup (no lost wakes across the blocking path)', () =>
         blockMs: BLOCK_MS,
       });
       const elapsed = Date.now() - started;
+      for (const t of archiveTimers) clearTimeout(t);
 
+      expect(waitersAtDelivery).toBeGreaterThan(0);
       expect(res.messages.map((m) => m.content)).toEqual(['fresh']);
-      expect(elapsed).toBeLessThan(PROMPT_MS);
+      expect(elapsed).toBeLessThanOrEqual(promptBound(lagMs, mamLatencyMs));
       expectNoLeaks(plugin);
       await plugin.disconnect();
     },
+    30_000,
   );
 
   it('holds the full budget (and leaks nothing) when nothing is posted', async () => {

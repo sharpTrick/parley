@@ -191,6 +191,6 @@ export class XmppInbound extends XmppRooms {
   protected rejoinAfterReconnect(): void {
     for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
     this.pendingPosts.clear();
-    for (const room of this.forgetAllRooms()) this.redriveJoin(room, 'reconnect');
+    for (const room of this.forgetAllRooms()) void this.redriveJoin(room, 'reconnect');
   }
 }

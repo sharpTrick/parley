@@ -103,15 +103,27 @@ export class XmppRooms extends XmppArchive {
     const wait = REJOIN_BASE_MS * 2 ** (losses - 1) + Math.floor(Math.random() * REJOIN_BASE_MS);
     console.error(`[parley-xmpp] occupancy in ${room} ended (${why}); re-joining in ${wait} ms`);
     const timer = setTimeout(() => {
-      if (!this.stopped && this.subscriptions.has(room)) this.redriveJoin(room, 'losing occupancy');
+      if (!this.stopped && this.subscriptions.has(room)) void this.redriveJoin(room, 'losing occupancy');
     }, wait);
     this.rejoins.set(room, { losses, at: now, timer });
   }
 
-  /** Re-enter `room` in the background, reporting a failure rather than swallowing the rejection. */
-  protected redriveJoin(room: string, after: string): void {
-    void this.ensureJoinedRoom(room).catch((err: unknown) => {
-      console.error(`[parley-xmpp] re-join after ${after} failed for ${room}: ${wire.asError(err).message}`);
+  /**
+   * Re-enter `room`, reporting a failure rather than swallowing the rejection: `ensureJoinedRoom`
+   * has already dropped the cache by the time this sees the rejection, so the room is outside its
+   * MUC with nothing scheduled to re-enter it and a subscribed topic's live push is dead. Keep every
+   * re-drive on THIS path, so that a trigger added later cannot be the one that reports nothing.
+   *
+   * It never rejects, so a caller that must wait for the re-entry can await it. Recovery is not
+   * re-scheduled here — the ladder in {@link onOccupancyLost} is armed by the loss, not by the
+   * re-join that answered it — which is what the reported consequence says.
+   */
+  protected redriveJoin(room: string, after: string): Promise<void> {
+    return this.ensureJoinedRoom(room).catch((err: unknown) => {
+      console.error(
+        `[parley-xmpp] re-join after ${after} failed for ${room}: ${wire.asError(err).message} — ` +
+          'live push for this topic stays dead until a post or fetch_recent re-enters the room',
+      );
     });
   }
 
@@ -174,13 +186,19 @@ export class XmppRooms extends XmppArchive {
    * Keep the `conflict` fallback in {@link doJoin} rather than here, so that a nick another occupant
    * holds produces one outcome and one diagnostic whether the first seam call was a `post` or a
    * `subscribe`.
+   *
+   * Each re-entry goes through {@link redriveJoin}, so that a room this switch cannot get back into
+   * is reported: this runs inside the FIRST post, whose own room is re-joined on the way and whose
+   * success says nothing about the other rooms in the loop. Swallowing them left a subscribed topic
+   * permanently outside its MUC with nothing on stderr. `redriveJoin` never rejects, so the awaited
+   * switch still cannot fail a caller's post.
    */
   private async switchNick(wanted: string): Promise<void> {
     if (wanted === '' || wanted === this.nick) return;
     this.nick = wanted;
     const rooms = this.forgetAllRooms();
     if (rooms.length === 0) return;
-    await Promise.allSettled(rooms.map((r) => this.ensureJoinedRoom(r)));
+    await Promise.all(rooms.map((r) => this.redriveJoin(r, 'a nick change')));
   }
 
   /**

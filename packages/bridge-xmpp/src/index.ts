@@ -186,29 +186,42 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
     return promise;
   }
 
+  /**
+   * Register the room's interest BEFORE the first await, so that a live reflection landing anywhere
+   * in the call — the existence probe, the join and its MAM check, or the first archive read — fires
+   * a waiter that is already registered. A wake fired into an empty set is gone, and a blocking read
+   * whose snapshot then misses the archive commit has nothing left to wake it: it parks out the
+   * whole budget (core's `catchup.block_max_ms`, 60 s by default) on a message the archive holds.
+   */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const since = args.since === undefined ? undefined : String(args.since);
-    if (!(await this.roomExists(args.topic))) {
-      return { messages: [], nextCursor: args.since ?? asCursor('') };
-    }
-    await this.ensureJoinedRoom(this.roomJid(args.topic));
     const limit = args.limit ?? 100;
-
-    let window = await this.readWindow(args.topic, since, limit);
     const blockMs = Math.floor(args.blockMs ?? 0);
-    if (window.items.length === 0 && blockMs > 0) {
-      window = await this.blockingMam(args.topic, since, limit, blockMs, window);
-    }
+    const room = this.roomJid(args.topic);
+    const waiter = blockMs > 0 ? this.armWaiter(room) : undefined;
+    try {
+      if (!(await this.roomExists(args.topic))) {
+        return { messages: [], nextCursor: args.since ?? asCursor('') };
+      }
+      await this.ensureJoinedRoom(room);
 
-    const messages = window.items.map((it) => this.toMessage(args.topic, it));
-    // Keep an EMPTY page's cursor on the window's unfiltered tail, so that a window of nothing but
-    // stanzas the seam drops advances past them instead of reporting '' — the zero cursor, which
-    // asks for this room's archive from message one. Keep a page that DID carry rows on its own last
-    // row, so that a truncated page cannot skip what it withheld (conformance grades it).
-    const nextCursor =
-      messages.at(-1)?.cursor ??
-      (window.tail === undefined ? (args.since ?? asCursor('')) : asCursor(window.tail));
-    return { messages, nextCursor };
+      const window =
+        waiter === undefined
+          ? await this.readWindow(args.topic, since, limit)
+          : await this.blockingMam(args.topic, since, limit, blockMs, waiter);
+
+      const messages = window.items.map((it) => this.toMessage(args.topic, it));
+      // Keep an EMPTY page's cursor on the window's unfiltered tail, so that a window of nothing but
+      // stanzas the seam drops advances past them instead of reporting '' — the zero cursor, which
+      // asks for this room's archive from message one. Keep a page that DID carry rows on its own last
+      // row, so that a truncated page cannot skip what it withheld (conformance grades it).
+      const nextCursor =
+        messages.at(-1)?.cursor ??
+        (window.tail === undefined ? (args.since ?? asCursor('')) : asCursor(window.tail));
+      return { messages, nextCursor };
+    } finally {
+      waiter?.cancel();
+    }
   }
 
   /**

@@ -1,4 +1,4 @@
-import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Class: diagnostics discarded on the failure path. A bridge whose stream is flapping, whose
@@ -41,30 +41,125 @@ describe('XMPP failure-path diagnostics', () => {
     await plugin.disconnect();
   });
 
-  it('reports a re-join that fails after a reconnect instead of swallowing it', async () => {
+});
+
+// Class: a join re-driven for ANY reason must report its failure, and the seam call that caused it
+// must not report success over a topic it has left dead. Every trigger below drops the plugin's
+// cached join and drives a fresh one; a rejection swallowed on any of them leaves a SUBSCRIBED topic
+// outside its MUC with live push dead for good and nothing on stderr — indistinguishable from an
+// idle bridge. The suite pinned only the reconnect trigger, so the nick-adoption path shipped
+// discarding every rejection through `Promise.allSettled` and was graded by nothing.
+//
+// Each row asserts the line — the room, the server's own condition, and the consequence it promises
+// the operator — AND the push state that line describes: dead while the re-join keeps bouncing, and
+// alive again once a later seam call re-enters the room. A row therefore cannot pass on the log
+// alone, and the promise the line makes is graded rather than merely printed.
+
+interface Redrive {
+  name: string;
+  /** What the report must name the re-drive as. */
+  after: string;
+  /** Drive it, leaving the SUBSCRIBED room's re-join bounced. Never throws for the caller. */
+  drive(ctx: RedriveCtx): Promise<void>;
+  /** Pin `backend_config.nick`, so that only the row that MEANS to adopt one drives a nick change. */
+  pinNick?: false;
+}
+interface RedriveCtx {
+  plugin: XmppPlugin;
+  fake: FakeXmpp;
+  topic: Topic;
+  room: string;
+  /** A second topic, so a trigger can be driven through a call that is NOT about `topic`. */
+  otherTopic: Topic;
+}
+
+/** Longer than the ladder's first step (200 ms + up to 200 ms of jitter). */
+const LADDER_MS = 900;
+const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+const redrives: Redrive[] = [
+  {
+    name: 'a reconnect',
+    after: 'reconnect',
+    drive: async ({ fake }) => {
+      fake.emit('online'); // the initial connect, consumed by the first-online guard
+      fake.emit('online'); // the reconnect: occupancy is gone and every room is re-driven
+      await settle(50);
+    },
+  },
+  {
+    name: 'a kick (the re-entry ladder)',
+    after: 'losing occupancy',
+    drive: async ({ fake, room }) => {
+      fake.endOccupancy(room, { statuses: ['307'] });
+      await settle(LADDER_MS);
+    },
+  },
+  {
+    name: 'a post bounced as not-an-occupant',
+    after: 'losing occupancy',
+    drive: async ({ plugin, fake, topic }) => {
+      fake.postReply = 'error';
+      fake.postErrorCondition = 'not-acceptable';
+      await plugin.post(topic, asHandle('parley'), 'x').catch(() => undefined);
+      await settle(LADDER_MS);
+    },
+  },
+  {
+    name: 'nick adoption on the first post to ANOTHER topic',
+    after: 'a nick change',
+    pinNick: false,
+    drive: async ({ plugin, otherTopic }) => {
+      await plugin.post(otherTopic, asHandle('alice'), 'hello').catch(() => undefined);
+      await settle(50);
+    },
+  },
+];
+
+describe('XMPP reports every re-driven join that fails', () => {
+  afterEach(() => {
+    mockState.client = undefined;
+    vi.restoreAllMocks();
+  });
+
+  it.each(redrives)('$name', async ({ after, drive, pinNick }) => {
     const fake = new FakeXmpp();
-    fake.joinReply = 'error';
-    fake.joinErrorCondition = 'forbidden';
     mockState.client = fake;
     const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     const plugin = new XmppPlugin();
-    await plugin.connect(CONFIG);
-    const topic = asTopic('t-diag');
+    await plugin.connect(pinNick === false ? CONFIG : { ...CONFIG, nick: 'parley-pinned' });
+    const topic = asTopic('t-redrive');
+    const otherTopic = asTopic('t-redrive-other');
     const room = priv(plugin).roomJid(topic);
-    priv(plugin).subscriptions.set(room, { topic, handlers: [() => undefined] });
-    priv(plugin).joined.set(room, Promise.resolve());
+    const seen: string[] = [];
+    await plugin.subscribe(topic, (m) => seen.push(m.content));
 
-    fake.emit('online'); // initial connect, consumed by the first-online guard
-    fake.emit('online'); // the reconnect: occupancy is gone, the re-join is rejected
-    await vi.waitFor(() => expect(errors).toHaveBeenCalled());
+    fake.joinReply = 'error';
+    fake.joinErrorCondition = 'forbidden';
+    await drive({ plugin, fake, topic, room, otherTopic });
 
     const logged = errors.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).toContain('re-join after reconnect failed');
-    expect(logged).toContain(room);
+    expect(logged).toContain(`re-join after ${after} failed for ${room}`);
     expect(logged).toContain('forbidden'); // the condition, not a flattened 'error'
+    expect(logged).toContain('live push for this topic stays dead');
+
+    // The consequence the line names, not just the line: the room is left, and it stays left.
+    expect(priv(plugin).joined.has(room)).toBe(false);
+    fake.deliver(room, 'while-out');
+    await settle(20);
+    expect(seen).toEqual([]);
+
+    // And the recovery it names: the next seam call re-enters the room and push comes back.
+    fake.joinReply = 'self';
+    fake.postReply = 'reflect';
+    await plugin.fetchRecent({ topic });
+    fake.deliver(room, 'after-re-entry');
+    await settle(20);
+    expect(seen).toEqual(['after-re-entry']);
+
     await plugin.disconnect();
-  });
+  }, 15_000);
 });
 
 // Class: a fallback that degrades a documented durability property without a signal. A room this
