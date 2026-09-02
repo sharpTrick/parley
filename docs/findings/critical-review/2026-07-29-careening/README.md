@@ -497,10 +497,27 @@ is wrong and what to do about it. Grading those prescriptions against the code t
 sharper instrument than the findings themselves, because a critic writing a prescription has to
 commit to a causal claim, and a causal claim can be refuted.
 
-**89 wrong prescriptions across rounds 9–19, none caught by any test suite.** The failure modes have
-shifted decisively over the run. Early rounds produced *"this fix is weak."* Rounds 18 and 19 produce
-*"this fix is impossible, would make things worse, or rests on a fact about the code that is false."*
-Round 19's nineteen include four that were disproved by measurement in the fixer's own session:
+**89 wrong prescriptions across rounds 9–19, none caught by any test suite.** The total is a sound
+*forward* sum (43 stated for rounds 9–16, then +13, +14, +19) from a soft anchor — the 43 cannot be
+reconstructed from the records beneath it, and round 16 reports three mutually inconsistent counts of
+itself. The inspectable case-level corpus is 65, or ~82 including two partially-recorded rounds. Treat
+89 as ±5. The half of the claim that needs no qualification is the second half.
+
+**A correction to an earlier version of this section.** It asserted that the failure modes *shifted*
+from *"this fix is weak"* to *"this fix is impossible."* Coded over all 57 machine-readable cases,
+that shift is **not in the data**: the strong-mode share oscillates between 50% and 69% with no trend,
+and round 13 — the earliest round with a case-level record — is the *highest* in the series at 88%.
+
+Two things did move, both monotonically, and they are a better result than the claim they replace. The
+**rate** of wrong prescriptions rose from 18% of blocking findings at round 9 to **59%** at round 19
+(18, 17, 24, ≥40, ~32, 43, 45, 59). And the **evidentiary basis** on which they were disproved shifted
+from reading-and-arguing to running-and-measuring: cases settled by *executing* something went 9%
+(R16) → 31% (R17) → 36% (R18) → **63%** (R19). The modes did not change kind; **the fixers changed
+method.** The most accurate one-line summary of the corpus is round 19's other sentence — the dominant
+mode is *a critic being right about the measurement and wrong about the cause*, 30% of cases and the
+largest single bucket.
+
+Four of round 19's nineteen were disproved by measurement in the fixer's own session:
 
 - A prescription refuted from the **vendor's own source**. Zulip's `include_anchor` finding claimed a
   fixture defect; `zerver/lib/narrow.py` shows `newest` is a sentinel that skips the id filter
