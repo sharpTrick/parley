@@ -177,9 +177,10 @@ export function warnInsecureConfig(service: string, password: string | undefined
   }
   if (isPlaintextRemote(service)) {
     console.warn(
-      `[parley-xmpp] SECURITY: service ${service} can put backend_config.password on the ` +
-        'network in the clear — it names a non-loopback host over a plaintext scheme, or over ' +
-        'no scheme at all, which @xmpp/resolve answers by DNS-SRV whose candidate list ends at ' +
+      `[parley-xmpp] SECURITY: backend_config.service ${service} can put ` +
+        'backend_config.password on the network in the clear — it names a non-loopback host over ' +
+        'a plaintext scheme, or over no scheme at all, which @xmpp/resolve answers by DNS-SRV ' +
+        'whose candidate list ends at ' +
         "a cleartext xmpp://…:5222. @xmpp/client's STARTTLS is opportunistic and SASL PLAIN is " +
         'always offered, so a peer that does not advertise (or that is stripped of) STARTTLS ' +
         'receives the password. Use xmpps:// or wss://.',

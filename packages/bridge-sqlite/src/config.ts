@@ -32,7 +32,7 @@ export interface SqliteBackendConfig {
    * the cursor — so skew between hosts sharing one file shifts which messages survive, and a row
    * can be pruned before any reader's cursor has reached it.
    */
-  retention_days?: number;
+  retention_days?: number | null;
 }
 
 /** How many new rows a single poll tick drains at most before yielding. */
@@ -64,6 +64,13 @@ export const MIN_POLL_INTERVAL_MS = 10;
  * `1e-9`, or a unit slip that meant milliseconds.
  */
 export const MIN_RETENTION_DAYS = 1 / 1440;
+/**
+ * Ceiling for `retention_days`, in days: the age of the epoch, which is where the cutoff stops
+ * being a cutoff. Past it `ts` is compared against an instant before any message this store could
+ * hold, so nothing is ever outside the window and the prune the operator asked for silently never
+ * runs — the opposite mistake to the floor above, and just as quiet.
+ */
+export const maxRetentionDays = (): number => Math.floor(Date.now() / 86_400_000);
 /**
  * Ceiling for `poll_interval_ms`. Keep it at setTimeout's 32-bit limit: Node silently clamps a
  * larger delay to 1 ms, so an operator asking for a very slow poll would get a hot loop instead.
@@ -136,19 +143,21 @@ export function validateBackendConfig(config: BackendConfig): SqliteBackendConfi
   const retention = cfg['retention_days'];
   if (
     retention !== undefined &&
-    (typeof retention !== 'number' || !(retention >= MIN_RETENTION_DAYS))
+    retention !== null &&
+    (typeof retention !== 'number' ||
+      !(retention >= MIN_RETENTION_DAYS) ||
+      retention > maxRetentionDays())
   ) {
     throw bad(
       'retention_days',
-      `expected a number >= ${MIN_RETENTION_DAYS} (one minute), got ${describe(retention)} — a ` +
-        `window this short deletes the whole history on the connect() prune, which is what 0 and ` +
-        `negatives were already refused for; omit the key to keep every message forever`,
+      `expected a number between ${MIN_RETENTION_DAYS} (one minute) and ${maxRetentionDays()} ` +
+        `(the age of the epoch), got ${describe(retention)} — a window this short deletes the ` +
+        `whole history on the connect() prune, which is what 0 and negatives were already refused ` +
+        `for, and a window past the epoch puts the cutoff before any message this store could ` +
+        `hold, so pruning would silently never run at all; omit the key (or set it to null) to ` +
+        `keep every message forever`,
     );
   }
-  if (typeof retention === 'number' && !Number.isFinite(retention)) {
-    throw bad('retention_days', `expected a finite number, got ${describe(retention)}`);
-  }
-
   if (typeof retention === 'number') retentionCutoff(retention);
 
   return cfg as SqliteBackendConfig;

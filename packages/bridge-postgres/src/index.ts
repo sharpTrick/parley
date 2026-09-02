@@ -16,6 +16,7 @@ import {
   DEFAULT_POOL_SIZE,
   DEFAULT_TABLE_NAME,
   DEFAULT_URL,
+  plaintextCredentialOrigin,
   type PostgresBackendConfig,
   usesDefaultCredentials,
   validateBackendConfig,
@@ -81,7 +82,7 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     this.url = cfg.url ?? DEFAULT_URL;
     const table = assertTableName(cfg.table_name ?? DEFAULT_TABLE_NAME);
     this.names = quotedNames(table);
-    this.retentionDays = cfg.retention_days;
+    this.retentionDays = cfg.retention_days ?? undefined;
     this.stopped = false;
 
     if (usesDefaultCredentials(this.url)) {
@@ -89,6 +90,18 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
         '[parley-postgres] SECURITY: connecting with the repo-public default credentials ' +
           "('postgres://parley:parley@…'). Set backend_config.url to a real connection string; a " +
           'network-reachable database provisioned with these credentials is world-readable/injectable.',
+      );
+    }
+
+    const plaintext = plaintextCredentialOrigin(this.url);
+    if (plaintext !== undefined) {
+      // Keep this on stderr rather than console.warn, so that a caller counting one of these two
+      // warnings does not silently count the other.
+      process.stderr.write(
+        `parley-postgres: SECURITY: backend_config.url ${plaintext} carries a credential to a ` +
+          `non-loopback host with TLS off, so the password this bridge sends — and every message ` +
+          `body after it — crosses the network in the clear, where anyone on the path can read ` +
+          `both and write to this table. Add '?sslmode=require' for any remote server.\n`,
       );
     }
 

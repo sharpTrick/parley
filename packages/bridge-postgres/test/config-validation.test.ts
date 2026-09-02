@@ -40,7 +40,9 @@ const GOOD_VALUES: Record<string, unknown[]> = {
   url: [PG_URL],
   table_name: ['parley_ok'],
   pool_size: [1, 2, 5],
-  retention_days: [0.5, 1, 3650],
+  // `null` is the spelling a yaml key written with no value parses to, and this key reads it as
+  // the key being absent — the same reading every other backend that takes it gives.
+  retention_days: [0.5, 1, 3650, null],
 };
 
 /** Bad values that are legitimate for a given key and therefore exempt from the rejection table. */
@@ -48,7 +50,7 @@ const EXEMPT: Record<string, unknown[]> = {
   url: ['abc', '30'],
   table_name: ['abc', '30'],
   pool_size: [],
-  retention_days: [0.5],
+  retention_days: [0.5, null],
 };
 
 /**

@@ -435,8 +435,9 @@ instance_id: "ctx-payments-a"   # read-state namespace; defaults to identity.han
                                 # MUST be distinct per concurrent session sharing a handle, and
                                 # should be fresh when repointing at a different backend (cursors
                                 # are backend-specific — see §6).
-state_path: null                # override the read-state file location
-                                # (default $XDG_STATE_HOME/parley/<instance_id>/read-state.json)
+# state_path: /srv/parley/read-state.json
+#   override the read-state file location; omit the key for the default
+#   $XDG_STATE_HOME/parley/<instance_id>/read-state.json
 identity:
   handle: "ctx-payments"   # this instance's logical handle
 topics:                    # subscribe to / catch up on (one fetchRecent call each) — THE ALLOWLIST
@@ -463,7 +464,7 @@ presence:                  # announce hello/heartbeat/goodbye; powers parley_lis
   heartbeat_ms: 600000     # 10 min — agents stay subscribed a long time
   ttl_ms: 1800000          # a handle is "live" if its last beat is within this window; default 3× heartbeat_ms
 permissions:
-  skip_permissions: false  # NOT IMPLEMENTED — nothing reads it (§2.5/§14 describe the intent).
+  skip_permissions: false  # NOT IMPLEMENTED — nothing in core or any plugin reads it (§14).
                            # `true` is a load error rather than an accepted no-op, so it can never
                            # imply a sandbox mode that does not exist.
 auth:                      # remote/chat mode only; ignored under local stdio (§10)
@@ -475,6 +476,7 @@ auth:                      # remote/chat mode only; ignored under local stdio (�
     audience: "parley-mcp"       # Keycloak ignores RFC 8707 `resource` — an audience mapper is required
     required_role: "parley-owner"  # optional identity gates: also allowed_subjects / allowed_usernames
 backend_config:            # opaque to core; passed verbatim to the plugin's connect()
+  db_path: ./parley.sqlite # this file runs parley-sqlite; each plugin's own shape:
   # sqlite:   { db_path, poll_interval_ms, retention_days? }
   #             poll_interval_ms is a latency knob only; no correctness impact
   # redis:    { url, retention_days? }          postgres: { url, table_name, pool_size, retention_days? }
@@ -485,8 +487,13 @@ backend_config:            # opaque to core; passed verbatim to the plugin's con
 ```
 
 `retention_days` is an opt-in prune knob on the backends whose store Parley itself owns (sqlite,
-postgres, redis, nats). Matrix and XMPP retention is a homeserver feature, not something an unprivileged
-bridge account can enact — see each plugin's README.
+postgres, redis, nats). All four read it the same way: omit the key — or write it with no value, so
+it parses as `null` — to keep every message forever, and a window is a number of days no smaller
+than `1/1440` (one minute) and no larger than each store's own representable ceiling. Below the
+floor the window deletes the whole history the moment it is applied, and past the ceiling the
+cutoff predates every message the store could hold, so pruning silently never runs. Matrix and XMPP
+retention is a homeserver feature, not something an unprivileged bridge account can enact — see
+each plugin's README.
 
 Identity/topic→backend mapping is **convention-based by default** (derive
 room/subject/channel from handle/topic), overridable in `backend_config`.
@@ -625,7 +632,9 @@ promise: *implement six methods, get a Claude bridge for your platform.*
   and lock write access to known handles.
 - **Secrets** (tokens, JIDs, NATS/Redis creds) live in `backend_config`, never in core,
   never committed. Document `.env` / secret handling in the README.
-- **`skip_permissions` defaults OFF**, sandbox-only.
+- **`skip_permissions` is NOT IMPLEMENTED.** Nothing in core or any plugin reads it, and
+  `true` is a load error rather than an accepted no-op — there is no sandbox mode to opt
+  into, and adding one would be adding the leniency this line exists to refuse. See §11.
 - **Remote mode (chat): single-tenant OAuth front door.** Each public instance authenticates
   exactly one owner via OAuth 2.1 + PKCE with user consent. Owner credential handoff to the
   server is **local** (CLI / stdin / localhost page) so no secret crosses the public internet

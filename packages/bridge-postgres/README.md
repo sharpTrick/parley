@@ -47,7 +47,7 @@ backend_config:
   url: "postgres://parley:parley@127.0.0.1:5432/parley"   # default
   table_name: "parley_messages"   # default; [A-Za-z0-9_] only, max 52 bytes — see below
   pool_size: 5                     # default; max pooled query connections (LISTEN uses one extra)
-  retention_days: 30               # optional; omit to keep every message forever
+  retention_days: 30               # optional; omit it (or set null) to keep every message forever
 ```
 
 `table_name` is capped at 52 bytes because every other relation is derived from it by suffixing

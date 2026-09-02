@@ -135,3 +135,79 @@ describe('credentials taken from the environment are graded too', () => {
     expect(warn).toHaveBeenCalledTimes(warns ? 1 : 0);
   });
 });
+
+// CLASS: a configurable endpoint that carries a SECRET and can be dialled without encryption. Every
+// other backend classifies its own; this one did not, and it is the backend whose published default
+// DSN embeds a password. Postgres has no encrypted SCHEME to key on — `postgres://` is TLS or not
+// according to `sslmode`/`ssl` — so the axis is (host spelling × the SSL settings pg itself reads),
+// and the warning must name the KEY and the ORIGIN and neither the password nor the database.
+// It stays a WARNING, not a load error: the loopback dev server is plaintext by construction.
+
+const stderrLines = async (config: Record<string, unknown>): Promise<string[]> => {
+  const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  await new PostgresPlugin().connect(config);
+  return spy.mock.calls.map((c) => String(c[0])).filter((line) => line.includes('TLS off'));
+};
+
+const SECRET = 'hunter2';
+
+/**
+ * Hosts that LOOK like a loopback spelling without being one, and loopback spellings that look
+ * remote. Where the classification cannot PROVE loopback it warns, because over-warning is the safe
+ * side of a credential that is about to cross a network.
+ */
+const TRANSPORT_HOSTS: [host: string, loopback: boolean][] = [
+  ['127.0.0.1:5432', true],
+  ['localhost', true],
+  ['[::1]:5432', true],
+  ['127.0.0.2', true],
+  ['db.example.com:5432', false],
+  ['10.0.0.4', false],
+  ['127.0.0.1.nip.io', false],
+  ['localhost.evil.com', false],
+  ['db', false],
+];
+
+describe('Postgres plaintext-credential warning classifies the transport, not the scheme', () => {
+  it.each(TRANSPORT_HOSTS)('%s', async (host, loopback) => {
+    const url = `postgres://app:${SECRET}@${host}/prod`;
+    const flagged = await stderrLines({ url });
+    expect(flagged).toHaveLength(loopback ? 0 : 1);
+    if (!loopback) {
+      expect(flagged[0]).toContain('backend_config.url');
+      expect(flagged[0]).toContain(`postgres://${host}`);
+      expect(flagged[0]).toContain('sslmode=require');
+      expect(flagged[0]).toContain('SECURITY');
+    }
+  });
+
+  it('never puts the credential or the database in the line it prints', async () => {
+    const flagged = await stderrLines({ url: `postgres://app:${SECRET}@db.example.com:5432/prod` });
+    expect(flagged).toHaveLength(1);
+    expect(flagged[0]).not.toContain(SECRET);
+    expect(flagged[0]).not.toContain('app');
+    expect(flagged[0]).not.toContain('prod');
+  });
+
+  /** What pg reads as "encrypted", and what it reads as a credential to lose. */
+  const TRANSPORT_CASES: [label: string, url: string, warns: boolean][] = [
+    ['no ssl setting at all', `postgres://app:${SECRET}@db.example.com/prod`, true],
+    ['sslmode=disable', `postgres://app:${SECRET}@db.example.com/prod?sslmode=disable`, true],
+    ['sslmode=require', `postgres://app:${SECRET}@db.example.com/prod?sslmode=require`, false],
+    ['sslmode=verify-full', `postgres://app:${SECRET}@db.example.com/prod?sslmode=verify-full`, false],
+    ['ssl=true', `postgres://app:${SECRET}@db.example.com/prod?ssl=true`, false],
+    ['no credential to lose', 'postgres://db.example.com/prod', false],
+    ['a credential in libpq query params', `postgres://db.example.com/prod?user=app&password=${SECRET}`, true],
+    ['a password with no user', `postgres://:${SECRET}@db.example.com/prod`, true],
+    ['a user with no password', 'postgres://app@db.example.com/prod', true],
+    ['the postgresql:// spelling', `postgresql://app:${SECRET}@db.example.com/prod`, true],
+  ];
+
+  it.each(TRANSPORT_CASES)('%s', async (_label, url, warns) => {
+    expect(await stderrLines({ url })).toHaveLength(warns ? 1 : 0);
+  });
+
+  it('the default DSN, which is loopback, stays silent about transport', async () => {
+    expect(await stderrLines({})).toEqual([]);
+  });
+});

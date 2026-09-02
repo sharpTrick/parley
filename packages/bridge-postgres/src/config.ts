@@ -3,6 +3,7 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
+import { isLoopbackHost } from '@sharptrick/parley-net-util';
 import { parse as parseDsn } from 'pg-connection-string';
 import { badConfig } from './errors.js';
 
@@ -23,7 +24,7 @@ export interface PostgresBackendConfig {
    * every message forever. Safe to enable at any time — `seq` is a BIGSERIAL and never reused, so
    * a cursor minted before a prune stays valid and just returns fewer rows.
    */
-  retention_days?: number;
+  retention_days?: number | null;
 }
 
 export const DEFAULT_URL = 'postgres://parley:parley@127.0.0.1:5432/parley';
@@ -103,6 +104,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
   const retention = cfg['retention_days'];
   if (
     retention !== undefined &&
+    retention !== null &&
     (typeof retention !== 'number' ||
       !Number.isFinite(retention) ||
       !(retention >= MIN_RETENTION_DAYS) ||
@@ -116,11 +118,36 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
         'table on the prune connect() runs immediately, which is what 0 and negatives were ' +
         `already refused for, and a window past ${MAX_RETENTION_DAYS} days puts the cutoff ` +
         'before any message this backend could have written, so pruning would silently never run ' +
-        'at all; omit the key to keep every message forever',
+        'at all; omit the key (or set it to null) to keep every message forever',
     );
   }
 
   return cfg as PostgresBackendConfig;
+}
+
+/**
+ * The origin to name when the DSN would put a credential on the wire in the clear, else undefined.
+ *
+ * Postgres carries no scheme that means TLS: `postgres://` is encrypted or not according to
+ * `sslmode`/`ssl`, and `new Pool({ connectionString })` with neither leaves node-postgres at
+ * ssl:false. So the question every sibling backend asks of its scheme is asked here of the SSL
+ * settings the same parser `pg` itself uses reports. Keep the ORIGIN the thing that is named, so
+ * that neither the password nor the database name reaches stderr; and keep the loopback question
+ * delegated, so that this backend and the others answer it the same way.
+ */
+export function plaintextCredentialOrigin(url: string): string | undefined {
+  let parsed: ReturnType<typeof parseDsn>;
+  try {
+    parsed = parseDsn(url);
+  } catch {
+    return undefined;
+  }
+  const host = parsed.host ?? '';
+  const carriesCredential = (parsed.user ?? '') !== '' || (parsed.password ?? '') !== '';
+  if (!carriesCredential || host === '' || isLoopbackHost(host) || Boolean(parsed.ssl)) {
+    return undefined;
+  }
+  return `postgres://${host}${parsed.port === null || parsed.port === undefined ? '' : `:${parsed.port}`}`;
 }
 
 /**

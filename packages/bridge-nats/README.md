@@ -102,7 +102,7 @@ backend_config:
   servers: "127.0.0.1:4222"   # string or list; default
   subject_prefix: "parley."    # default; topic → subject parley.<topic>
   stream_prefix: "PARLEY_"     # default; topic → stream PARLEY_<topic>
-  retention_days: 30           # optional; omit to keep every message forever (the default)
+  retention_days: 30           # optional; omit it (or set null) to keep every message forever
 
   # Auth — pick one; secrets belong in backend_config/.env, never in core, never committed.
   token: "…"                   # token auth
@@ -134,9 +134,9 @@ the server may or may not offer. A loopback server is not warned about.
 `retention_days` sets the per-topic stream's native `max_age` at creation time — JetStream's own
 built-in retention (this plugin just supplies the value), so no separate pruning code runs here.
 It's off by default — `max_age` is unset and JetStream keeps every message forever unless you opt
-in. It must be a positive number of days that composes a `max_age` JetStream's int64 nanosecond
-field can hold — from about `6e-15` days (the smallest window that rounds up to one nanosecond) to
-about `106751.99` days (~292 years, the largest that fits int64). Values outside that range are
+in. It must be a number of days from `1/1440` (one minute) — below that a window expires every message
+as fast as it is posted, and `max_age` is locked in at stream creation — up to about `106751.99`
+days (~292 years, the largest `max_age` JetStream's int64 nanosecond field can hold). Values outside that range are
 rejected at `connect()` rather than passed through, because outside it the composed `max_age` stops
 meaning what you wrote:
 below the low end it rounds to `0`, which JetStream reads as *unlimited* — the opposite of what it

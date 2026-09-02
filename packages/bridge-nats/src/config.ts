@@ -21,7 +21,7 @@ export interface NatsBackendConfig {
    * (`ensureStream`'s first caller); changing it later does not retroactively update an
    * already-existing stream — edit or recreate the stream out-of-band for that.
    */
-  retention_days?: number;
+  retention_days?: number | null;
   /** Token auth (`-auth`/`authorization.token`). Secret — `backend_config`/`.env` only. */
   token?: string;
   /** User/password auth. Secret — `backend_config`/`.env` only. */
@@ -142,6 +142,15 @@ export function validatePrefix(
 const NS_PER_DAY = 86_400_000_000_000;
 
 /**
+ * Floor for `retention_days`: one minute, expressed in days — the same floor the SQL-backed
+ * backends state, for the same reason. `max_age` is locked in at stream creation, so a window too
+ * short to hold a conversation expires every message as fast as it is posted; the nanosecond guard
+ * below only refuses a window that composes ZERO, which leaves the whole band between "instantly
+ * empty" and "one minute" quietly accepted.
+ */
+export const MIN_RETENTION_DAYS = 1 / 1440;
+
+/**
  * One past the largest `max_age` JetStream's int64 can hold. Every double below this is a legal
  * int64; `2**63` itself and everything above it — including `Infinity` — is not.
  */
@@ -159,11 +168,11 @@ const MAX_AGE_NS_LIMIT = 2 ** 63;
  * value is `Infinity`, which serializes to `null` and which the server stores as `max_age: 0` —
  * unlimited, silently, exactly what the low guard exists to prevent.
  */
-export function validateRetentionMaxAgeNs(days: number | undefined): number | undefined {
-  if (days === undefined) return undefined;
-  if (typeof days !== 'number' || !Number.isFinite(days) || days <= 0) {
+export function validateRetentionMaxAgeNs(days: number | null | undefined): number | undefined {
+  if (days === undefined || days === null) return undefined;
+  if (typeof days !== 'number' || !Number.isFinite(days) || days < MIN_RETENTION_DAYS) {
     throw new Error(
-      `invalid retention_days ${JSON.stringify(days)} — expected a positive number of days, or omit it for unlimited retention`,
+      `invalid retention_days ${JSON.stringify(days)} — expected a number of days no smaller than ${MIN_RETENTION_DAYS} (one minute), or omit it (or set it to null) for unlimited retention`,
     );
   }
   const maxAgeNs = Math.round(days * NS_PER_DAY);

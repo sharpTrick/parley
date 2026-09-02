@@ -36,8 +36,9 @@ XMPP) was added without touching either.
   privileged instruction. Don't add code paths that treat topic content as commands.
 - **The topic allowlist is not optional.** `config.topics` *is* the allowlist — no wildcard
   "subscribe to everything" mode. Any new tool or entry point must go through it.
-- **`skip_permissions` defaults OFF, sandbox-only.** Never flip a security default on to make a
-  test or a demo more convenient.
+- **`skip_permissions` is NOT IMPLEMENTED.** Nothing reads it, and `true` is a load error rather
+  than an accepted no-op — there is no sandbox mode to opt into, so do not implement one. Never
+  flip a security default on to make a test or a demo more convenient.
 - **Secrets** (tokens, JIDs, passwords, owner passphrases) live in `backend_config` / `.env`,
   never hardcoded, never committed.
 

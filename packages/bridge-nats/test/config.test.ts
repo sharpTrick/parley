@@ -10,6 +10,7 @@ import {
   type ConnectionOptions,
 } from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { MIN_RETENTION_DAYS } from '../src/config.js';
 import { captures, NatsPlugin, plaintextRemoteServer, redactUserinfo } from '../src/index.js';
 import { fakeJetStream, injectFake } from './fake-jetstream.js';
 import {
@@ -121,7 +122,7 @@ describe('nats backend_config — documented connection fields reach the driver'
   });
 
   const NS_PER_DAY = 86_400_000_000_000;
-  const retentions: { value: unknown; maxAge?: number }[] = [
+  const retentions: { value: unknown; maxAge?: number; omitted?: true }[] = [
     { value: undefined, maxAge: undefined },
     { value: 30, maxAge: 30 * NS_PER_DAY },
     { value: 1, maxAge: NS_PER_DAY },
@@ -135,7 +136,9 @@ describe('nats backend_config — documented connection fields reach the driver'
     { value: Number.NEGATIVE_INFINITY },
     { value: '30' },
     { value: 'thirty' },
-    { value: null },
+    // `null` is the spelling a yaml key written with no value parses to, and every backend that
+    // takes this key reads it as the key being absent rather than as a window of nothing.
+    { value: null, omitted: true },
     { value: true },
     { value: [] },
   ];
@@ -146,11 +149,12 @@ describe('nats backend_config — documented connection fields reach the driver'
       : typeof r.value === 'object'
         ? JSON.stringify(r.value)
         : String(r.value);
-    it(`retention_days ${label} ${r.maxAge === undefined && r.value !== undefined ? 'is rejected at connect()' : 'reaches the stream as max_age'}`, async () => {
+    const refused = r.maxAge === undefined && r.value !== undefined && r.omitted !== true;
+    it(`retention_days ${label} ${refused ? 'is rejected at connect()' : 'reaches the stream as max_age'}`, async () => {
       const plugin = new NatsPlugin();
       const config = r.value === undefined ? {} : { retention_days: r.value };
 
-      if (r.maxAge === undefined && r.value !== undefined) {
+      if (refused) {
         await expect(plugin.connect(config)).rejects.toThrow(/retention_days/);
         return;
       }
@@ -182,6 +186,12 @@ describe('nats backend_config — documented connection fields reach the driver'
     Number.isFinite(maxAge) && maxAge >= 1 && maxAge < MAX_AGE_NS_LIMIT;
 
   const boundaryDays: { days: number; end: 'low' | 'high' }[] = [
+    // The low end is now bounded by the one-minute floor rather than by the nanosecond conversion,
+    // so the rows that straddle it have to sit there: every row below is refused by the floor, and
+    // the conversion invariants above are graded on what the floor lets through.
+    { days: MIN_RETENTION_DAYS, end: 'low' },
+    { days: MIN_RETENTION_DAYS * 2, end: 'low' },
+    { days: MIN_RETENTION_DAYS * (1 - 1e-12), end: 'low' },
     { days: 1e-15, end: 'low' },
     { days: 5e-15, end: 'low' },
     { days: 1e-12, end: 'low' },

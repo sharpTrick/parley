@@ -64,9 +64,11 @@ like `retention_dayz`, or a knob borrowed from another backend) is rejected too,
 misconfiguration cannot quietly take the default behaviour. `url` and `key_prefix` must each be a
 non-empty string: an empty `url` — what an unexpanded `"${REDIS_URL}"` or an empty secret yields —
 would otherwise reach the client library as "unset" and connect to the unauthenticated default
-endpoint. `retention_days` must be a positive
-number of days (`0`, negative, `NaN`, a quoted string and anything reaching past the epoch are
-rejected; none of them mean "keep everything" and several silently delete history). `block_ms` and
+endpoint. `retention_days` must be a number of days
+between `1/1440` (one minute) and the age of the epoch (`0`, negative, any window shorter than a
+minute, `NaN`, a quoted string and anything reaching past the epoch are rejected; none of them mean
+"keep everything" and several silently delete history — a 43-second window trims the whole stream
+on the next `post`). `block_ms` and
 `connect_timeout_ms` must be positive whole milliseconds: a fractional or negative `block_ms` makes
 the server reject every `XREAD`, which kills live push *permanently* behind a `subscribe()` that
 resolved, and `block_ms: 0` blocks the reader forever. Omit a key (or set it to `null`) for its

@@ -10,6 +10,7 @@ import {
   MIN_RETENTION_DAYS,
   SqlitePlugin,
 } from '../src/index.js';
+import { maxRetentionDays } from '../src/config.js';
 
 /**
  * `backend_config` is untyped YAML from an operator. Every knob is validated before the database
@@ -58,14 +59,16 @@ const BAD_VALUES: unknown[] = [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY,
 const GOOD_VALUES: Record<string, unknown[]> = {
   db_path: ['x.db'],
   poll_interval_ms: [10, 1000],
-  retention_days: [0.5, 1, 3650],
+  // `null` is the spelling a yaml key written with no value parses to, and this key reads it as
+  // the key being absent — the same reading every other backend that takes it gives.
+  retention_days: [0.5, 1, 3650, null],
 };
 
 /** Bad values that are legitimate for a given key and therefore exempt from the rejection table. */
 const EXEMPT: Record<string, unknown[]> = {
   db_path: ['abc'],
   poll_interval_ms: [],
-  retention_days: [0.5],
+  retention_days: [0.5, null],
 };
 
 /**
@@ -225,11 +228,14 @@ describe('every bounded knob is graded at its own edges', () => {
  * cannot tell "prunes correctly" from "does not prune at all". Which side of a window a prune
  * deletes is retention-window.test.ts's (window x age) table; this one owns the accept/reject edge.
  *
- * The edges are READ FROM {@link MIN_RETENTION_DAYS} rather than restated, so re-tuning the floor
- * re-grades its own boundary instead of quietly moving out from under these rows.
+ * The edges are READ FROM {@link MIN_RETENTION_DAYS} and {@link maxRetentionDays} rather than
+ * restated, so re-tuning either bound re-grades its own boundary instead of quietly moving out
+ * from under these rows.
  */
-describe('the retention_days floor rejects every window that empties the store', () => {
+describe('the retention_days bounds reject every window that empties the store or never prunes', () => {
   const REJECTED = [
+    maxRetentionDays() + 1,
+    1e6,
     0,
     -1,
     Number.MIN_VALUE,
@@ -241,7 +247,15 @@ describe('the retention_days floor rejects every window that empties the store',
     1e308,
     Number.MAX_VALUE,
   ];
-  const ACCEPTED = [MIN_RETENTION_DAYS, MIN_RETENTION_DAYS * 1.5, 0.5, 1, 30, 3650, 1e6];
+  const ACCEPTED = [
+    MIN_RETENTION_DAYS,
+    MIN_RETENTION_DAYS * 1.5,
+    0.5,
+    1,
+    30,
+    3650,
+    maxRetentionDays(),
+  ];
 
   for (const days of REJECTED) {
     it(`retention_days = ${String(days)} is refused, naming the key and the floor`, async () => {

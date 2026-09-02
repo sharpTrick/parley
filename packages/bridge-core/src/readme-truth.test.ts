@@ -125,3 +125,179 @@ describe('the ceiling is stated wherever the widening is promised', () => {
     expect(claimedCeilings(README).length).toBeGreaterThanOrEqual(2);
   });
 });
+
+/**
+ * CLASS: a ROOT document stating a config key's contract differently from the validator that
+ * decides it. The operator-facing page above is executed rather than transcribed; the documents a
+ * contributor is pointed at FIRST were not read by anything, and two of them described a key this
+ * loader refuses as a working, sandbox-gated knob — an argument for implementing the leniency the
+ * loader exists to refuse. A third wrote a value the loader rejects into the one complete config
+ * example in the repo, so the block a reader copies did not load.
+ *
+ * Both halves are derived: the documents come from the repository root rather than a list kept
+ * here, and which keys are graded comes from asking THIS loader which values it refuses.
+ */
+const REPO_ROOT = new URL('../../../', import.meta.url);
+
+/** Every document at the repository root — the set, so a document added later is graded too. */
+function rootDocuments(): { name: string; text: string }[] {
+  return readdirSync(REPO_ROOT)
+    .filter((name) => name.endsWith('.md'))
+    .sort()
+    .map((name) => ({ name, text: readFileSync(new URL(name, REPO_ROOT), 'utf8') }));
+}
+
+/** A yaml block naming `identity:` is a whole Parley config, not a fragment of one. */
+const configBlocksIn = (text: string): string[] =>
+  [...text.matchAll(/```yaml\n([\s\S]*?)```/g)]
+    .map((m) => m[1]!)
+    .filter((body) => /^identity:/m.test(body));
+
+interface DocConfig {
+  doc: string;
+  parsed: Record<string, unknown>;
+}
+
+function documentedConfigs(): DocConfig[] {
+  return rootDocuments().flatMap(({ name, text }) =>
+    configBlocksIn(text).map((yaml) => ({
+      doc: name,
+      parsed: parseYaml(yaml) as Record<string, unknown>,
+    })),
+  );
+}
+
+/** Every `a.b` path in `config` whose leaf is a boolean — the knobs a document can call a default. */
+function booleanPaths(config: Record<string, unknown>, prefix = ''): string[] {
+  return Object.entries(config).flatMap(([key, value]) => {
+    if (typeof value === 'boolean') return [`${prefix}${key}`];
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      return booleanPaths(value as Record<string, unknown>, `${prefix}${key}.`);
+    }
+    return [];
+  });
+}
+
+const withPathSet = (
+  config: Record<string, unknown>,
+  path: string,
+  value: boolean,
+): Record<string, unknown> => {
+  const copy = structuredClone(config);
+  const segments = path.split('.');
+  let at = copy;
+  for (const segment of segments.slice(0, -1)) at = at[segment] as Record<string, unknown>;
+  at[segments.at(-1) as string] = value;
+  return copy;
+};
+
+/**
+ * Why the loader refuses `path: value` AT THAT PATH, or undefined otherwise. Keep the issue's own
+ * path the test, so that a key refused because a DIFFERENT key was set with it — a relational rule,
+ * which every one of these documents may legitimately call a knob — is not read as an unimplemented
+ * one.
+ */
+function refusalFor(
+  config: Record<string, unknown>,
+  path: string,
+  value: boolean,
+): string | undefined {
+  try {
+    parseConfig(withPathSet(config, path, value));
+    return undefined;
+  } catch (err) {
+    const issues = (err as { issues?: { path: (string | number)[]; message: string }[] }).issues;
+    return issues?.find((issue) => issue.path.join('.') === path)?.message;
+  }
+}
+
+/**
+ * A key the loader refuses AS UNIMPLEMENTED is not a knob, whatever a document calls it. Derived by
+ * asking the loader, so the next key that lands unimplemented is graded the day it does; the floor
+ * below is what fails if the loader rewords its refusal out from under this reading.
+ */
+function unsettableKeys(config: Record<string, unknown>): { path: string; refusal: string }[] {
+  return booleanPaths(config).flatMap((path) => {
+    const refusal = refusalFor(config, path, true) ?? refusalFor(config, path, false);
+    return refusal !== undefined && REFUSAL_LANGUAGE.test(refusal) ? [{ path, refusal }] : [];
+  });
+}
+
+/** How a document describes something an operator may choose. */
+const KNOB_LANGUAGE = /defaults? (?:off|on)\b|sandbox[- ]only|opt[- ]in|turn(?:ed)? (?:it )?on/i;
+/** How this loader's own refusal reads, and so how a document must read where it names the key. */
+const REFUSAL_LANGUAGE = /not implemented|load error/i;
+
+/** Every passage of `text` naming `key`, each with the line before and after it for context. */
+function passagesNaming(text: string, key: string): string[] {
+  const lines = text.split('\n');
+  return lines.flatMap((line, i) =>
+    line.includes(key) ? [lines.slice(Math.max(0, i - 1), i + 2).join(' ')] : [],
+  );
+}
+
+export function knobLanguageFindings(
+  docs: readonly { name: string; text: string }[],
+  key: string,
+): string[] {
+  return docs.flatMap(({ name, text }) =>
+    passagesNaming(text, key)
+      .filter((passage) => KNOB_LANGUAGE.test(passage) && !REFUSAL_LANGUAGE.test(passage))
+      .map((passage) => `${name}: ${passage.trim()}`),
+  );
+}
+
+describe('every root document agrees with the loader that decides the config', () => {
+  it('finds the documents and a whole config inside them, so the rows below are not empty', () => {
+    expect(rootDocuments().length, 'no root document found at all').toBeGreaterThanOrEqual(4);
+    expect(
+      documentedConfigs().length,
+      'no root document carries a complete config example any more',
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each(documentedConfigs().map((c) => [`${c.doc} config example`, c] as const))(
+    '%s loads',
+    (_label, config) => {
+      expect(() => parseConfig(config.parsed)).not.toThrow();
+    },
+  );
+
+  it('finds a key the loader refuses as unimplemented, so the rows below grade something', () => {
+    expect(
+      documentedConfigs().flatMap((c) => unsettableKeys(c.parsed)).length,
+      'no documented key is refused as unimplemented — reworded, or gone',
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it('never calls a key the loader refuses a knob, and says somewhere that it is refused', () => {
+    const docs = rootDocuments();
+    const unsettable = documentedConfigs().flatMap((c) => unsettableKeys(c.parsed));
+    for (const { path } of unsettable) {
+      const key = path.split('.').at(-1) as string;
+      expect(
+        knobLanguageFindings(docs, key),
+        `a root document describes '${key}' as a knob, and this loader refuses it`,
+      ).toEqual([]);
+      expect(
+        docs.filter(({ text }) =>
+          passagesNaming(text, key).some((p) => REFUSAL_LANGUAGE.test(p)),
+        ).length,
+        `no root document states that '${key}' is refused`,
+      ).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('reads knob language, and reads a passage that states the refusal beside it (controls)', () => {
+    const planted = [
+      { name: 'PLANTED.md', text: '- **`k` defaults OFF**, sandbox-only.\n' },
+      { name: 'FIXED.md', text: '- `k` is not implemented; `true` is a load error.\n' },
+      { name: 'BOTH.md', text: '- `k` is not implemented, so there is no sandbox-only mode.\n' },
+      { name: 'QUIET.md', text: '- `k` is passed to the plugin verbatim.\n' },
+    ];
+    expect(knobLanguageFindings(planted, 'k')).toEqual([
+      'PLANTED.md: - **`k` defaults OFF**, sandbox-only.',
+    ]);
+    expect(knobLanguageFindings(planted, 'absent')).toEqual([]);
+  });
+});

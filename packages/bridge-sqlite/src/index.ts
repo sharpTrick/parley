@@ -49,7 +49,7 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
     }
 
     this.pollIntervalMs = cfg.poll_interval_ms ?? 1000;
-    this.retentionDays = cfg.retention_days;
+    this.retentionDays = cfg.retention_days ?? undefined;
     this.stopped = false;
     // Keep the bump below every throw above it, so that a connect() that is refused — already
     // connected, or a store that failed after opening — cannot stop the loops an earlier connect()

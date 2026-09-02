@@ -58,9 +58,9 @@ export class ZulipPlugin implements BackendPlugin {
     const plaintext = plaintextRemoteOrigin(cfg.baseUrl);
     if (plaintext !== undefined) {
       console.warn(
-        `[parley-zulip] SECURITY: site_url ${plaintext} is plaintext http:// to a non-loopback ` +
-          'host, so the bot email and api_key travel the network as an unencrypted HTTP Basic ' +
-          'header on every request. Use https://.',
+        `[parley-zulip] SECURITY: backend_config.site_url ${plaintext} is plaintext http:// to a ` +
+          'non-loopback host, so the bot email and api_key travel the network as an unencrypted ' +
+          'HTTP Basic header on every request. Use https://.',
       );
     }
   }

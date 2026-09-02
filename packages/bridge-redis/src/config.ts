@@ -194,19 +194,32 @@ function normalizeMillis(key: string, value: unknown, fallback: number): number 
 }
 
 /**
+ * Floor for `retention_days`: one minute, expressed in days — the same floor the SQL-backed
+ * backends state, for the same reason. The trim below is applied on the NEXT post, so a window too
+ * short to hold a conversation empties the stream the moment it is used.
+ */
+export const MIN_RETENTION_DAYS = 1 / 1440;
+
+/**
  * `retention_days` is multiplied into a destructive `XADD MINID` threshold, so every unusable value
- * must be rejected rather than coerced: `0`/negative silently delete history (or every entry,
- * forever, as it lands), a value past the epoch makes the threshold negative so every `post`
- * throws, and a string/NaN produces an invalid stream id. `null` means "omitted" (DESIGN §11).
+ * must be rejected rather than coerced: `0`, negatives and any window under a minute silently
+ * delete the history (or every entry, forever, as it lands), a value past the epoch makes the
+ * threshold negative so every `post` throws, and a string/NaN produces an invalid stream id.
+ * `null` means "omitted" (DESIGN §11).
  */
 function normalizeRetentionDays(value: number | null | undefined): number | undefined {
   if (value === undefined || value === null) return undefined;
   const maxDays = Math.floor(Date.now() / 86_400_000);
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > maxDays) {
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    value < MIN_RETENTION_DAYS ||
+    value > maxDays
+  ) {
     throw pluginError(
-      `parley-redis: retention_days must be a positive number of days no greater than ${maxDays} ` +
-        `(got ${describeValue('retention_days', value)}); omit it (or set null) to keep every ` +
-        `entry forever`,
+      `parley-redis: retention_days must be a number of days between ${MIN_RETENTION_DAYS} ` +
+        `(one minute) and ${maxDays} (got ${describeValue('retention_days', value)}); omit it ` +
+        `(or set null) to keep every entry forever`,
     );
   }
   return value;
