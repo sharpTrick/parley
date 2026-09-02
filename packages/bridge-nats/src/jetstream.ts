@@ -97,7 +97,7 @@ export async function closeOnConsumerLoss(iter: ConsumerMessages): Promise<void>
   }
 }
 
-const statusOf = (err: unknown): unknown => (err as { code?: unknown }).code;
+const jsCodeOf = (err: unknown): unknown => (err as { code?: unknown }).code;
 
 /**
  * JetStream names a fault with a status CODE and its own wording, and only the PAIR identifies one:
@@ -107,7 +107,7 @@ const statusOf = (err: unknown): unknown => (err as { code?: unknown }).code;
  * nearest bucket.
  */
 const reports = (err: unknown, code: string, wording: RegExp): boolean =>
-  statusOf(err) === code && wording.test(err instanceof Error ? err.message : String(err));
+  jsCodeOf(err) === code && wording.test(err instanceof Error ? err.message : String(err));
 
 /** The manager's answer when the stream is there and that sequence or subject holds nothing. */
 export const isMessageMissing = (err: unknown): boolean =>
@@ -125,7 +125,7 @@ export const isStreamAbsent = (err: unknown): boolean => reports(err, '404', /st
  * `503` and `no responders`. A removed stream and an API outage both produce it, on the publish and
  * pull surfaces alike, so it narrows and never decides: only the manager tells them apart.
  */
-export const isNoResponder = (err: unknown): boolean => statusOf(err) === '503';
+export const isNoResponder = (err: unknown): boolean => jsCodeOf(err) === '503';
 
 /** Either answer a call gets for a stream that is gone — with {@link isNoResponder}'s ambiguity. */
 export const isStreamUnreachable = (err: unknown): boolean =>
