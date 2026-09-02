@@ -40,25 +40,49 @@ const narrowFor = (topic: string): string =>
     { operator: 'topic', operand: topic.toLowerCase() },
   ]);
 
+/**
+ * One request SHAPE and the value the flag must carry on it. A flag's correct value can depend on
+ * which call issued the request — `include_anchor` must be `false` on every read anchored at a real
+ * message id, because including the anchor re-delivers a record the previous page already returned,
+ * while on `anchor=newest` the server resolves a sentinel no row can carry
+ * ({@link SERVER_CONSTRAINTS.newestAnchor}) and the flag decides nothing at all. A `some(...)`
+ * assertion cannot pin that: one request of the right shape satisfies it for every other shape,
+ * so the direction where the flag IS load-bearing can be broken with the table still green.
+ */
+interface WireRule {
+  /** Names the shape; also the label a violation is reported under. */
+  shape: string;
+  applies: (params: Record<string, string>) => boolean;
+  value: string;
+}
+
 interface FlagRow {
   flag: keyof typeof SERVER_CONSTRAINTS.requestFlagDefaults;
-  /** The route the flag must appear on, and the value the plugin must put there explicitly. */
-  wire: { route: string; value: string };
+  /** The route the flag must appear on. */
+  route: string;
+  /** Must MATCH at least one request in the run, and hold on EVERY request it matches. */
+  wire: WireRule[];
   /** Fake/plugin settings this row needs on top of the shared fixture's defaults. */
   boot?: { heartbeatMs: number; config: Record<string, unknown> };
   /** What the bridge must observe. Also the run whose emitted requests the wire check reads. */
   pluginGets: (pair: ZulipPair, topic: string) => Promise<void>;
-  /** A value the FAKE behaves differently on — never the one the bridge itself sends. */
-  divergesOn: string;
+  /** Which rule's shape {@link FlagRow.divergenceShows} exercises, and the value it sends there. */
+  divergesOn: { shape: string; value: string };
   /** What the fake does on {@link FlagRow.divergesOn} — proves it can tell the two apart. */
   divergenceShows: (pair: ZulipPair, topic: string) => Promise<void>;
 }
 
+/** Requests of a narrowed read, split by what their `anchor` names. */
+const ANCHORED_AT_A_MESSAGE_ID = (p: Record<string, string>): boolean =>
+  Number.isFinite(Number(p.anchor));
+const ANCHORED_AT_NEWEST = (p: Record<string, string>): boolean => p.anchor === 'newest';
+
 const FLAGS: FlagRow[] = [
   {
     flag: 'apply_markdown',
-    wire: { route: 'GET /api/v1/messages', value: 'false' },
-    divergesOn: 'true',
+    route: 'GET /api/v1/messages',
+    wire: [{ shape: 'any narrowed read', applies: () => true, value: 'false' }],
+    divergesOn: { shape: 'any narrowed read', value: 'true' },
     pluginGets: async ({ plugin }, topic) => {
       const t = asTopic(topic);
       const live: Message[] = [];
@@ -86,8 +110,18 @@ const FLAGS: FlagRow[] = [
   },
   {
     flag: 'include_anchor',
-    wire: { route: 'GET /api/v1/messages', value: 'false' },
-    divergesOn: 'true',
+    route: 'GET /api/v1/messages',
+    wire: [
+      // The load-bearing direction: the anchor is a record the caller already holds, so including
+      // it re-delivers it — as an exclusive `since` that is not exclusive, or as a paginated walk
+      // that returns the previous page's edge again.
+      { shape: 'anchored at a message id', applies: ANCHORED_AT_A_MESSAGE_ID, value: 'false' },
+      // The server resolves `newest` to a sentinel no row carries and takes `anchored_to_right`,
+      // which drops the flag from the query outright — so `true` here is the value that stays
+      // correct if that ever stops being true, and the only thing that can grade it is the wire.
+      { shape: 'anchored at newest', applies: ANCHORED_AT_NEWEST, value: 'true' },
+    ],
+    divergesOn: { shape: 'anchored at a message id', value: 'true' },
     pluginGets: async ({ plugin }, topic) => {
       const t = asTopic(topic);
       await plugin.post(t, SENDER, 'first');
@@ -114,8 +148,9 @@ const FLAGS: FlagRow[] = [
   },
   {
     flag: 'dont_block',
-    wire: { route: 'GET /api/v1/events', value: 'false' },
-    divergesOn: 'true',
+    route: 'GET /api/v1/events',
+    wire: [{ shape: 'any events poll', applies: () => true, value: 'false' }],
+    divergesOn: { shape: 'any events poll', value: 'true' },
     boot: { heartbeatMs: 5000, config: { events_timeout_ms: 5000 } },
     pluginGets: async ({ plugin, fake }, topic) => {
       const t = asTopic(topic);
@@ -157,16 +192,29 @@ describe('zulip sends the wire-format flag a bridge needs, and the fake tells th
       await row.pluginGets(await open(), `flag-${rand()}`);
     });
 
-    it(`${row.flag}=${row.wire.value} is on the wire, not inherited from a default`, async () => {
+    it(`${row.flag} is on the wire with the value each request SHAPE needs`, async () => {
       const pair = await open();
       await row.pluginGets(pair, `flag-${rand()}`);
-      const sent = pair.fake.sentParams(row.wire.route);
+      const sent = pair.fake.sentParams(row.route);
       expect(sent.length).toBeGreaterThan(0);
       expect(sent.filter((p) => p[row.flag] === undefined)).toEqual([]);
-      expect(sent.some((p) => p[row.flag] === row.wire.value)).toBe(true);
+      // A rule that matched no request grades nothing, so report it beside the violations rather
+      // than letting the run pass on the shapes it happened to emit.
+      const wrong: string[] = [];
+      const ungraded: string[] = [];
+      for (const rule of row.wire) {
+        const matched = sent.filter((p) => rule.applies(p));
+        if (matched.length === 0) ungraded.push(rule.shape);
+        for (const p of matched) {
+          if (p[row.flag] !== rule.value) {
+            wrong.push(`${rule.shape}: ${row.flag}=${String(p[row.flag])}, need ${rule.value}`);
+          }
+        }
+      }
+      expect({ wrong, ungraded }).toEqual({ wrong: [], ungraded: [] });
     });
 
-    it(`${row.flag}: the fake behaves differently on ${row.divergesOn}`, async () => {
+    it(`${row.flag}: the fake behaves differently on ${row.divergesOn.value}`, async () => {
       await row.divergenceShows(await open(), `flag-${rand()}`);
     });
   }
@@ -185,13 +233,17 @@ describe('the wire-format flag table cannot go silently inert', () => {
     );
   });
 
-  it('never grades a divergence against the value the bridge itself sends', () => {
-    expect(FLAGS.filter((r) => r.divergesOn === r.wire.value).map((r) => r.flag)).toEqual([]);
+  it('never grades a divergence against the value the bridge sends on that same shape', () => {
+    const unusable = FLAGS.filter((r) => {
+      const rule = r.wire.find((w) => w.shape === r.divergesOn.shape);
+      return rule === undefined || rule.value === r.divergesOn.value;
+    });
+    expect(unusable.map((r) => r.flag)).toEqual([]);
   });
 
   it('names which server defaults are hostile and which already agree with the bridge', () => {
-    const hostile = FLAGS.filter(
-      (r) => SERVER_CONSTRAINTS.requestFlagDefaults[r.flag] !== r.wire.value,
+    const hostile = FLAGS.filter((r) =>
+      r.wire.some((w) => SERVER_CONSTRAINTS.requestFlagDefaults[r.flag] !== w.value),
     );
     expect(hostile.map((r) => r.flag)).toEqual(['apply_markdown', 'include_anchor']);
     expect(SERVER_CONSTRAINTS.requestFlagDefaults.dont_block).toBe('false');

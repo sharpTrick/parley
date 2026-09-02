@@ -77,6 +77,36 @@ export const ALL_PLACEMENTS: typeof PLACEMENTS = [
   { name: 'alone', pad: (p) => p },
 ];
 
+/**
+ * Every server-controlled field of a Zulip message record the plugin reads, and every shape the
+ * declared wire types say cannot arrive. Shared rather than restated per file, so that a field or a
+ * shape added here is met by every table that crosses them — the plugin's hazard sweep, its
+ * page-edge table, and the fixture-fidelity precondition that says the fake actually SERVES each
+ * one. A hazard the fixture swallows makes every plugin row that injects it an assertion about
+ * nothing, which is why the three read from one list.
+ */
+export const HAZARD_FIELDS = ['id', 'content', 'sender_email', 'timestamp'] as const;
+
+/** Shapes the declared wire types say cannot arrive. Names double as the test titles. */
+export const HAZARDS: Array<{ name: string; value: unknown }> = [
+  { name: 'missing', value: undefined },
+  { name: 'null', value: null },
+  { name: 'zero', value: 0 },
+  { name: 'negative', value: -1 },
+  { name: 'fractional', value: 1.5 },
+  { name: 'past the Date range', value: 1e18 },
+  { name: 'before the Date range', value: -1e18 },
+  { name: 'NaN', value: Number.NaN },
+  { name: 'Infinity', value: Number.POSITIVE_INFINITY },
+  { name: 'a string', value: 'nope' },
+  { name: 'an empty string', value: '' },
+  { name: 'an object', value: { nested: true } },
+  { name: 'an array', value: [1, 2] },
+  { name: 'a boolean', value: true },
+  { name: 'a huge string', value: 'x'.repeat(70_000) },
+  { name: 'non-ASCII around a control character', value: '\u{1F600}\u0000caf\u00e9' },
+];
+
 export interface ZulipPair {
   plugin: ZulipPlugin;
   fake: FakeZulip;

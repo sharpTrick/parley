@@ -5,15 +5,18 @@
  * this lints every test file for an inline shape handed to a fault injector that another file also
  * spells out, so the check widens as fault shapes are added instead of pinning today's four.
  */
+import { asTopic } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   type EventsFaultRow,
+  type FakeZulip,
   FAULTS,
   PERSISTENT_EVENTS_FAULTS,
   TRANSIENT_EVENTS_FAULTS,
 } from './fake-zulip.js';
+import { HAZARD_FIELDS, HAZARDS, rand, useZulip } from './harness.js';
 
 const TEST_DIR = fileURLToPath(new URL('./', import.meta.url));
 const TEST_FILES = readdirSync(TEST_DIR).filter((f) => f.endsWith('.test.ts'));
@@ -135,4 +138,82 @@ describe('every zulip fault shape is graded on both axes', () => {
       ),
     }).toEqual({ transientForever: [], persistentOnce: [] });
   });
+});
+
+/**
+ * CLASS: a fixture that SWALLOWS the hazard it injects grades its own filter, not the plugin. Every
+ * cell of the hazard table is a PRECONDITION — {@link FakeZulip.injectRaw} promises the record
+ * reaches the narrowed history read AND a queue narrowed to the topic, so one injection grades both
+ * the catch-up and the push path — and a precondition has to fail HERE, by name, rather than
+ * turning every plugin row that injects that shape into an assertion about a record the server
+ * never sent.
+ *
+ * The count comes from the RAW HTTP bodies, never from the plugin's output: the plugin DROPS an
+ * unusable record by design, so reading its output could not tell "the guard refused it" from "the
+ * fixture withheld it" — which is exactly how a filter comparing an anchor against a non-numeric
+ * `id` hid six of these shapes while sixteen rows reported them covered.
+ */
+describe('every hazard the fake injects is a record the fake serves', () => {
+  const boot = useZulip();
+  const AUTH = `Basic ${Buffer.from('parley-bot@localhost:parley-api-key').toString('base64')}`;
+
+  const get = async (fake: FakeZulip, path: string, query: Record<string, string>): Promise<
+    Record<string, unknown>
+  > => {
+    const res = await fetch(`${fake.url}${path}?${new URLSearchParams(query)}`, {
+      headers: { Authorization: AUTH },
+    });
+    return (await res.json()) as Record<string, unknown>;
+  };
+
+  const register = async (fake: FakeZulip, topic: string): Promise<string> => {
+    const res = await fetch(`${fake.url}/api/v1/register`, {
+      method: 'POST',
+      headers: { Authorization: AUTH, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        narrow: JSON.stringify([
+          ['stream', 'parley'],
+          ['topic', topic],
+        ]),
+        apply_markdown: 'false',
+      }),
+    });
+    return String(((await res.json()) as { queue_id?: string }).queue_id);
+  };
+
+  it('serves every field × shape on the narrowed read and on the event queue', async () => {
+    const { fake } = await boot();
+    const missing: string[] = [];
+    for (const field of HAZARD_FIELDS) {
+      for (const hazard of HAZARDS) {
+        const topic = `fidelity-${rand()}`;
+        const queueId = await register(fake, topic);
+        fake.injectRaw({ topic: asTopic(topic), fields: { [field]: hazard.value } });
+
+        const read = await get(fake, '/api/v1/messages', {
+          narrow: JSON.stringify([
+            { operator: 'stream', operand: 'parley' },
+            { operator: 'topic', operand: topic },
+          ]),
+          anchor: 'newest',
+          include_anchor: 'true',
+          num_before: '10',
+          num_after: '0',
+          apply_markdown: 'false',
+        });
+        const polled = await get(fake, '/api/v1/events', {
+          queue_id: queueId,
+          last_event_id: '-1',
+          dont_block: 'true',
+        });
+        const served = (read.messages as unknown[] | undefined)?.length ?? 0;
+        const pushed = (polled.events as Array<{ type?: string }> | undefined)?.filter(
+          (e) => e.type === 'message',
+        ).length;
+        if (served !== 1) missing.push(`read: ${field} = ${hazard.name} (served ${served})`);
+        if (pushed !== 1) missing.push(`queue: ${field} = ${hazard.name} (served ${String(pushed)})`);
+      }
+    }
+    expect(missing).toEqual([]);
+  }, 60_000);
 });

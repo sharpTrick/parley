@@ -192,22 +192,23 @@ describe('a server record becomes a Message only when its id can carry the curso
 });
 
 describe('a page anchor only ever moves in the direction of travel', () => {
-  const ROWS: Array<{ edge: unknown; from: string; backwards: boolean; next?: string }> = [
-    { edge: { id: 5 }, from: '10', backwards: true, next: '5' },
-    { edge: { id: 10 }, from: '10', backwards: true },
-    { edge: { id: 11 }, from: '10', backwards: true },
-    { edge: { id: 11 }, from: '10', backwards: false, next: '11' },
-    { edge: { id: 10 }, from: '10', backwards: false },
-    { edge: { id: 5 }, from: '10', backwards: false },
-    { edge: { id: 5 }, from: 'newest', backwards: true, next: '5' },
-    { edge: undefined, from: '10', backwards: true },
-    { edge: { id: 'nope' }, from: '10', backwards: true },
-    { edge: { id: Number.NaN }, from: '10', backwards: true },
+  const ROWS: Array<{ id: unknown; from: string; backwards: boolean; next?: string }> = [
+    { id: 5, from: '10', backwards: true, next: '5' },
+    { id: 10, from: '10', backwards: true },
+    { id: 11, from: '10', backwards: true },
+    { id: 11, from: '10', backwards: false, next: '11' },
+    { id: 10, from: '10', backwards: false },
+    { id: 5, from: '10', backwards: false },
+    { id: 5, from: 'newest', backwards: true, next: '5' },
+    { id: undefined, from: '10', backwards: true },
+    { id: 'nope', from: '10', backwards: true },
+    { id: Number.NaN, from: '10', backwards: true },
+    { id: Number.POSITIVE_INFINITY, from: '10', backwards: false },
   ];
 
   for (const row of ROWS) {
-    it(`${JSON.stringify(row.edge)} from ${row.from} ${row.backwards ? 'backwards' : 'forwards'} → ${String(row.next)}`, () => {
-      expect(pageAnchor(row.edge as ZulipMessage, row.from, row.backwards)).toBe(row.next);
+    it(`${JSON.stringify(row.id) ?? 'undefined'} from ${row.from} ${row.backwards ? 'backwards' : 'forwards'} → ${String(row.next)}`, () => {
+      expect(pageAnchor(row.id, row.from, row.backwards)).toBe(row.next);
     });
   }
 });

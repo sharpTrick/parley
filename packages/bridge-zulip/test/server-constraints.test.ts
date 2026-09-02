@@ -471,6 +471,8 @@ const NON_WRITE_CONSTRAINTS: Record<string, string> = {
   maxMessagesPerFetch: 'the page-size table at the top of this file',
   requiresValidCredentials: 'the credentials case below',
   requestFlagDefaults: 'wire-format-flags.test.ts',
+  newestAnchor: "wire-format-flags.test.ts's per-direction rules",
+  oldestAnchor: "wire-format-flags.test.ts's per-direction rules",
 };
 
 describe('zulip post never lets the server rewrite a write', () => {

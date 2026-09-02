@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { GAP_FILL_PAGE } from '../src/index.js';
+import { MAX_MESSAGES_PER_FETCH, type ZulipMessage, zulipToMessage } from '../src/wire.js';
 import { startFakeZulip } from './fake-zulip.js';
 import {
   decideIntegrationGate,
@@ -128,6 +129,75 @@ describe('zulip queue GC recovery', () => {
       timeout: 30_000,
       interval: 10,
     });
+  }, 60_000);
+
+  /**
+   * The page EDGE is the position that decides whether the walk can continue at all: the anchor for
+   * the next page is taken from there, so a record the client cannot name sitting exactly on it
+   * leaves the walk with nowhere to go. On this path that is permanent — a short page reads as a
+   * closed gap, `needsGapFillFrom` is cleared, and everything behind the record is never delivered
+   * and never retried. No `limit`-based read reaches it: only the gap-fill sizes its own page, so
+   * only here can a record be placed on the boundary of one.
+   */
+  it('replays what is behind an unnameable record sitting on the gap-fill page edge', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`gc-edge-${rand()}`);
+    // Kept unnameable by ASSERTION: a shape `zulipToMessage` happens to accept grades nothing here.
+    const EDGE_ID = 'nope';
+    expect(zulipToMessage(topic, { id: EDGE_ID } as unknown as ZulipMessage)).toBeUndefined();
+
+    const got: Message[] = [];
+    await plugin.subscribe(topic, (m) => got.push(m));
+    await plugin.post(topic, SENDER, 'before');
+    await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 5000, interval: 10 });
+
+    // The dead window fills the first gap-fill page to one short, so the injected record lands on
+    // the page boundary and the records behind it are only reachable by stepping over it.
+    fake.expireQueues();
+    const dead = Array.from({ length: GAP_FILL_PAGE - 1 }, (_, i) => `d${i}`);
+    for (const content of dead) fake.injectMessage({ topic, content });
+    fake.injectRaw({ topic, fields: { id: EDGE_ID } });
+    const behind = ['b0', 'b1', 'b2'];
+    for (const content of behind) fake.injectMessage({ topic, content });
+
+    await vi.waitFor(
+      () => expect(got.map((m) => m.content)).toEqual(['before', ...dead, ...behind]),
+      { timeout: 30_000, interval: 20 },
+    );
+    expect(new Set(got.map((m) => m.backendMsgId)).size).toBe(got.length);
+  }, 60_000);
+
+  /**
+   * The residual, pinned so it cannot regress into a silent one: a page in which NOT ONE record can
+   * be named offers no id to continue from, and no widening or fallback can invent one. What must
+   * NOT happen is the walk's dead stop being read as history running out — that clears
+   * `needsGapFillFrom` and drops everything behind the obstruction permanently. It stays armed and
+   * paced instead, so the hole is retried and reported rather than closed over.
+   */
+  it('keeps a gap that nothing can navigate armed, instead of reporting it closed', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`gc-blind-${rand()}`);
+    const got: Message[] = [];
+    await plugin.subscribe(topic, (m) => got.push(m));
+    await plugin.post(topic, SENDER, 'before');
+    await vi.waitFor(() => expect(got).toHaveLength(1), { timeout: 5000, interval: 10 });
+
+    // Wider than one server page, so no widening can reach past it: the read may ask for at most
+    // MAX_MESSAGES_PER_FETCH and every record it can get back carries no id to continue from.
+    fake.expireQueues();
+    const blind = MAX_MESSAGES_PER_FETCH + 1;
+    for (let i = 0; i < blind; i++) fake.injectRaw({ topic, fields: { id: `x${i}` } });
+    fake.injectMessage({ topic, content: 'behind' });
+
+    const reads = fake.requestCount('GET /api/v1/messages');
+    await vi.waitFor(
+      () => expect(fake.requestCount('GET /api/v1/messages')).toBeGreaterThan(reads + 2),
+      { timeout: 20_000, interval: 50 },
+    );
+    expect(got.map((m) => m.content)).toEqual(['before']);
   }, 60_000);
 
   /**

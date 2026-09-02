@@ -67,6 +67,16 @@ export const SERVER_CONSTRAINTS = {
    * sending it, until the day the server flips the default.
    */
   requestFlagDefaults: { apply_markdown: 'true', include_anchor: 'true', dont_block: 'false' },
+  /**
+   * `zerver/lib/narrow.py::parse_anchor_value`: `newest` is NOT resolved to the newest matching
+   * message's id — it becomes `LARGER_THAN_MAX_MESSAGE_ID`, a sentinel no row can carry, which sets
+   * `anchored_to_right`; that branch skips the id filter outright and drops `include_anchor` from
+   * the limit arithmetic (`if not anchored_to_right: before_limit += include_anchor`). `oldest` is
+   * 0. So `include_anchor` is a NO-OP on an `anchor=newest` read and load-bearing on every read
+   * anchored at a real id — which is why only a per-DIRECTION wire assertion can grade it.
+   */
+  newestAnchor: 10_000_000_000_000_000,
+  oldestAnchor: 0,
 } as const;
 
 /**
@@ -325,8 +335,9 @@ export interface FakeZulip {
    * Deliver a record whose FIELDS are not the wire types the plugin declares — a server version, a
    * proxy or a hostile realm member handing back a shape the type annotation promised could not
    * happen. It reaches the history read AND any queue narrowed to `topic`, so one injection grades
-   * both the catch-up and the push path. Routing still uses `topic`, so the record lands where the
-   * test expects however mangled its own fields are.
+   * both the catch-up and the push path. Routing still uses `topic`, and the narrowed read selects
+   * by ROW rather than by `id`, so the record is served on both axes however mangled its own fields
+   * are — which is what makes an assertion about the plugin's guard an assertion about the plugin.
    */
   injectRaw(opts: { topic: string; fields: Record<string, unknown>; stream?: string }): void;
   close(): Promise<void>;
@@ -353,8 +364,20 @@ export async function startFakeZulip(opts?: {
   const requestCounts = new Map<string, number>();
   const requestParams = new Map<string, Array<Record<string, string>>>();
   let responseHook: ((route: string) => void) | undefined;
-  const messages: WireMessage[] = []; // ascending by id by construction
+  const messages: WireMessage[] = []; // ascending by row by construction
   const queues = new Map<string, Queue>();
+
+  /**
+   * The row each stored message occupies, in the id space a REAL Zulip row lives in. Kept OFF the
+   * record so it can never reach the wire, and consulted by every narrowed read in place of `m.id`:
+   * the hazard {@link FakeZulip.injectRaw} models is a proxy or server version mangling the JSON,
+   * and such a record still occupies a row. Keep the read off `m.id`, so that an unnameable id
+   * changes what the CLIENT can do with a record and never whether the server returns it —
+   * comparing an anchor against `m.id` is false for every non-number, which silently withholds six
+   * of the id hazards the tests believe they are injecting and grades this filter instead of the
+   * plugin's guard.
+   */
+  const rowOf = new WeakMap<WireMessage, number>();
 
   // Keep the coercion, so that a deliberately mangled routing field cannot make the FAKE throw and
   // report a plugin defect that is really a fixture defect.
@@ -389,13 +412,15 @@ export async function startFakeZulip(opts?: {
     fields?: Record<string, unknown>,
   ): number => {
     const routing = { stream: m.display_recipient, topic: m.subject };
+    const row = ++msgSeq;
     const msg = {
       ...m,
-      id: ++msgSeq,
+      id: row,
       type: 'stream',
       timestamp: Math.floor(Date.now() / 1000),
       ...fields,
     } as WireMessage;
+    rowOf.set(msg, row);
     messages.push(msg);
     for (const q of queues.values()) {
       if (fold(q.stream) !== fold(routing.stream)) continue;
@@ -540,12 +565,12 @@ export async function startFakeZulip(opts?: {
             (stream === undefined || fold(m.display_recipient) === fold(stream)) &&
             (topic === undefined || fold(m.subject) === fold(topic)),
         );
-        const anchorRaw = url.searchParams.get('anchor') ?? 'newest';
-        const anchor = anchorRaw === 'newest' ? Number.POSITIVE_INFINITY : Number(anchorRaw);
+        const anchor = resolveAnchor(url.searchParams.get('anchor') ?? 'newest');
         const includeAnchor = (url.searchParams.get('include_anchor') ?? 'true') === 'true';
-        const before = numBefore > 0 ? pool.filter((m) => m.id < anchor).slice(-numBefore) : [];
-        const at = includeAnchor ? pool.filter((m) => m.id === anchor) : [];
-        const after = numAfter > 0 ? pool.filter((m) => m.id > anchor).slice(0, numAfter) : [];
+        const row = (m: WireMessage): number => rowOf.get(m) ?? Number.NaN;
+        const before = numBefore > 0 ? pool.filter((m) => row(m) < anchor).slice(-numBefore) : [];
+        const at = includeAnchor ? pool.filter((m) => row(m) === anchor) : [];
+        const after = numAfter > 0 ? pool.filter((m) => row(m) > anchor).slice(0, numAfter) : [];
         const applyMarkdown = flagIsTrue(url.searchParams.get('apply_markdown'), 'apply_markdown');
         json(res, 200, {
           result: 'success',
@@ -710,6 +735,18 @@ export async function startFakeZulip(opts?: {
 function toArray(v: FakeCredentials | FakeCredentials[] | undefined): FakeCredentials[] | undefined {
   if (v === undefined) return undefined;
   return Array.isArray(v) ? v : [v];
+}
+
+/**
+ * The row an `anchor` names, read the way `zerver/lib/narrow.py::parse_anchor_value` reads it: the
+ * two keywords are SENTINELS ({@link SERVER_CONSTRAINTS.newestAnchor} / `oldestAnchor`), never a
+ * lookup of the newest or oldest matching row, so no record can ever equal the `newest` anchor and
+ * `include_anchor` cannot decide anything on that read.
+ */
+function resolveAnchor(raw: string): number {
+  if (raw === 'newest') return SERVER_CONSTRAINTS.newestAnchor;
+  if (raw === 'oldest') return SERVER_CONSTRAINTS.oldestAnchor;
+  return Number(raw);
 }
 
 /** A request flag read the way Zulip reads it: absent means the documented server DEFAULT. */

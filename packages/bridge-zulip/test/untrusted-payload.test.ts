@@ -18,33 +18,11 @@
  */
 import { asCursor, asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
+import { type ZulipMessage, zulipToMessage } from '../src/wire.js';
 import { SERVER_CONSTRAINTS } from './fake-zulip.js';
-import { rand, SENDER, sleep, useZulip } from './harness.js';
+import { HAZARD_FIELDS as FIELDS, HAZARDS, rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
-
-/** Every server-controlled field of a Zulip message record the plugin reads. */
-const FIELDS = ['id', 'content', 'sender_email', 'timestamp'] as const;
-
-/** Shapes the declared wire types say cannot arrive. Names double as the test titles. */
-const HAZARDS: Array<{ name: string; value: unknown }> = [
-  { name: 'missing', value: undefined },
-  { name: 'null', value: null },
-  { name: 'zero', value: 0 },
-  { name: 'negative', value: -1 },
-  { name: 'fractional', value: 1.5 },
-  { name: 'past the Date range', value: 1e18 },
-  { name: 'before the Date range', value: -1e18 },
-  { name: 'NaN', value: Number.NaN },
-  { name: 'Infinity', value: Number.POSITIVE_INFINITY },
-  { name: 'a string', value: 'nope' },
-  { name: 'an empty string', value: '' },
-  { name: 'an object', value: { nested: true } },
-  { name: 'an array', value: [1, 2] },
-  { name: 'a boolean', value: true },
-  { name: 'a huge string', value: 'x'.repeat(70_000) },
-  { name: 'non-ASCII around a control character', value: '\u{1F600}\u0000caf\u00e9' },
-];
 
 /** Everything above the seam relies on; a Message that fails any of these is not usable. */
 function expectWellFormed(m: Message): void {
@@ -82,38 +60,87 @@ describe('a hostile record shape never throws out of fetchRecent', () => {
   }
 
   /**
-   * `id` shapes the plugin cannot use as a cursor that still ORDER after the history behind them, so
-   * a whole page can consist of them. A shape that mangles the record's order too (a negative or
-   * non-numeric id) cannot model a page — Zulip ids are monotonic — so those stay in the sweep above.
+   * Every `id` shape the plugin cannot NAME, derived by asking the parser rather than by listing —
+   * a shape added to {@link HAZARDS}, or a guard widened in `zulipToMessage`, changes this corpus
+   * the day it lands instead of the day someone remembers a row. The old hand-list admitted only
+   * the two order-preserving numeric shapes, which is precisely why no row could ever sit at a page
+   * EDGE: the shapes that put one there were the ones it excluded.
    */
-  const UNUSABLE_IDS = [
-    { name: 'fractional', value: 1.5 },
-    { name: 'past the safe-integer range', value: 1e18 },
+  const UNNAMEABLE_IDS = HAZARDS.filter(
+    (h) => zulipToMessage(asTopic('probe'), { id: h.value } as ZulipMessage) === undefined,
+  );
+
+  /** Usable history the unnameable record is buried in; index 0 is the OLDEST. */
+  const BURIED = ['g0', 'g1', 'g2', 'g3'];
+
+  /**
+   * Where the unnameable record sits. A backwards read pages from the newest, so the record that
+   * decides whether the walk can continue is the OLDEST one in the page — cross the position with
+   * the caller's `limit` and some row always puts an unnameable record exactly there.
+   */
+  const POSITIONS = [
+    { name: 'first', at: 0 },
+    { name: 'interior', at: 2 },
+    { name: 'last', at: BURIED.length },
   ];
 
-  /** Small enough to be served whole, and one of them equals the page the caller asked for. */
-  const AHEAD = [1, 3];
-
-  for (const shape of UNUSABLE_IDS) {
-    for (const ahead of AHEAD) {
-      for (const limit of [1, 2, 100]) {
-        it(`limit ${limit} reads past ${ahead} record(s) whose \`id\` is ${shape.name}`, async () => {
-          vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-          const { plugin, fake } = await boot();
-          const topic = asTopic(`unusable-${rand()}`);
-          await plugin.post(topic, SENDER, 'behind');
-          for (let i = 0; i < ahead; i++) {
-            fake.injectRaw({ topic, fields: { id: shape.value + i } });
+  for (const position of POSITIONS) {
+    // Includes BURIED.length - 1, the only limit that puts an unnameable record on the OLDEST end
+    // of the page a backwards read takes — the position from which the next anchor is chosen, and
+    // the one every other limit in this table walks straight past.
+    for (const limit of [1, 2, BURIED.length - 1, BURIED.length]) {
+      it(`limit ${limit} reads the whole window past a ${position.name} unnameable record`, async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const { plugin, fake } = await boot();
+        const expected = BURIED.slice(-limit);
+        for (const shape of UNNAMEABLE_IDS) {
+          const where = `${shape.name} at ${position.name}`;
+          const topic = asTopic(`unnameable-${rand()}`);
+          for (const [i, content] of BURIED.entries()) {
+            if (i === position.at) fake.injectRaw({ topic, fields: { id: shape.value } });
+            await plugin.post(topic, SENDER, content);
+          }
+          if (position.at === BURIED.length) {
+            fake.injectRaw({ topic, fields: { id: shape.value } });
           }
 
           const { messages, nextCursor } = await plugin.fetchRecent({ topic, limit });
-          expect(messages.map((m) => m.content)).toEqual(['behind']);
-          expect(Number(nextCursor)).toBeGreaterThan(0);
-          expect((await plugin.fetchRecent({ topic, since: nextCursor })).messages).toEqual([]);
-        });
-      }
+          expect(messages.map((m) => m.content), where).toEqual(expected);
+          expect(Number(nextCursor), where).toBeGreaterThan(0);
+          expect((await plugin.fetchRecent({ topic, since: nextCursor })).messages, where).toEqual(
+            [],
+          );
+        }
+      }, 60_000);
     }
   }
+
+  /**
+   * A step over a page-edge record is paid for by widening the NEXT page by exactly what that step
+   * makes it re-read. Without that the walk comes up one short on every page, and the only other way
+   * it can ever see past the record is the fallback that asks for a server-CAP page — turning a
+   * `limit`-sized read into a 5000-record one against a live server. Graded by running the read and
+   * taking the page sizes off the wire, because a walk that is merely correct cannot be told from
+   * one that is correct and ruinous.
+   */
+  it('pays for a step over a page-edge record with a page the size of the step', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`economy-${rand()}`);
+    const limit = BURIED.length - 1;
+    for (const content of BURIED.slice(0, BURIED.length - limit + 1)) {
+      await plugin.post(topic, SENDER, content);
+    }
+    fake.injectRaw({ topic, fields: { id: 'nope' } });
+    for (const content of BURIED.slice(BURIED.length - limit + 1)) {
+      await plugin.post(topic, SENDER, content);
+    }
+
+    const { messages } = await plugin.fetchRecent({ topic, limit });
+    expect(messages.map((m) => m.content)).toEqual(BURIED.slice(-limit));
+    const asked = fake.sentParams('GET /api/v1/messages').map((p) => Number(p.num_before));
+    expect(Math.max(...asked)).toBeLessThan(SERVER_CONSTRAINTS.maxMessagesPerFetch);
+  });
 
   it('a messages response that is not an object with an array under `messages` reads as empty', async () => {
     const { plugin, fake } = await boot();

@@ -91,17 +91,13 @@ function isoTimestamp(seconds: unknown): string {
 }
 
 /**
- * The anchor that walks past the page just read, taken from the RAW edge record so that a page whose
- * every record was unusable still advances. `undefined` when the edge carries no id that moves the
- * anchor in the direction of travel — keep that guard, so that a server answering with an unmoving
- * id cannot spin the read on one page forever.
+ * The anchor that walks past the page just read, from a candidate id the page showed. `undefined`
+ * when that id cannot NAME a position — it is not a finite number — or when it does not move the
+ * anchor in the direction of travel; keep the second guard, so that a server answering with an
+ * unmoving id cannot spin the read on one page forever. Takes the id rather than the record,
+ * because a caller may propose an id that no single record on the page carries.
  */
-export function pageAnchor(
-  edge: ZulipMessage | undefined,
-  from: string,
-  backwards: boolean,
-): string | undefined {
-  const id = edge?.id;
+export function pageAnchor(id: unknown, from: string, backwards: boolean): string | undefined {
   if (typeof id !== 'number' || !Number.isFinite(id)) return undefined;
   const current = Number(from);
   if (Number.isFinite(current) && (backwards ? id >= current : id <= current)) return undefined;
