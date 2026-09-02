@@ -642,6 +642,14 @@ const CREDENTIAL_STATES: Record<string, { live: boolean; reach: (p: MatrixPlugin
         fake.loginOutcome = 200;
       },
     },
+    'after a connect() whose login answered 200 with no credential': {
+      live: false,
+      reach: async (p) => {
+        fake.loginBody = { user_id: '@parley:fake' };
+        await expect(p.connect(fakeConfig())).rejects.toThrow(/\[parley-matrix\]/);
+        fake.loginBody = undefined;
+      },
+    },
     'after disconnect() then a fresh connect()': {
       live: true,
       reach: async (p) => {

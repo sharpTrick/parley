@@ -4,8 +4,9 @@ import type { Topic } from '@sharptrick/parley-core';
 const SYNC_RETRY_MAX_MS = 30_000;
 
 /**
- * Exponential backoff for a failing `/sync`, so a PERMANENT failure (revoked token → 401, kicked
- * from the room → 403) degrades to a slow probe instead of hammering the homeserver forever.
+ * Exponential backoff for a failing `/sync`, so a PERMANENT failure (revoked token → 401, removed
+ * from the room → a 200 listing it under `rooms.leave`, homeserver fault → 5xx) degrades to a slow
+ * probe instead of hammering the homeserver forever.
  */
 export const syncRetryDelayMs = (consecutiveFailures: number): number =>
   Math.min(200 * 2 ** (consecutiveFailures - 1), SYNC_RETRY_MAX_MS);
@@ -36,3 +37,16 @@ export function reportLoopCrash(topic: Topic, err: unknown): void {
       `${err instanceof Error ? (err.stack ?? err.message) : String(err)}`,
   );
 }
+
+/**
+ * A `/sync` that answers 200 while listing the subscribed room as one this account is no longer in
+ * — the shape a kick or a ban actually takes, which no HTTP status ever reports. Raised INTO the
+ * loop's own ladder rather than written straight to stderr, so it is throttled and backed off like
+ * every other permanent failure instead of costing a line per long-poll.
+ */
+export const membershipLost = (roomId: string, membership: string): Error =>
+  new Error(
+    `/sync no longer lists ${roomId} as joined (membership: ${membership}): this account was ` +
+      'removed from the room, so nothing more will be delivered live from it. Re-invite the ' +
+      'account (an `m.room.member` of `ban` must be lifted first) and reconnect the bridge.',
+  );

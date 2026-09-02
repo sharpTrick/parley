@@ -4,14 +4,17 @@ import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
  * CLASS: a background loop must not turn a permanent error into a silent infinite retry. A revoked
- * access token (401), a kick (403), a broken homeserver (500), or a dropped socket all land in the
- * same catch — the loop must recover from the transient ones and, for the permanent ones, say so on
- * stderr and slow down instead of hammering the homeserver forever with a dead live path.
+ * access token (401), a refused read (403), a broken homeserver (500), or a dropped socket all land
+ * in the same catch — the loop must recover from the transient ones and, for the permanent ones, say
+ * so on stderr and slow down instead of hammering the homeserver forever with a dead live path.
+ *
+ * Losing membership of the room is NOT in this table and cannot be: `/sync` never answers an error
+ * for it. That shape is graded at the end of this file.
  */
 
 const FAILURES = {
   '401 (revoked token)': { mode: 'status', status: 401 },
-  '403 (kicked from room)': { mode: 'status', status: 403 },
+  '403 (the homeserver refuses the read)': { mode: 'status', status: 403 },
   '500 (homeserver fault)': { mode: 'status', status: 500 },
   'network reject': { mode: 'network', status: 0 },
 } as const;
@@ -498,6 +501,103 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
           'a blocking read answered with messages at or before the cursor it was given',
         ).toEqual([]);
       }
+    }, 20_000);
+  }
+});
+
+/**
+ * CLASS: a 200 that has STOPPED naming the resource the loop reads. Every fault above is an HTTP
+ * status, a socket error, or a body shape — all of them things the loop can see. Losing membership
+ * of the room is none of those: `/sync` keeps answering 200, the room simply moves out of
+ * `rooms.join`, the timeline read comes back `undefined`, and a loop grading only what it CAN read
+ * calls that a healthy empty sync — resetting its failure counter, logging nothing, and long-polling
+ * a dead topic at full rate forever. Only the READ path 403s on a kick, so the loud half of the
+ * plugin is the one that still works and the live half is the mute one.
+ *
+ * Two of the rows must NOT read as a loss, because the naive spelling of this guard — "the room is
+ * absent from `rooms.join`" — is satisfied by every idle poll, and a delta can span a removal and a
+ * return. A guard graded only on the shapes it must catch is one that may catch everything.
+ */
+interface MembershipRow {
+  arm: () => void;
+  /** `reported` = the operator gets a line and the retries slow down; `silent` = an ordinary sync. */
+  degrades: 'reported' | 'silent';
+  /** What the stderr line must name, beyond the topic and the room. */
+  names?: RegExp;
+  /** Whether a message landing after the shape is armed still reaches the handler. */
+  delivers: boolean;
+}
+
+const MEMBERSHIP_LOSS: Record<string, MembershipRow> = {
+  'kicked — the room moves to rooms.leave': {
+    arm: () => void (fake.membership = 'leave'),
+    degrades: 'reported',
+    names: /membership: leave/,
+    delivers: false,
+  },
+  'banned — the same, with an m.room.member of ban': {
+    arm: () => void (fake.membership = 'ban'),
+    degrades: 'reported',
+    names: /membership: ban/,
+    delivers: false,
+  },
+  'removed and re-joined inside one delta': {
+    arm: () => void (fake.membership = 'rejoined'),
+    degrades: 'silent',
+    delivers: true,
+  },
+  'the room is merely absent from rooms.join, as an idle poll leaves it': {
+    // No `next_batch`: an idle sync that yields nothing also advances nothing.
+    arm: () => armForever(() => ({ rooms: { join: {} } })),
+    degrades: 'silent',
+    delivers: false,
+  },
+};
+
+describe('a /sync that stopped carrying the subscribed room is reported, not read as idle', () => {
+  for (const [name, row] of Object.entries(MEMBERSHIP_LOSS)) {
+    it(`${name}: degrades ${row.degrades}`, async () => {
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const p = await connectFake({});
+      const t = asTopic('kicked-out');
+      const got: string[] = [];
+      await p.subscribe(t, (m) => void got.push(m.content));
+      const roomId = fake.rooms[0]!.roomId;
+      const from = fake.syncAttempts.length;
+      row.arm();
+      fake.addMessage(String(t), FRESH);
+
+      if (row.degrades === 'silent') {
+        await new Promise((r) => setTimeout(r, PACING_WINDOW_MS));
+        const attempts = fake.syncAttempts.length - from;
+        await p.disconnect();
+
+        expect(reportedFailureCounts(errors.mock.calls)).toEqual([]);
+        expect(attempts).toBeGreaterThan(1);
+        expect(attempts).toBeLessThan(PACED_ATTEMPT_CEILING);
+        expect(got.includes(FRESH)).toBe(row.delivers);
+        return;
+      }
+
+      await vi.waitFor(() => expect(fake.syncAttempts.length - from).toBeGreaterThanOrEqual(4), {
+        timeout: 8000,
+        interval: 20,
+      });
+      const [a0, a1, a2, a3] = fake.syncAttempts.slice(from) as [number, number, number, number];
+      await p.disconnect();
+
+      const said = errors.mock.calls.map((c) => String(c[0]));
+      expect(
+        said.filter((line) => line.includes(String(t)) && line.includes(roomId)),
+        'a removal from the room reached the operator naming neither the topic nor the room',
+      ).not.toEqual([]);
+      expect(said.join('\n')).toMatch(row.names!);
+      // The same backoff the 401/500/network rows get: the gap between retries GROWS.
+      expect(a3 - a2).toBeGreaterThan((a1 - a0) * 2);
+      const reported = reportedFailureCounts(errors.mock.calls);
+      expect(reported).toEqual([...new Set(reported)]);
+      for (const n of reported) expect(n & (n - 1)).toBe(0);
+      expect(got).toEqual([]);
     }, 20_000);
   }
 });

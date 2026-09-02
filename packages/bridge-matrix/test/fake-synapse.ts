@@ -93,6 +93,23 @@ export class FakeSynapse {
    * expressible, so that the state a REJECTED `connect()` leaves behind is gradeable at all.
    */
   loginOutcome: number | 'network' = 200;
+  /**
+   * The body a 200 `POST /v3/login` answers with, INSTEAD of the well-formed one. Keep it
+   * expressible, so that what a `connect()` does with a login that succeeded and minted nothing is
+   * gradeable at all: {@link loginOutcome} only varies the status, and no status reaches the code
+   * that reads the credential out of the body.
+   */
+  loginBody?: unknown;
+  /**
+   * This account's membership in the room an INCREMENTAL `/sync` reads. Anything but `join` answers
+   * 200 with the room under `rooms.leave` — the shape a kick, a ban or a self-leave actually takes,
+   * and one no HTTP status and no malformed body can produce. `rejoined` carries the room under
+   * BOTH sections: the delta that spans a removal and a return, which must NOT read as a loss. Keep
+   * the positioning phase out of it, so that a case can seat a subscription and then remove it.
+   */
+  membership: 'join' | 'leave' | 'ban' | 'rejoined' = 'join';
+  /** The client position a removal was first served at — see the `/sync` handler. */
+  private removedAt?: number;
   /** How many events an incremental /sync will return before it truncates with `limited:true`. */
   syncCap = 100;
   /** Number of `limited:true` incremental syncs emitted — proves the backfill path was exercised. */
@@ -328,6 +345,7 @@ export class FakeSynapse {
       if (this.loginOutcome !== 200) {
         return jsonRes({ errcode: 'M_FORBIDDEN', error: 'injected' }, this.loginOutcome);
       }
+      if (this.loginBody !== undefined) return jsonRes(this.loginBody);
       // Mint the token from the HOST, so that a credential arriving at the wrong homeserver names
       // the one it was minted by instead of being indistinguishable from that host's own.
       return jsonRes({ access_token: tokenFor(url.host), user_id: '@parley:fake' });
@@ -411,6 +429,14 @@ export class FakeSynapse {
           content: { membership: 'join' },
         },
       ]);
+    }
+
+    // Answered like any other room endpoint, so that a plugin which grew a leave fails on the
+    // assertion that NAMES the rule (`provisioning.fake.test.ts`) instead of on an "unhandled POST"
+    // from this fixture, which reads as a broken fake rather than as a broken plugin.
+    if (/\/v3\/rooms\/[^/]+\/(?:leave|forget)$/.test(path)) {
+      if (inRoom === undefined) return notFound('room');
+      return jsonRes({});
     }
 
     if (path.endsWith('/join')) {
@@ -551,6 +577,43 @@ export class FakeSynapse {
       }
       const override = this.syncBodyOverrides.shift();
       if (override !== undefined) return jsonRes(override(syncRoom?.roomId ?? ''));
+      if (this.membership !== 'join') {
+        const key = syncRoom?.roomId ?? '';
+        const left = {
+          [key]: {
+            timeline: {
+              events: [
+                {
+                  type: 'm.room.member',
+                  event_id: `$membership${this.counter++}:fake`,
+                  state_key: SELF_MXID,
+                  sender: '@admin:fake',
+                  content: { membership: this.membership === 'ban' ? 'ban' : 'leave' },
+                },
+              ],
+              limited: false,
+            },
+          },
+        };
+        if (this.membership === 'rejoined') {
+          const from = tokenPos(since);
+          return jsonRes({
+            next_batch: `p${len}`,
+            rooms: {
+              leave: left,
+              join: { [key]: { timeline: { events: timeline.slice(from, len), limited: false } } },
+            },
+          });
+        }
+        // A removal appears in the ONE delta that spans it, and is re-served to any client still
+        // asking from a token at or before that point. Past it the room is absent from every
+        // section — indistinguishable from an idle poll, which is the whole reason a loop must
+        // report the delta rather than skip past it.
+        this.removedAt ??= tokenPos(since);
+        return tokenPos(since) <= this.removedAt
+          ? jsonRes({ next_batch: `p${len}`, rooms: { leave: left } })
+          : jsonRes({ next_batch: `p${len}`, rooms: { join: {} } });
+      }
       const k = tokenPos(since);
       const cap = Math.min(filterLimit, this.syncCap);
       const newCount = len - k;

@@ -602,7 +602,34 @@ const SIDE_EFFECTS: Record<
   },
 };
 
+/**
+ * The permanent room mutations no seam path may issue, read off the WIRE and over the whole run —
+ * `disconnect()` included, which the declared-effects list above never observes because it is read
+ * before the teardown. A source scan grades how a request is spelled; this grades whether it was
+ * made, so a leave reached through a helper, a variable or a module nobody listed still lands here.
+ */
+const FORBIDDEN_ROOM_MUTATIONS = ['leave', 'forget', 'kick', 'ban', 'upgrade'];
+
+const roomMutationsOnTheWire = (urls: URL[]): string[] =>
+  urls
+    .map((u) => u.pathname)
+    .filter((path) => FORBIDDEN_ROOM_MUTATIONS.includes(path.split('/').at(-1) ?? ''));
+
 describe('every seam call issues exactly the state changes it is declared to', () => {
+  it('tells a room mutation from the requests this plugin does make', () => {
+    const room = '/_matrix/client/v3/rooms/%21r%3Afake';
+    const seen = (path: string): string[] =>
+      roomMutationsOnTheWire([new URL(`https://synapse.fake${path}`)]);
+    for (const segment of FORBIDDEN_ROOM_MUTATIONS) {
+      expect(seen(`${room}/${segment}`), `a ${segment} was not seen`).not.toEqual([]);
+    }
+    expect(seen(`${room}/${FORBIDDEN_ROOM_MUTATIONS[0]!}?reason=x`)).not.toEqual([]);
+    const kept = [`${room}/join`, `${room}/state`, `${room}/messages`, '/_matrix/client/v3/sync'];
+    for (const path of kept) {
+      expect(seen(path), `${path} was read as a room mutation`).toEqual([]);
+    }
+  });
+
   for (const [name, row] of Object.entries(SIDE_EFFECTS)) {
     it(`${name}: ${row.effects.join(' + ') || 'nothing'}`, async () => {
       fake.aliasExists = row.aliasExists;
@@ -613,6 +640,7 @@ describe('every seam call issues exactly the state changes it is declared to', (
 
       expect(writes()).toEqual(row.effects);
       await p.disconnect();
+      expect(roomMutationsOnTheWire(fake.requestUrls)).toEqual([]);
     }, 20_000);
   }
 
@@ -629,5 +657,6 @@ describe('every seam call issues exactly the state changes it is declared to', (
     expect(writes()).toEqual(topics.flatMap(() => ['POST /join', 'GET /state']));
     expect(fake.rooms).toHaveLength(topics.length);
     await p.disconnect();
+    expect(roomMutationsOnTheWire(fake.requestUrls)).toEqual([]);
   }, 20_000);
 });

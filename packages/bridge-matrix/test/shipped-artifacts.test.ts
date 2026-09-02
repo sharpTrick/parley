@@ -277,7 +277,24 @@ describe('the README does not contradict the tool semantics core ships', () => {
  * leaves one, and the joined-room set is what bounds `/sync` latency — so the README paragraph that
  * says a read never provisions has to name the join it DOES make, and the day the plugin grows a
  * leave, this fails so the paragraph is rewritten rather than left stale.
+ *
+ * The room mutation is recognised from the path SEGMENT, never from the punctuation around it: a
+ * scan keyed on the character that follows — a closing backtick, say — grades one way of writing the
+ * same request and walks past a concatenation, a path in a variable, a query string, or a helper in
+ * a module nobody thought to look in. Comments are stripped first, so the prose that promises this
+ * lever does not exist is not itself read as the lever.
  */
+const stripComments = (source: string): string =>
+  source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
+/** Permanent room mutations reachable from a model-named topic; none belongs on any seam path. */
+const FORBIDDEN_ROOM_MUTATIONS = ['leave', 'forget', 'kick', 'ban', 'upgrade'];
+
+const roomMutationsIn = (source: string): string[] =>
+  FORBIDDEN_ROOM_MUTATIONS.filter((segment) =>
+    new RegExp(`['"\`][^'"\`]*\\/${segment}(?![A-Za-z0-9_])`).test(stripComments(source)),
+  );
+
 describe('the read-path paragraph names the side effect a read does have', () => {
   const readsSection = (): string => {
     const from = README.indexOf('**Reads never provision');
@@ -293,7 +310,35 @@ describe('the read-path paragraph names the side effect a read does have', () =>
     expect(readsSection()).toMatch(/`\/sync`/);
   });
 
+  it('recognizes a room mutation however it is spelled, and prose about one as prose', () => {
+    const planted: Record<string, string> = {
+      'a template literal': 'this.http("POST", `/_matrix/client/v3/rooms/${id}/leave`, {});',
+      'string concatenation':
+        "const p = '/_matrix/client/v3/rooms/' + id + '/leave'; this.http('POST', p, {});",
+      'a query string after the segment':
+        'this.http("POST", `/_matrix/client/v3/rooms/${id}/forget?reason=x`, {});',
+      'a helper that only builds the path':
+        'export const path = (id: string) => `/rooms/${id}/kick`;',
+      'a mutation nobody named in the README': 'const u = `/rooms/${id}/upgrade`;',
+    };
+    for (const [how, snippet] of Object.entries(planted)) {
+      expect(roomMutationsIn(snippet), `a leave written as ${how} was not seen`).not.toEqual([]);
+    }
+
+    const innocent: Record<string, string> = {
+      'a doc comment naming the lever the plugin lacks':
+        '/** There is no `/leave` or `/forget` lever in this plugin. */',
+      'a line comment about leaving a room': '// never leaves: no `/leave` is ever issued',
+      'an endpoint that merely starts with the word':
+        'this.http("GET", `/_matrix/client/v3/rooms/${id}/leaves`, {});',
+      'the join a read DOES make': 'this.http("POST", `/_matrix/client/v3/rooms/${id}/join`, {});',
+    };
+    for (const [how, snippet] of Object.entries(innocent)) {
+      expect(roomMutationsIn(snippet), `${how} was read as a room mutation`).toEqual([]);
+    }
+  });
+
   it('the plugin still never leaves or forgets a room, as that paragraph says', () => {
-    expect(PLUGIN_SRC).not.toMatch(/\/(?:leave|forget)`/);
+    expect(roomMutationsIn(PLUGIN_SRC)).toEqual([]);
   });
 });

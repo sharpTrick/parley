@@ -9,12 +9,14 @@ import {
   type MatrixBackendConfig, syncDeadlineMs, validateConfig,
 } from './config.js';
 import { emptyWindowCursor, requireLimit } from './cursor.js';
-import { reportLoopCrash, reportSyncFailure, syncRetryDelayMs } from './diagnostics.js';
+import {
+  membershipLost, reportLoopCrash, reportSyncFailure, syncRetryDelayMs,
+} from './diagnostics.js';
 import { liveKey, MatrixParking } from './park.js';
 import { INCREMENTAL_TIMELINE_LIMIT, returnedTooFast, SYNC_IDLE_PACE_MS } from './timeline.js';
 import {
-  type Boundary, eventToMessage, type MessageEvent, nextBatchOf, positionBoundaryOf,
-  positioningBatchOf, ROOM_START, syncFilterParam, type SyncResponse, TOPIC_KEY,
+  adoptedString, type Boundary, eventToMessage, membershipLossOf, type MessageEvent, nextBatchOf,
+  positionBoundaryOf, positioningBatchOf, ROOM_START, syncFilterParam, type SyncResponse, TOPIC_KEY,
 } from './wire.js';
 
 export { sanitizeAlias } from './alias.js';
@@ -60,7 +62,8 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
 
     for (const risk of configRisks(cfg)) console.warn(`[parley-matrix] SECURITY: ${risk}`);
 
-    const res = await this.http('POST', '/_matrix/client/v3/login', {
+    const path = '/_matrix/client/v3/login';
+    const res = await this.http('POST', path, {
       unauthenticated: true,
       body: {
         type: 'm.login.password',
@@ -68,9 +71,14 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
         password: this.password,
       },
     });
-    const json = (await res.json()) as { access_token: string; user_id: string };
-    this.token = json.access_token;
-    this.userId = json.user_id;
+    const json = (await res.json()) as Record<string, unknown> | null;
+    // Keep the credential adopted only through the guard, so that a 200 carrying none leaves this
+    // `connect()` REJECTED rather than resolved: the `standDown()` above has already cleared the
+    // token, and a resolved connect with no token is a plugin whose every later seam call fails
+    // blaming a disconnect that never happened.
+    const call = `POST ${path} to ${this.baseUrl}`;
+    this.token = adoptedString(json?.access_token, 'access_token', call);
+    this.userId = typeof json?.user_id === 'string' ? json.user_id : undefined;
   }
 
   async disconnect(): Promise<void> {
@@ -95,8 +103,10 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
       { body: { msgtype: 'm.text', body: content, [TOPIC_KEY]: topic, ...relation } },
     );
-    const json = (await res.json()) as { event_id: string };
-    return asBackendMsgId(json.event_id);
+    const json = (await res.json()) as Record<string, unknown> | null;
+    return asBackendMsgId(
+      adoptedString(json?.event_id, 'event_id', `PUT .../rooms/${roomId}/send/m.room.message`),
+    );
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
@@ -205,6 +215,12 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
             this.controllers.delete(controller);
           }
           if (this.isStale(generation)) break;
+          const lost = membershipLossOf(json, roomId);
+          // Keep this ahead of the token advance, so that a removal the homeserver reports in ONE
+          // delta is re-read on every retry: past it the room is simply absent from every later
+          // `/sync`, which is indistinguishable from an idle one, and the ladder below would report
+          // once and then poll a dead topic in silence at full rate forever.
+          if (lost !== undefined) throw membershipLost(roomId, lost);
           nextBatch = nextBatchOf(json.next_batch, nextBatch);
           const timeline = json.rooms?.join?.[roomId]?.timeline;
           const events = timeline?.events ?? [];

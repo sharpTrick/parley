@@ -33,8 +33,50 @@ export interface SyncResponse {
       string,
       { timeline?: { events?: MatrixEvent[]; limited?: boolean; prev_batch?: string } }
     >;
+    leave?: Record<string, unknown>;
   };
 }
+
+/** The `membership` of the last `m.room.member` a leave section carries, if it carries one. */
+const membershipIn = (left: unknown): string | undefined => {
+  const events = (left as { timeline?: { events?: unknown } } | null)?.timeline?.events;
+  if (!Array.isArray(events)) return undefined;
+  for (const e of [...events].reverse()) {
+    const member = e as { type?: unknown; content?: { membership?: unknown } } | null;
+    if (member?.type !== 'm.room.member') continue;
+    if (typeof member.content?.membership === 'string') return member.content.membership;
+  }
+  return undefined;
+};
+
+/**
+ * The membership a `/sync` reports for a room it has stopped delivering — a kick, a ban, a leave.
+ * Keep this read from `rooms.leave`, and only when `rooms.join` does not ALSO carry the room, so
+ * that neither an idle incremental `/sync` (which legitimately omits a room with no new events) nor
+ * a delta spanning a removal and a re-join is read as a loss.
+ */
+export const membershipLossOf = (sync: SyncResponse, roomId: string): string | undefined => {
+  const left = sync.rooms?.leave?.[roomId];
+  if (left === undefined || sync.rooms?.join?.[roomId] !== undefined) return undefined;
+  return membershipIn(left) ?? 'not joined';
+};
+
+/**
+ * A field a 200 must carry as a non-empty string before this plugin ADOPTS it — a credential it will
+ * bear on every later request, or an id it hands core to persist. Keep it a THROW naming the call
+ * and the homeserver, so that a homeserver, a proxy or a captive portal answering the right status
+ * with the wrong body cannot leave the plugin holding a value it will use forever: an adopted
+ * non-string goes out on the wire as `Bearer undefined`, or into a `read-state.json` as a cursor no
+ * later call can resolve.
+ */
+export const adoptedString = (raw: unknown, field: string, call: string): string => {
+  if (typeof raw === 'string' && raw !== '') return raw;
+  throw new Error(
+    `[parley-matrix] ${call} answered 200 but its ${field} was ` +
+      `${JSON.stringify(raw) ?? typeof raw} where a non-empty string was required; this is not a ` +
+      'Matrix homeserver, or a proxy or captive portal answered for it.',
+  );
+};
 
 /** The `?filter=` value for a `/sync` with a given timeline limit (0 = no history at all). */
 export const syncFilterParam = (roomId: string, timelineLimit: number): string =>
