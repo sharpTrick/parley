@@ -32,6 +32,11 @@ interface Row {
  * This lets us exercise the catch-up driver, dedup, mention-filter, and the dual-role server
  * without standing up a real backend — and doubles as a sanity check that the conformance
  * suite is backend-shaped, not SQLite-shaped.
+ *
+ * Every seam method refuses while the plugin is disconnected, exactly as
+ * packages/conformance/test/reference-plugin.ts and every shipped backend do. Keep that clause, so
+ * that a core test grading teardown ORDERING cannot pass against a fake that still serves calls a
+ * real backend would have already refused.
  */
 export class FakePlugin implements BackendPlugin {
   private seq = 0;
@@ -50,6 +55,7 @@ export class FakePlugin implements BackendPlugin {
   }
 
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    this.require();
     let set = this.subs.get(topic);
     if (set === undefined) {
       set = new Set<MessageHandler>();
@@ -64,6 +70,7 @@ export class FakePlugin implements BackendPlugin {
     content: string,
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
+    this.require();
     const seq = ++this.seq;
     const id = asBackendMsgId(String(seq));
     const msg: Message = {
@@ -82,6 +89,7 @@ export class FakePlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    this.require();
     const sinceSeq = args.since === undefined ? 0 : Number(args.since);
     const limit = args.limit ?? 100;
     const ordered = this.rows
@@ -98,6 +106,30 @@ export class FakePlugin implements BackendPlugin {
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
+    this.require();
     return { handle, backendRef: handle };
   }
+
+  /**
+   * Out-of-band inspection of what was durably recorded, answerable while disconnected because it
+   * is not a seam call. A test that wants to know what a torn-down bridge managed to post reads
+   * this; reading it through `fetchRecent` instead would need a connection the bridge has closed.
+   */
+  recorded(topic: Topic): Message[] {
+    return this.rows
+      .filter((r) => r.msg.topic === topic)
+      .sort((a, b) => a.seq - b.seq)
+      .map((r) => r.msg);
+  }
+
+  private require(): void {
+    if (!this.connected) throw new Error('fake plugin is disconnected');
+  }
+}
+
+/** A {@link FakePlugin} already connected, the state core's composition root leaves it in. */
+export async function connectedFake(): Promise<FakePlugin> {
+  const plugin = new FakePlugin();
+  await plugin.connect({});
+  return plugin;
 }

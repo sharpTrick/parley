@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { asHandle, asTopic } from '../message.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { connectedFake } from '../testing/fake-plugin.js';
 import { startPresenceLoop, type PresenceLoop } from '../transport/presence-loop.js';
 import { fetchRecentBlocking } from './blocking-fetch.js';
 import { SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, SeenSet } from './seen-set.js';
@@ -26,8 +26,8 @@ interface Knob {
   cleanup?: (made: unknown) => Promise<void>;
 }
 
-const presenceDeps = () => ({
-  plugin: new FakePlugin(),
+const presenceDeps = async () => ({
+  plugin: await connectedFake(),
   identity: asHandle('agent'),
   allow: new Allowlist(['ctx']),
   presenceTopic: asTopic('parley-presence'),
@@ -48,22 +48,22 @@ const KNOBS: Knob[] = [
   },
   {
     label: 'fetchRecentBlocking pollIntervalMs',
-    build: (pollIntervalMs) =>
-      fetchRecentBlocking(new FakePlugin(), { topic: asTopic('ctx') }, { blockMs: 0, pollIntervalMs }),
+    build: async (pollIntervalMs) =>
+      fetchRecentBlocking(await connectedFake(), { topic: asTopic('ctx') }, { blockMs: 0, pollIntervalMs }),
     degenerate: [0, -1, Number.NaN, Number.NEGATIVE_INFINITY],
     legal: 250,
   },
   {
     label: 'fetchRecentBlocking blockMs',
-    build: (blockMs) =>
-      fetchRecentBlocking(new FakePlugin(), { topic: asTopic('ctx') }, { blockMs, pollIntervalMs: 250 }),
+    build: async (blockMs) =>
+      fetchRecentBlocking(await connectedFake(), { topic: asTopic('ctx') }, { blockMs, pollIntervalMs: 250 }),
     degenerate: [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY],
     legal: 0,
   },
   {
     label: 'startPresenceLoop heartbeatMs',
-    build: (heartbeatMs) => {
-      const { plugin, identity, allow, presenceTopic } = presenceDeps();
+    build: async (heartbeatMs) => {
+      const { plugin, identity, allow, presenceTopic } = await presenceDeps();
       return startPresenceLoop(plugin, identity, allow, { presenceTopic, heartbeatMs });
     },
     degenerate: [

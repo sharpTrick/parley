@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { asCursor, asHandle, asTopic, type Cursor } from '../message.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { connectedFake } from '../testing/fake-plugin.js';
 import {
   NONCONFORMANT_SHAPE_NAMES,
   NONCONFORMANT_SHAPES,
@@ -44,7 +44,7 @@ function fakeClock(start = 0) {
 
 describe('fetchRecentBlocking', () => {
   it('returns immediately when the first fetch already has messages (passthrough)', async () => {
-    const plugin = new FakePlugin();
+    const plugin = await connectedFake();
     const t = asTopic('room');
     await plugin.post(t, SENDER, 'a');
     const clock = fakeClock();
@@ -58,7 +58,7 @@ describe('fetchRecentBlocking', () => {
   });
 
   it('with blockMs = 0 is a plain single passthrough (no waiting)', async () => {
-    const plugin = new FakePlugin();
+    const plugin = await connectedFake();
     const t = asTopic('room');
     const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
     const spy = vi.spyOn(plugin, 'fetchRecent');
@@ -74,7 +74,7 @@ describe('fetchRecentBlocking', () => {
   });
 
   it('returns promptly after a concurrent post lands mid-wait', async () => {
-    const plugin = new FakePlugin();
+    const plugin = await connectedFake();
     const t = asTopic('room');
     await plugin.post(t, SENDER, 'old');
     const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
@@ -96,7 +96,7 @@ describe('fetchRecentBlocking', () => {
   });
 
   it('returns an empty page with a stable cursor at the deadline', async () => {
-    const plugin = new FakePlugin();
+    const plugin = await connectedFake();
     const t = asTopic('room');
     await plugin.post(t, SENDER, 'old');
     const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
@@ -117,7 +117,7 @@ describe('fetchRecentBlocking', () => {
   });
 
   it('passes the REMAINING budget as blockMs to the plugin each iteration (native path)', async () => {
-    const plugin = new FakePlugin();
+    const plugin = await connectedFake();
     const t = asTopic('room');
     const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
     const clock = fakeClock();
@@ -164,12 +164,12 @@ describe('fetchRecentBlocking', () => {
     const T = asTopic('room');
 
     const flavours = {
-      'ignores blockMs (returns instantly)': (): BackendPlugin => {
-        const p = new FakePlugin();
+      'ignores blockMs (returns instantly)': async (): Promise<BackendPlugin> => {
+        const p = await connectedFake();
         return p;
       },
-      'honours blockMs natively (parks for the whole budget)': (): BackendPlugin => {
-        const p = new FakePlugin();
+      'honours blockMs natively (parks for the whole budget)': async (): Promise<BackendPlugin> => {
+        const p = await connectedFake();
         const orig = p.fetchRecent.bind(p);
         p.fetchRecent = async (a: FetchRecentArgs): Promise<FetchRecentResult> => {
           if ((a.blockMs ?? 0) > 0) await new Promise((r) => setTimeout(r, a.blockMs).unref?.());
@@ -203,7 +203,7 @@ describe('fetchRecentBlocking', () => {
       for (const [when, fire] of Object.entries(timings)) {
         for (const [start, argsFor] of Object.entries(starts)) {
           it.each(Object.entries(cadences))(`${flavour} × aborted ${when} × ${start} × %s`, async (_cadence, pollIntervalMs) => {
-            const plugin = make();
+            const plugin = await make();
             const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
             const ac = new AbortController();
             fire(ac);
@@ -230,7 +230,7 @@ describe('fetchRecentBlocking', () => {
       }
 
       it(`${flavour} × never aborted still spends the whole budget`, async () => {
-        const plugin = make();
+        const plugin = await make();
         const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
         const t0 = Date.now();
         await fetchRecentBlocking(plugin, { topic: T, since: tail }, { blockMs: 400, pollIntervalMs: 40 });
@@ -251,8 +251,8 @@ describe('fetchRecentBlocking', () => {
     const T = asTopic('room');
 
     /** A plugin that counts queries and, optionally, parks the first one until released. */
-    function counting(opts: { park?: boolean } = {}) {
-      const plugin = new FakePlugin();
+    async function counting(opts: { park?: boolean } = {}) {
+      const plugin = await connectedFake();
       const calls: FetchRecentArgs[] = [];
       let release: (() => void) | undefined;
       const orig = plugin.fetchRecent.bind(plugin);
@@ -269,7 +269,7 @@ describe('fetchRecentBlocking', () => {
     }
 
     it('an abort BEFORE the first fetch costs no backend query at all', async () => {
-      const { plugin, calls } = counting();
+      const { plugin, calls } = await counting();
       const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
       calls.length = 0;
       const ac = new AbortController();
@@ -286,7 +286,7 @@ describe('fetchRecentBlocking', () => {
     });
 
     it('an abort DURING the nap costs exactly the one query already made', async () => {
-      const { plugin, calls } = counting();
+      const { plugin, calls } = await counting();
       const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
       calls.length = 0;
       const ac = new AbortController();
@@ -308,7 +308,7 @@ describe('fetchRecentBlocking', () => {
     });
 
     it('an abort while a fetch is IN FLIGHT costs exactly that query', async () => {
-      const { plugin, calls, release } = counting({ park: true });
+      const { plugin, calls, release } = await counting({ park: true });
       const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
       calls.length = 0;
       const ac = new AbortController();
@@ -345,7 +345,7 @@ describe('fetchRecentBlocking', () => {
       ['a cadence coarser than the whole budget', 10, 250, 10, 2],
       ['a one-millisecond budget', 1, 1000, 1, 2],
     ])('%s resolves at its deadline, not at the next tick', async (_name, blockMs, pollIntervalMs, at, queries) => {
-      const { plugin, calls } = counting();
+      const { plugin, calls } = await counting();
       const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
       calls.length = 0;
       const clock = fakeClock();
@@ -382,7 +382,7 @@ describe('fetchRecentBlocking', () => {
       ['no since, topic is empty', false, false, 5],
       ['since at the tail, nothing newer', true, true, 5],
     ])('%s', async (_name, withSince, seeded, expectedCalls) => {
-      const plugin = new FakePlugin();
+      const plugin = await connectedFake();
       if (seeded) await plugin.post(T, SENDER, 'old');
       const tail = (await plugin.fetchRecent({ topic: T })).nextCursor;
       const calls: FetchRecentArgs[] = [];

@@ -28,16 +28,19 @@ const PUSHING = { live_push: { enabled: true } };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-/** Every presence post seen so far, in order. A FakePlugin records posts durably. */
-async function presenceLog(p: FakePlugin): Promise<string[]> {
-  const { messages } = await p.fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) });
-  return messages.map((m) => m.content);
+/**
+ * Every presence post seen so far, in order. Read out-of-band rather than through `fetchRecent`, so
+ * that these rows can inspect a bridge that has already torn its backend connection down — which is
+ * the state most of them are asserting about.
+ */
+function presenceLog(p: FakePlugin): string[] {
+  return p.recorded(asTopic(DEFAULT_PRESENCE_TOPIC)).map((m) => m.content);
 }
 
-const beatCount = async (p: FakePlugin): Promise<number> => (await presenceLog(p)).length;
+const beatCount = (p: FakePlugin): number => presenceLog(p).length;
 
-const kinds = async (p: FakePlugin): Promise<string[]> =>
-  (await presenceLog(p)).map((c) => decodePresence(c)?.kind ?? 'unknown');
+const kinds = (p: FakePlugin): string[] =>
+  presenceLog(p).map((c) => decodePresence(c)?.kind ?? 'unknown');
 
 /** A port already bound by somebody else, and the release that frees it. */
 async function occupiedPort(): Promise<{ port: number; release: () => Promise<void> }> {
@@ -168,9 +171,9 @@ describe('remote HTTP: close() resolves in whatever order the lifecycle runs', (
         } else await app.close();
       }
       for (const s of bound) expect(s.listening).toBe(false);
-      const atStop = await beatCount(plugin);
+      const atStop = beatCount(plugin);
       await sleep(80); // several heartbeat cadences
-      expect(await beatCount(plugin)).toBe(atStop);
+      expect(beatCount(plugin)).toBe(atStop);
     } finally {
       await plugin.disconnect();
       await blocker.release();
@@ -249,9 +252,9 @@ describe('a start interleaved with a stop leaves nothing running', () => {
       await settle();
 
       expect(root.running()).toBe(false);
-      const atStop = await beatCount(p);
+      const atStop = beatCount(p);
       await sleep(100); // several heartbeat cadences
-      expect(await beatCount(p)).toBe(atStop);
+      expect(beatCount(p)).toBe(atStop);
       await expect(root.stop()).resolves.toBeUndefined();
     } finally {
       await p.disconnect();
@@ -273,10 +276,10 @@ describe('presence is announced only once the transport is actually live', () =>
     await p.connect({});
     const app = createRemoteHttpApp(p, lifecycleCfg(PUSHING), { insecureNoAuth: true });
     await settle();
-    expect(await presenceLog(p)).toEqual([]); // constructed, never listened ⇒ never advertised
+    expect(presenceLog(p)).toEqual([]); // constructed, never listened ⇒ never advertised
     const s = await app.listen(0);
     expect(s.address()).not.toBeNull();
-    await vi.waitFor(async () => expect((await presenceLog(p)).length).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(presenceLog(p).length).toBeGreaterThan(0));
     await app.close();
     await p.disconnect();
   });
@@ -288,7 +291,7 @@ describe('presence is announced only once the transport is actually live', () =>
     const app = createRemoteHttpApp(p, lifecycleCfg(PUSHING), { insecureNoAuth: true });
     await expect(app.listen(blocker.port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
     await settle();
-    expect(await presenceLog(p)).toEqual([]);
+    expect(presenceLog(p)).toEqual([]);
     await app.close();
     await p.disconnect();
     await blocker.release();
@@ -299,10 +302,10 @@ describe('presence is announced only once the transport is actually live', () =>
     await p.connect({});
     const bridge = await buildBridge(p, lifecycleCfg(PUSHING));
     await settle();
-    expect(await presenceLog(p)).toEqual([]); // built, never attached ⇒ never advertised
+    expect(presenceLog(p)).toEqual([]); // built, never attached ⇒ never advertised
     const [, serverT] = InMemoryTransport.createLinkedPair();
     await bridge.attach(serverT);
-    await vi.waitFor(async () => expect((await presenceLog(p)).length).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(presenceLog(p).length).toBeGreaterThan(0));
     await bridge.shutdown();
 
     const failing = new FakePlugin();
@@ -312,7 +315,7 @@ describe('presence is announced only once the transport is actually live', () =>
     const [, t2] = InMemoryTransport.createLinkedPair();
     await expect(doomed.attach(t2)).rejects.toThrow(/subscribe boom/);
     await settle();
-    expect(await presenceLog(failing)).toEqual([]);
+    expect(presenceLog(failing)).toEqual([]);
   });
 });
 
@@ -356,19 +359,19 @@ describe('a composition root can only be started once', () => {
       const p = new FakePlugin();
       await p.connect({});
       const started = await roots[name]!(p);
-      await vi.waitFor(async () => expect((await kinds(p)).length).toBeGreaterThan(0));
+      await vi.waitFor(() => expect(kinds(p).length).toBeGreaterThan(0));
 
       await expect(started.startAgain()).rejects.toThrow();
       await sleep(80); // several heartbeat cadences
 
       // A second loop would announce itself with its own hello.
-      expect((await kinds(p)).filter((k) => k === 'hello')).toHaveLength(1);
+      expect(kinds(p).filter((k) => k === 'hello')).toHaveLength(1);
 
       await started.stop();
       expect(started.stillBound()).toBe(false);
-      const atStop = (await kinds(p)).length;
+      const atStop = kinds(p).length;
       await sleep(100);
-      expect((await kinds(p)).length).toBe(atStop); // nothing beats past teardown
+      expect(kinds(p).length).toBe(atStop); // nothing beats past teardown
       await p.disconnect();
     },
   );
@@ -407,7 +410,7 @@ describe('a composition root can only be started once', () => {
 
     expect(settled.map((s) => s.status).sort()).toEqual(['fulfilled', 'rejected']);
     await sleep(80); // several heartbeat cadences
-    expect((await kinds(p)).filter((k) => k === 'hello')).toHaveLength(1);
+    expect(kinds(p).filter((k) => k === 'hello')).toHaveLength(1);
 
     await stop();
     for (const s of settled) {
@@ -415,9 +418,45 @@ describe('a composition root can only be started once', () => {
         s.status === 'fulfilled' ? (s.value as { listening?: boolean } | undefined)?.listening : undefined;
       if (bound !== undefined) expect(bound).toBe(false); // teardown reached whatever bound
     }
-    const atStop = (await kinds(p)).length;
+    const atStop = kinds(p).length;
     await sleep(100);
-    expect((await kinds(p)).length).toBe(atStop);
+    expect(kinds(p).length).toBe(atStop);
+    await p.disconnect();
+  });
+});
+
+/**
+ * A goodbye is the beat that stops peers reporting a cleanly-stopped instance `online` for a whole
+ * `presence.ttl_ms`, and it is BEST-EFFORT: every root swallows whatever `presence.stop()` throws.
+ * That makes ordering the only thing holding it up — a release step sequenced before the goodbye
+ * takes the connection out from under it, the post throws, the swallow hides it, and every peer
+ * keeps advertising a process that is gone. So grade the OUTCOME on the presence topic rather than
+ * the call order, once per root, for every root that owns a presence loop.
+ */
+describe('a clean stop says its goodbye while it still can', () => {
+  const stops: Record<string, (p: FakePlugin) => Promise<() => Promise<void>>> = {
+    'http close()': async (p) => {
+      const app = createRemoteHttpApp(p, lifecycleCfg(), { insecureNoAuth: true });
+      await app.listen(0);
+      return () => app.close();
+    },
+    'stdio shutdown()': async (p) => {
+      const bridge = await buildBridge(p, lifecycleCfg());
+      await bridge.attach(InMemoryTransport.createLinkedPair()[1]);
+      return () => bridge.shutdown();
+    },
+  };
+
+  it.each(Object.keys(stops))('%s reaches the presence topic with a goodbye', async (name) => {
+    const p = new FakePlugin();
+    await p.connect({});
+    const stop = await stops[name]!(p);
+    await vi.waitFor(() => expect(kinds(p)).toContain('hello'));
+
+    await stop();
+
+    expect(kinds(p).filter((k) => k === 'goodbye')).toHaveLength(1);
+    expect(kinds(p).at(-1)).toBe('goodbye'); // the LAST thing said, not a beat that outlived it
     await p.disconnect();
   });
 });

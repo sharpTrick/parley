@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 /**
  * What the release actually ships, for EVERY public workspace.
@@ -123,7 +124,32 @@ const registriesOfWorkspaceNames = (source: string): string[] =>
     )
     .map(({ name }) => name);
 
+/**
+ * Every rule below reads `dist/`, and one of them EXECUTES it, so build it here rather than assume
+ * a prior `npm run build` — a rule that grades an absent artifact grades nothing at all, which is
+ * how a manifest could promise two files no tarball carried under a green suite. `tsc -b` decides
+ * whether the artifact matches `src/`; `--force` is only for the case it gets wrong, a deleted
+ * `dist/` under a tsbuildinfo that still reports the project up to date.
+ */
+let PACKED: Record<string, string[]> = {};
+
+/** Throwaway consumer installs built by the typecheck rows below. */
+const scratch: string[] = [];
+
 describe('every public workspace ships only what a consumer can run', () => {
+  beforeAll(() => {
+    execFileSync('npx', ['tsc', '-b'], { cwd: REPO_ROOT, stdio: 'pipe' });
+    const emitted = (w: Workspace): boolean => existsSync(join(REPO_ROOT, w.dir, 'dist'));
+    if (!WORKSPACES.every(emitted)) {
+      execFileSync('npx', ['tsc', '-b', '--force'], { cwd: REPO_ROOT, stdio: 'pipe' });
+    }
+    PACKED = packedFiles();
+  }, 600_000);
+
+  afterAll(() => {
+    for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+  });
+
   it('reads the release set from the release, and it is the whole repo', () => {
     expect(WORKSPACES.length).toBeGreaterThan(10);
     expect(WORKSPACES.map((w) => w.name)).toContain('@sharptrick/parley-core');
@@ -204,8 +230,6 @@ describe('every public workspace ships only what a consumer can run', () => {
    * registry would receive rather than what the checkout happens to hold.
    */
   describe('what npm would upload', () => {
-    const PACKED = packedFiles();
-
     it('lists every public workspace, so the rows below are not an empty table', () => {
       expect(WORKSPACES.map((w) => w.name).filter((n) => PACKED[n] === undefined)).toEqual([]);
     });
@@ -237,14 +261,15 @@ describe('every public workspace ships only what a consumer can run', () => {
     ...new Set([...promisedPaths(manifest.exports), ...promisedPaths(manifest.bin)]),
   ];
 
-  /** Would `files` put this path in the tarball? npm packs the manifest itself whatever it says. */
-  const packedBy = (files: unknown, path: string): boolean => {
-    const p = path.replace(/^\.\//, '');
-    if (p === 'package.json') return true;
-    return ((files as string[] | undefined) ?? []).some(
-      (f) =>
-        p === f.replace(/^\.\//, '') || p.startsWith(`${f.replace(/^\.\//, '').replace(/\/$/, '')}/`),
-    );
+  /**
+   * Promised paths the tarball does not carry, read from npm's own listing. Asking `files` whether
+   * npm WOULD pack the path re-implements npm and answers about the manifest, not the artifact: it
+   * is green on a `dist/` that was never built, that emitted a different layout than `exports`
+   * names, or that emitted nothing.
+   */
+  const unpackedPromises = (manifest: Record<string, unknown>, packed: readonly string[]): string[] => {
+    const carried = new Set(packed.map((f) => f.replace(/^\.\//, '')));
+    return promisesOf(manifest).filter((path) => !carried.has(path.replace(/^\.\//, '')));
   };
 
   /** The source a `dist/` artifact is built from, so a promise nothing can build is caught unbuilt. */
@@ -256,14 +281,53 @@ describe('every public workspace ships only what a consumer can run', () => {
 
   it.each(WORKSPACES.map((w) => [w.name, w] as const))(
     '%s packs every path its manifest promises',
-    (_name, w) => {
+    (name, w) => {
       const manifest = readJson(join(REPO_ROOT, w.dir, 'package.json'));
       const promised = promisesOf(manifest);
       expect(promised.length, 'this manifest promises nothing, so the row grades nothing').toBeGreaterThan(0);
       expect(
-        promised.filter((p) => !packedBy(manifest.files, p)),
-        'add a "files" entry covering it, or the tarball cannot resolve what the manifest advertises',
+        unpackedPromises(manifest, PACKED[name] ?? []),
+        'npm pack does not list it: build what emits it, or widen "files" — a consumer resolving ' +
+          'this path gets ERR_MODULE_NOT_FOUND',
       ).toEqual([]);
+    },
+  );
+
+  /** The module a bare `import '<pkg>'` resolves to, which is the only entrypoint nothing spawns. */
+  const entrypointOf = (manifest: Record<string, unknown>): string | undefined => {
+    const root = (manifest.exports as Record<string, unknown> | undefined)?.['.'];
+    if (typeof root === 'string') return root;
+    const conditions = root as Record<string, unknown> | undefined;
+    const fallback = conditions?.default ?? conditions?.import ?? conditions?.require;
+    return typeof fallback === 'string' ? fallback : undefined;
+  };
+
+  /**
+   * Packing the file is not shipping a working one. Nothing in this repo ever imported a built
+   * entrypoint — every test resolves `src/` through the vitest alias — so a `dist/index.js` that
+   * exists and throws on load shipped green, and `version.ts`, whose whole job is to resolve
+   * `../package.json` from wherever the emit lands, was graded only at the path `src/` gives it.
+   */
+  it.each(WORKSPACES.map((w) => [w.name, w] as const))(
+    '%s loads the entrypoint its manifest promises',
+    async (_name, w) => {
+      const manifest = readJson(join(REPO_ROOT, w.dir, 'package.json'));
+      const entry = entrypointOf(manifest);
+      expect(entry, 'no root export condition names a module to load').toBeTypeOf('string');
+      const loaded = (await import(
+        pathToFileURL(join(REPO_ROOT, w.dir, entry!)).href
+      )) as Record<string, unknown>;
+      expect(Object.keys(loaded).length, 'the built entrypoint exports nothing').toBeGreaterThan(0);
+
+      // A version constant that reads its own manifest is the one export whose ANSWER depends on
+      // where the emit landed, so grade it from the built module rather than from `src/`.
+      for (const [name, value] of Object.entries(loaded)) {
+        if (name.endsWith('_VERSION') && typeof value === 'string') {
+          expect(value, `${name} is stale against the manifest this package publishes`).toBe(
+            manifest.version,
+          );
+        }
+      }
     },
   );
 
@@ -279,20 +343,160 @@ describe('every public workspace ships only what a consumer can run', () => {
   );
 
   it('sees an unpacked promise and an unbuildable one (positive control)', () => {
-    expect(
-      promisesOf({
-        exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
-        bin: { 'parley-x': './dist/cli.js' },
-      }),
-    ).toEqual(['./dist/index.d.ts', './dist/index.js', './dist/cli.js']);
+    const manifest = {
+      exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+      bin: { 'parley-x': './dist/cli.js' },
+    };
+    expect(promisesOf(manifest)).toEqual(['./dist/index.d.ts', './dist/index.js', './dist/cli.js']);
     expect(promisesOf({ bin: './dist/cli.js' })).toEqual(['./dist/cli.js']);
-    expect(packedBy(['dist'], './dist/cli.js')).toBe(true);
-    expect(packedBy(['dist/index.js'], './dist/cli.js')).toBe(false);
-    expect(packedBy(undefined, './dist/index.js')).toBe(false);
-    expect(packedBy(['dist'], './package.json')).toBe(true);
+    expect(unpackedPromises(manifest, ['dist/index.d.ts', 'dist/index.js', 'dist/cli.js'])).toEqual([]);
+    expect(unpackedPromises(manifest, ['dist/index.d.ts', 'dist/index.js'])).toEqual(['./dist/cli.js']);
+    // The layout drifted under the promise — the emit moved a level down. `files: ["dist"]` still
+    // covers it, which is exactly why asking `files` cannot see this.
+    expect(
+      unpackedPromises(manifest, ['dist/index.d.ts', 'dist/src/index.js', 'dist/cli.js']),
+    ).toEqual(['./dist/index.js']);
+    expect(unpackedPromises(manifest, [])).toEqual([
+      './dist/index.d.ts',
+      './dist/index.js',
+      './dist/cli.js',
+    ]);
+    expect(unpackedPromises({ exports: { './package.json': './package.json' } }, ['package.json'])).toEqual([]);
+    expect(entrypointOf(manifest)).toBe('./dist/index.js');
+    expect(entrypointOf({ exports: { '.': './dist/index.js' } })).toBe('./dist/index.js');
+    expect(entrypointOf({ exports: { './package.json': './package.json' } })).toBeUndefined();
     expect(builtFrom('./dist/cli.js')).toBe('src/cli.ts');
     expect(builtFrom('./dist/index.d.ts')).toBe('src/index.ts');
   });
+
+  /**
+   * The rule above reads `.js` only, so the whole TYPE surface of the tarball was ungraded: three
+   * shipped declaration files type-imported `express`, which carries no typings of its own, while
+   * `@types/express` sat in devDependencies — a consumer with `skipLibCheck: false` got TS7016 on
+   * the documented public API, and one with the usual `skipLibCheck: true` silently got `any`.
+   *
+   * Nothing static can see that: this repo hoists every `@types/*` into one `node_modules`, so a
+   * declaration always resolves here whoever declared it. So COMPILE it — a throwaway consumer whose
+   * module resolution sees only what the manifest obliges an install to fetch, and `@types/node`,
+   * which by convention is the consumer's own. That reaches any future dependency whose typings live
+   * somewhere else, not just this one.
+   */
+  const AMBIENT = ['@types/node'];
+  const INTERNAL = /^@sharptrick\//;
+
+  const declaredDeps = (manifest: Record<string, unknown>): string[] => [
+    ...new Set(
+      ['dependencies', 'peerDependencies'].flatMap((field) =>
+        Object.keys((manifest[field] as Record<string, string> | undefined) ?? {}),
+      ),
+    ),
+  ];
+
+  const link = (from: string, to: string): void => {
+    if (existsSync(to) || !existsSync(from)) return;
+    mkdirSync(dirname(to), { recursive: true });
+    symlinkSync(from, to);
+  };
+
+  /**
+   * A consumer's install, as a real directory: workspace packages COPIED (a symlink would realpath
+   * back into the repo and resolve the hoisted types this rule exists to withhold), everything else
+   * symlinked from the repo's own install, and nothing at all for a type package the manifest does
+   * not name. Returns whatever tsc says about it.
+   */
+  function consumerErrors(entryPackages: string[], seedNodeModules: (nm: string) => void): string[] {
+    const root = mkdtempSync(join(tmpdir(), 'parley-consumer-'));
+    scratch.push(root);
+    const nm = join(root, 'node_modules');
+    mkdirSync(nm, { recursive: true });
+    seedNodeModules(nm);
+    for (const name of AMBIENT) link(join(REPO_ROOT, 'node_modules', name), join(nm, name));
+    writeFileSync(
+      join(root, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          module: 'nodenext',
+          moduleResolution: 'nodenext',
+          target: 'es2022',
+          strict: true,
+          noEmit: true,
+          skipLibCheck: false,
+          types: ['node'],
+        },
+        files: ['consumer.ts'],
+      }),
+    );
+    writeFileSync(
+      join(root, 'consumer.ts'),
+      entryPackages.map((n, i) => `import * as p${i} from '${n}';\nexport const e${i} = p${i};`).join('\n'),
+    );
+    const tsc = join(REPO_ROOT, 'node_modules', '.bin', 'tsc');
+    try {
+      execFileSync(tsc, ['-p', 'tsconfig.json'], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
+      return [];
+    } catch (e) {
+      const out = `${(e as { stdout?: string }).stdout ?? ''}${(e as { stderr?: string }).stderr ?? ''}`;
+      const reported = out.split('\n').filter((l) => l.includes('error TS'));
+      // A compiler that failed without saying "error TS" — it could not start, or the project is
+      // malformed — must not read as a clean typecheck.
+      return reported.length > 0 ? reported : [`tsc failed with no diagnostic: ${out.trim()}`];
+    }
+  }
+
+  /** Copy `w` and every workspace it depends on into `nm`, so none of them resolves via the repo. */
+  function installWorkspace(nm: string, name: string): void {
+    const w = WORKSPACES.find((x) => x.name === name);
+    if (w === undefined || existsSync(join(nm, name))) return;
+    const manifest = readJson(join(REPO_ROOT, w.dir, 'package.json'));
+    mkdirSync(join(nm, name), { recursive: true });
+    cpSync(join(REPO_ROOT, w.dir, 'dist'), join(nm, name, 'dist'), { recursive: true });
+    cpSync(join(REPO_ROOT, w.dir, 'package.json'), join(nm, name, 'package.json'));
+    for (const dep of declaredDeps(manifest)) {
+      if (INTERNAL.test(dep)) installWorkspace(nm, dep);
+      else link(join(REPO_ROOT, 'node_modules', dep), join(nm, dep));
+    }
+  }
+
+  it.each(WORKSPACES.map((w) => [w.name] as const))(
+    '%s type-checks in an install holding only what its manifest declares',
+    (name) => {
+      expect(consumerErrors([name], (nm) => installWorkspace(nm, name))).toEqual([]);
+    },
+    120_000,
+  );
+
+  it('the consumer typecheck sees a declaration a manifest does not pay for (positive control)', () => {
+    const leaky = (nm: string): void => {
+      const dir = join(nm, '@parley-probe', 'leaky');
+      mkdirSync(join(dir, 'dist'), { recursive: true });
+      writeFileSync(
+        join(dir, 'package.json'),
+        JSON.stringify({
+          name: '@parley-probe/leaky',
+          version: '0.0.0',
+          type: 'module',
+          exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+        }),
+      );
+      writeFileSync(join(dir, 'dist', 'index.js'), 'export const mounted = true;\n');
+      writeFileSync(
+        join(dir, 'dist', 'index.d.ts'),
+        "import type { Express } from 'express';\nexport declare const mounted: Express;\n",
+      );
+      // The type it needs is one symlink away and deliberately NOT made, exactly as a consumer's
+      // install leaves it when the manifest never asked for it.
+      link(join(REPO_ROOT, 'node_modules', 'express'), join(nm, 'express'));
+    };
+    const errors = consumerErrors(['@parley-probe/leaky'], leaky);
+    expect(errors.join('\n')).toContain('TS7016');
+
+    // …and the same probe passes once the type package is there, so the row is not just red always.
+    const paid = (nm: string): void => {
+      leaky(nm);
+      link(join(REPO_ROOT, 'node_modules', '@types', 'express'), join(nm, '@types', 'express'));
+    };
+    expect(consumerErrors(['@parley-probe/leaky'], paid)).toEqual([]);
+  }, 120_000);
 
   it('records no package as excused from a rule this file grades', () => {
     const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
