@@ -53,11 +53,17 @@ XMPP) was added without touching either.
 4. Add `packages/bridge-<name>/test/conformance.test.ts` calling
    `runConformanceSuite('<name>', factory)` from `@sharptrick/parley-conformance` — see
    [`packages/conformance/README.md`](packages/conformance/README.md) for the `BackendFactory`
-   shape. Have the factory skip cleanly (not fail) when no server is reachable, matching the
-   existing network backends' pattern. For hosted-SaaS backends with no self-hostable server
-   (Discord/Telegram/Slack pattern), run the suite against a minimal **in-process fake** of the
-   API subset the plugin uses (see `packages/bridge-slack/test/fake-slack.ts`), optionally with
-   an env-gated real-credential suite on top.
+   shape. **CI does not accept a suite that skips itself.** `scripts/assert-no-skipped-tests.mjs`
+   fails the build on any `describe` group in which nothing ran, so gating the suite on a reachable
+   server is a local convenience only — in CI the server has to be there. Give the suite one of the
+   two things CI can provide:
+   - add the backend's server to
+     [`examples/dev-compose/dev-infra.sh`](examples/dev-compose/dev-infra.sh), which is the script
+     CI runs to bring the services up (what the self-hostable backends do); or
+   - for a hosted SaaS with no self-hostable server (the Discord/Telegram/Slack/Zulip pattern), run
+     the suite against a minimal **in-process fake** of the API subset the plugin uses (see
+     `packages/bridge-slack/test/fake-slack.ts`), optionally with an env-gated real-credential
+     suite on top.
 5. Run `npm test`. Then confirm the success criterion: `git diff --stat packages/bridge-core`
    must be **empty**. If it isn't, the seam is missing something — raise it as an issue rather than
    patching around it.
@@ -77,16 +83,33 @@ XMPP) was added without touching either.
 ```bash
 npm install
 npm run build
-npm test          # full suite; network-backend conformance suites skip cleanly with no server up
+./examples/dev-compose/dev-infra.sh up all   # redis, nats, postgres, prosody, synapse, keycloak
+npm test
 ```
 
-Node **>=22** (see each `package.json`'s `engines` field). For the network backends, bring up a
-throwaway server via [`examples/dev-compose`](examples/dev-compose/README.md) to get their
-conformance suites to actually run instead of skip.
+Node **>=22** (see each `package.json`'s `engines` field). With no server up, `npm test` still
+reports green — the network-backend groups gate themselves off and simply do not run. That is
+convenient locally and **is not what CI accepts**: the skip gate below fails a build in which a
+`describe` group ran nothing, so bring the services up before you trust a green run. See
+[`examples/dev-compose`](examples/dev-compose/README.md) for what the script starts.
 
 ## Before opening a PR
 
-- `npm run build && npm test` green locally.
+- **The gate CI runs, green locally** — `npm test` alone is not it:
+
+  ```bash
+  npm run build
+  npm run typecheck:test --workspaces --if-present
+  npm run typecheck --workspaces --if-present
+  ./examples/dev-compose/dev-infra.sh up all
+  npm test -- --reporter=json --outputFile=/tmp/vitest.json
+  node scripts/assert-no-skipped-tests.mjs /tmp/vitest.json
+  ```
+
+  The two typecheck steps exist because each package's `tsconfig.json` covers `src/**` only and
+  vitest transpiles tests without typechecking them — without them no fixture in the repo is ever
+  seen by a compiler. The last line is the **skip gate**: a `describe` group in which nothing ran
+  fails the build, so a suite whose server was down reads as missing coverage rather than as a pass.
 - **Added a package, or changed packaging?** Run `npm run preflight:publish` (CI runs the same check
   on every PR). It flags any public package that isn't on npm yet — the automated release can't
   bootstrap one, so it must be [first-published by hand](#first-publish-of-a-brand-new-package-the-one-manual-case)

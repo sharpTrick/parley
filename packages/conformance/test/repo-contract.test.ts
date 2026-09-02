@@ -483,6 +483,115 @@ describe('no workflow publishes on a gate weaker than the pull-request gate', ()
 });
 
 /**
+ * CLASS: a root document describing the gate as something other than what the gate is. CONTRIBUTING
+ * told every new-backend author to have the conformance factory "skip cleanly when no server is
+ * reachable" and told everyone that `npm test` alone is the pre-PR check — while the workflow that
+ * decides the PR runs two typecheck steps, brings six services up, and fails any `describe` group
+ * in which nothing ran. A contributor who followed the doc got a red build for a reason the doc
+ * said could not happen, and the natural response to that is to weaken the gate.
+ *
+ * The rows are the repo's OWN scripts the pull-request workflow invokes — npm scripts by name and
+ * checked-in script files by path — read off that workflow rather than listed here, so a step added
+ * to CI becomes a row the day it lands and no wording in either file is what is asserted. `npm ci`
+ * and `docker compose` are not rows: they are not this repo's scripts, and a contributor cannot be
+ * told to run something the repo does not carry.
+ */
+describe("CONTRIBUTING names every one of the repo's scripts the PR gate runs", () => {
+  const CONTRIBUTING = readFileSync(new URL('../../../CONTRIBUTING.md', import.meta.url), 'utf8');
+
+  /** npm scripts a step invokes by name, plus checked-in executables it invokes by path. */
+  function repoScriptsIn(steps: string[]): string[] {
+    const found = new Set<string>();
+    for (const step of steps) {
+      for (const m of step.matchAll(/npm run ([\w:-]+)/g)) found.add(`npm run ${m[1] as string}`);
+      if (/^npm test\b/.test(step)) found.add('npm test');
+      for (const m of step.matchAll(/\.?\/?((?:scripts|examples)\/[\w./-]+\.(?:mjs|js|sh))/g)) {
+        found.add(m[1] as string);
+      }
+    }
+    return [...found].sort();
+  }
+
+  const prGate = (): string[] => {
+    const file = readdirSync(WORKFLOWS)
+      .filter((f) => /\.ya?ml$/.test(f))
+      .find((f) => /^ {2}pull_request:?/m.test(triggersOf(readFileSync(join(WORKFLOWS, f), 'utf8'))));
+    if (file === undefined) return [];
+    const workflow = readFileSync(join(WORKFLOWS, file), 'utf8');
+    return jobsOf(workflow).flatMap(([, body]) => stepsOf(body));
+  };
+
+  const SCRIPTS = repoScriptsIn(prGate());
+
+  it('finds the pull-request workflow and the scripts it runs, so the rows are not an empty table', () => {
+    expect(SCRIPTS.length, 'no repo script found in the pull-request workflow at all').toBeGreaterThan(4);
+    expect(CONTRIBUTING.length).toBeGreaterThan(1000);
+  });
+
+  /**
+   * Named, not merely contained: `npm run typecheck:test` is a substring of a doc that only ever
+   * says `npm run typecheck:tests`, and a plain `includes` reads that typo as coverage.
+   */
+  const names = (doc: string, script: string): boolean =>
+    new RegExp(`${script.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`)}(?![\\w:.-])`).test(doc);
+
+  it.each(SCRIPTS.map((script) => [script]))(
+    '%s',
+    (script) => {
+      expect(
+        names(CONTRIBUTING, script),
+        `CI runs \`${script}\` to decide a PR and CONTRIBUTING never names it — a contributor ` +
+          `following the doc cannot reproduce the gate that will judge them`,
+      ).toBe(true);
+    },
+  );
+
+  // Both directions on a SYNTHETIC workflow and a synthetic doc, because the repo's own files are
+  // what a scan like this silently comes to depend on.
+  const planted = stepsOf(
+    [
+      '    steps:',
+      '      - run: npm ci',
+      '      - run: npm run build',
+      '      - run: npm run typecheck:test --workspaces --if-present',
+      '      - name: Assert nothing skipped',
+      '        run: node scripts/assert-no-skipped-tests.mjs /tmp/vitest.json',
+      '      - run: ./examples/dev-compose/dev-infra.sh up all',
+      '      - run: npm test -- --reporter=json',
+      '      - run: docker compose -f examples/dev-compose/docker-compose.yml logs',
+    ].join('\n'),
+  );
+
+  it('reads exactly the repo scripts out of a planted workflow, and nothing else', () => {
+    expect(repoScriptsIn(planted)).toEqual([
+      'examples/dev-compose/dev-infra.sh',
+      'npm run build',
+      'npm run typecheck:test',
+      'npm test',
+      'scripts/assert-no-skipped-tests.mjs',
+    ]);
+  });
+
+  it.each([
+    ['a doc naming every one of them', repoScriptsIn(planted).join('\n'), []],
+    [
+      'a doc that stops at `npm test`',
+      'Run `npm run build` and `npm test` before opening a PR.',
+      ['examples/dev-compose/dev-infra.sh', 'npm run typecheck:test', 'scripts/assert-no-skipped-tests.mjs'],
+    ],
+    ['a doc naming none of them', 'Be excellent to each other.', repoScriptsIn(planted)],
+    [
+      'a doc whose spelling of a script merely CONTAINS it',
+      'Run `npm run build`, `npm run typecheck:tests`, `npm test`, ' +
+        '`./examples/dev-compose/dev-infra.shell` and `node scripts/assert-no-skipped-tests.mjs`.',
+      ['examples/dev-compose/dev-infra.sh', 'npm run typecheck:test'],
+    ],
+  ])('reports what %s omits', (_label, doc, missing) => {
+    expect(repoScriptsIn(planted).filter((script) => !names(doc, script))).toEqual(missing);
+  });
+});
+
+/**
  * The gate that stops a self-skipping suite from reading as a passing one — graded by RUNNING it,
  * not by reading the workflow that calls it.
  *
