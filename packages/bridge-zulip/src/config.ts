@@ -101,8 +101,9 @@ function assertKnownKeys(cfg: object): void {
 }
 
 /**
- * `site_url` must be usable as a base URL now, not at first request — and must be a base URL and
- * nothing else. A credential in it is REFUSED rather than carried: Zulip authenticates from
+ * `site_url` must be usable as a base URL now, not at first request, and what comes back IS a bare
+ * base URL: the origin and path the checks below read, not the string they read them out of. A
+ * credential in it is REFUSED rather than carried: Zulip authenticates from
  * `email`/`api_key`, secret hygiene keys on the config key NAME (`site_url` is not a secret one),
  * and an accepted value's origin is echoed by the plaintext warning. A query or fragment is refused
  * for the same fail-fast reason it would break every request path.
@@ -141,7 +142,12 @@ function requireHttpUrl(raw: unknown): string {
         'request path and can hide a credential in a key hygiene treats as non-secret.',
     );
   }
-  return trimmed;
+  // Return what the checks above INSPECTED, not the string they were run against. Every request
+  // path is concatenated onto this, so a structural character the parsed view normalizes away but
+  // the raw string keeps — a delimiter carrying nothing (`?`, `#`), a backslash — swallows or
+  // relocates the path of every call the plugin ever makes, and does it at first use rather than
+  // here where the key can still be named.
+  return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, '');
 }
 
 /**

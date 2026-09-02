@@ -7,7 +7,7 @@
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
 import {
   DECLARED_CONFIG_KEYS,
@@ -350,4 +350,124 @@ describe('zulip backend_config defaults', () => {
     await plugin.post(topic, SENDER, 'x');
     expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toEqual(['x']);
   });
+});
+
+/**
+ * CLASS: a config value checked through a PARSED view and then used in its RAW form. `site_url` is
+ * validated by reading `new URL(...)`'s components and was returned as the trimmed string those
+ * components were derived from, while `ZulipHttp.request` concatenates every request path onto it —
+ * so any character the parser normalizes away but the string keeps relocated the path of every call
+ * the plugin makes. `site_url: 'http://host:9991/?'` had `parsed.search === ''`, sailed through the
+ * query/fragment refusal, connected clean, and then answered every seam call with a 404 naming
+ * neither the key nor the reason.
+ *
+ * The delimiters are not the class, so they are not the table. The suffixes below are DERIVED from
+ * the parser: a suffix belongs here exactly when appending it leaves every component the validator
+ * inspects unchanged — which is the divergence itself, stated as a predicate rather than as a list
+ * somebody has to keep complete. Each is then held to the only outcome that distinguishes a
+ * validated value from an accepted one: `connect()` refuses it naming the key, or the connection
+ * WORKS — push delivery and a `fetchRecent` round trip, on the routes the fake actually serves.
+ */
+describe('a site_url connect() accepted is the one every request path is built on', () => {
+  let fake: Awaited<ReturnType<typeof startFakeZulip>>;
+
+  beforeAll(async () => {
+    fake = await startFakeZulip({ heartbeatMs: 5000 });
+  });
+  afterAll(async () => {
+    await fake.close();
+  });
+
+  /** The components `requireHttpUrl` reads. Two URLs agreeing on all of them pass the same checks. */
+  const inspectedView = (u: URL): string =>
+    [u.protocol, u.username, u.password, u.host, u.pathname, u.search, u.hash].join(' ');
+
+  /**
+   * Every suffix the URL parser makes no difference of — i.e. one the validator cannot see and the
+   * raw string carries anyway. Scanned over the code space rather than listed, so the delimiter
+   * nobody thought of is in the table on the day the parser starts ignoring it.
+   */
+  const invisibleSuffixes = (base: string): string[] => {
+    const bare = inspectedView(new URL(base));
+    const out: string[] = [];
+    for (let cp = 0; cp <= 0xff; cp++) {
+      const c = String.fromCodePoint(cp);
+      let decorated: URL;
+      try {
+        decorated = new URL(base + c);
+      } catch {
+        continue;
+      }
+      if (inspectedView(decorated) === bare) out.push(c);
+    }
+    return out;
+  };
+
+  const shown = (suffix: string): string =>
+    [...suffix]
+      .map((c) => `U+${(c.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}`)
+      .join(' ');
+
+  /**
+   * A round trip through the seam, or the `connect()` rejection that refused to start one. Never
+   * "connect resolved": that is the exact reading under which this defect shipped.
+   */
+  const tryConnection = async (siteUrl: string): Promise<string | undefined> => {
+    const plugin = new ZulipPlugin();
+    try {
+      const rejected = await plugin.connect({ site_url: siteUrl }).then(
+        () => undefined,
+        (err: Error) => err.message,
+      );
+      if (rejected !== undefined) return rejected;
+      const topic = asTopic(`raw-${rand()}`);
+      const got: Message[] = [];
+      const posts = fake.requestCount('POST /api/v1/messages');
+      await plugin.subscribe(topic, (m) => got.push(m));
+      await plugin.post(topic, SENDER, 'live');
+      await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(['live']), {
+        timeout: 5000,
+        interval: 10,
+      });
+      const read = await plugin.fetchRecent({ topic });
+      expect(read.messages.map((m) => m.content)).toEqual(['live']);
+      // The route the path was BUILT for, not merely a 2xx: a base that swallows the path answers
+      // on `POST /` instead, and one that relocates it answers on some third route.
+      expect(fake.requestCount('POST /api/v1/messages')).toBeGreaterThan(posts);
+      return undefined;
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+    }
+  };
+
+  it('derives suffixes the validator cannot see, so the rows below are not an empty set', () => {
+    const found = invisibleSuffixes('http://127.0.0.1:9991');
+    expect(found.length).toBeGreaterThanOrEqual(4);
+    // Named only to prove the SCAN reaches them — the rows are whatever it finds, not these.
+    expect(found).toEqual(expect.arrayContaining(['?', '#', '\\', '/']));
+  });
+
+  it('the undecorated base URL works, so an accepted row is a reachable verdict', async () => {
+    await expect(tryConnection(fake.url)).resolves.toBeUndefined();
+  });
+
+  it('every suffix the validator cannot see is refused or works', async () => {
+    const bad: string[] = [];
+    let worked = 0;
+    for (const suffix of invisibleSuffixes(fake.url)) {
+      // `requireHttpUrl` strips trailing slashes BEFORE parsing, so a suffix behind one reaches the
+      // parse by a different route than the same suffix alone.
+      for (const decorated of [`${fake.url}${suffix}`, `${fake.url}/${suffix}`]) {
+        const outcome = await tryConnection(decorated).catch(
+          (err: Error) => `did not work: ${err.message}`,
+        );
+        if (outcome === undefined) worked++;
+        if (outcome === undefined || outcome.includes('site_url')) continue;
+        bad.push(`${shown(suffix)} (${JSON.stringify(decorated)}): ${outcome.slice(0, 160)}`);
+      }
+    }
+    expect(bad, `site_url values accepted into a broken connection:\n${bad.join('\n')}`).toEqual([]);
+    // A validator that refused every row would satisfy the line above while grading nothing.
+    expect(worked).toBeGreaterThan(0);
+  }, 180_000);
 });

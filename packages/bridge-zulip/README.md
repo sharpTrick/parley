@@ -96,7 +96,11 @@ built-in default key. Every declared key is validated at `connect()`, which thro
 offending key: `site_url` must be a
 bare absolute `http(s)` base URL — no `user:password@` (Zulip authenticates from `email`/`api_key`,
 and a credential in the URL would be echoed by every diagnostic that names the site) and no query or
-fragment — `email`/`api_key`/`stream` must be non-empty, `stream` must additionally be a name the
+fragment. What is captured is the origin and path that check READ, not the string it was given, so a
+character the URL parser normalizes away but a string concatenation keeps — a delimiter carrying
+nothing, a `\`, a stray control byte — cannot survive into the path of every request; a value
+carrying an actual query or fragment is still a `connect()` error. `email`/`api_key`/`stream` must be
+non-empty, `stream` must additionally be a name the
 server's stream-indicator decoder leaves alone (see the table above), and `events_timeout_ms` must be
 a positive, finite number (`0` is an error, not "no cap"). A key that is present but empty (a bare
 `site_url:` in YAML) is reported rather than silently replaced by its default.
