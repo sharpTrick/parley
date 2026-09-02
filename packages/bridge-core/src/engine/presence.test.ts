@@ -886,6 +886,78 @@ describe('the roster keys on the emitting bridge, not on the backend sender', ()
     ).toEqual(['claude-new', 'claude-old']);
   });
 
+  /**
+   * A cap on an identity field has TWO sources: the record's self-reported `handle`, and the backend
+   * `senderHandle` the compatibility fallback reads when the record omits it. A cap enforced on the
+   * primary source alone is walked around by dropping the field — `MAX_HANDLE_LEN` was, and a
+   * 1,000,000-character sender became a roster key, agent-facing text and glob-match input.
+   *
+   * Grade the CLASS: every source that can name an emitter answers the SAME way at the SAME length.
+   * The lengths straddle the cap and run far past it, and the roster is asked for a verdict on two
+   * peers differing only past it, so a source that TRUNCATES instead of dropping (merging them into
+   * one entry) fails here too.
+   */
+  const HANDLE_SOURCES: Array<[name: string, msg: (handle: string, topic: string, seq: number) => Message]> = [
+    [
+      'the record’s self-reported handle',
+      (handle, topic, seq) => selfNamed2(handle, topic, seq, BOT),
+    ],
+    [
+      'the backend sender the pre-handle fallback reads',
+      (handle, topic, seq) => selfNamed2(undefined, topic, seq, handle),
+    ],
+  ];
+
+  const HANDLE_LENGTHS: Array<[name: string, len: number]> = [
+    ['one under the cap', MAX_HANDLE_LEN - 1],
+    ['exactly at the cap', MAX_HANDLE_LEN],
+    ['one past the cap', MAX_HANDLE_LEN + 1],
+    ['far past the cap', MAX_HANDLE_LEN * 8],
+  ];
+
+  /** A beat naming its emitter through whichever source the table is exercising. */
+  function selfNamed2(handle: string | undefined, topic: string, seq: number, sender: string): Message {
+    return {
+      topic: asTopic('parley-presence'),
+      senderHandle: asHandle(sender),
+      content: JSON.stringify({
+        v: 2,
+        kind: 'hello',
+        at: now - 1_000,
+        ...(handle === undefined ? {} : { handle }),
+        topics: [topic],
+        postTopics: [],
+        instanceId: `inst-${seq}`,
+      }),
+      timestamp: new Date(seq * 1000).toISOString(),
+      backendMsgId: asBackendMsgId(String(seq)),
+      cursor: asCursor(String(seq)),
+      mentions: [],
+    };
+  }
+
+  const HANDLE_CELLS = HANDLE_SOURCES.flatMap(([source, msg]) =>
+    HANDLE_LENGTHS.map(([lenName, len]) => [source, lenName, len, msg] as const),
+  );
+
+  it.each(HANDLE_CELLS.map((c) => [`${c[0]} — ${c[1]}`, c] as const))(
+    '%s gets the same verdict as every other source',
+    (_label, [, , len, msg]) => {
+      const shared = 'p'.repeat(len - 4);
+      const roster = computeRoster(
+        [msg(`${shared}-one`, 'ctx-one', 1), msg(`${shared}-two`, 'ctx-two', 2)],
+        now,
+        opts,
+      );
+      if (len > MAX_HANDLE_LEN) {
+        expect(roster, 'an over-long emitter name reached the roster through this source').toEqual([]);
+        return;
+      }
+      expect(roster).toHaveLength(2);
+      expect(roster.flatMap((e) => e.topics).sort()).toEqual(['ctx-one', 'ctx-two']);
+    },
+  );
+
   it.each([['a number', 42], ['an empty string', ''], ['null', null]])(
     'ignores %s as a self-reported handle and falls back to the sender',
     (_name, bad) => {

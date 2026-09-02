@@ -140,9 +140,26 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // single oversized page flushes it — after which the push loop re-delivers what was just
       // pulled. Re-derive the cursor from the last message KEPT, so that the remainder is paged on
       // the next call rather than skipped forever.
+      //
+      // Cut the page down to the topic that was ASKED for. `m.topic` is plugin-supplied and a
+      // backend's HISTORY read can be coarser than a topic exactly as its subscribe primitive can (a
+      // NATS wildcard subject, a Matrix room carrying several logical topics), so this is the same
+      // trust boundary `startPushLoop` applies on the live path — without it an unallowed topic, or
+      // the reserved presence topic, reaches the agent's context through the pull path instead, and
+      // a foreign `backendMsgId` is recorded against THIS topic's dedup window, suppressing a
+      // genuine live push that later collides with it.
+      const own = result.messages.filter((m) => m.topic === t);
+      if (own.length < result.messages.length) {
+        // Count only, once per call: the topics dropped are untrusted strings, and naming them here
+        // would put plugin-chosen text into the operator's log on every page.
+        console.error(
+          `[parley] dropped ${result.messages.length - own.length} fetched message(s) on topics other ` +
+            'than the one requested; the backend plugin is reading history beyond that topic',
+        );
+      }
       const cap = Math.min(limit ?? MAX_FETCH_LIMIT, MAX_FETCH_LIMIT);
-      const kept = result.messages.length > cap ? result.messages.slice(0, cap) : result.messages;
-      const nextCursor = kept.length < result.messages.length ? kept.at(-1)!.cursor : result.nextCursor;
+      const kept = own.length > cap ? own.slice(0, cap) : own;
+      const nextCursor = kept.length < own.length ? kept.at(-1)!.cursor : result.nextCursor;
       for (const m of kept) deps.seen?.markSeen(t, m.backendMsgId);
       return textResult({ messages: kept, nextCursor });
     },

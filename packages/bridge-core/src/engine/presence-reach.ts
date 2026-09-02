@@ -32,6 +32,28 @@ const MAX_PEER_PATTERN_LEN = 512;
 const PATTERN_BUDGET_MS = 50;
 
 /**
+ * The allowance and the meter that prices it — the sharing rule's two inputs, settable so a test can
+ * pin the RULE without racing a clock. What one screened match costs in wall-clock ms collapses by
+ * orders of magnitude once V8 has tiered the regex engine up, so pressure built out of real elapsed
+ * time grades nothing in a warm process: handing this allowance out first-come left the entire
+ * `bridge-core` suite green.
+ *
+ * Keep production on {@link DEFAULT_REACH_BUDGET}, so that the shipped allowance stays the measured
+ * one and this stays a seam for grading rather than a knob for widening.
+ */
+export interface ReachBudget {
+  /** One direction's whole-call allowance, in whatever units {@link ReachBudget.now} reports. */
+  totalMs: number;
+  /** Reads the cost meter; the difference across one unit of work is what that work spent. */
+  now: () => number;
+}
+
+const DEFAULT_REACH_BUDGET: ReachBudget = {
+  totalMs: PATTERN_BUDGET_MS,
+  now: () => performance.now(),
+};
+
+/**
  * One direction's CPU allowance for ONE {@link filterReachable} call. It MEASURES the work it
  * authorises rather than reading a clock started at call time, so that what the other direction
  * spends cannot exhaust it. `undefined` means the allowance is gone.
@@ -43,21 +65,24 @@ const PATTERN_BUDGET_MS = 50;
  * one legitimate colleague returned an EMPTY roster. Unspent share rolls forward, so a benign page
  * still lets one expensive peer use nearly all of it.
  */
-function budget(onClipped: () => void): (remainingEntries: number) => <T>(work: () => T) => T | undefined {
+function budget(
+  onClipped: () => void,
+  cfg: ReachBudget,
+): (remainingEntries: number) => <T>(work: () => T) => T | undefined {
   let spentMs = 0;
   return (remainingEntries) => {
-    const share = (PATTERN_BUDGET_MS - spentMs) / Math.max(remainingEntries, 1);
+    const share = (cfg.totalMs - spentMs) / Math.max(remainingEntries, 1);
     let entryMs = 0;
     return (work) => {
       if (entryMs >= share) {
         onClipped();
         return undefined;
       }
-      const started = performance.now();
+      const started = cfg.now();
       try {
         return work();
       } finally {
-        const costMs = performance.now() - started;
+        const costMs = cfg.now() - started;
         entryMs += costMs;
         spentMs += costMs;
       }
@@ -77,8 +102,9 @@ function budget(onClipped: () => void): (remainingEntries: number) => <T>(work: 
  */
 function peerReach(
   onClipped: () => void,
+  cfg: ReachBudget,
 ): (remainingEntries: number) => (sources: readonly string[], input: string) => boolean {
-  const spendFor = budget(onClipped);
+  const spendFor = budget(onClipped, cfg);
   const compiled = new Map<string, RegExp | null>();
   const compile = (src: string): RegExp | null => {
     const cached = compiled.get(src);
@@ -118,8 +144,9 @@ function peerReach(
 function budgeted(
   canPostTo: (topic: string) => boolean,
   onClipped: () => void,
+  cfg: ReachBudget,
 ): (remainingEntries: number) => (topic: string) => boolean {
-  const spendFor = budget(onClipped);
+  const spendFor = budget(onClipped, cfg);
   return (remainingEntries) => {
     const spend = spendFor(remainingEntries);
     return (topic) => spend(() => canPostTo(topic)) === true;
@@ -153,14 +180,21 @@ export function filterReachable(
      * an empty one is indistinguishable from "nobody is on the bus".
      */
     onReachClipped: () => void;
+    /**
+     * The per-direction allowance and its cost meter. Production omits it. Keep the default here
+     * rather than at the call site, so that a caller cannot widen the shipped allowance by leaving
+     * a key out of its literal.
+     */
+    reachBudget?: ReachBudget;
   },
 ): RosterEntry[] {
   let clipped = false;
   const note = (): void => {
     clipped = true;
   };
-  const reachesFor = peerReach(note);
-  const canPostToFor = budgeted(opts.canPostTo, note);
+  const cfg = opts.reachBudget ?? DEFAULT_REACH_BUDGET;
+  const reachesFor = peerReach(note, cfg);
+  const canPostToFor = budgeted(opts.canPostTo, note, cfg);
   const kept: RosterEntry[] = [];
   roster.forEach((e, i) => {
     clipped = false;

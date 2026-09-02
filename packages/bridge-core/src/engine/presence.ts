@@ -21,7 +21,12 @@
  * `presence-reach.ts` the reachability predicate applied to the result.
  */
 import { asHandle, type Handle, type Message } from '../message.js';
-import { decodePresence, MAX_RECORD_TOPICS, type PresenceRecord } from './presence-beat.js';
+import {
+  decodePresence,
+  MAX_HANDLE_LEN,
+  MAX_RECORD_TOPICS,
+  type PresenceRecord,
+} from './presence-beat.js';
 
 export * from './presence-beat.js';
 export { filterReachable } from './presence-reach.js';
@@ -66,13 +71,20 @@ export interface RosterOptions {
 }
 
 /**
- * Which handle a beat belongs to. The seam does not require a backend to carry the posting identity
- * (a bot-token backend delivers every session's beats under ONE bot handle), so the record's
- * self-reported `handle` leads and `senderHandle` is the compatibility fallback for a beat emitted
- * before the field existed.
+ * Which handle a beat belongs to, or `undefined` for a beat whose emitter cannot be named within the
+ * cap. The seam does not require a backend to carry the posting identity (a bot-token backend
+ * delivers every session's beats under ONE bot handle), so the record's self-reported `handle` leads
+ * and `senderHandle` is the compatibility fallback for a beat emitted before the field existed.
+ *
+ * Keep {@link MAX_HANDLE_LEN} applied to the FALLBACK as well as to the self-reported field, so that
+ * the cap cannot be walked around by simply omitting `handle`: either way the string becomes a
+ * roster map key, goes verbatim into the agent's context, and is fed to the handle-glob matcher.
+ * Keep it DROPPED rather than truncated, exactly as `decodePresence` drops an over-long `handle`, so
+ * that a truncation cannot merge two peers sharing a capped prefix into one entry.
  */
-function emitterOf(rec: PresenceRecord, m: Message): Handle {
-  return rec.handle === undefined ? m.senderHandle : asHandle(rec.handle);
+function emitterOf(rec: PresenceRecord, m: Message): Handle | undefined {
+  if (rec.handle !== undefined) return asHandle(rec.handle);
+  return m.senderHandle.length > MAX_HANDLE_LEN ? undefined : m.senderHandle;
 }
 
 /** Which of two beats loses its instance slot first: a `goodbye` before any live beat, then the older. */
@@ -144,6 +156,7 @@ export function computeRoster(messages: Message[], nowMs: number, opts: RosterOp
     const rec = decodePresence(m.content, nowMs);
     if (rec === null) continue;
     const emitter = emitterOf(rec, m);
+    if (emitter === undefined) continue;
     let insts = byHandle.get(emitter);
     if (insts === undefined) {
       insts = new Map();

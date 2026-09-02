@@ -1,4 +1,12 @@
-import { asBackendMsgId, asCursor, asHandle, type Cursor, type Message, type Topic } from '../message.js';
+import {
+  asBackendMsgId,
+  asCursor,
+  asHandle,
+  asTopic,
+  type Cursor,
+  type Message,
+  type Topic,
+} from '../message.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
 
 /**
@@ -92,6 +100,55 @@ export const NONCONFORMANT_SHAPES: Record<string, NonconformantShape> = {
 };
 
 export const NONCONFORMANT_SHAPE_NAMES = Object.keys(NONCONFORMANT_SHAPES);
+
+/**
+ * The topics a delivery COARSER than one topic hands core alongside the one it was asked for: a NATS
+ * wildcard subject, a Matrix room carrying several logical topics, a Slack channel doubling as two.
+ * Every agent-facing path has to answer the same way about each of them, or a guard that holds on
+ * one path is walked around on its sibling.
+ */
+export const FOREIGN_TOPIC_KINDS: Array<[name: string, topic: string]> = [
+  ['an unconfigured topic', 'secret-ops'],
+  ['a topic a post pattern allows but nothing subscribes to', 'ctx-pattern-only'],
+  ['the reserved presence topic', 'parley-presence'],
+];
+
+/**
+ * A plugin whose history read is COARSER than a topic: every page carries the requested topic's
+ * message plus one on each of {@link FOREIGN_TOPIC_KINDS}. The seam does not forbid it — it is what a
+ * wildcard subscription or a shared room produces — so every driver that reads pages must be run
+ * against it, not only against fixtures that pre-filter by topic.
+ */
+export function coarseDelivery(alsoCarry: readonly string[] = []): {
+  plugin: BackendPlugin;
+  /** Push one message on `topic` to every live subscriber, whatever topic they subscribed to. */
+  push(topic: string, n: number): void;
+} {
+  const handlers: Array<(m: Message) => void> = [];
+  const plugin = {
+    connect: () => Promise.resolve(),
+    disconnect: () => Promise.resolve(),
+    subscribe: (_topic: Topic, h: (m: Message) => void) => {
+      handlers.push(h);
+      return Promise.resolve();
+    },
+    post: () => Promise.resolve(asBackendMsgId('1')),
+    resolveIdentity: (handle: unknown) => Promise.resolve({ handle, backendRef: handle }),
+    fetchRecent: (args: FetchRecentArgs): Promise<FetchRecentResult> => {
+      const foreign = [...FOREIGN_TOPIC_KINDS.map(([, t]) => t), ...alsoCarry].filter(
+        (t) => t !== args.topic,
+      );
+      const messages = [row(args.topic, 1), ...foreign.map((t, i) => row(asTopic(t), i + 2))];
+      return Promise.resolve({ messages, nextCursor: asCursor(String(messages.length)) });
+    },
+  } as unknown as BackendPlugin;
+  return {
+    plugin,
+    push: (topic, n) => {
+      for (const h of handlers) h(row(asTopic(topic), n));
+    },
+  };
+}
 
 /** A plugin serving `shape`, recording every `fetchRecent` it is asked for. */
 export function pagingProbe(serve: ServePage): { plugin: BackendPlugin; calls: FetchRecentArgs[] } {

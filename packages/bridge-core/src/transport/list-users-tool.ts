@@ -111,12 +111,16 @@ export function registerListUsersTool(server: McpServer, deps: ToolDeps): void {
       }
       // A full page means older presence history was clipped — offline coverage is best-effort.
       const truncated = page.messages.length >= PRESENCE_FETCH_LIMIT;
+      // Same trust boundary the push loop and `parley_fetch_recent` apply: a plugin whose history
+      // read is coarser than a topic hands back a real topic's traffic alongside the beats, and a
+      // message from one that happens to decode as a beat would otherwise mint a roster peer.
+      const onPresence = page.messages.filter((m) => m.topic === deps.presenceTopic);
       // `limit` is a maximum the seam only asks for: a plugin may hand back MORE, and every extra
       // beat is another entry in agent-facing output. Fold the freshest.
       const beats =
-        page.messages.length > PRESENCE_FETCH_LIMIT
-          ? page.messages.slice(-PRESENCE_FETCH_LIMIT)
-          : page.messages;
+        onPresence.length > PRESENCE_FETCH_LIMIT
+          ? onPresence.slice(-PRESENCE_FETCH_LIMIT)
+          : onPresence;
 
       const roster = computeRoster(beats, now(), { ttlMs: deps.presenceTtlMs, sinceMs });
       // A peer dropped because the reach allowance ran out is a CUT answer, not an absent peer, and

@@ -60,7 +60,9 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
       return total;
     }
     const { messages, nextCursor } = result;
-    for (const m of messages) seen.markSeen(topic, m.backendMsgId);
+    // Only this topic's ids: a coarser-than-topic history read hands back foreign messages, and
+    // recording their ids here would suppress a later live push on THIS topic that collides with one.
+    for (const m of messages) if (m.topic === topic) seen.markSeen(topic, m.backendMsgId);
     total += messages.length;
     readState.set(topic, nextCursor);
 

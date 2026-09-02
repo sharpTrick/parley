@@ -9,7 +9,7 @@ import {
   MAX_TOPIC_LEN,
   type PresenceKind,
 } from '../engine/presence.js';
-import { MAX_AMBIGUITY } from '../regex-safety.js';
+import { isRedosSafeSource, MAX_AMBIGUITY } from '../regex-safety.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
 import { NoSuchTopicError, type FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -29,6 +29,24 @@ const costlySource = (n: number): string => `${'[a-z]?'.repeat(OPTIONAL_ATOMS)}Z
 /** A full record's worth of distinct screened-but-costly sources — legal on any beat. */
 const costlyBank = (seed: number): string[] =>
   Array.from({ length: MAX_RECORD_TOPICS }, (_, i) => costlySource(seed * MAX_RECORD_TOPICS + i));
+
+/**
+ * The corpus every hostile-page cell below is built from, checked against the property that makes it
+ * hostile at all. A source the ReDoS screen REJECTS compiles to nothing and is never matched, so a
+ * tightened screen would quietly turn every page here into a page of free work — and each cell would
+ * keep passing, because they all assert that a peer SURVIVES. Grade the corpus, not only the answer.
+ *
+ * Deliberately structural rather than a measured cost: what these sources cost in milliseconds is
+ * the very quantity that evaporates in a warm process, so an assertion about it grades nothing.
+ */
+describe('the hostile corpus these pages are built from is still hostile', () => {
+  it('is a full record of sources the screen ACCEPTS, so every one is compiled and matched', () => {
+    const bank = costlyBank(0);
+    expect(bank).toHaveLength(MAX_RECORD_TOPICS);
+    expect(new Set(bank).size, 'duplicates would be answered from the compile cache').toBe(bank.length);
+    expect(bank.filter((src) => !isRedosSafeSource(src))).toEqual([]);
+  });
+});
 
 /**
  * One subject: `parley_list_users` — the reachability roster core derives from the presence topic.
@@ -755,10 +773,12 @@ describe('a hostile presence page cannot silently delete a reachable peer', () =
   // Disclosure alone would satisfy the table above while every legitimate peer still vanished. The
   // allowance is therefore shared across the entries REMAINING, so a hostile subset spends its own
   // slice and no more: a peer behind it keeps enough allowance to be matched, and stays visible.
+  //
+  // Keep this a SMOKE test and read `engine/reach-budget.test.ts` for the grader: the pressure here
+  // is bought with wall-clock cost, and a screened match costs ~100x less once V8 has tiered the
+  // regex engine up — this cell reddens against a first-come allowance when run alone and stays
+  // green inside the file, so it cannot be what pins the sharing rule.
   it('a hostile subset spends only its share, so the peer behind it is RETURNED', async () => {
-    // ONE entry's full bank of costly sources already outspends the allowance several times over,
-    // so a handful is a saturating prefix — and a handful is all the overrun a slow machine can
-    // add, which keeps this a statement about the sharing rule rather than about the clock.
     const prefix = 4;
     const h = await harness({ now: () => NOW, presenceTtlMs: TTL, topics: [MINE] });
     for (let i = 0; i < prefix; i++) {
