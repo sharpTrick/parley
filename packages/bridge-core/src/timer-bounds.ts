@@ -1,6 +1,5 @@
 /**
- * What a Node timer can hold, and the one predicate every poll-nap interval that reaches one is
- * checked against.
+ * What a Node timer can hold, and the predicate core's poll-nap intervals are checked against.
  *
  * Past {@link MAX_TIMER_MS} a delay does not slow a timer down — it WRAPS, and the timer fires one
  * millisecond in, which is where a delay below 1 ms is floored too. A nap off either end therefore

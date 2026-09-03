@@ -15,12 +15,7 @@ import { MAX_TIMER_MS } from './timer-bounds.js';
 
 export * from './config-auth.js';
 
-/**
- * Most `topics` one config may carry. Every entry is an allowlist entry, matched against the topic
- * of every `post` / `fetch_recent` that reaches the tools; where `live_push.enabled` is set, the
- * push loop also opens one subscription per entry. So this bounds the allowlist a bridge carries,
- * and with live push on, the subscription fan-out it asks a backend for.
- */
+/** Most `topics` one config may carry. */
 export const MAX_TOPICS = 64;
 
 /**
@@ -33,19 +28,10 @@ export const MAX_TOPICS = 64;
  */
 export const MAX_POST_TOPICS = 64;
 
-/**
- * Longest `topics` / `post_topics` entry the loader accepts. This bounds the operator's config, not
- * the wire: an entry becomes an allowlist member and an interpolation in an operator diagnostic,
- * while a caller-supplied topic is bounded instead by the ReDoS input clamp on the pattern path and
- * by set membership on the explicit one. A real topic name is short.
- */
+/** Longest `topics` / `post_topics` entry the loader accepts. */
 export const MAX_TOPIC_LEN = 512;
 
-/**
- * Longest `identity.handle` the loader accepts. Core hands the configured handle to `post` on every
- * write, so an unbounded string reaches whichever backends carry a logical sender. A real handle is
- * short.
- */
+/** Longest `identity.handle` the loader accepts. */
 export const MAX_HANDLE_LEN = 128;
 
 /**

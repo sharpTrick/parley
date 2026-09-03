@@ -50,9 +50,8 @@ export function assertNoBackendKey(raw: unknown): void {
 
 /**
  * Reject a retired `presence:` key rather than letting `.strict()` report it as an unrecognized
- * one, so that an operator upgrading from a release where it was default-on reads a removal instead
- * of a suspected typo. Carries the key's own path, so the rendered diagnostic names `presence`
- * rather than the whole document.
+ * one, so that an operator upgrading reads a removal instead of a suspected typo. Carries the key's
+ * own path, so the rendered diagnostic names `presence` rather than the whole document.
  */
 export function assertNoPresenceKey(raw: unknown): void {
   if (typeof raw !== 'object' || raw === null || !('presence' in raw)) return;

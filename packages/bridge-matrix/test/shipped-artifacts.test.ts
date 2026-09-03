@@ -89,8 +89,6 @@ describe('the shipped multi-session configs deploy as documented', () => {
   );
 
   it('every shipped config shares a room with another (guards against grading less)', () => {
-    // Keep this per-config rather than a count over the whole set, so that ONE config drifting off
-    // the shared topic drops its rows loudly instead of shrinking the table below in silence.
     const stranded = configs
       .filter((c) => !coHabiting.some(([, creator, peer]) => creator === c || peer === c))
       .map((c) => c.file);

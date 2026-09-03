@@ -2,11 +2,8 @@
  * Every SHAPE a seam call's failure can arrive in AT A FIRE-AND-FORGET SITE. Core has to absorb all
  * of them identically, and it may reject with a non-Error or never settle at all.
  *
- * The two SYNCHRONOUS shapes look redundant with their async twins today, because every surviving
- * site wraps the call in an `async` function. Keep them anyway, so that the wrapper itself stays
- * graded: rewrite `closeQuietly` non-async and a synchronous throw escapes the `res.on('close')`
- * handler as an uncaught exception that takes the remote bridge down — with the whole core suite
- * green, unless these rows are here to catch it.
+ * Keep the two SYNCHRONOUS shapes, so that the `async` wrapper each site relies on stays graded: a
+ * `.catch()` does not absorb a throw raised before it is attached.
  *
  * Each shape ignores the real call's result, so the same table drives any seam call regardless of
  * what it resolves to.

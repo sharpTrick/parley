@@ -118,5 +118,4 @@ export abstract class DiscordSession {
   protected require(): void {
     if (!this.connected) throw new Error('DiscordPlugin not connected — call connect() first');
   }
-
 }
