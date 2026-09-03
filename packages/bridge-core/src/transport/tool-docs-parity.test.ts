@@ -123,7 +123,7 @@ describe('the channel instructions name exactly the registered tools', () => {
   it('names every registered tool, and names nothing else', async () => {
     const { client, shutdown } = await liveBridge();
     try {
-      const named = [...new Set((client.getInstructions() ?? '').match(/parley_[a-z_]+/g) ?? [])];
+      const named = [...new Set((client.getInstructions() ?? '').match(/parley_\w+/g) ?? [])];
       const registered = (await client.listTools()).tools.map((t) => t.name);
 
       expect(named.length, 'the instructions name no tool at all').toBeGreaterThan(0);

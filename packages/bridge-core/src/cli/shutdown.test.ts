@@ -62,7 +62,7 @@ describe('installShutdown runs teardown exactly once, from every trigger', () =>
  * EventEmitter it owns, always after registration. So drive a REAL `Readable` into each terminal
  * state a chosen number of macrotasks either side of the wiring, and require teardown exactly once
  * in every cell — the state check and the listener are then each the only thing standing between a
- * column of cells and a bridge that heart-beats a ghost peer forever.
+ * column of cells and a bridge whose poll loop keeps the process alive forever.
  */
 
 /** Mirrors `process.stdin`: flowing, and `autoDestroy: false`, so EOF emits 'end' and never 'close'. */

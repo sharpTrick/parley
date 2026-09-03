@@ -36,7 +36,7 @@ export const MAX_POST_TOPICS = 64;
  * Longest `topics` / `post_topics` entry the loader accepts. This bounds the operator's config, not
  * the wire: every entry an operator writes becomes a map key, a subscription registry entry and an
  * interpolation in an operator diagnostic, while a caller-supplied topic is bounded instead by the
- * ReDoS input clamp on the pattern path and by enum membership on the explicit one. A real topic
+ * ReDoS input clamp on the pattern path and by set membership on the explicit one. A real topic
  * name is short.
  */
 export const MAX_TOPIC_LEN = 512;
@@ -71,7 +71,7 @@ const ConfigObject = z.object({
   identity: z
     .object({
       handle: z.string().min(1).max(MAX_HANDLE_LEN, {
-        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: it is written into the sender field of every message this bridge posts`,
+        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: core hands it to the backend on every post`,
       }),
     })
     .strict(),

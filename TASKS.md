@@ -161,6 +161,9 @@ works end to end. Do not start v0.2 before this.
 
 ## Post-v1: presence + reachability roster
 
+> **Removed since:** presence, the roster and `parley_list_users` no longer ship. The items below
+> record what was built; they are history, not current capability.
+
 - [x] Presence beats (hello/heartbeat/goodbye) on ONE shared, reserved topic; `parley_list_users`
       derived above the seam so it works on every backend with no new seam method.
 - [x] Offline-aware roster (recently-seen peers, not just live ones); instance-scoped liveness;

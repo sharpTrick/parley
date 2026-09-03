@@ -3,8 +3,8 @@
  * against.
  *
  * Past {@link MAX_TIMER_MS} a delay does not slow a timer down — it WRAPS, and the timer fires one
- * millisecond in, which is where a delay below 1 ms is floored too. A heartbeat cadence, a poll nap
- * or a shutdown budget off either end therefore becomes the same storm, and the ceiling is the one
+ * millisecond in, which is where a delay below 1 ms is floored too. A poll nap or a shutdown budget
+ * off either end therefore becomes the same storm, and the ceiling is the one
  * end that reads as a slower loop. Every figure guarded here is an operator's or an embedder's TYPED
  * knob, so it is refused rather than clamped: silently rewriting a mis-set 24-day cadence to 24.8
  * days hides the config that produced it.

@@ -88,11 +88,15 @@ describe('the shipped multi-session configs deploy as documented', () => {
       ]),
   );
 
-  it('finds shipped configs that share a room (guards against grading nothing)', () => {
-    expect(
-      coHabiting.length,
-      'no two shipped configs share a topic, so the mutual-invite rule below grades nothing',
-    ).toBeGreaterThan(0);
+  it('every shipped config shares a room with another (guards against grading less)', () => {
+    // Keep this per-config rather than a count over the whole set, so that ONE config drifting off
+    // the shared topic drops its rows loudly instead of shrinking the table below in silence.
+    const stranded = configs
+      .filter((c) => !coHabiting.some(([, creator, peer]) => creator === c || peer === c))
+      .map((c) => c.file);
+    expect(stranded, 'these shipped configs share no topic, so they grade no invite rule').toEqual(
+      [],
+    );
   });
 
   it.each(coHabiting)('%s, so it invites it', (_name, creator, peer) => {
