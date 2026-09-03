@@ -2,9 +2,11 @@
  * Every SHAPE a seam call's failure can arrive in AT A FIRE-AND-FORGET SITE. Core has to absorb all
  * of them identically, and it may reject with a non-Error or never settle at all.
  *
- * A synchronous throw is not among them: every surviving site wraps the call in an `async` function,
- * which converts a sync throw into a rejection before the `void … .catch()` sees it, so a sync shape
- * would be an async twin that can never fail on its own.
+ * The two SYNCHRONOUS shapes look redundant with their async twins today, because every surviving
+ * site wraps the call in an `async` function. Keep them anyway, so that the wrapper itself stays
+ * graded: rewrite `closeQuietly` non-async and a synchronous throw escapes the `res.on('close')`
+ * handler as an uncaught exception that takes the remote bridge down — with the whole core suite
+ * green, unless these rows are here to catch it.
  *
  * Each shape ignores the real call's result, so the same table drives any seam call regardless of
  * what it resolves to.
@@ -14,6 +16,12 @@ export const FAILURE_SHAPES = {
   'rejects with a non-Error': (_real: Promise<unknown>): Promise<never> =>
     Promise.reject('seam boom (string)'),
   'never settles': (_real: Promise<unknown>): Promise<never> => new Promise<never>(() => {}),
+  'rejects synchronously': (_real: Promise<unknown>): Promise<never> => {
+    throw new Error('seam boom (sync)');
+  },
+  'throws a non-Error synchronously': (_real: Promise<unknown>): Promise<never> => {
+    throw 'seam boom (sync, string)';
+  },
 } as const;
 
 export type FailureShape = keyof typeof FAILURE_SHAPES;

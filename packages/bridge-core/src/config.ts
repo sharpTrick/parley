@@ -35,10 +35,9 @@ export const MAX_POST_TOPICS = 64;
 
 /**
  * Longest `topics` / `post_topics` entry the loader accepts. This bounds the operator's config, not
- * the wire: every entry an operator writes becomes a map key, a subscription registry entry and an
- * interpolation in an operator diagnostic, while a caller-supplied topic is bounded instead by the
- * ReDoS input clamp on the pattern path and by set membership on the explicit one. A real topic
- * name is short.
+ * the wire: an entry becomes an allowlist member and an interpolation in an operator diagnostic,
+ * while a caller-supplied topic is bounded instead by the ReDoS input clamp on the pattern path and
+ * by set membership on the explicit one. A real topic name is short.
  */
 export const MAX_TOPIC_LEN = 512;
 
