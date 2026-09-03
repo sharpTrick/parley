@@ -60,7 +60,7 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
       seen,
       blockMaxMs: 60_000,
       blockPollIntervalMs: 20,
-      };
+    };
     registerTools(server, deps);
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
@@ -142,7 +142,7 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
           seen,
           blockMaxMs: 60_000,
           blockPollIntervalMs: 20,
-              };
+        };
         registerTools(server, deps);
         const [clientT, serverT] = InMemoryTransport.createLinkedPair();
         const client = new Client({ name: 't', version: '0.0.0' }, { capabilities: {} });

@@ -89,6 +89,13 @@ describe('the shipped multi-session configs deploy as documented', () => {
   /**
    * Any of them may be the first to post to a shared room, and the creator's `invite` is the only
    * thing that admits the rest — so the requirement is symmetric, not "somebody invites everybody".
+   *
+   * The universe is what the configs ENUMERATE, and `post_topics` reaches past it: two configs each
+   * carrying `post_topics: ["ctx-.*"]` can both create `ctx-adhoc`, which no `topics` list names, so
+   * neither appears in the other's reach and the pair grades clean. Whether two patterns admit a
+   * common topic is regex intersection, which is not decidable in general — so the rule is the
+   * conservative one: a config with a non-empty `post_topics` can create a room for a topic nobody
+   * enumerates, and must therefore invite every other config in the set.
    */
   function coHabitants(
     set: ShippedConfig[],
@@ -97,16 +104,21 @@ describe('the shipped multi-session configs deploy as documented', () => {
     const reach = new Map(set.map((c) => [c, reachOf(c, universe)] as const));
     return set.flatMap((creator) =>
       set
-        .map((peer) => ({
-          peer,
-          shared: reach.get(creator)!.filter((t) => reach.get(peer)!.includes(t)),
-        }))
-        .filter(({ peer, shared }) => peer !== creator && shared.length > 0)
-        .map(({ peer, shared }): [string, ShippedConfig, ShippedConfig] => [
-          `${creator.file} shares ${shared.join(', ')} with ${peer.file}`,
-          creator,
-          peer,
-        ]),
+        .filter((peer) => peer !== creator)
+        .flatMap((peer): [string, ShippedConfig, ShippedConfig][] => {
+          const shared = reach.get(creator)!.filter((t) => reach.get(peer)!.includes(t));
+          if (shared.length > 0)
+            return [[`${creator.file} shares ${shared.join(', ')} with ${peer.file}`, creator, peer]];
+          if (creator.postPatterns.length > 0)
+            return [
+              [
+                `${creator.file} can create a room for a topic no config enumerates, so it shares one with ${peer.file}`,
+                creator,
+                peer,
+              ],
+            ];
+          return [];
+        }),
     );
   }
 
@@ -164,6 +176,45 @@ describe('the shipped multi-session configs deploy as documented', () => {
     // post_topics pattern being read and not a fixture nothing could satisfy.
     const withdrawn = [...planted.slice(0, 2), { ...planted[2]!, postPatterns: [] }];
     expect(lockouts(withdrawn)).toEqual([]);
+  });
+
+  /**
+   * The hazard one step out from the fixture above: a topic reachable only through `post_topics`
+   * and enumerated by nobody. Both configs can create `ctx-adhoc`, neither lists it, so no
+   * enumerated universe contains it and a reach-only rule calls the pair safe.
+   */
+  it('flags two configs whose post_topics both reach a topic no config enumerates', () => {
+    const fixture = (
+      file: string,
+      topics: string[],
+      postPatterns: string[],
+      invite: string[],
+    ): ShippedConfig => ({
+      file,
+      topics,
+      postPatterns,
+      backend: { user: file.replace('.yaml', ''), server_name: 'parley.local', invite } as MatrixBackendConfig,
+    });
+    const planted = [
+      fixture('code-agent-a.yaml', ['ctx-a'], ['ctx-adhoc'], []),
+      fixture('code-agent-b.yaml', ['ctx-b'], ['ctx-adhoc'], []),
+    ];
+
+    expect(
+      lockouts(planted),
+      'two configs that can both create a room for an unenumerated topic went unflagged',
+    ).toEqual([
+      'code-agent-a.yaml can create a room for a topic no config enumerates, so it shares one with code-agent-b.yaml',
+      'code-agent-b.yaml can create a room for a topic no config enumerates, so it shares one with code-agent-a.yaml',
+    ]);
+
+    // Inviting each other clears it, so the verdict above is the invite rule and not a fixture
+    // nothing could satisfy.
+    const invited = [
+      { ...planted[0]!, backend: { ...planted[0]!.backend, invite: ['@code-agent-b:parley.local'] } },
+      { ...planted[1]!, backend: { ...planted[1]!.backend, invite: ['@code-agent-a:parley.local'] } },
+    ];
+    expect(lockouts(invited)).toEqual([]);
   });
 
   it('no shipped config would lock a peer out of a room it creates', () => {

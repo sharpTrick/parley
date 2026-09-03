@@ -96,10 +96,35 @@ describe('public barrel surface', () => {
   /**
    * The names above are the surface a consumer can IMPORT; the members of those names are the
    * surface a consumer can CALL, and dropping one is a break the name pin cannot see —
-   * `AllowlistOptions.reserved` was removed with nothing red. Take the members off the compiler's
-   * own view of the barrel, resolving each re-export to the declaration it lands on, so a type that
-   * moves file stays graded and a member restated in a doc cannot stand in for the member itself.
+   * `AllowlistOptions.reserved` was removed with nothing red, and `SeenSet` grew a public method
+   * with nothing red. Take the members off the compiler's own view of the barrel, resolving each
+   * re-export to the declaration it lands on, so a type that moves file stays graded and a member
+   * restated in a doc cannot stand in for the member itself.
+   *
+   * A class's non-public members are not that surface, so they are not pinned: `private` and
+   * `protected` are withdrawable without a major, and a `#name` is not even nameable.
    */
+  const PUBLIC_MODIFIERS = ts.ModifierFlags.Private | ts.ModifierFlags.Protected;
+
+  type Members = readonly ts.ClassElement[] | readonly ts.TypeElement[];
+
+  const callableMembers = (decl: ts.Declaration): Members | undefined => {
+    if (ts.isInterfaceDeclaration(decl)) return decl.members;
+    if (ts.isTypeAliasDeclaration(decl) && ts.isTypeLiteralNode(decl.type)) return decl.type.members;
+    if (ts.isClassDeclaration(decl))
+      return decl.members.filter(
+        (m) =>
+          (ts.getCombinedModifierFlags(m) & PUBLIC_MODIFIERS) === 0 &&
+          !(m.name !== undefined && ts.isPrivateIdentifier(m.name)) &&
+          !ts.isClassStaticBlockDeclaration(m) &&
+          !ts.isSemicolonClassElement(m),
+      );
+    return undefined;
+  };
+
+  const memberName = (m: ts.ClassElement | ts.TypeElement): string =>
+    ts.isConstructorDeclaration(m) ? 'constructor' : (m.name?.getText() ?? '[index signature]');
+
   const memberShapes = (): Record<string, string[]> => {
     const program = ts.createProgram([BARREL_PATH], {
       target: ts.ScriptTarget.ES2022,
@@ -115,17 +140,10 @@ describe('public barrel surface', () => {
       const target =
         (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol;
       for (const decl of target.declarations ?? []) {
-        const members = ts.isInterfaceDeclaration(decl)
-          ? decl.members
-          : ts.isTypeAliasDeclaration(decl) && ts.isTypeLiteralNode(decl.type)
-            ? decl.type.members
-            : undefined;
+        const members = callableMembers(decl);
         if (members === undefined) continue;
         shapes[symbol.name] = [
-          ...new Set([
-            ...(shapes[symbol.name] ?? []),
-            ...members.map((m) => m.name?.getText() ?? '[index signature]'),
-          ]),
+          ...new Set([...(shapes[symbol.name] ?? []), ...members.map(memberName)]),
         ].sort();
       }
     }
@@ -133,6 +151,7 @@ describe('public barrel surface', () => {
   };
 
   const MEMBERS: Record<string, string[]> = {
+    Allowlist: ['assert', 'constructor', 'has', 'patterns', 'topics'],
     AllowlistOptions: ['postPatterns'],
     BackendCliOptions: ['bin', 'moduleUrl', 'plugin'],
     BackendConfig: ['[index signature]'],
@@ -142,35 +161,48 @@ describe('public barrel surface', () => {
     BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
     BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
     CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],
+    ConsentError: ['constructor'],
     FakeOidc: ['close', 'issuer', 'jwksUri', 'mint'],
     FakeOidcClaims: [
       'aud', 'azp', 'expiresInS', 'issuerOverride', 'notBeforeInS', 'omit', 'preferred_username',
       'realm_access', 'scope', 'signWithRogueKey', 'sub',
     ],
+    FetchAbortedError: ['constructor'],
     FetchRecentArgs: ['blockMs', 'limit', 'since', 'topic'],
     FetchRecentResult: ['messages', 'nextCursor'],
     Message: ['backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp', 'topic'],
+    NoSuchTopicError: ['constructor'],
     OAuthRemoteOptions: [
       'issuerUrl', 'mcpPath', 'now', 'scopesSupported', 'trustProxy', 'verifyOwner',
     ],
     OAuthRemoteServer: ['provider', 'resource'],
     OidcRemoteOptions: ['fetchFn', 'mcpPath', 'now', 'oidc', 'publicUrl'],
     OidcRemoteServer: ['authorizationServer', 'resource', 'verifier'],
+    OidcTokenVerifier: ['constructor', 'verifyAccessToken'],
     OidcVerifierOptions: [
       'allowedSubjects', 'allowedUsernames', 'audience', 'clockSkewS', 'issuer', 'jwksUri', 'now',
       'requiredRole', 'requiredScope',
     ],
     ParleyBridge: ['attach', 'server', 'shutdown'],
+    ParleyOAuthProvider: [
+      'authorize', 'challengeForAuthorizationCode', 'clientsStore', 'completeConsent',
+      'constructor', 'exchangeAuthorizationCode', 'exchangeRefreshToken', 'revokeToken', 'stop',
+      'verifyAccessToken',
+    ],
     ParleyOAuthProviderOptions: ['consentPath', 'now', 'resource', 'scopesSupported', 'verifyOwner'],
     ParseArgsOptions: ['bin', 'env', 'version'],
     PushLoopOptions: ['identity', 'mentionFilter'],
+    ReadStateStore: ['constructor', 'get', 'path', 'set'],
     RemoteAuthOptions: [
       'fetchFn', 'mcpPath', 'now', 'publicUrl', 'scopesSupported', 'trustProxy', 'verifyOwner',
     ],
     RemoteHttpOptions: ['allowedHosts', 'configureApp', 'insecureNoAuth', 'mcpPath', 'protect'],
     RemoteHttpServer: ['app', 'close', 'listen'],
+    SeenSet: ['constructor', 'firstSeen', 'has', 'markSeen'],
     ShutdownHost: ['on', 'stdin'],
     ToolDeps: ['allow', 'blockMaxMs', 'blockPollIntervalMs', 'identity', 'plugin', 'seen'],
+    TopicNotAllowedError: ['constructor'],
+    UnsafePatternError: ['constructor'],
   };
 
   it('publishes exactly these members on the types it exports, and no others', () => {

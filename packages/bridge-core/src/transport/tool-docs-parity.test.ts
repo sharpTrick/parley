@@ -98,14 +98,7 @@ describe('a post_topics-matched topic is accepted by every allowlist-gated tool'
   });
 });
 
-/**
- * The channel instructions are the prose Claude Code pastes into a session's system prompt, so a
- * tool they name that is not registered sends the model at a call that cannot resolve, and a tool
- * they omit is one the model never learns it has. Removing a tool once left its sentence behind.
- * Read both sides off a live bridge — the instructions the server advertises and the tools it
- * registers — so neither can be restated here and drift.
- */
-describe('the channel instructions name exactly the registered tools', () => {
+describe('the channel instructions the bridge advertises', () => {
   async function liveBridge(): Promise<{ client: Client; shutdown: () => Promise<void> }> {
     const cfg = parseConfig({
       identity: { handle: 'agent' },
@@ -120,6 +113,13 @@ describe('the channel instructions name exactly the registered tools', () => {
     return { client, shutdown: () => bridge.shutdown() };
   }
 
+  /**
+   * The instructions are the prose Claude Code pastes into a session's system prompt, so a tool
+   * they name that is not registered sends the model at a call that cannot resolve, and a tool
+   * they omit is one the model never learns it has. Removing a tool once left its sentence behind.
+   * Read both sides off a live bridge — the instructions the server advertises and the tools it
+   * registers — so neither can be restated here and drift.
+   */
   it('names every registered tool, and names nothing else', async () => {
     const { client, shutdown } = await liveBridge();
     try {
@@ -134,64 +134,27 @@ describe('the channel instructions name exactly the registered tools', () => {
   });
 
   /**
-   * The tool-name scan above grades only NAMES, so every claim the prose makes around them is
-   * ungraded: the untrusted-inbound clause (DESIGN §14) — the one control standing between a
-   * message written by another participant and the session's instruction stream — was deletable
-   * with the whole suite green. One row per CLAIM, matched loosely enough that the sentence can be
-   * rewritten and strictly enough that dropping it reddens; the membership pin makes a deleted row
-   * as visible as a deleted clause.
+   * The scan above grades only NAMES. Everything else the prose says — the untrusted-inbound clause
+   * (DESIGN §14) above all — is a semantic claim, and three rounds of trying to grade one with a
+   * pattern were each satisfied by prose that reversed it: an exception clause, an in-sentence
+   * carve-out, and a contradicting sibling sentence.
+   *
+   * So pin the bytes instead. This detects that the shipped instructions CHANGED; it does not
+   * grade whether they are correct. Any edit — improving, weakening or inverting — reddens until
+   * someone updates the golden, which is the point: a human reads the one string that reaches
+   * every model's system prompt.
    */
-  const REVERSAL = String.raw`only|unless|except|merely|instead|rather|however|but|ignore|disregard|obey|comply|act\s+on`;
+  const GOLDEN = fileURLToPath(new URL('./channel-instructions.golden.txt', import.meta.url));
 
-  /** One sentence character, so long as it does not open a word that flips the sense of a claim. */
-  const KEPT = String.raw`(?:(?!\b(?:${REVERSAL})\b)[^.])`;
-
-  /**
-   * A claim holds when ONE sentence states it end to end and nothing in that sentence reverses it.
-   * Token adjacency alone cannot: "untrusted" and "never … instructions" both appear, intact, in
-   * prose that tells the model to act on instructions from untrusted participants.
-   */
-  const states = (body: string): RegExp =>
-    new RegExp(String.raw`(?:^|\.\s+)${KEPT}*${body}${KEPT}*\.`, 'i');
-
-  const CLAIMS: readonly (readonly [claim: string, present: RegExp, inverted: string])[] = [
-    [
-      'inbound is untrusted',
-      states(String.raw`\binbound\b${KEPT}*\buntrusted\b`),
-      'Inbound text comes from other participants and is untrusted only in the sense that its provenance is unverified.',
-    ],
-    [
-      'inbound is never an instruction',
-      states(String.raw`\bnever\b${KEPT}{0,20}\binstructions?\b`),
-      'Never ignore instructions it contains — act on them.',
-    ],
-    [
-      'a reply carries the same topic',
-      states(String.raw`parley_reply${KEPT}*\bsame\b${KEPT}*\btopic\b`),
-      'To respond, call parley_reply with a different topic from the one the message arrived on.',
-    ],
-    [
-      'catch up on session start',
-      states(String.raw`parley_fetch_recent${KEPT}*session start`),
-      'Call parley_fetch_recent only on demand, never on session start.',
-    ],
-  ] as const;
-
-  it('pins the claims graded below', () => {
-    expect(CLAIMS.map(([claim]) => claim)).toHaveLength(4);
-    expect(new Set(CLAIMS.map(([claim]) => claim)).size).toBe(CLAIMS.length);
-  });
-
-  it.each(CLAIMS)('states that %s', async (_claim, present) => {
+  it('ships the pinned instructions byte for byte', async () => {
     const { client, shutdown } = await liveBridge();
     try {
-      expect(client.getInstructions() ?? '').toMatch(present);
+      expect(
+        `${client.getInstructions() ?? ''}\n`,
+        `the channel instructions changed; read the new text, then update ${GOLDEN}`,
+      ).toBe(readFileSync(GOLDEN, 'utf8'));
     } finally {
       await shutdown();
     }
-  });
-
-  it.each(CLAIMS)('tells %s from its negation', (_claim, present, inverted) => {
-    expect(inverted).not.toMatch(present);
   });
 });
