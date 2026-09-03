@@ -100,8 +100,11 @@ export interface BackendPlugin {
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;
 
   /**
-   * Single centralized durable write path. Writes `content` to `topic` as `identity`,
-   * optionally threaded to `inReplyTo`. Returns the new message's stable backend id.
+   * Single centralized durable write path. Writes `content` to `topic`, optionally threaded to
+   * `inReplyTo`. Returns the new message's stable backend id. `identity` is the handle core asks
+   * the write to be attributed to; a backend whose transport authenticates as an account of its own
+   * stamps the sender from that account and ignores it, so per-instance attribution there comes
+   * from giving each instance its own account rather than from this argument.
    * This is the single place write-notifications originate (DESIGN §4/§7).
    */
   post(

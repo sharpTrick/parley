@@ -53,7 +53,6 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
     seen: new SeenSet(),
     blockMaxMs: 60_000,
     blockPollIntervalMs: 20,
-    now: undefined,
     ...Object.fromEntries(
       Object.entries(opts).filter(([k]) => k !== 'topics' && k !== 'postPatterns'),
     ),

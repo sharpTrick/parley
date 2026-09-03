@@ -19,8 +19,6 @@ export interface ToolDeps {
   blockMaxMs: number;
   /** Poll cadence (ms) for core's generic long-poll fallback. */
   blockPollIntervalMs: number;
-  /** Clock source; injectable for tests. Default `Date.now`. */
-  now?: () => number;
 }
 
 /**

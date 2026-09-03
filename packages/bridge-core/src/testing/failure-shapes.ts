@@ -25,8 +25,12 @@ export type FailureShape = keyof typeof FAILURE_SHAPES;
 export const FAILURE_SHAPE_NAMES = Object.keys(FAILURE_SHAPES) as FailureShape[];
 
 /**
- * Collect every unhandled rejection raised while `work` runs. Node reports one a turn after the
- * microtask queue drains, so this keeps listening for a macrotask past the end of `work`.
+ * Collect every failure that ESCAPED while `work` runs — an unhandled rejection, and equally the
+ * `uncaughtException` a synchronous throw becomes when it leaves an event handler nothing is
+ * awaiting. Listening for rejections alone reads that second case as clean, which is how a
+ * fire-and-forget site that stopped absorbing a synchronous throw kept a table of shapes green.
+ * Node reports a rejection a turn after the microtask queue drains, so this keeps listening for a
+ * macrotask past the end of `work`.
  */
 export async function unhandledDuring(work: () => Promise<void>): Promise<unknown[]> {
   const escaped: unknown[] = [];
@@ -34,11 +38,13 @@ export async function unhandledDuring(work: () => Promise<void>): Promise<unknow
     escaped.push(reason);
   };
   process.on('unhandledRejection', capture);
+  process.on('uncaughtException', capture);
   try {
     await work();
     await new Promise((r) => setTimeout(r, 30));
   } finally {
     process.off('unhandledRejection', capture);
+    process.off('uncaughtException', capture);
   }
   return escaped;
 }

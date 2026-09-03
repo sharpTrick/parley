@@ -181,9 +181,10 @@ describe('every documented inclusive bound is graded AT the bound', () => {
 
 // Grading a bound only through probes DERIVED from it leaves its VALUE free: with every probe built
 // as `'a'.repeat(bound - 1)`, shrinking a capacity to 8 keeps the whole suite green while an
-// operator's configured topic starts being rejected. These constants are documented capacities —
-// promises to an operator — as well as bounds on work, so pin the value as a literal and pair it
-// with a literal, realistic input that must still be accepted.
+// operator's configured topic starts being rejected. These constants are chosen limits, not
+// promises derived from anything, so what is gradable about one is that it is ENFORCED at the value
+// it names: pin the value as a literal, pair it with a literal, realistic input that must still be
+// accepted, and require one step past it to be refused.
 //
 // The SUBJECT SET is derived from the tree the code lives in, never named. A hand-written list of
 // four filenames used to stand here; it could not see src/engine or src/transport, and thirteen
@@ -548,7 +549,7 @@ async function discoverySlowBy(ms: number): Promise<string> {
 
 const PROBED_PAST = CAPACITIES.filter((c) => c.refusesPast !== undefined);
 
-describe('every documented capacity is pinned to a value, not only to itself', () => {
+describe('every chosen limit is pinned to a value, not only to itself', () => {
   it('has a row for every numeric capacity anything under src/ exports', async () => {
     const declared = await declaredCapacities();
     // Floor the DERIVATION itself: a walk that stops matching would otherwise grade an empty

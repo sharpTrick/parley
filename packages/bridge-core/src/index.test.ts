@@ -9,8 +9,12 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import * as api from './index.js';
+
+const BARREL_PATH = fileURLToPath(new URL('./index.ts', import.meta.url));
+const BARREL = readFileSync(BARREL_PATH, 'utf8');
 
 const SRC = readdirSync(fileURLToPath(new URL('.', import.meta.url)), { recursive: true })
   .map(String)
@@ -66,17 +70,11 @@ describe('public barrel surface', () => {
     ).toBe(true);
   });
 
-  it.each(trimmed)('does not re-export the trimmed internal %s', (name) => {
-    expect(name in api).toBe(false);
-    expect((api as Record<string, unknown>)[name]).toBeUndefined();
-  });
-
   // Runtime bindings plus the barrel's own type-only export clauses: a `.d.ts` name is semver
   // surface with no runtime key to enumerate.
   const published = (): string[] => {
-    const barrel = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
     const names = new Set<string>(Object.keys(api));
-    for (const clause of barrel.matchAll(/export\s+(?:type\s+)?\{([^}]*)\}/g))
+    for (const clause of BARREL.matchAll(/export\s+(?:type\s+)?\{([^}]*)\}/g))
       for (const spec of clause[1]!.split(',')) {
         const name = spec.replace(/^\s*type\s+/, '').split(/\s+as\s+/).pop()?.trim();
         if (name) names.add(name);
@@ -86,6 +84,101 @@ describe('public barrel surface', () => {
 
   it('publishes exactly this surface, and nothing more', () => {
     expect(published()).toEqual([...SURFACE]);
+  });
+
+  // The scan above reads export CLAUSES, so a star re-export widens the surface past everything it
+  // can see: two exported types plus `export * from './x.js'` leave the pin above at full strength
+  // and full ignorance. Named clauses only is what makes that scan complete by construction.
+  it('re-exports through named clauses only, so the pin above can see the whole surface', () => {
+    expect(BARREL.match(/^\s*export\s+(?:type\s+)?\*/gm) ?? []).toEqual([]);
+  });
+
+  /**
+   * The names above are the surface a consumer can IMPORT; the members of those names are the
+   * surface a consumer can CALL, and dropping one is a break the name pin cannot see —
+   * `AllowlistOptions.reserved` was removed with nothing red. Take the members off the compiler's
+   * own view of the barrel, resolving each re-export to the declaration it lands on, so a type that
+   * moves file stays graded and a member restated in a doc cannot stand in for the member itself.
+   */
+  const memberShapes = (): Record<string, string[]> => {
+    const program = ts.createProgram([BARREL_PATH], {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      skipLibCheck: true,
+      noEmit: true,
+    });
+    const checker = program.getTypeChecker();
+    const source = program.getSourceFile(BARREL_PATH)!;
+    const shapes: Record<string, string[]> = {};
+    for (const symbol of checker.getExportsOfModule(checker.getSymbolAtLocation(source)!)) {
+      const target =
+        (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol;
+      for (const decl of target.declarations ?? []) {
+        const members = ts.isInterfaceDeclaration(decl)
+          ? decl.members
+          : ts.isTypeAliasDeclaration(decl) && ts.isTypeLiteralNode(decl.type)
+            ? decl.type.members
+            : undefined;
+        if (members === undefined) continue;
+        shapes[symbol.name] = [
+          ...new Set([
+            ...(shapes[symbol.name] ?? []),
+            ...members.map((m) => m.name?.getText() ?? '[index signature]'),
+          ]),
+        ].sort();
+      }
+    }
+    return shapes;
+  };
+
+  const MEMBERS: Record<string, string[]> = {
+    AllowlistOptions: ['postPatterns'],
+    BackendCliOptions: ['bin', 'moduleUrl', 'plugin'],
+    BackendConfig: ['[index signature]'],
+    BackendConfigKeys: ['keys', 'nested'],
+    BackendIdentity: ['backendRef', 'handle'],
+    BackendPlugin: ['connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe'],
+    BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
+    BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
+    CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],
+    FakeOidc: ['close', 'issuer', 'jwksUri', 'mint'],
+    FakeOidcClaims: [
+      'aud', 'azp', 'expiresInS', 'issuerOverride', 'notBeforeInS', 'omit', 'preferred_username',
+      'realm_access', 'scope', 'signWithRogueKey', 'sub',
+    ],
+    FetchRecentArgs: ['blockMs', 'limit', 'since', 'topic'],
+    FetchRecentResult: ['messages', 'nextCursor'],
+    Message: ['backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp', 'topic'],
+    OAuthRemoteOptions: [
+      'issuerUrl', 'mcpPath', 'now', 'scopesSupported', 'trustProxy', 'verifyOwner',
+    ],
+    OAuthRemoteServer: ['provider', 'resource'],
+    OidcRemoteOptions: ['fetchFn', 'mcpPath', 'now', 'oidc', 'publicUrl'],
+    OidcRemoteServer: ['authorizationServer', 'resource', 'verifier'],
+    OidcVerifierOptions: [
+      'allowedSubjects', 'allowedUsernames', 'audience', 'clockSkewS', 'issuer', 'jwksUri', 'now',
+      'requiredRole', 'requiredScope',
+    ],
+    ParleyBridge: ['attach', 'server', 'shutdown'],
+    ParleyOAuthProviderOptions: ['consentPath', 'now', 'resource', 'scopesSupported', 'verifyOwner'],
+    ParseArgsOptions: ['bin', 'env', 'version'],
+    PushLoopOptions: ['identity', 'mentionFilter'],
+    RemoteAuthOptions: [
+      'fetchFn', 'mcpPath', 'now', 'publicUrl', 'scopesSupported', 'trustProxy', 'verifyOwner',
+    ],
+    RemoteHttpOptions: ['allowedHosts', 'configureApp', 'insecureNoAuth', 'mcpPath', 'protect'],
+    RemoteHttpServer: ['app', 'close', 'listen'],
+    ShutdownHost: ['on', 'stdin'],
+    ToolDeps: ['allow', 'blockMaxMs', 'blockPollIntervalMs', 'identity', 'plugin', 'seen'],
+  };
+
+  it('publishes exactly these members on the types it exports, and no others', () => {
+    const shapes = memberShapes();
+    expect(Object.keys(shapes).every((name) => (SURFACE as readonly string[]).includes(name))).toBe(
+      true,
+    );
+    expect(shapes).toEqual(MEMBERS);
   });
 });
 
@@ -115,9 +208,8 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
 
   // Type-only re-exports are part of the shipped surface but carry no runtime binding, so read the
   // barrel's own export clauses rather than only `Object.keys(api)`.
-  const barrel = readFileSync(join(SRC, 'index.ts'), 'utf8');
   const exposed = new Set<string>(Object.keys(api));
-  for (const clause of barrel.matchAll(/export\s+(?:type\s+)?\{([^}]*)\}/g))
+  for (const clause of BARREL.matchAll(/export\s+(?:type\s+)?\{([^}]*)\}/g))
     for (const spec of clause[1]!.split(',')) {
       const name = spec.replace(/^\s*type\s+/, '').split(/\s+as\s+/).pop()?.trim();
       if (name) exposed.add(name);
@@ -429,7 +521,7 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
    * the next type added there without a producer fails here without anyone naming it.
    */
   const ENGINE_CLAUSE = /export\s+\{([^}]*)\}\s+from\s+'(\.\/(?:engine|transport)\/[^']+)'/g;
-  const barrelTypes = [...barrel.matchAll(ENGINE_CLAUSE)].flatMap(([, clause, module]) =>
+  const barrelTypes = [...BARREL.matchAll(ENGINE_CLAUSE)].flatMap(([, clause, module]) =>
     clause!
       .split(',')
       .map((spec) => spec.trim())

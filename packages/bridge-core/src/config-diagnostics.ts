@@ -61,7 +61,11 @@ export function assertNoPresenceKey(raw: unknown): void {
       path: ['presence'],
       message:
         'presence was removed: there is no roster, no heartbeat topic and no parley_list_users ' +
-        'tool for it to configure. Delete the `presence:` block from the config file.',
+        'tool for it to configure. Delete the `presence:` block from the config file. The topic it ' +
+        'named is no longer reserved either, so any instance whose `topics`/`post_topics` reach it ' +
+        'can now write there — and a peer still running the old build will read those writes as ' +
+        'roster entries, trusting the handle each record states about itself. Upgrade every ' +
+        'instance on the backend, or keep that topic off their allowlists.',
     },
   ]);
 }

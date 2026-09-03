@@ -1,4 +1,4 @@
-import { loadConfig, parseConfig, TOOL_TEXT } from '@sharptrick/parley-core';
+import { Allowlist, loadConfig, parseConfig, TOOL_TEXT } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,8 @@ const EXAMPLES = new URL('../../../examples/multi-session/matrix/', import.meta.
 interface ShippedConfig {
   file: string;
   topics: string[];
+  /** `post_topics` — post/fetch reach WITHOUT subscription, and rooms are created on post. */
+  postPatterns: string[];
   backend: MatrixBackendConfig;
 }
 
@@ -45,6 +47,7 @@ const configs: ShippedConfig[] = readdirSync(EXAMPLES)
     return {
       file,
       topics: doc.topics.map(String),
+      postPatterns: doc.post_topics.map(String),
       backend: doc.backend_config as MatrixBackendConfig,
     };
   });
@@ -72,21 +75,48 @@ describe('the shipped multi-session configs deploy as documented', () => {
   });
 
   /**
+   * Which rooms a config can end up in. Reach, not subscription: a room is provisioned by whoever
+   * POSTS to its topic first, and `post_topics` grants post reach to topics a config never lists —
+   * so a config can be first to create an invite-only room for a topic that appears nowhere in its
+   * `topics`, with an `invite` list that names none of the peers who do subscribe to it. Matched
+   * through core's own {@link Allowlist}, so full-match semantics are not re-derived here.
+   */
+  const reachOf = (c: ShippedConfig, universe: string[]): string[] => {
+    const allow = new Allowlist(c.topics, { postPatterns: c.postPatterns });
+    return universe.filter((t) => allow.has(t));
+  };
+
+  /**
    * Any of them may be the first to post to a shared room, and the creator's `invite` is the only
    * thing that admits the rest — so the requirement is symmetric, not "somebody invites everybody".
    */
-  const sharedRooms = (a: ShippedConfig, b: ShippedConfig): string[] =>
-    a.topics.filter((t) => b.topics.includes(t));
+  function coHabitants(
+    set: ShippedConfig[],
+  ): [label: string, creator: ShippedConfig, peer: ShippedConfig][] {
+    const universe = [...new Set(set.flatMap((c) => c.topics))];
+    const reach = new Map(set.map((c) => [c, reachOf(c, universe)] as const));
+    return set.flatMap((creator) =>
+      set
+        .map((peer) => ({
+          peer,
+          shared: reach.get(creator)!.filter((t) => reach.get(peer)!.includes(t)),
+        }))
+        .filter(({ peer, shared }) => peer !== creator && shared.length > 0)
+        .map(({ peer, shared }): [string, ShippedConfig, ShippedConfig] => [
+          `${creator.file} shares ${shared.join(', ')} with ${peer.file}`,
+          creator,
+          peer,
+        ]),
+    );
+  }
 
-  const coHabiting = configs.flatMap((creator) =>
-    configs
-      .filter((peer) => peer !== creator && sharedRooms(creator, peer).length > 0)
-      .map((peer): [string, ShippedConfig, ShippedConfig] => [
-        `${creator.file} shares ${sharedRooms(creator, peer).join(', ')} with ${peer.file}`,
-        creator,
-        peer,
-      ]),
-  );
+  /** Co-habiting pairs whose creator would lock the peer out of the room it creates. */
+  const lockouts = (set: ShippedConfig[]): string[] =>
+    coHabitants(set)
+      .filter(([, creator, peer]) => !(creator.backend.invite ?? []).includes(mxidOf(peer)))
+      .map(([label]) => label);
+
+  const coHabiting = coHabitants(configs);
 
   it('every shipped config shares a room with another (guards against grading less)', () => {
     const stranded = configs
@@ -99,6 +129,45 @@ describe('the shipped multi-session configs deploy as documented', () => {
 
   it.each(coHabiting)('%s, so it invites it', (_name, creator, peer) => {
     expect(creator.backend.invite ?? []).toContain(mxidOf(peer));
+  });
+
+  /**
+   * The shipped set cannot carry this hazard without shipping it, so plant it: a third config that
+   * reaches a shared topic ONLY through `post_topics` — the escape hatch remote-chat.yaml documents
+   * — and invites nobody. A rule that reads `topics` alone calls this deployment safe right up to
+   * the moment that config posts first.
+   */
+  it('flags a config whose only reach into a shared room is post_topics', () => {
+    const fixture = (
+      file: string,
+      topics: string[],
+      postPatterns: string[],
+      invite: string[],
+    ): ShippedConfig => ({
+      file,
+      topics,
+      postPatterns,
+      backend: { user: file.replace('.yaml', ''), server_name: 'parley.local', invite } as MatrixBackendConfig,
+    });
+    const planted = [
+      fixture('a.yaml', ['ctx-payments'], [], ['@b:parley.local', '@c:parley.local']),
+      fixture('b.yaml', ['ctx-payments'], [], ['@a:parley.local', '@c:parley.local']),
+      fixture('c.yaml', ['ctx-private'], ['ctx-.*'], []),
+    ];
+
+    expect(
+      lockouts(planted),
+      'a config reaching a shared room only through post_topics went unflagged',
+    ).toEqual(['c.yaml shares ctx-payments with a.yaml', 'c.yaml shares ctx-payments with b.yaml']);
+
+    // The same three with that one reach withdrawn are clean, so the verdict above is the
+    // post_topics pattern being read and not a fixture nothing could satisfy.
+    const withdrawn = [...planted.slice(0, 2), { ...planted[2]!, postPatterns: [] }];
+    expect(lockouts(withdrawn)).toEqual([]);
+  });
+
+  it('no shipped config would lock a peer out of a room it creates', () => {
+    expect(lockouts(configs)).toEqual([]);
   });
 });
 

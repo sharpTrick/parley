@@ -119,7 +119,6 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
             ? await fetchRecentBlocking(deps.plugin, args, {
                 blockMs,
                 pollIntervalMs: deps.blockPollIntervalMs,
-                now: deps.now,
                 signal: extra?.signal,
               })
             : await deps.plugin.fetchRecent(args);
