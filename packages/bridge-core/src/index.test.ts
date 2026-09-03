@@ -1,9 +1,9 @@
 // Barrel-surface regression guard.
 //
-// The public entry `@sharptrick/parley-core` is automated-semver surface: every symbol it
-// re-exports is frozen by the release automation. This test pins the trimmed set (consumer-free
-// internals that must NOT be public) and the kept seam/config/composition-root surface, so a
-// future edit that re-adds an internal to the barrel fails loudly here.
+// The public entry `@sharptrick/parley-core` is automated-semver surface: a merge to `main` is a
+// lockstep release, so a symbol that reaches the barrel is published and cannot be withdrawn
+// without a major. A sample of kept names cannot see a WIDENING — a new export is on neither the
+// kept list nor the trimmed one — so the surface is pinned WHOLE, by value, in both directions.
 //
 // It is a test only — it does not re-export anything from the barrel.
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -31,31 +31,31 @@ describe('public barrel surface', () => {
     'topicSchema',
   ] as const;
 
-  // A representative slice of the deliberate kept surface (seam, config, engine, composition
-  // roots).
-  const kept = [
-    'registerTools',
-    'asTopic',
-    'asHandle',
-    'asBackendMsgId',
-    'asCursor',
-    'safeName',
-    'MIN_HASH_LEN',
-    'DEFAULT_HASH_LEN',
-    'MAX_HASH_LEN',
-    'MAX_BLOCK_MS',
-    'NoSuchTopicError',
-    'isNoSuchTopicError',
-    'parseMentions',
-    'buildMessage',
-    'createStdioBridge',
-    'buildBridge',
-    'loadConfig',
-    'parseConfig',
-    'Allowlist',
-    'SeenSet',
-    'catchUpTopic',
-    'catchUpAll',
+  // The WHOLE published surface, by value. A sample list is blind in the direction that actually
+  // ships: a symbol added to the barrel is on neither the kept list nor the trimmed one, so it
+  // reaches npm unnoticed. Types are counted too — `Object.keys` sees no type-only re-export.
+  const SURFACE = [
+    'Allowlist', 'AllowlistOptions', 'AuthConfig', 'AuthSchema', 'BackendCliOptions',
+    'BackendConfig', 'BackendConfigKeys', 'BackendIdentity', 'BackendMsgId', 'BackendPlugin',
+    'BlockingFetchOptions', 'BuildMessageInput', 'CHANNEL_NOTIFICATION_METHOD', 'CORE_VERSION',
+    'CatchUpArgs', 'ConfigSchema', 'ConsentError', 'Cursor', 'DEFAULT_HASH_LEN', 'FakeOidc',
+    'FakeOidcClaims', 'FetchAbortedError', 'FetchRecentArgs', 'FetchRecentResult', 'Handle',
+    'MAX_BLOCK_MS', 'MAX_HASH_LEN', 'MAX_MATCH_INPUT', 'MIN_HASH_LEN', 'Message',
+    'MessageHandler', 'NoSuchTopicError', 'OAuthRemoteOptions', 'OAuthRemoteServer',
+    'OidcAuthConfig', 'OidcAuthSchema', 'OidcRemoteOptions', 'OidcRemoteServer',
+    'OidcTokenVerifier', 'OidcVerifierOptions', 'ParleyBridge', 'ParleyConfig',
+    'ParleyOAuthProvider', 'ParleyOAuthProviderOptions', 'ParseArgsOptions', 'ParsedArgs',
+    'PushLoopOptions', 'ReadStateStore', 'RemoteAuthOptions', 'RemoteAuthServer',
+    'RemoteHttpOptions', 'RemoteHttpServer', 'SeenSet', 'ShutdownHost', 'TOOL_TEXT', 'ToolDeps',
+    'Topic', 'TopicNotAllowedError', 'UnsafePatternError', 'allowlistFor', 'asBackendMsgId',
+    'asCursor', 'asHandle', 'asTopic', 'assertKnownConfigKeys', 'buildBridge', 'buildMessage',
+    'buildReactiveServer', 'catchUpAll', 'catchUpTopic', 'channelMeta', 'createOAuthRemoteApp',
+    'createOidcRemoteApp', 'createRemoteAuthApp', 'createRemoteHttpApp', 'createStdioBridge',
+    'defaultReadStatePath', 'emitChannel', 'fetchOidcDiscovery', 'fetchRecentBlocking',
+    'hashOwnerSecret', 'installShutdown', 'instanceIdOf', 'isFetchAbortedError',
+    'isNoSuchTopicError', 'loadConfig', 'makeOwnerVerifier', 'ownerVerifierFromPassphrase',
+    'parseArgs', 'parseConfig', 'parseMentions', 'registerTools', 'runBackendCli', 'safeName',
+    'startFakeOidc', 'startPushLoop', 'toolDepsFor', 'usageFor',
   ] as const;
 
   it.each(trimmed)('still defines the trimmed internal %s somewhere in src', (name) => {
@@ -71,9 +71,21 @@ describe('public barrel surface', () => {
     expect((api as Record<string, unknown>)[name]).toBeUndefined();
   });
 
-  it.each(kept)('still re-exports the kept symbol %s', (name) => {
-    expect(name in api).toBe(true);
-    expect((api as Record<string, unknown>)[name]).toBeDefined();
+  // Runtime bindings plus the barrel's own type-only export clauses: a `.d.ts` name is semver
+  // surface with no runtime key to enumerate.
+  const published = (): string[] => {
+    const barrel = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+    const names = new Set<string>(Object.keys(api));
+    for (const clause of barrel.matchAll(/export\s+(?:type\s+)?\{([^}]*)\}/g))
+      for (const spec of clause[1]!.split(',')) {
+        const name = spec.replace(/^\s*type\s+/, '').split(/\s+as\s+/).pop()?.trim();
+        if (name) names.add(name);
+      }
+    return [...names].sort();
+  };
+
+  it('publishes exactly this surface, and nothing more', () => {
+    expect(published()).toEqual([...SURFACE]);
   });
 });
 

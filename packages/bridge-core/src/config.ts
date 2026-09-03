@@ -4,11 +4,11 @@ import { z } from 'zod';
 import { AuthSchema } from './config-auth.js';
 import {
   assertNoBackendKey,
+  assertNoPresenceKey,
   describeDocument,
   issueLines,
   messageOf,
 } from './config-diagnostics.js';
-import { MAX_HANDLE_LEN } from './message.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
@@ -16,9 +16,10 @@ import { MAX_TIMER_MS } from './timer-bounds.js';
 export * from './config-auth.js';
 
 /**
- * Most `topics` one config may carry. Each entry is a live subscription the push loop opens against
- * the backend and an allowlist entry every call is matched against, so this bounds the fan-out a
- * single bridge asks a backend for.
+ * Most `topics` one config may carry. Every entry is an allowlist entry, matched against the topic
+ * of every `post` / `fetch_recent` that reaches the tools; where `live_push.enabled` is set, the
+ * push loop also opens one subscription per entry. So this bounds the allowlist a bridge carries,
+ * and with live push on, the subscription fan-out it asks a backend for.
  */
 export const MAX_TOPICS = 64;
 
@@ -40,6 +41,13 @@ export const MAX_POST_TOPICS = 64;
  * name is short.
  */
 export const MAX_TOPIC_LEN = 512;
+
+/**
+ * Longest `identity.handle` the loader accepts. Core hands the configured handle to `post` on every
+ * write, so an unbounded string reaches whichever backends carry a logical sender. A real handle is
+ * short.
+ */
+export const MAX_HANDLE_LEN = 128;
 
 /**
  * Longest server-side clamp `catchup.block_max_ms` may name. A blocked `parley_fetch_recent` holds
@@ -75,17 +83,13 @@ const ConfigObject = z.object({
       }),
     })
     .strict(),
-  /**
-   * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped because each
-   * entry is a live subscription the push loop opens against the backend AND an allowlist entry
-   * every `post`/`fetch_recent` is matched against, so the count bounds the fan-out a single bridge
-   * asks for.
-   */
+  /** Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped; MAX_TOPICS
+   *  in this module carries the bound and what it covers. */
   topics: z
     .array(topicString)
     .min(1)
     .max(MAX_TOPICS, {
-      message: `topics accepts at most ${MAX_TOPICS} entries: each one is a live subscription and an allowlist entry`,
+      message: `topics accepts at most ${MAX_TOPICS} entries: each one is an allowlist entry every post/fetch is matched against (and, with live_push.enabled, a subscription)`,
     }),
   /**
    * Extra topics allowed for `post`/`fetch_recent` ONLY, as full-match regex sources (anchored
@@ -157,7 +161,7 @@ const ConfigObject = z.object({
 
 /**
  * Unknown keys are a load error, not silently dropped: a misspelled `live_push.enable` or
- * `presense:` would otherwise leave the operator with a bridge that quietly does nothing.
+ * `catchup.limitt` would otherwise leave the operator with a bridge that quietly does nothing.
  * `backend_config` stays open — it is opaque to core (DESIGN §11).
  */
 const StrictConfigObject = ConfigObject.strict();
@@ -232,6 +236,7 @@ export type ParleyConfig = z.infer<typeof ConfigSchema>;
 /** Validate + default a raw config object (already parsed from YAML/JSON). */
 export function parseConfig(raw: unknown): ParleyConfig {
   assertNoBackendKey(raw);
+  assertNoPresenceKey(raw);
   return ConfigSchema.parse(raw);
 }
 

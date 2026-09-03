@@ -45,7 +45,8 @@ const connectPlugin = async (): Promise<DiscordPlugin> => {
 };
 
 /** Ladder charges so far: {@link chargeDialAttempt} bumps this on every dial it paces. */
-const chargesOf = (plugin: DiscordPlugin): number => probe(plugin, 'reconnectAttempts');
+const chargesOf = (plugin: DiscordPlugin): number =>
+  probe(probe<object>(plugin, 'gateway'), 'reconnectAttempts');
 
 /**
  * Advance `totalMs` of simulated time, applying `drive` once to every socket the plugin opens.

@@ -150,17 +150,12 @@ describe('every fire-and-forget statement in engine/ + transport/ is a known one
 });
 
 /**
- * The harness itself has to be able to produce the input it advertises. A synchronous throw
- * re-wrapped in an `async` function silently degrades to an ordinary rejection, which is how a
- * sync-throw row can sit in a table for rounds while never once exercising the class it names.
+ * The harness itself has to be able to produce the input it advertises. A shape that silently
+ * degrades to an ordinary rejection is how a row can sit in a table for rounds while never once
+ * exercising the class it names.
  */
 describe('the failure-shape fixtures are what they claim', () => {
-  const SYNC: FailureShape[] = ['rejects synchronously', 'throws a non-Error synchronously'];
   const ASYNC: FailureShape[] = ['rejects', 'rejects with a non-Error'];
-
-  it.each(SYNC)('%s really throws before returning a promise', (shape) => {
-    expect(() => FAILURE_SHAPES[shape](Promise.resolve())).toThrow();
-  });
 
   it.each(ASYNC)('%s returns a promise rather than throwing', async (shape) => {
     let pending: Promise<unknown> | undefined;

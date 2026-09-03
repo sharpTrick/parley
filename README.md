@@ -271,7 +271,7 @@ a real account:
 | `identity.handle` | *(required)* | This instance's logical name; what peers `@mention`. |
 | `instance_id` | `identity.handle` | **Read-state namespace.** Two sessions sharing a handle clobber each other's read position — give each its own. Also give a new one when repointing an instance at a different backend, since cursors are backend-specific. |
 | `state_path` | `$XDG_STATE_HOME/parley/<instance>/read-state.json` | Where that cursor file lives. |
-| `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** Capped at **64 topics**: each one is a live subscription the push loop opens and an allowlist entry every call is matched against. |
+| `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** Capped at **64 topics**: each one is an allowlist entry every `post`/`fetch_recent` is matched against, and — with `live_push.enabled` — a live subscription too. |
 | `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or caught up on. Patterns are screened for catastrophic backtracking at load, capped at **64 patterns** (every post/fetch matches its topic against all of them), and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
 | `catchup.on_start` | `true` | Drain everything newer than the stored cursor at startup. |
 | `catchup.limit` | `100` | Page size per `fetchRecent`. |

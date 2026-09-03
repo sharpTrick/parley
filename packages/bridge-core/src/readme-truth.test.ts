@@ -37,14 +37,35 @@ function sourceFiles(dir = HERE): string[] {
   });
 }
 
-/** Wherever the ceiling is stated in prose, with the number it states. */
+/** Wherever the pattern-match input clamp is stated in prose, with the number it states. */
 const CEILING_CLAIM = /topics of at most (\d+) characters/g;
+/** Wherever the longest topic the loader accepts is stated, with the number it states. */
+const TOPIC_LEN_CLAIM = /`?(?:config\.)?topics`?[^.]*?accepts?[^.]*?up to (\d+)/g;
 
 /** Join wrapped prose so a claim keeps matching when a doc comment is re-flowed around it. */
 const unwrapped = (text: string): string => text.replace(/\n[ \t]*(?:\*|#)?[ \t]*/g, ' ');
 
-const claimedCeilings = (text: string): number[] =>
-  [...unwrapped(text).matchAll(CEILING_CLAIM)].map((m) => Number(m[1]));
+const claimed = (text: string, claim: RegExp): number[] =>
+  [...unwrapped(text).matchAll(claim)].map((m) => Number(m[1]));
+
+const claimedCeilings = (text: string): number[] => claimed(text, CEILING_CLAIM);
+
+/**
+ * CLASS: a numeric ceiling this package ENFORCES and also states in prose. The match clamp was
+ * graded alone, so `MAX_TOPIC_LEN` could move without a single surface reddening — the README goes
+ * on saying 512 while the loader accepts something else. One row per enforced ceiling; the floor is
+ * how many surfaces state it, so a rewording that erases the claim fails rather than grading
+ * nothing.
+ */
+const CEILINGS: readonly (readonly [
+  label: string,
+  enforced: number,
+  claim: RegExp,
+  surfaces: number,
+])[] = [
+  ['the pattern-match input clamp', MAX_MATCH_INPUT, CEILING_CLAIM, 6],
+  ['the longest topic the loader accepts', MAX_TOPIC_LEN, TOPIC_LEN_CLAIM, 2],
+] as const;
 
 describe("the README's config sample is executed, not transcribed", () => {
   it('ships exactly one sample carrying post_topics', () => {
@@ -110,15 +131,18 @@ describe("the README's `post_topics` widening is true at every length it is reac
 });
 
 describe('the ceiling is stated wherever the widening is promised', () => {
-  it('states the enforced number and no other, everywhere it is stated', () => {
-    const surfaces = [README, ...sourceFiles().map((f) => readFileSync(f, 'utf8'))];
-    const stated = surfaces.flatMap(claimedCeilings);
-    expect(
-      stated.length,
-      'the ceiling claim matched fewer surfaces than it was written against — reworded, or gone',
-    ).toBeGreaterThanOrEqual(6);
-    for (const n of stated) expect(n).toBe(MAX_MATCH_INPUT);
-  });
+  it.each(CEILINGS)(
+    '%s: states the enforced number and no other, everywhere it is stated',
+    (_label, enforced, claim, floor) => {
+      const surfaces = [README, ...sourceFiles().map((f) => readFileSync(f, 'utf8'))];
+      const stated = surfaces.flatMap((text) => claimed(text, claim));
+      expect(
+        stated.length,
+        'the ceiling claim matched fewer surfaces than it was written against — reworded, or gone',
+      ).toBeGreaterThanOrEqual(floor);
+      for (const n of stated) expect(n).toBe(enforced);
+    },
+  );
 
   it('states it on the operator-facing page, at the sample and at the Allowlist rule', () => {
     expect(claimedCeilings(README).length).toBeGreaterThanOrEqual(2);

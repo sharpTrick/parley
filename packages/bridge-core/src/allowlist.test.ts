@@ -3,9 +3,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it } from 'vitest';
 import { Allowlist, allowlistFor, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
-import { MAX_POST_TOPICS, parseConfig } from './config.js';
+import { MAX_POST_TOPICS, MAX_TOPIC_LEN, parseConfig } from './config.js';
 import { MAX_MATCH_INPUT } from './regex-safety.js';
-import { ANCHORING_CASES, ANCHORING_LENGTH_CASES } from './testing/anchoring-corpus.js';
 import { FakePlugin } from './testing/fake-plugin.js';
 import { registerTools, toolDepsFor } from './transport/tools.js';
 
@@ -128,6 +127,63 @@ describe('allowlistFor wires a parsed config to the boundary', () => {
   });
 });
 
+/**
+ * The (pattern source, candidate topic, is-a-full-match) rows the `Allowlist` — the one site in this
+ * repository that compiles a regex source it did not author — is graded against.
+ *
+ * Dropping the `^(?:…)$` wrapper turns a pattern advertising `ops` into one that admits
+ * `my-ops-secret`.
+ */
+const ANCHORING_CASES: readonly (readonly [
+  label: string,
+  source: string,
+  input: string,
+  fullMatch: boolean,
+])[] = [
+  ['bare substring must not match a longer topic', 'ops', 'my-ops-secret', false],
+  ['bare substring matches only itself', 'ops', 'ops', true],
+  ['leading substring must not match its extension', 'my', 'my-ops', false],
+  ['trailing substring must not match its extension', 'ops', 'the-ops', false],
+  ['a prefix pattern matches what it spans', 'my-.*', 'my-ops', true],
+  ['a prefix pattern does not match past its prefix', 'my-.*', 'not-my-ops', false],
+  ['unanchored alternation must not match a substring hit', 'a|b', 'xax', false],
+  ['unanchored alternation matches a whole branch', 'a|b', 'b', true],
+  ['an already-anchored source still matches itself', '^x$', 'x', true],
+  ['an already-anchored source does not match a superstring', '^x$', 'yxy', false],
+  ['an empty alternation branch does not match arbitrary text', 'a|', 'zz', false],
+  ['match-everything really does match everything', '.*', 'anything-at-all', true],
+] as const;
+
+/**
+ * The INPUT-LENGTH axis of the same rule, kept separate so the membership pin below still grades
+ * the hand-written rows by value.
+ *
+ * Every row above is comfortably under {@link MAX_MATCH_INPUT}, so the rule was graded only inside
+ * the region an anchoring bug and a clamp bug look alike in: the config schema accepts a topic far
+ * longer than the match clamp, so the disagreeing region is reachable by an ordinary deployment,
+ * not only by an attacker.
+ *
+ * Every source here matches its input at EVERY length listed, so the verdict is decided by the
+ * length rule alone: a site that clamps instead of refusing answers the boundary differently rather
+ * than answering a case nobody sampled.
+ */
+const ANCHORING_LENGTH_CASES: readonly (readonly [
+  label: string,
+  source: string,
+  input: string,
+  fullMatch: boolean,
+])[] = ['.*', 'ops-.*', '[a-z0-9-]+'].flatMap((source) =>
+  [4, MAX_MATCH_INPUT - 1, MAX_MATCH_INPUT, MAX_MATCH_INPUT + 1, MAX_TOPIC_LEN].map(
+    (length) =>
+      [
+        `${source} against a ${length}-character topic`,
+        source,
+        `ops-${'a'.repeat(length - 4)}`,
+        length <= MAX_MATCH_INPUT,
+      ] as const,
+  ),
+);
+
 // `Allowlist` is public API: an embedder can construct one with patterns that never went through
 // parseConfig, and `has` is then driven by a caller-supplied topic. Screen at BOTH ends — refuse
 // the hostile source at construction, and bound the input the survivors ever see.
@@ -239,19 +295,21 @@ describe('Allowlist pattern safety', () => {
     expect(notMatch.filter((t) => allow.has(t))).toEqual([]);
   });
 
-  // The rows above are written here; the shared corpus is written once for every site in the
-  // repository that compiles a source it did not author, so an entry point that starts anchoring
-  // differently reddens against the SAME expectations its neighbours are held to. Pin the corpus
-  // membership by value — a generated table cannot see a row deleted from the list generating it,
-  // and the substring rows are exactly the ones an unanchored compile would let through.
+  // The rows above are the alternation/anchor shapes; the corpus above the describe carries the
+  // substring and input-length rows, replayed through every entry point that compiles a source it
+  // did not author. Pin its membership by value — a generated table cannot see a row deleted from
+  // the list generating it, and the substring rows are exactly the ones an unanchored compile
+  // would let through.
   const CORPUS = [...ANCHORING_CASES, ...ANCHORING_LENGTH_CASES];
 
-  it('pins the shared corpus membership', () => {
+  it('pins the corpus membership', () => {
     expect(ANCHORING_CASES.length).toBe(12);
     expect(ANCHORING_CASES.filter(([, , , full]) => !full).length).toBe(7);
-    // The length axis has to straddle the bound in both directions, or it grades one side twice.
-    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => full).length).toBeGreaterThan(0);
-    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => !full).length).toBeGreaterThan(0);
+    // The length axis is generated, so a shrunk generator drops rows with nothing to fail. Pin it
+    // by value like the hand-written half, straddling the bound in both directions.
+    expect(ANCHORING_LENGTH_CASES.length).toBe(15);
+    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => full).length).toBe(9);
+    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => !full).length).toBe(6);
   });
 
   it.each(

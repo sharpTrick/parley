@@ -6,11 +6,18 @@ import { Allowlist, TopicNotAllowedError } from './allowlist.js';
 import { MAX_CLIENTS, MAX_PENDING, shedCrowdedest } from './auth/eviction.js';
 import { ParleyOAuthProvider } from './auth/oauth-provider.js';
 import { DISCOVERY_TIMEOUT_MS, fetchOidcDiscovery } from './auth/oidc-discovery.js';
-import { MAX_BLOCK_MS, MAX_POST_TOPICS, MAX_TOPIC_LEN, MAX_TOPICS, parseConfig } from './config.js';
+import {
+  MAX_BLOCK_MS,
+  MAX_HANDLE_LEN,
+  MAX_POST_TOPICS,
+  MAX_TOPIC_LEN,
+  MAX_TOPICS,
+  parseConfig,
+} from './config.js';
 import { catchUpTopic, MAX_CATCHUP_PAGES } from './engine/catchup.js';
 import { ReadStateStore } from './engine/read-state.js';
 import { SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, SeenSet } from './engine/seen-set.js';
-import { asBackendMsgId, asCursor, asHandle, asTopic, MAX_HANDLE_LEN } from './message.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic } from './message.js';
 import {
   isRedosSafeSource,
   MAX_AMBIGUITY,
@@ -255,7 +262,7 @@ const CAPACITIES: Capacity[] = [
     name: 'MAX_TOPICS',
     actual: MAX_TOPICS,
     expected: 64,
-    realistic: 'a bridge configured for 64 topics subscribes to all 64',
+    realistic: 'a bridge configured for 64 topics loads and allowlists all 64',
     accepts: () =>
       parseConfig({ identity: { handle: 'h' }, topics: ctxTopics(64) }).topics.length === 64,
     refusesPast: () =>

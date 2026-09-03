@@ -3,6 +3,7 @@
  * of its issues, which names neither the file nor the shape expected — and the whole-file failure is
  * the first one an operator hits.
  */
+import { z } from 'zod';
 
 export const messageOf = (err: unknown): string =>
   err instanceof Error ? err.message : String(err);
@@ -45,4 +46,23 @@ export function assertNoBackendKey(raw: unknown): void {
       `not by config — run \`${suggestion}\` (each backend package ships its own bin). ` +
       'Remove `backend:` from the config file.',
   );
+}
+
+/**
+ * Reject a retired `presence:` key rather than letting `.strict()` report it as an unrecognized
+ * one, so that an operator upgrading from a release where it was default-on reads a removal instead
+ * of a suspected typo. Carries the key's own path, so the rendered diagnostic names `presence`
+ * rather than the whole document.
+ */
+export function assertNoPresenceKey(raw: unknown): void {
+  if (typeof raw !== 'object' || raw === null || !('presence' in raw)) return;
+  throw new z.ZodError([
+    {
+      code: z.ZodIssueCode.custom,
+      path: ['presence'],
+      message:
+        'presence was removed: there is no roster, no heartbeat topic and no parley_list_users ' +
+        'tool for it to configure. Delete the `presence:` block from the config file.',
+    },
+  ]);
 }

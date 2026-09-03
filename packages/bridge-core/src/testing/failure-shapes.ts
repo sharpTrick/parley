@@ -1,7 +1,10 @@
 /**
- * Every SHAPE a seam call's failure can arrive in. The seam signature says `Promise<…>`, but a
- * plugin may implement it as a plain function that validates its arguments and throws BEFORE
- * returning one, and it may reject with a non-Error. Core has to absorb all of them identically.
+ * Every SHAPE a seam call's failure can arrive in AT A FIRE-AND-FORGET SITE. Core has to absorb all
+ * of them identically, and it may reject with a non-Error or never settle at all.
+ *
+ * A synchronous throw is not among them: every surviving site wraps the call in an `async` function,
+ * which converts a sync throw into a rejection before the `void … .catch()` sees it, so a sync shape
+ * would be an async twin that can never fail on its own.
  *
  * Each shape ignores the real call's result, so the same table drives any seam call regardless of
  * what it resolves to.
@@ -10,12 +13,6 @@ export const FAILURE_SHAPES = {
   rejects: (_real: Promise<unknown>): Promise<never> => Promise.reject(new Error('seam boom')),
   'rejects with a non-Error': (_real: Promise<unknown>): Promise<never> =>
     Promise.reject('seam boom (string)'),
-  'rejects synchronously': (_real: Promise<unknown>): Promise<never> => {
-    throw new Error('seam boom (sync)');
-  },
-  'throws a non-Error synchronously': (_real: Promise<unknown>): Promise<never> => {
-    throw 'seam boom (sync, string)';
-  },
   'never settles': (_real: Promise<unknown>): Promise<never> => new Promise<never>(() => {}),
 } as const;
 

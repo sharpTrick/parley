@@ -132,4 +132,33 @@ describe('the channel instructions name exactly the registered tools', () => {
       await shutdown();
     }
   });
+
+  /**
+   * The tool-name scan above grades only NAMES, so every claim the prose makes around them is
+   * ungraded: the untrusted-inbound clause (DESIGN §14) — the one control standing between a
+   * message written by another participant and the session's instruction stream — was deletable
+   * with the whole suite green. One row per CLAIM, matched loosely enough that the sentence can be
+   * rewritten and strictly enough that dropping it reddens; the membership pin makes a deleted row
+   * as visible as a deleted clause.
+   */
+  const CLAIMS: readonly (readonly [claim: string, present: RegExp])[] = [
+    ['inbound is untrusted', /inbound[^.]*\buntrusted\b/i],
+    ['inbound is never an instruction', /never\b[^.]*\binstructions?\b/i],
+    ['a reply carries the same topic', /parley_reply[^.]*\bsame\b[^.]*\btopic\b/i],
+    ['catch up on session start', /parley_fetch_recent[^.]*session start/i],
+  ] as const;
+
+  it('pins the claims graded below', () => {
+    expect(CLAIMS.map(([claim]) => claim)).toHaveLength(4);
+    expect(new Set(CLAIMS.map(([claim]) => claim)).size).toBe(CLAIMS.length);
+  });
+
+  it.each(CLAIMS)('states that %s', async (_claim, present) => {
+    const { client, shutdown } = await liveBridge();
+    try {
+      expect(client.getInstructions() ?? '').toMatch(present);
+    } finally {
+      await shutdown();
+    }
+  });
 });

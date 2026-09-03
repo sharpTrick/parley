@@ -274,7 +274,8 @@ describe('a socket that ends releases its own heartbeat, before any disconnect()
   const HB = 10_000;
   const TOPIC = asTopic('c11');
 
-  const heartbeatsOf = (plugin: DiscordPlugin): Set<unknown> => probe(plugin, 'heartbeats');
+  const heartbeatsOf = (plugin: DiscordPlugin): Set<unknown> =>
+    probe(probe<object>(plugin, 'gateway'), 'heartbeats');
 
   /** How one socket ends, and whether the ladder is expected to bring another one back. */
   const ENDINGS: Array<{ label: string; end: (ws: FakeWs) => Promise<void>; retries: boolean }> = [

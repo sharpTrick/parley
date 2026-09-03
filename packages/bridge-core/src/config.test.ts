@@ -9,7 +9,6 @@ import {
   loadConfig,
   MAX_BLOCK_MS,
   parseConfig,
-  type ParleyConfig,
 } from './config.js';
 import { parseMentions } from './mentions.js';
 import { HANDLE_CANDIDATES } from './testing/handle-corpus.js';
@@ -671,60 +670,21 @@ describe('mention_filter requires a mentionable handle', () => {
 
 // This module refuses `permissions.skip_permissions: true` and every unknown key on one argument:
 // a setting nothing reads leaves the operator with a bridge that quietly does nothing.
-// `live_push.mention_filter` is that argument one level in: nothing reads it while
-// `live_push.enabled` is off, so it has to be a LOAD ERROR there rather than an accepted no-op.
-// `probe` is what establishes that nothing reads it — the row can only pass by being refused.
-describe('live_push.mention_filter is refused beneath a disabled live_push.enabled', () => {
-  interface DependentKnob {
-    path: readonly string[];
-    base: Record<string, unknown>;
-    set: Record<string, unknown>;
-    probe: (cfg: ParleyConfig) => unknown;
-  }
-
-  const NOTHING_READS_IT = Symbol('no reader while the enabler is off');
-
-  const KNOBS: readonly (readonly [label: string, knob: DependentKnob])[] = [
-    [
-      'live_push.mention_filter under live_push.enabled',
-      {
-        path: ['live_push', 'mention_filter'],
-        base: { live_push: { enabled: false } },
-        set: { live_push: { enabled: false, mention_filter: true } },
-        probe: () => NOTHING_READS_IT,
-      },
-    ],
-  ] as const;
-
-  const load = (extra: Record<string, unknown>): ParleyConfig =>
+// `live_push.mention_filter` is that argument one level in: nothing on the reactive path reads it,
+// so beneath a disabled `live_push.enabled` it has to be a LOAD ERROR rather than an accepted no-op.
+it('refuses live_push.mention_filter beneath a disabled live_push.enabled', () => {
+  let issuePaths: unknown[][] = [];
+  try {
     parseConfig({
       identity: { handle: 'h' },
       topics: ['ctx'],
       post_topics: ['.*'],
-      ...extra,
+      live_push: { enabled: false, mention_filter: true },
     });
-
-  it('pins the knob and confirms nothing reads it while the enabler is off', () => {
-    expect(KNOBS.map(([label]) => label)).toEqual([
-      'live_push.mention_filter under live_push.enabled',
-    ]);
-    expect(KNOBS.filter(([, k]) => k.probe(load(k.base)) === NOTHING_READS_IT).length).toBe(1);
-  });
-
-  it.each(KNOBS)('%s', (_label, knob) => {
-    let withKnob: ParleyConfig | undefined;
-    let issuePaths: unknown[][] = [];
-    try {
-      withKnob = load(knob.set);
-    } catch (e) {
-      issuePaths = (e as { issues?: { path: unknown[] }[] }).issues?.map((i) => i.path) ?? [];
-    }
-    if (withKnob === undefined) {
-      expect(issuePaths).toContainEqual([...knob.path]);
-      return;
-    }
-    expect(knob.probe(withKnob)).not.toEqual(knob.probe(load(knob.base)));
-  });
+  } catch (e) {
+    issuePaths = (e as { issues?: { path: unknown[] }[] }).issues?.map((i) => i.path) ?? [];
+  }
+  expect(issuePaths).toContainEqual(['live_push', 'mention_filter']);
 });
 
 // An error message shaped as a command is a command an operator will paste, and `backend:` is the one
@@ -819,6 +779,47 @@ describe('no config value reaches a runnable suggestion', () => {
 
   it.each(FIELD_ROWS)('never renders %s as a command', (_label, raw) => {
     for (const span of runnableSpans(messageFor(raw))) expect(span).not.toMatch(NOT_A_COMMAND);
+  });
+});
+
+// CLASS: a key this loader once shipped and has since retired. `.strict()` reports one as
+// "Unrecognized key(s) in object", rendered at `(document)` scope — a typo diagnosis, for a key an
+// upgrading operator copied out of a config that used to work. Every retirement therefore owes the
+// operator a diagnostic that names the key's own path and says it was removed; grade the set, so
+// the next retirement is graded the day it lands rather than the round after.
+describe('a retired config key is refused by name, not as a suspected typo', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-retired-'));
+  const RETIRED = [
+    ['backend', 'backend: local-sqlite\n', /`backend` is not a supported field/],
+    ['permissions.skip_permissions', 'permissions:\n  skip_permissions: true\n', /not implemented/],
+    ['presence', 'presence:\n  enabled: true\n', /presence was removed[\s\S]*parley_list_users/],
+  ] as const;
+
+  const BASE = 'identity:\n  handle: ctx\ntopics:\n  - ctx\n';
+  const write = (name: string, text: string): string => {
+    const path = join(dir, `${name}.yaml`);
+    writeFileSync(path, text);
+    return path;
+  };
+
+  it('the base config loads (positive control: the rows cannot pass by throwing always)', () => {
+    expect(loadConfig(write('base', BASE)).topics).toEqual(['ctx']);
+  });
+
+  it.each(RETIRED)('%s', (key, yaml, matcher) => {
+    let thrown: unknown;
+    try {
+      loadConfig(write(key.replace(/\./g, '-'), BASE + yaml));
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown, `${key} was accepted`).toBeInstanceOf(Error);
+    const rendered = (thrown as Error).message;
+    expect(rendered, 'the diagnostic must name the retired key by its own path').toContain(key);
+    expect(rendered, 'rendered at document scope, which reads as a typo in the file').not.toContain(
+      '(document)',
+    );
+    expect(rendered).toMatch(matcher);
   });
 });
 
