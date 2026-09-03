@@ -19,23 +19,22 @@ const SRC = readdirSync(fileURLToPath(new URL('.', import.meta.url)), { recursiv
 
 describe('public barrel surface', () => {
   // The consumer-free internals kept out of the barrel. These stay defined in their own
-  // modules (engine/presence.ts, identity-filter.ts, transport/tools.ts) for in-package callers,
+  // modules (config.ts, regex-safety.ts, engine/seen-set.ts, transport/) for in-package callers,
   // reached via relative imports — but must never be reachable through the public entry.
   const trimmed = [
-    'matchGlob',
-    'filterHandles',
-    'MAX_RECORD_TOPICS',
-    'MAX_INSTANCE_ID_LEN',
-    'encodePresence',
-    'decodePresence',
-    'computeRoster',
+    'MAX_TOPICS',
+    'MAX_POST_TOPICS',
+    'MAX_FETCH_LIMIT',
+    'SEEN_MAX_PER_TOPIC',
+    'isRedosSafeSource',
+    'describeAllowed',
+    'topicSchema',
   ] as const;
 
-  // A representative slice of the deliberate kept surface (seam, config, engine, presence
-  // default/types, composition roots).
+  // A representative slice of the deliberate kept surface (seam, config, engine, composition
+  // roots).
   const kept = [
     'registerTools',
-    'DEFAULT_PRESENCE_TOPIC',
     'asTopic',
     'asHandle',
     'asBackendMsgId',
@@ -412,7 +411,7 @@ describe('shipped JSDoc never links a value the barrel withholds', () => {
 
   /**
    * The mirror of the rule above: a type the barrel ships that no shipped function names at all. It
-   * is not merely useless — a consumer who can name `RosterEntry` but cannot obtain, parse or hand
+   * is not merely useless — a consumer who can name a result type but cannot obtain, parse or hand
    * one back reaches into this package's unpublished `src/` to work around it, which `files: ["dist"]`
    * does not even publish. Derive the pairs from the barrel's own `engine/`/`transport/` clauses, so
    * the next type added there without a producer fails here without anyone naming it.

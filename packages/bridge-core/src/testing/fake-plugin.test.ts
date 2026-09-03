@@ -7,9 +7,9 @@ import { FakePlugin } from './fake-plugin.js';
  * A shared fake that implements a seam clause BACKWARDS is worse than no coverage: every test built
  * on it stays green while grading the opposite of production. That is what happened here — a
  * since-less `fetchRecent` answered with the OLDEST page while `seam.ts` ("the backend's default
- * recent window") and every shipped backend answer with the NEWEST, so the roster and cold-start
- * catch-up were both graded at the wrong end of history, and the one grid that needed the real
- * clause had to carry its own private fake to get it.
+ * recent window") and every shipped backend answer with the NEWEST, so cold-start catch-up was
+ * graded at the wrong end of history, and the one grid that needed the real clause had to carry its
+ * own private fake to get it.
  *
  * The conformance suite already grades this clause against every shipped plugin; core's fake is the
  * half that sits outside it, so it is graded here against the same clause.
@@ -25,8 +25,8 @@ describe('FakePlugin implements the seam clauses core tests rely on', () => {
     return p;
   }
 
-  // (messages posted, page size) — straddling the limit in both directions, and at the sizes the
-  // roster actually runs at (`PRESENCE_FETCH_LIMIT` is 500).
+  // (messages posted, page size) — straddling the limit in both directions, at a page size a
+  // caller-driven fetch can actually ask for.
   it.each([
     [501, 500],
     [500, 500],
@@ -66,9 +66,9 @@ describe('FakePlugin implements the seam clauses core tests rely on', () => {
 
 /**
  * A fake that keeps serving after `disconnect()` cannot fail the way a backend fails, so every core
- * test grading teardown ORDERING is graded against something with no opinion about it: a presence
- * goodbye posted onto a closed connection still lands, and the swallowed error nobody would ever see
- * in production is a green row here. The conformance suite's reference plugin refuses the call, and
+ * test grading teardown ORDERING is graded against something with no opinion about it: a post onto
+ * a closed connection still lands, and the swallowed error nobody would ever see in production is a
+ * green row here. The conformance suite's reference plugin refuses the call, and
  * so does every shipped backend.
  *
  * The rule is over every BackendPlugin implementation bridge-core defines — found by importing the

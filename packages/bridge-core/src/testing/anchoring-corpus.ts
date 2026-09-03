@@ -1,15 +1,12 @@
-import { MAX_TOPIC_LEN } from '../engine/presence-beat.js';
+import { MAX_TOPIC_LEN } from '../topic-name.js';
 import { MAX_MATCH_INPUT } from '../regex-safety.js';
 
 /**
  * The ONE corpus of (pattern source, candidate topic, is-a-full-match) rows every site that compiles
  * a regex source it did not author is graded against.
  *
- * Core anchors an untrusted source in exactly two places — the {@link Allowlist}'s `post_topics` and
- * `filterReachable`'s peer `postTopics` — and only the first was pinned, so dropping the `^(?:…)$`
- * wrapper from the second (the one fed by ATTACKER-supplied sources, where a peer advertising `ops`
- * would be reported as able to post into `my-ops-secret`) left the whole suite green. Anchoring is
- * one rule; grading it in one place per site is how the two drift apart.
+ * Core anchors an untrusted source in the {@link Allowlist}'s `post_topics`. Dropping the `^(?:…)$`
+ * wrapper turns a pattern advertising `ops` into one that admits `my-ops-secret`.
  *
  * Keep this list single, so that a new anchoring site is registered against it rather than pinned by
  * a fresh copy that starts identical and stops being so.
@@ -40,9 +37,8 @@ export const ANCHORING_CASES: readonly (readonly [
  *
  * Every row above is comfortably under {@link MAX_MATCH_INPUT}, so the sites were graded only
  * inside the region they happened to agree in: one refused an over-long topic outright while the
- * other matched its 64-character PREFIX, and `parley_list_users` reported peers as reachable on
- * topics they could not post to. The config schema accepts a topic far longer than that, so the
- * disagreeing region is reachable by an ordinary deployment, not only by an attacker.
+ * other matched its 64-character PREFIX. The config schema accepts a topic far longer than that, so
+ * the disagreeing region is reachable by an ordinary deployment, not only by an attacker.
  *
  * Every source here matches its input at EVERY length listed, so the verdict is decided by the
  * length rule alone: a site that clamps instead of refusing answers the boundary differently rather

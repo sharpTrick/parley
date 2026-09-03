@@ -74,9 +74,8 @@ fixture uses this mode against a stable `#parley_conformance:parley.local`.
 
 > **Security — `shared_room` is test-only.** The `app.parley.topic` tag is **untrusted,
 > member-writable** event content: Matrix enforces no integrity on custom content keys, so any member
-> of the shared room can forge the tag and post a message that lands in whatever topic it names —
-> including the reserved presence topic (a forged well-formed record then enters the roster under the
-> sender's own homeserver-stamped handle). Inbound data thus chooses the topic/allowlist bucket. So
+> of the shared room can forge the tag and post a message that lands in whatever topic it names.
+> Inbound data thus chooses the topic/allowlist bucket. So
 > `shared_room` **MUST NOT** carry mutually-distrusting topics; use it only for test fixtures and
 > rate-limited single-tenant deployments. **Production leaves `shared_room` unset**, giving one
 > physically separate room per topic, where the tag is ignored and the room is the isolation boundary.
@@ -88,8 +87,7 @@ guessable, and Synapse federates by default. Note that `visibility: 'private'` o
 from the **room directory** — it does not restrict joins; the **join rule** does. So topic rooms are
 created with `preset: private_chat` → `join_rule: invite`: an uninvited account cannot read a
 topic's history, and cannot post messages that core would deliver into a live Claude Code session as
-`<channel>` events (the prompt-injection surface DESIGN §14 says to minimize), nor inject peers into
-the presence roster.
+`<channel>` events (the prompt-injection surface DESIGN §14 says to minimize).
 
 Bring the accounts you *do* want in via `invite`. Set `room_preset: public_chat` only when you
 deliberately want a room anyone on the homeserver can join.
@@ -124,7 +122,7 @@ it does not degrade into an opaque `M_FORBIDDEN` from a later `/send` or `/messa
 | `sync_timeout_ms`  | `25000`                  | `/sync` long-poll timeout; a positive whole number of milliseconds, at most `2147453647` (anything else is a load error). Each `/sync` gets a transport deadline of this plus a full 30s call budget, so raising it does not make the homeserver's own answer look like a timeout — and the ceiling is exactly the largest value whose deadline still fits Node's `2^31 - 1` timer range, past which every timer clamps to 1ms and the live path would die blaming the homeserver. It is also the cadence at which a blocking `fetch_recent` re-checks by itself, so a very large value slows the safety net that covers a `/sync` loop stuck in retry backoff. A small value does not turn that safety net into a request storm: every park sleeps at least 250ms, and a `/sync` that answers faster than it long-polled for is paced. |
 | `shared_room`      | _(unset)_                | If set, all topics share this one room (see above). Production leaves this unset. `connect()` warns on stderr while it is set. |
 | `room_preset`      | `private_chat`           | `preset` for rooms this plugin creates. The default gives `join_rule: invite`. `public_chat` opts back in to a world-joinable room (see below), and `connect()` warns on stderr while it is set. These are the only two accepted — any other value is a load error. |
-| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares any room with this one — a listed topic, or the presence topic every presence-enabled bridge writes to; see "Multiple concurrent sessions". |
+| `invite`           | `[]`                     | MXIDs invited to rooms this plugin creates — how humans and other accounts get into an invite-only topic room. **Required** once a second account shares any topic room with this one; see "Multiple concurrent sessions". |
 
 Secrets live in `backend_config` / `.env`, never in code. Every key above that widens the trust
 boundary — the default password, a plaintext `http://` `homeserver_url` to a non-loopback host,
@@ -164,15 +162,10 @@ rule** — they should each be **different**:
   its live path delivers nothing. Since you cannot know which session gets there first, list the
   peers on **every** config — that is what the shipped examples below do. (Rooms that already exist
   are joined as they are, so `invite` cannot repair a room somebody else created without you.)
-- **`invite` covers every room a config *writes to*, not only the topics it lists.** Presence is on
-  by default (`presence.enabled: true`), and each bridge beats to the reserved presence topic
-  (`presence.topic`, default `parley-presence`) — which in production, one room per topic, is its
-  own invite-only room. Two sessions with entirely **disjoint** `topics` therefore still meet there,
-  and the one that did not create it is locked out **silently**: the presence loop swallows the
-  heartbeat's `M_FORBIDDEN`, so that session simply never appears in any peer's `parley_list_users`
-  roster and sees nothing in its own. So `invite` must list **every account running a
-  presence-enabled bridge on this homeserver**, whatever its topics — and likewise any account whose
-  `post_topics` patterns can reach a topic yours does.
+- **`invite` covers every room a config *writes to*, not only the topics it lists.** A `post_topics`
+  pattern reaches topics that never appear in `topics`, and posting to one creates (or joins) its
+  own invite-only room. So `invite` must also list every account whose `post_topics` patterns can
+  reach a topic yours does, not only the accounts that share a listed topic with you.
 
 Runnable multi-config examples (two Code sessions with distinct accounts + a remote/chat config,
 all sharing one homeserver): [`examples/multi-session/matrix`](../../examples/multi-session/README.md).

@@ -217,18 +217,12 @@ server — all pointed at the same workspace:
   Slack stamps the posting bot as the sender and `post` cannot override it, so
   sessions sharing one bot token are indistinguishable on read-back: every session's messages arrive
   under the one bot id, so neither a human reading the channel nor an agent reasoning over
-  `senderHandle` in its context can tell which session spoke. `parley_list_users` is **not** affected
-  — a presence beat carries its emitter's handle inside the record and core keys the roster on that,
-  with liveness scoped per random per-process instance id, so two sessions on one bot token still
-  appear as two peers with their own topics. Socket Mode allows ~10 concurrent connections per app
+  `senderHandle` in its context can tell which session spoke. Socket Mode allows ~10 concurrent connections per app
   token and each plugin instance holds ONE, but the connections are **not** parallel copies of the
   stream: Slack routes each payload to **exactly one** of an app's open connections, with no
   guaranteed pattern. Two sessions sharing an `app_token` therefore each receive an arbitrary subset
   of the live pushes — silent, per-session live-path loss that only catch-up repairs (the blocking
   `fetch_recent` ladder above bounds how long it goes unnoticed).
-- **`presence.topic`** — must be mapped in `channel_map` to a real channel id (or presence
-  disabled). The default `parley-presence` is not a channel id, so it resolves to a channel that
-  does not exist and the roster stays empty.
 - **`channel_map`** — the hidden splitter: the same topic mapped to different channel ids in two
   configs silently splits history in two. Keep the map identical everywhere.
 - **`api_url`** — leave defaulted in production; it exists for tests.

@@ -6,13 +6,7 @@ import type { RequestHandler } from 'express';
 import { describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../config.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import {
-  INITIALIZE,
-  MCP_HEADERS,
-  NO_PRESENCE,
-  mcpPost,
-  serveRemoteHttp,
-} from '../testing/http-app.js';
+import { INITIALIZE, MCP_HEADERS, mcpPost, serveRemoteHttp } from '../testing/http-app.js';
 import { createRemoteHttpApp, type RemoteHttpOptions } from './http.js';
 
 /**
@@ -22,7 +16,7 @@ import { createRemoteHttpApp, type RemoteHttpOptions } from './http.js';
  */
 
 const served = (opts: RemoteHttpOptions = {}): ReturnType<typeof serveRemoteHttp> =>
-  serveRemoteHttp(opts, NO_PRESENCE);
+  serveRemoteHttp(opts);
 
 describe('reactive HTTP: fail closed by default', () => {
   it('401s /mcp when neither protect nor insecureNoAuth is set (no-arg ≠ no-auth)', async () => {
@@ -47,7 +41,7 @@ describe('reactive HTTP: fail closed by default', () => {
   describe('every mounted method is gated, on every auth config', () => {
     const mountedMethods = (): string[] => {
       const p = new FakePlugin();
-      const cfg = parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'], presence: { enabled: false } });
+      const cfg = parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] });
       const { app } = createRemoteHttpApp(p, cfg, { insecureNoAuth: true });
       const layers = (app as unknown as { router: { stack: Array<{ route?: { path: string; methods: Record<string, boolean> } }> } })
         .router.stack;
@@ -228,7 +222,7 @@ describe('the insecure-no-auth endpoint answers only to the hosts it was configu
    *     collapsing into the allow set however it got there.
    */
   const cfgFor = (): ReturnType<typeof parseConfig> =>
-    parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'], presence: { enabled: false } });
+    parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] });
 
   /** A request carrying no Host header at all — legal in HTTP/1.0, and its own gate input. */
   function statusWithoutHost(port: number): Promise<number> {

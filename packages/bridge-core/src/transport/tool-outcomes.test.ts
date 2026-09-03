@@ -4,7 +4,7 @@ import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { asHandle, asTopic } from '../message.js';
 import { NoSuchTopicError } from '../seam.js';
 import type { FakePlugin } from '../testing/fake-plugin.js';
-import { harness, parse, type ToolText } from '../testing/tool-cases.js';
+import { harness, parse, type ToolText } from '../testing/tool-harness.js';
 
 /**
  * One subject: what a tool answers when it has nothing to answer with. An empty window, a topic
@@ -88,18 +88,16 @@ describe('every tool honours NoSuchTopicError identically', () => {
   it.each([
     ['parley_fetch_recent', { topic: 'ctx' }, 'fetchRecent'],
     ['parley_fetch_recent (long-poll)', { topic: 'ctx', since: '0', block_ms: 500 }, 'fetchRecent'],
-    ['parley_list_users', {}, 'fetchRecent'],
   ] as const)('%s degrades to an empty result on the sentinel', async (name, args, seam) => {
     const res = await callWith(name.split(' ')[0]!, args, seam, sentinel);
     expect(res.isError).toBeFalsy();
-    const out = parse(res) as { messages?: unknown[]; users?: unknown[] };
-    expect(out.messages ?? out.users).toEqual([]);
+    const out = parse(res) as { messages?: unknown[] };
+    expect(out.messages).toEqual([]);
   });
 
   it.each([
     ['parley_fetch_recent', { topic: 'ctx' }, 'fetchRecent'],
     ['parley_fetch_recent (long-poll)', { topic: 'ctx', since: '0', block_ms: 500 }, 'fetchRecent'],
-    ['parley_list_users', {}, 'fetchRecent'],
     ['parley_post', { topic: 'ctx', content: 'x' }, 'post'],
     ['parley_reply', { topic: 'ctx', content: 'x' }, 'post'],
   ] as const)('%s surfaces a generic backend failure as an error', async (name, args, seam) => {

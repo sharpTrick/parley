@@ -44,7 +44,7 @@ interface ListedTool {
 
 describe('the README tool table matches the registered surface', () => {
   it('parses the table (guards against a broken scan)', () => {
-    expect(DOCUMENTED.size).toBeGreaterThan(3);
+    expect(DOCUMENTED.size).toBeGreaterThan(2);
     expect(DOCUMENTED.get('parley_post')).toEqual(['topic', 'content', 'in_reply_to']);
   });
 
@@ -72,7 +72,7 @@ describe('a post_topics-matched topic is accepted by every allowlist-gated tool'
   const takesTopic = [...DOCUMENTED].filter(([, p]) => p.includes('topic')).map(([name]) => name);
 
   it('finds allowlist-gated tools to check (guards against a broken filter)', () => {
-    expect(takesTopic.length).toBeGreaterThan(3);
+    expect(takesTopic.length).toBeGreaterThan(2);
   });
 
   it.each(takesTopic)('%s', async (name) => {

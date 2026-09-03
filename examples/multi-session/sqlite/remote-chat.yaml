@@ -11,8 +11,6 @@ catchup:
   limit: 100
 live_push:
   enabled: false          # chat cannot receive <channel> pushes
-presence:
-  enabled: false          # reactive-only chat can't receive pushes → skip heartbeats (DESIGN §7)
 permissions:
   skip_permissions: false
 

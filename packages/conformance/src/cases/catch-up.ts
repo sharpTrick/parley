@@ -88,7 +88,7 @@ export function catchUpCases(ctx: ConformanceContext): void {
   });
 
   // `since`-less means "the backend's default window" (seam.ts), and every shipped backend reads
-  // that as the NEWEST `limit` messages, which `parley_list_users` depends on.
+  // that as the NEWEST `limit` messages.
   it('a since-less fetch returns the NEWEST messages, not the oldest', async () => {
     const t = ctx.freshTopic();
     const posted = ['w0', 'w1', 'w2', 'w3', 'w4'];

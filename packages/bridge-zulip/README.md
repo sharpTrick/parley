@@ -152,13 +152,6 @@ What it costs is **transcript attribution**: every message a session posts reads
 so with one shared bot you cannot tell two sessions apart in the history. A distinct bot per session
 buys that back; naming the bots after your handles makes the transcript read like your config.
 
-What it does **not** cost is the presence roster. `parley_list_users` keys a peer by the handle each
-presence beat *carries in its own payload*, falling back to the message sender only for a beat
-emitted before that field existed — so sessions sharing one bot still appear as separate peers, each
-under its configured `identity.handle`, and a hand-off addressed to a handle from a config file
-resolves. This is a property of Zulip's sender model reaching only as far as the sender field: there
-is no per-message sender override for a bot account, and none is needed for reachability.
-
 ## Retention (server-side, not configured by this plugin)
 
 Zulip supports organization- and stream-level

@@ -4,12 +4,10 @@ import { fetchRecentBlocking, isFetchAbortedError } from '../engine/blocking-fet
 import { asBackendMsgId, asCursor, type BackendMsgId } from '../message.js';
 import { isNoSuchTopicError } from '../no-such-topic.js';
 import type { FetchRecentArgs } from '../seam.js';
-import { registerListUsersTool } from './list-users-tool.js';
 import type { ToolDeps } from './tool-deps.js';
 import { describeAllowed, textResult, topicList, topicSchema } from './tool-schema.js';
 
 export * from './tool-deps.js';
-export { DEFAULT_ROSTER_LIMIT, PRESENCE_FETCH_LIMIT } from './list-users-tool.js';
 
 /**
  * Server-side ceiling on `parley_fetch_recent`'s `limit`. The value arrives from a model whose
@@ -144,8 +142,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // Cut the page down to the topic that was ASKED for. `m.topic` is plugin-supplied and a
       // backend's HISTORY read can be coarser than a topic exactly as its subscribe primitive can (a
       // NATS wildcard subject, a Matrix room carrying several logical topics), so this is the same
-      // trust boundary `startPushLoop` applies on the live path — without it an unallowed topic, or
-      // the reserved presence topic, reaches the agent's context through the pull path instead, and
+      // trust boundary `startPushLoop` applies on the live path — without it an unallowed topic
+      // reaches the agent's context through the pull path instead, and
       // a foreign `backendMsgId` is recorded against THIS topic's dedup window, suppressing a
       // genuine live push that later collides with it.
       const own = result.messages.filter((m) => m.topic === t);
@@ -205,5 +203,4 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     },
   );
 
-  registerListUsersTool(server, deps);
 }

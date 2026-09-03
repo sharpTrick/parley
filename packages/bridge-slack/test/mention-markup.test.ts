@@ -104,8 +104,8 @@ const ROWS: Array<{ name: string; text: string; mentions: string[]; content?: st
  *
  * `mention_map` is "Slack user/usergroup id → Parley handle", and it used to govern `content` only —
  * so the same configured person surfaced as `@alice` inside the text and as an opaque `U0ALICE` in
- * `senderHandle`. Two identities for one human: the roster, a `filter` glob over handles, and any
- * "who said this" reasoning saw the id while the text said the handle. Every row below asserts BOTH
+ * `senderHandle`. Two identities for one human: a mention filter over handles, and any "who said
+ * this" reasoning, saw the id while the text said the handle. Every row below asserts BOTH
  * fields from the SAME record, so a future field carrying an id has to declare whether the map
  * applies to it rather than inheriting an answer by accident.
  */

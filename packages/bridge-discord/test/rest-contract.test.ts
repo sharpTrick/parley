@@ -82,8 +82,8 @@ describe('Discord REST contract', () => {
 
   describe('a topic with no backend representation', () => {
     // The seam gives a plugin exactly two legal answers for an absent topic: an empty page with a
-    // replayable cursor, or NoSuchTopicError. Core branches on NoSuchTopicError to return an empty
-    // roster, so an unmapped presence topic must not surface as a raw HTTP failure.
+    // replayable cursor, or NoSuchTopicError. Core branches on NoSuchTopicError to report the topic
+    // as not present yet, so an unmapped topic must not surface as a raw HTTP failure.
     //
     // CLASS: a seam classification decided AFTER a budget check. Both answers are legal, but the
     // same channel flipping between them on a timing race is not: whether the operator sees "topic
@@ -128,10 +128,10 @@ describe('Discord REST contract', () => {
     // What this pins is the PLUGIN's classification of a 10003 on a non-numeric id, not Discord's:
     // the fake keys channels by an arbitrary string and answers 10003 for anything it does not
     // hold, whereas the real router puts `/channels/{channel.id}` through a snowflake converter and
-    // may answer its own 404 instead. The README no longer promises which one the default presence
-    // topic gets, so this cell must not be read as covering that claim.
+    // may answer its own 404 instead — so this cell says nothing about what a real deployment gets
+    // for a topic that is not a snowflake at all.
     it('a 10003 on a non-snowflake channel id is the seam absent topic, not a raw HTTP failure', async () => {
-      await expect(plugin.fetchRecent({ topic: asTopic('parley-presence') })).rejects.toBeInstanceOf(
+      await expect(plugin.fetchRecent({ topic: asTopic('not-a-snowflake') })).rejects.toBeInstanceOf(
         NoSuchTopicError,
       );
     });

@@ -154,9 +154,9 @@ export class XmppRooms extends XmppArchive {
 
   /**
    * Take the bridge's logical handle as the occupant nick, unless `backend_config.nick` pinned one.
-   * The occupant nick is the sender of every archived message and therefore the key core's
-   * `parley_list_users` roster is built on; a random per-connection nick would make every restart of
-   * one bridge a new phantom identity that no one can hand work off to. Rooms already entered under
+   * The occupant nick is the sender of every archived message and therefore the `senderHandle` core
+   * reports; a random per-connection nick would make every restart of one bridge a new phantom
+   * identity that no one can hand work off to. Rooms already entered under
    * the provisional nick are re-entered under the new one (XEP-0045 §7.6 nick change).
    *
    * One connection is one occupant, so a LATER `post` under a different handle is archived under the

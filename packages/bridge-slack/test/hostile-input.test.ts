@@ -356,7 +356,7 @@ describe('slack meta-key topics resolve to their own channel-id literal, never a
   }
 
   // The other half of the same rule, on ONE workspace: what load ACCEPTS must survive the whole way
-  // to the fields a mention filter and a roster read. A fix that passed the rows above by refusing
+  // to the fields a mention filter reads. A fix that passed the rows above by refusing
   // everything would leave this one grading an empty map, so it states the count it expects.
   it('every mention_map value that load accepts reaches mentions and senderHandle intact', async () => {
     const accepted = HANDLE_SHAPED.filter((v) => parseMentions(`@${v}`).map(String)[0] === v);
@@ -697,7 +697,7 @@ const BAD_ENTRIES: Array<{ name: string; entry: unknown; surfacesAs?: string }> 
     entry: { type: 'message', ts: `1700000000.${'9'.repeat(400)}`, text: 'poison', user: 'U0' },
   },
   // IDENTITY, not shape: `senderHandle` must never be minted empty — the seam's own
-  // well-formedness rule forbids it and core's identity filter and roster read it directly.
+  // well-formedness rule forbids it and core's mention filter reads it directly.
   {
     name: 'no user and no bot_id',
     entry: { type: 'message', ts: '1700000000.000003', text: 'ghost' },

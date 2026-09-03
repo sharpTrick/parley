@@ -59,7 +59,7 @@ const textOf = (m: SlackMessage): string => (typeof m.text === 'string' ? m.text
 /**
  * The poster's Slack user/bot id, before `mention_map` resolves it to a Parley handle. A workflow-
  * or app-authored entry can carry neither field, and an EMPTY `senderHandle` breaks the seam's
- * well-formedness rule and lands in core's roster as a blank peer, so fall back to a stable name.
+ * well-formedness rule, so fall back to a stable name.
  */
 const senderOf = (m: SlackMessage): string => {
   for (const id of [m.user, m.bot_id]) {

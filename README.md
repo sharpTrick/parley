@@ -69,7 +69,7 @@ backend_config:
   db_path: "../parley-demo.db"   # BOTH sessions point at this one file — it is the bus
 ```
 
-> Defaults are catch-up-only and safe: no live push, and presence beats on (see [Configuration](#configuration) — they post to a shared topic on your backend). The rest of the knobs are in [Configuration](#configuration); you need none of them for the aha.
+> Defaults are catch-up-only and safe: no live push. The rest of the knobs are in [Configuration](#configuration); you need none of them for the aha.
 
 **3. Point a `.mcp.json` in each directory at the stdio server:**
 
@@ -162,7 +162,7 @@ Two delivery paths — one is the product, one is a preview. Stated once, here:
 
 Three numbers: **10 backends**, each implementing the same **6 seam methods**; Claude itself calls just **4 MCP tools**.
 
-The *seam* is that one small interface every backend implements. All the hard, backend-independent logic — live push, catch-up, dedup, ordering, presence, reply fan-out, OAuth mode — is written once above it in `@sharptrick/parley-core`. Dependencies point one way: a plugin depends on core, never the reverse.
+The *seam* is that one small interface every backend implements. All the hard, backend-independent logic — live push, catch-up, dedup, ordering, reply fan-out, OAuth mode — is written once above it in `@sharptrick/parley-core`. Dependencies point one way: a plugin depends on core, never the reverse.
 
 ```
  Messaging backend   SQLite · Redis · Postgres · Matrix · XMPP · NATS · Zulip · Discord · Slack · Telegram
@@ -170,7 +170,7 @@ The *seam* is that one small interface every backend implements. All the hard, b
  Backend plugin      implements the seam (the six methods below)
         │  normalized Message (topic · sender · content · backendMsgId · cursor · mentions)
  @sharptrick/parley-core   reactive tools (post · fetchRecent)   +   proactive push (<channel> events)
-        │            dedup + ordering via cursor · reply fan-out · presence · topic allowlist · OAuth mode
+        │            dedup + ordering via cursor · reply fan-out · topic allowlist · OAuth mode
    ┌────┴───────────────────────────┐
  Claude Code                     Claude chat  ·  you, in a normal chat client
  catch-up + live push (preview)  post + fetchRecent
@@ -225,14 +225,13 @@ Every backend clears the identical seam contract — cursor monotonicity, exclus
 
 ---
 
-## The four MCP tools
+## The three MCP tools
 
-Distinct from the six seam methods a backend implements, these are the 4 tools Claude actually calls:
+Distinct from the six seam methods a backend implements, these are the 3 tools Claude actually calls:
 
 - **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?, block_ms?}` → `{messages, nextCursor}`. With `block_ms` the call *waits* for the next message instead of returning an empty page, so a session polling for a reply pays for messages rather than for elapsed time — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
 - **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?}` → `{backendMsgId}`.
 - **`parley_reply`** — reply into the topic an inbound `<channel>` event arrived from. Like `parley_post`, it's written durably to the backend — the live channel is only the fast inbound hop, so a reply survives restart and shows up in the next catch-up.
-- **`parley_list_users`** — the reachability roster for hand-off: who's online now *plus* recently-seen-but-offline peers, derived above the seam (bridges beat hello/heartbeat/goodbye on one shared presence topic) so it works identically on every backend, with no new seam method.
 
 ### Waiting for a reply (`block_ms`)
 
@@ -272,26 +271,15 @@ a real account:
 | `identity.handle` | *(required)* | This instance's logical name; what peers `@mention`. |
 | `instance_id` | `identity.handle` | **Read-state namespace.** Two sessions sharing a handle clobber each other's read position — give each its own. Also give a new one when repointing an instance at a different backend, since cursors are backend-specific. |
 | `state_path` | `$XDG_STATE_HOME/parley/<instance>/read-state.json` | Where that cursor file lives. |
-| `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** Capped at **64 topics**: a presence beat advertises the whole list and every reader keeps only the first 64, so a longer list is refused at load rather than left half-announced. |
-| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or caught up on, but every presence beat advertises the pattern sources verbatim as `postTopics` so peers can compute hand-off reachability — do not encode anything confidential in one. Patterns are screened for catastrophic backtracking at load, capped at **64 patterns** (every post/fetch matches its topic against all of them), and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
+| `topics` | *(required)* | Subscribe + catch-up list. **This is the allowlist.** Capped at **64 topics**: each one is a live subscription the push loop opens and an allowlist entry every call is matched against. |
+| `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or caught up on. Patterns are screened for catastrophic backtracking at load, capped at **64 patterns** (every post/fetch matches its topic against all of them), and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
 | `catchup.on_start` | `true` | Drain everything newer than the stored cursor at startup. |
 | `catchup.limit` | `100` | Page size per `fetchRecent`. |
 | `catchup.block_max_ms` | `60000` | Server-side ceiling on `block_ms` (above). |
 | `catchup.block_poll_interval_ms` | `250` | Re-query cadence for core's generic long-poll fallback. Latency/cost only. |
 | `live_push.enabled` | `false` | Claude Code only — push `<channel>` events into a running session. |
 | `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. Only the live push path reads it, so `true` with `live_push.enabled: false` is a load error rather than a filter that never runs. Requires a handle an `@mention` can name (ASCII letters/digits, optional interior `.` `-` `_`); anything else is a load error rather than a bridge that silently receives nothing. |
-| `presence.enabled` | **`true`** | See the warning below. |
-| `presence.topic` | `parley-presence` | The one shared topic beats go to. Reserved: it can never appear in `topics`. |
-| `presence.heartbeat_ms` | `600000` | Beat cadence. |
-| `presence.ttl_ms` | `3 ×` heartbeat | Liveness window for `parley_list_users`. Must be ≥ the heartbeat. |
 | `backend_config` | `{}` | Opaque to core, passed verbatim to the plugin. Secrets live here — never committed. |
-
-> **Presence is on by default, and it writes to your backend.** Each bridge beats
-> hello/heartbeat/goodbye onto the shared `parley-presence` topic so `parley_list_users` can report
-> who is reachable. On SQLite that's an extra table's worth of rows. On a **real Matrix or Zulip
-> account it is a real room or stream**, created on first beat, that you did not ask for. If that's
-> unwanted — or the instance is a reactive-only chat front door that can't receive pushes anyway —
-> set `presence.enabled: false`.
 
 There is no `backend` key: the backend is whichever `parley-<name>` binary you run. A config
 carrying one is rejected at load with the binary to run instead, rather than silently ignored.
@@ -314,7 +302,7 @@ For a hardened setup, the maintainer runs Parley as their own single-tenant inst
 
 ## How it compares
 
-- **vs. localhost agent buses** (xats, claude-peers-mcp, AgentBus): the one thing they fundamentally can't do is put a human reading and replying in an ordinary chat app — on their phone, off the machine. Those buses are localhost-only and agents-only. Parley is the same primitives — topics, presence, `claude/channel` push — but off one machine and carrying a human plus a Claude chat too. **Should you switch from xats today?** Not for live push: xats rides the same experimental `claude/channel` capability, and Parley's is still preview-grade ([above](#what-runs-today-and-whats-still-preview)) — concede that. Switch when you want a human in a real chat app, cross-host sessions, or a durable backend you can swap: the same participants run on a local SQLite file today and Redis / NATS / Matrix / Zulip across machines tomorrow with zero participant-code changes.
+- **vs. localhost agent buses** (xats, claude-peers-mcp, AgentBus): the one thing they fundamentally can't do is put a human reading and replying in an ordinary chat app — on their phone, off the machine. Those buses are localhost-only and agents-only. Parley is the same primitives — topics, durable history, `claude/channel` push — but off one machine and carrying a human plus a Claude chat too. **Should you switch from xats today?** Not for live push: xats rides the same experimental `claude/channel` capability, and Parley's is still preview-grade ([above](#what-runs-today-and-whats-still-preview)) — concede that. Switch when you want a human in a real chat app, cross-host sessions, or a durable backend you can swap: the same participants run on a local SQLite file today and Redis / NATS / Matrix / Zulip across machines tomorrow with zero participant-code changes.
 - **vs. a plain MCP server:** Parley is dual-role. A request/response server can answer `post` / `fetch_recent`; it can't proactively push a `<channel>` event into a session that's already running. Parley does both (the push half is the research preview above).
 - **What it isn't:** not an agent framework (A2A, AutoGen, MindRoom) — deliberately just the seam. No built-in chat UI.
 

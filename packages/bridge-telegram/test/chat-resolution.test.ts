@@ -7,8 +7,8 @@ import { captureStderr, connectFresh, SENDER, startFake } from './rig.js';
  * A memoized resolution must never remember a FAILURE. `chatIdByTopic` and `canonicalById` live for
  * the whole connection, so one transient `getChat` failure would otherwise make an
  * `@channelusername` topic permanently unresolvable: every post, subscribe and catch-up on it
- * rejects for the life of the connection, and core's presence loop swallows the rejection, so the
- * only symptom is a topic that is silently never delivered. Each cell fails the resolution ONCE and
+ * rejects for the life of the connection, so the only symptom is a topic that is silently never
+ * delivered. Each cell fails the resolution ONCE and
  * then repeats the identical call on the same instance.
  */
 describe('telegram transient resolution failures', () => {

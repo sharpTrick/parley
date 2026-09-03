@@ -1,7 +1,7 @@
 /**
  * Structural ReDoS screening, shared by every path that compiles a regex it did not author:
  * `post_topics` from an operator's config (validated at load), `postTopics` from an untrusted peer's
- * presence beat, and any {@link Allowlist} an embedder builds by hand. Node's RegExp backtracks, so
+ * and any {@link Allowlist} an embedder builds by hand. Node's RegExp backtracks, so
  * one hostile or merely careless source can wedge the single-threaded process.
  */
 
@@ -22,7 +22,7 @@ export const MAX_MATCH_INPUT = 64;
  *
  * The bound is PER SOURCE. A caller that matches one input against a collection of screened sources
  * pays it once per source, so it must also bound HOW MANY it holds — `post_topics` caps the count at
- * `MAX_POST_TOPICS`, and the presence path at `MAX_RECORD_TOPICS`.
+ * `MAX_POST_TOPICS`.
  */
 export const MAX_AMBIGUITY = 65_536;
 

@@ -15,10 +15,6 @@ export interface ToolDeps {
    * the push loop) supplies it; the reactive HTTP path has no push loop, so it is optional.
    */
   seen?: SeenSet;
-  /** The shared presence topic `parley_list_users` reads (`presence.topic`). */
-  presenceTopic: Topic;
-  /** Liveness window (ms) for `parley_list_users` — a handle is live if its last beat is within it. */
-  presenceTtlMs: number;
   /** Server-side cap (ms) on `parley_fetch_recent`'s `block_ms` long-poll. */
   blockMaxMs: number;
   /** Poll cadence (ms) for core's generic long-poll fallback. */
@@ -41,8 +37,6 @@ export function toolDepsFor(
     plugin,
     identity: asHandle(cfg.identity.handle),
     allow: allowlistFor(cfg),
-    presenceTopic: asTopic(cfg.presence.topic),
-    presenceTtlMs: cfg.presence.ttl_ms,
     blockMaxMs: cfg.catchup.block_max_ms,
     blockPollIntervalMs: cfg.catchup.block_poll_interval_ms,
     seen: extras?.seen,

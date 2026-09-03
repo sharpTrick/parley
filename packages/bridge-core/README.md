@@ -42,7 +42,7 @@ byte-stable across calls. `timestamp` is informational only; ordering and dedup 
 | Config | `ConfigSchema`, `parseConfig`, `loadConfig`, `instanceIdOf` | Validates `parley.config.yaml`. |
 | Allowlist | `Allowlist`, `TopicNotAllowedError` | `config.topics` **is** the allowlist — no wildcard default. |
 | Engine | `SeenSet`, `ReadStateStore`, `catchUpTopic` / `catchUpAll` | Dedup set, per-instance read-cursor persistence, catch-up orchestration. |
-| Reactive tools | `registerTools`, `toolDepsFor` | `parley_fetch_recent` / `parley_post` / `parley_reply` / `parley_list_users` MCP tools. |
+| Reactive tools | `registerTools`, `toolDepsFor` | `parley_fetch_recent` / `parley_post` / `parley_reply` MCP tools. |
 | Live push | `emitChannel`, `channelMeta`, `startPushLoop` | Emits `claude/channel` `<channel>` notifications to already-running Code sessions. |
 | Local bridge | `buildBridge`, `createStdioBridge` | Composes plugin + tools + push loop into one stdio MCP server. |
 | Remote bridge (v0.2) | `buildReactiveServer`, `createRemoteHttpApp`, `createOAuthRemoteApp` | Streamable-HTTP transport + single-tenant OAuth 2.1 + PKCE front door. |
@@ -58,11 +58,10 @@ instance_id: agent-main         # read-state namespace; DISTINCT per concurrent 
 identity: { handle: "agent" }
 topics: ["ctx-demo"]            # THE allowlist — no wildcard default
 post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to fully-matching topics of at most 64 characters
-                                # (`MAX_MATCH_INPUT`); not subscribed, but the pattern source IS published on
-                                # every presence beat. A longer topic must be listed in `topics`.
+                                # (`MAX_MATCH_INPUT`); not subscribed. A longer topic must be
+                                # listed in `topics`.
 catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
-presence: { enabled: true, topic: "parley-presence", heartbeat_ms: 600000 }
 backend_config:                 # opaque to core; passed verbatim to the plugin's connect()
   db_path: "./parley.db"
 ```
@@ -76,9 +75,6 @@ is never left half-written. Cursors are backend-specific too, so an instance rep
 different backend needs a fresh `instance_id` (or its old read-state deleted); catch-up fails with
 a message saying exactly that.
 
-`presence.enabled` defaults to **true** and writes hello/heartbeat/goodbye to the shared
-`presence.topic` on your backend — on a real Matrix or Zulip account that is a room or stream
-created on first beat. Set it to `false` for reactive-only instances or where that is unwanted.
 `permissions.skip_permissions` is parsed but unimplemented; setting it to `true` is a load error
 rather than a silent no-op.
 
@@ -89,12 +85,10 @@ rather than a silent no-op.
 | `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. Marks returned ids seen so the push loop won't re-deliver them. |
 | `parley_post` | write (reactive) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. The chat side's only write path. |
 | `parley_reply` | write (channel) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
-| `parley_list_users` | presence (reactive) | `{ filter?, topic?, online_only?, since_ms?, limit? }` → `{ users: [{ handle, online, topics, postTopics, lastSeenMs }], truncated }`. The hand-off roster, rebuilt on demand from the shared presence topic. |
 
 Every topic argument goes through the topic `Allowlist`, which accepts a topic listed in
 `config.topics` **or** one fully matching a `post_topics` pattern — so `post_topics` genuinely
-widens the read/write surface beyond `topics` — and never the reserved `presence.topic`, even when
-a pattern covers it. Anything else throws `TopicNotAllowedError`.
+widens the read/write surface beyond `topics`. Anything else throws `TopicNotAllowedError`.
 
 That widening stops at a length: a pattern is matched only against topics of at most 64 characters
 (`MAX_MATCH_INPUT`, exported), because the count cap and the backtracking screen bound the matching

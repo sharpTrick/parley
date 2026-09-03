@@ -197,8 +197,8 @@ describe('every public workspace ships only what a consumer can run', () => {
 
   it('the artifact rule can see a violation at all (positive control)', () => {
     expect(IS_TEST_ARTIFACT.test('auth/keycloak.e2e.test.js')).toBe(true);
-    expect(IS_TEST_SOURCE.test('src/engine/presence.test.ts')).toBe(true);
-    expect(IS_TEST_SOURCE.test('src/engine/presence.ts')).toBe(false);
+    expect(IS_TEST_SOURCE.test('src/engine/seen-set.test.ts')).toBe(true);
+    expect(IS_TEST_SOURCE.test('src/engine/seen-set.ts')).toBe(false);
     expect(isEmitted({ include: ['src/**/*'] }, 'src/a/b.test.ts')).toBe(true);
     expect(isEmitted({ include: ['src/**/*'], exclude: ['src/**/*.test.ts'] }, 'src/a/b.test.ts')).toBe(false);
     expect(isEmitted({ include: ['src/**/*'], exclude: ['src/**/*.test.ts'] }, 'src/a/b.ts')).toBe(true);

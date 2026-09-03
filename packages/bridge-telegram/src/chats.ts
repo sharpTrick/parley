@@ -35,8 +35,8 @@ export class ChatResolver {
       })
       .catch((err: unknown) => {
         this.byTopic.delete(t);
-        // Report it here: core's presence loop swallows the rejection by design, so an
-        // unresolvable presence topic is otherwise a bridge that beats to nobody, in silence.
+        // Report it here: a caller that swallows the rejection would otherwise leave an
+        // unresolvable topic as a bridge that reaches nobody, in silence.
         this.diagnostics.report(
           `topic '${fromCaller(t)}' resolves to no Telegram chat: ${describe(err)}`,
           'unresolved-topic',

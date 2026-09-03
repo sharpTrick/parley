@@ -12,19 +12,8 @@ import {
   parseConfig,
   type ParleyConfig,
 } from './config.js';
-import {
-  decodePresence,
-  encodePresence,
-  MAX_HANDLE_LEN,
-  MAX_RECORD_TOPICS,
-  MAX_TOPIC_LEN,
-  type PresenceRecord,
-} from './engine/presence.js';
-import { asHandle, asTopic } from './message.js';
 import { parseMentions } from './mentions.js';
-import { FakePlugin } from './testing/fake-plugin.js';
 import { HANDLE_CANDIDATES } from './testing/handle-corpus.js';
-import { startPresenceLoop } from './transport/presence-loop.js';
 
 describe('config loader', () => {
   it('applies defaults from a minimal config', () => {
@@ -39,53 +28,16 @@ describe('config loader', () => {
     expect(cfg.permissions.skip_permissions).toBe(false);
     expect(cfg.backend_config).toEqual({});
     expect(cfg.post_topics).toEqual([]);
-    // Presence defaults: single shared topic, 10-min heartbeat, TTL = 3× heartbeat.
-    expect(cfg.presence).toEqual({
-      enabled: true,
-      topic: 'parley-presence',
-      heartbeat_ms: 600_000,
-      ttl_ms: 1_800_000,
-    });
-  });
-
-  it('derives presence.ttl_ms from an explicit heartbeat, but honors an explicit ttl', () => {
-    const derived = parseConfig({
-      identity: { handle: 'h' },
-      topics: ['a'],
-      presence: { heartbeat_ms: 60_000 },
-    });
-    expect(derived.presence.ttl_ms).toBe(180_000);
-    const pinned = parseConfig({
-      identity: { handle: 'h' },
-      topics: ['a'],
-      presence: { heartbeat_ms: 60_000, ttl_ms: 500_000 },
-    });
-    expect(pinned.presence.ttl_ms).toBe(500_000);
   });
 
   // Which post_topics sources are refused is graded against the shared hostile/safe corpus in
-  // regex-screen-parity.test.ts, and the ttl/heartbeat rule at its own boundary in
-  // stated-bounds.test.ts.
+  // regex-screen-parity.test.ts.
   it('accepts post_topics and rejects an uncompilable regex', () => {
     const cfg = parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-.*'] });
     expect(cfg.post_topics).toEqual(['ctx-.*']);
     expect(() =>
       parseConfig({ identity: { handle: 'h' }, topics: ['a'], post_topics: ['ctx-('] }),
     ).toThrow(/invalid regex/);
-  });
-
-  it('rejects an explicit topic that collides with the presence topic', () => {
-    expect(() =>
-      parseConfig({ identity: { handle: 'h' }, topics: ['parley-presence'] }),
-    ).toThrow(/reserved for presence/);
-    // Also when the presence topic is customized.
-    expect(() =>
-      parseConfig({
-        identity: { handle: 'h' },
-        topics: ['a', 'live'],
-        presence: { topic: 'live' },
-      }),
-    ).toThrow(/reserved for presence/);
   });
 
   it('merges partial nested objects with per-field defaults', () => {
@@ -297,7 +249,6 @@ const FULL = {
     block_poll_interval_ms: 100,
   },
   live_push: { enabled: true, mention_filter: false },
-  presence: { enabled: true, topic: 'parley-presence', heartbeat_ms: 1000, ttl_ms: 3000 },
   permissions: { skip_permissions: false },
   auth: {
     mode: 'oidc',
@@ -568,7 +519,6 @@ describe('config rejects an empty string in any field that names something', () 
       'identity.handle',
       'instance_id',
       'post_topics[0]',
-      'presence.topic',
       'state_path',
       'topics[0]',
     ]);
@@ -587,8 +537,8 @@ describe('config rejects an empty string in any field that names something', () 
 // Every numeric field is a count or a duration, and none of them means anything at zero, below zero
 // or between integers: `catchup.limit: 0` makes catch-up's `messages.length < limit` break condition
 // false forever and page without end, `block_poll_interval_ms: 0` turns the long-poll fallback into a
-// tight re-query loop, and `presence.heartbeat_ms: -1` fires the beat every tick. Walk the fixture so
-// a knob added later is graded the moment it appears there.
+// tight re-query loop. Walk the fixture so a knob added later is graded the moment it appears
+// there.
 describe('config rejects a degenerate number in any numeric field', () => {
   interface NumericLeaf {
     label: string;
@@ -617,8 +567,6 @@ describe('config rejects a degenerate number in any numeric field', () => {
       'catchup.block_max_ms',
       'catchup.block_poll_interval_ms',
       'catchup.limit',
-      'presence.heartbeat_ms',
-      'presence.ttl_ms',
     ]);
   });
 
@@ -656,8 +604,6 @@ describe('config rejects a degenerate number in any numeric field', () => {
     ['catchup.block_max_ms', MAX_BLOCK_MS],
     ['catchup.block_poll_interval_ms', null],
     ['catchup.limit', null],
-    ['presence.heartbeat_ms', null],
-    ['presence.ttl_ms', null],
   ]);
 
   // Both registries above are keyed by label, so a renamed or removed knob leaves a row that grades
@@ -672,15 +618,6 @@ describe('config rejects a degenerate number in any numeric field', () => {
 
   const FAR_ABOVE_ANY_PLAUSIBLE_CAP = 86_400_000;
 
-  // `ttl_ms >= heartbeat_ms` is graded on its own in stated-bounds.test.ts; keep the pair consistent
-  // here, so that a missing ceiling can never be answered by the cross-field rule instead.
-  function withCeilingProbe(leaf: NumericLeaf, value: number): Record<string, unknown> {
-    const mutated = withValue(leaf, value);
-    const presence = mutated.presence as { heartbeat_ms: number; ttl_ms: number };
-    presence.ttl_ms = Math.max(presence.ttl_ms, presence.heartbeat_ms);
-    return mutated;
-  }
-
   it.each(leaves.map((l) => [l.label, l] as const))(
     'grades %s against its documented ceiling',
     (label, leaf) => {
@@ -690,11 +627,11 @@ describe('config rejects a degenerate number in any numeric field', () => {
       ).toBe(true);
       const ceiling = CEILINGS.get(label) ?? null;
       if (ceiling === null) {
-        expect(() => parseConfig(withCeilingProbe(leaf, FAR_ABOVE_ANY_PLAUSIBLE_CAP))).not.toThrow();
+        expect(() => parseConfig(withValue(leaf, FAR_ABOVE_ANY_PLAUSIBLE_CAP))).not.toThrow();
         return;
       }
-      expect(() => parseConfig(withCeilingProbe(leaf, ceiling))).not.toThrow();
-      expect(() => parseConfig(withCeilingProbe(leaf, ceiling + 1))).toThrow();
+      expect(() => parseConfig(withValue(leaf, ceiling))).not.toThrow();
+      expect(() => parseConfig(withValue(leaf, ceiling + 1))).toThrow();
     },
   );
 });
@@ -758,33 +695,6 @@ describe('a knob is never accepted beneath a disabled enabler unless something r
         probe: () => NOTHING_READS_IT,
       },
     ],
-    [
-      'presence.topic under presence.enabled',
-      {
-        path: ['presence', 'topic'],
-        base: { presence: { enabled: false } },
-        set: { presence: { enabled: false, topic: 'roster-x' } },
-        probe: (cfg) => allowlistFor(cfg).has('roster-x'),
-      },
-    ],
-    [
-      'presence.heartbeat_ms under presence.enabled',
-      {
-        path: ['presence', 'heartbeat_ms'],
-        base: { presence: { enabled: false } },
-        set: { presence: { enabled: false, heartbeat_ms: 60_000 } },
-        probe: (cfg) => cfg.presence.ttl_ms,
-      },
-    ],
-    [
-      'presence.ttl_ms under presence.enabled',
-      {
-        path: ['presence', 'ttl_ms'],
-        base: { presence: { enabled: false } },
-        set: { presence: { enabled: false, ttl_ms: 900_000 } },
-        probe: (cfg) => cfg.presence.ttl_ms,
-      },
-    ],
   ] as const;
 
   const load = (extra: Record<string, unknown>): ParleyConfig =>
@@ -798,9 +708,6 @@ describe('a knob is never accepted beneath a disabled enabler unless something r
   it('pins the pairs and keeps one with no reader behind it', () => {
     expect(KNOBS.map(([label]) => label)).toEqual([
       'live_push.mention_filter under live_push.enabled',
-      'presence.topic under presence.enabled',
-      'presence.heartbeat_ms under presence.enabled',
-      'presence.ttl_ms under presence.enabled',
     ]);
     expect(KNOBS.filter(([, k]) => k.probe(load(k.base)) === NOTHING_READS_IT).length).toBe(1);
   });
@@ -896,12 +803,11 @@ describe('no config value reaches a runnable suggestion', () => {
 
   // The same class, one field at a time, over the strings an operator populates: whichever field a
   // hostile value lands in, whatever message comes back must not read as a command to run.
-  const FIELDS = ['instance_id', 'state_path', 'topics', 'post_topics', 'presence'] as const;
+  const FIELDS = ['instance_id', 'state_path', 'topics', 'post_topics'] as const;
   const FIELD_ROWS = FIELDS.flatMap((field) =>
     HOSTILE_VALUES.map(([label, value]) => {
       const raw: Record<string, unknown> = { identity: { handle: 'h' }, topics: ['a'] };
       if (field === 'topics' || field === 'post_topics') raw[field] = [value];
-      else if (field === 'presence') raw.presence = { topic: value };
       else raw[field] = value;
       return [`${field} = ${label}`, raw] as const;
     }),
@@ -909,297 +815,12 @@ describe('no config value reaches a runnable suggestion', () => {
 
   it('crosses every populated string field with every hostile value', () => {
     expect(FIELD_ROWS.length).toBe(FIELDS.length * HOSTILE_VALUES.length);
-    expect(FIELD_ROWS.length).toBeGreaterThan(60);
+    expect(FIELD_ROWS.length).toBeGreaterThan(45);
   });
 
   it.each(FIELD_ROWS)('never renders %s as a command', (_label, raw) => {
     for (const span of runnableSpans(messageFor(raw))) expect(span).not.toMatch(NOT_A_COMMAND);
   });
-});
-
-// A config VALUE that rides the presence beat is read back through a decoder that CAPS it, and the
-// decoder is on the peer's side: a value past a cap loads cleanly here and is then truncated out of —
-// or drops — every peer's copy, forever, with no error, no log and no way for the operator to see it.
-// The load is the only place that can say so. So grade every value the beat carries, on every axis
-// the decoder caps: at the cap it must load AND survive the round trip whole, past the cap it must be
-// refused at load. The carried set and the axes are DERIVED — from a marker round trip through the
-// real emitter, and from the shape of what the beat carries — so a new field, or a new axis on an
-// existing one, fails as a missing row rather than passing silently.
-describe('a config value carried by the presence beat is capped where it is declared', () => {
-  type Verdict = 'refused at load' | 'carried in full' | 'truncated on the wire' | 'record dropped';
-
-  interface Axis {
-    label: 'length' | 'count' | 'element length';
-    cap: number;
-    /** The config value sitting at `n` on this axis. */
-    at: (n: number) => string | string[];
-  }
-
-  interface WireValue {
-    /** The `PresenceRecord` field the beat carries it in. */
-    beatField: 'handle' | 'topics' | 'postTopics';
-    /** Where in the config document the emitter reads it from. */
-    configPath: readonly string[];
-    /** A value that marks this field in a beat, for the coverage derivation below. */
-    marker: string | string[];
-    axes: Axis[];
-  }
-
-  const listAxes = (element: (i: number) => string, long: (n: number) => string): Axis[] => [
-    { label: 'count', cap: MAX_RECORD_TOPICS, at: (n) => Array.from({ length: n }, (_u, i) => element(i)) },
-    { label: 'element length', cap: MAX_TOPIC_LEN, at: (n) => [long(n)] },
-  ];
-
-  const WIRE_VALUES: WireValue[] = [
-    {
-      beatField: 'handle',
-      configPath: ['identity', 'handle'],
-      marker: 'mk-handle',
-      axes: [{ label: 'length', cap: MAX_HANDLE_LEN, at: (n) => 'h'.repeat(n) }],
-    },
-    {
-      beatField: 'topics',
-      configPath: ['topics'],
-      marker: ['mk-topic'],
-      axes: listAxes((i) => `ctx-${i}`, (n) => 't'.repeat(n)),
-    },
-    {
-      beatField: 'postTopics',
-      configPath: ['post_topics'],
-      marker: ['mk-post-.*'],
-      axes: listAxes((i) => `ctx-${i}-.*`, (n) => 'a'.repeat(n)),
-    },
-  ];
-
-  /** Which axes a value of this shape can be capped on — the whole set, so none can go ungraded. */
-  const AXES_FOR_SHAPE: Record<'string' | 'string[]', string[]> = {
-    string: ['length'],
-    'string[]': ['count', 'element length'],
-  };
-
-  const CELLS = WIRE_VALUES.flatMap((w) =>
-    w.axes.map((axis) => [`${w.configPath.join('.')} ${axis.label}`, w, axis] as const),
-  );
-
-  function configWith(path: readonly string[], value: unknown): Record<string, unknown> {
-    const doc: Record<string, unknown> = { identity: { handle: 'h' }, topics: ['ctx'] };
-    let node = doc;
-    for (const key of path.slice(0, -1)) node = node[key] as Record<string, unknown>;
-    node[path.at(-1)!] = value;
-    return doc;
-  }
-
-  /** The `hello` beat the real emitter posts for `cfg`, decoded exactly as a peer decodes it. */
-  async function beatFrom(cfg: ParleyConfig): Promise<PresenceRecord | null> {
-    const plugin = new FakePlugin();
-    await plugin.connect({});
-    const topic = asTopic(cfg.presence.topic);
-    const loop = startPresenceLoop(plugin, asHandle(cfg.identity.handle), allowlistFor(cfg), {
-      presenceTopic: topic,
-      heartbeatMs: cfg.presence.heartbeat_ms,
-    });
-    await loop.stop();
-    const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
-    expect(messages.length).toBeGreaterThan(0);
-    return decodePresence(messages[0]!.content);
-  }
-
-  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
-
-  /** What a peer ends up holding for `value`, going through the loader and the real emitter. */
-  async function roundTrip(w: WireValue, value: string | string[]): Promise<Verdict> {
-    let cfg: ParleyConfig;
-    try {
-      cfg = parseConfig(configWith(w.configPath, value));
-    } catch {
-      return 'refused at load';
-    }
-    const beat = await beatFrom(cfg);
-    if (beat === null) return 'record dropped';
-    return same(beat[w.beatField], value) ? 'carried in full' : 'truncated on the wire';
-  }
-
-  /** The same verdict for a beat built BY HAND — what the decoder does, with no loader in front. */
-  function onTheWire(w: WireValue, value: string | string[]): Verdict {
-    const base: PresenceRecord = {
-      v: 2,
-      kind: 'hello',
-      at: 0,
-      handle: 'h',
-      topics: ['ctx'],
-      postTopics: [],
-      instanceId: 'i',
-    };
-    const decoded = decodePresence(
-      encodePresence({ ...base, [w.beatField]: value } as unknown as PresenceRecord),
-    );
-    if (decoded === null) return 'record dropped';
-    return same(decoded[w.beatField], value) ? 'carried in full' : 'truncated on the wire';
-  }
-
-  it('covers every beat field fed from the config, and every axis its shape can be capped on', async () => {
-    const doc: Record<string, unknown> = { identity: { handle: 'h' }, topics: ['ctx'] };
-    for (const w of WIRE_VALUES) {
-      let node = doc;
-      for (const key of w.configPath.slice(0, -1)) node = node[key] as Record<string, unknown>;
-      node[w.configPath.at(-1)!] = w.marker;
-    }
-    const beat = await beatFrom(parseConfig(doc));
-    expect(beat?.kind).toBe('hello');
-    const fromConfig = Object.entries(beat!)
-      .filter(([, value]) => JSON.stringify(value).includes('mk-'))
-      .map(([key]) => key)
-      .sort();
-    expect(fromConfig).toEqual(WIRE_VALUES.map((w) => w.beatField).sort());
-
-    for (const w of WIRE_VALUES) {
-      const shape = Array.isArray(beat![w.beatField]) ? 'string[]' : 'string';
-      expect(w.axes.map((a) => a.label).sort(), w.beatField).toEqual(AXES_FOR_SHAPE[shape].sort());
-    }
-  });
-
-  it('the round trip can SEE both ways a peer loses a value (positive control for the verdict)', () => {
-    const over = Array.from({ length: MAX_RECORD_TOPICS + 1 }, (_unused, i) => `ctx-${i}`);
-    expect(onTheWire(WIRE_VALUES[1]!, over)).toBe('truncated on the wire');
-    expect(onTheWire(WIRE_VALUES[0]!, 'h'.repeat(MAX_HANDLE_LEN + 1))).toBe('record dropped');
-  });
-
-  it.each(CELLS)('%s: the decoder carries a value AT the declared cap', (_label, w, axis) => {
-    expect(onTheWire(w, axis.at(axis.cap))).toBe('carried in full');
-  });
-
-  it.each(CELLS)('%s: the decoder is what makes the cap real — one past it is lost', (_l, w, axis) => {
-    expect(onTheWire(w, axis.at(axis.cap + 1))).not.toBe('carried in full');
-  });
-
-  it.each(CELLS)('%s at the cap loads and reaches a peer whole', async (_label, w, axis) => {
-    expect(await roundTrip(w, axis.at(axis.cap))).toBe('carried in full');
-  });
-
-  it.each(CELLS)('%s past the cap is refused at load, not lost behind the operator', async (_l, w, axis) => {
-    expect(await roundTrip(w, axis.at(axis.cap + 1))).toBe('refused at load');
-  });
-});
-
-/**
- * WHICH config values leave this process on the shared presence topic. `post_topics`' own field doc
- * claimed its pattern sources were "NEVER ... announced in presence" while the emitter had been
- * advertising them verbatim since the beat gained `postTopics` — a locality promise an operator
- * reads before deciding what a pattern may name, contradicted by the wire, with nothing grading the
- * disagreement. Prose cannot be compiled, so pin the fact the prose is about instead: one declared
- * verdict per schema leaf, each one MEASURED against a beat the real emitter posts. A field
- * documented as local while the beat carries it now has to be declared `broadcast` first.
- */
-describe('what a presence beat discloses from the config', () => {
-  type Visibility = 'broadcast' | 'local' | 'no second legal value';
-
-  const WIRE_VISIBILITY = new Map<string, Visibility>([
-    ['instance_id', 'local'],
-    ['state_path', 'local'],
-    ['identity.handle', 'broadcast'],
-    ['topics', 'broadcast'],
-    ['post_topics', 'broadcast'],
-    ['catchup.on_start', 'local'],
-    ['catchup.limit', 'local'],
-    ['catchup.block_max_ms', 'local'],
-    ['catchup.block_poll_interval_ms', 'local'],
-    ['live_push.enabled', 'local'],
-    ['live_push.mention_filter', 'local'],
-    ['presence.enabled', 'local'],
-    ['presence.topic', 'local'],
-    ['presence.heartbeat_ms', 'local'],
-    ['presence.ttl_ms', 'local'],
-    ['permissions.skip_permissions', 'no second legal value'],
-    ['auth.mode', 'local'],
-    ['auth.oidc.issuer', 'local'],
-    ['auth.oidc.audience', 'local'],
-    ['auth.oidc.jwks_uri', 'local'],
-    ['auth.oidc.required_scope', 'local'],
-    ['auth.oidc.allowed_subjects', 'local'],
-    ['auth.oidc.allowed_usernames', 'local'],
-    ['auth.oidc.required_role', 'local'],
-    ['auth.oidc.clock_skew_s', 'local'],
-  ]);
-
-  /** A second legal value for a leaf, shaped so the schema still accepts it. */
-  function otherValue(leaf: SchemaLeaf, current: unknown): unknown {
-    if (leaf.kind === 'enum') return leaf.options.find((o) => o !== current) ?? current;
-    if (typeof current === 'string') return `${current}-alt`;
-    if (typeof current === 'number') return current * 2;
-    if (typeof current === 'boolean') return !current;
-    if (Array.isArray(current)) return current.map((e) => `${String(e)}-alt`);
-    throw new Error(`${leaf.label}: no second value for ${typeof current}`);
-  }
-
-  /** The raw JSON a peer reads off the presence topic — not `decodePresence`, which caps and drops,
-   *  so a value the decoder would trim is still counted as disclosed. */
-  async function beatContent(cfg: ParleyConfig): Promise<Record<string, unknown>> {
-    const plugin = new FakePlugin();
-    await plugin.connect({});
-    const topic = asTopic(cfg.presence.topic);
-    const loop = startPresenceLoop(plugin, asHandle(cfg.identity.handle), allowlistFor(cfg), {
-      presenceTopic: topic,
-      heartbeatMs: cfg.presence.heartbeat_ms,
-      now: () => 1,
-    });
-    await loop.stop();
-    const { messages } = await plugin.fetchRecent({ topic, limit: 10 });
-    expect(messages.length).toBeGreaterThan(0);
-    return JSON.parse(messages[0]!.content) as Record<string, unknown>;
-  }
-
-  /**
-   * Which beat fields differ between two beats emitted from the SAME config — measured, not listed.
-   * Keep it measured, so that the comparison cannot be written to ignore a field a future wiring
-   * starts feeding from the config: the moment a field becomes config-derived it stops varying
-   * run-to-run, so it stops being excluded here and starts being graded below.
-   */
-  async function volatileFields(cfg: ParleyConfig): Promise<Set<string>> {
-    const [a, b] = [await beatContent(cfg), await beatContent(cfg)];
-    return new Set(
-      Object.keys({ ...a, ...b }).filter((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k])),
-    );
-  }
-
-  const stable = (beat: Record<string, unknown>, volatile: ReadonlySet<string>): string =>
-    JSON.stringify(
-      Object.entries(beat)
-        .filter(([k]) => !volatile.has(k))
-        .sort(([x], [y]) => x.localeCompare(y)),
-    );
-
-  const base = (): ParleyConfig => parseConfig(structuredClone(FULL));
-
-  it('excludes only the per-process instance token from the comparison', async () => {
-    expect([...(await volatileFields(base()))]).toEqual(['instanceId']);
-  });
-
-  it('declares a verdict for every leaf the schema has, and none it does not', () => {
-    expect([...WIRE_VISIBILITY.keys()].sort()).toEqual(SCHEMA_LEAVES.map((l) => l.label).sort());
-  });
-
-  it.each(SCHEMA_LEAVES.map((l) => [l.label, l] as const))(
-    '%s: what the beat carries matches the declared verdict',
-    async (label, leaf) => {
-      const declared = WIRE_VISIBILITY.get(label);
-      expect(declared, `${label} has no row: declare what a presence beat does with it`).toBeDefined();
-      const mutated = structuredClone(FULL) as Record<string, unknown>;
-      const holder = parentOf(mutated, leaf.path);
-      const key = leaf.path.at(-1)!;
-      holder[key] = otherValue(leaf, holder[key]);
-      let cfg: ParleyConfig;
-      try {
-        cfg = parseConfig(mutated);
-      } catch {
-        expect(declared, `${label} has a second legal value after all`).toBe('no second legal value');
-        return;
-      }
-      expect(declared, `${label} has a second legal value`).not.toBe('no second legal value');
-      const volatile = await volatileFields(base());
-      const carried = stable(await beatContent(cfg), volatile) !== stable(await beatContent(base()), volatile);
-      expect(carried ? 'broadcast' : 'local').toBe(declared);
-    },
-  );
 });
 
 // `loadConfig` is what every shipped backend CLI calls, so its failure message is the first thing a
@@ -1234,7 +855,7 @@ describe('loadConfig names the file and the failure kind', () => {
     ['a YAML syntax error', () => write('syntax.yaml', 'identity:\n   handle: a: b\n'), /is not valid YAML/],
     ['a missing required field', () => write('nofields.yaml', 'topics:\n  - ctx\n'), /identity: .*required/i],
     ['an unknown top-level key', () => write('unknown.yaml', `${VALID}presense: {}\n`), /presense/],
-    ['a field-level rule violation', () => write('badttl.yaml', `${VALID}presence:\n  heartbeat_ms: 60000\n  ttl_ms: 1000\n`), /presence\.ttl_ms: .*heartbeat_ms/],
+    ['a field-level rule violation', () => write('badfilter.yaml', `${VALID}live_push:\n  mention_filter: true\n`), /live_push\.mention_filter: .*live_push\.enabled/],
     ['a legacy backend key', () => write('backend.yaml', `${VALID}backend: local-sqlite\n`), /`backend` is not a supported field/],
   ] as const;
 

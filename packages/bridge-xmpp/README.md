@@ -37,9 +37,9 @@ window the same call answers without one — the newest `limit` when `since` is 
 strictly after it when it is not.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) becomes the MUC occupant nick.**
-> The sender of every archived message is that nick, and it is the key core's `parley_list_users`
-> roster is built on — so unless you pin `nick` yourself, the first `post` takes `identity.handle`
-> as this connection's nick and the bridge keeps one stable identity across restarts. See
+> The sender of every archived message is that nick, and it is the `senderHandle` core reports — so
+> unless you pin `nick` yourself, the first `post` takes `identity.handle` as this connection's nick
+> and the bridge keeps one stable identity across restarts. See
 > "Multiple concurrent sessions".
 
 ### Notes / caveats

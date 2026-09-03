@@ -1,10 +1,10 @@
 /**
  * CLASS: a backend's absent-topic errors must map onto the seam's absent-topic contract, and
  * nothing else may. Core distinguishes "topic not present yet" (`NoSuchTopicError` — a normal
- * result, e.g. an empty presence roster) from a real backend failure (propagates). Slack signals
+ * result, reported as `topicAbsent`) from a real backend failure (propagates). Slack signals
  * absence with `ok:false, error:'channel_not_found'`, which the generic `ok:false → Error` path
- * flattens into an indistinguishable failure — so a default deployment whose presence topic is not
- * a real channel id hard-fails `parley_list_users` instead of returning the empty roster.
+ * flattens into an indistinguishable failure — so a topic whose `channel_map` target is not a real
+ * channel id hard-fails `parley_fetch_recent` instead of reporting the topic as absent.
  */
 import { asCursor, asHandle, asTopic, NoSuchTopicError, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';

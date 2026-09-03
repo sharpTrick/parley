@@ -4,9 +4,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it } from 'vitest';
 import { Allowlist, allowlistFor, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
 import { MAX_POST_TOPICS, parseConfig } from './config.js';
-import { encodePresence } from './engine/presence.js';
-import { asHandle, type Topic } from './message.js';
 import { MAX_MATCH_INPUT } from './regex-safety.js';
+import { ANCHORING_CASES, ANCHORING_LENGTH_CASES } from './testing/anchoring-corpus.js';
 import { FakePlugin } from './testing/fake-plugin.js';
 import { registerTools, toolDepsFor } from './transport/tools.js';
 
@@ -64,23 +63,7 @@ describe('Allowlist post patterns', () => {
   });
 });
 
-describe('Allowlist reserved topics', () => {
-  it('refuses a reserved topic on post/fetch even when a pattern would match it', () => {
-    const allow = new Allowlist(['ctx-a'], {
-      postPatterns: ['.*'],
-      reserved: ['parley-presence'],
-    });
-    expect(allow.has('parley-presence')).toBe(false);
-    expect(() => allow.assert('parley-presence')).toThrow(TopicNotAllowedError);
-    expect(allow.has('ctx-a')).toBe(true); // the broad pattern still allows non-reserved topics
-  });
-
-  it('throws when an explicit topic is also reserved (config error)', () => {
-    expect(() => new Allowlist(['parley-presence'], { reserved: ['parley-presence'] })).toThrow(
-      TopicNotAllowedError,
-    );
-  });
-
+describe('Allowlist refusals', () => {
   // The over-long refusal and its message are graded at the clamp itself in stated-bounds.test.ts.
   it('refuses an unmatched topic without inventing a reason', () => {
     const allow = new Allowlist(['ctx'], { postPatterns: ['ctx-.*'] });
@@ -89,11 +72,11 @@ describe('Allowlist reserved topics', () => {
 });
 
 // `allowlistFor` is the one function that turns a parsed config into the runtime security boundary,
-// and every composition root calls it. The class-level cases above hand `reserved`/`postPatterns` in
-// by hand, so none of them can see a wiring mistake HERE — dropping `reserved`, or folding
-// `post_topics` into the explicit set, changes nothing they assert. Drive it from parseConfig output
-// only, and grade the three-way partition as a property of each row, so a config field added later
-// (a second reserved topic, a `subscribe_topics` list) is graded the moment it appears.
+// and every composition root calls it. The class-level cases above hand `postPatterns` in by hand,
+// so none of them can see a wiring mistake HERE — folding `post_topics` into the explicit set
+// changes nothing they assert. Drive it from parseConfig output only, and grade the partition as a
+// property of each row, so a config field added later (a `subscribe_topics` list) is graded the
+// moment it appears.
 describe('allowlistFor wires a parsed config to the boundary', () => {
   const ROWS: readonly (readonly [
     label: string,
@@ -107,16 +90,6 @@ describe('allowlistFor wires a parsed config to the boundary', () => {
       'several patterns',
       { topics: ['ctx-a', 'ctx-b'], post_topics: ['ops-.*', 'dev-[a-z]+'] },
       'dev-x',
-    ],
-    [
-      'custom presence topic under a broad pattern',
-      { topics: ['ctx-a'], post_topics: ['.*'], presence: { topic: 'roster-x' } },
-      'anything-at-all',
-    ],
-    [
-      'presence disabled under a broad pattern',
-      { topics: ['ctx-a'], post_topics: ['.*'], presence: { enabled: false } },
-      'anything-at-all',
     ],
   ] as const;
 
@@ -132,27 +105,17 @@ describe('allowlistFor wires a parsed config to the boundary', () => {
       'one pattern',
       'broad pattern',
       'several patterns',
-      'custom presence topic under a broad pattern',
-      'presence disabled under a broad pattern',
     ]);
-    expect(ROWS.filter(([, raw]) => patternsOf(raw).length > 0).length).toBeGreaterThanOrEqual(4);
+    expect(ROWS.filter(([, raw]) => patternsOf(raw).length > 0).length).toBeGreaterThanOrEqual(3);
     expect(ROWS.filter(([, raw]) => patternsOf(raw).includes('.*')).length).toBeGreaterThanOrEqual(
-      3,
+      1,
     );
-    expect(ROWS.filter(([, , hit]) => hit !== undefined).length).toBeGreaterThanOrEqual(4);
+    expect(ROWS.filter(([, , hit]) => hit !== undefined).length).toBeGreaterThanOrEqual(3);
   });
 
   it.each(ROWS)('subscribe sees exactly the explicit topics (%s)', (_label, raw) => {
     const cfg = configOf(raw);
     expect([...allowlistFor(cfg).topics()].sort()).toEqual([...cfg.topics].sort());
-  });
-
-  it.each(ROWS)('the presence topic is reserved on both dimensions (%s)', (_label, raw) => {
-    const cfg = configOf(raw);
-    const allow = allowlistFor(cfg);
-    expect(allow.has(cfg.presence.topic)).toBe(false);
-    expect(() => allow.assert(cfg.presence.topic)).toThrow(TopicNotAllowedError);
-    expect(allow.topics()).not.toContain(cfg.presence.topic);
   });
 
   it.each(ROWS)('a pattern match is postable but never subscribed (%s)', (_label, raw, hit) => {
@@ -276,6 +239,46 @@ describe('Allowlist pattern safety', () => {
     expect(notMatch.filter((t) => allow.has(t))).toEqual([]);
   });
 
+  // The rows above are written here; the shared corpus is written once for every site in the
+  // repository that compiles a source it did not author, so an entry point that starts anchoring
+  // differently reddens against the SAME expectations its neighbours are held to. Pin the corpus
+  // membership by value — a generated table cannot see a row deleted from the list generating it,
+  // and the substring rows are exactly the ones an unanchored compile would let through.
+  const CORPUS = [...ANCHORING_CASES, ...ANCHORING_LENGTH_CASES];
+
+  it('pins the shared corpus membership', () => {
+    expect(ANCHORING_CASES.length).toBe(12);
+    expect(ANCHORING_CASES.filter(([, , , full]) => !full).length).toBe(7);
+    // The length axis has to straddle the bound in both directions, or it grades one side twice.
+    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => full).length).toBeGreaterThan(0);
+    expect(ANCHORING_LENGTH_CASES.filter(([, , , full]) => !full).length).toBeGreaterThan(0);
+  });
+
+  it.each(
+    COMPILING_ENTRY_POINTS.flatMap(([entry, build]) =>
+      CORPUS.map(
+        ([label, source, input, fullMatch]) =>
+          [`${entry} × ${label}`, build, source, input, fullMatch] as const,
+      ),
+    ),
+  )('%s', (_name, build, source, input, fullMatch) => {
+    expect(build(source).has(input)).toBe(fullMatch);
+  });
+
+  // The rows above pin each entry point against an expectation written down in the corpus; this
+  // pins the entry points against EACH OTHER, so a cell where they diverge fails even when the
+  // corpus's own expectation has gone stale.
+  it('every entry point returns the same verdict in every cell', () => {
+    const disagreements = CORPUS.filter(([, source, input]) => {
+      const verdicts = COMPILING_ENTRY_POINTS.map(([, build]) => build(source).has(input));
+      return verdicts.some((v) => v !== verdicts[0]);
+    }).map(
+      ([label, source, input]) =>
+        `${label}: ${JSON.stringify({ source, length: input.length })}`,
+    );
+    expect(disagreements).toEqual([]);
+  });
+
   // The constructor validates the bare source but matches with `^(?:src)$`. An unbalanced source is
   // uncompilable alone yet LEGAL once wrapped, because the anchors re-associate into one branch of an
   // unanchored alternation — `ops)|(.*` becomes `/^(?:ops)|(.*)$/`, which matches every topic. So a
@@ -340,7 +343,6 @@ describe('the runtime gate never admits a topic the loader forbids', () => {
     '.',
     '..',
     'a'.repeat(MAX_MATCH_INPUT + 1),
-    'parley-presence',
   ];
   const BROAD_PATTERNS = ['.*', '[a-z]*', 'x?', '(?:)', '[\\s\\S]*'];
 
@@ -368,13 +370,12 @@ describe('the runtime gate never admits a topic the loader forbids', () => {
   );
 
   it('the table can fail in both directions, and on each clause independently', () => {
-    expect(DEGENERATE_TOPICS.filter((t) => !loaderAccepts(t))).toEqual(['', 'parley-presence']);
+    expect(DEGENERATE_TOPICS.filter((t) => !loaderAccepts(t))).toEqual(['']);
     expect(ROWS.filter(([, , , expected]) => expected).length).toBeGreaterThan(8);
     expect(ROWS.filter(([, , , expected]) => !expected).length).toBeGreaterThan(8);
     // One row per clause of the verdict, so deleting any clause reddens something.
     expect(ROWS.some(([, t, , e]) => t === '' && patternMatches('.*', t) && !e)).toBe(true);
     expect(ROWS.some(([, t, , e]) => t.length > MAX_MATCH_INPUT && !e)).toBe(true);
-    expect(ROWS.some(([, t, , e]) => t === 'parley-presence' && !e)).toBe(true);
   });
 
   it.each(ROWS)('%s', (_label, topic, pattern, expected) => {
@@ -393,17 +394,16 @@ describe('the runtime gate never admits a topic the loader forbids', () => {
 });
 
 // Which allowlist DIMENSION each caller-facing surface consults is a claim the class doc makes, and
-// it went stale: the doc called the explicit list the default scope of `parley_list_users`, while
-// the unscoped roster is the UNION of both dimensions. Assert the dimension by construction through
-// the real MCP surfaces, driven from parseConfig via the composition roots' own `toolDepsFor`, so a
-// surface that starts consulting a different dimension reddens here. A tool registered without a row
-// fails as a missing entry.
+// it has gone stale before. Assert the dimension by construction through the real MCP surfaces,
+// driven from parseConfig via the composition roots' own `toolDepsFor`, so a surface that starts
+// consulting a different dimension reddens here. A tool registered without a row fails as a missing
+// entry.
 describe('each caller-facing surface consults the allowlist dimension its doc names', () => {
   const EXPLICIT_TOPIC = 'ctx-mine';
   const PATTERN_ONLY_TOPIC = 'ctx-adhoc';
   const UNREACHABLE_TOPIC = 'other-x';
 
-  type Dimension = 'EXPLICIT' | 'POST_FETCH' | 'BOTH';
+  type Dimension = 'EXPLICIT' | 'POST_FETCH';
 
   interface Surface {
     label: string;
@@ -416,25 +416,10 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
     client: Client;
     allow: ReturnType<typeof allowlistFor>;
     plugin: FakePlugin;
-    presenceTopic: Topic;
   }
 
   const ok = async (client: Client, name: string, args: Record<string, unknown>): Promise<boolean> =>
     ((await client.callTool({ name, arguments: args })) as { isError?: boolean }).isError !== true;
-
-  const rosterHandles = async (client: Client, args: Record<string, unknown>): Promise<string[]> => {
-    const res = (await client.callTool({ name: 'parley_list_users', arguments: args })) as {
-      isError?: boolean;
-      content: { text: string }[];
-    };
-    if (res.isError === true) return [];
-    return (JSON.parse(res.content[0]!.text) as { users: { handle: string }[] }).users.map(
-      (u) => u.handle,
-    );
-  };
-
-  /** Each peer subscribes to exactly one topic, so its presence in the roster names that topic. */
-  const peerOn = (topic: string): string => `peer-${topic}`;
 
   const SURFACES: Surface[] = [
     {
@@ -456,18 +441,6 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
       reaches: (h, topic) => ok(h.client, 'parley_fetch_recent', { topic }),
     },
     {
-      label: 'parley_list_users scoped',
-      tool: 'parley_list_users',
-      dimension: 'POST_FETCH',
-      reaches: async (h, topic) =>
-        (await rosterHandles(h.client, { topic })).includes(peerOn(topic)),
-    },
-    {
-      label: 'parley_list_users unscoped',
-      dimension: 'BOTH',
-      reaches: async (h, topic) => (await rosterHandles(h.client, {})).includes(peerOn(topic)),
-    },
-    {
       label: 'subscribe / catch-up',
       dimension: 'EXPLICIT',
       reaches: (h, topic) => Promise.resolve(h.allow.topics().some((t) => t === topic)),
@@ -477,7 +450,6 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
   const REACHES: Record<Dimension, Record<string, boolean>> = {
     EXPLICIT: { [EXPLICIT_TOPIC]: true, [PATTERN_ONLY_TOPIC]: false, [UNREACHABLE_TOPIC]: false },
     POST_FETCH: { [EXPLICIT_TOPIC]: true, [PATTERN_ONLY_TOPIC]: true, [UNREACHABLE_TOPIC]: false },
-    BOTH: { [EXPLICIT_TOPIC]: true, [PATTERN_ONLY_TOPIC]: true, [UNREACHABLE_TOPIC]: false },
   };
 
   async function harness(): Promise<Harness> {
@@ -489,20 +461,6 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
     const plugin = new FakePlugin();
     await plugin.connect({});
     const deps = toolDepsFor(plugin, cfg);
-    for (const topic of [EXPLICIT_TOPIC, PATTERN_ONLY_TOPIC, UNREACHABLE_TOPIC])
-      await plugin.post(
-        deps.presenceTopic,
-        asHandle(peerOn(topic)),
-        encodePresence({
-          v: 2,
-          kind: 'heartbeat',
-          at: Date.now(),
-          handle: peerOn(topic),
-          topics: [topic],
-          postTopics: [],
-          instanceId: `i-${topic}`,
-        }),
-      );
     const server = new McpServer(
       { name: 'parley', version: '0.0.0' },
       { capabilities: { tools: {} } },
@@ -511,7 +469,7 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
     await Promise.all([server.connect(serverT), client.connect(clientT)]);
-    return { client, allow: deps.allow, plugin, presenceTopic: deps.presenceTopic };
+    return { client, allow: deps.allow, plugin };
   }
 
   it('every registered tool has a row naming the dimension it consults', async () => {
@@ -520,7 +478,7 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
     const covered = [...new Set(SURFACES.flatMap((s) => (s.tool === undefined ? [] : [s.tool])))];
     expect(registered.filter((n) => !covered.includes(n))).toEqual([]);
     expect(new Set(SURFACES.map((s) => s.dimension))).toEqual(
-      new Set<Dimension>(['EXPLICIT', 'POST_FETCH', 'BOTH']),
+      new Set<Dimension>(['EXPLICIT', 'POST_FETCH']),
     );
   });
 
@@ -533,26 +491,5 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
   )('%s', async (_label, surface, topic) => {
     const h = await harness();
     expect(await surface.reaches(h, topic)).toBe(REACHES[surface.dimension][topic]);
-  });
-
-  // The other half of the union: a peer I cannot post to, but who advertises a post pattern reaching
-  // a topic I subscribe to, is unscoped-reachable through the EXPLICIT dimension alone.
-  it('the unscoped roster includes a peer reachable only inbound', async () => {
-    const h = await harness();
-    await h.plugin.post(
-      h.presenceTopic,
-      asHandle('peer-inbound'),
-      encodePresence({
-        v: 2,
-        kind: 'heartbeat',
-        at: Date.now(),
-        handle: 'peer-inbound',
-        topics: ['their-private'],
-        postTopics: ['ctx-.*'],
-        instanceId: 'i-inbound',
-      }),
-    );
-    expect(await rosterHandles(h.client, {})).toContain('peer-inbound');
-    expect(await rosterHandles(h.client, {})).not.toContain(peerOn(UNREACHABLE_TOPIC));
   });
 });

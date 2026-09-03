@@ -83,7 +83,7 @@ for each session, same idea as `instance_id`, just carried in the "wrong" config
 
 **The catch:** unlike Matrix, XMPP's `post()` **does** use the seam's `identity`. The sender is the
 MUC **nick**, and with `nick` unset the first post takes its own `identity.handle` as that nick, so
-a session keeps the same sender across restarts and core's roster is keyed the same way. Sharing
+a session keeps the same sender across restarts. Sharing
 `username`/`password` is therefore fine — the field that must differ per session is
 `identity.handle`.
 

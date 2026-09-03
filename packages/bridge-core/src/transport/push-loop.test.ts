@@ -4,7 +4,6 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { catchUpTopic } from '../engine/catchup.js';
-import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message, type Topic } from '../message.js';
@@ -111,10 +110,8 @@ describe('startPushLoop (core emit handler)', () => {
       registerTools(server, {
         plugin,
         identity: asHandle('agent'),
-        allow: new Allowlist(['ctx'], { reserved: [DEFAULT_PRESENCE_TOPIC] }),
+        allow: new Allowlist(['ctx']),
         seen,
-        presenceTopic: asTopic(DEFAULT_PRESENCE_TOPIC),
-        presenceTtlMs: 90_000,
         blockMaxMs: 1_000,
         blockPollIntervalMs: 20,
       });
@@ -228,9 +225,9 @@ describe('startPushLoop (core emit handler)', () => {
  * `m.topic` is a PLUGIN-supplied field that decides which `<channel topic=…>` the agent sees, and a
  * backend's subscribe primitive can be coarser than a topic — a NATS wildcard subject, a Matrix room
  * carrying several logical topics, a Zulip stream. Core enforces the allowlist on the SUBSCRIBE call;
- * without a re-check on delivery, an over-delivering plugin puts an unsubscribed topic (or a presence
- * beat, which DESIGN §14 says never surfaces as a `<channel>` event) straight into agent context.
- * Table what such a plugin can hand back, including near-misses that a loose comparison would admit.
+ * without a re-check on delivery, an over-delivering plugin puts an unsubscribed topic straight into
+ * agent context. Table what such a plugin can hand back, including near-misses that a loose
+ * comparison would admit.
  */
 describe('a plugin that over-delivers cannot put an unsubscribed topic into the session', () => {
   /** A plugin whose subscribe only captures the handler, so the test decides what gets delivered. */
@@ -246,7 +243,7 @@ describe('a plugin that over-delivers cannot put an unsubscribed topic into the 
     await startPushLoop(
       server,
       plugin,
-      new Allowlist(['ctx'], { reserved: [DEFAULT_PRESENCE_TOPIC] }),
+      new Allowlist(['ctx']),
       new SeenSet(),
       { mentionFilter: false, identity: asHandle('me') },
     );
@@ -272,7 +269,6 @@ describe('a plugin that over-delivers cannot put an unsubscribed topic into the 
   const DELIVERED: Array<[label: string, topic: string, emitted: boolean]> = [
     ['the subscribed topic', 'ctx', true],
     ['a sibling topic that was never allow-listed', 'ops-secret', false],
-    ['the reserved presence topic', DEFAULT_PRESENCE_TOPIC, false],
     ['the subscribed topic in another case', 'CTX', false],
     ['the subscribed topic with trailing whitespace', 'ctx ', false],
     ['a topic that merely extends the subscribed one', 'ctx-other', false],

@@ -77,8 +77,8 @@ export class XmppConnection {
     if (provisional === undefined || provisional === this.nick) return;
     console.error(
       `[parley-xmpp] could not take '${this.nick}' as this connection's MUC nick (another occupant ` +
-        `holds it); posting as '${provisional}' instead, so parley_list_users will report that ` +
-        'name. Pin backend_config.nick to a free name to fix this permanently.',
+        `holds it); posting as '${provisional}' instead, so that is the sender peers will see. ` +
+        'Pin backend_config.nick to a free name to fix this permanently.',
     );
     for (const room of this.joined.keys()) {
       if (room !== joiningRoom) this.roomNicks.set(room, this.occupantNick(room));

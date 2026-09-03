@@ -138,7 +138,6 @@ const SITES: Array<[name: string, run: (fail: () => never) => Promise<Outcome>]>
     'parley_fetch_recent (long-poll)',
     (fail) => toolOutcome('parley_fetch_recent', { topic: 'ctx', since: '1', block_ms: 200 }, fail),
   ],
-  ['parley_list_users', (fail) => toolOutcome('parley_list_users', {}, fail)],
 ];
 
 describe('every absent-topic site recognises the sentinel by contract, not by class identity', () => {

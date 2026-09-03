@@ -26,6 +26,13 @@ export type Cursor = Brand<string, 'Cursor'>;
 
 /** Mint a {@link Topic} from a raw string. The only sanctioned way to brand. */
 export const asTopic = (s: string): Topic => s as Topic;
+/**
+ * Cap the length of a {@link Handle}. The configured handle is written into the sender field of
+ * every message this bridge posts, and into the read-state path on disk, so an unbounded string
+ * would reach both the wire and the filesystem. A real handle is short.
+ */
+export const MAX_HANDLE_LEN = 128;
+
 /** Mint a {@link Handle} from a raw string. */
 export const asHandle = (s: string): Handle => s as Handle;
 /** Mint a {@link BackendMsgId} from a raw string. */

@@ -6,9 +6,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
-import { decodePresence, DEFAULT_PRESENCE_TOPIC, type PresenceKind } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asHandle, asTopic, type Handle, type Topic } from '../message.js';
+import { asHandle, asTopic } from '../message.js';
 import {
   FAILURE_SHAPE_NAMES,
   FAILURE_SHAPES,
@@ -17,65 +16,19 @@ import {
 } from '../testing/failure-shapes.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { createRemoteHttpApp } from './http.js';
-import { startPresenceLoop } from './presence-loop.js';
 import { startPushLoop } from './push-loop.js';
 
 /**
- * Core fires several seam calls and deliberately does NOT await them — the presence beats and the
- * live-push emit. Every one of them must absorb the failure whatever SHAPE it arrives in, because
- * an escaped rejection from a fire-and-forget call has no handler anywhere and Node terminates the
- * process: a best-effort beat killing the bridge it exists to advertise.
+ * Core fires seam calls it deliberately does NOT await — the live-push emit, and the per-request
+ * teardown remote mode runs from a response's `close` event. Every one of them must absorb the
+ * failure whatever SHAPE it arrives in, because an escaped rejection from a fire-and-forget call has
+ * no handler anywhere and Node terminates the process.
  *
  * Table the shapes against every fire-and-forget call site and assert on captured
  * `unhandledRejection` events, not on "the call returned" — a site that lets one escape returns
  * perfectly well and takes the process down a tick later.
  */
-const PRESENCE_TOPIC = asTopic(DEFAULT_PRESENCE_TOPIC);
-
-/** A plugin whose presence `post` fails — in the given shape — for ONE beat kind only. */
-function pluginFailingOn(kind: PresenceKind, shape: FailureShape): FakePlugin {
-  const p = new FakePlugin();
-  const orig = p.post.bind(p);
-  p.post = ((topic: Topic, identity: Handle, content: string) => {
-    const real = orig(topic, identity, content);
-    if (topic === PRESENCE_TOPIC && decodePresence(content)?.kind === kind) {
-      return FAILURE_SHAPES[shape](real);
-    }
-    return real;
-  }) as FakePlugin['post'];
-  return p;
-}
-
 describe('no fire-and-forget seam call escapes as an unhandled rejection', () => {
-  describe.each(['hello', 'heartbeat', 'goodbye'] as PresenceKind[])('presence %s', (kind) => {
-    it.each(FAILURE_SHAPE_NAMES)('whose post %s', async (shape) => {
-      const failing = pluginFailingOn(kind, shape);
-      await failing.connect({});
-      const attempts: PresenceKind[] = [];
-      const posted = failing.post.bind(failing);
-      failing.post = ((topic: Topic, identity: Handle, content: string) => {
-        const decoded = topic === PRESENCE_TOPIC ? decodePresence(content) : null;
-        if (decoded !== null) attempts.push(decoded.kind);
-        return posted(topic, identity, content);
-      }) as FakePlugin['post'];
-
-      const escaped = await unhandledDuring(async () => {
-        const loop = startPresenceLoop(failing, asHandle('agent'), new Allowlist(['ctx']), {
-          presenceTopic: PRESENCE_TOPIC,
-          heartbeatMs: 10,
-          goodbyeTimeoutMs: 50,
-        });
-        await new Promise((r) => setTimeout(r, 80));
-        await loop.stop();
-      });
-
-      expect(escaped).toEqual([]);
-      // The failing site was actually exercised — without this the row proves nothing.
-      expect(attempts).toContain(kind);
-      await failing.disconnect();
-    });
-  });
-
   describe.each(FAILURE_SHAPE_NAMES)('push emit whose channel notification %s', (shape) => {
     it('is absorbed by the emit path', async () => {
       const plugin = new FakePlugin();
@@ -119,11 +72,7 @@ describe('no fire-and-forget seam call escapes as an unhandled rejection', () =>
       it('is absorbed by the response-close teardown', async () => {
         const plugin = new FakePlugin();
         await plugin.connect({});
-        const cfg = parseConfig({
-          identity: { handle: 'agent' },
-          topics: ['ctx'],
-          presence: { enabled: false },
-        });
+        const cfg = parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] });
         const app = createRemoteHttpApp(plugin, cfg, { insecureNoAuth: true });
         const srv = await app.listen(0);
         const port = (srv.address() as AddressInfo).port;
@@ -183,9 +132,6 @@ describe('every fire-and-forget statement in engine/ + transport/ is a known one
     'engine/blocking-fetch.ts: work.then(resolve, reject).finally(() => signal.removeEventListener(\'abort\', onAbort));',
     'transport/http.ts: closeQuietly(\'transport\', transport);',
     'transport/http.ts: closeQuietly(\'reactive server\', server);',
-    'transport/presence-loop.ts: enqueue(\'hello\');',
-    'transport/presence-loop.ts: enqueue(\'heartbeat\'), opts.heartbeatMs);',
-    'transport/presence-loop.ts: work.catch(() => undefined).then(() => {',
     'transport/push-loop.ts: emitChannel(server, m).catch(() => {',
   ];
 
@@ -222,20 +168,5 @@ describe('the failure-shape fixtures are what they claim', () => {
       pending = FAILURE_SHAPES[shape](Promise.resolve());
     }).not.toThrow();
     await expect(pending).rejects.toBeDefined();
-  });
-
-  it.each(SYNC)('a plugin carrying "%s" throws synchronously from post()', async (shape) => {
-    const plugin = pluginFailingOn('hello', shape);
-    await plugin.connect({});
-    const hello = JSON.stringify({
-      v: 2,
-      kind: 'hello',
-      at: 0,
-      topics: ['ctx'],
-      postTopics: [],
-      instanceId: 'i',
-    });
-    expect(() => plugin.post(PRESENCE_TOPIC, asHandle('agent'), hello)).toThrow();
-    await plugin.disconnect();
   });
 });

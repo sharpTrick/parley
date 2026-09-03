@@ -616,34 +616,20 @@ describe('telegram fetchRecent network claim', () => {
 });
 
 /**
- * Core enables presence by default on a topic (`parley-presence`) that is not a Telegram chat id,
- * and core's presence loop swallows the failure — so an operator gets an empty roster and no
- * explanation. The sibling SaaS plugins warn about this in their READMEs; either this one resolves
- * the default topic or it carries the same warning, and either way the plugin says something.
+ * A topic that is neither a numeric chat id nor an `@channelusername` resolves to no chat. The
+ * caller's rejection says so; the operator gets a line on stderr too, so a misconfigured topic is
+ * not a silently dead one.
  */
-describe('telegram default presence topic', () => {
-  const DEFAULT_PRESENCE_TOPIC = 'parley-presence';
-
-  it('is either resolvable or documented as needing configuration', async () => {
-    captureStderr();
-    const { plugin } = await startRig();
-    const resolvable = await plugin
-      .fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) })
-      .then(() => true)
-      .catch(() => false);
-    if (resolvable) return;
-    const warning = /presence/i.test(readme) ? readme : '';
-    expect(warning).toMatch(/presence\.enabled.*false|presence\.topic/is);
-    expect(warning).toContain(DEFAULT_PRESENCE_TOPIC);
-  }, 20_000);
+describe('telegram diagnostics for an unresolvable topic', () => {
+  const UNRESOLVABLE_TOPIC = 'not-a-chat-id';
 
   it('writes a diagnostic when a topic resolves to no chat, instead of failing silently', async () => {
     const stderr = captureStderr();
     const { plugin } = await startRig();
     await expect(
-      plugin.fetchRecent({ topic: asTopic(DEFAULT_PRESENCE_TOPIC) }),
+      plugin.fetchRecent({ topic: asTopic(UNRESOLVABLE_TOPIC) }),
     ).rejects.toThrow(/not a Telegram chat id/);
-    expect(stderr.join('')).toContain(DEFAULT_PRESENCE_TOPIC);
+    expect(stderr.join('')).toContain(UNRESOLVABLE_TOPIC);
     expect(stderr.join('')).toMatch(/resolves to no Telegram chat/);
   }, 20_000);
 });

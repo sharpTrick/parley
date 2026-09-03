@@ -97,6 +97,22 @@ function recordIntervals(): Set<unknown> {
 }
 
 describe('close() releases every timer the factory acquired', () => {
+  // The rows below are all "every interval this factory armed was released", which a factory that
+  // arms none satisfies for free. Keep this control, so that a recorder that stopped seeing
+  // intervals at all cannot pass the whole describe.
+  it('the interval recorder sees a real interval (positive control)', async () => {
+    const created = recordIntervals();
+    for (const { build } of FACTORIES) {
+      const server = await build();
+      try {
+        await server.listen(await freePort());
+      } finally {
+        await server.close();
+      }
+    }
+    expect(created.size).toBeGreaterThan(0);
+  });
+
   it.each(ROWS)('%s leaves no interval of its own running', async (_name, { build }) => {
     const created = new Set<unknown>();
     const cleared = new Set<unknown>();
@@ -120,7 +136,6 @@ describe('close() releases every timer the factory acquired', () => {
     const server = await build();
     const port = await freePort();
     await server.listen(port);
-    expect(created.size).toBeGreaterThan(0); // the measurement itself must not be vacuous
     await server.close();
 
     const leaked = [...created].filter((h) => !cleared.has(h));
@@ -136,7 +151,6 @@ describe('close() releases every timer the factory acquired', () => {
     const server = await build();
     try {
       await server.listen(await freePort());
-      expect(created.size).toBeGreaterThan(0);
       expect([...created].filter((h) => h.hasRef?.() !== false)).toEqual([]);
     } finally {
       await server.close();
@@ -153,8 +167,10 @@ describe('close() releases every timer the factory acquired', () => {
  */
 describe("a factory's close()/listen() contract matches the transport's", () => {
   it.each(ROWS)('%s', async (_name: string, factory: Factory) => {
+    const armed = recordIntervals();
     const server = await factory.build();
     await server.listen(await freePort());
+    const armedByFirstListen = armed.size;
     await server.close();
 
     const port = await freePort();
@@ -171,7 +187,9 @@ describe("a factory's close()/listen() contract matches the transport's", () => 
     await server.listen(port);
     try {
       expect((await fetch(probe)).status).toBe(200);
-      expect(rearmed.size).toBeGreaterThan(0);
+      // Re-acquires exactly what the first listen acquired, so a factory whose close() releases
+      // more than listen() brings back is caught however many timers that happens to be.
+      expect(rearmed.size).toBe(armedByFirstListen);
     } finally {
       await server.close();
     }

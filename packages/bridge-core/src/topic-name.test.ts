@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
 import { asTopic } from './message.js';
 import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 
@@ -303,7 +302,7 @@ describe('safeName is pinned to the exact names backends already carry', () => {
         'a-0123456789abcdef-93c694cfb27491be',
       ],
       ['XMPP localpart', sanitizeLocal, 'Ops', {}, 'ops-907a54c2b2789a37'],
-      ['XMPP localpart', sanitizeLocal, DEFAULT_PRESENCE_TOPIC, {}, 'parley-presence'],
+      ['XMPP localpart', sanitizeLocal, 'parley-context', {}, 'parley-context'],
       ['deleting fold', sanitizeDelete, '!!!', {}, '-9a7b006d203b362c'],
       ['lowercasing deleting fold', sanitizeLowerDelete, 'Ops!', {}, 'ops-c2acb669c886c412'],
       ['Matrix alias', sanitizeAlias, 'a b', { hashLen: 16, sep: '.' }, 'a_b.7dbde93504122a70'],
@@ -346,35 +345,4 @@ describe('safeName is pinned to the exact names backends already carry', () => {
       expect(safeName(asTopic(topic), fold, opts)).toBe(expected);
     },
   );
-});
-
-// The presence topic is reserved by EXACT string equality in the Allowlist, so the guarantee that a
-// broad `post_topics` pattern cannot reach the roster rests on near-miss variants staying distinct
-// TOPICS all the way down to the backend name. This is the layer that decides that.
-describe('near-misses of the presence topic never share its backend name', () => {
-  const NEAR_MISSES = [
-    DEFAULT_PRESENCE_TOPIC,
-    DEFAULT_PRESENCE_TOPIC.toUpperCase(),
-    'Parley-Presence',
-    'parley presence',
-    'parley.presence',
-    'parley/presence',
-    'parley_presence',
-    `${DEFAULT_PRESENCE_TOPIC} `,
-    ` ${DEFAULT_PRESENCE_TOPIC}`,
-    `${DEFAULT_PRESENCE_TOPIC}\u200b`,
-    'parley\u00a0presence',
-  ];
-
-  it.each(folds)('every variant maps to its own name (%s)', (_l, fold) => {
-    const byName = new Map<string, string>();
-    for (const raw of NEAR_MISSES) {
-      const name = safeName(asTopic(raw), fold);
-      expect(byName.get(name), `${JSON.stringify(raw)} collides with the reserved topic`).toBe(
-        undefined,
-      );
-      byName.set(name, raw);
-    }
-    expect(byName.size).toBe(NEAR_MISSES.length);
-  });
 });

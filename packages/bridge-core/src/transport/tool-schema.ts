@@ -20,7 +20,7 @@ export function describeAllowed(allow: Allowlist): string {
   if (pats.length > 0) {
     s += ` Also allowed (post/fetch only): any topic fully matching regex ${pats
       .map((p) => JSON.stringify(p))
-      .join(', ')} — except the reserved presence topic, which is refused even when a pattern covers it.`;
+      .join(', ')}.`;
   }
   return s;
 }

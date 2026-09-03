@@ -3,7 +3,6 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
-import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import { registerTools, toolDepsFor, type ToolDeps } from '../transport/tools.js';
@@ -50,13 +49,8 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
     identity: asHandle('alice'),
     allow:
       opts.allow ??
-      new Allowlist(opts.topics ?? ['ctx', 'ctx-reviews'], {
-        postPatterns: opts.postPatterns,
-        reserved: [DEFAULT_PRESENCE_TOPIC],
-      }),
+      new Allowlist(opts.topics ?? ['ctx', 'ctx-reviews'], { postPatterns: opts.postPatterns }),
     seen: new SeenSet(),
-    presenceTopic: asTopic(DEFAULT_PRESENCE_TOPIC),
-    presenceTtlMs: 90_000,
     blockMaxMs: 60_000,
     blockPollIntervalMs: 20,
     now: undefined,
@@ -81,4 +75,22 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
   const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
   await Promise.all([server.connect(serverT), client.connect(clientT)]);
   return { plugin, client, deps };
+}
+
+/** The shape a tool result comes back in. Shared so every tool-facing suite agrees on it. */
+export interface ToolText {
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+}
+
+/** The JSON payload a tool answers with. */
+export const parse = (r: unknown): unknown => JSON.parse((r as ToolText).content[0]!.text);
+
+/**
+ * Only the overrides a case actually names reach the shared harness. Keep the undefined-stripping,
+ * so that an option a caller leaves unset keeps the harness default instead of opting OUT of the
+ * dependency — the harness reads an explicitly-undefined key as "this test wants it absent".
+ */
+export function harness(opts: ToolHarnessOptions = {}): Promise<ToolHarness> {
+  return toolClient(Object.fromEntries(Object.entries(opts).filter(([, v]) => v !== undefined)));
 }

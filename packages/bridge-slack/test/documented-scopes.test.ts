@@ -406,23 +406,15 @@ describe('slack config docs track what connect() actually enforces', () => {
 });
 
 /**
- * CLASS: a README consequence about CORE behaviour, asserted where the fact LIVES.
+ * CLASS: a README consequence that rests on a VENDOR rule, pinned as prose where the advice lives.
  *
- * The "give every session its own bot" warning used to justify itself with a roster collapse —
- * "their presence heartbeats all arrive as the same `senderHandle`, the roster collapses them into
- * one phantom peer … and hand-off by handle then targets the wrong instance". Core stopped working
- * that way: `computeRoster` keys on the presence RECORD's self-reported `handle` and scopes liveness
- * per per-process `instanceId`, precisely so bot-token backends do not collapse. The prose outlived
- * the mechanism, and an operator reading it provisions a second Slack app to avoid a failure that
- * does not occur.
- *
- * Only the PROSE is graded here. The mechanism belongs to core and is graded there behaviourally —
- * `packages/bridge-core/src/engine/presence.test.ts`, "the roster keys on the emitting bridge, not
- * on the backend sender", which tables both attributions and requires N bridges to be N peers. This
- * file used to pin it by regexing core's source for a private function's name, so a rename or a file
- * move inside core reddened Slack's suite and reported the failure against the wrong package.
+ * The section's advice — give every push-capable session its own Slack app — rests on Socket Mode
+ * routing each payload to exactly ONE of an app's open connections. The README used to claim the
+ * opposite ("every open socket receives every subscribed event"), which turns "at least its own bot
+ * user" into advice that silently drops half of each session's live pushes.
+ * `multi-session-push.test.ts` grades the behaviour; this keeps the prose from drifting back.
  */
-describe('slack multi-session docs track the roster mechanism in core', () => {
+describe('slack multi-session docs rest on the Socket Mode routing rule', () => {
   /** The section with its line wrapping collapsed, so a claim is matched as prose, not as layout. */
   const multiSession = (): string => {
     const readme = read('../README.md');
@@ -431,18 +423,6 @@ describe('slack multi-session docs track the roster mechanism in core', () => {
     return found![0]!.replace(/\s+/g, ' ');
   };
 
-  it('does not restate the superseded roster-collapse consequence', () => {
-    const text = multiSession();
-    for (const claim of [/roster collapses/i, /phantom peer/i, /targets the wrong instance/i]) {
-      expect(text, `superseded claim still present: ${String(claim)}`).not.toMatch(claim);
-    }
-  });
-
-  // The vendor rule the section's advice rests on: Socket Mode routes each payload to ONE of an
-  // app's open connections. The README used to claim the opposite ("every open socket receives every
-  // subscribed event"), which turns "at least its own bot user" into advice that silently drops half
-  // of each session's live pushes. `multi-session-push.test.ts` grades the behaviour; this keeps the
-  // prose from drifting back.
   it('does not restate the superseded claim that every open socket receives every event', () => {
     const text = multiSession();
     expect(text).not.toMatch(/every open socket receives/i);
@@ -450,16 +430,13 @@ describe('slack multi-session docs track the roster mechanism in core', () => {
     expect(text).toMatch(/own Slack app/i);
   });
 
-  it('states the consequences that do survive, and that the roster is not one of them', () => {
+  it('states the consequences that do survive', () => {
     const text = multiSession();
     // Attribution in agent context, which the conformance identity case pins executably…
     expect(text).toMatch(/senderHandle/);
     expect(text).toMatch(/one bot id/i);
-    // …the Socket Mode connection quota…
+    // …and the Socket Mode connection quota.
     expect(text).toMatch(/~10 concurrent connections per app token/);
-    // …and an explicit statement that `parley_list_users` is unaffected, so the corrected claim is
-    // itself pinned rather than merely absent.
-    expect(text).toMatch(/`parley_list_users` is \*\*not\*\* affected/);
   });
 });
 

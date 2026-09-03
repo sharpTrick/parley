@@ -5,11 +5,10 @@ import * as allowlistMod from '../allowlist.js';
 import {
   INITIALIZE,
   MCP_HEADERS,
-  NO_PRESENCE,
   serveRemoteHttp,
   type ServedApp,
 } from '../testing/http-app.js';
-import { parse } from '../testing/tool-cases.js';
+import { parse } from '../testing/tool-harness.js';
 
 /**
  * One subject: what a client gets back from the reactive /mcp endpoint, and what each POST costs.
@@ -42,7 +41,6 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'parley_fetch_recent',
-      'parley_list_users',
       'parley_post',
       'parley_reply',
     ]);
@@ -95,8 +93,7 @@ describe('reactive HTTP: what app scope amortizes, and what it does not', () => 
         readers.add(this);
         return realTopics.call(this);
       });
-    // Presence off: keep this focused on the request path (a presence loop reuses deps.allow anyway).
-    const { port, teardown } = await serveRemoteHttp({ insecureNoAuth: true }, NO_PRESENCE);
+    const { port, teardown } = await serveRemoteHttp({ insecureNoAuth: true });
     const c = await connectTo(port);
     try {
       // Several POSTs, each building a brand-new reactive server + transport. `parley_post`'s
@@ -129,7 +126,7 @@ describe('reactive HTTP: what app scope amortizes, and what it does not', () => 
  */
 describe('reactive HTTP is stateless: no session id, no GET/DELETE', () => {
   it('the initialize response carries no mcp-session-id header', async () => {
-    const { port, teardown } = await serveRemoteHttp({ insecureNoAuth: true }, NO_PRESENCE);
+    const { port, teardown } = await serveRemoteHttp({ insecureNoAuth: true });
     try {
       const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
         method: 'POST',

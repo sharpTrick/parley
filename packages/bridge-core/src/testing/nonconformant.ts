@@ -110,7 +110,6 @@ export const NONCONFORMANT_SHAPE_NAMES = Object.keys(NONCONFORMANT_SHAPES);
 export const FOREIGN_TOPIC_KINDS: Array<[name: string, topic: string]> = [
   ['an unconfigured topic', 'secret-ops'],
   ['a topic a post pattern allows but nothing subscribes to', 'ctx-pattern-only'],
-  ['the reserved presence topic', 'parley-presence'],
 ];
 
 /**

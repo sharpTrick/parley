@@ -230,46 +230,6 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   place in `bridge-core`.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
-- **Presence / liveness.** A bridge announces itself by posting `hello` / `heartbeat` /
-  `goodbye` to **one shared presence topic** (`presence.topic`, default `parley-presence`), and
-  each beat carries the instance's subscribed topics **plus its `post_topics` reach** (the regex
-  sources it may post to but does not subscribe, §14). This is isolated from real topics: the
-  presence topic is **never subscribed and never enters catch-up / dedup**, so heartbeats never
-  surface as `<channel>` events or pollute durable history — and because it is a single stream, a
-  human on a real chat backend mutes **one** topic instead of one per context. It is also
-  **reserved**: no `post` / `fetch_recent` (nor any `post_topics` pattern, §14) may target it, so
-  a peer cannot spoof the roster. The `parley_list_users` tool reconstructs a **reachability roster**
-  from `fetchRecent` over that one topic plus a TTL window — so it works **identically on every backend
-  with no new seam method** and reports each peer's subscribed topics **and post reach**. It is
-  reachability-first, **not just who is awake this instant**: because a post to a sleeping peer's topic
-  lands durably and it catches up on next start, the default roster also includes peers **seen recently
-  but currently offline**, each tagged `online: true | false`, most-recently-seen first (the top
-  hand-off candidates lead). `online_only: true` narrows to live peers; `since_ms` bounds how far back
-  offline peers reach (default 24h); `limit` caps the result. Its default (unscoped) roster is
-  **everyone you share a channel with in either direction** — peers subscribed to a topic *you* can
-  post to, or whose advertised `post_topics` can reach a topic *you* subscribe to — so a
-  freshly-onboarded agent on a unique topic still discovers the peers it can hand off to (advertised
-  pattern sources are inbound, so they are compiled defensively, never enumerated). Liveness is scoped
-  **per instance**: each beat carries a fresh per-process `instanceId`, and a handle is `online` iff
-  **any** of its instances has a fresh, non-`goodbye` beat — so a `goodbye` from an exiting process
-  reaps only its own instance and a relaunch's `hello` is never clobbered by the old process's trailing
-  `goodbye`. TTL reclaims crashed instances; `goodbye` is a best-effort fast-path. The roster envelope
-  is `{ users, truncated }` — `truncated: true` warns the scanned presence page was full, so offline
-  peers older than it are not guaranteed to appear. **Presence records are versioned** (`v`; current
-  line `v:2`): evolve the format *additively within a version* — new optional fields (e.g. `postTopics`
-  and the per-process `instanceId`, both added on the `v:2` line)
-  decode to a default on older readers and are ignored by them, so mixed-version fleets interoperate
-  and a rolling upgrade only forgoes the *new* signal until every peer is current. A **version bump
-  is a flag day**, not a graceful step: `decodePresence` returns null for any record whose `v` it
-  does not recognize (a `v:2` reader *drops* a `v:1` record — pre-v2 beats simply never land on the
-  shared presence topic), so a bump needs every peer on the same line, or a reader taught to accept
-  both versions. Prefer additive fields.
-  This is **Parley-participant liveness, not a human directory** — a human in a native chat client
-  appears only once they send a real message. A reactive-only front door (the chat instance)
-  cannot receive `<channel>` pushes and can set `presence.enabled: false` to stay silent. Powered
-  above the seam by `post`/`fetchRecent`; knobs in §11 (`presence`). Keep `presence.topic`
-  consistent across a deployment — bridges announcing on different presence topics cannot see each
-  other.
 
 ---
 
@@ -444,7 +404,7 @@ topics:                    # subscribe to / catch up on (one fetchRecent call ea
   - "ctx-payments"
   - "ctx-payments-reviews"
 post_topics:               # OPTIONAL extra topics allowed for post/fetch only, as full-match regexes
-  - "ctx-payments-.*"      # (never subscribed/caught-up; the presence topic can never be matched)
+  - "ctx-payments-.*"      # (never subscribed/caught-up)
 catchup:
   on_start: true
   limit: 100                    # page size per fetchRecent
@@ -456,13 +416,6 @@ catchup:
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
-presence:                  # announce hello/heartbeat/goodbye; powers parley_list_users (§7)
-  enabled: true            # DEFAULT ON, and it WRITES to the backend: on a real Matrix/Zulip
-                           # account the presence topic is a room/stream created on first beat.
-                           # Reactive-only front doors (chat) should set this false.
-  topic: "parley-presence" # ONE shared topic all bridges announce on; mute this one to hide presence
-  heartbeat_ms: 600000     # 10 min — agents stay subscribed a long time
-  ttl_ms: 1800000          # a handle is "live" if its last beat is within this window; default 3× heartbeat_ms
 permissions:
   skip_permissions: false  # NOT IMPLEMENTED — nothing in core or any plugin reads it (§14).
                            # `true` is a load error rather than an accepted no-op, so it can never
@@ -623,9 +576,7 @@ promise: *implement six methods, get a Claude bridge for your platform.*
 - **Topic allowlist.** The bridge only subscribes to / catches up on an explicit list of
   topics (`topics`). No wildcard-everything by default. `post_topics` optionally extends
   **post/fetch only** with full-match regex patterns (for a chat instance posting to ad-hoc
-  topics) — it never widens subscribe/catch-up/presence, which stay the explicit list. The
-  presence topic is **reserved**: no pattern, however broad, makes it postable/fetchable, so a
-  peer cannot spoof the presence roster.
+  topics) — it never widens subscribe/catch-up, which stay the explicit list.
 - **Inbound is untrusted.** A backend message becomes agent context; treat it as untrusted
   input, never as privileged instruction. With spawn deferred, worst case is "writes into a
   live session," but the prompt-injection surface concentrates here — keep backends private

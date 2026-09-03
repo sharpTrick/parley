@@ -6,7 +6,6 @@ import { errorDigest, hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
-import { startPresenceLoop, type PresenceLoop } from './presence-loop.js';
 import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
 
 /**
@@ -40,7 +39,7 @@ async function closeQuietly(what: string, target: { close: () => Promise<void> }
  * How long {@link RemoteHttpServer.close} lets an in-flight request finish before its socket is
  * destroyed. Node's `server.close()` waits for every open connection, and a `parley_fetch_recent`
  * long-poll holds one for its whole `catchup.block_max_ms` budget (60 s by default) — past a
- * `docker stop` grace period, so the process is SIGKILLed mid-teardown while the presence goodbye
+ * `docker stop` grace period, so the process is SIGKILLed mid-teardown while the shutdown
  * has already advertised it as gone. The tool layer answers an aborted long-poll with an empty
  * result, so cutting one short is safe.
  */
@@ -170,22 +169,8 @@ export function createRemoteHttpApp(
   opts.configureApp?.(app);
 
   // Derive the tool deps ONCE at app scope (config is constant), so the allowlist and its compiled
-  // regexes are shared by every per-request reactive server and by the presence loop below.
+  // regexes are shared by every per-request reactive server.
   const deps = toolDepsFor(plugin, cfg);
-
-  // The chat bridge is a long-lived participant too: announce presence off the shared plugin
-  // (the reactive servers are per-request and stateless, so presence lives at app scope). Keep this
-  // armed but NOT fired here — `listen` calls it only once the socket is up, so an app whose bind
-  // fails, or which is never listened on, can never advertise itself as reachable.
-  let presence: PresenceLoop | undefined;
-  const announce = (): void => {
-    if (cfg.presence.enabled) {
-      presence = startPresenceLoop(plugin, deps.identity, deps.allow, {
-        presenceTopic: deps.presenceTopic,
-        heartbeatMs: cfg.presence.heartbeat_ms,
-      });
-    }
-  };
 
   // Keep this fail-CLOSED default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
   // an open endpoint. A no-arg call must never mean "no auth".
@@ -261,8 +246,8 @@ export function createRemoteHttpApp(
     // `httpServer = s` is set synchronously so close() can still find it.
     listen: (port, host = '127.0.0.1') => {
       // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
-      // leave the first one bound forever and its presence loop beating past close(), advertising
-      // a shut-down bridge as online. Latch this SYNCHRONOUSLY rather than reading
+      // leave the first one bound forever, serving past close(). Latch this SYNCHRONOUSLY rather
+      // than reading
       // `server.listening`, which stays false for the whole window between `app.listen` and its
       // `listening` event — two overlapping starts both pass that check. A bind failure clears the
       // latch, so a failed listen stays retryable.
@@ -286,7 +271,6 @@ export function createRemoteHttpApp(
               return;
             }
             s.off('error', failed);
-            announce();
             resolve(s);
           });
           s.once('error', failed);
@@ -296,8 +280,8 @@ export function createRemoteHttpApp(
         }
       });
       // Keep this recorded for close(), so that a teardown arriving mid-bind can WAIT for the bind
-      // instead of reading `s.listening === false` and walking away from a socket and a presence
-      // loop that are about to exist with nothing left to stop them.
+      // instead of reading `s.listening === false` and walking away from a socket that is about to
+      // exist with nothing left to stop it.
       binding = bound.catch(() => undefined);
       return bound;
     },
@@ -309,8 +293,6 @@ export function createRemoteHttpApp(
     close: async () => {
       await binding;
       binding = undefined;
-      await presence?.stop().catch(() => {}); // best-effort goodbye, never blocks the close
-      presence = undefined;
       const s = httpServer;
       httpServer = undefined;
       starting = false;

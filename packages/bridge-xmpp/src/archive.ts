@@ -63,9 +63,8 @@ export class XmppArchive extends XmppConnection {
    * `limit` counts seam messages, not archive rows. A MUC archives subject changes, corrections,
    * retractions and moderation tombstones, none of which carry a `<body>`, so one page of `limit`
    * rows yields fewer messages than asked for — or none at all, on a room whose recent history
-   * happens to be made of them, which is also the window core builds its `parley_list_users` roster
-   * from. Keep the fill-to-limit loop, so that what the tail of the archive is made of cannot decide
-   * how much of the room a reader gets to see.
+   * happens to be made of them. Keep the fill-to-limit loop, so that what the tail of the archive is
+   * made of cannot decide how much of the room a reader gets to see.
    *
    * Keep the FIRST page's last row as the window tail, so that a window admitting nothing still
    * reports the newest row it SAW; any older row rewinds the caller's cursor back over history it

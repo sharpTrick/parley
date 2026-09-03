@@ -33,24 +33,18 @@ const EXAMPLES = new URL('../../../examples/multi-session/matrix/', import.meta.
 interface ShippedConfig {
   file: string;
   topics: string[];
-  /** Every room this bridge WRITES to — its listed topics plus the presence topic it beats on. */
-  writes: string[];
   backend: MatrixBackendConfig;
 }
 
 // Loaded through core's own `loadConfig`, so a config that would not even parse in production — or
-// that fails the schema — fails here rather than being read past by a bespoke parser. The write set
-// comes from the same load, so a reserved or derived topic core adds later is graded the day it
-// appears rather than the day an operator's roster goes quiet.
+// that fails the schema — fails here rather than being read past by a bespoke parser.
 const configs: ShippedConfig[] = readdirSync(EXAMPLES)
   .filter((f) => f.endsWith('.yaml'))
   .map((file) => {
     const doc = loadConfig(fileURLToPath(new URL(file, EXAMPLES)));
-    const topics = doc.topics.map(String);
     return {
       file,
-      topics,
-      writes: [...topics, ...(doc.presence.enabled ? [String(doc.presence.topic)] : [])],
+      topics: doc.topics.map(String),
       backend: doc.backend_config as MatrixBackendConfig,
     };
   });
@@ -80,25 +74,16 @@ describe('the shipped multi-session configs deploy as documented', () => {
   /**
    * Any of them may be the first to post to a shared room, and the creator's `invite` is the only
    * thing that admits the rest — so the requirement is symmetric, not "somebody invites everybody".
-   * Graded over every room a config WRITES to rather than over its listed `topics`: the presence
-   * topic is a room every presence-enabled bridge posts to and no config lists, so a fleet with
-   * disjoint topics still meets there — and the beat that 403s is swallowed by the presence loop,
-   * leaving that session absent from every peer's roster with no operator signal at all.
    */
   const sharedRooms = (a: ShippedConfig, b: ShippedConfig): string[] =>
-    a.writes.filter((t) => b.writes.includes(t));
-
-  it('the write set covers a room no config lists as a topic', () => {
-    const listed = new Set(configs.flatMap((c) => c.topics));
-    expect(configs.flatMap((c) => c.writes.filter((t) => !listed.has(t)))).not.toEqual([]);
-  });
+    a.topics.filter((t) => b.topics.includes(t));
 
   it.each(
     configs.flatMap((creator) =>
       configs
         .filter((peer) => peer !== creator && sharedRooms(creator, peer).length > 0)
         .map((peer): [string, ShippedConfig, ShippedConfig] => [
-          `${creator.file} writes to ${sharedRooms(creator, peer).join(', ')} with ${peer.file}`,
+          `${creator.file} shares ${sharedRooms(creator, peer).join(', ')} with ${peer.file}`,
           creator,
           peer,
         ]),

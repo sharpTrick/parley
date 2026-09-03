@@ -8,23 +8,25 @@ import {
   issueLines,
   messageOf,
 } from './config-diagnostics.js';
-import {
-  DEFAULT_PRESENCE_TOPIC,
-  MAX_HANDLE_LEN,
-  MAX_RECORD_TOPICS,
-  MAX_TOPIC_LEN,
-} from './engine/presence.js';
+import { MAX_HANDLE_LEN } from './message.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
+import { MAX_TOPIC_LEN } from './topic-name.js';
 
 export * from './config-auth.js';
 
 /**
+ * Most `topics` one config may carry. Each entry is a live subscription the push loop opens against
+ * the backend and an allowlist entry every call is matched against, so this bounds both the fan-out
+ * a single bridge asks a backend for and the per-call matching cost.
+ */
+export const MAX_TOPICS = 64;
+
+/**
  * Most `post_topics` patterns one config may carry. {@link isRedosSafeSource} bounds what ONE source
  * can spend, but `Allowlist.has` matches a caller-supplied topic against all of them in turn, so the
- * calibrated per-source cost multiplies by this count on every post/reply/fetch. Mirrors the
- * `MAX_RECORD_TOPICS` cap the presence path already puts on the same shape of untrusted list.
+ * calibrated per-source cost multiplies by this count on every post/reply/fetch.
  *
  * `Allowlist` enforces it too, for the embedder that builds one without going through this schema;
  * the `.max()` below is the earlier, better-located operator error.
@@ -39,19 +41,18 @@ export const MAX_POST_TOPICS = 64;
 export const MAX_BLOCK_MS = 300_000;
 
 /**
- * A string a presence beat carries verbatim. Capped where it is DECLARED, because every reader drops
- * a longer one out of the decoded record: a longer value loads cleanly and then leaves this bridge
- * silently unadvertised on it forever, with no error anywhere.
+ * One `topics` / `post_topics` entry. Capped where it is DECLARED rather than at each sink, because
+ * a topic name becomes a map key, a subscription registry entry and an operator diagnostic.
  */
-const beatString = z.string().min(1).max(MAX_TOPIC_LEN, {
-  message: `at most ${MAX_TOPIC_LEN} characters: a presence beat carries this string verbatim and every reader drops a longer one, so it would be silently unreachable for hand-off`,
+const topicString = z.string().min(1).max(MAX_TOPIC_LEN, {
+  message: `at most ${MAX_TOPIC_LEN} characters`,
 });
 
 /**
  * The single config object that drives a bridge (DESIGN §11). Sane defaults everywhere.
  * `backend_config` is opaque to core and passed verbatim to the plugin's `connect()`.
  *
- * Post-parse cross-field checks (regex compilation, presence-topic collision) live in the
+ * Post-parse cross-field checks (regex compilation) live in the
  * `.superRefine` on {@link ConfigSchema} below — they need the whole object.
  */
 const ConfigObject = z.object({
@@ -65,39 +66,34 @@ const ConfigObject = z.object({
   identity: z
     .object({
       handle: z.string().min(1).max(MAX_HANDLE_LEN, {
-        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: every presence beat carries it and a reader drops the WHOLE beat past that length, so this bridge would never appear in any peer's parley_list_users`,
+        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: it is written into the sender field of every message this bridge posts and into the read-state path on disk`,
       }),
     })
     .strict(),
   /**
-   * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped at 64
-   * entries: every presence beat advertises this whole list and every reader keeps only that many,
-   * so a longer list would load cleanly and then under-advertise this bridge on its trailing topics
-   * forever — no peer would ever see it as a hand-off partner there.
+   * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped because each
+   * entry is a live subscription the push loop opens against the backend AND an allowlist entry
+   * every `post`/`fetch_recent` is matched against, so the count bounds both fan-out and per-call
+   * matching cost.
    */
   topics: z
-    .array(beatString)
+    .array(topicString)
     .min(1)
-    .max(MAX_RECORD_TOPICS, {
-      message: `topics accepts at most ${MAX_RECORD_TOPICS} entries: a presence beat carries the whole list and every reader keeps only the first ${MAX_RECORD_TOPICS}, so the rest would be silently unreachable for hand-off`,
+    .max(MAX_TOPICS, {
+      message: `topics accepts at most ${MAX_TOPICS} entries: each one is a live subscription and an allowlist entry`,
     }),
   /**
    * Extra topics allowed for `post`/`fetch_recent` ONLY, as full-match regex sources (anchored
    * `^(?:…)$` at compile time). Lets a chat instance post to ad-hoc topics without listing each
    * one. These are never subscribed to and never caught up on — that stays the explicit `topics`
-   * list — but every presence beat DOES advertise them, as the record's `postTopics`: a peer
-   * matches its own topics against these sources to decide whether this bridge is reachable for
-   * hand-off (DESIGN §7). That topic is shared and readable by every participant on the backend,
-   * so a pattern source must not encode anything confidential — it is published verbatim on every
-   * beat. A pattern can never match the presence topic itself (it is reserved). Invalid
-   * regexes are rejected at load (DESIGN §14). Capped at 64 entries: the ReDoS screen
+   * list. Invalid regexes are rejected at load (DESIGN §14). Capped at 64 entries: the ReDoS screen
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
    * one of them, so the count is the other half of that bound. That bound clamps the INPUT too: a
    * pattern here widens post/fetch only to topics of at most 64 characters (`MAX_MATCH_INPUT`),
    * while this field and `topics` both accept a string of up to 512. A longer topic is refused
    * however well a pattern matches it, and has to be listed in `topics` to be reachable at all.
    */
-  post_topics: z.array(beatString).max(MAX_POST_TOPICS).default([]),
+  post_topics: z.array(topicString).max(MAX_POST_TOPICS).default([]),
   catchup: z
     .object({
       on_start: z.boolean().default(true),
@@ -138,32 +134,6 @@ const ConfigObject = z.object({
     })
     .strict()
     .default({}),
-  /**
-   * Presence (DESIGN §7): the bridge announces itself (hello/heartbeat/goodbye) to ONE shared
-   * `topic` so `parley_list_users` can report who is LIVE — even an idle instance that hasn't
-   * posted. Each beat carries the instance's subscribed topics, so a human only has to mute this
-   * single topic. `ttl_ms` is the liveness window (a handle counts as live if its last beat is
-   * within it); when unset it defaults to 3× `heartbeat_ms`. Reactive-only instances that cannot
-   * receive `<channel>` pushes (the chat front door) should set `enabled: false`.
-   */
-  presence: z
-    .object({
-      enabled: z.boolean().default(true),
-      topic: z.string().min(1).default(DEFAULT_PRESENCE_TOPIC),
-      heartbeat_ms: z
-        .number()
-        .int()
-        .positive()
-        .max(MAX_TIMER_MS, {
-          message: `presence.heartbeat_ms must be <= ${MAX_TIMER_MS} (ms): the beat arms a Node timer, and a cadence past that wraps to ~1 ms — every peer's parley_list_users then reads a presence topic under a post storm`,
-        })
-        .default(600_000),
-      ttl_ms: z.number().int().positive().optional(),
-    })
-    .strict()
-    .default({})
-    // Dependent default: TTL tracks the heartbeat unless explicitly pinned.
-    .transform((p) => ({ ...p, ttl_ms: p.ttl_ms ?? p.heartbeat_ms * 3 })),
   permissions: z
     .object({
       /**
@@ -189,8 +159,6 @@ const StrictConfigObject = ConfigObject.strict();
 
 /**
  * The load-time config schema: {@link ConfigObject} plus the checks that need the whole object.
- * A `post_topics` pattern that *could* match the presence topic is allowed — a broad `.*` is
- * legitimate — because the reserved guard in `Allowlist` blocks that at runtime.
  */
 export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
   cfg.post_topics.forEach((src, i) => {
@@ -218,23 +186,6 @@ export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
       });
     }
   });
-  if (cfg.topics.includes(cfg.presence.topic)) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['topics'],
-      message: `${JSON.stringify(cfg.presence.topic)} is reserved for presence (presence.topic); rename the topic or change presence.topic`,
-    });
-  }
-  // A ttl below the heartbeat cadence would make every genuinely running instance read as offline
-  // between beats. The dependent-default transform runs first, so `ttl_ms` is always a number here.
-  if (cfg.presence.ttl_ms < cfg.presence.heartbeat_ms) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['presence', 'ttl_ms'],
-      message:
-        'presence.ttl_ms must be >= presence.heartbeat_ms; peers would appear offline between beats',
-    });
-  }
   if (cfg.live_push.mention_filter && !cfg.live_push.enabled) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,

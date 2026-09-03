@@ -62,10 +62,6 @@ export {
   isFetchAbortedError,
   type BlockingFetchOptions,
 } from './engine/blocking-fetch.js';
-// Presence: the reachability roster derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
-// Only the topic default is public — the roster is assembled behind `parley_list_users`, so the
-// record/entry types would ship with no way to build, read or hand one back.
-export { DEFAULT_PRESENCE_TOPIC } from './engine/presence.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
 export { registerTools, toolDepsFor, TOOL_TEXT, type ToolDeps } from './transport/tools.js';
@@ -87,11 +83,6 @@ export {
   CHANNEL_NOTIFICATION_METHOD,
 } from './transport/channel-emit.js';
 export { startPushLoop, type PushLoopOptions } from './transport/push-loop.js';
-export {
-  startPresenceLoop,
-  type PresenceLoop,
-  type PresenceLoopOptions,
-} from './transport/presence-loop.js';
 export {
   buildBridge,
   createStdioBridge,

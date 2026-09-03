@@ -97,7 +97,7 @@ export class FakePlugin implements BackendPlugin {
       .sort((a, b) => a.seq - b.seq);
     // Keep the since-less branch on the NEWEST page, so that this fake stands in for the clause
     // every shipped backend implements (seam.ts: "the backend's default recent window"). Taking the
-    // oldest instead makes every core test that reads without a cursor — the roster, cold-start
+    // oldest instead makes every core test that reads without a cursor — cold-start
     // catch-up — grade the opposite end of history from production.
     const matched = args.since === undefined ? ordered.slice(-limit) : ordered.slice(0, limit);
     const last = matched.at(-1);

@@ -36,9 +36,8 @@ export interface MatrixBackendConfig {
    *
    * SECURITY: the `app.parley.topic` tag is UNTRUSTED, member-writable event content with no
    * server-enforced integrity — any member of the shared room can send a message whose tag names an
-   * arbitrary topic (including the reserved presence topic, entering `computeRoster` under its own
-   * homeserver-stamped sender). So in `shared_room` mode inbound data chooses which topic/allowlist
-   * bucket a message lands in. This mode is for TEST FIXTURES / rate-limited deployments ONLY and
+   * arbitrary topic. So in `shared_room` mode inbound data chooses which topic/allowlist bucket a
+   * message lands in. This mode is for TEST FIXTURES / rate-limited deployments ONLY and
    * MUST NOT carry mutually-distrusting topics. Production leaves this UNSET: one physically separate
    * Matrix room per topic, where the tag is ignored (rooms are the isolation boundary).
    */
@@ -215,8 +214,8 @@ export function configRisks(cfg: MatrixBackendConfig): string[] {
     risks.push(
       `backend_config.shared_room (${JSON.stringify(cfg.shared_room)}) folds EVERY topic into one ` +
         `Matrix room, isolated only by the member-forgeable '${TOPIC_KEY}' event tag: any member ` +
-        'of that room can post a message tagged with any other topic, including the presence ' +
-        'topic. Leave shared_room unset in production so each topic gets its own room.',
+        'of that room can post a message tagged with any other topic. Leave shared_room unset in ' +
+        'production so each topic gets its own room.',
     );
   }
   if (cfg.room_preset === 'public_chat') {

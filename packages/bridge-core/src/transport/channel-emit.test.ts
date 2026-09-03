@@ -37,7 +37,7 @@ describe('the wire strings are literals, taken from the channels reference', () 
     await plugin.connect({});
     const bridge = await buildBridge(
       plugin,
-      parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'], presence: { enabled: false } }),
+      parseConfig({ identity: { handle: 'agent' }, topics: ['ctx'] }),
     );
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });

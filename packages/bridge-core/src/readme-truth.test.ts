@@ -4,8 +4,8 @@ import { parse as parseYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { allowlistFor, TopicNotAllowedError } from './allowlist.js';
 import { parseConfig } from './config.js';
-import { MAX_TOPIC_LEN } from './engine/presence-beat.js';
 import { MAX_MATCH_INPUT } from './regex-safety.js';
+import { MAX_TOPIC_LEN } from './topic-name.js';
 
 // This package's README IS its API doc — it is what an operator reads before writing a config, and
 // the only place several capabilities are described in prose at all. Three backend packages ship a

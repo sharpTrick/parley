@@ -19,21 +19,15 @@ import type {
   FetchRecentResult,
   MessageHandler,
 } from '../seam.js';
-import {
-  POST_BEHAVIOUR_NAMES,
-  POST_BEHAVIOURS,
-  unhandledDuring,
-  type PostBehaviour,
-} from '../testing/failure-shapes.js';
-import { GOODBYE_TIMEOUT_MS } from './presence-loop.js';
+import { unhandledDuring } from '../testing/failure-shapes.js';
 import { buildBridge } from './stdio-bridge.js';
 
 /**
- * A recording BackendPlugin for the lifecycle tests. It timestamps every seam
- * call into a single ordered `events` log so a test can assert the RELATIVE order of `subscribe`
- * (push wiring) vs `post` to the presence topic (presence hello). Failure injection is opt-in:
- * `fetchThrows` makes on-start catch-up fail; `subscribeThrowsOn` makes the push loop fail on a
- * given topic. Nothing here is SQLite-specific — it exercises the core lifecycle, not a backend.
+ * A recording BackendPlugin for the lifecycle tests. It timestamps every seam call into a single
+ * ordered `events` log, so a test can assert what a startup or a teardown actually did. Failure
+ * injection is opt-in: `fetchThrows` makes on-start catch-up fail; `subscribeThrowsOn` makes the
+ * push loop fail on a given topic. Nothing here is SQLite-specific — it exercises the core
+ * lifecycle, not a backend.
  */
 type Event =
   | { type: 'connect' }
@@ -53,7 +47,6 @@ class RecordingPlugin implements BackendPlugin {
       fetchThrows?: boolean;
       subscribeThrowsOn?: string;
       connectThrows?: boolean;
-      post?: PostBehaviour;
       subscribeParks?: () => Promise<void>;
     } = {},
   ) {}
@@ -78,17 +71,14 @@ class RecordingPlugin implements BackendPlugin {
     }
   }
 
-  // Keep this method NON-async, so that a `rejects synchronously` behaviour really throws before
-  // returning a promise; an async wrapper would silently downgrade it to an ordinary rejection.
-  post(
+  async post(
     topic: Topic,
     _identity: Handle,
     content: string,
     _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
     this.events.push({ type: 'post', topic, content });
-    const id = Promise.resolve(asBackendMsgId(String(++this.seq)));
-    return this.opts.post === undefined ? id : POST_BEHAVIOURS[this.opts.post](id);
+    return asBackendMsgId(String(++this.seq));
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
@@ -102,13 +92,11 @@ class RecordingPlugin implements BackendPlugin {
   }
 }
 
-const PRESENCE_TOPIC = 'parley-presence';
-
 /** What `attach` accepts — the SDK's transport interface, as the bridge declares it. */
 type AnyTransport = Parameters<Awaited<ReturnType<typeof buildBridge>>['attach']>[0];
 
 /** Wall-clock ceiling a teardown must settle inside, whatever the backend does. */
-const TEARDOWN_BUDGET_MS = GOODBYE_TIMEOUT_MS + 1_500;
+const TEARDOWN_BUDGET_MS = 3_500;
 
 async function within<T>(budget: number, work: Promise<T>): Promise<T | 'TIMED OUT'> {
   return Promise.race<T | 'TIMED OUT'>([
@@ -124,7 +112,6 @@ describe('buildBridge lifecycle: catch-up failure rollback', () => {
       identity: { handle: 'agent' },
       topics: ['ctx'],
       // catchup.on_start defaults true
-      presence: { enabled: false },
     });
     await expect(buildBridge(plugin, cfg)).rejects.toThrow(/catch-up boom/);
     // The connected plugin (and its background timers) must not be orphaned: disconnect ran once.
@@ -136,37 +123,12 @@ describe('buildBridge lifecycle: catch-up failure rollback', () => {
 });
 
 describe('bridge attach ordering + rollback', () => {
-  it('wires the push loop (subscribe) BEFORE announcing presence (hello post)', async () => {
-    const plugin = new RecordingPlugin();
-    const cfg = parseConfig({
-      identity: { handle: 'agent' },
-      topics: ['ctx'],
-      live_push: { enabled: true },
-      presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
-    });
-    const bridge = await buildBridge(plugin, cfg);
-    const [, serverT] = InMemoryTransport.createLinkedPair();
-    await bridge.attach(serverT);
-    // The presence hello is posted on a microtask after attach() returns; wait for it to land.
-    await vi.waitFor(() =>
-      expect(plugin.events.some((e) => e.type === 'post' && e.topic === PRESENCE_TOPIC)).toBe(true),
-    );
-    const firstSubscribe = plugin.events.findIndex((e) => e.type === 'subscribe');
-    const firstPresencePost = plugin.events.findIndex(
-      (e) => e.type === 'post' && e.topic === PRESENCE_TOPIC,
-    );
-    expect(firstSubscribe).toBeGreaterThanOrEqual(0);
-    expect(firstPresencePost).toBeGreaterThan(firstSubscribe);
-    await bridge.shutdown();
-  });
-
   /**
    * Rollback must cover EVERY awaited call in the startup sequence, not the one that was reported —
    * including the transport handshake, which is not a seam call and so is easy to leave outside the
    * rollback window while the table still reads as exhaustive. Same post-conditions in every row:
-   * the call rejects, the connection is released exactly once, and nothing ever announced this
-   * bridge as reachable. `connect` is the one row where there is nothing to release — it never got
-   * a connection.
+   * the call rejects and the connection is released exactly once. `connect` is the one row where
+   * there is nothing to release — it never got a connection.
    */
   describe('every startup failure point rolls back identically', () => {
     const cfgWith = (over: Record<string, unknown> = {}) =>
@@ -174,7 +136,6 @@ describe('bridge attach ordering + rollback', () => {
         identity: { handle: 'agent' },
         topics: ['ctx', 'ops'],
         live_push: { enabled: true },
-        presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
         ...over,
       });
 
@@ -192,7 +153,7 @@ describe('bridge attach ordering + rollback', () => {
       ['subscribe of the FIRST topic', { subscribeThrowsOn: 'ctx' }, /subscribe boom/, 1, liveTransport],
       ['subscribe of a LATER topic', { subscribeThrowsOn: 'ops' }, /subscribe boom/, 1, liveTransport],
     ])(
-      'a failure in %s rejects, releases the connection, and never announces presence',
+      'a failure in %s rejects and releases the connection',
       async (_name, inject, message, expectedDisconnects, transport) => {
         const plugin = new RecordingPlugin(inject);
         const cfg = cfgWith();
@@ -208,20 +169,14 @@ describe('bridge attach ordering + rollback', () => {
 
         expect(failed.message).toMatch(message);
         expect(plugin.disconnectCount).toBe(expectedDisconnects);
-        // Give the (20ms) heartbeat several cycles: a rolled-back startup never advertises itself.
-        await new Promise((r) => setTimeout(r, 120));
-        expect(plugin.events.filter((e) => e.type === 'post' && e.topic === PRESENCE_TOPIC)).toEqual(
-          [],
-        );
       },
     );
   });
 
   /**
    * `shutdown()` racing `attach()`. Every await inside attach is a point where the latch can already
-   * be set by the time it resolves, and the steps AFTER it must not run — a presence loop started
-   * past teardown beats on forever, advertising a disconnected bridge as reachable, with shutdown()
-   * already spent. Park each await in turn, land a full shutdown() while it is parked, then release:
+   * be set by the time it resolves, and the steps AFTER it must not run — a step that starts past
+   * teardown outlives the shutdown that was supposed to release it. Park each await in turn, land a full shutdown() while it is parked, then release:
    * one row per await point, so an await added to attach without a matching latch recheck fails its
    * own row rather than riding along on a neighbour's.
    *
@@ -302,7 +257,6 @@ describe('bridge attach ordering + rollback', () => {
         identity: { handle: 'agent' },
         topics: ['ctx'],
         live_push: { enabled: true },
-        presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
       });
       const bridge = await buildBridge(plugin, cfg);
       const closeSpy = vi.spyOn(bridge.server, 'close');
@@ -316,11 +270,8 @@ describe('bridge attach ordering + rollback', () => {
         expect(await within(TEARDOWN_BUDGET_MS, bridge.shutdown())).not.toBe('TIMED OUT');
         g.open();
         expect(await within(TEARDOWN_BUDGET_MS, attaching)).toMatch(/bridge shut down while attaching/);
-        // Several heartbeat periods: a presence loop started past the latch would beat forever.
-        await new Promise((r) => setTimeout(r, 120));
       });
 
-      expect(plugin.events.filter((e) => e.type === 'post' && e.topic === PRESENCE_TOPIC)).toEqual([]);
       expect(escaped).toEqual([]);
       // The step that resumes after teardown must start nothing further: once the bridge has
       // disconnected, the only seam call left to make is the rollback's own second disconnect. This
@@ -337,40 +288,33 @@ describe('bridge attach ordering + rollback', () => {
   });
 
   /**
-   * The presence goodbye is a best-effort side channel; teardown must never be hostage to it. Table
-   * every `post` behaviour a backend can exhibit against BOTH teardown entry points on this root
-   * (an explicit shutdown, and the rollback inside a failed attach) and require a bounded return
-   * plus exactly one disconnect in every cell.
+   * Teardown must be bounded and release exactly once, through BOTH entry points on this root — an
+   * explicit shutdown, and the rollback inside a failed attach.
    */
-  describe('teardown is bounded whatever the presence post does', () => {
-    it.each(POST_BEHAVIOUR_NAMES)('shutdown() completes with a post that %s', async (post) => {
-      const plugin = new RecordingPlugin({ post });
+  describe('teardown is bounded and releases exactly once', () => {
+    it('shutdown() completes inside its budget and disconnects once', async () => {
+      const plugin = new RecordingPlugin();
       const cfg = parseConfig({
         identity: { handle: 'agent' },
         topics: ['ctx'],
         live_push: { enabled: false },
-        // A live cadence, so the heartbeat site is exercised too and not just hello + goodbye.
-        presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 180_000 },
       });
       const escaped = await unhandledDuring(async () => {
         const bridge = await buildBridge(plugin, cfg);
         const [, serverT] = InMemoryTransport.createLinkedPair();
         await bridge.attach(serverT);
-        await new Promise((r) => setTimeout(r, 60)); // several heartbeats
         expect(await within(TEARDOWN_BUDGET_MS, bridge.shutdown())).not.toBe('TIMED OUT');
       });
       expect(plugin.disconnectCount).toBe(1);
-      // A best-effort beat may fail; it may never take the process down with it.
       expect(escaped).toEqual([]);
     });
 
-    it.each(POST_BEHAVIOUR_NAMES)('a failed attach rolls back with a post that %s', async (post) => {
-      const plugin = new RecordingPlugin({ post, subscribeThrowsOn: 'ops' });
+    it('a failed attach rolls back, and a later shutdown() does not release again', async () => {
+      const plugin = new RecordingPlugin({ subscribeThrowsOn: 'ops' });
       const cfg = parseConfig({
         identity: { handle: 'agent' },
         topics: ['ctx', 'ops'],
         live_push: { enabled: true },
-        presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
       });
       const bridge = await buildBridge(plugin, cfg);
       const [, serverT] = InMemoryTransport.createLinkedPair();
@@ -389,10 +333,9 @@ describe('bridge attach ordering + rollback', () => {
     });
 
     /**
-     * A teardown step that REJECTS is the case the table above cannot reach: every `post` behaviour
-     * it injects is swallowed by the best-effort presence beat. Latching the "already torn down"
-     * flag and then short-circuiting on the first rejection skipped `server.close()` forever and made
-     * every retry a silent no-op — on the stdio root that leaves stdin resumed, so an operator's
+     * A teardown step that REJECTS is its own case. Latching the "already torn down" flag and then
+     * short-circuiting on the first rejection skipped `server.close()` forever and made every retry
+     * a silent no-op — on the stdio root that leaves stdin resumed, so an operator's
      * signal handler awaiting shutdown() never returns. Cross the failing step with both teardown
      * entry points and require, in every cell, that the OTHER steps still ran exactly once.
      */
@@ -415,7 +358,6 @@ describe('bridge attach ordering + rollback', () => {
             identity: { handle: 'agent' },
             topics: ['ctx', 'ops'],
             live_push: { enabled: failingAttach },
-            presence: { enabled: true, heartbeat_ms: 60_000, ttl_ms: 180_000 },
           });
           const bridge = await buildBridge(plugin, cfg);
           const closeSpy = vi.spyOn(bridge.server, 'close');
@@ -443,32 +385,5 @@ describe('bridge attach ordering + rollback', () => {
         },
       );
     });
-
-    it('the sync-throw behaviour reaches the bridge as a real synchronous throw', () => {
-      const plugin = new RecordingPlugin({ post: 'rejects synchronously' });
-      expect(() => plugin.post(asTopic('ctx'), asHandle('agent'), 'x')).toThrow();
-    });
-  });
-
-  it('a failed attach (subscribe rejects) rejects and leaves NO presence loop beating', async () => {
-    const plugin = new RecordingPlugin({ subscribeThrowsOn: 'ops' });
-    const cfg = parseConfig({
-      identity: { handle: 'agent' },
-      topics: ['ctx', 'ops'],
-      live_push: { enabled: true },
-      presence: { enabled: true, heartbeat_ms: 20, ttl_ms: 1_000 },
-    });
-    const bridge = await buildBridge(plugin, cfg);
-    const [, serverT] = InMemoryTransport.createLinkedPair();
-    await expect(bridge.attach(serverT)).rejects.toThrow(/subscribe boom/);
-    // Because push is wired BEFORE presence, a subscribe failure means presence was never started —
-    // the bridge is not left half-live advertising reachability. Give the (short) heartbeat several
-    // cycles: still no presence post ever appears.
-    await new Promise((r) => setTimeout(r, 120));
-    const presencePosts = plugin.events.filter(
-      (e) => e.type === 'post' && e.topic === PRESENCE_TOPIC,
-    );
-    expect(presencePosts).toHaveLength(0);
-    await bridge.shutdown().catch(() => {});
   });
 });

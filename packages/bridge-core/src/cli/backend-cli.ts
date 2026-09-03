@@ -75,7 +75,7 @@ export interface ShutdownHost {
 /**
  * Run `onShutdown` at most once, on a terminating signal or on stdin EOF. Keep both stdin events
  * AND the once-only guard: an orphaned bridge (parent crashed or SIGKILLed) gets EOF and no signal,
- * so without them it heart-beats a ghost peer into every peer's roster — and 'end' followed by
+ * so without them a torn-down bridge lingers — and 'end' followed by
  * 'close', or a signal racing EOF, would otherwise tear the bridge down twice.
  *
  * Keep the two state checks alongside those listeners, so that an EOF which arrived while the

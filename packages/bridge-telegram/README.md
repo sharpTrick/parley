@@ -135,14 +135,6 @@ store's dedup makes the replay harmless.
 | `observed_retention_per_topic` | _(unset)_   | Deprecated spelling of `observed_retention_per_chat` — the bound is per chat, and `chat_map` can give one chat two topic names. Still honoured; the new key wins when both are set. |
 | `observed_max_chats` | `1000`                 | Max **unserved** chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or one of the 1000 most recently named by a seam call — a mark that is persisted with the store) are never evicted and are retained *on top of* this cap, so it bounds the chats anyone-can-add-the-bot traffic creates, not the store's total. Unserved chats displace each other least-recently-active first once the cap is reached. |
 
-> **Presence needs a real chat id.** Core enables presence by default (`presence.enabled: true`,
-> `presence.topic: parley-presence`), and on Telegram a topic string **is a chat id** — so the
-> out-of-the-box topic is neither a numeric id nor an `@channelusername` and can never resolve.
-> Either set `presence.enabled: false`, or point `presence.topic` at a real chat (directly, or
-> through `chat_map`). Left as-is, every heartbeat fails (core's presence loop swallows it, by
-> design) and `parley_list_users` reports an empty roster; the plugin writes one throttled stderr
-> line per unresolvable topic so the failure is not completely silent.
-
 Every key is checked before anything is dialled, and an **unknown key is a load error** naming
 the accepted set — a misspelled `chat_maps` would otherwise be dropped in silence, leaving
 every topic used as a literal chat id.

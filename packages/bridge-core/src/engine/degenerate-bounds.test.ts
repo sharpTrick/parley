@@ -1,19 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { Allowlist } from '../allowlist.js';
-import { asHandle, asTopic } from '../message.js';
+import { asTopic } from '../message.js';
 import { connectedFake } from '../testing/fake-plugin.js';
 import { MAX_TIMER_MS } from '../timer-bounds.js';
-import { GOODBYE_TIMEOUT_MS, startPresenceLoop, type PresenceLoop } from '../transport/presence-loop.js';
 import { fetchRecentBlocking } from './blocking-fetch.js';
 import { SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, SeenSet } from './seen-set.js';
 
 /**
  * Core's sizing knobs are all embedder-facing: `new SeenSet(a, b)`, `fetchRecentBlocking`'s poll
- * budget, `startPresenceLoop`'s cadence. Wire any of them from a mis-set config and a degenerate
- * value does not shrink the feature, it DELETES it — a zero dedup window re-emits every message as a
- * `<channel>` event forever, a zero poll interval turns a long poll into a single fetch, a sub-1 ms
- * cadence turns a heartbeat into a post storm — and it does so with no error and no log. Fail fast
- * instead. Table every such knob against the values that would degrade it, and pair each with the
+ * budget. Wire any of them from a mis-set config and a degenerate value does not shrink the feature,
+ * it DELETES it — a zero dedup window re-emits every message as a `<channel>` event forever, a zero
+ * poll interval turns a long poll into a single fetch — and it does so with no error and no log.
+ * Fail fast instead. Table every such knob against the values that would degrade it, and pair each with the
  * legal value it must still accept, so "reject everything" is not a passing answer.
  *
  * A knob whose value reaches a Node TIMER is degenerate off BOTH ends, which is the half that keeps
@@ -43,13 +40,6 @@ interface Knob {
   timerBacked?: true;
   cleanup?: (made: unknown) => Promise<void>;
 }
-
-const presenceDeps = async () => ({
-  plugin: await connectedFake(),
-  identity: asHandle('agent'),
-  allow: new Allowlist(['ctx']),
-  presenceTopic: asTopic('parley-presence'),
-});
 
 const KNOBS: Knob[] = [
   {
@@ -84,32 +74,6 @@ const KNOBS: Knob[] = [
       fetchRecentBlocking(await connectedFake(), { topic: asTopic('ctx') }, { blockMs, pollIntervalMs: 250 }),
     degenerate: [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY],
     legal: 0,
-  },
-  {
-    label: 'startPresenceLoop heartbeatMs',
-    build: async (heartbeatMs) => {
-      const { plugin, identity, allow, presenceTopic } = await presenceDeps();
-      return startPresenceLoop(plugin, identity, allow, { presenceTopic, heartbeatMs });
-    },
-    degenerate: DEGENERATE_TIMER_MS,
-    legal: 600_000,
-    timerBacked: true,
-    cleanup: (made) => (made as PresenceLoop).stop(),
-  },
-  {
-    label: 'startPresenceLoop goodbyeTimeoutMs',
-    build: async (goodbyeTimeoutMs) => {
-      const { plugin, identity, allow, presenceTopic } = await presenceDeps();
-      return startPresenceLoop(plugin, identity, allow, {
-        presenceTopic,
-        heartbeatMs: 600_000,
-        goodbyeTimeoutMs,
-      });
-    },
-    degenerate: DEGENERATE_TIMER_MS,
-    legal: GOODBYE_TIMEOUT_MS,
-    timerBacked: true,
-    cleanup: (made) => (made as PresenceLoop).stop(),
   },
 ];
 
@@ -192,7 +156,7 @@ describe('every knob whose value reaches a Node timer is tabled against the time
   }
 
   it('derives at least the knobs it was written against (guards against a blind derivation)', () => {
-    expect(KNOBS.filter((k) => k.timerBacked).length).toBeGreaterThanOrEqual(3);
+    expect(KNOBS.filter((k) => k.timerBacked).length).toBeGreaterThanOrEqual(1);
   });
 
   it('marks exactly the knobs that arm a timer with their own value', async () => {

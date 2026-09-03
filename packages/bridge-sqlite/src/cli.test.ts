@@ -65,10 +65,6 @@ function writeConfig(
     '  - ctx',
     'live_push:',
     '  enabled: true',
-    'presence:',
-    '  enabled: true',
-    '  heartbeat_ms: 500',
-    '  ttl_ms: 2000',
     'backend_config:',
     `  db_path: ${join(dir, 'eof.db')}`,
     '  poll_interval_ms: 100',
@@ -191,7 +187,7 @@ describe('the documented cost of a stale persisted cursor is the cost the CLI pa
 
 // End-to-end: spawn the built CLI with a piped stdin, wait for "bridge up", then close the
 // parent's write end (EOF WITHOUT a signal — the orphaned-parent scenario). The child must run
-// shutdown() and EXIT promptly, rather than lingering with the live poll loop + presence heartbeat.
+// shutdown() and EXIT promptly, rather than lingering with the live poll loop.
 describe('orphaned stdio bridge exits on stdin EOF (e2e)', () => {
   it('exits within a short timeout after the parent closes stdin (no signal)', async () => {
     const dir = tmp();
@@ -200,7 +196,7 @@ describe('orphaned stdio bridge exits on stdin EOF (e2e)', () => {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Wait for the bridge to be fully up (poll loop + presence heartbeat live) before EOF.
+    // Wait for the bridge to be fully up (poll loop live) before EOF.
     await new Promise<void>((resolve, reject) => {
       let buf = '';
       const to = setTimeout(() => reject(new Error('bridge did not start: ' + buf)), 10_000);

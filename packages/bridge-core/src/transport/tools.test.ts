@@ -1,26 +1,18 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
-import { DEFAULT_PRESENCE_TOPIC } from '../engine/presence.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asHandle, asTopic } from '../message.js';
 import type { FetchRecentArgs } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { NONCONFORMANT_SHAPES, NONCONFORMANT_SHAPE_NAMES } from '../testing/nonconformant.js';
-import {
-  harness,
-  parse,
-  postBeat,
-  type RosterResult,
-  type ToolText,
-} from '../testing/tool-cases.js';
-import { MAX_FETCH_LIMIT, PRESENCE_FETCH_LIMIT, toolDepsFor } from './tools.js';
+import { harness, parse, type ToolText } from '../testing/tool-harness.js';
+import { MAX_FETCH_LIMIT, toolDepsFor } from './tools.js';
 
 /**
  * One subject: the reactive tool surface — which tools are registered, what a call to one does,
  * which topics and argument values it accepts, and what its rendered description advertises. What a
- * tool answers when there is nothing to answer with lives in tool-outcomes.test.ts; the roster tool
- * has its own module and its own suite in list-users-tool.test.ts.
+ * tool answers when there is nothing to answer with lives in tool-outcomes.test.ts.
  */
 
 describe('reactive MCP tools (real Server↔Client path)', () => {
@@ -30,11 +22,10 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
     ({ client, plugin } = await harness());
   });
 
-  it('advertises fetch_recent, post, reply, and list_users', async () => {
+  it('advertises fetch_recent, post, and reply', async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'parley_fetch_recent',
-      'parley_list_users',
       'parley_post',
       'parley_reply',
     ]);
@@ -134,7 +125,7 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
   });
 });
 
-describe('post_topics regex patterns + presence reservation', () => {
+describe('post_topics regex patterns', () => {
   it('posts to and fetches a pattern-matched topic outside the explicit list', async () => {
     const { client, plugin } = await harness({ postPatterns: ['ctx-.*'] });
     const res = (await client.callTool({
@@ -161,52 +152,24 @@ describe('post_topics regex patterns + presence reservation', () => {
     expect(res.content[0]!.text).toContain('topic not allowed');
   });
 
-  it('never lets a broad pattern reach the reserved presence topic', async () => {
-    const { client } = await harness({ postPatterns: ['.*'] });
-    for (const name of ['parley_post', 'parley_fetch_recent'] as const) {
-      const res = (await client.callTool({
-        name,
-        arguments: name === 'parley_post' ? { topic: DEFAULT_PRESENCE_TOPIC, content: 'x' } : { topic: DEFAULT_PRESENCE_TOPIC },
-      })) as ToolText;
-      expect(res.isError).toBe(true);
-      expect(res.content[0]!.text).toContain('topic not allowed');
-    }
-  });
-
   /**
    * A description is shipped to the model in the tool list, so a claim it makes is as load-bearing as
    * the handler — and a claim only prose asserts drifts silently. Pair each one with the behaviour it
    * describes in the SAME case, so neither half can move alone.
    */
   describe('the advertised allowlist matches what the handler accepts', () => {
-    it('a pattern advertised as "any topic fully matching" discloses the presence exception', async () => {
+    it('a broad pattern is advertised as the "any topic fully matching" set it opens', async () => {
       const { client } = await harness({ postPatterns: ['.*'] });
       const { tools } = await client.listTools();
       for (const name of ['parley_post', 'parley_fetch_recent'] as const) {
         const description = tools.find((t) => t.name === name)!.description!;
         expect(description).toContain('any topic fully matching regex ".*"');
-        expect(description).toMatch(/reserved presence topic/);
       }
-    });
-
-    it('the unscoped roster reaches beyond the configured topics, as its `topic` field now says', async () => {
-      const { client, plugin } = await harness({ topics: ['ctx-mine'], postPatterns: ['ctx-.*'] });
-      await postBeat(plugin, 'pattern-only-peer', ['ctx-theirs'], 'hello', Date.now());
-      const out = parse(
-        await client.callTool({ name: 'parley_list_users', arguments: {} }),
-      ) as RosterResult;
-      // `ctx-theirs` is not a configured topic — only a pattern reaches it — yet the peer is listed.
-      expect(out.users.map((u) => u.handle)).toEqual(['pattern-only-peer']);
-
-      const { tools } = await client.listTools();
-      const props = tools.find((t) => t.name === 'parley_list_users')!.inputSchema.properties as Record<
-        string,
-        { description?: string }
-      >;
-      const topicField = props.topic?.description ?? '';
-      expect(topicField).toMatch(/either direction/);
-      // The claim the behaviour above contradicts. Its absence is the point of this case.
-      expect(topicField).not.toMatch(/default scope is the\s+configured topics/);
+      const res = (await client.callTool({
+        name: 'parley_post',
+        arguments: { topic: 'anything-at-all', content: 'x' },
+      })) as ToolText;
+      expect(res.isError).toBeFalsy();
     });
   });
 });
@@ -231,12 +194,12 @@ describe('every numeric tool argument is bounded before it reaches the backend',
     return seen;
   }
 
-  // Both ceilings are shipped defaults no caller can override, and every case around them derives
-  // its probe from the constant — so a silent shrink would move the whole table with it. Pin the
-  // two by VALUE as well, and grade the fetch cap AT its boundary rather than only above it: a
-  // one-sided "<= cap" is satisfied by a handler that clamps everything to 1.
-  it('pins the shipped ceilings', () => {
-    expect([MAX_FETCH_LIMIT, PRESENCE_FETCH_LIMIT]).toEqual([1_000, 500]);
+  // The ceiling is a shipped default no caller can override, and every case around it derives its
+  // probe from the constant — so a silent shrink would move the whole table with it. Pin it by VALUE
+  // as well, and grade the cap AT its boundary rather than only above it: a one-sided "<= cap" is
+  // satisfied by a handler that clamps everything to 1.
+  it('pins the shipped ceiling', () => {
+    expect(MAX_FETCH_LIMIT).toBe(1_000);
   });
 
   it.each([
@@ -272,22 +235,6 @@ describe('every numeric tool argument is bounded before it reaches the backend',
     }
   });
 
-  it.each(VALUES)('parley_list_users with limit=%d and since_ms=%d', async (value) => {
-    const { client, plugin } = await harness({ now: () => 1_000_000, presenceTtlMs: 90_000 });
-    await postBeat(plugin, 'claude-a', ['ctx'], 'hello', 999_000);
-    const seen = recordFetches(plugin);
-
-    const out = parse(
-      await client.callTool({
-        name: 'parley_list_users',
-        arguments: { limit: value, since_ms: value },
-      }),
-    ) as RosterResult;
-
-    // The roster's cost is fixed by the presence page, whatever the caller asks for.
-    for (const call of seen) expect(call.limit).toBe(PRESENCE_FETCH_LIMIT);
-    expect(out.users.length).toBeLessThanOrEqual(Math.min(value, PRESENCE_FETCH_LIMIT));
-  });
 });
 
 /**
@@ -295,8 +242,8 @@ describe('every numeric tool argument is bounded before it reaches the backend',
  * explicit that a longer page is legal — testing/nonconformant.ts ships it as a shape core must
  * survive — and the returned page is the number that decides how much untrusted text enters the
  * agent's context and how many ids are written into a per-topic dedup window of SEEN_MAX_PER_TOPIC
- * entries. `parley_list_users` already folds at most one page; `parley_fetch_recent` forwarded
- * whatever it was handed, so a 5000-message answer to `limit: 1` both filled the context and flushed
+ * entries. `parley_fetch_recent` forwarded whatever it was handed, so a 5000-message answer to
+ * `limit: 1` both filled the context and flushed
  * the topic's dedup window, after which the push loop re-delivered what had just been pulled.
  *
  * Drive it from the shared shapes rather than from a hand-written over-deliverer, and DERIVE which
@@ -322,7 +269,7 @@ describe('a result-returning tool bounds the page it hands back, not only the on
         .filter((t) => /Returns \{ (?:messages|users)/.test(t.description ?? ''))
         .map((t) => t.name)
         .sort(),
-    ).toEqual(['parley_fetch_recent', 'parley_list_users']);
+    ).toEqual(['parley_fetch_recent']);
   });
 
   it.each(
@@ -361,11 +308,9 @@ describe('toolDepsFor (single ToolDeps factory)', () => {
     // stdio root: passes its shared push-loop `seen`.
     const deps = toolDepsFor(plugin, cfg, { seen });
     expect(deps.plugin).toBe(plugin);
-    // Matches the fields the stdio bridge used to spell out inline (identity/allow/presenceTopic/ttl).
+    // Matches the fields the stdio bridge used to spell out inline (identity/allow/block bounds).
     expect(deps.identity).toBe(asHandle(cfg.identity.handle));
     expect(deps.allow.topics()).toEqual(['ctx', 'ctx-reviews']);
-    expect(deps.presenceTopic).toBe(asTopic(cfg.presence.topic));
-    expect(deps.presenceTtlMs).toBe(cfg.presence.ttl_ms);
     expect(deps.blockMaxMs).toBe(cfg.catchup.block_max_ms);
     expect(deps.blockPollIntervalMs).toBe(cfg.catchup.block_poll_interval_ms);
     expect(deps.seen).toBe(seen);
