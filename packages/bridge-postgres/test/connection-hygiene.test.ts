@@ -1,4 +1,4 @@
-import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
+import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import {
@@ -36,11 +36,9 @@ interface Priv {
   subs: Map<string, unknown>;
   subscribing: Map<string, unknown>;
   listens: Map<string, unknown>;
-  waiters: Map<string, unknown>;
-  pendingAborts: Set<unknown>;
 }
 
-const DRAINED = { subs: 0, subscribing: 0, listens: 0, waiters: 0, pendingAborts: 0 };
+const DRAINED = { subs: 0, subscribing: 0, listens: 0 };
 
 const priv = (plugin: PostgresPlugin): Priv => plugin as unknown as Priv;
 
@@ -49,12 +47,10 @@ function registrySizes(priv: Priv): Record<string, number> {
     subs: priv.subs.size,
     subscribing: priv.subscribing.size,
     listens: priv.listens.size,
-    waiters: priv.waiters.size,
-    pendingAborts: priv.pendingAborts.size,
   };
 }
 
-type Opener = 'connect' | 'subscribe' | 'blocking-fetch' | 'reconnect';
+type Opener = 'connect' | 'subscribe' | 'reconnect';
 /** Whether disconnect() lands while the connection is still being established, or after it is. */
 type When = 'in-flight' | 'settled';
 
@@ -64,7 +60,7 @@ interface RaceCell {
 }
 
 const RACE_CELLS: RaceCell[] = (
-  ['connect', 'subscribe', 'blocking-fetch', 'reconnect'] as Opener[]
+  ['connect', 'subscribe', 'reconnect'] as Opener[]
 ).flatMap((opener) => (['in-flight', 'settled'] as When[]).map((when) => ({ opener, when })));
 
 /**
@@ -111,10 +107,7 @@ if (await isUp(PG_URL)) {
             // Land inside the reconnect backoff so the replacement connect() is in flight.
             await sleep(cell.when === 'in-flight' ? 505 : 1200);
           } else {
-            const started =
-              cell.opener === 'subscribe'
-                ? settle(plugin.subscribe(topic, () => undefined))
-                : settle(plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 5000 }));
+            const started = settle(plugin.subscribe(topic, () => undefined));
             pending.push(started);
             if (cell.when === 'in-flight') await awaitListenerInFlight(priv);
             else await awaitListenerAdopted(priv);

@@ -152,19 +152,6 @@ const DRIVERS: Record<string, (arm: () => void) => Promise<string[]>> = {
     await p.disconnect();
     return got;
   },
-  'the dedicated /sync behind a blocking fetchRecent': async (arm) => {
-    const p = await connectFake({});
-    const t = asTopic('resilient');
-    await p.post(t, asHandle('writer'), 'seed');
-    const tail = (await p.fetchRecent({ topic: t, limit: 10 })).nextCursor;
-    arm();
-    const pending = p.fetchRecent({ topic: t, since: tail, blockMs: 8000, limit: 10 });
-    const lands = setTimeout(() => void fake.addMessage(String(t), FRESH), 100);
-    const got = (await pending).messages.map((m) => m.content);
-    clearTimeout(lands);
-    await p.disconnect();
-    return got;
-  },
 };
 
 describe('a malformed but parseable /sync body never escapes a background loop', () => {
@@ -237,8 +224,7 @@ describe('a malformed but parseable /sync body never escapes a background loop',
  * homeserver or proxy answering one bad shape forever presents as a dead live path, no operator
  * signal, and roughly a thousandfold the request rate.
  *
- * Graded on the subscribe loop alone: it is the only `/sync` driver that reports or backs off — the
- * dedicated one behind a blocking `fetchRecent` is bounded by the caller's own `blockMs`.
+ * Graded on the subscribe loop, the only `/sync` driver that reports or backs off.
  */
 
 /** Arm a shape that RE-ARMS itself, so every `/sync` for the rest of the case answers with it. */
@@ -469,37 +455,6 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
           fake.limitedEmitted,
           'the burst was never truncated, so no row here reached the recovery walk at all',
         ).toBeGreaterThan(0);
-      }
-    }, 20_000);
-
-    it(`${faultName} / the dedicated /sync behind a blocking fetchRecent: it resumes from a real token`, async () => {
-      vi.spyOn(console, 'error').mockImplementation(() => undefined);
-      const escaped: unknown[] = [];
-      const onEscape = (reason: unknown): void => void escaped.push(reason);
-      process.on('unhandledRejection', onEscape);
-      const p = await connectFake({});
-      const t = asTopic('positioned');
-      for (const c of PRE_SUBSCRIPTION) await p.post(t, asHandle('writer'), c);
-      const tail = (await p.fetchRecent({ topic: t, limit: 10 })).nextCursor;
-      const from = fake.requestUrls.length;
-
-      armPositioningForever(mangle);
-      const page = await p
-        .fetchRecent({ topic: t, since: tail, blockMs: 400, limit: 10 })
-        .catch((err: unknown) => err as Error);
-      await new Promise((r) => setTimeout(r, 50));
-      process.off('unhandledRejection', onEscape);
-      await p.disconnect();
-
-      expect(escaped.map(String)).toEqual([]);
-      for (const since of sinceParamsSince(from)) {
-        if (since !== null) expect(since).toMatch(MINTED_TOKEN);
-      }
-      if (!(page instanceof Error)) {
-        expect(
-          page.messages.map((m) => m.content),
-          'a blocking read answered with messages at or before the cursor it was given',
-        ).toEqual([]);
       }
     }, 20_000);
   }

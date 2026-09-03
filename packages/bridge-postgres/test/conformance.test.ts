@@ -16,8 +16,8 @@ async function makeContext(table: string) {
   await plugin.connect({ url: PG_URL, table_name: table });
   return {
     plugin,
-    // Postgres honors blockMs natively via LISTEN/NOTIFY — run the long-poll case.
-    supportsBlockingFetch: true,
+    // `fetchRecent` reads the table; it takes no wait. The suite grades the weaker contract.
+    supportsBlockingFetch: false,
     freshTopic: (): Topic =>
       asTopic(`${TOPIC_SHAPES[++seq % TOPIC_SHAPES.length] as string}-${seq}-${rand()}`),
     carriesSenderIdentity: true,

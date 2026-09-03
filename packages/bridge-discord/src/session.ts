@@ -12,7 +12,6 @@ import { plaintextCredentialRisks } from './creds.js';
 import { warn } from './diagnostics.js';
 import { DiscordGateway } from './gateway.js';
 import { DiscordRest } from './rest.js';
-import { wake, type Waiters } from './waiters.js';
 import { toMessage, type DiscordMessage } from './wire.js';
 
 /**
@@ -37,11 +36,9 @@ export abstract class DiscordSession {
   protected readonly gateway = new DiscordGateway(this.rest, {
     isStopped: () => this.stopped,
     onMessage: (m) => this.dispatch(m),
-    onSocketGone: () => wake(this.waiters),
   });
   /** channel id → subscription; MESSAGE_CREATE dispatch routes through this. */
   protected readonly subs = new Map<string, { topic: Topic; handler: MessageHandler }>();
-  protected readonly waiters: Waiters = new Map();
   /** Memoized `GET /users/@me` (the bot's own account), for resolveIdentity. */
   protected me?: Promise<{ id: string; username: string }>;
 
@@ -53,8 +50,7 @@ export abstract class DiscordSession {
     const reconnectCapMs = reconnectCapFor(cfg.gateway_dialers);
 
     // Retire the previous session BEFORE installing the new config, so that a re-entrant connect()
-    // cannot leave the old socket dispatching into a plugin whose `live` flag says there is none —
-    // which silently degrades every later native long-poll to an immediate return.
+    // cannot leave the old socket dispatching into a plugin that has already forgotten its topics.
     this.stopped = true;
     this.generation++;
     this.gateway.restart(cfg, reconnectCapMs);
@@ -79,8 +75,6 @@ export abstract class DiscordSession {
 
   private forgetTopics(): void {
     this.subs.clear();
-    wake(this.waiters);
-    this.waiters.clear();
     this.me = undefined;
   }
 
@@ -95,7 +89,6 @@ export abstract class DiscordSession {
         /* handler is best-effort; never break the loop (DESIGN §6) */
       }
     }
-    wake(this.waiters, m.channel_id);
   }
 
   /**

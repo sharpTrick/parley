@@ -115,13 +115,10 @@ describe('XMPP correlator provenance (a right token from a wrong sender settles 
     expect(items.map((i) => i.archId)).toEqual(['REAL']);
   });
 
-  it('room -> waiters/subscriptions: a groupchat message from another room neither wakes nor delivers', async () => {
+  it('room -> subscriptions: a groupchat message from another room does not deliver', async () => {
     const { plugin, room } = setup();
     const seen: string[] = [];
     await plugin.subscribe(TOPIC, (m) => seen.push(m.content));
-    const waiter = priv(plugin).armWaiter(room);
-    let fired: string | undefined;
-    void waiter.park(10_000).then((r) => (fired = r));
 
     priv(plugin).onStanza(
       reflection({
@@ -134,14 +131,12 @@ describe('XMPP correlator provenance (a right token from a wrong sender settles 
     await Promise.resolve();
 
     expect(seen).toEqual([]);
-    expect(fired).toBeUndefined();
 
     priv(plugin).onStanza(
       reflection({ from: `${room}/someone`, originId: 'unrelated', archId: 'arch-y', room }),
     );
     await Promise.resolve();
     expect(seen).toEqual(['hello']);
-    expect(fired).toBe('message');
     await plugin.disconnect();
   });
 
@@ -201,17 +196,13 @@ const selfPresence = (room: string): unknown =>
   );
 const presenceError = (room: string): unknown =>
   xml('presence', { from: `${room}/${OUR_NICK}`, type: 'error' }, errorEl('conflict'));
-const liveMessage = (room: string): unknown =>
-  reflection({ from: `${room}/someone`, originId: 'unrelated', archId: 'arch-live', room });
-
-const KINDS = ['join', 'post', 'waiter', 'collector'] as const;
+const KINDS = ['join', 'post', 'collector'] as const;
 type Kind = (typeof KINDS)[number];
 
 /** A stanza of each kind, all addressed to the SAME room the armed operation is using. */
 const stanzaOfKind: Record<Kind, (c: Ctx) => unknown> = {
   join: (c) => selfPresence(c.room),
   post: (c) => reflection({ from: `${c.room}/${OUR_NICK}`, originId: c.originId, archId: 'A1', room: c.room }),
-  waiter: (c) => liveMessage(c.room),
   collector: (c) => mamResult({ outerFrom: c.room, queryid: 'q-open', archId: 'A2' }),
 };
 
@@ -219,7 +210,6 @@ const stanzaOfKind: Record<Kind, (c: Ctx) => unknown> = {
 const strayOfKind: Record<Kind, (c: Ctx) => unknown> = {
   join: (c) => presenceError(c.room),
   post: (c) => bounce(c.room, 'o-already-cleared'),
-  waiter: (c) => liveMessage(c.room),
   collector: (c) => mamResult({ outerFrom: c.room, queryid: 'q-finished', archId: 'A3' }),
 };
 
@@ -242,12 +232,6 @@ describe('XMPP correlator kind (a stanza of one kind never settles an operation 
         (e: Error) => (outcome = e.message),
       );
       return { settled: () => outcome };
-    },
-    waiter: (c) => {
-      let reason: unknown;
-      const waiter = priv(c.plugin).armWaiter(c.room);
-      void waiter.park(10_000).then((r) => (reason = r));
-      return { settled: () => reason };
     },
     collector: (c) => {
       const items: Array<{ archId: string }> = [];

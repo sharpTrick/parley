@@ -16,7 +16,6 @@ import { resolveConfig } from './config.js';
 import { ZulipConnection } from './connection.js';
 import { readWindow } from './history.js';
 import { startPushLoop } from './push-loop.js';
-import { blockingFetch } from './wake.js';
 import { asArray, type RealmMember, requireSendableBody } from './wire.js';
 
 export type { ZulipBackendConfig } from './config.js';
@@ -35,12 +34,18 @@ export { GAP_FILL_PAGE, TAIL_PROBE_PAGE } from './history.js';
  * inexactness: topics are mutable".
  */
 export class ZulipPlugin implements BackendPlugin {
+  /**
+   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
+   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
+   */
+  readonly capabilities = { blockingFetch: false } as const;
+
   private readonly conn = new ZulipConnection();
 
   /**
    * A `connect()` over a live connection tears that one down FIRST, against the config it was made
    * with. Keep the teardown here and the validation ahead of it, so that no per-connection registry
-   * — subscribe loops, event queues, blocking-fetch waiters — can address the new connection with
+   * — subscribe loops, event queues — can address the new connection with
    * the old one's state, and a rejected config leaves the live connection running.
    */
   async connect(config: BackendConfig): Promise<void> {
@@ -94,21 +99,13 @@ export class ZulipPlugin implements BackendPlugin {
     return asBackendMsgId(String(id));
   }
 
-  /**
-   * `blockMs` is a ceiling on the WHOLE call, not just on the wait: every request the call makes
-   * carries the budget that is left, so none of them can spend it on a rate-limit hint.
-   */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const { conn } = this;
     conn.require();
-    const generation = conn.generation;
     const limit = args.limit ?? 100;
-    const blockMs = args.blockMs ?? 0;
-    const deadline = blockMs > 0 ? Date.now() + blockMs : undefined;
-    let { messages } = await readWindow(conn, args.topic, args.since, limit, { generation, deadline });
-    if (messages.length === 0 && args.since !== undefined && deadline !== undefined) {
-      messages = await blockingFetch(conn, args.topic, args.since, limit, deadline, generation);
-    }
+    const { messages } = await readWindow(conn, args.topic, args.since, limit, {
+      generation: conn.generation,
+    });
     const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');
     return { messages, nextCursor };
   }

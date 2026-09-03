@@ -21,9 +21,8 @@ async function makeContext() {
   await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
   return {
     plugin,
-    // Slack honors blockMs natively (parks on the shared Socket Mode stream), so the shared
-    // blocking-fetch conformance case runs directly against the plugin.
-    supportsBlockingFetch: true,
+    // `fetchRecent` reads history; it takes no wait. The suite grades the weaker contract.
+    supportsBlockingFetch: false,
     fake, // introspection for the ack-discipline test below (ignored by the shared suite)
     // A fresh "channel id" per test — unmapped topics are used as channel-id literals. The channel
     // is CREATED in the fake: an id that was never created is `channel_not_found`, not an empty

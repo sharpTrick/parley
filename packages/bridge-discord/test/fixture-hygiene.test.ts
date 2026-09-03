@@ -178,7 +178,7 @@ function inlineShapeCasts(src: string): number[] {
 // ordinary `as unknown as SomeType` widening — loses a case rather than reading as coverage.
 describe('a member the plugin does not export is read only through the harness', () => {
   const FLAGS: Array<[string, string]> = [
-    ['a private field reached for a value', '(p as unknown as { waiters: Map<string, unknown> }).waiters'],
+    ['a private field reached for a value', '(p as unknown as { subs: Map<string, unknown> }).subs'],
     ['an optional member reached for an absence check', '(p as unknown as { ready?: unknown }).ready'],
     ['a cast split across lines', '(p as unknown as {\n  heartbeats: Set<unknown>;\n}).heartbeats'],
     ['a cast bound to a name first', 'const inner = p as unknown as { subs: Map<string, unknown> };'],
@@ -189,7 +189,7 @@ describe('a member the plugin does not export is read only through the harness',
     ['a widening to a named type', 'const c = id as unknown as Cursor;'],
     ['a widening to an indexed type', '({}) as unknown as Parameters<typeof startPushLoop>[0]'],
     ['a single cast to an inline shape', 'const b = body as { type?: unknown };'],
-    ['the harness call that replaces it', "probe<Map<string, unknown>>(plugin, 'waiters')"],
+    ['the harness call that replaces it', "probe<Map<string, unknown>>(plugin, 'subs')"],
     ['the whole cast quoted as fixture text', 'const bad = "(p as unknown as { a: 1 }).a";'],
   ];
 

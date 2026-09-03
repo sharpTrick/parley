@@ -111,23 +111,9 @@ describe('telegram cursor grammar', () => {
           (page) => page,
           (err: unknown) => err as Error,
         );
-      // A blocking call must reach the SAME verdict — never park past a cursor it should have
-      // refused and then answer out of an unrelated sequence space.
-      const blocking =
-        row.verdict === 'serves'
-          ? undefined
-          : verdictOf(
-              await rig.plugin
-                .fetchRecent({ topic, since: row.since as never, limit: 100, blockMs: 300 })
-                .then(
-                  (page) => page,
-                  (err: unknown) => err as Error,
-                ),
-            );
       graded.push({
         since: row.since,
         verdict: verdictOf(answer),
-        blocking,
         page: answer instanceof Error ? undefined : answer.messages.map((m) => m.content),
       });
     }
@@ -136,7 +122,6 @@ describe('telegram cursor grammar', () => {
       rows.map((row) => ({
         since: row.since,
         verdict: row.verdict,
-        blocking: row.verdict === 'serves' ? undefined : row.verdict,
         page: row.seq === undefined ? undefined : POSTED.slice(row.seq),
       })),
     );
@@ -216,74 +201,6 @@ describe('telegram fetchRecent limit normalization', () => {
     },
     20_000,
   );
-
-  /**
-   * `limit` and `blockMs` are independent knobs, and the decision to PARK belongs to the second one
-   * alone: whether anything sits above `since`, never how many rows the first one let through. A
-   * gate that reads the sliced page instead parks a call the store could answer immediately — at
-   * `limit: 0` it blocks for the whole `blockMs` on a topic full of messages and then returns
-   * nothing, which is the plugin's advertised native long-poll doing the opposite of its job.
-   *
-   * The product is what grades it: the limit table never passed `blockMs`, and the blocking cases
-   * never varied `limit`, so no cell of it was covered.
-   */
-  it.each(LIMITS)(
-    'limit %s parks only when nothing is newer',
-    async (limit) => {
-      const fake = await startFake();
-      const plugin = await connectFresh(fake);
-      const topic = asTopic('-1009900003');
-      await plugin.post(topic, SENDER, 'a');
-      const head = (await plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
-      await plugin.post(topic, SENDER, 'b');
-      await plugin.post(topic, SENDER, 'c');
-
-      // Something IS newer than `head`: the call must not park, whatever the limit does to the page.
-      const started = Date.now();
-      const served = await plugin.fetchRecent({ topic, since: head, limit, blockMs: 400 });
-      expect(Date.now() - started).toBeLessThan(200);
-      const expected = ['b', 'c'].slice(0, limit === undefined ? 2 : Math.max(0, Math.floor(limit)));
-      expect(served.messages.map((m) => m.content)).toEqual(expected);
-      // An empty page never moves the caller backwards, so the next catch-up still finds b and c.
-      expect(seqOf(served.nextCursor)).toBeGreaterThanOrEqual(seqOf(head));
-      const next = await plugin.fetchRecent({ topic, since: served.nextCursor, limit: 100 });
-      expect([...served.messages, ...next.messages].map((m) => m.content)).toEqual(['b', 'c']);
-
-      // Nothing newer than the tail: NOW it must wait, and come back with a stable cursor.
-      const tail = (await plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
-      const idleStarted = Date.now();
-      const idle = await plugin.fetchRecent({ topic, since: tail, limit, blockMs: 400 });
-      expect(Date.now() - idleStarted).toBeGreaterThanOrEqual(350);
-      expect(idle.messages).toEqual([]);
-      expect(idle.nextCursor).toBe(tail);
-    },
-    20_000,
-  );
-
-  /**
-   * `blockMs` is the caller's own budget, so the park must be measured AGAINST IT and not merely be
-   * "some wait". This axis used to ride on the limit table as `[400, 5000]`, where the only
-   * assertion it reached was `elapsed < Math.min(blockMs / 2, 200)` — 200 for both values — while
-   * the half of the case that actually parks hardcoded 400. The two rows were exact behavioural
-   * duplicates: six cases that could not fail independently, and a `blockMs` axis that was counted
-   * as covered and was not. Both bounds here are derived FROM the row, so a park that collapsed to
-   * a constant would fail one row or the other.
-   */
-  it.each([300, 1200])('parks for its own blockMs budget of %i and no longer', async (blockMs) => {
-    const fake = await startFake();
-    const plugin = await connectFresh(fake);
-    const topic = asTopic('-1009900004');
-    await plugin.post(topic, SENDER, 'a');
-    const tail = (await plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
-
-    const started = Date.now();
-    const idle = await plugin.fetchRecent({ topic, since: tail, limit: 100, blockMs });
-    const elapsed = Date.now() - started;
-    expect(idle.messages).toEqual([]);
-    expect(idle.nextCursor).toBe(tail);
-    expect(elapsed).toBeGreaterThanOrEqual(blockMs * 0.85);
-    expect(elapsed).toBeLessThan(blockMs * 2);
-  }, 20_000);
 });
 
 /**
@@ -308,12 +225,6 @@ describe('telegram fetchRecent limit domain', () => {
     const refusal = /limit must be a finite number/;
     await expect(plugin.fetchRecent({ topic, limit })).rejects.toThrow(refusal);
     await expect(plugin.fetchRecent({ topic, since: head, limit })).rejects.toThrow(refusal);
-    // Blocking too: a refused limit must never park first and then answer out of the same hole.
-    const started = Date.now();
-    await expect(
-      plugin.fetchRecent({ topic, since: head, limit, blockMs: 2000 }),
-    ).rejects.toThrow(refusal);
-    expect(Date.now() - started).toBeLessThan(500);
     // And the topic is untouched by the refusal.
     expect((await plugin.fetchRecent({ topic, limit: 100 })).messages.map((m) => m.content)).toEqual(
       ['a', 'b', 'c'],

@@ -21,10 +21,8 @@ async function makeContext() {
   });
   return {
     plugin,
-    // Discord honors blockMs NATIVELY: fetchRecent waits on the shared gateway MESSAGE_CREATE
-    // stream (the same live primitive subscribe uses), so the shared blocking case runs directly
-    // against the plugin rather than being covered only by core's generic polling wrapper.
-    supportsBlockingFetch: true,
+    // `fetchRecent` reads REST history; it takes no wait. The suite grades the weaker contract.
+    supportsBlockingFetch: false,
     // A Parley topic IS a Discord channel id, and a channel must exist before anything can be
     // posted to or read from it — so provision it in the fake, exactly as a human would create
     // the channel in Discord. An id that was never created is a genuinely absent topic

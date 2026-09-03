@@ -3,18 +3,14 @@ import type { WebSocket } from 'ws';
 import { SlackShapeError } from './api.js';
 import type { SlackMessage } from './messages.js';
 
-/**
- * First and maximum rung of the degraded-Socket-Mode ladder: the cooldown between poll-driven
- * `apps.connections.open` dials, and the interval at which a blocked `fetchRecent` re-reads
- * `conversations.history` for as long as the live stream has delivered it nothing.
- */
+/** First and maximum rung of the cooldown between `apps.connections.open` dials. */
 export const DIAL_BACKOFF_MS = 500;
 export const MAX_DIAL_BACKOFF_MS = 5_000;
 
 /**
  * How long a Socket Mode connection may stay silent after opening before we give up on `hello`.
  * Keep a bound here, so that a degraded edge that accepts the TCP connection and then says nothing
- * cannot park `subscribe` and every blocking `fetchRecent` for the process lifetime.
+ * cannot park `subscribe` for the process lifetime.
  */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 
@@ -34,16 +30,6 @@ export interface SocketEnvelope {
   payload?: { event?: SlackMessage };
 }
 
-/**
- * A pending native long-poll (`fetchRecent` with `blockMs`) parked on the shared Socket Mode
- * stream. `since` is the exclusive floor (`ts`) it is waiting past; `wake` fires exactly once and
- * tears down its own timer + registration (no leaked listeners/timers).
- */
-export interface Waiter {
-  since: string;
-  wake: () => void;
-}
-
 export const closeQuietly = (ws: WebSocket): void => {
   try {
     ws.close();
@@ -51,35 +37,6 @@ export const closeQuietly = (ws: WebSocket): void => {
     /* already closing/closed */
   }
 };
-
-/**
- * Time until the next rung of the degradation ladder, given how long a blocked call has been parked:
- * rungs start at 0, {@link DIAL_BACKOFF_MS}, and each subsequent doubling capped at
- * {@link MAX_DIAL_BACKOFF_MS}. Keep the position derived from WALL CLOCK rather than counted per
- * iteration, so that an early wake (a socket loss draining the waiters) cannot advance the ladder and
- * push the next history re-read further out than the rung it was due on.
- */
-export function nextRungIn(elapsedMs: number): number {
-  let at = 0;
-  let width = DIAL_BACKOFF_MS;
-  while (at + width <= elapsedMs) {
-    at += width;
-    width = Math.min(width * 2, MAX_DIAL_BACKOFF_MS);
-  }
-  return at + width - elapsedMs;
-}
-
-/**
- * Reject once `ms` has passed, so a caller with its own budget can bound a wait it does not own.
- * `p` stays subscribed by the race, so a later rejection of it is never unhandled.
- */
-export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
-}
 
 /**
  * The websocket URL `apps.connections.open` handed us, or a named refusal. A vendor response is

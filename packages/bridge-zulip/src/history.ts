@@ -2,7 +2,6 @@ import {
   asCursor, type Cursor, type Message, type MessageHandler, type Topic,
 } from '@sharptrick/parley-core';
 import type { ZulipConnection } from './connection.js';
-import { readDeadlineMs } from './pacing.js';
 import {
   asArray, MAX_MESSAGES_PER_FETCH, pageAnchor, type ZulipMessage, zulipToMessage,
 } from './wire.js';
@@ -29,7 +28,6 @@ export const TAIL_PROBE_PAGE = 100;
 export interface ReadOpts {
   generation: number;
   signal?: AbortSignal;
-  deadline?: number;
 }
 
 /**
@@ -48,7 +46,6 @@ export async function readWindow(
   conn: ZulipConnection, topic: Topic, since: Cursor | undefined, limit: number, opts: ReadOpts,
 ): Promise<{ messages: Message[]; sawRecords: boolean; navigable: boolean }> {
   const signal = opts.signal;
-  const deadlineMs = opts.deadline === undefined ? undefined : readDeadlineMs(opts.deadline);
   const narrow = JSON.stringify([
     { operator: 'stream', operand: conn.cfg.stream },
     { operator: 'topic', operand: conn.wireTopic(topic) },
@@ -75,10 +72,10 @@ export async function readWindow(
       apply_markdown: 'false', // raw content, not rendered HTML
     };
     // Keep the check on BOTH sides of the request, so that a read resumed after a reconnect — a
-    // blocking fetch's re-read, a gap-fill's next page — cannot put the connection it addressed's
-    // narrow and anchor on the wire to whatever server replaced it.
+    // gap-fill's next page — cannot put the connection it addressed's narrow and anchor on the wire
+    // to whatever server replaced it.
     conn.assertGeneration(opts.generation);
-    const res = await conn.rest.request('GET', '/api/v1/messages', { query, signal, deadlineMs });
+    const res = await conn.rest.request('GET', '/api/v1/messages', { query, signal });
     const raw = asArray(((await res.json()) as { messages?: ZulipMessage[] } | null)?.messages);
     conn.assertGeneration(opts.generation);
     sawRecords ||= raw.length > 0;

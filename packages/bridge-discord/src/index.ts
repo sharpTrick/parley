@@ -13,11 +13,10 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { DEFAULT_DEADLINE_MS, sanitizeBody } from '@sharptrick/parley-net-util';
-import { newestWindow, outOfBudget, windowSince, type PageFn } from './catchup.js';
+import { newestWindow, windowSince, type PageFn } from './catchup.js';
 import { reasonOf, warn } from './diagnostics.js';
 import { TerminalGatewayCloseError } from './ladder.js';
 import { DiscordSession } from './session.js';
-import { arm } from './waiters.js';
 import {
   botAccount,
   CONTENT_LIMIT,
@@ -54,6 +53,12 @@ interface Catchup {
  * them as text; a comparison this plugin genuinely needed would have to go through `BigInt`.
  */
 export class DiscordPlugin extends DiscordSession implements BackendPlugin {
+  /**
+   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
+   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
+   */
+  readonly capabilities = { blockingFetch: false } as const;
+
   /**
    * `POST /channels/<id>/messages`. The seam's `identity` is deliberately unused: Discord stamps
    * `author` from the configured bot token, so per-session attribution needs a per-session token.
@@ -93,14 +98,7 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
     this.require();
     const generation = this.generation;
     const limit = args.limit ?? 100;
-    // The seam declares `blockMs?: number` with no bound, and every wait this call runs — the
-    // connect race, the waiter, each page's own budget — is derived here. Keep the finiteness arm,
-    // so that a budget which is neither `> 0` nor `<= 0` can neither reach a timer as `Infinity`,
-    // where it is a RangeError thrown out of the seam, nor hold the caller on the unbounded default
-    // it asked for none of.
-    const asked = args.blockMs ?? 0;
-    const blockMs = Number.isFinite(asked) ? asked : 0;
-    const deadline = Date.now() + (blockMs > 0 ? blockMs : DEFAULT_DEADLINE_MS);
+    const deadline = Date.now() + DEFAULT_DEADLINE_MS;
 
     if (args.since === undefined) {
       const records = await newestWindow(this.pager(args.topic, generation), limit, deadline);
@@ -108,54 +106,7 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
       return { messages, nextCursor: messages.at(-1)?.cursor ?? asCursor('0') };
     }
 
-    const walk: Catchup = { topic: args.topic, since: args.since, limit, deadline, generation };
-    if (blockMs <= 0) return this.fetchSince(walk);
-
-    // Native long-poll: wait on the SAME gateway MESSAGE_CREATE stream the live path uses, then
-    // re-run the exclusive REST query so ids/cursor stay canonical. Keep EVERY leg — the connect
-    // and both REST queries — inside the one `blockMs` budget, so that neither a gateway that
-    // accepts the socket without completing the handshake nor a rate-limited REST query can
-    // stretch this call past the cap core sized for the client's tool timeout. Returning
-    // early/empty is always safe: core polls the rest of its own budget.
-    try {
-      await withDeadline(this.gateway.ensureUp(), blockMs);
-    } catch {
-      /* no socket → skip the wait below; the immediate page is still correct */
-    }
-    const socketLive = this.gateway.isLive();
-    const remaining = deadline - Date.now();
-    const channelId = this.channelId(args.topic);
-    // Arm the waiter BEFORE the first query so a message landing during it can't be lost.
-    const waiter = socketLive && remaining > 0 ? arm(this.waiters, channelId, remaining) : undefined;
-    try {
-      const first = await this.fetchWithin(walk);
-      if (first.messages.length > 0 || waiter === undefined) return first;
-      await waiter.fired; // resolves on MESSAGE_CREATE for this channel, timeout, or disconnect
-      if (this.stopped || Date.now() >= deadline) return first;
-      return await this.fetchWithin(walk);
-    } finally {
-      waiter?.cancel();
-    }
-  }
-
-  /**
-   * One catch-up walk bounded by the long-poll's own `deadline`: a budget spent, or refused, while
-   * a query was in flight answers the empty replayable page. Keep the swallow behind
-   * {@link outOfBudget} and let an ABSENT TOPIC through it whatever the budget says, so that
-   * bounding this leg can hide neither a real 404 or 500 nor a seam classification the caller has
-   * to act on.
-   */
-  private async fetchWithin(walk: Catchup): Promise<FetchRecentResult> {
-    try {
-      return await this.fetchSince(walk);
-    } catch (err) {
-      if (err instanceof NoSuchTopicError) throw err;
-      const named = JSON.stringify(walk.topic as string);
-      if (outOfBudget(err, walk.deadline, `catch-up on topic ${named}`)) {
-        return { messages: [], nextCursor: walk.since };
-      }
-      throw err;
-    }
+    return this.fetchSince({ topic: args.topic, since: args.since, limit, deadline, generation });
   }
 
   /** Empty → `nextCursor` echoes `since` (stable, replayable). */
@@ -172,7 +123,7 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
    * Channel` mapped to the seam's absent topic, so that a 404 that is not it, and `50001 Missing
    * Access` — the channel exists and this bot is misconfigured — stay real failures instead of
    * reading to core as "topic not present yet". Keep every page behind the `generation` its seam
-   * call captured, so that a walk parked on a waiter or between pages across a re-`connect()`
+   * call captured, so that a walk parked between pages across a re-`connect()`
    * resolves `topic` against the map the caller asked under and never carries the successor
    * session's messages, or its cursor, back under that name.
    */
@@ -282,12 +233,4 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
     if ((handle as string) === me.username) return { handle, backendRef: me.id };
     return { handle, backendRef: handle };
   }
-}
-
-function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: NodeJS.Timeout;
-  const expiry = new Promise<never>((_, rejectDeadline) => {
-    timer = setTimeout(() => rejectDeadline(new Error(`timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([p, expiry]).finally(() => clearTimeout(timer));
 }

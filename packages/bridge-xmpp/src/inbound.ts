@@ -27,8 +27,8 @@ export class XmppInbound extends XmppRooms {
     // Keep the delivery arms FIRST, so that a `<result>` is only ever looked for on a stanza that is
     // not delivered content. A MUC reflects an occupant's own unknown children verbatim, so a
     // co-occupant can hang one off its groupchat message: dispatching on the child instead would
-    // take that message out of the room's live path and away from its long-poll waiters while
-    // leaving it in the archive — the live-versus-catch-up divergence this seam forbids.
+    // take that message out of the room's live path while leaving it in the archive — the
+    // live-versus-catch-up divergence this seam forbids.
     if (stanza.attrs.type === 'error') {
       this.onErrorMessage(stanza);
       return;
@@ -168,7 +168,6 @@ export class XmppInbound extends XmppRooms {
     }
 
     if (archId === undefined) return;
-    this.fireWaiters(room, 'message');
     const sub = this.subscriptions.get(room);
     if (sub === undefined) return;
     const body = stanza.getChildText('body');

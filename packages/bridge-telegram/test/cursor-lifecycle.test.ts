@@ -190,24 +190,18 @@ describe('telegram cursor across the store lifecycle', () => {
       const refilled = Array.from({ length: refill }, (_, i) => `n${i + 1}`);
       for (const c of refilled) await restarted.post(topic, SENDER, c);
 
-      // Both catch-up shapes: a blocking call must reach the same verdict, never park past a
-      // cursor it should have refused and then answer out of the replacement's sequence space.
-      for (const blockMs of [undefined, 500]) {
-        const answer = await restarted
-          .fetchRecent({ topic, since: cursor, limit: 100, blockMs })
-          .then(
-            (page) => page,
-            (err: unknown) => err as Error,
-          );
-        if (outcome === 'throws') {
-          expect(answer).toBeInstanceOf(Error);
-          expect((answer as Error).message).toMatch(why);
-          continue;
-        }
-        const page = answer as FetchRecentResult;
-        expect(page.messages.map((m) => m.content)).toEqual(refilled);
-        expect(seqOf(page.nextCursor)).toBeGreaterThanOrEqual(seqOf(cursor));
+      const answer = await restarted.fetchRecent({ topic, since: cursor, limit: 100 }).then(
+        (page) => page,
+        (err: unknown) => err as Error,
+      );
+      if (outcome === 'throws') {
+        expect(answer).toBeInstanceOf(Error);
+        expect((answer as Error).message).toMatch(why);
+        return;
       }
+      const page = answer as FetchRecentResult;
+      expect(page.messages.map((m) => m.content)).toEqual(refilled);
+      expect(seqOf(page.nextCursor)).toBeGreaterThanOrEqual(seqOf(cursor));
     },
     20_000,
   );

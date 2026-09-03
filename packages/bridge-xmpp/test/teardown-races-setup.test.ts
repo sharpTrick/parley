@@ -131,13 +131,6 @@ const rows: Race[] = [
     call: (plugin) => plugin.fetchRecent({ topic: TOPIC, limit: 10 }),
     mustReject: false,
   },
-  {
-    name: 'a blocking fetchRecent, parked on a MAM round trip',
-    setUp: connected,
-    hold: heldAtMam,
-    call: (plugin) => plugin.fetchRecent({ topic: TOPIC, limit: 10, blockMs: 500 }),
-    mustReject: false,
-  },
 ];
 
 describe('an XMPP disconnect that races a setup call still leaves nothing live', () => {

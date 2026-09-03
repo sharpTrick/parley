@@ -39,7 +39,8 @@ describe('public barrel surface', () => {
   // ships: a symbol added to the barrel is on neither the kept list nor the trimmed one, so it
   // reaches npm unnoticed. Types are counted too — `Object.keys` sees no type-only re-export.
   const SURFACE = [
-    'Allowlist', 'AllowlistOptions', 'AuthConfig', 'AuthSchema', 'BackendCliOptions',
+    'Allowlist', 'AllowlistOptions', 'AuthConfig', 'AuthSchema', 'BackendCapabilities',
+    'BackendCliOptions',
     'BackendConfig', 'BackendConfigKeys', 'BackendIdentity', 'BackendMsgId', 'BackendPlugin',
     'BlockingFetchOptions', 'BuildMessageInput', 'CHANNEL_NOTIFICATION_METHOD', 'CORE_VERSION',
     'CatchUpArgs', 'ConfigSchema', 'ConsentError', 'Cursor', 'DEFAULT_HASH_LEN', 'FakeOidc',
@@ -153,11 +154,14 @@ describe('public barrel surface', () => {
   const MEMBERS: Record<string, string[]> = {
     Allowlist: ['assert', 'constructor', 'has', 'patterns', 'topics'],
     AllowlistOptions: ['postPatterns'],
+    BackendCapabilities: ['blockingFetch'],
     BackendCliOptions: ['bin', 'moduleUrl', 'plugin'],
     BackendConfig: ['[index signature]'],
     BackendConfigKeys: ['keys', 'nested'],
     BackendIdentity: ['backendRef', 'handle'],
-    BackendPlugin: ['connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe'],
+    BackendPlugin: [
+      'capabilities', 'connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe',
+    ],
     BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
     BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
     CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],

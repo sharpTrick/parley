@@ -16,13 +16,6 @@ import {
   TOPIC_KEY,
 } from './wire.js';
 
-/**
- * Every park slice ends in a full canonical catch-up or an alias lookup, so keep this floor, so
- * that a small — but perfectly legal — `sync_timeout_ms` cannot turn one idle wait into thousands
- * of homeserver requests and spend the deployment's rate-limit budget on nothing.
- */
-const MIN_PARK_SLICE_MS = 250;
-
 /** The settings a `connect()` installs, the calls that carry them, and alias → room_id resolution. */
 export abstract class MatrixSession {
   protected baseUrl = DEFAULT_HOMESERVER_URL;
@@ -48,6 +41,22 @@ export abstract class MatrixSession {
   /** In-flight sync long-polls, aborted on disconnect so teardown is immediate. */
   protected readonly controllers = new Set<AbortController>();
 
+  /**
+   * End the current generation's background work, drop the credential that authorized it, and empty
+   * every registry describing it. Keep BOTH lifecycle entry points on this, so that a bare
+   * `connect()` — a reconnect with no preceding `disconnect()` — ends the previous generation's
+   * in-flight `/sync` at once rather than one long-poll later.
+   */
+  protected standDown(): void {
+    for (const c of this.controllers) c.abort();
+    this.controllers.clear();
+    this.rooms.clear();
+    // Keep `userId` — the credential alone is what authorizes anything, and an in-flight room
+    // resolve that outlives this teardown decides whether it TRUSTS the room by comparing its
+    // creator against that MXID: erased, the account stops recognising rooms it made itself.
+    this.token = undefined;
+  }
+
   /** True once work started under `generation` must stand down: we disconnected, or reconnected. */
   protected isStale(generation: number): boolean {
     return this.stopped || this.generation !== generation;
@@ -58,11 +67,6 @@ export abstract class MatrixSession {
     if (!isMessageEvent(e)) return false;
     if (this.sharedLocalpart === undefined) return true; // per-topic room: every message is ours
     return contentOf(e)[TOPIC_KEY] === topic;
-  }
-
-  /** How long a park may sleep before it re-queries: never past `remaining`, never below the floor. */
-  protected parkSlice(remaining: number): number {
-    return Math.min(remaining, Math.max(this.syncTimeoutMs, MIN_PARK_SLICE_MS));
   }
 
   /** Sleep, but no longer than the next `disconnect()` (which aborts every registered controller). */
@@ -150,28 +154,6 @@ export abstract class MatrixSession {
     if (this.isStale(generation)) return undefined;
     this.rooms.set(key, Promise.resolve(roomId));
     return roomId;
-  }
-
-  /**
-   * {@link existingRoom}, re-polled until `deadline`. Keep the wait, so that a blocking read on a
-   * topic whose first message has not landed yet waits for the peer's `post` to provision the room
-   * instead of turning an agent's long-poll into a spin. Keep it gated on `generation` and
-   * interruptible, so that the poll stands down AT the `disconnect()` rather than one
-   * `sync_timeout_ms` later — and never under the next `connect()`.
-   */
-  protected async roomForRead(
-    topic: Topic,
-    deadline: number,
-    generation: number,
-  ): Promise<string | undefined> {
-    for (;;) {
-      if (this.isStale(generation)) return undefined;
-      const roomId = await this.existingRoom(topic, generation);
-      if (roomId !== undefined) return roomId;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return undefined;
-      await this.interruptibleDelay(this.parkSlice(remaining));
-    }
   }
 
   private async resolveOrCreateRoom(localpart: string): Promise<string> {

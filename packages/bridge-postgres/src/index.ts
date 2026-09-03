@@ -32,8 +32,7 @@ import {
   serverRefused,
   subscribeFailed,
 } from './errors.js';
-import { PostgresListen } from './listen.js';
-import { LISTENER_WAIT_MS } from './listener.js';
+import { LISTENER_WAIT_MS, PostgresListener } from './listener.js';
 import type { TopicSubscription } from './push.js';
 import { newestMessages, pageResult } from './read.js';
 import { assertTableName, buildSchema, channelFor, quotedNames } from './schema.js';
@@ -49,11 +48,17 @@ const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 export const PRUNE_BATCH = 5000;
 
 /**
- * The PostgreSQL backend (DESIGN §9). A NOTIFY is only a doorbell: keep every subscriber and
- * blocking waiter re-querying strictly after its last-seen `seq`, so that a coalesced, dropped or
+ * The PostgreSQL backend (DESIGN §9). A NOTIFY is only a doorbell: keep every subscriber
+ * re-querying strictly after its last-seen `seq`, so that a coalesced, dropped or
  * mis-addressed notification costs latency and never a message (DESIGN §6).
  */
-export class PostgresPlugin extends PostgresListen implements BackendPlugin {
+export class PostgresPlugin extends PostgresListener implements BackendPlugin {
+  /**
+   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
+   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
+   */
+  readonly capabilities = { blockingFetch: false } as const;
+
   /**
    * Armed synchronously by `connect()` before its first await, so that two concurrent `connect()`s
    * cannot both pass a `pool === undefined` guard — `this.pool` is only published after the awaited
@@ -234,11 +239,6 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
     this.reconnecting = false;
     if (this.pruneTimer !== undefined) clearInterval(this.pruneTimer);
     this.pruneTimer = undefined;
-    // Release any blocked fetchRecent waits first — clears their timers deterministically. Each
-    // callback removes itself from `pendingAborts`/`waiters`; iterate a copy so that's safe.
-    for (const abort of [...this.pendingAborts]) abort();
-    this.pendingAborts.clear();
-    this.waiters.clear();
     this.listens.clear();
     for (const sub of this.subs.values()) this.clearRedrain(sub);
     this.subs.clear();
@@ -321,27 +321,14 @@ export class PostgresPlugin extends PostgresListen implements BackendPlugin {
   }
 
   private async readPage(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    const epoch = this.epoch;
     const limit = args.limit ?? 100;
     if (args.since === undefined) {
-      // Default window: the newest `limit` messages. With no cursor to advance past there is
-      // nothing to block on, so `blockMs` is ignored here.
+      // Default window: the newest `limit` messages.
       return pageResult(await newestMessages(this.require(), this.names, args.topic, limit));
     }
 
     assertCursor(args.since);
-    let rows = await this.readSince(args.topic, args.since, limit);
-    // Native long-poll. Returning early/empty stays safe — core's generic wrapper polls the
-    // remaining budget — so the native wait only ever SHORTENS latency, never extends it.
-    if (rows.length === 0 && (args.blockMs ?? 0) > 0 && !this.stopped) {
-      await this.waitForNotify(args.topic, args.since, limit, args.blockMs as number);
-      // `epoch`, not `stopped` alone: a connect() sets `stopped` back to false, so a wait that slept
-      // across a whole teardown/restart would re-resolve the pool and read the SUCCESSOR's table —
-      // and hand this caller a `nextCursor` from a sequence its topic has never been read on.
-      if (!this.stopped && epoch === this.epoch) {
-        rows = await this.readSince(args.topic, args.since, limit);
-      }
-    }
+    const rows = await this.readSince(args.topic, args.since, limit);
     return pageResult(rows, args.since);
   }
 

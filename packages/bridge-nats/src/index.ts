@@ -18,6 +18,9 @@ export { plaintextRemoteServer, redactUserinfo, type NatsBackendConfig } from '.
  * (exclusive `since`). Core never compares cursor values — NATS delivers in seq order.
  */
 export class NatsPlugin extends NatsLive implements BackendPlugin {
+  /** `fetchRecent` hands `blockMs` to the JetStream pull's own `expires`. */
+  readonly capabilities = { blockingFetch: true } as const;
+
   async post(
     topic: Topic,
     identity: Handle,

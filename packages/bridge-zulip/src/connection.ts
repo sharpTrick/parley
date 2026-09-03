@@ -8,16 +8,11 @@ export interface QueueState {
   queueId: string;
 }
 
-export interface TopicWaiters {
-  readonly wakes: Set<() => void>;
-  healthy: number;
-}
-
 /**
- * A single bounded wait for "a message may have landed on this topic", however it is obtained.
- * Keep `release` synchronous, so that no teardown a wake owns can run inside the caller's `blockMs`.
+ * A single bounded wait that a `disconnect()` can also end. Keep `release` synchronous, so that no
+ * teardown a wait owns can run inside a caller's seam call.
  */
-export interface Wake {
+export interface BoundedWait {
   readonly waited: Promise<void>;
   readonly release: () => void;
 }
@@ -46,15 +41,6 @@ export class ZulipConnection {
   /** Live queues (one per subscribe), so disconnect can best-effort delete them server-side. */
   readonly queues = new Set<QueueState>();
   /**
-   * Topics with a live `subscribe` loop → its wake callbacks for blocking `fetchRecent` calls
-   * piggybacking on that loop's already-registered event queue. `healthy` counts only the loops on
-   * the topic that can still deliver, so a blocked fetch can never park behind a subscription that
-   * will not wake it; the loop fires the callbacks on a delivery so a blocked fetch re-queries
-   * WITHOUT opening a second event queue for the topic. A loop can only end by the connection
-   * ending, so it is `disconnect()` that empties this and releases whoever is parked here.
-   */
-  readonly waiters = new Map<Topic, TopicWaiters>();
-  /**
    * Wire topic → the one Parley topic that claimed it by WRITING there, so a case-fold collision
    * fails fast. Only `post` and `subscribe` claim: a read addresses history it did not create, and a
    * registry a read can write is a namespace any caller-supplied topic name can take hostage.
@@ -67,7 +53,7 @@ export class ZulipConnection {
   private readonly pendingAborts = new Set<() => void>();
   /**
    * Queue deletions detached from a caller's deadline, awaited by `disconnect()` so best-effort
-   * cleanup still finishes without ever running inside a `fetchRecent`'s `blockMs`.
+   * cleanup still finishes without ever running inside a seam call.
    */
   private readonly pendingDeletes = new Set<Promise<void>>();
 
@@ -94,7 +80,6 @@ export class ZulipConnection {
     this.teardown.abort();
     for (const abort of this.pendingAborts) abort();
     this.pendingAborts.clear();
-    this.waiters.clear();
     for (const c of this.controllers) c.abort();
     this.controllers.clear();
     const exits = [...this.loopExits];
@@ -109,10 +94,10 @@ export class ZulipConnection {
 
   /**
    * Drop a queue the plugin has stopped using without making anyone wait for the round trip. Keep
-   * it off every caller's path, so that a slow or black-holed server cannot spend a `fetchRecent`'s
-   * `blockMs` — or a push loop's recovery latency — on cleanup. Keep `rest` the caller's rather than
-   * this connection's, so that a delete racing a reconnect drops the queue on the server that minted
-   * it instead of offering its id to whatever replaced that connection.
+   * it off every caller's path, so that a slow or black-holed server cannot spend a push loop's
+   * recovery latency on cleanup. Keep `rest` the caller's rather than this connection's, so that a
+   * delete racing a reconnect drops the queue on the server that minted it instead of offering its
+   * id to whatever replaced that connection.
    */
   deleteQueueDetached(rest: ZulipHttp, queueId: string): void {
     const done = rest.deleteQueue(queueId);
@@ -120,29 +105,12 @@ export class ZulipConnection {
     void done.finally(() => this.pendingDeletes.delete(done));
   }
 
-  /** An abort firing at `deadline` or on `disconnect()`; `done()` releases timer and registrations. */
-  deadlineAbort(deadline: number): { signal: AbortSignal; done: () => void } {
-    const controller = new AbortController();
-    const abort = (): void => controller.abort();
-    const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
-    this.pendingAborts.add(abort);
-    this.controllers.add(controller);
-    return {
-      signal: controller.signal,
-      done: (): void => {
-        clearTimeout(timer);
-        this.pendingAborts.delete(abort);
-        this.controllers.delete(controller);
-      },
-    };
-  }
-
   /**
-   * A wait ending at `ms`, on `disconnect()`, or when whoever holds `extra` fires it — once, with
-   * every registration undone. Keep the `stopped` re-check after the registration, so that a
-   * teardown racing the arming cannot leave the wait parked with nothing left to release it.
+   * A wait ending at `ms` or on `disconnect()` — once, with every registration undone. Keep the
+   * `stopped` re-check after the registration, so that a teardown racing the arming cannot leave the
+   * wait parked with nothing left to release it.
    */
-  timedWait(ms: number, extra?: Set<() => void>): Wake {
+  timedWait(ms: number): BoundedWait {
     let release!: () => void;
     const waited = new Promise<void>((resolve) => {
       let done = false;
@@ -150,13 +118,11 @@ export class ZulipConnection {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        extra?.delete(release);
         this.pendingAborts.delete(release);
         resolve();
       };
       const timer = setTimeout(release, ms);
       this.pendingAborts.add(release);
-      extra?.add(release);
       if (this.stopped) release();
     });
     return { waited, release };
@@ -166,12 +132,6 @@ export class ZulipConnection {
   async interruptibleDelay(ms: number): Promise<void> {
     if (this.stopped || ms <= 0) return;
     await this.timedWait(ms).waited;
-  }
-
-  /** Release every blocking `fetchRecent` piggybacking on `topic`'s live subscribe loop(s). */
-  wake(topic: Topic): void {
-    const live = this.waiters.get(topic);
-    if (live !== undefined) for (const wake of [...live.wakes]) wake();
   }
 
   /**

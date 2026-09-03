@@ -115,7 +115,6 @@ describe('background chores never escape as an unhandled rejection', () => {
   it.each([
     ['drain after a failing pool', 'drain'],
     ['listener reconnect that cannot reconnect', 'reconnect'],
-    ['a blocking waiter whose re-check query fails', 'waiter'],
   ])('%s', async (_label, path) => {
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: REAL_URL });
@@ -129,15 +128,11 @@ describe('background chores never escape as an unhandled rejection', () => {
       ][0] as string;
       state.clients[0]?.emit('notification', { channel });
       await sleep(60);
-    } else if (path === 'reconnect') {
+    } else {
       state.clientFails = true;
       state.clients[0]?.emit('end');
       await sleep(700);
       state.clientFails = false;
-    } else {
-      const wait = plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 120 });
-      state.poolFails = true;
-      await wait.catch(() => undefined);
     }
 
     expect(rejections, `${path} leaked a rejection`).toEqual([]);
@@ -171,9 +166,9 @@ describe('background chores never escape as an unhandled rejection', () => {
 // missing row rather than silence.
 
 type Surface = 'pooled connection' | 'listener connection';
-type Phase = 'idle' | 'with a live subscription' | 'with a blocking fetch parked';
+type Phase = 'idle' | 'with a live subscription';
 
-const PHASES: Phase[] = ['idle', 'with a live subscription', 'with a blocking fetch parked'];
+const PHASES: Phase[] = ['idle', 'with a live subscription'];
 
 /** The listener connection is lazy, so it only exists in the phases that open one. */
 const SURFACE_CELLS: { surface: Surface; phase: Phase }[] = PHASES.flatMap((phase) =>
@@ -196,19 +191,13 @@ describe("an 'error' event on a connection surface never reaches the process", (
       await plugin.connect({ url: REAL_URL });
       const topic = asTopic('t');
 
-      let parked: Promise<unknown> | undefined;
       if (cell.phase === 'with a live subscription') await plugin.subscribe(topic, () => undefined);
-      if (cell.phase === 'with a blocking fetch parked') {
-        parked = plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 400 });
-        await sleep(20);
-      }
 
       const priv = plugin as unknown as { pool?: EventEmitter; listener?: EventEmitter };
       const surface = cell.surface === 'pooled connection' ? priv.pool : priv.listener;
       expect(surface, 'this cell has no connection to grade, so it proves nothing').toBeDefined();
       expect(() => (surface as EventEmitter).emit('error', new Error(ADMIN_KILL))).not.toThrow();
 
-      await parked;
       expect(rejections, `${cell.surface} leaked a rejection`).toEqual([]);
 
       state.rows.set('t', [

@@ -102,13 +102,11 @@ describe('fetchRecent since-path drains a foreign block and always advances the 
 
 /**
  * CLASS: a cursor must cross a block of traffic it cannot return, and must not move for traffic it
- * simply has not reached — and a BLOCKING call must report the same position a non-blocking one
- * would. `/messages` bounds a page BEFORE filtering, so a page-sized block of another topic's events
+ * simply has not reached. `/messages` bounds a page BEFORE filtering, so a page-sized block of another topic's events
  * would wedge a cursor pinned at `since` forever; but advancing on a SHORT (end-of-timeline) page
  * means any traffic on any other topic in a shared room silently moves this topic's cursor, breaking
  * the seam's "since at the tail returns empty and a STABLE cursor" contract for every reader of that
- * room. A `blockMs` that discarded the advance would make the answer depend on the wait, not the
- * timeline.
+ * room.
  *
  * The depth is SWEPT across the page boundary rather than sampled, because the decision is made at
  * `count === limit` and the `since` event itself can occupy a page slot — hand-picked depths straddle
@@ -124,112 +122,37 @@ const sweep = (limit: number): number[] => Array.from({ length: 2 * limit + 1 },
 const cursorMustMove = (count: number, limit: number): boolean | undefined =>
   count < limit ? false : count >= 2 * limit ? true : undefined;
 
-/** 0 = the plain catch-up; >0 drives the native long-poll, which must agree with it. */
-const BLOCK_MODES = [0, 150];
-
 describe('a foreign block moves this topic cursor only when it fills a page', () => {
   for (const limit of LIMITS) {
     for (const count of sweep(limit)) {
       const must = cursorMustMove(count, limit);
-      for (const blockMs of BLOCK_MODES) {
-        it(`limit ${limit} / ${count} foreign event(s) after the cursor / blockMs ${blockMs}: moves it = ${must ?? 'either'}`, async () => {
-          install();
-          const p = await connect(true);
-          const A = asTopic('topic-A');
-          const B = asTopic('topic-B');
-          const writer = asHandle('w');
+      it(`limit ${limit} / ${count} foreign event(s) after the cursor: moves it = ${must ?? 'either'}`, async () => {
+        install();
+        const p = await connect(true);
+        const A = asTopic('topic-A');
+        const B = asTopic('topic-B');
+        const writer = asHandle('w');
 
-          const idA0 = await p.post(A, writer, 'a0');
-          for (let i = 0; i < count; i++) await p.post(B, writer, `b${i}`);
+        const idA0 = await p.post(A, writer, 'a0');
+        for (let i = 0; i < count; i++) await p.post(B, writer, `b${i}`);
 
-          const at = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit, blockMs });
-          expect(at.messages).toEqual([]);
-          const moved = String(at.nextCursor) !== String(idA0);
-          if (must !== undefined) expect(moved).toBe(must);
+        const at = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit });
+        expect(at.messages).toEqual([]);
+        const moved = String(at.nextCursor) !== String(idA0);
+        if (must !== undefined) expect(moved).toBe(must);
 
-          // Whatever it reported, the cursor is replayable: the next on-topic message is returned from
-          // it exactly once, and the read is idempotent until then.
-          const again = await p.fetchRecent({ topic: A, since: at.nextCursor, limit });
-          expect(again.messages).toEqual([]);
-          const idA1 = await p.post(A, writer, 'a1');
-          const next = await p.fetchRecent({ topic: A, since: at.nextCursor, limit });
+        // Whatever it reported, the cursor is replayable: the next on-topic message is returned from
+        // it exactly once, and the read is idempotent until then.
+        const again = await p.fetchRecent({ topic: A, since: at.nextCursor, limit });
+        expect(again.messages).toEqual([]);
+        const idA1 = await p.post(A, writer, 'a1');
+        const next = await p.fetchRecent({ topic: A, since: at.nextCursor, limit });
 
-          expect(next.messages.map((m) => m.content)).toEqual(['a1']);
-          expect(String(next.nextCursor)).toBe(String(idA1));
-          await p.disconnect();
-        });
-      }
-    }
-  }
-
-  /**
-   * WHEN the foreign traffic lands is an axis of the blocking answer, not a detail of the fixture.
-   * A block staged BEFORE the call is already crossed by the pre-block query whose cursor seeds the
-   * wait, so every such row grades the seed and none of them grades the carry that advances it
-   * across each empty re-query — a distinction worth one page of foreign traffic per long-poll
-   * window, compounding until the topic sits past the forward-page bound and wedges. Each row
-   * proves its traffic landed, so one that armed nothing fails instead of re-grading the seed.
-   */
-  const BLOCK_MS = 900;
-  /** More than one `limit`-sized forward page, so a cursor that fails to carry cannot cross it. */
-  const FOREIGN_DEPTH = 9;
-  const BLOCK_LIMIT = 3;
-
-  const FOREIGN_BLOCK_LANDS: Record<
-    string,
-    (f: FakeSynapse, land: () => void) => { fired: () => boolean; cancel: () => void }
-  > = {
-    'before the call': (_f, land) => {
-      land();
-      return { fired: () => true, cancel: () => undefined };
-    },
-    'inside the dedicated /sync positioning window': (f, land) => {
-      let fired = false;
-      f.stallPositioningMs = 60;
-      f.stallPositioning = (ordinal) => ordinal === 1;
-      f.duringPositioningStall = (ordinal) => {
-        if (ordinal !== 1 || fired) return;
-        fired = true;
-        land();
-      };
-      return { fired: () => fired, cancel: () => undefined };
-    },
-    'mid-block, after the first empty re-query': (_f, land) => {
-      let fired = false;
-      const timer = setTimeout(() => {
-        fired = true;
-        land();
-      }, 120);
-      return { fired: () => fired, cancel: () => clearTimeout(timer) };
-    },
-  };
-
-  for (const [whenName, place] of Object.entries(FOREIGN_BLOCK_LANDS)) {
-    it(`a foreign block landing ${whenName}: the blocking cursor is the one a plain read reports`, async () => {
-      const f = install();
-      const p = await connect(true);
-      const A = asTopic('topic-A');
-      const B = asTopic('topic-B');
-      const writer = asHandle('w');
-
-      const idA0 = await p.post(A, writer, 'a0');
-      const since = asCursor(String(idA0));
-      const armed = place(f, () => {
-        for (let i = 0; i < FOREIGN_DEPTH; i++) f.addMessage(String(B), `b${i}`);
+        expect(next.messages.map((m) => m.content)).toEqual(['a1']);
+        expect(String(next.nextCursor)).toBe(String(idA1));
+        await p.disconnect();
       });
-
-      const blocked = await p.fetchRecent({ topic: A, since, limit: BLOCK_LIMIT, blockMs: BLOCK_MS });
-      armed.cancel();
-      const plain = await p.fetchRecent({ topic: A, since, limit: BLOCK_LIMIT });
-
-      expect(armed.fired(), 'no foreign traffic landed, so this row grades the seed cursor').toBe(
-        true,
-      );
-      expect(blocked.messages).toEqual([]);
-      expect(String(blocked.nextCursor)).toBe(String(plain.nextCursor));
-      expect(String(blocked.nextCursor)).not.toBe(String(idA0));
-      await p.disconnect();
-    }, 30_000);
+    }
   }
 
   /**
@@ -392,62 +315,6 @@ describe('subscribe recovers a burst larger than the per-sync cap via prev_batch
       await p.disconnect();
     });
   }
-});
-
-describe('fetchRecent honors blockMs natively via a bounded /sync long-poll', () => {
-  it('wakes promptly when a message lands mid-wait, returning it via the canonical catch-up', async () => {
-    install();
-    const p = await connect(false); // per-topic room; no subscribe loop → dedicated bounded /sync
-    const T = asTopic('block-wake');
-    const writer = asHandle('w');
-
-    await p.post(T, writer, 'old');
-    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
-
-    const pending = p.fetchRecent({ topic: T, since: tail, blockMs: 2000 });
-    // A message lands ~60ms into the wait (after the first bounded /sync has parked).
-    setTimeout(() => void p.post(T, writer, 'fresh'), 60);
-
-    const woke = await pending;
-    expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
-    expect(String(woke.nextCursor)).not.toBe(String(tail)); // cursor advanced past the floor
-    await p.disconnect();
-  });
-
-  it('returns an empty page with a stable, replayable cursor at the blockMs timeout', async () => {
-    install();
-    const p = await connect(false);
-    const T = asTopic('block-timeout');
-    const writer = asHandle('w');
-
-    await p.post(T, writer, 'only');
-    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
-
-    const started = Date.now();
-    const timedOut = await p.fetchRecent({ topic: T, since: tail, blockMs: 250 });
-    expect(timedOut.messages).toEqual([]);
-    expect(String(timedOut.nextCursor)).toBe(String(tail)); // stable — replaying it yields [] again
-    expect(Date.now() - started).toBeGreaterThanOrEqual(150); // actually blocked, not instant
-    await p.disconnect();
-  });
-
-  it('disconnect() aborts an in-flight blocking fetch promptly (no leak, no hang)', async () => {
-    install();
-    const p = await connect(false);
-    const T = asTopic('block-disconnect');
-    const writer = asHandle('w');
-
-    await p.post(T, writer, 'seed');
-    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
-
-    const started = Date.now();
-    const pending = p.fetchRecent({ topic: T, since: tail, blockMs: 5000 });
-    setTimeout(() => void p.disconnect(), 50);
-
-    const res = await pending; // must resolve well before the 5s budget
-    expect(res.messages).toEqual([]);
-    expect(Date.now() - started).toBeLessThan(2000);
-  });
 });
 
 /**

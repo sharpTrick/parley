@@ -315,9 +315,9 @@ describe('a malformed gateway frame never escapes the message listener', () => {
 
   // Every row above is a frame SOMEBODY predicted, and the guards that answer them are pinned by
   // their own rows. The boundary around the whole switch is for the throw nobody predicted, so the
-  // only way to measure it is to inject one — here into the one statement of the dispatch branch
-  // that no inner handler wraps, the long-poll waiter fan-out. A future opcode branch that throws
-  // lands in exactly the same place.
+  // only way to measure it is to inject one — here into the subscription lookup the dispatch branch
+  // makes before the try that wraps the handler. A future opcode branch that throws lands in
+  // exactly the same place.
   it('a branch that throws costs the socket, not the process', async () => {
     gateway.handshake = true;
     const plugin = await connect();
@@ -325,17 +325,11 @@ describe('a malformed gateway frame never escapes the message listener', () => {
     await gateway.socket();
 
     let raised = false;
-    const waiters = probe<Map<string, Set<() => void>>>(plugin, 'waiters');
-    waiters.set(
-      CHANNEL,
-      new Set([
-        () => {
-          if (raised) return; // the close below fires every waiter again; raise exactly once
-          raised = true;
-          throw new Error('injected fault');
-        },
-      ]),
-    );
+    const subs = probe<Map<string, unknown>>(plugin, 'subs');
+    subs.get = (): never => {
+      raised = true;
+      throw new Error('injected fault');
+    };
 
     try {
       const settled = gateway.reacted();

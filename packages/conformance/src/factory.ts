@@ -25,9 +25,9 @@ export interface ConformanceContext {
    */
   concurrentPost: ((topic: Topic, writers: number, perWriter: number) => Promise<void>) | 'unsupported';
   /**
-   * True for backends that honor `blockMs` NATIVELY in `fetchRecent` (Redis `XREAD BLOCK`, NATS
-   * pull expiry, Matrix `/sync` timeout, XMPP MUC wait, Postgres `LISTEN`/`NOTIFY`, …). False for a
-   * polling-only backend that gets its long-poll from core's generic wrapper instead — SQLite.
+   * True for backends whose own read primitive takes a caller's wait (Redis `XREAD BLOCK`, NATS
+   * pull expiry). False for one whose `fetchRecent` reads history and takes no wait — every
+   * push-driven backend, and SQLite, which gets its long-poll from core's wrapper instead.
    */
   supportsBlockingFetch: boolean;
   /**

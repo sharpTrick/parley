@@ -27,14 +27,10 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 Archive ids are not lexically comparable, but core never compares cursors — the server's RSM
 `<after>` defines "strictly after" and the MAM archive defines order.
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. XMPP
-serves this natively via a live MUC wait plus a MAM reconcile (with an archival-lag re-poll). Core
-caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return
-catch-up semantics. It changes only *when* the call returns: a `block_ms` fetch answers the same
-window the same call answers without one — the newest `limit` when `since` is omitted, everything
-strictly after it when it is not.
+**No `block_ms` here.** `fetchRecent` reads the MAM archive and has no wait to spend a caller's
+budget on, so this plugin declares `capabilities.blockingFetch: false` and core withdraws `block_ms`
+from the `parley_fetch_recent` schema for an XMPP deployment. Live delivery is `subscribe`, over the
+MUC's live groupchat stanzas.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) becomes the MUC occupant nick.**
 > The sender of every archived message is that nick, and it is the `senderHandle` core reports — so

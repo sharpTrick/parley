@@ -1,4 +1,4 @@
-import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
+import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { sleep } from './pg-harness.js';
@@ -349,34 +349,5 @@ describe('a row landing while subscribe arms the live path', () => {
     expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
 
     await plugin.disconnect();
-  }, 15000);
-
-  it('a subscribe piggybacking an established LISTEN still drains its arming window', async () => {
-    const plugin = new PostgresPlugin();
-    await plugin.connect({ url: REAL_URL });
-    const topic = 'piggyback';
-
-    const parked = plugin.fetchRecent({
-      topic: asTopic(topic),
-      since: asCursor('0'),
-      blockMs: 3000,
-    });
-    await sleep(40);
-    const listensBefore = state.listenCalls.length;
-
-    const { land, landed } = landOnce(topic);
-    state.tailMs = ARMING_WINDOW_MS;
-    state.onTailRead = land;
-
-    const got: Message[] = [];
-    await plugin.subscribe(asTopic(topic), (m) => got.push(m));
-    await sleep(120);
-
-    expect(landed(), 'the tail read never happened, so this case proves nothing').toBe(true);
-    expect(state.listenCalls.length, 'the waiter’s LISTEN was not reused').toBe(listensBefore);
-    expect(got.map((m) => m.content)).toEqual(['m0']);
-
-    await plugin.disconnect();
-    await parked;
   }, 15000);
 });

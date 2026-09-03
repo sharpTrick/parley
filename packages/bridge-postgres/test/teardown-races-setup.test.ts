@@ -1,4 +1,4 @@
-import { asCursor, asHandle, asTopic } from '@sharptrick/parley-core';
+import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { sleep } from './pg-harness.js';
@@ -109,8 +109,6 @@ interface Priv {
   subs: Map<string, unknown>;
   subscribing: Map<string, unknown>;
   listens: Map<string, unknown>;
-  waiters: Map<string, unknown>;
-  pendingAborts: Set<unknown>;
 }
 
 interface Race {
@@ -152,13 +150,6 @@ const ROWS: Race[] = [
     setUp: connected,
     call: (plugin) => plugin.subscribe(TOPIC, () => undefined),
     mustReject: true,
-  },
-  {
-    name: 'a blocking fetchRecent(), parked on the LISTEN',
-    at: 'the LISTEN',
-    setUp: connected,
-    call: (plugin) => plugin.fetchRecent({ topic: TOPIC, since: asCursor('0'), blockMs: 500 }),
-    mustReject: false,
   },
   {
     name: 'post(), parked on the write lock',
@@ -237,11 +228,9 @@ describe('a Postgres disconnect that races a setup call still leaves nothing liv
           subs: priv.subs.size,
           subscribing: priv.subscribing.size,
           listens: priv.listens.size,
-          waiters: priv.waiters.size,
-          pendingAborts: priv.pendingAborts.size,
         },
         'a registry survived the teardown',
-      ).toEqual({ starting: 0, subs: 0, subscribing: 0, listens: 0, waiters: 0, pendingAborts: 0 });
+      ).toEqual({ starting: 0, subs: 0, subscribing: 0, listens: 0 });
 
       // Nothing above the seam can tell a half-initialised plugin from a disconnected one except by
       // driving it: a supervisor's next act after disconnect() is connect().

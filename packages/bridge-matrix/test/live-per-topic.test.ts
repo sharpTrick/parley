@@ -137,7 +137,6 @@ describe.skipIf(!bothAccounts)('live per-topic rooms, two accounts', () => {
       await expect(a.post(topic, asHandle('a'), 'from-a')).rejects.toThrow(named);
       await expect(a.fetchRecent({ topic, limit: 10 })).rejects.toThrow(named);
       await expect(a.subscribe(topic, () => undefined)).rejects.toThrow(named);
-      expect([...(a as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
       // …and the stranger's room is still empty: nothing of this session was written into it.
       expect(await roomMessages(tokens[1]!, alias)).toEqual([]);
     } finally {
@@ -163,7 +162,6 @@ describe.skipIf(!bothAccounts)('live per-topic rooms, two accounts', () => {
       await expect(b.post(topic, asHandle('b'), 'from-b')).rejects.toThrow(named);
       await expect(b.fetchRecent({ topic, limit: 10 })).rejects.toThrow(named);
       await expect(b.subscribe(topic, () => undefined)).rejects.toThrow(named);
-      expect([...(b as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
     } finally {
       await retireRoom(aliasForTopic(String(topic)), tokens);
       await a.disconnect();

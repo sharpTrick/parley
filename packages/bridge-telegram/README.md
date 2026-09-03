@@ -36,12 +36,10 @@ it is never dropped), else a `[photo]`/`[sticker]`/`[document]`/… placeholder 
 kind. Updates with none of these (service messages: joins, leaves, pins) are **not ingested** —
 an agent is never handed a blank turn.
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time.
-Telegram serves this natively off the shared `getUpdates` loop's per-chat delivery — no second
-consumer is opened (see the one-consumer-per-token rule below). Core caps the wait at
-`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+**No `block_ms` here.** `fetchRecent` reads the observed-message store and has no wait to spend a
+caller's budget on, so this plugin declares `capabilities.blockingFetch: false` and core withdraws
+`block_ms` from the `parley_fetch_recent` schema for a Telegram deployment. Live delivery is
+`subscribe`, off the one shared `getUpdates` loop.
 
 > **`post`'s `identity` argument is not used.** Telegram stamps the sender as the bot account
 > behind the token — the same caveat as the Matrix plugin's login account. Per-session

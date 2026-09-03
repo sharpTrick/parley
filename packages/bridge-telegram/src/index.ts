@@ -26,7 +26,6 @@ import { recordToMessage, requireLimit, requireOwnCursor } from './cursor.js';
 import { describe, Diagnostics, fromCaller, plaintextWarning } from './diagnostics.js';
 import { pollUpdates } from './poll.js';
 import { keyOf, type ObservedRecord, ObservedStore } from './store.js';
-import { Waiters } from './waiters.js';
 import {
   canonicalChatKey,
   contentOf,
@@ -53,7 +52,7 @@ export type { TelegramBackendConfig } from './config.js';
  * unique PER CHAT) and `cursor = '<store identity>.<seq>'`, over the store's own OBSERVATION
  * sequence ({@link StoredRecord.seq}) and the store FILE's identity ({@link ObservedStore.epoch}).
  *
- * Everything internal — the observed store, live subscriptions, long-poll waiters — is keyed by
+ * Everything internal — the observed store, live subscriptions — is keyed by
  * the CANONICAL NUMERIC CHAT ID a topic resolves to ({@link ChatResolver}), never by the topic
  * string; see {@link StoredRecord} for why.
  *
@@ -61,6 +60,12 @@ export type { TelegramBackendConfig } from './config.js';
  * Telegram bridge per bot token — see README.md, "Multiple concurrent sessions".
  */
 export class TelegramPlugin implements BackendPlugin {
+  /**
+   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
+   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
+   */
+  readonly capabilities = { blockingFetch: false } as const;
+
   private api = new BotApi(DEFAULT_API_URL, '');
   private chats?: ChatResolver;
   private store?: ObservedStore;
@@ -79,7 +84,6 @@ export class TelegramPlugin implements BackendPlugin {
    * the Parley topic its subscriber named the chat by — stamped on what that subscriber receives.
    */
   private readonly subs = new Map<string, { handler: MessageHandler; topic: Topic }[]>();
-  private readonly waiters = new Waiters();
   private readonly diagnostics = new Diagnostics((text) => this.api.redact(text));
 
   /**
@@ -188,7 +192,6 @@ export class TelegramPlugin implements BackendPlugin {
     this.subs.clear();
     this.chats = undefined;
     this.diagnostics.forgetCallerKinds();
-    this.waiters.wakeAll();
     this.store?.close();
     this.store = undefined;
   }
@@ -298,21 +301,7 @@ export class TelegramPlugin implements BackendPlugin {
             all.filter((r) => r.seq > sinceSeq).slice(0, limit);
       return slice.map((rec) => recordToMessage(rec, args.topic, store.epoch()));
     };
-    let messages = query();
-    // Native long-poll: park ONLY when NOTHING in the store sits above the exclusive `since` — the
-    // unsliced predicate, never the sliced page, so that a `limit` which happens to return no rows
-    // cannot park a call the store could already answer. The predicate, the initial query and the
-    // waiter registration run with NO await between them, so a message {@link ingest} takes during
-    // the wait can never slip through the gap.
-    if (
-      sinceSeq !== undefined &&
-      args.blockMs !== undefined &&
-      args.blockMs > 0 &&
-      !store.entries(chatId).some((r) => r.seq > sinceSeq)
-    ) {
-      await this.waiters.park(chatId, sinceSeq, args.blockMs);
-      messages = query();
-    }
+    const messages = query();
     const last = messages.at(-1);
     // An empty page must never move the caller backwards: hold `since` when there was one, and
     // otherwise report the topic's current tail — `limit: 0` on a topic with history would
@@ -398,9 +387,6 @@ export class TelegramPlugin implements BackendPlugin {
       // The chat cap will not clear on its own; a lost append descriptor a later compaction may.
       return store.isOpen();
     }
-    // Native long-poll: a genuinely-new message wakes any parked fetchRecent on this
-    // chat. Runs for BOTH ingest callers (the shared getUpdates loop and own posts via post()).
-    this.waiters.wake(chatId, rec.seq);
     for (const sub of this.subs.get(chatId) ?? []) {
       try {
         sub.handler(recordToMessage(rec, sub.topic, store.epoch()));

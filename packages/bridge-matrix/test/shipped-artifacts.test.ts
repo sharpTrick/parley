@@ -1,4 +1,4 @@
-import { Allowlist, loadConfig, parseConfig, TOOL_TEXT } from '@sharptrick/parley-core';
+import { Allowlist, loadConfig, TOOL_TEXT } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -311,9 +311,6 @@ const CORE_SHIPS: Record<string, string> = {
   'the parley_fetch_recent description': TOOL_TEXT.fetch_recent,
   "the block_ms argument's description": TOOL_TEXT.fetch_recent_block_ms,
   "the since argument's description": TOOL_TEXT.fetch_recent_since,
-  'the catchup defaults a config with none gets': JSON.stringify(
-    parseConfig({ identity: { handle: 'probe' }, topics: ['ops'] }).catchup,
-  ),
 };
 /**
  * EVERY source file this package ships, concatenated — never one named file. A claim about what the
@@ -347,16 +344,12 @@ interface CoreOwnedClaim {
 }
 
 const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
-  'block_ms holds an EMPTY window, with or without a since': {
+  'this deployment is not offered block_ms at all': {
     core: { ships: "the block_ms argument's description", pattern: /If the queried window is empty — whether or not/ },
-    readme: /Blocking engages on an \*\*empty window, `since` or not\*\*/,
-    // The tool routes ANY block_ms > 0 through fetchRecentBlocking, which re-enters with the cursor
-    // the first page reported — so a since-less call on an empty topic holds the whole budget.
-    forbidden: /returns at once, even on a topic\s+whose room does not exist yet/,
-  },
-  'the block_ms clamp defaults to 60s': {
-    core: { ships: 'the catchup defaults a config with none gets', pattern: /"block_max_ms":60000/ },
-    readme: /`catchup\.block_max_ms` \(default 60s\)/,
+    readme: /core withdraws `block_ms` from\s+the `parley_fetch_recent` schema/,
+    // The plugin declares the capability false, so the argument core describes above never reaches
+    // a Matrix deployment's tool schema; a README promising the wait is promising a different one.
+    forbidden: /Matrix\s+serves this natively/,
   },
   'an omitted since means the recent window': {
     core: { ships: "the since argument's description", pattern: /Omit for the recent window/ },

@@ -4,14 +4,13 @@ import { WebSocket, type RawData } from 'ws';
 import type { SlackApiCall } from './api.js';
 import type { SlackSettings } from './config.js';
 import { slackToMessage } from './markup.js';
-import { compareTs, isPlainMessage } from './messages.js';
+import { isPlainMessage } from './messages.js';
 import {
   closeQuietly,
   DIAL_BACKOFF_MS,
   MAX_DIAL_BACKOFF_MS,
   requireUsableSocketUrl,
   type SocketEnvelope,
-  type Waiter,
 } from './socket.js';
 
 /** The plugin, as the link sees it: the live configuration and which session is still current. */
@@ -27,9 +26,8 @@ export interface Route {
 }
 
 /**
- * ONE shared Socket Mode websocket per plugin instance, opened lazily on the first subscribe, and
- * everything parked on it: the routes it feeds, the native long-polls waiting on it, and the dial
- * pacer that spaces `apps.connections.open` when it is unavailable.
+ * ONE shared Socket Mode websocket per plugin instance, opened lazily on the first subscribe: the
+ * routes it feeds, and the dial pacer that spaces `apps.connections.open` when it is unavailable.
  *
  * Ascending-`ts` handler invocation is a PLUGIN guarantee and nothing here orders anything: it
  * rests on ONE connection feeding a channel, which a rotation deliberately suspends. Keep
@@ -49,12 +47,7 @@ export class SocketModeLink {
   private wsReady?: Promise<void>;
   /** channel id → the topic + handler it feeds (Socket Mode events carry the channel id). */
   readonly routes = new Map<string, Route>();
-  /**
-   * channel id → the native long-poll waiters parked on that channel, hooking the SAME shared
-   * stream as `subscribe` and independent of whether any route is registered.
-   */
-  private readonly waiters = new Map<string, Set<Waiter>>();
-  /** Earliest wall clock at which an automatic dial may go out — see {@link ensurePollSocket}. */
+  /** Earliest wall clock at which an automatic dial may go out — see {@link backOffDialling}. */
   private dialCooldownUntil = 0;
   private dialBackoffMs = DIAL_BACKOFF_MS;
   /** When the current connection saw `hello`, or 0 — the pacer's "has it served yet?" clock. */
@@ -81,9 +74,6 @@ export class SocketModeLink {
     // The reconnect owner is cleared here too, so the next session can own its own loop.
     this.reconnecting = false;
     this.routes.clear();
-    // Abort every blocked long-poll cleanly; the retired session stops any of them re-arming.
-    this.drainWaiters();
-    this.waiters.clear();
     this.wsReady = undefined;
     for (const ws of [...this.sockets]) closeQuietly(ws);
     this.sockets.clear();
@@ -93,9 +83,8 @@ export class SocketModeLink {
   /**
    * The shared socket, opened lazily on the first subscribe; resolves once `hello` is in. A
    * reactive-only deployment configures no `app_token`; keep that named rejection HERE rather than
-   * in one caller, so that neither `subscribe` nor a blocked `fetchRecent` dials
-   * `apps.connections.open` to be answered `not_authed` every time, under an error naming neither
-   * `app_token` nor Socket Mode.
+   * in one caller, so that no caller dials `apps.connections.open` to be answered `not_authed`
+   * every time, under an error naming neither `app_token` nor Socket Mode.
    */
   ensureSocket(): Promise<void> {
     if (this.host.settings().appToken === undefined) {
@@ -118,72 +107,6 @@ export class SocketModeLink {
       });
     }
     return this.wsReady;
-  }
-
-  /**
-   * The long-poll's view of the shared socket. Core re-drives `fetchRecent` every
-   * `block_poll_interval_ms` (250 ms) for the whole `block_max_ms` budget, so keep the cooldown
-   * between dials, so that one unavailable Socket Mode cannot turn a single `fetch_recent` into
-   * hundreds of `apps.connections.open` calls — Slack's tightest rate limit. "Unavailable" includes
-   * an edge that keeps ACCEPTING, which {@link noteConnectionEnded} paces on the same cooldown.
-   */
-  ensurePollSocket(): Promise<void> {
-    if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
-      return Promise.reject(
-        new Error('Slack Socket Mode dialling is backing off; apps.connections.open not attempted'),
-      );
-    }
-    return this.ensureSocket();
-  }
-
-  /**
-   * ARM a native long-poll on `channel` immediately and return its `{ wait, wake }` handle. `wait`
-   * resolves when a live event strictly after `sinceTs` arrives (via {@link onEnvelope}), when
-   * `blockMs` elapses, or when `wake()`/{@link stop} drains it — EXACTLY once, self-cleaning,
-   * never rejecting. Arming is separated from awaiting so the caller can register the waiter BEFORE
-   * the gap-closing re-query; `wake()` cancels it if that query already returned data.
-   */
-  armWaiter(
-    channel: string,
-    sinceTs: string,
-    blockMs: number,
-  ): { wait: Promise<void>; wake: () => void } {
-    let done = false;
-    let timer: ReturnType<typeof setTimeout>;
-    let resolveWait!: () => void;
-    const waiter: Waiter = {
-      since: sinceTs,
-      wake: () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        const set = this.waiters.get(channel);
-        if (set !== undefined) {
-          set.delete(waiter);
-          if (set.size === 0) this.waiters.delete(channel);
-        }
-        resolveWait();
-      },
-    };
-    const wait = new Promise<void>((resolve) => {
-      resolveWait = resolve;
-    });
-    timer = setTimeout(waiter.wake, blockMs);
-    const set = this.waiters.get(channel) ?? new Set<Waiter>();
-    set.add(waiter);
-    this.waiters.set(channel, set);
-    return { wait, wake: waiter.wake };
-  }
-
-  /**
-   * Release every parked long-poll (`wake()` mutates `waiters`, so snapshot both levels). Keep the
-   * loss of an ESTABLISHED socket calling this, so that a caller parked on a stream that has
-   * stopped serving falls back to the history ladder instead of holding its budget on a dead socket.
-   */
-  private drainWaiters(): void {
-    for (const set of [...this.waiters.values()]) {
-      for (const waiter of [...set]) waiter.wake();
-    }
   }
 
   private backOffDialling(): void {
@@ -265,7 +188,6 @@ export class SocketModeLink {
         // cause — cannot be read as a live connection dropping and be handed a reconnect owner.
         if (!helloSeen) return;
         this.noteConnectionEnded();
-        this.drainWaiters();
         void this.reconnect();
       });
     });
@@ -365,15 +287,6 @@ export class SocketModeLink {
     if (env.type !== 'events_api') return;
     const event = env.payload?.event;
     if (!isPlainMessage(event) || typeof event.channel !== 'string') return;
-
-    // Wake any long-poll waiters on this channel — independent of subscribe routes, since a
-    // blocking `fetchRecent` may have no route registered. Snapshot the set (wake() mutates it).
-    const waiting = this.waiters.get(event.channel);
-    if (waiting !== undefined) {
-      for (const waiter of [...waiting]) {
-        if (compareTs(event.ts, waiter.since) > 0) waiter.wake();
-      }
-    }
 
     const route = this.routes.get(event.channel);
     if (route === undefined) return;

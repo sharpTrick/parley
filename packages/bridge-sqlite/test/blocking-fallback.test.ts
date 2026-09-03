@@ -6,10 +6,10 @@ import { asHandle, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/
 import { SqlitePlugin } from '../src/index.js';
 
 /**
- * SQLite is polling-only by design, so it does NOT block natively — it gets its long-poll from
- * core's generic `fetchRecentBlocking` wrapper. This proves that path end to end against a REAL
- * SqlitePlugin, with no plugin change required: a blocked fetch wakes promptly on a concurrent
- * post, and returns an empty page with a stable cursor at the timeout.
+ * SQLite does not block natively, so it declares `blockingFetch: false` and the MCP tool omits
+ * `block_ms`. An EMBEDDER calling the seam directly still reaches core's `fetchRecentBlocking`
+ * wrapper, and this proves that path end to end against a real SqlitePlugin: a blocked fetch wakes
+ * promptly on a concurrent post, and returns an empty page with a stable cursor at the timeout.
  */
 describe('sqlite + core fetchRecentBlocking (generic fallback, zero plugin change)', () => {
   const SENDER = asHandle('writer');

@@ -36,7 +36,6 @@ export class DiscordGateway extends GatewayLadder {
   private urlOverride?: string;
   private handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS;
   private ws?: WebSocket;
-  private live = false;
   /** One entry PER SOCKET, so a late HELLO on a superseded one cannot clear the live socket's beat. */
   readonly heartbeats = new Set<NodeJS.Timeout>();
   /** Last dispatch sequence number, echoed in heartbeats. */
@@ -61,15 +60,6 @@ export class DiscordGateway extends GatewayLadder {
     this.heartbeats.clear();
     this.ws?.close();
     this.ws = undefined;
-    this.live = false;
-  }
-
-  /**
-   * A MESSAGE_CREATE-carrying socket exists RIGHT NOW — deliberately not the readiness memo, which
-   * survives the reconnect cycle and would let a long-poll sleep its budget on a dead socket.
-   */
-  isLive(): boolean {
-    return this.live && this.ws !== undefined && this.ws.readyState === WebSocket.OPEN;
   }
 
   /**
@@ -106,8 +96,7 @@ export class DiscordGateway extends GatewayLadder {
       let awaitedAck = false;
       let identified = false;
       // A socket Discord (or a proxy) accepts but never carries to READY would otherwise park
-      // this promise forever — and with it subscribe(), bridge startup, and every blocking
-      // fetchRecent that awaits the same gateway.
+      // this promise forever — and with it subscribe() and bridge startup.
       const stalled = `Discord gateway handshake timed out after ${this.handshakeTimeoutMs}ms (no READY)`;
       const handshake = setTimeout(() => {
         if (ready) return;
@@ -182,7 +171,6 @@ export class DiscordGateway extends GatewayLadder {
               if (payload.t === 'READY' && !ready) {
                 ready = true;
                 readyAt = Date.now();
-                this.live = true;
                 clearTimeout(handshake);
                 resolve();
               } else if (payload.t === 'MESSAGE_CREATE') {
@@ -249,7 +237,6 @@ export class DiscordGateway extends GatewayLadder {
         // moved on — real `ws` emits it a tick late — cannot mark the NEXT session fatal.
         if (this.ws !== ws) return;
         this.ws = undefined;
-        this.live = false;
         if (!this.host.isStopped()) {
           if (terminal) {
             this.ready = undefined;
@@ -260,9 +247,6 @@ export class DiscordGateway extends GatewayLadder {
             this.scheduleReconnect(epoch);
           }
         }
-        // The socket that would have woken them is gone: release every blocked long-poll so it
-        // re-queries REST now and hands the rest of its budget back to core's poll fallback.
-        this.host.onSocketGone();
       });
     });
   }

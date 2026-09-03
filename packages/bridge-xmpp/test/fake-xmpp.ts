@@ -62,12 +62,10 @@ export interface XmppPrivate {
   pendingJoins: Map<string, { resolve(): void; reject(err: Error): void }>;
   pendingPosts: Map<string, { room: string; resolve(id: unknown): void; reject(err: Error): void }>;
   mamCollectors: Map<string, { room: string; items: ArchiveItem[] }>;
-  waiters: Map<string, Set<(reason: string) => void>>;
   subscriptions: Map<string, { topic: Topic; handlers: Array<(m: unknown) => void> }>;
   roomJid(topic: Topic): string;
   joinOnce(room: string): Promise<void>;
   onStanza(stanza: unknown): void;
-  armWaiter(room: string): { park(ms: number): Promise<string>; cancel(): void };
   mamQuery(
     topic: Topic,
     opts: { after?: string; lastPage?: boolean; max: number },
@@ -77,8 +75,8 @@ export const priv = (p: XmppPlugin): XmppPrivate => p as unknown as XmppPrivate;
 
 /**
  * Every keyed registry the plugin uses to correlate an in-flight operation. A finished operation
- * must leave all of them empty — a survivor is a leaked timer, a stuck long-poll, or a correlator
- * an unrelated later stanza can resolve.
+ * must leave all of them empty — a survivor is a leaked timer or a correlator an unrelated later
+ * stanza can resolve.
  */
 export const expectNoLeaks = (plugin: XmppPlugin): void => {
   const p = priv(plugin);
@@ -86,8 +84,7 @@ export const expectNoLeaks = (plugin: XmppPlugin): void => {
     pendingJoins: p.pendingJoins.size,
     pendingPosts: p.pendingPosts.size,
     mamCollectors: p.mamCollectors.size,
-    waiters: p.waiters.size,
-  }).toEqual({ pendingJoins: 0, pendingPosts: 0, mamCollectors: 0, waiters: 0 });
+  }).toEqual({ pendingJoins: 0, pendingPosts: 0, mamCollectors: 0 });
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

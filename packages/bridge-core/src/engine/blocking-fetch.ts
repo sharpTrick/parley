@@ -7,7 +7,7 @@ export interface BlockingFetchOptions {
   /** Total long-poll budget in ms. Already clamped to the server cap by the caller. */
   blockMs: number;
   /**
-   * Poll cadence for the generic fallback (used only when a plugin returns early/empty). Must be in
+   * Cadence at which the budget is re-driven when a plugin returns early/empty. Must be in
    * `[1, MAX_TIMER_MS]`: a cadence outside that is REJECTED, not clamped, because silently degrading
    * it turns a long poll into a single fetch — the opposite of what this function is for — and every
    * value off either end arms the nap at ~1 ms, which is a spin against the backend rather than a
@@ -80,8 +80,9 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
 
 /**
  * Generic long-poll wrapper over the seam's `fetchRecent`, used ONLY by the MCP `fetch_recent`
- * tool. It gives EVERY backend blocking semantics with zero plugin changes, and lets a
- * backend that DOES honor `blockMs` natively block efficiently — the two compose:
+ * tool. It owns the cancellation race, the coarse-delivery arrival filter, the range validation and
+ * the re-drive of a budget a plugin returned early from — a natively blocking backend still needs
+ * every one of them:
  *
  *   - Each iteration calls `plugin.fetchRecent({ ...args, since, blockMs: remaining })`.
  *     A native plugin blocks up to `remaining` inside that one call; a non-native plugin ignores

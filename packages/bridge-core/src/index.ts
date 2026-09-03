@@ -10,6 +10,7 @@ export { asTopic, asHandle, asBackendMsgId, asCursor, buildMessage } from './mes
 export { safeName, MIN_HASH_LEN, DEFAULT_HASH_LEN, MAX_HASH_LEN } from './topic-name.js';
 export type {
   BackendPlugin,
+  BackendCapabilities,
   BackendConfig,
   BackendIdentity,
   FetchRecentArgs,

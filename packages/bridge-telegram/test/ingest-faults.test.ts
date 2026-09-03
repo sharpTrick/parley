@@ -92,7 +92,6 @@ describe('telegram store visibility and delivery', () => {
     const tail = (await rig.plugin.fetchRecent({ topic, limit: 100 })).nextCursor;
     const live: Message[] = [];
     await rig.plugin.subscribe(topic, (m) => live.push(m));
-    const parked = rig.plugin.fetchRecent({ topic, since: tail, blockMs: 1500 });
 
     if (persists) {
       // A directory at the temp path: every compaction fails, and none of them can touch a record.
@@ -126,12 +125,14 @@ describe('telegram store visibility and delivery', () => {
     // The step under test really failed — a cell whose obstruction never bit would grade nothing.
     const reported = `${stderr.join('')}${postError?.message ?? ''}`;
     expect(reported).toMatch(persists ? /could not compact/ : /ENOSPC/);
-    const woke = (await parked).messages.map((m) => m.content).includes('subject');
+    const caughtUp = (await rig.plugin.fetchRecent({ topic, since: tail, limit: 100 })).messages
+      .map((m) => m.content)
+      .includes('subject');
     expect({
       visible: (await contentsOf(rig.plugin, topic)).includes('subject'),
       pushed: live.map((m) => m.content).includes('subject'),
-      woke,
-    }).toEqual({ visible: durable, pushed: durable, woke: durable });
+      caughtUp,
+    }).toEqual({ visible: durable, pushed: durable, caughtUp: durable });
     // A post whose record never landed is never a resolved post.
     if (path === 'an own post') expect(postError === undefined).toBe(durable);
   }, 20_000);

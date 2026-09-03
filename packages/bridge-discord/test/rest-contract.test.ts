@@ -34,8 +34,6 @@ const PACKAGE_VERSION = (
   }
 ).version;
 
-/** A blocking window wide enough that a prompt REST failure lands well inside the call's budget. */
-const BLOCK_MS = 2000;
 
 // The REST half of the seam contract, driven against the in-process fake (test/fake-discord.ts),
 // which now speaks Discord's failure surface too: unknown channels, injectable status/body/headers,
@@ -87,41 +85,29 @@ describe('Discord REST contract', () => {
     //
     // CLASS: a seam classification decided AFTER a budget check. Both answers are legal, but the
     // same channel flipping between them on a timing race is not: whether the operator sees "topic
-    // not present yet" or an ordinary empty window would depend on how much of `block_ms` survived
-    // the legs before the 404 landed. `block_ms` is clamped from above and never floored, so a
-    // model may pass 1. The BUDGETS axis is that clamp's whole range; the LATENCY axis is a
-    // provider that answers slower than the budget left.
-    const BUDGETS = [0, 1, 50, BLOCK_MS];
+    // not present yet" or an ordinary empty window would depend on how much of the call's own
+    // deadline survived the legs before the 404 landed. The LATENCY axis is a provider that answers
+    // slower than a caller expects.
     const LATENCIES = [0, 120];
-    const READS: Array<[string, (p: BackendPlugin, t: Topic, blockMs: number) => Promise<unknown>]> =
-      [
-        [
-          'fetchRecent (default window)',
-          (p, t, blockMs) => p.fetchRecent({ topic: t, ...(blockMs > 0 ? { blockMs } : {}) }),
-        ],
-        [
-          'fetchRecent (since)',
-          (p, t, blockMs) =>
-            p.fetchRecent({ topic: t, since: asCursor('1'), ...(blockMs > 0 ? { blockMs } : {}) }),
-        ],
-      ];
+    const READS: Array<[string, (p: BackendPlugin, t: Topic) => Promise<unknown>]> = [
+      ['fetchRecent (default window)', (p, t) => p.fetchRecent({ topic: t })],
+      ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
+    ];
 
     for (const [label, run] of READS) {
-      for (const blockMs of BUDGETS) {
-        for (const latency of LATENCIES) {
-          it(`${label} with block_ms ${blockMs} and a ${latency}ms 404 is NoSuchTopicError`, async () => {
-            const absent = asTopic(freshChannelId()); // never created in the fake
-            if (latency > 0) {
-              fake.injectFault({
-                status: 404,
-                body: { message: 'Unknown Channel', code: 10003 },
-                path: '/channels/',
-                delayMs: latency,
-              });
-            }
-            await expect(run(plugin, absent, blockMs)).rejects.toBeInstanceOf(NoSuchTopicError);
-          });
-        }
+      for (const latency of LATENCIES) {
+        it(`${label} with a ${latency}ms 404 is NoSuchTopicError`, async () => {
+          const absent = asTopic(freshChannelId()); // never created in the fake
+          if (latency > 0) {
+            fake.injectFault({
+              status: 404,
+              body: { message: 'Unknown Channel', code: 10003 },
+              path: '/channels/',
+              delayMs: latency,
+            });
+          }
+          await expect(run(plugin, absent)).rejects.toBeInstanceOf(NoSuchTopicError);
+        });
       }
     }
 
@@ -159,11 +145,6 @@ describe('Discord REST contract', () => {
         ['post', (p, t) => p.post(t, SENDER, 'hi'), 'channel'],
         ['fetchRecent', (p, t) => p.fetchRecent({ topic: t }), 'channel'],
         ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') }), 'channel'],
-        [
-          'fetchRecent (blocking)',
-          (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: BLOCK_MS }),
-          'channel',
-        ],
         ['resolveIdentity', (p) => p.resolveIdentity(asHandle('someone')), 'user'],
       ];
 
@@ -376,11 +357,6 @@ describe('Discord REST contract', () => {
       [
         ['fetchRecent (no since)', undefined, (p, t) => p.fetchRecent({ topic: t, limit: 250 })],
         ['fetchRecent (since)', SINCE, (p, t) => p.fetchRecent({ topic: t, since: SINCE, limit: 250 })],
-        [
-          'fetchRecent (blocking)',
-          SINCE,
-          (p, t) => p.fetchRecent({ topic: t, since: SINCE, limit: 250, blockMs: BLOCK_MS }),
-        ],
       ];
 
     const seamPage = (value: unknown): { messages: Array<{ backendMsgId: string; cursor: string }>; nextCursor: string } =>
@@ -761,11 +737,6 @@ describe('Discord REST contract', () => {
         {
           label: 'fetchRecent (since)',
           run: (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') }),
-          query: { after: '1', limit: '100' },
-        },
-        {
-          label: 'fetchRecent (blocking)',
-          run: (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 50 }),
           query: { after: '1', limit: '100' },
         },
         { label: 'subscribe', run: (p, t) => p.subscribe(t, () => undefined), query: {} },
@@ -1358,10 +1329,6 @@ describe('Discord REST contract', () => {
       ['post', (p, t) => p.post(t, SENDER, 'hi')],
       ['fetchRecent (default window)', (p, t) => p.fetchRecent({ topic: t })],
       ['fetchRecent (since)', (p, t) => p.fetchRecent({ topic: t, since: asCursor('1') })],
-      [
-        'fetchRecent (blocking)',
-        (p, t) => p.fetchRecent({ topic: t, since: asCursor('1'), blockMs: 50 }),
-      ],
       ['subscribe', (p, t) => p.subscribe(t, () => undefined)],
     ];
 

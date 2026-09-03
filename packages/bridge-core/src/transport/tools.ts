@@ -33,11 +33,17 @@ export const TOOL_TEXT = {
     'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor } — ' +
     'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
     'does not exist yet, or the long-poll was cancelled); re-issue without `since` in that case. ' +
-    'Call this on session start for each configured topic, then on demand. Pass `block_ms` to ' +
-    'long-poll: if the queried window is empty — whether or not you passed `since` — the call ' +
-    'holds until a message arrives or the timeout elapses (capped server-side), so a polling ' +
-    'agent burns tokens per message, not per tick. A topic that does not exist on the backend ' +
-    'yet returns an empty page with `topicAbsent: true` rather than an error.',
+    'Call this on session start for each configured topic, then on demand. A topic that does not ' +
+    'exist on the backend yet returns an empty page with `topicAbsent: true` rather than an error.',
+  /**
+   * Appended to {@link TOOL_TEXT.fetch_recent} only where `block_ms` is on the schema. A deployment
+   * whose backend declares no native blocking never sends it, so the model is never told to pass an
+   * argument that would be stripped.
+   */
+  fetch_recent_blocking:
+    ' Pass `block_ms` to long-poll: if the queried window is empty — whether or not you passed ' +
+    '`since` — the call holds until a message arrives or the timeout elapses (capped ' +
+    'server-side), so a polling agent burns tokens per message, not per tick.',
   fetch_recent_since:
     'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
   fetch_recent_block_ms:
@@ -82,29 +88,38 @@ async function doPost(
 export function registerTools(server: McpServer, deps: ToolDeps): void {
   const { allow } = deps;
 
+  const fetchRecentInput = {
+    topic: topicSchema(allow, 'Topic to read (must be on the allowlist).'),
+    since: z
+      .string()
+      .optional()
+      .describe(TOOL_TEXT.fetch_recent_since),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(`Max messages to return in this page (capped server-side at ${MAX_FETCH_LIMIT}).`),
+    block_ms: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(TOOL_TEXT.fetch_recent_block_ms),
+  };
+  // Keep the field in the SHAPE and drop it here, so that the handler below keeps its inferred
+  // argument type and one code path serves both kinds of deployment.
+  const blocks = deps.plugin.capabilities?.blockingFetch !== false;
+  if (!blocks) delete (fetchRecentInput as Partial<typeof fetchRecentInput>).block_ms;
+
   server.registerTool(
     'parley_fetch_recent',
     {
-      description: TOOL_TEXT.fetch_recent + describeAllowed(allow),
-      inputSchema: {
-        topic: topicSchema(allow, 'Topic to read (must be on the allowlist).'),
-        since: z
-          .string()
-          .optional()
-          .describe(TOOL_TEXT.fetch_recent_since),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe(`Max messages to return in this page (capped server-side at ${MAX_FETCH_LIMIT}).`),
-        block_ms: z
-          .number()
-          .int()
-          .nonnegative()
-          .optional()
-          .describe(TOOL_TEXT.fetch_recent_block_ms),
-      },
+      description:
+        TOOL_TEXT.fetch_recent +
+        (blocks ? TOOL_TEXT.fetch_recent_blocking : '') +
+        describeAllowed(allow),
+      inputSchema: fetchRecentInput,
     },
     async ({ topic, since, limit, block_ms }, extra) => {
       const t = deps.allow.assert(topic);

@@ -138,16 +138,15 @@ const TARGETS = [
 /**
  * CLASS: every per-connection registry starts a connection EMPTY, on every entry path. `connect()`
  * is reachable without a `disconnect()` before it, and a registry cleared in only one of those paths
- * leaves the previous connection's state addressing the new one — a blocking `fetchRecent` spends
- * its whole budget parked behind a wake source that no longer exists, and the old server's event
- * queues are never released. The table crosses both entry paths with both servers, because a
+ * leaves the previous connection's state addressing the new one — a `subscribe` piggybacking a loop
+ * that no longer exists, and the old server's event queues never released. The table crosses both
+ * entry paths with both servers, because a
  * reconnect to a DIFFERENT site_url is also where a queue id minted by one server is offered to
  * another. The park points are shared with the table above, so a state added there is graded here.
  */
 describe('zulip starts every connection from clean per-connection state', () => {
-  const WAKE_BLOCK_MS = 4000;
-  /** A wake that lands inside this is a wake; anything slower is the caller's budget expiring. */
-  const WAKE_WITHIN_MS = 1500;
+  /** A delivery that lands inside this is push; anything slower is not a live path at all. */
+  const DELIVERED_WITHIN_MS = 4000;
 
   for (const point of PARK_POINTS.filter((p) => p.registerFails !== true)) {
     for (const entry of ENTRIES) {
@@ -170,17 +169,17 @@ describe('zulip starts every connection from clean per-connection state', () => 
           const mintedOnOld = fake.requestCount(REGISTER);
 
           await plugin.post(topic, SENDER, 'seed');
-          const tail = (await plugin.fetchRecent({ topic })).nextCursor;
           const registersBefore = next.requestCount(REGISTER);
+          const got: string[] = [];
+          await plugin.subscribe(topic, (m) => got.push(m.content));
           const started = Date.now();
-          const late = setTimeout(() => void plugin.post(topic, SENDER, 'late'), 200);
-          const res = await plugin.fetchRecent({ topic, since: tail, blockMs: WAKE_BLOCK_MS });
-          clearTimeout(late);
+          await plugin.post(topic, SENDER, 'late');
+          for (let i = 0; i < 400 && !got.includes('late'); i++) await sleep(10);
 
-          expect(res.messages.map((m) => m.content)).toEqual(['late']);
-          expect(Date.now() - started).toBeLessThan(WAKE_WITHIN_MS);
-          // The new connection carries no subscription, so the blocked fetch must have opened a
-          // queue of its OWN — the other half of "it did not park behind the old one".
+          expect(got).toContain('late');
+          expect(Date.now() - started).toBeLessThan(DELIVERED_WITHIN_MS);
+          // The new connection carries no subscription state, so this subscribe must have opened a
+          // queue of its OWN on the new server — the other half of "it did not join the old one".
           expect(next.requestCount(REGISTER)).toBeGreaterThan(registersBefore);
           expect(releasedOnOld).toBeGreaterThanOrEqual(mintedOnOld);
         }, 30_000);
@@ -207,10 +206,7 @@ describe('zulip starts every connection from clean per-connection state', () => 
 describe('zulip: no seam call answers from a connection it did not address', () => {
   /** Long enough that the reconnect lands well inside the parked request. */
   const HOLD_MS = 500;
-  /**
-   * How deep into a call's round trips the walk goes. Bounds a blocking `fetchRecent`, whose
-   * re-read/re-arm cycle keeps issuing them until its budget runs out.
-   */
+  /** How deep into a call's round trips the walk goes. */
   const MAX_ROUND_TRIPS = 3;
 
   interface SeamCall {
@@ -224,9 +220,9 @@ describe('zulip: no seam call answers from a connection it did not address', () 
       issue: async ({ plugin }, topic) => plugin.fetchRecent({ topic: asTopic(topic) }),
     },
     {
-      name: 'fetchRecent with blockMs',
+      name: 'fetchRecent from a cursor',
       issue: async ({ plugin }, topic, since) =>
-        plugin.fetchRecent({ topic: asTopic(topic), since: asCursor(since), blockMs: 4000 }),
+        plugin.fetchRecent({ topic: asTopic(topic), since: asCursor(since) }),
     },
     {
       name: 'post',
@@ -313,41 +309,6 @@ describe('zulip: no seam call answers from a connection it did not address', () 
     }
   }
 
-  /**
-   * The other shape the same call can be parked in: the WAIT rather than a request. A wait ends on
-   * teardown by design, so the honest answer there is the caller's own cursor and an empty window —
-   * never the new server's messages, and never a cursor in its id space.
-   */
-  for (const entry of ENTRIES) {
-    for (const target of TARGETS) {
-      it(`a blocking fetchRecent parked in its wait returns its own cursor across ${entry.name} against ${target.name}`, async () => {
-        const pair = await boot();
-        const { plugin } = pair;
-        const topic = asTopic(`park-${rand()}`);
-        for (let i = 0; i < 5; i++) await plugin.post(topic, SENDER, `a${i}`);
-        const tail = (await plugin.fetchRecent({ topic })).nextCursor;
-
-        const elsewhere = target.elsewhere ? await boot() : pair;
-        if (target.elsewhere) {
-          for (let i = 0; i < 4; i++) await elsewhere.plugin.post(topic, SENDER, `b${i}`);
-        }
-
-        const pending = plugin.fetchRecent({ topic, since: tail, blockMs: 4000 });
-        await sleep(200);
-        await entry.end(plugin, elsewhere.fake.url);
-
-        const settled = await pending.then(
-          (value) => ({ value }),
-          (error: unknown) => ({ error }),
-        );
-        if ('error' in settled) {
-          expect(String(settled.error)).toMatch(/connection was replaced/i);
-          return;
-        }
-        expect(settled.value).toEqual({ messages: [], nextCursor: tail });
-      }, 20_000);
-    }
-  }
 });
 
 /**

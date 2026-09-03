@@ -56,11 +56,6 @@ export async function startPushLoop(
   }
   const state: QueueState = { queueId: reg.queue_id };
   conn.queues.add(state);
-  // Advertise the topic as piggyback-able only now that every await is behind us and the loop is
-  // about to run — a waiter set with no live loop behind it parks a blocking fetchRecent.
-  const entry = conn.waiters.get(topic) ?? { wakes: new Set<() => void>(), healthy: 0 };
-  entry.healthy++;
-  conn.waiters.set(topic, entry);
 
   let lastEventId = reg.last_event_id;
   // Armed from the pre-register watermark so the register handshake window is replayed, and
@@ -68,7 +63,6 @@ export async function startPushLoop(
   // transient failure can't leave a permanent push hole.
   let needsGapFillFrom: number | undefined = lastDeliveredId;
   let consecutiveFailures = 0;
-  let degraded = false;
   /** Whether `state.queueId` has ever answered an events poll — the only proof push works. */
   let queueProven = false;
   /**
@@ -86,21 +80,7 @@ export async function startPushLoop(
       /* handler is best-effort; never break the loop (DESIGN §6) */
     }
   };
-  /** Stop advertising the topic as piggyback-able and release whoever is already parked on it. */
-  const degrade = (): void => {
-    if (degraded) return;
-    degraded = true;
-    entry.healthy--;
-    conn.wake(topic);
-  };
-  /** Advertise the topic as piggyback-able again — the loop can deliver, by whatever route. */
-  const promote = (): void => {
-    if (!degraded) return;
-    degraded = false;
-    entry.healthy++;
-  };
   const backoff = async (reason: string): Promise<void> => {
-    degrade();
     consecutiveFailures++;
     if (reportsLoopFailure(consecutiveFailures)) {
       console.error(
@@ -123,12 +103,10 @@ export async function startPushLoop(
           (id) => {
             lastDeliveredId = id;
             needsGapFillFrom = id;
-            conn.wake(topic); // gap-fill is also a delivery — release blocked fetchers
           },
           { generation, signal },
         );
         needsGapFillFrom = undefined; // gap closed — resume normal polling
-        promote();
       } catch {
         if (!alive()) return false;
         await backoff('gap-fill history read failed');
@@ -183,8 +161,7 @@ export async function startPushLoop(
           // A queue rejected before it ever answered a poll is a FAILING recovery, not a
           // completed one: pace it, so that a server rejecting every queue it mints cannot be
           // flooded with fresh registrations by its own error.
-          if (queueProven) promote();
-          else await backoff('a freshly registered event queue was rejected as stale');
+          if (!queueProven) await backoff('a freshly registered event queue was rejected as stale');
           queueProven = false;
         } catch {
           if (!alive()) return false;
@@ -196,7 +173,6 @@ export async function startPushLoop(
       return true;
     }
     queueProven = true;
-    let sawMessage = false;
     let acked = false;
     for (const ev of asArray(json.events)) {
       if (typeof ev?.id === 'number' && ev.id > lastEventId) {
@@ -206,15 +182,11 @@ export async function startPushLoop(
       if (ev?.type !== 'message') continue;
       const m = zulipToMessage(topic, ev.message);
       if (m === undefined) continue;
-      sawMessage = true; // a message landed on this topic — release any blocked fetchers
       const id = Number(m.backendMsgId);
       if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue; // gap-filled — dedup
       lastDeliveredId = id;
       deliver(m);
     }
-    // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
-    // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
-    if (sawMessage) conn.wake(topic);
     // Grade the answer on whether it MOVED the queue, not on whether it carried bytes: a parked
     // poll the ack cannot advance past is re-issued unchanged forever. Keep it paced, so that a
     // server ignoring `dont_block=false` — or answering with no events, stale ids, or ids that
@@ -224,11 +196,10 @@ export async function startPushLoop(
       await backoff('an events poll that asked to park answered without advancing the queue');
       return true;
     }
-    // Keep the failure-escalation reset here and NOT in `promote`, so that a recovery step that
-    // always succeeds — a gap-fill read, a re-register — cannot cancel the backoff protecting the
-    // server from a cycle that fails at the step after it.
+    // Keep the failure-escalation reset at the END of a whole successful pass, so that a recovery
+    // step that always succeeds — a gap-fill read, a re-register — cannot cancel the backoff
+    // protecting the server from a cycle that fails at the step after it.
     consecutiveFailures = 0;
-    promote();
     return true;
   };
 

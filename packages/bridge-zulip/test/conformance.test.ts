@@ -1,5 +1,5 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
-import { asHandle, asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
+import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
@@ -199,35 +199,6 @@ describe('zulip queue GC recovery', () => {
     );
     expect(got.map((m) => m.content)).toEqual(['before']);
   }, 60_000);
-
-  /**
-   * The gap-fill's per-page wake is the ONLY edge a blocked `fetchRecent` piggybacking on a
-   * recovering loop can get: a message that landed while the queue was dead is not on the fresh
-   * queue, so no events poll will ever announce it.
-   */
-  it('wakes a blocked fetchRecent on the gap-fill page that carries its message', async () => {
-    const { plugin, fake } = await boot();
-    const topic = asTopic(`gapwake-${rand()}`);
-    await plugin.subscribe(topic, () => undefined);
-    await plugin.post(topic, SENDER, 'old');
-    const tail = (await plugin.fetchRecent({ topic })).nextCursor as Cursor;
-
-    // Every history answer is computed on request and delivered 250ms later, so both of the blocked
-    // fetch's own reads are snapshotted before the queue dies. Expiring and injecting in ONE
-    // synchronous step puts the message strictly between the old queue's death and the fresh
-    // queue's birth: it is on no queue at all, so only a gap-fill page can carry it.
-    fake.holdResponse('GET /api/v1/messages', 250);
-
-    const started = Date.now();
-    const pending = plugin.fetchRecent({ topic, since: tail, blockMs: 5000 });
-    await sleep(600);
-    fake.expireQueues();
-    fake.injectMessage({ topic, content: 'in-the-gap' });
-    const res = await pending;
-
-    expect(res.messages.map((m) => m.content)).toEqual(['in-the-gap']);
-    expect(Date.now() - started).toBeLessThan(3000);
-  }, 30_000);
 });
 
 describe('zulip resolveIdentity', () => {

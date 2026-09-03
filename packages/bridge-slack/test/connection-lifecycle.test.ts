@@ -75,21 +75,17 @@ const spyReconnect = (plugin: SlackPlugin) => vi.spyOn(internals(plugin), 'recon
 
 describe('slack reconnect ownership under a sustained outage', () => {
   for (const outage of OUTAGES) {
-    for (const entry of ['subscribe', 'blocking-fetch'] as const) {
-      it(`${outage.name}, hit cold via ${entry}, mints no reconnect owner and dials O(wall clock)`, async () => {
+    {
+      it(`${outage.name}, hit cold via subscribe, mints no reconnect owner and dials O(wall clock)`, async () => {
         const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0COLD'] });
         const topic = asTopic('C0COLD');
         const reconnect = spyReconnect(plugin);
         try {
           outage.arm(fake);
           const t0 = Date.now();
-          if (entry === 'subscribe') {
-            const outcome = await settleWithin(capture(plugin.subscribe(topic, () => undefined)), OUTAGE_MS);
-            expect(outcome.status).toBe('rejected');
-            await sleep(Math.max(0, OUTAGE_MS - (Date.now() - t0)));
-          } else {
-            await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: OUTAGE_MS });
-          }
+          const outcome = await settleWithin(capture(plugin.subscribe(topic, () => undefined)), OUTAGE_MS);
+          expect(outcome.status).toBe('rejected');
+          await sleep(Math.max(0, OUTAGE_MS - (Date.now() - t0)));
           const elapsed = Date.now() - t0;
 
           // Nothing was ever established, so nothing was LOST: the failure belongs to the caller
@@ -144,8 +140,8 @@ describe('slack reconnect ownership under a sustained outage', () => {
   const FLAP_INTERVALS = [10, 100, 700, 2500];
 
   for (const everyMs of FLAP_INTERVALS) {
-    for (const entry of ['subscribe', 'blocking-fetch'] as const) {
-      it(`an edge that greets and drops every ${everyMs}ms, held open by ${entry}, redials O(wall clock)`, async () => {
+    {
+      it(`an edge that greets and drops every ${everyMs}ms redials O(wall clock)`, async () => {
         const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0FLAP'] });
         const topic = asTopic('C0FLAP');
         try {
@@ -153,11 +149,7 @@ describe('slack reconnect ownership under a sustained outage', () => {
           const dialsBefore = fake.hits('apps.connections.open');
           const t0 = Date.now();
           fake.flap(everyMs);
-          if (entry === 'subscribe') {
-            await sleep(FLAP_WINDOW_MS);
-          } else {
-            await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: FLAP_WINDOW_MS });
-          }
+          await sleep(FLAP_WINDOW_MS);
           fake.stopFlap();
           const elapsed = Date.now() - t0;
           const dials = fake.hits('apps.connections.open') - dialsBefore;
@@ -264,29 +256,7 @@ describe('slack memoized async singletons', () => {
     }
   }
 
-  it('a socket that fails to establish is retried after the cooldown, not replayed and not stormed', async () => {
-    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0BLOCK'] });
-    const topic = asTopic('C0BLOCK');
-    try {
-      fake.failMethod('apps.connections.open', 'internal_error', 1);
-      // Degrades to the non-blocking path once, then cools down.
-      await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
-      const afterFirst = fake.hits('apps.connections.open');
-      // Core re-drives fetchRecent on its poll cadence; within the cooldown none of those dial.
-      for (let i = 0; i < 5; i++) {
-        await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 20 });
-      }
-      expect(fake.hits('apps.connections.open')).toBe(afterFirst);
-      // The failure is NOT memoized: once the cooldown lapses the next blocking fetch dials again.
-      await sleep(600);
-      await plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: 50 });
-      expect(fake.hits('apps.connections.open')).toBeGreaterThan(afterFirst);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('subscribe is never gated by the poll cooldown: each call dials', async () => {
+  it('a failed dial is not memoized: each subscribe dials again', async () => {
     const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0SUBDIAL'] });
     const topic = asTopic('C0SUBDIAL');
     try {
@@ -321,12 +291,6 @@ const SOCKET_ENTRIES: Array<{
     rejects: true,
     run: (plugin, topic) => plugin.subscribe(asTopic(topic), () => undefined),
   },
-  {
-    name: 'blocking fetchRecent',
-    rejects: false,
-    run: (plugin, topic) =>
-      plugin.fetchRecent({ topic: asTopic(topic), since: asCursor('0'), blockMs: 300 }),
-  },
 ];
 
 describe('slack entry points that need the shared socket agree about a missing app_token', () => {
@@ -353,12 +317,11 @@ describe('slack entry points that need the shared socket agree about a missing a
   }
 });
 
-const BLOCK_MS = 2000;
-
 describe('slack teardown racing an in-flight connect', () => {
   for (const greet of ['greet', 'pre-hello-close', 'silent'] as GreetMode[]) {
     for (const delayMs of [0, 1, 5, 20, 50, 120]) {
-      for (const start of ['subscribe', 'blocking-fetch'] as const) {
+      {
+        const start = 'subscribe';
         it(`disconnect ${delayMs}ms into ${start} on a ${greet} socket settles it and leaves no socket open`, async () => {
           // Hold the handshake open long enough that the teardown lands mid-acquisition for the
           // small delays and after establishment for the large ones.
@@ -369,28 +332,16 @@ describe('slack teardown racing an in-flight connect', () => {
           });
           const topic = asTopic('C0RACE');
           try {
-            const inFlight = capture<unknown>(
-              start === 'subscribe'
-                ? plugin.subscribe(topic, () => undefined)
-                : plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: BLOCK_MS }),
-            );
+            const inFlight = capture<unknown>(plugin.subscribe(topic, () => undefined));
 
             await sleep(delayMs);
             await plugin.disconnect();
-            // Generous versus the teardown, tight versus the budgets that would hide the bug:
-            // under `blockMs`, and under the handshake timeout the silent rows would otherwise run.
+            // Generous versus the teardown, tight versus the handshake timeout the silent rows
+            // would otherwise run.
             const outcome = await settleWithin(inFlight, 300);
 
             const where = `${start} / ${greet} / +${delayMs}ms`;
             expect(outcome.status, where).not.toBe('pending');
-            if (start === 'blocking-fetch') {
-              // The caller's observable contract: an interrupted long-poll is an empty page at the
-              // cursor it was given — core surfaces a rejection here as a tool error.
-              expect(outcome.status, where).toBe('fulfilled');
-              const value = (outcome as { value: { messages: unknown[]; nextCursor: string } }).value;
-              expect(value.messages, where).toEqual([]);
-              expect(String(value.nextCursor), where).toBe('0');
-            }
 
             await sleep(300);
             expect(fake.liveSockets, where).toBe(0);
@@ -402,20 +353,10 @@ describe('slack teardown racing an in-flight connect', () => {
     }
   }
 
-  it('a socket that never says hello bounds subscribe and every blocking fetch on its own', async () => {
+  it('a socket that never says hello bounds subscribe on its own', async () => {
     const { plugin, cleanup } = await startPlugin({ channels: ['C0SILENT'], greet: 'silent' });
     const topic = asTopic('C0SILENT');
     try {
-      // The long-poll's own budget, not the handshake's, is what a blocked fetch_recent observes —
-      // so ask for a budget well UNDER the handshake timeout and hold the call to it.
-      const fetchStarted = Date.now();
-      const fetched = await settleWithin(
-        capture(plugin.fetchRecent({ topic, since: asCursor('0'), blockMs: HANDSHAKE_MS / 4 })),
-        HANDSHAKE_MS * 4,
-      );
-      expect(fetched.status).toBe('fulfilled');
-      expect(Date.now() - fetchStarted).toBeLessThan(HANDSHAKE_MS);
-
       const subscribed = await settleWithin(
         capture(plugin.subscribe(topic, () => undefined)),
         HANDSHAKE_MS * 6,
@@ -701,18 +642,11 @@ describe('slack connect is a session boundary, not a partial reset', () => {
       start: (plugin, onStale) => plugin.subscribe(asTopic(STALE_TOPIC), (m) => onStale(m.content)),
     },
     {
-      name: 'blocking fetchRecent awaiting apps.connections.open',
-      method: 'apps.connections.open',
-      latencyMs: 250,
-      start: (plugin) =>
-        plugin.fetchRecent({ topic: asTopic(STALE_TOPIC), since: asCursor('0'), blockMs: 3000 }),
-    },
-    {
-      name: 'blocking fetchRecent awaiting conversations.history',
+      name: 'fetchRecent awaiting conversations.history',
       method: 'conversations.history',
       latencyMs: 250,
       start: (plugin) =>
-        plugin.fetchRecent({ topic: asTopic(STALE_TOPIC), since: asCursor('0'), blockMs: 3000 }),
+        plugin.fetchRecent({ topic: asTopic(STALE_TOPIC), since: asCursor('0') }),
     },
     {
       name: 'resolveIdentity awaiting auth.test',
@@ -795,15 +729,11 @@ describe('slack connect is a session boundary, not a partial reset', () => {
       expect((await inFlight).status).toBe('rejected');
       await sleep(50);
 
-      // The dial cooldown is what stops core's 250 ms re-drive becoming a storm against Slack's
-      // tightest-limit endpoint — so a cooldown one session's failure imposes on the NEXT one
-      // silently disables its live push for as long as the ladder rung lasts.
+      // The dial cooldown is what paces the reconnect ladder against Slack's tightest-limit
+      // endpoint — so a cooldown one session's failure imposes on the NEXT one silently disables
+      // its live push for as long as the ladder rung lasts.
       const dialsBefore = fake.hits('apps.connections.open');
-      await plugin.fetchRecent({
-        topic: asTopic(STALE_TOPIC),
-        since: asCursor('0'),
-        blockMs: 100,
-      });
+      await plugin.subscribe(asTopic(STALE_TOPIC), () => undefined);
       expect(fake.hits('apps.connections.open'), 'the new session dialled').toBe(dialsBefore + 1);
     } finally {
       await plugin.disconnect();

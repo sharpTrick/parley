@@ -87,9 +87,9 @@ export interface ConformanceContext {
     | ((topic: Topic, writers: number, perWriter: number) => Promise<void>)
     | 'unsupported';
   /**
-   * True when the plugin honors `blockMs` NATIVELY in `fetchRecent` (Redis `XREAD BLOCK`, NATS
-   * pull expiry, Matrix `/sync` timeout, Postgres `LISTEN`/`NOTIFY`, …). False when it gets its
-   * long-poll from core's generic wrapper instead — SQLite.
+   * True when the plugin's own read primitive takes a caller's wait (Redis `XREAD BLOCK`, NATS
+   * pull expiry). False when `fetchRecent` reads history and takes no wait — every push-driven
+   * backend, and SQLite, which gets its long-poll from core's wrapper instead.
    */
   supportsBlockingFetch: boolean;
   /**

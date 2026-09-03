@@ -111,7 +111,7 @@ const CONFIG_KEYS: BackendConfigKeys = {
 
 /**
  * Core loads `backend_config` as `z.record(z.unknown())`, so each knob below arrives unchecked and
- * goes straight onto the `POST /createRoom` wire or into the park arithmetic. Keep this a LOAD
+ * goes straight onto the `POST /createRoom` wire or into the `/sync` arithmetic. Keep this a LOAD
  * ERROR rather than a coercion or a warning, so that an unsupported privilege or timing knob fails
  * the way `skip_permissions: true` does instead of taking effect in a shape nothing expects.
  */

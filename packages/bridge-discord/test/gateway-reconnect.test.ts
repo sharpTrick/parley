@@ -1,4 +1,4 @@
-import { asCursor, asTopic } from '@sharptrick/parley-core';
+import { asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 
 // The reconnect storm that resets the bot token and the undetected half-dead socket both live in
@@ -372,7 +372,6 @@ function track<T>(p: Promise<T>): { settled: boolean; error?: unknown } {
 
 describe('Discord gateway handshake never completes', () => {
   const HANDSHAKE = 3000;
-  const BLOCK = 200;
 
   // A socket that connects but never finishes HELLO → IDENTIFY → READY must not park an entry
   // point forever: every seam call has to settle within a bounded multiple of ITS OWN budget,
@@ -383,21 +382,15 @@ describe('Discord gateway handshake never completes', () => {
     { label: 'READY arrives normally', identifyReplies: true, sendHello: true },
   ];
 
-  // Both entry points RESOLVE on a stall: a stalled handshake is transient, the failed dial is
-  // already on the reconnect ladder, and the gateway carries only new messages — so neither call
-  // has anything to report but the diagnostic. Only a TERMINAL close rejects (its own suite below).
+  // The entry point RESOLVES on a stall: a stalled handshake is transient, the failed dial is
+  // already on the reconnect ladder, and the gateway carries only new messages — so the call has
+  // nothing to report but the diagnostic. Only a TERMINAL close rejects (its own suite below).
   const ENTRIES: Array<{ label: string; budget: number; run: (p: DiscordPlugin) => Promise<unknown> }> =
     [
       {
         label: 'subscribe',
         budget: HANDSHAKE,
         run: (p) => p.subscribe(asTopic('900001'), () => undefined),
-      },
-      {
-        label: 'fetchRecent(blockMs)',
-        budget: BLOCK,
-        run: (p) =>
-          p.fetchRecent({ topic: asTopic('900001'), since: asCursor('1'), blockMs: BLOCK }),
       },
     ];
 

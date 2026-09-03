@@ -52,6 +52,12 @@ export { escapeSlackText, unescapeSlackText } from './markup.js';
  * reconciled by cursor catch-up (DESIGN §6).
  */
 export class SlackPlugin implements BackendPlugin {
+  /**
+   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
+   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
+   */
+  readonly capabilities = { blockingFetch: false } as const;
+
   private settings = resolveConfig({});
   /** channel id → its one allowed topic: seeded from `channel_map`, then claimed first-come. */
   private readonly channelOwner = new Map<string, Topic>();
@@ -71,7 +77,7 @@ export class SlackPlugin implements BackendPlugin {
   };
   private readonly api = slackApiCall(this.host);
   private readonly link = new SocketModeLink(this.api, this.host);
-  private readonly history = new SlackHistory(this.api, this.link, this.host);
+  private readonly history = new SlackHistory(this.api, this.host);
 
   async connect(config: BackendConfig): Promise<void> {
     const cfg = config as SlackBackendConfig;
@@ -147,17 +153,7 @@ export class SlackPlugin implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
-    // Captured BEFORE the first read, so that the session a blocked call belongs to is the one it
-    // was CALLED in: that read can straddle a `disconnect()` + `connect()`, and a session read
-    // after it would be the new one's — leaving the block below with nothing to notice.
-    const session = this.session;
-    const first = await this.history.runFetch(args);
-
-    const blockMs = args.blockMs ?? 0;
-    if (blockMs <= 0 || args.since === undefined || first.messages.length > 0) {
-      return first;
-    }
-    return this.history.blockForMessage(args, first.nextCursor, Date.now() + blockMs, session);
+    return this.history.runFetch(args);
   }
 
   /**

@@ -132,23 +132,23 @@ describe('bridge-discord README — the gateway-failure prose is the observed be
   });
 });
 
-// CLASS: a budget knob that silently bounds something the prose describes as unbounded. The
-// seam-mapping row promised the window "is never silently truncated to 100" while `block_ms` — a
-// model-chosen number, clamped from above and never floored — is the WHOLE call's budget, page walk
-// included. A short page and "the topic has nothing older" are indistinguishable to the caller, so
-// the claim and the clock have to be pinned together: the prose is asserted here AND driven.
-describe('bridge-discord README — block_ms bounds the page walk, and says so', () => {
-  // The ROW, not the section: the section also contains the long-poll paragraph below, so slicing
+// CLASS: a budget that silently bounds something the prose describes as unbounded. The
+// seam-mapping row promised the window "is never silently truncated to 100" while the per-call
+// deadline is the WHOLE call's budget, page walk included. A short page and "the topic has nothing
+// older" are indistinguishable to the caller, so the claim and the walk have to be pinned together:
+// the prose is asserted here AND driven.
+describe('bridge-discord README — the call deadline bounds the page walk, and says so', () => {
+  // The ROW, not the section: the section also contains the deadline paragraph below, so slicing
   // to it would let one sentence satisfy both of the prose cells.
   const NO_SINCE_ROW = README.slice(
     README.indexOf('| `fetchRecent` (no `since`)'),
     README.indexOf('| absent topic'),
   );
-  const LONG_POLL = README.slice(
-    README.indexOf('**`fetch_recent` long-poll'),
+  const DEADLINE = README.slice(
+    README.indexOf('**No `block_ms` here.**'),
     README.indexOf('## Config'),
   );
-  const COUPLING = /`block_ms` bounds the whole call, the page walk included/;
+  const COUPLING = /deadline bounds the whole call, the page walk included/;
 
   const SEEDED = 250;
   const PAGE = 100;
@@ -173,20 +173,14 @@ describe('bridge-discord README — block_ms bounds the page walk, and says so',
     expect(NO_SINCE_ROW).toMatch(COUPLING);
   });
 
-  it('states the coupling where block_ms is introduced', () => {
-    expect(LONG_POLL).toMatch(COUPLING);
+  it('states the coupling where the deadline is introduced', () => {
+    expect(DEADLINE).toMatch(COUPLING);
   });
 
   it('no longer promises the window is never truncated', () => {
     expect(README).not.toMatch(/never silently truncated/);
   });
 
-  /** What the README's prose says to expect: the full window, or the one page the budget bought. */
-  const BUDGETS: Array<[string, number | undefined, (limit: number) => number]> = [
-    ['no block_ms at all', undefined, (limit) => Math.min(limit, SEEDED)],
-    ['a block_ms sized for the walk', 60_000, (limit) => Math.min(limit, SEEDED)],
-    ['a block_ms of 1', 1, (limit) => Math.min(limit, PAGE)],
-  ];
   const LIMITS = [PAGE, SEEDED];
   const POSITIONS: Array<[string, Cursor | undefined]> = [
     ['no since', undefined],
@@ -195,17 +189,14 @@ describe('bridge-discord README — block_ms bounds the page walk, and says so',
 
   for (const [position, since] of POSITIONS) {
     for (const limit of LIMITS) {
-      for (const [budgetLabel, blockMs, expected] of BUDGETS) {
-        it(`${position}, limit ${limit}, ${budgetLabel} → ${expected(limit)} messages`, async () => {
-          const { messages } = await plugin.fetchRecent({
-            topic,
-            limit,
-            ...(since !== undefined ? { since } : {}),
-            ...(blockMs !== undefined ? { blockMs } : {}),
-          });
-          expect(messages).toHaveLength(expected(limit));
+      it(`${position}, limit ${limit} → ${Math.min(limit, SEEDED)} messages`, async () => {
+        const { messages } = await plugin.fetchRecent({
+          topic,
+          limit,
+          ...(since !== undefined ? { since } : {}),
         });
-      }
+        expect(messages).toHaveLength(Math.min(limit, SEEDED));
+      });
     }
   }
 });

@@ -29,9 +29,7 @@ import {
 } from '../src/index.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import { rungStarts } from './harness.js';
 import { slackSourceModules } from './source-tree.js';
 
 const read = (rel: string): string =>
@@ -344,38 +342,6 @@ describe('slack rate-limit docs track the shared helper', () => {
     expect(text, 'MAX_DIAL_BACKOFF_MS value missing').toContain(seconds(MAX_DIAL_BACKOFF_MS));
   });
 
-  // The superseded claim itself: the plugin re-queried history exactly once, at the deadline. An
-  // operator reading that sizes `block_max_ms` expecting a minute of latency to be normal.
-  it('does not restate the superseded rule that history is re-read only at the end', () => {
-    expect(paragraph()).not.toMatch(/re-querying history once at the end|two `conversations\.history`/);
-  });
-
-  // The paragraph's COST claim, computed from the ladder rather than characterised. `O(log block_ms)`
-  // was true only by coincidence at the default budget: the ladder caps, so the rung count is linear
-  // in `block_ms` past the cap, and an operator who raises `block_max_ms` on the strength of a
-  // logarithmic bound buys two orders of magnitude more requests than the prose promised.
-  it('states a per-call request bound the ladder actually produces', () => {
-    const text = paragraph();
-    // The rung counts the ladder yields, pinned by value: a reshaped ladder fails HERE first, and
-    // then again on the prose below, so the two cannot drift apart.
-    expect(rungStarts(4_000).length, 'rungs at 4 s').toBe(5);
-    expect(rungStarts(60_000).length, 'rungs at 60 s').toBe(16);
-    expect(rungStarts(MAX_BLOCK_MS).length, 'rungs at the core ceiling').toBe(64);
-    // Linear past the cap is the property the superseded claim got wrong; state it, and the two
-    // figures an operator sizes `block_max_ms` from.
-    expect(text, 'still claims a logarithmic bound').not.toMatch(/O\(log/);
-    expect(text).toContain('4 + block_ms / MAX_DIAL_BACKOFF_MS');
-    // The claim is only true because each rung resumes where the last read stopped; when it did
-    // not, the real figure was that bound MULTIPLIED by the pages above the caller's cursor.
-    const prose = text.replace(/\s+/g, ' ');
-    expect(prose, 'the per-rung resume is not stated').toMatch(
-      /Each rung resumes from the position the previous read walked to/,
-    );
-    expect(prose).toMatch(/\*\*once\*\* rather than once per rung/);
-    expect(text).toContain(`${rungStarts(60_000).length} reads and dials`);
-    expect(text).toContain(`~${rungStarts(MAX_BLOCK_MS).length} of each`);
-    expect(text).toMatch(/\*\*linear\*\*, not logarithmic/);
-  });
 });
 
 /**

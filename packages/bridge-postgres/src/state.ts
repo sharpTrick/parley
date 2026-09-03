@@ -2,18 +2,10 @@ import type { Topic } from '@sharptrick/parley-core';
 import type { Client, Pool } from 'pg';
 import { DEFAULT_TABLE_NAME, DEFAULT_URL } from './config.js';
 import { NOT_CONNECTED } from './errors.js';
-import type { ListenState } from './listen.js';
+import type { ListenState } from './listener.js';
 import type { TopicSubscription } from './push.js';
 import { messagesSince } from './read.js';
 import { type MessageRow, quotedNames, type SchemaNames } from './schema.js';
-
-/** One parked blocking `fetchRecent`, as the paths that have to serve it see it. */
-export interface ParkedWaiter {
-  /** End the wait now; the caller re-runs its own exclusive `since` query. */
-  wake: () => void;
-  /** Re-run that query here and wake only if it finds something — for a wake nothing rang for. */
-  recheck: () => void;
-}
 
 /** The state one connected plugin carries; the layers above it add the behaviour. */
 export abstract class PluginState {
@@ -50,19 +42,8 @@ export abstract class PluginState {
    */
   protected readonly subscribing = new Map<string, Promise<TopicSubscription>>();
 
-  /**
-   * Blocking `fetchRecent` waiters keyed by NOTIFY channel, parked on the SAME doorbell `subscribe`
-   * waits on. The notification handler fans a NOTIFY out to every registered waiter.
-   */
-  protected readonly waiters = new Map<string, Set<ParkedWaiter>>();
   /** Established (or in-flight) LISTENs by channel — see {@link acquireListen}. */
   protected readonly listens = new Map<string, ListenState>();
-  /**
-   * Every in-flight blocking-fetch wait's release callback, fired on `disconnect()` so a blocked
-   * `fetchRecent` returns immediately with no leaked timer — the same teardown discipline the
-   * listener connection gets.
-   */
-  protected readonly pendingAborts = new Set<() => void>();
 
   protected require(): Pool {
     if (this.pool !== undefined) return this.pool;

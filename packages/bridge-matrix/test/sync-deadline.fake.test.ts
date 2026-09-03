@@ -60,7 +60,7 @@ describe('every /sync carries a call deadline beyond the long-poll it asked for'
       await p.post(t, WRITER, 'seed');
       const tail = (await p.fetchRecent({ topic: t, limit: 10 })).nextCursor;
       await p.subscribe(t, () => undefined);
-      await p.fetchRecent({ topic: t, since: tail, blockMs: 120 });
+      await p.fetchRecent({ topic: t, since: tail });
       await p.disconnect();
 
       const syncs = syncCalls();

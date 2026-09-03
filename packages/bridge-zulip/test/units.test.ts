@@ -10,15 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { normalizeBody, normalizeTopic, SERVER_CONSTRAINTS } from './fake-zulip.js';
 import { ALL_PLACEMENTS, CANDIDATE_PADDINGS, padName } from './harness.js';
 import { resolveConfig, type ZulipConfig } from '../src/config.js';
-import {
-  blockedFetchPause,
-  budgetedDeadlineMs,
-  longPollDeadlineMs,
-  loopBackoffMs,
-  readDeadlineMs,
-  REQUEST_DEADLINE_MS,
-  reportsLoopFailure,
-} from '../src/pacing.js';
+import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from '../src/pacing.js';
 import {
   asArray,
   type EventsResponse,
@@ -336,10 +328,6 @@ describe('backend_config resolves to exactly what reaches the wire', () => {
 });
 
 describe('every wait the plugin takes is bounded and escalates', () => {
-  it('a blocked fetch retries on a doubling pause under a ceiling', () => {
-    expect([0, 1, 2, 3, 4, 20].map(blockedFetchPause)).toEqual([400, 800, 1600, 3200, 5000, 5000]);
-  });
-
   it('a failing push loop backs off on a doubling pause under a ceiling', () => {
     expect([1, 2, 3, 4, 5, 6, 100].map(loopBackoffMs)).toEqual([200, 400, 800, 1600, 3200, 5000, 5000]);
   });
@@ -352,24 +340,5 @@ describe('every wait the plugin takes is bounded and escalates', () => {
   it("a parked poll's deadline clears the cap it asked the server to hold for", () => {
     expect(longPollDeadlineMs(600_000)).toBeGreaterThan(600_000);
     expect(longPollDeadlineMs(-1)).toBe(longPollDeadlineMs(0));
-  });
-
-  it("a 429 backoff inside a caller's budget is capped at what is left of it, plus one answer", () => {
-    const now = Date.now();
-    expect(budgetedDeadlineMs(now + 1000)).toBeGreaterThan(1000);
-    expect(budgetedDeadlineMs(now + 1000)).toBeLessThanOrEqual(1500);
-    // A spent budget still refuses a stated wait rather than admitting an unbounded one.
-    expect(budgetedDeadlineMs(now - 10_000)).toBe(500);
-  });
-
-  // A caller's `blockMs` says how long it will wait for a message to ARRIVE, and nothing about how
-  // long this server takes to answer a query. A read whose transport deadline is the RESIDUAL wait
-  // budget therefore rejects on latency the wait was never about, where the seam requires an empty
-  // page — so what is left of the wait may only ever lengthen a read's budget, never shorten it.
-  it('a history read gets a whole request budget however little of the wait is left', () => {
-    const now = Date.now();
-    const budgets = [-10_000, -1, 0, 1, 100, 500, 1000].map((left) => readDeadlineMs(now + left));
-    expect(budgets.filter((ms) => ms < REQUEST_DEADLINE_MS)).toEqual([]);
-    expect(readDeadlineMs(now + 10_000)).toBeGreaterThan(10_000);
   });
 });

@@ -134,7 +134,7 @@ const readChildren: Array<{ name: string; build(room: string): unknown }> = [
 ];
 
 describe('XMPP live push delivers a message whatever child an occupant hangs off it', () => {
-  it.each(readChildren)('a message carrying $name is delivered and wakes a parked long-poll', async ({ build }) => {
+  it.each(readChildren)('a message carrying $name is delivered', async ({ build }) => {
     const fake = new FakeXmpp();
     mockState.client = fake;
     const plugin = new XmppPlugin();
@@ -144,23 +144,17 @@ describe('XMPP live push delivers a message whatever child an occupant hangs off
     const live: Message[] = [];
     await plugin.subscribe(topic, (m) => live.push(m));
 
-    const waiter = priv(plugin).armWaiter(room);
-    let woke: string | undefined;
-    void waiter.park(10_000).then((r) => (woke = r));
-
     const item = fake.deliverItem(room, {
       body: 'still a message',
       sender: 'attacker',
       injected: [build(room)],
     });
     await new Promise((r) => setTimeout(r, 5));
-    waiter.cancel();
 
     expect({
       delivered: live.map((m) => m.content),
       id: String(live[0]?.backendMsgId),
-      woke,
-    }).toEqual({ delivered: ['still a message'], id: item.archId, woke: 'message' });
+    }).toEqual({ delivered: ['still a message'], id: item.archId });
 
     await plugin.disconnect();
     mockState.client = undefined;

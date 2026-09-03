@@ -63,8 +63,8 @@ const calls: Call[] = [
     },
   },
   {
-    name: 'fetchRecent (blocking, at the tail)',
-    start: (plugin, topic) => plugin.fetchRecent({ topic, since: asCursor(''), blockMs: 60 }),
+    name: 'fetchRecent (at the tail)',
+    start: (plugin, topic) => plugin.fetchRecent({ topic, since: asCursor('') }),
     check: (_plugin, _topic, value) => {
       expect((value as { nextCursor: unknown }).nextCursor).toBeDefined();
     },

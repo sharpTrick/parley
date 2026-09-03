@@ -132,49 +132,21 @@ describe('only a write provisions, and never into a world-joinable room', () => 
     await p.disconnect();
   });
 
-  it('a blocking read waits for the room a peer has yet to create', async () => {
-    fake.aliasExists = false;
-    const p = await connectFake({});
-    const t = asTopic('ctx-not-yet');
-
-    const pending = p.fetchRecent({ topic: t, since: asCursor(''), blockMs: 3000, limit: 5 });
-    const appears = setTimeout(() => {
-      fake.aliasExists = true;
-      fake.addMessage(String(t), 'first-ever');
-    }, 200);
-
-    const got = await pending;
-    clearTimeout(appears);
-
-    expect(got.messages.map((m) => m.content)).toEqual(['first-ever']);
-    expect(fake.createRoomBodies).toHaveLength(0);
-    await p.disconnect();
-  }, 20_000);
-
   /**
-   * CLASS: `blockMs` engages on an EMPTY window, with or without a `since` — so a topic with no room
-   * yet blocks either way, and the budget is the only thing that bounds it. Whatever the answer, a
-   * READ must never provision: the `createRoomBodies` assertion is what keeps a topic the model
-   * pattern-matched out of untrusted context from minting a room on someone's homeserver.
+   * CLASS: a READ must never provision, whatever it is asked for — the `createRoomBodies` assertion
+   * is what keeps a topic the model pattern-matched out of untrusted context from minting a room on
+   * someone's homeserver.
    */
   it.each([
-    { name: 'no since', since: undefined, blocks: true },
-    { name: 'a since', since: asCursor(''), blocks: true },
-  ])('a never-posted topic with blockMs and $name: blocks = $blocks', async ({ since, blocks }) => {
+    { name: 'no since', since: undefined },
+    { name: 'a since', since: asCursor('') },
+  ])('a never-posted topic read with $name answers empty and provisions nothing', async ({ since }) => {
     fake.aliasExists = false;
     const p = await connectFake({});
 
-    const started = Date.now();
-    const res = await p.fetchRecent({
-      topic: asTopic('ctx-not-yet'),
-      since,
-      blockMs: 1500,
-      limit: 5,
-    });
-    const elapsed = Date.now() - started;
+    const res = await p.fetchRecent({ topic: asTopic('ctx-not-yet'), since, limit: 5 });
 
     expect(res.messages).toEqual([]);
-    expect(elapsed > 1000).toBe(blocks);
     expect(fake.createRoomBodies).toHaveLength(0);
     await p.disconnect();
   }, 20_000);
@@ -266,7 +238,6 @@ describe('a room the plugin did not create is adopted only on its stated trust b
           await expect(entry.drive(p, ADOPTED)).rejects.toThrow(row.refusesNaming);
           // Nothing of this session reached the room, and no live route feeds it into the agent.
           expect(fake.sentBodies).toEqual([]);
-          expect([...(p as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
         }
         await p.disconnect();
       });
@@ -321,13 +292,12 @@ const REFUSED_JOIN = [403, 404];
 describe('a refused join fails the call that needed the room', () => {
   for (const status of REFUSED_JOIN) {
     for (const [entryName, entry] of Object.entries(ENTRY_POINTS)) {
-      it(`join → ${status} / ${entryName} rejects and registers no live route`, async () => {
+      it(`join → ${status} / ${entryName} rejects`, async () => {
         fake.aliasExists = true; // the room exists; this account is simply not a member
         fake.joinStatus = status;
         const p = await connectFake({});
 
         await expect(entry.drive(p, asTopic('ctx-payments'))).rejects.toThrow();
-        expect([...(p as unknown as { liveTopics: Set<string> }).liveTopics]).toEqual([]);
         await p.disconnect();
       });
     }
@@ -570,15 +540,10 @@ const SIDE_EFFECTS: Record<
     effects: ['POST /join', 'GET /state'],
     drive: (p, t) => p.fetchRecent({ topic: t, limit: 5 }),
   },
-  'fetchRecent (no since) with block_ms on a room that exists': {
-    aliasExists: true,
-    effects: ['POST /join', 'GET /state'],
-    drive: (p, t) => p.fetchRecent({ topic: t, limit: 5, blockMs: 300 }),
-  },
-  'fetchRecent (since) with block_ms on a topic with no room': {
+  'fetchRecent (since) on a topic with no room': {
     aliasExists: false,
     effects: [],
-    drive: (p, t) => p.fetchRecent({ topic: t, since: asCursor(''), limit: 5, blockMs: 300 }),
+    drive: (p, t) => p.fetchRecent({ topic: t, since: asCursor(''), limit: 5 }),
   },
   'post to a room that exists': {
     aliasExists: true,

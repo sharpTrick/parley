@@ -29,17 +29,70 @@ async function withDeadline<T>(p: Promise<T>, budgetMs: number, onTimeout: () =>
   }
 }
 
-/** The one shared non-pool LISTEN connection: bringing it up, wiring it, and replacing it. */
+export interface ListenState {
+  /** Resolves only once the LISTEN is ESTABLISHED — never merely intended. */
+  ready: Promise<void>;
+  /** Subscriptions that still need this channel LISTENed. */
+  refs: number;
+}
+
+/**
+ * The one shared non-pool LISTEN connection: bringing it up, wiring it, replacing it, and the
+ * reference-counted LISTENs the subscriptions on it hold.
+ */
 export abstract class PostgresListener extends PostgresPush {
+  /**
+   * Take a reference on the channel's LISTEN, resolving only once that LISTEN is ESTABLISHED —
+   * publishing "someone intends to LISTEN" as if it were "the channel is LISTENed" strands the
+   * caller on a doorbell that may never be installed. Rejects (having taken no reference) if the
+   * LISTEN failed, so the caller can fall back.
+   */
+  protected async acquireListen(listener: Client, channel: string): Promise<ListenState> {
+    const existing = this.listens.get(channel);
+    if (existing !== undefined) {
+      existing.refs++;
+      try {
+        await existing.ready;
+      } catch (err) {
+        this.releaseListen(channel, existing);
+        throw err;
+      }
+      return existing;
+    }
+    const entry: ListenState = {
+      ready: listener.query(`LISTEN "${channel}"`).then(() => undefined),
+      refs: 1,
+    };
+    this.listens.set(channel, entry);
+    try {
+      await entry.ready;
+    } catch (err) {
+      if (this.listens.get(channel) === entry) this.listens.delete(channel);
+      throw err;
+    }
+    return entry;
+  }
+
+  protected releaseListen(channel: string, entry: ListenState): void {
+    if (this.listens.get(channel) !== entry) return;
+    entry.refs--;
+    if (entry.refs > 0) return;
+    this.listens.delete(channel);
+    if (!this.stopped && this.listener !== undefined) {
+      void this.listener.query(`UNLISTEN "${channel}"`).catch(() => undefined);
+    }
+  }
+
   /**
    * The shared LISTEN connection: created lazily on first subscribe, and REPLACED by the backoff
    * reconnect after a drop. Keep the memo pointing at the reconnect that is in flight rather than
    * at the client whose socket just closed, so that a `subscribe` issued during the blackout waits
    * for the replacement and then succeeds — handed the dead client it is guaranteed to fail, and
    * core's push loop rethrows that, so the whole bridge fails to come up. The wait is bounded, so
-   * an outage that outlasts `budgetMs` is a named error rather than a call that never settles.
+   * an outage that outlasts {@link LISTENER_WAIT_MS} is a named error rather than a call that never
+   * settles.
    */
-  protected ensureListener(budgetMs = LISTENER_WAIT_MS): Promise<Client> {
+  protected ensureListener(): Promise<Client> {
     if (this.listenerPromise === undefined) {
       const attempt: Promise<Client> = this.createListener().catch((err: unknown) => {
         if (this.listenerPromise === attempt) this.listenerPromise = undefined;
@@ -47,17 +100,14 @@ export abstract class PostgresListener extends PostgresPush {
       });
       this.listenerPromise = attempt;
     }
-    const late = (): Error =>
-      new Error(`the listener connection did not come up within ${budgetMs}ms`);
-    return withDeadline(this.listenerPromise, budgetMs, late);
+    return withDeadline(this.listenerPromise, LISTENER_WAIT_MS, dialTimedOut);
   }
 
   /**
    * Keep the DIAL bounded here rather than at the caller, so that no attempt can stay memoised in
    * `listenerPromise` for longer than {@link LISTENER_WAIT_MS}: a caller's deadline rejects the
    * caller and leaves the memo, and every later `subscribe` then awaits the same dead promise and
-   * is told to retry something that cannot work. Bounding it here also keeps a `waitForNotify` with
-   * a few-millisecond budget from abandoning a healthy dial a concurrent `subscribe` is waiting on.
+   * is told to retry something that cannot work.
    */
   private async createListener(): Promise<Client> {
     const epoch = this.epoch;
@@ -94,23 +144,14 @@ export abstract class PostgresListener extends PostgresPush {
   }
 
   /**
-   * Re-drive every participant registered on these channels — the subscription re-queries from
-   * `lastSeen`, and the parked blocking waiters are served according to `doorbell`. Keep EVERY
-   * participant registry reachable from this ONE call, so that a recovery path cannot re-drive some
-   * of them and leave the rest asleep on a doorbell that is never going to ring again.
-   *
-   * `'rang'` is a NOTIFY that really fired, so each waiter ends its wait and its caller re-runs the
-   * exclusive `since` query. `'silent'` is a recovery with nothing behind it, so each waiter
-   * re-reads first: waking one that has nothing to return ends a native long-poll early and drops
-   * the LISTEN reference its topic still needs.
+   * Re-drive every subscription registered on these channels: each re-queries from `lastSeen`. Keep
+   * EVERY registry reachable from this ONE call, so that a recovery path cannot re-drive some of
+   * them and leave the rest asleep on a doorbell that is never going to ring again.
    */
-  protected redrive(channels: Iterable<string>, doorbell: 'rang' | 'silent'): void {
+  protected redrive(channels: Iterable<string>): void {
     for (const channel of channels) {
       const sub = this.subs.get(channel);
       if (sub !== undefined) this.drain(sub);
-      const set = this.waiters.get(channel);
-      if (set === undefined) continue;
-      for (const waiter of [...set]) (doorbell === 'rang' ? waiter.wake : waiter.recheck)();
     }
   }
 
@@ -121,7 +162,7 @@ export abstract class PostgresListener extends PostgresPush {
     });
     client.on('notification', (n) => {
       // Payload is a hint only (size limits + best-effort delivery) — always re-query.
-      this.redrive([n.channel], 'rang');
+      this.redrive([n.channel]);
     });
     client.on('end', () => {
       if (!this.stopped && this.listener === client) {
@@ -131,7 +172,7 @@ export abstract class PostgresListener extends PostgresPush {
   }
 
   /**
-   * Backoff loop: new connection, re-LISTEN every channel, then {@link redrive} every participant —
+   * Backoff loop: new connection, re-LISTEN every channel, then {@link redrive} every subscription —
    * anything posted while we were dark rang a NOTIFY nobody heard and nothing rings again, so a lost
    * notification window costs latency, never a message.
    */
@@ -164,18 +205,18 @@ export abstract class PostgresListener extends PostgresPush {
             await endWithin(client, TEARDOWN_WAIT_MS);
             return;
           }
-          // Re-LISTEN every channel a subscription OR an in-flight blocking waiter needs, so a
-          // reconnect mid-wait still delivers the doorbell.
+          // Re-LISTEN every channel a subscription needs, so a reconnect still delivers the
+          // doorbell.
           const listened: string[] = [];
           for (const channel of this.listens.keys()) {
             await client.query(`LISTEN "${channel}"`);
             listened.push(channel);
           }
           await this.adoptListener(client, epoch);
-          // The loop above awaits, and a waiter's blockMs can expire inside it: that release has
-          // already dropped the channel with no live connection to send its UNLISTEN to. Keep this
-          // reconciliation, so that the replacement is not left registered for a channel no
-          // participant needs — every future post to that topic would wake the process forever.
+          // The loop above awaits, and a subscription's last reference can be dropped inside it,
+          // with no live connection to send its UNLISTEN to. Keep this reconciliation, so that the
+          // replacement is not left registered for a channel nothing needs — every future post to
+          // that topic would wake the process forever.
           for (const channel of listened) {
             if (!this.listens.has(channel)) {
               void client.query(`UNLISTEN "${channel}"`).catch(() => undefined);
@@ -183,7 +224,7 @@ export abstract class PostgresListener extends PostgresPush {
           }
           landed(client);
           adopted = true;
-          this.redrive(new Set([...this.subs.keys(), ...this.waiters.keys()]), 'silent');
+          this.redrive([...this.subs.keys()]);
           return;
         } catch {
           // Bounded and not awaited, so that a peer which accepts the socket and then says nothing

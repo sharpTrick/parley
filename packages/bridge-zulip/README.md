@@ -27,11 +27,10 @@ everywhere — the bridge wants source text, not rendered HTML), `timestamp` ←
 `new Date(message.timestamp * 1000).toISOString()` (informational only — never used for ordering
 or dedup).
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. Zulip
-serves this natively via the `/api/v1/events` event-queue long-poll. Core caps the wait at
-`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+**No `block_ms` here.** `fetchRecent` reads `/api/v1/messages` and has no wait to spend a caller's
+budget on, so this plugin declares `capabilities.blockingFetch: false` and core withdraws `block_ms`
+from the `parley_fetch_recent` schema for a Zulip deployment. Live delivery is `subscribe`, over the
+`/api/v1/events` event queue.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Zulip stamps the
 > sender from the authenticated bot account, so a message's `senderHandle` is always that bot's

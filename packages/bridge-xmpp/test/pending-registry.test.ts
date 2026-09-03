@@ -20,7 +20,6 @@ vi.mock('@xmpp/client', async () => {
 });
 
 const NS_MUC_USER = 'http://jabber.org/protocol/muc#user';
-const NS_SID = 'urn:xmpp:sid:0';
 const NS_MAM = 'urn:xmpp:mam:2';
 const NS_FORWARD = 'urn:xmpp:forward:0';
 
@@ -129,38 +128,6 @@ describe('XMPP keyed correlation registries (a superseded entry never unregister
     expect(itemsB.map((i) => i.archId)).toEqual(['arch-b']);
   });
 
-  it('waiters: one long-poll timing out leaves a concurrent long-poll on the same room armed', async () => {
-    vi.useFakeTimers();
-    const plugin = new XmppPlugin();
-    const fake = new FakeXmpp();
-    const p = attach(plugin, fake);
-    const room = p.roomJid(TOPIC);
-
-    const shortWait = p.armWaiter(room);
-    const shortFired = shortWait.park(100);
-    const longWait = p.armWaiter(room);
-    let longFired: string | undefined;
-    void longWait.park(10_000).then((r) => {
-      longFired = r;
-    });
-    expect(p.waiters.get(room)?.size).toBe(2);
-
-    await vi.advanceTimersByTimeAsync(200);
-    expect(await shortFired).toBe('timeout');
-    expect(p.waiters.get(room)?.size).toBe(1); // the survivor is still registered
-
-    p.onStanza(
-      xml(
-        'message',
-        { from: `${room}/other`, type: 'groupchat' },
-        xml('body', {}, 'hi'),
-        xml('stanza-id', { xmlns: NS_SID, by: room, id: 'arch-1' }),
-      ),
-    );
-    await vi.advanceTimersByTimeAsync(0);
-    expect(longFired).toBe('message'); // still woken by its own event
-    expectNoLeaks(plugin);
-  });
 });
 
 // Class: a superseded entry settled through a route that is NOT its own timer. The table above only
@@ -290,9 +257,9 @@ const entries: Entry[] = [
   { name: 'post', settles: 'rejects', call: (p) => p.post(TOPIC, asHandle('a'), 'x') },
   { name: 'fetchRecent', settles: 'rejects', call: (p) => p.fetchRecent({ topic: TOPIC }) },
   {
-    name: 'fetchRecent with blockMs',
+    name: 'fetchRecent from a cursor',
     settles: 'rejects',
-    call: (p) => p.fetchRecent({ topic: TOPIC, since: asCursor('arch-1'), blockMs: 30_000 }),
+    call: (p) => p.fetchRecent({ topic: TOPIC, since: asCursor('arch-1') }),
   },
   { name: 'subscribe', settles: 'rejects', call: (p) => p.subscribe(TOPIC, () => undefined) },
   { name: 'resolveIdentity', settles: 'resolves', call: (p) => p.resolveIdentity(asHandle('a')) },

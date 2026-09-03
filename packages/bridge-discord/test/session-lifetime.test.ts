@@ -18,7 +18,7 @@ vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs
 
 import { DiscordPlugin } from '../src/index.js';
 import { resetGateway } from './fake-gateway.js';
-import { probe, reachReady, stubFetch, type FetchStub } from './harness.js';
+import { stubFetch, type FetchStub } from './harness.js';
 
 const TOPIC = asTopic('chat');
 const OLD_CHANNEL = '111';
@@ -68,19 +68,6 @@ interface Parked {
 }
 
 const PARKS: Parked[] = [
-  {
-    label: 'on the native long-poll waiter',
-    start: async (plugin, rest) => {
-      rest.pages[OLD_CHANNEL] = [];
-      await reachReady(plugin, TOPIC);
-      const call = plugin.fetchRecent({ topic: TOPIC, since: SINCE, blockMs: BLOCK_MS });
-      await vi.advanceTimersByTimeAsync(50);
-      expect(probe<Map<string, unknown>>(plugin, 'waiters').size, 'no waiter is armed').toBe(1);
-      return { call };
-    },
-    release: () => undefined,
-    echoes: SINCE as string,
-  },
   {
     label: 'between the pages of a since walk',
     start: async (plugin, rest) => {

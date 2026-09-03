@@ -117,11 +117,6 @@ const PARKED: ParkedCall[] = [
   rateLimited('fetchRecent (since)', 'a rejection', messagesOf, (p, t) =>
     p.fetchRecent({ topic: t, since: PARKED_SINCE }),
   ),
-  // A budget wide enough to hold the stated wait, so this cell measures the guard and not the
-  // blocking path's own deadline.
-  rateLimited('fetchRecent (blockMs)', 'the empty replayable page', messagesOf, (p, t) =>
-    p.fetchRecent({ topic: t, since: PARKED_SINCE, blockMs: 60_000 }),
-  ),
   rateLimited('resolveIdentity', 'a rejection', () => '/users/@me', (p) =>
     p.resolveIdentity(asHandle('someone')),
   ),
@@ -131,22 +126,6 @@ const PARKED: ParkedCall[] = [
     (channelId) => `/channels/${channelId}`,
     (p, t) => p.subscribe(t, () => undefined),
   ),
-  {
-    entry: 'fetchRecent (blockMs)',
-    park: 'a long-poll wait',
-    owed: 'the empty replayable page',
-    watched: messagesOf,
-    start: async (p, topic, channelId, fake) => {
-      await p.subscribe(topic, () => undefined);
-      const settled = settleOf(p.fetchRecent({ topic, since: PARKED_SINCE, blockMs: 60_000 }));
-      // The waiter is armed only after the first (empty) query has come back.
-      await vi.waitFor(() => expect(fake.requestCount(messagesOf(channelId))).toBeGreaterThan(0), {
-        timeout: 3000,
-      });
-      await delay(50);
-      return { settled };
-    },
-  },
 ];
 
 describe('disconnect() quiesces a call parked in', () => {

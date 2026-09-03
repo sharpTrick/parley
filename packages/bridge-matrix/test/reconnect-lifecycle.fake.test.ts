@@ -24,7 +24,6 @@ const TOPIC = asTopic('lifecycle');
 /** Longer than the retry backoff the loop is parked in, so a resurrected loop has time to show. */
 const OBSERVE_MS = 3000;
 /** Long enough that a park which only re-checks on its next tick shows up as latency, not a race. */
-const SLOW_SYNC_MS = 4000;
 
 let fake: FakeSynapse;
 beforeEach(() => {
@@ -114,8 +113,8 @@ const trackLongSleeps = (): SleepTracker => {
 };
 
 /**
- * Every park in this package that SLEEPS, and how to leave the plugin sitting in it. Each returns
- * the still-running call in a wrapper, so awaiting the arm cannot accidentally await the park.
+ * Every background sleep in this package, and how to leave the plugin sitting in it. Each returns
+ * the still-running call in a wrapper, so awaiting the arm cannot accidentally await the sleep.
  */
 const SLEEPING_PARKS: Record<string, (p: MatrixPlugin) => Promise<{ inFlight: Promise<unknown> }>> =
   {
@@ -124,26 +123,6 @@ const SLEEPING_PARKS: Record<string, (p: MatrixPlugin) => Promise<{ inFlight: Pr
       fake.syncFailures = Number.POSITIVE_INFINITY;
       await p.subscribe(TOPIC, () => undefined);
       return { inFlight: Promise.resolve() };
-    },
-    // The provisioning poll a blocking read drives while the topic still has no room.
-    'the room-provisioning poll of a blocking read': async (p) => {
-      fake.aliasExists = false;
-      const inFlight = p.fetchRecent({
-        topic: TOPIC,
-        since: asCursor(''),
-        blockMs: 30_000,
-        limit: 5,
-      });
-      void inFlight.catch(() => undefined);
-      return { inFlight };
-    },
-    // The park slice a blocking read waits out between canonical re-queries.
-    'the park slice of a blocking read at the tail': async (p) => {
-      await p.post(TOPIC, WRITER, 'seed');
-      const tail = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
-      const inFlight = p.fetchRecent({ topic: TOPIC, since: tail, blockMs: 30_000, limit: 5 });
-      void inFlight.catch(() => undefined);
-      return { inFlight };
     },
   };
 
@@ -196,12 +175,11 @@ describe('a subscribe loop does not survive disconnect + connect', () => {
 });
 
 /**
- * CLASS: no registry entry may outlive the work it describes. `liveTopics` is a claim that a running
- * `/sync` loop covers a (room, topic) pair; a blocking `fetchRecent` trusts it and declines to open
- * its own dedicated `/sync`. A phantom entry therefore costs a landed message a full slice of
- * `sync_timeout_ms` of silence — and in production `catchup.block_max_ms` is 60s.
+ * CLASS: no registry entry may outlive the work it describes. A `/sync` controller or a resolved
+ * room surviving a teardown is a request issued with a cleared token, and a room handed to the NEXT
+ * generation without being re-resolved under its credential.
  */
-const REGISTRIES = ['liveTopics', 'waiters', 'controllers', 'rooms'] as const;
+const REGISTRIES = ['controllers', 'rooms'] as const;
 
 const sizeOf = (p: MatrixPlugin, name: (typeof REGISTRIES)[number]): number =>
   (p as unknown as Record<string, { size: number }>)[name]!.size;
@@ -241,21 +219,17 @@ describe('every internal registry is empty after a lifecycle that stood the loop
     }, 30_000);
   }
 
-  it('a blocking fetchRecent afterwards still wakes far inside its budget', async () => {
+  it('a catch-up afterwards still reads the topic under the new generation', async () => {
     const p = await connectFake({ syncTimeoutMs: 8000 });
     await p.subscribe(TOPIC, () => undefined);
     await p.connect(fakeConfig({ syncTimeoutMs: 8000 }));
     await p.post(TOPIC, WRITER, 'seed');
     const tail = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
 
-    const started = Date.now();
-    const pending = p.fetchRecent({ topic: TOPIC, since: tail, blockMs: 3000 });
-    const lands = setTimeout(() => void p.post(TOPIC, WRITER, 'fresh'), 150);
-    const woke = await pending;
-    clearTimeout(lands);
+    await p.post(TOPIC, WRITER, 'fresh');
+    const got = await p.fetchRecent({ topic: TOPIC, since: tail });
 
-    expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
-    expect(Date.now() - started).toBeLessThan(1500);
+    expect(got.messages.map((m) => m.content)).toEqual(['fresh']);
     await p.disconnect();
   }, 30_000);
 });
@@ -324,19 +298,18 @@ const TEARDOWN_DRIVERS: Record<
     writesUntorn: 0,
     drive: (p) => p.subscribe(TOPIC, () => undefined),
   },
-  'a blocking fetchRecent from the empty sentinel': {
+  'a fetchRecent from the empty sentinel': {
     writesUntorn: 0,
-    drive: (p) =>
-      p.fetchRecent({ topic: TOPIC, since: asCursor(''), blockMs: 1500, limit: PAGE_LIMIT }),
+    drive: (p) => p.fetchRecent({ topic: TOPIC, since: asCursor(''), limit: PAGE_LIMIT }),
   },
-  'a blocking fetchRecent parked at the tail': {
+  'a fetchRecent from the tail': {
     writesUntorn: 0,
     setup: async (p) => {
       await p.post(TOPIC, WRITER, 'seed');
       return (await p.fetchRecent({ topic: TOPIC, limit: PAGE_LIMIT })).nextCursor;
     },
     drive: (p, since) =>
-      p.fetchRecent({ topic: TOPIC, since: since as never, blockMs: 1500, limit: PAGE_LIMIT }),
+      p.fetchRecent({ topic: TOPIC, since: since as never, limit: PAGE_LIMIT }),
   },
 };
 
@@ -379,7 +352,7 @@ const TEARDOWN_PHASES: Record<
       'a since-less fetchRecent',
       'a post',
       'a subscribe',
-      'a blocking fetchRecent from the empty sentinel',
+      'a fetchRecent from the empty sentinel',
     ],
   },
   'the /join that follows it': {
@@ -389,18 +362,22 @@ const TEARDOWN_PHASES: Record<
       'a since-less fetchRecent',
       'a post',
       'a subscribe',
-      'a blocking fetchRecent from the empty sentinel',
+      'a fetchRecent from the empty sentinel',
     ],
   },
   'the positioning /sync': {
     matches: (path) => path.endsWith('/v3/sync'),
     noisePages: [0],
-    drivers: ['a subscribe', 'a blocking fetchRecent parked at the tail'],
+    drivers: ['a subscribe'],
   },
   'a /messages page': {
     matches: (path) => path.endsWith('/messages'),
     noisePages: [1, 2, 5],
-    drivers: ['a since-less fetchRecent', 'a blocking fetchRecent from the empty sentinel'],
+    drivers: [
+      'a since-less fetchRecent',
+      'a fetchRecent from the empty sentinel',
+      'a fetchRecent from the tail',
+    ],
   },
 };
 
@@ -440,70 +417,6 @@ describe('a disconnect landing inside a round-trip leaves nothing behind', () =>
           await p.disconnect();
         }, 30_000);
       }
-    }
-  }
-});
-
-/**
- * CLASS: a plugin wait that watches only the shared stopped flag. Every background park must stand
- * down AT the `disconnect()` — checked BEFORE its next request, not only after it — or it keeps
- * talking to the homeserver with a cleared token, joins rooms post-teardown, and repopulates the
- * registries the next `connect()` just cleared. The `roomExists` axis is what separates the two parks
- * a blocking read can be sitting in: the room-provisioning poll (no room yet) and the `/sync`
- * long-poll (room resolved).
- */
-const AFTER: Record<string, (p: MatrixPlugin) => Promise<void>> = {
-  disconnect: async (p) => {
-    await p.disconnect();
-  },
-  // `connect()` is the OTHER entry point that ends a generation, so it owes the same stand-down: a
-  // teardown only `disconnect()` performs leaves the park holding its timer, its registration and
-  // its dedicated `/sync` until its slice expires — 25s of a caller's blockMs at the documented
-  // sync_timeout_ms — while the plugin it belongs to is already gone.
-  'connect (a bare reconnect, no disconnect)': async (p) => {
-    await p.connect(fakeConfig({ syncTimeoutMs: SLOW_SYNC_MS }));
-  },
-  'disconnect → connect': async (p) => {
-    await p.disconnect();
-    await p.connect(fakeConfig({ syncTimeoutMs: SLOW_SYNC_MS }));
-  },
-};
-
-describe('a parked blocking fetchRecent does not outlive the lifecycle call that ended it', () => {
-  for (const roomExists of [true, false]) {
-    for (const [name, after] of Object.entries(AFTER)) {
-      it(`room exists: ${roomExists} / ${name}: settles at once, then issues nothing`, async () => {
-        const requests: string[] = [];
-        fake.onRequest = (method, path) => void requests.push(`${method} ${path}`);
-        const p = await connectFake({ syncTimeoutMs: SLOW_SYNC_MS });
-        let since = asCursor('');
-        if (roomExists) {
-          await p.post(TOPIC, WRITER, 'seed');
-          since = (await p.fetchRecent({ topic: TOPIC, limit: 10 })).nextCursor;
-        } else {
-          fake.aliasExists = false;
-        }
-
-        const pending = p.fetchRecent({ topic: TOPIC, since, blockMs: 30_000, limit: 5 });
-        await settle(100); // let the wait park
-
-        const torn = Date.now();
-        await after(p);
-        // The room the wait was polling for appears the instant the teardown lands: a park that
-        // ignored it resolves the alias, joins, and reads — all with a cleared token.
-        fake.aliasExists = true;
-        await settle(50); // let a request already on the wire at the teardown be recorded.
-        const atTeardown = requests.length;
-
-        expect((await pending).messages).toEqual([]);
-        const settledAfter = Date.now() - torn;
-
-        await settle(500);
-        expect(requests.slice(atTeardown)).toEqual([]);
-        expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
-        expect(settledAfter).toBeLessThan(SLOW_SYNC_MS / 4);
-        await p.disconnect();
-      }, 30_000);
     }
   }
 });

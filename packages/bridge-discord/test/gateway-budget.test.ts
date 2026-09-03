@@ -1,4 +1,4 @@
-import { asCursor, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Discord allows 1000 IDENTIFYs per 24h and penalizes an overrun by RESETTING the bot token, so
@@ -86,24 +86,6 @@ describe('one rung of the ladder buys exactly one dial', () => {
       label: 'subscribe',
       start: (p, t) => {
         void p.subscribe(t, () => undefined).catch(() => undefined);
-      },
-    },
-    {
-      label: 'a native blocking fetchRecent',
-      start: (p, t) => {
-        void p
-          .fetchRecent({ topic: t, since: asCursor('1'), blockMs: HOUR_MS })
-          .catch(() => undefined);
-      },
-    },
-    {
-      label: "core's 250ms long-poll fallback",
-      start: (p, t) => {
-        void fetchRecentBlocking(
-          p,
-          { topic: t, since: asCursor('1') },
-          { blockMs: HOUR_MS, pollIntervalMs: 250 },
-        ).catch(() => undefined);
       },
     },
   ];
@@ -205,8 +187,8 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
     },
   ];
 
-  // Each entry point that can open the shared socket. The long-poll ones matter most: core calls
-  // the plugin again every `block_poll_interval_ms` for the WHOLE budget of one tool call.
+  // Every entry point that can open the shared socket, each of which a re-entrant caller can drive
+  // repeatedly for the whole life of one tool call.
   const INITIATORS: Array<{ label: string; start: (p: DiscordPlugin, t: Topic) => void }> = [
     {
       label: 'subscribe',
@@ -215,24 +197,10 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
       },
     },
     {
-      label: 'fetchRecent(blockMs) via core fetchRecentBlocking',
-      start: (p, t) => {
-        void fetchRecentBlocking(
-          p,
-          { topic: t, since: asCursor('1') },
-          { blockMs: HOUR_MS, pollIntervalMs: 250 },
-        ).catch(() => undefined);
-      },
-    },
-    {
-      label: 'subscribe + fetchRecent(blockMs) together',
+      label: 'two concurrent subscribes',
       start: (p, t) => {
         void p.subscribe(t, () => undefined).catch(() => undefined);
-        void fetchRecentBlocking(
-          p,
-          { topic: t, since: asCursor('1') },
-          { blockMs: HOUR_MS, pollIntervalMs: 250 },
-        ).catch(() => undefined);
+        void p.subscribe(asTopic('900002'), () => undefined).catch(() => undefined);
       },
     },
   ];
@@ -474,12 +442,11 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
   const subscribed = (plugin: DiscordPlugin, topic: Topic, sink: string[]): Promise<FakeWs> =>
     reachReady(plugin, topic, { handler: (m) => sink.push(m.content) });
 
-  const waitersOf = (plugin: DiscordPlugin): Map<string, Set<() => void>> =>
-    probe(plugin, 'waiters');
+  const subsOf = (plugin: DiscordPlugin): Map<string, unknown> => probe(plugin, 'subs');
 
   // WHICH call retires the first session. `connect()` is documented as starting the NEXT session, so
-  // it owes the same teardown `disconnect()` does — a socket left dispatching while `live` reads
-  // false degrades every later native long-poll to an immediate return, silently and for good.
+  // it owes the same teardown `disconnect()` does — a socket left dispatching against a plugin that
+  // has forgotten its topics is a live path that silently delivers nothing.
   const TRANSITIONS: Array<{ label: string; retire: (p: DiscordPlugin) => Promise<void> }> = [
     { label: 'disconnect() then connect()', retire: (p) => p.disconnect() },
     { label: 'connect() alone', retire: async () => undefined },
@@ -501,11 +468,9 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
       first: async () => undefined,
     },
     {
-      label: 'a long-poll was in flight',
+      label: 'a catch-up was in flight',
       first: async (p) => {
-        void p
-          .fetchRecent({ topic: TOPIC, since: asCursor('1'), blockMs: 30_000 })
-          .catch(() => undefined);
+        void p.fetchRecent({ topic: TOPIC, since: asCursor('1') }).catch(() => undefined);
         await vi.advanceTimersByTimeAsync(10);
       },
     },
@@ -580,16 +545,11 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
           expect(firstSink).toHaveLength(deliveredToFirst);
           expect(secondSink).toEqual(['to-the-live-session']);
 
-          // The new session's socket has to be LIVE, not merely open: a blocking fetch that arms no
-          // waiter returns instantly for the rest of the process, which every assertion above misses.
-          const blocked = plugin
-            .fetchRecent({ topic: LATE_TOPIC, since: asCursor('1'), blockMs: 30_000 })
-            .catch(() => undefined);
-          await vi.advanceTimersByTimeAsync(10);
-          expect(waitersOf(plugin).size, 'the long-poll armed no waiter, so it never waits').toBe(1);
+          // The new session's routing table has to hold exactly the topic it subscribed: a
+          // registry carried over from the retired session routes into a handler that is gone.
+          expect(subsOf(plugin).size, 'the new session routes more than its own topic').toBe(1);
 
           await plugin.disconnect();
-          await blocked;
           await vi.advanceTimersByTimeAsync(1); // deliver the fake's own deferred close event
           expect(openSockets()).toHaveLength(0);
           expect(vi.getTimerCount()).toBe(0); // no interval, watchdog or reconnect outlives teardown

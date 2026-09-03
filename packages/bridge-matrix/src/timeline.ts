@@ -1,11 +1,8 @@
 import type { Cursor, FetchRecentResult, Message, Topic } from '@sharptrick/parley-core';
-import { delay } from '@sharptrick/parley-net-util';
-import { syncDeadlineMs } from './config.js';
 import { cursorPastForeignBlock, emptyWindowCursor, STREAM_CURSOR_PREFIX } from './cursor.js';
 import { MatrixSession } from './session.js';
 import {
   eventToMessage, isMessageEvent, type MatrixEvent, type MessageEvent,
-  nextBatchOf, positioningBatchOf, syncFilterParam, type SyncResponse,
 } from './wire.js';
 
 /** Real per-sync timeline cap for the incremental `/sync` filter and the backfill page size. */
@@ -28,7 +25,7 @@ export const returnedTooFast = (startedAt: number, timeoutMs: number): boolean =
 /** Bound on forward catch-up pagination so an all-foreign timeline terminates instead of spinning. */
 const MAX_FORWARD_PAGES = 50;
 /** Bound on backward `limited`-burst recovery and recent-window pagination so both terminate. */
-const MAX_BACKFILL_PAGES = 50;
+const MAX_BACKWARD_PAGES = 50;
 /**
  * Server-side filter for the catch-up paths, so reactions, edits and membership churn cost no
  * client page budget. Keep it OFF the `backfill`/`positionBoundary` pair — those match a boundary
@@ -38,10 +35,7 @@ const MESSAGES_ONLY_FILTER = encodeURIComponent(JSON.stringify({ types: ['m.room
 
 type MessagesPage = { chunk: MatrixEvent[]; start?: string; end?: string };
 
-/**
- * Every read of a room's timeline: the `/messages` pagination that answers a catch-up, and the
- * dedicated bounded `/sync` a blocking read drives when no subscribe loop covers its room.
- */
+/** Every read of a room's timeline: the `/messages` pagination that answers a catch-up. */
 export abstract class MatrixTimeline extends MatrixSession {
   /**
    * Locate the cursor event and page forward from just after it, returning only belonging messages
@@ -185,7 +179,7 @@ export abstract class MatrixTimeline extends MatrixSession {
     let exhaustedTheTimeline = false;
     for (
       let page = 0;
-      page < MAX_BACKFILL_PAGES && collected.length < limit && !this.isStale(generation);
+      page < MAX_BACKWARD_PAGES && collected.length < limit && !this.isStale(generation);
       page++
     ) {
       const fromParam = from === undefined ? '' : `from=${encodeURIComponent(from)}&`;
@@ -208,7 +202,7 @@ export abstract class MatrixTimeline extends MatrixSession {
     }
     const stale = this.isStale(generation);
     // Keep a position claimable only when the walk reached one of its OWN stopping conditions — it
-    // filled the window, it ran out of timeline, or it spent {@link MAX_BACKFILL_PAGES}. A TEARDOWN
+    // filled the window, it ran out of timeline, or it spent {@link MAX_BACKWARD_PAGES}. A TEARDOWN
     // has read none of the history it would be claiming to have walked past, and core persists
     // whatever cursor it is handed; hand back nothing and leave the caller on its own position
     // instead, so that history is re-read rather than skipped. Keep the page bound OFF that list —
@@ -238,7 +232,7 @@ export abstract class MatrixTimeline extends MatrixSession {
   ): Promise<MessageEvent[]> {
     const recovered: MessageEvent[] = [];
     let from = prevBatch;
-    for (let page = 0; page < MAX_BACKFILL_PAGES && !this.isStale(generation); page++) {
+    for (let page = 0; page < MAX_BACKWARD_PAGES && !this.isStale(generation); page++) {
       const res = await this.http(
         'GET',
         `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(from)}&dir=b&limit=${INCREMENTAL_TIMELINE_LIMIT}`,
@@ -258,79 +252,5 @@ export abstract class MatrixTimeline extends MatrixSession {
       from = end;
     }
     return recovered.reverse();
-  }
-
-  /**
-   * Position a dedicated, bounded `/sync` used ONLY while a blocking `fetchRecent` waits on a room
-   * that no `subscribe` loop covers. Resolves once the `timeout=0` positioning sync's `next_batch`
-   * is in hand (its OWN token — never shared with the live loop), leaving {@link pollBoundedSync}
-   * running behind it.
-   */
-  protected async driveBoundedSync(
-    roomId: string,
-    topic: Topic,
-    blockMs: number,
-    controller: AbortController,
-    wake: () => void,
-  ): Promise<void> {
-    const generation = this.generation;
-    const deadline = Date.now() + blockMs;
-    const initParam = syncFilterParam(roomId, 0);
-    let nextBatch: string;
-    try {
-      const initial = await this.http(
-        'GET',
-        `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`,
-        { signal: controller.signal, deadlineMs: syncDeadlineMs(0) },
-      );
-      nextBatch = positioningBatchOf(((await initial.json()) as SyncResponse).next_batch);
-    } catch {
-      return;
-    }
-    void this.pollBoundedSync(roomId, topic, deadline, nextBatch, generation, controller, wake);
-  }
-
-  /**
-   * Long-poll a positioned dedicated `/sync` forward until a belonging event appears (→ `wake()`),
-   * the `blockMs` budget runs out, or it is aborted (disconnect/wake). Every `/sync` timeout is
-   * clamped to the remaining budget so the total wait never exceeds `blockMs`. Best-effort: any
-   * error (an abort included) just returns — the `blockMs` timer still resolves the wait.
-   */
-  private async pollBoundedSync(
-    roomId: string,
-    topic: Topic,
-    deadline: number,
-    positionedAt: string,
-    generation: number,
-    controller: AbortController,
-    wake: () => void,
-  ): Promise<void> {
-    const incParam = syncFilterParam(roomId, INCREMENTAL_TIMELINE_LIMIT);
-    let nextBatch = positionedAt;
-    try {
-      while (!this.isStale(generation) && !controller.signal.aborted) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) return;
-        const timeout = Math.min(remaining, this.syncTimeoutMs);
-        const started = Date.now();
-        const res = await this.http(
-          'GET',
-          `/_matrix/client/v3/sync?filter=${incParam}&since=${encodeURIComponent(nextBatch)}&timeout=${timeout}`,
-          { signal: controller.signal, deadlineMs: syncDeadlineMs(timeout) },
-        );
-        const json = (await res.json()) as SyncResponse;
-        nextBatch = nextBatchOf(json.next_batch, nextBatch);
-        const events = json.rooms?.join?.[roomId]?.timeline?.events ?? [];
-        if (events.some((e) => this.belongs(e, topic))) {
-          wake();
-          return;
-        }
-        if (returnedTooFast(started, timeout)) {
-          await delay(Math.min(remaining, SYNC_IDLE_PACE_MS));
-        }
-      }
-    } catch {
-      /* aborted (disconnect/wake) or transient — the blockMs timer still resolves the wait */
-    }
   }
 }

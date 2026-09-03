@@ -192,9 +192,8 @@ export function makeZulipContext(args: {
     await plugin.connect(args.connect);
     return {
       plugin,
-      // Zulip honors blockMs NATIVELY via the /api/v1/events long-poll, so the shared
-      // blocking-fetch conformance case runs directly against the plugin.
-      supportsBlockingFetch: true,
+      // `fetchRecent` reads history; it takes no wait. The suite grades the weaker contract.
+      supportsBlockingFetch: false,
       // Zulip stamps the sender from the authenticated bot, not from `post`'s `identity`.
       carriesSenderIdentity: false,
       freshTopic: (): Topic => asTopic(`t-${++contextSeq}-${rand()}`),

@@ -16,7 +16,6 @@
  *     just surfaced ones.
  */
 import {
-  asCursor,
   asHandle,
   asTopic,
   type Message,
@@ -159,30 +158,6 @@ describe('slack socket mode: untrusted envelopes', () => {
         { timeout: 3000, interval: 10 },
       );
       expect(live.map((m) => m.content)).toEqual(['still alive']);
-      expect(watch.crashes).toEqual([]);
-    } finally {
-      watch.stop();
-      await h.cleanup();
-    }
-  });
-
-  it('with a blocking fetch parked and NO route: the same table neither crashes nor loses the wake', async () => {
-    const h = await harness();
-    const watch = watchForCrashes();
-    try {
-      const parked = h.plugin.fetchRecent({ topic: h.topic, since: asCursor('0'), blockMs: 4000 });
-      // Let the waiter arm (handshake + gap-closing re-query) before the table lands.
-      await new Promise((r) => setTimeout(r, 250));
-
-      const ids = new Map<string, string>();
-      for (const row of DROPPED) ids.set(row.name, h.fake.pushEnvelope(row.body(h.fake)));
-
-      const [created] = h.fake.seed(h.topic, [{ text: 'wakes it' }]);
-      h.fake.pushEvent(h.topic, { ts: created!.ts, text: 'wakes it', user: 'U0PARLEY' });
-
-      const result = await parked;
-      expect(result.messages.map((m) => m.content)).toEqual(['wakes it']);
-      for (const [name, id] of ids) expect(h.fake.acked, `unacked: ${name}`).toContain(id);
       expect(watch.crashes).toEqual([]);
     } finally {
       watch.stop();
@@ -487,16 +462,12 @@ const DISCONNECT_REASONS: Array<{ reason?: string; preOpens: boolean }> = [
 
 describe('slack socket mode: disconnect reason drives the rotation', () => {
   for (const { reason, preOpens } of DISCONNECT_REASONS) {
-    for (const parked of [false, true] as const) {
-      it(`reason=${String(reason)} ${preOpens ? 'opens the replacement first' : 'closes at once'}, with a blocking fetch ${parked ? 'parked' : 'absent'}`, async () => {
+    {
+      it(`reason=${String(reason)} ${preOpens ? 'opens the replacement first' : 'closes at once'}`, async () => {
         const h = await harness();
         try {
           const live: Message[] = [];
           await h.plugin.subscribe(h.topic, (m) => live.push(m));
-          const blocked = parked
-            ? h.plugin.fetchRecent({ topic: h.topic, since: asCursor('0'), blockMs: 4000 })
-            : undefined;
-          if (parked) await new Promise((r) => setTimeout(r, 250));
           expect(h.fake.liveSockets).toBe(1);
           const dialsBefore = h.fake.connectionsOpened;
 
@@ -537,10 +508,6 @@ describe('slack socket mode: disconnect reason drives the rotation', () => {
             timeout: 4000,
             interval: 10,
           });
-          if (blocked !== undefined) {
-            const result = await blocked;
-            expect(result.messages.length, 'the parked fetch still returns a page').toBeGreaterThan(0);
-          }
         } finally {
           await h.cleanup();
         }

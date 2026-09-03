@@ -107,8 +107,9 @@ const ConfigObject = z.object({
         })
         .default(60_000),
       /**
-       * Poll cadence (ms) for core's generic long-poll fallback — how often it re-queries when a
-       * backend does not block natively. No correctness impact; latency/cost knob only.
+       * Poll cadence (ms) of core's long-poll wrapper — how often it re-drives `fetchRecent` while
+       * a blocking read is still waiting out its budget. No correctness impact; latency/cost knob
+       * only.
        */
       block_poll_interval_ms: z
         .number()

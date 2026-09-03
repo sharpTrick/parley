@@ -12,8 +12,9 @@ import { emptyWindowCursor, requireLimit } from './cursor.js';
 import {
   membershipLost, reportLoopCrash, reportSyncFailure, syncRetryDelayMs,
 } from './diagnostics.js';
-import { liveKey, MatrixParking } from './park.js';
-import { INCREMENTAL_TIMELINE_LIMIT, returnedTooFast, SYNC_IDLE_PACE_MS } from './timeline.js';
+import {
+  INCREMENTAL_TIMELINE_LIMIT, MatrixTimeline, returnedTooFast, SYNC_IDLE_PACE_MS,
+} from './timeline.js';
 import {
   adoptedString, type Boundary, eventToMessage, membershipLossOf, type MessageEvent, nextBatchOf,
   positionBoundaryOf, positioningBatchOf, ROOM_START, syncFilterParam, type SyncResponse, TOPIC_KEY,
@@ -37,7 +38,13 @@ export {
  * isolating them by an `app.parley.topic` content tag — the only practical way to run the suite
  * under Synapse's strict per-user room-creation rate limit without an appservice.
  */
-export class MatrixPlugin extends MatrixParking implements BackendPlugin {
+export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
+  /**
+   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
+   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
+   */
+  readonly capabilities = { blockingFetch: false } as const;
+
   private txnCounter = 0;
 
   async connect(config: BackendConfig): Promise<void> {
@@ -112,20 +119,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const generation = this.generation;
     const limit = requireLimit(args.limit, args.topic);
-    // `blockMs` is declared on the seam with no bound, and BOTH parks below — the one waiting for a
-    // peer to provision the room and the one waiting for an event in it — end only by comparing
-    // against this deadline. Keep the finiteness arm, so that a budget which is neither `> 0` nor
-    // `<= 0` cannot leave every one of those comparisons false: `Infinity` never lets a park stop,
-    // and `NaN` also collapses its slice to a bare tick, turning the wait into a request storm.
-    const asked = args.blockMs ?? 0;
-    const budgetMs = Number.isFinite(asked) ? asked : 0;
-    const deadline = Date.now() + budgetMs;
-    // Park for the room only when the answer would otherwise be an EMPTY page: the seam blocks on an
-    // empty window, not on provisioning, so a topic whose room already exists must not spend the
-    // budget re-resolving it.
-    const roomId =
-      (await this.existingRoom(args.topic, generation)) ??
-      (budgetMs > 0 ? await this.roomForRead(args.topic, deadline, generation) : undefined);
+    const roomId = await this.existingRoom(args.topic, generation);
     // A topic nobody has posted to has no room yet, and a read never provisions one; the empty page
     // an absent room answers with carries a cursor that replays from the room's first visible event.
     if (roomId === undefined) {
@@ -136,27 +130,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
     if (args.since === undefined) {
       return this.recentWindow(roomId, args.topic, limit, generation, undefined);
     }
-
-    const first = await this.fetchSince(roomId, args.topic, args.since, limit, generation);
-
-    // Engage the native long-poll ONLY when asked (blockMs > 0) and the exclusive query came back
-    // empty — otherwise this is the plain durable catch-up.
-    const blockMs = deadline - Date.now();
-    if (blockMs <= 0 || first.messages.length > 0 || this.stopped) {
-      return first;
-    }
-    // Wait on the live `/sync` primitive (the same one `subscribe` uses) up to the budget for a new
-    // belonging event in the room, then re-run the canonical exclusive `/messages` query so the
-    // returned ids/cursor stay canonical. A timeout leaves the empty page + `first`'s cursor.
-    return this.blockingFetch(
-      roomId,
-      args.topic,
-      args.since,
-      limit,
-      blockMs,
-      first.nextCursor,
-      generation,
-    );
+    return this.fetchSince(roomId, args.topic, args.since, limit, generation);
   }
 
   /**
@@ -186,11 +160,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
     // later swallows everything that landed in between, and one read earlier pages back past the
     // position into PRE-subscription history and leaks it as live events.
     let boundary: Boundary | undefined = positionBoundaryOf(positioned, roomId);
-    // Keep this registration after positioning AND behind the staleness gate, so that a concurrent
-    // blocking `fetchRecent` only ever hooks a wake source that is both able to observe its message
-    // and still running — a key added by a loop that has already stood down is a permanent phantom.
     if (this.isStale(generation)) return;
-    this.liveTopics.add(liveKey(roomId, topic));
 
     const loop = async (): Promise<void> => {
       let consecutiveFailures = 0;
@@ -252,7 +222,7 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
           if (this.isStale(generation)) break;
           for (const e of [...recovered, ...events.filter((e) => this.belongs(e, topic))]) {
             boundary = e.event_id;
-            this.deliver(roomId, topic, e, handler);
+            this.deliver(topic, e, handler);
           }
           // Keep the reset here rather than beside the response, so that a `/sync` the loop THROWS
           // on while reading — a malformed-but-parseable body — still counts as a consecutive
@@ -278,11 +248,8 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
     void loop().catch((err: unknown) => reportLoopCrash(topic, err));
   }
 
-  /**
-   * Hand one event to a subscribe handler and wake the long-polls parked on its room. Keep waking
-   * here rather than at the call sites, so that a delivery path added later cannot forget to.
-   */
-  private deliver(roomId: string, topic: Topic, e: MessageEvent, handler: MessageHandler): void {
+  /** Hand one event to a subscribe handler. */
+  private deliver(topic: Topic, e: MessageEvent, handler: MessageHandler): void {
     const message = eventToMessage(topic, e);
     try {
       // Keep the returned value attached rather than awaited, so that an `async` handler — which the
@@ -291,11 +258,6 @@ export class MatrixPlugin extends MatrixParking implements BackendPlugin {
       void Promise.resolve(handler(message)).catch(() => undefined);
     } catch {
       /* handler is best-effort; never break the loop (DESIGN §6) */
-    }
-    const set = this.waiters.get(roomId);
-    if (set === undefined) return;
-    for (const waiter of [...set]) {
-      if (waiter.topic === topic) waiter.wake();
     }
   }
 

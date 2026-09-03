@@ -104,10 +104,7 @@ function seed(topic: string, content: string): void {
 }
 
 /** Every place the live path issues a cursor-windowed read and swallows its failure. */
-type Site =
-  | 'the drain a NOTIFY starts'
-  | 'the re-drain the listener reconnect starts'
-  | "a blocking waiter's snapshot re-check";
+type Site = 'the drain a NOTIFY starts' | 'the re-drain the listener reconnect starts';
 
 type Outage = 'one read' | 'three reads' | 'until the server recovers';
 /**
@@ -135,19 +132,10 @@ interface Cell {
   doorbell: Doorbell;
 }
 
-/**
- * The waiter's re-check is issued exactly ONCE per wait and has no doorbell of its own to coalesce
- * — waiters.test.ts owns every way a ring reaches a parked fetch — so it carries neither dimension.
- */
 const CELLS: Cell[] = [
   ...(['the drain a NOTIFY starts', 'the re-drain the listener reconnect starts'] as Site[]).flatMap(
     (site) => OUTAGES.flatMap((outage) => DOORBELLS.map((doorbell) => ({ site, outage, doorbell }))),
   ),
-  {
-    site: "a blocking waiter's snapshot re-check",
-    outage: 'one read',
-    doorbell: 'no doorbell ever rings again',
-  },
 ];
 
 function armOutage(cell: Cell): void {
@@ -204,31 +192,7 @@ describe('a transient read failure on the push path is recovered from, not dropp
       const plugin = new PostgresPlugin();
       await plugin.connect({ url: URL, table_name: 'parley_sh' });
       const got: Message[] = [];
-      const waiterPage: Message[][] = [];
       try {
-        if (cell.site === "a blocking waiter's snapshot re-check") {
-          // The wait's own re-check is the SECOND windowed read (the first is fetchRecent's initial
-          // exclusive query). Park it, so the row and the outage are both in place before it runs.
-          state.gateRead = 2;
-          state.gate = new Promise<void>((resolve) => {
-            state.releaseGate = resolve;
-          });
-          const parked = plugin
-            .fetchRecent({ topic, since: asCursor('0'), blockMs: 500 })
-            .then((page) => {
-              waiterPage.push(page.messages);
-            });
-          await until(() => state.reads >= 2);
-          seed(String(topic), 'lost');
-          armOutage(cell);
-          state.releaseGate?.();
-          await parked;
-          expect(waiterPage[0]?.map((m) => m.content), 'the blocked fetch never saw the row').toEqual(
-            ['lost'],
-          );
-          return;
-        }
-
         await plugin.subscribe(topic, (m) => got.push(m));
         // The subscribe's own drain must settle before the outage is armed, so the read this cell
         // fails is the one its site names.

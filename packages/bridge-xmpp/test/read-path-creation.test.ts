@@ -56,11 +56,6 @@ const calls: Call[] = [
     mayCreate: false,
     run: (plugin, topic) => plugin.fetchRecent({ topic, since: asCursor(''), limit: 10 }),
   },
-  {
-    name: 'fetchRecent long-polling',
-    mayCreate: false,
-    run: (plugin, topic) => plugin.fetchRecent({ topic, since: asCursor(''), blockMs: 400 }),
-  },
 ];
 
 const existences = [

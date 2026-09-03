@@ -7,7 +7,7 @@
  */
 import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { expect } from 'vitest';
-import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
+import { SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -83,30 +83,12 @@ export function deliver(fake: FakeSlack, topic: Topic | string, text: string): v
 }
 
 /**
- * Native long-polls the plugin still has parked, read off the registry itself because the seam has
- * no surface for it. A settled `fetchRecent({blockMs})` must leave none: a waiter that outlives its
- * call holds a live timer and is iterated by every later live event on that channel, and NOTHING
- * else in the suite can observe either — the registry's two lifecycle guards were both deletable
- * with the suite green.
+ * The reconnect loop, wherever the plugin composes it. Read by name because the seam exposes it
+ * nowhere, so keep the lookup FAILING LOUDLY when a name moves — a probe that silently reads
+ * `undefined` grades nothing while staying green.
  */
-export function parkedWaiters(plugin: SlackPlugin): number {
-  const { waiters } = internals(plugin);
-  expect(waiters, 'the waiter registry moved; re-anchor parkedWaiters on it').toBeInstanceOf(Map);
-  return [...waiters.values()].reduce((total, set) => total + set.size, 0);
-}
-
-/**
- * The registry and the reconnect loop, wherever the plugin composes them. Both are read by name
- * because the seam exposes neither, so keep the lookup FAILING LOUDLY when a name moves — a probe
- * that silently reads `undefined` grades nothing while staying green.
- */
-export function internals(plugin: SlackPlugin): {
-  waiters: Map<string, Set<unknown>>;
-  reconnect: () => Promise<void>;
-} {
-  const { link } = plugin as unknown as {
-    link: { waiters: Map<string, Set<unknown>>; reconnect: () => Promise<void> };
-  };
+export function internals(plugin: SlackPlugin): { reconnect: () => Promise<void> } {
+  const { link } = plugin as unknown as { link: { reconnect: () => Promise<void> } };
   expect(link, 'SlackPlugin no longer composes a link; re-anchor the internals probe').toBeDefined();
   return link;
 }
@@ -137,20 +119,4 @@ export async function settleWithin<T>(
   return Promise.race([captured, sleep(ms).then(() => pending)]);
 }
 
-/**
- * The degradation ladder a blocked `fetchRecent` re-reads history on, derived from the plugin's OWN
- * exported constants rather than restated: rung starts, in ms from the moment the block began. Both
- * the latency grading in `blocking-fetch.test.ts` and the README's cost claim are computed from
- * this, so a reshaped ladder moves the tests and the prose together.
- */
-export function rungStarts(blockMs: number): number[] {
-  const starts = [0];
-  let at = 0;
-  let width = DIAL_BACKOFF_MS;
-  while (at < blockMs) {
-    at += width;
-    starts.push(at);
-    width = Math.min(width * 2, MAX_DIAL_BACKOFF_MS);
-  }
-  return starts;
-}
+

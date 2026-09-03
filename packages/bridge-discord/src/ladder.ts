@@ -25,16 +25,15 @@ export const INVALID_SESSION_SPREAD_MS = 4000;
 /** Rejects openSocket with this to tell the reconnect loop the close was terminal — do NOT retry. */
 export class TerminalGatewayCloseError extends Error {}
 
-/** What the gateway calls back into: the plugin's stopped flag and its two dispatch sinks. */
+/** What the gateway calls back into: the plugin's stopped flag and its dispatch sink. */
 export interface GatewayHost {
   isStopped: () => boolean;
   onMessage: (m: DiscordMessage) => void;
-  onSocketGone: () => void;
 }
 
 /**
  * The IDENTIFY budget every dial is paced by: one backoff ladder, one "not before" clock, and the
- * readiness memo both the live path and the blocking long-poll await.
+ * readiness memo the live path awaits.
  */
 export abstract class GatewayLadder {
   /** Resolves once the gateway is IDENTIFYed and READY; first subscribe awaits it. */
@@ -84,10 +83,9 @@ export abstract class GatewayLadder {
   }
 
   /**
-   * Open the socket if it isn't up yet, and await READY — one memo for the live path and the
-   * blocking long-poll alike, so the wait hooks the SAME connection. Keep a failed dial CLEARING
-   * that memo, so that it cannot wedge every later caller on a rejected promise; the ladder it
-   * joins is what paces the retry.
+   * Open the socket if it isn't up yet, and await READY — one memo, so every caller hooks the SAME
+   * connection. Keep a failed dial CLEARING that memo, so that it cannot wedge every later caller on
+   * a rejected promise; the ladder it joins is what paces the retry.
    */
   async ensureUp(): Promise<void> {
     if (this.fatal !== undefined) throw this.fatal;
@@ -139,9 +137,9 @@ export abstract class GatewayLadder {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.host.isStopped() || epoch !== this.epoch) return;
-      // Keep the memo assigned on the SAME tick as the dial, so that a re-entrant caller (core's
-      // 250 ms long-poll fallback) landing after this fired joins this socket instead of opening a
-      // second one; one landing before it is refused by ensureUp against `reconnectTimer`.
+      // Keep the memo assigned on the SAME tick as the dial, so that a re-entrant caller landing
+      // after this fired joins this socket instead of opening a second one; one landing before it
+      // is refused by ensureUp against `reconnectTimer`.
       const attempt = this.dial(epoch).catch((err: unknown) => {
         if (epoch === this.epoch) this.ready = undefined;
         if (!(err instanceof TerminalGatewayCloseError)) this.scheduleReconnect(epoch);
