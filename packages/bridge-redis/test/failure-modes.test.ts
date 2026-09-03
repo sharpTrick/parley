@@ -283,7 +283,7 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
     ['a refusal quoting its arguments', true],
   ];
 
-  const rows = refusals.flatMap(([code, text]) =>
+  const rows = refusals.flatMap(([code]) =>
     arrivals.flatMap(([arrival, refuses]) =>
       echoes.map(
         ([echo, echoesArgs]) =>

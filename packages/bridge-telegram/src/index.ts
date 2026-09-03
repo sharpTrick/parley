@@ -201,7 +201,7 @@ export class TelegramPlugin implements BackendPlugin {
    */
   async post(
     topic: Topic,
-    identity: Handle,
+    _identity: Handle,
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {

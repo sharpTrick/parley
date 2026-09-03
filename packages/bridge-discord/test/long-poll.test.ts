@@ -262,7 +262,7 @@ describe('Discord long-poll: a wakeup arriving', () => {
         // it is already in — a SECOND HELLO would be answered by ending the socket, since one
         // IDENTIFY per socket is what keeps a repeating peer off Discord's per-token quota.
         label: 'while the gateway handshake is still completing',
-        drive: async (p, call) => {
+        drive: async (_p, call) => {
           let identifying: FakeWs | undefined;
           state.onIdentify = (s: FakeWs) => {
             identifying = s;

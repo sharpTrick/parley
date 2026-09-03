@@ -4,8 +4,6 @@ import { parseConfig } from '../config.js';
 import {
   asBackendMsgId,
   asCursor,
-  asHandle,
-  asTopic,
   type BackendMsgId,
   type Handle,
   type Message,

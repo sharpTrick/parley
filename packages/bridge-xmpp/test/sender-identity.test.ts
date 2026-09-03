@@ -2,14 +2,13 @@ import { asHandle, asTopic, type Handle } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 
 // Class: a `senderHandle` that is a per-CONNECTION token rather than the bridge's logical identity.
-// DESIGN §5 defines senderHandle as the logical sender, and core keys the parley_list_users roster
-// (computeRoster, engine/presence.ts) on exactly that field — the presence record body carries no
-// handle of its own. A backend whose sender is regenerated per process therefore reports a handle
-// nobody can hand work off to, AND accumulates one phantom roster entry per restart for the whole
-// since_ms window. The table crosses every way this bridge comes back (a fresh process on the same
-// config, a stream reconnect) with every way its occupant identity can be configured, and demands
-// of each that the archive attributes both beats to ONE handle, and that the handle is the
-// configured identity rather than a token.
+// DESIGN §5 defines senderHandle as the logical sender, and it is what core puts in agent context
+// and on the `<channel>` event's `sender` meta key. A backend whose sender is regenerated per
+// process therefore reports a handle nobody can hand work off to, and a new one after every
+// restart. The table crosses every way this bridge comes back (a fresh process on the same config,
+// a stream reconnect) with every way its occupant identity can be configured, and demands of each
+// that the archive attributes both messages to ONE handle, and that the handle is the configured
+// identity rather than a token.
 
 // Keep the real client reachable when no fake is installed, so that the live row below (and the
 // reachability probe that gates it) still talks to a real server from this same file.
@@ -75,7 +74,7 @@ const beats = async (row: Row): Promise<string[]> => {
 describe('XMPP attributes a bridge to one stable handle across a restart', () => {
   it.each(rows)('$restart, $config', async (row) => {
     const handles = await beats(row);
-    // One roster entry, not one per process — and the entry an operator can address.
+    // One handle, not one per process — and the handle an operator can address.
     expect(new Set(handles).size).toBe(1);
     expect(handles[0]).toBe(row.expected);
   });

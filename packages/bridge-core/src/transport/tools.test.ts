@@ -266,7 +266,7 @@ describe('a result-returning tool bounds the page it hands back, not only the on
     const { tools } = await client.listTools();
     expect(
       tools
-        .filter((t) => /Returns \{ (?:messages|users)/.test(t.description ?? ''))
+        .filter((t) => /Returns \{ messages/.test(t.description ?? ''))
         .map((t) => t.name)
         .sort(),
     ).toEqual(['parley_fetch_recent']);

@@ -119,11 +119,15 @@ export abstract class DiscordSession {
     if (!this.connected) throw new Error('DiscordPlugin not connected — call connect() first');
   }
 
-  /** The ladder state, forwarded under the names the gateway suites read off the PLUGIN. */
-  private get reconnectAttempts(): number {
+  /**
+   * The ladder state, forwarded under the names the gateway suites read off the PLUGIN. Keep these
+   * `protected` rather than `private`, so that noUnusedLocals does not read them as dead: the only
+   * callers reach them at runtime through an `as unknown as` cast, which the compiler cannot see.
+   */
+  protected get reconnectAttempts(): number {
     return this.gateway.reconnectAttempts;
   }
-  private get heartbeats(): ReadonlySet<NodeJS.Timeout> {
+  protected get heartbeats(): ReadonlySet<NodeJS.Timeout> {
     return this.gateway.heartbeats;
   }
 }

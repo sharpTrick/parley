@@ -227,7 +227,7 @@ describe('orphaned stdio bridge exits on stdin EOF (e2e)', () => {
 
     if (result === 'timeout') {
       child.kill('SIGKILL');
-      throw new Error('CLI did not exit on stdin EOF within 5s — it kept heart-beating (ghost peer)');
+      throw new Error('CLI did not exit on stdin EOF within 5s — its poll loop kept the process alive');
     }
     // Exited with no signal → it ran its own clean shutdown() from the EOF handler.
     expect(result.signal).toBeNull();

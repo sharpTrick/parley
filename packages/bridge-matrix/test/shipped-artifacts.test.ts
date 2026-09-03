@@ -78,17 +78,24 @@ describe('the shipped multi-session configs deploy as documented', () => {
   const sharedRooms = (a: ShippedConfig, b: ShippedConfig): string[] =>
     a.topics.filter((t) => b.topics.includes(t));
 
-  it.each(
-    configs.flatMap((creator) =>
-      configs
-        .filter((peer) => peer !== creator && sharedRooms(creator, peer).length > 0)
-        .map((peer): [string, ShippedConfig, ShippedConfig] => [
-          `${creator.file} shares ${sharedRooms(creator, peer).join(', ')} with ${peer.file}`,
-          creator,
-          peer,
-        ]),
-    ),
-  )('%s, so it invites it', (_name, creator, peer) => {
+  const coHabiting = configs.flatMap((creator) =>
+    configs
+      .filter((peer) => peer !== creator && sharedRooms(creator, peer).length > 0)
+      .map((peer): [string, ShippedConfig, ShippedConfig] => [
+        `${creator.file} shares ${sharedRooms(creator, peer).join(', ')} with ${peer.file}`,
+        creator,
+        peer,
+      ]),
+  );
+
+  it('finds shipped configs that share a room (guards against grading nothing)', () => {
+    expect(
+      coHabiting.length,
+      'no two shipped configs share a topic, so the mutual-invite rule below grades nothing',
+    ).toBeGreaterThan(0);
+  });
+
+  it.each(coHabiting)('%s, so it invites it', (_name, creator, peer) => {
     expect(creator.backend.invite ?? []).toContain(mxidOf(peer));
   });
 });

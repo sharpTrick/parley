@@ -14,7 +14,7 @@
  * what) or is dropped. The field list is read out of the interface itself: a field added to
  * `SlackMessage` without a row here fails the coverage case rather than slipping through ungraded.
  */
-import { asCursor, asTopic, type Message, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { SlackPlugin } from '../src/index.js';
 import type { FakeSlack } from './fake-slack.js';

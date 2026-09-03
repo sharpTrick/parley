@@ -17,14 +17,6 @@ import type { Topic } from './message.js';
 export const MIN_HASH_LEN = 10;
 
 /**
- * Cap the length of a topic name the loader accepts. A topic arrives as a bare `z.string()` from an
- * MCP client, and every one of them becomes a map key, a subscription registry entry, and an
- * interpolation in an operator diagnostic — so keep it bounded here, where it is DECLARED, rather
- * than at each of those sinks. A real topic name is short.
- */
-export const MAX_TOPIC_LEN = 512;
-
-/**
  * Width {@link safeName} mints when `hashLen` is omitted — which is every shipped backend, so this
  * is the number a deployment actually runs on. It is a security parameter, not a formatting choice.
  *

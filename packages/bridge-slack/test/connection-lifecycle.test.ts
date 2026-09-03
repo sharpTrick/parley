@@ -403,7 +403,7 @@ describe('slack teardown racing an in-flight connect', () => {
   }
 
   it('a socket that never says hello bounds subscribe and every blocking fetch on its own', async () => {
-    const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0SILENT'], greet: 'silent' });
+    const { plugin, cleanup } = await startPlugin({ channels: ['C0SILENT'], greet: 'silent' });
     const topic = asTopic('C0SILENT');
     try {
       // The long-poll's own budget, not the handshake's, is what a blocked fetch_recent observes —

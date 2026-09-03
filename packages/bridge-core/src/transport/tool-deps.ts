@@ -1,7 +1,7 @@
 import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
 import type { SeenSet } from '../engine/seen-set.js';
-import { asHandle, asTopic, type Handle, type Topic } from '../message.js';
+import { asHandle, type Handle } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
 
 /** Dependencies the reactive/reply tools close over. */

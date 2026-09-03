@@ -1,8 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
+import { parseConfig } from '../config.js';
+import { FakePlugin } from '../testing/fake-plugin.js';
 import { toolClient } from '../testing/tool-harness.js';
+import { buildBridge } from './stdio-bridge.js';
 
 /**
  * The package README's tool table is the surface an operator reads before wiring an agent, and it
@@ -91,5 +95,41 @@ describe('a post_topics-matched topic is accepted by every allowlist-gated tool'
     const stranger = await client.callTool({ name, arguments: argsFor(STRANGER) });
     expect(stranger.isError).toBe(true);
     expect(JSON.stringify(stranger.content)).toContain('topic not allowed');
+  });
+});
+
+/**
+ * The channel instructions are the prose Claude Code pastes into a session's system prompt, so a
+ * tool they name that is not registered sends the model at a call that cannot resolve, and a tool
+ * they omit is one the model never learns it has. Removing a tool once left its sentence behind.
+ * Read both sides off a live bridge — the instructions the server advertises and the tools it
+ * registers — so neither can be restated here and drift.
+ */
+describe('the channel instructions name exactly the registered tools', () => {
+  async function liveBridge(): Promise<{ client: Client; shutdown: () => Promise<void> }> {
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: LISTED,
+      catchup: { on_start: false },
+      live_push: { enabled: false },
+    });
+    const bridge = await buildBridge(new FakePlugin(), cfg);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
+    await Promise.all([bridge.attach(serverT), client.connect(clientT)]);
+    return { client, shutdown: () => bridge.shutdown() };
+  }
+
+  it('names every registered tool, and names nothing else', async () => {
+    const { client, shutdown } = await liveBridge();
+    try {
+      const named = [...new Set((client.getInstructions() ?? '').match(/parley_[a-z_]+/g) ?? [])];
+      const registered = (await client.listTools()).tools.map((t) => t.name);
+
+      expect(named.length, 'the instructions name no tool at all').toBeGreaterThan(0);
+      expect(named.sort()).toEqual([...registered].sort());
+    } finally {
+      await shutdown();
+    }
   });
 });

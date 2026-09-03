@@ -28,8 +28,8 @@ export type Cursor = Brand<string, 'Cursor'>;
 export const asTopic = (s: string): Topic => s as Topic;
 /**
  * Cap the length of a {@link Handle}. The configured handle is written into the sender field of
- * every message this bridge posts, and into the read-state path on disk, so an unbounded string
- * would reach both the wire and the filesystem. A real handle is short.
+ * every message this bridge posts, so an unbounded string would reach the wire. A real handle is
+ * short.
  */
 export const MAX_HANDLE_LEN = 128;
 

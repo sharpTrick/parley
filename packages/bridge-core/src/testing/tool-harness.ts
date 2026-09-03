@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asHandle, asTopic } from '../message.js';
+import { asHandle } from '../message.js';
 import { registerTools, toolDepsFor, type ToolDeps } from '../transport/tools.js';
 import { FakePlugin } from './fake-plugin.js';
 

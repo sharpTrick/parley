@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { allowlistFor } from './allowlist.js';
 import {
   ConfigSchema,
   instanceIdOf,
@@ -580,8 +579,8 @@ describe('config rejects a degenerate number in any numeric field', () => {
     expect(() => parseConfig(withValue(leaf, -1))).toThrow();
   });
 
-  // The fixture's own value plus a half, so that a cross-field rule (ttl_ms >= heartbeat_ms) still
-  // holds and `.int()` is the only thing left that can reject the row.
+  // The fixture's own value plus a half, so that every range bound the field carries still holds
+  // and `.int()` is the only thing left that can reject the row.
   it.each(leaves.map((l) => [l.label, l] as const))(
     'rejects %s set to a fraction',
     (_label, leaf) => {
@@ -671,11 +670,11 @@ describe('mention_filter requires a mentionable handle', () => {
 });
 
 // This module refuses `permissions.skip_permissions: true` and every unknown key on one argument:
-// a setting nothing reads leaves the operator with a bridge that quietly does nothing. A knob that
-// is only read under ANOTHER knob is the same argument one level in, so grade the pairs as a class —
-// a knob is legal beneath a disabled enabler only if something still reads it. `probe` is what does
-// the reading; a pair with nothing behind it can only pass by being a load error.
-describe('a knob is never accepted beneath a disabled enabler unless something reads it', () => {
+// a setting nothing reads leaves the operator with a bridge that quietly does nothing.
+// `live_push.mention_filter` is that argument one level in: nothing reads it while
+// `live_push.enabled` is off, so it has to be a LOAD ERROR there rather than an accepted no-op.
+// `probe` is what establishes that nothing reads it — the row can only pass by being refused.
+describe('live_push.mention_filter is refused beneath a disabled live_push.enabled', () => {
   interface DependentKnob {
     path: readonly string[];
     base: Record<string, unknown>;
@@ -705,7 +704,7 @@ describe('a knob is never accepted beneath a disabled enabler unless something r
       ...extra,
     });
 
-  it('pins the pairs and keeps one with no reader behind it', () => {
+  it('pins the knob and confirms nothing reads it while the enabler is off', () => {
     expect(KNOBS.map(([label]) => label)).toEqual([
       'live_push.mention_filter under live_push.enabled',
     ]);

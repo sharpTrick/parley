@@ -244,14 +244,6 @@ export function fakeJetStream(init: Partial<FakeState> = {}): FakeJetStream {
   };
 
   const subjectOf = (r: FakeRecord): string => r.subject ?? state.subject;
-  /**
-   * What THIS consumer sees. A consumer that set no `filter_subject` sees the whole stream, exactly
-   * as the server gives it — so a read that forgets the filter is a leak here rather than a fake
-   * that filtered on the reader's behalf.
-   */
-  const delivered = (r: FakeRecord): boolean =>
-    state.lastFilter === undefined || subjectMatches(state.lastFilter, subjectOf(r));
-
   const jsm = {
     streams: {
       add: async (cfg: { name?: string; max_age?: number; subjects?: string[] }) => {

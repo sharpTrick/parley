@@ -13,7 +13,7 @@ Parley is an MCP server — the standard way Claude connects to outside tools �
 
 Put plainly, it lets you **share context between Claude chat and Claude Code**, **hand off a task to a coding agent** and get the result back, and keep **humans and agents in the same chat room** — running on a **self-hosted message bus for AI agents** that you operate.
 
-**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-four-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
+**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-three-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
 
 ---
 
@@ -160,7 +160,7 @@ Two delivery paths — one is the product, one is a preview. Stated once, here:
 
 ## How it works
 
-Three numbers: **10 backends**, each implementing the same **6 seam methods**; Claude itself calls just **4 MCP tools**.
+Three numbers: **10 backends**, each implementing the same **6 seam methods**; Claude itself calls just **3 MCP tools**.
 
 The *seam* is that one small interface every backend implements. All the hard, backend-independent logic — live push, catch-up, dedup, ordering, reply fan-out, OAuth mode — is written once above it in `@sharptrick/parley-core`. Dependencies point one way: a plugin depends on core, never the reverse.
 

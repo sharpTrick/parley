@@ -1,4 +1,4 @@
-import { MAX_TOPIC_LEN } from '../topic-name.js';
+import { MAX_TOPIC_LEN } from '../config.js';
 import { MAX_MATCH_INPUT } from '../regex-safety.js';
 
 /**

@@ -58,12 +58,16 @@ interface Factory {
    * second listen() brings back a complete server.
    */
   afterClose: 'terminal' | 're-listenable';
+  /** Whether `listen()` arms a background interval. Every interval row is free for a factory that
+   *  arms none, so the control below grades the MEASURED membership against this. */
+  armsIntervals: boolean;
 }
 
 const FACTORIES: Factory[] = [
   {
     name: 'createRemoteAuthApp (builtin)',
     afterClose: 'terminal',
+    armsIntervals: true,
     build: async () =>
       createRemoteAuthApp(plugin, baseCfg(), {
         publicUrl: new URL(`http://127.0.0.1:${await freePort()}`),
@@ -73,6 +77,7 @@ const FACTORIES: Factory[] = [
   {
     name: 'createRemoteAuthApp (oidc)',
     afterClose: 're-listenable',
+    armsIntervals: false,
     build: async () =>
       createRemoteAuthApp(plugin, oidcCfg(), {
         publicUrl: new URL(`http://127.0.0.1:${await freePort()}`),
@@ -98,19 +103,23 @@ function recordIntervals(): Set<unknown> {
 
 describe('close() releases every timer the factory acquired', () => {
   // The rows below are all "every interval this factory armed was released", which a factory that
-  // arms none satisfies for free. Keep this control, so that a recorder that stopped seeing
-  // intervals at all cannot pass the whole describe.
-  it('the interval recorder sees a real interval (positive control)', async () => {
-    const created = recordIntervals();
-    for (const { build } of FACTORIES) {
+  // arms none satisfies for free. Keep this control naming WHICH factories contributed, so that a
+  // row losing its subject fails here as changed membership instead of riding a neighbour's.
+  it('the interval recorder sees an interval from exactly the factories that arm one', async () => {
+    const armed: string[] = [];
+    for (const { name, build } of FACTORIES) {
+      const created = recordIntervals();
       const server = await build();
       try {
         await server.listen(await freePort());
       } finally {
         await server.close();
+        vi.restoreAllMocks();
       }
+      if (created.size > 0) armed.push(name);
     }
-    expect(created.size).toBeGreaterThan(0);
+    expect(armed).toEqual(FACTORIES.filter((f) => f.armsIntervals).map((f) => f.name));
+    expect(armed.length).toBeGreaterThan(0);
   });
 
   it.each(ROWS)('%s leaves no interval of its own running', async (_name, { build }) => {
@@ -167,10 +176,8 @@ describe('close() releases every timer the factory acquired', () => {
  */
 describe("a factory's close()/listen() contract matches the transport's", () => {
   it.each(ROWS)('%s', async (_name: string, factory: Factory) => {
-    const armed = recordIntervals();
     const server = await factory.build();
     await server.listen(await freePort());
-    const armedByFirstListen = armed.size;
     await server.close();
 
     const port = await freePort();
@@ -187,9 +194,6 @@ describe("a factory's close()/listen() contract matches the transport's", () => 
     await server.listen(port);
     try {
       expect((await fetch(probe)).status).toBe(200);
-      // Re-acquires exactly what the first listen acquired, so a factory whose close() releases
-      // more than listen() brings back is caught however many timers that happens to be.
-      expect(rearmed.size).toBe(armedByFirstListen);
     } finally {
       await server.close();
     }

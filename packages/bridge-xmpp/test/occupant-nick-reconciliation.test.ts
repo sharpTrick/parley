@@ -66,7 +66,7 @@ const events: Event[] = [
   {
     name: 'a stream reconnect re-joins every room',
     enter: postEach,
-    fire: async (plugin, fake) => {
+    fire: async (_plugin, fake) => {
       const before = fake.sent.filter((s) => s.is('presence')).length;
       fake.emit('online'); // consumed by the first-online guard
       fake.emit('online'); // the reconnect

@@ -431,6 +431,8 @@ notes MAM); re-scan prior art by function (DESIGN §17); update the main README 
   method**. Offline-aware roster, instance-scoped liveness, beats advertise `post_topics` reach,
   records versioned. Note it is **on by default and writes to the configured backend** — on a real
   Matrix/Zulip account that is a room created on first beat.
+  **Removed since:** presence, the roster and `parley_list_users` no longer ship; the paragraph above
+  describes a feature the code no longer has.
 - **71-finding audit remediation** (#16) across core and every backend.
 - **`block_ms`** (#21): long-poll on `fetchRecent`, native on nine backends with a generic fallback
   in core for SQLite. The seam gained one optional field and core learned no backend names — a

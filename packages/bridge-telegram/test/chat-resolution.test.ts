@@ -8,8 +8,8 @@ import { captureStderr, connectFresh, SENDER, startFake } from './rig.js';
  * the whole connection, so one transient `getChat` failure would otherwise make an
  * `@channelusername` topic permanently unresolvable: every post, subscribe and catch-up on it
  * rejects for the life of the connection, so the only symptom is a topic that is silently never
- * delivered. Each cell fails the resolution ONCE and
- * then repeats the identical call on the same instance.
+ * delivered. Each cell fails the resolution ONCE and then repeats the identical call on the same
+ * instance.
  */
 describe('telegram transient resolution failures', () => {
   const FAILURES = [

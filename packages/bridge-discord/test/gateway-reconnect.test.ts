@@ -1,4 +1,4 @@
-import { asCursor, asTopic, type MessageHandler, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 
 // The reconnect storm that resets the bot token and the undetected half-dead socket both live in

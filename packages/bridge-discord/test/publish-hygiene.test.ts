@@ -14,11 +14,6 @@ const tsconfig = JSON.parse(readFileSync(join(pkgDir, 'tsconfig.json'), 'utf8'))
   include?: string[];
   exclude?: string[];
 };
-const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as {
-  license?: string;
-  files?: string[];
-};
-
 function sourcesUnder(dir: string, prefix = ''): string[] {
   return readdirSync(join(pkgDir, dir), { withFileTypes: true }).flatMap((e) =>
     e.isDirectory()

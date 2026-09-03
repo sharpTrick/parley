@@ -6,7 +6,7 @@ import { Allowlist, TopicNotAllowedError } from './allowlist.js';
 import { MAX_CLIENTS, MAX_PENDING, shedCrowdedest } from './auth/eviction.js';
 import { ParleyOAuthProvider } from './auth/oauth-provider.js';
 import { DISCOVERY_TIMEOUT_MS, fetchOidcDiscovery } from './auth/oidc-discovery.js';
-import { MAX_BLOCK_MS, MAX_POST_TOPICS, MAX_TOPICS, parseConfig } from './config.js';
+import { MAX_BLOCK_MS, MAX_POST_TOPICS, MAX_TOPIC_LEN, MAX_TOPICS, parseConfig } from './config.js';
 import { catchUpTopic, MAX_CATCHUP_PAGES } from './engine/catchup.js';
 import { ReadStateStore } from './engine/read-state.js';
 import { SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, SeenSet } from './engine/seen-set.js';
@@ -20,17 +20,11 @@ import {
 import { FakePlugin } from './testing/fake-plugin.js';
 import { harness } from './testing/tool-harness.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
-import {
-  DEFAULT_HASH_LEN,
-  MAX_HASH_LEN,
-  MAX_TOPIC_LEN,
-  MIN_HASH_LEN,
-  safeName,
-} from './topic-name.js';
+import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 import { MAX_FETCH_LIMIT } from './transport/tools.js';
 
-// Every limit below is documented as INCLUSIVE — "at most 64 characters", "must be >= the
-// heartbeat", "an integer in [10, 40]" — and each is stated in an error message the operator reads.
+// Every limit below is documented as INCLUSIVE — "at most 64 characters", "an integer in [10, 40]"
+// — and each is stated in an error message the operator reads.
 // A table that samples one interior value on each side leaves the equality case free, and the
 // equality case is where a one-character regression lands: it refuses a legal input with a message
 // that contradicts itself ("at most 64 characters (this one is 64)"), and it locks an operator out
@@ -221,8 +215,6 @@ interface Capacity {
    */
   refusesPast?: () => boolean | Promise<boolean>;
 }
-
-const NOW = 1_700_000_000_000;
 
 /** True when the call is REFUSED — an enforcement point that throws rather than silently widening. */
 function refused(call: () => unknown): boolean {

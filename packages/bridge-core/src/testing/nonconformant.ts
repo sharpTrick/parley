@@ -86,7 +86,7 @@ export const NONCONFORMANT_SHAPES: Record<string, NonconformantShape> = {
     drains: 6_000,
   },
   'an empty page carrying a fresh cursor every call': {
-    serve: (a, call) => ({ messages: [], nextCursor: asCursor(`fresh-${call}`) }),
+    serve: (_a, call) => ({ messages: [], nextCursor: asCursor(`fresh-${call}`) }),
     drains: 0,
   },
   'a history API that caps its page below the requested limit': {

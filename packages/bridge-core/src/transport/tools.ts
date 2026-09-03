@@ -202,5 +202,4 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       return textResult({ backendMsgId: id });
     },
   );
-
 }

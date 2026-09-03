@@ -86,8 +86,8 @@ The room alias is **deterministic** (`#parley_<sanitizedTopic>:<server_name>`) a
 guessable, and Synapse federates by default. Note that `visibility: 'private'` only hides a room
 from the **room directory** — it does not restrict joins; the **join rule** does. So topic rooms are
 created with `preset: private_chat` → `join_rule: invite`: an uninvited account cannot read a
-topic's history, and cannot post messages that core would deliver into a live Claude Code session as
-`<channel>` events (the prompt-injection surface DESIGN §14 says to minimize).
+topic's history, and cannot post messages that core would deliver into a live Claude Code session
+as `<channel>` events (the prompt-injection surface DESIGN §14 says to minimize).
 
 Bring the accounts you *do* want in via `invite`. Set `room_preset: public_chat` only when you
 deliberately want a room anyone on the homeserver can join.

@@ -1,4 +1,4 @@
-import { asCursor, asTopic, type FetchRecentResult, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asTopic, type FetchRecentResult } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // CLASS: a seam call that resumes into the session that REPLACED the one it was made in. `stopped`

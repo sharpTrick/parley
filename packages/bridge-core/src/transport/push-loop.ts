@@ -22,9 +22,9 @@ export interface PushLoopOptions {
  *
  * Step 1 is a trust boundary, not a redundancy: `m.topic` is plugin-supplied and lands in the
  * agent's context, while a backend's subscribe primitive can be COARSER than a topic (a NATS
- * wildcard subject, a Matrix room carrying several logical topics). Re-checking it here is what makes
- * "the bridge only ever surfaces the topics it was configured for"
- * (DESIGN §14) hold structurally rather than depend on every plugin's care.
+ * wildcard subject, a Matrix room carrying several logical topics). Re-checking it here is what
+ * makes "the bridge only ever surfaces the topics it was configured for" (DESIGN §14) hold
+ * structurally rather than depend on every plugin's care.
  *
  * The plugin owns the delivery mechanism (poll loop for SQLite; blocking events later); core's
  * emit path is identical across mechanisms, so push developed against polling exercises the

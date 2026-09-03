@@ -214,10 +214,10 @@ server — all pointed at the same workspace:
 
 - **`bot_token` / `app_token`** — **give every push-capable session its own Slack app** (its own
   `app_token`; a second bot user inside one app is **not** enough — see the routing note below).
-  Slack stamps the posting bot as the sender and `post` cannot override it, so
-  sessions sharing one bot token are indistinguishable on read-back: every session's messages arrive
-  under the one bot id, so neither a human reading the channel nor an agent reasoning over
-  `senderHandle` in its context can tell which session spoke. Socket Mode allows ~10 concurrent connections per app
+  Slack stamps the posting bot as the sender and `post` cannot override it, so sessions sharing one
+  bot token are indistinguishable on read-back: every session's messages arrive under the one bot
+  id, so neither a human reading the channel nor an agent reasoning over `senderHandle` in its
+  context can tell which session spoke. Socket Mode allows ~10 concurrent connections per app
   token and each plugin instance holds ONE, but the connections are **not** parallel copies of the
   stream: Slack routes each payload to **exactly one** of an app's open connections, with no
   guaranteed pattern. Two sessions sharing an `app_token` therefore each receive an arbitrary subset

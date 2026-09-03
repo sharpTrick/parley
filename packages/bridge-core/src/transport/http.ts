@@ -39,9 +39,8 @@ async function closeQuietly(what: string, target: { close: () => Promise<void> }
  * How long {@link RemoteHttpServer.close} lets an in-flight request finish before its socket is
  * destroyed. Node's `server.close()` waits for every open connection, and a `parley_fetch_recent`
  * long-poll holds one for its whole `catchup.block_max_ms` budget (60 s by default) — past a
- * `docker stop` grace period, so the process is SIGKILLed mid-teardown while the shutdown
- * has already advertised it as gone. The tool layer answers an aborted long-poll with an empty
- * result, so cutting one short is safe.
+ * `docker stop` grace period. The tool layer answers an aborted long-poll with an empty result, so
+ * cutting one short is safe.
  */
 const CLOSE_GRACE_MS = 250;
 
@@ -247,10 +246,9 @@ export function createRemoteHttpApp(
     listen: (port, host = '127.0.0.1') => {
       // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
       // leave the first one bound forever, serving past close(). Latch this SYNCHRONOUSLY rather
-      // than reading
-      // `server.listening`, which stays false for the whole window between `app.listen` and its
-      // `listening` event — two overlapping starts both pass that check. A bind failure clears the
-      // latch, so a failed listen stays retryable.
+      // than reading `server.listening`, which stays false for the whole window between
+      // `app.listen` and its `listening` event — two overlapping starts both pass that check. A
+      // bind failure clears the latch, so a failed listen stays retryable.
       if (starting || httpServer?.listening === true) {
         return Promise.reject(new Error('remote HTTP server already listening'));
       }

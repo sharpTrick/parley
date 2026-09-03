@@ -1,4 +1,4 @@
-import { asHandle, asTopic, MIN_HASH_LEN, type Topic } from '@sharptrick/parley-core';
+import { asHandle, asTopic, MIN_HASH_LEN } from '@sharptrick/parley-core';
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -186,9 +186,9 @@ describe('XMPP identity.handle -> MUC nick fold is total and injective', () => {
   // Class: a seam accessor reporting a backend-native identifier the backend does not actually use.
   // `backendRef` is defined as the XMPP-side name behind a handle, and the fold is LOSSY wherever
   // the handle carries a character a JID resource cannot (`alice@corp.com`) — so answering with the
-  // raw handle hands an operator the one string that will never appear in parley_list_users or as a
-  // senderHandle. Riding the same generator makes any future divergence between the fold and the
-  // accessor a red row rather than just the `@` case.
+  // raw handle hands an operator the one string that will never appear as a senderHandle, and so
+  // never on the `<channel>` event's `sender`. Riding the same generator makes any divergence
+  // between the fold and the accessor a red row rather than just the `@` case.
   it.each(cells)(
     'resolveIdentity of a $len-char $charset handle answers the nick it posts and reads back under',
     async ({ value }) => {

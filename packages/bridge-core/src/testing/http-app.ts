@@ -35,7 +35,6 @@ export const INITIALIZE = JSON.stringify({
   },
 });
 
-
 export function mcpPost(port: number, body: string = INITIALIZE): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers: MCP_HEADERS, body });
 }

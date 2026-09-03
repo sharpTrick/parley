@@ -51,9 +51,6 @@ const valid: Record<string, unknown> = {
 const badStrings: unknown[] = [123, true, null, [], {}, ''];
 const badNumbers: unknown[] = ['50', true, null, [], {}, 0, -1, 1.5, Number.NaN, 20_000];
 
-const label = (v: unknown): string =>
-  typeof v === 'string' ? `'${v}'` : Array.isArray(v) ? '[]' : JSON.stringify(v) ?? String(v);
-
 const wrongValues = CONFIG_KEYS.flatMap((key) =>
   (key === 'mam_page' ? badNumbers : badStrings).map((value) => ({ key, value })),
 );

@@ -1,8 +1,8 @@
 /**
  * Structural ReDoS screening, shared by every path that compiles a regex it did not author:
- * `post_topics` from an operator's config (validated at load), `postTopics` from an untrusted peer's
- * and any {@link Allowlist} an embedder builds by hand. Node's RegExp backtracks, so
- * one hostile or merely careless source can wedge the single-threaded process.
+ * `post_topics` from an operator's config (validated at load), and any {@link Allowlist} an
+ * embedder builds by hand. Node's RegExp backtracks, so one hostile or merely careless source can
+ * wedge the single-threaded process.
  */
 
 /**

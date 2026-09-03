@@ -41,7 +41,7 @@ const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, m
 
 /** Park the subscribe loop the way this case wants, then hand back the plugin. */
 const PARKED_IN = {
-  'an in-flight /sync': async (p: MatrixPlugin) => {
+  'an in-flight /sync': async (_p: MatrixPlugin) => {
     await vi.waitFor(() => expect(fake.syncAttempts.length).toBeGreaterThanOrEqual(3), {
       timeout: 4000,
       interval: 5,

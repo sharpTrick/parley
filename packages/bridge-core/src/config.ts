@@ -12,14 +12,13 @@ import { MAX_HANDLE_LEN } from './message.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
-import { MAX_TOPIC_LEN } from './topic-name.js';
 
 export * from './config-auth.js';
 
 /**
  * Most `topics` one config may carry. Each entry is a live subscription the push loop opens against
- * the backend and an allowlist entry every call is matched against, so this bounds both the fan-out
- * a single bridge asks a backend for and the per-call matching cost.
+ * the backend and an allowlist entry every call is matched against, so this bounds the fan-out a
+ * single bridge asks a backend for.
  */
 export const MAX_TOPICS = 64;
 
@@ -34,16 +33,22 @@ export const MAX_TOPICS = 64;
 export const MAX_POST_TOPICS = 64;
 
 /**
+ * Longest `topics` / `post_topics` entry the loader accepts. This bounds the operator's config, not
+ * the wire: every entry an operator writes becomes a map key, a subscription registry entry and an
+ * interpolation in an operator diagnostic, while a caller-supplied topic is bounded instead by the
+ * ReDoS input clamp on the pattern path and by enum membership on the explicit one. A real topic
+ * name is short.
+ */
+export const MAX_TOPIC_LEN = 512;
+
+/**
  * Longest server-side clamp `catchup.block_max_ms` may name. A blocked `parley_fetch_recent` holds
  * the tool call open for its whole clamp, so a clamp past every configurable MCP client tool timeout
  * turns the long-poll into the client-side timeout the field exists to stay under.
  */
 export const MAX_BLOCK_MS = 300_000;
 
-/**
- * One `topics` / `post_topics` entry. Capped where it is DECLARED rather than at each sink, because
- * a topic name becomes a map key, a subscription registry entry and an operator diagnostic.
- */
+/** One `topics` / `post_topics` entry. */
 const topicString = z.string().min(1).max(MAX_TOPIC_LEN, {
   message: `at most ${MAX_TOPIC_LEN} characters`,
 });
@@ -66,15 +71,15 @@ const ConfigObject = z.object({
   identity: z
     .object({
       handle: z.string().min(1).max(MAX_HANDLE_LEN, {
-        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: it is written into the sender field of every message this bridge posts and into the read-state path on disk`,
+        message: `identity.handle accepts at most ${MAX_HANDLE_LEN} characters: it is written into the sender field of every message this bridge posts`,
       }),
     })
     .strict(),
   /**
    * Topics to subscribe to / catch up on. THIS IS THE ALLOWLIST (DESIGN §14). Capped because each
    * entry is a live subscription the push loop opens against the backend AND an allowlist entry
-   * every `post`/`fetch_recent` is matched against, so the count bounds both fan-out and per-call
-   * matching cost.
+   * every `post`/`fetch_recent` is matched against, so the count bounds the fan-out a single bridge
+   * asks for.
    */
   topics: z
     .array(topicString)
