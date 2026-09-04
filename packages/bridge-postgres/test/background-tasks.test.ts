@@ -6,13 +6,13 @@ import { fakePool } from './fake-pg.js';
 import { sleep } from './pg-harness.js';
 
 // Every fire-and-forget chore in this plugin (the prune tick, the drain loop, the listener
-// reconnect, a waiter's snapshot re-check) is best-effort by design: its failure must cost latency
+// reconnect, a subscription's re-drain) is best-effort by design: its failure must cost latency
 // or a skipped chore, never the process. Node kills the bridge on an unhandled rejection, so an
 // operator with one typoed config value would otherwise get a server that dies with a stack trace
 // naming nothing. This installs a process-level spy and forces each path to fail.
 
 const state = vi.hoisted(() => ({
-  /** When set, every pool query rejects — drives the drain/prune/waiter failure paths. */
+  /** When set, every pool query rejects — drives the drain and prune failure paths. */
   poolFails: false,
   /** When set, the LISTEN connection cannot be established — drives the reconnect failure path. */
   clientFails: false,

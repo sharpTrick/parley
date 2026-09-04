@@ -22,10 +22,10 @@ backend-specific (Matrix/XMPP) MCP in chat; that would bypass the normalized mes
 
 ## Tools
 
-- **`parley_fetch_recent { topic, since?, limit?, block_ms? }`** — read recent messages on a topic.
+- **`parley_fetch_recent { topic, since?, limit? }`** — read recent messages on a topic.
   Returns `{ messages, nextCursor }`. Call it first to catch up; pass the previous `nextCursor` as
-  `since` to page forward. Ordering/dedup use `cursor`, never timestamps. Pass `block_ms` to
-  **long-poll** — see "Waiting efficiently" below.
+  `since` to page forward. Ordering/dedup use `cursor`, never timestamps. Some deployments also
+  offer `block_ms` to **long-poll** — see "Waiting efficiently" below.
 - **`parley_post { topic, content, in_reply_to? }`** — publish a message (a handoff or a note) so
   the Code session and humans see it durably.
 
@@ -61,14 +61,19 @@ write to the backend, not just the live channel — so they survive a restart). 
 ## Waiting efficiently (resident / epoch agents)
 
 An agent that cannot receive live `<channel>` push — a Claude Code **subagent** (push lands at the
-session level), a headless `claude -p` worker, or the chat front door — would otherwise have to
-poll `parley_fetch_recent` in a loop, spending one model turn per empty tick. Pass **`block_ms`**
-to fold that wait into a single call: if nothing is newer than `since`, the tool **holds** up to
-`block_ms` (capped server-side, default 60s) until a message arrives or the timeout elapses, then
-returns whatever landed (possibly empty). Token cost then scales with **messages, not wall-clock
-time**.
+session level), a headless `claude -p` worker, or the chat front door — has to poll
+`parley_fetch_recent` in a loop, spending one model turn per empty tick.
 
-The resident loop is: catch up once, then re-call with the held cursor and a block:
+**FIRST, LOOK AT THE TOOL'S OWN SCHEMA.** `block_ms` is offered only where the backend's read
+primitive takes a caller's wait, and this is a per-deployment fact you cannot assume: a deployment
+that does not offer it leaves the argument off the schema, and **refuses** a call that sends it
+anyway. If `block_ms` is not among `parley_fetch_recent`'s arguments, do not send it.
+
+**Where `block_ms` IS offered**, it folds the wait into a single call: if nothing is newer than
+`since`, the tool **holds** up to `block_ms` (capped server-side, default 60s) until a message
+arrives or the timeout elapses, then returns whatever landed (possibly empty). Token cost then
+scales with **messages, not wall-clock time**. The resident loop is: catch up once, then re-call
+with the held cursor and a block:
 
 ```
 { messages, nextCursor } = parley_fetch_recent { topic, since: <held cursor>, block_ms: 55000 }
@@ -77,8 +82,18 @@ The resident loop is: catch up once, then re-call with the held cursor and a blo
 ```
 
 Keep `block_ms` a little under any surrounding tool/hook timeout. A returned empty page is normal —
-just loop again with the same cursor. Every backend honors `block_ms` (natively where the backend
-has a blocking primitive; via a core poll fallback otherwise), so the idiom is identical everywhere.
+just loop again with the same cursor.
+
+**Where it is NOT offered**, the same loop without it returns at once, every time — so pace it
+yourself and expect to pay a turn per tick:
+
+```
+{ messages, nextCursor } = parley_fetch_recent { topic, since: <held cursor> }
+# → returns immediately, empty when nothing is new. WAIT before asking again.
+# persist nextCursor, act on any messages, sleep, repeat
+```
+
+A tight loop here is a request flood against the backend for no new information.
 
 ## Safety
 

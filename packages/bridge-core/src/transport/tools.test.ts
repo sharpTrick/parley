@@ -1,13 +1,14 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asHandle, asTopic } from '../message.js';
-import type { FetchRecentArgs } from '../seam.js';
+import type { BackendCapabilities, FetchRecentArgs } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { NONCONFORMANT_SHAPES, NONCONFORMANT_SHAPE_NAMES } from '../testing/nonconformant.js';
 import { harness, parse, type ToolText } from '../testing/tool-harness.js';
-import { MAX_FETCH_LIMIT, toolDepsFor } from './tools.js';
+import { MAX_FETCH_LIMIT, TOOL_TEXT, toolDepsFor, withdrawnBlockMs } from './tools.js';
 
 /**
  * One subject: the reactive tool surface — which tools are registered, what a call to one does,
@@ -337,5 +338,69 @@ describe('dynamic tool descriptions', () => {
     expect(fetch.description).toContain('fully matching regex "ctx-.*"');
     const fetchProps = fetch.inputSchema.properties as Record<string, { enum?: string[] }>;
     expect(fetchProps.topic!.enum).toBeUndefined();
+  });
+});
+
+/**
+ * The blocking surface is THREE things that must move as one: `block_ms` on the advertised schema,
+ * the sentence in the description that tells the model to send it, and a long-poll behind it. A
+ * deployment showing any two of the three lies to the agent — the worst arrangement being an
+ * argument on the schema that the server silently drops, which a caller cannot tell from a
+ * long-poll that timed out empty and so answers by burning a turn per tick believing it is parked.
+ *
+ * Driven off what the PLUGIN declares, over all three declarations a real one can make. `undefined`
+ * is a row because it is what a plugin written before the capability existed still says, and because
+ * a fake that declared nothing was the whole reason the `false` arm — the arm eight shipped backends
+ * take — was never exercised here at all.
+ */
+describe.each([
+  ['declares native blocking', { blockingFetch: true } as BackendCapabilities | undefined],
+  ['declares no capabilities at all', undefined],
+  ['declares blocking is not native', { blockingFetch: false } as BackendCapabilities | undefined],
+])('the block_ms surface of a backend that %s', (_label, capabilities) => {
+  const offered = capabilities?.blockingFetch !== false;
+  const fetchTool = async (): Promise<{ client: Client; plugin: FakePlugin; tool: Tool }> => {
+    const { client, plugin } = await harness({ plugin: new FakePlugin(capabilities) });
+    const { tools } = await client.listTools();
+    return { client, plugin, tool: tools.find((t) => t.name === 'parley_fetch_recent')! };
+  };
+
+  it(`${offered ? 'offers' : 'withdraws'} block_ms on the advertised schema`, async () => {
+    const { tool } = await fetchTool();
+    const props = Object.keys((tool.inputSchema.properties ?? {}) as Record<string, unknown>);
+    expect(props).toContain('topic');
+    expect(props.includes('block_ms')).toBe(offered);
+    // The advertisement the refusal below has to be true to: a key not on this list is REJECTED.
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it(`${offered ? 'tells' : 'does not tell'} the model to send it`, async () => {
+    const { tool } = await fetchTool();
+    expect(tool.description!.includes(TOOL_TEXT.fetch_recent_blocking)).toBe(offered);
+    // The cancellation clause belongs to the long-poll: a deployment that cannot park cannot cancel.
+    expect(tool.description!.includes('long-poll')).toBe(offered);
+  });
+
+  it(`${offered ? 'long-polls on' : 'refuses'} a block_ms argument`, async () => {
+    const { client, plugin } = await fetchTool();
+    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'old' } });
+    const pending = client.callTool({
+      name: 'parley_fetch_recent',
+      arguments: { topic: 'ctx', since: '1', block_ms: 3000 },
+    });
+
+    if (!offered) {
+      const refused = (await pending) as ToolText;
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0]!.text).toContain(withdrawnBlockMs);
+      // A refusal is not a page: nothing must come back that reads as "nothing new".
+      expect(refused.content[0]!.text).not.toContain('"messages"');
+      return;
+    }
+
+    await new Promise((r) => setTimeout(r, 40));
+    await plugin.post(asTopic('ctx'), asHandle('other'), 'fresh');
+    const out = parse(await pending) as { messages: Array<{ content: string }> };
+    expect(out.messages.map((m) => m.content)).toEqual(['fresh']);
   });
 });

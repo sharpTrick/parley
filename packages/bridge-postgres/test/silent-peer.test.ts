@@ -63,7 +63,7 @@ function issue(plugin: PostgresPlugin, call: Call, topic: string): Promise<unkno
     case 'post':
       return plugin.post(asTopic(topic), asHandle('u'), 'after the peer went quiet');
     case 'fetchRecent':
-      return plugin.fetchRecent({ topic: asTopic(topic), since: asCursor('0'), blockMs: 250 });
+      return plugin.fetchRecent({ topic: asTopic(topic), since: asCursor('0') });
     case 'subscribe':
       return plugin.subscribe(asTopic(topic), () => undefined);
     default:

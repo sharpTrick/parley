@@ -11,8 +11,6 @@ async function makeContext() {
   await plugin.connect(BASE);
   return {
     plugin,
-    // `fetchRecent` reads the MAM archive; it takes no wait. The suite grades the weaker contract.
-    supportsBlockingFetch: false,
     // Each topic -> a fresh, unique MUC room, so tests are fully isolated.
     freshTopic: (): Topic => freshTopic(),
     carriesSenderIdentity: false,

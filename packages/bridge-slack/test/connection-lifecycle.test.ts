@@ -26,7 +26,7 @@
  *     must settle inside a bound. An acquisition whose only exit is a message the peer may never
  *     send has no bound at all, which is what the `silent` mode is here to prove.
  */
-import { asCursor, asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type BackendPlugin, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, SlackPlugin } from '../src/index.js';
 import { FakeSlack, type GreetMode } from './fake-slack.js';
@@ -75,28 +75,26 @@ const spyReconnect = (plugin: SlackPlugin) => vi.spyOn(internals(plugin), 'recon
 
 describe('slack reconnect ownership under a sustained outage', () => {
   for (const outage of OUTAGES) {
-    {
-      it(`${outage.name}, hit cold via subscribe, mints no reconnect owner and dials O(wall clock)`, async () => {
-        const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0COLD'] });
-        const topic = asTopic('C0COLD');
-        const reconnect = spyReconnect(plugin);
-        try {
-          outage.arm(fake);
-          const t0 = Date.now();
-          const outcome = await settleWithin(capture(plugin.subscribe(topic, () => undefined)), OUTAGE_MS);
-          expect(outcome.status).toBe('rejected');
-          await sleep(Math.max(0, OUTAGE_MS - (Date.now() - t0)));
-          const elapsed = Date.now() - t0;
+    it(`${outage.name}, hit cold via subscribe, mints no reconnect owner and dials O(wall clock)`, async () => {
+      const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0COLD'] });
+      const topic = asTopic('C0COLD');
+      const reconnect = spyReconnect(plugin);
+      try {
+        outage.arm(fake);
+        const t0 = Date.now();
+        const outcome = await settleWithin(capture(plugin.subscribe(topic, () => undefined)), OUTAGE_MS);
+        expect(outcome.status).toBe('rejected');
+        await sleep(Math.max(0, OUTAGE_MS - (Date.now() - t0)));
+        const elapsed = Date.now() - t0;
 
-          // Nothing was ever established, so nothing was LOST: the failure belongs to the caller
-          // that asked for it, and a reconnect loop would redial on top of that caller's own retries.
-          expect(reconnect, 'reconnect owners').toHaveBeenCalledTimes(0);
-          expect(fake.hits('apps.connections.open')).toBeLessThanOrEqual(dialBound(elapsed));
-        } finally {
-          await cleanup();
-        }
-      });
-    }
+        // Nothing was ever established, so nothing was LOST: the failure belongs to the caller
+        // that asked for it, and a reconnect loop would redial on top of that caller's own retries.
+        expect(reconnect, 'reconnect owners').toHaveBeenCalledTimes(0);
+        expect(fake.hits('apps.connections.open')).toBeLessThanOrEqual(dialBound(elapsed));
+      } finally {
+        await cleanup();
+      }
+    });
 
     it(`an established socket dropped into ${outage.name} keeps exactly one reconnect owner`, async () => {
       const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0DROP'] });
@@ -140,33 +138,31 @@ describe('slack reconnect ownership under a sustained outage', () => {
   const FLAP_INTERVALS = [10, 100, 700, 2500];
 
   for (const everyMs of FLAP_INTERVALS) {
-    {
-      it(`an edge that greets and drops every ${everyMs}ms redials O(wall clock)`, async () => {
-        const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0FLAP'] });
-        const topic = asTopic('C0FLAP');
-        try {
-          await plugin.subscribe(topic, () => undefined);
-          const dialsBefore = fake.hits('apps.connections.open');
-          const t0 = Date.now();
-          fake.flap(everyMs);
-          await sleep(FLAP_WINDOW_MS);
-          fake.stopFlap();
-          const elapsed = Date.now() - t0;
-          const dials = fake.hits('apps.connections.open') - dialsBefore;
+    it(`an edge that greets and drops every ${everyMs}ms redials O(wall clock)`, async () => {
+      const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0FLAP'] });
+      const topic = asTopic('C0FLAP');
+      try {
+        await plugin.subscribe(topic, () => undefined);
+        const dialsBefore = fake.hits('apps.connections.open');
+        const t0 = Date.now();
+        fake.flap(everyMs);
+        await sleep(FLAP_WINDOW_MS);
+        fake.stopFlap();
+        const elapsed = Date.now() - t0;
+        const dials = fake.hits('apps.connections.open') - dialsBefore;
 
-          expect(dials, 'dials vs wall clock').toBeLessThanOrEqual(dialBound(elapsed));
-          // …and the pacing is not a stall: every row loses at least one established socket, so at
-          // least one redial is owed, and the slow row must be back on a live stream at the end.
-          expect(fake.establishedClosed, 'sockets actually dropped').toBeGreaterThanOrEqual(1);
-          expect(dials, 'redial floor').toBeGreaterThanOrEqual(1);
-          if (everyMs > MAX_DIAL_BACKOFF_MS / 2) {
-            await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 8000, interval: 20 });
-          }
-        } finally {
-          await cleanup();
+        expect(dials, 'dials vs wall clock').toBeLessThanOrEqual(dialBound(elapsed));
+        // …and the pacing is not a stall: every row loses at least one established socket, so at
+        // least one redial is owed, and the slow row must be back on a live stream at the end.
+        expect(fake.establishedClosed, 'sockets actually dropped').toBeGreaterThanOrEqual(1);
+        expect(dials, 'redial floor').toBeGreaterThanOrEqual(1);
+        if (everyMs > MAX_DIAL_BACKOFF_MS / 2) {
+          await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 8000, interval: 20 });
         }
-      });
-    }
+      } finally {
+        await cleanup();
+      }
+    });
   }
 
   it('one reconnect owner survives the whole outage and resumes live delivery on recovery', async () => {
@@ -227,6 +223,37 @@ const SINGLETONS: Singleton[] = [
   },
 ];
 
+const ATTEMPT_BUDGET_MS = 5_000;
+
+/**
+ * One attempt that REACHED THE WIRE. A caller's attempt can be turned away by the dial pacer before
+ * any request goes out, which looks exactly like a memoized rejection from outside — so retry past
+ * a refusal that cost no request rather than counting it as an attempt. Derived from the hit
+ * counter rather than from the ladder's constants, so the pacer's schedule stays free to change.
+ */
+const attemptOnTheWire = async (
+  singleton: Singleton,
+  fake: FakeSlack,
+  plugin: SlackPlugin,
+): Promise<'ok' | 'threw'> => {
+  const before = fake.hits(singleton.method);
+  const giveUpAt = Date.now() + ATTEMPT_BUDGET_MS;
+  for (;;) {
+    try {
+      await singleton.drive(plugin);
+      return 'ok';
+    } catch {
+      if (fake.hits(singleton.method) > before) return 'threw';
+      if (Date.now() > giveUpAt)
+        throw new Error(
+          `${singleton.method} never reached the wire in ${ATTEMPT_BUDGET_MS}ms: every attempt was ` +
+            'turned away before a request went out',
+        );
+      await sleep(25);
+    }
+  }
+};
+
 describe('slack memoized async singletons', () => {
   for (const singleton of SINGLETONS) {
     for (const failFirst of [1, 3]) {
@@ -237,12 +264,7 @@ describe('slack memoized async singletons', () => {
           const attempts = failFirst + 2;
           const outcomes: Array<'ok' | 'threw'> = [];
           for (let i = 0; i < attempts; i++) {
-            try {
-              await singleton.drive(plugin);
-              outcomes.push('ok');
-            } catch {
-              outcomes.push('threw');
-            }
+            outcomes.push(await attemptOnTheWire(singleton, fake, plugin));
           }
           // Every FAILING attempt reached the wire, and the eventual success is memoized after
           // that: hits === failures + 1. A cached rejection collapses this to 1.
@@ -259,16 +281,68 @@ describe('slack memoized async singletons', () => {
   it('a failed dial is not memoized: each subscribe dials again', async () => {
     const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0SUBDIAL'] });
     const topic = asTopic('C0SUBDIAL');
+    const dial: Singleton = {
+      name: 'wsReady',
+      method: 'apps.connections.open',
+      arm: () => undefined,
+      drive: (p) => p.subscribe(topic, () => undefined),
+    };
     try {
       fake.failMethod('apps.connections.open', 'internal_error', 2);
       for (let i = 0; i < 2; i++) {
-        await expect(plugin.subscribe(topic, () => undefined)).rejects.toThrow();
+        expect(await attemptOnTheWire(dial, fake, plugin)).toBe('threw');
       }
       expect(fake.hits('apps.connections.open')).toBe(2);
     } finally {
       await cleanup();
     }
   });
+});
+
+/**
+ * CLASS: EVERY route to `apps.connections.open` is paced by the same ladder, not just the one that
+ * happens to dial today. Slack's tightest rate limit is this endpoint, and its cooldown was for a
+ * while WRITTEN by the dial path and READ by one caller — so removing that caller left the field
+ * consulted nowhere on the way to a dial, and any entry point a caller retries could spend a dial
+ * per attempt. Rows are the seam MINUS its lifecycle pair, typed off `BackendPlugin`, so a seventh
+ * seam method fails this file to compile until it is driven here too.
+ */
+describe('no entry point can dial apps.connections.open faster than the ladder', () => {
+  /** Long enough for an unpaced caller to spend dozens of dials, short enough to stay cheap. */
+  const HOT_WINDOW_MS = 1500;
+
+  type Driven = Exclude<keyof BackendPlugin, 'capabilities' | 'connect' | 'disconnect'>;
+
+  const DRIVE: Record<Driven, (plugin: SlackPlugin, topic: Topic) => Promise<unknown>> = {
+    subscribe: (plugin, topic) => plugin.subscribe(topic, () => undefined),
+    post: (plugin, topic) => plugin.post(topic, asHandle('writer'), 'x'),
+    fetchRecent: (plugin, topic) => plugin.fetchRecent({ topic }),
+    resolveIdentity: (plugin) => plugin.resolveIdentity(asHandle('parley-bot')),
+  };
+
+  it.each(Object.keys(DRIVE) as Driven[])(
+    '%s, retried through an unavailable Socket Mode, dials O(wall clock)',
+    async (call) => {
+      const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0HOT'] });
+      const topic = asTopic('C0HOT');
+      try {
+        fake.failMethod('apps.connections.open', 'internal_error');
+        const t0 = Date.now();
+        let attempts = 0;
+        while (Date.now() - t0 < HOT_WINDOW_MS) {
+          attempts++;
+          await DRIVE[call](plugin, topic).catch(() => undefined);
+        }
+        const elapsed = Date.now() - t0;
+        // The caller really did keep asking: a driver that fell over after one attempt would
+        // satisfy any dial ceiling and grade nothing.
+        expect(attempts, 'attempts made').toBeGreaterThan(dialBound(elapsed));
+        expect(fake.hits('apps.connections.open'), 'dials').toBeLessThanOrEqual(dialBound(elapsed));
+      } finally {
+        await cleanup();
+      }
+    },
+  );
 });
 
 /**
@@ -282,15 +356,9 @@ describe('slack memoized async singletons', () => {
  */
 const SOCKET_ENTRIES: Array<{
   name: string;
-  /** Whether the absent-token outcome is a rejection naming the token, or a degraded empty page. */
-  rejects: boolean;
   run: (plugin: SlackPlugin, topic: string) => Promise<unknown>;
 }> = [
-  {
-    name: 'subscribe',
-    rejects: true,
-    run: (plugin, topic) => plugin.subscribe(asTopic(topic), () => undefined),
-  },
+  { name: 'subscribe', run: (plugin, topic) => plugin.subscribe(asTopic(topic), () => undefined) },
 ];
 
 describe('slack entry points that need the shared socket agree about a missing app_token', () => {
@@ -301,7 +369,7 @@ describe('slack entry points that need the shared socket agree about a missing a
         const { fake, plugin, cleanup } = await startPlugin({ appToken, channels: ['C0TOKEN'] });
         try {
           const outcome = await capture(entry.run(plugin, 'C0TOKEN'));
-          if (absent && entry.rejects) {
+          if (absent) {
             expect(outcome.status).toBe('rejected');
             expect(String((outcome as { reason: unknown }).reason)).toMatch(/app_token/);
           } else {
@@ -320,36 +388,33 @@ describe('slack entry points that need the shared socket agree about a missing a
 describe('slack teardown racing an in-flight connect', () => {
   for (const greet of ['greet', 'pre-hello-close', 'silent'] as GreetMode[]) {
     for (const delayMs of [0, 1, 5, 20, 50, 120]) {
-      {
-        const start = 'subscribe';
-        it(`disconnect ${delayMs}ms into ${start} on a ${greet} socket settles it and leaves no socket open`, async () => {
-          // Hold the handshake open long enough that the teardown lands mid-acquisition for the
-          // small delays and after establishment for the large ones.
-          const { fake, plugin } = await startPlugin({
-            channels: ['C0RACE'],
-            greet,
-            arm: (f: FakeSlack) => f.setLatency('apps.connections.open', 60),
-          });
-          const topic = asTopic('C0RACE');
-          try {
-            const inFlight = capture<unknown>(plugin.subscribe(topic, () => undefined));
-
-            await sleep(delayMs);
-            await plugin.disconnect();
-            // Generous versus the teardown, tight versus the handshake timeout the silent rows
-            // would otherwise run.
-            const outcome = await settleWithin(inFlight, 300);
-
-            const where = `${start} / ${greet} / +${delayMs}ms`;
-            expect(outcome.status, where).not.toBe('pending');
-
-            await sleep(300);
-            expect(fake.liveSockets, where).toBe(0);
-          } finally {
-            await fake.close();
-          }
+      it(`disconnect ${delayMs}ms into subscribe on a ${greet} socket settles it and leaves no socket open`, async () => {
+        // Hold the handshake open long enough that the teardown lands mid-acquisition for the
+        // small delays and after establishment for the large ones.
+        const { fake, plugin } = await startPlugin({
+          channels: ['C0RACE'],
+          greet,
+          arm: (f: FakeSlack) => f.setLatency('apps.connections.open', 60),
         });
-      }
+        const topic = asTopic('C0RACE');
+        try {
+          const inFlight = capture<unknown>(plugin.subscribe(topic, () => undefined));
+
+          await sleep(delayMs);
+          await plugin.disconnect();
+          // Generous versus the teardown, tight versus the handshake timeout the silent rows
+          // would otherwise run.
+          const outcome = await settleWithin(inFlight, 300);
+
+          const where = `subscribe / ${greet} / +${delayMs}ms`;
+          expect(outcome.status, where).not.toBe('pending');
+
+          await sleep(300);
+          expect(fake.liveSockets, where).toBe(0);
+        } finally {
+          await fake.close();
+        }
+      });
     }
   }
 
@@ -679,8 +744,7 @@ describe('slack connect is a session boundary, not a partial reset', () => {
         // which a late mutation can reach state the new session owns.
         await plugin.subscribe(asTopic(STALE_TOPIC), (m) => fresh.push(m.content));
         // A retired call has no caller left to serve, so it must settle on the teardown rather than
-        // run its own budget out inside the new session — the rung loop re-reads history and arms a
-        // waiter per rung, all of it against a configuration it was never given.
+        // run its own budget out inside the new session, against a configuration it was never given.
         const settled = await settleWithin(inFlight, 900);
         expect(settled.status, 'the retired call ran on into the new session').not.toBe('pending');
         await sleep(500);

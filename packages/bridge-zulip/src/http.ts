@@ -55,11 +55,10 @@ export class ZulipHttp {
 
   /** Register a `<stream, topic>`-narrowed message event queue; its birth is the topic's tail. */
   async register(
-    wireTopic: string, signal?: AbortSignal, deadlineMs?: number,
+    wireTopic: string, signal?: AbortSignal,
   ): Promise<{ queue_id: string; last_event_id: number }> {
     const res = await this.request('POST', '/api/v1/register', {
       signal,
-      deadlineMs,
       form: {
         event_types: JSON.stringify(['message']),
         narrow: JSON.stringify([

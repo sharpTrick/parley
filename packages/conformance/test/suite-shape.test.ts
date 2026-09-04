@@ -14,11 +14,13 @@ import {
   SINCELESS_RETURN_MS,
 } from '@sharptrick/parley-conformance';
 import {
+  BLOCKING_READ,
   budgetsIn,
   cases,
   casesIn,
   deferredPromises,
   diagnosedAssertions,
+  escapeRegExp,
   guardedRegions,
   promiseExecutors,
   type SelfImposedBudget,
@@ -162,7 +164,7 @@ describe('the suite grades every backend it certifies', () => {
   const guardedByCase = (): [string, string, string][] =>
     cases().flatMap((c) =>
       guardedRegions(c.body).map(
-        ({ field, region }) => [field, c.title, region] as [string, string, string],
+        ({ read, region }) => [read, c.title, region] as [string, string, string],
       ),
     );
 
@@ -170,8 +172,8 @@ describe('the suite grades every backend it certifies', () => {
     expect(guardedByCase().length).toBeGreaterThan(3);
   });
 
-  it.each(guardedByCase())('makes the `%s` branch of "%s" assert', (field, title, region) => {
-    expect(region, `\`ctx.${field}\` in "${title}" guards a region that asserts nothing`).toContain(
+  it.each(guardedByCase())('makes the `%s` branch of "%s" assert', (read, title, region) => {
+    expect(region, `\`${read}\` in "${title}" guards a region that asserts nothing`).toContain(
       'expect(',
     );
   });
@@ -190,8 +192,23 @@ describe('the suite grades every backend it certifies', () => {
   });
 
   it.each([
-    ['a bare return on a flag', 'if (!ctx.supportsBlockingFetch) { return; }', 1, false],
-    ['an asserting arm', 'if (!ctx.supportsBlockingFetch) { expect(1).toBe(1); return; }', 1, true],
+    ['a bare return on a flag', 'if (!ctx.carriesSenderIdentity) { return; }', 1, false],
+    ['an asserting arm', 'if (!ctx.carriesSenderIdentity) { expect(1).toBe(1); return; }', 1, true],
+    [
+      // The capability the SEAM carries, read off the plugin under test rather than off a context
+      // field: a detector that knows only the `ctx.<field>` spelling sees no guard here at all, and
+      // the arm behind it could stop asserting for free.
+      'a bare return on a capability the plugin declares',
+      `if (${BLOCKING_READ} === false) { return; }`,
+      1,
+      false,
+    ],
+    [
+      'an asserting arm on a capability the plugin declares',
+      `if (${BLOCKING_READ} === false) { expect(1).toBe(1); return; }`,
+      1,
+      true,
+    ],
     [
       // The shape that defeated the first version of this checker: the guarded block asserts
       // nothing, but code AFTER the guard does, so a region running to the end of the body passes.
@@ -209,7 +226,7 @@ describe('the suite grades every backend it certifies', () => {
     [
       // The same trade one line further down: leave the assertions in place and step over them.
       'an arm that returns before the assertions it still contains',
-      'if (!ctx.supportsBlockingFetch) {\n  return;\n  expect(1).toBe(1);\n}',
+      'if (!ctx.carriesSenderIdentity) {\n  return;\n  expect(1).toBe(1);\n}',
       1,
       false,
     ],
@@ -605,16 +622,17 @@ describe('the suite grades every backend it certifies', () => {
   // Both arms of each boolean capability must ASSERT. Pinned by name so that deleting the weaker
   // arm — the thing that made the flag honest — is a failure, not a silent loss.
   it.each([
-    ['supportsBlockingFetch', 'blockMs is honoured natively or ignored promptly'],
-    ['carriesSenderIdentity', 'distinct senders are not collapsed'],
-    ['absentTopicBehaviour', 'never-posted topic'],
-  ])('gives `%s` a false arm that still asserts', (field, title) => {
+    [BLOCKING_READ, 'blockMs is honoured natively or ignored promptly'],
+    ['ctx.carriesSenderIdentity', 'distinct senders are not collapsed'],
+    ['ctx.absentTopicBehaviour', 'never-posted topic'],
+  ])('gives `%s` a false arm that still asserts', (read, title) => {
     const owner = cases().find((c) => c.title.includes(title));
     expect(owner, `no case titled like "${title}"`).toBeDefined();
     const body = (owner as { body: string }).body;
-    expect(body).toContain(`ctx.${field}`);
-    expect(body).toMatch(/\}\s*else\s*\{|if \(!ctx\.|if \(\(ctx\./);
-    const arms = body.split(/\}\s*else\s*\{|if \(!ctx\.|if \(\(ctx\./);
+    expect(body).toContain(read);
+    const split = new RegExp(`\\}\\s*else\\s*\\{|if \\(!?\\(?${escapeRegExp(read)}`);
+    expect(body).toMatch(split);
+    const arms = body.split(split);
     for (const arm of arms.slice(1)) expect(arm).toContain('expect(');
   });
 });

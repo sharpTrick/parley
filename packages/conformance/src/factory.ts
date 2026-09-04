@@ -8,6 +8,13 @@ import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
  * forgot one loses a compile rather than a test case. An optional flag whose absent value means
  * "skip" silently trades coverage for convenience, which is how the blocking-fetch case went
  * unexercised on backends that do implement it.
+ *
+ * A capability the SEAM already carries is not restated here: whether `fetchRecent` honours
+ * `blockMs` natively is read off `plugin.capabilities`, under the SAME predicate core uses when it
+ * decides whether to advertise `block_ms` — absent means offered. Two spellings of one fact let a
+ * backend flip its declaration with the suite still grading the other arm; and a plugin that
+ * declares nothing is graded on the STRICTER arm, because that is the arm core will advertise for
+ * it, exactly as `absentTopicBehaviour`'s default is the stricter of its two.
  */
 export interface ConformanceContext {
   /** A freshly connected plugin instance. */
@@ -24,12 +31,6 @@ export interface ConformanceContext {
    * per token, so a second poller gets HTTP 409.
    */
   concurrentPost: ((topic: Topic, writers: number, perWriter: number) => Promise<void>) | 'unsupported';
-  /**
-   * True for backends whose own read primitive takes a caller's wait (Redis `XREAD BLOCK`, NATS
-   * pull expiry). False for one whose `fetchRecent` reads history and takes no wait — every
-   * push-driven backend, and SQLite, which gets its long-poll from core's wrapper instead.
-   */
-  supportsBlockingFetch: boolean;
   /**
    * True when the backend round-trips the `identity` argument of `post` as the message's
    * `senderHandle`. False for backends that stamp the authenticated account instead: every hosted
@@ -62,7 +63,6 @@ export const CONTEXT_FIELDS: Record<keyof ConformanceContext, (v: unknown) => bo
   freshTopic: (v) => typeof v === 'function',
   cleanup: (v) => typeof v === 'function',
   concurrentPost: (v) => typeof v === 'function' || v === 'unsupported',
-  supportsBlockingFetch: (v) => typeof v === 'boolean',
   carriesSenderIdentity: (v) => typeof v === 'boolean',
   absentTopicBehaviour: (v) => v === undefined || v === 'empty-page' || v === 'throws',
 };

@@ -9,8 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // time-ordered, so that cursor sits ahead of the original channel's history and core persists it.
 //
 // The table crosses WHERE the call is parked with WHAT retired the session, because those are
-// independent: the waiter is released by the retirement itself, a page walk is released by the
-// provider, and `disconnect()` alone leaves the map in place while `connect()` replaces it. Every
+// independent: a page walk is released by the provider, and `disconnect()` alone leaves the map in
+// place while `connect()` replaces it. Every
 // cell ends with the successor session serving a read, so that refusing every later query — which
 // satisfies each negative assertion below — is a failure and not a pass.
 

@@ -70,10 +70,6 @@ const HOSTILE = [
 /** A cursor this backend really can mint, including both ends of the bigint range. */
 const LEGITIMATE = ['0', '1', '512', '9223372036854775807'];
 
-const BLOCK_MS = [0, 40];
-
-const HOSTILE_CELLS = HOSTILE.flatMap((since) => BLOCK_MS.map((blockMs) => ({ since, blockMs })));
-
 async function connected(): Promise<PostgresPlugin> {
   const plugin = new PostgresPlugin();
   await plugin.connect({ url: URL, table_name: 'parley_hc' });
@@ -86,43 +82,40 @@ beforeEach(() => {
 });
 
 describe('a cursor this backend did not mint is refused by name, before any SQL', () => {
-  it.each(
-    HOSTILE_CELLS.map((c) => [`${JSON.stringify(c.since)}, blockMs ${c.blockMs}`, c] as const),
-  )('%s', async (_label, cell) => {
-    const plugin = await connected();
-    try {
-      const attempt = plugin.fetchRecent({
-        topic: asTopic('hc'),
-        since: asCursor(cell.since),
-        blockMs: cell.blockMs,
-      });
-      await expect(attempt).rejects.toThrow(/^parley-postgres: invalid cursor /);
-      await attempt.catch((err: unknown) => {
-        const message = String((err as Error).message);
-        expect(message, 'the refusal must quote the value the caller passed').toContain(
-          JSON.stringify(cell.since),
-        );
-        // A driver or SQLSTATE string reaching the agent is the failure being prevented, so the
-        // absence of one is asserted rather than inferred from the prefix.
-        expect(message).not.toMatch(/invalid input syntax|out of range for type|22P02/);
-      });
-      expect(state.queries, 'a rejected cursor still reached the database').toEqual([]);
-    } finally {
-      await plugin.disconnect();
-    }
-  }, 20000);
+  it.each(HOSTILE.map((since) => [JSON.stringify(since), since] as const))(
+    '%s',
+    async (_label, since) => {
+      const plugin = await connected();
+      try {
+        const attempt = plugin.fetchRecent({ topic: asTopic('hc'), since: asCursor(since) });
+        await expect(attempt).rejects.toThrow(/^parley-postgres: invalid cursor /);
+        await attempt.catch((err: unknown) => {
+          const message = String((err as Error).message);
+          expect(message, 'the refusal must quote the value the caller passed').toContain(
+            JSON.stringify(since),
+          );
+          // A driver or SQLSTATE string reaching the agent is the failure being prevented, so the
+          // absence of one is asserted rather than inferred from the prefix.
+          expect(message).not.toMatch(/invalid input syntax|out of range for type|22P02/);
+        });
+        expect(state.queries, 'a rejected cursor still reached the database').toEqual([]);
+      } finally {
+        await plugin.disconnect();
+      }
+    },
+    20000,
+  );
 });
 
 describe('a cursor this backend did mint is still accepted', () => {
-  it.each(LEGITIMATE.flatMap((since) => BLOCK_MS.map((blockMs) => [`${since}, blockMs ${blockMs}`, since, blockMs] as const)))(
+  it.each(LEGITIMATE.map((since) => [since] as const))(
     '%s',
-    async (_label, since, blockMs) => {
+    async (since) => {
       const plugin = await connected();
       try {
         const page = await plugin.fetchRecent({
           topic: asTopic('hc'),
           since: asCursor(since),
-          blockMs,
         });
         expect(page.messages).toEqual([]);
         expect(String(page.nextCursor), 'an empty page must hold the cursor steady').toBe(since);

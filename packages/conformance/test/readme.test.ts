@@ -175,11 +175,10 @@ describe('README', () => {
             return Promise.resolve();
           },
           concurrentPost: 'unsupported',
-          carriesSenderIdentity: true,
         } as unknown as ConformanceContext);
 
       await expect(openContext('a runtime-built context', factory)).rejects.toThrow(
-        /has an invalid `supportsBlockingFetch`/,
+        /has an invalid `carriesSenderIdentity`/,
       );
       expect(tornDown, 'a rejected fixture must still be torn down').toBe(true);
     });

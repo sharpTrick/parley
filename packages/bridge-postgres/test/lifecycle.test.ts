@@ -61,7 +61,24 @@ const state = vi.hoisted(() => ({
 interface MockClientShape {
   ended: boolean;
   listened: string[];
+  unlistened: string[];
   emit: (event: string, arg?: unknown) => boolean;
+}
+
+/**
+ * LISTEN minus UNLISTEN, as ONE connection saw it — the only view a server-side registration is in.
+ * The plugin's own `listens` map is its BELIEF; a channel installed on the socket and absent from
+ * that map wakes the process for every future post to a topic nothing is subscribed to, and no
+ * entry is left anywhere to undo it. Containment cannot see that; only the equality can.
+ */
+function observed(client: MockClientShape): string[] {
+  const net = new Map<string, number>();
+  for (const channel of client.listened) net.set(channel, (net.get(channel) ?? 0) + 1);
+  for (const channel of client.unlistened) net.set(channel, (net.get(channel) ?? 0) - 1);
+  return [...net.entries()]
+    .filter(([, n]) => n > 0)
+    .map(([channel]) => channel)
+    .sort();
 }
 
 vi.mock('pg', async () => {
@@ -70,6 +87,7 @@ vi.mock('pg', async () => {
   class MockClient extends FakeEmitter implements MockClientShape {
     ended = false;
     readonly listened: string[] = [];
+    readonly unlistened: string[] = [];
     constructor() {
       super();
       state.clients.push(this);
@@ -86,6 +104,11 @@ vi.mock('pg', async () => {
       }
     }
     async query(sql: string): Promise<{ rows: unknown[] }> {
+      const unlisten = /^UNLISTEN "(.+)"$/.exec(sql);
+      if (unlisten !== null) {
+        this.unlistened.push(unlisten[1] as string);
+        return { rows: [] };
+      }
       const listen = /^LISTEN "(.+)"$/.exec(sql);
       if (listen !== null) {
         state.listenAttempts.push(listen[1] as string);
@@ -665,9 +688,13 @@ async function reconnectCase(cell: ReconnectCell): Promise<void> {
   const replacement = state.clients.at(-1);
   expect(replacement).toBeDefined();
   expect(replacement).not.toBe(listener);
-  for (const channel of channelsNeeded) {
-    expect(replacement?.listened, `re-LISTEN missing for ${channel}`).toContain(channel);
-  }
+  // SET EQUALITY, never containment: a replacement carrying MORE than the plugin believes it
+  // carries is the leak — the doorbell nothing will ever ring off again — and it satisfies every
+  // containment check perfectly.
+  expect(
+    observed(replacement as MockClientShape),
+    'the replacement is LISTENed for a set other than what the plugin believes it needs',
+  ).toEqual([...channelsNeeded].sort());
 
   // No NOTIFY is emitted: the reconnect's own re-drive is what must serve the subscriptions.
   await sleep(100);

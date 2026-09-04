@@ -163,7 +163,7 @@ describe('XMPP correlator provenance (a right token from a wrong sender settles 
 
 // Class: the same room key shared by correlators of DIFFERENT KINDS, so a stanza belonging to one
 // in-flight operation settles another. A room JID identifies a room, not an operation: a join, a
-// post, a long-poll waiter and a MAM collector can all be outstanding on one room at once, and a
+// post and a MAM collector can all be outstanding on one room at once, and a
 // bounce, a reflection, a presence or an archive result each belong to exactly one of them. Any
 // fall-through — "this stanza matched no post, so it must be about the join" — reports one
 // operation's condition against another, drops a correlator the server has not answered, and does

@@ -50,7 +50,7 @@ const chargesOf = (plugin: DiscordPlugin): number =>
 
 /**
  * Advance `totalMs` of simulated time, applying `drive` once to every socket the plugin opens.
- * Fine-grained while core's 250 ms long-poll fallback is at its busiest, coarser afterwards.
+ * Fine-grained through the first minute, where the ladder's rungs are shortest, coarser afterwards.
  */
 async function pump(totalMs: number, drive: (ws: FakeWs) => void): Promise<void> {
   const driven = new Set<FakeWs>();
@@ -80,15 +80,6 @@ async function pump(totalMs: number, drive: (ws: FakeWs) => void): Promise<void>
 describe('one rung of the ladder buys exactly one dial', () => {
   /** Where the re-entrant call lands relative to `nextDialAt`; only `-1` is still backing off. */
   const OFFSETS_MS = [-1, 0, 1, 50];
-
-  const INITIATORS: Array<{ label: string; start: (p: DiscordPlugin, t: Topic) => void }> = [
-    {
-      label: 'subscribe',
-      start: (p, t) => {
-        void p.subscribe(t, () => undefined).catch(() => undefined);
-      },
-    },
-  ];
 
   /**
    * How the ladder came to own a dial. Both arms leave a reconnect armed; they differ in whether
@@ -132,38 +123,36 @@ describe('one rung of the ladder buys exactly one dial', () => {
 
   for (const prior of PRIORS) {
     for (const offset of OFFSETS_MS) {
-      for (const initiator of INITIATORS) {
-        const when = offset < 0 ? `${-offset}ms before` : `${offset}ms after`;
-        it(`${initiator.label} ${when} nextDialAt, after ${prior.label}`, async () => {
-          const plugin = await connectPlugin();
-          await prior.arrange(plugin);
+      const when = offset < 0 ? `${-offset}ms before` : `${offset}ms after`;
+      it(`subscribe ${when} nextDialAt, after ${prior.label}`, async () => {
+        const plugin = await connectPlugin();
+        await prior.arrange(plugin);
 
-          const charged = chargesOf(plugin);
-          expect(charged, 'no rung was charged, so this cell has no budget to overspend').toBe(1);
-          const dialsBefore = instances.length;
+        const charged = chargesOf(plugin);
+        expect(charged, 'no rung was charged, so this cell has no budget to overspend').toBe(1);
+        const dialsBefore = instances.length;
 
-          // The clock alone — the ladder's timer keeps its full remaining delay, which is the
-          // lateness a real event loop hands it for free.
-          vi.setSystemTime(Date.now() + BACKOFF_BASE_MS + offset);
-          initiator.start(plugin, TOPIC);
-          await vi.advanceTimersByTimeAsync(0);
+        // The clock alone — the ladder's timer keeps its full remaining delay, which is the
+        // lateness a real event loop hands it for free.
+        vi.setSystemTime(Date.now() + BACKOFF_BASE_MS + offset);
+        void plugin.subscribe(TOPIC, () => undefined).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0);
 
-          expect(
-            instances.length,
-            'a caller dialed while the ladder still owned the rung it had already charged for',
-          ).toBe(dialsBefore);
+        expect(
+          instances.length,
+          'a caller dialed while the ladder still owned the rung it had already charged for',
+        ).toBe(dialsBefore);
 
-          await vi.advanceTimersByTimeAsync(BACKOFF_BASE_MS);
-          expect(instances.length, 'the ladder never spent the rung it charged for').toBe(
-            dialsBefore + 1,
-          );
-          expect(instances.length, 'sockets opened outran the rungs the ladder paid for').toBe(
-            chargesOf(plugin) + 1,
-          );
+        await vi.advanceTimersByTimeAsync(BACKOFF_BASE_MS);
+        expect(instances.length, 'the ladder never spent the rung it charged for').toBe(
+          dialsBefore + 1,
+        );
+        expect(instances.length, 'sockets opened outran the rungs the ladder paid for').toBe(
+          chargesOf(plugin) + 1,
+        );
 
-          await plugin.disconnect();
-        });
-      }
+        await plugin.disconnect();
+      });
     }
   }
 });

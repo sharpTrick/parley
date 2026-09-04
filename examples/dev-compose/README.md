@@ -57,7 +57,8 @@ sequence numbers are the cursor; a pull consumer with an expiry backs the native
 ## Postgres (v0.6) — ready to run
 
 `postgres:16-alpine` on `localhost:5432`, user/db `parley`/`parley` (password `parley`).
-`BIGSERIAL` seq is the cursor; `LISTEN`/`NOTIFY` drives both `subscribe` and the native `block_ms`.
+`BIGSERIAL` seq is the cursor; `LISTEN`/`NOTIFY` drives `subscribe` (this backend declares
+`blockingFetch: false`, so `block_ms` is not on its tool schema).
 The suite probes `postgres://parley:parley@127.0.0.1:5432/parley` (`PARLEY_PG_URL`) and self-skips
 when no server is up. No Docker handy? A plain `apt install postgresql` cluster with the same
 user/db works identically.
@@ -108,7 +109,8 @@ Doing it by hand takes three careful steps, because two Synapse defaults break a
    ```
 
 `server_name=parley.local`, C–S API on `localhost:8008`. Room → topic, `event_id` → cursor; a
-bounded room-filtered `/sync` backs the native `block_ms`.
+bounded room-filtered `/sync` drives `subscribe` (this backend declares `blockingFetch: false`, so
+`block_ms` is not on its tool schema).
 
 ## Zulip (v0.6) — upstream compose, not authored here
 

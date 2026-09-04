@@ -1,4 +1,5 @@
 import type { FetchRecentArgs, FetchRecentResult, Topic } from '@sharptrick/parley-core';
+import type { SlackSettings } from './config.js';
 import {
   ABSENT_ON_READ,
   asSeamError,
@@ -8,7 +9,6 @@ import {
   type SlackApiCall,
   SlackShapeError,
 } from './api.js';
-import type { SocketHost } from './link.js';
 import { slackToMessage } from './markup.js';
 import {
   compareTs,
@@ -18,8 +18,10 @@ import {
   type SlackMessage,
 } from './messages.js';
 
-/** {@link SocketHost}, plus what only a read needs: the topic mapping and the connected guard. */
-export interface HistoryHost extends SocketHost {
+/** The plugin, as a read sees it: the live settings, the teardown flag, and the topic mapping. */
+export interface HistoryHost {
+  settings: () => SlackSettings;
+  stopped: () => boolean;
   channelFor: (topic: Topic) => string;
   requireConnected: () => void;
 }

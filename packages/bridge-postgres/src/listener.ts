@@ -207,21 +207,10 @@ export abstract class PostgresListener extends PostgresPush {
           }
           // Re-LISTEN every channel a subscription needs, so a reconnect still delivers the
           // doorbell.
-          const listened: string[] = [];
           for (const channel of this.listens.keys()) {
             await client.query(`LISTEN "${channel}"`);
-            listened.push(channel);
           }
           await this.adoptListener(client, epoch);
-          // The loop above awaits, and a subscription's last reference can be dropped inside it,
-          // with no live connection to send its UNLISTEN to. Keep this reconciliation, so that the
-          // replacement is not left registered for a channel nothing needs — every future post to
-          // that topic would wake the process forever.
-          for (const channel of listened) {
-            if (!this.listens.has(channel)) {
-              void client.query(`UNLISTEN "${channel}"`).catch(() => undefined);
-            }
-          }
           landed(client);
           adopted = true;
           this.redrive([...this.subs.keys()]);

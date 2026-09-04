@@ -174,15 +174,8 @@ describe('a subscribe loop does not survive disconnect + connect', () => {
   }
 });
 
-/**
- * CLASS: no registry entry may outlive the work it describes. A `/sync` controller or a resolved
- * room surviving a teardown is a request issued with a cleared token, and a room handed to the NEXT
- * generation without being re-resolved under its credential.
- */
-const REGISTRIES = ['controllers', 'rooms'] as const;
-
-const sizeOf = (p: MatrixPlugin, name: (typeof REGISTRIES)[number]): number =>
-  (p as unknown as Record<string, { size: number }>)[name]!.size;
+const cachedRooms = (p: MatrixPlugin): number =>
+  (p as unknown as { rooms: { size: number } }).rooms.size;
 
 const LIFECYCLES: Record<string, (p: MatrixPlugin) => Promise<void>> = {
   'subscribe → disconnect → connect': async (p) => {
@@ -203,18 +196,13 @@ const LIFECYCLES: Record<string, (p: MatrixPlugin) => Promise<void>> = {
   },
 };
 
-describe('every internal registry is empty after a lifecycle that stood the loop down', () => {
+describe('the room cache is empty the moment a lifecycle that stood the loop down returns', () => {
   for (const [name, sequence] of Object.entries(LIFECYCLES)) {
-    it(`${name}: no registry outlives it`, async () => {
+    it(`${name}: no cached room outlives it`, async () => {
       const p = await connectFake({});
       await sequence(p);
 
-      // A `/sync` already on the wire when the sequence ended drains within one fake round-trip; a
-      // registry the plugin never cleared never empties, so the timeout is the real assertion.
-      await vi.waitFor(
-        () => expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0])),
-        { timeout: 4000, interval: 10 },
-      );
+      expect(cachedRooms(p)).toBe(0);
       await p.disconnect();
     }, 30_000);
   }
@@ -238,8 +226,8 @@ describe('every internal registry is empty after a lifecycle that stood the loop
  * CLASS: a staleness gate placed BEFORE the await it is supposed to cover. Every seam call resolves
  * a room over two or three round-trips, and a `disconnect()` can land inside any one of them: the
  * work then completes against a cleared token and writes its result into a registry the teardown has
- * already emptied, handing the NEXT generation a room, a route or a waiter it never asked for. A gate
- * checked only before the await it guards cannot see that.
+ * already emptied, handing the NEXT generation a room or a route it never asked for. A gate checked
+ * only before the await it guards cannot see that.
  *
  * WHERE the disconnect lands is driven off the fake's own request hook — the teardown runs while the
  * named request is in flight, not racing a wall-clock timer — and each row proves the phase it names
@@ -407,7 +395,7 @@ describe('a disconnect landing inside a round-trip leaves nothing behind', () =>
           // round-trips without a credential is neither, and that is the shape under test.
           if (outcome !== undefined) expect(String(outcome)).toMatch(/\[parley-matrix\]/);
           // Nothing the teardown cleared came back…
-          expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
+          expect(cachedRooms(p)).toBe(0);
           // …no long-poll or catch-up read ran against the cleared token (an in-flight room resolve
           // may still finish — it is bounded, idempotent and hands its result to nobody)…
           expect(armed.since().filter((r) => POST_TEARDOWN_FORBIDDEN.test(r))).toEqual([]);
@@ -778,7 +766,7 @@ describe('nothing is delivered across an await the generation ended inside', () 
             .map((u) => u.pathname)
             .filter((path) => POST_TEARDOWN_FORBIDDEN.test(path)),
         ).toEqual([]);
-        expect(REGISTRIES.map((r) => [r, sizeOf(p, r)])).toEqual(REGISTRIES.map((r) => [r, 0]));
+        expect(cachedRooms(p)).toBe(0);
         await p.disconnect();
       }, 30_000);
     }

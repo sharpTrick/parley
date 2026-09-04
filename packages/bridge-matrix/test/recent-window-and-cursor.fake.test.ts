@@ -543,3 +543,55 @@ describe('a read that never completed reports the caller position, never one beh
     }
   }
 });
+
+/**
+ * CLASS: a `limit` no page count can satisfy. `fetchRecent` is public API and the seam puts no floor
+ * on `limit` — only the MCP tool path upstream refuses a hostile one — so `NaN`, `0` and negatives
+ * arrive here. The one answer this plugin must never give is an EMPTY page on a topic that has
+ * history: a caller cannot tell that from "nothing new", and no retry recovers it. Refusing, naming
+ * the value, is what this backend does; whether it refuses or floors, the empty page is the failure.
+ */
+describe('a hostile limit is never answered with an empty page', () => {
+  const HOSTILE = [Number.NaN, 0, -1, Number.POSITIVE_INFINITY, 1.5];
+
+  for (const limit of HOSTILE) {
+    for (const sinceMode of ['none', 'start'] as const) {
+      it(`limit=${String(limit)} / since=${sinceMode}`, async () => {
+        const topic = asTopic('hostile-limit');
+        const plugin = await connectFake();
+        try {
+          for (let i = 0; i < 5; i++) await plugin.post(topic, WRITER, `m${i}`);
+          const since =
+            sinceMode === 'none'
+              ? undefined
+              : (await plugin.fetchRecent({ topic, limit: 1 })).nextCursor;
+
+          let page: FetchRecentResult | undefined;
+          let refusal: unknown;
+          try {
+            page = await plugin.fetchRecent({
+              topic,
+              ...(since === undefined ? {} : { since }),
+              limit,
+            });
+          } catch (err) {
+            refusal = err;
+          }
+
+          if (refusal !== undefined) {
+            expect(String(refusal), 'a refusal must name the value it refused').toContain(
+              String(limit),
+            );
+            return;
+          }
+          expect(
+            (page as FetchRecentResult).messages.length,
+            'an empty page on a topic that has history reads to a caller as "nothing new"',
+          ).toBeGreaterThan(0);
+        } finally {
+          await plugin.disconnect();
+        }
+      });
+    }
+  }
+});

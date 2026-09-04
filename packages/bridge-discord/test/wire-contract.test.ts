@@ -237,7 +237,7 @@ describe('the gateway CONNECT url carries the params Discord requires', () => {
 
 // CLASS: a gateway obligation only the real provider punishes. op 1 is how Discord probes a socket
 // it suspects is dead: a client that does not answer with its own op 1 is closed, and every
-// subscription and every parked long-poll on that socket dies with it — on a schedule only the
+// subscription on that socket dies with it — on a schedule only the
 // provider controls, so nothing local reproduces it. The fake closes 4009 on an unanswered probe,
 // so the branch cannot be deleted without losing rows. (op 7, op 9 and a withheld op 11 are driven
 // by gateway-reconnect.test.ts.)

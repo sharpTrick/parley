@@ -4,8 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // Class: membership in a room that this connection can lose WITHOUT the stream dropping, cached as
 // a resolved promise and therefore never rebuilt. `joined` is an "ensure" cache keyed by room and
 // evicted only on rejection, so once occupancy ends by any route the plugin never re-enters: push
-// is permanently dead in silence, every post bounces forever, and every blocking fetchRecent burns
-// its whole block_ms because no live stanza can wake it. Only a process restart recovers. A
+// is permanently dead in silence and every post bounces forever. Only a process restart recovers. A
 // reconnect is just ONE of the ways occupancy ends — a kick, a ban, an affiliation change, a room
 // destroy and a MUC component restart all end it with the stream still up, and the last of those
 // arrives only as a bounced post. The table walks every route and demands the same recovery of
@@ -135,7 +134,7 @@ describe('XMPP re-enters a room after occupancy ends, however it ended', () => {
     });
     expect(delivered).toContain('after');
     // Re-entry must not re-deliver: a MUC replays room history to a joiner unless the join asks for
-    // none, and a replay through the live path re-fires every subscriber and every long-poll waiter.
+    // none, and a replay through the live path re-fires every subscriber.
     expect(ids).toEqual([...new Set(ids)]);
     await plugin.disconnect();
   });

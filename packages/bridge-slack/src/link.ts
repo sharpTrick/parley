@@ -47,7 +47,7 @@ export class SocketModeLink {
   private wsReady?: Promise<void>;
   /** channel id → the topic + handler it feeds (Socket Mode events carry the channel id). */
   readonly routes = new Map<string, Route>();
-  /** Earliest wall clock at which an automatic dial may go out — see {@link backOffDialling}. */
+  /** Earliest wall clock at which a dial may go out — see {@link ensureSocket}. */
   private dialCooldownUntil = 0;
   private dialBackoffMs = DIAL_BACKOFF_MS;
   /** When the current connection saw `hello`, or 0 — the pacer's "has it served yet?" clock. */
@@ -85,11 +85,23 @@ export class SocketModeLink {
    * reactive-only deployment configures no `app_token`; keep that named rejection HERE rather than
    * in one caller, so that no caller dials `apps.connections.open` to be answered `not_authed`
    * every time, under an error naming neither `app_token` nor Socket Mode.
+   *
+   * The dial pacer is read HERE for the same reason: every route to a dial goes through this
+   * method, so a caller that retries — its own loop, or a second entry point added later — cannot
+   * turn an unavailable Socket Mode into a dial per attempt against Slack's tightest-limit
+   * endpoint. {@link reconnect} waits the cooldown out before it calls, so it never sees this arm.
    */
   ensureSocket(): Promise<void> {
     if (this.host.settings().appToken === undefined) {
       return Promise.reject(
         new Error('Slack Socket Mode needs an app_token; this deployment has no live push'),
+      );
+    }
+    if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
+      return Promise.reject(
+        new Error(
+          'Slack Socket Mode dialling is backing off; apps.connections.open not attempted',
+        ),
       );
     }
     if (this.wsReady === undefined) {

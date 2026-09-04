@@ -14,7 +14,6 @@ function reference(): ConformanceContext {
     freshTopic: (): Topic => asTopic('t'),
     cleanup: async () => undefined,
     concurrentPost: async () => undefined,
-    supportsBlockingFetch: false,
     carriesSenderIdentity: false,
     absentTopicBehaviour: 'empty-page',
   };
@@ -66,7 +65,7 @@ describe('assertConformanceContext', () => {
     ['absentTopicBehaviour', null],
     ['absentTopicBehaviour', true],
     ['carriesSenderIdentity', 'true'],
-    ['supportsBlockingFetch', 1],
+    ['carriesSenderIdentity', 1],
     ['concurrentPost', 'unsuported'],
     ['concurrentPost', true],
     ['freshTopic', 't-1'],
@@ -114,8 +113,8 @@ describe('a fixture is disconnected however it turns out to be wrong', () => {
   const WRONG: [string, (record: () => void) => unknown, RegExp, boolean][] = [
     [
       'an invalid capability flag',
-      (record) => ({ ...reference(), supportsBlockingFetch: undefined, cleanup: async () => record() }),
-      /invalid `supportsBlockingFetch`/,
+      (record) => ({ ...reference(), carriesSenderIdentity: undefined, cleanup: async () => record() }),
+      /invalid `carriesSenderIdentity`/,
       true,
     ],
     [
@@ -167,7 +166,7 @@ describe('a fixture is disconnected however it turns out to be wrong', () => {
 
   it('hands a well-formed fixture straight back, connected', async () => {
     const ctx = await openContext('ref', (() => Promise.resolve(reference())) as BackendFactory);
-    expect(ctx.supportsBlockingFetch).toBe(false);
+    expect(ctx.carriesSenderIdentity).toBe(false);
   });
 
   it('lets a rejecting factory reject, without inventing a teardown for a fixture that never was', async () => {

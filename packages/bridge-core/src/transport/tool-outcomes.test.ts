@@ -169,7 +169,7 @@ describe('parley_fetch_recent returns the key set its description promises', () 
       plugin.fetchRecent = async (): Promise<never> => {
         throw new NoSuchTopicError('ctx');
       };
-      return { topicAbsent: true };
+      return {};
     },
     'a cancelled long-poll': (plugin: FakePlugin) => {
       plugin.fetchRecent = async (): Promise<never> => {

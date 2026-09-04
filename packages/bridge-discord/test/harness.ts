@@ -133,7 +133,7 @@ export interface FetchStub {
   gatewayFault?: GatewayUrlFault;
   /** Requests the stub has served, optionally filtered to paths containing `pathIncludes`. */
   count(pathIncludes?: string): number;
-  /** Park the NEXT `…/messages` query until {@link release}, to pin a phase of the long-poll. */
+  /** Park the NEXT `…/messages` query until {@link release}, to pin a phase of a page walk. */
   holdNextPage(): void;
   /**
    * Park the NEXT `GET /gateway/bot` until {@link release}, to pin a dial between resolving its url

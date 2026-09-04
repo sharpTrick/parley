@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { asTopic, buildMessage } from '@sharptrick/parley-core';
-import { ASSERTED_PROPERTIES, CLAUSES } from '@sharptrick/parley-conformance';
+import { ASSERTED_PROPERTIES, CLAUSES, type ConformanceContext } from '@sharptrick/parley-conformance';
 import {
   blastRadiusOf,
   BROKEN_SUITE_MARK,
@@ -14,7 +14,13 @@ import {
   MAX_BLAST_RADIUS,
   ReferencePlugin,
 } from './reference-plugin.js';
-import { BOOLEAN_CAPABILITIES, cases, diagnosedAssertions, suiteSource } from './suite-source.js';
+import {
+  BOOLEAN_CAPABILITIES,
+  cases,
+  diagnosedAssertions,
+  escapeRegExp,
+  suiteSource,
+} from './suite-source.js';
 
 /**
  * The suite's negative control. A suite that accepts every plugin certifies nothing, and an
@@ -199,36 +205,42 @@ describe('every assertion carrying its own diagnostic has a variant that reaches
  * kept being certified against them. Neither table above can see it: the clause table is satisfied
  * by a control that exercises the OTHER arm, and the field table by any variant at all.
  *
- * Rows are flag × arm × the clause whose case branches on that flag, derived from `CONTEXT_FIELDS`
- * and from the suite source — so a new capability flag, or a new clause that branches on one,
+ * Rows are flag × arm × the clause whose case branches on that flag, derived from the capability
+ * axes and from the suite source — so a new capability flag, or a new clause that branches on one,
  * arrives as a red row rather than as silently uncontrolled coverage.
  */
 describe('every arm of every capability flag has a plugin that fails it', () => {
-  const declared = new Map<string, Record<string, unknown>>();
+  const declared = new Map<string, ConformanceContext>();
 
   beforeAll(async () => {
     for (const variant of BROKEN_VARIANTS) {
       const ctx = await variant.make();
-      declared.set(variant.name, ctx as unknown as Record<string, unknown>);
+      declared.set(variant.name, ctx);
       await ctx.cleanup().catch(() => undefined);
     }
   }, 120_000);
 
-  const clausesBranchingOn = (field: string): string[] =>
+  const clausesBranchingOn = (read: string): string[] =>
     cases()
-      .filter((c) => new RegExp(`ctx\\.${field}\\b`).test(c.body))
+      .filter((c) => new RegExp(`${escapeRegExp(read)}\\b`).test(c.body))
       .flatMap((c) => CLAUSES.filter((clause) => c.title.includes(clause)));
 
-  const rows = BOOLEAN_CAPABILITIES.flatMap((field) =>
-    clausesBranchingOn(field).flatMap((clause) =>
-      [true, false].map((arm) => [field, arm, clause] as [string, boolean, string]),
+  const axisNamed = (name: string): (typeof BOOLEAN_CAPABILITIES)[number] => {
+    const axis = BOOLEAN_CAPABILITIES.find((a) => a.name === name);
+    if (axis === undefined) throw new Error(`no capability axis named ${name}`);
+    return axis;
+  };
+
+  const rows = BOOLEAN_CAPABILITIES.flatMap((axis) =>
+    clausesBranchingOn(axis.read).flatMap((clause) =>
+      [true, false].map((arm) => [axis.name, arm, clause] as [string, boolean, string]),
     ),
   );
 
   it('finds a branching clause for every boolean flag, so the rows below grade something', () => {
     expect(BOOLEAN_CAPABILITIES.length).toBeGreaterThan(1);
-    for (const field of BOOLEAN_CAPABILITIES) {
-      expect(clausesBranchingOn(field), `no case branches on \`ctx.${field}\``).not.toEqual([]);
+    for (const axis of BOOLEAN_CAPABILITIES) {
+      expect(clausesBranchingOn(axis.read), `no case branches on \`${axis.read}\``).not.toEqual([]);
     }
     expect(rows.length).toBeGreaterThan(3);
   });
@@ -237,15 +249,19 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
     expect([...declared.keys()].sort()).toEqual(BROKEN_VARIANTS.map((v) => v.name).sort());
   });
 
-  it.each(rows)('`%s` = %s, on the clause "%s"', (field, arm, clause) => {
-    const controls = BROKEN_VARIANTS.filter(
-      (v) =>
-        declared.get(v.name)?.[field] === arm &&
-        (clause.includes(v.mustFail) || v.mustFail.includes(clause)),
-    );
+  it.each(rows)('`%s` = %s, on the clause "%s"', (name, arm, clause) => {
+    const axis = axisNamed(name);
+    const controls = BROKEN_VARIANTS.filter((v) => {
+      const ctx = declared.get(v.name);
+      return (
+        ctx !== undefined &&
+        axis.arm(ctx) === arm &&
+        (clause.includes(v.mustFail) || v.mustFail.includes(clause))
+      );
+    });
     expect(
       controls.map((v) => v.name),
-      `no BROKEN_VARIANTS entry declares \`${field}: ${String(arm)}\` and fails "${clause}" — ` +
+      `no BROKEN_VARIANTS entry declares \`${name}: ${String(arm)}\` and fails "${clause}" — ` +
         `every assertion inside that arm can be deleted with this package staying green`,
     ).not.toEqual([]);
   });

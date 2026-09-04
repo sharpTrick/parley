@@ -50,12 +50,12 @@ describe('telegram poll-loop fault isolation', () => {
  * Store-visibility and delivery are ONE decision, and a step that runs after the record is already
  * durable must not be able to split them. The amortized compaction is that step: it runs at the end
  * of `append`, so a full disk or an unusable temp path used to throw out of a write that had already
- * succeeded — the caller was told the message was dropped, no live subscriber was pushed it, and a
- * parked long poll waited out its whole budget for a message the very next `fetchRecent` returned.
+ * succeeded — the caller was told the message was dropped while the very next `fetchRecent`
+ * returned it, and no live subscriber was pushed it at all.
  *
  * Each cell fails one step on one ingest path and grades the invariant in BOTH directions: a record
- * `fetchRecent` can see also reached every subscriber and woke every waiter, or it is absent
- * everywhere and the caller was told so.
+ * `fetchRecent` can see also reached every subscriber, or it is absent everywhere and the caller was
+ * told so.
  *
  * Whether the record ends up present is NOT the same question as whether the failing step ran after
  * it was durable, so the two are separate axes here. An inbound update whose write failed is not

@@ -61,6 +61,10 @@ export class ReferencePlugin implements BackendPlugin {
     this.blocking = blocking;
   }
 
+  get capabilities(): { blockingFetch: boolean } {
+    return { blockingFetch: this.blocking };
+  }
+
   connect(_config: BackendConfig): Promise<void> {
     this.connected = true;
     return Promise.resolve();
@@ -99,7 +103,8 @@ export class ReferencePlugin implements BackendPlugin {
   }
 
   /**
-   * `blocking` is the OTHER arm of `supportsBlockingFetch`, and it has to be honoured for real: the
+   * `blocking` is the OTHER arm of the declared `blockingFetch` capability, and it has to be
+   * honoured for real: the
    * suite's native-blocking assertions grade waking on the message rather than on the budget, and a
    * poll would satisfy them by accident. Keep the read and the waiter in ONE synchronous turn, so
    * that a write landing between them cannot be lost — that window is what the suite's 0-3 ms race
@@ -163,19 +168,19 @@ let seq = 0;
 
 /**
  * The capability flags every fixture here used to hard-code, which made them a CONSTANT rather than
- * an axis: with `supportsBlockingFetch` false everywhere, nothing in this package ever ran the
- * suite's native-blocking half or the true arm of its lost-wakeup race, and both could be deleted
- * with the package green while eight backends that declare the capability kept being certified
- * against them. Every fixture below states which arm it takes, and `BROKEN_VARIANTS` covers both.
+ * an axis: with the polling arm taken everywhere, nothing in this package ever ran the suite's
+ * native-blocking half or the true arm of its lost-wakeup race, and both could be deleted with the
+ * package green while backends that declare the capability kept being certified against them. Every
+ * fixture below states which arm it takes, and `BROKEN_VARIANTS` covers both.
  */
-type Capabilities = Pick<ConformanceContext, 'supportsBlockingFetch' | 'carriesSenderIdentity'>;
+type Capabilities = Pick<ConformanceContext, 'carriesSenderIdentity'>;
 
 const DEFAULT_CAPABILITIES: Capabilities = {
-  supportsBlockingFetch: false,
   carriesSenderIdentity: true,
 };
 
 const delegate = (inner: ReferencePlugin): BackendPlugin => ({
+  capabilities: inner.capabilities,
   connect: (c) => inner.connect(c),
   disconnect: () => inner.disconnect(),
   subscribe: (t, h) => inner.subscribe(t, h),
@@ -231,14 +236,14 @@ export const makeReferenceContext = (): Promise<ConformanceContext> => {
 };
 
 /**
- * The positive control on the OTHER arm of `supportsBlockingFetch` — a reference that really honours
+ * The positive control on the OTHER arm of `capabilities.blockingFetch` — a reference that really honours
  * `blockMs` inside `fetchRecent`, as Redis, NATS, Matrix, Postgres, XMPP, Slack, Discord and Zulip
  * declare they do. Without it the suite's native-blocking assertions are satisfiable by nothing in
  * this repo, which is indistinguishable from their being deleted.
  */
 export const makeBlockingReferenceContext = (): Promise<ConformanceContext> => {
   const store = newReferenceStore();
-  return context(new ReferencePlugin(store, true), store, { supportsBlockingFetch: true });
+  return context(new ReferencePlugin(store, true), store);
 };
 
 /** The handle a backend that stamps its own account reports instead of `post`'s `identity`. */
@@ -339,10 +344,11 @@ export const blastRadiusOf = (v: BrokenVariant): number => v.blastRadius ?? NARR
  */
 const wrap = async (
   over: (inner: ReferencePlugin) => Partial<BackendPlugin>,
-  caps: Partial<Capabilities> = {},
+  opts: Partial<Capabilities> & { nativeBlocking?: boolean } = {},
 ): Promise<ConformanceContext> => {
+  const { nativeBlocking = false, ...caps } = opts;
   const store = newReferenceStore();
-  const inner = new ReferencePlugin(store, caps.supportsBlockingFetch ?? false);
+  const inner = new ReferencePlugin(store, nativeBlocking);
   return context({ ...delegate(inner), ...over(inner) }, store, caps);
 };
 
@@ -970,6 +976,18 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       })),
   },
   {
+    // The arm SELECTOR itself. Every variant below declares an arm the fixture then honours, so a
+    // suite that read the arm from anywhere but the plugin's own declaration — a context field
+    // restating it, or a constant — would grade all of them exactly the same. This one declares
+    // native `blockMs` support on a plugin that ignores the budget entirely: it can only fail if
+    // the case reads `capabilities.blockingFetch` off the plugin under test.
+    name: 'a plugin declaring native blockMs support on a read that ignores the budget',
+    blastRadius: 5,
+    mutates: 'capabilities',
+    mustFail: 'blockMs is honoured natively or ignored promptly',
+    make: () => wrap(() => ({ capabilities: { blockingFetch: true } })),
+  },
+  {
     // The idle arm's FLOOR, which nothing could fail: of the three native-blocking variants, two
     // fail arm (a) before reaching it and the third fails on the cursor, so a plugin that declares
     // native `blockMs` support and answers "still nothing" the instant it is asked was certified —
@@ -989,7 +1007,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
                 : { ...args, blockMs: Math.ceil(args.blockMs * EARLY_RETURN_FRACTION) },
             ),
         }),
-        { supportsBlockingFetch: true },
+        { nativeBlocking: true },
       ),
   },
   {
@@ -1011,7 +1029,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             return inner.fetchRecent({ ...args, blockMs: undefined });
           },
         }),
-        { supportsBlockingFetch: true },
+        { nativeBlocking: true },
       ),
   },
   {
@@ -1031,7 +1049,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             return { ...page, nextCursor: asCursor(`${String(page.nextCursor)}-drift`) };
           },
         }),
-        { supportsBlockingFetch: true },
+        { nativeBlocking: true },
       ),
   },
   {
@@ -1054,7 +1072,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             return { messages: [], nextCursor: all.nextCursor };
           },
         }),
-        { supportsBlockingFetch: true },
+        { nativeBlocking: true },
       ),
   },
   {

@@ -220,9 +220,9 @@ describe('zulip resolveIdentity', () => {
 });
 
 /**
- * The two passes below used to be copy-pasted context literals and had already drifted apart in the
- * long-poll cap. Guard the class, not that instance: a third transport or a second stream must go
- * through the shared factory rather than being pasted in here again.
+ * The two passes below used to be copy-pasted context literals and had already drifted apart.
+ * Guard the class, not that instance: a third transport or a second stream must go through the
+ * shared factory rather than being pasted in here again.
  */
 describe('zulip conformance passes share one context factory', () => {
   it('declares no conformance capability inline', () => {
@@ -230,7 +230,7 @@ describe('zulip conformance passes share one context factory', () => {
     const inlineCapabilities = source
       .split('\n')
       .map((line, i) => ({ line: i + 1, text: line.trim() }))
-      .filter((l) => /^(supportsBlockingFetch|carriesSenderIdentity|concurrentPost|freshTopic):/.test(l.text));
+      .filter((l) => /^(carriesSenderIdentity|concurrentPost|freshTopic):/.test(l.text));
     expect(inlineCapabilities).toEqual([]);
   });
 });

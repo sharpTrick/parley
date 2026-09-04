@@ -351,8 +351,8 @@ const HANDSHAKE_ROUTES: string[] = await (async (): Promise<string[]> => {
 /**
  * Every event queue the plugin opens is a server-side resource against the bot's queue budget, and
  * only the plugin knows the id. The ledger below is the class: whatever path minted a queue —
- * subscribe, a re-register after a GC, a blocking fetch's dedicated queue — the plugin must have
- * asked the server to drop it by the time `disconnect()` returns.
+ * subscribe, or a re-register after a GC — the plugin must have asked the server to drop it by the
+ * time `disconnect()` returns.
  */
 describe('zulip releases every event queue it opens', () => {
   for (const recoveries of [1, 3, 10]) {
@@ -429,4 +429,45 @@ describe('zulip releases every event queue it opens', () => {
       }, 30_000);
     }
   }
+});
+
+/**
+ * CLASS: teardown ENDS the request it is waiting on rather than waiting it out. `disconnect()`
+ * awaits every push loop, and a loop parked in an `/events` long-poll exits only when that request
+ * ends — so a teardown that does not cancel the in-flight poll spends the whole `events_timeout_ms`
+ * (bounded from above only by the loop-exit race), per connection, on every disconnect a caller
+ * makes and on every MCP process exit.
+ *
+ * Graded as the LATENCY a caller observes against the budget the config publishes, never as the
+ * presence of a registry the abort happens to be spelled with today.
+ */
+describe('disconnect ends an in-flight events long-poll instead of waiting it out', () => {
+  /** Far above the settle bound, so a teardown that waits the poll out cannot pass by being quick. */
+  const EVENTS_TIMEOUT_MS = 8000;
+  /** Generous for a cancel-and-await, an order of magnitude under the budget being cancelled. */
+  const SETTLE_BOUND_MS = 800;
+
+  it.each([1, 3])('with %i topic(s) parked on the server', async (topics) => {
+    // No heartbeat inside the test's lifetime: every poll is genuinely parked server-side, which is
+    // the healthy idle state a live deployment spends almost all of its time in.
+    const { plugin, fake } = await boot(
+      { heartbeatMs: 120_000 },
+      { events_timeout_ms: EVENTS_TIMEOUT_MS },
+    );
+    const names = Array.from({ length: topics }, () => `t-${rand()}`);
+    for (const name of names) await plugin.subscribe(asTopic(name), () => undefined);
+
+    await vi.waitFor(
+      () => expect(fake.requestCount('GET /api/v1/events')).toBeGreaterThanOrEqual(topics),
+      { timeout: 4000, interval: 10 },
+    );
+
+    const t0 = Date.now();
+    await plugin.disconnect();
+    expect(
+      Date.now() - t0,
+      `disconnect waited out the ${EVENTS_TIMEOUT_MS}ms events budget instead of cancelling the ` +
+        'poll it was parked on',
+    ).toBeLessThan(SETTLE_BOUND_MS);
+  });
 });

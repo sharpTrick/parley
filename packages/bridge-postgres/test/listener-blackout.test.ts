@@ -14,8 +14,8 @@ import { sleep } from './pg-harness.js';
 //     and is not queryable') is what would stop the whole bridge coming up.
 //   - a call that MUST NOT fail keeps its guarantee, which is asserted as the observable
 //     consequence and not as the absence of a throw: a subscribe's live path really delivers once
-//     the reconnect lands, and a blocking fetch really comes back with an empty page inside its
-//     own block budget rather than parking on the dead connection.
+//     the reconnect lands, and a catch-up read really comes back with an empty page promptly
+//     rather than parking on the dead connection.
 //
 // Every cell asserts its declared outcome unconditionally, so a cell that changes arm — a call
 // that starts failing, or one that stops — fails here instead of quietly grading nothing.
@@ -73,14 +73,15 @@ vi.mock('pg', async () => {
 const URL = 'postgres://app:s3cret@db.example.com:5432/prod';
 /** The plugin's own backoff between listener reconnect attempts. */
 const RECONNECT_DELAY_MS = 500;
-const BLOCK_MS = 200;
+/** A catch-up read must answer inside this even while the listener is down. */
+const READ_BOUND_MS = 1700;
 
 async function until(pred: () => boolean, budgetMs = 5000): Promise<void> {
   const deadline = Date.now() + budgetMs;
   while (!pred() && Date.now() < deadline) await sleep(5);
 }
 
-type Call = 'subscribe a new topic' | 'blocking fetchRecent' | 'subscribe the same topic again';
+type Call = 'subscribe a new topic' | 'fetchRecent' | 'subscribe the same topic again';
 type Window =
   | 'during the blackout'
   | 'during a blackout the reconnect cannot end'
@@ -96,8 +97,8 @@ const WINDOWS: Window[] = [
 /**
  * The arm each cell is graded against. A fresh subscribe is the only call that can fail: it needs
  * a LISTEN, so it waits for the reconnect and gives up only when that wait runs out. A repeat
- * subscribe is a registration on a channel already held, and a blocking fetch degrades to core's
- * poll fallback — neither may surface the outage to the caller.
+ * subscribe is a registration on a channel already held, and a catch-up read goes to the pool, not
+ * to the listener connection — neither may surface the outage to the caller.
  */
 const EXPECTS: Record<Call, Record<Window, Outcome>> = {
   'subscribe a new topic': {
@@ -105,7 +106,7 @@ const EXPECTS: Record<Call, Record<Window, Outcome>> = {
     'during a blackout the reconnect cannot end': 'rejects',
     'after the reconnect has landed': 'resolves',
   },
-  'blocking fetchRecent': {
+  'fetchRecent': {
     'during the blackout': 'resolves',
     'during a blackout the reconnect cannot end': 'resolves',
     'after the reconnect has landed': 'resolves',
@@ -155,8 +156,8 @@ describe('a seam call across a listener blackout keeps its declared outcome', ()
         const started = Date.now();
         let rejection: Error | undefined;
         let page: FetchRecentResult | undefined;
-        await (cell.call === 'blocking fetchRecent'
-          ? plugin.fetchRecent({ topic: target, since: asCursor('0'), blockMs: BLOCK_MS })
+        await (cell.call === 'fetchRecent'
+          ? plugin.fetchRecent({ topic: target, since: asCursor('0') })
           : plugin.subscribe(target, (m) => got.push(m))
         ).then(
           (result) => {
@@ -180,12 +181,12 @@ describe('a seam call across a listener blackout keeps its declared outcome', ()
 
         expect(rejection, 'this call is supposed to survive this window').toBeUndefined();
 
-        if (cell.call === 'blocking fetchRecent') {
-          // Not merely "it did not throw": the fetch has to come back with a page, inside its own
-          // block budget, rather than parking on a connection that is never coming back.
+        if (cell.call === 'fetchRecent') {
+          // Not merely "it did not throw": the read has to come back with a page, promptly, rather
+          // than parking on a connection that is never coming back.
           expect((page as FetchRecentResult).messages).toEqual([]);
           expect(String((page as FetchRecentResult).nextCursor)).toBe('0');
-          expect(elapsedMs, 'the fetch outlived its own block budget').toBeLessThan(BLOCK_MS + 1500);
+          expect(elapsedMs, 'the read waited on the listener connection').toBeLessThan(READ_BOUND_MS);
           return;
         }
 

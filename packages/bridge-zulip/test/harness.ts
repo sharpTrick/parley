@@ -192,8 +192,6 @@ export function makeZulipContext(args: {
     await plugin.connect(args.connect);
     return {
       plugin,
-      // `fetchRecent` reads history; it takes no wait. The suite grades the weaker contract.
-      supportsBlockingFetch: false,
       // Zulip stamps the sender from the authenticated bot, not from `post`'s `identity`.
       carriesSenderIdentity: false,
       freshTopic: (): Topic => asTopic(`t-${++contextSeq}-${rand()}`),

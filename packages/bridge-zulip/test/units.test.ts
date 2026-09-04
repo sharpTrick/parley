@@ -339,6 +339,5 @@ describe('every wait the plugin takes is bounded and escalates', () => {
 
   it("a parked poll's deadline clears the cap it asked the server to hold for", () => {
     expect(longPollDeadlineMs(600_000)).toBeGreaterThan(600_000);
-    expect(longPollDeadlineMs(-1)).toBe(longPollDeadlineMs(0));
   });
 });

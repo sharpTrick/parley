@@ -6,9 +6,9 @@
  *
  * (1) An unguarded dereference of an inbound field (`event.ts`) throws inside a `ws.on('message')`
  *     callback. There is no caller to propagate to, so it becomes an `uncaughtException` and takes
- *     the whole bridge process down. The waiter loop that a blocking `fetchRecent` parks runs
- *     BEFORE any route dispatch and outside its try/catch, so the arm with no route registered is
- *     the dangerous one — and the one nothing else in the suite drives.
+ *     the whole bridge process down. The envelope is parsed and ACKED before any route dispatch,
+ *     so the arm with no route registered is the dangerous one — and the one nothing else in the
+ *     suite drives.
  *
  * (2) Slack redelivers an unacked envelope and eventually drops the connection, so an ack that only
  *     lands for envelopes reaching a registered handler turns ordinary `channel_join` traffic into

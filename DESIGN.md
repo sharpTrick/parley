@@ -130,10 +130,13 @@ interface BackendPlugin {
     since?: Cursor;     // monotonic position (§6); omit = backend default window
     limit?: number;
     blockMs?: number;   // long-poll HINT: if empty past `since`, a plugin MAY block up to blockMs
-                        // for a new message before returning (possibly empty). Only a hint — core
-                        // wraps this with a generic poll fallback on the fetch_recent tool, so every
-                        // backend long-polls with or without native support; value is capped
-                        // server-side (catchup.block_max_ms, default 60s). 0/omit = return at once.
+                        // for a new message before returning (possibly empty). Only a hint — a
+                        // plugin that ignores it is still correct. The fetch_recent TOOL offers
+                        // `block_ms` only where the plugin declares capabilities.blockingFetch
+                        // (Redis, NATS); elsewhere it is off the schema and a call sending it is
+                        // refused. An embedder can still drive core's generic poll fallback
+                        // directly via fetchRecentBlocking. Value is capped server-side
+                        // (catchup.block_max_ms, default 60s). 0/omit = return at once.
   }): Promise<{ messages: Message[]; nextCursor: Cursor }>;
 
   // 5. Map a logical handle to a backend identity. Best-effort: a real account lookup where
@@ -408,11 +411,12 @@ post_topics:               # OPTIONAL extra topics allowed for post/fetch only, 
 catchup:
   on_start: true
   limit: 100                    # page size per fetchRecent
-  block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll;
-                                # a caller's value is clamped to this before it reaches a plugin,
-                                # kept below client tool timeouts so a blocked call never trips them
-  block_poll_interval_ms: 250    # re-query cadence for core's generic long-poll fallback, used only
-                                 # by backends that cannot block natively (SQLite). Latency/cost only.
+  block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll,
+                                # where the backend declares it; a caller's value is clamped to this
+                                # before it reaches a plugin, kept below client tool timeouts so a
+                                # blocked call never trips them
+  block_poll_interval_ms: 250    # re-query cadence for core's generic long-poll, which an EMBEDDER
+                                 # drives through fetchRecentBlocking. Latency/cost only.
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
@@ -798,8 +802,9 @@ the name (`parley`), so the evocative name and the searchable terms both do thei
 - [x] **Project name: `parley`** — locked. Propagates to package/repo/scope/channel id.
 - [x] Design handed to a Code instance; `CLAUDE.md` and `TASKS.md` written and worked to
       completion. v0.1–v1 plus the post-v1 OIDC mode all shipped.
-- [ ] **Cut 1.0.** The seam has been frozen since v0.1 and survived ten backends and one
-      post-freeze capability (`block_ms`) with no changes — see `docs/1.0-readiness.md` for the
+- [ ] **Cut 1.0.** The seam has been frozen since v0.1 and survived ten backends, one post-freeze
+      capability (`block_ms`) and its later WITHDRAWAL from eight of them — both additively, both
+      as optional fields — with no method changes; see `docs/1.0-readiness.md` for the
       evidence, what 1.0 would and would not freeze, and the mechanics. Deliberately not
       automatic: per `CLAUDE.md`, breaking changes land as `feat:` until 1.0 is cut on purpose.
 - [ ] Deferred by choice, not oversight (see `TASKS.md`): spawn-on-unknown-handle, richer

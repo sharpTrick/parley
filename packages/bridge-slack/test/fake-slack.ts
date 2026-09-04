@@ -23,7 +23,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { compareTs } from '../src/index.js';
 
 /** Default page size — small enough that the 100-message conformance case spans 3 pages. */
-const DEFAULT_PAGE_SIZE = 50;
+export const DEFAULT_PAGE_SIZE = 50;
 
 interface StoredMessage {
   type: 'message';
@@ -143,9 +143,9 @@ export class FakeSlack {
   /** Count of `hello` envelopes sent (only when greeting) — marks a settled Socket Mode connection. */
   helloSent = 0;
   /**
-   * Greeted connections that have since closed. Each one is a drain on the plugin side — it releases
-   * every long-poll parked on that stream — so a per-call request ceiling that a lost socket
-   * legitimately widens can be stated over THIS instead of over a hand-tuned constant.
+   * Greeted connections that have since closed. Each one costs the plugin a redial, so a per-call
+   * request ceiling that a lost socket legitimately widens can be stated over THIS instead of over
+   * a hand-tuned constant.
    */
   establishedClosed = 0;
 

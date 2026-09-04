@@ -103,12 +103,14 @@ health above the seam needs a core-owned path and is not something this plugin c
 The retention prune reports failures the same way (quiet for lock contention, a rate-limited
 stderr line otherwise), so a retention policy the process cannot enforce is never silent.
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. SQLite
-is polling-only, so there's no native block to serve this — it comes for free from core's generic
-long-poll wrapper (a short internal poll-and-recheck), zero plugin change. Core caps the wait at
-`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+**No `fetch_recent` long-poll here.** SQLite is polling-only: its read primitive takes no wait, so
+this plugin declares `capabilities.blockingFetch: false` and core leaves `block_ms` off the
+`parley_fetch_recent` schema this deployment advertises — a call that sends it anyway is refused by
+name rather than accepted and silently stripped. An agent polls on its own cadence, or runs under
+Claude Code with `live_push.enabled` and is pushed a `<channel>` event. Core's generic long-poll
+wrapper is still public API for an EMBEDDER (`fetchRecentBlocking`, re-driving at
+`catchup.block_poll_interval_ms` and capped by `catchup.block_max_ms`); it is only the MCP schema
+that narrows.
 
 ## Config (`backend_config`)
 

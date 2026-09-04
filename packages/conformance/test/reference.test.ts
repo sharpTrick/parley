@@ -1,4 +1,4 @@
-import { CONTEXT_FIELDS, runConformanceSuite } from '@sharptrick/parley-conformance';
+import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import {
@@ -7,7 +7,7 @@ import {
   makeStampedSenderReferenceContext,
   makeThrowingReferenceContext,
 } from './reference-plugin.js';
-import { BOOLEAN_CAPABILITIES } from './suite-source.js';
+import { BOOLEAN_CAPABILITIES, suiteSource } from './suite-source.js';
 
 const FIXTURES: [string, () => Promise<import('@sharptrick/parley-conformance').ConformanceContext>][] =
   [
@@ -20,9 +20,9 @@ const FIXTURES: [string, () => Promise<import('@sharptrick/parley-conformance').
 // The suite's positive control, and the only run of it that needs no server: an in-memory plugin
 // the repo controls, which must pass in full. Both arms of the seam's absent-topic MAY are covered
 // here, because no shipped backend takes the throwing arm and nothing else would ever grade it.
-// The last two cover the other arm of each BOOLEAN capability flag: with every fixture declaring
-// `supportsBlockingFetch: false` the suite's whole native-blocking half ran nowhere, which is
-// indistinguishable from its being deleted.
+// The last two cover the other arm of each BOOLEAN capability: with every fixture on the polling
+// arm the suite's whole native-blocking half ran nowhere, which is indistinguishable from its
+// being deleted.
 for (const [label, make] of FIXTURES) runConformanceSuite(label, make);
 
 /**
@@ -31,24 +31,35 @@ for (const [label, make] of FIXTURES) runConformanceSuite(label, make);
  * fixture that fails.
  */
 describe('the reference fixtures cover both arms of every boolean capability', () => {
-  it.each(BOOLEAN_CAPABILITIES.flatMap((f) => [true, false].map((arm) => [f, arm] as const)))(
-    'some passing fixture declares `%s` = %s',
-    async (field, arm) => {
-      const contexts = await Promise.all(FIXTURES.map(async ([, make]) => make()));
-      try {
-        expect(
-          contexts.filter((c) => (c as unknown as Record<string, unknown>)[field] === arm).length,
-          `no reference fixture takes the \`${field}: ${String(arm)}\` arm, so nothing in this ` +
-            `repo demonstrates that arm's assertions are satisfiable at all`,
-        ).toBeGreaterThan(0);
-      } finally {
-        await Promise.all(contexts.map((c) => c.cleanup().catch(() => undefined)));
-      }
-    },
-  );
+  const axisNamed = (name: string): (typeof BOOLEAN_CAPABILITIES)[number] => {
+    const axis = BOOLEAN_CAPABILITIES.find((a) => a.name === name);
+    if (axis === undefined) throw new Error(`no capability axis named ${name}`);
+    return axis;
+  };
 
-  it('reads real capability fields, so the rows above are not an empty table', () => {
-    expect(BOOLEAN_CAPABILITIES.every((f) => f in CONTEXT_FIELDS)).toBe(true);
+  it.each(
+    BOOLEAN_CAPABILITIES.flatMap((a) => [true, false].map((arm) => [a.name, arm] as const)),
+  )('some passing fixture declares `%s` = %s', async (name, arm) => {
+    const axis = axisNamed(name);
+    const contexts = await Promise.all(FIXTURES.map(async ([, make]) => make()));
+    try {
+      expect(
+        contexts.filter((c) => axis.arm(c) === arm).length,
+        `no reference fixture takes the \`${name}: ${String(arm)}\` arm, so nothing in this ` +
+          `repo demonstrates that arm's assertions are satisfiable at all`,
+      ).toBeGreaterThan(0);
+    } finally {
+      await Promise.all(contexts.map((c) => c.cleanup().catch(() => undefined)));
+    }
+  });
+
+  // Each axis must be something the suite actually branches on — read through the SAME expression
+  // the cases use, so an axis whose fact moved (out of the context and onto the seam, as
+  // `blockingFetch` did) cannot keep grading a spelling nothing reads any more.
+  it('reads capability axes the suite branches on, so the rows above are not an empty table', () => {
+    for (const axis of BOOLEAN_CAPABILITIES) {
+      expect(suiteSource, `nothing in the suite reads \`${axis.read}\``).toContain(axis.read);
+    }
     expect(BOOLEAN_CAPABILITIES.length).toBeGreaterThan(1);
   });
 });

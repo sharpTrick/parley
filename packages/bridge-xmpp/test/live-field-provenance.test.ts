@@ -97,7 +97,7 @@ const cells = children.flatMap((child) =>
 // message takes. The table above only grades whether a forged VALUE is honoured, so a child that
 // makes the message vanish before it is ever parsed satisfies every row of it — and vanishing is
 // worse than a forged field: the message is in the archive, so catch-up returns it while the live
-// path and every parked long-poll never see it, which is exactly the divergence the README forbids.
+// path never sees it, which is exactly the divergence the README forbids.
 // The generator is over the children the dispatcher and the stanza parser BRANCH on, whatever they
 // are for, because it is the branch and not the child that is the hazard.
 const readChildren: Array<{ name: string; build(room: string): unknown }> = [

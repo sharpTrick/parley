@@ -374,8 +374,7 @@ describe('Discord gateway handshake never completes', () => {
   const HANDSHAKE = 3000;
 
   // A socket that connects but never finishes HELLO → IDENTIFY → READY must not park an entry
-  // point forever: every seam call has to settle within a bounded multiple of ITS OWN budget,
-  // or `block_ms` (and core's catchup.block_max_ms cap) is silently unbounded.
+  // point forever: every seam call has to settle within a bounded multiple of its own budget.
   const STALLS: Array<{ label: string; identifyReplies: boolean; sendHello: boolean }> = [
     { label: 'no HELLO ever arrives', identifyReplies: false, sendHello: false },
     { label: 'HELLO arrives but IDENTIFY is ignored', identifyReplies: false, sendHello: true },
@@ -385,15 +384,6 @@ describe('Discord gateway handshake never completes', () => {
   // The entry point RESOLVES on a stall: a stalled handshake is transient, the failed dial is
   // already on the reconnect ladder, and the gateway carries only new messages — so the call has
   // nothing to report but the diagnostic. Only a TERMINAL close rejects (its own suite below).
-  const ENTRIES: Array<{ label: string; budget: number; run: (p: DiscordPlugin) => Promise<unknown> }> =
-    [
-      {
-        label: 'subscribe',
-        budget: HANDSHAKE,
-        run: (p) => p.subscribe(asTopic('900001'), () => undefined),
-      },
-    ];
-
   beforeEach(() => {
     resetGateway();
     stubFetch();
@@ -406,41 +396,35 @@ describe('Discord gateway handshake never completes', () => {
   });
 
   for (const stall of STALLS) {
-    for (const entry of ENTRIES) {
-      it(`${entry.label} settles when ${stall.label}`, async () => {
-        gw.state.onIdentify = stall.identifyReplies
-          ? (ws: FakeWs) => ws.ready()
-          : () => undefined;
-        const plugin = new DiscordPlugin();
-        await plugin.connect({
-          token: 't',
-          gateway_url: 'ws://fake',
-          handshake_timeout_ms: HANDSHAKE,
-        });
-
-        const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-        const state = track(entry.run(plugin));
-        const ws = gw.instances.at(-1);
-        if (stall.sendHello) ws?.hello(HUGE_HB);
-
-        await vi.advanceTimersByTimeAsync(entry.budget * 2 + 500);
-        expect(state.settled).toBe(true);
-        expect(state.error).toBeUndefined();
-
-        // Only the subscribe row's budget IS the handshake budget; the blocking fetch hands its own
-        // (shorter) budget back long before the watchdog fires, which is the point of its row.
-        if (!stall.identifyReplies && entry.label === 'subscribe') {
-          expect(ws?.terminated).toBe(true); // the dead socket is not left dangling
-          // A stall that resolves silently is the idle-bridge failure: subscribe owes the operator
-          // a line naming the topic it could not bring up.
-          const written = diag.mock.calls.map((c) => String(c[0])).join('');
-          expect(written).toContain('900001');
-          expect(written).toMatch(/handshake|READY/i);
-        }
-
-        await plugin.disconnect();
+    it(`subscribe settles when ${stall.label}`, async () => {
+      gw.state.onIdentify = stall.identifyReplies ? (ws: FakeWs) => ws.ready() : () => undefined;
+      const plugin = new DiscordPlugin();
+      await plugin.connect({
+        token: 't',
+        gateway_url: 'ws://fake',
+        handshake_timeout_ms: HANDSHAKE,
       });
-    }
+
+      const diag = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      const state = track(plugin.subscribe(asTopic('900001'), () => undefined));
+      const ws = gw.instances.at(-1);
+      if (stall.sendHello) ws?.hello(HUGE_HB);
+
+      await vi.advanceTimersByTimeAsync(HANDSHAKE * 2 + 500);
+      expect(state.settled).toBe(true);
+      expect(state.error).toBeUndefined();
+
+      if (!stall.identifyReplies) {
+        expect(ws?.terminated).toBe(true); // the dead socket is not left dangling
+        // A stall that resolves silently is the idle-bridge failure: subscribe owes the operator
+        // a line naming the topic it could not bring up.
+        const written = diag.mock.calls.map((c) => String(c[0])).join('');
+        expect(written).toContain('900001');
+        expect(written).toMatch(/handshake|READY/i);
+      }
+
+      await plugin.disconnect();
+    });
   }
 
   it(`a stalled first open uses the default handshake timeout (${DEFAULT_HANDSHAKE_TIMEOUT_MS}ms) when none is configured`, async () => {

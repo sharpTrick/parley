@@ -428,9 +428,9 @@ describe('XMPP seam calls whose transport fails mid-call leave nothing behind', 
         settled = true;
       };
       void entry.call(plugin).then(mark, mark);
-      // A blocking fetch parks for its whole budget, so give every entry point the room to finish
-      // on its own terms — but stop the moment it does, so that a registry entry cleared by its own
-      // 15 s timeout cannot pass for one the failure path settled.
+      // Give every entry point the room to finish on its own terms — but stop the moment it does,
+      // so that a registry entry cleared by its own 15 s timeout cannot pass for one the failure
+      // path settled.
       await vi.advanceTimersByTimeAsync(0);
       for (let waited = 0; !settled && waited < 90_000; waited += 1_000) {
         await vi.advanceTimersByTimeAsync(1_000);

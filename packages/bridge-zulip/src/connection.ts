@@ -9,15 +9,6 @@ export interface QueueState {
 }
 
 /**
- * A single bounded wait that a `disconnect()` can also end. Keep `release` synchronous, so that no
- * teardown a wait owns can run inside a caller's seam call.
- */
-export interface BoundedWait {
-  readonly waited: Promise<void>;
-  readonly release: () => void;
-}
-
-/**
  * The live connection: the registries every seam call and every push loop addresses, the transport
  * bound to the config the connection was opened with, and the teardown that ends all of it.
  */
@@ -106,15 +97,15 @@ export class ZulipConnection {
   }
 
   /**
-   * A wait ending at `ms` or on `disconnect()` — once, with every registration undone. Keep the
-   * `stopped` re-check after the registration, so that a teardown racing the arming cannot leave the
-   * wait parked with nothing left to release it.
+   * A pause ending at `ms` or on `disconnect()`, so that teardown never waits out a backoff — once,
+   * with every registration undone. Keep the `stopped` re-check after the registration, so that a
+   * teardown racing the arming cannot leave the pause parked with nothing left to release it.
    */
-  timedWait(ms: number): BoundedWait {
-    let release!: () => void;
-    const waited = new Promise<void>((resolve) => {
+  async interruptibleDelay(ms: number): Promise<void> {
+    if (this.stopped || ms <= 0) return;
+    await new Promise<void>((resolve) => {
       let done = false;
-      release = (): void => {
+      const release = (): void => {
         if (done) return;
         done = true;
         clearTimeout(timer);
@@ -125,13 +116,6 @@ export class ZulipConnection {
       this.pendingAborts.add(release);
       if (this.stopped) release();
     });
-    return { waited, release };
-  }
-
-  /** A pause that also ends on `disconnect()`, so that teardown never waits out a backoff. */
-  async interruptibleDelay(ms: number): Promise<void> {
-    if (this.stopped || ms <= 0) return;
-    await this.timedWait(ms).waited;
   }
 
   /**

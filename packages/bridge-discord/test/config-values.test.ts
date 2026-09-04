@@ -11,7 +11,7 @@ import { probe, settleOf } from './harness.js';
  * unchecked record and refuses only the key NAMES, so every value arrives as whatever the YAML
  * held and lands in one of three sinks — the channel id a topic routes to, a `setTimeout` delay,
  * or the URL a credentialed call is sent to. Two instances shipped: a numeric `channel_map` value
- * (the shape an unquoted YAML channel id has) keyed `subs`/`waiters` under a number while dispatch
+ * (the shape an unquoted YAML channel id has) keyed `subs` under a number while dispatch
  * looked them up under the string Discord sends, so the topic posted and caught up but was
  * PERMANENTLY DEAF to push, with no diagnostic; and `handshake_timeout_ms: '10s'` reached
  * `setTimeout` as NaN, so every dial failed 1 ms after the socket opened, forever, spending the

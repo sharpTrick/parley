@@ -47,10 +47,12 @@ them stops owning a case — a conformance clause used to be deletable with noth
 - resolveIdentity answers for the handle it was asked about;
 - distinct senders are not collapsed onto one another;
 - blockMs is honoured natively or ignored promptly — never a hang: it wakes on a concurrent post
-  and returns empty at timeout on a `supportsBlockingFetch` backend — *at* the timeout, having
+  and returns empty at timeout on a backend declaring `capabilities.blockingFetch: true` — *at* the
+  timeout, having
   actually waited (`IDLE_BLOCK_FLOOR_MS`), since a native block that answers "still nothing" at once
   is a long-poll core turns into a hot loop — and returns promptly and empty on one that declares it
-  `false`. The hint is optional; hanging on it is not. A since-LESS read
+  `false`. Which arm is graded is read off the plugin's own `capabilities`, the same declaration
+  core reads to decide whether to advertise `block_ms` — never restated in the fixture. The hint is optional; hanging on it is not. A since-LESS read
   carrying a block budget must come back in a FRACTION of it (`SINCELESS_RETURN_MS`), not merely
   inside it: that is the hot path for every `parley_fetch_recent` an agent makes before it holds a
   cursor, and a bound set at the budget itself certifies a plugin that parks for all of it;
@@ -86,12 +88,6 @@ export interface ConformanceContext {
   concurrentPost:
     | ((topic: Topic, writers: number, perWriter: number) => Promise<void>)
     | 'unsupported';
-  /**
-   * True when the plugin's own read primitive takes a caller's wait (Redis `XREAD BLOCK`, NATS
-   * pull expiry). False when `fetchRecent` reads history and takes no wait — every push-driven
-   * backend, and SQLite, which gets its long-poll from core's wrapper instead.
-   */
-  supportsBlockingFetch: boolean;
   /**
    * True when the backend round-trips `post`'s `identity` as the message's `senderHandle`. False
    * for backends that stamp the authenticated account instead (every hosted SaaS posts as its bot
@@ -138,7 +134,6 @@ async function makeContext() {
     concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
       /* open N independent clients and let each post `perWriter` messages */
     },
-    supportsBlockingFetch: true,
     carriesSenderIdentity: false,
   };
 }

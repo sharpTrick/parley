@@ -13,7 +13,6 @@ async function makeContext() {
   await plugin.connect(cfg);
   return {
     plugin,
-    supportsBlockingFetch: true, // fetchRecent honors blockMs natively via a JetStream pull expiry
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     carriesSenderIdentity: true,
     cleanup: async () => {

@@ -21,6 +21,6 @@ export const reportsLoopFailure = (consecutiveFailures: number): boolean =>
  * idle long-poll: an aborted-but-uncapped poll reads to the loop as a backend failure, and the whole
  * documented `events_timeout_ms` range above 30s would degrade into escalating backoff instead.
  */
-export const longPollDeadlineMs = (blockMs: number): number =>
-  Math.max(0, blockMs) + DEFAULT_DEADLINE_MS;
+export const longPollDeadlineMs = (eventsTimeoutMs: number): number =>
+  eventsTimeoutMs + DEFAULT_DEADLINE_MS;
 

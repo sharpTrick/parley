@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
+import { type ConformanceContext, CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
 
 const SRC = new URL('../src/', import.meta.url);
 
@@ -64,15 +64,51 @@ export const CAPABILITY_FIELDS = Object.keys(CONTEXT_FIELDS).filter(
 );
 
 /**
- * The capability fields with exactly TWO arms, derived from the validators rather than listed: a
- * field whose validator accepts both booleans and rejects a string selects one of two arms, and each
- * arm needs a fixture that takes it. Deriving it means a new boolean flag arrives as new rows
- * instead of as silently uncontrolled coverage.
+ * How a case reads the blocking-fetch arm. Deliberately NOT a context field: the seam already
+ * carries the declaration, and core reads that same one to decide whether to advertise `block_ms`.
+ * A second spelling in test wiring lets a backend flip its declaration with the suite still grading
+ * the arm it used to take.
  */
-export const BOOLEAN_CAPABILITIES = CAPABILITY_FIELDS.filter((field) => {
-  const accepts = CONTEXT_FIELDS[field as keyof typeof CONTEXT_FIELDS];
-  return accepts(true) && accepts(false) && !accepts('either');
-});
+export const BLOCKING_READ = 'ctx.plugin.capabilities?.blockingFetch';
+
+/** Every expression a case can branch on to do less, wherever the fact it reads lives. */
+export const CAPABILITY_READS: string[] = [
+  ...CAPABILITY_FIELDS.map((f) => `ctx.${f}`),
+  BLOCKING_READ,
+];
+
+export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** A capability with exactly two arms: what to call it, how the suite reads it, which arm a fixture takes. */
+export interface CapabilityAxis {
+  name: string;
+  read: string;
+  arm: (ctx: ConformanceContext) => boolean;
+}
+
+/**
+ * The capabilities with exactly TWO arms, each needing a fixture that takes it. The context fields
+ * are derived from the validators rather than listed — a field whose validator accepts both booleans
+ * and rejects a string selects one of two arms — so a new boolean flag arrives as new rows instead
+ * of as silently uncontrolled coverage. The seam-carried ones are named, because no validator here
+ * sees them.
+ */
+export const BOOLEAN_CAPABILITIES: CapabilityAxis[] = [
+  ...CAPABILITY_FIELDS.filter((field) => {
+    const accepts = CONTEXT_FIELDS[field as keyof typeof CONTEXT_FIELDS];
+    return accepts(true) && accepts(false) && !accepts('either');
+  }).map((field) => ({
+    name: field,
+    read: `ctx.${field}`,
+    arm: (ctx: ConformanceContext): boolean =>
+      (ctx as unknown as Record<string, unknown>)[field] === true,
+  })),
+  {
+    name: 'capabilities.blockingFetch',
+    read: BLOCKING_READ,
+    arm: (ctx: ConformanceContext): boolean => ctx.plugin.capabilities?.blockingFetch === true,
+  },
+];
 
 /** The initializer of a `const`/`let`, scanned to the `;` that ends it at nesting depth 0. */
 function initializerAt(text: string, from: number): string {
@@ -229,14 +265,14 @@ export const upToFirstReturn = (region: string): string => {
 };
 
 /**
- * Where a case body decides to do less. Detected as a SHAPE — a `ctx.<capability>` test followed by
- * a region — rather than by the one spelling `testCtx.skip()`, because the cheapest way to
+ * Where a case body decides to do less. Detected as a SHAPE — a capability read followed by a
+ * region — rather than by the one spelling `testCtx.skip()`, because the cheapest way to
  * reintroduce the coverage-for-a-boolean trade is a bare `return` that no spelling-match can see.
  */
-export function guardedRegions(body: string): { field: string; region: string }[] {
-  const out: { field: string; region: string }[] = [];
-  for (const field of CAPABILITY_FIELDS) {
-    for (const m of body.matchAll(new RegExp(`ctx\\.${field}\\b`, 'g'))) {
+export function guardedRegions(body: string): { read: string; region: string }[] {
+  const out: { read: string; region: string }[] = [];
+  for (const read of CAPABILITY_READS) {
+    for (const m of body.matchAll(new RegExp(`${escapeRegExp(read)}\\b`, 'g'))) {
       const open = body.indexOf('{', m.index);
       if (open < 0) continue;
       const header = body.slice(body.lastIndexOf('\n', m.index) + 1, open + 1);
@@ -244,7 +280,7 @@ export function guardedRegions(body: string): { field: string; region: string }[
       // The 'unsupported' sentinel is the one legitimate skip, and the skip check governs it. Keep
       // it exempt HERE only, so that a boolean flag can never borrow the same excuse.
       if (header.includes("'unsupported'")) continue;
-      out.push({ field, region: upToFirstReturn(guardedBlock(body, open)) });
+      out.push({ read, region: upToFirstReturn(guardedBlock(body, open)) });
     }
   }
   return out;

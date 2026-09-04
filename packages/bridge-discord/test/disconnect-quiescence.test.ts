@@ -4,14 +4,12 @@ import { DiscordPlugin } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 import { settleOf, type Settlement } from './harness.js';
 
-// CLASS: a disconnect-quiescence guard whose deletion is invisible. Two of them exist here — the
-// `isStopped` predicate net-util polls while it honours a 429, and the post-wake `stopped` check on
-// the blocking path — and deleting BOTH left the whole package green. Unguarded, a 429 backoff keeps
-// competing for the shared bot token's rate-limit budget for net-util's full deadline after
-// teardown, and a long-poll woken by disconnect()'s own wakeWaiters() issues a fresh REST request
-// against a plugin that has already been torn down. Every cell below asserts the same two things:
-// the parked call settles PROMPTLY once disconnect() lands, and the request count taken at teardown
-// never grows afterwards.
+// CLASS: a disconnect-quiescence guard whose deletion is invisible. The `isStopped` predicate
+// net-util polls while it honours a 429 is one, and deleting it left the whole package green.
+// Unguarded, a 429 backoff keeps competing for the shared bot token's rate-limit budget for
+// net-util's full deadline after teardown. Every cell below asserts the same two things: the parked
+// call settles PROMPTLY once disconnect() lands, and the request count taken at teardown never
+// grows afterwards.
 
 /** Discord's stated wait. Short enough to observe a retry, long enough that settling early is proof. */
 const RETRY_AFTER_S = 1;

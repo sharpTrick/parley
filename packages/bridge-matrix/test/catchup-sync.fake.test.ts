@@ -173,8 +173,8 @@ describe('a foreign block moves this topic cursor only when it fills a page', ()
 
     let since = asCursor(String(idA0));
     const drained: string[] = [];
-    // A budget comfortably longer than one drain, so the plugin's native long-poll really is the
-    // thing reporting the cursor — a budget the first drain already spends returns before it.
+    // A budget comfortably longer than one drain, so core's re-drive really is the thing reporting
+    // the cursor — a budget the first drain already spends returns before it.
     for (let call = 0; call < 4 && drained.length === 0; call++) {
       const page = await fetchRecentBlocking(
         p,

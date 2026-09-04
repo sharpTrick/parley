@@ -32,18 +32,20 @@ export const TOOL_TEXT = {
     'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
     'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor } — ' +
     'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
-    'does not exist yet, or the long-poll was cancelled); re-issue without `since` in that case. ' +
+    'does not exist yet); re-issue without `since` in that case. ' +
     'Call this on session start for each configured topic, then on demand. A topic that does not ' +
     'exist on the backend yet returns an empty page with `topicAbsent: true` rather than an error.',
   /**
    * Appended to {@link TOOL_TEXT.fetch_recent} only where `block_ms` is on the schema. A deployment
    * whose backend declares no native blocking never sends it, so the model is never told to pass an
-   * argument that would be stripped.
+   * argument that would be refused — and never told about a cancellation only a long-poll can have.
    */
   fetch_recent_blocking:
     ' Pass `block_ms` to long-poll: if the queried window is empty — whether or not you passed ' +
     '`since` — the call holds until a message arrives or the timeout elapses (capped ' +
-    'server-side), so a polling agent burns tokens per message, not per tick.',
+    'server-side), so a polling agent burns tokens per message, not per tick. A cancelled ' +
+    'long-poll answers like any other empty window, with `nextCursor` omitted when you passed no ' +
+    '`since`.',
   fetch_recent_since:
     'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
   fetch_recent_block_ms:
@@ -59,6 +61,24 @@ export const TOOL_TEXT = {
     'live channel is only the fast inbound hop, replies always write to the backend. Returns ' +
     '{ backendMsgId }.',
 } as const;
+
+/**
+ * What a deployment answers when the model sends `block_ms` to a backend that declares
+ * `capabilities.blockingFetch: false`. The argument is off the schema there, and the schema says
+ * `additionalProperties: false` — so it is REFUSED, naming the argument and the declaration that
+ * withdrew it, rather than accepted and silently dropped. A caller cannot tell a dropped `block_ms`
+ * from a long-poll that timed out empty, which is a polling agent burning a turn per tick believing
+ * it is parked.
+ */
+export const withdrawnBlockMs =
+  '`block_ms` is not accepted here: this deployment\'s backend declares ' +
+  '`capabilities.blockingFetch: false`, so parley_fetch_recent returns the window it has and ' +
+  'never long-polls. Omit `block_ms` and poll on your own cadence.';
+
+const withdrawnArgument: z.ZodErrorMap = (issue, ctx) =>
+  issue.code === z.ZodIssueCode.unrecognized_keys && issue.keys.includes('block_ms')
+    ? { message: withdrawnBlockMs }
+    : { message: ctx.defaultError };
 
 /** Shared durable write path for both `parley_post` and `parley_reply`. */
 async function doPost(
@@ -119,7 +139,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         TOOL_TEXT.fetch_recent +
         (blocks ? TOOL_TEXT.fetch_recent_blocking : '') +
         describeAllowed(allow),
-      inputSchema: fetchRecentInput,
+      inputSchema: z.object(fetchRecentInput, { errorMap: withdrawnArgument }).strict(),
     },
     async ({ topic, since, limit, block_ms }, extra) => {
       const t = deps.allow.assert(topic);

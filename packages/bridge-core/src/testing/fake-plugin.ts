@@ -8,6 +8,7 @@ import {
 } from '../message.js';
 import { parseMentions } from '../mentions.js';
 import type {
+  BackendCapabilities,
   BackendConfig,
   BackendIdentity,
   BackendPlugin,
@@ -43,6 +44,13 @@ export class FakePlugin implements BackendPlugin {
   private readonly rows: Row[] = [];
   private readonly subs = new Map<Topic, Set<MessageHandler>>();
   connected = false;
+
+  /**
+   * What this fake declares on the seam. A shipped backend states its capabilities and core reads
+   * them; a fake that could not state any left every core test on the default arm, which is how the
+   * whole of `blockingFetch: false` — the arm eight backends take — went unexercised.
+   */
+  constructor(readonly capabilities?: BackendCapabilities) {}
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   async connect(_config: BackendConfig): Promise<void> {

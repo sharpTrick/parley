@@ -97,7 +97,13 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
     const generation = this.generation;
-    const limit = args.limit ?? 100;
+    // The seam declares `limit?: number` with no floor, and `fetchRecent` is public API — only the
+    // MCP tool path upstream refuses a hostile one. Keep the floor HERE, so that a page walk
+    // bounded by `walked.length < limit` cannot be handed a value no length satisfies: `NaN`, `0`
+    // and negatives all end that loop before its first read and answer an empty page on a topic
+    // that has history, which a caller cannot tell from "nothing new".
+    const asked = Math.trunc(args.limit ?? 100);
+    const limit = Number.isNaN(asked) ? 1 : Math.max(1, asked);
     const deadline = Date.now() + DEFAULT_DEADLINE_MS;
 
     if (args.since === undefined) {

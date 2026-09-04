@@ -45,6 +45,49 @@ describe('Discord paging and minted cursors', () => {
     await fake.close();
   });
 
+
+  /**
+   * The same walk, driven by a `limit` no page count satisfies. `fetchRecent` is public API and the
+   * seam puts no floor on `limit` — only the MCP tool path upstream refuses a hostile one — so
+   * `NaN`, `0` and negatives reach the walk's own `walked.length < limit`, which is FALSE on its
+   * first evaluation. The walk then returns before its first read, and the caller gets an empty
+   * page with the cursor it handed in: indistinguishable from "nothing new" on a topic full of
+   * history, and unrecoverable by retrying.
+   */
+  describe('a hostile limit narrows the page, it never hides the topic', () => {
+    const HOSTILE = [-5, 0, 1, Number.NaN, Number.POSITIVE_INFINITY, 1.5, undefined];
+    const VOLUME = 2 * PAGE_LIMIT + 50;
+
+    for (const limit of HOSTILE) {
+      for (const sinceMode of ['none', 'seed', 'tail'] as const) {
+        it(`limit=${String(limit)} / since=${sinceMode}`, async () => {
+          const topic = liveTopic();
+          const seed = (await plugin.post(topic, SENDER, 'seed')) as unknown as Cursor;
+          for (let i = 0; i < VOLUME; i++) fake.deliver(topic as string, { content: `m${i}` });
+          const tail = (await plugin.fetchRecent({ topic })).nextCursor;
+          const since = { none: undefined, seed, tail }[sinceMode];
+
+          const before = fake.requestCount('/messages');
+          const page = await plugin.fetchRecent({
+            topic,
+            ...(since === undefined ? {} : { since }),
+            ...(limit === undefined ? {} : { limit }),
+          });
+          const reads = fake.requestCount('/messages') - before;
+
+          expect(
+            page.messages.length > 0,
+            'a page a caller cannot tell from "nothing new", on a topic that has history',
+          ).toBe(sinceMode !== 'tail');
+          // One walk over the fixture plus the page that finds the end — never a walk per message.
+          expect(reads, 'REST reads for one call').toBeLessThanOrEqual(
+            Math.ceil(VOLUME / PAGE_LIMIT) + 1,
+          );
+        });
+      }
+    }
+  });
+
   describe('one call paging forward from a cursor', () => {
     // Counts straddle the page cap on both sides; limits straddle it too, so the discriminating
     // cells (count and limit BOTH above 100) sit next to the single-page controls that would still

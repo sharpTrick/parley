@@ -15,7 +15,7 @@
 import { asCursor, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { compareTs, SlackPlugin } from '../src/index.js';
-import type { OldestWindow } from './fake-slack.js';
+import { DEFAULT_PAGE_SIZE as FAKE_PAGE_SIZE, type OldestWindow } from './fake-slack.js';
 import { capture, settleWithin, startSlack } from './harness.js';
 
 interface Run {
@@ -251,48 +251,73 @@ describe('slack fetchRecent floors a non-positive limit', () => {
 });
 
 /**
- * The same CLASS, one field wider. `limit` is a number the seam hands this plugin with no bound,
- * and a non-finite one reaches the page walk's own arithmetic — where it neither fills a window nor
- * ends it. Neither shows up in a returned page, so the rows below grade the two things only an
- * argument can break: whether the call SETTLES, and how many reads it spent getting there.
+ * The same CLASS, one field wider. `limit` is a number the seam hands this plugin with no bound —
+ * `fetchRecent` is public API, and only the MCP tool path upstream refuses a hostile one — and a
+ * non-finite one reaches the page walk's own arithmetic, where it neither fills a window nor ends
+ * it, and reaches `slice(0, NaN)`, which is an EMPTY page a caller cannot tell from "nothing new".
+ * So the rows grade three things only an argument can break: whether the call SETTLES, whether it
+ * still answers with the history it has, and how many reads it spent getting there.
+ *
+ * The fixture spans SEVERAL server pages, so `limit` can move the page count at all: over a
+ * single-page one the walk ends before any of this arithmetic runs, every cell costs exactly one
+ * read, and the cost half of this table grades nothing — which is what it did.
  */
 const ARG_LIMITS = [-5, 0, 1, Number.NaN, Number.POSITIVE_INFINITY, undefined];
 const SETTLE_MS = 3000;
+/** Several server pages' worth, so the walk's page count is a function of the argument. */
+const PAGED_VOLUME = FAKE_PAGE_SIZE * 3 - 10;
+const PAGES_OVER_FIXTURE = Math.ceil(PAGED_VOLUME / FAKE_PAGE_SIZE);
 
 describe('slack fetchRecent settles on every numeric seam argument, at bounded request cost', () => {
-  {
-    for (const limit of ARG_LIMITS) {
-      for (const sinceMode of ['none', 'zero', 'tail'] as const) {
-        it(`limit=${String(limit)} / since=${sinceMode}`, async () => {
-          const { fake, plugin, cleanup } = await startSlack({ appToken: null });
-          try {
-            const topic = asTopic('C0ARGS');
-            const seeded = fake.seed(
-              topic,
-              Array.from({ length: 5 }, (_, i) => ({ text: `m${i}` })),
-            );
-            const since = { none: undefined, zero: '0', tail: seeded.at(-1)!.ts }[sinceMode];
-            const args = {
-              topic,
-              ...(limit === undefined ? {} : { limit }),
-              ...(since === undefined ? {} : { since: asCursor(since) }),
-            };
+  /** Reads each cell spent, so the table can prove its own cost axis is not flat. */
+  const spent: number[] = [];
 
-            const before = fake.hits('conversations.history');
-            const settled = await settleWithin(capture(plugin.fetchRecent(args)), SETTLE_MS);
-            const reads = fake.hits('conversations.history') - before;
+  for (const limit of ARG_LIMITS) {
+    for (const sinceMode of ['none', 'zero', 'tail'] as const) {
+      it(`limit=${String(limit)} / since=${sinceMode}`, async () => {
+        const { fake, plugin, cleanup } = await startSlack({ appToken: null });
+        try {
+          const topic = asTopic('C0ARGS');
+          const seeded = fake.seed(
+            topic,
+            Array.from({ length: PAGED_VOLUME }, (_, i) => ({ text: `m${i}` })),
+          );
+          const since = { none: undefined, zero: '0', tail: seeded.at(-1)!.ts }[sinceMode];
+          const args = {
+            topic,
+            ...(limit === undefined ? {} : { limit }),
+            ...(since === undefined ? {} : { since: asCursor(since) }),
+          };
 
-            expect(settled.status, `never settled inside ${SETTLE_MS}ms`).toBe('fulfilled');
-            // One walk over a single-page fixture. A `limit` the plugin cannot reason about pages
-            // without limit.
-            expect(reads, 'history reads for one call').toBeLessThanOrEqual(2);
-          } finally {
-            await cleanup();
-          }
-        });
-      }
+          const before = fake.hits('conversations.history');
+          const settled = await settleWithin(capture(plugin.fetchRecent(args)), SETTLE_MS);
+          const reads = fake.hits('conversations.history') - before;
+          spent.push(reads);
+
+          expect(settled.status, `never settled inside ${SETTLE_MS}ms`).toBe('fulfilled');
+          // A hostile `limit` may narrow the page; it may never turn history into "nothing new".
+          // `since=tail` is the one cell with nothing above the floor, so it alone answers empty.
+          const returned = settled.status === 'fulfilled' ? settled.value.messages.length : -1;
+          expect(
+            returned > 0,
+            'a page a caller cannot tell from "nothing new", on a topic that has history',
+          ).toBe(sinceMode !== 'tail');
+          // One walk over the fixture, plus the page that discovers exhaustion.
+          expect(reads, 'history reads for one call').toBeLessThanOrEqual(PAGES_OVER_FIXTURE + 1);
+        } finally {
+          await cleanup();
+        }
+      });
     }
   }
+
+  // The cost half of the table above is only evidence while some argument can MOVE the page count.
+  // Every cell reading exactly one page is indistinguishable from a ceiling nothing can reach.
+  it('some argument costs more than one read, so the ceiling above grades something', () => {
+    expect(spent.length, 'cells that ran').toBe(ARG_LIMITS.length * 3);
+    expect(Math.max(...spent), 'the most any cell spent').toBeGreaterThan(1);
+    expect(Math.min(...spent), 'the least any cell spent').toBe(1);
+  });
 });
 
 describe('slack catch-up window arithmetic', () => {

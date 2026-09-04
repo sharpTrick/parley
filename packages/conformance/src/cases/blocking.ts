@@ -41,7 +41,7 @@ export function blockingCases(ctx: ConformanceContext): void {
         'of returning the default window it already had',
     ).toBeLessThan(SINCELESS_RETURN_MS);
 
-    if (!ctx.supportsBlockingFetch) {
+    if (ctx.plugin.capabilities?.blockingFetch === false) {
       // The hint is OPTIONAL; hanging on it is not. This is the only case in the suite that ever
       // passes `blockMs`, so nothing else can see a plugin that parks forever on it and stalls
       // `parley_fetch_recent` for its whole timeout.
@@ -97,7 +97,7 @@ export function blockingCases(ctx: ConformanceContext): void {
     const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
     const postLater = (): Promise<void> => postAfter(t, at, 'racer');
 
-    if (!ctx.supportsBlockingFetch) {
+    if (ctx.plugin.capabilities?.blockingFetch === false) {
       // The same hazard on a polling backend: a read racing the post must not report a cursor
       // ABOVE the message it did not see, or that message is lost for good.
       let landingFailure: unknown;

@@ -11,7 +11,7 @@ export type PageFn = (query: string, budgetMs: number) => Promise<DiscordMessage
  * routine 429 — which net-util refuses the instant the stated wait outgrows what is left, long
  * before the clock runs out — cannot end a whole long-poll as an agent-facing tool error.
  */
-export function outOfBudget(err: unknown, deadline: number, what: string): boolean {
+function outOfBudget(err: unknown, deadline: number, what: string): boolean {
   if (statusOf(err) !== 429) return Date.now() >= deadline;
   warn(`${what} is rate limited (${reasonOf(err)}); answering the page it has, to resume from`);
   return true;

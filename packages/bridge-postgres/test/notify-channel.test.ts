@@ -7,7 +7,7 @@ import { dropTable, isUp, PG_URL, rand, sleep, withAdmin } from './pg-harness.js
 
 // The NOTIFY channel is derived TWICE — once in Node by channelFor(), once inside the trigger by
 // PostgreSQL — and the live path is silently dead whenever the two disagree. Nothing errors: the
-// trigger rings a channel nobody LISTENs, push delivers nothing, and blocking fetches stall their
+// trigger rings a channel nobody LISTENs, push delivers nothing, and a subscription stalls its
 // whole budget while catch-up keeps working, so the deployment looks healthy. These cases pin the
 // two derivations together over topic shapes the `t-<n>-<rand>` ASCII generator never produces.
 

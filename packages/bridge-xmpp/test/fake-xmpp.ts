@@ -481,7 +481,7 @@ export class FakeXmpp {
     this.occupantNicks.delete(room);
   }
 
-  /** Reflect a live message that is NOT (yet) in the archive — a spurious long-poll wake. */
+  /** Reflect a live message that is NOT (yet) in the archive — live ahead of the archive. */
   reflectOnly(room: string, body: string, sender = 'someone'): void {
     this.feedRoom(
       room,

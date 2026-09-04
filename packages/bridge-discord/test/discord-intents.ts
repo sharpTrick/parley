@@ -8,7 +8,7 @@
  */
 export const GATEWAY_INTENT_BITS = {
   GUILDS: 1,
-  /** Without it Discord dispatches no MESSAGE_CREATE, and every long-poll blocks its budget. */
+  /** Without it Discord dispatches no MESSAGE_CREATE, so the live path delivers nothing. */
   GUILD_MESSAGES: 512,
   /** PRIVILEGED, and also toggled in the developer portal; without it `content` arrives empty. */
   MESSAGE_CONTENT: 32768,

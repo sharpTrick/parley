@@ -77,7 +77,7 @@ const heldAtJoin = (fake: FakeXmpp): Held => {
   };
 };
 
-/** Parked on the MAM round trip both the catch-up and the long-poll read paths go through. */
+/** Parked on the MAM round trip every read path goes through. */
 const heldAtMam = (fake: FakeXmpp): Held => {
   const g = gate();
   let arrived = false;
