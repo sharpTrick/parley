@@ -147,8 +147,8 @@ export class SlackPlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    this.require();
     assertBlockMsUnsupported('parley-slack', args.blockMs);
+    this.require();
     return this.history.runFetch(args);
   }
 

@@ -64,6 +64,15 @@ export const CONTEXT_FIELDS: Record<keyof ConformanceContext, (v: unknown) => bo
 };
 
 /**
+ * The fields that select a fixture ARM rather than supplying the fixture itself. A case that reads
+ * one of these is branching on what the backend can represent, and the branch it takes has to grade
+ * something — see the guarded-region check in `runConformanceSuite`.
+ */
+export const CAPABILITY_FIELDS: string[] = Object.keys(CONTEXT_FIELDS).filter(
+  (f) => !['plugin', 'freshTopic', 'cleanup'].includes(f),
+);
+
+/**
  * Build a fixture and validate it, disconnecting again if it turns out to be malformed. Keep the
  * teardown on the RAW fixture, so that a context rejected for one bad capability flag is still torn
  * down: the factory has already CONNECTED the plugin by the time it returns, and a validator that

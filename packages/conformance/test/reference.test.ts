@@ -7,7 +7,7 @@ import {
   makeStampedSenderReferenceContext,
   makeThrowingReferenceContext,
 } from './reference-plugin.js';
-import { BOOLEAN_CAPABILITIES } from './suite-source.js';
+import { CAPABILITY_AXES } from './suite-source.js';
 
 const FIXTURES: [string, () => Promise<import('@sharptrick/parley-conformance').ConformanceContext>][] =
   [
@@ -30,21 +30,21 @@ for (const [label, make] of FIXTURES) runConformanceSuite(label, make);
  * an arm whose assertions nothing in this repo can satisfy, and `negative-control` only demands a
  * fixture that fails.
  */
-describe('the reference fixtures cover both arms of every boolean capability', () => {
-  const axisNamed = (name: string): (typeof BOOLEAN_CAPABILITIES)[number] => {
-    const axis = BOOLEAN_CAPABILITIES.find((a) => a.name === name);
+describe('the reference fixtures cover every arm of every capability', () => {
+  const axisNamed = (name: string): (typeof CAPABILITY_AXES)[number] => {
+    const axis = CAPABILITY_AXES.find((a) => a.name === name);
     if (axis === undefined) throw new Error(`no capability axis named ${name}`);
     return axis;
   };
 
   it.each(
-    BOOLEAN_CAPABILITIES.flatMap((a) => [true, false].map((arm) => [a.name, arm] as const)),
+    CAPABILITY_AXES.flatMap((a) => a.arms.map((arm) => [a.name, arm] as const)),
   )('some passing fixture declares `%s` = %s', async (name, arm) => {
     const axis = axisNamed(name);
     const contexts = await Promise.all(FIXTURES.map(async ([, make]) => make()));
     try {
       expect(
-        contexts.filter((c) => axis.arm(c) === arm).length,
+        contexts.filter((c) => axis.armOf(c) === arm).length,
         `no reference fixture takes the \`${name}: ${String(arm)}\` arm, so nothing in this ` +
           `repo demonstrates that arm's assertions are satisfiable at all`,
       ).toBeGreaterThan(0);

@@ -276,6 +276,7 @@ const documentedBehaviours: Array<[string, RegExp]> = [
   ['a transient fault that never clears is reported without giving up', /live delivery DEGRADED/],
   ['a sub-millisecond long-poll budget returns immediately', /floors to nothing and returns immediately/],
   ['concurrent long polls hold a bounded number of readers', /capped at 8/],
+  ['…and a long poll past the cap is still waited out', /re-reads its window on the shared command\s+connection/],
   ['…and subscribe is not the thing being capped', /`subscribe` is not capped/],
   ['a permanent refusal fails the long poll instead of emptying it', /rather than\s+being reported as an empty long poll/],
   ['retention trims approximately, and only on write', /approximate/],

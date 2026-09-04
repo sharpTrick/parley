@@ -434,9 +434,11 @@ notes MAM); re-scan prior art by function (DESIGN §17); update the main README 
   **Removed since:** presence, the roster and `parley_list_users` no longer ship; the paragraph above
   describes a feature the code no longer has.
 - **71-finding audit remediation** (#16) across core and every backend.
-- **`block_ms`** (#21): long-poll on `fetchRecent`, native on nine backends with a generic fallback
-  in core for SQLite. The seam gained one optional field and core learned no backend names — a
-  capability added *after* the freeze without bending it.
+- **`block_ms`** (#21): long-poll on `fetchRecent`. The seam gained one optional field and core
+  learned no backend names — a capability added *after* the freeze without bending it.
+  **Changed since:** it is native on TWO backends (Redis and NATS, which have a read primitive to
+  park on) and REFUSED by the other eight; there is no generic fallback in core, and none of the
+  eight emulates the wait.
 
 ## Post-v1: optional retention/pruning (`retention_days`)
 

@@ -44,7 +44,7 @@ Legend: ✅ must match · ⚠️ hidden risk if it diverges · 🔀 must NOT mat
 |---|---|---|
 | `url` | ✅ | obvious — different servers, no shared history, no error either way |
 | `key_prefix` | ✅⚠️ | **Hidden.** Reads like cosmetic namespacing, but topic `"ctx-payments"` under prefix `parley:` is a completely different Redis key than under `app:` — a silent split with zero error, even though every other field (`topics`, etc.) looks consistent. |
-| `block_ms` | — | per-instance `XREAD BLOCK` / shutdown-recheck timeout |
+| `block_ms` | — | per-instance `XREAD BLOCK` idle re-arm interval for the live push loop. Not a shutdown cost: `disconnect()` destroys the reader socket rather than waiting a block out (measured at 1 ms against a live Redis with `block_ms: 8000` and a live subscription), so sizing it down buys nothing but more idle round-trips. |
 | `retention_days` | ⚠️ | Trimming rides on `XADD` to a **shared** stream — whichever writer's config has it set enforces it for every session touching that topic. Divergent values → inconsistent, most-aggressive-wins enforcement over time, not a per-session setting. |
 
 ### NATS ([full README](../../packages/bridge-nats/README.md))

@@ -18,11 +18,21 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import {
+  CALLER_BLOCK_RETURN_MS,
   type ConformanceContext,
   EARLY_RETURN_FRACTION,
   IDLE_BLOCK_MS,
   OVERSHOOT_MULTIPLE,
   PARK_FRACTION,
+  PROBE_MAX_BLOCK_MS,
+  RACE_BLOCK_MS,
+  REFUSAL_RETURN_MS,
+  SINCELESS_BLOCK_MS,
+  SINCELESS_RETURN_MS,
+  STABILITY_CALLER_READS,
+  STABILITY_READS_MIN,
+  STABILITY_SPAN_MS,
+  TAIL_BLOCK_MS,
 } from '@sharptrick/parley-conformance';
 
 /**
@@ -339,13 +349,13 @@ export const blastRadiusOf = (v: BrokenVariant): number => v.blastRadius ?? NARR
  * a fixture that could not have served the budget in the first place.
  */
 const wrap = async (
-  over: (inner: ReferencePlugin) => Partial<BackendPlugin>,
+  over: (inner: ReferencePlugin, store: ReferenceStore) => Partial<BackendPlugin>,
   opts: Partial<Capabilities> & { nativeBlocking?: boolean } = {},
 ): Promise<ConformanceContext> => {
   const { nativeBlocking = false, ...caps } = opts;
   const store = newReferenceStore();
   const inner = new ReferencePlugin(store, nativeBlocking);
-  return context({ ...delegate(inner), ...over(inner) }, store, caps);
+  return context({ ...delegate(inner), ...over(inner, store) }, store, caps);
 };
 
 /**
@@ -386,6 +396,151 @@ const respelledPostId = ([label, spell]: [
 export const BROKEN_SUITE_MARK = 'broken/';
 
 export const brokenSuiteName = (name: string): string => `${BROKEN_SUITE_MARK}${name}`;
+
+
+/**
+ * The state an arm switch can be conditioned on. Every one of these is CONSTANT inside a case that
+ * works on one topic, on a connection of its own, in a few hundred milliseconds — which is what
+ * every blocking case except the long run is, and why three plugins built on exactly these
+ * predicates passed the whole suite while ignoring every `block_ms` a real agent would send.
+ */
+interface SwitchPoint {
+  /** Blocking reads this connection has taken, this one included. */
+  call: number;
+  /** How old the connection was when the read arrived. */
+  connectionAgeMs: number;
+  blockMs: number;
+  topic: string;
+  /** Rows the topic held when the budget arrived. */
+  topicRows: number;
+  /** The first topic this connection was handed a budget for. */
+  firstTopic: string;
+  /** Connections that have been handed a budget, this one included. */
+  connection: number;
+}
+
+interface ArmSwitch {
+  when: string;
+  fires: (at: SwitchPoint) => boolean;
+}
+
+/** The budgets the suite hands out from a named constant — the only ones a plugin could enumerate. */
+export const ENUMERABLE_BUDGETS = [SINCELESS_BLOCK_MS, TAIL_BLOCK_MS, RACE_BLOCK_MS, IDLE_BLOCK_MS, 5_000];
+
+/**
+ * Above what any case but the long run issues on one connection, and below the fewest that run
+ * issues — so a switch on this count is invisible to every other case and certain inside that one.
+ */
+export const SWITCH_AFTER_CALLS = 10;
+
+/**
+ * The clock the long run is built to have a budget on both sides of, and which no other case comes
+ * near. Set AT the window rather than inside it, so this row stays the tightest switch the run can
+ * still catch: a control set safely inside would go on passing if the run stopped spanning it.
+ */
+const SWITCH_AFTER_MS = STABILITY_SPAN_MS;
+
+/**
+ * Above the deepest topic every OTHER case works on (one message) and below the depth the long run
+ * seeds, so a switch on topic state is invisible to all of them and certain inside that one.
+ */
+const SWITCH_TOPIC_ROWS = 10;
+
+/**
+ * The count row at the far edge of the run's reach rather than at the near edge the first row
+ * covers: `SWITCH_AFTER_CALLS` bounds the class only up to the fewest budgets the run hands out, so
+ * a plugin switching just past that count answered the whole suite. The last read the run is
+ * guaranteed to make is the one after this.
+ */
+const SWITCH_AFTER_MANY_CALLS = STABILITY_READS_MIN + STABILITY_CALLER_READS - 1;
+
+/**
+ * ONE mutation per way a switch can be hidden. The table is the point: the clause exists to forbid
+ * a backend that honours the budgets a suite is known to ask for and drops the rest, and a control
+ * per instance would leave the next predicate — a different count, a different clock, a different
+ * key — free to pass.
+ */
+export const ARM_SWITCHES: ArmSwitch[] = [
+  {
+    when: `after the ${SWITCH_AFTER_CALLS}th budget on a connection`,
+    fires: (at) => at.call > SWITCH_AFTER_CALLS,
+  },
+  {
+    when: `once the connection is ${SWITCH_AFTER_MS}ms old`,
+    fires: (at) => at.connectionAgeMs > SWITCH_AFTER_MS,
+  },
+  {
+    when: 'on any budget the suite does not hand out from a constant',
+    fires: (at) => at.blockMs > PROBE_MAX_BLOCK_MS && !ENUMERABLE_BUDGETS.includes(at.blockMs),
+  },
+  {
+    when: 'on every topic but the first this connection was asked about',
+    fires: (at) => at.topic !== at.firstTopic,
+  },
+  {
+    when: 'on every connection but the first to be handed a budget',
+    fires: (at) => at.connection > 1,
+  },
+  {
+    // The one the drawn ranges alone cannot reach: every budget above is two orders of magnitude
+    // below what an agent sends, so a plugin that honours what a suite hands out and drops what a
+    // caller hands out answered every read the suite made and none of the reads that matter.
+    when: 'on any budget larger than the largest the suite hands out from a constant',
+    fires: (at) => at.blockMs > SINCELESS_BLOCK_MS,
+  },
+  {
+    when: `once the topic holds more than ${SWITCH_TOPIC_ROWS} rows`,
+    fires: (at) => at.topicRows > SWITCH_TOPIC_ROWS,
+  },
+  {
+    when: `after the ${SWITCH_AFTER_MANY_CALLS}th budget on a connection`,
+    fires: (at) => at.call > SWITCH_AFTER_MANY_CALLS,
+  },
+];
+
+/**
+ * A plugin that answers block budgets honestly until its predicate fires, and silently drops every
+ * budget after that. On the REFUSING arm dropping the budget makes it answer with a page, so the arm
+ * itself changes; on the SERVING arm it stays on the arm it was on and merely stops waiting — the
+ * shape a real backend takes when a resource its blocking read needs runs out and is never released.
+ * Both are the same defect, and only a check that spans cases and connections sees either.
+ */
+const armSwitch = (sw: ArmSwitch, nativeBlocking: boolean, blastRadius: number): BrokenVariant => {
+  let connections = 0;
+  return {
+    name: `a read that stops honouring the budget ${sw.when}${nativeBlocking ? ', still serving' : ''}`,
+    blastRadius,
+    mutates: nativeBlocking ? 'native-block-waits-every-time' : 'blocking-arm-is-stable',
+    mustFail: 'a long run of unpredictable budgets',
+    make: () => {
+      const openedAt = Date.now();
+      let call = 0;
+      let connection = 0;
+      let firstTopic: string | undefined;
+      return wrap(
+        (inner, store) => ({
+          fetchRecent: (args) => {
+            if (args.blockMs === undefined || args.blockMs <= 0) return inner.fetchRecent(args);
+            if (connection === 0) connection = ++connections;
+            call += 1;
+            firstTopic ??= String(args.topic);
+            const at: SwitchPoint = {
+              call,
+              connectionAgeMs: Date.now() - openedAt,
+              blockMs: args.blockMs,
+              topic: String(args.topic),
+              topicRows: (store.log.get(String(args.topic)) ?? []).length,
+              firstTopic,
+              connection,
+            };
+            return inner.fetchRecent(sw.fires(at) ? { ...args, blockMs: undefined } : args);
+          },
+        }),
+        { nativeBlocking },
+      );
+    },
+  };
+};
 
 export const BROKEN_VARIANTS: BrokenVariant[] = [
   ...POST_ID_RESPELLINGS.map(respelledPostId),
@@ -586,7 +741,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // swallow the budget and answer with the window the backend already had. A caller cannot tell
     // that from a long-poll that timed out empty, so an agent polls on believing it is parked.
     name: 'a read that answers a block budget with the window it already had',
-    blastRadius: 5,
+    blastRadius: 6,
     mutates: 'native-block-actually-waits',
     mustFail: 'blockMs is honoured natively or refused',
     make: () =>
@@ -605,7 +760,10 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         fetchRecent: async (args) => {
           const budget = args.blockMs;
           if (args.since !== undefined && budget !== undefined) {
-            await new Promise((resolve) => setTimeout(resolve, budget * PARK_FRACTION));
+            // Capped: this is aimed at `refusal-is-prompt`, so anything past that bound fails it,
+            // and a park proportional to a budget an agent's size is minutes of nothing.
+            const parkFor = Math.min(budget * PARK_FRACTION, REFUSAL_RETURN_MS * 2);
+            await new Promise((resolve) => setTimeout(resolve, parkFor));
           }
           return inner.fetchRecent(args);
         },
@@ -615,7 +773,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // The same trade wearing one honest refusal: refuse the budget asked first, answer the next one
     // with a page. A refusal a backend does not hold to tells the caller nothing at all.
     name: 'a read that refuses one block budget and answers the next with a page',
-    blastRadius: 5,
+    blastRadius: 6,
     mutates: 'refusal-is-not-an-empty-page',
     mustFail: 'blockMs is honoured natively or refused',
     make: () =>
@@ -644,7 +802,10 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
           // Ahead of the delegate, so that the park is what the bound measures whichever arm the
           // inner plugin takes — a refusal held back for most of the budget is the same defect.
           if (args.since === undefined && args.blockMs !== undefined) {
-            const parkFor = Math.min(args.blockMs * PARK_FRACTION, 20_000);
+            // Capped just past the bound it is aimed at, so it still fails that bound and still
+            // outlasts what the suite will wait for on a caller-scale budget — without parking for
+            // the minutes such a budget would otherwise buy.
+            const parkFor = Math.min(args.blockMs * PARK_FRACTION, SINCELESS_RETURN_MS + 1_000);
             await new Promise((resolve) => setTimeout(resolve, parkFor));
           }
           return inner.fetchRecent(args);
@@ -992,6 +1153,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // green. This plugin is conformant on every other axis; it just gives its budget up early,
     // which is what core turns into a hot poll loop against the backend.
     name: 'a native blocking read that gives up long before the budget',
+    blastRadius: 6,
     mutates: 'native-block-actually-waits',
     mustFail: 'blockMs is honoured natively or refused',
     make: () =>
@@ -1052,29 +1214,6 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     /**
-     * The FINGERPRINT plugin. It refuses the first two block budgets it is handed — which is exactly
-     * as many as a suite with a fixed probe schedule ever asks for — and silently drops every budget
-     * after that. It is the defect the single-armed contract exists to forbid, wearing the arm the
-     * contract infers, and no count of probes defeats it: only requiring that the arm never CHANGES
-     * does. The mirror image (refuse twice, then block natively) is the same plugin with the other
-     * tail and fails the same assertion.
-     */
-    name: 'a read that refuses a couple of budgets and then quietly drops the rest',
-    blastRadius: 5,
-    mutates: 'blocking-arm-is-stable',
-    mustFail: 'blockMs is honoured natively or refused',
-    make: () => {
-      let handed = 0;
-      return wrap((inner) => ({
-        fetchRecent: (args) =>
-          args.blockMs !== undefined && args.blockMs > 0 && ++handed <= 2
-            ? inner.fetchRecent(args)
-            : inner.fetchRecent({ ...args, blockMs: undefined }),
-      }));
-    },
-  },
-  {
-    /**
      * A native blocker that WAITS — just far past the budget it was given. Every "did it wait at
      * all?" floor passes for it, so without a ceiling the only thing that ends the case is the
      * harness timeout, whose message names no clause. Conditioned on a SMALL budget so it reaches
@@ -1132,7 +1271,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // The lost-wakeup race: park "from now" instead of at the caller's cursor, so a message landing
     // between the read and the waiter is reported as already-consumed and can never be fetched.
     name: 'a native blocking read that parks from now instead of at the caller cursor',
-    blastRadius: 5,
+    blastRadius: 6,
     mutates: 'fetchRecent',
     mustFail: 'blocking fetch is not missed',
     make: () =>
@@ -1237,4 +1376,36 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         },
       })),
   },
+  {
+    /**
+     * A backend that parks on the budgets an AGENT sends. Every other budget in the suite is small
+     * enough to sit through, so a plugin can park on a caller-scale one for as long as it likes and
+     * be indistinguishable from one that has stopped answering — while every bound measured on a
+     * small budget passes. Conditioned on a budget larger than any the suite hands out from a
+     * constant, so it reaches the caller-scale reads and nothing else.
+     */
+    name: 'a read that parks on a budget the size an agent sends',
+    blastRadius: 2,
+    mutates: 'caller-scale-block-is-answered',
+    mustFail: 'a long run of unpredictable budgets',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            if ((args.blockMs ?? 0) > SINCELESS_BLOCK_MS) {
+              await new Promise((resolve) => setTimeout(resolve, CALLER_BLOCK_RETURN_MS + 500));
+            }
+            return inner.fetchRecent(args);
+          },
+        }),
+        { nativeBlocking: true },
+      ),
+  },
+  ...ARM_SWITCHES.map((sw) =>
+    armSwitch(sw, false, sw.when.startsWith('on every connection') ? 5 : 1),
+  ),
+  // The same class on the SERVING arm, which the arm half is by construction blind to. This is the
+  // shape the shipped Redis plugin took the day one line stopped releasing its reader budget: it
+  // never left the serving arm, it just stopped waiting, and 980 tests stayed green.
+  armSwitch(ARM_SWITCHES[0] as ArmSwitch, true, 1),
 ];

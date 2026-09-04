@@ -339,6 +339,8 @@ const NEEDS_SOCKET: Record<Driven, boolean> = {
 describe('no entry point can dial apps.connections.open faster than the ladder', () => {
   /** Long enough for an unpaced caller to spend dozens of dials, short enough to stay cheap. */
   const HOT_WINDOW_MS = 1500;
+  /** The widest rung, plus room for the dial the wait is pacing. */
+  const ATTEMPT_PARK_CEILING_MS = MAX_DIAL_BACKOFF_MS + HOT_WINDOW_MS;
 
   it.each(SEAM_CALLS)(
     '%s, retried through an unavailable Socket Mode, dials O(wall clock)',
@@ -349,16 +351,31 @@ describe('no entry point can dial apps.connections.open faster than the ladder',
         fake.failMethod('apps.connections.open', 'internal_error');
         const t0 = Date.now();
         let attempts = 0;
+        let starvedAttempts = 0;
         while (Date.now() - t0 < HOT_WINDOW_MS) {
           attempts++;
-          await DRIVE[call](plugin, topic).catch(() => undefined);
+          const settled = Symbol('settled');
+          const raced = await Promise.race([
+            DRIVE[call](plugin, topic).then(
+              () => settled,
+              () => settled,
+            ),
+            sleep(ATTEMPT_PARK_CEILING_MS).then(() => 'parked' as const),
+          ]);
+          if (raced !== settled) starvedAttempts++;
         }
         const elapsed = Date.now() - t0;
-        // The caller really did keep asking: a driver that fell over after one attempt would
-        // satisfy any dial ceiling and grade nothing.
-        expect(attempts, 'attempts made').toBeGreaterThan(dialBound(elapsed));
+        // The driver really did keep the entry point busy for the whole window: without this a
+        // driver that fell over after one attempt would satisfy any dial ceiling and grade nothing.
+        expect(attempts, 'attempts made').toBeGreaterThan(0);
+        expect(elapsed, 'the window closed early').toBeGreaterThanOrEqual(HOT_WINDOW_MS);
         const dials = fake.hits('apps.connections.open');
         if (!NEEDS_SOCKET[call]) {
+          // A REST call is not paced by anything and returns at once, so here the driver's own
+          // count is the sharper premise: it proves the loop really hammered a call that must
+          // never dial. An entry point that needs the socket is throttled by the ladder itself,
+          // and counting its attempts would grade the pacer as if it were a stalled driver.
+          expect(attempts, 'attempts made').toBeGreaterThan(dialBound(elapsed));
           expect(
             dials,
             `${call} reached apps.connections.open at all. It is a REST call: a dial here is ` +
@@ -372,6 +389,10 @@ describe('no entry point can dial apps.connections.open faster than the ladder',
         // …and the ceiling is not satisfied by never dialling at all, which is the failure mode
         // every row that only bounds from above is blind to.
         expect(dials, 'redial floor').toBeGreaterThanOrEqual(1);
+        // A paced caller waits at most one rung and comes back; one held past the widest rung has
+        // been starved, not paced, and satisfies every count above with a single attempt. Raced
+        // rather than awaited, so this fails by name instead of as a harness timeout.
+        expect(starvedAttempts, 'attempts held past the widest ladder rung').toBe(0);
       } finally {
         await cleanup();
       }
@@ -388,6 +409,53 @@ describe('no entry point can dial apps.connections.open faster than the ladder',
  * `app_token` nor Socket Mode. Both entry points are graded on the same two observables: what the
  * caller is told, and whether anything reached the wire.
  */
+/**
+ * CLASS: the dial pacer paces, it does not refuse. Both properties at once, because a fix for
+ * either alone breaks the other: a guard that turns callers away holds the dial count perfectly and
+ * makes a bridge whose socket dropped once fail to come up naming a BACKOFF instead of the outage —
+ * core rethrows a failed `subscribe` — while a guard removed to let callers through spends a dial
+ * per attempt against Slack's tightest-limit endpoint.
+ *
+ * The cooldown is armed by a LIVE connection dropping, which is the everyday shape (a rotation, a
+ * proxy blip) and the one that arms it while dials still SUCCEED — so the entry point below is
+ * refused by nothing but the pacer, and a run that hangs or rejects here is the pacer refusing a
+ * caller. Rows are the entry points that need the shared socket, so a third one is graded on both
+ * halves without a new case.
+ */
+describe('the dial pacer paces every entry point without refusing any', () => {
+  it.each(SEAM_CALLS.filter((c) => NEEDS_SOCKET[c]))(
+    '%s still resolves once a live socket drop has armed the cooldown',
+    async (entry) => {
+      const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0PACED', 'C0PACED2'] });
+      try {
+        await plugin.subscribe(asTopic('C0PACED'), () => undefined);
+        const dialsBefore = fake.hits('apps.connections.open');
+        fake.dropSockets();
+        // The pacer is armed by the plugin READING the close, not by the fake writing it, so wait
+        // for the socket to be gone: driving the entry point in the window before that grades a
+        // live socket rather than a cooling one, and passes whatever the guard does.
+        await expect.poll(() => fake.liveSockets, { timeout: 2_000, interval: 5 }).toBe(0);
+        const startedAt = Date.now();
+        const outcome = await capture(DRIVE[entry](plugin, asTopic('C0PACED2')));
+        expect(
+          outcome.status,
+          `${entry} was refused by the dial pacer after a live socket dropped: ` +
+            `${String((outcome as { reason?: unknown }).reason ?? '')}. Core rethrows a failed ` +
+            'subscribe, so the bridge fails to come up naming a backoff rather than the outage',
+        ).toBe('fulfilled');
+        // …and it was PACED on the way through, not let past the ladder: at most the rungs the
+        // wait it served covers, which is the property a fix that simply deletes the guard breaks.
+        expect(
+          fake.hits('apps.connections.open') - dialsBefore,
+          'dials spent getting back on a socket',
+        ).toBeLessThanOrEqual(dialBound(Date.now() - startedAt));
+      } finally {
+        await cleanup();
+      }
+    },
+  );
+});
+
 describe('slack entry points that need the shared socket agree about a missing app_token', () => {
   for (const entry of SEAM_CALLS.filter((c) => NEEDS_SOCKET[c])) {
     for (const appToken of ['xapp-test', null] as const) {

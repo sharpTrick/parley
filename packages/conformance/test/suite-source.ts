@@ -1,5 +1,9 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { type ConformanceContext, CONTEXT_FIELDS } from '@sharptrick/parley-conformance';
+import {
+  CAPABILITY_FIELDS,
+  type ConformanceContext,
+  CONTEXT_FIELDS,
+} from '@sharptrick/parley-conformance';
 
 const SRC = new URL('../src/', import.meta.url);
 
@@ -58,33 +62,51 @@ export function casesIn(source: string): { title: string; body: string }[] {
 export const cases = (): { title: string; body: string }[] =>
   suiteSources.flatMap((source) => casesIn(source));
 
-/** The capability fields a case could branch on to buy itself out of asserting. */
-export const CAPABILITY_FIELDS = Object.keys(CONTEXT_FIELDS).filter(
-  (f) => !['plugin', 'freshTopic', 'cleanup'].includes(f),
-);
+export { CAPABILITY_FIELDS };
 
 export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** A capability with exactly two arms: what to call it, and which arm a given fixture takes. */
+/** A capability with a handful of named arms: what to call it, and which arm a fixture takes. */
 export interface CapabilityAxis {
   name: string;
-  arm: (ctx: ConformanceContext) => boolean;
+  arms: unknown[];
+  armOf: (ctx: ConformanceContext) => unknown;
 }
 
 /**
- * The context flags with exactly TWO arms, each needing a fixture that takes it. DERIVED from the
- * validators rather than listed — a field whose validator accepts both booleans and rejects a string
- * selects one of two arms — so a new boolean flag arrives as new rows instead of as silently
- * uncontrolled coverage.
+ * The arms a capability can be NAMED by, probed against each validator. Deliberately wider than
+ * booleans: derived as `accepts(true) && accepts(false)`, the table graded `carriesSenderIdentity`
+ * and silently skipped `absentTopicBehaviour`, whose two arms select which half of the seam's
+ * absent-topic MAY runs — so one of them could have had no control at all.
  */
-export const BOOLEAN_CAPABILITIES: CapabilityAxis[] = CAPABILITY_FIELDS.filter((field) => {
+const ARM_CANDIDATES: unknown[] = [true, false, 'empty-page', 'throws', 'unsupported', 0, 1, ''];
+
+const armsOf = (field: string): unknown[] => {
   const accepts = CONTEXT_FIELDS[field as keyof typeof CONTEXT_FIELDS];
-  return accepts(true) && accepts(false) && !accepts('either');
-}).map((field) => ({
+  return ARM_CANDIDATES.filter((candidate) => accepts(candidate));
+};
+
+/**
+ * Every context field whose arms are values, each needing a fixture that takes each of them — so a
+ * new flag arrives as new rows instead of as silently uncontrolled coverage.
+ */
+export const CAPABILITY_AXES: CapabilityAxis[] = CAPABILITY_FIELDS.filter(
+  (field) => armsOf(field).length > 1,
+).map((field) => ({
   name: field,
-  arm: (ctx: ConformanceContext): boolean =>
-    (ctx as unknown as Record<string, unknown>)[field] === true,
+  arms: armsOf(field),
+  armOf: (ctx: ConformanceContext): unknown => (ctx as unknown as Record<string, unknown>)[field],
 }));
+
+/**
+ * Capability fields the probe above cannot turn into rows, because their arms are not values it can
+ * name: `concurrentPost` is a FUNCTION or the string that says the backend has no such thing.
+ * Recorded, so that a field added later with arms nothing tabulates arrives here as a red row rather
+ * than as an axis silently missing from the table.
+ */
+export const UNTABULATED_CAPABILITIES: string[] = CAPABILITY_FIELDS.filter(
+  (field) => armsOf(field).length <= 1,
+);
 
 /** The initializer of a `const`/`let`, scanned to the `;` that ends it at nesting depth 0. */
 function initializerAt(text: string, from: number): string {

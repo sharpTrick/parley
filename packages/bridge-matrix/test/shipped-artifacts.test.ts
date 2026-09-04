@@ -346,7 +346,7 @@ interface CoreOwnedClaim {
 const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
   'this deployment refuses block_ms rather than serving it': {
     core: { ships: "the block_ms argument's description", pattern: /refuses this argument rather than ignoring it/ },
-    readme: /it REFUSES one: a `parley_fetch_recent` carrying `block_ms` rejects/,
+    readme: /it REFUSES one: a `parley_fetch_recent` carrying a POSITIVE `block_ms` rejects/,
     // The README must promise a REFUSAL, not a wait: core describes the argument to the model on
     // every deployment, and a README promising the wait is promising a different tool.
     forbidden: /Matrix\s+serves this natively/,

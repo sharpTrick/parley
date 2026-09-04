@@ -467,7 +467,8 @@ describe('disconnect ends an in-flight events long-poll instead of waiting it ou
     expect(TEARDOWN_TIMEOUT_MS).toBeLessThan(EVENTS_TIMEOUT_MS);
   });
 
-  it.each([PARKED_TOPICS])('with %i topics parked on the server', async (topics) => {
+  it(`with ${PARKED_TOPICS} topics parked on the server`, async () => {
+    const topics = PARKED_TOPICS;
     // No heartbeat inside the test's lifetime: every poll is genuinely parked server-side, which is
     // the healthy idle state a live deployment spends almost all of its time in.
     const { plugin, fake } = await boot(

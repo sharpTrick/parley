@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   ASSERTED_PROPERTIES,
+  CALLER_BLOCK_RETURN_MS,
   CLAUSES,
   CONTEXT_FIELDS,
   EARLY_RETURN_FRACTION,
@@ -17,6 +18,9 @@ import {
   REFUSAL_RETURN_MS,
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
+  STABILITY_LONG_READS,
+  STABILITY_READS_MIN,
+  STABILITY_TOPICS,
   TAIL_BLOCK_MS,
 } from '@sharptrick/parley-conformance';
 import {
@@ -54,9 +58,15 @@ const EXPORTED_BUDGETS: Record<string, number> = {
 };
 
 /**
- * Every wall-clock budget the suite sets for itself. A budget ABOVE the harness's `testTimeout` can
- * never be reached: vitest kills the case first, so the carefully-worded diagnostic the budget
- * exists to produce is dead code and the operator gets a generic timeout.
+ * Every wall-clock budget the suite sets for itself. A WAIT above the harness's `testTimeout` can
+ * never be reached: vitest kills the case first, so the carefully-worded diagnostic the wait exists
+ * to produce is dead code and the operator gets a generic timeout.
+ *
+ * A `blockMs` is not a wait this suite takes — it is a figure handed to a plugin, and a suite that
+ * only ever hands out figures small enough to sit through is a suite whose reads a plugin can
+ * recognise by size, which is the switch `blocking-arm-is-stable` exists to forbid. So a budget the
+ * size a caller really sends is bounded by the race the suite runs it under rather than by the
+ * harness, and what has to stay under the harness is that race — graded below.
  */
 const selfImposedBudgets = (): SelfImposedBudget[] => budgetsIn(source, EXPORTED_BUDGETS);
 
@@ -480,6 +490,17 @@ describe('the suite grades every backend it certifies', () => {
       expect(IDLE_BLOCK_MS * EARLY_RETURN_FRACTION).toBeLessThan(IDLE_BLOCK_FLOOR_MS);
       expect(EARLY_RETURN_FRACTION).toBeGreaterThan(0);
     });
+
+    /**
+     * The arm-stability run's reach, graded against its own budgets rather than against a clock —
+     * every switch predicate `BROKEN_VARIANTS` stands up is a figure set against ONE of these, and a
+     * run that stopped covering the window, the count or the topics would turn each of those
+     * controls into a plugin that passes.
+     */
+    it('the stability run is built to reach every switch a control can hide behind', () => {
+      expect(STABILITY_READS_MIN).toBeGreaterThan(STABILITY_LONG_READS);
+      expect(STABILITY_TOPICS).toBeGreaterThan(1);
+    });
   });
 
   it('reads a testTimeout out of the harness config, so the budget rows below grade something', () => {
@@ -525,6 +546,17 @@ describe('the suite grades every backend it certifies', () => {
     expect([(handedIn as SelfImposedBudget).ms, (declared as SelfImposedBudget).ms]).toEqual([null, null]);
     expect(isForwarded(handedIn as SelfImposedBudget)).toBe(true);
     expect(isForwarded(declared as SelfImposedBudget)).toBe(false);
+  });
+
+  /**
+   * The bound that makes a budget above the harness ceiling safe. Without it, "the suite races that
+   * read" is a claim about code rather than a figure anyone has checked, and a race set past the
+   * harness ceiling is no race at all: the case is killed first and reports a bare timeout naming no
+   * clause — exactly the outcome the budget rows exist to prevent.
+   */
+  it('never waits longer for one read than the harness will let the case run', () => {
+    expect(CALLER_BLOCK_RETURN_MS).toBeLessThan(testTimeoutMs());
+    expect(SINCELESS_RETURN_MS).toBeLessThan(testTimeoutMs());
   });
 
   it.each(

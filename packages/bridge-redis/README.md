@@ -42,10 +42,12 @@ reader for every nap of the granted budget. (Distinct from the `block_ms` config
 is the `subscribe` loop's idle re-arm interval.)
 
 Each parked long poll holds a reader connection for its whole budget, so how many one bridge may
-hold at once is **capped at 8**. A call past the cap is served the empty page it can always be
-handed and core polls out the rest of its budget, rather than opening a ninth socket — a few hundred
-concurrent `fetch_recent` calls would otherwise exhaust `maxclients` on the Redis every peer session
-shares. `subscribe` is not capped: live push keeps one reader per subscribed topic.
+hold at once is **capped at 8** — a few hundred concurrent `fetch_recent` calls would otherwise
+exhaust `maxclients` on the Redis every peer session shares. A call past the cap still gets the wait
+it asked for: rather than opening a ninth socket it re-reads its window on the shared command
+connection every 100 ms until something arrives or the budget runs out. It never comes back early
+with an empty page, which a caller cannot tell from a long poll that timed out.
+`subscribe` is not capped: live push keeps one reader per subscribed topic.
 
 ## Config (`backend_config`)
 

@@ -104,7 +104,7 @@ The retention prune reports failures the same way (quiet for lock contention, a 
 stderr line otherwise), so a retention policy the process cannot enforce is never silent.
 
 **No `fetch_recent` long-poll here.** SQLite is polling-only: its read primitive takes no wait, so
-`fetchRecent` REFUSES a `blockMs` — it rejects with `BlockingFetchUnsupportedError` naming this
+`fetchRecent` REFUSES a POSITIVE `blockMs` — it rejects with `BlockingFetchUnsupportedError` naming this
 plugin, rather than answering with a page a caller cannot tell from a long-poll that timed out
 empty. The refusal propagates unchanged through core's `fetchRecentBlocking` wrapper too, off the
 first call and without spending the budget, so an EMBEDDER learns the wait did not happen. An agent

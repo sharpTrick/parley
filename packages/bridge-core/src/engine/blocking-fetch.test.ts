@@ -147,11 +147,13 @@ describe('fetchRecentBlocking', () => {
 
   /**
    * Cancellation has to reach the thing actually doing the waiting, not just the wrapper around it.
-   * Table both plugin flavours the seam allows — one that ignores `blockMs` (core naps between
-   * calls) and one that honours it NATIVELY (the wait happens inside a single plugin call) — across
-   * every moment an abort can land AND every cadence an operator can configure, and assert a bounded
-   * wall-clock return in every cell. Real timers: the defect is that core stays parked — inside
-   * `plugin.fetchRecent`, or inside its own nap — which a fake clock cannot express.
+   * Where the wait HAPPENS is the dimension: inside a single plugin call for a backend that honours
+   * `blockMs` natively, or inside core's own nap between calls for one that came back early —
+   * something this wrapper re-drives rather than trusts, which is why the early-returning shape has
+   * to be driven here even though no conformant plugin has it. Crossed with every moment an abort
+   * can land AND every cadence an operator can configure, asserting a bounded wall-clock return in
+   * every cell. Real timers: the defect is that core stays parked, which a fake clock cannot
+   * express.
    *
    * The cadence is a DIMENSION, not a constant. `catchup.block_poll_interval_ms` is an unbounded
    * positive integer, so it can be set as coarse as the whole budget; a wait that only re-reads the
@@ -164,7 +166,7 @@ describe('fetchRecentBlocking', () => {
     const T = asTopic('room');
 
     const flavours = {
-      'ignores blockMs (returns instantly)': async (): Promise<BackendPlugin> => {
+      'comes back early from a budget (core naps between calls)': async (): Promise<BackendPlugin> => {
         const p = await connectedFake();
         return p;
       },
@@ -238,6 +240,67 @@ describe('fetchRecentBlocking', () => {
         expect(Date.now() - t0).toBeGreaterThanOrEqual(350);
       });
     }
+  });
+
+  /**
+   * A bounded RETURN is not a bounded COST. The nap is `min(cadence, remaining)`, so on a coarse
+   * cadence it is armed for minutes; a cancelled long poll that resolves its caller while leaving
+   * that timer armed holds the Node event loop open for the rest of a budget nobody is waiting on —
+   * measured at 24,907 ms after the answer, and this is the path a client disconnect and a shutdown
+   * both take. Counted at the timer API rather than by watching the process exit, so the row names
+   * the leak instead of hanging.
+   *
+   * Cadences are the same dimension as above: a nap finer than the abort has already fired by the
+   * time the assertion runs and would grade nothing.
+   */
+  describe('an aborted long-poll leaves no timer armed behind it', () => {
+    const BUDGET_MS = 30_000;
+
+    it.each([BUDGET_MS, BUDGET_MS / 2, 5_000])('cadence %i', async (pollIntervalMs) => {
+      const plugin = await connectedFake();
+      const tail = (await plugin.fetchRecent({ topic: asTopic('room') })).nextCursor;
+      const armed = new Set<unknown>();
+      const realSetTimeout = globalThis.setTimeout;
+      const realClearTimeout = globalThis.clearTimeout;
+      globalThis.setTimeout = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        let handle: unknown;
+        handle = realSetTimeout(
+          (...a: unknown[]) => {
+            armed.delete(handle);
+            fn(...a);
+          },
+          ms,
+          ...rest,
+        );
+        armed.add(handle);
+        return handle;
+      }) as unknown as typeof globalThis.setTimeout;
+      globalThis.clearTimeout = ((handle: unknown) => {
+        armed.delete(handle);
+        realClearTimeout(handle as Parameters<typeof realClearTimeout>[0]);
+      }) as unknown as typeof globalThis.clearTimeout;
+
+      try {
+        const ac = new AbortController();
+        realSetTimeout(() => ac.abort(), 100).unref?.();
+        armed.clear();
+        await fetchRecentBlocking(
+          plugin,
+          { topic: asTopic('room'), since: tail },
+          { blockMs: BUDGET_MS, pollIntervalMs, signal: ac.signal },
+        ).catch(() => undefined);
+      } finally {
+        globalThis.setTimeout = realSetTimeout;
+        globalThis.clearTimeout = realClearTimeout;
+      }
+
+      expect(
+        armed.size,
+        'the cancelled long poll answered its caller and left its nap armed. The timer runs for ' +
+          'the rest of a budget nothing is waiting on, holding the event loop open — so a bridge ' +
+          'told to shut down sits there until the last abandoned poll expires',
+      ).toBe(0);
+    });
   });
 
   /**

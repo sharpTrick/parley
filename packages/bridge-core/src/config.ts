@@ -97,19 +97,39 @@ const ConfigObject = z.object({
        * caller's `block_ms` is clamped to this before it reaches a plugin, kept safely below MCP /
        * client tool timeouts so a blocked call never trips them. Default 60s, capped at
        * {@link MAX_BLOCK_MS}.
+       *
+       * A very small ceiling is legal and degenerate rather than refused: every blocking read still
+       * happens, it just ends almost at once, so an agent polling on `block_ms` re-drives the
+       * backend at whatever rate the ceiling allows — on Redis that is a fresh dedicated reader
+       * connection per call. Only ZERO is refused, because zero stops any budget reaching a plugin
+       * at all and so silently removes the contract instead of tightening it.
        */
       block_max_ms: z
         .number()
         .int()
-        .nonnegative()
+        .positive({
+          message:
+            'catchup.block_max_ms must be > 0 (ms): every caller\'s block_ms is clamped to this ' +
+            'before it reaches a plugin, so a ceiling of 0 means no backend is ever handed a ' +
+            'budget, none can refuse one, and parley_fetch_recent answers a long poll at once ' +
+            'with an empty page the caller cannot tell from one that timed out. To turn the long ' +
+            'poll off, stop sending block_ms; there is no ceiling that means "disabled"',
+        })
         .max(MAX_BLOCK_MS, {
           message: `catchup.block_max_ms must be <= ${MAX_BLOCK_MS} (ms): a blocked parley_fetch_recent holds the tool call for the whole clamp, and a longer one trips the MCP client tool timeout this field exists to stay under`,
         })
         .default(60_000),
       /**
-       * Poll cadence (ms) of core's long-poll wrapper — how often it re-drives `fetchRecent` while
-       * a blocking read is still waiting out its budget. No correctness impact; latency/cost knob
-       * only.
+       * How often core's long-poll wrapper re-drives `fetchRecent` AFTER a plugin has RETURNED from
+       * a budget early and with nothing for the topic asked for — a page of another topic's traffic
+       * on a backend whose delivery is coarser than a topic, or a native blocker cut short. Nothing
+       * re-drives a plugin that is still parked; the wrapper is waiting on that call.
+       *
+       * So this is not the delivery latency of a blocking fetch. Both backends that park natively
+       * spend the budget inside ONE `fetchRecent` and never reach the nap (measured against a live
+       * Redis and a live NATS: a message posted 400 ms into an 8 s budget arrives at 402 ms, an idle
+       * 1200 ms budget returns at ~1205 ms — the same at a cadence of 250 ms and of 5000 ms), and
+       * the eight backends that refuse `block_ms` never start the loop at all.
        */
       block_poll_interval_ms: z
         .number()

@@ -88,17 +88,76 @@ export const RACE_BLOCK_MS = 2_000;
 export const RACE_RETURN_MS = 1_000;
 
 /**
- * Ceiling on a probe's budget. Probes exist to make the NUMBER of blocking reads unpredictable, so
- * on the parking arm each one is really waited out — keep them small enough that an unknown number
- * of them costs nothing measurable.
+ * Ceiling on the budget the lost-wakeup case's opening read carries — the read that decides which
+ * arm the backend is on before the race is set up. Drawn rather than fixed, and small enough that
+ * waiting one out on the parking arm costs nothing measurable.
  */
 export const PROBE_MAX_BLOCK_MS = 40;
 
 /**
- * Most extra blocking reads a case makes beyond the ones its other assertions need. The arm is
- * INFERRED from behaviour, so a fixed count of them is a fingerprint: a plugin that refuses exactly
- * the reads the suite is known to make, and silently drops every budget after them, passes a suite
- * that asks a predictable number of times. Drawn at random between 1 and this, so what is graded is
- * that the arm never CHANGES — a property no schedule can be fitted to.
+ * The share of its budget a SERVED blocking read that came back EMPTY must actually have spent.
+ * Applied to EVERY such read, not only the one the idle clause measures by hand: a plugin that
+ * honours the first few budgets and then answers instantly forever is on the serving arm the whole
+ * time, so nothing that grades only the ARM can see it, and one hand-measured read cannot either.
+ *
+ * Derived from the idle clause's own floor over its own budget, so the two cannot drift apart and
+ * the {@link EARLY_RETURN_FRACTION} control still lands on the failing side of both.
  */
-export const MAX_EXTRA_PROBES = 3;
+export const SERVED_BLOCK_FLOOR_FRACTION = IDLE_BLOCK_FLOOR_MS / IDLE_BLOCK_MS;
+
+/**
+ * The window the arm-stability run must cover on ONE connection. A recorder scoped to a single case
+ * asserts stability over a handful of reads inside a few hundred milliseconds, which a backend that
+ * refuses for the first seconds of a connection and silently drops every budget afterwards passes
+ * without ever being asked a question it would answer differently.
+ */
+export const STABILITY_SPAN_MS = 3_000;
+
+/** Fewest / most DRAWN blocking reads that run makes; it also makes {@link STABILITY_CALLER_READS}. */
+export const STABILITY_READS_MIN = 26;
+export const STABILITY_READS_MAX = 30;
+
+/** How many of the drawn budgets are LONG, and the range they come from. */
+export const STABILITY_LONG_READS = 3;
+export const STABILITY_LONG_BLOCK_MIN_MS = 1_050;
+export const STABILITY_LONG_BLOCK_MAX_MS = 1_250;
+
+/** The range the remaining drawn budgets come from. */
+export const STABILITY_SHORT_BLOCK_MIN_MS = 10;
+export const STABILITY_SHORT_BLOCK_MAX_MS = 60;
+
+/**
+ * How many reads carry a budget the SIZE A REAL CALLER SENDS — up to `catchup.block_max_ms`, which
+ * the skill this repo ships tells an agent to fill with 55 000. Every other budget here is two
+ * orders of magnitude smaller, and that is itself a fingerprint: a plugin that honours the small
+ * figures a suite hands out and drops the large ones an agent sends passes a run drawn only from the
+ * small ones, which is the defect `blocking-arm-is-stable` exists to forbid.
+ */
+export const STABILITY_CALLER_READS = 2;
+
+/**
+ * The share of core's own ceiling below which a caller-scale budget is never drawn. Keep the FLOOR
+ * above every figure the suite hands out from a constant, so that the control aimed at a plugin
+ * which honours small budgets and drops large ones is really reached.
+ */
+export const CALLER_BLOCK_FLOOR_FRACTION = 1 / 8;
+
+/**
+ * How long a read carrying a caller-scale budget may take. Those budgets are deliberately LARGER
+ * than the harness's own per-case ceiling — that is what makes them the size an agent sends — so
+ * each is raced against this and fails by NAME rather than being killed by vitest with a diagnostic
+ * that names no clause. Both shapes answer long before it: one is a since-less read of a topic that
+ * already has messages, which both arms answer at once, and the other wakes on a write scheduled
+ * inside it.
+ */
+export const CALLER_BLOCK_RETURN_MS = 6_000;
+
+/**
+ * How many distinct topics the run spreads its reads over, and how deep the first of them is. A
+ * backend that serves budgets on the topic it was first asked about, or only while a topic is small
+ * enough to answer from a first page, drops every budget a real deployment sends it — and answers
+ * every other case, each of which works on ONE fresh topic holding one message, exactly as a
+ * conformant one does.
+ */
+export const STABILITY_TOPICS = 3;
+export const STABILITY_DEEP_TOPIC_ROWS = 14;

@@ -415,9 +415,12 @@ catchup:
   block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll;
                                 # a caller's value is clamped to this before it reaches a plugin,
                                 # kept below client tool timeouts so a blocked call never trips them
-  block_poll_interval_ms: 250    # re-query cadence of the long-poll core drives behind
-                                 # parley_fetch_recent's `block_ms`. This IS the delivery latency of
-                                 # a blocking fetch on a backend that serves one.
+  block_poll_interval_ms: 250    # how often core re-drives fetchRecent AFTER a plugin came back
+                                 # from a budget early with nothing for the topic asked for. NOT the
+                                 # delivery latency: Redis and NATS park inside one fetchRecent, so
+                                 # the nap is never reached (measured: 402ms arrival, ~1205ms idle
+                                 # return, identical at cadence 250 and 5000), and the eight that
+                                 # refuse block_ms never start the loop at all.
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`

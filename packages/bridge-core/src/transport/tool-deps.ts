@@ -17,7 +17,7 @@ export interface ToolDeps {
   seen?: SeenSet;
   /** Server-side cap (ms) on `parley_fetch_recent`'s `block_ms` long-poll. */
   blockMaxMs: number;
-  /** Poll cadence (ms) for core's generic long-poll fallback. */
+  /** Poll cadence (ms) at which core re-drives a plugin that came back early from a budget. */
   blockPollIntervalMs: number;
 }
 

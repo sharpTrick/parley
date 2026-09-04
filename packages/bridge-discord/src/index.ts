@@ -90,8 +90,8 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    this.require();
     assertBlockMsUnsupported('parley-discord', args.blockMs);
+    this.require();
     const generation = this.generation;
     // The seam declares `limit?: number` with no floor, and `fetchRecent` is public API — only the
     // MCP tool path upstream refuses a hostile one. Keep the floor HERE, so that a page walk

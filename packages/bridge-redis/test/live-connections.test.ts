@@ -624,6 +624,71 @@ describe.skipIf(!redisUp)('redis failure modes — a blocking fetch opens a boun
       ).toBeLessThanOrEqual(MAX_BLOCKING_READERS);
     }));
 
+  /**
+   * CLASS: the cap is a bound on CONCURRENT readers, not a lifetime budget. Every accounting of a
+   * pooled resource has the same failure — a path that takes one and never gives it back — and here
+   * it is invisible to every bound above: they all bound the count from ABOVE, and a plugin that has
+   * silently stopped opening readers satisfies each of them perfectly while every later long poll
+   * is quietly demoted to the polled arm.
+   *
+   * Rows are ROUNDS, so what is graded is that the Nth batch is served like the first rather than
+   * that a particular one is.
+   */
+  it.each([1, 2, 3])('%i rounds of long polls each get the cap back', async (rounds) =>
+    withProxiedPlugin(async ({ proxy, plugin, prefix, topic: t }) => {
+      await plugin.connect({ url: proxy.url, key_prefix: prefix });
+      await plugin.post(t, asHandle('w'), 'seed');
+      const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
+      const openedBefore = proxy.accepted();
+      for (let round = 0; round < rounds; round++) {
+        await Promise.all(
+          Array.from({ length: MAX_BLOCKING_READERS }, () =>
+            plugin.fetchRecent({ topic: t, since, blockMs: 300 }),
+          ),
+        );
+      }
+      expect(
+        proxy.accepted() - openedBefore,
+        `${rounds} round(s) of ${MAX_BLOCKING_READERS} concurrent long polls opened ` +
+          `${proxy.accepted() - openedBefore} readers. A round that opens fewer than the cap ` +
+          'allows is one whose readers were never released back to it: the cap has become a budget ' +
+          'the connection spends once, and every long poll after it is silently demoted',
+      ).toBe(rounds * MAX_BLOCKING_READERS);
+    }));
+
+  /**
+   * CLASS: no arm of `fetchRecent` answers a `blockMs` it did not wait out. A call past the cap has
+   * nowhere to park, which is exactly the moment a plugin is tempted to hand back the empty page it
+   * already has — indistinguishable to the caller from a long poll that timed out, and through the
+   * tool a re-drive of the caller's whole budget at core's own cadence.
+   */
+  it.each([MAX_BLOCKING_READERS + 1, 2 * MAX_BLOCKING_READERS])(
+    '%i concurrent long polls: the ones past the cap are waited out, not answered at once',
+    async (n) =>
+      withProxiedPlugin(async ({ proxy, plugin, prefix, topic: t }) => {
+        const budget = 1_500;
+        await plugin.connect({ url: proxy.url, key_prefix: prefix });
+        await plugin.post(t, asHandle('w'), 'seed');
+        const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
+        const startedAt = Date.now();
+        const spent = await Promise.all(
+          Array.from({ length: n }, async () => {
+            const at = Date.now();
+            const page = await plugin.fetchRecent({ topic: t, since, blockMs: budget });
+            return { ms: Date.now() - at, rows: page.messages.length };
+          }),
+        );
+        expect(Date.now() - startedAt, 'no call waited at all').toBeGreaterThanOrEqual(budget);
+        expect(
+          spent.filter((r) => r.rows === 0 && r.ms < budget / 2),
+          `of ${n} concurrent long polls on a ${budget}ms budget, these came back empty without ` +
+            'waiting. Past the reader cap the budget still has to be honoured: an empty page ' +
+            'returned at once is what a long poll that timed out looks like, so the caller cannot ' +
+            'tell it apart and core re-drives the whole budget against this Redis',
+        ).toEqual([]);
+      }),
+  );
+
   // The inverse arm, and the one a cap applied to the wrong place breaks: `subscribe` readers are
   // one per subscribed topic, live for the session, and are NOT long-polls — capping them silently
   // kills live push for every topic past the cap behind a `subscribe()` that resolved.

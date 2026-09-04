@@ -89,20 +89,23 @@ export class SocketModeLink {
    * The dial pacer is read HERE for the same reason: every route to a dial goes through this
    * method, so a caller that retries — its own loop, or a second entry point added later — cannot
    * turn an unavailable Socket Mode into a dial per attempt against Slack's tightest-limit
-   * endpoint. {@link reconnect} waits the cooldown out before it calls, so it never sees this arm.
+   * endpoint.
+   *
+   * A caller inside the cooldown WAITS it out rather than being turned away. Refusing it reports
+   * the pacer where the outage belongs: core rethrows a failed `subscribe`, so a bridge whose
+   * socket had dropped once failed to come up naming a backoff instead of Slack. Waiting also joins
+   * whatever reconnect is already in flight — it publishes into `wsReady`, which is what the loop
+   * below re-reads — so a live socket that comes back during the wait is the one this caller gets.
    */
-  ensureSocket(): Promise<void> {
+  async ensureSocket(): Promise<void> {
     if (this.host.settings().appToken === undefined) {
-      return Promise.reject(
-        new Error('Slack Socket Mode needs an app_token; this deployment has no live push'),
-      );
+      throw new Error('Slack Socket Mode needs an app_token; this deployment has no live push');
     }
-    if (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
-      return Promise.reject(
-        new Error(
-          'Slack Socket Mode dialling is backing off; apps.connections.open not attempted',
-        ),
-      );
+    while (this.wsReady === undefined && Date.now() < this.dialCooldownUntil) {
+      if (this.host.stopped()) {
+        throw new Error('Slack Socket Mode dialling abandoned; the plugin was disconnected');
+      }
+      await delay(this.dialCooldownUntil - Date.now());
     }
     if (this.wsReady === undefined) {
       const session = this.host.session();

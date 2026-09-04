@@ -28,7 +28,7 @@ Archive ids are not lexically comparable, but core never compares cursors — th
 `<after>` defines "strictly after" and the MAM archive defines order.
 
 **No `block_ms` here.** `fetchRecent` reads the MAM archive and has no wait to spend a caller's
-budget on, so it REFUSES one: a `parley_fetch_recent` carrying `block_ms` rejects with
+budget on, so it REFUSES one: a `parley_fetch_recent` carrying a POSITIVE `block_ms` rejects with
 `BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
 cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`, over
 the MUC's live groupchat stanzas.

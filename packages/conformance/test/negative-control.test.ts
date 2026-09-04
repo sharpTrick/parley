@@ -6,18 +6,36 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { asTopic, buildMessage } from '@sharptrick/parley-core';
-import { ASSERTED_PROPERTIES, CLAUSES, type ConformanceContext } from '@sharptrick/parley-conformance';
+import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import {
+  ASSERTED_PROPERTIES,
+  CALLER_BLOCK_FLOOR_FRACTION,
+  CLAUSES,
+  type ConformanceContext,
+  STABILITY_CALLER_READS,
+  STABILITY_DEEP_TOPIC_ROWS,
+  STABILITY_LONG_BLOCK_MAX_MS,
+  STABILITY_LONG_BLOCK_MIN_MS,
+  STABILITY_READS_MIN,
+  STABILITY_SHORT_BLOCK_MAX_MS,
+  STABILITY_SHORT_BLOCK_MIN_MS,
+  STABILITY_SPAN_MS,
+} from '@sharptrick/parley-conformance';
+import {
+  ARM_SWITCHES,
   blastRadiusOf,
+  ENUMERABLE_BUDGETS,
   BROKEN_SUITE_MARK,
   BROKEN_VARIANTS,
   MAX_BLAST_RADIUS,
   ReferencePlugin,
+  SWITCH_AFTER_CALLS,
 } from './reference-plugin.js';
 import {
-  BOOLEAN_CAPABILITIES,
+  CAPABILITY_AXES,
   diagnosedAssertions,
   suiteSource,
+  UNTABULATED_CAPABILITIES,
 } from './suite-source.js';
 
 /**
@@ -62,7 +80,7 @@ beforeAll(async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-}, 300_000);
+}, 900_000);
 
 const results = (): Row[] => report.testResults.flatMap((f) => f.assertionResults);
 
@@ -216,13 +234,22 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
     }
   }, 120_000);
 
-  const rows = BOOLEAN_CAPABILITIES.flatMap((axis) =>
-    [true, false].map((arm) => [axis.name, arm] as [string, boolean]),
+  const rows = CAPABILITY_AXES.flatMap((axis) =>
+    axis.arms.map((arm) => [axis.name, arm] as [string, unknown]),
   );
 
-  it('finds boolean flags to grade, so the rows below are not an empty table', () => {
-    expect(BOOLEAN_CAPABILITIES.length).toBeGreaterThan(0);
-    expect(rows.length).toBe(BOOLEAN_CAPABILITIES.length * 2);
+  it('finds capability arms to grade, so the rows below are not an empty table', () => {
+    expect(CAPABILITY_AXES.length).toBeGreaterThan(1);
+    expect(rows.length).toBeGreaterThan(CAPABILITY_AXES.length);
+  });
+
+  it('tabulates every capability field whose arms can be named', () => {
+    expect(
+      UNTABULATED_CAPABILITIES,
+      'this context field has arms the probe cannot name, so no row below requires a control for ' +
+        'either of them. `concurrentPost` is the recorded one — its arms are a function and a ' +
+        'string; anything else here is a capability whose coverage nothing is asking about',
+    ).toEqual(['concurrentPost']);
   });
 
   it('built every variant fixture, so the arm each one declares is readable', () => {
@@ -230,10 +257,10 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
   });
 
   it.each(rows)('`%s` = %s', (name, arm) => {
-    const axis = BOOLEAN_CAPABILITIES.find((a) => a.name === name)!;
+    const axis = CAPABILITY_AXES.find((a) => a.name === name)!;
     const controls = BROKEN_VARIANTS.filter((v) => {
       const ctx = declared.get(v.name);
-      return ctx !== undefined && axis.arm(ctx) === arm;
+      return ctx !== undefined && axis.armOf(ctx) === arm;
     });
     expect(
       controls.map((v) => v.name),
@@ -241,6 +268,56 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
         `below only proves a variant fails its own clause — so every assertion reachable only ` +
         `inside that arm can be deleted with this package staying green`,
     ).not.toEqual([]);
+  });
+});
+
+/**
+ * The switch table's own reach. Each predicate stands for a way a plugin can tell the reads a suite
+ * is known to make apart from the ones a real agent sends, and each is a figure set against the long
+ * run's own: a count above what that run asks for, or a clock past what it spans, is a control that
+ * fires nowhere and reads in the report as coverage.
+ */
+describe('every arm switch is reachable by the run built to catch it', () => {
+  it('waits for fewer budgets than the long run hands out', () => {
+    expect(SWITCH_AFTER_CALLS).toBeLessThan(STABILITY_READS_MIN);
+  });
+
+  /**
+   * The budget-value switch, from the other side: it stands for a plugin that recognises the reads a
+   * suite is known to make, and it only stands for anything while the run draws budgets that suite
+   * never hands out from a constant. A range that drifted over one of those constants would leave
+   * the control passing for a plugin the clause exists to catch.
+   */
+  it('draws its budgets from ranges holding none of the figures the suite hands out', () => {
+    const inRange = (v: number): boolean =>
+      (v >= STABILITY_SHORT_BLOCK_MIN_MS && v <= STABILITY_SHORT_BLOCK_MAX_MS) ||
+      (v >= STABILITY_LONG_BLOCK_MIN_MS && v <= STABILITY_LONG_BLOCK_MAX_MS);
+    expect(ENUMERABLE_BUDGETS.filter(inRange)).toEqual([]);
+    // …and the caller-scale reads really are larger than anything the suite hands out from a
+    // constant, so the control aimed at a plugin that honours small budgets and drops large ones is
+    // reached by every one of them rather than by the lucky draws.
+    expect(Math.floor(MAX_BLOCK_MS * CALLER_BLOCK_FLOOR_FRACTION)).toBeGreaterThan(
+      Math.max(...ENUMERABLE_BUDGETS),
+    );
+  });
+
+  it.each(ARM_SWITCHES.map((sw) => [sw.when, sw] as const))('%s fires inside that run', (_when, sw) => {
+    // The LAST read the run is guaranteed to make, on the topic it seeds deep, carrying the largest
+    // budget a caller may legally send — the far edge of every axis the run reaches along.
+    const nowhere = sw.fires({
+      call: STABILITY_READS_MIN + STABILITY_CALLER_READS,
+      connectionAgeMs: STABILITY_SPAN_MS + 1,
+      blockMs: MAX_BLOCK_MS,
+      topic: 'b',
+      topicRows: STABILITY_DEEP_TOPIC_ROWS,
+      firstTopic: 'a',
+      connection: 2,
+    });
+    expect(
+      nowhere,
+      'this predicate is never true of a read the long run makes, so the variant built on it ' +
+        'answers the whole suite honestly and proves nothing',
+    ).toBe(true);
   });
 });
 

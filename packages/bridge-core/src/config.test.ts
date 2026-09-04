@@ -534,9 +534,8 @@ describe('config rejects an empty string in any field that names something', () 
 
 // Every numeric field is a count or a duration, and none of them means anything at zero, below zero
 // or between integers: `catchup.limit: 0` makes catch-up's `messages.length < limit` break condition
-// false forever and page without end, `block_poll_interval_ms: 0` turns the long-poll fallback into a
-// tight re-query loop. Walk the fixture so a knob added later is graded the moment it appears
-// there.
+// false forever and page without end. Walk the fixture so a knob added later is graded the moment it
+// appears there.
 describe('config rejects a degenerate number in any numeric field', () => {
   interface NumericLeaf {
     label: string;
@@ -556,8 +555,7 @@ describe('config rejects a degenerate number in any numeric field', () => {
   // `backend_config` is opaque to core (DESIGN §11); its numbers are the plugin's to police.
   const leaves = numericLeaves(FULL).filter((l) => l.path[0] !== 'backend_config');
 
-  // Zero is legal only where it names "no cap" / "no tolerance" rather than a cadence or a count.
-  const ZERO_IS_LEGAL = new Set(['catchup.block_max_ms', 'auth.oidc.clock_skew_s']);
+  const ZERO_IS_LEGAL = new Set(['auth.oidc.clock_skew_s']);
 
   it('finds every numeric field in the fixture (guards against a broken walk)', () => {
     expect(leaves.map((l) => l.label).sort()).toEqual([

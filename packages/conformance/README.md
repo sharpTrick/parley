@@ -60,6 +60,16 @@ them stops owning a case — a conformance clause used to be deletable with noth
   itself certifies a plugin that parks for all of it;
 - a post landing in the window between a blocking fetch issuing its read and registering its
   waiter is not missed — a blocking fetch is not missed by 0-3ms of race;
+- the same arm answers a long run of unpredictable budgets: a drawn number of blocking reads over
+  drawn budgets — including budgets the size an agent really sends, up to what `catchup.block_max_ms`
+  allows — spread over several topics, one of them deep, and over seconds of ONE connection. Every
+  read the suite makes is scored, across cases and across connections: a backend that answers
+  `block_ms` one way on this connection and another on the next has changed the contract under a
+  caller who cannot see connections at all. Every SERVED read that comes back empty must have spent
+  its budget, so a backend that stays nominally on the serving arm while silently dropping the budget
+  is graded on the arm it claims. A finite run cannot catch a switch at an arbitrary threshold: what
+  is held is the class up to this run's reach, and `BROKEN_VARIANTS` carries a control at the far
+  edge of each axis it reaches along;
 - a backend that declares `carriesSenderIdentity: false` still reports ONE stable, non-empty
   `senderHandle` and keeps the two posts distinguishable by id;
 - multi-process writes don't corrupt state and cursor ordering still holds, and a reader

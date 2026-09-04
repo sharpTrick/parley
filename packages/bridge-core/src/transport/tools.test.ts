@@ -1,7 +1,7 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { parseConfig } from '../config.js';
+import { MAX_BLOCK_MS, parseConfig } from '../config.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asHandle, asTopic } from '../message.js';
 import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
@@ -417,6 +417,47 @@ describe('the block_ms surface', () => {
     expect(refused.content[0]!.text).toContain('parley-fake');
     expect(refused.content[0]!.text).toContain('block_ms');
     expect(refused.content[0]!.text).not.toContain('"messages"');
+  });
+
+  /**
+   * CLASS: no ceiling the config admits may silently disable the contract. The clamp is a
+   * `Math.min`, so a `block_max_ms` of 0 clamped every caller's budget to zero: no plugin was ever
+   * handed one, no backend could refuse one, and this tool answered a 30 s long poll at once with an
+   * empty page and no error — the exact outcome the refusal exists to make impossible, reachable
+   * from a documented key with no code change. Rows are the ceilings the SCHEMA still admits, tried
+   * against it rather than listed, so a bound widened back to zero arrives here as a live row.
+   */
+  describe('every ceiling the config admits still reaches the plugin as a budget', () => {
+    const admits = (blockMaxMs: number): boolean => {
+      try {
+        parseConfig({ identity: { handle: 'p' }, topics: ['ctx'], catchup: { block_max_ms: blockMaxMs } });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const CANDIDATES = [0, 1, 2, 250, 60_000, MAX_BLOCK_MS];
+    const admitted = CANDIDATES.filter(admits);
+
+    it('rejects at least one candidate at load, so the rows below are not the whole domain', () => {
+      expect(admitted.length).toBeGreaterThan(2);
+      expect(CANDIDATES.filter((c) => !admits(c))).not.toEqual([]);
+    });
+
+    it.each(admitted)('block_max_ms %i still lets a refusing backend refuse', async (blockMaxMs) => {
+      const { client } = await harness({ plugin: refusing(new FakePlugin()), blockMaxMs });
+      const answer = (await client.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', block_ms: 30_000 },
+      })) as ToolText;
+      expect(
+        answer.isError,
+        `with catchup.block_max_ms = ${blockMaxMs} the tool answered a 30s block_ms without the ` +
+          'backend ever seeing a budget, so the refusal never happened and the caller is handed a ' +
+          'page it cannot tell from a long poll that timed out empty',
+      ).toBe(true);
+      expect(answer.content[0]!.text).toContain('block_ms');
+    });
   });
 
   // The refusal is for the WAIT, not for the topic: the ordinary catch-up read a refusing backend

@@ -16,8 +16,13 @@ export interface BlockingFetchOptions {
   pollIntervalMs: number;
   /** Monotonic clock in ms. Default `Date.now`. */
   now?: () => number;
-  /** Sleep `ms`. Default a real `setTimeout`. */
-  sleep?: (ms: number) => Promise<void>;
+  /**
+   * Sleep `ms`, resolving early if `signal` fires. Default a real `setTimeout` that CLEARS its timer
+   * on abort: the nap is up to the caller's whole remaining budget (minutes), so a timer left armed
+   * holds the Node event loop open for all of it after the request it belonged to has been answered
+   * and thrown away — a shutdown then waits on a poll that nobody is listening to.
+   */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /**
    * Optional cancellation. Observed while napping AND while a natively-blocking `fetchRecent` is
    * parked inside the plugin, so an aborted long-poll returns in bounded time rather than after the
@@ -27,7 +32,16 @@ export interface BlockingFetchOptions {
   signal?: AbortSignal;
 }
 
-const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
 
 /**
  * A long-poll cancelled before any page came back. There is no cursor to return — core never mints
@@ -147,7 +161,10 @@ export async function fetchRecentBlocking(
     // Race the nap against the signal, so that cancellation latency is bounded by the ABORT and not
     // by the cadence: `block_poll_interval_ms` is an operator knob up to the whole budget, and a nap
     // whose abort is only re-read at the next iteration holds a cancelled long-poll for all of it.
-    await untilAborted(sleep(Math.min(opts.pollIntervalMs, Math.max(0, deadline - now()))), opts.signal);
+    await untilAborted(
+      sleep(Math.min(opts.pollIntervalMs, Math.max(0, deadline - now())), opts.signal),
+      opts.signal,
+    );
   }
 }
 

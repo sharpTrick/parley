@@ -11,6 +11,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import {
   createRedisClient,
   openCommandClient,
@@ -43,6 +44,14 @@ export { CONFIG_KEYS, DEFAULT_URL, type RedisBackendConfig } from './config.js';
  * counted: those are one per subscribed topic, bounded by the config.
  */
 export const MAX_BLOCKING_READERS = 8;
+
+/**
+ * How often a long poll past that cap re-reads its window. It buys the wait with a small `XRANGE`
+ * on the shared command client instead of a socket of its own, so the cost of a caller past the cap
+ * is one cheap read per tick rather than one connection for the whole budget — and the wake latency
+ * it trades for that is bounded by this figure rather than by the caller's whole `block_ms`.
+ */
+const CAPPED_POLL_INTERVAL_MS = 100;
 
 /**
  * Redis Streams backend (DESIGN §6/§9) — the FIRST event-driven push backend. A Stream entry id
@@ -224,8 +233,9 @@ export class RedisPlugin implements BackendPlugin {
    * dedicated connection is mandatory, not an optimization: `XREAD BLOCK` holds its connection for
    * the whole wait, so running it on the shared command client would stall every concurrent `post`
    * (XADD) — including the post meant to wake this very wait — into a deadlock. A timeout, a
-   * teardown, a transient fault or a call past {@link MAX_BLOCKING_READERS} returns `[]`, which is
-   * safe: the empty page carries `nextCursor === since` and core polls the rest of the budget.
+   * teardown or a transient fault ends the wait with `[]`, and the empty page then carries
+   * `nextCursor === since`. Past {@link MAX_BLOCKING_READERS} the same wait is served by
+   * {@link polledRead} instead of by a ninth socket.
    */
   private async blockingRead(
     key: string,
@@ -233,7 +243,9 @@ export class RedisPlugin implements BackendPlugin {
     blockMs: number,
     limit: number,
   ): Promise<Entry[]> {
-    if (this.blockingReaders >= MAX_BLOCKING_READERS) return [];
+    if (this.blockingReaders >= MAX_BLOCKING_READERS) {
+      return this.polledRead(key, since, blockMs, limit);
+    }
     const gen = this.generation;
     const reader = this.newReader();
     this.blockingReaders++;
@@ -254,6 +266,35 @@ export class RedisPlugin implements BackendPlugin {
     } finally {
       this.blockingReaders--;
       await this.retireReader(reader);
+    }
+  }
+
+  /**
+   * The wait a caller past {@link MAX_BLOCKING_READERS} gets: the same budget, honoured by
+   * re-reading the exclusive window on {@link CAPPED_POLL_INTERVAL_MS} instead of by holding a
+   * connection open. Keep it a WAIT. Answering at once with the empty page this call already has is
+   * indistinguishable to the caller from a long poll that timed out empty — the one outcome
+   * `blockMs` exists to make impossible — and through the tool it is worse than the socket it saved:
+   * core re-drives the whole of the caller's budget against this Redis at its own cadence.
+   */
+  private async polledRead(
+    key: string,
+    since: string,
+    blockMs: number,
+    limit: number,
+  ): Promise<Entry[]> {
+    const gen = this.generation;
+    const deadline = Date.now() + blockMs;
+    for (;;) {
+      const nap = Math.min(CAPPED_POLL_INTERVAL_MS, deadline - Date.now());
+      if (nap <= 0) return [];
+      await delay(nap);
+      // Re-read the generation AFTER the nap: a `disconnect()` that landed inside it has already
+      // discarded the command client, and `require()` would raise a fault where the caller is owed
+      // the empty page every other end of this wait hands back.
+      if (gen !== this.generation) return [];
+      const entries = await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
+      if (entries.length > 0) return entries;
     }
   }
 

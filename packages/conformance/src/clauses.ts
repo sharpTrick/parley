@@ -25,6 +25,7 @@ export const CLAUSES: readonly string[] = [
   'not collapsed onto one another',
   'blockMs is honoured natively or refused',
   'blocking fetch is not missed',
+  'a long run of unpredictable budgets',
   'interleaved with concurrent writers',
   'multi-process writes',
 ];
@@ -54,12 +55,22 @@ export const CLAUSES: readonly string[] = [
  *   BESIDE it (a row the reader never saw at all), so the re-delivery and re-ordering half could be
  *   deleted with this package — negative control included — staying green.
  *
- * - `blocking-arm-is-stable`: the answer a backend gives a block budget does not CHANGE within a
- *   connection. The arm is inferred from behaviour rather than declared, so a plugin that refuses
- *   exactly the reads the suite is known to make and silently drops every budget after them takes
- *   the refusing arm and ignores every `block_ms` a real agent sends. Graded by making the number of
- *   blocking reads, and the budgets they carry, unpredictable from the suite — a schedule cannot be
- *   fitted to what it cannot see.
+ * - `blocking-arm-is-stable`: the answer a backend gives a block budget does not CHANGE. The arm is
+ *   inferred from behaviour rather than declared, so a plugin that refuses exactly the reads the
+ *   suite is known to make and silently drops every budget after them takes the refusing arm and
+ *   ignores every `block_ms` a real agent sends. Graded over every blocking read the suite makes,
+ *   across cases and across connections, since a caller sees neither.
+ *
+ *   A finite run cannot catch a switch at an arbitrary threshold, so what is held is the class up to
+ *   the long run's REACH: the number of budgets it hands out, how large they are — up to what a
+ *   caller may legally send, not merely what is convenient to wait out — the topics it names and how
+ *   deep they are, the connections it opens, and the wall clock it covers. `BROKEN_VARIANTS` carries
+ *   one control per axis, each sitting at the far edge of that reach, so a reach that shrinks stops
+ *   failing a control instead of silently narrowing what the clause means.
+ * - `caller-scale-block-is-answered`: a budget the size an agent really sends is answered, not
+ *   parked on. Every other budget here is small enough for the suite to sit through, which is itself
+ *   a fingerprint — a plugin that honours small figures and drops large ones passes a run drawn only
+ *   from small ones.
  * - `refusing-read-covers-only-what-it-returned`: on the arm that never parks, a durable read
  *   racing a write reports a cursor no higher than the last row it RETURNED. Reporting the topic's
  *   tail instead — a cursor minted after the read rather than from its own rows — covers a message
@@ -83,6 +94,11 @@ export const CLAUSES: readonly string[] = [
  *   the budget expires.
  * - `native-block-actually-waits`: and it waits for it — a native `blockMs` that returns instantly
  *   with nothing to report turns core's long-poll into a hot loop against the backend.
+ * - `native-block-waits-every-time`: EVERY read on the serving arm that comes back empty spent its
+ *   budget, not just the one the idle clause measures by hand. A backend that honours the first few
+ *   budgets on a connection and answers instantly forever after never leaves the serving arm, so
+ *   nothing that grades the arm alone can see it — and one hand-measured read is by construction one
+ *   of the first few.
  * - `native-block-does-not-overshoot-the-budget`: and not far PAST it. Core holds the caller's
  *   request open for whatever the plugin spends, so a blocker that answers a 300 ms budget after
  *   3 s is a hang under a politer name — and every floor in the clause passes for one, leaving only
@@ -96,11 +112,13 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'post-id-agreement',
   'interleaved-reader-sees-each-row-once-in-order',
   'blocking-arm-is-stable',
+  'caller-scale-block-is-answered',
   'refusing-read-covers-only-what-it-returned',
   'refusal-is-not-an-empty-page',
   'sinceless-block-returns-promptly',
   'refusal-is-prompt',
   'native-block-wakes-on-the-message',
   'native-block-actually-waits',
+  'native-block-waits-every-time',
   'native-block-does-not-overshoot-the-budget',
 ];
