@@ -23,8 +23,6 @@ export { backoffMs, type SubscriptionHealth, type SubscriptionState } from './po
  * multi-process posts safe (§9/§10).
  */
 export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
-  readonly capabilities = { blockingFetch: false } as const;
-
   async connect(config: BackendConfig): Promise<void> {
     if (this.driver !== undefined) {
       throw new Error(

@@ -1,6 +1,7 @@
 import {
   asBackendMsgId,
   asCursor,
+  assertBlockMsUnsupported,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
@@ -60,12 +61,6 @@ export type { TelegramBackendConfig } from './config.js';
  * Telegram bridge per bot token — see README.md, "Multiple concurrent sessions".
  */
 export class TelegramPlugin implements BackendPlugin {
-  /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
   private api = new BotApi(DEFAULT_API_URL, '');
   private chats?: ChatResolver;
   private store?: ObservedStore;
@@ -279,6 +274,7 @@ export class TelegramPlugin implements BackendPlugin {
    * sliced to `limit`.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertBlockMsUnsupported('parley-telegram', args.blockMs);
     return this.redacting(async () => this.query(args));
   }
 

@@ -5,6 +5,7 @@ import {
   catchUpTopic,
   type Cursor,
   fetchRecentBlocking,
+  isBlockingFetchUnsupportedError,
   ReadStateStore,
   SeenSet,
 } from '@sharptrick/parley-core';
@@ -157,10 +158,12 @@ describe('a foreign block moves this topic cursor only when it fills a page', ()
 
   /**
    * The bound on forward pagination (MAX_FORWARD_PAGES * limit) is only survivable because each
-   * drain advances the cursor. Driven through core's own `fetchRecentBlocking`, which feeds
-   * `nextCursor` back as the next `since` — the exact loop a wedged cursor makes infinite.
+   * drain advances the cursor. Driven as the repeated catch-up core runs for this backend — each
+   * page's `nextCursor` fed back as the next `since`, the exact loop a wedged cursor makes infinite.
+   * This plugin has no read primitive to park a budget on, so the row also pins the other half of
+   * that: `fetchRecentBlocking` over it REFUSES rather than crossing the block slowly.
    */
-  it('a foreign block deeper than one drain is crossed by the blocking driver, not wedged', async () => {
+  it('a foreign block deeper than one drain is crossed by repeated catch-up, not wedged', async () => {
     install();
     const p = await connect(true);
     const A = asTopic('deep-A');
@@ -173,20 +176,26 @@ describe('a foreign block moves this topic cursor only when it fills a page', ()
 
     let since = asCursor(String(idA0));
     const drained: string[] = [];
-    // A budget comfortably longer than one drain, so core's re-drive really is the thing reporting
-    // the cursor — a budget the first drain already spends returns before it.
     for (let call = 0; call < 4 && drained.length === 0; call++) {
-      const page = await fetchRecentBlocking(
-        p,
-        { topic: A, since, limit: 5 },
-        { blockMs: 2000, pollIntervalMs: 10 },
-      );
+      const page = await p.fetchRecent({ topic: A, since, limit: 5 });
       drained.push(...page.messages.map((m) => m.content));
       since = page.nextCursor;
     }
 
     expect(drained).toEqual(['a1']);
     expect(String(since)).toBe(String(idA1));
+
+    // The refusal reaches an embedder through core's wrapper too, off the FIRST call: crossing the
+    // block by polling behind the caller's back is exactly the wait this backend cannot honour.
+    const refusal = await fetchRecentBlocking(
+      p,
+      { topic: A, since: asCursor(String(idA0)), limit: 5 },
+      { blockMs: 2000, pollIntervalMs: 10 },
+    ).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(isBlockingFetchUnsupportedError(refusal)).toBe(true);
     await p.disconnect();
   }, 30_000);
 });

@@ -104,13 +104,12 @@ The retention prune reports failures the same way (quiet for lock contention, a 
 stderr line otherwise), so a retention policy the process cannot enforce is never silent.
 
 **No `fetch_recent` long-poll here.** SQLite is polling-only: its read primitive takes no wait, so
-this plugin declares `capabilities.blockingFetch: false` and core leaves `block_ms` off the
-`parley_fetch_recent` schema this deployment advertises — a call that sends it anyway is refused by
-name rather than accepted and silently stripped. An agent polls on its own cadence, or runs under
-Claude Code with `live_push.enabled` and is pushed a `<channel>` event. Core's generic long-poll
-wrapper is still public API for an EMBEDDER (`fetchRecentBlocking`, re-driving at
-`catchup.block_poll_interval_ms` and capped by `catchup.block_max_ms`); it is only the MCP schema
-that narrows.
+`fetchRecent` REFUSES a `blockMs` — it rejects with `BlockingFetchUnsupportedError` naming this
+plugin, rather than answering with a page a caller cannot tell from a long-poll that timed out
+empty. The refusal propagates unchanged through core's `fetchRecentBlocking` wrapper too, off the
+first call and without spending the budget, so an EMBEDDER learns the wait did not happen. An agent
+polls on its own cadence, or runs under Claude Code with `live_push.enabled` and is pushed a
+`<channel>` event.
 
 ## Config (`backend_config`)
 

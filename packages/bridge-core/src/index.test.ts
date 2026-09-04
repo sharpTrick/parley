@@ -39,10 +39,11 @@ describe('public barrel surface', () => {
   // ships: a symbol added to the barrel is on neither the kept list nor the trimmed one, so it
   // reaches npm unnoticed. Types are counted too — `Object.keys` sees no type-only re-export.
   const SURFACE = [
-    'Allowlist', 'AllowlistOptions', 'AuthConfig', 'AuthSchema', 'BackendCapabilities',
+    'Allowlist', 'AllowlistOptions', 'AuthConfig', 'AuthSchema',
     'BackendCliOptions',
     'BackendConfig', 'BackendConfigKeys', 'BackendIdentity', 'BackendMsgId', 'BackendPlugin',
-    'BlockingFetchOptions', 'BuildMessageInput', 'CHANNEL_NOTIFICATION_METHOD', 'CORE_VERSION',
+    'BlockingFetchOptions', 'BlockingFetchUnsupportedError', 'BuildMessageInput',
+    'CHANNEL_NOTIFICATION_METHOD', 'CORE_VERSION',
     'CatchUpArgs', 'ConfigSchema', 'ConsentError', 'Cursor', 'DEFAULT_HASH_LEN', 'FakeOidc',
     'FakeOidcClaims', 'FetchAbortedError', 'FetchRecentArgs', 'FetchRecentResult', 'Handle',
     'MAX_BLOCK_MS', 'MAX_HASH_LEN', 'MAX_MATCH_INPUT', 'MIN_HASH_LEN', 'Message',
@@ -53,12 +54,13 @@ describe('public barrel surface', () => {
     'PushLoopOptions', 'ReadStateStore', 'RemoteAuthOptions', 'RemoteAuthServer',
     'RemoteHttpOptions', 'RemoteHttpServer', 'SeenSet', 'ShutdownHost', 'TOOL_TEXT', 'ToolDeps',
     'Topic', 'TopicNotAllowedError', 'UnsafePatternError', 'allowlistFor', 'asBackendMsgId',
-    'asCursor', 'asHandle', 'asTopic', 'assertKnownConfigKeys', 'buildBridge', 'buildMessage',
+    'asCursor', 'asHandle', 'asTopic', 'assertBlockMsUnsupported', 'assertKnownConfigKeys',
+    'buildBridge', 'buildMessage',
     'buildReactiveServer', 'catchUpAll', 'catchUpTopic', 'channelMeta', 'createOAuthRemoteApp',
     'createOidcRemoteApp', 'createRemoteAuthApp', 'createRemoteHttpApp', 'createStdioBridge',
     'defaultReadStatePath', 'emitChannel', 'fetchOidcDiscovery', 'fetchRecentBlocking',
-    'hashOwnerSecret', 'installShutdown', 'instanceIdOf', 'isFetchAbortedError',
-    'isNoSuchTopicError', 'loadConfig', 'makeOwnerVerifier', 'ownerVerifierFromPassphrase',
+    'hashOwnerSecret', 'installShutdown', 'instanceIdOf', 'isBlockingFetchUnsupportedError',
+    'isFetchAbortedError', 'isNoSuchTopicError', 'loadConfig', 'makeOwnerVerifier', 'ownerVerifierFromPassphrase',
     'parseArgs', 'parseConfig', 'parseMentions', 'registerTools', 'runBackendCli', 'safeName',
     'startFakeOidc', 'startPushLoop', 'toolDepsFor', 'usageFor',
   ] as const;
@@ -154,13 +156,12 @@ describe('public barrel surface', () => {
   const MEMBERS: Record<string, string[]> = {
     Allowlist: ['assert', 'constructor', 'has', 'patterns', 'topics'],
     AllowlistOptions: ['postPatterns'],
-    BackendCapabilities: ['blockingFetch'],
     BackendCliOptions: ['bin', 'moduleUrl', 'plugin'],
     BackendConfig: ['[index signature]'],
     BackendConfigKeys: ['keys', 'nested'],
     BackendIdentity: ['backendRef', 'handle'],
     BackendPlugin: [
-      'capabilities', 'connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe',
+      'connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe',
     ],
     BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
     BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
@@ -171,6 +172,7 @@ describe('public barrel surface', () => {
       'aud', 'azp', 'expiresInS', 'issuerOverride', 'notBeforeInS', 'omit', 'preferred_username',
       'realm_access', 'scope', 'signWithRogueKey', 'sub',
     ],
+    BlockingFetchUnsupportedError: ['constructor'],
     FetchAbortedError: ['constructor'],
     FetchRecentArgs: ['blockMs', 'limit', 'since', 'topic'],
     FetchRecentResult: ['messages', 'nextCursor'],

@@ -1,5 +1,6 @@
 import {
   asBackendMsgId,
+  assertBlockMsUnsupported,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
@@ -53,12 +54,6 @@ export const PRUNE_BATCH = 5000;
  * mis-addressed notification costs latency and never a message (DESIGN §6).
  */
 export class PostgresPlugin extends PostgresListener implements BackendPlugin {
-  /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
   /**
    * Armed synchronously by `connect()` before its first await, so that two concurrent `connect()`s
    * cannot both pass a `pool === undefined` guard — `this.pool` is only published after the awaited
@@ -312,6 +307,7 @@ export class PostgresPlugin extends PostgresListener implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertBlockMsUnsupported('parley-postgres', args.blockMs);
     assertStorable('topic', args.topic);
     try {
       return await this.readPage(args);

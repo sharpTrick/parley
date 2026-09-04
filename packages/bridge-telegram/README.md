@@ -37,9 +37,10 @@ kind. Updates with none of these (service messages: joins, leaves, pins) are **n
 an agent is never handed a blank turn.
 
 **No `block_ms` here.** `fetchRecent` reads the observed-message store and has no wait to spend a
-caller's budget on, so this plugin declares `capabilities.blockingFetch: false` and core withdraws
-`block_ms` from the `parley_fetch_recent` schema for a Telegram deployment. Live delivery is
-`subscribe`, off the one shared `getUpdates` loop.
+caller's budget on, so it REFUSES one: a `parley_fetch_recent` carrying `block_ms` rejects with
+`BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
+cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`, off the
+one shared `getUpdates` loop.
 
 > **`post`'s `identity` argument is not used.** Telegram stamps the sender as the bot account
 > behind the token — the same caveat as the Matrix plugin's login account. Per-session

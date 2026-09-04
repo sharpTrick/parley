@@ -34,24 +34,20 @@ export const TOOL_TEXT = {
     'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
     'does not exist yet); re-issue without `since` in that case. ' +
     'Call this on session start for each configured topic, then on demand. A topic that does not ' +
-    'exist on the backend yet returns an empty page with `topicAbsent: true` rather than an error.',
-  /**
-   * Appended to {@link TOOL_TEXT.fetch_recent} only where `block_ms` is on the schema. A deployment
-   * whose backend declares no native blocking never sends it, so the model is never told to pass an
-   * argument that would be refused — and never told about a cancellation only a long-poll can have.
-   */
-  fetch_recent_blocking:
-    ' Pass `block_ms` to long-poll: if the queried window is empty — whether or not you passed ' +
+    'exist on the backend yet returns an empty page with `topicAbsent: true` rather than an error. ' +
+    'Pass `block_ms` to long-poll: if the queried window is empty — whether or not you passed ' +
     '`since` — the call holds until a message arrives or the timeout elapses (capped ' +
     'server-side), so a polling agent burns tokens per message, not per tick. A cancelled ' +
     'long-poll answers like any other empty window, with `nextCursor` omitted when you passed no ' +
-    '`since`.',
+    '`since`. Not every backend can park on a wait: one that cannot REFUSES `block_ms` with an ' +
+    'error naming itself, so retry without it and poll on your own cadence.',
   fetch_recent_since:
     'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
   fetch_recent_block_ms:
     'Long-poll budget in ms. If the queried window is empty — whether or not you passed ' +
     '`since` — hold up to this long for a new message before returning (possibly empty). ' +
-    'Clamped server-side. 0 / omit = return the window at once, empty or not.',
+    'Clamped server-side. 0 / omit = return the window at once, empty or not. A backend with no ' +
+    'read primitive to park on refuses this argument rather than ignoring it.',
   post:
     'Publish a message into a topic on the durable backend so humans and other instances see it. ' +
     'Use this for handoffs and output. Returns { backendMsgId }.',
@@ -61,24 +57,6 @@ export const TOOL_TEXT = {
     'live channel is only the fast inbound hop, replies always write to the backend. Returns ' +
     '{ backendMsgId }.',
 } as const;
-
-/**
- * What a deployment answers when the model sends `block_ms` to a backend that declares
- * `capabilities.blockingFetch: false`. The argument is off the schema there, and the schema says
- * `additionalProperties: false` — so it is REFUSED, naming the argument and the declaration that
- * withdrew it, rather than accepted and silently dropped. A caller cannot tell a dropped `block_ms`
- * from a long-poll that timed out empty, which is a polling agent burning a turn per tick believing
- * it is parked.
- */
-export const withdrawnBlockMs =
-  '`block_ms` is not accepted here: this deployment\'s backend declares ' +
-  '`capabilities.blockingFetch: false`, so parley_fetch_recent returns the window it has and ' +
-  'never long-polls. Omit `block_ms` and poll on your own cadence.';
-
-const withdrawnArgument: z.ZodErrorMap = (issue, ctx) =>
-  issue.code === z.ZodIssueCode.unrecognized_keys && issue.keys.includes('block_ms')
-    ? { message: withdrawnBlockMs }
-    : { message: ctx.defaultError };
 
 /** Shared durable write path for both `parley_post` and `parley_reply`. */
 async function doPost(
@@ -127,19 +105,12 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       .optional()
       .describe(TOOL_TEXT.fetch_recent_block_ms),
   };
-  // Keep the field in the SHAPE and drop it here, so that the handler below keeps its inferred
-  // argument type and one code path serves both kinds of deployment.
-  const blocks = deps.plugin.capabilities?.blockingFetch !== false;
-  if (!blocks) delete (fetchRecentInput as Partial<typeof fetchRecentInput>).block_ms;
 
   server.registerTool(
     'parley_fetch_recent',
     {
-      description:
-        TOOL_TEXT.fetch_recent +
-        (blocks ? TOOL_TEXT.fetch_recent_blocking : '') +
-        describeAllowed(allow),
-      inputSchema: z.object(fetchRecentInput, { errorMap: withdrawnArgument }).strict(),
+      description: TOOL_TEXT.fetch_recent + describeAllowed(allow),
+      inputSchema: z.object(fetchRecentInput).strict(),
     },
     async ({ topic, since, limit, block_ms }, extra) => {
       const t = deps.allow.assert(topic);
@@ -201,14 +172,16 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     'parley_post',
     {
       description: TOOL_TEXT.post + describeAllowed(allow),
-      inputSchema: {
-        topic: topicSchema(allow, 'Topic to post into (must be on the allowlist).'),
-        content: z.string().describe('Message body.'),
-        in_reply_to: z
-          .string()
-          .optional()
-          .describe('Optional backendMsgId this message threads under.'),
-      },
+      inputSchema: z
+        .object({
+          topic: topicSchema(allow, 'Topic to post into (must be on the allowlist).'),
+          content: z.string().describe('Message body.'),
+          in_reply_to: z
+            .string()
+            .optional()
+            .describe('Optional backendMsgId this message threads under.'),
+        })
+        .strict(),
     },
     async ({ topic, content, in_reply_to }) => {
       const id = await doPost(deps, topic, content, in_reply_to);
@@ -220,16 +193,18 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     'parley_reply',
     {
       description: `${TOOL_TEXT.reply} Subscribed topics: ${topicList(allow)}.`,
-      inputSchema: {
-        // No enum: a reply targets whatever topic the inbound <channel> arrived from. Runtime
-        // membership is still enforced by `allow.assert` in doPost.
-        topic: z.string().describe('The topic to reply in (the inbound message’s topic).'),
-        content: z.string().describe('The reply body.'),
-        in_reply_to: z
-          .string()
-          .optional()
-          .describe('Optional msg_id of the message being replied to.'),
-      },
+      inputSchema: z
+        .object({
+          // No enum: a reply targets whatever topic the inbound <channel> arrived from. Runtime
+          // membership is still enforced by `allow.assert` in doPost.
+          topic: z.string().describe('The topic to reply in (the inbound message’s topic).'),
+          content: z.string().describe('The reply body.'),
+          in_reply_to: z
+            .string()
+            .optional()
+            .describe('Optional msg_id of the message being replied to.'),
+        })
+        .strict(),
     },
     async ({ topic, content, in_reply_to }) => {
       const id = await doPost(deps, topic, content, in_reply_to);

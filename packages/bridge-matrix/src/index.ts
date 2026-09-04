@@ -1,5 +1,6 @@
 import {
   asBackendMsgId, type BackendConfig, type BackendIdentity, type BackendMsgId,
+  assertBlockMsUnsupported,
   type BackendPlugin, type FetchRecentArgs, type FetchRecentResult,
   type Handle, type MessageHandler, type Topic,
 } from '@sharptrick/parley-core';
@@ -39,12 +40,6 @@ export {
  * under Synapse's strict per-user room-creation rate limit without an appservice.
  */
 export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
-  /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
   private txnCounter = 0;
 
   async connect(config: BackendConfig): Promise<void> {
@@ -117,6 +112,7 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertBlockMsUnsupported('parley-matrix', args.blockMs);
     const generation = this.generation;
     const limit = requireLimit(args.limit, args.topic);
     const roomId = await this.existingRoom(args.topic, generation);

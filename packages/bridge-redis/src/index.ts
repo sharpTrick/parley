@@ -54,9 +54,6 @@ export const MAX_BLOCKING_READERS = 8;
  * cursors.
  */
 export class RedisPlugin implements BackendPlugin {
-  /** `fetchRecent` hands `blockMs` straight to `XREAD BLOCK`. */
-  readonly capabilities = { blockingFetch: true } as const;
-
   private client?: RedisClient;
   private cfg: ResolvedConfig = resolveConfig({});
   /**

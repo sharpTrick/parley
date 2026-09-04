@@ -85,8 +85,9 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
  * every one of them:
  *
  *   - Each iteration calls `plugin.fetchRecent({ ...args, since, blockMs: remaining })`.
- *     A native plugin blocks up to `remaining` inside that one call; a non-native plugin ignores
- *     the field and returns immediately.
+ *     A native plugin blocks up to `remaining` inside that one call. A backend with nowhere to put
+ *     the budget REFUSES it — `BlockingFetchUnsupportedError` off the very first call, propagated
+ *     unchanged, never retried or emulated, so the caller learns the wait did not happen.
  *   - A page carrying the REQUESTED topic → return at once. A page carrying only other topics (a
  *     backend whose delivery is coarser than a topic) is not arrival: `since` advances past it and
  *     the wait continues.

@@ -129,14 +129,15 @@ interface BackendPlugin {
     topic: Topic;
     since?: Cursor;     // monotonic position (§6); omit = backend default window
     limit?: number;
-    blockMs?: number;   // long-poll HINT: if empty past `since`, a plugin MAY block up to blockMs
-                        // for a new message before returning (possibly empty). Only a hint — a
-                        // plugin that ignores it is still correct. The fetch_recent TOOL offers
-                        // `block_ms` only where the plugin declares capabilities.blockingFetch
-                        // (Redis, NATS); elsewhere it is off the schema and a call sending it is
-                        // refused. An embedder can still drive core's generic poll fallback
-                        // directly via fetchRecentBlocking. Value is capped server-side
-                        // (catchup.block_max_ms, default 60s). 0/omit = return at once.
+    blockMs?: number;   // long-poll budget: if empty past `since`, the plugin blocks up to blockMs
+                        // for a new message before returning (possibly empty). A backend with no
+                        // read primitive to park on REFUSES it instead — it rejects with
+                        // BlockingFetchUnsupportedError naming itself, and core propagates that to
+                        // the caller. Never silently ignored: an empty page is indistinguishable
+                        // from a long-poll that timed out. Today Redis and NATS serve it; the other
+                        // eight refuse. `block_ms` is on the fetch_recent tool schema on every
+                        // deployment. Value is capped server-side (catchup.block_max_ms, default
+                        // 60s). 0/omit = return at once.
   }): Promise<{ messages: Message[]; nextCursor: Cursor }>;
 
   // 5. Map a logical handle to a backend identity. Best-effort: a real account lookup where
@@ -411,12 +412,12 @@ post_topics:               # OPTIONAL extra topics allowed for post/fetch only, 
 catchup:
   on_start: true
   limit: 100                    # page size per fetchRecent
-  block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll,
-                                # where the backend declares it; a caller's value is clamped to this
-                                # before it reaches a plugin, kept below client tool timeouts so a
-                                # blocked call never trips them
-  block_poll_interval_ms: 250    # re-query cadence for core's generic long-poll, which an EMBEDDER
-                                 # drives through fetchRecentBlocking. Latency/cost only.
+  block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll;
+                                # a caller's value is clamped to this before it reaches a plugin,
+                                # kept below client tool timeouts so a blocked call never trips them
+  block_poll_interval_ms: 250    # re-query cadence of the long-poll core drives behind
+                                 # parley_fetch_recent's `block_ms`. This IS the delivery latency of
+                                 # a blocking fetch on a backend that serves one.
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`

@@ -1,6 +1,7 @@
 import {
   asBackendMsgId,
   asCursor,
+  assertBlockMsUnsupported,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
@@ -19,6 +20,8 @@ import {
 import {
   type ConformanceContext,
   EARLY_RETURN_FRACTION,
+  IDLE_BLOCK_MS,
+  OVERSHOOT_MULTIPLE,
   PARK_FRACTION,
 } from '@sharptrick/parley-conformance';
 
@@ -61,10 +64,6 @@ export class ReferencePlugin implements BackendPlugin {
     this.blocking = blocking;
   }
 
-  get capabilities(): { blockingFetch: boolean } {
-    return { blockingFetch: this.blocking };
-  }
-
   connect(_config: BackendConfig): Promise<void> {
     this.connected = true;
     return Promise.resolve();
@@ -103,15 +102,15 @@ export class ReferencePlugin implements BackendPlugin {
   }
 
   /**
-   * `blocking` is the OTHER arm of the declared `blockingFetch` capability, and it has to be
-   * honoured for real: the
-   * suite's native-blocking assertions grade waking on the message rather than on the budget, and a
-   * poll would satisfy them by accident. Keep the read and the waiter in ONE synchronous turn, so
-   * that a write landing between them cannot be lost — that window is what the suite's 0-3 ms race
-   * case exists to open, and a fixture with the hazard in it grades nothing.
+   * The two arms of the `blockMs` contract, both honoured for real. A `blocking` reference WAITS —
+   * the suite grades waking on the message rather than on the budget, and a poll would satisfy that
+   * by accident — and keeps the read and the waiter in ONE synchronous turn, so that a write landing
+   * between them cannot be lost; that window is what the suite's 0-3 ms race case exists to open.
+   * A non-`blocking` reference REFUSES, exactly as every backend with nowhere to park does.
    */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
+    if (!this.blocking) assertBlockMsUnsupported('reference', args.blockMs);
     const page = this.read(args);
     if (!this.blocking || args.blockMs === undefined || page.messages.length > 0) return page;
     const until = Date.now() + args.blockMs;
@@ -168,10 +167,8 @@ let seq = 0;
 
 /**
  * The capability flags every fixture here used to hard-code, which made them a CONSTANT rather than
- * an axis: with the polling arm taken everywhere, nothing in this package ever ran the suite's
- * native-blocking half or the true arm of its lost-wakeup race, and both could be deleted with the
- * package green while backends that declare the capability kept being certified against them. Every
- * fixture below states which arm it takes, and `BROKEN_VARIANTS` covers both.
+ * an axis: a flag no fixture ever takes the other arm of is a flag whose weaker contract is graded
+ * nowhere. Every fixture below states which arm it takes, and `BROKEN_VARIANTS` covers both.
  */
 type Capabilities = Pick<ConformanceContext, 'carriesSenderIdentity'>;
 
@@ -180,7 +177,6 @@ const DEFAULT_CAPABILITIES: Capabilities = {
 };
 
 const delegate = (inner: ReferencePlugin): BackendPlugin => ({
-  capabilities: inner.capabilities,
   connect: (c) => inner.connect(c),
   disconnect: () => inner.disconnect(),
   subscribe: (t, h) => inner.subscribe(t, h),
@@ -236,10 +232,10 @@ export const makeReferenceContext = (): Promise<ConformanceContext> => {
 };
 
 /**
- * The positive control on the OTHER arm of `capabilities.blockingFetch` — a reference that really honours
- * `blockMs` inside `fetchRecent`, as Redis, NATS, Matrix, Postgres, XMPP, Slack, Discord and Zulip
- * declare they do. Without it the suite's native-blocking assertions are satisfiable by nothing in
- * this repo, which is indistinguishable from their being deleted.
+ * The positive control on the BLOCKING arm — a reference that really honours `blockMs` inside
+ * `fetchRecent`, as Redis and NATS do over their own read primitives. Without it the suite's
+ * native-blocking assertions are satisfiable by nothing in this repo, which is indistinguishable
+ * from their being deleted.
  */
 export const makeBlockingReferenceContext = (): Promise<ConformanceContext> => {
   const store = newReferenceStore();
@@ -338,9 +334,9 @@ export const MAX_BLAST_RADIUS = 16;
 export const blastRadiusOf = (v: BrokenVariant): number => v.blastRadius ?? NARROW_BLAST_RADIUS;
 
 /**
- * The inner plugin is built to MATCH the capabilities the fixture declares — a variant that declares
- * native `blockMs` gets an inner that really honours it — so that the only thing failing the arm is
- * the wrapper's own defect and not the fixture lying about what it supports.
+ * `nativeBlocking` picks which arm of the `blockMs` contract the INNER plugin takes — parking on a
+ * budget, or refusing it — so that the only thing failing an arm is the wrapper's own defect and not
+ * a fixture that could not have served the budget in the first place.
  */
 const wrap = async (
   over: (inner: ReferencePlugin) => Partial<BackendPlugin>,
@@ -586,18 +582,48 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       })),
   },
   {
-    name: 'a fetch that parks forever on blockMs',
-    mutates: 'ignored-block-returns-promptly',
-    mustFail: 'blockMs is honoured natively or ignored promptly',
+    // The defect the contract exists to forbid, and the only one a DECLARATION could never catch:
+    // swallow the budget and answer with the window the backend already had. A caller cannot tell
+    // that from a long-poll that timed out empty, so an agent polls on believing it is parked.
+    name: 'a read that answers a block budget with the window it already had',
+    blastRadius: 5,
+    mutates: 'native-block-actually-waits',
+    mustFail: 'blockMs is honoured natively or refused',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: (args) => inner.fetchRecent({ ...args, blockMs: undefined }),
+      })),
+  },
+  {
+    // A refusal that arrives only after the wait it refuses. The caller budgeted for a long-poll and
+    // got one — with no messages and no page — which is strictly worse than either honest arm.
+    name: 'a read that parks for most of a budget before refusing it',
+    mutates: 'refusal-is-prompt',
+    mustFail: 'blockMs is honoured natively or refused',
     make: () =>
       wrap((inner) => ({
         fetchRecent: async (args) => {
-          const page = await inner.fetchRecent(args);
-          if (args.blockMs !== undefined && page.messages.length === 0) {
-            await new Promise((resolve) => setTimeout(resolve, Math.min(args.blockMs ?? 0, 1_200)));
+          const budget = args.blockMs;
+          if (args.since !== undefined && budget !== undefined) {
+            await new Promise((resolve) => setTimeout(resolve, budget * PARK_FRACTION));
           }
-          return page;
+          return inner.fetchRecent(args);
         },
+      })),
+  },
+  {
+    // The same trade wearing one honest refusal: refuse the budget asked first, answer the next one
+    // with a page. A refusal a backend does not hold to tells the caller nothing at all.
+    name: 'a read that refuses one block budget and answers the next with a page',
+    blastRadius: 5,
+    mutates: 'refusal-is-not-an-empty-page',
+    mustFail: 'blockMs is honoured natively or refused',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: (args) =>
+          args.since === undefined
+            ? inner.fetchRecent(args)
+            : inner.fetchRecent({ ...args, blockMs: undefined }),
       })),
   },
   {
@@ -611,16 +637,17 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // fraction, which is the property the clause claims to grade.
     name: 'a fetch that parks on a since-less blockMs',
     mutates: 'sinceless-block-returns-promptly',
-    mustFail: 'blockMs is honoured natively or ignored promptly',
+    mustFail: 'blockMs is honoured natively or refused',
     make: () =>
       wrap((inner) => ({
         fetchRecent: async (args) => {
-          const page = await inner.fetchRecent(args);
+          // Ahead of the delegate, so that the park is what the bound measures whichever arm the
+          // inner plugin takes — a refusal held back for most of the budget is the same defect.
           if (args.since === undefined && args.blockMs !== undefined) {
             const parkFor = Math.min(args.blockMs * PARK_FRACTION, 20_000);
             await new Promise((resolve) => setTimeout(resolve, parkFor));
           }
-          return page;
+          return inner.fetchRecent(args);
         },
       })),
   },
@@ -707,24 +734,6 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             handle: `not-${String(handle)}` as Handle,
             backendRef: 'reference:constant',
           }),
-      })),
-  },
-  {
-    // The lost-wakeup race: park "from now" instead of at the caller's cursor, so a message landing
-    // between the read and the waiter is reported as already-consumed and can never be fetched.
-    name: 'a blocking read that parks from now instead of at the caller cursor',
-    mutates: 'fetchRecent',
-    mustFail: 'blocking fetch is not missed',
-    make: () =>
-      wrap((inner) => ({
-        fetchRecent: async (args) => {
-          const page = await inner.fetchRecent(args);
-          if (args.since === undefined || args.blockMs === undefined) return page;
-          if (page.messages.length > 0) return page;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
-          return { messages: [], nextCursor: all.nextCursor };
-        },
       })),
   },
   {
@@ -976,18 +985,6 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       })),
   },
   {
-    // The arm SELECTOR itself. Every variant below declares an arm the fixture then honours, so a
-    // suite that read the arm from anywhere but the plugin's own declaration — a context field
-    // restating it, or a constant — would grade all of them exactly the same. This one declares
-    // native `blockMs` support on a plugin that ignores the budget entirely: it can only fail if
-    // the case reads `capabilities.blockingFetch` off the plugin under test.
-    name: 'a plugin declaring native blockMs support on a read that ignores the budget',
-    blastRadius: 5,
-    mutates: 'capabilities',
-    mustFail: 'blockMs is honoured natively or ignored promptly',
-    make: () => wrap(() => ({ capabilities: { blockingFetch: true } })),
-  },
-  {
     // The idle arm's FLOOR, which nothing could fail: of the three native-blocking variants, two
     // fail arm (a) before reaching it and the third fails on the cursor, so a plugin that declares
     // native `blockMs` support and answers "still nothing" the instant it is asked was certified —
@@ -996,7 +993,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // which is what core turns into a hot poll loop against the backend.
     name: 'a native blocking read that gives up long before the budget',
     mutates: 'native-block-actually-waits',
-    mustFail: 'blockMs is honoured natively or ignored promptly',
+    mustFail: 'blockMs is honoured natively or refused',
     make: () =>
       wrap(
         (inner) => ({
@@ -1015,8 +1012,9 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // which every fixture in this package used to be on the wrong side of the flag to reach. This
     // plugin returns the right messages under the right cursor; all it does is ignore the wake.
     name: 'a native blocking read that returns at the budget instead of on the message',
+    blastRadius: 5,
     mutates: 'native-block-wakes-on-the-message',
-    mustFail: 'blockMs is honoured natively or ignored promptly',
+    mustFail: 'blockMs is honoured natively or refused',
     make: () =>
       wrap(
         (inner) => ({
@@ -1038,7 +1036,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // `blockMs` that is allowed to expire empty.
     name: 'a native blocking read whose cursor moves on an empty timeout',
     mutates: 'nextCursor-stability',
-    mustFail: 'blockMs is honoured natively or ignored promptly',
+    mustFail: 'blockMs is honoured natively or refused',
     make: () =>
       wrap(
         (inner) => ({
@@ -1053,9 +1051,86 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       ),
   },
   {
-    // The lost-wakeup race on the arm that actually blocks. The variant below it takes the same
-    // shape on a polling backend; with every fixture declaring the polling arm, the true arm of the
-    // 0-3 ms case had no control at all and could be deleted with this package green.
+    /**
+     * The FINGERPRINT plugin. It refuses the first two block budgets it is handed — which is exactly
+     * as many as a suite with a fixed probe schedule ever asks for — and silently drops every budget
+     * after that. It is the defect the single-armed contract exists to forbid, wearing the arm the
+     * contract infers, and no count of probes defeats it: only requiring that the arm never CHANGES
+     * does. The mirror image (refuse twice, then block natively) is the same plugin with the other
+     * tail and fails the same assertion.
+     */
+    name: 'a read that refuses a couple of budgets and then quietly drops the rest',
+    blastRadius: 5,
+    mutates: 'blocking-arm-is-stable',
+    mustFail: 'blockMs is honoured natively or refused',
+    make: () => {
+      let handed = 0;
+      return wrap((inner) => ({
+        fetchRecent: (args) =>
+          args.blockMs !== undefined && args.blockMs > 0 && ++handed <= 2
+            ? inner.fetchRecent(args)
+            : inner.fetchRecent({ ...args, blockMs: undefined }),
+      }));
+    },
+  },
+  {
+    /**
+     * A native blocker that WAITS — just far past the budget it was given. Every "did it wait at
+     * all?" floor passes for it, so without a ceiling the only thing that ends the case is the
+     * harness timeout, whose message names no clause. Conditioned on a SMALL budget so it reaches
+     * the idle read and nothing else: the clause's other budgets are seconds long and a multiple of
+     * one of those would be killed rather than reported.
+     */
+    name: 'a native blocking read that parks well past the budget it was given',
+    mutates: 'native-block-does-not-overshoot-the-budget',
+    mustFail: 'blockMs is honoured natively or refused',
+    make: () =>
+      wrap(
+        (inner) => ({
+          fetchRecent: async (args) => {
+            const budget = args.blockMs;
+            const page = await inner.fetchRecent(args);
+            if (budget === undefined || budget > IDLE_BLOCK_MS || page.messages.length > 0) {
+              return page;
+            }
+            await new Promise((resolve) => setTimeout(resolve, budget * (OVERSHOOT_MULTIPLE - 1)));
+            return page;
+          },
+        }),
+        { nativeBlocking: true },
+      ),
+  },
+  {
+    /**
+     * The SAME lost wakeup, on the arm that never parks — and the only control that can reach it.
+     * This plugin refuses `blockMs` exactly as the eight shipped backends do, so the race case takes
+     * its refusing branch; what it gets wrong is minting `nextCursor` AFTER the read instead of from
+     * the rows the read returned, which is what a backend timestamping its position at "now" does.
+     * A write landing in that window is covered by a cursor that never carried it, and resuming from
+     * that cursor skips it for good.
+     *
+     * Gated on the PLAIN read: the refusing branch passes no budget at all, so a variant keyed on
+     * `blockMs` being present (as this one's parking sibling is) never runs on that branch and
+     * leaves its assertion with no control whatever.
+     */
+    name: 'a refusing read that mints its cursor after the read instead of from its own rows',
+    blastRadius: 5,
+    mutates: 'refusing-read-covers-only-what-it-returned',
+    mustFail: 'blocking fetch is not missed',
+    make: () =>
+      wrap((inner) => ({
+        fetchRecent: async (args) => {
+          const page = await inner.fetchRecent(args);
+          if (args.since === undefined || page.messages.length > 0) return page;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          const all = await inner.fetchRecent({ topic: args.topic, limit: 10_000 });
+          return { messages: [], nextCursor: all.nextCursor };
+        },
+      })),
+  },
+  {
+    // The lost-wakeup race: park "from now" instead of at the caller's cursor, so a message landing
+    // between the read and the waiter is reported as already-consumed and can never be fetched.
     name: 'a native blocking read that parks from now instead of at the caller cursor',
     blastRadius: 5,
     mutates: 'fetchRecent',

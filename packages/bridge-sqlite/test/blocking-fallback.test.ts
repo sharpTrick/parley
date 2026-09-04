@@ -2,16 +2,22 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { asHandle, asTopic, fetchRecentBlocking, type Topic } from '@sharptrick/parley-core';
+import {
+  asHandle,
+  asTopic,
+  fetchRecentBlocking,
+  isBlockingFetchUnsupportedError,
+  type Topic,
+} from '@sharptrick/parley-core';
 import { SqlitePlugin } from '../src/index.js';
 
 /**
- * SQLite does not block natively, so it declares `blockingFetch: false` and the MCP tool omits
- * `block_ms`. An EMBEDDER calling the seam directly still reaches core's `fetchRecentBlocking`
- * wrapper, and this proves that path end to end against a real SqlitePlugin: a blocked fetch wakes
- * promptly on a concurrent post, and returns an empty page with a stable cursor at the timeout.
+ * SQLite is polling-only: there is no read primitive to hand a caller's budget to, so it REFUSES
+ * `blockMs` rather than answering as though it had waited. Graded end to end through core's
+ * `fetchRecentBlocking` wrapper, which is the one caller that ever passes a budget — the refusal has
+ * to reach an embedder off the FIRST call, not be retried, emulated or absorbed into an empty page.
  */
-describe('sqlite + core fetchRecentBlocking (generic fallback, zero plugin change)', () => {
+describe('sqlite refuses a block budget', () => {
   const SENDER = asHandle('writer');
   let dir: string;
   let plugin: SqlitePlugin;
@@ -28,38 +34,59 @@ describe('sqlite + core fetchRecentBlocking (generic fallback, zero plugin chang
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('wakes promptly when a message lands mid-wait', async () => {
+  it('rejects fetchRecent with a blockMs, naming this backend', async () => {
     const t = freshTopic();
     await plugin.post(t, SENDER, 'old');
     const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
 
-    const pending = fetchRecentBlocking(
-      plugin,
-      { topic: t, since: tail },
-      { blockMs: 5000, pollIntervalMs: 20 },
+    const refusal = await plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 }).then(
+      () => undefined,
+      (err: unknown) => err,
     );
-    setTimeout(() => {
-      void plugin.post(t, SENDER, 'fresh');
-    }, 60);
-
-    const res = await pending;
-    expect(res.messages.map((m) => m.content)).toEqual(['fresh']);
-    expect(res.nextCursor).not.toBe(tail);
+    expect(isBlockingFetchUnsupportedError(refusal)).toBe(true);
+    expect(String(refusal)).toContain('parley-sqlite');
   });
 
-  it('returns an empty page with a stable cursor at the timeout', async () => {
+  // Fail FAST: the refusal is worth nothing if it costs the caller the wait it refused.
+  it('refuses through core long-poll wrapper without spending the budget', async () => {
     const t = freshTopic();
     await plugin.post(t, SENDER, 'old');
     const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
 
     const started = Date.now();
-    const res = await fetchRecentBlocking(
+    const refusal = await fetchRecentBlocking(
       plugin,
       { topic: t, since: tail },
-      { blockMs: 250, pollIntervalMs: 20 },
+      { blockMs: 5000, pollIntervalMs: 20 },
+    ).then(
+      () => undefined,
+      (err: unknown) => err,
     );
-    expect(res.messages).toEqual([]);
-    expect(res.nextCursor).toBe(tail);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+    expect(
+      isBlockingFetchUnsupportedError(refusal),
+      'core answered a refusing backend with a page instead of propagating the refusal — a caller ' +
+        'cannot tell that from a long-poll that timed out empty',
+    ).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  // The refusal is for the WAIT, not the topic: catch-up is untouched.
+  it('still serves the durable read the caller is left with', async () => {
+    const t = freshTopic();
+    await plugin.post(t, SENDER, 'old');
+    const tail = (await plugin.fetchRecent({ topic: t })).nextCursor;
+    await plugin.post(t, SENDER, 'fresh');
+
+    const res = await plugin.fetchRecent({ topic: t, since: tail });
+    expect(res.messages.map((m) => m.content)).toEqual(['fresh']);
+    expect(res.nextCursor).not.toBe(tail);
+  });
+
+  // `blockMs: 0` is what core hands every ordinary catch-up. Refusing it would break the read path.
+  it('accepts blockMs: 0, which is the ordinary catch-up call', async () => {
+    const t = freshTopic();
+    await plugin.post(t, SENDER, 'old');
+    const res = await plugin.fetchRecent({ topic: t, blockMs: 0 });
+    expect(res.messages.map((m) => m.content)).toEqual(['old']);
   });
 });

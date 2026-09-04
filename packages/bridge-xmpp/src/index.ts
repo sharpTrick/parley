@@ -1,5 +1,6 @@
 import {
   asCursor,
+  assertBlockMsUnsupported,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
@@ -48,12 +49,6 @@ const SUPERSEDED_BY_DISCONNECT =
  * defines "strictly after"; the archive defines order.
  */
 export class XmppPlugin extends XmppInbound implements BackendPlugin {
-  /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
   async connect(config: BackendConfig): Promise<void> {
     if (this.xmpp !== undefined || this.starting !== undefined) {
       throw new Error(
@@ -189,6 +184,7 @@ export class XmppPlugin extends XmppInbound implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertBlockMsUnsupported('parley-xmpp', args.blockMs);
     const since = args.since === undefined ? undefined : String(args.since);
     const limit = args.limit ?? 100;
     if (!(await this.roomExists(args.topic))) {

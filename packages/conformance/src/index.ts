@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe } from 'vitest';
+import { afterEach, beforeEach, describe, expect } from 'vitest';
 import { blockingCases } from './cases/blocking.js';
 import { catchUpCases } from './cases/catch-up.js';
 import { concurrencyCases } from './cases/concurrency.js';
@@ -8,11 +8,19 @@ import { type BackendFactory, type ConformanceContext, openContext } from './fac
 
 export {
   EARLY_RETURN_FRACTION,
+  IDLE_BLOCK_CEILING_MS,
   IDLE_BLOCK_FLOOR_MS,
   IDLE_BLOCK_MS,
+  MAX_EXTRA_PROBES,
+  OVERSHOOT_MULTIPLE,
   PARK_FRACTION,
+  PROBE_MAX_BLOCK_MS,
+  RACE_BLOCK_MS,
+  RACE_RETURN_MS,
+  REFUSAL_RETURN_MS,
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
+  TAIL_BLOCK_MS,
 } from './budgets.js';
 export { pageLimitsFor, PAGING_VOLUME } from './cases/catch-up.js';
 export { ASSERTED_PROPERTIES, CLAUSES } from './clauses.js';
@@ -29,6 +37,12 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     let ctx: ConformanceContext;
     let live: ConformanceContext | undefined;
     beforeEach(async () => {
+      // A case that returns through a capability guard without asserting has DELETED itself for
+      // every backend on that arm, and reads in the report exactly like one that passed. Graded
+      // behaviourally rather than by walking the suite's own source for guard shapes: a source walk
+      // is satisfied by a comment that merely mentions the read, which is how four such checks in
+      // this package became decoration. This one cannot be: it counts assertions that really ran.
+      expect.hasAssertions();
       live = undefined;
       ctx = await openContext(name, factory);
       live = ctx;

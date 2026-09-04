@@ -4,11 +4,12 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asHandle, asTopic } from '../message.js';
-import type { BackendCapabilities, FetchRecentArgs } from '../seam.js';
+import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
+import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { NONCONFORMANT_SHAPES, NONCONFORMANT_SHAPE_NAMES } from '../testing/nonconformant.js';
 import { harness, parse, type ToolText } from '../testing/tool-harness.js';
-import { MAX_FETCH_LIMIT, TOOL_TEXT, toolDepsFor, withdrawnBlockMs } from './tools.js';
+import { MAX_FETCH_LIMIT, TOOL_TEXT, toolDepsFor } from './tools.js';
 
 /**
  * One subject: the reactive tool surface — which tools are registered, what a call to one does,
@@ -343,64 +344,141 @@ describe('dynamic tool descriptions', () => {
 
 /**
  * The blocking surface is THREE things that must move as one: `block_ms` on the advertised schema,
- * the sentence in the description that tells the model to send it, and a long-poll behind it. A
- * deployment showing any two of the three lies to the agent — the worst arrangement being an
- * argument on the schema that the server silently drops, which a caller cannot tell from a
- * long-poll that timed out empty and so answers by burning a turn per tick believing it is parked.
+ * the sentence in the description that tells the model to send it, and something behind it that
+ * either long-polls or REFUSES. A deployment showing any two of the three lies to the agent — the
+ * worst arrangement being an argument on the schema that the server silently drops, which a caller
+ * cannot tell from a long-poll that timed out empty and so answers by burning a turn per tick
+ * believing it is parked.
  *
- * Driven off what the PLUGIN declares, over all three declarations a real one can make. `undefined`
- * is a row because it is what a plugin written before the capability existed still says, and because
- * a fake that declared nothing was the whole reason the `false` arm — the arm eight shipped backends
- * take — was never exercised here at all.
+ * `block_ms` is offered UNIFORMLY, on every deployment: there is no declaration to read, so the two
+ * arms below are what a backend DOES with the budget, not what it says about itself.
  */
-describe.each([
-  ['declares native blocking', { blockingFetch: true } as BackendCapabilities | undefined],
-  ['declares no capabilities at all', undefined],
-  ['declares blocking is not native', { blockingFetch: false } as BackendCapabilities | undefined],
-])('the block_ms surface of a backend that %s', (_label, capabilities) => {
-  const offered = capabilities?.blockingFetch !== false;
-  const fetchTool = async (): Promise<{ client: Client; plugin: FakePlugin; tool: Tool }> => {
-    const { client, plugin } = await harness({ plugin: new FakePlugin(capabilities) });
+describe('the block_ms surface', () => {
+  /** A backend with nowhere to park a budget: the eight shipped ones that refuse. */
+  const refusing = (inner: FakePlugin): BackendPlugin => ({
+    connect: (c) => inner.connect(c),
+    disconnect: () => inner.disconnect(),
+    subscribe: (t, h) => inner.subscribe(t, h),
+    post: (t, i, c, o) => inner.post(t, i, c, o),
+    fetchRecent: (a) =>
+      a.blockMs !== undefined && a.blockMs > 0
+        ? Promise.reject(new BlockingFetchUnsupportedError('parley-fake'))
+        : inner.fetchRecent(a),
+    resolveIdentity: (h) => inner.resolveIdentity(h),
+  });
+
+  const fetchTool = async (plugin?: BackendPlugin): Promise<{ client: Client; tool: Tool }> => {
+    const { client } = await harness(plugin === undefined ? {} : { plugin });
     const { tools } = await client.listTools();
-    return { client, plugin, tool: tools.find((t) => t.name === 'parley_fetch_recent')! };
+    return { client, tool: tools.find((t) => t.name === 'parley_fetch_recent')! };
   };
 
-  it(`${offered ? 'offers' : 'withdraws'} block_ms on the advertised schema`, async () => {
+  it('offers block_ms on the advertised schema', async () => {
     const { tool } = await fetchTool();
     const props = Object.keys((tool.inputSchema.properties ?? {}) as Record<string, unknown>);
     expect(props).toContain('topic');
-    expect(props.includes('block_ms')).toBe(offered);
-    // The advertisement the refusal below has to be true to: a key not on this list is REJECTED.
-    expect(tool.inputSchema.additionalProperties).toBe(false);
+    expect(props).toContain('block_ms');
   });
 
-  it(`${offered ? 'tells' : 'does not tell'} the model to send it`, async () => {
+  it('tells the model to send it, and that a backend may refuse it', async () => {
     const { tool } = await fetchTool();
-    expect(tool.description!.includes(TOOL_TEXT.fetch_recent_blocking)).toBe(offered);
-    // The cancellation clause belongs to the long-poll: a deployment that cannot park cannot cancel.
-    expect(tool.description!.includes('long-poll')).toBe(offered);
+    expect(tool.description).toContain(TOOL_TEXT.fetch_recent);
+    expect(TOOL_TEXT.fetch_recent).toContain('long-poll');
+    expect(TOOL_TEXT.fetch_recent).toContain('REFUSES `block_ms`');
   });
 
-  it(`${offered ? 'long-polls on' : 'refuses'} a block_ms argument`, async () => {
-    const { client, plugin } = await fetchTool();
+  it('long-polls a block_ms argument on a backend that parks', async () => {
+    const inner = new FakePlugin();
+    const { client } = await fetchTool(inner);
     await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'old' } });
     const pending = client.callTool({
       name: 'parley_fetch_recent',
       arguments: { topic: 'ctx', since: '1', block_ms: 3000 },
     });
-
-    if (!offered) {
-      const refused = (await pending) as ToolText;
-      expect(refused.isError).toBe(true);
-      expect(refused.content[0]!.text).toContain(withdrawnBlockMs);
-      // A refusal is not a page: nothing must come back that reads as "nothing new".
-      expect(refused.content[0]!.text).not.toContain('"messages"');
-      return;
-    }
-
     await new Promise((r) => setTimeout(r, 40));
-    await plugin.post(asTopic('ctx'), asHandle('other'), 'fresh');
+    await inner.post(asTopic('ctx'), asHandle('other'), 'fresh');
     const out = parse(await pending) as { messages: Array<{ content: string }> };
     expect(out.messages.map((m) => m.content)).toEqual(['fresh']);
+  });
+
+  /**
+   * The refusal reaches the caller AS a refusal. Nothing between the plugin and the model may turn
+   * it into a page: an empty page is what a long-poll that timed out looks like, and the agent then
+   * polls on believing the wait happened.
+   */
+  it("propagates a refusing backend's error rather than answering with a page", async () => {
+    const { client } = await fetchTool(refusing(new FakePlugin()));
+    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'old' } });
+    const refused = (await client.callTool({
+      name: 'parley_fetch_recent',
+      arguments: { topic: 'ctx', since: '1', block_ms: 3000 },
+    })) as ToolText;
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]!.text).toContain('parley-fake');
+    expect(refused.content[0]!.text).toContain('block_ms');
+    expect(refused.content[0]!.text).not.toContain('"messages"');
+  });
+
+  // The refusal is for the WAIT, not for the topic: the ordinary catch-up read a refusing backend
+  // is left with must still work through the same tool.
+  it('still serves a plain fetch_recent on a refusing backend', async () => {
+    const { client } = await fetchTool(refusing(new FakePlugin()));
+    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'old' } });
+    const out = parse(
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } }),
+    ) as { messages: Array<{ content: string }> };
+    expect(out.messages.map((m) => m.content)).toEqual(['old']);
+  });
+});
+
+/**
+ * Strictness over the REGISTERED SURFACE, not per tool. `.strict()` landed on `parley_fetch_recent`
+ * alone, and the two siblings — both of which perform a DURABLE WRITE — went on silently dropping
+ * unknown keys: a model emitting `inReplyTo` (the seam's own TS field name) instead of `in_reply_to`
+ * got back a successful `{backendMsgId}` for a post that was never threaded, with no signal at all.
+ *
+ * Driven off `listTools`, so a fourth tool is graded the day it is registered rather than the day
+ * someone remembers to add a row.
+ */
+describe('every registered tool refuses an argument it did not advertise', () => {
+  const argumentsFor: Record<string, Record<string, unknown>> = {
+    parley_fetch_recent: { topic: 'ctx' },
+    parley_post: { topic: 'ctx', content: 'body' },
+    parley_reply: { topic: 'ctx', content: 'body' },
+  };
+
+  const registered = async (): Promise<Tool[]> => {
+    const { client } = await harness();
+    return (await client.listTools()).tools;
+  };
+
+  it('has an accepted call for every registered tool', async () => {
+    const names = (await registered()).map((t) => t.name).sort();
+    expect(names).toEqual(Object.keys(argumentsFor).sort());
+  });
+
+  it.each(Object.keys(argumentsFor))('%s advertises additionalProperties: false', async (name) => {
+    const tool = (await registered()).find((t) => t.name === name)!;
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it.each(Object.keys(argumentsFor))('%s refuses one unadvertised key', async (name) => {
+    const { client } = await harness();
+    const accepted = (await client.callTool({
+      name,
+      arguments: argumentsFor[name]!,
+    })) as ToolText;
+    expect(accepted.isError, `${name} refused the arguments this row calls it with`).toBeFalsy();
+
+    const refused = (await client.callTool({
+      name,
+      arguments: { ...argumentsFor[name], inReplyTo: 'camelCased' },
+    })) as ToolText;
+    expect(
+      refused.isError,
+      `${name} accepted \`inReplyTo\` — an unadvertised key it silently dropped, which on a ` +
+        'durable write returns a successful id for a message that was never threaded',
+    ).toBe(true);
+    expect(refused.content[0]!.text).toContain('inReplyTo');
   });
 });

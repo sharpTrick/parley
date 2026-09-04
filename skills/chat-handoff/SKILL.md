@@ -64,12 +64,12 @@ An agent that cannot receive live `<channel>` push — a Claude Code **subagent*
 session level), a headless `claude -p` worker, or the chat front door — has to poll
 `parley_fetch_recent` in a loop, spending one model turn per empty tick.
 
-**FIRST, LOOK AT THE TOOL'S OWN SCHEMA.** `block_ms` is offered only where the backend's read
-primitive takes a caller's wait, and this is a per-deployment fact you cannot assume: a deployment
-that does not offer it leaves the argument off the schema, and **refuses** a call that sends it
-anyway. If `block_ms` is not among `parley_fetch_recent`'s arguments, do not send it.
+`block_ms` is on `parley_fetch_recent`'s schema everywhere, but only some backends can serve it —
+the ones whose own read primitive takes a caller's wait. **Try it once and read what comes back.**
+A backend that cannot park on a budget **refuses** the call with an error naming itself; that is
+not a failure of your request, it is the answer. Drop `block_ms` and use the paced loop below.
 
-**Where `block_ms` IS offered**, it folds the wait into a single call: if nothing is newer than
+**Where `block_ms` IS served**, it folds the wait into a single call: if nothing is newer than
 `since`, the tool **holds** up to `block_ms` (capped server-side, default 60s) until a message
 arrives or the timeout elapses, then returns whatever landed (possibly empty). Token cost then
 scales with **messages, not wall-clock time**. The resident loop is: catch up once, then re-call
@@ -84,7 +84,7 @@ with the held cursor and a block:
 Keep `block_ms` a little under any surrounding tool/hook timeout. A returned empty page is normal —
 just loop again with the same cursor.
 
-**Where it is NOT offered**, the same loop without it returns at once, every time — so pace it
+**Where it is refused**, the same loop without it returns at once, every time — so pace it
 yourself and expect to pay a turn per tick:
 
 ```

@@ -300,6 +300,35 @@ describe('slack memoized async singletons', () => {
 });
 
 /**
+ * The seam MINUS its lifecycle pair, typed off `BackendPlugin`, so a seventh seam method fails this
+ * file to compile until it is driven here too.
+ */
+type Driven = Exclude<keyof BackendPlugin, 'connect' | 'disconnect'>;
+
+const DRIVE: Record<Driven, (plugin: SlackPlugin, topic: Topic) => Promise<unknown>> = {
+  subscribe: (plugin, topic) => plugin.subscribe(topic, () => undefined),
+  post: (plugin, topic) => plugin.post(topic, asHandle('writer'), 'x'),
+  fetchRecent: (plugin, topic) => plugin.fetchRecent({ topic }),
+  resolveIdentity: (plugin) => plugin.resolveIdentity(asHandle('parley-bot')),
+};
+
+const SEAM_CALLS = Object.keys(DRIVE) as Driven[];
+
+/**
+ * Which seam calls may reach `apps.connections.open` AT ALL. Only the live path needs the shared
+ * Socket Mode socket; the rest are Web API calls over the bot token, and a reactive-only deployment
+ * configures no `app_token` for them to dial with. Kept as a PROHIBITION rather than folded into the
+ * ladder's ceiling: `hits <= dialBound(elapsed)` is satisfied identically by zero dials and by paced
+ * ones, so a post made to acquire the socket on every write is completely invisible to it.
+ */
+const NEEDS_SOCKET: Record<Driven, boolean> = {
+  subscribe: true,
+  post: false,
+  fetchRecent: false,
+  resolveIdentity: false,
+};
+
+/**
  * CLASS: EVERY route to `apps.connections.open` is paced by the same ladder, not just the one that
  * happens to dial today. Slack's tightest rate limit is this endpoint, and its cooldown was for a
  * while WRITTEN by the dial path and READ by one caller — so removing that caller left the field
@@ -311,16 +340,7 @@ describe('no entry point can dial apps.connections.open faster than the ladder',
   /** Long enough for an unpaced caller to spend dozens of dials, short enough to stay cheap. */
   const HOT_WINDOW_MS = 1500;
 
-  type Driven = Exclude<keyof BackendPlugin, 'capabilities' | 'connect' | 'disconnect'>;
-
-  const DRIVE: Record<Driven, (plugin: SlackPlugin, topic: Topic) => Promise<unknown>> = {
-    subscribe: (plugin, topic) => plugin.subscribe(topic, () => undefined),
-    post: (plugin, topic) => plugin.post(topic, asHandle('writer'), 'x'),
-    fetchRecent: (plugin, topic) => plugin.fetchRecent({ topic }),
-    resolveIdentity: (plugin) => plugin.resolveIdentity(asHandle('parley-bot')),
-  };
-
-  it.each(Object.keys(DRIVE) as Driven[])(
+  it.each(SEAM_CALLS)(
     '%s, retried through an unavailable Socket Mode, dials O(wall clock)',
     async (call) => {
       const { fake, plugin, cleanup } = await startPlugin({ channels: ['C0HOT'] });
@@ -337,7 +357,21 @@ describe('no entry point can dial apps.connections.open faster than the ladder',
         // The caller really did keep asking: a driver that fell over after one attempt would
         // satisfy any dial ceiling and grade nothing.
         expect(attempts, 'attempts made').toBeGreaterThan(dialBound(elapsed));
-        expect(fake.hits('apps.connections.open'), 'dials').toBeLessThanOrEqual(dialBound(elapsed));
+        const dials = fake.hits('apps.connections.open');
+        if (!NEEDS_SOCKET[call]) {
+          expect(
+            dials,
+            `${call} reached apps.connections.open at all. It is a REST call: a dial here is ` +
+              'invisible to a ceiling — paced dials and zero dials satisfy `hits <= dialBound` ' +
+              'identically — and on a reactive-only deployment it spends Slack\'s tightest-limit ' +
+              'endpoint once per call for nothing',
+          ).toBe(0);
+          return;
+        }
+        expect(dials, 'dials').toBeLessThanOrEqual(dialBound(elapsed));
+        // …and the ceiling is not satisfied by never dialling at all, which is the failure mode
+        // every row that only bounds from above is blind to.
+        expect(dials, 'redial floor').toBeGreaterThanOrEqual(1);
       } finally {
         await cleanup();
       }
@@ -354,21 +388,14 @@ describe('no entry point can dial apps.connections.open faster than the ladder',
  * `app_token` nor Socket Mode. Both entry points are graded on the same two observables: what the
  * caller is told, and whether anything reached the wire.
  */
-const SOCKET_ENTRIES: Array<{
-  name: string;
-  run: (plugin: SlackPlugin, topic: string) => Promise<unknown>;
-}> = [
-  { name: 'subscribe', run: (plugin, topic) => plugin.subscribe(asTopic(topic), () => undefined) },
-];
-
 describe('slack entry points that need the shared socket agree about a missing app_token', () => {
-  for (const entry of SOCKET_ENTRIES) {
+  for (const entry of SEAM_CALLS.filter((c) => NEEDS_SOCKET[c])) {
     for (const appToken of ['xapp-test', null] as const) {
       const absent = appToken === null;
-      it(`${entry.name} with ${absent ? 'no' : 'an'} app_token ${absent ? 'never dials' : 'dials'}`, async () => {
+      it(`${entry} with ${absent ? 'no' : 'an'} app_token ${absent ? 'never dials' : 'dials'}`, async () => {
         const { fake, plugin, cleanup } = await startPlugin({ appToken, channels: ['C0TOKEN'] });
         try {
-          const outcome = await capture(entry.run(plugin, 'C0TOKEN'));
+          const outcome = await capture(DRIVE[entry](plugin, asTopic('C0TOKEN')));
           if (absent) {
             expect(outcome.status).toBe('rejected');
             expect(String((outcome as { reason: unknown }).reason)).toMatch(/app_token/);

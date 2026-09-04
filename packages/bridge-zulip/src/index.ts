@@ -1,6 +1,7 @@
 import {
   asBackendMsgId,
   asCursor,
+  assertBlockMsUnsupported,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
@@ -34,12 +35,6 @@ export { GAP_FILL_PAGE, TAIL_PROBE_PAGE } from './history.js';
  * inexactness: topics are mutable".
  */
 export class ZulipPlugin implements BackendPlugin {
-  /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
   private readonly conn = new ZulipConnection();
 
   /**
@@ -100,6 +95,7 @@ export class ZulipPlugin implements BackendPlugin {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertBlockMsUnsupported('parley-zulip', args.blockMs);
     const { conn } = this;
     conn.require();
     const limit = args.limit ?? 100;

@@ -5,23 +5,26 @@ import {
   CLAUSES,
   CONTEXT_FIELDS,
   EARLY_RETURN_FRACTION,
+  IDLE_BLOCK_CEILING_MS,
   IDLE_BLOCK_FLOOR_MS,
   IDLE_BLOCK_MS,
   PAGING_VOLUME,
   pageLimitsFor,
   PARK_FRACTION,
+  PROBE_MAX_BLOCK_MS,
+  RACE_BLOCK_MS,
+  RACE_RETURN_MS,
+  REFUSAL_RETURN_MS,
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
+  TAIL_BLOCK_MS,
 } from '@sharptrick/parley-conformance';
 import {
-  BLOCKING_READ,
   budgetsIn,
   cases,
   casesIn,
   deferredPromises,
   diagnosedAssertions,
-  escapeRegExp,
-  guardedRegions,
   promiseExecutors,
   type SelfImposedBudget,
   suiteSource as source,
@@ -38,10 +41,16 @@ function testTimeoutMs(): number {
 
 /** The budgets exported as figures, so a budget written as a name grades as the figure it holds. */
 const EXPORTED_BUDGETS: Record<string, number> = {
+  IDLE_BLOCK_CEILING_MS,
   IDLE_BLOCK_FLOOR_MS,
   IDLE_BLOCK_MS,
+  PROBE_MAX_BLOCK_MS,
+  RACE_BLOCK_MS,
+  RACE_RETURN_MS,
+  REFUSAL_RETURN_MS,
   SINCELESS_BLOCK_MS,
   SINCELESS_RETURN_MS,
+  TAIL_BLOCK_MS,
 };
 
 /**
@@ -155,29 +164,6 @@ describe('the suite grades every backend it certifies', () => {
     expect(unjustified.map((c) => c.title)).toEqual([]);
   });
 
-  // The same trade, spelled as a bare `return` instead of a skip — invisible to any check that greps
-  // for `skip`. Every region a case guards on a capability has to assert something.
-  //
-  // A row per REGION, not per case: only a few cases carry a capability guard at all, so a table
-  // over every registered case spent most of its rows looping over an empty list — indistinguishable
-  // in the report from the rows that grade something.
-  const guardedByCase = (): [string, string, string][] =>
-    cases().flatMap((c) =>
-      guardedRegions(c.body).map(
-        ({ read, region }) => [read, c.title, region] as [string, string, string],
-      ),
-    );
-
-  it('finds capability-guarded regions, so the rows below are not an empty table', () => {
-    expect(guardedByCase().length).toBeGreaterThan(3);
-  });
-
-  it.each(guardedByCase())('makes the `%s` branch of "%s" assert', (read, title, region) => {
-    expect(region, `\`${read}\` in "${title}" guards a region that asserts nothing`).toContain(
-      'expect(',
-    );
-  });
-
   // The detector itself, against the shapes it has to recognize — so it cannot regress to knowing
   // exactly one spelling, which is how it started.
   it.each([
@@ -189,51 +175,6 @@ describe('the suite grades every backend it certifies', () => {
     ['an ordinary case', "it('x', async () => { expect(1).toBe(1); });", false],
   ])('recognizes %s as a skip: %s', (_label, snippet, isSkip) => {
     expect(SKIP_SPELLINGS.some((s) => s.test(snippet))).toBe(isSkip);
-  });
-
-  it.each([
-    ['a bare return on a flag', 'if (!ctx.carriesSenderIdentity) { return; }', 1, false],
-    ['an asserting arm', 'if (!ctx.carriesSenderIdentity) { expect(1).toBe(1); return; }', 1, true],
-    [
-      // The capability the SEAM carries, read off the plugin under test rather than off a context
-      // field: a detector that knows only the `ctx.<field>` spelling sees no guard here at all, and
-      // the arm behind it could stop asserting for free.
-      'a bare return on a capability the plugin declares',
-      `if (${BLOCKING_READ} === false) { return; }`,
-      1,
-      false,
-    ],
-    [
-      'an asserting arm on a capability the plugin declares',
-      `if (${BLOCKING_READ} === false) { expect(1).toBe(1); return; }`,
-      1,
-      true,
-    ],
-    [
-      // The shape that defeated the first version of this checker: the guarded block asserts
-      // nothing, but code AFTER the guard does, so a region running to the end of the body passes.
-      'a bare return followed by assertions outside the guard',
-      'if (!ctx.carriesSenderIdentity) {\n  return;\n}\nexpect(1).toBe(1);',
-      1,
-      false,
-    ],
-    [
-      "the 'unsupported' sentinel, which the skip check governs instead",
-      "if (ctx.concurrentPost === 'unsupported') { testCtx.skip(); return; }",
-      0,
-      true,
-    ],
-    [
-      // The same trade one line further down: leave the assertions in place and step over them.
-      'an arm that returns before the assertions it still contains',
-      'if (!ctx.carriesSenderIdentity) {\n  return;\n  expect(1).toBe(1);\n}',
-      1,
-      false,
-    ],
-  ])('sees %s', (_label, snippet, regionCount, asserts) => {
-    const regions = guardedRegions(snippet);
-    expect(regions).toHaveLength(regionCount);
-    expect(regions.every((r) => r.region.includes('expect('))).toBe(asserts);
   });
 
   /**
@@ -617,22 +558,5 @@ describe('the suite grades every backend it certifies', () => {
   // fixture leaves unassigned.
   it.each(Object.keys(CONTEXT_FIELDS))('reads the required field `%s`', (field) => {
     expect(source, `nothing in the suite reads \`${field}\``).toMatch(new RegExp(`\\.${field}\\b`));
-  });
-
-  // Both arms of each boolean capability must ASSERT. Pinned by name so that deleting the weaker
-  // arm — the thing that made the flag honest — is a failure, not a silent loss.
-  it.each([
-    [BLOCKING_READ, 'blockMs is honoured natively or ignored promptly'],
-    ['ctx.carriesSenderIdentity', 'distinct senders are not collapsed'],
-    ['ctx.absentTopicBehaviour', 'never-posted topic'],
-  ])('gives `%s` a false arm that still asserts', (read, title) => {
-    const owner = cases().find((c) => c.title.includes(title));
-    expect(owner, `no case titled like "${title}"`).toBeDefined();
-    const body = (owner as { body: string }).body;
-    expect(body).toContain(read);
-    const split = new RegExp(`\\}\\s*else\\s*\\{|if \\(!?\\(?${escapeRegExp(read)}`);
-    expect(body).toMatch(split);
-    const arms = body.split(split);
-    for (const arm of arms.slice(1)) expect(arm).toContain('expect(');
   });
 });

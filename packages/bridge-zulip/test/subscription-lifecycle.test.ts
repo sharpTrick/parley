@@ -8,6 +8,7 @@
 import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { ANY_ROUTE, FAULTS, startFakeZulip } from './fake-zulip.js';
+import { TEARDOWN_TIMEOUT_MS } from '../src/http.js';
 import { ZulipPlugin } from '../src/index.js';
 import {
   type ConnectionEnding,
@@ -442,12 +443,31 @@ describe('zulip releases every event queue it opens', () => {
  * presence of a registry the abort happens to be spelled with today.
  */
 describe('disconnect ends an in-flight events long-poll instead of waiting it out', () => {
-  /** Far above the settle bound, so a teardown that waits the poll out cannot pass by being quick. */
   const EVENTS_TIMEOUT_MS = 8000;
-  /** Generous for a cancel-and-await, an order of magnitude under the budget being cancelled. */
+  /** Generous for a cancel-and-await, and strictly under the LOWEST ceiling above it. */
   const SETTLE_BOUND_MS = 800;
+  /** One row: with the abort deleted every topic count settles at the same ceiling, so a second
+   *  count discriminates nothing and costs another parked connection. */
+  const PARKED_TOPICS = 3;
 
-  it.each([1, 3])('with %i topic(s) parked on the server', async (topics) => {
+  /**
+   * The ceiling the bound below has to beat is NOT `events_timeout_ms`. `disconnect()` races the
+   * loop exits against {@link TEARDOWN_TIMEOUT_MS} and gives up there, so a teardown that cancels
+   * NOTHING still returns at that figure. A settle bound at or above it grades the race and not the
+   * abort: lower `TEARDOWN_TIMEOUT_MS` under the bound and the row below passes with the abort loop
+   * deleted. Read the real constant, so that moving it reddens here rather than hollowing the row
+   * out.
+   */
+  it('bounds the settle strictly under the race that would otherwise cut it', () => {
+    expect(
+      SETTLE_BOUND_MS,
+      'the settle bound is at or above the teardown race, so a disconnect that cancels nothing ' +
+        'satisfies it',
+    ).toBeLessThan(TEARDOWN_TIMEOUT_MS);
+    expect(TEARDOWN_TIMEOUT_MS).toBeLessThan(EVENTS_TIMEOUT_MS);
+  });
+
+  it.each([PARKED_TOPICS])('with %i topics parked on the server', async (topics) => {
     // No heartbeat inside the test's lifetime: every poll is genuinely parked server-side, which is
     // the healthy idle state a live deployment spends almost all of its time in.
     const { plugin, fake } = await boot(
@@ -466,8 +486,9 @@ describe('disconnect ends an in-flight events long-poll instead of waiting it ou
     await plugin.disconnect();
     expect(
       Date.now() - t0,
-      `disconnect waited out the ${EVENTS_TIMEOUT_MS}ms events budget instead of cancelling the ` +
-        'poll it was parked on',
+      `disconnect took longer than a cancel-and-await: it either waited out the ` +
+        `${EVENTS_TIMEOUT_MS}ms events budget or fell through to the ${TEARDOWN_TIMEOUT_MS}ms ` +
+        'teardown race, instead of cancelling the poll it was parked on',
     ).toBeLessThan(SETTLE_BOUND_MS);
   });
 });

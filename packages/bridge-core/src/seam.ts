@@ -55,12 +55,11 @@ export interface FetchRecentArgs {
   /** Max messages to return in this page. */
   limit?: number;
   /**
-   * Long-poll HINT (ms). When set and the exclusive `since` query is empty, a plugin MAY block
-   * internally up to `blockMs` waiting for the topic cursor to advance past `since`, then return
-   * whatever arrived (possibly an empty page). It is only a hint: a plugin that ignores it (or
-   * returns early/empty) is still correct — core's generic long-poll wrapper polls the remaining
-   * budget on the MCP `fetch_recent` path. Only a plugin declaring
-   * {@link BackendCapabilities.blockingFetch} has that budget offered to it by the MCP tool at all.
+   * Long-poll budget (ms). A plugin that cannot park a caller throws
+   * `BlockingFetchUnsupportedError` on any `blockMs > 0`, before the read reaches the wire and
+   * whatever the queried window holds. One that can blocks internally up to `blockMs` waiting for
+   * the topic cursor to advance past `since`, then returns whatever arrived (possibly an empty
+   * page). Ignoring it silently is not conformant.
    * Omit / `0` = return immediately (the durable catch-up semantics). Blocking engages whenever the
    * queried window comes back EMPTY, with or without a `since`: a since-less read of a topic that
    * already has messages returns them at once, but on an empty topic it waits out the budget like
@@ -77,21 +76,6 @@ export interface FetchRecentResult {
   nextCursor: Cursor;
 }
 
-/**
- * What a plugin declares it can do beyond the six methods. Every field is OPTIONAL and additive:
- * an absent declaration means core keeps the behaviour it has for every backend, so a plugin is
- * never forced to answer a question a later version asks.
- */
-export interface BackendCapabilities {
-  /**
-   * Whether `fetchRecent` honours {@link FetchRecentArgs.blockMs} with the backend's OWN read
-   * primitive — Redis `XREAD BLOCK`, a JetStream pull expiry. `false` withdraws `block_ms` from the
-   * advertised `parley_fetch_recent` schema, so no agent asks a backend to park on a wait it would
-   * have to hand-roll above a push primitive that has no place to put a caller's budget.
-   */
-  readonly blockingFetch?: boolean;
-}
-
 /** Live-path callback: fires once per inbound message, in ascending cursor order per topic. */
 export type MessageHandler = (msg: Message) => void;
 
@@ -101,9 +85,6 @@ export type MessageHandler = (msg: Message) => void;
  * catch-up; `post` is the single durable write path serving replies/output for both.
  */
 export interface BackendPlugin {
-  /** What this plugin can do beyond the six methods; absent = nothing beyond them. */
-  readonly capabilities?: BackendCapabilities;
-
   /** Establish the live connection to the backend. */
   connect(config: BackendConfig): Promise<void>;
   /** Tear down the connection and ALL subscriptions (cancels the live path). */

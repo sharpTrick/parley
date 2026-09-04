@@ -33,6 +33,8 @@ const state = vi.hoisted(() => ({
   // When set, the next `query('LISTEN …')` parks on this deferred — the window in which a
   // disconnect() can land between "the LISTEN was issued" and "the subscription was registered".
   listenGate: null as Deferred | null,
+  /** LISTENs to let through before {@link listenGate} parks one, so a row can pick which. */
+  listenGateSkip: 0,
   /** Every channel a LISTEN was issued for, in order. */
   listenAttempts: [] as string[],
   // When true, `query('LISTEN …')` rejects (drives the failed-subscribe path).
@@ -114,8 +116,11 @@ vi.mock('pg', async () => {
         state.listenAttempts.push(listen[1] as string);
         const gate = state.listenGate;
         if (gate !== null) {
-          state.listenGate = null;
-          await gate.promise;
+          if (state.listenGateSkip > 0) state.listenGateSkip--;
+          else {
+            state.listenGate = null;
+            await gate.promise;
+          }
         }
       }
       if (state.listenRejects && /LISTEN/.test(sql)) throw new Error('LISTEN failed (mock)');
@@ -174,6 +179,7 @@ beforeEach(() => {
   state.connectFailures = 0;
   state.connectGate = null;
   state.listenGate = null;
+  state.listenGateSkip = 0;
   state.listenAttempts.length = 0;
   state.listenRejects = false;
   state.deleteGate = null;
@@ -723,4 +729,64 @@ describe('Postgres listener reconnect re-drives every participant the blackout s
     },
     15000,
   );
+});
+
+/**
+ * The invariant every UNLISTEN reconciliation now rests on, and which nothing asserted:
+ * `adoptListener`'s epoch gate. The reconnect loop re-LISTENs every channel BEFORE it publishes the
+ * candidate, so a `disconnect()` landing inside that loop must END the connection rather than let it
+ * become `this.listener`. An adopted orphan pins the Node event loop and holds a server backend slot
+ * for the life of the process, carrying LISTENs no registration is left anywhere to undo.
+ *
+ * The SECOND LISTEN of a two-channel re-registration: the first goes through, so the window under
+ * test is strictly inside the loop rather than at its entry, which is where a guard that only
+ * checked before starting would still pass.
+ */
+describe('a disconnect inside the reconnect re-LISTEN loop ends the replacement', () => {
+  it('with the second LISTEN of a two-channel re-registration parked', async () => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL });
+    await plugin.subscribe(asTopic('pgA'), () => undefined);
+    await plugin.subscribe(asTopic('pgB'), () => undefined);
+
+    const listener = state.clients[0];
+    expect(listener, 'no listener connection was opened').toBeDefined();
+    const listensBefore = state.listenAttempts.length;
+    expect(listensBefore, 'two subscriptions, two LISTENs').toBe(2);
+
+    const gate = deferred();
+    state.listenGate = gate;
+    state.listenGateSkip = 1;
+    listener!.emit('end');
+    await until(() => state.listenAttempts.length === listensBefore + 2, 5000);
+
+    const replacement = state.clients.at(-1);
+    expect(replacement).toBeDefined();
+    expect(replacement).not.toBe(listener);
+
+    const stopping = plugin.disconnect();
+    gate.resolve();
+    await stopping;
+    // Past the point where the parked re-registration wakes and would publish its candidate.
+    await sleep(100);
+
+    expect(replacement!.ended, 'the replacement outlived the disconnect').toBe(true);
+
+    // …and it was not ADOPTED on the way out, which `ended` alone cannot see: a stopped plugin that
+    // published the candidate anyway hands the SUCCESSOR a dead socket, so its LISTEN goes out on a
+    // connection that will never deliver a NOTIFY and nothing anywhere reports it.
+    await plugin.connect({ url: REAL_URL });
+    const before = state.listenAttempts.length;
+    await plugin.subscribe(asTopic('pgC'), () => undefined);
+    expect(state.listenAttempts.length, 'the successor issued no LISTEN').toBe(before + 1);
+    const channel = state.listenAttempts.at(-1) as string;
+    const serving = state.clients.find((c) => c.listened.includes(channel));
+    expect(serving, 'no connection carries the successor LISTEN').toBeDefined();
+    expect(
+      serving!.ended,
+      "the successor's LISTEN went out on a connection a stopped plugin had adopted: it holds a " +
+        'server backend slot, delivers nothing, and no registration is left anywhere to undo it',
+    ).toBe(false);
+    await plugin.disconnect();
+  });
 });

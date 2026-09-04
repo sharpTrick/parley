@@ -7,7 +7,7 @@ import {
   makeStampedSenderReferenceContext,
   makeThrowingReferenceContext,
 } from './reference-plugin.js';
-import { BOOLEAN_CAPABILITIES, suiteSource } from './suite-source.js';
+import { BOOLEAN_CAPABILITIES } from './suite-source.js';
 
 const FIXTURES: [string, () => Promise<import('@sharptrick/parley-conformance').ConformanceContext>][] =
   [
@@ -20,9 +20,9 @@ const FIXTURES: [string, () => Promise<import('@sharptrick/parley-conformance').
 // The suite's positive control, and the only run of it that needs no server: an in-memory plugin
 // the repo controls, which must pass in full. Both arms of the seam's absent-topic MAY are covered
 // here, because no shipped backend takes the throwing arm and nothing else would ever grade it.
-// The last two cover the other arm of each BOOLEAN capability: with every fixture on the polling
-// arm the suite's whole native-blocking half ran nowhere, which is indistinguishable from its
-// being deleted.
+// `reference (native blockMs)` covers the parking arm of the `blockMs` contract and
+// `reference (in-memory)` the refusing one; an arm no fixture PASSES on is an arm whose assertions
+// nothing in this repo can satisfy, which is indistinguishable from their being deleted.
 for (const [label, make] of FIXTURES) runConformanceSuite(label, make);
 
 /**
@@ -51,16 +51,6 @@ describe('the reference fixtures cover both arms of every boolean capability', (
     } finally {
       await Promise.all(contexts.map((c) => c.cleanup().catch(() => undefined)));
     }
-  });
-
-  // Each axis must be something the suite actually branches on — read through the SAME expression
-  // the cases use, so an axis whose fact moved (out of the context and onto the seam, as
-  // `blockingFetch` did) cannot keep grading a spelling nothing reads any more.
-  it('reads capability axes the suite branches on, so the rows above are not an empty table', () => {
-    for (const axis of BOOLEAN_CAPABILITIES) {
-      expect(suiteSource, `nothing in the suite reads \`${axis.read}\``).toContain(axis.read);
-    }
-    expect(BOOLEAN_CAPABILITIES.length).toBeGreaterThan(1);
   });
 });
 

@@ -267,6 +267,9 @@ const SETTLE_MS = 3000;
 /** Several server pages' worth, so the walk's page count is a function of the argument. */
 const PAGED_VOLUME = FAKE_PAGE_SIZE * 3 - 10;
 const PAGES_OVER_FIXTURE = Math.ceil(PAGED_VOLUME / FAKE_PAGE_SIZE);
+/** The same fixture ending exactly ON a page boundary — the arithmetic's only edge case. */
+const EXACT_PAGES = 3;
+const EXACT_VOLUME = FAKE_PAGE_SIZE * EXACT_PAGES;
 
 describe('slack fetchRecent settles on every numeric seam argument, at bounded request cost', () => {
   /** Reads each cell spent, so the table can prove its own cost axis is not flat. */
@@ -302,8 +305,7 @@ describe('slack fetchRecent settles on every numeric seam argument, at bounded r
             returned > 0,
             'a page a caller cannot tell from "nothing new", on a topic that has history',
           ).toBe(sinceMode !== 'tail');
-          // One walk over the fixture, plus the page that discovers exhaustion.
-          expect(reads, 'history reads for one call').toBeLessThanOrEqual(PAGES_OVER_FIXTURE + 1);
+          expect(reads, 'history reads for one call').toBeLessThanOrEqual(PAGES_OVER_FIXTURE);
         } finally {
           await cleanup();
         }
@@ -315,8 +317,36 @@ describe('slack fetchRecent settles on every numeric seam argument, at bounded r
   // Every cell reading exactly one page is indistinguishable from a ceiling nothing can reach.
   it('some argument costs more than one read, so the ceiling above grades something', () => {
     expect(spent.length, 'cells that ran').toBe(ARG_LIMITS.length * 3);
-    expect(Math.max(...spent), 'the most any cell spent').toBeGreaterThan(1);
+    // REACHED, not merely approached: `PAGED_VOLUME` is deliberately not a page multiple, so a
+    // ceiling one read above the walk's own cost is a ceiling no cell can ever touch and a
+    // regression spending an extra read passes the table written to catch it.
+    expect(Math.max(...spent), 'the most any cell spent').toBe(PAGES_OVER_FIXTURE);
     expect(Math.min(...spent), 'the least any cell spent').toBe(1);
+  });
+
+  /**
+   * The page-count arithmetic's one edge: a fixture ending exactly ON a page boundary. Slack — and
+   * this fake — answer the last FULL page with `has_more: false`, so exhaustion costs no extra read
+   * and the walk is `pages`, not `pages + 1`. A walk that treats a full page as "there may be more"
+   * spends that extra read, which every cell above is blind to because `PAGED_VOLUME` ends short.
+   */
+  it('costs exactly its page count over a fixture that ends on a page boundary', async () => {
+    const { fake, plugin, cleanup } = await startSlack({ appToken: null });
+    try {
+      const topic = asTopic('C0EXACT');
+      fake.seed(topic, Array.from({ length: EXACT_VOLUME }, (_, i) => ({ text: `m${i}` })));
+      const before = fake.hits('conversations.history');
+      const page = await plugin.fetchRecent({
+        topic,
+        since: asCursor('0'),
+        limit: EXACT_VOLUME,
+      });
+      const reads = fake.hits('conversations.history') - before;
+      expect(page.messages.length, 'the whole fixture').toBe(EXACT_VOLUME);
+      expect(reads, 'history reads over a page-multiple fixture').toBe(EXACT_PAGES);
+    } finally {
+      await cleanup();
+    }
   });
 });
 

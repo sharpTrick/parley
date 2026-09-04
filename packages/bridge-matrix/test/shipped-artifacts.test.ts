@@ -344,11 +344,11 @@ interface CoreOwnedClaim {
 }
 
 const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
-  'this deployment is not offered block_ms at all': {
-    core: { ships: "the block_ms argument's description", pattern: /If the queried window is empty — whether or not/ },
-    readme: /core withdraws `block_ms` from\s+the `parley_fetch_recent` schema/,
-    // The plugin declares the capability false, so the argument core describes above never reaches
-    // a Matrix deployment's tool schema; a README promising the wait is promising a different one.
+  'this deployment refuses block_ms rather than serving it': {
+    core: { ships: "the block_ms argument's description", pattern: /refuses this argument rather than ignoring it/ },
+    readme: /it REFUSES one: a `parley_fetch_recent` carrying `block_ms` rejects/,
+    // The README must promise a REFUSAL, not a wait: core describes the argument to the model on
+    // every deployment, and a README promising the wait is promising a different tool.
     forbidden: /Matrix\s+serves this natively/,
   },
   'an omitted since means the recent window': {

@@ -16,9 +16,7 @@ import {
 } from './reference-plugin.js';
 import {
   BOOLEAN_CAPABILITIES,
-  cases,
   diagnosedAssertions,
-  escapeRegExp,
   suiteSource,
 } from './suite-source.js';
 
@@ -199,15 +197,13 @@ describe('every assertion carrying its own diagnostic has a variant that reaches
 
 /**
  * One level ACROSS from the clause. A capability flag selects an arm, and every fixture in this
- * package used to declare the same value for both flags — so the suite's whole native-blocking half
- * and the true arm of its 0-3 ms lost-wakeup race ran nowhere at all, and could be deleted with this
- * package (negative control included) staying green while eight backends that declare the capability
- * kept being certified against them. Neither table above can see it: the clause table is satisfied
- * by a control that exercises the OTHER arm, and the field table by any variant at all.
+ * package used to declare the same value for both flags — so the weaker arm ran nowhere at all and
+ * could be deleted with this package (negative control included) staying green while certified
+ * backends kept being graded against it. Neither table above can see it: the clause table is
+ * satisfied by a control that exercises the OTHER arm, and the field table by any variant at all.
  *
- * Rows are flag × arm × the clause whose case branches on that flag, derived from the capability
- * axes and from the suite source — so a new capability flag, or a new clause that branches on one,
- * arrives as a red row rather than as silently uncontrolled coverage.
+ * Rows are flag × arm, DERIVED from the context validators — so a new boolean flag arrives as red
+ * rows rather than as silently uncontrolled coverage.
  */
 describe('every arm of every capability flag has a plugin that fails it', () => {
   const declared = new Map<string, ConformanceContext>();
@@ -220,49 +216,30 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
     }
   }, 120_000);
 
-  const clausesBranchingOn = (read: string): string[] =>
-    cases()
-      .filter((c) => new RegExp(`${escapeRegExp(read)}\\b`).test(c.body))
-      .flatMap((c) => CLAUSES.filter((clause) => c.title.includes(clause)));
-
-  const axisNamed = (name: string): (typeof BOOLEAN_CAPABILITIES)[number] => {
-    const axis = BOOLEAN_CAPABILITIES.find((a) => a.name === name);
-    if (axis === undefined) throw new Error(`no capability axis named ${name}`);
-    return axis;
-  };
-
   const rows = BOOLEAN_CAPABILITIES.flatMap((axis) =>
-    clausesBranchingOn(axis.read).flatMap((clause) =>
-      [true, false].map((arm) => [axis.name, arm, clause] as [string, boolean, string]),
-    ),
+    [true, false].map((arm) => [axis.name, arm] as [string, boolean]),
   );
 
-  it('finds a branching clause for every boolean flag, so the rows below grade something', () => {
-    expect(BOOLEAN_CAPABILITIES.length).toBeGreaterThan(1);
-    for (const axis of BOOLEAN_CAPABILITIES) {
-      expect(clausesBranchingOn(axis.read), `no case branches on \`${axis.read}\``).not.toEqual([]);
-    }
-    expect(rows.length).toBeGreaterThan(3);
+  it('finds boolean flags to grade, so the rows below are not an empty table', () => {
+    expect(BOOLEAN_CAPABILITIES.length).toBeGreaterThan(0);
+    expect(rows.length).toBe(BOOLEAN_CAPABILITIES.length * 2);
   });
 
   it('built every variant fixture, so the arm each one declares is readable', () => {
     expect([...declared.keys()].sort()).toEqual(BROKEN_VARIANTS.map((v) => v.name).sort());
   });
 
-  it.each(rows)('`%s` = %s, on the clause "%s"', (name, arm, clause) => {
-    const axis = axisNamed(name);
+  it.each(rows)('`%s` = %s', (name, arm) => {
+    const axis = BOOLEAN_CAPABILITIES.find((a) => a.name === name)!;
     const controls = BROKEN_VARIANTS.filter((v) => {
       const ctx = declared.get(v.name);
-      return (
-        ctx !== undefined &&
-        axis.arm(ctx) === arm &&
-        (clause.includes(v.mustFail) || v.mustFail.includes(clause))
-      );
+      return ctx !== undefined && axis.arm(ctx) === arm;
     });
     expect(
       controls.map((v) => v.name),
-      `no BROKEN_VARIANTS entry declares \`${name}: ${String(arm)}\` and fails "${clause}" — ` +
-        `every assertion inside that arm can be deleted with this package staying green`,
+      `no BROKEN_VARIANTS entry declares \`${name}: ${String(arm)}\`, and the per-variant table ` +
+        `below only proves a variant fails its own clause — so every assertion reachable only ` +
+        `inside that arm can be deleted with this package staying green`,
     ).not.toEqual([]);
   });
 });

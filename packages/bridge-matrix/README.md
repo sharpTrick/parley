@@ -26,8 +26,9 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 ordering or dedup).
 
 **No `block_ms` here.** `fetchRecent` reads `/messages` and has no wait to spend a caller's budget
-on, so this plugin declares `capabilities.blockingFetch: false` and core withdraws `block_ms` from
-the `parley_fetch_recent` schema for a Matrix deployment. Live delivery is `subscribe`, over a
+on, so it REFUSES one: a `parley_fetch_recent` carrying `block_ms` rejects with
+`BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
+cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`, over a
 room-filtered `/sync` long-poll.
 
 **Reads never provision — but they do JOIN.** `post` and `subscribe` create a topic's room when the

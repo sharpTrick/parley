@@ -82,7 +82,7 @@ rather than a silent no-op.
 
 | Tool | Role | Effect |
 |---|---|---|
-| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. It is offered only where the backend plugin declares `capabilities.blockingFetch`. Marks returned ids seen so the push loop won't re-deliver them. |
+| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. It is advertised on every deployment; a backend with no read primitive to park on rejects it with `BlockingFetchUnsupportedError` rather than answering with a page. Marks returned ids seen so the push loop won't re-deliver them. |
 | `parley_post` | write (reactive) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. The chat side's only write path. |
 | `parley_reply` | write (channel) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
 

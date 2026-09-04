@@ -28,9 +28,10 @@ everywhere — the bridge wants source text, not rendered HTML), `timestamp` ←
 or dedup).
 
 **No `block_ms` here.** `fetchRecent` reads `/api/v1/messages` and has no wait to spend a caller's
-budget on, so this plugin declares `capabilities.blockingFetch: false` and core withdraws `block_ms`
-from the `parley_fetch_recent` schema for a Zulip deployment. Live delivery is `subscribe`, over the
-`/api/v1/events` event queue.
+budget on, so it REFUSES one: a `parley_fetch_recent` carrying `block_ms` rejects with
+`BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
+cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`, over
+the `/api/v1/events` event queue.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Zulip stamps the
 > sender from the authenticated bot account, so a message's `senderHandle` is always that bot's

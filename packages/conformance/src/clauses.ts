@@ -23,7 +23,7 @@ export const CLAUSES: readonly string[] = [
   'disconnect is idempotent',
   'resolveIdentity answers',
   'not collapsed onto one another',
-  'blockMs is honoured natively or ignored promptly',
+  'blockMs is honoured natively or refused',
   'blocking fetch is not missed',
   'interleaved with concurrent writers',
   'multi-process writes',
@@ -54,19 +54,39 @@ export const CLAUSES: readonly string[] = [
  *   BESIDE it (a row the reader never saw at all), so the re-delivery and re-ordering half could be
  *   deleted with this package — negative control included — staying green.
  *
- * The four below are ELAPSED TIME, which is neither a field nor a call. Every assertion over
+ * - `blocking-arm-is-stable`: the answer a backend gives a block budget does not CHANGE within a
+ *   connection. The arm is inferred from behaviour rather than declared, so a plugin that refuses
+ *   exactly the reads the suite is known to make and silently drops every budget after them takes
+ *   the refusing arm and ignores every `block_ms` a real agent sends. Graded by making the number of
+ *   blocking reads, and the budgets they carry, unpredictable from the suite — a schedule cannot be
+ *   fitted to what it cannot see.
+ * - `refusing-read-covers-only-what-it-returned`: on the arm that never parks, a durable read
+ *   racing a write reports a cursor no higher than the last row it RETURNED. Reporting the topic's
+ *   tail instead — a cursor minted after the read rather than from its own rows — covers a message
+ *   the caller never saw, and resuming from it skips that message for good. This is the lost-wakeup
+ *   hazard as the eight refusing backends meet it, and only a control that REFUSES `blockMs` can
+ *   reach the branch that asserts it.
+ * - `refusal-is-not-an-empty-page`: a backend that refuses one block budget refuses every one of
+ *   them. A refusal followed by a page is indistinguishable, to the caller, from a long-poll that
+ *   timed out empty — so the agent goes on polling in the belief that it is parked.
+ *
+ * The three below are ELAPSED TIME, which is neither a field nor a call. Every assertion over
  * `Date.now() - <start>` names one of them in its own failure message, and `suite-shape` requires
  * that of any new one — an uncontrolled timing bound is invisible to every other check here.
  *
- * - `sinceless-block-returns-promptly`: a read carrying a block budget and NO cursor returns its
- *   default window at once. That is the first iteration of core's long-poll wrapper, i.e. every
- *   `parley_fetch_recent` an agent makes before it holds a cursor.
- * - `ignored-block-returns-promptly`: a backend that declares no native support ignores `blockMs`
- *   promptly rather than parking on it. The hint is optional; hanging on it is not.
+ * - `sinceless-block-returns-promptly`: a read carrying a block budget and NO cursor answers at
+ *   once — with the window it already had, or with a refusal. That is the first iteration of core's
+ *   long-poll wrapper, i.e. every `parley_fetch_recent` an agent makes before it holds a cursor.
+ * - `refusal-is-prompt`: a backend that cannot serve a budget refuses it AT ONCE. One that parks
+ *   first and refuses afterwards has spent the caller's wait and returned nothing for it.
  * - `native-block-wakes-on-the-message`: a native blocker returns when the message lands, not when
  *   the budget expires.
  * - `native-block-actually-waits`: and it waits for it — a native `blockMs` that returns instantly
  *   with nothing to report turns core's long-poll into a hot loop against the backend.
+ * - `native-block-does-not-overshoot-the-budget`: and not far PAST it. Core holds the caller's
+ *   request open for whatever the plugin spends, so a blocker that answers a 300 ms budget after
+ *   3 s is a hang under a politer name — and every floor in the clause passes for one, leaving only
+ *   the harness timeout, which names no clause at all.
  */
 export const ASSERTED_PROPERTIES: readonly string[] = [
   'nextCursor-agreement',
@@ -75,8 +95,12 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'disconnect-stops-live-delivery',
   'post-id-agreement',
   'interleaved-reader-sees-each-row-once-in-order',
+  'blocking-arm-is-stable',
+  'refusing-read-covers-only-what-it-returned',
+  'refusal-is-not-an-empty-page',
   'sinceless-block-returns-promptly',
-  'ignored-block-returns-promptly',
+  'refusal-is-prompt',
   'native-block-wakes-on-the-message',
   'native-block-actually-waits',
+  'native-block-does-not-overshoot-the-budget',
 ];

@@ -10,7 +10,6 @@ export { asTopic, asHandle, asBackendMsgId, asCursor, buildMessage } from './mes
 export { safeName, MIN_HASH_LEN, DEFAULT_HASH_LEN, MAX_HASH_LEN } from './topic-name.js';
 export type {
   BackendPlugin,
-  BackendCapabilities,
   BackendConfig,
   BackendIdentity,
   FetchRecentArgs,
@@ -19,6 +18,11 @@ export type {
 } from './seam.js';
 export { NoSuchTopicError } from './seam.js';
 export { isNoSuchTopicError } from './no-such-topic.js';
+export {
+  assertBlockMsUnsupported,
+  BlockingFetchUnsupportedError,
+  isBlockingFetchUnsupportedError,
+} from './blocking-unsupported.js';
 export {
   assertKnownConfigKeys,
   type BackendConfigKeys,

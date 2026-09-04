@@ -6,15 +6,11 @@ import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
  *
  * The capability fields are REQUIRED and take an explicit negative, so that a backend which simply
  * forgot one loses a compile rather than a test case. An optional flag whose absent value means
- * "skip" silently trades coverage for convenience, which is how the blocking-fetch case went
- * unexercised on backends that do implement it.
+ * "skip" silently trades coverage for convenience.
  *
- * A capability the SEAM already carries is not restated here: whether `fetchRecent` honours
- * `blockMs` natively is read off `plugin.capabilities`, under the SAME predicate core uses when it
- * decides whether to advertise `block_ms` — absent means offered. Two spellings of one fact let a
- * backend flip its declaration with the suite still grading the other arm; and a plugin that
- * declares nothing is graded on the STRICTER arm, because that is the arm core will advertise for
- * it, exactly as `absentTopicBehaviour`'s default is the stricter of its two.
+ * Whether `fetchRecent` honours `blockMs` is deliberately NOT a field here, nor anywhere else: the
+ * suite decides it from what the backend DOES with a budget — park, or refuse — so there is no
+ * declaration a backend can flip while the suite goes on grading the arm it used to take.
  */
 export interface ConformanceContext {
   /** A freshly connected plugin instance. */

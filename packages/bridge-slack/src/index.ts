@@ -1,5 +1,6 @@
 import {
   asBackendMsgId,
+  assertBlockMsUnsupported,
   asTopic,
   type BackendConfig,
   type BackendIdentity,
@@ -52,12 +53,6 @@ export { escapeSlackText, unescapeSlackText } from './markup.js';
  * reconciled by cursor catch-up (DESIGN §6).
  */
 export class SlackPlugin implements BackendPlugin {
-  /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
   private settings = resolveConfig({});
   /** channel id → its one allowed topic: seeded from `channel_map`, then claimed first-come. */
   private readonly channelOwner = new Map<string, Topic>();
@@ -153,6 +148,7 @@ export class SlackPlugin implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
+    assertBlockMsUnsupported('parley-slack', args.blockMs);
     return this.history.runFetch(args);
   }
 

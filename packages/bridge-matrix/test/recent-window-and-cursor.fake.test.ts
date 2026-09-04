@@ -552,10 +552,21 @@ describe('a read that never completed reports the caller position, never one beh
  * the value, is what this backend does; whether it refuses or floors, the empty page is the failure.
  */
 describe('a hostile limit is never answered with an empty page', () => {
-  const HOSTILE = [Number.NaN, 0, -1, Number.POSITIVE_INFINITY, 1.5];
+  /**
+   * Each hostile `limit`, against the `since` modes that DISCRIMINATE. Neuter the limit guard and
+   * `Infinity`/`1.5` still pass a since-LESS read: the recent window comes back non-empty whatever
+   * the value did to the page count, so only the resuming read can see them at all.
+   */
+  const HOSTILE: Array<[number, ReadonlyArray<'none' | 'start'>]> = [
+    [Number.NaN, ['none', 'start']],
+    [0, ['none', 'start']],
+    [-1, ['none', 'start']],
+    [Number.POSITIVE_INFINITY, ['start']],
+    [1.5, ['start']],
+  ];
 
-  for (const limit of HOSTILE) {
-    for (const sinceMode of ['none', 'start'] as const) {
+  for (const [limit, sinceModes] of HOSTILE) {
+    for (const sinceMode of sinceModes) {
       it(`limit=${String(limit)} / since=${sinceMode}`, async () => {
         const topic = asTopic('hostile-limit');
         const plugin = await connectFake();

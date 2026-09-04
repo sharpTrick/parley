@@ -229,7 +229,7 @@ Every backend clears the identical seam contract — cursor monotonicity, exclus
 
 Distinct from the six seam methods a backend implements, these are the 3 tools Claude actually calls:
 
-- **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?}` → `{messages, nextCursor}`, plus `block_ms?` **on the backends whose own read primitive takes a wait** — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
+- **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?, block_ms?}` → `{messages, nextCursor}`. `block_ms` long-polls where the backend's own read primitive takes a wait, and is **refused by name** where it cannot — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
 - **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?}` → `{backendMsgId}`.
 - **`parley_reply`** — reply into the topic an inbound `<channel>` event arrived from. Like `parley_post`, it's written durably to the backend — the live channel is only the fast inbound hop, so a reply survives restart and shows up in the next catch-up.
 
@@ -238,10 +238,10 @@ Distinct from the six seam methods a backend implements, these are the 3 tools C
 A session that hands off work usually wants the answer. Without help that means polling
 `parley_fetch_recent` on a timer and burning a tool call per tick, most of them empty.
 
-**`block_ms` is offered only where the backend's own read primitive takes a caller's wait** —
-today Redis (`XREAD BLOCK`) and NATS (a JetStream pull expiry). There, pass it and the call blocks
-server-side until a message newer than `since` arrives, or the budget expires — whichever comes
-first:
+**`block_ms` is on the schema everywhere, and served where the backend's own read primitive takes a
+caller's wait** — today Redis (`XREAD BLOCK`) and NATS (a JetStream pull expiry). There, pass it and
+the call blocks server-side until a message newer than `since` arrives, or the budget expires —
+whichever comes first:
 
 ```jsonc
 { "topic": "ctx-demo", "since": "<nextCursor from the last call>", "block_ms": 30000 }
@@ -252,17 +252,17 @@ per interval. Keep `block_ms` comfortably under your client's tool timeout — a
 outlives the timeout looks like a hang. Core clamps it to `catchup.block_max_ms` (default 60s)
 before it ever reaches a plugin, so a caller cannot exceed the server's own ceiling.
 
-**On the other eight** — discord, telegram, matrix, slack, xmpp, postgres, zulip and sqlite — the
-plugin declares `capabilities.blockingFetch: false`, core leaves `block_ms` off the tool schema
-that deployment advertises, and a call that sends it anyway is **refused by name** rather than
-accepted and silently stripped. An agent there polls `parley_fetch_recent` on its own cadence, or
-runs under Claude Code with `live_push.enabled` and is pushed a `<channel>` event instead. Check
-the tool's own schema rather than assuming the argument: the
+**On the other eight** — discord, telegram, matrix, slack, xmpp, postgres, zulip and sqlite — there
+is no read primitive to park a budget on, so `fetchRecent` **fails fast**: it rejects with
+`BlockingFetchUnsupportedError` naming the backend, and the tool hands that error back rather than a
+page. That is the point of refusing rather than ignoring — an empty page is exactly what a long-poll
+that timed out looks like, so an agent handed one goes on polling in the belief that it is parked.
+Retry without `block_ms` and poll on your own cadence, or run under Claude Code with
+`live_push.enabled` and be pushed a `<channel>` event instead. The
 [chat-hand-off skill](skills/chat-handoff/SKILL.md) shows both loops.
 
-Whether an argument is offered at all is decided by one optional seam field
-(`BackendCapabilities.blockingFetch`), so both adding `block_ms` and withdrawing it cost **zero**
-changes to any other package.
+The refusal lives entirely in the plugin: the seam carries `blockMs` and nothing else, so a backend
+that cannot serve a wait costs **zero** changes to any other package.
 
 ---
 
@@ -280,8 +280,8 @@ a real account:
 | `post_topics` | `[]` | Extra topics allowed for post/fetch only, as anchored regexes. Never subscribed or caught up on. Patterns are screened for catastrophic backtracking at load, capped at **64 patterns** (every post/fetch matches its topic against all of them), and matched only against topics of **at most 64 characters** — a longer topic must be listed in `topics`. |
 | `catchup.on_start` | `true` | Drain everything newer than the stored cursor at startup. |
 | `catchup.limit` | `100` | Page size per `fetchRecent`. |
-| `catchup.block_max_ms` | `60000` | Server-side ceiling on `block_ms` (above), where it is offered. |
-| `catchup.block_poll_interval_ms` | `250` | Re-query cadence for the generic long-poll core drives for an EMBEDDER that calls `fetchRecentBlocking` directly. Latency/cost only. |
+| `catchup.block_max_ms` | `60000` | Server-side ceiling on `block_ms` (above). |
+| `catchup.block_poll_interval_ms` | `250` | Re-query cadence of the long-poll core drives behind `parley_fetch_recent`'s `block_ms`. This **is** the delivery latency of a blocking fetch: the default adds up to a quarter second to the path sold above as returning "the moment" a message lands. Lower it for latency, raise it to spend fewer backend queries per blocked call. |
 | `live_push.enabled` | `false` | Claude Code only — push `<channel>` events into a running session. |
 | `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. Only the live push path reads it, so `true` with `live_push.enabled: false` is a load error rather than a filter that never runs. Requires a handle an `@mention` can name (ASCII letters/digits, optional interior `.` `-` `_`); anything else is a load error rather than a bridge that silently receives nothing. |
 | `backend_config` | `{}` | Opaque to core, passed verbatim to the plugin. Secrets live here — never committed. |

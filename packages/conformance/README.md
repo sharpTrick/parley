@@ -46,16 +46,18 @@ them stops owning a case — a conformance clause used to be deletable with noth
 - post accepts inReplyTo and the reply is durable, in order;
 - resolveIdentity answers for the handle it was asked about;
 - distinct senders are not collapsed onto one another;
-- blockMs is honoured natively or ignored promptly — never a hang: it wakes on a concurrent post
-  and returns empty at timeout on a backend declaring `capabilities.blockingFetch: true` — *at* the
-  timeout, having
-  actually waited (`IDLE_BLOCK_FLOOR_MS`), since a native block that answers "still nothing" at once
-  is a long-poll core turns into a hot loop — and returns promptly and empty on one that declares it
-  `false`. Which arm is graded is read off the plugin's own `capabilities`, the same declaration
-  core reads to decide whether to advertise `block_ms` — never restated in the fixture. The hint is optional; hanging on it is not. A since-LESS read
-  carrying a block budget must come back in a FRACTION of it (`SINCELESS_RETURN_MS`), not merely
-  inside it: that is the hot path for every `parley_fetch_recent` an agent makes before it holds a
-  cursor, and a bound set at the budget itself certifies a plugin that parks for all of it;
+- blockMs is honoured natively or refused — never silently ignored, never a hang. A backend that
+  parks wakes on a concurrent post and returns empty *at* the timeout, having actually waited
+  (`IDLE_BLOCK_FLOOR_MS`), since a native block that answers "still nothing" at once is a long-poll
+  core turns into a hot loop. A backend with no read primitive to park on rejects with
+  `BlockingFetchUnsupportedError` instead — promptly (`REFUSAL_RETURN_MS`), and for every budget it
+  is handed, because a refusal followed by a page is what a long-poll that timed out empty looks
+  like. Which arm a backend is on is decided by what it DOES with a budget, never by a declaration:
+  a plugin that answers a budget with the window it already had is graded on the arm that required
+  it to wait. A since-LESS read carrying a block budget must come back in a FRACTION of it
+  (`SINCELESS_RETURN_MS`), not merely inside it: that is the hot path for every
+  `parley_fetch_recent` an agent makes before it holds a cursor, and a bound set at the budget
+  itself certifies a plugin that parks for all of it;
 - a post landing in the window between a blocking fetch issuing its read and registering its
   waiter is not missed — a blocking fetch is not missed by 0-3ms of race;
 - a backend that declares `carriesSenderIdentity: false` still reports ONE stable, non-empty

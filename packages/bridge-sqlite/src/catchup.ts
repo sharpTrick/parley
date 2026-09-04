@@ -1,5 +1,6 @@
 import {
   asBackendMsgId,
+  assertBlockMsUnsupported,
   type BackendMsgId,
   type Cursor,
   type FetchRecentArgs,
@@ -29,6 +30,7 @@ export abstract class SqliteCatchUp extends SqliteStore {
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    assertBlockMsUnsupported('parley-sqlite', args.blockMs);
     const limit = normalizeLimit(args.limit, args.topic);
     const storeId = this.require(this.storeId);
     const resumeAfter = args.since === undefined ? undefined : this.resumeAfter(args.since, args.topic);

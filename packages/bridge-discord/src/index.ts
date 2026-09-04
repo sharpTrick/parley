@@ -1,7 +1,7 @@
 import {
   asBackendMsgId,
   asCursor,
-  NoSuchTopicError,
+  assertBlockMsUnsupported,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
@@ -10,6 +10,7 @@ import {
   type FetchRecentResult,
   type Handle,
   type MessageHandler,
+  NoSuchTopicError,
   type Topic,
 } from '@sharptrick/parley-core';
 import { DEFAULT_DEADLINE_MS, sanitizeBody } from '@sharptrick/parley-net-util';
@@ -54,12 +55,6 @@ interface Catchup {
  */
 export class DiscordPlugin extends DiscordSession implements BackendPlugin {
   /**
-   * No read primitive here takes a caller's wait: this backend's events arrive by push, and
-   * `fetchRecent` reads history. `block_ms` is therefore not offered on the tool.
-   */
-  readonly capabilities = { blockingFetch: false } as const;
-
-  /**
    * `POST /channels/<id>/messages`. The seam's `identity` is deliberately unused: Discord stamps
    * `author` from the configured bot token, so per-session attribution needs a per-session token.
    */
@@ -96,6 +91,7 @@ export class DiscordPlugin extends DiscordSession implements BackendPlugin {
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     this.require();
+    assertBlockMsUnsupported('parley-discord', args.blockMs);
     const generation = this.generation;
     // The seam declares `limit?: number` with no floor, and `fetchRecent` is public API — only the
     // MCP tool path upstream refuses a hostile one. Keep the floor HERE, so that a page walk
