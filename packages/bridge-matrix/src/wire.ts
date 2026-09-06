@@ -94,29 +94,6 @@ export const syncFilterParam = (roomId: string, timelineLimit: number): string =
     }),
   );
 
-/** A subscription position with provably no room history behind it — see {@link positionBoundaryOf}. */
-export const ROOM_START = Symbol('room-start');
-
-/**
- * Where a `limited` burst's backward recovery must stop: the newest event a positioning `/sync`
- * snapshot carries, of ANY type (a state event is a valid boundary since `backfill` matches by id,
- * not by topic/type), or {@link ROOM_START} when that snapshot showed the room's whole timeline and
- * it was empty. `undefined` — the room missing from the join block, an unreadable timeline — means
- * the read established NO boundary, which a backward walk must treat as a refusal rather than as
- * licence to page to the beginning of the room.
- */
-export type Boundary = string | typeof ROOM_START;
-
-export const positionBoundaryOf = (sync: SyncResponse, roomId: string): Boundary | undefined => {
-  const timeline = sync.rooms?.join?.[roomId]?.timeline;
-  if (timeline === undefined) return undefined;
-  const events = Array.isArray(timeline.events) ? timeline.events : undefined;
-  if (events === undefined) return undefined;
-  const tip = events.at(-1)?.event_id;
-  if (typeof tip === 'string') return tip;
-  return events.length === 0 && timeline.limited !== true ? ROOM_START : undefined;
-};
-
 /**
  * The resume token a `/sync` response advances to. Keep a non-string a THROW rather than adopting or
  * ignoring it, so that a loop cannot resume from a token the homeserver will reject — or, on a

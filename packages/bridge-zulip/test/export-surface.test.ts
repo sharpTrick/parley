@@ -65,7 +65,7 @@ describe('zulip public export surface', () => {
     const declared = [...sources.values()].flatMap(declaredExports);
     expect(declared).toContain('ZulipPlugin'); // `export class`
     expect(declared).toContain('readRetryAfter'); // `export async function`
-    expect(declared).toContain('GAP_FILL_PAGE'); // `export const`
+    expect(declared).toContain('MAX_MESSAGES_PER_FETCH'); // `export const`
     expect(declared).toContain('ReadOpts'); // `export interface`
     expect(reexports(entry)).toContain('ZulipBackendConfig'); // `export type { … } from`
   });

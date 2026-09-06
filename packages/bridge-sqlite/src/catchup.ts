@@ -8,15 +8,13 @@ import {
   type Handle,
   type Topic,
 } from '@sharptrick/parley-core';
-import { CATCHUP_LEDGER_MAX, normalizeLimit } from './config.js';
+import { normalizeLimit } from './config.js';
 import { mintCursor, parseCursor, rowToMessage } from './cursor.js';
 import type { MessageRow } from './schema.js';
 import { SqliteStore } from './store.js';
 
-/** `post`, the catch-up read, and the hand-off point the live path resumes from. */
+/** `post` and the catch-up read. */
 export abstract class SqliteCatchUp extends SqliteStore {
-  protected readonly caughtUpThrough = new Map<Topic, bigint>();
-
   async post(
     topic: Topic,
     identity: Handle,
@@ -39,11 +37,6 @@ export abstract class SqliteCatchUp extends SqliteStore {
         ? (this.require(this.selectRecentStmt).all(args.topic, limit) as MessageRow[]).reverse()
         : (this.require(this.selectAfterStmt).all(args.topic, resumeAfter, limit) as MessageRow[]);
     const servedThrough = rows.at(-1)?.id ?? resumeAfter ?? 0n;
-    this.recordCatchUp(
-      args.topic,
-      BigInt(servedThrough),
-      this.coveredAfter(args.topic, rows, resumeAfter),
-    );
     return {
       messages: rows.map((row) => rowToMessage(row, storeId)),
       nextCursor: mintCursor(storeId, servedThrough),
@@ -53,42 +46,6 @@ export abstract class SqliteCatchUp extends SqliteStore {
   protected maxId(topic: Topic): number {
     const row = this.require(this.maxIdStmt).get(topic) as { maxId: number } | undefined;
     return row?.maxId ?? 0;
-  }
-
-  /**
-   * The rowid this page's coverage begins strictly after. A resuming read covers everything above
-   * its `since`; a since-less read serves the topic's most-recent window and covers nothing below
-   * the oldest row it returned, so its lower bound is that row's predecessor in this topic.
-   */
-  private coveredAfter(topic: Topic, rows: MessageRow[], resumeAfter: bigint | undefined): bigint {
-    if (resumeAfter !== undefined) return resumeAfter;
-    const oldestServed = rows[0]?.id;
-    if (oldestServed === undefined) return 0n;
-    const row = this.require(this.predecessorStmt).get(topic, oldestServed) as
-      | { id: number }
-      | undefined;
-    return row === undefined ? 0n : BigInt(row.id);
-  }
-
-  /**
-   * Remember the rowid this topic's catch-up has accounted for, so a later {@link subscribe}
-   * resumes there. It only ever advances, so a re-read of an older page cannot pull the live path
-   * back over messages already served. Keep the `coveredAfter` arm too, so that a page leaving
-   * unread rows BELOW it does not carry the mark over them: `fetchRecent` cannot see whether its
-   * caller persists the cursor it hands back — the `parley_fetch_recent` tool does not — and rows
-   * skipped over here are delivered by neither path.
-   * Evicts least-recently-recorded first at {@link CATCHUP_LEDGER_MAX}.
-   */
-  private recordCatchUp(topic: Topic, rowid: bigint, coveredAfter: bigint): void {
-    const seen = this.caughtUpThrough.get(topic);
-    if (seen !== undefined && (rowid <= seen || coveredAfter > seen)) return;
-    this.caughtUpThrough.delete(topic);
-    this.caughtUpThrough.set(topic, rowid);
-    while (this.caughtUpThrough.size > CATCHUP_LEDGER_MAX) {
-      const oldest = this.caughtUpThrough.keys().next().value;
-      if (oldest === undefined) return;
-      this.caughtUpThrough.delete(oldest);
-    }
   }
 
   /**

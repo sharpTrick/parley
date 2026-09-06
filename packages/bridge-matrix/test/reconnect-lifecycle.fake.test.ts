@@ -594,11 +594,11 @@ describe('no seam call reaches the homeserver without the credential of its own 
 /**
  * CLASS: a delivery path that awaits anything between its staleness gate and the call into the
  * caller's handler. The subscribe loop gates on `isStale` once per iteration and then keeps
- * awaiting — a `/messages` recovery of a `limited` burst is a whole HTTP exchange, and up to
- * `MAX_BACKFILL_PAGES` of them — so a gate read before that await has been stale for the entire
- * round-trip by the time the batch is in hand, and the handler fires after `disconnect()` has
- * already resolved. Inbound Matrix events become agent context, so a batch delivered past the
- * teardown is context injected into a session the operator believes is detached.
+ * awaiting — a long-polled `/sync` is a whole HTTP exchange the homeserver may hold for the
+ * configured timeout — so a gate read before that await has been stale for the entire round-trip by
+ * the time the batch is in hand, and the handler fires after `disconnect()` has already resolved.
+ * Inbound Matrix events become agent context, so a batch delivered past the teardown is context
+ * injected into a session the operator believes is detached.
  *
  * Driven over EVERY await the loop makes with a batch pending delivery rather than the one that was
  * found leaking, because each is a separate place a gate can be missing from, and over BOTH
@@ -650,38 +650,6 @@ const DELIVERY_AWAITS: Record<string, DeliveryAwait> = {
         return HELD_MS;
       };
       await vi.waitFor(() => expect(held).toBe(1), { timeout: 6000, interval: 5 });
-    },
-  },
-  // The same await, but on a sync the loop must FOLLOW with a `/messages` recovery — a separate
-  // state, because the gate that stops the delivery and the gate that stops that recovery from
-  // being issued at all are different lines.
-  'the incremental /sync carrying a `limited` burst': {
-    park: async (_p, fire) => {
-      fake.syncCap = 1;
-      let held = 0;
-      fake.holdSync = () => {
-        if (held > 0) return 0;
-        held++;
-        seedBatch();
-        fire();
-        return HELD_MS;
-      };
-      await vi.waitFor(() => expect(held).toBe(1), { timeout: 6000, interval: 5 });
-    },
-  },
-  'the `limited`-burst backfill page': {
-    park: async (_p, fire) => {
-      fake.syncCap = 1; // 3 new events > the cap → `limited` + prev_batch → backfill
-      let pages = 0;
-      fake.holdMessages = (url) => {
-        if (url.searchParams.get('dir') !== 'b' || !url.searchParams.has('from')) return 0;
-        pages++;
-        if (pages > 1) return 0;
-        fire();
-        return HELD_MS;
-      };
-      seedBatch();
-      await vi.waitFor(() => expect(pages).toBeGreaterThan(0), { timeout: 6000, interval: 5 });
     },
   },
   'the retry backoff after a failed /sync': {

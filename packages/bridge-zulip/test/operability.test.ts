@@ -59,19 +59,10 @@ const PERMANENT_FAILURES: Array<{
     },
   },
   {
-    name: 'every fresh queue is rejected as stale and the gap-fill reads fail too',
+    name: 'every fresh queue is rejected as stale',
     counted: 'POST /api/v1/register',
     apply: (fake: FakeZulip) => {
       fake.failRoute('GET /api/v1/events', FAULTS.staleQueue);
-      fake.failMessagesReads(1_000_000);
-    },
-  },
-  {
-    name: 'the gap-fill after a queue GC keeps failing',
-    counted: 'GET /api/v1/messages',
-    apply: (fake: FakeZulip) => {
-      fake.failMessagesReads(1_000_000);
-      fake.expireQueues();
     },
   },
 ];

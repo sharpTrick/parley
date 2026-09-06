@@ -76,13 +76,6 @@ export const maxRetentionDays = (): number => Math.floor(Date.now() / 86_400_000
  * larger delay to 1 ms, so an operator asking for a very slow poll would get a hot loop instead.
  */
 export const MAX_POLL_INTERVAL_MS = 2_147_483_647;
-/**
- * Most catch-up hand-off points held at once. `fetchRecent`'s topic is caller-supplied, and core
- * admits any topic a `post_topics` pattern matches, so the ledger is capped rather than left to
- * grow one entry per distinct topic ever fetched. An evicted topic's {@link SqlitePlugin.subscribe}
- * samples the current tail, exactly as a topic catch-up never read does.
- */
-export const CATCHUP_LEDGER_MAX = 1024;
 /** Consecutive failing poll ticks before the loop escalates (backs off, or stops if fatal). */
 export const ESCALATE_AFTER = 10;
 /** Minimum gap between repeats of the same background-job diagnostic. */

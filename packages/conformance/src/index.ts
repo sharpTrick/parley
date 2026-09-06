@@ -41,6 +41,7 @@ export {
   TAIL_BLOCK_MS,
 } from './budgets.js';
 export { pageLimitsFor, PAGING_VOLUME } from './cases/catch-up.js';
+export { QUIET_POSTS } from './cases/live.js';
 export { ASSERTED_PROPERTIES, CLAUSES } from './clauses.js';
 export type { BackendFactory, ConformanceContext } from './factory.js';
 export {

@@ -15,6 +15,13 @@ const TEARDOWN_SETTLE_MS = 500;
 const DELIVERY_MS = 5_000;
 const ECHO_MS = 3_000;
 
+/**
+ * Messages the quiet-topic floor sends, one at a time. More than any other case delivers into one
+ * topic, so a live path that serves the first few messages and then goes quiet is reached HERE and
+ * nowhere else — see the control built on it in `BROKEN_VARIANTS`.
+ */
+export const QUIET_POSTS = 3;
+
 const delivered = (within: number, arrived: () => void): Promise<void> =>
   vi.waitFor(arrived, { timeout: within, interval: 10 });
 
@@ -43,10 +50,11 @@ export function liveCases(ctx: ConformanceContext): void {
     expect(viaCatchUp!.mentions).toContain(OTHER);
   });
 
-  // Both of subscribe's documented guarantees at once: it delivers exactly the post-subscribe
-  // tail (never replaying history as if it were live — a defect that has already bitten a
-  // shipped backend) and it delivers in ascending cursor order.
-  it('subscribe delivers exactly the post-subscribe tail, once, in cursor order', async () => {
+  // subscribe's UPPER bound: whatever it delivers is drawn from the post-subscribe tail, in cursor
+  // order, never twice. It is NOT required to deliver all of it — a burst wider than a backend's
+  // delivery window is reconciled by catch-up, which is asserted here as the other half of the
+  // bargain. Replaying history as if it were live is a superset, and still forbidden.
+  it('subscribe delivers only the post-subscribe tail, in cursor order, never twice', async () => {
     const t = ctx.freshTopic();
     const before = ['h0', 'h1', 'h2', 'h3', 'h4'];
     for (const c of before) await ctx.plugin.post(t, SENDER, c);
@@ -56,18 +64,56 @@ export function liveCases(ctx: ConformanceContext): void {
 
     const after = ['n0', 'n1', 'n2'];
     for (const c of after) await ctx.plugin.post(t, SENDER, c);
-    await delivered(DELIVERY_MS, () => expect(live.length).toBeGreaterThanOrEqual(after.length));
+    // The whole tail is WAITED for and not required: a plugin that drops part of a burst is
+    // conformant, and the floor under that — `a live subscriber does not fall behind a quiet
+    // topic` — is graded below rather than here.
+    await delivered(DELIVERY_MS, () =>
+      expect(live.length).toBeGreaterThanOrEqual(after.length),
+    ).catch(() => undefined);
+    expect(live.length).toBeGreaterThan(0);
 
-    // Delivery ORDER is the assertion; cursor VALUES are opaque and deliberately not comparable
-    // (CLAUDE.md — core never compares cursors, and MAM archive ids are not lexically sortable).
-    expect(live.map((m) => m.content)).toEqual(after); // no history replay, nothing extra
-    expect(new Set(live.map((m) => m.backendMsgId)).size).toBe(after.length); // exactly once
+    // A SUBSEQUENCE of the tail, which is one assertion for three properties: nothing from before
+    // the subscribe, nothing twice, nothing out of order. Cursor VALUES are opaque and deliberately
+    // not comparable (CLAUDE.md — core never compares cursors, and MAM archive ids are not
+    // lexically sortable), so delivery ORDER is what carries it.
+    const seen = live.map((m) => m.content);
+    expect(seen).toEqual(after.filter((c) => seen.includes(c)));
+    expect(new Set(live.map((m) => String(m.backendMsgId))).size).toBe(live.length);
+
+    // The other half of the bargain: what push left out, catch-up returns — under the same identity
+    // core's dedup depends on.
     const viaCatchUp = await drainAll(ctx.plugin, t);
     expect(viaCatchUp.map((m) => m.content)).toEqual([...before, ...after]);
-    // Live and catch-up agree on identity for the same messages, in the same order.
-    expect(live.map((m) => m.backendMsgId)).toEqual(
-      viaCatchUp.slice(before.length).map((m) => m.backendMsgId),
-    );
+    const byContent = new Map(viaCatchUp.map((m) => [m.content, m]));
+    for (const m of live) {
+      expect(String(m.backendMsgId)).toBe(String(byContent.get(m.content)?.backendMsgId));
+      expect(String(m.cursor)).toBe(String(byContent.get(m.content)?.cursor));
+    }
+  });
+
+  // The FLOOR under the subset above. A push path that may drop is not a push path that may deliver
+  // nothing, and an empty delivery is a subset of every tail — so without this case a plugin whose
+  // subscribe registers no server-side listener at all is certified. What a delivery window cannot
+  // cover is a BURST, so a topic written one message at a time, each delivered before the next is
+  // posted, loses nothing.
+  it('a live subscriber does not fall behind a quiet topic', async () => {
+    const t = ctx.freshTopic();
+    const live: Message[] = [];
+    await ctx.plugin.subscribe(t, (m) => live.push(m));
+
+    const sent: string[] = [];
+    for (let i = 0; i < QUIET_POSTS; i++) {
+      sent.push(`q${i}`);
+      await ctx.plugin.post(t, SENDER, `q${i}`);
+      await delivered(DELIVERY_MS, () =>
+        expect(
+          live.map((m) => m.content),
+          'the live path fell behind a topic written one message at a time, waiting for each to ' +
+            'arrive before sending the next — a subset is what a delivery window cannot cover, ' +
+            'not a licence to deliver nothing',
+        ).toEqual(sent),
+      );
+    }
   });
 
   // Every other subscribe case posts through the SAME client that registered the handler, so only

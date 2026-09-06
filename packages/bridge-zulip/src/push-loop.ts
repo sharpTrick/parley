@@ -1,6 +1,5 @@
 import type { Message, MessageHandler, Topic } from '@sharptrick/parley-core';
 import type { QueueState, ZulipConnection } from './connection.js';
-import { gapFill, probeTail } from './history.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from './pacing.js';
 import { asArray, type EventsResponse, zulipToMessage } from './wire.js';
 
@@ -9,14 +8,9 @@ import { asArray, type EventsResponse, zulipToMessage } from './wire.js';
  * resolves, so a post immediately after subscribe() is guaranteed to be queued, and Zulip delivers
  * our own sends to our own queue, matching the seam's echo expectation.
  *
- * The delivery watermark is probed BEFORE register and the handshake window is then closed by an
- * armed gap-fill, so every message newer than the probe is delivered EXACTLY once. A probe that
- * cannot establish a tail at all ({@link probeTail}) arms no gap-fill: with no watermark to replay
- * FROM, the only honest window is the queue's own.
- *
- * Queue GC: Zulip garbage-collects queues after ~10 min idle and then answers
- * `BAD_EVENT_QUEUE_ID`; recovery re-registers and arms the same gap-fill, which `lastDeliveredId`
- * dedupes against the events the fresh queue then delivers.
+ * Delivery is a subset of the tail (DESIGN §6) — but never a repeat. Keep `lastDeliveredId`: an
+ * event carrying an id the loop cannot ack leaves the queue position unmoved, and the server then
+ * hands back the message behind it on every poll until the fault clears.
  */
 const replacedDuringHandshake = (): Error =>
   new Error(
@@ -38,10 +32,10 @@ export async function startPushLoop(
   // a server answers neither cuts them instead of returning with them still in flight — the CLI
   // calls `process.exit(0)` the moment shutdown resolves, so whatever is still in flight then is
   // killed mid-request rather than finished.
+  /** The newest message id handed to the handler; anything at or below it has already gone out. */
   let lastDeliveredId: number | undefined;
   let reg: Awaited<ReturnType<typeof rest.register>>;
   try {
-    lastDeliveredId = await probeTail(conn, topic, { generation, signal });
     reg = await rest.register(wire, signal);
   } catch (err) {
     if (alive()) throw err;
@@ -58,10 +52,6 @@ export async function startPushLoop(
   conn.queues.add(state);
 
   let lastEventId = reg.last_event_id;
-  // Armed from the pre-register watermark so the register handshake window is replayed, and
-  // re-armed by a queue GC; the top of the loop drains it, retrying until the read succeeds so a
-  // transient failure can't leave a permanent push hole.
-  let needsGapFillFrom: number | undefined = lastDeliveredId;
   let consecutiveFailures = 0;
   /** Whether `state.queueId` has ever answered an events poll — the only proof push works. */
   let queueProven = false;
@@ -93,26 +83,6 @@ export async function startPushLoop(
 
   /** One pass of the push loop; `false` ends it. */
   const advance = async (): Promise<boolean> => {
-    // Drain a pending gap-fill BEFORE polling the fresh queue — retry the gap (not the events
-    // poll) until it clears, advancing `lastDeliveredId`/`needsGapFillFrom` per delivered page
-    // so a mid-pagination throw keeps its progress and a retry resumes past delivered pages.
-    if (needsGapFillFrom !== undefined) {
-      try {
-        lastDeliveredId = await gapFill(
-          conn, topic, needsGapFillFrom, deliver,
-          (id) => {
-            lastDeliveredId = id;
-            needsGapFillFrom = id;
-          },
-          { generation, signal },
-        );
-        needsGapFillFrom = undefined; // gap closed — resume normal polling
-      } catch {
-        if (!alive()) return false;
-        await backoff('gap-fill history read failed');
-      }
-      return true; // re-check liveness / re-attempt before polling the fresh queue
-    }
     const controller = new AbortController();
     conn.controllers.add(controller);
     let capped = false;
@@ -150,14 +120,12 @@ export async function startPushLoop(
     if (!alive()) return false;
     if (json.result === 'error') {
       if (json.code === 'BAD_EVENT_QUEUE_ID') {
-        // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
         try {
           const superseded = state.queueId;
           const fresh = await rest.register(wire, signal);
           conn.deleteQueueDetached(rest, superseded);
           state.queueId = fresh.queue_id;
           lastEventId = fresh.last_event_id;
-          needsGapFillFrom = lastDeliveredId;
           // A queue rejected before it ever answered a poll is a FAILING recovery, not a
           // completed one: pace it, so that a server rejecting every queue it mints cannot be
           // flooded with fresh registrations by its own error.
@@ -183,7 +151,7 @@ export async function startPushLoop(
       const m = zulipToMessage(topic, ev.message);
       if (m === undefined) continue;
       const id = Number(m.backendMsgId);
-      if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue; // gap-filled — dedup
+      if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue;
       lastDeliveredId = id;
       deliver(m);
     }

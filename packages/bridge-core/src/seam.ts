@@ -12,6 +12,12 @@
  *      is invoked in ascending order. Core never ORDERS or PARSES a cursor (DESIGN §6) — but it
  *      does compare two for byte equality, as the no-progress brake in `catchUpTopic`. A cursor
  *      naming a position must therefore be byte-stable across calls.
+ *   3. The two paths carry DIFFERENT obligations. `fetchRecent` is COMPLETE: every message above
+ *      `since` is returned, page by page. `subscribe` is LOSSY: what it delivers is a SUBSET of the
+ *      post-subscribe tail — in cursor order, never twice, never anything from before the
+ *      subscribe — and what it leaves out is reached by the next `fetchRecent`. A backend whose
+ *      delivery window cannot cover a burst is conformant; one whose live path delivers nothing at
+ *      all is not.
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
 
@@ -76,7 +82,7 @@ export interface FetchRecentResult {
   nextCursor: Cursor;
 }
 
-/** Live-path callback: fires once per inbound message, in ascending cursor order per topic. */
+/** Live-path callback: fires at most once per inbound message, in ascending cursor order per topic. */
 export type MessageHandler = (msg: Message) => void;
 
 /**
@@ -91,11 +97,13 @@ export interface BackendPlugin {
   disconnect(): Promise<void>;
 
   /**
-   * Register interest in a topic. `handler` fires once per inbound message on the live path,
-   * IN ASCENDING CURSOR ORDER per topic. The plugin decides HOW the handler is driven
-   * (poll loop for SQLite; blocking event source for Redis/Matrix/…); core decides WHAT
-   * happens (emit a `<channel>` event). `disconnect()` tears down all subscriptions
-   * (DESIGN §4/§9).
+   * Register interest in a topic. `handler` fires AT MOST ONCE per inbound message on the live
+   * path, IN ASCENDING CURSOR ORDER per topic, and only for messages that arrive after this call.
+   * It is not required to fire for all of them: delivery is a subset, and `fetchRecent` resuming
+   * from the caller's cursor is what closes the gap (conformance clause 3 above). The plugin
+   * decides HOW the handler is driven (poll loop for SQLite; blocking event source for
+   * Redis/Matrix/…); core decides WHAT happens (emit a `<channel>` event). `disconnect()` tears
+   * down all subscriptions (DESIGN §4/§9).
    */
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;
 

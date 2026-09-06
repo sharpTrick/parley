@@ -286,25 +286,17 @@ describe('a malformed /sync body that never stops is reported and slowed, not ho
 /**
  * CLASS: the POSITIONING `/sync` is a phase of its own, and every field the plugin reads off it is
  * exactly as untrusted as the incremental one's. Both tables above arm incremental bodies only — yet
- * the positioning read is what decides WHERE a subscription resumes from and how far back a
- * `limited` burst may be recovered, so a shape it mishandles does not merely degrade the live path:
- * it feeds the room's existing history into the agent session as though it had just arrived.
+ * the positioning read is what decides WHERE a subscription resumes from, so a shape it mishandles
+ * does not merely degrade the live path: it feeds the room's existing history into the agent session
+ * as though it had just arrived. The resume TOKEN is how that happens — defaulted to `''` when
+ * absent or mistyped, it asks for `?since=`, which a homeserver reads as an initial sync.
  *
- * Two fields, two ways that happens. The resume TOKEN — defaulted to `''` when absent or mistyped,
- * it asks for `?since=`, which a homeserver reads as an initial sync. And the BOUNDARY the burst
- * recovery walks back to — with none, it pages to the beginning of the room. Both are graded by one
- * assertion, because both produce the same observable: a message that already existed when
- * `subscribe()` was called arriving on the live path.
+ * The observable is one assertion for every shape: a message that already existed when
+ * `subscribe()` was called must never arrive on the live path. Push may DROP (the tail is a subset),
+ * and it may not invent.
  */
 interface PositioningFault {
   mangle: (body: Record<string, unknown>, roomId: string) => unknown;
-  /**
-   * Set where the shape is the homeserver's PROMISE that nothing precedes this position: a
-   * `timeline.limit: 1` filter answering with no event and not claiming it truncated. Paging back
-   * past the subscription is exactly what that promise buys, so those cells are graded from the
-   * other side — the recovery must actually reach back — rather than on the no-history invariant.
-   */
-  licensesRoomStart?: true;
 }
 
 const BODY_FAULTS: Record<string, PositioningFault['mangle']> = {
@@ -356,9 +348,6 @@ const TIMELINE_FAULTS: Record<string, PositioningFault> = Object.fromEntries(
           ...body,
           rooms: { join: { [roomId]: { timeline: { ...shape(tipOf(body, roomId)), ...limited } } } },
         }),
-        ...(eventsName === 'events is empty' && limitedName !== 'limited true'
-          ? { licensesRoomStart: true as const }
-          : {}),
       },
     ]),
   ),
@@ -405,7 +394,7 @@ const sinceParamsSince = (from: number): (string | null)[] =>
 
 describe('a positioning /sync the plugin cannot resume from never replays the room as live events', () => {
   for (const [faultName, fault] of Object.entries(POSITIONING_FAULTS)) {
-    const { mangle, licensesRoomStart } = fault;
+    const { mangle } = fault;
     it(`${faultName} / the subscribe loop: nothing that predates subscribe() is delivered`, async () => {
       vi.spyOn(console, 'error').mockImplementation(() => undefined);
       const escaped: unknown[] = [];
@@ -422,27 +411,19 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
         () => true,
         () => false,
       );
-      // Truncate the burst, so that the boundary half of the class is exercised too: with no
-      // boundary the recovery walk is what reaches back past the subscription into history.
+      // Truncate the burst, so the rows cover a `limited` sync as well as a whole one: a shape the
+      // positioning read mishandles must not turn a truncated timeline into a walk back into
+      // history either.
       fake.syncCap = 1;
       for (const c of POST_SUBSCRIPTION) fake.addMessage(String(t), c);
       await new Promise((r) => setTimeout(r, 400));
       process.off('unhandledRejection', onEscape);
       await p.disconnect();
 
-      if (licensesRoomStart === true) {
-        // The other side of the same predicate: a shape that DOES establish a room-start boundary
-        // must be honoured, or a cell could pass by refusing every shape indiscriminately.
-        expect(
-          seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
-          'the position was promised to have no history behind it, so the recovery owes that history',
-        ).not.toEqual([]);
-      } else {
-        expect(
-          seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
-          'history that was already in the room arrived as a live <channel> event',
-        ).toEqual([]);
-      }
+      expect(
+        seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
+        'history that was already in the room arrived as a live <channel> event',
+      ).toEqual([]);
       expect(escaped.map(String)).toEqual([]);
       for (const since of sinceParamsSince(from)) {
         if (since !== null) expect(since).toMatch(MINTED_TOKEN);
@@ -453,7 +434,7 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
         );
         expect(
           fake.limitedEmitted,
-          'the burst was never truncated, so no row here reached the recovery walk at all',
+          'the burst was never truncated, so no row here graded a `limited` sync at all',
         ).toBeGreaterThan(0);
       }
     }, 20_000);

@@ -11,8 +11,9 @@ import { connectFake, FakeSynapse } from './fake-synapse.js';
  * so the filter can only be graded on the wire.
  *
  * Each call site is identified by (dir, limit, from) — never by the filter itself, which is what is
- * under test — and every recorded request must match exactly one, so a fourth call site added later
- * cannot slip in ungraded.
+ * under test — and every recorded request must match exactly one, so a call site added later cannot
+ * slip in ungraded. The count is read off the table rather than written into the title, so removing
+ * a call site moves the row with the code instead of reddening a figure in prose.
  */
 
 const WRITER = asHandle('writer');
@@ -29,12 +30,6 @@ const CALL_SITES: Record<string, { match: (u: URL) => boolean; filter: string | 
     match: (u) => q(u, 'dir') === 'b' && q(u, 'limit') === String(LIMIT),
     filter: MESSAGES_ONLY,
   },
-  // This one matches a boundary `event_id` that may itself be a state event, which a filtered page
-  // would hide — so for it the CORRECT wire is no filter at all.
-  'backfill (a `limited` burst)': {
-    match: (u) => q(u, 'dir') === 'b' && q(u, 'limit') === '100' && u.searchParams.has('from'),
-    filter: null,
-  },
 };
 
 let fake: FakeSynapse;
@@ -48,7 +43,7 @@ afterEach(() => {
 });
 
 describe('every /messages call site sends the filter its page semantics require', () => {
-  it('all three fire, each with exactly the filter it needs', async () => {
+  it(`all ${Object.keys(CALL_SITES).length} fire, each with exactly the filter it needs`, async () => {
     fake.syncCap = 2;
     const p = await connectFake({});
     const t = asTopic('wire');
@@ -58,10 +53,13 @@ describe('every /messages call site sends the filter its page semantics require'
     await p.post(t, WRITER, 'next');
     await p.fetchRecent({ topic: t, since: tail, limit: LIMIT }); // context + drainForward
 
+    // A burst past the per-sync cap, so the live path is running while the reads above are graded:
+    // it must issue no `/messages` request of its own, which the exhaustiveness check below is what
+    // catches — push does not read history.
     const got: string[] = [];
     await p.subscribe(t, (m) => got.push(m.content));
-    for (let i = 0; i < 5; i++) fake.addMessage(String(t), `burst${i}`); // 5 > syncCap → backfill
-    await vi.waitFor(() => expect(got).toHaveLength(5), { timeout: 4000, interval: 10 });
+    for (let i = 0; i < 5; i++) fake.addMessage(String(t), `burst${i}`);
+    await vi.waitFor(() => expect(got.length).toBeGreaterThan(0), { timeout: 4000, interval: 10 });
     await p.disconnect();
 
     for (const [name, site] of Object.entries(CALL_SITES)) {

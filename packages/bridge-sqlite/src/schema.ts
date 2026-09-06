@@ -51,7 +51,6 @@ export const SQL = {
   insert: 'INSERT INTO messages (topic, sender, content, ts, in_reply_to) VALUES (?, ?, ?, ?, ?)',
   selectAfter: `SELECT ${MESSAGE_COLUMNS.join(', ')} FROM messages WHERE topic = ? AND id > ? ORDER BY id ASC LIMIT ?`,
   selectRecent: `SELECT ${MESSAGE_COLUMNS.join(', ')} FROM messages WHERE topic = ? ORDER BY id DESC LIMIT ?`,
-  predecessor: 'SELECT id FROM messages WHERE topic = ? AND id < ? ORDER BY id DESC LIMIT 1',
   maxId: 'SELECT COALESCE(MAX(id), 0) AS maxId FROM messages WHERE topic = ?',
   prune: 'DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)',
   seq: "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",

@@ -10,7 +10,7 @@ import { type PreparedStatements, prepareAll } from './store.js';
 
 export { classifyDbError, type DbErrorClass } from './classify.js';
 export {
-  CATCHUP_LEDGER_MAX, ESCALATE_AFTER, MAX_PAGE, MAX_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS,
+  ESCALATE_AFTER, MAX_PAGE, MAX_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS,
   MIN_RETENTION_DAYS, POLL_BATCH, PRUNE_BATCH, PRUNE_INTERVAL_MS, retentionCutoff,
   type SqliteBackendConfig, validateBackendConfig,
 } from './config.js';
@@ -79,9 +79,6 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
     this.pruneBatchTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
-    // Keep the hand-off points cleared with the driver, so that a reconnect onto a different or
-    // reset store cannot resume a live loop at a rowid belonging to the previous one.
-    this.caughtUpThrough.clear();
     for (const h of this.health) {
       h.state = 'stopped';
       h.lastError = 'disconnected';

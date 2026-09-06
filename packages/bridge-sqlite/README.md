@@ -14,12 +14,30 @@ The **seam-proving reference backend** for [Parley](../../README.md) — zero-in
 | backendMsgId | the row `id` (`AUTOINCREMENT`) — unique, never reused |
 | cursor | `<storeId>.<rowid>` — the row id prefixed with this store's identity (`parley_meta.store_id`); opaque to core |
 | `fetchRecent({since})` | `SELECT ... WHERE topic = ? AND id > ? ORDER BY id ASC` (exclusive); no `since` → last-`limit` window, reversed to ascending |
-| `subscribe` | a per-topic **poll loop**: `SELECT ... WHERE id > :lastSeen` every `poll_interval_ms`, advancing `lastSeen`; a tick that fills its batch drains again at once rather than waiting the interval |
+| `subscribe` | a per-topic **poll loop**: `SELECT ... WHERE id > :lastSeen` every `poll_interval_ms`, starting at the topic's tail as it stands when `subscribe` is called and advancing `lastSeen`; a tick that fills its batch drains again at once rather than waiting the interval |
 | `resolveIdentity` | string convention (handle = backendRef) — local backend, not a provisioned account |
 
-There's no real event source to block on, so `subscribe` polls. The cursor makes this fully
-correct regardless of cadence — `poll_interval_ms` is a pure latency/cost knob, never a
-correctness concern and never a throughput ceiling.
+There's no real event source to block on, so `subscribe` polls. The cursor makes a poll tick miss
+nothing whatever the cadence — `poll_interval_ms` is a pure latency/cost knob, never a throughput
+ceiling.
+
+### The start-up window is dark, and catch-up is what closes it
+
+Live push is a **subset** of the post-subscribe tail (the seam's contract), and on this backend the
+subset it drops is the start-up window. Core runs catch-up to completion and arms the live loop
+*afterwards*, and the loop begins at the topic's tail as it stands then — so in a **multi-writer**
+deployment (several bridges on one file, §10), a row a peer commits between those two moments is
+above the cursor catch-up persisted and below the tail the loop starts at. Push never carries it.
+
+It is not lost: a `parley_fetch_recent` resuming from the caller's own cursor returns it, in order.
+But that is a weaker promise here than "catch-up reconciles" sounds, and the reason is worth stating
+plainly — **the `parley_fetch_recent` tool does not persist the cursor it hands back.** An agent
+that carries the cursor forward itself sees the window once; one that keeps re-reading from a stale
+cursor sees it repeatedly (core's dedup absorbs the repeats, so nothing is double-emitted). A
+single-writer deployment — one bridge, one process — has no such window at all: everything after the
+subscribe is its own or arrives later.
+
+`packages/bridge-sqlite/test/push-gap-reconciliation.test.ts` executes both halves.
 
 ### Cursors carry the store's identity
 

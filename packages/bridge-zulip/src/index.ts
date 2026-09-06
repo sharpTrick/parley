@@ -20,7 +20,6 @@ import { startPushLoop } from './push-loop.js';
 import { asArray, type RealmMember, requireSendableBody } from './wire.js';
 
 export type { ZulipBackendConfig } from './config.js';
-export { GAP_FILL_PAGE, TAIL_PROBE_PAGE } from './history.js';
 
 /**
  * Zulip backend (DESIGN §6/§9) — self-hosted, and the closest native fit of any backend: Zulip's
@@ -99,7 +98,7 @@ export class ZulipPlugin implements BackendPlugin {
     const { conn } = this;
     conn.require();
     const limit = args.limit ?? 100;
-    const { messages } = await readWindow(conn, args.topic, args.since, limit, {
+    const messages = await readWindow(conn, args.topic, args.since, limit, {
       generation: conn.generation,
     });
     const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');

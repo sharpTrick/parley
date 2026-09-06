@@ -32,20 +32,18 @@ export abstract class SqlitePoller extends SqliteRetention {
 
   /**
    * Live path = a per-topic poll loop (DESIGN §9, polling-only). `SELECT WHERE id > :lastSeen ASC`
-   * per tick, advancing `lastSeen`. `disconnect()` cancels the loop. The cursor guarantees nothing
-   * is missed regardless of cadence.
+   * per tick, advancing `lastSeen` from the topic's tail at the moment of the call. Every row above
+   * that is delivered once, in rowid order; `disconnect()` cancels the loop.
    *
-   * It starts where this topic's catch-up handed off, not at the current max rowid: core runs
-   * catch-up to completion and arms `subscribe` later, so a start point sampled here would skip
-   * everything a peer committed in between — below the sampled mark, above the read position
-   * catch-up persisted, and therefore owned by neither path. Sampling is right only for a topic
-   * catch-up never read — or one whose hand-off point aged out of {@link CATCHUP_LEDGER_MAX}: its
-   * rows are history the live path has never owned.
+   * Push is a SUBSET of the post-subscribe tail (DESIGN §6), and the subset it drops here is the
+   * start-up window: core runs catch-up to completion and arms `subscribe` afterwards, so a row a
+   * peer commits in between is above the caller's persisted cursor and below this tail. It is
+   * reached by the next `fetchRecent` resuming from that cursor, never by push.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     const storeId = this.require(this.storeId);
     const generation = this.generation;
-    let lastSeen: number | bigint = this.caughtUpThrough.get(topic) ?? this.maxId(topic);
+    let lastSeen: number | bigint = this.maxId(topic);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let diagQuietUntil = 0;

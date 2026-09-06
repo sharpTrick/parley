@@ -5,7 +5,7 @@ import {
   eventToMessage, isMessageEvent, type MatrixEvent, type MessageEvent,
 } from './wire.js';
 
-/** Real per-sync timeline cap for the incremental `/sync` filter and the backfill page size. */
+/** Real per-sync timeline cap for the incremental `/sync` filter. */
 export const INCREMENTAL_TIMELINE_LIMIT = 100;
 /**
  * Pace between `/sync` calls that came back far sooner than the long-poll they asked for. A
@@ -24,13 +24,9 @@ export const returnedTooFast = (startedAt: number, timeoutMs: number): boolean =
 
 /** Bound on forward catch-up pagination so an all-foreign timeline terminates instead of spinning. */
 const MAX_FORWARD_PAGES = 50;
-/** Bound on backward `limited`-burst recovery and recent-window pagination so both terminate. */
+/** Bound on recent-window pagination so a backward walk terminates. */
 const MAX_BACKWARD_PAGES = 50;
-/**
- * Server-side filter for the catch-up paths, so reactions, edits and membership churn cost no
- * client page budget. Keep it OFF the `backfill`/`positionBoundary` pair — those match a boundary
- * `event_id` that may itself be a state event, which a filtered page would hide.
- */
+/** Server-side filter, so reactions, edits and membership churn cost no client page budget. */
 const MESSAGES_ONLY_FILTER = encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
 
 type MessagesPage = { chunk: MatrixEvent[]; start?: string; end?: string };
@@ -215,42 +211,5 @@ export abstract class MatrixTimeline extends MatrixSession {
     const messages = collected.slice(0, limit).reverse().map((e) => eventToMessage(topic, e));
     const nextCursor = messages.at(-1)?.cursor ?? emptyWindowCursor(tailToken, sinceCursor, stale);
     return { messages, nextCursor };
-  }
-
-  /**
-   * Page BACKWARDS from a `limited` sync's `prev_batch` (newest→oldest) until the last event already
-   * delivered (`stopAfter`), the chunk empties, or the page bound trips; returned ASCENDING. `skip`
-   * holds the ids already in the current sync batch so a token-boundary overlap can't double-deliver.
-   */
-  protected async backfill(
-    roomId: string,
-    topic: Topic,
-    prevBatch: string,
-    stopAfter: string | undefined,
-    skip: Set<unknown>,
-    generation: number,
-  ): Promise<MessageEvent[]> {
-    const recovered: MessageEvent[] = [];
-    let from = prevBatch;
-    for (let page = 0; page < MAX_BACKWARD_PAGES && !this.isStale(generation); page++) {
-      const res = await this.http(
-        'GET',
-        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(from)}&dir=b&limit=${INCREMENTAL_TIMELINE_LIMIT}`,
-      );
-      const { chunk, end } = (await res.json()) as MessagesPage;
-      if (chunk.length === 0) break;
-      let reachedBoundary = false;
-      for (const e of chunk) {
-        if (stopAfter !== undefined && e.event_id === stopAfter) {
-          reachedBoundary = true;
-          break;
-        }
-        if (skip.has(e.event_id)) continue; // already in this sync's batch — don't double-deliver.
-        if (this.belongs(e, topic)) recovered.push(e);
-      }
-      if (reachedBoundary || end === undefined) break;
-      from = end;
-    }
-    return recovered.reverse();
   }
 }

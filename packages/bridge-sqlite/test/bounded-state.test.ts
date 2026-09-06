@@ -2,8 +2,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CATCHUP_LEDGER_MAX, SqlitePlugin } from '../src/index.js';
+import { afterEach, describe, expect, it } from 'vitest';
+import { SqlitePlugin } from '../src/index.js';
 
 /**
  * Every seam call is keyed by a topic, and core admits any topic a `post_topics` pattern matches —
@@ -20,7 +20,13 @@ const TOPICS = 2000;
 const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-bound-')), 'p.db');
 /** Slow enough that 2000 concurrent loops do not spend the test querying, in the walk below. */
 const cfg = (path: string) => ({ db_path: path, poll_interval_ms: 60_000 });
-const fastCfg = (path: string) => ({ db_path: path, poll_interval_ms: 10 });
+
+/**
+ * What a collection that is NOT one record per call may hold. Deliberately far below
+ * {@link TOPICS}: nothing in the plugin is keyed by topic any more, so a ledger reintroduced here
+ * reds whatever cap is written beside it, instead of being admitted by one sized to fit it.
+ */
+const NOT_PER_TOPIC = 8;
 
 let open: SqlitePlugin[] = [];
 function tracked(): SqlitePlugin {
@@ -82,82 +88,10 @@ describe('no plugin state grows with the number of distinct topics a caller name
           expect(size, `${name} must hold one record per ${entry.name}() call`).toBe(TOPICS);
         } else {
           expect(size, `${name} grew with the number of distinct topics`).toBeLessThanOrEqual(
-            CATCHUP_LEDGER_MAX,
+            NOT_PER_TOPIC,
           );
         }
       }
     });
   }
-});
-
-/**
- * The bound costs something, and this is exactly what: the catch-up→live hand-off point survives
- * for as long as the ledger holds the topic, and an evicted topic's `subscribe` samples the tail —
- * the same start point a topic catch-up never read gets, so the message posted in between is left
- * to core's next catch-up instead of being pushed. Both arms are pinned, so replacing the eviction
- * with a `clear()` (which satisfies the bound above perfectly) reds here.
- */
-describe('the catch-up hand-off survives until its topic is evicted', () => {
-  const T = asTopic('ctx');
-  const EVICTION = [
-    {
-      name: 'the ledger is exactly full',
-      others: CATCHUP_LEDGER_MAX - 1,
-      othersFirst: false,
-      pushed: ['between'],
-    },
-    {
-      name: 'one topic past full, this topic recorded first',
-      others: CATCHUP_LEDGER_MAX,
-      othersFirst: false,
-      pushed: [],
-    },
-    {
-      name: 'one topic past full, this topic recorded last',
-      others: CATCHUP_LEDGER_MAX,
-      othersFirst: true,
-      pushed: ['between'],
-    },
-  ];
-
-  for (const { name, others, othersFirst, pushed } of EVICTION) {
-    it(`${name}: subscribe pushes ${JSON.stringify(pushed)}`, async () => {
-      const p = tracked();
-      await p.connect(fastCfg(dbFile()));
-      const fetchOthers = async (): Promise<void> => {
-        for (let i = 0; i < others; i++) await p.fetchRecent({ topic: asTopic(`ctx-${i}`) });
-      };
-      await p.post(T, me, 'history');
-      if (othersFirst) await fetchOthers();
-      await p.fetchRecent({ topic: T });
-      await p.post(T, me, 'between');
-      if (!othersFirst) await fetchOthers();
-
-      const got: string[] = [];
-      await p.subscribe(T, (m) => got.push(m.content));
-      await p.post(T, me, 'after');
-      await vi.waitFor(() => expect(got).toContain('after'), { timeout: 5000, interval: 5 });
-      expect(got).toEqual([...pushed, 'after']);
-    });
-  }
-
-  it('a topic whose hand-off keeps advancing outlives a flood of topics fetched once', async () => {
-    const p = tracked();
-    await p.connect(fastCfg(dbFile()));
-    await p.post(T, me, 'history');
-    await p.fetchRecent({ topic: T });
-    for (let i = 0; i < CATCHUP_LEDGER_MAX - 1; i++) {
-      await p.fetchRecent({ topic: asTopic(`ctx-${i}`) });
-    }
-    await p.post(T, me, 'read-again');
-    await p.fetchRecent({ topic: T });
-    await p.fetchRecent({ topic: asTopic('ctx-over') });
-    await p.post(T, me, 'between');
-
-    const got: string[] = [];
-    await p.subscribe(T, (m) => got.push(m.content));
-    await p.post(T, me, 'after');
-    await vi.waitFor(() => expect(got).toContain('after'), { timeout: 5000, interval: 5 });
-    expect(got).toEqual(['between', 'after']);
-  });
 });

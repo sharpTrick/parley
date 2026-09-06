@@ -17,8 +17,8 @@ import {
   INCREMENTAL_TIMELINE_LIMIT, MatrixTimeline, returnedTooFast, SYNC_IDLE_PACE_MS,
 } from './timeline.js';
 import {
-  adoptedString, type Boundary, eventToMessage, membershipLossOf, type MessageEvent, nextBatchOf,
-  positionBoundaryOf, positioningBatchOf, ROOM_START, syncFilterParam, type SyncResponse, TOPIC_KEY,
+  adoptedString, eventToMessage, membershipLossOf, type MessageEvent, nextBatchOf, positioningBatchOf,
+  syncFilterParam, type SyncResponse, TOPIC_KEY,
 } from './wire.js';
 
 export { sanitizeAlias } from './alias.js';
@@ -138,9 +138,8 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
     const generation = this.generation;
     const roomId = await this.ensureRoom(topic);
     if (this.isStale(generation)) return;
-    // The initial position asks for `timeline.limit: 1` — the newest event, never delivered, only
-    // the boundary `backfill` stops at; the loop uses a REAL limit so a burst that overflows the
-    // per-sync cap is reported via `limited`/`prev_batch` instead of being silently truncated.
+    // The initial position asks for `timeline.limit: 1`: nothing it carries is ever delivered, so
+    // the smallest legal snapshot is the cheapest way to reach a `next_batch`.
     const initParam = syncFilterParam(roomId, 1);
     const incParam = syncFilterParam(roomId, INCREMENTAL_TIMELINE_LIMIT);
 
@@ -151,11 +150,6 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
     });
     const positioned = (await initial.json()) as SyncResponse;
     let nextBatch = positioningBatchOf(positioned.next_batch);
-    // Keep this boundary read from the SAME response as `nextBatch`, so that a `limited`-burst
-    // {@link backfill} stops EXACTLY at the subscription position: a boundary read one round-trip
-    // later swallows everything that landed in between, and one read earlier pages back past the
-    // position into PRE-subscription history and leaks it as live events.
-    let boundary: Boundary | undefined = positionBoundaryOf(positioned, roomId);
     if (this.isStale(generation)) return;
 
     const loop = async (): Promise<void> => {
@@ -188,36 +182,12 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
           // once and then poll a dead topic in silence at full rate forever.
           if (lost !== undefined) throw membershipLost(roomId, lost);
           nextBatch = nextBatchOf(json.next_batch, nextBatch);
-          const timeline = json.rooms?.join?.[roomId]?.timeline;
-          const events = timeline?.events ?? [];
-          // The server truncated this sync's timeline to the filter cap; the omitted (older) events
-          // are reachable only by paging `prev_batch` backwards. Recover and deliver them ASCENDING
-          // before the new batch so no burst larger than the per-sync cap is silently dropped (the
-          // "handler fires once per inbound message" seam contract).
-          let recovered: MessageEvent[] = [];
-          if (
-            timeline?.limited === true &&
-            timeline.prev_batch !== undefined &&
-            boundary !== undefined
-          ) {
-            try {
-              recovered = await this.backfill(
-                roomId,
-                topic,
-                timeline.prev_batch,
-                boundary === ROOM_START ? undefined : boundary,
-                new Set(events.map((e) => e.event_id)),
-                generation,
-              );
-            } catch {
-              /* backfill is best-effort; anything missed stays reachable via fetchRecent catch-up */
-            }
-          }
-          // Keep this gate between the backfill and the delivery below, so that a teardown landing
-          // inside that round-trip cannot hand the handler a batch after `disconnect()` resolved.
-          if (this.isStale(generation)) break;
-          for (const e of [...recovered, ...events.filter((e) => this.belongs(e, topic))]) {
-            boundary = e.event_id;
+          const events = json.rooms?.join?.[roomId]?.timeline?.events ?? [];
+          // A burst wider than the per-sync cap arrives TRUNCATED, and the events the homeserver
+          // dropped from it are left to catch-up: push is a SUBSET of the post-subscribe tail
+          // (DESIGN §6). What this loop still owes is that every event it DOES carry goes out once,
+          // in timeline order, and that none of it predates the subscription.
+          for (const e of events.filter((e) => this.belongs(e, topic))) {
             this.deliver(topic, e, handler);
           }
           // Keep the reset here rather than beside the response, so that a `/sync` the loop THROWS

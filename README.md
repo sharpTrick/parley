@@ -182,7 +182,7 @@ The whole product is these six seam methods:
 interface BackendPlugin {
   connect(config): Promise<void>;
   disconnect(): Promise<void>;
-  subscribe(topic, handler): Promise<void>;                       // live path (push)
+  subscribe(topic, handler): Promise<void>;              // live path (push) — lossy, see below
   post(topic, identity, content, opts?): Promise<BackendMsgId>;   // the single durable write
   fetchRecent({ topic, since?, limit? }): Promise<{ messages, nextCursor }>; // catch-up
   resolveIdentity(handle): Promise<BackendIdentity>;
@@ -190,6 +190,8 @@ interface BackendPlugin {
 ```
 
 Two invariants make a backend correct: a stable, unique `backendMsgId` (the **dedup key** — how core throws away a message it has already seen) and a **monotonic** `cursor` (an opaque, ever-advancing per-topic position). Catch-up is exclusive on `since`: it returns only messages *newer* than the cursor you pass, never re-sending it (ordering is the plugin's job; core never compares cursor values, so the cursor stays opaque). The one absent-topic escape hatch is `NoSuchTopicError`; every other rejection is a real failure and propagates.
+
+The two paths owe different things, and this is deliberate. `fetchRecent` is **complete** — every message above `since` comes back, page by page. `subscribe` is **lossy**: what it delivers is a *subset* of the post-subscribe tail, in cursor order, never twice, never anything from before the subscribe; what it leaves out is returned by the next `fetchRecent`. That is what keeps a backend from having to rebuild its transport's own gaps client-side — a Matrix burst wider than the 100-event per-sync cap, or a SQLite row a peer commits during start-up, is left to catch-up rather than reconstructed by hand. A live path that delivers *nothing* is still non-conformant, and the shared suite grades both bounds.
 
 Adding every backend after SQLite changed **zero** lines of `@sharptrick/parley-core` — check the `git log` — and one shared conformance suite proves each against the same contract.
 
@@ -221,7 +223,7 @@ binary and a `backend_config` block, not a line of participant code.
 - **`live`** — exercised against real implementations in CI/dev: SQLite on a real on-disk file, real Redis/NATS binaries, live Synapse/Prosody homeservers, and Postgres 16 (SQLite, Redis, Matrix, NATS, XMPP, Postgres — 6 of 10).
 - **`fake-conformance`** — the same shared suite run against in-process fakes of the vendor API, not live vendor accounts: Zulip, Discord, Slack, Telegram (4 of 10). Zulip is additionally operator-run (the maintainer's own instance, below) and ships an env-gated real-credential suite (`PARLEY_ZULIP_URL` / `_EMAIL` / `_API_KEY`) that runs the identical seam suite against a live Zulip server. Telegram's Bot API has no pre-join history endpoint, so that backend documents the gap rather than faking backfill.
 
-Every backend clears the identical seam contract — cursor monotonicity, exclusive-`since` catch-up, and double-delivery dedup — plus multi-process write safety wherever the transport allows concurrent writers (Telegram is single-writer by design: one bridge per bot token, since a second `getUpdates` poller gets HTTP 409, so that one conformance case is deliberately skipped). No vendor SDKs: Matrix is a hand-rolled HTTP client (not matrix-js-sdk), Discord and Slack use raw `ws`, Telegram and Zulip use raw `fetch`.
+Every backend clears the identical seam contract — cursor monotonicity, exclusive-`since` catch-up, subset-but-never-duplicated live push, and double-delivery dedup — plus multi-process write safety wherever the transport allows concurrent writers (Telegram is single-writer by design: one bridge per bot token, since a second `getUpdates` poller gets HTTP 409, so that one conformance case is deliberately skipped). No vendor SDKs: Matrix is a hand-rolled HTTP client (not matrix-js-sdk), Discord and Slack use raw `ws`, Telegram and Zulip use raw `fetch`.
 
 ---
 
@@ -258,7 +260,8 @@ is no read primitive to park a budget on, so `fetchRecent` **fails fast**: it re
 page. That is the point of refusing rather than ignoring — an empty page is exactly what a long-poll
 that timed out looks like, so an agent handed one goes on polling in the belief that it is parked.
 Retry without `block_ms` and poll on your own cadence, or run under Claude Code with
-`live_push.enabled` and be pushed a `<channel>` event instead. The
+`live_push.enabled` and be pushed a `<channel>` event as well — push is a latency shortcut over
+catch-up, never a replacement for it. The
 [chat-hand-off skill](skills/chat-handoff/SKILL.md) shows both loops.
 
 The refusal lives entirely in the plugin: the seam carries `blockMs` and nothing else, so a backend

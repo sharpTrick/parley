@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asTopic, type Topic } from '../message.js';
+import { MAX_FETCH_LIMIT } from '../transport/tools.js';
 import { SeenSet, SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS } from './seen-set.js';
 
 const T = asTopic('t');
@@ -12,6 +13,22 @@ describe('SeenSet', () => {
     expect(s.firstSeen(T, id(1))).toBe(true);
     expect(s.firstSeen(T, id(1))).toBe(false);
     expect(s.firstSeen(T, id(2))).toBe(true);
+  });
+
+  /**
+   * The capacity, against the figure it is a budget for. Push delivers a subset of the tail and a
+   * reconciling `parley_fetch_recent` covers the rest, so the window has to hold one whole such
+   * page — `MAX_FETCH_LIMIT` ids — with room for the push traffic that lands beside it. A window
+   * shorter than a page means the oldest ids of a reconciling read are evicted by the read itself,
+   * and the push loop re-emits as `<channel>` events what the agent has just pulled.
+   */
+  it('holds several whole reconciling pages, so one read cannot flush its own oldest ids', () => {
+    expect(SEEN_MAX_PER_TOPIC).toBeGreaterThanOrEqual(4 * MAX_FETCH_LIMIT);
+    const s = new SeenSet();
+    for (let i = 0; i < MAX_FETCH_LIMIT; i++) s.markSeen(T, id(i));
+    // A whole further page of live traffic lands beside it, and the first id is still deduped.
+    for (let i = MAX_FETCH_LIMIT; i < 2 * MAX_FETCH_LIMIT; i++) s.firstSeen(T, id(i));
+    expect(s.has(T, id(0))).toBe(true);
   });
 
   it('dedup is per-topic (same id in different topics are independent)', () => {

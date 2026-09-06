@@ -1,24 +1,10 @@
 import {
-  asCursor, type Cursor, type Message, type MessageHandler, type Topic,
+  type Cursor, type Message, type Topic,
 } from '@sharptrick/parley-core';
 import type { ZulipConnection } from './connection.js';
 import {
   asArray, MAX_MESSAGES_PER_FETCH, pageAnchor, type ZulipMessage, zulipToMessage,
 } from './wire.js';
-
-/**
- * Messages a single gap-fill history read asks for. Exported so a test's dead-window sizes stay
- * derived from it and cannot stop straddling a page boundary if it changes.
- */
-export const GAP_FILL_PAGE = 500;
-
-/**
- * Records the pre-subscribe watermark probe reads. Keep it a WINDOW rather than a single record, so
- * that an unusable newest record cannot hide the topic's real tail: the probe would then have to
- * navigate past it by that record's own bad id, land nowhere, and read an empty topic — arming a
- * gap-fill that replays the entire history through the live handler.
- */
-export const TAIL_PROBE_PAGE = 100;
 
 /**
  * What a narrowed history read is bound to. Every read carries a generation, so that a paginated one
@@ -35,16 +21,10 @@ export interface ReadOpts {
  * ascending by id, so no client-side reordering is needed. Paginates so the seam's `limit` stays
  * honest: Zulip rejects `num_before + num_after > 5000` outright, so a larger caller limit is served
  * as successive pages rather than propagated as a 400.
- *
- * `sawRecords` reports whether the server showed any record AT ALL — which an empty message list
- * cannot tell you, because every record it showed may have been unusable. `navigable` reports WHY
- * the walk stopped: `true` when the window was filled or history ran out, `false` when no id the
- * page showed could name where to continue from. Keep the two apart, so that a caller replaying a
- * gap cannot read a walk that stopped dead as a gap that closed.
  */
 export async function readWindow(
   conn: ZulipConnection, topic: Topic, since: Cursor | undefined, limit: number, opts: ReadOpts,
-): Promise<{ messages: Message[]; sawRecords: boolean; navigable: boolean }> {
+): Promise<Message[]> {
   const signal = opts.signal;
   const narrow = JSON.stringify([
     { operator: 'stream', operand: conn.cfg.stream },
@@ -53,8 +33,6 @@ export async function readWindow(
   const backwards = since === undefined;
   const want = Math.max(0, limit);
   const out: Message[] = [];
-  let sawRecords = false;
-  let navigable = true;
   let widen = 0;
   let anchor = backwards ? 'newest' : String(since);
   let includeAnchor = backwards;
@@ -78,7 +56,6 @@ export async function readWindow(
     const res = await conn.rest.request('GET', '/api/v1/messages', { query, signal });
     const raw = asArray(((await res.json()) as { messages?: ZulipMessage[] } | null)?.messages);
     conn.assertGeneration(opts.generation);
-    sawRecords ||= raw.length > 0;
     const got: Message[] = []; // Zulip returns ascending by id
 
     let firstUsable = -1;
@@ -112,8 +89,7 @@ export async function readWindow(
     // for.
     if (raw.length < page) break;
     if (out.length >= want) break;
-    const stop = (): void => {
-      navigable = false;
+    const reportDeadEnd = (): void => {
       console.warn(
         `[parley-zulip] history read on topic ${JSON.stringify(topic)} stopped at anchor ` +
           `${anchor}: no record on the page it answered with carries an id that moves the read on, ` +
@@ -129,7 +105,7 @@ export async function readWindow(
     if (inward !== undefined) {
       const next = pageAnchor(Number(inward.backendMsgId), anchor, backwards);
       if (next === undefined) {
-        stop();
+        reportDeadEnd();
         break;
       }
       anchor = next;
@@ -141,60 +117,9 @@ export async function readWindow(
       // request either clears it or settles that nothing can.
       widen = MAX_MESSAGES_PER_FETCH;
     } else {
-      stop();
+      reportDeadEnd();
       break;
     }
   }
-  return { messages: out, sawRecords, navigable };
-}
-
-/**
- * The id the live path may treat as already delivered: the newest USABLE message on `topic`, `0`
- * when the server showed no record at all, and `undefined` when it showed only records carrying
- * no usable id — a tail that cannot be established, and so one nothing may be replayed from.
- */
-export async function probeTail(
-  conn: ZulipConnection, topic: Topic, opts: ReadOpts,
-): Promise<number | undefined> {
-  const { messages, sawRecords } = await readWindow(conn, topic, undefined, TAIL_PROBE_PAGE, opts);
-  const newest = messages.at(-1);
-  if (newest !== undefined) return Number(newest.backendMsgId);
-  return sawRecords ? undefined : 0;
-}
-
-/**
- * Replay everything after `sinceId` through `handler`; returns the new last delivered id.
- * `onProgress` is invoked with the last delivered id after EACH page lands, so a caller retrying
- * a throwing gap-fill can resume past already-delivered pages instead of re-delivering them (the
- * history read at the top of the loop may throw on any non-2xx/network blip — the caller retries).
- *
- * A walk that stopped because it could not navigate ({@link readWindow}'s `navigable`) THROWS
- * rather than returning. Keep it on the throwing path, so that a gap nothing can cross is retried
- * under the caller's backoff and stays reported, instead of a short page being read as a gap that
- * closed and everything behind the obstruction being dropped silently and never retried.
- */
-export async function gapFill(
-  conn: ZulipConnection, topic: Topic, sinceId: number,
-  deliver: MessageHandler, onProgress: (id: number) => void, opts: ReadOpts,
-): Promise<number> {
-  const page = GAP_FILL_PAGE;
-  let cursor = asCursor(String(sinceId));
-  for (;;) {
-    // May throw (non-2xx / network blip / teardown) → the caller retries from `onProgress`.
-    const { messages, navigable } = await readWindow(conn, topic, cursor, page, opts);
-    for (const m of messages) deliver(m);
-    const last = messages.at(-1);
-    if (last !== undefined) {
-      cursor = last.cursor; // advance so a retry resumes past this delivered page
-      onProgress(Number(cursor)); // report per-page progress — durable across a later throw
-    }
-    if (!navigable) {
-      throw new Error(
-        `gap-fill for topic ${JSON.stringify(topic)} cannot read past the page after cursor ` +
-          `${String(cursor)}: no record on it carries an id the read can continue from, so the ` +
-          'gap is not closed.',
-      );
-    }
-    if (last === undefined || messages.length < page) return Number(cursor);
-  }
+  return out;
 }

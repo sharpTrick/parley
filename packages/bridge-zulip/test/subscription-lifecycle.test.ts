@@ -381,7 +381,10 @@ describe('zulip releases every event queue it opens', () => {
   }
 
   it('the handshake routes are the ones subscribe() issues, and include the one that mints a queue', () => {
-    expect(HANDSHAKE_ROUTES.length).toBeGreaterThan(1);
+    // Not a COUNT: the handshake is one round trip today and was two before the pre-register tail
+    // probe went, so a figure here would pin the shape rather than the property. What has to hold is
+    // that the derivation found something and that the request which mints a queue is in it.
+    expect(HANDSHAKE_ROUTES).not.toEqual([]);
     expect(HANDSHAKE_ROUTES).toContain(REGISTER);
   });
 

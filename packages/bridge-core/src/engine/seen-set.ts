@@ -17,12 +17,16 @@ function requirePositiveInt(name: string, value: number): void {
 /**
  * Per-topic dedup set keyed on `backendMsgId` (DESIGN §6 — NEVER on timestamp).
  *
- * The same logical message can arrive twice: once via live push, once via `fetchRecent`
- * (a session that briefly dropped and reconnected). Core dedups on the stable backend id.
+ * The same logical message can arrive twice: once via live push, once via `fetchRecent`. That
+ * overlap is the NORMAL path, not an exception — push delivers a subset of the post-subscribe tail
+ * (seam.ts, clause 3) and a reconciling read is what covers the rest, so it routinely re-reads a
+ * region push has already served. Core dedups on the stable backend id.
  *
- * Bounded FIFO per topic so memory stays flat. The window only needs to cover the overlap
- * between a catch-up pull and the live poll — cursor monotonicity prevents re-fetching
- * ancient ids — so a few thousand ids per topic is ample.
+ * Bounded FIFO per topic so memory stays flat. What the window has to cover is one reconciling
+ * READ against the push traffic concurrent with it — the server-side page cap on
+ * `parley_fetch_recent` is the figure it is a budget against, and `seen-set.test.ts` grades the two
+ * together rather than restating either here. Cursor monotonicity keeps ancient ids from coming
+ * back at all.
  *
  * The NUMBER of topics is bounded too, LRU. A `post_topics` pattern leaves the topic space open and
  * `fetch_recent` warms a bucket for whatever topic it is handed, so an agent reading ad-hoc topics

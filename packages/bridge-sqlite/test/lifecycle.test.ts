@@ -5,7 +5,7 @@ import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openDriver, type SqlDriver } from '../src/driver.js';
 import { POLL_BATCH, SqlitePlugin } from '../src/index.js';
-import { SCHEMA } from '../src/schema.js';
+import { SCHEMA, SQL } from '../src/schema.js';
 import { type ExpectedHealth, expectHealth } from './health.js';
 
 /**
@@ -305,9 +305,15 @@ describe('a connect() that fails after opening the store leaves nothing behind',
   /**
    * One row per call `connect()` makes against the driver, so a step added to `connect()` later is
    * covered without a new row — and the count is pinned, so adding one past the end of this table
-   * fails here rather than shipping ungraded.
+   * fails here rather than shipping ungraded. The prepare half is DERIVED from {@link SQL}: a
+   * statement added or dropped moves the table with the code, rather than reddening a hand-kept
+   * figure that says nothing about which step changed.
    */
-  const FAULT_POSITIONS = Array.from({ length: 12 }, (_unused, i) => i + 1);
+  const NON_PREPARE_DRIVER_CALLS = 5;
+  const FAULT_POSITIONS = Array.from(
+    { length: Object.keys(SQL).length + NON_PREPARE_DRIVER_CALLS },
+    (_unused, i) => i + 1,
+  );
 
   it(`connect() makes exactly ${FAULT_POSITIONS.length} driver calls, one per row below`, async () => {
     const p = tracked();

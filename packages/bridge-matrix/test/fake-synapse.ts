@@ -112,14 +112,8 @@ export class FakeSynapse {
   private removedAt?: number;
   /** How many events an incremental /sync will return before it truncates with `limited:true`. */
   syncCap = 100;
-  /** Number of `limited:true` incremental syncs emitted — proves the backfill path was exercised. */
+  /** Number of `limited:true` incremental syncs emitted — proves a truncated sync really occurred. */
   limitedEmitted = 0;
-  /**
-   * By how many events a `limited` sync's `prev_batch` overlaps the batch it returned. Keep the
-   * non-zero settings exercised, so that the backfill's de-duplication guard stays reachable at all:
-   * Synapse's own `prev_batch` is exclusive, and a suite modelling only Synapse can never fire it.
-   */
-  prevBatchOverlap = 0;
   /** False → `/directory/room/<alias>` 404s, forcing `POST /createRoom` (provisioning path). */
   aliasExists = true;
   /**
@@ -222,15 +216,8 @@ export class FakeSynapse {
    */
   afterPositioningSync: (ordinal: number) => void = () => undefined;
   /**
-   * Called with each `/messages` request AFTER its response body has been computed and BEFORE that
-   * body is returned; the returned ms hold the response in flight. Lets a case land an event in the
-   * window where a reader has already snapshotted its (empty) result — the lost-wakeup shape — or
-   * stall one specific read (the `limited`-burst backfill) without touching the others.
-   */
-  holdMessages: (url: URL, body: { chunk: Ev[] }) => number = () => 0;
-  /**
    * Called with each INCREMENTAL `/sync` request BEFORE its body is computed; the returned ms hold
-   * the response in flight. The sibling of {@link holdMessages} and {@link stallPositioning} for the
+   * the response in flight. The sibling of {@link stallPositioning} for the
    * await a subscribe loop spends most of its life in. Keep it ahead of the body, so that a case can
    * land the batch that very sync will carry from inside the hook instead of racing the loop's
    * cadence — a seed written between polls is served by whichever sync happens to be on the wire.
@@ -525,8 +512,6 @@ export class FakeSynapse {
         const start = Math.max(0, b - limit);
         return { chunk: timeline.slice(start, b).reverse(), start: `p${b}`, end: `p${start}` };
       })();
-      const hold = this.holdMessages(url, body);
-      if (hold > 0) await new Promise((r) => setTimeout(r, hold));
       return jsonRes(body);
     }
 
@@ -641,8 +626,8 @@ export class FakeSynapse {
         });
       }
       // Burst larger than the effective per-sync cap: return only the newest `cap`, mark `limited`,
-      // and expose a `prev_batch` that paginates BACKWARD over the omitted (older) events —
-      // re-including `prevBatchOverlap` of the batch's own oldest events.
+      // and expose a `prev_batch` that paginates BACKWARD over the omitted (older) events, as
+      // Synapse's exclusive one does.
       this.limitedEmitted++;
       const startIdx = len - cap;
       return joined({
@@ -653,7 +638,7 @@ export class FakeSynapse {
               timeline: {
                 events: timeline.slice(startIdx, len),
                 limited: true,
-                prev_batch: `p${Math.min(startIdx + this.prevBatchOverlap, len)}`,
+                prev_batch: `p${startIdx}`,
               },
             },
           },

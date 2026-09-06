@@ -201,24 +201,18 @@ describe('a foreign block moves this topic cursor only when it fills a page', ()
 });
 
 /**
- * Two CLASSES over one table.
+ * CLASS: a live-path boundary established at a DIFFERENT INSTANT than the subscription position.
+ * A homeserver truncates any `/sync` timeline to the filter cap and flags it `limited`, so a burst
+ * wider than the cap arrives with its older events missing. Push is a SUBSET of the post-subscribe
+ * tail (DESIGN §6), so those events are a gap catch-up closes — but the events the sync DOES carry
+ * must still be exactly post-position, once, ascending: a loop that positioned itself late drops
+ * what landed in between, and one that positioned early replays PRE-subscription history as live
+ * events. `WHEN_EVENTS_LAND` puts a burst on each side of that instant, and every row is seeded with
+ * pre-subscription history so both directions are graded at once.
  *
- *  1. A de-duplication guard whose triggering condition the fake cannot construct. Recovering a
- *     `limited` burst pages backwards from `prev_batch`, and whether that token re-includes the batch
- *     it arrived with is not pinned by the spec — Synapse's is exclusive, so the plugin's `skip` set
- *     never fires against it and could be deleted with the suite green. Sweeping the overlap makes
- *     the boundary itself an axis.
- *  2. A live-path recovery boundary established at a DIFFERENT INSTANT than the subscription
- *     position. The backward recovery stops at "the last event already delivered", and that boundary
- *     has to be the subscription position exactly: read one round-trip LATER and everything that
- *     landed in between is graded as already-delivered and silently dropped; read EARLIER (or not at
- *     all) and the recovery pages back past the position and replays PRE-subscription history as
- *     live events. `WHEN_EVENTS_LAND` puts a burst on each side of that instant, and every row is
- *     seeded with pre-subscription history so both directions are graded at once.
- *
- * Every cell must deliver EXACTLY the post-position events, once, ascending.
+ * Both halves are graded per cell: a non-empty subsequence of the post-position events on the live
+ * path, and the WHOLE of them from a cursor taken before the subscribe.
  */
-const PREV_BATCH_OVERLAPS = [0, 1, 2];
 const SYNC_CAPS = [1, 2, 3];
 const BURST = 5;
 /** On-topic history that exists BEFORE subscribe — never live, in either room mode. */
@@ -248,61 +242,67 @@ const WHEN_EVENTS_LAND: Record<
   },
 };
 
-describe('subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {
+/** Ascending, once, and drawn only from `expected` — the subset the relaxed contract permits. */
+const expectSubsequence = (got: string[], expected: string[]): void => {
+  expect(got).toEqual(expected.filter((c) => got.includes(c)));
+  expect(got.length, 'the live path delivered nothing at all').toBeGreaterThan(0);
+};
+
+describe('a burst wider than the per-sync cap is a subset on push and whole on catch-up', () => {
   for (const [whenName, when] of Object.entries(WHEN_EVENTS_LAND)) {
-    for (const overlap of PREV_BATCH_OVERLAPS) {
-      for (const syncCap of SYNC_CAPS) {
-        it(`prev_batch overlaps by ${overlap} / per-sync cap ${syncCap} / events land ${whenName}: exactly the post-position events, once`, async () => {
-          const f = install();
-          f.syncCap = syncCap; // truncates any incremental sync → forces limited:true
-          f.prevBatchOverlap = overlap;
-          const p = await connect(false); // per-topic room
-          const T = asTopic('burst');
-          const writer = asHandle('w');
-          for (const c of PRE_HISTORY) await p.post(T, writer, c);
+    for (const syncCap of SYNC_CAPS) {
+      it(`per-sync cap ${syncCap} / events land ${whenName}: post-position events only, once`, async () => {
+        const f = install();
+        f.syncCap = syncCap; // truncates any incremental sync → forces limited:true
+        const p = await connect(false); // per-topic room
+        const T = asTopic('burst');
+        const writer = asHandle('w');
+        for (const c of PRE_HISTORY) await p.post(T, writer, c);
+        const beforeSubscribe = (await p.fetchRecent({ topic: T, limit: 100 })).nextCursor;
 
-          const got: string[] = [];
-          const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
-          await p.subscribe(T, (m) => got.push(m.content));
+        const got: string[] = [];
+        const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
+        await p.subscribe(T, (m) => got.push(m.content));
 
-          // While the loop is between polls, the rest of the burst lands at once (> syncCap →
-          // truncated), so recovery through `prev_batch` is the only way any of it is delivered.
-          const burst = Array.from({ length: BURST }, (_, i) => `m${i}`);
-          for (const c of burst) f.addMessage(String(T), c);
-          const expected = [...when.landed, ...burst];
+        // While the loop is between polls, the rest of the burst lands at once (> syncCap → the
+        // sync that carries it is truncated).
+        const burst = Array.from({ length: BURST }, (_, i) => `m${i}`);
+        for (const c of burst) f.addMessage(String(T), c);
+        const expected = [...when.landed, ...burst];
 
-          await vi.waitFor(() => expect(got.length).toBeGreaterThanOrEqual(expected.length), {
-            timeout: 4000,
-            interval: 10,
-          });
-          // Keep this settle, so that a DUPLICATE arriving one poll later fails the row instead of
-          // landing after the assertion read it.
-          await new Promise((r) => setTimeout(r, 150));
-
-          expect(fired()).toBe(true);
-          expect(got).toEqual(expected); // ascending, complete, in order, no duplicate, no history
-          expect(f.limitedEmitted).toBeGreaterThan(0); // the truncation/backfill path actually ran
-          await p.disconnect();
+        await vi.waitFor(() => expect(got.length).toBeGreaterThan(0), {
+          timeout: 4000,
+          interval: 10,
         });
-      }
+        // Keep this settle, so that a DUPLICATE arriving one poll later fails the row instead of
+        // landing after the assertion read it.
+        await new Promise((r) => setTimeout(r, 300));
+
+        expect(fired()).toBe(true);
+        expect(f.limitedEmitted).toBeGreaterThan(0); // the truncation really happened
+        expectSubsequence(got, expected);
+        const page = await p.fetchRecent({ topic: T, since: beforeSubscribe, limit: 100 });
+        expect(page.messages.map((m) => m.content)).toEqual(expected);
+        await p.disconnect();
+      });
     }
   }
 
   /**
-   * The same boundary in `shared_room` mode, where the pre-subscription history the recovery must
-   * not page into is mostly ANOTHER topic's — the case in which a boundary derived from this topic's
+   * The same boundary in `shared_room` mode, where the pre-subscription history the live path must
+   * not replay is mostly ANOTHER topic's — the case in which a boundary derived from this topic's
    * own messages does not exist at all.
    */
   for (const [whenName, when] of Object.entries(WHEN_EVENTS_LAND)) {
     it(`shared_room / events land ${whenName}: foreign pre-history is never replayed as live`, async () => {
       const f = install();
       f.syncCap = 2;
-      f.prevBatchOverlap = 1;
       const p = await connect(true);
       const T = asTopic('burst');
       const writer = asHandle('w');
       for (const c of PRE_HISTORY) await p.post(asTopic('someone-else'), writer, c);
       await p.post(T, writer, 'mine-before-subscribe');
+      const beforeSubscribe = (await p.fetchRecent({ topic: T, limit: 100 })).nextCursor;
 
       const got: string[] = [];
       const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
@@ -312,15 +312,14 @@ describe('subscribe recovers a burst larger than the per-sync cap via prev_batch
       for (const c of burst) f.addMessage(String(T), c);
       const expected = [...when.landed, ...burst];
 
-      await vi.waitFor(() => expect(got.length).toBeGreaterThanOrEqual(expected.length), {
-        timeout: 4000,
-        interval: 10,
-      });
-      await new Promise((r) => setTimeout(r, 150));
+      await vi.waitFor(() => expect(got.length).toBeGreaterThan(0), { timeout: 4000, interval: 10 });
+      await new Promise((r) => setTimeout(r, 300));
 
       expect(fired()).toBe(true);
-      expect(got).toEqual(expected);
       expect(f.limitedEmitted).toBeGreaterThan(0);
+      expectSubsequence(got, expected);
+      const page = await p.fetchRecent({ topic: T, since: beforeSubscribe, limit: 100 });
+      expect(page.messages.map((m) => m.content)).toEqual(expected);
       await p.disconnect();
     });
   }

@@ -25,6 +25,7 @@ import {
   OVERSHOOT_MULTIPLE,
   PARK_FRACTION,
   PROBE_MAX_BLOCK_MS,
+  QUIET_POSTS,
   RACE_BLOCK_MS,
   REFUSAL_RETURN_MS,
   SINCELESS_BLOCK_MS,
@@ -611,13 +612,34 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   {
     name: 'a subscribe that replays history as live',
     mutates: 'subscribe',
-    mustFail: 'exactly the post-subscribe tail',
+    mustFail: 'only the post-subscribe tail',
     make: () =>
       wrap((inner) => ({
         subscribe: async (topic, handler) => {
           const past = await inner.fetchRecent({ topic, limit: 10_000 });
           for (const m of past.messages) handler(m);
           await inner.subscribe(topic, handler);
+        },
+      })),
+  },
+  {
+    // The other side of the same clause, and the one the relaxation opened. `only the
+    // post-subscribe tail` admits any SUBSET of that tail, and an empty delivery is a subset of
+    // every tail — so a live path that serves a few messages and then goes silent passes it, and so
+    // does one that registers no listener at all. This one is a poll loop that dies: it serves what
+    // every OTHER live case sends into a topic and stops one message short of the quiet floor, so
+    // only that floor can see it. Derived from {@link QUIET_POSTS}, so a floor that shortens takes
+    // this control with it rather than leaving one that fires nowhere.
+    name: 'a live path that goes silent after the first few messages',
+    mutates: 'subscribe',
+    mustFail: 'does not fall behind a quiet topic',
+    make: () =>
+      wrap((inner) => ({
+        subscribe: (topic, handler) => {
+          let delivered = 0;
+          return inner.subscribe(topic, (m) => {
+            if (delivered++ < QUIET_POSTS - 1) handler(m);
+          });
         },
       })),
   },

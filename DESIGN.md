@@ -37,8 +37,9 @@ them.
 
 1. **Two delivery paths, by design.**
    - *Live push* uses Claude Code's native **`claude/channel`** capability (`--channels`).
-     It only reaches **already-running** sessions and retains **no history** — anything
-     sent while a session is down is not delivered by this path.
+     It only reaches **already-running** sessions, retains **no history**, and is **lossy by
+     contract** (§6) — anything sent while a session is down is not delivered by this path, and
+     neither is anything a backend's delivery window could not cover while it was up.
    - *Catch-up* uses **standard MCP tools** backed by the messaging backend's own
      persistence. This is the durable path.
    - The backend — not the channel — is the source of truth and memory.
@@ -114,9 +115,10 @@ interface BackendPlugin {
   connect(config: BackendConfig): Promise<void>;
   disconnect(): Promise<void>;
 
-  // 2. Register interest in a topic; handler fires per inbound message (live path).
-  //    The plugin decides HOW handler is driven (poll loop / blocking event source);
-  //    core decides WHAT happens (emit <channel> event). See §9.
+  // 2. Register interest in a topic; handler fires at most once per inbound message that
+  //    arrives after the call, for a SUBSET of them (live path — see §6). The plugin decides
+  //    HOW handler is driven (poll loop / blocking event source); core decides WHAT happens
+  //    (emit <channel> event). See §9.
   subscribe(topic: Topic, handler: (msg: Message) => void): Promise<void>;
 
   // 3. Write a message to a topic as a given identity. Single centralized write path.
@@ -154,7 +156,8 @@ interface BackendPlugin {
   as their own `Topic` where a backend supports them — that is the plugin's business.
 - A **handle does not imply an account.** Matrix/XMPP back it with a provisioned user/JID;
   NATS/local treat it as a name convention. The plugin decides.
-- `subscribe` drives the live path (push). `fetchRecent` drives catch-up. `post` serves
+- `subscribe` drives the live path (push). `fetchRecent` drives catch-up — and is the path that
+  RECONCILES what push left out (§6), not merely the one that covers downtime. `post` serves
   replies/output for both, and is the single place write-notifications are emitted.
 
 ---
@@ -183,8 +186,26 @@ timestamp** (clock skew and equal-timestamp ties make timestamps unsafe).
 
 ## 6. Cursor: dedup & ordering (baked into the seam)
 
-The same logical message can arrive twice — once via live push, once via `fetchRecent`
-(e.g. a session that briefly dropped and reconnected). To make this deterministic:
+The two paths carry different obligations. `fetchRecent` is **complete**: every message above
+`since` comes back, page by page. `subscribe` is **lossy**: what it delivers is a **subset** of the
+post-subscribe tail — in cursor order, never twice, never anything from before the subscribe — and
+what it leaves out is returned by the next `fetchRecent`. A backend whose delivery window cannot
+cover a burst is conformant; one whose live path delivers nothing at all is not, and the shared
+suite grades both bounds (`only the post-subscribe tail`, and `does not fall behind a quiet topic`).
+
+Two consequences a deployment feels, both measured:
+
+- **SQLite.** `subscribe` starts at the topic's tail as it stands when it is called. Core runs
+  catch-up to completion and arms the live loop afterwards, so in a **multi-writer** deployment a
+  row a peer commits in that start-up window is delivered by neither path until the agent's next
+  `parley_fetch_recent` resuming from its own cursor. That promise is weaker here than elsewhere:
+  the `parley_fetch_recent` tool does **not** persist the cursor it hands back, so an agent that
+  does not carry it forward re-reads the window rather than moving past it.
+- **Matrix.** A `/sync` timeline is truncated to the per-sync cap (100 events); a burst wider than
+  that arrives with its older events missing, and they stay dark until the next catch-up.
+
+The same logical message can still arrive twice — once via live push, once via `fetchRecent`, which
+is now the ORDINARY path rather than a reconnect edge case. To make this deterministic:
 
 - Every backend MUST expose a **monotonic position per topic**, surfaced as `cursor` on each
   Message and as `nextCursor` from `fetchRecent`.
@@ -229,9 +250,9 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   written to the **backend** via `post` so it lives in durable history for the next
   catch-up. Rule: *replies always write to the backend; the live channel is only the fast
   hop.* Otherwise the instance's own messages vanish on restart.
-- **Live-push filtering.** The live path forwards **all** messages in subscribed topics;
-  handle-mention is a **filter flag**, not a separate subscription. Filtering lives in one
-  place in `bridge-core`.
+- **Live-push filtering.** The live path forwards every message it receives in subscribed topics
+  (which is a subset of them — §6); handle-mention is a **filter flag**, not a separate
+  subscription. Filtering lives in one place in `bridge-core`.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
 
@@ -296,7 +317,8 @@ dumb and dependency-free: poll, reconcile via cursor, done.
   drives `subscribe` from a real blocking event source (`XREAD BLOCK`). That milestone
   inherits the job of proving the push path works against genuine events, not a timer.
 - Poll interval (e.g. 500ms–2s) is a latency/cost knob on the SQLite plugin with **no
-  correctness impact** — the cursor guarantees nothing is missed regardless of cadence.
+  correctness impact** — the cursor guarantees a poll tick misses nothing, whatever the cadence.
+  What push does not cover is the start-up window above, and catch-up is what closes that.
 - **Multi-process** (N sessions → N bridges on one host, §10) is safe with SQLite **WAL mode**
   (already specified) plus a busy-timeout/retry so simultaneous `post`s from different
   instances don't error. With UDS gone, that concurrent-write handling is the *only*

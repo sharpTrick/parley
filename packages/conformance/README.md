@@ -28,7 +28,14 @@ them stops owning a case — a conformance clause used to be deletable with noth
 - every delivered `Message` is well-formed: real `topic`, non-empty `senderHandle`, and `mentions`
   matching `parseMentions(content)` (core's push loop filters on it);
 - the same message has an identical `backendMsgId`/`cursor` via live push and via catch-up, and
-  `subscribe` delivers exactly the post-subscribe tail, once, in cursor order;
+  `subscribe` delivers only the post-subscribe tail, in cursor order, never twice. Push is
+  explicitly **lossy**: what it delivers is a *subset* of that tail, and what it left out is
+  returned by the next catch-up. Replaying history as if it were live is a superset, and stays
+  forbidden;
+- a live subscriber does not fall behind a quiet topic — the floor under the subset above. A
+  message a delivery window cannot cover is a burst; a topic written one message at a time, each
+  delivered before the next is sent, loses nothing. Without this clause an empty delivery satisfies
+  the subset above, and a plugin whose `subscribe` registers no listener at all is certified;
 - `subscribe` delivers a message **written by an independent client** — not only the subscriber's
   own writes. This is the case Parley exists for (a human posts in chat, an agent must receive it),
   and a plugin whose live path registers no server-side listener and merely echoes its own `post`
