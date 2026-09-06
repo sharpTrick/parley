@@ -181,15 +181,18 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
           // `/sync`, which is indistinguishable from an idle one, and the ladder below would report
           // once and then poll a dead topic in silence at full rate forever.
           if (lost !== undefined) throw membershipLost(roomId, lost);
-          nextBatch = nextBatchOf(json.next_batch, nextBatch);
           const events = json.rooms?.join?.[roomId]?.timeline?.events ?? [];
+          const mine = events.filter((e) => this.belongs(e, topic));
+          // Keep the token advance AHEAD of every delivery, so that a `/sync` this loop cannot
+          // resume past is thrown on before its events reach a handler rather than after: past that
+          // point the retry re-reads the same delta, and a second delivery is one the contract
+          // forbids outright.
+          nextBatch = nextBatchOf(json.next_batch, nextBatch, events.length);
           // A burst wider than the per-sync cap arrives TRUNCATED, and the events the homeserver
           // dropped from it are left to catch-up: push is a SUBSET of the post-subscribe tail
           // (DESIGN §6). What this loop still owes is that every event it DOES carry goes out once,
           // in timeline order, and that none of it predates the subscription.
-          for (const e of events.filter((e) => this.belongs(e, topic))) {
-            this.deliver(topic, e, handler);
-          }
+          for (const e of mine) this.deliver(topic, e, handler);
           // Keep the reset here rather than beside the response, so that a `/sync` the loop THROWS
           // on while reading — a malformed-but-parseable body — still counts as a consecutive
           // failure: reset early it stays pinned at 1, and a homeserver answering that shape forever

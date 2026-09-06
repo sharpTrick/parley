@@ -7,7 +7,7 @@ import type { ConformanceContext } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { afterEach, vi } from 'vitest';
+import { afterEach, expect, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
 import { type FakeZulip, SERVER_CONSTRAINTS, startFakeZulip } from './fake-zulip.js';
 
@@ -126,11 +126,18 @@ export function useZulip(): Boot {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    const unexercised: string[] = [];
     for (const { plugin, fake } of open) {
       await plugin.disconnect().catch(() => undefined);
+      unexercised.push(...fake.armedButNeverServed());
       await fake.close();
     }
     open = [];
+    expect(
+      unexercised,
+      'this case armed a server fault on a route no request ever reached, so it exercised exactly ' +
+        'the same path as an unarmed run while reading in the report as coverage',
+    ).toEqual([]);
   });
 
   return async (opts, config) => {

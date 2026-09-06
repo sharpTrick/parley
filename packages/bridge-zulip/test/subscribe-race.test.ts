@@ -7,7 +7,6 @@
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { MAX_MESSAGES_PER_FETCH } from '../src/wire.js';
 import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
@@ -52,47 +51,36 @@ describe('zulip subscribe handshake windows', () => {
 });
 
 /**
- * CLASS: a record the read cannot use is not the end of history, and it is not a live event either.
- * A history read is the only thing that meets one now, so it must neither be replayed through the
- * live handler nor mistaken for an empty topic. The table crosses every unusable shape the newest
- * record can arrive in with the history behind it, including a whole server page of them.
+ * `subscribe` reads no history at all: it registers a narrowed queue and resumes from the
+ * `last_event_id` that registration hands back. So nothing BEHIND the subscription can reach the
+ * live handler, and the shapes of the records back there cannot change that — which is why the
+ * table that used to cross four unusable `id` shapes against four history depths (one of them a
+ * whole server page, 5001 records) measured the same path sixteen times, at the cost of its own
+ * settle each. The `id` shapes are graded where a record can actually reach the plugin: through a
+ * live queue in `untrusted-payload.test.ts`, on the fake's own wire in `fixture-hygiene.test.ts`,
+ * and on the record→Message path in `units.test.ts`.
+ *
+ * What is left is the property itself, over a topic that really does hold history — including a
+ * record the read paths would refuse — so the case still fails if `subscribe` ever starts reading
+ * back.
  */
 describe('zulip subscribe never replays history, whatever the records behind it look like', () => {
-  /**
-   * Shapes of `id` that make a record unusable — it is both the dedup key and the cursor. Only the
-   * shapes a server can ORDER are here: an id that is not a comparable number lands in no read
-   * window at all, and it is graded on the push path instead (untrusted-payload.test.ts drives every
-   * hazard shape through a live queue).
-   */
-  const UNUSABLE_IDS: Array<{ name: string; value: unknown }> = [
-    { name: 'zero', value: 0 },
-    { name: 'negative', value: -1 },
-    { name: 'fractional', value: 1.5 },
-    { name: 'past the safe-integer range', value: 1e18 },
-  ];
-  /** Straddles a server page, so a replay would also have to paginate to be complete. */
-  const HISTORIES = [0, 1, 3, MAX_MESSAGES_PER_FETCH + 1];
+  it('delivers only the post-subscribe tail past history ending in an unusable record', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`watermark-${rand()}`);
+    for (let i = 0; i < 3; i++) fake.injectMessage({ topic, content: `h${i}` });
+    fake.injectRaw({ topic, fields: { id: 0 } });
 
-  for (const shape of UNUSABLE_IDS) {
-    for (const history of HISTORIES) {
-      it(`delivers only the post-subscribe tail past a newest record whose id is ${shape.name}, over ${history} message(s) of history`, async () => {
-        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-        const { plugin, fake } = await boot();
-        const topic = asTopic(`watermark-${rand()}`);
-        for (let i = 0; i < history; i++) fake.injectMessage({ topic, content: `h${i}` });
-        fake.injectRaw({ topic, fields: { id: shape.value } });
+    const got: Message[] = [];
+    await plugin.subscribe(topic, (m) => got.push(m));
+    await plugin.post(topic, SENDER, 'after');
 
-        const got: Message[] = [];
-        await plugin.subscribe(topic, (m) => got.push(m));
-        await plugin.post(topic, SENDER, 'after');
-
-        await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(['after']), {
-          timeout: 5000,
-          interval: 10,
-        });
-        await sleep(400);
-        expect(got.map((m) => m.content)).toEqual(['after']);
-      }, 30_000);
-    }
-  }
+    await vi.waitFor(() => expect(got.map((m) => m.content)).toEqual(['after']), {
+      timeout: 5000,
+      interval: 10,
+    });
+    await sleep(400);
+    expect(got.map((m) => m.content)).toEqual(['after']);
+  }, 30_000);
 });

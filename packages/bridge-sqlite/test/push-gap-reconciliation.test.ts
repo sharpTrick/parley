@@ -66,6 +66,10 @@ const contents = (page: { messages: readonly { content: string }[] }): string[] 
  * sizes above it as well.
  */
 const WINDOW_SIZES = [0, 1, 5];
+
+/** Live loops run at once, and rows written under each after they are all open. */
+const SUBSCRIPTIONS = 3;
+const LIVE_ROUNDS = 4;
 const HISTORIES = [
   { name: 'a fresh topic', rows: 0, limit: 100 },
   { name: 'a topic with history', rows: 3, limit: 100 },
@@ -137,26 +141,52 @@ describe('the start-up window is dark on push and reconciled by the next catch-u
   });
 
   /**
-   * The tail is sampled per topic, at the moment of the call: reading or subscribing one topic must
-   * not move where another starts, or a quiet topic's loop resumes at a rowid a busy one minted and
-   * delivers nothing for as long as it takes the quiet one to catch up.
+   * The start point belongs to the SUBSCRIPTION, not to the store and not to the topic. Its
+   * predecessor asserted "per topic, not per store" — which nothing can observe, because a rowid
+   * only rises: a start point taken from the store's tail still sits below every row the topic will
+   * later receive, so the whole package stayed green with the store-global spelling in place. What
+   * IS observable is what a start point is FOR. Several live loops run at once in any real
+   * deployment, and one that shares its position with another hands each subscriber half the
+   * stream — a live path that looks alive from every angle and drops rows an agent is waiting on.
    */
-  it('the start point is per topic, not per store', async () => {
-    const path = join(dir(), 'p.db');
-    const reader = await connected(path);
-    const peer = await connected(path);
-    const other = asTopic('other');
+  it.each([
+    ['the same topic', true],
+    ['distinct topics', false],
+  ])(
+    'concurrent subscriptions over %s each receive the whole post-subscribe sequence',
+    async (_label, shared) => {
+      const path = join(dir(), 'p.db');
+      const reader = await connected(path);
+      const peer = await connected(path);
+      const topics = Array.from({ length: SUBSCRIPTIONS }, (_unused, i) =>
+        shared ? T : asTopic(`t${i}`),
+      );
+      // History under every subscription, so a loop that started at the store's tail — or replayed
+      // what was already there — is visible as well as one that shares a position.
+      for (const [i, t] of topics.entries()) {
+        for (const c of numbered(`history-${i}`, 5)) await peer.post(t, me, c);
+      }
 
-    await fill(peer, numbered('busy', 20));
-    const pushedOther: string[] = [];
-    await reader.subscribe(other, (m) => pushedOther.push(m.content));
-    await peer.post(other, me, 'other-after-subscribe');
+      const got: string[][] = topics.map(() => []);
+      for (const [i, t] of topics.entries()) {
+        await reader.subscribe(t, (m) => got[i]!.push(m.content));
+      }
 
-    await vi.waitFor(() => expect(pushedOther).toEqual(['other-after-subscribe']), {
-      timeout: 5000,
-      interval: 10,
-    });
-  });
+      // Interleaved across the subscriptions, so a position shared between two of them splits the
+      // stream rather than merely reordering one.
+      const owed: string[][] = topics.map(() => []);
+      for (let round = 0; round < LIVE_ROUNDS; round++) {
+        for (const [i, t] of topics.entries()) {
+          const content = `live-${i}-${round}`;
+          await peer.post(t, me, content);
+          if (shared) for (const each of owed) each.push(content);
+          else owed[i]!.push(content);
+        }
+      }
+
+      await vi.waitFor(() => expect(got).toEqual(owed), { timeout: 5000, interval: 10 });
+    },
+  );
 
   /**
    * A rowid names a row in ONE store. A start point carried across a reconnect onto a different (or

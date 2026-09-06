@@ -69,26 +69,6 @@ const PARK_POINTS: ParkPoint[] = [
     repair: ({ fake }) => fake.clearRouteFailures(),
     registerFails: true,
   },
-  {
-    name: 'a gap-fill in flight',
-    park: async ({ fake }, topic) => {
-      fake.holdResponse('GET /api/v1/messages', 400);
-      fake.gcQueues();
-      fake.injectMessage({ topic, content: 'in-the-gap' });
-      await sleep(300);
-    },
-    repair: ({ fake }) => fake.clearRouteFailures(),
-  },
-  {
-    name: 'the backoff between gap-fill retries',
-    park: async ({ fake }, topic) => {
-      fake.gcQueues();
-      fake.failMessagesReads(20);
-      fake.injectMessage({ topic, content: 'in-the-gap' });
-      await sleep(SETTLE_MS);
-    },
-    repair: ({ fake }) => fake.failMessagesReads(0),
-  },
 ];
 
 const TEARDOWNS = [

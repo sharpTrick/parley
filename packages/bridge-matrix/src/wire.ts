@@ -31,7 +31,7 @@ export interface SyncResponse {
   rooms?: {
     join?: Record<
       string,
-      { timeline?: { events?: MatrixEvent[]; limited?: boolean; prev_batch?: string } }
+      { timeline?: { events?: MatrixEvent[] } }
     >;
     leave?: Record<string, unknown>;
   };
@@ -95,15 +95,24 @@ export const syncFilterParam = (roomId: string, timelineLimit: number): string =
   );
 
 /**
- * The resume token a `/sync` response advances to. Keep a non-string a THROW rather than adopting or
- * ignoring it, so that a loop cannot resume from a token the homeserver will reject — or, on a
- * server whose tokens are ordinal, silently seek past unread events — and instead reports and backs
- * off from the last token that worked.
+ * The resume token an INCREMENTAL `/sync` advances to, given the token the request was made with and
+ * how many timeline events the answer carried. Keep an absent, empty, mistyped or UNADVANCED one a
+ * THROW, so that the loop cannot re-issue the `?since=` it has just been answered on: that
+ * re-requests the same delta, and this plugin holds no in-push dedup — the contract lets push DROP
+ * (DESIGN §6) and still forbids it to REPEAT, under the same `event_id` and the same cursor.
  */
-export const nextBatchOf = (raw: unknown, current: string): string => {
-  if (raw === undefined) return current;
-  if (typeof raw !== 'string') {
-    throw new Error(`/sync answered with a ${typeof raw} next_batch where a token was required`);
+export const nextBatchOf = (raw: unknown, current: string, carried: number): string => {
+  if (typeof raw !== 'string' || raw === '') {
+    throw new Error(
+      `/sync answered with next_batch ${JSON.stringify(raw) ?? typeof raw} where a resume token ` +
+        'was required',
+    );
+  }
+  if (carried > 0 && raw === current) {
+    throw new Error(
+      `/sync answered with the token it was given (${raw}) while carrying ${carried} timeline ` +
+        'event(s); resuming from it would re-read that delta and deliver it a second time',
+    );
   }
   return raw;
 };

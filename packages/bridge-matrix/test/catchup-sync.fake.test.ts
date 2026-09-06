@@ -19,7 +19,7 @@ import { connectFake, FakeSynapse } from './fake-synapse.js';
 /**
  * Matrix catch-up & sync correctness.
  *
- * These drive the ACTUAL plugin code (fetchRecent / subscribe / backfill) against the in-memory
+ * These drive the ACTUAL plugin code (fetchRecent / subscribe) against the in-memory
  * fake Synapse in `./fake-synapse.ts`. No live homeserver: the conformance suite
  * (`conformance.test.ts`) covers the live drive and is `describe.skip`'d when no Synapse answers.
  */

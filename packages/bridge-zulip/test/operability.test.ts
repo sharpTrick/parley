@@ -10,12 +10,17 @@ import { rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
 
+/** The one route a teardown with no live queue never issues. */
+const DELETE_QUEUE = 'DELETE /api/v1/events';
+
 /**
  * Every request the loop can issue. The bound below is asserted on ALL of them, not on the one the
- * failure is injected into: a recovery path that answers 200 (a re-register, a gap-fill read) is
- * exactly where an unpaced retry hides from a single-counter assertion.
+ * failure is injected into: the RECOVERY path that answers 200 — a re-register — is exactly where
+ * an unpaced retry hides from a single-counter assertion. `GET /api/v1/messages` is deliberately
+ * not here: the push loop cannot issue it (`readWindow` is reached from `fetchRecent` alone), so
+ * counting it would hold a third of this bound against a counter that is permanently zero.
  */
-const LOOP_ROUTES = ['POST /api/v1/register', 'GET /api/v1/events', 'GET /api/v1/messages'] as const;
+const LOOP_ROUTES = ['POST /api/v1/register', 'GET /api/v1/events'] as const;
 
 /**
  * Ways the push loop can stop making progress forever — none of them recoverable by retrying harder.
@@ -27,8 +32,8 @@ const LOOP_ROUTES = ['POST /api/v1/register', 'GET /api/v1/events', 'GET /api/v1
  * The PERSISTENT axis of the shared fault vocabulary supplies one row per shape (injected with no
  * `times`, so it never clears), because pacing is invisible to an injection that clears after one
  * request. The bespoke rows below it are the failures that are not a single wire shape at all: a
- * request nobody answers, and the RECOVERY paths — re-register and gap-fill — which are exactly
- * where an unpaced retry hides from a counter watching the route the fault was injected into.
+ * request nobody answers, and the RECOVERY path — the re-register — which is exactly where an
+ * unpaced retry hides from a counter watching the route the fault was injected into.
  */
 const PERMANENT_FAILURES: Array<{
   name: string;
@@ -113,6 +118,12 @@ describe('zulip disconnect completes in bounded time whatever the server does', 
           await plugin.subscribe(asTopic(`down-${i}-${rand()}`), () => undefined);
         }
         state.apply(fake);
+        if (liveQueues === 0) {
+          fake.allowUnservedFaults(
+            DELETE_QUEUE,
+            'no queue was ever registered, so teardown issues no DELETE for this state to fault',
+          );
+        }
 
         const started = Date.now();
         const outcome = await Promise.race([

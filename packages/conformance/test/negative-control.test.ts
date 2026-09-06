@@ -12,6 +12,14 @@ import {
   CALLER_BLOCK_FLOOR_FRACTION,
   CLAUSES,
   type ConformanceContext,
+  DELIVERY_MS,
+  livePayload,
+  LIVE_SUBSCRIPTIONS,
+  liveWriter,
+  QUIET_BACKLOG_ROWS,
+  QUIET_DELIVERY_MS,
+  QUIET_IDLE_MS,
+  QUIET_POSTS_MIN,
   STABILITY_CALLER_READS,
   STABILITY_DEEP_TOPIC_ROWS,
   STABILITY_LONG_BLOCK_MAX_MS,
@@ -27,6 +35,7 @@ import {
   ENUMERABLE_BUDGETS,
   BROKEN_SUITE_MARK,
   BROKEN_VARIANTS,
+  LIVE_DEATHS,
   MAX_BLAST_RADIUS,
   ReferencePlugin,
   SWITCH_AFTER_CALLS,
@@ -318,6 +327,79 @@ describe('every arm switch is reachable by the run built to catch it', () => {
       'this predicate is never true of a read the long run makes, so the variant built on it ' +
         'answers the whole suite honestly and proves nothing',
     ).toBe(true);
+  });
+});
+
+/**
+ * The live-death table's own reach, the same way the switch table's is graded. Each row stands for a
+ * threshold a live path can die at while answering every read the rest of the suite makes, and each
+ * is a figure set against the floor's own: a count above the depth that case draws, an age past the
+ * span it idles for, or a topic deeper than the backlog it seeds is a control that fires nowhere and
+ * reads in the report as coverage.
+ */
+describe('every way a live path can die is reached by the case built to catch it', () => {
+  /** A delivery the floor really makes, at a chosen depth — payload and writer drawn, as it draws them. */
+  const atDepth = (offered: number): Parameters<(typeof LIVE_DEATHS)[number]['drops']>[0] => ({
+    offered,
+    subscriptionAgeMs: 0,
+    topicRows: QUIET_BACKLOG_ROWS + offered,
+    content: livePayload(),
+    senderHandle: String(liveWriter()),
+  });
+
+  it.each(LIVE_DEATHS.map((d) => [d.when, d] as const))('%s is reached by that case', (_when, death) => {
+    // The last message the floor is GUARANTEED to send: at the shallowest depth it ever draws, on a
+    // subscription that has been held open across the idle span, over the backlog it seeds.
+    const nowhere = death.drops({
+      offered: QUIET_POSTS_MIN,
+      subscriptionAgeMs: QUIET_IDLE_MS,
+      topicRows: QUIET_BACKLOG_ROWS + QUIET_POSTS_MIN,
+      // DRAWN, not written out: the two vocabulary rows are only reachable while the floor's
+      // payloads and handles really are drawn, so this row grades the generator rather than a
+      // sample somebody typed here to make it pass.
+      content: livePayload(),
+      senderHandle: String(liveWriter()),
+    });
+    expect(
+      nowhere,
+      'this predicate is never true of a message the quiet-topic floor sends, so the control built ' +
+        'on it delivers the whole case honestly and proves nothing',
+    ).toBe(true);
+  });
+
+  /**
+   * The count row's far edge, stated as the arithmetic rather than as a habit. The floor offers
+   * `INDEPENDENT_WRITERS + depth` where the fixture has a second writer and `depth` alone where
+   * `concurrentPost` is `'unsupported'`, so `QUIET_POSTS_MIN` is the reach BOTH arms guarantee —
+   * and a control placed anywhere inside the drawn range would fire on a fraction of runs, which
+   * reads in the report as coverage on the runs it happens to catch.
+   */
+  it('the count rows sit inside the reach BOTH capability arms guarantee', () => {
+    const counting = LIVE_DEATHS.filter((d) => d.when.includes('message on a subscription'));
+    expect(counting.length).toBeGreaterThan(1);
+    for (const d of counting) {
+      expect(
+        d.drops(atDepth(QUIET_POSTS_MIN)),
+        'this count row only fires deeper than the floor is GUARANTEED to reach. Where ' +
+          "`concurrentPost` is 'unsupported' the floor's only writer is the subscriber, so what a " +
+          'run guarantees is the drawn depth alone — and a row placed inside the drawn range fires ' +
+          'on a fraction of runs, which reads as coverage on the runs it happens to catch',
+      ).toBe(true);
+    }
+  });
+
+  // A cap on SUBSCRIPTIONS is not a delivery predicate, so no row above can place it: what makes it
+  // reachable is the suite opening more of them than the cap admits.
+  it('the suite opens more live subscriptions than the control it stands up drops', () => {
+    expect(LIVE_SUBSCRIPTIONS).toBeGreaterThan(2);
+  });
+
+  // The latency control is the one row that does not drop, so no predicate above can place it: it
+  // has to arrive late enough to fail the bound and early enough that the suite is still waiting.
+  it('the late-delivery control lands between the bound it fails and the wait it must survive', () => {
+    const late = (QUIET_DELIVERY_MS + DELIVERY_MS) / 2;
+    expect(late).toBeGreaterThan(QUIET_DELIVERY_MS);
+    expect(late).toBeLessThan(DELIVERY_MS);
   });
 });
 

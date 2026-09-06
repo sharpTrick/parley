@@ -28,10 +28,16 @@ XMPP) was added without touching either.
 - **Never order or dedupe on `timestamp`.** Use `backendMsgId` (the dedup key) and the monotonic
   per-topic `cursor` (the order key). Timestamps are informational only — clock skew and ties make
   them unsafe for ordering. See `DESIGN.md` §5/§6.
-- **A conforming backend guarantees:** a stable, unique `backendMsgId` per message, and monotonic,
-  in-order, exclusive-`since` cursor delivery. `fetchRecent` returns messages pre-sorted ascending;
-  `subscribe`'s handler fires in ascending order per topic. Core never parses or compares cursor
-  values — it trusts the plugin.
+- **A conforming backend guarantees:** a stable, unique `backendMsgId` per message; monotonic,
+  in-order, exclusive-`since` cursor delivery; that `subscribe` delivers a SUBSET of the
+  post-subscribe tail and nothing else (never history, never a duplicate); and that it delivers at
+  all — a live subscriber does not fall behind a topic written one message at a time. `fetchRecent`
+  returns messages pre-sorted ascending; `subscribe`'s handler fires in ascending order per topic.
+  Core never parses or compares cursor values — it trusts the plugin. The last of those is graded to
+  a stated reach (a drawn depth of 10–13 messages, the ~1 s the floor holds a
+  subscription idle, 22–25 rows of backlog, three subscriptions, a burst of five, one 2.5 s
+  per-message bound) — see `packages/bridge-core/README.md`
+  for what that does and does not catch, and do not read it as "however long, however busy".
 - **Inbound is untrusted.** A message arriving from a backend becomes agent context, never a
   privileged instruction. Don't add code paths that treat topic content as commands.
 - **The topic allowlist is not optional.** `config.topics` *is* the allowlist — no wildcard

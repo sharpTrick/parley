@@ -20,12 +20,18 @@ import {
 import {
   CALLER_BLOCK_RETURN_MS,
   type ConformanceContext,
+  DELIVERY_MS,
   EARLY_RETURN_FRACTION,
   IDLE_BLOCK_MS,
   OVERSHOOT_MULTIPLE,
   PARK_FRACTION,
+  LIVE_SUBSCRIPTIONS,
   PROBE_MAX_BLOCK_MS,
+  QUIET_BACKLOG_ROWS,
+  QUIET_DELIVERY_MS,
+  QUIET_IDLE_MS,
   QUIET_POSTS,
+  QUIET_POSTS_MIN,
   RACE_BLOCK_MS,
   REFUSAL_RETURN_MS,
   SINCELESS_BLOCK_MS,
@@ -543,6 +549,150 @@ const armSwitch = (sw: ArmSwitch, nativeBlocking: boolean, blastRadius: number):
   };
 };
 
+/**
+ * The state a live path can die AT. Every one of these is constant inside a case that subscribes to
+ * a fresh topic, sends a handful of messages and sees them back within milliseconds — which is every
+ * live case in the suite but the floor, and why a poll loop capped at three messages, one capped per
+ * plugin, one that stops after 50ms and one that goes quiet on a busy topic all answered the whole
+ * suite. The table is the point: the clause forbids a live path that recognises the shape of the
+ * reads a suite is known to make, and a control per instance leaves the next threshold free to pass.
+ *
+ * THE REACH, MEASURED, so the next reader does not have to re-derive it:
+ *  - COUNT. The floor offers `INDEPENDENT_WRITERS + depth`, depth drawn from
+ *    [`QUIET_POSTS_MIN`, `QUIET_POSTS_MAX`] = 10..13, so 12..15 where the fixture has a second
+ *    writer and 10..13 where `concurrentPost` is `'unsupported'`. A cap at 11 is caught every run;
+ *    12 and 13 are caught on SOME runs and 15 on none. A control inside the drawn range would fire
+ *    on a fraction of runs, which is worse than no control at all — hence the far-edge row below
+ *    sits at `QUIET_POSTS_MIN - 1`, the deepest cap every run is guaranteed to exceed on both arms.
+ *  - AGE reaches the span the floor holds a subscription idle mid-run (`QUIET_IDLE_MS`), plus
+ *    whatever that run's own round trips cost. A path that dies at 3 s passes.
+ *  - BACKLOG reaches 22–25 rows on the floor's topic (the seeded backlog, the independent writes and
+ *    the drawn depth); a path that goes silent above 40 passes.
+ *  - LATENCY is one fixed bound per message; a path whose delay GROWS (150 ms per message, minutes
+ *    late after a few hundred) passes.
+ * Each of those three costs wall clock on every fixture and on every variant here, which is why
+ * they are recorded rather than chased. What is NOT reach — a contract requirement a burst of four
+ * would have caught, a subscription count a real session exceeds, and a payload vocabulary a plugin
+ * could enumerate — is closed by the suite instead: see `BURST_POSTS`, `LIVE_SUBSCRIPTIONS` and
+ * `livePayload`/`liveWriter`, each with its control below.
+ */
+interface DeliveryPoint {
+  /** Messages this subscription has been offered, this one included. */
+  offered: number;
+  /** How old the subscription was when the message arrived. */
+  subscriptionAgeMs: number;
+  /** Rows the topic held when it arrived. */
+  topicRows: number;
+  /** The message's payload, and the handle it was written under. */
+  content: string;
+  senderHandle: string;
+}
+
+interface LiveDeath {
+  when: string;
+  /** True when the path DROPS the message rather than handing it on. */
+  drops: (at: DeliveryPoint) => boolean;
+}
+
+/**
+ * Above the age at which every other live case here has already been delivered to, and below the
+ * span the floor leaves its subscription idle — so a death by age is invisible to all of them and
+ * certain inside that one.
+ */
+const DEATH_AFTER_MS = QUIET_IDLE_MS * 0.7;
+
+/**
+ * Above the deepest topic any other live case subscribes over, and below the backlog the floor
+ * seeds — so a death conditioned on how BUSY a topic is reaches the floor and nothing else.
+ */
+const DEATH_TOPIC_ROWS = QUIET_BACKLOG_ROWS - 1;
+
+/**
+ * How late the latency control delivers. Between the bound the floor holds a message to and the
+ * window the suite will WAIT for one, so the control still arrives — and still fails the bound it
+ * exists to fail — instead of degenerating into another path that drops.
+ */
+const LATE_DELIVERY_MS = (QUIET_DELIVERY_MS + DELIVERY_MS) / 2;
+
+/**
+ * The narrowest batch the reordering control shuffles, and how long it waits for one to stop
+ * growing. Four rather than the five the tail case sends, so the control is aimed at the CLASS
+ * — any burst a delivery window can hold — rather than at that case's current width; a suite that
+ * stopped leaving a batch this wide in flight would leave this control passing, which the negative
+ * control reports as a variant that failed nothing. The settle is short enough that every OTHER
+ * case — which sends a message at a time — sees a batch of one and no delay worth measuring.
+ */
+const REORDER_ABOVE = 4;
+const BATCH_SETTLE_MS = 30;
+
+/**
+ * The payloads and handles every live case used to write from a literal, before they were drawn.
+ * A plugin serving only these answered all 34 cases; it now serves nothing the floor sends. Keep
+ * these EXACT, so that the two rows built on them go green — and so fail the negative control —
+ * the moment a live case goes back to writing from a constant.
+ */
+const RETIRED_PAYLOADS = /^(?:q\d+|bk\d+|h\d+|n\d+|live-[ab]|w\d+-\d+|plugin-\d+|before-teardown|after-teardown)$/;
+const RETIRED_WRITERS = /^(?:writer|second-writer|w\d+|plugin)$/;
+
+export const LIVE_DEATHS: LiveDeath[] = [
+  {
+    // The boundary the rest of the suite names. `QUIET_POSTS` is the deepest single-topic delivery
+    // any other case requires, so it is the figure a plugin could read off the suite and cap itself
+    // at — and until the floor drew its own depth from a range starting above it, a cap here passed.
+    when: `after the ${QUIET_POSTS}th message on a subscription`,
+    drops: (at) => at.offered > QUIET_POSTS,
+  },
+  {
+    // The far edge of the same axis: the deepest cap every run is still guaranteed to exceed.
+    when: `after the ${QUIET_POSTS_MIN - 1}th message on a subscription`,
+    drops: (at) => at.offered > QUIET_POSTS_MIN - 1,
+  },
+  {
+    when: `once the subscription is ${DEATH_AFTER_MS}ms old`,
+    drops: (at) => at.subscriptionAgeMs > DEATH_AFTER_MS,
+  },
+  {
+    when: `once the topic holds more than ${DEATH_TOPIC_ROWS} rows`,
+    drops: (at) => at.topicRows > DEATH_TOPIC_ROWS,
+  },
+  {
+    // Gated on the same depth as the row above, so it reaches the floor and nothing else: what it
+    // stands for is a plugin that recognises the TEXT a suite is known to write, which is the live
+    // path's version of the budget-value switch the blocking clause already forbids.
+    when: 'for any payload the suite did not write from a literal',
+    drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && !RETIRED_PAYLOADS.test(at.content),
+  },
+  {
+    when: 'for any writer the suite did not name in a constant',
+    drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && !RETIRED_WRITERS.test(at.senderHandle),
+  },
+];
+
+/** A live path that delivers honestly until its predicate fires, and drops everything after that. */
+const liveDeath = (death: LiveDeath): BrokenVariant => ({
+  name: `a live path that stops delivering ${death.when}`,
+  mutates: 'subscribe',
+  mustFail: 'does not fall behind a quiet topic',
+  make: () =>
+    wrap((inner, store) => ({
+      subscribe: (topic, handler) => {
+        const born = Date.now();
+        let offered = 0;
+        return inner.subscribe(topic, (m) => {
+          offered += 1;
+          const at: DeliveryPoint = {
+            offered,
+            subscriptionAgeMs: Date.now() - born,
+            topicRows: (store.log.get(String(topic)) ?? []).length,
+            content: m.content,
+            senderHandle: String(m.senderHandle),
+          };
+          if (!death.drops(at)) handler(m);
+        });
+      },
+    })),
+});
+
 export const BROKEN_VARIANTS: BrokenVariant[] = [
   ...POST_ID_RESPELLINGS.map(respelledPostId),
   {
@@ -622,25 +772,76 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         },
       })),
   },
+  ...LIVE_DEATHS.map(liveDeath),
   {
-    // The other side of the same clause, and the one the relaxation opened. `only the
-    // post-subscribe tail` admits any SUBSET of that tail, and an empty delivery is a subset of
-    // every tail — so a live path that serves a few messages and then goes silent passes it, and so
-    // does one that registers no listener at all. This one is a poll loop that dies: it serves what
-    // every OTHER live case sends into a topic and stops one message short of the quiet floor, so
-    // only that floor can see it. Derived from {@link QUIET_POSTS}, so a floor that shortens takes
-    // this control with it rather than leaving one that fires nowhere.
-    name: 'a live path that goes silent after the first few messages',
-    mutates: 'subscribe',
-    mustFail: 'does not fall behind a quiet topic',
+    /**
+     * ORDER, on the one shape that can carry it: a batch. This path delivers everything, once, and
+     * only from the post-subscribe tail — it just hands a burst over backwards. Every live case but
+     * the tail one sends a message at a time or compares as a set, so nothing else here can see it,
+     * and a conversation an agent reads in the wrong order is a wrong conversation.
+     */
+    name: 'a live path that hands a burst back in reverse',
+    blastRadius: 2,
+    mutates: 'cursor',
+    mustFail: 'only the post-subscribe tail',
     make: () =>
       wrap((inner) => ({
         subscribe: (topic, handler) => {
-          let delivered = 0;
+          const batch: Message[] = [];
+          let timer: ReturnType<typeof setTimeout> | undefined;
           return inner.subscribe(topic, (m) => {
-            if (delivered++ < QUIET_POSTS - 1) handler(m);
+            batch.push(m);
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+              const held = batch.splice(0);
+              for (const each of held.length >= REORDER_ABOVE ? held.reverse() : held) handler(each);
+            }, BATCH_SETTLE_MS);
           });
         },
+      })),
+  },
+  {
+    /**
+     * A connection that registers its first subscriptions and silently ignores the rest — a fixed
+     * listener pool, a server-side per-connection cap, a `Map` keyed on something that collides.
+     * Two was the deepest the suite went, so this shape answered every case while a session
+     * subscribed to a third topic in its allowlist heard nothing at all.
+     */
+    name: `a live path that registers only its first ${LIVE_SUBSCRIPTIONS - 1} subscriptions`,
+    mutates: 'subscribe',
+    mustFail: 'on the live path too',
+    make: () =>
+      wrap((inner) => {
+        let registered = 0;
+        return {
+          subscribe: async (topic, handler) => {
+            registered += 1;
+            if (registered >= LIVE_SUBSCRIPTIONS) return;
+            await inner.subscribe(topic, handler);
+          },
+        };
+      }),
+  },
+  {
+    /**
+     * The same clause's LATENCY half, and the one no floor phrased as "did it arrive?" can reach:
+     * this path delivers everything, in order, exactly once — just late enough that an agent acts on
+     * it after the turn it belonged to. Conditioned on a topic deeper than any other case here
+     * subscribes over, so the case that bounds the wait is the only one it reaches.
+     */
+    name: 'a live path that delivers everything, seconds late',
+    mutates: 'live-delivery-is-prompt',
+    mustFail: 'does not fall behind a quiet topic',
+    make: () =>
+      wrap((inner, store) => ({
+        subscribe: (topic, handler) =>
+          inner.subscribe(topic, (m) => {
+            if ((store.log.get(String(topic)) ?? []).length <= DEATH_TOPIC_ROWS) {
+              handler(m);
+              return;
+            }
+            setTimeout(() => handler(m), LATE_DELIVERY_MS);
+          }),
       })),
   },
   {

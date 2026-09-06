@@ -5,7 +5,7 @@ import { MatrixPlugin, type RoomPreset, sanitizeAlias } from '../src/index.js';
  * In-memory fake Synapse: a `global.fetch` stub modelling an alias DIRECTORY of rooms — one
  * `room_id` and one timeline per alias — plus Matrix pagination tokens, room creation, and
  * injectable `/sync` failures. Shared by every Matrix test file so a behavior proven here is proven
- * against the real plugin code paths (`fetchRecent` / `subscribe` / `backfill` / `ensureRoom`), not
+ * against the real plugin code paths (`fetchRecent` / `subscribe` / `ensureRoom`), not
  * against a mock of them.
  *
  * Keep the room-per-alias directory, so that the topic → room mapping is under test: a fake with one
@@ -181,6 +181,18 @@ export class FakeSynapse {
     body: Record<string, unknown>,
     roomId: string,
   ) => unknown)[] = [];
+  /**
+   * The same, for the TIMELINE answer of an incremental `/sync`, and additionally handed the
+   * `since` that answer is for. {@link syncBodyOverrides} replaces the body outright, so a case
+   * using it can never break the RESUME TOKEN of a delta that really holds events: a body written
+   * by hand carries no `event_id` this fake ever minted, and a token that fails to advance is only
+   * observable against events already delivered under it.
+   */
+  readonly incrementalBodyOverrides: ((
+    body: Record<string, unknown>,
+    roomId: string,
+    since: string,
+  ) => unknown)[] = [];
   /** How an injected `/sync` failure presents: an HTTP status, or a rejected fetch. */
   syncFailureMode: 'status' | 'network' = 'status';
   syncFailureStatus = 500;
@@ -211,8 +223,7 @@ export class FakeSynapse {
   /**
    * Called once a positioning sync's body — its `next_batch` AND the timeline tip that goes with it
    * — has been computed, and BEFORE it is returned. An event landed here is strictly newer than the
-   * position the subscriber is about to resume from, so it MUST be delivered live; it is the window
-   * a boundary read one round-trip after the position silently swallows.
+   * position the subscriber is about to resume from, so it MUST be delivered live.
    */
   afterPositioningSync: (ordinal: number) => void = () => undefined;
   /**
@@ -563,6 +574,12 @@ export class FakeSynapse {
         return res;
       }
       this.syncAttempts.push(Date.now());
+      const incremental = (payload: Record<string, unknown>): Response => {
+        const mangle = this.incrementalBodyOverrides.shift();
+        return mangle === undefined
+          ? joined(payload)
+          : jsonRes(mangle(payload, syncRoom?.roomId ?? '', since));
+      };
       const syncHold = this.holdSync(url);
       if (syncHold > 0) await new Promise((r) => setTimeout(r, syncHold));
       if (this.syncFailures > 0) {
@@ -614,13 +631,13 @@ export class FakeSynapse {
       const newCount = len - k;
       const roomKey = syncRoom?.roomId ?? '';
       if (newCount <= 0) {
-        return joined({
+        return incremental({
           next_batch: `p${k}`,
           rooms: { join: { [roomKey]: { timeline: { events: [], limited: false } } } },
         });
       }
       if (newCount <= cap) {
-        return joined({
+        return incremental({
           next_batch: `p${len}`,
           rooms: { join: { [roomKey]: { timeline: { events: timeline.slice(k, len), limited: false } } } },
         });
@@ -630,7 +647,7 @@ export class FakeSynapse {
       // Synapse's exclusive one does.
       this.limitedEmitted++;
       const startIdx = len - cap;
-      return joined({
+      return incremental({
         next_batch: `p${len}`,
         rooms: {
           join: {

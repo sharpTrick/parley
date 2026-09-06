@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asTopic, type Topic } from '../message.js';
+import { parseConfig } from '../config.js';
 import { MAX_FETCH_LIMIT } from '../transport/tools.js';
 import { SeenSet, SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS } from './seen-set.js';
 
@@ -19,16 +20,37 @@ describe('SeenSet', () => {
    * The capacity, against the figure it is a budget for. Push delivers a subset of the tail and a
    * reconciling `parley_fetch_recent` covers the rest, so the window has to hold one whole such
    * page — `MAX_FETCH_LIMIT` ids — with room for the push traffic that lands beside it. A window
-   * shorter than a page means the oldest ids of a reconciling read are evicted by the read itself,
-   * and the push loop re-emits as `<channel>` events what the agent has just pulled.
+   * shorter than that means the oldest ids of a reconciling read are evicted by the traffic
+   * concurrent with it, and the push loop re-emits as `<channel>` events what the agent just pulled.
+   *
+   * The figure and the exercise are the SAME number here. Asserting one budget while filling the
+   * window with another leaves the difference ungraded: the bound said four pages, the body wrote
+   * two, and three would have passed the bound and lost the read's oldest id.
    */
+  const RECONCILING_PAGES = 4;
+
   it('holds several whole reconciling pages, so one read cannot flush its own oldest ids', () => {
-    expect(SEEN_MAX_PER_TOPIC).toBeGreaterThanOrEqual(4 * MAX_FETCH_LIMIT);
+    expect(SEEN_MAX_PER_TOPIC).toBeGreaterThanOrEqual(RECONCILING_PAGES * MAX_FETCH_LIMIT);
     const s = new SeenSet();
     for (let i = 0; i < MAX_FETCH_LIMIT; i++) s.markSeen(T, id(i));
-    // A whole further page of live traffic lands beside it, and the first id is still deduped.
-    for (let i = MAX_FETCH_LIMIT; i < 2 * MAX_FETCH_LIMIT; i++) s.firstSeen(T, id(i));
+    // …and the whole budget's worth of live traffic lands beside it before the first id is read
+    // back, so a window one page shorter than the bound loses it.
+    for (let i = MAX_FETCH_LIMIT; i < RECONCILING_PAGES * MAX_FETCH_LIMIT; i++) {
+      s.firstSeen(T, id(i));
+    }
     expect(s.has(T, id(0))).toBe(true);
+  });
+
+  /**
+   * The OTHER reconciling path, and the reason the budget above is not the whole story:
+   * `catchUpTopic` pages at `catchup.limit`, which the config declares positive with NO ceiling —
+   * so a deployment can ask for a page this window cannot hold, and the tool's `MAX_FETCH_LIMIT`
+   * clamp does not reach it. What is bounded is the DEFAULT, and a default raised past the budget
+   * would silently make every start-up catch-up re-emit its own oldest rows as `<channel>` events.
+   */
+  it('the default catch-up page fits the window, on the path no server-side cap clamps', () => {
+    const cfg = parseConfig({ identity: { handle: 'a' }, topics: ['t'], backend_config: {} });
+    expect(cfg.catchup.limit).toBeLessThanOrEqual(SEEN_MAX_PER_TOPIC / RECONCILING_PAGES);
   });
 
   it('dedup is per-topic (same id in different topics are independent)', () => {

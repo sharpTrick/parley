@@ -539,8 +539,10 @@ room/subject/channel from handle/topic), overridable in `backend_config`.
   (local floor) and Redis (broker).
 - **Zulip** (self-hosted): the closest native fit — stream+topic→topic (near 1:1; Zulip
   topics are mutable, so membership can drift if admins move messages), globally monotonic
-  message id→cursor, narrowed event queue + `/events` long-poll→subscribe (queue GC recovered
-  by re-register + cursor gap-fill), `GET /messages` anchor→fetchRecent.
+  message id→cursor, narrowed event queue + `/events` long-poll→subscribe (a GC'd queue is
+  re-registered and the loop resumes from the new one; whatever the dead queue held is left to the
+  next `fetchRecent`, per the subset contract in §6 — the push path issues no history read at all),
+  `GET /messages` anchor→fetchRecent.
 - **Discord, Telegram, Slack** — the first **hosted SaaS** backends, unlike the self-hosted
   core set; history durability and identity live under the vendor's policy (positioning
   noted in each plugin's class JSDoc). Discord: channel→topic, snowflake→cursor, gateway

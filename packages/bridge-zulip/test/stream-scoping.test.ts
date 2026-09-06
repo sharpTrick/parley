@@ -75,8 +75,7 @@ const READERS: StreamReader[] = [
       const seen: string[] = [];
       await plugin.subscribe(topic, (m) => seen.push(m.content));
       // Wait for the loop's first events poll, so that what arrives afterwards can only have come
-      // through the QUEUE: until then the subscribe handshake's own gap-fill is still draining, and
-      // it reads history through the narrow rather than the registration — a different wire site.
+      // through the QUEUE.
       await vi.waitFor(() => expect(fake.requestCount('GET /api/v1/events')).toBeGreaterThan(0), {
         timeout: 3000,
         interval: 10,

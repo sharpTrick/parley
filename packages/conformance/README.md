@@ -32,15 +32,25 @@ them stops owning a case — a conformance clause used to be deletable with noth
   explicitly **lossy**: what it delivers is a *subset* of that tail, and what it left out is
   returned by the next catch-up. Replaying history as if it were live is a superset, and stays
   forbidden;
-- a live subscriber does not fall behind a quiet topic — the floor under the subset above. A
-  message a delivery window cannot cover is a burst; a topic written one message at a time, each
-  delivered before the next is sent, loses nothing. Without this clause an empty delivery satisfies
-  the subset above, and a plugin whose `subscribe` registers no listener at all is certified;
+- a live subscriber does not fall behind a quiet topic — the floor under the subset above. The
+  subset bound is satisfied by any PREFIX of the tail, so a live path that serves the first message
+  and then stops answers every other live clause here; this floor is what reaches it. What a
+  delivery window cannot cover is a burst, so a topic written one message at a time, each delivered
+  before the next is sent, loses nothing and is owed all of it. Held along every axis such a path can
+  die along rather than at one threshold in one window: a DEPTH drawn per run from a range starting
+  above the deepest any other case reaches, an AGE past the point every other case has already been
+  delivered to, a BACKLOG deeper than any other case subscribes over, an independent WRITER wherever
+  `concurrentPost` can supply one, and a per-message LATENCY (`QUIET_DELIVERY_MS`) well inside what
+  the suite will wait. `BROKEN_VARIANTS` carries a control per axis, each at the far edge of the
+  reach that run guarantees — the same doctrine the blocking clause's switch table applies, because
+  a floor at one named figure is one a plugin can read off this package and cap itself at;
 - `subscribe` delivers a message **written by an independent client** — not only the subscriber's
   own writes. This is the case Parley exists for (a human posts in chat, an agent must receive it),
   and a plugin whose live path registers no server-side listener and merely echoes its own `post`
   used to pass in full. Graded through `concurrentPost`, so it skips only where the backend cannot
-  represent a second writer at all;
+  represent a second writer at all — and on that arm (`'unsupported'`, which today is Telegram
+  alone) NOTHING in this suite can see a loopback: the floor above then has no writer but the
+  subscriber either, so what certifies a live path there is that it delivers, not who wrote it;
 - topics are isolated on catch-up, and on the live path too;
 - disconnect is idempotent and stops the plugin serving;
 - post either round-trips a payload exactly — newline, surrounding spaces, an astral emoji, a

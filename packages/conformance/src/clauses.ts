@@ -100,6 +100,10 @@ export const CLAUSES: readonly string[] = [
  *   budgets on a connection and answers instantly forever after never leaves the serving arm, so
  *   nothing that grades the arm alone can see it — and one hand-measured read is by construction one
  *   of the first few.
+ * - `live-delivery-is-prompt`: a message reaches a live handler inside a bound well under what the
+ *   suite will WAIT for one. Core holds nothing open for a `<channel>` event, so a delivery seconds
+ *   late is one the agent acts on after the turn it belonged to — and every other clause on the live
+ *   path is satisfied by a path that delivers everything, eventually.
  * - `native-block-does-not-overshoot-the-budget`: and not far PAST it. Core holds the caller's
  *   request open for whatever the plugin spends, so a blocker that answers a 300 ms budget after
  *   3 s is a hang under a politer name — and every floor in the clause passes for one, leaving only
@@ -122,4 +126,5 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'native-block-actually-waits',
   'native-block-waits-every-time',
   'native-block-does-not-overshoot-the-budget',
+  'live-delivery-is-prompt',
 ];

@@ -287,15 +287,6 @@ export interface FakeZulip {
    * protocol error rather than a network failure.
    */
   expireQueues(): void;
-  /** Make the next `GET /api/v1/messages` fail once with a 502 (a transient history-read blip). */
-  failNextMessagesRead(): void;
-  /** Make the next `n` `GET /api/v1/messages` reads fail with a 502, then behave normally. */
-  failMessagesReads(n: number): void;
-  /**
-   * How many injected history-read failures the fake has actually SERVED. A test that arms one can
-   * assert its fault was exercised rather than armed for a read the code under test never issues.
-   */
-  servedMessagesReadFailures(): number;
   /** Fail every request on `route` (e.g. `GET /api/v1/events`) until cleared. */
   failRoute(route: string, failure: RouteFailure): void;
   /**
@@ -319,6 +310,22 @@ export interface FakeZulip {
    */
   holdResponse(route: string, ms: number): void;
   clearRouteFailures(): void;
+  /**
+   * Faults armed on this fake that no request ever reached. A fault armed for a call the plugin no
+   * longer makes is a row that parks in NOTHING: it reads as another covered await while exercising
+   * the same path as an unarmed run — which is what two `subscription-lifecycle` rows had become
+   * once the push loop stopped reading history. Asserted in the shared teardown, so a route that
+   * goes out of reach fails the tests that thought they were injecting into it.
+   */
+  armedButNeverServed(): string[];
+  /**
+   * Declare that this case arms a fault on ONE route it KNOWS nothing will reach, with the reason.
+   * The one legitimate shape is a crossing whose other factor is zero — a server state applied to a
+   * teardown that has no queue to release. Keep the reason REQUIRED and the ROUTE named, so that
+   * the escape cannot be taken to quiet a row that has stopped exercising the path it names: a
+   * whole-fake flag excuses a `hangRoute` armed beside it on a route the loop can never issue.
+   */
+  allowUnservedFaults(route: string, because: string): void;
   /** How many requests the fake has served for `route`, or on EVERY route when none is named. */
   requestCount(route?: string): number;
   /**
@@ -354,8 +361,9 @@ export async function startFakeZulip(opts?: {
   const accounts = toArray(opts?.credentials) ?? DEFAULT_CREDENTIALS;
   let msgSeq = FIRST_MESSAGE_ID - 1;
   let queueSeq = 0;
-  let failMessagesReadsRemaining = 0; // GET /api/v1/messages fails (502) while > 0, then normal
-  let failMessagesReadsServed = 0;
+  const armedFaults = new Set<string>();
+  const servedFaults = new Set<string>();
+  const unservedAllowed = new Set<string>();
   const routeFailures = new Map<string, RouteFailure>();
   const rateLimits = new Map<string, RateLimit>();
   const routeDelays = new Map<string, number>();
@@ -440,7 +448,10 @@ export async function startFakeZulip(opts?: {
     const route = `${req.method} ${new URL(req.url ?? '/', 'http://fake').pathname}`;
     requestCounts.set(route, (requestCounts.get(route) ?? 0) + 1);
     const held = routeDelays.get(route) ?? routeDelays.get(ANY_ROUTE);
-    if (held !== undefined) holdWrites(res, held);
+    if (held !== undefined) {
+      servedFaults.add(`holdResponse ${routeDelays.has(route) ? route : ANY_ROUTE}`);
+      holdWrites(res, held);
+    }
     void handle(req, res)
       .catch(() => {
         if (!res.writableEnded) json(res, 500, { result: 'error', msg: 'internal' });
@@ -461,9 +472,13 @@ export async function startFakeZulip(opts?: {
       return;
     }
 
-    if (hangRoutes.has(route)) return; // never answered — the socket just stays open
+    if (hangRoutes.has(route)) {
+      servedFaults.add(`hangRoute ${route}`);
+      return; // never answered — the socket just stays open
+    }
 
     const limit = rateLimits.get(route);
+    if (limit !== undefined) servedFaults.add(`rateLimit ${route}`);
     if (limit !== undefined && limit.times > 0) {
       limit.times--;
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -478,6 +493,7 @@ export async function startFakeZulip(opts?: {
     }
 
     const forced = routeFailures.get(route);
+    if (forced !== undefined) servedFaults.add(`failRoute ${route}`);
     if (forced !== undefined && (forced.times === undefined || forced.times > 0)) {
       if (forced.times !== undefined) forced.times--;
       json(res, forced.status, forced.body ?? { result: 'error', msg: `forced ${forced.status}` });
@@ -520,13 +536,6 @@ export async function startFakeZulip(opts?: {
       }
 
       case 'GET /api/v1/messages': {
-        // Injected transient failure: a proxy 502 on the history read (gap-fill / fetchRecent).
-        if (failMessagesReadsRemaining > 0) {
-          failMessagesReadsRemaining--;
-          failMessagesReadsServed++;
-          json(res, 502, { result: 'error', msg: 'Bad gateway' });
-          return;
-        }
         const numBefore = Number(url.searchParams.get('num_before') ?? '0');
         const numAfter = Number(url.searchParams.get('num_after') ?? '0');
         if (numBefore + numAfter > SERVER_CONSTRAINTS.maxMessagesPerFetch) {
@@ -659,7 +668,7 @@ export async function startFakeZulip(opts?: {
     url: `http://127.0.0.1:${port}`,
     gcQueues: () => {
       // Silently drop queues AND sever parked polls — like a server restart. The client's next
-      // poll gets BAD_EVENT_QUEUE_ID and must re-register + gap-fill.
+      // poll gets BAD_EVENT_QUEUE_ID and must re-register.
       for (const q of queues.values()) dropWaiter(q, true);
       queues.clear();
     },
@@ -671,23 +680,34 @@ export async function startFakeZulip(opts?: {
       }
       queues.clear();
     },
-    failNextMessagesRead: () => {
-      failMessagesReadsRemaining = 1;
-    },
-    failMessagesReads: (n: number) => {
-      failMessagesReadsRemaining = n;
-    },
-    servedMessagesReadFailures: () => failMessagesReadsServed,
     failRoute: (route, failure) => {
+      armedFaults.add(`failRoute ${route}`);
       routeFailures.set(route, { ...failure });
       for (const q of queues.values()) dropWaiter(q, true);
     },
-    hangRoute: (route) => hangRoutes.add(route),
+    hangRoute: (route) => {
+      armedFaults.add(`hangRoute ${route}`);
+      hangRoutes.add(route);
+    },
     stallAnchor: (edgeId) => {
       anchorStall = { edgeId };
     },
-    rateLimit: (route, limit) => rateLimits.set(route, { ...limit }),
-    holdResponse: (route, ms) => routeDelays.set(route, ms),
+    rateLimit: (route, limit) => {
+      armedFaults.add(`rateLimit ${route}`);
+      rateLimits.set(route, { ...limit });
+    },
+    holdResponse: (route, ms) => {
+      armedFaults.add(`holdResponse ${route}`);
+      routeDelays.set(route, ms);
+    },
+    armedButNeverServed: () =>
+      [...armedFaults]
+        .filter((f) => !servedFaults.has(f) && !unservedAllowed.has(f.slice(f.indexOf(' ') + 1)))
+        .sort(),
+    allowUnservedFaults: (route, because) => {
+      if (because.trim() === '') throw new Error('allowUnservedFaults needs a reason');
+      unservedAllowed.add(route);
+    },
     clearRouteFailures: () => {
       routeFailures.clear();
       rateLimits.clear();

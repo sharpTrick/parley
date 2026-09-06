@@ -23,11 +23,27 @@ interface BackendPlugin {
 }
 ```
 
-A conforming backend guarantees two things (checked by `@sharptrick/parley-conformance`):
+A conforming backend guarantees four things (checked by `@sharptrick/parley-conformance`):
 
 1. a **stable, unique `backendMsgId`** per message — the dedup key;
 2. **monotonic, in-order, exclusive-`since` cursor delivery** — `fetchRecent` returns messages
-   pre-sorted ascending and `subscribe`'s handler fires in ascending order per topic.
+   pre-sorted ascending and `subscribe`'s handler fires in ascending order per topic;
+3. `subscribe` delivers a **subset** of the post-subscribe tail and no more — never a message from
+   before the subscription, never one twice. It is not required to deliver all of it: a delivery
+   window that cannot cover a burst is conformant, and what push left out comes back from the next
+   `fetchRecent`;
+4. …but it is required to deliver. A live subscriber does not fall behind a **quiet** topic — one
+   written a message at a time, each delivered before the next is sent.
+
+The suite grades (4) to a stated REACH, not in general, and the difference matters to anyone
+reading this as a promise. It holds a live path over a drawn depth of 10–13 messages written one
+at a time (12–15 deliveries wherever the fixture can supply a second writer), the ~1 s it holds
+that subscription idle mid-run, a topic holding 22–25 rows, three concurrent subscriptions on one
+connection, a burst of five in flight, and payloads and writer handles drawn per run — plus one
+fixed per-message bound (2.5 s). A path that only fails past those figures — one that dies at 3 s
+of age, or above 40 rows, or whose delay GROWS per message until it is minutes late — is **not
+conforming** and is **not caught here**. Reaching further costs wall clock on every backend's run,
+which is the trade this figure records.
 
 `cursor` and `backendMsgId` are opaque strings — core never parses one and never orders by one. It
 does compare two for byte equality: `backendMsgId` is the dedup key, and two cursors are compared

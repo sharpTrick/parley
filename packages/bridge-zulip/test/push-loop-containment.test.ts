@@ -1,8 +1,7 @@
 /**
  * CLASS: no throw anywhere inside the push loop may end push for a topic or escape as an unhandled
- * rejection. The loop's own error handling covers the awaits it wraps — the handler call, the HTTP
- * poll, the gap-fill read — and nothing else, so any throw at a site nobody enumerated rejects
- * `loop()`. `disconnect()` settles that promise, but the fire-and-forget `void running.finally(…)`
+ * rejection. A throw at a site the loop's own error handling does not cover rejects `loop()`.
+ * `disconnect()` settles that promise, but the fire-and-forget `void running.finally(…)`
  * derived from it has no handler at all, and on Node 22 an unhandled rejection is an uncaught
  * exception: `src/cli.ts` installs no handler, so the MCP stdio server exits.
  *

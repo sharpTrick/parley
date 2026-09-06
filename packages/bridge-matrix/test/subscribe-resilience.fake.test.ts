@@ -119,9 +119,9 @@ const FRESH = 'after-the-garbage';
 const MALFORMED: Record<string, { body: (roomId: string) => unknown; degrades: 'reported' | 'paced' }> =
   {
     'JSON null': { body: () => null, degrades: 'reported' },
-    'an array': { body: () => [], degrades: 'paced' },
-    'a bare string': { body: () => 'ok', degrades: 'paced' },
-    'a number': { body: () => 123, degrades: 'paced' },
+    'an array': { body: () => [], degrades: 'reported' },
+    'a bare string': { body: () => 'ok', degrades: 'reported' },
+    'a number': { body: () => 123, degrades: 'reported' },
     'rooms: null': { body: () => ({ next_batch: 'p0', rooms: null }), degrades: 'paced' },
     'rooms.join is not a map': {
       body: () => ({ next_batch: 'p0', rooms: { join: 'x' } }),
@@ -279,6 +279,89 @@ describe('a malformed /sync body that never stops is reported and slowed, not ho
       expect(reported).toEqual([...new Set(reported)]);
       for (const n of reported) expect(n & (n - 1)).toBe(0);
       expect(reported.slice(0, 3)).toEqual([1, 2, 4]);
+    }, 20_000);
+  }
+});
+
+/**
+ * CLASS: an incremental `/sync` the loop cannot ADVANCE past. Both tables above arm an incremental
+ * body for what a bad shape costs the OPERATOR — a report, a backoff, a pace — and the positioning
+ * table below arms the resume token for what a bad one costs the SESSION. Neither can see the third
+ * cost, because both replace the body outright and so answer with no event this fake ever minted: a
+ * token that does not move re-issues the same `?since=`, which re-reads the same delta and hands the
+ * same `event_id` to the handler a second time. This plugin holds no in-push dedup — the contract
+ * lets push DROP (DESIGN §6) and still forbids it to REPEAT.
+ *
+ * The observable is one assertion for every shape: no message reaches the handler twice, and the
+ * loop still recovers. Each row is armed from inside `holdSync`, so the mangled answer is the one
+ * carrying the batch rather than whichever idle poll happened to be on the wire.
+ */
+const UNADVANCED: Record<
+  string,
+  (body: Record<string, unknown>, roomId: string, since: string) => unknown
+> = {
+  'next_batch is absent': ({ next_batch: _token, ...rest }) => rest,
+  'next_batch is null': (b) => ({ ...b, next_batch: null }),
+  'next_batch is a number': (b) => ({ ...b, next_batch: 0 }),
+  'next_batch is the empty string': (b) => ({ ...b, next_batch: '' }),
+  'next_batch repeats the token the request was made with': (b, _roomId, since) => ({
+    ...b,
+    next_batch: since,
+  }),
+};
+
+/** The batch a mangled answer carries — both must reach the handler, and neither of them twice. */
+const BATCH = ['batched-1', 'batched-2'];
+
+describe('an incremental /sync the loop cannot resume past never delivers an event twice', () => {
+  for (const [faultName, mangle] of Object.entries(UNADVANCED)) {
+    it(`${faultName}: the delta it carried is delivered once, and the loop recovers`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const escaped: unknown[] = [];
+      const onEscape = (reason: unknown): void => void escaped.push(reason);
+      process.on('unhandledRejection', onEscape);
+      const p = await connectFake({});
+      const t = asTopic('unadvanced');
+      const seen: { id: string; content: string }[] = [];
+      await p.subscribe(t, (m) => void seen.push({ id: String(m.backendMsgId), content: m.content }));
+
+      // Armed on the first `/sync` that has the batch to carry, so the mangled answer is the one
+      // holding events: a shape armed on an idle poll breaks a token nothing was delivered under,
+      // which is the one arrangement in which every row here passes for free.
+      let armed = false;
+      let armedAfter = 0;
+      fake.holdSync = () => {
+        if (armed || (fake.rooms[0]?.timeline.length ?? 0) < BATCH.length) return 0;
+        armed = true;
+        fake.incrementalBodyOverrides.push(mangle);
+        armedAfter = fake.syncAttempts.length;
+        return 0;
+      };
+      for (const c of BATCH) fake.addMessage(String(t), c);
+
+      // Waiting for the batch is not enough: a token that did not move re-reads the same delta on
+      // the VERY NEXT request, so the second delivery is only observable once the loop has issued
+      // one. Wait for the requests, not for the messages.
+      await vi
+        .waitFor(() => expect(fake.syncAttempts.length).toBeGreaterThanOrEqual(armedAfter + 4), {
+          timeout: 8000,
+          interval: 20,
+        })
+        .catch(() => undefined);
+      process.off('unhandledRejection', onEscape);
+      await p.disconnect();
+
+      expect(armed, 'no incremental /sync ran, so no row here armed the shape under test').toBe(true);
+      expect(escaped.map(String)).toEqual([]);
+      expect(
+        seen.map((m) => m.id),
+        'the loop resumed from a token it had already been answered on, so an event it had ' +
+          'already delivered reached the handler a second time',
+      ).toEqual([...new Set(seen.map((m) => m.id))]);
+      expect(
+        seen.map((m) => m.content),
+        'the loop never recovered from a resume token it could not advance past',
+      ).toEqual(BATCH);
     }, 20_000);
   }
 });
@@ -483,8 +566,7 @@ const MEMBERSHIP_LOSS: Record<string, MembershipRow> = {
     delivers: true,
   },
   'the room is merely absent from rooms.join, as an idle poll leaves it': {
-    // No `next_batch`: an idle sync that yields nothing also advances nothing.
-    arm: () => armForever(() => ({ rooms: { join: {} } })),
+    arm: () => armForever(() => ({ next_batch: 'p0', rooms: { join: {} } })),
     degrades: 'silent',
     delivers: false,
   },

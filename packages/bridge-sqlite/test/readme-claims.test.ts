@@ -52,6 +52,29 @@ const CLAIMS: Claim[] = [
   },
   { what: 'that --help and --version answer on stdout', patterns: [/`--help`\/`--version` answer on \*\*stdout\*\*/] },
   {
+    what: 'that live push is a subset and the start-up window is the part it drops',
+    patterns: [/subset/i, /start-up window/i, /Push never carries it/i],
+  },
+  {
+    what: 'that the reconciling read is only as good as the cursor the caller keeps',
+    patterns: [/does not persist the cursor it hands back/i],
+  },
+  {
+    what: 'that a single-writer deployment has no such window',
+    patterns: [/single-writer deployment/i, /no such window at all/i],
+  },
+  {
+    // The most user-visible thing this README gained, and the one whose pointer no other check can
+    // see: it is written in BACKTICKS rather than as a link, so the anchor-resolution block below
+    // never looks at it. Deleting the section, or renaming the file it credits, has to fail here.
+    what: 'the dark start-up window, credited to the file that executes both halves of it',
+    patterns: [/executes both halves/i],
+    evidence: {
+      file: 'test/push-gap-reconciliation.test.ts',
+      pattern: /the start-up window is dark on push and reconciled by the next catch-up/,
+    },
+  },
+  {
     what: 'the pragma read-back',
     patterns: [/read-back|read back/i],
     evidence: { file: 'test/driver-parity.test.ts', pattern: /PRAGMA \$\{p\.name\}/ },

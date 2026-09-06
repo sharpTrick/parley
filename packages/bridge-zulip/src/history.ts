@@ -49,9 +49,8 @@ export async function readWindow(
       num_after: backwards ? '0' : String(page),
       apply_markdown: 'false', // raw content, not rendered HTML
     };
-    // Keep the check on BOTH sides of the request, so that a read resumed after a reconnect — a
-    // gap-fill's next page — cannot put the connection it addressed's narrow and anchor on the wire
-    // to whatever server replaced it.
+    // Keep the check on BOTH sides of the request, so that a read resumed after a reconnect cannot
+    // put the connection it addressed's narrow and anchor on the wire to whatever server replaced it.
     conn.assertGeneration(opts.generation);
     const res = await conn.rest.request('GET', '/api/v1/messages', { query, signal });
     const raw = asArray(((await res.json()) as { messages?: ZulipMessage[] } | null)?.messages);
