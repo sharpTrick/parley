@@ -80,6 +80,10 @@ describe.skipIf(!redisUp)('redis + core catch-up — what core actually does wit
       await r.plugin.post(r.topic, asHandle('w'), 'one');
       await r.plugin.post(r.topic, asHandle('w'), 'two');
       await expect(r.drain()).resolves.toBe(2);
+      // The driver reads the window without moving the position — `parley_fetch_recent` is what
+      // advances it, once the agent has actually been handed the page — so the agent's read is
+      // what makes the next catch-up incremental. Take the same cursor the tool would persist.
+      r.readState.set(r.topic, (await r.plugin.fetchRecent({ topic: r.topic })).nextCursor);
       expect(r.readState.get(r.topic)).not.toBe(future);
       // …and the advanced cursor is live: a second catch-up drains only what arrived since.
       await r.plugin.post(r.topic, asHandle('w'), 'three');
@@ -91,6 +95,10 @@ describe.skipIf(!redisUp)('redis + core catch-up — what core actually does wit
     withRig('0-1', async (r) => {
       await r.plugin.post(r.topic, asHandle('w'), 'one');
       await expect(r.drain()).resolves.toBe(1);
+      r.readState.set(
+        r.topic,
+        (await r.plugin.fetchRecent({ topic: r.topic, since: asCursor('0-1') })).nextCursor,
+      );
       await expect(r.drain()).resolves.toBe(0);
     }));
 });

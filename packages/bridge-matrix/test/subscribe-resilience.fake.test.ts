@@ -1,5 +1,6 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SYNC_DIAG_INTERVAL_MS, syncFailureReporter } from '../src/diagnostics.js';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
@@ -83,14 +84,13 @@ describe('subscribe loop does not silently hot-retry a permanent /sync failure',
       // The gap between retries GROWS. A flat delay makes these two roughly equal.
       expect(a3 - a2).toBeGreaterThan((a1 - a0) * 2);
 
-      // The stated throttle, graded by CARDINALITY: an outage of `attempts` retries costs about
-      // log2(attempts) lines, at exactly the powers of two, each reported once. A ceiling alone is
-      // satisfied by logging nothing, so the floor is asserted too.
+      // The stated throttle, graded against the CLOCK the loop actually ran on: this outage is far
+      // shorter than one report interval, so it costs exactly one line however many retries it
+      // took. A ceiling alone is satisfied by logging nothing, so the floor is asserted too — and
+      // the line still names which failure it is, so an operator can see the ladder climbing.
       const reported = reportedFailureCounts(errors.mock.calls);
-      expect(reported).toEqual([...new Set(reported)]);
-      for (const n of reported) expect(n & (n - 1)).toBe(0);
-      expect(reported.length).toBeLessThanOrEqual(Math.floor(Math.log2(attempts)) + 1);
-      expect(reported.slice(0, 3)).toEqual([1, 2, 4]);
+      expect(reported).toEqual([1]);
+      expect(attempts).toBeGreaterThan(reported.length);
     }, 20_000);
   }
 });
@@ -274,11 +274,9 @@ describe('a malformed /sync body that never stops is reported and slowed, not ho
 
       // The same two assertions the 401/403/500/network table makes: the gap between retries GROWS…
       expect(a3 - a2).toBeGreaterThan((a1 - a0) * 2);
-      // …and the operator hears about it, at exactly the powers of two, each reported once.
-      const reported = reportedFailureCounts(errors.mock.calls);
-      expect(reported).toEqual([...new Set(reported)]);
-      for (const n of reported) expect(n & (n - 1)).toBe(0);
-      expect(reported.slice(0, 3)).toEqual([1, 2, 4]);
+      // …and the operator hears about it once inside this outage, which is far shorter than one
+      // report interval.
+      expect(reportedFailureCounts(errors.mock.calls)).toEqual([1]);
     }, 20_000);
   }
 });
@@ -612,10 +610,67 @@ describe('a /sync that stopped carrying the subscribed room is reported, not rea
       expect(said.join('\n')).toMatch(row.names!);
       // The same backoff the 401/500/network rows get: the gap between retries GROWS.
       expect(a3 - a2).toBeGreaterThan((a1 - a0) * 2);
-      const reported = reportedFailureCounts(errors.mock.calls);
-      expect(reported).toEqual([...new Set(reported)]);
-      for (const n of reported) expect(n & (n - 1)).toBe(0);
+      expect(reportedFailureCounts(errors.mock.calls)).toEqual([1]);
       expect(got).toEqual([]);
     }, 20_000);
   }
+});
+
+/**
+ * CLASS: an operator's only view of a dead live path is stderr, so the report point has to hold
+ * against BOTH failure shapes at once — a path that never recovers, and one that recovers half the
+ * time. A throttle keyed on the failure COUNT holds against neither.
+ *
+ * Graded on the reporter with an injected clock rather than through the loop: the interval is a
+ * minute, and the property is about hours of it. What the loop contributes — that this is the
+ * function it calls, once per failure, with the running count — is graded by the cases above.
+ */
+describe('the /sync report point is bounded by the clock, not by the failure count', () => {
+  /** A run of `ticks` failures, `everyMs` apart, whose Nth attempt succeeds iff `recovers(n)`. */
+  const run = (opts: { ticks: number; everyMs: number; recovers?: (n: number) => boolean }): number[] => {
+    let clock = 0;
+    const at: number[] = [];
+    const report = syncFailureReporter(() => clock);
+    vi.spyOn(console, 'error').mockImplementation(() => {
+      at.push(clock);
+    });
+    let consecutive = 0;
+    for (let n = 0; n < opts.ticks; n++) {
+      clock += opts.everyMs;
+      if (opts.recovers?.(n) === true) {
+        consecutive = 0;
+        continue;
+      }
+      consecutive += 1;
+      report(asTopic('doomed'), consecutive, new Error('boom'));
+    }
+    return at;
+  };
+
+  it('a path that is permanently dead keeps saying so, at a bounded interval', () => {
+    // Twelve hours of a homeserver that never answers, retried at the ladder's ceiling.
+    const said = run({ ticks: (12 * 3_600_000) / 30_000, everyMs: 30_000 });
+    expect(said.length).toBeGreaterThan(0);
+    const gaps = said.slice(1).map((t, i) => t - said[i]!);
+    expect(
+      Math.max(...gaps),
+      'the interval between report points GREW: a throttle on powers of two of the failure count ' +
+        'does that forever, because the retry delay it multiplies is capped — so a path dead for ' +
+        'days reports at hour 34 and then says nothing for another day and a half',
+    ).toBeLessThanOrEqual(SYNC_DIAG_INTERVAL_MS + 30_000);
+    expect(said.length).toBeGreaterThanOrEqual((11 * 3_600_000) / SYNC_DIAG_INTERVAL_MS);
+  });
+
+  it('a server that answers every other request does not flood', () => {
+    // An hour of 1-in-2 at the ladder's FIRST rung, which is where a count that resets on any
+    // success pins it: 200ms apart, so nothing here is throttled by the backoff at all.
+    const said = run({ ticks: 3_600_000 / 200, everyMs: 200, recovers: (n) => n % 2 === 0 });
+    expect(
+      said.length,
+      'an intermittently failing homeserver flooded stderr: `consecutiveFailures` resets on ANY ' +
+        'success, so a count-keyed report point sits at rung one forever and says so on every ' +
+        'other request',
+    ).toBeLessThanOrEqual(3_600_000 / SYNC_DIAG_INTERVAL_MS + 1);
+    expect(said.length).toBeGreaterThan(0);
+  });
 });

@@ -3,6 +3,7 @@ import { expect, it, vi } from 'vitest';
 import { drainAll, expectWellFormedMessage } from '../assertions.js';
 import type { ConformanceContext } from '../factory.js';
 import { OTHER } from '../handles.js';
+import { CONTENT_SHAPES } from './content.js';
 
 /**
  * How long a torn-down plugin is watched before its live path is called stopped. Long enough that a
@@ -58,19 +59,31 @@ export const QUIET_DELIVERY_MS = 2_500;
 const QUIET_IDLE_AT = 1;
 
 /**
- * Messages the tail case leaves in flight at once. Four is the floor, not a taste: every live case
- * here used to put at most THREE messages between a write and a delivery — the tail case sent three,
- * the independent-client case sends two and compares them as sets, and the quiet floor sends one at
- * a time — so a live path that reordered any burst wider than that satisfied the whole suite while
- * handing an agent a conversation out of sequence. Ordering is a contract requirement (seam.ts
- * clause 2), not a threshold, which is why this one is closed rather than recorded as reach.
+ * The range the tail case draws its in-flight burst from, per run. Every live case here used to put
+ * at most THREE messages between a write and a delivery — the tail case sent three, the
+ * independent-client case sends two and compares them as sets, and the quiet floor sends one at a
+ * time — so a live path that reordered any burst wider than that satisfied the whole suite while
+ * handing an agent a conversation out of sequence. DRAWN rather than named, for the same reason the
+ * floor draws its depth: a path that shuffles only above a threshold can read a constant off this
+ * package and sit above it.
+ *
+ * Ordering is a contract requirement (seam.ts clause 2) rather than a threshold, but what this
+ * suite REACHES is still a width: bursts up to {@link BURST_POSTS_MAX}, and only
+ * {@link BURST_POSTS_MIN} on every run. A path that hands back a burst wider than that in order and
+ * shuffles nothing narrower is outside this suite's reach, and is recorded as such rather than
+ * called closed.
  */
-const BURST_POSTS = 5;
+export const BURST_POSTS_MIN = 5;
+export const BURST_POSTS_MAX = 8;
 
 /**
  * Live subscriptions one connection is asked to hold at once. Two was the deepest any case went, so
  * a plugin that registered its first two and dropped every later one certified — and a real session
  * subscribes to every topic in its allowlist.
+ *
+ * REACH, not closure: what this figure buys is a control at a cap of two. A connection that
+ * registers its first three subscriptions and ignores the fourth answers this suite honestly, and a
+ * session whose allowlist is longer than this hears nothing on the rest.
  */
 export const LIVE_SUBSCRIPTIONS = 3;
 
@@ -80,6 +93,11 @@ export const LIVE_SUBSCRIPTIONS = 3;
  * that delivered only what matched it, and dropped everything else, passed all 34 cases while
  * carrying nothing a deployment would send. Nothing about a message this suite writes may be
  * knowable before the run: not its text, and not who wrote it.
+ *
+ * REACH, not closure: what the drawing forbids is a plugin keyed on a literal this package once
+ * wrote. A plugin keyed on the SHAPE of what it draws — eight lowercase base-36 characters — is
+ * still outside it, which is why the floor also carries {@link CONTENT_SHAPES} on the live path
+ * rather than tokens alone.
  *
  * Exported because `BROKEN_VARIANTS` stands up a plugin keyed on the OLD vocabulary, and that
  * control only fails while these really are drawn.
@@ -147,7 +165,7 @@ export function liveCases(ctx: ConformanceContext): void {
     // Sent back to back with nothing waited for in between, so more than three are in flight at
     // once: what a delivery window sees here is a BATCH, and the order it hands that batch over in
     // is the only thing this case can grade that the one-at-a-time floor below cannot.
-    const after = Array.from({ length: BURST_POSTS }, livePayload);
+    const after = Array.from({ length: between(BURST_POSTS_MIN, BURST_POSTS_MAX) }, livePayload);
     for (const c of after) await ctx.plugin.post(t, writer, c);
     // The whole tail is WAITED for and never required: a backend whose delivery window cannot cover
     // a burst may drop ALL of it and stay conformant (DESIGN §6), so a floor asserted here would be
@@ -189,11 +207,14 @@ export function liveCases(ctx: ConformanceContext): void {
   //
   // Held along every axis a live path can die along rather than at one threshold in one window: a
   // DEPTH drawn from a range no constant names, an AGE past what any other case waits, a BACKLOG
-  // deeper than any other case subscribes over, an independent WRITER where the fixture has one,
-  // and a per-message LATENCY well inside what the suite will wait. `BROKEN_VARIANTS` carries one
-  // control per axis; without them a plugin that recognises the shape of the reads this suite makes
-  // passes it while dropping everything a deployment sends — the class the blocking clause's own
-  // switch table exists to forbid, on the live path.
+  // deeper than any other case subscribes over, an independent WRITER where the fixture has one, a
+  // per-message LATENCY well inside what the suite will wait, and the CONTENT it carries — every
+  // other live case here writes an eight-character lowercase token, so a path that drops anything
+  // longer, anything non-ASCII, or anything with a newline in it delivered every message this suite
+  // sent and nothing a person types. `BROKEN_VARIANTS` carries one control per axis; without them a
+  // plugin that recognises the shape of the reads this suite makes passes it while dropping
+  // everything a deployment sends — the class the blocking clause's own switch table exists to
+  // forbid, on the live path.
   it('a live subscriber does not fall behind a quiet topic', async () => {
     const t = ctx.freshTopic();
     const writer = liveWriter();
@@ -222,10 +243,24 @@ export function liveCases(ctx: ConformanceContext): void {
       // Once, mid-run: nothing else here holds a subscription open long enough to ask whether it
       // is still alive, so a path that dies of age answers every other case exactly as a live one.
       if (i === QUIET_IDLE_AT) await sleep(QUIET_IDLE_MS);
-      const content = livePayload();
+      // The drawn token, carrying one shape from the table the write path is graded on. The draw
+      // keeps the text unknowable; the shape is what makes the message something a person could
+      // have sent.
+      const shape = CONTENT_SHAPES[i]?.[1];
+      const token = livePayload();
+      let content = shape === undefined ? token : `${token} ${shape}`;
+      let sentAt = Date.now();
+      // A backend may REFUSE a shape — the write clause permits that arm and grades it there — but
+      // a refusal must not buy it a shorter floor, so the iteration falls back to the bare token,
+      // which no backend may refuse. The drawn depth is the depth EVERY backend is held to.
+      if (shape === undefined) {
+        await ctx.plugin.post(t, writer, content);
+      } else if (!(await ctx.plugin.post(t, writer, content).then(() => true, () => false))) {
+        content = token;
+        sentAt = Date.now();
+        await ctx.plugin.post(t, writer, content);
+      }
       sent.push(content);
-      const sentAt = Date.now();
-      await ctx.plugin.post(t, writer, content);
       await delivered(DELIVERY_MS, () =>
         expect(
           live.map((m) => m.content).slice(independent),

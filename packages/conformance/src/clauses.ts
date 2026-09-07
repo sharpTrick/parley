@@ -13,6 +13,7 @@ export const CLAUSES: readonly string[] = [
   'returns the NEWEST messages',
   'since at the tail',
   'never-posted topic',
+  'hands a resuming session everything it missed',
   'via live push and via catch-up',
   'either round-trips',
   'post accepts inReplyTo',

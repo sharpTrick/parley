@@ -25,6 +25,14 @@ them stops owning a case — a conformance clause used to be deletable with noth
 - a since-less fetch returns the NEWEST messages — the backend's default window;
 - a never-posted topic returns an empty page with a replayable cursor — or, taking the other arm
   the seam permits, rejects with `NoSuchTopicError` naming the topic (`absentTopicBehaviour`);
+- core's own `parley_fetch_recent` tool, registered over this plugin,
+  hands a resuming session everything it missed. Every clause above drives `plugin.fetchRecent`
+  directly, which is not what an agent calls: the reconciliation the lossy-push contract rests on
+  ("what push leaves out, the next `parley_fetch_recent` returns") is a property of the TOOL, and a
+  session down while more than one page arrived reached only the newest page of it on five
+  certified backends while this suite stayed green. Graded by running the catch-up procedure
+  `docs/CONVENTIONS.md` ships — no cursor, then the `nextCursor` handed back, until a page comes
+  back empty;
 - every delivered `Message` is well-formed: real `topic`, non-empty `senderHandle`, and `mentions`
   matching `parseMentions(content)` (core's push loop filters on it);
 - the same message has an identical `backendMsgId`/`cursor` via live push and via catch-up, and

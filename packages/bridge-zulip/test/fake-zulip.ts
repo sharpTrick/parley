@@ -276,6 +276,9 @@ export const PERSISTENT_EVENTS_FAULTS: EventsFaultRow[] = eventsFaultRows(true);
 /** Stands for every endpoint at once wherever a route name is taken. */
 export const ANY_ROUTE = '*';
 
+/** The history read {@link FakeZulip.stallAnchor} answers on — the one route that fault reaches. */
+const HISTORY_ROUTE = 'GET /api/v1/messages';
+
 export interface FakeZulip {
   /** Base URL, e.g. `http://127.0.0.1:54321`. */
   url: string;
@@ -295,6 +298,9 @@ export interface FakeZulip {
    * from is what a read that navigates by the page's edge record can walk in circles on, and it is
    * NOT reachable by injecting records: the normal read filters strictly by id, so its pages always
    * advance however mangled the records in them are.
+   *
+   * Tracked like every other injectable fault ({@link armedButNeverServed}): it was the one that
+   * was not, so a stall armed for a read the case never issues passed as another covered await.
    */
   stallAnchor(edgeId: unknown): void;
   /** Accept every request on `route` and never answer it — an unreachable-but-open server. */
@@ -319,13 +325,16 @@ export interface FakeZulip {
    */
   armedButNeverServed(): string[];
   /**
-   * Declare that this case arms a fault on ONE route it KNOWS nothing will reach, with the reason.
-   * The one legitimate shape is a crossing whose other factor is zero — a server state applied to a
-   * teardown that has no queue to release. Keep the reason REQUIRED and the ROUTE named, so that
-   * the escape cannot be taken to quiet a row that has stopped exercising the path it names: a
-   * whole-fake flag excuses a `hangRoute` armed beside it on a route the loop can never issue.
+   * Declare that this case arms ONE fault it KNOWS nothing will reach, with the reason. The one
+   * legitimate shape is a crossing whose other factor is zero — a server state applied to a
+   * teardown that has no queue to release.
+   *
+   * Keyed on the FAULT — `"<kind> <route>"`, exactly as {@link armedButNeverServed} reports it —
+   * not on the route: an escape naming a route excused every kind armed on it, so one legitimate
+   * `failRoute` exemption also quietly excused a `hangRoute`, a `rateLimit` and a `holdResponse`
+   * on the same endpoint, which is the opposite of what the reason is asked for.
    */
-  allowUnservedFaults(route: string, because: string): void;
+  allowUnservedFaults(fault: string, because: string): void;
   /** How many requests the fake has served for `route`, or on EVERY route when none is named. */
   requestCount(route?: string): number;
   /**
@@ -553,6 +562,7 @@ export async function startFakeZulip(opts?: {
         const stream = narrow.find((n) => n.operator === 'stream')?.operand;
         const topic = narrow.find((n) => n.operator === 'topic')?.operand;
         if (anchorStall !== undefined) {
+          servedFaults.add(`stallAnchor ${HISTORY_ROUTE}`);
           const page = numBefore + numAfter;
           json(res, 200, {
             result: 'success',
@@ -690,6 +700,7 @@ export async function startFakeZulip(opts?: {
       hangRoutes.add(route);
     },
     stallAnchor: (edgeId) => {
+      armedFaults.add(`stallAnchor ${HISTORY_ROUTE}`);
       anchorStall = { edgeId };
     },
     rateLimit: (route, limit) => {
@@ -701,12 +712,10 @@ export async function startFakeZulip(opts?: {
       routeDelays.set(route, ms);
     },
     armedButNeverServed: () =>
-      [...armedFaults]
-        .filter((f) => !servedFaults.has(f) && !unservedAllowed.has(f.slice(f.indexOf(' ') + 1)))
-        .sort(),
-    allowUnservedFaults: (route, because) => {
+      [...armedFaults].filter((f) => !servedFaults.has(f) && !unservedAllowed.has(f)).sort(),
+    allowUnservedFaults: (fault, because) => {
       if (because.trim() === '') throw new Error('allowUnservedFaults needs a reason');
-      unservedAllowed.add(route);
+      unservedAllowed.add(fault);
     },
     clearRouteFailures: () => {
       routeFailures.clear();

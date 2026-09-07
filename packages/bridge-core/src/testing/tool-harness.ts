@@ -7,6 +7,7 @@ import { SeenSet } from '../engine/seen-set.js';
 import { asHandle } from '../message.js';
 import { registerTools, toolDepsFor, type ToolDeps } from '../transport/tools.js';
 import { FakePlugin } from './fake-plugin.js';
+import { memoryReadState } from './nonconformant.js';
 
 /**
  * The ONE `McpServer + registerTools + linked-pair Client` fixture the tool tests run on.
@@ -51,6 +52,7 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
       opts.allow ??
       new Allowlist(opts.topics ?? ['ctx', 'ctx-reviews'], { postPatterns: opts.postPatterns }),
     seen: new SeenSet(),
+    readState: memoryReadState(),
     blockMaxMs: 60_000,
     blockPollIntervalMs: 20,
     ...Object.fromEntries(

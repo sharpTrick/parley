@@ -19,13 +19,14 @@ import {
 } from '@sharptrick/parley-core';
 import {
   CALLER_BLOCK_RETURN_MS,
+  carriesControlCharacter,
   type ConformanceContext,
   DELIVERY_MS,
+  isPlainAscii,
   EARLY_RETURN_FRACTION,
   IDLE_BLOCK_MS,
   OVERSHOOT_MULTIPLE,
   PARK_FRACTION,
-  LIVE_SUBSCRIPTIONS,
   PROBE_MAX_BLOCK_MS,
   QUIET_BACKLOG_ROWS,
   QUIET_DELIVERY_MS,
@@ -38,6 +39,7 @@ import {
   SINCELESS_RETURN_MS,
   STABILITY_CALLER_READS,
   STABILITY_READS_MIN,
+  SHORT_PAYLOAD,
   STABILITY_SPAN_MS,
   TAIL_BLOCK_MS,
 } from '@sharptrick/parley-conformance';
@@ -558,23 +560,37 @@ const armSwitch = (sw: ArmSwitch, nativeBlocking: boolean, blastRadius: number):
  * reads a suite is known to make, and a control per instance leaves the next threshold free to pass.
  *
  * THE REACH, MEASURED, so the next reader does not have to re-derive it:
- *  - COUNT. The floor offers `INDEPENDENT_WRITERS + depth`, depth drawn from
- *    [`QUIET_POSTS_MIN`, `QUIET_POSTS_MAX`] = 10..13, so 12..15 where the fixture has a second
- *    writer and 10..13 where `concurrentPost` is `'unsupported'`. A cap at 11 is caught every run;
- *    12 and 13 are caught on SOME runs and 15 on none. A control inside the drawn range would fire
- *    on a fraction of runs, which is worse than no control at all — hence the far-edge row below
- *    sits at `QUIET_POSTS_MIN - 1`, the deepest cap every run is guaranteed to exceed on both arms.
+ *  - COUNT, PER SUBSCRIPTION. The floor offers `INDEPENDENT_WRITERS + depth` ON ONE SUBSCRIPTION,
+ *    depth drawn from [`QUIET_POSTS_MIN`, `QUIET_POSTS_MAX`] = 10..13, so 12..15 where the fixture
+ *    has a second writer and 10..13 where `concurrentPost` is `'unsupported'`. A cap at 11 is caught
+ *    every run; 12 and 13 are caught on SOME runs and 15 on none. A control inside the drawn range
+ *    would fire on a fraction of runs, which is worse than no control at all — hence the far-edge
+ *    row below sits at `QUIET_POSTS_MIN - 1`, the deepest cap every run is guaranteed to exceed on
+ *    both arms. The SCOPE is the bound that matters and reads as though it were global: a cap
+ *    counted per PLUGIN or per connection rather than per subscription is measured to pass at 20,
+ *    because no case here offers one connection that many deliveries. There is no
+ *    `connectionOffered` axis, and that is what closing it would take.
  *  - AGE reaches the span the floor holds a subscription idle mid-run (`QUIET_IDLE_MS`), plus
  *    whatever that run's own round trips cost. A path that dies at 3 s passes.
  *  - BACKLOG reaches 22–25 rows on the floor's topic (the seeded backlog, the independent writes and
  *    the drawn depth); a path that goes silent above 40 passes.
  *  - LATENCY is one fixed bound per message; a path whose delay GROWS (150 ms per message, minutes
  *    late after a few hundred) passes.
- * Each of those three costs wall clock on every fixture and on every variant here, which is why
- * they are recorded rather than chased. What is NOT reach — a contract requirement a burst of four
- * would have caught, a subscription count a real session exceeds, and a payload vocabulary a plugin
- * could enumerate — is closed by the suite instead: see `BURST_POSTS`, `LIVE_SUBSCRIPTIONS` and
- * `livePayload`/`liveWriter`, each with its control below.
+ *  - ORDER reaches a burst drawn from [`BURST_POSTS_MIN`, `BURST_POSTS_MAX`] = 5..8, so a path that
+ *    shuffles bursts of 5 is caught every run and one that only shuffles above 8 is caught on none.
+ *  - SUBSCRIPTIONS reaches `LIVE_SUBSCRIPTIONS` = 3 on one connection: a path that registers its
+ *    first two is caught, one that registers its first three is not, and a session whose allowlist
+ *    is longer than three hears nothing on the rest.
+ *  - VOCABULARY reaches a payload and a handle drawn per call, which forbids a plugin keyed on a
+ *    LITERAL this package once wrote. One keyed on the SHAPE of a draw — `[a-z][0-9a-z]{0,8}` — is
+ *    still outside it; what the CONTENT rows below reach is the complement the floor now sends.
+ *  - CONTENT reaches the shapes in `CONTENT_SHAPES`: a payload past `SHORT_PAYLOAD` characters, one
+ *    that is not plain ASCII, and one carrying a newline or a tab. A path sized against some other
+ *    property of a real message — a mention, a code fence, a 4 kB paste — is outside it until that
+ *    shape is a row in that table.
+ * Every one of these costs wall clock on every fixture and on every variant here, which is why they
+ * are recorded rather than chased. None of them is CLOSED, and each has its control below at the far
+ * edge of the reach a run guarantees.
  */
 interface DeliveryPoint {
   /** Messages this subscription has been offered, this one included. */
@@ -588,8 +604,18 @@ interface DeliveryPoint {
   senderHandle: string;
 }
 
+/**
+ * Which property of a delivery a row conditions on. Declared rather than recovered from {@link
+ * LiveDeath.when}: the far-edge check below used to select the count rows by looking for a phrase
+ * inside that human label, so renaming a row silently removed it from the check that keeps it
+ * inside the floor's guaranteed reach, and a table with one count row left satisfied the `> 1`
+ * that was supposed to notice.
+ */
+type DeathAxis = 'count' | 'age' | 'depth' | 'vocabulary' | 'content';
+
 interface LiveDeath {
   when: string;
+  axis: DeathAxis;
   /** True when the path DROPS the message rather than handing it on. */
   drops: (at: DeliveryPoint) => boolean;
 }
@@ -612,7 +638,7 @@ const DEATH_TOPIC_ROWS = QUIET_BACKLOG_ROWS - 1;
  * window the suite will WAIT for one, so the control still arrives — and still fails the bound it
  * exists to fail — instead of degenerating into another path that drops.
  */
-const LATE_DELIVERY_MS = (QUIET_DELIVERY_MS + DELIVERY_MS) / 2;
+export const LATE_DELIVERY_MS = (QUIET_DELIVERY_MS + DELIVERY_MS) / 2;
 
 /**
  * The narrowest batch the reordering control shuffles, and how long it waits for one to stop
@@ -622,8 +648,16 @@ const LATE_DELIVERY_MS = (QUIET_DELIVERY_MS + DELIVERY_MS) / 2;
  * control reports as a variant that failed nothing. The settle is short enough that every OTHER
  * case — which sends a message at a time — sees a batch of one and no delay worth measuring.
  */
-const REORDER_ABOVE = 4;
+export const REORDER_ABOVE = 4;
 const BATCH_SETTLE_MS = 30;
+
+/**
+ * How many subscriptions the capped control registers before it starts ignoring them. An
+ * INDEPENDENT figure, not `LIVE_SUBSCRIPTIONS - 1`: derived from the suite's own constant it fires
+ * for every value that constant could take, so the negative control's "the suite opens more than
+ * this control drops" was true by construction and said nothing about how deep the suite goes.
+ */
+export const SUBSCRIPTION_CAP = 2;
 
 /**
  * The payloads and handles every live case used to write from a literal, before they were drawn.
@@ -640,19 +674,23 @@ export const LIVE_DEATHS: LiveDeath[] = [
     // any other case requires, so it is the figure a plugin could read off the suite and cap itself
     // at — and until the floor drew its own depth from a range starting above it, a cap here passed.
     when: `after the ${QUIET_POSTS}th message on a subscription`,
+    axis: 'count',
     drops: (at) => at.offered > QUIET_POSTS,
   },
   {
     // The far edge of the same axis: the deepest cap every run is still guaranteed to exceed.
     when: `after the ${QUIET_POSTS_MIN - 1}th message on a subscription`,
+    axis: 'count',
     drops: (at) => at.offered > QUIET_POSTS_MIN - 1,
   },
   {
     when: `once the subscription is ${DEATH_AFTER_MS}ms old`,
+    axis: 'age',
     drops: (at) => at.subscriptionAgeMs > DEATH_AFTER_MS,
   },
   {
     when: `once the topic holds more than ${DEATH_TOPIC_ROWS} rows`,
+    axis: 'depth',
     drops: (at) => at.topicRows > DEATH_TOPIC_ROWS,
   },
   {
@@ -660,11 +698,38 @@ export const LIVE_DEATHS: LiveDeath[] = [
     // stands for is a plugin that recognises the TEXT a suite is known to write, which is the live
     // path's version of the budget-value switch the blocking clause already forbids.
     when: 'for any payload the suite did not write from a literal',
+    axis: 'vocabulary',
     drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && !RETIRED_PAYLOADS.test(at.content),
   },
   {
     when: 'for any writer the suite did not name in a constant',
+    axis: 'vocabulary',
     drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && !RETIRED_WRITERS.test(at.senderHandle),
+  },
+  /**
+   * The three below stand for a live path sized for the payloads a TEST writes: a websocket frame
+   * cap, a fixed read buffer, a transcoder that survives ASCII and drops the rest, a line-oriented
+   * reader that stops at the first newline. Each was measured CERTIFIED — 0 of 34 cases red — while
+   * every live case wrote an eight-character lowercase token, and each is caught only because the
+   * floor now carries the same content table the write path is graded on.
+   *
+   * Gated on the floor's own depth exactly as the vocabulary rows are, so they reach that case and
+   * nothing else — the write path posts these payloads on fresh topics with no subscriber.
+   */
+  {
+    when: `for any payload longer than ${SHORT_PAYLOAD} characters`,
+    axis: 'content',
+    drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && at.content.length > SHORT_PAYLOAD,
+  },
+  {
+    when: 'for any payload that is not plain ASCII',
+    axis: 'content',
+    drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && !isPlainAscii(at.content),
+  },
+  {
+    when: 'for any payload carrying a newline or a tab',
+    axis: 'content',
+    drops: (at) => at.topicRows > DEATH_TOPIC_ROWS && carriesControlCharacter(at.content),
   },
 ];
 
@@ -689,6 +754,80 @@ const liveDeath = (death: LiveDeath): BrokenVariant => ({
           };
           if (!death.drops(at)) handler(m);
         });
+      },
+    })),
+});
+
+/**
+ * A page a resumed read hands back, and what it drops out of it. Written against the page rather
+ * than against a case, so a row is a shape a real backend can take — a server-side window applied
+ * to a cursor read, an off-by-one slice, a cursor minted from the topic's tail — and not a
+ * transcription of the assertion it must fail.
+ */
+interface ResumedReadLoss {
+  what: string;
+  mutates: string;
+  /** The page as the caller receives it, given the rows really after `since` and the page size. */
+  serve: (after: Message[], limit: number, since: Cursor) => FetchRecentResult;
+}
+
+const RESUMED_READ_LOSSES: ResumedReadLoss[] = [
+  {
+    // The OLD end, which is the end a reader cannot notice: the page it gets is a valid page, its
+    // cursor is a real cursor, and the rows before it are simply never mentioned again.
+    what: 'drops the oldest half of every resumed page',
+    mutates: 'fetchRecent',
+    serve: (after, limit) => {
+      const page = after.slice(0, limit);
+      return { messages: page.slice(Math.ceil(page.length / 2)), nextCursor: page.at(-1)!.cursor };
+    },
+  },
+  {
+    // The NEW end, with the cursor still reporting the whole page — so the rows it dropped are
+    // behind the position the caller resumes from, and are skipped on every later call.
+    what: 'drops the newest half of every resumed page',
+    mutates: 'fetchRecent',
+    serve: (after, limit) => {
+      const page = after.slice(0, limit);
+      return { messages: page.slice(0, Math.floor(page.length / 2)), nextCursor: page.at(-1)!.cursor };
+    },
+  },
+  {
+    // A cursor that names where the read STARTED instead of where it ended. The page is complete,
+    // so nothing about it is wrong until the caller pages: the second call asks the same question.
+    what: 'answers a resumed page with the cursor it was asked from',
+    mutates: 'nextCursor-agreement',
+    serve: (after, limit, since) => ({ messages: after.slice(0, limit), nextCursor: since }),
+  },
+  {
+    // R1's own shape, at the plugin: a read that treats a cursor as decoration and answers with the
+    // backend's newest window. A caller near the tail cannot tell — which is why every other case
+    // here is blind to it — and a caller far behind is handed the far side of its own gap.
+    what: 'answers a resumed page with the newest window instead of the oldest rows after it',
+    mutates: 'fetchRecent',
+    serve: (after, limit) => {
+      const window = after.slice(-limit);
+      return { messages: window, nextCursor: window.at(-1)!.cursor };
+    },
+  },
+];
+
+const resumedReadLoss = (loss: ResumedReadLoss): BrokenVariant => ({
+  name: `a read that ${loss.what}`,
+  mutates: loss.mutates,
+  mustFail: 'hands a resuming session everything it missed',
+  make: () =>
+    wrap((inner) => ({
+      fetchRecent: async (args) => {
+        const page = await inner.fetchRecent(args);
+        const since = args.since;
+        if (since === undefined || page.messages.length < 2) return page;
+        const all = await inner.fetchRecent({ topic: args.topic, since, limit: 10_000 });
+        // Only a caller that is BEHIND by more than a page: near the tail every row here is the
+        // identity, so the clauses that read a page or two off a small topic answer honestly.
+        const limit = page.messages.length;
+        if (all.messages.length <= limit) return page;
+        return loss.serve(all.messages, limit, since);
       },
     })),
 });
@@ -807,7 +946,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
      * Two was the deepest the suite went, so this shape answered every case while a session
      * subscribed to a third topic in its allowlist heard nothing at all.
      */
-    name: `a live path that registers only its first ${LIVE_SUBSCRIPTIONS - 1} subscriptions`,
+    name: `a live path that registers only its first ${SUBSCRIPTION_CAP} subscriptions`,
     mutates: 'subscribe',
     mustFail: 'on the live path too',
     make: () =>
@@ -816,7 +955,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         return {
           subscribe: async (topic, handler) => {
             registered += 1;
-            if (registered >= LIVE_SUBSCRIPTIONS) return;
+            if (registered > SUBSCRIPTION_CAP) return;
             await inner.subscribe(topic, handler);
           },
         };
@@ -892,6 +1031,9 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a cursor that does not advance past a truncating limit',
+    // Four paging widths, plus the tool-surface case: an agent paging through a backlog stalls on
+    // the same cursor exactly as the paging clause's own reader does.
+    blastRadius: 5,
     mutates: 'cursor',
     mustFail: 'paging from a cursor with limit',
     make: () =>
@@ -933,7 +1075,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     // row itself, exactly as a BIGSERIAL reader sees seq 42 committed while 41 is not. Only a reader
     // placed INSIDE the write window can see it.
     name: 'a cursor that advances past a row it did not return',
-    blastRadius: 7,
+    blastRadius: 8,
     mutates: 'cursor',
     mustFail: 'interleaved with concurrent writers',
     make: () =>
@@ -1624,6 +1766,17 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         { nativeBlocking: true },
       ),
   },
+  /**
+   * The four ways a resumed read can strand a backlog, on the ONE case that reads through core's
+   * `parley_fetch_recent` rather than through the plugin. Each is a page a caller has no way to
+   * tell from a short one it will be handed the rest of next time — the loss is only visible once
+   * the whole catch-up procedure has run and the topic still has messages the agent never saw.
+   *
+   * Every row here is conditioned on a read that carries a `since`, so a since-less window read —
+   * which every other clause in the suite leans on — answers honestly and the control stays aimed
+   * at the case it names.
+   */
+  ...RESUMED_READ_LOSSES.map(resumedReadLoss),
   ...ARM_SWITCHES.map((sw) =>
     armSwitch(sw, false, sw.when.startsWith('on every connection') ? 5 : 1),
   ),

@@ -134,6 +134,11 @@ describe('the suite grades every backend it certifies', () => {
       ['a table case %s'],
     ],
     [
+      'an it.each head wrapped onto several lines',
+      "    it.each(TABLE)(\n      'a wrapped case %s',\n      async (l) => {\n        expect(l).toBe(l);\n      },\n    );",
+      ['a wrapped case %s'],
+    ],
+    [
       'a modifier the parser has not met',
       "    it.concurrent('a concurrent case', async () => { expect(1).toBe(1); });",
       ['a concurrent case'],

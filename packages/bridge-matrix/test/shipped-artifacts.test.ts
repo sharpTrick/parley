@@ -351,8 +351,11 @@ const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
     // every deployment, and a README promising the wait is promising a different tool.
     forbidden: /Matrix\s+serves this natively/,
   },
-  'an omitted since means the recent window': {
-    core: { ships: "the since argument's description", pattern: /Omit for the recent window/ },
+  "an omitted since resumes this instance's read position, over the plugin's recent window": {
+    core: {
+      ships: "the since argument's description",
+      pattern: /Omit to resume from where this instance last read, or — if it keeps no read position/,
+    },
     readme: /`fetchRecent` \(no `since`\)/,
   },
   'an absent topic is an empty page here, never the topicAbsent answer': {

@@ -103,10 +103,19 @@ describe('zulip push loop backs off and reports when it fails permanently', () =
   }
 });
 
-const SERVER_STATES = [
+/** Each state names the FAULT it arms, so the escape below can excuse that one and nothing else. */
+const SERVER_STATES: Array<{ name: string; apply: (fake: FakeZulip) => void; arms?: string }> = [
   { name: 'responsive', apply: () => undefined },
-  { name: 'answering 500', apply: (fake: FakeZulip) => fake.failRoute('DELETE /api/v1/events', FAULTS.serverError) },
-  { name: 'a black hole', apply: (fake: FakeZulip) => fake.hangRoute('DELETE /api/v1/events') },
+  {
+    name: 'answering 500',
+    apply: (fake) => fake.failRoute(DELETE_QUEUE, FAULTS.serverError),
+    arms: `failRoute ${DELETE_QUEUE}`,
+  },
+  {
+    name: 'a black hole',
+    apply: (fake) => fake.hangRoute(DELETE_QUEUE),
+    arms: `hangRoute ${DELETE_QUEUE}`,
+  },
 ];
 
 describe('zulip disconnect completes in bounded time whatever the server does', () => {
@@ -118,9 +127,9 @@ describe('zulip disconnect completes in bounded time whatever the server does', 
           await plugin.subscribe(asTopic(`down-${i}-${rand()}`), () => undefined);
         }
         state.apply(fake);
-        if (liveQueues === 0) {
+        if (liveQueues === 0 && state.arms !== undefined) {
           fake.allowUnservedFaults(
-            DELETE_QUEUE,
+            state.arms,
             'no queue was ever registered, so teardown issues no DELETE for this state to fault',
           );
         }

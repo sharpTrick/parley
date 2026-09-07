@@ -53,8 +53,10 @@ export function casesIn(source: string): { title: string; body: string }[] {
     const to = i + 1 < starts.length ? starts[i + 1]!.index : region.length;
     const body = region.slice(from, to);
     // The title is the string literal the callback follows, not the first one in the body: an
-    // `it.each` table's own cells come first and are not titles.
-    out.push({ title: /\('([^']+)',\s*(?:async\b|\()/.exec(body)?.[1] ?? `case ${i}`, body });
+    // `it.each` table's own cells come first and are not titles. Whitespace is allowed between the
+    // `(` and the title, so a head prettier wrapped — `it.each(table)(\n  'title',\n  async …` —
+    // is not a case this parser reads as `case 0`, invisible to every check built on it.
+    out.push({ title: /\(\s*'([^']+)',\s*(?:async\b|\()/.exec(body)?.[1] ?? `case ${i}`, body });
   }
   return out;
 }
@@ -230,14 +232,27 @@ function afterFirstArgument(args: string): string | undefined {
  *
  * The fragment rather than the whole message, so that a diagnostic assembled from several literals
  * is still matched against what the runner prints.
+ *
+ * BOTH quote styles. Single quotes alone made this blind to exactly the diagnostics that carry an
+ * apostrophe — which is why they are double-quoted — and a diagnostic this cannot see is one the
+ * negative control never asks for a control for. The run-level cross-check in `negative-control`
+ * is what catches the next such hole rather than a third quoting rule here.
  */
 export function diagnosedAssertions(source: string): string[] {
   const out: string[] = [];
   for (const m of source.matchAll(/\bexpect\(/g)) {
     const open = (m.index as number) + m[0].length - 1;
     const rest = afterFirstArgument(parenthesized(source, open));
-    const literal = /^\s*'((?:\\.|[^'\\])*)'/.exec(rest ?? '');
-    if (literal !== null) out.push((literal[1] as string).replaceAll("\\'", "'"));
+    const literal =
+      /^\s*'((?:\\.|[^'\\])*)'/.exec(rest ?? '') ??
+      /^\s*"((?:\\.|[^"\\])*)"/.exec(rest ?? '') ??
+      // A TEMPLATE diagnostic, up to its first interpolation: the whole of what the runner prints
+      // before a figure this run drew. Only the static head is comparable, and it is enough to
+      // recognise the message.
+      /^\s*`((?:\\.|[^`\\$]|\$(?!\{))+)/.exec(rest ?? '');
+    if (literal !== null) {
+      out.push((literal[1] as string).replaceAll("\\'", "'").replaceAll('\\"', '"'));
+    }
   }
   return out;
 }

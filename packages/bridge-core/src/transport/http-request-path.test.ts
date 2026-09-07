@@ -53,6 +53,44 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
     expect(out.messages.map((m) => m.content)).toEqual(['hello over http']);
   });
 
+  /**
+   * The remote root keeps NO read position, and that is a decision rather than an oversight. It is
+   * stateless — a fresh server per POST, one shared `ToolDeps` for every client on the port — so a
+   * single position here would be several chat sessions' at once: each would advance past what the
+   * others had not been handed, and what one session read would go missing from another for good.
+   * The local stdio bridge, which is one session by construction, is where the position lives.
+   *
+   * Graded through the endpoint rather than off the dependency bag, so wiring a store in — the one
+   * change that would make this root worse — reddens here whatever shape it arrives in.
+   */
+  it('keeps no read position: a since-less read is the recent window, however many times it is made', async () => {
+    for (let i = 0; i < 12; i++) {
+      await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: `m${i}` } });
+    }
+    const windowOf = async (c: Client): Promise<string[]> =>
+      (
+        parse(
+          await c.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: 4 } }),
+        ) as { messages: Array<{ content: string }> }
+      ).messages.map((m) => m.content);
+
+    const newest = ['m8', 'm9', 'm10', 'm11'];
+    expect(await windowOf(client)).toEqual(newest);
+    // …the same client again, and a second client sharing the port: neither resumes past it.
+    expect(await windowOf(client)).toEqual(newest);
+    const second = await connectTo(served.port);
+    try {
+      expect(
+        await windowOf(second),
+        'the remote root advanced a read position. It is shared by every client on this port, so ' +
+          "one chat session's reads now move another session's resume point past pages that " +
+          'session was never handed',
+      ).toEqual(newest);
+    } finally {
+      await second.close();
+    }
+  });
+
   it('is reactive-only — does NOT advertise the claude/channel capability', () => {
     const caps = client.getServerCapabilities();
     expect(caps?.experimental?.['claude/channel']).toBeUndefined();

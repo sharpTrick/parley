@@ -30,7 +30,13 @@ export const MAX_FETCH_LIMIT = 1_000;
 export const TOOL_TEXT = {
   fetch_recent:
     'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
-    'cursor from a previous call) to get only newer messages. Returns { messages, nextCursor } — ' +
+    'cursor from a previous call) to get only newer messages. Omit `since` and a bridge that keeps ' +
+    'a read position for you resumes from it, so a session that was down comes back to the OLDEST ' +
+    'message it has not seen; a bridge that keeps none — and a first-ever read of a topic — ' +
+    'answers with the most recent page instead. Either way, keep calling with the `nextCursor` you ' +
+    'are handed until a page comes back empty and you have everything reachable. Pass back only a ' +
+    '`nextCursor` a previous page gave you: another cursor is read from, but does not move where ' +
+    'this session resumes. Returns { messages, nextCursor } — ' +
     'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
     'does not exist yet); re-issue without `since` in that case. ' +
     'Call this on session start for each configured topic, then on demand. A topic that does not ' +
@@ -42,7 +48,9 @@ export const TOOL_TEXT = {
     '`since`. Not every backend can park on a wait: one that cannot REFUSES `block_ms` with an ' +
     'error naming itself, so retry without it and poll on your own cadence.',
   fetch_recent_since:
-    'Opaque cursor; return only messages strictly after it. Omit for the recent window.',
+    'Opaque cursor; return only messages strictly after it. Omit to resume from where this ' +
+    'instance last read, or — if it keeps no read position, or has never read this topic — from ' +
+    'the recent window.',
   fetch_recent_block_ms:
     'Long-poll budget in ms. If the queried window is empty — whether or not you passed ' +
     '`since` — hold up to this long for a new message before returning (possibly empty). ' +
@@ -115,7 +123,13 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     async ({ topic, since, limit, block_ms }, extra) => {
       const t = deps.allow.assert(topic);
       const args: FetchRecentArgs = { topic: t };
-      if (since !== undefined) args.since = asCursor(since);
+      // A caller with no cursor of its own resumes from the position THIS instance last read to.
+      // Without it a since-less read answers with the backend's recent window whatever happened
+      // while the session was away, so everything older than that window — however much of it the
+      // session had never been handed — is unreachable: the agent's next call asks for the recent
+      // window again, and the window has only moved forward.
+      const resumeFrom = since === undefined ? deps.readState?.get(t) : asCursor(since);
+      if (resumeFrom !== undefined) args.since = resumeFrom;
       if (limit !== undefined) args.limit = Math.min(limit, MAX_FETCH_LIMIT);
       const blockMs = block_ms !== undefined ? Math.min(block_ms, deps.blockMaxMs) : 0;
       let result;
@@ -163,6 +177,27 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       const cap = Math.min(limit ?? MAX_FETCH_LIMIT, MAX_FETCH_LIMIT);
       const kept = own.length > cap ? own.slice(0, cap) : own;
       const nextCursor = kept.length < own.length ? kept.at(-1)!.cursor : result.nextCursor;
+      // Advance the instance's position to exactly what this page COVERED, so the next since-less
+      // call starts where this one stopped — but ONLY when the read really resumed from that
+      // position, which is a compare-and-set against a fresh read rather than a check of the value
+      // this call opened with. A caller may pass any cursor it likes: one AHEAD of the stored
+      // position drags the position past a region the agent was never handed, and everything in
+      // between is then unreachable by resume. One BEHIND is safe and still does not move it — a
+      // rewind costs duplicates, which the seen-set absorbs. The documented paging loop always
+      // satisfies the condition: its first call is since-less, and every later one carries the
+      // cursor this branch just wrote.
+      //
+      // Skipped when the position has not moved, so an idle agent polling a quiet topic does not
+      // rewrite the state file once per tick for a cursor that never changed.
+      //
+      // Keep this BEFORE the dedup warm-up, so that a cursor the store refuses takes the whole call
+      // down without first recording these ids as delivered — a page the agent never received but
+      // the push loop will now suppress is lost on both paths at once.
+      const readState = deps.readState;
+      if (readState !== undefined && nextCursor !== undefined) {
+        const stored = readState.get(t);
+        if (resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
+      }
       for (const m of kept) deps.seen?.markSeen(t, m.backendMsgId);
       return textResult({ messages: kept, nextCursor });
     },

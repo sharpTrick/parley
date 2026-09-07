@@ -124,7 +124,10 @@ describe('a hostile event never throws out of a read path', () => {
       });
 
       expect(total).toBeGreaterThan(0);
-      expect(String(readState.get(topic))).not.toBe(String(since));
+      // The driver reads without moving the stored position; what must cross the hostile events is
+      // the cursor the resumed page reports, which is the value `parley_fetch_recent` persists.
+      const resumed = await p.fetchRecent({ topic, since, limit: 100 });
+      expect(String(resumed.nextCursor)).not.toBe(String(since));
       await p.disconnect();
     });
 

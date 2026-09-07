@@ -78,7 +78,7 @@ describe('fetchRecent since-path drains a foreign block and always advances the 
     await p.disconnect();
   });
 
-  it('catchUpTopic over the same shared room counts the trailing A message and advances read-state past X', async () => {
+  it('catchUpTopic over the same shared room counts the trailing A message and reports a cursor past X', async () => {
     install();
     const p = await connect(true);
     const A = asTopic('cu-A');
@@ -96,7 +96,11 @@ describe('fetchRecent since-path drains a foreign block and always advances the 
     const total = await catchUpTopic({ plugin: p, topic: A, limit: 5, readState, seen });
 
     expect(total).toBe(1); // drains the trailing a1 rather than breaking early at 0
-    expect(String(readState.get(A))).toBe(String(idA1)); // read-state crossed the foreign block
+    // The driver leaves the stored position for `parley_fetch_recent` to advance, so what carries
+    // the crossing is the cursor the resumed page REPORTS — the value that tool persists.
+    expect(readState.get(A)).toBe(asCursor(String(idA0)));
+    const resumed = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5 });
+    expect(String(resumed.nextCursor)).toBe(String(idA1)); // the cursor crossed the foreign block
     await p.disconnect();
   });
 });

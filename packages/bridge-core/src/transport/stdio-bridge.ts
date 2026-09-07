@@ -58,13 +58,15 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   const readState = new ReadStateStore(statePath);
 
   // Keep tools and the push loop on this ONE `seen` set, so a message pulled via the fetch_recent
-  // tool is not later re-pushed.
-  registerTools(server, toolDepsFor(plugin, cfg, { seen }));
+  // tool is not later re-pushed — and on this ONE read-state, which is the AGENT's read position:
+  // the tool resumes from it and advances it, while on-start catch-up only reads it.
+  registerTools(server, toolDepsFor(plugin, cfg, { seen, readState }));
 
   await plugin.connect(cfg.backend_config as BackendConfig);
 
-  // On-start catch-up: advance the per-instance read cursor + warm the seen-set BEFORE the
-  // push loop starts (so the live path doesn't double-emit across the boundary). Does not emit.
+  // On-start catch-up: warm the seen-set BEFORE the push loop starts (so the live path doesn't
+  // double-emit across the boundary). Does not emit, and does not advance the read position — the
+  // backlog it pages over is what `parley_fetch_recent` still owes the agent.
   // A catch-up failure lands AFTER connect, and the caller never receives a ParleyBridge to call
   // shutdown() on — keep the disconnect here (releasing the plugin's poll/prune timers) before
   // re-throwing, so a leaked connection can't keep the event loop alive and hang the process.

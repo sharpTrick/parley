@@ -2,37 +2,33 @@ import { parseMentions } from '@sharptrick/parley-core';
 import { expect, it } from 'vitest';
 import type { ConformanceContext } from '../factory.js';
 import { OTHER, SENDER } from '../handles.js';
+import { CONTENT_SHAPES } from './content.js';
 
 /** The write path: what `post` carries through, and who the seam says sent it. */
 export function postCases(ctx: ConformanceContext): void {
   // Every other case posts short ASCII ('a', 'same', 'm0'), so nothing else certifies that `post`
   // round-trips content at all: the same `parley_post` could behave four different ways across
   // certified backends. Refusing a payload is a visible, legitimate answer; altering it silently
-  // is not. Carriage return is not a row YET: an XMPP body is XML character data, whose parser
-  // normalizes CR to LF before any plugin sees it, so no plugin can round-trip one — but refusing
-  // it is the arm this clause already permits, and bridge-xmpp accepts a CR and stores an LF. Add
-  // the row when that plugin refuses; adding it first only reddens the backend.
-  it.each([
-    ['a newline', 'fidelity\nsecond line'],
-    ['leading and trailing spaces', '  fidelity  '],
-    ['an astral emoji', 'fidelity \u{1F600} done'],
-    ['a combining sequence', 'fidelity e\u0301 vs \u00E9'],
-    ['a tab', 'fidelity\tcolumn'],
-  ])('post either round-trips %s exactly or refuses it', async (_label, content) => {
-    const t = ctx.freshTopic();
-    const posted: string | Error = await ctx.plugin.post(t, SENDER, content).then(
-      (id) => String(id),
-      (err: unknown) => err as Error,
-    );
-    if (posted instanceof Error) {
-      expect(posted.message.length).toBeGreaterThan(0);
-      return;
-    }
-    const { messages } = await ctx.plugin.fetchRecent({ topic: t });
-    expect(messages).toHaveLength(1);
-    expect(messages[0]!.content).toBe(content);
-    expect(messages[0]!.mentions).toEqual(parseMentions(content));
-  });
+  // is not. The table is SHARED with the live floor, so a shape added for one path is graded on
+  // both — these payloads used to reach `post` and `fetchRecent` only, and never a live handler.
+  it.each(CONTENT_SHAPES.map(([label, body]) => [label, body] as [string, string]))(
+    'post either round-trips %s exactly or refuses it',
+    async (_label, content) => {
+      const t = ctx.freshTopic();
+      const posted: string | Error = await ctx.plugin.post(t, SENDER, content).then(
+        (id) => String(id),
+        (err: unknown) => err as Error,
+      );
+      if (posted instanceof Error) {
+        expect(posted.message.length).toBeGreaterThan(0);
+        return;
+      }
+      const { messages } = await ctx.plugin.fetchRecent({ topic: t });
+      expect(messages).toHaveLength(1);
+      expect(messages[0]!.content).toBe(content);
+      expect(messages[0]!.mentions).toEqual(parseMentions(content));
+    },
+  );
 
   // `post`'s `opts.inReplyTo` is part of the seam and core's post tool passes it
   // (transport/tools.ts). The seam surfaces no reply field on Message, so the contract is exactly

@@ -193,9 +193,9 @@ describe('fetchRecentBlocking', () => {
       'a cadence as coarse as the whole budget': BUDGET_MS,
     };
 
-    // `since` is a DIMENSION, not a constant: the tool explicitly invites a `since`-less long poll
-    // ("Omit for the recent window"), and that is the column where no page has landed yet and no
-    // cursor exists to hand back — so cancellation there cannot be a `nextCursor` at all.
+    // `since` is a DIMENSION, not a constant: the tool explicitly invites a `since`-less long poll,
+    // and that is the column where no page has landed yet and no cursor exists to hand back — so
+    // cancellation there cannot be a `nextCursor` at all.
     const starts = {
       'a since at the tail': (tail: Cursor): { since?: Cursor } => ({ since: tail }),
       'no since': (): { since?: Cursor } => ({}),

@@ -88,7 +88,12 @@ describe('the start-up window is dark on push and reconciled by the next catch-u
         const readState = new ReadStateStore(join(dir(), 'state.json'));
         const seen = new SeenSet();
         await catchUpTopic({ plugin: reader, topic: T, limit: history.limit, readState, seen });
-        const persisted = readState.get(T);
+        // On-start catch-up warms the dedup set and leaves the caller's position alone —
+        // `parley_fetch_recent` is what advances it, out of the page it hands the agent. Take the
+        // same cursor that tool would persist for a session starting cold on this topic.
+        expect(readState.get(T)).toBeUndefined();
+        const persisted = (await reader.fetchRecent({ topic: T, limit: history.limit })).nextCursor;
+        readState.set(T, persisted);
         expect(persisted).toBeDefined();
 
         const windowed = numbered('in-the-window', size);
@@ -236,7 +241,10 @@ describe('the reconciling read is only as good as the cursor the caller keeps', 
 
     await fill(peer, ['history']);
     await catchUpTopic({ plugin: reader, topic: T, limit: 100, readState, seen });
-    const stale = readState.get(T);
+    // The position the AGENT holds, which is the one this case is about: the driver leaves it
+    // alone and `parley_fetch_recent` advances it out of the page it returns.
+    const stale = (await reader.fetchRecent({ topic: T, limit: 100 })).nextCursor;
+    readState.set(T, stale);
     expect(stale).toBeDefined();
 
     await fill(peer, ['in-the-window']);

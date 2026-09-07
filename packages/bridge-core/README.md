@@ -35,15 +35,27 @@ A conforming backend guarantees four things (checked by `@sharptrick/parley-conf
 4. …but it is required to deliver. A live subscriber does not fall behind a **quiet** topic — one
    written a message at a time, each delivered before the next is sent.
 
+The suite also grades one thing that is not a backend guarantee at all: that core's own
+`parley_fetch_recent`, driven over the plugin, hands a resuming session everything it missed. That
+clause is a property of the tool rather than of any plugin, which is why it is not a fifth item
+here — but it is the half of the lossy-push bargain an agent actually calls, and it belongs to the
+same contract.
+
 The suite grades (4) to a stated REACH, not in general, and the difference matters to anyone
-reading this as a promise. It holds a live path over a drawn depth of 10–13 messages written one
-at a time (12–15 deliveries wherever the fixture can supply a second writer), the ~1 s it holds
-that subscription idle mid-run, a topic holding 22–25 rows, three concurrent subscriptions on one
-connection, a burst of five in flight, and payloads and writer handles drawn per run — plus one
-fixed per-message bound (2.5 s). A path that only fails past those figures — one that dies at 3 s
-of age, or above 40 rows, or whose delay GROWS per message until it is minutes late — is **not
-conforming** and is **not caught here**. Reaching further costs wall clock on every backend's run,
-which is the trade this figure records.
+reading this as a promise. It holds a live path over a drawn depth of 10–13 messages ON ONE
+SUBSCRIPTION, written one at a time (12–15 deliveries wherever the fixture can supply a second
+writer), the ~1 s it holds that subscription idle mid-run, a topic holding 22–25 rows, three
+concurrent subscriptions on one connection, a burst of five to eight in flight (five on every run),
+payloads and writer handles drawn per run, and the payload SHAPES a real message carries — longer
+than a token, non-ASCII, a newline or a tab, on a backend that accepts them; one that refuses a
+shape is graded on the bare token for that message, so the depth above is the depth every backend
+is held to, and the shape axis reaches only the backends that take the shape. Plus one fixed
+per-message bound (2.5 s). A path that
+only fails past those figures — one that dies at 3 s of age, or above 40 rows, or that caps
+deliveries per CONNECTION rather than per subscription (nothing here offers one connection twenty),
+or whose delay GROWS per message until it is minutes late — is **not conforming** and is **not
+caught here**. Reaching further costs wall clock on every backend's run, which is the trade this
+figure records.
 
 `cursor` and `backendMsgId` are opaque strings — core never parses one and never orders by one. It
 does compare two for byte equality: `backendMsgId` is the dedup key, and two cursors are compared
@@ -98,7 +110,7 @@ rather than a silent no-op.
 
 | Tool | Role | Effect |
 |---|---|---|
-| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. It is advertised on every deployment; a backend with no read primitive to park on rejects a **positive** `block_ms` with `BlockingFetchUnsupportedError` rather than answering with a page. `block_ms: 0` asks for no wait and is the ordinary catch-up read every backend serves, so it is answered with a page rather than refused. Marks returned ids seen so the push loop won't re-deliver them. |
+| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. With NO `since` it resumes from this instance's persisted read position, so a session that was down comes back to the oldest message it has not seen and pages forward from there; with no position to resume from — the remote HTTP root keeps none, and a first-ever read of a topic has none yet — it answers with the backend's recent window, and nothing older than that window is reachable from it. The position advances only on a read that actually resumed from it, so a `since` the caller chose is read from but never drags the position over messages the agent was not handed. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. It is advertised on every deployment; a backend with no read primitive to park on rejects a **positive** `block_ms` with `BlockingFetchUnsupportedError` rather than answering with a page. `block_ms: 0` asks for no wait and is the ordinary catch-up read every backend serves, so it is answered with a page rather than refused. Marks returned ids seen so the push loop won't re-deliver them. |
 | `parley_post` | write (reactive) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. The chat side's only write path. |
 | `parley_reply` | write (channel) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
 

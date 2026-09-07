@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,9 +9,12 @@ import { asTopic, buildMessage } from '@sharptrick/parley-core';
 import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import {
   ASSERTED_PROPERTIES,
+  BURST_POSTS_MAX,
+  BURST_POSTS_MIN,
   CALLER_BLOCK_FLOOR_FRACTION,
   CLAUSES,
   type ConformanceContext,
+  CONTENT_SHAPES,
   DELIVERY_MS,
   livePayload,
   LIVE_SUBSCRIPTIONS,
@@ -35,9 +38,12 @@ import {
   ENUMERABLE_BUDGETS,
   BROKEN_SUITE_MARK,
   BROKEN_VARIANTS,
+  LATE_DELIVERY_MS,
   LIVE_DEATHS,
   MAX_BLAST_RADIUS,
   ReferencePlugin,
+  REORDER_ABOVE,
+  SUBSCRIPTION_CAP,
   SWITCH_AFTER_CALLS,
 } from './reference-plugin.js';
 import {
@@ -71,6 +77,20 @@ interface JsonReport {
 let report: JsonReport;
 let stdout = '';
 
+/**
+ * Where the child run's own report and output are kept after the temp directory goes.
+ *
+ * Every check below scores a variant out of a report that was being deleted in a `finally`, so a
+ * row that reddens once in many runs left NOTHING to read: not which cases the child failed, not
+ * its output, not even whether the child agreed with itself. The exposure that produces exactly
+ * that signature is structural and is recorded rather than widened away — `fails a plugin with %s`
+ * bounds each variant from ABOVE, and a large share of them sit at margin zero, so a single flaky
+ * case anywhere in the child run reddens exactly one row. Raising the radii would hide that; the
+ * evidence is what was missing.
+ */
+const KEPT_RUN = join(tmpdir(), 'parley-negative-control-last');
+let keptRun = '';
+
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), 'parley-negative-control-'));
   const out = join(dir, 'report.json');
@@ -85,7 +105,14 @@ beforeAll(async () => {
       },
     ).catch((err: { stdout?: string; stderr?: string }) => err);
     stdout = `${run.stdout ?? ''}${run.stderr ?? ''}`;
-    report = JSON.parse(readFileSync(out, 'utf8')) as JsonReport;
+    // Copy the evidence out BEFORE anything can throw on it: a child that produced no parseable
+    // report is exactly the case whose output is worth reading.
+    mkdirSync(KEPT_RUN, { recursive: true });
+    writeFileSync(join(KEPT_RUN, 'run.log'), stdout);
+    const raw = readFileSync(out, 'utf8');
+    writeFileSync(join(KEPT_RUN, 'report.json'), raw);
+    keptRun = KEPT_RUN;
+    report = JSON.parse(raw) as JsonReport;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -202,11 +229,42 @@ describe('every Message field the suite reads has a plugin that corrupts it', ()
 describe('every assertion carrying its own diagnostic has a variant that reaches it', () => {
   const diagnosed = [...new Set(diagnosedAssertions(suiteSource))];
 
-  it('finds diagnosed assertions to check (guards against a broken parser)', () => {
+  /**
+   * The diagnostic a failing row actually PRINTED, recovered from the child's own output:
+   * vitest renders `expect(actual, 'why')` as `AssertionError: why: expected …`. Rows that failed
+   * without a custom message carry no `why` and are not counted.
+   */
+  const printedDiagnostics = (): string[] =>
+    results()
+      .flatMap((row) => row.failureMessages ?? [])
+      .map((failure) => /^AssertionError: ([\s\S]*?): expected /.exec(failure)?.[1])
+      .filter((why): why is string => why !== undefined && why.length > 0);
+
+  /**
+   * The floor, as a RUN-LEVEL fact rather than a number that was true two rounds ago. A pinned
+   * `>= 9` against an actual 21 left the scanner free to lose more than half its output and stay
+   * green — and it did lose output: a diagnostic double-quoted because it contains an apostrophe
+   * was invisible to a scan that matched single quotes only, so the one check here that grades an
+   * ASSERTION silently stopped asking for a control for it.
+   *
+   * What cannot be pinned or truncated is what the child run printed. Every diagnostic a broken
+   * variant made the runner emit has to be one this scan knows about; a parser that drops a
+   * quoting style, a nesting depth or the tail of its own output fails here rather than shrinking
+   * the table below in silence.
+   */
+  it('knows every diagnostic the broken variants actually printed', () => {
+    const printed = [...new Set(printedDiagnostics())];
     expect(
-      diagnosed.length,
-      'the diagnostic scan found fewer than it was written against',
-    ).toBeGreaterThanOrEqual(9);
+      printed.length,
+      'no broken variant printed a diagnostic at all — the scan below has nothing to be checked ' +
+        'against, and this whole describe is grading an empty table',
+    ).toBeGreaterThan(diagnosed.length / 2);
+    expect(
+      printed.filter((why) => !diagnosed.some((d) => why.includes(d) || d.includes(why))),
+      'the runner printed a diagnostic this scan does not know about, so nothing requires a ' +
+        'control for it. Either the scan cannot see how that assertion is written, or it is ' +
+        'dropping output it used to find',
+    ).toEqual([]);
   });
 
   it.each(diagnosed.map((d) => [d]))('%s', (message) => {
@@ -338,8 +396,10 @@ describe('every arm switch is reachable by the run built to catch it', () => {
  * reads in the report as coverage.
  */
 describe('every way a live path can die is reached by the case built to catch it', () => {
+  type Delivery = Parameters<(typeof LIVE_DEATHS)[number]['drops']>[0];
+
   /** A delivery the floor really makes, at a chosen depth — payload and writer drawn, as it draws them. */
-  const atDepth = (offered: number): Parameters<(typeof LIVE_DEATHS)[number]['drops']>[0] => ({
+  const atDepth = (offered: number): Delivery => ({
     offered,
     subscriptionAgeMs: 0,
     topicRows: QUIET_BACKLOG_ROWS + offered,
@@ -347,24 +407,40 @@ describe('every way a live path can die is reached by the case built to catch it
     senderHandle: String(liveWriter()),
   });
 
-  it.each(LIVE_DEATHS.map((d) => [d.when, d] as const))('%s is reached by that case', (_when, death) => {
-    // The last message the floor is GUARANTEED to send: at the shallowest depth it ever draws, on a
-    // subscription that has been held open across the idle span, over the backlog it seeds.
-    const nowhere = death.drops({
-      offered: QUIET_POSTS_MIN,
-      subscriptionAgeMs: QUIET_IDLE_MS,
-      topicRows: QUIET_BACKLOG_ROWS + QUIET_POSTS_MIN,
-      // DRAWN, not written out: the two vocabulary rows are only reachable while the floor's
-      // payloads and handles really are drawn, so this row grades the generator rather than a
-      // sample somebody typed here to make it pass.
-      content: livePayload(),
-      senderHandle: String(liveWriter()),
+  /**
+   * Every delivery the floor is GUARANTEED to make, derived from the loop that makes them rather
+   * than hand-built: the shallowest depth it ever draws, the idle span it holds the subscription
+   * open across from its second message on, the backlog it seeds, and the content each iteration
+   * carries — the drawn token alone once the shared table runs out.
+   *
+   * A SET rather than one point, because the content rows are reachable only on the iterations that
+   * carry a shape, and a single point that had to satisfy every row at once could only ever be one
+   * of them. DRAWN where the floor draws, so these rows grade the generator rather than a sample
+   * somebody typed here to make the table pass.
+   */
+  const guaranteed = (): Delivery[] =>
+    Array.from({ length: QUIET_POSTS_MIN }, (_unused, i) => {
+      const shape = CONTENT_SHAPES[i]?.[1];
+      return {
+        offered: i + 1,
+        subscriptionAgeMs: i >= 1 ? QUIET_IDLE_MS : 0,
+        topicRows: QUIET_BACKLOG_ROWS + i + 1,
+        content: shape === undefined ? livePayload() : `${livePayload()} ${shape}`,
+        senderHandle: String(liveWriter()),
+      };
     });
+
+  it('derives more than one guaranteed delivery, so the rows below are not one point', () => {
+    expect(guaranteed().length).toBeGreaterThan(CONTENT_SHAPES.length);
+    expect(new Set(guaranteed().map((d) => d.content)).size).toBe(guaranteed().length);
+  });
+
+  it.each(LIVE_DEATHS.map((d) => [d.when, d] as const))('%s is reached by that case', (_when, death) => {
     expect(
-      nowhere,
-      'this predicate is never true of a message the quiet-topic floor sends, so the control built ' +
-        'on it delivers the whole case honestly and proves nothing',
-    ).toBe(true);
+      guaranteed().filter((at) => death.drops(at)).length,
+      'this predicate is true of no message the quiet-topic floor is guaranteed to send, so the ' +
+        'control built on it delivers the whole case honestly and proves nothing',
+    ).toBeGreaterThan(0);
   });
 
   /**
@@ -375,7 +451,7 @@ describe('every way a live path can die is reached by the case built to catch it
    * reads in the report as coverage on the runs it happens to catch.
    */
   it('the count rows sit inside the reach BOTH capability arms guarantee', () => {
-    const counting = LIVE_DEATHS.filter((d) => d.when.includes('message on a subscription'));
+    const counting = LIVE_DEATHS.filter((d) => d.axis === 'count');
     expect(counting.length).toBeGreaterThan(1);
     for (const d of counting) {
       expect(
@@ -389,24 +465,55 @@ describe('every way a live path can die is reached by the case built to catch it
   });
 
   // A cap on SUBSCRIPTIONS is not a delivery predicate, so no row above can place it: what makes it
-  // reachable is the suite opening more of them than the cap admits.
+  // reachable is the suite opening more of them than the cap admits. Compare the two BINDINGS: the
+  // cap used to be spelled `LIVE_SUBSCRIPTIONS - 1`, which made "the suite opens more than the
+  // control drops" true for every value that constant could take, including one that reaches
+  // nothing a session does.
   it('the suite opens more live subscriptions than the control it stands up drops', () => {
-    expect(LIVE_SUBSCRIPTIONS).toBeGreaterThan(2);
+    expect(LIVE_SUBSCRIPTIONS).toBeGreaterThan(SUBSCRIPTION_CAP);
+  });
+
+  // …and the same comparison for ORDER. The reorder control shuffles a batch of REORDER_ABOVE, so
+  // it fires on every run only while the narrowest burst the tail case draws is wider than that.
+  it('the narrowest burst the suite draws is wider than the batch the reorder control shuffles', () => {
+    expect(BURST_POSTS_MIN).toBeGreaterThan(REORDER_ABOVE);
+    expect(BURST_POSTS_MAX).toBeGreaterThanOrEqual(BURST_POSTS_MIN);
   });
 
   // The latency control is the one row that does not drop, so no predicate above can place it: it
   // has to arrive late enough to fail the bound and early enough that the suite is still waiting.
+  // Both figures are IMPORTED: the control's own delay is derived from these two, and a check that
+  // recomputed it here graded its own arithmetic — halving `QUIET_DELIVERY_MS` in the suite left
+  // this row green while the control that depends on it stopped failing anything.
   it('the late-delivery control lands between the bound it fails and the wait it must survive', () => {
-    const late = (QUIET_DELIVERY_MS + DELIVERY_MS) / 2;
-    expect(late).toBeGreaterThan(QUIET_DELIVERY_MS);
-    expect(late).toBeLessThan(DELIVERY_MS);
+    expect(LATE_DELIVERY_MS).toBeGreaterThan(QUIET_DELIVERY_MS);
+    expect(LATE_DELIVERY_MS).toBeLessThan(DELIVERY_MS);
   });
 });
 
 describe('the suite rejects a non-conformant plugin', () => {
+  /**
+   * The evidence, kept. Every row in this describe is scored out of the child's report, and each
+   * variant is bounded from above by a radius many of them sit exactly at — so one flaky case
+   * anywhere in that child run reddens one row here and nothing else. Diagnosing which case, and
+   * whether the child agreed with itself, is only possible from the run that produced it.
+   */
+  it('kept the child run beside this one, so a row that reddens can be diagnosed', () => {
+    expect(keptRun).not.toBe('');
+    expect(
+      [join(keptRun, 'report.json'), join(keptRun, 'run.log')].filter((f) => !existsSync(f)),
+      'the child run did not outlive this one. A row below that reddens once in many runs then ' +
+        'leaves nothing to read: not which cases the child failed, not its output, not even ' +
+        'whether the child agreed with itself',
+    ).toEqual([]);
+    const kept = JSON.parse(readFileSync(join(keptRun, 'report.json'), 'utf8')) as JsonReport;
+    expect(kept.testResults.flatMap((f) => f.assertionResults).length).toBe(results().length);
+    expect(readFileSync(join(keptRun, 'run.log'), 'utf8').length).toBeGreaterThan(0);
+  });
+
   // Without this the per-variant rows below read an empty report and pass having graded nothing.
   it('the child run collected every broken variant', () => {
-    expect(report, stdout.slice(-4_000)).toBeDefined();
+    expect(report, `${keptRun}\n${stdout.slice(-4_000)}`).toBeDefined();
     expect(results().length).toBeGreaterThan(BROKEN_VARIANTS.length);
     for (const variant of BROKEN_VARIANTS) {
       expect(rowsOf(variant.name).length, `no rows collected for "${variant.name}"`).toBeGreaterThan(
@@ -492,7 +599,8 @@ describe('the suite rejects a non-conformant plugin', () => {
         failed.length,
         `"${name}" may fail at most ${radius} of ${suiteCases()} cases and failed ` +
           `${failed.length}. Either the mutation now breaks more than it is aimed at — in which ` +
-          `case it no longer shows "${mustFail}" is alive — or its blastRadius needs raising:\n` +
+          `case it no longer shows "${mustFail}" is alive — or its blastRadius needs raising. ` +
+          `The child run that produced this is kept at ${keptRun}:\n` +
           titles,
       ).toBeLessThanOrEqual(radius);
     },

@@ -206,7 +206,7 @@ describe('public barrel surface', () => {
     RemoteHttpServer: ['app', 'close', 'listen'],
     SeenSet: ['constructor', 'firstSeen', 'has', 'markSeen'],
     ShutdownHost: ['on', 'stdin'],
-    ToolDeps: ['allow', 'blockMaxMs', 'blockPollIntervalMs', 'identity', 'plugin', 'seen'],
+    ToolDeps: ['allow', 'blockMaxMs', 'blockPollIntervalMs', 'identity', 'plugin', 'readState', 'seen'],
     TopicNotAllowedError: ['constructor'],
     UnsafePatternError: ['constructor'],
   };

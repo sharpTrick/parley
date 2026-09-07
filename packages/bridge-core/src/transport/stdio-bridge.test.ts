@@ -1,9 +1,15 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../config.js';
 import {
   asBackendMsgId,
   asCursor,
+  asHandle,
+  asTopic,
   type BackendMsgId,
   type Handle,
   type Message,
@@ -17,6 +23,7 @@ import type {
   FetchRecentResult,
   MessageHandler,
 } from '../seam.js';
+import { FakePlugin } from '../testing/fake-plugin.js';
 import { unhandledDuring } from '../testing/failure-shapes.js';
 import { buildBridge } from './stdio-bridge.js';
 
@@ -384,4 +391,104 @@ describe('bridge attach ordering + rollback', () => {
       );
     });
   });
+});
+
+/**
+ * CLASS: the catch-up-on-start convention, run end to end through the composition root the way
+ * `docs/CONVENTIONS.md` tells a session to run it. The promise the whole lossy-push contract rests
+ * on is "what push leaves out, the next `parley_fetch_recent` returns", and it was TRUE at the seam
+ * and FALSE through this procedure on every backend: the on-start driver paged over the backlog and
+ * advanced the persisted position without emitting, and the tool had no access to that position, so
+ * a since-less call answered with the backend's newest window. Measured on five certified backends,
+ * a session down while 250 messages arrived saw 100 and missed 150 — in session two, and in every
+ * session after it.
+ *
+ * Graded through `buildBridge` rather than through `catchUpTopic` and `registerTools` separately:
+ * each half is conformant on its own, and it is the composition that lost the messages.
+ */
+describe('a session that was down catches up through the documented procedure', () => {
+  /** Well past one page, so the newest page is not the whole backlog. */
+  const MISSED = 12;
+  const PAGE = 5;
+
+  const bridgeOn = async (
+    plugin: BackendPlugin,
+    statePath: string,
+  ): Promise<{ client: Client; shutdown: () => Promise<void> }> => {
+    const cfg = parseConfig({
+      identity: { handle: 'agent' },
+      topics: ['ctx'],
+      state_path: statePath,
+      live_push: { enabled: false },
+    });
+    const bridge = await buildBridge(plugin, cfg);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'session', version: '0' }, { capabilities: {} });
+    await Promise.all([bridge.server.connect(serverT), client.connect(clientT)]);
+    return {
+      client,
+      shutdown: async () => {
+        await client.close();
+        await bridge.shutdown();
+      },
+    };
+  };
+
+  /** The procedure verbatim: no cursor first, then the one handed back, until a page is empty. */
+  const catchUp = async (client: Client): Promise<string[]> => {
+    const got: string[] = [];
+    let since: string | undefined;
+    for (let page = 0; page <= MISSED; page++) {
+      const args: Record<string, unknown> = { topic: 'ctx', limit: PAGE };
+      if (since !== undefined) args.since = since;
+      const out = JSON.parse(
+        ((await client.callTool({ name: 'parley_fetch_recent', arguments: args })) as {
+          content: { text: string }[];
+        }).content[0]!.text,
+      ) as { messages: { content: string }[]; nextCursor?: string };
+      if (out.messages.length === 0) return got;
+      got.push(...out.messages.map((m) => m.content));
+      if (out.nextCursor === undefined || out.nextCursor === since) return got;
+      since = out.nextCursor;
+    }
+    return got;
+  };
+
+  it('reaches every message that arrived while it was gone, oldest first', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'parley-bridge-catchup-'));
+    const statePath = join(dir, 'read-state.json');
+    const store = new FakePlugin();
+    const T = asTopic('ctx');
+    const peer = asHandle('bob');
+    try {
+      await store.connect({});
+      await store.post(T, peer, 'read-in-session-one');
+
+      const first = await bridgeOn(store, statePath);
+      expect(await catchUp(first.client)).toEqual(['read-in-session-one']);
+      await first.shutdown();
+
+      // …down, while more arrives than one page holds.
+      await store.connect({});
+      const missed = Array.from({ length: MISSED }, (_unused, i) => `missed-${i}`);
+      for (const content of missed) await store.post(T, peer, content);
+
+      const second = await bridgeOn(store, statePath);
+      expect(
+        await catchUp(second.client),
+        'on-start catch-up consumed the backlog and the tool answered from the far side of it: ' +
+          'the session ran the documented procedure and the older half is now unreachable, ' +
+          'because every later call asks from further on still',
+      ).toEqual(missed);
+      await second.shutdown();
+
+      // A third session starts, catches up, and is handed nothing it has already read.
+      await store.connect({});
+      const third = await bridgeOn(store, statePath);
+      expect(await catchUp(third.client)).toEqual([]);
+      await third.shutdown();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

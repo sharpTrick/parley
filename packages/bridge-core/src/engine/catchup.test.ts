@@ -37,23 +37,30 @@ async function seeded(n: number, prefix = 'm') {
 }
 
 describe('catch-up driver', () => {
-  it('drains all, warms the seen-set, advances read-state', async () => {
+  it('drains all, warms the seen-set, and leaves the read position where it found it', async () => {
     const p = await seeded(5);
     const readState = new ReadStateStore(rsPath());
     const seen = new SeenSet();
     const n = await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen });
     expect(n).toBe(5);
-    expect(readState.get(T)).toBe('5'); // cursor of the last message
     expect(seen.has(T, asBackendMsgId('5'))).toBe(true);
     // warmed: a message already pulled should NOT count as first-seen on the push path
     expect(seen.firstSeen(T, asBackendMsgId('3'))).toBe(false);
+    // The five it just paged over are the five `parley_fetch_recent` still owes the agent, and the
+    // stored position is that tool's record of what the agent has been handed. A driver that
+    // advanced it here consumed the backlog invisibly: the agent's next since-less call resumed
+    // from the far end and answered with the newest window, and everything before it was gone.
+    expect(
+      readState.get(T),
+      'on-start catch-up advanced the read position past a backlog it never handed anyone',
+    ).toBeUndefined();
   });
 
   /**
-   * The driver writes whatever `nextCursor` a page carried straight into read-state, and the seam's
-   * TYPE is no guarantee — a JS plugin, or a TS one returning a value typed away, can omit it. The
-   * persisted position is the only thing standing between a restart and a cold re-drain, so require
-   * that a page core cannot use fails on the page that produced it rather than erasing the position.
+   * The seam's TYPE is no guarantee — a JS plugin, or a TS one returning a value typed away, can
+   * omit `nextCursor` or spell it as something no cursor can be. The driver pages over such an
+   * answer without persisting anything, so the position a restart resumes from survives it; the
+   * refusal itself belongs to the tool that does the writing, and `tools.test.ts` grades it there.
    */
   it.each([
     ['no nextCursor at all', {}],
@@ -71,20 +78,22 @@ describe('catch-up driver', () => {
 
     await expect(
       catchUpTopic({ plugin, topic: T, limit: 10, readState, seen: new SeenSet() }),
-    ).rejects.toThrow(TypeError);
+    ).resolves.toBe(0);
     expect(readState.get(T)).toBe('42');
     expect(new ReadStateStore(path).get(T)).toBe('42');
   });
 
-  it('second catch-up returns only newer (exclusive since)', async () => {
+  it('a resumed catch-up reads only newer (exclusive since)', async () => {
     const p = await seeded(3, 'a');
     const readState = new ReadStateStore(rsPath());
     const seen = new SeenSet();
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(3);
     for (let i = 0; i < 2; i++) await p.post(T, me, `b${i}`);
+    // The agent read the first three through the tool, which is what moves the position.
+    readState.set(T, asCursor('3'));
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(2);
-    expect(readState.get(T)).toBe('5');
-    // fully drained → no further messages
+    readState.set(T, asCursor('5'));
+    // caught up → no further messages
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(0);
   });
 
@@ -280,7 +289,7 @@ describe('catch-up driver', () => {
         seen: new SeenSet(),
       });
       expect(total).toBe(4);
-      expect(readState.get(T)).toBe('4');
+      expect(readState.get(T)).toBeUndefined();
     });
 
   });
@@ -288,24 +297,25 @@ describe('catch-up driver', () => {
   /**
    * How much a cold start actually drains is a function of BOTH inputs — stored cursor and page
    * size — and the loop silently reads only the newest window when there is no cursor. Pin the
-   * exact drained count and final read-state per cell, against the SHARED fake: a bespoke
-   * conformant-window plugin here would leave the shared one free to keep answering a since-less
-   * read backwards, which is how this grid came to be the only place the clause was visible.
+   * exact drained count per cell, and the position it started from as the position it ends at,
+   * against the SHARED fake: a bespoke conformant-window plugin here would leave the shared one
+   * free to keep answering a since-less read backwards, which is how this grid came to be the only
+   * place the clause was visible.
    */
   describe('drained window depends on stored-cursor × page-size', () => {
     it.each([
-      // stored cursor | total | limit | drained | final read-state
-      [undefined, 2, 3, 2, '2'],
-      [undefined, 3, 3, 3, '3'],
-      [undefined, 10, 3, 3, '10'], // cold start adopts the newest window's tail: 7 rows never drained
-      [undefined, 1000, 100, 100, '1000'],
-      ['0', 2, 3, 2, '2'],
-      ['0', 3, 3, 3, '3'],
-      ['0', 10, 3, 10, '10'], // resumed catch-up pages to exhaustion
-      ['5', 10, 3, 5, '10'],
+      // stored cursor | total | limit | drained
+      [undefined, 2, 3, 2],
+      [undefined, 3, 3, 3],
+      [undefined, 10, 3, 3], // cold start reads the newest window: 7 rows never paged over
+      [undefined, 1000, 100, 100],
+      ['0', 2, 3, 2],
+      ['0', 3, 3, 3],
+      ['0', 10, 3, 10], // resumed catch-up pages to exhaustion
+      ['5', 10, 3, 5],
     ])(
-      'stored=%s total=%i limit=%i drains %i and leaves read-state at %s',
-      async (stored, total, limit, drained, finalCursor) => {
+      'stored=%s total=%i limit=%i drains %i and leaves the position at stored',
+      async (stored, total, limit, drained) => {
         const readState = new ReadStateStore(rsPath());
         if (stored !== undefined) readState.set(T, asCursor(stored));
         const n = await catchUpTopic({
@@ -316,7 +326,7 @@ describe('catch-up driver', () => {
           seen: new SeenSet(),
         });
         expect(n).toBe(drained);
-        expect(readState.get(T)).toBe(finalCursor);
+        expect(readState.get(T)).toBe(stored);
       },
     );
   });
@@ -355,17 +365,19 @@ describe('catch-up driver', () => {
       expect(calls).toHaveLength(MAX_CATCHUP_PAGES);
     });
 
-    // Every page rewrites the state file, so an unbounded loop is a disk hazard as well as a CPU
-    // one: the ceiling has to hold with the REAL store, not only the in-memory stand-in above.
-    it('a stuck cursor stops before it can rewrite the state file more than a handful of times', async () => {
+    // The ceiling has to hold with the REAL store, not only the in-memory stand-in above — and the
+    // position a restart resumes from must survive a backend that hands back the same cursor
+    // forever, rather than being moved to a cursor that names no progress.
+    it('a stuck cursor stops in a handful of calls and moves no stored position', async () => {
       const path = rsPath();
       const readState = new ReadStateStore(path);
+      readState.set(T, asCursor('start'));
       const { plugin, calls } = pagingProbe(
         NONCONFORMANT_SHAPES['a full page whose cursor never advances']!.serve,
       );
       await catchUpTopic({ plugin, topic: T, limit: 1_000, readState, seen: new SeenSet() });
       expect(calls.length).toBeLessThan(5);
-      expect(new ReadStateStore(path).get(T)).toBe('stuck');
+      expect(new ReadStateStore(path).get(T)).toBe('start');
     });
 
     /**
@@ -406,7 +418,7 @@ describe('catch-up driver', () => {
     const readState = new ReadStateStore(rsPath());
     const seen = new SeenSet();
     expect(await catchUpAll({ plugin: p, topics: [A, B], limit: 100, readState, seen })).toBe(3);
-    expect(readState.get(A)).toBe('1');
-    expect(readState.get(B)).toBe('3');
+    expect(readState.get(A)).toBeUndefined();
+    expect(readState.get(B)).toBeUndefined();
   });
 });

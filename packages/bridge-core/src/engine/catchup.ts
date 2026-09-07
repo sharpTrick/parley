@@ -9,36 +9,44 @@ export interface CatchUpArgs {
   topic: Topic;
   /** Page size per fetchRecent call. */
   limit: number;
-  readState: ReadStateStore;
+  /**
+   * Where to resume from, and the file that came from. Narrowed to the READING half of
+   * {@link ReadStateStore}, so that the driver cannot advance the agent's read position: the
+   * backlog it pages over is the backlog `parley_fetch_recent` still has to hand the agent, and a
+   * driver that moved the position past it consumed the whole thing invisibly.
+   */
+  readState: Pick<ReadStateStore, 'get' | 'path'>;
   seen: SeenSet;
 }
 
 /**
  * Ceiling on how many pages one topic's catch-up will read. A backend that keeps handing back
  * non-empty pages with an advancing cursor is indistinguishable from a very long topic, so the
- * driver stops and says so rather than pinning a CPU and a state-file rewrite per page forever.
+ * driver stops and says so rather than pinning a CPU per page forever.
  */
 export const MAX_CATCHUP_PAGES = 10_000;
 
 /**
- * Catch-up driver for ONE topic (DESIGN §7). Warms the seen-set and advances the persisted read
- * position. How much it reads depends on whether a cursor was persisted:
+ * Catch-up driver for ONE topic (DESIGN §7). Warms the seen-set from the caller's persisted read
+ * position forward, so the live poll cannot double-emit across the catch-up/live boundary. How much
+ * it reads depends on whether a cursor was persisted:
  *
  *   - RESUMED (a cursor on disk): pages forward from that cursor until the topic is exhausted —
  *     which means an EMPTY page, so exhausting a topic always costs one final empty round-trip.
- *   - COLD START (no cursor): reads the backend's most-recent `limit` window and adopts its tail.
- *     Anything older than that window is outside this instance's catch-up horizon — it is never
- *     drained and never will be, because read-state now points past it.
+ *   - COLD START (no cursor): reads the backend's most-recent `limit` window and pages forward from
+ *     it. Anything older than that window is outside this instance's catch-up horizon.
  *
  * A topic the backend cannot represent yet (`NoSuchTopicError`, recognised by contract via
- * {@link isNoSuchTopicError}) counts as zero messages and leaves read-state untouched — the seam
- * declares that "absent", not a failure, so one missing chat channel must not take the whole bridge
- * down.
+ * {@link isNoSuchTopicError}) counts as zero messages — the seam declares that "absent", not a
+ * failure, so one missing chat channel must not take the whole bridge down.
  *
- * It deliberately does NOT emit to the channel: on-start history is surfaced when the agent
- * calls the `fetch_recent` tool (the pull/push split, §7). The driver's jobs are (a) advance
- * the per-instance read cursor and (b) prevent the live poll from double-emitting across the
- * catch-up/live boundary. Core loops this once per configured topic (§7).
+ * It deliberately does NOT emit to the channel, and it does NOT advance the persisted read
+ * position: on-start history is surfaced when the agent calls the `fetch_recent` tool (the
+ * pull/push split, §7), and read-state is that tool's record of what the AGENT has been handed.
+ * Keep it that way, so that the backlog stays reachable: a driver that advanced the position
+ * consumed the whole backlog invisibly, and a since-less `parley_fetch_recent` — which resumes from
+ * that position — then had nothing to answer with but the newest window, leaving everything between
+ * the two unreachable for good. Core loops this once per configured topic (§7).
  *
  * @returns the number of messages drained.
  */
@@ -64,7 +72,6 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
     // recording their ids here would suppress a later live push on THIS topic that collides with one.
     for (const m of messages) if (m.topic === topic) seen.markSeen(topic, m.backendMsgId);
     total += messages.length;
-    readState.set(topic, nextCursor);
 
     // Keep EMPTY — not "shorter than the requested limit" — as the exhaustion test, so that a
     // backend whose history API caps a page below `limit` (Discord's 100, Telegram, Matrix
@@ -118,7 +125,7 @@ export async function catchUpAll(args: {
   plugin: BackendPlugin;
   topics: Iterable<Topic>;
   limit: number;
-  readState: ReadStateStore;
+  readState: CatchUpArgs['readState'];
   seen: SeenSet;
 }): Promise<number> {
   const { plugin, topics, limit, readState, seen } = args;

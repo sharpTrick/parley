@@ -4,6 +4,7 @@ import { catchUpCases } from './cases/catch-up.js';
 import { concurrencyCases } from './cases/concurrency.js';
 import { liveCases } from './cases/live.js';
 import { postCases } from './cases/post.js';
+import { toolSurfaceCases } from './cases/tool-surface.js';
 import {
   type BackendFactory,
   CAPABILITY_FIELDS,
@@ -42,6 +43,14 @@ export {
 } from './budgets.js';
 export { pageLimitsFor, PAGING_VOLUME } from './cases/catch-up.js';
 export {
+  carriesControlCharacter,
+  CONTENT_SHAPES,
+  isPlainAscii,
+  SHORT_PAYLOAD,
+} from './cases/content.js';
+export {
+  BURST_POSTS_MAX,
+  BURST_POSTS_MIN,
   DELIVERY_MS,
   livePayload,
   LIVE_SUBSCRIPTIONS,
@@ -115,6 +124,7 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     });
     catchUpCases(current);
     postCases(current);
+    toolSurfaceCases(current);
     liveCases(current);
     blockingCases(current);
     concurrencyCases(current);

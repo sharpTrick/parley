@@ -1,6 +1,8 @@
+import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { promisify } from 'node:util';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 /**
  * Every promise this package's README makes, in one table. Filed under the behaviour they happen to
@@ -18,7 +20,14 @@ const FLAT = README.replace(/\s+/g, ' ');
 interface Claim {
   what: string;
   patterns: RegExp[];
-  evidence?: { file: string; pattern: RegExp };
+  /**
+   * Where the README sends a reader, and the case that file must REGISTER for the pointer to be
+   * honest. Matched against the titles vitest COLLECTS from that file, not against its source text:
+   * a regex over another test file's source is satisfied by a `//` comment, so the pointer survived
+   * renaming the suite, moving the phrase into a comment, and finally deleting the whole suite body
+   * — twenty green rows crediting a file that executed nothing.
+   */
+  evidence?: { file: string; registers: RegExp };
 }
 
 /**
@@ -71,24 +80,58 @@ const CLAIMS: Claim[] = [
     patterns: [/executes both halves/i],
     evidence: {
       file: 'test/push-gap-reconciliation.test.ts',
-      pattern: /the start-up window is dark on push and reconciled by the next catch-up/,
+      registers: /^the start-up window is dark on push and reconciled by the next catch-up > /,
     },
   },
   {
     what: 'the pragma read-back',
     patterns: [/read-back|read back/i],
-    evidence: { file: 'test/driver-parity.test.ts', pattern: /PRAGMA \$\{p\.name\}/ },
+    evidence: {
+      file: 'test/driver-parity.test.ts',
+      registers: /reads back every pragma the cross-process story rests on$/,
+    },
   },
   {
     what: 'the -wal sidecar appearing on disk',
     patterns: [/-wal.{0,3} sidecar/i],
-    evidence: { file: 'test/multi-process.test.ts', pattern: /\$\{path\}-wal/ },
+    evidence: {
+      file: 'test/multi-process.test.ts',
+      registers: /WAL is live on disk: a write materializes the -wal sidecar/,
+    },
   },
 ];
 
 const NAMED = [...new Set(CLAIMS.flatMap((c) => (c.evidence === undefined ? [] : [c.evidence.file])))];
 const sentencesNaming = (file: string): string[] =>
   FLAT.split(/(?<=\.)\s/).filter((s) => s.includes(file));
+
+const PACKAGE_DIR = fileURLToPath(new URL('../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const PACKAGE_REL = 'packages/bridge-sqlite';
+
+/**
+ * What vitest actually COLLECTS from each credited file — the run-level fact the pointers are
+ * graded against. `vitest list` imports and registers without running, so a suite that was renamed,
+ * commented out or deleted disappears from here, while its source text can go on containing any
+ * phrase a scanner was written to look for.
+ */
+const registered = new Map<string, string[]>();
+
+beforeAll(async () => {
+  const { stdout } = await promisify(execFile)(
+    'npx',
+    ['vitest', 'list', ...NAMED.map((f) => `${PACKAGE_REL}/${f}`), '--json'],
+    { cwd: REPO_ROOT, maxBuffer: 32 * 1024 * 1024 },
+  );
+  const collected = JSON.parse(stdout.slice(stdout.indexOf('['))) as { name: string; file: string }[];
+  for (const file of NAMED) {
+    const path = fileURLToPath(new URL(file, new URL(`file://${PACKAGE_DIR}`)));
+    registered.set(
+      file,
+      collected.filter((t) => t.file === path).map((t) => t.name),
+    );
+  }
+}, 180_000);
 
 describe('the README states what this package promises', () => {
   for (const c of CLAIMS.filter((claim) => claim.evidence === undefined)) {
@@ -102,7 +145,7 @@ describe('the README credits each claim to the file that grades it', () => {
   for (const c of CLAIMS) {
     const evidence = c.evidence;
     if (evidence === undefined) continue;
-    it(`${c.what} is credited to ${evidence.file}, and that file holds the evidence`, () => {
+    it(`${c.what} is credited to ${evidence.file}, and that file registers the case`, () => {
       const own = sentencesNaming(evidence.file);
       expect(own.length).toBeGreaterThan(0);
       for (const p of c.patterns) {
@@ -111,9 +154,13 @@ describe('the README credits each claim to the file that grades it', () => {
           expect(sentencesNaming(other).filter((s) => p.test(s))).toEqual([]);
         }
       }
+      const names = registered.get(evidence.file) ?? [];
+      expect(names.length, `vitest collected no test at all from ${evidence.file}`).toBeGreaterThan(0);
       expect(
-        readFileSync(fileURLToPath(new URL(`../${evidence.file}`, import.meta.url)), 'utf8'),
-      ).toMatch(evidence.pattern);
+        names.filter((name) => evidence.registers.test(name)),
+        `${evidence.file} registers no case matching ${String(evidence.registers)}, so the README ` +
+          'sends a reader to a file that does not grade what it is credited with',
+      ).not.toEqual([]);
     });
   }
 });

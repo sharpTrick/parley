@@ -12,19 +12,39 @@ export const syncRetryDelayMs = (consecutiveFailures: number): number =>
   Math.min(200 * 2 ** (consecutiveFailures - 1), SYNC_RETRY_MAX_MS);
 
 /**
- * A permanently broken live path is otherwise invisible to the operator, who sees only homeserver
- * load. Rate-limited to powers of two so a long outage cannot itself become the flood.
+ * How often a still-failing `/sync` may say so. The same interval bridge-sqlite's poll loop and
+ * bridge-zulip's push loop report on, so an operator reading three backends' logs reads one shape.
  */
-export function reportSyncFailure(topic: Topic, consecutiveFailures: number, err: unknown): void {
-  if ((consecutiveFailures & (consecutiveFailures - 1)) !== 0) return;
-  // Drop the query string: a `/sync` URL carries the whole JSON room filter, which buries the
-  // status and error body an operator actually needs under a screenful of percent-encoding.
-  const detail = (err instanceof Error ? err.message : String(err)).replace(/\?\S*?(?= →|$)/, '');
-  console.error(
-    `[parley-matrix] /sync failed for topic ${JSON.stringify(String(topic))} ` +
-      `(${consecutiveFailures} consecutive; retrying in ${syncRetryDelayMs(consecutiveFailures)}ms): ${detail}`,
-  );
-}
+export const SYNC_DIAG_INTERVAL_MS = 60_000;
+
+/**
+ * A permanently broken live path is otherwise invisible to the operator, who sees only homeserver
+ * load — and a report point that fires on powers of two of a COUNT reads as a throttle without
+ * being one. {@link syncRetryDelayMs} is capped, so past the cap the interval between report
+ * points grows linearly with the count forever: failure #1024 lands four hours in and #8192
+ * thirty-four, so a path dead for three days says so at hour 34 and then goes quiet for another
+ * day and a half. The count still names WHICH failure this is; the CLOCK decides when it is said.
+ *
+ * Stateful, and one per subscribe loop: the quiet window belongs to the path being reported on,
+ * not to the module, so one dead topic cannot silence another.
+ */
+export const syncFailureReporter = (
+  now: () => number = Date.now,
+): ((topic: Topic, consecutiveFailures: number, err: unknown) => void) => {
+  let quietUntil = -1;
+  return (topic, consecutiveFailures, err) => {
+    const at = now();
+    if (at < quietUntil) return;
+    quietUntil = at + SYNC_DIAG_INTERVAL_MS;
+    // Drop the query string: a `/sync` URL carries the whole JSON room filter, which buries the
+    // status and error body an operator actually needs under a screenful of percent-encoding.
+    const detail = (err instanceof Error ? err.message : String(err)).replace(/\?\S*?(?= →|$)/, '');
+    console.error(
+      `[parley-matrix] /sync failed for topic ${JSON.stringify(String(topic))} ` +
+        `(${consecutiveFailures} consecutive; retrying in ${syncRetryDelayMs(consecutiveFailures)}ms): ${detail}`,
+    );
+  };
+};
 
 /**
  * A `/sync` loop ended on something its retry ladder did not contain: live delivery for this topic

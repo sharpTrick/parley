@@ -1,13 +1,21 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { MAX_BLOCK_MS, parseConfig } from '../config.js';
+import { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asBackendMsgId, asHandle, asTopic } from '../message.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic, type Cursor, type Topic } from '../message.js';
 import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
 import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
-import { NONCONFORMANT_SHAPES, NONCONFORMANT_SHAPE_NAMES } from '../testing/nonconformant.js';
+import {
+  memoryReadState,
+  NONCONFORMANT_SHAPES,
+  NONCONFORMANT_SHAPE_NAMES,
+} from '../testing/nonconformant.js';
 import { harness, parse, type ToolText } from '../testing/tool-harness.js';
 import { MAX_FETCH_LIMIT, TOOL_TEXT, toolDepsFor } from './tools.js';
 
@@ -298,6 +306,192 @@ describe('a result-returning tool bounds the page it hands back, not only the on
     if (out.messages.length < served.length) expect(out.nextCursor).toBe(out.messages.at(-1)!.cursor);
     // The dedup window still holds the FIRST id of the page: an oversized warm-up evicts it.
     expect(deps.seen!.has(T, asBackendMsgId(out.messages[0]!.backendMsgId))).toBe(true);
+  });
+});
+
+/**
+ * The reconciliation the catch-up-on-start convention promises, at the surface an agent actually
+ * calls. `subscribe` is lossy by contract and what it leaves out is "returned by the next
+ * `parley_fetch_recent`" — but a since-less call used to answer with the backend's RECENT WINDOW,
+ * so a session away while more than a window arrived could never reach the older part of it: the
+ * on-start driver paged over the backlog and every call the agent made asked for the newest page of
+ * a topic that had moved on. Measured through the documented procedure on five backends, a session
+ * down for 250 messages saw 100 and missed 150, in session two and in every session after it.
+ */
+describe('parley_fetch_recent resumes from where this instance last read', () => {
+  const T = asTopic('ctx');
+  const bob = asHandle('bob');
+  /** Well past what one page carries, so the newest page is not the whole backlog. */
+  const MISSED = 12;
+  const PAGE = 5;
+
+  /** The procedure CONVENTIONS.md ships: no cursor first, then the one handed back, until empty. */
+  const drainAsAnAgentWould = async (client: Client): Promise<string[]> => {
+    const got: string[] = [];
+    let since: string | undefined;
+    for (let page = 0; page <= MISSED; page++) {
+      const args: Record<string, unknown> = { topic: 'ctx', limit: PAGE };
+      if (since !== undefined) args.since = since;
+      const out = parse(await client.callTool({ name: 'parley_fetch_recent', arguments: args })) as {
+        messages: Array<{ content: string }>;
+        nextCursor?: string;
+      };
+      if (out.messages.length === 0) return got;
+      got.push(...out.messages.map((m) => m.content));
+      if (out.nextCursor === undefined || out.nextCursor === since) return got;
+      since = out.nextCursor;
+    }
+    return got;
+  };
+
+  it('a session that was down reaches every message it missed, oldest first', async () => {
+    const readState = memoryReadState();
+    const { client, plugin } = await harness({ readState });
+    await plugin.post(T, bob, 'read-in-session-one');
+    expect(await drainAsAnAgentWould(client)).toEqual(['read-in-session-one']);
+
+    for (let i = 0; i < MISSED; i++) await plugin.post(T, bob, `missed-${i}`);
+
+    const missed = Array.from({ length: MISSED }, (_unused, i) => `missed-${i}`);
+    expect(
+      await drainAsAnAgentWould(client),
+      'the agent followed the documented procedure and never reached the oldest of what it ' +
+        'missed: a since-less read answered with the newest page instead of resuming from this ' +
+        "instance's own position, and every page after it only moved further from the gap",
+    ).toEqual(missed);
+    // …and a session that has caught up is not handed it all a second time.
+    expect(await drainAsAnAgentWould(client)).toEqual([]);
+  });
+
+  it('a fetch with no read position still answers with the recent window', async () => {
+    const { client, plugin } = await harness({ readState: undefined });
+    for (let i = 0; i < MISSED; i++) await plugin.post(T, bob, `m${i}`);
+    const out = parse(
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: PAGE } }),
+    ) as { messages: Array<{ content: string }> };
+    expect(out.messages.map((m) => m.content)).toEqual(['m7', 'm8', 'm9', 'm10', 'm11']);
+  });
+
+  it('advances the position to what the page COVERED, and leaves it alone when it has not moved', async () => {
+    const writes: string[] = [];
+    const inner = memoryReadState();
+    const readState = {
+      get: (t: Topic): Cursor | undefined => inner.get(t),
+      set: (t: Topic, c: Cursor): void => {
+        writes.push(String(c));
+        inner.set(t, c);
+      },
+    };
+    const { client, plugin } = await harness({ readState });
+    for (let i = 0; i < 3; i++) await plugin.post(T, bob, `m${i}`);
+
+    await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: 2 } });
+    expect(readState.get(T)).toBe('3');
+
+    for (let idle = 0; idle < 3; idle++) {
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } });
+    }
+    expect(
+      writes,
+      'a read that covered nothing new rewrote the position anyway — an idle agent polling a quiet ' +
+        'topic pays a state-file rewrite per tick for a position that never moved',
+    ).toEqual(['3']);
+
+    await plugin.post(T, bob, 'fresh');
+    await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } });
+    expect(writes).toEqual(['3', '4']);
+  });
+
+  /**
+   * A cursor the CALLER supplies is not evidence of anything: `since` is an argument the model
+   * fills in, and the model's context is untrusted inbound message content. One AHEAD of the
+   * stored position drags that position over a region the agent was never handed — measured at
+   * a position of `q-4`, one call carrying `q-19` moved it to `q-24` and the next since-less page
+   * opened at `q-25`, so `q-5…q-19` were unreachable by resume for good. One BEHIND is harmless
+   * (a rewind costs duplicates, which the seen-set absorbs) and still must not move it, because
+   * the position records what the agent has been handed and a re-read hands it nothing new.
+   *
+   * So the position advances only on a read that really RESUMED from it — which is what the
+   * documented paging loop does on every call, and what an arbitrary `since` does not.
+   */
+  it.each([
+    ['ahead of', 19],
+    ['behind', 2],
+  ])('a since %s the stored position does not move it', async (_where, since) => {
+    const readState = memoryReadState();
+    const { client, plugin } = await harness({ readState });
+    for (let i = 0; i < 25; i++) await plugin.post(T, bob, `q-${i}`);
+    readState.set(T, asCursor('5'));
+
+    const jumped = parse(
+      await client.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', since: String(since), limit: PAGE },
+      }),
+    ) as { messages: Array<{ content: string }> };
+    expect(jumped.messages.length).toBeGreaterThan(0);
+
+    expect(
+      String(readState.get(T)),
+      "a cursor the caller chose moved this instance's read position. Ahead of it that strands " +
+        'every message in between — the next since-less read opens past them and nothing ever ' +
+        'asks for them again',
+    ).toBe('5');
+
+    // …and the resume still opens exactly where the agent left off.
+    const resumed = parse(
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: PAGE } }),
+    ) as { messages: Array<{ content: string }> };
+    expect(resumed.messages.map((m) => m.content)).toEqual(['q-5', 'q-6', 'q-7', 'q-8', 'q-9']);
+  });
+
+  it('the documented loop advances it, because every page resumes from where the last stopped', async () => {
+    const readState = memoryReadState();
+    const { client, plugin } = await harness({ readState });
+    for (let i = 0; i < 25; i++) await plugin.post(T, bob, `q-${i}`);
+    readState.set(T, asCursor('5'));
+    expect(await drainAsAnAgentWould(client)).toEqual(
+      Array.from({ length: 20 }, (_unused, i) => `q-${i + 5}`),
+    );
+    expect(readState.get(T)).toBe('25');
+  });
+
+  /**
+   * The seam's TYPE is no guarantee: a JS plugin, or a TS one returning a value typed away, can
+   * omit `nextCursor` or spell it as something no cursor can be. The position a restart resumes
+   * from is the only thing between the agent and a cold re-read, so a page core cannot record has
+   * to fail on the page that produced it rather than erase the position — and it must fail BEFORE
+   * the dedup warm-up, or the ids of a page the agent never received are suppressed on the push
+   * path too.
+   */
+  it.each([
+    ['no nextCursor at all', 'kept', {}],
+    ['a null nextCursor', 'refused', { nextCursor: null }],
+    ['a numeric nextCursor', 'refused', { nextCursor: 7 }],
+    ['an empty-string nextCursor', 'refused', { nextCursor: '' }],
+  ])('a page carrying %s is %s without moving the stored position', async (_label, outcome, over) => {
+    const readState = new ReadStateStore(join(mkdtempSync(join(tmpdir(), 'parley-tools-')), 'rs.json'));
+    readState.set(T, asCursor('42'));
+    const { client, plugin, deps } = await harness({ readState });
+    const kept = await plugin.post(T, bob, 'body');
+    plugin.fetchRecent = async (args) => ({
+      ...(await FakePlugin.prototype.fetchRecent.call(plugin, args)),
+      ...over,
+    }) as never;
+
+    const res = (await client.callTool({
+      name: 'parley_fetch_recent',
+      arguments: { topic: 'ctx' },
+    })) as ToolText;
+    expect(res.isError === true).toBe(outcome === 'refused');
+    expect(readState.get(T)).toBe('42');
+    if (outcome === 'refused') {
+      expect(
+        deps.seen!.has(T, kept),
+        'a page the caller never received was recorded as delivered, so the push loop will drop ' +
+          'it too — the read is lost on both paths at once',
+      ).toBe(false);
+    }
   });
 });
 

@@ -11,7 +11,7 @@ import {
 } from './config.js';
 import { emptyWindowCursor, requireLimit } from './cursor.js';
 import {
-  membershipLost, reportLoopCrash, reportSyncFailure, syncRetryDelayMs,
+  membershipLost, reportLoopCrash, syncFailureReporter, syncRetryDelayMs,
 } from './diagnostics.js';
 import {
   INCREMENTAL_TIMELINE_LIMIT, MatrixTimeline, returnedTooFast, SYNC_IDLE_PACE_MS,
@@ -154,6 +154,7 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
 
     const loop = async (): Promise<void> => {
       let consecutiveFailures = 0;
+      const reportSyncFailure = syncFailureReporter();
       while (!this.isStale(generation)) {
         const started = Date.now();
         // Keep EVERY use of the parsed body inside this try, so that a malformed-but-parseable
