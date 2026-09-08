@@ -9,18 +9,33 @@ import { defineConfig } from 'vitest/config';
 const fromHere = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 /**
- * Derive this from `packages/` rather than hand-listing it, so that a package missing from the map
- * cannot resolve through the workspace symlink and have its tests grade a stale `dist/` build.
+ * Derive this from each package's own `exports` map rather than hand-listing it, so that a package
+ * or a SUBPATH missing from the table cannot resolve through the workspace symlink and have its
+ * tests grade a stale `dist/` build. A vite string alias matches by PREFIX, so `<pkg>/testing` would
+ * otherwise be rewritten to `<pkg>/src/index.ts/testing` — longest key first, and exact-match on the
+ * bare package name, is what keeps the two apart.
  */
-function packageAliases(): Record<string, string> {
+function packageAliases(): { find: string | RegExp; replacement: string }[] {
   const root = new URL('./packages/', import.meta.url);
-  const out: Record<string, string> = {};
+  const out: { find: string | RegExp; replacement: string }[] = [];
   for (const dir of readdirSync(root)) {
     const manifest = new URL(`${dir}/package.json`, root);
-    const { name } = JSON.parse(readFileSync(manifest, 'utf8')) as { name: string };
-    out[name] = fromHere(`./packages/${dir}/src/index.ts`);
+    const { name, exports } = JSON.parse(readFileSync(manifest, 'utf8')) as {
+      name: string;
+      exports?: Record<string, { default?: string } | string>;
+    };
+    for (const [subpath, target] of Object.entries(exports ?? {})) {
+      if (subpath === './package.json') continue;
+      const dist = typeof target === 'string' ? target : target.default;
+      if (dist === undefined) continue;
+      const src = dist.replace(/^\.\/dist\//, './src/').replace(/\.js$/, '.ts');
+      out.push({
+        find: subpath === '.' ? new RegExp(`^${name.replace('/', '\\/')}$`) : `${name}${subpath.slice(1)}`,
+        replacement: fromHere(`./packages/${dir}/${src.slice(2)}`),
+      });
+    }
   }
-  return out;
+  return out.sort((a, b) => String(b.find).length - String(a.find).length);
 }
 
 export default defineConfig({

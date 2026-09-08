@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { MAX_ERROR_BODY } from '../src/index.js';
 import {
   FORBIDDEN_IN_RENDER,
-  MAX_ERROR_BODY,
   NEVER_RENDERABLE,
   RENDER_LEAK_SENTINEL,
   UNSAFE_TEXT,
-} from '../src/index.js';
+} from '../src/testing/index.js';
 import { describeConfigShape, describeConfigValue } from '../src/config-value.js';
 
 const SECRET = 'PLANTED-SECRET-8f3a';

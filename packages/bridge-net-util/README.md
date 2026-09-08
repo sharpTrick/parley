@@ -131,17 +131,27 @@ seam error into.
   `an array`), never enumerated, and a `key` naming a credential carrier — `password`, `token`,
   `url`, `cert`, … — is described by shape whatever type it arrives as, so a secret nested anywhere
   inside a mistyped value never reaches a log line.
+
+## Testing subpath
+
+`@sharptrick/parley-net-util/testing` carries the corpora and the harness a BACKEND crosses over its
+own `backend_config` validator. Kept off the production entry point, so the shipped module stays
+dependency-free; `vitest` is an optional peer, needed only by whoever imports this subpath.
+
+- **`expectLabelledRefusal(plugin, spec)`** — the whole class in one call. A backend states its own
+  label, keys and entry point; the harness crosses `NEVER_RENDERABLE`, `WRAPPING_A_SECRET` and
+  `UNSAFE_TEXT` over them and asserts what is the same everywhere: the refusal is still the PLUGIN's
+  labelled load error, it names the key, it is one bounded line, and it carries neither the caller's
+  own text nor anything a container held.
+- **`NEVER_RENDERABLE`** / **`RENDER_LEAK_SENTINEL`** — the values that break a naive renderer
+  (circular, bigint, null-prototype, no JSON form and no string form, a `toJSON` that raises
+  `RENDER_LEAK_SENTINEL`).
+- **`WRAPPING_A_SECRET`** / **`PLANTED_SECRET`** — containers holding a secret, for the branch that
+  admits every non-string.
 - **`UNSAFE_TEXT`** / **`FORBIDDEN_IN_RENDER`** — the text corpus and the code-point class no
-  rendered value may carry: a line or paragraph separator, a bidi override, a control character, or
-  4KiB of one character. Every entry survives `JSON.stringify` intact, so these are the rows that
-  actually reach `sanitizeBody` — a hostile OBJECT never does, because it is described rather than
-  rendered.
-- **`NEVER_RENDERABLE`** / **`RENDER_LEAK_SENTINEL`** — the corpus `describeConfigValue` is graded
-  against, published with it: the values that break a naive renderer (circular, bigint,
-  null-prototype, no JSON form and no string form, a `toJSON` that raises `RENDER_LEAK_SENTINEL`).
-  A backend crosses it over its own validator to hold the invariant where it matters — that the
-  refusal an operator reads is still the PLUGIN's labelled load error, not whatever the caller's
-  value raised.
+  rendered value may carry: a line or paragraph separator, a bidi override, or 4KiB of one
+  character. Every entry survives `JSON.stringify` intact, so these are the rows that actually reach
+  `sanitizeBody` — a hostile OBJECT never does, because it is described rather than rendered.
 
 ## Plaintext-credential classification
 

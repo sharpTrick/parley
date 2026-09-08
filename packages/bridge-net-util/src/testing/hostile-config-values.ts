@@ -31,7 +31,7 @@ const textless = (): unknown =>
  */
 export const RENDER_LEAK_SENTINEL = 'rendering me leaks this line';
 
-export const NEVER_RENDERABLE: Array<[string, unknown]> = [
+export const NEVER_RENDERABLE: readonly (readonly [string, unknown])[] = [
   ['a circular array', circular()],
   ['a circular object', selfReferential()],
   [
@@ -58,7 +58,7 @@ export const NEVER_RENDERABLE: Array<[string, unknown]> = [
  * these rows live where a hostile OBJECT is not — a container is described by shape and never
  * rendered, so only a PRIMITIVE reaches the sanitiser at all.
  */
-export const UNSAFE_TEXT: Array<[string, string]> = [
+export const UNSAFE_TEXT: readonly (readonly [string, string])[] = [
   ['a LINE SEPARATOR (U+2028)', 'before\u2028after'],
   ['a PARAGRAPH SEPARATOR (U+2029)', 'before\u2029after'],
   ['a RIGHT-TO-LEFT OVERRIDE (U+202E)', 'before\u202Eafter'],
@@ -68,3 +68,19 @@ export const UNSAFE_TEXT: Array<[string, string]> = [
 
 /** Every code point a rendered value may not carry: Unicode control, format, and the two separators. */
 export const FORBIDDEN_IN_RENDER = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
+/** A secret nobody could reach any other way, so finding it in a message means the message leaked it. */
+export const PLANTED_SECRET = 'PLANTED-SECRET-8f3a';
+
+/**
+ * Containers holding {@link PLANTED_SECRET}. The branch that hands a rejected value to a renderer
+ * reads "not a non-empty string", which admits every one of these — so a renderer that ENUMERATES
+ * one puts the secret in the operator's log and in the model context core renders a seam error into,
+ * whatever key it was written under.
+ */
+export const WRAPPING_A_SECRET: readonly (readonly [string, unknown])[] = [
+  ['an object', { password: PLANTED_SECRET }],
+  ['an array', [PLANTED_SECRET]],
+  ['a nested object', { outer: { inner: [PLANTED_SECRET] } }],
+  ['a null-prototype object', Object.assign(Object.create(null) as object, { v: PLANTED_SECRET })],
+];

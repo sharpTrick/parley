@@ -1,4 +1,4 @@
-import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '@sharptrick/parley-net-util';
+import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '@sharptrick/parley-net-util/testing';
 
 export { RENDER_LEAK_SENTINEL };
 
@@ -75,7 +75,7 @@ const rejectedByShape: Record<string, Array<[string, unknown]>> = {
  * Every knob crossed with every value it must refuse. Built by APPENDING the shared shapes rather
  * than listing them per knob, so a knob added later cannot get the value axis half-applied.
  */
-export const rejectedByKnob: Record<string, Array<[string, unknown]>> = Object.fromEntries(
+export const rejectedByKnob: Record<string, (readonly [string, unknown])[]> = Object.fromEntries(
   Object.entries(rejectedByShape).map(([knob, values]) => [knob, [...values, ...NEVER_RENDERABLE]]),
 );
 
