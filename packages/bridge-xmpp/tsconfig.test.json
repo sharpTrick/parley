@@ -3,7 +3,7 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": ".",
+    "rootDir": "..",
     "tsBuildInfoFile": "tsconfig.test.tsbuildinfo",
     "baseUrl": ".",
     "paths": { "@sharptrick/parley-xmpp": ["./src/index.ts"] }
@@ -13,6 +13,6 @@
     { "path": "../bridge-net-util" },
     { "path": "../conformance" }
   ],
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["src/**/*", "test/**/*", "../bridge-net-util/test/never-renderable.ts"],
   "exclude": []
 }

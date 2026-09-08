@@ -109,6 +109,22 @@ TLS failure into an unenveloped one just by racing it.
   isolates, joiners, BOM) character, plus U+2028/U+2029, replacing unpaired surrogates. It bounds
   and flattens only — the body's words still reach the reader.
 
+## Rejected config values
+
+A backend refuses a `backend_config` value on its SHAPE, and the refusal names the value. Rendering
+it is where five plugins each grew a copy, and where a caller's value gets to fight back: a
+null-prototype object, a bigint, a circular structure the YAML parser builds from an anchor, or a
+`toJSON` that raises all break a naive `String(v)` — the plugin's labelled load error becomes a bare
+`TypeError`, or the caller's own text, in the operator's log and in the model context core renders a
+seam error into.
+
+- **`describeConfigValue(value)`** — the value as one bounded, flattened line, whatever it is. Never
+  throws, and never carries text the value's own rendering raised. `NaN` and `Infinity` stay
+  readable, which `JSON.stringify` alone does not manage.
+- **`describeConfigShape(value)`** — what a value IS (`an object`, `an array`, `the empty string`,
+  `a number`), carrying nothing of what it holds. Use it for a key whose value is a URL or any other
+  credential carrier, so a password in a mistyped value never reaches a log line.
+
 ## Plaintext-credential classification
 
 - `isLoopbackHost(hostname)` — loopback iff the host is exactly `localhost` or a literal

@@ -2,7 +2,8 @@ import {
   assertKnownConfigKeys,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { fromCaller, pluginError } from './diagnostics.js';
+import { describeConfigShape, describeConfigValue } from '@sharptrick/parley-net-util';
+import { pluginError } from './diagnostics.js';
 
 /** The endpoint `url` falls back to when omitted (or `null`). Exported so a test can name it
  * without hard-coding an endpoint of its own. */
@@ -80,41 +81,12 @@ export function resolveConfig(cfg: RedisBackendConfig): ResolvedConfig {
 }
 
 /**
- * Render a rejected config value for an operator; `JSON.stringify` alone turns NaN into `null`.
- *
- * Keep a `url` value out of it entirely, so that a password in a mistyped URL never reaches a log
- * line — the invariant {@link normalizeUrl} keeps, which `normalizeString` runs ahead of and would
- * otherwise break for every `url` that is not a string at all. Keep the rest bounded and flattened,
- * so that a value nobody here authored cannot forge line structure in the error core renders into
- * model context.
+ * Keep a `url` value out of a message entirely, so that a password in a mistyped URL never reaches a
+ * log line — the invariant {@link normalizeUrl} keeps, which `normalizeString` runs ahead of and
+ * would otherwise break for every `url` that is not a string at all.
  */
 function describeValue(key: string, value: unknown): string {
-  if (key === 'url') return shapeOf(value);
-  return fromCaller(render(value));
-}
-
-/**
- * A caller's value as text, or {@link shapeOf} it when it has no text. Keep the whole render inside
- * the catch, so that a value whose own rendering THROWS — a circular structure the YAML parser will
- * build from an anchor, a bigint, a `toJSON`/`toString` that refuses or raises — is still refused by
- * `connect()` as this plugin's own labelled error, rather than escaping as the bare multi-line
- * `TypeError` (or the caller's own thrown message, unsanitised) that the guards around it exist to
- * keep out of an operator's log and the model context core renders a seam error into.
- */
-function render(value: unknown): string {
-  if (typeof value === 'number') return String(value);
-  try {
-    return JSON.stringify(value) ?? String(value);
-  } catch {
-    return shapeOf(value);
-  }
-}
-
-/** What a value IS, carrying nothing of what it holds. */
-function shapeOf(value: unknown): string {
-  if (value === '') return 'the empty string';
-  if (Array.isArray(value)) return 'an array';
-  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+  return key === 'url' ? describeConfigShape(value) : describeConfigValue(value);
 }
 
 /**

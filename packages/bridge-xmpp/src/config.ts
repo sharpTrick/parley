@@ -3,7 +3,7 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { isLoopbackHost } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isLoopbackHost } from '@sharptrick/parley-net-util';
 
 import { JID_PART_MAX_BYTES } from './jid.js';
 import { assertXmlSafe, attributeNormalizedCodepoint, codepointLabel } from './stanzas.js';
@@ -88,7 +88,6 @@ export function isPlaintextRemote(service: string): boolean {
   return host !== '' && !isLoopbackHost(host);
 }
 
-const describeValue = (v: unknown): string => (typeof v === 'string' ? `'${v}'` : String(v));
 const bad = (key: string, reason: string): Error =>
   new Error(`parley-xmpp: invalid backend_config.${key} — ${reason}`);
 
@@ -104,7 +103,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
     if (key === 'mam_page') continue;
     const value = cfg[key];
     if (value !== undefined && (typeof value !== 'string' || value === '')) {
-      throw bad(key, `expected a non-empty string, got ${describeValue(value)}`);
+      throw bad(key, `expected a non-empty string, got ${describeConfigValue(value)}`);
     }
     if (typeof value === 'string') assertXmlSafe(value, `backend_config.${key}`);
   }
@@ -113,7 +112,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
     if (typeof value === 'string' && /[\s@/]/.test(value)) {
       throw bad(
         key,
-        `${describeValue(value)} contains whitespace, '@' or '/' — it is one part of a JID, and a ` +
+        `${describeConfigValue(value)} contains whitespace, '@' or '/' — it is one part of a JID, and a ` +
           'separator here builds a different address than the one written',
       );
     }
@@ -134,7 +133,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
   if (typeof nick === 'string' && nick.includes('/')) {
     throw bad(
       'nick',
-      `${describeValue(nick)} contains '/' — the nick is the JID resource, so this connection could ` +
+      `${describeConfigValue(nick)} contains '/' — the nick is the JID resource, so this connection could ` +
         'not recognise its own presence back from the room',
     );
   }
@@ -156,7 +155,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
   ) {
     throw bad(
       'mam_page',
-      `expected an integer between 1 and ${MAX_MAM_PAGE}, got ${describeValue(page)}`,
+      `expected an integer between 1 and ${MAX_MAM_PAGE}, got ${describeConfigValue(page)}`,
     );
   }
   return cfg as XmppBackendConfig;

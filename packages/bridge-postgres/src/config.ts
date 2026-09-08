@@ -3,7 +3,7 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { isLoopbackHost } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isLoopbackHost } from '@sharptrick/parley-net-util';
 import { parse as parseDsn } from 'pg-connection-string';
 import { badConfig } from './errors.js';
 
@@ -62,10 +62,6 @@ const CONFIG_KEYS: BackendConfigKeys = {
   } satisfies Record<keyof Required<PostgresBackendConfig>, 0>),
 };
 
-function describeValue(v: unknown): string {
-  return typeof v === 'string' ? `'${v}'` : String(v);
-}
-
 /**
  * Validate `backend_config` before the pool is opened or anything is deleted (§11). Every rejection
  * names the key and the plugin, and happens before `connect()` has touched the database, so a typo
@@ -77,12 +73,12 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
 
   const url = cfg['url'];
   if (url !== undefined && (typeof url !== 'string' || url === '')) {
-    throw badConfig('url', `expected a non-empty string, got ${describeValue(url)}`);
+    throw badConfig('url', `expected a non-empty string, got ${describeConfigValue(url)}`);
   }
 
   const tableName = cfg['table_name'];
   if (tableName !== undefined && (typeof tableName !== 'string' || tableName === '')) {
-    throw badConfig('table_name', `expected a non-empty string, got ${describeValue(tableName)}`);
+    throw badConfig('table_name', `expected a non-empty string, got ${describeConfigValue(tableName)}`);
   }
 
   const poolSize = cfg['pool_size'];
@@ -96,7 +92,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
     throw badConfig(
       'pool_size',
       `expected an integer between ${MIN_POOL_SIZE} and ${MAX_POOL_SIZE}, got ` +
-        `${describeValue(poolSize)} — a pool that cannot hand out a connection makes connect() ` +
+        `${describeConfigValue(poolSize)} — a pool that cannot hand out a connection makes connect() ` +
         `wait forever`,
     );
   }
@@ -114,7 +110,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
       'retention_days',
       `expected a finite number of days between ${MIN_RETENTION_DAYS} (one minute) and ` +
         `${MAX_RETENTION_DAYS}, got ` +
-        `${describeValue(retention)} — a window shorter than a minute empties the whole shared ` +
+        `${describeConfigValue(retention)} — a window shorter than a minute empties the whole shared ` +
         'table on the prune connect() runs immediately, which is what 0 and negatives were ' +
         `already refused for, and a window past ${MAX_RETENTION_DAYS} days puts the cutoff ` +
         'before any message this backend could have written, so pruning would silently never run ' +

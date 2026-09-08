@@ -1,5 +1,6 @@
 import { asCursor } from '@sharptrick/parley-core';
 import type { Cursor, FetchRecentArgs, FetchRecentResult, Topic } from '@sharptrick/parley-core';
+import { describeConfigValue } from '@sharptrick/parley-net-util';
 
 export const UNKNOWN_INCARNATION = '0';
 
@@ -47,8 +48,6 @@ export function parseCursor(since: Cursor | undefined): ParsedCursor | undefined
 
 const DEFAULT_PAGE = 100;
 
-const describeValue = (v: unknown): string => (typeof v === 'string' ? JSON.stringify(v) : String(v));
-
 /**
  * A page size below 1 — or one that is not a number at all — makes every window this read computes
  * empty, and an empty page still mints a cursor. Reject it here, before any cursor exists: a
@@ -59,7 +58,7 @@ export function normalizeLimit(limit: number | undefined, topic: Topic): number 
   if (limit === undefined) return DEFAULT_PAGE;
   if (!Number.isInteger(limit) || limit < 1) {
     throw new Error(
-      `invalid nats limit ${describeValue(limit)} for topic ${JSON.stringify(String(topic))} — ` +
+      `invalid nats limit ${describeConfigValue(limit)} for topic ${JSON.stringify(String(topic))} — ` +
         'expected an integer of at least 1',
     );
   }

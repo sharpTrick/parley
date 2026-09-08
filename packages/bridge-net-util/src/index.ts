@@ -16,6 +16,7 @@ import { retryAfterFromHeader, usableHint } from './retry-after.js';
 import { sleepUnlessStopped } from './timing.js';
 
 export { HttpStatusError, statusOf } from './errors.js';
+export { describeConfigShape, describeConfigValue } from './config-value.js';
 export { isLoopbackHost, plaintextRemoteOrigin } from './plaintext.js';
 export { MAX_ERROR_BODY, sanitizeBody } from './redact.js';
 export { retryAfterFromHeader } from './retry-after.js';

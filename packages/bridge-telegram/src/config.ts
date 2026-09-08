@@ -5,7 +5,8 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { fromCaller } from './diagnostics.js';
+import { describeConfigValue } from '@sharptrick/parley-net-util';
+
 
 /** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see `plaintextWarning`. */
 export const DEFAULT_API_URL = 'https://api.telegram.org';
@@ -102,7 +103,7 @@ export function requireNumericKnobs(cfg: TelegramBackendConfig): void {
     if (!Number.isInteger(value) || value < min || value > max) {
       throw new Error(
         `TelegramPlugin: backend_config.${key} must be an integer in [${min}, ${max}] — ` +
-          `got ${fromCaller(String(value))}`,
+          `got ${describeConfigValue(value)}`,
       );
     }
   }
