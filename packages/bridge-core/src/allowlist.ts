@@ -2,6 +2,8 @@ import { MAX_POST_TOPICS, type ParleyConfig } from './config.js';
 import { asTopic, type Topic } from './message.js';
 import { isRedosSafeSource, MAX_MATCH_INPUT } from './regex-safety.js';
 
+const NOT_ALLOWED_MARKER = 'TopicNotAllowedError';
+
 /** Raised when a tool call or subscription targets a topic outside the allowlist. */
 export class TopicNotAllowedError extends Error {
   constructor(
@@ -13,12 +15,15 @@ export class TopicNotAllowedError extends Error {
         ? `topic not allowed: ${JSON.stringify(topic)}`
         : `topic not allowed: ${JSON.stringify(topic)} — ${reason}`,
     );
-    this.name = 'TopicNotAllowedError';
   }
+
+  override readonly name: typeof NOT_ALLOWED_MARKER = NOT_ALLOWED_MARKER;
 }
 
 const EMPTY_TOPIC_REASON =
   'a topic names a channel, so it can never be the empty string (the config loader refuses one too)';
+
+const UNSAFE_PATTERN_MARKER = 'UnsafePatternError';
 
 /** Raised when a `post_topics` pattern could be driven into catastrophic backtracking. */
 export class UnsafePatternError extends Error {
@@ -27,8 +32,9 @@ export class UnsafePatternError extends Error {
       `post pattern risks catastrophic backtracking: ${JSON.stringify(pattern)} — a ` +
         'caller-supplied topic could hang the bridge. Simplify it (see post_topics in the README).',
     );
-    this.name = 'UnsafePatternError';
   }
+
+  override readonly name: typeof UNSAFE_PATTERN_MARKER = UNSAFE_PATTERN_MARKER;
 }
 
 /**

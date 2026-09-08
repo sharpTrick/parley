@@ -20,7 +20,6 @@
  *      all is not.
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
-import type { NoSuchTopicError } from './no-such-topic.js';
 
 /**
  * Opaque per-backend configuration, passed verbatim from `config.backend_config`.
@@ -96,7 +95,7 @@ export interface BackendPlugin {
    * Redis/Matrix/…); core decides WHAT happens (emit a `<channel>` event). `disconnect()` tears
    * down all subscriptions (DESIGN §4/§9).
    *
-   * A plugin that cannot represent the topic yet MAY throw {@link NoSuchTopicError} here, as in
+   * A plugin that cannot represent the topic yet MAY throw `NoSuchTopicError` here, as in
    * `fetchRecent` below: that costs the ONE topic its live path and the rest of the attach
    * proceeds. Every other rejection is a real failure and fails the attach.
    */
@@ -125,7 +124,7 @@ export interface BackendPlugin {
    * A topic that has NEVER been posted to returns an EMPTY PAGE (`messages: []`) with a
    * REPLAYABLE `nextCursor` — passing that `nextCursor` back as `since` again yields `[]`
    * and the same cursor. A plugin that genuinely cannot represent an absent topic (e.g. a chat channel
-   * that does not exist) MAY throw {@link NoSuchTopicError} instead; core treats that as
+   * that does not exist) MAY throw `NoSuchTopicError` instead; core treats that as
    * "topic not present yet", distinct from a real backend failure (which propagates).
    */
   fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult>;

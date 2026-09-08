@@ -1,6 +1,7 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SYNC_DIAG_INTERVAL_MS, syncFailureReporter } from '../src/diagnostics.js';
+import { SYNC_IDLE_PACE_MS } from '../src/timeline.js';
 import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
@@ -279,6 +280,30 @@ describe('a malformed /sync body that never stops is reported and slowed, not ho
       expect(reportedFailureCounts(errors.mock.calls)).toEqual([1]);
     }, 20_000);
   }
+});
+
+/**
+ * The pace floor holds at every `sync_timeout_ms` the loader accepts, not just at the one the
+ * fixtures happen to use. `returnedTooFast` takes the LARGER of half the timeout and the floor, and
+ * those two are THE SAME NUMBER at `sync_timeout_ms` 50 — this fake's own default — so a table
+ * pinned there passes with the floor deleted, and a small timeout then re-opens the hot spin the
+ * floor exists to close. Every row here is a real subscribe loop against the fake.
+ */
+const PACE_STRADDLE_MS = [1, SYNC_IDLE_PACE_MS, 2 * SYNC_IDLE_PACE_MS, 25_000];
+
+describe('an idle /sync answering instantly is paced at every accepted sync_timeout_ms', () => {
+  it.each(PACE_STRADDLE_MS)('sync_timeout_ms = %i', async (syncTimeoutMs) => {
+    const p = await connectFake({ syncTimeoutMs });
+    await p.subscribe(asTopic('idle'), () => undefined);
+    await new Promise((r) => setTimeout(r, PACING_WINDOW_MS));
+    const attempts = fake.syncAttempts.length;
+    await p.disconnect();
+
+    expect(attempts, 'the loop stopped syncing altogether').toBeGreaterThan(1);
+    expect(attempts, 'the loop re-issued /sync as fast as the socket allowed').toBeLessThan(
+      PACED_ATTEMPT_CEILING,
+    );
+  }, 20_000);
 });
 
 /**

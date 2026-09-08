@@ -400,7 +400,7 @@ new-plugin-only, ZERO `bridge-core` changes (`git diff` must show none), conform
 
 **Conformance contract a backend must satisfy:** stable-unique `backendMsgId` AND monotonic,
 in-order, **exclusive-`since`** cursor delivery (fetchRecent returns pre-sorted ascending). Order is
-the plugin's guarantee; core never compares cursor values. Dedup is on `backendMsgId`, never timestamp.
+the plugin's guarantee; core never orders by a cursor value. Dedup is on `backendMsgId`, never timestamp.
 
 **If a backend seems to need a core change → STOP and surface it (the seam is wrong; fix the seam,
 not core).** That has not happened in v0.1 or v0.2 and is the design's whole bet.

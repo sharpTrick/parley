@@ -404,10 +404,13 @@ export class ParleyOAuthProvider implements OAuthServerProvider {
   }
 }
 
+const CONSENT_MARKER = 'ConsentError';
+
 /** Raised by completeConsent on owner-secret failure or unknown/expired consent. */
 export class ConsentError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'ConsentError';
   }
+
+  override readonly name: typeof CONSENT_MARKER = CONSENT_MARKER;
 }

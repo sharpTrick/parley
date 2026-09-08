@@ -33,7 +33,8 @@ XMPP) was added without touching either.
   post-subscribe tail and nothing else (never history, never a duplicate); and that it delivers at
   all — a live subscriber does not fall behind a topic written one message at a time. `fetchRecent`
   returns messages pre-sorted ascending; `subscribe`'s handler fires in ascending order per topic.
-  Core never parses or compares cursor values — it trusts the plugin. The last of those is graded to
+  Core never parses a cursor value or orders by one — it trusts the plugin, and compares two only
+  for byte equality, as the no-progress brake. The last of those is graded to
   a stated reach (a drawn depth of 10–13 messages on ONE subscription, the ~1 s the floor holds a
   subscription idle, 10 rows of backlog already on the topic when it subscribes, three
   subscriptions, a burst of five to eight, the payload shapes a real message carries except those a

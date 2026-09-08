@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
+import { KNOWN_CHANNEL } from './fake-telegram.js';
 import { coldRestart, contentsOf, SENDER, seqOf, startRig } from './rig.js';
 
 /**
@@ -157,6 +158,60 @@ describe('telegram push starts at the subscribe point', () => {
     const sequences = live.map((m) => seqOf(m.cursor as string));
     expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
     expect(Math.min(...sequences)).toBeGreaterThan(history.length);
+  }, 20_000);
+});
+
+/**
+ * `subscribe` resolves an `@channelusername` over the network BEFORE the subscriber is registered,
+ * and the one shared `getUpdates` loop keeps ingesting through that await — so a post landing in
+ * that window reaches no handler. The seam permits it (push is a SUBSET of the post-subscribe tail)
+ * and the next `fetchRecent` repairs it. Grade the PERMISSION, so that a delivery absolute this
+ * backend does not hold cannot be restated in prose without a red test under it.
+ */
+describe('telegram push is a subset of the post-subscribe tail', () => {
+  const RACES: Array<[when: string, unresolved: boolean, pushed: string[]]> = [
+    ['while `subscribe` is still resolving the chat', true, []],
+    ['once `subscribe` has registered', false, ['raced']],
+  ];
+
+  it.each(RACES)('a post arriving %s', async (_when, unresolved, pushed) => {
+    const rig = await startRig();
+    const topic = asTopic(KNOWN_CHANNEL.username);
+    const live: Message[] = [];
+
+    const held = unresolved ? rig.fake.holdMethod('getChat') : undefined;
+    const subscribing = rig.plugin.subscribe(topic, (m) => live.push(m));
+    if (held !== undefined) {
+      await vi.waitFor(() => expect(rig.fake.callCount('getChat')).toBeGreaterThan(0), {
+        timeout: 5000,
+        interval: 5,
+      });
+    } else {
+      await subscribing;
+    }
+
+    rig.fake.injectUserMessage(String(KNOWN_CHANNEL.id), 'bob', 'raced');
+    // Observed BEFORE the handler is reachable is what makes the first row deterministic: only a
+    // freshly stamped record is ever pushed, so a record already on disk can never replay.
+    await vi.waitFor(() => expect(readFileSync(rig.storePath, 'utf8')).toContain('raced'), {
+      timeout: 5000,
+      interval: 10,
+    });
+    held?.release();
+    await subscribing;
+    if (!unresolved) {
+      await vi.waitFor(() => expect(live.map((m) => m.content)).toEqual(pushed), {
+        timeout: 5000,
+        interval: 10,
+      });
+    }
+
+    expect(
+      live.map((m) => m.content),
+      "this backend's README describes what push delivers here; it may not promise more than the " +
+        'seam does, and this row is what holds the two together',
+    ).toEqual(pushed);
+    expect(await contentsOf(rig.plugin, topic)).toContain('raced');
   }, 20_000);
 });
 

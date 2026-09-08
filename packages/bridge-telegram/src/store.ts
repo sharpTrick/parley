@@ -288,7 +288,7 @@ export class ObservedStore {
     this.applyRetention();
     // Compaction is amortization, not durability: the record is already on disk and indexed here,
     // so keep a failing rewrite off this return path — a throw would tell the caller its message was
-    // dropped while the store serves it, and no subscriber or parked long poll would ever see it.
+    // dropped while the store serves it, and no subscriber would ever see it.
     try {
       this.compactIfDue();
     } catch (err) {

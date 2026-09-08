@@ -6,8 +6,9 @@ const MARKER = 'NoSuchTopicError';
 export class NoSuchTopicError extends Error {
   constructor(public readonly topic: string) {
     super(`no such topic: ${JSON.stringify(topic)}`);
-    this.name = MARKER;
   }
+
+  override readonly name: typeof MARKER = MARKER;
 }
 
 /**

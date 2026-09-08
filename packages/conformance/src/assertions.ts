@@ -9,6 +9,23 @@ import { expect } from 'vitest';
 export const DRAIN_PAGE = 500;
 
 /**
+ * Grade a rejection as one of the sentinels a PLUGIN raises across the seam. Core and a plugin are
+ * two installs of `@sharptrick/parley-core` whenever a consumer pins a version, so the class object
+ * a plugin throws is not the one core holds and `name` is the whole contract — every `is…`
+ * recogniser core answers with reduces to this comparison. One clause over the whole set rather
+ * than an arm per case, so a second sentinel cannot ship graded only by the first one's arm.
+ */
+export function expectSeamSentinel(
+  err: unknown,
+  sentinel: 'BlockingFetchUnsupportedError' | 'NoSuchTopicError',
+): void {
+  expect(err, `a ${sentinel} must be an Error`).toBeInstanceOf(Error);
+  expect((err as Error).name, `a ${sentinel} names itself, so any install can recognise it`).toBe(
+    sentinel,
+  );
+}
+
+/**
  * Read every message in `topic` by PAGING to exhaustion. It must not read one oversized page: a
  * backend with a server-side page cap below the request would silently return a prefix, and the
  * assertions built on it would grade a partial view.

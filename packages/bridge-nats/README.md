@@ -17,7 +17,7 @@ larger mesh). Implements the seam in `packages/bridge-nats/src/index.ts`; adding
 | `resolveIdentity` | string convention |
 
 One stream per topic keeps the sequence a clean per-topic monotonic integer, which is what the
-cursor orders by. Core never compares cursor values — NATS delivers in seq order. The sequence range
+cursor orders by. Core never orders by a cursor value — NATS delivers in seq order. The sequence range
 is **not** dense: `max_age` retention prunes the front and message deletes punch holes, so `last_seq
 - since` is an upper bound on what a page can return, never a count. A page therefore also ends when
 the pull falls quiet, not only when that bound is reached: a window's top is a *sequence*, not a

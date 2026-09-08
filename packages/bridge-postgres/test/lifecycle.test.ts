@@ -512,14 +512,14 @@ describe('a seam call that spanned a teardown answers for the lifecycle that was
 describe('Postgres subscribe registration', () => {
   // `subscribing` is keyed by channel, and the channel for a topic is the same in every lifecycle.
   // So the cleanup in subscribe()'s `finally` is aimed at a key a SUCCESSOR may already own: evicting
-  // it makes a concurrent subscribe miss the in-flight registration, build a second one, and inflate
-  // the channel's LISTEN refcount while dropping the first registration's handlers.
+  // it makes a concurrent subscribe miss the in-flight registration, build a second one, and LISTEN
+  // the channel again while dropping the first registration's handlers.
   it('a subscribe rejected by teardown does not evict the successor lifecycle in-flight entry', async () => {
     const plugin = new PostgresPlugin();
     const priv = plugin as unknown as {
       subs: Map<string, { handlers: unknown[] }>;
       subscribing: Map<string, unknown>;
-      listens: Map<string, { refs: number }>;
+      listens: Map<string, unknown>;
     };
     const topic = asTopic('t');
     await plugin.connect({ url: REAL_URL });
@@ -549,7 +549,7 @@ describe('Postgres subscribe registration', () => {
 
     expect(priv.subs.size).toBe(1);
     expect([...priv.subs.values()][0]?.handlers.length, 'a handler was dropped').toBe(2);
-    expect([...priv.listens.values()].map((l) => l.refs), 'LISTEN refcount inflated').toEqual([1]);
+    expect(priv.listens.size, 'a second LISTEN entry was built for the channel').toBe(1);
     expect(state.listenAttempts.length, 'a duplicate LISTEN was issued').toBe(2);
 
     await plugin.disconnect();

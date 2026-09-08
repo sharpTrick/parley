@@ -14,7 +14,7 @@ the seam in `packages/bridge-redis/src/index.ts`; adding it required **zero** `@
 | `subscribe` | **`XREAD BLOCK`** loop on a dedicated connection — real events, not a poll timer |
 | `resolveIdentity` | string convention (handle = backendRef) |
 
-Stream ids aren't lexically comparable, but core never compares cursors — Redis returns entries in
+Stream ids aren't lexically comparable, but core never orders by a cursor — Redis returns entries in
 order and `fetchRecent` is exclusive on `since`.
 
 **A cursor past the stream's high-water mark self-heals.** Core's read-state outlives the Redis it
@@ -136,7 +136,7 @@ opt in.
 
 Two things worth knowing: trimming is **approximate** (the `~` modifier lets Redis batch the trim
 for O(1) amortized cost instead of an exact O(log N) trim on every write — harmless, since core
-never compares cursor values), and it's **opportunistic** — a topic that stops receiving posts
+never orders by a cursor value), and it's **opportunistic** — a topic that stops receiving posts
 keeps its full history until its next post, because nothing else triggers a trim. There's no error
 for "this much history is gone"; a reader that's been offline longer than the window just gets
 fewer entries back on catch-up.

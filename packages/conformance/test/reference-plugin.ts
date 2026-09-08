@@ -1080,9 +1080,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     // Drifts on a re-read of a topic that has never held a message, and nowhere else — which is
-    // exactly the assertion the clause turns on. Its predecessor returned an empty page for EVERY
-    // read: it failed 29 of the suite's 32 cases, so it could no more show that this assertion was
-    // alive than a plugin that answers nothing at all could.
+    // exactly the assertion the clause turns on.
     name: 'a drifting cursor on a re-read of an empty topic',
     mutates: 'cursor',
     mustFail: 'never-posted topic',

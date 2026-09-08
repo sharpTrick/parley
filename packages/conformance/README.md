@@ -14,7 +14,7 @@ this suite's cases:
 
 1. every message gets a **stable, unique `backendMsgId`** (the dedup key);
 2. `fetchRecent` / `subscribe` deliver **monotonic, in-order, exclusive-`since`** cursor ordering
-   (the order key) — core never parses or compares cursor values, it only trusts the plugin;
+   (the order key) — core never parses a cursor value or orders by one, it only trusts the plugin;
 3. what `subscribe` delivers is a **subset** of the post-subscribe tail and nothing else — never
    history, never a duplicate;
 4. …and it delivers: a live subscriber does not fall behind a topic written one message at a time.

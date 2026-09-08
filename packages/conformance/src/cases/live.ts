@@ -177,8 +177,8 @@ export function liveCases(ctx: ConformanceContext): void {
 
     // A SUBSEQUENCE of the tail, which is one assertion for three properties: nothing from before
     // the subscribe, nothing twice, nothing out of order. Cursor VALUES are opaque and deliberately
-    // not comparable (CLAUDE.md — core never compares cursors, and MAM archive ids are not
-    // lexically sortable), so delivery ORDER is what carries it.
+    // not ordered by core (CLAUDE.md — ordering is the plugin's guarantee, and MAM archive ids
+    // are not lexically sortable), so delivery ORDER is what carries it.
     const seen = live.map((m) => m.content);
     expect(
       seen,

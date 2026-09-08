@@ -15,8 +15,9 @@ export class BlockingFetchUnsupportedError extends Error {
       `${backend}: \`block_ms\` is not supported by this backend — its read path has no primitive ` +
         "to park a caller's budget on. Omit `block_ms` and poll on your own cadence.",
     );
-    this.name = MARKER;
   }
+
+  override readonly name: typeof MARKER = MARKER;
 }
 
 /**

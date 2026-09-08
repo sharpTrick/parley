@@ -32,8 +32,6 @@ async function withDeadline<T>(p: Promise<T>, budgetMs: number, onTimeout: () =>
 export interface ListenState {
   /** Resolves only once the LISTEN is ESTABLISHED — never merely intended. */
   ready: Promise<void>;
-  /** Subscriptions that still need this channel LISTENed. */
-  refs: number;
 }
 
 /**
@@ -42,26 +40,15 @@ export interface ListenState {
  */
 export abstract class PostgresListener extends PostgresPush {
   /**
-   * Take a reference on the channel's LISTEN, resolving only once that LISTEN is ESTABLISHED —
-   * publishing "someone intends to LISTEN" as if it were "the channel is LISTENed" strands the
-   * caller on a doorbell that may never be installed. Rejects (having taken no reference) if the
-   * LISTEN failed, so the caller can fall back.
+   * LISTEN on the channel, resolving only once that LISTEN is ESTABLISHED — publishing "someone
+   * intends to LISTEN" as if it were "the channel is LISTENed" strands the caller on a doorbell
+   * that may never be installed. Rejects (leaving no entry behind) if the LISTEN failed, so the
+   * caller can fall back. One subscription per channel reaches here: `subscribe` answers a repeat
+   * from `subs` or from the in-flight memo before it can.
    */
   protected async acquireListen(listener: Client, channel: string): Promise<ListenState> {
-    const existing = this.listens.get(channel);
-    if (existing !== undefined) {
-      existing.refs++;
-      try {
-        await existing.ready;
-      } catch (err) {
-        this.releaseListen(channel, existing);
-        throw err;
-      }
-      return existing;
-    }
     const entry: ListenState = {
       ready: listener.query(`LISTEN "${channel}"`).then(() => undefined),
-      refs: 1,
     };
     this.listens.set(channel, entry);
     try {
@@ -75,8 +62,6 @@ export abstract class PostgresListener extends PostgresPush {
 
   protected releaseListen(channel: string, entry: ListenState): void {
     if (this.listens.get(channel) !== entry) return;
-    entry.refs--;
-    if (entry.refs > 0) return;
     this.listens.delete(channel);
     if (!this.stopped && this.listener !== undefined) {
       void this.listener.query(`UNLISTEN "${channel}"`).catch(() => undefined);

@@ -45,7 +45,7 @@ const SUPERSEDED_BY_DISCONNECT =
  * `subscribe` delivers every reflected groupchat message carrying a room stanza-id.
  *
  * Catch-up REQUIRES server-side MAM (mod_mam + muc_mam); without it the room has no archive and
- * `fetchRecent` returns nothing. Core never compares cursor values — the server's RSM `<after>`
+ * `fetchRecent` returns nothing. Core never orders by a cursor value — the server's RSM `<after>`
  * defines "strictly after"; the archive defines order.
  */
 export class XmppPlugin extends XmppInbound implements BackendPlugin {

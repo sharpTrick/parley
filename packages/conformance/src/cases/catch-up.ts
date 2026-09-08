@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { drainAll, expectWellFormedMessage } from '../assertions.js';
+import { drainAll, expectSeamSentinel, expectWellFormedMessage } from '../assertions.js';
 import type { ConformanceContext } from '../factory.js';
 import { SENDER } from '../handles.js';
 
@@ -120,8 +120,7 @@ export function catchUpCases(ctx: ConformanceContext): void {
         () => undefined,
         (e: unknown) => e,
       );
-      expect(err).toBeInstanceOf(Error);
-      expect((err as Error).name).toBe('NoSuchTopicError');
+      expectSeamSentinel(err, 'NoSuchTopicError');
       expect((err as { topic?: unknown }).topic).toBe(String(t));
       expect((err as Error).message).toContain(String(t));
       return;

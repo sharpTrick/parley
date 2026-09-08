@@ -7,6 +7,7 @@ import {
   type Topic,
 } from '@sharptrick/parley-core';
 import { expect, it } from 'vitest';
+import { expectSeamSentinel } from '../assertions.js';
 import {
   CALLER_BLOCK_FLOOR_FRACTION,
   CALLER_BLOCK_RETURN_MS,
@@ -163,6 +164,7 @@ export function blockingCases(ctx: ConformanceContext): void {
       page = await ctx.plugin.fetchRecent(args);
     } catch (err) {
       if (!isBlockingFetchUnsupportedError(err)) throw err;
+      expectSeamSentinel(err, 'BlockingFetchUnsupportedError');
       taken.push({ arm: 'refused', budgetMs, elapsedMs: Date.now() - startedAt, emptyPage: false });
       return 'refused';
     }

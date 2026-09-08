@@ -54,8 +54,9 @@ const ABORTED_MARKER = 'FetchAbortedError';
 export class FetchAbortedError extends Error {
   constructor() {
     super('fetch_recent cancelled before any page was read');
-    this.name = ABORTED_MARKER;
   }
+
+  override readonly name: typeof ABORTED_MARKER = ABORTED_MARKER;
 }
 
 /**

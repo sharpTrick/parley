@@ -24,7 +24,7 @@ server-assigned, per-room value used as BOTH `backendMsgId` (dedup key) and `cur
 | sender | the occupant nick (resource of `room@svc/nick`), which defaults to `identity.handle` |
 | timestamp | the `<delay stamp>` the SERVER attested — MAM's `<forwarded>` envelope, or on the live path a `<delay from='room'>` the room itself added — else now. A `<delay>` naming any other entity, **or naming none at all** (XEP-0203's `from` is a SHOULD, so an omitted one attests nothing and a real MUC does reflect an occupant's un-attributed `<delay>` verbatim), is an occupant's own and is ignored, so a co-occupant cannot choose it (informational only) |
 
-Archive ids are not lexically comparable, but core never compares cursors — the server's RSM
+Archive ids are not lexically comparable, but core never orders by a cursor — the server's RSM
 `<after>` defines "strictly after" and the MAM archive defines order.
 
 **No `block_ms` here.** `fetchRecent` reads the MAM archive and has no wait to spend a caller's

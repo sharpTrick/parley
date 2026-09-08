@@ -166,18 +166,18 @@ describe('public barrel surface', () => {
     BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
     BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
     CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],
-    ConsentError: ['constructor'],
+    ConsentError: ['constructor', 'name'],
     FakeOidc: ['close', 'issuer', 'jwksUri', 'mint'],
     FakeOidcClaims: [
       'aud', 'azp', 'expiresInS', 'issuerOverride', 'notBeforeInS', 'omit', 'preferred_username',
       'realm_access', 'scope', 'signWithRogueKey', 'sub',
     ],
-    BlockingFetchUnsupportedError: ['constructor'],
-    FetchAbortedError: ['constructor'],
+    BlockingFetchUnsupportedError: ['constructor', 'name'],
+    FetchAbortedError: ['constructor', 'name'],
     FetchRecentArgs: ['blockMs', 'limit', 'since', 'topic'],
     FetchRecentResult: ['messages', 'nextCursor'],
     Message: ['backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp', 'topic'],
-    NoSuchTopicError: ['constructor'],
+    NoSuchTopicError: ['constructor', 'name'],
     OAuthRemoteOptions: [
       'issuerUrl', 'mcpPath', 'now', 'scopesSupported', 'trustProxy', 'verifyOwner',
     ],
@@ -207,8 +207,8 @@ describe('public barrel surface', () => {
     SeenSet: ['constructor', 'firstSeen', 'has', 'markSeen'],
     ShutdownHost: ['on', 'stdin'],
     ToolDeps: ['allow', 'blockMaxMs', 'blockPollIntervalMs', 'identity', 'plugin', 'readState', 'seen'],
-    TopicNotAllowedError: ['constructor'],
-    UnsafePatternError: ['constructor'],
+    TopicNotAllowedError: ['constructor', 'name'],
+    UnsafePatternError: ['constructor', 'name'],
   };
 
   it('publishes exactly these members on the types it exports, and no others', () => {

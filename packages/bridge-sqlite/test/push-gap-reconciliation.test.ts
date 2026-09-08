@@ -146,13 +146,10 @@ describe('the start-up window is dark on push and reconciled by the next catch-u
   });
 
   /**
-   * The start point belongs to the SUBSCRIPTION, not to the store and not to the topic. Its
-   * predecessor asserted "per topic, not per store" — which nothing can observe, because a rowid
-   * only rises: a start point taken from the store's tail still sits below every row the topic will
-   * later receive, so the whole package stayed green with the store-global spelling in place. What
-   * IS observable is what a start point is FOR. Several live loops run at once in any real
-   * deployment, and one that shares its position with another hands each subscriber half the
-   * stream — a live path that looks alive from every angle and drops rows an agent is waiting on.
+   * The start point belongs to the SUBSCRIPTION, not to the store and not to the topic. Several live
+   * loops run at once in any real deployment, and one that shares its position with another hands
+   * each subscriber half the stream — a live path that looks alive from every angle and drops rows
+   * an agent is waiting on.
    */
   it.each([
     ['the same topic', true],

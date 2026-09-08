@@ -15,7 +15,7 @@ export { plaintextRemoteServer, redactUserinfo, type NatsBackendConfig } from '.
  * an incarnation-qualified stream sequence as the backendMsgId — a re-provisioned stream restarts
  * its sequences at 1, so the bare sequence would name a second message under the first one's id.
  * `post` = `js.publish` (→ seq); `fetchRecent` = an ephemeral consumer from `opt_start_seq`
- * (exclusive `since`). Core never compares cursor values — NATS delivers in seq order.
+ * (exclusive `since`). Core never orders by a cursor value — NATS delivers in seq order.
  */
 export class NatsPlugin extends NatsLive implements BackendPlugin {
   async post(

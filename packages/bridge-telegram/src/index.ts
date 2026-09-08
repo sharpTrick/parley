@@ -311,9 +311,10 @@ export class TelegramPlugin implements BackendPlugin {
   }
 
   /**
-   * Live path: register on the shared `getUpdates` loop. Registration is synchronous once the chat
-   * resolves, and {@link ingest} runs only for a freshly stamped record, so a post racing a fresh
-   * subscribe can never be missed and nothing already in the store can replay here.
+   * Live path: register on the shared `getUpdates` loop. {@link ingest} runs only for a freshly
+   * stamped record, so nothing already in the store can replay here — and a post observed while
+   * this is still resolving the chat reaches no handler, which is the seam's subset contract and is
+   * left to catch-up.
    */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     return this.redacting(async () => this.register(topic, handler));

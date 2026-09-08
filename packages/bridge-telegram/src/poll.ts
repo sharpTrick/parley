@@ -11,7 +11,7 @@ const MIN_IDLE_POLL_MS = 250;
 
 /**
  * The ONE shared `getUpdates` long-poll loop — Telegram allows exactly one consumer per bot token
- * (a second gets HTTP 409), so every subscription and every parked read is fed from here.
+ * (a second gets HTTP 409), so every subscription is fed from here.
  * `offset` = last confirmed `update_id + 1` — Telegram's acknowledgement protocol. Each connect
  * starts at offset 0, replaying whatever backlog Telegram retained (~24h); the store's dedup makes
  * that replay harmless and doubles as offline catch-up. Accepts BOTH `update.message`

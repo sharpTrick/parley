@@ -8,9 +8,9 @@ import { aliasIsLegal, HOSTILE_LOCALPARTS } from './alias-legality.js';
  * check at all — the declared union or `number` exists only at compile time. An unvalidated value
  * either reaches the wire (a `preset` lands verbatim in `POST /createRoom`; `trusted_private_chat`
  * hands every invitee power level 100 and lets any of them flip `m.room.join_rules` to public) or
- * reaches the park arithmetic (a `sync_timeout_ms` of 0 collapses every wait into a re-query storm,
- * and one past `MAX_SYNC_TIMEOUT_MS` overflows the timer its transport deadline is armed on, which
- * Node clamps to 1ms — so every `/sync` aborts at once and the live path dies blaming the
+ * reaches the long-poll arithmetic (a `sync_timeout_ms` of 0 collapses every wait into a re-query
+ * storm, and one past `MAX_SYNC_TIMEOUT_MS` overflows the timer its transport deadline is armed on,
+ * which Node clamps to 1ms — so every `/sync` aborts at once and the live path dies blaming the
  * homeserver). Both must be LOAD ERRORS, the way `skip_permissions: true` is — never a lenient
  * coercion, and bounded at BOTH ends: a range guarded only from below leaves the same collapse
  * reachable from the top.

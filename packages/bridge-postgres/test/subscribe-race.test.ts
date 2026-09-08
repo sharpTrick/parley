@@ -5,10 +5,10 @@ import { sleep } from './pg-harness.js';
 
 // `subscribe` looks up the topic's existing registration and then, several awaits later, installs a
 // new one. If that check-then-act is separated by an await, k concurrent subscribes to one topic all
-// miss the check and the last writer wins: every earlier handler is dropped forever and the
-// channel's LISTEN refcount is left inflated. Sequential subscribes cannot see it, so this matrix
-// drives the concurrent shape directly, at several k and with the awaits made slow enough that the
-// window is always open.
+// miss the check and the last writer wins: every earlier handler is dropped forever and the channel
+// is LISTENed once per caller. Sequential subscribes cannot see it, so this matrix drives the
+// concurrent shape directly, at several k and with the awaits made slow enough that the window is
+// always open.
 
 const state = vi.hoisted(() => ({
   /** Delay applied to the tail read and the LISTEN, so the registration window is wide. */
@@ -153,16 +153,15 @@ describe('concurrent subscribe registration', () => {
 
     const priv = plugin as unknown as {
       subs: Map<string, { handlers: unknown[] }>;
-      listens: Map<string, { refs: number }>;
+      listens: Map<string, unknown>;
       subscribing: Map<string, unknown>;
     };
     expect(priv.subs.size, 'one registration per topic').toBe(cell.topics);
     expect(priv.subscribing.size, 'in-flight registry leaked').toBe(0);
     expect([...priv.subs.values()].reduce((n, s) => n + s.handlers.length, 0)).toBe(cell.k);
-    expect([...priv.listens.values()].map((l) => l.refs)).toEqual(
-      Array.from({ length: cell.topics }, () => 1),
-    );
+    expect(priv.listens.size, 'one LISTEN entry per channel').toBe(cell.topics);
     expect(state.listenCalls.length, 'one LISTEN per channel').toBe(cell.topics);
+    expect(new Set(state.listenCalls).size, 'a channel was LISTENed twice').toBe(cell.topics);
 
     state.slowMs = 0;
     for (const [channel, sub] of priv.subs.entries()) {
