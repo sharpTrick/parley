@@ -58,7 +58,7 @@ export function normalizeLimit(limit: number | undefined, topic: Topic): number 
   if (limit === undefined) return DEFAULT_PAGE;
   if (!Number.isInteger(limit) || limit < 1) {
     throw new Error(
-      `invalid nats limit ${describeConfigValue(limit)} for topic ${JSON.stringify(String(topic))} — ` +
+      `invalid nats limit ${describeConfigValue('limit', limit)} for topic ${JSON.stringify(String(topic))} — ` +
         'expected an integer of at least 1',
     );
   }

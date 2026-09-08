@@ -103,7 +103,7 @@ export function requireNumericKnobs(cfg: TelegramBackendConfig): void {
     if (!Number.isInteger(value) || value < min || value > max) {
       throw new Error(
         `TelegramPlugin: backend_config.${key} must be an integer in [${min}, ${max}] — ` +
-          `got ${describeConfigValue(value)}`,
+          `got ${describeConfigValue(key, value)}`,
       );
     }
   }

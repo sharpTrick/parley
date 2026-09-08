@@ -22,3 +22,37 @@ describe('nats refuses an unrenderable limit under its own label', () => {
     expect(message).not.toMatch(/[\n\r]/);
   });
 });
+
+const SECRET = 'PLANTED-SECRET-8f3a';
+
+/**
+ * CLASS: the branch that hands a rejected value to the renderer reads `not a non-empty string`, so
+ * it admits every CONTAINER a secret can be nested inside — and a credential key holds one even when
+ * the value IS a string. A refusal that enumerates the container, or prints the credential, puts it
+ * in the operator's log and in the model context core renders a seam error into.
+ */
+const WRAPPING_A_SECRET: Array<[string, unknown]> = [
+  ['an object', { password: SECRET }],
+  ['an array', [SECRET]],
+  ['a nested object', { outer: { inner: [SECRET] } }],
+  [
+    'a null-prototype object',
+    Object.assign(Object.create(null) as object, { v: SECRET }),
+  ],
+];
+
+describe('nats discloses nothing a rejected limit carries', () => {
+  it.each(WRAPPING_A_SECRET)('limit = %s is refused without it', (_label, value) => {
+    let raised: unknown;
+    try {
+      normalizeLimit(value as number, asTopic('room'));
+    } catch (err) {
+      raised = err;
+    }
+    expect(raised, 'a wrapped value must still be refused, or this row grades nothing').toBeInstanceOf(Error);
+    const message = (raised as Error).message;
+    expect(message).toMatch(/^invalid nats limit /);
+    expect(message).not.toContain(SECRET);
+    expect(message).not.toMatch(/[\n\r]/);
+  });
+});

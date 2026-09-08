@@ -124,12 +124,12 @@ null-prototype object, a bigint, a circular structure the YAML parser builds fro
 `TypeError`, or the caller's own text, in the operator's log and in the model context core renders a
 seam error into.
 
-- **`describeConfigValue(value)`** — the value as one bounded, flattened line, whatever it is. Never
-  throws, and never carries text the value's own rendering raised. `NaN` and `Infinity` stay
-  readable, which `JSON.stringify` alone does not manage.
-- **`describeConfigShape(value)`** — what a value IS (`an object`, `an array`, `the empty string`,
-  `a number`), carrying nothing of what it holds. Use it for a key whose value is a URL or any other
-  credential carrier, so a password in a mistyped value never reaches a log line.
+- **`describeConfigValue(key, value)`** — the value as one bounded, flattened line, whatever it is.
+  Never throws, and never carries text the value's own rendering raised. `NaN` and `Infinity` stay
+  readable, which `JSON.stringify` alone does not manage. A container is DESCRIBED (`an object`,
+  `an array`), never enumerated, and a `key` naming a credential carrier — `password`, `token`,
+  `url`, `cert`, … — is described by shape whatever type it arrives as, so a secret nested anywhere
+  inside a mistyped value never reaches a log line.
 - **`NEVER_RENDERABLE`** / **`RENDER_LEAK_SENTINEL`** — the corpus `describeConfigValue` is graded
   against, published with it: the values that break a naive renderer (circular, bigint,
   null-prototype, no JSON form and no string form, a `toJSON` that raises `RENDER_LEAK_SENTINEL`).

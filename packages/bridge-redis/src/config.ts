@@ -2,7 +2,7 @@ import {
   assertKnownConfigKeys,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { describeConfigShape, describeConfigValue } from '@sharptrick/parley-net-util';
+import { describeConfigValue } from '@sharptrick/parley-net-util';
 import { pluginError } from './diagnostics.js';
 
 /** The endpoint `url` falls back to when omitted (or `null`). Exported so a test can name it
@@ -81,15 +81,6 @@ export function resolveConfig(cfg: RedisBackendConfig): ResolvedConfig {
 }
 
 /**
- * Keep a `url` value out of a message entirely, so that a password in a mistyped URL never reaches a
- * log line — the invariant {@link normalizeUrl} keeps, which `normalizeString` runs ahead of and
- * would otherwise break for every `url` that is not a string at all.
- */
-function describeValue(key: string, value: unknown): string {
-  return key === 'url' ? describeConfigShape(value) : describeConfigValue(value);
-}
-
-/**
  * Reject a key `backend_config` does not declare, so that `retention_dayz` or `keyprefix` cannot be
  * accepted in silence and take the DEFAULT behaviour: history kept forever, or a keyspace no peer
  * session shares while every field still reads as consistent.
@@ -114,7 +105,7 @@ function normalizeString(key: string, value: unknown, fallback: string): string 
   if (value === undefined || value === null) return fallback;
   if (typeof value !== 'string' || value === '') {
     throw pluginError(
-      `parley-redis: ${key} must be a non-empty string (got ${describeValue(key, value)}); ` +
+      `parley-redis: ${key} must be a non-empty string (got ${describeConfigValue(key, value)}); ` +
         `omit it for the default '${fallback}'`,
     );
   }
@@ -159,7 +150,7 @@ function normalizeMillis(key: string, value: unknown, fallback: number): number 
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     throw pluginError(
       `parley-redis: ${key} must be a positive whole number of milliseconds ` +
-        `(got ${describeValue(key, value)}); omit it for the default ${fallback}`,
+        `(got ${describeConfigValue(key, value)}); omit it for the default ${fallback}`,
     );
   }
   return value;
@@ -190,7 +181,7 @@ function normalizeRetentionDays(value: number | null | undefined): number | unde
   ) {
     throw pluginError(
       `parley-redis: retention_days must be a number of days between ${MIN_RETENTION_DAYS} ` +
-        `(one minute) and ${maxDays} (got ${describeValue('retention_days', value)}); omit it ` +
+        `(one minute) and ${maxDays} (got ${describeConfigValue('retention_days', value)}); omit it ` +
         `(or set null) to keep every entry forever`,
     );
   }

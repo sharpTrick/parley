@@ -73,12 +73,12 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
 
   const url = cfg['url'];
   if (url !== undefined && (typeof url !== 'string' || url === '')) {
-    throw badConfig('url', `expected a non-empty string, got ${describeConfigValue(url)}`);
+    throw badConfig('url', `expected a non-empty string, got ${describeConfigValue('url', url)}`);
   }
 
   const tableName = cfg['table_name'];
   if (tableName !== undefined && (typeof tableName !== 'string' || tableName === '')) {
-    throw badConfig('table_name', `expected a non-empty string, got ${describeConfigValue(tableName)}`);
+    throw badConfig('table_name', `expected a non-empty string, got ${describeConfigValue('table_name', tableName)}`);
   }
 
   const poolSize = cfg['pool_size'];
@@ -92,7 +92,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
     throw badConfig(
       'pool_size',
       `expected an integer between ${MIN_POOL_SIZE} and ${MAX_POOL_SIZE}, got ` +
-        `${describeConfigValue(poolSize)} — a pool that cannot hand out a connection makes connect() ` +
+        `${describeConfigValue('pool_size', poolSize)} — a pool that cannot hand out a connection makes connect() ` +
         `wait forever`,
     );
   }
@@ -110,7 +110,7 @@ export function validateBackendConfig(config: BackendConfig): PostgresBackendCon
       'retention_days',
       `expected a finite number of days between ${MIN_RETENTION_DAYS} (one minute) and ` +
         `${MAX_RETENTION_DAYS}, got ` +
-        `${describeConfigValue(retention)} — a window shorter than a minute empties the whole shared ` +
+        `${describeConfigValue('retention_days', retention)} — a window shorter than a minute empties the whole shared ` +
         'table on the prune connect() runs immediately, which is what 0 and negatives were ' +
         `already refused for, and a window past ${MAX_RETENTION_DAYS} days puts the cutoff ` +
         'before any message this backend could have written, so pruning would silently never run ' +

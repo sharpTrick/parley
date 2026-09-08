@@ -102,7 +102,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
     if (key === 'mam_page') continue;
     const value = cfg[key];
     if (value !== undefined && (typeof value !== 'string' || value === '')) {
-      throw bad(key, `expected a non-empty string, got ${describeConfigValue(value)}`);
+      throw bad(key, `expected a non-empty string, got ${describeConfigValue(key, value)}`);
     }
     if (typeof value === 'string') assertXmlSafe(value, `backend_config.${key}`);
   }
@@ -111,7 +111,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
     if (typeof value === 'string' && /[\s@/]/.test(value)) {
       throw bad(
         key,
-        `${describeConfigValue(value)} contains whitespace, '@' or '/' — it is one part of a JID, and a ` +
+        `${describeConfigValue(key, value)} contains whitespace, '@' or '/' — it is one part of a JID, and a ` +
           'separator here builds a different address than the one written',
       );
     }
@@ -132,7 +132,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
   if (typeof nick === 'string' && nick.includes('/')) {
     throw bad(
       'nick',
-      `${describeConfigValue(nick)} contains '/' — the nick is the JID resource, so this connection could ` +
+      `${describeConfigValue('nick', nick)} contains '/' — the nick is the JID resource, so this connection could ` +
         'not recognise its own presence back from the room',
     );
   }
@@ -154,7 +154,7 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
   ) {
     throw bad(
       'mam_page',
-      `expected an integer between 1 and ${MAX_MAM_PAGE}, got ${describeConfigValue(page)}`,
+      `expected an integer between 1 and ${MAX_MAM_PAGE}, got ${describeConfigValue('mam_page', page)}`,
     );
   }
   return cfg as XmppBackendConfig;
