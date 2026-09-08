@@ -1,4 +1,11 @@
-import { asHandle, type Handle, type Message, parseMentions } from '@sharptrick/parley-core';
+import {
+  asHandle,
+  FAILURE_SHAPE_NAMES,
+  FAILURE_SHAPES,
+  type Handle,
+  type Message,
+  parseMentions,
+} from '@sharptrick/parley-core';
 import { expect, it, vi } from 'vitest';
 import { drainAll, expectWellFormedMessage } from '../assertions.js';
 import type { ConformanceContext } from '../factory.js';
@@ -134,17 +141,6 @@ const FAULT_SETTLE_MS = 250;
 /** Owed deliveries per faulted run — sent one at a time, each awaited, so none may be dropped. */
 const FAULTED_POSTS = 3;
 
-const rejectsLater = (): Promise<never> =>
-  new Promise((_resolve, reject) => setTimeout(() => reject(new Error('the consumer blew up')), 0));
-
-const throwsAnErrorNow = (): never => {
-  throw new Error('the consumer blew up');
-};
-
-const throwsANonErrorNow = (): never => {
-  throw 'the consumer blew up';
-};
-
 /**
  * The ways a handler can fail that a `(msg: Message) => void` seam type does not forbid.
  * `subscribe` is handed a callback the plugin did not write — core's is the push loop, a consumer's
@@ -152,20 +148,18 @@ const throwsANonErrorNow = (): never => {
  * rest of the topic regardless.
  *
  * The rejecting arms are the ones that end the bridge: a promise nothing attached to reaches Node's
- * default `--unhandled-rejections=throw`. An `instanceof` guard misses the non-Error arm, and
- * AWAITING the handler — the obvious containment — trades the crash for a stall, which is what the
- * arm that never settles is here to forbid.
+ * default `--unhandled-rejections=throw`. An `instanceof` guard misses both the non-Error arm and
+ * the non-native thenable, and AWAITING the handler — the obvious containment — trades the crash
+ * for a stall, which is what the arm that never settles is here to forbid.
+ *
+ * Taken from core's own table rather than restated here, so that a shape added for ONE
+ * fire-and-forget site is asked of every backend rather than of core alone. The list that used to
+ * sit here had drifted: it carried an arm core's table did not, and core's table carried two this
+ * clause never asked a backend for.
  */
-const HANDLER_FAULTS: Array<[label: string, fault: () => unknown]> = [
-  ['throws', throwsAnErrorNow],
-  ['throws something that is not an Error', throwsANonErrorNow],
-  [
-    'returns a rejected promise',
-    (): Promise<never> => Promise.reject(new Error('the consumer blew up')),
-  ],
-  ['rejects a turn later', rejectsLater],
-  ['returns a promise that never settles', (): Promise<never> => new Promise<never>(() => undefined)],
-];
+const HANDLER_FAULTS: Array<[label: string, fault: () => unknown]> = FAILURE_SHAPE_NAMES.map(
+  (shape) => [shape, (): unknown => FAILURE_SHAPES[shape](Promise.resolve())],
+);
 
 /** Where in a run of owed deliveries the handler fails. */
 const FAULT_POSITIONS: Array<[where: string, faultsAt: (nth: number) => boolean]> = [
