@@ -24,7 +24,8 @@ describe('telegram 429 backoff', () => {
   const CASES = [
     { name: 'header only', retryAfterHeader: 1, expected: 1000 },
     { name: 'body only', retryAfterBody: 1, expected: 1000 },
-    { name: 'both, header wins', retryAfterHeader: 1, retryAfterBody: 4, expected: 1000 },
+    { name: 'both, the body asks for longer', retryAfterHeader: 1, retryAfterBody: 2, expected: 2000 },
+    { name: 'both, the header asks for longer', retryAfterHeader: 2, retryAfterBody: 1, expected: 2000 },
     { name: 'header 0 falls through to the body', retryAfterHeader: 0, retryAfterBody: 2, expected: 2000 },
     { name: 'body 0 falls through to the default', retryAfterBody: 0, expected: 500 },
     { name: 'negative body falls through to the default', retryAfterBody: -3, expected: 500 },
