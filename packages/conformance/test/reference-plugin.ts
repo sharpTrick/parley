@@ -118,7 +118,7 @@ export class ReferencePlugin implements BackendPlugin {
       id,
     });
     this.store.log.set(String(topic), [...(this.store.log.get(String(topic)) ?? []), message]);
-    for (const s of this.store.subscriptions) if (s.topic === String(topic)) safeDeliver(s.handler, message);
+    for (const s of this.store.subscriptions) if (s.topic === String(topic)) safeDeliver(s.handler, () => message);
     for (const wake of this.store.writes.splice(0)) wake();
     return asBackendMsgId(id);
   }
@@ -763,7 +763,7 @@ const liveDeath = (death: LiveDeath): BrokenVariant => ({
             content: m.content,
             senderHandle: String(m.senderHandle),
           };
-          if (!death.drops(at)) safeDeliver(handler, m);
+          if (!death.drops(at)) safeDeliver(handler, () => m);
         });
       },
     })),
@@ -940,7 +940,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       wrap((inner) => ({
         subscribe: async (topic, handler) => {
           const past = await inner.fetchRecent({ topic, limit: 10_000 });
-          for (const m of past.messages) safeDeliver(handler, m);
+          for (const m of past.messages) safeDeliver(handler, () => m);
           await inner.subscribe(topic, handler);
         },
       })),
@@ -1031,7 +1031,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             timer = setTimeout(() => {
               const held = batch.splice(0);
               for (const each of held.length >= REORDER_ABOVE ? held.reverse() : held) {
-                safeDeliver(handler, each);
+                safeDeliver(handler, () => each);
               }
             }, BATCH_SETTLE_MS);
           });
@@ -1075,10 +1075,10 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         subscribe: (topic, handler) =>
           inner.subscribe(topic, (m) => {
             if ((store.log.get(String(topic)) ?? []).length <= DEATH_TOPIC_ROWS) {
-              safeDeliver(handler, m);
+              safeDeliver(handler, () => m);
               return;
             }
-            setTimeout(() => safeDeliver(handler, m), LATE_DELIVERY_MS);
+            setTimeout(() => safeDeliver(handler, () => m), LATE_DELIVERY_MS);
           }),
       })),
   },
@@ -1223,7 +1223,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
               m.content.length > SHORT_PAYLOAD ||
               !isPlainAscii(m.content) ||
               carriesControlCharacter(m.content);
-            if (!busy || !typed) safeDeliver(handler, m);
+            if (!busy || !typed) safeDeliver(handler, () => m);
           }),
       })),
   },
@@ -1392,7 +1392,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             const id = await inner.post(t, i, c, o);
             const landed = (await inner.fetchRecent({ topic: t, limit: 1 })).messages.at(-1);
             if (landed !== undefined) {
-              for (const s of registered) if (s.topic !== String(t)) safeDeliver(s.handler, landed);
+              for (const s of registered) if (s.topic !== String(t)) safeDeliver(s.handler, () => landed);
             }
             return id;
           },
@@ -1501,7 +1501,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             const id = await inner.post(t, i, c, o);
             const landed = (await inner.fetchRecent({ topic: t, limit: 1 })).messages.at(-1);
             if (landed !== undefined) {
-              for (const s of registered) if (s.topic === String(t)) safeDeliver(s.handler, landed);
+              for (const s of registered) if (s.topic === String(t)) safeDeliver(s.handler, () => landed);
             }
             return id;
           },
@@ -1869,7 +1869,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
               torn = true;
               for (const s of registered) {
                 const last = (await inner.fetchRecent({ topic: s.topic, limit: 1 })).messages.at(-1);
-                if (last !== undefined) setTimeout(() => safeDeliver(s.handler, last), 10);
+                if (last !== undefined) setTimeout(() => safeDeliver(s.handler, () => last), 10);
               }
             }
             await inner.disconnect();

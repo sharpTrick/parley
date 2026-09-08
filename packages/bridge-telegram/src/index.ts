@@ -386,7 +386,7 @@ export class TelegramPlugin implements BackendPlugin {
       return store.isOpen();
     }
     for (const sub of this.subs.get(chatId) ?? []) {
-      safeDeliver(sub.handler, recordToMessage(rec, sub.topic, store.epoch()));
+      safeDeliver(sub.handler, () => recordToMessage(rec, sub.topic, store.epoch()));
     }
     return true;
   }

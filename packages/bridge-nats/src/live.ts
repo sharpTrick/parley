@@ -93,7 +93,7 @@ export abstract class NatsLive extends NatsReads {
             }
             nextDelivery = m.info.deliverySequence + 1;
             lastSeq = m.seq;
-            safeDeliver(handler, this.rowToMessage(topic, m.seq, m.data));
+            safeDeliver(handler, () => this.rowToMessage(topic, m.seq, m.data));
           }
         } catch {
           /* iterator closed on disconnect or consumer loss */

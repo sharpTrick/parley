@@ -172,8 +172,10 @@ export class XmppInbound extends XmppRooms {
     if (sub === undefined) return;
     const body = stanza.getChildText('body');
     if (body === null) return;
-    const msg = this.toMessage(sub.topic, { archId, from, body, stamp: wire.roomStamp(stanza, room) });
-    for (const h of sub.handlers) safeDeliver(h, msg);
+    for (const h of sub.handlers)
+      safeDeliver(h, () =>
+        this.toMessage(sub.topic, { archId, from, body, stamp: wire.roomStamp(stanza, room) }),
+      );
   }
 
   /**

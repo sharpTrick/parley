@@ -304,8 +304,7 @@ export class SocketModeLink {
 
     const route = this.routes.get(event.channel);
     if (route === undefined) return;
-    safeDeliver(
-      route.handler,
+    safeDeliver(route.handler, () =>
       slackToMessage(route.topic, event, this.host.settings().mentionMap),
     );
   }

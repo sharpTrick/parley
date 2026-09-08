@@ -62,7 +62,7 @@ export abstract class SqlitePoller extends SqliteRetention {
           // in memory, and the bookkeeping below would report a torn-down loop as live.
           if (this.orphaned(generation)) return;
           lastSeen = row.id;
-          safeDeliver(handler, rowToMessage(row, storeId));
+          safeDeliver(handler, () => rowToMessage(row, storeId));
         }
         // Keep this check, so that a loop torn down on the batch's final row neither reports
         // itself live below nor re-arms: `disconnect()` has already emptied the canceller list,

@@ -72,7 +72,7 @@ export async function runReadLoop(
     for (const stream of res) {
       for (const entry of stream.messages) {
         lastId = entry.id;
-        safeDeliver(handler, rowToMessage(topic, entry.id, entry.message));
+        safeDeliver(handler, () => rowToMessage(topic, entry.id, entry.message));
       }
     }
   }

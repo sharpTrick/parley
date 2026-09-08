@@ -82,12 +82,17 @@ export type MessageHandler = (msg: Message) => void;
  * REJECTION arm too, so that an `async` handler — which this file's `=> void` return type does not
  * forbid, and which core is free to pass — cannot take the whole bridge down with an unhandled
  * rejection on Node's default `--unhandled-rejections=throw`.
+ *
+ * The message arrives as a THUNK, so that BUILDING it is inside the containment too: inbound is
+ * untrusted (CLAUDE.md), and a wire record a plugin's own converter chokes on would otherwise throw
+ * from the call site — out through the socket-level catch that ends the connection, taking live
+ * delivery for every subscription with it.
  */
-export function safeDeliver(handler: MessageHandler, message: Message): void {
+export function safeDeliver(handler: MessageHandler, message: () => Message): void {
   try {
-    void Promise.resolve(handler(message)).catch(() => undefined);
+    void Promise.resolve(handler(message())).catch(() => undefined);
   } catch {
-    /* the handler's failure is never the live path's */
+    /* neither the handler's failure nor the converter's is the live path's */
   }
 }
 

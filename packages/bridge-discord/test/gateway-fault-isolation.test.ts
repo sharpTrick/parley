@@ -299,6 +299,61 @@ describe('a malformed gateway frame never escapes the message listener', () => {
     }
   }
 
+  /**
+   * CLASS: a wire record the plugin's OWN converter chokes on. It clears the gateway's id/channel
+   * check, so it reaches `toMessage` — which ran at the CALL SITE of the delivery helper, outside
+   * the containment, for as long as that helper took a built message rather than a thunk. A throw
+   * there leaves the one `ws` message listener and ENDS THE SOCKET, so live delivery for every
+   * subscription on it stops; catch-up keeps working, so nothing says so. Inbound is untrusted
+   * (CLAUDE.md), and a converter tested in isolation cannot see this boundary at all.
+   */
+  const hostileRecord = (id: string, over: string): string =>
+    `{"op":0,"t":"MESSAGE_CREATE","s":2,"d":{"id":"${id}","channel_id":"${CHANNEL}",` +
+    `"timestamp":"2024-01-01T00:00:00.000Z","author":{"id":"1","username":"someone"},${over}}}`;
+
+  const CONVERTER_CHOKES: Array<[string, string]> = [
+    ['a non-string content', hostileRecord('7001', '"content":7')],
+    ['an array content', hostileRecord('7002', '"content":["hi"]')],
+    ['an object where mentions belong', hostileRecord('7003', '"content":"<@1> hi","mentions":{}')],
+    ['a string where mentions belong', hostileRecord('7004', '"content":"<@1> hi","mentions":"x"')],
+  ];
+
+  const WELL_FORMED = hostileRecord('7100', '"content":"still here"');
+
+  it.each(CONVERTER_CHOKES)(
+    '%s costs one message, not the live path behind it',
+    async (_label, frame) => {
+      gateway.handshake = true;
+      const plugin = await connect();
+      const delivered: string[] = [];
+      await plugin.subscribe(TOPIC, (m) => delivered.push(m.content));
+      await gateway.socket();
+      try {
+        const sentBefore = gateway.received().length;
+        const settled = gateway.reacted();
+        gateway.send(frame);
+        gateway.send(WELL_FORMED);
+        gateway.send(PROBE.ready.frame);
+        await settled;
+
+        expect(crashes.map(String), 'the converter threw out into the process').toEqual([]);
+        expect(
+          delivered,
+          'a record the converter chokes on ended live delivery for the subscription',
+        ).toContain('still here');
+        expect(
+          gateway.received().slice(sentBefore),
+          'one unconvertible record cost the whole socket',
+        ).toContain(PROBE.ready.answer);
+        expect(written(), 'the converter failure reached the operator as a stack trace').not.toMatch(
+          /is not a function/,
+        );
+      } finally {
+        await plugin.disconnect();
+      }
+    },
+  );
+
   const OTHER_DISPATCH = [
     '{"op":0,"s":2,"d":null}',
     '{"op":0,"t":"READY","d":null}',

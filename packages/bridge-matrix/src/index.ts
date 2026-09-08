@@ -220,7 +220,7 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
 
   /** Hand one event to a subscribe handler. */
   private deliver(topic: Topic, e: MessageEvent, handler: MessageHandler): void {
-    safeDeliver(handler, eventToMessage(topic, e));
+    safeDeliver(handler, () => eventToMessage(topic, e));
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {

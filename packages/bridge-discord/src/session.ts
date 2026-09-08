@@ -81,7 +81,7 @@ export abstract class DiscordSession {
   private dispatch(m: DiscordMessage): void {
     const sub = this.subs.get(m.channel_id);
     if (sub !== undefined) {
-      safeDeliver(sub.handler, toMessage(sub.topic, m));
+      safeDeliver(sub.handler, () => toMessage(sub.topic, m));
     }
   }
 

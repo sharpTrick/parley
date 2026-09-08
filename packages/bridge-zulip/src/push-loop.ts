@@ -64,7 +64,7 @@ export async function startPushLoop(
   let parking = true;
   const deliver = (m: Message): void => {
     if (!alive()) return;
-    safeDeliver(handler, m);
+    safeDeliver(handler, () => m);
   };
   const backoff = async (reason: string): Promise<void> => {
     consecutiveFailures++;
