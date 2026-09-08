@@ -311,8 +311,8 @@ interface CallerChannel {
   names: RegExp;
   /**
    * False where the channel must echo NOTHING of the value — a rejected `url`, which can carry a
-   * password. The row then asserts {@link ECHOED} is ABSENT, so that a channel cannot pass by
-   * quietly having started to echo it.
+   * password, and any value a CONTAINER holds. The row then asserts {@link ECHOED} is ABSENT, so
+   * that a channel cannot pass by quietly having started to echo it.
    */
   echoes?: false;
 }
@@ -422,13 +422,29 @@ const callerChannels: Array<[string, CallerChannel]> = [
       names: /live delivery RESUMED/,
     },
   ],
+  // Two families per knob, because the two halves of the disclosure rule pull opposite ways.
+  // A value the operator WROTE is echoed back bounded and flattened, so a typo is diagnosable. A
+  // value a CONTAINER holds is never echoed at all: the branch that reaches the renderer is "not a
+  // non-empty string", which admits every container a password can be nested inside, and enumerating
+  // one puts that password in the log. `url` is on the silent side under both, since it is the one
+  // value that carries a credential as a plain string.
   ...CONFIG_KEYS.map(
     (knob): [string, CallerChannel] => [
-      `a rejected backend_config.${knob}`,
+      `a rejected backend_config.${knob} wrapped in an array`,
       {
         observe: (hostile) => said(new RedisPlugin().connect({ [knob]: [hostile] })),
         names: new RegExp(`parley-redis: ${knob} must`),
-        // A rejected `url` is the one value that can carry a password, so it is never echoed.
+        echoes: false as const,
+      },
+    ],
+  ),
+  // `key_prefix` is absent: any non-empty string is a legal prefix, so there is no refusal to grade.
+  ...(['url', 'block_ms', 'connect_timeout_ms', 'retention_days'] as const).map(
+    (knob): [string, CallerChannel] => [
+      `a rejected backend_config.${knob} written as a string`,
+      {
+        observe: (hostile) => said(new RedisPlugin().connect({ [knob]: hostile })),
+        names: new RegExp(`parley-redis: ${knob} must`),
         ...(knob === 'url' ? { echoes: false as const } : {}),
       },
     ],
