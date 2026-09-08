@@ -2,6 +2,7 @@ import {
   assertKnownConfigKeys,
   type BackendConfig,
   type BackendConfigKeys,
+  isPlainObject,
 } from '@sharptrick/parley-core';
 import { isLoopbackHost } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
@@ -65,9 +66,6 @@ const DECLARED: BackendConfigKeys = {
     } satisfies Record<keyof Required<NonNullable<NatsBackendConfig['tls']>>, 0>),
   },
 };
-
-const isPlainObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** What a value IS, for a diagnostic that must never carry what a value HOLDS. */
 const typeName = (value: unknown): string =>

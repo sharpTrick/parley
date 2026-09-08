@@ -26,6 +26,7 @@ export {
 export {
   assertKnownConfigKeys,
   type BackendConfigKeys,
+  isPlainObject,
 } from './backend-config-keys.js';
 
 // Shared helpers (used by plugins and core alike).

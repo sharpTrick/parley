@@ -1,5 +1,5 @@
 import { assertKnownConfigKeys, type BackendConfigKeys } from '@sharptrick/parley-core';
-import { DEFAULT_DEADLINE_MS, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { DEFAULT_DEADLINE_MS, isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
 import { TOPIC_KEY } from './wire.js';
 
@@ -81,15 +81,6 @@ export const MAX_SYNC_TIMEOUT_MS = MAX_TIMER_MS - DEFAULT_DEADLINE_MS;
  * always fits a Node timer.
  */
 export const syncDeadlineMs = (timeoutMs: number): number => timeoutMs + DEFAULT_DEADLINE_MS;
-
-const isHttpUrl = (s: string): boolean => {
-  try {
-    const { protocol } = new URL(s);
-    return protocol === 'http:' || protocol === 'https:';
-  } catch {
-    return false;
-  }
-};
 
 /**
  * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to

@@ -45,3 +45,13 @@ export function isLoopbackHost(hostname: string): boolean {
   if (groups.some((g) => g !== '' && Number.parseInt(g, 16) !== 0)) return false;
   return Number.parseInt(tail, 16) === 1;
 }
+
+/** True for a string a fetch can dereference: an absolute URL on the `http:`/`https:` scheme. */
+export const isHttpUrl = (value: string): boolean => {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+};

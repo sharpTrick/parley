@@ -7,13 +7,14 @@
  * Record<keyof Required<XBackendConfig>, 0>` form every backend uses — so that a key added to the
  * interface and not to the list is a compile error rather than a key `connect()` rejects.
  */
+/** True for an object literal — the only shape `backend_config` and its nested groups may take. */
+export const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
 export interface BackendConfigKeys {
   readonly keys: readonly string[];
   readonly nested?: Readonly<Record<string, readonly string[]>>;
 }
-
-const isPlainObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** What a value IS, for a diagnostic that must never carry what a value HOLDS. */
 const typeName = (value: unknown): string =>

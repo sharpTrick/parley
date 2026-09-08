@@ -132,6 +132,8 @@ seam error into.
   address (`127.0.0.1.example.com`, `localhost.example.com`) is classified by what it *is* and still
   gets warned about. Anything unproven — including an IPv4-mapped spelling of a loopback address —
   counts as remote: the safe direction is to warn.
+- `isHttpUrl(value)` — true for a string a fetch can dereference: an absolute URL on `http:` or
+  `https:`. A parse, so a bare host or a relative path answers false rather than being dialled.
 - `plaintextRemoteOrigin(url)` — the ORIGIN to name when the URL would put a credential on the wire
   in the clear, else `undefined`. Naming the origin rather than the whole configured URL keeps a
   secret smuggled into a path out of stderr, and out of the tool result core hands the model. The

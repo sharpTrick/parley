@@ -3,7 +3,7 @@ import {
   parseMentions,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
@@ -177,15 +177,6 @@ export function requireUsableSocketUrl(apiUrl: string, url: unknown): string {
   }
   return url;
 }
-
-const isHttpUrl = (s: string): boolean => {
-  try {
-    const { protocol } = new URL(s);
-    return protocol === 'http:' || protocol === 'https:';
-  } catch {
-    return false;
-  }
-};
 
 /**
  * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to

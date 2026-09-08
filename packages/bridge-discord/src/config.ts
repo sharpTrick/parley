@@ -2,6 +2,7 @@ import {
   assertKnownConfigKeys,
   type BackendConfig,
   type BackendConfigKeys,
+  isPlainObject,
   type Topic,
 } from '@sharptrick/parley-core';
 import { RECONNECT_CAP_MS } from './ladder.js';
@@ -63,9 +64,6 @@ export const MAX_DIALERS = Math.floor(MAX_TIMER_MS / RECONNECT_CAP_MS);
  * credentialed call is sent to, a `setTimeout` delay, or the channel id a topic is routed to.
  */
 export type ConfigShape = 'text' | 'channel map' | 'timer ms' | 'dialer count' | 'nested object';
-
-const isPlainObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** What a value IS. Keep a refusal off what a value HOLDS, so that it cannot print a bot token. */
 const typeName = (value: unknown): string => {
