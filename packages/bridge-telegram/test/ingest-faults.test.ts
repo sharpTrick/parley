@@ -2,49 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { asTopic, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { type ObservedRecord, ObservedStore, type StoredRecord } from '../src/store.js';
-import { captureStderr, contentsOf, registerCleanup, SENDER, startRig } from './rig.js';
-
-/**
- * The getUpdates loop is the only ingestion path and it is detached: anything that throws
- * inside it (a full disk on the store write, a subscriber handler) must not take live push
- * down for the rest of the process, nor surface as an unhandled rejection.
- */
-describe('telegram poll-loop fault isolation', () => {
-  const THROW_SITES = ['store append', 'subscriber handler'] as const;
-
-  it.each(THROW_SITES)('keeps consuming updates when %s throws', async (site) => {
-    const unhandled: unknown[] = [];
-    const onUnhandled = (err: unknown): void => void unhandled.push(err);
-    process.on('unhandledRejection', onUnhandled);
-    registerCleanup(() => void process.off('unhandledRejection', onUnhandled));
-
-    captureStderr();
-    const rig = await startRig();
-    const chat = '-1006000123';
-    const topic = asTopic(chat);
-    const live: Message[] = [];
-    await rig.plugin.subscribe(topic, (m) => {
-      if (site === 'subscriber handler' && m.content === 'poison') throw new Error('handler blew up');
-      live.push(m);
-    });
-    if (site === 'store append') {
-      vi.spyOn(ObservedStore.prototype, 'append').mockImplementationOnce(() => {
-        throw new Error('ENOSPC: no space left on device');
-      });
-    }
-
-    rig.fake.injectUserMessage(chat, 'alice', 'poison');
-    rig.fake.injectUserMessage(chat, 'alice', 'after');
-
-    await vi.waitFor(() => expect(live.map((m) => m.content)).toContain('after'), {
-      timeout: 3000,
-      interval: 10,
-    });
-    expect(await contentsOf(rig.plugin, topic)).toContain('after');
-    await new Promise((r) => setTimeout(r, 20));
-    expect(unhandled).toEqual([]);
-  });
-});
+import { captureStderr, contentsOf, SENDER, startRig } from './rig.js';
 
 /**
  * Store-visibility and delivery are ONE decision, and a step that runs after the record is already

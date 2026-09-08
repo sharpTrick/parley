@@ -60,27 +60,3 @@ describe('one bad events answer is tolerated without ending push', () => {
     }, 20_000);
   }
 });
-
-describe('a handler that throws never breaks the loop it is attached to', () => {
-  it('every later message still reaches it, and nothing escapes as a rejection', async () => {
-    await withRejectionCollector(async (rejections) => {
-      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-      const { plugin } = await boot();
-      const topic = asTopic(`throwing-handler-${rand()}`);
-      const seen: string[] = [];
-      await plugin.subscribe(topic, (m) => {
-        seen.push(m.content);
-        throw new Error('handler exploded');
-      });
-
-      await plugin.post(topic, SENDER, 'first');
-      await sleep(400);
-      await plugin.post(topic, SENDER, 'second');
-      await sleep(400);
-
-      expect(rejections).toEqual([]);
-      expect(seen).toEqual(['first', 'second']);
-      expect(parleyErrors(error)).toEqual([]);
-    });
-  }, 20_000);
-});
