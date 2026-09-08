@@ -434,7 +434,7 @@ describe('a session that was down catches up through the documented procedure', 
     };
   };
 
-  /** The procedure verbatim: no cursor first, then the one handed back, until a page is empty. */
+  /** The procedure verbatim: no cursor first, then the one handed back, until it stops advancing. */
   const catchUp = async (client: Client): Promise<string[]> => {
     const got: string[] = [];
     let since: string | undefined;
@@ -446,7 +446,6 @@ describe('a session that was down catches up through the documented procedure', 
           content: { text: string }[];
         }).content[0]!.text,
       ) as { messages: { content: string }[]; nextCursor?: string };
-      if (out.messages.length === 0) return got;
       got.push(...out.messages.map((m) => m.content));
       if (out.nextCursor === undefined || out.nextCursor === since) return got;
       since = out.nextCursor;

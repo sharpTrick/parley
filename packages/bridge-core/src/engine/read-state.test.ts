@@ -34,6 +34,53 @@ describe('ReadStateStore', () => {
     expect(new ReadStateStore(path).get(asTopic('t'))).toBeUndefined();
   });
 
+  /**
+   * A file that cannot be read is NOT the same thing as one that was never written, and the
+   * difference is the whole catch-up horizon: an unreadable file silently reverts EVERY topic to
+   * the backend's recent window, and the next `set` then merges over the load that discarded it, so
+   * the text an operator could have recovered a cursor from is gone too. Measured, before this: a
+   * state file truncated by eight bytes resumed from `undefined`, printed nothing, and one write
+   * later held only the topic that had just been written.
+   *
+   * One row per way the file can be unusable, since each reaches `load` down a different path and
+   * only the JSON-parse one was ever considered.
+   */
+  describe('an unreadable read-state file is reported and kept, never silently overwritten', () => {
+    const UNREADABLE: Array<[label: string, body: string]> = [
+      ['truncated mid-write', '{"ops":"cursor-1234'],
+      ['not JSON at all', 'not json at all'],
+      ['a JSON array', '["ops"]'],
+      ['a JSON scalar', '"cursor-1234"'],
+      ['empty', ''],
+    ];
+
+    it.each(UNREADABLE)('%s', (_label, body) => {
+      const path = tmpFile();
+      writeFileSync(path, body, 'utf8');
+      const said: string[] = [];
+      const err = console.error;
+      console.error = (...args: unknown[]) => said.push(args.map(String).join(' '));
+      try {
+        const store = new ReadStateStore(path);
+        expect(store.get(asTopic('ops'))).toBeUndefined();
+        store.set(asTopic('other'), asCursor('c2'));
+      } finally {
+        console.error = err;
+      }
+
+      expect(
+        said.filter((line) => line.includes(path)),
+        'a read-state file the bridge could not read cold-started every topic in it without ' +
+          'saying so. The only symptom an operator sees is messages that never arrive',
+      ).not.toEqual([]);
+      expect(
+        readFileSync(`${path}.corrupt`, 'utf8'),
+        'the unreadable file was discarded rather than kept, so the cursors an operator could ' +
+          'have recovered from it are gone',
+      ).toBe(body);
+    });
+  });
+
   it('does not lose writes when the file is a JSON array', () => {
     const path = tmpFile();
     writeFileSync(path, '[]', 'utf8');

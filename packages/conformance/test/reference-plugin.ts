@@ -21,6 +21,7 @@ import {
   CALLER_BLOCK_RETURN_MS,
   carriesControlCharacter,
   type ConformanceContext,
+  CONTENT_SHAPES,
   DELIVERY_MS,
   isPlainAscii,
   EARLY_RETURN_FRACTION,
@@ -42,6 +43,7 @@ import {
   SHORT_PAYLOAD,
   STABILITY_SPAN_MS,
   TAIL_BLOCK_MS,
+  TOOL_BACKLOG_MIN,
 } from '@sharptrick/parley-conformance';
 
 /**
@@ -189,10 +191,11 @@ let seq = 0;
  * an axis: a flag no fixture ever takes the other arm of is a flag whose weaker contract is graded
  * nowhere. Every fixture below states which arm it takes, and `BROKEN_VARIANTS` covers both.
  */
-type Capabilities = Pick<ConformanceContext, 'carriesSenderIdentity'>;
+type Capabilities = Pick<ConformanceContext, 'carriesSenderIdentity' | 'refusesContentShapes'>;
 
 const DEFAULT_CAPABILITIES: Capabilities = {
   carriesSenderIdentity: true,
+  refusesContentShapes: [],
 };
 
 const delegate = (inner: ReferencePlugin): BackendPlugin => ({
@@ -572,8 +575,11 @@ const armSwitch = (sw: ArmSwitch, nativeBlocking: boolean, blastRadius: number):
  *    `connectionOffered` axis, and that is what closing it would take.
  *  - AGE reaches the span the floor holds a subscription idle mid-run (`QUIET_IDLE_MS`), plus
  *    whatever that run's own round trips cost. A path that dies at 3 s passes.
- *  - BACKLOG reaches 22–25 rows on the floor's topic (the seeded backlog, the independent writes and
- *    the drawn depth); a path that goes silent above 40 passes.
+ *  - BACKLOG reaches `QUIET_BACKLOG_ROWS` = 10 rows already on the topic when the floor subscribes,
+ *    which is the figure a path conditioned on how BUSY a topic is meets; the topic goes on to hold
+ *    22–25 rows by the end of the case (20–23 where `concurrentPost` is `'unsupported'`), but those
+ *    rows arrive one at a time with the subscription already open. A path that goes silent above 40
+ *    passes.
  *  - LATENCY is one fixed bound per message; a path whose delay GROWS (150 ms per message, minutes
  *    late after a few hundred) passes.
  *  - ORDER reaches a burst drawn from [`BURST_POSTS_MIN`, `BURST_POSTS_MAX`] = 5..8, so a path that
@@ -584,10 +590,14 @@ const armSwitch = (sw: ArmSwitch, nativeBlocking: boolean, blastRadius: number):
  *  - VOCABULARY reaches a payload and a handle drawn per call, which forbids a plugin keyed on a
  *    LITERAL this package once wrote. One keyed on the SHAPE of a draw — `[a-z][0-9a-z]{0,8}` — is
  *    still outside it; what the CONTENT rows below reach is the complement the floor now sends.
- *  - CONTENT reaches the shapes in `CONTENT_SHAPES`: a payload past `SHORT_PAYLOAD` characters, one
- *    that is not plain ASCII, and one carrying a newline or a tab. A path sized against some other
- *    property of a real message — a mention, a code fence, a 4 kB paste — is outside it until that
- *    shape is a row in that table.
+ *  - CONTENT reaches the shapes in `CONTENT_SHAPES` THAT THE FIXTURE DID NOT DECLARE REFUSED: a
+ *    payload past `SHORT_PAYLOAD` characters, one that is not plain ASCII, and one carrying a
+ *    newline or a tab. A path sized against some other property of a real message — a mention, a
+ *    code fence, a 4 kB paste — is outside it until that shape is a row in that table. A backend
+ *    naming a label in `refusesContentShapes` withdraws that row from this axis, and the write
+ *    clause then requires the refusal to be real; what it may NOT do is refuse silently, which
+ *    while the floor fell back to a bare token bought a backend carrying nothing a person could
+ *    type — on either path — a 36-of-36 certification.
  * Every one of these costs wall clock on every fixture and on every variant here, which is why they
  * are recorded rather than chased. None of them is CLOSED, and each has its control below at the far
  * edge of the reach a run guarantees.
@@ -767,6 +777,18 @@ const liveDeath = (death: LiveDeath): BrokenVariant => ({
 interface ResumedReadLoss {
   what: string;
   mutates: string;
+  /**
+   * How far behind the caller must be before this shape loses anything, in rows. Default: one page
+   * — near the tail every row here is the identity, so the clauses that read a page or two off a
+   * small topic answer honestly.
+   *
+   * Declared per row so the DEPTH the tool clause reaches is itself controlled. While the clause's
+   * backlog was a literal 12, a shape gated at 12, 13, 20, 50 or 200 rows behind was certified
+   * 36/36 every time and only a gate at 5 was caught: the clause reached eleven messages behind and
+   * read as closed. The far-edge row below sits at {@link TOOL_BACKLOG_MIN} - 1, the deepest gate
+   * every run is still guaranteed to exceed.
+   */
+  behind?: number;
   /** The page as the caller receives it, given the rows really after `since` and the page size. */
   serve: (after: Message[], limit: number, since: Cursor) => FetchRecentResult;
 }
@@ -810,6 +832,19 @@ const RESUMED_READ_LOSSES: ResumedReadLoss[] = [
       return { messages: window, nextCursor: window.at(-1)!.cursor };
     },
   },
+  {
+    // The far edge of the DEPTH axis, and the ONLY row here that no plugin-level paging clause
+    // reaches: every other case reads a topic a page or two deep, so a shape that serves honestly
+    // until the reader is this far behind answers all of them, and only the tool clause — which
+    // strands its session behind a whole drawn backlog — asks a question deep enough to see it.
+    what: `drops the oldest half of a resumed page once the reader is more than ${TOOL_BACKLOG_MIN - 1} messages behind`,
+    mutates: 'fetchRecent',
+    behind: TOOL_BACKLOG_MIN - 1,
+    serve: (after, limit) => {
+      const page = after.slice(0, limit);
+      return { messages: page.slice(Math.ceil(page.length / 2)), nextCursor: page.at(-1)!.cursor };
+    },
+  },
 ];
 
 const resumedReadLoss = (loss: ResumedReadLoss): BrokenVariant => ({
@@ -823,10 +858,8 @@ const resumedReadLoss = (loss: ResumedReadLoss): BrokenVariant => ({
         const since = args.since;
         if (since === undefined || page.messages.length < 2) return page;
         const all = await inner.fetchRecent({ topic: args.topic, since, limit: 10_000 });
-        // Only a caller that is BEHIND by more than a page: near the tail every row here is the
-        // identity, so the clauses that read a page or two off a small topic answer honestly.
         const limit = page.messages.length;
-        if (all.messages.length <= limit) return page;
+        if (all.messages.length <= (loss.behind ?? limit)) return page;
         return loss.serve(all.messages, limit, since);
       },
     })),
@@ -1100,6 +1133,59 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
       wrap((inner) => ({
         post: (t, i, c, o) => inner.post(t, i, c.replace(/\s+/gu, ' ').trim(), o),
       })),
+  },
+  {
+    // The measured defeat of the content axis, whole: refuse every shape on the way in AND drop
+    // every long, non-ASCII or control-carrying message on the way out, while declaring no refusal
+    // at all. The write clause used to permit a refusal without a declaration and the live floor
+    // used to fall back to a bare token on one, so this plugin — which carries nothing a person
+    // could type, on either path — was certified 36 of 36.
+    name: 'a write path that refuses every content shape while declaring none',
+    mutates: 'content-shape-declaration',
+    mustFail: 'either round-trips',
+    blastRadius: 7,
+    make: () =>
+      wrap((inner, store) => ({
+        post: (t, i, c, o) => {
+          if (CONTENT_SHAPES.some(([, body]) => c.includes(body))) {
+            return Promise.reject(new Error('this payload is not supported by this backend'));
+          }
+          return inner.post(t, i, c, o);
+        },
+        subscribe: (topic, handler) =>
+          inner.subscribe(topic, (m) => {
+            const busy = (store.log.get(String(topic)) ?? []).length > DEATH_TOPIC_ROWS;
+            const typed =
+              m.content.length > SHORT_PAYLOAD ||
+              !isPlainAscii(m.content) ||
+              carriesControlCharacter(m.content);
+            if (!busy || !typed) handler(m);
+          }),
+      })),
+  },
+  {
+    // The PARTIAL of the same shape, which is worse: it withdraws exactly one row of the content
+    // axis and leaves the case reading as covered. Nothing but the floor's reached-vs-declared
+    // check can see it — the axis is still exercised, just no longer along the length dimension.
+    name: 'a write path that refuses the longest content shape while declaring none',
+    mutates: 'content-shape-declaration',
+    mustFail: 'either round-trips',
+    make: () =>
+      wrap((inner) => ({
+        post: (t, i, c, o) =>
+          c.length > SHORT_PAYLOAD
+            ? Promise.reject(new Error('message too long for this backend'))
+            : inner.post(t, i, c, o),
+      })),
+  },
+  {
+    // The declaration in the other direction: a fixture that names a refusal it does not have buys
+    // a shorter live floor for free. `refusesContentShapes` is only a weaker grade while it is TRUE.
+    name: 'a fixture that declares a refusal the backend does not have',
+    mutates: 'content-shape-declaration',
+    mustFail: 'either round-trips',
+    blastRadius: 6,
+    make: () => wrap(() => ({}), { refusesContentShapes: CONTENT_SHAPES.map(([label]) => label) }),
   },
   {
     // The defect the contract exists to forbid, and the only one a DECLARATION could never catch:

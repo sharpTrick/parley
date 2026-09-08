@@ -65,10 +65,6 @@ const CLAIMS: Claim[] = [
     patterns: [/subset/i, /start-up window/i, /Push never carries it/i],
   },
   {
-    what: 'that the reconciling read is only as good as the cursor the caller keeps',
-    patterns: [/does not persist the cursor it hands back/i],
-  },
-  {
     what: 'that a single-writer deployment has no such window',
     patterns: [/single-writer deployment/i, /no such window at all/i],
   },

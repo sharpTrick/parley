@@ -15,6 +15,7 @@ function reference(): ConformanceContext {
     cleanup: async () => undefined,
     concurrentPost: async () => undefined,
     carriesSenderIdentity: false,
+    refusesContentShapes: [],
     absentTopicBehaviour: 'empty-page',
   };
 }

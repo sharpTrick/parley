@@ -31,22 +31,54 @@ export class ReadStateStore {
     this.state = ReadStateStore.load(filePath);
   }
 
+  /**
+   * Keep an UNREADABLE file distinguishable from an absent one, so that a truncated or half-written
+   * state file cannot silently cold-start every topic and then erase the evidence: the load
+   * discards it, the next `set` writes over what it discarded, and the operator's only signal that
+   * every topic went back to the backend's recent window — the loss this whole convention exists to
+   * prevent — is messages that never arrive.
+   */
   private static load(filePath: string): Record<string, string> {
     // Null-prototype backing map: `constructor`/`__proto__` topic names can neither leak a
     // prototype value out of get() nor turn set() into a silent no-op.
     const out: Record<string, string> = Object.create(null);
+    let raw;
     try {
-      const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
-      // Reject arrays (an `[]` file would otherwise swallow string-keyed writes on flush) and
-      // keep only own, string-valued entries (a non-string cursor would wedge catch-up).
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-          if (typeof v === 'string') out[k] = v;
-        }
-      }
+      raw = readFileSync(filePath, 'utf8');
     } catch {
-      // Missing or corrupt file → start from an empty read position.
+      return out; // never written, or removed: the cold start this instance is entitled to
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return ReadStateStore.quarantine(filePath, out);
+    }
+    // Reject arrays (an `[]` file would otherwise swallow string-keyed writes on flush) and
+    // keep only own, string-valued entries (a non-string cursor would wedge catch-up).
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return ReadStateStore.quarantine(filePath, out);
+    }
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === 'string') out[k] = v;
+    }
+    return out;
+  }
+
+  private static quarantine(filePath: string, out: Record<string, string>): Record<string, string> {
+    const kept = `${filePath}.corrupt`;
+    let moved = false;
+    try {
+      renameSync(filePath, kept);
+      moved = true;
+    } catch {
+      // Read-only directory, or another process moved it first — the diagnostic is what matters.
+    }
+    console.error(
+      `[parley] read-state at ${filePath} is not a readable JSON object; every topic in it ` +
+        'resumes from the backend’s recent window instead of where this instance last read, ' +
+        `and anything older is unreachable. ${moved ? `The unreadable file is kept at ${kept}` : 'It could not be moved aside and the next write will replace it'}.`,
+    );
     return out;
   }
 

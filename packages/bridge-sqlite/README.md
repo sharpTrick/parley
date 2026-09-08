@@ -29,13 +29,13 @@ subset it drops is the start-up window. Core runs catch-up to completion and arm
 deployment (several bridges on one file, §10), a row a peer commits between those two moments is
 above the cursor catch-up persisted and below the tail the loop starts at. Push never carries it.
 
-It is not lost: a `parley_fetch_recent` resuming from the caller's own cursor returns it, in order.
-But that is a weaker promise here than "catch-up reconciles" sounds, and the reason is worth stating
-plainly — **the `parley_fetch_recent` tool does not persist the cursor it hands back.** An agent
-that carries the cursor forward itself sees the window once; one that keeps re-reading from a stale
-cursor sees it repeatedly (core's dedup absorbs the repeats, so nothing is double-emitted). A
-single-writer deployment — one bridge, one process — has no such window at all: everything after the
-subscribe is its own or arrives later.
+It is not lost: the next `parley_fetch_recent` returns it, in order, and the agent has no
+bookkeeping to do for that to happen — a call with no `since` resumes from the position this
+instance last read, and the tool persists the cursor it hands back, so the window is crossed once
+and stayed past. An agent that passes a stale cursor of its own sees the window repeatedly instead
+(core's dedup absorbs the repeats, so nothing is double-emitted), and a cursor it was never handed
+does not move where the session resumes from at all. A single-writer deployment — one bridge, one
+process — has no such window at all: everything after the subscribe is its own or arrives later.
 
 `packages/bridge-sqlite/test/push-gap-reconciliation.test.ts` executes both halves.
 

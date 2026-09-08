@@ -15,6 +15,7 @@ async function makeContext() {
     plugin,
     freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
     carriesSenderIdentity: true,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
       await dropStreams(`PT_${tag}_`);

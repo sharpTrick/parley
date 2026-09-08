@@ -88,10 +88,15 @@ export interface ToolText {
 export const parse = (r: unknown): unknown => JSON.parse((r as ToolText).content[0]!.text);
 
 /**
- * Only the overrides a case actually names reach the shared harness. Keep the undefined-stripping,
- * so that an option a caller leaves unset keeps the harness default instead of opting OUT of the
- * dependency — the harness reads an explicitly-undefined key as "this test wants it absent".
+ * Only the overrides a case actually names reach the shared harness — where "names" means the key
+ * is PRESENT, not that its value is defined. `harness({ readState: undefined })` is the one way a
+ * case can ask for the absent-store branch, which is the shipped configuration of the remote HTTP
+ * root; a filter on the VALUE deletes exactly those keys, and the case written to grade that branch
+ * silently graded the empty-position branch instead (instrumented: `readState absent = false`).
+ *
+ * Keys the caller never wrote are dropped, so an options object built with optional properties
+ * still inherits every harness default.
  */
 export function harness(opts: ToolHarnessOptions = {}): Promise<ToolHarness> {
-  return toolClient(Object.fromEntries(Object.entries(opts).filter(([, v]) => v !== undefined)));
+  return toolClient(opts);
 }

@@ -225,13 +225,13 @@ describe('the start-up window is dark on push and reconciled by the next catch-u
 });
 
 /**
- * What makes the promise above WEAKER on this backend than "catch-up reconciles" sounds: the
- * reconciling read has to be one whose cursor the caller keeps. `catchUpTopic` persists through
- * `ReadStateStore`; the `parley_fetch_recent` MCP tool an agent calls by hand does not, so an agent
- * that reads the window and then reads again from its OLD cursor sees it twice rather than never —
- * which is why core's dedup, not the cursor, is what makes the overlap safe.
+ * The overlap the reconciliation is allowed to have. `catchUpTopic` and `parley_fetch_recent` both
+ * persist through `ReadStateStore`, so an agent that reads and then reads again sees the window
+ * once — but a caller is free to pass a cursor of its own, and one BEHIND the position it holds
+ * re-serves rows it already had. That is safe because core's dedup absorbs the repeat, and this is
+ * where that is executed rather than asserted in prose.
  */
-describe('the reconciling read is only as good as the cursor the caller keeps', () => {
+describe('a read from a stale cursor of the caller’s own re-serves, and dedup absorbs it', () => {
   it('re-reading from a stale cursor re-serves the window, and the seen-set absorbs it', async () => {
     const path = join(dir(), 'p.db');
     const reader = await connected(path);
@@ -241,8 +241,6 @@ describe('the reconciling read is only as good as the cursor the caller keeps', 
 
     await fill(peer, ['history']);
     await catchUpTopic({ plugin: reader, topic: T, limit: 100, readState, seen });
-    // The position the AGENT holds, which is the one this case is about: the driver leaves it
-    // alone and `parley_fetch_recent` advances it out of the page it returns.
     const stale = (await reader.fetchRecent({ topic: T, limit: 100 })).nextCursor;
     readState.set(T, stale);
     expect(stale).toBeDefined();

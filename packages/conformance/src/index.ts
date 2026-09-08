@@ -61,6 +61,7 @@ export {
   QUIET_POSTS,
   QUIET_POSTS_MIN,
 } from './cases/live.js';
+export { TOOL_BACKLOG_MIN, TOOL_PAGE } from './cases/tool-surface.js';
 export { ASSERTED_PROPERTIES, CLAUSES } from './clauses.js';
 export type { BackendFactory, ConformanceContext } from './factory.js';
 export {
@@ -71,9 +72,12 @@ export {
 } from './factory.js';
 
 /**
- * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend
- * conforms iff: stable-unique backendMsgId AND monotonic, in-order, exclusive-`since` cursor
- * delivery. Write once here; run against every backend via {@link BackendFactory}.
+ * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend conforms
+ * when it holds FOUR things: a stable-unique backendMsgId; monotonic, in-order, exclusive-`since`
+ * cursor delivery; a live path that delivers only a subset of the post-subscribe tail; and a live
+ * path that delivers at all. The first two alone are not conformance — a plugin registering no
+ * listener satisfies both and fails 10 of these cases. Write once here; run against every backend
+ * via {@link BackendFactory}.
  */
 export function runConformanceSuite(name: string, factory: BackendFactory): void {
   describe(`seam conformance: ${name}`, () => {

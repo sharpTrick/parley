@@ -4,6 +4,7 @@ import {
   ASSERTED_PROPERTIES,
   CALLER_BLOCK_RETURN_MS,
   CLAUSES,
+  CONTENT_SHAPES,
   CONTEXT_FIELDS,
   EARLY_RETURN_FRACTION,
   IDLE_BLOCK_CEILING_MS,
@@ -13,6 +14,7 @@ import {
   pageLimitsFor,
   PARK_FRACTION,
   PROBE_MAX_BLOCK_MS,
+  QUIET_POSTS_MIN,
   RACE_BLOCK_MS,
   RACE_RETURN_MS,
   REFUSAL_RETURN_MS,
@@ -29,6 +31,7 @@ import {
   casesIn,
   deferredPromises,
   diagnosedAssertions,
+  diagnosticSites,
   promiseExecutors,
   type SelfImposedBudget,
   suiteSource as source,
@@ -86,6 +89,22 @@ const SKIP_SPELLINGS = [
   /\bit\.skipIf\b/,
   /\bdescribe\.skipIf\b/,
 ];
+
+/**
+ * The live floor writes one `CONTENT_SHAPES` row per iteration and draws its depth per run, so the
+ * shapes it REACHES are the first `depth` of them. A depth that could fall below the table's length
+ * would silently stop exercising the tail of it — the per-message delivery assertion stays green,
+ * because the shape is never sent — and the content axis would shrink with nothing turning red. A
+ * plugin cannot produce that, so no `BROKEN_VARIANTS` row can grade it; it is a fact about two
+ * constants and belongs here.
+ */
+it('the floor’s shallowest drawn depth still reaches every content shape', () => {
+  expect(
+    QUIET_POSTS_MIN,
+    'the live floor draws a depth that can be shorter than the content table, so on those runs ' +
+      'the last shapes are never sent and the axis they stand for is not graded at all',
+  ).toBeGreaterThanOrEqual(CONTENT_SHAPES.length);
+});
 
 describe('the suite grades every backend it certifies', () => {
   // Without this the checks below read an empty list and pass having examined nothing.
@@ -451,8 +470,44 @@ describe('the suite grades every backend it certifies', () => {
         "expect(x, 'the topic\\'s cursor moved').toBe(1);",
         ["the topic's cursor moved"],
       ],
+      // The three forms this scan was blind to at once. Each was an assertion the negative control
+      // never asked for a control for, and none of them left a trace: the table simply got shorter.
+      [
+        'a diagnostic template OPENING with an interpolation',
+        'expect(got, `${depth} deep: the reader fell behind`).toEqual(sent);',
+        ['deep: the reader fell behind'],
+      ],
+      [
+        'a diagnostic bound to a const',
+        "const WHY = 'the cursor stood still';\nexpect(got, WHY).toEqual(sent);",
+        ['the cursor stood still'],
+      ],
+      [
+        'a first argument holding a comma inside a string',
+        "expect(render('a, b'), 'the payload was rewritten').toBe('a, b');",
+        ['the payload was rewritten'],
+      ],
     ])('reads %s', (_label, snippet, found) => {
       expect(diagnosedAssertions(snippet)).toEqual(found);
+    });
+
+    /**
+     * The scan's COMPLETENESS over the real suite, which no synthetic row can grade. Every
+     * `expect(actual, …)` the suite writes carries a message, so a form this cannot read shows up
+     * here as a site with none — rather than as a shorter table in the negative control, which is
+     * how three forms went missing at once with nothing turning red.
+     */
+    it('recovers a message from every diagnosed assertion the suite actually writes', () => {
+      const sites = diagnosticSites(source);
+      expect(sites.length, 'the scan found no diagnosed assertions at all').toBeGreaterThan(
+        CLAUSES.length,
+      );
+      expect(
+        sites.filter((site) => site.message === undefined).map((site) => site.argument),
+        'this scan cannot read the message of an `expect(actual, …)` the suite writes, so the ' +
+          'negative control never asks for a control for it — and an assertion nothing can make ' +
+          'fail is indistinguishable from a deleted one',
+      ).toEqual([]);
     });
   });
 

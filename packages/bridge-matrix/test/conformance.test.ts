@@ -61,6 +61,7 @@ function contextFactory(sharedRoom: string) {
       // Each topic is globally unique → its `app.parley.topic` tag isolates it inside the room.
       freshTopic: (): Topic => asTopic(`t-${++seq}-${Date.now().toString(36)}-${rand()}`),
       carriesSenderIdentity: false,
+      refusesContentShapes: [],
       cleanup: async () => {
         await plugin.disconnect();
       },

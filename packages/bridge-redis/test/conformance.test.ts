@@ -12,6 +12,7 @@ async function makeContext() {
     plugin,
     freshTopic: (): Topic => freshTopic('t'),
     carriesSenderIdentity: true,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
       await wipe(prefix);

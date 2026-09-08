@@ -98,6 +98,7 @@ for (const kind of ['better-sqlite3', 'node:sqlite'] as Kind[]) {
       plugin,
       freshTopic: (): Topic => asTopic(`t-${++topicSeq}`),
       carriesSenderIdentity: true,
+      refusesContentShapes: [],
       cleanup: async () => {
         await plugin.disconnect();
         rmSync(dir, { recursive: true, force: true });

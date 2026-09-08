@@ -12,6 +12,7 @@ async function makeContext() {
     // Telegram would 400 on, and an unmapped topic is used as the chat id literal.
     freshTopic: (): Topic => asTopic(String(-1_002_000_000_000 - ++seq)),
     carriesSenderIdentity: false, // posts as the bot account; `identity` is informational
+    refusesContentShapes: [],
     cleanup: rig.close,
     // Keep concurrentPost 'unsupported', so that the multi-writer case does not open a second
     // getUpdates consumer on a token Telegram allows exactly one on (HTTP 409), or a second writer

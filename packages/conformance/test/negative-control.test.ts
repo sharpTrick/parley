@@ -1,5 +1,14 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,6 +80,7 @@ interface Row {
 }
 
 interface JsonReport {
+  startTime: number;
   testResults: { assertionResults: Row[] }[];
 }
 
@@ -88,11 +98,26 @@ let stdout = '';
  * case anywhere in the child run reddens exactly one row. Raising the radii would hide that; the
  * evidence is what was missing.
  */
-const KEPT_RUN = join(tmpdir(), 'parley-negative-control-last');
+const KEPT_PREFIX = 'parley-negative-control-kept-';
+const KEPT_RUN = join(tmpdir(), `${KEPT_PREFIX}${process.pid}-${Date.now().toString(36)}`);
+/** How long a kept run stays before the next run sweeps it. Far longer than any run takes. */
+const KEEP_FOR_MS = 6 * 60 * 60 * 1000;
 let keptRun = '';
+/** The exact bytes this run parsed, so the copy on disk can be shown to be the same run's. */
+let keptReportText = '';
+const PARENT_STARTED_AT = Date.now();
 
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'parley-negative-control-'));
+  for (const entry of readdirSync(tmpdir())) {
+    if (!entry.startsWith(KEPT_PREFIX)) continue;
+    const path = join(tmpdir(), entry);
+    try {
+      if (Date.now() - statSync(path).mtimeMs > KEEP_FOR_MS) rmSync(path, { recursive: true, force: true });
+    } catch {
+      // Another run is holding it, or it is already gone.
+    }
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'parley-negative-control-run-'));
   const out = join(dir, 'report.json');
   try {
     const run = await promisify(execFile)(
@@ -112,6 +137,7 @@ beforeAll(async () => {
     const raw = readFileSync(out, 'utf8');
     writeFileSync(join(KEPT_RUN, 'report.json'), raw);
     keptRun = KEPT_RUN;
+    keptReportText = raw;
     report = JSON.parse(raw) as JsonReport;
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -241,24 +267,26 @@ describe('every assertion carrying its own diagnostic has a variant that reaches
       .filter((why): why is string => why !== undefined && why.length > 0);
 
   /**
-   * The floor, as a RUN-LEVEL fact rather than a number that was true two rounds ago. A pinned
-   * `>= 9` against an actual 21 left the scanner free to lose more than half its output and stay
-   * green — and it did lose output: a diagnostic double-quoted because it contains an apostrophe
-   * was invisible to a scan that matched single quotes only, so the one check here that grades an
-   * ASSERTION silently stopped asking for a control for it.
-   *
    * What cannot be pinned or truncated is what the child run printed. Every diagnostic a broken
    * variant made the runner emit has to be one this scan knows about; a parser that drops a
    * quoting style, a nesting depth or the tail of its own output fails here rather than shrinking
    * the table below in silence.
+   *
+   * The floor is `CLAUSES.length` — a figure that does NOT move with the scanner. It used to be
+   * `diagnosed.length / 2`, which is derived from the scanner's own output: a scan that lost
+   * twenty of its twenty-four entries lowered the bar it was being held to by the same amount and
+   * stayed green. What this guards is the recovery of `printedDiagnostics` itself going blind (a
+   * change in how the runner renders a message), which would otherwise satisfy the subset check
+   * below vacuously.
    */
   it('knows every diagnostic the broken variants actually printed', () => {
     const printed = [...new Set(printedDiagnostics())];
     expect(
       printed.length,
-      'no broken variant printed a diagnostic at all — the scan below has nothing to be checked ' +
-        'against, and this whole describe is grading an empty table',
-    ).toBeGreaterThan(diagnosed.length / 2);
+      'the broken variants printed almost no diagnostics — either they have stopped reaching the ' +
+        'assertions that carry one, or the recovery below can no longer read what the runner ' +
+        'prints, and the subset check is then satisfied by an empty list',
+    ).toBeGreaterThanOrEqual(CLAUSES.length);
     expect(
       printed.filter((why) => !diagnosed.some((d) => why.includes(d) || d.includes(why))),
       'the runner printed a diagnostic this scan does not know about, so nothing requires a ' +
@@ -310,13 +338,38 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
     expect(rows.length).toBeGreaterThan(CAPABILITY_AXES.length);
   });
 
-  it('tabulates every capability field whose arms can be named', () => {
+  /**
+   * A capability whose arms the probe cannot NAME gets no row below, so nothing here would require
+   * a control for it. Each such field therefore has to say why it cannot be tabulated and what
+   * covers it instead — a field that lands here with no entry is a capability whose coverage
+   * nothing is asking about, which is the state this whole describe exists to forbid.
+   */
+  const UNTABULATED_REASONS: Record<string, string> = {
+    concurrentPost:
+      'its arms are a FUNCTION and the string that says the backend has no such thing. Every ' +
+      'case that branches on it grades something on both arms, which the guarded-region check in ' +
+      '`runConformanceSuite` enforces per case.',
+    refusesContentShapes:
+      'its arms are a LIST of labels, not a value the probe can name. Tabulating it would also ' +
+      'demand a reference fixture that PASSES while declaring every content shape refused, and no ' +
+      'plugin in this repo refuses one. Covered instead by the `content-shape-declaration` entry ' +
+      'in ASSERTED_PROPERTIES, which the table above requires a control for, and by three of ' +
+      'them: refusing every shape while declaring none, refusing one while declaring none, and ' +
+      'declaring a refusal the backend does not have.',
+  };
+
+  it('records, for every capability the probe cannot tabulate, what covers it instead', () => {
     expect(
-      UNTABULATED_CAPABILITIES,
+      UNTABULATED_CAPABILITIES.filter((field) => UNTABULATED_REASONS[field] === undefined),
       'this context field has arms the probe cannot name, so no row below requires a control for ' +
-        'either of them. `concurrentPost` is the recorded one — its arms are a function and a ' +
-        'string; anything else here is a capability whose coverage nothing is asking about',
-    ).toEqual(['concurrentPost']);
+        'either of them, and nothing here says what does. Record why it cannot be tabulated and ' +
+        'what covers it — or give it an entry in ASSERTED_PROPERTIES, which does require one',
+    ).toEqual([]);
+    expect(
+      Object.keys(UNTABULATED_REASONS).filter((f) => !UNTABULATED_CAPABILITIES.includes(f)),
+      'this field is recorded as untabulated but the probe now names its arms, so the rows above ' +
+        'grade it and the excuse is stale',
+    ).toEqual([]);
   });
 
   it('built every variant fixture, so the arm each one declares is readable', () => {
@@ -506,9 +559,26 @@ describe('the suite rejects a non-conformant plugin', () => {
         'leaves nothing to read: not which cases the child failed, not its output, not even ' +
         'whether the child agreed with itself',
     ).toEqual([]);
-    const kept = JSON.parse(readFileSync(join(keptRun, 'report.json'), 'utf8')) as JsonReport;
+    // Kept files are THIS run's, byte for byte. The path used to be fixed and the only check on
+    // its contents was a row count that is the same figure for every run, so a report another
+    // worktree had written hours earlier satisfied it — and the copy meant to explain a red row
+    // described a different run. Two agents on one machine interleave; a per-run path plus an
+    // exact comparison is what makes the evidence attributable.
+    expect(
+      readFileSync(join(keptRun, 'report.json'), 'utf8'),
+      'the kept report is not the one this run parsed',
+    ).toBe(keptReportText);
+    expect(
+      readFileSync(join(keptRun, 'run.log'), 'utf8'),
+      'the kept log is not this run’s output — a non-empty file is not evidence of anything; an ' +
+        'npm notice banner alone satisfies a length check',
+    ).toBe(stdout);
+    const kept = JSON.parse(keptReportText) as JsonReport;
     expect(kept.testResults.flatMap((f) => f.assertionResults).length).toBe(results().length);
-    expect(readFileSync(join(keptRun, 'run.log'), 'utf8').length).toBeGreaterThan(0);
+    expect(
+      kept.startTime,
+      'the child report predates this run, so it was written by another one',
+    ).toBeGreaterThanOrEqual(PARENT_STARTED_AT);
   });
 
   // Without this the per-variant rows below read an empty report and pass having graded nothing.

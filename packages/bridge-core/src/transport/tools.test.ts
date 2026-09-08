@@ -7,7 +7,15 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { MAX_BLOCK_MS, parseConfig } from '../config.js';
 import { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { asBackendMsgId, asCursor, asHandle, asTopic, type Cursor, type Topic } from '../message.js';
+import {
+  asBackendMsgId,
+  asCursor,
+  asHandle,
+  asTopic,
+  type Cursor,
+  type Message,
+  type Topic,
+} from '../message.js';
 import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
 import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -306,6 +314,29 @@ describe('a result-returning tool bounds the page it hands back, not only the on
     if (out.messages.length < served.length) expect(out.nextCursor).toBe(out.messages.at(-1)!.cursor);
     // The dedup window still holds the FIRST id of the page: an oversized warm-up evicts it.
     expect(deps.seen!.has(T, asBackendMsgId(out.messages[0]!.backendMsgId))).toBe(true);
+
+    // …and the position this instance RESUMES from is the same cursor, not the one the plugin
+    // handed back over rows core trimmed off the page. Writing the pre-trim cursor leaves the page
+    // itself correct and the remainder unreachable for good: nothing the agent can do reaches
+    // rows behind a position it never asked to be at.
+    expect(
+      String(deps.readState!.get(T)),
+      'the stored read position covers rows this page did not deliver. The next since-less call ' +
+        'opens PAST the remainder core just trimmed, so those messages are unreachable by resume ' +
+        'forever — the page is right and the position is a lie',
+    ).toBe(out.nextCursor);
+
+    const follow = parse(
+      await client.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', ...(limit === undefined ? {} : { limit }) },
+      }),
+    ) as { messages: Array<{ backendMsgId: string }> };
+    const remainder = serve({ topic: T, since: asCursor(out.nextCursor!), limit: cap }, 1).messages;
+    expect(
+      follow.messages.map((m) => m.backendMsgId),
+      'the since-less call after a trimmed page did not open on the trimmed remainder',
+    ).toEqual(remainder.slice(0, cap).map((m) => String(m.backendMsgId)));
   });
 });
 
@@ -325,7 +356,13 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
   const MISSED = 12;
   const PAGE = 5;
 
-  /** The procedure CONVENTIONS.md ships: no cursor first, then the one handed back, until empty. */
+  /**
+   * The procedure CONVENTIONS.md ships: no cursor first, then the one handed back, until that
+   * cursor stops advancing. An EMPTY page is not the stop — core filters a page to the requested
+   * topic after the plugin applied `limit`, so a coarse history read answers an all-foreign page as
+   * empty with its cursor moved on, and a loop that returned there would strand everything behind
+   * it.
+   */
   const drainAsAnAgentWould = async (client: Client): Promise<string[]> => {
     const got: string[] = [];
     let since: string | undefined;
@@ -336,7 +373,6 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
         messages: Array<{ content: string }>;
         nextCursor?: string;
       };
-      if (out.messages.length === 0) return got;
       got.push(...out.messages.map((m) => m.content));
       if (out.nextCursor === undefined || out.nextCursor === since) return got;
       since = out.nextCursor;
@@ -364,7 +400,13 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
   });
 
   it('a fetch with no read position still answers with the recent window', async () => {
-    const { client, plugin } = await harness({ readState: undefined });
+    const { client, plugin, deps } = await harness({ readState: undefined });
+    expect(
+      deps.readState,
+      'this case grades the branch a bridge with NO read-state store takes — the shipped remote ' +
+        'HTTP root — and the harness handed it one anyway, so it graded the empty-POSITION branch ' +
+        'instead. Naming a dependency `undefined` is how a case asks for it to be absent',
+    ).toBeUndefined();
     for (let i = 0; i < MISSED; i++) await plugin.post(T, bob, `m${i}`);
     const out = parse(
       await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: PAGE } }),
@@ -445,6 +487,64 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
     expect(resumed.messages.map((m) => m.content)).toEqual(['q-5', 'q-6', 'q-7', 'q-8', 'q-9']);
   });
 
+  /**
+   * The documented loop over a backend whose HISTORY read is COARSER than a topic — Matrix in
+   * `shared_room`, a NATS wildcard subject, a Slack channel doubling as two. Core filters a page
+   * down to the topic that was asked for AFTER the plugin applied `limit`, so a page holding only
+   * other topics' rows reaches the agent as `{ messages: [], nextCursor: <advanced> }`.
+   *
+   * The terminal condition is therefore the CURSOR STANDING STILL, never an empty page. Measured on
+   * live Synapse against a room holding one on-topic message, sixty foreign ones and three more
+   * on-topic: a loop that returned on the first empty page reached 0 of the 3 it had missed, and
+   * the same run against the same server reached all 3 once only cursor progress ended it.
+   */
+  it('reaches everything behind a page that holds only other topics’ messages', async () => {
+    const FOREIGN_RUN = 20;
+    const missed = Array.from({ length: 3 }, (_unused, i) => `missed-${i}`);
+    const entries: Message[] = [];
+    const add = (topic: string, content: string): void => {
+      entries.push({
+        topic: asTopic(topic),
+        senderHandle: bob,
+        content,
+        timestamp: '1970-01-01T00:00:00.000Z',
+        backendMsgId: asBackendMsgId(String(entries.length + 1)),
+        cursor: asCursor(String(entries.length + 1)),
+        mentions: [],
+      });
+    };
+    add('ctx', 'read-in-session-one');
+
+    const plugin = {
+      connect: () => Promise.resolve(),
+      disconnect: () => Promise.resolve(),
+      subscribe: () => Promise.resolve(),
+      post: () => Promise.resolve(asBackendMsgId('0')),
+      resolveIdentity: (handle: unknown) => Promise.resolve({ handle, backendRef: 'ref' }),
+      // A page of `limit` ROWS, whatever topics they sit on — the read is coarse, not the filter.
+      fetchRecent: (args: FetchRecentArgs) => {
+        const from = args.since === undefined ? entries.length - (args.limit ?? 10) : Number(args.since);
+        const page = entries.filter((m) => Number(m.cursor) > Math.max(from, 0)).slice(0, args.limit ?? 10);
+        return Promise.resolve({ messages: page, nextCursor: page.at(-1)?.cursor ?? args.since });
+      },
+    } as unknown as BackendPlugin;
+
+    const readState = memoryReadState();
+    const { client } = await harness({ plugin, readState });
+    expect(await drainAsAnAgentWould(client)).toEqual(['read-in-session-one']);
+
+    // …and the session is away while the room fills with other topics' traffic, then with its own.
+    for (let i = 0; i < FOREIGN_RUN; i++) add('secret-ops', `not-mine-${i}`);
+    for (const content of missed) add('ctx', content);
+
+    expect(
+      await drainAsAnAgentWould(client),
+      'the documented catch-up loop stopped on a page that held only other topics’ messages. ' +
+        'That page is not the end of the topic — its cursor moved on — so everything behind it is ' +
+        'unread, and the next call opens further along still',
+    ).toEqual(missed);
+  });
+
   it('the documented loop advances it, because every page resumes from where the last stopped', async () => {
     const readState = memoryReadState();
     const { client, plugin } = await harness({ readState });
@@ -465,24 +565,43 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
    * path too.
    */
   it.each([
-    ['no nextCursor at all', 'kept', {}],
-    ['a null nextCursor', 'refused', { nextCursor: null }],
-    ['a numeric nextCursor', 'refused', { nextCursor: 7 }],
-    ['an empty-string nextCursor', 'refused', { nextCursor: '' }],
-  ])('a page carrying %s is %s without moving the stored position', async (_label, outcome, over) => {
+    // `delete` rather than a `{}` override: `{ ...page, ...{} }` is the IDENTITY, so the row
+    // labelled "no nextCursor at all" served a page WITH one. Made an absent nextCursor fatal in
+    // production and it stayed green — the identity case wearing the label of the one shape
+    // nothing else here covers.
+    ['no nextCursor at all', 'kept', (page: Record<string, unknown>) => delete page.nextCursor],
+    ['a null nextCursor', 'refused', (page: Record<string, unknown>) => (page.nextCursor = null)],
+    ['a numeric nextCursor', 'refused', (page: Record<string, unknown>) => (page.nextCursor = 7)],
+    ['an empty-string nextCursor', 'refused', (page: Record<string, unknown>) => (page.nextCursor = '')],
+  ])('a page carrying %s is %s without moving the stored position', async (_label, outcome, spoil) => {
     const readState = new ReadStateStore(join(mkdtempSync(join(tmpdir(), 'parley-tools-')), 'rs.json'));
     readState.set(T, asCursor('42'));
     const { client, plugin, deps } = await harness({ readState });
     const kept = await plugin.post(T, bob, 'body');
-    plugin.fetchRecent = async (args) => ({
-      ...(await FakePlugin.prototype.fetchRecent.call(plugin, args)),
-      ...over,
-    }) as never;
+    const served: Record<string, unknown>[] = [];
+    plugin.fetchRecent = async (args) => {
+      const page: Record<string, unknown> = {
+        ...(await FakePlugin.prototype.fetchRecent.call(plugin, args)),
+      };
+      spoil(page);
+      served.push(page);
+      return page as never;
+    };
 
     const res = (await client.callTool({
       name: 'parley_fetch_recent',
       arguments: { topic: 'ctx' },
     })) as ToolText;
+    // The page this row actually SERVED, graded outside the plugin so the diagnostic survives: a
+    // `{ ...page, ...over }` spread with an empty override is the IDENTITY, and the row labelled
+    // "no nextCursor at all" served a page WITH one — the one shape nothing else here covers,
+    // wearing the label of the case above it.
+    expect(
+      served.map((page) => 'nextCursor' in page && page.nextCursor !== undefined),
+      'this row did not build the page shape its label names, so it grades the shape another row ' +
+        'already covers',
+    ).toEqual(served.map(() => outcome === 'refused'));
+    expect(served.length).toBeGreaterThan(0);
     expect(res.isError === true).toBe(outcome === 'refused');
     expect(readState.get(T)).toBe('42');
     if (outcome === 'refused') {

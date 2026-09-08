@@ -82,6 +82,16 @@ export const CLAUSES: readonly string[] = [
  * - `refusal-is-not-an-empty-page`: a backend that refuses one block budget refuses every one of
  *   them. A refusal followed by a page is indistinguishable, to the caller, from a long-poll that
  *   timed out empty — so the agent goes on polling in the belief that it is parked.
+ * - `content-shape-declaration`: which of `post`'s two permitted answers a backend gives each
+ *   `CONTENT_SHAPES` row is its DECLARATION (`refusesContentShapes`), not its choice per run — and
+ *   the declaration binds BOTH paths: a declared refusal must really be refused, an undeclared one
+ *   is a failure, and a declared refusal withdraws that shape from the live floor. It is neither a
+ *   Message field nor a seam call, and the capability-arm table cannot name its arms (they are a
+ *   LIST), so without an entry here nothing would require a control. While the arm was implicit —
+ *   `post` free to refuse silently, the floor falling back to a bare token on a rejection — a
+ *   backend that refused every shape AND dropped every long, non-ASCII or control-carrying message
+ *   live was certified 36 of 36: the identical measurement recorded for the defect the shared
+ *   content table was added to catch.
  *
  * The three below are ELAPSED TIME, which is neither a field nor a call. Every assertion over
  * `Date.now() - <start>` names one of them in its own failure message, and `suite-shape` requires
@@ -121,6 +131,7 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'caller-scale-block-is-answered',
   'refusing-read-covers-only-what-it-returned',
   'refusal-is-not-an-empty-page',
+  'content-shape-declaration',
   'sinceless-block-returns-promptly',
   'refusal-is-prompt',
   'native-block-wakes-on-the-message',

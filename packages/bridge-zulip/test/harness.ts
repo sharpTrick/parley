@@ -201,6 +201,12 @@ export function makeZulipContext(args: {
       plugin,
       // Zulip stamps the sender from the authenticated bot, not from `post`'s `identity`.
       carriesSenderIdentity: false,
+      // The one refusal any backend in this repo takes, and it was invisible until it had to be
+      // declared: Zulip's `normalize_body` strips a body's trailing whitespace on SEND, so `post`
+      // refuses that shape rather than storing something else (`src/wire.ts`). Declaring it says
+      // what the write clause asserts — the refusal is real — and what the live floor therefore
+      // cannot carry here.
+      refusesContentShapes: ['leading and trailing spaces'],
       freshTopic: (): Topic => asTopic(`t-${++contextSeq}-${rand()}`),
       cleanup: async () => {
         await plugin.disconnect();

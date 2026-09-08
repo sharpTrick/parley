@@ -41,15 +41,28 @@ clause is a property of the tool rather than of any plugin, which is why it is n
 here — but it is the half of the lossy-push bargain an agent actually calls, and it belongs to the
 same contract.
 
+It too has a REACH, and it is a DEPTH: the session it strands is behind by a backlog drawn per run
+from 12–16 messages, paged five at a time. A read that serves an honest page until the caller is
+further behind than that, and loses rows only past it, is outside the clause. Measured while the
+backlog was the fixed 12: a plugin that dropped half of every resumed page once the reader was more
+than N behind was certified 36 of 36 at N = 12, 13, 20, 50 and 200, and was caught only at N = 5 —
+a reach of eleven messages behind. Drawing the backlog and placing a control at the far edge is
+what closes the constant, not the class: a loss that begins at 17 rows behind is still outside it.
+
 The suite grades (4) to a stated REACH, not in general, and the difference matters to anyone
 reading this as a promise. It holds a live path over a drawn depth of 10–13 messages ON ONE
 SUBSCRIPTION, written one at a time (12–15 deliveries wherever the fixture can supply a second
-writer), the ~1 s it holds that subscription idle mid-run, a topic holding 22–25 rows, three
-concurrent subscriptions on one connection, a burst of five to eight in flight (five on every run),
-payloads and writer handles drawn per run, and the payload SHAPES a real message carries — longer
-than a token, non-ASCII, a newline or a tab, on a backend that accepts them; one that refuses a
-shape is graded on the bare token for that message, so the depth above is the depth every backend
-is held to, and the shape axis reaches only the backends that take the shape. Plus one fixed
+writer), the ~1 s it holds that subscription idle mid-run, a BACKLOG of 10 rows already on the
+topic when the subscription opens (the topic reaches 22–25 rows by the end of the case, or 20–23
+where `concurrentPost` is `'unsupported'` — but what the live path is held over is the backlog it
+subscribed across), three concurrent subscriptions on one connection, a burst of five to eight in
+flight (five on every run), payloads and writer handles drawn per run, and the payload SHAPES a
+real message carries — longer than a token, non-ASCII, a newline or a tab. A backend may refuse a
+shape, and then it is graded on neither path — but it must DECLARE the refusal
+(`refusesContentShapes`) and the write clause holds it to that refusal being real, so the shape
+axis reaches exactly the shapes each backend did not withdraw, in the open. Today that is all six
+everywhere but Zulip, which refuses the surrounding-spaces row because its server strips trailing
+whitespace on send: five there. Plus one fixed
 per-message bound (2.5 s). A path that
 only fails past those figures — one that dies at 3 s of age, or above 40 rows, or that caps
 deliveries per CONNECTION rather than per subscription (nothing here offers one connection twenty),

@@ -35,8 +35,9 @@ XMPP) was added without touching either.
   returns messages pre-sorted ascending; `subscribe`'s handler fires in ascending order per topic.
   Core never parses or compares cursor values — it trusts the plugin. The last of those is graded to
   a stated reach (a drawn depth of 10–13 messages on ONE subscription, the ~1 s the floor holds a
-  subscription idle, 22–25 rows of backlog, three subscriptions, a burst of five to eight, the
-  payload shapes a real message carries where a backend accepts them, one 2.5 s per-message bound) — see
+  subscription idle, 10 rows of backlog already on the topic when it subscribes, three
+  subscriptions, a burst of five to eight, the payload shapes a real message carries except those a
+  backend DECLARES it refuses, one 2.5 s per-message bound) — see
   `packages/bridge-core/README.md`
   for what that does and does not catch, and do not read it as "however long, however busy".
 - **Inbound is untrusted.** A message arriving from a backend becomes agent context, never a

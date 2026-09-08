@@ -193,16 +193,24 @@ what it leaves out is returned by the next `fetchRecent`. A backend whose delive
 cover a burst is conformant; one whose live path delivers nothing at all is not, and the shared
 suite grades both bounds (`only the post-subscribe tail`, and `does not fall behind a quiet topic`).
 
-Two consequences a deployment feels, both measured:
+Three consequences a deployment feels. Documented, not closed: each is a window a particular
+backend's live path cannot cover, and the list holds the ones that have been written down.
 
 - **SQLite.** `subscribe` starts at the topic's tail as it stands when it is called. Core runs
   catch-up to completion and arms the live loop afterwards, so in a **multi-writer** deployment a
-  row a peer commits in that start-up window is delivered by neither path until the agent's next
-  `parley_fetch_recent` resuming from its own cursor. That promise is weaker here than elsewhere:
-  the `parley_fetch_recent` tool does **not** persist the cursor it hands back, so an agent that
-  does not carry it forward re-reads the window rather than moving past it.
-- **Matrix.** A `/sync` timeline is truncated to the per-sync cap (100 events); a burst wider than
-  that arrives with its older events missing, and they stay dark until the next catch-up.
+  row a peer commits in that start-up window is delivered by neither path until the next
+  `parley_fetch_recent`. That call closes it without the agent doing any bookkeeping: the tool
+  resumes from the position this instance last read and persists the one it hands back.
+- **Matrix.** The plugin asks each incremental `/sync` for at most `INCREMENTAL_TIMELINE_LIMIT`
+  (100) timeline events per room — its own filter value, sent by the client, not a homeserver
+  ceiling — so a burst wider than that arrives with its older events missing, and they stay dark
+  until the next catch-up. Reached through this package's fake; on live Synapse neither shape tried
+  (a burst of 130 while a long-poll was parked, and the same burst at an idle subscriber) lost
+  anything — both delivered 130 of 130.
+- **Zulip.** An event queue idle-GCs after ~10 minutes and is re-registered empty, and a message
+  that reaches the server while no queue of ours exists reaches no queue at all. That window is
+  left to the next `parley_fetch_recent` (bridge-zulip/README.md). Not measured: this repo has no
+  live Zulip, and the only oracle is the package's own fake.
 
 The same logical message can still arrive twice — once via live push, once via `fetchRecent`, which
 is now the ORDINARY path rather than a reconnect edge case. To make this deterministic:

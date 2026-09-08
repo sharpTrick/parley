@@ -211,16 +211,53 @@ export function promiseExecutors(
   return out;
 }
 
-/** The text after the first TOP-LEVEL comma of an argument list, or undefined when there is none. */
+/**
+ * The text after the first TOP-LEVEL comma of an argument list, or undefined when there is none.
+ *
+ * String-aware, so that a comma INSIDE a literal is not read as the argument separator: without it
+ * `expect(text, 'why')` split at the comma of a payload like `'a, b'` and the diagnostic that
+ * followed was invisible to the scan — and a diagnostic this cannot see is one nothing asks for a
+ * control for.
+ */
 function afterFirstArgument(args: string): string | undefined {
   let depth = 0;
   for (let i = 0; i < args.length; i++) {
     const ch = args[i] as string;
+    if (ch === '\'' || ch === '"' || ch === '`') {
+      i = endOfLiteral(args, i);
+      continue;
+    }
     if ('([{'.includes(ch)) depth++;
     else if (')]}'.includes(ch)) depth--;
     else if (ch === ',' && depth === 0) return args.slice(i + 1);
   }
   return undefined;
+}
+
+/** The index of the closing quote of the literal opening at {@link open}; interpolations included. */
+function endOfLiteral(text: string, open: number): number {
+  const quote = text[open] as string;
+  for (let i = open + 1; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (quote === '`' && ch === '$' && text[i + 1] === '{') {
+      let depth = 1;
+      i += 2;
+      for (; i < text.length && depth > 0; i++) {
+        const inner = text[i] as string;
+        if (inner === '\'' || inner === '"' || inner === '`') i = endOfLiteral(text, i);
+        else if (inner === '{') depth++;
+        else if (inner === '}') depth--;
+      }
+      i--;
+      continue;
+    }
+    if (ch === quote) return i;
+  }
+  return text.length;
 }
 
 /**
@@ -239,20 +276,69 @@ function afterFirstArgument(args: string): string | undefined {
  * is what catches the next such hole rather than a third quoting rule here.
  */
 export function diagnosedAssertions(source: string): string[] {
-  const out: string[] = [];
+  return diagnosticSites(source)
+    .map((site) => site.message)
+    .filter((message): message is string => message !== undefined);
+}
+
+/** An `expect(actual, …)` carrying a second argument, and the literal fragment recovered from it. */
+export interface DiagnosticSite {
+  /** The second argument as written, so a form this cannot read can be named in a failure. */
+  argument: string;
+  message: string | undefined;
+}
+
+/**
+ * Every `expect(...)` in the suite that carries a second argument, whether or not a message could be
+ * recovered from it. The COUNT is what makes this scan checkable: a form it cannot read shows up as
+ * a site with no message rather than as a shorter table, and a table that silently shrinks is a set
+ * of assertions nothing asks for a control for. Three such forms were invisible at once — a template
+ * opening with an interpolation, a message bound to a `const`, and a first argument holding a comma.
+ */
+export function diagnosticSites(source: string): DiagnosticSite[] {
+  const bound = messageConstants(source);
+  const out: DiagnosticSite[] = [];
   for (const m of source.matchAll(/\bexpect\(/g)) {
     const open = (m.index as number) + m[0].length - 1;
     const rest = afterFirstArgument(parenthesized(source, open));
-    const literal =
-      /^\s*'((?:\\.|[^'\\])*)'/.exec(rest ?? '') ??
-      /^\s*"((?:\\.|[^"\\])*)"/.exec(rest ?? '') ??
-      // A TEMPLATE diagnostic, up to its first interpolation: the whole of what the runner prints
-      // before a figure this run drew. Only the static head is comparable, and it is enough to
-      // recognise the message.
-      /^\s*`((?:\\.|[^`\\$]|\$(?!\{))+)/.exec(rest ?? '');
-    if (literal !== null) {
-      out.push((literal[1] as string).replaceAll("\\'", "'").replaceAll('\\"', '"'));
-    }
+    if (rest === undefined) continue;
+    out.push({ argument: rest.trim(), message: messageIn(rest, bound) });
+  }
+  return out;
+}
+
+const unescape = (text: string): string =>
+  text.replaceAll("\\'", "'").replaceAll('\\"', '"').replaceAll('\\`', '`');
+
+/**
+ * The first STATIC fragment of a diagnostic argument — enough to recognise the message in what the
+ * runner printed. A template is read past its interpolations rather than up to the first one, so a
+ * message that OPENS with a drawn figure still yields the words after it.
+ */
+function messageIn(rest: string, bound: Record<string, string>): string | undefined {
+  const quoted =
+    /^\s*'((?:\\.|[^'\\])*)'/.exec(rest) ?? /^\s*"((?:\\.|[^"\\])*)"/.exec(rest);
+  if (quoted !== null) return unescape(quoted[1] as string);
+  const template = /^\s*`/.exec(rest);
+  if (template !== null) {
+    const body = rest.slice(template[0].length, endOfLiteral(rest, template[0].length - 1));
+    const fragments = body
+      .split(/\$\{(?:[^{}]|\{[^{}]*\})*\}/g)
+      .map((f) => unescape(f).trim())
+      .filter((f) => f.length > 0);
+    return fragments[0];
+  }
+  const name = /^\s*([A-Za-z_$][\w$]*)\s*[,)]?\s*$/.exec(rest.replace(/,\s*$/, ''));
+  return name === null ? undefined : bound[name[1] as string];
+}
+
+/** `const NAME = '…'` bindings, so a diagnostic passed by name is still recognised. */
+function messageConstants(source: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of source.matchAll(
+    /\b(?:const|let)\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;]+)?\s*=\s*(?:'((?:\\.|[^'\\])*)'|"((?:\\.|[^"\\])*)")/g,
+  )) {
+    out[m[1] as string] = unescape((m[2] ?? m[3]) as string);
   }
   return out;
 }

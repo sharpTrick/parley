@@ -31,6 +31,7 @@ async function makeContext() {
       return t;
     },
     carriesSenderIdentity: false,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
       await fake.close();

@@ -34,18 +34,21 @@ export const TOOL_TEXT = {
     'a read position for you resumes from it, so a session that was down comes back to the OLDEST ' +
     'message it has not seen; a bridge that keeps none — and a first-ever read of a topic — ' +
     'answers with the most recent page instead. Either way, keep calling with the `nextCursor` you ' +
-    'are handed until a page comes back empty and you have everything reachable. Pass back only a ' +
+    'are handed until it STOPS ADVANCING — the same cursor twice, or none handed back at all. An ' +
+    'EMPTY page does not mean you are done: a backend whose history read is coarser than one topic ' +
+    "hands back a page of other topics' messages, which reaches you as an empty page whose cursor " +
+    'moved on, and stopping there leaves everything behind it unread. Pass back only a ' +
     '`nextCursor` a previous page gave you: another cursor is read from, but does not move where ' +
     'this session resumes. Returns { messages, nextCursor } — ' +
-    'nextCursor is omitted when you passed no `since` and the read produced no page (the topic ' +
-    'does not exist yet); re-issue without `since` in that case. ' +
+    'nextCursor is omitted only when the read had no position to hand back at all: a since-less ' +
+    'read of a topic this bridge has never read and the backend does not have. ' +
     'Call this on session start for each configured topic, then on demand. A topic that does not ' +
     'exist on the backend yet returns an empty page with `topicAbsent: true` rather than an error. ' +
     'Pass `block_ms` to long-poll: if the queried window is empty — whether or not you passed ' +
     '`since` — the call holds until a message arrives or the timeout elapses (capped ' +
     'server-side), so a polling agent burns tokens per message, not per tick. A cancelled ' +
-    'long-poll answers like any other empty window, with `nextCursor` omitted when you passed no ' +
-    '`since`. Not every backend can park on a wait: one that cannot REFUSES `block_ms` with an ' +
+    'long-poll answers like any other empty window, echoing back the position it read from. ' +
+    'Not every backend can park on a wait: one that cannot REFUSES `block_ms` with an ' +
     'error naming itself, so retry without it and poll on your own cadence.',
   fetch_recent_since:
     'Opaque cursor; return only messages strictly after it. Omit to resume from where this ' +

@@ -238,6 +238,15 @@ export function liveCases(ctx: ConformanceContext): void {
       );
     }
 
+    // The shapes this fixture DECLARED it can carry. A backend may refuse one — the write clause
+    // permits that arm and grades the refusal against this same list — but the refusal is a
+    // declaration, never a run-time fallback: while a rejection here silently retried as a bare
+    // token, a backend refusing every shape on `post` and dropping every long, non-ASCII or
+    // control-carrying message live was certified 36 of 36, which is the identical measurement
+    // recorded for the defect the shared table was added to catch. The drawn depth is still the
+    // depth EVERY backend is held to.
+    const carries = CONTENT_SHAPES.filter(([label]) => !ctx.refusesContentShapes.includes(label));
+
     const sent: string[] = [];
     for (let i = 0, depth = between(QUIET_POSTS_MIN, QUIET_POSTS_MAX); i < depth; i++) {
       // Once, mid-run: nothing else here holds a subscription open long enough to ask whether it
@@ -246,20 +255,11 @@ export function liveCases(ctx: ConformanceContext): void {
       // The drawn token, carrying one shape from the table the write path is graded on. The draw
       // keeps the text unknowable; the shape is what makes the message something a person could
       // have sent.
-      const shape = CONTENT_SHAPES[i]?.[1];
+      const shape = carries[i]?.[1];
       const token = livePayload();
-      let content = shape === undefined ? token : `${token} ${shape}`;
-      let sentAt = Date.now();
-      // A backend may REFUSE a shape — the write clause permits that arm and grades it there — but
-      // a refusal must not buy it a shorter floor, so the iteration falls back to the bare token,
-      // which no backend may refuse. The drawn depth is the depth EVERY backend is held to.
-      if (shape === undefined) {
-        await ctx.plugin.post(t, writer, content);
-      } else if (!(await ctx.plugin.post(t, writer, content).then(() => true, () => false))) {
-        content = token;
-        sentAt = Date.now();
-        await ctx.plugin.post(t, writer, content);
-      }
+      const content = shape === undefined ? token : `${token} ${shape}`;
+      const sentAt = Date.now();
+      await ctx.plugin.post(t, writer, content);
       sent.push(content);
       await delivered(DELIVERY_MS, () =>
         expect(

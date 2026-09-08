@@ -14,6 +14,7 @@ async function makeContext() {
     // Each topic -> a fresh, unique MUC room, so tests are fully isolated.
     freshTopic: (): Topic => freshTopic(),
     carriesSenderIdentity: false,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
     },

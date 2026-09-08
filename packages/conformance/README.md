@@ -7,11 +7,18 @@ against.
 
 ## What it proves
 
-A backend is conformant iff:
+A backend is conformant when it holds all four of these. The first two are about the message; the
+last two are about the live path, and a backend that holds only the first two is **not** conformant
+— measured, a plugin that registers no live listener at all satisfies (1) and (2) and fails 10 of
+this suite's cases:
 
 1. every message gets a **stable, unique `backendMsgId`** (the dedup key);
 2. `fetchRecent` / `subscribe` deliver **monotonic, in-order, exclusive-`since`** cursor ordering
-   (the order key) — core never parses or compares cursor values, it only trusts the plugin.
+   (the order key) — core never parses or compares cursor values, it only trusts the plugin;
+3. what `subscribe` delivers is a **subset** of the post-subscribe tail and nothing else — never
+   history, never a duplicate;
+4. …and it delivers: a live subscriber does not fall behind a topic written one message at a time.
+   This one is graded to a stated REACH rather than in general — see `packages/bridge-core/README.md`.
 
 Concretely, `runConformanceSuite` (`src/index.ts`) checks the clauses below. The list is not prose:
 each phrase is an entry in the exported `CLAUSES` table, and this package's own tests fail if any of
@@ -62,7 +69,10 @@ them stops owning a case — a conformance clause used to be deletable with noth
 - topics are isolated on catch-up, and on the live path too;
 - disconnect is idempotent and stops the plugin serving;
 - post either round-trips a payload exactly — newline, surrounding spaces, an astral emoji, a
-  combining sequence, a tab — or refuses it, never altering it silently. Carriage return is not yet a
+  combining sequence, a tab — or refuses it, never altering it silently, and WHICH of the two is
+  the fixture's declaration (`refusesContentShapes`) rather than its choice per run: a refusal is
+  also a shape the live floor cannot carry, so a declared refusal must be real and an undeclared one
+  is a failure. Carriage return is not yet a
   row, and not because it cannot be graded: XMPP carries bodies as XML character data, where the
   parser normalizes CR to LF (XML 1.0 §2.11) before any plugin sees it, so the wire genuinely
   cannot round-trip one — but *refusing* it is the other arm this clause already permits, and
@@ -131,6 +141,14 @@ export interface ConformanceContext {
    * user; Matrix reports the homeserver-stamped `sender`) — there, asserting it would assert a lie.
    */
   carriesSenderIdentity: boolean;
+  /**
+   * Labels from `CONTENT_SHAPES` this backend REFUSES on `post`. Every backend here states `[]`
+   * but Zulip, whose server strips trailing whitespace on send.
+   * A declared refusal must be real (the write clause asserts the rejection) and withdraws that
+   * shape from the live floor, which records what it carried against what was declared — so a
+   * refusal is an arm taken in the open, never a silent fallback.
+   */
+  refusesContentShapes: readonly string[];
   /**
    * Which arm of `fetchRecent`'s absent-topic contract this backend takes: an empty page with a
    * replayable cursor, or a `NoSuchTopicError` rejection — seam.ts permits both. The ONLY optional

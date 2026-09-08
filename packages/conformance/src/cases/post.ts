@@ -11,18 +11,37 @@ export function postCases(ctx: ConformanceContext): void {
   // certified backends. Refusing a payload is a visible, legitimate answer; altering it silently
   // is not. The table is SHARED with the live floor, so a shape added for one path is graded on
   // both — these payloads used to reach `post` and `fetchRecent` only, and never a live handler.
+  //
+  // Which answer a backend gives is its DECLARATION, not its choice per run: `refusesContentShapes`
+  // names the labels it refuses, and both arms are graded against it. While the arm was implicit —
+  // "either round-trips or refuses", with the live floor silently retrying a refused shape as a
+  // bare token — a backend refusing every one of these and dropping every long, non-ASCII or
+  // control-carrying message live was certified 36 of 36.
   it.each(CONTENT_SHAPES.map(([label, body]) => [label, body] as [string, string]))(
-    'post either round-trips %s exactly or refuses it',
-    async (_label, content) => {
+    'post either round-trips %s exactly or refuses it — and which, this fixture DECLARES',
+    async (label, content) => {
+      const declaredRefused = ctx.refusesContentShapes.includes(label);
       const t = ctx.freshTopic();
       const posted: string | Error = await ctx.plugin.post(t, SENDER, content).then(
         (id) => String(id),
         (err: unknown) => err as Error,
       );
-      if (posted instanceof Error) {
-        expect(posted.message.length).toBeGreaterThan(0);
+      if (declaredRefused) {
+        expect(
+          posted,
+          'the fixture declares this shape refused, so the live floor does not carry it and the ' +
+            'round trip below is not graded — but `post` accepted it. A declaration that buys a ' +
+            'weaker grade has to be true',
+        ).toBeInstanceOf(Error);
+        expect((posted as Error).message.length).toBeGreaterThan(0);
         return;
       }
+      expect(
+        posted,
+        '`post` refused a shape this fixture did not declare refused. Refusing is a legitimate ' +
+          'arm — declare it in `refusesContentShapes`, which also states that the live floor ' +
+          'cannot carry it — but it may not be taken silently',
+      ).not.toBeInstanceOf(Error);
       const { messages } = await ctx.plugin.fetchRecent({ topic: t });
       expect(messages).toHaveLength(1);
       expect(messages[0]!.content).toBe(content);

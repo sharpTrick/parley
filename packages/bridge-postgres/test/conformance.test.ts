@@ -19,6 +19,7 @@ async function makeContext(table: string) {
     freshTopic: (): Topic =>
       asTopic(`${TOPIC_SHAPES[++seq % TOPIC_SHAPES.length] as string}-${seq}-${rand()}`),
     carriesSenderIdentity: true,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
       await dropTable(table);

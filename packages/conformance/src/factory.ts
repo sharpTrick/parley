@@ -1,4 +1,5 @@
 import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
+import { CONTENT_SHAPES } from './cases/content.js';
 
 /**
  * What a backend provides so the shared suite can run against it. Written ONCE against the seam;
@@ -35,6 +36,22 @@ export interface ConformanceContext {
    */
   carriesSenderIdentity: boolean;
   /**
+   * Which labels from `CONTENT_SHAPES` this backend REFUSES on `post`. Refusing a payload is an arm
+   * the write clause permits — but it is an arm, and an arm has to be STATED: a refusal also
+   * shortens what the live floor can carry, and while the floor silently fell back to a bare token
+   * on a rejection, a backend that refused every shape on `post` and dropped every long, non-ASCII
+   * or control-carrying message on the live path was certified 36 of 36 — the identical measurement
+   * recorded for the defect that fallback was added to fix.
+   *
+   * Declared, so it cannot be a silent trade: a label here MUST really be refused (the write clause
+   * asserts the rejection), a label absent from it MUST round-trip exactly and MUST reach a live
+   * subscriber, and the live floor records which shapes it actually carried and grades that against
+   * this list. Every backend here states `[]` but Zulip, whose server strips a body's trailing
+   * whitespace on send and whose `post` therefore refuses that shape rather than storing something
+   * else — a trade that was being made silently until it had to be declared.
+   */
+  refusesContentShapes: readonly string[];
+  /**
    * Which arm of `fetchRecent`'s absent-topic contract the backend takes: an empty page with a
    * replayable cursor, or a `NoSuchTopicError` rejection. seam.ts permits BOTH, and core has a
    * whole module mapping the second to "topic not present yet".
@@ -60,6 +77,8 @@ export const CONTEXT_FIELDS: Record<keyof ConformanceContext, (v: unknown) => bo
   cleanup: (v) => typeof v === 'function',
   concurrentPost: (v) => typeof v === 'function' || v === 'unsupported',
   carriesSenderIdentity: (v) => typeof v === 'boolean',
+  refusesContentShapes: (v) =>
+    Array.isArray(v) && v.every((label) => CONTENT_SHAPES.some(([known]) => known === label)),
   absentTopicBehaviour: (v) => v === undefined || v === 'empty-page' || v === 'throws',
 };
 
