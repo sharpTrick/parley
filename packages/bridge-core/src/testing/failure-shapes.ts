@@ -5,6 +5,13 @@
  * Keep the two SYNCHRONOUS shapes, so that the `async` wrapper each site relies on stays graded: a
  * `.catch()` does not absorb a throw raised before it is attached.
  *
+ * Keep the NON-NATIVE thenable, so that a site is graded on ADOPTING what it was handed rather than
+ * on recognising it: `x instanceof Promise` compiles and passes every other row here. It wraps an
+ * already-rejected native promise, which is what makes dropping it visible — the inner rejection
+ * reaches Node unhandled unless something calls `then` on the wrapper. A seam handler's return type
+ * is `void`, which constrains nothing about what it actually returns, and `Promise.resolve` was
+ * chosen precisely because it adopts any thenable.
+ *
  * Each shape ignores the real call's result, so the same table drives any seam call regardless of
  * what it resolves to.
  */
@@ -12,6 +19,17 @@ export const FAILURE_SHAPES = {
   rejects: (_real: Promise<unknown>): Promise<never> => Promise.reject(new Error('seam boom')),
   'rejects with a non-Error': (_real: Promise<unknown>): Promise<never> =>
     Promise.reject('seam boom (string)'),
+  'rejects a turn later': (_real: Promise<unknown>): Promise<never> =>
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('seam boom (late)')), 0);
+    }),
+  'rejects as a non-native thenable': (_real: Promise<unknown>): Promise<never> => {
+    const inner = Promise.reject(new Error('seam boom (thenable)'));
+    return {
+      then: (onFulfilled?: unknown, onRejected?: (reason: unknown) => void): Promise<unknown> =>
+        inner.then(onFulfilled as undefined, onRejected),
+    } as unknown as Promise<never>;
+  },
   'never settles': (_real: Promise<unknown>): Promise<never> => new Promise<never>(() => {}),
   'rejects synchronously': (_real: Promise<unknown>): Promise<never> => {
     throw new Error('seam boom (sync)');
