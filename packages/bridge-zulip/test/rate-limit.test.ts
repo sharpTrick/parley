@@ -26,10 +26,16 @@ const RETRY_ROWS: RetryRow[] = [
   { name: 'the Retry-After header alone', headerSeconds: 0.05, window: [50, 400] },
   { name: 'the retry-after JSON body alone', bodySeconds: 0.05, window: [50, 400] },
   {
-    name: 'both, with the header winning',
+    name: 'both, with the body asking for longer',
     headerSeconds: 0.05,
-    bodySeconds: 3,
-    window: [50, 400],
+    bodySeconds: 0.2,
+    window: [200, 600],
+  },
+  {
+    name: 'both, with the header asking for longer',
+    headerSeconds: 0.2,
+    bodySeconds: 0.05,
+    window: [200, 600],
   },
   { name: 'neither, falling back to the shared default', window: [DEFAULT_BACKOFF_MS - 50, 1500] },
   // Above the clamp on a self-chosen backoff, inside the call deadline: honoured in full, because

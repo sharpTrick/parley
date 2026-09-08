@@ -25,10 +25,42 @@ describe('bodyRetryAfter', () => {
     await expect(nested(answer({ parameters: { retry_after: 30 } }))).resolves.toBe(30_000);
   });
 
-  it('lets the header win, so a body can never shorten a stated wait', async () => {
-    await expect(seconds(answer({ retry_after: 1 }, { 'retry-after': '9' }))).resolves.toBe(9000);
-    await expect(millis(answer({ retry_after_ms: 1 }, { 'retry-after': '9' }))).resolves.toBe(9000);
-  });
+  /**
+   * Both orderings, for all three vendor shapes. The row this replaced picked header 9s against
+   * body 1s — the ONE ordering where "the header wins" and "the header is a floor" agree, so it
+   * could not tell them apart, and the code was returning the header as the ANSWER. A CDN stamping
+   * `Retry-After: 1` in front of a vendor asking 60s is the case that matters, and it is the one
+   * that ordering never asked.
+   */
+  const HINT_PAIRS: Array<[header: number | undefined, body: number | undefined, wait: number]> = [
+    [9000, 1000, 9000],
+    [1000, 1500, 1500],
+    [undefined, 1500, 1500],
+    [9000, undefined, 9000],
+  ];
+
+  const headers = (header: number | undefined): Record<string, string> =>
+    header === undefined ? {} : { 'retry-after': String(header / 1000) };
+
+  it.each(HINT_PAIRS)(
+    'header %s + body %s waits the longer of the two: %ims',
+    async (header, body, wait) => {
+      await expect(
+        seconds(answer(body === undefined ? {} : { retry_after: body / 1000 }, headers(header))),
+      ).resolves.toBe(wait);
+      await expect(
+        millis(answer(body === undefined ? {} : { retry_after_ms: body }, headers(header))),
+      ).resolves.toBe(wait);
+      await expect(
+        nested(
+          answer(
+            body === undefined ? {} : { parameters: { retry_after: body / 1000 } },
+            headers(header),
+          ),
+        ),
+      ).resolves.toBe(wait);
+    },
+  );
 
   it('reads a field the vendor did not put where this parser looks as no hint', async () => {
     await expect(seconds(answer({ retry_after_ms: 5000 }))).resolves.toBeUndefined();

@@ -105,10 +105,11 @@ TLS failure into an unenveloped one just by racing it.
   field-values states.
 - **`bodyRetryAfter(hintOf, unitMs?)`** — build the `retryAfterOf` hook for a vendor that also
   states the wait in the 429 BODY (`retry_after`, `retry_after_ms`, `retry-after`,
-  `parameters.retry_after` — four vendors, four fields, two units). The header stays a FLOOR the
-  body cannot lower, a body no parser can read means "no usable hint" rather than an error out of
-  the retry loop, and the result is returned UNCLAMPED so nothing retries sooner than the vendor
-  asked.
+  `parameters.retry_after` — four vendors, four fields, two units). The LONGER of header and body
+  wins, so neither can shorten the other: a body cannot undercut the standard header, and a CDN's
+  short header cannot undercut the vendor's own figure. A body no parser can read means "no usable
+  hint" rather than an error out of the retry loop, and the result is returned UNCLAMPED so nothing
+  retries sooner than the vendor asked.
 - **`sanitizeBody(text)`** — bound and flatten an untrusted response body before it goes in an
   Error: truncates at `MAX_ERROR_BODY` (never between the halves of an astral character) and strips
   every Unicode control (`Cc`, i.e. C0, C1 and DEL) and format (`Cf`, i.e. bidi overrides,

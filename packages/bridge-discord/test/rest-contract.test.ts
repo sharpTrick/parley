@@ -172,16 +172,25 @@ describe('Discord REST contract', () => {
   describe('429 rate limits', () => {
     // One row per HINT SOURCE, each with a hint distinguishable from every other source's — a
     // floor alone is met by any longer wait, so each row also carries the ceiling that excludes
-    // the sources it is not testing (notably net-util's hintless DEFAULT_BACKOFF_MS).
+    // the sources it is not testing (notably net-util's hintless DEFAULT_BACKOFF_MS). Both
+    // orderings of header against body, because the LONGER of the two is what is waited: a row
+    // that only ever puts the longer figure in the header cannot tell "the header wins" apart from
+    // "neither may shorten the other".
     const HINT_MS = 200;
     const WAITS: Array<[string, { headers?: Record<string, string>; body: unknown }, number, number]> =
       [
         ['header only', { headers: { 'retry-after': '0.2' }, body: {} }, HINT_MS, DEFAULT_BACKOFF_MS],
         ['body only', { body: { retry_after: 0.2 } }, HINT_MS, DEFAULT_BACKOFF_MS],
         [
-          'header wins over body',
-          { headers: { 'retry-after': '0.2' }, body: { retry_after: 3 } },
-          HINT_MS,
+          'the body when it asks for longer than the header',
+          { headers: { 'retry-after': '0.2' }, body: { retry_after: 0.4 } },
+          2 * HINT_MS,
+          DEFAULT_BACKOFF_MS,
+        ],
+        [
+          'the header when it asks for longer than the body',
+          { headers: { 'retry-after': '0.4' }, body: { retry_after: 0.2 } },
+          2 * HINT_MS,
           DEFAULT_BACKOFF_MS,
         ],
         [

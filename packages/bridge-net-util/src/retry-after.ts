@@ -110,12 +110,14 @@ export const usableHint = (ms: number | undefined): number | undefined =>
   ms !== undefined && Number.isFinite(ms) && ms > 0 ? ms : undefined;
 
 /**
- * A 429's BODY hint, behind the standard header. Four vendors state the same thing in four places
- * (`retry_after`, `retry_after_ms`, `retry-after`, `parameters.retry_after`) and in two units, and
- * only that differs: the header is a FLOOR the body cannot lower, a body a parser cannot read means
- * "no usable hint" rather than an error out of the retry loop, and the result is returned UNCLAMPED
- * so that nothing here retries sooner than the vendor asked — which is what escalates a rate limit
- * into a ban.
+ * A 429's BODY hint, alongside the standard header. Four vendors state the same thing in four
+ * places (`retry_after`, `retry_after_ms`, `retry-after`, `parameters.retry_after`) and in two
+ * units, and only that differs: the LONGER of the two wins, a body a parser cannot read means "no
+ * usable hint" rather than an error out of the retry loop, and the result is returned UNCLAMPED so
+ * that nothing here retries sooner than the vendor asked — which is what escalates a rate limit
+ * into a ban. Reading the header as the ANSWER rather than as a floor is the same defect in the
+ * other direction: a CDN stamping `Retry-After: 1` in front of a vendor asking 60s retries 59s
+ * early.
  *
  * `hintOf` reads the parsed body; anything it returns that is not a positive number is no hint.
  * `unitMs` scales it — 1000 for a vendor stating seconds, the default 1 for milliseconds.
@@ -126,13 +128,13 @@ export function bodyRetryAfter<T>(
 ): (res: Response) => Promise<number | undefined> {
   return async (res: Response): Promise<number | undefined> => {
     const header = retryAfterFromHeader(res);
-    if (header !== undefined) return header;
+    let body: number | undefined;
     try {
       const stated = hintOf((await res.clone().json()) as T);
-      if (typeof stated === 'number' && stated > 0) return stated * unitMs;
+      if (typeof stated === 'number' && stated > 0) body = stated * unitMs;
     } catch {
       /* no usable body hint */
     }
-    return undefined;
+    return header === undefined ? body : Math.max(header, body ?? 0);
   };
 }
