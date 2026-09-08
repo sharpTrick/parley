@@ -1,4 +1,7 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
 import {
@@ -6,7 +9,7 @@ import {
   fetchWithRetry,
   MAX_BACKOFF_MS,
 } from '@sharptrick/parley-net-util';
-import { importingFiles } from './consumers.js';
+import { importedNames, importingFiles, SELF } from './consumers.js';
 import {
   captureWaits,
   loop,
@@ -304,13 +307,71 @@ describe('every export earns its place', () => {
 
   const consumers = (name: string): string[] =>
     importingFiles()
-      .filter(({ code }) => new RegExp(`\\b${name}\\b`).test(code))
+      .filter((file) => importedNames(file).has(name))
       .map(({ path }) => path);
 
   it('finds consumers at all, so the rows below are not reading an empty set', () => {
     expect(importingFiles().length).toBeGreaterThan(5);
     expect(consumers('fetchWithRetry').length).toBeGreaterThan(3);
     expect(Object.keys(api).length).toBeGreaterThan(5);
+  });
+
+  /**
+   * The RULER, on a synthetic tree rather than on `packages/`. A file that merely SPELLS a name is
+   * not a consumer of it, and reading the whole text of an importing file said otherwise: appending
+   * `export const label = 1;` — imported by nothing — PASSED this guard, because `label` is the
+   * spelling of a property at half a dozen call sites. A broken ruler here does not fail; it reports
+   * a surface that is not the surface.
+   */
+  describe('what counts as a consumer', () => {
+    const NO_SELF_DIR = 'nothing-here';
+    const plant = (files: Record<string, string>): URL => {
+      const root = pathToFileURL(`${mkdtempSync(join(tmpdir(), 'net-util-consumes-'))}/`);
+      for (const [path, body] of Object.entries(files)) {
+        mkdirSync(new URL(`./${dirname(path)}/`, root), { recursive: true });
+        writeFileSync(new URL(`./${path}`, root), body);
+      }
+      return root;
+    };
+
+    const namesImported = (files: Record<string, string>): string[] => [
+      ...new Set(
+        importingFiles(plant(files), NO_SELF_DIR).flatMap((file) => [...importedNames(file)]),
+      ),
+    ];
+
+    it('counts a name where it is imported and not where it is only spelled', () => {
+      const seen = namesImported({
+        'consumer/src/uses.ts': `import { fetchWithRetry } from '${SELF}';\nvoid fetchWithRetry;\n`,
+        'consumer/src/spells.ts':
+          `import { delay } from '${SELF}';\n` +
+          'const opts = { label: 1, sanitizeBody: 2 };\nvoid opts;\nvoid delay;\n',
+      });
+      expect(seen).toContain('fetchWithRetry');
+      expect(seen).toContain('delay');
+      expect(seen, 'a property spelled like an export counted as importing it').not.toContain(
+        'label',
+      );
+      expect(seen).not.toContain('sanitizeBody');
+    });
+
+    it('counts an alias, a type-only import, and a namespace read', () => {
+      const seen = namesImported({
+        'consumer/src/shapes.ts':
+          `import { type FetchWithRetryOptions, HttpStatusError as Boom } from '${SELF}';\n` +
+          `import * as net from '${SELF}';\n` +
+          'void net.statusOf;\ndeclare const o: FetchWithRetryOptions;\nvoid o;\nvoid Boom;\n',
+      });
+      expect(seen.sort()).toEqual(['FetchWithRetryOptions', 'HttpStatusError', 'statusOf']);
+    });
+
+    it('counts nothing in a file that only names the package in a string', () => {
+      expect(
+        namesImported({
+          'lister/src/table.ts': `const FORBIDDEN = ['${SELF}'];\nvoid FORBIDDEN;\n`,
+        }),
+      ).toEqual([]);
+    });
   });
 
   it.each(Object.keys(api).sort())('`%s` is imported somewhere, or kept on purpose', (name) => {

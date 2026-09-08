@@ -84,3 +84,46 @@ export function consumerPackageSources(
 export function importingFiles(root: URL = PACKAGES, selfDir: string = SELF_DIR): SourceFile[] {
   return packageSources(['src', 'test'], root, selfDir).filter(({ code }) => namesModule(code));
 }
+
+/**
+ * The names a file IMPORTS from this package. Word-matching the file's text instead counts a name
+ * that merely happens to be SPELLED somewhere in it: `label` is a property at half a dozen call
+ * sites, so appending `export const label = 1;` here — imported by nothing — passed the dead-export
+ * guard, and the whole surface count it produced was wrong. Resolved from the import SPECIFIER, so
+ * a name counts only where it was actually bound.
+ */
+export function importedNames(file: SourceFile): Set<string> {
+  const out = new Set<string>();
+  const FROM = `['"]${SELF}['"]`;
+  for (const m of file.code.matchAll(new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*${FROM}`, 'g'))) {
+    for (const entry of (m[1] ?? '').split(',')) {
+      const name = entry.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0]?.trim();
+      if (name !== undefined && name !== '') out.add(name);
+    }
+  }
+  for (const ns of namespaceBindings(file.code, FROM))
+    for (const read of file.code.matchAll(new RegExp(`\\b${ns}\\.(\\w+)`, 'g')))
+      out.add(read[1] as string);
+  return out;
+}
+
+/**
+ * Every identifier holding this package's NAMESPACE, in the three forms it is obtained in: a star
+ * import, a dynamic import, and a value of the `typeof import(…)` type — which is how a vitest
+ * module mock reaches the real module (`importOriginal<NetUtil>()`), and the form that makes
+ * `actual.HttpStatusError` a real consumption rather than a spelling.
+ */
+function namespaceBindings(code: string, FROM: string): string[] {
+  const out = new Set<string>();
+  const add = (pattern: string): void => {
+    for (const m of code.matchAll(new RegExp(pattern, 'g'))) out.add(m[1] as string);
+  };
+  add(`import\\s*\\*\\s*as\\s+(\\w+)\\s*from\\s*${FROM}`);
+  add(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*await\\s+import\\(\\s*${FROM}\\s*\\)`);
+  for (const alias of code.matchAll(
+    new RegExp(`type\\s+(\\w+)\\s*=\\s*typeof\\s+import\\(\\s*${FROM}\\s*\\)`, 'g'),
+  )) {
+    add(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*await\\s+\\w+<${alias[1] as string}>\\(`);
+  }
+  return [...out];
+}
