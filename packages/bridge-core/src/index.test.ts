@@ -61,7 +61,8 @@ describe('public barrel surface', () => {
     'defaultReadStatePath', 'emitChannel', 'fetchOidcDiscovery', 'fetchRecentBlocking',
     'hashOwnerSecret', 'installShutdown', 'instanceIdOf', 'isBlockingFetchUnsupportedError',
     'isFetchAbortedError', 'isNoSuchTopicError', 'loadConfig', 'makeOwnerVerifier', 'ownerVerifierFromPassphrase',
-    'parseArgs', 'parseConfig', 'parseMentions', 'registerTools', 'runBackendCli', 'safeName',
+    'parseArgs', 'parseConfig', 'parseMentions', 'registerTools', 'runBackendCli', 'safeDeliver',
+    'safeName',
     'startFakeOidc', 'startPushLoop', 'toolDepsFor', 'usageFor',
   ] as const;
 

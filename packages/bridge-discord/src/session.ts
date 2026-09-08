@@ -1,4 +1,4 @@
-import type { BackendConfig, MessageHandler, Topic } from '@sharptrick/parley-core';
+import { type BackendConfig, type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import {
   assertKnownBackendConfig,
   DEFAULT_ALLOWED_MENTIONS,
@@ -81,13 +81,7 @@ export abstract class DiscordSession {
   private dispatch(m: DiscordMessage): void {
     const sub = this.subs.get(m.channel_id);
     if (sub !== undefined) {
-      try {
-        // Keep the rejection arm UNAWAITED, so that a handler which never settles cannot park
-        // every later message behind it — awaiting trades a crash for a silent stall.
-        void Promise.resolve(sub.handler(toMessage(sub.topic, m))).catch(() => undefined);
-      } catch {
-        /* handler is best-effort; never break the loop (DESIGN §6) */
-      }
+      safeDeliver(sub.handler, toMessage(sub.topic, m));
     }
   }
 

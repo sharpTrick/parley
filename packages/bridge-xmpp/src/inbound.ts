@@ -1,4 +1,4 @@
-import { asBackendMsgId, type BackendMsgId } from '@sharptrick/parley-core';
+import { asBackendMsgId, type BackendMsgId, safeDeliver } from '@sharptrick/parley-core';
 
 import { MAM_MISSING_HINT } from './archive.js';
 import * as jid from './jid.js';
@@ -173,13 +173,7 @@ export class XmppInbound extends XmppRooms {
     const body = stanza.getChildText('body');
     if (body === null) return;
     const msg = this.toMessage(sub.topic, { archId, from, body, stamp: wire.roomStamp(stanza, room) });
-    for (const h of sub.handlers) {
-      try {
-        void Promise.resolve(h(msg)).catch(() => undefined);
-      } catch {
-        /* handler is best-effort; never break the live path (DESIGN §6) */
-      }
-    }
+    for (const h of sub.handlers) safeDeliver(h, msg);
   }
 
   /**

@@ -1,4 +1,4 @@
-import type { MessageHandler, Topic } from '@sharptrick/parley-core';
+import { type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import { rowToMessage } from './read.js';
 import { PluginState } from './state.js';
 
@@ -65,11 +65,7 @@ export abstract class PostgresPush extends PluginState {
               const msg = rowToMessage(row);
               // Keep each handler in its own try/catch, so that one throwing handler cannot starve
               // the others on this channel (DESIGN §6).
-              for (const handler of sub.handlers) {
-                try {
-                  void Promise.resolve(handler(msg)).catch(() => undefined);
-                } catch {}
-              }
+              for (const handler of sub.handlers) safeDeliver(handler, msg);
             }
           }
         } while (sub.pending && !this.stopped && epoch === this.epoch);

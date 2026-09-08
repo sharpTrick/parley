@@ -1,4 +1,4 @@
-import type { MessageHandler, Topic } from '@sharptrick/parley-core';
+import { type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import type { ConsumerMessages } from 'nats';
 import { closeOnConsumerLoss, delay, EphemeralConsumer, fromSequence } from './jetstream.js';
 import { NatsReads } from './read.js';
@@ -92,13 +92,7 @@ export abstract class NatsLive extends NatsReads {
             }
             nextDelivery = m.info.deliverySequence + 1;
             lastSeq = m.seq;
-            try {
-              void Promise.resolve(handler(this.rowToMessage(topic, m.seq, m.data))).catch(
-                () => undefined,
-              );
-            } catch {
-              /* handler is best-effort (DESIGN §6) */
-            }
+            safeDeliver(handler, this.rowToMessage(topic, m.seq, m.data));
           }
         } catch {
           /* iterator closed on disconnect or consumer loss */

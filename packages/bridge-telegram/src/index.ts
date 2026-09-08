@@ -12,6 +12,7 @@ import {
   type Handle,
   type Message,
   type MessageHandler,
+  safeDeliver,
   type Topic,
 } from '@sharptrick/parley-core';
 import { BotApi } from './api.js';
@@ -385,13 +386,7 @@ export class TelegramPlugin implements BackendPlugin {
       return store.isOpen();
     }
     for (const sub of this.subs.get(chatId) ?? []) {
-      try {
-        void Promise.resolve(sub.handler(recordToMessage(rec, sub.topic, store.epoch()))).catch(
-          () => undefined,
-        );
-      } catch {
-        /* handler is best-effort; never break the loop (DESIGN §6) */
-      }
+      safeDeliver(sub.handler, recordToMessage(rec, sub.topic, store.epoch()));
     }
     return true;
   }

@@ -1,4 +1,4 @@
-import type { MessageHandler, Topic } from '@sharptrick/parley-core';
+import { type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import { classifyDbError, errMessage } from './classify.js';
 import { DIAG_INTERVAL_MS, ESCALATE_AFTER, POLL_BATCH } from './config.js';
 import { rowToMessage } from './cursor.js';
@@ -62,11 +62,7 @@ export abstract class SqlitePoller extends SqliteRetention {
           // in memory, and the bookkeeping below would report a torn-down loop as live.
           if (this.orphaned(generation)) return;
           lastSeen = row.id;
-          try {
-            void Promise.resolve(handler(rowToMessage(row, storeId))).catch(() => undefined);
-          } catch {
-            // Handler is best-effort (DESIGN §6); never let it break the poll loop.
-          }
+          safeDeliver(handler, rowToMessage(row, storeId));
         }
         // Keep this check, so that a loop torn down on the batch's final row neither reports
         // itself live below nor re-arms: `disconnect()` has already emptied the canceller list,

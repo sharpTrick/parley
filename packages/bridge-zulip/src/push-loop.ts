@@ -1,4 +1,4 @@
-import type { Message, MessageHandler, Topic } from '@sharptrick/parley-core';
+import { type Message, type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import type { QueueState, ZulipConnection } from './connection.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from './pacing.js';
 import { asArray, type EventsResponse, zulipToMessage } from './wire.js';
@@ -64,11 +64,7 @@ export async function startPushLoop(
   let parking = true;
   const deliver = (m: Message): void => {
     if (!alive()) return;
-    try {
-      void Promise.resolve(handler(m)).catch(() => undefined);
-    } catch {
-      /* handler is best-effort; never break the loop (DESIGN §6) */
-    }
+    safeDeliver(handler, m);
   };
   const backoff = async (reason: string): Promise<void> => {
     consecutiveFailures++;

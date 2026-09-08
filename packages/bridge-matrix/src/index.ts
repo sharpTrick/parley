@@ -2,7 +2,7 @@ import {
   asBackendMsgId, type BackendConfig, type BackendIdentity, type BackendMsgId,
   assertBlockMsUnsupported,
   type BackendPlugin, type FetchRecentArgs, type FetchRecentResult,
-  type Handle, type MessageHandler, type Topic,
+  type Handle, type MessageHandler, safeDeliver, type Topic,
 } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import {
@@ -220,15 +220,7 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
 
   /** Hand one event to a subscribe handler. */
   private deliver(topic: Topic, e: MessageEvent, handler: MessageHandler): void {
-    const message = eventToMessage(topic, e);
-    try {
-      // Keep the returned value attached rather than awaited, so that an `async` handler — which the
-      // seam's `=> void` return type does not forbid — can neither end the bridge process with an
-      // unhandled rejection nor serialise this loop behind one that never settles.
-      void Promise.resolve(handler(message)).catch(() => undefined);
-    } catch {
-      /* handler is best-effort; never break the loop (DESIGN §6) */
-    }
+    safeDeliver(handler, eventToMessage(topic, e));
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
