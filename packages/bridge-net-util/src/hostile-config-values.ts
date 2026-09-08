@@ -46,3 +46,25 @@ export const NEVER_RENDERABLE: Array<[string, unknown]> = [
   ['a bigint', 10n],
   ['a null-prototype object', Object.create(null) as unknown],
 ];
+
+/**
+ * Text a caller can put in a `backend_config` value that no refusal may pass through verbatim. It
+ * reaches the operator's log and the model context core renders a seam error into, so it may not
+ * forge line structure, carry a bidi override, or run unbounded.
+ *
+ * Every entry survives `JSON.stringify` INTACT. A newline, a carriage return and a C0 control are
+ * all ESCAPED by it and arrive harmless, so a row carrying one would grade nothing; what it does not
+ * escape is the two Unicode line breaks, every format character, and length. That is also what makes
+ * these rows live where a hostile OBJECT is not — a container is described by shape and never
+ * rendered, so only a PRIMITIVE reaches the sanitiser at all.
+ */
+export const UNSAFE_TEXT: Array<[string, string]> = [
+  ['a LINE SEPARATOR (U+2028)', 'before\u2028after'],
+  ['a PARAGRAPH SEPARATOR (U+2029)', 'before\u2029after'],
+  ['a RIGHT-TO-LEFT OVERRIDE (U+202E)', 'before\u202Eafter'],
+  ['4KiB of one character', 'x'.repeat(4096)],
+  ['4KiB carrying a bidi override', `${'x'.repeat(4096)}\u202Eafter`],
+];
+
+/** Every code point a rendered value may not carry: Unicode control, format, and the two separators. */
+export const FORBIDDEN_IN_RENDER = /[\p{Cc}\p{Cf}\u2028\u2029]/u;

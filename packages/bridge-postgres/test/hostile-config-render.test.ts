@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '@sharptrick/parley-net-util';
+import {
+  FORBIDDEN_IN_RENDER,
+  MAX_ERROR_BODY,
+  NEVER_RENDERABLE,
+  RENDER_LEAK_SENTINEL,
+  UNSAFE_TEXT,
+} from '@sharptrick/parley-net-util';
 import { validateBackendConfig } from '../src/config.js';
 
 /**
@@ -73,6 +79,30 @@ describe('postgres discloses nothing a rejected backend_config value carries', (
       }
       const message = raised instanceof Error ? raised.message : '';
       if (CREDENTIAL_KEYS.includes(key)) expect(message).not.toContain(SECRET);
+    });
+  }
+});
+
+/**
+ * CLASS: the value's TEXT is untrusted too. A numeric knob given a STRING is refused, and that
+ * string is what the refusal renders — the only path by which caller-authored text reaches an
+ * operator's log and the model context core renders a seam error into. A container never gets here:
+ * it is described by shape, which is why the hostile-OBJECT table above cannot grade the sanitiser.
+ */
+describe('postgres bounds and flattens the text a rejected value carries', () => {
+  for (const key of ['pool_size', 'retention_days'] as const) {
+    it.each(UNSAFE_TEXT)(`${String(key)} = %s is refused as one bounded, harmless line`, (_label, text) => {
+      let raised: unknown;
+      try {
+        validateBackendConfig({ [key]: text });
+      } catch (err) {
+        raised = err;
+      }
+      expect(raised, 'a text value must still be refused, or this row grades nothing').toBeInstanceOf(Error);
+      const message = (raised as Error).message;
+      expect(message).not.toMatch(FORBIDDEN_IN_RENDER);
+      expect(message).not.toMatch(/[\n\r]/);
+      expect(message.length).toBeLessThan(MAX_ERROR_BODY + 1024);
     });
   }
 });

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_ERROR_BODY, NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '../src/index.js';
+import {
+  FORBIDDEN_IN_RENDER,
+  MAX_ERROR_BODY,
+  NEVER_RENDERABLE,
+  RENDER_LEAK_SENTINEL,
+  UNSAFE_TEXT,
+} from '../src/index.js';
 import { describeConfigShape, describeConfigValue } from '../src/config-value.js';
 
 const SECRET = 'PLANTED-SECRET-8f3a';
@@ -169,5 +175,31 @@ describe('the corpus keeps the properties it was assembled for', () => {
       NEVER_RENDERABLE.filter(([, value]) => breaks(value)).map(([label]) => label),
       `no row left in the corpus reaches the "${mode}" branch of the renderer`,
     ).not.toEqual([]);
+  });
+});
+
+/**
+ * CLASS: the value reaches an operator's log and the model context core renders a seam error into,
+ * so its TEXT is untrusted as well as its shape. Only a PRIMITIVE gets this far — a container is
+ * described rather than rendered — which is exactly why the hostile-object corpus cannot grade the
+ * sanitiser: `JSON.stringify` escapes a newline before `sanitizeBody` ever sees one, so every
+ * assertion about flattening was passing on text that was never dangerous.
+ */
+describe('a rendered value is one bounded line of harmless text', () => {
+  it.each(UNSAFE_TEXT)('%s survives neither the flattening nor the bound', (_label, text) => {
+    const rendered = describeConfigValue('key_prefix', text);
+    expect(rendered).not.toMatch(FORBIDDEN_IN_RENDER);
+    expect(rendered).not.toMatch(/[\n\r]/);
+    expect(rendered.length).toBeLessThanOrEqual(MAX_ERROR_BODY + 16);
+  });
+
+  it('every row is text a naive renderer would pass through, so none is vacuous', () => {
+    for (const [label, text] of UNSAFE_TEXT) {
+      const naive = JSON.stringify(text);
+      expect(
+        naive.length > MAX_ERROR_BODY || FORBIDDEN_IN_RENDER.test(naive),
+        `${label} is already harmless under JSON.stringify — it grades nothing`,
+      ).toBe(true);
+    }
   });
 });

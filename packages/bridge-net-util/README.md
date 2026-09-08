@@ -131,6 +131,11 @@ seam error into.
   `an array`), never enumerated, and a `key` naming a credential carrier — `password`, `token`,
   `url`, `cert`, … — is described by shape whatever type it arrives as, so a secret nested anywhere
   inside a mistyped value never reaches a log line.
+- **`UNSAFE_TEXT`** / **`FORBIDDEN_IN_RENDER`** — the text corpus and the code-point class no
+  rendered value may carry: a line or paragraph separator, a bidi override, a control character, or
+  4KiB of one character. Every entry survives `JSON.stringify` intact, so these are the rows that
+  actually reach `sanitizeBody` — a hostile OBJECT never does, because it is described rather than
+  rendered.
 - **`NEVER_RENDERABLE`** / **`RENDER_LEAK_SENTINEL`** — the corpus `describeConfigValue` is graded
   against, published with it: the values that break a naive renderer (circular, bigint,
   null-prototype, no JSON form and no string form, a `toJSON` that raises `RENDER_LEAK_SENTINEL`).
