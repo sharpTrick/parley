@@ -71,8 +71,7 @@ const ENCRYPTED_SCHEMES = ['xmpps:', 'wss:'];
  *
  * The host is split by hand rather than through `URL`, so that the schemeless DNS-SRV form is
  * classified at all — but the loopback question is `isLoopbackHost`'s, so that this backend and
- * every other one answer it identically. A second answer here read `127.999.999.999` and
- * `127.00.0.1` as loopback, silencing this warning on two registrable hostnames.
+ * every other one answer it identically.
  */
 export function isPlaintextRemote(service: string): boolean {
   const trimmed = service.trim();

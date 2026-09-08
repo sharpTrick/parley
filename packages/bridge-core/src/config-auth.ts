@@ -6,6 +6,7 @@
  * are public-side config).
  */
 import { z } from 'zod';
+import { isLoopbackAuthHost } from './auth/loopback-hosts.js';
 
 export const OidcAuthSchema = z
   .object({
@@ -18,9 +19,7 @@ export const OidcAuthSchema = z
       .refine(
         (u) => {
           const url = new URL(u);
-          return (
-            url.protocol === 'https:' || url.hostname === '127.0.0.1' || url.hostname === 'localhost'
-          );
+          return url.protocol === 'https:' || isLoopbackAuthHost(url.hostname);
         },
         { message: 'auth.oidc.issuer must use https (the JWKS trust root depends on TLS)' },
       ),

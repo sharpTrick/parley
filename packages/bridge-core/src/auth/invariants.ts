@@ -1,5 +1,6 @@
 import express from 'express';
 import type { OidcAuthConfig } from '../config.js';
+import { LOOPBACK_HOSTS } from './loopback-hosts.js';
 
 /**
  * Boot-time invariants for the remote front doors. The config schema checks these too, but the
@@ -7,11 +8,7 @@ import type { OidcAuthConfig } from '../config.js';
  * that actually protects the deployment lives here.
  */
 
-// Keep this set equal to the SDK's own issuer exemption — `checkIssuerUrl` in
-// @modelcontextprotocol/sdk/server/auth/router.js exempts exactly `localhost` and `127.0.0.1` — so
-// that a base URL this guard accepts also boots on the built-in front door, which hands issuerUrl
-// straight to it. Widening this set (IPv6 loopback, a .localhost name) boots here and dies there.
-export const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
+export { LOOPBACK_HOSTS } from './loopback-hosts.js';
 const LOOPBACK_LIST = [...LOOPBACK_HOSTS].join(' and ');
 
 const TRANSPORT_SCHEMES = new Set(['http:', 'https:']);
