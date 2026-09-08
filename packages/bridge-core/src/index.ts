@@ -16,8 +16,7 @@ export type {
   FetchRecentResult,
   MessageHandler,
 } from './seam.js';
-export { NoSuchTopicError } from './seam.js';
-export { isNoSuchTopicError } from './no-such-topic.js';
+export { isNoSuchTopicError, NoSuchTopicError } from './no-such-topic.js';
 export {
   assertBlockMsUnsupported,
   BlockingFetchUnsupportedError,

@@ -2,7 +2,7 @@ import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { describe, expect, it } from 'vitest';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { asHandle, asTopic } from '../message.js';
-import { NoSuchTopicError } from '../seam.js';
+import { NoSuchTopicError } from '../no-such-topic.js';
 import type { FakePlugin } from '../testing/fake-plugin.js';
 import { harness, parse, type ToolText } from '../testing/tool-harness.js';
 

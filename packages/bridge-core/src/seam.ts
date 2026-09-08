@@ -21,16 +21,6 @@
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
 
-/** Thrown by a plugin whose `fetchRecent`/`subscribe` target topic has no backend
- *  representation yet (e.g. a chat channel that does not exist). Core maps ONLY this to
- *  "topic absent" — all other rejections are real failures and propagate. */
-export class NoSuchTopicError extends Error {
-  constructor(public readonly topic: string) {
-    super(`no such topic: ${JSON.stringify(topic)}`);
-    this.name = 'NoSuchTopicError';
-  }
-}
-
 /**
  * Opaque per-backend configuration, passed verbatim from `config.backend_config`.
  * Core never inspects it; the plugin owns its shape (DESIGN §11).

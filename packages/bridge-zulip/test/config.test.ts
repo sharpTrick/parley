@@ -330,7 +330,7 @@ describe('zulip backend_config fails at the time the README says it does', () =>
  */
 const CONFIG_EFFECTS: Record<string, string> = {
   site_url: 'every fixture connects against the fake\'s own URL, and creds-warning.test.ts classifies the configured host',
-  email: 'presence-attribution.test.ts authenticates distinct bots and reads the sender each one stamps',
+  email: 'sender-attribution.test.ts authenticates distinct bots and reads the sender each one stamps',
   api_key: 'the same rows, plus the 401 case in server-constraints.test.ts',
   stream: 'stream-scoping.test.ts: post, fetchRecent and subscribe against a configured and a foreign stream',
   events_timeout_ms: 'the idle push-loop rate table above, which counts polls per cap',

@@ -56,11 +56,6 @@ export class FetchAbortedError extends Error {
   }
 }
 
-/**
- * The literal {@link FetchAbortedError} assigns to `this.name`. Keep it a literal rather than
- * `FetchAbortedError.name`, so that a bundler mangling the class binding cannot make the marker on
- * an instance and the marker being compared against diverge.
- */
 const ABORTED_MARKER = 'FetchAbortedError';
 
 /**

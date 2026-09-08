@@ -21,20 +21,18 @@ const DEPLOYMENTS = [
   {
     name: 'every session sharing one bot',
     botFor: () => 'parley-bot@localhost',
-    /** One entry, carrying the union of both sessions' reach — the merged phantom peer. */
     expectedSenders: ['parley-bot@localhost', 'parley-bot@localhost'],
   },
   {
     name: 'a distinct bot per session',
     botFor: (i: number) => SESSIONS[i]!.bot,
-    /** Separate entries — but named after the BOTS, never after `identity.handle`. */
     expectedSenders: [SESSIONS[0]!.bot, SESSIONS[1]!.bot],
   },
 ];
 
 describe('zulip attributes every post to the authenticated bot, not to identity.handle', () => {
   for (const deployment of DEPLOYMENTS) {
-    it(`reports bot emails as the roster key with ${deployment.name}`, async () => {
+    it(`reports bot emails as the sender with ${deployment.name}`, async () => {
       const { fake } = await boot({
         members: SESSIONS.map((s, i) => ({ user_id: 20 + i, email: s.bot, full_name: s.handle })),
         credentials: [
@@ -43,7 +41,7 @@ describe('zulip attributes every post to the authenticated bot, not to identity.
           { email: 'reader@localhost', apiKey: 'k' },
         ],
       });
-      const topic = asTopic(`presence-${rand()}`);
+      const topic = asTopic(`attribution-${rand()}`);
 
       for (const [i, session] of SESSIONS.entries()) {
         const plugin = new ZulipPlugin();
@@ -52,7 +50,7 @@ describe('zulip attributes every post to the authenticated bot, not to identity.
           email: deployment.botFor(i),
           api_key: 'per-session-key',
         });
-        await plugin.post(topic, asHandle(session.handle), `beat from ${session.handle}`);
+        await plugin.post(topic, asHandle(session.handle), `post from ${session.handle}`);
         await plugin.disconnect();
       }
 

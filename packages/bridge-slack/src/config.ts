@@ -4,6 +4,7 @@ import {
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
 import { plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
 export const DEFAULT_API_URL = 'https://slack.com/api';
@@ -153,6 +154,28 @@ export function requireUsableChannelMap(map: unknown): Record<string, string> {
     owner.set(channel, topic);
   }
   return checked;
+}
+
+/**
+ * The websocket URL `apps.connections.open` handed us, or a named refusal. A vendor response is
+ * untrusted input, not an authorization: this URL carries the single-use Socket Mode ticket, every
+ * workspace message and every ack, so it is held to no weaker a transport guarantee than the one
+ * the operator configured for the Web API. `ws:` therefore passes only where a plaintext `api_url`
+ * would, and never silently downgrades an `https:` workspace toward a host nobody configured.
+ */
+export function requireUsableSocketUrl(apiUrl: string, url: unknown): string {
+  if (typeof url !== 'string' || !/^wss?:\/\//.test(url)) {
+    throw new SlackShapeError('apps.connections.open', 'returned no usable websocket url');
+  }
+  const insecure = plaintextRemoteOrigin(url);
+  if (insecure !== undefined && plaintextRemoteOrigin(apiUrl) === undefined) {
+    throw new SlackShapeError(
+      'apps.connections.open',
+      `returned ${insecure}, a plaintext websocket to a non-loopback host, while ` +
+        `backend_config.api_url ${apiUrl} is not — refusing to downgrade the live stream`,
+    );
+  }
+  return url;
 }
 
 const isHttpUrl = (s: string): boolean => {

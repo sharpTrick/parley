@@ -2,14 +2,13 @@ import type { MessageHandler, Topic } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import { WebSocket, type RawData } from 'ws';
 import type { SlackApiCall } from './api.js';
-import type { SlackSettings } from './config.js';
+import { requireUsableSocketUrl, type SlackSettings } from './config.js';
 import { slackToMessage } from './markup.js';
 import { isPlainMessage } from './messages.js';
 import {
   closeQuietly,
   DIAL_BACKOFF_MS,
   MAX_DIAL_BACKOFF_MS,
-  requireUsableSocketUrl,
   type SocketEnvelope,
 } from './socket.js';
 

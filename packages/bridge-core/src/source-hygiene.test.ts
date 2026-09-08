@@ -247,11 +247,11 @@ describe('source hygiene', () => {
    *
    * This file is exempt, so that the rule can name the packages it bans.
    *
-   * The roster is DERIVED, the way the rest of the repository derives it — a backend is a package
+   * The backend package set is DERIVED, the way the rest of the repository derives it — a backend is a package
    * that declares the shared conformance suite — so that a backend added or renamed after this rule
    * was written is one the rule covers rather than one it silently exempts. Restating it here would
    * make the rule's own coverage a thing nobody grades: the generated rows below are built from
-   * whatever the roster holds, so they agree with it however wrong it is.
+   * whatever that set holds, so they agree with it however wrong it is.
    */
   const SUITE = '@sharptrick/parley-conformance';
 
@@ -431,15 +431,15 @@ describe('source hygiene', () => {
     }
     expect(
       BACKEND_PACKAGES.length,
-      'the backend roster derived from the manifests came back short — the scan, not the repo',
+      'the backend package set derived from the manifests came back short — the scan, not the repo',
     ).toBeGreaterThan(8);
     expect(LINTS[0]!.fires.length).toBe(BACKEND_PACKAGES.length * 3);
   });
 
   /**
-   * The derivation on a planted tree, because the roster this rule covers is exactly the thing that
-   * used to be wrong here: a backend the repo gains must join the rule the day it lands, and a
-   * package that merely sits under the same prefix must not.
+   * The derivation on a planted tree, because the package set this rule covers is exactly the
+   * thing that used to be wrong here: a backend the repo gains must join the rule the day it
+   * lands, and a package that merely sits under the same prefix must not.
    */
   it('derives a backend added to a planted tree, and the rule it builds names it', () => {
     const root = mkdtempSync(join(tmpdir(), 'backends-'));

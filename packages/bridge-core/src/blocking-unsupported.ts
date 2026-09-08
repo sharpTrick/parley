@@ -17,11 +17,6 @@ export class BlockingFetchUnsupportedError extends Error {
   }
 }
 
-/**
- * The literal {@link BlockingFetchUnsupportedError} assigns to `this.name`. Keep it a literal rather
- * than `BlockingFetchUnsupportedError.name`, so that a bundler mangling the class binding cannot
- * make the marker on an instance and the marker being compared against diverge.
- */
 const MARKER = 'BlockingFetchUnsupportedError';
 
 /**

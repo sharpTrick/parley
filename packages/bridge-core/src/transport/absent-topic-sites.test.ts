@@ -7,7 +7,8 @@ import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
-import { NoSuchTopicError, type BackendPlugin } from '../seam.js';
+import { NoSuchTopicError } from '../no-such-topic.js';
+import type { BackendPlugin } from '../seam.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import { memoryReadState } from '../testing/nonconformant.js';
@@ -206,18 +207,33 @@ describe('no production site in bridge-core recognises a sentinel by class ident
     });
   }
 
+  const rel = (f: string): string => f.slice(SRC.length);
+
   /**
-   * Each sentinel's `instanceof` may appear ONLY inside the module that owns its by-contract
-   * recogniser. Table them, so a sentinel added later is a row rather than a rule nobody applied.
+   * Every sentinel this package declares a by-contract recogniser for, as [sentinel, the module
+   * that declares it]. DERIVED from the source, so the rule survives that module being renamed or
+   * moved, and so a sentinel added later becomes a row rather than a rule nobody applied.
    */
-  it.each([
-    ['NoSuchTopicError', 'no-such-topic.ts'],
-    ['FetchAbortedError', 'engine/blocking-fetch.ts'],
-  ])('%s is compared by class only inside %s', (sentinel, owner) => {
+  const RECOGNISERS = sources(SRC).flatMap((f) =>
+    [...readFileSync(f, 'utf8').matchAll(/export function is(\w+Error)\b/g)].map(
+      (m) => [m[1]!, rel(f)] as [string, string],
+    ),
+  );
+
+  it('finds a recogniser for every sentinel (a walk that went blind grades nothing below)', () => {
+    expect(RECOGNISERS.map(([sentinel]) => sentinel).sort()).toEqual([
+      'BlockingFetchUnsupportedError',
+      'FetchAbortedError',
+      'NoSuchTopicError',
+    ]);
+  });
+
+  /** Each sentinel's `instanceof` may appear ONLY inside the module that owns its recogniser. */
+  it.each(RECOGNISERS)('%s is compared by class only inside %s', (sentinel, owner) => {
     const offenders = sources(SRC).filter((f) =>
       new RegExp(`instanceof\\s+${sentinel}`).test(readFileSync(f, 'utf8')),
     );
-    expect(offenders.map((f) => f.slice(SRC.length))).toEqual([owner]);
+    expect(offenders.map(rel)).toEqual([owner]);
   });
 
   /**

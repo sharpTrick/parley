@@ -1,7 +1,6 @@
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { isNoSuchTopicError } from './no-such-topic.js';
-import { NoSuchTopicError } from './seam.js';
+import { isNoSuchTopicError, NoSuchTopicError } from './no-such-topic.js';
 
 /** A second install of parley-core resolved alongside this one: same contract, different class. */
 class DuplicateInstall extends Error {

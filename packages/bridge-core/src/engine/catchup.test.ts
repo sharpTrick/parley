@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
-import { NoSuchTopicError, type BackendPlugin, type FetchRecentArgs, type FetchRecentResult } from '../seam.js';
+import { NoSuchTopicError } from '../no-such-topic.js';
+import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
 import {
   memoryReadState,

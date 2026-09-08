@@ -165,8 +165,8 @@ export async function startPushLoop(
       return true;
     }
     // Keep the failure-escalation reset at the END of a whole successful pass, so that a recovery
-    // step that always succeeds — a gap-fill read, a re-register — cannot cancel the backoff
-    // protecting the server from a cycle that fails at the step after it.
+    // step that always succeeds — a re-register — cannot cancel the backoff protecting the server
+    // from a cycle that fails at the step after it.
     consecutiveFailures = 0;
     return true;
   };

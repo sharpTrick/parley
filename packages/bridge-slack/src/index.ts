@@ -35,9 +35,9 @@ import { TS_RE } from './messages.js';
 
 export type { SlackBackendConfig } from './config.js';
 export { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
-export { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS, requireUsableSocketUrl } from './socket.js';
+export { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS } from './socket.js';
 export { HISTORY_PAGE_LIMIT, MAX_HISTORY_PAGES } from './api.js';
-export { MAX_TIMER_MS, TIMER_CONFIG_KEYS, TOKEN_CONFIG_KEYS } from './config.js';
+export { MAX_TIMER_MS, requireUsableSocketUrl, TIMER_CONFIG_KEYS, TOKEN_CONFIG_KEYS } from './config.js';
 export { compareTs, TS_RE } from './messages.js';
 export { escapeSlackText, unescapeSlackText } from './markup.js';
 
