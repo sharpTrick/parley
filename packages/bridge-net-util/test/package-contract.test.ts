@@ -231,6 +231,7 @@ describe('every shipped default is graded on the path it governs', () => {
     DEFAULT_MAX_ATTEMPTS: 'maxAttempts',
     DEFAULT_DEADLINE_MS: 'deadlineMs',
     MAX_RESPONSE_BYTES: 'maxBodyBytes',
+    MAX_BODY_WAIT_MS: 'none',
     DEFAULT_BACKOFF_MS: 'none',
     MAX_BACKOFF_MS: 'none',
     MAX_ERROR_BODY: 'none',
@@ -298,6 +299,9 @@ describe('every export earns its place', () => {
     clampBackoff:
       'the applier of MAX_BACKOFF_MS, which three backends read and two document by name',
     DEFAULT_MAX_ATTEMPTS: 'the documented default of FetchWithRetryOptions.maxAttempts',
+    MAX_BODY_WAIT_MS:
+      'the ceiling this loop applies to a body-stated wait before adopting it — a figure a ' +
+      'consumer diagnosing an ignored hint has to be able to name, not override',
     MAX_RESPONSE_BYTES: 'the documented default of FetchWithRetryOptions.maxBodyBytes',
     retryAfterFromHeader:
       'the RFC 9110 header parse, both forms — the FLOOR every `bodyRetryAfter` hook is built on ' +

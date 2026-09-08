@@ -37,9 +37,13 @@ Four bounds are worth knowing before you call it:
 - A wait the server states — via `Retry-After` or the caller's `retryAfterOf` — is honoured in
   **full**, however long; it is refused, **ending the call**, only when it would not fit inside
   this call's `deadlineMs`. The only backoff the helper invents for itself is the fixed
-  `DEFAULT_BACKOFF_MS`, used when a 429 carries no usable hint at all; nothing in this loop clamps
-  a stated one. (`clampBackoff`/`MAX_BACKOFF_MS` are for a **plugin's own** reconnect ladder — the
-  loop does not call them.)
+  `DEFAULT_BACKOFF_MS`, used when a 429 carries no usable hint at all. (`clampBackoff`/
+  `MAX_BACKOFF_MS` are for a **plugin's own** reconnect ladder — the loop does not call them.)
+- The one exception is a figure your `retryAfterOf` read out of a **body**: past
+  `MAX_BODY_WAIT_MS` (3_600_000) it is dropped, exactly as an unreadable body is. The header is
+  RFC 9110's own field and is never bounded, but a body field and its unit are per-vendor, so an
+  unbounded one lets a single JSON number state a wait past any `deadlineMs` and **refuse every
+  call** the loop makes. Above the ceiling the call does what the header alone says.
 - `maxBodyBytes` (default `MAX_RESPONSE_BYTES`) is a ceiling on the bytes **one response** puts in
   memory, applied while reading rather than after: a response over it fails with
   `<label> → body: …` instead of handing back a body your `res.json()` would misparse. It applies
@@ -186,8 +190,9 @@ is a fork whatever it is called.
 `DEFAULT_BACKOFF_MS` (500), `MAX_BACKOFF_MS` (5000 — the ceiling `clampBackoff` applies to a
 plugin's own ladder, not to anything `fetchWithRetry` does), `DEFAULT_MAX_ATTEMPTS` (8),
 `DEFAULT_DEADLINE_MS` (30000), `MAX_ERROR_BODY` (2048), `MAX_RESPONSE_BYTES` (16 MiB — the default
-`maxBodyBytes`), `STOP_POLL_MS` (25 — how often a backoff re-reads `isStopped()`, i.e. the longest a
-disconnect waits on one).
+`maxBodyBytes`), `MAX_BODY_WAIT_MS` (3_600_000 — past which a wait read out of a 429 body is
+dropped rather than adopted), `STOP_POLL_MS` (25 — how often a backoff re-reads `isStopped()`, i.e.
+the longest a disconnect waits on one).
 
 ## Why this is not `bridge-core`
 
