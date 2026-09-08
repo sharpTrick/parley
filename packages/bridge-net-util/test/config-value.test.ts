@@ -91,3 +91,83 @@ describe('a container is described, never enumerated', () => {
     expect(describeConfigValue('block_ms', 5)).toBe('5');
   });
 });
+
+/**
+ * CLASS: {@link NEVER_RENDERABLE} is a DATA TABLE, so it shrinks with no code change and nothing
+ * notices — deleting the null-prototype row, which is the entire justification for lifting the
+ * renderer here, left 306 passed / 0 failed. Every other derived check in this package carries a
+ * floor; this is that floor.
+ *
+ * Pinned by the PROPERTY each row exists for rather than by a count: `toHaveLength` cements the
+ * table as it stands, and a row whose value stopped being hostile would still satisfy it.
+ */
+describe('the corpus keeps the properties it was assembled for', () => {
+  /**
+   * How a value defeats a renderer built out of `JSON.stringify` and `String`. Each mode is one
+   * naive renderer's failure, not one composite renderer's: a bare null-prototype object stringifies
+   * to `{}` and throws only under `String`, which is exactly the crash the five forked renderers
+   * this corpus retired all shared.
+   */
+  const FAILURE_MODES: Record<string, (value: unknown) => boolean> = {
+    'JSON.stringify throws': (value) => {
+      try {
+        JSON.stringify(value);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    'String throws': (value) => {
+      try {
+        String(value);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    'JSON.stringify returns undefined': (value) => {
+      try {
+        return JSON.stringify(value) === undefined;
+      } catch {
+        return false;
+      }
+    },
+    'JSON.stringify succeeds where String throws': (value) => {
+      try {
+        if (typeof JSON.stringify(value) !== 'string') return false;
+      } catch {
+        return false;
+      }
+      try {
+        String(value);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    "the value's own toJSON raises text it wrote": (value) => {
+      try {
+        JSON.stringify(value);
+        return false;
+      } catch (err) {
+        return String(err).includes(RENDER_LEAK_SENTINEL);
+      }
+    },
+  };
+
+  it.each(NEVER_RENDERABLE)('%s defeats a naive renderer', (_label, value) => {
+    const broken = Object.entries(FAILURE_MODES).filter(([, breaks]) => breaks(value));
+    expect(
+      broken.map(([mode]) => mode),
+      'this row renders fine without help — it grades nothing where it sits',
+    ).not.toEqual([]);
+  });
+
+  it.each(Object.keys(FAILURE_MODES))('the corpus still carries a value where %s', (mode) => {
+    const breaks = FAILURE_MODES[mode] as (value: unknown) => boolean;
+    expect(
+      NEVER_RENDERABLE.filter(([, value]) => breaks(value)).map(([label]) => label),
+      `no row left in the corpus reaches the "${mode}" branch of the renderer`,
+    ).not.toEqual([]);
+  });
+});
