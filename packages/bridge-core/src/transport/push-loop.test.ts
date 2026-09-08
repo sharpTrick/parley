@@ -176,7 +176,7 @@ describe('startPushLoop (core emit handler)', () => {
   });
 
   /**
-   * `subscribe` is the other seam call seam.ts declares NoSuchTopicError for. A chat channel that
+   * `subscribe` is the other seam call whose JSDoc admits NoSuchTopicError. A chat channel that
    * does not exist yet must cost that ONE topic its live path, not the whole attach; anything else
    * is a real failure and has to propagate.
    */

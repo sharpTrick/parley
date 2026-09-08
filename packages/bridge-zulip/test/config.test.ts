@@ -5,8 +5,10 @@
  * the push loop into a silent, unlogged request flood against their own server.
  */
 import { asTopic, type Message } from '@sharptrick/parley-core';
+import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ZulipPlugin } from '../src/index.js';
 import {
@@ -22,6 +24,7 @@ import { startFakeZulip, ZULIP_DEFAULT_RATE_LIMIT_PER_MIN } from './fake-zulip.j
 const boot = useZulip();
 
 const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
+const PACKAGE_REL = 'packages/bridge-zulip';
 
 /** The `events_timeout_ms` row of the README's config table — the claims below are read out of it. */
 const CAP_DOC = /^\| `events_timeout_ms`\s*\|\s*`(\d+)`\s*\|(.*)$/m.exec(README);
@@ -333,13 +336,45 @@ const CONFIG_EFFECTS: Record<string, string> = {
   email: 'sender-attribution.test.ts authenticates distinct bots and reads the sender each one stamps',
   api_key: 'the same rows, plus the 401 case in server-constraints.test.ts',
   stream: 'stream-scoping.test.ts: post, fetchRecent and subscribe against a configured and a foreign stream',
-  events_timeout_ms: 'the idle push-loop rate table above, which counts polls per cap',
+  events_timeout_ms: 'config.test.ts: the idle push-loop rate table above, which counts polls per cap',
 };
+
+const creditedFiles = (where: string): string[] => [...where.matchAll(/\b[\w.-]+\.test\.ts\b/g)].map((m) => m[0]);
+
+/**
+ * What vitest actually COLLECTS from this package — the run-level fact the pointers are graded
+ * against. A credit is only worth the file it names: a suite renamed, deleted or never written
+ * leaves the claim reading exactly as it did while grading nothing, and free text cannot tell the
+ * difference. `vitest list` imports and registers without running, so a file that registers no
+ * suite does not appear here.
+ */
+const collected = new Set<string>();
+
+const CREDITED = [...new Set(Object.values(CONFIG_EFFECTS).flatMap(creditedFiles))];
+
+beforeAll(async () => {
+  const { stdout } = await promisify(execFile)(
+    'npx',
+    ['vitest', 'list', ...CREDITED.map((f) => `${PACKAGE_REL}/test/${f}`), '--json'],
+    { cwd: fileURLToPath(new URL('../../../', import.meta.url)), maxBuffer: 32 * 1024 * 1024 },
+  );
+  const tests = JSON.parse(stdout.slice(stdout.indexOf('['))) as { file: string }[];
+  for (const t of tests) collected.add(t.file.slice(t.file.lastIndexOf('/') + 1));
+}, 180_000);
 
 describe('every declared backend_config key is graded for effect, not only for validation', () => {
   it('claims exactly the declared keys, each with where its effect is exercised', () => {
     expect(Object.keys(CONFIG_EFFECTS).sort()).toEqual([...DECLARED_CONFIG_KEYS].sort());
     expect(Object.entries(CONFIG_EFFECTS).filter(([, where]) => where.trim() === '')).toEqual([]);
+  });
+
+  it('every claim names a test file this package actually runs', () => {
+    const unbacked = Object.entries(CONFIG_EFFECTS).flatMap(([key, where]) => {
+      const files = creditedFiles(where);
+      if (files.length === 0) return [`${key}: names no test file`];
+      return files.filter((f) => !collected.has(f)).map((f) => `${key}: ${f} is not collected`);
+    });
+    expect(unbacked).toEqual([]);
   });
 });
 

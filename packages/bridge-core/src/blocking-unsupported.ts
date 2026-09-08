@@ -1,3 +1,5 @@
+const MARKER = 'BlockingFetchUnsupportedError';
+
 /**
  * Raised by a `fetchRecent` asked to honour a `blockMs` its backend has no read primitive to park
  * on. `parley_fetch_recent` advertises `block_ms` on every deployment, so the refusal is what tells
@@ -13,11 +15,9 @@ export class BlockingFetchUnsupportedError extends Error {
       `${backend}: \`block_ms\` is not supported by this backend — its read path has no primitive ` +
         "to park a caller's budget on. Omit `block_ms` and poll on your own cadence.",
     );
-    this.name = 'BlockingFetchUnsupportedError';
+    this.name = MARKER;
   }
 }
-
-const MARKER = 'BlockingFetchUnsupportedError';
 
 /**
  * True for a {@link BlockingFetchUnsupportedError} raised by ANY copy of this package.

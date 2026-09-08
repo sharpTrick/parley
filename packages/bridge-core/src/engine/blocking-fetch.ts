@@ -43,6 +43,8 @@ const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
     signal?.addEventListener('abort', done, { once: true });
   });
 
+const ABORTED_MARKER = 'FetchAbortedError';
+
 /**
  * A long-poll cancelled before any page came back. There is no cursor to return — core never mints
  * cursor values (DESIGN §6) and the caller supplied none — so cancellation cannot be expressed as a
@@ -52,11 +54,9 @@ const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
 export class FetchAbortedError extends Error {
   constructor() {
     super('fetch_recent cancelled before any page was read');
-    this.name = 'FetchAbortedError';
+    this.name = ABORTED_MARKER;
   }
 }
-
-const ABORTED_MARKER = 'FetchAbortedError';
 
 /**
  * True for a {@link FetchAbortedError} raised by ANY copy of this package.

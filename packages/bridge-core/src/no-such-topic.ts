@@ -1,19 +1,14 @@
+const MARKER = 'NoSuchTopicError';
+
 /** Thrown by a plugin whose `fetchRecent`/`subscribe` target topic has no backend
  *  representation yet (e.g. a chat channel that does not exist). Core maps ONLY this to
  *  "topic absent" — all other rejections are real failures and propagate. */
 export class NoSuchTopicError extends Error {
   constructor(public readonly topic: string) {
     super(`no such topic: ${JSON.stringify(topic)}`);
-    this.name = 'NoSuchTopicError';
+    this.name = MARKER;
   }
 }
-
-/**
- * The literal the {@link NoSuchTopicError} constructor assigns to `this.name`. Keep it a literal
- * rather than `NoSuchTopicError.name`, so that a bundler mangling the class binding cannot make the
- * marker on an instance and the marker being compared against diverge.
- */
-const MARKER = 'NoSuchTopicError';
 
 /**
  * True for a {@link NoSuchTopicError} raised by ANY copy of this package.

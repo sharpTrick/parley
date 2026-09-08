@@ -20,6 +20,7 @@
  *      all is not.
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
+import type { NoSuchTopicError } from './no-such-topic.js';
 
 /**
  * Opaque per-backend configuration, passed verbatim from `config.backend_config`.
@@ -94,6 +95,10 @@ export interface BackendPlugin {
    * decides HOW the handler is driven (poll loop for SQLite; blocking event source for
    * Redis/Matrix/…); core decides WHAT happens (emit a `<channel>` event). `disconnect()` tears
    * down all subscriptions (DESIGN §4/§9).
+   *
+   * A plugin that cannot represent the topic yet MAY throw {@link NoSuchTopicError} here, as in
+   * `fetchRecent` below: that costs the ONE topic its live path and the rest of the attach
+   * proceeds. Every other rejection is a real failure and fails the attach.
    */
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;
 

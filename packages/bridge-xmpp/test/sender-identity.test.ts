@@ -45,12 +45,12 @@ const configs: Array<{ config: string; cfg: Partial<XmppBackendConfig>; expected
 const restarts: Restart[] = ['a fresh process on the same config', 'a stream reconnect'];
 const rows: Row[] = restarts.flatMap((restart) => configs.map((c) => ({ restart, ...c })));
 
-const beats = async (row: Row): Promise<string[]> => {
+const handlesAcross = async (row: Row): Promise<string[]> => {
   const fake = new FakeXmpp();
   mockState.client = fake;
   const first = new XmppPlugin();
   await first.connect({ password: PASSWORD, ...row.cfg });
-  await first.post(TOPIC, IDENTITY, 'beat-1');
+  await first.post(TOPIC, IDENTITY, 'post-1');
 
   let reader = first;
   if (row.restart === 'a stream reconnect') {
@@ -62,10 +62,10 @@ const beats = async (row: Row): Promise<string[]> => {
     reader = new XmppPlugin();
     await reader.connect({ password: PASSWORD, ...row.cfg });
   }
-  await reader.post(TOPIC, IDENTITY, 'beat-2');
+  await reader.post(TOPIC, IDENTITY, 'post-2');
 
   const read = await reader.fetchRecent({ topic: TOPIC, limit: 10 });
-  expect(read.messages.map((m) => m.content)).toEqual(['beat-1', 'beat-2']);
+  expect(read.messages.map((m) => m.content)).toEqual(['post-1', 'post-2']);
   const handles = read.messages.map((m) => String(m.senderHandle));
   await reader.disconnect();
   return handles;
@@ -73,7 +73,7 @@ const beats = async (row: Row): Promise<string[]> => {
 
 describe('XMPP attributes a bridge to one stable handle across a restart', () => {
   it.each(rows)('$restart, $config', async (row) => {
-    const handles = await beats(row);
+    const handles = await handlesAcross(row);
     // One handle, not one per process — and the handle an operator can address.
     expect(new Set(handles).size).toBe(1);
     expect(handles[0]).toBe(row.expected);
@@ -279,15 +279,15 @@ describe.skipIf(!serverUp)('XMPP sender identity against a real MUC archive', ()
     const topic = freshTopic('ident');
     const first = new XmppPlugin();
     await first.connect(BASE);
-    await first.post(topic, IDENTITY, 'beat-1');
+    await first.post(topic, IDENTITY, 'post-1');
     await first.disconnect();
 
     const second = new XmppPlugin();
     await second.connect(BASE);
     try {
-      await second.post(topic, IDENTITY, 'beat-2');
+      await second.post(topic, IDENTITY, 'post-2');
       const read = await second.fetchRecent({ topic, limit: 10 });
-      expect(read.messages.map((m) => m.content)).toEqual(['beat-1', 'beat-2']);
+      expect(read.messages.map((m) => m.content)).toEqual(['post-1', 'post-2']);
       const handles = read.messages.map((m) => String(m.senderHandle));
       expect(new Set(handles)).toEqual(new Set([String(IDENTITY)]));
     } finally {

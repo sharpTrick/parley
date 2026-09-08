@@ -7,6 +7,7 @@ import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
+import * as surface from '../index.js';
 import { NoSuchTopicError } from '../no-such-topic.js';
 import type { BackendPlugin } from '../seam.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
@@ -22,8 +23,8 @@ import { startPushLoop } from './push-loop.js';
  * `instanceof` reads "this chat channel does not exist yet" as a hard backend failure and bricks the
  * whole bridge on startup.
  *
- * Table the sites against the errors they must tell apart, and pin that no production site in core
- * has drifted back to `instanceof`.
+ * Table the sites against the errors they must tell apart, and keep every other module in core out
+ * of reach of the class binding a drift back to `instanceof` would need.
  */
 const T = asTopic('ctx');
 
@@ -210,45 +211,84 @@ describe('no production site in bridge-core recognises a sentinel by class ident
   const rel = (f: string): string => f.slice(SRC.length);
 
   /**
-   * Every sentinel this package declares a by-contract recogniser for, as [sentinel, the module
-   * that declares it]. DERIVED from the source, so the rule survives that module being renamed or
-   * moved, and so a sentinel added later becomes a row rather than a rule nobody applied.
+   * Every error class this package declares, as [sentinel, the module that declares it]. DERIVED
+   * from the source, so the rule survives that module being renamed or moved, and so a sentinel
+   * added later becomes a row rather than a rule nobody applied. An UNEXPORTED one counts too — it
+   * cannot reach the surface check below, which is the point.
    */
-  const RECOGNISERS = sources(SRC).flatMap((f) =>
-    [...readFileSync(f, 'utf8').matchAll(/export function is(\w+Error)\b/g)].map(
+  const SENTINELS = sources(SRC).flatMap((f) =>
+    [...readFileSync(f, 'utf8').matchAll(/^\s*(?:export )?class (\w+) extends \w*Error\b/gm)].map(
       (m) => [m[1]!, rel(f)] as [string, string],
     ),
   );
 
-  it('finds a recogniser for every sentinel (a walk that went blind grades nothing below)', () => {
-    expect(RECOGNISERS.map(([sentinel]) => sentinel).sort()).toEqual([
-      'BlockingFetchUnsupportedError',
-      'FetchAbortedError',
-      'NoSuchTopicError',
-    ]);
-  });
-
-  /** Each sentinel's `instanceof` may appear ONLY inside the module that owns its recogniser. */
-  it.each(RECOGNISERS)('%s is compared by class only inside %s', (sentinel, owner) => {
-    const offenders = sources(SRC).filter((f) =>
-      new RegExp(`instanceof\\s+${sentinel}`).test(readFileSync(f, 'utf8')),
-    );
-    expect(offenders.map(rel)).toEqual([owner]);
-  });
+  const errorsOnSurface = Object.entries(surface as Record<string, unknown>)
+    .filter(([, v]) => typeof v === 'function' && Error.isPrototypeOf(v as object))
+    .map(([name]) => name)
+    .sort();
 
   /**
    * An error a consumer is told to distinguish is useless if the symbol never leaves the package:
-   * `package.json` publishes only `.`, so a class missing from index.ts is uncatchable no matter what
-   * its own JSDoc promises. Derive the list from the source rather than naming the classes, so a new
-   * one has to be wired up or fail here.
+   * `package.json` publishes only `.`, so a class missing from index.ts is uncatchable no matter
+   * what its own JSDoc promises. Comparing the walk against the LOADED surface grades both
+   * directions at once — a class that never reached index.ts, and a walk that has gone blind and is
+   * therefore grading nothing below.
    */
-  it('every error class this package declares is on its public surface', () => {
-    const declared = sources(SRC).flatMap((f) =>
-      [...readFileSync(f, 'utf8').matchAll(/export class (\w+) extends Error/g)].map((m) => m[1]!),
-    );
-    expect(declared.length).toBeGreaterThan(3); // the walk found something to check
-    const surface = readFileSync(join(SRC, 'index.ts'), 'utf8');
-    const missing = declared.filter((name) => !new RegExp(`\\b${name}\\b`).test(surface));
-    expect(missing).toEqual([]);
+  it('the source walk finds exactly the error classes this package exports', () => {
+    expect(SENTINELS.map(([sentinel]) => sentinel).sort()).toEqual(errorsOnSurface);
   });
+
+  const hasRecogniser = (sentinel: string): boolean =>
+    typeof (surface as Record<string, unknown>)[`is${sentinel}`] === 'function';
+
+  /**
+   * Sentinels core RAISES. None of them ever arrives from a plugin, so no second install of this
+   * package can hand core a twin to miss: `ConsentError` — the one that IS compared by class, in
+   * auth/remote.ts — is compared against the binding the module it is constructed in exports, and
+   * the other two are only thrown. A sentinel a PLUGIN can raise across the seam never belongs
+   * here; it needs an `is…` recogniser on the public surface, and the rows below then keep its class
+   * binding out of every module but its own.
+   */
+  const RAISED_BY_CORE_ONLY = ['ConsentError', 'TopicNotAllowedError', 'UnsafePatternError'];
+
+  it('every sentinel has a by-contract recogniser, or is named as one core only raises', () => {
+    expect(
+      SENTINELS.map(([sentinel]) => sentinel)
+        .filter((sentinel) => !hasRecogniser(sentinel))
+        .sort(),
+    ).toEqual(RAISED_BY_CORE_ONLY);
+  });
+
+  /**
+   * `instanceof` needs the class BINDING, and a module reaches a binding only by importing it — so
+   * banning the import bans the comparison whatever the operator (`instanceof`, `.constructor ===`)
+   * and whatever the local alias. A type-only import erases before runtime and can reach no
+   * operator, so it is not one. What recognition must DO is graded by the foreign-twin table above;
+   * this keeps the shortcut out of reach.
+   */
+  function importsClassBinding(src: string, sentinel: string): boolean {
+    for (const stmt of src.matchAll(/import\s+(type\s+)?(?:\*\s+as\s+(\w+)|\{([^}]*)\})\s*from/g)) {
+      if (stmt[1] !== undefined) continue;
+      if (stmt[2] !== undefined) {
+        if (new RegExp(`\\b${stmt[2]}\\.${sentinel}\\b`).test(src)) return true;
+        continue;
+      }
+      for (const spec of stmt[3]!.split(',')) {
+        const imported = spec.trim();
+        if (imported === '' || imported.startsWith('type ')) continue;
+        if (imported.split(/\s+as\s+/)[0]!.trim() === sentinel) return true;
+      }
+    }
+    return false;
+  }
+
+  it.each(SENTINELS.filter(([sentinel]) => hasRecogniser(sentinel)))(
+    '%s is imported as a class binding only by %s',
+    (sentinel, owner) => {
+      const importers = sources(SRC)
+        .filter((f) => rel(f) !== owner && importsClassBinding(readFileSync(f, 'utf8'), sentinel))
+        .map(rel);
+      expect(importers).toEqual([]);
+    },
+  );
 });

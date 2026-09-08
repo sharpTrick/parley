@@ -171,6 +171,11 @@ works end to end. Do not start v0.2 before this.
 
 ## Post-v1: `block_ms` long-poll (issue #20)
 
+> **Changed since:** `block_ms` is native on TWO backends — Redis and NATS, the ones with a read
+> primitive to park a budget on — and REFUSED by the other eight; there is no generic fallback in
+> core, and none of the eight emulates the wait. The items below record what was built; they are
+> history, not current capability.
+
 - [x] Optional `blockMs` hint on the seam's `fetchRecent`, exposed as `block_ms` on
       `parley_fetch_recent`; server-side cap `catchup.block_max_ms`.
 - [x] Native implementations on all nine event-driven backends; generic re-query fallback in core
