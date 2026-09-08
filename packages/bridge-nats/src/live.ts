@@ -93,7 +93,9 @@ export abstract class NatsLive extends NatsReads {
             nextDelivery = m.info.deliverySequence + 1;
             lastSeq = m.seq;
             try {
-              handler(this.rowToMessage(topic, m.seq, m.data));
+              void Promise.resolve(handler(this.rowToMessage(topic, m.seq, m.data))).catch(
+                () => undefined,
+              );
             } catch {
               /* handler is best-effort (DESIGN §6) */
             }

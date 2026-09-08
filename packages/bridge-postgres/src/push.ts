@@ -67,7 +67,7 @@ export abstract class PostgresPush extends PluginState {
               // the others on this channel (DESIGN §6).
               for (const handler of sub.handlers) {
                 try {
-                  handler(msg);
+                  void Promise.resolve(handler(msg)).catch(() => undefined);
                 } catch {}
               }
             }

@@ -67,6 +67,12 @@ them stops owning a case — a conformance clause used to be deletable with noth
   alone) NOTHING in this suite can see a loopback: the floor above then has no writer but the
   subscriber either, so what certifies a live path there is that it delivers, not who wrote it;
 - topics are isolated on catch-up, and on the live path too;
+- a live path **survives a handler that** fails — one that throws, throws a non-`Error`, returns a
+  rejected promise, rejects a turn later, or returns one that never settles. The handler is the
+  CALLER's (DESIGN §6), so three properties are graded together: the rest of the topic still
+  arrives in order, no rejection escapes to the process — under Node's default an unattached one
+  ends the whole bridge — and the plugin writes no backend-failure diagnostic for it, which is what
+  stops a live path "containing" a fault by backing a healthy topic off;
 - disconnect is idempotent and stops the plugin serving;
 - post either round-trips a payload exactly — newline, surrounding spaces, an astral emoji, a
   combining sequence, a tab — or refuses it, never altering it silently, and WHICH of the two is

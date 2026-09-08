@@ -22,6 +22,7 @@ export const CLAUSES: readonly string[] = [
   'written by an independent client',
   'topics are isolated',
   'on the live path too',
+  'survives a handler that',
   'disconnect is idempotent',
   'resolveIdentity answers',
   'not collapsed onto one another',
@@ -119,6 +120,21 @@ export const CLAUSES: readonly string[] = [
  *   request open for whatever the plugin spends, so a blocker that answers a 300 ms budget after
  *   3 s is a hang under a politer name — and every floor in the clause passes for one, leaving only
  *   the harness timeout, which names no clause at all.
+ *
+ * The three below are what a plugin owes when the fault is the CALLER's — the handler `subscribe`
+ * was handed, which the plugin did not write. One clause covers them because no two can be
+ * satisfied by the same accident, and each needs its own control because a clause keeps its control
+ * while an assertion inside it has none.
+ *
+ * - `handler-fault-does-not-stop-delivery`: a handler that fails costs its own message and nothing
+ *   else. Graded over owed deliveries — one message at a time, each awaited — so a subset is never
+ *   the answer here.
+ * - `handler-fault-reaches-no-unhandled-rejection`: the rejection of an `async` handler, which the
+ *   `=> void` seam type does not forbid, never reaches the process. Under Node's default it ends
+ *   the bridge — every topic at once, from one consumer's bad turn.
+ * - `handler-fault-is-not-a-backend-failure`: and the plugin does not diagnose it as its own. One
+ *   that counts a consumer fault toward a failure ladder throttles a healthy topic, which is how a
+ *   live path "contains" a fault by going quiet.
  */
 export const ASSERTED_PROPERTIES: readonly string[] = [
   'nextCursor-agreement',
@@ -139,4 +155,7 @@ export const ASSERTED_PROPERTIES: readonly string[] = [
   'native-block-waits-every-time',
   'native-block-does-not-overshoot-the-budget',
   'live-delivery-is-prompt',
+  'handler-fault-does-not-stop-delivery',
+  'handler-fault-reaches-no-unhandled-rejection',
+  'handler-fault-is-not-a-backend-failure',
 ];

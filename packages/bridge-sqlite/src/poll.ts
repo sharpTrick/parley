@@ -63,7 +63,7 @@ export abstract class SqlitePoller extends SqliteRetention {
           if (this.orphaned(generation)) return;
           lastSeen = row.id;
           try {
-            handler(rowToMessage(row, storeId));
+            void Promise.resolve(handler(rowToMessage(row, storeId))).catch(() => undefined);
           } catch {
             // Handler is best-effort (DESIGN §6); never let it break the poll loop.
           }

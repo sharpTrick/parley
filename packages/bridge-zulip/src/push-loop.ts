@@ -65,7 +65,7 @@ export async function startPushLoop(
   const deliver = (m: Message): void => {
     if (!alive()) return;
     try {
-      handler(m);
+      void Promise.resolve(handler(m)).catch(() => undefined);
     } catch {
       /* handler is best-effort; never break the loop (DESIGN §6) */
     }

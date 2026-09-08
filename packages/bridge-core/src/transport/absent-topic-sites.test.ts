@@ -4,13 +4,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { afterAll, describe, expect, it } from 'vitest';
-import { Allowlist } from '../allowlist.js';
+import { Allowlist, TopicNotAllowedError, UnsafePatternError } from '../allowlist.js';
 import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import * as surface from '../index.js';
 import { NoSuchTopicError } from '../no-such-topic.js';
+import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
+import { ConsentError } from '../auth/oauth-provider.js';
 import type { BackendPlugin } from '../seam.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { FakePlugin } from '../testing/fake-plugin.js';
@@ -250,8 +252,295 @@ describe('a cancelled long-poll is recognised by contract, not by class identity
   }
 });
 
+
+/**
+ * A sentinel's `name` is what a second install matches on. Pinned by the COMPILER rather than read
+ * out of an artifact: three source scanners and one over the emitted declarations each grew a new
+ * hole rather than closing the last, because each graded the SYNTAX a declaration happens to be
+ * written in. `Exactly` grades the property — the type of `name` is the class's own name and
+ * nothing wider — so an alias to `string`, a getter, and an un-annotated literal are all answered
+ * by `tsc` instead of by a pattern.
+ */
+type Exactly<T, U> = [T] extends [U] ? ([U] extends [T] ? true : never) : never;
+
+/**
+ * Imported from the modules that DECLARE them rather than through the barrel, so that the row
+ * below asserting each is the class the barrel publishes is a comparison rather than a tautology.
+ */
+const SENTINEL_CLASSES = {
+  BlockingFetchUnsupportedError,
+  ConsentError,
+  FetchAbortedError,
+  NoSuchTopicError,
+  TopicNotAllowedError,
+  UnsafePatternError,
+};
+
+const NAME_PINS: {
+  [K in keyof typeof SENTINEL_CLASSES]: Exactly<
+    InstanceType<(typeof SENTINEL_CLASSES)[K]>['name'],
+    K
+  >;
+} = {
+  BlockingFetchUnsupportedError: true,
+  ConsentError: true,
+  FetchAbortedError: true,
+  NoSuchTopicError: true,
+  TopicNotAllowedError: true,
+  UnsafePatternError: true,
+};
+
+type TokenKind = 'ident' | 'string' | 'number' | 'punct' | 'regex';
+
+interface Token {
+  kind: TokenKind;
+  /** A string's CONTENTS; every other token's source text. */
+  value: string;
+}
+
+/** Operators after which a `/` divides rather than opens a regular expression. */
+const CLOSERS = new Set([')', ']', '}', '++', '--']);
+
+/** Keywords after which it opens one anyway. */
+const OPERATOR_KEYWORDS = new Set([
+  'return',
+  'typeof',
+  'instanceof',
+  'in',
+  'of',
+  'new',
+  'delete',
+  'void',
+  'case',
+  'do',
+  'else',
+  'yield',
+  'await',
+  'throw',
+]);
+
+const isIdStart = (c: string): boolean =>
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_' || c === '$';
+const isDigit = (c: string): boolean => c >= '0' && c <= '9';
+
+/**
+ * JavaScript, as tokens. The one primitive under every rule below, so that what they read is CODE:
+ * a sentinel named in a JSDoc block the emit preserves, or in the message of a marker comparison,
+ * is a comment and a string here and can no longer be mistaken for a class binding — and equally,
+ * a binding reached by a spelling no pattern anticipated is still an identifier.
+ */
+function tokenize(src: string): Token[] {
+  const out: Token[] = [];
+  const regexMayFollow = (): boolean => {
+    const p = out[out.length - 1];
+    if (p === undefined) return true;
+    if (p.kind === 'ident') return OPERATOR_KEYWORDS.has(p.value);
+    if (p.kind === 'punct') return !CLOSERS.has(p.value);
+    return false;
+  };
+  const frames: Array<'code' | 'template'> = ['code'];
+  const braces: number[] = [0];
+  let i = 0;
+  while (i < src.length) {
+    if (frames[frames.length - 1] === 'template') {
+      let text = '';
+      while (i < src.length) {
+        const c = src[i]!;
+        if (c === '\\') {
+          text += src[i + 1] ?? '';
+          i += 2;
+          continue;
+        }
+        if (c === '`') {
+          i++;
+          frames.pop();
+          break;
+        }
+        if (c === '$' && src[i + 1] === '{') {
+          i += 2;
+          frames.push('code');
+          braces.push(0);
+          break;
+        }
+        text += c;
+        i++;
+      }
+      out.push({ kind: 'string', value: text });
+      continue;
+    }
+    const c = src[i]!;
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+      i++;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      i++;
+      let text = '';
+      while (i < src.length && src[i] !== c) {
+        if (src[i] === '\\') {
+          text += src[i + 1] ?? '';
+          i += 2;
+          continue;
+        }
+        text += src[i];
+        i++;
+      }
+      i++;
+      out.push({ kind: 'string', value: text });
+      continue;
+    }
+    if (c === '`') {
+      i++;
+      frames.push('template');
+      continue;
+    }
+    if (c === '/' && regexMayFollow()) {
+      const start = i;
+      i++;
+      let inClass = false;
+      while (i < src.length) {
+        const d = src[i]!;
+        if (d === '\\') {
+          i += 2;
+          continue;
+        }
+        if (d === '\n') break;
+        if (d === '[') inClass = true;
+        else if (d === ']') inClass = false;
+        else if (d === '/' && !inClass) break;
+        i++;
+      }
+      i++;
+      while (i < src.length && isIdStart(src[i]!)) i++;
+      out.push({ kind: 'regex', value: src.slice(start, i) });
+      continue;
+    }
+    if (isIdStart(c)) {
+      const start = i;
+      while (i < src.length && (isIdStart(src[i]!) || isDigit(src[i]!))) i++;
+      out.push({ kind: 'ident', value: src.slice(start, i) });
+      continue;
+    }
+    if (isDigit(c)) {
+      const start = i;
+      while (i < src.length && (isDigit(src[i]!) || isIdStart(src[i]!) || src[i] === '.')) i++;
+      out.push({ kind: 'number', value: src.slice(start, i) });
+      continue;
+    }
+    if (c === '{') {
+      braces[braces.length - 1]!++;
+      out.push({ kind: 'punct', value: c });
+      i++;
+      continue;
+    }
+    if (c === '}') {
+      if (braces[braces.length - 1] === 0 && frames.length > 1) {
+        frames.pop();
+        braces.pop();
+        i++;
+        continue;
+      }
+      braces[braces.length - 1]!--;
+      out.push({ kind: 'punct', value: c });
+      i++;
+      continue;
+    }
+    const two = src.slice(i, i + 2);
+    if (two === '++' || two === '--') {
+      out.push({ kind: 'punct', value: two });
+      i += 2;
+      continue;
+    }
+    out.push({ kind: 'punct', value: c });
+    i++;
+  }
+  return out;
+}
+
+/** The index of the `)` closing the `(` at `open`, or -1. */
+function closingParen(toks: Token[], open: number): number {
+  let depth = 0;
+  for (let i = open; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (t.kind !== 'punct') continue;
+    if (t.value === '(') depth++;
+    else if (t.value === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Every call to `name` in `toks`, as the token span of the whole call expression — trailing
+ * argument lists included, so that `it.each(TABLE)(title, body)` is ONE span covering the case
+ * body. A `function name(` declaration is not a call and gets no span, so a rule below cannot be
+ * satisfied by a helper simply being declared.
+ */
+function callSpans(toks: Token[], name: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (t.kind !== 'ident' || t.value !== name) continue;
+    if (toks[i - 1]?.kind === 'ident' && toks[i - 1]!.value === 'function') continue;
+    let j = i + 1;
+    while (toks[j]?.kind === 'punct' && toks[j]!.value === '.') j += 2;
+    if (toks[j]?.value !== '(') continue;
+    let end = j;
+    while (toks[end]?.kind === 'punct' && toks[end]!.value === '(') {
+      const close = closingParen(toks, end);
+      if (close === -1) break;
+      end = close + 1;
+    }
+    spans.push([i, end - 1]);
+  }
+  return spans;
+}
+
+const within = (spans: Array<[number, number]>, at: number): boolean =>
+  spans.some(([from, to]) => at >= from && at <= to);
+
+/**
+ * A detector that answers `false` for the wrong reason grades nothing, and every rewrite of these
+ * rules has grown a new hole rather than closed the last one. Registering a detector is the only
+ * way to get one, and it costs a POSITIVE and a NEGATIVE control table — neither of which the type
+ * lets you leave empty — so a hole fails a row of the detector's own table instead of passing
+ * production. The row that re-opened F3 twice over had no table at all.
+ */
+type ControlRow<A extends unknown[]> = [form: string, ...args: A];
+type ControlTable<A extends unknown[]> = [ControlRow<A>, ...Array<ControlRow<A>>];
+
+const CONTROLLED: string[] = [];
+
+const detected = (v: unknown): boolean => (Array.isArray(v) ? v.length > 0 : Boolean(v));
+
+function controlled<A extends unknown[], R>(
+  what: string,
+  detect: (...args: A) => R,
+  finds: ControlTable<A>,
+  misses: ControlTable<A>,
+): (...args: A) => R {
+  CONTROLLED.push(what);
+  it.each(finds)(`${what}: %s is found`, (_form, ...args) => {
+    expect(detected(detect(...(args as A)))).toBe(true);
+  });
+  it.each(misses)(`${what}: %s is not`, (_form, ...args) => {
+    expect(detected(detect(...(args as A)))).toBe(false);
+  });
+  return detect;
+}
+
 describe('no production site in bridge-core recognises a sentinel by class identity', () => {
   const SRC = new URL('..', import.meta.url).pathname;
+  const S = 'NoSuchTopicError';
 
   function filesUnder(dir: string, ext: string): string[] {
     return readdirSync(dir).flatMap((entry) => {
@@ -262,16 +551,33 @@ describe('no production site in bridge-core recognises a sentinel by class ident
   }
 
   const relSrc = (f: string): string => f.slice(SRC.length);
+  const emitOf = (owner: string): string => `${owner.slice(0, -'.ts'.length)}.js`;
 
   /**
    * Every error class this package declares, as [sentinel, the module that declares it]. DERIVED
    * from the source, so the rule survives that module being renamed or moved, and so a sentinel
    * added later becomes a row rather than a rule nobody applied.
    */
+  const declarationsIn = controlled(
+    'the error-class walk',
+    (src: string): string[] =>
+      [...src.matchAll(/^\s*(?:export )?class (\w+) extends \w*Error\b/gm)].map((m) => m[1]!),
+    [
+      ['an exported error class', 'export class NoSuchTopicError extends Error {'],
+      ['a class this package does not export', 'class PageBudgetExceeded extends Error {'],
+      ['a class extending another Error type', 'export class Late extends TypeError {'],
+      ['a declaration the file indents', '  export class Nested extends Error {'],
+    ],
+    [
+      ['a class that is not an error', 'export class Allowlist extends Base {'],
+      ['an interface', 'export interface Wrapped extends Error {}'],
+      ['a line comment naming one', '// class Ghost extends Error is not a declaration'],
+      ['a JSDoc line naming one', ' * class Ghost extends Error, described'],
+    ],
+  );
+
   const SENTINELS = filesUnder(SRC, '.ts').flatMap((f) =>
-    [...readFileSync(f, 'utf8').matchAll(/^\s*(?:export )?class (\w+) extends \w*Error\b/gm)].map(
-      (m) => [m[1]!, relSrc(f)] as [string, string],
-    ),
+    declarationsIn(readFileSync(f, 'utf8')).map((name) => [name, relSrc(f)] as [string, string]),
   );
 
   const declared = SENTINELS.map(([sentinel]) => sentinel).sort();
@@ -296,7 +602,7 @@ describe('no production site in bridge-core recognises a sentinel by class ident
    * Sentinels core RAISES and never receives, so no second install of this package can hand core a
    * twin of one to miss: `ConsentError` — the one that IS compared by class, in auth/remote.ts — is
    * compared against the binding the module it is constructed in exports. They still name
-   * themselves, graded below, so a consumer holding two installs can tell them apart; what they do
+   * themselves, pinned below, so a consumer holding two installs can tell them apart; what they do
    * not need is a recogniser in core. A sentinel a PLUGIN can raise across the seam never belongs
    * here.
    */
@@ -320,114 +626,267 @@ describe('no production site in bridge-core recognises a sentinel by class ident
     expect(new (LOCAL[sentinel] as ErrorClass)('x').name).toBe(sentinel);
   });
 
-  /**
-   * `instanceof` needs the class BINDING, and a module reaches one only by importing it — so banning
-   * the import bans the comparison whatever the operator (`instanceof`, `.constructor ===`) and
-   * whatever the local alias. Read the EMIT rather than the source: an import that survives to
-   * runtime is exactly the one that can reach an operator, so the type-only erasure this rule must
-   * not fire on is settled by the compiler instead of re-derived from syntax. What recognition must
-   * DO is graded by the foreign-twin rows above; this keeps the shortcut out of reach.
-   */
-  function holdsClassBinding(src: string, sentinel: string): boolean {
-    const binds = (clause: string): boolean =>
-      clause
-        .replace(/[{}]/g, '')
-        .split(',')
-        .some((spec) => spec.trim().split(/\s+as\s+|\s*:\s*/)[0]!.trim() === sentinel);
+  it('the compiler pins the name of every error class the barrel publishes', () => {
+    expect(Object.keys(NAME_PINS).sort()).toEqual(errorsOnSurface);
+  });
 
-    /** Every local name the whole module object is reachable through. */
-    const namespaces = [
-      ...[...src.matchAll(/import\s*\*\s*as\s+(\w+)\s*from/g)],
-      ...[...src.matchAll(/import\s+(\w+)\s*(?:,\s*[{*]|from)/g)],
-      ...[...src.matchAll(/(\w+)\s*=\s*(?:await\s+)?(?:import|require)\s*\(/g)],
-    ].map((m) => m[1]!);
-
-    for (const m of src.matchAll(/import\s*({[^}]*})\s*from/g)) if (binds(m[1]!)) return true;
-    for (const m of src.matchAll(/({[^}]*})\s*=\s*(?:await\s+)?(?:import|require)\s*\(/g)) {
-      if (binds(m[1]!)) return true;
-    }
-    for (const ns of namespaces) {
-      if (new RegExp(`\\b${ns}\\s*\\.\\s*${sentinel}\\b`).test(src)) return true;
-      for (const m of src.matchAll(new RegExp(`({[^}]*})\\s*=\\s*${ns}\\b`, 'g'))) {
-        if (binds(m[1]!)) return true;
-      }
-    }
-    return false;
-  }
+  it.each(Object.entries(SENTINEL_CLASSES))(
+    'the class %s is pinned under is the one the barrel publishes',
+    (sentinel, cls) => {
+      expect(cls).toBe(LOCAL[sentinel]);
+    },
+  );
 
   /**
-   * A detector that silently answers `false` grades nothing, and every rewrite of this rule has
-   * grown a new hole rather than closed the last one. Every authoring form that leaves a module
-   * holding the binding is a row, so a hole fails a row of this table instead of passing production.
+   * `instanceof` needs the class BINDING, and a module reaches one only by importing it — so
+   * banning the import bans the comparison whatever the operator (`instanceof`,
+   * `.constructor ===`) and whatever the local alias. Read the EMIT rather than the source: an
+   * import that survives to runtime is exactly the one that can reach an operator, so the
+   * type-only erasure this rule must not fire on is settled by the compiler instead of re-derived
+   * from syntax. What recognition must DO is graded by the foreign-twin rows above; this keeps the
+   * shortcut out of reach.
+   *
+   * Deny by IDENTIFIER rather than by enumerated import forms: the class object is reachable
+   * wherever its own name is a token of the module's code, and the six spellings the enumeration
+   * missed — a computed member, an inline dynamic import, a two-hop alias, a default import, a
+   * `createRequire`, a comment between the braces — are all just that. A re-export names it
+   * without binding it, and a string names it without reaching it unless the string IS the member
+   * being read.
    */
-  const HOLDS: Array<[form: string, src: string]> = [
-    ['a named import', "import { asTopic, NoSuchTopicError } from './no-such-topic.js';"],
-    ['an aliased named import', "import { NoSuchTopicError as Absent } from './no-such-topic.js';"],
+  const holdsClassBinding = controlled(
+    'a module holding the class binding',
+    (src: string, sentinel: string): boolean => {
+      const toks = tokenize(src);
+      const reExported = (at: number): boolean => {
+        let open = -1;
+        for (let i = at - 1; i >= 0; i--) {
+          const t = toks[i]!;
+          if (t.kind !== 'punct') continue;
+          if (t.value === '}') return false;
+          if (t.value === '{') {
+            open = i;
+            break;
+          }
+        }
+        if (open <= 0) return false;
+        const before = toks[open - 1]!;
+        if (before.kind !== 'ident' || before.value !== 'export') return false;
+        let close = -1;
+        for (let i = at + 1; i < toks.length; i++) {
+          const t = toks[i]!;
+          if (t.kind === 'punct' && t.value === '}') {
+            close = i;
+            break;
+          }
+        }
+        const after = close === -1 ? undefined : toks[close + 1];
+        return after?.kind === 'ident' && after.value === 'from';
+      };
+      return toks.some((t, at) => {
+        if (t.kind === 'ident') return t.value === sentinel && !reExported(at);
+        return t.kind === 'string' && t.value === sentinel && toks[at - 1]?.value === '[';
+      });
+    },
     [
-      'a namespace member',
-      "import * as core from './index.js';\nif (e instanceof core.NoSuchTopicError) {}",
+      ['a named import', "import { asTopic, NoSuchTopicError } from './no-such-topic.js';", S],
+      ['an aliased named import', "import { NoSuchTopicError as Absent } from './x.js';", S],
+      [
+        'a namespace member',
+        "import * as core from './index.js';\nif (e instanceof core.NoSuchTopicError) {}",
+        S,
+      ],
+      [
+        'a computed namespace member',
+        "import * as core from './index.js';\nif (e instanceof core['NoSuchTopicError']) {}",
+        S,
+      ],
+      [
+        'a namespace destructure',
+        "import * as core from './index.js';\nconst { NoSuchTopicError } = core;",
+        S,
+      ],
+      [
+        'a two-hop namespace alias',
+        "import * as core from './index.js';\nconst c = core;\nc.NoSuchTopicError;",
+        S,
+      ],
+      ['a dynamic import', "const { NoSuchTopicError } = await import('./x.js');", S],
+      ['a dynamic namespace', "const core = await import('./index.js');\ncore.NoSuchTopicError;", S],
+      ['an inline dynamic import member', "(await import('./index.js')).NoSuchTopicError;", S],
+      ['a require', "const { NoSuchTopicError } = require('./x.js');", S],
+      ['a require namespace', "const core = require('./index.js');\ncore.NoSuchTopicError;", S],
+      [
+        'a createRequire',
+        "const req = createRequire(import.meta.url);\nconst { NoSuchTopicError } = req('./x.js');",
+        S,
+      ],
+      ['a default import member', "import core from './index.js';\ncore.NoSuchTopicError;", S],
+      ['a default import named as the sentinel', "import NoSuchTopicError from './index.js';", S],
+      [
+        'a named import with a comment between the braces',
+        "import { /* the sentinel */ NoSuchTopicError } from './x.js';",
+        S,
+      ],
+      [
+        'a member read out of a template interpolation',
+        'import * as core from "./index.js";\nconst s = `${core.NoSuchTopicError}`;',
+        S,
+      ],
     ],
     [
-      'a namespace destructure',
-      "import * as core from './index.js';\nconst { NoSuchTopicError } = core;",
+      ['a marker comparison', "if (err.name === 'NoSuchTopicError') return true;", S],
+      ['a recogniser import', "import { isNoSuchTopicError } from './no-such-topic.js';", S],
+      ['a longer name that contains it', "import { NoSuchTopicErrorPage } from './pages.js';", S],
+      ['a barrel re-export', "export { NoSuchTopicError } from './no-such-topic.js';", S],
+      [
+        'a re-export beside other names',
+        "export { asTopic, NoSuchTopicError, isNoSuchTopicError } from './x.js';",
+        S,
+      ],
+      ['a line comment naming it', '// NoSuchTopicError is recognised by contract, not by class', S],
+      ['a JSDoc block naming it', '/** {@link NoSuchTopicError} and why. */\nexport const x = 1;', S],
+      ['a diagnostic naming it', "throw new Error('expected a NoSuchTopicError here');", S],
     ],
-    ['a dynamic import', "const { NoSuchTopicError } = await import('./no-such-topic.js');"],
-    ['a dynamic namespace', "const core = await import('./index.js');\ncore.NoSuchTopicError;"],
-    ['a require', "const { NoSuchTopicError } = require('./no-such-topic.js');"],
-    ['a require namespace', "const core = require('./index.js');\ncore.NoSuchTopicError;"],
-    ['a default import member', "import core from './index.js';\ncore.NoSuchTopicError;"],
-  ];
+  );
 
-  const DOES_NOT_HOLD: Array<[form: string, src: string]> = [
-    ['a marker comparison', "if (err.name === 'NoSuchTopicError') return true;"],
-    ['a recogniser import', "import { isNoSuchTopicError } from './no-such-topic.js';"],
-    ['a longer name that contains it', "import { NoSuchTopicErrorPage } from './pages.js';"],
-    ['a type-only specifier', "import { type NoSuchTopicError } from './no-such-topic.js';"],
-    ['a barrel re-export', "export { NoSuchTopicError } from './no-such-topic.js';"],
-  ];
+  /**
+   * Which modules CALL a by-contract recogniser — the derived form of the site table above. A
+   * recogniser call is what makes a module a site, so a site added later arrives here as a red row
+   * rather than as a behaviour nothing tables.
+   */
+  const recogniserCallsIn = controlled(
+    'a module calling a recogniser',
+    (src: string, sentinels: string[]): string[] => {
+      const toks = tokenize(src);
+      const names = new Set(sentinels.map((s) => `is${s}`));
+      return toks
+        .filter(
+          (t, i) =>
+            t.kind === 'ident' &&
+            names.has(t.value) &&
+            toks[i + 1]?.value === '(' &&
+            !(toks[i - 1]?.kind === 'ident' && toks[i - 1]!.value === 'function'),
+        )
+        .map((t) => t.value);
+    },
+    [
+      ['a call', 'if (!isNoSuchTopicError(err)) throw err;', [S]],
+      ['a call through a namespace', 'if (core.isNoSuchTopicError(err)) return [];', [S]],
+    ],
+    [
+      ['the recogniser it declares', 'export function isNoSuchTopicError(err) { return false; }', [S]],
+      ['a re-export of one', "export { isNoSuchTopicError } from './no-such-topic.js';", [S]],
+      ['a mention in a comment', '// recognised via isNoSuchTopicError(err), by contract', [S]],
+    ],
+  );
 
-  it.each(HOLDS)('%s leaves the module holding the binding', (_form, src) => {
-    expect(holdsClassBinding(src, 'NoSuchTopicError')).toBe(true);
-  });
-
-  it.each(DOES_NOT_HOLD)('%s does not', (_form, src) => {
-    expect(holdsClassBinding(src, 'NoSuchTopicError')).toBe(false);
-  });
-
-  // A sentinel's `name` is what a SECOND install matches on, so the declaration must pin it to the
-  // literal. Read from the EMIT: dropping the annotation compiles clean, keeps `this.constructor.name`
-  // correct in an unminified test, and is invisible to both the compiler ratchet and the second-install
-  // fixture — but it emits `name: string`, which a consumer's checker can see.
-  it.each(SENTINELS)('%s declares its name as a literal in the shipped types', (sentinel, owner) => {
-    const dts = readFileSync(join(DIST, owner.replace(/\.ts$/, '.d.ts')), 'utf8');
-    const decl = new RegExp(`class ${sentinel}\\b[\\s\\S]*?readonly name: ([^;]+);`).exec(dts);
-    expect(decl, `${sentinel} declares no readonly name in ${owner}`).not.toBeNull();
-    expect(
-      decl?.[1]?.trim(),
-      'a sentinel whose emitted name is `string` no longer pins the marker a foreign install matches on',
-    ).not.toBe('string');
-  });
-
-  const emitted = filesUnder(DIST, '.js');
+  const DIST_FILES = filesUnder(DIST, '.js');
   const relDist = (f: string): string => f.slice(DIST.length + 1);
-  const emitOf = (owner: string): string => owner.replace(/\.ts$/, '.js');
+  const shipped = filesUnder(SRC, '.ts')
+    .filter((f) => !f.endsWith('.d.ts'))
+    .map((f) => emitOf(relSrc(f)));
+  // `tsc -b` never deletes the output of a source that was removed, so a dist carrying a module
+  // from an earlier chunk would be read here as a live recogniser. Grade only what a source still
+  // backs, so a stale local build reports the real rule rather than a phantom module.
+  const emitted = DIST_FILES.map((f) => [relDist(f), readFileSync(f, 'utf8')] as [string, string])
+    .filter(([name]) => shipped.includes(name));
 
-  it('the emit walk reaches the modules the rule below grades', () => {
-    expect(emitted.map(relDist)).toEqual(
-      expect.arrayContaining(SENTINELS.map(([, owner]) => emitOf(owner))),
-    );
+  const holdersOf = (sentinel: string, owner: string): string[] =>
+    emitted
+      .filter(([name, text]) => name !== emitOf(owner) && holdsClassBinding(text, sentinel))
+      .map(([name]) => name);
+
+  const recogniserSites = (): string[] =>
+    emitted
+      .filter(([, text]) => recogniserCallsIn(text, RECOGNISED).length > 0)
+      .map(([name]) => name)
+      .sort();
+
+  /**
+   * Every module that asks whether a rejection is a sentinel, against the behavioural site it is
+   * reached through above. A module added to this set with no row up there is a site whose
+   * recognition nothing grades — which is the whole failure this file exists to prevent, arriving
+   * by addition rather than by drift.
+   */
+  const RECOGNISER_SITES: Record<string, string> = {
+    'engine/catchup.js': 'catchUpTopic',
+    'transport/push-loop.js': 'startPushLoop',
+    'transport/tools.js': 'parley_fetch_recent',
+  };
+
+  it('the emit walk reaches every module this package ships', () => {
+    expect(emitted.map(([name]) => name)).toEqual(expect.arrayContaining(shipped));
+    expect(shipped).toEqual(expect.arrayContaining(SENTINELS.map(([, owner]) => emitOf(owner))));
+  });
+
+  it('every module that recognises a sentinel is a site the rows above drive', () => {
+    expect(recogniserSites()).toEqual(Object.keys(RECOGNISER_SITES).sort());
+    const siteNames = SITES.map(([name]) => name);
+    expect(
+      Object.values(RECOGNISER_SITES).filter(
+        (site) => !siteNames.some((name) => name.startsWith(site)),
+      ),
+      'a module calls a recogniser but the behavioural table above reaches it through no site',
+    ).toEqual([]);
   });
 
   it.each(SENTINELS.filter(([sentinel]) => hasRecogniser(sentinel)))(
     '%s survives to runtime only in %s',
     (sentinel, owner) => {
-      const holders = emitted
-        .filter(
-          (f) =>
-            relDist(f) !== emitOf(owner) && holdsClassBinding(readFileSync(f, 'utf8'), sentinel),
-        )
-        .map(relDist);
-      expect(holders).toEqual([]);
+      expect(holdersOf(sentinel, owner)).toEqual([]);
     },
   );
+});
+
+/**
+ * The rules above read TEXT, and the only reason any of them still discriminates is that its
+ * detector ships both control tables. The row that re-opened F3 shipped with none: it was a
+ * regular expression written inline in the grading row itself, where nothing required a control
+ * and nothing could see it had stopped matching the class it named. So text detection is confined
+ * to registered detectors, and a grading row may not do any of its own.
+ */
+describe('this file grades no text except through a controlled detector', () => {
+  const OWN_SOURCE = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  const OWN_TOKENS = tokenize(OWN_SOURCE);
+  const CONTROLLED_SPANS = callSpans(OWN_TOKENS, 'controlled');
+  const CASE_SPANS = [...callSpans(OWN_TOKENS, 'it'), ...callSpans(OWN_TOKENS, 'test')];
+  /** Reading a file, or building a pattern, is detection — and belongs in a detector. */
+  const DETECTION = ['RegExp', 'readFileSync', 'readdirSync', 'statSync', 'execFileSync', 'cpSync'];
+
+  it('finds the detectors, the cases and the patterns, so the rows below are not empty', () => {
+    expect(CONTROLLED, 'no detector was registered').not.toEqual([]);
+    expect(CONTROLLED_SPANS.length).toBe(CONTROLLED.length);
+    expect(CASE_SPANS.length).toBeGreaterThan(10);
+    expect(OWN_TOKENS.filter((t) => t.kind === 'regex').length).toBeGreaterThan(0);
+    expect(
+      OWN_TOKENS.filter((t) => t.kind === 'ident' && DETECTION.includes(t.value)).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('every pattern it writes lives inside a controlled detector', () => {
+    const loose = OWN_TOKENS.map((t, at) => [t, at] as const)
+      .filter(([t, at]) => t.kind === 'regex' && !within(CONTROLLED_SPANS, at))
+      .map(([t]) => t.value);
+    expect(
+      loose,
+      'a pattern outside a controlled detector grades text with no positive and negative ' +
+        'control tables — the shape every rewrite of these rules has shipped its next hole in',
+    ).toEqual([]);
+  });
+
+  it('no case does its own detecting', () => {
+    const inline = OWN_TOKENS.map((t, at) => [t, at] as const)
+      .filter(
+        ([t, at]) =>
+          within(CASE_SPANS, at) &&
+          !within(CONTROLLED_SPANS, at) &&
+          (t.kind === 'regex' || (t.kind === 'ident' && DETECTION.includes(t.value))),
+      )
+      .map(([t]) => t.value);
+    expect(
+      inline,
+      'a case that reads a file or builds a pattern of its own is a detector nobody controls, ' +
+        'sitting where a control table cannot reach it',
+    ).toEqual([]);
+  });
 });

@@ -175,7 +175,7 @@ export class XmppInbound extends XmppRooms {
     const msg = this.toMessage(sub.topic, { archId, from, body, stamp: wire.roomStamp(stanza, room) });
     for (const h of sub.handlers) {
       try {
-        h(msg);
+        void Promise.resolve(h(msg)).catch(() => undefined);
       } catch {
         /* handler is best-effort; never break the live path (DESIGN §6) */
       }

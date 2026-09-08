@@ -124,6 +124,70 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 const between = (low: number, high: number): number =>
   low + Math.floor(Math.random() * (high - low + 1));
 
+/**
+ * How long a faulted run is watched afterwards for an escaped rejection or a diagnostic. Both
+ * arrive a turn or more after the delivery that caused them, so a case asserting the instant its
+ * last message landed would assert before the failure it is looking for exists.
+ */
+const FAULT_SETTLE_MS = 250;
+
+/** Owed deliveries per faulted run — sent one at a time, each awaited, so none may be dropped. */
+const FAULTED_POSTS = 3;
+
+const rejectsLater = (): Promise<never> =>
+  new Promise((_resolve, reject) => setTimeout(() => reject(new Error('the consumer blew up')), 0));
+
+const throwsAnErrorNow = (): never => {
+  throw new Error('the consumer blew up');
+};
+
+const throwsANonErrorNow = (): never => {
+  throw 'the consumer blew up';
+};
+
+/**
+ * The ways a handler can fail that a `(msg: Message) => void` seam type does not forbid.
+ * `subscribe` is handed a callback the plugin did not write — core's is the push loop, a consumer's
+ * is whatever they passed — so every one of these is the CALLER's fault, and the live path owes the
+ * rest of the topic regardless.
+ *
+ * The rejecting arms are the ones that end the bridge: a promise nothing attached to reaches Node's
+ * default `--unhandled-rejections=throw`. An `instanceof` guard misses the non-Error arm, and
+ * AWAITING the handler — the obvious containment — trades the crash for a stall, which is what the
+ * arm that never settles is here to forbid.
+ */
+const HANDLER_FAULTS: Array<[label: string, fault: () => unknown]> = [
+  ['throws', throwsAnErrorNow],
+  ['throws something that is not an Error', throwsANonErrorNow],
+  [
+    'returns a rejected promise',
+    (): Promise<never> => Promise.reject(new Error('the consumer blew up')),
+  ],
+  ['rejects a turn later', rejectsLater],
+  ['returns a promise that never settles', (): Promise<never> => new Promise<never>(() => undefined)],
+];
+
+/** Where in a run of owed deliveries the handler fails. */
+const FAULT_POSITIONS: Array<[where: string, faultsAt: (nth: number) => boolean]> = [
+  ['on the first message of a run', (nth): boolean => nth === 0],
+  ['in the middle of a run', (nth): boolean => nth === 1],
+  ['on every message it is given', (): boolean => true],
+];
+
+/**
+ * Every fault against every position. ONE row per pair rather than one row per shape driving three
+ * runs, so that each row asks a connection for a single subscription {@link FAULTED_POSTS} deep —
+ * the depth and the subscription count every other live case here already sits inside, which keeps
+ * each `BROKEN_VARIANTS` control aimed at the one case it was calibrated against.
+ */
+const FAULT_MATRIX: Array<[label: string, fault: () => unknown, faultsAt: (nth: number) => boolean]> =
+  HANDLER_FAULTS.flatMap(([label, fault]) =>
+    FAULT_POSITIONS.map(
+      ([where, faultsAt]) =>
+        [`${label} ${where}`, fault, faultsAt] as [string, () => unknown, (nth: number) => boolean],
+    ),
+  );
+
 /** The push path: what `subscribe` delivers, to which topic, and what `disconnect` stops. */
 export function liveCases(ctx: ConformanceContext): void {
   // The content carries an @mention so `mentions` is asserted non-vacuously on BOTH paths: core's
@@ -339,6 +403,77 @@ export function liveCases(ctx: ConformanceContext): void {
         "a live subscription carried another topic's message",
       ).toEqual([sent[i]]);
       for (const m of got[i]!) expect(m.topic).toBe(t);
+    }
+  });
+
+  /**
+   * DESIGN §6: the handler is best-effort, and its failure is the CALLER's. Three properties, so
+   * that no two of them can be satisfied by the same accident — a plugin that "contains" a fault by
+   * abandoning the topic passes the first alone, and one that contains it by awaiting the handler
+   * passes the first two while a handler that never settles parks every later message behind it.
+   * Ten backends carried this guarantee in a hand-written comment that no test could tell from its
+   * absence; four of the ten had no grade for it anywhere.
+   */
+  it.each(FAULT_MATRIX)('a live path survives a handler that %s', async (_label, fault, faultsAt) => {
+    const noise: string[] = [];
+    const escaped: unknown[] = [];
+    const collect = (reason: unknown): void => {
+      escaped.push(reason);
+    };
+    // Collected here rather than left to the runner's global accounting, so the row that produced
+    // an escaped rejection is the row that fails.
+    process.on('unhandledRejection', collect);
+    const onStderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk): boolean => {
+      noise.push(String(chunk));
+      return true;
+    });
+    const onConsole = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]): void => {
+      noise.push(args.map((a) => String(a)).join(' '));
+    });
+    const writer = liveWriter();
+    try {
+      const t = ctx.freshTopic();
+      const offered: string[] = [];
+      const sent: string[] = [];
+      let nth = 0;
+      await ctx.plugin.subscribe(t, (m) => {
+        offered.push(m.content);
+        return faultsAt(nth++) ? fault() : undefined;
+      });
+
+      for (let i = 0; i < FAULTED_POSTS; i++) {
+        const content = livePayload();
+        await ctx.plugin.post(t, writer, content);
+        sent.push(content);
+        await delivered(DELIVERY_MS, () =>
+          expect(
+            offered,
+            'handler-fault-does-not-stop-delivery: a failing handler took the rest of the topic ' +
+              'down with it. The messages were sent one at a time, each awaited before the next, ' +
+              'so none of them is a burst a delivery window may drop — and the failure is the ' +
+              'consumer\'s, never the backend\'s',
+          ).toEqual(sent),
+        );
+      }
+
+      await sleep(FAULT_SETTLE_MS);
+      expect(
+        escaped,
+        'handler-fault-reaches-no-unhandled-rejection: a handler\'s rejection escaped to the ' +
+          'process. The seam types the handler `=> void`, which does not forbid an `async` one, ' +
+          'and under Node\'s default `--unhandled-rejections=throw` an unattached rejection ends ' +
+          'the whole bridge — every topic, not just this one',
+      ).toEqual([]);
+      expect(
+        noise,
+        'handler-fault-is-not-a-backend-failure: the plugin diagnosed a consumer fault as its own. ' +
+          'A backend that counts it toward a failure ladder backs a perfectly healthy topic off, ' +
+          'which is how a live path "contains" a fault by going quiet',
+      ).toEqual([]);
+    } finally {
+      onStderr.mockRestore();
+      onConsole.mockRestore();
+      process.off('unhandledRejection', collect);
     }
   });
 

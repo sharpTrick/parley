@@ -386,7 +386,9 @@ export class TelegramPlugin implements BackendPlugin {
     }
     for (const sub of this.subs.get(chatId) ?? []) {
       try {
-        sub.handler(recordToMessage(rec, sub.topic, store.epoch()));
+        void Promise.resolve(sub.handler(recordToMessage(rec, sub.topic, store.epoch()))).catch(
+          () => undefined,
+        );
       } catch {
         /* handler is best-effort; never break the loop (DESIGN §6) */
       }
