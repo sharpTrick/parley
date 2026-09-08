@@ -5,7 +5,7 @@ import { readRetryAfter } from './wire.js';
 /** Milliseconds a best-effort teardown request may take before it is abandoned. */
 export const TEARDOWN_TIMEOUT_MS = 2000;
 
-export interface RequestOpts {
+interface RequestOpts {
   form?: Record<string, string>;
   query?: Record<string, string>;
   signal?: AbortSignal;

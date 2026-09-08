@@ -65,7 +65,7 @@ export const TOKEN_CONFIG_KEYS = ['bot_token', 'app_token'] as const;
  * that re-parses the value — rather than just carrying it — has one, and a value the type check
  * admits but the grammar cannot round-trip is accepted at load and then silently inert.
  */
-export interface MapValueGrammar {
+interface MapValueGrammar {
   accepts: (value: string) => boolean;
   /** What the operator has to change, phrased for stderr. */
   requirement: string;
@@ -80,7 +80,7 @@ export interface MapValueGrammar {
  * `isMentionableHandle` is the same predicate but is not on its public export surface — a seam gap,
  * not a licence to reach into core's source tree.)
  */
-export const MENTIONABLE_HANDLE: MapValueGrammar = {
+const MENTIONABLE_HANDLE: MapValueGrammar = {
   accepts: (value) => parseMentions(`@${value}`)[0] === value,
   requirement:
     'an @-mention of it must parse back to exactly it (alphanumeric at both ends; interior ' +
@@ -101,7 +101,7 @@ export const MENTIONABLE_HANDLE: MapValueGrammar = {
  * Keep the type check AHEAD of `grammar`, so that a non-string value is still refused by the shape
  * it failed rather than by a predicate that was never written to read one.
  */
-export function requireUsableMap(
+function requireUsableMap(
   configKey: string,
   what: string,
   map: unknown,
@@ -140,7 +140,7 @@ export function requireUsableMap(
  * silently displace each other's route and relabel one topic's traffic as the other's, crossing into
  * a different topic's dedup and allowlist namespace.
  */
-export function requireUsableChannelMap(map: unknown): Record<string, string> {
+function requireUsableChannelMap(map: unknown): Record<string, string> {
   const checked = requireUsableMap('channel_map', 'a channel id', map);
   const owner = new Map<string, string>();
   for (const [topic, channel] of Object.entries(checked)) {

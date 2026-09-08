@@ -19,7 +19,7 @@ import {
 } from './messages.js';
 
 /** The plugin, as a read sees it: the live settings, the teardown flag, and the topic mapping. */
-export interface HistoryHost {
+interface HistoryHost {
   settings: () => SlackSettings;
   stopped: () => boolean;
   channelFor: (topic: Topic) => string;

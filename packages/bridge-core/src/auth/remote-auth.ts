@@ -23,7 +23,7 @@ export interface RemoteAuthOptions {
 
 export type RemoteAuthServer = OAuthRemoteServer | OidcRemoteServer;
 
-export type OptionScope = 'builtin' | 'oidc' | 'shared';
+type OptionScope = 'builtin' | 'oidc' | 'shared';
 
 /**
  * Which mode each option reaches. An option the selected mode never forwards is a silent no-op, and

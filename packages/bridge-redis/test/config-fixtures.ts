@@ -1,4 +1,4 @@
-import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '../../bridge-net-util/test/never-renderable.js';
+import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '@sharptrick/parley-net-util';
 
 export { RENDER_LEAK_SENTINEL };
 

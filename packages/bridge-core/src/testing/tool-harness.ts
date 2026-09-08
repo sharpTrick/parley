@@ -18,14 +18,14 @@ import { memoryReadState } from './nonconformant.js';
  * without anything turning red. So the defaults live here, per-file variation is an explicit
  * override, and {@link toolClient} refuses to build deps that silently lost a key.
  */
-export interface ToolHarnessOptions extends Partial<ToolDeps> {
+interface ToolHarnessOptions extends Partial<ToolDeps> {
   /** Explicit `topics` for the default Allowlist. Ignored when `allow` is overridden. */
   topics?: string[];
   /** `post_topics` sources for the default Allowlist. Ignored when `allow` is overridden. */
   postPatterns?: string[];
 }
 
-export interface ToolHarness {
+interface ToolHarness {
   plugin: FakePlugin;
   client: Client;
   deps: ToolDeps;

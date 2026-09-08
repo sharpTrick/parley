@@ -31,7 +31,7 @@ export interface SqlDriver {
   close(): void;
 }
 
-export interface OpenOptions {
+interface OpenOptions {
   /** PRAGMA busy_timeout (ms) — retry window when another process holds the write lock. */
   busyTimeoutMs?: number;
 }

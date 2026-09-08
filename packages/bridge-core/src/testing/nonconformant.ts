@@ -46,13 +46,13 @@ function window(args: FetchRecentArgs, count: number, total: number): FetchRecen
 }
 
 /** Serves one page; `call` is the 0-based index of this call on the plugin. */
-export type ServePage = (args: FetchRecentArgs, call: number) => FetchRecentResult;
+type ServePage = (args: FetchRecentArgs, call: number) => FetchRecentResult;
 
 /**
  * How many messages a driver that pages to exhaustion must drain from each shape, or `undefined`
  * where the shape is deliberately unbounded and only TERMINATION is required.
  */
-export interface NonconformantShape {
+interface NonconformantShape {
   serve: ServePage;
   drains?: number;
 }

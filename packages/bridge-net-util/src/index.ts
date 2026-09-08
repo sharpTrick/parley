@@ -17,6 +17,7 @@ import { sleepUnlessStopped } from './timing.js';
 
 export { HttpStatusError, statusOf } from './errors.js';
 export { describeConfigShape, describeConfigValue } from './config-value.js';
+export { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from './hostile-config-values.js';
 export { isHttpUrl, isLoopbackHost, plaintextRemoteOrigin } from './plaintext.js';
 export { MAX_ERROR_BODY, sanitizeBody } from './redact.js';
 export { bodyRetryAfter, retryAfterFromHeader } from './retry-after.js';

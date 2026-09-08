@@ -27,7 +27,7 @@ export const fromCaller = (text: string): string => sanitizeBody(text);
  * cannot become a throttle key of its own: a class parameterized by caller input passes that input
  * as {@link Diagnostics.report}'s separate `instance`, which is where the bound below applies.
  */
-export type DiagnosticKind =
+type DiagnosticKind =
   | 'bookkeeping-line'
   | 'compaction'
   | 'high-water-mark'

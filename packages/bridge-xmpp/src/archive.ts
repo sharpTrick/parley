@@ -13,7 +13,7 @@ export const MAM_MISSING_HINT =
   '(ejabberd); without an archive there is no cursor, no catch-up and no live delivery';
 
 /** One archive window: the rows the seam carries, and where in the archive the read actually got to. */
-export interface ReadWindow {
+interface ReadWindow {
   items: wire.BodiedItem[];
   /** Archive id of the last row the read SAW, admitted or not; `undefined` when it saw none. */
   tail?: string;

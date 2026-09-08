@@ -19,9 +19,9 @@ import { dirname } from 'node:path';
 import { describe, Diagnostics, note } from './diagnostics.js';
 
 /** Mode for everything the store creates — the plaintext of every message the bridge has seen. */
-export const OWNER_ONLY_FILE = 0o600;
+const OWNER_ONLY_FILE = 0o600;
 /** Mode for a directory the store creates for its path. */
-export const OWNER_ONLY_DIR = 0o700;
+const OWNER_ONLY_DIR = 0o700;
 
 /**
  * Every path the store writes BESIDE its file: the claim on it ({@link StoreLock}), the token held

@@ -38,7 +38,7 @@ export function topicSchema(allow: Allowlist, description: string): z.ZodType<st
 }
 
 /** Alias the SDK's result type so handlers align with the CallTool result exactly. */
-export type ToolResult = CallToolResult;
+type ToolResult = CallToolResult;
 
 export const textResult = (obj: unknown): ToolResult => ({
   content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }],

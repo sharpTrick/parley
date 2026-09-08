@@ -39,7 +39,7 @@ export function mcpPost(port: number, body: string = INITIALIZE): Promise<Respon
   return fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers: MCP_HEADERS, body });
 }
 
-export interface RemoteApp {
+interface RemoteApp {
   plugin: FakePlugin;
   app: RemoteHttpServer;
   teardown: () => Promise<void>;

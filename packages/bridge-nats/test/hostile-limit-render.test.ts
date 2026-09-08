@@ -1,9 +1,6 @@
 import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
-import {
-  NEVER_RENDERABLE,
-  RENDER_LEAK_SENTINEL,
-} from '../../bridge-net-util/test/never-renderable.js';
+import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from '@sharptrick/parley-net-util';
 import { normalizeLimit } from '../src/cursor.js';
 
 /**

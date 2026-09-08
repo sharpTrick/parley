@@ -130,6 +130,12 @@ seam error into.
 - **`describeConfigShape(value)`** — what a value IS (`an object`, `an array`, `the empty string`,
   `a number`), carrying nothing of what it holds. Use it for a key whose value is a URL or any other
   credential carrier, so a password in a mistyped value never reaches a log line.
+- **`NEVER_RENDERABLE`** / **`RENDER_LEAK_SENTINEL`** — the corpus `describeConfigValue` is graded
+  against, published with it: the values that break a naive renderer (circular, bigint,
+  null-prototype, no JSON form and no string form, a `toJSON` that raises `RENDER_LEAK_SENTINEL`).
+  A backend crosses it over its own validator to hold the invariant where it matters — that the
+  refusal an operator reads is still the PLUGIN's labelled load error, not whatever the caller's
+  value raised.
 
 ## Plaintext-credential classification
 

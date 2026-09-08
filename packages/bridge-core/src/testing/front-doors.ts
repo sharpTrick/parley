@@ -41,9 +41,9 @@ export type DoorName = {
 type Assert<T extends true> = T;
 export type DoorNamesAreDerivable = Assert<[DoorName] extends [never] ? false : true>;
 
-export type DoorServer = { [K in DoorName]: AwaitedReturn<(typeof core)[K]> }[DoorName];
+type DoorServer = { [K in DoorName]: AwaitedReturn<(typeof core)[K]> }[DoorName];
 
-export interface Booted {
+interface Booted {
   server: DoorServer;
   base: string;
   authorization: string;
@@ -87,7 +87,7 @@ export interface Trigger {
  * raises, so any sink that renders that error renders these — which makes them the thing to search
  * for, in the response AND in the log, rather than trusting either to be the only sink.
  */
-export const CANARIES = {
+const CANARIES = {
   passphrase: 'PARLEY-CANARY-passphrase',
   client_secret: 'PARLEY-CANARY-client-secret',
   code_verifier: 'PARLEY-CANARY-code-verifier',

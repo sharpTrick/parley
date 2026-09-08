@@ -28,7 +28,7 @@ export const DIAL_WAIT_MS = 5000;
 export const QUERY_WAIT_MS = 3 * LOCK_WAIT_MS;
 
 /** TCP keepalive idle time, so a peer that vanished without a FIN becomes an error, not silence. */
-export const KEEPALIVE_DELAY_MS = 10_000;
+const KEEPALIVE_DELAY_MS = 10_000;
 
 /** Ceiling on the whole of `disconnect()` — see {@link endWithin}. */
 export const TEARDOWN_WAIT_MS = 5000;

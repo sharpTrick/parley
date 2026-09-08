@@ -13,7 +13,7 @@ import {
 } from './socket.js';
 
 /** The plugin, as the link sees it: the live configuration and which session is still current. */
-export interface SocketHost {
+interface SocketHost {
   settings: () => SlackSettings;
   stopped: () => boolean;
   session: () => number;

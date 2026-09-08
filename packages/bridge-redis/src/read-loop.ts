@@ -19,7 +19,7 @@ const RETRY_MAX_MS = 2000;
  */
 const DEGRADED_AFTER_FAILURES = 5;
 
-export interface ReadLoop {
+interface ReadLoop {
   reader: RedisClient;
   topic: Topic;
   key: string;

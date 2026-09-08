@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { describeConfigShape, describeConfigValue, MAX_ERROR_BODY } from '../src/index.js';
-import { NEVER_RENDERABLE, RENDER_LEAK_SENTINEL } from './never-renderable.js';
+import {
+  describeConfigShape,
+  describeConfigValue,
+  MAX_ERROR_BODY,
+  NEVER_RENDERABLE,
+  RENDER_LEAK_SENTINEL,
+} from '../src/index.js';
 
 /**
  * CLASS: a rejected `backend_config` value is rendered into an error an operator reads and core
