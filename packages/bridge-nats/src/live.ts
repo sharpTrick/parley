@@ -1,6 +1,7 @@
 import { type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import type { ConsumerMessages } from 'nats';
-import { closeOnConsumerLoss, delay, EphemeralConsumer, fromSequence } from './jetstream.js';
+import { closeOnConsumerLoss, EphemeralConsumer, fromSequence } from './jetstream.js';
 import { NatsReads } from './read.js';
 
 const RESUBSCRIBE_BACKOFF_MS = 1000;

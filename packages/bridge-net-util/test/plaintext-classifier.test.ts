@@ -131,12 +131,6 @@ describe('no consumer re-implements an export of this package', () => {
     'bridge-discord:plaintextRemoteOrigin':
       'it needs the scheme to recommend as well as the origin to name, which a ' +
       '`string | undefined` return cannot carry — widening the return is what retires it',
-    'bridge-nats:delay':
-      'a duplicate with no obstruction at all: importing `delay` from here is a one-line change ' +
-      'in that package, which owns it',
-    'bridge-redis:delay':
-      'a duplicate with no obstruction at all: importing `delay` from here is a one-line change ' +
-      'in that package, which owns it',
   };
 
   /**

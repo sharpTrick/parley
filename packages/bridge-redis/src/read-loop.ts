@@ -1,4 +1,5 @@
 import { type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import { type RedisClient, serverRefusal } from './client.js';
 import {
   errorText,
@@ -17,8 +18,6 @@ const RETRY_MAX_MS = 2000;
  * follow, a replica stuck `LOADING` — otherwise leaves live delivery dead and completely silent.
  */
 const DEGRADED_AFTER_FAILURES = 5;
-
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export interface ReadLoop {
   reader: RedisClient;

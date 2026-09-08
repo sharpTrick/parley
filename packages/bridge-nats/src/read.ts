@@ -1,7 +1,8 @@
 import type { Cursor, FetchRecentArgs, FetchRecentResult, Message, Topic } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import type { StreamInfo } from 'nats';
 import { absentTopicPage, normalizeLimit, parseCursor, type ParsedCursor } from './cursor.js';
-import { delay, isNoResponder, isStreamAbsent } from './jetstream.js';
+import { isNoResponder, isStreamAbsent } from './jetstream.js';
 import { NatsPulls } from './pull.js';
 
 const WIDEN_FACTOR = 4;

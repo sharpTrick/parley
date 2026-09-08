@@ -1,7 +1,7 @@
 import type { Cursor, FetchRecentResult, Message, Topic } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import type { ConsumerMessages } from 'nats';
 import {
-  delay,
   DRAIN_TIMEOUT_MS,
   EphemeralConsumer,
   fromSequence,

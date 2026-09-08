@@ -1,3 +1,4 @@
+import { delay } from '@sharptrick/parley-net-util';
 import { AckPolicy, ConsumerEvents, DeliverPolicy } from 'nats';
 import type { ConsumerConfig, ConsumerMessages, JetStreamManager } from 'nats';
 
@@ -7,8 +8,6 @@ const FETCH_EXPIRY_MS = 2000;
 const FETCH_EXPIRY_CEILING_MS = 30_000;
 const FETCH_IDLE_MS = 200; // close a pull this long without a message rather than wait out `expires`
 const LINK_PATIENCE_FACTOR = 3;
-
-export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * How long ONE pull waits, scaled by what its own setup round trips just cost. Keep the scaling: a

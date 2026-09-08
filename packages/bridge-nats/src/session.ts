@@ -1,4 +1,5 @@
 import type { BackendConfig } from '@sharptrick/parley-core';
+import { delay } from '@sharptrick/parley-net-util';
 import { connect } from 'nats';
 import type { JetStreamClient, JetStreamManager, NatsConnection } from 'nats';
 import {
@@ -10,7 +11,7 @@ import {
   validatePrefix,
   validateRetentionMaxAgeNs,
 } from './config.js';
-import { delay, DRAIN_TIMEOUT_MS, type Closeable } from './jetstream.js';
+import { DRAIN_TIMEOUT_MS, type Closeable } from './jetstream.js';
 import { MAX_STREAM_NAME_BYTES } from './naming.js';
 
 /** The link, the addressing it was opened with, and everything `disconnect()` has to give back. */
