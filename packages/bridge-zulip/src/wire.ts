@@ -109,11 +109,10 @@ export function pageAnchor(id: unknown, from: string, backwards: boolean): strin
  * undefined when neither is usable, so the shared default and the shared ceiling stay in
  * `clampBackoff` rather than being re-implemented — and re-tuned — per backend.
  */
-const zulipHint = bodyRetryAfter<{ 'retry-after'?: number }>((b) => b['retry-after'], 1000);
-
-export async function readRetryAfter(res: Response): Promise<number | undefined> {
-  return zulipHint(res);
-}
+export const readRetryAfter = bodyRetryAfter<{ 'retry-after'?: number }>(
+  (b) => b['retry-after'],
+  1000,
+);
 
 /**
  * The body as Zulip would store it, or a throw. `zerver/lib/message.py::normalize_body` right-strips

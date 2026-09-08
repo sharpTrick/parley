@@ -61,13 +61,58 @@ describe('zulip public export surface', () => {
     expect(sourceFiles).toContain(ENTRY);
   });
 
+  /**
+   * The parser, against a fixture that carries one export of every shape and three non-exports.
+   * Naming a REAL export as the witness for a shape grades nothing: `declaredExports` matches any
+   * export spelling of a name, so deleting `(?:async\s+)?` from the regex left the suite green (31
+   * passed) and so did rewriting the witness itself as an `export const` (31 passed). A
+   * name-presence assertion cannot fail for the reason it claims, and the hole it advertised as
+   * guarded was already open. An exact expected SET fails the moment a shape branch is dropped, and
+   * cannot be satisfied by a differently-spelled real export.
+   */
+  const SHAPE_FIXTURE = [
+    'export const aConst = 1;',
+    'export let aLet = 1;',
+    'export var aVar = 1;',
+    'export function aFunction(): void {}',
+    'export async function anAsyncFunction(): Promise<void> {}',
+    'export class AClass {}',
+    'export abstract class AnAbstractClass {}',
+    'export interface AnInterface { a: string }',
+    'export type AType = string;',
+    'export enum AnEnum { A }',
+    'export declare const aDeclaredConst: number;',
+    '  export const notAtColumnZero = 1;',
+    'const notExported = 1;',
+    "const mentions = 'export function notADeclaration()';",
+  ].join('\n');
+
+  const REEXPORT_FIXTURE = [
+    "export { aName, other as renamed } from './x.js';",
+    "export type { AType } from './y.js';",
+    "import { notAnExport } from './z.js';",
+  ].join('\n');
+
   it('reads every export shape it claims to grade, so a parse miss cannot pass as a clean file', () => {
-    const declared = [...sources.values()].flatMap(declaredExports);
-    expect(declared).toContain('ZulipPlugin'); // `export class`
-    expect(declared).toContain('readRetryAfter'); // `export async function`
-    expect(declared).toContain('MAX_MESSAGES_PER_FETCH'); // `export const`
-    expect(declared).toContain('ReadOpts'); // `export interface`
-    expect(reexports(entry)).toContain('ZulipBackendConfig'); // `export type { … } from`
+    expect(declaredExports(SHAPE_FIXTURE)).toEqual([
+      'aConst',
+      'aLet',
+      'aVar',
+      'aFunction',
+      'anAsyncFunction',
+      'AClass',
+      'AnAbstractClass',
+      'AnInterface',
+      'AType',
+      'AnEnum',
+      'aDeclaredConst',
+    ]);
+    expect(reexports(REEXPORT_FIXTURE)).toEqual(['aName', 'renamed', 'AType']);
+  });
+
+  it('reads this package with the parser above, so the rows below are not reading an empty set', () => {
+    expect([...sources.values()].flatMap(declaredExports).length).toBeGreaterThan(10);
+    expect(reexports(entry).length).toBeGreaterThan(0);
   });
 
   it('the entry publishes only names a test consumes or the allowlist admits', () => {
