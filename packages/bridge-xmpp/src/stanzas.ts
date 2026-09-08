@@ -1,4 +1,5 @@
 import { xml } from '@xmpp/client';
+import { sanitizeBody } from '@sharptrick/parley-net-util';
 
 /** A minimal view of the ltx element / @xmpp client surface we use (no upstream types ship). */
 export type El = {
@@ -102,14 +103,20 @@ export const assertXmlSafe = (value: string, what: string): void => {
   }
 };
 
-/** The RFC 6120 §8.3 defined-condition child of a stanza's `<error>`, plus its optional `<text>`. */
+/**
+ * The RFC 6120 §8.3 defined-condition child of a stanza's `<error>`, plus its optional `<text>`.
+ *
+ * Both fields are SERVER-controlled and reach a thrown Error and an operator's stderr from here, so
+ * both are bounded and flattened at the boundary rather than at each of the four places they land —
+ * one of which is the model context core renders a thrown seam error into.
+ */
 export const stanzaError = (stanza: El): { condition: string; text: string } => {
   const err = stanza.getChild('error');
   if (err === undefined) return { condition: 'error', text: '' };
   const defined = err.children.find((c): c is El => typeof c !== 'string' && c.name !== 'text');
   return {
-    condition: defined?.name ?? err.attrs.type ?? 'error',
-    text: err.getChildText('text', NS_STANZAS) ?? err.getChildText('text') ?? '',
+    condition: sanitizeBody(defined?.name ?? err.attrs.type ?? 'error'),
+    text: sanitizeBody(err.getChildText('text', NS_STANZAS) ?? err.getChildText('text') ?? ''),
   };
 };
 export const describeError = (e: { condition: string; text: string }): string =>

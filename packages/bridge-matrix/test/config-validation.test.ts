@@ -1,3 +1,4 @@
+import { MAX_TIMER_MS } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MAX_SYNC_TIMEOUT_MS, MatrixPlugin, ROOM_PRESETS, syncDeadlineMs } from '../src/index.js';
 import { aliasIsLegal, HOSTILE_LOCALPARTS } from './alias-legality.js';
@@ -154,7 +155,6 @@ describe('connect refuses a backend_config value the type system cannot enforce'
   const TIMER_KNOBS: Record<string, (value: number) => number> = {
     sync_timeout_ms: syncDeadlineMs,
   };
-  const MAX_TIMER_MS = 2 ** 31 - 1;
 
   for (const [knob, armedDelay] of Object.entries(TIMER_KNOBS)) {
     for (const value of FIELDS[knob]!.accepted as number[]) {

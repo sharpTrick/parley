@@ -11,7 +11,7 @@ import {
  * cannot fetch its later pages from whatever server the plugin is connected to by then — the pages
  * would be one window in two id spaces.
  */
-export interface ReadOpts {
+interface ReadOpts {
   generation: number;
   signal?: AbortSignal;
 }

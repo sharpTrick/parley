@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url);
 
 export type SqlParam = string | number | bigint | null;
 
-export interface RunResult {
+interface RunResult {
   lastInsertRowid: number | bigint;
   changes: number | bigint;
 }

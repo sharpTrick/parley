@@ -4,9 +4,10 @@ import { DiscordPlugin } from '../src/index.js';
 import { FAKE_TOKEN, startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 
 /**
- * Both ways a handler's failure reaches the process. Keep BOTH listeners, so that a fix which only
- * absorbs the synchronous half still loses every rejection row: an escaped rejection arrives as
- * `unhandledRejection`, never as `uncaughtException`.
+ * Both ways a handler's failure reaches the process. Keep BOTH listeners AND a row for each, so that
+ * a fix absorbing only one half still fails: an escaped rejection arrives as `unhandledRejection`
+ * and a synchronous throw out of the socket's message listener as `uncaughtException`, and a table
+ * carrying only one of them leaves the other listener installed but unreachable.
  */
 function watchForCrashes(): { crashes: unknown[]; stop: () => void } {
   const crashes: unknown[] = [];
@@ -52,15 +53,30 @@ describe("a subscribe handler's failure never leaves the handler", () => {
     await fake.close();
   });
 
-  it('a handler that fails does not stop a LATER subscriber on another topic', async () => {
+  const FAILING: Array<[how: string, handler: (m: Message) => void]> = [
+    [
+      'rejects',
+      (async (_m: Message): Promise<void> => {
+        throw new Error('handler rejected');
+      }) as (m: Message) => void,
+    ],
+    [
+      'throws synchronously',
+      (_m: Message): void => {
+        throw new Error('handler threw');
+      },
+    ],
+  ];
+
+  it.each(FAILING)('a handler that %s does not stop a LATER subscriber on another topic', async (
+    _how,
+    failing,
+  ) => {
     const broken = liveTopic();
     const healthy = liveTopic();
     const watch = watchForCrashes();
     try {
-      const rejecting = async (_m: Message): Promise<void> => {
-        throw new Error('handler rejected');
-      };
-      await plugin.subscribe(broken, rejecting);
+      await plugin.subscribe(broken, failing);
       const seen: string[] = [];
       await plugin.subscribe(healthy, (m) => seen.push(m.content));
 

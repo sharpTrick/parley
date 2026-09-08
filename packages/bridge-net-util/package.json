@@ -2,7 +2,7 @@
   "name": "@sharptrick/parley-net-util",
   "version": "0.1.0",
   "type": "module",
-  "description": "@sharptrick/parley-net-util \u2014 tiny HTTP helper for Parley backends: one fetchWithRetry loop (429 / Retry-After / attempt + wall-clock deadline / bounded response read / error-body redaction) plus the shared delay every backend that waits uses. NOT bridge-core: the seam itself stays dependency-free and HTTP-free. Lockstep-published with the rest of Parley (semantic-release, no hand-versioning).",
+  "description": "@sharptrick/parley-net-util \u2014 the helpers Parley's backends share below the seam: one fetchWithRetry loop (429 / Retry-After header+body / attempt + wall-clock deadline / bounded response read / error-body redaction), the plaintext-credential and loopback classifier every backend's connect() warning asks, the renderer that puts a rejected backend_config value in an error without disclosing what it holds, and the shared delay. NOT bridge-core: the seam itself stays dependency-free and HTTP-free. Lockstep-published with the rest of Parley (semantic-release, no hand-versioning).",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
@@ -48,6 +48,14 @@
     "parley",
     "http",
     "retry",
+    "retry-after",
+    "rate-limit",
+    "backoff",
+    "redaction",
+    "secret-redaction",
+    "plaintext-credentials",
+    "loopback",
+    "config-validation",
     "message-bus",
     "agent-messaging"
   ],

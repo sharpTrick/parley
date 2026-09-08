@@ -7,7 +7,8 @@ import { FakePlugin } from '../testing/fake-plugin.js';
 import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
 import { createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
-import { assertPublicBaseUrl, assertTrustProxy, LOOPBACK_HOSTS } from './invariants.js';
+import { assertPublicBaseUrl, assertTrustProxy } from './invariants.js';
+import { LOOPBACK_HOSTS } from './loopback-hosts.js';
 import { createOidcRemoteApp } from './oidc-remote.js';
 import {
   createRemoteAuthApp,

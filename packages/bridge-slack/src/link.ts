@@ -19,7 +19,7 @@ interface SocketHost {
   session: () => number;
 }
 
-export interface Route {
+interface Route {
   topic: Topic;
   handler: MessageHandler;
 }

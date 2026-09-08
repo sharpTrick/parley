@@ -8,7 +8,6 @@ import { LOOPBACK_HOSTS } from './loopback-hosts.js';
  * that actually protects the deployment lives here.
  */
 
-export { LOOPBACK_HOSTS } from './loopback-hosts.js';
 const LOOPBACK_LIST = [...LOOPBACK_HOSTS].join(' and ');
 
 const TRANSPORT_SCHEMES = new Set(['http:', 'https:']);

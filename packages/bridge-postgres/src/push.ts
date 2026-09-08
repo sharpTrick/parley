@@ -62,8 +62,6 @@ export abstract class PostgresPush extends PluginState {
             if (rows.length === 0) break;
             for (const row of rows) {
               sub.lastSeen = String(row.seq);
-              // Keep each handler in its own try/catch, so that one throwing handler cannot starve
-              // the others on this channel (DESIGN §6).
               for (const handler of sub.handlers) safeDeliver(handler, () => rowToMessage(row));
             }
           }
