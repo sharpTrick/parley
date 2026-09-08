@@ -17,6 +17,7 @@ export type {
   MessageHandler,
 } from './seam.js';
 export { safeDeliver } from './seam.js';
+export { isArmableDelay, MAX_TIMER_MS } from './timer-bounds.js';
 export { isNoSuchTopicError, NoSuchTopicError } from './no-such-topic.js';
 export {
   assertBlockMsUnsupported,

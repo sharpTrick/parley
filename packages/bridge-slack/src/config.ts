@@ -2,7 +2,10 @@ import {
   assertKnownConfigKeys,
   parseMentions,
   type BackendConfigKeys,
+  MAX_TIMER_MS,
 } from '@sharptrick/parley-core';
+
+export { MAX_TIMER_MS };
 import { isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
@@ -46,9 +49,6 @@ export interface SlackSettings {
   handshakeTimeoutMs: number;
   rotationGraceMs: number;
 }
-
-/** Largest delay Node's timers accept; past it every one of them silently becomes 1ms. */
-export const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * Every `backend_config` key whose value is handed straight to `setTimeout`. Keep

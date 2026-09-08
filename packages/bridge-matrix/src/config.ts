@@ -1,4 +1,4 @@
-import { assertKnownConfigKeys, type BackendConfigKeys } from '@sharptrick/parley-core';
+import { assertKnownConfigKeys, type BackendConfigKeys, MAX_TIMER_MS } from '@sharptrick/parley-core';
 import { DEFAULT_DEADLINE_MS, isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
 import { TOPIC_KEY } from './wire.js';
@@ -62,9 +62,6 @@ export const DEFAULT_SERVER_NAME = 'parley.local';
 
 /** Repo-public login password every dev fixture ships with; never a secret. */
 export const DEFAULT_PASSWORD = 'parleypass';
-
-/** Largest delay Node's timers accept; past it every one of them silently becomes 1ms. */
-const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * Largest accepted `sync_timeout_ms`: the one this plugin can still arm a real transport deadline

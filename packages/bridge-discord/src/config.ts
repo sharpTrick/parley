@@ -3,8 +3,11 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
   isPlainObject,
+  MAX_TIMER_MS,
   type Topic,
 } from '@sharptrick/parley-core';
+
+export { MAX_TIMER_MS };
 import { RECONNECT_CAP_MS } from './ladder.js';
 
 /** Plugin-specific backend_config. */
@@ -46,9 +49,6 @@ export interface AllowedMentions {
 }
 
 export const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
-
-/** Longest delay a Node timer holds. Past it the delay wraps and the timer fires at 1ms instead. */
-export const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * Most dialers whose share of the reconnect ceiling still ARMS: {@link RECONNECT_CAP_MS} is
