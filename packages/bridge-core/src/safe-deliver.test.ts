@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from './message.js';
-import { type MessageHandler, safeDeliver } from './seam.js';
+import { safeDeliver } from './safe-deliver.js';
+import type { MessageHandler } from './seam.js';
 
 const MESSAGE: Message = {
   topic: asTopic('room'),
