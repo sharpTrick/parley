@@ -351,8 +351,27 @@ const SERVER_BATCH = 50;
  * The widest any control may be declared, whatever it corrupts. `since` is threaded through most of
  * the suite, so the one variant that re-delivers at a cursor legitimately reaches half of it — but
  * past half a control has stopped discriminating, and no figure recorded here can buy that back.
+ *
+ * The two handler-fault controls scale with the SHARED fault table rather than with anything they
+ * corrupt: each fails one row per rejecting shape per fault position, so a shape added to
+ * `FAILURE_SHAPES` widens them by {@link FAULT_POSITIONS_PER_SHAPE}. That is what raised this from
+ * 16, and it stays a bound on the same terms — the row beside it still refuses anything past half
+ * the suite.
  */
-export const MAX_BLAST_RADIUS = 16;
+export const MAX_BLAST_RADIUS = 18;
+
+/** Positions in a run the shared clause drives each fault shape at (first, middle, every). */
+const FAULT_POSITIONS_PER_SHAPE = 3;
+
+/**
+ * Shapes whose failure arrives as a REJECTION. A control that never attaches to what the handler
+ * returned fails one row per one of these per position, and nothing else — which is exactly what
+ * keeps it aimed at "survives a handler that".
+ */
+const REJECTING_SHAPES = 4;
+
+/** Shapes a live path can be handed that a control mistaking one for a backend fault will misreport. */
+const NON_STALLING_SHAPES = 6;
 
 export const blastRadiusOf = (v: BrokenVariant): number => v.blastRadius ?? NARROW_BLAST_RADIUS;
 
@@ -973,7 +992,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a live path that drops the promise its handler returns',
-    blastRadius: 6,
+    blastRadius: REJECTING_SHAPES * FAULT_POSITIONS_PER_SHAPE,
     mutates: 'handler-fault-reaches-no-unhandled-rejection',
     mustFail: 'survives a handler that',
     make: () =>
@@ -988,7 +1007,7 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   },
   {
     name: 'a live path that diagnoses a consumer fault as a backend failure',
-    blastRadius: 12,
+    blastRadius: NON_STALLING_SHAPES * FAULT_POSITIONS_PER_SHAPE,
     mutates: 'handler-fault-is-not-a-backend-failure',
     mustFail: 'survives a handler that',
     make: () =>

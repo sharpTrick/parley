@@ -142,7 +142,11 @@ beforeAll(async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-}, 900_000);
+  // Budget for the WHOLE nested suite, not for any one case in it: the child runs every clause
+  // against every broken variant. Keep the headroom large, so that a clause added to the shared
+  // suite — which is the point of the suite — cannot turn every check in this file into a SKIP.
+  // Measured: 872s for 4,029 child cases, 992s for 4,503 after the handler-fault table was widened.
+}, 1_800_000);
 
 const results = (): Row[] => report.testResults.flatMap((f) => f.assertionResults);
 
