@@ -296,6 +296,9 @@ describe('every export earns its place', () => {
       'the applier of MAX_BACKOFF_MS, which three backends read and two document by name',
     DEFAULT_MAX_ATTEMPTS: 'the documented default of FetchWithRetryOptions.maxAttempts',
     MAX_RESPONSE_BYTES: 'the documented default of FetchWithRetryOptions.maxBodyBytes',
+    retryAfterFromHeader:
+      'the RFC 9110 header parse, both forms — the FLOOR every `bodyRetryAfter` hook is built on ' +
+      'and the whole answer for a vendor that states no body hint',
     STOP_POLL_MS: 'the documented bound on how long disconnect waits on a backoff',
   };
 

@@ -1,5 +1,5 @@
 import { buildMessage, type Message, type Topic } from '@sharptrick/parley-core';
-import { retryAfterFromHeader } from '@sharptrick/parley-net-util';
+import { bodyRetryAfter } from '@sharptrick/parley-net-util';
 
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 export const TOPIC_KEY = 'app.parley.topic';
@@ -163,15 +163,6 @@ export function eventToMessage(topic: Topic, e: MessageEvent): Message {
  * and `undefined` when there is no usable hint, so that we never retry sooner than the homeserver
  * asked — that is what escalates a rate limit into a ban — and the ceiling stays in net-util.
  */
-export async function readRetryAfter(res: Response): Promise<number | undefined> {
-  const header = retryAfterFromHeader(res);
-  if (header !== undefined) return header;
-  try {
-    const json = (await res.clone().json()) as { retry_after_ms?: number };
-    const ms = json.retry_after_ms;
-    if (typeof ms === 'number' && ms > 0) return ms;
-  } catch {
-    /* no usable body hint */
-  }
-  return undefined;
-}
+export const readRetryAfter = bodyRetryAfter<{ retry_after_ms?: number }>(
+  (b) => b.retry_after_ms,
+);

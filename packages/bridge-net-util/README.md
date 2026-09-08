@@ -103,6 +103,12 @@ TLS failure into an unenveloped one just by racing it.
   (`delay-seconds`, decimal only, plus the de-facto fraction; and HTTP-date), or `undefined` when
   the header carries no usable hint. A multi-valued header yields the **longest** wait any of its
   field-values states.
+- **`bodyRetryAfter(hintOf, unitMs?)`** — build the `retryAfterOf` hook for a vendor that also
+  states the wait in the 429 BODY (`retry_after`, `retry_after_ms`, `retry-after`,
+  `parameters.retry_after` — four vendors, four fields, two units). The header stays a FLOOR the
+  body cannot lower, a body no parser can read means "no usable hint" rather than an error out of
+  the retry loop, and the result is returned UNCLAMPED so nothing retries sooner than the vendor
+  asked.
 - **`sanitizeBody(text)`** — bound and flatten an untrusted response body before it goes in an
   Error: truncates at `MAX_ERROR_BODY` (never between the halves of an astral character) and strips
   every Unicode control (`Cc`, i.e. C0, C1 and DEL) and format (`Cf`, i.e. bidi overrides,

@@ -1,5 +1,5 @@
 import { buildMessage, type Message, type Topic } from '@sharptrick/parley-core';
-import { retryAfterFromHeader } from '@sharptrick/parley-net-util';
+import { bodyRetryAfter } from '@sharptrick/parley-net-util';
 
 /** The subset of a `GET /api/v1/users` member we read; `full_name` is set by that member. */
 export interface RealmMember {
@@ -109,17 +109,10 @@ export function pageAnchor(id: unknown, from: string, backwards: boolean): strin
  * undefined when neither is usable, so the shared default and the shared ceiling stay in
  * `clampBackoff` rather than being re-implemented — and re-tuned — per backend.
  */
+const zulipHint = bodyRetryAfter<{ 'retry-after'?: number }>((b) => b['retry-after'], 1000);
+
 export async function readRetryAfter(res: Response): Promise<number | undefined> {
-  const header = retryAfterFromHeader(res);
-  if (header !== undefined) return header;
-  try {
-    const json = (await res.clone().json()) as { 'retry-after'?: number };
-    const field = json['retry-after'];
-    if (typeof field === 'number' && field > 0) return field * 1000;
-  } catch {
-    /* no usable body hint */
-  }
-  return undefined;
+  return zulipHint(res);
 }
 
 /**

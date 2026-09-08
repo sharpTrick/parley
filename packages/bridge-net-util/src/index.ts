@@ -19,7 +19,7 @@ export { HttpStatusError, statusOf } from './errors.js';
 export { describeConfigShape, describeConfigValue } from './config-value.js';
 export { isHttpUrl, isLoopbackHost, plaintextRemoteOrigin } from './plaintext.js';
 export { MAX_ERROR_BODY, sanitizeBody } from './redact.js';
-export { retryAfterFromHeader } from './retry-after.js';
+export { bodyRetryAfter, retryAfterFromHeader } from './retry-after.js';
 export { delay, STOP_POLL_MS } from './timing.js';
 
 /** Wait applied when a 429 carries no usable hint. */

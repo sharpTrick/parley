@@ -1,5 +1,5 @@
 import type { BackendMsgId } from '@sharptrick/parley-core';
-import { retryAfterFromHeader, sanitizeBody } from '@sharptrick/parley-net-util';
+import { bodyRetryAfter, sanitizeBody } from '@sharptrick/parley-net-util';
 
 /** The subset of a Telegram `Message` object this plugin reads. */
 export interface TgMessage {
@@ -183,15 +183,7 @@ export function senderOf(msg: TgMessage): string {
  * token ban. A wait that cannot fit the call's deadline ends the call there — net-util's job, not
  * this parser's.
  */
-export async function readRetryAfter(res: Response): Promise<number | undefined> {
-  const header = retryAfterFromHeader(res);
-  if (header !== undefined) return header;
-  try {
-    const json = (await res.clone().json()) as { parameters?: { retry_after?: number } };
-    const seconds = json.parameters?.retry_after;
-    if (typeof seconds === 'number' && seconds > 0) return seconds * 1000;
-  } catch {
-    /* no usable body hint */
-  }
-  return undefined;
-}
+export const readRetryAfter = bodyRetryAfter<{ parameters?: { retry_after?: number } }>(
+  (b) => b.parameters?.retry_after,
+  1000,
+);

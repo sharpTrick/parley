@@ -108,3 +108,31 @@ export function retryAfterFromHeader(res: Response): number | undefined {
 /** A hint only counts as server-stated when it is a real, positive duration. */
 export const usableHint = (ms: number | undefined): number | undefined =>
   ms !== undefined && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+
+/**
+ * A 429's BODY hint, behind the standard header. Four vendors state the same thing in four places
+ * (`retry_after`, `retry_after_ms`, `retry-after`, `parameters.retry_after`) and in two units, and
+ * only that differs: the header is a FLOOR the body cannot lower, a body a parser cannot read means
+ * "no usable hint" rather than an error out of the retry loop, and the result is returned UNCLAMPED
+ * so that nothing here retries sooner than the vendor asked — which is what escalates a rate limit
+ * into a ban.
+ *
+ * `hintOf` reads the parsed body; anything it returns that is not a positive number is no hint.
+ * `unitMs` scales it — 1000 for a vendor stating seconds, the default 1 for milliseconds.
+ */
+export function bodyRetryAfter<T>(
+  hintOf: (body: T) => unknown,
+  unitMs = 1,
+): (res: Response) => Promise<number | undefined> {
+  return async (res: Response): Promise<number | undefined> => {
+    const header = retryAfterFromHeader(res);
+    if (header !== undefined) return header;
+    try {
+      const stated = hintOf((await res.clone().json()) as T);
+      if (typeof stated === 'number' && stated > 0) return stated * unitMs;
+    } catch {
+      /* no usable body hint */
+    }
+    return undefined;
+  };
+}
