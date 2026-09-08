@@ -244,8 +244,8 @@ describe('every discarded promise in src/ is a known one', () => {
     'transport/push-loop.ts: void emitChannel(server, m).catch(() => {':
       'the catch absorbs every shape, graded by the push-emit table above',
     'safe-deliver.ts: void Promise.resolve(handler(message())).catch(() => undefined);':
-      'safeDeliver absorbs every shape, graded by safe-deliver.test.ts and, for each backend, by ' +
-      'the conformance handler-fault clause',
+      'safeDeliver absorbs every shape in FAILURE_SHAPES, which both safe-deliver.test.ts and the ' +
+      'conformance handler-fault clause are driven from — so this row cannot outlive the table',
   };
 
   /**
